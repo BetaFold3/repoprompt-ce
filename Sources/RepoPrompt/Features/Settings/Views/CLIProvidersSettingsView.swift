@@ -473,6 +473,19 @@ struct CLIProvidersSettingsView: View {
                         .buttonStyle(CustomButtonStyle())
                     }
 
+                    HStack {
+                        Text(viewModel.claudeCLIModelDiscovery.caption)
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                        Spacer()
+                        Button("Refresh Models") {
+                            Task { await viewModel.refreshClaudeCLIModels(force: true) }
+                        }
+                        .disabled(viewModel.claudeCLIModelDiscovery.isRefreshing)
+                        .buttonStyle(CustomButtonStyle())
+                    }
+
                     directProviderInlineControls(for: .claude)
 
                     Text("Routing GLM models through claude? See CC Zai below.")

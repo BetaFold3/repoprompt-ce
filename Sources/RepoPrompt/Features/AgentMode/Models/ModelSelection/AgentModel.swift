@@ -85,6 +85,7 @@ enum AgentModel: String, CaseIterable, Codable {
     case claudeSonnet5 = "claude-sonnet-5"
     case claudeSonnet46 = "claude-sonnet-4-6"
     case claudeSonnet45 = "claude-sonnet-4-5"
+    case claudeOpus55 = "claude-opus-5-5"
     case claudeOpus5 = "claude-opus-5"
     case claudeOpus47 = "claude-opus-4-7"
     case claudeOpus46 = "claude-opus-4-6"
@@ -158,6 +159,7 @@ enum AgentModel: String, CaseIterable, Codable {
         case .claudeSonnet5: "Sonnet 5"
         case .claudeSonnet46: "Sonnet 4.6"
         case .claudeSonnet45: "Sonnet 4.5"
+        case .claudeOpus55: "Opus 5.5"
         case .claudeOpus5: "Opus 5"
         case .claudeOpus47: "Opus 4.7"
         case .claudeOpus46: "Opus 4.6"
@@ -225,6 +227,7 @@ enum AgentModel: String, CaseIterable, Codable {
         case .claudeSonnet5: "Pinned Claude Sonnet 5. Balanced speed and capability with 1M context for everyday engineering."
         case .claudeSonnet46: "Pinned Claude Sonnet 4.6. Balanced speed and capability for everyday engineering."
         case .claudeSonnet45: "Pinned Claude Sonnet 4.5. Balanced speed and capability for everyday engineering."
+        case .claudeOpus55: "Pinned Claude Opus 5.5. Opus-tier capability for complex reasoning and architecture."
         case .claudeOpus5: "Pinned Claude Opus 5. Opus-tier capability for complex reasoning and architecture."
         case .claudeOpus47: "Pinned Claude Opus 4.7. Opus-tier capability for complex reasoning and architecture."
         case .claudeOpus46: "Pinned Claude Opus 4.6. Opus-tier capability for complex reasoning and architecture."
@@ -293,7 +296,7 @@ enum AgentModel: String, CaseIterable, Codable {
                 .claudeFable51,
                 .claudeFable5,
                 .claudeOpus1m,
-                .claudeOpus, .claudeOpus5, .claudeOpus47, .claudeOpus46, .claudeOpus45,
+                .claudeOpus, .claudeOpus55, .claudeOpus5, .claudeOpus47, .claudeOpus46, .claudeOpus45,
                 .claudeSonnet, .claudeSonnet5, .claudeSonnet46, .claudeSonnet45,
                 .claudeHaiku, .claudeHaiku45
             ]
@@ -583,7 +586,7 @@ enum AgentModel: String, CaseIterable, Codable {
     /// Returns `nil` for models where the context window is unknown or unverified.
     var contextWindowTokens: Int? {
         switch self {
-        case .claudeFable51, .claudeFable5, .claudeSonnet5, .claudeOpus5, .claudeOpus1m, .glm52_1m:
+        case .claudeFable51, .claudeFable5, .claudeSonnet5, .claudeOpus55, .claudeOpus5, .claudeOpus1m, .glm52_1m:
             1_000_000
         case .claudeSonnet, .claudeOpus, .claudeHaiku,
              .claudeSonnet46, .claudeSonnet45,

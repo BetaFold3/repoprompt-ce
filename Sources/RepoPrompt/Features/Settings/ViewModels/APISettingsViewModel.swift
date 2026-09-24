@@ -660,6 +660,35 @@ public class APISettingsViewModel: ObservableObject {
         }
     }
 
+    private func installClaudeModelDiscoveryObservers() {
+        claudeCLIModelDiscovery.objectWillChange
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in self?.objectWillChange.send() }
+            .store(in: &cliConnectionCancellables)
+        NotificationCenter.default.publisher(for: .claudeCLIModelCatalogDidChange)
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in
+                Task { @MainActor [weak self] in
+                    guard let self, !hasPreparedForWindowClose else { return }
+                    await updateAvailableModels()
+                }
+            }
+            .store(in: &cliConnectionCancellables)
+    }
+
+    func refreshClaudeCLIModels(force: Bool = false) async {
+        guard !hasPreparedForWindowClose, isClaudeCodeConnected else { return }
+        do {
+            let config = try Self.claudeCodeProbeConfiguration(
+                defaults: cliExecutableOverrideDefaults,
+                captureTailBytes: ClaudeCLIModelDiscoveryProbe.maximumOutputBytes
+            )
+            await claudeCLIModelDiscovery.refresh(config: config, force: force)
+        } catch {
+            claudeCLIModelDiscovery.invalidate()
+        }
+    }
+
     private func installCLIConnectionObservers() {
         Publishers.MergeMany([
             NotificationCenter.default.publisher(for: .claudeCodeConnectionChanged).map { _ in AgentProviderKind.claudeCode },
@@ -672,6 +701,9 @@ public class APISettingsViewModel: ObservableObject {
         .sink { [weak self] provider in
             guard let self else { return }
             reloadCLIConnectionFlagsFromDefaults()
+            if provider == .claudeCode, automaticallyDiscoverClaudeModels, !isClaudeCodeConnected {
+                claudeCLIModelDiscovery.invalidate()
+            }
             setContextBuilderProviderVerified(
                 provider,
                 verified: contextBuilderProviderIsConnected(provider)
@@ -681,11 +713,16 @@ public class APISettingsViewModel: ObservableObject {
     }
 
     private func reloadCLIConnectionFlagsFromDefaults() {
+        let wasClaudeConnected = isClaudeCodeConnected
         let wasOhMyPiConnected = isOhMyPiConnected
         let wasCursorConnected = isCursorConnected
         isClaudeCodeConnected = UserDefaults.standard.bool(forKey: "ClaudeCodeConnected")
         if isClaudeCodeConnected {
             claudeCodeCLIStatus = .binaryPresent
+        }
+        if wasClaudeConnected != isClaudeCodeConnected, automaticallyDiscoverClaudeModels {
+            claudeCLIModelDiscovery.invalidate()
+            if isClaudeCodeConnected { Task { await self.refreshClaudeCLIModels() } }
         }
         isCodexConnected = UserDefaults.standard.bool(forKey: "CodexCLIConnected")
         isOpenCodeConnected = UserDefaults.standard.bool(forKey: "OpenCodeCLIConnected")
@@ -841,6 +878,7 @@ public class APISettingsViewModel: ObservableObject {
 
         fingerprintedClaudeExecutableProbe = nil
         claudeExecutableOverridePipelineObserver(.clearProbeFingerprint)
+        if automaticallyDiscoverClaudeModels { claudeCLIModelDiscovery.invalidate() }
         claudeExecutableOverridePipelineObserver(.probe)
         return await refreshClaudeCodeBinaryStatus(forceProbe: true)
     }
@@ -871,13 +909,17 @@ public class APISettingsViewModel: ObservableObject {
 
         fingerprintedClaudeExecutableProbe = nil
         claudeExecutableOverridePipelineObserver(.clearProbeFingerprint)
+        if automaticallyDiscoverClaudeModels { claudeCLIModelDiscovery.invalidate() }
         claudeExecutableOverridePipelineObserver(.probe)
         return await refreshClaudeCodeBinaryStatus(forceProbe: true)
     }
 
     @discardableResult
     func recheckClaudeExecutableOverride() async -> Bool {
-        await refreshClaudeCodeBinaryStatus(forceProbe: true)
+        if automaticallyDiscoverClaudeModels { claudeCLIModelDiscovery.invalidate() }
+        let ready = await refreshClaudeCodeBinaryStatus(forceProbe: true)
+        if ready, automaticallyDiscoverClaudeModels { await refreshClaudeCLIModels(force: true) }
+        return ready
     }
 
     func claudeExecutablePathSuggestedBySelection(_ selectedURL: URL) -> String {
@@ -987,6 +1029,9 @@ public class APISettingsViewModel: ObservableObject {
                 status: .succeeded(resolvedCommand: resolvedCommand, version: version)
             )
             claudeCodeCLIStatus = .binaryPresent
+            if automaticallyDiscoverClaudeModels, isClaudeCodeConnected {
+                Task { [weak self] in await self?.refreshClaudeCLIModels() }
+            }
         case let .failed(message):
             fingerprintedClaudeExecutableProbe = FingerprintedClaudeExecutableProbe(
                 fingerprint: fingerprint,
@@ -1454,6 +1499,8 @@ public class APISettingsViewModel: ObservableObject {
     private let cliResolvedCommandCacheInvalidator: () async -> Void
     private let claudeExecutableOverridePipelineObserver: (ClaudeExecutableOverridePipelineStage) -> Void
     private let claudeFamilyModelAvailabilityRefreshBoundary: (@MainActor @Sendable () async -> Void)?
+    let claudeCLIModelDiscovery: ClaudeCLIModelDiscoveryService
+    private let automaticallyDiscoverClaudeModels: Bool
     private let codexModelPollingService: CodexModelPollingService
     private let apiModelCatalog: APIModelCatalog
     private let openAIModelMetadataResolver: OpenAIAPIModelMetadataResolver
@@ -1478,6 +1525,7 @@ public class APISettingsViewModel: ObservableObject {
         keyManager: KeyManager,
         loadStoredDataOnInit: Bool = true,
         codexModelPollingService: CodexModelPollingService = .shared,
+        claudeCLIModelDiscovery: ClaudeCLIModelDiscoveryService? = nil,
         apiModelCatalog: APIModelCatalog? = nil,
         openAIModelMetadataResolver: OpenAIAPIModelMetadataResolver? = nil,
         openAIModelMetadataRegistry: OpenAIAPIModelMetadataRegistry = .shared,
@@ -1510,6 +1558,8 @@ public class APISettingsViewModel: ObservableObject {
         }
         self.claudeExecutableOverridePipelineObserver = claudeExecutableOverridePipelineObserver ?? { _ in }
         self.claudeFamilyModelAvailabilityRefreshBoundary = claudeFamilyModelAvailabilityRefreshBoundary
+        self.claudeCLIModelDiscovery = claudeCLIModelDiscovery ?? .shared
+        automaticallyDiscoverClaudeModels = loadStoredDataOnInit
         self.codexModelPollingService = codexModelPollingService
         self.apiModelCatalog = apiModelCatalog ?? Self.makeDefaultAPIModelCatalog()
         self.openAIModelMetadataResolver = openAIModelMetadataResolver
@@ -1527,6 +1577,7 @@ public class APISettingsViewModel: ObservableObject {
         self.contextBuilderProviderValidationWillBegin = contextBuilderProviderValidationWillBegin
         synchronizeClaudeExecutableOverrideAppliedState(updateDraft: true)
         installCLIConnectionObservers()
+        installClaudeModelDiscoveryObservers()
         installAgentAvailabilityObservers()
         refreshAgentAvailability()
         reloadOpenAIModelCatalogMetadata()
@@ -1731,6 +1782,13 @@ public class APISettingsViewModel: ObservableObject {
             guard !Task.isCancelled, !hasPreparedForWindowClose else { return }
 
             applyContextBuilderProviderValidationResult(readiness.0, provider: .claudeCode)
+            if automaticallyDiscoverClaudeModels {
+                if readiness.0 {
+                    Task { [weak self] in await self?.refreshClaudeCLIModels() }
+                } else {
+                    claudeCLIModelDiscovery.invalidate()
+                }
+            }
             applyContextBuilderProviderValidationResult(readiness.1, provider: .codexExec)
             applyContextBuilderProviderValidationResult(readiness.2, provider: .openCode)
             applyContextBuilderProviderValidationResult(readiness.3, provider: .ohMyPi)
@@ -3470,6 +3528,10 @@ public class APISettingsViewModel: ObservableObject {
                 userInfo: ["windowID": 0]
             )
             if ok {
+                if automaticallyDiscoverClaudeModels {
+                    claudeCLIModelDiscovery.invalidate()
+                    Task { [weak self] in await self?.refreshClaudeCLIModels(force: true) }
+                }
                 collector.append("Claude Code marked as connected")
                 claudeCodeLogCollector = nil
             }

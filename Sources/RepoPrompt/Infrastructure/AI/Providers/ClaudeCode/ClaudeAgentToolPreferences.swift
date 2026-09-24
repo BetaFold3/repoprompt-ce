@@ -198,7 +198,7 @@ struct ClaudeAgentToolPreferences {
 
         // Full family IDs deliberately remain case-sensitive. The shared family
         // catalog owns the strict major/minor/date grammar.
-        if ClaudeModelFamilyCatalog.family(for: baseModel) != nil {
+        if ClaudeModelFamilyCatalog.cliFamily(for: baseModel) != nil {
             return .eligible
         }
 

@@ -2324,7 +2324,7 @@ enum AgentModelCatalog {
         else {
             return false
         }
-        return ClaudeModelFamilyCatalog.pointRelease(baseModel) != nil
+        return ClaudeModelFamilyCatalog.cliPointRelease(baseModel) != nil
     }
 
     /// Family-grammar context-window fallback for registry-listed dynamic Claude
@@ -2336,7 +2336,7 @@ enum AgentModelCatalog {
     ) -> Int? {
         guard agentKind == .claudeCode,
               let baseModel = ClaudeModelSpecifier(raw: rawModel).baseModel,
-              let pointRelease = ClaudeModelFamilyCatalog.pointRelease(baseModel)
+              let pointRelease = ClaudeModelFamilyCatalog.cliPointRelease(baseModel)
         else {
             return nil
         }

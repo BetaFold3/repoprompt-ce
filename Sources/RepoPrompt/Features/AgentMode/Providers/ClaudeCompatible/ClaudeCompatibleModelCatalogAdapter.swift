@@ -10,7 +10,8 @@ enum ClaudeCompatibleModelCatalogAdapter {
         for agentKind: AgentProviderKind,
         availability: AgentModelCatalog.AvailabilityContext = .current,
         includeClaudeEffortVariants: Bool = true,
-        store: AnthropicDiscoveredModelStore = .shared
+        store: AnthropicDiscoveredModelStore = .shared,
+        cliStore: ClaudeCLIDiscoveredModelStore = .shared
     ) -> ClaudeCompatiblePluginModelCatalogSnapshot? {
         guard let pluginID = ClaudeCompatiblePluginBridge.pluginID(for: agentKind) else { return nil }
         let snapshot = pluginCatalogSnapshot(
@@ -22,7 +23,8 @@ enum ClaudeCompatibleModelCatalogAdapter {
             ? optionsSplicingDynamicClaudePointReleases(
                 into: snapshot.options,
                 includeClaudeEffortVariants: includeClaudeEffortVariants,
-                store: store
+                store: store,
+                cliStore: cliStore
             )
             : snapshot.options
         let mappedOptions = AgentModelCatalog.isAgentAvailable(agentKind, availability: availability)
@@ -54,13 +56,15 @@ enum ClaudeCompatibleModelCatalogAdapter {
         for agentKind: AgentProviderKind,
         availability: AgentModelCatalog.AvailabilityContext = .current,
         includeClaudeEffortVariants: Bool = true,
-        store: AnthropicDiscoveredModelStore = .shared
+        store: AnthropicDiscoveredModelStore = .shared,
+        cliStore: ClaudeCLIDiscoveredModelStore = .shared
     ) -> [AgentModelOption]? {
         catalogSnapshot(
             for: agentKind,
             availability: availability,
             includeClaudeEffortVariants: includeClaudeEffortVariants,
-            store: store
+            store: store,
+            cliStore: cliStore
         ).map { modelOptions(from: $0.options, for: agentKind) }
     }
 
@@ -202,7 +206,7 @@ enum ClaudeCompatibleModelCatalogAdapter {
             // Claude Code path even when no static AgentModel case exists. Validation is
             // deliberately registry-independent so stored selections survive withdrawal.
             guard agentKind == .claudeCode,
-                  let pointRelease = ClaudeModelFamilyCatalog.pointRelease(baseModel)
+                  let pointRelease = ClaudeModelFamilyCatalog.cliPointRelease(baseModel)
             else {
                 return false
             }
@@ -244,27 +248,25 @@ enum ClaudeCompatibleModelCatalogAdapter {
         // grammar branch in `isValid`; every caller with dynamic-model access
         // passes a concrete agent kind, so nil never unlocks the grammar path.
         guard agentKind == .claudeCode else { return false }
-        return ClaudeModelFamilyCatalog.pointRelease(normalized)?.family.xhighEligible == true
+        return ClaudeModelFamilyCatalog.cliPointRelease(normalized)?.family.xhighEligible == true
     }
 
-    /// Splices registry-corroborated dynamic Claude point releases into the
-    /// `.claudeCode` plugin snapshot. Listing stays registry-gated: only IDs the
-    /// official Anthropic models API returned (and that pass the strict family
-    /// grammar via `ClaudeCodeAIModelCatalog.effectiveDefinitions`) appear, with
-    /// their exact discovered raw IDs, sorted descending minor before the family
-    /// anchor. The provider package snapshot itself stays untouched, and
-    /// compatible backends (GLM/Kimi/custom) never receive dynamic entries.
+    /// Splices API-registry and verified CLI point releases into standard Claude
+    /// Code only. Exact IDs and CLI context qualifiers are retained; family
+    /// grammar still owns effort metadata. Compatible backends never receive
+    /// these entries, and the provider package snapshot remains static.
     private static func optionsSplicingDynamicClaudePointReleases(
         into pluginOptions: [ClaudeCompatiblePluginModelOption],
         includeClaudeEffortVariants: Bool,
-        store: AnthropicDiscoveredModelStore
+        store: AnthropicDiscoveredModelStore,
+        cliStore: ClaudeCLIDiscoveredModelStore
     ) -> [ClaudeCompatiblePluginModelOption] {
         let staticBaseRaws = Set(pluginOptions.compactMap { option -> String? in
             ClaudeModelSpecifier(raw: option.rawValue).baseModel?.lowercased()
         })
-        let dynamicDefinitions = ClaudeCodeAIModelCatalog.effectiveDefinitions(store: store)
+        let dynamicDefinitions = ClaudeCodeAIModelCatalog.effectiveDefinitions(store: store, cliStore: cliStore)
             .compactMap { definition -> (ClaudeModelFamilyCatalog.PointRelease, ClaudeCodeAIModelCatalog.ModelDefinition)? in
-                guard let pointRelease = ClaudeModelFamilyCatalog.pointRelease(definition.runtimeModelRaw),
+                guard let pointRelease = ClaudeModelFamilyCatalog.cliPointRelease(definition.runtimeModelRaw),
                       AgentModel.resolvedModel(forRaw: definition.runtimeModelRaw, agentKind: .claudeCode) == nil,
                       !staticBaseRaws.contains(definition.runtimeModelRaw.lowercased())
                 else {
@@ -296,7 +298,7 @@ enum ClaudeCompatibleModelCatalogAdapter {
             if base.caseInsensitiveCompare(pointRelease.family.anchor) == .orderedSame {
                 return index
             }
-            guard let existing = ClaudeModelFamilyCatalog.pointRelease(base.lowercased()),
+            guard let existing = ClaudeModelFamilyCatalog.cliPointRelease(base.lowercased()),
                   existing.family.anchor == pointRelease.family.anchor,
                   ClaudeModelFamilyCatalog.pointReleasePrecedes(pointRelease, existing)
             else {
@@ -311,7 +313,7 @@ enum ClaudeCompatibleModelCatalogAdapter {
         for definition: ClaudeCodeAIModelCatalog.ModelDefinition,
         includeEffortVariants: Bool
     ) -> [ClaudeCompatiblePluginModelOption] {
-        let description = "Registry-discovered Claude point release, listed automatically from Anthropic's official models API."
+        let description = "Discovered Claude Code point release, listed automatically from verified model metadata."
         guard includeEffortVariants, !definition.supportedEfforts.isEmpty else {
             return [ClaudeCompatiblePluginModelOption(
                 rawValue: definition.runtimeModelRaw,
@@ -506,6 +508,7 @@ enum ClaudeCompatibleModelCatalogAdapter {
         AgentModel.claudeSonnet5.rawValue.lowercased(),
         AgentModel.claudeOpus.rawValue.lowercased(),
         AgentModel.claudeOpus1m.rawValue.lowercased(),
+        AgentModel.claudeOpus55.rawValue.lowercased(),
         AgentModel.claudeOpus5.rawValue.lowercased(),
         AgentModel.claudeOpus47.rawValue.lowercased(),
         AgentModel.claudeOpus46.rawValue.lowercased(),

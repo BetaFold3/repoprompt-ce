@@ -2,7 +2,7 @@
 
 Scope: read when the task touches Claude Fable 5.1 static support, Claude Code dynamic point releases, the Anthropic models registry, Claude family grammar, or Anthropic family-based request shaping.
 Authority: Authoritative
-Last-verified: 2026-09-21
+Last-verified: 2026-09-24
 
 ## Authority and ownership
 
@@ -11,7 +11,8 @@ Keep these authorities separate:
 - `Sources/RepoPrompt/Infrastructure/AI/ModelCatalog/Providers/ClaudeModelFamilyCatalog.swift` is the core, keyless authority for supported family/major anchors, point-release grammar, family effort metadata, CLI context windows, and API request-shape traits.
 - `Sources/RepoPrompt/Infrastructure/AI/ModelCatalog/Providers/AnthropicAPIModelsClient.swift` fetches and validates official `GET /v1/models` descriptors.
 - `Sources/RepoPrompt/Infrastructure/AI/ModelCatalog/Providers/AnthropicDiscoveredModelStore.swift` is the persisted descriptor authority.
-- `Sources/RepoPrompt/Infrastructure/AI/ModelCatalog/Providers/ClaudeCodeAIModelCatalog.swift` combines the static Claude Code catalog with registry-corroborated point releases for Oracle/picker presentation while retaining grammar-based validation.
+- `Sources/RepoPrompt/Infrastructure/AI/ModelCatalog/Providers/ClaudeCodeAIModelCatalog.swift` combines static Claude Code entries, Anthropic registry entries, and verified CLI-discovered point releases for Oracle/picker presentation while retaining grammar-based validation.
+- `Sources/RepoPrompt/Infrastructure/AI/Providers/ClaudeCode/ClaudeCLIModelDiscoveryProbe.swift` owns initialization-only CLI discovery; `ClaudeCLIModelDiscoveryService.swift` owns shared refresh lifecycle and status. `Sources/RepoPrompt/Infrastructure/AI/ModelCatalog/Providers/ClaudeCLIDiscoveredModelStore.swift` owns its separate scoped cache.
 - `Sources/RepoPrompt/Features/AgentMode/Providers/ClaudeCompatible/ClaudeCompatibleModelCatalogAdapter.swift` overlays those dynamic entries only for standard `.claudeCode`.
 - `Sources/RepoPrompt/Infrastructure/AI/Providers/Anthropic/AnthropicModelFamilyTraits.swift` applies exact-ID overrides before family traits; `AnthropicModelConfiguration.swift` and `AnthropicRequestPlan.swift` turn those traits into native API requests.
 
@@ -37,9 +38,29 @@ The models client paginates the official Anthropic endpoint, tolerantly decodes 
 
 The store synchronously hydrates a version-1 UserDefaults envelope, atomically replaces the complete canonical model array, and increments a monotone revision only when model data changes. Invalid responses, transient fetch failures, corrupt persisted bytes, and future envelope versions do not replace the last-good catalog; corrupt/future bytes are left intact. A structurally valid empty response is authoritative and clears the catalog. Removing an API key does not clear it.
 
-Only registry IDs that also pass the strict family grammar enter dynamic Claude Code picker/discovery options. Wire IDs remain exact. Registry display names are trimmed and accepted only when nonempty, control-free, at most 80 characters, and at most 320 UTF-8 bytes; otherwise the family-generated name is used. Registry token limits may enrich capability metadata, but registry capabilities do not select request traits.
+Anthropic registry IDs must pass the strict family grammar to enter dynamic Claude Code picker/discovery options. The separate CLI source below can additionally supply exact CLI-only `[1m]` selections. Wire IDs remain exact. Registry display names are trimmed and accepted only when nonempty, control-free, at most 80 characters, and at most 320 UTF-8 bytes; otherwise the family-generated name is used. Registry token limits may enrich capability metadata, but registry capabilities do not select request traits.
 
-When an authoritative refresh withdraws a model, it disappears from new picker choices. Stored raw selections remain unchanged and grammar-valid IDs remain validation-compatible; an unavailable runtime ID must fail loudly at the provider rather than being substituted.
+An authoritative refresh withdraws that source's contribution. A model disappears from new picker choices only when neither static entries nor another active discovery source supplies it. Stored raw selections remain unchanged and grammar-valid IDs remain validation-compatible; an unavailable runtime ID must fail loudly at the provider rather than being substituted.
+
+## Claude CLI discovery (subscription-compatible)
+
+The native API list endpoint is authenticated: API-key validation and `GET /v1/models` discovery are separate operations. Claude CLI discovery does not require a separately configured Anthropic API key and never imports that key or extracts subscription credentials.
+
+The approved metadata-only probe on Claude Code 2.1.281 returned `apiProvider: firstParty`, subscription category `Claude Max`, and `resolvedModel: claude-opus-5-5[1m]` for both `default` and `opus[1m]`. It exited successfully after stdin EOF without a user message. This verifies initialization metadata, not a generation request or the rebuilt application's UI.
+
+The discovery probe uses the existing executable-override/path resolution and process runner. It runs in a disposable temporary directory with `--safe-mode`, strict empty MCP configuration, no tools, and no session persistence. It sends only the matching initialize control request, closes stdin, and requires a successful process exit and matching success response. The child deadline is 15 seconds; retained stdout is capped at 1 MiB, stderr at 8 KiB, and model rows at 1,024. Capture-limit output is rejected rather than treating a parseable tail as complete. Cancellation reaps the process through the existing runner. Older CLIs that reject the flags fail closed; there is no fallback to a generation request.
+
+Only first-party initialization responses are accepted, and explicit alternate-provider/custom-endpoint environment routing is rejected. Prefer `resolvedModel`; use `value` only if resolution is absent and the value itself is a supported concrete point-release ID. Never derive IDs from display names or descriptions. Aliases stay curated. Exact duplicates are collapsed.
+
+`cliPointRelease` permits exactly one terminal, case-sensitive `[1m]` on otherwise strict known-major point releases. It preserves the original wire ID and adds a generated `(1M)` label. CLI validation, effort handling, ordering, Auto candidacy, discovery, sidebar context and capability metadata share that helper. Native API grammar and request traits do not accept the suffix. Bare and qualified versions remain distinct, with bare first at equal version/date.
+
+The app-wide service coalesces refreshes across windows only when discovery-relevant launch configuration matches (command/selection, environment overrides, path hints, suffix, candidates and shell lookup mode). Configuration comparison is in-memory only and never logs or persists environment values. Startup follows cached CLI connection validation; successful connect, executable changes/recheck, and the explicit **Refresh Models** control also trigger discovery. Automatic repeated requests have a 60-second cooldown; explicit refresh bypasses it. Known logout/configuration changes invalidate the current generation and deactivate old CLI entries. Obsolete completions cannot publish; a successor waits for canceled work to finish. Closing one Settings window removes observation rather than canceling shared work; app termination cancels it. The CLI settings card exposes refresh and failure status separately from connection readiness.
+
+The version-1 `ClaudeCLIModelCatalogV1` cache stores only exact model IDs, timestamp, and a hash of executable real path plus account email/organization identity. It contains no plaintext account identity or credentials. Disk hydration alone never exposes entries: a matching account must first be verified by initialization. Missing identity fields allow only an in-memory result. An unchanged connection's transient failure retains data verified during this app process; known account/backend/configuration changes deactivate it. External account changes remain unknown until revalidation. Invalid/future cache bytes are not silently cleared. A valid empty response removes that CLI source's contributions.
+
+The merged catalog uses static > API registry > CLI precedence and caches both source identities/revisions. API and CLI stores remain separate: CLI metadata never changes native API availability, prices, token limits, or request traits. Withdrawing one source does not remove an entry supplied by another. Compatible GLM/Kimi/custom backends receive no dynamic overlay.
+
+Opus 5.5 is also explicitly curated as `claude-opus-5-5` across the provider package, `AgentModel.claudeOpus55`, Oracle catalog, and static XHigh set. It uses the existing Opus 5 CLI family efforts/context, with no recommendation/default change. Test future releases such as 5.8/5.9 so this static fallback cannot conceal broken discovery. Older binaries cannot decode the new enum case; the rollback policy below applies.
 
 ## Request-shaping traits and exact overrides
 
@@ -107,6 +128,7 @@ Use the smallest coordinated suites for the changed boundary:
 | Boundary | Focused coverage |
 | --- | --- |
 | Family rows, grammar, ordering, traits | `ClaudeModelFamilyCatalogTests` |
+| CLI initialization parsing/transport, scoped persistence, refresh lifecycle, qualified IDs and catalog union | `ClaudeCLIModelDiscoveryTests` |
 | Models API decoding, pagination, atomic validation | `AnthropicAPIModelsClientTests` |
 | Persistence, replacement, revision, last-good retention | `AnthropicDiscoveredModelStoreTests` |
 | Native request shape and capability metadata | `AnthropicRequestPlanTests` |

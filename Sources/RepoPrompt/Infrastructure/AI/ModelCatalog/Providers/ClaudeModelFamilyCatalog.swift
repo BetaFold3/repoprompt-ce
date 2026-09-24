@@ -65,8 +65,8 @@ enum ClaudeModelFamilyCatalog {
         /// label to its undated static sibling.
         var generatedDisplayName: String {
             let base = "\(family.familyDisplayName) \(family.major).\(minor)"
-            guard let dateSuffix else { return base }
-            return "\(base) (\(dateSuffix))"
+            let dated = dateSuffix.map { "\(base) (\($0))" } ?? base
+            return rawModelID.hasSuffix("[1m]") ? "\(dated) (1M)" : dated
         }
     }
 
@@ -111,6 +111,20 @@ enum ClaudeModelFamilyCatalog {
             return exact
         }
         return pointRelease(modelID)?.family
+    }
+
+    /// CLI-only context qualifier. Native API grammar deliberately remains unchanged.
+    static func cliPointRelease(_ modelID: String) -> PointRelease? {
+        let base = modelID.hasSuffix("[1m]") ? String(modelID.dropLast(4)) : modelID
+        guard let release = pointRelease(base) else { return nil }
+        return PointRelease(
+            family: release.family, minor: release.minor,
+            dateSuffix: release.dateSuffix, rawModelID: modelID
+        )
+    }
+
+    static func cliFamily(for modelID: String) -> Family? {
+        family(for: modelID) ?? cliPointRelease(modelID)?.family
     }
 
     static func pointRelease(_ modelID: String) -> PointRelease? {
@@ -162,6 +176,9 @@ enum ClaudeModelFamilyCatalog {
         if leftDate != rightDate {
             return leftDate > rightDate
         }
+        let leftExtended = lhs.rawModelID.hasSuffix("[1m]")
+        let rightExtended = rhs.rawModelID.hasSuffix("[1m]")
+        if leftExtended != rightExtended { return !leftExtended }
         return ModelPickerStringOrdering.precedes(lhs.rawModelID, rhs.rawModelID)
     }
 

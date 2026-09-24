@@ -20,15 +20,21 @@ enum ClaudeCodeAIModelCatalog {
 
     private final class EffectiveDefinitionsCacheEntry {
         weak var store: AnthropicDiscoveredModelStore?
+        weak var cliStore: ClaudeCLIDiscoveredModelStore?
+        let cliRevision: UInt64
         let revision: UInt64
         let definitions: [ModelDefinition]
 
         init(
             store: AnthropicDiscoveredModelStore,
             revision: UInt64,
+            cliStore: ClaudeCLIDiscoveredModelStore,
+            cliRevision: UInt64,
             definitions: [ModelDefinition]
         ) {
             self.store = store
+            self.cliStore = cliStore
+            self.cliRevision = cliRevision
             self.revision = revision
             self.definitions = definitions
         }
@@ -51,6 +57,7 @@ enum ClaudeCodeAIModelCatalog {
         ModelDefinition(runtimeModelRaw: "claude-fable-5", displayName: "Fable 5", supportedEfforts: [.low, .medium, .high, .max, .xhigh]),
         ModelDefinition(runtimeModelRaw: "opus[1m]", displayName: "Opus Latest (1M)", supportedEfforts: [.low, .medium, .high, .max, .xhigh]),
         ModelDefinition(runtimeModelRaw: "opus", displayName: "Opus Latest", supportedEfforts: [.low, .medium, .high, .max, .xhigh]),
+        ModelDefinition(runtimeModelRaw: "claude-opus-5-5", displayName: "Opus 5.5", supportedEfforts: [.low, .medium, .high, .max, .xhigh]),
         ModelDefinition(runtimeModelRaw: "claude-opus-5", displayName: "Opus 5", supportedEfforts: [.low, .medium, .high, .max, .xhigh]),
         ModelDefinition(runtimeModelRaw: "claude-opus-4-7", displayName: "Opus 4.7", supportedEfforts: [.low, .medium, .high, .max, .xhigh]),
         ModelDefinition(runtimeModelRaw: "claude-opus-4-6", displayName: "Opus 4.6", supportedEfforts: [.low, .medium, .high, .max, .xhigh]),
@@ -89,7 +96,8 @@ enum ClaudeCodeAIModelCatalog {
 
     static func validatedModel(
         specifier rawSpecifier: String,
-        store: AnthropicDiscoveredModelStore = .shared
+        store: AnthropicDiscoveredModelStore = .shared,
+        cliStore: ClaudeCLIDiscoveredModelStore = .shared
     ) -> AIModel? {
         let normalized = normalizedSpecifier(rawSpecifier)
         if compatibleBackendDescriptor(specifier: normalized) != nil {
@@ -102,8 +110,8 @@ enum ClaudeCodeAIModelCatalog {
         guard let baseModel = parsed.baseModel else {
             return nil
         }
-        guard let definition = definition(forBaseModelRaw: baseModel, store: store) else {
-            guard let pointRelease = ClaudeModelFamilyCatalog.pointRelease(baseModel) else {
+        guard let definition = definition(forBaseModelRaw: baseModel, store: store, cliStore: cliStore) else {
+            guard let pointRelease = ClaudeModelFamilyCatalog.cliPointRelease(baseModel) else {
                 return validatedAgentCatalogEffortModel(specifier: normalized)
             }
             if let effort = parsed.explicitEffortLevel {
@@ -141,15 +149,16 @@ enum ClaudeCodeAIModelCatalog {
 
     static func displayName(
         for specifier: String,
-        store: AnthropicDiscoveredModelStore = .shared
+        store: AnthropicDiscoveredModelStore = .shared,
+        cliStore: ClaudeCLIDiscoveredModelStore = .shared
     ) -> String {
         if let descriptor = compatibleBackendDescriptor(specifier: specifier) {
             return descriptor.modelDisplayName
         }
         let parsed = ClaudeModelSpecifier(raw: specifier)
-        guard let definition = definition(forBaseModelRaw: parsed.baseModel, store: store) else {
+        guard let definition = definition(forBaseModelRaw: parsed.baseModel, store: store, cliStore: cliStore) else {
             if let baseModel = parsed.baseModel,
-               let pointRelease = ClaudeModelFamilyCatalog.pointRelease(baseModel)
+               let pointRelease = ClaudeModelFamilyCatalog.cliPointRelease(baseModel)
             {
                 if let effort = parsed.explicitEffortLevel {
                     return "Claude Code \(pointRelease.generatedDisplayName) \(effort.displayName)"
@@ -176,11 +185,12 @@ enum ClaudeCodeAIModelCatalog {
     }
 
     static func modelsForPicker(
-        store: AnthropicDiscoveredModelStore = .shared
+        store: AnthropicDiscoveredModelStore = .shared,
+        cliStore: ClaudeCLIDiscoveredModelStore = .shared
     ) -> [AIModel] {
         var models: [AIModel] = [.claudeCode]
         var seenRawValues = Set(models.map { $0.rawValue.lowercased() })
-        for definition in effectiveDefinitions(store: store) {
+        for definition in effectiveDefinitions(store: store, cliStore: cliStore) {
             let baseModel = legacyModel(forBaseModelRaw: definition.runtimeModelRaw)
                 ?? .claudeCodeModel(specifier: definition.runtimeModelRaw)
             if seenRawValues.insert(baseModel.rawValue.lowercased()).inserted {
@@ -230,9 +240,10 @@ enum ClaudeCodeAIModelCatalog {
 
     static func menu(
         for models: [AIModel],
-        store: AnthropicDiscoveredModelStore = .shared
+        store: AnthropicDiscoveredModelStore = .shared,
+        cliStore: ClaudeCLIDiscoveredModelStore = .shared
     ) -> AIModel.ClaudeCodePickerMenu {
-        let definitions = effectiveDefinitions(store: store)
+        let definitions = effectiveDefinitions(store: store, cliStore: cliStore)
         let sortedModels = models
             .filter { $0.providerType == .claudeCode }
             .sorted { modelPrecedes($0, $1, definitions: definitions) }
@@ -319,9 +330,10 @@ enum ClaudeCodeAIModelCatalog {
     static func modelPrecedes(
         _ lhs: AIModel,
         _ rhs: AIModel,
-        store: AnthropicDiscoveredModelStore = .shared
+        store: AnthropicDiscoveredModelStore = .shared,
+        cliStore: ClaudeCLIDiscoveredModelStore = .shared
     ) -> Bool {
-        modelPrecedes(lhs, rhs, definitions: effectiveDefinitions(store: store))
+        modelPrecedes(lhs, rhs, definitions: effectiveDefinitions(store: store, cliStore: cliStore))
     }
 
     /// Definitions-taking variant so multi-comparison callers (sorting, menu
@@ -359,14 +371,18 @@ enum ClaudeCodeAIModelCatalog {
     }
 
     static func effectiveDefinitions(
-        store: AnthropicDiscoveredModelStore = .shared
+        store: AnthropicDiscoveredModelStore = .shared,
+        cliStore: ClaudeCLIDiscoveredModelStore = .shared
     ) -> [ModelDefinition] {
         let registry = store.revisionedModels
+        let cliRegistry = cliStore.revisionedModels
 
         effectiveDefinitionsCacheLock.lock()
         if let cached = effectiveDefinitionsCache,
            cached.store === store,
-           cached.revision == registry.revision
+           cached.revision == registry.revision,
+           cached.cliStore === cliStore,
+           cached.cliRevision == cliRegistry.revision
         {
             effectiveDefinitionsCacheLock.unlock()
             return cached.definitions
@@ -376,7 +392,7 @@ enum ClaudeCodeAIModelCatalog {
         let staticRawValues = Set(modelDefinitions.map {
             normalizedSpecifier($0.runtimeModelRaw)
         })
-        let dynamicDefinitions = registry.models.compactMap { model -> ModelDefinition? in
+        var dynamicDefinitions = registry.models.compactMap { model -> ModelDefinition? in
             guard let pointRelease = ClaudeModelFamilyCatalog.pointRelease(model.id),
                   !staticRawValues.contains(normalizedSpecifier(model.id))
             else {
@@ -392,6 +408,17 @@ enum ClaudeCodeAIModelCatalog {
             )
         }
 
+        var seen = staticRawValues.union(dynamicDefinitions.map(\.runtimeModelRaw))
+        for id in cliRegistry.modelIDs {
+            guard seen.insert(id).inserted,
+                  let release = ClaudeModelFamilyCatalog.cliPointRelease(id) else { continue }
+            dynamicDefinitions.append(ModelDefinition(
+                runtimeModelRaw: id,
+                displayName: release.generatedDisplayName,
+                supportedEfforts: release.family.supportedEfforts
+            ))
+        }
+
         let staticPositions = Dictionary(uniqueKeysWithValues: modelDefinitions.enumerated().map {
             (normalizedSpecifier($0.element.runtimeModelRaw), $0.offset)
         })
@@ -403,6 +430,8 @@ enum ClaudeCodeAIModelCatalog {
         effectiveDefinitionsCache = EffectiveDefinitionsCacheEntry(
             store: store,
             revision: registry.revision,
+            cliStore: cliStore,
+            cliRevision: cliRegistry.revision,
             definitions: definitions
         )
         effectiveDefinitionsCacheLock.unlock()
@@ -414,12 +443,12 @@ enum ClaudeCodeAIModelCatalog {
         _ rhs: ModelDefinition,
         staticPositions: [String: Int]
     ) -> Bool {
-        let leftFamily = ClaudeModelFamilyCatalog.family(for: lhs.runtimeModelRaw)
-        let rightFamily = ClaudeModelFamilyCatalog.family(for: rhs.runtimeModelRaw)
+        let leftFamily = ClaudeModelFamilyCatalog.cliFamily(for: lhs.runtimeModelRaw)
+        let rightFamily = ClaudeModelFamilyCatalog.cliFamily(for: rhs.runtimeModelRaw)
 
         if let leftFamily, let rightFamily, leftFamily.identity == rightFamily.identity {
-            let leftPointRelease = ClaudeModelFamilyCatalog.pointRelease(lhs.runtimeModelRaw)
-            let rightPointRelease = ClaudeModelFamilyCatalog.pointRelease(rhs.runtimeModelRaw)
+            let leftPointRelease = ClaudeModelFamilyCatalog.cliPointRelease(lhs.runtimeModelRaw)
+            let rightPointRelease = ClaudeModelFamilyCatalog.cliPointRelease(rhs.runtimeModelRaw)
             switch (leftPointRelease, rightPointRelease) {
             case let (.some(left), .some(right)):
                 return ClaudeModelFamilyCatalog.pointReleasePrecedes(left, right)
@@ -498,9 +527,10 @@ enum ClaudeCodeAIModelCatalog {
 
     private static func definition(
         forBaseModelRaw raw: String?,
-        store: AnthropicDiscoveredModelStore
+        store: AnthropicDiscoveredModelStore,
+        cliStore: ClaudeCLIDiscoveredModelStore
     ) -> ModelDefinition? {
-        definition(forBaseModelRaw: raw, definitions: effectiveDefinitions(store: store))
+        definition(forBaseModelRaw: raw, definitions: effectiveDefinitions(store: store, cliStore: cliStore))
     }
 
     private static func definition(

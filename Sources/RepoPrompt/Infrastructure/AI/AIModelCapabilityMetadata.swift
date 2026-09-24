@@ -93,7 +93,7 @@ enum AIModelCapabilityMetadata {
                 return (resolved.contextWindowTokens, .exact)
             }
             if let baseModel = ClaudeModelSpecifier(raw: specifier).baseModel,
-               let familyContextWindow = ClaudeModelFamilyCatalog.pointRelease(baseModel)?
+               let familyContextWindow = ClaudeModelFamilyCatalog.cliPointRelease(baseModel)?
                .family.contextWindowTokens
             {
                 return (familyContextWindow, .exact)

@@ -800,7 +800,7 @@ final class AgentRuntimeSidebarViewModel: ObservableObject {
             // 200K provider fallback below.
             if selectedAgent == .claudeCode,
                let baseModel = ClaudeModelSpecifier(raw: selectedModelRaw).baseModel,
-               let familyContextWindow = ClaudeModelFamilyCatalog.pointRelease(baseModel)?
+               let familyContextWindow = ClaudeModelFamilyCatalog.cliPointRelease(baseModel)?
                .family.contextWindowTokens
             {
                 return familyContextWindow
