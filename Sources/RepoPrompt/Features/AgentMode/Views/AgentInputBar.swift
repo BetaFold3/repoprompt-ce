@@ -16,6 +16,8 @@ struct AgentComposerActions {
     let retrieveDraft: (_ tabID: UUID) -> String
     let claimSubmit: (_ attempt: AgentComposerSubmitAttempt) -> AgentModeViewModel.AgentComposerSubmitClaimResult
     let executeSubmit: (_ claim: AgentModeViewModel.AgentComposerSubmitClaim, _ text: String) async -> AgentModeViewModel.UserTurnSubmissionResult
+    let scheduledSend: AgentScheduledSendActions
+    let staleResetRecovery: AgentStaleResetRecoveryActions
     let cancelRun: (_ target: AgentRunCancelTarget) async -> Void
     let attachImages: (_ tabID: UUID, _ urls: [URL]) -> Void
     let removeImage: (_ tabID: UUID, _ attachmentID: UUID) -> Void
@@ -198,6 +200,61 @@ struct AgentInputBar: View {
             executeSubmit: { claim, text in
                 await agentModeVM.executeComposerSubmitAttempt(text: text, claim: claim)
             },
+            scheduledSend: AgentScheduledSendActions(
+                executeSchedule: { claim, text, notBefore, runAlongsideOtherSessions in
+                    await agentModeVM.executeComposerScheduleAttempt(
+                        text: text,
+                        notBefore: notBefore,
+                        runAlongsideOtherSessions: runAlongsideOtherSessions,
+                        claim: claim
+                    )
+                },
+                update: {
+                    tabID,
+                    scheduleID,
+                    text,
+                    notBefore,
+                    runAlongsideOtherSessions,
+                    removingImageAttachmentIDs,
+                    removingTaggedFileAttachmentIDs in
+                    await agentModeVM.updateScheduledSend(
+                        tabID: tabID,
+                        scheduleID: scheduleID,
+                        text: text,
+                        notBefore: notBefore,
+                        runAlongsideOtherSessions: runAlongsideOtherSessions,
+                        removingImageAttachmentIDs: removingImageAttachmentIDs,
+                        removingTaggedFileAttachmentIDs: removingTaggedFileAttachmentIDs
+                    )
+                },
+                cancel: { tabID, scheduleID in
+                    await agentModeVM.cancelScheduledSend(
+                        tabID: tabID,
+                        scheduleID: scheduleID
+                    )
+                },
+                sendNow: { tabID, scheduleID, runAlongsideOtherSessions in
+                    await agentModeVM.sendScheduledSendNow(
+                        tabID: tabID,
+                        scheduleID: scheduleID,
+                        runAlongsideOtherSessions: runAlongsideOtherSessions
+                    )
+                },
+                discardUnreadable: { tabID in
+                    await agentModeVM.discardUnreadableScheduledSend(tabID: tabID)
+                },
+                retrySaving: { tabID in
+                    await agentModeVM.retryScheduledSendSaving(tabID: tabID)
+                }
+            ),
+            staleResetRecovery: AgentStaleResetRecoveryActions(
+                reloadLatest: { tabID, recoveryID in
+                    await agentModeVM.reloadLatestForStaleResetRecovery(tabID: tabID, recoveryID: recoveryID)
+                },
+                retryStopping: { tabID, recoveryID in
+                    await agentModeVM.retryStaleResetRecoveryStop(tabID: tabID, recoveryID: recoveryID)
+                }
+            ),
             cancelRun: { target in _ = await agentModeVM.cancelAgentRun(target: target) },
             attachImages: { tabID, urls in agentModeVM.attachImages(tabID: tabID, urls: urls) },
             removeImage: { tabID, attachmentID in agentModeVM.removePendingImage(tabID: tabID, attachmentID: attachmentID) },
@@ -459,6 +516,40 @@ struct AgentComposerView: View, Equatable {
             && !submissionLatch.isLatched(for: currentTabID)
     }
 
+    private var renderedScheduledSend: AgentScheduledSendProps? {
+        guard let scheduledSend = props.scheduledSend,
+              scheduledSend.tabID == props.currentTabID,
+              scheduledSend.tabID == currentTabID
+        else { return nil }
+        return scheduledSend
+    }
+
+    private var renderedStaleResetRecovery: AgentStaleResetRecoveryProps? {
+        guard let recovery = props.staleResetRecovery,
+              recovery.tabID == props.currentTabID,
+              recovery.tabID == currentTabID
+        else { return nil }
+        return recovery
+    }
+
+    private var hasSchedulableContent: Bool {
+        !localInputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            || hasPendingAttachments
+    }
+
+    private var canScheduleToRenderedTarget: Bool {
+        props.canSchedule
+            && renderedScheduledSend == nil
+            && hasSchedulableContent
+            && props.canSendWithCurrentProvider
+            && renderedSubmitTarget != nil
+            && !submissionLatch.isLatched(for: currentTabID)
+    }
+
+    private var isNewSessionScheduleTarget: Bool {
+        props.scheduleTargetIsNewSessionStart
+    }
+
     private var localInputTextBinding: Binding<String> {
         Binding(
             get: { localInputText },
@@ -500,11 +591,22 @@ struct AgentComposerView: View, Equatable {
         return steeringUnsupportedInfoBoxHeight + AgentAttachmentStripLayout.composerVerticalSpacingWhenPresent
     }
 
+    private var scheduledSendBannerReservedHeight: CGFloat {
+        guard renderedScheduledSend != nil else { return 0 }
+        return 48 + AgentAttachmentStripLayout.composerVerticalSpacingWhenPresent
+    }
+
+    private var staleResetRecoveryBannerReservedHeight: CGFloat {
+        guard renderedStaleResetRecovery != nil else { return 0 }
+        return 48 + AgentAttachmentStripLayout.composerVerticalSpacingWhenPresent
+    }
+
     private var mainContentHeight: CGFloat {
         editorTextFieldHeight + AgentAttachmentStripLayout.reservedHeight(
             hasImages: hasPendingImageAttachments,
             hasTaggedFiles: hasPendingTaggedFileAttachments
-        ) + steeringUnsupportedInfoBoxReservedHeight
+        ) + steeringUnsupportedInfoBoxReservedHeight + scheduledSendBannerReservedHeight
+            + staleResetRecoveryBannerReservedHeight
     }
 
     private var composerChromeVerticalPadding: CGFloat {
@@ -727,6 +829,20 @@ struct AgentComposerView: View, Equatable {
 
     private var mainContent: some View {
         VStack(alignment: .leading, spacing: AgentAttachmentStripLayout.composerVerticalSpacingWhenPresent) {
+            if let staleResetRecovery = renderedStaleResetRecovery {
+                AgentStaleResetRecoveryBanner(
+                    props: staleResetRecovery,
+                    actions: actions.staleResetRecovery
+                )
+            }
+
+            if let scheduledSend = renderedScheduledSend {
+                AgentScheduledSendBanner(
+                    props: scheduledSend,
+                    actions: actions.scheduledSend
+                )
+            }
+
             if hasSteeringUnsupportedNotice {
                 steeringUnsupportedInfoBox
             }
@@ -840,22 +956,52 @@ struct AgentComposerView: View, Equatable {
                     transaction.animation = nil
                 }
 
-                if let cancelTarget = props.cancelTarget {
-                    CancelButton(action: { cancelRun(cancelTarget) })
-                } else {
-                    SendOrResendButton(
-                        inputText: localInputText,
-                        hasMessages: false, // Disable resend in agent mode - just show greyed send button
-                        sendWhenEmpty: hasPendingAttachments,
-                        sendTooltip: "Send Message",
-                        foregroundColor: .accentColor,
-                        sendAction: sendMessage,
-                        resendAction: {}
-                    )
-                    .disabled(!canSubmitToRenderedTarget)
-                    .transaction { transaction in
-                        transaction.animation = nil
+                HStack(spacing: props.cancelTarget == nil ? 0 : 8) {
+                    if let cancelTarget = props.cancelTarget {
+                        CancelButton(action: { cancelRun(cancelTarget) })
+                    } else {
+                        SendOrResendButton(
+                            inputText: localInputText,
+                            hasMessages: false, // Disable resend in agent mode - just show greyed send button
+                            sendWhenEmpty: hasPendingAttachments,
+                            sendTooltip: "Send Message",
+                            foregroundColor: .accentColor,
+                            sendAction: sendMessage,
+                            resendAction: {}
+                        )
+                        .disabled(!canSubmitToRenderedTarget)
+
+                        Divider()
+                            .frame(height: 24)
                     }
+
+                    ScheduleSendMenuButton(
+                        isEnabled: canScheduleToRenderedTarget,
+                        isNewSessionStart: isNewSessionScheduleTarget,
+                        hasExistingScheduledSend: renderedScheduledSend != nil,
+                        isDetached: props.cancelTarget != nil,
+                        onSchedule: { notBefore, runAlongsideOtherSessions in
+                            scheduleMessage(
+                                notBefore: notBefore,
+                                runAlongsideOtherSessions: runAlongsideOtherSessions
+                            )
+                        }
+                    )
+                }
+                .background {
+                    if props.cancelTarget == nil {
+                        Capsule()
+                            .fill(Color.secondary.opacity(0.035))
+                    }
+                }
+                .overlay {
+                    if props.cancelTarget == nil {
+                        Capsule()
+                            .stroke(Color.secondary.opacity(0.1), lineWidth: 0.5)
+                    }
+                }
+                .transaction { transaction in
+                    transaction.animation = nil
                 }
             }
             .fixedSize(horizontal: true, vertical: false)
@@ -2120,6 +2266,69 @@ struct AgentComposerView: View, Equatable {
     }
 
     // MARK: - Actions
+
+    private func scheduleMessage(
+        notBefore: Date,
+        runAlongsideOtherSessions: Bool
+    ) {
+        guard !submissionLatch.isLatched(for: currentTabID) else {
+            logViewSubmitRejection(reason: "local_attempt_latched", target: renderedSubmitTarget)
+            return
+        }
+        guard canScheduleToRenderedTarget else { return }
+
+        let rawDraftSnapshot = localInputText
+        let trimmed = rawDraftSnapshot.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty || hasPendingAttachments else { return }
+        guard let submitTarget = renderedSubmitTarget else {
+            logViewSubmitRejection(reason: "view_nil_target", target: props.submitTarget)
+            showSteeringUnsupportedNotice(Self.staleSubmitTargetMessage)
+            return
+        }
+        guard let attempt = submissionLatch.begin(
+            target: submitTarget,
+            rawDraftSnapshot: rawDraftSnapshot
+        ) else {
+            logViewSubmitRejection(reason: "local_attempt_latched", target: submitTarget)
+            return
+        }
+
+        actions.storeDraft(attempt.sourceTabID, rawDraftSnapshot)
+        switch actions.claimSubmit(attempt) {
+        case let .claimed(claim):
+            Task { @MainActor in
+                let submissionResult = await actions.scheduledSend.executeSchedule(
+                    claim,
+                    trimmed,
+                    notBefore,
+                    runAlongsideOtherSessions
+                )
+                let effects = submissionLatch.complete(
+                    attempt,
+                    result: submissionResult,
+                    currentTabID: currentTabID,
+                    currentRawDraft: localInputText
+                )
+                guard effects.matchedAttempt else {
+                    logViewSubmitRejection(reason: "stale_schedule_completion", target: attempt.target)
+                    return
+                }
+                if effects.shouldClearInput {
+                    setLocalInputText("")
+                    resetTextFieldTrigger.toggle()
+                }
+                if let blockedMessage = effects.blockedMessage {
+                    showSteeringUnsupportedNotice(blockedMessage)
+                }
+            }
+        case let .rejected(rejection):
+            submissionLatch.cancel(attempt)
+            if case .activeAttemptExists = rejection {
+                return
+            }
+            showSteeringUnsupportedNotice(Self.staleSubmitTargetMessage)
+        }
+    }
 
     private func sendMessage() {
         guard !submissionLatch.isLatched(for: currentTabID) else {

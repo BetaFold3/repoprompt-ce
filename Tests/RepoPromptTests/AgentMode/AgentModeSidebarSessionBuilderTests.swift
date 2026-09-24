@@ -452,6 +452,166 @@ final class AgentModeSidebarSessionBuilderTests: XCTestCase {
         )
     }
 
+    func testUnhydratedScheduledEntrySurvivesThreadedRowCopyAndSearch() throws {
+        let parentTabID = id(60)
+        let childTabID = id(61)
+        let parentSessionID = id(160)
+        let childSessionID = id(161)
+        let due = date(1_800_000_000)
+        let rows = build(
+            tabs: [
+                tab(parentTabID, sessionID: parentSessionID),
+                tab(childTabID, sessionID: childSessionID)
+            ],
+            sessionIndex: sessionIndex([
+                entry(parentSessionID, tabID: parentTabID, lastUserMessageAt: date(100)),
+                entry(
+                    childSessionID,
+                    tabID: childTabID,
+                    parentSessionID: parentSessionID,
+                    lastUserMessageAt: nil,
+                    scheduledSendSummary: scheduledSummary(state: .scheduled, notBefore: due)
+                )
+            ])
+        )
+
+        let child = try row(for: childTabID, in: rows)
+        XCTAssertEqual(child.depth, 1)
+        XCTAssertEqual(child.scheduledSendStatus, .pending(due))
+        XCTAssertTrue(child.searchFields.fields.map(\.text).contains("scheduled"))
+        XCTAssertTrue(AgentModeSidebarSessionBuilder.sessionIndexEntryHasConversationContent(
+            entry(
+                childSessionID,
+                tabID: childTabID,
+                lastUserMessageAt: nil,
+                scheduledSendSummary: scheduledSummary(state: .scheduled, notBefore: due)
+            )
+        ))
+    }
+
+    func testHydratedNilSuppressesStaleScheduledBadgeTitleAndSearch() throws {
+        let tabID = id(62)
+        let sessionID = id(162)
+        let tab = ComposeTabState(
+            id: tabID,
+            name: "New Session",
+            lastModified: date(1),
+            activeAgentSessionID: sessionID
+        )
+        var staleEntry = entry(sessionID, tabID: tabID, lastUserMessageAt: nil)
+        staleEntry.name = "New Session"
+        staleEntry.scheduledSendSummary = scheduledSummary(state: .scheduled, notBefore: date(200))
+        staleEntry.lastScheduledDispatch = receipt()
+
+        let unhydrated = liveSession(
+            tabID: tabID,
+            sessionID: sessionID,
+            lastUserMessageAt: nil,
+            hydrated: false
+        )
+        let unhydratedRow = try row(
+            for: tabID,
+            in: build(tabs: [tab], sessions: [tabID: unhydrated], sessionIndex: sessionIndex([staleEntry]))
+        )
+        XCTAssertEqual(unhydratedRow.title, "New Session")
+        XCTAssertEqual(unhydratedRow.scheduledSendStatus, .pending(date(200)))
+        XCTAssertTrue(unhydratedRow.searchFields.fields.map(\.text).contains("scheduled"))
+
+        unhydrated.hasLoadedPersistedState = true
+        let liveReceipt = receipt()
+        unhydrated.lastScheduledDispatch = liveReceipt
+        let liveRow = try row(
+            for: tabID,
+            in: build(tabs: [tab], sessions: [tabID: unhydrated], sessionIndex: sessionIndex([staleEntry]))
+        )
+        XCTAssertEqual(liveRow.scheduledSendStatus, .sent(liveReceipt))
+        XCTAssertTrue(liveRow.searchFields.fields.map(\.text).contains("scheduled"))
+
+        unhydrated.lastScheduledDispatch = nil
+        let hydratedRow = try row(
+            for: tabID,
+            in: build(tabs: [tab], sessions: [tabID: unhydrated], sessionIndex: sessionIndex([staleEntry]))
+        )
+        XCTAssertEqual(hydratedRow.title, "New Chat")
+        XCTAssertNil(hydratedRow.scheduledSendStatus)
+        XCTAssertFalse(hydratedRow.searchFields.fields.map(\.text).contains("scheduled"))
+    }
+
+    func testNoIndexEntryHistoricalReceiptRetainsDefaultTitleAndStatus() throws {
+        let tabID = id(64)
+        let sessionID = id(164)
+        let tab = ComposeTabState(
+            id: tabID,
+            name: "New Session",
+            lastModified: date(1),
+            activeAgentSessionID: sessionID
+        )
+        let live = liveSession(tabID: tabID, sessionID: sessionID, lastUserMessageAt: nil)
+        let emptyRow = try row(
+            for: tabID,
+            in: build(tabs: [tab], sessions: [tabID: live], sessionIndex: [:])
+        )
+        XCTAssertEqual(emptyRow.title, "New Chat")
+        XCTAssertNil(emptyRow.scheduledSendStatus)
+
+        let sentReceipt = receipt()
+        live.lastScheduledDispatch = sentReceipt
+        let historicalRow = try row(
+            for: tabID,
+            in: build(tabs: [tab], sessions: [tabID: live], sessionIndex: [:])
+        )
+        XCTAssertEqual(historicalRow.title, "New Session")
+        XCTAssertEqual(historicalRow.scheduledSendStatus, .sent(sentReceipt))
+        XCTAssertTrue(historicalRow.searchFields.fields.map(\.text).contains("scheduled"))
+    }
+
+    func testScheduledAttentionOverridesHistoryAndHistoricalClockRemainsSearchable() throws {
+        let tabID = id(63)
+        let sessionID = id(163)
+        let sentReceipt = receipt()
+        let cases: [(AgentSessionScheduledSendSummary?, AgentSidebarScheduledSendStatus?, Bool, String)] = [
+            (scheduledSummary(state: .needsConfirmation), .needsConfirmation(date(200)), true, "Needs confirmation"),
+            (scheduledSummary(state: .failed), .failed(date(200)), true, "Send failed"),
+            (scheduledSummary(state: .dispatching), .dispatching(date(200)), false, "Sending"),
+            (scheduledSummary(state: .scheduled), .pending(date(200)), false, "Scheduled for"),
+            (scheduledSummary(unreadable: true), .unreadable, true, "Unreadable")
+        ]
+        for (summary, expected, attention, text) in cases {
+            let indexed = entry(
+                sessionID,
+                tabID: tabID,
+                lastUserMessageAt: nil,
+                scheduledSendSummary: summary,
+                lastScheduledDispatch: sentReceipt
+            )
+            let projected = try row(
+                for: tabID,
+                in: build(tabs: [tab(tabID, sessionID: sessionID)], sessionIndex: sessionIndex([indexed]))
+            )
+            XCTAssertEqual(projected.scheduledSendStatus, expected)
+            XCTAssertEqual(projected.scheduledSendStatus?.needsAttention, attention)
+            XCTAssertTrue(projected.scheduledSendStatus?.tooltipText.contains(text) == true)
+            XCTAssertTrue(projected.searchFields.fields.map(\.text).contains("scheduled"))
+            XCTAssertTrue(AgentModeSidebarSessionBuilder.sessionIndexEntryHasConversationContent(indexed))
+        }
+
+        let historical = entry(
+            sessionID,
+            tabID: tabID,
+            lastUserMessageAt: nil,
+            lastScheduledDispatch: sentReceipt
+        )
+        let projected = try row(
+            for: tabID,
+            in: build(tabs: [tab(tabID, sessionID: sessionID)], sessionIndex: sessionIndex([historical]))
+        )
+        XCTAssertEqual(projected.scheduledSendStatus, .sent(sentReceipt))
+        XCTAssertFalse(try XCTUnwrap(projected.scheduledSendStatus).needsAttention)
+        XCTAssertTrue(projected.scheduledSendStatus?.tooltipText.contains("Sent") == true)
+        XCTAssertTrue(projected.searchFields.fields.map(\.text).contains("scheduled"))
+        XCTAssertTrue(AgentModeSidebarSessionBuilder.sessionIndexEntryHasConversationContent(historical))
+    }
+
     private func build(
         tabs: [ComposeTabState],
         sessions: [UUID: AgentModeViewModel.TabSession] = [:],
@@ -479,14 +639,15 @@ final class AgentModeSidebarSessionBuilderTests: XCTestCase {
         tabID: UUID,
         sessionID: UUID,
         parentSessionID: UUID? = nil,
-        lastUserMessageAt: Date
+        lastUserMessageAt: Date?,
+        hydrated: Bool = true
     ) -> AgentModeViewModel.TabSession {
         let session = AgentModeViewModel.TabSession(tabID: tabID)
         session.testInstallPersistentSessionBinding(sessionID: sessionID)
         session.parentSessionID = parentSessionID
-        session.hasLoadedPersistedState = true
+        session.hasLoadedPersistedState = hydrated
         session.lastUserMessageAt = lastUserMessageAt
-        session.lastActivityAt = lastUserMessageAt
+        session.lastActivityAt = lastUserMessageAt ?? date(1)
         return session
     }
 
@@ -511,7 +672,9 @@ final class AgentModeSidebarSessionBuilderTests: XCTestCase {
         parentSessionID: UUID? = nil,
         lastUserMessageAt: Date?,
         savedAt: Date? = nil,
-        remoteHostName: String? = nil
+        remoteHostName: String? = nil,
+        scheduledSendSummary: AgentSessionScheduledSendSummary? = nil,
+        lastScheduledDispatch: AgentScheduledSendProvenance? = nil
     ) -> AgentSessionIndexEntry {
         AgentSessionIndexEntry(
             id: sessionID,
@@ -532,7 +695,37 @@ final class AgentModeSidebarSessionBuilderTests: XCTestCase {
             isMCPOriginated: false,
             origin: nil,
             worktreeBindingSummaries: [],
-            activeWorktreeMergeSummaries: []
+            activeWorktreeMergeSummaries: [],
+            scheduledSendSummary: scheduledSendSummary,
+            lastScheduledDispatch: lastScheduledDispatch
+        )
+    }
+
+    private func scheduledSummary(
+        state: AgentScheduledSendPersist.State = .scheduled,
+        notBefore: Date? = nil,
+        unreadable: Bool = false
+    ) -> AgentSessionScheduledSendSummary {
+        AgentSessionScheduledSendSummary(
+            id: unreadable ? nil : UUID(),
+            createdAt: unreadable ? nil : date(100),
+            updatedAt: unreadable ? nil : date(150),
+            notBefore: unreadable ? nil : (notBefore ?? date(200)),
+            stateRaw: unreadable ? nil : state.rawValue,
+            confirmationReasonRaw: nil,
+            isNewSessionStart: true,
+            runAlongsideOtherSessions: false,
+            previewText: unreadable ? "" : "Send later",
+            isUnreadable: unreadable
+        )
+    }
+
+    private func receipt() -> AgentScheduledSendProvenance {
+        AgentScheduledSendProvenance(
+            scheduleID: UUID(),
+            attemptID: UUID(),
+            scheduledFor: date(100),
+            sentAt: date(120)
         )
     }
 

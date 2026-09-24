@@ -3075,7 +3075,7 @@ final class AgentRunMCPToolServiceWaitTests: XCTestCase {
         let window = makeWindow()
         defer { WindowStatesManager.shared.unregisterWindowState(window) }
         let viewModel = makeViewModel(windowID: window.windowID)
-        let session = await viewModel.ensureSessionReady(tabID: UUID())
+        let session = try await viewModel.ensureSessionReady(tabID: UUID())
         let interactionID = UUID()
 
         session.pendingInteractionResolutionAttribution = "remote:aaaa1111"
@@ -3091,7 +3091,7 @@ final class AgentRunMCPToolServiceWaitTests: XCTestCase {
         let window = makeWindow()
         defer { WindowStatesManager.shared.unregisterWindowState(window) }
         let viewModel = makeViewModel(windowID: window.windowID)
-        let session = await viewModel.ensureSessionReady(tabID: UUID())
+        let session = try await viewModel.ensureSessionReady(tabID: UUID())
         let interactionID = UUID()
 
         viewModel.recordMCPInteractionResolution(for: session, interactionID: interactionID)
@@ -3370,7 +3370,7 @@ final class AgentRunMCPToolServiceWaitTests: XCTestCase {
         liveSnapshots: LiveSnapshots
     ) async throws -> RunningSessionFixture {
         let sessionID = UUID()
-        let session = await viewModel.ensureSessionReady(tabID: UUID())
+        let session = try! await viewModel.ensureSessionReady(tabID: UUID())
         _ = viewModel.test_installPersistentSessionBinding(sessionID: sessionID, on: session)
         try await viewModel.mcpActivateControlContext(
             forTabID: session.tabID,

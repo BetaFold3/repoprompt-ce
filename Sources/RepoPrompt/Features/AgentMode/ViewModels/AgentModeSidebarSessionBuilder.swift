@@ -73,7 +73,11 @@ struct AgentModeSidebarSessionBuilder {
     }
 
     static func sessionIndexEntryHasConversationContent(_ entry: AgentSessionIndexEntry) -> Bool {
-        entry.itemCount > 0 || entry.lastUserMessageAt != nil || entry.hasUnknownConversationContent
+        entry.itemCount > 0
+            || entry.lastUserMessageAt != nil
+            || entry.hasUnknownConversationContent
+            || entry.scheduledSendSummary != nil
+            || entry.lastScheduledDispatch != nil
     }
 
     private func makeBuildContext() -> BuildContext {
@@ -253,7 +257,9 @@ struct AgentModeSidebarSessionBuilder {
             origin: entry.origin,
             profile: entry.profile,
             worktreeBindingSummaries: entry.worktreeBindingSummaries,
-            activeWorktreeMergeSummaries: entry.activeWorktreeMergeSummaries
+            activeWorktreeMergeSummaries: entry.activeWorktreeMergeSummaries,
+            scheduledSendSummary: entry.scheduledSendSummary,
+            lastScheduledDispatch: entry.lastScheduledDispatch
         )
     }
 
@@ -315,6 +321,11 @@ struct AgentModeSidebarSessionBuilder {
         let remoteHostName = metadataLiveSession?.remoteHost?.hostDisplayName ?? entry?.remoteHostName
         let worktree = sidebarRowWorktree(liveSession: metadataLiveSession, entry: entry)
         let mergeAttention = sidebarRowWorktreeMergeAttention(liveSession: metadataLiveSession, entry: entry)
+        let scheduledSendStatus = AgentSidebarScheduledSendStatus(
+            summary: metadataLiveSession.map { AgentSessionScheduledSendSummary.make(from: $0.scheduledSend) }
+                ?? entry?.scheduledSendSummary,
+            lastDispatch: metadataLiveSession.map(\.lastScheduledDispatch) ?? entry?.lastScheduledDispatch
+        )
         let searchFields = Self.searchFields(
             title: title,
             entry: entry,
@@ -322,6 +333,7 @@ struct AgentModeSidebarSessionBuilder {
             isMCPControlled: isMCPControlled,
             worktree: worktree,
             mergeAttention: mergeAttention,
+            scheduledSendStatus: scheduledSendStatus,
             sessionID: resolvedSessionID,
             tabID: tab.id
         )
@@ -343,6 +355,7 @@ struct AgentModeSidebarSessionBuilder {
             remoteControlDeviceDisplayName: remoteControlDeviceDisplayName,
             worktree: worktree,
             worktreeMergeAttention: mergeAttention,
+            scheduledSendStatus: scheduledSendStatus,
             searchFields: searchFields
         )
     }
@@ -424,7 +437,8 @@ struct AgentModeSidebarSessionBuilder {
         }
         let hasTranscript = liveSession?.items.isEmpty == false
         let hasSentUserMessage = context.sortDateByTabID[tab.id] != nil
-        return (!hasTranscript && !hasSentUserMessage)
+        let hasScheduledSend = liveSession?.scheduledSend != nil || liveSession?.lastScheduledDispatch != nil
+        return (!hasTranscript && !hasSentUserMessage && !hasScheduledSend)
             ? emptySidebarTitle(named: context.tabNameByID[tab.id])
             : (context.tabNameByID[tab.id] ?? Self.normalizedSessionTitle(nil))
     }
@@ -439,7 +453,12 @@ struct AgentModeSidebarSessionBuilder {
         }
         let hasTranscript = (liveSession?.items.isEmpty == false) || entry.itemCount > 0
         let hasSentUserMessage = entry.lastUserMessageAt != nil
-        if !hasTranscript, !hasSentUserMessage, !entry.hasUnknownConversationContent {
+        let hasScheduledSend = if liveSession?.hasLoadedPersistedState == true {
+            liveSession?.scheduledSend != nil || liveSession?.lastScheduledDispatch != nil
+        } else {
+            entry.scheduledSendSummary != nil || entry.lastScheduledDispatch != nil
+        }
+        if !hasTranscript, !hasSentUserMessage, !entry.hasUnknownConversationContent, !hasScheduledSend {
             return emptySidebarTitle(named: entry.name)
         }
         return Self.normalizedSessionTitle(entry.name)
@@ -486,6 +505,7 @@ struct AgentModeSidebarSessionBuilder {
         isMCPControlled: Bool,
         worktree: AgentWorktreeIndicator?,
         mergeAttention: AgentWorktreeMergeAttention?,
+        scheduledSendStatus: AgentSidebarScheduledSendStatus?,
         sessionID: UUID?,
         tabID: UUID
     ) -> AgentSessionSearchFields {
@@ -497,7 +517,8 @@ struct AgentModeSidebarSessionBuilder {
                 runState?.searchLabel,
                 entry?.lastRunStateRaw,
                 isMCPControlled ? "MCP" : nil,
-                mergeAttention == nil ? nil : "merge"
+                mergeAttention == nil ? nil : "merge",
+                scheduledSendStatus == nil ? nil : "scheduled"
             ],
             model: [
                 entry?.agentKindRaw,
@@ -791,6 +812,7 @@ struct AgentModeSidebarSessionBuilder {
             remoteControlDeviceDisplayName: session.remoteControlDeviceDisplayName,
             worktree: session.worktree,
             worktreeMergeAttention: session.worktreeMergeAttention,
+            scheduledSendStatus: session.scheduledSendStatus,
             searchFields: session.searchFields
         )
     }

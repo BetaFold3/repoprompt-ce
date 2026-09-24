@@ -315,7 +315,7 @@ final class RemoteAgentSessionControllerSettleTests: XCTestCase {
     }
 
     @MainActor
-    func testEnsureDerivedTranscriptCurrentForExportRefreshesTerminalStaleTranscript() async {
+    func testEnsureDerivedTranscriptCurrentForExportRefreshesTerminalStaleTranscript() async throws {
         let viewModel = AgentModeViewModel(
             testWindowID: 1,
             testWorkspacePath: FileManager.default.currentDirectoryPath,
@@ -323,7 +323,7 @@ final class RemoteAgentSessionControllerSettleTests: XCTestCase {
         )
         let tabID = UUID()
         viewModel.test_setCurrentTabIDOverride(tabID)
-        let session = await viewModel.ensureSessionReady(tabID: tabID)
+        let session = try await viewModel.ensureSessionReady(tabID: tabID)
         session.runState = .running
         session.setItemsSilently([
             .user("Prompt", sequenceIndex: 0),

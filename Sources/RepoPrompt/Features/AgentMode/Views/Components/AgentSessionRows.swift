@@ -6,6 +6,39 @@ struct AgentRemoteControlDeviceBadgeText: Equatable {
     let statusPlateTooltip: String
 }
 
+extension AgentSidebarScheduledSendStatus {
+    var tooltipText: String {
+        func scheduledText(_ date: Date?) -> String {
+            date.map { "Scheduled for \(AgentScheduledSendDateFormatting.dateAndTime($0))" }
+                ?? "Scheduled message"
+        }
+        switch self {
+        case let .pending(date):
+            return scheduledText(date)
+        case let .dispatching(date):
+            return scheduledText(date) + " · Sending"
+        case let .needsConfirmation(date):
+            return scheduledText(date) + " · Needs confirmation"
+        case let .failed(date):
+            return scheduledText(date) + " · Send failed"
+        case .unreadable:
+            return "Unreadable scheduled message · Open chat to review"
+        case let .sent(provenance):
+            return "Scheduled for \(AgentScheduledSendDateFormatting.dateAndTime(provenance.scheduledFor))"
+                + " · Sent \(AgentScheduledSendDateFormatting.dateAndTime(provenance.sentAt))"
+        }
+    }
+
+    var needsAttention: Bool {
+        switch self {
+        case .needsConfirmation, .failed, .unreadable:
+            true
+        case .pending, .dispatching, .sent:
+            false
+        }
+    }
+}
+
 // MARK: - Agent Session Row
 
 struct AgentSessionRow: View {
@@ -33,6 +66,7 @@ struct AgentSessionRow: View {
     /// it through the row's hover tooltip and accessibility label without
     /// shifting layout — see `mergeAttentionBadge`.
     var worktreeMergeAttention: AgentWorktreeMergeAttention?
+    var scheduledSendStatus: AgentSidebarScheduledSendStatus?
     let threadDepth: Int
     var hasThreadChildren: Bool = false
     var isThreadCollapsed: Bool = false
@@ -187,6 +221,10 @@ struct AgentSessionRow: View {
                         .lineLimit(1)
                         .truncationMode(.tail)
 
+                    if let scheduledSendStatus {
+                        scheduledSendBadge(for: scheduledSendStatus)
+                    }
+
                     if isPinned {
                         Image(systemName: "pin.fill")
                             .font(.system(size: pinFontSize))
@@ -301,7 +339,7 @@ struct AgentSessionRow: View {
         }
         .onHover { isHovered = $0 }
         .onTapGesture { onSelect() }
-        .accessibilityLabel(title)
+        .accessibilityLabel(scheduledSendStatus.map { "\(title), \($0.tooltipText)" } ?? title)
         .popover(isPresented: $showDeleteConfirmation, attachmentAnchor: .rect(.bounds), arrowEdge: .bottom) {
             VStack(alignment: .leading, spacing: 12) {
                 Text("Delete chat?")
@@ -508,6 +546,17 @@ struct AgentSessionRow: View {
     /// plate. Orange is the same hue used elsewhere for MCP affordances
     /// (file drawer chips, in-progress streaming badge, etc).
     private static let mcpAccentColor = Color.orange
+
+    private func scheduledSendBadge(for status: AgentSidebarScheduledSendStatus) -> some View {
+        let isHistorical = if case .sent = status { true } else { false }
+        return Image(systemName: status.needsAttention ? "exclamationmark.circle.fill" : "clock")
+            .font(.system(size: pinFontSize))
+            .foregroundStyle(
+                status.needsAttention ? Color.orange : Color.secondary.opacity(isHistorical ? 0.55 : 0.9)
+            )
+            .hoverTooltip(status.tooltipText)
+            .accessibilityLabel(status.tooltipText)
+    }
 
     // MARK: - Unified status plate
 

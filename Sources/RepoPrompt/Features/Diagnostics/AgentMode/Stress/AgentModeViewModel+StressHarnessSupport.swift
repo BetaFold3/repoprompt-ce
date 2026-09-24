@@ -14,12 +14,12 @@
         }
 
         func testBindSessionToActiveSessionProxies(tabID: UUID) async {
-            let session = await ensureSessionReady(tabID: tabID)
+            guard let session = try? await ensureSessionReady(tabID: tabID) else { return }
             applySessionToBindings(session)
         }
 
         func testPrepareStressSession(tabID: UUID) async {
-            let session = await ensureSessionReady(tabID: tabID)
+            guard let session = try? await ensureSessionReady(tabID: tabID) else { return }
             session.selectedAgent = .codexExec
             session.selectedModelRaw = defaultModelRaw(for: .codexExec)
             session.selectedReasoningEffortRaw = nil
@@ -42,7 +42,7 @@
         }
 
         func testResetStressTranscript(tabID: UUID) async {
-            let session = await ensureSessionReady(tabID: tabID)
+            guard let session = try? await ensureSessionReady(tabID: tabID) else { return }
             session.setItemsSilently([], reason: .stressHarnessReset)
             session.clearDerivedTranscriptCaches()
             session.pendingAskUser = nil
@@ -121,7 +121,7 @@
             text: String,
             urgentUIRefresh: Bool = true
         ) {
-            let session = session(for: tabID)
+            guard let session = session(for: tabID, createIfNeeded: false) else { return }
             let item: AgentChatItem = switch role {
             case .user:
                 .user(text, sequenceIndex: session.nextSequenceIndex)
@@ -143,7 +143,7 @@
             delta: String,
             urgentUIRefresh: Bool = true
         ) {
-            let session = session(for: tabID)
+            guard let session = session(for: tabID, createIfNeeded: false) else { return }
             let fullBindingSyncCount = test_updateBindingsCallCount
             guard applyAssistantDelta(delta, session: session) else { return }
             session.assistantDeltaFlushGeneration &+= 1
@@ -162,7 +162,7 @@
             tabID: UUID,
             urgentUIRefresh: Bool = true
         ) {
-            let session = session(for: tabID)
+            guard let session = session(for: tabID, createIfNeeded: false) else { return }
             let fullBindingSyncCount = test_updateBindingsCallCount
             endActiveAssistantSegment(session)
             session.assistantDeltaFlushGeneration &+= 1
@@ -183,7 +183,7 @@
             statusText: String?,
             urgentUIRefresh: Bool = true
         ) {
-            let session = session(for: tabID)
+            guard let session = session(for: tabID, createIfNeeded: false) else { return }
             session.runState = state
             session.runningStatusText = statusText
             requestUIRefresh(tabID: tabID, urgent: urgentUIRefresh)
@@ -194,7 +194,7 @@
             if reset {
                 await testResetStressTranscript(tabID: tabID)
             }
-            let session = await ensureSessionReady(tabID: tabID)
+            guard let session = try? await ensureSessionReady(tabID: tabID) else { return [:] }
             session.selectedAgent = .codexExec
             session.selectedModelRaw = defaultModelRaw(for: .codexExec)
             session.runState = .completed
@@ -345,6 +345,7 @@
             enum StressHarnessPersistenceError: Error {
                 case noActiveWorkspace
                 case missingComposeTab(UUID)
+                case sessionUnavailable(UUID)
                 case missingWorkspaceRoot
                 case missingFixture(String)
                 case invalidFixture(String, Error)
@@ -471,7 +472,9 @@
                     autoEditEnabled: agentSession.autoEditEnabled
                 )
 
-                let liveSession = session(for: tabID)
+                guard let liveSession = session(for: tabID, createIfNeeded: true) else {
+                    throw StressHarnessPersistenceError.sessionUnavailable(tabID)
+                }
                 _ = test_installPersistentSessionBinding(
                     sessionID: agentSession.id,
                     on: liveSession,

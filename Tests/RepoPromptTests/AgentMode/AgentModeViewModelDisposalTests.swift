@@ -43,7 +43,7 @@ final class AgentModeViewModelDisposalTests: XCTestCase {
     private func makeSubscribedWeakViewModel() async -> SubscribedViewModelFixture {
         let approvalStore = ApplyEditsApprovalStore()
         let viewModel = makeViewModel(applyEditsApprovalStore: approvalStore)
-        let session = await viewModel.ensureSessionReady(tabID: UUID())
+        let session = try! await viewModel.ensureSessionReady(tabID: UUID())
 
         for _ in 0 ..< 100 where session.applyEditsApprovalSubscriptionID == nil {
             await Task.yield()

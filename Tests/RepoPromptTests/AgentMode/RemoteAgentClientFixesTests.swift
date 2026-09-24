@@ -201,6 +201,7 @@ final class RemoteAgentClientFixesTests: XCTestCase {
         let payload = AgentSessionHydrationPayload(
             sessionID: prepared.sessionID,
             persistedSession: persistedSession,
+            persistenceState: prepared.persistenceState,
             canonicalLiveItems: persistedSession.items.map { $0.toItem() },
             transcript: prepared.transcript,
             builtPresentation: prepared.builtPresentation,
@@ -437,6 +438,7 @@ final class RemoteAgentClientFixesTests: XCTestCase {
         let payload = AgentSessionHydrationPayload(
             sessionID: prepared.sessionID,
             persistedSession: loadedSession,
+            persistenceState: prepared.persistenceState,
             canonicalLiveItems: [original],
             transcript: prepared.transcript,
             builtPresentation: prepared.builtPresentation,
@@ -539,6 +541,7 @@ final class RemoteAgentClientFixesTests: XCTestCase {
         let payload = AgentSessionHydrationPayload(
             sessionID: prepared.sessionID,
             persistedSession: decoded,
+            persistenceState: prepared.persistenceState,
             canonicalLiveItems: decoded.items.map { $0.toItem() },
             transcript: prepared.transcript,
             builtPresentation: prepared.builtPresentation,
@@ -1009,7 +1012,7 @@ final class RemoteAgentClientFixesTests: XCTestCase {
             codexControllerFactory: { _, _, _, _, _, _ in ClientFixesNoopCodexController() }
         )
         viewModel.test_setCurrentTabIDOverride(tabID)
-        let session = await viewModel.ensureSessionReady(tabID: tabID)
+        let session = try! await viewModel.ensureSessionReady(tabID: tabID)
         session.remoteHost = Self.makeBinding(hostID: "metadata-host", remoteSessionID: "metadata-remote")
         let coordinator = RemoteAgentModeCoordinator(catalogProvider: { _ in catalog })
         coordinator.attach(viewModel: viewModel)

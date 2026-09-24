@@ -255,8 +255,8 @@ final class AgentChatTitlebarSafetyTests: XCTestCase {
             )
 
             let viewModel = window.agentModeViewModel
-            let sessionA = viewModel.session(for: tabAID)
-            _ = viewModel.session(for: tabBID)
+            let sessionA = try XCTUnwrap(viewModel.session(for: tabAID, createIfNeeded: true))
+            _ = try XCTUnwrap(viewModel.session(for: tabBID, createIfNeeded: true))
             viewModel.setAgentModeActive(true)
             viewModel.test_setCurrentTabIDOverride(tabAID)
             window.setAgentTitlebarAccessoryVisible(true, onNewSession: {})

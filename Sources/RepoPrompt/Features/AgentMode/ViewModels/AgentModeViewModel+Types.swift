@@ -36,7 +36,48 @@ protocol AgentModeRunInteractionStateObserving: AnyObject {
 extension AgentModeViewModel {
     enum UserTurnSubmissionResult: Equatable {
         case submitted
+        case scheduled(id: UUID)
         case blocked(message: String)
+    }
+
+    /// Origin of a prepared user turn (plan §3.3). `.scheduled` carries the frozen record and
+    /// the persisted attempt whose `itemID` becomes the optimistic bubble's identity; it never
+    /// reads or clears composer pending state.
+    enum UserTurnInputSource {
+        case composer
+        case scheduled(record: AgentScheduledSendPersist, attempt: AgentScheduledSendPersist.Attempt)
+    }
+
+    /// Result of the shared append seam used by composer, MCP, and scheduled turns.
+    struct PreparedUserTurnAppend {
+        let userItem: AgentChatItem
+        /// Provider text before workflow wrapping (native slash provider text or the typed text,
+        /// interview-first preamble included when consumed). Remote start naming derives from it.
+        let effectiveUserText: String
+        let wrappedText: String
+        let codexCompactionInFlight: Bool
+        let stagedCodexComputerUseActivationID: UUID?
+    }
+
+    /// View-model projection of a provider-accepted scheduled turn whose durable finalization is
+    /// owned by the process coordinator. Carries the shared recovery identity and immutable
+    /// evidence for UI only; it owns no retry policy, persistence revision, or release decision.
+    struct ScheduledSendPendingFinalization: Equatable {
+        let key: AgentScheduledSendRecoveryKey
+        let lease: AgentScheduledSendAdmissionLease
+        let attempt: AgentScheduledSendPersist.Attempt
+        let receipt: AgentScheduledSendProvenance
+        /// Immutable snapshot of the accepted user item (already stamped with `receipt`).
+        let acceptedItem: AgentChatItem
+        var status: AgentScheduledSendRecoveryPhase
+
+        var scheduleID: UUID {
+            lease.scheduleID
+        }
+
+        var admittedUpdatedAt: Date {
+            lease.admittedUpdatedAt
+        }
     }
 
     struct AgentComposerSubmitClaim {
@@ -118,15 +159,236 @@ extension AgentModeViewModel {
         let requestedSessionID: UUID
     }
 
+    struct SessionPersistenceContext: Equatable {
+        let workspace: WorkspaceModel
+        let workspaceOwner: SessionIndexOwner?
+
+        var workspaceID: UUID {
+            workspace.id
+        }
+    }
+
+    enum SessionAccessError: Error, Equatable {
+        case tabUnavailable(tabID: UUID)
+        case removalInProgress(tabID: UUID, operationID: UUID)
+        case ownerChanged(tabID: UUID)
+    }
+
     struct SessionSaveCommitToken: Equatable {
         let tabID: UUID
         let sessionIdentity: ObjectIdentifier
         let workspaceID: UUID
+        let workspaceOwner: SessionIndexOwner?
         let binding: AgentPersistentSessionBindingIdentity
         let bindingTransitionGeneration: UInt64
         let sourceItemsRevision: Int
         let persistenceMutationGeneration: UInt64
         let saveRequestGeneration: UInt64
+    }
+
+    /// Owner-fenced record of a committed peer transcript reset discovered by this owner's own
+    /// save. The complete local working view stays in the `TabSession` (retained, never given a
+    /// fresh stamp); only an explicitly confirmed paired reload replaces it.
+    struct StaleResetRecovery: Equatable {
+        /// Replacement permit captured when the user confirms "Reload latest…": the payload may
+        /// only be applied while the local view is exactly what the user saw when confirming.
+        struct ConsentRevision: Equatable {
+            let sourceItemsRevision: Int
+            let persistenceMutationGeneration: UInt64
+        }
+
+        enum Phase: Equatable {
+            /// The old run is being stopped through the ordinary cancellation/terminal lifecycle.
+            /// A non-nil problem means the single stop attempt did not reach quiescence.
+            case stopping(problem: String?)
+            /// Ingestion is quiescent; the retained view is unsavable until an explicit reload.
+            /// A non-nil problem reports the last failed reload attempt.
+            case retained(problem: String?)
+            /// One confirmed paired read is in flight under the captured permit.
+            case reloading(attemptID: UUID, consent: ConsentRevision)
+        }
+
+        let id: UUID
+        let tabID: UUID
+        let sessionIdentity: ObjectIdentifier
+        let binding: AgentPersistentSessionBindingIdentity
+        let bindingTransitionGeneration: UInt64
+        let workspaceID: UUID
+        let workspaceOwner: SessionIndexOwner?
+        /// The rejected lifetime/reset state, kept for comparison only (never save authority).
+        let rejectedPersistenceState: AgentSessionPersistenceState
+        /// Reset generation reported by the failed save; a replacement must cover it.
+        let observedResetGeneration: UInt64
+        var phase: Phase
+    }
+
+    /// Removal admission recorded by the pre-destructive preflight for every target tab: the
+    /// recovery episode (if any) the user consented to discard. The final removal boundary
+    /// revalidates the tab against it; an episode first discovered after the preflight is not
+    /// covered and vetoes the removal.
+    struct StaleResetRemovalAdmission: Equatable {
+        let id: UUID
+        /// The removal operation this admission belongs to.
+        let operationID: UUID
+        /// Session object and binding the admission was granted for; a replaced owner or a
+        /// changed binding is not covered.
+        let sessionIdentity: ObjectIdentifier
+        let binding: AgentPersistentSessionBindingIdentity?
+        let transitionGeneration: UInt64
+        let consentedEpisodeID: UUID?
+        /// Set when the owning operation's commit begins: rebinding and new work are refused and
+        /// no debounced save is scheduled (the operation's final save owns durability).
+        var isReserved: Bool = false
+        /// How the operation's final save for this owner settled.
+        enum FinalSaveKind: Equatable {
+            /// Nothing was dirty (or persistence is suppressed): the live state is the durable state.
+            case clean
+            /// A snapshot was durably written; `finalSaveRevision`/`finalSaveMutationGeneration`
+            /// identify exactly that snapshot, not the live state observed afterwards.
+            case written
+            /// The save discovered a committed peer reset: the owner entered stop-and-retain and is
+            /// judged by consent, never by settlement.
+            case recovery
+            /// Dirty state that could not be written (no authority, missing file, deferred).
+            case unsaved
+        }
+
+        /// Content revision of the snapshot the operation's final save made durable (or of the
+        /// clean live state); a live revision that differs is not settled.
+        var finalSaveRevision: Int?
+        /// Persistence-mutation generation of that same snapshot.
+        var finalSaveMutationGeneration: UInt64?
+        var finalSaveKind: FinalSaveKind?
+        /// Set after the operation's final save: no later save may run for this owner.
+        var isFinalSaveCompleted: Bool = false
+        /// Set synchronously by the final batch commit: the owner is retired for removal.
+        var isCommitted: Bool = false
+
+        /// No debounced save may be scheduled once the operation owns durability for this owner.
+        var blocksScheduledSaves: Bool {
+            isReserved || isFinalSaveCompleted || isCommitted
+        }
+    }
+
+    /// Result of one paired load operation. `attemptID` is the immutable identity of the load
+    /// that produced it; callers compare it with the session's current attempt before acting on
+    /// the outcome, so an obsolete (cancelled or superseded) load can never change a newer
+    /// load's readiness or published outcome.
+    struct PersistedLoadOutcome: Equatable {
+        let attemptID: UUID?
+        let disposition: TabSession.PersistedLoadDisposition
+    }
+
+    /// Operation-owned compose-tab removal batch: the complete requested tab set with each
+    /// target's ownership state captured before the first admission await (a live owner with its
+    /// binding/transition identity, or explicit absence), the workspace owner captured at entry,
+    /// the admitted targets, and the verdict — scoped to this operation rather than to whatever
+    /// object currently occupies a tab ID or whichever workspace is active later.
+    @MainActor
+    final class ComposeTabRemovalOperation {
+        /// Ownership observed at admission entry, before any await.
+        struct EntryOwner {
+            let session: TabSession
+            let binding: AgentPersistentSessionBindingIdentity?
+            let transitionGeneration: UInt64
+        }
+
+        struct Target {
+            let tabID: UUID
+            let session: TabSession
+            let binding: AgentPersistentSessionBindingIdentity?
+            let transitionGeneration: UInt64
+            let admissionID: UUID
+            let consentedEpisodeID: UUID?
+        }
+
+        struct CleanupDescriptor {
+            let tabID: UUID
+            let session: TabSession?
+            let boundSessionID: UUID?
+            let runID: UUID?
+            let approvalScope: ApplyEditsApprovalScope
+            let approvalSubscriptionID: UUID?
+            let approvalScopeGeneration: UInt64?
+            let mcpContext: AgentMCPControlContext?
+            var deletionCandidates: [AgentSessionDeletionCandidate]
+            var deletionDiscoverySucceeded = true
+        }
+
+        enum Phase: Equatable {
+            case admitted
+            case preparing
+            case prepared
+            case committed
+            case cleaning
+            case finished
+            case aborted
+        }
+
+        let id: UUID
+        let reason: PromptViewModel.ComposeTabRemovalReason
+        /// Workspace/storage owner captured before admission. Every persistence action
+        /// uses this value and never reacquires the active workspace.
+        let persistenceContext: SessionPersistenceContext
+        let requestedTabIDs: Set<UUID>
+        let requestedStashedTabIDs: Set<UUID>
+        /// Requested tabs that had no live session at entry; they must still have none at commit.
+        let absentTabIDs: Set<UUID>
+        let targets: [Target]
+        var cleanupDescriptorsByTabID: [UUID: CleanupDescriptor] = [:]
+        var phase: Phase = .admitted
+        var cleanupTask: Task<Void, Never>?
+        var cleanupFailures: [String] = []
+        var isCallerFinalized = false
+
+        var workspace: WorkspaceModel {
+            persistenceContext.workspace
+        }
+
+        var workspaceID: UUID {
+            persistenceContext.workspaceID
+        }
+
+        init(
+            id: UUID,
+            reason: PromptViewModel.ComposeTabRemovalReason,
+            persistenceContext: SessionPersistenceContext,
+            requestedTabIDs: Set<UUID>,
+            requestedStashedTabIDs: Set<UUID>,
+            absentTabIDs: Set<UUID>,
+            targets: [Target]
+        ) {
+            self.id = id
+            self.reason = reason
+            self.persistenceContext = persistenceContext
+            self.requestedTabIDs = requestedTabIDs
+            self.requestedStashedTabIDs = requestedStashedTabIDs
+            self.absentTabIDs = absentTabIDs
+            self.targets = targets
+        }
+    }
+
+    /// Confirmation request issued before a lifecycle operation would destroy or replace a tab
+    /// whose retained local conversation cannot be saved.
+    struct AgentStaleResetDiscardRequest: Equatable {
+        let tabCount: Int
+        /// Human-readable operation, e.g. "Closing the tab".
+        let operation: String
+
+        var title: String {
+            tabCount == 1 ? "Discard the unsaved conversation?" : "Discard \(tabCount) unsaved conversations?"
+        }
+
+        var message: String {
+            let subject = tabCount == 1
+                ? "This session has a local conversation that could not be saved after it was reset in another window."
+                : "\(tabCount) sessions have local conversations that could not be saved after they were reset in another window."
+            return "\(subject) \(operation) will discard that local conversation permanently."
+        }
+
+        var confirmButtonTitle: String {
+            "Discard and Continue"
+        }
     }
 
     enum PersistentBindingResolution: Equatable {
@@ -687,6 +949,7 @@ extension AgentModeViewModel {
         /// the session has an awaiting-approval, conflicted, or
         /// awaiting-commit merge operation; nil otherwise.
         let worktreeMergeAttention: AgentWorktreeMergeAttention?
+        let scheduledSendStatus: AgentSidebarScheduledSendStatus?
         let threadKey: AgentSidebarThreadKey?
         let hasThreadChildren: Bool
         let isThreadCollapsed: Bool
@@ -716,6 +979,7 @@ extension AgentModeViewModel {
             remoteControlDeviceDisplayName: String? = nil,
             worktree: AgentWorktreeIndicator? = nil,
             worktreeMergeAttention: AgentWorktreeMergeAttention? = nil,
+            scheduledSendStatus: AgentSidebarScheduledSendStatus? = nil,
             threadKey: AgentSidebarThreadKey? = nil,
             hasThreadChildren: Bool = false,
             isThreadCollapsed: Bool = false,
@@ -740,6 +1004,7 @@ extension AgentModeViewModel {
             self.remoteControlDeviceDisplayName = remoteControlDeviceDisplayName
             self.worktree = worktree
             self.worktreeMergeAttention = worktreeMergeAttention
+            self.scheduledSendStatus = scheduledSendStatus
             self.threadKey = threadKey
             self.hasThreadChildren = hasThreadChildren
             self.isThreadCollapsed = isThreadCollapsed

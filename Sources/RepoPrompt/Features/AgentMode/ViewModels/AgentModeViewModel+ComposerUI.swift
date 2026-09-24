@@ -25,6 +25,29 @@ extension AgentModeViewModel {
         let submitTarget = makeComposerSubmitTarget(tabID: tabID, session: session)
         let remoteCatalog = remoteHostCatalogSnapshot(for: session)
         let isRemoteSession = session?.remoteHost != nil
+        let scheduledSend: AgentScheduledSendProps? = session.flatMap { session in
+            switch session.scheduledSend {
+            case nil:
+                nil
+            case .unreadable?:
+                AgentScheduledSendProps.unreadable(tabID: session.tabID)
+            case let .v1(record)?:
+                AgentScheduledSendProps(
+                    tabID: session.tabID,
+                    scheduledSend: record,
+                    blockingSessionName: scheduledSendBlockingSessionName(
+                        for: record,
+                        session: session
+                    ),
+                    recoveryPhase: session.scheduledSendPendingFinalization?.status,
+                    pendingConfirmation: session.activeAgentSessionID.flatMap { sessionID in
+                        scheduledSendCoordinator?.pendingConfirmationStatus(sessionID: sessionID)
+                    }.flatMap { $0.scheduleID == record.id ? $0 : nil }
+                )
+            }
+        }
+        let canSchedule = canScheduleSend(tabID: tabID, session: session)
+        let scheduleTargetIsNewSessionStart = scheduleTargetIsNewSessionStart(tabID: tabID, session: session)
         let selectedModelRawForProps = session?.selectedModelRaw ?? selectedModelRaw
         let selectedModelDisplayNameForProps = remoteCatalog?.displayName(forModelID: selectedModelRawForProps)
             ?? selectedModelDisplayName
@@ -36,6 +59,10 @@ extension AgentModeViewModel {
                 imageAttachments: pendingImageAttachments,
                 taggedFileAttachments: pendingTaggedFileAttachments
             ),
+            scheduledSend: scheduledSend,
+            staleResetRecovery: session.flatMap { staleResetRecoveryProps(for: $0) },
+            canSchedule: canSchedule,
+            scheduleTargetIsNewSessionStart: scheduleTargetIsNewSessionStart,
             runState: runState,
             cancelTarget: cancelTarget,
             isAgentBusy: isAgentBusy,
@@ -69,10 +96,37 @@ extension AgentModeViewModel {
         )
     }
 
+    private func scheduledSendBlockingSessionName(
+        for scheduledSend: AgentScheduledSendPersist,
+        session: TabSession
+    ) -> String? {
+        guard scheduledSend.firstEligibleAt != nil else { return nil }
+        if !scheduledSend.isNewSessionStart {
+            return scheduledSendSessionName(session)
+        }
+
+        for (candidateTabID, candidateSession) in sessions where candidateTabID != session.tabID {
+            if scheduledSendBusyState(tabID: candidateTabID).isBusy {
+                return scheduledSendSessionName(candidateSession)
+            }
+        }
+        return nil
+    }
+
+    private func scheduledSendSessionName(_ session: TabSession) -> String? {
+        guard let sessionID = session.activeAgentSessionID,
+              let name = sessionIndex[sessionID]?.name.trimmingCharacters(in: .whitespacesAndNewlines),
+              !name.isEmpty
+        else { return nil }
+        return name
+    }
+
     func makeComposerSubmitTarget(tabID: UUID?, session: TabSession?) -> AgentComposerSubmitTarget? {
         guard let tabID else { return nil }
         let existingSession = session ?? sessions[tabID]
-        let resolvedSession = existingSession ?? self.session(for: tabID)
+        guard let resolvedSession = existingSession ?? self.session(for: tabID, createIfNeeded: true) else {
+            return nil
+        }
         // V1-3: the default tab of a fresh workspace never passes through
         // `createAndActivateSessionTab()` — its session materializes lazily
         // right here on the first composer sync. Apply the workspace-default
@@ -136,6 +190,9 @@ extension AgentModeViewModel {
             test_syncComposerCallCount += 1
         #endif
         ui.composer.update(makeComposerProps(tabID: tabID))
+        if let observedTabID = tabID ?? currentTabID {
+            notifyScheduledSendBusyStateMayHaveChanged(tabIDs: [observedTabID])
+        }
     }
 
     func syncAllActiveUIState(tabID: UUID? = nil) {

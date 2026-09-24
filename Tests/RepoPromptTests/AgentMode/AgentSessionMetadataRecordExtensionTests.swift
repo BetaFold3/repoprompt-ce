@@ -31,6 +31,9 @@ final class AgentSessionMetadataRecordExtensionTests: XCTestCase {
         XCTAssertEqual(record.toolCallCount, 0)
         XCTAssertNil(record.firstActivityAt)
         XCTAssertNil(record.lastActivityAt)
+        XCTAssertNil(record.scheduledSendSummary)
+        XCTAssertNil(record.lastScheduledDispatch)
+        XCTAssertFalse(record.hasUnreadableScheduledSend)
     }
 
     func testDecodingPresentKeyPathsAndDurationFields() throws {
@@ -702,6 +705,104 @@ final class AgentSessionMetadataRecordExtensionTests: XCTestCase {
         XCTAssertFalse(base.matchesIndexedSessionMetadata(differentDuration))
         XCTAssertFalse(base.matchesIndexedSessionMetadata(differentToolCount))
         XCTAssertFalse(base.matchesIndexedSessionMetadata(differentActivityBounds))
+    }
+
+    func testScheduledProjectionBoundsPreviewAndPreservesHistoryThroughIndexAndEntry() throws {
+        XCTAssertEqual(AgentSessionMetadataIndex.currentSchemaVersion, 7)
+        let tabID = UUID()
+        let scheduledFor = Date(timeIntervalSince1970: 1_800_000_000)
+        let schedule = AgentScheduledSendPersist(
+            id: UUID(),
+            createdAt: scheduledFor.addingTimeInterval(-60),
+            updatedAt: scheduledFor.addingTimeInterval(-30),
+            notBefore: scheduledFor,
+            state: .scheduled,
+            confirmationReason: nil,
+            rawText: String(repeating: "x", count: 140),
+            attachments: [],
+            taggedFileAttachments: [],
+            workflow: nil,
+            interviewFirst: false,
+            isNewSessionStart: true,
+            runAlongsideOtherSessions: false,
+            firstEligibleAt: nil,
+            attempt: nil,
+            lastFailureMessage: nil
+        )
+        let receipt = AgentScheduledSendProvenance(
+            scheduleID: UUID(),
+            attemptID: UUID(),
+            scheduledFor: scheduledFor.addingTimeInterval(-3600),
+            sentAt: scheduledFor.addingTimeInterval(-3500)
+        )
+        let session = AgentSession(
+            composeTabID: tabID,
+            name: "Scheduled",
+            scheduledSend: .v1(schedule),
+            lastScheduledDispatch: receipt
+        )
+        let record = AgentSessionMetadataRecord.record(
+            from: session,
+            fileURL: URL(fileURLWithPath: "/tmp/scheduled.json"),
+            observedFileSize: nil,
+            observedFileModificationDate: nil
+        )
+        let summary = try XCTUnwrap(record.scheduledSendSummary)
+        XCTAssertEqual(summary.previewText, String(repeating: "x", count: 120))
+        XCTAssertEqual(summary.id, schedule.id)
+        XCTAssertEqual(summary.notBefore, scheduledFor)
+        XCTAssertFalse(record.hasUnreadableScheduledSend)
+        XCTAssertEqual(record.lastScheduledDispatch, receipt)
+        let entry = try XCTUnwrap(record.sidebarEntry())
+        XCTAssertEqual(entry.scheduledSendSummary, summary)
+        XCTAssertEqual(entry.lastScheduledDispatch, receipt)
+
+        let index = AgentSessionMetadataIndex(entries: [record])
+        let decoded = try JSONDecoder().decode(
+            AgentSessionMetadataIndex.self,
+            from: JSONEncoder().encode(index)
+        )
+        XCTAssertEqual(decoded.schemaVersion, 7)
+        XCTAssertEqual(decoded.entries.first?.scheduledSendSummary, summary)
+        XCTAssertEqual(decoded.entries.first?.lastScheduledDispatch, receipt)
+        var changedSummary = record
+        changedSummary.scheduledSendSummary = nil
+        var changedHistory = record
+        changedHistory.lastScheduledDispatch = nil
+        XCTAssertFalse(record.matchesIndexedSessionMetadata(changedSummary))
+        XCTAssertFalse(record.matchesIndexedSessionMetadata(changedHistory))
+    }
+
+    func testUnreadableScheduledProjectionRetainsAttentionAndHistory() throws {
+        let receipt = AgentScheduledSendProvenance(
+            scheduleID: UUID(),
+            attemptID: UUID(),
+            scheduledFor: Date(timeIntervalSince1970: 100),
+            sentAt: Date(timeIntervalSince1970: 120)
+        )
+        let session = AgentSession(
+            composeTabID: UUID(),
+            name: "Unreadable",
+            scheduledSend: .unreadable(.object(["future": .bool(true)])),
+            lastScheduledDispatch: receipt
+        )
+        let record = AgentSessionMetadataRecord.record(
+            from: session,
+            fileURL: URL(fileURLWithPath: "/tmp/unreadable.json"),
+            observedFileSize: nil,
+            observedFileModificationDate: nil
+        )
+        XCTAssertTrue(record.hasUnreadableScheduledSend)
+        XCTAssertTrue(try XCTUnwrap(record.sidebarEntry()).hasUnreadableScheduledSend)
+        XCTAssertEqual(record.lastScheduledDispatch, receipt)
+        XCTAssertEqual(record.scheduledSendSummary?.previewText, "")
+        XCTAssertNil(record.scheduledSendSummary?.placeholderRecord)
+        let decoded = try JSONDecoder().decode(
+            AgentSessionMetadataRecord.self,
+            from: JSONEncoder().encode(record)
+        )
+        XCTAssertTrue(decoded.hasUnreadableScheduledSend)
+        XCTAssertEqual(decoded.lastScheduledDispatch, receipt)
     }
 
     // MARK: - Stub vs Full Session (Rebuild Regression Guard)

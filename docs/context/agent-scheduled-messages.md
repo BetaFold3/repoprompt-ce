@@ -1,0 +1,81 @@
+# Agent Mode scheduled messages
+
+Scope: read when the task touches Agent Mode scheduled or delayed message sending, schedule editing, persistence and dispatch admission, sidebar or message markers, or the Scheduled Messages dashboard.
+Authority: Authoritative
+Last-verified: 2026-09-24
+
+Phases 1–4 are implemented. Identity-verified fresh OracleA and OracleB R1 reviews accepted Phase 4 at code-review level, explicitly closed P4-F1, P4-F2/G1, P4-F4, and P4-F5, found no remaining P0/P1, and required no further loop. This does not claim rendered-UI or live-runtime acceptance. Code and tests remain the behavioral source of truth.
+
+## Product contract
+
+- Scheduling is available for local Agent Mode sessions, for either a new-session first prompt or a follow-up. There is at most one pending scheduled message per session.
+- A scheduled time is a not-before deadline. A due follow-up waits for its own session to become idle. A due new session also waits for the workspace to become idle unless its persisted `runAlongsideOtherSessions` override is enabled.
+- Scheduled text never answers a parked question and never enters steering, pending instructions, or the provider fallback queue as a live composer submission.
+- The persisted record freezes text, image and tagged-file attachments, workflow, and `interviewFirst`. Agent kind, model, reasoning effort, and OMP thinking selection are read live from the session at dispatch.
+- One stable schedule control remains available through Send/Cancel transitions, preserving an open custom popover and its step/toggle state while only the primary control and decoration change. Quick choices are 15 minutes, 30 minutes, 1 hour, 2 hours, and 4 hours; a custom picker covers 15-minute steps through 24 hours.
+- Edit, reschedule, Send now, and Cancel operate in place. Send now still obeys admission; for a new session, the run-alongside override may bypass only the other-session workspace gate.
+- Nothing executes while the app is quit. Remote-host sessions, multiple pending messages per session, provider quota/reset detection, and provider-protocol changes are outside this feature.
+
+## Persistence and state authority
+
+- `AgentScheduledSendPersist` is the durable pending-record authority. Its states are `scheduled`, `needsConfirmation`, `dispatching`, and `failed`; confirmation reasons distinguish closed-app, sleep, clock-change, incomplete-run, unknown-delivery, and unavailable-destination cases.
+- The session member is decoded as either a typed v1 record or an unreadable semantic JSON value. Unreadable or future-shaped data is re-emitted rather than silently dropped and is never dispatched. Unknown state strings normalize to confirmation-required behavior.
+- Agent session serialization remains version 7. The derived metadata index is schema 7 and contains a bounded schedule summary plus `lastScheduledDispatch`; the index is a discovery and presentation hint, never dispatch authority. A schema mismatch rebuilds from schedule-aware session stubs.
+- Schedule mutations use the expected persisted `updatedAt` revision and save immediately. A stale edit is rejected. Failure before the durable commit preserves the composer draft and attachments; index repair after a successful session commit does not turn that mutation back into failure.
+- Pending schedule state survives conversation reset. Forks and handoffs do not copy a pending schedule. Older builds may lose a pending schedule if they resave the session; the unchanged serialization version does not provide downgrade protection.
+- Imported images remain in managed storage until successful dispatch, cancellation, deletion of the persisted session, or a successful attachment-removal edit. Edit cleanup occurs only after the updated schedule is durably committed and does not delete a managed image path still referenced by a retained attachment. Tagged files retain relative-path identity and resolve at dispatch; an unavailable tagged file fails visibly.
+- New-session removal and fallback activation preserve their accepted ownership boundaries: cleanup uses captured approval authority, shared permission restoration is generation-conditional, and application stages revalidate removal owner, mutation owner, captured selection revision, and active-tab membership across suspension points. The synchronous Prompt-and-Agent logical commit is the irreversible boundary; resource cleanup follows it. Fallback activation merges intervening prompt/subview edits while still applying the admitted context, selection, expansion, codemap, slice, and transition state.
+
+## Admission, sleep, and dispatch
+
+- One app-wide `AgentScheduledSendCoordinator` owns timers, wake handling, cross-window busy aggregation, and per-session admission leases. View models are weak dispatch hosts. Before admission, metadata candidates are hydrated and their ID, state, revision, deadline, destination, and ownership are revalidated.
+- Busy includes active run states (including user/question/approval waits), pending approval or user-input/permission requests, pending instructions, unsettled cancellation, and start/dispatch reservations.
+- Due candidates are ordered by deadline, creation time, and ID. At most one workspace-gated new session is admitted per evaluation pass.
+- A deadline crossed during sleep, while closed, or across an uncertain clock gap requires confirmation. Every record overdue at relaunch requires confirmation.
+- A follow-up observed due while continuously awake may wait on its captured blocking run across sleep only if that same run is observed completing in-process and no replacement run intervenes. Failed, cancelled, normalized, or lost run identity requires confirmation. New-session admission rechecks and reserves workspace availability atomically.
+- Dispatch first durably writes a `dispatching` attempt with deterministic item ID, then appends/prepares the user item. Provider acceptance (`.sent` or durable `.queuedFallback`) stamps provenance, records `lastScheduledDispatch`, and clears the pending record. Pre-handoff failure retains or re-arms the schedule; an unaccepted optimistic item is not marked Sent.
+- Restarting with a `dispatching` record produces `needsConfirmation(deliveryUnknown)`; if the deterministic item already exists, presentation warns about duplicate-execution risk. Failed Send now reuses the recorded item ID instead of appending a second bubble.
+
+## Projection and dashboard
+
+- Sidebar projection prefers identity-matched, hydrated live schedule and receipt values, including authoritative `nil`; otherwise it falls back to the metadata index. Pending uses a clock, attention states use an orange marker, and an accepted historical send uses a dim clock. Schedule state also contributes the `scheduled` search token and counts as sidebar content.
+- The user message carries persisted provenance and renders the scheduled-for and sent-at marker. Provenance is not included in provider-facing or handoff text.
+- The Scheduled Messages sheet is opened from the Agent sidebar header. Current-workspace rows combine index hints with hydrated state and process-owned confirmation/recovery obligations, and reuse the durable banner actions.
+- All-workspaces rows are index-only, read-only, and offer Open workspace. Missing or unreadable indexes are shown as incomplete rather than as a false empty result. Foreign workspaces are not hydrated or rebuilt by the dashboard.
+- Dashboard reloads and actions capture workspace/index ownership, revalidate after suspension, and guard against stale publication. Coordinator notifications are coalesced and change-aware. Historical receipts alone do not create pending dashboard rows.
+
+## Phase 4 picker and editing contract
+
+- `ScheduleSendMenuButton` is one stable child outside the Send/Cancel conditional. Changing run state swaps only the primary button and capsule decoration, so the custom popover, selected step, and run-alongside toggle retain identity across the transition.
+- The custom picker starts at 15 minutes and exposes exactly 1–96 fifteen-minute steps. A one-second `TimelineView` recomputes the relative deadline; the preview and Schedule action use the same `notBefore` value. Schedule is disabled if scheduling becomes unavailable, and the composer path revalidates the deadline before installing either route. The actual current-time cap is 24 hours with no extra step of slack.
+- Delay text derives minutes through the shared, clamped `AgentScheduledSendTiming.customDelayMinutes` calculation rather than a view-owned step multiplier.
+- The editor range includes `min(originalNotBefore, now)`, so an original deadline that has passed remains visible. Save-time validation still rejects a stale past selection beyond the one-minute interaction grace and rejects any selection later than actual `now + 24h`.
+- Attachment editing is staged as separate image-attachment and tagged-file removal-ID sets. The preview and empty-content check use retained attachments; opening or refreshing the editor resets the staged IDs.
+- Save filters the persisted record by those removal IDs and commits the updated schedule before cleanup. Managed image files are cleared only after a successful durable commit, and a removed image path stays on disk when another retained attachment uses the same standardized local path. Tagged-file removal changes the record only.
+- A live `dispatching` attempt cannot be edited. The same edit contract is used from the session banner and current-workspace dashboard rows.
+
+## Phase 4 acceptance evidence
+
+- Fresh identity-verified OracleA and OracleB R1 reviews accepted the scoped implementation at code-review level. They closed P4-F1, P4-F2/G1, P4-F4, and P4-F5, established no fix-induced regression or remaining P0/P1, and requested no further loop.
+- Focused validation passed: `AgentScheduledSendDispatchTests` **49** (ticket `4dedb3e2-0e6a-4dea-98c7-b8d71dbaec27`) and unchanged `AgentScheduledMessagesViewModelTests` **9** (ticket `0e3607ce-0622-4963-92fa-663a64ac74d2`).
+- Lint passed (ticket `77ab3f94-265a-4e06-ad9f-aed2815e2446`) and the RepoPrompt product build passed (ticket `243a7962-4ec8-4d85-8bc7-ff84159e46a9`).
+- Final full-root validation passed **6,037/6,037 tests across 568/568 suites with zero final failures** and source/artifact integrity (ticket `be1a63b9-1a43-4117-a4b1-9dfcf75f5109`). `AgentModeRunServiceLifecycleTests`, `RemoteAgentSessionTests`, and `WorkspaceCodemapLocalGitClassificationTests` passed on crash retry, so this was not a zero-retry run. The earlier `2f4b9449-00e4-434c-8b4a-79eacf05b769` run had zero final test failures but exited 67 on a dirty source digest and is not green evidence; `116336b1` was green before remediation.
+- Executable ledger reconciliation passed with exactly **6,132 IDs**.
+
+## Deferred work and validation limits
+
+- No rendered SwiftUI, visible-app, actual provider-runner, live-provider, or physical sleep/wake/lid-close validation is claimed; Phase 4 acceptance is code-review level only.
+- P4-F3 remains report-only: image and tagged-file removal IDs use same-typed positional closure arguments. The reviewed wiring is correct, but no view-wiring regression test exercises those closures. P4-01 also remains report-only: native popover behavior and state retention are not verified by rendering. The R1-N1 helper assertions exercise timing helpers, not rendered F1/F2 behavior, and must not be cited as direct UI regression coverage.
+- R1-N2: the no-animation transaction now also covers Cancel and Send/Cancel transitions. The P4-01 visual check should verify that this does not flatten a required CancelButton effect.
+- R1-N3: if scheduling becomes unavailable while the popover is open, Schedule is disabled without an inline reason; the Menu-label tooltip is not visible inside the popover. No further code change is required for this minor.
+- The sidebar can retain an index-only Sending presentation until hydration. General closed/paged-out restoration, collapsed-child attention aggregation, and a HUD badge remain deferred.
+- All-workspaces remains index-only and does not enrich process-only attention from another workspace. Dashboard coverage does not yet include every noncandidate index update, hydrated unreadable transition, rename, or real rendered workspace-manager/sheet integration path.
+- Provider-specific acceptance semantics, especially durable fallback acknowledgement, still need live validation before historical markers are treated as integration evidence.
+- Automatic quota/reset scheduling remains separate. Historical receipt behavior across reset, fork, and handoff is not redefined by the current projection work.
+
+## Owning seams and focused validation
+
+- Model and persistence: `Sources/RepoPrompt/Features/AgentMode/Models/AgentScheduledSend.swift`, `Runtime/AgentSession.swift`, `Runtime/AgentSessionDataService.swift`, and `Runtime/AgentSessionMetadataIndex.swift`.
+- Admission and dispatch: `Runtime/Scheduling/AgentScheduledSendCoordinator.swift` and `ViewModels/AgentModeViewModel+ScheduledSend.swift`.
+- UI and projection: `Views/AgentInputBar.swift`, `Views/Components/ScheduleSendMenuButton.swift`, `AgentScheduledSendBanner.swift`, `AgentScheduledMessagesView.swift`, `ViewModels/UI/AgentScheduledMessagesViewModel.swift`, and `ViewModels/AgentModeSidebarSessionBuilder.swift`.
+- Smallest regression routes are `make dev-test FILTER=AgentScheduledSendPersistenceTests`, `AgentScheduledSendCoordinatorTests`, `AgentScheduledSendDispatchTests`, `AgentModeSidebarSessionBuilderTests`, and `AgentScheduledMessagesViewModelTests`.

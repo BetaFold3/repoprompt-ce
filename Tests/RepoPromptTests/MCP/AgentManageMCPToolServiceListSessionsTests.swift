@@ -122,14 +122,21 @@ final class AgentManageMCPToolServiceListSessionsTests: XCTestCase {
         state: AgentSessionRunState
     ) async throws -> UUID {
         let sessionID = UUID()
-        let tabID = UUID()
-        let session = await window.agentModeViewModel.ensureSessionReady(tabID: tabID)
+        let session = try await makeRegisteredSession(in: window)
         _ = window.agentModeViewModel.test_installPersistentSessionBinding(sessionID: sessionID, on: session)
         session.parentSessionID = parentSessionID
         session.runState = state
         session.selectedAgent = .codexExec
         session.selectedModelRaw = "codex"
         return sessionID
+    }
+
+    private func makeRegisteredSession(
+        in window: WindowState
+    ) async throws -> AgentModeViewModel.TabSession {
+        await window.promptManager.createBlankComposeTab(createAgentSession: false)
+        let tabID = try XCTUnwrap(window.workspaceManager.activeWorkspace?.activeComposeTabID)
+        return try await window.agentModeViewModel.ensureSessionReady(tabID: tabID)
     }
 
     private func makeWindow() async throws -> WindowState {

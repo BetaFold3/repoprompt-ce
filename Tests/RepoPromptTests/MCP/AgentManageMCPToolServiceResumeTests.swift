@@ -28,7 +28,7 @@ final class AgentManageMCPToolServiceResumeTests: XCTestCase {
         let sessionID = UUID()
         let initialConnectionID = UUID()
         let resumedConnectionID = UUID()
-        let session = await viewModel.ensureSessionReady(tabID: UUID())
+        let session = try await makeRegisteredSession(in: window)
         _ = viewModel.test_installPersistentSessionBinding(sessionID: sessionID, on: session)
         try await viewModel.mcpActivateControlContext(
             forTabID: session.tabID,
@@ -136,7 +136,7 @@ final class AgentManageMCPToolServiceResumeTests: XCTestCase {
 
         let viewModel = window.agentModeViewModel
         let sessionID = UUID()
-        let session = await viewModel.ensureSessionReady(tabID: UUID())
+        let session = try await makeRegisteredSession(in: window)
         _ = viewModel.test_installPersistentSessionBinding(sessionID: sessionID, on: session)
         try await viewModel.mcpActivateControlContext(
             forTabID: session.tabID,
@@ -236,8 +236,8 @@ final class AgentManageMCPToolServiceResumeTests: XCTestCase {
         window.apiSettingsViewModel.isOhMyPiConnected = true
 
         let sessionID = UUID()
-        let tabID = UUID()
-        let session = await window.agentModeViewModel.ensureSessionReady(tabID: tabID)
+        let session = try await makeRegisteredSession(in: window)
+        let tabID = session.tabID
         _ = window.agentModeViewModel.test_installPersistentSessionBinding(sessionID: sessionID, on: session)
         let modelID = AgentModelSelectionID(
             agentRaw: AgentProviderKind.ohMyPi.rawValue,
@@ -285,7 +285,7 @@ final class AgentManageMCPToolServiceResumeTests: XCTestCase {
         let sessionID = UUID()
         let userRowID = UUID()
         let assistantRowID = UUID()
-        let session = await viewModel.ensureSessionReady(tabID: UUID())
+        let session = try await makeRegisteredSession(in: window)
         _ = viewModel.test_installPersistentSessionBinding(sessionID: sessionID, on: session)
         session.runState = .completed
         session.transcript = AgentTranscriptIO.buildTranscript(
@@ -327,7 +327,7 @@ final class AgentManageMCPToolServiceResumeTests: XCTestCase {
 
         let viewModel = window.agentModeViewModel
         let sessionID = UUID()
-        let session = await viewModel.ensureSessionReady(tabID: UUID())
+        let session = try await makeRegisteredSession(in: window)
         _ = viewModel.test_installPersistentSessionBinding(sessionID: sessionID, on: session)
         let service = makeService(window: window, connectionID: UUID())
 
@@ -483,6 +483,14 @@ final class AgentManageMCPToolServiceResumeTests: XCTestCase {
         ])
         XCTAssertEqual(persistedCompletedResult.objectValue?["completed_turn_count"]?.intValue, 1)
         XCTAssertEqual(persistedCompletedResult.objectValue?["returned_turn_count"]?.intValue, 1)
+    }
+
+    private func makeRegisteredSession(
+        in window: WindowState
+    ) async throws -> AgentModeViewModel.TabSession {
+        await window.promptManager.createBlankComposeTab(createAgentSession: false)
+        let tabID = try XCTUnwrap(window.workspaceManager.activeWorkspace?.activeComposeTabID)
+        return try await window.agentModeViewModel.ensureSessionReady(tabID: tabID)
     }
 
     private func makeWindow() async throws -> WindowState {

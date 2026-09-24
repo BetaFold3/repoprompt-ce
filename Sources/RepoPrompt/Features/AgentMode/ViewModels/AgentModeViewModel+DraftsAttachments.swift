@@ -94,7 +94,7 @@ extension AgentModeViewModel {
 
     func attachImages(tabID: UUID, urls: [URL]) {
         guard !urls.isEmpty else { return }
-        let session = session(for: tabID)
+        guard let session = session(for: tabID, createIfNeeded: true) else { return }
         guard let workspaceDirectory = attachmentWorkspaceDirectoryURL() else {
             let errorItem = AgentChatItem.error("Images require an active workspace.", sequenceIndex: session.nextSequenceIndex)
             session.appendItem(errorItem)
@@ -169,7 +169,7 @@ extension AgentModeViewModel {
     }
 
     func removePendingImage(tabID: UUID, attachmentID: UUID) {
-        let session = session(for: tabID)
+        guard let session = session(for: tabID, createIfNeeded: false) else { return }
         let beforeCount = session.pendingImageAttachments.count
         session.pendingImageAttachments.removeAll { $0.id == attachmentID }
         guard session.pendingImageAttachments.count != beforeCount else {
@@ -181,7 +181,7 @@ extension AgentModeViewModel {
     }
 
     func clearPendingImages(tabID: UUID) {
-        let session = session(for: tabID)
+        guard let session = session(for: tabID, createIfNeeded: false) else { return }
         guard !session.pendingImageAttachments.isEmpty else {
             return
         }
@@ -195,7 +195,7 @@ extension AgentModeViewModel {
         let trimmedPath = relativePath.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedPath.isEmpty else { return }
         let normalizedPath = Self.unescapeTaggedPath(trimmedPath)
-        let session = session(for: tabID)
+        guard let session = session(for: tabID, createIfNeeded: true) else { return }
         if session.pendingTaggedFileAttachments.contains(where: { $0.relativePath == normalizedPath }) {
             return
         }
@@ -221,7 +221,7 @@ extension AgentModeViewModel {
     }
 
     func removePendingTaggedFile(tabID: UUID, attachmentID: UUID) {
-        let session = session(for: tabID)
+        guard let session = session(for: tabID, createIfNeeded: false) else { return }
         let beforeCount = session.pendingTaggedFileAttachments.count
         session.pendingTaggedFileAttachments.removeAll { $0.id == attachmentID }
         guard session.pendingTaggedFileAttachments.count != beforeCount else {
@@ -233,7 +233,7 @@ extension AgentModeViewModel {
     }
 
     func syncPendingTaggedFilesFromDraft(tabID: UUID, text: String) {
-        let session = session(for: tabID)
+        guard let session = session(for: tabID, createIfNeeded: false) else { return }
         guard !session.pendingTaggedFileAttachments.isEmpty else { return }
         let tokens = Set(Self.extractTaggedPaths(from: text).map(Self.unescapeTaggedPath(_:)))
         let beforeCount = session.pendingTaggedFileAttachments.count

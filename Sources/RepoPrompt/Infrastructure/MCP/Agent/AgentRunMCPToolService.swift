@@ -2012,7 +2012,7 @@ struct AgentRunMCPToolService {
             sessionName: nil,
             inheritWorktreeBindings: false
         )
-        let session = await agentModeVM.ensureSessionReady(tabID: target.tabID)
+        let session = try await agentModeVM.ensureSessionReady(tabID: target.tabID)
         guard session.activeAgentSessionID == sessionID else {
             await agentModeVM.mcpDiscardSessionTarget(target)
             throw MCPError.invalidParams("The requested agent session is not currently available.")

@@ -91,6 +91,58 @@ final class RemoteWorkspacePickupIntegrationTests: XCTestCase {
         )
     }
 
+    /// R5 P1-3: the paired hydration inserted into `materializeRemoteWorkspaceSession` suspends.
+    /// If the fresh tab is rebound while that load is held, the materializer must not write the
+    /// remote binding, provider selection, run state, loaded flag, or index entry onto the tab
+    /// that now represents the other session.
+    @MainActor
+    func testPickupRebindDuringHeldHydrationConfiguresNothingOnTheReboundTab() async throws {
+        let remoteID = UUID().uuidString
+        let localSessionID = try XCTUnwrap(UUID(uuidString: remoteID))
+        let remoteDescriptor = descriptor(id: remoteID, name: "Held pickup", modified: 25)
+        let store = StubWorkspacePickupCatalogStore(state: .loaded(.init(
+            hostWorkspaceID: "host-workspace",
+            hostWorkspaceName: "Project Alpha",
+            sessions: [remoteDescriptor],
+            fetchedAt: Date(timeIntervalSinceReferenceDate: 40)
+        )))
+        let fixture = try await makeFixture(store: store)
+        var attachedTabIDs: [UUID] = []
+        fixture.coordinator.test_setMaterializedRemoteWorkspaceAttachHandler { session in
+            attachedTabIDs.append(session.tabID)
+        }
+
+        // While the materialization's paired load is held after preparation, the created tab is
+        // rebound to a different durable session.
+        let replacementID = UUID()
+        var heldTabIDs: [UUID] = []
+        fixture.viewModel.test_persistedLoadPrepareHook = { [viewModel = fixture.viewModel] held in
+            guard held.activeAgentSessionID == localSessionID else { return }
+            heldTabIDs.append(held.tabID)
+            _ = viewModel.test_installPersistentSessionBinding(sessionID: replacementID, on: held)
+        }
+        let pickedUp = await fixture.coordinator.pickUpWorkspaceSession(
+            descriptor: remoteDescriptor,
+            hostRecord: fixture.host
+        )
+        fixture.viewModel.test_persistedLoadPrepareHook = nil
+
+        XCTAssertNil(pickedUp, "An interrupted materialization reports no session")
+        XCTAssertEqual(heldTabIDs.count, 1, "Exactly one paired load was held and interrupted")
+        let tabID = try XCTUnwrap(heldTabIDs.first)
+        let session = try XCTUnwrap(fixture.viewModel.sessions[tabID])
+        XCTAssertEqual(session.activeAgentSessionID, replacementID, "The rebound binding is untouched")
+        XCTAssertNil(session.remoteHost, "A's remote-host binding is never written onto B")
+        XCTAssertFalse(session.hasLoadedPersistedState, "A rejected hydration never declares the rebound tab loaded")
+        XCTAssertNil(session.persistenceState)
+        XCTAssertNil(fixture.viewModel.ownerValidatedSessionIndex[localSessionID], "No index entry is upserted for the rejected materialization")
+        XCTAssertTrue(attachedTabIDs.isEmpty, "Attach never runs for a rejected materialization")
+        XCTAssertFalse(
+            fixture.viewModel.sessions.values.contains { $0.remoteHost?.remoteSessionID == remoteID },
+            "No tab carries the remote identity"
+        )
+    }
+
     @MainActor
     private func makeFixture(
         store: StubWorkspacePickupCatalogStore

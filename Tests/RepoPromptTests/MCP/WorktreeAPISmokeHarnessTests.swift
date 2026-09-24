@@ -37,7 +37,7 @@ final class WorktreeAPISmokeHarnessTests: XCTestCase {
 
         let bindSessionID = UUID()
         let bindTabID = try XCTUnwrap(window.workspaceManager.activeWorkspace?.activeComposeTabID)
-        let bindSession = window.agentModeViewModel.session(for: bindTabID)
+        let bindSession = try XCTUnwrap(window.agentModeViewModel.session(for: bindTabID, createIfNeeded: true))
         _ = window.agentModeViewModel.test_installPersistentSessionBinding(
             sessionID: bindSessionID,
             on: bindSession,
@@ -178,7 +178,7 @@ final class WorktreeAPISmokeHarnessTests: XCTestCase {
         let tabID = try XCTUnwrap(window.workspaceManager.activeWorkspace?.activeComposeTabID)
         let workspaceID = try XCTUnwrap(window.workspaceManager.activeWorkspace?.id)
         let sessionID = UUID()
-        let session = window.agentModeViewModel.session(for: tabID)
+        let session = try XCTUnwrap(window.agentModeViewModel.session(for: tabID, createIfNeeded: true))
         _ = window.agentModeViewModel.test_installPersistentSessionBinding(
             sessionID: sessionID,
             on: session,
@@ -529,7 +529,7 @@ final class WorktreeAPISmokeHarnessTests: XCTestCase {
             targetTab.promptText = "Generate the deterministic worktree export."
             window.workspaceManager.updateComposeTab(targetTab, markDirty: false)
             let sessionID = UUID()
-            let session = window.agentModeViewModel.session(for: targetTab.id)
+            let session = try XCTUnwrap(window.agentModeViewModel.session(for: targetTab.id, createIfNeeded: true))
             _ = window.agentModeViewModel.test_installPersistentSessionBinding(
                 sessionID: sessionID,
                 on: session,
@@ -634,7 +634,7 @@ final class WorktreeAPISmokeHarnessTests: XCTestCase {
         let manageWorktree = try await Self.windowTool(named: MCPWindowToolName.manageWorktree, in: window)
         let sessionID = UUID()
         let tabID = try XCTUnwrap(window.workspaceManager.activeWorkspace?.activeComposeTabID)
-        let session = window.agentModeViewModel.session(for: tabID)
+        let session = try XCTUnwrap(window.agentModeViewModel.session(for: tabID, createIfNeeded: true))
         _ = window.agentModeViewModel.test_installPersistentSessionBinding(
             sessionID: sessionID,
             on: session,

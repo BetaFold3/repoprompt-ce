@@ -251,7 +251,7 @@ extension AgentModeViewModel {
         else {
             return
         }
-        let session = session(for: tabID)
+        guard let session = session(for: tabID, createIfNeeded: true) else { return }
         guard session.remoteHost == nil,
               !session.isPreparingInitialWorktree,
               session.pendingInitialStartLocation != selection
@@ -311,7 +311,7 @@ extension AgentModeViewModel {
               props.isEnabled || isRemoteFailureLocalFallback,
               props.selection != selection
         else { return }
-        let session = session(for: tabID)
+        guard let session = session(for: tabID, createIfNeeded: false) else { return }
         switch selection {
         case .thisMac:
             clearRemoteStartWindowPickerIfOwned(by: tabID)

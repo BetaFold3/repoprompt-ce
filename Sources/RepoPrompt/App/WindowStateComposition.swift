@@ -1,3 +1,4 @@
+import AppKit
 import Foundation
 
 @MainActor
@@ -193,6 +194,17 @@ enum WindowStateCompositionFactory {
                 agentModeViewModel: agentModeViewModel
             )
         )
+        // Explicit discard confirmation before a tab whose retained conversation cannot be saved
+        // (stale-reset recovery) is closed or stashed. Without a presenter the removal is refused.
+        agentModeViewModel.staleResetRecoveryDiscardConfirmation = { request in
+            let alert = NSAlert()
+            alert.messageText = request.title
+            alert.informativeText = request.message
+            alert.alertStyle = .warning
+            alert.addButton(withTitle: request.confirmButtonTitle)
+            alert.addButton(withTitle: "Cancel")
+            return alert.runModal() == .alertFirstButtonReturn
+        }
 
         #if DEBUG
             return WindowStateComposition(

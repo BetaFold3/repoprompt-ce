@@ -22,7 +22,9 @@ final class CodexFallbackFIFOTests: XCTestCase {
                 ))
             ]
         )
-        let (viewModel, session) = makeRunningSession(controller: controller)
+        guard let (viewModel, session) = makeRunningSession(controller: controller) else {
+            return XCTFail("Expected the Codex test session to materialize")
+        }
 
         let outcome = await viewModel.test_codexCoordinator.sendCodexNativeMessage(
             session: session,
@@ -43,7 +45,9 @@ final class CodexFallbackFIFOTests: XCTestCase {
         let controller = FallbackFIFOController(
             steerResults: [.success(.init(acceptedTurnID: "actual-turn"))]
         )
-        let (viewModel, session) = makeRunningSession(controller: controller)
+        guard let (viewModel, session) = makeRunningSession(controller: controller) else {
+            return XCTFail("Expected the Codex test session to materialize")
+        }
 
         let outcome = await viewModel.test_codexCoordinator.sendCodexNativeMessage(
             session: session,
@@ -74,7 +78,9 @@ final class CodexFallbackFIFOTests: XCTestCase {
                 .success(CodexTurnSteerReceipt(acceptedTurnID: "actual-turn"))
             ]
         )
-        let (viewModel, session) = makeRunningSession(controller: controller)
+        guard let (viewModel, session) = makeRunningSession(controller: controller) else {
+            return XCTFail("Expected the Codex test session to materialize")
+        }
 
         let outcome = await viewModel.test_codexCoordinator.sendCodexNativeMessage(
             session: session,
@@ -111,7 +117,9 @@ final class CodexFallbackFIFOTests: XCTestCase {
             authoritativeTurnID: "turn",
             routingTurnID: "turn"
         )
-        let (viewModel, session) = makeRunningSession(controller: controller)
+        guard let (viewModel, session) = makeRunningSession(controller: controller) else {
+            return XCTFail("Expected the Codex test session to materialize")
+        }
 
         let outcome = await viewModel.test_codexCoordinator.sendCodexNativeMessage(
             session: session,
@@ -146,7 +154,9 @@ final class CodexFallbackFIFOTests: XCTestCase {
             authoritativeTurnID: "turn",
             routingTurnID: "turn"
         )
-        let (viewModel, session) = makeRunningSession(controller: controller)
+        guard let (viewModel, session) = makeRunningSession(controller: controller) else {
+            return XCTFail("Expected the Codex test session to materialize")
+        }
 
         let outcome = await viewModel.test_codexCoordinator.sendCodexNativeMessage(
             session: session,
@@ -198,7 +208,9 @@ final class CodexFallbackFIFOTests: XCTestCase {
                 ))
             ]
         )
-        let (viewModel, session) = makeRunningSession(controller: controller)
+        guard let (viewModel, session) = makeRunningSession(controller: controller) else {
+            return XCTFail("Expected the Codex test session to materialize")
+        }
         let attemptID = session.codexSteerAckTracker.beginAttempt()
         let queueID = UUID()
         let context = fallbackContext(
@@ -311,7 +323,9 @@ final class CodexFallbackFIFOTests: XCTestCase {
                 ))
             ]
         )
-        let (viewModel, session) = makeRunningSession(controller: controller)
+        guard let (viewModel, session) = makeRunningSession(controller: controller) else {
+            return XCTFail("Expected the Codex test session to materialize")
+        }
 
         _ = await viewModel.test_codexCoordinator.sendCodexNativeMessage(
             session: session,
@@ -331,7 +345,9 @@ final class CodexFallbackFIFOTests: XCTestCase {
         let controller = FallbackFIFOController(
             steerResults: [.failure(nonSteerable), .failure(nonSteerable)]
         )
-        let (viewModel, session) = makeRunningSession(controller: controller)
+        guard let (viewModel, session) = makeRunningSession(controller: controller) else {
+            return XCTFail("Expected the Codex test session to materialize")
+        }
 
         _ = await viewModel.test_codexCoordinator.sendCodexNativeMessage(
             session: session,
@@ -384,7 +400,9 @@ final class CodexFallbackFIFOTests: XCTestCase {
             steerResults: [.failure(nonSteerable), .failure(nonSteerable)],
             startGate: startGate
         )
-        let (viewModel, session) = makeRunningSession(controller: controller)
+        guard let (viewModel, session) = makeRunningSession(controller: controller) else {
+            return XCTFail("Expected the Codex test session to materialize")
+        }
 
         _ = await viewModel.test_codexCoordinator.sendCodexNativeMessage(
             session: session,
@@ -432,7 +450,9 @@ final class CodexFallbackFIFOTests: XCTestCase {
             steerResults: [.failure(nonSteerable)],
             startGate: startGate
         )
-        let (viewModel, session) = makeRunningSession(controller: controller)
+        guard let (viewModel, session) = makeRunningSession(controller: controller) else {
+            return XCTFail("Expected the Codex test session to materialize")
+        }
 
         _ = await viewModel.test_codexCoordinator.sendCodexNativeMessage(
             session: session,
@@ -478,7 +498,9 @@ final class CodexFallbackFIFOTests: XCTestCase {
             steerResults: [.failure(nonSteerable)],
             startGate: startGate
         )
-        let (viewModel, session) = makeRunningSession(controller: controller)
+        guard let (viewModel, session) = makeRunningSession(controller: controller) else {
+            return XCTFail("Expected the Codex test session to materialize")
+        }
 
         _ = await viewModel.test_codexCoordinator.sendCodexNativeMessage(
             session: session,
@@ -535,7 +557,9 @@ final class CodexFallbackFIFOTests: XCTestCase {
         let controller = FallbackFIFOController(
             steerResults: [.failure(nonSteerable)]
         )
-        let (viewModel, session) = makeRunningSession(controller: controller)
+        guard let (viewModel, session) = makeRunningSession(controller: controller) else {
+            return XCTFail("Expected the Codex test session to materialize")
+        }
         var publicationAttempts = 0
         viewModel.test_setTerminalPublicationOverride { _, _, _ in
             publicationAttempts += 1
@@ -715,7 +739,9 @@ final class CodexFallbackFIFOTests: XCTestCase {
                 ))
             ]
         )
-        let (nilViewModel, nilSession) = makeRunningSession(controller: controller)
+        guard let (nilViewModel, nilSession) = makeRunningSession(controller: controller) else {
+            return XCTFail("Expected the Codex test session to materialize")
+        }
         _ = await nilViewModel.test_codexCoordinator.sendCodexNativeMessage(
             session: nilSession,
             text: "nil completion",
@@ -750,7 +776,9 @@ final class CodexFallbackFIFOTests: XCTestCase {
                 ))
             ]
         )
-        let (failedViewModel, failedSession) = makeRunningSession(controller: failedController)
+        guard let (failedViewModel, failedSession) = makeRunningSession(controller: failedController) else {
+            return XCTFail("Expected the Codex test session to materialize")
+        }
         _ = await failedViewModel.test_codexCoordinator.sendCodexNativeMessage(
             session: failedSession,
             text: "failed completion",
@@ -777,7 +805,9 @@ final class CodexFallbackFIFOTests: XCTestCase {
             steerResults: [],
             startGate: startGate
         )
-        let (viewModel, session) = makeRunningSession(controller: controller)
+        guard let (viewModel, session) = makeRunningSession(controller: controller) else {
+            return XCTFail("Expected the Codex test session to materialize")
+        }
         session.runState = .idle
         session.codexAuthoritativeActiveTurn = nil
         session.codexRoutingObservedTurnID = nil
@@ -831,7 +861,9 @@ final class CodexFallbackFIFOTests: XCTestCase {
 
     func testLateAcceptedMCPAttemptDropsAlreadyClaimedFallbackBeforeProviderReplay() async throws {
         let controller = FallbackFIFOController(steerResults: [])
-        let (viewModel, session) = makeRunningSession(controller: controller)
+        guard let (viewModel, session) = makeRunningSession(controller: controller) else {
+            return XCTFail("Expected the Codex test session to materialize")
+        }
         let attemptID = session.codexSteerAckTracker.beginAttempt()
         let queueID = UUID()
         _ = try await controller.startUserTurn(
@@ -869,7 +901,9 @@ final class CodexFallbackFIFOTests: XCTestCase {
 
     func testRemovingQueuedDeliveredSiblingDoesNotCancelInFlightFallbackOrPendingMask() async {
         let controller = FallbackFIFOController(steerResults: [])
-        let (viewModel, session) = makeRunningSession(controller: controller)
+        guard let (viewModel, session) = makeRunningSession(controller: controller) else {
+            return XCTFail("Expected the Codex test session to materialize")
+        }
         let claimedAttemptID = session.codexSteerAckTracker.beginAttempt()
         let queuedAttemptID = session.codexSteerAckTracker.beginAttempt()
         let claimedQueueID = UUID()
@@ -914,7 +948,9 @@ final class CodexFallbackFIFOTests: XCTestCase {
             failure: requestFailure(message: "cannot steer a review turn")
         )
         let controller = FallbackFIFOController(steerResults: [.failure(failure)])
-        let (viewModel, session) = makeRunningSession(controller: controller)
+        guard let (viewModel, session) = makeRunningSession(controller: controller) else {
+            return XCTFail("Expected the Codex test session to materialize")
+        }
         let attemptID = session.codexSteerAckTracker.beginAttempt()
         let queueID = UUID()
         let context = fallbackContext(
@@ -958,7 +994,9 @@ final class CodexFallbackFIFOTests: XCTestCase {
                 ))
             ]
         )
-        let (viewModel, session) = makeRunningSession(controller: controller)
+        guard let (viewModel, session) = makeRunningSession(controller: controller) else {
+            return XCTFail("Expected the Codex test session to materialize")
+        }
         viewModel.storeDraftText(for: session.tabID, "queued manual")
         let userItem = AgentChatItem.user(
             "queued manual",
@@ -1003,7 +1041,9 @@ final class CodexFallbackFIFOTests: XCTestCase {
                 ))
             ]
         )
-        let (viewModel, session) = makeRunningSession(controller: controller)
+        guard let (viewModel, session) = makeRunningSession(controller: controller) else {
+            return XCTFail("Expected the Codex test session to materialize")
+        }
         let attemptID = session.codexSteerAckTracker.beginAttempt()
         let queueID = UUID()
         let context = fallbackContext(
@@ -1035,12 +1075,15 @@ final class CodexFallbackFIFOTests: XCTestCase {
 
     private func makeRunningSession(
         controller: any CodexSessionControlling
-    ) -> (AgentModeViewModel, AgentModeViewModel.TabSession) {
+    ) -> (AgentModeViewModel, AgentModeViewModel.TabSession)? {
         let viewModel = AgentModeViewModel(
             codexControllerFactory: { _, _, _, _, _, _ in controller }
         )
         viewModel.test_initializeRunService()
-        let session = viewModel.session(for: UUID())
+        guard let session = viewModel.session(for: UUID(), createIfNeeded: true) else {
+            XCTFail("Expected the Codex test session to materialize")
+            return nil
+        }
         let runID = UUID()
         session.selectedAgent = .codexExec
         session.runID = runID
@@ -1075,7 +1118,7 @@ final class CodexFallbackFIFOTests: XCTestCase {
         )
         viewModel.test_initializeRunService()
         let sessionID = UUID()
-        let session = await viewModel.ensureSessionReady(tabID: UUID())
+        let session = try! await viewModel.ensureSessionReady(tabID: UUID())
         _ = viewModel.test_installPersistentSessionBinding(sessionID: sessionID, on: session)
         try await viewModel.mcpActivateControlContext(
             forTabID: session.tabID,

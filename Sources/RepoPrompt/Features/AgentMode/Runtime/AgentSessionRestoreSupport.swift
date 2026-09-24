@@ -359,7 +359,9 @@ enum AgentSessionRestoreSupport {
             origin: session.origin,
             profile: session.profile,
             worktreeBindingSummaries: session.worktreeBindings.worktreeBindingSummaries,
-            activeWorktreeMergeSummaries: session.worktreeMergeOperations.activeWorktreeMergeSummaries
+            activeWorktreeMergeSummaries: session.worktreeMergeOperations.activeWorktreeMergeSummaries,
+            scheduledSendSummary: AgentSessionScheduledSendSummary.make(from: session.scheduledSend),
+            lastScheduledDispatch: session.lastScheduledDispatch
         )
     }
 

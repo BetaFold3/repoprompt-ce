@@ -864,7 +864,7 @@ struct AgentManageMCPToolService {
             throw MCPError.invalidParams("Session '\(sessionReference)' is not currently live and cannot be stopped.")
         }
 
-        let session = await agentModeVM.ensureSessionReady(tabID: target.tabID)
+        let session = try await agentModeVM.ensureSessionReady(tabID: target.tabID)
         let wasActive = session.runState.isActive
         if wasActive {
             await agentModeVM.cancelAgentRun(tabID: target.tabID, completion: .terminalPublished)
@@ -1154,7 +1154,7 @@ struct AgentManageMCPToolService {
            let liveSession = try agentModeVM.authoritativeLiveSession(for: referenceUUID),
            let sessionID = liveSession.activeAgentSessionID
         {
-            let hydrated = await agentModeVM.ensureSessionReady(tabID: liveSession.tabID)
+            let hydrated = try await agentModeVM.ensureSessionReady(tabID: liveSession.tabID)
             if !hydrated.runState.isActive {
                 // Safe on every terminal get_log: canReuseDerivedTranscriptForSave makes this
                 // a no-op when already synchronized.
@@ -1188,7 +1188,7 @@ struct AgentManageMCPToolService {
            let liveSession = try agentModeVM.authoritativeLiveSession(for: referenceUUID),
            let sessionID = liveSession.activeAgentSessionID
         {
-            let hydrated = await agentModeVM.ensureSessionReady(tabID: liveSession.tabID)
+            let hydrated = try await agentModeVM.ensureSessionReady(tabID: liveSession.tabID)
             let liveName = targetWindow.workspaceManager.composeTab(with: hydrated.tabID)?.name
                 ?? agentModeVM.sessionIndex[sessionID]?.name
                 ?? "Agent Session"

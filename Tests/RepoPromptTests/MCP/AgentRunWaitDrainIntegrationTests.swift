@@ -423,7 +423,7 @@ final class AgentRunWaitDrainTestHarness {
         liveSnapshots: AgentRunWaitDrainLiveSnapshots
     ) async throws -> Fixture {
         let sessionID = UUID()
-        let session = await viewModel.ensureSessionReady(tabID: UUID())
+        let session = try! await viewModel.ensureSessionReady(tabID: UUID())
         _ = viewModel.test_installPersistentSessionBinding(sessionID: sessionID, on: session)
         do {
             try await viewModel.mcpActivateControlContext(

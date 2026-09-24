@@ -17,7 +17,7 @@ final class AgentRunLiveSessionFallbackTests: XCTestCase {
         let service = makeService(window: window, viewModel: viewModel)
 
         let sessionID = UUID()
-        let session = await viewModel.ensureSessionReady(tabID: UUID())
+        let session = try await viewModel.ensureSessionReady(tabID: UUID())
         _ = viewModel.test_installPersistentSessionBinding(sessionID: sessionID, on: session)
         XCTAssertEqual(session.activeAgentSessionID, sessionID)
         XCTAssertNil(session.mcpControlContext)
@@ -63,7 +63,7 @@ final class AgentRunLiveSessionFallbackTests: XCTestCase {
         let service = makeService(window: window, viewModel: viewModel)
 
         let sessionID = UUID()
-        let session = await viewModel.ensureSessionReady(tabID: UUID())
+        let session = try await viewModel.ensureSessionReady(tabID: UUID())
         _ = viewModel.test_installPersistentSessionBinding(sessionID: sessionID, on: session)
         session.runState = .running
 
@@ -87,7 +87,7 @@ final class AgentRunLiveSessionFallbackTests: XCTestCase {
         let service = makeService(window: window, viewModel: viewModel)
 
         let sessionID = UUID()
-        let session = await viewModel.ensureSessionReady(tabID: UUID())
+        let session = try await viewModel.ensureSessionReady(tabID: UUID())
         _ = viewModel.test_installPersistentSessionBinding(sessionID: sessionID, on: session)
 
         do {

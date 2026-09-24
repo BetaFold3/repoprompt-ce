@@ -7,7 +7,7 @@ final class AgentModeStopSubmitTargetTests: XCTestCase {
     func testComposerSubmitTargetIsUnavailableDuringWorkspaceSwitchInFlight() throws {
         let vm = makeViewModel()
         let tabID = UUID()
-        let session = vm.session(for: tabID)
+        let session = try XCTUnwrap(vm.session(for: tabID, createIfNeeded: true))
         vm.test_setCurrentTabIDOverride(tabID)
         defer { vm.test_setCurrentTabIDOverride(nil) }
 
@@ -329,7 +329,7 @@ final class AgentModeStopSubmitTargetTests: XCTestCase {
         let vm = makeViewModel()
         let sourceTabID = UUID()
         let destinationTabID = UUID()
-        let sourceSession = await vm.ensureSessionReady(tabID: sourceTabID)
+        let sourceSession = try await vm.ensureSessionReady(tabID: sourceTabID)
         sourceSession.selectedAgent = .codexExec
         let target = try XCTUnwrap(vm.makeComposerSubmitTarget(tabID: sourceTabID, session: sourceSession))
         XCTAssertEqual(target.route, .createAgentSessionFromSourceTab)
@@ -402,7 +402,7 @@ final class AgentModeStopSubmitTargetTests: XCTestCase {
     func testComposerClaimPublishesNilImmediatelyAndRejectsSecondClaimAsExisting() async throws {
         let vm = makeViewModel()
         let tabID = UUID()
-        let session = await vm.ensureSessionReady(tabID: tabID)
+        let session = try await vm.ensureSessionReady(tabID: tabID)
         vm.test_setCurrentTabIDOverride(tabID)
         defer { vm.test_setCurrentTabIDOverride(nil) }
         vm.storeDraftText(for: tabID, "claim draft")
@@ -456,7 +456,7 @@ final class AgentModeStopSubmitTargetTests: XCTestCase {
     func testStaleComposerClaimReleaseCannotClearNewerClaim() async throws {
         let vm = makeViewModel()
         let tabID = UUID()
-        let session = await vm.ensureSessionReady(tabID: tabID)
+        let session = try await vm.ensureSessionReady(tabID: tabID)
         vm.test_setCurrentTabIDOverride(tabID)
         defer { vm.test_setCurrentTabIDOverride(nil) }
 
@@ -540,7 +540,7 @@ final class AgentModeStopSubmitTargetTests: XCTestCase {
     func testGuardedFirstSendRejectsUnprovenCreateToExistingTransitionAndPreservesDraft() async throws {
         let vm = makeViewModel()
         let sourceTabID = UUID()
-        let sourceSession = await vm.ensureSessionReady(tabID: sourceTabID)
+        let sourceSession = try await vm.ensureSessionReady(tabID: sourceTabID)
         sourceSession.selectedAgent = .codexExec
         sourceSession.pendingImageAttachments = [
             AgentImageAttachment(
@@ -581,10 +581,10 @@ final class AgentModeStopSubmitTargetTests: XCTestCase {
         XCTAssertTrue(sourceSession.items.isEmpty)
     }
 
-    func testFreshManualThreadProjectsAndUpdatesInitialStartLocation() async {
+    func testFreshManualThreadProjectsAndUpdatesInitialStartLocation() async throws {
         let vm = makeViewModel()
         let tabID = UUID()
-        let session = await vm.ensureSessionReady(tabID: tabID)
+        let session = try await vm.ensureSessionReady(tabID: tabID)
         vm.test_setCurrentTabIDOverride(tabID)
         defer { vm.test_setCurrentTabIDOverride(nil) }
 
@@ -597,13 +597,13 @@ final class AgentModeStopSubmitTargetTests: XCTestCase {
         XCTAssertEqual(vm.makeComposerSubmitTarget(tabID: tabID, session: session)?.expectedInitialStartLocation, .newWorktree)
     }
 
-    func testFreshLinkedManualThreadProjectsInitialLocationThenPersistentLocalLocationAfterStart() async {
+    func testFreshLinkedManualThreadProjectsInitialLocationThenPersistentLocalLocationAfterStart() async throws {
         let vm = makeViewModel()
         vm.selectedAgent = .codexExec
         vm.selectedModelRaw = "iris-alpha"
         vm.selectedReasoningEffortRaw = "high"
         let tabID = UUID()
-        let session = await vm.ensureSessionReady(tabID: tabID)
+        let session = try await vm.ensureSessionReady(tabID: tabID)
         vm.ensureSession(for: tabID)
         vm.test_setCurrentTabIDOverride(tabID)
         defer { vm.test_setCurrentTabIDOverride(nil) }
@@ -632,7 +632,7 @@ final class AgentModeStopSubmitTargetTests: XCTestCase {
     func testLinkedStartedThreadDoesNotReuseRetainedInitialWorktreeIntent() async throws {
         let vm = makeViewModel()
         let tabID = UUID()
-        let session = await vm.ensureSessionReady(tabID: tabID)
+        let session = try await vm.ensureSessionReady(tabID: tabID)
         vm.ensureSession(for: tabID)
         session.selectedAgent = .codexExec
         vm.test_setCurrentTabIDOverride(tabID)
@@ -658,7 +658,7 @@ final class AgentModeStopSubmitTargetTests: XCTestCase {
     func testLinkedMCPParentedThreadDoesNotExposeOrPrepareInitialWorktree() async throws {
         let vm = makeViewModel()
         let tabID = UUID()
-        let session = await vm.ensureSessionReady(tabID: tabID)
+        let session = try await vm.ensureSessionReady(tabID: tabID)
         vm.ensureSession(for: tabID)
         session.parentSessionID = UUID()
         session.selectedAgent = .codexExec
@@ -686,7 +686,7 @@ final class AgentModeStopSubmitTargetTests: XCTestCase {
     func testGuardedFirstSendRejectsStaleInitialStartLocationSelection() async throws {
         let vm = makeViewModel()
         let sourceTabID = UUID()
-        let session = await vm.ensureSessionReady(tabID: sourceTabID)
+        let session = try await vm.ensureSessionReady(tabID: sourceTabID)
         vm.test_setCurrentTabIDOverride(sourceTabID)
         defer { vm.test_setCurrentTabIDOverride(nil) }
         vm.selectInitialStartLocation(.newWorktree, for: sourceTabID)
@@ -717,11 +717,11 @@ final class AgentModeStopSubmitTargetTests: XCTestCase {
         let sourceTabID = UUID()
         let ambientTabID = UUID()
         let destinationTabID = UUID()
-        let sourceSession = await vm.ensureSessionReady(tabID: sourceTabID)
+        let sourceSession = try await vm.ensureSessionReady(tabID: sourceTabID)
         XCTAssertEqual(sourceSession.selectedAgent, .codexExec)
         XCTAssertEqual(sourceSession.selectedModelRaw, "iris-alpha")
         XCTAssertEqual(sourceSession.selectedReasoningEffortRaw, "high")
-        let ambientSession = await vm.ensureSessionReady(tabID: ambientTabID)
+        let ambientSession = try await vm.ensureSessionReady(tabID: ambientTabID)
         let imageAttachment = AgentImageAttachment(
             source: .localFile(path: "/tmp/render-target-image.png"),
             title: "render-target-image.png"
@@ -766,7 +766,7 @@ final class AgentModeStopSubmitTargetTests: XCTestCase {
         vm.selectedAgent = .codexExec
         let sourceTabID = UUID()
         let destinationTabID = UUID()
-        let sourceSession = await vm.ensureSessionReady(tabID: sourceTabID)
+        let sourceSession = try await vm.ensureSessionReady(tabID: sourceTabID)
         sourceSession.pendingImageAttachments = [
             AgentImageAttachment(
                 source: .localFile(path: "/tmp/source-state-changed.png"),
@@ -780,7 +780,10 @@ final class AgentModeStopSubmitTargetTests: XCTestCase {
             text: "should not consume changed source",
             target: target,
             createAndActivateSessionTab: {
-                _ = vm.session(for: destinationTabID)
+                guard vm.session(for: destinationTabID, createIfNeeded: true) != nil else {
+                    XCTFail("Expected the destination session to materialize")
+                    return nil
+                }
                 sourceSession.pendingImageAttachments.removeAll()
                 return destinationTabID
             }

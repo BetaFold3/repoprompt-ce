@@ -10,7 +10,7 @@ final class AgentModeViewModelInactiveRefreshTests: XCTestCase {
         viewModel.test_setCurrentTabIDOverride(tabID)
         defer { viewModel.test_setCurrentTabIDOverride(nil) }
 
-        let session = await viewModel.ensureSessionReady(tabID: tabID)
+        let session = try await viewModel.ensureSessionReady(tabID: tabID)
         session.runState = .running
         let invocationID = UUID()
         let marker = "RAW_PAYLOAD_MARKER_\(UUID().uuidString)"
@@ -61,7 +61,7 @@ final class AgentModeViewModelInactiveRefreshTests: XCTestCase {
         viewModel.test_setCurrentTabIDOverride(tabID)
         defer { viewModel.test_setCurrentTabIDOverride(nil) }
 
-        let session = await viewModel.ensureSessionReady(tabID: tabID)
+        let session = try await viewModel.ensureSessionReady(tabID: tabID)
         session.runState = .running
         let invocationA = UUID()
         let invocationB = UUID()
@@ -144,7 +144,7 @@ final class AgentModeViewModelInactiveRefreshTests: XCTestCase {
         viewModel.test_setCurrentTabIDOverride(tabID)
         defer { viewModel.test_setCurrentTabIDOverride(nil) }
 
-        let session = await viewModel.ensureSessionReady(tabID: tabID)
+        let session = try await viewModel.ensureSessionReady(tabID: tabID)
         session.runState = .running
         var items = makeTranscriptItems(prefix: "history", turnCount: 40)
         items.append(.user("Run a live tool", sequenceIndex: items.count))
@@ -189,13 +189,13 @@ final class AgentModeViewModelInactiveRefreshTests: XCTestCase {
         XCTAssertEqual(session.derivedTranscriptSyncState?.sourceItemsRevision, session.sourceItemsRevision)
     }
 
-    func testIncrementalRefreshReconcilesOlderTurnWhenCompactionChangesFullEnvelope() async {
+    func testIncrementalRefreshReconcilesOlderTurnWhenCompactionChangesFullEnvelope() async throws {
         let viewModel = makeViewModel()
         let tabID = UUID()
         viewModel.test_setCurrentTabIDOverride(tabID)
         defer { viewModel.test_setCurrentTabIDOverride(nil) }
 
-        let session = await viewModel.ensureSessionReady(tabID: tabID)
+        let session = try await viewModel.ensureSessionReady(tabID: tabID)
         session.runState = .running
         let initialItems = makeTranscriptItems(prefix: "boundary", turnCount: 32)
         let oldestItemID = initialItems[0].id
@@ -230,13 +230,13 @@ final class AgentModeViewModelInactiveRefreshTests: XCTestCase {
         XCTAssertGreaterThan(session.transcriptPerformanceSnapshot.incrementalImportSuccessCount, 0)
     }
 
-    func testIncrementalRefreshStillRemovesImportPolicyExcludedItems() async {
+    func testIncrementalRefreshStillRemovesImportPolicyExcludedItems() async throws {
         let viewModel = makeViewModel()
         let tabID = UUID()
         viewModel.test_setCurrentTabIDOverride(tabID)
         defer { viewModel.test_setCurrentTabIDOverride(nil) }
 
-        let session = await viewModel.ensureSessionReady(tabID: tabID)
+        let session = try await viewModel.ensureSessionReady(tabID: tabID)
         session.runState = .running
         session.setItemsSilently(
             makeTranscriptItems(prefix: "history", turnCount: 40),
@@ -267,15 +267,15 @@ final class AgentModeViewModelInactiveRefreshTests: XCTestCase {
         )
     }
 
-    func testRefreshingInactiveSessionDoesNotClobberActivePresentation() async {
+    func testRefreshingInactiveSessionDoesNotClobberActivePresentation() async throws {
         let viewModel = makeViewModel()
         let activeTabID = UUID()
         let inactiveTabID = UUID()
         viewModel.test_setCurrentTabIDOverride(activeTabID)
         defer { viewModel.test_setCurrentTabIDOverride(nil) }
 
-        let activeSession = await viewModel.ensureSessionReady(tabID: activeTabID)
-        let inactiveSession = await viewModel.ensureSessionReady(tabID: inactiveTabID)
+        let activeSession = try await viewModel.ensureSessionReady(tabID: activeTabID)
+        let inactiveSession = try await viewModel.ensureSessionReady(tabID: inactiveTabID)
         activeSession.replaceItems(makeTranscriptItems(prefix: "active", turnCount: 2))
         inactiveSession.replaceItems(makeTranscriptItems(prefix: "inactive", turnCount: 2))
 
@@ -307,14 +307,14 @@ final class AgentModeViewModelInactiveRefreshTests: XCTestCase {
         XCTAssertEqual(viewModel.activeTranscriptPresentation.visibleRows.last?.text, "background mutation")
     }
 
-    func testScheduledLiveRefreshBuildsWhenSessionTurnsInactive() async {
+    func testScheduledLiveRefreshBuildsWhenSessionTurnsInactive() async throws {
         let viewModel = makeViewModel()
         let activeTabID = UUID()
         let otherTabID = UUID()
         viewModel.test_setCurrentTabIDOverride(activeTabID)
         defer { viewModel.test_setCurrentTabIDOverride(nil) }
 
-        let session = await viewModel.ensureSessionReady(tabID: activeTabID)
+        let session = try await viewModel.ensureSessionReady(tabID: activeTabID)
         session.setItemsSilently([.user("Initial", sequenceIndex: 0)], reason: .testOverride)
         viewModel.refreshDerivedTranscriptState(for: session)
         viewModel.applySessionToBindings(session)
@@ -342,14 +342,14 @@ final class AgentModeViewModelInactiveRefreshTests: XCTestCase {
         XCTAssertEqual(viewModel.activeTranscriptPresentation.visibleRows.last?.text, "Scheduled assistant")
     }
 
-    func testCoalescedScheduledRefreshBuildsOnceWithLatestSourceItems() async {
+    func testCoalescedScheduledRefreshBuildsOnceWithLatestSourceItems() async throws {
         let viewModel = makeViewModel()
         let activeTabID = UUID()
         let otherTabID = UUID()
         viewModel.test_setCurrentTabIDOverride(activeTabID)
         defer { viewModel.test_setCurrentTabIDOverride(nil) }
 
-        let session = await viewModel.ensureSessionReady(tabID: activeTabID)
+        let session = try await viewModel.ensureSessionReady(tabID: activeTabID)
         session.setItemsSilently([.user("Initial", sequenceIndex: 0)], reason: .testOverride)
         viewModel.refreshDerivedTranscriptState(for: session)
         viewModel.applySessionToBindings(session)
@@ -377,15 +377,15 @@ final class AgentModeViewModelInactiveRefreshTests: XCTestCase {
         XCTAssertEqual(viewModel.activeTranscriptPresentation.visibleRows.last?.text, "Latest inactive mutation")
     }
 
-    func testSilentReplacementInvalidatesDerivedStateAndActivationCatchUpRebuilds() async {
+    func testSilentReplacementInvalidatesDerivedStateAndActivationCatchUpRebuilds() async throws {
         let viewModel = makeViewModel()
         let activeTabID = UUID()
         let inactiveTabID = UUID()
         viewModel.test_setCurrentTabIDOverride(activeTabID)
         defer { viewModel.test_setCurrentTabIDOverride(nil) }
 
-        let activeSession = await viewModel.ensureSessionReady(tabID: activeTabID)
-        let inactiveSession = await viewModel.ensureSessionReady(tabID: inactiveTabID)
+        let activeSession = try await viewModel.ensureSessionReady(tabID: activeTabID)
+        let inactiveSession = try await viewModel.ensureSessionReady(tabID: inactiveTabID)
         activeSession.setItemsSilently([.user("Active", sequenceIndex: 0)], reason: .testOverride)
         inactiveSession.setItemsSilently([.user("Inactive initial", sequenceIndex: 0)], reason: .testOverride)
         viewModel.refreshDerivedTranscriptState(for: activeSession)
@@ -408,15 +408,15 @@ final class AgentModeViewModelInactiveRefreshTests: XCTestCase {
         XCTAssertEqual(viewModel.activeTranscriptPresentation.visibleRows.map(\.text), ["Replacement source", "Replacement answer"])
     }
 
-    func testInactiveAssistantDeltaIsRejectedBeforeQueueAdmission() async {
+    func testInactiveAssistantDeltaIsRejectedBeforeQueueAdmission() async throws {
         let viewModel = makeViewModel()
         let activeTabID = UUID()
         let inactiveTabID = UUID()
         viewModel.test_setCurrentTabIDOverride(activeTabID)
         defer { viewModel.test_setCurrentTabIDOverride(nil) }
 
-        let activeSession = await viewModel.ensureSessionReady(tabID: activeTabID)
-        let inactiveSession = await viewModel.ensureSessionReady(tabID: inactiveTabID)
+        let activeSession = try await viewModel.ensureSessionReady(tabID: activeTabID)
+        let inactiveSession = try await viewModel.ensureSessionReady(tabID: inactiveTabID)
         activeSession.replaceItems([.user("active", sequenceIndex: 0)])
         inactiveSession.replaceItems([.user("inactive", sequenceIndex: 0)])
         viewModel.refreshDerivedTranscriptState(for: activeSession)
@@ -432,13 +432,13 @@ final class AgentModeViewModelInactiveRefreshTests: XCTestCase {
         XCTAssertEqual(inactiveSession.items.last?.text, " background delta")
     }
 
-    func testActiveGenericAssistantDeltaPublishesTranscriptWithoutFullBindingSync() async {
+    func testActiveGenericAssistantDeltaPublishesTranscriptWithoutFullBindingSync() async throws {
         let viewModel = makeViewModel()
         let tabID = UUID()
         viewModel.test_setCurrentTabIDOverride(tabID)
         defer { viewModel.test_setCurrentTabIDOverride(nil) }
 
-        let session = await viewModel.ensureSessionReady(tabID: tabID)
+        let session = try await viewModel.ensureSessionReady(tabID: tabID)
         session.replaceItems([.user("start", sequenceIndex: 0)])
         viewModel.refreshDerivedTranscriptState(for: session)
         viewModel.applySessionToBindings(session)
@@ -459,13 +459,13 @@ final class AgentModeViewModelInactiveRefreshTests: XCTestCase {
         XCTAssertEqual(viewModel.test_syncRunInteractionCallCount, runInteractionSyncCount)
     }
 
-    func testActiveCodexAssistantDeltaUsesPresentationOnlyRefresh() async {
+    func testActiveCodexAssistantDeltaUsesPresentationOnlyRefresh() async throws {
         let viewModel = makeViewModel()
         let tabID = UUID()
         viewModel.test_setCurrentTabIDOverride(tabID)
         defer { viewModel.test_setCurrentTabIDOverride(nil) }
 
-        let session = await viewModel.ensureSessionReady(tabID: tabID)
+        let session = try await viewModel.ensureSessionReady(tabID: tabID)
         session.selectedAgent = .codexExec
         session.replaceItems([.user("start", sequenceIndex: 0)])
         viewModel.refreshDerivedTranscriptState(for: session)
@@ -482,13 +482,13 @@ final class AgentModeViewModelInactiveRefreshTests: XCTestCase {
         XCTAssertEqual(viewModel.test_updateBindingsCallCount, updateBindingsCount)
     }
 
-    func testFullRefreshSupersedesPendingAssistantPresentation() async {
+    func testFullRefreshSupersedesPendingAssistantPresentation() async throws {
         let viewModel = makeViewModel()
         let tabID = UUID()
         viewModel.test_setCurrentTabIDOverride(tabID)
         defer { viewModel.test_setCurrentTabIDOverride(nil) }
 
-        let session = await viewModel.ensureSessionReady(tabID: tabID)
+        let session = try await viewModel.ensureSessionReady(tabID: tabID)
         session.replaceItems([.user("start", sequenceIndex: 0)])
         viewModel.refreshDerivedTranscriptState(for: session)
         viewModel.applySessionToBindings(session)
@@ -508,14 +508,14 @@ final class AgentModeViewModelInactiveRefreshTests: XCTestCase {
         XCTAssertEqual(viewModel.activeTranscriptPresentation.visibleRows.last?.text, "full refresh wins")
     }
 
-    func testAssistantPresentationRejectsStaleRevisionGenerationAndTabOwnership() async {
+    func testAssistantPresentationRejectsStaleRevisionGenerationAndTabOwnership() async throws {
         let viewModel = makeViewModel()
         let tabID = UUID()
         let otherTabID = UUID()
         viewModel.test_setCurrentTabIDOverride(tabID)
         defer { viewModel.test_setCurrentTabIDOverride(nil) }
 
-        let session = await viewModel.ensureSessionReady(tabID: tabID)
+        let session = try await viewModel.ensureSessionReady(tabID: tabID)
         session.replaceItems([.user("start", sequenceIndex: 0)])
         viewModel.refreshDerivedTranscriptState(for: session)
         viewModel.applySessionToBindings(session)
@@ -562,7 +562,7 @@ final class AgentModeViewModelInactiveRefreshTests: XCTestCase {
         viewModel.test_setCurrentTabIDOverride(tabID)
         defer { viewModel.test_setCurrentTabIDOverride(nil) }
 
-        let session = await viewModel.ensureSessionReady(tabID: tabID)
+        let session = try await viewModel.ensureSessionReady(tabID: tabID)
         let firstBinding = try XCTUnwrap(viewModel.test_installPersistentSessionBinding(
             sessionID: UUID(),
             on: session
@@ -602,15 +602,15 @@ final class AgentModeViewModelInactiveRefreshTests: XCTestCase {
         session.finishPersistentBindingTransition(generation: transitionGeneration)
     }
 
-    func testActivationRepublishesRunInteractionRuntimeAndLiveBashState() async {
+    func testActivationRepublishesRunInteractionRuntimeAndLiveBashState() async throws {
         let viewModel = makeViewModel()
         let activeTabID = UUID()
         let inactiveTabID = UUID()
         viewModel.test_setCurrentTabIDOverride(activeTabID)
         defer { viewModel.test_setCurrentTabIDOverride(nil) }
 
-        let activeSession = await viewModel.ensureSessionReady(tabID: activeTabID)
-        let inactiveSession = await viewModel.ensureSessionReady(tabID: inactiveTabID)
+        let activeSession = try await viewModel.ensureSessionReady(tabID: activeTabID)
+        let inactiveSession = try await viewModel.ensureSessionReady(tabID: inactiveTabID)
         activeSession.replaceItems([.user("active", sequenceIndex: 0)])
         inactiveSession.replaceItems([.user("inactive", sequenceIndex: 0)])
         viewModel.refreshDerivedTranscriptState(for: activeSession)
@@ -667,7 +667,7 @@ final class AgentModeViewModelInactiveRefreshTests: XCTestCase {
 
     func testPersistentBindingSameIDIsIdempotentAndSameTabRebindRotatesGeneration() async throws {
         let viewModel = makeViewModel()
-        let session = await viewModel.ensureSessionReady(tabID: UUID())
+        let session = try await viewModel.ensureSessionReady(tabID: UUID())
         let firstID = UUID()
         let secondID = UUID()
 
@@ -723,8 +723,8 @@ final class AgentModeViewModelInactiveRefreshTests: XCTestCase {
     func testAmbiguousPersistentBindingFailsRoutingWithoutLeakingCandidates() async throws {
         let viewModel = makeViewModel()
         let sessionID = UUID()
-        let first = await viewModel.ensureSessionReady(tabID: UUID())
-        let second = await viewModel.ensureSessionReady(tabID: UUID())
+        let first = try await viewModel.ensureSessionReady(tabID: UUID())
+        let second = try await viewModel.ensureSessionReady(tabID: UUID())
         _ = viewModel.test_installPersistentSessionBinding(sessionID: sessionID, on: first)
         _ = viewModel.test_installPersistentSessionBinding(sessionID: sessionID, on: second)
 
@@ -752,8 +752,8 @@ final class AgentModeViewModelInactiveRefreshTests: XCTestCase {
     func testPersistentBindingMoveIsBlockedByRunOwnershipAndStoreRegistration() async throws {
         let viewModel = makeViewModel()
         let sessionID = UUID()
-        let source = await viewModel.ensureSessionReady(tabID: UUID())
-        let target = await viewModel.ensureSessionReady(tabID: UUID())
+        let source = try await viewModel.ensureSessionReady(tabID: UUID())
+        let target = try await viewModel.ensureSessionReady(tabID: UUID())
         _ = viewModel.test_installPersistentSessionBinding(sessionID: sessionID, on: source)
         _ = viewModel.test_installPersistentSessionBinding(sessionID: UUID(), on: target)
 
@@ -776,10 +776,10 @@ final class AgentModeViewModelInactiveRefreshTests: XCTestCase {
         await AgentRunSessionStore.cleanup(registration: registration)
     }
 
-    func testMCPActivationRejectsReservedBindingTransition() async {
+    func testMCPActivationRejectsReservedBindingTransition() async throws {
         let viewModel = makeViewModel()
         let sessionID = UUID()
-        let session = await viewModel.ensureSessionReady(tabID: UUID())
+        let session = try await viewModel.ensureSessionReady(tabID: UUID())
         _ = viewModel.test_installPersistentSessionBinding(sessionID: sessionID, on: session)
         let transitionGeneration = session.beginPersistentBindingTransition()
         defer { session.finishPersistentBindingTransition(generation: transitionGeneration) }
@@ -798,12 +798,12 @@ final class AgentModeViewModelInactiveRefreshTests: XCTestCase {
         XCTAssertNil(registration)
     }
 
-    func testHydrationAndPresentationRejectStaleBindingGeneration() async {
+    func testHydrationAndPresentationRejectStaleBindingGeneration() async throws {
         let viewModel = makeViewModel()
         let tabID = UUID()
         viewModel.test_setCurrentTabIDOverride(tabID)
         defer { viewModel.test_setCurrentTabIDOverride(nil) }
-        let session = await viewModel.ensureSessionReady(tabID: tabID)
+        let session = try await viewModel.ensureSessionReady(tabID: tabID)
         let firstID = UUID()
         let secondID = UUID()
         _ = viewModel.test_installPersistentSessionBinding(sessionID: firstID, on: session)
@@ -835,7 +835,7 @@ final class AgentModeViewModelInactiveRefreshTests: XCTestCase {
 
     func testSaveCommitTokenRejectsMutationAndRebindGenerations() async throws {
         let viewModel = makeViewModel()
-        let session = await viewModel.ensureSessionReady(tabID: UUID())
+        let session = try await viewModel.ensureSessionReady(tabID: UUID())
         _ = viewModel.test_installPersistentSessionBinding(sessionID: UUID(), on: session)
         session.saveRequestGeneration = 7
         let token = try XCTUnwrap(viewModel.test_saveCommitToken(for: session, workspaceID: UUID()))
@@ -849,18 +849,18 @@ final class AgentModeViewModelInactiveRefreshTests: XCTestCase {
         XCTAssertFalse(viewModel.test_isSaveCommitTokenCurrent(reboundToken))
     }
 
-    func testSidebarIndexRejectsStaleAndAmbiguousBindings() async {
+    func testSidebarIndexRejectsStaleAndAmbiguousBindings() async throws {
         let viewModel = makeViewModel()
         let currentID = UUID()
         let staleID = UUID()
         let tabID = UUID()
-        let session = await viewModel.ensureSessionReady(tabID: tabID)
+        let session = try await viewModel.ensureSessionReady(tabID: tabID)
         _ = viewModel.test_installPersistentSessionBinding(sessionID: currentID, on: session)
 
         XCTAssertFalse(viewModel.test_shouldAcceptSidebarIndexEntry(makeIndexEntry(id: staleID, tabID: tabID)))
         XCTAssertTrue(viewModel.test_shouldAcceptSidebarIndexEntry(makeIndexEntry(id: currentID, tabID: tabID)))
 
-        let duplicate = await viewModel.ensureSessionReady(tabID: UUID())
+        let duplicate = try await viewModel.ensureSessionReady(tabID: UUID())
         _ = viewModel.test_installPersistentSessionBinding(sessionID: currentID, on: duplicate)
         XCTAssertFalse(viewModel.test_shouldAcceptSidebarIndexEntry(makeIndexEntry(id: currentID, tabID: tabID)))
     }
@@ -1341,7 +1341,7 @@ final class AgentModeViewModelInactiveRefreshTests: XCTestCase {
             latestOwner: transitionOwner,
             activeWorkspace: transitionWorkspace
         )
-        let liveOlderChild = viewModel.session(for: activeOlderChildTabID)
+        let liveOlderChild = try XCTUnwrap(viewModel.session(for: activeOlderChildTabID, createIfNeeded: true))
         _ = viewModel.test_installPersistentSessionBinding(
             sessionID: liveOlderChildSessionID,
             on: liveOlderChild

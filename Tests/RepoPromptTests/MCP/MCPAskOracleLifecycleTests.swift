@@ -233,7 +233,7 @@ final class MCPAskOracleLifecycleTests: XCTestCase {
         ) throws -> UUID {
             let sessionID = sessionID ?? runID
             let activeRunID = activeRunID ?? runID
-            let session = window.agentModeViewModel.session(for: tabID)
+            let session = try XCTUnwrap(window.agentModeViewModel.session(for: tabID, createIfNeeded: true))
             guard window.agentModeViewModel.test_installPersistentSessionBinding(
                 sessionID: sessionID,
                 on: session,

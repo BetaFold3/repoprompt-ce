@@ -2203,7 +2203,9 @@ import XCTest
                             )
                             sourceTab.activeAgentSessionID = sourceSessionID
                             window.workspaceManager.updateComposeTab(sourceTab, markDirty: false)
-                            let sourceSession = agentModeViewModel.session(for: fixture.contextA.tabID)
+                            let sourceSession = try XCTUnwrap(
+                                agentModeViewModel.session(for: fixture.contextA.tabID, createIfNeeded: true)
+                            )
                             sourceSession.testInstallPersistentSessionBinding(sessionID: sourceSessionID)
                             sourceSession.mcpControlContext = makeAgentMCPControlContext(
                                 sessionID: sourceSessionID
@@ -4441,7 +4443,9 @@ import XCTest
             fixture: PersistentMCPTestFixture
         ) throws {
             let runID = try XCTUnwrap(context.runID)
-            let session = fixture.contextA.window.agentModeViewModel.session(for: context.tabID)
+            let session = try XCTUnwrap(
+                fixture.contextA.window.agentModeViewModel.session(for: context.tabID, createIfNeeded: true)
+            )
             session.runID = runID
             session.runState = .running
             fixture.contextA.window.agentModeViewModel.setAgentRunActive(

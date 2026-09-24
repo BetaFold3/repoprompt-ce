@@ -91,6 +91,61 @@ final class RemoteSidebarBadgingTests: XCTestCase {
         XCTAssertEqual(parent.hiddenThreadDescendantCount, 1)
     }
 
+    func testScheduledStatusSurvivesThreadCollapseCopy() {
+        let viewModel = makeViewModel()
+        let parentTabID = id(13)
+        let childTabID = id(14)
+        let parentSessionID = id(113)
+        let childSessionID = id(114)
+        let tabs = [
+            tab(parentTabID, sessionID: parentSessionID),
+            tab(childTabID, sessionID: childSessionID)
+        ]
+        let workspace = WorkspaceModel(
+            name: "Scheduled Sidebar Badge",
+            repoPaths: [],
+            ephemeralFlag: true,
+            composeTabs: tabs,
+            activeComposeTabID: nil
+        )
+        let owner = viewModel.test_receiveWorkspaceSwitchNotification(workspace)
+        var parentEntry = entry(parentSessionID, tabID: parentTabID, lastUserMessageAt: nil)
+        let scheduledFor = date(1_800_000_000)
+        parentEntry.scheduledSendSummary = AgentSessionScheduledSendSummary(
+            id: UUID(),
+            createdAt: scheduledFor.addingTimeInterval(-60),
+            updatedAt: scheduledFor.addingTimeInterval(-30),
+            notBefore: scheduledFor,
+            stateRaw: AgentScheduledSendPersist.State.scheduled.rawValue,
+            confirmationReasonRaw: nil,
+            isNewSessionStart: true,
+            runAlongsideOtherSessions: false,
+            previewText: "Send later",
+            isUnreadable: false
+        )
+        viewModel.test_installSessionIndexSnapshot(
+            sessionIndex([
+                parentEntry,
+                entry(
+                    childSessionID,
+                    tabID: childTabID,
+                    parentSessionID: parentSessionID,
+                    lastUserMessageAt: date(50)
+                )
+            ]),
+            owner: owner,
+            latestOwner: owner,
+            activeWorkspace: workspace
+        )
+        viewModel.setSidebarThreadCollapsed(true, for: .session(parentSessionID))
+
+        let rows = viewModel.filteredSidebarSessions(for: tabs, currentTabID: nil)
+
+        XCTAssertEqual(rows.map(\.tabID), [parentTabID])
+        XCTAssertEqual(rows.first?.scheduledSendStatus, .pending(scheduledFor))
+        XCTAssertTrue(rows.first?.searchFields.fields.map(\.text).contains("scheduled") == true)
+    }
+
     func testRemoteControlDeviceIDUsesRemoteOriginFromIndexEntry() throws {
         let tabID = id(21)
         let sessionID = id(121)

@@ -24,6 +24,45 @@ struct AgentSessionIndexEntry: Identifiable, Equatable {
     var profile: AgentSessionProfile = .standard
     var worktreeBindingSummaries: [AgentSessionWorktreeBindingSummary]
     var activeWorktreeMergeSummaries: [AgentSessionWorktreeMergeSummary]
+    /// Pending scheduled-send discovery hint. Counts as conversation content for sidebar
+    /// visibility and titling; the coordinator revalidates it against the hydrated record.
+    var scheduledSendSummary: AgentSessionScheduledSendSummary?
+    var lastScheduledDispatch: AgentScheduledSendProvenance?
+
+    var hasUnreadableScheduledSend: Bool {
+        scheduledSendSummary?.isUnreadable == true
+    }
+}
+
+enum AgentSidebarScheduledSendStatus: Equatable {
+    case pending(Date?)
+    case dispatching(Date?)
+    case needsConfirmation(Date?)
+    case failed(Date?)
+    case unreadable
+    case sent(AgentScheduledSendProvenance)
+
+    init?(summary: AgentSessionScheduledSendSummary?, lastDispatch: AgentScheduledSendProvenance?) {
+        if let summary {
+            if summary.isUnreadable {
+                self = .unreadable
+                return
+            }
+            switch summary.stateRaw.flatMap(AgentScheduledSendPersist.State.init(rawValue:)) ?? .needsConfirmation {
+            case .scheduled:
+                self = .pending(summary.notBefore)
+            case .dispatching:
+                self = .dispatching(summary.notBefore)
+            case .needsConfirmation:
+                self = .needsConfirmation(summary.notBefore)
+            case .failed:
+                self = .failed(summary.notBefore)
+            }
+            return
+        }
+        guard let lastDispatch else { return nil }
+        self = .sent(lastDispatch)
+    }
 }
 
 struct AgentSessionSidebarBuildRequest {
@@ -72,6 +111,9 @@ struct AgentSessionHydrationRequest {
 struct AgentSessionHydrationPayload {
     let sessionID: UUID
     let persistedSession: AgentSession
+    /// Service-issued lifetime/reset state issued by the same gate-held load that produced
+    /// `persistedSession`; the owner adopts both together.
+    let persistenceState: AgentSessionPersistenceState
     let canonicalLiveItems: [AgentChatItem]
     let transcript: AgentTranscript
     let builtPresentation: AgentModeViewModel.BuiltTranscriptPresentation

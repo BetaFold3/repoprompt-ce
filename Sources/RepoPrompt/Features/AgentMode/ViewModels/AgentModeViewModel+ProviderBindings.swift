@@ -14,7 +14,7 @@ extension AgentModeViewModel {
             syncAllActiveUIState()
             return
         }
-        _ = session(for: tabID)
+        guard session(for: tabID, createIfNeeded: true) != nil else { return }
         let scope = applyEditsScope(for: tabID)
         Task { [applyEditsApprovalStore] in
             await applyEditsApprovalStore.setAutoEditEnabled(

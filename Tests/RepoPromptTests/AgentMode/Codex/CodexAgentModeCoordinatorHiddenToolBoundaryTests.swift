@@ -7,7 +7,9 @@ final class CodexAgentModeCoordinatorHiddenToolBoundaryTests: XCTestCase {
     func testHiddenSetStatusBetweenCompletedAssistantItemsStillProducesTwoAssistantRows() async {
         let controller = HiddenToolBoundaryFakeCodexController(snapshot: .active(activeFlags: []))
         let viewModel = makeViewModel(controller: controller)
-        let session = preparedCodexSession(in: viewModel, controller: controller)
+        guard let session = preparedCodexSession(in: viewModel, controller: controller) else {
+            return XCTFail("Expected the Codex test session to materialize")
+        }
         let firstScope = CodexNativeSessionController.ItemScope(
             turnID: "turn",
             itemID: "assistant-a"
@@ -55,7 +57,9 @@ final class CodexAgentModeCoordinatorHiddenToolBoundaryTests: XCTestCase {
     func testHiddenSetStatusMidStreamFlushesBufferedDeltaWithoutCreatingNewAssistantSegment() async {
         let controller = HiddenToolBoundaryFakeCodexController(snapshot: .active(activeFlags: []))
         let viewModel = makeViewModel(controller: controller)
-        let session = preparedCodexSession(in: viewModel, controller: controller)
+        guard let session = preparedCodexSession(in: viewModel, controller: controller) else {
+            return XCTFail("Expected the Codex test session to materialize")
+        }
         let invocationID = UUID()
 
         await viewModel.test_codexCoordinator.test_handleCodexNativeEvent(.assistantDelta("A"), session: session)
@@ -82,7 +86,9 @@ final class CodexAgentModeCoordinatorHiddenToolBoundaryTests: XCTestCase {
     func testVisibleTrackerToolStillSealsAssistantBoundaryAroundToolRow() async {
         let controller = HiddenToolBoundaryFakeCodexController(snapshot: .active(activeFlags: []))
         let viewModel = makeViewModel(controller: controller)
-        let session = preparedCodexSession(in: viewModel, controller: controller)
+        guard let session = preparedCodexSession(in: viewModel, controller: controller) else {
+            return XCTFail("Expected the Codex test session to materialize")
+        }
         let invocationID = UUID()
 
         await viewModel.test_codexCoordinator.test_handleCodexNativeEvent(.assistantDelta("A"), session: session)
@@ -112,7 +118,9 @@ final class CodexAgentModeCoordinatorHiddenToolBoundaryTests: XCTestCase {
     func testHiddenWaitForNextUserInstructionFlushesBufferedDeltaWhenSessionParks() async {
         let controller = HiddenToolBoundaryFakeCodexController(snapshot: .active(activeFlags: []))
         let viewModel = makeViewModel(controller: controller)
-        let session = preparedCodexSession(in: viewModel, controller: controller)
+        guard let session = preparedCodexSession(in: viewModel, controller: controller) else {
+            return XCTFail("Expected the Codex test session to materialize")
+        }
         let invocationID = UUID()
 
         await viewModel.test_codexCoordinator.test_handleCodexNativeEvent(.assistantDelta("A"), session: session)
@@ -149,8 +157,11 @@ final class CodexAgentModeCoordinatorHiddenToolBoundaryTests: XCTestCase {
         in viewModel: AgentModeViewModel,
         controller: HiddenToolBoundaryFakeCodexController,
         runID: UUID = UUID()
-    ) -> AgentModeViewModel.TabSession {
-        let session = viewModel.session(for: UUID())
+    ) -> AgentModeViewModel.TabSession? {
+        guard let session = viewModel.session(for: UUID(), createIfNeeded: true) else {
+            XCTFail("Expected the Codex test session to materialize")
+            return nil
+        }
         session.selectedAgent = .codexExec
         session.runID = runID
         session.runState = .running

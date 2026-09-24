@@ -11,7 +11,7 @@ final class AgentModeViewModelAskUserTimeoutTests: XCTestCase {
             codexControllerFactory: { _, _, _, _, _, _ in AskUserTimeoutNoopCodexController() }
         )
         viewModel.test_setCurrentTabIDOverride(tabID)
-        let session = await viewModel.ensureSessionReady(tabID: tabID)
+        let session = try await viewModel.ensureSessionReady(tabID: tabID)
         let interactionID = try XCTUnwrap(UUID(uuidString: "11111111-1111-1111-1111-111111111111"))
         let interaction = AgentAskUserInteraction(
             id: interactionID,

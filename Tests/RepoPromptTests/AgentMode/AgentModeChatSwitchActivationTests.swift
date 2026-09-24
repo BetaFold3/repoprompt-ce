@@ -798,6 +798,35 @@ final class AgentModeChatSwitchActivationTests: XCTestCase {
             await fixture.window.promptManager.switchComposeTab(fixture.tabBID)
             XCTAssertEqual(fixture.viewModel.currentTabID, fixture.tabBID)
 
+            // A pending scheduled send on the source must never travel with a handoff (plan §3.1).
+            let sourceScheduleCreatedAt = Date()
+            let sourceSchedule = AgentScheduledSendPersist(
+                id: UUID(),
+                createdAt: sourceScheduleCreatedAt,
+                updatedAt: sourceScheduleCreatedAt,
+                notBefore: sourceScheduleCreatedAt.addingTimeInterval(900),
+                state: .scheduled,
+                confirmationReason: nil,
+                rawText: "scheduled on the source",
+                attachments: [],
+                taggedFileAttachments: [],
+                workflow: nil,
+                interviewFirst: false,
+                isNewSessionStart: false,
+                runAlongsideOtherSessions: false,
+                firstEligibleAt: nil,
+                attempt: nil,
+                lastFailureMessage: nil
+            )
+            let sourceReceipt = AgentScheduledSendProvenance(
+                scheduleID: UUID(),
+                attemptID: UUID(),
+                scheduledFor: sourceScheduleCreatedAt,
+                sentAt: sourceScheduleCreatedAt
+            )
+            fixture.sessionA.scheduledSend = .v1(sourceSchedule)
+            fixture.sessionA.lastScheduledDispatch = sourceReceipt
+
             let destinationTabID = try await fixture.viewModel.prepareHandoffHeadless(
                 sourceTabID: fixture.tabAID,
                 upToItemID: nil,
@@ -811,6 +840,10 @@ final class AgentModeChatSwitchActivationTests: XCTestCase {
             XCTAssertNotEqual(destinationTabID, fixture.tabBID)
 
             let destinationSession = try XCTUnwrap(fixture.viewModel.sessions[destinationTabID])
+            XCTAssertNil(destinationSession.scheduledSend, "Handoff destinations never inherit a pending schedule")
+            XCTAssertNil(destinationSession.lastScheduledDispatch, "Handoff destinations never inherit a dispatch receipt")
+            XCTAssertNil(destinationSession.scheduledSendWorkspaceID)
+            XCTAssertEqual(fixture.sessionA.scheduledSend, .v1(sourceSchedule), "The source keeps its own schedule")
             XCTAssertEqual(destinationSession.items.map(\.text), fixture.tabATexts)
             XCTAssertNil(destinationSession.pendingHandoff.sourceItemID)
             let pendingPayload = try XCTUnwrap(destinationSession.pendingHandoff.payload)
@@ -1376,8 +1409,8 @@ final class AgentModeChatSwitchActivationTests: XCTestCase {
             )
 
             let viewModel = window.agentModeViewModel
-            let sessionA = viewModel.session(for: tabAID)
-            let sessionB = viewModel.session(for: tabBID)
+            let sessionA = try XCTUnwrap(viewModel.session(for: tabAID, createIfNeeded: true))
+            let sessionB = try XCTUnwrap(viewModel.session(for: tabBID, createIfNeeded: true))
             XCTAssertEqual(sessionA.activeAgentSessionID, sessionAID)
             XCTAssertEqual(sessionB.activeAgentSessionID, sessionBID)
             XCTAssertEqual(window.workspaceManager.activeAgentSessionID(forTabID: tabAID), sessionAID)

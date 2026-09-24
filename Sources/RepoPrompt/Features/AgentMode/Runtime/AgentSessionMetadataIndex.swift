@@ -1,7 +1,7 @@
 import Foundation
 
 struct AgentSessionMetadataIndex: Codable, Equatable {
-    static let currentSchemaVersion = 6
+    static let currentSchemaVersion = 7
 
     var schemaVersion: Int
     var generatedAt: Date
@@ -38,6 +38,82 @@ struct AgentSessionMetadataIndex: Codable, Equatable {
         lastReconciledAt = try container.decodeIfPresent(Date.self, forKey: .lastReconciledAt)
         entries = try container.decodeIfPresent([AgentSessionMetadataRecord].self, forKey: .entries) ?? []
         quarantinedFiles = try container.decodeIfPresent([AgentSessionMetadataQuarantineRecord].self, forKey: .quarantinedFiles) ?? []
+    }
+}
+
+/// Compact projection of a persisted scheduled-send member for index discovery and sidebar
+/// content guards. Carries only what admission and titling need; text is truncated.
+struct AgentSessionScheduledSendSummary: Codable, Equatable {
+    static let previewTextLimit = 120
+
+    var id: UUID?
+    var createdAt: Date?
+    var updatedAt: Date?
+    var notBefore: Date?
+    var stateRaw: String?
+    var confirmationReasonRaw: String?
+    var isNewSessionStart: Bool
+    var runAlongsideOtherSessions: Bool
+    var previewText: String
+    var isUnreadable: Bool
+
+    static func make(from member: AgentScheduledSendMember?) -> AgentSessionScheduledSendSummary? {
+        switch member {
+        case nil:
+            nil
+        case .unreadable?:
+            AgentSessionScheduledSendSummary(
+                id: nil,
+                createdAt: nil,
+                updatedAt: nil,
+                notBefore: nil,
+                stateRaw: nil,
+                confirmationReasonRaw: nil,
+                isNewSessionStart: false,
+                runAlongsideOtherSessions: false,
+                previewText: "",
+                isUnreadable: true
+            )
+        case let .v1(record)?:
+            AgentSessionScheduledSendSummary(
+                id: record.id,
+                createdAt: record.createdAt,
+                updatedAt: record.updatedAt,
+                notBefore: record.notBefore,
+                stateRaw: record.state.rawValue,
+                confirmationReasonRaw: record.confirmationReason?.rawValue,
+                isNewSessionStart: record.isNewSessionStart,
+                runAlongsideOtherSessions: record.runAlongsideOtherSessions,
+                previewText: String(record.rawText.prefix(previewTextLimit)),
+                isUnreadable: false
+            )
+        }
+    }
+
+    /// Placeholder record used only as a discovery candidate before hydration. Never dispatched:
+    /// the coordinator requires a hydrated candidate before handing out an admission lease.
+    var placeholderRecord: AgentScheduledSendPersist? {
+        guard !isUnreadable,
+              let id, let createdAt, let updatedAt, let notBefore, let stateRaw
+        else { return nil }
+        return AgentScheduledSendPersist(
+            id: id,
+            createdAt: createdAt,
+            updatedAt: updatedAt,
+            notBefore: notBefore,
+            state: AgentScheduledSendPersist.State(rawValue: stateRaw) ?? .needsConfirmation,
+            confirmationReason: confirmationReasonRaw.flatMap(AgentScheduledSendPersist.ConfirmationReason.init(rawValue:)),
+            rawText: previewText,
+            attachments: [],
+            taggedFileAttachments: [],
+            workflow: nil,
+            interviewFirst: false,
+            isNewSessionStart: isNewSessionStart,
+            runAlongsideOtherSessions: runAlongsideOtherSessions,
+            firstEligibleAt: nil,
+            attempt: nil,
+            lastFailureMessage: nil
+        )
     }
 }
 
@@ -78,6 +154,12 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
     var coveredTurnDurationSeconds: Int
     var interActiveIntervalGapSeconds: [Int]
     var toolCallCount: Int
+    var scheduledSendSummary: AgentSessionScheduledSendSummary?
+    var lastScheduledDispatch: AgentScheduledSendProvenance?
+
+    var hasUnreadableScheduledSend: Bool {
+        scheduledSendSummary?.isUnreadable == true
+    }
 
     /// Default idle threshold in minutes. Gaps between merged active intervals longer than this are idle.
     static let defaultIdleThresholdMinutes = 10
@@ -159,7 +241,9 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
         keyPaths: Set<String> = [],
         coveredTurnDurationSeconds: Int = 0,
         interActiveIntervalGapSeconds: [Int] = [],
-        toolCallCount: Int = 0
+        toolCallCount: Int = 0,
+        scheduledSendSummary: AgentSessionScheduledSendSummary? = nil,
+        lastScheduledDispatch: AgentScheduledSendProvenance? = nil
     ) {
         self.id = id
         self.filename = filename
@@ -195,6 +279,8 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
         self.coveredTurnDurationSeconds = coveredTurnDurationSeconds
         self.interActiveIntervalGapSeconds = interActiveIntervalGapSeconds
         self.toolCallCount = toolCallCount
+        self.scheduledSendSummary = scheduledSendSummary
+        self.lastScheduledDispatch = lastScheduledDispatch
     }
 
     enum CodingKeys: String, CodingKey {
@@ -232,6 +318,8 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
         case coveredTurnDurationSeconds
         case interActiveIntervalGapSeconds
         case toolCallCount
+        case scheduledSendSummary
+        case lastScheduledDispatch
     }
 
     init(from decoder: Decoder) throws {
@@ -290,6 +378,8 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
         coveredTurnDurationSeconds = try container.decodeIfPresent(Int.self, forKey: .coveredTurnDurationSeconds) ?? 0
         interActiveIntervalGapSeconds = try container.decodeIfPresent([Int].self, forKey: .interActiveIntervalGapSeconds) ?? []
         toolCallCount = try container.decodeIfPresent(Int.self, forKey: .toolCallCount) ?? 0
+        scheduledSendSummary = try container.decodeIfPresent(AgentSessionScheduledSendSummary.self, forKey: .scheduledSendSummary)
+        lastScheduledDispatch = try container.decodeIfPresent(AgentScheduledSendProvenance.self, forKey: .lastScheduledDispatch)
     }
 
     func sidebarEntry(tabID overrideTabID: UUID? = nil, displayName: String? = nil) -> AgentSessionIndexEntry? {
@@ -315,7 +405,9 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
             origin: effectiveOrigin,
             profile: profile,
             worktreeBindingSummaries: worktreeBindingSummaries,
-            activeWorktreeMergeSummaries: activeWorktreeMergeSummaries
+            activeWorktreeMergeSummaries: activeWorktreeMergeSummaries,
+            scheduledSendSummary: scheduledSendSummary,
+            lastScheduledDispatch: lastScheduledDispatch
         )
     }
 
@@ -374,6 +466,8 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
             && coveredTurnDurationSeconds == other.coveredTurnDurationSeconds
             && interActiveIntervalGapSeconds == other.interActiveIntervalGapSeconds
             && toolCallCount == other.toolCallCount
+            && scheduledSendSummary == other.scheduledSendSummary
+            && lastScheduledDispatch == other.lastScheduledDispatch
     }
 
     static func record(
@@ -423,7 +517,9 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
             keyPaths: aggregatedKeyPaths,
             coveredTurnDurationSeconds: durationPrimitives.coveredSeconds,
             interActiveIntervalGapSeconds: durationPrimitives.gapSeconds,
-            toolCallCount: computedToolCallCount
+            toolCallCount: computedToolCallCount,
+            scheduledSendSummary: AgentSessionScheduledSendSummary.make(from: session.scheduledSend),
+            lastScheduledDispatch: session.lastScheduledDispatch
         )
     }
 

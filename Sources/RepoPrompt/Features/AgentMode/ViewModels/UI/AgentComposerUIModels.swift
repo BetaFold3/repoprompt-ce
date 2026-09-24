@@ -173,7 +173,7 @@ struct AgentComposerSubmissionLatch {
             && inputRevision == attempt.inputRevision
             && currentRawDraft == attempt.rawDraftSnapshot
         switch result {
-        case .submitted:
+        case .submitted, .scheduled:
             return CompletionEffects(
                 matchedAttempt: true,
                 shouldClearInput: inputStillMatches,
@@ -190,10 +190,240 @@ struct AgentComposerSubmissionLatch {
     }
 }
 
+struct AgentScheduledSendProps: Equatable, Identifiable {
+    enum Status: Equatable {
+        case scheduled
+        case waitingForCurrentRun(blockingSessionName: String?)
+        case waitingForWorkspace(blockingSessionName: String?)
+        case needsConfirmation(AgentScheduledSendPersist.ConfirmationReason?)
+        case dispatching
+        /// Provider accepted the message; the durable commit of item + receipt is still pending
+        /// and automatic persistence retries are in progress.
+        case finalizing
+        /// Provider accepted the message; automatic persistence stopped. Only a persistence
+        /// retry is offered (never a provider re-send).
+        case savingFailed(message: String?)
+        case failed(message: String?)
+        /// Persisted member this build cannot read; only Discard is offered.
+        case unreadable
+    }
+
+    let id: UUID
+    let tabID: UUID
+    let notBefore: Date
+    let rawText: String
+    let attachments: AgentAttachmentStripSnapshot
+    let isNewSessionStart: Bool
+    let runAlongsideOtherSessions: Bool
+    let firstEligibleAt: Date?
+    let status: Status
+    /// Recovery guidance that must be visible before any re-drive (for example the explicit
+    /// duplicate-delivery warning after an interrupted dispatch whose bubble already exists).
+    let recoveryMessage: String?
+    /// A coordinator decision that the record requires confirmation whose durable save has not
+    /// been acknowledged yet. Automatic sending is paused; the banner presents the confirmation
+    /// state derived from the decision rather than from the persisted record.
+    let pendingConfirmationSaving: PendingConfirmationSaving?
+
+    enum PendingConfirmationSaving: Equatable {
+        case saving
+        case needsAttention(message: String?)
+    }
+
+    init(
+        tabID: UUID,
+        scheduledSend: AgentScheduledSendPersist,
+        blockingSessionName: String? = nil,
+        recoveryPhase: AgentScheduledSendRecoveryPhase? = nil,
+        pendingConfirmation: AgentScheduledSendPendingConfirmationStatus? = nil
+    ) {
+        id = scheduledSend.id
+        self.tabID = tabID
+        notBefore = scheduledSend.notBefore
+        rawText = scheduledSend.rawText
+        attachments = AgentAttachmentStripSnapshot(
+            scopeTabID: tabID,
+            imageAttachments: scheduledSend.attachments,
+            taggedFileAttachments: scheduledSend.taggedFileAttachments
+        )
+        isNewSessionStart = scheduledSend.isNewSessionStart
+        runAlongsideOtherSessions = scheduledSend.runAlongsideOtherSessions
+        firstEligibleAt = scheduledSend.firstEligibleAt
+        if let pendingConfirmation, scheduledSend.state != .dispatching {
+            // Derived projection: the decision blocks sending now even though the persisted
+            // record has not been rewritten yet.
+            status = .needsConfirmation(pendingConfirmation.reason)
+            switch pendingConfirmation.phase {
+            case let .needsAttention(lastFailure):
+                pendingConfirmationSaving = .needsAttention(message: lastFailure)
+                recoveryMessage = Self.pendingConfirmationAttentionMessage
+            case .waitingForOwner, .saving, .waitingToRetry:
+                pendingConfirmationSaving = .saving
+                recoveryMessage = Self.pendingConfirmationSavingMessage
+            }
+            return
+        }
+        pendingConfirmationSaving = nil
+        status = switch scheduledSend.state {
+        case .scheduled where scheduledSend.firstEligibleAt != nil && scheduledSend.isNewSessionStart:
+            .waitingForWorkspace(blockingSessionName: blockingSessionName)
+        case .scheduled where scheduledSend.firstEligibleAt != nil:
+            .waitingForCurrentRun(blockingSessionName: blockingSessionName)
+        case .scheduled:
+            .scheduled
+        case .needsConfirmation:
+            .needsConfirmation(scheduledSend.confirmationReason)
+        case .dispatching where recoveryPhase != nil:
+            Self.acceptedStatus(for: recoveryPhase)
+        case .dispatching:
+            .dispatching
+        case .failed:
+            .failed(message: scheduledSend.lastFailureMessage)
+        }
+        recoveryMessage = switch scheduledSend.state {
+        case .needsConfirmation:
+            scheduledSend.lastFailureMessage.flatMap { $0.isEmpty ? nil : $0 }
+        case .dispatching where recoveryPhase.map(Self.isAttention) == true:
+            Self.savingFailedRecoveryMessage
+        case .scheduled, .dispatching, .failed:
+            nil
+        }
+    }
+
+    static let savingFailedRecoveryMessage =
+        "Message sent, but saving has not completed. Retry saving will not send the message again."
+    static let pendingConfirmationSavingMessage =
+        "Automatic sending is paused until this confirmation is saved."
+    static let pendingConfirmationAttentionMessage =
+        "Automatic sending is paused. Saving the confirmation failed; retry saving or confirm the message yourself."
+
+    private static func acceptedStatus(for phase: AgentScheduledSendRecoveryPhase?) -> Status {
+        switch phase {
+        case let .needsAttention(reason)?:
+            .savingFailed(message: attentionMessage(for: reason))
+        case .awaitingProviderOutcome?, .saving?, .waitingToRetry?, nil:
+            .finalizing
+        }
+    }
+
+    private static func isAttention(_ phase: AgentScheduledSendRecoveryPhase) -> Bool {
+        if case .needsAttention = phase { return true }
+        return false
+    }
+
+    private static func attentionMessage(for reason: AgentScheduledSendRecoveryAttentionReason) -> String? {
+        switch reason {
+        case let .persistenceExhausted(lastFailure):
+            lastFailure.isEmpty ? nil : lastFailure
+        case .destinationUnavailable:
+            "The workspace storage folder is unavailable."
+        case let .invalidAcceptanceEvidence(detail):
+            detail.isEmpty ? nil : detail
+        case .unresolvedProviderOutcome:
+            "The provider outcome was not reported before this window went away."
+        }
+    }
+
+    private init(unreadableForTabID tabID: UUID) {
+        id = tabID
+        self.tabID = tabID
+        notBefore = .distantPast
+        rawText = ""
+        attachments = AgentAttachmentStripSnapshot(
+            scopeTabID: tabID,
+            imageAttachments: [],
+            taggedFileAttachments: []
+        )
+        isNewSessionStart = false
+        runAlongsideOtherSessions = false
+        firstEligibleAt = nil
+        status = .unreadable
+        pendingConfirmationSaving = nil
+        recoveryMessage = "This scheduled message was saved by a newer or incompatible version and can't be read here. It will never be sent automatically."
+    }
+
+    static func unreadable(tabID: UUID) -> AgentScheduledSendProps {
+        AgentScheduledSendProps(unreadableForTabID: tabID)
+    }
+
+    var isUnreadable: Bool {
+        status == .unreadable
+    }
+}
+
+struct AgentScheduledSendActions {
+    let executeSchedule: (
+        _ claim: AgentModeViewModel.AgentComposerSubmitClaim,
+        _ text: String,
+        _ notBefore: Date,
+        _ runAlongsideOtherSessions: Bool
+    ) async -> AgentModeViewModel.UserTurnSubmissionResult
+    let update: (
+        _ tabID: UUID,
+        _ scheduleID: UUID,
+        _ text: String,
+        _ notBefore: Date,
+        _ runAlongsideOtherSessions: Bool,
+        _ removingImageAttachmentIDs: Set<UUID>,
+        _ removingTaggedFileAttachmentIDs: Set<UUID>
+    ) async -> String?
+    let cancel: (_ tabID: UUID, _ scheduleID: UUID) async -> String?
+    let sendNow: (
+        _ tabID: UUID,
+        _ scheduleID: UUID,
+        _ runAlongsideOtherSessions: Bool
+    ) async -> String?
+    let discardUnreadable: (_ tabID: UUID) async -> String?
+    /// Persistence-only retry for an accepted message whose durable save stopped; never a send.
+    let retrySaving: (_ tabID: UUID) async -> String?
+}
+
+/// Presentation of a stale-reset recovery: this tab retains a local conversation that cannot be
+/// saved because the conversation was reset in another window; only an explicit reload replaces it.
+struct AgentStaleResetRecoveryProps: Equatable, Identifiable {
+    enum Status: Equatable {
+        case stopping
+        case retained
+        case reloading
+    }
+
+    let tabID: UUID
+    let recoveryID: UUID
+    let status: Status
+    /// Last reported problem (failed stop or failed reload); the retained view is unchanged.
+    let problem: String?
+
+    var id: UUID {
+        recoveryID
+    }
+
+    var canReload: Bool {
+        status == .retained
+    }
+
+    var canRetryStop: Bool {
+        status == .stopping && problem != nil
+    }
+}
+
+struct AgentStaleResetRecoveryActions {
+    /// Explicitly confirmed replacement of the retained view by the persisted snapshot.
+    let reloadLatest: (_ tabID: UUID, _ recoveryID: UUID) async -> String?
+    /// One more stop attempt after a reported stop problem.
+    let retryStopping: (_ tabID: UUID, _ recoveryID: UUID) async -> String?
+}
+
 struct AgentComposerProps: Equatable {
     let currentTabID: UUID?
     let submitTarget: AgentComposerSubmitTarget?
     let attachments: AgentAttachmentStripSnapshot
+    let scheduledSend: AgentScheduledSendProps?
+    let staleResetRecovery: AgentStaleResetRecoveryProps?
+    let canSchedule: Bool
+    /// Semantic first-prompt predicate (unlinked tab or linked-but-untouched session): the
+    /// schedule control offers "Run alongside other sessions" exactly when the record will be a
+    /// workspace-gated new-session start.
+    let scheduleTargetIsNewSessionStart: Bool
     let runState: AgentSessionRunState
     let cancelTarget: AgentRunCancelTarget?
     let isAgentBusy: Bool
@@ -230,6 +460,10 @@ struct AgentComposerProps: Equatable {
             imageAttachments: [],
             taggedFileAttachments: []
         ),
+        scheduledSend: nil,
+        staleResetRecovery: nil,
+        canSchedule: false,
+        scheduleTargetIsNewSessionStart: false,
         runState: .idle,
         cancelTarget: nil,
         isAgentBusy: false,

@@ -10,6 +10,113 @@ enum AgentSessionDataError: Error {
     case noActiveWorkspace
 }
 
+enum AgentSessionFileCreationPolicy {
+    /// Existing behavior for deliberate initial session creation.
+    case createIfMissing
+    /// A writer targeting an existing incarnation must not recreate an explicitly deleted file.
+    case requireExisting
+}
+
+/// Immutable, process-local ownership of one durable session incarnation. Callers capture this
+/// once when they create or hydrate an editable session and never refresh it after deletion.
+struct AgentSessionPersistenceStamp: Hashable {
+    let sessionID: UUID
+    let workspaceID: UUID
+    let deletionGeneration: UInt64
+    fileprivate let serviceID: UUID
+    fileprivate let fileURL: URL
+}
+
+/// Full-save authority for one session incarnation and transcript-reset generation.
+struct AgentSessionPersistenceState: Hashable {
+    let stamp: AgentSessionPersistenceStamp
+    let transcriptResetGeneration: UInt64
+}
+
+struct AgentSessionEditableLoad {
+    let session: AgentSession
+    let persistenceState: AgentSessionPersistenceState
+}
+
+struct AgentSessionDeletionCandidate: Hashable {
+    let composeTabID: UUID
+    let persistenceState: AgentSessionPersistenceState
+
+    var sessionID: UUID {
+        persistenceState.stamp.sessionID
+    }
+
+    var storagePath: String {
+        persistenceState.stamp.fileURL.path
+    }
+}
+
+enum AgentSessionConditionalDeletionResult: Equatable {
+    case deleted
+    case alreadyAbsent
+    case ownershipChanged
+}
+
+struct AgentSessionSaveCommit {
+    enum Disposition: Equatable {
+        case written
+        case resetAlreadyCommitted
+    }
+
+    let fileURL: URL
+    let persistenceState: AgentSessionPersistenceState
+    let disposition: Disposition
+}
+
+enum AgentScheduledSendMutationError: Error, Equatable {
+    case sessionNotFound(UUID)
+    case unreadableScheduledSend(UUID)
+    case staleExpectedUpdatedAt(expected: Date?, actual: Date?)
+    case staleExpectedAttempt(
+        expected: AgentScheduledSendPersist.Attempt,
+        actual: AgentScheduledSendPersist.Attempt?
+    )
+    case scheduledSendNotDispatching(actual: AgentScheduledSendPersist.State)
+    case invalidAcceptedUserItem(expectedItemID: UUID, actualItemID: UUID)
+    case acceptedItemNotUser(UUID)
+    case invalidDispatchReceipt
+    case staleExpectedScheduledSendMember(
+        expected: AgentScheduledSendMember,
+        actual: AgentScheduledSendMember?
+    )
+    case staleExpectedFinalizedItem(
+        itemID: UUID,
+        expected: AgentScheduledSendProvenance,
+        actual: AgentScheduledSendProvenance?
+    )
+    case invalidPersistenceStamp
+    case staleDeletionGeneration(expected: UInt64, actual: UInt64)
+    case staleTranscriptResetGeneration(expected: UInt64, actual: UInt64)
+    case sessionAlreadyExists(UUID)
+}
+
+struct AgentScheduledSendFinalizedItemRemoval: Equatable {
+    let itemID: UUID
+    let receipt: AgentScheduledSendProvenance
+}
+
+enum AgentScheduledSendMutation {
+    case upsert(expectedUpdatedAt: Date?, value: AgentScheduledSendPersist)
+    case clear(expectedUpdatedAt: Date, completedDispatch: AgentScheduledSendProvenance?)
+    case discardUnreadable(expected: AgentScheduledSendJSONValue)
+}
+
+struct AgentScheduledSendMutationResult {
+    enum MetadataIndexStatus: Equatable {
+        case updated
+        case repairNeeded(String)
+    }
+
+    let session: AgentSession
+    let fileURL: URL
+    let metadataIndexStatus: MetadataIndexStatus
+}
+
 // MARK: - Agent Session Metadata
 
 /// Lightweight metadata for agent session listing
@@ -103,9 +210,24 @@ private actor AgentSessionDiskWriter {
 // MARK: - Agent Session Data Service
 
 /// An actor that reads/writes AgentSessions from each workspace's "AgentSessions" folder.
+///
+/// Production composition uses `shared` for every Agent Mode window and MCP entry point, so the
+/// per-session persistence gate below is process-wide for app writes. Direct instances remain
+/// available to isolated tests.
 actor AgentSessionDataService {
     static let shared = AgentSessionDataService()
 
+    #if DEBUG
+        private var testConditionalDeletionHook: (@Sendable (AgentSessionDeletionCandidate) async throws -> Void)?
+
+        func test_setConditionalDeletionHook(
+            _ hook: (@Sendable (AgentSessionDeletionCandidate) async throws -> Void)?
+        ) {
+            testConditionalDeletionHook = hook
+        }
+    #endif
+
+    private let persistenceServiceID = UUID()
     private let encoder = JSONEncoder()
     private let decoder = JSONDecoder()
     private let diskWriter = AgentSessionDiskWriter()
@@ -120,6 +242,58 @@ actor AgentSessionDataService {
     private var metadataIndexCacheByFolder: [URL: AgentSessionMetadataIndex] = [:]
     private var metadataIndexReconciliationTasksByFolder: [URL: MetadataIndexReconciliationTaskState] = [:]
     private var metadataIndexReconciledThisProcess: Set<URL> = []
+
+    private struct AgentSessionScheduleAuthority {
+        var scheduledSend: AgentScheduledSendMember?
+        var lastScheduledDispatch: AgentScheduledSendProvenance?
+        var protectedAcceptedUserItemsByID: [UUID: AgentChatItem]
+        var intentionallyRemovedAcceptedUserItemReceiptsByID: [UUID: AgentScheduledSendProvenance]
+    }
+
+    private struct AgentSessionTranscriptResetAuthority {
+        let deletionGeneration: UInt64
+        let generation: UInt64
+        let receipt: AgentSessionTranscriptResetReceipt
+        let canonicalSessionSnapshot: Data
+    }
+
+    private enum StaleFinalizedItemRemovalPolicy {
+        case fail
+        case ignore
+    }
+
+    /// Process-local authority used by ordinary saves after a schedule mutation/finalization.
+    /// Production uses the shared data service, so this both avoids a full JSON parse on the hot
+    /// save path and prevents stale VM snapshots from dropping finalized scheduled user items.
+    private var scheduleAuthorityByFileURL: [URL: AgentSessionScheduleAuthority] = [:]
+    private var transcriptResetAuthorityByFileURL: [URL: AgentSessionTranscriptResetAuthority] = [:]
+    private var activeSessionPersistence: Set<UUID> = []
+    private var sessionPersistenceWaiters: [UUID: [CheckedContinuation<Void, Never>]] = [:]
+    /// Process-local explicit-deletion evidence keyed by canonical session-file identity. A
+    /// recovery context captures the generation before provider handoff; an explicit deletion
+    /// (even of an already-absent file) advances it so an older context can never reconstruct.
+    private var deletionGenerationsByFileKey: [URL: UInt64] = [:]
+    #if DEBUG
+        /// Test seam: throws the returned error for recovery finalization attempts.
+        private var test_scheduledSendRecoveryFailureInjector: ((AgentScheduledSendAcceptedPayload) -> Error?)?
+
+        /// Installs (or clears with `nil`) the recovery failure injector. Callers that use the
+        /// shared instance must clear it during teardown.
+        func test_setScheduledSendRecoveryFailureInjector(
+            _ injector: (@Sendable (AgentScheduledSendAcceptedPayload) -> Error?)?
+        ) {
+            test_scheduledSendRecoveryFailureInjector = injector
+        }
+
+        /// Test seam: throws the returned error instead of unlinking an existing session file.
+        private var test_agentSessionDeletionFailureInjector: ((URL) -> Error?)?
+
+        func test_setAgentSessionDeletionFailureInjector(
+            _ injector: (@Sendable (URL) -> Error?)?
+        ) {
+            test_agentSessionDeletionFailureInjector = injector
+        }
+    #endif
 
     private enum AgentSessionMetadataIndexLoadMode {
         case fast
@@ -141,6 +315,11 @@ actor AgentSessionDataService {
 
     private struct AgentSessionLastRunStateHeader: Decodable {
         let lastRunState: String?
+    }
+
+    private struct AgentSessionScheduleHeader: Decodable {
+        let scheduledSend: AgentScheduledSendMember?
+        let lastScheduledDispatch: AgentScheduledSendProvenance?
     }
 
     private struct AgentSessionHeader: Decodable {
@@ -179,6 +358,8 @@ actor AgentSessionDataService {
         let isMCPOriginated: Bool?
         let origin: AgentSessionOrigin?
         let profile: AgentSessionProfile?
+        let scheduledSend: AgentScheduledSendMember?
+        let lastScheduledDispatch: AgentScheduledSendProvenance?
 
         private enum CodingKeys: String, CodingKey {
             case id
@@ -216,6 +397,8 @@ actor AgentSessionDataService {
             case isMCPOriginated
             case origin
             case profile
+            case scheduledSend
+            case lastScheduledDispatch
         }
 
         init(from decoder: Decoder) throws {
@@ -284,6 +467,11 @@ actor AgentSessionDataService {
             } else {
                 profile = nil
             }
+            scheduledSend = try container.decodeIfPresent(AgentScheduledSendMember.self, forKey: .scheduledSend)
+            lastScheduledDispatch = try container.decodeIfPresent(
+                AgentScheduledSendProvenance.self,
+                forKey: .lastScheduledDispatch
+            )
         }
     }
 
@@ -673,7 +861,10 @@ actor AgentSessionDataService {
         #endif
     }
 
-    private func upsertMetadataRecord(_ record: AgentSessionMetadataRecord, folder: URL) async {
+    private func upsertMetadataRecordReporting(
+        _ record: AgentSessionMetadataRecord,
+        folder: URL
+    ) async -> Result<Void, Error> {
         do {
             let key = canonicalMetadataFolderKey(folder)
             var index: AgentSessionMetadataIndex = if let cached = metadataIndexCacheByFolder[key] {
@@ -690,9 +881,15 @@ actor AgentSessionDataService {
             index.generatedAt = Date()
             metadataIndexCacheByFolder[key] = index
             try await writeMetadataIndex(index, folder: folder)
+            return .success(())
         } catch {
-            // Session files remain authoritative; a later backfill/reconcile can repair the index.
+            return .failure(error)
         }
+    }
+
+    private func upsertMetadataRecord(_ record: AgentSessionMetadataRecord, folder: URL) async {
+        _ = await upsertMetadataRecordReporting(record, folder: folder)
+        // Session files remain authoritative; a later backfill/reconcile can repair the index.
     }
 
     private func upsertMetadataRecordIfIndexPresent(_ session: AgentSession, fileURL: URL) async {
@@ -1040,34 +1237,1126 @@ actor AgentSessionDataService {
         return index.entries.sortedForAgentSessionMetadataIndex()
     }
 
+    private func canonicalSessionFileKey(_ fileURL: URL) -> URL {
+        fileURL.standardizedFileURL
+    }
+
+    private func currentTranscriptResetGeneration(for fileKey: URL) -> UInt64 {
+        transcriptResetAuthorityByFileURL[fileKey]?.generation ?? 0
+    }
+
+    private func persistenceState(
+        sessionID: UUID,
+        workspaceID: UUID,
+        fileURL: URL
+    ) -> AgentSessionPersistenceState {
+        let fileKey = canonicalSessionFileKey(fileURL)
+        return AgentSessionPersistenceState(
+            stamp: AgentSessionPersistenceStamp(
+                sessionID: sessionID,
+                workspaceID: workspaceID,
+                deletionGeneration: deletionGenerationsByFileKey[fileKey] ?? 0,
+                serviceID: persistenceServiceID,
+                fileURL: fileKey
+            ),
+            transcriptResetGeneration: currentTranscriptResetGeneration(for: fileKey)
+        )
+    }
+
+    private func validatePersistenceStamp(
+        _ stamp: AgentSessionPersistenceStamp,
+        sessionID: UUID,
+        workspaceID: UUID
+    ) throws {
+        guard stamp.serviceID == persistenceServiceID,
+              stamp.sessionID == sessionID,
+              stamp.workspaceID == workspaceID
+        else {
+            throw AgentScheduledSendMutationError.invalidPersistenceStamp
+        }
+        let currentGeneration = deletionGenerationsByFileKey[stamp.fileURL] ?? 0
+        guard stamp.deletionGeneration == currentGeneration else {
+            throw AgentScheduledSendMutationError.staleDeletionGeneration(
+                expected: stamp.deletionGeneration,
+                actual: currentGeneration
+            )
+        }
+    }
+
+    private func sessionContainsItem(_ session: AgentSession, itemID: UUID) -> Bool {
+        if session.items.contains(where: { $0.id == itemID }) {
+            return true
+        }
+        guard let transcript = session.transcript else { return false }
+        for turn in transcript.turns {
+            if turn.request?.id == itemID {
+                return true
+            }
+            if turn.responseSpans.contains(where: {
+                $0.activities.contains(where: { $0.id == itemID })
+            }) {
+                return true
+            }
+        }
+        return false
+    }
+
+    private func scheduleAuthority(
+        _ authority: AgentSessionScheduleAuthority,
+        applyingTranscriptResetTo postResetSession: AgentSession
+    ) -> AgentSessionScheduleAuthority {
+        var updated = authority
+        for (itemID, protectedItem) in authority.protectedAcceptedUserItemsByID
+            where !sessionContainsItem(postResetSession, itemID: itemID)
+        {
+            guard let receipt = protectedItem.scheduledSend else { continue }
+            updated.protectedAcceptedUserItemsByID.removeValue(forKey: itemID)
+            updated.intentionallyRemovedAcceptedUserItemReceiptsByID[itemID] = receipt
+        }
+        return updated
+    }
+
+    private func cachedOrLoadedScheduleAuthority(
+        for fileURL: URL
+    ) throws -> AgentSessionScheduleAuthority {
+        let key = canonicalSessionFileKey(fileURL)
+        if let cached = scheduleAuthorityByFileURL[key] {
+            return cached
+        }
+
+        let persistedData = try Data(contentsOf: fileURL, options: .mappedIfSafe)
+        let persistedHeader = try AgentSessionDataCodec.decodeEnvelope(
+            AgentSessionScheduleHeader.self,
+            from: persistedData,
+            using: decoder
+        ).value
+        let authority = AgentSessionScheduleAuthority(
+            scheduledSend: persistedHeader.scheduledSend,
+            lastScheduledDispatch: persistedHeader.lastScheduledDispatch,
+            protectedAcceptedUserItemsByID: [:],
+            intentionallyRemovedAcceptedUserItemReceiptsByID: [:]
+        )
+        scheduleAuthorityByFileURL[key] = authority
+        return authority
+    }
+
+    private func rememberScheduleAuthority(
+        from session: AgentSession,
+        fileURL: URL,
+        protecting acceptedUserItem: AgentChatItem? = nil,
+        preservingItemAuthority itemAuthority: AgentSessionScheduleAuthority? = nil
+    ) {
+        let key = canonicalSessionFileKey(fileURL)
+        let existingAuthority = itemAuthority ?? scheduleAuthorityByFileURL[key]
+        var protectedItems = existingAuthority?.protectedAcceptedUserItemsByID ?? [:]
+        var intentionallyRemovedItems =
+            existingAuthority?.intentionallyRemovedAcceptedUserItemReceiptsByID ?? [:]
+        if let acceptedUserItem {
+            protectedItems[acceptedUserItem.id] = acceptedUserItem
+            intentionallyRemovedItems.removeValue(forKey: acceptedUserItem.id)
+        }
+        scheduleAuthorityByFileURL[key] = AgentSessionScheduleAuthority(
+            scheduledSend: session.scheduledSend,
+            lastScheduledDispatch: session.lastScheduledDispatch,
+            protectedAcceptedUserItemsByID: protectedItems,
+            intentionallyRemovedAcceptedUserItemReceiptsByID: intentionallyRemovedItems
+        )
+    }
+
+    private func scheduleAuthority(
+        _ authority: AgentSessionScheduleAuthority,
+        applying removals: [AgentScheduledSendFinalizedItemRemoval],
+        to session: AgentSession,
+        staleRemovalPolicy: StaleFinalizedItemRemovalPolicy = .fail
+    ) throws -> AgentSessionScheduleAuthority {
+        guard !removals.isEmpty else { return authority }
+
+        var updated = authority
+        for removal in removals {
+            let conflictingReceipt = [
+                updated.protectedAcceptedUserItemsByID[removal.itemID]?.scheduledSend,
+                scheduledSendProvenance(in: session, itemID: removal.itemID),
+                updated.intentionallyRemovedAcceptedUserItemReceiptsByID[removal.itemID]
+            ]
+            .compactMap(\.self)
+            .first { $0 != removal.receipt }
+
+            if let conflictingReceipt {
+                switch staleRemovalPolicy {
+                case .fail:
+                    throw AgentScheduledSendMutationError.staleExpectedFinalizedItem(
+                        itemID: removal.itemID,
+                        expected: removal.receipt,
+                        actual: conflictingReceipt
+                    )
+                case .ignore:
+                    // The explicit reset still commits, but must not erase a newer accepted item.
+                    continue
+                }
+            }
+            updated.protectedAcceptedUserItemsByID.removeValue(forKey: removal.itemID)
+            updated.intentionallyRemovedAcceptedUserItemReceiptsByID[removal.itemID] = removal.receipt
+        }
+        return updated
+    }
+
+    private func sessionByApplyingScheduleAuthority(
+        _ authority: AgentSessionScheduleAuthority,
+        to session: AgentSession
+    ) -> AgentSession {
+        var merged = session
+        merged.scheduledSend = authority.scheduledSend
+        merged.lastScheduledDispatch = authority.lastScheduledDispatch
+        merged = sessionByMergingProtectedAcceptedUserItems(
+            authority.protectedAcceptedUserItemsByID,
+            into: merged
+        )
+        return sessionByRemovingIntentionallyRemovedAcceptedUserItems(
+            authority.intentionallyRemovedAcceptedUserItemReceiptsByID,
+            from: merged
+        )
+    }
+
+    private func scheduledSendProvenance(
+        in session: AgentSession,
+        itemID: UUID
+    ) -> AgentScheduledSendProvenance? {
+        if let item = session.items.first(where: { $0.id == itemID }),
+           let receipt = item.scheduledSend
+        {
+            return receipt
+        }
+        guard let transcript = session.transcript else { return nil }
+        for turn in transcript.turns {
+            if let request = turn.request,
+               request.id == itemID,
+               let receipt = request.scheduledSend
+            {
+                return receipt
+            }
+            for span in turn.responseSpans {
+                if let receipt = span.activities.first(where: { $0.id == itemID })?.scheduledSend {
+                    return receipt
+                }
+            }
+        }
+        return nil
+    }
+
+    private func finalizedScheduledUserItem(
+        in session: AgentSession,
+        itemID: UUID,
+        receipt: AgentScheduledSendProvenance
+    ) -> AgentChatItem? {
+        if let item = session.items.first(where: {
+            $0.id == itemID && $0.scheduledSend == receipt
+        }) {
+            return item.toItem()
+        }
+        guard let transcript = session.transcript else { return nil }
+        for turn in transcript.turns {
+            if let request = turn.request,
+               request.id == itemID,
+               request.scheduledSend == receipt
+            {
+                return request.toItem()
+            }
+            for span in turn.responseSpans {
+                if let activity = span.activities.first(where: {
+                    $0.id == itemID && $0.scheduledSend == receipt
+                }) {
+                    return activity.toItem()
+                }
+            }
+        }
+        return nil
+    }
+
+    private func sessionByRemovingIntentionallyRemovedAcceptedUserItems(
+        _ removedItemReceiptsByID: [UUID: AgentScheduledSendProvenance],
+        from session: AgentSession
+    ) -> AgentSession {
+        guard !removedItemReceiptsByID.isEmpty else { return session }
+
+        var updated = session
+        updated.items.removeAll { removedItemReceiptsByID[$0.id] != nil }
+        if var transcript = updated.transcript {
+            for turnIndex in transcript.turns.indices {
+                if let request = transcript.turns[turnIndex].request,
+                   removedItemReceiptsByID[request.id] != nil
+                {
+                    transcript.turns[turnIndex].request = nil
+                }
+                for spanIndex in transcript.turns[turnIndex].responseSpans.indices {
+                    transcript.turns[turnIndex].responseSpans[spanIndex].activities.removeAll {
+                        removedItemReceiptsByID[$0.id] != nil
+                    }
+                }
+            }
+            updated.transcript = transcript
+        }
+        return updated
+    }
+
+    private func sessionByMergingProtectedAcceptedUserItems(
+        _ protectedItemsByID: [UUID: AgentChatItem],
+        into session: AgentSession
+    ) -> AgentSession {
+        guard !protectedItemsByID.isEmpty else { return session }
+
+        var merged = session
+        var workingItems = merged.workingSourceItems()
+        var didChange = false
+        let protectedItems = protectedItemsByID.values.sorted { lhs, rhs in
+            if lhs.sequenceIndex == rhs.sequenceIndex {
+                if lhs.timestamp == rhs.timestamp {
+                    return lhs.id.uuidString < rhs.id.uuidString
+                }
+                return lhs.timestamp < rhs.timestamp
+            }
+            return lhs.sequenceIndex < rhs.sequenceIndex
+        }
+
+        for protectedItem in protectedItems {
+            if let receipt = protectedItem.scheduledSend,
+               finalizedScheduledUserItem(
+                   in: merged,
+                   itemID: protectedItem.id,
+                   receipt: receipt
+               ) != nil
+            {
+                continue
+            }
+            if let existingIndex = workingItems.firstIndex(where: { $0.id == protectedItem.id }) {
+                guard workingItems[existingIndex] != protectedItem else { continue }
+                workingItems[existingIndex] = protectedItem
+            } else {
+                workingItems.append(protectedItem)
+            }
+            didChange = true
+        }
+        guard didChange else { return merged }
+
+        workingItems.sort { lhs, rhs in
+            if lhs.sequenceIndex == rhs.sequenceIndex {
+                if lhs.timestamp == rhs.timestamp {
+                    return lhs.id.uuidString < rhs.id.uuidString
+                }
+                return lhs.timestamp < rhs.timestamp
+            }
+            return lhs.sequenceIndex < rhs.sequenceIndex
+        }
+        let nextSequenceIndex = max(
+            merged.transcript?.nextSequenceIndex ?? 0,
+            (workingItems.map(\.sequenceIndex).max() ?? -1) + 1
+        )
+        let terminalState = merged.lastRunState.flatMap(AgentSessionRunState.init(rawValue:))
+        if let transcript = merged.transcript {
+            merged.transcript = AgentTranscriptIO.rebuiltTranscriptPreservingCompactedPrefix(
+                existingTranscript: transcript,
+                workingItems: workingItems,
+                terminalState: terminalState,
+                nextSequenceIndex: nextSequenceIndex,
+                policy: .canonical
+            )
+        } else {
+            merged.transcript = AgentTranscriptIO.buildTranscript(
+                from: workingItems,
+                terminalState: terminalState,
+                nextSequenceIndex: nextSequenceIndex,
+                policy: .canonical
+            )
+        }
+        merged.items = workingItems.map {
+            AgentChatItemPersist(from: $0, sanitizeToolResults: false)
+        }
+        return merged
+    }
+
     // MARK: - Public API
 
-    /// Save an AgentSession for a given workspace, returning the file URL on success.
+    /// Issues the lifetime/reset state for a genuine initial creation. The caller retains this
+    /// value and must not replace it after a missing-file or deletion failure.
+    func prepareInitialAgentSessionPersistence(
+        sessionID: UUID,
+        for workspace: WorkspaceModel
+    ) async throws -> AgentSessionPersistenceState {
+        await acquireSessionPersistence(for: sessionID)
+        defer { releaseSessionPersistence(for: sessionID) }
+        let folder = try ensureAgentSessionsFolder(for: workspace)
+        let fileURL = agentSessionFileURL(id: sessionID, in: folder)
+        guard !FileManager.default.fileExists(atPath: fileURL.path) else {
+            throw AgentScheduledSendMutationError.sessionAlreadyExists(sessionID)
+        }
+        return persistenceState(
+            sessionID: sessionID,
+            workspaceID: workspace.id,
+            fileURL: fileURL
+        )
+    }
+
+    /// Loads an editable session and its process-local persistence state under one gate. The
+    /// caller must adopt both values together; the state cannot safely authorize an older snapshot.
+    func loadAgentSessionForEditing(
+        id sessionID: UUID,
+        for workspace: WorkspaceModel
+    ) async throws -> AgentSessionEditableLoad? {
+        await acquireSessionPersistence(for: sessionID)
+        defer { releaseSessionPersistence(for: sessionID) }
+        let folder = try ensureAgentSessionsFolder(for: workspace)
+        let fileURL = agentSessionFileURL(id: sessionID, in: folder)
+        guard FileManager.default.fileExists(atPath: fileURL.path) else { return nil }
+        let session = try await loadAgentSessionLocked(from: fileURL)
+        return AgentSessionEditableLoad(
+            session: session,
+            persistenceState: persistenceState(
+                sessionID: sessionID,
+                workspaceID: workspace.id,
+                fileURL: fileURL
+            )
+        )
+    }
+
+    /// Saves the full session while keeping schedule persistence under its dedicated CAS authority.
+    ///
+    /// On initial creation, the supplied schedule fields are written as-is. Once the file exists,
+    /// its `scheduledSend` and `lastScheduledDispatch` members are authoritative and are merged
+    /// into the full-session payload. Callers use `mutateScheduledSend` for schedule changes and
+    /// `finalizeScheduledSend` for provider-accepted turns. Finalized user items remain protected
+    /// from stale VM snapshots until a caller explicitly supplies their exact item/receipt identities
+    /// in `intentionallyRemovingFinalizedScheduledSendItems`. Explicit removals install process-local
+    /// tombstones so later stale snapshots cannot resurrect the removed items. A committed transcript
+    /// reset also records its canonical post-reset snapshot for accepted-send recovery after accidental
+    /// file loss. This URL-returning overload remains for generic compatibility; editable Agent Mode
+    /// owners must use the persistence-state overload below.
     func saveAgentSession(
         _ session: AgentSession,
         for workspace: WorkspaceModel,
         preparation: SavePreparation = .canonicalize,
-        trustedCanonicalItemCount: Int? = nil
+        trustedCanonicalItemCount: Int? = nil,
+        intentionallyRemovingFinalizedScheduledSendItems removals: [AgentScheduledSendFinalizedItemRemoval] = [],
+        committingTranscriptReset resetReceipt: AgentSessionTranscriptResetReceipt? = nil,
+        fileCreationPolicy: AgentSessionFileCreationPolicy = .createIfMissing
     ) async throws -> URL {
-        let agentSessionsFolder = try ensureAgentSessionsFolder(for: workspace)
+        await acquireSessionPersistence(for: session.id)
+        defer { releaseSessionPersistence(for: session.id) }
+        let commit = try await saveAgentSessionLocked(
+            session,
+            for: workspace,
+            preparation: preparation,
+            trustedCanonicalItemCount: trustedCanonicalItemCount,
+            intentionallyRemovingFinalizedScheduledSendItems: removals,
+            committingTranscriptReset: resetReceipt,
+            fileCreationPolicy: fileCreationPolicy,
+            expectedPersistenceState: nil
+        )
+        return commit.fileURL
+    }
 
-        let filename = "AgentSession-\(session.id.uuidString).json"
-        let fileURL = agentSessionsFolder.appendingPathComponent(filename)
+    /// Fenced full-save entry point for an editable owner. The returned state is the only state
+    /// that owner may use for later saves; failures never refresh or transfer ownership.
+    func saveAgentSession(
+        _ session: AgentSession,
+        for workspace: WorkspaceModel,
+        preparation: SavePreparation = .canonicalize,
+        trustedCanonicalItemCount: Int? = nil,
+        intentionallyRemovingFinalizedScheduledSendItems removals: [AgentScheduledSendFinalizedItemRemoval] = [],
+        committingTranscriptReset resetReceipt: AgentSessionTranscriptResetReceipt? = nil,
+        fileCreationPolicy: AgentSessionFileCreationPolicy = .createIfMissing,
+        persistenceState: AgentSessionPersistenceState
+    ) async throws -> AgentSessionSaveCommit {
+        await acquireSessionPersistence(for: session.id)
+        defer { releaseSessionPersistence(for: session.id) }
+        return try await saveAgentSessionLocked(
+            session,
+            for: workspace,
+            preparation: preparation,
+            trustedCanonicalItemCount: trustedCanonicalItemCount,
+            intentionallyRemovingFinalizedScheduledSendItems: removals,
+            committingTranscriptReset: resetReceipt,
+            fileCreationPolicy: fileCreationPolicy,
+            expectedPersistenceState: persistenceState
+        )
+    }
+
+    private func saveAgentSessionLocked(
+        _ session: AgentSession,
+        for workspace: WorkspaceModel,
+        preparation: SavePreparation,
+        trustedCanonicalItemCount: Int?,
+        intentionallyRemovingFinalizedScheduledSendItems removals: [AgentScheduledSendFinalizedItemRemoval],
+        committingTranscriptReset resetReceipt: AgentSessionTranscriptResetReceipt?,
+        fileCreationPolicy: AgentSessionFileCreationPolicy,
+        expectedPersistenceState: AgentSessionPersistenceState?
+    ) async throws -> AgentSessionSaveCommit {
+        let agentSessionsFolder: URL
+        let fileURL: URL
+        if let expectedPersistenceState {
+            try validatePersistenceStamp(
+                expectedPersistenceState.stamp,
+                sessionID: session.id,
+                workspaceID: workspace.id
+            )
+            fileURL = expectedPersistenceState.stamp.fileURL
+            agentSessionsFolder = fileURL.deletingLastPathComponent()
+        } else {
+            agentSessionsFolder = try ensureAgentSessionsFolder(for: workspace)
+            fileURL = agentSessionFileURL(id: session.id, in: agentSessionsFolder)
+        }
+        let fileKey = canonicalSessionFileKey(fileURL)
+
+        let fileExists = FileManager.default.fileExists(atPath: fileURL.path)
+        if !fileExists, case .requireExisting = fileCreationPolicy {
+            throw AgentScheduledSendMutationError.sessionNotFound(session.id)
+        }
+
+        let currentResetGeneration = currentTranscriptResetGeneration(for: fileKey)
+        if let resetReceipt,
+           fileExists,
+           let committedReset = transcriptResetAuthorityByFileURL[fileKey],
+           committedReset.deletionGeneration == (deletionGenerationsByFileKey[fileKey] ?? 0),
+           committedReset.receipt == resetReceipt
+        {
+            return AgentSessionSaveCommit(
+                fileURL: fileURL,
+                persistenceState: persistenceState(
+                    sessionID: session.id,
+                    workspaceID: workspace.id,
+                    fileURL: fileURL
+                ),
+                disposition: .resetAlreadyCommitted
+            )
+        }
+        if let expectedPersistenceState,
+           expectedPersistenceState.transcriptResetGeneration != currentResetGeneration
+        {
+            throw AgentScheduledSendMutationError.staleTranscriptResetGeneration(
+                expected: expectedPersistenceState.transcriptResetGeneration,
+                actual: currentResetGeneration
+            )
+        }
+
+        let staleRemovalPolicy: StaleFinalizedItemRemovalPolicy =
+            resetReceipt == nil ? .fail : .ignore
+        var sessionWithAuthoritativeSchedule = session
+        var itemAuthorityForSave: AgentSessionScheduleAuthority?
+        if fileExists {
+            var authority = try cachedOrLoadedScheduleAuthority(for: fileURL)
+            authority = try scheduleAuthority(
+                authority,
+                applying: removals,
+                to: session,
+                staleRemovalPolicy: staleRemovalPolicy
+            )
+            if resetReceipt != nil {
+                authority = scheduleAuthority(
+                    authority,
+                    applyingTranscriptResetTo: session
+                )
+            }
+            itemAuthorityForSave = authority
+            sessionWithAuthoritativeSchedule = sessionByApplyingScheduleAuthority(
+                authority,
+                to: sessionWithAuthoritativeSchedule
+            )
+        } else if !removals.isEmpty {
+            var authority = AgentSessionScheduleAuthority(
+                scheduledSend: session.scheduledSend,
+                lastScheduledDispatch: session.lastScheduledDispatch,
+                protectedAcceptedUserItemsByID: [:],
+                intentionallyRemovedAcceptedUserItemReceiptsByID: [:]
+            )
+            authority = try scheduleAuthority(
+                authority,
+                applying: removals,
+                to: session,
+                staleRemovalPolicy: staleRemovalPolicy
+            )
+            itemAuthorityForSave = authority
+            sessionWithAuthoritativeSchedule = sessionByApplyingScheduleAuthority(
+                authority,
+                to: sessionWithAuthoritativeSchedule
+            )
+        }
+        let hasItemAuthority = itemAuthorityForSave.map {
+            !$0.protectedAcceptedUserItemsByID.isEmpty
+                || !$0.intentionallyRemovedAcceptedUserItemReceiptsByID.isEmpty
+        } ?? false
 
         let sessionToSave = sessionPreparedForStorage(
-            session,
+            sessionWithAuthoritativeSchedule,
             fileURL: fileURL,
             savedAt: Date(),
             preparation: preparation,
-            trustedCanonicalItemCount: trustedCanonicalItemCount
+            trustedCanonicalItemCount: resetReceipt != nil || hasItemAuthority
+                ? nil
+                : trustedCanonicalItemCount
         )
         let freshEncoder = JSONEncoder()
         // Field-local codec: `providerUsage` bytes are re-inserted verbatim; any preservation
         // failure throws here, before the atomic writer replaces the file.
         let data = try AgentSessionDataCodec.encodeSession(sessionToSave, using: freshEncoder)
         try await diskWriter.enqueueAndWait(data: data, url: fileURL)
+        rememberScheduleAuthority(
+            from: sessionToSave,
+            fileURL: fileURL,
+            preservingItemAuthority: itemAuthorityForSave
+        )
+        if let resetReceipt {
+            transcriptResetAuthorityByFileURL[fileKey] =
+                AgentSessionTranscriptResetAuthority(
+                    deletionGeneration: deletionGenerationsByFileKey[fileKey] ?? 0,
+                    generation: currentResetGeneration &+ 1,
+                    receipt: resetReceipt,
+                    canonicalSessionSnapshot: data
+                )
+        }
         await upsertMetadataRecord(metadataRecord(from: sessionToSave, fileURL: fileURL), folder: agentSessionsFolder)
-        return fileURL
+        return AgentSessionSaveCommit(
+            fileURL: fileURL,
+            persistenceState: persistenceState(
+                sessionID: session.id,
+                workspaceID: workspace.id,
+                fileURL: fileURL
+            ),
+            disposition: .written
+        )
+    }
+
+    /// Atomically compare-and-mutates the persisted scheduled-send member.
+    ///
+    /// All schedule mutations for one session are serialized through this API. A successful return
+    /// always means the authoritative session file was durably replaced. Metadata-index failure is
+    /// reported separately because retrying the already-committed mutation would be unsafe. Editable
+    /// scheduling owners must use the persistence-stamp overload below.
+    func mutateScheduledSend(
+        sessionID: UUID,
+        for workspace: WorkspaceModel,
+        mutation: AgentScheduledSendMutation
+    ) async throws -> AgentScheduledSendMutationResult {
+        await acquireSessionPersistence(for: sessionID)
+        defer { releaseSessionPersistence(for: sessionID) }
+        return try await performScheduledSendMutation(
+            sessionID: sessionID,
+            for: workspace,
+            persistenceStamp: nil,
+            mutation: mutation
+        )
+    }
+
+    /// Fenced schedule-only mutation for an editable owner.
+    func mutateScheduledSend(
+        sessionID: UUID,
+        for workspace: WorkspaceModel,
+        persistenceStamp: AgentSessionPersistenceStamp,
+        mutation: AgentScheduledSendMutation
+    ) async throws -> AgentScheduledSendMutationResult {
+        await acquireSessionPersistence(for: sessionID)
+        defer { releaseSessionPersistence(for: sessionID) }
+        return try await performScheduledSendMutation(
+            sessionID: sessionID,
+            for: workspace,
+            persistenceStamp: persistenceStamp,
+            mutation: mutation
+        )
+    }
+
+    private func performScheduledSendMutation(
+        sessionID: UUID,
+        for workspace: WorkspaceModel,
+        persistenceStamp: AgentSessionPersistenceStamp?,
+        mutation: AgentScheduledSendMutation
+    ) async throws -> AgentScheduledSendMutationResult {
+        let agentSessionsFolder: URL
+        let fileURL: URL
+        if let persistenceStamp {
+            try validatePersistenceStamp(
+                persistenceStamp,
+                sessionID: sessionID,
+                workspaceID: workspace.id
+            )
+            fileURL = persistenceStamp.fileURL
+            agentSessionsFolder = fileURL.deletingLastPathComponent()
+        } else {
+            agentSessionsFolder = try ensureAgentSessionsFolder(for: workspace)
+            fileURL = agentSessionFileURL(id: sessionID, in: agentSessionsFolder)
+        }
+        guard FileManager.default.fileExists(atPath: fileURL.path) else {
+            throw AgentScheduledSendMutationError.sessionNotFound(sessionID)
+        }
+
+        var session = try await loadAgentSessionLocked(from: fileURL)
+
+        switch mutation {
+        case let .upsert(expectedUpdatedAt, value):
+            let actualUpdatedAt: Date?
+            switch session.scheduledSend {
+            case nil:
+                actualUpdatedAt = nil
+            case let .v1(current):
+                actualUpdatedAt = current.updatedAt
+            case .unreadable:
+                throw AgentScheduledSendMutationError.unreadableScheduledSend(sessionID)
+            }
+            guard expectedUpdatedAt == actualUpdatedAt else {
+                throw AgentScheduledSendMutationError.staleExpectedUpdatedAt(
+                    expected: expectedUpdatedAt,
+                    actual: actualUpdatedAt
+                )
+            }
+            session.scheduledSend = .v1(value)
+        case let .clear(expectedUpdatedAt, completedDispatch):
+            let actualUpdatedAt: Date?
+            switch session.scheduledSend {
+            case nil:
+                actualUpdatedAt = nil
+            case let .v1(current):
+                actualUpdatedAt = current.updatedAt
+            case .unreadable:
+                throw AgentScheduledSendMutationError.unreadableScheduledSend(sessionID)
+            }
+            guard actualUpdatedAt == expectedUpdatedAt else {
+                throw AgentScheduledSendMutationError.staleExpectedUpdatedAt(
+                    expected: expectedUpdatedAt,
+                    actual: actualUpdatedAt
+                )
+            }
+            session.scheduledSend = nil
+            if let completedDispatch {
+                session.lastScheduledDispatch = completedDispatch
+            }
+        case let .discardUnreadable(expected):
+            let expectedMember = AgentScheduledSendMember.unreadable(expected)
+            guard session.scheduledSend == expectedMember else {
+                throw AgentScheduledSendMutationError.staleExpectedScheduledSendMember(
+                    expected: expectedMember,
+                    actual: session.scheduledSend
+                )
+            }
+            session.scheduledSend = nil
+        }
+
+        let sessionToSave = sessionPreparedForStorage(
+            session,
+            fileURL: fileURL,
+            savedAt: Date(),
+            preparation: .alreadyCanonicalTranscript,
+            trustedCanonicalItemCount: session.itemCount
+        )
+        let data = try AgentSessionDataCodec.encodeSession(sessionToSave, using: JSONEncoder())
+        try await diskWriter.enqueueAndWait(data: data, url: fileURL)
+        rememberScheduleAuthority(from: sessionToSave, fileURL: fileURL)
+
+        let indexStatus: AgentScheduledSendMutationResult.MetadataIndexStatus =
+            switch await upsertMetadataRecordReporting(
+                metadataRecord(from: sessionToSave, fileURL: fileURL),
+                folder: agentSessionsFolder
+            ) {
+            case .success:
+                .updated
+            case let .failure(error):
+                .repairNeeded(String(describing: error))
+            }
+
+        return AgentScheduledSendMutationResult(
+            session: sessionToSave,
+            fileURL: fileURL,
+            metadataIndexStatus: indexStatus
+        )
+    }
+
+    /// Atomically commits an accepted scheduled user turn and retires its durable schedule.
+    ///
+    /// The immutable schedule revision and exact dispatch attempt are validated under the same
+    /// per-session persistence gate used by ordinary saves. A successful return means the user
+    /// item (with provenance), dispatch receipt, and schedule removal are in one durable session
+    /// replacement. Matching retries are persistence-idempotent and never authorize provider work.
+    func finalizeScheduledSend(
+        sessionID: UUID,
+        for workspace: WorkspaceModel,
+        expectedUpdatedAt: Date,
+        expectedAttempt: AgentScheduledSendPersist.Attempt,
+        acceptedUserItem: AgentChatItem,
+        receipt: AgentScheduledSendProvenance
+    ) async throws -> AgentScheduledSendMutationResult {
+        await acquireSessionPersistence(for: sessionID)
+        do {
+            let result = try await performScheduledSendFinalization(
+                sessionID: sessionID,
+                for: workspace,
+                expectedUpdatedAt: expectedUpdatedAt,
+                expectedAttempt: expectedAttempt,
+                acceptedUserItem: acceptedUserItem,
+                receipt: receipt
+            )
+            releaseSessionPersistence(for: sessionID)
+            return result
+        } catch {
+            releaseSessionPersistence(for: sessionID)
+            throw error
+        }
+    }
+
+    /// Captures a DataService-issued recovery context for a persisted `.dispatching` attempt
+    /// under the session gate: the pinned destination, the current explicit-deletion generation,
+    /// and the canonical session snapshot used only for accidental missing-file reconstruction.
+    /// Provider-handoff callers must use the persistence-stamp overload below.
+    func prepareScheduledSendRecovery(
+        sessionID: UUID,
+        for workspace: WorkspaceModel,
+        expectedUpdatedAt: Date,
+        expectedAttempt: AgentScheduledSendPersist.Attempt
+    ) async throws -> AgentScheduledSendRecoveryContext {
+        await acquireSessionPersistence(for: sessionID)
+        defer { releaseSessionPersistence(for: sessionID) }
+        return try await prepareScheduledSendRecoveryLocked(
+            sessionID: sessionID,
+            for: workspace,
+            persistenceStamp: nil,
+            expectedUpdatedAt: expectedUpdatedAt,
+            expectedAttempt: expectedAttempt
+        )
+    }
+
+    /// Fenced recovery preparation for an editable owner.
+    func prepareScheduledSendRecovery(
+        sessionID: UUID,
+        for workspace: WorkspaceModel,
+        persistenceStamp: AgentSessionPersistenceStamp,
+        expectedUpdatedAt: Date,
+        expectedAttempt: AgentScheduledSendPersist.Attempt
+    ) async throws -> AgentScheduledSendRecoveryContext {
+        await acquireSessionPersistence(for: sessionID)
+        defer { releaseSessionPersistence(for: sessionID) }
+        return try await prepareScheduledSendRecoveryLocked(
+            sessionID: sessionID,
+            for: workspace,
+            persistenceStamp: persistenceStamp,
+            expectedUpdatedAt: expectedUpdatedAt,
+            expectedAttempt: expectedAttempt
+        )
+    }
+
+    private func prepareScheduledSendRecoveryLocked(
+        sessionID: UUID,
+        for workspace: WorkspaceModel,
+        persistenceStamp: AgentSessionPersistenceStamp?,
+        expectedUpdatedAt: Date,
+        expectedAttempt: AgentScheduledSendPersist.Attempt
+    ) async throws -> AgentScheduledSendRecoveryContext {
+        let agentSessionsFolder: URL
+        let fileURL: URL
+        if let persistenceStamp {
+            try validatePersistenceStamp(
+                persistenceStamp,
+                sessionID: sessionID,
+                workspaceID: workspace.id
+            )
+            fileURL = persistenceStamp.fileURL
+            agentSessionsFolder = fileURL.deletingLastPathComponent()
+        } else {
+            agentSessionsFolder = try ensureAgentSessionsFolder(for: workspace)
+            fileURL = agentSessionFileURL(id: sessionID, in: agentSessionsFolder)
+        }
+        let fileKey = canonicalSessionFileKey(fileURL)
+        guard FileManager.default.fileExists(atPath: fileURL.path) else {
+            throw AgentScheduledSendMutationError.sessionNotFound(sessionID)
+        }
+        let session = try await loadAgentSessionLocked(from: fileURL)
+        guard let record = session.scheduledSend?.persistedValue else {
+            throw AgentScheduledSendMutationError.staleExpectedUpdatedAt(expected: expectedUpdatedAt, actual: nil)
+        }
+        guard record.updatedAt == expectedUpdatedAt else {
+            throw AgentScheduledSendMutationError.staleExpectedUpdatedAt(expected: expectedUpdatedAt, actual: record.updatedAt)
+        }
+        guard record.attempt == expectedAttempt else {
+            throw AgentScheduledSendMutationError.staleExpectedAttempt(expected: expectedAttempt, actual: record.attempt)
+        }
+        guard record.state == .dispatching else {
+            throw AgentScheduledSendMutationError.scheduledSendNotDispatching(actual: record.state)
+        }
+        let snapshot = try AgentSessionDataCodec.encodeSession(session, using: JSONEncoder())
+        return AgentScheduledSendRecoveryContext(
+            sessionID: sessionID,
+            workspaceID: workspace.id,
+            workspace: workspace,
+            fileURL: fileURL,
+            agentSessionsFolderURL: agentSessionsFolder,
+            deletionGeneration: deletionGenerationsByFileKey[fileKey] ?? 0,
+            canonicalSessionSnapshot: snapshot,
+            transcriptResetReceiptAtPreparation:
+            transcriptResetAuthorityByFileURL[fileKey]?.receipt,
+            transcriptResetGenerationAtPreparation:
+            currentTranscriptResetGeneration(for: fileKey),
+            dataService: self
+        )
+    }
+
+    /// Recovery finalization at the pinned destination, under the same gate and through the same
+    /// accepted-item/receipt/schedule-retirement pipeline as `finalizeScheduledSend`. When the
+    /// authoritative file is missing, explicit-deletion evidence is checked first; only an
+    /// accidental loss is reconstructed from the captured canonical snapshot. Never overwrites an
+    /// existing file wholesale.
+    func finalizeScheduledSend(
+        recovery payload: AgentScheduledSendAcceptedPayload
+    ) async throws -> AgentScheduledSendRecoveryOutcome {
+        let context = payload.context
+        guard context.dataService === self else {
+            throw AgentScheduledSendMutationError.invalidPersistenceStamp
+        }
+        await acquireSessionPersistence(for: context.sessionID)
+        defer { releaseSessionPersistence(for: context.sessionID) }
+        let fileKey = canonicalSessionFileKey(context.fileURL)
+        let currentDeletionGeneration = deletionGenerationsByFileKey[fileKey] ?? 0
+        guard currentDeletionGeneration == context.deletionGeneration else {
+            return .explicitlyDeleted
+        }
+        let laterResetAuthority = transcriptResetAuthorityByFileURL[fileKey].flatMap { authority in
+            authority.deletionGeneration == currentDeletionGeneration
+                && authority.generation > context.transcriptResetGenerationAtPreparation
+                ? authority
+                : nil
+        }
+        #if DEBUG
+            if let injected = test_scheduledSendRecoveryFailureInjector?(payload) {
+                throw injected
+            }
+        #endif
+        try validateAcceptedScheduledSendEvidence(
+            expectedAttempt: payload.attempt,
+            acceptedUserItem: payload.acceptedItem,
+            receipt: payload.receipt
+        )
+        if FileManager.default.fileExists(atPath: context.fileURL.path) {
+            let session = try await loadAgentSessionLocked(from: context.fileURL)
+            let result = try await commitScheduledSendFinalization(
+                session: session,
+                fileURL: context.fileURL,
+                agentSessionsFolder: context.agentSessionsFolderURL,
+                expectedUpdatedAt: payload.expectedUpdatedAt,
+                expectedAttempt: payload.attempt,
+                acceptedUserItem: payload.acceptedItem,
+                receipt: payload.receipt,
+                suppressAcceptedItem: laterResetAuthority != nil
+                    && !sessionContainsItem(session, itemID: payload.attempt.itemID)
+            )
+            return .committed(result)
+        }
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: context.agentSessionsFolderURL.path, isDirectory: &isDirectory),
+              isDirectory.boolValue
+        else {
+            throw AgentScheduledSendRecoveryError.destinationUnavailable(context.agentSessionsFolderURL)
+        }
+        let recoverySnapshotData =
+            laterResetAuthority?.canonicalSessionSnapshot ?? context.canonicalSessionSnapshot
+        var snapshot: AgentSession
+        do {
+            snapshot = try AgentSessionDataCodec.decodeSession(from: recoverySnapshotData)
+        } catch {
+            throw AgentScheduledSendRecoveryError.snapshotUndecodable
+        }
+        if let scheduleAuthority = scheduleAuthorityByFileURL[fileKey] {
+            snapshot = sessionByApplyingScheduleAuthority(scheduleAuthority, to: snapshot)
+        }
+        let result = try await commitScheduledSendFinalization(
+            session: snapshot,
+            fileURL: context.fileURL,
+            agentSessionsFolder: context.agentSessionsFolderURL,
+            expectedUpdatedAt: payload.expectedUpdatedAt,
+            expectedAttempt: payload.attempt,
+            acceptedUserItem: payload.acceptedItem,
+            receipt: payload.receipt,
+            suppressAcceptedItem: laterResetAuthority != nil
+                && !sessionContainsItem(snapshot, itemID: payload.attempt.itemID)
+        )
+        return .committed(result)
+    }
+
+    private func validateAcceptedScheduledSendEvidence(
+        expectedAttempt: AgentScheduledSendPersist.Attempt,
+        acceptedUserItem: AgentChatItem,
+        receipt: AgentScheduledSendProvenance
+    ) throws {
+        guard acceptedUserItem.id == expectedAttempt.itemID else {
+            throw AgentScheduledSendMutationError.invalidAcceptedUserItem(
+                expectedItemID: expectedAttempt.itemID,
+                actualItemID: acceptedUserItem.id
+            )
+        }
+        guard acceptedUserItem.kind == .user else {
+            throw AgentScheduledSendMutationError.acceptedItemNotUser(acceptedUserItem.id)
+        }
+        guard acceptedUserItem.scheduledSend == nil || acceptedUserItem.scheduledSend == receipt,
+              receipt.attemptID == expectedAttempt.attemptID
+        else {
+            throw AgentScheduledSendMutationError.invalidDispatchReceipt
+        }
+    }
+
+    private func performScheduledSendFinalization(
+        sessionID: UUID,
+        for workspace: WorkspaceModel,
+        expectedUpdatedAt: Date,
+        expectedAttempt: AgentScheduledSendPersist.Attempt,
+        acceptedUserItem: AgentChatItem,
+        receipt: AgentScheduledSendProvenance
+    ) async throws -> AgentScheduledSendMutationResult {
+        try validateAcceptedScheduledSendEvidence(
+            expectedAttempt: expectedAttempt,
+            acceptedUserItem: acceptedUserItem,
+            receipt: receipt
+        )
+
+        let agentSessionsFolder = try ensureAgentSessionsFolder(for: workspace)
+        let fileURL = agentSessionFileURL(id: sessionID, in: agentSessionsFolder)
+        guard FileManager.default.fileExists(atPath: fileURL.path) else {
+            throw AgentScheduledSendMutationError.sessionNotFound(sessionID)
+        }
+        let session = try await loadAgentSessionLocked(from: fileURL)
+        return try await commitScheduledSendFinalization(
+            session: session,
+            fileURL: fileURL,
+            agentSessionsFolder: agentSessionsFolder,
+            expectedUpdatedAt: expectedUpdatedAt,
+            expectedAttempt: expectedAttempt,
+            acceptedUserItem: acceptedUserItem,
+            receipt: receipt
+        )
+    }
+
+    /// Shared, gate-held finalization pipeline for a loaded authoritative session (existing file)
+    /// or the canonical reconstruction snapshot (accidentally missing file).
+    private func commitScheduledSendFinalization(
+        session loadedSession: AgentSession,
+        fileURL: URL,
+        agentSessionsFolder: URL,
+        expectedUpdatedAt: Date,
+        expectedAttempt: AgentScheduledSendPersist.Attempt,
+        acceptedUserItem: AgentChatItem,
+        receipt: AgentScheduledSendProvenance,
+        suppressAcceptedItem: Bool = false
+    ) async throws -> AgentScheduledSendMutationResult {
+        var stampedItem = acceptedUserItem
+        stampedItem.scheduledSend = receipt
+        var session = loadedSession
+        let fileKey = canonicalSessionFileKey(fileURL)
+        var itemAuthorityForCommit = scheduleAuthorityByFileURL[fileKey]
+        let exactRemovalWasCommitted =
+            itemAuthorityForCommit?
+                .intentionallyRemovedAcceptedUserItemReceiptsByID[stampedItem.id] == receipt
+        let acceptedItemMustRemainAbsent = exactRemovalWasCommitted || suppressAcceptedItem
+        if suppressAcceptedItem, !exactRemovalWasCommitted {
+            var authority = itemAuthorityForCommit ?? AgentSessionScheduleAuthority(
+                scheduledSend: session.scheduledSend,
+                lastScheduledDispatch: session.lastScheduledDispatch,
+                protectedAcceptedUserItemsByID: [:],
+                intentionallyRemovedAcceptedUserItemReceiptsByID: [:]
+            )
+            authority.protectedAcceptedUserItemsByID.removeValue(forKey: stampedItem.id)
+            authority.intentionallyRemovedAcceptedUserItemReceiptsByID[stampedItem.id] = receipt
+            itemAuthorityForCommit = authority
+        }
+        var shouldRetirePersistedSchedule = false
+
+        switch session.scheduledSend {
+        case let .v1(record):
+            let matchesAcceptedSchedule = record.id == receipt.scheduleID
+            let matchesAcceptedAttempt = record.attempt == expectedAttempt
+            if matchesAcceptedSchedule, matchesAcceptedAttempt {
+                guard receipt.scheduledFor == record.notBefore else {
+                    throw AgentScheduledSendMutationError.invalidDispatchReceipt
+                }
+                // Internal schedule-state persistence may advance updatedAt after provider
+                // acceptance. The immutable attempt, not that mutable revision, identifies
+                // the pending work that this persistence-only finalization must retire.
+                shouldRetirePersistedSchedule = true
+            } else if matchesAcceptedSchedule, record.updatedAt == expectedUpdatedAt {
+                throw AgentScheduledSendMutationError.staleExpectedAttempt(
+                    expected: expectedAttempt,
+                    actual: record.attempt
+                )
+            }
+        // A different schedule or attempt is a genuine successor. Preserve it while
+        // completing the accepted predecessor's item and receipt below.
+        case nil, .unreadable:
+            // A prior partial write, cancellation, or successor from a future schema must
+            // not reduce accepted-message recovery to receipt-only success. Complete the
+            // durable item and receipt while leaving any unknown member untouched.
+            break
+        }
+
+        if acceptedItemMustRemainAbsent {
+            session = sessionByRemovingIntentionallyRemovedAcceptedUserItems(
+                [stampedItem.id: receipt],
+                from: session
+            )
+        } else {
+            session = sessionByMergingProtectedAcceptedUserItems(
+                [stampedItem.id: stampedItem],
+                into: session
+            )
+        }
+        if shouldRetirePersistedSchedule {
+            session.scheduledSend = nil
+        }
+        session.lastScheduledDispatch = receipt
+        let sessionToSave = sessionPreparedForStorage(
+            session,
+            fileURL: fileURL,
+            savedAt: Date(),
+            preparation: .alreadyCanonicalTranscript,
+            trustedCanonicalItemCount: nil
+        )
+        let data = try AgentSessionDataCodec.encodeSession(sessionToSave, using: JSONEncoder())
+        try await diskWriter.enqueueAndWait(data: data, url: fileURL)
+        rememberScheduleAuthority(
+            from: sessionToSave,
+            fileURL: fileURL,
+            protecting: acceptedItemMustRemainAbsent ? nil : stampedItem,
+            preservingItemAuthority: itemAuthorityForCommit
+        )
+
+        let indexStatus: AgentScheduledSendMutationResult.MetadataIndexStatus =
+            switch await upsertMetadataRecordReporting(
+                metadataRecord(from: sessionToSave, fileURL: fileURL),
+                folder: agentSessionsFolder
+            ) {
+            case .success:
+                .updated
+            case let .failure(error):
+                .repairNeeded(String(describing: error))
+            }
+
+        return AgentScheduledSendMutationResult(
+            session: sessionToSave,
+            fileURL: fileURL,
+            metadataIndexStatus: indexStatus
+        )
+    }
+
+    private func acquireSessionPersistence(for sessionID: UUID) async {
+        if activeSessionPersistence.insert(sessionID).inserted {
+            return
+        }
+        await withCheckedContinuation { continuation in
+            sessionPersistenceWaiters[sessionID, default: []].append(continuation)
+        }
+    }
+
+    private func releaseSessionPersistence(for sessionID: UUID) {
+        guard var waiters = sessionPersistenceWaiters[sessionID], !waiters.isEmpty else {
+            activeSessionPersistence.remove(sessionID)
+            sessionPersistenceWaiters.removeValue(forKey: sessionID)
+            return
+        }
+        let next = waiters.removeFirst()
+        if waiters.isEmpty {
+            sessionPersistenceWaiters.removeValue(forKey: sessionID)
+        } else {
+            sessionPersistenceWaiters[sessionID] = waiters
+        }
+        next.resume()
     }
 
     func renameAgentSession(
@@ -1092,8 +2381,25 @@ actor AgentSessionDataService {
             .value.lastRunState
     }
 
-    /// Load an AgentSession from disk.
+    /// Loads a session under the same per-session gate used by full saves and schedule CAS.
     func loadAgentSession(from fileURL: URL) async throws -> AgentSession {
+        let filename = fileURL.lastPathComponent
+        guard let sessionID = agentSessionID(fromFilename: filename) else {
+            throw AgentSessionDataError.invalidFilename(filename)
+        }
+
+        await acquireSessionPersistence(for: sessionID)
+        do {
+            let session = try await loadAgentSessionLocked(from: fileURL)
+            releaseSessionPersistence(for: sessionID)
+            return session
+        } catch {
+            releaseSessionPersistence(for: sessionID)
+            throw error
+        }
+    }
+
+    private func loadAgentSessionLocked(from fileURL: URL) async throws -> AgentSession {
         let filename = fileURL.lastPathComponent
         guard filename.starts(with: "AgentSession-"), filename.hasSuffix(".json") else {
             throw AgentSessionDataError.invalidFilename(filename)
@@ -1126,17 +2432,43 @@ actor AgentSessionDataService {
             } else {
                 await upsertMetadataRecordIfIndexPresent(runtimeSession, fileURL: fileURL)
             }
+            rememberScheduleAuthority(from: runtimeSession, fileURL: fileURL)
             return runtimeSession
         } catch {
             throw AgentSessionDataError.loadFailed(error)
         }
     }
 
-    /// Load a lightweight AgentSession suitable for session lists without decoding full items.
+    /// Loads a lightweight stub under the same gate because metadata recovery may rewrite the file.
     func loadAgentSessionStub(
         from fileURL: URL,
         recoverMissingMetadata: Bool = false,
         persistRecoveredMetadata: Bool = false
+    ) async throws -> AgentSession {
+        let filename = fileURL.lastPathComponent
+        guard let sessionID = agentSessionID(fromFilename: filename) else {
+            throw AgentSessionDataError.invalidFilename(filename)
+        }
+
+        await acquireSessionPersistence(for: sessionID)
+        do {
+            let session = try await loadAgentSessionStubLocked(
+                from: fileURL,
+                recoverMissingMetadata: recoverMissingMetadata,
+                persistRecoveredMetadata: persistRecoveredMetadata
+            )
+            releaseSessionPersistence(for: sessionID)
+            return session
+        } catch {
+            releaseSessionPersistence(for: sessionID)
+            throw error
+        }
+    }
+
+    private func loadAgentSessionStubLocked(
+        from fileURL: URL,
+        recoverMissingMetadata: Bool,
+        persistRecoveredMetadata: Bool
     ) async throws -> AgentSession {
         let filename = fileURL.lastPathComponent
         guard filename.starts(with: "AgentSession-"), filename.hasSuffix(".json") else {
@@ -1189,7 +2521,7 @@ actor AgentSessionDataService {
                     }
                 }
             }
-            return AgentSession(
+            let stub = AgentSession(
                 id: header.id,
                 serializationVersion: header.serializationVersion ?? AgentSession.legacyUnversionedSerializationVersion,
                 workspaceID: header.workspaceID,
@@ -1224,12 +2556,16 @@ actor AgentSessionDataService {
                 pendingHandoffCreatedAt: header.pendingHandoffCreatedAt,
                 pendingHandoffSourceItemID: header.pendingHandoffSourceItemID,
                 pendingHandoffDefersProviderLockUntilSend: header.pendingHandoffDefersProviderLockUntilSend ?? false,
+                scheduledSend: header.scheduledSend,
+                lastScheduledDispatch: header.lastScheduledDispatch,
                 isMCPOriginated: header.isMCPOriginated ?? false,
                 origin: header.origin,
                 profile: header.profile ?? .standard,
                 worktreeBindings: header.worktreeBindings ?? [],
                 worktreeMergeOperations: header.worktreeMergeOperations ?? []
             )
+            rememberScheduleAuthority(from: stub, fileURL: fileURL)
+            return stub
         } catch {
             throw AgentSessionDataError.loadFailed(error)
         }
@@ -1438,32 +2774,139 @@ actor AgentSessionDataService {
         return nil
     }
 
-    /// Delete a particular agent session file.
+    /// Delete a particular agent session file under the same per-session gate as saves and CAS.
     func deleteAgentSessionFile(_ fileURL: URL) async throws {
+        guard let sessionID = agentSessionID(fromFilename: fileURL.lastPathComponent) else {
+            try await deleteAgentSessionFileLocked(fileURL)
+            return
+        }
+        await acquireSessionPersistence(for: sessionID)
+        defer { releaseSessionPersistence(for: sessionID) }
+        try await deleteAgentSessionFileLocked(fileURL)
+    }
+
+    private func deleteAgentSessionFileLocked(_ fileURL: URL) async throws {
         let folder = fileURL.deletingLastPathComponent()
         let filename = fileURL.lastPathComponent
         let parsedID = agentSessionID(fromFilename: filename)
+        let fileKey = canonicalSessionFileKey(fileURL)
         if FileManager.default.fileExists(atPath: fileURL.path) {
+            #if DEBUG
+                if let injected = test_agentSessionDeletionFailureInjector?(fileURL) {
+                    throw injected
+                }
+            #endif
             try FileManager.default.removeItem(at: fileURL)
         }
+
+        // Publish committed deletion authority only after unlink succeeds (or the file was already
+        // absent). This remains synchronous under the per-session gate with no suspension window.
+        scheduleAuthorityByFileURL.removeValue(forKey: fileKey)
+        transcriptResetAuthorityByFileURL.removeValue(forKey: fileKey)
+        let generation = (deletionGenerationsByFileKey[fileKey] ?? 0) &+ 1
+        deletionGenerationsByFileKey[fileKey] = generation
         await removeMetadataRecords(
             matching: { record in
                 record.filename == filename || parsedID.map { record.id == $0 } == true
             },
             folder: folder
         )
+        var userInfo: [String: Any] = ["fileKey": fileKey, "generation": generation]
+        if let parsedID {
+            userInfo["sessionID"] = parsedID
+        }
+        NotificationCenter.default.post(name: .agentSessionDeletionDidCommit, object: nil, userInfo: userInfo)
     }
 
-    /// Delete an agent session by ID.
+    /// Current explicit-deletion generation for a session file (0 when never deleted).
+    func scheduledSendDeletionGeneration(for fileURL: URL) -> UInt64 {
+        deletionGenerationsByFileKey[canonicalSessionFileKey(fileURL)] ?? 0
+    }
+
+    /// Delete an agent session by ID under the same per-session gate as saves and CAS.
     func deleteAgentSession(id: UUID, for workspace: WorkspaceModel) async throws {
         let agentSessionsFolder = try ensureAgentSessionsFolder(for: workspace)
-        let filename = agentSessionFilename(for: id)
-        let fileURL = agentSessionsFolder.appendingPathComponent(filename)
+        let fileURL = agentSessionsFolder.appendingPathComponent(agentSessionFilename(for: id))
+        try await deleteAgentSessionFile(fileURL)
+    }
 
-        if FileManager.default.fileExists(atPath: fileURL.path) {
-            try FileManager.default.removeItem(at: fileURL)
+    func deletionCandidates(
+        forComposeTabID tabID: UUID,
+        for workspace: WorkspaceModel
+    ) async throws -> [AgentSessionDeletionCandidate] {
+        let agentSessionsFolder = try ensureAgentSessionsFolder(for: workspace)
+        var candidateFilesByPath: [String: URL] = [:]
+        if let index = await readMetadataIndexIfAvailable(folder: agentSessionsFolder) {
+            for record in index.entries where record.composeTabID == tabID {
+                let fileURL = agentSessionsFolder.appendingPathComponent(record.filename)
+                candidateFilesByPath[fileURL.path] = fileURL
+            }
         }
-        await removeMetadataRecords(matching: { $0.id == id || $0.filename == filename }, folder: agentSessionsFolder)
+
+        let files = try await listAgentSessions(for: workspace)
+        for fileURL in files {
+            guard
+                let stub = try? await loadAgentSessionStub(
+                    from: fileURL,
+                    recoverMissingMetadata: false,
+                    persistRecoveredMetadata: false
+                ),
+                stub.composeTabID == tabID
+            else { continue }
+            candidateFilesByPath[fileURL.path] = fileURL
+        }
+
+        return candidateFilesByPath.values.compactMap { fileURL in
+            guard let sessionID = agentSessionID(fromFilename: fileURL.lastPathComponent) else {
+                return nil
+            }
+            return AgentSessionDeletionCandidate(
+                composeTabID: tabID,
+                persistenceState: persistenceState(
+                    sessionID: sessionID,
+                    workspaceID: workspace.id,
+                    fileURL: fileURL
+                )
+            )
+        }
+    }
+
+    func deleteAgentSession(
+        ifCurrent candidate: AgentSessionDeletionCandidate,
+        for workspace: WorkspaceModel
+    ) async throws -> AgentSessionConditionalDeletionResult {
+        let state = candidate.persistenceState
+        let sessionID = state.stamp.sessionID
+        await acquireSessionPersistence(for: sessionID)
+        defer { releaseSessionPersistence(for: sessionID) }
+        #if DEBUG
+            if let testConditionalDeletionHook {
+                try await testConditionalDeletionHook(candidate)
+            }
+        #endif
+        try validatePersistenceStamp(
+            state.stamp,
+            sessionID: sessionID,
+            workspaceID: workspace.id
+        )
+        let fileURL = state.stamp.fileURL
+        guard FileManager.default.fileExists(atPath: fileURL.path) else {
+            try await deleteAgentSessionFileLocked(fileURL)
+            return .alreadyAbsent
+        }
+        guard
+            let stub = try? await loadAgentSessionStubLocked(
+                from: fileURL,
+                recoverMissingMetadata: false,
+                persistRecoveredMetadata: false
+            ),
+            stub.id == sessionID,
+            stub.composeTabID == candidate.composeTabID
+        else {
+            return .ownershipChanged
+        }
+        try await deleteAgentSessionFileLocked(fileURL)
+        return .deleted
     }
 
     func deleteAgentSessions(forComposeTabID tabID: UUID, for workspace: WorkspaceModel) async throws {
@@ -1489,7 +2932,7 @@ actor AgentSessionDataService {
         }
 
         for fileURL in candidateFilesByPath.values {
-            try? FileManager.default.removeItem(at: fileURL)
+            try? await deleteAgentSessionFile(fileURL)
         }
         await removeMetadataRecords(matching: { $0.composeTabID == tabID }, folder: agentSessionsFolder)
     }
