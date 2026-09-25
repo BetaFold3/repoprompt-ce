@@ -3358,7 +3358,11 @@ final class AgentRunWorktreeStartTests: AgentRunWorktreeStartGitSeedTestCase {
         var childrenStartedAtResolution: [Int] = []
         service.resolveWaitPolicyContext = { metadata in
             childrenStartedAtResolution.append(recorder.observations.count)
-            return AgentMCPWaitPolicy.RequestContext(metadata: metadata, parentFamily: .codex)
+            return AgentMCPWaitPolicy.RequestContext(
+                metadata: metadata,
+                parentFamily: .codex,
+                parentPromptCacheRetention: .standard
+            )
         }
 
         let detached = try await service.execute(args: [
@@ -3421,7 +3425,11 @@ final class AgentRunWorktreeStartTests: AgentRunWorktreeStartGitSeedTestCase {
         var resolutionCount = 0
         service.resolveWaitPolicyContext = { metadata in
             resolutionCount += 1
-            return AgentMCPWaitPolicy.RequestContext(metadata: metadata, parentFamily: .codex)
+            return AgentMCPWaitPolicy.RequestContext(
+                metadata: metadata,
+                parentFamily: .codex,
+                parentPromptCacheRetention: .standard
+            )
         }
 
         _ = try await service.execute(args: [

@@ -121,6 +121,7 @@ A role whose display name starts with `Codex CLI` (or an explicit `model_id` wit
 
 	static var lifecycleAutomaticWaitProviderSummary: String {
 		let claudeSeconds = Int(MCPTimeoutPolicy.agentLifecycleClaudeAutomaticWaitSeconds)
+		let claudeExtendedSeconds = Int(MCPTimeoutPolicy.agentLifecycleClaudeExtendedCacheAutomaticWaitSeconds)
 		let codexSeconds = Int(MCPTimeoutPolicy.agentLifecycleCodexAutomaticWaitSeconds)
 		let otherSeconds = Int(MCPTimeoutPolicy.agentLifecycleOtherAutomaticWaitSeconds)
 		let unresolvedSeconds = Int(MCPTimeoutPolicy.agentLifecycleUnresolvedAutomaticWaitSeconds)
@@ -130,7 +131,7 @@ A role whose display name starts with `Codex CLI` (or an explicit `model_id` wit
 		} else {
 			fallbackSummary = "other parents \(otherSeconds) seconds and unresolved parents \(unresolvedSeconds) seconds"
 		}
-		return "Claude \(claudeSeconds) seconds, Codex \(codexSeconds) seconds, and \(fallbackSummary)"
+		return "Claude \(claudeSeconds) seconds (\(claudeExtendedSeconds) seconds when the parent's effective Claude configuration explicitly sets a one-hour prompt cache), Codex \(codexSeconds) seconds, and \(fallbackSummary)"
 	}
 
 	static var lifecycleExplicitWaitRange: String {

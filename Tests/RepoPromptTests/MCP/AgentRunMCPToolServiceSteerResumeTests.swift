@@ -269,7 +269,11 @@ final class AgentRunMCPToolServiceSteerResumeTests: XCTestCase {
         var resolutionCount = 0
         service.resolveWaitPolicyContext = { metadata in
             resolutionCount += 1
-            return AgentMCPWaitPolicy.RequestContext(metadata: metadata, parentFamily: .codex)
+            return AgentMCPWaitPolicy.RequestContext(
+                metadata: metadata,
+                parentFamily: .codex,
+                parentPromptCacheRetention: .standard
+            )
         }
         var dispatchCount = 0
         service.testDispatchSteerInstruction = { dispatchedSessionID, _, _, agentModeVM in
@@ -320,7 +324,11 @@ final class AgentRunMCPToolServiceSteerResumeTests: XCTestCase {
         service.resolveWaitPolicyContext = { metadata in
             resolutionCount += 1
             resolvedBeforeDispatch = true
-            return AgentMCPWaitPolicy.RequestContext(metadata: metadata, parentFamily: .codex)
+            return AgentMCPWaitPolicy.RequestContext(
+                metadata: metadata,
+                parentFamily: .codex,
+                parentPromptCacheRetention: .standard
+            )
         }
         service.testDispatchSteerInstruction = { dispatchedSessionID, _, _, agentModeVM in
             XCTAssertTrue(resolvedBeforeDispatch, "The parent family must be frozen before the steering mutation")

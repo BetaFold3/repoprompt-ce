@@ -1,6 +1,7 @@
 import Darwin
 import Foundation
 import OSLog
+import RepoPromptShared
 
 final actor ClaudeNativeProcessSessionController {
     enum CommandProvenance: String, Equatable {
@@ -328,6 +329,7 @@ final actor ClaudeNativeProcessSessionController {
     struct SessionRef {
         var sessionID: String?
         var configuredContextWindow: Int?
+        var promptCacheRetention: MCPTimeoutPolicy.AgentLifecycleParentPromptCacheRetention = .standard
         var initializationGeneration: UInt64 = 0
         var initializedDuringCall: Bool = false
     }
@@ -426,6 +428,7 @@ final actor ClaudeNativeProcessSessionController {
     private let config: ClaudeCodeAgentConfig
     private let commandSelection: CLICommandSelection
     private let environmentResolver: any ClaudeCodeLaunchEnvironmentResolving
+    private let managedSettingsURL: URL?
     private let configService = MCPConfigExportService.shared
     private let rawEventFileLoggingEnabled: Bool
     private var rawEventLogFileURL: URL?
@@ -461,6 +464,7 @@ final actor ClaudeNativeProcessSessionController {
     private var translator: ClaudeSDKNDJSONTranslator
     private var sessionID: String?
     private var configuredContextWindow: Int?
+    private var promptCacheRetention: MCPTimeoutPolicy.AgentLifecycleParentPromptCacheRetention = .standard
     private var lastSpawnedCommand: String?
     private var turnInFlight: Bool {
         pendingTurnIDHead < pendingTurnIDBuffer.count
@@ -685,6 +689,7 @@ final actor ClaudeNativeProcessSessionController {
         config: ClaudeCodeAgentConfig,
         commandSelection: CLICommandSelection? = nil,
         environmentResolver: any ClaudeCodeLaunchEnvironmentResolving = ClaudeCodeLaunchEnvironmentResolver(),
+        managedSettingsURL: URL? = ClaudePromptCacheRetentionResolver.defaultManagedSettingsURL,
         authoritativeTurnIdleFallbackSeconds: TimeInterval = 1.0
     ) {
         self.runID = runID
@@ -694,6 +699,7 @@ final actor ClaudeNativeProcessSessionController {
         self.config = config
         self.commandSelection = commandSelection ?? config.commandSelection
         self.environmentResolver = environmentResolver
+        self.managedSettingsURL = managedSettingsURL
         self.authoritativeTurnIdleFallbackSeconds = authoritativeTurnIdleFallbackSeconds
         rawEventFileLoggingEnabled = Self.isRawEventFileLoggingEnabled()
         rawEventLogFileURL = nil
@@ -736,6 +742,7 @@ final actor ClaudeNativeProcessSessionController {
             return SessionRef(
                 sessionID: sessionID,
                 configuredContextWindow: configuredContextWindow,
+                promptCacheRetention: promptCacheRetention,
                 initializationGeneration: initializationGeneration,
                 initializedDuringCall: initializationGeneration != initializationGenerationAtEntry
             )
@@ -760,6 +767,7 @@ final actor ClaudeNativeProcessSessionController {
             return SessionRef(
                 sessionID: sessionID,
                 configuredContextWindow: configuredContextWindow,
+                promptCacheRetention: promptCacheRetention,
                 initializationGeneration: initializationGeneration,
                 initializedDuringCall: initializationGeneration != initializationGenerationAtEntry
             )
@@ -775,6 +783,7 @@ final actor ClaudeNativeProcessSessionController {
         SessionRef(
             sessionID: sessionID,
             configuredContextWindow: configuredContextWindow,
+            promptCacheRetention: promptCacheRetention,
             initializationGeneration: initializationGeneration,
             initializedDuringCall: false
         )
@@ -960,6 +969,7 @@ final actor ClaudeNativeProcessSessionController {
         await clearExpectedAgentPIDIfNeeded()
         process = nil
         configuredContextWindow = nil
+        promptCacheRetention = .standard
         activeLaunchEnvironmentSignature = nil
         activeFlagSettingsBaseModel = nil
         isInitialized = false
@@ -974,6 +984,17 @@ final actor ClaudeNativeProcessSessionController {
         rawEventLogFileSessionID = nil
         hasWrittenRawEventLogHeader = false
         finishEventsStreamIfNeeded()
+    }
+
+    private func resolvePromptCacheRetentionForProcessLaunch(
+        launchEnvironment: [String: String],
+        workingDirectory: String?
+    ) {
+        promptCacheRetention = ClaudePromptCacheRetentionResolver.resolve(
+            launchEnvironment: launchEnvironment,
+            workingDirectory: workingDirectory,
+            managedSettingsURL: managedSettingsURL
+        )
     }
 
     static func resolveCommandForLaunch(
@@ -1106,6 +1127,10 @@ final actor ClaudeNativeProcessSessionController {
 
         let workingDirectory = resolvedWorkingDirectory()
         configuredContextWindow = ClaudeEffectiveContextWindowResolver.resolveConfiguredContextWindow(
+            launchEnvironment: environment,
+            workingDirectory: workingDirectory
+        )
+        resolvePromptCacheRetentionForProcessLaunch(
             launchEnvironment: environment,
             workingDirectory: workingDirectory
         )
@@ -2401,6 +2426,16 @@ final actor ClaudeNativeProcessSessionController {
         ) -> Bool {
             activeLaunchEnvironmentSignature = LaunchEnvironmentSignature(activeLaunchEnvironment)
             return liveFlagSettingsRequiresProcessRestart(for: nextLaunchEnvironment)
+        }
+
+        func test_resolvePromptCacheRetentionForLaunch(
+            launchEnvironment: [String: String],
+            workingDirectory: String?
+        ) {
+            resolvePromptCacheRetentionForProcessLaunch(
+                launchEnvironment: launchEnvironment,
+                workingDirectory: workingDirectory
+            )
         }
 
         /// Build the initialize control request payload for testing.

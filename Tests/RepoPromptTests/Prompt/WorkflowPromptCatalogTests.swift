@@ -48,14 +48,14 @@ final class WorkflowPromptCatalogTests: XCTestCase {
     }
 
     func testRenderedManagedPromptFrontmatterCompatibility() {
-        XCTAssertEqual(RepoPromptWorkflowPrompts.skillsVersion, 67)
+        XCTAssertEqual(RepoPromptWorkflowPrompts.skillsVersion, 68)
 
         for descriptor in WorkflowPromptCatalog.installDescriptors {
             let rendered = RepoPromptWorkflowPrompts.render(id: descriptor.id, variant: .mcp)
             XCTAssertTrue(rendered.hasPrefix("---\n"), descriptor.name)
             XCTAssertTrue(rendered.contains("name: \"\(descriptor.name)\""), descriptor.name)
             XCTAssertTrue(rendered.contains("repoprompt_managed: true"), descriptor.name)
-            XCTAssertTrue(rendered.contains("repoprompt_skills_version: 67"), descriptor.name)
+            XCTAssertTrue(rendered.contains("repoprompt_skills_version: 68"), descriptor.name)
             XCTAssertTrue(rendered.contains("repoprompt_variant: mcp"), descriptor.name)
             XCTAssertFalse(RepoPromptWorkflowPrompts.stripYAMLFrontmatter(rendered).hasPrefix("---"), descriptor.name)
         }
@@ -193,6 +193,9 @@ final class WorkflowPromptCatalogTests: XCTestCase {
         }
 
         let claudeAutomaticWaitSeconds = Int(MCPTimeoutPolicy.agentLifecycleClaudeAutomaticWaitSeconds)
+        let claudeExtendedAutomaticWaitSeconds = Int(
+            MCPTimeoutPolicy.agentLifecycleClaudeExtendedCacheAutomaticWaitSeconds
+        )
         let codexAutomaticWaitSeconds = Int(MCPTimeoutPolicy.agentLifecycleCodexAutomaticWaitSeconds)
         let otherAutomaticWaitSeconds = Int(MCPTimeoutPolicy.agentLifecycleOtherAutomaticWaitSeconds)
         let unresolvedAutomaticWaitSeconds = Int(MCPTimeoutPolicy.agentLifecycleUnresolvedAutomaticWaitSeconds)
@@ -201,7 +204,7 @@ final class WorkflowPromptCatalogTests: XCTestCase {
         } else {
             "other parents \(otherAutomaticWaitSeconds) seconds and unresolved parents \(unresolvedAutomaticWaitSeconds) seconds"
         }
-        let automaticWaitProviderSummary = "Claude \(claudeAutomaticWaitSeconds) seconds, Codex \(codexAutomaticWaitSeconds) seconds, and \(fallbackWaitSummary)"
+        let automaticWaitProviderSummary = "Claude \(claudeAutomaticWaitSeconds) seconds (\(claudeExtendedAutomaticWaitSeconds) seconds when the parent's effective Claude configuration explicitly sets a one-hour prompt cache), Codex \(codexAutomaticWaitSeconds) seconds, and \(fallbackWaitSummary)"
 
         let maximumExplicitWaitSeconds = Int(MCPTimeoutPolicy.agentLifecycleMaximumExplicitTimeoutSeconds)
         let explicitWaitRangeFormatter = NumberFormatter()
@@ -228,6 +231,10 @@ final class WorkflowPromptCatalogTests: XCTestCase {
                 XCTAssertTrue(rendered.contains("omission selects the automatic wait from the effective parent provider"), label)
                 XCTAssertTrue(
                     rendered.contains("effective parent provider: \(automaticWaitProviderSummary)."),
+                    label
+                )
+                XCTAssertTrue(
+                    rendered.contains("\(claudeExtendedAutomaticWaitSeconds) seconds when the parent's effective Claude configuration explicitly sets a one-hour prompt cache"),
                     label
                 )
                 XCTAssertTrue(rendered.contains("upper bounds rather than mandatory sleeps"), label)

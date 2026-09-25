@@ -281,23 +281,38 @@ struct AgentRunMCPToolService {
     /// and explicit values above the shared maximum are rejected without clamping.
     static func resolvedStartWaitSelection(
         _ value: Value?,
-        parentFamily: AgentMCPWaitPolicy.ParentFamily
+        parentFamily: AgentMCPWaitPolicy.ParentFamily,
+        promptCacheRetention: AgentMCPWaitPolicy.ParentPromptCacheRetention
     ) throws -> AgentMCPWaitPolicy.Selection {
-        try AgentMCPWaitPolicy.selection(rawTimeout: value, parentFamily: parentFamily)
+        try AgentMCPWaitPolicy.selection(
+            rawTimeout: value,
+            parentFamily: parentFamily,
+            promptCacheRetention: promptCacheRetention
+        )
     }
 
     static func resolvedWaitSelection(
         _ value: Value?,
-        parentFamily: AgentMCPWaitPolicy.ParentFamily
+        parentFamily: AgentMCPWaitPolicy.ParentFamily,
+        promptCacheRetention: AgentMCPWaitPolicy.ParentPromptCacheRetention
     ) throws -> AgentMCPWaitPolicy.Selection {
-        try AgentMCPWaitPolicy.selection(rawTimeout: value, parentFamily: parentFamily)
+        try AgentMCPWaitPolicy.selection(
+            rawTimeout: value,
+            parentFamily: parentFamily,
+            promptCacheRetention: promptCacheRetention
+        )
     }
 
     static func resolvedSteerWaitSelection(
         _ value: Value?,
-        parentFamily: AgentMCPWaitPolicy.ParentFamily
+        parentFamily: AgentMCPWaitPolicy.ParentFamily,
+        promptCacheRetention: AgentMCPWaitPolicy.ParentPromptCacheRetention
     ) throws -> AgentMCPWaitPolicy.Selection {
-        try AgentMCPWaitPolicy.selection(rawTimeout: value, parentFamily: parentFamily)
+        try AgentMCPWaitPolicy.selection(
+            rawTimeout: value,
+            parentFamily: parentFamily,
+            promptCacheRetention: promptCacheRetention
+        )
     }
 
     private nonisolated static func agentRunExpiredSnapshot(sessionID: UUID) -> AgentRunMCPSnapshot {
@@ -338,7 +353,7 @@ struct AgentRunMCPToolService {
     /// run binding. The default treats the parent as unresolved; the server view model injects the
     /// authoritative resolver. Invoked once at the outer entry, before any mutation or delegation.
     var resolveWaitPolicyContext: (_ metadata: RequestMetadata) async -> AgentMCPWaitPolicy.RequestContext = {
-        AgentMCPWaitPolicy.RequestContext(metadata: $0, parentFamily: .unresolved)
+        AgentMCPWaitPolicy.RequestContext.unresolved(metadata: $0)
     }
 
     let startRun: StartRun
@@ -700,7 +715,11 @@ struct AgentRunMCPToolService {
         // never dispatches a mutation. Detached starts still validate the supplied value but report
         // no wait policy.
         let waitContext = await resolveWaitPolicyContext(metadata)
-        let waitSelection = try Self.resolvedStartWaitSelection(args["timeout"], parentFamily: waitContext.parentFamily)
+        let waitSelection = try Self.resolvedStartWaitSelection(
+            args["timeout"],
+            parentFamily: waitContext.parentFamily,
+            promptCacheRetention: waitContext.parentPromptCacheRetention
+        )
         let timeoutSeconds = waitSelection.timeoutSeconds
         #if DEBUG
             if ompQualificationLease != nil {
@@ -1557,11 +1576,15 @@ struct AgentRunMCPToolService {
         let waitSelection: AgentMCPWaitPolicy.Selection
         if forcePoll {
             // `op=poll` never waits, so it does not need the parent family.
-            waitContext = AgentMCPWaitPolicy.RequestContext(metadata: metadata, parentFamily: .unresolved)
+            waitContext = AgentMCPWaitPolicy.RequestContext.unresolved(metadata: metadata)
             waitSelection = .poll
         } else {
             waitContext = await resolveWaitPolicyContext(metadata)
-            waitSelection = try Self.resolvedWaitSelection(args["timeout"], parentFamily: waitContext.parentFamily)
+            waitSelection = try Self.resolvedWaitSelection(
+                args["timeout"],
+                parentFamily: waitContext.parentFamily,
+                promptCacheRetention: waitContext.parentPromptCacheRetention
+            )
         }
         return try await performSingleWait(
             sessionID: sessionID,
@@ -1580,7 +1603,11 @@ struct AgentRunMCPToolService {
         let includeStatusUpdates = parseBool(args["include_status_updates"]) ?? false
         let metadata = await captureRequestMetadata()
         let waitContext = await resolveWaitPolicyContext(metadata)
-        let waitSelection = try Self.resolvedWaitSelection(args["timeout"], parentFamily: waitContext.parentFamily)
+        let waitSelection = try Self.resolvedWaitSelection(
+            args["timeout"],
+            parentFamily: waitContext.parentFamily,
+            promptCacheRetention: waitContext.parentPromptCacheRetention
+        )
         return try await performWait(
             sessionIDs: sessionIDs,
             agentModeVM: agentModeVM,
@@ -1859,7 +1886,8 @@ struct AgentRunMCPToolService {
             steerWaitContext = waitContext
             steerWaitSelection = try Self.resolvedSteerWaitSelection(
                 rawSteerTimeoutSeconds,
-                parentFamily: waitContext.parentFamily
+                parentFamily: waitContext.parentFamily,
+                promptCacheRetention: waitContext.parentPromptCacheRetention
             )
         } else if rawSteerTimeoutSeconds != nil {
             ignoredTimeoutWarning = "Ignoring timeout_seconds because wait=false; the steering instruction was accepted without waiting."

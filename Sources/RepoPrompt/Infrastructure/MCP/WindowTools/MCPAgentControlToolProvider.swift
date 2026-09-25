@@ -31,11 +31,12 @@ final class MCPAgentControlToolProvider: MCPWindowToolProviding {
 
     private static var lifecycleWaitSemantics: String {
         let claudeSeconds = Int(MCPTimeoutPolicy.agentLifecycleClaudeAutomaticWaitSeconds)
+        let claudeExtendedSeconds = Int(MCPTimeoutPolicy.agentLifecycleClaudeExtendedCacheAutomaticWaitSeconds)
         let codexSeconds = Int(MCPTimeoutPolicy.agentLifecycleCodexAutomaticWaitSeconds)
         let otherSeconds = Int(MCPTimeoutPolicy.agentLifecycleOtherAutomaticWaitSeconds)
         let unresolvedSeconds = Int(MCPTimeoutPolicy.agentLifecycleUnresolvedAutomaticWaitSeconds)
         let maximumExplicitSeconds = Int(MCPTimeoutPolicy.agentLifecycleMaximumExplicitTimeoutSeconds)
-        return "Omit the timeout for automatic selection from the effective parent provider: Claude \(claudeSeconds) seconds, Codex \(codexSeconds) seconds, other \(otherSeconds) seconds, and unresolved \(unresolvedSeconds) seconds. Completion, interaction, cancellation, or other actionable state returns early; the selected timeout is only a wait-phase upper bound. A timeout returns the current state while the accepted worker remains active for later wait or poll. Explicit values must be in the inclusive range 0...\(maximumExplicitSeconds) seconds; zero means poll."
+        return "Omit the timeout for automatic selection from the effective parent provider: Claude \(claudeSeconds) seconds (\(claudeExtendedSeconds) seconds when the parent's effective Claude configuration explicitly sets a one-hour prompt cache), Codex \(codexSeconds) seconds, other \(otherSeconds) seconds, and unresolved \(unresolvedSeconds) seconds. Completion, interaction, cancellation, or other actionable state returns early; the selected timeout is only a wait-phase upper bound. A timeout returns the current state while the accepted worker remains active for later wait or poll. Explicit values must be in the inclusive range 0...\(maximumExplicitSeconds) seconds; zero means poll."
     }
 
     private func agentExploreTool() -> Tool {

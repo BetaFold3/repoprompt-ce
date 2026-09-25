@@ -143,6 +143,7 @@ final class ClaudeAgentModeCoordinator {
     private var privateFallbackControllerByTabID: [UUID: TrackedPrivateFallbackController] = [:]
     #if DEBUG
         private var testStopToolTrackingGate: (() async -> Void)?
+        private var testBeforePromptCacheRetentionSync: ((AgentModeViewModel.TabSession) -> Void)?
         private var testResumeRecoveryHandoffBeforeCommitGate: (@MainActor () async -> Void)?
     #endif
     private var pendingResumeTransferTasksByTabID: [UUID: Task<NativeAgentRuntimeSessionRef, Never>] = [:]
@@ -635,6 +636,12 @@ final class ClaudeAgentModeCoordinator {
                     for: session
                 )
             }
+            #if DEBUG
+                testBeforePromptCacheRetentionSync?(session)
+            #endif
+            if sessionOwnsClaudeController(controller, for: session) {
+                session.claudePromptCacheRetention = sessionRef.promptCacheRetention
+            }
             updateProviderSessionIDIfNeeded(sessionRef.sessionID, for: session)
             guard let installedController = session.claudeController else {
                 return
@@ -1065,6 +1072,12 @@ final class ClaudeAgentModeCoordinator {
 
         func test_setStopToolTrackingGate(_ gate: (() async -> Void)?) {
             testStopToolTrackingGate = gate
+        }
+
+        func test_setBeforePromptCacheRetentionSync(
+            _ hook: ((AgentModeViewModel.TabSession) -> Void)?
+        ) {
+            testBeforePromptCacheRetentionSync = hook
         }
 
         func test_setResumeRecoveryHandoffBeforeCommitGate(_ gate: (@MainActor () async -> Void)?) {

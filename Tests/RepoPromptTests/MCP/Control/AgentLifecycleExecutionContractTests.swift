@@ -10,10 +10,13 @@ import XCTest
 @MainActor
 final class AgentLifecycleExecutionContractTests: XCTestCase {
     private typealias ParentFamily = AgentMCPWaitPolicy.ParentFamily
+    private typealias ParentPromptCacheRetention = AgentMCPWaitPolicy.ParentPromptCacheRetention
     private typealias ParentCandidate = AgentMCPWaitPolicy.ParentCandidate
 
     /// Start, wait, steer and Explore start share one selection authority.
-    private var lifecycleSelectionResolvers: [(Value?, ParentFamily) throws -> AgentMCPWaitPolicy.Selection] {
+    private var lifecycleSelectionResolvers: [
+        (Value?, ParentFamily, ParentPromptCacheRetention) throws -> AgentMCPWaitPolicy.Selection
+    ] {
         [
             AgentRunMCPToolService.resolvedStartWaitSelection,
             AgentRunMCPToolService.resolvedWaitSelection,
@@ -24,11 +27,14 @@ final class AgentLifecycleExecutionContractTests: XCTestCase {
 
     func testSharedLifecycleTimeoutAuthorityMatchesProductContract() {
         XCTAssertEqual(MCPTimeoutPolicy.agentLifecycleClaudeAutomaticWaitSeconds, 180)
+        XCTAssertEqual(MCPTimeoutPolicy.agentLifecycleClaudeExtendedCacheAutomaticWaitSeconds, 1500)
+        XCTAssertEqual(MCPTimeoutPolicy.claudeCodeStdioMCPToolIdleTimeoutSeconds, 1800)
+        XCTAssertEqual(MCPTimeoutPolicy.agentLifecycleClaudeHostPreWaitBudgetSeconds, 60)
         XCTAssertEqual(MCPTimeoutPolicy.agentLifecycleCodexAutomaticWaitSeconds, 600)
         XCTAssertEqual(MCPTimeoutPolicy.agentLifecycleOtherAutomaticWaitSeconds, 180)
         XCTAssertEqual(MCPTimeoutPolicy.agentLifecycleUnresolvedAutomaticWaitSeconds, 180)
-        XCTAssertEqual(MCPTimeoutPolicy.agentLifecycleMaximumAutomaticWaitSeconds, 600)
-        XCTAssertEqual(MCPTimeoutPolicy.agentLifecycleAutomaticWaitResponseEnvelopeSeconds, 630)
+        XCTAssertEqual(MCPTimeoutPolicy.agentLifecycleMaximumAutomaticWaitSeconds, 1500)
+        XCTAssertEqual(MCPTimeoutPolicy.agentLifecycleAutomaticWaitResponseEnvelopeSeconds, 1530)
         XCTAssertEqual(
             MCPTimeoutPolicy.agentLifecycleAutomaticWaitResponseEnvelopeSeconds,
             MCPTimeoutPolicy.agentLifecycleMaximumAutomaticWaitSeconds
@@ -49,10 +55,27 @@ final class AgentLifecycleExecutionContractTests: XCTestCase {
             MCPTimeoutPolicy.agentLifecycleMaximumExplicitTimeoutSeconds
         )
 
-        let tableMaximum = ParentFamily.allCases
-            .map { MCPTimeoutPolicy.agentLifecycleAutomaticWaitSeconds(for: $0) }
-            .max()
-        XCTAssertEqual(tableMaximum, MCPTimeoutPolicy.agentLifecycleMaximumAutomaticWaitSeconds)
+        let tableValues = ParentFamily.allCases
+            .flatMap { family in
+                ParentPromptCacheRetention.allCases.map {
+                    MCPTimeoutPolicy.agentLifecycleAutomaticWaitSeconds(
+                        for: family,
+                        promptCacheRetention: $0
+                    )
+                }
+            }
+        XCTAssertEqual(tableValues.max(), MCPTimeoutPolicy.agentLifecycleMaximumAutomaticWaitSeconds)
+        XCTAssertLessThan(
+            MCPTimeoutPolicy.agentLifecycleClaudeExtendedCacheAutomaticWaitSeconds
+                + MCPTimeoutPolicy.cliSemanticWaitResponseMarginSeconds
+                + MCPTimeoutPolicy.agentLifecycleClaudeHostPreWaitBudgetSeconds,
+            MCPTimeoutPolicy.claudeCodeStdioMCPToolIdleTimeoutSeconds
+        )
+        XCTAssertTrue(tableValues.allSatisfy {
+            $0 + MCPTimeoutPolicy.cliSemanticWaitResponseMarginSeconds
+                + MCPTimeoutPolicy.agentLifecycleClaudeHostPreWaitBudgetSeconds
+                < MCPTimeoutPolicy.claudeCodeStdioMCPToolIdleTimeoutSeconds
+        })
     }
 
     func testProviderFamilyTableIsExhaustiveOverEveryProviderKind() {
@@ -69,12 +92,21 @@ final class AgentLifecycleExecutionContractTests: XCTestCase {
             XCTAssertEqual(family, expectedFamily, "\(provider)")
             let expectedSeconds: TimeInterval = provider == .codexExec ? 600 : 180
             XCTAssertEqual(
-                MCPTimeoutPolicy.agentLifecycleAutomaticWaitSeconds(for: family),
+                MCPTimeoutPolicy.agentLifecycleAutomaticWaitSeconds(
+                    for: family,
+                    promptCacheRetention: .standard
+                ),
                 expectedSeconds,
                 "\(provider)"
             )
         }
-        XCTAssertEqual(MCPTimeoutPolicy.agentLifecycleAutomaticWaitSeconds(for: .unresolved), 180)
+        XCTAssertEqual(
+            MCPTimeoutPolicy.agentLifecycleAutomaticWaitSeconds(
+                for: .unresolved,
+                promptCacheRetention: .standard
+            ),
+            180
+        )
         XCTAssertNotEqual(
             AgentMCPWaitPolicy.parentFamily(for: .customClaudeCompatible),
             .claude,
@@ -84,22 +116,55 @@ final class AgentLifecycleExecutionContractTests: XCTestCase {
 
     func testOmittedLifecycleTimeoutSelectsAutomaticWaitForFrozenFamily() throws {
         for family in ParentFamily.allCases {
-            let expected = MCPTimeoutPolicy.agentLifecycleAutomaticWaitSeconds(for: family)
-            for resolver in lifecycleSelectionResolvers {
-                let selection = try resolver(nil, family)
-                XCTAssertEqual(selection.mode, .automatic, "\(family)")
-                XCTAssertEqual(selection.timeoutSeconds, expected, "\(family)")
-                XCTAssertEqual(selection.parentFamily, family, "\(family)")
-                let canonical = try XCTUnwrap(selection.canonicalValue.objectValue)
-                XCTAssertEqual(canonical["mode"], .string("automatic"))
-                XCTAssertEqual(canonical["timeout_seconds"], .int(Int(expected)))
-                XCTAssertEqual(canonical["parent_family"], .string(family.rawValue))
-                XCTAssertEqual(canonical.count, 3, "no extra policy fields: \(canonical.keys.sorted())")
+            for retention in ParentPromptCacheRetention.allCases {
+                let expected = MCPTimeoutPolicy.agentLifecycleAutomaticWaitSeconds(
+                    for: family,
+                    promptCacheRetention: retention
+                )
+                for resolver in lifecycleSelectionResolvers {
+                    let selection = try resolver(nil, family, retention)
+                    XCTAssertEqual(selection.mode, .automatic, "\(family), \(retention)")
+                    XCTAssertEqual(selection.timeoutSeconds, expected, "\(family), \(retention)")
+                    XCTAssertEqual(selection.parentFamily, family, "\(family), \(retention)")
+                    let canonical = try XCTUnwrap(selection.canonicalValue.objectValue)
+                    XCTAssertEqual(canonical["mode"], .string("automatic"))
+                    XCTAssertEqual(canonical["timeout_seconds"], .int(Int(expected)))
+                    XCTAssertEqual(canonical["parent_family"], .string(family.rawValue))
+                    XCTAssertEqual(canonical.count, 3, "no extra policy fields: \(canonical.keys.sorted())")
+                }
             }
         }
+        XCTAssertEqual(
+            try AgentRunMCPToolService.resolvedWaitSelection(
+                nil,
+                parentFamily: .claude,
+                promptCacheRetention: .extended
+            ),
+            .automatic(parentFamily: .claude, promptCacheRetention: .extended)
+        )
+        XCTAssertEqual(
+            try AgentRunMCPToolService.resolvedWaitSelection(
+                nil,
+                parentFamily: .claude,
+                promptCacheRetention: .extended
+            ).canonicalValue,
+            .object([
+                "mode": .string("automatic"),
+                "timeout_seconds": .int(1500),
+                "parent_family": .string("claude")
+            ])
+        )
+
         // Omitted `.null` is omission too.
-        let nullSelection = try AgentRunMCPToolService.resolvedWaitSelection(.null, parentFamily: .codex)
-        XCTAssertEqual(nullSelection, .automatic(parentFamily: .codex))
+        let nullSelection = try AgentRunMCPToolService.resolvedWaitSelection(
+            .null,
+            parentFamily: .codex,
+            promptCacheRetention: .standard
+        )
+        XCTAssertEqual(
+            nullSelection,
+            .automatic(parentFamily: .codex, promptCacheRetention: .standard)
+        )
         XCTAssertEqual(nullSelection.timeoutSeconds, 600)
     }
 
@@ -108,31 +173,31 @@ final class AgentLifecycleExecutionContractTests: XCTestCase {
 
         for resolver in lifecycleSelectionResolvers {
             // Explicit zero is a non-blocking poll and never carries a family.
-            let poll = try resolver(.int(0), .codex)
+            let poll = try resolver(.int(0), .codex, .extended)
             XCTAssertEqual(poll, .poll)
             XCTAssertEqual(poll.canonicalValue, .object(["mode": .string("poll"), "timeout_seconds": .int(0)]))
 
             // Explicit positive values are explicit for every family (no family override).
-            let explicit = try resolver(.int(600), .claude)
+            let explicit = try resolver(.int(600), .claude, .extended)
             XCTAssertEqual(explicit, .explicit(timeoutSeconds: 600))
             XCTAssertNil(explicit.parentFamily)
             XCTAssertEqual(explicit.canonicalValue, .object(["mode": .string("explicit"), "timeout_seconds": .int(600)]))
             XCTAssertGreaterThan(explicit.timeoutSeconds, TimeInterval(MCPTimeoutPolicy.boundedToolExecutionDeadlineSeconds))
 
             // Inclusive maximum across every accepted representation.
-            XCTAssertEqual(try resolver(.double(maximum), .other).timeoutSeconds, maximum)
-            XCTAssertEqual(try resolver(.int(Int(maximum)), .other).timeoutSeconds, maximum)
-            XCTAssertEqual(try resolver(.string(String(Int(maximum))), .other).timeoutSeconds, maximum)
-            XCTAssertEqual(try resolver(.int(14400), .unresolved).mode, .explicit)
+            XCTAssertEqual(try resolver(.double(maximum), .other, .extended).timeoutSeconds, maximum)
+            XCTAssertEqual(try resolver(.int(Int(maximum)), .other, .extended).timeoutSeconds, maximum)
+            XCTAssertEqual(try resolver(.string(String(Int(maximum))), .other, .extended).timeoutSeconds, maximum)
+            XCTAssertEqual(try resolver(.int(14400), .unresolved, .extended).mode, .explicit)
 
             // Fractional explicit values survive unchanged.
-            let fractional = try resolver(.double(900.5), .codex)
+            let fractional = try resolver(.double(900.5), .codex, .extended)
             XCTAssertEqual(fractional, .explicit(timeoutSeconds: 900.5))
             XCTAssertEqual(fractional.canonicalValue.objectValue?["timeout_seconds"], .double(900.5))
 
             // 14,401 and larger are rejected — never silently clamped to the maximum.
             for value in [Value.int(14401), .double(maximum + 1), .string("14401"), .int(86400)] {
-                XCTAssertThrowsError(try resolver(value, .codex), "\(value)") { error in
+                XCTAssertThrowsError(try resolver(value, .codex, .extended), "\(value)") { error in
                     XCTAssertTrue(String(describing: error).contains("14400"), String(describing: error))
                 }
             }
@@ -146,6 +211,49 @@ final class AgentLifecycleExecutionContractTests: XCTestCase {
         let otherRun = ParentCandidate(runID: UUID(), isActive: true, selectedAgent: .claudeCode)
         let unbound = ParentCandidate(runID: nil, isActive: true, selectedAgent: .claudeCode)
         let duplicate = ParentCandidate(runID: runID, isActive: true, selectedAgent: .claudeCode)
+        let extendedClaude = ParentCandidate(
+            runID: runID,
+            isActive: true,
+            selectedAgent: .claudeCode,
+            promptCacheRetention: .extended
+        )
+        let extendedCodex = ParentCandidate(
+            runID: runID,
+            isActive: true,
+            selectedAgent: .codexExec,
+            promptCacheRetention: .extended
+        )
+        let extendedGLM = ParentCandidate(
+            runID: runID,
+            isActive: true,
+            selectedAgent: .claudeCodeGLM,
+            promptCacheRetention: .extended
+        )
+        let extendedCustom = ParentCandidate(
+            runID: runID,
+            isActive: true,
+            selectedAgent: .customClaudeCompatible,
+            promptCacheRetention: .extended
+        )
+
+        XCTAssertEqual(
+            AgentMCPWaitPolicy.resolveParent(runID: runID, candidates: [extendedClaude]),
+            .init(family: .claude, promptCacheRetention: .extended)
+        )
+        XCTAssertEqual(
+            AgentMCPWaitPolicy.resolveParent(runID: runID, candidates: [extendedCodex]),
+            .init(family: .codex, promptCacheRetention: .standard)
+        )
+        for candidate in [extendedGLM, extendedCustom] {
+            XCTAssertEqual(
+                AgentMCPWaitPolicy.resolveParent(runID: runID, candidates: [candidate]),
+                .init(family: .other, promptCacheRetention: .standard)
+            )
+        }
+        XCTAssertEqual(
+            AgentMCPWaitPolicy.resolveParent(runID: nil, candidates: [extendedClaude]),
+            .unresolved
+        )
 
         // Unique active exact match wins; inactive/other/unbound sessions do not disturb it.
         XCTAssertEqual(AgentMCPWaitPolicy.resolveParentFamily(runID: runID, candidates: [stale, active, otherRun, unbound]), .codex)
@@ -163,7 +271,6 @@ final class AgentLifecycleExecutionContractTests: XCTestCase {
     func testServerFreezesParentFamilyFromAuthenticatedRunBindingOnly() async throws {
         let window = makeWindow()
         defer { WindowStatesManager.shared.unregisterWindowState(window) }
-        let viewModel = window.agentModeViewModel
         let connectionID = UUID()
         let runID = UUID()
         XCTAssertTrue(window.mcpServer.registerRunIDMapping(
@@ -192,8 +299,31 @@ final class AgentLifecycleExecutionContractTests: XCTestCase {
         )
         let bound = await window.mcpServer.resolveAgentLifecycleWaitPolicyContext(metadata: metadata)
         XCTAssertEqual(bound.parentFamily, .codex)
+        XCTAssertEqual(bound.parentPromptCacheRetention, .standard)
         XCTAssertEqual(bound.metadata.connectionID, connectionID)
         XCTAssertEqual(bound.metadata.clientName, metadata.clientName)
+
+        parent.runState = .idle
+        let extendedClaudeParent = try await makeRegisteredSession(in: window)
+        extendedClaudeParent.runID = runID
+        extendedClaudeParent.selectedAgent = .claudeCode
+        extendedClaudeParent.claudePromptCacheRetention = .extended
+        extendedClaudeParent.runState = .running
+        defer { extendedClaudeParent.runState = .idle }
+        let extendedClaude = await window.mcpServer.resolveAgentLifecycleWaitPolicyContext(metadata: metadata)
+        XCTAssertEqual(extendedClaude.parentFamily, .claude)
+        XCTAssertEqual(extendedClaude.parentPromptCacheRetention, .extended)
+
+        extendedClaudeParent.runState = .idle
+        let nonClaudeParent = try await makeRegisteredSession(in: window)
+        nonClaudeParent.runID = runID
+        nonClaudeParent.selectedAgent = .codexExec
+        nonClaudeParent.claudePromptCacheRetention = .extended
+        nonClaudeParent.runState = .running
+        defer { nonClaudeParent.runState = .idle }
+        let nonClaude = await window.mcpServer.resolveAgentLifecycleWaitPolicyContext(metadata: metadata)
+        XCTAssertEqual(nonClaude.parentFamily, .codex)
+        XCTAssertEqual(nonClaude.parentPromptCacheRetention, .standard)
 
         // Ambiguous: a second active session claiming the same run identity.
         let duplicate = try await makeRegisteredSession(in: window)
@@ -206,12 +336,12 @@ final class AgentLifecycleExecutionContractTests: XCTestCase {
 
         // Stale: the bound run is no longer active anywhere.
         duplicate.runState = .completed
-        parent.runState = .completed
+        nonClaudeParent.runState = .completed
         let stale = await window.mcpServer.resolveAgentLifecycleWaitPolicyContext(metadata: metadata)
         XCTAssertEqual(stale.parentFamily, .unresolved)
 
         // Missing / external: no authenticated run binding for the connection.
-        parent.runState = .running
+        nonClaudeParent.runState = .running
         let unboundConnection = MCPServerViewModel.RequestMetadata(
             connectionID: UUID(),
             clientName: "agent-lifecycle-contract-tests",

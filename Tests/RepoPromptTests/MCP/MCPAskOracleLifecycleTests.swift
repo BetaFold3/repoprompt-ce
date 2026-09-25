@@ -229,7 +229,9 @@ final class MCPAskOracleLifecycleTests: XCTestCase {
         @discardableResult
         func activateAgentRunForBatch(
             sessionID: UUID? = nil,
-            activeRunID: UUID? = nil
+            activeRunID: UUID? = nil,
+            selectedAgent: AgentProviderKind? = nil,
+            promptCacheRetention: AgentMCPWaitPolicy.ParentPromptCacheRetention = .standard
         ) throws -> UUID {
             let sessionID = sessionID ?? runID
             let activeRunID = activeRunID ?? runID
@@ -241,6 +243,10 @@ final class MCPAskOracleLifecycleTests: XCTestCase {
             ) != nil else {
                 throw LifecycleTestError.runMappingFailed
             }
+            if let selectedAgent {
+                session.selectedAgent = selectedAgent
+            }
+            session.claudePromptCacheRetention = promptCacheRetention
             session.runID = activeRunID
             session.runState = .running
             window.agentModeViewModel.setAgentRunActive(tabID, isActive: true)
@@ -622,6 +628,76 @@ final class MCPAskOracleLifecycleTests: XCTestCase {
             XCTAssertNotNil(result["usage"]?.objectValue)
             let operationID = try operationID(in: result)
             XCTAssertEqual(fixture.store.snapshot(operationID)?.delivery, .delivered)
+        }
+    }
+
+    func testAutomaticSendUsesExtendedClaudeParentWaitPolicy() async throws {
+        try await withFixture { fixture in
+            _ = try fixture.activateAgentRunForBatch(
+                selectedAgent: .claudeCode,
+                promptCacheRetention: .extended
+            )
+
+            let task = Task { @MainActor in try await fixture.ask() }
+            try await fixture.harness.waitUntilOpen(count: 1)
+            try await fixture.waitUntilParked()
+            fixture.harness.finish(index: 0, text: "Extended inline answer")
+
+            let result = try await task.value
+            let waitPolicy = try XCTUnwrap(result["wait_policy"]?.objectValue)
+            XCTAssertEqual(waitPolicy["mode"]?.stringValue, "automatic")
+            XCTAssertEqual(waitPolicy["timeout_seconds"]?.intValue, 1500)
+            XCTAssertEqual(waitPolicy["parent_family"]?.stringValue, "claude")
+        }
+    }
+
+    func testAutomaticWaitUsesExtendedClaudeParentWaitPolicy() async throws {
+        try await withFixture { fixture in
+            _ = try fixture.activateAgentRunForBatch(
+                selectedAgent: .claudeCode,
+                promptCacheRetention: .extended
+            )
+            let pending = try await fixture.ask(["timeout_seconds": .int(0)])
+            let operationID = try operationID(in: pending)
+            try await fixture.harness.waitUntilOpen(count: 1)
+
+            let waitTask = Task { @MainActor in
+                try await fixture.call([
+                    "op": .string("wait"),
+                    "operation_ids": .array([.string(operationID.uuidString)])
+                ])
+            }
+            try await fixture.waitUntilParked()
+            fixture.harness.finish(index: 0, text: "Extended waited answer")
+
+            let result = try await waitTask.value
+            let waitPolicy = try XCTUnwrap(result["wait_policy"]?.objectValue)
+            XCTAssertEqual(waitPolicy["mode"]?.stringValue, "automatic")
+            XCTAssertEqual(waitPolicy["timeout_seconds"]?.intValue, 1500)
+            XCTAssertEqual(waitPolicy["parent_family"]?.stringValue, "claude")
+        }
+    }
+
+    func testAutomaticBatchUsesExtendedClaudeParentWaitPolicy() async throws {
+        try await withFixture { fixture in
+            _ = try fixture.activateAgentRunForBatch(
+                selectedAgent: .claudeCode,
+                promptCacheRetention: .extended
+            )
+            let batchTask = Task { @MainActor in
+                try await fixture.call([
+                    "consultations": batchConsultations(fixture: fixture, count: 1)
+                ])
+            }
+            try await fixture.harness.waitUntilOpen(count: 1)
+            try await fixture.waitUntilParked()
+            fixture.harness.finish(index: 0, text: "Extended batch answer")
+
+            let result = try await batchTask.value
+            let waitPolicy = try XCTUnwrap(result["wait_policy"]?.objectValue)
+            XCTAssertEqual(waitPolicy["mode"]?.stringValue, "automatic")
+            XCTAssertEqual(waitPolicy["timeout_seconds"]?.intValue, 1500)
+            XCTAssertEqual(waitPolicy["parent_family"]?.stringValue, "claude")
         }
     }
 

@@ -220,6 +220,54 @@ final class ClaudeNativeApprovalAndResumeTests: XCTestCase {
         await initializedController.shutdown()
     }
 
+    func testPromptCacheRetentionSessionRefUsesLaunchResolutionAndShutdownReset() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "ClaudeNativePromptCacheRetentionTests-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        let managedSettingsURL = root.appendingPathComponent("managed-settings.json")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        try JSONSerialization.data(
+            withJSONObject: ["promptCacheTtl": "1h"],
+            options: [.sortedKeys]
+        ).write(to: managedSettingsURL, options: .atomic)
+
+        let controller = try ClaudeNativeProcessSessionController(
+            runID: UUID(),
+            tabID: UUID(),
+            windowID: 1,
+            workspacePath: nil,
+            config: .discovery(
+                commandName: "/usr/bin/false",
+                runtimeVariant: .standard
+            ),
+            managedSettingsURL: managedSettingsURL
+        )
+
+        await controller.test_resolvePromptCacheRetentionForLaunch(
+            launchEnvironment: [:],
+            workingDirectory: nil
+        )
+        let resolvedRef = await controller.currentSessionRef()
+        XCTAssertEqual(resolvedRef.promptCacheRetention, .extended)
+
+        try JSONSerialization.data(
+            withJSONObject: ["promptCacheTtl": "5m"],
+            options: [.sortedKeys]
+        ).write(to: managedSettingsURL, options: .atomic)
+        await controller.shutdown()
+        let shutdownRef = await controller.currentSessionRef()
+        XCTAssertEqual(shutdownRef.promptCacheRetention, .standard)
+
+        await controller.test_resolvePromptCacheRetentionForLaunch(
+            launchEnvironment: [:],
+            workingDirectory: nil
+        )
+        let relaunchedRef = await controller.currentSessionRef()
+        XCTAssertEqual(relaunchedRef.promptCacheRetention, .standard)
+    }
+
     @MainActor
     func testPermissionStageAndLocalAutoFailuresDoNotRetryFreshResume() {
         let underlying = ClaudeNativeProcessSessionController.ControllerError.invalidControlResponse(

@@ -19,6 +19,7 @@ enum AppLinkCallTimeoutPolicy {
     static let fast: TimeInterval = 60
     static let grace: TimeInterval = 30
     /// App-link response cap only; expiry does not cancel an already accepted lifecycle worker.
+    /// Remote callers resolve as unresolved (180 seconds), so a clamped shared envelope is only a response bound.
     static let cap: TimeInterval = 900
 
     static func timeout(op: String, payload: [String: JSONValue]) -> TimeInterval {

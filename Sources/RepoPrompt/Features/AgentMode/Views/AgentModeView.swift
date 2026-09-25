@@ -2965,6 +2965,12 @@ struct AgentModeChatDetailView: View {
             else { return nil }
             return AgentMCPWaitPolicy.parentFamily(for: authoritativeOwnerSession.selectedAgent)
         }()
+        let authoritativeLocalParentPromptCacheRetention: AgentMCPWaitPolicy.ParentPromptCacheRetention = {
+            guard authoritativeLocalParentFamily == .claude,
+                  let authoritativeOwnerSession
+            else { return .standard }
+            return authoritativeOwnerSession.claudePromptCacheRetention
+        }()
         let ownerWorkspaceID = oracleViewModel.workspaceManager.activeWorkspaceID
         let oracleToolCardContext: AgentOracleToolCardContext? = {
             guard !isRemoteSession,
@@ -3022,7 +3028,8 @@ struct AgentModeChatDetailView: View {
             ),
             agentControlToolCardContext: showCancel
                 ? AgentControlToolCardContext(
-                    authoritativeLocalParentFamily: authoritativeLocalParentFamily
+                    authoritativeLocalParentFamily: authoritativeLocalParentFamily,
+                    authoritativeLocalParentPromptCacheRetention: authoritativeLocalParentPromptCacheRetention
                 )
                 : nil,
             agentOracleToolCardContext: oracleToolCardContext,

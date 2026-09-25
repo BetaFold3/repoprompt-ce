@@ -190,10 +190,30 @@ final class AgentControlToolCardPresentationTests: XCTestCase {
         }
     }
 
+    func testExtendedClaudeParentCallSubtitleUsesTwentyFiveMinuteAutomaticWait() throws {
+        let context = AgentControlToolCardContext(
+            authoritativeLocalParentFamily: .claude,
+            authoritativeLocalParentPromptCacheRetention: .extended
+        )
+
+        try XCTAssertEqual(
+            ToolCardRouter.callSubtitle(
+                for: "agent_run",
+                argsJSON: jsonString(["op": "start"]),
+                agentControlContext: context
+            ),
+            "start • wait ≤25m"
+        )
+    }
+
     func testAskOracleSubtitlesUseParentFamilyAndCanonicalResultWaitLabels() throws {
         let operationID = "11111111-1111-1111-1111-111111111111"
         let codexContext = AgentControlToolCardContext(authoritativeLocalParentFamily: .codex)
         let claudeContext = AgentControlToolCardContext(authoritativeLocalParentFamily: .claude)
+        let extendedClaudeContext = AgentControlToolCardContext(
+            authoritativeLocalParentFamily: .claude,
+            authoritativeLocalParentPromptCacheRetention: .extended
+        )
 
         try XCTAssertEqual(
             ToolCardRouter.callSubtitle(
@@ -210,6 +230,14 @@ final class AgentControlToolCardPresentationTests: XCTestCase {
                 agentControlContext: claudeContext
             ),
             "wait • \(operationID) • wait ≤3m"
+        )
+        try XCTAssertEqual(
+            ToolCardRouter.callSubtitle(
+                for: "ask_oracle",
+                argsJSON: jsonString(["op": "wait", "operation_ids": [operationID]]),
+                agentControlContext: extendedClaudeContext
+            ),
+            "wait • \(operationID) • wait ≤25m"
         )
         try XCTAssertEqual(
             ToolCardRouter.callSubtitle(

@@ -344,7 +344,8 @@ struct MCPOracleToolService {
         let invocation = await resolveWaitInvocation()
         let selection = try AgentMCPWaitPolicy.selection(
             rawTimeout: rawTimeout,
-            parentFamily: invocation.context.parentFamily
+            parentFamily: invocation.context.parentFamily,
+            promptCacheRetention: invocation.context.parentPromptCacheRetention
         )
 
         await sendStageProgress(connectionID, askOracleToolName, "starting", "Starting Oracle...")
@@ -810,7 +811,8 @@ struct MCPOracleToolService {
         let invocation = await resolveWaitInvocation()
         let selection = try AgentMCPWaitPolicy.selection(
             rawTimeout: rawTimeout,
-            parentFamily: invocation.context.parentFamily
+            parentFamily: invocation.context.parentFamily,
+            promptCacheRetention: invocation.context.parentPromptCacheRetention
         )
         operationStore.purge()
         let targetIDs = requestedIDs ?? operationStore.undeliveredOperationIDs(owner: caller)
@@ -1196,7 +1198,8 @@ struct MCPOracleToolService {
         let invocation = await resolveWaitInvocation()
         let selection = try AgentMCPWaitPolicy.selection(
             rawTimeout: rawTimeout,
-            parentFamily: invocation.context.parentFamily
+            parentFamily: invocation.context.parentFamily,
+            promptCacheRetention: invocation.context.parentPromptCacheRetention
         )
         let source = try await captureBatchSource(
             args: args,

@@ -19,7 +19,7 @@ struct AgentExploreMCPToolService {
     /// Plan §6.3: frozen parent-family resolver shared with the delegated `agent_run` control
     /// service. Resolved once at the Explore outer entry, before child creation or delegation.
     var resolveWaitPolicyContext: (_ metadata: RequestMetadata) async -> AgentMCPWaitPolicy.RequestContext = {
-        AgentMCPWaitPolicy.RequestContext(metadata: $0, parentFamily: .unresolved)
+        AgentMCPWaitPolicy.RequestContext.unresolved(metadata: $0)
     }
 
     let startRun: StartRun
@@ -36,9 +36,14 @@ struct AgentExploreMCPToolService {
 
     static func resolvedStartWaitSelection(
         _ value: Value?,
-        parentFamily: AgentMCPWaitPolicy.ParentFamily
+        parentFamily: AgentMCPWaitPolicy.ParentFamily,
+        promptCacheRetention: AgentMCPWaitPolicy.ParentPromptCacheRetention
     ) throws -> AgentMCPWaitPolicy.Selection {
-        try AgentRunMCPToolService.resolvedStartWaitSelection(value, parentFamily: parentFamily)
+        try AgentRunMCPToolService.resolvedStartWaitSelection(
+            value,
+            parentFamily: parentFamily,
+            promptCacheRetention: promptCacheRetention
+        )
     }
 
     func execute(args: [String: Value]) async throws -> Value {
@@ -72,7 +77,11 @@ struct AgentExploreMCPToolService {
         // explore child is created or the request is rebound. The frozen values flow through the
         // internal start-to-wait delegation; omission is never rewritten to an explicit number.
         let waitContext = await resolveWaitPolicyContext(metadata)
-        let waitSelection = try Self.resolvedStartWaitSelection(args["timeout"], parentFamily: waitContext.parentFamily)
+        let waitSelection = try Self.resolvedStartWaitSelection(
+            args["timeout"],
+            parentFamily: waitContext.parentFamily,
+            promptCacheRetention: waitContext.parentPromptCacheRetention
+        )
         let context = try await resolveStartContext(metadata: metadata)
         let started = try await startExploreRuns(
             messages: messages,
@@ -130,7 +139,8 @@ struct AgentExploreMCPToolService {
             let waitContext = await resolveWaitPolicyContext(metadata)
             let waitSelection = try AgentRunMCPToolService.resolvedWaitSelection(
                 args["timeout"],
-                parentFamily: waitContext.parentFamily
+                parentFamily: waitContext.parentFamily,
+                promptCacheRetention: waitContext.parentPromptCacheRetention
             )
             frozenWait = (waitContext, waitSelection)
         } else {

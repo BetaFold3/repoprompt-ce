@@ -3148,7 +3148,11 @@ final class AgentRunMCPToolServiceWaitTests: XCTestCase {
 
         func resolve(_ metadata: MCPServerViewModel.RequestMetadata) -> AgentMCPWaitPolicy.RequestContext {
             count += 1
-            return AgentMCPWaitPolicy.RequestContext(metadata: metadata, parentFamily: family)
+            return AgentMCPWaitPolicy.RequestContext(
+                metadata: metadata,
+                parentFamily: family,
+                parentPromptCacheRetention: .standard
+            )
         }
     }
 
@@ -3318,7 +3322,11 @@ final class AgentRunMCPToolServiceWaitTests: XCTestCase {
         var service = makeService(window: window, viewModel: viewModel, liveSnapshots: liveSnapshots, recorder: WaitScopeRecorder())
         service.resolveWaitPolicyContext = { metadata in
             XCTFail("Delegated frozen waits must not re-resolve the parent family")
-            return AgentMCPWaitPolicy.RequestContext(metadata: metadata, parentFamily: .claude)
+            return AgentMCPWaitPolicy.RequestContext(
+                metadata: metadata,
+                parentFamily: .claude,
+                parentPromptCacheRetention: .standard
+            )
         }
         await liveSnapshots.set(makeSnapshot(sessionID: fixture.sessionID, status: .completed, latestAssistantPreview: "done"))
 
@@ -3328,12 +3336,13 @@ final class AgentRunMCPToolServiceWaitTests: XCTestCase {
                 clientName: "agent-run-wait-tests",
                 windowID: window.windowID
             ),
-            parentFamily: .codex
+            parentFamily: .codex,
+            parentPromptCacheRetention: .standard
         )
         let value = try await service.executeFrozenWait(
             sessionIDs: [fixture.sessionID],
             context: frozenContext,
-            selection: .automatic(parentFamily: .codex)
+            selection: .automatic(parentFamily: .codex, promptCacheRetention: .standard)
         )
 
         let object = try XCTUnwrap(value.objectValue)

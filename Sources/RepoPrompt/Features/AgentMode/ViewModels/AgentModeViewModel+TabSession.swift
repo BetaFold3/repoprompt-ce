@@ -1,5 +1,6 @@
 import Combine
 import Foundation
+import RepoPromptShared
 
 extension AgentModeViewModel {
     /// A resend selector carries either a picked target (`windowID`, with an optional `workspaceID` guard
@@ -584,6 +585,7 @@ extension AgentModeViewModel {
         var providerTokenUsageByTurn: [AgentTokenUsagePersist] = []
         var claudeConfiguredContextWindow: Int?
         var claudeConfiguredContextWindowKey: ClaudeProvisionalContextWindowResolver.Key?
+        var claudePromptCacheRetention: MCPTimeoutPolicy.AgentLifecycleParentPromptCacheRetention = .standard
         var pendingNonCodexUserInputTokenQueue: [Int] = []
         var activeNonCodexTurnTokenAccumulator: NonCodexTurnTokenAccumulator?
         /// Owner-keyed provider accounting (plan §3.2). Installed by persisted hydration or lazily when

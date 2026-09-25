@@ -19,7 +19,7 @@ import XCTest
         func testAskOracleAutomaticSendsAndWaitUseOwnedResponseEnvelope() async {
             let session = makeUnconnectedSession()
             let expected = MCPTimeoutPolicy.agentLifecycleAutomaticWaitResponseEnvelopeSeconds
-            XCTAssertEqual(expected, 630)
+            XCTAssertEqual(expected, 1530)
             let cases: [[String: Value]] = [
                 [:],
                 ["op": .string("send")],
@@ -134,7 +134,7 @@ import XCTest
             let session = makeUnconnectedSession()
             let sessionID = UUID().uuidString
             let expected = MCPTimeoutPolicy.agentLifecycleAutomaticWaitResponseEnvelopeSeconds
-            XCTAssertEqual(expected, 630)
+            XCTAssertEqual(expected, 1530)
             let cases: [(toolName: String, arguments: [String: Value])] = [
                 ("agent_run", ["op": .string("start")]),
                 ("agent_explore", ["op": .string("start")]),

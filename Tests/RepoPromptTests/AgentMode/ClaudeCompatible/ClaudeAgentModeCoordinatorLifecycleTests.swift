@@ -134,17 +134,40 @@ extension AgentModeRunServiceLifecycleTests {
         XCTAssertNotEqual(acknowledgedBinding, pendingBinding)
     }
 
+    func testOwnedStartupPropagatesPromptCacheRetentionToSession() async {
+        let recorder = LifecycleRecorder()
+        let controller = LifecycleFakeNativeController(
+            recorder: recorder,
+            label: "extended-cache",
+            promptCacheRetention: .extended
+        )
+        let harness = makeHarness(recorder: recorder, claudeController: controller)
+        let session = makeRunningClaudeSession(controller: controller)
+        harness.host.test_installLiveSession(session)
+
+        let sent = await harness.host.claudeCoordinator.sendClaudeNativeMessage(
+            session: session,
+            text: "propagate retention",
+            attachments: []
+        )
+
+        XCTAssertTrue(sent)
+        XCTAssertEqual(session.claudePromptCacheRetention, .extended)
+    }
+
     func testCancelledDispatchCannotResumeAgainstSuccessorController() async {
         let recorder = LifecycleRecorder()
         let cancelledStartGate = LifecycleAsyncGate()
         let cancelledController = LifecycleFakeNativeController(
             recorder: recorder,
             label: "cancelled-dispatch",
-            startGate: cancelledStartGate
+            startGate: cancelledStartGate,
+            promptCacheRetention: .extended
         )
         let successorController = LifecycleFakeNativeController(
             recorder: recorder,
-            label: "successor-dispatch"
+            label: "successor-dispatch",
+            promptCacheRetention: .standard
         )
         var factoryInvocationCount = 0
         let harness = makeHarness(
@@ -194,6 +217,7 @@ extension AgentModeRunServiceLifecycleTests {
         )
         XCTAssertEqual(session.claudeExpectedTurnIDs.count, 1)
         XCTAssertEqual(session.runState, .running)
+        XCTAssertEqual(session.claudePromptCacheRetention, .standard)
         XCTAssertTrue(session.items.filter { $0.kind == .error }.isEmpty)
 
         await cancelledStartGate.release()
@@ -206,6 +230,7 @@ extension AgentModeRunServiceLifecycleTests {
         )
         XCTAssertEqual(session.claudeExpectedTurnIDs.count, 1)
         XCTAssertEqual(session.runState, .running)
+        XCTAssertEqual(session.claudePromptCacheRetention, .standard)
         XCTAssertTrue(session.items.filter { $0.kind == .error }.isEmpty)
     }
 
@@ -310,6 +335,69 @@ extension AgentModeRunServiceLifecycleTests {
         XCTAssertEqual(acknowledgement.acknowledgedEffort, .high)
         XCTAssertEqual(session.runState, .running)
         XCTAssertTrue(session.items.filter { $0.kind == .error }.isEmpty)
+    }
+
+    func testSupersededStartupReturnCannotOverwriteSuccessorPromptCacheRetention() async {
+        let recorder = LifecycleRecorder()
+        let supersededStartGate = LifecycleAsyncGate()
+        let supersededController = LifecycleFakeNativeController(
+            recorder: recorder,
+            label: "superseded-retention-startup",
+            startGate: supersededStartGate,
+            promptCacheRetention: .extended
+        )
+        let successorController = LifecycleFakeNativeController(
+            recorder: recorder,
+            label: "successor-retention-startup",
+            promptCacheRetention: .standard
+        )
+        let harness = makeHarness(
+            recorder: recorder,
+            claudeControllerFactory: { _, _, _, _ in supersededController }
+        )
+        let session = makeRunningClaudeSession(controller: supersededController)
+        session.claudeController = nil
+        harness.host.test_installLiveSession(session)
+
+        var didSupersedeBeforeRetentionSync = false
+        harness.host.claudeCoordinator.test_setBeforePromptCacheRetentionSync { observedSession in
+            guard !didSupersedeBeforeRetentionSync else { return }
+            didSupersedeBeforeRetentionSync = true
+            if let supersededAttemptID = observedSession.activeRunAttemptID {
+                _ = observedSession.endRunAttempt(
+                    ifCurrentAttemptID: supersededAttemptID,
+                    source: "test_superseded_retention_startup"
+                )
+            }
+            observedSession.runID = UUID()
+            observedSession.runState = .running
+            observedSession.beginRunAttempt(source: "test_successor_retention_startup")
+            observedSession.claudeController = successorController
+            observedSession.claudePromptCacheRetention = .standard
+        }
+        defer {
+            harness.host.claudeCoordinator.test_setBeforePromptCacheRetentionSync(nil)
+        }
+
+        let supersededDispatch = Task {
+            await harness.host.claudeCoordinator.sendClaudeNativeMessage(
+                session: session,
+                text: "superseded retention",
+                attachments: []
+            )
+        }
+        await supersededStartGate.waitUntilArrived()
+        await supersededStartGate.release()
+        let supersededSent = await supersededDispatch.value
+
+        XCTAssertFalse(supersededSent)
+        XCTAssertTrue(didSupersedeBeforeRetentionSync)
+        XCTAssertEqual(session.claudePromptCacheRetention, .standard)
+        XCTAssertTrue(
+            session.claudeController.map {
+                ObjectIdentifier($0 as AnyObject) == ObjectIdentifier(successorController as AnyObject)
+            } ?? false
+        )
     }
 
     func testRetainedAutoControllerAppliesDeferredEffortBeforeNextSend() async {
@@ -2084,6 +2172,7 @@ actor LifecycleFakeNativeController: NativeAgentRuntimeControlling {
     private let shutdownGate: LifecycleAsyncGate?
     private let emittedAssistantTextOnSend: String?
     private let sessionID: String
+    private let promptCacheRetention: AgentMCPWaitPolicy.ParentPromptCacheRetention
     private let stream: AsyncStream<NativeAgentRuntimeEvent>
     private let streamContinuation: AsyncStream<NativeAgentRuntimeEvent>.Continuation
     private var startExistingSessionIDs: [String?] = []
@@ -2110,7 +2199,8 @@ actor LifecycleFakeNativeController: NativeAgentRuntimeControlling {
         sendUserMessageGate: LifecycleAsyncGate? = nil,
         shutdownGate: LifecycleAsyncGate? = nil,
         emittedAssistantTextOnSend: String? = nil,
-        sessionID: String = "lifecycle-claude-session"
+        sessionID: String = "lifecycle-claude-session",
+        promptCacheRetention: AgentMCPWaitPolicy.ParentPromptCacheRetention = .standard
     ) {
         self.recorder = recorder
         self.label = label
@@ -2128,6 +2218,7 @@ actor LifecycleFakeNativeController: NativeAgentRuntimeControlling {
         self.shutdownGate = shutdownGate
         self.emittedAssistantTextOnSend = emittedAssistantTextOnSend
         self.sessionID = sessionID
+        self.promptCacheRetention = promptCacheRetention
         var capturedContinuation: AsyncStream<NativeAgentRuntimeEvent>.Continuation?
         stream = AsyncStream { continuation in
             capturedContinuation = continuation
@@ -2199,6 +2290,7 @@ actor LifecycleFakeNativeController: NativeAgentRuntimeControlling {
         activeSession = true
         return NativeAgentRuntimeSessionRef(
             sessionID: sessionID,
+            promptCacheRetention: promptCacheRetention,
             initializationGeneration: initializationGeneration,
             initializedDuringCall: initializationGeneration != generationAtEntry
         )
@@ -2226,6 +2318,7 @@ actor LifecycleFakeNativeController: NativeAgentRuntimeControlling {
         }
         return NativeAgentRuntimeSessionRef(
             sessionID: sessionID,
+            promptCacheRetention: promptCacheRetention,
             initializationGeneration: initializationGeneration,
             initializedDuringCall: false
         )

@@ -7,7 +7,7 @@ import RepoPromptShared
 
 /// Invocation-local wait policy for `agent_run` / `agent_explore` lifecycle calls (plan §6.3)
 /// and, unchanged, for bounded `ask_oracle` sends and `op:"wait"` (Oracle resumable wait plan
-/// §3.1/§3.6): the same family table, the same `selection(rawTimeout:parentFamily:)` rules and
+/// §3.1/§3.6): the same family table, the same `selection(rawTimeout:parentFamily:promptCacheRetention:)` rules and
 /// the same canonical root `wait_policy` tuple attached once per response via `attaching(_:to:)`.
 ///
 /// The effective-parent classification is frozen once at the outer lifecycle entry from the
@@ -19,15 +19,31 @@ import RepoPromptShared
 /// transport protocol.
 enum AgentMCPWaitPolicy {
     typealias ParentFamily = MCPTimeoutPolicy.AgentLifecycleParentFamily
+    typealias ParentPromptCacheRetention = MCPTimeoutPolicy.AgentLifecycleParentPromptCacheRetention
 
-    /// The already authenticated request metadata plus the frozen parent-family classification.
+    /// The already authenticated request metadata plus the frozen parent-family classification
+    /// and prompt-cache retention visible at the matched parent process launch.
     struct RequestContext {
         let metadata: MCPServerViewModel.RequestMetadata
         let parentFamily: ParentFamily
+        let parentPromptCacheRetention: ParentPromptCacheRetention
 
-        init(metadata: MCPServerViewModel.RequestMetadata, parentFamily: ParentFamily) {
+        init(
+            metadata: MCPServerViewModel.RequestMetadata,
+            parentFamily: ParentFamily,
+            parentPromptCacheRetention: ParentPromptCacheRetention
+        ) {
             self.metadata = metadata
             self.parentFamily = parentFamily
+            self.parentPromptCacheRetention = parentPromptCacheRetention
+        }
+
+        static func unresolved(metadata: MCPServerViewModel.RequestMetadata) -> RequestContext {
+            RequestContext(
+                metadata: metadata,
+                parentFamily: .unresolved,
+                parentPromptCacheRetention: .standard
+            )
         }
     }
 
@@ -43,10 +59,16 @@ enum AgentMCPWaitPolicy {
         let timeoutSeconds: TimeInterval
         let parentFamily: ParentFamily?
 
-        static func automatic(parentFamily: ParentFamily) -> Selection {
+        static func automatic(
+            parentFamily: ParentFamily,
+            promptCacheRetention: ParentPromptCacheRetention
+        ) -> Selection {
             Selection(
                 mode: .automatic,
-                timeoutSeconds: MCPTimeoutPolicy.agentLifecycleAutomaticWaitSeconds(for: parentFamily),
+                timeoutSeconds: MCPTimeoutPolicy.agentLifecycleAutomaticWaitSeconds(
+                    for: parentFamily,
+                    promptCacheRetention: promptCacheRetention
+                ),
                 parentFamily: parentFamily
             )
         }
@@ -170,31 +192,72 @@ enum AgentMCPWaitPolicy {
         let runID: UUID?
         let isActive: Bool
         let selectedAgent: AgentProviderKind
+        let promptCacheRetention: ParentPromptCacheRetention
+
+        init(
+            runID: UUID?,
+            isActive: Bool,
+            selectedAgent: AgentProviderKind,
+            promptCacheRetention: ParentPromptCacheRetention = .standard
+        ) {
+            self.runID = runID
+            self.isActive = isActive
+            self.selectedAgent = selectedAgent
+            self.promptCacheRetention = promptCacheRetention
+        }
+    }
+
+    struct ResolvedParent: Equatable {
+        let family: ParentFamily
+        let promptCacheRetention: ParentPromptCacheRetention
+
+        static let unresolved = ResolvedParent(family: .unresolved, promptCacheRetention: .standard)
     }
 
     /// Requires an authenticated run identity and exactly one active session with that exact
     /// `runID`. Missing identity, no match, a stale (inactive) match, or an ambiguous match
-    /// resolves to `.unresolved`.
-    static func resolveParentFamily(runID: UUID?, candidates: [ParentCandidate]) -> ParentFamily {
+    /// resolves to the unresolved family with standard retention.
+    static func resolveParent(runID: UUID?, candidates: [ParentCandidate]) -> ResolvedParent {
         guard let runID else { return .unresolved }
         let matches = candidates.filter { $0.runID == runID && $0.isActive }
         guard matches.count == 1, let match = matches.first else { return .unresolved }
-        return parentFamily(for: match.selectedAgent)
+        let family = parentFamily(for: match.selectedAgent)
+        return ResolvedParent(
+            family: family,
+            promptCacheRetention: family == .claude ? match.promptCacheRetention : .standard
+        )
+    }
+
+    static func resolveParentFamily(runID: UUID?, candidates: [ParentCandidate]) -> ParentFamily {
+        resolveParent(runID: runID, candidates: candidates).family
     }
 
     /// Single MainActor isolation segment: filters live tab sessions by exact `runID` and reads the
-    /// unique active match's `selectedAgent` without suspending.
+    /// unique active match's provider and prompt-cache retention without suspending.
+    @MainActor
+    static func resolveParent(
+        runID: UUID?,
+        sessions: some Sequence<AgentModeViewModel.TabSession>
+    ) -> ResolvedParent {
+        resolveParent(
+            runID: runID,
+            candidates: sessions.map {
+                ParentCandidate(
+                    runID: $0.runID,
+                    isActive: $0.runState.isActive,
+                    selectedAgent: $0.selectedAgent,
+                    promptCacheRetention: $0.claudePromptCacheRetention
+                )
+            }
+        )
+    }
+
     @MainActor
     static func resolveParentFamily(
         runID: UUID?,
         sessions: some Sequence<AgentModeViewModel.TabSession>
     ) -> ParentFamily {
-        resolveParentFamily(
-            runID: runID,
-            candidates: sessions.map {
-                ParentCandidate(runID: $0.runID, isActive: $0.runState.isActive, selectedAgent: $0.selectedAgent)
-            }
-        )
+        resolveParent(runID: runID, sessions: sessions).family
     }
 
     /// Resolves the wait selection for a raw `timeout` / `timeout_seconds` argument.
@@ -202,9 +265,16 @@ enum AgentMCPWaitPolicy {
     /// explicit values from 1 through the shared maximum are accepted and larger values throw
     /// without clamping. `ask_oracle` validates the raw value before any model selection or
     /// packaging and reuses this resolution unchanged.
-    static func selection(rawTimeout: Value?, parentFamily: ParentFamily) throws -> Selection {
+    static func selection(
+        rawTimeout: Value?,
+        parentFamily: ParentFamily,
+        promptCacheRetention: ParentPromptCacheRetention
+    ) throws -> Selection {
         guard let seconds = try AgentMCPToolHelpers.parseTimeoutSeconds(rawTimeout) else {
-            return .automatic(parentFamily: parentFamily)
+            return .automatic(
+                parentFamily: parentFamily,
+                promptCacheRetention: promptCacheRetention
+            )
         }
         return seconds > 0 ? .explicit(timeoutSeconds: seconds) : .poll
     }

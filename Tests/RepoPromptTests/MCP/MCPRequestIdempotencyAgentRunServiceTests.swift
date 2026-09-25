@@ -213,7 +213,11 @@ final class MCPRequestIdempotencyAgentRunServiceTests: XCTestCase {
         var currentFamily: AgentMCPWaitPolicy.ParentFamily = .codex
         service.resolveWaitPolicyContext = { metadata in
             resolutionCounter.increment()
-            return AgentMCPWaitPolicy.RequestContext(metadata: metadata, parentFamily: currentFamily)
+            return AgentMCPWaitPolicy.RequestContext(
+                metadata: metadata,
+                parentFamily: currentFamily,
+                parentPromptCacheRetention: .standard
+            )
         }
         service.testDispatchSteerInstruction = { dispatchedSessionID, _, _, agentModeVM in
             dispatchCounter.increment()

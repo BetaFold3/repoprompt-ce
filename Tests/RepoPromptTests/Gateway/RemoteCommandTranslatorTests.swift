@@ -724,8 +724,12 @@ final class RemoteCommandTranslatorTests: XCTestCase {
     func testOmittedStartAndWaitingSteerUseOwnedResponseEnvelope() throws {
         let sid = "11111111-1111-1111-1111-111111111111"
         let translator = RemoteCommandTranslator()
-        let expected = MCPTimeoutPolicy.agentLifecycleAutomaticWaitResponseEnvelopeSeconds
-        XCTAssertEqual(expected, 630)
+        // The shared owned-host envelope may exceed the gateway's independent app-link cap.
+        let expected = min(
+            MCPTimeoutPolicy.agentLifecycleAutomaticWaitResponseEnvelopeSeconds,
+            AppLinkCallTimeoutPolicy.cap
+        )
+        XCTAssertEqual(expected, 900)
         let frames = [
             RemoteClientFrame(type: "start", payload: .object(["message": .string("go")])),
             RemoteClientFrame(
@@ -805,7 +809,10 @@ final class RemoteCommandTranslatorTests: XCTestCase {
             ))
             XCTAssertEqual(
                 call.timeout,
-                MCPTimeoutPolicy.agentLifecycleAutomaticWaitResponseEnvelopeSeconds,
+                min(
+                    MCPTimeoutPolicy.agentLifecycleAutomaticWaitResponseEnvelopeSeconds,
+                    AppLinkCallTimeoutPolicy.cap
+                ),
                 "\(wait)"
             )
         }

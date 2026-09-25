@@ -682,7 +682,8 @@ actor MCPCommandRunner {
                                           Block until input needed or terminal; omitted timeout is automatic
             op=wait session_ids=["<uuid1>","<uuid2>"] [timeout=N]
                                           Wait until first session needs input or terminates
-              automatic omission by effective parent: Claude \(Int(MCPTimeoutPolicy.agentLifecycleClaudeAutomaticWaitSeconds))s,
+              automatic omission by effective parent: Claude \(Int(MCPTimeoutPolicy.agentLifecycleClaudeAutomaticWaitSeconds))s
+                (\(Int(MCPTimeoutPolicy.agentLifecycleClaudeExtendedCacheAutomaticWaitSeconds))s when the parent's effective Claude configuration explicitly sets a one-hour prompt cache),
                 Codex \(Int(MCPTimeoutPolicy.agentLifecycleCodexAutomaticWaitSeconds))s,
                 other \(Int(MCPTimeoutPolicy.agentLifecycleOtherAutomaticWaitSeconds))s, unresolved \(Int(MCPTimeoutPolicy.agentLifecycleUnresolvedAutomaticWaitSeconds))s.
               Actionable state returns early; a timeout returns current state while the worker remains active.

@@ -94,6 +94,15 @@ struct ContextBuilderCardContext {
 
 struct AgentControlToolCardContext {
     let authoritativeLocalParentFamily: AgentMCPWaitPolicy.ParentFamily?
+    let authoritativeLocalParentPromptCacheRetention: AgentMCPWaitPolicy.ParentPromptCacheRetention
+
+    init(
+        authoritativeLocalParentFamily: AgentMCPWaitPolicy.ParentFamily?,
+        authoritativeLocalParentPromptCacheRetention: AgentMCPWaitPolicy.ParentPromptCacheRetention = .standard
+    ) {
+        self.authoritativeLocalParentFamily = authoritativeLocalParentFamily
+        self.authoritativeLocalParentPromptCacheRetention = authoritativeLocalParentPromptCacheRetention
+    }
 }
 
 struct AgentOracleToolCardContext {
@@ -319,8 +328,11 @@ enum AgentControlWaitLabelBuilder {
         if let timeout {
             return timeout <= 0 ? "poll" : "wait ≤\(formatSeconds(timeout))"
         }
-        if let family = context?.authoritativeLocalParentFamily {
-            let seconds = MCPTimeoutPolicy.agentLifecycleAutomaticWaitSeconds(for: family)
+        if let context, let family = context.authoritativeLocalParentFamily {
+            let seconds = MCPTimeoutPolicy.agentLifecycleAutomaticWaitSeconds(
+                for: family,
+                promptCacheRetention: context.authoritativeLocalParentPromptCacheRetention
+            )
             return "wait ≤\(formatSeconds(seconds))"
         }
         return "wait auto"

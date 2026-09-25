@@ -2396,7 +2396,7 @@ final class MCPServerViewModel: ObservableObject {
     private func purgeStaleAgentRunWaitScopes(now: Date = Date(), source: String) {
         let staleTokens = agentRunWaitScopesByToken.compactMap { token, scope -> UUID? in
             // A scope without a recorded timeout must not be purged before the longest automatic
-            // family wait could legitimately still be parked (plan §6.1: 600 seconds for Codex).
+            // wait could legitimately still be parked (plan §6.1: up to 1500 seconds for extended-cache Claude).
             let timeout = scope.timeoutSeconds ?? MCPTimeoutPolicy.agentLifecycleMaximumAutomaticWaitSeconds
             let maxAge = timeout + agentRunWaitScopeStaleGraceSeconds
             return now.timeIntervalSince(scope.startedAt) > maxAge ? token : nil
@@ -2623,7 +2623,7 @@ final class MCPServerViewModel: ObservableObject {
         return managerRunID
     }
 
-    /// Plan §6.3: freezes the effective parent provider family for one agent lifecycle call.
+    /// Plan §6.3: freezes the effective parent provider family and prompt-cache retention for one agent lifecycle call.
     ///
     /// Provenance contract: only this window's direct, authenticated connection→run binding can
     /// name a parent. Remote gateway devices, connections without an identity, the manager's
@@ -2633,10 +2633,10 @@ final class MCPServerViewModel: ObservableObject {
     /// Deliberately no tab-context resolution here: `resolveTabContextSnapshot` records
     /// compatibility-fallback diagnostics under the supplied tool name and can consume a pending
     /// run-scoped binding, neither of which a policy read may do. The live-session filter and
-    /// `selectedAgent` read happen in one MainActor segment after the run identity is known.
+    /// `selectedAgent` and launch-resolved retention read happen in one MainActor segment after the run identity is known.
     @MainActor
     func resolveAgentLifecycleWaitPolicyContext(metadata: RequestMetadata) async -> AgentMCPWaitPolicy.RequestContext {
-        let unresolved = AgentMCPWaitPolicy.RequestContext(metadata: metadata, parentFamily: .unresolved)
+        let unresolved = AgentMCPWaitPolicy.RequestContext.unresolved(metadata: metadata)
         guard let connectionID = metadata.connectionID,
               !MCPClientIdentity.isRemoteClient(metadata.clientName)
         else {
@@ -2650,11 +2650,15 @@ final class MCPServerViewModel: ObservableObject {
         else {
             return unresolved
         }
-        let parentFamily = AgentMCPWaitPolicy.resolveParentFamily(
+        let parent = AgentMCPWaitPolicy.resolveParent(
             runID: runID,
             sessions: targetWindow.agentModeViewModel.sessions.values
         )
-        return AgentMCPWaitPolicy.RequestContext(metadata: metadata, parentFamily: parentFamily)
+        return AgentMCPWaitPolicy.RequestContext(
+            metadata: metadata,
+            parentFamily: parent.family,
+            parentPromptCacheRetention: parent.promptCacheRetention
+        )
     }
 
     #if DEBUG
