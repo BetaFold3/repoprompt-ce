@@ -47,7 +47,7 @@ final class AgentControlToolCardPresentationTests: XCTestCase {
                 argsJSON: jsonString(["op": "start", "model": "requested-worker-model"]),
                 agentControlContext: codexContext
             ),
-            "start • requested-worker-model • wait ≤10m"
+            "start • requested-worker-model • wait ≤25m"
         )
         try XCTAssertEqual(
             ToolCardRouter.callSubtitle(
@@ -221,7 +221,7 @@ final class AgentControlToolCardPresentationTests: XCTestCase {
                 argsJSON: jsonString(["message": "question", "mode": "plan"]),
                 agentControlContext: codexContext
             ),
-            "plan • wait ≤10m"
+            "plan • wait ≤25m"
         )
         try XCTAssertEqual(
             ToolCardRouter.callSubtitle(
@@ -293,7 +293,7 @@ final class AgentControlToolCardPresentationTests: XCTestCase {
                 argsJSON: jsonString(["consultations": [["message": "one"], ["message": "two"]]]),
                 agentControlContext: codexContext
             ),
-            "wait ≤10m"
+            "wait ≤25m"
         )
     }
 
@@ -307,6 +307,17 @@ final class AgentControlToolCardPresentationTests: XCTestCase {
         XCTAssertEqual(
             AgentRunCardPresentation(resultObject: automaticResult)?.waitLabel,
             "wait ≤7m"
+        )
+
+        var currentCodexAutomaticResult = resultObject(reasoningEffort: nil)
+        currentCodexAutomaticResult["wait_policy"] = [
+            "mode": "automatic",
+            "timeout_seconds": 1500,
+            "parent_family": "codex"
+        ]
+        XCTAssertEqual(
+            AgentRunCardPresentation(resultObject: currentCodexAutomaticResult)?.waitLabel,
+            "wait ≤25m"
         )
 
         var explicitResult = resultObject(reasoningEffort: nil)

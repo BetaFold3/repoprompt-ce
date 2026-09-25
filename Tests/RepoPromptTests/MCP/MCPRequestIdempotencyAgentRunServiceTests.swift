@@ -243,7 +243,7 @@ final class MCPRequestIdempotencyAgentRunServiceTests: XCTestCase {
         let first = try await service.execute(args: args)
         let expectedPolicy: Value = .object([
             "mode": .string("automatic"),
-            "timeout_seconds": .int(600),
+            "timeout_seconds": .int(1500),
             "parent_family": .string("codex")
         ])
         XCTAssertEqual(first.objectValue?["wait_policy"], expectedPolicy)

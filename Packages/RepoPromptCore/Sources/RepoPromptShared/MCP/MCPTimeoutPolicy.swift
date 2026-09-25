@@ -89,7 +89,7 @@ public enum MCPTimeoutPolicy {
     public static let agentLifecycleClaudeExtendedCacheAutomaticWaitSeconds: TimeInterval = 1500
     /// Automatic lifecycle wait when the effective parent is Codex. This is a CE operational
     /// heuristic, not a Codex CLI/app-server prompt-cache TTL contract.
-    public static let agentLifecycleCodexAutomaticWaitSeconds: TimeInterval = 600
+    public static let agentLifecycleCodexAutomaticWaitSeconds: TimeInterval = 1500
     /// Automatic lifecycle wait for every other named provider.
     public static let agentLifecycleOtherAutomaticWaitSeconds: TimeInterval = 180
     /// Automatic lifecycle wait when no authoritative live parent can be resolved

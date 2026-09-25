@@ -15,7 +15,7 @@ final class MCPToolExecutionContractTests: XCTestCase {
         XCTAssertEqual(MCPTimeoutPolicy.agentLifecycleClaudeAutomaticWaitSeconds, 180)
         XCTAssertEqual(MCPTimeoutPolicy.agentLifecycleClaudeExtendedCacheAutomaticWaitSeconds, 1500)
         XCTAssertEqual(MCPTimeoutPolicy.claudeCodeStdioMCPToolIdleTimeoutSeconds, 1800)
-        XCTAssertEqual(MCPTimeoutPolicy.agentLifecycleCodexAutomaticWaitSeconds, 600)
+        XCTAssertEqual(MCPTimeoutPolicy.agentLifecycleCodexAutomaticWaitSeconds, 1500)
         XCTAssertEqual(MCPTimeoutPolicy.agentLifecycleOtherAutomaticWaitSeconds, 180)
         XCTAssertEqual(MCPTimeoutPolicy.agentLifecycleUnresolvedAutomaticWaitSeconds, 180)
         XCTAssertEqual(MCPTimeoutPolicy.agentLifecycleMaximumAutomaticWaitSeconds, 1500)

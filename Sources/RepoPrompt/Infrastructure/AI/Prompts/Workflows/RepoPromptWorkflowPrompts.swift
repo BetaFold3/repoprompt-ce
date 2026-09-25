@@ -72,7 +72,8 @@ enum RepoPromptWorkflowPrompts {
     /// Version 66: Agent workflows and rp-reminder document bounded/resumable ask_oracle waits, pending recovery, blocking Step B batches, and cache-neutral wait behavior.
     /// Version 67: Replaces blocking Step B batch guidance with bounded, indexed, resumable consultations that queue behind actual Oracle capacity.
     /// Version 68: Documents the extended Claude automatic lifecycle wait when explicit one-hour prompt-cache configuration is resolved at launch.
-    static let skillsVersion = 68
+    /// Version 69: Raises the Codex-family automatic lifecycle wait from 10 to 25 minutes as a CE operational heuristic.
+    static let skillsVersion = 69
 
     static func render(
         id: RepoPromptWorkflowID,

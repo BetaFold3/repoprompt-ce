@@ -30,7 +30,7 @@ final class AgentLifecycleExecutionContractTests: XCTestCase {
         XCTAssertEqual(MCPTimeoutPolicy.agentLifecycleClaudeExtendedCacheAutomaticWaitSeconds, 1500)
         XCTAssertEqual(MCPTimeoutPolicy.claudeCodeStdioMCPToolIdleTimeoutSeconds, 1800)
         XCTAssertEqual(MCPTimeoutPolicy.agentLifecycleClaudeHostPreWaitBudgetSeconds, 60)
-        XCTAssertEqual(MCPTimeoutPolicy.agentLifecycleCodexAutomaticWaitSeconds, 600)
+        XCTAssertEqual(MCPTimeoutPolicy.agentLifecycleCodexAutomaticWaitSeconds, 1500)
         XCTAssertEqual(MCPTimeoutPolicy.agentLifecycleOtherAutomaticWaitSeconds, 180)
         XCTAssertEqual(MCPTimeoutPolicy.agentLifecycleUnresolvedAutomaticWaitSeconds, 180)
         XCTAssertEqual(MCPTimeoutPolicy.agentLifecycleMaximumAutomaticWaitSeconds, 1500)
@@ -41,6 +41,15 @@ final class AgentLifecycleExecutionContractTests: XCTestCase {
                 + MCPTimeoutPolicy.cliSemanticWaitResponseMarginSeconds
         )
         XCTAssertEqual(MCPTimeoutPolicy.agentLifecycleMaximumExplicitTimeoutSeconds, 14400)
+        XCTAssertEqual(
+            CodexIntegrationConfiguration.desiredToolTimeoutSeconds,
+            MCPTimeoutPolicy.codexServerActiveTimeoutSeconds
+        )
+        XCTAssertLessThan(
+            MCPTimeoutPolicy.agentLifecycleCodexAutomaticWaitSeconds
+                + MCPTimeoutPolicy.cliSemanticWaitResponseMarginSeconds,
+            TimeInterval(CodexIntegrationConfiguration.desiredToolTimeoutSeconds)
+        )
 
         // The public symbol survives only as the unresolved-parent compatibility alias.
         XCTAssertEqual(
@@ -90,15 +99,22 @@ final class AgentLifecycleExecutionContractTests: XCTestCase {
                 .other
             }
             XCTAssertEqual(family, expectedFamily, "\(provider)")
-            let expectedSeconds: TimeInterval = provider == .codexExec ? 600 : 180
-            XCTAssertEqual(
-                MCPTimeoutPolicy.agentLifecycleAutomaticWaitSeconds(
-                    for: family,
-                    promptCacheRetention: .standard
-                ),
-                expectedSeconds,
-                "\(provider)"
-            )
+            for retention in ParentPromptCacheRetention.allCases {
+                let expectedSeconds: TimeInterval = switch (provider, retention) {
+                case (.claudeCode, .extended), (.codexExec, _):
+                    1500
+                default:
+                    180
+                }
+                XCTAssertEqual(
+                    MCPTimeoutPolicy.agentLifecycleAutomaticWaitSeconds(
+                        for: family,
+                        promptCacheRetention: retention
+                    ),
+                    expectedSeconds,
+                    "\(provider), \(retention)"
+                )
+            }
         }
         XCTAssertEqual(
             MCPTimeoutPolicy.agentLifecycleAutomaticWaitSeconds(
@@ -165,7 +181,7 @@ final class AgentLifecycleExecutionContractTests: XCTestCase {
             nullSelection,
             .automatic(parentFamily: .codex, promptCacheRetention: .standard)
         )
-        XCTAssertEqual(nullSelection.timeoutSeconds, 600)
+        XCTAssertEqual(nullSelection.timeoutSeconds, 1500)
     }
 
     func testExplicitLifecycleTimeoutBoundariesAcceptZeroAndMaximumAndRejectAboveWithoutClamp() throws {

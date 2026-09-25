@@ -3461,7 +3461,7 @@ final class AgentRunWorktreeStartTests: AgentRunWorktreeStartGitSeedTestCase {
             waitedObject["wait_policy"],
             .object([
                 "mode": .string("automatic"),
-                "timeout_seconds": .int(600),
+                "timeout_seconds": .int(1500),
                 "parent_family": .string("codex")
             ])
         )
