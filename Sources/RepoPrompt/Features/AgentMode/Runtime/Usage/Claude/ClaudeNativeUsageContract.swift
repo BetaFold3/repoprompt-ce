@@ -15,6 +15,11 @@ import Foundation
 /// Versions without a recorded contract still qualify for **token observations only**: per-result
 /// `usage` triples contribute to the cache-hit share while the cumulative-cost baseline stays
 /// unavailable for that execution. They are never silently promoted to the monetary contract.
+///
+/// Token permission and monetary qualification are separate: a resolved tokens-only execution keeps
+/// observing tokens across a same-process compaction boundary (the boundary is observational and
+/// its cost stays unsupported), while cumulative-cost continuity across compaction is qualified
+/// only by a registered contract's `compactionQualified`.
 enum ClaudeNativeUsageContract {
     enum LaunchModeKind: String, Equatable {
         case freshSession
@@ -35,7 +40,9 @@ enum ClaudeNativeUsageContract {
         /// always reports it).
         let requiresQueueDepth: Bool
         /// Whether cumulative cost continues across a same-process compaction boundary without a
-        /// baseline/generation reset (established on the 2.1.268 captures).
+        /// baseline/generation reset (established on the 2.1.268 captures). This is monetary
+        /// qualification for this registered contract; token-only continuation of resolved
+        /// tokens-only executions is decided separately by `counterBoundaryBlock`.
         let compactionQualified: Bool
         /// Whether the cumulative `total_cost_usd` cadence is established for this version.
         let monetaryQualified: Bool
@@ -65,8 +72,11 @@ enum ClaudeNativeUsageContract {
         let requiresQueueDepth: Bool
         let compactionQualified: Bool
 
-        /// Token-only executions on versions without a recorded contract: serial turns only,
-        /// a missing queue depth is tolerated, and a counter boundary is unqualified.
+        /// Token-only executions on versions without a recorded contract: serial turns only and
+        /// a missing queue depth is tolerated. This is also the fallback for nil/unknown contract
+        /// IDs, so `compactionQualified` stays `false` here: it never grants monetary compaction
+        /// continuity, and resolved tokens-only token continuation is decided by
+        /// `counterBoundaryBlock` from the exact tokens-only ID instead.
         static let tokensOnly = Policy(maxQueuedTurnCount: 0, requiresQueueDepth: false, compactionQualified: false)
     }
 
@@ -179,14 +189,34 @@ enum ClaudeNativeUsageContract {
     }
 
     /// A same-process counter boundary (compaction) blocks accounting before any affected result
-    /// unless the contract established that cumulative cost and result scope survive it.
+    /// unless it is known to be safe to observe across it. Decision order:
+    /// - nil (awaiting or no verdict): block.
+    /// - A registered contract (resolved first, so its own policy cannot be bypassed by its name):
+    ///   allow only when it established that cumulative cost and result scope survive compaction.
+    /// - An exact tokens-only ID with a non-empty, whitespace-free version suffix: allow. The
+    ///   boundary is observational for token accounting; cost stays unsupported for the execution
+    ///   and every later result still passes the ordinary ownership/contiguity checks.
+    /// - Anything else (bare prefix, malformed suffix, unknown ID): block.
     static func counterBoundaryBlock(
         contractID: String?,
         kind: String
     ) -> AgentUsageExecutionBlockReason? {
-        if policy(forContractID: contractID).compactionQualified {
+        guard let contractID else { return .unsupportedCounterBoundary(kind) }
+        if let contract = contract(withID: contractID) {
+            return contract.compactionQualified ? nil : .unsupportedCounterBoundary(kind)
+        }
+        if isResolvedTokensOnlyContractID(contractID) {
             return nil
         }
         return .unsupportedCounterBoundary(kind)
+    }
+
+    /// Exact tokens-only prefix followed by a non-empty version suffix without whitespace (the form
+    /// `verdict(for:runtimeVersion:)` produces for an ordinary reported version). Anything looser
+    /// fails closed.
+    private static func isResolvedTokensOnlyContractID(_ contractID: String) -> Bool {
+        guard contractID.hasPrefix(tokensOnlyContractPrefix) else { return false }
+        let suffix = contractID.dropFirst(tokensOnlyContractPrefix.count)
+        return !suffix.isEmpty && !suffix.contains(where: \.isWhitespace)
     }
 }

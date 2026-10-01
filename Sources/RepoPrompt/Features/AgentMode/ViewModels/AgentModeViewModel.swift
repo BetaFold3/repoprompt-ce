@@ -17563,19 +17563,14 @@ final class AgentModeViewModel: ObservableObject {
         return "…" + suffix
     }
 
+    /// Canonical Claude translator label for `system/status: compacting`. A nil-text `status`
+    /// release clears the running status only while this exact transport label is shown.
+    /// Pinned to the translator output by `ClaudeCompactionRunningStatusTests`.
+    private static let claudeCompactingStatusText = "Compacting context"
+
     private static func claudeDisplayableStatusText(_ raw: String?) -> String? {
-        var text = raw?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        guard !text.isEmpty else { return nil }
-        if let range = text.range(of: "Permission mode:", options: [.caseInsensitive]) {
-            text = String(text[..<range.lowerBound])
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-            while text.hasSuffix("—") || text.hasSuffix("-") {
-                text.removeLast()
-                text = text.trimmingCharacters(in: .whitespacesAndNewlines)
-            }
-        }
-        guard !text.isEmpty else { return nil }
-        return text
+        let text = raw?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return text.isEmpty ? nil : text
     }
 
     @discardableResult
@@ -17914,9 +17909,11 @@ final class AgentModeViewModel: ObservableObject {
                 if let statusText, !statusText.isEmpty {
                     shouldUpdateBindings = setTransportRunningStatus(statusText, session: session) || shouldUpdateBindings
                 } else if session.selectedAgent.usesClaudeNativeRuntime,
-                          result.text?.range(of: "Permission mode:", options: [.caseInsensitive]) != nil,
-                          session.runningStatusSource != .reasoning
+                          session.runningStatusSource == .transport,
+                          session.runningStatusText == Self.claudeCompactingStatusText
                 {
+                    // A status release withdraws only the compaction-owned label; newer transport
+                    // or reasoning labels are left untouched.
                     shouldUpdateBindings = session.setRunningStatus(nil, source: nil) || shouldUpdateBindings
                 }
 

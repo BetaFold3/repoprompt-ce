@@ -130,19 +130,23 @@ public struct ClaudeSDKNDJSONTranslator {
             return [ClaudeProviderStreamResult(type: ClaudeProviderStreamResult.lifecycleType, text: "initialized")]
         }
 
+        // `system/status` always yields exactly one `status` result. The `status` field alone
+        // decides the text: a readable non-empty string is shown ("compacting" maps to the
+        // canonical "Compacting context" label), while a missing, null, empty, `"null"`, or
+        // non-string value yields a nil-text release. Compaction marker fields
+        // (`compact_result`, `compact_error`, `compact_metadata`) never affect this output; they
+        // stay accounting evidence for the host controller. A release is only a status update,
+        // never a turn boundary or usage observation.
         if subtype == "status" {
             let status = firstString(in: json, keys: ["status"])?
                 .trimmingCharacters(in: .whitespacesAndNewlines)
-            var fragments: [String] = []
-            if let status, !status.isEmpty, status != "null" {
-                if status.caseInsensitiveCompare("compacting") == .orderedSame {
-                    fragments.append("Compacting context")
-                } else {
-                    fragments.append(status)
-                }
+            guard let status, !status.isEmpty, status != "null" else {
+                return [ClaudeProviderStreamResult(type: "status", text: nil)]
             }
-            guard !fragments.isEmpty else { return [] }
-            return [ClaudeProviderStreamResult(type: "status", text: fragments.joined(separator: " — "))]
+            if status.caseInsensitiveCompare("compacting") == .orderedSame {
+                return [ClaudeProviderStreamResult(type: "status", text: "Compacting context")]
+            }
+            return [ClaudeProviderStreamResult(type: "status", text: status)]
         }
 
         if subtype == "task_started" {
@@ -175,7 +179,11 @@ public struct ClaudeSDKNDJSONTranslator {
             if let preTokens, preTokens > 0 {
                 fragments.append("at ~\(preTokens) tokens")
             }
-            return [ClaudeProviderStreamResult(type: "system", text: fragments.joined(separator: " — "))]
+            // Release any compaction status first, then emit the unchanged transcript row.
+            return [
+                ClaudeProviderStreamResult(type: "status", text: nil),
+                ClaudeProviderStreamResult(type: "system", text: fragments.joined(separator: " — "))
+            ]
         }
 
         // Claude Code lifecycle: session_state_changed (running / idle / etc.)

@@ -379,6 +379,7 @@ allowed_tracked_docs=(
   "docs/context/plans/completed/2026-09-03-omp-thinking-capability-sweep-plan.md"
   "docs/context/plans/completed/2026-09-04-dynamic-gpt-model-catalog-plan.md"
   "docs/context/plans/completed/2026-09-17-claude-auto-permissions-plan.md"
+  "docs/context/plans/completed/2026-10-01-claude-compaction-status-and-tokens-only-continuity-plan.md"
   "docs/context/plans/completed/omp-agent-models-menu-thinking-fix.md"
   "docs/context/plans/completed/omp-transcript-authority-and-model-ux.md"
   "docs/context/plans/completed/oracle-remote-models-cursor-catalog.md"

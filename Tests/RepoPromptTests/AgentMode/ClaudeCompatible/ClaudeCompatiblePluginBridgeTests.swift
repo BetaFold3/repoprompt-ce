@@ -164,6 +164,33 @@ final class ClaudeCompatiblePluginBridgeTests: XCTestCase {
         XCTAssertNil(AIStreamResult(type: "content", text: "x").usageObservation, "default initializer compatibility")
     }
 
+    func testNilTextStatusReleaseSurvivesProviderToAppConversion() {
+        let release = ClaudeCompatiblePluginStreamResult(type: "status", text: nil)
+        let core = ClaudeCompatiblePluginBridge.streamResult(from: release)
+        XCTAssertEqual(core.type, "status")
+        XCTAssertNil(core.text)
+        XCTAssertNil(core.usageObservation)
+        XCTAssertEqual(ClaudeCompatiblePluginBridge.providerStreamResult(from: core), release)
+
+        // The app translator facade (package translator + bridge) delivers releases as nil-text
+        // `status` results, never as turn boundaries or usage carriers.
+        var translator = ClaudeSDKNDJSONTranslator()
+        let terminal = translator.parseNDJSONLine(Data(
+            #"{"type":"system","subtype":"status","status":null,"compact_result":"<redacted>","compact_error":"Not enough messages to compact."}"#.utf8
+        ))
+        XCTAssertEqual(terminal.map(\.type), ["status"])
+        XCTAssertNil(terminal.first?.text)
+        XCTAssertNil(terminal.first?.usageObservation)
+
+        let boundary = translator.parseNDJSONLine(Data(
+            #"{"type":"system","subtype":"compact_boundary","compact_metadata":{"trigger":"auto","pre_tokens":1000}}"#.utf8
+        ))
+        XCTAssertEqual(boundary.map(\.type), ["status", "system"])
+        XCTAssertNil(boundary.first?.text)
+        XCTAssertEqual(boundary.last?.text, "Context compacted — trigger: auto — at ~1000 tokens")
+        XCTAssertTrue(boundary.allSatisfy { $0.usageObservation == nil })
+    }
+
     func testRootBridgeCatalogRawValueSmokeIsNonMutating() throws {
         XCTAssertEqual(ClaudeCompatibleProviderRuntimeBridge.noModelRawValue(for: .glmZAI), AgentModel.claudeSonnet.rawValue)
         XCTAssertEqual(ClaudeCompatibleProviderRuntimeBridge.noModelRawValue(for: .kimi), AgentModel.kimiCode.rawValue)

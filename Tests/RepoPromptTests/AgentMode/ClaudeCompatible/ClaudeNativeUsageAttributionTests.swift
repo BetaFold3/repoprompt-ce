@@ -757,6 +757,95 @@ final class ClaudeNativeUsageAttributionTests: XCTestCase {
         await expectNext(collector, .launchEnded(launchToken: launch.token))
     }
 
+    /// Production delivery of the compaction status release (2026-10-01 compaction status plan
+    /// §3.1/§4): the captured 2.1.268 `system/status` lines and a synthetic `compact_boundary`,
+    /// replayed through `handleStreamPayload` mid-turn, reach the controller's transcript `events`
+    /// as `status("Compacting context")`, a nil-text `status` release, then the boundary's release
+    /// and its unchanged `system` row. The counter-boundary evidence kinds are unchanged, no
+    /// release is a `message_stop` or usage carrier, and nothing consumes the completion FIFO:
+    /// the in-flight turn is completed only by its own later result.
+    func testCompactionStatusReleaseReachesControllerEventsWithUnchangedBoundaryEvidenceAndNoTurnCompletion() async throws {
+        let fixtureURL = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent()
+            .appendingPathComponent("Fixtures/ClaudeNativeUsage/2.1.268-compact.jsonl")
+        let captured: [[String: Any]] = try String(contentsOf: fixtureURL, encoding: .utf8)
+            .split(separator: "\n")
+            .map { line in try XCTUnwrap(JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any]) }
+        let capturedInit = try XCTUnwrap(captured.first(where: { ($0["subtype"] as? String) == "init" }))
+        let session = try XCTUnwrap(capturedInit["session_id"] as? String)
+        let statusLines = captured.filter { ($0["type"] as? String) == "system" && ($0["subtype"] as? String) == "status" }
+        XCTAssertEqual(statusLines.count, 2, "captured compacting status, then the terminal null-status marker payload")
+        XCTAssertEqual(statusLines.first?["status"] as? String, "compacting")
+        XCTAssertTrue(statusLines.last?["status"] is NSNull)
+
+        let controller = try makeController()
+        let usage = await Collector(controller.usageAccountingEvents)
+        let lifecycleStream = await controller.events
+        var lifecycle = lifecycleStream.makeAsyncIterator()
+        let launch = await controller.test_beginSyntheticUsageLaunch()
+        await expectNext(usage, .launched(launch))
+        let turn = await controller.test_registerSyntheticDispatch()
+        await expectNext(usage, .dispatched(launchToken: launch.token, turnID: turn, ordinal: 0))
+        await controller.test_handleStreamPayload(systemInit(session: session))
+        _ = await usage.next() // runtimeEvidence
+        _ = await usage.next() // runtimeBinding
+
+        for line in statusLines {
+            await controller.test_handleStreamPayload(line)
+        }
+        await controller.test_handleStreamPayload([
+            "type": "system", "subtype": "compact_boundary", "session_id": session, "uuid": "cb-synthetic",
+            "compact_metadata": ["trigger": "auto", "pre_tokens": 150_000]
+        ] as [String: Any])
+        await expectNext(usage, .counterBoundaryObserved(launchToken: launch.token, kind: "status:compacting"))
+        await expectNext(usage, .counterBoundaryObserved(launchToken: launch.token, kind: "status:compact_result"))
+        await expectNext(usage, .counterBoundaryObserved(launchToken: launch.token, kind: "compact_boundary"))
+        let inFlightAfterCompaction = await controller.hasTurnInFlight
+        XCTAssertTrue(inFlightAfterCompaction, "status releases and the boundary never consume the completion FIFO")
+
+        // A non-compaction sentinel status (no boundary evidence) delimits the compaction events.
+        let sentinel = "sentinel status"
+        await controller.test_handleStreamPayload(["type": "system", "subtype": "status", "status": sentinel, "session_id": session, "uuid": "sentinel"])
+        var streamed: [AIStreamResult] = []
+        var completedBeforeResult = false
+        while let event = await lifecycle.next() {
+            if case let .stream(result) = event {
+                if result.type == "status", result.text == sentinel { break }
+                streamed.append(result)
+            } else if case .turnCompleted = event {
+                completedBeforeResult = true
+            }
+        }
+        XCTAssertFalse(completedBeforeResult, "no turn completes before the in-flight turn's own result")
+        let statusAndRows = streamed.filter { $0.type == "status" || $0.type == "system" }
+        XCTAssertEqual(statusAndRows.map(\.type), ["status", "status", "status", "system"])
+        XCTAssertEqual(
+            statusAndRows.map(\.text),
+            ["Compacting context", nil, nil, "Context compacted — trigger: auto — at ~150000 tokens"]
+        )
+        XCTAssertFalse(streamed.contains { $0.type == "message_stop" || $0.type == "usage" })
+        XCTAssertTrue(statusAndRows.allSatisfy { $0.usageObservation == nil && $0.stopReason == nil })
+
+        // The same in-flight turn is still completed by its own result, exactly once.
+        await controller.test_handleStreamPayload(resultPayload(index: 0, uuid: "r0", session: session))
+        guard case let .resultAttributed(attribution)? = await usage.next() else {
+            return XCTFail("the in-flight turn's result is still attributed after compaction")
+        }
+        XCTAssertEqual(attribution.turnID, turn)
+        await expectNext(usage, .turnClosed(launchToken: launch.token, turnID: turn, status: .completed))
+        var completedTurnID: UUID?
+        while let event = await lifecycle.next() {
+            if case let .turnCompleted(turnID, _) = event {
+                completedTurnID = turnID
+                break
+            }
+        }
+        XCTAssertEqual(completedTurnID, turn)
+        let inFlightAfterResult = await controller.hasTurnInFlight
+        XCTAssertFalse(inFlightAfterResult)
+        await controller.test_endSyntheticUsageLaunch()
+        await expectNext(usage, .launchEnded(launchToken: launch.token))
+    }
+
     // MARK: - Stream lifetime and stdout generation (OracleB P1#3 / P1#4)
 
     /// The first subscriber gets the lifetime stream; a later subscriber (same controller re-attached

@@ -139,7 +139,9 @@ final class ClaudeNativeUsageContractTests: XCTestCase {
 
     /// Queue depth beyond the qualified bound is unsupported ownership (never matched to a
     /// guessed dispatch); a missing depth blocks only where the contract established that it is
-    /// always reported. Compaction blocks only where cumulative continuation is not established.
+    /// always reported. Compaction blocks a registered contract only where cumulative continuation
+    /// is not established; a resolved tokens-only execution continues token observation across it
+    /// (recorded contract change, 2026-10-01 compaction continuity plan §3.3).
     func testQueueBoundAndCounterBoundaryPolicyFollowTheContract() {
         let supported = ClaudeNativeUsageContract.supported2_1_268.contractID
         XCTAssertEqual(
@@ -160,10 +162,7 @@ final class ClaudeNativeUsageContractTests: XCTestCase {
             ClaudeNativeUsageContract.queuePolicyBlock(contractID: tokensOnly, queuedTurnCount: 1),
             .unsupportedQueueSemantics("queued_turn_count 1 exceeds qualified bound 0")
         )
-        XCTAssertEqual(
-            ClaudeNativeUsageContract.counterBoundaryBlock(contractID: tokensOnly, kind: "compact_boundary"),
-            .unsupportedCounterBoundary("compact_boundary")
-        )
+        XCTAssertNil(ClaudeNativeUsageContract.counterBoundaryBlock(contractID: tokensOnly, kind: "compact_boundary"))
         XCTAssertEqual(
             ClaudeNativeUsageContract.counterBoundaryBlock(contractID: nil, kind: "compact_boundary"),
             .unsupportedCounterBoundary("compact_boundary")
@@ -183,5 +182,61 @@ final class ClaudeNativeUsageContractTests: XCTestCase {
             .unsupportedCounterBoundary("compact_boundary")
         )
         XCTAssertNil(ClaudeNativeUsageContract.counterBoundaryBlock(contractID: "relaxed", kind: "compact_boundary"))
+    }
+
+    /// Token permission is separate from monetary qualification: every controller compaction kind
+    /// leaves a resolved tokens-only execution observing tokens, while nil, a registered contract
+    /// without compaction qualification, and malformed tokens-only identifiers stay blocked.
+    /// Resolving the boundary never changes the tokens-only verdict or its unsupported baseline.
+    func testTokensOnlyExecutionsContinueAcrossCompactionWhileMalformedAndUnresolvedIDsBlock() {
+        let kinds = ["compact_boundary", "status:compacting", "status:compact_error"]
+        let tokensOnly = ClaudeNativeUsageContract.tokensOnlyContractID(runtimeVersion: "2.1.281")
+        XCTAssertEqual(tokensOnly, "claude-native.tokens-only.v1@2.1.281")
+        let prefix = ClaudeNativeUsageContract.tokensOnlyContractPrefix
+        for kind in kinds {
+            XCTAssertNil(ClaudeNativeUsageContract.counterBoundaryBlock(contractID: tokensOnly, kind: kind), kind)
+            XCTAssertNil(
+                ClaudeNativeUsageContract.counterBoundaryBlock(contractID: ClaudeNativeUsageContract.supported2_1_268.contractID, kind: kind),
+                kind
+            )
+            XCTAssertEqual(
+                ClaudeNativeUsageContract.counterBoundaryBlock(contractID: nil, kind: kind),
+                .unsupportedCounterBoundary(kind)
+            )
+            for malformed in [prefix, prefix + " ", prefix + "\n", "claude-native.tokens-only.v2@2.1.281", "unknown@2.1.281"] {
+                XCTAssertEqual(
+                    ClaudeNativeUsageContract.counterBoundaryBlock(contractID: malformed, kind: kind),
+                    .unsupportedCounterBoundary(kind),
+                    "\(kind) / \(malformed.debugDescription)"
+                )
+            }
+        }
+
+        // The shared fallback policy is unchanged: nil/unknown IDs never gain compaction continuity.
+        XCTAssertFalse(ClaudeNativeUsageContract.Policy.tokensOnly.compactionQualified)
+        XCTAssertEqual(ClaudeNativeUsageContract.policy(forContractID: tokensOnly), .tokensOnly)
+
+        // Fresh and resumed 2.1.281 launches stay tokens-only with an unsupported baseline.
+        XCTAssertEqual(
+            ClaudeNativeUsageContract.verdict(for: launch(), runtimeVersion: "2.1.281"),
+            .qualified(contractID: tokensOnly, baseline: .unsupported)
+        )
+        XCTAssertEqual(
+            ClaudeNativeUsageContract.verdict(for: launch(mode: .resumedSession("s")), runtimeVersion: "2.1.281"),
+            .qualified(contractID: tokensOnly, baseline: .unsupported)
+        )
+
+        // A registered contract is resolved first, so its own policy cannot be bypassed by an ID
+        // that is shaped like a tokens-only identifier.
+        ClaudeNativeUsageContract.test_contractsOverride = [
+            .init(contractID: tokensOnly, runtimeVersion: "2.1.281", launchModes: [.freshSession])
+        ]
+        for kind in kinds {
+            XCTAssertEqual(
+                ClaudeNativeUsageContract.counterBoundaryBlock(contractID: tokensOnly, kind: kind),
+                .unsupportedCounterBoundary(kind),
+                kind
+            )
+        }
     }
 }

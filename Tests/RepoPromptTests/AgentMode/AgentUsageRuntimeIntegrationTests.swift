@@ -869,6 +869,281 @@ final class AgentUsageRuntimeIntegrationTests: XCTestCase {
         }
     }
 
+    // MARK: - Tokens-only continuity across compaction (2026-10-01 compaction continuity plan §3.3)
+
+    /// Saved-session-shaped regression ("P2 follow-up", `claude_code_version` 2.1.281): a resolved
+    /// tokens-only execution observes `status:compacting` and `compact_boundary` between two
+    /// results. The boundary is observational: the verdict, open `.unavailable` segment, latest
+    /// request CH, revisions and record are untouched by it; the next dispatch/result lands in order
+    /// and adds its triple exactly once; reported costs are never checkpointed; save/reload
+    /// round-trips the owned record.
+    func testTokensOnlyExecutionKeepsObservingTokensAcrossCompactionBoundaries() async throws {
+        XCTAssertNil(ClaudeNativeUsageContract.test_contractsOverride)
+        let fixture = try makeFixture()
+        defer { fixture.cleanup() }
+        _ = try await fixture.seedPersistedSession(providerUsage: nil, rawProviderUsageMember: nil)
+        fixture.session.usageAccounting = AgentUsageAccumulator(
+            ownerSessionID: fixture.sessionID, persisted: nil, hasPriorHistory: false, qualification: .executionVerified
+        )
+        let tokensOnly = "claude-native.tokens-only.v1@2.1.281"
+        let tokensOnlyVerdict = AgentUsageExecutionVerdict.qualified(contractID: tokensOnly, baseline: .unsupported)
+        let controller = UsageEvidenceFakeNativeController()
+        fixture.session.claudeController = controller
+        let launch = controller.emitLaunch()
+        controller.emit(.runtimeEvidence(launchToken: launch.token, runtimeVersion: "2.1.281", providerSessionID: "ps"))
+        let turn1 = UUID()
+        let turn2 = UUID()
+        controller.emit(.dispatched(launchToken: launch.token, turnID: turn1, ordinal: 0))
+        controller.emit(Self.mainRequest(launch: launch, turnID: turn1, requestID: "msg-1", input: 10, read: 90))
+        controller.emit(.resultAttributed(Self.attribution(
+            launch: launch, turnID: turn1, ordinal: 0, uuid: "r1", cost: 0.5, input: 10, read: 90, creation: 0, output: 1
+        )))
+        controller.emit(.turnClosed(launchToken: launch.token, turnID: turn1, status: .completed))
+        await drained(fixture, controller, label: "pre-compaction drained")
+        XCTAssertEqual(fixture.session.usageAccounting?.executionVerdict, tokensOnlyVerdict)
+        let latestBefore = try XCTUnwrap(fixture.session.usageAccounting?.latestRequestCacheHit(for: .claudeAssistant))
+        XCTAssertEqual(latestBefore.requestID, "msg-1")
+        XCTAssertEqual(latestBefore.share?.ratio, Decimal(90) / Decimal(100))
+        let ownedRevisionBefore = try XCTUnwrap(fixture.session.usageAccounting?.ownedRevision)
+        let presentationRevisionBefore = try XCTUnwrap(fixture.session.usageAccounting?.presentationRevision)
+        let recordBefore = try XCTUnwrap(fixture.session.usageAccounting?.persistedRepresentation?.record)
+
+        controller.emit(.counterBoundaryObserved(launchToken: launch.token, kind: "status:compacting"))
+        controller.emit(.counterBoundaryObserved(launchToken: launch.token, kind: "compact_boundary"))
+        await drained(fixture, controller, label: "boundaries drained")
+        let afterBoundaries = try XCTUnwrap(fixture.session.usageAccounting)
+        XCTAssertEqual(afterBoundaries.executionVerdict, tokensOnlyVerdict, "an allowed boundary never blocks a tokens-only execution")
+        XCTAssertEqual(afterBoundaries.activeExecutionID, launch.token)
+        XCTAssertEqual(afterBoundaries.ownedRevision, ownedRevisionBefore, "a boundary alone causes no owned revision or save")
+        XCTAssertEqual(afterBoundaries.presentationRevision, presentationRevisionBefore)
+        XCTAssertEqual(afterBoundaries.persistedRepresentation?.record, recordBefore)
+        let latestAfterBoundaries = try XCTUnwrap(afterBoundaries.latestRequestCacheHit(for: .claudeAssistant))
+        XCTAssertEqual(latestAfterBoundaries, latestBefore, "latest-request CH is not nulled by an allowed boundary")
+        XCTAssertFalse(latestAfterBoundaries.detail.hasPrefix("Unavailable"), latestAfterBoundaries.detail)
+
+        controller.emit(.dispatched(launchToken: launch.token, turnID: turn2, ordinal: 1))
+        controller.emit(Self.mainRequest(launch: launch, turnID: turn2, requestID: "msg-2", input: 30, read: 70))
+        controller.emit(.resultAttributed(Self.attribution(
+            launch: launch, turnID: turn2, ordinal: 1, uuid: "r2", cost: 0.9, input: 30, read: 70, creation: 0, output: 1
+        )))
+        controller.emit(.turnClosed(launchToken: launch.token, turnID: turn2, status: .completed))
+        await drained(fixture, controller, label: "post-compaction drained")
+        let accounting = try XCTUnwrap(fixture.session.usageAccounting)
+        XCTAssertEqual(accounting.executionVerdict, tokensOnlyVerdict)
+        let record = try XCTUnwrap(accounting.persistedRepresentation?.record)
+        XCTAssertNil(record.semanticViolation)
+        XCTAssertFalse(record.hasUnmeasuredHistory)
+        XCTAssertEqual(record.turns.map(\.turnID), [turn1, turn2])
+        XCTAssertEqual(record.turns.map(\.acceptedResultID), ["r1", "r2"])
+        XCTAssertEqual(record.turns.map(\.outcome), [.completed, .completed])
+        XCTAssertEqual(record.turns.map(\.coverage), [.complete, .complete])
+        XCTAssertEqual(record.claudeSegments.count, 1, "the segment is never suspended or reopened")
+        let segment = try XCTUnwrap(record.claudeSegments.first)
+        XCTAssertEqual(segment.contractID, tokensOnly)
+        XCTAssertEqual(segment.executionID, launch.token)
+        XCTAssertEqual(segment.state, .open)
+        XCTAssertEqual(segment.coverage, .unavailable)
+        XCTAssertNil(segment.baseline)
+        XCTAssertNil(segment.latestCumulative, "nonzero reported costs are never checkpointed for tokens-only executions")
+        XCTAssertEqual(segment.acceptedResultOrder, 0)
+        XCTAssertNil(accounting.sessionCostEstimate)
+        XCTAssertEqual(accounting.cacheHitShare, .init(ratio: Decimal(160) / Decimal(200), coverage: .complete), "both triples, each exactly once")
+        let latestAfter = try XCTUnwrap(accounting.latestRequestCacheHit(for: .claudeAssistant))
+        XCTAssertEqual(latestAfter.requestID, "msg-2")
+        XCTAssertEqual(latestAfter.share?.ratio, Decimal(70) / Decimal(100))
+
+        fixture.session.isDirty = true
+        await fixture.viewModel.flushSave(for: fixture.tabID)
+        let reloaded = try await fixture.reloadPersistedSession()
+        XCTAssertEqual(reloaded.providerUsage?.record, record)
+    }
+
+    /// A session saved while the pre-amendment rule suspended its tokens-only execution at
+    /// compaction is neither migrated nor repaired: the suspended `.unavailable` segment, its
+    /// turns and `hasUnmeasuredHistory` survive verbatim. Recovery happens only through a new
+    /// launch, which opens its own tokens-only segment and keeps observing tokens across its own
+    /// compaction boundary.
+    func testHydratedSuspendedTokensOnlyHistoryRecoversOnlyThroughANewLaunchThatObservesTokens() async throws {
+        XCTAssertNil(ClaudeNativeUsageContract.test_contractsOverride)
+        let fixture = try makeFixture()
+        defer { fixture.cleanup() }
+        let tokensOnly = ClaudeNativeUsageContract.tokensOnlyContractID(runtimeVersion: "2.1.281")
+        let oldExecution = UUID()
+        var restored = AgentProviderUsageRecord(
+            originSessionID: fixture.sessionID,
+            trackingStartedAt: Date(timeIntervalSince1970: 1_700_000_000),
+            hasUnmeasuredHistory: true
+        )
+        restored.turns = [
+            .init(
+                executionID: oldExecution,
+                segmentIndex: 0,
+                turnID: UUID(),
+                acceptedResultID: "old-r1",
+                inputTokens: 10,
+                outputTokens: 1,
+                cacheReadInputTokens: 90,
+                cacheCreationInputTokens: 0,
+                outcome: .completed,
+                coverage: .complete
+            ),
+            .init(executionID: oldExecution, segmentIndex: 0, turnID: UUID(), outcome: .interrupted, coverage: .partial)
+        ]
+        restored.claudeSegments = [
+            .init(
+                contractID: tokensOnly,
+                provider: "claude",
+                providerSessionID: "ps-old",
+                executionID: oldExecution,
+                resetGeneration: 0,
+                baseline: nil,
+                latestCumulative: nil,
+                currency: "USD",
+                acceptedResultID: nil,
+                acceptedResultOrder: 0,
+                state: .suspended,
+                coverage: .unavailable
+            )
+        ]
+        XCTAssertNil(restored.semanticViolation)
+        _ = try await fixture.seedPersistedSession(providerUsage: .record(restored), rawProviderUsageMember: nil)
+        let payload = try await fixture.hydrationPayload()
+        let didHydrate = await fixture.viewModel.test_applyPersistedHydration(payload, to: fixture.session)
+        XCTAssertTrue(didHydrate)
+        let hydrated = try XCTUnwrap(fixture.session.usageAccounting)
+        XCTAssertEqual(hydrated.eligibility, .eligible)
+        XCTAssertEqual(hydrated.record, restored, "hydration never migrates or repairs suspended history")
+
+        let controller = UsageEvidenceFakeNativeController()
+        fixture.session.claudeController = controller
+        let launch = controller.emitLaunch()
+        controller.emit(.runtimeEvidence(launchToken: launch.token, runtimeVersion: "2.1.281", providerSessionID: "ps"))
+        let turn1 = UUID()
+        let turn2 = UUID()
+        controller.emit(.dispatched(launchToken: launch.token, turnID: turn1, ordinal: 0))
+        controller.emit(.resultAttributed(Self.attribution(
+            launch: launch, turnID: turn1, ordinal: 0, uuid: "n1", cost: 0.5, input: 10, read: 90, creation: 0, output: 1
+        )))
+        controller.emit(.counterBoundaryObserved(launchToken: launch.token, kind: "status:compacting"))
+        controller.emit(.counterBoundaryObserved(launchToken: launch.token, kind: "compact_boundary"))
+        controller.emit(.dispatched(launchToken: launch.token, turnID: turn2, ordinal: 1))
+        controller.emit(.resultAttributed(Self.attribution(
+            launch: launch, turnID: turn2, ordinal: 1, uuid: "n2", cost: 0.9, input: 30, read: 70, creation: 0, output: 1
+        )))
+        await drained(fixture, controller, label: "recovery launch drained")
+
+        let accounting = try XCTUnwrap(fixture.session.usageAccounting)
+        XCTAssertEqual(accounting.executionVerdict, .qualified(contractID: tokensOnly, baseline: .unsupported))
+        let record = try XCTUnwrap(accounting.persistedRepresentation?.record)
+        XCTAssertNil(record.semanticViolation)
+        XCTAssertTrue(record.hasUnmeasuredHistory, "existing flags are preserved, never cleared by a new launch")
+        XCTAssertEqual(record.claudeSegments.count, 2)
+        XCTAssertEqual(record.claudeSegments[0], restored.claudeSegments[0], "the suspended segment is never reopened or rewritten")
+        XCTAssertEqual(Array(record.turns.prefix(2)), restored.turns)
+        let live = record.claudeSegments[1]
+        XCTAssertEqual(live.contractID, tokensOnly)
+        XCTAssertEqual(live.executionID, launch.token)
+        XCTAssertEqual(live.state, .open)
+        XCTAssertEqual(live.coverage, .unavailable)
+        XCTAssertNil(live.baseline)
+        XCTAssertNil(live.latestCumulative)
+        let liveTurns = Array(record.turns.dropFirst(2))
+        XCTAssertEqual(liveTurns.map(\.turnID), [turn1, turn2])
+        XCTAssertEqual(liveTurns.map(\.acceptedResultID), ["n1", "n2"])
+        XCTAssertEqual(liveTurns.map(\.segmentIndex), [1, 1])
+        XCTAssertNil(accounting.sessionCostEstimate)
+        // Restored 90/100 plus live 90/100 and 70/100; restored gaps keep the share partial.
+        XCTAssertEqual(accounting.cacheHitShare, .init(ratio: Decimal(250) / Decimal(300), coverage: .partial))
+    }
+
+    /// Mid-turn compaction: a dispatched, unfinished turn with live main-request usage receives
+    /// `status:compacting` and `compact_boundary` before its own result. The boundaries leave the
+    /// open turn, record, revisions and latest-request CH untouched; the turn stays registered (a
+    /// later main request for it is still accepted), and its result and closure are accepted
+    /// exactly once (a re-delivered result and a second closure change nothing).
+    func testTokensOnlyInFlightTurnKeepsItsOwnershipAcrossCompactionAndAcceptsItsResultExactlyOnce() async throws {
+        XCTAssertNil(ClaudeNativeUsageContract.test_contractsOverride)
+        let fixture = try makeFixture()
+        defer { fixture.cleanup() }
+        fixture.session.usageAccounting = AgentUsageAccumulator(
+            ownerSessionID: fixture.sessionID, persisted: nil, hasPriorHistory: false, qualification: .executionVerified
+        )
+        let tokensOnlyVerdict = AgentUsageExecutionVerdict.qualified(
+            contractID: "claude-native.tokens-only.v1@2.1.281",
+            baseline: .unsupported
+        )
+        let controller = UsageEvidenceFakeNativeController()
+        fixture.session.claudeController = controller
+        let launch = controller.emitLaunch()
+        controller.emit(.runtimeEvidence(launchToken: launch.token, runtimeVersion: "2.1.281", providerSessionID: "ps"))
+        let turn = UUID()
+        controller.emit(.dispatched(launchToken: launch.token, turnID: turn, ordinal: 0))
+        controller.emit(Self.mainRequest(launch: launch, turnID: turn, requestID: "msg-1", input: 10, read: 90))
+        await drained(fixture, controller, label: "in-flight turn drained")
+        let before = try XCTUnwrap(fixture.session.usageAccounting)
+        XCTAssertEqual(before.executionVerdict, tokensOnlyVerdict)
+        let openRecord = try XCTUnwrap(before.persistedRepresentation?.record)
+        XCTAssertEqual(openRecord.turns.map(\.turnID), [turn])
+        XCTAssertEqual(openRecord.turns.map(\.outcome), [.open])
+        let latestBefore = try XCTUnwrap(before.latestRequestCacheHit(for: .claudeAssistant))
+        XCTAssertEqual(latestBefore.requestID, "msg-1")
+        XCTAssertEqual(latestBefore.share?.ratio, Decimal(90) / Decimal(100))
+
+        controller.emit(.counterBoundaryObserved(launchToken: launch.token, kind: "status:compacting"))
+        controller.emit(.counterBoundaryObserved(launchToken: launch.token, kind: "compact_boundary"))
+        await drained(fixture, controller, label: "mid-turn boundaries drained")
+        let during = try XCTUnwrap(fixture.session.usageAccounting)
+        XCTAssertEqual(during.executionVerdict, tokensOnlyVerdict, "a mid-turn boundary never blocks a tokens-only execution")
+        XCTAssertEqual(during.activeExecutionID, launch.token)
+        XCTAssertEqual(during.ownedRevision, before.ownedRevision, "the boundary neither closes nor suspends anything")
+        XCTAssertEqual(during.presentationRevision, before.presentationRevision)
+        XCTAssertEqual(during.persistedRepresentation?.record, openRecord, "the open turn and open segment are unchanged")
+        XCTAssertEqual(during.latestRequestCacheHit(for: .claudeAssistant), latestBefore)
+
+        // The open turn is still owned: a post-compaction main request for it is accepted.
+        controller.emit(Self.mainRequest(launch: launch, turnID: turn, requestID: "msg-2", input: 30, read: 70))
+        await drained(fixture, controller, label: "post-compaction request drained")
+        let latestAfterCompaction = try XCTUnwrap(fixture.session.usageAccounting?.latestRequestCacheHit(for: .claudeAssistant))
+        XCTAssertEqual(latestAfterCompaction.requestID, "msg-2")
+        XCTAssertEqual(latestAfterCompaction.share?.ratio, Decimal(70) / Decimal(100))
+
+        controller.emit(.resultAttributed(Self.attribution(
+            launch: launch, turnID: turn, ordinal: 0, uuid: "r1", cost: 0.5, input: 10, read: 90, creation: 0, output: 1
+        )))
+        controller.emit(.turnClosed(launchToken: launch.token, turnID: turn, status: .completed))
+        await drained(fixture, controller, label: "same-turn result and closure drained")
+        let after = try XCTUnwrap(fixture.session.usageAccounting)
+        XCTAssertEqual(after.executionVerdict, tokensOnlyVerdict)
+        let record = try XCTUnwrap(after.persistedRepresentation?.record)
+        XCTAssertNil(record.semanticViolation)
+        XCTAssertFalse(record.hasUnmeasuredHistory)
+        XCTAssertEqual(record.turns.map(\.turnID), [turn])
+        XCTAssertEqual(record.turns.map(\.acceptedResultID), ["r1"])
+        XCTAssertEqual(record.turns.map(\.outcome), [.completed])
+        XCTAssertEqual(record.turns.map(\.coverage), [.complete])
+        XCTAssertEqual(record.claudeSegments.count, 1)
+        XCTAssertEqual(record.claudeSegments.first?.state, .open)
+        XCTAssertEqual(record.claudeSegments.first?.coverage, .unavailable)
+        XCTAssertNil(record.claudeSegments.first?.latestCumulative)
+        XCTAssertNil(after.sessionCostEstimate)
+        XCTAssertEqual(after.cacheHitShare, .init(ratio: Decimal(90) / Decimal(100), coverage: .complete))
+
+        // Exactly once: a re-delivered result and a second closure change nothing.
+        let revisionAfterAcceptance = after.ownedRevision
+        controller.emit(.resultAttributed(Self.attribution(
+            launch: launch, turnID: turn, ordinal: 0, uuid: "r1", cost: 0.5, input: 10, read: 90, creation: 0, output: 1
+        )))
+        controller.emit(.turnClosed(launchToken: launch.token, turnID: turn, status: .completed))
+        await drained(fixture, controller, label: "re-delivery drained")
+        XCTAssertEqual(fixture.session.usageAccounting?.ownedRevision, revisionAfterAcceptance)
+        XCTAssertEqual(fixture.session.usageAccounting?.persistedRepresentation?.record, record)
+        XCTAssertEqual(
+            fixture.session.usageAccounting?.closeTurn(turn, outcome: .completed),
+            .rejected(.unregisteredTurn),
+            "the closure already retired the turn"
+        )
+    }
+
     // MARK: - Single-stream closure and forwarder lifecycle
 
     func testClosureOnTheUsageStreamCannotRaceAnAttributedResultAndRetiresUnattributedTurns() async throws {
@@ -1834,6 +2109,28 @@ final class AgentUsageRuntimeIntegrationTests: XCTestCase {
             reportedCost: cost,
             turnStatus: status
         )
+    }
+
+    /// One live main-line assistant request with a complete input triple (cache creation zero).
+    private static func mainRequest(
+        launch: NativeProcessLaunchIdentity,
+        turnID: UUID,
+        requestID: String,
+        input: Int,
+        read: Int
+    ) -> NativeUsageAccountingEvent {
+        .mainRequestUsageAttributed(.init(
+            launchToken: launch.token,
+            turnID: turnID,
+            requestID: requestID,
+            observation: .init(
+                source: .assistant,
+                inputTokens: input,
+                outputTokens: 1,
+                cacheReadInputTokens: read,
+                cacheCreationInputTokens: 0
+            )
+        ))
     }
 
     /// Waits until every event the fake emitted has been ingested through the session seam.

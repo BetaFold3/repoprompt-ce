@@ -813,6 +813,166 @@ final class ClaudeSDKNDJSONTranslatorTests: XCTestCase {
         ]), 200_000)
     }
 
+    func testSystemStatusFieldTableEmitsExactlyOneStatusResult() {
+        let absent = "<absent>"
+        let cases: [(label: String, status: Any, expected: String?)] = [
+            ("compacting", "compacting", "Compacting context"),
+            ("compacting mixed case and padding", "  CoMpAcTiNg \n", "Compacting context"),
+            ("ordinary", "Waiting for permission", "Waiting for permission"),
+            ("ordinary trimmed", "  requesting  ", "requesting"),
+            ("json null", NSNull(), nil),
+            ("empty", "", nil),
+            ("whitespace", " \n\t ", nil),
+            ("null sentinel", "null", nil),
+            ("null sentinel padded", "  null ", nil),
+            ("missing key", absent, nil),
+            ("number", 42, nil),
+            ("boolean", true, nil),
+            ("array", ["compacting"], nil),
+            ("object", ["status": "compacting"], nil)
+        ]
+
+        for testCase in cases {
+            var translator = ClaudeSDKNDJSONTranslator()
+            var payload: [String: Any] = ["type": "system", "subtype": "status", "session_id": "s-status"]
+            if (testCase.status as? String) != absent {
+                payload["status"] = testCase.status
+            }
+            let results = translator.parseNDJSONLine(jsonLine(payload))
+            XCTAssertEqual(results.map(\.type), ["status"], testCase.label)
+            XCTAssertEqual(results.first?.text, testCase.expected, testCase.label)
+        }
+    }
+
+    func testSystemStatusCompactionMarkersNeverChangeStatusOutput() {
+        var translator = ClaudeSDKNDJSONTranslator()
+
+        let terminal = translator.parseNDJSONLine(jsonLine([
+            "type": "system",
+            "subtype": "status",
+            "status": NSNull(),
+            "compact_result": "<redacted>",
+            "compact_error": "Not enough messages to compact."
+        ]))
+        XCTAssertEqual(terminal.map(\.type), ["status"])
+        XCTAssertNil(terminal.first?.text)
+
+        let compactingWithMetadata = translator.parseNDJSONLine(jsonLine([
+            "type": "system",
+            "subtype": "status",
+            "status": "compacting",
+            "compact_metadata": ["trigger": "auto", "pre_tokens": 327_303]
+        ]))
+        XCTAssertEqual(compactingWithMetadata.map(\.type), ["status"])
+        XCTAssertEqual(compactingWithMetadata.first?.text, "Compacting context")
+
+        let ordinaryWithMarkers = translator.parseNDJSONLine(jsonLine([
+            "type": "system",
+            "subtype": "status",
+            "status": "requesting",
+            "compact_result": "success",
+            "compact_error": "boom"
+        ]))
+        XCTAssertEqual(ordinaryWithMarkers.map(\.type), ["status"])
+        XCTAssertEqual(ordinaryWithMarkers.first?.text, "requesting")
+
+        let markerOnly = translator.parseNDJSONLine(jsonLine([
+            "type": "system",
+            "subtype": "status",
+            "compact_result": "success"
+        ]))
+        XCTAssertEqual(markerOnly.map(\.type), ["status"])
+        XCTAssertNil(markerOnly.first?.text)
+    }
+
+    func testCompactBoundaryEmitsReleaseThenUnchangedSystemRow() {
+        var translator = ClaudeSDKNDJSONTranslator()
+
+        let withMetadata = translator.parseNDJSONLine(jsonLine([
+            "type": "system",
+            "subtype": "compact_boundary",
+            "compact_metadata": ["trigger": "auto", "pre_tokens": 327_303]
+        ]))
+        XCTAssertEqual(withMetadata.map(\.type), ["status", "system"])
+        XCTAssertNil(withMetadata.first?.text)
+        XCTAssertEqual(withMetadata.last?.text, "Context compacted — trigger: auto — at ~327303 tokens")
+
+        let bare = translator.parseNDJSONLine(jsonLine([
+            "type": "system",
+            "subtype": "compact_boundary"
+        ]))
+        XCTAssertEqual(bare.map(\.type), ["status", "system"])
+        XCTAssertNil(bare.first?.text)
+        XCTAssertEqual(bare.last?.text, "Context compacted")
+    }
+
+    func testCapturedCompactFixtureReplaysCompactingLabelThenRelease() throws {
+        // The captured 2.1.268 manual `/compact` fixture lives in the app test target; it is the
+        // only captured compaction wire evidence, so replay it verbatim rather than a copy.
+        let fixtureURL = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent() // SDK
+            .deletingLastPathComponent() // RepoPromptClaudeCompatibleProviderTests
+            .deletingLastPathComponent() // Tests
+            .deletingLastPathComponent() // RepoPromptAgentProviders
+            .deletingLastPathComponent() // Packages
+            .deletingLastPathComponent() // repository root
+            .appendingPathComponent("Tests/RepoPromptTests/AgentMode/Fixtures/ClaudeNativeUsage/2.1.268-compact.jsonl")
+        let fixture = try String(contentsOf: fixtureURL, encoding: .utf8)
+        var translator = ClaudeSDKNDJSONTranslator()
+
+        var statusResults: [ClaudeProviderStreamResult] = []
+        var statusLineCount = 0
+        for line in fixture.split(whereSeparator: \.isNewline) {
+            let results = translator.parseNDJSONLine(Data(line.utf8))
+            let isStatusLine = line.contains("\"subtype\": \"status\"")
+            if isStatusLine {
+                statusLineCount += 1
+                XCTAssertEqual(results.map(\.type), ["status"], "Each captured status line yields exactly one status result")
+            }
+            statusResults.append(contentsOf: results.filter { $0.type == "status" })
+        }
+
+        XCTAssertEqual(statusLineCount, 2)
+        XCTAssertEqual(statusResults.map(\.text), ["Compacting context", nil])
+    }
+
+    func testStatusReleasesNeverProduceTurnBoundaryOrUsage() {
+        let releasePayloads: [[String: Any]] = [
+            ["type": "system", "subtype": "status", "status": NSNull()],
+            ["type": "system", "subtype": "status"],
+            ["type": "system", "subtype": "status", "status": "null"],
+            ["type": "system", "subtype": "status", "status": 7],
+            [
+                "type": "system",
+                "subtype": "status",
+                "status": NSNull(),
+                "compact_result": "<redacted>",
+                "compact_error": "Not enough messages to compact."
+            ],
+            [
+                "type": "system",
+                "subtype": "compact_boundary",
+                "compact_metadata": ["trigger": "auto", "pre_tokens": 323_375]
+            ]
+        ]
+
+        for payload in releasePayloads {
+            var translator = ClaudeSDKNDJSONTranslator()
+            let results = translator.parseNDJSONLine(jsonLine(payload))
+            XCTAssertFalse(results.isEmpty)
+            for result in results {
+                XCTAssertNotEqual(result.type, "message_stop")
+                XCTAssertNotEqual(result.type, "usage")
+                XCTAssertNil(result.usageObservation)
+                XCTAssertNil(result.promptTokens)
+                XCTAssertNil(result.completionTokens)
+                XCTAssertNil(result.contextUsedTokens)
+                XCTAssertNil(result.cost)
+                XCTAssertNil(result.stopReason)
+            }
+        }
+    }
+
     private func modelContextWindow(
         from translator: inout ClaudeSDKNDJSONTranslator,
         modelUsage: [String: Any],
