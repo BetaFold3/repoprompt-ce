@@ -2858,6 +2858,9 @@ final class AgentModeViewModel: ObservableObject {
             providerRuntimePermissionResolver: { [providerBindingService] agent, profile in
                 providerBindingService.runtimePermission(for: agent, profile: profile)
             },
+            delegationRunToolPolicyResolver: { [weak self] session in
+                self?.mcpDelegationRunToolPolicy(for: session) ?? .leaf
+            },
             bindPendingOracleReviewContext: { [weak self] tabID, runID in
                 self?.mcpBindPendingAgentRunOracleReviewContext(tabID: tabID, runID: runID)
             },
@@ -6714,29 +6717,330 @@ final class AgentModeViewModel: ObservableObject {
         return try await AgentSessionDataService.shared.resolveAgentSessionID(reference: trimmed, for: workspace)
     }
 
+    // MARK: - Bounded delegation lineage
+
+    /// Parent relationship for one durable session, reconciled across every parent claim for that
+    /// identity: each live record bound to it and its owner-validated index entry.
+    /// - A live record with a non-nil parent claims that parent (hydrated or not).
+    /// - A hydrated live record without a parent claims root. An unhydrated live record without a
+    ///   parent makes no claim: its persisted parent may not have loaded yet.
+    /// - An index entry claims its recorded parent, or root when it records none.
+    /// Two different non-nil parents are inconsistent. A non-nil parent outranks a root claim (the
+    /// deeper, more restrictive reading). With no claim at all the parent is unknown, so an
+    /// unhydrated persisted identity is never mistaken for a genuinely new root.
+    func mcpDelegationParentLookup(sessionID: UUID) -> AgentDelegationPolicy.ParentLookup {
+        delegationParentLookup(sessionID: sessionID, callerSession: nil)
+    }
+
+    private func delegationParentLookup(
+        sessionID: UUID?,
+        callerSession: TabSession?
+    ) -> AgentDelegationPolicy.ParentLookup {
+        var liveRecords: [TabSession] = if let sessionID {
+            sessions.values.filter { $0.activeAgentSessionID == sessionID }
+        } else {
+            []
+        }
+        if let callerSession, !liveRecords.contains(where: { $0 === callerSession }) {
+            liveRecords.append(callerSession)
+        }
+        var parentClaims = Set<UUID>()
+        var hasRootClaim = false
+        for record in liveRecords {
+            if let parentSessionID = record.parentSessionID {
+                parentClaims.insert(parentSessionID)
+            } else if record.hasLoadedPersistedState {
+                hasRootClaim = true
+            }
+        }
+        if let sessionID, let indexedEntry = ownerValidatedSessionIndex[sessionID] {
+            if let indexedParentSessionID = indexedEntry.parentSessionID {
+                parentClaims.insert(indexedParentSessionID)
+            } else {
+                hasRootClaim = true
+            }
+        }
+        guard parentClaims.count <= 1 else { return .inconsistent }
+        if let parentSessionID = parentClaims.first { return .parent(parentSessionID) }
+        return hasRootClaim ? .root : .unknown
+    }
+
+    /// Lineage of a live session (a caller resolved from its exact tab). The caller's own record is
+    /// one parent claim for its durable identity, reconciled with every other live record and the
+    /// index entry claiming that identity; every ancestor is reconciled the same way by ID. A
+    /// hydrated live session without identity or parent is a genuinely new root.
+    func mcpDelegationLineage(for session: TabSession) -> AgentDelegationPolicy.LineageResolution {
+        let sessionID = session.activeAgentSessionID
+        return AgentDelegationPolicy.resolveLineage(
+            sessionID: sessionID,
+            startingParent: delegationParentLookup(sessionID: sessionID, callerSession: session),
+            parentOf: { mcpDelegationParentLookup(sessionID: $0) }
+        )
+    }
+
+    func mcpDelegationLineage(sessionID: UUID) -> AgentDelegationPolicy.LineageResolution {
+        AgentDelegationPolicy.resolveLineage(
+            sessionID: sessionID,
+            startingParent: mcpDelegationParentLookup(sessionID: sessionID),
+            parentOf: { mcpDelegationParentLookup(sessionID: $0) }
+        )
+    }
+
+    func mcpDelegationDecision(for session: TabSession) -> AgentDelegationPolicy.Decision {
+        AgentDelegationPolicy.decision(
+            taskLabelKind: session.mcpControlContext?.taskLabelKind,
+            lineage: mcpDelegationLineage(for: session)
+        )
+    }
+
+    /// Run-time MCP tool policy (advertisement flag, leaf restrictions, prompt audience) for the
+    /// session's current role and lineage. Computed at lease/prompt preparation; never persisted.
+    func mcpDelegationRunToolPolicy(for session: TabSession) -> AgentDelegationPolicy.RunToolPolicy {
+        AgentDelegationPolicy.runToolPolicy(
+            decision: mcpDelegationDecision(for: session),
+            taskLabelKind: session.mcpControlContext?.taskLabelKind
+        )
+    }
+
+    private func mcpDelegationSourceSession(sourceTabID: UUID) throws -> TabSession {
+        let sourceSession: TabSession? = if let liveSession = sessions[sourceTabID] {
+            liveSession
+        } else if workspaceManager?.composeTab(with: sourceTabID) != nil {
+            session(for: sourceTabID, createIfNeeded: true)
+        } else {
+            nil
+        }
+        guard let sourceSession else {
+            throw MCPError.invalidParams(
+                "RepoPrompt could not resolve the calling Agent Mode session. Refusing to start or control other agents; retry after the source session is active."
+            )
+        }
+        return sourceSession
+    }
+
+    /// Delegation admission for an Agent Mode caller. A nil source is an external MCP client and
+    /// keeps its existing behavior (returns nil); a routed Agent Mode source must be a non-explore
+    /// session at depth 0 or 1 with verifiable lineage, whether or not it still owns an MCP control
+    /// context.
+    /// - Returns: the admitted caller's durable identity, frozen synchronously with admission. An
+    ///   admitted caller without one is a genuinely new hydrated root; its identity is bound here so
+    ///   later commit and dispatch checks compare against the session that was actually admitted.
+    @discardableResult
     func mcpValidateAgentRunSpawnAllowed(
         sourceTabID: UUID?,
         isExploreOnly: Bool = false
+    ) throws -> UUID? {
+        guard let sourceTabID else { return nil }
+        let sourceSession = try mcpDelegationSourceSession(sourceTabID: sourceTabID)
+        let decision = mcpDelegationDecision(for: sourceSession)
+        if isExploreOnly, decision == .exploreLeaf {
+            throw MCPError.invalidParams("Explore agents cannot start additional explore agents.")
+        }
+        if let message = AgentDelegationPolicy.denialMessage(for: decision) {
+            throw MCPError.invalidParams(message)
+        }
+        guard let admittedCallerSessionID = ensureSessionBoundToTab(sourceSession) else {
+            throw MCPError.invalidParams(
+                "RepoPrompt could not bind a durable identity for the calling Agent Mode session. Refusing to start or control other agents; retry after the source session is active."
+            )
+        }
+        return admittedCallerSessionID
+    }
+
+    /// After an await resolved the spawn parent, a routed caller's parent must be the identity frozen
+    /// at admission; a replacement session in the same tab is never credited with the request.
+    func mcpRequireAdmittedSpawnParent(
+        sourceTabID: UUID?,
+        admittedCallerSessionID: UUID?,
+        resolvedParentSessionID: UUID?,
+        operation: String
     ) throws {
-        guard let sourceTabID,
-              let sourceSession = sessions[sourceTabID],
-              let controlContext = sourceSession.mcpControlContext
+        guard sourceTabID != nil else { return }
+        guard let admittedCallerSessionID, resolvedParentSessionID == admittedCallerSessionID else {
+            throw MCPError.invalidParams(
+                "\(operation): the calling agent session changed while its parent was being resolved. Refusing to create or reactivate delegated work; retry after the source session is active."
+            )
+        }
+    }
+
+    /// Admission for session-addressed control from an Agent Mode caller: the caller must still be
+    /// allowed to delegate and the target must satisfy the worker ceiling. Returns the frozen caller
+    /// identity for the mutation-boundary recheck (`mcpRevalidateDelegationCommit`).
+    func mcpAdmitDelegationControl(
+        sourceTabID: UUID?,
+        targetSessionID: UUID,
+        operation: String
+    ) throws -> UUID? {
+        let admittedCallerSessionID = try mcpValidateAgentRunSpawnAllowed(sourceTabID: sourceTabID)
+        try mcpValidateDelegationTarget(
+            sourceTabID: sourceTabID,
+            targetSessionID: targetSessionID,
+            operation: operation
+        )
+        return admittedCallerSessionID
+    }
+
+    /// Synchronous re-admission at a mutation or dispatch boundary, after the request may have
+    /// suspended since admission. The routed caller tab must still hold the admitted durable
+    /// identity, still be allowed to delegate, and (when given) still satisfy the target depth
+    /// ceiling. A nil source is an external MCP client and is unchanged.
+    func mcpRevalidateDelegationCommit(
+        sourceTabID: UUID?,
+        expectedCallerSessionID: UUID?,
+        targetSessionID: UUID? = nil,
+        isExploreOnly: Bool = false,
+        operation: String
+    ) throws {
+        guard let sourceTabID else { return }
+        guard let sourceSession = sessions[sourceTabID],
+              sourceSession.activeAgentSessionID == expectedCallerSessionID
+        else {
+            throw MCPError.invalidParams(
+                "\(operation): the calling agent session changed while the request was in flight. Refusing to commit delegated work; retry after the source session is active."
+            )
+        }
+        try mcpValidateAgentRunSpawnAllowed(sourceTabID: sourceTabID, isExploreOnly: isExploreOnly)
+        try mcpValidateDelegationTarget(
+            sourceTabID: sourceTabID,
+            targetSessionID: targetSessionID,
+            operation: operation
+        )
+    }
+
+    /// Whether any live record or owner-validated index entry names `sessionID` as its parent.
+    func mcpDelegationHasChildSessions(_ sessionID: UUID) -> Bool {
+        sessions.values.contains { $0.parentSessionID == sessionID }
+            || ownerValidatedSessionIndex.values.contains { $0.parentSessionID == sessionID }
+    }
+
+    /// Guards recording `parentSessionID` on a live record that has none, against the parent its
+    /// durable identity already reconciles to (`mcpDelegationParentLookup`):
+    /// - Restoring that same reconciled parent (for example an indexed parent not yet on the live
+    ///   record) changes no depth and is allowed.
+    /// - A different parent than the reconciled one, or inconsistent claims, fail closed.
+    /// - A genuine root-to-parent adoption is rejected when the session already has delegated
+    ///   children: it would shift the whole existing subtree one level deeper while its running
+    ///   descendants keep the tool policy computed at their lease start.
+    private func validateSpawnParentAdoption(_ parentSessionID: UUID?, for session: TabSession) throws {
+        guard let parentSessionID,
+              session.parentSessionID == nil,
+              let sessionID = session.activeAgentSessionID,
+              sessionID != parentSessionID
         else {
             return
         }
-        if isExploreOnly, controlContext.taskLabelKind == .explore {
-            throw MCPError.invalidParams("Explore agents cannot start additional explore agents.")
-        }
-        // Top-level MCP sessions (no parent) may spawn sub-agents.
-        guard sourceSession.parentSessionID != nil else {
+        switch mcpDelegationParentLookup(sessionID: sessionID) {
+        case let .parent(reconciledParentSessionID) where reconciledParentSessionID == parentSessionID:
             return
+        case .parent, .inconsistent:
+            throw MCPError.invalidParams(
+                "Refusing to attach agent session \(sessionID.uuidString) under parent session \(parentSessionID.uuidString): its recorded delegation lineage names a different or conflicting parent."
+            )
+        case .root, .unknown:
+            guard mcpDelegationHasChildSessions(sessionID) else { return }
+            throw MCPError.invalidParams(
+                "Refusing to attach agent session \(sessionID.uuidString) under parent session \(parentSessionID.uuidString): it already has delegated child sessions, and adopting it would change their delegation depth while their runs keep their current tool policy. Start a fresh session instead."
+            )
         }
-        if isExploreOnly {
-            return
-        }
-        throw MCPError.invalidParams(
-            "Sub-agents cannot start additional agent runs. Only top-level MCP-started agent sessions may spawn sub-agents; non-explore sub-agents may start read-only explore children with agent_explore."
+    }
+
+    /// Commit point for a spawn parent: runs the caller's synchronous delegation re-check, rejects
+    /// subtree-invalidating adoption, then records the parent. No suspension separates the checks
+    /// from the mutation.
+    private func commitSpawnParentSessionID(
+        _ parentSessionID: UUID?,
+        to session: TabSession,
+        inheritWorktreeBindings: Bool,
+        delegationCommitCheck: () throws -> Void
+    ) throws {
+        try delegationCommitCheck()
+        try validateSpawnParentAdoption(parentSessionID, for: session)
+        applySpawnParentSessionID(
+            parentSessionID,
+            to: session,
+            inheritWorktreeBindings: inheritWorktreeBindings
         )
+    }
+
+    /// Durable session currently bound to an existing compose tab, if any.
+    func mcpExistingSessionID(forTabID tabID: UUID) -> UUID? {
+        sessions[tabID]?.activeAgentSessionID ?? workspaceManager?.composeTab(with: tabID)?.activeAgentSessionID
+    }
+
+    /// Depth ceiling for agent-originated operations that reactivate an existing session
+    /// (explicit-tab start, resume, steer). Main (depth 0) keeps its existing session-addressed
+    /// behavior. A worker (depth ≥ 1) may only target sessions strictly deeper than itself, so it
+    /// cannot reactivate itself, an ancestor, a sibling, or a parentless root (whose adoption
+    /// would also reshape that root's delegation permissions). A nil target is a fresh session.
+    /// This is a depth ceiling, not a replacement for existing session-access authorization.
+    func mcpValidateDelegationTarget(
+        sourceTabID: UUID?,
+        targetSessionID: UUID?,
+        operation: String
+    ) throws {
+        guard let sourceTabID, let targetSessionID else { return }
+        let sourceSession = try mcpDelegationSourceSession(sourceTabID: sourceTabID)
+        let callerLineage = mcpDelegationLineage(for: sourceSession)
+        guard let callerDepth = callerLineage.depth else {
+            throw MCPError.invalidParams(
+                AgentDelegationPolicy.denialMessage(for: .lineageFailure(callerLineage))
+                    ?? "RepoPrompt could not verify this agent session's delegation lineage."
+            )
+        }
+        guard callerDepth > 0 else { return }
+        guard targetSessionID != sourceSession.activeAgentSessionID else {
+            throw MCPError.invalidParams("\(operation) cannot target the calling agent session itself.")
+        }
+        guard let targetDepth = mcpDelegationLineage(sessionID: targetSessionID).depth else {
+            throw MCPError.invalidParams(
+                "\(operation) could not verify the target session's delegation lineage. Refusing to reactivate it from a delegated agent."
+            )
+        }
+        guard targetDepth > callerDepth else {
+            throw MCPError.invalidParams(
+                "\(operation) from a delegated agent at depth \(callerDepth) may only target sessions deeper in the delegation tree (such as its own sub-workers); the target is at depth \(targetDepth)."
+            )
+        }
+    }
+
+    /// Parent for an MCP `fork_session` destination: the fork source's existing parent keeps the
+    /// destination at the source's place in the tree, while an Agent Mode requester is a second
+    /// candidate parent. The deeper resulting destination wins (ties keep the source's parent), so a
+    /// fork can neither escape the requester's depth nor detach a nested source into a new root.
+    /// Returns nil for a root destination; throws for unverifiable lineage or a destination that
+    /// would be deeper than depth 2.
+    func mcpForkDestinationParentSessionID(
+        forkSourceSessionID: UUID,
+        requesterTabID: UUID?
+    ) throws -> UUID? {
+        let sourceParentLookup = mcpDelegationParentLookup(sessionID: forkSourceSessionID)
+        guard let sourceDepth = mcpDelegationLineage(sessionID: forkSourceSessionID).depth else {
+            throw MCPError.invalidParams(
+                "fork_session could not verify the source session's delegation lineage. Refusing to fork it."
+            )
+        }
+        var parentSessionID: UUID? = if case let .parent(parentID) = sourceParentLookup { parentID } else { nil }
+        var destinationDepth = sourceDepth
+        if let requesterTabID {
+            let requester = try mcpDelegationSourceSession(sourceTabID: requesterTabID)
+            guard let requesterSessionID = requester.activeAgentSessionID ?? ensureSessionBoundToTab(requester),
+                  let requesterDepth = mcpDelegationLineage(for: requester).depth
+            else {
+                throw MCPError.invalidParams(
+                    "fork_session could not verify the requesting agent session's delegation lineage."
+                )
+            }
+            if requesterDepth + 1 > destinationDepth {
+                parentSessionID = requesterSessionID
+                destinationDepth = requesterDepth + 1
+            }
+        }
+        guard destinationDepth <= AgentDelegationPolicy.maximumDelegatingDepth + 1 else {
+            throw MCPError.invalidParams(
+                "fork_session would create a session at delegation depth \(destinationDepth); RepoPrompt does not create sessions deeper than depth \(AgentDelegationPolicy.maximumDelegatingDepth + 1)."
+            )
+        }
+        return parentSessionID
     }
 
     func mcpSpawnParentSessionID(sourceTabID: UUID?) -> UUID? {
@@ -7520,7 +7824,8 @@ final class AgentModeViewModel: ObservableObject {
         createIfNeeded: Bool,
         sessionName: String?,
         parentSessionID: UUID? = nil,
-        inheritWorktreeBindings: Bool = false
+        inheritWorktreeBindings: Bool = false,
+        delegationCommitCheck: () throws -> Void = {}
     ) async throws -> MCPSessionTarget {
         if let sessionID {
             let indexedParentSessionID = ownerValidatedSessionIndex[sessionID]?.parentSessionID
@@ -7534,7 +7839,8 @@ final class AgentModeViewModel: ObservableObject {
                     tabID: existingTabID,
                     sessionID: sessionID,
                     parentSessionID: indexedParentSessionID ?? parentSessionID,
-                    inheritWorktreeBindings: inheritWorktreeBindings
+                    inheritWorktreeBindings: inheritWorktreeBindings,
+                    delegationCommitCheck: delegationCommitCheck
                 )
             }
             guard createIfNeeded else {
@@ -7551,12 +7857,23 @@ final class AgentModeViewModel: ObservableObject {
             )
             let hydrated = try await ensureSessionReady(tabID: createdTabID)
             await loadSessionFromDisk(for: hydrated)
-            applySpawnParentSessionID(
-                indexedParentSessionID ?? parentSessionID,
-                to: hydrated,
-                inheritWorktreeBindings: inheritWorktreeBindings
+            let createdTarget = MCPSessionTarget(
+                tabID: hydrated.tabID,
+                sessionID: sessionID,
+                origin: .createdForSessionResume
             )
-            return .init(tabID: hydrated.tabID, sessionID: sessionID, origin: .createdForSessionResume)
+            do {
+                try commitSpawnParentSessionID(
+                    indexedParentSessionID ?? parentSessionID,
+                    to: hydrated,
+                    inheritWorktreeBindings: inheritWorktreeBindings,
+                    delegationCommitCheck: delegationCommitCheck
+                )
+            } catch {
+                await mcpDiscardSessionTarget(createdTarget)
+                throw error
+            }
+            return createdTarget
         }
 
         if let tabID {
@@ -7564,6 +7881,9 @@ final class AgentModeViewModel: ObservableObject {
                 throw MCPError.invalidParams("Tab '\(tabID.uuidString)' was not found.")
             }
             let hydrated = try await ensureSessionReady(tabID: tabID)
+            // Check before an empty tab is bound, so a fresh identity is not mistaken for an
+            // existing parentless target.
+            try delegationCommitCheck()
             let resolvedSessionID: UUID?
             if createIfNeeded {
                 guard let installedSessionID = ensureSessionBoundToTab(hydrated) else {
@@ -7574,10 +7894,11 @@ final class AgentModeViewModel: ObservableObject {
                 resolvedSessionID = hydrated.activeAgentSessionID
             }
             if parentSessionID != nil {
-                applySpawnParentSessionID(
+                try commitSpawnParentSessionID(
                     parentSessionID,
                     to: hydrated,
-                    inheritWorktreeBindings: inheritWorktreeBindings
+                    inheritWorktreeBindings: inheritWorktreeBindings,
+                    delegationCommitCheck: {}
                 )
             }
             return .init(tabID: hydrated.tabID, sessionID: resolvedSessionID, origin: .existingTab)
@@ -7591,19 +7912,31 @@ final class AgentModeViewModel: ObservableObject {
         guard let createdSessionID = ensureSessionBoundToTab(hydrated) else {
             throw MCPError.invalidParams("The new tab could not be bound to an agent session.")
         }
-        applySpawnParentSessionID(
-            parentSessionID,
-            to: hydrated,
-            inheritWorktreeBindings: inheritWorktreeBindings
+        let createdTarget = MCPSessionTarget(
+            tabID: hydrated.tabID,
+            sessionID: createdSessionID,
+            origin: .createdNewTab
         )
-        return .init(tabID: hydrated.tabID, sessionID: createdSessionID, origin: .createdNewTab)
+        do {
+            try commitSpawnParentSessionID(
+                parentSessionID,
+                to: hydrated,
+                inheritWorktreeBindings: inheritWorktreeBindings,
+                delegationCommitCheck: delegationCommitCheck
+            )
+        } catch {
+            await mcpDiscardSessionTarget(createdTarget)
+            throw error
+        }
+        return createdTarget
     }
 
     private func mcpExistingSessionTarget(
         tabID: UUID,
         sessionID: UUID,
         parentSessionID: UUID?,
-        inheritWorktreeBindings: Bool
+        inheritWorktreeBindings: Bool,
+        delegationCommitCheck: () throws -> Void
     ) async throws -> MCPSessionTarget {
         let hydrated = try await ensureSessionReady(tabID: tabID)
         if hydrated.activeAgentSessionID != sessionID {
@@ -7619,10 +7952,11 @@ final class AgentModeViewModel: ObservableObject {
         }
         let resolvedSessionID = sessionID
         let indexedParentSessionID = ownerValidatedSessionIndex[resolvedSessionID]?.parentSessionID
-        applySpawnParentSessionID(
+        try commitSpawnParentSessionID(
             hydrated.parentSessionID ?? indexedParentSessionID ?? parentSessionID,
             to: hydrated,
-            inheritWorktreeBindings: inheritWorktreeBindings
+            inheritWorktreeBindings: inheritWorktreeBindings,
+            delegationCommitCheck: delegationCommitCheck
         )
         return .init(tabID: hydrated.tabID, sessionID: resolvedSessionID, origin: .existingSession)
     }
@@ -17149,7 +17483,8 @@ final class AgentModeViewModel: ObservableObject {
             agentKind: session.selectedAgent,
             taskLabelKind: session.mcpControlContext?.taskLabelKind,
             codeMapsDisabled: GlobalSettingsStore.shared.globalCodeMapsDisabled(),
-            sessionProfile: session.profile
+            sessionProfile: session.profile,
+            delegationAudience: mcpDelegationRunToolPolicy(for: session).promptAudience
         )
         return AgentMessage(systemPrompt: systemPrompt, userMessage: fullMessage, resumeSessionID: resumeSessionID)
     }
@@ -19984,7 +20319,9 @@ final class AgentModeViewModel: ObservableObject {
         destinationAgent: AgentProviderKind,
         destinationModelRaw: String,
         destinationReasoningEffortRaw: String?,
-        destinationOhMyPiThinkingSelections: OhMyPiThinkingSelections = .empty
+        destinationOhMyPiThinkingSelections: OhMyPiThinkingSelections = .empty,
+        delegationParentSessionID: UUID? = nil,
+        delegationCommitCheck: () throws -> Void = {}
     ) async throws -> UUID {
         guard let promptManager,
               let workspaceManager
@@ -20058,6 +20395,26 @@ final class AgentModeViewModel: ObservableObject {
         }
         // Branches never inherit source accounting; the destination starts its own identity.
         destSession.replaceUsageAccounting(nil)
+        // MCP forks re-check the requester and destination placement after the suspensions above,
+        // then record delegation lineage on the durable identity before any Oracle clone or
+        // payload is published. UI handoffs pass nil and stay parentless.
+        do {
+            try delegationCommitCheck()
+        } catch {
+            await promptManager.closeComposeTab(destTabID)
+            throw error
+        }
+        if let delegationParentSessionID {
+            applySpawnParentSessionID(
+                delegationParentSessionID,
+                to: destSession,
+                inheritWorktreeBindings: false
+            )
+            guard destSession.parentSessionID == delegationParentSessionID else {
+                await promptManager.closeComposeTab(destTabID)
+                throw PersistentBindingMutationError.staleTransition
+            }
+        }
 
         // 4) Clone only Oracle/chat sessions owned by the source Agent Mode session.
         //    The run ID stays nil until the destination's first explicit continuation.

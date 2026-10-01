@@ -857,6 +857,71 @@ final class AgentModeChatSwitchActivationTests: XCTestCase {
         }
     }
 
+    func testPrepareHandoffHeadlessPersistsDelegationParentOnlyWhenRequested() async throws {
+        try await withFixture { fixture in
+            let parentlessTabID = try await fixture.viewModel.prepareHandoffHeadless(
+                sourceTabID: fixture.tabAID,
+                upToItemID: nil,
+                destinationAgent: fixture.sessionA.selectedAgent,
+                destinationModelRaw: fixture.sessionA.selectedModelRaw,
+                destinationReasoningEffortRaw: fixture.sessionA.selectedReasoningEffortRaw
+            )
+            let parentlessSession = try XCTUnwrap(fixture.viewModel.sessions[parentlessTabID])
+            XCTAssertNil(parentlessSession.parentSessionID, "UI handoffs keep creating parentless destinations")
+
+            let parentedTabID = try await fixture.viewModel.prepareHandoffHeadless(
+                sourceTabID: fixture.tabAID,
+                upToItemID: nil,
+                destinationAgent: fixture.sessionA.selectedAgent,
+                destinationModelRaw: fixture.sessionA.selectedModelRaw,
+                destinationReasoningEffortRaw: fixture.sessionA.selectedReasoningEffortRaw,
+                delegationParentSessionID: fixture.sessionBID
+            )
+            let parentedSession = try XCTUnwrap(fixture.viewModel.sessions[parentedTabID])
+            let parentedSessionID = try XCTUnwrap(parentedSession.activeAgentSessionID)
+            XCTAssertEqual(parentedSession.parentSessionID, fixture.sessionBID)
+            XCTAssertEqual(
+                fixture.viewModel.mcpDelegationParentLookup(sessionID: parentedSessionID),
+                .parent(fixture.sessionBID)
+            )
+            XCTAssertNil(fixture.sessionA.parentSessionID, "The fork source keeps its own lineage")
+        }
+    }
+
+    func testPrepareHandoffHeadlessCommitCheckFailureClosesDestinationBeforeRecordingParent() async throws {
+        try await withFixture { fixture in
+            let workspaceTabIDsBefore = Set(fixture.window.workspaceManager.activeWorkspace?.composeTabs.map(\.id) ?? [])
+            struct StaleLineage: Error {}
+            var commitCheckCalls = 0
+            do {
+                _ = try await fixture.viewModel.prepareHandoffHeadless(
+                    sourceTabID: fixture.tabAID,
+                    upToItemID: nil,
+                    destinationAgent: fixture.sessionA.selectedAgent,
+                    destinationModelRaw: fixture.sessionA.selectedModelRaw,
+                    destinationReasoningEffortRaw: fixture.sessionA.selectedReasoningEffortRaw,
+                    delegationParentSessionID: fixture.sessionBID,
+                    delegationCommitCheck: {
+                        commitCheckCalls += 1
+                        throw StaleLineage()
+                    }
+                )
+                XCTFail("A failed delegation commit check must abort the fork")
+            } catch is StaleLineage {}
+
+            XCTAssertEqual(commitCheckCalls, 1)
+            XCTAssertFalse(
+                fixture.viewModel.sessions.values.contains { $0.parentSessionID == fixture.sessionBID },
+                "No destination may be recorded under the delegation parent"
+            )
+            XCTAssertEqual(
+                Set(fixture.window.workspaceManager.activeWorkspace?.composeTabs.map(\.id) ?? []),
+                workspaceTabIDsBefore,
+                "The destination tab is closed when the commit check fails"
+            )
+        }
+    }
+
     func testHandoffClonesOracleChatsIntoDestinationOwnershipAndPreservesFailClosedBoundaries() async throws {
         try await withFixture { fixture in
             let workspaceID = try XCTUnwrap(fixture.window.workspaceManager.activeWorkspace?.id)

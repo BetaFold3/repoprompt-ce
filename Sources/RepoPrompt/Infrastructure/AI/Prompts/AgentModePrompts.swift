@@ -10,24 +10,27 @@ import Foundation
 /// Identifies which delegation-tool surface an export-producing caller
 /// actually sees via `ListTools`. Drives which `oracle_export_path` /
 /// `oracle_export_instruction` handoff guidance (if any) should be
-/// emitted in prompts and tool descriptions.
+/// emitted in prompts. Tool descriptions (`ask_oracle`, `oracle_send`,
+/// `context_builder`) and tool-result export blocks stay capability-neutral
+/// and defer to the prompt, so they never name a delegation tool.
 ///
-/// Only one of `agentRunOnly` / `agentExploreOnly` / `both` should ever
-/// apply to a given caller — the MCP advertisement policy never exposes
-/// both tools simultaneously unless `allowsAgentExternalControlTools`
-/// is explicitly set for a non-explore sub-agent.
+/// Exactly one case applies to a given caller. For Agent Mode runs the
+/// bounded-delegation policy (`AgentDelegationPolicy.runToolPolicy`)
+/// selects it from the session's role and lineage depth.
 enum ExportDelegationAudience: Hashable {
-    /// Top-level RepoPrompt agent / external MCP client: sees
-    /// `agent_run` + `agent_manage`, does not see `agent_explore`.
+    /// Nil-role Agent Mode session that may delegate, or an external MCP
+    /// client: sees `agent_run` + `agent_manage`, not `agent_explore`.
     case agentRunOnly
-    /// Non-explore sub-agent (engineer / pair / design) without
-    /// orchestrator permission: sees `agent_explore` only.
+    /// Non-explore role (engineer / pair / design) without the
+    /// `allowsAgentExternalControlTools` advertisement exception: sees
+    /// `agent_explore` only. Legacy default for named-role prompts.
     case agentExploreOnly
-    /// Orchestrator sub-agent with `allowsAgentExternalControlTools`
-    /// enabled: sees both delegation tools. Rare.
+    /// Named non-explore role that may delegate under the bounded
+    /// delegation policy (depth 0 or 1): sees both delegation tools.
     case both
-    /// Caller has no delegation tools (explore sub-agents, discover
-    /// agents, delegate-edit agents). Guidance must be omitted.
+    /// Caller has no delegation tools (explore agents, sub-workers at
+    /// the delegation depth limit, unverifiable lineage, discover and
+    /// delegate-edit agents). Guidance must be omitted.
     case none
 }
 
@@ -110,11 +113,18 @@ enum AgentModePrompts {
     // MARK: - Engineer
 
     /// Builds an engineer agent prompt — precise execution, same structure as the standard
-    /// prompt but stripped of agent delegation and biased toward minimal, targeted changes.
+    /// prompt, biased toward minimal, targeted changes. `delegationAudience` selects the
+    /// delegation section (`.agentExploreOnly` keeps the legacy explore-probe section).
     static func engineerPrompt(
         agentKind: AgentProviderKind?,
-        codeMapsDisabled: Bool = false
+        codeMapsDisabled: Bool = false,
+        delegationAudience: ExportDelegationAudience = .agentExploreOnly
     ) -> String {
+        let delegationSection = Fragments.roleDelegationSection(
+            audience: delegationAudience,
+            includesResearchToolsNote: false
+        )
+        let delegationBlock = delegationSection.isEmpty ? "" : "\n\(delegationSection)\n"
         let readPolicy = Fragments.providerReadPolicy(agentKind: agentKind)
         let afterTask = Fragments.afterCompletingTask(
             agentKind: agentKind
@@ -167,13 +177,7 @@ enum AgentModePrompts {
         - `oracle_chat_log` - Recover conversation text after `ask_oracle op:"wait"` without IDs has collected owned undelivered operations
         \(Fragments.namedOracleConsultationGuidance)
         \(Fragments.oracleResumableWaitGuidance)
-
-        *Read-only Sub-agent Probes:*
-        - `agent_explore` - Launch/control short read-only explore child agents (`start`, `poll`, `wait`, `cancel` only; pass `messages` to start several probes in one call)
-        \(Fragments.agentExploreExportGuidance)
-
-        \(Fragments.agentExploreWhenToDispatchGuidance)
-
+        \(delegationBlock)
         *User Interaction:*
         - `ask_user` - Ask the user a question when you need clarification\(toolSuffix)
 
@@ -289,13 +293,13 @@ enum AgentModePrompts {
         // - `agentExploreExportGuidance`: caller sees `agent_explore`
         //   but not `agent_run` (non-explore sub-agent without
         //   orchestrator permission).
-        // - `agentBothExportGuidance`: rare orchestrator sub-agent that
-        //   sees both; currently unused by the prompt layer but kept
-        //   here so the advertisement/prompt story can grow in lockstep.
+        // - `agentBothExportGuidance`: named non-explore role that may
+        //   delegate under the bounded-delegation policy (depth 0 or 1)
+        //   and sees both; rendered by `roleDelegationSection(.both)`.
         //
         // Do NOT reference `agent_run` and `agent_explore` together in
-        // caller-facing copy outside of this fragment — the policy
-        // never exposes both simultaneously.
+        // caller-facing copy outside of the `.both` fragments — only that
+        // audience sees both tools.
 
         /// Guidance for callers that have `agent_run` (top-level agent
         /// surface / external MCP client). Never names `agent_explore`.
@@ -364,10 +368,9 @@ enum AgentModePrompts {
         **After a probe returns**, treat its summary as a report of what it intended to do, not a trace of what it actually saw. Spot-check load-bearing claims with your own `read_file` / `file_search` / `git` before acting on them — especially file:line references or "X doesn't exist" findings. If the answer is thin or ambiguous, dispatch a narrow follow-up probe rather than re-doing the investigation yourself.
         """
 
-        /// Guidance for rare orchestrator sub-agents that see both
-        /// delegation tools. Used only when the run policy has
-        /// explicitly opted into `allowsAgentExternalControlTools` for a
-        /// non-explore sub-agent.
+        /// Guidance for named non-explore roles that see both delegation
+        /// tools because the bounded-delegation run policy enabled
+        /// `allowsAgentExternalControlTools` (depth 0 or 1).
         static let agentBothExportGuidance = """
         - To hand the export to a delegated agent, include the returned \
         `oracle_export_path` inside the `message` / `messages` of your next \
@@ -377,6 +380,58 @@ enum AgentModePrompts {
         export at `<path>` with `read_file` …" sentence you can emit verbatim \
         at the head of that message.
         """
+
+        /// Bounded-delegation contract shown to callers that can still start agents.
+        static let boundedDelegationDepthNote = """
+        - Delegation depth is bounded (main → worker → sub-worker): agents started from a worker \
+        session are sub-workers, and sub-workers and explore agents cannot start or control other \
+        agents. Give every delegated task a self-contained brief.
+        """
+
+        /// Delegation section for named non-explore role prompts (engineer / pair / design).
+        /// `.agentExploreOnly` renders the legacy explore-probe section; `.none` (delegation
+        /// leaf) renders nothing, so no delegation tool or export-to-child guidance appears.
+        static func roleDelegationSection(
+            audience: ExportDelegationAudience,
+            includesResearchToolsNote: Bool
+        ) -> String {
+            let researchToolsNote = includesResearchToolsNote
+                ? "\n- Research/planning tools (`ask_oracle`, `context_builder` when available) stay in the current session and do not create another agent"
+                : ""
+            let agentExploreToolLine = "- `agent_explore` - Launch/control short read-only explore child agents (`start`, `poll`, `wait`, `cancel` only; pass `messages` to start several probes in one call)"
+            let agentRunToolLine = "- `agent_run` / `agent_manage` - Start, steer, wait on, and manage separate Agent Mode sessions (`model_id` roles: explore, engineer, pair, design)"
+            switch audience {
+            case .agentExploreOnly:
+                return """
+                *Read-only Sub-agent Probes:*
+                \(agentExploreToolLine)\(researchToolsNote)
+                \(agentExploreExportGuidance)
+
+                \(agentExploreWhenToDispatchGuidance)
+                """
+            case .both:
+                return """
+                *Agent Delegation:*
+                \(agentRunToolLine)
+                \(agentExploreToolLine)\(researchToolsNote)
+                \(boundedDelegationDepthNote)
+                \(agentBothExportGuidance)
+
+                \(agentExploreWhenToDispatchGuidance)
+                """
+            case .agentRunOnly:
+                return """
+                *Agent Delegation:*
+                \(agentRunToolLine)\(researchToolsNote)
+                \(boundedDelegationDepthNote)
+                \(agentRunExportGuidance)
+
+                \(agentRunExploreWhenToDispatchGuidance)
+                """
+            case .none:
+                return ""
+            }
+        }
 
         /// Convenience accessor: selects the appropriate export guidance
         /// fragment for a caller audience. Returns an empty string when

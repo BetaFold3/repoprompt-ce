@@ -13,6 +13,9 @@ struct AgentManageMCPToolService {
     let bindCurrentRequestToTab: (_ tabID: UUID, _ metadata: RequestMetadata) async throws -> Void
     let restrictDiscoveryToRoleLabels: @MainActor (_ workspaceID: UUID?) -> Bool
     let cursorParameterMetadataBuilder: CursorAgentParameterMetadataBuilder
+    /// Rejects a request that came from an Agent Mode run whose source tab could not be
+    /// resolved, so it is never mistaken for an external client outside the delegation ceiling.
+    var validateSpawnRouting: (_ metadata: RequestMetadata, _ sourceTabID: UUID?, _ operation: String) async throws -> Void = { _, _, _ in }
 
     init(
         toolName: String,
@@ -382,6 +385,24 @@ struct AgentManageMCPToolService {
         ])
     }
 
+    /// Session-addressed control or transcript reads (get_log, stop_session) from a delegated
+    /// worker are bounded like reactivation: a depth ≥ 1 caller may only address sessions strictly
+    /// deeper than itself. External and depth-0 callers are unchanged.
+    private func validateDelegatedControlTarget(
+        sessionID: UUID,
+        agentModeVM: AgentModeViewModel,
+        operation: String
+    ) async throws {
+        let metadata = await captureRequestMetadata()
+        let sourceTabID = await resolveSpawnSourceTabID(metadata)
+        try await validateSpawnRouting(metadata, sourceTabID, operation)
+        try agentModeVM.mcpValidateDelegationTarget(
+            sourceTabID: sourceTabID,
+            targetSessionID: sessionID,
+            operation: operation
+        )
+    }
+
     private func executeGetLog(args: [String: Value]) async throws -> Value {
         let sessionReference = try requireNonEmptyString(args["session_id"], name: "session_id")
         let targetWindow = try requireTargetWindow()
@@ -406,6 +427,11 @@ struct AgentManageMCPToolService {
             reference: sessionReference,
             workspace: workspace,
             agentModeVM: agentModeVM
+        )
+        try await validateDelegatedControlTarget(
+            sessionID: transcriptInfo.sessionID,
+            agentModeVM: agentModeVM,
+            operation: "agent_manage.get_log"
         )
         let totalTurns = transcriptInfo.transcript.turns.count
         var completedTurnCount = completedTurnCount(in: transcriptInfo.transcript)
@@ -577,6 +603,9 @@ struct AgentManageMCPToolService {
             throw MCPError.invalidParams("session_id must be a valid UUID.")
         }
 
+        let metadata = await captureRequestMetadata()
+        let requesterTabID = await resolveSpawnSourceTabID(metadata)
+        try await validateSpawnRouting(metadata, requesterTabID, "agent_manage.fork_session")
         let targetWindow = try requireTargetWindow()
         guard let workspace = targetWindow.workspaceManager.activeWorkspace else {
             throw MCPError.invalidParams("No active workspace available for agent_manage.fork_session.")
@@ -609,12 +638,36 @@ struct AgentManageMCPToolService {
             throw MCPError.invalidParams("up_to_item_id was not found in the session transcript.")
         }
 
+        // A fork creates a new session: gate the requesting agent like create/start, then place
+        // the destination in the delegation tree before it is published.
+        let requesterSessionID = try agentModeVM.mcpValidateAgentRunSpawnAllowed(sourceTabID: requesterTabID)
+        let destinationParentSessionID = try agentModeVM.mcpForkDestinationParentSessionID(
+            forkSourceSessionID: sessionInfo.sessionID,
+            requesterTabID: requesterTabID
+        )
+        let forkSourceSessionID = sessionInfo.sessionID
         let destinationTabID = try await agentModeVM.prepareHandoffHeadless(
             sourceTabID: sourceTabID,
             upToItemID: upToItemID,
             destinationAgent: destination.agent,
             destinationModelRaw: destination.modelRaw,
-            destinationReasoningEffortRaw: destination.reasoningEffortRaw
+            destinationReasoningEffortRaw: destination.reasoningEffortRaw,
+            delegationParentSessionID: destinationParentSessionID,
+            delegationCommitCheck: {
+                try agentModeVM.mcpRevalidateDelegationCommit(
+                    sourceTabID: requesterTabID,
+                    expectedCallerSessionID: requesterSessionID,
+                    operation: "agent_manage.fork_session"
+                )
+                guard try agentModeVM.mcpForkDestinationParentSessionID(
+                    forkSourceSessionID: forkSourceSessionID,
+                    requesterTabID: requesterTabID
+                ) == destinationParentSessionID else {
+                    throw MCPError.invalidParams(
+                        "agent_manage.fork_session: the delegation lineage changed while the fork was being prepared. Refusing to publish the fork; retry the call."
+                    )
+                }
+            }
         )
         guard let destinationSession = agentModeVM.session(for: destinationTabID, createIfNeeded: false),
               let destinationSessionID = destinationSession.activeAgentSessionID
@@ -694,8 +747,19 @@ struct AgentManageMCPToolService {
         let targetWindow = try requireTargetWindow()
         let agentModeVM = targetWindow.agentModeViewModel
         let sourceTabID = await resolveSpawnSourceTabID(metadata)
-        try agentModeVM.mcpValidateAgentRunSpawnAllowed(sourceTabID: sourceTabID)
+        try await validateSpawnRouting(metadata, sourceTabID, "agent_manage.create_session")
+        let admittedCallerSessionID = try agentModeVM.mcpValidateAgentRunSpawnAllowed(sourceTabID: sourceTabID)
         let spawnParentSessionID = await resolveSpawnParentSessionID(metadata, targetWindow)
+        // A routed Agent Mode caller must never degrade into an unparented root session.
+        if sourceTabID != nil, spawnParentSessionID == nil {
+            throw MCPError.invalidParams("agent_manage.create_session was routed from an Agent Mode run, but RepoPrompt could not resolve its parent Agent session. Refusing to create an unparented session; reconnect the agent MCP client or retry after the source session is active.")
+        }
+        try agentModeVM.mcpRequireAdmittedSpawnParent(
+            sourceTabID: sourceTabID,
+            admittedCallerSessionID: admittedCallerSessionID,
+            resolvedParentSessionID: spawnParentSessionID,
+            operation: "agent_manage.create_session"
+        )
         // create_session always creates a new session — default to the effective engineer role when model_id is omitted.
         // Validate selection before creating a target to avoid phantom sessions on bad model_id.
         let selection = try AgentMCPSelectionResolver.resolve(
@@ -711,7 +775,14 @@ struct AgentManageMCPToolService {
             createIfNeeded: true,
             sessionName: normalizedString(args["session_name"]),
             parentSessionID: spawnParentSessionID,
-            inheritWorktreeBindings: false
+            inheritWorktreeBindings: false,
+            delegationCommitCheck: {
+                try agentModeVM.mcpRevalidateDelegationCommit(
+                    sourceTabID: sourceTabID,
+                    expectedCallerSessionID: admittedCallerSessionID,
+                    operation: "agent_manage.create_session"
+                )
+            }
         )
         do {
             try await agentModeVM.mcpConfigureSession(
@@ -771,11 +842,23 @@ struct AgentManageMCPToolService {
         let sessionReference = try requireNonEmptyString(args["session_id"], name: "session_id")
         let agentModeVM = targetWindow.agentModeViewModel
         let sourceTabID = await resolveSpawnSourceTabID(metadata)
-        try agentModeVM.mcpValidateAgentRunSpawnAllowed(sourceTabID: sourceTabID)
+        try await validateSpawnRouting(metadata, sourceTabID, "agent_manage.resume_session")
+        let admittedCallerSessionID = try agentModeVM.mcpValidateAgentRunSpawnAllowed(sourceTabID: sourceTabID)
         let spawnParentSessionID = await resolveSpawnParentSessionID(metadata, targetWindow)
+        try agentModeVM.mcpRequireAdmittedSpawnParent(
+            sourceTabID: sourceTabID,
+            admittedCallerSessionID: admittedCallerSessionID,
+            resolvedParentSessionID: spawnParentSessionID,
+            operation: "agent_manage.resume_session"
+        )
         guard let sessionID = try await agentModeVM.mcpResolveSessionID(reference: sessionReference, workspace: workspace) else {
             throw MCPError.invalidParams("Session '\(sessionReference)' was not found in the active workspace.")
         }
+        try agentModeVM.mcpValidateDelegationTarget(
+            sourceTabID: sourceTabID,
+            targetSessionID: sessionID,
+            operation: "agent_manage.resume_session"
+        )
         let selection = try AgentMCPSelectionResolver.resolve(
             modelID: normalizedString(args["model_id"]),
             availability: targetWindow.apiSettingsViewModel.agentModeAvailabilityContext,
@@ -788,8 +871,27 @@ struct AgentManageMCPToolService {
             createIfNeeded: true,
             sessionName: nil,
             parentSessionID: spawnParentSessionID,
-            inheritWorktreeBindings: false
+            inheritWorktreeBindings: false,
+            delegationCommitCheck: {
+                try agentModeVM.mcpRevalidateDelegationCommit(
+                    sourceTabID: sourceTabID,
+                    expectedCallerSessionID: admittedCallerSessionID,
+                    targetSessionID: sessionID,
+                    operation: "agent_manage.resume_session"
+                )
+            }
         )
+        // Revalidate after hydration suspended the request: lineage observed above must still hold.
+        do {
+            try agentModeVM.mcpValidateDelegationTarget(
+                sourceTabID: sourceTabID,
+                targetSessionID: sessionID,
+                operation: "agent_manage.resume_session"
+            )
+        } catch {
+            await agentModeVM.mcpDiscardSessionTarget(target)
+            throw error
+        }
         let hadMatchingMCPControl = agentModeVM.session(for: target.tabID, createIfNeeded: false)?.mcpControlContext?.sessionID == sessionID
         do {
             // Resume adopts the live session's existing control registration. Re-registering the
@@ -851,6 +953,11 @@ struct AgentManageMCPToolService {
         guard let sessionID = try await agentModeVM.mcpResolveSessionID(reference: sessionReference, workspace: workspace) else {
             throw MCPError.invalidParams("Session '\(sessionReference)' was not found in the active workspace.")
         }
+        try await validateDelegatedControlTarget(
+            sessionID: sessionID,
+            agentModeVM: agentModeVM,
+            operation: "agent_manage.stop_session"
+        )
 
         let target: AgentModeViewModel.MCPSessionTarget
         do {
@@ -907,6 +1014,9 @@ struct AgentManageMCPToolService {
         guard !requestedIDs.isEmpty else {
             throw MCPError.invalidParams("cleanup_sessions: none of the provided session_ids are valid UUIDs.")
         }
+        let cleanupMetadata = await captureRequestMetadata()
+        let cleanupSourceTabID = await resolveSpawnSourceTabID(cleanupMetadata)
+        try await validateSpawnRouting(cleanupMetadata, cleanupSourceTabID, "agent_manage.cleanup_sessions")
 
         #if DEBUG
             let cleanupStartMS = AgentModePerfDiagnostics.timestampMSIfEnabled()
@@ -918,6 +1028,21 @@ struct AgentManageMCPToolService {
         var skippedSessions: [[String: Value]] = []
 
         for sessionID in requestedIDs {
+            // A delegated worker may only clean up sessions deeper than itself.
+            do {
+                try agentModeVM.mcpValidateDelegationTarget(
+                    sourceTabID: cleanupSourceTabID,
+                    targetSessionID: sessionID,
+                    operation: "agent_manage.cleanup_sessions"
+                )
+            } catch {
+                skippedSessions.append([
+                    "session_id": .string(sessionID.uuidString),
+                    "name": .string("Unknown"),
+                    "reason": .string("outside_delegation_scope")
+                ])
+                continue
+            }
             let candidate: CleanupSessionCandidate?
             if let liveSession = try agentModeVM.authoritativeLiveSession(for: sessionID) {
                 let snapshotStatus = agentModeVM.mcpSnapshot(for: liveSession)?.status

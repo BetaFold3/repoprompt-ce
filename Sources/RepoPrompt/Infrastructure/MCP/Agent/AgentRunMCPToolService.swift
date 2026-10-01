@@ -342,7 +342,7 @@ struct AgentRunMCPToolService {
         throw MCPError.internalError("agent_run.start Oracle launch-source resolution is not configured.")
     }
 
-    var validateSpawnRouting: (_ metadata: RequestMetadata, _ sourceTabID: UUID?) async throws -> Void = { _, _ in }
+    var validateSpawnRouting: (_ metadata: RequestMetadata, _ sourceTabID: UUID?, _ operation: String) async throws -> Void = { _, _, _ in }
     let resolveSpawnParentSessionID: (_ metadata: RequestMetadata, _ targetWindow: WindowState) async -> UUID?
     var resolveSpawnParentSessionIDFromSourceTabID: ((_ sourceTabID: UUID, _ targetWindow: WindowState) async -> UUID?)?
     let bindCurrentRequestToTab: (_ tabID: UUID, _ metadata: RequestMetadata) async throws -> Void
@@ -800,8 +800,15 @@ struct AgentRunMCPToolService {
                 "workflowName": workflow?.displayName ?? "nil"
             ])
         #endif
-        try await validateSpawnRouting(metadata, parentSourceTabID)
-        try agentModeVM.mcpValidateAgentRunSpawnAllowed(sourceTabID: parentSourceTabID)
+        try await validateSpawnRouting(metadata, parentSourceTabID, "agent_run.start")
+        let admittedCallerSessionID = try agentModeVM.mcpValidateAgentRunSpawnAllowed(sourceTabID: parentSourceTabID)
+        // An explicit tab may already hold a session; a delegated worker must not reactivate a
+        // shallower one (including adopting a parentless root) through start.
+        try agentModeVM.mcpValidateDelegationTarget(
+            sourceTabID: parentSourceTabID,
+            targetSessionID: resolvedTabID.flatMap { agentModeVM.mcpExistingSessionID(forTabID: $0) },
+            operation: "agent_run.start"
+        )
         let spawnParentSessionID: UUID? = if let parentSourceTabID,
                                              let resolveSpawnParentSessionIDFromSourceTabID
         {
@@ -825,6 +832,12 @@ struct AgentRunMCPToolService {
         if parentSourceTabID != nil, spawnParentSessionID == nil {
             throw MCPError.invalidParams("agent_run.start was routed from an Agent Mode run, but RepoPrompt could not resolve its parent Agent session. Refusing to create an unparented run; reconnect the agent MCP client or retry after the source session is active.")
         }
+        try agentModeVM.mcpRequireAdmittedSpawnParent(
+            sourceTabID: parentSourceTabID,
+            admittedCallerSessionID: admittedCallerSessionID,
+            resolvedParentSessionID: spawnParentSessionID,
+            operation: "agent_run.start"
+        )
 
         // Freeze the source before model validation or target creation. Later selection/worktree
         // mutations must not alter the child run's delegated review packaging.
@@ -881,7 +894,15 @@ struct AgentRunMCPToolService {
             parentSessionID: spawnParentSessionID,
             inheritWorktreeBindings: usesRoutedParentSource
                 ? false
-                : effectiveParentWorktreeInheritance
+                : effectiveParentWorktreeInheritance,
+            delegationCommitCheck: {
+                try agentModeVM.mcpRevalidateDelegationCommit(
+                    sourceTabID: parentSourceTabID,
+                    expectedCallerSessionID: admittedCallerSessionID,
+                    targetSessionID: resolvedTabID.flatMap { agentModeVM.mcpExistingSessionID(forTabID: $0) },
+                    operation: "agent_run.start"
+                )
+            }
         )
         guard let targetSessionID = target.sessionID else {
             await agentModeVM.mcpDiscardSessionTarget(target)
@@ -1794,10 +1815,72 @@ struct AgentRunMCPToolService {
         }
     #endif
 
+    struct DelegatedControlAdmission {
+        let sourceTabID: UUID?
+        let callerSessionID: UUID?
+    }
+
+    /// Session-addressed control (cancel, respond) from a delegated worker is bounded like
+    /// reactivation: a depth ≥ 1 caller may only act on sessions strictly deeper than itself, never
+    /// itself, an ancestor, a sibling, or a root. External and depth-0 callers are unchanged. The
+    /// returned admission freezes the caller identity for the mutation-boundary recheck.
+    @discardableResult
+    private func validateDelegatedControlTarget(
+        sessionID: UUID,
+        agentModeVM: AgentModeViewModel,
+        operation: String
+    ) async throws -> DelegatedControlAdmission {
+        let metadata = await captureRequestMetadata()
+        let sourceTabID = await resolveSpawnParentSourceTabID(metadata)
+        try await validateSpawnRouting(metadata, sourceTabID, operation)
+        let callerSessionID = try agentModeVM.mcpAdmitDelegationControl(
+            sourceTabID: sourceTabID,
+            targetSessionID: sessionID,
+            operation: operation
+        )
+        return DelegatedControlAdmission(sourceTabID: sourceTabID, callerSessionID: callerSessionID)
+    }
+
+    /// Cancellation mutation boundary: synchronously re-admits the frozen caller (identity,
+    /// eligibility, target scope) and re-resolves the live cancel target, then enters
+    /// `cancelAgentRun(target:)`, whose own guards also run before its first suspension.
+    private func cancelAfterDelegationRevalidation(
+        sessionID: UUID,
+        expectedRunID: UUID?,
+        admission: DelegatedControlAdmission,
+        agentModeVM: AgentModeViewModel
+    ) async throws {
+        try agentModeVM.mcpRevalidateDelegationCommit(
+            sourceTabID: admission.sourceTabID,
+            expectedCallerSessionID: admission.callerSessionID,
+            targetSessionID: sessionID,
+            operation: "agent_run.cancel"
+        )
+        guard let session = agentModeVM.mcpControlledSession(sessionID: sessionID), session.runState.isActive else {
+            throw MCPError.invalidParams("The run is not currently active and cannot be cancelled.")
+        }
+        let cancelTarget = agentModeVM.makeRunCancelTarget(tabID: session.tabID, session: session)
+        if let expectedRunID, cancelTarget.expectedRunID != expectedRunID {
+            throw MCPError.invalidParams(
+                "The requested run_id is not the current run for this session; refusing to cancel a different run."
+            )
+        }
+        guard await agentModeVM.cancelAgentRun(target: cancelTarget, completion: .terminalPublished) else {
+            throw MCPError.invalidParams(
+                "The requested run is no longer current; refusing to cancel a different run."
+            )
+        }
+    }
+
     private func executeCancel(args: [String: Value]) async throws -> Value {
         let targetWindow = try requireTargetWindow()
         let agentModeVM = resolvedAgentModeViewModel(targetWindow)
         let sessionID = try await resolveControlSessionID(args, targetWindow: targetWindow, agentModeVM: agentModeVM)
+        let controlAdmission = try await validateDelegatedControlTarget(
+            sessionID: sessionID,
+            agentModeVM: agentModeVM,
+            operation: "agent_run.cancel"
+        )
         let initialSnapshot = await currentSnapshot(sessionID: sessionID, agentModeVM: agentModeVM)
         let expectedRunID: UUID?
         if args["run_id"] != nil {
@@ -1831,25 +1914,12 @@ struct AgentRunMCPToolService {
             "cancelling",
             "Cancelling the agent run..."
         ) {
-            let cancelTarget = await MainActor.run {
-                guard let session = agentModeVM.mcpControlledSession(sessionID: sessionID), session.runState.isActive else {
-                    return nil as AgentRunCancelTarget?
-                }
-                return agentModeVM.makeRunCancelTarget(tabID: session.tabID, session: session)
-            }
-            guard let cancelTarget else {
-                throw MCPError.invalidParams("The run is not currently active and cannot be cancelled.")
-            }
-            if let expectedRunID, cancelTarget.expectedRunID != expectedRunID {
-                throw MCPError.invalidParams(
-                    "The requested run_id is not the current run for this session; refusing to cancel a different run."
-                )
-            }
-            guard await agentModeVM.cancelAgentRun(target: cancelTarget, completion: .terminalPublished) else {
-                throw MCPError.invalidParams(
-                    "The requested run is no longer current; refusing to cancel a different run."
-                )
-            }
+            try await cancelAfterDelegationRevalidation(
+                sessionID: sessionID,
+                expectedRunID: expectedRunID,
+                admission: controlAdmission,
+                agentModeVM: agentModeVM
+            )
             await Task.yield()
             return await currentSnapshot(sessionID: sessionID, agentModeVM: agentModeVM).toValue()
         }
@@ -1866,6 +1936,16 @@ struct AgentRunMCPToolService {
         let text = try resolveMessage(args["message"], name: "message")
         let workflow = try resolveWorkflow(args: args)
         let metadata = await captureRequestMetadata()
+
+        // Steering starts or redirects work: an Agent Mode caller must still be allowed to delegate,
+        // and a delegated worker may only steer sessions deeper than itself.
+        let steerSourceTabID = await resolveSpawnParentSourceTabID(metadata)
+        try await validateSpawnRouting(metadata, steerSourceTabID, "agent_run.steer")
+        let steerCallerSessionID = try agentModeVM.mcpAdmitDelegationControl(
+            sourceTabID: steerSourceTabID,
+            targetSessionID: sessionID,
+            operation: "agent_run.steer"
+        )
 
         // Plan §6.3/§6.4: resolve the frozen parent family and validate the active wait selection
         // before the steering mutation or any control-context reactivation, so an invalid explicit
@@ -1908,6 +1988,14 @@ struct AgentRunMCPToolService {
         let delivery: AgentModeViewModel.MCPInstructionDispatch
         let snapshot: AgentRunMCPSnapshot
         do {
+            // Control-context resolution may have suspended since admission: re-admit the caller
+            // and target synchronously before the steering instruction is dispatched.
+            try agentModeVM.mcpRevalidateDelegationCommit(
+                sourceTabID: steerSourceTabID,
+                expectedCallerSessionID: steerCallerSessionID,
+                targetSessionID: sessionID,
+                operation: "agent_run.steer"
+            )
             if resolution.session.runState.isActive {
                 delivery = try await dispatchSteerInstruction(
                     sessionID: sessionID,
@@ -2108,6 +2196,11 @@ struct AgentRunMCPToolService {
         let targetWindow = try requireTargetWindow()
         let agentModeVM = targetWindow.agentModeViewModel
         let sessionID = try await resolveControlSessionID(args, targetWindow: targetWindow, agentModeVM: agentModeVM)
+        try await validateDelegatedControlTarget(
+            sessionID: sessionID,
+            agentModeVM: agentModeVM,
+            operation: "agent_run.respond"
+        )
         let interactionID = try requireUUID(args["interaction_id"], name: "interaction_id")
         let workflow = try resolveWorkflow(args: args)
         let payload = try parseResponsePayload(args: args)

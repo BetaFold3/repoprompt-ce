@@ -10,7 +10,8 @@ extension MCPBootstrapLeaseSpec {
         agent: AgentProviderKind,
         sessionProfile: AgentSessionProfile = .standard,
         taskLabelKind: AgentModelCatalog.TaskLabelKind? = nil,
-        allowsAgentExternalControlTools: Bool = false
+        allowsAgentExternalControlTools: Bool = false,
+        additionalRestrictedTools: Set<String> = []
     ) -> MCPBootstrapLeaseSpec {
         MCPBootstrapLeaseSpec(
             runID: runID,
@@ -18,7 +19,9 @@ extension MCPBootstrapLeaseSpec {
             windowID: windowID,
             tabID: tabID,
             clientName: agent.mcpClientNameHint,
-            restrictedTools: AgentModeMCPToolPolicy.restrictedTools,
+            // Delegation-leaf restrictions are unioned, never substituted, so they hide and deny
+            // their tools even when grants or the advertisement flag would otherwise expose them.
+            restrictedTools: AgentModeMCPToolPolicy.restrictedTools.union(additionalRestrictedTools),
             additionalTools: AgentModeMCPPolicyInstaller.additionalTools(
                 for: agent,
                 sessionProfile: sessionProfile

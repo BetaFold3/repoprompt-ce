@@ -758,8 +758,12 @@ final class MCPServerViewModel: ObservableObject {
                     targetWindow: targetWindow
                 )
             },
-            validateSpawnRouting: { [self] metadata, sourceTabID in
-                try await validateAgentRunStartRouting(metadata: metadata, resolvedSourceTabID: sourceTabID)
+            validateSpawnRouting: { [self] metadata, sourceTabID, operation in
+                try await validateAgentRunStartRouting(
+                    metadata: metadata,
+                    resolvedSourceTabID: sourceTabID,
+                    operation: operation
+                )
             },
             resolveSpawnParentSessionID: { [self] metadata, targetWindow in
                 await resolveSpawnParentSessionID(metadata: metadata, targetWindow: targetWindow)
@@ -1075,7 +1079,7 @@ final class MCPServerViewModel: ObservableObject {
     }
 
     private var agentManageToolService: AgentManageMCPToolService {
-        AgentManageMCPToolService(
+        var service = AgentManageMCPToolService(
             toolName: MCPWindowToolName.agentManage,
             captureRequestMetadata: { [self] in await captureRequestMetadata() },
             requireTargetWindow: { [self] in try requireTargetWindow() },
@@ -1089,6 +1093,14 @@ final class MCPServerViewModel: ObservableObject {
                 try await bindCurrentRequestToTabIfPossible(tabID: tabID, metadata: metadata)
             }
         )
+        service.validateSpawnRouting = { [self] metadata, sourceTabID, operation in
+            try await validateAgentRunStartRouting(
+                metadata: metadata,
+                resolvedSourceTabID: sourceTabID,
+                operation: operation
+            )
+        }
+        return service
     }
 
     @Published private(set) var isRunning = false // overall status

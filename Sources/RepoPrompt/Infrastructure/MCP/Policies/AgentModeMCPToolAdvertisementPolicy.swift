@@ -39,7 +39,9 @@ enum AgentModeMCPToolAdvertisementPolicy {
     }()
 
     /// Tools hidden from non-explore role agents (engineer, pair, design) by default.
-    /// The run policy can opt back into agent_run/agent_manage for allowed orchestrator sessions.
+    /// The run policy's `allowsAgentExternalControlTools` flag (set by `AgentDelegationPolicy` for
+    /// depth-0/1 sessions) opts back into agent_run/agent_manage. The flag is advertisement-only,
+    /// not authorization: delegation leaves are denied through per-run `restrictedTools`.
     private static let nonExploreRoleHiddenTools: Set<String> = MCPToolCapabilities.toolNames(for: [.agentExternalControl])
 
     // MARK: - Public API

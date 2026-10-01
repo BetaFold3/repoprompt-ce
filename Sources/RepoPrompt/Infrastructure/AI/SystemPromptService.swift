@@ -673,9 +673,23 @@ class SystemPromptService {
         """
     }
 
+    /// `agent_run` delegation guidance for nil-role coding sessions that may still delegate.
+    private static func codingAgentDelegationGuidance(codexNativeDelegationGuidance: String) -> String {
+        """
+        Delegate with `agent_run` when a narrow, self-contained investigation would flood your context — web or documentation lookup, git archaeology, uncertain searches worth parallel probes, "how is X wired?" questions in unfamiliar code — or whenever the user asks for an agent by role; then use `agent_run`, not a substitute. model_id roles: explore for read-only probes, engineer for bounded implementation, pair for coupled multi-step work, design for architecture or critique work that produces a repository report under docs/reviews/, docs/designs/, or docs/analysis/. A user's explicit request for a design agent authorizes that report file; do not choose a design agent yourself for a read-only request — use the Oracle or an explore agent instead.\(codexNativeDelegationGuidance)
+
+        Make each delegated task self-contained: one specific question, where to look, and the output you want back. Fan out only independent probes with detach:true; continue other independent in-scope work while they run when there is any, otherwise wait. Then wait or poll on every returned session_id and respond to any pending interaction — never end your turn with an unattended session. When handing Oracle output to a delegated agent, request the export with export_response:true and place the returned oracle_export_instruction verbatim at the head of the delegated message.
+
+        Child-agent summaries are claims, not evidence. Spot-check load-bearing file:line references, absence claims, and recommendations with your own reads before acting on them. If a probe returns thin, steer that same session with one narrow follow-up rather than redoing the investigation.
+        """
+    }
+
+    /// - Parameter delegationAudience: `.none` renders the delegation-leaf variant (no
+    ///   `agent_run` guidance); every other audience keeps the `agent_run` delegation copy.
     private static func codingAgentPrompt(
         agentKind: AgentProviderKind?,
-        codeMapsDisabled: Bool
+        codeMapsDisabled: Bool,
+        delegationAudience: ExportDelegationAudience = .agentRunOnly
     ) -> String {
         let structureReadingGuidance = codeMapsDisabled
             ? "Use `get_file_tree` (mode:\"auto\") to orient and `file_search` to locate; Code Maps are globally disabled, so use targeted text reads instead of `get_code_structure`."
@@ -708,6 +722,9 @@ class SystemPromptService {
 
         Codex native `spawn_agent` children are separate from RepoPrompt-managed `agent_run` sessions: they do not appear in `agent_manage` and RepoPrompt cannot wait, steer, or permission them. Use `agent_run` whenever the child must remain visible and controllable through RepoPrompt.
         """ : ""
+        let delegationGuidance = delegationAudience == .none
+            ? "RepoPrompt agent delegation is not available in this session (delegation depth is bounded at main → worker → sub-worker); do the work directly."
+            : codingAgentDelegationGuidance(codexNativeDelegationGuidance: codexNativeDelegationGuidance)
 
         let prompt = """
         # RepoPrompt Coding Agent — System Prompt (vNext-rc2.1)
@@ -765,11 +782,7 @@ class SystemPromptService {
 
         Review triggers on risk, not file count: security, privacy, or auth boundaries; destructive migrations; concurrency or distributed state; public API or compatibility surfaces; architecture-wide behavior; or changes that are hard to validate directly. One review: apply in-scope findings, rerun affected validation, and don't loop again unless new risk appears or the user asks.
 
-        Delegate with `agent_run` when a narrow, self-contained investigation would flood your context — web or documentation lookup, git archaeology, uncertain searches worth parallel probes, "how is X wired?" questions in unfamiliar code — or whenever the user asks for an agent by role; then use `agent_run`, not a substitute. model_id roles: explore for read-only probes, engineer for bounded implementation, pair for coupled multi-step work, design for architecture or critique work that produces a repository report under docs/reviews/, docs/designs/, or docs/analysis/. A user's explicit request for a design agent authorizes that report file; do not choose a design agent yourself for a read-only request — use the Oracle or an explore agent instead.\(codexNativeDelegationGuidance)
-
-        Make each delegated task self-contained: one specific question, where to look, and the output you want back. Fan out only independent probes with detach:true; continue other independent in-scope work while they run when there is any, otherwise wait. Then wait or poll on every returned session_id and respond to any pending interaction — never end your turn with an unattended session. When handing Oracle output to a delegated agent, request the export with export_response:true and place the returned oracle_export_instruction verbatim at the head of the delegated message.
-
-        Child-agent summaries are claims, not evidence. Spot-check load-bearing file:line references, absence claims, and recommendations with your own reads before acting on them. If a probe returns thin, steer that same session with one narrow follow-up rather than redoing the investigation.
+        \(delegationGuidance)
 
         ## Validation and completion
 
@@ -787,11 +800,15 @@ class SystemPromptService {
     ///   - agentKind: Optional active agent kind to specialize provider-specific guidance
     ///   - taskLabelKind: Optional task label to select role-specific prompt variants
     ///   - sessionProfile: Stable top-level session profile selected before provider startup
+    ///   - delegationAudience: Delegation surface the run actually has (see
+    ///     `AgentDelegationPolicy.runToolPolicy`). `nil` keeps the legacy role-derived copy
+    ///     (`agent_run` for nil-role sessions, `agent_explore` for named roles).
     static func agentModePrompt(
         agentKind: AgentProviderKind? = nil,
         taskLabelKind: AgentModelCatalog.TaskLabelKind? = nil,
         codeMapsDisabled: Bool = false,
-        sessionProfile: AgentSessionProfile = .standard
+        sessionProfile: AgentSessionProfile = .standard,
+        delegationAudience: ExportDelegationAudience? = nil
     ) -> String {
         if sessionProfile == .knowledge {
             return AgentModePrompts.knowledgePrompt(agentKind: agentKind)
@@ -807,12 +824,14 @@ class SystemPromptService {
         case .engineer:
             return AgentModePrompts.engineerPrompt(
                 agentKind: agentKind,
-                codeMapsDisabled: codeMapsDisabled
+                codeMapsDisabled: codeMapsDisabled,
+                delegationAudience: delegationAudience ?? .agentExploreOnly
             )
         case nil:
             return codingAgentPrompt(
                 agentKind: agentKind,
-                codeMapsDisabled: codeMapsDisabled
+                codeMapsDisabled: codeMapsDisabled,
+                delegationAudience: delegationAudience ?? .agentRunOnly
             )
         case .pair, .design:
             break // Fall through to the standard non-explore role prompt
@@ -922,19 +941,25 @@ class SystemPromptService {
         - Keep updates direct and factual: usually 1-2 sentences, no filler.
         """
 
-        // Pair/design role sessions see `agent_explore`, not the top-level
-        // `agent_run` / `agent_manage` control plane.
-        let agentDelegationSection = """
-        *Read-only Sub-agent Probes:*
-        - `agent_explore` - Launch/control short read-only explore child agents (`start`, `poll`, `wait`, `cancel` only; pass `messages` to start several probes in one call)
-        - Research/planning tools (`ask_oracle`, `context_builder` when available) stay in the current session and do not create another agent
-        \(AgentModePrompts.Fragments.agentExploreExportGuidance.trimmingCharacters(in: .whitespacesAndNewlines))
-
-        \(AgentModePrompts.Fragments.agentExploreWhenToDispatchGuidance.trimmingCharacters(in: .whitespacesAndNewlines))
-        """
-        let agentDelegationFinalNote = """
-        - For read-only probes, use `agent_explore` rather than reaching for `context_builder` or unsupported agent control tools
-        """
+        // Pair/design role sessions see `agent_explore` by default; the bounded-delegation
+        // policy may add `agent_run` / `agent_manage` (`.both`) or remove all delegation
+        // tools (`.none`, delegation leaf).
+        let roleDelegationAudience = delegationAudience ?? .agentExploreOnly
+        let agentDelegationSection = AgentModePrompts.Fragments.roleDelegationSection(
+            audience: roleDelegationAudience,
+            includesResearchToolsNote: true
+        )
+        let agentDelegationBlock = agentDelegationSection.isEmpty ? "" : "\n\(agentDelegationSection)\n"
+        let agentDelegationFinalNote = switch roleDelegationAudience {
+        case .agentExploreOnly:
+            "\n- For read-only probes, use `agent_explore` rather than reaching for `context_builder` or unsupported agent control tools"
+        case .both:
+            "\n- For read-only probes, use `agent_explore`; use `agent_run` for heavier or steerable delegated work"
+        case .agentRunOnly:
+            "\n- For read-only probes, use `agent_run` with `model_id=\"explore\"` rather than reaching for `context_builder`"
+        case .none:
+            ""
+        }
 
         let prompt = """
         **Conversation Style**
@@ -964,9 +989,7 @@ class SystemPromptService {
         - `oracle_chat_log` - Recover conversation text after `ask_oracle op:"wait"` without IDs has collected owned undelivered operations
         \(AgentModePrompts.Fragments.namedOracleConsultationGuidance)
         \(AgentModePrompts.Fragments.oracleResumableWaitGuidance)
-
-        \(agentDelegationSection)
-
+        \(agentDelegationBlock)
         *User Interaction:*
         - `ask_user` - Ask the user a question when you need clarification\(setStatusInList)\(codexToolPriorityGuidance)\(progressUpdatesGuidance)
 
@@ -996,8 +1019,7 @@ class SystemPromptService {
         **Important Notes**
         - Always explore before editing unfamiliar code
         - For multi-file changes, work methodically file by file
-        - Prefer continuing Oracle chats (`ask_oracle` with `new_chat:false` and the chat's `chat_id`) unless a fresh thread is necessary; a continued chat keeps its own model preset
-        \(agentDelegationFinalNote)
+        - Prefer continuing Oracle chats (`ask_oracle` with `new_chat:false` and the chat's `chat_id`) unless a fresh thread is necessary; a continued chat keeps its own model preset\(agentDelegationFinalNote)
         - If something goes wrong, explain what happened and offer to fix it\(askForHelpNote)
         """
         return AgentModePrompts.Fragments.codexQualifiedToolReferences(prompt, agentKind: agentKind)

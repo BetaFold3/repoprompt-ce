@@ -3138,7 +3138,8 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         runID: UUID,
         sessionProfile: AgentSessionProfile = .standard,
         taskLabelKind: AgentModelCatalog.TaskLabelKind? = nil,
-        allowsAgentExternalControlTools: Bool = false
+        allowsAgentExternalControlTools: Bool = false,
+        additionalRestrictedTools: Set<String> = []
     ) -> MCPBootstrapLease? {
         guard shouldManageCodexTooling else { return nil }
         viewModel?.mcpBindPendingAgentRunOracleReviewContext(tabID: tabID, runID: runID)
@@ -3150,7 +3151,8 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             agent: .codexExec,
             sessionProfile: sessionProfile,
             taskLabelKind: taskLabelKind,
-            allowsAgentExternalControlTools: allowsAgentExternalControlTools
+            allowsAgentExternalControlTools: allowsAgentExternalControlTools,
+            additionalRestrictedTools: additionalRestrictedTools
         )
         return MCPBootstrapLease(
             spec: leaseSpec,
@@ -4164,13 +4166,16 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             && requiresTransportStart
         let shouldWaitForRouting = requiresTransportStart
         if shouldInstallPolicy {
-            let allowsAgentExternalControlTools = session.mcpControlContext != nil && session.parentSessionID == nil
+            // Codex installs MCP policy only at transport start, so a live thread keeps the
+            // delegation policy resolved here until its next transport start.
+            let delegationPolicy = viewModel?.mcpDelegationRunToolPolicy(for: session) ?? .leaf
             guard let lease = makeCodexRunLease(
                 tabID: session.tabID,
                 runID: runID,
                 sessionProfile: session.profile,
                 taskLabelKind: session.mcpControlContext?.taskLabelKind,
-                allowsAgentExternalControlTools: allowsAgentExternalControlTools
+                allowsAgentExternalControlTools: delegationPolicy.allowsAgentExternalControlTools,
+                additionalRestrictedTools: delegationPolicy.additionalRestrictedTools
             ) else { return }
             let acquired = await lease.acquire()
             guard acquired else { return }
@@ -4217,7 +4222,8 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             agentKind: .codexExec,
             taskLabelKind: session.mcpControlContext?.taskLabelKind,
             codeMapsDisabled: GlobalSettingsStore.shared.globalCodeMapsDisabled(),
-            sessionProfile: session.profile
+            sessionProfile: session.profile,
+            delegationAudience: (viewModel?.mcpDelegationRunToolPolicy(for: session) ?? .leaf).promptAudience
         )
         let resumeCandidate: CodexNativeSessionController.SessionRef? = {
             let threadID = session.codexConversationID?

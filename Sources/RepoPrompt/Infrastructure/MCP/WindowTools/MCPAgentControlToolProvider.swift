@@ -175,7 +175,7 @@ final class MCPAgentControlToolProvider: MCPWindowToolProviding {
 
             **Snapshot output notes**: `poll`/`wait` first report live control snapshots, then terminal snapshots retained by the short in-memory MCP cursor, then archived snapshots from the active workspace's hydrated session index. Archived/indexed snapshots do not have a live control handle; non-terminal indexed raw states such as `running`, `idle`, or `waitingForUser` are surfaced as `completed` so clients render them as archived/non-actionable, with the original raw state preserved in `status_text`. Sessions visible only from persisted disk metadata (for example, returned by `agent_manage.list_sessions` before or outside active workspace index hydration) may still poll as `expired`; use `agent_manage.get_log` for transcript catch-up when a listed session has no poll snapshot.
 
-            **Sub-agent spawning**: MCP-started `orchestrate` runs can dispatch sub-agents. Sub-agents cannot recursively start additional agent runs.
+            **Sub-agent spawning**: delegation depth is bounded (main → worker → sub-worker). Main sessions and non-explore workers they start can use `agent_run` / `agent_manage`; sub-workers started by a worker, and explore agents at any depth, cannot start or control other agents.
 
             **Parallel agents**: When launching multiple agents in parallel, always use `detach: true` so each `start` returns immediately without blocking. You can then `wait` or `poll` each `session_id` independently.
 

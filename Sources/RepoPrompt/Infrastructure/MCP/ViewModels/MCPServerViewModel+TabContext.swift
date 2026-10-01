@@ -2891,7 +2891,8 @@ extension MCPServerViewModel {
     @MainActor
     func validateAgentRunStartRouting(
         metadata: RequestMetadata,
-        resolvedSourceTabID: UUID?
+        resolvedSourceTabID: UUID?,
+        operation: String = "agent_run.start"
     ) async throws {
         guard resolvedSourceTabID == nil, let connectionID = metadata.connectionID else {
             return
@@ -2912,7 +2913,7 @@ extension MCPServerViewModel {
         ) else {
             return
         }
-        throw MCPError.invalidParams("agent_run.start was invoked from an Agent Mode run, but RepoPrompt could not resolve its run-scoped tab context. Refusing to create an unparented top-level run; reconnect the agent MCP client or retry after the run is routed.")
+        throw MCPError.invalidParams("\(operation) was invoked from an Agent Mode run, but RepoPrompt could not resolve its run-scoped tab context. Refusing to create an unparented top-level run; reconnect the agent MCP client or retry after the run is routed.")
     }
 
     @MainActor

@@ -15,6 +15,9 @@ final class AgentModeRunService {
         let claudeCoordinator: ClaudeAgentModeCoordinator
         let shouldManageCodexTooling: Bool
         let providerRuntimePermissionResolver: (_ agent: AgentProviderKind, _ profile: AgentProviderPermissionProfile) -> AgentProviderRuntimePermissionBinding
+        /// Bounded-delegation run policy (advertisement flag, leaf restrictions) for a session's
+        /// current role and lineage, resolved when the run's MCP lease is prepared.
+        let delegationRunToolPolicyResolver: (AgentModeViewModel.TabSession) -> AgentDelegationPolicy.RunToolPolicy
         /// Promotes an immutable launch review snapshot to the exact process run before its MCP
         /// bootstrap lease can expose nested tools.
         let bindPendingOracleReviewContext: (_ tabID: UUID, _ runID: UUID) -> Void
@@ -325,7 +328,7 @@ final class AgentModeRunService {
         let connectionPolicyInstaller = dependencies.connectionPolicyInstaller
         let expectedPIDPolicyArmer = dependencies.expectedPIDPolicyArmer
         let taskLabelKind = session.mcpControlContext?.taskLabelKind
-        let allowsAgentExternalControlTools = session.mcpControlContext != nil && session.parentSessionID == nil
+        let delegationPolicy = dependencies.delegationRunToolPolicyResolver(session)
         let makeLease: (_ runID: UUID) -> MCPBootstrapLease = { runID in
             self.dependencies.bindPendingOracleReviewContext(tabID, runID)
             let leaseSpec = MCPBootstrapLeaseSpec.agentMode(
@@ -336,7 +339,8 @@ final class AgentModeRunService {
                 agent: selectedAgent,
                 sessionProfile: session.profile,
                 taskLabelKind: taskLabelKind,
-                allowsAgentExternalControlTools: allowsAgentExternalControlTools
+                allowsAgentExternalControlTools: delegationPolicy.allowsAgentExternalControlTools,
+                additionalRestrictedTools: delegationPolicy.additionalRestrictedTools
             )
             let lease = MCPBootstrapLease(
                 spec: leaseSpec,

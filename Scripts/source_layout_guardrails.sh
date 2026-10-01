@@ -365,6 +365,7 @@ allowed_tracked_docs=(
   "docs/architecture/settings-persistence.md"
   "docs/architecture/source-layout.md"
   "docs/architecture/xcode-workspace.md"
+  "docs/context/agent-mcp-delegation-depth.md"
   "docs/context/archive/2026-07-30-AGENTS.md"
   "docs/context/archive/2026-07-30-CLAUDE.md"
   "docs/context/archive/MANIFEST.md"

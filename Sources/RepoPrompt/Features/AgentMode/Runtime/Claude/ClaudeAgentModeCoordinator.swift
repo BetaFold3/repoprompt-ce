@@ -2513,7 +2513,8 @@ final class ClaudeAgentModeCoordinator {
             agentKind: session.selectedAgent,
             taskLabelKind: session.mcpControlContext?.taskLabelKind,
             codeMapsDisabled: GlobalSettingsStore.shared.globalCodeMapsDisabled(),
-            sessionProfile: session.profile
+            sessionProfile: session.profile,
+            delegationAudience: (viewModel?.mcpDelegationRunToolPolicy(for: session) ?? .leaf).promptAudience
         )
     }
 

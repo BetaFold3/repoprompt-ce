@@ -212,6 +212,16 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
             throw XCTSkip("Persistent Agent Mode MCP socketpair integration requires DEBUG inspection helpers.")
         #endif
     }
+
+    func testSubWorkerLeaseDeniesRawDelegationToolCallsOnRetainedSocketWhileReadFileSucceeds() async throws {
+        #if DEBUG
+            try await withFixture(agentOwned: true, delegationSubWorker: true) { fixture in
+                try await runCheckpoint(fixture: fixture, scenario: .subWorkerDelegationDenial)
+            }
+        #else
+            throw XCTSkip("Persistent Agent Mode MCP socketpair integration requires DEBUG inspection helpers.")
+        #endif
+    }
 }
 
 #if DEBUG
@@ -237,13 +247,15 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
             case worktreeSearchPhysicalCoverage
             case threeRootFileToolScope
             case hiddenWorktreeReadSliceRebase
+            case subWorkerDelegationDenial
 
             var requiresSerialReadPrelude: Bool {
                 switch self {
                 case .agentOwnedNoRangeNonEmptyWorktreeFile, .agentOwnedSequentialReadUnion,
                      .manageSelectionGetCanonicalHandover, .worktreeCoverageCertificateRepeats,
                      .worktreeCoverageCertificatePersistenceBoundary, .worktreeCoverageCertificateFailClosed,
-                     .worktreeSearchPhysicalCoverage, .threeRootFileToolScope, .hiddenWorktreeReadSliceRebase:
+                     .worktreeSearchPhysicalCoverage, .threeRootFileToolScope, .hiddenWorktreeReadSliceRebase,
+                     .subWorkerDelegationDenial:
                     false
                 default:
                     true
@@ -255,12 +267,14 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
             agentOwned: Bool = false,
             inactiveAgentTab: Bool = false,
             gitBacked: Bool = false,
+            delegationSubWorker: Bool = false,
             _ operation: (Fixture) async throws -> Void
         ) async throws {
             let fixture = try await Fixture.make(
                 agentOwned: agentOwned,
                 inactiveAgentTab: inactiveAgentTab,
-                gitBacked: gitBacked
+                gitBacked: gitBacked,
+                delegationSubWorker: delegationSubWorker
             )
             do {
                 try await operation(fixture)
@@ -288,7 +302,7 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
             XCTAssertEqual(spec.purpose, .agentModeRun)
             XCTAssertTrue(spec.oneShot)
             XCTAssertTrue(spec.requiresExpectedAgentPID)
-            XCTAssertEqual(spec.restrictedTools, AgentModeMCPToolPolicy.restrictedTools)
+            XCTAssertEqual(spec.restrictedTools, fixture.expectedRestrictedTools)
             XCTAssertEqual(spec.additionalTools, AgentModeMCPPolicyInstaller.additionalTools(for: .codexExec))
 
             let pendingBeforeInitialize = await fixture.networkManager.debugPendingPolicySnapshot(
@@ -443,6 +457,8 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
                 try await assertThreeRootFileToolScope(fixture: fixture)
             case .hiddenWorktreeReadSliceRebase:
                 try await assertHiddenWorktreeReadSliceRebase(fixture: fixture)
+            case .subWorkerDelegationDenial:
+                try await assertSubWorkerDelegationDenial(fixture: fixture)
             }
         }
 
@@ -2471,6 +2487,96 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
             XCTAssertEqual(originalSelection?.slices, [:])
         }
 
+        /// Raw wire evidence that the depth-2 leaf lease derived by production lineage both hides
+        /// and denies every delegation tool on a real retained socket, while the same connection
+        /// keeps serving ordinary file tools.
+        func assertSubWorkerDelegationDenial(fixture: Fixture) async throws {
+            let chain = try XCTUnwrap(fixture.delegationChain)
+            let viewModel = fixture.window.agentModeViewModel
+            let delegationTools: Set<String> = [
+                MCPWindowToolName.agentRun,
+                MCPWindowToolName.agentManage,
+                MCPWindowToolName.agentExplore
+            ]
+
+            // Production derivation for the routed tab's own session: main -> worker -> sub-worker.
+            XCTAssertEqual(chain.subWorker.activeAgentSessionID, Fixture.agentSessionID)
+            XCTAssertEqual(chain.subWorker.mcpControlContext?.taskLabelKind, .pair)
+            XCTAssertEqual(viewModel.mcpDelegationLineage(sessionID: Fixture.delegationMainSessionID), .resolved(depth: 0))
+            XCTAssertEqual(viewModel.mcpDelegationLineage(sessionID: Fixture.delegationWorkerSessionID), .resolved(depth: 1))
+            XCTAssertEqual(viewModel.mcpDelegationLineage(for: chain.subWorker), .resolved(depth: 2))
+            XCTAssertEqual(chain.decision, .depthLimit(depth: 2))
+            XCTAssertEqual(chain.runToolPolicy, .leaf)
+            XCTAssertEqual(chain.runToolPolicy.additionalRestrictedTools, delegationTools)
+            XCTAssertTrue(AgentModeMCPToolPolicy.restrictedTools.isDisjoint(with: delegationTools))
+            XCTAssertEqual(fixture.spec.taskLabelKind, .pair)
+            XCTAssertFalse(fixture.spec.allowsAgentExternalControlTools)
+            XCTAssertEqual(fixture.spec.tabID, Fixture.tabID)
+            XCTAssertEqual(fixture.spec.runID, Fixture.runID)
+            XCTAssertEqual(fixture.spec.windowID, fixture.windowID)
+
+            // Exact run/tab/window identity and policy of the routed connection before any negative call.
+            let baseline = await fixture.retainedConnectionSnapshot()
+            Self.assertStableAgentModeSnapshot(baseline, fixture: fixture)
+            XCTAssertEqual(
+                baseline.connectionPolicy.restrictedTools,
+                AgentModeMCPToolPolicy.restrictedTools.union(delegationTools)
+            )
+            guard delegationTools.isSubset(of: baseline.connectionPolicy.restrictedTools),
+                  delegationTools.isSubset(of: baseline.runPolicy?.restrictedTools ?? [])
+            else {
+                // Never send raw delegation calls on a connection that is not leaf-restricted.
+                throw ClientFixtureError.delegationLeafPolicyNotApplied
+            }
+
+            let listResponse = try await fixture.socketClient.request(id: 3, method: "tools/list", params: [:])
+            let listed = try Set(Self.toolNames(from: listResponse, id: 3))
+            XCTAssertTrue(listed.contains(MCPWindowToolName.readFile))
+            XCTAssertTrue(listed.isDisjoint(with: delegationTools), "Advertised delegation tools: \(listed.intersection(delegationTools).sorted())")
+
+            let surfaceBefore = fixture.delegationSurface()
+            let rawCalls: [(id: Int, tool: String, arguments: [String: Any])] = [
+                (4, MCPWindowToolName.agentRun, ["op": "start", "message": "sub-worker delegation probe", "model_id": "engineer"]),
+                (5, MCPWindowToolName.agentManage, ["op": "create_session", "session_name": "sub-worker delegation probe"]),
+                (6, MCPWindowToolName.agentExplore, ["op": "start", "message": "sub-worker delegation probe"])
+            ]
+            for call in rawCalls {
+                let response = try await fixture.socketClient.request(
+                    id: call.id,
+                    method: "tools/call",
+                    params: ["name": call.tool, "arguments": call.arguments]
+                )
+                let object = try Self.responseObject(from: response, id: call.id)
+                let result = try XCTUnwrap(object["result"] as? [String: Any], call.tool)
+                XCTAssertEqual(result["isError"] as? Bool, true, call.tool)
+                let content = try XCTUnwrap(result["content"] as? [[String: Any]], call.tool)
+                XCTAssertEqual(
+                    content.compactMap { $0["text"] as? String },
+                    ["Tool '\(call.tool)' is disabled for this connection."],
+                    call.tool
+                )
+                XCTAssertEqual(fixture.delegationSurface(), surfaceBefore, "\(call.tool) changed sessions or tabs")
+                let current = await fixture.retainedConnectionSnapshot()
+                XCTAssertEqual(current, baseline, call.tool)
+            }
+
+            let readResponse = try await fixture.socketClient.request(
+                id: 7,
+                method: "tools/call",
+                params: [
+                    "name": MCPWindowToolName.readFile,
+                    "arguments": ["path": fixture.fileURL.path]
+                ]
+            )
+            let readText = try Self.readFileText(from: readResponse, id: 7)
+            XCTAssertTrue(readText.contains(Fixture.sentinelContent), readText)
+            await assertReadFileAutoSelectionSettled(fixture: fixture)
+            let afterRead = await fixture.retainedConnectionSnapshot()
+            XCTAssertEqual(afterRead, baseline)
+            XCTAssertEqual(fixture.delegationSurface(), surfaceBefore)
+            XCTAssertEqual(viewModel.mcpDelegationLineage(for: chain.subWorker), .resolved(depth: 2))
+        }
+
         func clearSelection(fixture: Fixture, id: Int) async throws {
             let response = try await fixture.socketClient.request(
                 id: id,
@@ -2564,7 +2670,7 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
             XCTAssertEqual(snapshot.peerPID, Int(getpid()))
             XCTAssertEqual(snapshot.runPurpose, .agentModeRun)
             XCTAssertEqual(snapshot.runID, Fixture.runID)
-            XCTAssertEqual(snapshot.connectionPolicy.restrictedTools, AgentModeMCPToolPolicy.restrictedTools)
+            XCTAssertEqual(snapshot.connectionPolicy.restrictedTools, fixture.expectedRestrictedTools)
             XCTAssertEqual(
                 snapshot.connectionPolicy.additionalTools,
                 AgentModeMCPPolicyInstaller.additionalTools(for: .codexExec)
@@ -2573,7 +2679,7 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
             XCTAssertEqual(snapshot.connectionPolicy.windowID, fixture.windowID)
             XCTAssertEqual(snapshot.runPolicy?.windowID, fixture.windowID)
             XCTAssertEqual(snapshot.runPolicy?.workspaceID, fixture.workspaceID)
-            XCTAssertEqual(snapshot.runPolicy?.restrictedTools, AgentModeMCPToolPolicy.restrictedTools)
+            XCTAssertEqual(snapshot.runPolicy?.restrictedTools, fixture.expectedRestrictedTools)
             XCTAssertEqual(
                 snapshot.runPolicy?.additionalTools,
                 AgentModeMCPPolicyInstaller.additionalTools(for: .codexExec)
@@ -2591,7 +2697,7 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
             XCTAssertEqual(snapshot.handshake.clientName, AgentProviderKind.codexMCPClientID)
             XCTAssertEqual(snapshot.handshake.admissionStatus, "ready")
             XCTAssertEqual(snapshot.handshake.policyApplicationCount, 1)
-            XCTAssertEqual(snapshot.handshake.appliedPolicy?.restrictedTools, AgentModeMCPToolPolicy.restrictedTools)
+            XCTAssertEqual(snapshot.handshake.appliedPolicy?.restrictedTools, fixture.expectedRestrictedTools)
             XCTAssertEqual(
                 snapshot.handshake.appliedPolicy?.additionalTools,
                 AgentModeMCPPolicyInstaller.additionalTools(for: .codexExec)
@@ -2613,8 +2719,8 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
             XCTAssertNil(object["error"])
         }
 
-        static func toolNames(from rawJSON: String) throws -> [String] {
-            let object = try responseObject(from: rawJSON, id: 2)
+        static func toolNames(from rawJSON: String, id: Int = 2) throws -> [String] {
+            let object = try responseObject(from: rawJSON, id: id)
             let result = try XCTUnwrap(object["result"] as? [String: Any])
             let tools = try XCTUnwrap(result["tools"] as? [[String: Any]])
             return tools.compactMap { $0["name"] as? String }
@@ -2726,6 +2832,10 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
         static let parentRunID = UUID(uuidString: "55555555-5555-4555-8555-555555555555")!
         static let parentConnectionID = UUID(uuidString: "66666666-6666-4666-8666-666666666666")!
         static let agentSessionID = UUID(uuidString: "77777777-7777-4777-8777-777777777777")!
+        static let delegationMainTabID = UUID(uuidString: "99999999-9999-4999-8999-999999999991")!
+        static let delegationMainSessionID = UUID(uuidString: "99999999-9999-4999-8999-999999999992")!
+        static let delegationWorkerTabID = UUID(uuidString: "99999999-9999-4999-8999-999999999993")!
+        static let delegationWorkerSessionID = UUID(uuidString: "99999999-9999-4999-8999-999999999994")!
         static let sessionToken = "persistent-agent-mode-read-file-checkpoint-session"
         static let parentSessionToken = "persistent-agent-mode-read-file-parent-session"
         static let sentinelContent = """
@@ -2774,6 +2884,8 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
         let lease: MCPBootstrapLease
         let agentOwned: Bool
         let gitBacked: Bool
+        /// Live main -> worker -> sub-worker lineage whose sub-worker is the routed fixture tab.
+        let delegationChain: DelegationChain?
         private var worktreeRootURL: URL?
         private var worktreeRootID: UUID?
         private var retiredWorktreeRootURLs: [URL] = []
@@ -2801,7 +2913,8 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
             spec: MCPBootstrapLeaseSpec,
             lease: MCPBootstrapLease,
             agentOwned: Bool,
-            gitBacked: Bool
+            gitBacked: Bool,
+            delegationChain: DelegationChain?
         ) {
             self.rootURL = rootURL
             self.fileURL = fileURL
@@ -2818,12 +2931,100 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
             self.lease = lease
             self.agentOwned = agentOwned
             self.gitBacked = gitBacked
+            self.delegationChain = delegationChain
+        }
+
+        struct DelegationChain {
+            let subWorker: AgentModeViewModel.TabSession
+            let decision: AgentDelegationPolicy.Decision
+            let runToolPolicy: AgentDelegationPolicy.RunToolPolicy
+        }
+
+        struct DelegationSurface: Equatable {
+            let composeTabIDs: Set<UUID>
+            let liveSessionTabIDs: Set<UUID>
+            let childSessionTabIDs: Set<UUID>
+        }
+
+        /// Base Agent Mode restrictions plus any leaf restrictions derived for the routed session.
+        var expectedRestrictedTools: Set<String> {
+            AgentModeMCPToolPolicy.restrictedTools.union(delegationChain?.runToolPolicy.additionalRestrictedTools ?? [])
+        }
+
+        func delegationSurface() -> DelegationSurface {
+            let sessions = window.agentModeViewModel.sessions
+            return DelegationSurface(
+                composeTabIDs: Set(window.workspaceManager.activeWorkspace?.composeTabs.map(\.id) ?? []),
+                liveSessionTabIDs: Set(sessions.keys),
+                childSessionTabIDs: Set(sessions.filter { $0.value.parentSessionID == Self.agentSessionID }.keys)
+            )
+        }
+
+        /// Hydrates the routed tab's live session as a named-role sub-worker under a live worker and main,
+        /// then derives its run policy through the production view-model lineage, exactly as
+        /// `AgentModeRunService` does when it prepares the run's MCP lease.
+        static func makeDelegationChain(in window: WindowState) throws -> DelegationChain {
+            let viewModel = window.agentModeViewModel
+            func hydrate(
+                tabID: UUID,
+                sessionID: UUID,
+                parentSessionID: UUID?,
+                role: AgentModelCatalog.TaskLabelKind?
+            ) throws -> AgentModeViewModel.TabSession {
+                let session = try XCTUnwrap(viewModel.session(for: tabID, createIfNeeded: true))
+                guard session.activeAgentSessionID == sessionID else {
+                    throw ClientFixtureError.delegationChainSeedFailed(tabID)
+                }
+                session.hasLoadedPersistedState = true
+                session.parentSessionID = parentSessionID
+                if parentSessionID != nil {
+                    session.mcpControlContext = AgentModeViewModel.AgentMCPControlContext(
+                        sessionID: sessionID,
+                        activationID: UUID(),
+                        registration: .init(sessionID: sessionID, generation: 0),
+                        currentEpoch: nil,
+                        preparedEpoch: nil,
+                        pendingEpochTransition: nil,
+                        originatingConnectionID: nil,
+                        interactionTransport: .mcp(sessionID: sessionID, originatingConnectionID: nil),
+                        suppressUserNotifications: true,
+                        forceAutoEditEnabled: false,
+                        autoEditEnabledBeforeOverride: false,
+                        taskLabelKind: role
+                    )
+                }
+                return session
+            }
+            _ = try hydrate(
+                tabID: delegationMainTabID,
+                sessionID: delegationMainSessionID,
+                parentSessionID: nil,
+                role: nil
+            )
+            _ = try hydrate(
+                tabID: delegationWorkerTabID,
+                sessionID: delegationWorkerSessionID,
+                parentSessionID: delegationMainSessionID,
+                role: .engineer
+            )
+            let subWorker = try hydrate(
+                tabID: tabID,
+                sessionID: agentSessionID,
+                parentSessionID: delegationWorkerSessionID,
+                role: .pair
+            )
+            return DelegationChain(
+                subWorker: subWorker,
+                decision: viewModel.mcpDelegationDecision(for: subWorker),
+                runToolPolicy: viewModel.mcpDelegationRunToolPolicy(for: subWorker)
+            )
         }
 
         static func make(
             agentOwned: Bool = false,
             inactiveAgentTab: Bool = false,
-            gitBacked: Bool = false
+            gitBacked: Bool = false,
+            delegationSubWorker: Bool = false
         ) async throws -> Fixture {
             let rootURL = FileManager.default.temporaryDirectory
                 .appendingPathComponent("PersistentAgentModeMCPReadFileConnectionTests", isDirectory: true)
@@ -2907,6 +3108,23 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
                 if inactiveAgentTab {
                     composeTabs.insert(
                         ComposeTabState(id: activeTabID, name: "Parent Active Tab"),
+                        at: 0
+                    )
+                }
+                if delegationSubWorker {
+                    composeTabs.insert(
+                        contentsOf: [
+                            ComposeTabState(
+                                id: delegationMainTabID,
+                                name: "Delegation Main",
+                                activeAgentSessionID: delegationMainSessionID
+                            ),
+                            ComposeTabState(
+                                id: delegationWorkerTabID,
+                                name: "Delegation Worker",
+                                activeAgentSessionID: delegationWorkerSessionID
+                            )
+                        ],
                         at: 0
                     )
                 }
@@ -3025,13 +3243,21 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
                     )
                 }
 
+                let delegationChain = try delegationSubWorker ? makeDelegationChain(in: window) : nil
+                let taskLabelKind: AgentModelCatalog.TaskLabelKind? = if let delegationChain {
+                    delegationChain.subWorker.mcpControlContext?.taskLabelKind
+                } else {
+                    agentOwned ? .pair : nil
+                }
                 let spec = MCPBootstrapLeaseSpec.agentMode(
                     tabID: tabID,
                     runID: runID,
                     gateID: gateID,
                     windowID: window.windowID,
                     agent: .codexExec,
-                    taskLabelKind: agentOwned ? .pair : nil
+                    taskLabelKind: taskLabelKind,
+                    allowsAgentExternalControlTools: delegationChain?.runToolPolicy.allowsAgentExternalControlTools ?? false,
+                    additionalRestrictedTools: delegationChain?.runToolPolicy.additionalRestrictedTools ?? []
                 )
                 let resolvedLease = MCPBootstrapLease(spec: spec)
                 lease = resolvedLease
@@ -3058,7 +3284,8 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
                     spec: spec,
                     lease: resolvedLease,
                     agentOwned: agentOwned,
-                    gitBacked: gitBacked
+                    gitBacked: gitBacked,
+                    delegationChain: delegationChain
                 )
             } catch {
                 await connectionManager?.stop()
@@ -3874,6 +4101,8 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
         case handoverPolicyApplicationFailed(String)
         case liveFixtureTooShort(Int)
         case presentationStateMismatch(String)
+        case delegationChainSeedFailed(UUID)
+        case delegationLeafPolicyNotApplied
     }
 
     private struct RetainedConnectionSnapshot: Equatable {

@@ -253,7 +253,16 @@ struct AgentExploreMCPToolService {
 
         let agentModeVM = targetWindow.agentModeViewModel
         let caller = try await resolveExploreCaller(metadata: metadata, agentModeVM: agentModeVM)
-        try agentModeVM.mcpValidateAgentRunSpawnAllowed(sourceTabID: caller.sourceTabID, isExploreOnly: true)
+        let admittedCallerSessionID = try agentModeVM.mcpValidateAgentRunSpawnAllowed(
+            sourceTabID: caller.sourceTabID,
+            isExploreOnly: true
+        )
+        try agentModeVM.mcpRequireAdmittedSpawnParent(
+            sourceTabID: caller.sourceTabID,
+            admittedCallerSessionID: admittedCallerSessionID,
+            resolvedParentSessionID: caller.sourceSessionID,
+            operation: "agent_explore.start"
+        )
 
         let selection = try AgentMCPSelectionResolver.resolve(
             modelID: nil,
@@ -287,7 +296,15 @@ struct AgentExploreMCPToolService {
                     createIfNeeded: true,
                     sessionName: nil,
                     parentSessionID: context.parentSessionID,
-                    inheritWorktreeBindings: inheritWorktreeBindings
+                    inheritWorktreeBindings: inheritWorktreeBindings,
+                    delegationCommitCheck: {
+                        try context.agentModeVM.mcpRevalidateDelegationCommit(
+                            sourceTabID: context.callerSourceTabID,
+                            expectedCallerSessionID: context.callerSessionID,
+                            isExploreOnly: true,
+                            operation: "agent_explore.start"
+                        )
+                    }
                 )
                 targets.append(target)
             }
