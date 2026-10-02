@@ -1,4 +1,5 @@
 import Foundation
+import MCP
 import XCTest
 @_spi(TestSupport) @testable import RepoPromptApp
 
@@ -148,13 +149,18 @@ final class AgentModeViewModelDelegatedQuestionTests: XCTestCase {
         let task = Task { try await vm.askUser(tabID: child.tabID, interaction: interaction) }
         try await waitUntil { child.session.pendingAskUser?.isAwaitingParentAgent == true }
 
+        // Idle (retaining its process run ID): not a tool-result destination yet.
+        XCTAssertFalse(vm.mcpHasDeliverableDelegatedQuestionNotices(parentRunID: runA, excludingChildSessionIDs: []))
+        XCTAssertEqual(vm.delegatedQuestionBannerRows(forParentTabID: parent.tabID).map(\.status), [.waitingForNextTurn])
+
+        startParentRun(parent, runID: runA)
         XCTAssertTrue(vm.mcpHasDeliverableDelegatedQuestionNotices(parentRunID: runA, excludingChildSessionIDs: []))
         XCTAssertFalse(
             vm.mcpHasDeliverableDelegatedQuestionNotices(parentRunID: runA, excludingChildSessionIDs: [child.sessionID]),
             "A wait already covering the asking child is not woken for it"
         )
         XCTAssertFalse(vm.mcpHasDeliverableDelegatedQuestionNotices(parentRunID: UUID(), excludingChildSessionIDs: []))
-        XCTAssertEqual(vm.delegatedQuestionBannerRows(forParentTabID: parent.tabID).map(\.status), [.waitingForNextTurn])
+        XCTAssertEqual(vm.delegatedQuestionBannerRows(forParentTabID: parent.tabID).map(\.status), [.awaitingNextToolResult])
         XCTAssertEqual(vm.delegatedQuestionSidebarAttentionBySessionID()[parent.sessionID]?.undeliveredChildQuestionCount, 1)
         XCTAssertEqual(vm.delegatedQuestionSidebarAttentionBySessionID()[child.sessionID]?.ownQuestion, .waitingOnParentAgent)
 
@@ -164,9 +170,11 @@ final class AgentModeViewModelDelegatedQuestionTests: XCTestCase {
 
         XCTAssertTrue(vm.mcpHandOffDelegatedQuestionNotices(parentRunID: runA, coveredKeys: []).isEmpty)
         XCTAssertFalse(vm.mcpHasDeliverableDelegatedQuestionNotices(parentRunID: runA, excludingChildSessionIDs: []))
-        // A provider that reuses its process run ID, or a later run, never sees an acknowledged notice again.
-        let runB = UUID()
-        parent.session.runID = runB
+        // A provider that reuses its process run ID for a new turn, or a later run, never sees an
+        // acknowledged notice again (plan §6.2: acknowledged at handoff, no automatic re-arm).
+        parent.session.beginRunAttempt(source: "test")
+        XCTAssertTrue(vm.mcpHandOffDelegatedQuestionNotices(parentRunID: runA, coveredKeys: []).isEmpty)
+        let runB = startParentRun(parent)
         XCTAssertTrue(vm.mcpHandOffDelegatedQuestionNotices(parentRunID: runB, coveredKeys: []).isEmpty)
         XCTAssertEqual(vm.delegatedQuestionBannerRows(forParentTabID: parent.tabID).map(\.status), [.delivered])
         XCTAssertEqual(vm.delegatedQuestionSidebarAttentionBySessionID()[parent.sessionID]?.pendingChildQuestionCount, 1)
@@ -183,8 +191,7 @@ final class AgentModeViewModelDelegatedQuestionTests: XCTestCase {
         let parent = makeSession(vm, parent: nil)
         let child = makeSession(vm, parent: parent.sessionID)
         vm.test_setMCPControlledTabIDs([child.tabID])
-        let runID = UUID()
-        parent.session.runID = runID
+        let runID = startParentRun(parent)
         let interaction = makeInteraction(timeoutSeconds: 60)
 
         let task = Task { try await vm.askUser(tabID: child.tabID, interaction: interaction) }
@@ -195,9 +202,110 @@ final class AgentModeViewModelDelegatedQuestionTests: XCTestCase {
         XCTAssertEqual(vm.delegatedQuestionNotices.records[key]?.acknowledged, true)
         XCTAssertEqual(vm.delegatedQuestionNotices.records[key]?.deliveredRunIDs, [runID])
         XCTAssertFalse(vm.mcpHasDeliverableDelegatedQuestionNotices(parentRunID: runID, excludingChildSessionIDs: []))
+        // The direct-commit path records the covered question once, as a persistence-only record.
+        XCTAssertTrue(noticeNotes(parent).isEmpty, "A covered question is never recorded as a delivered notice")
+        let records = coveredRecordNotes(parent)
+        XCTAssertEqual(records.count, 1)
+        XCTAssertTrue(records.first?.text.contains(interaction.id.uuidString) == true)
+        XCTAssertTrue(records.first?.text.contains("1. [id `choice`] Which option?") == true)
 
         vm.skipAskUser(tabID: child.tabID, interactionID: interaction.id)
         _ = try await task.value
+    }
+
+    func testCoveredSnapshotQuestionsPersistCompleteContentThroughStorageAndReload() async throws {
+        let vm = makeViewModel()
+        let parent = makeSession(vm, parent: nil)
+        let childA = makeSession(vm, parent: parent.sessionID)
+        let childB = makeSession(vm, parent: parent.sessionID)
+        let childC = makeSession(vm, parent: parent.sessionID)
+        vm.test_setMCPControlledTabIDs([childA.tabID, childB.tabID, childC.tabID])
+        let runID = startParentRun(parent)
+        let workspace = makeTemporaryWorkspace()
+        defer { try? FileManager.default.removeItem(at: try XCTUnwrap(workspace.customStoragePath)) }
+
+        // Single snapshot: `agent_run` returns the asking child's question itself.
+        let interactionA = makeDetailedInteraction(marker: "ALPHA")
+        let taskA = Task { try await vm.askUser(tabID: childA.tabID, interaction: interactionA) }
+        try await waitUntil { childA.session.pendingAskUser?.isAwaitingParentAgent == true }
+        let single = agentRunQuestionSnapshot(child: childA, interaction: interactionA)
+        let settledSingle = try await deliverAgentRunResult(single, vm: vm, parent: parent, runID: runID)
+        XCTAssertEqual(settledSingle, single, "A covered question never adds notice output to the returned result")
+
+        // Multi snapshot: one `agent_run` wait result carries two asking children.
+        let interactionB = makeDetailedInteraction(marker: "BRAVO")
+        let interactionC = makeDetailedInteraction(marker: "CHARLIE")
+        let taskB = Task { try await vm.askUser(tabID: childB.tabID, interaction: interactionB) }
+        try await waitUntil { childB.session.pendingAskUser?.isAwaitingParentAgent == true }
+        let taskC = Task { try await vm.askUser(tabID: childC.tabID, interaction: interactionC) }
+        try await waitUntil { childC.session.pendingAskUser?.isAwaitingParentAgent == true }
+        let multi: Value = .object([
+            "snapshots": .array([
+                agentRunQuestionSnapshot(child: childB, interaction: interactionB),
+                agentRunQuestionSnapshot(child: childC, interaction: interactionC)
+            ])
+        ])
+        let settledMulti = try await deliverAgentRunResult(multi, vm: vm, parent: parent, runID: runID)
+        XCTAssertEqual(settledMulti, multi, "Covered snapshots never add notice output to the returned result")
+
+        for (child, interaction) in [(childA, interactionA), (childB, interactionB), (childC, interactionC)] {
+            let key = AgentDelegatedQuestionNoticeKey(childSessionID: child.sessionID, interactionID: interaction.id)
+            XCTAssertEqual(vm.delegatedQuestionNotices.records[key]?.acknowledged, true)
+            XCTAssertEqual(vm.delegatedQuestionNotices.records[key]?.deliveredRunIDs, [runID])
+        }
+        XCTAssertTrue(noticeNotes(parent).isEmpty, "Covered questions are never duplicated as delivered-notice notes")
+        let inMemoryRecords = coveredRecordNotes(parent).map(\.text)
+        XCTAssertEqual(inMemoryRecords.count, 2, "One persistence-only record per delivered result")
+
+        // Actual storage path: canonical save (tool-result storage summaries), then reload.
+        let service = AgentSessionDataService.shared
+        let stored = AgentSession(
+            id: parent.sessionID,
+            workspaceID: workspace.id,
+            composeTabID: parent.tabID,
+            name: "Delegated Question Parent"
+        ).withItems(parent.session.items)
+        let fileURL = try await service.saveAgentSession(stored, for: workspace)
+        let reloadedItems = try await service.loadAgentSession(from: fileURL).items.map { $0.toItem() }
+
+        let reloadedRecords = reloadedItems.filter {
+            $0.kind == .system && $0.text.hasPrefix(AgentDelegatedQuestionNoticeWire.coveredRecordHeader)
+        }.map(\.text)
+        XCTAssertEqual(reloadedRecords, inMemoryRecords, "The records survive storage and reload verbatim")
+        XCTAssertFalse(reloadedItems.contains {
+            $0.kind == .system && $0.text.hasPrefix(AgentDelegatedQuestionNoticeWire.noticeHeader)
+        })
+        let recordA = try XCTUnwrap(reloadedRecords.first)
+        let recordBC = try XCTUnwrap(reloadedRecords.last)
+        for fragment in expectedQuestionFragments(child: childA, interaction: interactionA) {
+            XCTAssertTrue(recordA.contains(fragment), "Single-snapshot record lost: \(fragment)")
+        }
+        for (child, interaction) in [(childB, interactionB), (childC, interactionC)] {
+            for fragment in expectedQuestionFragments(child: child, interaction: interaction) {
+                XCTAssertTrue(recordBC.contains(fragment), "Multi-snapshot record lost: \(fragment)")
+            }
+        }
+        XCTAssertEqual(recordBC.components(separatedBy: AgentDelegatedQuestionNoticeWire.coveredRecordHeader).count - 1, 2)
+        // The storage summary of each `agent_run` result keeps only the interaction identity, so the
+        // complete question content survives only in the records.
+        for marker in ["ALPHA", "BRAVO", "CHARLIE"] {
+            let longContext = "Context \(marker): " + Self.longContextBody
+            let carriers = reloadedItems.filter {
+                $0.text.contains(longContext) || $0.toolResultJSON?.contains(longContext) == true
+            }
+            XCTAssertFalse(carriers.isEmpty, marker)
+            XCTAssertTrue(
+                carriers.allSatisfy { $0.kind == .system && $0.text.hasPrefix(AgentDelegatedQuestionNoticeWire.coveredRecordHeader) },
+                marker
+            )
+        }
+
+        for (child, interaction) in [(childA, interactionA), (childB, interactionB), (childC, interactionC)] {
+            vm.skipAskUser(tabID: child.tabID, interactionID: interaction.id)
+        }
+        _ = try await taskA.value
+        _ = try await taskB.value
+        _ = try await taskC.value
     }
 
     // MARK: - Idle parent: next turn's first input (§6.2)
@@ -219,8 +327,15 @@ final class AgentModeViewModelDelegatedQuestionTests: XCTestCase {
         XCTAssertTrue(staged.contains(interaction.id.uuidString))
         XCTAssertEqual(parent.session.items.count, itemCountBefore, "Staging never writes to the transcript or user text")
 
+        // Outcomes without this stage's identity never settle it.
+        let firstStage = try XCTUnwrap(vm.delegatedQuestionTurnStageID(forTabID: parent.tabID))
+        vm.recordDelegatedQuestionNoticeSendOutcome(for: parent.session, stageID: nil, didSend: true)
+        vm.recordDelegatedQuestionNoticeSendOutcome(for: parent.session, stageID: UUID(), didSend: true)
+        XCTAssertEqual(vm.delegatedQuestionTurnStageID(forTabID: parent.tabID), firstStage)
+        XCTAssertEqual(parent.session.items.count, itemCountBefore)
+
         // A failed send rolls the stage back; the notice stays deliverable.
-        vm.recordDelegatedQuestionNoticeSendOutcome(for: parent.session, didSend: false)
+        vm.recordDelegatedQuestionNoticeSendOutcome(for: parent.session, stageID: firstStage, didSend: false)
         XCTAssertTrue(vm.delegatedQuestionNotices.stagedTurnNoticesByParentTabID.isEmpty)
         XCTAssertEqual(parent.session.items.count, itemCountBefore)
         let key = AgentDelegatedQuestionNoticeKey(childSessionID: child.sessionID, interactionID: interaction.id)
@@ -229,12 +344,17 @@ final class AgentModeViewModelDelegatedQuestionTests: XCTestCase {
 
         let restaged = vm.stageDelegatedQuestionNoticesForTurnInput("next", session: parent.session)
         XCTAssertTrue(restaged.hasSuffix("\n\nnext"))
-        let runID = UUID()
-        parent.session.runID = runID
+        let restageID = try XCTUnwrap(vm.delegatedQuestionTurnStageID(forTabID: parent.tabID))
+        XCTAssertNotEqual(restageID, firstStage)
+        let runID = startParentRun(parent)
         // While staged, the tool-result path never double-delivers the same notice.
         XCTAssertTrue(vm.mcpHandOffDelegatedQuestionNotices(parentRunID: runID, coveredKeys: []).isEmpty)
+        // A late outcome of the superseded first stage never commits the newer stage.
+        vm.recordDelegatedQuestionNoticeSendOutcome(for: parent.session, stageID: firstStage, didSend: true)
+        XCTAssertEqual(vm.delegatedQuestionTurnStageID(forTabID: parent.tabID), restageID)
+        XCTAssertEqual(parent.session.items.count, itemCountBefore)
 
-        vm.recordDelegatedQuestionNoticeSendOutcome(for: parent.session, didSend: true)
+        vm.recordDelegatedQuestionNoticeSendOutcome(for: parent.session, stageID: restageID, didSend: true)
         XCTAssertEqual(parent.session.items.count, itemCountBefore + 1)
         let note = try XCTUnwrap(parent.session.items.last)
         XCTAssertEqual(note.kind, .system)
@@ -269,25 +389,30 @@ final class AgentModeViewModelDelegatedQuestionTests: XCTestCase {
         let parent = makeSession(vm, parent: nil)
         let child = makeSession(vm, parent: parent.sessionID)
         vm.test_setMCPControlledTabIDs([child.tabID])
-        let runID = UUID()
-        parent.session.runID = runID
-        parent.session.runState = .running
+        let runID = startParentRun(parent)
         let interaction = makeInteraction(timeoutSeconds: 60)
 
         let task = Task { try await vm.askUser(tabID: child.tabID, interaction: interaction) }
         try await waitUntil { child.session.pendingAskUser?.isAwaitingParentAgent == true }
         let key = AgentDelegatedQuestionNoticeKey(childSessionID: child.sessionID, interactionID: interaction.id)
+        let target = try XCTUnwrap(vm.mcpDelegatedQuestionDeliveryTarget(parentRunID: runID))
+        XCTAssertEqual(target.runAttemptID, parent.session.activeRunAttemptID)
 
-        let first = try XCTUnwrap(vm.mcpReserveDelegatedQuestionNotices(parentRunID: runID, coveredKeys: []))
+        let first = try XCTUnwrap(vm.mcpReserveDelegatedQuestionNotices(target: target, coveredKeys: []))
         XCTAssertEqual(first.payloads.map(\.key), [key])
         XCTAssertEqual(first.parentRunID, runID)
+        XCTAssertEqual(first.target, target)
         XCTAssertEqual(vm.delegatedQuestionNotices.records[key]?.acknowledged, false, "Reserving never acknowledges")
         XCTAssertEqual(vm.delegatedQuestionNotices.records[key]?.deliveredRunIDs, [])
         XCTAssertFalse(vm.mcpHasDeliverableDelegatedQuestionNotices(parentRunID: runID, excludingChildSessionIDs: []))
         XCTAssertNil(
-            vm.mcpReserveDelegatedQuestionNotices(parentRunID: runID, coveredKeys: []),
+            vm.mcpReserveDelegatedQuestionNotices(target: target, coveredKeys: []),
             "A concurrent result never carries a notice already reserved by another result"
         )
+        // A reserved notice is never also staged into a next-turn input.
+        XCTAssertEqual(vm.stageDelegatedQuestionNoticesForTurnInput("text", session: parent.session), "text")
+        XCTAssertNil(vm.delegatedQuestionTurnStageID(forTabID: parent.tabID))
+        XCTAssertNil(vm.delegatedQuestionNotices.records[key]?.stagedParentTabID)
 
         // Cancelled or failed before handoff: the notice is deliverable again to the same run.
         vm.mcpReleaseDelegatedQuestionNoticeReservation(first.id)
@@ -297,13 +422,13 @@ final class AgentModeViewModelDelegatedQuestionTests: XCTestCase {
         XCTAssertEqual(vm.delegatedQuestionBannerRows(forParentTabID: parent.tabID).map(\.status), [.awaitingNextToolResult])
 
         // Handed off: committed exactly once.
-        let second = try XCTUnwrap(vm.mcpReserveDelegatedQuestionNotices(parentRunID: runID, coveredKeys: []))
+        let second = try XCTUnwrap(vm.mcpReserveDelegatedQuestionNotices(target: target, coveredKeys: []))
         XCTAssertEqual(second.payloads.map(\.key), [key])
         vm.mcpCommitDelegatedQuestionNoticeReservation(second.id)
         XCTAssertEqual(vm.delegatedQuestionNotices.records[key]?.acknowledged, true)
         XCTAssertEqual(vm.delegatedQuestionNotices.records[key]?.deliveredRunIDs, [runID])
         XCTAssertTrue(vm.delegatedQuestionNotices.reservations.isEmpty)
-        XCTAssertNil(vm.mcpReserveDelegatedQuestionNotices(parentRunID: runID, coveredKeys: []))
+        XCTAssertNil(vm.mcpReserveDelegatedQuestionNotices(target: target, coveredKeys: []))
         // Late finishes of settled reservations are no-ops.
         vm.mcpReleaseDelegatedQuestionNoticeReservation(second.id)
         vm.mcpReleaseDelegatedQuestionNoticeReservation(first.id)
@@ -319,16 +444,15 @@ final class AgentModeViewModelDelegatedQuestionTests: XCTestCase {
         let parent = makeSession(vm, parent: nil)
         let child = makeSession(vm, parent: parent.sessionID)
         vm.test_setMCPControlledTabIDs([child.tabID])
-        let runID = UUID()
-        parent.session.runID = runID
-        parent.session.runState = .running
+        let runID = startParentRun(parent)
         let interaction = makeInteraction(timeoutSeconds: 60)
 
         let task = Task { try await vm.askUser(tabID: child.tabID, interaction: interaction) }
         try await waitUntil { child.session.pendingAskUser?.isAwaitingParentAgent == true }
         let key = AgentDelegatedQuestionNoticeKey(childSessionID: child.sessionID, interactionID: interaction.id)
+        let target = try XCTUnwrap(vm.mcpDelegatedQuestionDeliveryTarget(parentRunID: runID))
 
-        let stranded = try XCTUnwrap(vm.mcpReserveDelegatedQuestionNotices(parentRunID: runID, coveredKeys: []))
+        let stranded = try XCTUnwrap(vm.mcpReserveDelegatedQuestionNotices(target: target, coveredKeys: []))
         vm.reconcileDelegatedQuestionNotices(trigger: "test")
         XCTAssertNotNil(vm.delegatedQuestionNotices.records[key]?.reservationID, "An active run keeps its in-flight reservation")
 
@@ -341,7 +465,7 @@ final class AgentModeViewModelDelegatedQuestionTests: XCTestCase {
         XCTAssertEqual(vm.delegatedQuestionNotices.records[key]?.acknowledged, false, "A released reservation never commits later")
 
         parent.session.runState = .running
-        let pending = try XCTUnwrap(vm.mcpReserveDelegatedQuestionNotices(parentRunID: runID, coveredKeys: []))
+        let pending = try XCTUnwrap(vm.mcpReserveDelegatedQuestionNotices(target: target, coveredKeys: []))
         vm.skipAskUser(tabID: child.tabID, interactionID: interaction.id)
         _ = try await task.value
         XCTAssertNil(vm.delegatedQuestionNotices.records[key])
@@ -394,9 +518,7 @@ final class AgentModeViewModelDelegatedQuestionTests: XCTestCase {
         assertReleased(vm, key: key, parentTabID: parent.tabID)
 
         XCTAssertEqual(parent.session.items.count, itemCount, "Released stages never write a transcript note")
-        let nextRunID = UUID()
-        parent.session.runID = nextRunID
-        parent.session.runState = .running
+        let nextRunID = startParentRun(parent)
         XCTAssertEqual(
             vm.mcpHandOffDelegatedQuestionNotices(parentRunID: nextRunID, coveredKeys: []).map(\.key),
             [key],
@@ -407,6 +529,443 @@ final class AgentModeViewModelDelegatedQuestionTests: XCTestCase {
         _ = try await task.value
     }
 
+    func testCodexQueuedFallbackDropsTheReleasedStageBlockAndLaterDispatchCarriesNoStaleNotice() async throws {
+        for resolvesBeforeDispatch in [false, true] {
+            let controller = LifecycleNoopCodexController(recorder: LifecycleRecorder())
+            let vm = makeViewModel(codexController: controller)
+            let parent = makeSession(vm, parent: nil)
+            parent.session.selectedAgent = .codexExec
+            let child = makeSession(vm, parent: parent.sessionID)
+            vm.test_setMCPControlledTabIDs([child.tabID])
+            let interaction = makeInteraction(timeoutSeconds: 60)
+
+            let task = Task { try await vm.askUser(tabID: child.tabID, interaction: interaction) }
+            try await waitUntil { child.session.pendingAskUser?.isAwaitingParentAgent == true }
+            let key = AgentDelegatedQuestionNoticeKey(childSessionID: child.sessionID, interactionID: interaction.id)
+            XCTAssertFalse(parent.session.runState.isActive, "Precondition: an idle parent stages the notice")
+
+            // The parent's run becomes active (without an authoritative Codex turn) after the
+            // idle-turn stage was built and before the provider handoff, so Codex queues the staged
+            // input as a fallback instead of sending it.
+            let outcome = await vm.startAgentRun(
+                tabID: parent.tabID,
+                initialMessage: "user follow-up",
+                providerHandoffAuthorization: {
+                    parent.session.runID = UUID()
+                    parent.session.runState = .running
+                    parent.session.beginRunAttempt(source: "test.activeBeforeHandoff")
+                    return true
+                }
+            )
+            guard case let .queuedFallback(queueID, .activeWithoutAuthoritativeIdentity)? = outcome else {
+                XCTFail("Expected a queued Codex fallback, got \(String(describing: outcome))")
+                vm.skipAskUser(tabID: child.tabID, interactionID: interaction.id)
+                _ = try await task.value
+                return
+            }
+            // Codex session setup binds the run it starts the thread for; the queued entry carries it.
+            let runID = try XCTUnwrap(parent.session.runID)
+            XCTAssertEqual(parent.session.codexFallbackQueue.first?.originRunID, runID)
+
+            // The released stage's runtime block is gone from the queued copy; the user's text stays.
+            let entry = try XCTUnwrap(parent.session.codexFallbackQueue.first)
+            XCTAssertEqual(parent.session.codexFallbackQueue.map(\.id), [queueID])
+            let queuedText = entry.providerText
+            XCTAssertFalse(queuedText.contains(AgentDelegatedQuestionNoticeWire.runtimeNoticeTagName))
+            XCTAssertFalse(queuedText.contains(AgentDelegatedQuestionNoticeWire.noticeHeader))
+            XCTAssertFalse(queuedText.contains(interaction.id.uuidString))
+            XCTAssertTrue(queuedText.contains("user follow-up"))
+            XCTAssertEqual(entry.draftText, queuedText, "A queued fallback without composer context restores the same text")
+            assertReleased(vm, key: key, parentTabID: parent.tabID)
+            XCTAssertEqual(vm.delegatedQuestionNotices.records[key]?.deliveredRunIDs, [])
+            XCTAssertTrue(noticeNotes(parent).isEmpty, "A queued fallback never records the notice")
+            XCTAssertTrue(controller.sentTexts.isEmpty, "Precondition: nothing reached the provider yet")
+            XCTAssertTrue(vm.mcpHasDeliverableDelegatedQuestionNotices(parentRunID: runID, excludingChildSessionIDs: []))
+
+            if resolvesBeforeDispatch {
+                // The child's question resolves before the queued input is dispatched.
+                vm.skipAskUser(tabID: child.tabID, interactionID: interaction.id)
+                _ = try await task.value
+                XCTAssertNil(vm.delegatedQuestionNotices.records[key])
+            } else {
+                // An intervening tool result of the active run delivers the notice legitimately.
+                let target = try XCTUnwrap(vm.mcpDelegatedQuestionDeliveryTarget(parentRunID: runID))
+                let reservation = try XCTUnwrap(vm.mcpReserveDelegatedQuestionNotices(target: target, coveredKeys: []))
+                XCTAssertEqual(reservation.payloads.map(\.key), [key])
+                let original: Value = .object(["content": .string("tool body")])
+                let attached = try XCTUnwrap(AgentDelegatedQuestionNoticeWire.attaching(reservation.payloads, to: original))
+                let delivery = MCPToolResultDeliveryTransaction()
+                MCPServerViewModel.registerDelegatedQuestionNoticeParticipant(
+                    on: delivery,
+                    viewModel: vm,
+                    reservationID: reservation.id,
+                    attachedKeys: reservation.attachedKeys
+                )
+                let settled = await delivery.settle(attached, handOff: true)
+                XCTAssertEqual(settled, attached)
+                XCTAssertEqual(vm.delegatedQuestionNotices.records[key]?.deliveredRunIDs, [runID])
+                XCTAssertEqual(noticeNotes(parent).count, 1)
+            }
+
+            // Eventual dispatch of the queued input carries no stale or duplicate notice.
+            XCTAssertTrue(vm.test_codexCoordinator.test_claimCodexFallbackHead(
+                session: parent.session,
+                expectedQueueID: queueID,
+                beginsSuccessorAttempt: false
+            ))
+            await vm.test_codexCoordinator.test_dispatchClaimedCodexFallback(session: parent.session)
+            XCTAssertEqual(controller.sentTexts, [queuedText], "The dispatched input is exactly the queued text")
+            XCTAssertEqual(noticeNotes(parent).count, resolvesBeforeDispatch ? 0 : 1, "Dispatch never records a notice")
+            if !resolvesBeforeDispatch {
+                XCTAssertEqual(vm.delegatedQuestionNotices.records[key]?.acknowledged, true)
+                XCTAssertEqual(vm.delegatedQuestionNotices.records[key]?.deliveredRunIDs, [runID])
+                vm.skipAskUser(tabID: child.tabID, interactionID: interaction.id)
+                _ = try await task.value
+            }
+        }
+    }
+
+    // MARK: - Active run-attempt binding and final handoff settlement (§6.2)
+
+    func testIdleParentRetainingItsRunIDIsNeverADestinationAndWakesOncePerAttempt() async throws {
+        let vm = makeViewModel()
+        let parent = makeSession(vm, parent: nil)
+        let child = makeSession(vm, parent: parent.sessionID)
+        vm.test_setMCPControlledTabIDs([child.tabID])
+        // Claude keeps its process run ID while the parent is idle between turns.
+        let runID = UUID()
+        parent.session.runID = runID
+        let interaction = makeInteraction(timeoutSeconds: 60)
+
+        let task = Task { try await vm.askUser(tabID: child.tabID, interaction: interaction) }
+        try await waitUntil { child.session.pendingAskUser?.isAwaitingParentAgent == true }
+        let key = AgentDelegatedQuestionNoticeKey(childSessionID: child.sessionID, interactionID: interaction.id)
+
+        XCTAssertNil(vm.mcpDelegatedQuestionDeliveryTarget(parentRunID: runID))
+        XCTAssertFalse(vm.mcpHasDeliverableDelegatedQuestionNotices(parentRunID: runID, excludingChildSessionIDs: []))
+        XCTAssertTrue(vm.mcpHandOffDelegatedQuestionNotices(parentRunID: runID, coveredKeys: []).isEmpty)
+        XCTAssertEqual(vm.delegatedQuestionNotices.records[key]?.acknowledged, false)
+        XCTAssertEqual(vm.delegatedQuestionNotices.records[key]?.wokenRunAttemptIDs, [], "An idle parent is never woken")
+
+        // An active state without a run attempt is not a destination either.
+        parent.session.runState = .running
+        vm.reconcileDelegatedQuestionNotices(trigger: "test")
+        XCTAssertNil(vm.mcpDelegatedQuestionDeliveryTarget(parentRunID: runID))
+        XCTAssertEqual(vm.delegatedQuestionNotices.records[key]?.wokenRunAttemptIDs, [])
+
+        let firstAttempt = parent.session.beginRunAttempt(source: "test").attemptID
+        vm.reconcileDelegatedQuestionNotices(trigger: "test")
+        XCTAssertEqual(
+            vm.mcpDelegatedQuestionDeliveryTarget(parentRunID: runID),
+            AgentDelegatedQuestionDeliveryTarget(parentRunID: runID, runAttemptID: firstAttempt)
+        )
+        XCTAssertEqual(vm.delegatedQuestionNotices.records[key]?.wokenRunAttemptIDs, [firstAttempt])
+        vm.reconcileDelegatedQuestionNotices(trigger: "test")
+        XCTAssertEqual(vm.delegatedQuestionNotices.records[key]?.wokenRunAttemptIDs, [firstAttempt], "One wake per attempt")
+
+        // A new turn under the same process run ID is a new attempt: still undelivered, woken again.
+        let secondAttempt = parent.session.beginRunAttempt(source: "test").attemptID
+        vm.reconcileDelegatedQuestionNotices(trigger: "test")
+        XCTAssertEqual(vm.delegatedQuestionNotices.records[key]?.wokenRunAttemptIDs, [firstAttempt, secondAttempt])
+
+        vm.skipAskUser(tabID: child.tabID, interactionID: interaction.id)
+        _ = try await task.value
+    }
+
+    func testSettleForAReplacedAttemptStripsAndReleasesWhileTheCurrentAttemptCommits() async throws {
+        let vm = makeViewModel()
+        let parent = makeSession(vm, parent: nil)
+        let child = makeSession(vm, parent: parent.sessionID)
+        vm.test_setMCPControlledTabIDs([child.tabID])
+        let runID = startParentRun(parent)
+        let interaction = makeInteraction(timeoutSeconds: 60)
+
+        let task = Task { try await vm.askUser(tabID: child.tabID, interaction: interaction) }
+        try await waitUntil { child.session.pendingAskUser?.isAwaitingParentAgent == true }
+        let key = AgentDelegatedQuestionNoticeKey(childSessionID: child.sessionID, interactionID: interaction.id)
+        let original: Value = .object(["content": .string("body")])
+
+        let staleTarget = try XCTUnwrap(vm.mcpDelegatedQuestionDeliveryTarget(parentRunID: runID))
+        let stale = try XCTUnwrap(vm.mcpReserveDelegatedQuestionNotices(target: staleTarget, coveredKeys: []))
+        let staleValue = try XCTUnwrap(AgentDelegatedQuestionNoticeWire.attaching(stale.payloads, to: original))
+        // The parent's next turn begins under the same process run ID before the late result settles.
+        parent.session.beginRunAttempt(source: "test")
+
+        let settledStale = vm.mcpSettleDelegatedQuestionNoticeReservation(
+            stale.id, attachedKeys: stale.attachedKeys, value: staleValue, handOff: true
+        )
+        XCTAssertEqual(settledStale, original, "A result for a replaced attempt never carries the notice")
+        XCTAssertTrue(noticeNotes(parent).isEmpty, "A stripped notice is never recorded in the parent transcript")
+        XCTAssertEqual(vm.delegatedQuestionNotices.records[key]?.acknowledged, false)
+        XCTAssertEqual(vm.delegatedQuestionNotices.records[key]?.deliveredRunIDs, [])
+        XCTAssertNil(vm.delegatedQuestionNotices.records[key]?.reservationID)
+        XCTAssertTrue(vm.delegatedQuestionNotices.reservations.isEmpty)
+        XCTAssertNil(
+            vm.mcpReserveDelegatedQuestionNotices(target: staleTarget, coveredKeys: []),
+            "A target captured by an earlier attempt never reserves"
+        )
+        XCTAssertTrue(vm.mcpHasDeliverableDelegatedQuestionNotices(parentRunID: runID, excludingChildSessionIDs: []))
+
+        let currentTarget = try XCTUnwrap(vm.mcpDelegatedQuestionDeliveryTarget(parentRunID: runID))
+        XCTAssertNotEqual(currentTarget, staleTarget)
+        let current = try XCTUnwrap(vm.mcpReserveDelegatedQuestionNotices(target: currentTarget, coveredKeys: []))
+        let currentValue = try XCTUnwrap(AgentDelegatedQuestionNoticeWire.attaching(current.payloads, to: original))
+        let settledCurrent = vm.mcpSettleDelegatedQuestionNoticeReservation(
+            current.id, attachedKeys: current.attachedKeys, value: currentValue, handOff: true
+        )
+        XCTAssertEqual(settledCurrent, currentValue, "Committed notices are handed off unchanged")
+        XCTAssertEqual(vm.delegatedQuestionNotices.records[key]?.acknowledged, true)
+        XCTAssertEqual(vm.delegatedQuestionNotices.records[key]?.deliveredRunIDs, [runID])
+        // The commit step itself records exactly the handed-off notice text in the parent transcript.
+        XCTAssertEqual(
+            noticeNotes(parent).map(\.text),
+            try [XCTUnwrap(AgentDelegatedQuestionNoticeWire.renderedText(for: current.payloads))]
+        )
+        XCTAssertTrue(noticeNotes(parent).first?.text.contains(interaction.id.uuidString) == true)
+        // A second settle of the same reservation never hands the notice off again.
+        XCTAssertEqual(
+            vm.mcpSettleDelegatedQuestionNoticeReservation(
+                current.id, attachedKeys: current.attachedKeys, value: currentValue, handOff: true
+            ),
+            original
+        )
+        XCTAssertEqual(noticeNotes(parent).count, 1, "A second settle never records the notice again")
+
+        vm.skipAskUser(tabID: child.tabID, interactionID: interaction.id)
+        _ = try await task.value
+    }
+
+    func testCancelledSettleStripsAndReleasesAndResolutionBeforeHandoffStrips() async throws {
+        let vm = makeViewModel()
+        let parent = makeSession(vm, parent: nil)
+        let child = makeSession(vm, parent: parent.sessionID)
+        vm.test_setMCPControlledTabIDs([child.tabID])
+        let runID = startParentRun(parent)
+        let interaction = makeInteraction(timeoutSeconds: 60)
+
+        let task = Task { try await vm.askUser(tabID: child.tabID, interaction: interaction) }
+        try await waitUntil { child.session.pendingAskUser?.isAwaitingParentAgent == true }
+        let key = AgentDelegatedQuestionNoticeKey(childSessionID: child.sessionID, interactionID: interaction.id)
+        let target = try XCTUnwrap(vm.mcpDelegatedQuestionDeliveryTarget(parentRunID: runID))
+        let original: Value = .object(["content": .string("body")])
+
+        // Cancelled before the final handoff: never both returned and left pending.
+        let cancelled = try XCTUnwrap(vm.mcpReserveDelegatedQuestionNotices(target: target, coveredKeys: []))
+        let cancelledValue = try XCTUnwrap(AgentDelegatedQuestionNoticeWire.attaching(cancelled.payloads, to: original))
+        XCTAssertEqual(
+            vm.mcpSettleDelegatedQuestionNoticeReservation(
+                cancelled.id, attachedKeys: cancelled.attachedKeys, value: cancelledValue, handOff: false
+            ),
+            original
+        )
+        XCTAssertEqual(vm.delegatedQuestionNotices.records[key]?.acknowledged, false)
+        XCTAssertEqual(vm.delegatedQuestionNotices.records[key]?.deliveredRunIDs, [])
+        XCTAssertNil(vm.delegatedQuestionNotices.records[key]?.reservationID)
+        XCTAssertTrue(vm.delegatedQuestionNotices.reservations.isEmpty)
+        XCTAssertTrue(vm.mcpHasDeliverableDelegatedQuestionNotices(parentRunID: runID, excludingChildSessionIDs: []))
+        XCTAssertTrue(noticeNotes(parent).isEmpty, "A cancelled handoff never records the notice")
+        // A late abandon of the settled reservation changes nothing.
+        vm.mcpReleaseDelegatedQuestionNoticeReservation(cancelled.id)
+        XCTAssertEqual(vm.delegatedQuestionNotices.records[key]?.acknowledged, false)
+
+        // Resolved after reservation but before the final handoff: stripped, nothing acknowledged.
+        let resolved = try XCTUnwrap(vm.mcpReserveDelegatedQuestionNotices(target: target, coveredKeys: []))
+        let resolvedValue = try XCTUnwrap(AgentDelegatedQuestionNoticeWire.attaching(resolved.payloads, to: original))
+        vm.skipAskUser(tabID: child.tabID, interactionID: interaction.id)
+        _ = try await task.value
+        XCTAssertEqual(
+            vm.mcpSettleDelegatedQuestionNoticeReservation(
+                resolved.id, attachedKeys: resolved.attachedKeys, value: resolvedValue, handOff: true
+            ),
+            original
+        )
+        XCTAssertNil(vm.delegatedQuestionNotices.records[key])
+        XCTAssertTrue(vm.delegatedQuestionNotices.reservations.isEmpty)
+        XCTAssertTrue(noticeNotes(parent).isEmpty, "A notice resolved before the handoff is never recorded")
+    }
+
+    func testCancellationDuringTheMainActorSettlementHopStripsReleasesAndStaysRetryable() async throws {
+        let vm = makeViewModel()
+        let parent = makeSession(vm, parent: nil)
+        let child = makeSession(vm, parent: parent.sessionID)
+        vm.test_setMCPControlledTabIDs([child.tabID])
+        let runID = startParentRun(parent)
+        let interaction = makeInteraction(timeoutSeconds: 60)
+
+        let task = Task { try await vm.askUser(tabID: child.tabID, interaction: interaction) }
+        try await waitUntil { child.session.pendingAskUser?.isAwaitingParentAgent == true }
+        let key = AgentDelegatedQuestionNoticeKey(childSessionID: child.sessionID, interactionID: interaction.id)
+        let target = try XCTUnwrap(vm.mcpDelegatedQuestionDeliveryTarget(parentRunID: runID))
+        let original: Value = .object(["content": .string("body")])
+        let reservation = try XCTUnwrap(vm.mcpReserveDelegatedQuestionNotices(target: target, coveredKeys: []))
+        let attached = try XCTUnwrap(AgentDelegatedQuestionNoticeWire.attaching(reservation.payloads, to: original))
+
+        // A gate participant registered first holds settlement after the live handler sampled
+        // `handOff`, before the production participant's main-actor commit step runs.
+        let delivery = MCPToolResultDeliveryTransaction()
+        let gate = DelegatedQuestionSettlementGate()
+        delivery.register(
+            settle: { value, handOff in
+                await gate.hold(handOff: handOff)
+                return value
+            },
+            abandon: {}
+        )
+        MCPServerViewModel.registerDelegatedQuestionNoticeParticipant(
+            on: delivery,
+            viewModel: vm,
+            reservationID: reservation.id,
+            attachedKeys: reservation.attachedKeys
+        )
+        let handler = Task.detached { await delivery.settle(attached, handOff: !Task.isCancelled) }
+        let held = await gate.waitUntilHeld()
+        XCTAssertTrue(held, "Settlement must reach the gate")
+        let sampledHandOff = await gate.heldHandOff
+        XCTAssertEqual(sampledHandOff, true, "Precondition: the live handler requested a handoff")
+
+        // Cancelled after settlement was requested, before the commit step.
+        handler.cancel()
+        await gate.release()
+        let settled = await handler.value
+
+        XCTAssertEqual(settled, original, "A handler cancelled before the commit never carries the notice")
+        XCTAssertTrue(noticeNotes(parent).isEmpty, "A cancelled handoff never records the notice")
+        XCTAssertEqual(vm.delegatedQuestionNotices.records[key]?.acknowledged, false)
+        XCTAssertEqual(vm.delegatedQuestionNotices.records[key]?.deliveredRunIDs, [])
+        XCTAssertNil(vm.delegatedQuestionNotices.records[key]?.reservationID)
+        XCTAssertTrue(vm.delegatedQuestionNotices.reservations.isEmpty)
+        XCTAssertTrue(vm.mcpHasDeliverableDelegatedQuestionNotices(parentRunID: runID, excludingChildSessionIDs: []))
+
+        // Retryable: the next live result delivers and records it exactly once.
+        let retry = try XCTUnwrap(vm.mcpReserveDelegatedQuestionNotices(target: target, coveredKeys: []))
+        XCTAssertEqual(retry.payloads.map(\.key), [key])
+        let retryAttached = try XCTUnwrap(AgentDelegatedQuestionNoticeWire.attaching(retry.payloads, to: original))
+        let retryDelivery = MCPToolResultDeliveryTransaction()
+        MCPServerViewModel.registerDelegatedQuestionNoticeParticipant(
+            on: retryDelivery,
+            viewModel: vm,
+            reservationID: retry.id,
+            attachedKeys: retry.attachedKeys
+        )
+        let retried = await retryDelivery.settle(retryAttached, handOff: true)
+        XCTAssertEqual(retried, retryAttached)
+        XCTAssertEqual(vm.delegatedQuestionNotices.records[key]?.acknowledged, true)
+        XCTAssertEqual(vm.delegatedQuestionNotices.records[key]?.deliveredRunIDs, [runID])
+        XCTAssertEqual(
+            noticeNotes(parent).map(\.text),
+            try [XCTUnwrap(AgentDelegatedQuestionNoticeWire.renderedText(for: retry.payloads))]
+        )
+
+        vm.skipAskUser(tabID: child.tabID, interactionID: interaction.id)
+        _ = try await task.value
+    }
+
+    func testReconcileReleasesAReservationWhoseAttemptWasReplaced() async throws {
+        let vm = makeViewModel()
+        let parent = makeSession(vm, parent: nil)
+        let child = makeSession(vm, parent: parent.sessionID)
+        vm.test_setMCPControlledTabIDs([child.tabID])
+        let runID = startParentRun(parent)
+        let interaction = makeInteraction(timeoutSeconds: 60)
+
+        let task = Task { try await vm.askUser(tabID: child.tabID, interaction: interaction) }
+        try await waitUntil { child.session.pendingAskUser?.isAwaitingParentAgent == true }
+        let key = AgentDelegatedQuestionNoticeKey(childSessionID: child.sessionID, interactionID: interaction.id)
+        let target = try XCTUnwrap(vm.mcpDelegatedQuestionDeliveryTarget(parentRunID: runID))
+        _ = try XCTUnwrap(vm.mcpReserveDelegatedQuestionNotices(target: target, coveredKeys: []))
+
+        let nextAttempt = parent.session.beginRunAttempt(source: "test").attemptID
+        vm.reconcileDelegatedQuestionNotices(trigger: "test")
+        XCTAssertTrue(vm.delegatedQuestionNotices.reservations.isEmpty)
+        XCTAssertNil(vm.delegatedQuestionNotices.records[key]?.reservationID)
+        XCTAssertEqual(vm.delegatedQuestionNotices.records[key]?.acknowledged, false)
+        XCTAssertEqual(
+            vm.delegatedQuestionNotices.records[key]?.wokenRunAttemptIDs.contains(nextAttempt),
+            true,
+            "The released notice wakes the current attempt"
+        )
+
+        vm.skipAskUser(tabID: child.tabID, interactionID: interaction.id)
+        _ = try await task.value
+    }
+
+    // MARK: - Controller provenance fallback (§6.1)
+
+    func testMCPControlledRootWithoutAnOriginatingConnectionFallsBackToTheUser() async throws {
+        for installsControlContext in [false, true] {
+            let vm = makeViewModel()
+            let root = makeSession(vm, parent: nil, forceControlContext: installsControlContext)
+            vm.test_setMCPControlledTabIDs([root.tabID])
+            XCTAssertEqual(root.session.mcpControlContext != nil, installsControlContext)
+            XCTAssertNil(root.session.mcpControlContext?.originatingConnectionID)
+
+            XCTAssertEqual(vm.delegatedQuestionAudience(for: root.session, provenance: .unverified), .userFallback)
+            XCTAssertEqual(
+                vm.delegatedQuestionAudience(
+                    for: root.session,
+                    provenance: .init(verifiedNonAgentModeConnectionID: UUID())
+                ),
+                .userFallback,
+                "No verification can match a controller without a connection"
+            )
+
+            let interaction = makeInteraction(timeoutSeconds: 60)
+            let task = Task { try await vm.askUser(tabID: root.tabID, interaction: interaction) }
+            try await waitUntil { root.session.askUserContinuation != nil }
+            XCTAssertEqual(root.session.pendingAskUser?.delegatedRouting, .userFallback)
+            XCTAssertNotNil(root.session.pendingAskUser?.timeoutStartedAt, "The user's normal timeout runs")
+            XCTAssertTrue(vm.delegatedQuestionNotices.records.isEmpty)
+            XCTAssertEqual(vm.delegatedQuestionSidebarAttentionBySessionID()[root.sessionID]?.ownQuestion, .needsUserAnswer)
+
+            vm.skipAskUser(tabID: root.tabID, interactionID: interaction.id)
+            _ = try await task.value
+        }
+    }
+
+    // MARK: - Steer while asking (§6.1: routing is not debounced; a steer never toggles control)
+
+    func testParentSteerOfAnAskingChildIsRejectedAndKeepsParentRouting() async throws {
+        let vm = makeViewModel()
+        let parent = makeSession(vm, parent: nil)
+        let child = makeSession(vm, parent: parent.sessionID)
+        vm.test_setMCPControlledTabIDs([child.tabID])
+        startParentRun(parent)
+        let interaction = makeInteraction(timeoutSeconds: 60)
+
+        let task = Task { try await vm.askUser(tabID: child.tabID, interaction: interaction) }
+        try await waitUntil { child.session.pendingAskUser?.isAwaitingParentAgent == true }
+        let key = AgentDelegatedQuestionNoticeKey(childSessionID: child.sessionID, interactionID: interaction.id)
+
+        do {
+            _ = try await vm.mcpDispatchInstruction(
+                sessionID: child.sessionID,
+                text: "Use option B",
+                allowStartingRun: true
+            )
+            XCTFail("A steer while the child asks must be rejected in favor of agent_run respond")
+        } catch {
+            let message = "\(error) \(error.localizedDescription)"
+            XCTAssertTrue(message.contains("Use agent_run.respond instead"), message)
+        }
+        vm.reconcileDelegatedQuestionNotices(trigger: "test")
+        XCTAssertTrue(vm.isMCPControlled(tabID: child.tabID), "A rejected steer never toggles MCP control")
+        XCTAssertEqual(child.session.pendingAskUser?.interaction.id, interaction.id)
+        XCTAssertEqual(child.session.pendingAskUser?.delegatedRouting, .awaitingParentAgent)
+        XCTAssertNil(child.session.pendingAskUser?.timeoutStartedAt, "The paused timeout never starts")
+        XCTAssertEqual(vm.delegatedQuestionNotices.records[key]?.parentSessionID, parent.sessionID)
+
+        // The supported parent action still answers the question.
+        _ = try await vm.mcpResolvePendingInteraction(
+            sessionID: child.sessionID,
+            interactionID: interaction.id,
+            payload: parentAnswer("B"),
+            resolvedBy: "parent-agent"
+        )
+        let response = try await task.value
+        XCTAssertEqual(response.answersByQuestionID["choice"]?.answers, ["B"])
+        XCTAssertTrue(vm.delegatedQuestionNotices.records.isEmpty)
+    }
+
     // MARK: - Answer authority races (§6.7: existing first-wins paths, no new mechanism)
 
     func testUserAnswerInChildTabWinsOverALaterParentRespond() async throws {
@@ -414,8 +973,7 @@ final class AgentModeViewModelDelegatedQuestionTests: XCTestCase {
         let parent = makeSession(vm, parent: nil)
         let child = makeSession(vm, parent: parent.sessionID)
         vm.test_setMCPControlledTabIDs([child.tabID])
-        let runID = UUID()
-        parent.session.runID = runID
+        let runID = startParentRun(parent)
         let interaction = makeInteraction(timeoutSeconds: 60)
 
         let task = Task { try await vm.askUser(tabID: child.tabID, interaction: interaction) }
@@ -515,19 +1073,170 @@ final class AgentModeViewModelDelegatedQuestionTests: XCTestCase {
         let session: AgentModeViewModel.TabSession
     }
 
-    private func makeViewModel() -> AgentModeViewModel {
+    private func makeViewModel(codexController: LifecycleNoopCodexController? = nil) -> AgentModeViewModel {
         AgentModeViewModel(
             testWindowID: 1,
             testWorkspacePath: FileManager.default.currentDirectoryPath,
-            codexControllerFactory: { _, _, _, _, _, _ in LifecycleNoopCodexController(recorder: LifecycleRecorder()) }
+            codexControllerFactory: { _, _, _, _, _, _ in
+                codexController ?? LifecycleNoopCodexController(recorder: LifecycleRecorder())
+            }
         )
+    }
+
+    /// Delegated-question runtime notes recorded in the parent transcript.
+    private func noticeNotes(_ parent: LiveSession) -> [AgentChatItem] {
+        parent.session.items.filter {
+            $0.kind == .system && $0.text.hasPrefix(AgentDelegatedQuestionNoticeWire.noticeHeader)
+        }
+    }
+
+    /// Persistence-only records of covered questions recorded in the parent transcript.
+    private func coveredRecordNotes(_ parent: LiveSession) -> [AgentChatItem] {
+        parent.session.items.filter {
+            $0.kind == .system && $0.text.hasPrefix(AgentDelegatedQuestionNoticeWire.coveredRecordHeader)
+        }
+    }
+
+    /// Long text with no surrounding whitespace (rendering trims each field).
+    private static let longContextBody = String(
+        repeating: "Every tenant stays online during the migration, and rollback must finish within five minutes. ",
+        count: 30
+    ) + "End of constraints."
+
+    /// A question with long context, per-question context, described options, and constraints.
+    private func makeDetailedInteraction(marker: String) -> AgentAskUserInteraction {
+        AgentAskUserInteraction(
+            title: "Release plan \(marker)",
+            context: "Context \(marker): " + Self.longContextBody,
+            timeoutSeconds: 60,
+            questions: [
+                AgentAskUserQuestion(
+                    id: "strategy",
+                    header: "Strategy \(marker)",
+                    question: "Which rollout strategies should the child combine for \(marker)?",
+                    context: "Question context \(marker): " + Self.longContextBody,
+                    options: [
+                        AgentAskUserOption(
+                            label: "Canary \(marker)",
+                            description: "Ship to one percent first \(marker). " + Self.longContextBody
+                        ),
+                        AgentAskUserOption(label: "Blue-green \(marker)")
+                    ],
+                    allowsMultiple: true,
+                    allowsCustom: false
+                ),
+                AgentAskUserQuestion(id: "notes", question: "Any other constraints for \(marker)?")
+            ]
+        )
+    }
+
+    private func expectedQuestionFragments(child: LiveSession, interaction: AgentAskUserInteraction) -> [String] {
+        var fragments = [
+            child.sessionID.uuidString,
+            interaction.id.uuidString,
+            "Title: \(interaction.title ?? "")",
+            "Context: \(interaction.context ?? "")"
+        ]
+        for (index, question) in interaction.questions.enumerated() {
+            let header = question.header.map { "\($0): " } ?? ""
+            fragments.append("\(index + 1). [id `\(question.id)`] \(header)\(question.question)")
+            if let context = question.context {
+                fragments.append("   Context: \(context)")
+            }
+            for option in question.options {
+                fragments.append(option.description.map { "   - \(option.label) — \($0)" } ?? "   - \(option.label)")
+            }
+        }
+        fragments.append("   Selection: choose any number of options; custom answer not allowed")
+        fragments.append("   Selection: free-form answer; custom answer allowed")
+        return fragments
+    }
+
+    /// One `agent_run` snapshot of a child waiting on its `ask_user` question.
+    private func agentRunQuestionSnapshot(child: LiveSession, interaction: AgentAskUserInteraction) -> Value {
+        .object([
+            "session_id": .string(child.sessionID.uuidString),
+            "status": .string("waiting_for_input"),
+            "interaction": .object([
+                "id": .string(interaction.id.uuidString),
+                "kind": .string("question"),
+                "prompt": .string(interaction.title ?? ""),
+                "context": .string(interaction.context ?? ""),
+                "questions": .array(interaction.questions.map { question in
+                    .object([
+                        "id": .string(question.id),
+                        "question": .string(question.question),
+                        "context": .string(question.context ?? ""),
+                        "allows_multiple": .bool(question.allowsMultiple),
+                        "allows_custom": .bool(question.allowsCustom),
+                        "options": .array(question.options.map { option in
+                            .object([
+                                "label": .string(option.label),
+                                "description": .string(option.description ?? "")
+                            ])
+                        })
+                    ])
+                })
+            ])
+        ])
+    }
+
+    /// Production final-handoff path for one `agent_run` result: completion observers record the
+    /// unannotated result, then the delivery transaction settles the reservation.
+    private func deliverAgentRunResult(
+        _ value: Value,
+        vm: AgentModeViewModel,
+        parent: LiveSession,
+        runID: UUID
+    ) async throws -> Value {
+        let coveredKeys = AgentRunMCPToolService.coveredDelegatedQuestionNoticeKeys(in: value)
+        XCTAssertFalse(coveredKeys.isEmpty)
+        let target = try XCTUnwrap(vm.mcpDelegatedQuestionDeliveryTarget(parentRunID: runID))
+        let reservation = try XCTUnwrap(vm.mcpReserveDelegatedQuestionNotices(target: target, coveredKeys: coveredKeys))
+        XCTAssertTrue(reservation.payloads.isEmpty, "Covered questions are reserved without an attached payload")
+        let attached = AgentDelegatedQuestionNoticeWire.attaching(reservation.payloads, to: value) ?? value
+        let delivery = MCPToolResultDeliveryTransaction()
+        MCPServerViewModel.registerDelegatedQuestionNoticeParticipant(
+            on: delivery,
+            viewModel: vm,
+            reservationID: reservation.id,
+            attachedKeys: reservation.attachedKeys
+        )
+        let resultJSON = try XCTUnwrap(String(data: JSONEncoder().encode(delivery.unannotated(attached)), encoding: .utf8))
+        parent.session.appendItem(.toolResult(
+            name: MCPWindowToolName.agentRun,
+            resultJSON: resultJSON,
+            sequenceIndex: parent.session.nextSequenceIndex
+        ))
+        return await delivery.settle(attached, handOff: true)
+    }
+
+    private func makeTemporaryWorkspace() -> WorkspaceModel {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("AgentModeViewModelDelegatedQuestionTests", isDirectory: true)
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        return WorkspaceModel(
+            name: "Delegated Question Persistence",
+            repoPaths: ["/tmp/repo"],
+            customStoragePath: directory
+        )
+    }
+
+    /// Starts an active parent run attempt under `runID` (the delivery destination identity).
+    @discardableResult
+    private func startParentRun(_ parent: LiveSession, runID: UUID = UUID()) -> UUID {
+        parent.session.runID = runID
+        parent.session.runState = .running
+        parent.session.beginRunAttempt(source: "test")
+        return runID
     }
 
     private func makeSession(
         _ vm: AgentModeViewModel,
         parent: UUID?,
         controlled: Bool = true,
-        originatingConnectionID: UUID? = nil
+        originatingConnectionID: UUID? = nil,
+        forceControlContext: Bool = false
     ) -> LiveSession {
         let tabID = UUID()
         let sessionID = UUID()
@@ -535,7 +1244,7 @@ final class AgentModeViewModelDelegatedQuestionTests: XCTestCase {
         session.testInstallPersistentSessionBinding(sessionID: sessionID)
         session.parentSessionID = parent
         session.hasLoadedPersistedState = true
-        if controlled, parent != nil || originatingConnectionID != nil {
+        if controlled, parent != nil || originatingConnectionID != nil || forceControlContext {
             session.mcpControlContext = AgentModeViewModel.AgentMCPControlContext(
                 sessionID: sessionID,
                 activationID: UUID(),
@@ -605,5 +1314,34 @@ final class AgentModeViewModelDelegatedQuestionTests: XCTestCase {
             }
             try await Task.sleep(nanoseconds: 5_000_000)
         }
+    }
+}
+
+/// Holds a delivery transaction's settlement after the handler sampled `handOff`, so a test can
+/// cancel the handler between the settlement request and a later participant's commit step.
+private actor DelegatedQuestionSettlementGate {
+    private var continuation: CheckedContinuation<Void, Never>?
+    private var released = false
+    private(set) var heldHandOff: Bool?
+
+    func hold(handOff: Bool) async {
+        heldHandOff = handOff
+        guard !released else { return }
+        await withCheckedContinuation { continuation = $0 }
+    }
+
+    func waitUntilHeld(timeout: TimeInterval = 5) async -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if heldHandOff != nil { return true }
+            try? await Task.sleep(nanoseconds: 1_000_000)
+        }
+        return heldHandOff != nil
+    }
+
+    func release() {
+        released = true
+        continuation?.resume()
+        continuation = nil
     }
 }

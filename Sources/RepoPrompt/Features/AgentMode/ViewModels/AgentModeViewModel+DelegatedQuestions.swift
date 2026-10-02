@@ -1,4 +1,5 @@
 import Foundation
+import MCP
 
 // Delegated `ask_user` escalation (docs/context/plans/2026-10-02-oracle-errors-and-delegated-ask-user-plan.md §6;
 // owning contract: docs/context/agent-mcp-delegation-depth.md "Delegated questions").
@@ -9,8 +10,10 @@ import Foundation
 // agent learns about the question:
 // - parent blocked in a covering `agent_run` wait → existing actionable snapshot, acknowledged at handoff;
 // - parent blocked in another bounded wait → early wake (`delegatedQuestionPending`);
-// - parent busy → next eligible RepoPrompt MCP tool result (`MCPServerViewModel.runTool`);
-// - parent idle → banner/badge, then a labeled runtime block in the next turn's first input.
+// - parent busy → next eligible RepoPrompt MCP tool result (`MCPServerViewModel.runTool`), bound to
+//   the parent run attempt captured when that tool started and settled at the final handoff;
+// - parent idle → banner/badge, then a labeled runtime block in the next turn's first input,
+//   acknowledged only by that exact stage's provider submission outcome.
 // Nothing here starts a turn, steers, interrupts a tool, or answers a question.
 
 /// Runtime-only notice registry stored on `AgentModeViewModel` (never persisted).
@@ -29,8 +32,9 @@ struct AgentDelegatedQuestionNoticeRegistry {
         var acknowledged = false
         /// Parent tab whose next-turn input carries this notice while the send outcome is pending.
         var stagedParentTabID: UUID?
-        /// Parent runs already woken for this notice (wake de-duplication only; not a delivery).
-        var wokenRunIDs: Set<UUID> = []
+        /// Parent run attempts already woken for this notice (wake de-duplication only; not a
+        /// delivery). Keyed by attempt because a provider may keep its process run ID across turns.
+        var wokenRunAttemptIDs: Set<UUID> = []
         /// Tool-result handoff holding this notice while its result travels to the transport.
         /// Reserved notices are neither deliverable elsewhere nor acknowledged until the
         /// reservation commits (result handed off) or releases (cancelled/failed before handoff).
@@ -54,8 +58,15 @@ struct AgentDelegatedQuestionNoticeRegistry {
     }
 
     struct Reservation: Equatable {
-        let parentRunID: UUID
+        let target: AgentDelegatedQuestionDeliveryTarget
         let keys: Set<AgentDelegatedQuestionNoticeKey>
+        /// Keys already visible in the result itself (an `agent_run` question snapshot), reserved
+        /// without an attached payload. A commit records them as a persistence-only note.
+        var coveredKeys: Set<AgentDelegatedQuestionNoticeKey> = []
+
+        var parentRunID: UUID {
+            target.parentRunID
+        }
     }
 
     var records: [AgentDelegatedQuestionNoticeKey: Record] = [:]
@@ -77,17 +88,36 @@ struct AgentDelegatedQuestionNoticeRegistry {
     }
 }
 
+/// Parent run attempt a tool result is returned to, captured when the tool starts executing
+/// (plan §6.2). A result only delivers notices while this exact attempt is still the parent's
+/// active one: a process run ID alone cannot tell an earlier turn's late completion (Claude keeps
+/// its process run ID across turns) from the current turn.
+struct AgentDelegatedQuestionDeliveryTarget: Equatable, Hashable {
+    let parentRunID: UUID
+    let runAttemptID: UUID
+}
+
 /// One tool-result handoff of delegated-question notices (plan §6.2). The payloads are attached
-/// to exactly one result; the notices stay pending until the reservation commits (the result was
-/// handed to the transport) or releases (cancelled or failed before handoff).
+/// to exactly one result; the notices stay pending until the reservation settles at the final
+/// handoff (`mcpSettleDelegatedQuestionNoticeReservation`: revalidate, then commit or strip and
+/// release) or releases (the handler exited before handoff).
 struct AgentDelegatedQuestionNoticeReservation: Equatable {
     let id: UUID
-    let parentRunID: UUID
+    let target: AgentDelegatedQuestionDeliveryTarget
     /// Notices to attach to the result (empty when only covered keys were reserved).
     let payloads: [AgentDelegatedQuestionNoticePayload]
     /// Notices already visible in the result itself (an `agent_run` question snapshot);
     /// acknowledged on commit without duplicating their text.
     let coveredKeys: Set<AgentDelegatedQuestionNoticeKey>
+
+    var parentRunID: UUID {
+        target.parentRunID
+    }
+
+    /// Keys whose payloads are attached to the result under `delegated_question_notices`.
+    var attachedKeys: Set<AgentDelegatedQuestionNoticeKey> {
+        Set(payloads.map(\.key))
+    }
 }
 
 /// One parent-banner row per pending child question (plan §6.5). Never an answer surface.
@@ -315,13 +345,14 @@ extension AgentModeViewModel {
             changed = true
         }
         for (reservationID, reservation) in delegatedQuestionNotices.reservations {
-            // A tool-result handoff that can no longer reach its run (the run ended or changed, or
-            // every reserved question resolved) is released rather than left pending forever.
+            // A tool-result handoff that can no longer reach its run attempt (the run ended, or a
+            // new turn replaced the attempt, or every reserved question resolved) is released
+            // rather than left pending forever. Its final settlement then strips the notices.
             let holdsLiveRecord = reservation.keys.contains {
                 delegatedQuestionNotices.records[$0]?.reservationID == reservationID
             }
-            let runIsActive = delegatedQuestionParentSession(forRunID: reservation.parentRunID)?.runState.isActive == true
-            guard !holdsLiveRecord || !runIsActive else { continue }
+            let attemptIsCurrent = delegatedQuestionParentSession(for: reservation.target) != nil
+            guard !holdsLiveRecord || !attemptIsCurrent else { continue }
             delegatedQuestionNotices.reservations.removeValue(forKey: reservationID)
             releaseDelegatedQuestionReservationKeys(reservation, reservationID: reservationID)
             changed = true
@@ -395,10 +426,13 @@ extension AgentModeViewModel {
             }
     }
 
-    /// The live parent record whose active run is `runID` and whose identity is a notice parent.
+    /// The live parent record whose *active* run is `runID` and whose identity is a notice parent.
+    /// An idle parent that merely retains its process run ID (Claude) is never a destination.
     private func delegatedQuestionParentSession(forRunID runID: UUID) -> TabSession? {
         let matches = sessions.values.filter { $0.runID == runID && $0.remoteHost == nil }
         guard matches.count == 1, let parent = matches.first,
+              parent.runState.isActive,
+              parent.activeRunAttemptID != nil,
               let parentSessionID = parent.activeAgentSessionID,
               liveDelegatedQuestionParent(parentSessionID: parentSessionID) === parent
         else {
@@ -407,20 +441,32 @@ extension AgentModeViewModel {
         return parent
     }
 
+    /// The live parent whose active run and run attempt still match `target`.
+    private func delegatedQuestionParentSession(for target: AgentDelegatedQuestionDeliveryTarget) -> TabSession? {
+        guard let parent = delegatedQuestionParentSession(forRunID: target.parentRunID),
+              parent.activeRunAttemptID == target.runAttemptID
+        else {
+            return nil
+        }
+        return parent
+    }
+
     // MARK: - Wake (§6.2 "Wake early")
 
-    /// Wakes every bounded wait owned by a parent's active run once per (notice, run).
+    /// Wakes every bounded wait owned by a parent's active run once per (notice, run attempt).
     private func wakeParentsForDelegatedQuestionsIfNeeded() {
         var runIDsToWake = Set<UUID>()
         for (key, record) in delegatedQuestionNotices.records {
             guard let parent = liveDelegatedQuestionParent(parentSessionID: record.parentSessionID),
+                  parent.runState.isActive,
                   let runID = parent.runID,
+                  let runAttemptID = parent.activeRunAttemptID,
                   delegatedQuestionNotices.isDeliverable(record, toRunID: runID),
-                  !record.wokenRunIDs.contains(runID)
+                  !record.wokenRunAttemptIDs.contains(runAttemptID)
             else {
                 continue
             }
-            delegatedQuestionNotices.records[key]?.wokenRunIDs.insert(runID)
+            delegatedQuestionNotices.records[key]?.wokenRunAttemptIDs.insert(runAttemptID)
             runIDsToWake.insert(runID)
         }
         for runID in runIDsToWake {
@@ -432,6 +478,19 @@ extension AgentModeViewModel {
     }
 
     // MARK: - MCP handoff API (called by MCPServerViewModel / AgentRunMCPToolService)
+
+    /// Captures the parent run attempt that a tool executing for `parentRunID` returns its result
+    /// to (plan §6.2). Nil unless `parentRunID` is the active run of a live notice parent. Callers
+    /// capture this when the tool starts, so a result completing after its turn ended (or after a
+    /// new turn began under a reused process run ID) can never deliver a notice.
+    func mcpDelegatedQuestionDeliveryTarget(parentRunID: UUID) -> AgentDelegatedQuestionDeliveryTarget? {
+        guard let parent = delegatedQuestionParentSession(forRunID: parentRunID),
+              let runAttemptID = parent.activeRunAttemptID
+        else {
+            return nil
+        }
+        return AgentDelegatedQuestionDeliveryTarget(parentRunID: parentRunID, runAttemptID: runAttemptID)
+    }
 
     /// True when a pending child question addressed to the parent whose active run is
     /// `parentRunID` has not been delivered to (or acknowledged by) that run. Children in
@@ -454,22 +513,24 @@ extension AgentModeViewModel {
         }
     }
 
-    /// Reserves the notices for one tool result being returned to `parentRunID` (plan §6.2).
-    /// Revalidates the parent run and each pending interaction immediately before handoff.
-    /// `coveredKeys` (questions already visible in the result) are reserved without a payload;
-    /// every other deliverable notice is reserved and its payload returned for attachment.
-    /// Nothing is acknowledged here: the caller commits once the result is handed to the
-    /// transport and releases on cancellation or failure, so cancellation never consumes a notice.
+    /// Reserves the notices for one tool result being returned to `target` (plan §6.2). Requires
+    /// the captured parent run attempt to still be the active one and revalidates each pending
+    /// interaction. `coveredKeys` (questions already visible in the result) are reserved without a
+    /// payload; every other deliverable notice is reserved and its payload returned for attachment.
+    /// Nothing is acknowledged here: the connection handler settles the reservation at its final
+    /// handoff (`mcpSettleDelegatedQuestionNoticeReservation`) and releases it on any other exit,
+    /// so cancellation never consumes a notice.
     func mcpReserveDelegatedQuestionNotices(
-        parentRunID: UUID,
+        target: AgentDelegatedQuestionDeliveryTarget,
         coveredKeys: Set<AgentDelegatedQuestionNoticeKey>
     ) -> AgentDelegatedQuestionNoticeReservation? {
         guard !delegatedQuestionNotices.records.isEmpty,
-              let parent = delegatedQuestionParentSession(forRunID: parentRunID),
+              let parent = delegatedQuestionParentSession(for: target),
               let parentSessionID = parent.activeAgentSessionID
         else {
             return nil
         }
+        let parentRunID = target.parentRunID
         var payloads: [AgentDelegatedQuestionNoticePayload] = []
         var reservedCoveredKeys = Set<AgentDelegatedQuestionNoticeKey>()
         var keys = Set<AgentDelegatedQuestionNoticeKey>()
@@ -500,24 +561,117 @@ extension AgentModeViewModel {
         for key in keys {
             delegatedQuestionNotices.records[key]?.reservationID = reservationID
         }
-        delegatedQuestionNotices.reservations[reservationID] = .init(parentRunID: parentRunID, keys: keys)
-        Self.steeringDebugLog("[DelegatedQuestion] reserve id=\(reservationID) parentRunID=\(parentRunID) attached=\(payloads.count) covered=\(reservedCoveredKeys.count)")
+        delegatedQuestionNotices.reservations[reservationID] = .init(
+            target: target,
+            keys: keys,
+            coveredKeys: reservedCoveredKeys
+        )
+        Self.steeringDebugLog("[DelegatedQuestion] reserve id=\(reservationID) parentRunID=\(parentRunID) attempt=\(target.runAttemptID) attached=\(payloads.count) covered=\(reservedCoveredKeys.count)")
         return AgentDelegatedQuestionNoticeReservation(
             id: reservationID,
-            parentRunID: parentRunID,
+            target: target,
             payloads: payloads,
             coveredKeys: reservedCoveredKeys
         )
     }
 
-    /// The reserved result was handed to the transport: stamp the parent run and acknowledge.
-    /// Unknown or already-resolved reservations are a no-op (the question may have resolved).
+    /// Final handoff boundary of one tool-result reservation (plan §6.2). The connection handler
+    /// calls it after the last suspending completion processing (completion observers recorded
+    /// the unannotated result) and formats and returns the settled value without suspending
+    /// again, so the returned response and the parent transcript carry exactly the notices
+    /// committed here.
+    /// - `handOff == false` (the handler was cancelled before settling), a calling task that is
+    ///   cancelled by the time this main-actor step runs, an unknown or already-released
+    ///   reservation, or a captured parent attempt that is no longer active: every attached
+    ///   notice is removed from `value` and every held notice is released, so a cancelled result
+    ///   never both carries a notice and leaves it pending.
+    /// - Otherwise each notice is revalidated (still held by this reservation, question still
+    ///   pending): valid notices are stamped and acknowledged, and the attached ones are recorded
+    ///   synchronously as a labeled note in the parent transcript; notices that resolved or lost
+    ///   the reservation meanwhile are removed from `value` and never recorded. Committed covered
+    ///   questions (already visible in the result) are recorded as a separate persistence-only
+    ///   note with their complete content; `value` is never changed for them.
+    /// Returns the value to hand off.
+    func mcpSettleDelegatedQuestionNoticeReservation(
+        _ reservationID: UUID,
+        attachedKeys: Set<AgentDelegatedQuestionNoticeKey>,
+        value: Value,
+        handOff: Bool
+    ) -> Value {
+        // The handler sampled `handOff` before suspending into this main-actor step. A
+        // cancellation that landed during that hop must still strip and release, so the calling
+        // (handler) task is rechecked here, at the commit point, with the reservation and attempt.
+        let handOff = handOff && !Task.isCancelled
+        guard let reservation = delegatedQuestionNotices.reservations.removeValue(forKey: reservationID) else {
+            Self.steeringDebugLog("[DelegatedQuestion] settle id=\(reservationID) reservation gone; stripped=\(attachedKeys.count)")
+            return AgentDelegatedQuestionNoticeWire.removing(attachedKeys, from: value)
+        }
+        let attemptIsCurrent = delegatedQuestionParentSession(for: reservation.target) != nil
+        var committedKeys = Set<AgentDelegatedQuestionNoticeKey>()
+        var releasedKeys = Set<AgentDelegatedQuestionNoticeKey>()
+        for key in reservation.keys {
+            guard let record = delegatedQuestionNotices.records[key],
+                  record.reservationID == reservationID
+            else {
+                continue
+            }
+            if handOff, attemptIsCurrent, delegatedQuestionPendingChild(for: record) != nil {
+                committedKeys.insert(key)
+            } else {
+                releasedKeys.insert(key)
+            }
+        }
+        for key in committedKeys {
+            delegatedQuestionNotices.records[key]?.reservationID = nil
+            delegatedQuestionNotices.records[key]?.deliveredRunIDs.insert(reservation.parentRunID)
+            delegatedQuestionNotices.records[key]?.acknowledged = true
+        }
+        if !releasedKeys.isEmpty {
+            releaseDelegatedQuestionReservationKeys(
+                .init(target: reservation.target, keys: releasedKeys),
+                reservationID: reservationID
+            )
+        }
+        let strippedKeys = attachedKeys.subtracting(committedKeys)
+        let settled = AgentDelegatedQuestionNoticeWire.removing(strippedKeys, from: value)
+        // Completion observers recorded the unannotated result, so the committed notices reach
+        // the parent transcript only here, in the same main-actor step that commits them.
+        if let parent = delegatedQuestionParentSession(for: reservation.target) {
+            if let noticeText = AgentDelegatedQuestionNoticeWire.renderedText(
+                for: attachedKeys.intersection(committedKeys),
+                in: settled
+            ) {
+                appendDelegatedQuestionNoticeNote(noticeText, session: parent)
+            }
+            appendDelegatedQuestionCoveredRecordNote(
+                for: committedKeys.intersection(reservation.coveredKeys),
+                parent: parent
+            )
+        }
+        Self.steeringDebugLog("[DelegatedQuestion] settle id=\(reservationID) handOff=\(handOff) attemptCurrent=\(attemptIsCurrent) committed=\(committedKeys.count) released=\(releasedKeys.count) stripped=\(strippedKeys.count)")
+        publishDelegatedQuestionChange(childTabIDs: [])
+        if !releasedKeys.isEmpty {
+            wakeParentsForDelegatedQuestionsIfNeeded()
+        }
+        return settled
+    }
+
+    /// Commits a reservation for a caller without a connection-handler handoff boundary (the
+    /// result is returned synchronously after reservation). Stamps the parent run and
+    /// acknowledges. Unknown or already-released reservations are a no-op.
     func mcpCommitDelegatedQuestionNoticeReservation(_ reservationID: UUID) {
         guard let reservation = delegatedQuestionNotices.reservations.removeValue(forKey: reservationID) else { return }
+        var committedCoveredKeys = Set<AgentDelegatedQuestionNoticeKey>()
         for key in reservation.keys where delegatedQuestionNotices.records[key]?.reservationID == reservationID {
             delegatedQuestionNotices.records[key]?.reservationID = nil
             delegatedQuestionNotices.records[key]?.deliveredRunIDs.insert(reservation.parentRunID)
             delegatedQuestionNotices.records[key]?.acknowledged = true
+            if reservation.coveredKeys.contains(key) {
+                committedCoveredKeys.insert(key)
+            }
+        }
+        if let parent = delegatedQuestionParentSession(for: reservation.target) {
+            appendDelegatedQuestionCoveredRecordNote(for: committedCoveredKeys, parent: parent)
         }
         Self.steeringDebugLog("[DelegatedQuestion] commit id=\(reservationID) parentRunID=\(reservation.parentRunID) notices=\(reservation.keys.count)")
         publishDelegatedQuestionChange(childTabIDs: [])
@@ -539,17 +693,19 @@ extension AgentModeViewModel {
     ) {
         for key in reservation.keys where delegatedQuestionNotices.records[key]?.reservationID == reservationID {
             delegatedQuestionNotices.records[key]?.reservationID = nil
-            delegatedQuestionNotices.records[key]?.wokenRunIDs.remove(reservation.parentRunID)
+            delegatedQuestionNotices.records[key]?.wokenRunAttemptIDs.remove(reservation.target.runAttemptID)
         }
     }
 
-    /// Reserve and immediately commit, for callers without a transport handoff boundary.
-    /// Callers must attach every returned payload to the returned result.
+    /// Reserve and immediately commit for the parent's current attempt, for callers without a
+    /// transport handoff boundary. Callers must attach every returned payload to the result.
     func mcpHandOffDelegatedQuestionNotices(
         parentRunID: UUID,
         coveredKeys: Set<AgentDelegatedQuestionNoticeKey>
     ) -> [AgentDelegatedQuestionNoticePayload] {
-        guard let reservation = mcpReserveDelegatedQuestionNotices(parentRunID: parentRunID, coveredKeys: coveredKeys) else {
+        guard let target = mcpDelegatedQuestionDeliveryTarget(parentRunID: parentRunID),
+              let reservation = mcpReserveDelegatedQuestionNotices(target: target, coveredKeys: coveredKeys)
+        else {
             return []
         }
         mcpCommitDelegatedQuestionNoticeReservation(reservation.id)
@@ -560,7 +716,8 @@ extension AgentModeViewModel {
 
     /// Prepends a labeled runtime notice block to the provider-facing first input of a parent's
     /// next turn. The user's message text and transcript item are never modified. The notices
-    /// stay unacknowledged until `recordDelegatedQuestionNoticeSendOutcome` confirms the send.
+    /// stay unacknowledged until `recordDelegatedQuestionNoticeSendOutcome` confirms the send of
+    /// this exact stage. Notices reserved by an open tool-result handoff are never staged.
     func stageDelegatedQuestionNoticesForTurnInput(_ text: String, session: TabSession) -> String {
         guard !delegatedQuestionNotices.records.isEmpty || delegatedQuestionNotices.stagedTurnNoticesByParentTabID[session.tabID] != nil else {
             return text
@@ -581,6 +738,7 @@ extension AgentModeViewModel {
         for record in delegatedQuestionRecordsSorted(parentSessionID: parentSessionID) {
             guard !record.acknowledged,
                   record.stagedParentTabID == nil,
+                  record.reservationID == nil,
                   runID.map({ !record.deliveredRunIDs.contains($0) }) ?? true,
                   let payload = delegatedQuestionPayload(for: record)
             else {
@@ -638,14 +796,32 @@ extension AgentModeViewModel {
         delegatedQuestionNotices.stagedTurnNoticesByParentTabID[session.tabID] = staged
     }
 
+    /// Wraps already-neutralized notice text (`AgentDelegatedQuestionNoticePayload.renderedText`)
+    /// ahead of the provider text; child-controlled text cannot close this wrapper.
     static func delegatedQuestionTurnInput(noticeText: String, providerText: String) -> String {
-        "<repoprompt_runtime_notice kind=\"delegated_child_questions\">\n\(noticeText)\n</repoprompt_runtime_notice>\n\n\(providerText)"
+        delegatedQuestionTurnInputBlock(noticeText: noticeText) + providerText
+    }
+
+    /// The exact runtime block (with its trailing separator) that `delegatedQuestionTurnInput`
+    /// prepends for `noticeText`. A released stage removes exactly this block from queued copies.
+    static func delegatedQuestionTurnInputBlock(noticeText: String) -> String {
+        let tag = AgentDelegatedQuestionNoticeWire.runtimeNoticeTagName
+        let body = AgentDelegatedQuestionNoticeWire.neutralizingRuntimeNoticeDelimiters(noticeText)
+        return "<\(tag) kind=\"delegated_child_questions\">\n\(body)\n</\(tag)>\n\n"
     }
 
     /// Commits (stamp with the parent's run, acknowledge, persist a labeled note) or rolls back
-    /// the staged next-turn notices once the provider send outcome is known.
-    func recordDelegatedQuestionNoticeSendOutcome(for session: TabSession, didSend: Bool) {
-        guard let staged = delegatedQuestionNotices.stagedTurnNoticesByParentTabID[session.tabID] else { return }
+    /// the staged next-turn notices once the provider submission outcome of the input that carried
+    /// them is known. Only the stage identified by `stageID` is settled: a late outcome from an
+    /// earlier, superseded start never commits or releases a newer stage. A nil `stageID` (the
+    /// input carried no notices) is a no-op.
+    func recordDelegatedQuestionNoticeSendOutcome(for session: TabSession, stageID: UUID?, didSend: Bool) {
+        guard let stageID,
+              let staged = delegatedQuestionNotices.stagedTurnNoticesByParentTabID[session.tabID],
+              staged.stageID == stageID
+        else {
+            return
+        }
         guard didSend else {
             rollBackStagedDelegatedQuestionNotices(staged, parentTabID: session.tabID)
             publishDelegatedQuestionChange(childTabIDs: [])
@@ -666,21 +842,49 @@ extension AgentModeViewModel {
             record.acknowledged = true
             delegatedQuestionNotices.records[key] = record
         }
-        // Persist what the model saw as a labeled, ID-bearing runtime note. Live state stays in
-        // the child's pendingAskUser, so this note is never read back as current state.
-        session.appendItem(.system(staged.text, sequenceIndex: session.nextSequenceIndex))
+        appendDelegatedQuestionNoticeNote(staged.text, session: session)
+        Self.steeringDebugLog("[DelegatedQuestion] next-turn input delivered tab=\(session.tabID) stage=\(stageID) notices=\(staged.keys.count) runID=\(runID?.uuidString ?? "nil")")
+        publishDelegatedQuestionChange(childTabIDs: [])
+    }
+
+    /// Persists delivered notice text (what the model saw) as a labeled, ID-bearing runtime note
+    /// in the parent transcript. Live state stays in the child's pendingAskUser, so this note is
+    /// never read back as current state.
+    private func appendDelegatedQuestionNoticeNote(_ text: String, session: TabSession) {
+        session.appendItem(.system(text, sequenceIndex: session.nextSequenceIndex))
         session.isDirty = true
         scheduleSave(for: session.tabID)
-        Self.steeringDebugLog("[DelegatedQuestion] next-turn input delivered tab=\(session.tabID) notices=\(staged.keys.count) runID=\(runID?.uuidString ?? "nil")")
-        publishDelegatedQuestionChange(childTabIDs: [])
         requestUIRefresh(tabID: session.tabID)
     }
 
+    /// Records committed covered questions (already visible in an `agent_run` result snapshot)
+    /// as one labeled, persistence-only note with their complete content, resolved from the
+    /// still-pending interactions. The storage summary of the `agent_run` result keeps only the
+    /// interaction identity, so without this note the persisted parent history would lose the
+    /// question the parent was handed. The returned result is never changed.
+    private func appendDelegatedQuestionCoveredRecordNote(
+        for keys: Set<AgentDelegatedQuestionNoticeKey>,
+        parent: TabSession
+    ) {
+        guard !keys.isEmpty, let parentSessionID = parent.activeAgentSessionID else { return }
+        let payloads = delegatedQuestionRecordsSorted(parentSessionID: parentSessionID)
+            .filter { keys.contains($0.key) }
+            .compactMap { delegatedQuestionPayload(for: $0) }
+        guard let recordText = AgentDelegatedQuestionNoticeWire.coveredRecordText(for: payloads) else { return }
+        appendDelegatedQuestionNoticeNote(recordText, session: parent)
+    }
+
     /// Stage and commit in one step for inputs delivered synchronously to a waiting provider
-    /// (instruction-continuation resume and queued instructions).
+    /// (instruction-continuation resume and queued instructions): returning the text is the
+    /// handoff, so the stage created here commits immediately.
     func deliverDelegatedQuestionNoticesWithImmediateInput(_ text: String, session: TabSession) -> String {
         let staged = stageDelegatedQuestionNoticesForTurnInput(text, session: session)
-        recordDelegatedQuestionNoticeSendOutcome(for: session, didSend: true)
+        guard staged != text else { return staged }
+        recordDelegatedQuestionNoticeSendOutcome(
+            for: session,
+            stageID: delegatedQuestionTurnStageID(forTabID: session.tabID),
+            didSend: true
+        )
         return staged
     }
 
@@ -692,6 +896,33 @@ extension AgentModeViewModel {
         for key in staged.keys where delegatedQuestionNotices.records[key]?.stagedParentTabID == parentTabID {
             delegatedQuestionNotices.records[key]?.stagedParentTabID = nil
         }
+        removeReleasedStageBlockFromQueuedCodexFallbacks(staged, parentTabID: parentTabID)
+    }
+
+    /// A released stage's notices are deliverable again, so no queued copy of the input that
+    /// carried them may still deliver them. A Codex `.queuedFallback` keeps the already assembled
+    /// provider text, so this removes exactly the released stage's runtime block from every queued
+    /// (not yet claimed) fallback entry of the parent tab. The user's text, context, and
+    /// attachments stay unchanged, and the notices reach the parent only through a later delivery
+    /// that acknowledges them.
+    private func removeReleasedStageBlockFromQueuedCodexFallbacks(
+        _ staged: AgentDelegatedQuestionNoticeRegistry.StagedTurnNotice,
+        parentTabID: UUID
+    ) {
+        guard let session = sessions[parentTabID], !session.codexFallbackQueue.isEmpty else { return }
+        let block = Self.delegatedQuestionTurnInputBlock(noticeText: staged.text)
+        var strippedQueueIDs: [UUID] = []
+        for index in session.codexFallbackQueue.indices {
+            guard let range = session.codexFallbackQueue[index].providerText.range(of: block) else { continue }
+            session.codexFallbackQueue[index].providerText.removeSubrange(range)
+            // A fallback queued without a composer context restores its provider text as the draft.
+            if let draftRange = session.codexFallbackQueue[index].draftText.range(of: block) {
+                session.codexFallbackQueue[index].draftText.removeSubrange(draftRange)
+            }
+            strippedQueueIDs.append(session.codexFallbackQueue[index].id)
+        }
+        guard !strippedQueueIDs.isEmpty else { return }
+        Self.steeringDebugLog("[DelegatedQuestion] released stage=\(staged.stageID) removed from queued Codex fallback tab=\(parentTabID) queueIDs=\(strippedQueueIDs.map(\.uuidString))")
     }
 
     // MARK: - Presentation (§6.5)

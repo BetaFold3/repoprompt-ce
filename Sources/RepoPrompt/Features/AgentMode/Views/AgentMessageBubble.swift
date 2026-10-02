@@ -1398,7 +1398,7 @@ private struct AskUserQuestionArgs: Decodable {
 
     let title: String?
     let context: String?
-    let questions: [Question]?
+    let questions: [(originalIndex: Int, question: Question)]?
     let question: String?
 
     private enum CodingKeys: String, CodingKey {
@@ -1413,7 +1413,9 @@ private struct AskUserQuestionArgs: Decodable {
         title = try? container.decodeIfPresent(String.self, forKey: .title)
         context = try? container.decodeIfPresent(String.self, forKey: .context)
         questions = (try? container.decodeIfPresent([AskUserDisplayValue<Question>].self, forKey: .questions))?
-            .compactMap(\.value)
+            .enumerated().compactMap { index, entry in
+                entry.value.map { (originalIndex: index, question: $0) }
+            }
         question = try? container.decodeIfPresent(String.self, forKey: .question)
     }
 }
@@ -1477,8 +1479,8 @@ func parseAskUserQuestionSummaryRobust(args: String?, result: String?) -> AskUse
     let skipped = resultDTO?.skipped ?? false
 
     if isStructured {
-        let questions = structuredQuestions.enumerated().map { index, question -> AskUserQuestionSummary.Question in
-            let fallbackID = "question_\(index + 1)"
+        let questions = structuredQuestions.map { originalIndex, question -> AskUserQuestionSummary.Question in
+            let fallbackID = "question_\(originalIndex + 1)"
             let id = normalizedNonEmpty(question.id) ?? fallbackID
             let answer = resultDTO?.answers?[id]
             let questionSkipped = answer?.skipped ?? skipped

@@ -21,7 +21,8 @@ final class CodexIntegratedAgentModeRunner {
         session: AgentModeViewModel.TabSession,
         initialMessageForRun: String,
         attachments: [AgentImageAttachment],
-        fallbackContext: AgentModeViewModel.TabSession.CodexFallbackSubmissionContext?
+        fallbackContext: AgentModeViewModel.TabSession.CodexFallbackSubmissionContext?,
+        delegatedQuestionStageID: UUID? = nil
     ) async -> CodexAgentModeCoordinator.NativeSendOutcome {
         let ownership: AgentRunOwnership
         let createdOwnership: Bool
@@ -57,6 +58,16 @@ final class CodexIntegratedAgentModeRunner {
                 terminalizeRejectedSend: createdOwnership
             )
             hooks.recordPendingHandoffSendOutcome(session, outcome.didSend)
+            // Delegated child-question notices acknowledge only on an actual send. A queued
+            // fallback (`didSend == true`) has not reached the model yet, so its stage is released
+            // and the notices stay deliverable; the release also removes the stage's runtime
+            // block from the queued fallback text, so only a later delivery carries them.
+            let delegatedQuestionNoticesSent = if case .sent = outcome { true } else { false }
+            hooks.recordDelegatedQuestionNoticeSendOutcome(
+                session,
+                delegatedQuestionStageID,
+                delegatedQuestionNoticesSent
+            )
             switch outcome {
             case .sent:
                 session.recordRunProgress(ownership: ownership, kind: .stageTransition, stage: .running)

@@ -201,6 +201,38 @@ final class AskUserQuestionPresentationTests: XCTestCase {
         XCTAssertEqual(second.customResponse, "Second detail")
     }
 
+    func testMalformedLeadingSiblingPreservesImplicitQuestionIDAndAnswer() throws {
+        let args = #"{"questions":[null,{"question":"Second?","options":["Yes","No"]}]}"#
+        let result = #"""
+        {
+          "answers": {
+            "question_1": {
+              "answers": ["Wrong sibling answer"],
+              "selected_options": ["No"]
+            },
+            "question_2": {
+              "answers": ["Yes"],
+              "selected_options": ["Yes"],
+              "custom_response": "Second detail"
+            }
+          }
+        }
+        """#
+
+        let summary = parseAskUserQuestionSummaryRobust(args: args, result: result)
+
+        XCTAssertFalse(summary.isHistoricalScalar)
+        XCTAssertEqual(summary.questions.count, 1)
+        let question = try XCTUnwrap(summary.questions.first)
+        XCTAssertEqual(question.id, "question_2")
+        XCTAssertEqual(question.question, "Second?")
+        XCTAssertEqual(question.answer, "Yes")
+        XCTAssertEqual(question.customResponse, "Second detail")
+        XCTAssertEqual(question.options.map(\.label), ["Yes", "No"])
+        XCTAssertEqual(question.options.map(\.isSelected), [true, false])
+        XCTAssertFalse(question.skipped)
+    }
+
     func testHistoricalScalarPayloadsRemainUnchanged() throws {
         let args = #"{"question":"  Historical question  ","title":"Ignored title","context":"Ignored context"}"#
         let cases: [(name: String, result: String?, answer: String, skipped: Bool, timedOut: Bool, status: String?)] = [

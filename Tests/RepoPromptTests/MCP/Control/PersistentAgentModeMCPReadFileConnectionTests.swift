@@ -6,7 +6,7 @@ import XCTest
 
 @MainActor
 final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
-    func testDelegatedQuestionReadFileDeliveryCommitsOnlyAfterCompletionObservers() async throws {
+    func testDelegatedQuestionReadFileDeliveryCommitsAndRecordsAtFinalHandoffAfterCompletionObservers() async throws {
         #if DEBUG
             try await withFixture(agentOwned: true) { fixture in
                 try await runCheckpoint(fixture: fixture, scenario: .delegatedQuestionDelivery)
@@ -30,6 +30,26 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
         #if DEBUG
             try await withFixture(agentOwned: true) { fixture in
                 try await runCheckpoint(fixture: fixture, scenario: .delegatedQuestionError)
+            }
+        #else
+            throw XCTSkip("Persistent Agent Mode MCP socketpair integration requires DEBUG inspection helpers.")
+        #endif
+    }
+
+    func testDelegatedQuestionResolvedDuringCompletionObserversIsStrippedFromTheResult() async throws {
+        #if DEBUG
+            try await withFixture(agentOwned: true) { fixture in
+                try await runCheckpoint(fixture: fixture, scenario: .delegatedQuestionResolvedDuringCompletion)
+            }
+        #else
+            throw XCTSkip("Persistent Agent Mode MCP socketpair integration requires DEBUG inspection helpers.")
+        #endif
+    }
+
+    func testDelegatedQuestionParentAttemptReplacedDuringCompletionObserversIsStrippedAndRedelivered() async throws {
+        #if DEBUG
+            try await withFixture(agentOwned: true) { fixture in
+                try await runCheckpoint(fixture: fixture, scenario: .delegatedQuestionAttemptReplacedDuringCompletion)
             }
         #else
             throw XCTSkip("Persistent Agent Mode MCP socketpair integration requires DEBUG inspection helpers.")
@@ -281,6 +301,8 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
             case delegatedQuestionDelivery
             case delegatedQuestionCancellation
             case delegatedQuestionError
+            case delegatedQuestionResolvedDuringCompletion
+            case delegatedQuestionAttemptReplacedDuringCompletion
 
             var requiresSerialReadPrelude: Bool {
                 switch self {
@@ -289,7 +311,8 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
                      .worktreeCoverageCertificatePersistenceBoundary, .worktreeCoverageCertificateFailClosed,
                      .worktreeSearchPhysicalCoverage, .threeRootFileToolScope, .hiddenWorktreeReadSliceRebase,
                      .subWorkerDelegationDenial, .delegatedQuestionDelivery, .delegatedQuestionCancellation,
-                     .delegatedQuestionError:
+                     .delegatedQuestionError, .delegatedQuestionResolvedDuringCompletion,
+                     .delegatedQuestionAttemptReplacedDuringCompletion:
                     false
                 default:
                     true
@@ -493,7 +516,8 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
                 try await assertHiddenWorktreeReadSliceRebase(fixture: fixture)
             case .subWorkerDelegationDenial:
                 try await assertSubWorkerDelegationDenial(fixture: fixture)
-            case .delegatedQuestionDelivery, .delegatedQuestionCancellation, .delegatedQuestionError:
+            case .delegatedQuestionDelivery, .delegatedQuestionCancellation, .delegatedQuestionError,
+                 .delegatedQuestionResolvedDuringCompletion, .delegatedQuestionAttemptReplacedDuringCompletion:
                 try await assertDelegatedQuestionDelivery(fixture: fixture, scenario: scenario)
             }
         }
@@ -502,22 +526,67 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
         final class DelegatedQuestionResultBox {
             var resultJSON: String?
             var isError: Bool?
+            /// The next successful read observed suspends inside its completion processing.
+            var suspendNextSuccess = false
+        }
+
+        /// Holds a completion observer suspended, ignoring cancellation, until the test releases it.
+        actor DelegatedQuestionObserverGate {
+            struct NotEntered: Error {}
+            private var entered = false
+            private var released = false
+            private var waiters: [CheckedContinuation<Void, Never>] = []
+
+            func enterAndWait() async {
+                entered = true
+                guard !released else { return }
+                await withCheckedContinuation { waiters.append($0) }
+            }
+
+            func waitUntilEntered(timeout: Duration = .seconds(10)) async throws {
+                let deadline = ContinuousClock.now + timeout
+                while !entered {
+                    guard ContinuousClock.now < deadline else { throw NotEntered() }
+                    try await Task.sleep(for: .milliseconds(10))
+                }
+            }
+
+            func release() {
+                released = true
+                waiters.forEach { $0.resume() }
+                waiters.removeAll()
+            }
+        }
+
+        /// Delegated-question runtime notes recorded in a parent transcript.
+        static func delegatedQuestionNoticeNotes(in session: AgentModeViewModel.TabSession) -> [AgentChatItem] {
+            session.items.filter {
+                $0.kind == .system && $0.text.hasPrefix(AgentDelegatedQuestionNoticeWire.noticeHeader)
+            }
         }
 
         func assertDelegatedQuestionDelivery(fixture: Fixture, scenario: CheckpointScenario) async throws {
-            let baselineResponse = try await fixture.socketClient.request(
-                id: 3, method: "tools/call",
-                params: ["name": MCPWindowToolName.readFile, "arguments": ["path": fixture.fileURL.path]]
-            )
-            let baselineBlocks = try Self.toolContent(from: baselineResponse, id: 3)
-            XCTAssertTrue(baselineBlocks.compactMap { $0["text"] as? String }.joined().contains(Fixture.sentinelContent))
-
             let vm = fixture.window.agentModeViewModel
             let parent = try XCTUnwrap(vm.session(for: Fixture.tabID, createIfNeeded: true))
             XCTAssertEqual(parent.activeAgentSessionID, Fixture.agentSessionID)
             parent.hasLoadedPersistedState = true
             parent.parentSessionID = nil
             parent.runID = Fixture.runID
+            // Tool results only deliver notices to the parent's active run attempt (plan §6.2).
+            parent.runState = .running
+            parent.beginRunAttempt(source: "delegated-question-test")
+            defer {
+                // The attempt-replacement scenario begins a newer attempt; end whichever is current.
+                parent.endCurrentRunAttempt(source: "delegated-question-test")
+                parent.runState = .idle
+            }
+
+            let baselineResponse = try await fixture.socketClient.request(
+                id: 3, method: "tools/call",
+                params: ["name": MCPWindowToolName.readFile, "arguments": ["path": fixture.fileURL.path]]
+            )
+            let baselineBlocks = try Self.toolContent(from: baselineResponse, id: 3)
+            XCTAssertTrue(baselineBlocks.compactMap { $0["text"] as? String }.joined().contains(Fixture.sentinelContent))
 
             let childTab = await fixture.window.promptManager.createBackgroundComposeTab(
                 strategy: .blank, name: "Delegated delivery child"
@@ -558,13 +627,15 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
                 try await vm.askUser(tabID: childTabID, interaction: interaction)
             }
             let box = DelegatedQuestionResultBox()
+            let observerGate = DelegatedQuestionObserverGate()
+            let cancelDuringCompletion = scenario == .delegatedQuestionCancellation
             let observerToken = await fixture.networkManager.registerToolEventObserver(
                 for: Fixture.runID,
                 observer: .init(
                     onCalled: { _, _, _ in },
                     onCompleted: { _, toolName, _, resultJSON, isError in
                         guard toolName == MCPWindowToolName.readFile else { return }
-                        await MainActor.run {
+                        let suspend = await MainActor.run { () -> Bool in
                             box.resultJSON = resultJSON
                             box.isError = isError
                             if isError {
@@ -575,11 +646,37 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
                                 XCTAssertTrue(vm.mcpHasDeliverableDelegatedQuestionNotices(
                                     parentRunID: Fixture.runID, excludingChildSessionIDs: []
                                 ))
+                                return false
                             }
+                            guard box.suspendNextSuccess else { return false }
+                            box.suspendNextSuccess = false
+                            // Completion processing of the notice-bearing result: runTool attached the
+                            // notice, but observers record the unannotated result, and the notice stays
+                            // reserved, unacknowledged, and unrecorded until the final handoff, which
+                            // runs only after this observer returns.
+                            XCTAssertFalse(resultJSON.contains(interaction.id.uuidString), resultJSON)
+                            XCTAssertNotNil(vm.delegatedQuestionNotices.records[key]?.reservationID)
+                            XCTAssertEqual(vm.delegatedQuestionNotices.records[key]?.acknowledged, false)
+                            XCTAssertEqual(vm.delegatedQuestionNotices.records[key]?.deliveredRunIDs, [])
+                            XCTAssertFalse(vm.mcpHasDeliverableDelegatedQuestionNotices(
+                                parentRunID: Fixture.runID, excludingChildSessionIDs: []
+                            ))
+                            XCTAssertTrue(Self.delegatedQuestionNoticeNotes(in: parent).isEmpty)
+                            return true
                         }
+                        guard suspend else { return }
+                        if cancelDuringCompletion {
+                            // Completion observers run inline in the SDK handler task: cancel it after
+                            // runTool attached its value. The SDK still sends the handler's return value,
+                            // and the socket remains open for the next call on the same run.
+                            withUnsafeCurrentTask { $0?.cancel() }
+                        }
+                        // Suspend inside completion processing until the test releases the handler.
+                        await observerGate.enterAndWait()
                     }
                 )
             )
+            var pendingRequest: Task<String, Error>?
             do {
                 try await AsyncTestWait.waitUntil("child question addressed to parent", timeout: 3) {
                     await MainActor.run {
@@ -590,44 +687,47 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
                     }
                 }
 
-                let cancelAtTail = scenario == .delegatedQuestionCancellation
+                let delivered = scenario == .delegatedQuestionDelivery
+                let resolveDuringCompletion = scenario == .delegatedQuestionResolvedDuringCompletion
+                let replaceAttemptDuringCompletion = scenario == .delegatedQuestionAttemptReplacedDuringCompletion
                 let errorCall = scenario == .delegatedQuestionError
-                let tailObserved = PersistentAsyncSignal()
-                if !errorCall {
-                    await fixture.networkManager.debugSetBeforeToolCompletionObserversForTesting { connectionID, toolName in
-                        guard connectionID == Fixture.connectionID, toolName == MCPWindowToolName.readFile else { return }
-                        await MainActor.run {
-                            XCTAssertNotNil(vm.delegatedQuestionNotices.records[key]?.reservationID)
-                            XCTAssertEqual(vm.delegatedQuestionNotices.records[key]?.acknowledged, false)
-                            XCTAssertEqual(vm.delegatedQuestionNotices.records[key]?.deliveredRunIDs, [])
-                            XCTAssertFalse(vm.mcpHasDeliverableDelegatedQuestionNotices(
-                                parentRunID: Fixture.runID, excludingChildSessionIDs: []
-                            ))
-                        }
-                        await tailObserved.mark()
-                        if cancelAtTail {
-                            // Cancel the actual SDK handler task after runTool attached its value.
-                            // The socket remains open for the next call on the same run.
-                            withUnsafeCurrentTask { $0?.cancel() }
-                        }
-                    }
-                }
                 let path = errorCall ? fixture.rootURL.appendingPathComponent("missing.swift").path : fixture.fileURL.path
-                let response = try await fixture.socketClient.request(
-                    id: 4, method: "tools/call",
-                    params: ["name": MCPWindowToolName.readFile, "arguments": ["path": path]]
-                )
-                await fixture.networkManager.debugSetBeforeToolCompletionObserversForTesting(nil)
+                box.suspendNextSuccess = !errorCall
+                let socketClient = fixture.socketClient
+                let request = Task { @MainActor in
+                    try await socketClient.request(
+                        id: 4, method: "tools/call",
+                        params: ["name": MCPWindowToolName.readFile, "arguments": ["path": path]]
+                    )
+                }
+                pendingRequest = request
+                if !errorCall {
+                    // OracleA finding 1 trigger: the handler is suspended inside its completion processing
+                    // after runTool reserved and attached the notice. Change the question or the parent
+                    // identity now, then let the handler reach its final handoff.
+                    try await observerGate.waitUntilEntered()
+                    if resolveDuringCompletion {
+                        vm.skipAskUser(tabID: childTabID, interactionID: interaction.id)
+                    } else if replaceAttemptDuringCompletion {
+                        // The parent's next turn begins under the same process run ID.
+                        parent.beginRunAttempt(source: "delegated-question-test")
+                    }
+                    await observerGate.release()
+                }
+                let response = try await request.value
+                pendingRequest = nil
                 let result = try XCTUnwrap(try Self.responseObject(from: response, id: 4)["result"] as? [String: Any])
                 let observedJSON = try XCTUnwrap(box.resultJSON)
                 let observed = try JSONDecoder().decode(Value.self, from: Data(observedJSON.utf8))
+                // Completion observers (the transcript's source) record the unannotated result in every
+                // scenario; a delivered notice is recorded only by the final handoff.
+                XCTAssertNil(observed.objectValue?[AgentDelegatedQuestionNoticeWire.resultKey])
+                XCTAssertFalse(observedJSON.contains(interaction.id.uuidString), observedJSON)
                 if errorCall {
                     XCTAssertEqual(result["isError"] as? Bool, true)
                     XCTAssertEqual(box.isError, true)
-                    XCTAssertNil(observed.objectValue?[AgentDelegatedQuestionNoticeWire.resultKey])
-                } else {
-                    let reachedTail = await tailObserved.isMarked()
-                    XCTAssertTrue(reachedTail)
+                    XCTAssertTrue(Self.delegatedQuestionNoticeNotes(in: parent).isEmpty)
+                } else if delivered {
                     XCTAssertEqual(box.isError, false)
                     let blocks = try Self.toolContent(from: response, id: 4)
                     XCTAssertEqual(blocks.count, baselineBlocks.count + 1)
@@ -639,12 +739,46 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
                     XCTAssertTrue(noticeText.contains(childSessionID.uuidString), noticeText)
                     XCTAssertTrue(noticeText.contains(interaction.id.uuidString), noticeText)
                     XCTAssertTrue(noticeText.contains("Which route should the child use?"), noticeText)
-                    let notices = try XCTUnwrap(observed.objectValue?[AgentDelegatedQuestionNoticeWire.resultKey]?.arrayValue)
-                    XCTAssertEqual(notices.count, 1)
-                    XCTAssertEqual(notices.first?.objectValue?["interaction_id"]?.stringValue, interaction.id.uuidString)
+                    // Committed and recorded by the final handoff, before the handler returned the response.
+                    XCTAssertEqual(vm.delegatedQuestionNotices.records[key]?.acknowledged, true)
+                    XCTAssertEqual(vm.delegatedQuestionNotices.records[key]?.deliveredRunIDs, [Fixture.runID])
+                    XCTAssertNil(vm.delegatedQuestionNotices.records[key]?.reservationID)
+                    XCTAssertEqual(
+                        Self.delegatedQuestionNoticeNotes(in: parent).map(\.text), [noticeText],
+                        "The parent transcript records exactly the notice text returned on the wire"
+                    )
+                } else {
+                    // Resolved, cancelled, or superseded by a newer parent attempt while the handler was
+                    // suspended in its completion observers: the notice is neither returned nor recorded.
+                    XCTAssertEqual(box.isError, false)
+                    XCTAssertEqual(
+                        try JSONSerialization.data(withJSONObject: Self.toolContent(from: response, id: 4), options: [.sortedKeys]),
+                        try JSONSerialization.data(withJSONObject: baselineBlocks, options: [.sortedKeys])
+                    )
+                    XCTAssertFalse(response.contains(interaction.id.uuidString), response)
+                    XCTAssertTrue(Self.delegatedQuestionNoticeNotes(in: parent).isEmpty)
+                    XCTAssertNil(vm.delegatedQuestionNotices.records[key]?.reservationID)
+                    XCTAssertTrue(vm.delegatedQuestionNotices.reservations.isEmpty)
                 }
 
-                if cancelAtTail || errorCall {
+                if resolveDuringCompletion {
+                    let answer = try await questionTask.value
+                    XCTAssertTrue(answer.skipped)
+                    XCTAssertTrue(vm.delegatedQuestionNotices.records.isEmpty)
+                    XCTAssertTrue(vm.delegatedQuestionNotices.reservations.isEmpty)
+                    XCTAssertTrue(Self.delegatedQuestionNoticeNotes(in: parent).isEmpty)
+                    let afterResolution = try await fixture.socketClient.request(
+                        id: 5, method: "tools/call",
+                        params: ["name": MCPWindowToolName.readFile, "arguments": ["path": fixture.fileURL.path]]
+                    )
+                    XCTAssertEqual(
+                        try JSONSerialization.data(withJSONObject: Self.toolContent(from: afterResolution, id: 5), options: [.sortedKeys]),
+                        try JSONSerialization.data(withJSONObject: baselineBlocks, options: [.sortedKeys])
+                    )
+                    await fixture.networkManager.unregisterToolEventObserver(for: Fixture.runID, token: observerToken)
+                    return
+                }
+                if !delivered {
                     try await AsyncTestWait.waitUntil("notice released after undelivered result", timeout: 3) {
                         await MainActor.run {
                             vm.delegatedQuestionNotices.records[key]?.reservationID == nil
@@ -662,10 +796,13 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
                     let retryText = try Self.readFileText(from: retry, id: 5)
                     XCTAssertTrue(retryText.contains(Fixture.sentinelContent), retryText)
                     XCTAssertTrue(retryText.contains(interaction.id.uuidString), retryText)
+                    // The retry's own final handoff records the delivered notice exactly once.
+                    let retryNoticeText = try XCTUnwrap(Self.toolContent(from: retry, id: 5).last?["text"] as? String)
+                    XCTAssertEqual(Self.delegatedQuestionNoticeNotes(in: parent).map(\.text), [retryNoticeText])
                 }
-                try await AsyncTestWait.waitUntil("notice committed at handler handoff", timeout: 3) {
-                    await MainActor.run { vm.delegatedQuestionNotices.records[key]?.acknowledged == true }
-                }
+                // Committed at the final handoff of the result that carried it, before that response
+                // was returned, so no wait is needed here.
+                XCTAssertEqual(vm.delegatedQuestionNotices.records[key]?.acknowledged, true)
                 XCTAssertEqual(vm.delegatedQuestionNotices.records[key]?.deliveredRunIDs, [Fixture.runID])
                 XCTAssertNil(vm.delegatedQuestionNotices.records[key]?.reservationID)
                 XCTAssertEqual(child.pendingAskUser?.interaction.id, interaction.id, "Delivery must not answer the question")
@@ -678,11 +815,13 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
                     try JSONSerialization.data(withJSONObject: Self.toolContent(from: afterCommit, id: 6), options: [.sortedKeys]),
                     try JSONSerialization.data(withJSONObject: baselineBlocks, options: [.sortedKeys])
                 )
+                XCTAssertEqual(Self.delegatedQuestionNoticeNotes(in: parent).count, 1, "An acknowledged notice is never recorded again")
                 await fixture.networkManager.unregisterToolEventObserver(for: Fixture.runID, token: observerToken)
                 vm.skipAskUser(tabID: childTabID, interactionID: interaction.id)
                 _ = try await questionTask.value
             } catch {
-                await fixture.networkManager.debugSetBeforeToolCompletionObserversForTesting(nil)
+                await observerGate.release()
+                if let pendingRequest { _ = try? await pendingRequest.value }
                 await fixture.networkManager.unregisterToolEventObserver(for: Fixture.runID, token: observerToken)
                 vm.skipAskUser(tabID: childTabID, interactionID: interaction.id)
                 _ = try? await questionTask.value

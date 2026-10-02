@@ -1022,6 +1022,8 @@ final class MCPAskOracleLifecycleTests: XCTestCase {
         let parent = try XCTUnwrap(vm.session(for: fixture.tabID, createIfNeeded: false))
         parent.hasLoadedPersistedState = true
         parent.parentSessionID = nil
+        // Notices wake and deliver only to the parent's active run attempt (plan §6.2).
+        let parentAttemptID = parent.activeRunAttemptID ?? parent.beginRunAttempt(source: "delegated-question-test").attemptID
         let childTab = await fixture.window.promptManager.createBackgroundComposeTab(
             strategy: .blank, name: "Delegated Oracle child"
         )
@@ -1069,7 +1071,7 @@ final class MCPAskOracleLifecycleTests: XCTestCase {
                         )
                 }
             }
-            XCTAssertTrue(vm.delegatedQuestionNotices.records[key]?.wokenRunIDs.contains(fixture.runID) == true)
+            XCTAssertTrue(vm.delegatedQuestionNotices.records[key]?.wokenRunAttemptIDs.contains(parentAttemptID) == true)
             try await body(key)
             vm.skipAskUser(tabID: childTabID, interactionID: interaction.id)
             _ = try await questionTask.value

@@ -75,6 +75,50 @@ final class ToolOutputFormatterDelegatedQuestionNoticeTests: XCTestCase {
         XCTAssertNil(split.noticeText)
     }
 
+    func testRemovingStripsOnlyTheNamedNoticesAndDropsTheKeyWhenEmpty() throws {
+        let original: Value = .object(["status": .string("pending"), "content": .string("body")])
+        let first = payload(name: "First child")
+        let second = payload(name: "Second child")
+        let attached = try XCTUnwrap(AgentDelegatedQuestionNoticeWire.attaching([first, second], to: original))
+
+        let withoutFirst = AgentDelegatedQuestionNoticeWire.removing([first.key], from: attached)
+        XCTAssertEqual(withoutFirst.objectValue?[AgentDelegatedQuestionNoticeWire.resultKey]?.arrayValue, [second.wireValue()])
+        XCTAssertEqual(AgentDelegatedQuestionNoticeWire.splitting(withoutFirst).original, original)
+
+        XCTAssertEqual(AgentDelegatedQuestionNoticeWire.removing([first.key, second.key], from: attached), original)
+        XCTAssertEqual(
+            AgentDelegatedQuestionNoticeWire.removing([.init(childSessionID: UUID(), interactionID: UUID())], from: attached),
+            attached,
+            "Unknown keys change nothing"
+        )
+        XCTAssertEqual(AgentDelegatedQuestionNoticeWire.removing([], from: attached), attached)
+        for nonObject: Value in [.string("text"), .array([.int(1)]), .null] {
+            XCTAssertEqual(AgentDelegatedQuestionNoticeWire.removing([first.key], from: nonObject), nonObject)
+        }
+        XCTAssertEqual(AgentDelegatedQuestionNoticeWire.noticeKey(of: first.wireValue()), first.key)
+        XCTAssertNil(AgentDelegatedQuestionNoticeWire.noticeKey(of: .object(["child_session_id": .string("nope")])))
+    }
+
+    func testRenderedTextForKeysMatchesTheFormattedNoticeBlockOfThoseEntriesOnly() throws {
+        let original: Value = .object(["content": .string("body")])
+        let first = payload(name: "First child")
+        let second = payload(name: "Second child")
+        let attached = try XCTUnwrap(AgentDelegatedQuestionNoticeWire.attaching([first, second], to: original))
+
+        // Recording only the committed entries matches the notice block the formatter returns.
+        let both = try XCTUnwrap(AgentDelegatedQuestionNoticeWire.renderedText(for: [first.key, second.key], in: attached))
+        XCTAssertEqual(both, AgentDelegatedQuestionNoticeWire.splitting(attached).noticeText)
+        XCTAssertEqual(both, AgentDelegatedQuestionNoticeWire.renderedText(for: [first, second]))
+        XCTAssertEqual(
+            AgentDelegatedQuestionNoticeWire.renderedText(for: [second.key], in: attached),
+            AgentDelegatedQuestionNoticeWire.renderedText(for: [second])
+        )
+        XCTAssertNil(AgentDelegatedQuestionNoticeWire.renderedText(for: [], in: attached))
+        XCTAssertNil(AgentDelegatedQuestionNoticeWire.renderedText(for: [.init(childSessionID: UUID(), interactionID: UUID())], in: attached))
+        XCTAssertNil(AgentDelegatedQuestionNoticeWire.renderedText(for: [first.key], in: original))
+        XCTAssertNil(AgentDelegatedQuestionNoticeWire.renderedText(for: [first.key], in: .string("text")))
+    }
+
     private func encoded(_ blocks: [MCP.Tool.Content]) throws -> Data {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys]

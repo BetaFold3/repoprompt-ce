@@ -1746,22 +1746,11 @@ struct AgentRunMCPToolService {
         let waitScopeToken = await beginAgentRunWait(metadata, Set(sessionIDs), timeoutSeconds)
         if let waitScopeToken, hasDeliverableDelegatedQuestionNotices(waitScopeToken, Set(sessionIDs)) {
             let snapshots = await collectCurrentSnapshots(sessionIDs: sessionIDs, agentModeVM: agentModeVM)
-            let value: Value = if let ready = snapshots.first(where: { isInterestingSnapshot($0) }) {
-                decoratedMultiWaitValue(
-                    snapshot: ready, sessionIDs: sessionIDs,
-                    result: ready.status == .expired ? "expired" : "snapshot_ready",
-                    snapshots: snapshots, pendingSessionIDs: pendingSessionIDs(from: snapshots)
-                )
-            } else {
-                Self.decoratedMultiWaitInterruptValue(
-                    sessionIDs: sessionIDs,
-                    representativeSnapshot: snapshots.first ?? initialSnapshots[0],
-                    snapshots: snapshots,
-                    pendingSessionIDs: pendingSessionIDs(from: snapshots),
-                    interruptedSessionID: snapshots.first?.sessionID ?? sessionIDs[0],
-                    wakeReason: .delegatedQuestionPending
-                )
-            }
+            let value = delegatedQuestionMultiWaitValue(
+                sessionIDs: sessionIDs,
+                triggeringSnapshot: snapshots.first ?? initialSnapshots[0],
+                snapshots: snapshots
+            )
             await endAgentRunWait(waitScopeToken, waitScopeCompletion(from: value, fallbackSessionIDs: sessionIDs))
             return AgentMCPWaitPolicy.attaching(selection, to: value)
         }
@@ -2675,6 +2664,41 @@ struct AgentRunMCPToolService {
         )
     }
 
+    /// Multi-wait value for a delegated child-question wake (plan §6.2), arbitrated and rendered
+    /// over exactly one snapshot collection: an actionable or terminal child in `snapshots` wins
+    /// (`snapshot_ready`/`expired`); otherwise the interrupt renders this same set, so an
+    /// `interrupted_by_child_question` result never carries an actionable child snapshot.
+    private nonisolated func delegatedQuestionMultiWaitValue(
+        sessionIDs: [UUID],
+        triggeringSnapshot: AgentRunMCPSnapshot,
+        snapshots: [AgentRunMCPSnapshot]
+    ) -> Value {
+        if let ready = snapshots.first(where: { isInterestingSnapshot($0) }) {
+            return decoratedMultiWaitValue(
+                snapshot: ready, sessionIDs: sessionIDs,
+                result: ready.status == .expired ? "expired" : "snapshot_ready",
+                snapshots: snapshots, pendingSessionIDs: pendingSessionIDs(from: snapshots)
+            )
+        }
+        var rendered = snapshots
+        if rendered.isEmpty {
+            rendered = [triggeringSnapshot]
+        } else if !rendered.contains(where: { $0.sessionID == triggeringSnapshot.sessionID }) {
+            rendered.append(triggeringSnapshot)
+        }
+        let representative = rendered.first { $0.sessionID == triggeringSnapshot.sessionID } ?? triggeringSnapshot
+        let pendingIDs = pendingSessionIDs(from: rendered)
+        let runningIDs = rendered.filter { $0.status == .running }.map(\.sessionID)
+        return Self.decoratedMultiWaitInterruptValue(
+            sessionIDs: sessionIDs,
+            representativeSnapshot: representative,
+            snapshots: rendered,
+            pendingSessionIDs: pendingIDs.isEmpty && !runningIDs.isEmpty ? runningIDs : pendingIDs,
+            interruptedSessionID: triggeringSnapshot.sessionID,
+            wakeReason: .delegatedQuestionPending
+        )
+    }
+
     private nonisolated static func decoratedMultiWaitInterruptValue(
         sessionIDs: [UUID],
         representativeSnapshot: AgentRunMCPSnapshot,
@@ -2760,20 +2784,13 @@ struct AgentRunMCPToolService {
                 latestSnapshots: snapshots
             )
         case let .delegatedQuestionInterrupted(snapshot):
-            // Actionable/terminal children still win when publication races the wake.
-            if let ready = snapshots.first(where: { isInterestingSnapshot($0) }) {
-                return decoratedMultiWaitValue(
-                    snapshot: ready, sessionIDs: sessionIDs,
-                    result: ready.status == .expired ? "expired" : "snapshot_ready",
-                    snapshots: snapshots, pendingSessionIDs: pendingSessionIDs(from: snapshots)
-                )
-            }
-            return await waitAnySteeringInterruptValue(
+            // Arbitrated and rendered over this single post-wake collection: an actionable or
+            // terminal child in it always wins, and no second refresh can render an interrupt over
+            // a completion that was never arbitrated.
+            return delegatedQuestionMultiWaitValue(
                 sessionIDs: sessionIDs,
-                agentModeVM: agentModeVM,
                 triggeringSnapshot: snapshot,
-                latestSnapshots: snapshots,
-                wakeReason: .delegatedQuestionPending
+                snapshots: snapshots
             )
         case let .superseded(snapshot):
             return decoratedMultiWaitSupersededValue(

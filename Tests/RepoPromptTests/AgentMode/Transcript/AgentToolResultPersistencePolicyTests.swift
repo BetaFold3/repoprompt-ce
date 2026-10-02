@@ -38,6 +38,72 @@ final class AgentToolResultPersistencePolicyTests: XCTestCase {
         }
     }
 
+    func testDelegatedQuestionNoticesSurviveNonObjectSummaries() throws {
+        let notices: [[String: String]] = [[
+            "kind": "delegated_question",
+            "child_session_id": UUID().uuidString,
+            "interaction_id": UUID().uuidString,
+            "text": "Which branch should I use?"
+        ]]
+        let cases: [(summary: String, matches: (Any?) -> Bool)] = [
+            ("[\"a\",\"b\"]", { ($0 as? [String]) == ["a", "b"] }),
+            ("\"done\"", { ($0 as? String) == "done" }),
+            ("42", { ($0 as? Int) == 42 }),
+            ("plain text summary", { ($0 as? String) == "plain text summary" })
+        ]
+        for row in cases {
+            let wrapped = AgentToolResultPersistencePolicy.preservingDelegatedQuestionNotices(notices, in: row.summary)
+            let object = try decodedObject(wrapped)
+            XCTAssertEqual(
+                object[AgentDelegatedQuestionNoticeWire.resultKey] as? [[String: String]],
+                notices, row.summary
+            )
+            XCTAssertTrue(row.matches(object["summary"]), "Non-object summary is kept under `summary`: \(row.summary)")
+        }
+        let objectSummary = AgentToolResultPersistencePolicy.preservingDelegatedQuestionNotices(
+            notices,
+            in: jsonString(["status": "success"])
+        )
+        let object = try decodedObject(objectSummary)
+        XCTAssertEqual(object["status"] as? String, "success")
+        XCTAssertNil(object["summary"], "Object summaries keep their shape and gain only the notice sibling")
+    }
+
+    func testDelegatedQuestionNoticeStrippingKeepsDistinctRenderedText() throws {
+        let notices: [[String: String]] = [[
+            "kind": "delegated_question",
+            "child_session_id": UUID().uuidString,
+            "interaction_id": UUID().uuidString,
+            "text": "Which branch should I use?"
+        ]]
+        for toolName in ["read_file", "ask_user", "bash"] {
+            let base: [String: Any] = ["status": "success", "contents": "file body"]
+            var withNotices = base
+            withNotices[AgentDelegatedQuestionNoticeWire.resultKey] = notices
+            let renderedText = "Rendered presentation distinct from the raw JSON"
+
+            var plain = AgentChatItem.toolResult(name: toolName, resultJSON: jsonString(base), isError: false)
+            plain.text = renderedText
+            var delivered = AgentChatItem.toolResult(name: toolName, resultJSON: jsonString(withNotices), isError: false)
+            delivered.text = renderedText
+
+            let plainResult = try XCTUnwrap(AgentToolResultPersistencePolicy.sanitizedToolResult(for: plain))
+            let deliveredResult = try XCTUnwrap(AgentToolResultPersistencePolicy.sanitizedToolResult(for: delivered))
+            var deliveredObject = try decodedObject(XCTUnwrap(deliveredResult.resultJSON))
+            XCTAssertEqual(
+                deliveredObject.removeValue(forKey: AgentDelegatedQuestionNoticeWire.resultKey) as? [[String: String]],
+                notices, toolName
+            )
+            XCTAssertEqual(
+                jsonString(deliveredObject),
+                try jsonString(decodedObject(XCTUnwrap(plainResult.resultJSON))),
+                "Notice stripping must summarize exactly what the same item without notices would, \(toolName)"
+            )
+            XCTAssertEqual(deliveredResult.transcriptStatus, plainResult.transcriptStatus, toolName)
+            XCTAssertEqual(deliveredResult.summaryOnly, plainResult.summaryOnly, toolName)
+        }
+    }
+
     func testConfirmedOracleSendToolNamesPersistBoundedStructuredSummaries() throws {
         let rows: [(toolName: String, receivesOracleMetadata: Bool)] = [
             ("ask_oracle", true),

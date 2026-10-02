@@ -214,7 +214,8 @@ final class ACPIntegratedAgentModeRunner {
             _ authorized: Bool,
             _ startupFailureReason: String?
         ) -> Bool,
-        providerStartBootstrapObserver: @escaping () -> Void
+        providerStartBootstrapObserver: @escaping () -> Void,
+        delegatedQuestionStageID: UUID? = nil
     ) async {
         #if DEBUG
             var providerBoundaryResponsibilityTransferred = false
@@ -317,7 +318,8 @@ final class ACPIntegratedAgentModeRunner {
                             controller: existingController,
                             runRequest: runRequest,
                             deferredLease: deferredLease,
-                            attachmentReservationID: attachmentReservationID
+                            attachmentReservationID: attachmentReservationID,
+                            delegatedQuestionStageID: delegatedQuestionStageID
                         )
                     } onCancel: {}
                 }
@@ -541,7 +543,8 @@ final class ACPIntegratedAgentModeRunner {
                     providerStartBoundaryReporter: providerStartBoundaryReporter,
                     providerStartBootstrapObserver: providerStartBootstrapObserver,
                     attachmentReservationID: attachmentReservationID,
-                    startupTeardownClaim: startupTeardownClaim
+                    startupTeardownClaim: startupTeardownClaim,
+                    delegatedQuestionStageID: delegatedQuestionStageID
                 )
             } onCancel: { [weak self] in
                 guard freshRunRequest.agentKind == .ohMyPi else { return }
@@ -1067,7 +1070,8 @@ final class ACPIntegratedAgentModeRunner {
         ) -> Bool,
         providerStartBootstrapObserver: () -> Void,
         attachmentReservationID: UUID?,
-        startupTeardownClaim: StartupTeardownClaim
+        startupTeardownClaim: StartupTeardownClaim,
+        delegatedQuestionStageID: UUID?
     ) async {
         #if DEBUG
             var providerBoundaryReported = false
@@ -1408,7 +1412,8 @@ final class ACPIntegratedAgentModeRunner {
                 attachments: attachments,
                 controller: controller,
                 runRequest: runRequest,
-                attachmentReservationID: attachmentReservationID
+                attachmentReservationID: attachmentReservationID,
+                delegatedQuestionStageID: delegatedQuestionStageID
             )
         } catch is CancellationError {
             if !providerInitializationCompleted {
@@ -1469,7 +1474,8 @@ final class ACPIntegratedAgentModeRunner {
         controller: ACPAgentSessionController,
         runRequest: ACPRunRequest,
         deferredLease: MCPBootstrapLease?,
-        attachmentReservationID: UUID?
+        attachmentReservationID: UUID?,
+        delegatedQuestionStageID: UUID?
     ) async {
         do {
             guard await controller.hasReusableSession else {
@@ -1535,7 +1541,8 @@ final class ACPIntegratedAgentModeRunner {
                 attachments: attachments,
                 controller: controller,
                 runRequest: runRequest,
-                attachmentReservationID: attachmentReservationID
+                attachmentReservationID: attachmentReservationID,
+                delegatedQuestionStageID: delegatedQuestionStageID
             )
         } catch is CancellationError {
             await finalize(
@@ -1575,7 +1582,8 @@ final class ACPIntegratedAgentModeRunner {
         attachments: [AgentImageAttachment],
         controller: ACPAgentSessionController,
         runRequest: ACPRunRequest,
-        attachmentReservationID: UUID?
+        attachmentReservationID: UUID?,
+        delegatedQuestionStageID: UUID?
     ) async {
         log("prompt turn begin", runID: runID)
         setRunningStatus("Thinking…", source: .transport, session: session, urgent: true)
@@ -1586,6 +1594,12 @@ final class ACPIntegratedAgentModeRunner {
             attachments
         )
         hooks.recordPendingHandoffSendOutcome(session, true)
+        // Delegated child-question notices in this input acknowledge only at the actual
+        // `session/prompt` write — not optimistically here, and not at turn end (plan §6.2).
+        let delegatedQuestionAcknowledgement = makeDelegatedQuestionPromptAcknowledgement(
+            session: session,
+            stageID: delegatedQuestionStageID
+        )
         hooks.stageConsumedAttachmentFilesForDeferredCleanup(attachments, session)
         hooks.markAttachmentsConsumed(session, attachmentReservationID)
 
@@ -1604,11 +1618,18 @@ final class ACPIntegratedAgentModeRunner {
 
         do {
             log("controller.prompt begin", runID: runID)
-            try await controller.prompt(agentMessage, request: runRequest)
+            try await controller.prompt(
+                agentMessage,
+                request: runRequest,
+                onSubmitted: delegatedQuestionAcknowledgement.onSubmitted
+            )
+            await delegatedQuestionAcknowledgement.settle()
             let identity = await controller.currentProviderSessionIdentity()
             applyProviderSessionIdentity(identity, session: session)
             log("controller.prompt returned; awaiting event consumer", runID: runID)
         } catch {
+            // Releases the staged notices unless the prompt was actually written.
+            await delegatedQuestionAcknowledgement.settle()
             let identity = await controller.refreshProviderSessionIdentityAfterPromptInterruption()
             applyProviderSessionIdentity(identity, session: session)
             let normalizedError = await controller.normalizeError(error)
@@ -1643,6 +1664,39 @@ final class ACPIntegratedAgentModeRunner {
             errorText: outcome.errorText,
             notifyTurnComplete: outcome.terminalState == .completed,
             shouldShutdownController: outcome.terminalState != .completed
+        )
+    }
+
+    /// Settles delegated child-question notices staged into one ACP prompt (plan §6.2):
+    /// `onSubmitted` (passed to `ACPAgentSessionController.prompt`) fires at the actual
+    /// `session/prompt` write and acknowledges that exact stage; `settle()` — awaited once the
+    /// prompt returned or threw, before finalization — releases the stage when no write happened
+    /// and otherwise just joins the acknowledgement. A nil stage is a no-op.
+    private func makeDelegatedQuestionPromptAcknowledgement(
+        session: AgentModeViewModel.TabSession,
+        stageID: UUID?
+    ) -> (onSubmitted: (@Sendable () -> Void)?, settle: () async -> Void) {
+        guard let stageID else { return (nil, {}) }
+        let (submissions, continuation) = AsyncStream<Void>.makeStream(bufferingPolicy: .bufferingNewest(1))
+        let hooks = hooks
+        let acknowledgement = Task { @MainActor [weak session] in
+            var submitted = false
+            for await _ in submissions {
+                submitted = true
+                break
+            }
+            guard let session else { return }
+            hooks.recordDelegatedQuestionNoticeSendOutcome(session, stageID, submitted)
+        }
+        return (
+            onSubmitted: {
+                continuation.yield(())
+                continuation.finish()
+            },
+            settle: {
+                continuation.finish()
+                await acknowledgement.value
+            }
         )
     }
 

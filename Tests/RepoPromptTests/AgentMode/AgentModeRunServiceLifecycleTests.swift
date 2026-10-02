@@ -3433,6 +3433,170 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         XCTAssertEqual(session.runState, .completed)
     }
 
+    /// Plan §6.2 / OracleA 6: staged delegated-question notices in an ACP prompt are acknowledged at
+    /// the actual `session/prompt` write — while the turn is still running — not at turn completion,
+    /// and a cancellation after the write never also reports the stage as unsent.
+    func testACPDelegatedQuestionStageIsAcknowledgedAtThePromptWriteNotAtTurnCompletion() async throws {
+        let recorder = LifecycleRecorder()
+        let workspace = try makeTemporaryDirectory()
+        let provider = try LifecycleFakeACPProvider(
+            providerID: .cursor,
+            commandPath: makeFakeACPServerScript().path,
+            recorder: recorder
+        )
+        let harness = makeHarness(
+            recorder: recorder,
+            workspacePathProvider: { _ in workspace.path },
+            acpProviderFactory: { _, _ in provider }
+        )
+        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        session.selectedAgent = .cursor
+        let stageID = UUID()
+        let acknowledged = "delegated-notice:\(stageID.uuidString):true"
+
+        _ = await harness.service.startRun(
+            tabID: session.tabID,
+            session: session,
+            initialUserMessage: "prompt carrying staged notices",
+            initialMessageForRun: "prompt carrying staged notices",
+            attachments: [],
+            delegatedQuestionStageID: stageID
+        )
+        // The fake server never answers the first prompt, so the turn stays running.
+        try await waitUntil("ACP prompt write must acknowledge the stage while the turn runs") {
+            recorder.events.contains(acknowledged)
+        }
+        XCTAssertTrue(session.runState.isActive, "Acknowledged before the turn completed")
+
+        await harness.service.cancelRun(
+            tabID: session.tabID,
+            session: session,
+            completion: .terminalPublished
+        )
+        let stageEvents = recorder.events.filter { $0.hasPrefix("delegated-notice:\(stageID.uuidString)") }
+        XCTAssertEqual(stageEvents, [acknowledged], "Exactly one outcome per stage; cancellation after the write never reports unsent")
+    }
+
+    /// Plan §6.2 / OracleA 6, OracleB 7: an ACP prompt that fails before its `session/prompt` write
+    /// never acknowledges the staged notices; the runner reports that exact stage as not sent, so the
+    /// notices stay deliverable.
+    func testACPDelegatedQuestionStageIsReportedNotSentWhenThePromptIsNeverWritten() async throws {
+        let recorder = LifecycleRecorder()
+        let workspace = try makeTemporaryDirectory()
+        let provider = try LifecycleFakeACPProvider(
+            providerID: .cursor,
+            commandPath: makeFakeACPServerScript().path,
+            recorder: recorder,
+            failPromptBuild: true
+        )
+        let harness = makeHarness(
+            recorder: recorder,
+            workspacePathProvider: { _ in workspace.path },
+            acpProviderFactory: { _, _ in provider }
+        )
+        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        session.selectedAgent = .cursor
+        let stageID = UUID()
+
+        _ = await harness.service.startRun(
+            tabID: session.tabID,
+            session: session,
+            initialUserMessage: "prompt carrying staged notices",
+            initialMessageForRun: "prompt carrying staged notices",
+            attachments: [],
+            delegatedQuestionStageID: stageID
+        )
+        try await withLifecycleTimeout("ACP prompt that fails before its write") {
+            await session.agentTask?.value
+        }
+
+        XCTAssertTrue(recorder.events.contains("provider:prompt-build-failed"), "Precondition: the prompt was never written")
+        let stageEvents = recorder.events.filter { $0.hasPrefix("delegated-notice:\(stageID.uuidString)") }
+        XCTAssertEqual(
+            stageEvents,
+            ["delegated-notice:\(stageID.uuidString):false"],
+            "A prompt that never reached the provider releases its stage exactly once and never acknowledges it"
+        )
+        XCTAssertFalse(session.runState.isActive)
+    }
+
+    /// Plan §6.2 / evidence scout: Codex `NativeSendOutcome.didSend` is also true for a queued fallback,
+    /// which has not reached the model. Staged delegated-question notices acknowledge only after an
+    /// actual send, never before it, and a queued fallback reports its stage as not sent.
+    func testCodexDelegatedQuestionStageAcknowledgesOnlyAfterAnActualSendNotAQueuedFallback() async {
+        // Actual send: acknowledged exactly once, after the provider accepted the turn.
+        do {
+            let recorder = LifecycleRecorder()
+            let controller = LifecycleNoopCodexController(recorder: recorder)
+            let harness = makeHarness(recorder: recorder, codexController: controller)
+            let session = AgentModeViewModel.TabSession(tabID: UUID())
+            session.selectedAgent = .codexExec
+            session.codexConversationID = "saved-thread"
+            session.codexRolloutPath = "/tmp/saved-thread.jsonl"
+            let stageID = UUID()
+            let acknowledged = "delegated-notice:\(stageID.uuidString):true"
+
+            let outcome = await harness.service.startRun(
+                tabID: session.tabID,
+                session: session,
+                initialUserMessage: "send carrying staged notices",
+                initialMessageForRun: "send carrying staged notices",
+                attachments: [],
+                delegatedQuestionStageID: stageID
+            )
+
+            XCTAssertEqual(outcome, .sent)
+            let events = recorder.events
+            XCTAssertEqual(events.filter { $0.hasPrefix("delegated-notice:") }, [acknowledged])
+            let sendIndex = events.firstIndex(of: "codex:send")
+            let acknowledgementIndex = events.firstIndex(of: acknowledged)
+            XCTAssertNotNil(sendIndex)
+            XCTAssertNotNil(acknowledgementIndex)
+            if let sendIndex, let acknowledgementIndex {
+                XCTAssertLessThan(sendIndex, acknowledgementIndex, "Never acknowledged before the provider accepted the turn")
+            }
+            await harness.service.cancelRun(tabID: session.tabID, session: session)
+        }
+
+        // Queued fallback: `didSend` is true, but the input has not reached the model.
+        do {
+            let recorder = LifecycleRecorder()
+            let controller = LifecycleNoopCodexController(
+                recorder: recorder,
+                sendBehavior: .failure,
+                activatesThread: true
+            )
+            let harness = makeHarness(recorder: recorder, codexController: controller)
+            let session = AgentModeViewModel.TabSession(tabID: UUID())
+            session.selectedAgent = .codexExec
+            session.runState = .running
+            session.runID = UUID()
+            let ownership = session.beginRunAttempt(source: "test.queuedFallbackNotice")
+            let stageID = UUID()
+
+            let outcome = await harness.service.startRun(
+                tabID: session.tabID,
+                session: session,
+                initialUserMessage: "queued send carrying staged notices",
+                initialMessageForRun: "queued send carrying staged notices",
+                attachments: [],
+                delegatedQuestionStageID: stageID
+            )
+
+            guard case .queuedFallback? = outcome else {
+                _ = session.endRunAttempt(ifCurrent: ownership, source: "test.cleanup")
+                return XCTFail("Expected a durable Codex fallback, got \(String(describing: outcome))")
+            }
+            XCTAssertEqual(outcome?.didSend, true, "Precondition: the coordinator reports a queued fallback as sent")
+            XCTAssertEqual(
+                recorder.events.filter { $0.hasPrefix("delegated-notice:") },
+                ["delegated-notice:\(stageID.uuidString):false"],
+                "A queued fallback never acknowledges its stage; the notices stay deliverable"
+            )
+            _ = session.endRunAttempt(ifCurrent: ownership, source: "test.cleanup")
+        }
+    }
+
     func testCursorMidPromptPublicationOnlyCancellationAllowsCleanupAndImmediateSuccessor() async throws {
         let recorder = LifecycleRecorder()
         let workspace = try makeTemporaryDirectory()
@@ -5048,7 +5212,12 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
             stageResumeRecoveryHandoffIfNeeded: { _ in },
             prependPendingHandoffIfNeeded: { text, _ in text },
             recordPendingHandoffSendOutcome: { _, didSend in recorder.record("handoff:\(didSend)") },
-            signalMCPInstructionDelivered: { _ in recorder.record("delivered") }
+            signalMCPInstructionDelivered: { _ in recorder.record("delivered") },
+            recordDelegatedQuestionNoticeSendOutcome: { _, stageID, didSend in
+                // Only staged inputs are recorded, so runs without notices keep their event sequences.
+                guard let stageID else { return }
+                recorder.record("delegated-notice:\(stageID.uuidString):\(didSend)")
+            }
         )
     }
 
@@ -5704,6 +5873,8 @@ final class LifecycleNoopCodexController: CodexSessionControlling {
     private var remainingResumeTimeouts: Int
     private(set) var startReferences: [CodexNativeSessionController.SessionRef?] = []
     private(set) var hasActiveThread = false
+    /// Text of every `startUserTurn` / `steerUserTurn` dispatch, in order.
+    private(set) var sentTexts: [String] = []
 
     init(
         recorder: LifecycleRecorder,
@@ -5806,11 +5977,13 @@ final class LifecycleNoopCodexController: CodexSessionControlling {
 
     func setThreadName(_ name: String, threadID: String?) async throws {}
     func startUserTurn(text: String, images: [AgentImageAttachment], model: String?, reasoningEffort: String?, serviceTier: String?) async throws -> CodexTurnStartReceipt {
+        sentTexts.append(text)
         try recordCodexSend()
         return CodexTurnStartReceipt(provisionalSubmissionID: "lifecycle-submission")
     }
 
     func steerUserTurn(text: String, images: [AgentImageAttachment], expectedTurnID: String) async throws -> CodexTurnSteerReceipt {
+        sentTexts.append(text)
         try recordCodexSend()
         return CodexTurnSteerReceipt(acceptedTurnID: expectedTurnID)
     }
@@ -5868,6 +6041,8 @@ private struct LifecycleFakeACPProvider: ACPAgentProvider {
     var failSupport = false
     var cancelSupport = false
     var recorder: LifecycleRecorder?
+    /// Fails building the `session/prompt` request, so the prompt is never written.
+    var failPromptBuild = false
 
     func support(for _: ACPRunRequest) async throws -> ACPSupportResult {
         recorder?.record("provider:support")
@@ -5909,7 +6084,11 @@ private struct LifecycleFakeACPProvider: ACPAgentProvider {
         for message: AgentMessage,
         request: ACPRunRequest
     ) throws -> [[String: Any]] {
-        [["type": "text", "text": message.userMessage]]
+        if failPromptBuild {
+            recorder?.record("provider:prompt-build-failed")
+            throw LifecycleTestError.expectedACPDispatchStop
+        }
+        return [["type": "text", "text": message.userMessage]]
     }
 
     func normalizeSessionUpdate(

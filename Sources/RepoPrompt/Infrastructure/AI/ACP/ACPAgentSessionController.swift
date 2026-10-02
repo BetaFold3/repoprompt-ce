@@ -606,9 +606,14 @@ actor ACPAgentSessionController {
         providerSessionIdentity
     }
 
+    /// Submits one prompt turn and returns when the provider answers `session/prompt` (turn end).
+    /// `onSubmitted` runs once, synchronously on this actor, immediately after the request was
+    /// written to the provider transport — the actual dispatch boundary — and never when building
+    /// or writing the request failed.
     func prompt(
         _ message: AgentMessage,
-        request overrideRunRequest: ACPRunRequest? = nil
+        request overrideRunRequest: ACPRunRequest? = nil,
+        onSubmitted: (@Sendable () -> Void)? = nil
     ) async throws {
         guard state == .sessionOpen || state == .promptRunning, let sessionID else {
             throw ControllerError.invalidState(expected: "sessionOpen or promptRunning", actual: state)
@@ -642,13 +647,14 @@ actor ACPAgentSessionController {
                     )
                 }
             #endif
-            response = try await sendRequest(
+            response = try await sendRequestResponse(
                 method: "session/prompt",
                 params: [
                     "sessionId": sessionID,
                     "prompt": promptBlocks
-                ]
-            )
+                ],
+                onWritten: onSubmitted
+            ).result
             #if DEBUG
                 if isRawACPCaptureEnabled {
                     capturePromptTraceEvent(
@@ -2120,7 +2126,8 @@ actor ACPAgentSessionController {
     private func sendRequestResponse(
         method: String,
         params: [String: Any],
-        explicitTimeoutInterval: TimeInterval? = nil
+        explicitTimeoutInterval: TimeInterval? = nil,
+        onWritten: (@Sendable () -> Void)? = nil
     ) async throws -> RequestResponse {
         switch state {
         case .closing, .closed, .failed:
@@ -2151,6 +2158,7 @@ actor ACPAgentSessionController {
                     "method": method,
                     "params": params
                 ])
+                onWritten?()
             } catch {
                 let pendingRequest = pendingRequests.removeValue(forKey: requestID.storageKey)
                 pendingRequest?.timeoutTask?.cancel()

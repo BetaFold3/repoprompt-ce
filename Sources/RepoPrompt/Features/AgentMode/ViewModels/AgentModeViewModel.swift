@@ -3090,6 +3090,9 @@ final class AgentModeViewModel: ObservableObject {
             },
             signalMCPInstructionDelivered: { [weak self] session in
                 await self?.signalMCPInstructionDelivered(for: session)
+            },
+            recordDelegatedQuestionNoticeSendOutcome: { [weak self] session, stageID, didSend in
+                self?.recordDelegatedQuestionNoticeSendOutcome(for: session, stageID: stageID, didSend: didSend)
             }
         )
         let toolTrackingHooks = makeToolTrackingHooks()
@@ -17178,9 +17181,8 @@ final class AgentModeViewModel: ObservableObject {
 
     @MainActor
     private func recordPendingHandoffSendOutcome(for session: TabSession, didSend: Bool) {
-        // Delegated child-question notices staged into this turn's first input commit or roll
-        // back with the same provider send outcome (plan §6.2, idle parent).
-        recordDelegatedQuestionNoticeSendOutcome(for: session, didSend: didSend)
+        // Delegated child-question notices settle separately, keyed by their exact stage
+        // (`Hooks.recordDelegatedQuestionNoticeSendOutcome`), never by this tab-wide outcome.
         guard session.pendingHandoff.isStagedForSend else { return }
         if didSend {
             session.pendingHandoff.clearAfterSend()
@@ -17401,10 +17403,13 @@ final class AgentModeViewModel: ObservableObject {
             agent: session.selectedAgent,
             session: session
         )
-        // Idle parent: pending child questions ride on this turn's first input as a labeled
-        // runtime block (never the user's text). Committed by the provider send outcome, which
-        // happens after the run identity exists.
-        let augmentedInitialMessage = stageDelegatedQuestionNoticesForTurnInput(augmentedMessage, session: session)
+        // Idle parent only (plan §6.2): pending child questions ride on this turn's first input
+        // as a labeled runtime block (never the user's text). A busy parent gets them with its
+        // next eligible tool result instead, so steer/supersede/queued-fallback inputs never
+        // carry them. The runner settles exactly this stage at its actual provider submission.
+        let augmentedInitialMessage = session.runState.isActive
+            ? augmentedMessage
+            : stageDelegatedQuestionNoticesForTurnInput(augmentedMessage, session: session)
         let delegatedQuestionStageID = augmentedInitialMessage == augmentedMessage
             ? nil
             : delegatedQuestionTurnStageID(forTabID: tabID)
@@ -17435,14 +17440,22 @@ final class AgentModeViewModel: ObservableObject {
             initialMessageForRun: initialMessageForRun,
             attachments: attachments,
             codexFallbackContext: preparedCodexFallbackContext,
-            providerHandoffAuthorization: providerHandoffAuthorization
+            providerHandoffAuthorization: providerHandoffAuthorization,
+            delegatedQuestionStageID: delegatedQuestionStageID
         )
         // A stage the send outcome did not resolve is released when the start never reached the
-        // provider (stale/cancelled/failed or an inactive run); otherwise it awaits that outcome.
+        // provider (stale/cancelled/failed, a queued Codex fallback, or an inactive run);
+        // otherwise it awaits that exact stage's outcome.
+        let startReportedNoSend = switch startOutcome {
+        case .sent?, nil:
+            false
+        case .some:
+            true
+        }
         settleDelegatedQuestionTurnStageAfterRunStart(
             delegatedQuestionStageID,
             session: session,
-            startReportedNoSend: startOutcome.map { !$0.didSend } ?? false
+            startReportedNoSend: startReportedNoSend
         )
         return startOutcome
     }

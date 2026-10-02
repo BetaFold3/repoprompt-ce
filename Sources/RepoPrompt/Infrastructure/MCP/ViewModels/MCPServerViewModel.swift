@@ -3444,6 +3444,18 @@ final class MCPServerViewModel: ObservableObject {
         let indexedRunID = shouldRegisterRunToolExecution(toolName: name)
             ? executionRunID
             : nil
+        // Delegated child-question notices (plan §6.2) may ride on this result only while the
+        // parent run attempt active when the tool started is still the active one.
+        let delegatedQuestionTarget: AgentDelegatedQuestionDeliveryTarget? = if let executionRunID,
+                                                                                AgentDelegatedQuestionNoticeWire.isEligible(toolName: name),
+                                                                                let targetWindow = try? requireTargetWindow()
+        {
+            targetWindow.agentModeViewModel.mcpDelegatedQuestionDeliveryTarget(
+                parentRunID: executionRunID
+            )
+        } else {
+            nil
+        }
 
         // Generate a unique token for this tool execution to prevent cleanup races
         let toolToken = UUID()
@@ -3635,7 +3647,7 @@ final class MCPServerViewModel: ObservableObject {
             if T.self == Value.self,
                let value = result as? Value,
                case let .object(object) = value,
-               let executionRunID,
+               let delegatedQuestionTarget,
                AgentDelegatedQuestionNoticeWire.isEligible(toolName: name),
                object["is_error"]?.boolValue != true,
                object["isError"]?.boolValue != true,
@@ -3649,27 +3661,28 @@ final class MCPServerViewModel: ObservableObject {
                       let targetWindow = try? requireTargetWindow()
                 else { return result }
                 // runTool is MainActor-isolated. Reservation, attachment, and return never
-                // suspend; the connection handler commits only at its final SDK handoff.
+                // suspend. The connection handler hands completion observers the unannotated
+                // value, then settles the reservation at its final handoff after the last
+                // suspending completion processing: it revalidates the captured parent attempt
+                // and each question there, strips any notice that is no longer deliverable (or
+                // every notice when cancelled), records the committed notices in the parent
+                // transcript, and formats and returns the value without suspending again.
                 let coveredKeys = name == MCPWindowToolName.agentRun
                     ? AgentRunMCPToolService.coveredDelegatedQuestionNoticeKeys(in: value)
                     : []
                 let vm = targetWindow.agentModeViewModel
                 guard let reservation = vm.mcpReserveDelegatedQuestionNotices(
-                    parentRunID: executionRunID,
+                    target: delegatedQuestionTarget,
                     coveredKeys: coveredKeys
                 ) else { return result }
                 let attached = AgentDelegatedQuestionNoticeWire.attaching(reservation.payloads, to: value) ?? value
                 if let delivery = ServerNetworkManager.currentToolResultDelivery {
-                    let reservationID = reservation.id
-                    delivery.onFinish { [weak vm] delivered in
-                        Task { @MainActor [weak vm] in
-                            if delivered {
-                                vm?.mcpCommitDelegatedQuestionNoticeReservation(reservationID)
-                            } else {
-                                vm?.mcpReleaseDelegatedQuestionNoticeReservation(reservationID)
-                            }
-                        }
-                    }
+                    Self.registerDelegatedQuestionNoticeParticipant(
+                        on: delivery,
+                        viewModel: vm,
+                        reservationID: reservation.id,
+                        attachedKeys: reservation.attachedKeys
+                    )
                 } else {
                     // Direct callers have no connection-handler delivery boundary.
                     vm.mcpCommitDelegatedQuestionNoticeReservation(reservation.id)
@@ -3692,6 +3705,43 @@ final class MCPServerViewModel: ObservableObject {
             }
             throw error
         }
+    }
+
+    /// Registers one delegated-question reservation on the connection handler's final-handoff
+    /// transaction (plan §6.2). Completion observers see the result without the attached
+    /// notices. Settlement hops to the main actor, where
+    /// `mcpSettleDelegatedQuestionNoticeReservation` revalidates the reservation, the captured
+    /// attempt, each question, and the handler task's cancellation, then commits or strips.
+    /// Abandonment releases the reservation.
+    static func registerDelegatedQuestionNoticeParticipant(
+        on delivery: MCPToolResultDeliveryTransaction,
+        viewModel vm: AgentModeViewModel,
+        reservationID: UUID,
+        attachedKeys: Set<AgentDelegatedQuestionNoticeKey>
+    ) {
+        delivery.register(
+            unannotate: { value in
+                AgentDelegatedQuestionNoticeWire.removing(attachedKeys, from: value)
+            },
+            settle: { [weak vm] value, handOff in
+                await MainActor.run { [weak vm] () -> Value in
+                    guard let vm else {
+                        return AgentDelegatedQuestionNoticeWire.removing(attachedKeys, from: value)
+                    }
+                    return vm.mcpSettleDelegatedQuestionNoticeReservation(
+                        reservationID,
+                        attachedKeys: attachedKeys,
+                        value: value,
+                        handOff: handOff
+                    )
+                }
+            },
+            abandon: { [weak vm] in
+                Task { @MainActor [weak vm] in
+                    vm?.mcpReleaseDelegatedQuestionNoticeReservation(reservationID)
+                }
+            }
+        )
     }
 
     // -----------------------------------------------------------------

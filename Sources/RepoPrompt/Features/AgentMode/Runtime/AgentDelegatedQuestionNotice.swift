@@ -81,9 +81,32 @@ struct AgentDelegatedQuestionNoticePayload: Equatable {
     }
 
     /// Labeled, ID-bearing text block shown to the parent model and persisted with the tool
-    /// result or turn input that delivered it.
+    /// result or turn input that delivered it. Child-controlled strings can never form a runtime
+    /// notice wrapper tag (`AgentDelegatedQuestionNoticeWire.neutralizingRuntimeNoticeDelimiters`).
     var renderedText: String {
-        var lines: [String] = [AgentDelegatedQuestionNoticeWire.noticeHeader, guidanceText]
+        let lines = [AgentDelegatedQuestionNoticeWire.noticeHeader, guidanceText] + contentLines
+        return AgentDelegatedQuestionNoticeWire.neutralizingRuntimeNoticeDelimiters(lines.joined(separator: "\n"))
+    }
+
+    /// Persistence-only record of a question the parent already received inside its covering
+    /// `agent_run` result snapshot (plan §6.2 persistence). The ordinary storage summary of that
+    /// result keeps only the interaction identity, so this labeled, ID-bearing record keeps the
+    /// complete question content (title, context, questions, options, and selection constraints)
+    /// in the parent transcript. It carries no guidance, because the parent never saw any, and it
+    /// is never added to the returned result.
+    var coveredRecordText: String {
+        let sessionID = key.childSessionID.uuidString
+        let interactionID = key.interactionID.uuidString
+        let lines = [
+            AgentDelegatedQuestionNoticeWire.coveredRecordHeader,
+            "Child session \"\(childSessionName)\" (`\(sessionID)`) asked an `ask_user` question (interaction `\(interactionID)`). The parent received it in its `agent_run` result; this record preserves the complete question for history."
+        ] + contentLines
+        return AgentDelegatedQuestionNoticeWire.neutralizingRuntimeNoticeDelimiters(lines.joined(separator: "\n"))
+    }
+
+    /// Question content shared by the delivered notice and the covered record.
+    private var contentLines: [String] {
+        var lines: [String] = []
         if let title = Self.nonEmpty(title) {
             lines.append("Title: \(title)")
         }
@@ -106,7 +129,7 @@ struct AgentDelegatedQuestionNoticePayload: Equatable {
                 }
             }
         }
-        return lines.joined(separator: "\n")
+        return lines
     }
 
     /// Structured entry carried under `AgentDelegatedQuestionNoticeWire.resultKey`. The `text`
@@ -186,10 +209,17 @@ enum AgentDelegatedQuestionNoticeWire {
     static let oraclePendingReason = "interrupted_by_child_question"
     /// First line of every rendered notice block.
     static let noticeHeader = "[RepoPrompt runtime notice: delegated child question — not user input]"
+    /// First line of every persistence-only covered-question record
+    /// (`AgentDelegatedQuestionNoticePayload.coveredRecordText`).
+    static let coveredRecordHeader = "[RepoPrompt runtime record: delegated child question delivered in an agent_run result — not user input]"
+    /// Tag name of the block wrapping next-turn notices in a parent's provider input.
+    static let runtimeNoticeTagName = "repoprompt_runtime_notice"
 
     /// Explicit allowlist of RepoPrompt MCP tools whose object results may carry notices in
     /// `resultKey`. Excludes tools whose results the app or model parses structurally without
-    /// a dedicated field (`ask_user`, `apply_edits`) and long-running or side-effect tools.
+    /// a dedicated field (`ask_user`, `apply_edits`) and mutating or side-effect tools. Bounded
+    /// waits (`ask_oracle`, `oracle_send`, `agent_run`) are included: their results are the
+    /// natural handoff point for a parent blocked in them.
     static let eligibleToolNames: Set<String> = [
         MCPWindowToolName.readFile,
         MCPWindowToolName.search,
@@ -235,9 +265,78 @@ enum AgentDelegatedQuestionNoticeWire {
         return (.object(object), texts.isEmpty ? nil : renderedText(texts))
     }
 
+    /// Returns `value` without the notice entries for `keys` (matched by child session and
+    /// interaction ID), dropping `resultKey` once no entry remains. Every other key and value
+    /// passes through unchanged. Used at the final result handoff to remove notices that are no
+    /// longer deliverable (plan §6.2).
+    static func removing(_ keys: Set<AgentDelegatedQuestionNoticeKey>, from value: Value) -> Value {
+        guard !keys.isEmpty,
+              case var .object(object) = value,
+              let entries = object[resultKey]?.arrayValue
+        else {
+            return value
+        }
+        let kept = entries.filter { entry in
+            guard let key = noticeKey(of: entry) else { return true }
+            return !keys.contains(key)
+        }
+        guard kept.count != entries.count else { return value }
+        if kept.isEmpty {
+            object.removeValue(forKey: resultKey)
+        } else {
+            object[resultKey] = .array(kept)
+        }
+        return .object(object)
+    }
+
+    /// Joined rendered text of the notice entries for `keys` in `value`, in entry order, or nil
+    /// when none is present. Used to record exactly the notices committed at a result handoff.
+    static func renderedText(for keys: Set<AgentDelegatedQuestionNoticeKey>, in value: Value) -> String? {
+        guard !keys.isEmpty, let entries = value.objectValue?[resultKey]?.arrayValue else { return nil }
+        let texts = entries.compactMap { entry -> String? in
+            guard let key = noticeKey(of: entry), keys.contains(key) else { return nil }
+            return entry.objectValue?["text"]?.stringValue
+        }
+        return texts.isEmpty ? nil : renderedText(texts)
+    }
+
+    /// Identity of one structured notice entry, when well-formed.
+    static func noticeKey(of entry: Value) -> AgentDelegatedQuestionNoticeKey? {
+        guard let object = entry.objectValue,
+              let childSessionID = object["child_session_id"]?.stringValue.flatMap(UUID.init(uuidString:)),
+              let interactionID = object["interaction_id"]?.stringValue.flatMap(UUID.init(uuidString:))
+        else {
+            return nil
+        }
+        return AgentDelegatedQuestionNoticeKey(childSessionID: childSessionID, interactionID: interactionID)
+    }
+
+    /// Neutralizes every `<repoprompt_runtime_notice` / `</repoprompt_runtime_notice` opener
+    /// (case-insensitive, optional inner whitespace) by replacing its `<` with `‹`, so text a
+    /// child controls (session name, title, questions, options) can never close the next-turn
+    /// wrapper early or open a nested one (plan §6.2, OracleB finding 3).
+    static func neutralizingRuntimeNoticeDelimiters(_ text: String) -> String {
+        guard text.range(of: runtimeNoticeTagName, options: .caseInsensitive) != nil,
+              let regex = try? NSRegularExpression(
+                  pattern: "<(\\s*/?\\s*\(runtimeNoticeTagName))",
+                  options: [.caseInsensitive]
+              )
+        else {
+            return text
+        }
+        let range = NSRange(text.startIndex..., in: text)
+        return regex.stringByReplacingMatches(in: text, range: range, withTemplate: "‹$1")
+    }
+
     /// Joined notice block for one delivery (tool result or turn input).
     static func renderedText(for payloads: [AgentDelegatedQuestionNoticePayload]) -> String? {
         let texts = payloads.map(\.renderedText)
+        return texts.isEmpty ? nil : renderedText(texts)
+    }
+
+    /// Joined persistence-only record of the covered questions committed by one result handoff.
+    static func coveredRecordText(for payloads: [AgentDelegatedQuestionNoticePayload]) -> String? {
+        let texts = payloads.map(\.coveredRecordText)
         return texts.isEmpty ? nil : renderedText(texts)
     }
 

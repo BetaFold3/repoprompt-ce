@@ -8,6 +8,7 @@ import SwiftUI
 struct AgentDelegatedQuestionsBanner: View {
     static let maximumVisibleRows = 3
     static let rowHeight: CGFloat = 20
+    static let rowSpacing: CGFloat = 2
     static let verticalChrome: CGFloat = 12
 
     let rows: [AgentDelegatedQuestionBannerRow]
@@ -20,11 +21,11 @@ struct AgentDelegatedQuestionsBanner: View {
     static func reservedHeight(rowCount: Int) -> CGFloat {
         guard rowCount > 0 else { return 0 }
         let visibleRows = min(rowCount, maximumVisibleRows) + (rowCount > maximumVisibleRows ? 1 : 0)
-        return CGFloat(visibleRows) * rowHeight + verticalChrome
+        return CGFloat(visibleRows) * rowHeight + CGFloat(visibleRows - 1) * rowSpacing + verticalChrome
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 2) {
+        VStack(alignment: .leading, spacing: Self.rowSpacing) {
             ForEach(Array(rows.prefix(Self.maximumVisibleRows))) { row in
                 let error = actionError?.rowID == row.id ? actionError?.message : nil
                 HStack(spacing: 8) {

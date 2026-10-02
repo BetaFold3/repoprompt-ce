@@ -486,7 +486,9 @@ extension AgentModeViewModel {
 
         struct CodexFallbackQueueEntry: Equatable, Identifiable {
             let id: UUID
-            let providerText: String
+            /// Mutable only so a released delegated-question stage can remove its exact runtime
+            /// block before dispatch (`removeReleasedStageBlockFromQueuedCodexFallbacks`).
+            var providerText: String
             let images: [AgentImageAttachment]
             let taggedFileAttachments: [AgentTaggedFileAttachment]
             let model: String?
@@ -494,7 +496,7 @@ extension AgentModeViewModel {
             let serviceTier: String?
             let attachmentReservationID: UUID?
             let optimisticUserItemID: UUID?
-            let draftText: String
+            var draftText: String
             let origin: CodexFallbackOrigin
             let fallbackReason: CodexFallbackReason
             let originThreadID: String

@@ -11490,8 +11490,10 @@ actor ServerNetworkManager {
         //  tools/call  (UPDATED)
         // ------------------------------------------------------------------
         await server.withMethodHandler(CallTool.self) { [weak self] params in
+            // Final result handoff boundary (plan §6.2): settled once by a success branch below
+            // right before formatting; every other exit releases its participants.
             let delivery = MCPToolResultDeliveryTransaction()
-            defer { delivery.finish(delivered: false) }
+            defer { delivery.abandon() }
             guard let self else {
                 return CallTool.Result(
                     content: [MCP.Tool.Content.text(text: "Server unavailable", annotations: nil, _meta: nil)],
@@ -12970,7 +12972,7 @@ actor ServerNetworkManager {
                                                 recordScope: shouldTrackToolOwnership
                                             ) {
                                                 try await Self.$currentToolDispatchAuthorization.withValue(dispatchAuthorization) {
-                                                    let value = try await Self.$currentExplicitWindowRoutingHint.withValue(explicitWindowRoutingHint) {
+                                                    let dispatchedValue = try await Self.$currentExplicitWindowRoutingHint.withValue(explicitWindowRoutingHint) {
                                                         // A non-nil hint is built only from dispatch authorization captured for
                                                         // ownershipWindowID, so hint.windowID == ownershipWindowID by construction.
                                                         // Keep the effective-window override nil for non-explicit calls.
@@ -12995,21 +12997,9 @@ actor ServerNetworkManager {
                                                     #if DEBUG
                                                         await self.debugBeforeToolResultFormattingForTesting?(connectionID, toolName)
                                                     #endif
-                                                    // Build well‑structured, human‑readable content blocks for the result
-                                                    let contentBlocks = EditFlowPerf.measure(
-                                                        EditFlowPerf.Stage.MCPToolCall.formatResult,
-                                                        EditFlowPerf.Dimensions(toolName: toolName)
-                                                    ) {
-                                                        Self.formatToolResult(
-                                                            toolName: toolName,
-                                                            args: effectiveArgsForFormatter,
-                                                            value: value
-                                                        )
-                                                    }
-                                                    EditFlowPerf.lifecycleEvent(
-                                                        EditFlowPerf.Lifecycle.MCPToolCall.formatResultReturned,
-                                                        EditFlowPerf.Dimensions(toolName: toolName)
-                                                    )
+                                                    // Completion observers record the unannotated result: notices attached for the
+                                                    // final handoff are not part of the result until `delivery.settle` commits them.
+                                                    let observedValue = delivery.unannotated(dispatchedValue)
 
                                                     // Fire completion observer with result for detailed UI rendering
                                                     #if DEBUG
@@ -13024,7 +13014,7 @@ actor ServerNetworkManager {
                                                                 EditFlowPerf.Stage.MCPToolCall.completionObserverResultEncoding,
                                                                 EditFlowPerf.Dimensions(toolName: toolName)
                                                             ) {
-                                                                ToolOutputFormatter.rawJSONString(value)
+                                                                ToolOutputFormatter.rawJSONString(observedValue)
                                                             }
                                                             let eventObserverCount = await EditFlowPerf.measure(
                                                                 EditFlowPerf.Stage.MCPToolCall.completionObserverCallbacks,
@@ -13044,12 +13034,33 @@ actor ServerNetworkManager {
                                                         EditFlowPerf.Dimensions(toolName: toolName, status: "success")
                                                     )
 
+                                                    // Final handoff boundary (plan §6.2), after the last suspending completion
+                                                    // processing: attached participants (reserved delegated-question notices)
+                                                    // revalidate, then commit and record or strip. Nothing below suspends before
+                                                    // the content is returned. A cancelled handler strips and releases them,
+                                                    // because the SDK still sends a result returned after cancellation.
+                                                    let value = await delivery.settle(dispatchedValue, handOff: !Task.isCancelled)
+                                                    // Build well‑structured, human‑readable content blocks for the result
+                                                    let contentBlocks = EditFlowPerf.measure(
+                                                        EditFlowPerf.Stage.MCPToolCall.formatResult,
+                                                        EditFlowPerf.Dimensions(toolName: toolName)
+                                                    ) {
+                                                        Self.formatToolResult(
+                                                            toolName: toolName,
+                                                            args: effectiveArgsForFormatter,
+                                                            value: value
+                                                        )
+                                                    }
+                                                    EditFlowPerf.lifecycleEvent(
+                                                        EditFlowPerf.Lifecycle.MCPToolCall.formatResultReturned,
+                                                        EditFlowPerf.Dimensions(toolName: toolName)
+                                                    )
+
                                                     // Note: context_builder caller termination is NOT done here.
                                                     // The spawned agent connection is terminated by ContextBuilderAgentViewModel
                                                     // when the run completes. This prevents killing the host MCP client
                                                     // (e.g., Claude Desktop) that invoked context_builder.
 
-                                                    delivery.finish(delivered: !Task.isCancelled)
                                                     return handlerResult(
                                                         CallTool.Result(content: contentBlocks, isError: false),
                                                         outcome: "success"
@@ -13106,7 +13117,7 @@ actor ServerNetworkManager {
                                     } else {
                                         // Not window-scoped → no ownership tracking needed
                                         do {
-                                            let value = try await EditFlowPerf.measure(
+                                            let dispatchedValue = try await EditFlowPerf.measure(
                                                 EditFlowPerf.Stage.MCPToolCall.dispatch,
                                                 EditFlowPerf.Dimensions(toolName: toolName)
                                             ) {
@@ -13124,21 +13135,9 @@ actor ServerNetworkManager {
                                             #if DEBUG
                                                 await self.debugBeforeToolResultFormattingForTesting?(connectionID, toolName)
                                             #endif
-                                            // Build well‑structured, human‑readable content blocks for the result
-                                            let contentBlocks = EditFlowPerf.measure(
-                                                EditFlowPerf.Stage.MCPToolCall.formatResult,
-                                                EditFlowPerf.Dimensions(toolName: toolName)
-                                            ) {
-                                                Self.formatToolResult(
-                                                    toolName: toolName,
-                                                    args: effectiveArgsForFormatter,
-                                                    value: value
-                                                )
-                                            }
-                                            EditFlowPerf.lifecycleEvent(
-                                                EditFlowPerf.Lifecycle.MCPToolCall.formatResultReturned,
-                                                EditFlowPerf.Dimensions(toolName: toolName)
-                                            )
+                                            // Completion observers record the unannotated result; see the window-scoped
+                                            // branch above.
+                                            let observedValue = delivery.unannotated(dispatchedValue)
 
                                             // Fire completion observer with result for detailed UI rendering
                                             #if DEBUG
@@ -13153,7 +13152,7 @@ actor ServerNetworkManager {
                                                         EditFlowPerf.Stage.MCPToolCall.completionObserverResultEncoding,
                                                         EditFlowPerf.Dimensions(toolName: toolName)
                                                     ) {
-                                                        ToolOutputFormatter.rawJSONString(value)
+                                                        ToolOutputFormatter.rawJSONString(observedValue)
                                                     }
                                                     let eventObserverCount = await EditFlowPerf.measure(
                                                         EditFlowPerf.Stage.MCPToolCall.completionObserverCallbacks,
@@ -13173,10 +13172,28 @@ actor ServerNetworkManager {
                                                 EditFlowPerf.Dimensions(toolName: toolName, status: "success")
                                             )
 
+                                            // Final handoff boundary after the last suspending completion processing;
+                                            // nothing below suspends. See the window-scoped branch above.
+                                            let value = await delivery.settle(dispatchedValue, handOff: !Task.isCancelled)
+                                            // Build well‑structured, human‑readable content blocks for the result
+                                            let contentBlocks = EditFlowPerf.measure(
+                                                EditFlowPerf.Stage.MCPToolCall.formatResult,
+                                                EditFlowPerf.Dimensions(toolName: toolName)
+                                            ) {
+                                                Self.formatToolResult(
+                                                    toolName: toolName,
+                                                    args: effectiveArgsForFormatter,
+                                                    value: value
+                                                )
+                                            }
+                                            EditFlowPerf.lifecycleEvent(
+                                                EditFlowPerf.Lifecycle.MCPToolCall.formatResultReturned,
+                                                EditFlowPerf.Dimensions(toolName: toolName)
+                                            )
+
                                             // Note: context_builder caller termination is NOT done here.
                                             // See comment in window-scoped branch above.
 
-                                            delivery.finish(delivered: !Task.isCancelled)
                                             return handlerResult(
                                                 CallTool.Result(content: contentBlocks, isError: false),
                                                 outcome: "success"

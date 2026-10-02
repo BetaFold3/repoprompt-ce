@@ -131,6 +131,15 @@ final class AgentModeRunService {
         let recordPendingHandoffSendOutcome: (_ session: AgentModeViewModel.TabSession, _ didSend: Bool) -> Void
         /// Wakes MCP waiters once a steering instruction has actually been delivered to the provider.
         let signalMCPInstructionDelivered: (_ session: AgentModeViewModel.TabSession) async -> Void
+        /// Commits or rolls back exactly the delegated child-question notices staged into this
+        /// turn's first input (`stageID` from `AgentModeViewModel.startAgentRun`). Runners call it at
+        /// the actual provider submission outcome of the input that carried them (never at a
+        /// queued fallback or optimistic pre-dispatch point); a nil or superseded stage is a no-op.
+        var recordDelegatedQuestionNoticeSendOutcome: (
+            _ session: AgentModeViewModel.TabSession,
+            _ stageID: UUID?,
+            _ didSend: Bool
+        ) -> Void = { _, _, _ in }
     }
 
     private let dependencies: Dependencies
@@ -214,7 +223,8 @@ final class AgentModeRunService {
         initialMessageForRun: String,
         attachments: [AgentImageAttachment],
         codexFallbackContext: AgentModeViewModel.TabSession.CodexFallbackSubmissionContext? = nil,
-        providerHandoffAuthorization: (@MainActor () -> Bool)? = nil
+        providerHandoffAuthorization: (@MainActor () -> Bool)? = nil,
+        delegatedQuestionStageID: UUID? = nil
     ) async -> CodexAgentModeCoordinator.NativeSendOutcome? {
         assert(session.tabID == tabID, "AgentModeRunService.startRun requires the originating tab ID to match the TabSession tab ID")
         let selectedAgent = session.selectedAgent
@@ -299,7 +309,8 @@ final class AgentModeRunService {
                 session: session,
                 initialMessageForRun: initialMessageForRun,
                 attachments: attachments,
-                fallbackContext: codexFallbackContext
+                fallbackContext: codexFallbackContext,
+                delegatedQuestionStageID: delegatedQuestionStageID
             )
         }
 
@@ -360,7 +371,8 @@ final class AgentModeRunService {
                 initialUserMessage: initialUserMessage,
                 initialMessageForRun: initialMessageForRun,
                 attachments: attachments,
-                makeLease: makeLease
+                makeLease: makeLease,
+                delegatedQuestionStageID: delegatedQuestionStageID
             )
             return nil
         }
@@ -452,7 +464,8 @@ final class AgentModeRunService {
                 makeLease: makeLease,
                 providerStartAuthorizer: providerStartAuthorizer,
                 providerStartBoundaryReporter: providerStartBoundaryReporter,
-                providerStartBootstrapObserver: providerStartBootstrapObserver
+                providerStartBootstrapObserver: providerStartBootstrapObserver,
+                delegatedQuestionStageID: delegatedQuestionStageID
             )
             return nil
         }
@@ -462,7 +475,8 @@ final class AgentModeRunService {
             initialUserMessage: initialUserMessage,
             initialMessageForRun: initialMessageForRun,
             attachments: attachments,
-            makeLease: makeLease
+            makeLease: makeLease,
+            delegatedQuestionStageID: delegatedQuestionStageID
         )
         return nil
     }

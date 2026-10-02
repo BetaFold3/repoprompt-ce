@@ -22,7 +22,8 @@ final class HeadlessAgentModeRunner {
         initialUserMessage: String,
         initialMessageForRun: String,
         attachments: [AgentImageAttachment],
-        makeLease: (_ runID: UUID) -> MCPBootstrapLease
+        makeLease: (_ runID: UUID) -> MCPBootstrapLease,
+        delegatedQuestionStageID: UUID? = nil
     ) async {
         let attachmentReservationID = hooks.reserveAttachmentsForTurn(attachments, session)
 
@@ -128,7 +129,8 @@ final class HeadlessAgentModeRunner {
                         session: session,
                         runID: runID,
                         ownership: ownership,
-                        attachmentReservationID: attachmentReservationID
+                        attachmentReservationID: attachmentReservationID,
+                        delegatedQuestionStageID: delegatedQuestionStageID
                     )
                     return
                 }
@@ -148,7 +150,8 @@ final class HeadlessAgentModeRunner {
                     ownership: ownership,
                     attachments: attachments,
                     attachmentReservationID: attachmentReservationID,
-                    lease: lease
+                    lease: lease,
+                    delegatedQuestionStageID: delegatedQuestionStageID
                 )
             } onCancel: {}
         }
@@ -158,9 +161,11 @@ final class HeadlessAgentModeRunner {
         session: AgentModeViewModel.TabSession,
         runID: UUID,
         ownership: AgentRunOwnership,
-        attachmentReservationID: UUID?
+        attachmentReservationID: UUID?,
+        delegatedQuestionStageID: UUID?
     ) async {
         hooks.recordPendingHandoffSendOutcome(session, false)
+        hooks.recordDelegatedQuestionNoticeSendOutcome(session, delegatedQuestionStageID, false)
         await terminalCommitBarrier.commit(.init(
             session: session,
             ownership: ownership,
@@ -189,7 +194,8 @@ final class HeadlessAgentModeRunner {
         ownership: AgentRunOwnership,
         attachments: [AgentImageAttachment],
         attachmentReservationID: UUID?,
-        lease: MCPBootstrapLease
+        lease: MCPBootstrapLease,
+        delegatedQuestionStageID: UUID?
     ) async {
         var providerInitializationCompleted = false
         do {
@@ -198,6 +204,7 @@ final class HeadlessAgentModeRunner {
             providerInitializationCompleted = true
             await lease.providerInitializationCompleted(provider: session.selectedAgent.rawValue, outcome: "ready")
             hooks.recordPendingHandoffSendOutcome(session, true)
+            hooks.recordDelegatedQuestionNoticeSendOutcome(session, delegatedQuestionStageID, true)
             hooks.stageConsumedAttachmentFilesForDeferredCleanup(attachments, session)
             hooks.markAttachmentsConsumed(session, attachmentReservationID)
             _ = await lease.releaseWhenRouted()
@@ -240,6 +247,8 @@ final class HeadlessAgentModeRunner {
                 await lease.providerInitializationCompleted(provider: session.selectedAgent.rawValue, outcome: "cancelled")
             }
             hooks.recordPendingHandoffSendOutcome(session, false)
+            // No-op once the stream started (that stage already committed).
+            hooks.recordDelegatedQuestionNoticeSendOutcome(session, delegatedQuestionStageID, false)
             await terminalCommitBarrier.commit(.init(
                 session: session,
                 ownership: ownership,
@@ -262,6 +271,7 @@ final class HeadlessAgentModeRunner {
                 await lease.providerInitializationCompleted(provider: session.selectedAgent.rawValue, outcome: "failed")
             }
             hooks.recordPendingHandoffSendOutcome(session, false)
+            hooks.recordDelegatedQuestionNoticeSendOutcome(session, delegatedQuestionStageID, false)
             await terminalCommitBarrier.commit(.init(
                 session: session,
                 ownership: ownership,

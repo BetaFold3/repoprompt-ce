@@ -81,7 +81,13 @@ enum AgentToolResultPersistencePolicy {
         {
             var originalItem = item
             originalItem.toolResultJSON = originalJSON
-            originalItem.text = originalJSON
+            // Only the mirrored raw payload carries the notices; a distinct rendered
+            // `text` is the tool's own presentation and must reach the summarizer intact.
+            if item.text.trimmingCharacters(in: .whitespacesAndNewlines)
+                == raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            {
+                originalItem.text = originalJSON
+            }
             guard let original = sanitizedToolResult(for: originalItem, toolExecution: toolExecution, context: context) else { return nil }
             let resultJSON = preservingDelegatedQuestionNotices(notices, in: original.resultJSON ?? original.text)
             return AgentSanitizedToolResult(
@@ -441,10 +447,22 @@ enum AgentToolResultPersistencePolicy {
 
     /// The ordinary summary remains byte-bounded; delivered question notices are an
     /// additive exception because truncating them would lose the parent's actual input.
-    private static func preservingDelegatedQuestionNotices(_ notices: Any, in summaryJSON: String) -> String {
-        guard var object = jsonObject(from: summaryJSON) else { return summaryJSON }
-        object[AgentDelegatedQuestionNoticeWire.resultKey] = notices
-        return jsonString(from: object) ?? summaryJSON
+    /// A non-object summary (array, scalar, or plain text) is wrapped under `summary`
+    /// so the notices are never dropped merely because the summary is not an object.
+    /// Internal (not private) so the non-object shape can be pinned directly by tests.
+    static func preservingDelegatedQuestionNotices(_ notices: Any, in summaryJSON: String) -> String {
+        if var object = jsonObject(from: summaryJSON) {
+            object[AgentDelegatedQuestionNoticeWire.resultKey] = notices
+            return jsonString(from: object) ?? summaryJSON
+        }
+        let trimmed = summaryJSON.trimmingCharacters(in: .whitespacesAndNewlines)
+        let summary: Any = trimmed.data(using: .utf8)
+            .flatMap { try? JSONSerialization.jsonObject(with: $0, options: [.fragmentsAllowed]) }
+            ?? summaryJSON
+        return jsonString(from: [
+            "summary": summary,
+            AgentDelegatedQuestionNoticeWire.resultKey: notices
+        ]) ?? summaryJSON
     }
 
     private static func lifecycleWaitPolicyFallbackJSON(

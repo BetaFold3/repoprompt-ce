@@ -3538,6 +3538,67 @@ final class AgentRunMCPToolServiceWaitTests: XCTestCase {
         }
     }
 
+    /// A delegated-question wake is arbitrated over the single post-wake snapshot collection: a
+    /// sibling that completed (or needs input) by then wins, and the interrupt never carries it.
+    func testMultiWaitDelegatedQuestionWakeYieldsToASiblingActionableInTheFinalSnapshotSet() async throws {
+        for siblingStatus in [AgentRunMCPSnapshot.Status.completed, .waitingForInput] {
+            let window = makeWindow()
+            defer { WindowStatesManager.shared.unregisterWindowState(window) }
+            let live = LiveSnapshots()
+            let recorder = WaitScopeRecorder()
+            let vm = makeViewModel(windowID: window.windowID)
+            let first = try await installRunningSession(in: vm, liveSnapshots: live)
+            let second = try await installRunningSession(in: vm, liveSnapshots: live)
+            defer {
+                Task {
+                    await AgentRunSessionStore.cleanup(registration: first.registration)
+                    await AgentRunSessionStore.cleanup(registration: second.registration)
+                }
+            }
+            let question = DelegatedQuestionAvailability()
+            var service = makeService(window: window, viewModel: vm, liveSnapshots: live, recorder: recorder)
+            service.hasDeliverableDelegatedQuestionNotices = { _, excluded in
+                question.isDeliverable(excluding: excluded)
+            }
+            let wait = Task { @MainActor in
+                try await service.execute(args: [
+                    "op": .string("wait"),
+                    "session_ids": .array([.string(first.sessionID.uuidString), .string(second.sessionID.uuidString)]),
+                    "timeout": .int(2)
+                ])
+            }
+            try await waitForAgentRunSessionStoreWaiter(registration: first.registration)
+            try await waitForAgentRunSessionStoreWaiter(registration: second.registration)
+
+            // The sibling turns actionable after the waiters parked but before the post-wake
+            // collection; only the child-question wake reaches the parked waiters.
+            await live.set(makeSnapshot(sessionID: first.sessionID, status: siblingStatus))
+            question.childID = UUID()
+            await AgentRunSessionStore.wakeCurrentWaiters(
+                second.runningSnapshot, cursor: second.cursor, reason: .delegatedQuestionPending
+            )
+
+            let result = try await wait.value
+            let object = try XCTUnwrap(result.objectValue)
+            let waitObject = try XCTUnwrap(object["wait"]?.objectValue)
+            XCTAssertEqual(waitObject["result"]?.stringValue, "snapshot_ready", "\(siblingStatus)")
+            XCTAssertEqual(waitObject["winner_session_id"]?.stringValue, first.sessionID.uuidString, "\(siblingStatus)")
+            XCTAssertEqual(object["session_id"]?.stringValue, first.sessionID.uuidString, "\(siblingStatus)")
+            XCTAssertEqual(
+                waitObject["pending_session_ids"]?.arrayValue?.compactMap(\.stringValue),
+                [second.sessionID.uuidString],
+                "\(siblingStatus)"
+            )
+            XCTAssertFalse(
+                ToolOutputFormatter.rawJSONString(result).contains(AgentDelegatedQuestionNoticeWire.agentRunWaitResult),
+                "An actionable sibling in the final set is never rendered as a child-question interrupt"
+            )
+            let completions = await recorder.completions()
+            XCTAssertEqual(completions.count, 1)
+            XCTAssertNotEqual(completions.first?.reason, .delegatedQuestionPending, "\(siblingStatus)")
+        }
+    }
+
     private func makeWindow() -> WindowState {
         let previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
         GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)

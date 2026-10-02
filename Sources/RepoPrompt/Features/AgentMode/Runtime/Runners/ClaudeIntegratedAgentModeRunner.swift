@@ -48,7 +48,8 @@ final class ClaudeIntegratedAgentModeRunner {
         initialUserMessage: String,
         initialMessageForRun: String,
         attachments: [AgentImageAttachment],
-        makeLease: (_ runID: UUID) -> MCPBootstrapLease
+        makeLease: (_ runID: UUID) -> MCPBootstrapLease,
+        delegatedQuestionStageID: UUID? = nil
     ) async {
         let attachmentReservationID = hooks.reserveAttachmentsForTurn(attachments, session)
 
@@ -100,7 +101,8 @@ final class ClaudeIntegratedAgentModeRunner {
                         session: session,
                         runID: runID,
                         ownership: ownership,
-                        attachmentReservationID: attachmentReservationID
+                        attachmentReservationID: attachmentReservationID,
+                        delegatedQuestionStageID: delegatedQuestionStageID
                     )
                     return
                 }
@@ -122,6 +124,9 @@ final class ClaudeIntegratedAgentModeRunner {
                     outcome: sent ? "ready" : (Task.isCancelled ? "cancelled" : "failed")
                 )
                 self.hooks.recordPendingHandoffSendOutcome(session, sent)
+                // Stage-scoped: a late outcome from this (possibly superseded) turn never settles
+                // a newer turn's staged notices, even though Claude reuses its process run ID.
+                self.hooks.recordDelegatedQuestionNoticeSendOutcome(session, delegatedQuestionStageID, sent)
                 guard sent else {
                     await self.finalize(
                         session: session,
@@ -319,9 +324,11 @@ final class ClaudeIntegratedAgentModeRunner {
         session: AgentModeViewModel.TabSession,
         runID: UUID,
         ownership: AgentRunOwnership,
-        attachmentReservationID: UUID?
+        attachmentReservationID: UUID?,
+        delegatedQuestionStageID: UUID?
     ) async {
         hooks.recordPendingHandoffSendOutcome(session, false)
+        hooks.recordDelegatedQuestionNoticeSendOutcome(session, delegatedQuestionStageID, false)
         await terminalCommitBarrier.commit(.init(
             session: session,
             ownership: ownership,
