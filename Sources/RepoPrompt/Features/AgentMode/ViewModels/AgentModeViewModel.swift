@@ -516,8 +516,12 @@ final class AgentModeViewModel: ObservableObject {
         didSet {
             syncSidebarUIState(refresh: true, reason: .sessionList)
             scheduleSidebarAutoArchiveIfReady(reason: .liveSessionSetChanged)
+            reconcileDelegatedQuestionNotices(trigger: "sessionList")
         }
     }
+
+    /// Runtime-only delegated `ask_user` notice registry (see AgentModeViewModel+DelegatedQuestions.swift).
+    var delegatedQuestionNotices = AgentDelegatedQuestionNoticeRegistry()
 
     private struct AgentRunOracleReviewKey: Hashable {
         let sessionID: UUID
@@ -588,6 +592,7 @@ final class AgentModeViewModel: ObservableObject {
             syncSidebarUIState(refresh: true, reason: .mcpControl)
             syncComposerUIState()
             scheduleSidebarAutoArchiveIfReady(reason: .mcpProtectionChanged)
+            reconcileDelegatedQuestionNotices(trigger: "mcpControl")
         }
     }
 
@@ -5722,6 +5727,7 @@ final class AgentModeViewModel: ObservableObject {
         session.mcpControlCleanupTask?.cancel()
         session.mcpControlCleanupTask = nil
         session.mcpFollowUpRunPending = false
+        reconcileDelegatedQuestionNotices(trigger: "mcpTeardown")
     }
 
     func publishMCPStateChange(for session: TabSession) {
@@ -8861,6 +8867,21 @@ final class AgentModeViewModel: ObservableObject {
         )
     }
 
+    /// Early wake for a pending delegated child question (plan §6.2): wakes every bounded
+    /// `agent_run`/`ask_oracle` wait owned by the parent's active run with a distinct reason.
+    /// Never steers, interrupts, or starts anything.
+    func wakeMCPWaitersForDelegatedQuestion(parentRunID: UUID) async {
+        guard let mcpServer else { return }
+        await mcpServer.wakeAgentRunWaitersOwnedByActiveRun(
+            runID: parentRunID,
+            source: Self.delegatedQuestionWakeSource,
+            reason: .delegatedQuestionPending,
+            publicationForSessionID: { [weak self] childSessionID in
+                self?.mcpWaitPublication(sessionID: childSessionID)
+            }
+        )
+    }
+
     private func wakeMCPWaitersForActiveDispatch(
         delivery: MCPInstructionDispatch,
         session: TabSession,
@@ -10353,6 +10374,8 @@ final class AgentModeViewModel: ObservableObject {
         // so background sessions still raise sidebar attention badges when
         // providers call updateBindings directly (e.g. draft attachments).
         observeSidebarRunStateTransition(for: session)
+        // Parent run/identity changes and child question changes reconcile delegated notices.
+        reconcileDelegatedQuestionNoticesIfRelevant(to: session)
         guard session.tabID == currentTabID else {
             #if DEBUG
                 AgentModePerfDiagnostics.increment("ui.updateBindings.skippedInactive", tabID: session.tabID)
@@ -15849,7 +15872,8 @@ final class AgentModeViewModel: ObservableObject {
                         session: session
                     )
                     guard let liveContinuation = session.instructionContinuation else { return }
-                    let resumedTurnTokens = Self.estimateRuntimeTokens(for: augmentedText)
+                    let resumedText = deliverDelegatedQuestionNoticesWithImmediateInput(augmentedText, session: session)
+                    let resumedTurnTokens = Self.estimateRuntimeTokens(for: resumedText)
                     addUserInputTokensToActiveNonCodexTurn(resumedTurnTokens, for: session)
                     session.instructionTimeoutTask?.cancel()
                     session.instructionTimeoutTask = nil
@@ -15859,7 +15883,7 @@ final class AgentModeViewModel: ObservableObject {
                     session.runState = .running
                     updateBindingsFromSession(session)
                     liveContinuation.resume(returning: UserInstructionResponse(
-                        text: augmentedText,
+                        text: resumedText,
                         timedOut: false,
                         elapsedSeconds: 0
                     ))
@@ -17154,6 +17178,9 @@ final class AgentModeViewModel: ObservableObject {
 
     @MainActor
     private func recordPendingHandoffSendOutcome(for session: TabSession, didSend: Bool) {
+        // Delegated child-question notices staged into this turn's first input commit or roll
+        // back with the same provider send outcome (plan §6.2, idle parent).
+        recordDelegatedQuestionNoticeSendOutcome(for: session, didSend: didSend)
         guard session.pendingHandoff.isStagedForSend else { return }
         if didSend {
             session.pendingHandoff.clearAfterSend()
@@ -17367,13 +17394,20 @@ final class AgentModeViewModel: ObservableObject {
         }
         await prepareSessionForRunStart(tabID: tabID, session: session)
         await prepareMCPWaitTrackingForRunStart(session: session)
-        let augmentedInitialMessage = await augmentUserMessageForProviderSend(
+        let augmentedMessage = await augmentUserMessageForProviderSend(
             initialMessage,
             attachments: attachments,
             taggedFileAttachments: taggedFileAttachments,
             agent: session.selectedAgent,
             session: session
         )
+        // Idle parent: pending child questions ride on this turn's first input as a labeled
+        // runtime block (never the user's text). Committed by the provider send outcome, which
+        // happens after the run identity exists.
+        let augmentedInitialMessage = stageDelegatedQuestionNoticesForTurnInput(augmentedMessage, session: session)
+        let delegatedQuestionStageID = augmentedInitialMessage == augmentedMessage
+            ? nil
+            : delegatedQuestionTurnStageID(forTabID: tabID)
 
         let initialMessageForRun = await buildInitialThreadMessageIfNeeded(
             tabID: tabID,
@@ -17393,15 +17427,24 @@ final class AgentModeViewModel: ObservableObject {
             )
         }
 
-        return await runService.startRun(
+        let startOutcome = await runService.startRun(
             tabID: tabID,
             session: session,
-            initialUserMessage: augmentedInitialMessage,
+            // The notice-free text keeps the runners' "run text differs" token re-estimate honest.
+            initialUserMessage: augmentedMessage,
             initialMessageForRun: initialMessageForRun,
             attachments: attachments,
             codexFallbackContext: preparedCodexFallbackContext,
             providerHandoffAuthorization: providerHandoffAuthorization
         )
+        // A stage the send outcome did not resolve is released when the start never reached the
+        // provider (stale/cancelled/failed or an inactive run); otherwise it awaits that outcome.
+        settleDelegatedQuestionTurnStageAfterRunStart(
+            delegatedQuestionStageID,
+            session: session,
+            startReportedNoSend: startOutcome.map { !$0.didSend } ?? false
+        )
+        return startOutcome
     }
 
     private static func headlessContinuityDecision(
@@ -18706,11 +18749,12 @@ final class AgentModeViewModel: ObservableObject {
         // Check for queued instructions first
         if !session.pendingInstructions.isEmpty {
             let queuedText = session.pendingInstructions.removeFirst()
-            let text = await augmentUserMessageForProviderSend(
+            let augmentedText = await augmentUserMessageForProviderSend(
                 queuedText,
                 agent: session.selectedAgent,
                 session: session
             )
+            let text = deliverDelegatedQuestionNoticesWithImmediateInput(augmentedText, session: session)
             return UserInstructionResponse(text: text, timedOut: false, elapsedSeconds: 0)
         }
 
@@ -18803,14 +18847,16 @@ final class AgentModeViewModel: ObservableObject {
 
     func askUserInteraction(
         tabID: UUID,
-        interaction: AgentAskUserInteraction
+        interaction: AgentAskUserInteraction,
+        controllerProvenance: AgentDelegatedQuestionControllerProvenance = .unverified
     ) async throws -> AgentAskUserResponse {
-        try await askUser(tabID: tabID, interaction: interaction)
+        try await askUser(tabID: tabID, interaction: interaction, controllerProvenance: controllerProvenance)
     }
 
     func askUser(
         tabID: UUID,
-        interaction: AgentAskUserInteraction
+        interaction: AgentAskUserInteraction,
+        controllerProvenance: AgentDelegatedQuestionControllerProvenance = .unverified
     ) async throws -> AgentAskUserResponse {
         let session = try await ensureSessionReady(tabID: tabID, reconnectActiveProviders: true)
         try interaction.validate()
@@ -18826,6 +18872,14 @@ final class AgentModeViewModel: ObservableObject {
 
         return try await withCheckedThrowingContinuation { continuation in
             session.askUserContinuation = continuation
+            // Delegated ask_user (plan §6): route once the question and continuation exist. A
+            // question addressed to the parent agent does not start its timeout.
+            let audience = installDelegatedQuestionRouting(
+                for: session,
+                interactionID: interaction.id,
+                provenance: controllerProvenance
+            )
+            guard !audience.pausesTimeout else { return }
             schedulePendingAskUserTimeout(
                 for: session,
                 interactionID: interaction.id,
@@ -18879,7 +18933,9 @@ final class AgentModeViewModel: ObservableObject {
         guard let session = sessions[tabID],
               let pending = session.pendingAskUser,
               pending.interaction.id == interactionID,
-              session.askUserContinuation != nil
+              session.askUserContinuation != nil,
+              // The timeout stays paused while the parent agent owns the question (plan §6.4).
+              !pending.isAwaitingParentAgent
         else { return }
 
         schedulePendingAskUserTimeout(
@@ -18894,7 +18950,7 @@ final class AgentModeViewModel: ObservableObject {
         }
     }
 
-    private func schedulePendingAskUserTimeout(
+    func schedulePendingAskUserTimeout(
         for session: TabSession,
         interactionID: UUID,
         timeoutSeconds: TimeInterval,
@@ -18930,6 +18986,7 @@ final class AgentModeViewModel: ObservableObject {
             session.pendingAskUser = nil
             session.askUserContinuation = nil
             reconcileInteractiveRunState(session)
+            reconcileDelegatedQuestionNotices(trigger: "askUserTimeout")
             updateBindingsFromSession(session)
             recordMCPInteractionResolution(for: session, interactionID: interactionID)
 
@@ -18942,7 +18999,7 @@ final class AgentModeViewModel: ObservableObject {
         }
     }
 
-    private func invalidatePendingAskUserTimeout(for session: TabSession) {
+    func invalidatePendingAskUserTimeout(for session: TabSession) {
         session.pendingAskUserTimeoutGeneration &+= 1
         session.askUserTimeoutTask?.cancel()
         session.askUserTimeoutTask = nil
@@ -19000,6 +19057,7 @@ final class AgentModeViewModel: ObservableObject {
         session.pendingAskUser = nil
         session.askUserContinuation = nil
         reconcileInteractiveRunState(session)
+        reconcileDelegatedQuestionNotices(trigger: "askUserResolved")
         updateBindingsFromSession(session)
         recordMCPInteractionResolution(for: session, interactionID: interactionID)
 
@@ -19096,6 +19154,7 @@ final class AgentModeViewModel: ObservableObject {
         session.queuedUserInputRequests.removeAll()
         session.queuedMCPElicitationRequests.removeAll()
         reconcileInteractiveRunState(session)
+        reconcileDelegatedQuestionNotices(trigger: "askUserCancelled")
         continuation?.resume(throwing: CancellationError())
         publishRunInteractionStateChange(for: session, reason: .pendingQuestionCancelled)
     }

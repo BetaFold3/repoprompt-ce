@@ -612,12 +612,59 @@ final class AgentModeSidebarSessionBuilderTests: XCTestCase {
         XCTAssertTrue(AgentModeSidebarSessionBuilder.sessionIndexEntryHasConversationContent(historical))
     }
 
+    func testDelegatedQuestionAttentionResolvesByDurableSessionIDOnThreadedIndexOnlyRows() throws {
+        let parentTabID = id(70)
+        let childTabID = id(71)
+        let quietTabID = id(72)
+        let parentSessionID = id(170)
+        let childSessionID = id(171)
+        let quietSessionID = id(172)
+        let parentAttention = AgentDelegatedQuestionSidebarAttention(
+            pendingChildQuestionCount: 1,
+            undeliveredChildQuestionCount: 1,
+            ownQuestion: nil
+        )
+        let childAttention = AgentDelegatedQuestionSidebarAttention(ownQuestion: .waitingOnParentAgent)
+        let rows = build(
+            tabs: [
+                tab(parentTabID, sessionID: parentSessionID),
+                tab(childTabID, sessionID: childSessionID),
+                tab(quietTabID, sessionID: quietSessionID)
+            ],
+            sessionIndex: sessionIndex([
+                entry(parentSessionID, tabID: parentTabID, lastUserMessageAt: date(100)),
+                entry(childSessionID, tabID: childTabID, parentSessionID: parentSessionID, lastUserMessageAt: date(90)),
+                entry(quietSessionID, tabID: quietTabID, lastUserMessageAt: date(80))
+            ]),
+            delegatedQuestionAttention: [
+                parentSessionID: parentAttention,
+                childSessionID: childAttention,
+                quietSessionID: AgentDelegatedQuestionSidebarAttention()
+            ]
+        )
+
+        let parent = try row(for: parentTabID, in: rows)
+        XCTAssertEqual(parent.delegatedQuestionAttention, parentAttention)
+        XCTAssertEqual(parent.delegatedQuestionAttention?.tooltipText, "1 pending child question (1 not yet delivered)")
+        XCTAssertTrue(parent.searchFields.fields.map(\.text).contains("question"))
+
+        let child = try row(for: childTabID, in: rows)
+        XCTAssertEqual(child.depth, 1)
+        XCTAssertEqual(child.delegatedQuestionAttention, childAttention)
+        XCTAssertEqual(child.delegatedQuestionAttention?.tooltipText, "Waiting on parent agent")
+
+        let quiet = try row(for: quietTabID, in: rows)
+        XCTAssertNil(quiet.delegatedQuestionAttention, "Empty attention never renders a badge")
+        XCTAssertFalse(quiet.searchFields.fields.map(\.text).contains("question"))
+    }
+
     private func build(
         tabs: [ComposeTabState],
         sessions: [UUID: AgentModeViewModel.TabSession] = [:],
-        sessionIndex: [UUID: AgentSessionIndexEntry]
+        sessionIndex: [UUID: AgentSessionIndexEntry],
+        delegatedQuestionAttention: [UUID: AgentDelegatedQuestionSidebarAttention] = [:]
     ) -> [AgentModeViewModel.SidebarSession] {
-        AgentModeSidebarSessionBuilder(
+        var builder = AgentModeSidebarSessionBuilder(
             allTabs: tabs,
             linkedTabs: tabs,
             sessions: sessions,
@@ -632,7 +679,9 @@ final class AgentModeSidebarSessionBuilderTests: XCTestCase {
             sidebarRestoreFrozenOrderByTabID: [:],
             mcpControlledTabIDs: [],
             registeredRemoteHosts: []
-        ).build()
+        )
+        builder.delegatedQuestionAttentionBySessionID = delegatedQuestionAttention
+        return builder.build()
     }
 
     private func liveSession(

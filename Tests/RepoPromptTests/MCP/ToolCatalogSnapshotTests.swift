@@ -178,6 +178,12 @@ final class ToolCatalogSnapshotTests: XCTestCase {
         let oracleChatLog = try XCTUnwrap(tools.first { $0.name == MCPWindowToolName.oracleChatLog })
         let agentExplore = try XCTUnwrap(tools.first { $0.name == MCPWindowToolName.agentExplore })
         let agentRun = try XCTUnwrap(tools.first { $0.name == MCPWindowToolName.agentRun })
+        let pairLabel = try XCTUnwrap(AgentModelCatalog.taskLabels.first { $0.kind == .pair })
+        XCTAssertTrue(agentRun.description.contains("`pair` — \(pairLabel.description)"))
+        XCTAssertEqual(
+            pairLabel.description,
+            "Interactive pair programming with highest-tier models; preferred worker for addressing Oracle review and re-review findings"
+        )
         let applyEdits = try XCTUnwrap(tools.first { $0.name == MCPWindowToolName.applyEdits })
         let setStatus = try XCTUnwrap(tools.first { $0.name == MCPWindowToolName.setStatus })
 
@@ -843,7 +849,7 @@ final class ToolCatalogSnapshotTests: XCTestCase {
         "16|ask_user|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=nil,openWorld=false|desc=6b3870ae4848eb01c73de9fbbdf2ed1782487db150260469853757f799257ee0|schema=080446bb7697cf5f4cd31f07b42ecff8ab29edc8501ee0e84e61426748569156",
         "17|remote_pairing|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=nil,openWorld=false|desc=b66a65cddc2ce05b1aa4bd372bf87806149f0059c77318f2c0c88d998953733b|schema=78d2d5faef64665bd00b69fe88ebd9776445c1b21e028dbaf03f7bbeaa6dfed2",
         "18|agent_explore|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=nil,openWorld=false|desc=c99c0866d0cafeb3d4365592cc139369fc554295d16c48727fba567da1088f46|schema=3ebe5f060c868bed56e458923fa82b973d1d71a6c43c094d2b1623b2984efd90",
-        "19|agent_run|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=nil,openWorld=false|desc=6ffcb242b8b0ae9d95b1cf2bb0cf78ef909688e4c818bdf2478b92684e1ad085|schema=c71be9897e5ebf3bc4253b244e52f947b5b8be019e1384035075afbc0ee076e7",
+        "19|agent_run|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=nil,openWorld=false|desc=444e2154a065bd73221bc7335d1c35931c94888244f2823d7aff391b2ba17030|schema=c71be9897e5ebf3bc4253b244e52f947b5b8be019e1384035075afbc0ee076e7",
         "20|agent_manage|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=nil,openWorld=false|desc=b057e2b0203e6ec0faeac9b9342f1823d655cd7a60e51436d44d817da5516d69|schema=4cd0a819fec64efd8e0d3ad26a5242f622dd9496627b19f381bbc02ebc8fc3e5",
         "21|share_thoughts|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=nil,openWorld=false|desc=b1ac755b39a4ac2d8a621e78801a258c5d95ec2ff4e063f600081fa27891a852|schema=a5dea0c92fd4da06a15f991e1e8a287235ca681ae381cef1b594bc7c07e538d7",
         "22|set_status|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=nil,openWorld=false|desc=19bbfd6fc47639e02295de4e9289ea77f25c6a91ad150998726768b84c266783|schema=0854d727c81f1eb8fa0a14edb9d6ab8bb58974d919cc53150bd72473f1ae0196",

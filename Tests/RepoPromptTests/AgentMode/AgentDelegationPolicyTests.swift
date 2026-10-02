@@ -600,8 +600,52 @@ final class AgentDelegationPolicyTests: XCTestCase {
                 XCTAssertTrue(prompt.contains(toolReference(MCPWindowToolName.agentManage, agentKind)), label)
                 XCTAssertTrue(prompt.contains(toolReference(MCPWindowToolName.agentExplore, agentKind)), label)
                 XCTAssertTrue(prompt.contains("main → worker → sub-worker"), label)
+                XCTAssertTrue(prompt.contains("prefer a Pair worker"), label)
                 XCTAssertTrue(prompt.contains("oracle_export_path"), label)
             }
+        }
+    }
+
+    func testPairReviewRemediationGuidanceMatchesDelegationAudienceAcrossProviders() {
+        for agentKind in [AgentProviderKind.claudeCode, .codexExec, .openCode] {
+            XCTAssertTrue(
+                SystemPromptService.agentModePrompt(agentKind: agentKind).contains("prefer a Pair worker"),
+                "\(agentKind.rawValue)/nil-role"
+            )
+            XCTAssertFalse(
+                SystemPromptService.agentModePrompt(agentKind: agentKind, delegationAudience: .agentExploreOnly)
+                    .contains("prefer a Pair worker"),
+                "\(agentKind.rawValue)/nil-role/agentExploreOnly"
+            )
+            XCTAssertTrue(
+                SystemPromptService.agentModePrompt(agentKind: agentKind, delegationAudience: .both)
+                    .contains("prefer a Pair worker"),
+                "\(agentKind.rawValue)/nil-role/both"
+            )
+            for role in [AgentModelCatalog.TaskLabelKind.engineer, .pair, .design] {
+                for audience in [ExportDelegationAudience.agentExploreOnly, nil] {
+                    let prompt = SystemPromptService.agentModePrompt(
+                        agentKind: agentKind,
+                        taskLabelKind: role,
+                        delegationAudience: audience
+                    )
+                    XCTAssertFalse(
+                        prompt.contains("prefer a Pair worker"),
+                        "\(agentKind.rawValue)/\(role.rawValue)/\(String(describing: audience))"
+                    )
+                }
+            }
+            for role in [AgentModelCatalog.TaskLabelKind.engineer, .pair, .design] {
+                let prompt = SystemPromptService.agentModePrompt(
+                    agentKind: agentKind,
+                    taskLabelKind: role,
+                    delegationAudience: .agentRunOnly
+                )
+                XCTAssertTrue(prompt.contains("prefer a Pair worker"), "\(agentKind.rawValue)/\(role.rawValue)/agentRunOnly")
+            }
+
+            let explorePrompt = SystemPromptService.agentModePrompt(agentKind: agentKind, taskLabelKind: .explore)
+            XCTAssertFalse(explorePrompt.contains("prefer a Pair worker"), "\(agentKind.rawValue)/explore")
         }
     }
 
@@ -619,6 +663,7 @@ final class AgentDelegationPolicyTests: XCTestCase {
                     XCTAssertFalse(prompt.contains("`\(tool)`"), "\(label) \(tool)")
                     XCTAssertFalse(prompt.contains("__\(tool)`"), "\(label) \(tool)")
                 }
+                XCTAssertFalse(prompt.contains("prefer a Pair worker"), label)
                 XCTAssertFalse(prompt.contains("oracle_export_instruction"), label)
                 XCTAssertFalse(prompt.contains("When to dispatch"), label)
                 XCTAssertFalse(prompt.contains("spawn_agent"), label)

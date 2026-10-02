@@ -1,4 +1,5 @@
 import Foundation
+import MCP
 @testable import RepoPromptApp
 import XCTest
 
@@ -6,6 +7,125 @@ import XCTest
 final class AgentRunMCPToolServiceWaitAnyTests: XCTestCase {
     private enum TestFailure: Error {
         case missingEpoch
+    }
+
+    func testWaitAnyDelegatedWakeRechecksDeliverability() async throws {
+        for deliverable in [true, false] {
+            let sessionID = UUID()
+            let registration = await AgentRunSessionStore.register(sessionID: sessionID)
+            defer { Task { await AgentRunSessionStore.cleanup(registration: registration) } }
+            let epoch = try await beginEpoch(registration: registration, activationID: UUID(), expected: nil, kind: .initial)
+            let cursor = AgentRunSessionStore.WaitCursor(registration: registration, epoch: epoch)
+            let availability = DelegatedAvailability()
+            let wait = Task {
+                await AgentRunMCPToolService.test_waitUntilActionableDisposition(
+                    sessionID: sessionID, timeoutSeconds: 2,
+                    hasDeliverableDelegatedQuestion: { await availability.get() }
+                )
+            }
+            try await waitForAgentRunSessionStoreWaiter(registration: registration)
+            await availability.set(deliverable)
+            await AgentRunSessionStore.wakeCurrentWaiters(
+                makeRunningSnapshot(sessionID: sessionID), cursor: cursor, reason: .delegatedQuestionPending
+            )
+            if !deliverable {
+                try await waitForAgentRunSessionStoreWaiter(registration: registration)
+                _ = await AgentRunSessionStore.publishTerminal(
+                    .init(epoch: epoch, snapshot: makeSnapshot(sessionID: sessionID, status: .completed)),
+                    registration: registration, commitID: UUID(), successorKind: nil
+                )
+            }
+            let result = await wait.value
+            XCTAssertEqual(result.disposition, deliverable ? "delegated_question_interrupted" : "actionable")
+            XCTAssertEqual(result.wakeReason, deliverable ? "delegated_question_pending" : nil)
+        }
+    }
+
+    func testWaitAnyDelegatedEntryCheckAndStickyWakeBeforePark() async throws {
+        for stickyWake in [false, true] {
+            let sessionID = UUID()
+            let registration = await AgentRunSessionStore.register(sessionID: sessionID)
+            defer { Task { await AgentRunSessionStore.cleanup(registration: registration) } }
+            let epoch = try await beginEpoch(registration: registration, activationID: UUID(), expected: nil, kind: .initial)
+            let cursor = AgentRunSessionStore.WaitCursor(registration: registration, epoch: epoch)
+            let snapshot = makeRunningSnapshot(sessionID: sessionID)
+            await AgentRunSessionStore.signalSnapshot(snapshot, cursor: cursor)
+            let availability = DelegatedAvailability()
+            if !stickyWake { await availability.set(true) }
+            // In the sticky branch install the question after the static entry check but
+            // before store parking, deterministically using the checker itself.
+            let result = await AgentRunMCPToolService.test_waitUntilActionableDisposition(
+                sessionID: sessionID, timeoutSeconds: 2,
+                hasDeliverableDelegatedQuestion: {
+                    if stickyWake, await !(availability.get()) {
+                        await availability.set(true)
+                        await AgentRunSessionStore.signalSnapshotAndWakeWaiters(
+                            snapshot, cursor: cursor, reason: .delegatedQuestionPending
+                        )
+                        return false
+                    }
+                    return await availability.get()
+                }
+            )
+            XCTAssertEqual(result.disposition, "delegated_question_interrupted")
+        }
+    }
+
+    func testDelegatedWaitAnyArbitrationIsBelowSteeringAndActionableAboveStatusAndTimeout() {
+        let firstID = UUID()
+        let secondID = UUID()
+        for stronger in ["publication_rejected", "steering_interrupted", "actionable", "superseded", "expired"] {
+            let result = AgentRunMCPToolService.test_arbitrateWaitAnyDisposition(
+                sessionIDs: [firstID, secondID],
+                candidates: [(firstID, "delegated_question_interrupted"), (secondID, stronger)]
+            )
+            XCTAssertEqual(result.disposition, stronger)
+        }
+        for weaker in ["status_update", "timed_out", "cancelled"] {
+            let result = AgentRunMCPToolService.test_arbitrateWaitAnyDisposition(
+                sessionIDs: [firstID, secondID],
+                candidates: [(firstID, weaker), (secondID, "delegated_question_interrupted")]
+            )
+            XCTAssertEqual(result.disposition, "delegated_question_interrupted")
+        }
+    }
+
+    func testCoveredQuestionKeysIncludesOnlyQuestionSnapshotsAndDeduplicates() {
+        let childID = UUID()
+        let interactionID = UUID()
+        let question: Value = .object([
+            "session_id": .string(childID.uuidString),
+            "interaction": .object(["kind": .string("question"), "id": .string(interactionID.uuidString)])
+        ])
+        let value: Value = .object([
+            "session_id": .string(childID.uuidString),
+            "interaction": .object(["kind": .string("question"), "id": .string(interactionID.uuidString)]),
+            "snapshots": .array([
+                question,
+                .object(["session_id": .string(UUID().uuidString), "interaction": .object([
+                    "kind": .string("approval"), "id": .string(UUID().uuidString)
+                ])]),
+                .object(["session_id": .string("invalid"), "interaction": .object([
+                    "kind": .string("question"), "id": .string(interactionID.uuidString)
+                ])])
+            ])
+        ])
+        XCTAssertEqual(
+            AgentRunMCPToolService.coveredDelegatedQuestionNoticeKeys(in: value),
+            [AgentDelegatedQuestionNoticeKey(childSessionID: childID, interactionID: interactionID)]
+        )
+        XCTAssertTrue(AgentRunMCPToolService.coveredDelegatedQuestionNoticeKeys(in: .string("text")).isEmpty)
+    }
+
+    private actor DelegatedAvailability {
+        private var deliverable = false
+        func set(_ value: Bool) {
+            deliverable = value
+        }
+
+        func get() -> Bool {
+            deliverable
+        }
     }
 
     func testWaitAnySteeringWakeInterruptsAndFreshWaitCanResume() async throws {

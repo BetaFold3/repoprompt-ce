@@ -415,6 +415,7 @@ extension AgentModeViewModel {
         case sessionName
         case parentRepair
         case metadataUpdated
+        case delegatedQuestion
         case search
         case visibleCount
         case explicit
@@ -462,6 +463,8 @@ extension AgentModeViewModel {
         var pairedDeviceDisplayNameByBareID: [String: String] = [:]
         let sessionListSortDates: [UUID: Date]
         let sidebarRestoreFrozenOrderByTabID: [UUID: Int]
+        /// Delegated ask_user badges keyed by durable session ID (plan §6.5).
+        var delegatedQuestionAttentionBySessionID: [UUID: AgentDelegatedQuestionSidebarAttention] = [:]
     }
 
     struct ActiveUIInvalidation: OptionSet {
@@ -950,6 +953,9 @@ extension AgentModeViewModel {
         /// awaiting-commit merge operation; nil otherwise.
         let worktreeMergeAttention: AgentWorktreeMergeAttention?
         let scheduledSendStatus: AgentSidebarScheduledSendStatus?
+        /// Delegated ask_user legibility (plan §6.5): pending child questions on a parent row,
+        /// or "Waiting on parent agent" / "Needs your answer" on an asking child row.
+        let delegatedQuestionAttention: AgentDelegatedQuestionSidebarAttention?
         let threadKey: AgentSidebarThreadKey?
         let hasThreadChildren: Bool
         let isThreadCollapsed: Bool
@@ -980,6 +986,7 @@ extension AgentModeViewModel {
             worktree: AgentWorktreeIndicator? = nil,
             worktreeMergeAttention: AgentWorktreeMergeAttention? = nil,
             scheduledSendStatus: AgentSidebarScheduledSendStatus? = nil,
+            delegatedQuestionAttention: AgentDelegatedQuestionSidebarAttention? = nil,
             threadKey: AgentSidebarThreadKey? = nil,
             hasThreadChildren: Bool = false,
             isThreadCollapsed: Bool = false,
@@ -1005,6 +1012,7 @@ extension AgentModeViewModel {
             self.worktree = worktree
             self.worktreeMergeAttention = worktreeMergeAttention
             self.scheduledSendStatus = scheduledSendStatus
+            self.delegatedQuestionAttention = delegatedQuestionAttention
             self.threadKey = threadKey
             self.hasThreadChildren = hasThreadChildren
             self.isThreadCollapsed = isThreadCollapsed

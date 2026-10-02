@@ -71,6 +71,31 @@ enum AgentToolResultPersistencePolicy {
         context: AgentToolResultProcessingContext? = nil
     ) -> AgentSanitizedToolResult? {
         guard item.kind == .toolResult else { return nil }
+        // Keep delivered runtime notices verbatim while summarizing the original tool
+        // payload normally. Their ID-bearing question content is what the model saw.
+        if let raw = item.toolResultJSON,
+           raw.contains(AgentDelegatedQuestionNoticeWire.resultKey),
+           var object = jsonObject(from: raw, context: context),
+           let notices = object.removeValue(forKey: AgentDelegatedQuestionNoticeWire.resultKey),
+           let originalJSON = jsonString(from: object)
+        {
+            var originalItem = item
+            originalItem.toolResultJSON = originalJSON
+            originalItem.text = originalJSON
+            guard let original = sanitizedToolResult(for: originalItem, toolExecution: toolExecution, context: context) else { return nil }
+            let resultJSON = preservingDelegatedQuestionNotices(notices, in: original.resultJSON ?? original.text)
+            return AgentSanitizedToolResult(
+                text: resultJSON,
+                resultJSON: resultJSON,
+                toolIsError: original.toolIsError,
+                persistedStatusWord: original.persistedStatusWord,
+                transcriptStatus: original.transcriptStatus,
+                summaryOnly: original.summaryOnly,
+                processID: original.processID,
+                exitCode: original.exitCode,
+                preservesRawPayload: original.preservesRawPayload
+            )
+        }
         let normalizedToolName = normalizedToolName(item.toolName)
         let rawResultJSON = item.toolResultJSON?.trimmingCharacters(in: .whitespacesAndNewlines)
         let preservedText = rawResultJSON?.isEmpty == false ? rawResultJSON! : item.text
@@ -399,8 +424,11 @@ enum AgentToolResultPersistencePolicy {
             ?? allowedStructuredSummary
             ?? lifecycleWaitPolicySummary
             ?? boundedFallback
+        let notices = rawCandidates.compactMap {
+            jsonObject(from: $0, context: context)?[AgentDelegatedQuestionNoticeWire.resultKey]
+        }.first
         return AgentPersistedToolResultSummary(
-            resultJSON: resultJSON,
+            resultJSON: notices.map { preservingDelegatedQuestionNotices($0, in: resultJSON) } ?? resultJSON,
             statusWord: statusWord,
             transcriptStatus: transcriptStatus,
             toolIsError: sanitized?.toolIsError ?? generatedExecution?.toolIsError ?? item.toolIsError,
@@ -409,6 +437,14 @@ enum AgentToolResultPersistencePolicy {
             summaryText: summaryText,
             summaryOnly: promptExportStructuredMetadata == nil
         )
+    }
+
+    /// The ordinary summary remains byte-bounded; delivered question notices are an
+    /// additive exception because truncating them would lose the parent's actual input.
+    private static func preservingDelegatedQuestionNotices(_ notices: Any, in summaryJSON: String) -> String {
+        guard var object = jsonObject(from: summaryJSON) else { return summaryJSON }
+        object[AgentDelegatedQuestionNoticeWire.resultKey] = notices
+        return jsonString(from: object) ?? summaryJSON
     }
 
     private static func lifecycleWaitPolicyFallbackJSON(

@@ -153,7 +153,7 @@ final class MCPAgentControlToolProvider: MCPWindowToolProviding {
             **Role labels** — pass as `model_id` to select via the global role-default mapping:
             - `explore` — Fast exploration and codebase mapping
             - `engineer` — Balanced engineering work
-            - `pair` — Interactive pair programming with highest-tier models
+            - `pair` — Interactive pair programming with highest-tier models; preferred worker for addressing Oracle review and re-review findings
             - `design` — Architecture, design discussions, creative problem solving; writes a markdown review document (saved under `docs/reviews/`, `docs/designs/`, or `docs/analysis/`) as its primary deliverable for review/analysis tasks
 
             Role labels resolve through the effective global role-default mapping; see the top-level `task_labels` array from `agent_manage.list_agents` for the authoritative label→model mapping. If `model_id` is omitted on `start`, RepoPrompt uses the `pair` role. To pin an exact agent+model+effort target, pass a specific compound `model_id` from `agents[].models[].model_id` in the same response.

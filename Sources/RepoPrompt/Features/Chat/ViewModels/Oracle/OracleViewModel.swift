@@ -3839,7 +3839,12 @@ class OracleViewModel: ObservableObject {
                     OracleReviewPackagingDiagnostics.recordFailure(error)
                 #endif
                 Task {
-                    await handleSendMessageError(error, aiResponseId: aiResponseId, sessionID: targetSessionID)
+                    await handleSendMessageError(
+                        error,
+                        aiResponseId: aiResponseId,
+                        sessionID: targetSessionID,
+                        capturedModel: model
+                    )
                 }
             }
         }
@@ -3932,7 +3937,12 @@ class OracleViewModel: ObservableObject {
     // MARK: - Error Handling
 
     @MainActor
-    private func handleSendMessageError(_ error: Error, aiResponseId: UUID, sessionID: UUID) async {
+    private func handleSendMessageError(
+        _ error: Error,
+        aiResponseId: UUID,
+        sessionID: UUID,
+        capturedModel: AIModel
+    ) async {
         func clearStreamingIfOwned() {
             if clearSessionStreaming(sessionID, matching: aiResponseId) {
                 clearMCPSessionUIState(for: sessionID)
@@ -4001,9 +4011,14 @@ class OracleViewModel: ObservableObject {
         emitOracleMCPStreamTerminal(queryID: aiResponseId, reason: .failed)
         defer { finalizingAIResponses.remove(aiResponseId) }
 
-        // Pass token count to error message handler for non-cancellation errors
+        // This is the current Prompt/Copy context estimate, not the assembled
+        // Oracle request: it excludes conversation messages and provider-added text.
         let tokenCount = promptViewModel.totalTokenCount
-        let errorMessage = userFriendlyErrorMessage(for: error, tokenCount: tokenCount)
+        let errorMessage = OracleErrorPresenter.message(
+            for: error,
+            tokenCount: tokenCount,
+            capturedModel: capturedModel
+        )
         if messageStore[sessionID]?.contains(where: { $0.id == aiResponseId }) == true {
             let appendedErrorBlock = "\n\n--\nError:\n\(errorMessage)"
             var didFinalizeMessage = false
@@ -4044,62 +4059,6 @@ class OracleViewModel: ObservableObject {
         return sessionMessages.map { msg in
             let role: ConversationEntry.Role = msg.isUser ? .user : .assistant
             return ConversationEntry(role: role, content: msg.content)
-        }
-    }
-
-    private func userFriendlyErrorMessage(for error: Error, tokenCount: Int = 0) -> String {
-        guard let err = error as NSError?, err.domain == NSURLErrorDomain else {
-            // Check if this is an OpenAI request too large error
-            if let openAIError = error as? CustomOpenAIProviderError {
-                switch openAIError {
-                case .requestTooLarge:
-                    var message = "Request too large. The model has strict token limits and the provided request exceeds them."
-                    if tokenCount > 0 {
-                        message += "\n\nCurrent request size: ~\(tokenCount.formatted()) tokens"
-                        message += "\nTip: Try deselecting some files to reduce the context size."
-                    }
-                    return message
-                default:
-                    // Check if it's the vague "no additional details" error
-                    let errorString = error.asFriendlyString()
-                    if errorString.contains("no additional details") {
-                        var message = "OpenAI error: Request failed. This often occurs when the request is too large or there are insufficient credits on your account."
-                        if tokenCount > 0 {
-                            message += "\n\nCurrent request size: ~\(tokenCount.formatted()) tokens"
-                            message += "\nTip: Try deselecting some files to reduce the context size."
-                        }
-                        return message
-                    }
-                    return errorString
-                }
-            }
-
-            // Also check for the generic error string case
-            let errorString = error.asFriendlyString()
-            if errorString.contains("no additional details") {
-                var message = "Request failed. This often occurs when the request is too large or there are insufficient credits on your account."
-                if tokenCount > 0 {
-                    message += "\n\nCurrent request size: ~\(tokenCount.formatted()) tokens"
-                    message += "\nTip: Try deselecting some files to reduce the context size."
-                }
-                return message
-            }
-
-            return errorString
-        }
-        switch err.code {
-        case NSURLErrorTimedOut:
-            return "The request timed out. Please check your internet connection and try again."
-        case NSURLErrorCannotConnectToHost:
-            return "Unable to connect to the server. Please try again later."
-        case NSURLErrorNetworkConnectionLost:
-            return "The network connection was lost. Please check your internet connection and try again."
-        case NSURLErrorNotConnectedToInternet:
-            return "No internet connection. Please check your network settings and try again."
-        case NSURLErrorSecureConnectionFailed:
-            return "Secure connection failed."
-        default:
-            return "\(error.asFriendlyString())"
         }
     }
 

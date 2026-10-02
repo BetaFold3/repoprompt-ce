@@ -2,6 +2,42 @@
 import XCTest
 
 final class AgentToolResultPersistencePolicyTests: XCTestCase {
+    func testDelegatedQuestionNoticesSurviveSanitizationAndPersistenceSummary() throws {
+        let notices: [[String: String]] = [[
+            "kind": "delegated_question",
+            "child_session_id": UUID().uuidString,
+            "interaction_id": UUID().uuidString,
+            "text": String(repeating: "Question content the model saw. ", count: 100)
+        ]]
+        for toolName in ["read_file", "agent_run", "ask_oracle", "prompt"] {
+            let raw = jsonString([
+                "status": "running",
+                "session_id": UUID().uuidString,
+                "contents": String(repeating: "unrelated file body ", count: 500),
+                AgentDelegatedQuestionNoticeWire.resultKey: notices
+            ])
+            let item = AgentChatItem.toolResult(name: toolName, resultJSON: raw, isError: false)
+            let sanitized = try XCTUnwrap(AgentToolResultPersistencePolicy.sanitizedToolResult(for: item))
+            let sanitizedObject = try decodedObject(XCTUnwrap(sanitized.resultJSON))
+            XCTAssertEqual(
+                sanitizedObject[AgentDelegatedQuestionNoticeWire.resultKey] as? [[String: String]],
+                notices, toolName
+            )
+            let persisted = try XCTUnwrap(persistedSummary(toolName: toolName, rawResultJSON: raw))
+            let object = try decodedObject(persisted.resultJSON)
+            XCTAssertEqual(
+                object[AgentDelegatedQuestionNoticeWire.resultKey] as? [[String: String]],
+                notices, toolName
+            )
+            XCTAssertNil(object["contents"], "Only the delivered notice bypasses ordinary summary truncation")
+            let again = try XCTUnwrap(persistedSummary(toolName: toolName, rawResultJSON: persisted.resultJSON))
+            XCTAssertEqual(
+                try decodedObject(again.resultJSON)[AgentDelegatedQuestionNoticeWire.resultKey] as? [[String: String]],
+                notices, toolName
+            )
+        }
+    }
+
     func testConfirmedOracleSendToolNamesPersistBoundedStructuredSummaries() throws {
         let rows: [(toolName: String, receivesOracleMetadata: Bool)] = [
             ("ask_oracle", true),

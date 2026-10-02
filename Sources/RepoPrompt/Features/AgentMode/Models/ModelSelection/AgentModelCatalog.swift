@@ -1975,7 +1975,7 @@ enum AgentModelCatalog {
     static let taskLabels: [TaskLabel] = [
         TaskLabel(kind: .explore, label: "explore", description: "Fast exploration and codebase mapping"),
         TaskLabel(kind: .engineer, label: "engineer", description: "Balanced engineering work"),
-        TaskLabel(kind: .pair, label: "pair", description: "Interactive pair programming with highest-tier models"),
+        TaskLabel(kind: .pair, label: "pair", description: "Interactive pair programming with highest-tier models; preferred worker for addressing Oracle review and re-review findings"),
         TaskLabel(kind: .design, label: "design", description: "Architecture, design discussions, and creative problem solving")
     ]
 

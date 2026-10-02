@@ -103,9 +103,18 @@ struct AgentAskUserWizardCard: View {
 
             Spacer()
 
-            let countdownAnchor = pending.timeoutStartedAt ?? pending.interaction.askedAt
-            TimeoutCountdownView(startedAt: countdownAnchor, timeoutSeconds: pending.interaction.timeoutSeconds)
-                .id(countdownAnchor)
+            if pending.isAwaitingParentAgent {
+                // The timeout is paused while the parent agent owns the question (delegated
+                // ask_user plan §6.4), so there is no countdown to show.
+                Label("Waiting on parent agent", systemImage: "arrow.turn.left.up")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+                    .accessibilityIdentifier("agent.askUser.waitingOnParentAgent")
+            } else {
+                let countdownAnchor = pending.timeoutStartedAt ?? pending.interaction.askedAt
+                TimeoutCountdownView(startedAt: countdownAnchor, timeoutSeconds: pending.interaction.timeoutSeconds)
+                    .id(countdownAnchor)
+            }
         }
     }
 

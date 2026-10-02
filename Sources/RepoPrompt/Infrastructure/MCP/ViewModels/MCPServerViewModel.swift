@@ -715,6 +715,9 @@ final class MCPServerViewModel: ObservableObject {
                 },
                 unsubscribe: { [self] executionID in
                     unsubscribeOracleWaitScope(executionID: executionID)
+                },
+                isDelegatedQuestionRequested: { [self] executionID in
+                    oracleWaitScopeDelegatedQuestionRequested(executionID: executionID)
                 }
             ),
             cancelOracleQuery: { [self] chatID, queryID in
@@ -788,6 +791,15 @@ final class MCPServerViewModel: ObservableObject {
             },
             endAgentRunWait: { [self] token, completion in
                 endAgentRunWaitScope(token, completion: completion)
+            },
+            hasDeliverableDelegatedQuestionNotices: { [self] token, excludedChildIDs in
+                guard let scope = agentRunWaitScopesByToken[token],
+                      let targetWindow = try? requireTargetWindow()
+                else { return false }
+                return targetWindow.agentModeViewModel.mcpHasDeliverableDelegatedQuestionNotices(
+                    parentRunID: scope.parentRunID,
+                    excludingChildSessionIDs: excludedChildIDs
+                )
             },
             resolveWaitPolicyContext: { [self] metadata in
                 await resolveAgentLifecycleWaitPolicyContext(metadata: metadata)
@@ -2005,15 +2017,16 @@ final class MCPServerViewModel: ObservableObject {
     /// plan §3.3). Created in the same synchronous MainActor sequence that registers the
     /// execution — before the start gate opens — with the already-resolved `indexedRunID`, and
     /// removed in the same cleanup that unregisters the execution. It owns how *this call*
-    /// stops waiting (sticky steering flag plus a wake for an already-parked observer); it
-    /// never owns or cancels the Oracle query. A steer that arrives during preparation is
-    /// captured by the sticky flag and honored at the first park attempt.
+    /// stops waiting (separate sticky steering/question flags plus a parked-observer wake);
+    /// it never owns or cancels the Oracle query. A wake during preparation is captured and
+    /// honored at the first park attempt; pending questions also seed new scopes at registration.
     @MainActor
     private struct OracleMCPWaitScope {
         let executionID: UUID
         let runID: UUID
         let connectionID: UUID?
         var steeringRequested = false
+        var delegatedQuestionRequested = false
         var onWake: (@MainActor () -> Void)?
     }
 
@@ -2160,7 +2173,14 @@ final class MCPServerViewModel: ObservableObject {
                 oracleWaitScopesByExecutionID[executionID] = OracleMCPWaitScope(
                     executionID: executionID,
                     runID: runID,
-                    connectionID: connectionID
+                    connectionID: connectionID,
+                    // A one-shot wake may precede registration; seed the sticky flag from
+                    // the authoritative run-scoped notice registry before the start gate opens.
+                    delegatedQuestionRequested: (try? requireTargetWindow())?.agentModeViewModel
+                        .mcpHasDeliverableDelegatedQuestionNotices(
+                            parentRunID: runID,
+                            excludingChildSessionIDs: []
+                        ) ?? false
                 )
                 steeringDebugLog("[AgentRunSteeringWake] ask_oracle wait scope begin runID=\(runID) executionID=\(executionID)")
             }
@@ -2431,21 +2451,27 @@ final class MCPServerViewModel: ObservableObject {
             .joined(separator: ",")
     }
 
-    // MARK: - ask_oracle wait scopes (steering wake)
+    // MARK: - ask_oracle wait scopes (steering and delegated-question wakes)
 
     /// Marks and wakes every bounded `ask_oracle` wait owned by `runID`. The flag is sticky so
     /// a call still in preparation returns pending at its first park attempt.
     @MainActor
-    private func wakeOracleWaitScopes(ownedBy runID: UUID, source: String) {
+    private func wakeOracleWaitScopes(ownedBy runID: UUID, source: String, reason: AgentRunSessionStore.WakeReason) {
         var wakes: [@MainActor () -> Void] = []
         for (executionID, scope) in oracleWaitScopesByExecutionID
             where scope.runID == runID
         {
             var updated = scope
-            // Registration precedes argument dispatch, so retain an early steer before a
-            // bounded single, batch, or wait invocation reaches its resumable park. Each later
-            // wait observes this sticky bit and returns without losing the wake.
-            updated.steeringRequested = true
+            // Registration precedes argument dispatch, so retain either early wake before a
+            // bounded single, batch, or wait invocation reaches its resumable park. Separate
+            // sticky flags preserve the reason, with steering taking precedence in the service.
+            if reason == .delegatedQuestionPending {
+                updated.delegatedQuestionRequested = true
+            } else if reason == .steeringRequested {
+                updated.steeringRequested = true
+            } else {
+                continue
+            }
             if let onWake = updated.onWake {
                 wakes.append(onWake)
                 updated.onWake = nil
@@ -2469,12 +2495,17 @@ final class MCPServerViewModel: ObservableObject {
         oracleWaitScopesByExecutionID[executionID]?.steeringRequested ?? false
     }
 
-    /// Registers the parked observer's wake. Fires immediately when steering was already
+    @MainActor
+    func oracleWaitScopeDelegatedQuestionRequested(executionID: UUID) -> Bool {
+        oracleWaitScopesByExecutionID[executionID]?.delegatedQuestionRequested ?? false
+    }
+
+    /// Registers the parked observer's wake. Fires immediately when either wake was already
     /// requested so the sticky flag can never be missed between the double-check and the park.
     @MainActor
     func subscribeOracleWaitScope(executionID: UUID, onWake: @escaping @MainActor () -> Void) {
         guard var scope = oracleWaitScopesByExecutionID[executionID] else { return }
-        if scope.steeringRequested {
+        if scope.steeringRequested || scope.delegatedQuestionRequested {
             onWake()
             return
         }
@@ -2510,11 +2541,12 @@ final class MCPServerViewModel: ObservableObject {
     func wakeAgentRunWaitersOwnedByActiveRun(
         runID: UUID,
         source: String,
+        reason: AgentRunSessionStore.WakeReason = .steeringRequested,
         publicationForSessionID: (UUID) -> (snapshot: AgentRunMCPSnapshot, cursor: AgentRunSessionStore.WaitCursor)?
     ) async {
         // Bounded ask_oracle waits owned by this run wake first, before the child agent_run
         // guard below, so an Oracle-only wait still returns its pending result promptly.
-        wakeOracleWaitScopes(ownedBy: runID, source: source)
+        wakeOracleWaitScopes(ownedBy: runID, source: source, reason: reason)
         let sessionIDs = Set(childAgentRunWaitCountsByParentRunID[runID]?.keys.map(\.self) ?? [])
         guard !sessionIDs.isEmpty else {
             steeringDebugLog("[AgentRunSteeringWake] parent wake found no child agent_run waiters source=\(source) parentRunID=\(runID) active=\(debugActiveTools(for: runID))")
@@ -2526,11 +2558,21 @@ final class MCPServerViewModel: ObservableObject {
                 steeringDebugLog("[AgentRunSteeringWake] parent wake skipped missing child snapshot source=\(source) parentRunID=\(runID) childSessionID=\(sessionID)")
                 continue
             }
-            await AgentRunSessionStore.wakeCurrentWaiters(
-                publication.snapshot,
-                cursor: publication.cursor,
-                reason: .steeringRequested
-            )
+            if reason == .delegatedQuestionPending {
+                // Entry checks cover questions predating scope registration. Sticky store
+                // signalling covers a question racing the entry check and the first park.
+                await AgentRunSessionStore.signalSnapshotAndWakeWaiters(
+                    publication.snapshot,
+                    cursor: publication.cursor,
+                    reason: reason
+                )
+            } else {
+                await AgentRunSessionStore.wakeCurrentWaiters(
+                    publication.snapshot,
+                    cursor: publication.cursor,
+                    reason: reason
+                )
+            }
         }
         await Task.yield()
         steeringDebugLog("[AgentRunSteeringWake] parent wake yielded source=\(source) parentRunID=\(runID)")
@@ -3590,6 +3632,50 @@ final class MCPServerViewModel: ObservableObject {
                 correlation: lifecycleCorrelation,
                 EditFlowPerf.Dimensions(toolName: name, outcome: "success")
             )
+            if T.self == Value.self,
+               let value = result as? Value,
+               case let .object(object) = value,
+               let executionRunID,
+               AgentDelegatedQuestionNoticeWire.isEligible(toolName: name),
+               object["is_error"]?.boolValue != true,
+               object["isError"]?.boolValue != true,
+               object["ok"]?.boolValue != false,
+               object["success"]?.boolValue != false,
+               object["error"] == nil || object["error"] == .null,
+               object["wait"]?.objectValue?["result"]?.stringValue != "completed_with_errors",
+               !["error", "failed", "failure", "cancelled", "completed_with_errors"].contains(object["status"]?.stringValue ?? "")
+            {
+                guard !Task.isCancelled, !task.isCancelled,
+                      let targetWindow = try? requireTargetWindow()
+                else { return result }
+                // runTool is MainActor-isolated. Reservation, attachment, and return never
+                // suspend; the connection handler commits only at its final SDK handoff.
+                let coveredKeys = name == MCPWindowToolName.agentRun
+                    ? AgentRunMCPToolService.coveredDelegatedQuestionNoticeKeys(in: value)
+                    : []
+                let vm = targetWindow.agentModeViewModel
+                guard let reservation = vm.mcpReserveDelegatedQuestionNotices(
+                    parentRunID: executionRunID,
+                    coveredKeys: coveredKeys
+                ) else { return result }
+                let attached = AgentDelegatedQuestionNoticeWire.attaching(reservation.payloads, to: value) ?? value
+                if let delivery = ServerNetworkManager.currentToolResultDelivery {
+                    let reservationID = reservation.id
+                    delivery.onFinish { [weak vm] delivered in
+                        Task { @MainActor [weak vm] in
+                            if delivered {
+                                vm?.mcpCommitDelegatedQuestionNoticeReservation(reservationID)
+                            } else {
+                                vm?.mcpReleaseDelegatedQuestionNoticeReservation(reservationID)
+                            }
+                        }
+                    }
+                } else {
+                    // Direct callers have no connection-handler delivery boundary.
+                    vm.mcpCommitDelegatedQuestionNoticeReservation(reservation.id)
+                }
+                return attached as! T
+            }
             return result
         } catch {
             EditFlowPerf.end(EditFlowPerf.Stage.MCPToolCall.runToolTimeoutEnvelope, cancellationEnvelopeState)

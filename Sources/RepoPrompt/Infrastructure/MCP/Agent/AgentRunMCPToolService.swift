@@ -99,6 +99,7 @@ struct AgentRunWaitScopeCompletion: Equatable {
         case timedOut = "timed_out"
         case startupPending = "startup_pending"
         case statusUpdate = "status_update"
+        case delegatedQuestionPending = "delegated_question_pending"
         case expired
         case superseded
         case cancelled
@@ -115,6 +116,7 @@ struct AgentRunWaitScopeCompletion: Equatable {
 private enum MultiWaitDisposition {
     case actionable(AgentRunMCPSnapshot)
     case steeringInterrupted(AgentRunMCPSnapshot)
+    case delegatedQuestionInterrupted(AgentRunMCPSnapshot)
     case superseded(AgentRunMCPSnapshot)
     case statusUpdate(AgentRunMCPSnapshot)
     case terminalPublicationRejected(String)
@@ -168,6 +170,7 @@ private final class WaitScopeCompletionBox: @unchecked Sendable {
     }
 }
 
+private let agentRunDelegatedQuestionWakeNote = "Woken early: another child agent is waiting for your answer; see delegated_question_notices."
 private let agentRunSteeringWakeNote = "Steering interrupted this wait; the agent run has not completed. After responding to the user, call agent_run.wait for this session again to resume waiting."
 private let agentRunExpiredHandleRecoveryNote = [
     "This run/control/wait handle has expired.",
@@ -349,6 +352,7 @@ struct AgentRunMCPToolService {
     let withHeartbeat: (_ connectionID: UUID?, _ tool: String, _ stage: String, _ message: String, _ operation: @escaping HeartbeatOperation) async throws -> Value
     var beginAgentRunWait: (_ metadata: RequestMetadata, _ sessionIDs: Set<UUID>, _ timeoutSeconds: TimeInterval?) async -> UUID? = { _, _, _ in nil }
     var endAgentRunWait: (_ token: UUID, _ completion: AgentRunWaitScopeCompletion) async -> Void = { _, _ in }
+    var hasDeliverableDelegatedQuestionNotices: @MainActor @Sendable (_ waitToken: UUID, _ childSessionIDs: Set<UUID>) -> Bool = { _, _ in false }
     /// Plan §6.3: freezes the effective parent family for one lifecycle call from the authenticated
     /// run binding. The default treats the parent as unresolved; the server view model injects the
     /// authoritative resolver. Invoked once at the outer entry, before any mutation or delegation.
@@ -1740,6 +1744,27 @@ struct AgentRunMCPToolService {
         }
 
         let waitScopeToken = await beginAgentRunWait(metadata, Set(sessionIDs), timeoutSeconds)
+        if let waitScopeToken, hasDeliverableDelegatedQuestionNotices(waitScopeToken, Set(sessionIDs)) {
+            let snapshots = await collectCurrentSnapshots(sessionIDs: sessionIDs, agentModeVM: agentModeVM)
+            let value: Value = if let ready = snapshots.first(where: { isInterestingSnapshot($0) }) {
+                decoratedMultiWaitValue(
+                    snapshot: ready, sessionIDs: sessionIDs,
+                    result: ready.status == .expired ? "expired" : "snapshot_ready",
+                    snapshots: snapshots, pendingSessionIDs: pendingSessionIDs(from: snapshots)
+                )
+            } else {
+                Self.decoratedMultiWaitInterruptValue(
+                    sessionIDs: sessionIDs,
+                    representativeSnapshot: snapshots.first ?? initialSnapshots[0],
+                    snapshots: snapshots,
+                    pendingSessionIDs: pendingSessionIDs(from: snapshots),
+                    interruptedSessionID: snapshots.first?.sessionID ?? sessionIDs[0],
+                    wakeReason: .delegatedQuestionPending
+                )
+            }
+            await endAgentRunWait(waitScopeToken, waitScopeCompletion(from: value, fallbackSessionIDs: sessionIDs))
+            return AgentMCPWaitPolicy.attaching(selection, to: value)
+        }
         do {
             let value = try await withHeartbeat(
                 metadata.connectionID,
@@ -1752,7 +1777,11 @@ struct AgentRunMCPToolService {
                     agentModeVM: agentModeVM,
                     timeoutSeconds: timeoutSeconds,
                     initialSnapshots: initialSnapshots,
-                    includeStatusUpdates: includeStatusUpdates
+                    includeStatusUpdates: includeStatusUpdates,
+                    hasDeliverableDelegatedQuestion: { [self] in
+                        guard let waitScopeToken else { return false }
+                        return await hasDeliverableDelegatedQuestionNotices(waitScopeToken, Set(sessionIDs))
+                    }
                 )
             }
             let completion = waitScopeCompletion(from: value, fallbackSessionIDs: sessionIDs)
@@ -2273,6 +2302,17 @@ struct AgentRunMCPToolService {
             ? Self.normalizedStatusTextKey((AgentRunSessionStore.snapshot(for: initialCursor))?.statusText)
             : nil
         let waitScopeToken = await beginAgentRunWait(metadata, [sessionID], timeoutSeconds)
+        if let waitScopeToken, hasDeliverableDelegatedQuestionNotices(waitScopeToken, [sessionID]) {
+            let current = await currentSnapshot(sessionID: sessionID, agentModeVM: agentModeVM)
+            let value = current.isActionableForMCPWait
+                ? current.toValue()
+                : Self.delegatedQuestionInterruptedSingleWaitValue(current)
+            await endAgentRunWait(waitScopeToken, singleWaitScopeCompletion(from: value, sessionID: sessionID))
+            return await finalDecoratedSingleWaitValue(
+                from: value, sessionID: sessionID, agentModeVM: agentModeVM,
+                workflow: workflow, initialDelivery: initialDelivery
+            )
+        }
         let completionBox = WaitScopeCompletionBox()
         let snapshot: Value
         do {
@@ -2337,6 +2377,19 @@ struct AgentRunMCPToolService {
                                 errorDescription: nil
                             ))
                             return Self.steeringInterruptedSingleWaitValue(triggeringSnapshot)
+                        }
+                        if reason == .delegatedQuestionPending,
+                           let waitScopeToken,
+                           await hasDeliverableDelegatedQuestionNotices(waitScopeToken, [sessionID])
+                        {
+                            completionBox.set(AgentRunWaitScopeCompletion(
+                                reason: .delegatedQuestionPending,
+                                result: AgentDelegatedQuestionNoticeWire.agentRunWaitResult,
+                                winnerSessionID: nil,
+                                pendingSessionIDs: [sessionID],
+                                errorDescription: nil
+                            ))
+                            return Self.delegatedQuestionInterruptedSingleWaitValue(triggeringSnapshot)
                         }
                         if reason == .interactionResolved {
                             completionBox.set(AgentRunWaitScopeCompletion(
@@ -2493,6 +2546,17 @@ struct AgentRunMCPToolService {
         return .object(object)
     }
 
+    private nonisolated static func delegatedQuestionInterruptedSingleWaitValue(
+        _ snapshot: AgentRunMCPSnapshot
+    ) -> Value {
+        var object = snapshot.asObject()
+        object["_meta"] = .object([
+            "wake_reason": .string(AgentRunSessionStore.WakeReason.delegatedQuestionPending.rawValue),
+            "wait_result": .string(AgentDelegatedQuestionNoticeWire.agentRunWaitResult)
+        ])
+        return .object(object)
+    }
+
     private nonisolated static func steeringInterruptedSingleWaitValue(
         _ snapshot: AgentRunMCPSnapshot
     ) -> Value {
@@ -2589,7 +2653,8 @@ struct AgentRunMCPToolService {
         sessionIDs: [UUID],
         agentModeVM: AgentModeViewModel,
         triggeringSnapshot: AgentRunMCPSnapshot,
-        latestSnapshots: [AgentRunMCPSnapshot]
+        latestSnapshots: [AgentRunMCPSnapshot],
+        wakeReason: AgentRunSessionStore.WakeReason = .steeringRequested
     ) async -> Value {
         let freshSnapshots = await collectCurrentSnapshots(sessionIDs: sessionIDs, agentModeVM: agentModeVM)
         var snapshots = freshSnapshots.isEmpty ? latestSnapshots : freshSnapshots
@@ -2605,7 +2670,8 @@ struct AgentRunMCPToolService {
             representativeSnapshot: triggeringSnapshot,
             snapshots: snapshots,
             pendingSessionIDs: pendingIDs.isEmpty && !runningIDs.isEmpty ? runningIDs : pendingIDs,
-            interruptedSessionID: triggeringSnapshot.sessionID
+            interruptedSessionID: triggeringSnapshot.sessionID,
+            wakeReason: wakeReason
         )
     }
 
@@ -2614,24 +2680,31 @@ struct AgentRunMCPToolService {
         representativeSnapshot: AgentRunMCPSnapshot,
         snapshots: [AgentRunMCPSnapshot],
         pendingSessionIDs: [UUID],
-        interruptedSessionID: UUID
+        interruptedSessionID: UUID,
+        wakeReason: AgentRunSessionStore.WakeReason = .steeringRequested
     ) -> Value {
+        let delegated = wakeReason == .delegatedQuestionPending
+        let note = delegated ? agentRunDelegatedQuestionWakeNote : agentRunSteeringWakeNote
         var object = representativeSnapshot.asObject()
         object.removeValue(forKey: "assistant_text")
-        object["status_text"] = .string("Wait interrupted by a new steering instruction; the agent run is still running.")
+        object["status_text"] = .string(
+            delegated
+                ? agentRunDelegatedQuestionWakeNote
+                : "Wait interrupted by a new steering instruction; the agent run is still running."
+        )
         object["_meta"] = .object([
-            "wake_reason": .string(AgentRunSessionStore.WakeReason.steeringRequested.rawValue),
-            "note": .string(agentRunSteeringWakeNote)
+            "wake_reason": .string(wakeReason.rawValue),
+            "note": .string(note)
         ])
         object["wait"] = .object([
             "mode": .string("any"),
-            "result": .string("interrupted_by_steering"),
+            "result": .string(delegated ? AgentDelegatedQuestionNoticeWire.agentRunWaitResult : "interrupted_by_steering"),
             "winner_session_id": .null,
             "interrupted_session_id": .string(interruptedSessionID.uuidString),
             "session_ids": .array(sessionIDs.map { .string($0.uuidString) }),
             "waited_count": .int(sessionIDs.count),
             "pending_session_ids": .array(pendingSessionIDs.map { .string($0.uuidString) }),
-            "instruction": .string(agentRunSteeringWakeNote)
+            "instruction": .string(note)
         ])
         object["snapshots"] = .array(snapshots.map { snapshot in
             var snapshotObject = snapshot.asObject()
@@ -2648,7 +2721,8 @@ struct AgentRunMCPToolService {
         agentModeVM: AgentModeViewModel,
         timeoutSeconds: TimeInterval,
         initialSnapshots: [AgentRunMCPSnapshot],
-        includeStatusUpdates: Bool = false
+        includeStatusUpdates: Bool = false,
+        hasDeliverableDelegatedQuestion: @escaping @Sendable () async -> Bool = { false }
     ) async throws -> Value {
         let cursors = await MainActor.run {
             sessionIDs.compactMap { agentModeVM.mcpWaitCursor(sessionID: $0) }
@@ -2665,7 +2739,8 @@ struct AgentRunMCPToolService {
             cursors: cursors,
             fallbackSessionID: sessionIDs[0],
             timeoutSeconds: timeoutSeconds,
-            includeStatusUpdates: includeStatusUpdates
+            includeStatusUpdates: includeStatusUpdates,
+            hasDeliverableDelegatedQuestion: hasDeliverableDelegatedQuestion
         )
         let snapshots = await collectCurrentSnapshots(sessionIDs: sessionIDs, agentModeVM: agentModeVM)
         switch result.disposition {
@@ -2683,6 +2758,22 @@ struct AgentRunMCPToolService {
                 agentModeVM: agentModeVM,
                 triggeringSnapshot: snapshot,
                 latestSnapshots: snapshots
+            )
+        case let .delegatedQuestionInterrupted(snapshot):
+            // Actionable/terminal children still win when publication races the wake.
+            if let ready = snapshots.first(where: { isInterestingSnapshot($0) }) {
+                return decoratedMultiWaitValue(
+                    snapshot: ready, sessionIDs: sessionIDs,
+                    result: ready.status == .expired ? "expired" : "snapshot_ready",
+                    snapshots: snapshots, pendingSessionIDs: pendingSessionIDs(from: snapshots)
+                )
+            }
+            return await waitAnySteeringInterruptValue(
+                sessionIDs: sessionIDs,
+                agentModeVM: agentModeVM,
+                triggeringSnapshot: snapshot,
+                latestSnapshots: snapshots,
+                wakeReason: .delegatedQuestionPending
             )
         case let .superseded(snapshot):
             return decoratedMultiWaitSupersededValue(
@@ -2735,13 +2826,15 @@ struct AgentRunMCPToolService {
         cursors: [AgentRunSessionStore.WaitCursor],
         fallbackSessionID: UUID,
         timeoutSeconds: TimeInterval,
-        includeStatusUpdates: Bool = false
+        includeStatusUpdates: Bool = false,
+        hasDeliverableDelegatedQuestion: @escaping @Sendable () async -> Bool = { false }
     ) async -> WaitAnyResult {
         let operations: [@Sendable () async -> WaitAnyResult] = cursors.map { cursor in
             { await Self.waitUntilActionable(
                 cursor: cursor,
                 timeoutSeconds: timeoutSeconds,
-                includeStatusUpdates: includeStatusUpdates
+                includeStatusUpdates: includeStatusUpdates,
+                hasDeliverableDelegatedQuestion: hasDeliverableDelegatedQuestion
             ) }
         }
         return await resolveFirstWaitAny(
@@ -2787,7 +2880,8 @@ struct AgentRunMCPToolService {
     private nonisolated static func waitUntilActionable(
         cursor initialCursor: AgentRunSessionStore.WaitCursor,
         timeoutSeconds: TimeInterval,
-        includeStatusUpdates: Bool = false
+        includeStatusUpdates: Bool = false,
+        hasDeliverableDelegatedQuestion: @escaping @Sendable () async -> Bool = { false }
     ) async -> WaitAnyResult {
         let sessionID = initialCursor.registration.sessionID
         let clock = ContinuousClock()
@@ -2799,6 +2893,14 @@ struct AgentRunMCPToolService {
             ? normalizedStatusTextKey((AgentRunSessionStore.snapshot(for: initialCursor))?.statusText)
             : nil
         var cursor = initialCursor
+        if !Task.isCancelled, await hasDeliverableDelegatedQuestion(),
+           let snapshot = await AgentRunSessionStore.snapshot(for: cursor)
+        {
+            return WaitAnyResult(
+                sessionID: sessionID,
+                disposition: snapshot.isActionableForMCPWait ? .actionable(snapshot) : .delegatedQuestionInterrupted(snapshot)
+            )
+        }
         while true {
             if Task.isCancelled {
                 return WaitAnyResult(sessionID: sessionID, disposition: .cancelled)
@@ -2825,6 +2927,9 @@ struct AgentRunMCPToolService {
                 }
                 if reason == .steeringRequested {
                     return WaitAnyResult(sessionID: sessionID, disposition: .steeringInterrupted(snapshot))
+                }
+                if reason == .delegatedQuestionPending, await hasDeliverableDelegatedQuestion() {
+                    return WaitAnyResult(sessionID: sessionID, disposition: .delegatedQuestionInterrupted(snapshot))
                 }
             case let .epochAdvanced(epoch, transitionKind):
                 if transitionKind == .unrelated {
@@ -2885,12 +2990,14 @@ struct AgentRunMCPToolService {
             3
         case .expired:
             4
-        case .statusUpdate:
+        case .delegatedQuestionInterrupted:
             5
-        case .timedOut:
+        case .statusUpdate:
             6
-        case .cancelled:
+        case .timedOut:
             7
+        case .cancelled:
+            8
         }
     }
 
@@ -2947,6 +3054,7 @@ struct AgentRunMCPToolService {
             let disposition = switch result.disposition {
             case .actionable: "actionable"
             case .steeringInterrupted: "steering_interrupted"
+            case .delegatedQuestionInterrupted: "delegated_question_interrupted"
             default: "other"
             }
             return (result.sessionID, disposition)
@@ -2958,14 +3066,15 @@ struct AgentRunMCPToolService {
 
         static func test_waitUntilActionableDisposition(
             sessionID: UUID,
-            timeoutSeconds: TimeInterval
+            timeoutSeconds: TimeInterval,
+            hasDeliverableDelegatedQuestion: @escaping @Sendable () async -> Bool = { false }
         ) async -> (disposition: String, wakeReason: String?, sessionID: UUID, snapshotStatus: String?) {
             guard let registration = await AgentRunSessionStore.currentRegistration(for: sessionID),
                   let cursor = await AgentRunSessionStore.currentCursor(for: registration)
             else {
                 return ("expired", nil, sessionID, nil)
             }
-            let result = await waitUntilActionable(cursor: cursor, timeoutSeconds: timeoutSeconds)
+            let result = await waitUntilActionable(cursor: cursor, timeoutSeconds: timeoutSeconds, hasDeliverableDelegatedQuestion: hasDeliverableDelegatedQuestion)
             switch result.disposition {
             case let .actionable(snapshot):
                 return ("actionable", nil, result.sessionID, snapshot.status.rawValue)
@@ -2973,6 +3082,13 @@ struct AgentRunMCPToolService {
                 return (
                     "steering_interrupted",
                     AgentRunSessionStore.WakeReason.steeringRequested.rawValue,
+                    result.sessionID,
+                    snapshot.status.rawValue
+                )
+            case let .delegatedQuestionInterrupted(snapshot):
+                return (
+                    "delegated_question_interrupted",
+                    AgentRunSessionStore.WakeReason.delegatedQuestionPending.rawValue,
                     result.sessionID,
                     snapshot.status.rawValue
                 )
@@ -2993,7 +3109,8 @@ struct AgentRunMCPToolService {
 
         static func test_waitUntilFirstActionableDisposition(
             sessionIDs: [UUID],
-            timeoutSeconds: TimeInterval
+            timeoutSeconds: TimeInterval,
+            hasDeliverableDelegatedQuestion: @escaping @Sendable () async -> Bool = { false }
         ) async -> (sessionID: UUID, disposition: String) {
             var cursors: [AgentRunSessionStore.WaitCursor] = []
             for sessionID in sessionIDs {
@@ -3005,11 +3122,13 @@ struct AgentRunMCPToolService {
             let result = await waitUntilFirstActionable(
                 cursors: cursors,
                 fallbackSessionID: sessionIDs[0],
-                timeoutSeconds: timeoutSeconds
+                timeoutSeconds: timeoutSeconds,
+                hasDeliverableDelegatedQuestion: hasDeliverableDelegatedQuestion
             )
             let disposition = switch result.disposition {
             case .terminalPublicationRejected: "publication_rejected"
             case .steeringInterrupted: "steering_interrupted"
+            case .delegatedQuestionInterrupted: "delegated_question_interrupted"
             case .actionable: "actionable"
             case .superseded: "superseded"
             case .expired: "expired"
@@ -3032,6 +3151,8 @@ struct AgentRunMCPToolService {
                     disposition = .terminalPublicationRejected("test")
                 case "steering_interrupted":
                     disposition = .steeringInterrupted(snapshot)
+                case "delegated_question_interrupted":
+                    disposition = .delegatedQuestionInterrupted(snapshot)
                 case "actionable":
                     disposition = .actionable(snapshot)
                 case "superseded":
@@ -3058,6 +3179,7 @@ struct AgentRunMCPToolService {
             let disposition = switch result.disposition {
             case .terminalPublicationRejected: "publication_rejected"
             case .steeringInterrupted: "steering_interrupted"
+            case .delegatedQuestionInterrupted: "delegated_question_interrupted"
             case .actionable: "actionable"
             case .superseded: "superseded"
             case .expired: "expired"
@@ -3087,6 +3209,7 @@ struct AgentRunMCPToolService {
         case "status_update": .statusUpdate
         case "superseded": .superseded
         case "cancelled", "interrupted_by_steering": .cancelled
+        case AgentDelegatedQuestionNoticeWire.agentRunWaitResult: .delegatedQuestionPending
         case "error": .error
         default: .snapshotReady
         }
@@ -3106,6 +3229,8 @@ struct AgentRunMCPToolService {
             .startupPending
         } else if waitResult == "timed_out" {
             .timedOut
+        } else if waitResult == AgentDelegatedQuestionNoticeWire.agentRunWaitResult {
+            .delegatedQuestionPending
         } else if status == .expired {
             .expired
         } else {
@@ -3114,8 +3239,8 @@ struct AgentRunMCPToolService {
         return AgentRunWaitScopeCompletion(
             reason: reason,
             result: waitResult ?? reason.rawValue,
-            winnerSessionID: status == .expired || reason == .timedOut || reason == .startupPending ? nil : sessionID,
-            pendingSessionIDs: reason == .timedOut || reason == .startupPending ? [sessionID] : [],
+            winnerSessionID: status == .expired || reason == .timedOut || reason == .startupPending || reason == .delegatedQuestionPending ? nil : sessionID,
+            pendingSessionIDs: reason == .timedOut || reason == .startupPending || reason == .delegatedQuestionPending ? [sessionID] : [],
             errorDescription: nil
         )
     }
@@ -3151,6 +3276,13 @@ struct AgentRunMCPToolService {
             object["wait"] = .object([
                 "result": .string("interrupted_by_steering"),
                 "instruction": .string(agentRunSteeringWakeNote)
+            ])
+        }
+        if wakeReason == .delegatedQuestionPending {
+            object["status_text"] = .string(agentRunDelegatedQuestionWakeNote)
+            object["wait"] = .object([
+                "result": .string(AgentDelegatedQuestionNoticeWire.agentRunWaitResult),
+                "instruction": .string(agentRunDelegatedQuestionWakeNote)
             ])
         }
         if wakeReason == .interactionResolved {
@@ -3260,6 +3392,8 @@ struct AgentRunMCPToolService {
             metadata["wake_reason"] = .string(wakeReason.rawValue)
             if wakeReason == .steeringRequested {
                 metadata["note"] = .string(agentRunSteeringWakeNote)
+            } else if wakeReason == .delegatedQuestionPending {
+                metadata["note"] = .string(agentRunDelegatedQuestionWakeNote)
             }
         }
         return metadata.isEmpty ? nil : metadata
@@ -3268,6 +3402,22 @@ struct AgentRunMCPToolService {
     private func wakeReason(from object: [String: Value]) -> AgentRunSessionStore.WakeReason? {
         guard let raw = object["_meta"]?.objectValue?["wake_reason"]?.stringValue else { return nil }
         return AgentRunSessionStore.WakeReason(rawValue: raw)
+    }
+
+    /// Question snapshots already visible in an agent_run result acknowledge their notice
+    /// at handoff without duplicating its text. Handles single, wait_any, and poll-many shapes.
+    nonisolated static func coveredDelegatedQuestionNoticeKeys(in value: Value) -> Set<AgentDelegatedQuestionNoticeKey> {
+        guard let object = value.objectValue else { return [] }
+        let snapshots = [value] + (object["snapshots"]?.arrayValue ?? [])
+        return Set(snapshots.compactMap { snapshot in
+            guard let child = snapshot.objectValue,
+                  let sessionID = child["session_id"]?.stringValue.flatMap(UUID.init(uuidString:)),
+                  let interaction = child["interaction"]?.objectValue,
+                  interaction["kind"]?.stringValue == "question",
+                  let interactionID = interaction["id"]?.stringValue.flatMap(UUID.init(uuidString:))
+            else { return nil }
+            return AgentDelegatedQuestionNoticeKey(childSessionID: sessionID, interactionID: interactionID)
+        })
     }
 
     static func snapshot(from object: [String: Value]) -> AgentRunMCPSnapshot? {
@@ -3966,7 +4116,7 @@ struct AgentRunMCPToolService {
 private extension AgentRunSessionStore.WakeReason {
     var suppressesAssistantPreview: Bool {
         switch self {
-        case .instructionDelivered, .steeringRequested:
+        case .instructionDelivered, .steeringRequested, .delegatedQuestionPending:
             true
         case .interactionResolved:
             false

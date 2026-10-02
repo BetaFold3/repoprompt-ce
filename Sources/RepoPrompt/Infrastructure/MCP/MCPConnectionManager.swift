@@ -2464,6 +2464,8 @@ actor ServerNetworkManager {
     static var currentExplicitWindowRoutingHint: MCPExplicitWindowRoutingHint?
     @TaskLocal
     static var currentEffectiveWindowID: Int?
+    @TaskLocal
+    static var currentToolResultDelivery: MCPToolResultDeliveryTransaction?
 
     nonisolated static func explicitWindowRoutingHint(
         connectionID: UUID,
@@ -11488,6 +11490,8 @@ actor ServerNetworkManager {
         //  tools/call  (UPDATED)
         // ------------------------------------------------------------------
         await server.withMethodHandler(CallTool.self) { [weak self] params in
+            let delivery = MCPToolResultDeliveryTransaction()
+            defer { delivery.finish(delivered: false) }
             guard let self else {
                 return CallTool.Result(
                     content: [MCP.Tool.Content.text(text: "Server unavailable", annotations: nil, _meta: nil)],
@@ -12975,7 +12979,9 @@ actor ServerNetworkManager {
                                                                 EditFlowPerf.Stage.MCPToolCall.dispatch,
                                                                 EditFlowPerf.Dimensions(toolName: toolName)
                                                             ) {
-                                                                try await dispatchResolvedProvider(resolvedOperation)
+                                                                try await Self.$currentToolResultDelivery.withValue(delivery) {
+                                                                    try await dispatchResolvedProvider(resolvedOperation)
+                                                                }
                                                             }
                                                         }
                                                     }
@@ -13043,6 +13049,7 @@ actor ServerNetworkManager {
                                                     // when the run completes. This prevents killing the host MCP client
                                                     // (e.g., Claude Desktop) that invoked context_builder.
 
+                                                    delivery.finish(delivered: !Task.isCancelled)
                                                     return handlerResult(
                                                         CallTool.Result(content: contentBlocks, isError: false),
                                                         outcome: "success"
@@ -13103,7 +13110,9 @@ actor ServerNetworkManager {
                                                 EditFlowPerf.Stage.MCPToolCall.dispatch,
                                                 EditFlowPerf.Dimensions(toolName: toolName)
                                             ) {
-                                                try await dispatchResolvedProvider(resolvedOperation)
+                                                try await Self.$currentToolResultDelivery.withValue(delivery) {
+                                                    try await dispatchResolvedProvider(resolvedOperation)
+                                                }
                                             }
                                             releaseResourceAdmissionLeases(outcome: "provider_success")
                                             let permitPostDispatchEnvelopeState = EditFlowPerf.begin(
@@ -13167,6 +13176,7 @@ actor ServerNetworkManager {
                                             // Note: context_builder caller termination is NOT done here.
                                             // See comment in window-scoped branch above.
 
+                                            delivery.finish(delivered: !Task.isCancelled)
                                             return handlerResult(
                                                 CallTool.Result(content: contentBlocks, isError: false),
                                                 outcome: "success"

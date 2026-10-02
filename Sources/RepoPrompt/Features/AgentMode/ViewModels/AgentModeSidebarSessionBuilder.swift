@@ -16,6 +16,8 @@ struct AgentModeSidebarSessionBuilder {
     let mcpControlledTabIDs: Set<UUID>
     let registeredRemoteHosts: [(id: String, displayName: String)]
     var pairedDeviceDisplayNameByBareID: [String: String] = [:]
+    /// Delegated ask_user badges resolved by durable session ID, so index-only rows work too.
+    var delegatedQuestionAttentionBySessionID: [UUID: AgentDelegatedQuestionSidebarAttention] = [:]
 
     private struct BuildContext {
         let tabByID: [UUID: ComposeTabState]
@@ -326,6 +328,9 @@ struct AgentModeSidebarSessionBuilder {
                 ?? entry?.scheduledSendSummary,
             lastDispatch: metadataLiveSession.map(\.lastScheduledDispatch) ?? entry?.lastScheduledDispatch
         )
+        let delegatedQuestionAttention = resolvedSessionID
+            .flatMap { delegatedQuestionAttentionBySessionID[$0] }
+            .flatMap { $0.isEmpty ? nil : $0 }
         let searchFields = Self.searchFields(
             title: title,
             entry: entry,
@@ -334,6 +339,7 @@ struct AgentModeSidebarSessionBuilder {
             worktree: worktree,
             mergeAttention: mergeAttention,
             scheduledSendStatus: scheduledSendStatus,
+            delegatedQuestionAttention: delegatedQuestionAttention,
             sessionID: resolvedSessionID,
             tabID: tab.id
         )
@@ -356,6 +362,7 @@ struct AgentModeSidebarSessionBuilder {
             worktree: worktree,
             worktreeMergeAttention: mergeAttention,
             scheduledSendStatus: scheduledSendStatus,
+            delegatedQuestionAttention: delegatedQuestionAttention,
             searchFields: searchFields
         )
     }
@@ -506,6 +513,7 @@ struct AgentModeSidebarSessionBuilder {
         worktree: AgentWorktreeIndicator?,
         mergeAttention: AgentWorktreeMergeAttention?,
         scheduledSendStatus: AgentSidebarScheduledSendStatus?,
+        delegatedQuestionAttention: AgentDelegatedQuestionSidebarAttention? = nil,
         sessionID: UUID?,
         tabID: UUID
     ) -> AgentSessionSearchFields {
@@ -518,7 +526,8 @@ struct AgentModeSidebarSessionBuilder {
                 entry?.lastRunStateRaw,
                 isMCPControlled ? "MCP" : nil,
                 mergeAttention == nil ? nil : "merge",
-                scheduledSendStatus == nil ? nil : "scheduled"
+                scheduledSendStatus == nil ? nil : "scheduled",
+                delegatedQuestionAttention.map { _ in "question" }
             ],
             model: [
                 entry?.agentKindRaw,
@@ -813,6 +822,7 @@ struct AgentModeSidebarSessionBuilder {
             worktree: session.worktree,
             worktreeMergeAttention: session.worktreeMergeAttention,
             scheduledSendStatus: session.scheduledSendStatus,
+            delegatedQuestionAttention: session.delegatedQuestionAttention,
             searchFields: session.searchFields
         )
     }

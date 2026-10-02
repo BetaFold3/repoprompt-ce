@@ -58,6 +58,7 @@ actor AgentRunSessionStore {
     enum WakeReason: String, Equatable {
         case instructionDelivered = "instruction_delivered"
         case steeringRequested = "steering_requested"
+        case delegatedQuestionPending = "delegated_question_pending"
         case interactionResolved = "interaction_resolved"
     }
 

@@ -6,6 +6,36 @@ import XCTest
 
 @MainActor
 final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
+    func testDelegatedQuestionReadFileDeliveryCommitsOnlyAfterCompletionObservers() async throws {
+        #if DEBUG
+            try await withFixture(agentOwned: true) { fixture in
+                try await runCheckpoint(fixture: fixture, scenario: .delegatedQuestionDelivery)
+            }
+        #else
+            throw XCTSkip("Persistent Agent Mode MCP socketpair integration requires DEBUG inspection helpers.")
+        #endif
+    }
+
+    func testDelegatedQuestionPostAttachCancellationReleasesAndNextReadDelivers() async throws {
+        #if DEBUG
+            try await withFixture(agentOwned: true) { fixture in
+                try await runCheckpoint(fixture: fixture, scenario: .delegatedQuestionCancellation)
+            }
+        #else
+            throw XCTSkip("Persistent Agent Mode MCP socketpair integration requires DEBUG inspection helpers.")
+        #endif
+    }
+
+    func testDelegatedQuestionReadFileErrorDoesNotReserveNotice() async throws {
+        #if DEBUG
+            try await withFixture(agentOwned: true) { fixture in
+                try await runCheckpoint(fixture: fixture, scenario: .delegatedQuestionError)
+            }
+        #else
+            throw XCTSkip("Persistent Agent Mode MCP socketpair integration requires DEBUG inspection helpers.")
+        #endif
+    }
+
     func testWorktreeReadCoverageCertificateHitsExactFullAndSliceRepeatsButNotExpansion() async throws {
         #if DEBUG
             try await withFixture(agentOwned: true) { fixture in
@@ -248,6 +278,9 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
             case threeRootFileToolScope
             case hiddenWorktreeReadSliceRebase
             case subWorkerDelegationDenial
+            case delegatedQuestionDelivery
+            case delegatedQuestionCancellation
+            case delegatedQuestionError
 
             var requiresSerialReadPrelude: Bool {
                 switch self {
@@ -255,7 +288,8 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
                      .manageSelectionGetCanonicalHandover, .worktreeCoverageCertificateRepeats,
                      .worktreeCoverageCertificatePersistenceBoundary, .worktreeCoverageCertificateFailClosed,
                      .worktreeSearchPhysicalCoverage, .threeRootFileToolScope, .hiddenWorktreeReadSliceRebase,
-                     .subWorkerDelegationDenial:
+                     .subWorkerDelegationDenial, .delegatedQuestionDelivery, .delegatedQuestionCancellation,
+                     .delegatedQuestionError:
                     false
                 default:
                     true
@@ -459,7 +493,206 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
                 try await assertHiddenWorktreeReadSliceRebase(fixture: fixture)
             case .subWorkerDelegationDenial:
                 try await assertSubWorkerDelegationDenial(fixture: fixture)
+            case .delegatedQuestionDelivery, .delegatedQuestionCancellation, .delegatedQuestionError:
+                try await assertDelegatedQuestionDelivery(fixture: fixture, scenario: scenario)
             }
+        }
+
+        @MainActor
+        final class DelegatedQuestionResultBox {
+            var resultJSON: String?
+            var isError: Bool?
+        }
+
+        func assertDelegatedQuestionDelivery(fixture: Fixture, scenario: CheckpointScenario) async throws {
+            let baselineResponse = try await fixture.socketClient.request(
+                id: 3, method: "tools/call",
+                params: ["name": MCPWindowToolName.readFile, "arguments": ["path": fixture.fileURL.path]]
+            )
+            let baselineBlocks = try Self.toolContent(from: baselineResponse, id: 3)
+            XCTAssertTrue(baselineBlocks.compactMap { $0["text"] as? String }.joined().contains(Fixture.sentinelContent))
+
+            let vm = fixture.window.agentModeViewModel
+            let parent = try XCTUnwrap(vm.session(for: Fixture.tabID, createIfNeeded: true))
+            XCTAssertEqual(parent.activeAgentSessionID, Fixture.agentSessionID)
+            parent.hasLoadedPersistedState = true
+            parent.parentSessionID = nil
+            parent.runID = Fixture.runID
+
+            let childTab = await fixture.window.promptManager.createBackgroundComposeTab(
+                strategy: .blank, name: "Delegated delivery child"
+            )
+            let childTabID = try XCTUnwrap(childTab).id
+            let childSessionID = UUID()
+            let child = try XCTUnwrap(vm.session(for: childTabID, createIfNeeded: true))
+            _ = try XCTUnwrap(vm.test_installPersistentSessionBinding(
+                sessionID: childSessionID, on: child, updateWorkspaceMetadata: true
+            ))
+            child.hasLoadedPersistedState = true
+            child.parentSessionID = Fixture.agentSessionID
+            child.mcpControlContext = AgentModeViewModel.AgentMCPControlContext(
+                sessionID: childSessionID,
+                activationID: UUID(),
+                registration: .init(sessionID: childSessionID, generation: 0),
+                currentEpoch: nil,
+                preparedEpoch: nil,
+                pendingEpochTransition: nil,
+                originatingConnectionID: nil,
+                interactionTransport: .mcp(sessionID: childSessionID, originatingConnectionID: nil),
+                suppressUserNotifications: true,
+                forceAutoEditEnabled: false,
+                autoEditEnabledBeforeOverride: false,
+                taskLabelKind: .engineer
+            )
+            vm.test_setMCPControlledTabIDs([childTabID])
+            let interaction = AgentAskUserInteraction(
+                timeoutSeconds: 60,
+                questions: [AgentAskUserQuestion(
+                    id: "route", question: "Which route should the child use?",
+                    options: [AgentAskUserOption(label: "A"), AgentAskUserOption(label: "B")],
+                    allowsCustom: true
+                )]
+            )
+            let key = AgentDelegatedQuestionNoticeKey(childSessionID: childSessionID, interactionID: interaction.id)
+            let questionTask = Task { @MainActor in
+                try await vm.askUser(tabID: childTabID, interaction: interaction)
+            }
+            let box = DelegatedQuestionResultBox()
+            let observerToken = await fixture.networkManager.registerToolEventObserver(
+                for: Fixture.runID,
+                observer: .init(
+                    onCalled: { _, _, _ in },
+                    onCompleted: { _, toolName, _, resultJSON, isError in
+                        guard toolName == MCPWindowToolName.readFile else { return }
+                        await MainActor.run {
+                            box.resultJSON = resultJSON
+                            box.isError = isError
+                            if isError {
+                                // The error observer runs before the handler's failure defer.
+                                // A transient reservation would still be visible here.
+                                XCTAssertNil(vm.delegatedQuestionNotices.records[key]?.reservationID)
+                                XCTAssertEqual(vm.delegatedQuestionNotices.records[key]?.acknowledged, false)
+                                XCTAssertTrue(vm.mcpHasDeliverableDelegatedQuestionNotices(
+                                    parentRunID: Fixture.runID, excludingChildSessionIDs: []
+                                ))
+                            }
+                        }
+                    }
+                )
+            )
+            do {
+                try await AsyncTestWait.waitUntil("child question addressed to parent", timeout: 3) {
+                    await MainActor.run {
+                        child.pendingAskUser?.isAwaitingParentAgent == true
+                            && vm.mcpHasDeliverableDelegatedQuestionNotices(
+                                parentRunID: Fixture.runID, excludingChildSessionIDs: []
+                            )
+                    }
+                }
+
+                let cancelAtTail = scenario == .delegatedQuestionCancellation
+                let errorCall = scenario == .delegatedQuestionError
+                let tailObserved = PersistentAsyncSignal()
+                if !errorCall {
+                    await fixture.networkManager.debugSetBeforeToolCompletionObserversForTesting { connectionID, toolName in
+                        guard connectionID == Fixture.connectionID, toolName == MCPWindowToolName.readFile else { return }
+                        await MainActor.run {
+                            XCTAssertNotNil(vm.delegatedQuestionNotices.records[key]?.reservationID)
+                            XCTAssertEqual(vm.delegatedQuestionNotices.records[key]?.acknowledged, false)
+                            XCTAssertEqual(vm.delegatedQuestionNotices.records[key]?.deliveredRunIDs, [])
+                            XCTAssertFalse(vm.mcpHasDeliverableDelegatedQuestionNotices(
+                                parentRunID: Fixture.runID, excludingChildSessionIDs: []
+                            ))
+                        }
+                        await tailObserved.mark()
+                        if cancelAtTail {
+                            // Cancel the actual SDK handler task after runTool attached its value.
+                            // The socket remains open for the next call on the same run.
+                            withUnsafeCurrentTask { $0?.cancel() }
+                        }
+                    }
+                }
+                let path = errorCall ? fixture.rootURL.appendingPathComponent("missing.swift").path : fixture.fileURL.path
+                let response = try await fixture.socketClient.request(
+                    id: 4, method: "tools/call",
+                    params: ["name": MCPWindowToolName.readFile, "arguments": ["path": path]]
+                )
+                await fixture.networkManager.debugSetBeforeToolCompletionObserversForTesting(nil)
+                let result = try XCTUnwrap(try Self.responseObject(from: response, id: 4)["result"] as? [String: Any])
+                let observedJSON = try XCTUnwrap(box.resultJSON)
+                let observed = try JSONDecoder().decode(Value.self, from: Data(observedJSON.utf8))
+                if errorCall {
+                    XCTAssertEqual(result["isError"] as? Bool, true)
+                    XCTAssertEqual(box.isError, true)
+                    XCTAssertNil(observed.objectValue?[AgentDelegatedQuestionNoticeWire.resultKey])
+                } else {
+                    let reachedTail = await tailObserved.isMarked()
+                    XCTAssertTrue(reachedTail)
+                    XCTAssertEqual(box.isError, false)
+                    let blocks = try Self.toolContent(from: response, id: 4)
+                    XCTAssertEqual(blocks.count, baselineBlocks.count + 1)
+                    XCTAssertEqual(
+                        try JSONSerialization.data(withJSONObject: Array(blocks.dropLast()), options: [.sortedKeys]),
+                        try JSONSerialization.data(withJSONObject: baselineBlocks, options: [.sortedKeys])
+                    )
+                    let noticeText = try XCTUnwrap(blocks.last?["text"] as? String)
+                    XCTAssertTrue(noticeText.contains(childSessionID.uuidString), noticeText)
+                    XCTAssertTrue(noticeText.contains(interaction.id.uuidString), noticeText)
+                    XCTAssertTrue(noticeText.contains("Which route should the child use?"), noticeText)
+                    let notices = try XCTUnwrap(observed.objectValue?[AgentDelegatedQuestionNoticeWire.resultKey]?.arrayValue)
+                    XCTAssertEqual(notices.count, 1)
+                    XCTAssertEqual(notices.first?.objectValue?["interaction_id"]?.stringValue, interaction.id.uuidString)
+                }
+
+                if cancelAtTail || errorCall {
+                    try await AsyncTestWait.waitUntil("notice released after undelivered result", timeout: 3) {
+                        await MainActor.run {
+                            vm.delegatedQuestionNotices.records[key]?.reservationID == nil
+                                && vm.mcpHasDeliverableDelegatedQuestionNotices(
+                                    parentRunID: Fixture.runID, excludingChildSessionIDs: []
+                                )
+                        }
+                    }
+                    XCTAssertEqual(vm.delegatedQuestionNotices.records[key]?.acknowledged, false)
+                    XCTAssertEqual(vm.delegatedQuestionNotices.records[key]?.deliveredRunIDs, [])
+                    let retry = try await fixture.socketClient.request(
+                        id: 5, method: "tools/call",
+                        params: ["name": MCPWindowToolName.readFile, "arguments": ["path": fixture.fileURL.path]]
+                    )
+                    let retryText = try Self.readFileText(from: retry, id: 5)
+                    XCTAssertTrue(retryText.contains(Fixture.sentinelContent), retryText)
+                    XCTAssertTrue(retryText.contains(interaction.id.uuidString), retryText)
+                }
+                try await AsyncTestWait.waitUntil("notice committed at handler handoff", timeout: 3) {
+                    await MainActor.run { vm.delegatedQuestionNotices.records[key]?.acknowledged == true }
+                }
+                XCTAssertEqual(vm.delegatedQuestionNotices.records[key]?.deliveredRunIDs, [Fixture.runID])
+                XCTAssertNil(vm.delegatedQuestionNotices.records[key]?.reservationID)
+                XCTAssertEqual(child.pendingAskUser?.interaction.id, interaction.id, "Delivery must not answer the question")
+
+                let afterCommit = try await fixture.socketClient.request(
+                    id: 6, method: "tools/call",
+                    params: ["name": MCPWindowToolName.readFile, "arguments": ["path": fixture.fileURL.path]]
+                )
+                XCTAssertEqual(
+                    try JSONSerialization.data(withJSONObject: Self.toolContent(from: afterCommit, id: 6), options: [.sortedKeys]),
+                    try JSONSerialization.data(withJSONObject: baselineBlocks, options: [.sortedKeys])
+                )
+                await fixture.networkManager.unregisterToolEventObserver(for: Fixture.runID, token: observerToken)
+                vm.skipAskUser(tabID: childTabID, interactionID: interaction.id)
+                _ = try await questionTask.value
+            } catch {
+                await fixture.networkManager.debugSetBeforeToolCompletionObserversForTesting(nil)
+                await fixture.networkManager.unregisterToolEventObserver(for: Fixture.runID, token: observerToken)
+                vm.skipAskUser(tabID: childTabID, interactionID: interaction.id)
+                _ = try? await questionTask.value
+                throw error
+            }
+        }
+
+        static func toolContent(from rawJSON: String, id: Int) throws -> [[String: Any]] {
+            let result = try XCTUnwrap(try responseObject(from: rawJSON, id: id)["result"] as? [String: Any])
+            return try XCTUnwrap(result["content"] as? [[String: Any]])
         }
 
         func assertHiddenWorktreeReadSliceRebase(fixture: Fixture) async throws {

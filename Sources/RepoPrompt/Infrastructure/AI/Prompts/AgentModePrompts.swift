@@ -388,6 +388,15 @@ enum AgentModePrompts {
         agents. Give every delegated task a self-contained brief.
         """
 
+        static let pairReviewRemediationGuidance = """
+        When delegating fixes for Oracle review or re-review findings, prefer a Pair worker \
+        (`agent_run` with `model_id="pair"`) to address the findings, run the affected validation, \
+        and return evidence for you to assess. For later findings in the same workstream, steer \
+        the existing Pair session rather than starting a fresh worker. Small, straightforward \
+        fixes can stay with the current agent; this preference does not require delegation or \
+        another Oracle review.
+        """
+
         /// Delegation section for named non-explore role prompts (engineer / pair / design).
         /// `.agentExploreOnly` renders the legacy explore-probe section; `.none` (delegation
         /// leaf) renders nothing, so no delegation tool or export-to-child guidance appears.
@@ -415,6 +424,7 @@ enum AgentModePrompts {
                 \(agentRunToolLine)
                 \(agentExploreToolLine)\(researchToolsNote)
                 \(boundedDelegationDepthNote)
+                - \(pairReviewRemediationGuidance)
                 \(agentBothExportGuidance)
 
                 \(agentExploreWhenToDispatchGuidance)
@@ -424,6 +434,7 @@ enum AgentModePrompts {
                 *Agent Delegation:*
                 \(agentRunToolLine)\(researchToolsNote)
                 \(boundedDelegationDepthNote)
+                - \(pairReviewRemediationGuidance)
                 \(agentRunExportGuidance)
 
                 \(agentRunExploreWhenToDispatchGuidance)

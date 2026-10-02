@@ -452,6 +452,8 @@ struct AgentComposerProps: Equatable {
     let stagedSlashCommand: AgentStagedSlashCommandProps?
     let draftRestorationEvent: AgentDraftRestorationProps?
     let fileTagLookupContextIdentity: AgentWorkspaceLookupContextIdentity
+    /// Pending child questions addressed to this tab's agent (delegated ask_user plan §6.5).
+    var delegatedQuestions: [AgentDelegatedQuestionBannerRow] = []
 
     static let empty = AgentComposerProps(
         currentTabID: nil,

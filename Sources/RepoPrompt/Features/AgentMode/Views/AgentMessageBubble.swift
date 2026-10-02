@@ -197,6 +197,7 @@ struct AgentMessageBubble: View {
     @State private var isStartingCodexManagedLogin = false
     @State private var codexManagedLoginFeedback: String?
     @State private var codexManagedLoginCompleted = false
+    @State private var isAskUserExchangeExpanded = false
     private var fontPreset: FontScalePreset {
         fontScale.preset
     }
@@ -723,6 +724,7 @@ struct AgentMessageBubble: View {
     /// Completed question exchange (tool_result state) - shows Q&A grouped together
     private var askUserQuestionExchangeView: some View {
         let summary = parseAskUserQuestionSummaryRobust(args: item.toolArgsJSON, result: item.toolResultJSON)
+        let isExpanded = !summary.isHistoricalScalar && isAskUserExchangeExpanded
         return HStack {
             VStack(alignment: .leading, spacing: 8) {
                 HStack(alignment: .top, spacing: 8) {
@@ -745,18 +747,40 @@ struct AgentMessageBubble: View {
                                         .padding(.vertical, 2)
                                         .background(Color.secondary.opacity(0.12))
                                         .cornerRadius(6)
+                                        .textSelection(.enabled)
                                 }
                             }
                             if let context = summary.contextLine {
                                 Text(context)
                                     .font(fontPreset.swiftUIFont(sizeAtNormal: 11))
                                     .foregroundColor(.secondary)
-                                    .lineLimit(2)
+                                    .lineLimit(isExpanded ? nil : 2)
                                     .textSelection(.enabled)
                             }
                         }
 
-                        AskUserQuestionResultView(summary: summary)
+                        AskUserQuestionResultView(summary: summary, isExpanded: isExpanded)
+
+                        if !summary.isHistoricalScalar {
+                            Button {
+                                if isExpanded {
+                                    withAnimation(.easeInOut(duration: 0.2)) {
+                                        isAskUserExchangeExpanded.toggle()
+                                    }
+                                } else {
+                                    isAskUserExchangeExpanded.toggle()
+                                }
+                            } label: {
+                                HStack(spacing: 4) {
+                                    Image(systemName: isExpanded ? "chevron.up" : "chevron.down")
+                                        .font(fontPreset.swiftUIFont(sizeAtNormal: 10, weight: .medium))
+                                    Text(isExpanded ? "Show less" : "Show full exchange")
+                                        .font(fontPreset.swiftUIFont(sizeAtNormal: 11))
+                                }
+                                .foregroundColor(.secondary)
+                            }
+                            .buttonStyle(.plain)
+                        }
                     }
                 }
 
@@ -1270,12 +1294,21 @@ struct AgentMessageBubble: View {
 
 // MARK: - Ask User Question Summary
 
-private struct AskUserQuestionSummary {
+struct AskUserQuestionSummary {
+    struct Option {
+        let label: String
+        let description: String?
+        let isSelected: Bool
+    }
+
     struct Question: Identifiable {
         let id: String
         let header: String?
         let question: String
+        let context: String?
+        let options: [Option]
         let answer: String?
+        let customResponse: String?
         let skipped: Bool
     }
 
@@ -1305,17 +1338,84 @@ private struct AskUserQuestionSummary {
     }
 }
 
+/// Display-only loss tolerance: consume each entry even when its shape is malformed.
+private struct AskUserDisplayValue<Value: Decodable>: Decodable {
+    let value: Value?
+
+    init(from decoder: Decoder) throws {
+        value = try? Value(from: decoder)
+    }
+}
+
 private struct AskUserQuestionArgs: Decodable {
+    struct Option: Decodable {
+        let label: String
+        let description: String?
+
+        private enum CodingKeys: String, CodingKey {
+            case label
+            case description
+        }
+
+        init(from decoder: Decoder) throws {
+            let value = try decoder.singleValueContainer()
+            if let label = try? value.decode(String.self) {
+                self.label = label
+                description = nil
+            } else {
+                let container = try decoder.container(keyedBy: CodingKeys.self)
+                label = try container.decode(String.self, forKey: .label)
+                description = try? container.decodeIfPresent(String.self, forKey: .description)
+            }
+        }
+    }
+
     struct Question: Decodable {
         let id: String?
         let header: String?
         let question: String
+        let context: String?
+        let options: [Option]
+
+        private enum CodingKeys: String, CodingKey {
+            case id
+            case header
+            case question
+            case context
+            case options
+        }
+
+        init(from decoder: Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            id = try? container.decodeIfPresent(String.self, forKey: .id)
+            header = try? container.decodeIfPresent(String.self, forKey: .header)
+            question = try container.decode(String.self, forKey: .question)
+            context = try? container.decodeIfPresent(String.self, forKey: .context)
+            options = (try? container.decodeIfPresent([AskUserDisplayValue<Option>].self, forKey: .options))?
+                .compactMap(\.value) ?? []
+        }
     }
 
     let title: String?
     let context: String?
     let questions: [Question]?
     let question: String?
+
+    private enum CodingKeys: String, CodingKey {
+        case title
+        case context
+        case questions
+        case question
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        title = try? container.decodeIfPresent(String.self, forKey: .title)
+        context = try? container.decodeIfPresent(String.self, forKey: .context)
+        questions = (try? container.decodeIfPresent([AskUserDisplayValue<Question>].self, forKey: .questions))?
+            .compactMap(\.value)
+        question = try? container.decodeIfPresent(String.self, forKey: .question)
+    }
 }
 
 private struct AskUserQuestionResult: Decodable {
@@ -1331,6 +1431,16 @@ private struct AskUserQuestionResult: Decodable {
             case customResponse = "custom_response"
             case skipped
         }
+
+        init(from decoder: Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            answers = (try? container.decodeIfPresent([AskUserDisplayValue<String>].self, forKey: .answers))?
+                .compactMap(\.value)
+            selectedOptions = (try? container.decodeIfPresent([AskUserDisplayValue<String>].self, forKey: .selectedOptions))?
+                .compactMap(\.value)
+            customResponse = try? container.decodeIfPresent(String.self, forKey: .customResponse)
+            skipped = try? container.decodeIfPresent(Bool.self, forKey: .skipped)
+        }
     }
 
     let answers: [String: Answer]?
@@ -1344,11 +1454,20 @@ private struct AskUserQuestionResult: Decodable {
         case skipped
         case timedOut = "timed_out"
     }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        answers = (try? container.decodeIfPresent([String: AskUserDisplayValue<Answer>].self, forKey: .answers))?
+            .compactMapValues(\.value)
+        response = try? container.decodeIfPresent(String.self, forKey: .response)
+        skipped = try? container.decodeIfPresent(Bool.self, forKey: .skipped)
+        timedOut = try? container.decodeIfPresent(Bool.self, forKey: .timedOut)
+    }
 }
 
 /// Robust parsing that handles the structured ask_user contract and display-only historical scalar transcripts.
 /// Write-side scalar requests are rejected by the MCP API; this parser intentionally keeps old transcript data readable.
-private func parseAskUserQuestionSummaryRobust(args: String?, result: String?) -> AskUserQuestionSummary {
+func parseAskUserQuestionSummaryRobust(args: String?, result: String?) -> AskUserQuestionSummary {
     let argsDTO = ToolJSON.decode(AskUserQuestionArgs.self, from: args)
     let resultDTO = ToolJSON.decode(AskUserQuestionResult.self, from: result)
     let resultString = result?.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -1363,11 +1482,23 @@ private func parseAskUserQuestionSummaryRobust(args: String?, result: String?) -
             let id = normalizedNonEmpty(question.id) ?? fallbackID
             let answer = resultDTO?.answers?[id]
             let questionSkipped = answer?.skipped ?? skipped
+            let selectedOptions = Set(answer?.selectedOptions?.compactMap(normalizedNonEmpty) ?? [])
+            let options = question.options.compactMap { option -> AskUserQuestionSummary.Option? in
+                guard let label = normalizedNonEmpty(option.label) else { return nil }
+                return AskUserQuestionSummary.Option(
+                    label: label,
+                    description: normalizedNonEmpty(option.description),
+                    isSelected: selectedOptions.contains(label)
+                )
+            }
             return AskUserQuestionSummary.Question(
                 id: id,
                 header: normalizedNonEmpty(question.header),
                 question: question.question,
+                context: normalizedNonEmpty(question.context),
+                options: options,
                 answer: questionSkipped ? "Skipped" : displayAnswer(from: answer, timedOut: timedOut),
+                customResponse: normalizedNonEmpty(answer?.customResponse),
                 skipped: questionSkipped
             )
         }
@@ -1392,7 +1523,10 @@ private func parseAskUserQuestionSummaryRobust(args: String?, result: String?) -
         id: "question",
         header: nil,
         question: question,
+        context: nil,
+        options: [],
         answer: scalarDisplayAnswer(response: response, skipped: skipped, timedOut: timedOut),
+        customResponse: nil,
         skipped: skipped
     )
     return AskUserQuestionSummary(
@@ -1421,7 +1555,10 @@ private func fallbackQuestion() -> AskUserQuestionSummary.Question {
         id: "question",
         header: nil,
         question: "Question",
+        context: nil,
+        options: [],
         answer: nil,
+        customResponse: nil,
         skipped: false
     )
 }
@@ -1595,6 +1732,7 @@ private struct CollapsibleAssistantTranscriptContent: View {
 
 private struct AskUserQuestionResultView: View {
     let summary: AskUserQuestionSummary
+    let isExpanded: Bool
     @ObservedObject private var fontScale = FontScaleManager.shared
     private var fontPreset: FontScalePreset {
         fontScale.preset
@@ -1618,8 +1756,38 @@ private struct AskUserQuestionResultView: View {
                             Text(question.question)
                                 .font(fontPreset.standardFont)
                                 .foregroundColor(.primary)
-                                .lineLimit(3)
+                                .lineLimit(isExpanded ? nil : 3)
                                 .textSelection(.enabled)
+
+                            if isExpanded {
+                                if let context = question.context {
+                                    Text(context)
+                                        .font(fontPreset.swiftUIFont(sizeAtNormal: 11))
+                                        .foregroundColor(.secondary)
+                                        .textSelection(.enabled)
+                                }
+
+                                ForEach(Array(question.options.enumerated()), id: \.offset) { _, option in
+                                    HStack(alignment: .top, spacing: 6) {
+                                        Image(systemName: option.isSelected ? "checkmark.circle.fill" : "circle")
+                                            .font(fontPreset.swiftUIFont(sizeAtNormal: 11))
+                                            .foregroundColor(option.isSelected ? .blue : .secondary)
+                                            .accessibilityLabel(option.isSelected ? "Selected option" : "Unselected option")
+                                        VStack(alignment: .leading, spacing: 2) {
+                                            Text(option.label)
+                                                .font(fontPreset.swiftUIFont(sizeAtNormal: 11))
+                                                .foregroundColor(.primary)
+                                                .textSelection(.enabled)
+                                            if let description = option.description {
+                                                Text(description)
+                                                    .font(fontPreset.swiftUIFont(sizeAtNormal: 11))
+                                                    .foregroundColor(.secondary)
+                                                    .textSelection(.enabled)
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
 
@@ -1631,12 +1799,13 @@ private struct AskUserQuestionResultView: View {
                         Text(question.answer ?? "No response")
                             .font(fontPreset.standardFont)
                             .foregroundColor(question.skipped || summary.timedOut ? .secondary : .primary)
-                            .lineLimit(3)
+                            .lineLimit(isExpanded ? nil : 3)
                             .textSelection(.enabled)
                     }
                 }
             }
         }
+        .textSelection(.enabled)
     }
 }
 

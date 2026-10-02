@@ -674,9 +674,18 @@ class SystemPromptService {
     }
 
     /// `agent_run` delegation guidance for nil-role coding sessions that may still delegate.
-    private static func codingAgentDelegationGuidance(codexNativeDelegationGuidance: String) -> String {
-        """
-        Delegate with `agent_run` when a narrow, self-contained investigation would flood your context — web or documentation lookup, git archaeology, uncertain searches worth parallel probes, "how is X wired?" questions in unfamiliar code — or whenever the user asks for an agent by role; then use `agent_run`, not a substitute. model_id roles: explore for read-only probes, engineer for bounded implementation, pair for coupled multi-step work, design for architecture or critique work that produces a repository report under docs/reviews/, docs/designs/, or docs/analysis/. A user's explicit request for a design agent authorizes that report file; do not choose a design agent yourself for a read-only request — use the Oracle or an explore agent instead.\(codexNativeDelegationGuidance)
+    /// - Parameter includesPairReviewRemediationGuidance: Renders the shared Pair-worker
+    ///   review-remediation paragraph; only `agent_run`-capable audiences (`.agentRunOnly`,
+    ///   `.both`) include it.
+    private static func codingAgentDelegationGuidance(
+        codexNativeDelegationGuidance: String,
+        includesPairReviewRemediationGuidance: Bool
+    ) -> String {
+        let pairReviewRemediationGuidance = includesPairReviewRemediationGuidance
+            ? "\n\n" + AgentModePrompts.Fragments.pairReviewRemediationGuidance
+            : ""
+        return """
+        Delegate with `agent_run` when a narrow, self-contained investigation would flood your context — web or documentation lookup, git archaeology, uncertain searches worth parallel probes, "how is X wired?" questions in unfamiliar code — or whenever the user asks for an agent by role; then use `agent_run`, not a substitute. model_id roles: explore for read-only probes, engineer for bounded implementation, pair for coupled multi-step work, design for architecture or critique work that produces a repository report under docs/reviews/, docs/designs/, or docs/analysis/. A user's explicit request for a design agent authorizes that report file; do not choose a design agent yourself for a read-only request — use the Oracle or an explore agent instead.\(codexNativeDelegationGuidance)\(pairReviewRemediationGuidance)
 
         Make each delegated task self-contained: one specific question, where to look, and the output you want back. Fan out only independent probes with detach:true; continue other independent in-scope work while they run when there is any, otherwise wait. Then wait or poll on every returned session_id and respond to any pending interaction — never end your turn with an unattended session. When handing Oracle output to a delegated agent, request the export with export_response:true and place the returned oracle_export_instruction verbatim at the head of the delegated message.
 
@@ -686,6 +695,7 @@ class SystemPromptService {
 
     /// - Parameter delegationAudience: `.none` renders the delegation-leaf variant (no
     ///   `agent_run` guidance); every other audience keeps the `agent_run` delegation copy.
+    ///   Only `.agentRunOnly` and `.both` add the Pair-worker review-remediation paragraph.
     private static func codingAgentPrompt(
         agentKind: AgentProviderKind?,
         codeMapsDisabled: Bool,
@@ -724,7 +734,11 @@ class SystemPromptService {
         """ : ""
         let delegationGuidance = delegationAudience == .none
             ? "RepoPrompt agent delegation is not available in this session (delegation depth is bounded at main → worker → sub-worker); do the work directly."
-            : codingAgentDelegationGuidance(codexNativeDelegationGuidance: codexNativeDelegationGuidance)
+            : codingAgentDelegationGuidance(
+                codexNativeDelegationGuidance: codexNativeDelegationGuidance,
+                includesPairReviewRemediationGuidance: delegationAudience == .agentRunOnly
+                    || delegationAudience == .both
+            )
 
         let prompt = """
         # RepoPrompt Coding Agent — System Prompt (vNext-rc2.1)

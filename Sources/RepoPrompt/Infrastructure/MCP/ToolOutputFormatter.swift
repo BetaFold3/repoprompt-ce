@@ -997,6 +997,25 @@ extension ToolOutputFormatter {
         result: Value,
         emitResources: Bool
     ) -> [MCP.Tool.Content] {
+        let (original, noticeText) = AgentDelegatedQuestionNoticeWire.splitting(result)
+        var blocks = buildOriginalContentBlocks(
+            toolName: toolName,
+            args: args,
+            result: original,
+            emitResources: emitResources
+        )
+        if let noticeText {
+            blocks.append(.text(noticeText))
+        }
+        return blocks
+    }
+
+    private static func buildOriginalContentBlocks(
+        toolName: String,
+        args: [String: Value],
+        result: Value,
+        emitResources: Bool
+    ) -> [MCP.Tool.Content] {
         // Raw JSON mode: bypass all markdown/text formatting.
         if wantsRawJSON(args: args) {
             return [.text(rawJSONString(result))]

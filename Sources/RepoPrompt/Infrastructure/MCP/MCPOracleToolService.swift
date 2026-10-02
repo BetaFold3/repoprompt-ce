@@ -72,12 +72,25 @@ struct MCPOracleToolService {
         let isSteeringRequested: @MainActor (_ executionID: UUID) -> Bool
         let subscribe: @MainActor (_ executionID: UUID, _ onWake: @escaping @MainActor () -> Void) -> Void
         let unsubscribe: @MainActor (_ executionID: UUID) -> Void
+        var isDelegatedQuestionRequested: @MainActor (_ executionID: UUID) -> Bool = { _ in false }
 
         static let none = OracleWaitScopeHooks(
             isSteeringRequested: { _ in false },
             subscribe: { _, _ in },
             unsubscribe: { _ in }
         )
+    }
+
+    private enum WaitWakeReason: Equatable {
+        case steering
+        case delegatedQuestion
+
+        var wireValue: String {
+            switch self {
+            case .steering: MCPOracleToolService.steeringWakeReason
+            case .delegatedQuestion: AgentDelegatedQuestionNoticeWire.oracleWakeReason
+            }
+        }
     }
 
     let startOracleSend: StartOracleSend
@@ -204,7 +217,7 @@ struct MCPOracleToolService {
 
     static let pendingNote = "Oracle still running; nothing was resent. Use ask_oracle with resume args. Never resend."
     private static let cancelNote = "Cancel never delivers a result. Collect each lane's final state with ask_oracle op:\"wait\"."
-    static let steeringWakeReason = "steering_requested"
+    nonisolated static let steeringWakeReason = "steering_requested"
 
     private static let singleAskOracleArgs: Set<String> = [
         "message", "mode", "chat_id", "new_chat", "model", "chat_name",
@@ -409,12 +422,13 @@ struct MCPOracleToolService {
             }
             outcomeLabel = result["status"]?.stringValue ?? "completed"
         } else {
-            let reason = Self.pendingReason(outcome: outcome, selection: selection)
+            let wakeReason = waitWakeReason(outcome: outcome, invocation: invocation)
+            let reason = Self.pendingReason(outcome: outcome, selection: selection, wakeReason: wakeReason)
             result = pendingStub(
                 operationID,
                 reason: reason,
                 includeResume: true,
-                steering: outcome == .steering
+                wakeReason: wakeReason
             )
             outcomeLabel = reason
         }
@@ -430,7 +444,7 @@ struct MCPOracleToolService {
             operationCount: 1,
             stubBytes: stubBytes,
             progressPresent: result["pending"]?.objectValue?["progress"] != nil,
-            wakeReason: outcome == .steering ? Self.steeringWakeReason : nil
+            wakeReason: result["status"]?.stringValue == "pending" ? waitWakeReason(outcome: outcome, invocation: invocation)?.wireValue : nil
         )
 
         await sendStageProgress(connectionID, askOracleToolName, "complete", "Oracle complete")
@@ -568,11 +582,14 @@ struct MCPOracleToolService {
 
     private static func pendingReason(
         outcome: OracleMCPOperationStore.WaitOutcome,
-        selection: AgentMCPWaitPolicy.Selection
+        selection: AgentMCPWaitPolicy.Selection,
+        wakeReason: WaitWakeReason? = nil
     ) -> String {
         switch outcome {
         case .steering:
-            "interrupted_by_steering"
+            wakeReason == .delegatedQuestion
+                ? AgentDelegatedQuestionNoticeWire.oraclePendingReason
+                : "interrupted_by_steering"
         case .polled, .deadline:
             selection.mode == .poll ? "polled" : "timed_out"
         case .settled:
@@ -582,11 +599,23 @@ struct MCPOracleToolService {
         }
     }
 
+    private func waitWakeReason(
+        outcome: OracleMCPOperationStore.WaitOutcome,
+        invocation: OracleWaitInvocation
+    ) -> WaitWakeReason? {
+        guard outcome == .steering, let executionID = invocation.wakeScopeExecutionID else { return nil }
+        // The store's external wake outcome is reason-neutral. Classify the separate sticky
+        // scope flags here; real steering always takes precedence.
+        if waitScopeHooks.isSteeringRequested(executionID) { return .steering }
+        if waitScopeHooks.isDelegatedQuestionRequested(executionID) { return .delegatedQuestion }
+        return nil
+    }
+
     private func externalWake(for invocation: OracleWaitInvocation) -> OracleMCPOperationStore.ExternalWake? {
         guard let executionID = invocation.wakeScopeExecutionID else { return nil }
         let hooks = waitScopeHooks
         return OracleMCPOperationStore.ExternalWake(
-            isRequested: { hooks.isSteeringRequested(executionID) },
+            isRequested: { hooks.isSteeringRequested(executionID) || hooks.isDelegatedQuestionRequested(executionID) },
             subscribe: { onWake in hooks.subscribe(executionID, onWake) },
             unsubscribe: { hooks.unsubscribe(executionID) }
         )
@@ -615,7 +644,7 @@ struct MCPOracleToolService {
         _ operationID: UUID,
         reason: String,
         includeResume: Bool,
-        steering: Bool
+        wakeReason: WaitWakeReason?
     ) -> [String: Value] {
         guard let snapshot = operationStore.snapshot(operationID) else {
             return ["status": .string("unknown"), "operation_id": .string(operationID.uuidString)]
@@ -676,8 +705,8 @@ struct MCPOracleToolService {
         if includeResume {
             stub["resume"] = Self.resumeValue([operationID])
             stub["note"] = .string(Self.pendingNote)
-            if steering {
-                stub["_meta"] = .object(["wake_reason": .string(Self.steeringWakeReason)])
+            if let wakeReason {
+                stub["_meta"] = .object(["wake_reason": .string(wakeReason.wireValue)])
             }
         }
         return stub
@@ -746,7 +775,7 @@ struct MCPOracleToolService {
             return unknownLaneObject(operationID)
         }
         if !snapshot.phase.isTerminal {
-            return pendingStub(operationID, reason: "polled", includeResume: false, steering: false)
+            return pendingStub(operationID, reason: "polled", includeResume: false, wakeReason: nil)
         }
         var lane: [String: Value] = [
             "operation_id": .string(operationID.uuidString),
@@ -889,7 +918,8 @@ struct MCPOracleToolService {
         var retryableIDs: [UUID] = []
         var stubBytes = 0
         var progressPresent = false
-        let laneReason = Self.pendingReason(outcome: outcome, selection: selection)
+        let wakeReason = waitWakeReason(outcome: outcome, invocation: invocation)
+        let laneReason = Self.pendingReason(outcome: outcome, selection: selection, wakeReason: wakeReason)
         for id in observable {
             switch operationStore.lookup(id, caller: caller) {
             case let .found(snapshot) where snapshot.phase.isTerminal:
@@ -903,7 +933,7 @@ struct MCPOracleToolService {
                 }
             case .found:
                 pendingIDs.append(id)
-                let stub = pendingStub(id, reason: laneReason, includeResume: false, steering: false)
+                let stub = pendingStub(id, reason: laneReason, includeResume: false, wakeReason: nil)
                 stubBytes += Self.approximateByteCount(.object(stub))
                 progressPresent = progressPresent || stub["pending"]?.objectValue?["progress"] != nil
                 lanesByID[id] = .object(stub)
@@ -922,7 +952,7 @@ struct MCPOracleToolService {
         } else if pendingIDs.isEmpty {
             "completed_with_errors"
         } else if outcome == .steering {
-            "interrupted_by_steering"
+            laneReason
         } else if selection.mode == .poll {
             "polled"
         } else {
@@ -945,8 +975,8 @@ struct MCPOracleToolService {
             envelope["resume"] = Self.resumeValue(resumeIDs)
             envelope["note"] = .string(Self.pendingNote)
         }
-        if outcome == .steering, !pendingIDs.isEmpty {
-            envelope["_meta"] = .object(["wake_reason": .string(Self.steeringWakeReason)])
+        if let wakeReason, !pendingIDs.isEmpty {
+            envelope["_meta"] = .object(["wake_reason": .string(wakeReason.wireValue)])
         }
         recordWaitDiagnostics(
             op: op,
@@ -956,7 +986,7 @@ struct MCPOracleToolService {
             operationCount: targetIDs.count,
             stubBytes: stubBytes,
             progressPresent: progressPresent,
-            wakeReason: outcome == .steering ? Self.steeringWakeReason : nil
+            wakeReason: pendingIDs.isEmpty ? nil : wakeReason?.wireValue
         )
         return Self.agentFacingOracleResult(AgentMCPWaitPolicy.attaching(selection, to: .object(envelope)))
     }

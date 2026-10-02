@@ -3357,6 +3357,187 @@ final class AgentRunMCPToolServiceWaitTests: XCTestCase {
         )
     }
 
+    @MainActor
+    private final class DelegatedQuestionAvailability {
+        var childID: UUID?
+        func isDeliverable(excluding ids: Set<UUID>) -> Bool {
+            childID.map { !ids.contains($0) } ?? false
+        }
+    }
+
+    func testDelegatedQuestionEntryCheckReturnsBeforeSingleWaitParks() async throws {
+        let window = makeWindow()
+        defer { WindowStatesManager.shared.unregisterWindowState(window) }
+        let live = LiveSnapshots()
+        let recorder = WaitScopeRecorder()
+        let vm = makeViewModel(windowID: window.windowID)
+        let child = try await installRunningSession(in: vm, liveSnapshots: live)
+        defer { Task { await AgentRunSessionStore.cleanup(registration: child.registration) } }
+        var service = makeService(
+            window: window, viewModel: vm, liveSnapshots: live, recorder: recorder,
+            beforeHeartbeatOperation: { XCTFail("Entry check must not park") }
+        )
+        let question = DelegatedQuestionAvailability()
+        question.childID = UUID()
+        service.hasDeliverableDelegatedQuestionNotices = { _, excluded in
+            XCTAssertEqual(excluded, [child.sessionID])
+            return question.isDeliverable(excluding: excluded)
+        }
+        let result = try await service.execute(args: [
+            "op": .string("wait"), "session_id": .string(child.sessionID.uuidString), "timeout": .int(2)
+        ])
+        XCTAssertEqual(result.objectValue?["wait"]?.objectValue?["result"]?.stringValue, "interrupted_by_child_question")
+        XCTAssertEqual(result.objectValue?["status"]?.stringValue, "running")
+        XCTAssertNil(result.objectValue?["assistant_text"])
+        XCTAssertFalse(ToolOutputFormatter.rawJSONString(result).contains("steering"))
+        let completions = await recorder.completions()
+        XCTAssertEqual(completions.count, 1)
+        XCTAssertEqual(completions.first?.reason, .delegatedQuestionPending)
+    }
+
+    func testDelegatedQuestionWakeReturnsEarlyOnlyWhileDeliverable() async throws {
+        for deliverable in [true, false] {
+            let window = makeWindow()
+            defer { WindowStatesManager.shared.unregisterWindowState(window) }
+            let live = LiveSnapshots()
+            let recorder = WaitScopeRecorder()
+            let vm = makeViewModel(windowID: window.windowID)
+            let child = try await installRunningSession(in: vm, liveSnapshots: live)
+            defer { Task { await AgentRunSessionStore.cleanup(registration: child.registration) } }
+            let question = DelegatedQuestionAvailability()
+            var service = makeService(window: window, viewModel: vm, liveSnapshots: live, recorder: recorder)
+            service.hasDeliverableDelegatedQuestionNotices = { _, excluded in
+                question.isDeliverable(excluding: excluded)
+            }
+            let wait = Task { @MainActor in
+                try await service.execute(args: [
+                    "op": .string("wait"), "session_id": .string(child.sessionID.uuidString), "timeout": .int(2)
+                ])
+            }
+            try await waitForAgentRunSessionStoreWaiter(registration: child.registration)
+            if deliverable { question.childID = UUID() }
+            await AgentRunSessionStore.wakeCurrentWaiters(
+                child.runningSnapshot, cursor: child.cursor, reason: .delegatedQuestionPending
+            )
+            if !deliverable {
+                try await waitForAgentRunSessionStoreWaiter(registration: child.registration)
+                let completions = await recorder.completions()
+                XCTAssertTrue(completions.isEmpty, "A stale delegated wake must re-park")
+                let terminal = makeSnapshot(sessionID: child.sessionID, status: .completed)
+                await live.set(terminal)
+                _ = await AgentRunSessionStore.publishTerminal(
+                    .init(epoch: child.epoch, snapshot: terminal),
+                    registration: child.registration, commitID: UUID(), successorKind: nil
+                )
+            }
+            let result = try await wait.value
+            if deliverable {
+                XCTAssertEqual(result.objectValue?["wait"]?.objectValue?["result"]?.stringValue, "interrupted_by_child_question")
+                XCTAssertEqual(result.objectValue?["_meta"]?.objectValue?["wake_reason"]?.stringValue, "delegated_question_pending")
+            } else {
+                XCTAssertEqual(result.objectValue?["status"]?.stringValue, "completed")
+                XCTAssertNil(result.objectValue?["_meta"]?.objectValue?["wake_reason"])
+            }
+            let completions = await recorder.completions()
+            XCTAssertEqual(completions.count, 1)
+        }
+    }
+
+    func testWaitCoveringQuestionChildKeepsActionableSnapshot() async throws {
+        let window = makeWindow()
+        defer { WindowStatesManager.shared.unregisterWindowState(window) }
+        let live = LiveSnapshots()
+        let recorder = WaitScopeRecorder()
+        let vm = makeViewModel(windowID: window.windowID)
+        let child = try await installRunningSession(in: vm, liveSnapshots: live)
+        defer { Task { await AgentRunSessionStore.cleanup(registration: child.registration) } }
+        let question = DelegatedQuestionAvailability()
+        question.childID = child.sessionID
+        var service = makeService(window: window, viewModel: vm, liveSnapshots: live, recorder: recorder)
+        service.hasDeliverableDelegatedQuestionNotices = { _, excluded in
+            XCTAssertTrue(excluded.contains(child.sessionID))
+            return question.isDeliverable(excluding: excluded)
+        }
+        let wait = Task { @MainActor in
+            try await service.execute(args: [
+                "op": .string("wait"), "session_id": .string(child.sessionID.uuidString), "timeout": .int(2)
+            ])
+        }
+        try await waitForAgentRunSessionStoreWaiter(registration: child.registration)
+        let interactionID = UUID()
+        let pending = makeSnapshot(
+            sessionID: child.sessionID, status: .waitingForInput,
+            interaction: .init(
+                id: interactionID, kind: .question, responseType: .structured,
+                title: "Choose", prompt: nil, context: nil, allowsMultiple: false,
+                options: [], fields: [], details: []
+            )
+        )
+        await live.set(pending)
+        await AgentRunSessionStore.signalSnapshotAndWakeWaiters(
+            pending, cursor: child.cursor, reason: .delegatedQuestionPending
+        )
+        let result = try await wait.value
+        XCTAssertEqual(result.objectValue?["interaction"]?.objectValue?["id"]?.stringValue, interactionID.uuidString)
+        XCTAssertNil(result.objectValue?["wait"]?.objectValue?["result"]?.stringValue)
+        XCTAssertEqual(
+            AgentRunMCPToolService.coveredDelegatedQuestionNoticeKeys(in: result),
+            [AgentDelegatedQuestionNoticeKey(childSessionID: child.sessionID, interactionID: interactionID)]
+        )
+    }
+
+    func testMultiWaitDelegatedQuestionEntryAndWake() async throws {
+        for atEntry in [true, false] {
+            let window = makeWindow()
+            defer { WindowStatesManager.shared.unregisterWindowState(window) }
+            let live = LiveSnapshots()
+            let recorder = WaitScopeRecorder()
+            let vm = makeViewModel(windowID: window.windowID)
+            let first = try await installRunningSession(in: vm, liveSnapshots: live)
+            let second = try await installRunningSession(in: vm, liveSnapshots: live)
+            defer {
+                Task {
+                    await AgentRunSessionStore.cleanup(registration: first.registration)
+                    await AgentRunSessionStore.cleanup(registration: second.registration)
+                }
+            }
+            let question = DelegatedQuestionAvailability()
+            if atEntry { question.childID = UUID() }
+            var service = makeService(
+                window: window, viewModel: vm, liveSnapshots: live, recorder: recorder,
+                beforeHeartbeatOperation: { if atEntry { XCTFail("Entry check must not park") } }
+            )
+            service.hasDeliverableDelegatedQuestionNotices = { _, excluded in
+                XCTAssertEqual(excluded, Set([first.sessionID, second.sessionID]))
+                return question.isDeliverable(excluding: excluded)
+            }
+            let wait = Task { @MainActor in
+                try await service.execute(args: [
+                    "op": .string("wait"),
+                    "session_ids": .array([.string(first.sessionID.uuidString), .string(second.sessionID.uuidString)]),
+                    "timeout": .int(2)
+                ])
+            }
+            if !atEntry {
+                try await waitForAgentRunSessionStoreWaiter(registration: first.registration)
+                try await waitForAgentRunSessionStoreWaiter(registration: second.registration)
+                question.childID = UUID()
+                await AgentRunSessionStore.wakeCurrentWaiters(
+                    second.runningSnapshot, cursor: second.cursor, reason: .delegatedQuestionPending
+                )
+            }
+            let result = try await wait.value
+            let object = try XCTUnwrap(result.objectValue)
+            XCTAssertEqual(object["wait"]?.objectValue?["result"]?.stringValue, "interrupted_by_child_question")
+            XCTAssertNil(object["wait"]?.objectValue?["winner_session_id"]?.stringValue)
+            XCTAssertEqual(object["snapshots"]?.arrayValue?.count, 2)
+            XCTAssertFalse(ToolOutputFormatter.rawJSONString(result).contains("steering"))
+            let completions = await recorder.completions()
+            XCTAssertEqual(completions.count, 1)
+            XCTAssertEqual(completions.first?.reason, .delegatedQuestionPending)
+        }
+    }
+
     private func makeWindow() -> WindowState {
         let previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
         GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
@@ -3466,7 +3647,8 @@ final class AgentRunMCPToolServiceWaitTests: XCTestCase {
         status: AgentRunMCPSnapshot.Status,
         statusText: String? = nil,
         latestAssistantPreview: String? = nil,
-        lastInteractionResolution: AgentRunMCPSnapshot.InteractionResolution? = nil
+        lastInteractionResolution: AgentRunMCPSnapshot.InteractionResolution? = nil,
+        interaction: AgentRunMCPSnapshot.Interaction? = nil
     ) -> AgentRunMCPSnapshot {
         AgentRunMCPSnapshot(
             sessionID: sessionID,
@@ -3480,7 +3662,7 @@ final class AgentRunMCPToolServiceWaitTests: XCTestCase {
             status: status,
             statusText: statusText ?? status.rawValue,
             latestAssistantPreview: latestAssistantPreview,
-            interaction: nil,
+            interaction: interaction,
             transcriptItemCount: 1,
             updatedAt: Date(),
             parentSessionID: nil,

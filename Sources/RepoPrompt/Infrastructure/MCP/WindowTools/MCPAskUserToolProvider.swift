@@ -142,9 +142,15 @@ final class MCPAskUserToolProvider: MCPWindowToolProviding {
                     surface: .agentQuestion
                 )
             }
+            // Delegated ask_user (plan §6.1): an external controller is only ever recognized
+            // from verified connection provenance, never inferred from a root lineage.
+            let controllerProvenance = await verifiedControllerProvenance(
+                controllerConnectionID: targetWindow.agentModeViewModel.mcpControllerConnectionID(tabID: tabID)
+            )
             response = try await targetWindow.agentModeViewModel.askUserInteraction(
                 tabID: tabID,
-                interaction: parsed.interaction
+                interaction: parsed.interaction,
+                controllerProvenance: controllerProvenance
             )
 
         case .unknown:
@@ -152,6 +158,28 @@ final class MCPAskUserToolProvider: MCPWindowToolProviding {
         }
 
         return askUserResponseValue(response, includeLegacyResponse: parsed.includeLegacyResponse)
+    }
+
+    /// Verifies that the connection controlling an asking session is a live non-Agent-Mode MCP
+    /// client: the connection is still admitted or pending, its run purpose stays `.unknown`
+    /// even after run-context rehydration, and it has no Agent Mode run mapping (so no Agent
+    /// Mode source tab can route it). Anything unverifiable returns `.unverified`, which makes
+    /// the audience fall back to the user rather than guessing.
+    static func verifiedControllerProvenance(
+        controllerConnectionID: UUID?,
+        networkManager: ServerNetworkManager = .shared
+    ) async -> AgentDelegatedQuestionControllerProvenance {
+        guard let controllerConnectionID else { return .unverified }
+        guard await networkManager.clientIdentifier(forConnection: controllerConnectionID) != nil else {
+            return .unverified
+        }
+        _ = await networkManager.rehydrateRunTabContextForConnectionIfPossible(controllerConnectionID)
+        guard await networkManager.runPurpose(for: controllerConnectionID) == .unknown,
+              await networkManager.runIDForConnection(controllerConnectionID) == nil
+        else {
+            return .unverified
+        }
+        return AgentDelegatedQuestionControllerProvenance(verifiedNonAgentModeConnectionID: controllerConnectionID)
     }
 
     static func resolvedInteractionTimeoutSeconds(

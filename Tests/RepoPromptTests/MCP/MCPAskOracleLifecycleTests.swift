@@ -1013,6 +1013,293 @@ final class MCPAskOracleLifecycleTests: XCTestCase {
 
     // MARK: - Steering wake through the execution registry
 
+    private func withPendingDelegatedQuestion(
+        fixture: Fixture,
+        _ body: @MainActor (AgentDelegatedQuestionNoticeKey) async throws -> Void
+    ) async throws {
+        let parentSessionID = try fixture.activateAgentRunForBatch()
+        let vm = fixture.window.agentModeViewModel
+        let parent = try XCTUnwrap(vm.session(for: fixture.tabID, createIfNeeded: false))
+        parent.hasLoadedPersistedState = true
+        parent.parentSessionID = nil
+        let childTab = await fixture.window.promptManager.createBackgroundComposeTab(
+            strategy: .blank, name: "Delegated Oracle child"
+        )
+        let childTabID = try XCTUnwrap(childTab).id
+        let childSessionID = UUID()
+        let child = try XCTUnwrap(vm.session(for: childTabID, createIfNeeded: true))
+        _ = try XCTUnwrap(vm.test_installPersistentSessionBinding(
+            sessionID: childSessionID, on: child, updateWorkspaceMetadata: true
+        ))
+        child.hasLoadedPersistedState = true
+        child.parentSessionID = parentSessionID
+        child.mcpControlContext = AgentModeViewModel.AgentMCPControlContext(
+            sessionID: childSessionID,
+            activationID: UUID(),
+            registration: .init(sessionID: childSessionID, generation: 0),
+            currentEpoch: nil,
+            preparedEpoch: nil,
+            pendingEpochTransition: nil,
+            originatingConnectionID: nil,
+            interactionTransport: .mcp(sessionID: childSessionID, originatingConnectionID: nil),
+            suppressUserNotifications: true,
+            forceAutoEditEnabled: false,
+            autoEditEnabledBeforeOverride: false,
+            taskLabelKind: .engineer
+        )
+        vm.test_setMCPControlledTabIDs([childTabID])
+        let interaction = AgentAskUserInteraction(
+            timeoutSeconds: 60,
+            questions: [AgentAskUserQuestion(
+                id: "choice", question: "Which option?",
+                options: [AgentAskUserOption(label: "A"), AgentAskUserOption(label: "B")],
+                allowsCustom: true
+            )]
+        )
+        let key = AgentDelegatedQuestionNoticeKey(childSessionID: childSessionID, interactionID: interaction.id)
+        let questionTask = Task { @MainActor in
+            try await vm.askUser(tabID: childTabID, interaction: interaction)
+        }
+        do {
+            try await AsyncTestWait.waitUntil("deliverable delegated question before Oracle scope", timeout: 3) {
+                await MainActor.run {
+                    child.pendingAskUser?.isAwaitingParentAgent == true
+                        && vm.mcpHasDeliverableDelegatedQuestionNotices(
+                            parentRunID: fixture.runID, excludingChildSessionIDs: []
+                        )
+                }
+            }
+            XCTAssertTrue(vm.delegatedQuestionNotices.records[key]?.wokenRunIDs.contains(fixture.runID) == true)
+            try await body(key)
+            vm.skipAskUser(tabID: childTabID, interactionID: interaction.id)
+            _ = try await questionTask.value
+        } catch {
+            vm.skipAskUser(tabID: childTabID, interactionID: interaction.id)
+            _ = try? await questionTask.value
+            throw error
+        }
+    }
+
+    func testLateRegisteredOracleScopeSeedsDelegatedQuestionForSendBatchAndWait() async throws {
+        for kind in ["send", "batch", "wait"] {
+            try await withFixture("late-delegated-\(kind)") { fixture in
+                try await withPendingDelegatedQuestion(fixture: fixture) { key in
+                    let operationID: UUID?
+                    if kind == "wait" {
+                        let initial = try await fixture.ask(["timeout_seconds": .int(0)])
+                        operationID = try self.operationID(in: initial)
+                    } else {
+                        operationID = nil
+                    }
+                    // The notice and its one-shot wake predate scope registration. No wake
+                    // is fired by this test after registration; this flag must be seeded.
+                    let registered = await fixture.window.mcpServer.test_beginResolvedToolExecution(
+                        metadata: fixture.metadata, resolvedContext: nil, toolName: MCPWindowToolName.askOracle
+                    )
+                    let execution = try XCTUnwrap(registered)
+                    defer { fixture.window.mcpServer.test_endToolExecution(executionID: execution.executionID) }
+                    XCTAssertTrue(fixture.window.mcpServer.oracleWaitScopeDelegatedQuestionRequested(executionID: execution.executionID))
+                    XCTAssertFalse(fixture.window.mcpServer.oracleWaitScopeSteeringRequested(executionID: execution.executionID))
+
+                    let box = AskResultBox()
+                    let task = Task { @MainActor in
+                        do {
+                            let result = try await MCPServerViewModel.$currentToolExecutionID.withValue(execution.executionID) {
+                                if kind == "send" {
+                                    return try await fixture.ask(["timeout_seconds": .int(30)])
+                                }
+                                if kind == "batch" {
+                                    return try await fixture.call([
+                                        "consultations": batchConsultations(fixture: fixture, count: 1),
+                                        "timeout_seconds": .int(30)
+                                    ])
+                                }
+                                return try await fixture.call([
+                                    "op": .string("wait"),
+                                    "operation_ids": .array([.string(XCTUnwrap(operationID).uuidString)]),
+                                    "timeout_seconds": .int(30)
+                                ])
+                            }
+                            box.result = .success(result)
+                        } catch {
+                            box.result = .failure(error)
+                        }
+                    }
+                    defer { task.cancel() }
+                    try await AsyncTestWait.waitUntil("late scope returns without waiting for Oracle completion", timeout: 3) {
+                        await MainActor.run { box.result != nil }
+                    }
+                    await task.value
+                    let result = try XCTUnwrap(box.result).get()
+                    XCTAssertEqual(result["_meta"]?.objectValue?["wake_reason"]?.stringValue, "delegated_question")
+                    if kind == "send" {
+                        XCTAssertEqual(result["status"]?.stringValue, "pending")
+                        XCTAssertEqual(result["pending"]?.objectValue?["reason"]?.stringValue, "interrupted_by_child_question")
+                    } else {
+                        XCTAssertEqual(result["wait"]?.objectValue?["result"]?.stringValue, "interrupted_by_child_question")
+                        let lane = try XCTUnwrap(try lanes(in: result).first)
+                        XCTAssertEqual(lane["status"]?.stringValue, "pending")
+                        XCTAssertEqual(lane["pending"]?.objectValue?["reason"]?.stringValue, "interrupted_by_child_question")
+                    }
+                    XCTAssertEqual(fixture.store.test_waiterCount(), 0)
+                    XCTAssertEqual(fixture.window.agentModeViewModel.delegatedQuestionNotices.records[key]?.acknowledged, false)
+                }
+            }
+        }
+    }
+
+    func testLateRegisteredDelegatedOracleScopeStillDeliversAlreadySettledOperation() async throws {
+        try await withFixture { fixture in
+            try await withPendingDelegatedQuestion(fixture: fixture) { _ in
+                let initial = try await fixture.ask(["timeout_seconds": .int(0)])
+                let id = try operationID(in: initial)
+                try await fixture.harness.waitUntilOpen(count: 1)
+                fixture.harness.finish(index: 0, text: "Settled before late scope")
+                try await fixture.waitUntilTerminal(id)
+                let registered = await fixture.window.mcpServer.test_beginResolvedToolExecution(
+                    metadata: fixture.metadata, resolvedContext: nil, toolName: MCPWindowToolName.askOracle
+                )
+                let execution = try XCTUnwrap(registered)
+                defer { fixture.window.mcpServer.test_endToolExecution(executionID: execution.executionID) }
+                XCTAssertTrue(fixture.window.mcpServer.oracleWaitScopeDelegatedQuestionRequested(executionID: execution.executionID))
+                let result = try await MCPServerViewModel.$currentToolExecutionID.withValue(execution.executionID) {
+                    try await fixture.call([
+                        "op": .string("wait"), "operation_ids": .array([.string(id.uuidString)]),
+                        "timeout_seconds": .int(30)
+                    ])
+                }
+                XCTAssertEqual(result["wait"]?.objectValue?["result"]?.stringValue, "completed")
+                XCTAssertNil(result["_meta"])
+                XCTAssertEqual(try lanes(in: result).first?["response"]?.stringValue, "Settled before late scope")
+            }
+        }
+    }
+
+    func testDelegatedQuestionWakeReturnsSinglePendingWithoutSteering() async throws {
+        try await withFixture { fixture in
+            let registered = await fixture.window.mcpServer.test_beginResolvedToolExecution(
+                metadata: fixture.metadata, resolvedContext: nil, toolName: MCPWindowToolName.askOracle
+            )
+            let execution = try XCTUnwrap(registered)
+            defer { fixture.window.mcpServer.test_endToolExecution(executionID: execution.executionID) }
+            let task = Task { @MainActor in
+                try await MCPServerViewModel.$currentToolExecutionID.withValue(execution.executionID) {
+                    try await fixture.ask()
+                }
+            }
+            try await fixture.harness.waitUntilOpen(count: 1)
+            try await fixture.waitUntilParked()
+            await fixture.window.mcpServer.wakeAgentRunWaitersOwnedByActiveRun(
+                runID: fixture.runID, source: "delegated-question-test", reason: .delegatedQuestionPending
+            ) { _ in nil }
+            XCTAssertFalse(fixture.window.mcpServer.oracleWaitScopeSteeringRequested(executionID: execution.executionID))
+            XCTAssertTrue(fixture.window.mcpServer.oracleWaitScopeDelegatedQuestionRequested(executionID: execution.executionID))
+            let result = try await task.value
+            XCTAssertEqual(result["status"]?.stringValue, "pending")
+            XCTAssertEqual(result["pending"]?.objectValue?["reason"]?.stringValue, "interrupted_by_child_question")
+            XCTAssertEqual(result["_meta"]?.objectValue?["wake_reason"]?.stringValue, "delegated_question")
+            XCTAssertNil(result["response"])
+            let id = try operationID(in: result)
+            XCTAssertEqual(fixture.store.snapshot(id)?.phase, .running)
+            XCTAssertEqual(fixture.harness.openedStreamCount, 1)
+        }
+    }
+
+    func testDelegatedQuestionWakeCoversBatchAndWait() async throws {
+        for batch in [true, false] {
+            try await withFixture(batch ? "delegated-batch" : "delegated-wait") { fixture in
+                try fixture.activateAgentRunForBatch()
+                let operationID: UUID?
+                if batch {
+                    operationID = nil
+                } else {
+                    let pending = try await fixture.ask(["timeout_seconds": .int(0)])
+                    operationID = try self.operationID(in: pending)
+                }
+                let registered = await fixture.window.mcpServer.test_beginResolvedToolExecution(
+                    metadata: fixture.metadata, resolvedContext: nil, toolName: MCPWindowToolName.askOracle
+                )
+                let execution = try XCTUnwrap(registered)
+                defer { fixture.window.mcpServer.test_endToolExecution(executionID: execution.executionID) }
+                let task = Task { @MainActor in
+                    try await MCPServerViewModel.$currentToolExecutionID.withValue(execution.executionID) {
+                        if batch {
+                            return try await fixture.call(["consultations": batchConsultations(fixture: fixture, count: 1)])
+                        }
+                        return try await fixture.call([
+                            "op": .string("wait"),
+                            "operation_ids": .array([.string(XCTUnwrap(operationID).uuidString)])
+                        ])
+                    }
+                }
+                try await fixture.harness.waitUntilOpen(count: 1)
+                try await fixture.waitUntilParked()
+                await fixture.window.mcpServer.wakeAgentRunWaitersOwnedByActiveRun(
+                    runID: fixture.runID, source: "delegated-question-test", reason: .delegatedQuestionPending
+                ) { _ in nil }
+                let result = try await task.value
+                XCTAssertEqual(result["wait"]?.objectValue?["result"]?.stringValue, "interrupted_by_child_question")
+                XCTAssertEqual(result["_meta"]?.objectValue?["wake_reason"]?.stringValue, "delegated_question")
+                let lane = try XCTUnwrap(try lanes(in: result).first)
+                XCTAssertEqual(lane["pending"]?.objectValue?["reason"]?.stringValue, "interrupted_by_child_question")
+                XCTAssertEqual(lane["status"]?.stringValue, "pending")
+                XCTAssertEqual(fixture.harness.openedStreamCount, 1)
+            }
+        }
+    }
+
+    func testOracleStickyDelegatedWakeSteeringPrecedenceAndCompletionWins() async throws {
+        try await withFixture { fixture in
+            let initial = try await fixture.ask(["timeout_seconds": .int(0)])
+            let id = try operationID(in: initial)
+            for steering in [false, true] {
+                let registered = await fixture.window.mcpServer.test_beginResolvedToolExecution(
+                    metadata: fixture.metadata, resolvedContext: nil, toolName: MCPWindowToolName.askOracle
+                )
+                let execution = try XCTUnwrap(registered)
+                await fixture.window.mcpServer.wakeAgentRunWaitersOwnedByActiveRun(
+                    runID: fixture.runID, source: "early-delegated-test", reason: .delegatedQuestionPending
+                ) { _ in nil }
+                if steering {
+                    await fixture.window.mcpServer.wakeAgentRunWaitersOwnedByActiveRun(
+                        runID: fixture.runID, source: "early-steering-test"
+                    ) { _ in nil }
+                }
+                let result = try await MCPServerViewModel.$currentToolExecutionID.withValue(execution.executionID) {
+                    try await fixture.call(["op": .string("wait"), "operation_ids": .array([.string(id.uuidString)])])
+                }
+                XCTAssertEqual(
+                    result["wait"]?.objectValue?["result"]?.stringValue,
+                    steering ? "interrupted_by_steering" : "interrupted_by_child_question"
+                )
+                XCTAssertEqual(
+                    result["_meta"]?.objectValue?["wake_reason"]?.stringValue,
+                    steering ? "steering_requested" : "delegated_question"
+                )
+                fixture.window.mcpServer.test_endToolExecution(executionID: execution.executionID)
+            }
+            try await fixture.harness.waitUntilOpen(count: 1)
+            fixture.harness.finish(index: 0, text: "Completed before wake")
+            try await AsyncTestWait.waitUntil("Oracle terminal", timeout: 5) {
+                await MainActor.run { fixture.store.allSettled([id]) }
+            }
+            let registered = await fixture.window.mcpServer.test_beginResolvedToolExecution(
+                metadata: fixture.metadata, resolvedContext: nil, toolName: MCPWindowToolName.askOracle
+            )
+            let execution = try XCTUnwrap(registered)
+            defer { fixture.window.mcpServer.test_endToolExecution(executionID: execution.executionID) }
+            await fixture.window.mcpServer.wakeAgentRunWaitersOwnedByActiveRun(
+                runID: fixture.runID, source: "terminal-delegated-test", reason: .delegatedQuestionPending
+            ) { _ in nil }
+            let result = try await MCPServerViewModel.$currentToolExecutionID.withValue(execution.executionID) {
+                try await fixture.call(["op": .string("wait"), "operation_ids": .array([.string(id.uuidString)])])
+            }
+            XCTAssertEqual(result["wait"]?.objectValue?["result"]?.stringValue, "completed")
+            XCTAssertNil(result["_meta"])
+            XCTAssertEqual(try lanes(in: result).first?["response"]?.stringValue, "Completed before wake")
+        }
+    }
+
     func testSteeringWakeReturnsPendingAndToolExecutionDrains() async throws {
         try await withFixture { fixture in
             let registered = await fixture.window.mcpServer.test_beginResolvedToolExecution(

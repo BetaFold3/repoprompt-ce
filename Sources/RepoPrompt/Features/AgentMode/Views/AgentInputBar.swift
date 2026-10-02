@@ -39,6 +39,8 @@ struct AgentComposerActions {
     let applyClaudeToolSettingMutation: (_ mutation: ClaudeToolSettingMutation) -> Void
     let setClaudeEffortLevel: (_ level: ClaudeCodeEffortLevel) -> Void
     let openCLIProvidersSettings: () -> Void
+    /// Delegated ask_user parent banner actions (plan §6.5); nil hides the Open action.
+    var delegatedQuestions: AgentDelegatedQuestionBannerActions?
 }
 
 enum CursorModelProviderChipDisplay {
@@ -319,7 +321,10 @@ struct AgentInputBar: View {
                     object: nil,
                     userInfo: ["windowID": windowID]
                 )
-            }
+            },
+            delegatedQuestions: AgentDelegatedQuestionBannerActions(
+                openChild: { row in await agentModeVM.openDelegatedQuestionChild(row) }
+            )
         )
     }
 
@@ -524,6 +529,11 @@ struct AgentComposerView: View, Equatable {
         return scheduledSend
     }
 
+    private var renderedDelegatedQuestions: [AgentDelegatedQuestionBannerRow] {
+        guard props.currentTabID == currentTabID, actions.delegatedQuestions != nil else { return [] }
+        return props.delegatedQuestions
+    }
+
     private var renderedStaleResetRecovery: AgentStaleResetRecoveryProps? {
         guard let recovery = props.staleResetRecovery,
               recovery.tabID == props.currentTabID,
@@ -601,12 +611,19 @@ struct AgentComposerView: View, Equatable {
         return 48 + AgentAttachmentStripLayout.composerVerticalSpacingWhenPresent
     }
 
+    private var delegatedQuestionsBannerReservedHeight: CGFloat {
+        let rowCount = renderedDelegatedQuestions.count
+        guard rowCount > 0 else { return 0 }
+        return AgentDelegatedQuestionsBanner.reservedHeight(rowCount: rowCount)
+            + AgentAttachmentStripLayout.composerVerticalSpacingWhenPresent
+    }
+
     private var mainContentHeight: CGFloat {
         editorTextFieldHeight + AgentAttachmentStripLayout.reservedHeight(
             hasImages: hasPendingImageAttachments,
             hasTaggedFiles: hasPendingTaggedFileAttachments
         ) + steeringUnsupportedInfoBoxReservedHeight + scheduledSendBannerReservedHeight
-            + staleResetRecoveryBannerReservedHeight
+            + staleResetRecoveryBannerReservedHeight + delegatedQuestionsBannerReservedHeight
     }
 
     private var composerChromeVerticalPadding: CGFloat {
@@ -840,6 +857,13 @@ struct AgentComposerView: View, Equatable {
                 AgentScheduledSendBanner(
                     props: scheduledSend,
                     actions: actions.scheduledSend
+                )
+            }
+
+            if let delegatedQuestionActions = actions.delegatedQuestions, !renderedDelegatedQuestions.isEmpty {
+                AgentDelegatedQuestionsBanner(
+                    rows: renderedDelegatedQuestions,
+                    actions: delegatedQuestionActions
                 )
             }
 

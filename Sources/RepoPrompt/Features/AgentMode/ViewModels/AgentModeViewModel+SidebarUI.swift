@@ -342,7 +342,8 @@ extension AgentModeViewModel {
             sessionIndex: ownerValidatedSessionIndex,
             pairedDeviceDisplayNameByBareID: pairedDeviceDisplayNameByBareIDForSidebar(),
             sessionListSortDates: ownerValidatedSessionListSortDates,
-            sidebarRestoreFrozenOrderByTabID: ownerValidatedSidebarRestoreFrozenOrderByTabID
+            sidebarRestoreFrozenOrderByTabID: ownerValidatedSidebarRestoreFrozenOrderByTabID,
+            delegatedQuestionAttentionBySessionID: delegatedQuestionSidebarAttentionBySessionID()
         )
     }
 }

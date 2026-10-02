@@ -3548,7 +3548,7 @@ struct AgentModeChatDetailView: View {
         HStack(spacing: 6) {
             ProgressView()
                 .scaleEffect(0.7)
-            Text(runInteractionSnapshot.runningStatusText ?? "Thinking…")
+            Text(AgentRunningStatusPresentation.displayText(for: runInteractionSnapshot.runningStatusText))
                 .font(fontPreset.swiftUIFont(sizeAtNormal: 12))
                 .foregroundColor(.secondary)
                 .lineLimit(1)

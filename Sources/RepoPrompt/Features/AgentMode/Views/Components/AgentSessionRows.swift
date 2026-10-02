@@ -67,6 +67,8 @@ struct AgentSessionRow: View {
     /// shifting layout — see `mergeAttentionBadge`.
     var worktreeMergeAttention: AgentWorktreeMergeAttention?
     var scheduledSendStatus: AgentSidebarScheduledSendStatus?
+    /// Delegated ask_user legibility (plan §6.5): a compact badge that never takes focus.
+    var delegatedQuestionAttention: AgentDelegatedQuestionSidebarAttention?
     let threadDepth: Int
     var hasThreadChildren: Bool = false
     var isThreadCollapsed: Bool = false
@@ -233,6 +235,10 @@ struct AgentSessionRow: View {
 
                     if let attention = worktreeMergeAttention {
                         mergeAttentionBadge(for: attention)
+                    }
+
+                    if let delegatedQuestionAttention, !delegatedQuestionAttention.isEmpty {
+                        delegatedQuestionBadge(for: delegatedQuestionAttention)
                     }
 
                     if let remoteHostName {
@@ -491,6 +497,30 @@ struct AgentSessionRow: View {
             .foregroundStyle(tint)
             .frame(width: pinFontSize + 2, height: pinFontSize + 2)
             .accessibilityLabel(attention.tooltipText)
+            .hoverTooltip(attention.tooltipText)
+    }
+
+    private func delegatedQuestionBadge(for attention: AgentDelegatedQuestionSidebarAttention) -> some View {
+        let tint: Color = switch attention.ownQuestion {
+        case .needsUserAnswer:
+            .orange
+        case .waitingOnParentAgent, nil:
+            .blue
+        }
+        let glyph = switch attention.ownQuestion {
+        case .needsUserAnswer:
+            "questionmark.circle.fill"
+        case .waitingOnParentAgent:
+            "arrow.turn.left.up"
+        case nil:
+            "questionmark.bubble"
+        }
+        return Image(systemName: glyph)
+            .font(.system(size: pinFontSize, weight: .semibold))
+            .foregroundStyle(tint)
+            .frame(width: pinFontSize + 2, height: pinFontSize + 2)
+            .accessibilityLabel(attention.tooltipText)
+            .accessibilityIdentifier("agent.sidebar.delegatedQuestionBadge")
             .hoverTooltip(attention.tooltipText)
     }
 

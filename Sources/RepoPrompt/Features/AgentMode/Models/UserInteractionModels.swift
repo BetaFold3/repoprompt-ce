@@ -494,14 +494,33 @@ struct AgentAskUserInteraction: Identifiable, Hashable {
     }
 }
 
+/// Who is expected to answer a pending Agent Mode `ask_user` question when it is not simply the
+/// user of a top-level session (delegated `ask_user` plan §6.1/§6.5). Presentation only: the
+/// pending state itself stays the single authority for content, drafts, and the timeout.
+enum AgentAskUserDelegatedRouting: Hashable {
+    /// Unchanged behavior (top-level session or verified external controller).
+    case direct
+    /// Addressed to the parent agent; the timeout is paused and the card shows
+    /// "Waiting on parent agent" instead of a countdown.
+    case awaitingParentAgent
+    /// In-app child that could not be routed to a live parent: the user answers here and
+    /// the normal timeout runs.
+    case userFallback
+}
+
 struct AgentAskUserPendingState: Identifiable, Hashable {
     var interaction: AgentAskUserInteraction
     var draftsByQuestionID: [String: AgentAskUserDraft]
     var currentQuestionIndex: Int
     var timeoutStartedAt: Date?
+    var delegatedRouting: AgentAskUserDelegatedRouting = .direct
 
     var id: UUID {
         interaction.id
+    }
+
+    var isAwaitingParentAgent: Bool {
+        delegatedRouting == .awaitingParentAgent
     }
 
     init(

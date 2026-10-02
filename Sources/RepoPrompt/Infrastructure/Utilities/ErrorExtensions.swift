@@ -62,8 +62,30 @@ extension Error {
             return apiErr.displayDescription
         }
 
-        // 4. Fallback to NSError bridging:
+        // Preserve the existing friendly formatting of wrapped provider errors.
+        if let providerError = self as? AIProviderError {
+            switch providerError {
+            case let .apiError(source?), let .unknown(source?):
+                return source.asFriendlyString()
+            default:
+                break
+            }
+        }
+
+        if let description = (self as? LocalizedError)?.errorDescription?
+            .trimmingCharacters(in: .whitespacesAndNewlines), !description.isEmpty
+        {
+            return description
+        }
+
         let nsError = self as NSError
+        if let description = (nsError.userInfo[NSLocalizedDescriptionKey] as? String)?
+            .trimmingCharacters(in: .whitespacesAndNewlines), !description.isEmpty
+        {
+            return description
+        }
+
+        // Keep the diagnostic fallback when no explicit description is available.
         let domain = nsError.domain
         let code = nsError.code
 

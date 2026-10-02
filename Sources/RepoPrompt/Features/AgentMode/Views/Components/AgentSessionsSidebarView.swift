@@ -424,6 +424,7 @@ struct AgentModeSessionsListView: View {
                                 worktree: session.worktree,
                                 worktreeMergeAttention: session.worktreeMergeAttention,
                                 scheduledSendStatus: session.scheduledSendStatus,
+                                delegatedQuestionAttention: session.delegatedQuestionAttention,
                                 threadDepth: session.depth,
                                 hasThreadChildren: session.hasThreadChildren,
                                 isThreadCollapsed: session.isThreadCollapsed,

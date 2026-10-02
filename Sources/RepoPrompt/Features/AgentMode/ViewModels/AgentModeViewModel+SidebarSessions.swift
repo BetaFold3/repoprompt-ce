@@ -432,7 +432,8 @@ extension AgentModeViewModel {
             sidebarRestoreFrozenOrderByTabID: ownerValidatedSidebarRestoreFrozenOrderByTabID,
             mcpControlledTabIDs: mcpControlledTabIDs,
             registeredRemoteHosts: registeredRemoteHostsForSidebar(currentIndex: currentIndex),
-            pairedDeviceDisplayNameByBareID: pairedDeviceDisplayNameByBareID
+            pairedDeviceDisplayNameByBareID: pairedDeviceDisplayNameByBareID,
+            delegatedQuestionAttentionBySessionID: delegatedQuestionSidebarAttentionBySessionID()
         ).build()
     }
 
@@ -908,6 +909,7 @@ extension AgentModeViewModel {
             worktree: row.worktree,
             worktreeMergeAttention: row.worktreeMergeAttention,
             scheduledSendStatus: row.scheduledSendStatus,
+            delegatedQuestionAttention: row.delegatedQuestionAttention,
             threadKey: threadKey,
             hasThreadChildren: hasThreadChildren,
             isThreadCollapsed: isThreadCollapsed,
