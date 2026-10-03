@@ -49,7 +49,7 @@ enum WorkspaceCodemapArtifactDemandRecovery: Equatable {
 
     init(_ rejection: WorkspaceCodemapBindingDemandRejection) {
         switch rejection {
-        case .rootNotRegistered, .capabilityUnavailable:
+        case .rootNotRegistered, .capabilityUnavailable, .repositoryAuthorityChanged:
             self = .resetRootSession
         case .rootEpochMismatch, .rootPathMismatch, .catalogGenerationMismatch,
              .requestGenerationInvalid, .stalePathGeneration, .staleIngressGeneration,

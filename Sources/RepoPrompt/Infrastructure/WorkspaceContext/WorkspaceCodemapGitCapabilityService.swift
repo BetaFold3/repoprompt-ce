@@ -1,6 +1,7 @@
 import CryptoKit
 import Darwin
 import Foundation
+import OSLog
 
 struct WorkspaceCodemapPathFingerprintClient {
     let fingerprint: @Sendable (_ repositoryRoot: URL, _ repositoryRelativePath: String) throws
@@ -156,6 +157,102 @@ struct WorkspaceCodemapSourceAuthorityToken: Hashable {
     }
 }
 
+/// Names-only reason a source-authority token could not be issued or revalidated.
+/// Never carries source or metadata contents, paths, digests, ref values, or raw error text.
+enum WorkspaceCodemapSourceAuthorityFailure: Hashable {
+    enum AuthorityComponent: String, CaseIterable, Hashable {
+        case layout
+        case index
+        case checkoutConfiguration = "checkout_configuration"
+        case attributes
+        case sparse
+        case metadata
+    }
+
+    enum UnstableWindow: String, Hashable {
+        case attributes
+        case repository
+        case pathFingerprint = "path_fingerprint"
+        case capability
+    }
+
+    enum CaptureFailure: String, Hashable {
+        case permissionDenied = "permission_denied"
+        case transient
+    }
+
+    case capabilityInactive
+    case candidatePathRejected
+    case candidateNotRegularFile
+    /// The capture disagrees with the cached baseline on non-binding components.
+    case repositoryAuthorityChanged(changed: [AuthorityComponent])
+    /// The capture disagrees on namespace, object format, or a binding epoch.
+    case repositoryBindingChanged
+    /// The capture's repository layout or loaded-root prefix guard failed.
+    case repositoryLayoutChanged
+    case unstableWindow(UnstableWindow)
+    case captureFailed(CaptureFailure)
+    case tokenInvalid
+    case cancelled
+
+    var reason: String {
+        switch self {
+        case .capabilityInactive: "capability_inactive"
+        case .candidatePathRejected: "candidate_path_rejected"
+        case .candidateNotRegularFile: "candidate_not_regular_file"
+        case .repositoryAuthorityChanged: "repository_authority_changed"
+        case .repositoryBindingChanged: "repository_binding_changed"
+        case .repositoryLayoutChanged: "repository_layout_changed"
+        case let .unstableWindow(window): "unstable_window.\(window.rawValue)"
+        case let .captureFailed(failure): "capture_failed.\(failure.rawValue)"
+        case .tokenInvalid: "token_invalid"
+        case .cancelled: "cancelled"
+        }
+    }
+
+    var changedComponents: [AuthorityComponent] {
+        guard case let .repositoryAuthorityChanged(changed) = self else { return [] }
+        return changed
+    }
+
+    /// Root-wide failures mean the cached repository authority no longer matches the repository,
+    /// so retrying any candidate against the same capability cannot succeed.
+    var isRootWide: Bool {
+        switch self {
+        case .repositoryAuthorityChanged, .repositoryBindingChanged, .repositoryLayoutChanged:
+            true
+        case .capabilityInactive, .candidatePathRejected, .candidateNotRegularFile,
+             .unstableWindow, .captureFailed, .tokenInvalid, .cancelled:
+            false
+        }
+    }
+}
+
+enum WorkspaceCodemapSourceAuthorityIssuance: Hashable {
+    case issued(WorkspaceCodemapSourceAuthorityToken)
+    case unavailable(WorkspaceCodemapSourceAuthorityFailure)
+
+    var token: WorkspaceCodemapSourceAuthorityToken? {
+        guard case let .issued(token) = self else { return nil }
+        return token
+    }
+
+    var failure: WorkspaceCodemapSourceAuthorityFailure? {
+        guard case let .unavailable(failure) = self else { return nil }
+        return failure
+    }
+}
+
+enum WorkspaceCodemapSourceAuthorityRevalidation: Hashable {
+    case valid
+    case invalid(WorkspaceCodemapSourceAuthorityFailure)
+
+    var failure: WorkspaceCodemapSourceAuthorityFailure? {
+        guard case let .invalid(failure) = self else { return nil }
+        return failure
+    }
+}
+
 struct WorkspaceCodemapGitCapabilityServiceHooks {
     var beforeResolution: @Sendable () async -> Void
     var afterFirstAuthorityCapture: @Sendable () async -> Void
@@ -181,6 +278,11 @@ struct WorkspaceCodemapGitCapabilityServiceHooks {
 }
 
 actor WorkspaceCodemapGitCapabilityService {
+    private static let logger = Logger(
+        subsystem: "com.repoprompt.workspace",
+        category: "CodemapSourceAuthority"
+    )
+
     #if DEBUG
         struct Snapshot: Equatable {
             let activeRecordCount: Int
@@ -224,6 +326,10 @@ actor WorkspaceCodemapGitCapabilityService {
         var binding: RootBinding
         var retainedWorkTreeRoot: URL?
         var retainedGitDirectory: URL?
+        #if DEBUG
+            /// One bounded diagnostic entry per root; removed with the record on release.
+            var lastSourceAuthorityFailure: WorkspaceCodemapSourceAuthorityFailure?
+        #endif
     }
 
     private struct RootFlight {
@@ -416,6 +522,12 @@ actor WorkspaceCodemapGitCapabilityService {
                 waiterCount: flights.values.reduce(0) { $0 + $1.waiters.count },
                 resolutionObserverCount: resolutionObservers.count
             )
+        }
+
+        func lastSourceAuthorityFailureForTesting(
+            rootEpoch: WorkspaceCodemapRootEpoch
+        ) -> WorkspaceCodemapSourceAuthorityFailure? {
+            records[rootEpoch]?.lastSourceAuthorityFailure
         }
     #endif
 
@@ -650,67 +762,86 @@ actor WorkspaceCodemapGitCapabilityService {
         currentPathGeneration: UInt64,
         observedIngressGeneration: UInt64,
         currentIngressGeneration: UInt64
-    ) async -> WorkspaceCodemapSourceAuthorityToken? {
-        guard let record = records[capability.rootEpoch],
+    ) async -> WorkspaceCodemapSourceAuthorityIssuance {
+        let rootEpoch = capability.rootEpoch
+        guard let record = records[rootEpoch],
               case let .eligible(activeCapability) = record.state,
               activeCapability == capability,
-              let stableAuthority = record.stableAuthority,
-              let candidatePath = Self.safeRepositoryRelativePath(candidateRepositoryRelativePath),
+              let stableAuthority = record.stableAuthority
+        else { return .unavailable(sourceAuthorityFailed(.capabilityInactive, rootEpoch: rootEpoch)) }
+        guard let candidatePath = Self.safeRepositoryRelativePath(candidateRepositoryRelativePath),
               Self.isCandidate(
                   candidatePath,
                   insideLoadedRootPrefix: capability.repositoryRelativeLoadedRootPrefix
               )
-        else { return nil }
+        else { return .unavailable(sourceAuthorityFailed(.candidatePathRejected, rootEpoch: rootEpoch)) }
         let loadedRoot = URL(fileURLWithPath: record.binding.standardizedLoadedRootPath)
 
+        let failure: WorkspaceCodemapSourceAuthorityFailure
         do {
-            let prePathFingerprint = try pathFingerprintClient.fingerprint(
-                capability.repositoryLayout.workTreeRoot,
-                candidatePath
-            )
-            guard prePathFingerprint.isRegularFile else { return nil }
+            let prePathFingerprint: GitBlobLStatFingerprint
+            do {
+                prePathFingerprint = try pathFingerprintClient.fingerprint(
+                    capability.repositoryLayout.workTreeRoot,
+                    candidatePath
+                )
+            } catch {
+                throw SourceAuthorityStepError(Self.candidatePathFailure(for: error))
+            }
+            guard prePathFingerprint.isRegularFile else {
+                throw SourceAuthorityStepError(.candidateNotRegularFile)
+            }
             await hooks.afterSourcePathFingerprintCapture()
             try Task.checkCancellation()
-            let preRepository = try await captureAuthority(
+            let preRepository = try await captureAuthorityStep(
                 loadedRoot: loadedRoot,
-                expectedLayout: capability.repositoryLayout,
-                prefix: capability.repositoryRelativeLoadedRootPrefix
+                capability: capability
             )
-            guard preRepository.stableAuthority == stableAuthority else { return nil }
-            let preAttributes = try digestEvidence(
-                urls: Self.candidateAttributeURLs(
-                    layout: capability.repositoryLayout,
-                    candidateRepositoryRelativePath: candidatePath
-                ),
-                includeBoundedContents: true
+            // Return on the first baseline mismatch: no token can be accepted, and a second capture
+            // would only spend Git calls on a rejection whose root-wide cause is already known.
+            if let mismatch = Self.authorityMismatch(
+                baseline: stableAuthority,
+                observed: preRepository.stableAuthority
+            ) {
+                throw SourceAuthorityStepError(mismatch)
+            }
+            let preAttributes = try candidateAttributeStep(
+                layout: capability.repositoryLayout,
+                candidatePath: candidatePath
             )
             try Task.checkCancellation()
-            let postAttributes = try digestEvidence(
-                urls: Self.candidateAttributeURLs(
-                    layout: capability.repositoryLayout,
-                    candidateRepositoryRelativePath: candidatePath
-                ),
-                includeBoundedContents: true
+            let postAttributes = try candidateAttributeStep(
+                layout: capability.repositoryLayout,
+                candidatePath: candidatePath
             )
-            let postRepository = try await captureAuthority(
+            let postRepository = try await captureAuthorityStep(
                 loadedRoot: loadedRoot,
-                expectedLayout: capability.repositoryLayout,
-                prefix: capability.repositoryRelativeLoadedRootPrefix
+                capability: capability
             )
-            let postPathFingerprint = try pathFingerprintClient.fingerprint(
-                capability.repositoryLayout.workTreeRoot,
-                candidatePath
-            )
-            guard preAttributes == postAttributes,
-                  preRepository == postRepository,
-                  postRepository.stableAuthority == stableAuthority,
-                  prePathFingerprint == postPathFingerprint,
-                  postPathFingerprint.isRegularFile,
-                  case let .eligible(currentCapability) = records[capability.rootEpoch]?.state,
+            let postPathFingerprint: GitBlobLStatFingerprint
+            do {
+                postPathFingerprint = try pathFingerprintClient.fingerprint(
+                    capability.repositoryLayout.workTreeRoot,
+                    candidatePath
+                )
+            } catch {
+                throw SourceAuthorityStepError(Self.captureFailure(for: error, window: .pathFingerprint))
+            }
+            // The pre-capture matched the baseline, so any later disagreement is window instability.
+            guard preAttributes == postAttributes else {
+                throw SourceAuthorityStepError(.unstableWindow(.attributes))
+            }
+            guard preRepository == postRepository,
+                  postRepository.stableAuthority == stableAuthority
+            else { throw SourceAuthorityStepError(.unstableWindow(.repository)) }
+            guard prePathFingerprint == postPathFingerprint,
+                  postPathFingerprint.isRegularFile
+            else { throw SourceAuthorityStepError(.unstableWindow(.pathFingerprint)) }
+            guard case let .eligible(currentCapability) = records[rootEpoch]?.state,
                   currentCapability == capability
-            else { return nil }
+            else { throw SourceAuthorityStepError(.unstableWindow(.capability)) }
 
-            return WorkspaceCodemapSourceAuthorityToken.issue(
+            guard let token = WorkspaceCodemapSourceAuthorityToken.issue(
                 capability: capability,
                 observedRootEpoch: observedRootEpoch,
                 observedRepositoryAuthority: observedRepositoryAuthority,
@@ -722,10 +853,14 @@ actor WorkspaceCodemapGitCapabilityService {
                 currentPathGeneration: currentPathGeneration,
                 observedIngressGeneration: observedIngressGeneration,
                 currentIngressGeneration: currentIngressGeneration
-            )
+            ) else { throw SourceAuthorityStepError(.tokenInvalid) }
+            return .issued(token)
+        } catch let error as SourceAuthorityStepError {
+            failure = error.failure
         } catch {
-            return nil
+            failure = Self.captureFailure(for: error, window: .repository)
         }
+        return .unavailable(sourceAuthorityFailed(failure, rootEpoch: rootEpoch))
     }
 
     /// Revalidates previously issued source-authority tokens against one stable repository/path window.
@@ -733,18 +868,19 @@ actor WorkspaceCodemapGitCapabilityService {
     func revalidateSourceAuthorities(
         capability: GitCodemapRootCapability,
         tokens: [WorkspaceCodemapSourceAuthorityToken]
-    ) async -> Bool {
-        guard let record = records[capability.rootEpoch],
+    ) async -> WorkspaceCodemapSourceAuthorityRevalidation {
+        let rootEpoch = capability.rootEpoch
+        guard let record = records[rootEpoch],
               case let .eligible(activeCapability) = record.state,
               activeCapability == capability,
               let stableAuthority = record.stableAuthority
-        else { return false }
-        if tokens.isEmpty { return true }
+        else { return .invalid(sourceAuthorityFailed(.capabilityInactive, rootEpoch: rootEpoch)) }
+        if tokens.isEmpty { return .valid }
 
         var candidatePaths = Set<String>()
         for token in tokens {
             guard token.isFactoryValidated,
-                  token.rootEpoch == capability.rootEpoch,
+                  token.rootEpoch == rootEpoch,
                   token.repositoryAuthority == capability.repositoryAuthority,
                   token.repositoryRelativeLoadedRootPrefix == capability.repositoryRelativeLoadedRootPrefix,
                   let candidatePath = Self.safeRepositoryRelativePath(token.standardizedRepositoryRelativePath),
@@ -754,88 +890,209 @@ actor WorkspaceCodemapGitCapabilityService {
                       insideLoadedRootPrefix: capability.repositoryRelativeLoadedRootPrefix
                   ),
                   candidatePaths.insert(candidatePath).inserted
-            else { return false }
+            else { return .invalid(sourceAuthorityFailed(.tokenInvalid, rootEpoch: rootEpoch)) }
         }
 
         let loadedRoot = URL(fileURLWithPath: record.binding.standardizedLoadedRootPath)
+        let failure: WorkspaceCodemapSourceAuthorityFailure
         do {
             var prePathFingerprints: [String: GitBlobLStatFingerprint] = [:]
             var preAttributeGenerations: [String: String] = [:]
             for token in tokens {
                 let path = token.standardizedRepositoryRelativePath
-                let fingerprint = try pathFingerprintClient.fingerprint(
-                    capability.repositoryLayout.workTreeRoot,
-                    path
-                )
+                let fingerprint = try pathFingerprintStep(capability: capability, path: path)
                 guard fingerprint == token.acceptedPostPathFingerprint,
                       fingerprint.isRegularFile
-                else { return false }
+                else { throw SourceAuthorityStepError(.unstableWindow(.pathFingerprint)) }
                 prePathFingerprints[path] = fingerprint
             }
             try Task.checkCancellation()
 
-            let preRepository = try await captureAuthority(
+            let preRepository = try await captureAuthorityStep(
                 loadedRoot: loadedRoot,
-                expectedLayout: capability.repositoryLayout,
-                prefix: capability.repositoryRelativeLoadedRootPrefix
+                capability: capability
             )
-            guard preRepository.stableAuthority == stableAuthority else { return false }
+            if let mismatch = Self.authorityMismatch(
+                baseline: stableAuthority,
+                observed: preRepository.stableAuthority
+            ) {
+                throw SourceAuthorityStepError(mismatch)
+            }
 
             for token in tokens {
                 let path = token.standardizedRepositoryRelativePath
-                let generation = try digestEvidence(
-                    urls: Self.candidateAttributeURLs(
-                        layout: capability.repositoryLayout,
-                        candidateRepositoryRelativePath: path
-                    ),
-                    includeBoundedContents: true
+                let generation = try candidateAttributeStep(
+                    layout: capability.repositoryLayout,
+                    candidatePath: path
                 )
-                guard generation == token.candidateAttributeGeneration else { return false }
+                guard generation == token.candidateAttributeGeneration else {
+                    throw SourceAuthorityStepError(.unstableWindow(.attributes))
+                }
                 preAttributeGenerations[path] = generation
             }
             try Task.checkCancellation()
 
             for token in tokens {
                 let path = token.standardizedRepositoryRelativePath
-                let generation = try digestEvidence(
-                    urls: Self.candidateAttributeURLs(
-                        layout: capability.repositoryLayout,
-                        candidateRepositoryRelativePath: path
-                    ),
-                    includeBoundedContents: true
+                let generation = try candidateAttributeStep(
+                    layout: capability.repositoryLayout,
+                    candidatePath: path
                 )
                 guard generation == preAttributeGenerations[path],
                       generation == token.candidateAttributeGeneration
-                else { return false }
+                else { throw SourceAuthorityStepError(.unstableWindow(.attributes)) }
             }
 
-            let postRepository = try await captureAuthority(
+            let postRepository = try await captureAuthorityStep(
+                loadedRoot: loadedRoot,
+                capability: capability
+            )
+            guard preRepository == postRepository,
+                  postRepository.stableAuthority == stableAuthority
+            else { throw SourceAuthorityStepError(.unstableWindow(.repository)) }
+
+            for token in tokens {
+                let path = token.standardizedRepositoryRelativePath
+                let fingerprint = try pathFingerprintStep(capability: capability, path: path)
+                guard fingerprint == prePathFingerprints[path],
+                      fingerprint == token.acceptedPostPathFingerprint,
+                      fingerprint.isRegularFile
+                else { throw SourceAuthorityStepError(.unstableWindow(.pathFingerprint)) }
+            }
+            guard case let .eligible(currentCapability) = records[rootEpoch]?.state,
+                  currentCapability == capability
+            else { throw SourceAuthorityStepError(.unstableWindow(.capability)) }
+            return .valid
+        } catch let error as SourceAuthorityStepError {
+            failure = error.failure
+        } catch {
+            failure = Self.captureFailure(for: error, window: .repository)
+        }
+        return .invalid(sourceAuthorityFailed(failure, rootEpoch: rootEpoch))
+    }
+
+    /// A typed source-authority step failure; thrown only inside this service's capture windows.
+    private struct SourceAuthorityStepError: Error {
+        let failure: WorkspaceCodemapSourceAuthorityFailure
+
+        init(_ failure: WorkspaceCodemapSourceAuthorityFailure) {
+            self.failure = failure
+        }
+    }
+
+    private func captureAuthorityStep(
+        loadedRoot: URL,
+        capability: GitCodemapRootCapability
+    ) async throws -> AuthorityCapture {
+        do {
+            return try await captureAuthority(
                 loadedRoot: loadedRoot,
                 expectedLayout: capability.repositoryLayout,
                 prefix: capability.repositoryRelativeLoadedRootPrefix
             )
-            guard preRepository == postRepository,
-                  postRepository.stableAuthority == stableAuthority
-            else { return false }
-
-            for token in tokens {
-                let path = token.standardizedRepositoryRelativePath
-                let fingerprint = try pathFingerprintClient.fingerprint(
-                    capability.repositoryLayout.workTreeRoot,
-                    path
-                )
-                guard fingerprint == prePathFingerprints[path],
-                      fingerprint == token.acceptedPostPathFingerprint,
-                      fingerprint.isRegularFile
-                else { return false }
-            }
-            guard case let .eligible(currentCapability) = records[capability.rootEpoch]?.state,
-                  currentCapability == capability
-            else { return false }
-            return true
         } catch {
-            return false
+            throw SourceAuthorityStepError(Self.captureFailure(for: error, window: .repository))
         }
+    }
+
+    private func candidateAttributeStep(
+        layout: GitRepositoryLayout,
+        candidatePath: String
+    ) throws -> String {
+        do {
+            return try digestEvidence(
+                urls: Self.candidateAttributeURLs(
+                    layout: layout,
+                    candidateRepositoryRelativePath: candidatePath
+                ),
+                includeBoundedContents: true
+            )
+        } catch {
+            throw SourceAuthorityStepError(Self.captureFailure(for: error, window: .attributes))
+        }
+    }
+
+    private func pathFingerprintStep(
+        capability: GitCodemapRootCapability,
+        path: String
+    ) throws -> GitBlobLStatFingerprint {
+        do {
+            return try pathFingerprintClient.fingerprint(capability.repositoryLayout.workTreeRoot, path)
+        } catch {
+            throw SourceAuthorityStepError(Self.captureFailure(for: error, window: .pathFingerprint))
+        }
+    }
+
+    /// Compares one capture against the cached baseline. Binding components (namespace, object
+    /// format, binding epochs) map to a binding change; every other component is an authority change.
+    private static func authorityMismatch(
+        baseline: StableAuthority,
+        observed: StableAuthority
+    ) -> WorkspaceCodemapSourceAuthorityFailure? {
+        guard baseline != observed else { return nil }
+        guard baseline.repositoryNamespace == observed.repositoryNamespace,
+              baseline.objectFormat == observed.objectFormat,
+              baseline.repositoryBindingEpoch == observed.repositoryBindingEpoch,
+              baseline.worktreeBindingEpoch == observed.worktreeBindingEpoch
+        else { return .repositoryBindingChanged }
+        var changed: [WorkspaceCodemapSourceAuthorityFailure.AuthorityComponent] = []
+        if baseline.layoutGeneration != observed.layoutGeneration { changed.append(.layout) }
+        if baseline.indexGeneration != observed.indexGeneration { changed.append(.index) }
+        if baseline.checkoutConfigurationGeneration != observed.checkoutConfigurationGeneration {
+            changed.append(.checkoutConfiguration)
+        }
+        if baseline.attributeGeneration != observed.attributeGeneration { changed.append(.attributes) }
+        if baseline.sparseGeneration != observed.sparseGeneration { changed.append(.sparse) }
+        if baseline.metadataGeneration != observed.metadataGeneration { changed.append(.metadata) }
+        return .repositoryAuthorityChanged(changed: changed)
+    }
+
+    private static func candidatePathFailure(for error: Error) -> WorkspaceCodemapSourceAuthorityFailure {
+        switch captureFailure(for: error, window: .pathFingerprint) {
+        case .cancelled: .cancelled
+        case .captureFailed(.permissionDenied): .captureFailed(.permissionDenied)
+        default: .candidatePathRejected
+        }
+    }
+
+    private static func captureFailure(
+        for error: Error,
+        window: WorkspaceCodemapSourceAuthorityFailure.UnstableWindow
+    ) -> WorkspaceCodemapSourceAuthorityFailure {
+        if let stepError = error as? SourceAuthorityStepError { return stepError.failure }
+        if error is CancellationError { return .cancelled }
+        if let captureError = error as? CapabilityCaptureError {
+            switch captureError {
+            case .layoutChanged(.repositoryLayout): return .repositoryLayoutChanged
+            case .layoutChanged(.descriptorWindow): return .unstableWindow(window)
+            case .permissionDenied: return .captureFailed(.permissionDenied)
+            case .authorityFileTooLarge: return .captureFailed(.transient)
+            }
+        }
+        let nsError = error as NSError
+        if nsError.domain == NSPOSIXErrorDomain,
+           nsError.code == Int(EACCES) || nsError.code == Int(EPERM)
+        {
+            return .captureFailed(.permissionDenied)
+        }
+        return .captureFailed(.transient)
+    }
+
+    /// Records and logs one names-only failure leaf. Never logs contents, paths, digests, or raw errors.
+    private func sourceAuthorityFailed(
+        _ failure: WorkspaceCodemapSourceAuthorityFailure,
+        rootEpoch: WorkspaceCodemapRootEpoch
+    ) -> WorkspaceCodemapSourceAuthorityFailure {
+        #if DEBUG
+            records[rootEpoch]?.lastSourceAuthorityFailure = failure
+        #endif
+        if failure != .cancelled {
+            let changed = failure.changedComponents.map(\.rawValue).joined(separator: ",")
+            Self.logger.notice(
+                "codemap source authority unavailable root=\(rootEpoch.rootID.uuidString, privacy: .public) reason=\(failure.reason, privacy: .public) changed=[\(changed, privacy: .public)]"
+            )
+        }
+        return failure
     }
 
     private func resolveCandidate(loadedRootURL: URL) async -> Resolution {
@@ -961,17 +1218,17 @@ actor WorkspaceCodemapGitCapabilityService {
               ) == prefix,
               Self.layoutIdentity(currentLayout) == Self.layoutIdentity(expectedLayout)
         else {
-            throw CapabilityCaptureError.layoutChanged
+            throw CapabilityCaptureError.layoutChanged(.repositoryLayout)
         }
         switch Self.layoutState(currentLayout) {
         case .valid:
             break
         case .missing:
-            throw CapabilityCaptureError.layoutChanged
+            throw CapabilityCaptureError.layoutChanged(.repositoryLayout)
         case .permissionDenied:
             throw CapabilityCaptureError.permissionDenied
         case .invalid:
-            throw CapabilityCaptureError.layoutChanged
+            throw CapabilityCaptureError.layoutChanged(.repositoryLayout)
         }
 
         let objectFormat = try await gitService.gitBlobObjectFormat(at: currentLayout.workTreeRoot)
@@ -1067,7 +1324,14 @@ actor WorkspaceCodemapGitCapabilityService {
     }
 
     private enum CapabilityCaptureError: Error {
-        case layoutChanged
+        /// Where a layout change was observed. Only the capture's repository layout/prefix guard is a
+        /// layout change; descriptor-window races and traversal rejection are window instability.
+        enum Origin {
+            case repositoryLayout
+            case descriptorWindow
+        }
+
+        case layoutChanged(Origin)
         case permissionDenied
         case authorityFileTooLarge
     }
@@ -1248,7 +1512,13 @@ actor WorkspaceCodemapGitCapabilityService {
                 continue
             }
             data.append(1)
-            appendStatEvidence(evidence.statValue, to: &data)
+            if Self.isDirectory(evidence.statValue) {
+                // Directory size and timestamps churn with every lock or temp file Git and the
+                // app create; identity covers replacement, and authority files carry their own evidence.
+                appendIdentityEvidence(evidence.statValue, to: &data)
+            } else {
+                appendStatEvidence(evidence.statValue, to: &data)
+            }
             if let contents = evidence.contents {
                 data.append(contents)
                 data.append(0)
@@ -1321,7 +1591,7 @@ actor WorkspaceCodemapGitCapabilityService {
                 throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
             }
             guard (linkStat.st_mode & S_IFMT) != S_IFLNK else {
-                throw CapabilityCaptureError.layoutChanged
+                throw CapabilityCaptureError.layoutChanged(.descriptorWindow)
             }
             let isLeaf = index == components.count - 1
             hooks.afterAuthorityEvidenceComponentStat(component, isLeaf)
@@ -1345,13 +1615,14 @@ actor WorkspaceCodemapGitCapabilityService {
             }
             // Intermediate directories are traversal capabilities, not authority
             // evidence. Sibling churn may change their size/timestamps without
-            // changing the descriptor-bound path. The leaf's complete stat is
-            // authority evidence and must remain stable across lookup and open.
+            // changing the descriptor-bound path. A file leaf's complete stat is
+            // authority evidence and must remain stable across lookup and open;
+            // a directory leaf contributes identity only, keyed on the observed type.
             let componentRemainedStable = isLeaf
-                ? sameStableStat(linkStat, descriptorStat)
+                ? sameLeafEvidence(linkStat, descriptorStat)
                 : sameDescriptorIdentity(linkStat, descriptorStat)
             guard componentRemainedStable else {
-                throw CapabilityCaptureError.layoutChanged
+                throw CapabilityCaptureError.layoutChanged(.descriptorWindow)
             }
             links.append(DescriptorLink(
                 parentDescriptor: parentDescriptor,
@@ -1377,8 +1648,8 @@ actor WorkspaceCodemapGitCapabilityService {
         guard fstat(leafDescriptor, &postStat) == 0 else {
             throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
         }
-        guard sameStableStat(preStat, postStat) else {
-            throw CapabilityCaptureError.layoutChanged
+        guard sameLeafEvidence(preStat, postStat) else {
+            throw CapabilityCaptureError.layoutChanged(.descriptorWindow)
         }
         for link in links {
             var current = stat()
@@ -1389,7 +1660,7 @@ actor WorkspaceCodemapGitCapabilityService {
                   sameDescriptorIdentity(link.childStat, current),
                   (current.st_mode & S_IFMT) != S_IFLNK
             else {
-                throw CapabilityCaptureError.layoutChanged
+                throw CapabilityCaptureError.layoutChanged(.descriptorWindow)
             }
         }
         return DescriptorEvidence(statValue: postStat, contents: contents)
@@ -1430,6 +1701,27 @@ actor WorkspaceCodemapGitCapabilityService {
         ].joined(separator: ":")
         data.append(Data(evidence.utf8))
         data.append(0)
+    }
+
+    private func appendIdentityEvidence(_ value: stat, to data: inout Data) {
+        let evidence = [
+            String(value.st_dev),
+            String(value.st_ino),
+            String(value.st_mode)
+        ].joined(separator: ":")
+        data.append(Data(evidence.utf8))
+        data.append(0)
+    }
+
+    private static func isDirectory(_ value: stat) -> Bool {
+        (value.st_mode & S_IFMT) == S_IFDIR
+    }
+
+    /// Directory leaves compare identity only; every other leaf keeps the full stable-stat window.
+    private func sameLeafEvidence(_ lhs: stat, _ rhs: stat) -> Bool {
+        Self.isDirectory(lhs) && Self.isDirectory(rhs)
+            ? sameDescriptorIdentity(lhs, rhs)
+            : sameStableStat(lhs, rhs)
     }
 
     private func sameDescriptorIdentity(_ lhs: stat, _ rhs: stat) -> Bool {

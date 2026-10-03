@@ -1260,4 +1260,429 @@ final class CodemapBindingEngineWarmManifestTests: CodemapBindingEngineTestCase 
         let storeAccounting = await runtime.artifactStore.accounting()
         XCTAssertEqual(storeAccounting.activeLeaseCount, 1)
     }
+
+    // MARK: Repository-authority drift during warm manifest adoption
+
+    /// A real index advance after warm registration makes the first adopted record's issuance fail
+    /// root-wide. Adoption must stop spending captures, release its reservation, stay dirty, re-run
+    /// only lazily on the next eligible request, and adopt again after the store-owned reset.
+    func testWarmAdoptionIssuanceDriftStopsCapturesStaysDirtyAndReadoptsAfterReset() async throws {
+        let repository = try makeRepositoryFixture(name: #function)
+        let root = try makeAuthorityDriftRepository(repository)
+        let runtime = try CodeMapArtifactRuntime(
+            rootURL: makeSecureDirectory(in: repository.sandbox, named: "artifacts")
+        )
+        let coldReady = try await publishColdAuthorityDriftManifest(root: root, runtime: runtime)
+        let issuances = CodemapLockedCounter()
+        let events = EngineHookEvents()
+        let ingress = AuthorityDriftIngressGeneration()
+        let warm = try await makeEngineFixture(
+            root: root,
+            runtime: runtime,
+            hooks: WorkspaceCodemapBindingEngineHooks(event: { events.record($0) }),
+            capabilityHooks: WorkspaceCodemapGitCapabilityServiceHooks(
+                afterSourcePathFingerprintCapture: { issuances.increment() }
+            ),
+            projectionCatalogFactory: { rootEpoch, fileIDs in
+                Self.authorityDriftCatalog(root: root, rootEpoch: rootEpoch, fileIDs: fileIDs, ingress: ingress)
+            }
+        )
+        guard case .registered(adoptedReadyCount: 0) = await warm.engine.registerRoot(warm.registration) else {
+            return XCTFail("Expected lazy warm registration at the published authority.")
+        }
+        try repository.stage("Notes.txt", at: root)
+        let before = await warm.engine.accounting()
+
+        let drifted = await warm.engine.demand(warm.demand(
+            path: Self.authorityDriftPaths[0],
+            priority: .background
+        ))
+
+        guard case .rejected(.repositoryAuthorityChanged) = drifted else {
+            return XCTFail("The demand after the failed adoption must observe the drift: \(drifted)")
+        }
+        let afterDrift = await warm.engine.accounting()
+        XCTAssertEqual(events.numericTotal(kind: .manifestLoadHit), 3, "Adoption loaded all three records.")
+        XCTAssertEqual(
+            Self.adoptionAuthorityEventKinds(events),
+            [.manifestLoadHit, .repositoryAuthorityChanged, .repositoryAuthorityChanged],
+            "Adoption observes the drift once, then the demand observes it once."
+        )
+        XCTAssertEqual(
+            issuances.value,
+            2,
+            "Adoption stops after its first root-wide issuance (one of three records); the demand issues once."
+        )
+        XCTAssertEqual(afterDrift.counters.manifestLoads - before.counters.manifestLoads, 1)
+        XCTAssertEqual(
+            afterDrift.counters.repositoryAuthorityChanges - before.counters.repositoryAuthorityChanges,
+            2,
+            "Each consumer records one observation; neither is a reset."
+        )
+        XCTAssertEqual(afterDrift.counters.manifestAdoptions, before.counters.manifestAdoptions)
+        XCTAssertEqual(afterDrift.dirtyManifestCount, 1, "The pipeline must stay dirty for lazy re-adoption.")
+        XCTAssertEqual(afterDrift.manifestAdoptionLeaseCount, 0)
+        XCTAssertEqual(afterDrift.manifestAdoptionLeaseByteCount, 0)
+        XCTAssertEqual(afterDrift.counters.busyRejections, before.counters.busyRejections)
+
+        try await Task.sleep(for: .milliseconds(300))
+        let idle = await warm.engine.accounting()
+        XCTAssertEqual(
+            idle.counters.manifestLoads,
+            afterDrift.counters.manifestLoads,
+            "A dirty manifest must not re-adopt autonomously."
+        )
+        XCTAssertEqual(issuances.value, 2)
+
+        let lazy = await warm.engine.demand(warm.demand(
+            path: Self.authorityDriftPaths[1],
+            priority: .explicit
+        ))
+        guard case .rejected(.repositoryAuthorityChanged) = lazy else {
+            return XCTFail("The drifted session must keep rejecting until the store resets it: \(lazy)")
+        }
+        let afterLazy = await warm.engine.accounting()
+        XCTAssertEqual(
+            afterLazy.counters.manifestLoads - afterDrift.counters.manifestLoads,
+            1,
+            "The next eligible request re-adopts lazily."
+        )
+        XCTAssertEqual(
+            issuances.value,
+            4,
+            "The lazy re-adoption reached issuance, so the failed attempt released its record reservation."
+        )
+        XCTAssertEqual(afterLazy.counters.busyRejections, before.counters.busyRejections)
+        XCTAssertEqual(afterLazy.dirtyManifestCount, 1)
+        XCTAssertEqual(afterLazy.manifestAdoptionLeaseCount, 0)
+        XCTAssertEqual(afterLazy.manifestAdoptionLeaseByteCount, 0)
+
+        // The store-owned reset: invalidate the session, then re-register with advanced generations.
+        _ = await warm.engine.invalidateCatalog(rootEpoch: warm.rootEpoch)
+        ingress.advance(to: 2)
+        guard case .registered(adoptedReadyCount: 0) = await warm.engine.registerRoot(
+            Self.replacementRegistration(warm, generation: 2)
+        ) else {
+            return XCTFail("The replacement registration must resolve the advanced authority.")
+        }
+        // Seed one verified record for the replacement authority, as that session's writer would.
+        _ = try await publishVerifiedManifestRecord(
+            fixture: warm,
+            runtime: runtime,
+            ready: XCTUnwrap(coldReady[Self.authorityDriftPaths[0]])
+        )
+        let beforeReadoption = await warm.engine.accounting()
+
+        let readopted = await warm.engine.demand(Self.reissuedDemand(
+            warm,
+            path: Self.authorityDriftPaths[0],
+            priority: .background,
+            generation: 2
+        ))
+
+        XCTAssertTrue(isReady(readopted), "\(readopted)")
+        let afterReadoption = await warm.engine.accounting()
+        XCTAssertEqual(
+            afterReadoption.counters.manifestAdoptions - beforeReadoption.counters.manifestAdoptions,
+            1,
+            "The replacement session must adopt lazily after the reset."
+        )
+        XCTAssertEqual(afterReadoption.dirtyManifestCount, 0)
+        XCTAssertEqual(
+            afterReadoption.counters.repositoryAuthorityChanges,
+            afterLazy.counters.repositoryAuthorityChanges
+        )
+        XCTAssertEqual(afterReadoption.counters.builds, 0)
+        XCTAssertEqual(afterReadoption.counters.materializations, 0)
+    }
+
+    /// A real index advance after every adopted record's issuance, but before batch revalidation,
+    /// must fail the batch root-wide, close every prepared lease, release the reservation and stay
+    /// dirty. After the store-owned reset the stale manifest misses and CAS recovers without builds.
+    func testWarmAdoptionBatchRevalidationDriftClosesLeasesStaysDirtyAndRecoversAfterReset() async throws {
+        let repository = try makeRepositoryFixture(name: #function)
+        let root = try makeAuthorityDriftRepository(repository)
+        let runtime = try CodeMapArtifactRuntime(
+            rootURL: makeSecureDirectory(in: repository.sandbox, named: "artifacts")
+        )
+        _ = try await publishColdAuthorityDriftManifest(root: root, runtime: runtime)
+        let issuances = CodemapLockedCounter()
+        let events = EngineHookEvents()
+        let drift = ManifestRefreshAuthorityDrift(
+            repository: repository,
+            root: root,
+            recordPaths: Set(Self.authorityDriftPaths)
+        )
+        let warm = try await makeEngineFixture(
+            root: root,
+            runtime: runtime,
+            hooks: WorkspaceCodemapBindingEngineHooks(event: { events.record($0) }),
+            capabilityHooks: WorkspaceCodemapGitCapabilityServiceHooks(
+                afterSourcePathFingerprintCapture: { issuances.increment() }
+            ),
+            catalogResolutionHook: { drift.observeResolution($0) }
+        )
+        guard case .registered(adoptedReadyCount: 0) = await warm.engine.registerRoot(warm.registration) else {
+            return XCTFail("Expected lazy warm registration at the published authority.")
+        }
+        drift.arm()
+        let before = await warm.engine.accounting()
+        let leasesBefore = await runtime.artifactStore.accounting().activeLeaseCount
+
+        let result = await warm.engine.demand(warm.demand(
+            path: Self.authorityDriftPaths[0],
+            priority: .explicit
+        ))
+
+        XCTAssertTrue(drift.didStage(), "The index must advance between the last issuance and batch revalidation.")
+        guard case .rejected(.repositoryAuthorityChanged) = result else {
+            return XCTFail("The demand after the failed adoption must observe the drift: \(result)")
+        }
+        let after = await warm.engine.accounting()
+        XCTAssertEqual(events.numericTotal(kind: .manifestLoadHit), 3)
+        XCTAssertEqual(
+            issuances.value,
+            4,
+            "All three adopted records issued before the drift; the demand issues once."
+        )
+        XCTAssertEqual(
+            Self.adoptionAuthorityEventKinds(events),
+            [.manifestLoadHit, .repositoryAuthorityChanged, .repositoryAuthorityChanged],
+            "Batch revalidation observes the drift once, then the demand observes it once."
+        )
+        XCTAssertEqual(
+            after.counters.repositoryAuthorityChanges - before.counters.repositoryAuthorityChanges,
+            2
+        )
+        XCTAssertEqual(after.counters.manifestAdoptions, before.counters.manifestAdoptions)
+        XCTAssertEqual(after.dirtyManifestCount, 1, "The pipeline must stay dirty for lazy re-adoption.")
+        XCTAssertEqual(after.manifestAdoptionLeaseCount, 0)
+        XCTAssertEqual(after.manifestAdoptionLeaseByteCount, 0)
+        XCTAssertEqual(after.counters.busyRejections, before.counters.busyRejections)
+        let leasesAfter = await runtime.artifactStore.accounting().activeLeaseCount
+        XCTAssertEqual(leasesAfter, leasesBefore, "Every lease acquired for a prepared record must be closed.")
+
+        // The store-owned reset, then lazy re-adoption on the replacement session.
+        _ = await warm.engine.invalidateCatalog(rootEpoch: warm.rootEpoch)
+        guard case .registered(adoptedReadyCount: 0) = await warm.engine.registerRoot(
+            Self.replacementRegistration(warm, generation: 2)
+        ) else {
+            return XCTFail("The replacement registration must resolve the advanced authority.")
+        }
+        let beforeRecovery = await warm.engine.accounting()
+        let missesBeforeRecovery = events.count(kind: .manifestLoadMiss)
+
+        let recovered = await warm.engine.demand(Self.reissuedDemand(
+            warm,
+            path: Self.authorityDriftPaths[0],
+            priority: .explicit,
+            generation: 2
+        ))
+
+        XCTAssertTrue(isReady(recovered), "\(recovered)")
+        let afterRecovery = await warm.engine.accounting()
+        XCTAssertEqual(afterRecovery.counters.manifestLoads - beforeRecovery.counters.manifestLoads, 1)
+        XCTAssertEqual(
+            events.count(kind: .manifestLoadMiss) - missesBeforeRecovery,
+            1,
+            "The pre-advance manifest is stale for the replacement authority, so re-adoption misses."
+        )
+        XCTAssertEqual(afterRecovery.dirtyManifestCount, 0)
+        XCTAssertEqual(
+            afterRecovery.counters.repositoryAuthorityChanges,
+            after.counters.repositoryAuthorityChanges
+        )
+        XCTAssertEqual(afterRecovery.counters.builds, 0, "Content-addressed artifacts recover without builds.")
+        XCTAssertEqual(afterRecovery.counters.materializations, 0)
+    }
+
+    private static let authorityDriftPaths = [
+        "Sources/Alpha.swift",
+        "Sources/Beta.swift",
+        "Sources/Gamma.swift"
+    ]
+
+    private func makeAuthorityDriftRepository(_ repository: ReviewGitRepositoryFixture) throws -> URL {
+        let root = try repository.makeRepository(
+            named: "repository",
+            files: [
+                "Sources/Alpha.swift": SwiftFixtureSource.emptyStruct("Alpha"),
+                "Sources/Beta.swift": SwiftFixtureSource.emptyStruct("Beta"),
+                "Sources/Gamma.swift": SwiftFixtureSource.emptyStruct("Gamma"),
+                "Notes.txt": "notes\n"
+            ]
+        )
+        // Leave a tracked modification so a later real `git add` advances the index.
+        try repository.write("notes changed\n", to: "Notes.txt", at: root)
+        try repository.settleIndex(at: root)
+        return root
+    }
+
+    /// Builds every drift path on a cold engine and waits until the current manifest holds them all.
+    private func publishColdAuthorityDriftManifest(
+        root: URL,
+        runtime: CodeMapArtifactRuntime
+    ) async throws -> [String: WorkspaceCodemapLiveReadySnapshot] {
+        let cold = try await makeEngineFixture(root: root, runtime: runtime)
+        guard case .registered = await cold.engine.registerRoot(cold.registration) else {
+            XCTFail("Expected cold registration.")
+            throw WorkspaceCodemapProvenanceTestSupportError.capabilityUnavailable
+        }
+        var readyByPath: [String: WorkspaceCodemapLiveReadySnapshot] = [:]
+        for path in Self.authorityDriftPaths {
+            let result = await cold.engine.demand(cold.demand(path: path))
+            guard case let .ready(ready) = result else {
+                XCTFail("Expected a cold build for \(path), got \(result).")
+                throw WorkspaceCodemapProvenanceTestSupportError.capabilityUnavailable
+            }
+            readyByPath[path] = ready
+        }
+        let capability = try await eligible(cold.capabilityService.state(for: cold.rootEpoch))
+        let namespace = try CodeMapRootManifestNamespace(
+            capability: capability,
+            pipelineIdentity: SyntaxManager.shared.pipelineIdentity(
+                for: .swift,
+                decoderPolicy: .workspaceAutomaticV1
+            )
+        )
+        let authority = try CodeMapRootManifestAuthority(
+            namespace: namespace,
+            token: capability.repositoryAuthority
+        )
+        var recordPaths: Set<String> = []
+        for _ in 0 ..< 250 {
+            if case let .hit(snapshot) = try await runtime.manifestStore.loadCurrentManifest(
+                namespace: namespace,
+                currentAuthority: authority
+            ) {
+                recordPaths = Set(snapshot.records.map(\.repositoryRelativePath))
+                if recordPaths == Set(Self.authorityDriftPaths) { break }
+            }
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        XCTAssertEqual(recordPaths, Set(Self.authorityDriftPaths), "The cold manifest must hold every record.")
+        await cold.engine.unloadRoot(rootEpoch: cold.rootEpoch)
+        return readyByPath
+    }
+
+    private static func adoptionAuthorityEventKinds(
+        _ events: EngineHookEvents
+    ) -> [WorkspaceCodemapBindingEngineHookKind] {
+        let kinds: Set<WorkspaceCodemapBindingEngineHookKind> = [
+            .manifestLoadHit,
+            .manifestLoadMiss,
+            .manifestAdopted,
+            .repositoryAuthorityChanged
+        ]
+        return events.snapshot().map(\.kind).filter { kinds.contains($0) }
+    }
+
+    private static func authorityDriftCatalog(
+        root: URL,
+        rootEpoch: WorkspaceCodemapRootEpoch,
+        fileIDs: EngineFileIDs,
+        ingress: AuthorityDriftIngressGeneration
+    ) -> WorkspaceCodemapBindingCatalogClient {
+        WorkspaceCodemapBindingCatalogClient { epoch, relativePath in
+            guard epoch == rootEpoch,
+                  let identity = WorkspaceCodemapArtifactBindingIdentity(
+                      rootID: rootEpoch.rootID,
+                      rootLifetimeID: rootEpoch.rootLifetimeID,
+                      fileID: fileIDs.id(for: relativePath),
+                      standardizedRootPath: root.path,
+                      standardizedRelativePath: relativePath,
+                      standardizedFullPath: root.appendingPathComponent(relativePath).path
+                  )
+            else { return nil }
+            return WorkspaceCodemapManifestBindingCandidate(
+                identity: identity,
+                requestGeneration: 1,
+                pathGeneration: 1,
+                ingressGeneration: ingress.value
+            )
+        }
+    }
+
+    /// Mirrors the store's re-registration after a reset: the same root epoch with advanced generations.
+    private static func replacementRegistration(
+        _ fixture: EngineFixture,
+        generation: UInt64
+    ) -> WorkspaceCodemapBindingRootRegistration {
+        WorkspaceCodemapBindingRootRegistration(
+            rootID: fixture.rootEpoch.rootID,
+            rootLifetimeID: fixture.rootEpoch.rootLifetimeID,
+            loadedRootURL: fixture.root,
+            catalogGeneration: generation,
+            ingressGeneration: generation
+        )
+    }
+
+    private static func reissuedDemand(
+        _ fixture: EngineFixture,
+        path: String,
+        priority: CodeMapArtifactBuildPriority,
+        generation: UInt64
+    ) -> WorkspaceCodemapBindingDemand {
+        let template = fixture.demand(path: path, priority: priority)
+        return WorkspaceCodemapBindingDemand(
+            owner: template.owner,
+            identity: template.identity,
+            requestGeneration: 1,
+            catalogGeneration: generation,
+            pathGeneration: 1,
+            ingressGeneration: generation,
+            priority: priority,
+            language: .swift
+        )
+    }
+}
+
+private final class AuthorityDriftIngressGeneration: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storage: UInt64 = 1
+
+    var value: UInt64 {
+        lock.withLock { storage }
+    }
+
+    func advance(to value: UInt64) {
+        lock.withLock { storage = value }
+    }
+}
+
+/// Stages a tracked change once, on the first manifest-binding refresh after every record was
+/// resolved: after all adoption issuances and before the batch revalidation.
+private final class ManifestRefreshAuthorityDrift: @unchecked Sendable {
+    private let lock = NSLock()
+    private let repository: ReviewGitRepositoryFixture
+    private let root: URL
+    private let recordPaths: Set<String>
+    private var armed = false
+    private var resolvedPaths: Set<String> = []
+    private var staged = false
+
+    init(repository: ReviewGitRepositoryFixture, root: URL, recordPaths: Set<String>) {
+        self.repository = repository
+        self.root = root
+        self.recordPaths = recordPaths
+    }
+
+    func arm() {
+        lock.withLock { armed = true }
+    }
+
+    func observeResolution(_ relativePath: String) {
+        lock.lock()
+        defer { lock.unlock() }
+        guard armed, !staged, recordPaths.contains(relativePath) else { return }
+        guard resolvedPaths.isSuperset(of: recordPaths) else {
+            resolvedPaths.insert(relativePath)
+            return
+        }
+        staged = (try? repository.stage("Notes.txt", at: root)) != nil
+    }
+
+    func didStage() -> Bool {
+        lock.withLock { staged }
+    }
 }

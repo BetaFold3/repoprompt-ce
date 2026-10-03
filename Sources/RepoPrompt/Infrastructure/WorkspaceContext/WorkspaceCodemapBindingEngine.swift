@@ -55,6 +55,9 @@ actor WorkspaceCodemapBindingEngine {
         var pathGenerations: [String: UInt64]
         var generation: UInt64
         var invalidationGeneration: UInt64
+        /// Root-wide source-authority failure observed by a current projection job. Latched for
+        /// the life of this session: no projection work is scheduled against the stale capability.
+        var projectionAuthorityFailure: WorkspaceCodemapProjectionDemandUnavailableReason?
     }
 
     private struct PipelineScope: Hashable {
@@ -268,6 +271,8 @@ actor WorkspaceCodemapBindingEngine {
     private enum ProjectionCandidateResolution {
         case entry(WorkspaceCodemapProjectionEntry, manifestRecord: CodeMapRootManifestRecord?)
         case transient
+        /// The repository authority failed root-wide; no candidate can succeed on this capability.
+        case authorityFailure(WorkspaceCodemapProjectionDemandUnavailableReason)
         case budget(WorkspaceCodemapProjectionBudget)
     }
 
@@ -616,6 +621,8 @@ actor WorkspaceCodemapBindingEngine {
     ) -> WorkspaceCodemapProjectionPreloadLaunchPhase {
         guard !isShuttingDown else { return .cancelled }
         guard case let .eligible(session)? = roots[rootEpoch] else { return .superseded }
+        // A latched authority failure ends projection for this session until it is replaced.
+        guard session.projectionAuthorityFailure == nil else { return .cancelled }
         if let existing = projectionJobs[rootEpoch] {
             if existing.phase == .superseded { return .superseded }
             if existing.phase == .cancelled { return .cancelled }
@@ -1221,7 +1228,9 @@ actor WorkspaceCodemapBindingEngine {
         contributionGeneration: WorkspaceCodemapSelectionGraphContributionGeneration
     ) -> Bool {
         observeOverlayContributionGeneration(contributionGeneration, rootEpoch: rootEpoch)
-        guard let job = projectionJobs[rootEpoch],
+        guard case let .eligible(session)? = roots[rootEpoch],
+              session.projectionAuthorityFailure == nil,
+              let job = projectionJobs[rootEpoch],
               job.phase == .complete,
               job.task == nil,
               let proof = job.coverageProof,
@@ -1863,9 +1872,53 @@ actor WorkspaceCodemapBindingEngine {
 
     private func activateProjectionDemands(rootEpoch: WorkspaceCodemapRootEpoch) {
         guard projectionDemands.values.contains(where: { $0.ticket.rootEpoch == rootEpoch }),
-              case .eligible? = roots[rootEpoch]
+              case let .eligible(session)? = roots[rootEpoch],
+              session.projectionAuthorityFailure == nil
         else { return }
         _ = scheduleProjectionPreload(rootEpoch: rootEpoch)
+    }
+
+    private static func projectionAuthorityFailureReason(
+        _ failure: WorkspaceCodemapSourceAuthorityFailure
+    ) -> WorkspaceCodemapProjectionDemandUnavailableReason? {
+        switch failure {
+        case .repositoryAuthorityChanged:
+            .repositoryAuthorityChanged
+        case .repositoryBindingChanged, .repositoryLayoutChanged:
+            .capabilityUnavailable
+        case .capabilityInactive, .candidatePathRejected, .candidateNotRegularFile,
+             .unstableWindow, .captureFailed, .tokenInvalid, .cancelled:
+            nil
+        }
+    }
+
+    /// Latches a root-wide source-authority failure on the session that owns the observing job.
+    /// Synchronous by design: no suspension separates the job/session fence from the latch, the
+    /// typed demand revocation, and job cancellation, so an old worker cannot poison or cancel a
+    /// replacement session. Only normal session replacement clears the latch.
+    private func recordProjectionAuthorityFailure(
+        jobID: UUID,
+        rootEpoch: WorkspaceCodemapRootEpoch,
+        sessionID: UUID,
+        reason: WorkspaceCodemapProjectionDemandUnavailableReason
+    ) {
+        guard let job = projectionJobs[rootEpoch],
+              job.id == jobID,
+              job.sessionID == sessionID,
+              projectionJobIsCurrent(job),
+              case var .eligible(session)? = roots[rootEpoch],
+              session.id == sessionID
+        else { return }
+        let latched = session.projectionAuthorityFailure ?? reason
+        if session.projectionAuthorityFailure == nil {
+            session.projectionAuthorityFailure = latched
+            roots[rootEpoch] = .eligible(session)
+        }
+        revokeProjectionDemands(
+            rootEpoch: rootEpoch,
+            status: .unavailable(reason: latched, retryAfterMilliseconds: nil)
+        )
+        cancelProjectionJob(rootEpoch: rootEpoch, terminalPhase: .cancelled)
     }
 
     private func projectionDemandStatusValue(
@@ -1891,6 +1944,12 @@ actor WorkspaceCodemapBindingEngine {
             guard session.registration.catalogGeneration == ticket.catalogGeneration,
                   session.registration.ingressGeneration == ticket.ingressGeneration
             else { return terminalizeProjectionDemand(ticket.id, status: .stale) }
+            if let failure = session.projectionAuthorityFailure {
+                return terminalizeProjectionDemand(
+                    ticket.id,
+                    status: .unavailable(reason: failure, retryAfterMilliseconds: nil)
+                )
+            }
         case .unavailable:
             return terminalizeProjectionDemand(
                 ticket.id,
@@ -2568,6 +2627,17 @@ actor WorkspaceCodemapBindingEngine {
                     )
                 case .transient:
                     return .retry
+                case let .authorityFailure(reason):
+                    // A root-wide authority failure is not a per-candidate failure: latch it on the
+                    // session so polling and scheduling cannot relaunch work against the stale
+                    // capability, then end the job without a timer retry.
+                    recordProjectionAuthorityFailure(
+                        jobID: jobID,
+                        rootEpoch: rootEpoch,
+                        sessionID: afterPageRead.sessionID,
+                        reason: reason
+                    )
+                    return .cancelled
                 case let .budget(budget):
                     finishProjectionForBudget(jobID: jobID, rootEpoch: rootEpoch, budget: budget)
                     return .budgetLimited
@@ -3133,7 +3203,7 @@ actor WorkspaceCodemapBindingEngine {
             break
         }
 
-        let sourceAuthority = await capabilityService.makeSourceAuthority(
+        let issuance = await capabilityService.makeSourceAuthority(
             capability: session.capability,
             observedRootEpoch: rootEpoch,
             observedRepositoryAuthority: job.repositoryAuthority,
@@ -3143,8 +3213,21 @@ actor WorkspaceCodemapBindingEngine {
             observedIngressGeneration: job.ingressGeneration,
             currentIngressGeneration: session.registration.ingressGeneration
         )
-        guard !Task.isCancelled,
-              let sourceAuthority,
+        guard !Task.isCancelled else { return .transient }
+        if let failure = issuance.failure {
+            // Fence before recording: a worker whose job or session was replaced during the
+            // capture must not count or latch a failure against the replacement.
+            guard let currentJob = currentProjectionJob(jobID: jobID, rootEpoch: rootEpoch),
+                  currentJob.sessionID == session.id,
+                  case let .eligible(currentSession)? = roots[rootEpoch],
+                  currentSession.id == session.id
+            else { return .transient }
+            recordSourceAuthorityFailure(failure, rootEpoch: rootEpoch)
+            return Self.projectionAuthorityFailureReason(failure).map {
+                ProjectionCandidateResolution.authorityFailure($0)
+            } ?? .transient
+        }
+        guard let sourceAuthority = issuance.token,
               projectionCandidateIsCurrent(
                   jobID: jobID,
                   rootEpoch: rootEpoch,
@@ -4383,7 +4466,7 @@ actor WorkspaceCodemapBindingEngine {
                   )
             else { continue }
 
-            let sourceAuthority = await capabilityService.makeSourceAuthority(
+            let issuance = await capabilityService.makeSourceAuthority(
                 capability: initial.capability,
                 observedRootEpoch: rootEpoch,
                 observedRepositoryAuthority: initial.capability.repositoryAuthority,
@@ -4398,7 +4481,19 @@ actor WorkspaceCodemapBindingEngine {
                 releaseAdoptionReservation(scope: pipelineScope, adoptionID: adoptionID)
                 return .superseded
             }
-            guard let sourceAuthority else { continue }
+            guard let sourceAuthority = issuance.token else {
+                guard let failure = issuance.failure else { continue }
+                recordSourceAuthorityFailure(failure, rootEpoch: rootEpoch)
+                guard failure.isRootWide else { continue }
+                // Every remaining record would fail the same root-wide comparison. Stop spending
+                // captures and leave the manifest for lazy re-adoption after the session resets.
+                await closePreparedManifestAdoptions(prepared)
+                releaseAdoptionReservation(scope: pipelineScope, adoptionID: adoptionID)
+                if adoptionContextIsCurrent(context, rootEpoch: rootEpoch) {
+                    updateManifestState(.dirtyRetryRequired, context: context, rootEpoch: rootEpoch)
+                }
+                return .retryable
+            }
             automaticSelectionCandidateRecords[record.repositoryRelativePath] = record
 
             let coordinatorResult = try? await runtime.coordinator.resolve(
@@ -4524,11 +4619,14 @@ actor WorkspaceCodemapBindingEngine {
             }
         }
 
-        let authoritiesAreCurrent = await capabilityService.revalidateSourceAuthorities(
+        let revalidation = await capabilityService.revalidateSourceAuthorities(
             capability: initial.capability,
             tokens: prepared.map(\.sourceAuthority)
         )
-        guard authoritiesAreCurrent,
+        if let failure = revalidation.failure {
+            recordSourceAuthorityFailure(failure, rootEpoch: rootEpoch)
+        }
+        guard revalidation == .valid,
               adoptionContextIsCurrent(context, rootEpoch: rootEpoch)
         else {
             await closePreparedManifestAdoptions(prepared)
@@ -5648,7 +5746,7 @@ actor WorkspaceCodemapBindingEngine {
             break
         }
 
-        let sourceAuthority = await capabilityService.makeSourceAuthority(
+        let issuance = await capabilityService.makeSourceAuthority(
             capability: session.capability,
             observedRootEpoch: current.rootEpoch,
             observedRepositoryAuthority: session.capability.repositoryAuthority,
@@ -5660,7 +5758,17 @@ actor WorkspaceCodemapBindingEngine {
         )
         try Task.checkCancellation()
         guard let current = currentRequest(requestID) else { throw CancellationError() }
-        guard let sourceAuthority else { return .rejected(.sourceAuthorityUnavailable) }
+        let sourceAuthority: WorkspaceCodemapSourceAuthorityToken
+        switch issuance {
+        case let .issued(token):
+            sourceAuthority = token
+        case let .unavailable(failure):
+            // The engine maps and returns; recovery stays with the store's root-session reset.
+            guard let rejection = sourceAuthorityRejection(for: failure, rootEpoch: current.rootEpoch) else {
+                throw CancellationError()
+            }
+            return .rejected(rejection)
+        }
         guard case var .eligible(latest)? = roots[current.rootEpoch], latest.id == current.sessionID else {
             return .rejected(.staleCompletion)
         }
@@ -5746,12 +5854,17 @@ actor WorkspaceCodemapBindingEngine {
             bindingIdentity: request.demand.identity,
             locatorIdentity: locator,
             sourceAuthority: sourceAuthority
-        ), let token = WorkspaceCodemapArtifactRequestToken.issue(
+        ) else {
+            return sourceAuthorityFactoryRejection(.sourceExpectationRejected, rootEpoch: request.rootEpoch)
+        }
+        guard let token = WorkspaceCodemapArtifactRequestToken.issue(
             identity: request.demand.identity,
             requestGeneration: request.demand.requestGeneration,
             catalogGeneration: request.demand.catalogGeneration,
             sourceExpectation: expectation
-        ) else { return .rejected(.sourceAuthorityUnavailable) }
+        ) else {
+            return sourceAuthorityFactoryRejection(.artifactRequestTokenRejected, rootEpoch: request.rootEpoch)
+        }
         let admission = await beginOverlayDemand(
             requestID: requestID,
             token: token,
@@ -5826,12 +5939,17 @@ actor WorkspaceCodemapBindingEngine {
             expectedArtifactKey: input.artifactKey,
             classificationReason: reason,
             sourceAuthority: sourceAuthority
-        ), let token = WorkspaceCodemapArtifactRequestToken.issue(
+        ) else {
+            return sourceAuthorityFactoryRejection(.sourceExpectationRejected, rootEpoch: current.rootEpoch)
+        }
+        guard let token = WorkspaceCodemapArtifactRequestToken.issue(
             identity: current.demand.identity,
             requestGeneration: current.demand.requestGeneration,
             catalogGeneration: current.demand.catalogGeneration,
             sourceExpectation: expectation
-        ) else { return .rejected(.sourceAuthorityUnavailable) }
+        ) else {
+            return sourceAuthorityFactoryRejection(.artifactRequestTokenRejected, rootEpoch: current.rootEpoch)
+        }
         let admission = await beginOverlayDemand(
             requestID: requestID,
             token: token,
@@ -7518,6 +7636,57 @@ actor WorkspaceCodemapBindingEngine {
     private func recordFailure(_ rootEpoch: WorkspaceCodemapRootEpoch?) {
         incrementCounter(\.failures)
         emit(.failure, rootEpoch: rootEpoch)
+    }
+
+    /// Downstream factory rejections after a token was issued, tagged apart from service leaves.
+    private enum SourceAuthorityFactoryFailure: UInt64 {
+        case sourceExpectationRejected = 1
+        case artifactRequestTokenRejected = 2
+    }
+
+    /// Counts root-wide authority changes and emits names-only diagnostics for one service failure.
+    /// The capability service logs the leaf; the engine never invalidates from this path.
+    private func recordSourceAuthorityFailure(
+        _ failure: WorkspaceCodemapSourceAuthorityFailure,
+        rootEpoch: WorkspaceCodemapRootEpoch
+    ) {
+        if failure.isRootWide {
+            incrementCounter(\.repositoryAuthorityChanges)
+            emit(
+                .repositoryAuthorityChanged,
+                rootEpoch: rootEpoch,
+                numericValue: UInt64(failure.changedComponents.count)
+            )
+        } else if failure != .cancelled {
+            emit(.sourceAuthorityTransientUnavailable, rootEpoch: rootEpoch)
+        }
+    }
+
+    /// Maps a source-authority failure to a demand rejection; `nil` means cancellation.
+    private func sourceAuthorityRejection(
+        for failure: WorkspaceCodemapSourceAuthorityFailure,
+        rootEpoch: WorkspaceCodemapRootEpoch
+    ) -> WorkspaceCodemapBindingDemandRejection? {
+        recordSourceAuthorityFailure(failure, rootEpoch: rootEpoch)
+        switch failure {
+        case .repositoryAuthorityChanged:
+            return .repositoryAuthorityChanged
+        case .repositoryBindingChanged, .repositoryLayoutChanged:
+            return .capabilityUnavailable
+        case .cancelled:
+            return nil
+        case .capabilityInactive, .candidatePathRejected, .candidateNotRegularFile,
+             .unstableWindow, .captureFailed, .tokenInvalid:
+            return .sourceAuthorityUnavailable
+        }
+    }
+
+    private func sourceAuthorityFactoryRejection(
+        _ failure: SourceAuthorityFactoryFailure,
+        rootEpoch: WorkspaceCodemapRootEpoch
+    ) -> WorkspaceCodemapBindingDemandResult {
+        emit(.sourceAuthorityTransientUnavailable, rootEpoch: rootEpoch, numericValue: failure.rawValue)
+        return .rejected(.sourceAuthorityUnavailable)
     }
 
     private func emit(

@@ -745,6 +745,7 @@ final class MCPCodeStructureWorktreeTests: XCTestCase {
             (.languageMismatch, "binding_rejected.language_mismatch"),
             (.classificationMismatch, "binding_rejected.classification_mismatch"),
             (.sourceAuthorityUnavailable, "binding_rejected.source_authority_unavailable"),
+            (.repositoryAuthorityChanged, "binding_rejected.repository_authority_changed"),
             (.staleCompletion, "binding_rejected.stale_completion")
         ]
         let overlayCases: [(WorkspaceCodemapLiveDemandRejection, String)] = [
@@ -781,12 +782,23 @@ final class MCPCodeStructureWorktreeTests: XCTestCase {
             let issue = try XCTUnwrap(dto.issues.first)
             XCTAssertEqual(issue.code, "artifact_unavailable")
             XCTAssertEqual(issue.detail, detail)
-            XCTAssertEqual(issue.message, "A codemap artifact is unavailable. (reason=\(detail))")
+            let expectedMessage = rejection == .repositoryAuthorityChanged
+                ? "Repository authority changed; retry the request. (reason=\(detail))"
+                : "A codemap artifact is unavailable. (reason=\(detail))"
+            XCTAssertEqual(issue.message, expectedMessage)
+            XCTAssertFalse(
+                issue.message.localizedCaseInsensitiveContains("reset"),
+                "A rejection observes drift; it cannot claim a completed reset."
+            )
             XCTAssertEqual(
                 issue.retryable,
                 WorkspaceCodemapArtifactDemandRecovery(rejection).isRetryable
             )
             XCTAssertEqual(dto.retry != nil, issue.retryable)
+            if rejection == .repositoryAuthorityChanged {
+                XCTAssertEqual(WorkspaceCodemapArtifactDemandRecovery(rejection), .resetRootSession)
+                XCTAssertTrue(issue.retryable)
+            }
         }
     }
 
@@ -1388,6 +1400,1292 @@ final class MCPCodeStructureWorktreeTests: XCTestCase {
         XCTAssertEqual(reverseRelated.reachedBy, ["referrers"])
     }
 
+    func testCodeStructureSucceedsAfterGitDirectoryChurn() async throws {
+        let repositories = try ReviewGitRepositoryFixture(name: #function)
+        let root = try repositories.makeRepository(
+            named: "repository",
+            files: [
+                "Sources/First.swift": "struct First { func first() {} }\n",
+                "Sources/Second.swift": "struct Second { func second() {} }\n",
+                "Sources/Third.swift": "struct Third { func third() {} }\n"
+            ]
+        )
+        defer { repositories.cleanup() }
+        try repositories.settleIndex(at: root)
+        let window = try await makeWindow(root: root)
+        let store = window.workspaceFileContextStore
+        let initial = try await codeStructureDTO(window: window, root: root, path: "Sources/First.swift")
+        XCTAssertEqual(initial.status, "ready", "\(initial.issues)")
+
+        for _ in 0 ..< 3 {
+            try repositories.churnRepositoryDirectoryTimestamps(at: root, includeWorktreeRoot: false)
+            _ = try repositories.runGit(["status", "--porcelain"], at: root)
+        }
+
+        for path in ["Sources/Second.swift", "Sources/Third.swift"] {
+            let dto = try await codeStructureDTO(window: window, root: root, path: path)
+            XCTAssertEqual(dto.status, "ready", "\(path): \(dto.issues)")
+            XCTAssertTrue(dto.issues.isEmpty, "\(path): \(dto.issues)")
+        }
+        let repairCount = await store.codemapRootSessionRepairCountForTesting()
+        XCTAssertEqual(repairCount, 0)
+        let counters = try await engineCounters(store: store)
+        XCTAssertEqual(counters.repositoryAuthorityChanges, 0)
+    }
+
+    func testCodeStructureRecoversOnceAfterIndexAdvance() async throws {
+        let repositories = try ReviewGitRepositoryFixture(name: #function)
+        let root = try repositories.makeRepository(
+            named: "repository",
+            files: [
+                "Sources/First.swift": "struct First { func first() {} }\n",
+                "Sources/Second.swift": "struct Second { func second() {} }\n",
+                "Sources/Third.swift": "struct Third { func third() {} }\n",
+                "Notes.txt": "notes\n"
+            ]
+        )
+        defer { repositories.cleanup() }
+        try repositories.write("notes changed\n", to: "Notes.txt", at: root)
+        try repositories.settleIndex(at: root)
+        let window = try await makeWindow(root: root)
+        let store = window.workspaceFileContextStore
+        let initial = try await codeStructureDTO(window: window, root: root, path: "Sources/First.swift")
+        XCTAssertEqual(initial.status, "ready", "\(initial.issues)")
+
+        try repositories.stage("Notes.txt", at: root)
+        let clock = ContinuousClock()
+        let started = clock.now
+        let recovered = try await codeStructureDTO(window: window, root: root, path: "Sources/Second.swift")
+        let elapsed = clock.now - started
+
+        XCTAssertEqual(recovered.status, "ready", "\(recovered.issues)")
+        XCTAssertTrue(recovered.issues.isEmpty, "\(recovered.issues)")
+        XCTAssertLessThan(elapsed, .seconds(10))
+        let repairCountAfterRecovery = await store.codemapRootSessionRepairCountForTesting()
+        XCTAssertEqual(repairCountAfterRecovery, 1)
+
+        let following = try await codeStructureDTO(window: window, root: root, path: "Sources/Third.swift")
+        XCTAssertEqual(following.status, "ready", "\(following.issues)")
+        let repairCountAfterFollowing = await store.codemapRootSessionRepairCountForTesting()
+        XCTAssertEqual(repairCountAfterFollowing, 1)
+        let counters = try await engineCounters(store: store)
+        XCTAssertEqual(counters.repositoryAuthorityChanges, 1)
+    }
+
+    func testConcurrentAuthorityRepairReissuesAllSiblingSeeds() async throws {
+        let repositories = try ReviewGitRepositoryFixture(name: #function)
+        var files = ["Notes.txt": "notes\n"]
+        for name in ["Held", "Alpha", "Beta", "Gamma", "Delta"] {
+            files["Sources/\(name).swift"] = "struct \(name) { func run() {} }\n"
+        }
+        let root = try repositories.makeRepository(named: "repository", files: files)
+        defer { repositories.cleanup() }
+        try repositories.write("notes changed\n", to: "Notes.txt", at: root)
+        try repositories.settleIndex(at: root)
+        let barrier = CodeStructureDistinctDemandBarrier(expectedFileCount: 4)
+        let window = try await makeWindow(
+            root: root,
+            codemapDemandResultHook: { ticket, result in
+                await barrier.passThrough(ticket: ticket, result: result)
+            }
+        )
+        let store = window.workspaceFileContextStore
+        let records = try await ["Held", "Alpha", "Beta", "Gamma", "Delta"].asyncMap { name in
+            try await fileRecord(
+                at: root.appendingPathComponent("Sources/\(name).swift"),
+                store: store,
+                rootScope: .visibleWorkspace
+            )
+        }
+        await barrier.ignore(fileID: records[0].id)
+        let heldTicket = try await readyTicket(store: store, fileID: records[0].id)
+        addTeardownBlock { _ = await store.cancelCodemapArtifactDemand(heldTicket) }
+
+        try repositories.stage("Notes.txt", at: root)
+        let mcpServer = window.mcpServer
+        let firstRecords = Array(records[1 ... 3])
+        let secondRecords = Array(records[2 ... 4])
+        async let first = mcpServer.buildCodeStructureDTO(
+            fromRecords: firstRecords,
+            request: request(maximumFiles: 10),
+            includePathNotFoundIssue: true
+        )
+        async let second = mcpServer.buildCodeStructureDTO(
+            fromRecords: secondRecords,
+            request: request(maximumFiles: 10),
+            includePathNotFoundIssue: true
+        )
+        let (firstDTO, secondDTO) = try await (first, second)
+
+        let overlapped = await barrier.didReleaseByArrival()
+        XCTAssertTrue(overlapped, "Both operations must overlap at the rejection.")
+        XCTAssertEqual(firstDTO.status, "ready", "\(firstDTO.issues)")
+        XCTAssertEqual(secondDTO.status, "ready", "\(secondDTO.issues)")
+        XCTAssertEqual(firstDTO.files.count, 3)
+        XCTAssertEqual(secondDTO.files.count, 3)
+        let repairCount = await store.codemapRootSessionRepairCountForTesting()
+        XCTAssertEqual(repairCount, 1)
+        let heldStatus = await store.codemapArtifactDemandStatus(heldTicket)
+        guard case .unavailable(.staleCurrentness) = heldStatus else {
+            return XCTFail("The pre-reset ticket must be stale after the root session reset: \(heldStatus)")
+        }
+    }
+
+    func testOldTicketCannotResetReplacementSession() async throws {
+        let repositories = try ReviewGitRepositoryFixture(name: #function)
+        let root = try repositories.makeRepository(
+            named: "repository",
+            files: [
+                "Sources/First.swift": "struct First { func first() {} }\n",
+                "Sources/Second.swift": "struct Second { func second() {} }\n",
+                "Notes.txt": "notes\n"
+            ]
+        )
+        defer { repositories.cleanup() }
+        try repositories.write("notes changed\n", to: "Notes.txt", at: root)
+        try repositories.settleIndex(at: root)
+        let window = try await makeWindow(root: root)
+        let store = window.workspaceFileContextStore
+        let initial = try await codeStructureDTO(window: window, root: root, path: "Sources/First.swift")
+        XCTAssertEqual(initial.status, "ready", "\(initial.issues)")
+
+        try repositories.stage("Notes.txt", at: root)
+        let second = try await fileRecord(
+            at: root.appendingPathComponent("Sources/Second.swift"),
+            store: store,
+            rootScope: .visibleWorkspace
+        )
+        let requested = await store.requestCodemapArtifactWithOwnership(forFileID: second.id)
+        guard case let .pending(oldTicket) = requested.result else {
+            return XCTFail("Expected a pending demand, got \(requested.result)")
+        }
+        let rejected = await waitForDemandResult(store: store, ticket: oldTicket) {
+            if case .unavailable(.rejected(.repositoryAuthorityChanged)) = $0 { return true }
+            return false
+        }
+        XCTAssertTrue(rejected)
+
+        let repaired = await store.prepareCodemapRootSessionRetry(
+            oldTicket,
+            rejection: .repositoryAuthorityChanged,
+            priority: .demand,
+            deadline: ContinuousClock.now.advanced(by: .seconds(5))
+        )
+        let replacement = try XCTUnwrap(repaired)
+        let replacementTicket = try XCTUnwrap(demandTicket(from: replacement.result))
+        addTeardownBlock { _ = await store.cancelCodemapArtifactDemand(replacementTicket) }
+        let replacementReady = await waitForDemandResult(store: store, ticket: replacementTicket) {
+            if case .ready = $0 { return true }
+            return false
+        }
+        XCTAssertTrue(replacementReady)
+        let repairCountAfterReset = await store.codemapRootSessionRepairCountForTesting()
+        XCTAssertEqual(repairCountAfterReset, 1)
+
+        let replay = await store.prepareCodemapRootSessionRetry(
+            oldTicket,
+            rejection: .repositoryAuthorityChanged,
+            priority: .demand,
+            deadline: ContinuousClock.now.advanced(by: .seconds(5))
+        )
+        XCTAssertNil(replay)
+        let repairCountAfterReplay = await store.codemapRootSessionRepairCountForTesting()
+        XCTAssertEqual(repairCountAfterReplay, 1)
+        let replacementStatus = await store.codemapArtifactDemandStatus(replacementTicket)
+        guard case .ready = replacementStatus else {
+            return XCTFail("The old ticket must not disturb the replacement session: \(replacementStatus)")
+        }
+    }
+
+    func testContinuedAuthorityChangesExhaustOneRootRepair() async throws {
+        let repositories = try ReviewGitRepositoryFixture(name: #function)
+        let root = try repositories.makeRepository(
+            named: "repository",
+            files: [
+                "Sources/First.swift": "struct First { func first() {} }\n",
+                "Sources/Second.swift": "struct Second { func second() {} }\n",
+                "Sources/Third.swift": "struct Third { func third() {} }\n",
+                "Notes.txt": "notes\n",
+                "Extra.txt": "extra\n"
+            ]
+        )
+        defer { repositories.cleanup() }
+        try repositories.write("notes changed\n", to: "Notes.txt", at: root)
+        try repositories.write("extra changed\n", to: "Extra.txt", at: root)
+        try repositories.settleIndex(at: root)
+        let advance = CodeStructureAuthorityAdvanceAfterReset(
+            repositories: repositories,
+            root: root,
+            relativePath: "Extra.txt"
+        )
+        let window = try await makeWindow(
+            root: root,
+            capabilityHooks: WorkspaceCodemapGitCapabilityServiceHooks(
+                afterSourcePathFingerprintCapture: { advance.observeIssuance() }
+            )
+        )
+        let store = window.workspaceFileContextStore
+        let initial = try await codeStructureDTO(window: window, root: root, path: "Sources/First.swift")
+        XCTAssertEqual(initial.status, "ready", "\(initial.issues)")
+
+        try repositories.stage("Notes.txt", at: root)
+        advance.arm()
+        let clock = ContinuousClock()
+        let started = clock.now
+        let exhausted = try await codeStructureDTO(window: window, root: root, path: "Sources/Second.swift")
+        let elapsed = clock.now - started
+
+        XCTAssertTrue(advance.didAdvance(), "The second authority change must land after the replacement registration.")
+        XCTAssertEqual(exhausted.status, "unavailable", "\(exhausted.issues)")
+        let issue = try XCTUnwrap(exhausted.issues.first)
+        XCTAssertEqual(issue.detail, "binding_rejected.repository_authority_changed")
+        XCTAssertTrue(issue.retryable)
+        XCTAssertLessThan(elapsed, .seconds(10))
+        let repairCount = await store.codemapRootSessionRepairCountForTesting()
+        XCTAssertEqual(repairCount, 1, "One operation may spend at most one root-session reset.")
+
+        let retried = try await codeStructureDTO(window: window, root: root, path: "Sources/Third.swift")
+        XCTAssertEqual(retried.status, "ready", "\(retried.issues)")
+        let repairCountAfterRetry = await store.codemapRootSessionRepairCountForTesting()
+        XCTAssertEqual(repairCountAfterRetry, 2)
+    }
+
+    func testCodeStructureToolSurvivesIndexAdvanceAndInterleavedStatus() async throws {
+        let repositories = try ReviewGitRepositoryFixture(name: #function)
+        var files = ["Notes.txt": "notes\n"]
+        for index in 0 ... 5 {
+            files["Sources/File\(index).swift"] = "struct File\(index) { func method\(index)() {} }\n"
+        }
+        let root = try repositories.makeRepository(named: "repository", files: files)
+        defer { repositories.cleanup() }
+        try repositories.write("notes changed\n", to: "Notes.txt", at: root)
+        try repositories.settleIndex(at: root)
+        let window = try await makeWindow(root: root)
+        let store = window.workspaceFileContextStore
+        let invoke = try await codeStructureToolInvoker(window: window)
+
+        let initial = try await invoke(root.appendingPathComponent("Sources/File0.swift").path)
+        XCTAssertEqual(initial.status, "ready", "\(initial.issues)")
+
+        try repositories.stage("Notes.txt", at: root)
+        for index in 1 ... 5 {
+            _ = try repositories.runGit(["status", "--porcelain"], at: root)
+            let reply = try await invoke(root.appendingPathComponent("Sources/File\(index).swift").path)
+            XCTAssertEqual(reply.status, "ready", "File\(index): \(reply.issues)")
+            XCTAssertFalse(
+                reply.issues.contains { $0.code == "artifact_unavailable" },
+                "File\(index): \(reply.issues)"
+            )
+            XCTAssertTrue(reply.issues.isEmpty, "File\(index): \(reply.issues)")
+        }
+        let repairCount = await store.codemapRootSessionRepairCountForTesting()
+        XCTAssertEqual(repairCount, 1)
+    }
+
+    func testRetainedProjectionPreloadStopsAfterIndexAdvanceAndForegroundRecoversOnce() async throws {
+        let repositories = try ReviewGitRepositoryFixture(name: #function)
+        var files = ["Notes.txt": "notes\n"]
+        for index in 0 ..< 20 {
+            files["Sources/File\(index).swift"] = "struct File\(index) { func method\(index)() {} }\n"
+        }
+        let root = try repositories.makeRepository(named: "repository", files: files)
+        defer { repositories.cleanup() }
+        try repositories.write("notes changed\n", to: "Notes.txt", at: root)
+        try repositories.settleIndex(at: root)
+        let stage = CodeStructureOneShotGitStage(repositories: repositories, root: root, relativePath: "Notes.txt")
+        let window = try await makeWindow(
+            root: root,
+            projectionPreloadLaunchPolicy: .enabled,
+            prepareStore: { store in
+                await store.setCodemapProjectionCatalogBuildHandlerForTesting { _ in
+                    stage.stageOnce()
+                }
+            }
+        )
+        let store = window.workspaceFileContextStore
+        let roots = await store.rootRefs(scope: .visibleWorkspace)
+        let rootID = try XCTUnwrap(roots.first?.id)
+
+        let clock = ContinuousClock()
+        let settleDeadline = clock.now.advanced(by: .seconds(8))
+        var settledCounters: WorkspaceCodemapBindingEngineCounters?
+        while clock.now < settleDeadline {
+            if stage.snapshot().didStage,
+               let counters = await store.codemapBindingEngineAccountingForTesting(rootID: rootID)?.counters,
+               counters.projectionRetries > 0
+               || counters.projectionCoveragesCancelled > 0
+               || counters.projectionCoveragesCompleted > 0
+            {
+                settledCounters = counters
+                break
+            }
+            try await Task.sleep(for: .milliseconds(25))
+        }
+        XCTAssertNil(stage.snapshot().error)
+        let before = try XCTUnwrap(settledCounters, "Projection preload never observed the staged index change.")
+        XCTAssertLessThanOrEqual(before.repositoryAuthorityChanges, 1)
+        let latchedStore = try await storePreloadState(store: store, rootID: rootID)
+        XCTAssertEqual(
+            latchedStore.launchPhase,
+            .handedOff,
+            "The handed-off launch stays current, so store triggers cannot relaunch it."
+        )
+        assertNoStorePreloadRetry(latchedStore)
+
+        try await Task.sleep(for: storePreloadRetryHorizon)
+        let idleStore = try await storePreloadState(store: store, rootID: rootID)
+        XCTAssertEqual(
+            idleStore,
+            latchedStore,
+            "No store event, relaunch, or timer retry may follow the latch within the maximum store backoff."
+        )
+        let afterIdleAccounting = await store.codemapBindingEngineAccountingForTesting(rootID: rootID)
+        let afterIdle = try XCTUnwrap(afterIdleAccounting?.counters)
+        XCTAssertEqual(afterIdle.capabilityResolutions, before.capabilityResolutions)
+        XCTAssertEqual(afterIdle.repositoryAuthorityChanges, before.repositoryAuthorityChanges)
+        XCTAssertEqual(
+            afterIdle.projectionRetries,
+            before.projectionRetries,
+            "A root-wide authority change must not keep the projection job in a timer retry loop."
+        )
+        XCTAssertEqual(
+            afterIdle.projectionPreloadsScheduled,
+            before.projectionPreloadsScheduled,
+            "A latched authority failure must not reschedule projection preload."
+        )
+        XCTAssertEqual(afterIdle.projectionPreloadsStarted, before.projectionPreloadsStarted)
+        XCTAssertEqual(afterIdle.manifestLoads, before.manifestLoads)
+        XCTAssertEqual(afterIdleAccounting?.projectionJobCount, 0)
+        let repairCountBeforeForeground = await store.codemapRootSessionRepairCountForTesting()
+        XCTAssertEqual(repairCountBeforeForeground, 0, "Background detection must not reset the root session.")
+
+        let foreground = try await codeStructureDTO(window: window, root: root, path: "Sources/File7.swift")
+        XCTAssertEqual(foreground.status, "ready", "\(foreground.issues)")
+        let repairCount = await store.codemapRootSessionRepairCountForTesting()
+        XCTAssertEqual(repairCount, 1)
+    }
+
+    func testReferrersExpansionFromRetainedSeedUsesColdProjection() async throws {
+        let repositories = try ReviewGitRepositoryFixture(name: #function)
+        let root = try repositories.makeRepository(
+            named: "repository",
+            files: [
+                "Sources/Source.swift": "struct Source {\n    let target: Target\n}\n",
+                "Sources/Target.swift": "struct Target { func targetMethod() {} }\n"
+            ]
+        )
+        addTeardownBlock { repositories.cleanup() }
+        try repositories.settleIndex(at: root)
+        let window = try await makeWindow(root: root)
+        let store = window.workspaceFileContextStore
+        let target = try await fileRecord(
+            at: root.appendingPathComponent("Sources/Target.swift"),
+            store: store,
+            rootScope: .visibleWorkspace
+        )
+        let targetTicket = try await readyTicket(store: store, fileID: target.id)
+        addTeardownBlock { _ = await store.cancelCodemapArtifactDemand(targetTicket) }
+
+        let reverse = try await window.mcpServer.buildCodeStructureDTO(
+            fromRecords: [target],
+            request: request(direction: .referrers, maximumDepth: 1),
+            includePathNotFoundIssue: true,
+            lookupContext: .visibleWorkspace
+        )
+
+        XCTAssertEqual(reverse.status, "ready", "\(reverse.issues)")
+        XCTAssertEqual(reverse.files.map(\.path), [
+            "repository/Sources/Target.swift",
+            "repository/Sources/Source.swift"
+        ])
+    }
+
+    func testReferrersExpansionFromRetainedSeedRecoversAfterIndexAdvance() async throws {
+        let repositories = try ReviewGitRepositoryFixture(name: #function)
+        let root = try repositories.makeRepository(
+            named: "repository",
+            files: [
+                "Sources/Source.swift": "struct Source {\n    let target: Target\n}\n",
+                "Sources/Target.swift": "struct Target { func targetMethod() {} }\n",
+                "Notes.txt": "notes\n"
+            ]
+        )
+        addTeardownBlock { repositories.cleanup() }
+        try repositories.write("notes changed\n", to: "Notes.txt", at: root)
+        try repositories.settleIndex(at: root)
+        let window = try await makeWindow(root: root)
+        let store = window.workspaceFileContextStore
+        let target = try await fileRecord(
+            at: root.appendingPathComponent("Sources/Target.swift"),
+            store: store,
+            rootScope: .visibleWorkspace
+        )
+        let targetTicket = try await readyTicket(store: store, fileID: target.id)
+        addTeardownBlock { _ = await store.cancelCodemapArtifactDemand(targetTicket) }
+
+        try repositories.stage("Notes.txt", at: root)
+        let clock = ContinuousClock()
+        let started = clock.now
+        let reverse = try await window.mcpServer.buildCodeStructureDTO(
+            fromRecords: [target],
+            request: request(direction: .referrers, maximumDepth: 1),
+            includePathNotFoundIssue: true,
+            lookupContext: .visibleWorkspace
+        )
+        let elapsed = clock.now - started
+        let repairCount = await store.codemapRootSessionRepairCountForTesting()
+        let targetStatus = await store.codemapArtifactDemandStatus(targetTicket)
+
+        XCTAssertEqual(reverse.status, "ready", "\(reverse.issues) repairs=\(repairCount)")
+        XCTAssertEqual(reverse.files.map(\.path), [
+            "repository/Sources/Target.swift",
+            "repository/Sources/Source.swift"
+        ])
+        XCTAssertLessThan(elapsed, .seconds(10))
+        XCTAssertEqual(repairCount, 1, "The projection authority failure must spend exactly one root reset.")
+        guard case .unavailable(.staleCurrentness) = targetStatus else {
+            return XCTFail("The retained pre-reset seed ticket must be stale: \(targetStatus)")
+        }
+
+        let repeated = try await window.mcpServer.buildCodeStructureDTO(
+            fromRecords: [target],
+            request: request(direction: .referrers, maximumDepth: 1),
+            includePathNotFoundIssue: true,
+            lookupContext: .visibleWorkspace
+        )
+        XCTAssertEqual(repeated.status, "ready", "\(repeated.issues)")
+        XCTAssertEqual(repeated.files.map(\.path), [
+            "repository/Sources/Target.swift",
+            "repository/Sources/Source.swift"
+        ])
+        let repairCountAfterRepeat = await store.codemapRootSessionRepairCountForTesting()
+        XCTAssertEqual(repairCountAfterRepeat, 1, "A later expansion on the replacement must not reset again.")
+    }
+
+    func testProjectionAuthorityFailurePersistsAcrossPollingAndResetsOnceByTicket() async throws {
+        let repositories = try ReviewGitRepositoryFixture(name: #function)
+        let root = try makeReferrersRepository(repositories)
+        addTeardownBlock { repositories.cleanup() }
+        let window = try await makeWindow(root: root)
+        let store = window.workspaceFileContextStore
+        let target = try await fileRecord(
+            at: root.appendingPathComponent("Sources/Target.swift"),
+            store: store,
+            rootScope: .visibleWorkspace
+        )
+        let targetTicket = try await readyTicket(store: store, fileID: target.id)
+        addTeardownBlock { _ = await store.cancelCodemapArtifactDemand(targetTicket) }
+
+        try repositories.stage("Notes.txt", at: root)
+        let acquisition = await store.acquireCodemapProjectionDemand(
+            sourceTickets: [targetTicket],
+            deadlineUptimeNanoseconds: codeStructureProjectionDeadline(after: .seconds(60))
+        )
+        guard case let .acquired(projectionTicket, _) = acquisition else {
+            return XCTFail("Expected a retained projection ticket: \(acquisition)")
+        }
+        addTeardownBlock { _ = await store.releaseCodemapProjectionDemand(projectionTicket) }
+        let failed = await waitForProjectionStatus(store: store, ticket: projectionTicket) {
+            self.isProjectionAuthorityFailure($0)
+        }
+        XCTAssertTrue(isProjectionAuthorityFailure(failed), "\(failed)")
+        guard isProjectionAuthorityFailure(failed) else { return }
+
+        let latched = try await engineAccounting(store: store)
+        XCTAssertEqual(latched.projectionJobCount, 0, "The latched failure must end the projection job.")
+        XCTAssertEqual(latched.counters.repositoryAuthorityChanges, 1)
+        let latchedActivity = CodeStructureProjectionActivity(latched.counters)
+        for _ in 0 ..< 20 {
+            let status = await store.codemapProjectionDemandStatus(projectionTicket)
+            XCTAssertTrue(isProjectionAuthorityFailure(status), "Polling must preserve the failure: \(status)")
+            try await Task.sleep(for: .milliseconds(25))
+        }
+        let reacquired = await store.acquireCodemapProjectionDemand(
+            sourceTickets: [targetTicket],
+            deadlineUptimeNanoseconds: codeStructureProjectionDeadline(after: .seconds(60))
+        )
+        guard case let .acquired(siblingTicket, siblingStatus) = reacquired else {
+            return XCTFail("A demand on the latched session must still carry a ticket: \(reacquired)")
+        }
+        addTeardownBlock { _ = await store.releaseCodemapProjectionDemand(siblingTicket) }
+        XCTAssertTrue(isProjectionAuthorityFailure(siblingStatus), "\(siblingStatus)")
+        let siblingPolled = await store.codemapProjectionDemandStatus(siblingTicket)
+        XCTAssertTrue(isProjectionAuthorityFailure(siblingPolled), "\(siblingPolled)")
+        let afterPolling = try await engineAccounting(store: store)
+        XCTAssertEqual(afterPolling.projectionJobCount, 0)
+        XCTAssertEqual(
+            CodeStructureProjectionActivity(afterPolling.counters),
+            latchedActivity,
+            "Polling and reacquisition must not schedule, reload, or recapture against the latched session."
+        )
+        let repairCountAfterPolling = await store.codemapRootSessionRepairCountForTesting()
+        XCTAssertEqual(repairCountAfterPolling, 0)
+
+        let wrongReason = await store.prepareCodemapProjectionRootSessionRetry(
+            projectionTicket,
+            reason: .capabilityUnavailable,
+            deadline: ContinuousClock.now.advanced(by: .seconds(5))
+        )
+        XCTAssertEqual(wrongReason, .stale)
+        let notRecoverable = await store.prepareCodemapProjectionRootSessionRetry(
+            projectionTicket,
+            reason: .generationMismatch,
+            deadline: ContinuousClock.now.advanced(by: .seconds(5))
+        )
+        XCTAssertEqual(notRecoverable, .stale)
+        let expired = await store.prepareCodemapProjectionRootSessionRetry(
+            projectionTicket,
+            reason: .repositoryAuthorityChanged,
+            deadline: ContinuousClock.now.advanced(by: .milliseconds(-1))
+        )
+        XCTAssertEqual(expired, .deadlineReached)
+        let cancelledCall = Task {
+            try? await Task.sleep(for: .seconds(30))
+            return await store.prepareCodemapProjectionRootSessionRetry(
+                projectionTicket,
+                reason: .repositoryAuthorityChanged,
+                deadline: ContinuousClock.now.advanced(by: .seconds(5))
+            )
+        }
+        cancelledCall.cancel()
+        let cancelled = await cancelledCall.value
+        XCTAssertEqual(cancelled, .cancelled)
+        let repairCountAfterRefusals = await store.codemapRootSessionRepairCountForTesting()
+        XCTAssertEqual(repairCountAfterRefusals, 0, "Refused preparations must not detach.")
+
+        let prepared = await store.prepareCodemapProjectionRootSessionRetry(
+            projectionTicket,
+            reason: .repositoryAuthorityChanged,
+            deadline: ContinuousClock.now.advanced(by: .seconds(5))
+        )
+        XCTAssertEqual(prepared, .prepared)
+        let replay = await store.prepareCodemapProjectionRootSessionRetry(
+            projectionTicket,
+            reason: .repositoryAuthorityChanged,
+            deadline: ContinuousClock.now.advanced(by: .seconds(5))
+        )
+        XCTAssertEqual(replay, .stale)
+        let siblingReset = await store.prepareCodemapProjectionRootSessionRetry(
+            siblingTicket,
+            reason: .repositoryAuthorityChanged,
+            deadline: ContinuousClock.now.advanced(by: .seconds(5))
+        )
+        XCTAssertEqual(siblingReset, .stale, "Detachment removes every projection record for the root.")
+        let repairCountAfterReset = await store.codemapRootSessionRepairCountForTesting()
+        XCTAssertEqual(repairCountAfterReset, 1)
+        let oldProjectionStatus = await store.codemapProjectionDemandStatus(projectionTicket)
+        XCTAssertEqual(oldProjectionStatus, .stale)
+        let targetStatus = await store.codemapArtifactDemandStatus(targetTicket)
+        guard case .unavailable(.staleCurrentness) = targetStatus else {
+            return XCTFail("The pre-reset seed ticket must be stale: \(targetStatus)")
+        }
+
+        let reverse = try await referrersDTO(window: window, record: target)
+        XCTAssertEqual(reverse.status, "ready", "\(reverse.issues)")
+        XCTAssertEqual(reverse.files.map(\.path), referrerPaths)
+        let repairCountAfterExpansion = await store.codemapRootSessionRepairCountForTesting()
+        XCTAssertEqual(repairCountAfterExpansion, 1)
+    }
+
+    func testBackgroundProjectionDriftStaysIdleUntilForegroundAcquisitionRepairsOnce() async throws {
+        let repositories = try ReviewGitRepositoryFixture(name: #function)
+        let root = try makeReferrersRepository(repositories)
+        addTeardownBlock { repositories.cleanup() }
+        // Hold the background preload launch until the retained seed is ready and the index moved.
+        let launchGate = CodeStructureOpenGate()
+        addTeardownBlock { launchGate.open() }
+        let window = try await makeWindow(
+            root: root,
+            projectionPreloadLaunchPolicy: .enabled,
+            prepareStore: { store in
+                await store.setCodemapProjectionPreloadStartHandlerForTesting { _ in
+                    await launchGate.waitUntilOpened()
+                }
+            }
+        )
+        let store = window.workspaceFileContextStore
+        let target = try await fileRecord(
+            at: root.appendingPathComponent("Sources/Target.swift"),
+            store: store,
+            rootScope: .visibleWorkspace
+        )
+        let targetTicket = try await readyTicket(store: store, fileID: target.id)
+        addTeardownBlock { _ = await store.cancelCodemapArtifactDemand(targetTicket) }
+
+        try repositories.stage("Notes.txt", at: root)
+        launchGate.open()
+        let detected = try await waitForEngineAccounting(store: store) {
+            $0.counters.repositoryAuthorityChanges >= 1 && $0.projectionJobCount == 0
+        }
+        XCTAssertTrue(launchGate.didHoldCaller(), "The background preload launch must start behind the gate.")
+        XCTAssertEqual(detected.counters.repositoryAuthorityChanges, 1, "Preload must detect the drift once.")
+        XCTAssertEqual(detected.projectionJobCount, 0)
+        XCTAssertGreaterThanOrEqual(detected.counters.projectionCoveragesCancelled, 1)
+        let detectedActivity = CodeStructureProjectionActivity(detected.counters)
+        let rootID = targetTicket.rootEpoch.rootID
+        let detectedStore = try await storePreloadState(store: store, rootID: rootID)
+        XCTAssertEqual(detectedStore.launchPhase, .handedOff)
+        assertNoStorePreloadRetry(detectedStore)
+
+        try await Task.sleep(for: storePreloadRetryHorizon)
+        let idleStore = try await storePreloadState(store: store, rootID: rootID)
+        XCTAssertEqual(
+            idleStore,
+            detectedStore,
+            "No store event, relaunch, or timer retry may follow the latch within the maximum store backoff."
+        )
+        let idle = try await engineAccounting(store: store)
+        XCTAssertEqual(idle.projectionJobCount, 0)
+        XCTAssertEqual(
+            CodeStructureProjectionActivity(idle.counters),
+            detectedActivity,
+            "A latched background failure must stay idle without rescheduling."
+        )
+        let repairCountWhileIdle = await store.codemapRootSessionRepairCountForTesting()
+        XCTAssertEqual(repairCountWhileIdle, 0, "Background detection must not reset the root session.")
+        let retainedSeed = await store.codemapArtifactDemandStatus(targetTicket)
+        guard case .ready = retainedSeed else {
+            return XCTFail("No autonomous reset may disturb the retained seed: \(retainedSeed)")
+        }
+
+        let acquisition = await store.acquireCodemapProjectionDemand(
+            sourceTickets: [targetTicket],
+            deadlineUptimeNanoseconds: codeStructureProjectionDeadline(after: .seconds(60))
+        )
+        guard case let .acquired(projectionTicket, status) = acquisition else {
+            return XCTFail("Acquisition after drift must return a ticket-bearing failure: \(acquisition)")
+        }
+        XCTAssertTrue(isProjectionAuthorityFailure(status), "\(status)")
+        _ = await store.releaseCodemapProjectionDemand(projectionTicket)
+        let afterAcquisition = try await engineAccounting(store: store)
+        XCTAssertEqual(CodeStructureProjectionActivity(afterAcquisition.counters), detectedActivity)
+
+        let reverse = try await referrersDTO(window: window, record: target)
+        XCTAssertEqual(reverse.status, "ready", "\(reverse.issues)")
+        XCTAssertEqual(reverse.files.map(\.path), referrerPaths)
+        let repairCount = await store.codemapRootSessionRepairCountForTesting()
+        XCTAssertEqual(repairCount, 1, "The foreground expansion must spend exactly one reset.")
+        let targetStatus = await store.codemapArtifactDemandStatus(targetTicket)
+        guard case .unavailable(.staleCurrentness) = targetStatus else {
+            return XCTFail("The retained pre-reset seed ticket must be stale: \(targetStatus)")
+        }
+    }
+
+    /// A store preload launch that reaches an already-latched session receives the engine's
+    /// `.cancelled` disposition. The store must finish the launch as cancelled and schedule no retry.
+    func testStorePreloadLaunchOnLatchedSessionFinishesCancelledWithoutRetry() async throws {
+        let repositories = try ReviewGitRepositoryFixture(name: #function)
+        let root = try makeReferrersRepository(repositories)
+        addTeardownBlock { repositories.cleanup() }
+        // Hold the background launch before eligibility until a foreground demand latched the session.
+        let launchGate = CodeStructureOpenGate()
+        addTeardownBlock { launchGate.open() }
+        let window = try await makeWindow(
+            root: root,
+            projectionPreloadLaunchPolicy: .enabled,
+            prepareStore: { store in
+                await store.setCodemapProjectionPreloadStartHandlerForTesting { _ in
+                    await launchGate.waitUntilOpened()
+                }
+            }
+        )
+        let store = window.workspaceFileContextStore
+        let target = try await fileRecord(
+            at: root.appendingPathComponent("Sources/Target.swift"),
+            store: store,
+            rootScope: .visibleWorkspace
+        )
+        let targetTicket = try await readyTicket(store: store, fileID: target.id)
+        addTeardownBlock { _ = await store.cancelCodemapArtifactDemand(targetTicket) }
+        let rootEpoch = targetTicket.rootEpoch
+
+        try repositories.stage("Notes.txt", at: root)
+        let acquisition = await store.acquireCodemapProjectionDemand(
+            sourceTickets: [targetTicket],
+            deadlineUptimeNanoseconds: codeStructureProjectionDeadline(after: .seconds(60))
+        )
+        guard case let .acquired(projectionTicket, _) = acquisition else {
+            return XCTFail("Expected a retained projection ticket: \(acquisition)")
+        }
+        addTeardownBlock { _ = await store.releaseCodemapProjectionDemand(projectionTicket) }
+        let failed = await waitForProjectionStatus(store: store, ticket: projectionTicket) {
+            self.isProjectionAuthorityFailure($0)
+        }
+        XCTAssertTrue(isProjectionAuthorityFailure(failed), "\(failed)")
+        guard isProjectionAuthorityFailure(failed) else { return }
+        let latched = try await engineAccounting(store: store)
+        XCTAssertEqual(latched.projectionJobCount, 0)
+        let heldPhase = await store.codemapProjectionPreloadLaunchPhaseForTesting(rootEpoch: rootEpoch)
+        XCTAssertEqual(heldPhase, .eligibilityQueued, "The background launch must still be held.")
+
+        launchGate.open()
+        let finishedPhase = await waitForPreloadLaunchPhase(store: store, rootEpoch: rootEpoch) {
+            $0 == .cancelled
+        }
+
+        XCTAssertTrue(launchGate.didHoldCaller())
+        XCTAssertEqual(finishedPhase, .cancelled, "The latched engine must refuse the launch.")
+        let cancelledStore = try await storePreloadState(store: store, rootID: rootEpoch.rootID)
+        XCTAssertEqual(
+            Array(cancelledStore.events.map(\.kind).suffix(2)),
+            [.engineScheduling, .cancelled],
+            "The launch reached engine scheduling and finished cancelled."
+        )
+        assertNoStorePreloadRetry(cancelledStore)
+        let afterCancelled = try await engineAccounting(store: store)
+        XCTAssertEqual(afterCancelled.projectionJobCount, 0)
+        XCTAssertEqual(
+            CodeStructureProjectionActivity(afterCancelled.counters),
+            CodeStructureProjectionActivity(latched.counters),
+            "The refused launch must not schedule, reload, or recapture."
+        )
+
+        try await Task.sleep(for: storePreloadRetryHorizon)
+        let idleStore = try await storePreloadState(store: store, rootID: rootEpoch.rootID)
+        XCTAssertEqual(
+            idleStore,
+            cancelledStore,
+            "A cancelled launch must not relaunch or retry within the maximum store backoff."
+        )
+        let idle = try await engineAccounting(store: store)
+        XCTAssertEqual(
+            CodeStructureProjectionActivity(idle.counters),
+            CodeStructureProjectionActivity(latched.counters)
+        )
+        let repairCountWhileIdle = await store.codemapRootSessionRepairCountForTesting()
+        XCTAssertEqual(repairCountWhileIdle, 0, "A cancelled background launch must not reset the root session.")
+
+        let reverse = try await referrersDTO(window: window, record: target)
+        XCTAssertEqual(reverse.status, "ready", "\(reverse.issues)")
+        XCTAssertEqual(reverse.files.map(\.path), referrerPaths)
+        let repairCount = await store.codemapRootSessionRepairCountForTesting()
+        XCTAssertEqual(repairCount, 1, "The foreground expansion must spend exactly one reset.")
+    }
+
+    func testSeedRepairThenProjectionFailureShareOneRootResetBudget() async throws {
+        let repositories = try ReviewGitRepositoryFixture(name: #function)
+        let root = try makeReferrersRepository(
+            repositories,
+            extraFiles: ["Sources/First.swift": "struct First { func first() {} }\n"],
+            modifiedFiles: ["Notes.txt", "Extra.txt"]
+        )
+        addTeardownBlock { repositories.cleanup() }
+        // Armed issuances: #1 seed on the original session (rejected), #2 seed on the replacement
+        // (accepted), #3 the replacement's first cold-projection candidate (observes Extra.txt).
+        let advance = CodeStructureAuthorityAdvanceAfterReset(
+            repositories: repositories,
+            root: root,
+            relativePath: "Extra.txt",
+            onIssuance: 3
+        )
+        let window = try await makeWindow(
+            root: root,
+            capabilityHooks: WorkspaceCodemapGitCapabilityServiceHooks(
+                afterSourcePathFingerprintCapture: { advance.observeIssuance() }
+            )
+        )
+        let store = window.workspaceFileContextStore
+        let initial = try await codeStructureDTO(window: window, root: root, path: "Sources/First.swift")
+        XCTAssertEqual(initial.status, "ready", "\(initial.issues)")
+        let target = try await fileRecord(
+            at: root.appendingPathComponent("Sources/Target.swift"),
+            store: store,
+            rootScope: .visibleWorkspace
+        )
+
+        try repositories.stage("Notes.txt", at: root)
+        advance.arm()
+        let clock = ContinuousClock()
+        let started = clock.now
+        let exhausted = try await referrersDTO(window: window, record: target)
+        let elapsed = clock.now - started
+
+        XCTAssertTrue(advance.didAdvance(), "The second change must land on the replacement's projection.")
+        XCTAssertEqual(exhausted.status, "unavailable", "\(exhausted.issues)")
+        let issue = try XCTUnwrap(exhausted.issues.first)
+        XCTAssertEqual(issue.code, "projection_unavailable", "\(exhausted.issues)")
+        XCTAssertTrue(issue.retryable)
+        XCTAssertLessThan(elapsed, .seconds(10))
+        let repairCount = await store.codemapRootSessionRepairCountForTesting()
+        XCTAssertEqual(repairCount, 1, "Seed and projection recovery share one reset per root per operation.")
+
+        let retried = try await referrersDTO(window: window, record: target)
+        XCTAssertEqual(retried.status, "ready", "\(retried.issues)")
+        XCTAssertEqual(retried.files.map(\.path), referrerPaths)
+        let repairCountAfterRetry = await store.codemapRootSessionRepairCountForTesting()
+        XCTAssertEqual(repairCountAfterRetry, 2)
+    }
+
+    func testProjectionRepairThenSeedRejectionShareOneRootResetBudget() async throws {
+        let repositories = try ReviewGitRepositoryFixture(name: #function)
+        let root = try makeReferrersRepository(repositories, modifiedFiles: ["Notes.txt", "Extra.txt"])
+        addTeardownBlock { repositories.cleanup() }
+        // Armed issuances: #1 the original session's projection candidate (rejected, projection
+        // reset), #2 the restarted attempt's seed on the replacement (observes Extra.txt).
+        let advance = CodeStructureAuthorityAdvanceAfterReset(
+            repositories: repositories,
+            root: root,
+            relativePath: "Extra.txt"
+        )
+        let window = try await makeWindow(
+            root: root,
+            capabilityHooks: WorkspaceCodemapGitCapabilityServiceHooks(
+                afterSourcePathFingerprintCapture: { advance.observeIssuance() }
+            )
+        )
+        let store = window.workspaceFileContextStore
+        let target = try await fileRecord(
+            at: root.appendingPathComponent("Sources/Target.swift"),
+            store: store,
+            rootScope: .visibleWorkspace
+        )
+        let targetTicket = try await readyTicket(store: store, fileID: target.id)
+        addTeardownBlock { _ = await store.cancelCodemapArtifactDemand(targetTicket) }
+        let before = try await engineCounters(store: store)
+
+        try repositories.stage("Notes.txt", at: root)
+        advance.arm()
+        let clock = ContinuousClock()
+        let started = clock.now
+        let exhausted = try await referrersDTO(window: window, record: target)
+        let elapsed = clock.now - started
+
+        XCTAssertTrue(advance.didAdvance(), "The second change must land on the replacement's seed.")
+        XCTAssertEqual(exhausted.status, "unavailable", "\(exhausted.issues)")
+        let issue = try XCTUnwrap(exhausted.issues.first)
+        XCTAssertEqual(issue.detail, "binding_rejected.repository_authority_changed", "\(exhausted.issues)")
+        XCTAssertTrue(issue.retryable)
+        XCTAssertLessThan(elapsed, .seconds(10))
+        let repairCount = await store.codemapRootSessionRepairCountForTesting()
+        XCTAssertEqual(repairCount, 1, "Projection and seed recovery share one reset per root per operation.")
+        let after = try await engineCounters(store: store)
+        XCTAssertGreaterThan(
+            after.projectionCoveragesCancelled,
+            before.projectionCoveragesCancelled,
+            "The original session's projection must observe the first change before the seed path."
+        )
+
+        let retried = try await referrersDTO(window: window, record: target)
+        XCTAssertEqual(retried.status, "ready", "\(retried.issues)")
+        XCTAssertEqual(retried.files.map(\.path), referrerPaths)
+        let repairCountAfterRetry = await store.codemapRootSessionRepairCountForTesting()
+        XCTAssertEqual(repairCountAfterRetry, 2)
+    }
+
+    /// A projection reset spent on the operation's last publication attempt cannot restart, so the
+    /// result must keep the typed projection cause and retry guidance, not a borrowed stale reason.
+    func testProjectionResetOnFinalPublicationAttemptKeepsTypedUnavailable() async throws {
+        let repositories = try ReviewGitRepositoryFixture(name: #function)
+        let root = try makeReferrersRepository(repositories)
+        addTeardownBlock { repositories.cleanup() }
+        let window = try await makeWindow(root: root)
+        let store = window.workspaceFileContextStore
+        let target = try await fileRecord(
+            at: root.appendingPathComponent("Sources/Target.swift"),
+            store: store,
+            rootScope: .visibleWorkspace
+        )
+        let targetTicket = try await readyTicket(store: store, fileID: target.id)
+        addTeardownBlock { _ = await store.cancelCodemapArtifactDemand(targetTicket) }
+        let before = try await engineCounters(store: store)
+
+        try repositories.stage("Notes.txt", at: root)
+        let structureAttempts = CodemapLockedValues<Int>()
+        let coordinator = WorkspaceCodemapPresentationCoordinator(
+            store: store,
+            policy: WorkspaceCodemapPresentationRequestPolicy(maximumStructurePublicationAttempts: 1),
+            structureAttemptDidBegin: { structureAttempts.append($0) }
+        )
+        let exhausted = try await coordinator.structurePresentation(
+            seedFileIDs: [target.id],
+            direction: .referrers,
+            traversalLimits: WorkspaceCodemapStructureTraversalLimits(
+                maximumDepth: 1,
+                maximumNodeCount: 10,
+                maximumEdgeCount: 500,
+                maximumByteCount: 8 * 1024 * 1024
+            ),
+            outputLimits: WorkspaceCodemapStructureOutputLimits(
+                maximumFileCount: 10,
+                maximumCodemapTokenCount: 6000
+            ),
+            rootScope: .visibleWorkspace
+        )
+
+        XCTAssertEqual(structureAttempts.values, [0], "The cap leaves no attempt for the restart.")
+        XCTAssertEqual(exhausted.outcome, .unavailable, "\(exhausted.issues)")
+        XCTAssertEqual(
+            exhausted.issues,
+            [.projectionUnavailable(reason: .repositoryAuthorityChanged, retryAfterMilliseconds: 100)],
+            "The spent projection reset must surface its typed cause, not publication staleness."
+        )
+        let repairCount = await store.codemapRootSessionRepairCountForTesting()
+        XCTAssertEqual(repairCount, 1, "The final attempt still spends exactly one root reset.")
+
+        let dto = MCPServerViewModel.codeStructureReplyDTO(
+            presentation: exhausted,
+            logicalPathsByFileID: [target.id: "repository/Sources/Target.swift"],
+            worktreeScope: nil
+        )
+        XCTAssertEqual(dto.status, "unavailable")
+        XCTAssertEqual(dto.issues.map(\.code), ["projection_unavailable"])
+        let issue = try XCTUnwrap(dto.issues.first)
+        XCTAssertTrue(issue.retryable)
+        XCTAssertEqual(issue.retryAfterMilliseconds, 100)
+        XCTAssertNotNil(dto.retry)
+        XCTAssertEqual(
+            issue.message,
+            "Repository authority changed during codemap projection; retry the request."
+        )
+
+        let retried = try await referrersDTO(window: window, record: target)
+        XCTAssertEqual(retried.status, "ready", "\(retried.issues)")
+        XCTAssertEqual(retried.files.map(\.path), referrerPaths)
+        let repairCountAfterRetry = await store.codemapRootSessionRepairCountForTesting()
+        XCTAssertEqual(repairCountAfterRetry, 1, "Following the retry guidance must not reset again.")
+        // The reset detaches the session, so engine counters are read once the retry replaced it.
+        let after = try await engineCounters(store: store)
+        XCTAssertGreaterThan(
+            after.projectionCoveragesCancelled,
+            before.projectionCoveragesCancelled,
+            "The original session's projection, not the seed path, must observe the change."
+        )
+    }
+
+    func testConcurrentExpansionsObservingOneProjectionFailureDetachOnce() async throws {
+        let repositories = try ReviewGitRepositoryFixture(name: #function)
+        let root = try makeReferrersRepository(repositories)
+        addTeardownBlock { repositories.cleanup() }
+        let pause = CodeStructureOneShotIssuancePause()
+        addTeardownBlock { pause.release() }
+        let window = try await makeWindow(
+            root: root,
+            capabilityHooks: WorkspaceCodemapGitCapabilityServiceHooks(
+                afterSourcePathFingerprintCapture: { await pause.observeIssuance() }
+            )
+        )
+        let store = window.workspaceFileContextStore
+        let target = try await fileRecord(
+            at: root.appendingPathComponent("Sources/Target.swift"),
+            store: store,
+            rootScope: .visibleWorkspace
+        )
+        let targetTicket = try await readyTicket(store: store, fileID: target.id)
+        addTeardownBlock { _ = await store.cancelCodemapArtifactDemand(targetTicket) }
+
+        try repositories.stage("Notes.txt", at: root)
+        pause.arm()
+        let mcpServer = window.mcpServer
+        let referrersRequest = request(direction: .referrers, maximumDepth: 1)
+        async let first = mcpServer.buildCodeStructureDTO(
+            fromRecords: [target],
+            request: referrersRequest,
+            includePathNotFoundIssue: true,
+            lookupContext: .visibleWorkspace
+        )
+        async let second = mcpServer.buildCodeStructureDTO(
+            fromRecords: [target],
+            request: referrersRequest,
+            includePathNotFoundIssue: true,
+            lookupContext: .visibleWorkspace
+        )
+        let parked = await pause.waitUntilParked()
+        let joined = try await waitForEngineAccounting(store: store) {
+            $0.retainedProjectionDemandCount >= 2
+        }
+        XCTAssertTrue(parked, "The shared projection worker must park at its authority capture.")
+        XCTAssertEqual(
+            joined.retainedProjectionDemandCount,
+            2,
+            "Both operations must hold projection tickets on the same session before it fails."
+        )
+        pause.release()
+        let (firstDTO, secondDTO) = try await (first, second)
+
+        XCTAssertEqual(firstDTO.status, "ready", "\(firstDTO.issues)")
+        XCTAssertEqual(secondDTO.status, "ready", "\(secondDTO.issues)")
+        XCTAssertEqual(firstDTO.files.map(\.path), referrerPaths)
+        XCTAssertEqual(secondDTO.files.map(\.path), referrerPaths)
+        let repairCount = await store.codemapRootSessionRepairCountForTesting()
+        XCTAssertEqual(repairCount, 1, "Only one operation may detach; the other's ticket is stale.")
+        let targetStatus = await store.codemapArtifactDemandStatus(targetTicket)
+        guard case .unavailable(.staleCurrentness) = targetStatus else {
+            return XCTFail("The retained pre-reset seed ticket must be stale: \(targetStatus)")
+        }
+    }
+
+    func testOldProjectionWorkerAndTicketCannotDisturbReplacementSession() async throws {
+        let repositories = try ReviewGitRepositoryFixture(name: #function)
+        let root = try makeReferrersRepository(
+            repositories,
+            extraFiles: ["Sources/Second.swift": "struct Second { func second() {} }\n"]
+        )
+        addTeardownBlock { repositories.cleanup() }
+        let pause = CodeStructureOneShotIssuancePause()
+        addTeardownBlock { pause.release() }
+        let window = try await makeWindow(
+            root: root,
+            capabilityHooks: WorkspaceCodemapGitCapabilityServiceHooks(
+                afterSourcePathFingerprintCapture: { await pause.observeIssuance() }
+            )
+        )
+        let store = window.workspaceFileContextStore
+        let target = try await fileRecord(
+            at: root.appendingPathComponent("Sources/Target.swift"),
+            store: store,
+            rootScope: .visibleWorkspace
+        )
+        let second = try await fileRecord(
+            at: root.appendingPathComponent("Sources/Second.swift"),
+            store: store,
+            rootScope: .visibleWorkspace
+        )
+        let targetTicket = try await readyTicket(store: store, fileID: target.id)
+        addTeardownBlock { _ = await store.cancelCodemapArtifactDemand(targetTicket) }
+
+        pause.arm()
+        let acquisition = await store.acquireCodemapProjectionDemand(
+            sourceTickets: [targetTicket],
+            deadlineUptimeNanoseconds: codeStructureProjectionDeadline(after: .seconds(60))
+        )
+        guard case let .acquired(oldProjectionTicket, _) = acquisition else {
+            return XCTFail("Expected a retained projection ticket: \(acquisition)")
+        }
+        addTeardownBlock { _ = await store.releaseCodemapProjectionDemand(oldProjectionTicket) }
+        let parked = await pause.waitUntilParked()
+        XCTAssertTrue(parked, "The original session's projection worker must park at its authority capture.")
+        guard parked else { return }
+
+        try repositories.stage("Notes.txt", at: root)
+        let requested = await store.requestCodemapArtifactWithOwnership(forFileID: second.id)
+        guard case let .pending(oldSecondTicket) = requested.result else {
+            return XCTFail("Expected a pending demand, got \(requested.result)")
+        }
+        let rejected = await waitForDemandResult(store: store, ticket: oldSecondTicket) {
+            if case .unavailable(.rejected(.repositoryAuthorityChanged)) = $0 { return true }
+            return false
+        }
+        XCTAssertTrue(rejected)
+        let repaired = await store.prepareCodemapRootSessionRetry(
+            oldSecondTicket,
+            rejection: .repositoryAuthorityChanged,
+            priority: .demand,
+            deadline: ContinuousClock.now.advanced(by: .seconds(5))
+        )
+        let replacement = try XCTUnwrap(repaired)
+        let replacementSecondTicket = try XCTUnwrap(demandTicket(from: replacement.result))
+        addTeardownBlock { _ = await store.cancelCodemapArtifactDemand(replacementSecondTicket) }
+        let replacementSecondReady = await waitForDemandResult(store: store, ticket: replacementSecondTicket) {
+            if case .ready = $0 { return true }
+            return false
+        }
+        XCTAssertTrue(replacementSecondReady)
+        let repairCountAfterReset = await store.codemapRootSessionRepairCountForTesting()
+        XCTAssertEqual(repairCountAfterReset, 1)
+        let oldProjectionStatus = await store.codemapProjectionDemandStatus(oldProjectionTicket)
+        XCTAssertEqual(oldProjectionStatus, .stale)
+        let beforeRelease = try await engineCounters(store: store)
+
+        pause.release()
+        let replacementTargetTicket = try await readyTicket(store: store, fileID: target.id)
+        addTeardownBlock { _ = await store.cancelCodemapArtifactDemand(replacementTargetTicket) }
+        let replacementAcquisition = await store.acquireCodemapProjectionDemand(
+            sourceTickets: [replacementTargetTicket],
+            deadlineUptimeNanoseconds: codeStructureProjectionDeadline(after: .seconds(60))
+        )
+        guard case let .acquired(replacementProjectionTicket, _) = replacementAcquisition else {
+            return XCTFail("Expected a replacement projection ticket: \(replacementAcquisition)")
+        }
+        addTeardownBlock { _ = await store.releaseCodemapProjectionDemand(replacementProjectionTicket) }
+        let replacementStatus = await waitForProjectionStatus(store: store, ticket: replacementProjectionTicket) {
+            if case .ready = $0 { return true }
+            return false
+        }
+        guard case .ready = replacementStatus else {
+            return XCTFail("The released old worker must neither latch nor cancel the replacement: \(replacementStatus)")
+        }
+        let drained = try await waitForEngineAccounting(store: store) { $0.drainingProjectionTaskCount == 0 }
+        XCTAssertEqual(drained.drainingProjectionTaskCount, 0)
+        XCTAssertEqual(
+            drained.counters.repositoryAuthorityChanges,
+            beforeRelease.repositoryAuthorityChanges,
+            "The old worker's capture result must be fenced before it is recorded."
+        )
+
+        let staleReset = await store.prepareCodemapProjectionRootSessionRetry(
+            oldProjectionTicket,
+            reason: .repositoryAuthorityChanged,
+            deadline: ContinuousClock.now.advanced(by: .seconds(5))
+        )
+        XCTAssertEqual(staleReset, .stale)
+        let repairCountAfterStaleReset = await store.codemapRootSessionRepairCountForTesting()
+        XCTAssertEqual(repairCountAfterStaleReset, 1)
+        let replacementAfterStaleReset = await store.codemapProjectionDemandStatus(replacementProjectionTicket)
+        guard case .ready = replacementAfterStaleReset else {
+            return XCTFail("An old ticket must not disturb the replacement: \(replacementAfterStaleReset)")
+        }
+    }
+
+    func testProjectionRootSessionResetHonorsDeadlineWhileSharedCleanupIsPaused() async throws {
+        let repositories = try ReviewGitRepositoryFixture(name: #function)
+        let root = try makeReferrersRepository(
+            repositories,
+            extraFiles: ["Sources/Other.swift": "struct Other { func other() {} }\n"]
+        )
+        addTeardownBlock { repositories.cleanup() }
+        let pause = CodeStructureDemandResultPause()
+        addTeardownBlock { pause.release() }
+        let window = try await makeWindow(
+            root: root,
+            codemapDemandResultHook: { ticket, result in
+                await pause.transform(ticket: ticket, result: result)
+            }
+        )
+        let store = window.workspaceFileContextStore
+        let target = try await fileRecord(
+            at: root.appendingPathComponent("Sources/Target.swift"),
+            store: store,
+            rootScope: .visibleWorkspace
+        )
+        let other = try await fileRecord(
+            at: root.appendingPathComponent("Sources/Other.swift"),
+            store: store,
+            rootScope: .visibleWorkspace
+        )
+        let targetTicket = try await readyTicket(store: store, fileID: target.id)
+        addTeardownBlock { _ = await store.cancelCodemapArtifactDemand(targetTicket) }
+
+        try repositories.stage("Notes.txt", at: root)
+        let acquisition = await store.acquireCodemapProjectionDemand(
+            sourceTickets: [targetTicket],
+            deadlineUptimeNanoseconds: codeStructureProjectionDeadline(after: .seconds(60))
+        )
+        guard case let .acquired(projectionTicket, _) = acquisition else {
+            return XCTFail("Expected a retained projection ticket: \(acquisition)")
+        }
+        addTeardownBlock { _ = await store.releaseCodemapProjectionDemand(projectionTicket) }
+        let failed = await waitForProjectionStatus(store: store, ticket: projectionTicket) {
+            self.isProjectionAuthorityFailure($0)
+        }
+        XCTAssertTrue(isProjectionAuthorityFailure(failed), "\(failed)")
+        guard isProjectionAuthorityFailure(failed) else { return }
+
+        // A demand task parked in its result hook keeps the shared detach cleanup in flight.
+        pause.pause(fileID: other.id)
+        let requested = await store.requestCodemapArtifactWithOwnership(forFileID: other.id)
+        guard case let .pending(otherTicket) = requested.result else {
+            return XCTFail("Expected a pending demand, got \(requested.result)")
+        }
+        addTeardownBlock { _ = await store.cancelCodemapArtifactDemand(otherTicket) }
+        let parked = await pause.waitUntilParked()
+        XCTAssertTrue(parked)
+        guard parked else { return }
+
+        let clock = ContinuousClock()
+        let started = clock.now
+        let outcome = await store.prepareCodemapProjectionRootSessionRetry(
+            projectionTicket,
+            reason: .repositoryAuthorityChanged,
+            deadline: clock.now.advanced(by: .milliseconds(300))
+        )
+        let elapsed = clock.now - started
+        XCTAssertEqual(outcome, .deadlineReached)
+        XCTAssertLessThan(elapsed, .seconds(3), "The caller's deadline must bound the shared cleanup wait.")
+        let repairCount = await store.codemapRootSessionRepairCountForTesting()
+        XCTAssertEqual(repairCount, 1)
+        let replay = await store.prepareCodemapProjectionRootSessionRetry(
+            projectionTicket,
+            reason: .repositoryAuthorityChanged,
+            deadline: ContinuousClock.now.advanced(by: .seconds(5))
+        )
+        XCTAssertEqual(replay, .stale)
+
+        pause.release()
+        let reverse = try await referrersDTO(window: window, record: target)
+        XCTAssertEqual(reverse.status, "ready", "\(reverse.issues)")
+        XCTAssertEqual(reverse.files.map(\.path), referrerPaths)
+        let repairCountAfterExpansion = await store.codemapRootSessionRepairCountForTesting()
+        XCTAssertEqual(repairCountAfterExpansion, 1, "Completed shared cleanup must not need another reset.")
+        let accounting = try await engineAccounting(store: store)
+        XCTAssertEqual(accounting.retainedProjectionDemandCount, 0)
+    }
+
+    func testCancelledExpansionStopsWaitingWhileSharedCleanupContinues() async throws {
+        let repositories = try ReviewGitRepositoryFixture(name: #function)
+        let root = try makeReferrersRepository(
+            repositories,
+            extraFiles: ["Sources/Other.swift": "struct Other { func other() {} }\n"]
+        )
+        addTeardownBlock { repositories.cleanup() }
+        let pause = CodeStructureDemandResultPause()
+        addTeardownBlock { pause.release() }
+        let window = try await makeWindow(
+            root: root,
+            codemapDemandResultHook: { ticket, result in
+                await pause.transform(ticket: ticket, result: result)
+            }
+        )
+        let store = window.workspaceFileContextStore
+        let target = try await fileRecord(
+            at: root.appendingPathComponent("Sources/Target.swift"),
+            store: store,
+            rootScope: .visibleWorkspace
+        )
+        let other = try await fileRecord(
+            at: root.appendingPathComponent("Sources/Other.swift"),
+            store: store,
+            rootScope: .visibleWorkspace
+        )
+        let targetTicket = try await readyTicket(store: store, fileID: target.id)
+        addTeardownBlock { _ = await store.cancelCodemapArtifactDemand(targetTicket) }
+
+        try repositories.stage("Notes.txt", at: root)
+        pause.pause(fileID: other.id)
+        let requested = await store.requestCodemapArtifactWithOwnership(forFileID: other.id)
+        guard case let .pending(otherTicket) = requested.result else {
+            return XCTFail("Expected a pending demand, got \(requested.result)")
+        }
+        addTeardownBlock { _ = await store.cancelCodemapArtifactDemand(otherTicket) }
+        let parked = await pause.waitUntilParked()
+        XCTAssertTrue(parked)
+        guard parked else { return }
+
+        let mcpServer = window.mcpServer
+        let referrersRequest = request(direction: .referrers, maximumDepth: 1)
+        let operation = Task {
+            try await mcpServer.buildCodeStructureDTO(
+                fromRecords: [target],
+                request: referrersRequest,
+                includePathNotFoundIssue: true,
+                lookupContext: .visibleWorkspace
+            )
+        }
+        let spentReset = await waitForRepairCount(store: store, 1)
+        XCTAssertTrue(spentReset, "The expansion must spend its reset and wait on the shared cleanup.")
+        guard spentReset else {
+            operation.cancel()
+            return
+        }
+        let clock = ContinuousClock()
+        let started = clock.now
+        operation.cancel()
+        let result = await operation.result
+        let elapsed = clock.now - started
+        XCTAssertLessThan(elapsed, .seconds(3), "Cancellation must end the caller's wait, not the shared cleanup.")
+        if case let .success(dto) = result {
+            XCTAssertNotEqual(dto.status, "ready", "A cancelled expansion cannot finish behind paused cleanup.")
+        }
+
+        pause.release()
+        let followUp = try await referrersDTO(window: window, record: target)
+        XCTAssertEqual(followUp.status, "ready", "\(followUp.issues)")
+        XCTAssertEqual(followUp.files.map(\.path), referrerPaths)
+        let repairCount = await store.codemapRootSessionRepairCountForTesting()
+        XCTAssertEqual(repairCount, 1, "The cancelled caller's cleanup must still complete for the next request.")
+        let accounting = try await engineAccounting(store: store)
+        XCTAssertEqual(accounting.retainedProjectionDemandCount, 0, "Cancelled operation resources must be released.")
+    }
+
     func testStoreCanScanSessionWorktreeRoot() async throws {
         let repositories = try ReviewGitRepositoryFixture(name: #function)
         let worktreeRootURL = try repositories.makeRepository(
@@ -1770,6 +3068,224 @@ final class MCPCodeStructureWorktreeTests: XCTestCase {
         )
     }
 
+    private func codeStructureDTO(
+        window: WindowState,
+        root: URL,
+        path: String
+    ) async throws -> ToolResultDTOs.CodeStructureReplyDTO {
+        let record = try await fileRecord(
+            at: root.appendingPathComponent(path),
+            store: window.workspaceFileContextStore,
+            rootScope: .visibleWorkspace
+        )
+        return try await window.mcpServer.buildCodeStructureDTO(
+            fromRecords: [record],
+            request: request(maximumFiles: 10),
+            includePathNotFoundIssue: true
+        )
+    }
+
+    private func engineCounters(
+        store: WorkspaceFileContextStore
+    ) async throws -> WorkspaceCodemapBindingEngineCounters {
+        let roots = await store.rootRefs(scope: .visibleWorkspace)
+        let rootID = try XCTUnwrap(roots.first?.id)
+        let accounting = await store.codemapBindingEngineAccountingForTesting(rootID: rootID)
+        return try XCTUnwrap(accounting?.counters)
+    }
+
+    private func engineAccounting(
+        store: WorkspaceFileContextStore
+    ) async throws -> WorkspaceCodemapBindingEngineAccounting {
+        let roots = await store.rootRefs(scope: .visibleWorkspace)
+        let rootID = try XCTUnwrap(roots.first?.id)
+        let accounting = await store.codemapBindingEngineAccountingForTesting(rootID: rootID)
+        return try XCTUnwrap(accounting)
+    }
+
+    /// Polls engine accounting until `condition` holds or the timeout passes; returns the last value.
+    private func waitForEngineAccounting(
+        store: WorkspaceFileContextStore,
+        timeout: Duration = .seconds(10),
+        _ condition: (WorkspaceCodemapBindingEngineAccounting) -> Bool
+    ) async throws -> WorkspaceCodemapBindingEngineAccounting {
+        let roots = await store.rootRefs(scope: .visibleWorkspace)
+        let rootID = try XCTUnwrap(roots.first?.id)
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: timeout)
+        var last = await store.codemapBindingEngineAccountingForTesting(rootID: rootID)
+        while clock.now < deadline {
+            if let last, condition(last) { return last }
+            try await Task.sleep(for: .milliseconds(20))
+            last = await store.codemapBindingEngineAccountingForTesting(rootID: rootID)
+        }
+        return try XCTUnwrap(last)
+    }
+
+    private func waitForRepairCount(
+        store: WorkspaceFileContextStore,
+        _ expected: Int,
+        timeout: Duration = .seconds(10)
+    ) async -> Bool {
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: timeout)
+        while clock.now < deadline {
+            if await store.codemapRootSessionRepairCountForTesting() >= expected { return true }
+            try? await Task.sleep(for: .milliseconds(10))
+        }
+        return await store.codemapRootSessionRepairCountForTesting() >= expected
+    }
+
+    private func codeStructureProjectionDeadline(after duration: Duration) -> UInt64 {
+        DispatchTime.now().uptimeNanoseconds + UInt64(duration.components.seconds) * 1_000_000_000
+    }
+
+    private func isProjectionAuthorityFailure(_ status: WorkspaceCodemapProjectionDemandStatus) -> Bool {
+        if case .unavailable(reason: .repositoryAuthorityChanged, retryAfterMilliseconds: nil) = status {
+            return true
+        }
+        return false
+    }
+
+    private func waitForProjectionStatus(
+        store: WorkspaceFileContextStore,
+        ticket: WorkspaceCodemapProjectionDemandTicket,
+        timeout: Duration = .seconds(10),
+        matches: (WorkspaceCodemapProjectionDemandStatus) -> Bool
+    ) async -> WorkspaceCodemapProjectionDemandStatus {
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: timeout)
+        var status = await store.codemapProjectionDemandStatus(ticket)
+        while !matches(status), clock.now < deadline {
+            try? await Task.sleep(for: .milliseconds(20))
+            status = await store.codemapProjectionDemandStatus(ticket)
+        }
+        return status
+    }
+
+    private func waitForPreloadLaunchPhase(
+        store: WorkspaceFileContextStore,
+        rootEpoch: WorkspaceCodemapRootEpoch,
+        timeout: Duration = .seconds(10),
+        matches: (WorkspaceCodemapProjectionPreloadLaunchPhase?) -> Bool
+    ) async -> WorkspaceCodemapProjectionPreloadLaunchPhase? {
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: timeout)
+        var phase = await store.codemapProjectionPreloadLaunchPhaseForTesting(rootEpoch: rootEpoch)
+        while !matches(phase), clock.now < deadline {
+            try? await Task.sleep(for: .milliseconds(20))
+            phase = await store.codemapProjectionPreloadLaunchPhaseForTesting(rootEpoch: rootEpoch)
+        }
+        return phase
+    }
+
+    /// Bounds any timer-driven store relaunch: the longer of the production policy's largest single
+    /// backoff and its cumulative backoff across every permitted retry, plus scheduling margin.
+    private var storePreloadRetryHorizon: Duration {
+        let policy = WorkspaceFileContextStore.CodemapProjectionPreloadRetryPolicy.production
+        let cumulative = (1 ... policy.maximumRetryCount).reduce(UInt64(0)) {
+            $0 + policy.backoffNanoseconds(forAttempt: $1)
+        }
+        let bound = max(cumulative, policy.maximumBackoffNanoseconds)
+        return .nanoseconds(Int64(bound)) + .milliseconds(500)
+    }
+
+    /// Store-side preload evidence for the root's current epoch: event log, launch phase, and retry.
+    private func storePreloadState(
+        store: WorkspaceFileContextStore,
+        rootID: UUID
+    ) async throws -> CodeStructureStorePreloadState {
+        let events = await store.codemapProjectionPreloadStoreEventsForTesting(rootID: rootID)
+        let rootEpoch = try XCTUnwrap(events.last?.rootEpoch, "The root must have preload store events.")
+        let launchPhase = await store.codemapProjectionPreloadLaunchPhaseForTesting(rootEpoch: rootEpoch)
+        let retry = await store.codemapProjectionPreloadRetrySnapshotForTesting(rootEpoch: rootEpoch)
+        return CodeStructureStorePreloadState(
+            events: events,
+            launchPhase: launchPhase,
+            retryAttempt: retry?.attempt
+        )
+    }
+
+    private func assertNoStorePreloadRetry(
+        _ state: CodeStructureStorePreloadState,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) {
+        XCTAssertNil(state.retryAttempt, "No store retry may be pending.", file: file, line: line)
+        XCTAssertFalse(
+            state.events.contains { $0.kind == .retryScheduled || $0.kind == .retryStarted },
+            "The store must never schedule a timer retry for this root: \(state.events.map(\.kind))",
+            file: file,
+            line: line
+        )
+    }
+
+    /// Real Git repository where `Source` references `Target`; listed text files carry unstaged edits
+    /// that tests stage later to advance repository authority.
+    private func makeReferrersRepository(
+        _ repositories: ReviewGitRepositoryFixture,
+        extraFiles: [String: String] = [:],
+        modifiedFiles: [String] = ["Notes.txt"]
+    ) throws -> URL {
+        var files = [
+            "Sources/Source.swift": "struct Source {\n    let target: Target\n}\n",
+            "Sources/Target.swift": "struct Target { func targetMethod() {} }\n"
+        ]
+        for path in modifiedFiles {
+            files[path] = "\(path) original\n"
+        }
+        files.merge(extraFiles) { _, extra in extra }
+        let root = try repositories.makeRepository(named: "repository", files: files)
+        for path in modifiedFiles {
+            try repositories.write("\(path) changed\n", to: path, at: root)
+        }
+        try repositories.settleIndex(at: root)
+        return root
+    }
+
+    private var referrerPaths: [String] {
+        ["repository/Sources/Target.swift", "repository/Sources/Source.swift"]
+    }
+
+    private func referrersDTO(
+        window: WindowState,
+        record: WorkspaceFileRecord
+    ) async throws -> ToolResultDTOs.CodeStructureReplyDTO {
+        try await window.mcpServer.buildCodeStructureDTO(
+            fromRecords: [record],
+            request: request(direction: .referrers, maximumDepth: 1),
+            includePathNotFoundIssue: true,
+            lookupContext: .visibleWorkspace
+        )
+    }
+
+    private func codeStructureToolInvoker(
+        window: WindowState
+    ) async throws -> (String) async throws -> ToolResultDTOs.CodeStructureReplyDTO {
+        let workspace = try XCTUnwrap(window.workspaceManager.activeWorkspace)
+        let tabID = try XCTUnwrap(workspace.activeComposeTabID)
+        let connectionID = UUID()
+        try window.mcpServer.bindTabForConnection(
+            connectionID: connectionID,
+            clientName: "code-structure-authority-recovery",
+            tabID: tabID,
+            workspaceID: workspace.id,
+            windowID: window.windowID
+        )
+        let tools = await window.mcpServer.windowMCPTools
+        let tool = try XCTUnwrap(tools.first { $0.name == MCPWindowToolName.getCodeStructure })
+        return { path in
+            let value = try await ServerNetworkManager.withConnectionID(connectionID) {
+                try await tool([
+                    "scope": .string("paths"),
+                    "paths": .array([.string(path)])
+                ])
+            }
+            let data = try JSONEncoder().encode(value)
+            return try JSONDecoder().decode(ToolResultDTOs.CodeStructureReplyDTO.self, from: data)
+        }
+    }
+
     private func demandTicket(
         from result: WorkspaceCodemapArtifactDemandResult
     ) -> WorkspaceCodemapArtifactDemandTicket? {
@@ -1930,6 +3446,9 @@ final class MCPCodeStructureWorktreeTests: XCTestCase {
 
     private func makeWindow(
         root: URL,
+        projectionPreloadLaunchPolicy: WorkspaceFileContextStore.CodemapProjectionPreloadLaunchPolicyForTesting = .disabled,
+        capabilityHooks: WorkspaceCodemapGitCapabilityServiceHooks = .none,
+        prepareStore: (WorkspaceFileContextStore) async -> Void = { _ in },
         codemapDemandResultHook: @escaping @Sendable (
             WorkspaceCodemapArtifactDemandTicket,
             WorkspaceCodemapBindingDemandResult
@@ -1937,6 +3456,8 @@ final class MCPCodeStructureWorktreeTests: XCTestCase {
     ) async throws -> WindowState {
         let codemapFixture = try MCPCodeStructureCodemapRuntimeFixture(
             name: "MCPCodeStructureWorktreeTests",
+            projectionPreloadLaunchPolicy: projectionPreloadLaunchPolicy,
+            capabilityHooks: capabilityHooks,
             codemapDemandResultHook: codemapDemandResultHook
         )
         addTeardownBlock {
@@ -1944,7 +3465,9 @@ final class MCPCodeStructureWorktreeTests: XCTestCase {
         }
         let previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
         GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
-        let window = WindowState(workspaceFileContextStore: codemapFixture.makeStore())
+        let store = codemapFixture.makeStore()
+        await prepareStore(store)
+        let window = WindowState(workspaceFileContextStore: store)
         WindowStatesManager.shared.registerWindowState(window)
         addTeardownBlock { @MainActor in
             window.beginClose()
@@ -2198,6 +3721,258 @@ private actor CodeStructurePersistentDemandBarrier {
     }
 }
 
+/// Passes real demand results through unchanged; only holds first results until the expected
+/// number of distinct files has a result, so concurrent operations overlap at recovery.
+private actor CodeStructureDistinctDemandBarrier {
+    private let expectedFileCount: Int
+    private var ignoredFileIDs: Set<UUID> = []
+    private var arrivedFileIDs: Set<UUID> = []
+    private var released = false
+    private var releasedByArrival = false
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    init(expectedFileCount: Int) {
+        self.expectedFileCount = expectedFileCount
+    }
+
+    func ignore(fileID: UUID) {
+        ignoredFileIDs.insert(fileID)
+    }
+
+    func passThrough(
+        ticket: WorkspaceCodemapArtifactDemandTicket,
+        result: WorkspaceCodemapBindingDemandResult
+    ) async -> WorkspaceCodemapBindingDemandResult {
+        guard !released, !ignoredFileIDs.contains(ticket.fileID) else { return result }
+        guard arrivedFileIDs.insert(ticket.fileID).inserted else { return result }
+        if arrivedFileIDs.count >= expectedFileCount {
+            releasedByArrival = true
+            release()
+            return result
+        }
+        if waiters.isEmpty {
+            Task { [weak self] in
+                try? await Task.sleep(for: .seconds(5))
+                await self?.release()
+            }
+        }
+        await withCheckedContinuation { continuation in
+            waiters.append(continuation)
+        }
+        return result
+    }
+
+    func didReleaseByArrival() -> Bool {
+        releasedByArrival
+    }
+
+    private func release() {
+        released = true
+        let pending = waiters
+        waiters.removeAll()
+        pending.forEach { $0.resume() }
+    }
+}
+
+/// Stages a second unrelated edit with real Git on the `onIssuance`-th armed source-authority
+/// issuance. The default (second) follows the replacement registration of the first root-session
+/// reset; the hook runs before the authority capture, so that issuance observes the edit.
+private final class CodeStructureAuthorityAdvanceAfterReset: @unchecked Sendable {
+    private let lock = NSLock()
+    private let repositories: ReviewGitRepositoryFixture
+    private let root: URL
+    private let relativePath: String
+    private let onIssuance: Int
+    private var armed = false
+    private var issuanceCount = 0
+    private var advanced = false
+
+    init(repositories: ReviewGitRepositoryFixture, root: URL, relativePath: String, onIssuance: Int = 2) {
+        self.repositories = repositories
+        self.root = root
+        self.relativePath = relativePath
+        self.onIssuance = onIssuance
+    }
+
+    func arm() {
+        lock.lock()
+        defer { lock.unlock() }
+        armed = true
+    }
+
+    func observeIssuance() {
+        lock.lock()
+        defer { lock.unlock() }
+        guard armed, !advanced else { return }
+        issuanceCount += 1
+        guard issuanceCount == onIssuance else { return }
+        advanced = (try? repositories.stage(relativePath, at: root)) != nil
+    }
+
+    func didAdvance() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return advanced
+    }
+}
+
+private final class CodeStructureOneShotGitStage: @unchecked Sendable {
+    struct Snapshot {
+        let didStage: Bool
+        let error: String?
+    }
+
+    private let lock = NSLock()
+    private let repositories: ReviewGitRepositoryFixture
+    private let root: URL
+    private let relativePath: String
+    private var didStage = false
+    private var error: String?
+
+    init(repositories: ReviewGitRepositoryFixture, root: URL, relativePath: String) {
+        self.repositories = repositories
+        self.root = root
+        self.relativePath = relativePath
+    }
+
+    func stageOnce() {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !didStage else { return }
+        didStage = true
+        do {
+            try repositories.stage(relativePath, at: root)
+        } catch {
+            self.error = String(describing: error)
+        }
+    }
+
+    func snapshot() -> Snapshot {
+        lock.lock()
+        defer { lock.unlock() }
+        return Snapshot(didStage: didStage, error: error)
+    }
+}
+
+/// Holds callers (bounded) until the test opens it; records whether any caller waited.
+private final class CodeStructureOpenGate: @unchecked Sendable {
+    private let lock = NSLock()
+    private var opened = false
+    private var waited = false
+
+    func open() {
+        lock.withLock { opened = true }
+    }
+
+    func waitUntilOpened() async {
+        lock.withLock { waited = true }
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: .seconds(10))
+        while clock.now < deadline, !lock.withLock({ opened }) {
+            try? await Task.sleep(for: .milliseconds(10))
+        }
+    }
+
+    func didHoldCaller() -> Bool {
+        lock.withLock { waited }
+    }
+}
+
+/// Parks the first armed source-authority issuance until released; later issuances pass.
+private final class CodeStructureOneShotIssuancePause: @unchecked Sendable {
+    private let lock = NSLock()
+    private let fence = TestReleaseFence(name: "code structure issuance pause")
+    private var armed = false
+    private var claimed = false
+
+    func arm() {
+        lock.withLock { armed = true }
+    }
+
+    func observeIssuance() async {
+        let shouldPark = lock.withLock { () -> Bool in
+            guard armed, !claimed else { return false }
+            claimed = true
+            return true
+        }
+        guard shouldPark else { return }
+        await fence.enterAndWaitIgnoringCancellationUntilRelease(timeout: 30)
+    }
+
+    func waitUntilParked() async -> Bool {
+        await fence.waitUntilEntered(timeout: .seconds(10))
+    }
+
+    func release() {
+        fence.release()
+    }
+}
+
+/// Parks the first real demand result for one configured file until released, ignoring the
+/// detach cancellation, so the root's shared cleanup flight stays in progress.
+private final class CodeStructureDemandResultPause: @unchecked Sendable {
+    private let lock = NSLock()
+    private let fence = TestReleaseFence(name: "code structure demand result pause")
+    private var pausedFileID: UUID?
+    private var claimed = false
+
+    func pause(fileID: UUID) {
+        lock.withLock { pausedFileID = fileID }
+    }
+
+    func transform(
+        ticket: WorkspaceCodemapArtifactDemandTicket,
+        result: WorkspaceCodemapBindingDemandResult
+    ) async -> WorkspaceCodemapBindingDemandResult {
+        let shouldPark = lock.withLock { () -> Bool in
+            guard ticket.fileID == pausedFileID, !claimed else { return false }
+            claimed = true
+            return true
+        }
+        if shouldPark {
+            await fence.enterAndWaitIgnoringCancellationUntilRelease(timeout: 30)
+        }
+        return result
+    }
+
+    func waitUntilParked() async -> Bool {
+        await fence.waitUntilEntered(timeout: .seconds(10))
+    }
+
+    func release() {
+        fence.release()
+    }
+}
+
+/// Engine counters that must stay flat while a session's projection authority failure is latched.
+private struct CodeStructureStorePreloadState: Equatable {
+    let events: [WorkspaceFileContextStore.CodemapProjectionPreloadStoreEvent]
+    let launchPhase: WorkspaceCodemapProjectionPreloadLaunchPhase?
+    let retryAttempt: Int?
+}
+
+private struct CodeStructureProjectionActivity: Equatable {
+    let capabilityResolutions: UInt64
+    let repositoryAuthorityChanges: UInt64
+    let manifestLoads: UInt64
+    let projectionPreloadsScheduled: UInt64
+    let projectionPreloadsStarted: UInt64
+    let projectionCatalogPages: UInt64
+    let projectionBatchesStarted: UInt64
+    let projectionRetries: UInt64
+
+    init(_ counters: WorkspaceCodemapBindingEngineCounters) {
+        capabilityResolutions = counters.capabilityResolutions
+        repositoryAuthorityChanges = counters.repositoryAuthorityChanges
+        manifestLoads = counters.manifestLoads
+        projectionPreloadsScheduled = counters.projectionPreloadsScheduled
+        projectionPreloadsStarted = counters.projectionPreloadsStarted
+        projectionCatalogPages = counters.projectionCatalogPages
+        projectionBatchesStarted = counters.projectionBatchesStarted
+        projectionRetries = counters.projectionRetries
+    }
+}
+
 private actor CodeStructureContentReadCounter {
     private(set) var value = 0
 
@@ -2209,6 +3984,7 @@ private actor CodeStructureContentReadCounter {
 private final class MCPCodeStructureCodemapRuntimeFixture: @unchecked Sendable {
     private let sandbox: URL
     private let provider: CodeMapArtifactRuntimeProvider
+    private let projectionPreloadLaunchPolicy: WorkspaceFileContextStore.CodemapProjectionPreloadLaunchPolicyForTesting
     private let codemapDemandResultHook: @Sendable (
         WorkspaceCodemapArtifactDemandTicket,
         WorkspaceCodemapBindingDemandResult
@@ -2216,11 +3992,14 @@ private final class MCPCodeStructureCodemapRuntimeFixture: @unchecked Sendable {
 
     init(
         name: String,
+        projectionPreloadLaunchPolicy: WorkspaceFileContextStore.CodemapProjectionPreloadLaunchPolicyForTesting = .disabled,
+        capabilityHooks: WorkspaceCodemapGitCapabilityServiceHooks = .none,
         codemapDemandResultHook: @escaping @Sendable (
             WorkspaceCodemapArtifactDemandTicket,
             WorkspaceCodemapBindingDemandResult
         ) async -> WorkspaceCodemapBindingDemandResult = { _, result in result }
     ) throws {
+        self.projectionPreloadLaunchPolicy = projectionPreloadLaunchPolicy
         self.codemapDemandResultHook = codemapDemandResultHook
         let sandbox = try Self.makeSecureDirectory(name: name)
         do {
@@ -2238,7 +4017,8 @@ private final class MCPCodeStructureCodemapRuntimeFixture: @unchecked Sendable {
                                 namespaceSalt: Data(
                                     repeating: 0x4D,
                                     count: GitBlobRepositoryNamespace.saltByteCount
-                                )
+                                ),
+                                hooks: capabilityHooks
                             ),
                             sourceReader: registry.makeValidatedSourceReaderClient(),
                             catalogClient: registry.makeBindingCatalogClient()
@@ -2264,7 +4044,7 @@ private final class MCPCodeStructureCodemapRuntimeFixture: @unchecked Sendable {
             codemapRuntimeProvider: {
                 try provider.runtime()
             },
-            codemapProjectionPreloadLaunchPolicyForTesting: .disabled,
+            codemapProjectionPreloadLaunchPolicyForTesting: projectionPreloadLaunchPolicy,
             codemapDemandResultHook: codemapDemandResultHook
         )
     }

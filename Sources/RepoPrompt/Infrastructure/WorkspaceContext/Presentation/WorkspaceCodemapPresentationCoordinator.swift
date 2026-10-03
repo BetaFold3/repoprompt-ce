@@ -60,12 +60,17 @@ private actor WorkspaceCodemapDemandRecoveryState {
         case .refreshCurrentness:
             refreshedFileIDs.insert(ticket.fileID).inserted
         case .resetRootSession:
-            resetRootEpochs.insert(ticket.rootEpoch).inserted
+            claimRootSessionReset(rootEpoch: ticket.rootEpoch)
         case .retryFreshDemand:
             retriedFileIDs.insert(ticket.fileID).inserted
         case .terminal:
             false
         }
+    }
+
+    /// One root-session reset per operation and root, shared by seed and projection recovery.
+    func claimRootSessionReset(rootEpoch: WorkspaceCodemapRootEpoch) -> Bool {
+        resetRootEpochs.insert(rootEpoch).inserted
     }
 }
 
@@ -101,6 +106,10 @@ private actor WorkspaceCodemapOperationPresentationOwnership {
 
     func record(_ ticket: WorkspaceCodemapProjectionDemandTicket) {
         projectionTicketsByID[ticket.id] = ticket
+    }
+
+    func owns(_ ticket: WorkspaceCodemapProjectionDemandTicket) -> Bool {
+        projectionTicketsByID[ticket.id] == ticket
     }
 
     func tickets() -> [WorkspaceCodemapArtifactDemandTicket] {
@@ -1673,6 +1682,9 @@ private struct WorkspaceCodemapStructureAttempt {
     let presentation: WorkspaceCodemapStructurePresentation
     let receipt: WorkspaceCodemapStructurePublicationReceipt?
     let staleReason: WorkspaceCodemapStructurePublicationStaleReason?
+    /// Returned instead of a generic stale result when the requested restart cannot run, so a
+    /// spent projection reset keeps its typed cause and retry guidance.
+    var unrestartablePresentation: WorkspaceCodemapStructurePresentation?
 }
 
 private struct WorkspaceCodemapStructurePublicationRevocation {
@@ -1732,7 +1744,8 @@ extension WorkspaceCodemapPresentationCoordinator {
                     {
                         continue
                     }
-                    return .stale(staleReason, requestedSeedCount: seedFileIDs.count)
+                    return attempt.unrestartablePresentation
+                        ?? .stale(staleReason, requestedSeedCount: seedFileIDs.count)
                 }
                 guard let receipt = attempt.receipt else {
                     await release(ownership)
@@ -2041,7 +2054,8 @@ extension WorkspaceCodemapPresentationCoordinator {
             )] = []
             var projectionOutcomes: [(
                 outcome: ProjectionDemandWaitOutcome,
-                sourceTickets: [WorkspaceCodemapArtifactDemandTicket]
+                sourceTickets: [WorkspaceCodemapArtifactDemandTicket],
+                projectionTicket: WorkspaceCodemapProjectionDemandTicket?
             )] = []
             for rootEpoch in sourceTicketsByRoot.keys.sorted(by: workspaceCodemapRootEpochPrecedes) {
                 let sourceTickets = sourceTicketsByRoot[rootEpoch] ?? []
@@ -2059,12 +2073,12 @@ extension WorkspaceCodemapPresentationCoordinator {
                             1000,
                             max(25, Int(exactly: retryAfterMilliseconds) ?? 1000)
                         )
-                    ), sourceTickets))
+                    ), sourceTickets, nil))
                 case let .unavailable(reason, retryAfterMilliseconds):
                     projectionOutcomes.append((.unavailable(
                         reason,
                         retryAfterMilliseconds: retryAfterMilliseconds.flatMap { Int(exactly: $0) }
-                    ), sourceTickets))
+                    ), sourceTickets, nil))
                 }
             }
             for acquired in acquiredProjectionDemands {
@@ -2074,10 +2088,10 @@ extension WorkspaceCodemapPresentationCoordinator {
                     clock: clock,
                     deadline: deadline
                 )
-                projectionOutcomes.append((outcome, acquired.sourceTickets))
+                projectionOutcomes.append((outcome, acquired.sourceTickets, acquired.ticket))
             }
 
-            for (waitOutcome, sourceTickets) in projectionOutcomes {
+            for (waitOutcome, sourceTickets, projectionTicket) in projectionOutcomes {
                 switch waitOutcome {
                 case .ready:
                     continue
@@ -2121,6 +2135,82 @@ extension WorkspaceCodemapPresentationCoordinator {
                         receipt: nil,
                         staleReason: nil
                     )
+                case let .unavailable(reason, retryAfterMilliseconds)
+                    where reason.rootSessionResetRejection != nil && projectionTicket != nil:
+                    // The projection's session observed a root-wide authority failure. Spend the
+                    // operation's shared once-per-root reset, then restart the whole attempt so
+                    // every seed and projection ticket is reissued against the replacement.
+                    guard let projectionTicket,
+                          await ownership.owns(projectionTicket),
+                          await recoveryState.claimRootSessionReset(rootEpoch: projectionTicket.rootEpoch)
+                    else {
+                        issues.append(.projectionUnavailable(
+                            reason: reason,
+                            retryAfterMilliseconds: retryAfterMilliseconds ?? 100
+                        ))
+                        return WorkspaceCodemapStructureAttempt(
+                            presentation: emptyStructurePresentation(
+                                outcome: .unavailable,
+                                issues: issues,
+                                requestedSeedCount: seedFileIDs.count,
+                                resolvedSeedCount: graphSeeds.count
+                            ),
+                            receipt: nil,
+                            staleReason: nil
+                        )
+                    }
+                    switch await store.prepareCodemapProjectionRootSessionRetry(
+                        projectionTicket,
+                        reason: reason,
+                        deadline: deadline
+                    ) {
+                    case .prepared, .stale:
+                        let staleFileID = sourceTickets.first?.fileID
+                            ?? graphSeeds.first { $0.ticket.rootEpoch == projectionTicket.rootEpoch }?
+                            .ticket.fileID
+                        let staleReason: WorkspaceCodemapStructurePublicationStaleReason =
+                            staleFileID.map { .presentation(.catalog(fileID: $0)) } ?? .output
+                        issues.append(.projectionUnavailable(
+                            reason: reason,
+                            retryAfterMilliseconds: retryAfterMilliseconds ?? 100
+                        ))
+                        return WorkspaceCodemapStructureAttempt(
+                            presentation: emptyStructurePresentation(
+                                outcome: .stale,
+                                issues: [],
+                                requestedSeedCount: seedFileIDs.count,
+                                resolvedSeedCount: 0
+                            ),
+                            receipt: nil,
+                            staleReason: staleReason,
+                            // The reset was spent; if no attempt or deadline remains for the
+                            // restart, report the typed cause, not the borrowed restart reason.
+                            unrestartablePresentation: emptyStructurePresentation(
+                                outcome: .unavailable,
+                                issues: issues,
+                                requestedSeedCount: seedFileIDs.count,
+                                resolvedSeedCount: graphSeeds.count
+                            )
+                        )
+                    case .deadlineReached:
+                        issues.append(readinessTimeoutIssue(
+                            clock: clock,
+                            deadline: deadline,
+                            retryAfterMilliseconds: retryAfterMilliseconds ?? 100
+                        ))
+                        return WorkspaceCodemapStructureAttempt(
+                            presentation: emptyStructurePresentation(
+                                outcome: .timeout,
+                                issues: issues,
+                                requestedSeedCount: seedFileIDs.count,
+                                resolvedSeedCount: graphSeeds.count
+                            ),
+                            receipt: nil,
+                            staleReason: nil
+                        )
+                    case .cancelled:
+                        throw CancellationError()
+                    }
                 case let .unavailable(reason, retryAfterMilliseconds):
                     issues.append(.projectionUnavailable(
                         reason: reason,

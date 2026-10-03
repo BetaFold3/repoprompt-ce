@@ -837,7 +837,7 @@ import XCTest
                         observedIngressGeneration: 1,
                         currentIngressGeneration: 1
                     )
-                    let sourceAuthority = try XCTUnwrap(issuedSourceAuthority)
+                    let sourceAuthority = try XCTUnwrap(issuedSourceAuthority.token)
                     let sourceExpectation = try XCTUnwrap(WorkspaceCodemapSourceExpectation.validatedWorktree(
                         bindingIdentity: identity,
                         source: source,

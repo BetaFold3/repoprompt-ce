@@ -427,6 +427,11 @@ actor WorkspaceFileContextStore {
         let fileIDs: [UUID]
         let metadataByteCount: UInt64
         let engine: WorkspaceCodemapBindingEngine
+        /// The store session that acquired this demand; fences projection-driven root resets.
+        let sessionID: UUID
+        let authority: CodemapRootAuthority
+        /// Root-wide authority failure observed for this demand while its session was current.
+        var observedAuthorityFailure: WorkspaceCodemapProjectionDemandUnavailableReason?
         var expiryTask: Task<Void, Never>?
     }
 
@@ -562,6 +567,7 @@ actor WorkspaceFileContextStore {
     }
 
     private struct CodemapRootSession {
+        let id = UUID()
         let authority: CodemapRootAuthority
         var endpoint: WorkspaceCodemapBindingIntegrationEndpoint?
         var routeToken: WorkspaceCodemapBindingIntegrationRouteToken?
@@ -14452,15 +14458,23 @@ actor WorkspaceFileContextStore {
             deadlineUptimeNanoseconds: deadlineUptimeNanoseconds,
             owner: WorkspaceCodemapLiveDemandOwner()
         )
-        guard case let .acquired(ticket, _) = acquisition else { return acquisition }
+        guard case let .acquired(ticket, status) = acquisition else { return acquisition }
 
         var demandRecord = CodemapProjectionDemandRecord(
             ticket: ticket,
             fileIDs: uniqueFileIDs,
             metadataByteCount: metadataByteCount,
             engine: engine,
+            sessionID: session.id,
+            authority: session.authority,
+            observedAuthorityFailure: nil,
             expiryTask: nil
         )
+        if let failure = Self.codemapProjectionAuthorityFailure(status),
+           codemapSessionsByRootEpoch[rootEpoch]?.id == session.id
+        {
+            demandRecord.observedAuthorityFailure = failure
+        }
         let expiryTask = Task { [weak self] in
             let now = DispatchTime.now().uptimeNanoseconds
             if deadlineUptimeNanoseconds > now {
@@ -14490,6 +14504,11 @@ actor WorkspaceFileContextStore {
             }
             return .stale
         }
+        // An observed authority failure persists while this record and its session are current;
+        // detachment removes the record, after which normal stale/cancelled behavior applies.
+        if let failure = record.observedAuthorityFailure {
+            return .unavailable(reason: failure, retryAfterMilliseconds: nil)
+        }
         let isCurrent = record.fileIDs.allSatisfy { fileID in
             guard let session = codemapSessionsByRootEpoch[ticket.rootEpoch],
                   session.authority.catalogGeneration == ticket.catalogGeneration,
@@ -14505,7 +14524,26 @@ actor WorkspaceFileContextStore {
             await record.engine.releaseProjectionDemand(ticket)
             return .stale
         }
-        return await record.engine.projectionDemandStatus(ticket)
+        let status = await record.engine.projectionDemandStatus(ticket)
+        if let failure = Self.codemapProjectionAuthorityFailure(status),
+           var current = codemapProjectionDemandsByID[ticket.id],
+           current.ticket == ticket,
+           current.sessionID == record.sessionID,
+           codemapSessionsByRootEpoch[ticket.rootEpoch]?.id == record.sessionID
+        {
+            current.observedAuthorityFailure = failure
+            codemapProjectionDemandsByID[ticket.id] = current
+        }
+        return status
+    }
+
+    private static func codemapProjectionAuthorityFailure(
+        _ status: WorkspaceCodemapProjectionDemandStatus
+    ) -> WorkspaceCodemapProjectionDemandUnavailableReason? {
+        guard case let .unavailable(reason, _) = status,
+              reason.rootSessionResetRejection != nil
+        else { return nil }
+        return reason
     }
 
     @discardableResult
@@ -14533,7 +14571,13 @@ actor WorkspaceFileContextStore {
         guard let record = codemapProjectionDemandsByID.removeValue(forKey: ticket.id),
               record.ticket == ticket
         else { return }
-        let terminalStatus = await record.engine.projectionDemandStatus(ticket)
+        let terminalStatus: WorkspaceCodemapProjectionDemandStatus = if let failure =
+            record.observedAuthorityFailure
+        {
+            .unavailable(reason: failure, retryAfterMilliseconds: nil)
+        } else {
+            await record.engine.projectionDemandStatus(ticket)
+        }
         await record.engine.releaseProjectionDemand(ticket)
         terminalCodemapProjectionDemandsByID[ticket.id] = TerminalCodemapProjectionDemandRecord(
             ticket: ticket,
@@ -14637,6 +14681,47 @@ actor WorkspaceFileContextStore {
             forFileID: ticket.fileID,
             priority: priority
         )
+    }
+
+    /// Resets the root session for a projection demand whose current session observed a root-wide
+    /// authority failure. Fenced on the exact retained projection record, its cached failure, and
+    /// the acquiring session; an old ticket cannot reset a replacement because detachment removes
+    /// every projection record for the root. The caller restarts its whole structure attempt.
+    func prepareCodemapProjectionRootSessionRetry(
+        _ ticket: WorkspaceCodemapProjectionDemandTicket,
+        reason: WorkspaceCodemapProjectionDemandUnavailableReason,
+        deadline: ContinuousClock.Instant?
+    ) async -> WorkspaceCodemapProjectionRootSessionRetryPreparation {
+        guard !Task.isCancelled else { return .cancelled }
+        guard codemapDeadlineIsCurrent(deadline) else { return .deadlineReached }
+        guard let rejection = reason.rootSessionResetRejection,
+              WorkspaceCodemapArtifactDemandRecovery(rejection) == .resetRootSession,
+              let record = codemapProjectionDemandsByID[ticket.id],
+              record.ticket == ticket,
+              record.observedAuthorityFailure == reason,
+              let session = codemapSessionsByRootEpoch[ticket.rootEpoch],
+              session.id == record.sessionID,
+              session.authority == record.authority,
+              session.engine === record.engine,
+              codemapAuthorityMatchesLoadedRoot(session.authority),
+              ticket.catalogGeneration == record.authority.catalogGeneration,
+              ticket.ingressGeneration == record.authority.ingressGeneration
+        else { return .stale }
+
+        #if DEBUG
+            codemapRootSessionRepairCountStorageForTesting += 1
+        #endif
+        let cleanup = detachCodemapSession(rootEpoch: ticket.rootEpoch)
+        if let cleanup {
+            guard await waitForCodemapSharedTask(cleanup.task, deadline: deadline) else {
+                return Task.isCancelled ? .cancelled : .deadlineReached
+            }
+        }
+        guard !Task.isCancelled else { return .cancelled }
+        guard codemapDeadlineIsCurrent(deadline) else { return .deadlineReached }
+        guard rootStatesByID[ticket.rootEpoch.rootID]?.lifetimeID == ticket.rootEpoch.rootLifetimeID
+        else { return .stale }
+        return .prepared
     }
 
     func queryCodemapSelectionGraph(

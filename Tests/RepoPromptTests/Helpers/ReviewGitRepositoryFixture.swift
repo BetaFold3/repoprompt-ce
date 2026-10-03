@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 @testable import RepoPromptApp
 
@@ -134,6 +135,73 @@ final class ReviewGitRepositoryFixture {
             ["status", "--porcelain=v1", "--untracked-files=all", "--", relativePath],
             at: root
         ).trimmingCharacters(in: .newlines)
+    }
+
+    /// Backdates tracked worktree files and refreshes the index so later `git status` calls find
+    /// stat-clean entries and cannot rewrite racily-clean index entries. Throws when a probe
+    /// `git status` still rewrites the index, because tests that depend on a stable index would be invalid.
+    func settleIndex(at root: URL) throws {
+        let indexURL = try gitPath("index", at: root)
+        // Unstaged edits keep their original index stat, which can stay racily clean until the
+        // index is rewritten in a later second; a bounded retry lets that rewrite settle.
+        for attempt in 0 ..< 4 {
+            if attempt > 0 { Thread.sleep(forTimeInterval: 1.1) }
+            let backdated = Date(timeIntervalSinceNow: -120)
+            let tracked = try runGit(["ls-files", "-z"], at: root)
+                .split(separator: "\0")
+                .map(String.init)
+            for path in tracked {
+                try FileManager.default.setAttributes(
+                    [.modificationDate: backdated],
+                    ofItemAtPath: root.appendingPathComponent(path).path
+                )
+            }
+            _ = try runGit(["update-index", "-q", "--refresh"], at: root)
+            let before = try Self.indexStat(at: indexURL)
+            _ = try runGit(["status", "--porcelain"], at: root)
+            let after = try Self.indexStat(at: indexURL)
+            if before == after { return }
+        }
+        throw NSError(
+            domain: "ReviewGitRepositoryFixture.git",
+            code: 4,
+            userInfo: [NSLocalizedDescriptionKey: "git status kept rewriting a settled index"]
+        )
+    }
+
+    /// Changes directory timestamps inside the Git directory, and optionally the worktree root,
+    /// without changing any authority file. Mirrors lock-file churn from read-only Git commands.
+    func churnRepositoryDirectoryTimestamps(at root: URL, includeWorktreeRoot: Bool) throws {
+        var directories = try [gitPath("", at: root)]
+        if includeWorktreeRoot { directories.append(root) }
+        for directory in directories {
+            let probe = directory.appendingPathComponent("rp-directory-churn-\(UUID().uuidString)")
+            try Data("churn\n".utf8).write(to: probe)
+            try FileManager.default.removeItem(at: probe)
+        }
+    }
+
+    func gitPath(_ name: String, at root: URL) throws -> URL {
+        let arguments = name.isEmpty
+            ? ["rev-parse", "--absolute-git-dir"]
+            : ["rev-parse", "--path-format=absolute", "--git-path", name]
+        let path = try runGit(arguments, at: root).trimmingCharacters(in: .whitespacesAndNewlines)
+        return URL(fileURLWithPath: path).standardizedFileURL
+    }
+
+    private static func indexStat(at url: URL) throws -> [Int64] {
+        var value = stat()
+        guard lstat(url.path, &value) == 0 else {
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        }
+        return [
+            Int64(value.st_ino),
+            Int64(value.st_size),
+            Int64(value.st_mtimespec.tv_sec),
+            Int64(value.st_mtimespec.tv_nsec),
+            Int64(value.st_ctimespec.tv_sec),
+            Int64(value.st_ctimespec.tv_nsec)
+        ]
     }
 
     @discardableResult

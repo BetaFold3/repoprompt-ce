@@ -57,8 +57,30 @@ enum WorkspaceCodemapProjectionDemandBusyReason: Hashable {
 enum WorkspaceCodemapProjectionDemandUnavailableReason: Hashable {
     case rootNotRegistered
     case capabilityUnavailable
+    /// The current engine session observed a root-wide repository authority change. The
+    /// failure is latched on that session; only a store-driven root-session reset clears it.
+    case repositoryAuthorityChanged
     case generationMismatch
     case projectionBudget(WorkspaceCodemapProjectionBudget)
+
+    /// The artifact rejection whose recovery resets the root session for this projection
+    /// failure, or nil when the failure is not recovered by a root-session reset.
+    var rootSessionResetRejection: WorkspaceCodemapBindingDemandRejection? {
+        switch self {
+        case .repositoryAuthorityChanged: .repositoryAuthorityChanged
+        case .capabilityUnavailable: .capabilityUnavailable
+        case .rootNotRegistered, .generationMismatch, .projectionBudget: nil
+        }
+    }
+}
+
+/// Outcome of a projection-ticket-fenced root-session reset. The caller restarts its whole
+/// structure attempt after `prepared`; the store never reissues individual seeds here.
+enum WorkspaceCodemapProjectionRootSessionRetryPreparation: Equatable {
+    case prepared
+    case stale
+    case deadlineReached
+    case cancelled
 }
 
 enum WorkspaceCodemapProjectionDemandStatus: Hashable {

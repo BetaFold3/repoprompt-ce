@@ -84,7 +84,7 @@ final class WorkspaceCodemapAuthorityTestFixture: @unchecked Sendable {
             currentPathGeneration: pathGeneration,
             observedIngressGeneration: ingressGeneration,
             currentIngressGeneration: ingressGeneration
-        ) else {
+        ).token else {
             throw WorkspaceCodemapProvenanceTestSupportError.sourceAuthorityUnavailable
         }
         return authority

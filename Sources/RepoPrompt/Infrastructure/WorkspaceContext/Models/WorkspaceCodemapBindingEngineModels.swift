@@ -406,6 +406,9 @@ enum WorkspaceCodemapBindingDemandRejection: Equatable {
     case languageMismatch
     case classificationMismatch
     case sourceAuthorityUnavailable
+    /// The repository authority no longer matches the root session's cached baseline; the
+    /// session must be reset so re-registration adopts the current authority.
+    case repositoryAuthorityChanged
     case overlayRejected(WorkspaceCodemapLiveDemandRejection)
     case staleCompletion
 }
@@ -480,6 +483,8 @@ enum WorkspaceCodemapBindingEngineHookKind: String {
     case capabilityEligible
     case capabilityTerminalUnavailable
     case capabilityTransientRetry
+    case repositoryAuthorityChanged
+    case sourceAuthorityTransientUnavailable
     case classificationClean
     case classificationWorktree
     case classificationUnavailable
@@ -616,6 +621,7 @@ struct WorkspaceCodemapBindingEngineHooks {
 struct WorkspaceCodemapBindingEngineCounters: Equatable {
     var capabilityResolutions: UInt64 = 0
     var capabilityRetries: UInt64 = 0
+    var repositoryAuthorityChanges: UInt64 = 0
     var classifications: UInt64 = 0
     var cleanClassifications: UInt64 = 0
     var worktreeClassifications: UInt64 = 0
@@ -684,6 +690,7 @@ struct WorkspaceCodemapBindingEngineCounters: Equatable {
     init(initialValue: UInt64 = 0) {
         capabilityResolutions = initialValue
         capabilityRetries = initialValue
+        repositoryAuthorityChanges = initialValue
         classifications = initialValue
         cleanClassifications = initialValue
         worktreeClassifications = initialValue

@@ -537,7 +537,7 @@ final class WorkspaceCodemapGitCapabilityServiceTests: XCTestCase {
             observedIngressGeneration: 11,
             currentIngressGeneration: 11
         )
-        let accepted = try XCTUnwrap(acceptedCandidate)
+        let accepted = try XCTUnwrap(acceptedCandidate.token)
         XCTAssertTrue(accepted.isFactoryValidated)
         XCTAssertEqual(accepted.repositoryRelativeLoadedRootPrefix, "Sources")
         XCTAssertEqual(accepted.acceptedPrePathFingerprint, pathFingerprint)
@@ -620,7 +620,7 @@ final class WorkspaceCodemapGitCapabilityServiceTests: XCTestCase {
             observedIngressGeneration: 11,
             currentIngressGeneration: 11
         )
-        let afterNestedAttributes = try XCTUnwrap(afterNestedAttributesCandidate)
+        let afterNestedAttributes = try XCTUnwrap(afterNestedAttributesCandidate.token)
         XCTAssertNotEqual(afterNestedAttributes.candidateAttributeGeneration, accepted.candidateAttributeGeneration)
     }
 
@@ -647,7 +647,7 @@ final class WorkspaceCodemapGitCapabilityServiceTests: XCTestCase {
             observedIngressGeneration: 1,
             currentIngressGeneration: 1
         )
-        XCTAssertNotNil(authority)
+        XCTAssertNotNil(authority.token)
         XCTAssertEqual(recorder.snapshot(), .init(callCount: 2, allPathsMatched: true))
 
         let symlinkTarget = root.appendingPathComponent("Sources/Target.swift")
@@ -918,6 +918,419 @@ final class WorkspaceCodemapGitCapabilityServiceTests: XCTestCase {
         _ = try await capability(service.resolve(root: rootRequest))
     }
 
+    func testSourceAuthoritySurvivesDirectoryTimestampChurn() async throws {
+        let fixture = try ReviewGitRepositoryFixture(name: #function)
+        let root = try fixture.makeRepository(named: "repository")
+        try fixture.settleIndex(at: root)
+        let service = WorkspaceCodemapGitCapabilityService(namespaceSalt: namespaceSalt)
+        let capability = try await capability(service.resolve(root: request(for: root, seed: 100)))
+        let path = "Sources/Feature.swift"
+        let initial = await issueSourceAuthority(service, capability: capability, path: path)
+        XCTAssertNotNil(initial.token)
+
+        try fixture.churnRepositoryDirectoryTimestamps(at: root, includeWorktreeRoot: true)
+        let afterDeterministicChurn = await issueSourceAuthority(service, capability: capability, path: path)
+        XCTAssertNotNil(
+            afterDeterministicChurn.token,
+            "Directory timestamp churn in .git and the worktree root must not reject source authority: " +
+                "\(String(describing: afterDeterministicChurn.failure))"
+        )
+
+        _ = try fixture.runGit(["status", "--porcelain"], at: root)
+        let afterStatus = await issueSourceAuthority(service, capability: capability, path: path)
+        XCTAssertNotNil(
+            afterStatus.token,
+            "Read-only git status lock churn must not reject source authority: " +
+                "\(String(describing: afterStatus.failure))"
+        )
+    }
+
+    func testResolveDoesNotAdvanceAuthorityForDirectoryTimestampChurn() async throws {
+        let fixture = try ReviewGitRepositoryFixture(name: #function)
+        let root = try fixture.makeRepository(named: "repository")
+        try fixture.settleIndex(at: root)
+        let service = WorkspaceCodemapGitCapabilityService(namespaceSalt: namespaceSalt)
+        let rootRequest = request(for: root, seed: 101)
+        let initial = try await capability(service.resolve(root: rootRequest)).repositoryAuthority
+
+        try fixture.churnRepositoryDirectoryTimestamps(at: root, includeWorktreeRoot: true)
+        _ = try fixture.runGit(["status", "--porcelain"], at: root)
+        let afterChurn = try await capability(service.resolve(root: rootRequest)).repositoryAuthority
+
+        XCTAssertEqual(afterChurn.layoutGeneration, initial.layoutGeneration)
+        XCTAssertEqual(afterChurn.authorityGeneration, initial.authorityGeneration)
+        XCTAssertEqual(afterChurn, initial)
+    }
+
+    func testBatchRevalidationSurvivesDirectoryChurnWithoutResolve() async throws {
+        let fixture = try ReviewGitRepositoryFixture(name: #function)
+        let root = try fixture.makeRepository(
+            named: "repository",
+            files: [
+                "Sources/Feature.swift": "let value = 1\n",
+                "Sources/Other.swift": "let other = 2\n"
+            ]
+        )
+        try fixture.settleIndex(at: root)
+        let service = WorkspaceCodemapGitCapabilityService(namespaceSalt: namespaceSalt)
+        let capability = try await capability(service.resolve(root: request(for: root, seed: 102)))
+        let featureToken = await issueSourceAuthority(service, capability: capability, path: "Sources/Feature.swift")
+        let otherToken = await issueSourceAuthority(service, capability: capability, path: "Sources/Other.swift")
+        let tokens = try [XCTUnwrap(featureToken.token), XCTUnwrap(otherToken.token)]
+        let initiallyValid = await revalidateSourceAuthorities(service, capability: capability, tokens: tokens)
+        XCTAssertEqual(initiallyValid, .valid)
+
+        try fixture.churnRepositoryDirectoryTimestamps(at: root, includeWorktreeRoot: true)
+        _ = try fixture.runGit(["status", "--porcelain"], at: root)
+        let validAfterChurn = await revalidateSourceAuthorities(service, capability: capability, tokens: tokens)
+
+        XCTAssertEqual(
+            validAfterChurn,
+            .valid,
+            "Batch revalidation must survive directory timestamp churn without a fresh resolve."
+        )
+    }
+
+    func testSourceAuthorityReportsChangeAfterIndexAdvance() async throws {
+        let fixture = try ReviewGitRepositoryFixture(name: #function)
+        let root = try fixture.makeRepository(
+            named: "repository",
+            files: [
+                "Sources/Feature.swift": "let value = 1\n",
+                "Sources/Other.swift": "let other = 2\n"
+            ]
+        )
+        try fixture.settleIndex(at: root)
+        let service = WorkspaceCodemapGitCapabilityService(namespaceSalt: namespaceSalt)
+        let rootRequest = request(for: root, seed: 103)
+        let capability = try await capability(service.resolve(root: rootRequest))
+        let path = "Sources/Feature.swift"
+        let issued = await issueSourceAuthority(service, capability: capability, path: path)
+        let token = try XCTUnwrap(issued.token)
+
+        try fixture.write("notes\n", to: "Notes.txt", at: root)
+        try fixture.stage("Notes.txt", at: root)
+        let afterStage = await issueSourceAuthority(service, capability: capability, path: path)
+        XCTAssertEqual(afterStage, .unavailable(.repositoryAuthorityChanged(changed: [.index])))
+        let revalidationAfterStage = await revalidateSourceAuthorities(
+            service,
+            capability: capability,
+            tokens: [token]
+        )
+        XCTAssertEqual(revalidationAfterStage, .invalid(.repositoryAuthorityChanged(changed: [.index])))
+        await assertEqual(
+            service.state(for: rootRequest.rootEpoch),
+            .eligible(capability),
+            "Issuance and revalidation must never adopt the newly observed authority."
+        )
+        #if DEBUG
+            let lastFailure = await service.lastSourceAuthorityFailureForTesting(rootEpoch: rootRequest.rootEpoch)
+            XCTAssertEqual(lastFailure, .repositoryAuthorityChanged(changed: [.index]))
+        #endif
+
+        let advanced = try await self.capability(service.resolve(root: rootRequest))
+        XCTAssertGreaterThan(
+            advanced.repositoryAuthority.authorityGeneration,
+            capability.repositoryAuthority.authorityGeneration
+        )
+        let afterResolve = await issueSourceAuthority(service, capability: advanced, path: path)
+        XCTAssertNotNil(afterResolve.token)
+
+        try fixture.commit("Stage notes", at: root)
+        let afterCommit = await issueSourceAuthority(service, capability: advanced, path: path)
+        let commitFailure = try XCTUnwrap(afterCommit.failure)
+        XCTAssertTrue(
+            commitFailure.changedComponents.contains(.metadata),
+            "A commit must report a metadata authority change: \(commitFailure)"
+        )
+        XCTAssertTrue(commitFailure.isRootWide)
+    }
+
+    func testDescriptorWindowRaceIsUnstableNotChanged() async throws {
+        let fixture = try ReviewGitRepositoryFixture(name: #function)
+        let root = try fixture.makeRepository(
+            named: "repository",
+            files: [
+                "Sources/Feature.swift": "let value = 1\n",
+                "Sources/Other.swift": "let other = 2\n"
+            ]
+        )
+        try fixture.settleIndex(at: root)
+        let path = "Sources/Feature.swift"
+
+        let sourceMutation = SourcePathMutation(url: root.appendingPathComponent(path))
+        let sourceService = WorkspaceCodemapGitCapabilityService(
+            namespaceSalt: namespaceSalt,
+            hooks: WorkspaceCodemapGitCapabilityServiceHooks(
+                afterSourcePathFingerprintCapture: { await sourceMutation.mutateOnce() }
+            )
+        )
+        let sourceCapability = try await capability(sourceService.resolve(root: request(for: root, seed: 104)))
+        let sourceRace = await issueSourceAuthority(sourceService, capability: sourceCapability, path: path)
+        XCTAssertEqual(sourceRace, .unavailable(.unstableWindow(.pathFingerprint)))
+
+        let indexURL = try fixture.gitPath("index", at: root)
+        let indexRace = IndexReplacementDuringSecondOpen(
+            indexURL: indexURL,
+            repositories: fixture,
+            root: root,
+            stagedPath: "Sources/Other.swift"
+        )
+        let indexService = WorkspaceCodemapGitCapabilityService(
+            namespaceSalt: namespaceSalt,
+            hooks: WorkspaceCodemapGitCapabilityServiceHooks(
+                afterAuthorityEvidenceOpen: { indexRace.replaceOnSecondOpen($0) }
+            )
+        )
+        let indexRootRequest = request(for: root, seed: 105)
+        let indexCapability = try await capability(indexService.resolve(root: indexRootRequest))
+        try fixture.write("let other = 3\n", to: "Sources/Other.swift", at: root)
+        indexRace.arm()
+        let raced = await issueSourceAuthority(indexService, capability: indexCapability, path: path)
+
+        XCTAssertTrue(indexRace.didReplace())
+        XCTAssertEqual(raced, .unavailable(.unstableWindow(.repository)))
+        await assertEqual(indexService.state(for: indexRootRequest.rootEpoch), .eligible(indexCapability))
+    }
+
+    func testLayoutIdentityAndPointerChangesRemainRejected() async throws {
+        let fixture = try ReviewGitRepositoryFixture(name: #function)
+        let canonical = try fixture.makeRepository(named: "canonical")
+        let path = "Sources/Feature.swift"
+
+        let canonicalService = WorkspaceCodemapGitCapabilityService(namespaceSalt: namespaceSalt)
+        let canonicalCapability = try await capability(
+            canonicalService.resolve(root: request(for: canonical, seed: 106))
+        )
+        let gitDirectory = canonical.appendingPathComponent(".git", isDirectory: true)
+        let retired = fixture.sandbox.appendingPathComponent("retired-git", isDirectory: true)
+        try FileManager.default.moveItem(at: gitDirectory, to: retired)
+        try FileManager.default.copyItem(at: retired, to: gitDirectory)
+        let afterInodeReplacement = await issueSourceAuthority(
+            canonicalService,
+            capability: canonicalCapability,
+            path: path
+        )
+        XCTAssertNil(afterInodeReplacement.token)
+        XCTAssertEqual(afterInodeReplacement.failure?.isRootWide, true, "\(afterInodeReplacement)")
+
+        let linkedSource = try fixture.makeRepository(named: "linked-source")
+        let linked = try fixture.makeLinkedWorktree(from: linkedSource, named: "linked", branch: "linked-pointer")
+        let linkedService = WorkspaceCodemapGitCapabilityService(namespaceSalt: namespaceSalt)
+        let linkedCapability = try await capability(
+            linkedService.resolve(root: request(for: linked, seed: 107))
+        )
+        let commondir = linkedCapability.repositoryLayout.gitDir.appendingPathComponent("commondir")
+        try (linkedCapability.repositoryLayout.commonDir.path + "\n")
+            .write(to: commondir, atomically: true, encoding: .utf8)
+        let afterCommondir = await issueSourceAuthority(linkedService, capability: linkedCapability, path: path)
+        XCTAssertNil(afterCommondir.token)
+        XCTAssertEqual(afterCommondir.failure?.isRootWide, true, "\(afterCommondir)")
+
+        let pointerService = WorkspaceCodemapGitCapabilityService(namespaceSalt: namespaceSalt)
+        let pointerCapability = try await capability(
+            pointerService.resolve(root: request(for: linked, seed: 108))
+        )
+        let pointer = linked.appendingPathComponent(".git")
+        try "gitdir: \(pointerCapability.repositoryLayout.gitDir.path)\n\n"
+            .write(to: pointer, atomically: true, encoding: .utf8)
+        let afterPointer = await issueSourceAuthority(pointerService, capability: pointerCapability, path: path)
+        XCTAssertNil(afterPointer.token)
+        XCTAssertEqual(afterPointer.failure?.isRootWide, true, "\(afterPointer)")
+    }
+
+    /// Directory-leaf timestamps change between the no-follow lookup and the descriptor open.
+    /// Identity-only directory evidence must accept the churn; replacing the leaf must not.
+    func testDirectoryLeafChurnBetweenLookupAndOpenKeepsAuthority() async throws {
+        let fixture = try ReviewGitRepositoryFixture(name: #function)
+        let root = try fixture.makeRepository(named: "repository")
+        try fixture.settleIndex(at: root)
+        let churn = try DirectoryLeafWindowMutation(
+            targets: [root, fixture.gitPath("", at: root)],
+            action: .churn
+        )
+        let service = WorkspaceCodemapGitCapabilityService(
+            namespaceSalt: namespaceSalt,
+            hooks: WorkspaceCodemapGitCapabilityServiceHooks(
+                afterAuthorityEvidenceComponentStat: { component, isLeaf in
+                    churn.mutateAfterLookup(component: component, isLeaf: isLeaf)
+                }
+            )
+        )
+        try await assertDirectoryLeafChurnKeepsAuthority(service: service, churn: churn, root: root, seed: 109)
+
+        let replacementRoot = try fixture.makeRepository(named: "replacement")
+        try fixture.settleIndex(at: replacementRoot)
+        let replacement = try DirectoryLeafWindowMutation(
+            targets: [fixture.gitPath("", at: replacementRoot)],
+            action: .replaceOnce
+        )
+        let replacementService = WorkspaceCodemapGitCapabilityService(
+            namespaceSalt: namespaceSalt,
+            hooks: WorkspaceCodemapGitCapabilityServiceHooks(
+                afterAuthorityEvidenceComponentStat: { component, isLeaf in
+                    replacement.mutateAfterLookup(component: component, isLeaf: isLeaf)
+                }
+            )
+        )
+        try await assertDirectoryLeafReplacementRejected(
+            service: replacementService,
+            replacement: replacement,
+            root: replacementRoot,
+            seed: 110
+        )
+    }
+
+    /// Directory-leaf timestamps change between the descriptor's pre- and post-observation.
+    /// Identity-only directory evidence must accept the churn; replacing the leaf must not.
+    func testDirectoryLeafChurnBetweenDescriptorObservationsKeepsAuthority() async throws {
+        let fixture = try ReviewGitRepositoryFixture(name: #function)
+        let root = try fixture.makeRepository(named: "repository")
+        try fixture.settleIndex(at: root)
+        let churn = try DirectoryLeafWindowMutation(
+            targets: [root, fixture.gitPath("", at: root)],
+            action: .churn
+        )
+        let service = WorkspaceCodemapGitCapabilityService(
+            namespaceSalt: namespaceSalt,
+            hooks: WorkspaceCodemapGitCapabilityServiceHooks(
+                afterAuthorityEvidenceOpen: { churn.mutateAfterOpen($0) }
+            )
+        )
+        try await assertDirectoryLeafChurnKeepsAuthority(service: service, churn: churn, root: root, seed: 111)
+
+        let replacementRoot = try fixture.makeRepository(named: "replacement")
+        try fixture.settleIndex(at: replacementRoot)
+        let replacement = try DirectoryLeafWindowMutation(
+            targets: [fixture.gitPath("", at: replacementRoot)],
+            action: .replaceOnce
+        )
+        let replacementService = WorkspaceCodemapGitCapabilityService(
+            namespaceSalt: namespaceSalt,
+            hooks: WorkspaceCodemapGitCapabilityServiceHooks(
+                afterAuthorityEvidenceOpen: { replacement.mutateAfterOpen($0) }
+            )
+        )
+        try await assertDirectoryLeafReplacementRejected(
+            service: replacementService,
+            replacement: replacement,
+            root: replacementRoot,
+            seed: 112
+        )
+    }
+
+    private func assertDirectoryLeafChurnKeepsAuthority(
+        service: WorkspaceCodemapGitCapabilityService,
+        churn: DirectoryLeafWindowMutation,
+        root: URL,
+        seed: UInt8,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) async throws {
+        let rootRequest = request(for: root, seed: seed)
+        let resolved = try await capability(service.resolve(root: rootRequest))
+        let path = "Sources/Feature.swift"
+
+        churn.arm()
+        let issued = await issueSourceAuthority(service, capability: resolved, path: path)
+        let token = try XCTUnwrap(
+            issued.token,
+            "Directory-leaf churn inside a descriptor window must not reject issuance: " +
+                "\(String(describing: issued.failure))",
+            file: file,
+            line: line
+        )
+        let revalidated = await revalidateSourceAuthorities(service, capability: resolved, tokens: [token])
+        XCTAssertEqual(revalidated, .valid, file: file, line: line)
+        await assertEqual(
+            service.state(for: rootRequest.rootEpoch),
+            .eligible(resolved),
+            "Issuance and revalidation never adopt authority.",
+            file: file,
+            line: line
+        )
+        let reresolved = try await capability(service.resolve(root: rootRequest))
+        XCTAssertEqual(
+            reresolved.repositoryAuthority,
+            resolved.repositoryAuthority,
+            "Directory-leaf churn must not advance repository authority.",
+            file: file,
+            line: line
+        )
+
+        let observation = churn.snapshot()
+        XCTAssertEqual(
+            observation.mutatedTargets,
+            churn.targetPaths,
+            "Every directory leaf must have churned inside the window.",
+            file: file,
+            line: line
+        )
+        XCTAssertGreaterThan(observation.mutationCount, 0, file: file, line: line)
+        XCTAssertEqual(
+            observation.unchangedTimestampCount,
+            0,
+            "Each in-window churn must change the directory's timestamps, or the window was not exercised.",
+            file: file,
+            line: line
+        )
+    }
+
+    private func assertDirectoryLeafReplacementRejected(
+        service: WorkspaceCodemapGitCapabilityService,
+        replacement: DirectoryLeafWindowMutation,
+        root: URL,
+        seed: UInt8,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) async throws {
+        let rootRequest = request(for: root, seed: seed)
+        let resolved = try await capability(service.resolve(root: rootRequest))
+
+        replacement.arm()
+        let issued = await issueSourceAuthority(service, capability: resolved, path: "Sources/Feature.swift")
+
+        XCTAssertEqual(replacement.snapshot().mutationCount, 1, file: file, line: line)
+        XCTAssertEqual(
+            issued,
+            .unavailable(.unstableWindow(.repository)),
+            "Replacing a directory leaf inside the window must fail closed.",
+            file: file,
+            line: line
+        )
+        await assertEqual(
+            service.state(for: rootRequest.rootEpoch),
+            .eligible(resolved),
+            file: file,
+            line: line
+        )
+    }
+
+    private func issueSourceAuthority(
+        _ service: WorkspaceCodemapGitCapabilityService,
+        capability: GitCodemapRootCapability,
+        path: String
+    ) async -> WorkspaceCodemapSourceAuthorityIssuance {
+        await service.makeSourceAuthority(
+            capability: capability,
+            observedRootEpoch: capability.rootEpoch,
+            observedRepositoryAuthority: capability.repositoryAuthority,
+            candidateRepositoryRelativePath: path,
+            observedPathGeneration: 1,
+            currentPathGeneration: 1,
+            observedIngressGeneration: 1,
+            currentIngressGeneration: 1
+        )
+    }
+
+    private func revalidateSourceAuthorities(
+        _ service: WorkspaceCodemapGitCapabilityService,
+        capability: GitCodemapRootCapability,
+        tokens: [WorkspaceCodemapSourceAuthorityToken]
+    ) async -> WorkspaceCodemapSourceAuthorityRevalidation {
+        await service.revalidateSourceAuthorities(capability: capability, tokens: tokens)
+    }
+
     private func request(for root: URL, seed: UInt8) -> WorkspaceCodemapGitCapabilityRequest {
         WorkspaceCodemapGitCapabilityRequest(
             rootID: UUID(uuid: (seed, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1)),
@@ -939,18 +1352,19 @@ final class WorkspaceCodemapGitCapabilityServiceTests: XCTestCase {
     private func assertEqual<T: Equatable>(
         _ actual: T,
         _ expected: T,
+        _ message: String = "",
         file: StaticString = #filePath,
         line: UInt = #line
     ) {
-        XCTAssertEqual(actual, expected, file: file, line: line)
+        XCTAssertEqual(actual, expected, message, file: file, line: line)
     }
 
     private func assertNil(
-        _ value: (some Any)?,
+        _ issuance: WorkspaceCodemapSourceAuthorityIssuance,
         file: StaticString = #filePath,
         line: UInt = #line
     ) {
-        XCTAssertNil(value, file: file, line: line)
+        XCTAssertNil(issuance.token, file: file, line: line)
     }
 
     private func assertTransient(
@@ -1136,8 +1550,13 @@ private actor AuthorityMutation {
     func mutate() {
         guard enabled else { return }
         sequence += 1
-        let marker = root.appendingPathComponent(".git/authority-race-\(sequence)")
-        try? "race-\(sequence)\n".write(to: marker, atomically: true, encoding: .utf8)
+        // Directory timestamps are not authority evidence, so the race must change an authority file.
+        let attributes = root.appendingPathComponent(".git/info/attributes")
+        try? FileManager.default.createDirectory(
+            at: attributes.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try? "*.race\(sequence) text\n".write(to: attributes, atomically: true, encoding: .utf8)
     }
 
     func disable() {
@@ -1180,6 +1599,156 @@ private final class ExactPathFingerprintRecorder: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         return Snapshot(callCount: callCount, allPathsMatched: allPathsMatched)
+    }
+}
+
+/// Replaces the Git index with a real `git add` immediately after the second index descriptor
+/// open of one armed issuance, which is the post-capture window.
+private final class IndexReplacementDuringSecondOpen: @unchecked Sendable {
+    private let lock = NSLock()
+    private let indexPath: String
+    private let repositories: ReviewGitRepositoryFixture
+    private let root: URL
+    private let stagedPath: String
+    private var armed = false
+    private var indexOpenCount = 0
+    private var replaced = false
+
+    init(indexURL: URL, repositories: ReviewGitRepositoryFixture, root: URL, stagedPath: String) {
+        indexPath = indexURL.standardizedFileURL.path
+        self.repositories = repositories
+        self.root = root
+        self.stagedPath = stagedPath
+    }
+
+    func arm() {
+        lock.lock()
+        defer { lock.unlock() }
+        armed = true
+    }
+
+    func replaceOnSecondOpen(_ openedURL: URL) {
+        lock.lock()
+        defer { lock.unlock() }
+        guard armed, !replaced, openedURL.standardizedFileURL.path == indexPath else { return }
+        indexOpenCount += 1
+        guard indexOpenCount == 2 else { return }
+        replaced = (try? repositories.stage(stagedPath, at: root)) != nil
+    }
+
+    func didReplace() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return replaced
+    }
+}
+
+/// Mutates a directory leaf inside one authority-evidence descriptor window. `.churn` creates and
+/// removes a child until the directory's timestamps observably change; `.replaceOnce` swaps the
+/// directory for a copy with a new inode.
+private final class DirectoryLeafWindowMutation: @unchecked Sendable {
+    enum Action {
+        case churn
+        case replaceOnce
+    }
+
+    struct Snapshot {
+        let mutationCount: Int
+        let mutatedTargets: Set<String>
+        let unchangedTimestampCount: Int
+    }
+
+    let targetPaths: Set<String>
+    private let lock = NSLock()
+    private let action: Action
+    private let targetsByLeafName: [String: URL]
+    private var armed = false
+    private var mutationCount = 0
+    private var mutatedTargets: Set<String> = []
+    private var unchangedTimestampCount = 0
+
+    init(targets: [URL], action: Action) {
+        let canonical = targets.map { $0.resolvingSymlinksInPath().standardizedFileURL }
+        targetPaths = Set(canonical.map(\.path))
+        targetsByLeafName = Dictionary(uniqueKeysWithValues: canonical.map { ($0.lastPathComponent, $0) })
+        self.action = action
+    }
+
+    func arm() {
+        lock.lock()
+        defer { lock.unlock() }
+        armed = true
+    }
+
+    /// Fires between the no-follow `fstatat` lookup and `openat` of a leaf component.
+    func mutateAfterLookup(component: String, isLeaf: Bool) {
+        guard isLeaf, let target = targetsByLeafName[component] else { return }
+        mutate(target)
+    }
+
+    /// Fires between the leaf descriptor's pre-observation and post-observation.
+    func mutateAfterOpen(_ openedURL: URL) {
+        let opened = openedURL.resolvingSymlinksInPath().standardizedFileURL
+        guard targetPaths.contains(opened.path) else { return }
+        mutate(opened)
+    }
+
+    func snapshot() -> Snapshot {
+        lock.lock()
+        defer { lock.unlock() }
+        return Snapshot(
+            mutationCount: mutationCount,
+            mutatedTargets: mutatedTargets,
+            unchangedTimestampCount: unchangedTimestampCount
+        )
+    }
+
+    private func mutate(_ target: URL) {
+        lock.lock()
+        defer { lock.unlock() }
+        guard armed else { return }
+        switch action {
+        case .churn:
+            mutationCount += 1
+            mutatedTargets.insert(target.path)
+            if !Self.churnUntilTimestampsChange(target) {
+                unchangedTimestampCount += 1
+            }
+        case .replaceOnce:
+            guard mutationCount == 0 else { return }
+            let retired = target.deletingLastPathComponent()
+                .appendingPathComponent("\(target.lastPathComponent)-retired", isDirectory: true)
+            guard (try? FileManager.default.moveItem(at: target, to: retired)) != nil,
+                  (try? FileManager.default.copyItem(at: retired, to: target)) != nil
+            else { return }
+            mutationCount = 1
+            mutatedTargets.insert(target.path)
+        }
+    }
+
+    private static func churnUntilTimestampsChange(_ directory: URL) -> Bool {
+        guard let before = timestamps(directory) else { return false }
+        for _ in 0 ..< 32 {
+            let probe = directory.appendingPathComponent("rp-window-churn-\(UUID().uuidString)")
+            guard FileManager.default.createFile(atPath: probe.path, contents: Data("churn\n".utf8)) else {
+                return false
+            }
+            try? FileManager.default.removeItem(at: probe)
+            if let after = timestamps(directory), after != before { return true }
+            usleep(1000)
+        }
+        return false
+    }
+
+    private static func timestamps(_ directory: URL) -> [Int]? {
+        var value = stat()
+        guard lstat(directory.path, &value) == 0 else { return nil }
+        return [
+            value.st_mtimespec.tv_sec,
+            value.st_mtimespec.tv_nsec,
+            value.st_ctimespec.tv_sec,
+            value.st_ctimespec.tv_nsec
+        ]
     }
 }
 

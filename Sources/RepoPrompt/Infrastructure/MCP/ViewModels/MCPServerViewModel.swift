@@ -6002,6 +6002,8 @@ final class MCPServerViewModel: ObservableObject {
             return "binding_rejected.classification_mismatch"
         case .sourceAuthorityUnavailable:
             return "binding_rejected.source_authority_unavailable"
+        case .repositoryAuthorityChanged:
+            return "binding_rejected.repository_authority_changed"
         case .staleCompletion:
             return "binding_rejected.stale_completion"
         }
@@ -6117,12 +6119,16 @@ final class MCPServerViewModel: ObservableObject {
                 )
             case let .rejected(rejection):
                 let detail = codeStructureRejectionDetail(rejection)
+                // Outcome-neutral: the rejection records an observation, not a completed reset.
+                let message = rejection == .repositoryAuthorityChanged
+                    ? "Repository authority changed; retry the request. (reason=\(detail))"
+                    : "A codemap artifact is unavailable. (reason=\(detail))"
                 return DTO(
                     code: "artifact_unavailable", phase: "seed_demand", path: path,
                     retryable: WorkspaceCodemapArtifactDemandRecovery(rejection).isRetryable,
                     retryAfterMilliseconds: nil,
                     attempted: nil, limit: nil,
-                    message: "A codemap artifact is unavailable. (reason=\(detail))",
+                    message: message,
                     detail: detail
                 )
             case .routeConflict:
@@ -6248,6 +6254,8 @@ final class MCPServerViewModel: ObservableObject {
                 "The codemap projection root is no longer registered."
             case .capabilityUnavailable:
                 "Codemap projection is unavailable for this root."
+            case .repositoryAuthorityChanged:
+                "Repository authority changed during codemap projection; retry the request."
             case .generationMismatch:
                 "The codemap projection generation changed before admission."
             case .projectionBudget:
