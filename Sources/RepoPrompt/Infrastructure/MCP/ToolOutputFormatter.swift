@@ -5532,7 +5532,12 @@ extension ToolOutputFormatter {
         }
         // Multi-poll collection response
         if let pollMeta = object["poll"]?.objectValue, pollMeta["mode"]?.stringValue == "many" {
-            return formatMultiPoll(object: object, pollMeta: pollMeta, title: multiPollTitle)
+            return formatMultiPoll(
+                object: object,
+                pollMeta: pollMeta,
+                title: multiPollTitle,
+                supportsRespondGuidance: supportsRespondGuidance
+            )
         }
         let op = prettifiedAgentControlOperation(args["op"]?.stringValue, fallback: operationFallback)
         let session = object["session"]?.objectValue
@@ -5617,7 +5622,8 @@ extension ToolOutputFormatter {
             }
             lines.append(contentsOf: formattedWaitAnyNestedRecoveryLines(
                 object,
-                primarySessionID: sessionID
+                primarySessionID: sessionID,
+                supportsRespondGuidance: supportsRespondGuidance
             ))
         }
         if let agentName, !agentName.isEmpty {
@@ -5654,6 +5660,11 @@ extension ToolOutputFormatter {
                     lines.append("- Provide `response=\"<your instruction text>\"`")
                     lines.append("- **Important**: Use `respond`, not `steer`, while status is `waiting_for_input`.")
                 case "question":
+                    let structuredFields = structuredQuestionFields(in: interaction)
+                    if !structuredFields.isEmpty {
+                        lines.append(contentsOf: structuredQuestionResponseGuidanceLines(fields: structuredFields))
+                        break
+                    }
                     let options = interaction?["options"]?.arrayValue ?? []
                     if !options.isEmpty {
                         let labels = options.compactMap { $0.objectValue?["label"]?.stringValue }
@@ -5689,7 +5700,12 @@ extension ToolOutputFormatter {
                 lines.append("agent_explore does not support respond. Cancel this explore run or start a new explore run with clearer instructions.")
             }
         }
-        if let interactionPrompt, !interactionPrompt.isEmpty {
+        // A structured ask_user question derives its prompt from its questions, so the full
+        // question block replaces the prompt instead of repeating it.
+        let structuredQuestionLines = interaction.map(structuredQuestionContentLines) ?? []
+        if !structuredQuestionLines.isEmpty {
+            lines.append("\n**Pending questions**\n\n" + structuredQuestionLines.joined(separator: "\n"))
+        } else if let interactionPrompt, !interactionPrompt.isEmpty {
             lines.append("\n**Prompt**\n\n\(interactionPrompt)")
         }
         if let assistantText, !assistantText.isEmpty {
@@ -5697,6 +5713,86 @@ extension ToolOutputFormatter {
             lines.append("\n**\(heading)**\n\n\(assistantText)")
         }
         return [.text(lines.joined(separator: "\n"))]
+    }
+
+    /// Structured `ask_user` fields of a `question` interaction. Empty for legacy flat
+    /// questions, which carry `options` and a prompt instead.
+    private static func structuredQuestionFields(in interaction: [String: Value]?) -> [[String: Value]] {
+        guard let interaction, interaction["kind"]?.stringValue == "question" else { return [] }
+        return interaction["fields"]?.arrayValue?.compactMap(\.objectValue) ?? []
+    }
+
+    /// Complete content of a structured `ask_user` interaction carried by an `agent_run`
+    /// snapshot: title, overall context, and each question's id, header, prompt, context,
+    /// selection constraints, and options with descriptions. Shares wording with the delegated
+    /// question notice. Empty when the interaction is not a structured question.
+    static func structuredQuestionContentLines(_ interaction: [String: Value]) -> [String] {
+        let questions = structuredQuestionFields(in: interaction).compactMap { field -> AgentDelegatedQuestionNoticePayload.Question? in
+            guard let id = field["id"]?.stringValue else { return nil }
+            let options = (field["options"]?.arrayValue ?? []).compactMap { option -> AgentDelegatedQuestionNoticePayload.Option? in
+                if let label = option.stringValue {
+                    return .init(label: label, description: nil)
+                }
+                guard let object = option.objectValue, let label = object["label"]?.stringValue else { return nil }
+                return .init(label: label, description: object["description"]?.stringValue)
+            }
+            return .init(
+                id: id,
+                header: field["header"]?.stringValue,
+                question: field["prompt"]?.stringValue ?? "",
+                context: field["context"]?.stringValue,
+                options: options,
+                allowsMultiple: field["allows_multiple"]?.boolValue ?? false,
+                allowsCustom: field["allows_custom"]?.boolValue ?? field["allows_other"]?.boolValue ?? true
+            )
+        }
+        guard !questions.isEmpty else { return [] }
+        return AgentDelegatedQuestionNoticePayload.contentLines(
+            title: interaction["title"]?.stringValue,
+            context: interaction["context"]?.stringValue,
+            questions: questions
+        )
+    }
+
+    /// `respond` guidance for a structured `ask_user` question, matching the `answers` shapes
+    /// `AgentRunMCPToolService.parseResponsePayload` accepts.
+    private static func structuredQuestionResponseGuidanceLines(fields: [[String: Value]]) -> [String] {
+        let ids = fields.compactMap { $0["id"]?.stringValue }
+        var lines = [
+            "- Provide `answers` as an object keyed by question id (\(ids.map { "`\($0)`" }.joined(separator: ", "))), answering every question.",
+            "- Each answer is an exact option label or custom text, an array of strings for a multi-select question, or `{\"selected_options\": [\"<label>\"], \"custom_response\": \"<text>\"}`. Use `{\"skipped\": true}` to skip one question."
+        ]
+        if ids.count == 1 {
+            lines.append("- Shorthand for this single question: `response=\"<answer>\"`.")
+        }
+        lines.append("- Provide `response=\"skip\"` to skip the whole interaction.")
+        lines.append("- The complete questions, context, and options are under **Pending questions** below.")
+        return lines
+    }
+
+    /// Structured `ask_user` question of a nested `snapshots` entry (wait_any or poll_many),
+    /// which `AgentRunMCPToolService.coveredDelegatedQuestionNoticeKeys` also treats as delivered.
+    private static func formattedNestedStructuredQuestionLines(
+        _ snapshot: [String: Value],
+        indent: String,
+        supportsRespondGuidance: Bool
+    ) -> [String] {
+        guard let interaction = snapshot["interaction"]?.objectValue else { return [] }
+        let content = structuredQuestionContentLines(interaction)
+        guard !content.isEmpty else { return [] }
+        var lines: [String] = []
+        let interactionID = interaction["id"]?.stringValue
+        if let interactionID, !interactionID.isEmpty {
+            lines.append("\(indent)- Interaction ID: `\(interactionID)`")
+            if supportsRespondGuidance,
+               snapshot["status"]?.stringValue == "waiting_for_input",
+               let sessionID = snapshot["session_id"]?.stringValue, !sessionID.isEmpty
+            {
+                lines.append("\(indent)- Respond with `agent_run` `op=respond`, `session_id=\"\(sessionID)\"`, `interaction_id=\"\(interactionID)\"`, and an `answers` object keyed by question id (exact option labels or custom text; arrays for multi-select).")
+            }
+        }
+        lines.append(contentsOf: content.map { indent + $0 })
+        return lines
     }
 
     private static func agentRunWorktreeObjects(from object: [String: Value]) -> [[String: Value]] {
@@ -5793,7 +5889,12 @@ extension ToolOutputFormatter {
         return [.text(lines.joined(separator: "\n"))]
     }
 
-    private static func formatMultiPoll(object: [String: Value], pollMeta: [String: Value], title: String) -> [MCP.Tool.Content] {
+    private static func formatMultiPoll(
+        object: [String: Value],
+        pollMeta: [String: Value],
+        title: String,
+        supportsRespondGuidance: Bool
+    ) -> [MCP.Tool.Content] {
         var lines = ["**\(title)**"]
         let polledCount = pollMeta["polled_count"]?.intValue ?? 0
         let interestingIDs = pollMeta["interesting_session_ids"]?.arrayValue?.compactMap(\.stringValue) ?? []
@@ -5827,13 +5928,19 @@ extension ToolOutputFormatter {
                 forceFullInline: responseWideFullFallback,
                 indent: "  "
             ))
+            lines.append(contentsOf: formattedNestedStructuredQuestionLines(
+                snapObj,
+                indent: "  ",
+                supportsRespondGuidance: supportsRespondGuidance
+            ))
         }
         return [.text(lines.joined(separator: "\n"))]
     }
 
     private static func formattedWaitAnyNestedRecoveryLines(
         _ object: [String: Value],
-        primarySessionID: String?
+        primarySessionID: String?,
+        supportsRespondGuidance: Bool
     ) -> [String] {
         let forceFullInline = isResponseWideFullFallback(object)
         var lines: [String] = []
@@ -5848,7 +5955,12 @@ extension ToolOutputFormatter {
                 nested,
                 forceFullInline: forceFullInline
             )
-            guard hasRetrieval || hasRetainedFullText else { continue }
+            let questionLines = formattedNestedStructuredQuestionLines(
+                nested,
+                indent: "  ",
+                supportsRespondGuidance: supportsRespondGuidance
+            )
+            guard hasRetrieval || hasRetainedFullText || !questionLines.isEmpty else { continue }
 
             let status = prettifiedAgentStatus(nested["status"]?.stringValue) ?? "unknown"
             lines.append("- Additional result: `\(sessionID ?? "?")` — **\(status)**")
@@ -5857,6 +5969,7 @@ extension ToolOutputFormatter {
                 forceFullInline: forceFullInline,
                 indent: "  "
             ))
+            lines.append(contentsOf: questionLines)
         }
         return lines
     }

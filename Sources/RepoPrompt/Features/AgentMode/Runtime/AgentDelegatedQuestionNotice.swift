@@ -106,6 +106,13 @@ struct AgentDelegatedQuestionNoticePayload: Equatable {
 
     /// Question content shared by the delivered notice and the covered record.
     private var contentLines: [String] {
+        Self.contentLines(title: title, context: context, questions: questions)
+    }
+
+    /// Question content (title, context, questions, per-question context, selection
+    /// constraints, and options). Also used by `ToolOutputFormatter` to render a structured
+    /// `ask_user` interaction carried by an `agent_run` snapshot, so both surfaces share wording.
+    static func contentLines(title: String?, context: String?, questions: [Question]) -> [String] {
         var lines: [String] = []
         if let title = Self.nonEmpty(title) {
             lines.append("Title: \(title)")

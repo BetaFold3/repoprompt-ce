@@ -308,6 +308,104 @@ final class AgentModeViewModelDelegatedQuestionTests: XCTestCase {
         _ = try await taskC.value
     }
 
+    /// Pins the production `ask_user` → `agent_run` snapshot mapping (`mcpSnapshot(for:)` →
+    /// `mcpPendingInteraction`) to the formatter: the wire encoding `agent_run` poll/wait returns
+    /// carries every structured field, and its formatted text hands the parent the complete
+    /// question, including a token present only in an option the parent could not guess.
+    func testAgentRunSnapshotOfPendingAskUserEncodesAndFormatsCompleteStructuredQuestion() async throws {
+        let vm = makeViewModel()
+        let parent = makeSession(vm, parent: nil)
+        let child = makeSession(vm, parent: parent.sessionID)
+        vm.test_setMCPControlledTabIDs([child.tabID])
+        let unknownToken = "UNKNOWN-OPTION-TOKEN-91c4e7"
+        let hiddenLabel = "Pinned build \(unknownToken)"
+        let hiddenDescription = "Only the root controller knows \(unknownToken) is required."
+        let strategyContext = "Strategy context: " + Self.longContextBody
+        let targetContext = "Target context line one.\nTarget context line two with detail."
+        let interaction = AgentAskUserInteraction(
+            title: "Release decision",
+            context: "Overall context: " + Self.longContextBody,
+            timeoutSeconds: 60,
+            questions: [
+                AgentAskUserQuestion(
+                    id: "strategy",
+                    header: "Strategy",
+                    question: "Which rollout strategies should run?",
+                    context: strategyContext,
+                    options: [
+                        AgentAskUserOption(label: "Canary", description: "One percent first."),
+                        AgentAskUserOption(label: hiddenLabel, description: hiddenDescription)
+                    ],
+                    allowsMultiple: true,
+                    allowsCustom: false
+                ),
+                AgentAskUserQuestion(
+                    id: "target",
+                    header: "Target",
+                    question: "Which environment receives the build?",
+                    context: targetContext,
+                    options: [AgentAskUserOption(label: "staging"), AgentAskUserOption(label: "production", description: "Live traffic.")],
+                    allowsMultiple: false,
+                    allowsCustom: true
+                )
+            ]
+        )
+
+        let task = Task { try await vm.askUser(tabID: child.tabID, interaction: interaction) }
+        try await waitUntil { child.session.pendingAskUser?.isAwaitingParentAgent == true }
+
+        // Wire encoding produced by the production snapshot builder, as agent_run poll/wait returns it.
+        let snapshot = try XCTUnwrap(vm.mcpSnapshot(for: child.session))
+        XCTAssertEqual(snapshot.status, .waitingForInput)
+        let object = snapshot.asObject()
+        let wireInteraction = try XCTUnwrap(object["interaction"]?.objectValue)
+        XCTAssertEqual(wireInteraction["id"]?.stringValue, interaction.id.uuidString)
+        XCTAssertEqual(wireInteraction["kind"]?.stringValue, "question")
+        XCTAssertEqual(wireInteraction["title"]?.stringValue, interaction.title)
+        XCTAssertEqual(wireInteraction["context"]?.stringValue, interaction.context)
+        let fields = try XCTUnwrap(wireInteraction["fields"]?.arrayValue?.compactMap(\.objectValue))
+        XCTAssertEqual(fields.map { $0["id"]?.stringValue }, ["strategy", "target"])
+        for (field, question) in zip(fields, interaction.questions) {
+            XCTAssertEqual(field["header"]?.stringValue, question.header, question.id)
+            XCTAssertEqual(field["prompt"]?.stringValue, question.question, question.id)
+            XCTAssertEqual(field["context"]?.stringValue, question.context, question.id)
+            XCTAssertEqual(field["allows_multiple"]?.boolValue, question.allowsMultiple, question.id)
+            XCTAssertEqual(field["allows_custom"]?.boolValue, question.allowsCustom, question.id)
+            XCTAssertNil(field["allows_other"], "ask_user fields carry allows_custom, not allows_other: \(question.id)")
+            let options = field["options"]?.arrayValue?.compactMap(\.objectValue) ?? []
+            XCTAssertEqual(options.map { $0["label"]?.stringValue }, question.options.map(\.label), question.id)
+            XCTAssertEqual(options.map { $0["description"]?.stringValue }, question.options.map(\.description), question.id)
+        }
+
+        // Formatted agent_run text: the only copy of the question the parent model reads.
+        let blocks = ToolOutputFormatter.formatAgentRun(args: ["op": .string("wait")], value: .object(object))
+        guard case let .text(text, _, _) = try XCTUnwrap(blocks.first) else {
+            return XCTFail("Expected agent_run text output")
+        }
+        for fragment in [
+            "Title: Release decision",
+            "Context: Overall context: " + Self.longContextBody,
+            "1. [id `strategy`] Strategy: Which rollout strategies should run?",
+            "   Context: \(strategyContext)",
+            "   Selection: choose any number of options; custom answer not allowed",
+            "   - Canary — One percent first.",
+            "   - \(hiddenLabel) — \(hiddenDescription)",
+            "2. [id `target`] Target: Which environment receives the build?",
+            "   Context: \(targetContext)",
+            "   Selection: choose one option; custom answer allowed",
+            "   - staging\n",
+            "   - production — Live traffic.",
+            "- Interaction ID: `\(interaction.id.uuidString)`",
+            "- Provide `answers` as an object keyed by question id (`strategy`, `target`), answering every question."
+        ] {
+            XCTAssertTrue(text.contains(fragment), "Formatted agent_run snapshot lost: \(fragment)")
+        }
+        XCTAssertFalse(text.contains("Provide the requested answers to continue."), "The derived generic prompt is replaced by the full questions")
+
+        vm.skipAskUser(tabID: child.tabID, interactionID: interaction.id)
+        _ = try await task.value
+    }
+
     // MARK: - Idle parent: next turn's first input (§6.2)
 
     func testIdleParentNoticeIsStagedIntoProviderInputAndCommittedAsSystemNoteOnlyAfterSend() async throws {
