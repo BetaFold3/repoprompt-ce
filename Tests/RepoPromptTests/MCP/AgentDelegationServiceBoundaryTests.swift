@@ -546,6 +546,309 @@ final class AgentDelegationServiceBoundaryTests: XCTestCase {
         }
     }
 
+    /// Live regression: a Knowledge root's detached `agent_run.start` runs the production starter,
+    /// whose MCP control activation must admit the fresh Knowledge worker; a later steer from the root
+    /// must reactivate that worker after its MCP control expired. For each provider and model source,
+    /// and for either edit-approval setting, MCP control never forces auto-edit: the worker keeps its
+    /// normal Knowledge-session setting in the session and the approval store through start,
+    /// reactivation, and cleanup. The global sub-agent permission profile still governs native
+    /// provider permissions, and the worker's run lease and prompt stay delegation leaves.
+    func testKnowledgeWorkerStartActivatesControlThroughProductionStarterAndSteersAfterExpiry() async throws {
+        // New sessions take the global edit-approval default; restore it after the test.
+        let autoEditDefaultKey = "agentModeAutoEditEnabled"
+        let previousAutoEditDefault = UserDefaults.standard.object(forKey: autoEditDefaultKey)
+        defer {
+            if let previousAutoEditDefault {
+                UserDefaults.standard.set(previousAutoEditDefault, forKey: autoEditDefaultKey)
+            } else {
+                UserDefaults.standard.removeObject(forKey: autoEditDefaultKey)
+            }
+        }
+        try await withFixture { fixture in
+            let knowledge = try await makeKnowledgeTree(fixture)
+            let vm = fixture.viewModel
+            fixture.window.apiSettingsViewModel.isClaudeCodeConnected = true
+            fixture.window.apiSettingsViewModel.isCodexConnected = true
+            let dispatches = KnowledgeDispatchProbe()
+            var run = makeKnowledgeStartService(
+                fixture,
+                source: knowledge.root,
+                probe: KnowledgeStartProbe(),
+                startRun: productionStartRun(recordingInto: dispatches)
+            )
+            run.testDispatchSteerInstruction = { sessionID, _, _, agentModeVM in
+                let tabID = try XCTUnwrap(agentModeVM.mcpControlledSession(sessionID: sessionID)?.tabID)
+                await dispatches.records.append(self.knowledgeDispatchRecord(sessionID: sessionID, tabID: tabID, host: agentModeVM))
+                return .startedRun
+            }
+            // Explicit variants select the other provider on the root, so the explicit model_id wins.
+            let variants: [(label: String, worker: AgentProviderKind, root: (agent: AgentProviderKind, model: String, effort: String), modelID: String?)] = [
+                ("Claude inherited", .claudeCode, (.claudeCode, "opus", "high"), nil),
+                ("Claude explicit", .claudeCode, (.codexExec, "gpt-5.4", "high"), "claudeCode:sonnet"),
+                ("Codex inherited", .codexExec, (.codexExec, "gpt-5.4", "high"), nil),
+                ("Codex explicit", .codexExec, (.claudeCode, "opus", "high"), "codexExec:gpt-5.4")
+            ]
+            for autoEdit in [false, true] {
+                for variant in variants {
+                    let label = "\(variant.label), auto-edit \(autoEdit)"
+                    ApplyEditsApprovalStore.setGlobalDefaultAutoEditEnabled(autoEdit)
+                    knowledge.root.session.selectedAgent = variant.root.agent
+                    knowledge.root.session.selectedModelRaw = variant.root.model
+                    knowledge.root.session.selectedReasoningEffortRaw = variant.root.effort
+                    let subagentProfile = vm.providerBindingService.permissionProfileForMCPActivation(
+                        isSubagent: true,
+                        provider: variant.worker.providerBindingID
+                    )
+                    let tabsBefore = composeTabIDs(fixture)
+                    let dispatchesBefore = dispatches.records.count
+
+                    let value = try await run.execute(args: knowledgeStartArgs(modelID: variant.modelID))
+
+                    XCTAssertEqual(dispatches.records.count, dispatchesBefore + 1, "\(label): the production starter reached provider dispatch")
+                    let started = try XCTUnwrap(dispatches.records.last, label)
+                    XCTAssertEqual(started.parentSessionID, knowledge.root.sessionID, label)
+                    assertKnowledgeWorkerDispatch(started, autoEdit: autoEdit, permissionProfile: subagentProfile, label: "\(label) start")
+                    let workerID = started.sessionID
+                    let worker = try XCTUnwrap(vm.mcpControlledSession(sessionID: workerID), label)
+                    let receipt = try XCTUnwrap(value.objectValue?["knowledge_worker"]?.objectValue, label)
+                    XCTAssertEqual(receipt["model_source"]?.stringValue, variant.modelID == nil ? "inherited" : "explicit", label)
+                    XCTAssertEqual(receipt["provider"]?.stringValue, variant.worker.rawValue, label)
+                    XCTAssertEqual(worker.selectedAgent, variant.worker, label)
+                    XCTAssertEqual(worker.selectedModelRaw, receipt["model"]?.stringValue, label)
+                    if variant.modelID == nil {
+                        XCTAssertEqual(worker.selectedModelRaw, variant.root.model, label)
+                        XCTAssertEqual(receipt["reasoning_effort"]?.stringValue, variant.root.effort, label)
+                        // Codex keeps the inherited effort on the session; Claude effort is a
+                        // per-model preference, so configuration clears the session field.
+                        XCTAssertEqual(
+                            worker.selectedReasoningEffortRaw,
+                            variant.worker == .codexExec ? variant.root.effort : nil,
+                            label
+                        )
+                    }
+                    XCTAssertEqual(vm.mcpDelegationLineage(sessionID: workerID), .resolved(depth: 1), label)
+                    XCTAssertEqual(composeTabIDs(fixture).subtracting(tabsBefore).count, 1, label)
+                    try await AsyncTestWait.waitUntil("\(label): worker approval subscription installed") {
+                        worker.applyEditsApprovalScopeGeneration != nil
+                    }
+                    await assertEditApproval(of: worker, is: autoEdit, in: vm, label: "\(label) after start")
+
+                    // Control expires: cleanup restores user-configured provider permissions and
+                    // leaves the edit-approval setting as it was.
+                    await vm.mcpDeactivateControlContext(sessionID: workerID, cleanupSessionStore: true)
+                    XCTAssertNil(vm.mcpControlledSession(sessionID: workerID), label)
+                    XCTAssertEqual(worker.permissionProfile, .userConfigured, label)
+                    await assertEditApproval(of: worker, is: autoEdit, in: vm, label: "\(label) after expiry")
+
+                    // The root's later steer reactivates its own worker with the same posture.
+                    _ = try await run.execute(args: steerArgs(workerID))
+                    XCTAssertEqual(dispatches.records.count, dispatchesBefore + 2, "\(label): the steer reached dispatch after reactivation")
+                    let steered = try XCTUnwrap(dispatches.records.last, label)
+                    XCTAssertEqual(steered.sessionID, workerID, label)
+                    assertKnowledgeWorkerDispatch(steered, autoEdit: autoEdit, permissionProfile: subagentProfile, label: "\(label) steer")
+                    XCTAssertTrue(vm.mcpControlledSession(sessionID: workerID) === worker, label)
+
+                    // A setting changed while the worker is controlled survives cleanup.
+                    await vm.applyEditsApprovalStore.setAutoEditEnabled(
+                        !autoEdit,
+                        for: vm.applyEditsScope(for: worker.tabID),
+                        updateGlobalDefault: false
+                    )
+                    try await AsyncTestWait.waitUntil("\(label): worker observed the changed setting") {
+                        worker.autoEditEnabled == !autoEdit
+                    }
+                    await vm.mcpDeactivateControlContext(sessionID: workerID, cleanupSessionStore: true)
+                    XCTAssertNil(vm.mcpControlledSession(sessionID: workerID), label)
+                    XCTAssertEqual(worker.permissionProfile, .userConfigured, label)
+                    await assertEditApproval(of: worker, is: !autoEdit, in: vm, label: "\(label) after changed-setting cleanup")
+                }
+            }
+        }
+    }
+
+    /// Knowledge control activation admits only a Knowledge caller's verified worker: standard
+    /// activation keeps rejecting every Knowledge session; a Knowledge expectation rejects roots,
+    /// standard sessions, and unverifiable or deeper lineage; the production starter never infers
+    /// the profile from a live tab; and standard or external steers still cannot reactivate a worker.
+    func testKnowledgeControlActivationRejectsStandardExternalAndUnverifiedTargets() async throws {
+        try await withFixture { fixture in
+            let knowledge = try await makeKnowledgeTree(fixture)
+            let vm = fixture.viewModel
+            let standardMessage = "Knowledge sessions cannot be converted into MCP-controlled coding sessions. Start a standard Agent session instead."
+            let workerMessage = "requires a verified Knowledge worker session started by a Knowledge session"
+            // The existing worker's MCP control has expired.
+            knowledge.worker.session.mcpControlContext = nil
+
+            @MainActor func knowledgeSession(parentSessionID: UUID) async throws -> Node {
+                let session = try await makeExtraSession(fixture)
+                let sessionID = UUID()
+                session.testInstallPersistentSessionBinding(sessionID: sessionID)
+                session.hasLoadedPersistedState = true
+                XCTAssertTrue(session.adoptSessionProfile(.knowledge))
+                session.parentSessionID = parentSessionID
+                return Node(tabID: session.tabID, sessionID: sessionID, session: session)
+            }
+            let unverifiedLineage = try await knowledgeSession(parentSessionID: UUID())
+            let depthTwo = try await knowledgeSession(parentSessionID: knowledge.worker.sessionID)
+
+            for (label, node) in [("Knowledge root", knowledge.root), ("Knowledge worker", knowledge.worker)] {
+                await assertInvalidParams(contains: standardMessage, label: "standard activation of \(label)") {
+                    _ = try await vm.mcpActivateControlContext(
+                        forTabID: node.tabID,
+                        sessionID: node.sessionID,
+                        originatingConnectionID: nil
+                    )
+                }
+                XCTAssertNil(node.session.mcpControlContext, label)
+            }
+
+            let nonWorkers: [(label: String, node: Node)] = [
+                ("Knowledge root", knowledge.root),
+                ("standard root", fixture.main),
+                ("standard worker", fixture.worker),
+                ("Knowledge session with unverifiable lineage", unverifiedLineage),
+                ("depth-2 Knowledge session", depthTwo)
+            ]
+            for target in nonWorkers {
+                let activationBefore = target.node.session.mcpControlContext?.activationID
+                await assertInvalidParams(contains: workerMessage, label: "Knowledge activation of \(target.label)") {
+                    _ = try await vm.mcpActivateControlContext(
+                        forTabID: target.node.tabID,
+                        sessionID: target.node.sessionID,
+                        originatingConnectionID: nil,
+                        expectedSessionProfile: .knowledge
+                    )
+                }
+                XCTAssertEqual(target.node.session.mcpControlContext?.activationID, activationBefore, target.label)
+            }
+
+            // The starter takes a Knowledge expectation only from a target created with that profile.
+            let dispatches = KnowledgeDispatchProbe()
+            let startRun = productionStartRun(recordingInto: dispatches)
+            for origin in [AgentModeViewModel.MCPSessionTarget.Origin.existingTab, .createdNewTab] {
+                await assertInvalidParams(contains: standardMessage, label: "starter target \(origin)") {
+                    _ = try await startRun(
+                        AgentModeViewModel.MCPSessionTarget(
+                            tabID: knowledge.worker.tabID,
+                            sessionID: knowledge.worker.sessionID,
+                            origin: origin
+                        ),
+                        "Research one perspective.",
+                        metadata(fixture.window),
+                        { _, _ in },
+                        vm,
+                        nil,
+                        nil,
+                        nil,
+                        nil,
+                        .empty,
+                        nil,
+                        knowledge.root.sessionID,
+                        nil
+                    )
+                }
+            }
+            XCTAssertTrue(dispatches.records.isEmpty)
+            XCTAssertNil(knowledge.worker.session.mcpControlContext)
+
+            let steered = DispatchProbe()
+            for (label, source) in [("standard root", Optional(fixture.main.tabID)), ("external", nil)] {
+                var run = makeRunService(fixture, sourceTabID: source)
+                run.testDispatchSteerInstruction = { _, _, _, _ in
+                    steered.count += 1
+                    return .startedRun
+                }
+                await assertInvalidParams(contains: standardMessage, label: "\(label) steer") {
+                    _ = try await run.execute(args: steerArgs(knowledge.worker.sessionID))
+                }
+            }
+            XCTAssertEqual(steered.count, 0)
+            XCTAssertNil(vm.mcpControlledSession(sessionID: knowledge.worker.sessionID))
+        }
+    }
+
+    /// A Knowledge root's steer reactivates its expired worker only for the caller frozen at
+    /// admission: when the caller's identity or eligibility changes before reactivation commits, the
+    /// steer never dispatches and no reactivated control outlives the refusal. Neither refusal nor the
+    /// successful reactivation changes the worker's own edit-approval setting.
+    func testKnowledgeSteerReactivationFailsClosedWhenTheCallerGoesStale() async throws {
+        try await withFixture { fixture in
+            let knowledge = try await makeKnowledgeTree(fixture)
+            let vm = fixture.viewModel
+            let root = knowledge.root
+            let worker = knowledge.worker
+            worker.session.mcpControlContext = nil
+            // The worker's own setting requires edit approval.
+            try await AsyncTestWait.waitUntil("worker approval subscription installed") {
+                worker.session.applyEditsApprovalScopeGeneration != nil
+            }
+            await vm.applyEditsApprovalStore.setAutoEditEnabled(
+                false,
+                for: vm.applyEditsScope(for: worker.tabID),
+                updateGlobalDefault: false
+            )
+            try await AsyncTestWait.waitUntil("worker observed its setting") {
+                !worker.session.autoEditEnabled
+            }
+            var run = makeRunService(fixture, sourceTabID: root.tabID)
+            let steered = DispatchProbe()
+            run.testDispatchSteerInstruction = { _, _, _, _ in
+                steered.count += 1
+                return .startedRun
+            }
+            // `wait: true` resolves the wait context after control admission and before reactivation.
+            @MainActor func steerWhileCallerChanges(_ change: @escaping @MainActor @Sendable () -> Void) async throws {
+                var staleRun = run
+                staleRun.resolveWaitPolicyContext = { metadata in
+                    await MainActor.run { change() }
+                    return .unresolved(metadata: metadata)
+                }
+                _ = try await staleRun.execute(args: steerArgs(worker.sessionID, wait: true))
+            }
+
+            // The caller's tab is rebound: its worker's lineage no longer verifies at activation.
+            let replacementID = UUID()
+            await assertInvalidParams(
+                contains: "requires a verified Knowledge worker session",
+                label: "caller rebound before reactivation"
+            ) {
+                try await steerWhileCallerChanges {
+                    root.session.testInstallPersistentSessionBinding(sessionID: replacementID)
+                }
+            }
+            XCTAssertEqual(steered.count, 0)
+            XCTAssertNil(vm.mcpControlledSession(sessionID: worker.sessionID))
+            XCTAssertEqual(worker.session.permissionProfile, .userConfigured)
+            await assertEditApproval(of: worker.session, is: false, in: vm, label: "after rebound-caller refusal")
+            root.session.testInstallPersistentSessionBinding(sessionID: root.sessionID)
+
+            // The caller loses eligibility: reactivation succeeds, the dispatch recheck refuses, and
+            // the reactivated control is removed.
+            let exploreContext = controlContext(sessionID: root.sessionID, role: .explore)
+            await assertInvalidParams(
+                contains: "Explore agents cannot start or control other agents",
+                label: "caller eligibility revoked before dispatch"
+            ) {
+                try await steerWhileCallerChanges {
+                    root.session.mcpControlContext = exploreContext
+                }
+            }
+            XCTAssertEqual(steered.count, 0)
+            XCTAssertNil(vm.mcpControlledSession(sessionID: worker.sessionID))
+            XCTAssertEqual(worker.session.permissionProfile, .userConfigured, "Cleanup restored provider permissions")
+            await assertEditApproval(of: worker.session, is: false, in: vm, label: "after reactivated-control cleanup")
+            root.session.mcpControlContext = nil
+
+            // Unchanged, the same steer reactivates the worker and dispatches.
+            _ = try await run.execute(args: steerArgs(worker.sessionID))
+            XCTAssertEqual(steered.count, 1)
+            let reactivated = try XCTUnwrap(vm.mcpControlledSession(sessionID: worker.sessionID))
+            XCTAssertEqual(reactivated.profile, .knowledge)
+            XCTAssertEqual(reactivated.mcpControlContext?.forceAutoEditEnabled, false)
+            await assertEditApproval(of: worker.session, is: false, in: vm, label: "after reactivation")
+        }
+    }
+
     func testKnowledgeStartRejectsCallerReplacedBeforeInnerAdmission() async throws {
         try await withFixture { fixture in
             let knowledge = try await makeKnowledgeTree(fixture)
@@ -1022,6 +1325,27 @@ final class AgentDelegationServiceBoundaryTests: XCTestCase {
         var count = 0
     }
 
+    /// Provider dispatches reached through the production starter or a steer, with the target's state
+    /// then: control, edit approval, permissions, and the run lease and prompt built for it.
+    @MainActor
+    private final class KnowledgeDispatchProbe {
+        struct Record {
+            let sessionID: UUID
+            let profile: AgentSessionProfile?
+            let parentSessionID: UUID?
+            let hasControlContext: Bool
+            let forceAutoEditEnabled: Bool?
+            let autoEditEnabled: Bool?
+            let approvalStoreAutoEditEnabled: Bool
+            let permissionProfile: AgentModeViewModel.AgentPermissionProfile?
+            let runToolPolicy: AgentDelegationPolicy.RunToolPolicy?
+            let leaseSpec: MCPBootstrapLeaseSpec?
+            let systemPrompt: String?
+        }
+
+        var records: [Record] = []
+    }
+
     @MainActor
     private final class KnowledgeStartProbe {
         struct Start {
@@ -1319,9 +1643,38 @@ final class AgentDelegationServiceBoundaryTests: XCTestCase {
         source: Node,
         probe: KnowledgeStartProbe,
         hooks: CallerHookProbe? = nil,
-        beforeLaunchSourceResolved: (@MainActor () -> Void)? = nil
+        beforeLaunchSourceResolved: (@MainActor () -> Void)? = nil,
+        startRun: AgentRunMCPToolService.StartRun? = nil
     ) -> AgentRunMCPToolService {
         let window = fixture.window
+        let recordingStartRun: AgentRunMCPToolService.StartRun = { target, _, _, _, agentModeVM, agentRaw, modelRaw, reasoningEffortRaw, taskLabelKind, _, workflow, expectedParentSessionID, _ in
+            let targetSession = agentModeVM.session(for: target.tabID, createIfNeeded: false)
+            probe.starts.append(.init(
+                agentRaw: agentRaw,
+                modelRaw: modelRaw,
+                reasoningEffortRaw: reasoningEffortRaw,
+                taskLabelKind: taskLabelKind,
+                workflowWasNil: workflow == nil,
+                expectedParentSessionID: expectedParentSessionID,
+                targetSessionID: target.sessionID,
+                targetProfile: targetSession?.profile,
+                targetParentSessionID: targetSession?.parentSessionID
+            ))
+            guard let sessionID = target.sessionID else {
+                throw MCPError.internalError("Knowledge start target did not resolve a session ID.")
+            }
+            return AgentExternalMCPRunStarter.StartOutcome(
+                snapshot: Self.knowledgeWorkerSnapshot(
+                    sessionID: sessionID,
+                    tabID: target.tabID,
+                    parentSessionID: targetSession?.parentSessionID,
+                    agentRaw: agentRaw,
+                    modelRaw: modelRaw,
+                    reasoningEffortRaw: reasoningEffortRaw
+                ),
+                delivery: .startedRun
+            )
+        }
         var service = AgentRunMCPToolService(
             toolName: MCPWindowToolName.agentRun,
             captureRequestMetadata: {
@@ -1337,34 +1690,7 @@ final class AgentDelegationServiceBoundaryTests: XCTestCase {
             resolveSpawnParentSessionID: { _, _ in nil },
             bindCurrentRequestToTab: { _, _ in },
             withHeartbeat: { _, _, _, _, operation in try await operation() },
-            startRun: { target, _, _, _, agentModeVM, agentRaw, modelRaw, reasoningEffortRaw, taskLabelKind, _, workflow, expectedParentSessionID, _ in
-                let targetSession = agentModeVM.session(for: target.tabID, createIfNeeded: false)
-                probe.starts.append(.init(
-                    agentRaw: agentRaw,
-                    modelRaw: modelRaw,
-                    reasoningEffortRaw: reasoningEffortRaw,
-                    taskLabelKind: taskLabelKind,
-                    workflowWasNil: workflow == nil,
-                    expectedParentSessionID: expectedParentSessionID,
-                    targetSessionID: target.sessionID,
-                    targetProfile: targetSession?.profile,
-                    targetParentSessionID: targetSession?.parentSessionID
-                ))
-                guard let sessionID = target.sessionID else {
-                    throw MCPError.internalError("Knowledge start target did not resolve a session ID.")
-                }
-                return AgentExternalMCPRunStarter.StartOutcome(
-                    snapshot: Self.knowledgeWorkerSnapshot(
-                        sessionID: sessionID,
-                        tabID: target.tabID,
-                        parentSessionID: targetSession?.parentSessionID,
-                        agentRaw: agentRaw,
-                        modelRaw: modelRaw,
-                        reasoningEffortRaw: reasoningEffortRaw
-                    ),
-                    delivery: .startedRun
-                )
-            }
+            startRun: startRun ?? recordingStartRun
         )
         service.resolveSpawnParentSessionIDFromSourceTabID = { (sourceTabID: UUID, window: WindowState) async -> UUID? in
             window.agentModeViewModel.mcpSpawnParentSessionID(sourceTabID: sourceTabID)
@@ -1400,6 +1726,140 @@ final class AgentDelegationServiceBoundaryTests: XCTestCase {
         }
         service.codexWebSearchEnabled = { true }
         return service
+    }
+
+    /// `agent_run.start`'s production start seam (as wired by `MCPServerViewModel`): the real
+    /// `AgentExternalMCPRunStarter` activates MCP control, configures, and binds the target; only the
+    /// provider dispatch is recorded instead of launching a provider.
+    private func productionStartRun(recordingInto dispatches: KnowledgeDispatchProbe) -> AgentRunMCPToolService.StartRun {
+        { target, message, metadata, bindCurrentRequestToTab, agentModeVM, agentRaw, modelRaw, reasoningEffortRaw, taskLabelKind, roleOhMyPiThinkingSelections, workflow, expectedParentSessionID, oracleReviewSource in
+            try await AgentExternalMCPRunStarter.start(
+                target: target,
+                message: message,
+                metadata: metadata,
+                bindCurrentRequestToTab: bindCurrentRequestToTab,
+                agentModeVM: agentModeVM,
+                agentRaw: agentRaw,
+                modelRaw: modelRaw,
+                reasoningEffortRaw: reasoningEffortRaw,
+                taskLabelKind: taskLabelKind,
+                roleOhMyPiThinkingSelections: roleOhMyPiThinkingSelections,
+                workflow: workflow,
+                expectedParentSessionID: expectedParentSessionID,
+                oracleReviewSource: oracleReviewSource,
+                dispatchInstruction: { sessionID, tabID, _, _, host in
+                    await dispatches.records.append(self.knowledgeDispatchRecord(sessionID: sessionID, tabID: tabID, host: host))
+                    return .startedRun
+                }
+            )
+        }
+    }
+
+    /// The dispatch target's state as the run would see it. The lease spec and prompt come from the
+    /// production builders (`MCPBootstrapLeaseSpec.agentMode`, `SystemPromptService.agentModePrompt`)
+    /// fed with the view model's own delegation run-tool policy, as the run service and coordinators do.
+    private func knowledgeDispatchRecord(
+        sessionID: UUID,
+        tabID: UUID,
+        host: AgentModeViewModel
+    ) async -> KnowledgeDispatchProbe.Record {
+        let session = host.session(for: tabID, createIfNeeded: false)
+        let scope = host.applyEditsScope(for: tabID)
+        let runToolPolicy = session.map { host.mcpDelegationRunToolPolicy(for: $0) }
+        let leaseSpec = session.flatMap { session in
+            runToolPolicy.map { policy in
+                MCPBootstrapLeaseSpec.agentMode(
+                    tabID: tabID,
+                    runID: UUID(),
+                    gateID: UUID(),
+                    windowID: scope.windowID,
+                    agent: session.selectedAgent,
+                    sessionProfile: session.profile,
+                    taskLabelKind: session.mcpControlContext?.taskLabelKind,
+                    allowsAgentExternalControlTools: policy.allowsAgentExternalControlTools,
+                    additionalRestrictedTools: policy.additionalRestrictedTools
+                )
+            }
+        }
+        let systemPrompt = session.flatMap { session in
+            runToolPolicy.map { policy in
+                SystemPromptService.agentModePrompt(
+                    agentKind: session.selectedAgent,
+                    taskLabelKind: session.mcpControlContext?.taskLabelKind,
+                    sessionProfile: session.profile,
+                    delegationAudience: policy.promptAudience
+                )
+            }
+        }
+        return await KnowledgeDispatchProbe.Record(
+            sessionID: sessionID,
+            profile: session?.profile,
+            parentSessionID: session?.parentSessionID,
+            hasControlContext: session?.mcpControlContext?.sessionID == sessionID,
+            forceAutoEditEnabled: session?.mcpControlContext?.forceAutoEditEnabled,
+            autoEditEnabled: session?.autoEditEnabled,
+            approvalStoreAutoEditEnabled: host.applyEditsApprovalStore.autoEditEnabled(for: scope),
+            permissionProfile: session?.permissionProfile,
+            runToolPolicy: runToolPolicy,
+            leaseSpec: leaseSpec,
+            systemPrompt: systemPrompt
+        )
+    }
+
+    /// A dispatched Knowledge research worker: MCP-controlled without forced auto-edit, so the
+    /// session and approval store keep its own edit-approval setting; on the global sub-agent
+    /// permission profile; and a delegation leaf in both its run lease and its prompt.
+    private func assertKnowledgeWorkerDispatch(
+        _ record: KnowledgeDispatchProbe.Record,
+        autoEdit: Bool,
+        permissionProfile: AgentModeViewModel.AgentPermissionProfile,
+        label: String,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) {
+        XCTAssertEqual(record.profile, .knowledge, label, file: file, line: line)
+        XCTAssertTrue(record.hasControlContext, "\(label): MCP control is active at dispatch", file: file, line: line)
+        XCTAssertEqual(record.forceAutoEditEnabled, false, label, file: file, line: line)
+        XCTAssertEqual(record.autoEditEnabled, autoEdit, label, file: file, line: line)
+        XCTAssertEqual(record.approvalStoreAutoEditEnabled, autoEdit, label, file: file, line: line)
+        XCTAssertEqual(record.permissionProfile, permissionProfile, label, file: file, line: line)
+        XCTAssertEqual(record.runToolPolicy, .leaf, label, file: file, line: line)
+        guard let lease = record.leaseSpec, let prompt = record.systemPrompt else {
+            return XCTFail("\(label): no lease or prompt was built", file: file, line: line)
+        }
+        XCTAssertEqual(lease.sessionProfile, .knowledge, label, file: file, line: line)
+        XCTAssertEqual(lease.allowedToolsOverride, AgentModeMCPToolPolicy.knowledgeAllowedTools, label, file: file, line: line)
+        XCTAssertTrue(
+            AgentDelegationPolicy.delegationToolNames.isSubset(of: lease.restrictedTools),
+            "\(label): the lease restricts every delegation tool",
+            file: file,
+            line: line
+        )
+        XCTAssertFalse(lease.allowsAgentExternalControlTools, label, file: file, line: line)
+        XCTAssertTrue(prompt.contains(AgentModePrompts.Fragments.knowledgeResearchWorkerGuidance), label, file: file, line: line)
+        XCTAssertFalse(prompt.contains(AgentModePrompts.Fragments.knowledgeResearchRootGuidance), label, file: file, line: line)
+    }
+
+    private func assertEditApproval(
+        of session: AgentModeViewModel.TabSession,
+        is autoEdit: Bool,
+        in vm: AgentModeViewModel,
+        label: String,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) async {
+        XCTAssertEqual(session.autoEditEnabled, autoEdit, "\(label): session", file: file, line: line)
+        let stored = await vm.applyEditsApprovalStore.autoEditEnabled(for: vm.applyEditsScope(for: session.tabID))
+        XCTAssertEqual(stored, autoEdit, "\(label): approval store", file: file, line: line)
+    }
+
+    private func steerArgs(_ sessionID: UUID, wait: Bool = false) -> [String: Value] {
+        [
+            "op": .string("steer"),
+            "session_id": .string(sessionID.uuidString),
+            "message": .string("Follow up on the strongest source."),
+            "wait": .bool(wait)
+        ]
     }
 
     private nonisolated static func knowledgeWorkerSnapshot(

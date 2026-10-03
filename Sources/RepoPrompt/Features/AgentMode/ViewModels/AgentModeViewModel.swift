@@ -8102,7 +8102,8 @@ final class AgentModeViewModel: ObservableObject {
         let createdTarget = MCPSessionTarget(
             tabID: hydrated.tabID,
             sessionID: createdSessionID,
-            origin: .createdNewTab
+            origin: .createdNewTab,
+            adoptedSessionProfile: childSessionProfile
         )
         do {
             try commitSpawnParentSessionID(
@@ -8486,11 +8487,26 @@ final class AgentModeViewModel: ObservableObject {
         taskLabelKind: AgentModelCatalog.TaskLabelKind? = nil,
         startPending: Bool = false,
         markSessionAsMCPOriginated: Bool = true,
-        requireInactiveRunState: Bool = false
+        requireInactiveRunState: Bool = false,
+        expectedSessionProfile: AgentSessionProfile = .standard
     ) async throws -> AgentMCPControlContext {
         let session = try await ensureSessionReady(tabID: tabID)
-        guard session.profile == .standard else {
-            throw MCPError.invalidParams("Knowledge sessions cannot be converted into MCP-controlled coding sessions. Start a standard Agent session instead.")
+        switch expectedSessionProfile {
+        case .standard:
+            guard session.profile == .standard else {
+                throw MCPError.invalidParams("Knowledge sessions cannot be converted into MCP-controlled coding sessions. Start a standard Agent session instead.")
+            }
+        case .knowledge:
+            // Only a Knowledge `agent_run` caller expects this (its fresh worker, or its own worker
+            // admitted by K6 for steer): the target must be a verified Knowledge research worker.
+            guard session.hasLoadedPersistedState,
+                  session.profile == .knowledge,
+                  mcpDelegationSessionProfile(sessionID: sessionID) == .knowledge,
+                  mcpDelegationLineage(for: session)
+                  == .resolved(depth: AgentDelegationPolicy.maximumKnowledgeDelegatingDepth + 1)
+            else {
+                throw MCPError.invalidParams("MCP control for a Knowledge research worker requires a verified Knowledge worker session started by a Knowledge session. Refusing to activate it.")
+            }
         }
         guard newWorkBlockedMessage(for: session) == nil else {
             throw MCPError.invalidParams(Self.composeTabRemovalInProgressMessage)
@@ -8555,6 +8571,10 @@ final class AgentModeViewModel: ObservableObject {
         let priorAutoEditEnabled = existingContext?.sessionID == sessionID
             ? existingContext?.autoEditEnabledBeforeOverride ?? session.autoEditEnabled
             : session.autoEditEnabled
+        // A Knowledge research worker keeps its normal Knowledge-session edit-approval setting: MCP
+        // control never forces auto-edit, so activation and cleanup leave the session's and approval
+        // store's auto-edit untouched. Standard activation is unchanged.
+        let forcesAutoEdit = expectedSessionProfile == .standard
         #if DEBUG
             let permitsQualificationApplyEditsReview: Bool = if let qualification = session.ompQualificationStartContext,
                                                                 let activeWorkspaceID = workspaceManager?.activeWorkspace?.id
@@ -8567,11 +8587,13 @@ final class AgentModeViewModel: ObservableObject {
             } else {
                 false
             }
-            let mcpForceAutoEditEnabled = permitsQualificationApplyEditsReview
-                ? priorAutoEditEnabled
-                : true
+            let mcpForceAutoEditEnabled = forcesAutoEdit && (
+                permitsQualificationApplyEditsReview
+                    ? priorAutoEditEnabled
+                    : true
+            )
         #else
-            let mcpForceAutoEditEnabled = true
+            let mcpForceAutoEditEnabled = forcesAutoEdit
         #endif
         let activatedControlContext = AgentMCPControlContext(
             sessionID: sessionID,
@@ -8621,7 +8643,7 @@ final class AgentModeViewModel: ObservableObject {
         #endif
         #if DEBUG
             let activationAutoEditEnabled = !permitsQualificationApplyEditsReview
-            if priorAutoEditEnabled != activationAutoEditEnabled {
+            if forcesAutoEdit, priorAutoEditEnabled != activationAutoEditEnabled {
                 session.autoEditEnabled = activationAutoEditEnabled
                 await applyEditsApprovalStore.setAutoEditEnabled(
                     activationAutoEditEnabled,
@@ -8630,7 +8652,7 @@ final class AgentModeViewModel: ObservableObject {
                 )
             }
         #else
-            if priorAutoEditEnabled != true {
+            if forcesAutoEdit, priorAutoEditEnabled != true {
                 session.autoEditEnabled = true
                 await applyEditsApprovalStore.setAutoEditEnabled(
                     true,
@@ -8651,9 +8673,11 @@ final class AgentModeViewModel: ObservableObject {
                 session.mcpControlContext = nil
                 session.mcpFollowUpRunPending = false
                 session.permissionProfile = .userConfigured
-                session.autoEditEnabled = priorAutoEditEnabled
+                if forcesAutoEdit {
+                    session.autoEditEnabled = priorAutoEditEnabled
+                }
                 mcpControlledTabIDs.remove(tabID)
-                if let generation = session.applyEditsApprovalScopeGeneration {
+                if forcesAutoEdit, let generation = session.applyEditsApprovalScopeGeneration {
                     _ = await applyEditsApprovalStore.setAutoEditEnabled(
                         priorAutoEditEnabled,
                         for: applyEditsScope(for: tabID),

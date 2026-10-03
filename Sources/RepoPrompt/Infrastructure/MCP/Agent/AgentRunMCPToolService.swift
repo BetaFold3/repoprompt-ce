@@ -2433,7 +2433,10 @@ struct AgentRunMCPToolService {
             sessionID: sessionID,
             targetWindow: targetWindow,
             agentModeVM: agentModeVM,
-            metadata: metadata
+            metadata: metadata,
+            // Only a Knowledge caller admitted for its own worker (K6) may reactivate a Knowledge
+            // session; every other caller keeps the standard-only activation.
+            expectedSessionProfile: steerAdmission.callerProfile == .knowledge ? .knowledge : .standard
         )
         let delivery: AgentModeViewModel.MCPInstructionDispatch
         let snapshot: AgentRunMCPSnapshot
@@ -2553,7 +2556,8 @@ struct AgentRunMCPToolService {
         sessionID: UUID,
         targetWindow: WindowState,
         agentModeVM: AgentModeViewModel,
-        metadata: RequestMetadata
+        metadata: RequestMetadata,
+        expectedSessionProfile: AgentSessionProfile
     ) async throws -> SteerControlResolution {
         if let controlledSession = agentModeVM.mcpControlledSession(sessionID: sessionID) {
             return SteerControlResolution(
@@ -2598,7 +2602,8 @@ struct AgentRunMCPToolService {
                 originatingConnectionID: metadata.connectionID,
                 startPending: true,
                 markSessionAsMCPOriginated: false,
-                requireInactiveRunState: true
+                requireInactiveRunState: true,
+                expectedSessionProfile: expectedSessionProfile
             )
         } catch {
             await agentModeVM.mcpDiscardSessionTarget(target)

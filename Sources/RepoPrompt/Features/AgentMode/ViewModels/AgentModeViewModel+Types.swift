@@ -635,6 +635,9 @@ extension AgentModeViewModel {
         let tabID: UUID
         let sessionID: UUID?
         let origin: Origin
+        /// Profile adopted by a newly created child tab (`childSessionProfile`), or nil. MCP control
+        /// activation expects this profile instead of `.standard`; it is never inferred from a tab.
+        var adoptedSessionProfile: AgentSessionProfile?
     }
 
     struct AutoEditPermissionGuidance: Equatable {

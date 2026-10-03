@@ -189,7 +189,9 @@ enum AgentExternalMCPRunStarter {
             originatingConnectionID: metadata.connectionID,
             origin: AgentSessionOrigin.fromClientIdentity(metadata.clientName),
             taskLabelKind: taskLabelKind,
-            startPending: true
+            startPending: true,
+            // A Knowledge research worker's target carries its adopted profile from creation.
+            expectedSessionProfile: target.adoptedSessionProfile ?? .standard
         )
 
         // All failures after activation must clean up only this invocation's control context.
