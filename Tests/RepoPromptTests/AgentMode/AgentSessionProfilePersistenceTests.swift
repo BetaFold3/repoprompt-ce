@@ -14,8 +14,13 @@ final class AgentSessionProfilePersistenceTests: XCTestCase {
                 "apply_edits",
                 "oracle_utils",
                 "ask_oracle",
-                "oracle_chat_log"
+                "oracle_chat_log",
+                "agent_run"
             ]
+        )
+        XCTAssertEqual(
+            KnowledgeSessionPolicy.allowedAgentRunOperations,
+            ["start", "poll", "wait", "cancel", "steer", "respond"]
         )
     }
 

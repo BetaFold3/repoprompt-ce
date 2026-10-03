@@ -9,6 +9,10 @@ import Foundation
 /// cyclic, or inconsistent are delegation leaves. The ceiling applies to Agent Mode sessions
 /// only; external MCP clients without an Agent Mode source keep their existing surface.
 ///
+/// Knowledge-profile sessions deliberately depart from the depth-1 rule: only a verified
+/// Knowledge root (depth 0) may delegate, and only through `agent_run` to fresh Knowledge
+/// research workers. Every Knowledge session at depth ≥ 1 is a leaf (`knowledgeLeaf`).
+///
 /// Related:
 /// - AgentModeViewModel.mcpDelegationLineage / mcpValidateAgentRunSpawnAllowed (live/index lookup, admission)
 /// - AgentModeRunLease.swift (leaf restrictions folded into `restrictedTools`)
@@ -18,10 +22,16 @@ enum AgentDelegationPolicy {
     /// Deepest lineage depth that may still start or control delegated agents.
     static let maximumDelegatingDepth = 1
 
+    /// Deepest lineage depth at which a Knowledge-profile session may still delegate.
+    static let maximumKnowledgeDelegatingDepth = 0
+
     /// Every RepoPrompt MCP delegation tool: `agent_run`, `agent_manage`, and `agent_explore`.
     static let delegationToolNames: Set<String> = MCPToolCapabilities.toolNames(
         for: [.agentExternalControl, .agentExploreControl]
     )
+
+    /// The only delegation tool an eligible Knowledge root receives.
+    static let knowledgeDelegationToolNames: Set<String> = [MCPWindowToolName.agentRun]
 
     /// Parent relationship recorded for one known session.
     enum ParentLookup: Equatable {
@@ -50,6 +60,8 @@ enum AgentDelegationPolicy {
     enum Decision: Equatable {
         case eligible(depth: Int)
         case exploreLeaf
+        /// Knowledge research worker (Knowledge session below the Knowledge delegating depth).
+        case knowledgeLeaf(depth: Int)
         case depthLimit(depth: Int)
         case lineageFailure(LineageResolution)
 
@@ -104,21 +116,36 @@ enum AgentDelegationPolicy {
     }
 
     /// Explore is a leaf at every depth. A nil role (explicit-model session) is not a lineage
-    /// failure and is judged by depth like any named non-explore role.
+    /// failure and is judged by depth like any named non-explore role. Knowledge sessions are
+    /// leaves below `maximumKnowledgeDelegatingDepth`, checked before the general depth test.
     static func decision(
         taskLabelKind: AgentModelCatalog.TaskLabelKind?,
-        lineage: LineageResolution
+        lineage: LineageResolution,
+        sessionProfile: AgentSessionProfile = .standard
     ) -> Decision {
         if taskLabelKind == .explore { return .exploreLeaf }
         guard let depth = lineage.depth else { return .lineageFailure(lineage) }
+        if sessionProfile == .knowledge, depth > maximumKnowledgeDelegatingDepth {
+            return .knowledgeLeaf(depth: depth)
+        }
         return depth <= maximumDelegatingDepth ? .eligible(depth: depth) : .depthLimit(depth: depth)
     }
 
     static func runToolPolicy(
         decision: Decision,
-        taskLabelKind: AgentModelCatalog.TaskLabelKind?
+        taskLabelKind: AgentModelCatalog.TaskLabelKind?,
+        sessionProfile: AgentSessionProfile = .standard
     ) -> RunToolPolicy {
         guard decision.canDelegate else { return .leaf }
+        if sessionProfile == .knowledge {
+            // A Knowledge root keeps only `agent_run`; `agent_manage` and `agent_explore` stay
+            // restricted at execution time even though the advertisement flag is set.
+            return RunToolPolicy(
+                allowsAgentExternalControlTools: true,
+                additionalRestrictedTools: delegationToolNames.subtracting(knowledgeDelegationToolNames),
+                promptAudience: .agentRunOnly
+            )
+        }
         return RunToolPolicy(
             allowsAgentExternalControlTools: true,
             additionalRestrictedTools: [],
@@ -135,6 +162,8 @@ enum AgentDelegationPolicy {
             nil
         case .exploreLeaf:
             "Explore agents cannot start or control other agents."
+        case .knowledgeLeaf:
+            "Knowledge research workers cannot start or control other agents."
         case let .depthLimit(depth):
             "This agent session is at delegation depth \(depth); RepoPrompt allows delegation only from depth 0 (main) and depth 1 (worker) sessions, so sub-workers cannot start or control other agents."
         case let .lineageFailure(resolution):

@@ -311,7 +311,9 @@ final class AgentModeViewModelDelegatedQuestionTests: XCTestCase {
     /// Pins the production `ask_user` → `agent_run` snapshot mapping (`mcpSnapshot(for:)` →
     /// `mcpPendingInteraction`) to the formatter: the wire encoding `agent_run` poll/wait returns
     /// carries every structured field, and its formatted text hands the parent the complete
-    /// question, including a token present only in an option the parent could not guess.
+    /// question, including a token present only in an option the parent could not guess. The
+    /// single-wait result is re-parsed by the service (`AgentRunMCPToolService.snapshot(from:)`)
+    /// and re-encoded (`asObject()`) before formatting, so that conversion must be lossless too.
     func testAgentRunSnapshotOfPendingAskUserEncodesAndFormatsCompleteStructuredQuestion() async throws {
         let vm = makeViewModel()
         let parent = makeSession(vm, parent: nil)
@@ -377,10 +379,42 @@ final class AgentModeViewModelDelegatedQuestionTests: XCTestCase {
             XCTAssertEqual(options.map { $0["description"]?.stringValue }, question.options.map(\.description), question.id)
         }
 
+        // Single wait decorates the service-parsed snapshot of the raw wait value; per-question
+        // context and selection semantics must survive that wire conversion unchanged.
+        let converted = try XCTUnwrap(AgentRunMCPToolService.snapshot(from: object))
+        XCTAssertEqual(converted.interaction, snapshot.interaction, "Service wire conversion must preserve the structured question")
+        let convertedObject = converted.asObject()
+        XCTAssertEqual(convertedObject["interaction"], object["interaction"], "Re-encoded interaction must match the production wire encoding")
+
         // Formatted agent_run text: the only copy of the question the parent model reads.
-        let blocks = ToolOutputFormatter.formatAgentRun(args: ["op": .string("wait")], value: .object(object))
+        for (path, value) in [("snapshot", object), ("service-converted", convertedObject)] {
+            try assertFormattedAgentRunCarriesCompleteQuestion(
+                value: value,
+                path: path,
+                interaction: interaction,
+                hiddenLabel: hiddenLabel,
+                hiddenDescription: hiddenDescription,
+                strategyContext: strategyContext,
+                targetContext: targetContext
+            )
+        }
+
+        vm.skipAskUser(tabID: child.tabID, interactionID: interaction.id)
+        _ = try await task.value
+    }
+
+    private func assertFormattedAgentRunCarriesCompleteQuestion(
+        value: [String: Value],
+        path: String,
+        interaction: AgentAskUserInteraction,
+        hiddenLabel: String,
+        hiddenDescription: String,
+        strategyContext: String,
+        targetContext: String
+    ) throws {
+        let blocks = ToolOutputFormatter.formatAgentRun(args: ["op": .string("wait")], value: .object(value))
         guard case let .text(text, _, _) = try XCTUnwrap(blocks.first) else {
-            return XCTFail("Expected agent_run text output")
+            return XCTFail("Expected agent_run text output (\(path))")
         }
         for fragment in [
             "Title: Release decision",
@@ -398,12 +432,9 @@ final class AgentModeViewModelDelegatedQuestionTests: XCTestCase {
             "- Interaction ID: `\(interaction.id.uuidString)`",
             "- Provide `answers` as an object keyed by question id (`strategy`, `target`), answering every question."
         ] {
-            XCTAssertTrue(text.contains(fragment), "Formatted agent_run snapshot lost: \(fragment)")
+            XCTAssertTrue(text.contains(fragment), "Formatted agent_run \(path) lost: \(fragment)")
         }
-        XCTAssertFalse(text.contains("Provide the requested answers to continue."), "The derived generic prompt is replaced by the full questions")
-
-        vm.skipAskUser(tabID: child.tabID, interactionID: interaction.id)
-        _ = try await task.value
+        XCTAssertFalse(text.contains("Provide the requested answers to continue."), "The derived generic prompt is replaced by the full questions (\(path))")
     }
 
     // MARK: - Idle parent: next turn's first input (§6.2)

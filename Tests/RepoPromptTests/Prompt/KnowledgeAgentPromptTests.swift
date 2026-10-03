@@ -60,6 +60,78 @@ final class KnowledgeAgentPromptTests: XCTestCase {
         }
     }
 
+    func testKnowledgeRootPromptDescribesParallelResearchWorkers() {
+        for provider in [AgentProviderKind.claudeCode, .codexExec] {
+            let root = SystemPromptService.agentModePrompt(
+                agentKind: provider,
+                sessionProfile: .knowledge,
+                delegationAudience: .agentRunOnly
+            )
+            XCTAssertTrue(root.contains("RepoPrompt's Knowledge agent"), "\(provider)")
+            XCTAssertTrue(root.contains("**Knowledge research workers**"), "\(provider)")
+            XCTAssertTrue(root.contains("agent_run`"), "\(provider)")
+            XCTAssertTrue(root.contains("`detach:true`"), "\(provider)")
+            XCTAssertTrue(root.contains("`op:\"wait\"`"), "\(provider)")
+            XCTAssertTrue(root.contains("Omitting `model_id` gives a worker this session's provider and model"), "\(provider)")
+            XCTAssertTrue(root.contains("URLs or workspace paths and their uncertainties"), "\(provider)")
+            XCTAssertTrue(root.contains("you own the final answer and any workspace artifacts"), "\(provider)")
+            XCTAssertTrue(root.contains("Workers cannot start or control other agents"), "\(provider)")
+            XCTAssertFalse(root.contains("agent-delegation tasks"), "\(provider): the root prohibition is replaced")
+            XCTAssertFalse(root.contains("**Research worker**"), "\(provider)")
+            for forbidden in ["agent_manage", "agent_explore", "model_id=\"pair\"", "Pair worker"] {
+                XCTAssertFalse(root.contains(forbidden), "\(provider): \(forbidden)")
+            }
+            XCTAssertEqual(
+                root,
+                SystemPromptService.agentModePrompt(
+                    agentKind: provider,
+                    sessionProfile: .knowledge,
+                    delegationAudience: .agentRunOnly
+                ),
+                "\(provider): root text is static for the session"
+            )
+        }
+    }
+
+    func testKnowledgeWorkerPromptReportsBackAndCannotDelegate() {
+        for provider in [AgentProviderKind.claudeCode, .codexExec] {
+            let worker = SystemPromptService.agentModePrompt(
+                agentKind: provider,
+                sessionProfile: .knowledge,
+                delegationAudience: AgentDelegationPolicy.RunToolPolicy.leaf.promptAudience
+            )
+            XCTAssertTrue(worker.contains("**Research worker**"), "\(provider)")
+            XCTAssertTrue(worker.contains("You are a Knowledge research worker"), "\(provider)")
+            XCTAssertTrue(worker.contains("Return your findings in your final message"), "\(provider)")
+            XCTAssertTrue(worker.contains("You cannot start or control other agents."), "\(provider)")
+            XCTAssertTrue(worker.contains("agent-delegation tasks"), "\(provider)")
+            XCTAssertFalse(worker.contains("**Knowledge research workers**"), "\(provider)")
+            for forbidden in ["agent_run", "agent_manage", "agent_explore", "Pair worker"] {
+                XCTAssertFalse(worker.contains(forbidden), "\(provider): \(forbidden)")
+            }
+        }
+    }
+
+    func testKnowledgePromptWithoutAudienceKeepsStandaloneProhibition() {
+        let standalone = SystemPromptService.agentModePrompt(
+            agentKind: .claudeCode,
+            sessionProfile: .knowledge
+        )
+        XCTAssertTrue(standalone.contains(
+            "Do not perform coding, build, Git, shell, worktree, computer-use, or agent-delegation tasks. Explain when a request belongs in a standard Agent Mode session."
+        ))
+        XCTAssertFalse(standalone.contains("**Knowledge research workers**"))
+        XCTAssertFalse(standalone.contains("**Research worker**"))
+        XCTAssertNotEqual(
+            standalone,
+            SystemPromptService.agentModePrompt(
+                agentKind: .claudeCode,
+                sessionProfile: .knowledge,
+                delegationAudience: .agentRunOnly
+            )
+        )
+    }
+
     func testStandardPromptDoesNotAdoptKnowledgeIdentity() {
         let standard = SystemPromptService.agentModePrompt(agentKind: .claudeCode)
         let knowledge = SystemPromptService.agentModePrompt(

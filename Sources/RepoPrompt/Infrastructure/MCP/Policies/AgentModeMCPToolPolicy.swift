@@ -25,6 +25,18 @@ enum AgentModeMCPToolPolicy {
     consultations batches accept 1...16 lanes, return stable indexed operation receipts, queue behind actual per-tab Oracle capacity, and use the same bounded wait envelope as op:wait. Resume or cancel pending lanes by operation ID; request_id remains single-send-only. No packet, hash, manifest, or verification-gate ritual is required.
     """
 
+    /// Knowledge-root `agent_run` description. It lists only what a Knowledge caller may do: start
+    /// fresh Knowledge research workers and control its own workers. Workers never see `agent_run`.
+    static let knowledgeAgentRunDescription = """
+    Start and control Knowledge research workers: fresh Knowledge sessions that each research one independent question or perspective and report back. From a Knowledge session only the following is available.
+
+    op:start creates a new research worker with message as its question. Omit model_id to give the worker this session's provider, model, and effort, or pass an explicit Claude Code or Codex compound model_id (agent:model). Role labels, tab_id, session_id, workflows, and worktree arguments are rejected. A Codex worker requires Codex's Search tool to be turned on. Prefer detach:true and start every worker before waiting. The start receipt's knowledge_worker field reports the worker's provider and model.
+
+    op:wait and op:poll with session_id or session_ids collect results from this session's own workers. Omit timeout for the automatic wait; pending is normal, so wait again instead of starting a new worker. op:steer (session_id, message), op:respond (session_id, interaction_id, response or answers), and op:cancel (session_id) act only on this session's own workers.
+
+    Workers cannot start or control other agents, and no other session, including standard Agent Mode sessions, can be addressed.
+    """
+
     /// Tools granted to legacy/generic agent mode runs (from MCPPolicyGatedTools).
     /// These enable user interaction, agent workflow control, and agent-only oracle recovery.
     static let grantedCapabilities: Set<MCPToolCapability> = [

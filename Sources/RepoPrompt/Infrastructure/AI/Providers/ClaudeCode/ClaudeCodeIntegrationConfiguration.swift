@@ -70,6 +70,8 @@ enum ClaudeCodeIntegrationConfiguration {
     /// Claude Code tools to disallow during Knowledge sessions.
     /// Native Read remains available for images and PDFs; RepoPrompt owns text reads.
     /// WebSearch/WebFetch are intentionally absent so provider web preferences remain authoritative.
+    /// Native delegation (`Task` and its successor `Agent`) is blocked: Knowledge roots delegate
+    /// only through RepoPrompt `agent_run` research workers.
     private static let knowledgeDisallowedTools: [String] = [
         "Bash",
         "Write",
@@ -77,6 +79,7 @@ enum ClaudeCodeIntegrationConfiguration {
         "Glob",
         "Grep",
         "Task",
+        "Agent",
         "SlashCommand",
         "BashOutput",
         "KillShell",

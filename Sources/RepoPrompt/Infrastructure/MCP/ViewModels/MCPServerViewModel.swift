@@ -418,6 +418,9 @@ final class MCPServerViewModel: ObservableObject {
             MCPOracleToolService.ExportOracleResponse?
         var requestMetadataOverrideForTesting: RequestMetadata?
         var agentRunDispatchOverrideForTesting: AgentExternalMCPRunStarter.DispatchInstruction?
+        /// Replaces the Codex Search toggle read by the Knowledge research-worker web gate so tests
+        /// never read or write real settings.
+        var agentRunCodexWebSearchEnabledOverrideForTesting: Bool?
         private var contextBuilderFollowUpOverrideForTesting: MCPWindowToolDependencies.RunMCPPlanOrQuestion?
         private var contextBuilderBeforeFinalReviewAuthorizationForTesting:
             MCPWindowToolDependencies.BeforeContextBuilderFinalReviewAuthorization?
@@ -461,6 +464,10 @@ final class MCPServerViewModel: ObservableObject {
             _ override: AgentExternalMCPRunStarter.DispatchInstruction?
         ) {
             agentRunDispatchOverrideForTesting = override
+        }
+
+        func setAgentRunCodexWebSearchEnabledOverrideForTesting(_ override: Bool?) {
+            agentRunCodexWebSearchEnabledOverrideForTesting = override
         }
 
         func executeAgentRunForTesting(args: [String: Value]) async throws -> Value {
@@ -803,6 +810,18 @@ final class MCPServerViewModel: ObservableObject {
             },
             resolveWaitPolicyContext: { [self] metadata in
                 await resolveAgentLifecycleWaitPolicyContext(metadata: metadata)
+            },
+            resolveConnectionSessionProfile: { metadata in
+                guard let connectionID = metadata.connectionID else { return .standard }
+                return await ServerNetworkManager.shared.effectiveSessionProfile(for: connectionID)
+            },
+            codexWebSearchEnabled: { [self] in
+                #if DEBUG
+                    if let override = agentRunCodexWebSearchEnabledOverrideForTesting {
+                        return override
+                    }
+                #endif
+                return CodexAgentToolPreferences.searchToolEnabled()
             },
             startRun: { [self] target, message, metadata, bindCurrentRequestToTab, agentModeVM, agentRaw, modelRaw, reasoningEffortRaw, taskLabelKind, roleOhMyPiThinkingSelections, workflow, expectedParentSessionID, oracleReviewSource in
                 try await AgentExternalMCPRunStarter.start(

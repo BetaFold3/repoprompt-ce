@@ -825,7 +825,10 @@ class SystemPromptService {
         delegationAudience: ExportDelegationAudience? = nil
     ) -> String {
         if sessionProfile == .knowledge {
-            return AgentModePrompts.knowledgePrompt(agentKind: agentKind)
+            return AgentModePrompts.knowledgePrompt(
+                agentKind: agentKind,
+                delegationAudience: delegationAudience
+            )
         }
 
         // Role-specific prompts: dedicated lean prompts instead of conditional blocks

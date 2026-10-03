@@ -360,6 +360,14 @@ struct AgentRunMCPToolService {
         AgentMCPWaitPolicy.RequestContext.unresolved(metadata: $0)
     }
 
+    /// Session profile of the calling connection's enforced tool policy. The default treats the
+    /// caller as standard; the server view model injects the connection manager's value. A
+    /// Knowledge caller is also recognized from its live routed source session.
+    var resolveConnectionSessionProfile: (_ metadata: RequestMetadata) async -> AgentSessionProfile = { _ in .standard }
+    /// K5 web gate input: whether Codex's built-in Search tool is enabled. Injectable so tests never
+    /// read or write real settings.
+    var codexWebSearchEnabled: @MainActor () -> Bool = { CodexAgentToolPreferences.searchToolEnabled() }
+
     let startRun: StartRun
     var currentSnapshotProvider: (@Sendable (_ sessionID: UUID, _ agentModeVM: AgentModeViewModel) async -> AgentRunMCPSnapshot?)?
     #if DEBUG
@@ -392,6 +400,9 @@ struct AgentRunMCPToolService {
             _ workflow: AgentWorkflowDefinition?,
             _ agentModeVM: AgentModeViewModel
         ) async throws -> AgentModeViewModel.MCPInstructionDispatch)?
+        /// Runs at the `request_id` registry lookup's suspension point, after the lookup returned and
+        /// before its decision is acted on.
+        var testDuringIdempotencyLookup: (() async -> Void)?
     #endif
     var vcsService: VCSService = .shared
     var gitTargetResolver: GitRepoTargetResolver = .init()
@@ -422,31 +433,41 @@ struct AgentRunMCPToolService {
         if op != "start", startWorktreeCoordinator.containsArguments(args) {
             throw MCPError.invalidParams("agent_run worktree arguments are only supported with op=start.")
         }
+        let knowledgeCaller = try await admitKnowledgeCaller(op: op, args: args)
         switch op {
         case "start", "steer", "respond":
             if let requestID = normalizedString(args["request_id"]) {
-                return try await executeIdempotentMutation(op: op, requestID: requestID, args: args)
+                return try await executeIdempotentMutation(
+                    op: op,
+                    requestID: requestID,
+                    args: args,
+                    knowledgeCaller: knowledgeCaller
+                )
             }
-            return try await executeMutationCore(op: op, args: args)
+            return try await executeMutationCore(op: op, args: args, knowledgeCaller: knowledgeCaller)
         case "poll":
-            return try await executeWait(args: args, forcePoll: true)
+            return try await executeWait(args: args, forcePoll: true, knowledgeCaller: knowledgeCaller)
         case "wait":
-            return try await executeWait(args: args)
+            return try await executeWait(args: args, knowledgeCaller: knowledgeCaller)
         case "cancel":
-            return try await executeCancel(args: args)
+            return try await executeCancel(args: args, knowledgeCaller: knowledgeCaller)
         default:
             throw MCPError.invalidParams("Unsupported agent_run op '\(op)'. Use start, poll, wait, cancel, steer, or respond.")
         }
     }
 
-    private func executeMutationCore(op: String, args: [String: Value]) async throws -> Value {
+    private func executeMutationCore(
+        op: String,
+        args: [String: Value],
+        knowledgeCaller: KnowledgeCaller? = nil
+    ) async throws -> Value {
         switch op {
         case "start":
-            return try await executeStart(args: args)
+            return try await executeStart(args: args, knowledgeCaller: knowledgeCaller)
         case "steer":
-            return try await executeSteer(args: args)
+            return try await executeSteer(args: args, knowledgeCaller: knowledgeCaller)
         case "respond":
-            return try await executeRespond(args: args)
+            return try await executeRespond(args: args, knowledgeCaller: knowledgeCaller)
         default:
             throw MCPError.invalidParams("Unsupported agent_run mutating op '\(op)'.")
         }
@@ -459,13 +480,24 @@ struct AgentRunMCPToolService {
     private func executeIdempotentMutation(
         op: String,
         requestID: String,
-        args: [String: Value]
+        args: [String: Value],
+        knowledgeCaller: KnowledgeCaller?
     ) async throws -> Value {
         let metadata = await captureRequestMetadata()
         let clientID = MCPClientIdentity.storageKey(metadata.clientName)
             ?? metadata.connectionID?.uuidString
             ?? "unknown-client"
-        let key = MCPRequestIdempotencyRegistry.Key(clientID: clientID, requestID: requestID)
+        // KW-02: authorize the frozen Knowledge caller (and its own-child target) before this
+        // request_id is looked up; nil for every other caller.
+        let knowledgeAuthorization = try await authorizeKnowledgeIdempotentRequest(
+            op: op,
+            args: args,
+            knowledgeCaller: knowledgeCaller
+        )
+        let key = MCPRequestIdempotencyRegistry.Key(
+            clientID: Self.idempotencyClientID(clientID, knowledgeCaller: knowledgeCaller),
+            requestID: requestID
+        )
         let fingerprint = MCPRequestIdempotencyRegistry.Fingerprint(
             operation: op,
             payloadHashSHA256: MCPRequestIdempotencyRegistry.payloadHashHex(
@@ -473,10 +505,19 @@ struct AgentRunMCPToolService {
                 excluding: ["request_id", "response_mode"]
             )
         )
-        switch await idempotencyRegistry.begin(key: key, fingerprint: fingerprint) {
+        let decision = await idempotencyRegistry.begin(key: key, fingerprint: fingerprint)
+        #if DEBUG
+            await testDuringIdempotencyLookup?()
+        #endif
+        // KW-02: the lookup suspended since authorization. Every branch that discloses a recorded
+        // outcome, an in-flight marker, or a conflict first re-checks the frozen Knowledge caller and
+        // target synchronously, with no suspension before the disclosure. A new request is left to
+        // the operation's own admission and boundary rechecks, which record any failure.
+        switch decision {
         case .new:
             break
         case let .duplicate(outcome):
+            try revalidateKnowledgeIdempotentRequest(knowledgeAuthorization)
             switch outcome {
             case let .success(value):
                 return Self.idempotentReplayValue(value, requestID: requestID)
@@ -486,16 +527,18 @@ struct AgentRunMCPToolService {
                 )
             }
         case .inFlight:
+            try revalidateKnowledgeIdempotentRequest(knowledgeAuthorization)
             throw MCPError.invalidParams(
                 "request_id '\(requestID)' is still in flight; poll for state instead of retrying."
             )
         case let .conflict(existing):
+            try revalidateKnowledgeIdempotentRequest(knowledgeAuthorization)
             throw MCPError.invalidParams(
                 "request_id_conflict: request_id '\(requestID)' was already used for a different \(existing.operation) payload."
             )
         }
         do {
-            let value = try await executeMutationCore(op: op, args: args)
+            let value = try await executeMutationCore(op: op, args: args, knowledgeCaller: knowledgeCaller)
             await idempotencyRegistry.complete(key: key, outcome: .success(value))
             return value
         } catch {
@@ -512,6 +555,64 @@ struct AgentRunMCPToolService {
             ))
             throw error
         }
+    }
+
+    /// KW-02: a Knowledge caller's request_ids live in a namespace keyed by its admitted durable
+    /// identity, so they never replay another session's outcome (a standard session's or another
+    /// Knowledge root's), and identical requests from separate roots never collapse into one
+    /// worker. Standard client keys are lowercased (`MCPClientIdentity.storageKey`), a bare
+    /// connection UUID (hex digits and dashes), or `unknown-client`, so the prefix cannot collide
+    /// with them. External and standard callers keep their existing key.
+    static func idempotencyClientID(_ clientID: String, knowledgeCaller: KnowledgeCaller?) -> String {
+        guard let knowledgeCaller else { return clientID }
+        return "KNOWLEDGE-CALLER:\(knowledgeCaller.admittedCallerSessionID.uuidString)|\(clientID)"
+    }
+
+    /// Frozen authorization of one Knowledge `request_id`: the caller and the target resolved for it.
+    private struct KnowledgeIdempotencyAuthorization {
+        let op: String
+        let knowledgeCaller: KnowledgeCaller
+        let targetSessionID: UUID?
+        let agentModeVM: AgentModeViewModel
+    }
+
+    /// KW-02: before a Knowledge request_id is looked up, the frozen caller must still hold its tab
+    /// as a hydrated, eligible Knowledge root and, for steer and respond, the target must still be
+    /// its own Knowledge research worker. Returns nil for every other caller.
+    private func authorizeKnowledgeIdempotentRequest(
+        op: String,
+        args: [String: Value],
+        knowledgeCaller: KnowledgeCaller?
+    ) async throws -> KnowledgeIdempotencyAuthorization? {
+        guard let knowledgeCaller else { return nil }
+        let targetWindow = try requireTargetWindow()
+        let agentModeVM = resolvedAgentModeViewModel(targetWindow)
+        let targetSessionID: UUID? = if op == "start" {
+            nil
+        } else {
+            try await resolveControlSessionID(args, targetWindow: targetWindow, agentModeVM: agentModeVM)
+        }
+        let authorization = KnowledgeIdempotencyAuthorization(
+            op: op,
+            knowledgeCaller: knowledgeCaller,
+            targetSessionID: targetSessionID,
+            agentModeVM: agentModeVM
+        )
+        try revalidateKnowledgeIdempotentRequest(authorization)
+        return authorization
+    }
+
+    /// Synchronous re-check of a frozen Knowledge `request_id` authorization: the caller's identity,
+    /// hydrated Knowledge profile, and eligibility, and its own-child target. No-op for other callers.
+    private func revalidateKnowledgeIdempotentRequest(_ authorization: KnowledgeIdempotencyAuthorization?) throws {
+        guard let authorization else { return }
+        try authorization.agentModeVM.mcpRevalidateDelegationCommit(
+            sourceTabID: authorization.knowledgeCaller.sourceTabID,
+            expectedCallerSessionID: authorization.knowledgeCaller.admittedCallerSessionID,
+            targetSessionID: authorization.targetSessionID,
+            operation: "agent_run.\(authorization.op)",
+            expectedCallerProfile: .knowledge
+        )
     }
 
     private nonisolated static func idempotentReplayValue(_ value: Value, requestID: String) -> Value {
@@ -546,7 +647,10 @@ struct AgentRunMCPToolService {
         }
     #endif
 
-    private func executeStart(args: [String: Value]) async throws -> Value {
+    private func executeStart(
+        args: [String: Value],
+        knowledgeCaller: KnowledgeCaller? = nil
+    ) async throws -> Value {
         let metadata = await captureRequestMetadata()
         #if DEBUG
             var ompQualificationLease: OhMyPiAgentModeSmokeGate.Snapshot?
@@ -770,22 +874,43 @@ struct AgentRunMCPToolService {
 
         let agentModeVM = targetWindow.agentModeViewModel
         let resolvedTabID = try resolveRequestedTabID(args)
-        let defaultTaskLabel = Self.defaultTaskLabelForStart(resolvedTabID: resolvedTabID, workflow: workflow)
+        if knowledgeCaller != nil {
+            // K3: a Knowledge start always creates a fresh Knowledge research worker.
+            try validateKnowledgeStartArguments(
+                args: args,
+                resolvedTabID: resolvedTabID,
+                workflow: workflow,
+                worktreeStartRequest: worktreeStartRequest
+            )
+        }
+        // A Knowledge start never falls back to a role default: an omitted model_id inherits the
+        // admitted parent's frozen selection below (K4).
+        let defaultTaskLabel = knowledgeCaller == nil
+            ? Self.defaultTaskLabelForStart(resolvedTabID: resolvedTabID, workflow: workflow)
+            : nil
         #if DEBUG
             testBeforeProviderAvailabilityPreflight?()
         #endif
-        let selection = try AgentMCPSelectionResolver.resolve(
+        let agentAvailability = targetWindow.apiSettingsViewModel.agentModeAvailabilityContext
+        var resolvedSelection = try AgentMCPSelectionResolver.resolve(
             modelID: normalizedString(args["model_id"]),
             defaultTaskLabel: defaultTaskLabel,
-            availability: targetWindow.apiSettingsViewModel.agentModeAvailabilityContext,
+            availability: agentAvailability,
             workspaceID: workspace.id
         )
+        var inheritedReasoningEffortRaw: String?
+        var resolvedKnowledgeModelSource: String?
+        if knowledgeCaller != nil, let explicitAgentRaw = resolvedSelection.agentRaw {
+            // K4/K5: an explicit compound model must be Knowledge-supported and web-capable.
+            try validateKnowledgeWorkerProvider(agentRaw: explicitAgentRaw)
+            resolvedKnowledgeModelSource = "explicit"
+        }
         #if DEBUG
             let existingRequestedAgent = resolvedTabID.flatMap {
                 agentModeVM.session(for: $0, createIfNeeded: false)?.selectedAgent
             }
-            let earlyEffectiveTargetIsOhMyPi = selection.agentRaw == AgentProviderKind.ohMyPi.rawValue
-                || (selection.agentRaw == nil && existingRequestedAgent == .ohMyPi)
+            let earlyEffectiveTargetIsOhMyPi = resolvedSelection.agentRaw == AgentProviderKind.ohMyPi.rawValue
+                || (resolvedSelection.agentRaw == nil && existingRequestedAgent == .ohMyPi)
             if ompQualificationLease != nil, !earlyEffectiveTargetIsOhMyPi {
                 throw MCPError.invalidParams(
                     "_omp_qualification_lease_id may only authorize an effective OMP target."
@@ -805,13 +930,65 @@ struct AgentRunMCPToolService {
             ])
         #endif
         try await validateSpawnRouting(metadata, parentSourceTabID, "agent_run.start")
-        let admittedCallerSessionID = try agentModeVM.mcpValidateAgentRunSpawnAllowed(sourceTabID: parentSourceTabID)
+        if let knowledgeCaller {
+            guard let parentSourceTabID, parentSourceTabID == knowledgeCaller.sourceTabID else {
+                throw MCPError.invalidParams(
+                    "agent_run.start from a Knowledge session changed routing while it was being admitted. Refusing to create a research worker; retry after the session is active."
+                )
+            }
+            // KW-01: the Knowledge root admitted at the outer gate must still hold the tab as a
+            // hydrated, eligible Knowledge session before inner admission runs, so a replacement
+            // (or a standard placeholder) in the same tab is never admitted in its place.
+            try agentModeVM.mcpRevalidateDelegationCommit(
+                sourceTabID: parentSourceTabID,
+                expectedCallerSessionID: knowledgeCaller.admittedCallerSessionID,
+                operation: "agent_run.start",
+                expectedCallerProfile: .knowledge
+            )
+        }
+        let innerAdmittedCallerSessionID = try agentModeVM.mcpValidateAgentRunSpawnAllowed(sourceTabID: parentSourceTabID)
+        if let knowledgeCaller, innerAdmittedCallerSessionID != knowledgeCaller.admittedCallerSessionID {
+            throw MCPError.invalidParams(
+                "agent_run.start: the calling agent session changed while the request was in flight. Refusing to create a research worker; retry after the session is active."
+            )
+        }
+        // A Knowledge start is always credited to the identity frozen by outer admission.
+        let admittedCallerSessionID = knowledgeCaller?.admittedCallerSessionID ?? innerAdmittedCallerSessionID
+        let admittedCallerProfile: AgentSessionProfile? = knowledgeCaller == nil ? nil : .knowledge
+        if let knowledgeCaller {
+            if resolvedSelection.agentRaw == nil {
+                // K4: freeze the admitted parent's live provider, model, and effort synchronously
+                // with admission; never fall back to the window default.
+                let inherited = try agentModeVM.mcpKnowledgeChildSelectionSnapshot(
+                    sourceTabID: knowledgeCaller.sourceTabID,
+                    expectedCallerSessionID: knowledgeCaller.admittedCallerSessionID
+                )
+                try validateKnowledgeWorkerProvider(agentRaw: inherited.agent.rawValue)
+                guard AgentModelCatalog.isAgentAvailable(inherited.agent, availability: agentAvailability) else {
+                    throw MCPError.invalidParams(
+                        "agent_run.start cannot give the research worker this session's provider (\(inherited.agent.displayName)) because it is currently unavailable."
+                    )
+                }
+                resolvedSelection = AgentMCPSelectionResolver.ResolvedSelection(
+                    agentRaw: inherited.agent.rawValue,
+                    modelRaw: inherited.modelRaw,
+                    taskLabelKind: nil,
+                    ohMyPiThinkingSelections: .empty
+                )
+                inheritedReasoningEffortRaw = inherited.reasoningEffortRaw
+                resolvedKnowledgeModelSource = "inherited"
+            }
+        }
+        let selection = resolvedSelection
+        let selectionReasoningEffortRaw = inheritedReasoningEffortRaw
+        let knowledgeWorkerModelSource = resolvedKnowledgeModelSource
         // An explicit tab may already hold a session; a delegated worker must not reactivate a
         // shallower one (including adopting a parentless root) through start.
         try agentModeVM.mcpValidateDelegationTarget(
             sourceTabID: parentSourceTabID,
             targetSessionID: resolvedTabID.flatMap { agentModeVM.mcpExistingSessionID(forTabID: $0) },
-            operation: "agent_run.start"
+            operation: "agent_run.start",
+            expectedCallerProfile: admittedCallerProfile
         )
         let spawnParentSessionID: UUID? = if let parentSourceTabID,
                                              let resolveSpawnParentSessionIDFromSourceTabID
@@ -904,9 +1081,11 @@ struct AgentRunMCPToolService {
                     sourceTabID: parentSourceTabID,
                     expectedCallerSessionID: admittedCallerSessionID,
                     targetSessionID: resolvedTabID.flatMap { agentModeVM.mcpExistingSessionID(forTabID: $0) },
-                    operation: "agent_run.start"
+                    operation: "agent_run.start",
+                    expectedCallerProfile: admittedCallerProfile
                 )
-            }
+            },
+            childSessionProfile: knowledgeCaller == nil ? nil : .knowledge
         )
         guard let targetSessionID = target.sessionID else {
             await agentModeVM.mcpDiscardSessionTarget(target)
@@ -1367,7 +1546,7 @@ struct AgentRunMCPToolService {
                         agentModeVM,
                         selection.agentRaw,
                         selection.modelRaw,
-                        nil,
+                        selectionReasoningEffortRaw,
                         selection.taskLabelKind,
                         selection.ohMyPiThinkingSelections,
                         workflow,
@@ -1384,7 +1563,7 @@ struct AgentRunMCPToolService {
                     agentModeVM,
                     selection.agentRaw,
                     selection.modelRaw,
-                    nil,
+                    selectionReasoningEffortRaw,
                     selection.taskLabelKind,
                     selection.ohMyPiThinkingSelections,
                     workflow,
@@ -1544,7 +1723,13 @@ struct AgentRunMCPToolService {
                     session.ompQualificationStartContext = nil
                 }
             #endif
-            let startedValue = decoratedRunValue(snapshot: effectiveSnapshot, workflow: workflow, delivery: outcome.delivery)
+            let startedValue = Self.attachingKnowledgeWorkerReceipt(
+                to: decoratedRunValue(snapshot: effectiveSnapshot, workflow: workflow, delivery: outcome.delivery),
+                modelSource: knowledgeWorkerModelSource,
+                agentRaw: selection.agentRaw,
+                modelRaw: selection.modelRaw,
+                reasoningEffortRaw: selectionReasoningEffortRaw
+            )
             // Detached starts have no wait policy to report; every other start selected one.
             return detach ? startedValue : AgentMCPWaitPolicy.attaching(waitSelection, to: startedValue)
         }
@@ -1581,15 +1766,28 @@ struct AgentRunMCPToolService {
                 session.ompQualificationStartContext = nil
             }
         #endif
-        return AgentMCPWaitPolicy.attaching(waitSelection, to: waitedValue)
+        return AgentMCPWaitPolicy.attaching(
+            waitSelection,
+            to: Self.attachingKnowledgeWorkerReceipt(
+                to: waitedValue,
+                modelSource: knowledgeWorkerModelSource,
+                agentRaw: selection.agentRaw,
+                modelRaw: selection.modelRaw,
+                reasoningEffortRaw: selectionReasoningEffortRaw
+            )
+        )
     }
 
-    private func executeWait(args: [String: Value], forcePoll: Bool = false) async throws -> Value {
+    private func executeWait(
+        args: [String: Value],
+        forcePoll: Bool = false,
+        knowledgeCaller: KnowledgeCaller? = nil
+    ) async throws -> Value {
         if args["session_ids"] != nil {
             if forcePoll {
-                return try await executePollMany(args: args)
+                return try await executePollMany(args: args, knowledgeCaller: knowledgeCaller)
             }
-            return try await executeWaitAny(args: args)
+            return try await executeWaitAny(args: args, knowledgeCaller: knowledgeCaller)
         }
 
         let targetWindow = try requireTargetWindow()
@@ -1611,6 +1809,12 @@ struct AgentRunMCPToolService {
                 promptCacheRetention: waitContext.parentPromptCacheRetention
             )
         }
+        try validateKnowledgeObservationTargets(
+            [sessionID],
+            knowledgeCaller: knowledgeCaller,
+            agentModeVM: agentModeVM,
+            operation: forcePoll ? "agent_run.poll" : "agent_run.wait"
+        )
         return try await performSingleWait(
             sessionID: sessionID,
             agentModeVM: agentModeVM,
@@ -1620,7 +1824,10 @@ struct AgentRunMCPToolService {
         )
     }
 
-    private func executeWaitAny(args: [String: Value]) async throws -> Value {
+    private func executeWaitAny(
+        args: [String: Value],
+        knowledgeCaller: KnowledgeCaller? = nil
+    ) async throws -> Value {
         let references = try parseSessionIDArray(args)
         let targetWindow = try requireTargetWindow()
         let agentModeVM = resolvedAgentModeViewModel(targetWindow)
@@ -1632,6 +1839,12 @@ struct AgentRunMCPToolService {
             args["timeout"],
             parentFamily: waitContext.parentFamily,
             promptCacheRetention: waitContext.parentPromptCacheRetention
+        )
+        try validateKnowledgeObservationTargets(
+            sessionIDs,
+            knowledgeCaller: knowledgeCaller,
+            agentModeVM: agentModeVM,
+            operation: "agent_run.wait"
         )
         return try await performWait(
             sessionIDs: sessionIDs,
@@ -1813,11 +2026,20 @@ struct AgentRunMCPToolService {
         return targetWindow.agentModeViewModel
     }
 
-    private func executePollMany(args: [String: Value]) async throws -> Value {
+    private func executePollMany(
+        args: [String: Value],
+        knowledgeCaller: KnowledgeCaller? = nil
+    ) async throws -> Value {
         let references = try parseSessionIDArray(args)
         let targetWindow = try requireTargetWindow()
         let agentModeVM = resolvedAgentModeViewModel(targetWindow)
         let sessionIDs = try await resolveControlSessionIDs(references, targetWindow: targetWindow, agentModeVM: agentModeVM)
+        try validateKnowledgeObservationTargets(
+            sessionIDs,
+            knowledgeCaller: knowledgeCaller,
+            agentModeVM: agentModeVM,
+            operation: "agent_run.poll"
+        )
         let snapshots = await collectCurrentSnapshots(sessionIDs: sessionIDs, agentModeVM: agentModeVM)
         return AgentMCPWaitPolicy.attaching(.poll, to: decoratedMultiPollValue(sessionIDs: sessionIDs, snapshots: snapshots))
     }
@@ -1836,6 +2058,168 @@ struct AgentRunMCPToolService {
     struct DelegatedControlAdmission {
         let sourceTabID: UUID?
         let callerSessionID: UUID?
+        /// Profile the caller was admitted with; `.knowledge` keeps Knowledge rechecks at every
+        /// boundary. Nil for standard and external callers, whose rechecks are unchanged.
+        var callerProfile: AgentSessionProfile?
+    }
+
+    /// Routed Knowledge caller of one `agent_run` call, admitted at the outer entry. Every later
+    /// admission, commit, dispatch, and replay check is made against this frozen caller, never
+    /// against whichever session occupies the tab by then.
+    struct KnowledgeCaller {
+        let sourceTabID: UUID
+        /// Durable identity frozen by admission; later checks require the tab to still hold it.
+        let admittedCallerSessionID: UUID
+    }
+
+    static let knowledgeCodexWebSearchDisabledMessage = "Codex web search is turned off, so a Codex Knowledge research worker could not search the web. Turn on the Codex Search tool (Settings → CLI Providers → Codex → Core tools → Search, or the Codex tools menu in the Agent composer), or pass a Claude Code model_id. No research worker was created."
+
+    /// K1/K2 admission for every `agent_run` operation. A caller is a Knowledge caller when its
+    /// connection's enforced tool policy or the verified profile of its live routed source record
+    /// is Knowledge. A Knowledge caller must use an allowlisted operation, resolve to a hydrated
+    /// live Knowledge record, and be an eligible Knowledge root: placeholders, workers
+    /// (`knowledgeLeaf`), and unverifiable lineage are denied. Research workers never run
+    /// workflows, so workflow arguments are rejected for every Knowledge operation. The returned
+    /// caller is carried through every later check of this call. Returns nil for every other
+    /// caller, whose behavior is unchanged.
+    private func admitKnowledgeCaller(op: String, args: [String: Value]) async throws -> KnowledgeCaller? {
+        let metadata = await captureRequestMetadata()
+        let connectionProfile = await resolveConnectionSessionProfile(metadata)
+        let sourceTabID = await resolveSpawnParentSourceTabID(metadata)
+        // Only a routed caller has a live source record to inspect. An unrouted caller (an external
+        // client) never resolves the window here, so its operation keeps its own single resolution;
+        // an unrouted Knowledge connection still fails closed below.
+        let agentModeVM: AgentModeViewModel? = if sourceTabID != nil, let targetWindow = try? requireTargetWindow() {
+            resolvedAgentModeViewModel(targetWindow)
+        } else {
+            nil
+        }
+        let callerResolution = sourceTabID.flatMap { agentModeVM?.mcpDelegationCallerProfileResolution(sourceTabID: $0) }
+        // A live record whose verified profile is Knowledge (including an unhydrated placeholder
+        // whose identity is indexed as Knowledge) makes this a Knowledge caller even when the
+        // connection reports no profile; it then fails closed below unless it is hydrated.
+        let liveClaimsKnowledge = if case .resolved(.knowledge, _) = callerResolution { true } else { false }
+        guard connectionProfile == .knowledge || liveClaimsKnowledge else { return nil }
+        guard KnowledgeSessionPolicy.allowedAgentRunOperations.contains(op) else {
+            throw MCPError.invalidParams(
+                "agent_run op '\(op)' is not available to Knowledge sessions. Use start, poll, wait, cancel, steer, or respond."
+            )
+        }
+        guard let sourceTabID,
+              let agentModeVM,
+              callerResolution == .resolved(.knowledge, isHydrated: true),
+              let admittedCallerSessionID = try agentModeVM.mcpValidateAgentRunSpawnAllowed(sourceTabID: sourceTabID)
+        else {
+            throw MCPError.invalidParams(
+                "agent_run was called from a Knowledge session, but RepoPrompt could not resolve that session. Refusing to start or control research workers; retry after the session is active."
+            )
+        }
+        if args["workflow_id"] != nil || args["workflow_name"] != nil {
+            throw MCPError.invalidParams(
+                "agent_run from a Knowledge session does not support workflows. Describe the research question in message instead."
+            )
+        }
+        return KnowledgeCaller(sourceTabID: sourceTabID, admittedCallerSessionID: admittedCallerSessionID)
+    }
+
+    /// K3: a Knowledge start always creates a fresh Knowledge research worker, so existing-tab
+    /// selectors, workflows, worktree arguments, and role-label `model_id`s are rejected before
+    /// any model resolution or target creation.
+    private func validateKnowledgeStartArguments(
+        args: [String: Value],
+        resolvedTabID: UUID?,
+        workflow: AgentWorkflowDefinition?,
+        worktreeStartRequest: AgentMCPStartWorktreeCoordinator.Request
+    ) throws {
+        // `session_id` is already rejected for every start by the general start guard.
+        if resolvedTabID != nil || args["_tabID"] != nil || args["tab_id"] != nil {
+            throw MCPError.invalidParams(
+                "agent_run.start from a Knowledge session always creates a fresh research worker; tab_id and other existing-session selectors are not supported."
+            )
+        }
+        if workflow != nil || args["workflow_id"] != nil || args["workflow_name"] != nil {
+            throw MCPError.invalidParams(
+                "agent_run.start from a Knowledge session does not support workflows. Describe the research question in message instead."
+            )
+        }
+        if worktreeStartRequest.hasExplicitWorktreeArgs || startWorktreeCoordinator.containsArguments(args) {
+            throw MCPError.invalidParams(
+                "agent_run.start from a Knowledge session does not support worktree arguments; research workers do not edit code."
+            )
+        }
+        if let modelID = normalizedString(args["model_id"]) {
+            guard modelID.contains(":") else {
+                throw MCPError.invalidParams(
+                    "agent_run.start from a Knowledge session does not accept role labels such as '\(modelID)'. Omit model_id to use this session's provider and model, or pass an explicit Claude Code or Codex model_id (agent:model)."
+                )
+            }
+            // K4/K5 before catalog resolution: an unsupported provider or a Codex worker without
+            // web search is rejected deterministically, independent of catalog availability.
+            if let parsed = AgentModelSelectionID.parse(modelID) {
+                try validateKnowledgeWorkerProvider(agentRaw: parsed.agentRaw)
+            }
+        }
+    }
+
+    /// K4/K5: a Knowledge research worker runs only on a Knowledge-supported provider, and a Codex
+    /// worker requires Codex's local Search tool toggle. Only that known local toggle is checked;
+    /// remote web availability is never probed, and Claude has no RepoPrompt toggle to gate.
+    private func validateKnowledgeWorkerProvider(agentRaw: String) throws {
+        guard let agent = AgentProviderKind(rawValue: agentRaw),
+              KnowledgeSessionPolicy.supportedProviders.contains(agent)
+        else {
+            let supported = KnowledgeSessionPolicy.supportedProvidersOrdered
+                .map(\.displayName)
+                .joined(separator: " or ")
+            throw MCPError.invalidParams(
+                "Knowledge research workers run only on \(supported); agent '\(agentRaw)' is not supported. Omit model_id to use this session's provider and model."
+            )
+        }
+        if agent == .codexExec, !codexWebSearchEnabled() {
+            throw MCPError.invalidParams(Self.knowledgeCodexWebSearchDisabledMessage)
+        }
+    }
+
+    /// K6 for session-addressed `wait`/`poll`: a Knowledge caller may observe only its own
+    /// Knowledge research workers. Runs synchronously after the session references and wait
+    /// context resolved, re-checking the frozen caller identity and every target.
+    private func validateKnowledgeObservationTargets(
+        _ sessionIDs: [UUID],
+        knowledgeCaller: KnowledgeCaller?,
+        agentModeVM: AgentModeViewModel,
+        operation: String
+    ) throws {
+        guard let knowledgeCaller else { return }
+        for sessionID in sessionIDs {
+            try agentModeVM.mcpRevalidateDelegationCommit(
+                sourceTabID: knowledgeCaller.sourceTabID,
+                expectedCallerSessionID: knowledgeCaller.admittedCallerSessionID,
+                targetSessionID: sessionID,
+                operation: operation,
+                expectedCallerProfile: .knowledge
+            )
+        }
+    }
+
+    /// K4 start receipt: names the Knowledge research worker's resolved provider and model and
+    /// whether they were inherited from the calling session or passed explicitly. Non-Knowledge
+    /// starts (nil `modelSource`) are returned unchanged.
+    static func attachingKnowledgeWorkerReceipt(
+        to value: Value,
+        modelSource: String?,
+        agentRaw: String?,
+        modelRaw: String?,
+        reasoningEffortRaw: String?
+    ) -> Value {
+        guard let modelSource, var object = value.objectValue else { return value }
+        object["knowledge_worker"] = .object([
+            "profile": .string(AgentSessionProfile.knowledge.rawValue),
+            "model_source": .string(modelSource),
+            "provider": agentRaw.map(Value.string) ?? .null,
+            "model": modelRaw.map(Value.string) ?? .null,
+            "reasoning_effort": reasoningEffortRaw.map(Value.string) ?? .null
+        ])
+        return .object(object)
     }
 
     /// Session-addressed control (cancel, respond) from a delegated worker is bounded like
@@ -1846,11 +2230,51 @@ struct AgentRunMCPToolService {
     private func validateDelegatedControlTarget(
         sessionID: UUID,
         agentModeVM: AgentModeViewModel,
-        operation: String
+        operation: String,
+        knowledgeCaller: KnowledgeCaller?
     ) async throws -> DelegatedControlAdmission {
         let metadata = await captureRequestMetadata()
+        return try await admitDelegatedControl(
+            metadata: metadata,
+            sessionID: sessionID,
+            agentModeVM: agentModeVM,
+            operation: operation,
+            knowledgeCaller: knowledgeCaller
+        )
+    }
+
+    /// Control admission for one session-addressed call. Standard and external callers are admitted
+    /// as before. A Knowledge caller is never re-admitted from whichever session now occupies its
+    /// tab (KW-01): the routed tab must be unchanged, and the frozen identity must still be a
+    /// hydrated, eligible Knowledge root whose target is its own Knowledge research worker.
+    private func admitDelegatedControl(
+        metadata: RequestMetadata,
+        sessionID: UUID,
+        agentModeVM: AgentModeViewModel,
+        operation: String,
+        knowledgeCaller: KnowledgeCaller?
+    ) async throws -> DelegatedControlAdmission {
         let sourceTabID = await resolveSpawnParentSourceTabID(metadata)
         try await validateSpawnRouting(metadata, sourceTabID, operation)
+        if let knowledgeCaller {
+            guard sourceTabID == knowledgeCaller.sourceTabID else {
+                throw MCPError.invalidParams(
+                    "\(operation) from a Knowledge session changed routing while it was being admitted. Refusing to control research workers; retry after the session is active."
+                )
+            }
+            try agentModeVM.mcpRevalidateDelegationCommit(
+                sourceTabID: knowledgeCaller.sourceTabID,
+                expectedCallerSessionID: knowledgeCaller.admittedCallerSessionID,
+                targetSessionID: sessionID,
+                operation: operation,
+                expectedCallerProfile: .knowledge
+            )
+            return DelegatedControlAdmission(
+                sourceTabID: knowledgeCaller.sourceTabID,
+                callerSessionID: knowledgeCaller.admittedCallerSessionID,
+                callerProfile: .knowledge
+            )
+        }
         let callerSessionID = try agentModeVM.mcpAdmitDelegationControl(
             sourceTabID: sourceTabID,
             targetSessionID: sessionID,
@@ -1872,7 +2296,8 @@ struct AgentRunMCPToolService {
             sourceTabID: admission.sourceTabID,
             expectedCallerSessionID: admission.callerSessionID,
             targetSessionID: sessionID,
-            operation: "agent_run.cancel"
+            operation: "agent_run.cancel",
+            expectedCallerProfile: admission.callerProfile
         )
         guard let session = agentModeVM.mcpControlledSession(sessionID: sessionID), session.runState.isActive else {
             throw MCPError.invalidParams("The run is not currently active and cannot be cancelled.")
@@ -1890,14 +2315,18 @@ struct AgentRunMCPToolService {
         }
     }
 
-    private func executeCancel(args: [String: Value]) async throws -> Value {
+    private func executeCancel(
+        args: [String: Value],
+        knowledgeCaller: KnowledgeCaller? = nil
+    ) async throws -> Value {
         let targetWindow = try requireTargetWindow()
         let agentModeVM = resolvedAgentModeViewModel(targetWindow)
         let sessionID = try await resolveControlSessionID(args, targetWindow: targetWindow, agentModeVM: agentModeVM)
         let controlAdmission = try await validateDelegatedControlTarget(
             sessionID: sessionID,
             agentModeVM: agentModeVM,
-            operation: "agent_run.cancel"
+            operation: "agent_run.cancel",
+            knowledgeCaller: knowledgeCaller
         )
         let initialSnapshot = await currentSnapshot(sessionID: sessionID, agentModeVM: agentModeVM)
         let expectedRunID: UUID?
@@ -1947,7 +2376,10 @@ struct AgentRunMCPToolService {
         return cancelResult
     }
 
-    private func executeSteer(args: [String: Value]) async throws -> Value {
+    private func executeSteer(
+        args: [String: Value],
+        knowledgeCaller: KnowledgeCaller? = nil
+    ) async throws -> Value {
         let targetWindow = try requireTargetWindow()
         let agentModeVM = resolvedAgentModeViewModel(targetWindow)
         let sessionID = try await resolveControlSessionID(args, targetWindow: targetWindow, agentModeVM: agentModeVM)
@@ -1957,12 +2389,12 @@ struct AgentRunMCPToolService {
 
         // Steering starts or redirects work: an Agent Mode caller must still be allowed to delegate,
         // and a delegated worker may only steer sessions deeper than itself.
-        let steerSourceTabID = await resolveSpawnParentSourceTabID(metadata)
-        try await validateSpawnRouting(metadata, steerSourceTabID, "agent_run.steer")
-        let steerCallerSessionID = try agentModeVM.mcpAdmitDelegationControl(
-            sourceTabID: steerSourceTabID,
-            targetSessionID: sessionID,
-            operation: "agent_run.steer"
+        let steerAdmission = try await admitDelegatedControl(
+            metadata: metadata,
+            sessionID: sessionID,
+            agentModeVM: agentModeVM,
+            operation: "agent_run.steer",
+            knowledgeCaller: knowledgeCaller
         )
 
         // Plan §6.3/§6.4: resolve the frozen parent family and validate the active wait selection
@@ -2009,10 +2441,11 @@ struct AgentRunMCPToolService {
             // Control-context resolution may have suspended since admission: re-admit the caller
             // and target synchronously before the steering instruction is dispatched.
             try agentModeVM.mcpRevalidateDelegationCommit(
-                sourceTabID: steerSourceTabID,
-                expectedCallerSessionID: steerCallerSessionID,
+                sourceTabID: steerAdmission.sourceTabID,
+                expectedCallerSessionID: steerAdmission.callerSessionID,
                 targetSessionID: sessionID,
-                operation: "agent_run.steer"
+                operation: "agent_run.steer",
+                expectedCallerProfile: steerAdmission.callerProfile
             )
             if resolution.session.runState.isActive {
                 delivery = try await dispatchSteerInstruction(
@@ -2210,14 +2643,18 @@ struct AgentRunMCPToolService {
         )
     }
 
-    private func executeRespond(args: [String: Value]) async throws -> Value {
+    private func executeRespond(
+        args: [String: Value],
+        knowledgeCaller: KnowledgeCaller? = nil
+    ) async throws -> Value {
         let targetWindow = try requireTargetWindow()
         let agentModeVM = targetWindow.agentModeViewModel
         let sessionID = try await resolveControlSessionID(args, targetWindow: targetWindow, agentModeVM: agentModeVM)
-        try await validateDelegatedControlTarget(
+        let controlAdmission = try await validateDelegatedControlTarget(
             sessionID: sessionID,
             agentModeVM: agentModeVM,
-            operation: "agent_run.respond"
+            operation: "agent_run.respond",
+            knowledgeCaller: knowledgeCaller
         )
         let interactionID = try requireUUID(args["interaction_id"], name: "interaction_id")
         let workflow = try resolveWorkflow(args: args)
@@ -2235,6 +2672,17 @@ struct AgentRunMCPToolService {
         // devices connect through per-device app links named `remote:<device8>`, so
         // their storage key already carries the remote namespace.
         let resolvedBy = MCPClientIdentity.storageKey(metadata.clientName) ?? "mcp"
+        // Dispatch boundary (KW-03): re-admit the frozen caller (identity, eligibility, target
+        // ceiling) after the awaits since admission, with no suspension before resolution. A
+        // Knowledge caller also keeps its verified Knowledge profile and own-child rule. External
+        // callers (no routed source) are unaffected.
+        try agentModeVM.mcpRevalidateDelegationCommit(
+            sourceTabID: controlAdmission.sourceTabID,
+            expectedCallerSessionID: controlAdmission.callerSessionID,
+            targetSessionID: sessionID,
+            operation: "agent_run.respond",
+            expectedCallerProfile: controlAdmission.callerProfile
+        )
         let dispatch = try await agentModeVM.mcpResolvePendingInteraction(
             sessionID: sessionID,
             interactionID: interactionID,
@@ -3586,12 +4034,19 @@ struct AgentRunMCPToolService {
                       let label = optionObject["label"]?.stringValue else { return nil }
                 return .init(label: label, description: optionObject["description"]?.stringValue)
             } ?? []
+            // `ask_user` fields encode `allows_custom` and omit `allows_other`; preserve that shape.
+            let allowsOther = fieldObject["allows_other"]?.boolValue
+            let allowsCustom = fieldObject["allows_custom"]?.boolValue
             return .init(
                 id: id,
                 header: fieldObject["header"]?.stringValue,
                 prompt: prompt,
+                context: fieldObject["context"]?.stringValue,
                 isSecret: fieldObject["is_secret"]?.boolValue == true,
-                allowsOther: fieldObject["allows_other"]?.boolValue == true,
+                allowsOther: allowsOther ?? allowsCustom ?? false,
+                allowsMultiple: fieldObject["allows_multiple"]?.boolValue,
+                allowsCustom: allowsCustom,
+                emitAllowsOther: allowsOther != nil,
                 options: fieldOptions
             )
         } ?? []

@@ -10,7 +10,8 @@ final class KnowledgeSessionMCPPolicyTests: XCTestCase {
             MCPWindowToolName.applyEdits,
             MCPWindowToolName.oracleUtils,
             MCPWindowToolName.askOracle,
-            MCPWindowToolName.oracleChatLog
+            MCPWindowToolName.oracleChatLog,
+            MCPWindowToolName.agentRun
         ]
 
         XCTAssertEqual(AgentModeMCPToolPolicy.knowledgeAllowedTools, expected)
@@ -37,6 +38,15 @@ final class KnowledgeSessionMCPPolicyTests: XCTestCase {
                 allowedToolsOverride: expected
             )
         )
+        for delegationTool in [MCPWindowToolName.agentManage, MCPWindowToolName.agentExplore] {
+            XCTAssertFalse(
+                ServerNetworkManager.isAllowedByPositiveToolCeiling(
+                    canonicalToolName: delegationTool,
+                    allowedToolsOverride: expected
+                ),
+                "Knowledge sessions never get \(delegationTool)"
+            )
+        }
         XCTAssertTrue(
             ServerNetworkManager.isAllowedByPositiveToolCeiling(
                 canonicalToolName: "future_tool",
@@ -176,6 +186,40 @@ final class KnowledgeSessionMCPPolicyTests: XCTestCase {
                 sessionProfile: .knowledge
             )
             XCTAssertEqual(unrelated, base)
+        #else
+            throw XCTSkip("Tool description diagnostics require DEBUG helpers.")
+        #endif
+    }
+
+    func testKnowledgeAgentRunDescriptionListsOnlyResearchWorkerBehavior() async throws {
+        #if DEBUG
+            let manager = ServerNetworkManager.shared
+            let base = "standard agent_run description"
+
+            let standard = await manager.debugAdvertisedToolDescription(
+                for: MCPWindowToolName.agentRun,
+                baseDescription: base,
+                purpose: .agentModeRun,
+                sessionProfile: .standard
+            )
+            XCTAssertEqual(standard, base)
+
+            let projected = await manager.debugAdvertisedToolDescription(
+                for: MCPWindowToolName.agentRun,
+                baseDescription: base,
+                purpose: .agentModeRun,
+                sessionProfile: .knowledge
+            )
+            XCTAssertEqual(projected, AgentModeMCPToolPolicy.knowledgeAgentRunDescription)
+            XCTAssertTrue(projected.contains("Knowledge research workers"))
+            XCTAssertTrue(projected.contains("Omit model_id"))
+            XCTAssertTrue(projected.contains("Role labels, tab_id, session_id, workflows, and worktree arguments are rejected"))
+            XCTAssertTrue(projected.contains("detach:true"))
+            XCTAssertTrue(projected.contains("this session's own workers"))
+            XCTAssertTrue(projected.contains("Workers cannot start or control other agents"))
+            for absent in ["agent_manage", "agent_explore", "explore", "engineer", "pair", "design"] {
+                XCTAssertFalse(projected.contains(absent), absent)
+            }
         #else
             throw XCTSkip("Tool description diagnostics require DEBUG helpers.")
         #endif

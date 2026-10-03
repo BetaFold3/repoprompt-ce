@@ -702,6 +702,10 @@ final class AgentModeViewModel: ObservableObject {
         var test_scheduledSendResyncReadFailureInjector: (@MainActor (UUID) -> Error?)?
         /// Holds an admitted dispatch after the attempt commit and before recovery preparation.
         var test_scheduledSendAfterDispatchCommitHook: (@MainActor (TabSession) async -> Void)?
+        /// Test seam: called in `mcpResolveOrCreateSessionTarget`'s new-tab branch immediately
+        /// before a requested child session profile is adopted, so a test can observe that no
+        /// identity is bound yet or make the placeholder ineligible for adoption.
+        var test_mcpBeforeChildSessionProfileAdoptionHook: (@MainActor (TabSession) -> Void)?
     #endif
 
     /// Workspace that owns session persistence for this view model.
@@ -6798,16 +6802,101 @@ final class AgentModeViewModel: ObservableObject {
     func mcpDelegationDecision(for session: TabSession) -> AgentDelegationPolicy.Decision {
         AgentDelegationPolicy.decision(
             taskLabelKind: session.mcpControlContext?.taskLabelKind,
-            lineage: mcpDelegationLineage(for: session)
+            lineage: mcpDelegationLineage(for: session),
+            sessionProfile: session.profile
         )
     }
 
     /// Run-time MCP tool policy (advertisement flag, leaf restrictions, prompt audience) for the
-    /// session's current role and lineage. Computed at lease/prompt preparation; never persisted.
+    /// session's current role, lineage, and profile. Computed at lease/prompt preparation; never
+    /// persisted.
     func mcpDelegationRunToolPolicy(for session: TabSession) -> AgentDelegationPolicy.RunToolPolicy {
         AgentDelegationPolicy.runToolPolicy(
             decision: mcpDelegationDecision(for: session),
-            taskLabelKind: session.mcpControlContext?.taskLabelKind
+            taskLabelKind: session.mcpControlContext?.taskLabelKind,
+            sessionProfile: session.profile
+        )
+    }
+
+    /// Session profile for one durable identity, reconciled across its profile claims: each
+    /// hydrated live record bound to it and its owner-validated index entry. An unhydrated live
+    /// record makes no claim because its persisted profile may not have loaded yet. Returns nil
+    /// when nothing claims a profile or the claims disagree, so callers fail closed.
+    func mcpDelegationSessionProfile(sessionID: UUID) -> AgentSessionProfile? {
+        var claims = Set<AgentSessionProfile>()
+        for record in sessions.values where record.activeAgentSessionID == sessionID && record.hasLoadedPersistedState {
+            claims.insert(record.profile)
+        }
+        if let indexedEntry = ownerValidatedSessionIndex[sessionID] {
+            claims.insert(indexedEntry.profile)
+        }
+        return claims.count == 1 ? claims.first : nil
+    }
+
+    /// Profile of a delegation caller (a live record resolved from its exact tab), failing closed
+    /// like its lineage. A hydrated record claims its own profile. An unhydrated placeholder makes no
+    /// claim, because its persisted profile may not have loaded and its `.standard` default must
+    /// never downgrade a Knowledge session; it defers to its durable identity's reconciled claims
+    /// (`mcpDelegationSessionProfile`). Nil when the profile cannot be verified.
+    func mcpDelegationCallerProfile(for session: TabSession) -> AgentSessionProfile? {
+        if session.hasLoadedPersistedState {
+            return session.profile
+        }
+        return session.activeAgentSessionID.flatMap { mcpDelegationSessionProfile(sessionID: $0) }
+    }
+
+    /// How the live Agent Mode record in a routed caller tab resolves as a delegation caller.
+    enum MCPDelegationCallerProfileResolution: Equatable {
+        /// The tab has no live record; `agent_run` then relies on the connection's profile.
+        case noLiveRecord
+        /// A live record whose profile cannot be verified (no claim, or conflicting claims).
+        case unverified
+        /// The caller's verified profile, and whether the tab's own record is hydrated.
+        case resolved(AgentSessionProfile, isHydrated: Bool)
+    }
+
+    /// Caller profile of the live record in `sourceTabID`, without creating a placeholder.
+    func mcpDelegationCallerProfileResolution(sourceTabID: UUID) -> MCPDelegationCallerProfileResolution {
+        guard let record = sessions[sourceTabID] else { return .noLiveRecord }
+        guard let profile = mcpDelegationCallerProfile(for: record) else { return .unverified }
+        return .resolved(profile, isHydrated: record.hasLoadedPersistedState)
+    }
+
+    /// Provider, model, and effort a Knowledge research worker inherits when `agent_run.start`
+    /// omits `model_id`.
+    struct MCPKnowledgeChildSelection: Equatable {
+        let agent: AgentProviderKind
+        let modelRaw: String
+        let reasoningEffortRaw: String?
+    }
+
+    /// Frozen snapshot of the admitted Knowledge caller's live provider, model, and effort, read
+    /// synchronously from its tab. Throws, and never falls back to the window default, when the
+    /// tab no longer holds the admitted identity, the caller is not a hydrated Knowledge session,
+    /// or its selection is not a Knowledge-supported provider with a model.
+    func mcpKnowledgeChildSelectionSnapshot(
+        sourceTabID: UUID,
+        expectedCallerSessionID: UUID?
+    ) throws -> MCPKnowledgeChildSelection {
+        let failure = MCPError.invalidParams(
+            "agent_run.start could not read this Knowledge session's provider and model to give the research worker. Pass an explicit Claude Code or Codex model_id (agent:model), or retry after the session is active."
+        )
+        guard let expectedCallerSessionID,
+              let caller = sessions[sourceTabID],
+              caller.activeAgentSessionID == expectedCallerSessionID,
+              caller.hasLoadedPersistedState,
+              caller.profile == .knowledge,
+              KnowledgeSessionPolicy.supportedProviders.contains(caller.selectedAgent)
+        else {
+            throw failure
+        }
+        let modelRaw = caller.selectedModelRaw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !modelRaw.isEmpty else { throw failure }
+        let effortRaw = caller.selectedReasoningEffortRaw?.trimmingCharacters(in: .whitespacesAndNewlines)
+        return MCPKnowledgeChildSelection(
+            agent: caller.selectedAgent,
+            modelRaw: modelRaw,
+            reasoningEffortRaw: effortRaw?.isEmpty == false ? effortRaw : nil
         )
     }
 
@@ -6841,12 +6930,25 @@ final class AgentModeViewModel: ObservableObject {
     ) throws -> UUID? {
         guard let sourceTabID else { return nil }
         let sourceSession = try mcpDelegationSourceSession(sourceTabID: sourceTabID)
-        let decision = mcpDelegationDecision(for: sourceSession)
+        let callerProfile = mcpDelegationCallerProfile(for: sourceSession)
+        let decision = AgentDelegationPolicy.decision(
+            taskLabelKind: sourceSession.mcpControlContext?.taskLabelKind,
+            lineage: mcpDelegationLineage(for: sourceSession),
+            sessionProfile: callerProfile ?? sourceSession.profile
+        )
         if isExploreOnly, decision == .exploreLeaf {
             throw MCPError.invalidParams("Explore agents cannot start additional explore agents.")
         }
         if let message = AgentDelegationPolicy.denialMessage(for: decision) {
             throw MCPError.invalidParams(message)
+        }
+        // A caller whose profile cannot be verified fails closed like unverifiable lineage, so an
+        // unhydrated placeholder's `.standard` default never grants a Knowledge session standard
+        // delegation. Lineage denials above keep their precedence.
+        guard callerProfile != nil else {
+            throw MCPError.invalidParams(
+                "RepoPrompt could not verify the calling Agent Mode session's profile. Refusing to start or control other agents; retry after the source session is active."
+            )
         }
         guard let admittedCallerSessionID = ensureSessionBoundToTab(sourceSession) else {
             throw MCPError.invalidParams(
@@ -6893,12 +6995,16 @@ final class AgentModeViewModel: ObservableObject {
     /// suspended since admission. The routed caller tab must still hold the admitted durable
     /// identity, still be allowed to delegate, and (when given) still satisfy the target depth
     /// ceiling. A nil source is an external MCP client and is unchanged.
+    /// - Parameter expectedCallerProfile: the profile the caller was admitted with. When given, the
+    ///   tab's record must still be hydrated with that profile, and a Knowledge expectation keeps the
+    ///   Knowledge own-child rule even if the live record no longer reads as Knowledge.
     func mcpRevalidateDelegationCommit(
         sourceTabID: UUID?,
         expectedCallerSessionID: UUID?,
         targetSessionID: UUID? = nil,
         isExploreOnly: Bool = false,
-        operation: String
+        operation: String,
+        expectedCallerProfile: AgentSessionProfile? = nil
     ) throws {
         guard let sourceTabID else { return }
         guard let sourceSession = sessions[sourceTabID],
@@ -6908,11 +7014,19 @@ final class AgentModeViewModel: ObservableObject {
                 "\(operation): the calling agent session changed while the request was in flight. Refusing to commit delegated work; retry after the source session is active."
             )
         }
+        if let expectedCallerProfile {
+            guard sourceSession.hasLoadedPersistedState, sourceSession.profile == expectedCallerProfile else {
+                throw MCPError.invalidParams(
+                    "\(operation): the calling agent session is no longer a verified \(expectedCallerProfile.rawValue) session. Refusing to commit delegated work; retry after the source session is active."
+                )
+            }
+        }
         try mcpValidateAgentRunSpawnAllowed(sourceTabID: sourceTabID, isExploreOnly: isExploreOnly)
         try mcpValidateDelegationTarget(
             sourceTabID: sourceTabID,
             targetSessionID: targetSessionID,
-            operation: operation
+            operation: operation,
+            expectedCallerProfile: expectedCallerProfile
         )
     }
 
@@ -6981,11 +7095,14 @@ final class AgentModeViewModel: ObservableObject {
     /// behavior. A worker (depth ≥ 1) may only target sessions strictly deeper than itself, so it
     /// cannot reactivate itself, an ancestor, a sibling, or a parentless root (whose adoption
     /// would also reshape that root's delegation permissions). A nil target is a fresh session.
+    /// A Knowledge caller is narrower at every depth: it may only address its own direct Knowledge
+    /// research workers (`validateKnowledgeDelegationTarget`), checked before the depth-0 return.
     /// This is a depth ceiling, not a replacement for existing session-access authorization.
     func mcpValidateDelegationTarget(
         sourceTabID: UUID?,
         targetSessionID: UUID?,
-        operation: String
+        operation: String,
+        expectedCallerProfile: AgentSessionProfile? = nil
     ) throws {
         guard let sourceTabID, let targetSessionID else { return }
         let sourceSession = try mcpDelegationSourceSession(sourceTabID: sourceTabID)
@@ -6994,6 +7111,15 @@ final class AgentModeViewModel: ObservableObject {
             throw MCPError.invalidParams(
                 AgentDelegationPolicy.denialMessage(for: .lineageFailure(callerLineage))
                     ?? "RepoPrompt could not verify this agent session's delegation lineage."
+            )
+        }
+        // A caller admitted as Knowledge keeps the own-child rule; otherwise the caller's verified
+        // profile decides (an unhydrated placeholder never reads as standard by default).
+        if expectedCallerProfile == .knowledge || mcpDelegationCallerProfile(for: sourceSession) == .knowledge {
+            try validateKnowledgeDelegationTarget(
+                caller: sourceSession,
+                targetSessionID: targetSessionID,
+                operation: operation
             )
         }
         guard callerDepth > 0 else { return }
@@ -7008,6 +7134,33 @@ final class AgentModeViewModel: ObservableObject {
         guard targetDepth > callerDepth else {
             throw MCPError.invalidParams(
                 "\(operation) from a delegated agent at depth \(callerDepth) may only target sessions deeper in the delegation tree (such as its own sub-workers); the target is at depth \(targetDepth)."
+            )
+        }
+    }
+
+    /// Knowledge own-child rule: a session-addressed call from a Knowledge caller may only target a
+    /// session whose reconciled parent is the caller's current durable identity and whose
+    /// reconciled profile (live record or owner-validated index) is `.knowledge`. Standard
+    /// sessions, siblings, roots, deeper descendants, and unknown or conflicting profiles fail
+    /// closed. Admission, target validation, and every commit/dispatch recheck run this.
+    private func validateKnowledgeDelegationTarget(
+        caller: TabSession,
+        targetSessionID: UUID,
+        operation: String
+    ) throws {
+        guard let callerSessionID = caller.activeAgentSessionID else {
+            throw MCPError.invalidParams(
+                "\(operation) from a Knowledge session could not verify the calling session's identity. Refusing to address other agent sessions."
+            )
+        }
+        guard targetSessionID != callerSessionID else {
+            throw MCPError.invalidParams("\(operation) cannot target the calling agent session itself.")
+        }
+        guard mcpDelegationParentLookup(sessionID: targetSessionID) == .parent(callerSessionID),
+              mcpDelegationSessionProfile(sessionID: targetSessionID) == .knowledge
+        else {
+            throw MCPError.invalidParams(
+                "\(operation) from a Knowledge session may only target its own Knowledge research workers; the target is not a verified Knowledge worker started by this session."
             )
         }
     }
@@ -7834,8 +7987,16 @@ final class AgentModeViewModel: ObservableObject {
         sessionName: String?,
         parentSessionID: UUID? = nil,
         inheritWorktreeBindings: Bool = false,
-        delegationCommitCheck: () throws -> Void = {}
+        delegationCommitCheck: () throws -> Void = {},
+        childSessionProfile: AgentSessionProfile? = nil
     ) async throws -> MCPSessionTarget {
+        // A child profile is chosen only for a fresh tab; existing sessions keep their
+        // session-lifetime profile.
+        if childSessionProfile != nil, sessionID != nil || tabID != nil {
+            throw MCPError.invalidParams(
+                "A child session profile can only be applied to a newly created agent session; existing tabs and sessions keep their profile."
+            )
+        }
         if let sessionID {
             let indexedParentSessionID = ownerValidatedSessionIndex[sessionID]?.parentSessionID
             let existingTabID: UUID? = switch persistentBindingResolution(for: sessionID) {
@@ -7918,6 +8079,23 @@ final class AgentModeViewModel: ObservableObject {
         }
         let createdTabID = try await mcpCreateBackgroundSessionTab(name: sessionName)
         let hydrated = try await ensureSessionReady(tabID: createdTabID)
+        if let childSessionProfile {
+            // Adopt before the identity is bound, the parent is recorded, a lease is prepared, or
+            // a provider starts, so no prompt or tool policy is ever computed for another profile.
+            #if DEBUG
+                test_mcpBeforeChildSessionProfileAdoptionHook?(hydrated)
+            #endif
+            guard hydrated.adoptSessionProfile(childSessionProfile) else {
+                await mcpDiscardSessionTarget(MCPSessionTarget(
+                    tabID: hydrated.tabID,
+                    sessionID: hydrated.activeAgentSessionID,
+                    origin: .createdNewTab
+                ))
+                throw MCPError.invalidParams(
+                    "RepoPrompt could not apply the \(childSessionProfile.rawValue) profile to the new agent session. Refusing to start it."
+                )
+            }
+        }
         guard let createdSessionID = ensureSessionBoundToTab(hydrated) else {
             throw MCPError.invalidParams("The new tab could not be bound to an agent session.")
         }

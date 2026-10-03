@@ -390,6 +390,7 @@ allowed_tracked_docs=(
   "docs/context/plans/completed/2026-09-21-agent-scheduled-messages-plan.md"
   "docs/context/plans/2026-09-21-oracle-resumable-wait-plan.md"
   "docs/context/plans/2026-10-02-oracle-errors-and-delegated-ask-user-plan.md"
+  "docs/context/plans/2026-10-03-oracle-shim-auth-and-knowledge-workers-plan.md"
   "docs/context/plans/agent-focus-delivery-reliability.md"
   "docs/context/plans/agent-mode-qol-shortcut-focus-toolbar-motion.md"
   "docs/context/plans/omp-provider-integration.md"

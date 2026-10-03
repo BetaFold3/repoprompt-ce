@@ -546,6 +546,12 @@ actor ServerNetworkManager {
         return "Tool '\(toolName)' is not available in this Knowledge session. Available: \(allowedToolsOverride.sorted().joined(separator: ", "))."
     }
 
+    /// Denial for a tool in the connection's restricted set. Restrictions outrank the positive
+    /// ceiling, in `tools/list` and in `tools/call`, so both execution gates use this text.
+    nonisolated static func restrictedToolDenialMessage(forCanonicalToolName toolName: String) -> String {
+        "Tool '\(toolName)' is disabled for this connection."
+    }
+
     nonisolated static func admissionClass(forCanonicalToolName toolName: String) -> MCPToolAdmissionClass? {
         MCPToolAdmissionPolicy.classification(forCanonicalToolName: toolName)
     }
@@ -3127,6 +3133,12 @@ actor ServerNetworkManager {
     /// Returns the run purpose for a connection, used for UI routing (e.g., ask_user).
     func runPurpose(for connectionID: UUID) -> MCPRunPurpose {
         runPurposeByConnection[connectionID] ?? .unknown
+    }
+
+    /// Session profile of the tool policy currently enforced for a connection (the same value the
+    /// Knowledge positive tool ceiling uses). `.standard` when no Agent Mode lease set one.
+    func effectiveSessionProfile(for connectionID: UUID) -> AgentSessionProfile {
+        effectivePolicyState(for: connectionID).sessionProfile
     }
 
     func setRunPurpose(_ purpose: MCPRunPurpose, for connectionID: UUID) {
@@ -6977,12 +6989,15 @@ actor ServerNetworkManager {
         purpose: MCPRunPurpose,
         sessionProfile: AgentSessionProfile
     ) -> String {
-        guard sessionProfile == .knowledge,
-              name == MCPWindowToolName.askOracle
-        else {
+        guard sessionProfile == .knowledge else { return baseDescription }
+        switch name {
+        case MCPWindowToolName.askOracle:
+            return AgentModeMCPToolPolicy.knowledgeAskOracleDescription
+        case MCPWindowToolName.agentRun:
+            return AgentModeMCPToolPolicy.knowledgeAgentRunDescription
+        default:
             return baseDescription
         }
-        return AgentModeMCPToolPolicy.knowledgeAskOracleDescription
     }
 
     /// Checks if a tool's schema declares a `window_id` parameter.
@@ -11528,6 +11543,29 @@ actor ServerNetworkManager {
                 forCanonicalToolName: toolName,
                 allowedToolsOverride: earlyPolicy.allowedToolsOverride
             ) {
+                // Restrictions are checked before the ceiling, as in tools/list: a tool that is both
+                // restricted (such as a Knowledge root's agent_manage/agent_explore, or every
+                // delegation tool of a Knowledge research worker) and outside the ceiling gets the
+                // same `policy_restricted` denial as the restriction gate below.
+                if earlyPolicy.restricted.contains(toolName) {
+                    log.notice("Connection \(connectionID) attempted to call restricted tool \(toolName)")
+                    let message = Self.restrictedToolDenialMessage(forCanonicalToolName: toolName)
+                    let rawJSON = MCPToolArgsNormalizer.normalize(
+                        params: params.arguments,
+                        originalToolName: originalName,
+                        canonicalToolName: toolName
+                    ).rawJSON
+                    let result = Self.toolErrorResult(rawJSON: rawJSON, message: message)
+                    return await denyToolCall(
+                        connectionID: connectionID,
+                        invocationID: prePolicyInvocationID,
+                        toolName: toolName,
+                        args: params.arguments,
+                        code: "policy_restricted",
+                        message: message,
+                        result: result
+                    )
+                }
                 let result = CallTool.Result.err(denialMessage)
                 return await denyToolCall(
                     connectionID: connectionID,
@@ -11845,7 +11883,7 @@ actor ServerNetworkManager {
                 defer { EditFlowPerf.end(EditFlowPerf.Stage.MCPToolCall.policyGating, policyState) }
                 if policy.restricted.contains(toolName) {
                     log.notice("Connection \(connectionID) attempted to call restricted tool \(toolName)")
-                    let message = "Tool '\(toolName)' is disabled for this connection."
+                    let message = Self.restrictedToolDenialMessage(forCanonicalToolName: toolName)
                     let result = Self.toolErrorResult(rawJSON: capturedRawJSON, message: message)
                     return await denyToolCall(
                         connectionID: connectionID,

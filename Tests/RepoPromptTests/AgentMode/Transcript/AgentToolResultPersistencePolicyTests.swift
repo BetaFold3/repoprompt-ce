@@ -985,6 +985,116 @@ final class AgentToolResultPersistencePolicyTests: XCTestCase {
         XCTAssertEqual(incrementalFallback.reusedTurnCount, 0)
     }
 
+    /// Canonical save (`AgentSessionDataService` → persisted transcript) and a cold reload by a fresh
+    /// service keep a completed `ask_user` exchange intact: the questions (args) and the submitted
+    /// answers (result) reach the card unchanged, so the reloaded card renders every question,
+    /// context, option, and answer and keeps its "Show full exchange" affordance.
+    func testCompletedAskUserExchangeSurvivesCanonicalSaveAndColdReload() async throws {
+        let contextToken = "CONTEXT_TOKEN_5e1d"
+        let answerToken = "ANSWER_TOKEN_3c9b"
+        let longContext = "CONTEXT_START " + String(repeating: "Context sentence with selectable detail. ", count: 200) + contextToken
+        let questionContext = "Question context " + String(repeating: "with rollout constraints. ", count: 40) + "QCTX_TOKEN_77a2"
+        let argsJSON = jsonString([
+            "title": "Covered persistence",
+            "context": longContext,
+            "timeout_seconds": 60,
+            "questions": [
+                [
+                    "id": "decision",
+                    "header": "Decision",
+                    "question": "Approve the rollout?",
+                    "context": questionContext,
+                    "options": [
+                        ["label": "APPROVE_6D2F", "description": "Ship it now."],
+                        ["label": "REJECT_6D2F", "description": "Hold the release."]
+                    ],
+                    "allows_multiple": false,
+                    "allows_custom": false
+                ],
+                [
+                    "id": "checks",
+                    "question": "Which checks must pass first?",
+                    "options": ["unit", "integration"],
+                    "allows_multiple": true,
+                    "allows_custom": true
+                ]
+            ]
+        ])
+        let resultJSON = jsonString([
+            "answers": [
+                "decision": [
+                    "answers": ["APPROVE_6D2F"],
+                    "selected_options": ["APPROVE_6D2F"],
+                    "custom_response": NSNull(),
+                    "skipped": false
+                ],
+                "checks": [
+                    "answers": ["unit", "integration", "Smoke the canary \(answerToken)"],
+                    "selected_options": ["unit", "integration"],
+                    "custom_response": "Smoke the canary \(answerToken)",
+                    "skipped": false
+                ]
+            ],
+            "timed_out": false,
+            "skipped": false,
+            "elapsed_seconds": 4
+        ])
+        XCTAssertGreaterThan(argsJSON.utf8.count, AgentToolResultPersistencePolicy.maxPersistedToolSummaryBytes)
+
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("AgentToolResultPersistencePolicyTests", isDirectory: true)
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let workspace = WorkspaceModel(name: "Ask User Persistence", repoPaths: ["/tmp/repo"], customStoragePath: directory)
+        let session = AgentSession(id: UUID(), workspaceID: workspace.id, composeTabID: UUID(), name: "Ask user child")
+            .withItems([
+                AgentChatItem(kind: .user, text: "Ask the question.", sequenceIndex: 0),
+                .toolResult(name: "ask_user", invocationID: UUID(), argsJSON: argsJSON, resultJSON: resultJSON, isError: false, sequenceIndex: 1),
+                AgentChatItem(kind: .assistant, text: "Approved.", sequenceIndex: 2)
+            ])
+        let fileURL = try await AgentSessionDataService().saveAgentSession(session, for: workspace)
+        let onDisk = try String(contentsOf: fileURL, encoding: .utf8)
+        XCTAssertTrue(onDisk.contains(contextToken), "The canonical file keeps the question content")
+        XCTAssertTrue(onDisk.contains(answerToken), "The canonical file keeps the submitted answer")
+
+        // Cold reload, then re-save and reload again: restored sessions are saved again in normal use.
+        let reloaded = try await AgentSessionDataService().loadAgentSession(from: fileURL)
+        _ = try await AgentSessionDataService().saveAgentSession(reloaded, for: workspace)
+        let resaved = try await AgentSessionDataService().loadAgentSession(from: fileURL)
+        for (label, restored) in [("reload", reloaded), ("re-save", resaved)] {
+            let item = try XCTUnwrap(
+                restored.toLiveItems().first { $0.kind == .toolResult && $0.toolName == "ask_user" },
+                label
+            )
+            XCTAssertEqual(item.toolArgsJSON, argsJSON, label)
+            XCTAssertEqual(item.toolResultJSON, resultJSON, "Only the submitted answers persist, unchanged (\(label))")
+
+            let summary = parseAskUserQuestionSummaryRobust(args: item.toolArgsJSON, result: item.toolResultJSON)
+            XCTAssertFalse(summary.isHistoricalScalar, "The reloaded card offers Show full exchange (\(label))")
+            XCTAssertEqual(summary.displayTitle, "Covered persistence (2 questions)", label)
+            XCTAssertEqual(summary.contextLine, longContext, label)
+            XCTAssertEqual(summary.questions.map(\.id), ["decision", "checks"], label)
+            let decision = try XCTUnwrap(summary.questions.first, label)
+            XCTAssertEqual(decision.header, "Decision", label)
+            XCTAssertEqual(decision.question, "Approve the rollout?", label)
+            XCTAssertEqual(decision.context, questionContext, label)
+            XCTAssertEqual(decision.options.map(\.label), ["APPROVE_6D2F", "REJECT_6D2F"], label)
+            XCTAssertEqual(decision.options.map(\.description), ["Ship it now.", "Hold the release."], label)
+            XCTAssertEqual(decision.options.map(\.isSelected), [true, false], label)
+            XCTAssertEqual(decision.answer, "APPROVE_6D2F", label)
+            let checks = try XCTUnwrap(summary.questions.last, label)
+            XCTAssertEqual(checks.options.map(\.isSelected), [true, true], label)
+            XCTAssertEqual(checks.answer, "unit, integration, Smoke the canary \(answerToken)", label)
+            XCTAssertEqual(checks.customResponse, "Smoke the canary \(answerToken)", label)
+        }
+
+        // An already summarized legacy payload stays a summary; it is never re-labeled as complete.
+        let legacyStub = #"{"status":"success","summary_only":true,"summary_text":"ask_user • success"}"#
+        let legacy = try XCTUnwrap(persistedSummary(toolName: "ask_user", rawResultJSON: legacyStub, argsJSON: argsJSON))
+        XCTAssertTrue(legacy.summaryOnly)
+        XCTAssertEqual(try decodedObject(legacy.resultJSON)["summary_only"] as? Bool, true)
+    }
+
     private func persistedSummary(toolName: String, rawResultJSON: String, argsJSON: String? = nil) -> AgentPersistedToolResultSummary? {
         let invocationID = UUID()
         let item = AgentChatItem(

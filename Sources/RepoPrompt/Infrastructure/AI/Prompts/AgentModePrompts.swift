@@ -218,7 +218,23 @@ enum AgentModePrompts {
     ///
     /// Keep this prompt free of dynamic workspace, model, web-availability, and
     /// workflow state so providers can reuse the same prompt prefix across turns.
-    static func knowledgePrompt(agentKind: AgentProviderKind?) -> String {
+    /// Knowledge-session prompt. `delegationAudience` selects the static delegation text:
+    /// `.agentRunOnly` is a Knowledge root that may start research workers, `.none` is a Knowledge
+    /// session without delegation tools (in practice a research worker: a parentless, hydrated
+    /// Knowledge session always resolves to depth 0), and nil keeps the standalone prohibition.
+    /// Each text is fixed for the life of a session, so prompt caching is unaffected.
+    static func knowledgePrompt(
+        agentKind: AgentProviderKind?,
+        delegationAudience: ExportDelegationAudience? = nil
+    ) -> String {
+        let delegationGuidance = switch delegationAudience {
+        case .agentRunOnly:
+            Fragments.knowledgeResearchRootGuidance
+        case .some(.none):
+            Fragments.knowledgeResearchWorkerGuidance
+        case nil, .agentExploreOnly, .both:
+            Fragments.knowledgeStandaloneDelegationGuidance
+        }
         let mediaGuidance = switch agentKind {
         case .claudeCode:
             "Use the provider-native `Read` tool only for images, screenshots, PDFs, and other non-text media. Use RepoPrompt `read_file` for all text."
@@ -242,7 +258,7 @@ enum AgentModePrompts {
         Oracle consultation is optional. Use `oracle_utils` to resolve named presets exactly. For independent opinions, start separate `ask_oracle` chats with `new_chat:true`, explicit presets, and parallel calls when possible; continue each lane by its `chat_id`, which keeps that lane on its own preset. Default to zero critique rounds. Use one anonymized cross-critique only for material disagreement or a meaningful blind spot, and a second only for one explicit unresolved issue. Judge the evidence and user's criteria yourself; model identity and votes are not authority.
         \(Fragments.oracleResumableWaitGuidance)
 
-        Do not perform coding, build, Git, shell, worktree, computer-use, or agent-delegation tasks. Explain when a request belongs in a standard Agent Mode session.
+        \(delegationGuidance)
         """
         return Fragments.codexQualifiedToolReferences(prompt, agentKind: agentKind)
     }
@@ -264,6 +280,33 @@ enum AgentModePrompts {
         - For independent opinions, issue all `ask_oracle` calls together in the same tool-call batch. Give every lane `new_chat:true` and its own explicit `model`; `chat_name` is optional display text only and never selects a model. Refer to lanes by preset alias only, and never relay one lane's metadata to another.
         - Continue each lane with its own returned `chat_id`. The lane stays on its own preset, so `model` can be omitted on continuation; passing a different `model` switches that lane deliberately. Each result reports how the model was chosen through `model_selection` (`explicit`, `inherited`, or `automatic`).
         - Before comparing or synthesizing answers, verify every result's returned `model_preset_id` and `model_preset_name` match the requested preset. If identity is missing, mismatched, or any lane fails, report that failure and do not synthesize the answers.
+        """
+
+        // MARK: - Knowledge delegation
+
+        /// Knowledge session without delegation guidance (no audience supplied).
+        static let knowledgeStandaloneDelegationGuidance = """
+        Do not perform coding, build, Git, shell, worktree, computer-use, or agent-delegation tasks. Explain when a request belongs in a standard Agent Mode session.
+        """
+
+        /// Knowledge root (`.agentRunOnly`): may start parallel Knowledge research workers.
+        static let knowledgeResearchRootGuidance = """
+        Do not perform coding, build, Git, shell, worktree, or computer-use tasks. Explain when a request belongs in a standard Agent Mode session.
+
+        **Knowledge research workers**
+        - For broad research that splits into independent questions, you may start parallel Knowledge research workers with `agent_run`. Answer quick questions yourself instead.
+        - Give each worker one independent question or perspective and the context it needs. Start every worker with `op:"start"` and `detach:true`, then collect results with `op:"wait"` on their `session_ids`.
+        - Omitting `model_id` gives a worker this session's provider and model. Pass an explicit Claude Code or Codex compound `model_id` only when a different model materially helps; role labels, workflows, worktrees, and existing tabs are not available.
+        - Ask workers to return findings with URLs or workspace paths and their uncertainties. Verify and combine their findings yourself; you own the final answer and any workspace artifacts.
+        - Workers cannot start or control other agents, and `agent_run` addresses only your own workers.
+        """
+
+        /// Knowledge research worker (`.none`): reports back and cannot delegate.
+        static let knowledgeResearchWorkerGuidance = """
+        Do not perform coding, build, Git, shell, worktree, computer-use, or agent-delegation tasks.
+
+        **Research worker**
+        You are a Knowledge research worker: another Knowledge session started you to research one question. Return your findings in your final message: the conclusion first, then the evidence with URLs or workspace paths, then your uncertainties and open questions. The session that started you combines the results and owns any workspace artifacts, so do not create or edit workspace files unless its message asks you to. You cannot start or control other agents.
         """
 
         static let oracleResumableWaitGuidance = """

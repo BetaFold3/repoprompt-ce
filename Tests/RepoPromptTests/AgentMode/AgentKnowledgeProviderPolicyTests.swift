@@ -9,8 +9,15 @@ final class AgentKnowledgeProviderPolicyTests: XCTestCase {
             sessionProfile: .knowledge
         ))
 
-        for tool in ["Bash", "Write", "Edit", "Glob", "Grep", "Task", "Skill", "NotebookEdit"] {
+        for tool in ["Bash", "Write", "Edit", "Glob", "Grep", "Task", "Agent", "Skill", "NotebookEdit"] {
             XCTAssertTrue(denied.contains(tool), tool)
+        }
+        let promptOnlyDenied = Set(ClaudeCodeIntegrationConfiguration.disallowedTools(
+            for: .promptOnly,
+            sessionProfile: .knowledge
+        ))
+        for nativeDelegationTool in ["Task", "Agent"] {
+            XCTAssertTrue(promptOnlyDenied.contains(nativeDelegationTool), nativeDelegationTool)
         }
         for retained in ["Read", "WebSearch", "WebFetch"] {
             XCTAssertFalse(denied.contains(retained), retained)
@@ -39,6 +46,27 @@ final class AgentKnowledgeProviderPolicyTests: XCTestCase {
         XCTAssertEqual(policy.viewImageToolEnabled, true)
         XCTAssertEqual(policy.includeApplyPatchTool, false)
         XCTAssertEqual(policy.multiAgentEnabled, false)
+    }
+
+    /// Knowledge research workers delegate only through RepoPrompt `agent_run`; Codex native
+    /// multi-agent stays off for every shell/web/steering combination a Knowledge run can use.
+    func testCodexNativeMultiAgentStaysOffForEveryKnowledgeToolPolicy() {
+        for shell in [false, true] {
+            for web in [false, true] {
+                for steering in [false, true] {
+                    let policy = CodexNativeSessionController.defaultAppServerToolPolicy(
+                        shellToolEnabled: shell,
+                        webSearchRequestEnabled: web,
+                        forceExperimentalSteering: steering
+                    )
+                    XCTAssertEqual(
+                        policy.multiAgentEnabled,
+                        false,
+                        "shell=\(shell) web=\(web) steering=\(steering)"
+                    )
+                }
+            }
+        }
     }
 
     @MainActor

@@ -569,6 +569,519 @@ final class AgentDelegationPolicyTests: XCTestCase {
         }
     }
 
+    // MARK: - Knowledge research workers
+
+    func testKnowledgeDelegatesOnlyFromTheRootAndOnlyThroughAgentRun() {
+        XCTAssertEqual(Policy.maximumKnowledgeDelegatingDepth, 0)
+        XCTAssertEqual(Policy.knowledgeDelegationToolNames, [MCPWindowToolName.agentRun])
+
+        // Standard sessions keep the general depth-1 rule.
+        XCTAssertEqual(Policy.decision(taskLabelKind: nil, lineage: .resolved(depth: 1)), .eligible(depth: 1))
+        XCTAssertEqual(
+            Policy.decision(taskLabelKind: nil, lineage: .resolved(depth: 1), sessionProfile: .standard),
+            .eligible(depth: 1)
+        )
+
+        let root = Policy.decision(taskLabelKind: nil, lineage: .resolved(depth: 0), sessionProfile: .knowledge)
+        XCTAssertEqual(root, .eligible(depth: 0))
+        XCTAssertNil(Policy.denialMessage(for: root))
+        let rootPolicy = Policy.runToolPolicy(decision: root, taskLabelKind: nil, sessionProfile: .knowledge)
+        XCTAssertTrue(rootPolicy.allowsAgentExternalControlTools)
+        XCTAssertEqual(
+            rootPolicy.additionalRestrictedTools,
+            [MCPWindowToolName.agentManage, MCPWindowToolName.agentExplore]
+        )
+        XCTAssertEqual(rootPolicy.promptAudience, .agentRunOnly)
+
+        for depth in 1 ... 3 {
+            let decision = Policy.decision(taskLabelKind: nil, lineage: .resolved(depth: depth), sessionProfile: .knowledge)
+            XCTAssertEqual(decision, .knowledgeLeaf(depth: depth), "depth \(depth)")
+            XCTAssertFalse(decision.canDelegate)
+            XCTAssertEqual(Policy.runToolPolicy(decision: decision, taskLabelKind: nil, sessionProfile: .knowledge), .leaf)
+            XCTAssertEqual(
+                Policy.denialMessage(for: decision),
+                "Knowledge research workers cannot start or control other agents."
+            )
+        }
+
+        // Explore and unverifiable lineage keep their own fail-closed decisions under Knowledge.
+        XCTAssertEqual(
+            Policy.decision(taskLabelKind: .explore, lineage: .resolved(depth: 0), sessionProfile: .knowledge),
+            .exploreLeaf
+        )
+        for failure in [Policy.LineageResolution.unresolved, .cyclic, .inconsistent] {
+            let decision = Policy.decision(taskLabelKind: nil, lineage: failure, sessionProfile: .knowledge)
+            XCTAssertEqual(decision, .lineageFailure(failure))
+            XCTAssertEqual(Policy.runToolPolicy(decision: decision, taskLabelKind: nil, sessionProfile: .knowledge), .leaf)
+        }
+    }
+
+    func testKnowledgeRootLeaseKeepsOnlyAgentRunWhileWorkerLeaseHidesEveryDelegationTool() {
+        let rootPolicy = Policy.runToolPolicy(
+            decision: .eligible(depth: 0),
+            taskLabelKind: nil,
+            sessionProfile: .knowledge
+        )
+        let rootSpec = MCPBootstrapLeaseSpec.agentMode(
+            tabID: UUID(),
+            runID: UUID(),
+            gateID: UUID(),
+            windowID: 1,
+            agent: .claudeCode,
+            sessionProfile: .knowledge,
+            allowsAgentExternalControlTools: rootPolicy.allowsAgentExternalControlTools,
+            additionalRestrictedTools: rootPolicy.additionalRestrictedTools
+        )
+        XCTAssertTrue(rootSpec.restrictedTools.contains(MCPWindowToolName.agentManage))
+        XCTAssertTrue(rootSpec.restrictedTools.contains(MCPWindowToolName.agentExplore))
+        XCTAssertFalse(rootSpec.restrictedTools.contains(MCPWindowToolName.agentRun))
+        XCTAssertTrue(rootSpec.allowedToolsOverride?.contains(MCPWindowToolName.agentRun) == true)
+        XCTAssertTrue(rootSpec.allowsAgentExternalControlTools)
+
+        let workerPolicy = Policy.runToolPolicy(
+            decision: .knowledgeLeaf(depth: 1),
+            taskLabelKind: nil,
+            sessionProfile: .knowledge
+        )
+        let workerSpec = MCPBootstrapLeaseSpec.agentMode(
+            tabID: UUID(),
+            runID: UUID(),
+            gateID: UUID(),
+            windowID: 1,
+            agent: .codexExec,
+            sessionProfile: .knowledge,
+            allowsAgentExternalControlTools: workerPolicy.allowsAgentExternalControlTools,
+            additionalRestrictedTools: workerPolicy.additionalRestrictedTools
+        )
+        XCTAssertTrue(workerSpec.restrictedTools.isSuperset(of: Policy.delegationToolNames))
+        XCTAssertFalse(workerSpec.allowsAgentExternalControlTools)
+    }
+
+    func testKnowledgeRootAdmitsAndTargetsOnlyItsOwnKnowledgeWorkers() throws {
+        let vm = makeViewModel()
+        let root = makeSession(vm, parent: nil, role: nil, profile: .knowledge)
+        let worker = makeSession(vm, parent: root.sessionID, role: nil, profile: .knowledge)
+        let secondWorker = makeSession(vm, parent: root.sessionID, role: nil, profile: .knowledge)
+        let standardChild = makeSession(vm, parent: root.sessionID, role: .engineer)
+        let grandchild = makeSession(vm, parent: worker.sessionID, role: nil, profile: .knowledge)
+        let otherRoot = makeSession(vm, parent: nil, role: nil, profile: .knowledge)
+        let otherRootWorker = makeSession(vm, parent: otherRoot.sessionID, role: nil, profile: .knowledge)
+        let standardRoot = makeSession(vm, parent: nil, role: nil)
+        let unhydratedChild = makeSession(vm, parent: root.sessionID, role: nil, profile: .knowledge)
+        unhydratedChild.session.hasLoadedPersistedState = false
+
+        // Admission: the Knowledge root delegates through agent_run alone; its workers are leaves.
+        XCTAssertEqual(try vm.mcpValidateAgentRunSpawnAllowed(sourceTabID: root.tabID), root.sessionID)
+        XCTAssertEqual(vm.mcpDelegationRunToolPolicy(for: root.session).promptAudience, .agentRunOnly)
+        XCTAssertEqual(
+            vm.mcpDelegationRunToolPolicy(for: root.session).additionalRestrictedTools,
+            [MCPWindowToolName.agentManage, MCPWindowToolName.agentExplore]
+        )
+        for knowledgeWorker in [worker, secondWorker, otherRootWorker] {
+            XCTAssertEqual(vm.mcpDelegationDecision(for: knowledgeWorker.session), .knowledgeLeaf(depth: 1))
+            XCTAssertEqual(vm.mcpDelegationRunToolPolicy(for: knowledgeWorker.session), .leaf)
+            XCTAssertThrowsError(try vm.mcpValidateAgentRunSpawnAllowed(sourceTabID: knowledgeWorker.tabID)) { error in
+                XCTAssertTrue(
+                    String(describing: error).contains("Knowledge research workers cannot start or control other agents"),
+                    String(describing: error)
+                )
+            }
+            XCTAssertThrowsError(try vm.mcpAdmitDelegationControl(
+                sourceTabID: knowledgeWorker.tabID,
+                targetSessionID: root.sessionID,
+                operation: "agent_run.cancel"
+            ))
+        }
+        // A standard worker of a standard main keeps the general depth-1 rule.
+        let standardWorker = makeSession(vm, parent: standardRoot.sessionID, role: .engineer)
+        XCTAssertNoThrow(try vm.mcpValidateAgentRunSpawnAllowed(sourceTabID: standardWorker.tabID))
+
+        // Own-child targeting.
+        for operation in ["agent_run.steer", "agent_run.cancel", "agent_run.respond", "agent_run.wait"] {
+            for ownWorker in [worker, secondWorker] {
+                XCTAssertNoThrow(try vm.mcpValidateDelegationTarget(
+                    sourceTabID: root.tabID, targetSessionID: ownWorker.sessionID, operation: operation
+                ), operation)
+                XCTAssertEqual(
+                    try vm.mcpAdmitDelegationControl(
+                        sourceTabID: root.tabID, targetSessionID: ownWorker.sessionID, operation: operation
+                    ),
+                    root.sessionID,
+                    operation
+                )
+            }
+            XCTAssertNoThrow(try vm.mcpValidateDelegationTarget(
+                sourceTabID: root.tabID, targetSessionID: nil, operation: operation
+            ), "A nil target is a fresh worker")
+            XCTAssertThrowsError(try vm.mcpValidateDelegationTarget(
+                sourceTabID: root.tabID, targetSessionID: root.sessionID, operation: operation
+            )) { error in
+                XCTAssertTrue(String(describing: error).contains("cannot target the calling agent session itself"), String(describing: error))
+            }
+            let foreignTargets = [
+                standardChild.sessionID,
+                grandchild.sessionID,
+                otherRoot.sessionID,
+                otherRootWorker.sessionID,
+                standardRoot.sessionID,
+                standardWorker.sessionID,
+                unhydratedChild.sessionID,
+                UUID()
+            ]
+            for target in foreignTargets {
+                XCTAssertThrowsError(try vm.mcpValidateDelegationTarget(
+                    sourceTabID: root.tabID, targetSessionID: target, operation: operation
+                )) { error in
+                    XCTAssertTrue(
+                        String(describing: error).contains("may only target its own Knowledge research workers"),
+                        "\(operation): \(error)"
+                    )
+                }
+                XCTAssertThrowsError(try vm.mcpAdmitDelegationControl(
+                    sourceTabID: root.tabID, targetSessionID: target, operation: operation
+                ), operation)
+            }
+        }
+        XCTAssertNil(vm.mcpDelegationSessionProfile(sessionID: unhydratedChild.sessionID), "Unhydrated records make no profile claim")
+        XCTAssertEqual(vm.mcpDelegationSessionProfile(sessionID: worker.sessionID), .knowledge)
+        XCTAssertEqual(vm.mcpDelegationSessionProfile(sessionID: standardChild.sessionID), .standard)
+        XCTAssertNil(vm.mcpDelegationSessionProfile(sessionID: UUID()))
+
+        // A standard main keeps its existing session-addressed behavior, including Knowledge sessions.
+        XCTAssertNoThrow(try vm.mcpValidateDelegationTarget(
+            sourceTabID: standardRoot.tabID, targetSessionID: worker.sessionID, operation: "agent_run.steer"
+        ))
+    }
+
+    func testKnowledgeTargetProfileReconcilesLiveAndIndexedClaims() throws {
+        let vm = makeViewModel()
+        let rootTabID = UUID()
+        let rootSessionID = UUID()
+        let conflictTabID = UUID()
+        let conflictSessionID = UUID()
+        let indexedKnowledgeTabID = UUID()
+        let indexedKnowledgeSessionID = UUID()
+        let indexedStandardTabID = UUID()
+        let indexedStandardSessionID = UUID()
+        let workspace = WorkspaceModel(
+            name: "Knowledge Profile Claims",
+            repoPaths: [],
+            ephemeralFlag: true,
+            composeTabs: [
+                ComposeTabState(id: rootTabID, name: "Root", activeAgentSessionID: rootSessionID),
+                ComposeTabState(id: conflictTabID, name: "Conflict", activeAgentSessionID: conflictSessionID),
+                ComposeTabState(id: indexedKnowledgeTabID, name: "Indexed K", activeAgentSessionID: indexedKnowledgeSessionID),
+                ComposeTabState(id: indexedStandardTabID, name: "Indexed S", activeAgentSessionID: indexedStandardSessionID)
+            ],
+            activeComposeTabID: nil
+        )
+        let owner = vm.test_receiveWorkspaceSwitchNotification(workspace)
+        vm.test_installSessionIndexSnapshot(
+            Dictionary(uniqueKeysWithValues: [
+                indexEntry(rootSessionID, tabID: rootTabID, parent: nil, profile: .knowledge),
+                indexEntry(conflictSessionID, tabID: conflictTabID, parent: rootSessionID, profile: .standard),
+                indexEntry(indexedKnowledgeSessionID, tabID: indexedKnowledgeTabID, parent: rootSessionID, profile: .knowledge),
+                indexEntry(indexedStandardSessionID, tabID: indexedStandardTabID, parent: rootSessionID, profile: .standard)
+            ].map { ($0.id, $0) }),
+            owner: owner,
+            latestOwner: owner,
+            activeWorkspace: workspace
+        )
+        let root = makeSession(vm, tabID: rootTabID, sessionID: rootSessionID, parent: nil, role: nil, profile: .knowledge)
+        // The live record claims Knowledge while the index claims standard: neither is chosen.
+        _ = makeSession(vm, tabID: conflictTabID, sessionID: conflictSessionID, parent: rootSessionID, role: nil, profile: .knowledge)
+        XCTAssertNil(vm.mcpDelegationSessionProfile(sessionID: conflictSessionID))
+        XCTAssertEqual(vm.mcpDelegationSessionProfile(sessionID: indexedKnowledgeSessionID), .knowledge)
+        XCTAssertEqual(vm.mcpDelegationSessionProfile(sessionID: indexedStandardSessionID), .standard)
+
+        let operation = "agent_run.wait"
+        XCTAssertNoThrow(try vm.mcpValidateDelegationTarget(
+            sourceTabID: root.tabID, targetSessionID: indexedKnowledgeSessionID, operation: operation
+        ), "An index-only Knowledge worker of this root is its own worker")
+        for target in [conflictSessionID, indexedStandardSessionID] {
+            XCTAssertThrowsError(try vm.mcpValidateDelegationTarget(
+                sourceTabID: root.tabID, targetSessionID: target, operation: operation
+            )) { error in
+                XCTAssertTrue(
+                    String(describing: error).contains("may only target its own Knowledge research workers"),
+                    String(describing: error)
+                )
+            }
+        }
+    }
+
+    func testKnowledgeCommitRecheckRejectsReplacedCallerAndRetargetedWorker() throws {
+        let vm = makeViewModel()
+        let root = makeSession(vm, parent: nil, role: nil, profile: .knowledge)
+        let worker = makeSession(vm, parent: root.sessionID, role: nil, profile: .knowledge)
+        let otherRoot = makeSession(vm, parent: nil, role: nil, profile: .knowledge)
+        let operation = "agent_run.respond"
+
+        let admitted = try vm.mcpAdmitDelegationControl(
+            sourceTabID: root.tabID, targetSessionID: worker.sessionID, operation: operation
+        )
+        XCTAssertEqual(admitted, root.sessionID)
+        XCTAssertNoThrow(try vm.mcpRevalidateDelegationCommit(
+            sourceTabID: root.tabID,
+            expectedCallerSessionID: admitted,
+            targetSessionID: worker.sessionID,
+            operation: operation
+        ))
+
+        // The worker moved under another root while the request was suspended.
+        worker.session.parentSessionID = otherRoot.sessionID
+        XCTAssertThrowsError(try vm.mcpRevalidateDelegationCommit(
+            sourceTabID: root.tabID,
+            expectedCallerSessionID: admitted,
+            targetSessionID: worker.sessionID,
+            operation: operation
+        )) { error in
+            XCTAssertTrue(
+                String(describing: error).contains("may only target its own Knowledge research workers"),
+                String(describing: error)
+            )
+        }
+        worker.session.parentSessionID = root.sessionID
+
+        // A replacement session now occupies the caller tab: the admitted identity no longer holds it.
+        root.session.testInstallPersistentSessionBinding(sessionID: UUID())
+        XCTAssertThrowsError(try vm.mcpRevalidateDelegationCommit(
+            sourceTabID: root.tabID,
+            expectedCallerSessionID: admitted,
+            targetSessionID: worker.sessionID,
+            operation: operation
+        )) { error in
+            XCTAssertTrue(String(describing: error).contains("changed while the request was in flight"), String(describing: error))
+        }
+    }
+
+    func testDelegationCallerProfileFailsClosedForUnhydratedPlaceholders() throws {
+        let vm = makeViewModel()
+        let rootTabID = UUID()
+        let rootSessionID = UUID()
+        let workerTabID = UUID()
+        let workerSessionID = UUID()
+        let workspace = WorkspaceModel(
+            name: "Knowledge Caller Placeholders",
+            repoPaths: [],
+            ephemeralFlag: true,
+            composeTabs: [
+                ComposeTabState(id: rootTabID, name: "Root", activeAgentSessionID: rootSessionID),
+                ComposeTabState(id: workerTabID, name: "Worker", activeAgentSessionID: workerSessionID)
+            ],
+            activeComposeTabID: nil
+        )
+        let owner = vm.test_receiveWorkspaceSwitchNotification(workspace)
+        vm.test_installSessionIndexSnapshot(
+            Dictionary(uniqueKeysWithValues: [
+                indexEntry(rootSessionID, tabID: rootTabID, parent: nil, profile: .knowledge),
+                indexEntry(workerSessionID, tabID: workerTabID, parent: rootSessionID, profile: .knowledge)
+            ].map { ($0.id, $0) }),
+            owner: owner,
+            latestOwner: owner,
+            activeWorkspace: workspace
+        )
+        let standardRoot = makeSession(vm, parent: nil, role: nil)
+        // Persisted Knowledge sessions whose live records are still placeholders: the `.standard`
+        // default of an unhydrated record is no claim, so the indexed Knowledge profile decides.
+        let root = makeSession(vm, tabID: rootTabID, sessionID: rootSessionID, parent: nil, role: nil)
+        root.session.hasLoadedPersistedState = false
+        let worker = makeSession(
+            vm, tabID: workerTabID, sessionID: workerSessionID, parent: rootSessionID, role: nil, controlled: false
+        )
+        worker.session.hasLoadedPersistedState = false
+        XCTAssertEqual(root.session.profile, .standard)
+        XCTAssertEqual(vm.mcpDelegationCallerProfileResolution(sourceTabID: rootTabID), .resolved(.knowledge, isHydrated: false))
+        XCTAssertEqual(vm.mcpDelegationCallerProfileResolution(sourceTabID: workerTabID), .resolved(.knowledge, isHydrated: false))
+        XCTAssertEqual(
+            vm.mcpDelegationCallerProfileResolution(sourceTabID: standardRoot.tabID),
+            .resolved(.standard, isHydrated: true)
+        )
+        XCTAssertEqual(vm.mcpDelegationCallerProfileResolution(sourceTabID: UUID()), .noLiveRecord)
+
+        // The worker placeholder is a Knowledge leaf, never a standard depth-1 worker.
+        XCTAssertEqual(vm.mcpDelegationLineage(for: worker.session), .resolved(depth: 1))
+        XCTAssertThrowsError(try vm.mcpValidateAgentRunSpawnAllowed(sourceTabID: workerTabID)) { error in
+            XCTAssertTrue(
+                String(describing: error).contains("Knowledge research workers cannot start or control other agents"),
+                String(describing: error)
+            )
+        }
+        // The root placeholder keeps the own-child rule instead of standard depth-0 access.
+        XCTAssertThrowsError(try vm.mcpValidateDelegationTarget(
+            sourceTabID: rootTabID, targetSessionID: standardRoot.sessionID, operation: "agent_run.cancel"
+        )) { error in
+            XCTAssertTrue(
+                String(describing: error).contains("may only target its own Knowledge research workers"),
+                String(describing: error)
+            )
+        }
+        /// A Knowledge commit requires the admitted caller to be a hydrated Knowledge record.
+        func assertNotVerifiedKnowledge(_ label: String) {
+            XCTAssertThrowsError(try vm.mcpRevalidateDelegationCommit(
+                sourceTabID: rootTabID,
+                expectedCallerSessionID: rootSessionID,
+                operation: "agent_run.start",
+                expectedCallerProfile: .knowledge
+            ), label) { error in
+                XCTAssertTrue(String(describing: error).contains("is no longer a verified knowledge session"), "\(label): \(error)")
+            }
+        }
+        assertNotVerifiedKnowledge("unhydrated placeholder")
+        // Once hydrated, the record's own profile decides: a standard record never satisfies a
+        // Knowledge commit, and a hydrated Knowledge record does.
+        root.session.hasLoadedPersistedState = true
+        assertNotVerifiedKnowledge("hydrated standard record")
+        XCTAssertTrue(root.session.adoptSessionProfile(.knowledge))
+        XCTAssertNoThrow(try vm.mcpRevalidateDelegationCommit(
+            sourceTabID: rootTabID,
+            expectedCallerSessionID: rootSessionID,
+            operation: "agent_run.start",
+            expectedCallerProfile: .knowledge
+        ))
+        XCTAssertEqual(vm.mcpDelegationCallerProfileResolution(sourceTabID: rootTabID), .resolved(.knowledge, isHydrated: true))
+
+        // A placeholder whose live parent claim resolves its lineage but whose profile has no claim
+        // at all is refused rather than admitted as a standard worker.
+        let unverified = makeSession(vm, parent: standardRoot.sessionID, role: .engineer)
+        unverified.session.hasLoadedPersistedState = false
+        XCTAssertEqual(vm.mcpDelegationLineage(for: unverified.session), .resolved(depth: 1))
+        XCTAssertEqual(vm.mcpDelegationCallerProfileResolution(sourceTabID: unverified.tabID), .unverified)
+        XCTAssertThrowsError(try vm.mcpValidateAgentRunSpawnAllowed(sourceTabID: unverified.tabID)) { error in
+            XCTAssertTrue(
+                String(describing: error).contains("could not verify the calling Agent Mode session's profile"),
+                String(describing: error)
+            )
+        }
+        XCTAssertThrowsError(try vm.mcpAdmitDelegationControl(
+            sourceTabID: unverified.tabID, targetSessionID: UUID(), operation: "agent_run.cancel"
+        ))
+    }
+
+    func testKnowledgeExpectedCallerProfileKeepsOwnChildRuleForAStandardRecord() throws {
+        let vm = makeViewModel()
+        let root = makeSession(vm, parent: nil, role: nil, profile: .knowledge)
+        let worker = makeSession(vm, parent: root.sessionID, role: nil, profile: .knowledge)
+        let standardRoot = makeSession(vm, parent: nil, role: nil)
+        // A standard record's own profile allows depth-0 access, but a caller admitted as Knowledge
+        // keeps the own-child rule at every recheck.
+        XCTAssertNoThrow(try vm.mcpValidateDelegationTarget(
+            sourceTabID: standardRoot.tabID, targetSessionID: root.sessionID, operation: "agent_run.cancel"
+        ))
+        XCTAssertThrowsError(try vm.mcpValidateDelegationTarget(
+            sourceTabID: standardRoot.tabID,
+            targetSessionID: root.sessionID,
+            operation: "agent_run.cancel",
+            expectedCallerProfile: .knowledge
+        )) { error in
+            XCTAssertTrue(
+                String(describing: error).contains("may only target its own Knowledge research workers"),
+                String(describing: error)
+            )
+        }
+        XCTAssertNoThrow(try vm.mcpRevalidateDelegationCommit(
+            sourceTabID: root.tabID,
+            expectedCallerSessionID: root.sessionID,
+            targetSessionID: worker.sessionID,
+            operation: "agent_run.respond",
+            expectedCallerProfile: .knowledge
+        ))
+        // Standard callers without an expected profile keep their existing commit recheck.
+        XCTAssertNoThrow(try vm.mcpRevalidateDelegationCommit(
+            sourceTabID: standardRoot.tabID,
+            expectedCallerSessionID: standardRoot.sessionID,
+            targetSessionID: worker.sessionID,
+            operation: "agent_run.cancel"
+        ))
+    }
+
+    func testKnowledgeChildSelectionSnapshotFreezesTheAdmittedCallerOrFailsClosed() throws {
+        let vm = makeViewModel()
+        let root = makeSession(vm, parent: nil, role: nil, profile: .knowledge)
+        root.session.selectedAgent = .codexExec
+        root.session.selectedModelRaw = "  gpt-5.4  "
+        root.session.selectedReasoningEffortRaw = " high "
+        XCTAssertEqual(
+            try vm.mcpKnowledgeChildSelectionSnapshot(sourceTabID: root.tabID, expectedCallerSessionID: root.sessionID),
+            AgentModeViewModel.MCPKnowledgeChildSelection(agent: .codexExec, modelRaw: "gpt-5.4", reasoningEffortRaw: "high")
+        )
+        root.session.selectedReasoningEffortRaw = "   "
+        XCTAssertNil(
+            try vm.mcpKnowledgeChildSelectionSnapshot(sourceTabID: root.tabID, expectedCallerSessionID: root.sessionID)
+                .reasoningEffortRaw
+        )
+
+        func assertFailsClosed(
+            _ tabID: UUID,
+            _ expected: UUID?,
+            _ label: String,
+            file: StaticString = #filePath,
+            line: UInt = #line
+        ) {
+            XCTAssertThrowsError(
+                try vm.mcpKnowledgeChildSelectionSnapshot(sourceTabID: tabID, expectedCallerSessionID: expected),
+                label,
+                file: file,
+                line: line
+            ) { error in
+                XCTAssertTrue(
+                    String(describing: error).contains("could not read this Knowledge session's provider and model"),
+                    "\(label): \(error)",
+                    file: file,
+                    line: line
+                )
+            }
+        }
+
+        assertFailsClosed(root.tabID, nil, "no admitted identity")
+        assertFailsClosed(root.tabID, UUID(), "different admitted identity")
+        assertFailsClosed(UUID(), root.sessionID, "unknown tab")
+
+        let standardRoot = makeSession(vm, parent: nil, role: nil)
+        standardRoot.session.selectedAgent = .claudeCode
+        assertFailsClosed(standardRoot.tabID, standardRoot.sessionID, "standard caller")
+
+        root.session.selectedAgent = .openCode
+        root.session.selectedModelRaw = "some-model"
+        assertFailsClosed(root.tabID, root.sessionID, "unsupported provider")
+
+        root.session.selectedAgent = .claudeCode
+        root.session.selectedModelRaw = "   "
+        assertFailsClosed(root.tabID, root.sessionID, "empty model")
+
+        root.session.selectedModelRaw = "sonnet"
+        root.session.hasLoadedPersistedState = false
+        assertFailsClosed(root.tabID, root.sessionID, "unhydrated caller")
+        root.session.hasLoadedPersistedState = true
+        XCTAssertEqual(
+            try vm.mcpKnowledgeChildSelectionSnapshot(sourceTabID: root.tabID, expectedCallerSessionID: root.sessionID),
+            AgentModeViewModel.MCPKnowledgeChildSelection(agent: .claudeCode, modelRaw: "sonnet", reasoningEffortRaw: nil)
+        )
+    }
+
+    func testChildSessionProfileIsRejectedForExistingTabsAndSessions() async throws {
+        let vm = makeViewModel()
+        let existing = makeSession(vm, parent: nil, role: nil)
+        for (tabID, sessionID) in [(Optional(existing.tabID), UUID?.none), (nil, Optional(existing.sessionID))] {
+            do {
+                _ = try await vm.mcpResolveOrCreateSessionTarget(
+                    tabID: tabID,
+                    sessionID: sessionID,
+                    createIfNeeded: true,
+                    sessionName: nil,
+                    childSessionProfile: .knowledge
+                )
+                XCTFail("A child profile must never be applied to an existing tab or session")
+            } catch {
+                XCTAssertTrue(
+                    String(describing: error).contains("can only be applied to a newly created agent session"),
+                    String(describing: error)
+                )
+            }
+        }
+        XCTAssertEqual(existing.session.profile, .standard)
+    }
+
     // MARK: - Prompt audience
 
     func testNilAudienceKeepsLegacyRolePromptsAcrossProviders() {
@@ -703,12 +1216,15 @@ final class AgentDelegationPolicyTests: XCTestCase {
         sessionID: UUID = UUID(),
         parent: UUID?,
         role: AgentModelCatalog.TaskLabelKind?,
-        controlled: Bool = true
+        controlled: Bool = true,
+        profile: AgentSessionProfile = .standard
     ) -> LiveSession {
         let session = vm.session(for: tabID, createIfNeeded: true)!
         session.testInstallPersistentSessionBinding(sessionID: sessionID)
         session.parentSessionID = parent
         session.hasLoadedPersistedState = true
+        // Adopt while the record is still an untouched placeholder (before any control context).
+        XCTAssertTrue(session.adoptSessionProfile(profile))
         if controlled, parent != nil || role != nil {
             session.mcpControlContext = AgentModeViewModel.AgentMCPControlContext(
                 sessionID: sessionID,
@@ -728,7 +1244,12 @@ final class AgentDelegationPolicyTests: XCTestCase {
         return LiveSession(tabID: tabID, sessionID: sessionID, session: session)
     }
 
-    private func indexEntry(_ sessionID: UUID, tabID: UUID, parent: UUID?) -> AgentSessionIndexEntry {
+    private func indexEntry(
+        _ sessionID: UUID,
+        tabID: UUID,
+        parent: UUID?,
+        profile: AgentSessionProfile = .standard
+    ) -> AgentSessionIndexEntry {
         AgentSessionIndexEntry(
             id: sessionID,
             tabID: tabID,
@@ -747,6 +1268,7 @@ final class AgentDelegationPolicyTests: XCTestCase {
             remoteHostName: nil,
             isMCPOriginated: parent != nil,
             origin: nil,
+            profile: profile,
             worktreeBindingSummaries: [],
             activeWorktreeMergeSummaries: []
         )

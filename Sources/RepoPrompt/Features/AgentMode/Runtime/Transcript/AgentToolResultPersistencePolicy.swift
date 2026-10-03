@@ -425,7 +425,13 @@ enum AgentToolResultPersistencePolicy {
             statusWord: statusWord,
             context: context
         )
-        let resultJSON = promptExportStructuredMetadata
+        let completeExchangeJSON = completeAskUserExchangeResultJSON(
+            normalizedToolName: normalizedToolName,
+            sanitized: sanitized,
+            context: context
+        )
+        let resultJSON = completeExchangeJSON
+            ?? promptExportStructuredMetadata
             ?? cursorACPStructuredSummary
             ?? allowedStructuredSummary
             ?? lifecycleWaitPolicySummary
@@ -441,8 +447,32 @@ enum AgentToolResultPersistencePolicy {
             processID: processID,
             exitCode: exitCode,
             summaryText: summaryText,
-            summaryOnly: promptExportStructuredMetadata == nil
+            summaryOnly: promptExportStructuredMetadata == nil && completeExchangeJSON == nil
         )
+    }
+
+    /// A completed `ask_user` exchange persists verbatim so a reloaded card still shows the full
+    /// question and answer: its args are the agent's questions and its result holds only the
+    /// submitted answers (never drafts). Like delivered question notices, it bypasses the summary
+    /// byte budget. An already summarized legacy payload stays a summary.
+    private static let completeExchangeToolNames: Set<String> = ["ask_user", "ask_user_question"]
+
+    private static func completeAskUserExchangeResultJSON(
+        normalizedToolName: String?,
+        sanitized: AgentSanitizedToolResult?,
+        context: AgentToolResultProcessingContext?
+    ) -> String? {
+        guard let normalizedToolName,
+              completeExchangeToolNames.contains(normalizedToolName),
+              let sanitized,
+              sanitized.preservesRawPayload,
+              let resultJSON = sanitized.resultJSON,
+              !resultJSON.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              boolValue(jsonObject(from: resultJSON, context: context), keys: ["summary_only", "summaryOnly"]) != true
+        else {
+            return nil
+        }
+        return resultJSON
     }
 
     /// The ordinary summary remains byte-bounded; delivered question notices are an
@@ -1063,13 +1093,17 @@ enum AgentToolResultPersistencePolicy {
             activity.text = sanitizedToolCallText(toolName: updatedExecution.toolName ?? item.toolName)
         }
 
-        updatedExecution.argsJSON = nil
+        let preservesCompleteExchange = activity.itemKind == .toolResult
+            && !persistentSummaryOnly
+            && normalizedToolName.map(completeExchangeToolNames.contains) == true
+        updatedExecution.argsJSON = preservesCompleteExchange ? (updatedExecution.argsJSON ?? item.toolArgsJSON) : nil
         updatedExecution.summaryOnly = persistentSummaryOnly
         updatedExecution.keyPaths = []
         enforcePersistentPayloadCap(
             activity: &activity,
             execution: &updatedExecution,
-            normalizedToolName: normalizedToolName
+            normalizedToolName: normalizedToolName,
+            preservesCompleteExchange: preservesCompleteExchange
         )
         activity.toolExecution = updatedExecution
         context?.storeToolExecution(updatedExecution, for: activity.id)
@@ -1079,13 +1113,15 @@ enum AgentToolResultPersistencePolicy {
     private static func enforcePersistentPayloadCap(
         activity: inout AgentTranscriptActivity,
         execution: inout AgentTranscriptToolExecution,
-        normalizedToolName: String?
+        normalizedToolName: String?,
+        preservesCompleteExchange: Bool
     ) {
         execution.processID = storageSafeMetadataString(execution.processID)
         execution.summaryText = smallStorageSummaryText(execution.summaryText)
         if exceedsCommittedMetadataLimit(execution.toolName) {
             execution.toolName = storageSafeMetadataString(normalizedToolName) ?? "tool"
         }
+        guard !preservesCompleteExchange else { return }
 
         let statusWord = AgentTranscriptToolStatusSemantics.persistedStatusWord(from: execution.status)
         let fallbackWithMetadata = minimalResultJSON(

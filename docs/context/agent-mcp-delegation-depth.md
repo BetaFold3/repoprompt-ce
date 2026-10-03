@@ -1,8 +1,8 @@
 # Bounded RepoPrompt MCP delegation
 
-Scope: read when the task touches RepoPrompt MCP delegation depth, `agent_run` / `agent_manage` / `agent_explore` admission or advertisement for Agent Mode runs, delegation lineage, fork_session parent placement, role prompt delegation guidance, or delegated child `ask_user` routing to a parent agent.
+Scope: read when the task touches RepoPrompt MCP delegation depth, `agent_run` / `agent_manage` / `agent_explore` admission or advertisement for Agent Mode runs, delegation lineage, fork_session parent placement, role prompt delegation guidance, Knowledge research workers, or delegated child `ask_user` routing to a parent agent.
 Authority: Authoritative
-Last-verified: 2026-10-02
+Last-verified: 2026-10-03
 
 ## Contract
 
@@ -11,6 +11,7 @@ Last-verified: 2026-10-02
 - Depth ≥ 2 sessions, explore sessions at any depth, and sessions whose lineage is missing, cyclic, or inconsistent are delegation leaves with none of the three tools.
 - External MCP clients without an Agent Mode source tab keep their existing surface. An Agent Mode connection whose source tab cannot be resolved is rejected rather than treated as external.
 - Native Codex `spawn_agent` delegation is out of scope.
+- Knowledge-profile sessions follow a narrower rule: only a Knowledge root (depth 0) delegates, only through `agent_run`, and only to fresh Knowledge research workers that are leaves. See [Knowledge research workers](#knowledge-research-workers).
 
 ## Lineage
 
@@ -39,10 +40,46 @@ Last-verified: 2026-10-02
 - Main and external callers keep their existing session-addressed behavior. A worker may target only sessions strictly deeper than itself (`mcpValidateDelegationTarget`), never itself, an ancestor, a sibling, or another root. This depth ceiling is not an ownership check.
   - It applies to resume, steer, and explicit-tab start, and to session-addressed control: `agent_run` cancel and respond, and `agent_manage` stop_session and get_log.
   - `agent_run` control admission (`mcpAdmitDelegationControl`) also requires the caller to be eligible.
-  - Cancel carries the frozen caller identity to its mutation boundary, then re-admits the caller (identity, eligibility, target ceiling) immediately before `cancelAgentRun(target:)`.
+  - Cancel and respond carry the frozen caller identity to their boundary, then re-admit the caller (identity, eligibility, target ceiling) immediately before `cancelAgentRun(target:)` or `mcpResolvePendingInteraction`. A caller replaced or made ineligible after admission is rejected there; external callers (no routed source) are unaffected. A Knowledge caller's recheck also requires its verified Knowledge profile and own-child target (see [Knowledge research workers](#knowledge-research-workers)).
+- A routed caller whose live record cannot verify its profile fails admission after the lineage denials. A hydrated record uses its own profile. An unhydrated placeholder makes no claim (its `.standard` default may predate loading), so it uses its durable identity's reconciled profile (`mcpDelegationCallerProfile`). It fails closed when there is none or the claims conflict.
   - For cleanup_sessions, IDs outside the ceiling are skipped as `outside_delegation_scope`.
   - These control paths also reject an Agent Mode connection whose source tab cannot be routed. Existing session-access authorization is unchanged.
 - `fork_session` places the destination before publication through `prepareHandoffHeadless(delegationParentSessionID:)`. The destination keeps the source's parent unless the requesting agent's child would be deeper. It is never deeper than depth 2, and a worker can never mint a new root. UI handoffs pass no parent and stay parentless.
+
+## Knowledge research workers
+
+Knowledge-profile sessions deliberately replace the depth 0–1 rule above with a stricter one. Design rationale: [Claude Oracle shim authentication and Knowledge research workers plan](plans/2026-10-03-oracle-shim-auth-and-knowledge-workers-plan.md) §4.
+
+- **Depth:** only a Knowledge root delegates (`AgentDelegationPolicy.maximumKnowledgeDelegatingDepth = 0`). Every Knowledge session at depth ≥ 1 resolves to `.knowledgeLeaf(depth:)`. It has none of the three tools, and admission denies it with "Knowledge research workers cannot start or control other agents." Lineage failures still fail closed as for every session.
+- **Surface:** the root's run policy keeps only `agent_run` (`knowledgeDelegationToolNames`). It restricts `agent_manage` and `agent_explore` and uses the `.agentRunOnly` audience. `agent_run` is in `KnowledgeSessionPolicy.allowedMCPToolNames`, so the positive Knowledge ceiling still intersects every grant, and leaf restrictions remove it again for workers. Restrictions are checked before the ceiling in both `tools/list` and `tools/call`. A restricted tool therefore reports `Tool '<name>' is disabled for this connection.` (`policy_restricted`) even when the ceiling also excludes it (`ServerNetworkManager.restrictedToolDenialMessage`). `MCPConnectionManager` describes `agent_run` to Knowledge connections with `AgentModeMCPToolPolicy.knowledgeAgentRunDescription`.
+- **Caller admission:** `AgentRunMCPToolService.admitKnowledgeCaller` runs for every `agent_run` op.
+  - A caller counts as Knowledge when its connection's enforced profile (`ServerNetworkManager.effectiveSessionProfile(for:)`) or the verified profile of its live routed source record (`mcpDelegationCallerProfileResolution`) is `.knowledge`. An unhydrated placeholder whose identity is indexed as Knowledge therefore counts as Knowledge, never as standard.
+  - Only `KnowledgeSessionPolicy.allowedAgentRunOperations` (start, poll, wait, cancel, steer, respond) are accepted. An op added to `agent_run` later stays denied until it is listed there.
+  - The routed source must be a hydrated live Knowledge record, otherwise the call fails closed. This covers a missing source, an unhydrated placeholder, and a connection whose source is not Knowledge.
+  - Workflow arguments are rejected for every op.
+  - Admission runs `mcpValidateAgentRunSpawnAllowed` and freezes the caller (`KnowledgeCaller`: source tab and durable identity).
+  - Every other caller is unchanged.
+- **Carried caller:** every later Knowledge check uses the frozen `KnowledgeCaller`. It never re-admits whichever session now occupies the tab.
+  - Start, cancel, steer, and respond require an unchanged routed tab. Then `mcpRevalidateDelegationCommit(expectedCallerProfile: .knowledge)` must find the frozen identity still in the tab as a hydrated Knowledge record. This runs before start's inner admission, model inheritance, and target admission, and before each control admission.
+  - Start credits only the frozen identity. A different inner admitted identity is rejected.
+  - Each commit and dispatch recheck (start's commit, cancel, steer, respond) and each observation recheck passes `.knowledge`. A replacement identity therefore fails ("changed while the request was in flight"), and so does a standard record ("no longer a verified knowledge session"). The own-child rule applies even when the live record no longer reads as Knowledge.
+- **Idempotent replay:** a Knowledge caller's `request_id` namespace is keyed by its admitted durable identity (`AgentRunMCPToolService.idempotencyClientID`: `KNOWLEDGE-CALLER:<session>|<client>`).
+  - Neither another root's nor a standard session's recorded outcome replays to it, and identical requests from separate roots start separate workers.
+  - Before the lookup, `authorizeKnowledgeIdempotentRequest` re-checks the frozen caller and, for steer and respond, its own-child target, and freezes that target.
+  - The registry lookup suspends, so every branch that discloses a recorded outcome, an in-flight marker, or a conflict re-checks the same caller and target synchronously first (`revalidateKnowledgeIdempotentRequest`), with no suspension before the disclosure. A new request is left to the operation's own admission and boundary rechecks.
+  - Standard and external callers keep the shared client namespace.
+- **Start:** every start creates a fresh worker. `validateKnowledgeStartArguments` runs before model resolution and tab creation. It rejects `tab_id`/`_tabID`, workflows, all worktree arguments (including `inherit_worktree`), and role-label `model_id`s. `session_id` is rejected earlier, by the general start guard that applies to every start. An explicit compound `model_id` must name Claude Code or Codex (`validateKnowledgeWorkerProvider`), and this is checked before catalog resolution.
+- **Model inheritance:** when `model_id` is omitted, `mcpKnowledgeChildSelectionSnapshot` freezes the admitted caller's provider, model, and effort synchronously right after admission. The tab must still hold the admitted identity and be a hydrated Knowledge session on a supported provider with a model; otherwise the start fails. It never falls back to the window default or a role default. Later changes to the parent's selection do not affect the start. The result carries `knowledge_worker`: `profile`, `model_source` (`inherited` or `explicit`), `provider`, `model`, and `reasoning_effort`.
+- **Web gate:** a Codex worker, explicit or inherited, requires the local Codex Search tool toggle (`codexWebSearchEnabled`, injected by `MCPServerViewModel`). If the toggle is off, the start fails with `knowledgeCodexWebSearchDisabledMessage` before any tab is created. Remote web availability is not probed, and Claude has no RepoPrompt toggle to gate.
+- **Profile before binding:** `mcpResolveOrCreateSessionTarget(childSessionProfile: .knowledge)` adopts the profile on the new blank tab. This happens before the tab is bound to a session, before the parent is recorded, and before the run starts. If adoption fails, the created tab is discarded and nothing starts. A child profile on an existing tab or session target is rejected.
+- **Worktrees:** explicit worktree arguments are rejected, but omitted `inherit_worktree` keeps its default. A worker started from a routed Knowledge root therefore inherits the root's worktree bindings like any other routed child (`mcpReconcileRoutedSpawnWorktreeBindings`).
+- **Own-child targeting:** for a Knowledge caller, `mcpValidateDelegationTarget` runs `validateKnowledgeDelegationTarget` before its depth-0 return.
+  - The target's reconciled parent must equal the caller's durable identity.
+  - The target's reconciled profile must be `.knowledge`. `mcpDelegationSessionProfile` reconciles claims from hydrated live records and the owner-validated index entry, and returns nil when there are none or they conflict.
+  - Self, standard sessions, siblings, other roots, grandchildren, and unknown or conflicting profiles fail closed.
+  - The check runs at admission, at the cancel, steer, and respond boundaries, and before a Knowledge `request_id` replay. It also covers session-addressed `wait` and `poll`, including `session_ids` (`validateKnowledgeObservationTargets`).
+  - Standard callers still address Knowledge workers under the ordinary rules.
+- **Native delegation:** Claude Knowledge runs disallow both `Task` and its successor `Agent` (`ClaudeCodeIntegrationConfiguration.knowledgeDisallowedTools`). Codex runs keep `multiAgentEnabled: false`.
 
 ## Prompt audience
 
@@ -56,6 +93,12 @@ Last-verified: 2026-10-02
 
 - A shared Pair-worker preference for delegating Oracle review/re-review remediation (`AgentModePrompts.Fragments.pairReviewRemediationGuidance`) renders only for `.agentRunOnly` and `.both` audiences, in both the nil-role coding prompt and named-role prompts. `.none` and `.agentExploreOnly` omit it.
 - The Pair role description in `AgentModelCatalog.taskLabels` and the `agent_run` tool description carry the same preference.
+
+Knowledge sessions use `AgentModePrompts.knowledgePrompt(agentKind:delegationAudience:)` instead:
+
+- `.agentRunOnly` renders the research-root guidance.
+- `.none` renders the research-worker guidance. A hydrated parentless Knowledge session always resolves to depth 0, so in practice `.none` means a worker.
+- nil (and the other audiences) keeps the standalone no-delegation prohibition.
 
 A nil audience keeps the legacy role-derived copy for direct callers. Tool descriptions (`ask_oracle`, `oracle_send`, `context_builder`) and tool-result export blocks are capability-neutral: they never name a delegation tool and defer to the prompt.
 
@@ -114,10 +157,14 @@ Delivery depends on the parent's state:
   - It builds a live main → worker → pair sub-worker chain in the fixture window. It derives the sub-worker's policy with `AgentModeViewModel.mcpDelegationRunToolPolicy` and passes that policy to `MCPBootstrapLeaseSpec.agentMode`, mirroring `AgentModeRunService`.
   - It uses a real socketpair `BootstrapSocketConnectionManager` with expected-PID admission and run routing. `tools/list` omits all three delegation tools.
   - Raw `tools/call` for `agent_run` start, `agent_manage` create_session, and `agent_explore` start each return `isError` with `Tool '<name>' is disabled for this connection.`. None of these calls creates a session or tab, and `read_file` on the same connection still succeeds.
+- Knowledge leases on the same fixture:
+  - `testKnowledgeRootLeaseAdvertisesOnlyAgentRunAndRejectsForgedCallsOnRetainedSocket`: a Knowledge root lists `agent_run` but not `agent_manage` or `agent_explore`, and those two return `disabled`. Forged `agent_run` calls are rejected without changing the surface or snapshot. They include a role label, an unsupported provider, a Codex worker with Search off, worktree arguments, an op outside the allowlist, and control or observation of a standard main. Polling its own worker passes the gate.
+  - `testKnowledgeWorkerLeaseDeniesEveryDelegationToolOnRetainedSocket`: a Knowledge worker (`.knowledgeLeaf(depth: 1)`) lists none of the three tools, and raw calls return `disabled`.
+  - In both, `read_file` still succeeds.
 - Scope: this is an in-process SwiftPM fixture.
   - It does not invoke the `AgentModeRunService` or Codex coordinator call sites, and it launches no provider process.
   - It is not packaged-app or live-provider denial evidence.
-  - Handler re-checks are covered separately by `AgentDelegationServiceBoundaryTests`.
+  - Handler re-checks are covered separately by `AgentDelegationServiceBoundaryTests`. That suite includes the Knowledge start-argument, web-gate, frozen-inheritance, profile-adoption, discard-on-failure, leaf, and own-child scenarios. It also covers caller replacement (rebind or standard downgrade) before start and control admission, `request_id` partitioning, replay authorization before and after a suspended registry lookup (`testDuringIdempotencyLookup`), and the standard respond dispatch recheck. The pure Knowledge policy, profile reconciliation, caller-profile fail-closed, and commit rechecks are in `AgentDelegationPolicyTests`.
 - Delegated-question delivery transaction on the same socketpair fixture (`PersistentAgentModeMCPReadFileConnectionTests`, parent with an active run attempt):
   - Each success scenario suspends a real completion observer registered for the parent run (a cancellation-ignoring gate), so the handler is suspended inside its completion processing after `runTool` attached the notice. While suspended, the observed result carries no notice, and the notice is reserved, unacknowledged, and unrecorded.
   - `testDelegatedQuestionReadFileDeliveryCommitsAndRecordsAtFinalHandoffAfterCompletionObservers`: once released, the response carries the notice, the record is acknowledged when the response arrives, and the parent transcript holds exactly one notice note whose text equals the returned notice block.
@@ -134,10 +181,12 @@ Delivery depends on the parent's state:
 
 ## Known limitations
 
-- `agent_run` poll, wait, wait_any, and poll_many, and `agent_manage` list_sessions, are status observation and are not depth-gated.
+- `agent_run` poll, wait, wait_any, and poll_many, and `agent_manage` list_sessions, are status observation and are not depth-gated. The exception is a Knowledge caller: it may observe only its own Knowledge workers.
+- Knowledge restrictions are enforced at admission, not in the advertised schema. The generic `agent_run` input schema still lists `tab_id`, workflow, and worktree parameters for Knowledge connections, and calls that use them are rejected.
+- Live Claude and Codex Knowledge research-worker runs have not been exercised; coverage is the in-process fixtures above.
 - The worker ceiling is depth-based: a worker may address a deeper session in another worker's subtree.
 - Delegated-question routing needs the parent to be a live local session in the same window. Remote-host sessions and parents that are not live fall back to the user.
 - Delegated-question tool-result commit happens at the handler's final handoff, not at confirmed client receipt. The handler does not suspend between settlement and returning the content, but the SDK writes after the handler returns. A transport write failure after that handoff (for example, connection loss) is not observed, so that notice counts as delivered. The same applies to a cancellation, or a question resolution, that lands after settlement but before the SDK writes: the committed result is still sent. Settlement revalidates on the main actor, so a reservation already released by reconcile is stripped, not committed. `agent_explore` results never carry notices.
 - Once a notice is acknowledged, it is not re-delivered if the parent's turn ends without answering (plan §6.2: acknowledged at handoff, no automatic re-arm). The child's question stays pending with its timeout paused until the parent answers or escalates, or the parent route fails and the question falls back to the user. This is the current owner contract.
-- Native provider subagents (Claude `Task`, Codex multi-agent) are not Agent Mode children and are out of scope (plan §1). MCP request metadata carries no native-subagent attribution. If a native subagent shared the parent's MCP connection and run, its eligible tool results could carry the parent's notices. Production Claude configuration disallows `Task`, and the Codex configuration sets `multiAgentEnabled: false` (`CodexNativeSessionController`), so this shared-connection premise has not been established.
+- Native provider subagents (Claude `Task`, Codex multi-agent) are not Agent Mode children and are out of scope (plan §1). MCP request metadata carries no native-subagent attribution. If a native subagent shared the parent's MCP connection and run, its eligible tool results could carry the parent's notices. Production Claude configuration disallows `Task` (Knowledge runs also disallow `Agent`), and the Codex configuration sets `multiAgentEnabled: false` (`CodexNativeSessionController`), so this shared-connection premise has not been established.
 - The persisted `.system` notes (delivered notices and covered-question records) are replayed to providers inside `<system>…</system>` history. Their exact manual on-screen rendering has only been checked in code (`AgentMessageBubble.systemBubble` renders the full text); it has not been checked visually.

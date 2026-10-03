@@ -223,7 +223,7 @@ struct CodexProviderToolsRuntimeSection: View {
 
                 ProviderRuntimeToggleRow(
                     title: "Search",
-                    description: "Allow Codex to search the project while it works through a task.",
+                    description: "Allow Codex to search the web while it works through a task.",
                     isOn: tools.searchToolEnabled,
                     onChange: { onApplyMutation(.searchTool(enabled: $0)) }
                 )
