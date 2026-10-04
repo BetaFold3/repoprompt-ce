@@ -1836,6 +1836,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             session.codexAuthoritativeActiveTurn = candidate
             session.codexPendingTurnKind = nil
             session.codexRoutingObservedTurnID = turnID
+            bindResumedThreadFallbacks(to: candidate, session: session)
             return kind
         }
 
@@ -2290,10 +2291,54 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         session.isDirty = true
         viewModel?.requestUIRefresh(tabID: session.tabID, urgent: true)
         viewModel?.scheduleSave(for: session.tabID)
-        if case .noActiveTurn = reason {
+        if Self.codexFallbackReasonAllowsIdlePump(reason) {
             scheduleCodexFallbackIdlePump(session: session, queueID: submission.queueID)
         }
         return .queuedFallback(queueID: submission.queueID, reason: reason)
+    }
+
+    /// Heads the idle pump may release once a thread read reports `.idle`.
+    private static func codexFallbackReasonAllowsIdlePump(_ reason: CodexTurnFallbackDecision) -> Bool {
+        switch reason {
+        case .noActiveTurn, .resumedThreadActive:
+            true
+        default:
+            false
+        }
+    }
+
+    /// A resumed-thread head bound to the current identified turn is released only by that
+    /// turn's correlated completion through the terminal commit barrier, never by the idle pump.
+    private func codexFallbackHeadAwaitsCorrelatedCompletion(
+        _ head: AgentModeViewModel.TabSession.CodexFallbackQueueEntry,
+        session: AgentModeViewModel.TabSession
+    ) -> Bool {
+        guard head.fallbackReason == .resumedThreadActive,
+              let blockingTurn = head.blockingTurn,
+              let identity = session.codexAuthoritativeActiveTurn,
+              authoritativeCodexTurnIsCurrent(identity, session: session)
+        else { return false }
+        return codexFallbackBlockingTurn(for: identity) == blockingTurn
+    }
+
+    /// True while an earlier send still waits, unbound, behind the current resumed-thread marker.
+    /// Later input joins that wait so the resumed turn's identity (or the idle pump) releases the
+    /// whole queue in FIFO order.
+    private func codexResumedThreadWaitIsPending(
+        behind anonymous: AgentModeViewModel.TabSession.CodexAnonymousTurnLiveness,
+        session: AgentModeViewModel.TabSession
+    ) -> Bool {
+        guard anonymousCodexTurnIsCurrent(anonymous, session: session) else { return false }
+        return session.codexFallbackQueue.contains { entry in
+            entry.state == .queued
+                && entry.fallbackReason == .resumedThreadActive
+                && entry.blockingTurn == nil
+                && entry.originThreadID == anonymous.threadID
+                && entry.originControllerInstanceID == anonymous.controllerInstanceID
+                && entry.originControllerGeneration == anonymous.controllerGeneration
+                && entry.originRunID == anonymous.runID
+                && entry.originRunAttemptID == anonymous.runAttemptID
+        }
     }
 
     private func scheduleCodexFallbackIdlePump(
@@ -2318,7 +2363,8 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                   let head = session.codexFallbackQueue.first,
                   head.id == queueID,
                   head.state == .queued,
-                  case .noActiveTurn = head.fallbackReason,
+                  Self.codexFallbackReasonAllowsIdlePump(head.fallbackReason),
+                  !codexFallbackHeadAwaitsCorrelatedCompletion(head, session: session),
                   let controller = session.codexController,
                   ObjectIdentifier(controller) == head.originControllerInstanceID,
                   session.codexControllerGeneration == head.originControllerGeneration,
@@ -2328,12 +2374,21 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             else { return }
             do {
                 let snapshot = try await controller.readThreadSnapshot(includeTurns: true, timeout: 2)
+                // The head may have been claimed or made successor-eligible during the read, or a
+                // replayed `turn/started` may have bound it to the identified resumed turn. Once
+                // bound, only that turn's correlated completion releases it, so its terminal
+                // publication and successor transition are never bypassed by an idle read.
+                guard let currentHead = session.codexFallbackQueue.first,
+                      currentHead.id == queueID,
+                      currentHead.state == .queued,
+                      !codexFallbackHeadAwaitsCorrelatedCompletion(currentHead, session: session)
+                else { return }
                 if snapshot.conversationID == head.originThreadID,
                    snapshot.runtimeStatus == .idle,
                    snapshot.currentTurnID == nil,
                    snapshot.activeTurnIDs.isEmpty
                 {
-                    if let blockingTurn = head.blockingTurn,
+                    if let blockingTurn = currentHead.blockingTurn,
                        session.codexAuthoritativeActiveTurn?.turnID == blockingTurn.turnID
                     {
                         session.codexAuthoritativeActiveTurn = nil
@@ -2603,6 +2658,29 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             return
         }
         abandonCodexFallbackQueue(session: session, reason: reason)
+    }
+
+    /// A replayed `turn/started` can name the turn a cold-resumed thread was already running after
+    /// sends queued behind the anonymous resumed-thread marker. Bind every such entry to the
+    /// identified turn so its completion releases them, in order, through the terminal commit barrier.
+    private func bindResumedThreadFallbacks(
+        to identity: AgentModeViewModel.TabSession.CodexAuthoritativeTurnIdentity,
+        session: AgentModeViewModel.TabSession
+    ) {
+        let blockingTurn = codexFallbackBlockingTurn(for: identity)
+        for index in session.codexFallbackQueue.indices {
+            let entry = session.codexFallbackQueue[index]
+            guard entry.state == .queued,
+                  entry.fallbackReason == .resumedThreadActive,
+                  entry.blockingTurn == nil,
+                  entry.originThreadID == identity.threadID,
+                  entry.originControllerInstanceID == identity.controllerInstanceID,
+                  entry.originControllerGeneration == identity.controllerGeneration,
+                  entry.originRunID == identity.runID,
+                  entry.originRunAttemptID == identity.runAttemptID
+            else { continue }
+            session.codexFallbackQueue[index].blockingTurn = blockingTurn
+        }
     }
 
     private func rebindCodexFallbackBlockers(
@@ -3338,6 +3416,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             } else {
                 session.codexConversationID = normalizedThreadID
                 session.codexRolloutPath = ref.rolloutPath
+                installResumedActiveThreadMarkerIfNeeded(session: session)
             }
             session.codexModel = ref.model
             session.codexReasoningEffort = ref.reasoningEffort
@@ -3362,6 +3441,48 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             )
         }
         resetCodexResumeTimeoutState(for: session)
+    }
+
+    /// A resumed thread can already be running a turn this coordinator never saw start (cold
+    /// resume). The controller learns that only from the resume snapshot, never from an
+    /// authoritative `turn/started`, so mark the thread busy with an anonymous `.unknown` turn:
+    /// new text queues behind it and the idle pump releases the queue once a read reports
+    /// `.idle`. Never fabricates a `turn/started` (accounting and usage side effects).
+    private func installResumedActiveThreadMarkerIfNeeded(session: AgentModeViewModel.TabSession) {
+        guard let controller = session.codexController,
+              controller.lastKnownRuntimeStatus?.isActive == true,
+              let threadID = session.codexConversationID,
+              let runID = session.runID,
+              let runAttemptID = session.activeRunAttemptID
+        else { return }
+        if let identity = session.codexAuthoritativeActiveTurn {
+            // A current identity already names the running turn.
+            guard !authoritativeCodexTurnIsCurrent(identity, session: session) else { return }
+            // Provably stale (another thread, controller, run or attempt): it can never correlate
+            // a lifecycle event again, and would make the resumed turn's replayed `turn/started`
+            // look like an identity mismatch.
+            session.codexAuthoritativeActiveTurn = nil
+            if session.codexPendingSteerLifecycleReconciliation?.priorIdentity == identity {
+                session.codexPendingSteerLifecycleReconciliation = nil
+            }
+            if session.codexRoutingObservedTurnID == identity.turnID {
+                session.codexRoutingObservedTurnID = nil
+            }
+        }
+        if let current = session.codexAnonymousActiveTurn,
+           anonymousCodexTurnIsCurrent(current, session: session)
+        {
+            return
+        }
+        session.codexAnonymousActiveTurn = .init(
+            threadID: threadID,
+            turnKind: .unknown,
+            controllerInstanceID: ObjectIdentifier(controller),
+            controllerGeneration: session.codexControllerGeneration,
+            runID: runID,
+            runAttemptID: runAttemptID
+        )
+        logCodex("[AgentModeVM][CodexReconnect] resumed thread \(threadID) is active without a known turn identity for tab \(session.tabID); new input queues until it is idle")
     }
 
     private func recoveryFailureMessage(
@@ -4402,15 +4523,24 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             if !shouldSkipTimedOutResumeTarget, resumeTimeoutCount == nil {
                 resetCodexResumeTimeoutState(for: session)
             }
-            let invalidatedTimedOutController = isControlPlaneTimeout
-                ? invalidateCodexControllerForReconnect(
+            // An oversized inbound frame has already terminated the app-server transport, so
+            // the controller is replaced exactly like a poisoned control-plane timeout.
+            let controllerInvalidationSource: String? = if isControlPlaneTimeout {
+                attemptedResume ? "resume-timeout" : "start-timeout"
+            } else if CodexAppServerClient.isInboundFrameLimitError(effectiveError) {
+                "inbound-frame-limit"
+            } else {
+                nil
+            }
+            let invalidatedController = controllerInvalidationSource.map { source in
+                invalidateCodexControllerForReconnect(
                     session: session,
                     expectedController: session.codexController,
-                    source: attemptedResume ? "resume-timeout" : "start-timeout",
+                    source: source,
                     preserveRunID: preserveExistingRunID
                 )
-                : false
-            if !invalidatedTimedOutController {
+            } ?? false
+            if !invalidatedController {
                 markCodexReconnectNeeded(for: session, source: "ensure-error")
             }
             let errorItem = AgentChatItem.error(
@@ -4432,9 +4562,31 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         wasRunAlreadyActive: Bool,
         session: AgentModeViewModel.TabSession
     ) -> CodexTurnDispatchPlan {
-        guard wasRunAlreadyActive else { return .start }
+        guard wasRunAlreadyActive else {
+            // Cold send: the resume inside `ensureCodexNativeSession` may have found the thread
+            // already running. A replayed `turn/started` installs a real identity; otherwise the
+            // resumed-thread marker stands in for the unknown turn.
+            if let identity = session.codexAuthoritativeActiveTurn,
+               authoritativeCodexTurnIsCurrent(identity, session: session)
+            {
+                return .fallback(.nonSteerableTurn(kind: identity.turnKind))
+            }
+            // The resume may have finished before this run had lineage (a slash command or a
+            // reconnect outside a run), when the marker could not be installed. Reconcile the
+            // controller's retained status now, including for an already-ready controller.
+            installResumedActiveThreadMarkerIfNeeded(session: session)
+            if let anonymous = session.codexAnonymousActiveTurn,
+               anonymousCodexTurnIsCurrent(anonymous, session: session)
+            {
+                return .fallback(.resumedThreadActive)
+            }
+            return .start
+        }
         guard let identity = session.codexAuthoritativeActiveTurn else {
             if let anonymous = session.codexAnonymousActiveTurn {
+                if codexResumedThreadWaitIsPending(behind: anonymous, session: session) {
+                    return .fallback(.resumedThreadActive)
+                }
                 return .fallback(.nonSteerableTurn(kind: anonymous.turnKind))
             }
             return .fallback(.activeWithoutAuthoritativeIdentity)
