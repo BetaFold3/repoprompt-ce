@@ -235,6 +235,8 @@ enum AgentToolResultPersistencePolicy {
             exitCode: exitCode,
             rawObject: rawObject,
             argsJSON: item.toolArgsJSON,
+            rawResultText: rawResultJSON?.isEmpty == false ? rawResultJSON : item.text,
+            toolIsError: item.toolIsError,
             context: context
         )
         let persistedToolIsError = persistedToolIsError(
@@ -1612,6 +1614,8 @@ enum AgentToolResultPersistencePolicy {
         exitCode: Int?,
         rawObject: [String: Any]?,
         argsJSON: String?,
+        rawResultText: String? = nil,
+        toolIsError: Bool? = nil,
         context: AgentToolResultProcessingContext?
     ) -> String? {
         let allowExistingRenderSummary = boolValue(rawObject, keys: ["summary_only", "summaryOnly"]) == true
@@ -1644,7 +1648,8 @@ enum AgentToolResultPersistencePolicy {
             statusWord: statusWord,
             processID: processID,
             exitCode: exitCode,
-            rawObject: rawObject
+            rawObject: rawObject,
+            toolIsError: toolIsError
         ) {
             return cursorSummaryJSON
         }
@@ -1675,7 +1680,10 @@ enum AgentToolResultPersistencePolicy {
             return oracleChatSummaryJSON(
                 normalizedToolName: normalizedToolName,
                 statusWord: statusWord,
-                rawObject: rawObject
+                rawObject: rawObject,
+                rawResultText: rawResultText,
+                toolIsError: toolIsError,
+                argsJSON: argsJSON
             )
         case "context_builder":
             return contextBuilderSummaryJSON(
@@ -1834,7 +1842,8 @@ enum AgentToolResultPersistencePolicy {
         statusWord: String,
         processID: String?,
         exitCode: Int?,
-        rawObject: [String: Any]?
+        rawObject: [String: Any]?,
+        toolIsError: Bool? = nil
     ) -> String? {
         guard let rawObject,
               stringValue(rawObject, keys: ["acp_status"]) != nil
@@ -1848,6 +1857,28 @@ enum AgentToolResultPersistencePolicy {
             exitCode: exitCode,
             rawObject: rawObject
         )
+        // A failed Cursor Oracle call keeps the same bounded, redacted diagnostics as other
+        // providers (the shared projection unwraps `rawOutput`), never raw-output text. A failed
+        // ACP call whose wrapped Oracle result was unfinished or cancelled keeps that outcome.
+        if normalizedToolName == "ask_oracle" || normalizedToolName == "oracle_send" {
+            switch OracleToolResultInspection.classify(object: rawObject, toolIsError: toolIsError, statusWord: statusWord) {
+            case let .failed(failure):
+                let rawInputMode = (rawObject["rawInput"] as? [String: Any])?["mode"] as? String
+                return OracleToolResultInspection.boundedFailureSummaryJSON(
+                    base: object,
+                    failure: failure,
+                    argumentMode: OracleToolResultInspection.recognizedMode(rawInputMode)
+                        ?? OracleToolResultInspection.recognizedMode(rawObject["mode"] as? String),
+                    statusWord: statusWord,
+                    normalizedToolName: normalizedToolName,
+                    maxBytes: maxPersistedToolSummaryBytes
+                )
+            case let .invocationFailureOnly(outcome):
+                object[OracleToolResultInspection.Key.oracleOutcome] = outcome.rawValue
+            case .notFailed:
+                break
+            }
+        }
         if let content = cursorACPContentSummary(
             from: rawObject,
             isEdit: isEdit,
@@ -2365,10 +2396,17 @@ enum AgentToolResultPersistencePolicy {
         return reply
     }
 
+    /// Oracle summaries keep identity and outcome metadata. A failed result additionally keeps
+    /// its redacted, bounded diagnostics from the shared `OracleToolResultInspection`
+    /// projection (plan Patch B), so a reloaded card can explain itself; successful, pending,
+    /// and cancelled output is byte-identical to the summary without that projection.
     private static func oracleChatSummaryJSON(
         normalizedToolName: String?,
         statusWord: String,
-        rawObject: [String: Any]?
+        rawObject: [String: Any]?,
+        rawResultText: String? = nil,
+        toolIsError: Bool? = nil,
+        argsJSON: String? = nil
     ) -> String? {
         var object = genericSummaryObject(
             normalizedToolName: normalizedToolName,
@@ -2376,7 +2414,35 @@ enum AgentToolResultPersistencePolicy {
             processID: nil,
             exitCode: nil
         )
-        guard let rawObject else { return jsonString(from: object) }
+        let classification = OracleToolResultInspection.classify(
+            resultJSON: rawResultText,
+            text: nil,
+            toolIsError: toolIsError,
+            statusWord: statusWord
+        )
+        let failure = classification.failure
+        // The invocation `status` stays as it was; the Oracle's own outcome sits beside it.
+        var oracleOutcome: String?
+        if case let .invocationFailureOnly(outcome) = classification {
+            oracleOutcome = outcome.rawValue
+            object[OracleToolResultInspection.Key.oracleOutcome] = outcome.rawValue
+        }
+        func failureSummaryJSON(_ failure: OracleToolResultInspection.Failure) -> String {
+            OracleToolResultInspection.boundedFailureSummaryJSON(
+                base: object,
+                failure: failure,
+                argumentMode: OracleToolResultInspection.recognizedMode(fromArgumentsJSON: argsJSON),
+                statusWord: statusWord,
+                normalizedToolName: normalizedToolName,
+                maxBytes: maxPersistedToolSummaryBytes
+            )
+        }
+        guard let rawObject else {
+            if let failure {
+                return failureSummaryJSON(failure)
+            }
+            return jsonString(from: object)
+        }
         if let chatID = smallStringValue(rawObject, keys: ["chat_id", "chatID"]) {
             object["chat_id"] = chatID
         }
@@ -2426,8 +2492,27 @@ enum AgentToolResultPersistencePolicy {
         if let summaryText = oracleChatSummaryText(from: object) {
             object["summary_text"] = summaryText
         }
+        if let failure {
+            return failureSummaryJSON(failure)
+        }
         if let json = jsonString(from: object), !exceedsPersistedToolSummaryBudget(json) {
             return json
+        }
+        if let oracleOutcome {
+            for summaryText in [object["summary_text"] as? String, nil] {
+                var minimal = minimalResultObject(
+                    statusWord: statusWord,
+                    normalizedToolName: normalizedToolName,
+                    processID: nil,
+                    exitCode: nil,
+                    summaryText: summaryText,
+                    renderSummary: nil
+                )
+                minimal[OracleToolResultInspection.Key.oracleOutcome] = oracleOutcome
+                if let json = jsonString(from: minimal), !exceedsPersistedToolSummaryBudget(json) {
+                    return json
+                }
+            }
         }
         return minimalResultJSON(
             statusWord: statusWord,

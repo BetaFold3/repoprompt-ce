@@ -66,7 +66,7 @@ final class MCPOracleToolProvider: MCPWindowToolProviding {
 
             `op:"wait"` accepts only `operation_ids` and `timeout_seconds`; `op:"cancel"` accepts only required operation IDs and does not wait. Both controls reject all send arguments. Cancel only when the user asks or the question is known to be wrong. An unkeyed repeated send is a new consultation; a caller-supplied UUID `request_id` protects an identical live send from duplicate spend but is not persisted across app relaunch.
 
-            Every Oracle send re-packages the full chat history. `selection_mode` controls continuation context: `current` (default) re-packages the current workspace selection exactly as before; `none` sends no workspace selection and suppresses review-mode frozen/automatic diffs for this turn; `explicit_slices` packages only the supplied `slices` for this turn. Explicit slices never mutate the shared workspace selection. Prune selection, use `selection_mode:none`, or continue a long lane in a fresh chat with a concise summary.
+            Every Oracle send re-packages the full chat history. `selection_mode` controls this send's packaging on any single send with an explicit conversation target (`chat_id` or `new_chat:true`): `current` (default) re-packages the current workspace selection exactly as before; `none` sends no workspace selection and suppresses review-mode frozen/automatic diffs for this send; `explicit_slices` packages only the supplied `slices` for this send. Explicit slices never mutate the shared workspace selection. In `review` mode, `none` and `explicit_slices` omit the automatic diff, so put diff text in `message` or slice the changed files. `consultations` lanes always package `current`. Prune selection, use `selection_mode:none`, or continue a long lane in a fresh chat with a concise summary.
 
             Before a provider starts, the exact immutable packaged request is checked against a known model context window with output reserve and tokenizer margin. `max_output_tokens` customizes only that reserve. Unknown context windows skip the overflow check. Result usage echoes `context_window` and `pct` only for exact windows, never provider fallbacks, and reports the applied `output_reserve_tokens`.
 
@@ -76,7 +76,7 @@ final class MCPOracleToolProvider: MCPWindowToolProviding {
 
             A `chat_id` continuation stays on the model preset that chat last used, so `model` can be omitted and the lane will not drift. Passing a different `model` with `chat_id` deliberately switches that lane from then on. If the chat's preset was deleted, disabled, or no longer supports the requested `mode`, the call fails instead of silently substituting another model. A manual send into the chat from the app resets its preset binding. Each result reports how the model was chosen through `model_selection` (`explicit`, `inherited`, or `automatic`).
 
-            When the user names one or more Oracles, treat those names as model-preset selectors. First resolve them with `oracle_utils op=models`, prefer each returned exact preset UUID, and pass an explicit `model` on every new-chat lane. Issue independent lanes together in the same tool-call batch or via `consultations`. `chat_name` is display-only and never selects a model. Before synthesizing, verify each result's returned preset ID/name matches the requested preset; if identity is missing or mismatched, do not synthesize. Refer to lanes by preset alias only, and never relay one lane's metadata to another.
+            When the user names one or more Oracles, treat those names as model-preset selectors. Resolve them with `oracle_utils op=models` unless their exact preset UUIDs are already known (for example from an `oracle_model_required` rejection), prefer exact preset UUIDs, and pass an explicit `model` on every new-chat lane. Issue independent lanes together in the same tool-call batch or via `consultations`. `chat_name` is display-only and never selects a model. Before synthesizing, verify each result's returned preset ID/name matches the requested preset; if identity is missing or mismatched, do not synthesize. Refer to lanes by preset alias only, and never relay one lane's metadata to another.
 
             Pass `export_response: true` to write the response to a shareable file and get back shareable `oracle_export_path` / `oracle_export_instruction` values. To hand the export to a child agent, include `oracle_export_path` inside the `message` (or `messages`) you send on your next delegation call; your system prompt names the specific delegation tool available to you.
 
@@ -113,16 +113,16 @@ final class MCPOracleToolProvider: MCPWindowToolProviding {
                         description: "Continue a specific chat in the current agent tab. The chat keeps the model preset it last used, so `model` can be omitted."
                     ),
                     "new_chat": .boolean(
-                        description: "Start a new chat session (default: false). Keep false for continuity; use true for an independent review or each independent parallel lane. When multiple compatible presets exist, new chats require an explicit model."
+                        description: "Start a new chat session (default: false). Keep false for continuity; use true for an independent review or each independent parallel lane. A fresh chat needs an explicit `model` when more than one preset supports the mode; the rejection lists the exact preset UUIDs to retry with."
                     ),
                     "model": .string(
-                        description: "Exact model preset UUID (preferred) or exact preset name from oracle_utils op=models. Required when the user requests a named Oracle. Omit it with `chat_id` to keep that chat's current preset; passing a different preset switches the chat to it."
+                        description: "Exact model preset UUID (preferred) or exact preset name from oracle_utils op=models. Required when the user requests a named Oracle, and on a fresh chat when more than one preset supports the mode; that rejection lists the exact preset UUIDs to retry with. Omit it with `chat_id` to keep that chat's current preset; passing a different preset switches the chat to it."
                     ),
                     "chat_name": .string(
                         description: "Optional display-only session name; valid only with new_chat:true. This never selects the model."
                     ),
                     "selection_mode": .string(
-                        description: "Continuation-only context mode: current (default) packages the current shared selection; none packages no selection and no review diff; explicit_slices packages only `slices` for this send without mutating shared selection.",
+                        description: "Single-send context mode. none and explicit_slices require an explicit conversation target (`chat_id` or `new_chat:true`) and are rejected in `consultations`. current (default) packages the current shared selection; none packages no selection and no review diff; explicit_slices packages only `slices` for this send without mutating shared selection.",
                         default: "current",
                         enum: ["current", "none", "explicit_slices"]
                     ),

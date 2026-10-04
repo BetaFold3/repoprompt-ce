@@ -934,7 +934,6 @@ final class AgentRunMCPToolServiceWaitTests: XCTestCase {
 
     func testOMPQualificationAuthorizationUsesSingleAbsoluteDeadline() async throws {
         #if DEBUG
-            AgentRunMCPToolService.ompQualificationAuthorizationDeadlineNanosecondsOverride = 50_000_000
             let root = FileManager.default.temporaryDirectory
                 .appendingPathComponent("OMPQualificationSingleDeadline-\(UUID().uuidString)", isDirectory: true)
             try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
@@ -961,9 +960,21 @@ final class AgentRunMCPToolServiceWaitTests: XCTestCase {
                 duration: 60
             )
             let runID = UUID()
-            var delayedAuthorizationTask: Task<Void, Never>?
-            var bootstrapEntries = 0
+            // One injected authorization clock drives deadline arming, every remaining-budget check,
+            // and the start receipt, so wall-clock scheduling never decides this outcome.
+            let clockOrigin: UInt64 = 1_000_000_000_000
+            let preAdmissionElapsed: UInt64 = 3_600_000_000_000
+            let authorizationBudget = AgentRunMCPToolService.ompQualificationAuthorizationDeadlineNanoseconds(
+                requestTimeoutSeconds: 10
+            )
+            let expectedDeadline = clockOrigin + preAdmissionElapsed + authorizationBudget
+            let authorizationClock = OMPQualificationTestClock(uptimeNanoseconds: clockOrigin)
+            var providerDispatchCount = 0
+            var preDispatchHookInvocations = 0
+            var terminalCategories: [String] = []
             var capturedContext: OhMyPiAgentModeSmokeGate.StartContext?
+            var rollbackCleanupContexts: [OhMyPiAgentModeSmokeGate.StartContext?] = []
+            var receiptOutcomesAtRollbackCleanup: [OhMyPiAgentModeSmokeGate.StartAuthorizationReceipt.Outcome?] = []
             let viewModel = makeViewModel(windowID: window.windowID)
             let liveSnapshots = LiveSnapshots()
             let recorder = WaitScopeRecorder()
@@ -974,24 +985,18 @@ final class AgentRunMCPToolServiceWaitTests: XCTestCase {
                 recorder: recorder,
                 connectionID: connectionID,
                 startRun: { target, _, _, _, agentModeVM, _, _, _, _, _, _, _, _ in
+                    providerDispatchCount += 1
                     let session = agentModeVM.session(for: target.tabID)
                     session.runID = runID
                     session.runState = .running
                     let context = try XCTUnwrap(session.ompQualificationStartContext)
                     capturedContext = context
-                    delayedAuthorizationTask = Task { @MainActor in
-                        try? await Task.sleep(for: .milliseconds(75))
-                        let gateAuthorized = OhMyPiAgentModeSmokeGate.shared.authorizeProviderStart(
-                            transaction: context.transaction,
-                            runID: runID
-                        )
-                        let proposed: OhMyPiAgentModeSmokeGate.StartAuthorizationReceipt.Outcome = gateAuthorized
-                            ? .authorized(.init(runID: runID, activeAgentSessionID: nil, runAttemptID: nil))
-                            : .denied
-                        if context.authorizationReceipt.resolve(proposed) == proposed, gateAuthorized {
-                            bootstrapEntries += 1
-                        }
-                    }
+                    // Dispatch was admitted one millisecond before the original deadline...
+                    XCTAssertNil(context.authorizationReceipt.resolvedOutcome)
+                    XCTAssertTrue(context.authorizationReceipt.authorizationStillPermitted)
+                    // ...and that same deadline elapses after dispatch, before any authorization arrives.
+                    XCTAssertTrue(authorizationClock.advance(to: expectedDeadline))
+                    XCTAssertFalse(context.authorizationReceipt.authorizationStillPermitted)
                     return try .init(
                         snapshot: self.makeSnapshot(
                             sessionID: XCTUnwrap(target.sessionID),
@@ -1034,31 +1039,151 @@ final class AgentRunMCPToolServiceWaitTests: XCTestCase {
                 )
             }
 
-            let clock = ContinuousClock()
-            let startedAt = clock.now
+            service.ompQualificationMonotonicNowNanoseconds = { authorizationClock.now() }
+            service.testAfterOMPQualificationInitialSnapshot = {
+                // Time spent before admission must not consume the authorization budget.
+                XCTAssertTrue(authorizationClock.advance(to: clockOrigin + preAdmissionElapsed))
+            }
+            service.testBeforeOMPQualificationProviderDispatch = {
+                preDispatchHookInvocations += 1
+                XCTAssertTrue(authorizationClock.advance(to: expectedDeadline - 1_000_000))
+            }
+            service.testBeforeOMPQualificationRollbackCleanup = { context in
+                rollbackCleanupContexts.append(context)
+                receiptOutcomesAtRollbackCleanup.append(context?.authorizationReceipt.resolvedOutcome)
+            }
+            service.testOMPQualificationTerminalCategory = { terminalCategories.append($0) }
+
+            let startArgs: [String: Value] = [
+                "op": .string("start"),
+                "message": .string("Delayed authorization must lose at the first deadline."),
+                "model_id": .string("ohMyPi:default"),
+                "workspace_id": .string(workspace.id.uuidString),
+                "timeout": .int(10),
+                "_omp_qualification_lease_id": .string(lease.leaseID.uuidString)
+            ]
+            let configuredService = service
             do {
-                _ = try await service.execute(args: [
-                    "op": .string("start"),
-                    "message": .string("Delayed authorization must lose at the first deadline."),
-                    "model_id": .string("ohMyPi:default"),
-                    "workspace_id": .string(workspace.id.uuidString),
-                    "timeout": .int(10),
-                    "_omp_qualification_lease_id": .string(lease.leaseID.uuidString)
-                ])
+                // Hang safeguard only; the injected clock, not elapsed time, decides the outcome.
+                try await withOMPQualificationWatchdog(seconds: 5) {
+                    _ = try await configuredService.execute(args: startArgs)
+                }
                 XCTFail("Expected authorization deadline failure")
             } catch let error as MCPError {
                 XCTAssertTrue(String(describing: error).contains("deadline"), String(describing: error))
             }
-            await delayedAuthorizationTask?.value
-            let elapsed = startedAt.duration(to: clock.now)
-            XCTAssertLessThan(elapsed, .seconds(1), "Cleanup must not open a second authorization window")
-            XCTAssertEqual(bootstrapEntries, 0)
-            let finalAuthorizationOutcome = await capturedContext?.authorizationReceipt.wait()
-            XCTAssertEqual(finalAuthorizationOutcome, .denied)
+            XCTAssertEqual(preDispatchHookInvocations, 1, "The one-millisecond-before-deadline admission boundary ran")
+            XCTAssertEqual(providerDispatchCount, 1, "Admission before the deadline dispatches exactly once")
+            XCTAssertEqual(terminalCategories, ["qualification_authorization_timeout"])
+            let context = try XCTUnwrap(capturedContext)
+            // The post-dispatch deadline check, not rollback cleanup, owns the denial: the receipt is
+            // already denied when cleanup begins, so cleanup has no unresolved authorization to wait on.
+            XCTAssertEqual(rollbackCleanupContexts.count, 1, "Rollback cleanup ran exactly once")
+            XCTAssertTrue((rollbackCleanupContexts.first ?? nil) === context, "Cleanup received the dispatched context")
+            XCTAssertEqual(receiptOutcomesAtRollbackCleanup, [.denied])
+            XCTAssertEqual(context.authorizationReceipt.resolvedOutcome, .denied)
             XCTAssertNil(OhMyPiAgentModeSmokeGate.shared.activeSnapshot())
+
+            // The formerly delayed runner authorization arrives only after cleanup: the released
+            // transaction is rejected and the receipt keeps its first denial, so bootstrap never runs.
+            let gateAuthorized = OhMyPiAgentModeSmokeGate.shared.authorizeProviderStart(
+                transaction: context.transaction,
+                runID: runID
+            )
+            XCTAssertFalse(gateAuthorized, "Cleanup released the transaction")
+            let lateAuthorization = OhMyPiAgentModeSmokeGate.StartAuthorizationReceipt.Outcome.authorized(
+                .init(runID: runID, activeAgentSessionID: nil, runAttemptID: nil)
+            )
+            let lateOutcome = context.authorizationReceipt.resolve(lateAuthorization)
+            XCTAssertEqual(lateOutcome, .denied, "The first denial stays authoritative")
+            let bootstrapEntries = gateAuthorized && lateOutcome == lateAuthorization ? 1 : 0
+            XCTAssertEqual(bootstrapEntries, 0)
         #else
             throw XCTSkip("OMP qualification transaction is DEBUG-only")
         #endif
+    }
+
+    func testOMPQualificationAuthorizationRemainingNanosecondsBoundaries() throws {
+        #if DEBUG
+            let deadline: UInt64 = 1000
+            XCTAssertEqual(
+                AgentRunMCPToolService.ompQualificationAuthorizationRemainingNanoseconds(
+                    deadlineUptimeNanoseconds: deadline,
+                    nowUptimeNanoseconds: 999
+                ),
+                1,
+                "Before the deadline the remaining budget is the exact difference"
+            )
+            XCTAssertEqual(
+                AgentRunMCPToolService.ompQualificationAuthorizationRemainingNanoseconds(
+                    deadlineUptimeNanoseconds: deadline,
+                    nowUptimeNanoseconds: deadline
+                ),
+                0,
+                "Exactly at the deadline no budget remains"
+            )
+            XCTAssertEqual(
+                AgentRunMCPToolService.ompQualificationAuthorizationRemainingNanoseconds(
+                    deadlineUptimeNanoseconds: deadline,
+                    nowUptimeNanoseconds: 1001
+                ),
+                0,
+                "After the deadline the budget saturates at zero instead of underflowing"
+            )
+            XCTAssertEqual(
+                AgentRunMCPToolService.ompQualificationAuthorizationRemainingNanoseconds(
+                    deadlineUptimeNanoseconds: nil,
+                    nowUptimeNanoseconds: .max
+                ),
+                AgentRunMCPToolService.ompQualificationAuthorizationCleanupDeadlineNanoseconds,
+                "A start without an armed deadline keeps the bounded cleanup fallback"
+            )
+        #else
+            throw XCTSkip("OMP qualification transaction is DEBUG-only")
+        #endif
+    }
+
+    func testOMPQualificationWatchdogCancelsAndDrainsOperationBeforeReturning() async {
+        let events = LifecycleRecorder()
+        // The operation leaves its first phase only through cancellation, then parks in
+        // post-cancellation work (ignoring cancellation) until the test releases it. A zero-second
+        // watchdog makes expiry the first child result. While the operation is parked, a draining
+        // watchdog cannot have returned. A watchdog that resumes its caller without awaiting the
+        // operation already has, because that resume precedes the cancellation the operation observed.
+        let cancellation = TestCancellationGate(name: "watchdog operation cancellation")
+        let postCancellationWork = TestReleaseFence(name: "watchdog operation post-cancellation work")
+        let watchdogRun = Task { @MainActor in
+            do {
+                try await withOMPQualificationWatchdog(seconds: 0) {
+                    events.record("operation-started")
+                    try? await cancellation.waitUntilCancelled()
+                    events.record("operation-cancelled:\(Task.isCancelled)")
+                    await postCancellationWork.enterAndWaitIgnoringCancellationUntilRelease()
+                    events.record("operation-drained")
+                }
+                events.record("watchdog-completed")
+            } catch is OMPQualificationWatchdogTimeout {
+                events.record("watchdog-returned")
+            } catch {
+                events.record("watchdog-failed:\(error)")
+            }
+        }
+        let parked = await postCancellationWork.waitUntilEntered()
+        let eventsWhileParked = events.events
+        postCancellationWork.release()
+        await watchdogRun.value
+
+        XCTAssertTrue(parked, "The cancelled operation reached its post-cancellation fence")
+        XCTAssertEqual(
+            eventsWhileParked,
+            ["operation-started", "operation-cancelled:true"],
+            "The watchdog must not return while its cancelled operation is still running"
+        )
+        XCTAssertEqual(
+            events.events,
+            ["operation-started", "operation-cancelled:true", "operation-drained", "watchdog-returned"],
+            "Expiry cancels the operation and drains it before the caller resumes"
+        )
     }
 
     func testOMPQualificationExpiredBeforeProviderDispatchRollsBackWithoutDispatch() async throws {
@@ -3900,5 +4025,65 @@ private actor WaitScopeRecorder {
 
     func completions() -> [AgentRunWaitScopeCompletion] {
         recordedCompletions
+    }
+}
+
+/// Virtual monotonic uptime for OMP qualification authorization tests. Every read and forward-only
+/// advance holds `lock`, which makes the instance safe to share between the service start path and
+/// the receipt's `@Sendable` clock reads; each test owns its own instance.
+private final class OMPQualificationTestClock: @unchecked Sendable {
+    private let lock = NSLock()
+    private var uptimeNanoseconds: UInt64
+
+    init(uptimeNanoseconds: UInt64) {
+        self.uptimeNanoseconds = uptimeNanoseconds
+    }
+
+    func now() -> UInt64 {
+        lock.withLock { uptimeNanoseconds }
+    }
+
+    /// Moves time forward only; returns false (leaving time unchanged) for a backward request.
+    func advance(to target: UInt64) -> Bool {
+        lock.withLock {
+            guard target >= uptimeNanoseconds else { return false }
+            uptimeNanoseconds = target
+            return true
+        }
+    }
+}
+
+private struct OMPQualificationWatchdogTimeout: Error, CustomStringConvertible {
+    let seconds: TimeInterval
+
+    var description: String {
+        "OMP qualification execution exceeded its \(seconds)s hang watchdog"
+    }
+}
+
+private extension AgentRunMCPToolServiceWaitTests {
+    /// Runs `operation` under a hang watchdog inside one structured task group. The first child to
+    /// finish decides the result; leaving the group cancels the other child and awaits it. On expiry the
+    /// operation is therefore cancelled and drained before this returns, so test teardown never
+    /// releases shared isolation under live work. A genuinely uncooperative operation keeps the test
+    /// waiting and is contained by the coordinated runner's process-level deadline, never orphaned.
+    func withOMPQualificationWatchdog(
+        seconds: TimeInterval,
+        operation: @escaping @MainActor @Sendable () async throws -> Void
+    ) async throws {
+        try await withThrowingTaskGroup(of: Bool.self) { group in
+            group.addTask {
+                try await operation()
+                return true
+            }
+            group.addTask {
+                try await Task.sleep(nanoseconds: UInt64((seconds * 1_000_000_000).rounded()))
+                return false
+            }
+            defer { group.cancelAll() }
+            guard try await group.next() == true else {
+                throw OMPQualificationWatchdogTimeout(seconds: seconds)
+            }
+        }
     }
 }

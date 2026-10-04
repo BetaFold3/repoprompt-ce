@@ -2012,14 +2012,13 @@ struct MCPOracleToolService {
         }
         let chatID = args["chat_id"]?.stringValue?
             .trimmingCharacters(in: .whitespacesAndNewlines)
-        if newChat, mode != .current {
+        // A send-local mode needs an explicit conversation target: a continuation chat_id or a
+        // fresh new_chat:true. Implicit latest-chat sends keep packaging the current selection.
+        // chat_id plus new_chat:true is rejected earlier by validateCommonOracleArgs.
+        let hasExplicitTarget = newChat || chatID?.isEmpty == false
+        if mode != .current, !hasExplicitTarget {
             throw MCPError.invalidParams(
-                "selection_mode is only valid for continuation sends with an explicit chat_id"
-            )
-        }
-        if mode != .current, chatID?.isEmpty != false {
-            throw MCPError.invalidParams(
-                "selection_mode:\(mode.rawValue) requires an explicit chat_id for a continuation send"
+                "selection_mode:\(mode.rawValue) requires an explicit conversation target: pass chat_id to continue a chat or new_chat:true to start one"
             )
         }
         if mode == .explicitSlices {
@@ -2123,12 +2122,40 @@ struct MCPOracleToolService {
             }
         guard compatiblePresets.count > 1 else { return }
 
-        let choices = compatiblePresets
-            .map { "'\($0.name)' (\($0.id.uuidString))" }
-            .joined(separator: ", ")
         throw MCPError.invalidParams(
-            "new_chat:true requires an explicit model when multiple model presets support '\(mode)' mode: \(choices). Retry with model set to one exact preset name or UUID from oracle_utils op=models. chat_name only labels the Oracle session and never selects a model."
+            Self.newChatModelRequiredMessage(mode: mode, compatiblePresets: compatiblePresets)
         )
+    }
+
+    /// Self-correcting rejection for a fresh chat without `model`. The stable
+    /// `oracle_model_required:` prefix and the complete, current preset list let an agent retry
+    /// directly; nothing here selects a model. Presets are listed in the caller's order.
+    static func newChatModelRequiredMessage(mode: String, compatiblePresets: [ModelPreset]) -> String {
+        let choices = compatiblePresets
+            .map { "'\(Self.escapedPresetName($0.name))' (\($0.id.uuidString))" }
+            .joined(separator: ", ")
+        return "oracle_model_required: new_chat:true requires an explicit model when multiple model presets support '\(mode)' mode (\(compatiblePresets.count) compatible configured presets). This is a pre-provider validation failure; no Oracle chat was created and nothing was sent. Retry the same call with model set to exactly one of these preset UUIDs: \(choices). This list is current; no oracle_utils call is needed. chat_name only labels the Oracle session and never selects a model."
+    }
+
+    /// Keeps a preset name on one line and unambiguous inside the single-quoted choice list.
+    private static func escapedPresetName(_ name: String) -> String {
+        var escaped = ""
+        for scalar in name.unicodeScalars {
+            switch scalar {
+            case "\\": escaped += "\\\\"
+            case "'": escaped += "\\'"
+            case "\n": escaped += "\\n"
+            case "\r": escaped += "\\r"
+            case "\t": escaped += "\\t"
+            default:
+                if CharacterSet.controlCharacters.contains(scalar) {
+                    escaped += String(format: "\\u{%04X}", scalar.value)
+                } else {
+                    escaped.unicodeScalars.append(scalar)
+                }
+            }
+        }
+        return escaped
     }
 
     private func resolveBatchModelSelector(

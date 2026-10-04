@@ -365,10 +365,186 @@ private struct OracleToolCardChatLinks: View {
     }
 }
 
+/// Failed-Oracle card presentation (Oracle failure inspection plan, B4). Built only from the
+/// shared `OracleToolResultInspection` projection, so a live failed card and the same card
+/// after transcript reload show the same redacted diagnostics. Never establishes root routing
+/// identity: the card's Open Oracle control uses the authoritative chat-ID policy instead, and a
+/// diagnostic's structured `laneChatID` only opens that lane's chat.
+struct OracleFailureCardPresentation: Equatable {
+    static let unavailableHeadline = "Error details unavailable"
+
+    let failure: OracleToolResultInspection.Failure
+
+    init(failure: OracleToolResultInspection.Failure) {
+        self.failure = failure
+    }
+
+    /// Non-nil only when the Oracle result failed, using the trusted resolution (provider error
+    /// flag, normalized status, or any failed lane). Pending and cancelled results return nil.
+    init?(item: AgentChatItem) {
+        let status = AgentTranscriptToolNormalizer.status(for: item)
+        guard let failure = OracleToolResultInspection.inspect(
+            resultJSON: item.toolResultJSON,
+            text: item.text,
+            toolIsError: item.toolIsError,
+            statusWord: AgentTranscriptToolStatusSemantics.persistedStatusWord(from: status)
+        ) else {
+            return nil
+        }
+        self.failure = failure
+    }
+
+    var detailsUnavailable: Bool {
+        failure.diagnostics.isEmpty
+    }
+
+    /// Collapsed subtitle: the redacted headline, prefixed by lane counts for multi-lane results.
+    var subtitle: String {
+        let headline = failure.headline ?? Self.unavailableHeadline
+        if let counts = failure.laneCounts, counts.laneCount > 1 {
+            return "\(counts.failedCount) of \(counts.laneCount) failed • \(headline)"
+        }
+        return headline
+    }
+
+    var unavailableExplanation: String {
+        failure.isSavedSummary
+            ? "The saved transcript did not keep this Oracle call's error details."
+            : "This Oracle result did not include error details."
+    }
+
+    var showsTruncationNote: Bool {
+        failure.primaryMessageTruncated
+    }
+
+    /// Historical lane counts; nonterminal lanes are described as unfinished when recorded,
+    /// never as still running.
+    var laneSummary: String? {
+        guard let counts = failure.laneCounts else { return nil }
+        var text = "\(counts.failedCount) of \(counts.laneCount) \(counts.laneCount == 1 ? "lane" : "lanes") failed"
+        if counts.nonterminalCount > 0 {
+            text += "; \(counts.nonterminalCount) unfinished when recorded"
+        }
+        return text
+    }
+
+    var omittedSummary: String? {
+        let omitted = failure.omittedDiagnosticCount
+        guard omitted > 0 else { return nil }
+        return "\(omitted) more \(omitted == 1 ? "error was" : "errors were") not retained"
+    }
+
+    static func diagnosticLabel(_ diagnostic: OracleToolResultInspection.Diagnostic) -> String? {
+        let parts = [
+            diagnostic.index.map { "Lane \($0)" },
+            diagnostic.code
+        ].compactMap(\.self)
+        return parts.isEmpty ? nil : parts.joined(separator: " • ")
+    }
+}
+
+/// The failed card's Open Oracle control: its own hit target and accessibility action, so the
+/// header tap only toggles disclosure.
+private struct OracleFailureOpenControl: View {
+    let timestamp: Date?
+    let action: () -> Void
+
+    var body: some View {
+        HStack(spacing: 6) {
+            Button(action: action) {
+                Label("Open Oracle", systemImage: "arrow.up.right")
+                    .font(.system(size: 11))
+            }
+            .buttonStyle(.plain)
+            .foregroundColor(.secondary)
+            .hoverTooltip("Open Oracle chat")
+            .accessibilityLabel("Open Oracle chat")
+            if let timestamp {
+                MessageTimestampText(date: timestamp)
+                    .font(.system(size: 10))
+                    .foregroundColor(.secondary.opacity(0.7))
+            }
+        }
+    }
+}
+
+private struct OracleFailureDetailsView: View {
+    let presentation: OracleFailureCardPresentation
+    let openContext: AgentOracleOpenContext?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            if presentation.detailsUnavailable {
+                Text(OracleFailureCardPresentation.unavailableHeadline)
+                    .font(.system(size: 11, weight: .semibold))
+                Text(presentation.unavailableExplanation)
+                    .font(.system(size: 11))
+                    .foregroundColor(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            } else {
+                ForEach(Array(presentation.failure.diagnostics.enumerated()), id: \.offset) { offset, diagnostic in
+                    VStack(alignment: .leading, spacing: 2) {
+                        if let label = OracleFailureCardPresentation.diagnosticLabel(diagnostic) {
+                            Text(label)
+                                .font(.system(size: 10, weight: .semibold, design: .monospaced))
+                                .foregroundColor(.secondary)
+                                .textSelection(.enabled)
+                        }
+                        Text(diagnostic.message)
+                            .font(.system(size: 11, design: .monospaced))
+                            .textSelection(.enabled)
+                            .fixedSize(horizontal: false, vertical: true)
+                        if offset == 0, presentation.showsTruncationNote {
+                            Text("(message truncated when saved)")
+                                .font(.system(size: 10))
+                                .foregroundColor(.secondary)
+                        }
+                        if let chatID = diagnostic.laneChatID,
+                           let userInfo = AgentOracleToolRouting.operationPopoverUserInfo(
+                               openContext: openContext,
+                               chatID: chatID
+                           )
+                        {
+                            Button {
+                                NotificationCenter.default.post(
+                                    name: .showAgentOraclePopover,
+                                    object: nil,
+                                    userInfo: userInfo
+                                )
+                            } label: {
+                                Label("Open lane chat", systemImage: "bubble.left.and.bubble.right")
+                                    .font(.system(size: 11))
+                            }
+                            .buttonStyle(.plain)
+                            .foregroundColor(.secondary)
+                            .accessibilityLabel("Open Oracle chat \(chatID)")
+                        }
+                    }
+                }
+            }
+            if let omittedSummary = presentation.omittedSummary {
+                Text(omittedSummary)
+                    .font(.system(size: 10))
+                    .foregroundColor(.secondary)
+            }
+            if let laneSummary = presentation.laneSummary {
+                Text(laneSummary)
+                    .font(.system(size: 10))
+                    .foregroundColor(.secondary)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+}
+
 struct ChatSendResultCard: View {
     let item: AgentChatItem
     let oracleOpenContext: AgentOracleOpenContext?
     let oracleToolCardContext: AgentOracleToolCardContext?
+
+    /// Card-local disclosure for the failed branch only; always starts collapsed regardless of
+    /// `agentToolCardAutoExpandEnabled`.
+    @State private var isFailureExpanded = false
 
     private var normalizedToolName: String {
         (normalizedToolCardName(item.toolName) ?? "").lowercased()
@@ -429,7 +605,62 @@ struct ChatSendResultCard: View {
         }
     }
 
+    /// Only failed Oracle cards become expandable (user decision 4); `chat_send` is unchanged.
+    private var failurePresentation: OracleFailureCardPresentation? {
+        guard isOracleTool else { return nil }
+        return OracleFailureCardPresentation(item: item)
+    }
+
     var body: some View {
+        if let failurePresentation {
+            failedCard(failurePresentation)
+        } else {
+            staticCard
+        }
+    }
+
+    /// Failed branch: header tap toggles disclosure only; Open Oracle is a separate trailing
+    /// control with its own hit target, present only when authoritative routing yields a chat.
+    /// The live sidecar stays mounted beside the container so an invocation failure (for
+    /// example a failed wait call) never hides a still-running operation.
+    private func failedCard(_ presentation: OracleFailureCardPresentation) -> some View {
+        let openAction = onTap
+        return VStack(alignment: .leading, spacing: 4) {
+            ToolCardContainer(
+                iconName: toolIcon(for: item.toolName),
+                iconColor: ToolCardAccentResolver.color(for: item.toolName),
+                title: "Oracle",
+                headerStatusText: OracleToolCardState.failed.displayLabel,
+                subtitle: presentation.subtitle,
+                status: .failure,
+                timestamp: item.timestamp,
+                headerTrailingView: openAction.map { action in
+                    AnyView(OracleFailureOpenControl(timestamp: item.timestamp, action: action))
+                },
+                isExpandable: true,
+                isExpanded: $isFailureExpanded
+            ) {
+                OracleFailureDetailsView(presentation: presentation, openContext: oracleOpenContext)
+                if let oraclePresentation {
+                    OracleToolCardChatLinks(
+                        chatIDs: oraclePresentation.uniqueChatIDs,
+                        openContext: oracleOpenContext
+                    )
+                }
+            }
+            if let oraclePresentation, let oracleToolCardContext {
+                OracleToolCardLiveSidecar(
+                    operationStore: oracleToolCardContext.operationStore,
+                    lanes: oraclePresentation.lanes,
+                    openContext: oracleOpenContext,
+                    showsOpenChatAction: openAction == nil
+                )
+                .padding(.leading, 10)
+            }
+        }
+    }
+
+    private var staticCard: some View {
         StaticToolCardContainer(
             iconName: toolIcon(for: item.toolName),
             iconColor: ToolCardAccentResolver.color(for: item.toolName),

@@ -2966,6 +2966,14 @@ import XCTest
                         }
                     }
 
+                    let workspaceID = try XCTUnwrap(
+                        fixture.contextA.window.workspaceManager.activeWorkspace?.id
+                    )
+                    let revisionBefore = fixture.contextA.window.workspaceManager.selectionRevisionForMCP(
+                        workspaceID: workspaceID,
+                        tabID: fixture.contextA.tabID
+                    )
+
                     try await ask()
                     try await ask(["selection_mode": .string("current")])
                     try await ask([
@@ -2984,8 +2992,44 @@ import XCTest
                         ])])
                     ])
 
+                    // Fresh chats are an explicit conversation target too (plan A1).
+                    let freshArgs: [String: Value] = [
+                        "new_chat": .bool(true),
+                        "model": .string("FreshContextOracle")
+                    ]
+                    try await ask(freshArgs.merging(["selection_mode": .string("none")]) { _, new in new })
+                    try await ask(freshArgs.merging([
+                        "selection_mode": .string("explicit_slices"),
+                        "slices": .array([.object([
+                            "path": .string(selectedFile.path),
+                            "ranges": .array([.object([
+                                "start_line": .int(2),
+                                "end_line": .int(2)
+                            ])])
+                        ])])
+                    ]) { _, new in new })
+                    try await ask(freshArgs.merging(["selection_mode": .string("current")]) { _, new in new })
+                    do {
+                        try await ask(freshArgs.merging([
+                            "selection_mode": .string("explicit_slices"),
+                            "slices": .array([.object([
+                                "path": .string("does/not/exist-fresh-slice.swift"),
+                                "ranges": .array([.object([
+                                    "start_line": .int(1),
+                                    "end_line": .int(1)
+                                ])])
+                            ])])
+                        ]) { _, new in new })
+                        XCTFail("Expected an unresolvable fresh-chat slice to fail before provider start")
+                    } catch {
+                        XCTAssertTrue(
+                            error.localizedDescription.contains("Invalid explicit Oracle slices"),
+                            error.localizedDescription
+                        )
+                    }
+
                     let turns = capture.turns
-                    XCTAssertEqual(turns.count, 4)
+                    XCTAssertEqual(turns.count, 7, "An invalid fresh slice must not reach sendChat")
                     XCTAssertEqual(turns[0].message.systemPrompt, turns[1].message.systemPrompt)
                     XCTAssertEqual(
                         turns[0].message.buildTail(embedSystemPrompt: false),
@@ -3020,6 +3064,45 @@ import XCTest
                     )
                     XCTAssertNil(turns[3].message.gitDiff)
 
+                    XCTAssertTrue(turns[4].context.packaging.selection.selectedPaths.isEmpty)
+                    XCTAssertTrue(turns[4].context.packaging.selection.slices.isEmpty)
+                    XCTAssertEqual(turns[4].context.packaging.gitInclusionOverride, GitInclusion.none)
+                    XCTAssertEqual(turns[4].context.packaging.reviewGitContext, .automaticOnly())
+                    XCTAssertTrue(turns[4].message.fileBlocks.isEmpty)
+                    XCTAssertNil(turns[4].message.gitDiff)
+
+                    let freshSliced = turns[5].message.fileBlocks.joined(separator: "\n")
+                    XCTAssertTrue(freshSliced.contains("slice_middle"), freshSliced)
+                    XCTAssertFalse(freshSliced.contains("slice_first"), freshSliced)
+                    XCTAssertFalse(freshSliced.contains("slice_last"), freshSliced)
+                    XCTAssertEqual(
+                        turns[5].context.packaging.selection.slices[selectedFile.path],
+                        [LineRange(start: 2, end: 2)]
+                    )
+                    XCTAssertEqual(turns[5].context.packaging.gitInclusionOverride, GitInclusion.none)
+                    XCTAssertEqual(turns[5].context.packaging.reviewGitContext, .automaticOnly())
+                    XCTAssertNil(turns[5].message.gitDiff)
+
+                    XCTAssertEqual(turns[6].context.packaging.selection, turns[1].context.packaging.selection)
+                    XCTAssertEqual(
+                        turns[6].context.packaging.gitInclusionOverride,
+                        turns[1].context.packaging.gitInclusionOverride
+                    )
+                    XCTAssertEqual(
+                        turns[6].message.buildTail(embedSystemPrompt: false),
+                        turns[1].message.buildTail(embedSystemPrompt: false),
+                        "A fresh current send packages exactly like an implicit current send"
+                    )
+
+                    XCTAssertEqual(
+                        fixture.contextA.window.workspaceManager.selectionRevisionForMCP(
+                            workspaceID: workspaceID,
+                            tabID: fixture.contextA.tabID
+                        ),
+                        revisionBefore,
+                        "Send-local selection modes never mutate the shared selection revision"
+                    )
+
                     let persisted = try XCTUnwrap(
                         fixture.contextA.window.workspaceManager.composeTab(with: fixture.contextA.tabID)
                     ).selection
@@ -3029,6 +3112,168 @@ import XCTest
                     await fixture.cleanup()
                 } catch {
                     fixture.contextA.window.mcpServer.setOracleChatSendOverrideForTesting(nil)
+                    await fixture.cleanup()
+                    throw error
+                }
+            }
+        }
+
+        /// Plan A1 downstream check: a fresh review with send-local context is packaged by the real
+        /// Oracle send path and reaches the provider transport instead of being rejected as empty.
+        func testAskOracleFreshReviewSelectionModesReachTransportThroughRealPackaging() async throws {
+            try await MCPSharedServerTestLease.shared.withLease { lease in
+                let fixture = try await PersistentMCPTestFixture.make(lease: lease)
+                let presetsManager = ModelPresetsManager.shared
+                let settings = GlobalSettingsStore.shared
+                let previousPresets = presetsManager.presets
+                let previousShowPresets = settings.mcpShowModelPresets()
+                let previousTemporaryDisable = settings.mcpTemporarilyDisablePresets()
+                let apiSettings = try XCTUnwrap(fixture.contextA.window.promptManager.apiSettingsViewModel)
+                let previousClaudeCodeConnected = apiSettings.isClaudeCodeConnected
+                defer {
+                    presetsManager.presets = previousPresets
+                    settings.setMCPShowModelPresets(previousShowPresets, commit: false)
+                    settings.setMCPTemporarilyDisablePresets(previousTemporaryDisable, commit: false)
+                    apiSettings.isClaudeCodeConnected = previousClaudeCodeConnected
+                    fixture.contextA.window.mcpServer.setOraclePostPackagingTransportOverrideForTesting(nil)
+                }
+
+                do {
+                    try await activateWorkspace(fixture.contextA)
+                    let selectedFile = fixture.contextA.fileURL
+                    try write(
+                        "let fresh_selected_marker = 1\nlet fresh_slice_marker = 2\n",
+                        to: selectedFile
+                    )
+                    let sharedSelection = StoredSelection(
+                        selectedPaths: [selectedFile.path],
+                        codemapAutoEnabled: false
+                    )
+                    // Seed the exact tab this test later reads, as an agent's MCP selection write
+                    // would. `persistActiveSelection` targets whichever compose tab is active in the
+                    // shared window, and a `.runtimeMutation` seed has no canonical-selection fence,
+                    // so a stale headless UI flush (token counting, packaging snapshots) could
+                    // overwrite it independently of the send-local mode under test.
+                    let sharedIdentity = WorkspaceSelectionIdentity(
+                        workspaceID: fixture.contextA.workspaceID,
+                        tabID: fixture.contextA.tabID
+                    )
+                    _ = await fixture.contextA.window.selectionCoordinator.persistSelection(
+                        sharedSelection,
+                        for: sharedIdentity,
+                        source: .mcpTabContext,
+                        mirrorToUIIfActive: true
+                    )
+                    try XCTAssertEqual(
+                        XCTUnwrap(
+                            fixture.contextA.window.workspaceManager.composeTab(with: fixture.contextA.tabID)
+                        ).selection,
+                        sharedSelection,
+                        "Precondition: the shared selection is seeded on the source tab"
+                    )
+                    let endpoint = try fixture.endpointA()
+                    try await configureAgentModeEndpoint(
+                        endpoint,
+                        context: makeFrozenContext(
+                            fixture: fixture,
+                            selection: sharedSelection,
+                            bindings: []
+                        ),
+                        fixture: fixture
+                    )
+                    let preset = ModelPreset(
+                        name: "FreshContextReviewA",
+                        model: .claudeCodeSonnet,
+                        supportedModes: SupportedModes(chat: true, plan: true, review: true)
+                    )
+                    let otherPreset = ModelPreset(
+                        name: "FreshContextReviewB",
+                        model: .claudeCodeSonnet,
+                        supportedModes: SupportedModes(chat: true, plan: true, review: true)
+                    )
+                    presetsManager.presets = [preset, otherPreset]
+                    settings.setMCPShowModelPresets(true, commit: false)
+                    settings.setMCPTemporarilyDisablePresets(false, commit: false)
+                    apiSettings.isClaudeCodeConnected = true
+
+                    let transport = OracleTransportMessageCapture()
+                    fixture.contextA.window.mcpServer.setOraclePostPackagingTransportOverrideForTesting {
+                        message, _ in
+                        transport.record(message)
+                        let stream = AsyncThrowingStream<ChatStreamOutput, Error> { continuation in
+                            continuation.yield(ChatStreamOutput(
+                                text: "fresh review response",
+                                reasoning: nil,
+                                tokens: ChatTokenInfo(),
+                                isFinal: true
+                            ))
+                            continuation.finish()
+                        }
+                        return (UUID(), stream)
+                    }
+
+                    func freshReview(_ extra: [String: Value]) async throws -> Value {
+                        var args: [String: Value] = [
+                            "message": .string("Review only the context this send supplies."),
+                            "mode": .string("review"),
+                            "model": .string(preset.id.uuidString),
+                            "new_chat": .bool(true)
+                        ]
+                        args.merge(extra) { _, new in new }
+                        return try await ServerNetworkManager.withConnectionID(endpoint.connectionID) {
+                            try await fixture.contextA.window.mcpServer.executeAskOracleForTesting(args: args)
+                        }
+                    }
+
+                    let revisionBefore = fixture.contextA.window.workspaceManager.selectionRevisionForMCP(
+                        workspaceID: fixture.contextA.workspaceID,
+                        tabID: fixture.contextA.tabID
+                    )
+                    let none = try await freshReview(["selection_mode": .string("none")])
+                    let sliced = try await freshReview([
+                        "selection_mode": .string("explicit_slices"),
+                        "slices": .array([.object([
+                            "path": .string(selectedFile.path),
+                            "ranges": .array([.object([
+                                "start_line": .int(2),
+                                "end_line": .int(2)
+                            ])])
+                        ])])
+                    ])
+                    for result in [none, sliced] {
+                        XCTAssertEqual(
+                            result.objectValue?["response"]?.stringValue,
+                            "fresh review response",
+                            ToolOutputFormatter.rawJSONString(result)
+                        )
+                    }
+
+                    let messages = transport.messages
+                    XCTAssertEqual(messages.count, 2, "Both fresh reviews must reach the provider transport")
+                    let noneFiles = messages.first?.fileBlocks.joined(separator: "\n") ?? ""
+                    XCTAssertFalse(noneFiles.contains("fresh_selected_marker"), noneFiles)
+                    XCTAssertFalse(noneFiles.contains("fresh_slice_marker"), noneFiles)
+                    XCTAssertNil(messages.first?.gitDiff)
+                    let slicedFiles = messages.last?.fileBlocks.joined(separator: "\n") ?? ""
+                    XCTAssertTrue(slicedFiles.contains("fresh_slice_marker"), slicedFiles)
+                    XCTAssertFalse(slicedFiles.contains("fresh_selected_marker"), slicedFiles)
+                    XCTAssertNil(messages.last?.gitDiff)
+
+                    let persisted = try XCTUnwrap(
+                        fixture.contextA.window.workspaceManager.composeTab(with: fixture.contextA.tabID)
+                    ).selection
+                    XCTAssertEqual(persisted, sharedSelection)
+                    XCTAssertEqual(
+                        fixture.contextA.window.workspaceManager.selectionRevisionForMCP(
+                            workspaceID: fixture.contextA.workspaceID,
+                            tabID: fixture.contextA.tabID
+                        ),
+                        revisionBefore,
+                        "Send-local fresh reviews must not mutate the shared selection"
+                    )
+
+                    await fixture.cleanup()
+                } catch {
                     await fixture.cleanup()
                     throw error
                 }
@@ -3116,6 +3361,12 @@ import XCTest
                         XCTAssertEqual(error.code, .oracleContextOverflow)
                         XCTAssertNotNil(error.details?["largest_contributors"])
                         XCTAssertTrue(error.details?["remedies"]?.contains("selection_mode:none") == true)
+                        XCTAssertTrue(
+                            error.details?["remedies"]?.contains(
+                                "selection_mode:none or explicit_slices on the same chat_id or a fresh chat"
+                            ) == true,
+                            error.details?["remedies"] ?? ""
+                        )
                         XCTAssertTrue(error.message.contains("context window is 128"), error.message)
                     }
                     XCTAssertEqual(transport.invocationCount, 0)
@@ -3381,6 +3632,7 @@ import XCTest
                     XCTAssertTrue(sessionsResponse.rawJSON.contains("\"isError\":true"), sessionsResponse.rawJSON)
                     XCTAssertTrue(sessionsResponse.rawJSON.contains("unavailable in Agent Mode"), sessionsResponse.rawJSON)
 
+                    var listedRetryUUID: String?
                     for chatName in [String?.none, "Knowledge Duel A"] {
                         var ambiguousArgs: [String: Value] = [
                             "message": .string("Ask both named Oracles"),
@@ -3399,15 +3651,50 @@ import XCTest
                             XCTFail("Expected a new Oracle lane without model to fail closed")
                         } catch {
                             let message = error.localizedDescription
+                            XCTAssertTrue(message.contains("oracle_model_required: "), message)
                             XCTAssertTrue(message.contains("requires an explicit model"), message)
+                            XCTAssertTrue(message.contains("'review' mode (2 compatible configured presets)"), message)
+                            XCTAssertTrue(message.contains("pre-provider validation failure"), message)
+                            XCTAssertTrue(
+                                message.contains("Retry the same call with model set to exactly one of these preset UUIDs"),
+                                message
+                            )
+                            XCTAssertTrue(message.contains("This list is current; no oracle_utils call is needed"), message)
                             XCTAssertTrue(message.contains("chat_name only labels"), message)
                             XCTAssertTrue(message.contains(firstPreset.name), message)
                             XCTAssertTrue(message.contains(firstPreset.id.uuidString), message)
                             XCTAssertTrue(message.contains(secondPreset.name), message)
                             XCTAssertTrue(message.contains(secondPreset.id.uuidString), message)
+                            let firstRange = try XCTUnwrap(message.range(of: firstPreset.id.uuidString))
+                            let secondRange = try XCTUnwrap(message.range(of: secondPreset.id.uuidString))
+                            XCTAssertLessThan(
+                                firstRange.lowerBound,
+                                secondRange.lowerBound,
+                                "Presets keep the deterministic name order"
+                            )
+                            let listed = try XCTUnwrap(message.range(of: "preset UUIDs: "))
+                            let retryUUID = message[listed.upperBound...]
+                                .split(separator: "(", maxSplits: 1)
+                                .last?
+                                .prefix(36)
+                            listedRetryUUID = retryUUID.map(String.init)
                         }
                     }
                     XCTAssertEqual(capture.callCount, 1, "Ambiguous named lanes must fail before sendChat")
+
+                    // The rejection alone is enough to retry: reuse a UUID copied from its text.
+                    let retryUUID = try XCTUnwrap(listedRetryUUID)
+                    XCTAssertEqual(retryUUID, firstPreset.id.uuidString)
+                    _ = try await ServerNetworkManager.withConnectionID(connectionID) {
+                        try await fixture.contextA.window.mcpServer.executeAskOracleForTesting(args: [
+                            "message": .string("Ask both named Oracles"),
+                            "mode": .string("review"),
+                            "model": .string(retryUUID),
+                            "new_chat": .bool(true)
+                        ])
+                    }
+                    XCTAssertEqual(capture.callCount, 2, "A UUID listed by the rejection retries directly")
+                    XCTAssertEqual(capture.args?["model"]?.stringValue, retryUUID)
 
                     let invalidCases: [([String: Value], String)] = [
                         (["message": .string("x"), "mode": .int(7)], "mode must be a string"),
@@ -3416,15 +3703,23 @@ import XCTest
                         (["message": .string("x"), "model": .string("  ")], "model cannot be empty"),
                         (["message": .string("x"), "chat_name": .string("Lane")], "chat_name is only valid"),
                         (["message": .string("x"), "selection_mode": .int(1)], "selection_mode must be a string"),
-                        (["message": .string("x"), "selection_mode": .string("explicit_slices")], "requires an explicit chat_id"),
-                        (["message": .string("x"), "selection_mode": .string("none")], "requires an explicit chat_id"),
+                        (["message": .string("x"), "selection_mode": .string("explicit_slices")], "requires an explicit conversation target"),
+                        (["message": .string("x"), "selection_mode": .string("none")], "requires an explicit conversation target"),
                         (["message": .string("x"), "slices": .array([])], "slices is only valid"),
                         (["message": .string("x"), "max_output_tokens": .int(0)], "must be a positive integer"),
                         ([
                             "message": .string("x"),
+                            "selection_mode": .string("explicit_slices"),
+                            "new_chat": .bool(true),
+                            "model": .string(firstPreset.id.uuidString)
+                        ], "requires a non-empty slices array"),
+                        ([
+                            "message": .string("x"),
                             "selection_mode": .string("none"),
-                            "new_chat": .bool(true)
-                        ], "only valid for continuation sends"),
+                            "new_chat": .bool(true),
+                            "model": .string(firstPreset.id.uuidString),
+                            "slices": .array([.object(["path": .string("a.swift")])])
+                        ], "slices is only valid"),
                         ([
                             "message": .string("x"),
                             "chat_id": .string("abc123"),
@@ -4937,6 +5232,15 @@ import XCTest
             invocationCount += 1
             messages.append(message)
             models.append(model)
+        }
+    }
+
+    @MainActor
+    private final class OracleTransportMessageCapture {
+        private(set) var messages: [AIMessage] = []
+
+        func record(_ message: AIMessage) {
+            messages.append(message)
         }
     }
 

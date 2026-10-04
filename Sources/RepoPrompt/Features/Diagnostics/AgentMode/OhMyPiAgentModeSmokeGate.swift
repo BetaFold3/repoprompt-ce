@@ -158,13 +158,17 @@
             init(
                 transaction: StartTransaction,
                 expectedWorkspaceID: UUID,
-                authorizationDeadlineUptimeNanoseconds: UInt64? = nil
+                authorizationDeadlineUptimeNanoseconds: UInt64? = nil,
+                monotonicNowNanoseconds: @escaping @Sendable () -> UInt64 = {
+                    DispatchTime.now().uptimeNanoseconds
+                }
             ) {
                 self.transaction = transaction
                 generationID = transaction.transactionID
                 self.expectedWorkspaceID = expectedWorkspaceID
                 authorizationReceipt = StartAuthorizationReceipt(
-                    authorizationDeadlineUptimeNanoseconds: authorizationDeadlineUptimeNanoseconds
+                    authorizationDeadlineUptimeNanoseconds: authorizationDeadlineUptimeNanoseconds,
+                    monotonicNowNanoseconds: monotonicNowNanoseconds
                 )
             }
         }

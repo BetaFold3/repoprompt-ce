@@ -152,11 +152,39 @@ final class AgentToolResultPersistencePolicyTests: XCTestCase {
                 XCTAssertEqual(object["has_response"] as? Bool, true, row.toolName)
                 XCTAssertEqual(object["diff_count"] as? Int, 1, row.toolName)
                 XCTAssertEqual(object["error_count"] as? Int, 1, row.toolName)
+                // A result carrying `errors[]` is failed under the Oracle card's trusted resolution
+                // (`OracleToolCardPresentation.state`), so the summary keeps the redacted, bounded
+                // primary diagnostic and a `Failed:` headline (failure-inspection plan B3).
+                let retainedError = rawError.trimmingCharacters(in: .whitespacesAndNewlines)
+                XCTAssertEqual(
+                    object["errors"] as? [[String: String]],
+                    [["message": retainedError]],
+                    row.toolName
+                )
+                XCTAssertNil(object["error_truncated"], row.toolName)
                 XCTAssertEqual(
                     object["summary_text"] as? String,
+                    OracleToolResultInspection.truncatedUTF8(
+                        "Failed: " + retainedError,
+                        maxBytes: OracleToolResultInspection.summaryTextMaxBytes
+                    ).text,
+                    row.toolName
+                )
+
+                var successObject = try decodedObject(raw)
+                successObject.removeValue(forKey: "errors")
+                let successSummary = try XCTUnwrap(
+                    persistedSummary(toolName: row.toolName, rawResultJSON: jsonString(successObject))
+                )
+                let successSummaryObject = try decodedObject(successSummary.resultJSON)
+                XCTAssertEqual(
+                    successSummaryObject["summary_text"] as? String,
                     "review • Claude_Fable_xhigh • 1 diff",
                     row.toolName
                 )
+                XCTAssertNil(successSummaryObject["errors"], row.toolName)
+                XCTAssertNil(successSummaryObject["error_count"], row.toolName)
+                XCTAssertNil(successSummaryObject["error_truncated"], row.toolName)
 
                 let uiIdentityJSON = try XCTUnwrap(
                     AgentToolResultPersistencePolicy.uiFacingOracleIdentityJSON(
@@ -217,13 +245,13 @@ final class AgentToolResultPersistencePolicyTests: XCTestCase {
                 XCTAssertNil(object["diff_count"], row.toolName)
                 XCTAssertNil(object["error_count"], row.toolName)
                 XCTAssertEqual(object["summary_text"] as? String, "chat_send • success", row.toolName)
+                XCTAssertNil(object["errors"], row.toolName)
+                XCTAssertFalse(summary.resultJSON.contains(rawError), row.toolName)
             }
             XCTAssertNil(object["response"], row.toolName)
             XCTAssertNil(object["diffs"], row.toolName)
-            XCTAssertNil(object["errors"], row.toolName)
             XCTAssertFalse(summary.resultJSON.contains(rawResponse), row.toolName)
             XCTAssertFalse(summary.resultJSON.contains(rawDiff), row.toolName)
-            XCTAssertFalse(summary.resultJSON.contains(rawError), row.toolName)
             XCTAssertLessThanOrEqual(summary.resultJSON.utf8.count, AgentToolResultPersistencePolicy.maxPersistedToolSummaryBytes, row.toolName)
         }
 

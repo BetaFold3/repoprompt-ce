@@ -1030,6 +1030,23 @@ enum ToolResultDTOs {
             let message: String?
         }
 
+        /// One `errors[]` entry: a legacy string, or the object persisted for failed Oracle
+        /// summaries (`{code?, message, index?, lane_chat_id?}`). Decodes to its message text so an
+        /// object entry never breaks decoding of the rest of the result.
+        private struct ErrorEntry: Decodable {
+            let text: String?
+
+            init(from decoder: Decoder) throws {
+                if let string = try? decoder.singleValueContainer().decode(String.self) {
+                    text = string
+                } else if let payload = try? ErrorPayload(from: decoder) {
+                    text = payload.message ?? payload.code
+                } else {
+                    text = nil
+                }
+            }
+        }
+
         struct Pending: Codable, Equatable {
             struct Progress: Codable, Equatable {
                 let outputChars: Int?
@@ -1249,7 +1266,8 @@ enum ToolResultDTOs {
             } else {
                 diffs = try container.decodeIfPresent([Diff].self, forKey: .patches)
             }
-            errors = try container.decodeIfPresent([String].self, forKey: .errors)
+            errors = try container.decodeIfPresent([ErrorEntry].self, forKey: .errors)?
+                .compactMap(\.text)
             modelID = try container.decodeIfPresent(String.self, forKey: .modelID)
             modelName = try container.decodeIfPresent(String.self, forKey: .modelName)
             uiModelID = try container.decodeIfPresent(String.self, forKey: .uiModelID)

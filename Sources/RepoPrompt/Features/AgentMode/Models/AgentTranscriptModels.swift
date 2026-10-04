@@ -792,6 +792,10 @@ public struct AgentTranscriptClusterSummary: Codable, Sendable, Equatable {
     public let containsWarning: Bool
     public let shortNarration: String?
     public let collapsedDisplay: AgentTranscriptCollapsedSummaryDisplay?
+    /// Failed logical tool executions (each counted once by its latest normalized status; pending,
+    /// running and cancelled work excluded). `nil` when none failed or when the summary predates
+    /// the count, so summaries without failures encode exactly as before.
+    public let failedToolCount: Int?
 
     public init(
         toolCount: Int,
@@ -803,7 +807,8 @@ public struct AgentTranscriptClusterSummary: Codable, Sendable, Equatable {
         containsFailure: Bool,
         containsWarning: Bool,
         shortNarration: String?,
-        collapsedDisplay: AgentTranscriptCollapsedSummaryDisplay? = nil
+        collapsedDisplay: AgentTranscriptCollapsedSummaryDisplay? = nil,
+        failedToolCount: Int? = nil
     ) {
         self.toolCount = toolCount
         self.toolNames = toolNames
@@ -815,6 +820,7 @@ public struct AgentTranscriptClusterSummary: Codable, Sendable, Equatable {
         self.containsWarning = containsWarning
         self.shortNarration = shortNarration
         self.collapsedDisplay = collapsedDisplay
+        self.failedToolCount = failedToolCount.flatMap { $0 > 0 ? $0 : nil }
     }
 }
 
@@ -979,6 +985,9 @@ public struct AgentTranscriptProjection: Sendable, Equatable {
 struct AgentTranscriptPresentationMetadata: Equatable {
     let latestUserMessageID: UUID?
     let latestTurnID: UUID?
+    /// The live run's latest turn when it has tool activity. Its activity clusters and grouped
+    /// history are the *default-collapse* target: collapsed unless the user explicitly expanded
+    /// them (`AgentTranscriptGroupExpansionPolicy`); tool cards inside never auto-expand.
     let dynamicSummaryLockTargetTurnID: UUID?
     let recentAssistantItemIDs: Set<UUID>
     let activeContextBuilderCallItemID: UUID?
