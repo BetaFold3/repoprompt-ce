@@ -70,6 +70,9 @@ enum CodexTurnInterruptError: Error, LocalizedError, Equatable {
 
 protocol CodexSessionControlling: AnyObject {
     var hasActiveThread: Bool { get }
+    /// Last thread runtime status the controller learned from a resume/read snapshot or a
+    /// `thread/status/changed` notification. Nil when unknown (and for test doubles).
+    var lastKnownRuntimeStatus: CodexNativeSessionController.ThreadSnapshot.RuntimeStatus? { get }
     var events: AsyncStream<CodexNativeSessionController.Event> { get }
 
     func ensureEventsStreamReady()
@@ -588,6 +591,42 @@ final class CodexNativeSessionController {
         let kind: LifecycleAuthorityObservationKind
     }
 
+    /// Whether the app-server honors `thread/resume {excludeTurns:true}`.
+    enum ExcludeTurnsSupport: Equatable {
+        case unknown
+        /// The response carried no turns (indistinguishable from an empty legacy thread).
+        case honored
+        /// The response still carried turns; the field was silently ignored.
+        case ignored
+        /// The app-server rejected the field by name; resume is sent without it.
+        case rejected
+    }
+
+    /// Whether the app-server implements `thread/turns/list`.
+    enum TurnsListSupport: Equatable {
+        case unknown
+        case supported
+        case unsupported
+    }
+
+    private struct AppServerCapabilityMemo {
+        let transportGeneration: UInt64?
+        var excludeTurns: ExcludeTurnsSupport = .unknown
+        var turnsList: TurnsListSupport = .unknown
+        var turnsListRejectsItemsView = false
+    }
+
+    private struct ListedTurn {
+        let id: String
+        let status: String?
+    }
+
+    private enum NewestTurnListing {
+        /// The listing succeeded; nil means the thread has no turns.
+        case listed(ListedTurn?)
+        case unsupported
+    }
+
     private let client: CodexAppServerClient
     private let runID: UUID
     private let tabID: UUID
@@ -630,6 +669,13 @@ final class CodexNativeSessionController {
     private var terminalFileChangeItemIDs: Set<String> = []
     private var commandExecutionMirrorStateByItemID: [String: CommandExecutionMirrorState] = [:]
     private var appServerRequestValueStyle: CodexAgentToolPreferences.AppServerRequestValueStyle = .configStyle
+    /// Per-app-server-process capability memo; reset whenever the client transport generation changes.
+    private var appServerCapabilities = AppServerCapabilityMemo(transportGeneration: nil)
+    /// Last runtime status from a resume/read snapshot or `thread/status/changed`.
+    private(set) var lastKnownRuntimeStatus: ThreadSnapshot.RuntimeStatus?
+    /// Incremented whenever routing state is rewritten by a snapshot or a turn lifecycle
+    /// notification, so a live snapshot read can detect that it was superseded mid-await.
+    private var routingRevision: UInt64 = 0
 
     var hasActiveThread: Bool {
         threadID?.isEmpty == false
@@ -1104,7 +1150,7 @@ final class CodexNativeSessionController {
 
             let configOverrides = await options.configOverridesProvider()
             let pathValue = existing?.rolloutPath
-            let result: [String: Any]
+            let snapshot: ThreadSnapshot
 
             if let resumeThreadID {
                 var params: [String: Any] = ["threadId": resumeThreadID]
@@ -1128,16 +1174,18 @@ final class CodexNativeSessionController {
                 // preserves original instructions across resume (confirmed by Codex protocol
                 // tests: resume_switches_models_preserves_base_instructions). Resending them
                 // wastes ~5-6k tokens on every reconnect for no benefit.
-                result = try await requestWithCompatibleAppServerRequestValueStyle(
-                    method: "thread/resume",
-                    timeout: options.requestTimeout
-                ) { requestValueStyle in
-                    var requestParams = params
-                    requestParams["approvalPolicy"] = options.approvalPolicyProvider().appServerRequestValue(style: requestValueStyle)
-                    requestParams["sandbox"] = options.sandboxModeProvider().appServerRequestValue(style: requestValueStyle)
-                    requestParams["approvalsReviewer"] = options.approvalReviewerProvider().appServerRequestValue
-                    return requestParams
-                }
+                let transportGeneration = await client.currentTransportGeneration()
+                let resumed = try await requestThreadResumeSnapshot(
+                    params: params,
+                    fallbackEffort: reasoningEffort,
+                    transportGeneration: transportGeneration
+                )
+                snapshot = try await reconcileResumedSnapshot(
+                    resumed.snapshot,
+                    resumeThreadID: resumeThreadID,
+                    responseIncludedTurns: resumed.responseIncludedTurns,
+                    transportGeneration: transportGeneration
+                )
             } else {
                 var params: [String: Any] = [:]
                 if let model {
@@ -1156,7 +1204,7 @@ final class CodexNativeSessionController {
                 if !baseInstructions.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                     params["baseInstructions"] = baseInstructions
                 }
-                result = try await requestWithCompatibleAppServerRequestValueStyle(
+                let result = try await requestWithCompatibleAppServerRequestValueStyle(
                     method: "thread/start",
                     timeout: options.requestTimeout
                 ) { requestValueStyle in
@@ -1166,14 +1214,14 @@ final class CodexNativeSessionController {
                     requestParams["approvalsReviewer"] = options.approvalReviewerProvider().appServerRequestValue
                     return requestParams
                 }
+                snapshot = Self.parseThreadSnapshot(from: result, fallbackEffort: reasoningEffort)
             }
 
-            let pendingSessionRef = Self.parseThreadSnapshot(from: result, fallbackEffort: reasoningEffort).sessionRef
-            try await disableThreadMemoryMode(threadID: pendingSessionRef.conversationID)
+            try await disableThreadMemoryMode(threadID: snapshot.conversationID)
 
             let sessionRef = try await eventHandlingMutex.withLock {
                 try ensureBindingCanComplete()
-                let sessionRef = applyThreadResponse(result, fallbackEffort: reasoningEffort)
+                let sessionRef = applyThreadSnapshot(snapshot)
                 await finishBindingAndDrainBufferedInbound()
                 return sessionRef
             }
@@ -1189,6 +1237,325 @@ final class CodexNativeSessionController {
             }
             throw error
         }
+    }
+
+    // MARK: - Resume history policy and turn-list reconciliation
+
+    private func capabilityMemo(forTransportGeneration generation: UInt64) -> AppServerCapabilityMemo {
+        if appServerCapabilities.transportGeneration != generation {
+            appServerCapabilities = AppServerCapabilityMemo(transportGeneration: generation)
+        }
+        return appServerCapabilities
+    }
+
+    private func updateCapabilityMemo(
+        forTransportGeneration generation: UInt64,
+        _ update: (inout AppServerCapabilityMemo) -> Void
+    ) {
+        _ = capabilityMemo(forTransportGeneration: generation)
+        update(&appServerCapabilities)
+    }
+
+    /// Sends `thread/resume` with `excludeTurns:true` unless this app-server rejected the field,
+    /// and parses the response into a compact snapshot right away so the raw (possibly large)
+    /// response dictionary is not retained across later awaits.
+    private func requestThreadResumeSnapshot(
+        params: [String: Any],
+        fallbackEffort: String?,
+        transportGeneration: UInt64
+    ) async throws -> (snapshot: ThreadSnapshot, responseIncludedTurns: Bool) {
+        // Whether the request that produced `result` carried the flag: only such a response says
+        // anything about honoring it, so a successful no-flag retry keeps the `.rejected` memo.
+        var sentExcludeTurns = capabilityMemo(forTransportGeneration: transportGeneration).excludeTurns != .rejected
+        let result: [String: Any]
+        do {
+            result = try await requestThreadResume(params: params, excludeTurns: sentExcludeTurns)
+        } catch {
+            guard sentExcludeTurns, Self.isExcludeTurnsRejection(error) else { throw error }
+            updateCapabilityMemo(forTransportGeneration: transportGeneration) { $0.excludeTurns = .rejected }
+            Self.logger.notice(
+                "thread/resume rejected excludeTurns; retrying once without it transportGeneration=\(transportGeneration, privacy: .public)"
+            )
+            sentExcludeTurns = false
+            result = try await requestThreadResume(params: params, excludeTurns: false)
+        }
+        let responseTurnCount = Self.threadResponseTurnCount(result)
+        if sentExcludeTurns {
+            let previous = capabilityMemo(forTransportGeneration: transportGeneration).excludeTurns
+            if responseTurnCount > 0 {
+                if previous != .ignored {
+                    updateCapabilityMemo(forTransportGeneration: transportGeneration) { $0.excludeTurns = .ignored }
+                    Self.logger.notice(
+                        "thread/resume ignored excludeTurns turnCount=\(responseTurnCount, privacy: .public) transportGeneration=\(transportGeneration, privacy: .public)"
+                    )
+                }
+            } else if previous == .unknown {
+                updateCapabilityMemo(forTransportGeneration: transportGeneration) { $0.excludeTurns = .honored }
+            }
+        }
+        return (
+            Self.parseThreadSnapshot(from: result, fallbackEffort: fallbackEffort),
+            responseTurnCount > 0
+        )
+    }
+
+    /// One `thread/resume` attempt; the existing request-value-style retry still applies inside it.
+    private func requestThreadResume(
+        params: [String: Any],
+        excludeTurns: Bool
+    ) async throws -> [String: Any] {
+        try await requestWithCompatibleAppServerRequestValueStyle(
+            method: "thread/resume",
+            timeout: options.requestTimeout
+        ) { requestValueStyle in
+            var requestParams = params
+            if excludeTurns {
+                requestParams["excludeTurns"] = true
+            }
+            requestParams["approvalPolicy"] = options.approvalPolicyProvider().appServerRequestValue(style: requestValueStyle)
+            requestParams["sandbox"] = options.sandboxModeProvider().appServerRequestValue(style: requestValueStyle)
+            requestParams["approvalsReviewer"] = options.approvalReviewerProvider().appServerRequestValue
+            return requestParams
+        }
+    }
+
+    /// Settles the resumed thread's runtime state inside the binding window, before memory mode
+    /// and the apply block. Never falls back to a full `thread/read` here: on a just-resumed
+    /// transport that could exceed the inbound frame ceiling.
+    private func reconcileResumedSnapshot(
+        _ snapshot: ThreadSnapshot,
+        resumeThreadID: String,
+        responseIncludedTurns: Bool,
+        transportGeneration: UInt64
+    ) async throws -> ThreadSnapshot {
+        switch snapshot.runtimeStatus {
+        case .idle:
+            return snapshot
+        case .notLoaded:
+            Self.logger.notice(
+                "thread/resume reported notLoaded; installing empty routing without relabeling status"
+            )
+            return snapshot
+        case .systemError:
+            throw CodexSessionControllerError.threadInSystemErrorState(threadID: resumeThreadID)
+        case .active:
+            // `excludeTurns` was ignored: the response already carries turns, so use them as-is.
+            guard !responseIncludedTurns else { return snapshot }
+            let listTimeout = min(options.requestTimeout ?? 15, 15)
+            do {
+                switch try await listNewestTurn(
+                    threadID: snapshot.conversationID,
+                    timeout: listTimeout,
+                    transportGeneration: transportGeneration
+                ) {
+                case let .listed(newestTurn):
+                    return Self.mergedSnapshot(snapshot, newestListedTurn: newestTurn)
+                case .unsupported:
+                    Self.logger.notice(
+                        "resumed thread is active but thread/turns/list is unsupported; active turn identity unresolved"
+                    )
+                    return snapshot
+                }
+            } catch let cancellation as CancellationError {
+                throw cancellation
+            } catch {
+                // A dead transport must fail the resume at the request that observed it, not
+                // surface later as a send failure; only protocol failures and timeouts degrade
+                // to an unresolved identity.
+                if Self.isTransportFatalClientError(error) { throw error }
+                Self.logger.notice(
+                    "resumed thread is active but thread/turns/list failed; active turn identity unresolved"
+                )
+                Self.logCodexDebug(
+                    "[CodexNativeController] startup thread/turns/list failed: \(error.localizedDescription)"
+                )
+                return snapshot
+            }
+        }
+    }
+
+    /// Lists only the newest turn (`limit:1`, descending, items not loaded). An itemsView rejection
+    /// is retried once without it; an unsupported method is memoized and reported as `.unsupported`.
+    private func listNewestTurn(
+        threadID: String,
+        timeout: TimeInterval?,
+        transportGeneration: UInt64
+    ) async throws -> NewestTurnListing {
+        let memo = capabilityMemo(forTransportGeneration: transportGeneration)
+        guard memo.turnsList != .unsupported else { return .unsupported }
+        let includeItemsView = !memo.turnsListRejectsItemsView
+        do {
+            return try await requestNewestTurnListing(
+                threadID: threadID,
+                includeItemsView: includeItemsView,
+                timeout: timeout,
+                transportGeneration: transportGeneration
+            )
+        } catch {
+            guard includeItemsView, Self.isTurnsListItemsViewRejection(error) else { throw error }
+            updateCapabilityMemo(forTransportGeneration: transportGeneration) { $0.turnsListRejectsItemsView = true }
+            Self.logger.notice(
+                "thread/turns/list rejected itemsView; retrying once without it transportGeneration=\(transportGeneration, privacy: .public)"
+            )
+            return try await requestNewestTurnListing(
+                threadID: threadID,
+                includeItemsView: false,
+                timeout: timeout,
+                transportGeneration: transportGeneration
+            )
+        }
+    }
+
+    private func requestNewestTurnListing(
+        threadID: String,
+        includeItemsView: Bool,
+        timeout: TimeInterval?,
+        transportGeneration: UInt64
+    ) async throws -> NewestTurnListing {
+        var params: [String: Any] = [
+            "threadId": threadID,
+            "limit": 1,
+            "sortDirection": "desc"
+        ]
+        if includeItemsView {
+            params["itemsView"] = "notLoaded"
+        }
+        do {
+            let result = try await performRequest(
+                method: "thread/turns/list",
+                params: params,
+                timeout: timeout
+            )
+            updateCapabilityMemo(forTransportGeneration: transportGeneration) { $0.turnsList = .supported }
+            return .listed(Self.parseNewestListedTurn(from: result))
+        } catch {
+            guard Self.isTurnsListUnsupportedError(error) else { throw error }
+            updateCapabilityMemo(forTransportGeneration: transportGeneration) { $0.turnsList = .unsupported }
+            Self.logger.notice(
+                "thread/turns/list is unsupported transportGeneration=\(transportGeneration, privacy: .public)"
+            )
+            return .unsupported
+        }
+    }
+
+    private static func threadResponseTurnCount(_ result: [String: Any]) -> Int {
+        let thread = result["thread"] as? [String: Any] ?? [:]
+        return (thread["turns"] as? [Any])?.count ?? 0
+    }
+
+    private static func parseNewestListedTurn(from result: [String: Any]) -> ListedTurn? {
+        guard let turns = result["data"] as? [[String: Any]],
+              let newest = turns.first,
+              let turnID = firstString(in: newest, keys: ["id", "turnId", "turn_id", "turnID"])?
+              .trimmingCharacters(in: .whitespacesAndNewlines),
+              !turnID.isEmpty
+        else {
+            return nil
+        }
+        return ListedTurn(id: turnID, status: firstString(in: newest, keys: ["status"]))
+    }
+
+    /// The listing is authoritative for the newest turn: an in-progress newest turn becomes the
+    /// single active/current turn; otherwise there is no resolvable active turn identity.
+    private static func mergedSnapshot(
+        _ base: ThreadSnapshot,
+        newestListedTurn newestTurn: ListedTurn?
+    ) -> ThreadSnapshot {
+        let activeTurnID = newestTurn.flatMap { isThreadSnapshotTurnActive($0.status) ? $0.id : nil }
+        return ThreadSnapshot(
+            conversationID: base.conversationID,
+            rolloutPath: base.rolloutPath,
+            model: base.model,
+            reasoningEffort: base.reasoningEffort,
+            runtimeStatus: base.runtimeStatus,
+            currentTurnID: activeTurnID,
+            activeTurnIDs: activeTurnID.map { [$0] } ?? [],
+            latestTurnStatus: newestTurn.flatMap { parseTerminalTurnStatus(from: $0.status) }
+                ?? base.latestTurnStatus
+        )
+    }
+
+    private static func structuredRequestFailure(_ error: Error) -> CodexAppServerClient.RequestFailure? {
+        guard let clientError = error as? CodexAppServerClient.ClientError,
+              case let .requestFailed(failure) = clientError
+        else {
+            return nil
+        }
+        return failure
+    }
+
+    /// Client errors meaning the app-server transport itself is gone (as opposed to a structured
+    /// request failure or a timeout on a live transport).
+    private static func isTransportFatalClientError(_ error: Error) -> Bool {
+        switch error as? CodexAppServerClient.ClientError {
+        case .processNotRunning?, .transportWriteFailed?, .transportReadSetupFailed?, .inboundFrameTooLarge?:
+            true
+        default:
+            false
+        }
+    }
+
+    /// The part of a lowercased error message that states what was rejected: everything before
+    /// the first standalone `expected`, after which serde-style errors list accepted names.
+    private static func rejectionClause(of message: String) -> String {
+        let lowered = message.lowercased()
+        guard let expected = lowered.range(of: #"\bexpected\b"#, options: .regularExpression) else {
+            return lowered
+        }
+        return String(lowered[..<expected.lowerBound])
+    }
+
+    private static func matches(_ text: String, pattern: String) -> Bool {
+        text.range(of: pattern, options: .regularExpression) != nil
+    }
+
+    /// True only for a structured failure whose rejection clause rejects `excludeTurns` itself as an
+    /// unknown, unsupported, unrecognized or unexpected field. A bare `-32602`, another field's
+    /// rejection (even one listing `excludeTurns` among the expected fields), a timeout, an auth
+    /// error or a frame-limit error never qualifies.
+    static func isExcludeTurnsRejection(_ error: Error) -> Bool {
+        guard let failure = structuredRequestFailure(error) else { return false }
+        let clause = rejectionClause(of: failure.message)
+        let field = #"(?:excludeturns|exclude_turns)(?![a-z0-9_])"#
+        let rejectedField = #"(?:unknown|unsupported|unrecognized|unrecognised|unexpected)\s+(?:field|parameter|param|key|property|argument|option)s?[^a-z0-9_]{0,4}"#
+            + field
+        let fieldRejected = #"(?<![a-z0-9_])"# + field
+            + #"[^a-z0-9_]{0,4}(?:is\s+)?(?:not\s+supported|unsupported|unknown|not\s+recognized|unrecognized|not\s+allowed)"#
+        return matches(clause, pattern: rejectedField) || matches(clause, pattern: fieldRejected)
+    }
+
+    /// `-32601`, or a rejection clause naming the `thread/turns/list` method itself as unknown,
+    /// unsupported or not found. A field or value rejection on that method (including `itemsView`)
+    /// and a method merely listed among the expected ones never qualify.
+    static func isTurnsListUnsupportedError(_ error: Error) -> Bool {
+        guard let failure = structuredRequestFailure(error) else { return false }
+        if isTurnsListItemsViewRejection(error) { return false }
+        if failure.code == -32601 { return true }
+        let clause = rejectionClause(of: failure.message)
+        let method = #"thread/turns/list(?![a-z0-9_/])"#
+        let rejectedMethod = #"(?:unknown|unsupported|unrecognized|unrecognised|no\s+such)(?:\s+(?:method|variant|request|rpc))?[^a-z0-9_/]{0,4}"#
+            + method
+        let methodNotFound = #"method\s+not\s+found[^a-z0-9_/]{0,4}"# + method
+        let methodRejected = method
+            + #"[^a-z0-9_]{0,4}(?:is\s+)?(?:not\s+found|not\s+supported|unsupported|unknown|not\s+implemented|not\s+recognized|unrecognized)"#
+            + #"(?!\s+(?:field|variant|parameter|param|value|key|property|argument|option)s?\b)"#
+        return matches(clause, pattern: rejectedMethod)
+            || matches(clause, pattern: methodNotFound)
+            || matches(clause, pattern: methodRejected)
+    }
+
+    /// A structured failure whose rejection clause rejects the `itemsView` field, or rejects its
+    /// `notLoaded` value (as a variant or a quoted value). Prose such as "thread is notLoaded"
+    /// never qualifies.
+    static func isTurnsListItemsViewRejection(_ error: Error) -> Bool {
+        guard let failure = structuredRequestFailure(error) else { return false }
+        let clause = rejectionClause(of: failure.message)
+        guard matches(
+            clause,
+            pattern: #"\b(?:unknown|unsupported|not\s+supported|unrecognized|unrecognised|unexpected|invalid)\b"#
+        ) else { return false }
+        return matches(clause, pattern: #"(?<![a-z0-9_])(?:itemsview|items_view)(?![a-z0-9_])"#)
+            || matches(clause, pattern: #"(?:variant[^a-z0-9_]{0,4}|[`'"])(?:notloaded|not_loaded)(?![a-z0-9_])"#)
     }
 
     private func disableThreadMemoryMode(threadID rawThreadID: String) async throws {
@@ -1235,11 +1602,15 @@ final class CodexNativeSessionController {
     }
 
     private func sendThreadMemoryModeDisableRequest(threadID: String) async throws {
-        try await Self.sendThreadMemoryModeDisableRequest(
-            client: client,
-            threadID: threadID,
-            timeout: optionalMemoryModeRequestTimeout,
-            useDefaultTimeout: true
+        // Same request and timeout as the static path (`client.request` defaults to
+        // `useDefaultTimeout: true`), routed through the injectable request boundary.
+        _ = try await performRequest(
+            method: "thread/memoryMode/set",
+            params: [
+                "threadId": threadID,
+                "mode": "disabled"
+            ],
+            timeout: optionalMemoryModeRequestTimeout
         )
     }
 
@@ -1278,15 +1649,42 @@ final class CodexNativeSessionController {
         else {
             throw CodexAppServerClient.ClientError.invalidResponse
         }
-        let result = try await performRequest(
-            method: "thread/read",
-            params: [
-                "threadId": threadID,
-                "includeTurns": includeTurns
-            ],
-            timeout: timeout
+        let transportGeneration = await client.currentTransportGeneration()
+        // Metadata first: an idle thread (the common case) needs no turn data at all.
+        let metadataSnapshot = try await Self.parseThreadSnapshot(
+            from: performRequest(
+                method: "thread/read",
+                params: [
+                    "threadId": threadID,
+                    "includeTurns": false
+                ],
+                timeout: timeout
+            ),
+            fallbackEffort: nil
         )
-        return Self.parseThreadSnapshot(from: result, fallbackEffort: nil)
+        guard includeTurns, metadataSnapshot.runtimeStatus != .idle else {
+            return metadataSnapshot
+        }
+        switch try await listNewestTurn(
+            threadID: threadID,
+            timeout: timeout,
+            transportGeneration: transportGeneration
+        ) {
+        case let .listed(newestTurn):
+            return Self.mergedSnapshot(metadataSnapshot, newestListedTurn: newestTurn)
+        case .unsupported:
+            // Legacy app-server without `thread/turns/list`: full read, bounded by the
+            // transport's inbound frame ceiling.
+            let result = try await performRequest(
+                method: "thread/read",
+                params: [
+                    "threadId": threadID,
+                    "includeTurns": true
+                ],
+                timeout: timeout
+            )
+            return Self.parseThreadSnapshot(from: result, fallbackEffort: nil)
+        }
     }
 
     func setThreadName(_ name: String, threadID explicitThreadID: String?) async throws {
@@ -1611,12 +2009,29 @@ final class CodexNativeSessionController {
             return .failed
         }
         let timeout = min(options.requestTimeout ?? 5, 5)
+        guard let revisionBeforeRead = try? await eventHandlingMutex.withLock({ self.routingRevision }) else {
+            return .failed
+        }
         do {
             let snapshot = try await readThreadSnapshot(includeTurns: true, timeout: timeout)
-            reconcileActiveTurnRoutingState(from: snapshot)
-            return .refreshed(snapshot.currentTurnID)
+            return try await eventHandlingMutex.withLock { () -> InterruptActiveTurnRefreshResult in
+                // A lifecycle notification or another snapshot rewrote routing while this read
+                // was in flight; the live routing is newer than the snapshot, so keep it.
+                guard self.routingRevision == revisionBeforeRead else {
+                    return .refreshed(self.routingCurrentTurnID)
+                }
+                self.reconcileActiveTurnRoutingState(from: snapshot)
+                return .refreshed(snapshot.currentTurnID)
+            }
         } catch {
             Self.logCodexDebug("[CodexNativeController] interrupt active-turn refresh failed: \(error.localizedDescription)")
+            // Never report `.failed` for a superseded read: that would revive the cached turn ID
+            // through `resolvedInterruptTurnID` even though live routing has already moved on.
+            if let live = try? await eventHandlingMutex.withLock({
+                (revision: self.routingRevision, currentTurnID: self.routingCurrentTurnID)
+            }), live.revision != revisionBeforeRead {
+                return .refreshed(live.currentTurnID)
+            }
             return .failed
         }
     }
@@ -1628,6 +2043,8 @@ final class CodexNativeSessionController {
         activeTurnIDs = Set(snapshot.activeTurnIDs)
         activeTurnOrder = snapshot.activeTurnIDs
         activeTurnIDsWithObservedActivity = Set(snapshot.activeTurnIDs)
+        lastKnownRuntimeStatus = snapshot.runtimeStatus
+        routingRevision &+= 1
     }
 
     static func activeTurnMismatchActualTurnID(fromErrorDescription description: String) -> String? {
@@ -1828,6 +2245,8 @@ final class CodexNativeSessionController {
         activeTurnIDs = Set(snapshot.activeTurnIDs)
         activeTurnOrder = snapshot.activeTurnIDs
         activeTurnIDsWithObservedActivity = Set(snapshot.activeTurnIDs)
+        lastKnownRuntimeStatus = snapshot.runtimeStatus
+        routingRevision &+= 1
         assistantEmittedTextByTurnID.removeAll(keepingCapacity: true)
         completedCanonicalItemScopes.removeAll(keepingCapacity: true)
         completedCanonicalItemScopeOrder.removeAll(keepingCapacity: true)
@@ -1844,8 +2263,7 @@ final class CodexNativeSessionController {
         commandExecutionMirrorStateByItemID.removeAll(keepingCapacity: true)
     }
 
-    private func applyThreadResponse(_ result: [String: Any], fallbackEffort: String?) -> SessionRef {
-        let snapshot = Self.parseThreadSnapshot(from: result, fallbackEffort: fallbackEffort)
+    private func applyThreadSnapshot(_ snapshot: ThreadSnapshot) -> SessionRef {
         restoreThreadSnapshot(snapshot)
         #if DEBUG
             ensureRawEventLogFileReadyIfNeeded()
@@ -1855,11 +2273,28 @@ final class CodexNativeSessionController {
                 "conversationID": snapshot.conversationID,
                 "rolloutPath": snapshot.rolloutPath ?? NSNull(),
                 "activeTurnIDs": snapshot.activeTurnIDs,
-                "currentTurnID": snapshot.currentTurnID ?? NSNull()
+                "currentTurnID": snapshot.currentTurnID ?? NSNull(),
+                "runtimeStatus": Self.runtimeStatusLabel(snapshot.runtimeStatus),
+                "activeFlags": snapshot.activeFlags
             ] as [String: Any])
         #endif
         return snapshot.sessionRef
     }
+
+    #if DEBUG
+        private static func runtimeStatusLabel(_ status: ThreadSnapshot.RuntimeStatus) -> String {
+            switch status {
+            case .notLoaded:
+                "notLoaded"
+            case .idle:
+                "idle"
+            case .systemError:
+                "systemError"
+            case .active:
+                "active"
+            }
+        }
+    #endif
 
     private static func parseThreadSnapshot(
         from result: [String: Any],
@@ -2413,6 +2848,7 @@ final class CodexNativeSessionController {
         switch notification.method {
         case "turn/started", "codex/event/turn_started":
             emittedToolEventDedupKeys.removeAll(keepingCapacity: true)
+            routingRevision &+= 1
             let turnID: String?
             if let turn = params["turn"] as? [String: Any] {
                 turnID = (turn["id"] as? String) ?? (turn["turn_id"] as? String)
@@ -2438,6 +2874,7 @@ final class CodexNativeSessionController {
             await emit(.turnStarted(turnID: turnID))
         case "turn/completed", "codex/event/turn_completed":
             emittedToolEventDedupKeys.removeAll(keepingCapacity: true)
+            routingRevision &+= 1
             let turnPayload = params["turn"] as? [String: Any]
             let status = mapTurnStatus((turnPayload?["status"] as? String) ?? "completed")
             let parsedTurnID =
@@ -2878,6 +3315,12 @@ final class CodexNativeSessionController {
                 await emit(.errorNotification(errorNotification))
             }
         default:
+            if notification.method == "thread/status/changed",
+               let rawStatus = params["status"]
+            {
+                // Thread-mismatched notifications were already dropped by the routing filter.
+                lastKnownRuntimeStatus = Self.parseThreadRuntimeStatus(from: rawStatus)
+            }
             if let activity = Self.parseLivenessActivity(method: notification.method, params: params) {
                 await emit(.livenessActivity(activity))
             }
@@ -3410,6 +3853,22 @@ final class CodexNativeSessionController {
             routingCurrentTurnID
         }
 
+        var test_activeTurnIDs: Set<String> {
+            activeTurnIDs
+        }
+
+        var test_excludeTurnsSupport: ExcludeTurnsSupport {
+            appServerCapabilities.excludeTurns
+        }
+
+        var test_turnsListSupport: TurnsListSupport {
+            appServerCapabilities.turnsList
+        }
+
+        func test_refreshActiveTurnForInterruptIfPossible() async -> InterruptActiveTurnRefreshResult {
+            await refreshActiveTurnForInterruptIfPossible()
+        }
+
         static func test_shouldDropNotificationForRouting(
             method: String,
             params: [String: Any],
@@ -3591,9 +4050,10 @@ final class CodexNativeSessionController {
         }
 
         func test_finishBinding(result: [String: Any], fallbackEffort: String?) async -> SessionRef {
+            let snapshot = Self.parseThreadSnapshot(from: result, fallbackEffort: fallbackEffort)
             guard let sessionRef = try? await eventHandlingMutex.withLock({
                 try ensureBindingCanComplete()
-                let sessionRef = applyThreadResponse(result, fallbackEffort: fallbackEffort)
+                let sessionRef = applyThreadSnapshot(snapshot)
                 await finishBindingAndDrainBufferedInbound()
                 return sessionRef
             }) else {
@@ -8257,6 +8717,8 @@ enum CodexSessionControllerError: LocalizedError {
     case emptyUserTurn
     case invalidResumeReferenceMissingThreadID
     case invalidLifecycleState(String)
+    /// `thread/resume` succeeded but the app-server reports the thread in `systemError`.
+    case threadInSystemErrorState(threadID: String)
 
     var errorDescription: String? {
         switch self {
@@ -8268,11 +8730,17 @@ enum CodexSessionControllerError: LocalizedError {
             "Cannot resume this Codex thread because its saved thread ID is missing. Start a new Codex thread instead."
         case let .invalidLifecycleState(description):
             "This Codex session controller cannot be started because it is \(description). Create a new controller instance."
+        case let .threadInSystemErrorState(threadID):
+            "Codex reports thread \(threadID) is in a system-error state."
         }
     }
 }
 
 extension CodexSessionControlling {
+    var lastKnownRuntimeStatus: CodexNativeSessionController.ThreadSnapshot.RuntimeStatus? {
+        nil
+    }
+
     func acknowledgePendingTurnFailure(
         turnID _: String?,
         failure _: CodexNativeSessionController.TurnFailure

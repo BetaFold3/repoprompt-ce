@@ -437,6 +437,9 @@ extension AgentModeViewModel {
 
         enum CodexFallbackReason: Equatable {
             case activeWithoutAuthoritativeIdentity
+            /// A cold send found the just-resumed thread already active without a turn this
+            /// coordinator saw start; the idle pump releases it once a read reports `.idle`.
+            case resumedThreadActive
             case staleAuthoritativeIdentity
             case nonSteerableTurn(kind: CodexTurnKind)
             case noActiveTurn(failure: CodexAppServerClient.RequestFailure)

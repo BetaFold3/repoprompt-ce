@@ -267,14 +267,18 @@ final class CodexNativeSessionControllerTurnDispatchTests: XCTestCase {
     }
 
     func testCancellationReconciliationInterruptsUniqueSnapshotTurnWithoutPromotingIt() async throws {
+        // Bounded reader contract: metadata-only `thread/read`, then the newest turn from
+        // `thread/turns/list`; full turn history is never requested.
         let recorder = TurnRequestRecorder(resultsByMethod: [
             "thread/read": [
                 "thread": [
                     "id": "thread-1",
-                    "status": ["type": "active"],
-                    "turns": [
-                        ["id": "turn-snapshot", "status": "inProgress"]
-                    ]
+                    "status": ["type": "active"]
+                ]
+            ],
+            "thread/turns/list": [
+                "data": [
+                    ["id": "turn-snapshot", "status": "inProgress", "items": []]
                 ]
             ],
             "turn/interrupt": [:]
@@ -286,8 +290,14 @@ final class CodexNativeSessionControllerTurnDispatchTests: XCTestCase {
 
         XCTAssertEqual(receipt.interruptedTurnID, "turn-snapshot")
         XCTAssertNil(controller.test_authoritativeLifecycleTurnID)
-        XCTAssertEqual(recorder.requests().map(\.method), ["thread/read", "turn/interrupt"])
-        XCTAssertEqual(recorder.requests().last?.params["turnId"] as? String, "turn-snapshot")
+        let requests = recorder.requests()
+        XCTAssertEqual(requests.map(\.method), ["thread/read", "thread/turns/list", "turn/interrupt"])
+        guard requests.count == 3 else { return }
+        XCTAssertEqual(requests.first?.params["includeTurns"] as? Bool, false)
+        XCTAssertEqual(requests[1].params["limit"] as? Int, 1)
+        XCTAssertEqual(requests[1].params["sortDirection"] as? String, "desc")
+        XCTAssertEqual(requests[1].params["itemsView"] as? String, "notLoaded")
+        XCTAssertEqual(requests.last?.params["turnId"] as? String, "turn-snapshot")
     }
 
     func testJSONRPCFailureParserPreservesMethodCodeMessageAndData() {

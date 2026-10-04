@@ -392,6 +392,7 @@ allowed_tracked_docs=(
   "docs/context/plans/completed/2026-09-21-agent-scheduled-messages-plan.md"
   "docs/context/plans/2026-09-21-oracle-resumable-wait-plan.md"
   "docs/context/plans/2026-10-02-oracle-errors-and-delegated-ask-user-plan.md"
+  "docs/context/plans/2026-10-03-codex-cold-resume-reliability-plan.md"
   "docs/context/plans/2026-10-03-oracle-shim-auth-and-knowledge-workers-plan.md"
   "docs/context/plans/2026-10-03-oracle-failure-inspection-plan.md"
   "docs/context/oracle-failure-inspection.md"

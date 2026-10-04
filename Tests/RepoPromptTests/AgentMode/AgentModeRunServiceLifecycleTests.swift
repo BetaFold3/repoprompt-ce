@@ -2710,6 +2710,482 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         await harness.service.cancelRun(tabID: session.tabID, session: session)
     }
 
+    func testCodexResumeInboundFrameLimitFailureInvalidatesControllerAndKeepsSavedThread() async throws {
+        struct Row {
+            let name: String
+            let resumeError: Error
+            let invalidatesController: Bool
+        }
+        let rows = [
+            Row(
+                name: "inbound-frame-limit",
+                resumeError: CodexAppServerClient.ClientError.inboundFrameTooLarge(
+                    observedBytes: 33_554_433,
+                    limitBytes: 33_554_432
+                ),
+                invalidatesController: true
+            ),
+            // Contrast: an ordinary resume failure only marks reconnect and keeps the controller.
+            Row(
+                name: "generic-resume-failure",
+                resumeError: LifecycleTestError.expectedCodexStartFailure,
+                invalidatesController: false
+            )
+        ]
+
+        for row in rows {
+            let recorder = LifecycleRecorder()
+            let controller = LifecycleNoopCodexController(
+                recorder: recorder,
+                resumeErrorsBeforeSuccess: [row.resumeError]
+            )
+            let harness = makeHarness(recorder: recorder, codexController: controller)
+            let session = AgentModeViewModel.TabSession(tabID: UUID())
+            session.selectedAgent = .codexExec
+            session.codexConversationID = "saved-thread"
+            session.codexRolloutPath = "/tmp/saved-thread.jsonl"
+
+            let failedOutcome = await harness.service.startRun(
+                tabID: session.tabID,
+                session: session,
+                initialUserMessage: "resume",
+                initialMessageForRun: "resume",
+                attachments: []
+            )
+
+            guard case .failed? = failedOutcome else {
+                XCTFail("\(row.name): expected the failed resume to fail the run, got \(String(describing: failedOutcome))")
+                continue
+            }
+            XCTAssertEqual(controller.startReferences.count, 1, row.name)
+            XCTAssertEqual(controller.startReferences[0]?.conversationID, "saved-thread", row.name)
+            XCTAssertEqual(session.codexConversationID, "saved-thread", row.name)
+            XCTAssertEqual(session.codexRolloutPath, "/tmp/saved-thread.jsonl", row.name)
+            XCTAssertTrue(session.codexNeedsReconnect, row.name)
+            XCTAssertEqual(session.codexResumeTimeoutState.consecutiveTimeouts, 0, row.name)
+            XCTAssertTrue(session.items.contains {
+                $0.kind == .error
+                    && $0.text.hasPrefix("Codex native resume failed:")
+                    && $0.text.contains(row.resumeError.localizedDescription)
+            }, row.name)
+            XCTAssertFalse(session.items.contains { $0.text.contains("Started a fresh thread") }, row.name)
+            if row.invalidatesController {
+                XCTAssertNil(session.codexController, row.name)
+                try await waitUntil("\(row.name): invalidated controller should shut down") {
+                    recorder.contains("codex:shutdown")
+                }
+            } else {
+                XCTAssertNotNil(session.codexController, row.name)
+                XCTAssertFalse(recorder.contains("codex:shutdown"), row.name)
+            }
+
+            let retryOutcome = await harness.service.startRun(
+                tabID: session.tabID,
+                session: session,
+                initialUserMessage: "retry",
+                initialMessageForRun: "retry",
+                attachments: []
+            )
+
+            XCTAssertEqual(retryOutcome, .sent, row.name)
+            XCTAssertEqual(controller.startReferences.count, 2, row.name)
+            XCTAssertEqual(controller.startReferences[1]?.conversationID, "saved-thread", row.name)
+            XCTAssertEqual(session.codexConversationID, "saved-thread", row.name)
+            await harness.service.cancelRun(tabID: session.tabID, session: session)
+        }
+    }
+
+    func testCodexColdResumeOfActiveThreadQueuesFirstSendUntilThreadIsIdle() async throws {
+        let recorder = LifecycleRecorder()
+        let controller = LifecycleNoopCodexController(
+            recorder: recorder,
+            resumedRuntimeStatus: .active(activeFlags: [])
+        )
+        controller.snapshotRuntimeStatus = .active(activeFlags: [])
+        let harness = makeHarness(recorder: recorder, codexController: controller)
+        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        session.selectedAgent = .codexExec
+        session.codexConversationID = "saved-thread"
+        session.codexRolloutPath = "/tmp/saved-thread.jsonl"
+
+        let outcome = await harness.service.startRun(
+            tabID: session.tabID,
+            session: session,
+            initialUserMessage: "resume",
+            initialMessageForRun: "resume",
+            attachments: []
+        )
+
+        guard case let .queuedFallback(_, reason)? = outcome else {
+            return XCTFail("Expected the cold-resume send to queue behind the active thread, got \(String(describing: outcome))")
+        }
+        XCTAssertEqual(reason, .resumedThreadActive)
+        XCTAssertEqual(controller.startReferences.count, 1)
+        XCTAssertEqual(controller.startReferences.first??.conversationID, "saved-thread")
+        XCTAssertTrue(controller.sentTexts.isEmpty, "No turn/start may race the resumed thread's running turn.")
+        XCTAssertEqual(session.codexFallbackQueue.count, 1)
+        XCTAssertNil(session.codexAuthoritativeActiveTurn, "The resume must not fabricate an authoritative turn.")
+        XCTAssertEqual(session.codexAnonymousActiveTurn?.turnKind, .unknown)
+        XCTAssertEqual(session.codexAnonymousActiveTurn?.threadID, "saved-thread")
+        XCTAssertTrue(session.runState.isActive)
+
+        try await waitUntil("idle pump should poll the resumed thread") {
+            controller.snapshotReadCount >= 1
+        }
+        XCTAssertTrue(controller.sentTexts.isEmpty, "The queued send must wait while the thread reports active.")
+
+        controller.snapshotRuntimeStatus = .idle
+        try await waitUntilAsync("idle pump should release the queued send once the thread is idle") {
+            controller.sentTexts == ["resume"]
+        }
+        XCTAssertNil(session.codexAnonymousActiveTurn)
+        XCTAssertTrue(session.codexFallbackQueue.isEmpty)
+        await harness.service.cancelRun(tabID: session.tabID, session: session)
+    }
+
+    func testCodexColdResumeQueuedSendWaitsForReplayedTurnCompletion() async throws {
+        let recorder = LifecycleRecorder()
+        let controller = LifecycleNoopCodexController(
+            recorder: recorder,
+            resumedRuntimeStatus: .active(activeFlags: [])
+        )
+        // The thread keeps reporting active, so only the replayed turn's completion can release.
+        controller.snapshotRuntimeStatus = .active(activeFlags: [])
+        let harness = makeHarness(recorder: recorder, codexController: controller)
+        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        session.selectedAgent = .codexExec
+        session.codexConversationID = "saved-thread"
+
+        let outcome = await harness.service.startRun(
+            tabID: session.tabID,
+            session: session,
+            initialUserMessage: "resume",
+            initialMessageForRun: "resume",
+            attachments: []
+        )
+        guard case .queuedFallback(_, .resumedThreadActive)? = outcome else {
+            return XCTFail("Expected the cold-resume send to queue behind the active thread, got \(String(describing: outcome))")
+        }
+
+        // The binding window replays the resumed turn's `turn/started` after the send queued.
+        await harness.host.test_codexCoordinator.test_handleCodexNativeEvent(
+            .turnStarted(turnID: "turn-resumed"),
+            session: session
+        )
+        XCTAssertEqual(session.codexAuthoritativeActiveTurn?.turnID, "turn-resumed")
+        XCTAssertNil(session.codexAnonymousActiveTurn)
+        XCTAssertEqual(session.codexFallbackQueue.first?.blockingTurn?.turnID, "turn-resumed")
+        XCTAssertTrue(controller.sentTexts.isEmpty, "No new turn may be dispatched while the replayed turn is active.")
+
+        await harness.host.test_codexCoordinator.test_handleCodexNativeEvent(
+            .turnCompleted(turnID: "turn-resumed", status: .completed),
+            session: session
+        )
+        try await waitUntilAsync("completion of the replayed turn should release the queued send") {
+            controller.sentTexts == ["resume"]
+        }
+        XCTAssertTrue(session.codexFallbackQueue.isEmpty)
+        XCTAssertNil(session.codexAnonymousActiveTurn)
+        await harness.service.cancelRun(tabID: session.tabID, session: session)
+    }
+
+    func testCodexColdResumeIdleReadAfterReplayedStartWaitsForCorrelatedCompletion() async throws {
+        let recorder = LifecycleRecorder()
+        let controller = LifecycleNoopCodexController(
+            recorder: recorder,
+            resumedRuntimeStatus: .active(activeFlags: [])
+        )
+        controller.snapshotRuntimeStatus = .active(activeFlags: [])
+        let snapshotGate = LifecyclePublicationGate()
+        controller.snapshotGate = snapshotGate
+        let harness = makeHarness(recorder: recorder, codexController: controller)
+        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        session.selectedAgent = .codexExec
+        session.codexConversationID = "saved-thread"
+
+        let outcome = await harness.service.startRun(
+            tabID: session.tabID,
+            session: session,
+            initialUserMessage: "resume",
+            initialMessageForRun: "resume",
+            attachments: []
+        )
+        guard case .queuedFallback(_, .resumedThreadActive)? = outcome else {
+            return XCTFail("Expected the cold-resume send to queue behind the active thread, got \(String(describing: outcome))")
+        }
+        let resumedAttemptID = session.activeRunAttemptID
+        try await waitUntil("idle pump read should be in flight") {
+            controller.snapshotReadCount == 1
+        }
+
+        // The replayed start binds the queued send while the pump's read is still outstanding.
+        await harness.host.test_codexCoordinator.test_handleCodexNativeEvent(
+            .turnStarted(turnID: "turn-resumed"),
+            session: session
+        )
+        XCTAssertEqual(session.codexFallbackQueue.first?.blockingTurn?.turnID, "turn-resumed")
+
+        // That read then reports idle before the coordinator consumes the turn's completion.
+        controller.snapshotRuntimeStatus = .idle
+        await snapshotGate.release()
+        try await waitUntil("idle pump should stop once the head is bound to the identified turn") {
+            session.codexFallbackPumpTask == nil
+        }
+        XCTAssertTrue(controller.sentTexts.isEmpty, "An idle read must not dispatch around the identified turn's completion.")
+        XCTAssertEqual(controller.snapshotReadCount, 1)
+        XCTAssertEqual(session.codexAuthoritativeActiveTurn?.turnID, "turn-resumed")
+        XCTAssertEqual(session.codexFallbackQueue.first?.state, .queued)
+
+        await harness.host.test_codexCoordinator.test_handleCodexNativeEvent(
+            .turnCompleted(turnID: "turn-resumed", status: .completed),
+            session: session
+        )
+        try await waitUntilAsync("the correlated completion should release the queued send") {
+            controller.sentTexts == ["resume"]
+        }
+        XCTAssertTrue(session.codexFallbackQueue.isEmpty)
+        XCTAssertNotNil(session.activeRunAttemptID)
+        XCTAssertNotEqual(
+            session.activeRunAttemptID,
+            resumedAttemptID,
+            "The queued send starts as the published successor attempt, after the resumed turn's terminal commit."
+        )
+        await harness.service.cancelRun(tabID: session.tabID, session: session)
+    }
+
+    func testCodexColdResumeQueuedSendsDrainInOrderThroughReplayedTurnAndSuccessor() async throws {
+        let recorder = LifecycleRecorder()
+        let controller = LifecycleNoopCodexController(
+            recorder: recorder,
+            resumedRuntimeStatus: .active(activeFlags: [])
+        )
+        // The thread keeps reporting active, so only lifecycle completions can release the queue.
+        controller.snapshotRuntimeStatus = .active(activeFlags: [])
+        let harness = makeHarness(recorder: recorder, codexController: controller)
+        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        session.selectedAgent = .codexExec
+        session.codexConversationID = "saved-thread"
+
+        let first = await harness.service.startRun(
+            tabID: session.tabID,
+            session: session,
+            initialUserMessage: "first",
+            initialMessageForRun: "first",
+            attachments: []
+        )
+        guard case .queuedFallback(_, .resumedThreadActive)? = first else {
+            return XCTFail("Expected the cold-resume send to queue behind the active thread, got \(String(describing: first))")
+        }
+
+        // A second message submitted during the now-active run joins the same resumed-thread wait.
+        let second = await harness.host.test_codexCoordinator.sendCodexNativeMessage(
+            session: session,
+            text: "second",
+            attachments: []
+        )
+        guard case .queuedFallback(_, .resumedThreadActive) = second else {
+            return XCTFail("Expected the follow-up to join the resumed-thread wait, got \(second)")
+        }
+        XCTAssertEqual(session.codexFallbackQueue.map(\.providerText), ["first", "second"])
+        XCTAssertTrue(session.codexFallbackQueue.allSatisfy { $0.blockingTurn == nil })
+
+        await harness.host.test_codexCoordinator.test_handleCodexNativeEvent(
+            .turnStarted(turnID: "turn-resumed"),
+            session: session
+        )
+        XCTAssertEqual(
+            session.codexFallbackQueue.map(\.blockingTurn?.turnID),
+            ["turn-resumed", "turn-resumed"],
+            "Every send admitted behind the marker binds to the identified resumed turn."
+        )
+
+        await harness.host.test_codexCoordinator.test_handleCodexNativeEvent(
+            .turnCompleted(turnID: "turn-resumed", status: .completed),
+            session: session
+        )
+        try await waitUntilAsync("the resumed turn's completion should release only the first send") {
+            controller.sentTexts == ["first"]
+        }
+        XCTAssertEqual(session.codexFallbackQueue.map(\.providerText), ["second"])
+        try await waitUntil("the first send's dispatch should await its lifecycle start") {
+            session.codexFallbackDispatchInFlight?.state == .awaitingLifecycleStart
+        }
+
+        await harness.host.test_codexCoordinator.test_handleCodexNativeEvent(
+            .turnStarted(turnID: "turn-first"),
+            session: session
+        )
+        XCTAssertEqual(session.codexFallbackQueue.first?.blockingTurn?.turnID, "turn-first")
+        XCTAssertEqual(controller.sentTexts, ["first"], "The second send waits for the first send's turn.")
+
+        await harness.host.test_codexCoordinator.test_handleCodexNativeEvent(
+            .turnCompleted(turnID: "turn-first", status: .completed),
+            session: session
+        )
+        try await waitUntilAsync("the first send's completion should release the second send") {
+            controller.sentTexts == ["first", "second"]
+        }
+        XCTAssertTrue(session.codexFallbackQueue.isEmpty)
+        await harness.service.cancelRun(tabID: session.tabID, session: session)
+    }
+
+    func testCodexPrewarmedActiveThreadQueuesFirstColdSendUntilIdle() async throws {
+        let recorder = LifecycleRecorder()
+        let controller = LifecycleNoopCodexController(
+            recorder: recorder,
+            resumedRuntimeStatus: .active(activeFlags: [])
+        )
+        controller.snapshotRuntimeStatus = .active(activeFlags: [])
+        let harness = makeHarness(recorder: recorder, codexController: controller)
+        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        session.selectedAgent = .codexExec
+        session.codexConversationID = "saved-thread"
+
+        // Resume outside any run (as a slash command or an idle reconnect does): the thread reports
+        // active, but there is no run lineage yet to anchor the busy marker.
+        await harness.host.test_codexCoordinator.ensureCodexNativeSession(session: session)
+        XCTAssertEqual(controller.startReferences.count, 1)
+        XCTAssertTrue(controller.hasActiveThread)
+        XCTAssertFalse(session.runState.isActive)
+        XCTAssertNil(session.codexAnonymousActiveTurn)
+
+        let outcome = await harness.service.startRun(
+            tabID: session.tabID,
+            session: session,
+            initialUserMessage: "resume",
+            initialMessageForRun: "resume",
+            attachments: []
+        )
+
+        guard case .queuedFallback(_, .resumedThreadActive)? = outcome else {
+            return XCTFail("Expected the first cold send to queue behind the prewarmed active thread, got \(String(describing: outcome))")
+        }
+        XCTAssertEqual(controller.startReferences.count, 1, "The ready controller is reused without another resume.")
+        XCTAssertTrue(controller.sentTexts.isEmpty, "No turn/start may race the resumed thread's running turn.")
+        XCTAssertEqual(session.codexAnonymousActiveTurn?.threadID, "saved-thread")
+        XCTAssertEqual(session.codexAnonymousActiveTurn?.runAttemptID, session.activeRunAttemptID)
+
+        try await waitUntil("idle pump should poll the resumed thread") {
+            controller.snapshotReadCount >= 1
+        }
+        XCTAssertTrue(controller.sentTexts.isEmpty, "The queued send must wait while the thread reports active.")
+
+        controller.snapshotRuntimeStatus = .idle
+        try await waitUntilAsync("idle pump should release the queued send once the thread is idle") {
+            controller.sentTexts == ["resume"]
+        }
+        XCTAssertTrue(session.codexFallbackQueue.isEmpty)
+        await harness.service.cancelRun(tabID: session.tabID, session: session)
+    }
+
+    func testCodexColdResumeReplacesStaleAuthoritativeIdentityWithResumedThreadMarker() async throws {
+        let recorder = LifecycleRecorder()
+        let controller = LifecycleNoopCodexController(
+            recorder: recorder,
+            resumedRuntimeStatus: .active(activeFlags: [])
+        )
+        controller.snapshotRuntimeStatus = .active(activeFlags: [])
+        let harness = makeHarness(recorder: recorder, codexController: controller)
+        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        session.selectedAgent = .codexExec
+        session.codexConversationID = "saved-thread"
+        let staleIdentity = AgentModeViewModel.TabSession.CodexAuthoritativeTurnIdentity(
+            threadID: "saved-thread",
+            turnID: "turn-stale",
+            turnKind: .user,
+            controllerInstanceID: ObjectIdentifier(controller),
+            controllerGeneration: UUID(),
+            runID: UUID(),
+            runAttemptID: UUID()
+        )
+        // An identity from another controller generation and run survives into this send's resume.
+        controller.onThreadEstablished = { [weak session] in
+            session?.codexAuthoritativeActiveTurn = staleIdentity
+        }
+
+        let outcome = await harness.service.startRun(
+            tabID: session.tabID,
+            session: session,
+            initialUserMessage: "resume",
+            initialMessageForRun: "resume",
+            attachments: []
+        )
+
+        guard case .queuedFallback(_, .resumedThreadActive)? = outcome else {
+            return XCTFail("Expected a stale identity not to hide the resumed active thread, got \(String(describing: outcome))")
+        }
+        XCTAssertTrue(controller.sentTexts.isEmpty, "No turn/start may race the resumed thread's running turn.")
+        XCTAssertNil(session.codexAuthoritativeActiveTurn, "The provably stale identity is dropped.")
+        XCTAssertEqual(session.codexAnonymousActiveTurn?.runAttemptID, session.activeRunAttemptID)
+        XCTAssertNil(session.codexFallbackQueue.first?.blockingTurn, "The queued send must not wait on the stale turn.")
+
+        await harness.host.test_codexCoordinator.test_handleCodexNativeEvent(
+            .turnStarted(turnID: "turn-resumed"),
+            session: session
+        )
+        XCTAssertEqual(session.codexAuthoritativeActiveTurn?.turnID, "turn-resumed")
+        XCTAssertEqual(session.codexFallbackQueue.first?.blockingTurn?.turnID, "turn-resumed")
+
+        await harness.host.test_codexCoordinator.test_handleCodexNativeEvent(
+            .turnCompleted(turnID: "turn-resumed", status: .completed),
+            session: session
+        )
+        try await waitUntilAsync("the resumed turn's completion should release the queued send") {
+            controller.sentTexts == ["resume"]
+        }
+        XCTAssertTrue(session.codexFallbackQueue.isEmpty)
+        await harness.service.cancelRun(tabID: session.tabID, session: session)
+    }
+
+    func testCodexResumeSystemErrorKeepsSavedThreadAndRetriesSameThread() async {
+        let recorder = LifecycleRecorder()
+        let controller = LifecycleNoopCodexController(
+            recorder: recorder,
+            resumeErrorsBeforeSuccess: [
+                CodexSessionControllerError.threadInSystemErrorState(threadID: "saved-thread")
+            ]
+        )
+        let harness = makeHarness(recorder: recorder, codexController: controller)
+        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        session.selectedAgent = .codexExec
+        session.codexConversationID = "saved-thread"
+        session.codexRolloutPath = "/tmp/saved-thread.jsonl"
+
+        let failedOutcome = await harness.service.startRun(
+            tabID: session.tabID,
+            session: session,
+            initialUserMessage: "resume",
+            initialMessageForRun: "resume",
+            attachments: []
+        )
+
+        guard case .failed? = failedOutcome else {
+            return XCTFail("Expected the system-error resume to fail the run, got \(String(describing: failedOutcome))")
+        }
+        XCTAssertEqual(controller.startReferences.count, 1, "A system-error thread must not fall back to a fresh thread.")
+        XCTAssertEqual(session.codexConversationID, "saved-thread")
+        XCTAssertEqual(session.codexRolloutPath, "/tmp/saved-thread.jsonl")
+        XCTAssertTrue(session.codexNeedsReconnect)
+        XCTAssertTrue(session.items.contains {
+            $0.kind == .error
+                && $0.text.hasPrefix("Codex native resume failed:")
+                && $0.text.contains("system-error state")
+        })
+        XCTAssertFalse(session.items.contains { $0.text.contains("Started a fresh thread") })
+
+        let retryOutcome = await harness.service.startRun(
+            tabID: session.tabID,
+            session: session,
+            initialUserMessage: "retry",
+            initialMessageForRun: "retry",
+            attachments: []
+        )
+        XCTAssertEqual(retryOutcome, .sent)
+        XCTAssertEqual(controller.startReferences.count, 2)
+        XCTAssertEqual(controller.startReferences[1]?.conversationID, "saved-thread")
+        await harness.service.cancelRun(tabID: session.tabID, session: session)
+    }
+
     func testCodexStartResultWithoutThreadIDDoesNotPersistResumeMetadata() async {
         let recorder = LifecycleRecorder()
         let controller = LifecycleNoopCodexController(
@@ -5889,8 +6365,22 @@ final class LifecycleNoopCodexController: CodexSessionControlling {
     private let startedRolloutPath: String?
     private var remainingStartFailures: Int
     private var remainingResumeTimeouts: Int
+    /// Errors thrown, in order, by resume attempts after any configured resume timeouts.
+    private var remainingResumeErrors: [Error]
+    /// Runtime status reported after a successful resume (nil keeps the protocol default).
+    private let resumedRuntimeStatus: CodexNativeSessionController.ThreadSnapshot.RuntimeStatus?
+    private var establishedThreadID: String?
     private(set) var startReferences: [CodexNativeSessionController.SessionRef?] = []
     private(set) var hasActiveThread = false
+    private(set) var lastKnownRuntimeStatus: CodexNativeSessionController.ThreadSnapshot.RuntimeStatus?
+    /// When set, `readThreadSnapshot` reports this status for the established thread.
+    var snapshotRuntimeStatus: CodexNativeSessionController.ThreadSnapshot.RuntimeStatus?
+    private(set) var snapshotReadCount = 0
+    /// When set, every `readThreadSnapshot` waits for this gate after counting the read and
+    /// before reading `snapshotRuntimeStatus`, so a test can order events against an in-flight read.
+    fileprivate var snapshotGate: LifecyclePublicationGate?
+    /// Runs inside a successful start/resume, before the result is returned to the coordinator.
+    var onThreadEstablished: (() -> Void)?
     /// Text of every `startUserTurn` / `steerUserTurn` dispatch, in order.
     private(set) var sentTexts: [String] = []
 
@@ -5899,16 +6389,20 @@ final class LifecycleNoopCodexController: CodexSessionControlling {
         failSend: Bool = false,
         startFailuresBeforeSuccess: Int = 0,
         resumeTimeoutFailuresBeforeSuccess: Int = 0,
+        resumeErrorsBeforeSuccess: [Error] = [],
         startedConversationID: String = "lifecycle",
-        startedRolloutPath: String? = nil
+        startedRolloutPath: String? = nil,
+        resumedRuntimeStatus: CodexNativeSessionController.ThreadSnapshot.RuntimeStatus? = nil
     ) {
         self.recorder = recorder
         sendBehavior = failSend ? .failure : .success
         activatesThread = true
         remainingStartFailures = max(0, startFailuresBeforeSuccess)
         remainingResumeTimeouts = max(0, resumeTimeoutFailuresBeforeSuccess)
+        remainingResumeErrors = resumeErrorsBeforeSuccess
         self.startedConversationID = startedConversationID
         self.startedRolloutPath = startedRolloutPath
+        self.resumedRuntimeStatus = resumedRuntimeStatus
     }
 
     init(
@@ -5922,8 +6416,10 @@ final class LifecycleNoopCodexController: CodexSessionControlling {
         self.activatesThread = activatesThread
         remainingStartFailures = max(0, startFailuresBeforeSuccess)
         remainingResumeTimeouts = 0
+        remainingResumeErrors = []
         startedConversationID = "lifecycle"
         startedRolloutPath = nil
+        resumedRuntimeStatus = nil
     }
 
     var events: AsyncStream<CodexNativeSessionController.Event> {
@@ -5961,17 +6457,25 @@ final class LifecycleNoopCodexController: CodexSessionControlling {
             hasActiveThread = false
             throw LifecycleCodexResumeTimeoutError()
         }
+        if existing != nil, !remainingResumeErrors.isEmpty {
+            hasActiveThread = false
+            throw remainingResumeErrors.removeFirst()
+        }
         if remainingStartFailures > 0 {
             remainingStartFailures -= 1
             hasActiveThread = false
             throw LifecycleTestError.expectedCodexStartFailure
         }
         hasActiveThread = activatesThread
+        onThreadEstablished?()
         if let existing {
+            establishedThreadID = existing.conversationID
+            lastKnownRuntimeStatus = resumedRuntimeStatus
             // A real resume echoes the resumed thread's identity; mirroring that here
             // lets tests assert post-resume metadata instead of a synthetic fresh ID.
             return existing
         }
+        establishedThreadID = startedConversationID
         return CodexNativeSessionController.SessionRef(
             conversationID: startedConversationID,
             rolloutPath: startedRolloutPath,
@@ -5981,7 +6485,23 @@ final class LifecycleNoopCodexController: CodexSessionControlling {
     }
 
     func readThreadSnapshot(includeTurns: Bool, timeout: TimeInterval?) async throws -> CodexNativeSessionController.ThreadSnapshot {
-        CodexNativeSessionController.ThreadSnapshot(
+        snapshotReadCount += 1
+        if let snapshotGate {
+            await snapshotGate.wait()
+        }
+        if let snapshotRuntimeStatus {
+            return CodexNativeSessionController.ThreadSnapshot(
+                conversationID: establishedThreadID ?? startedConversationID,
+                rolloutPath: nil,
+                model: nil,
+                reasoningEffort: nil,
+                runtimeStatus: snapshotRuntimeStatus,
+                currentTurnID: nil,
+                activeTurnIDs: [],
+                latestTurnStatus: nil
+            )
+        }
+        return CodexNativeSessionController.ThreadSnapshot(
             conversationID: "lifecycle",
             rolloutPath: nil,
             model: nil,

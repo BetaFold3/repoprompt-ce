@@ -1003,6 +1003,8 @@ final class CodexCLIProvider: AIProvider {
                 return "Codex app-server returned an invalid response."
             case .jsonDecodeFailed:
                 return "Failed to decode Codex app-server JSON response."
+            case .inboundFrameTooLarge:
+                return clientError.errorDescription ?? error.localizedDescription
             }
         }
         let localized = error.localizedDescription.trimmingCharacters(in: .whitespacesAndNewlines)

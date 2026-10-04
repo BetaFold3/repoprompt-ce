@@ -1,6 +1,7 @@
 import Darwin
 import Darwin.POSIX.fcntl
 import Foundation
+import OSLog
 
 enum CodexJSONValue: Equatable {
     case string(String)
@@ -171,6 +172,14 @@ actor CodexAppServerClient {
     }
 
     struct Config {
+        /// Ceiling for accepting and decoding one inbound JSON-RPC frame from Codex app-server stdout.
+        ///
+        /// This bounds which messages are accepted and decoded, not process memory: an oversized
+        /// completed line is allocated before rejection, and an accepted frame's decode graph can be
+        /// several times its text size. Frames above the ceiling terminate the transport generation
+        /// with `ClientError.inboundFrameTooLarge` instead of being dropped silently.
+        static let maxInboundFrameBytes = 32 * 1024 * 1024
+
         let commandName: String
         let additionalPathHints: [String]
         let enableDebugLogging: Bool
@@ -216,6 +225,9 @@ actor CodexAppServerClient {
         case executableUnavailable(String)
         case transportWriteFailed(message: String, errno: Int32?)
         case transportReadSetupFailed(message: String, errno: Int32?)
+        /// An inbound stdout frame exceeded the transport's frame ceiling. `observedBytes` is the
+        /// size seen when the violation was detected; for an unfinished frame it is a lower bound.
+        case inboundFrameTooLarge(observedBytes: Int, limitBytes: Int)
 
         var errorDescription: String? {
             switch self {
@@ -233,6 +245,8 @@ actor CodexAppServerClient {
                 message
             case let .transportReadSetupFailed(message, _):
                 message
+            case let .inboundFrameTooLarge(observedBytes, limitBytes):
+                "Codex app-server sent a message of at least \(observedBytes) bytes, above the \(limitBytes)-byte inbound frame limit; the app-server connection was closed."
             }
         }
     }
@@ -245,6 +259,7 @@ actor CodexAppServerClient {
         case livenessCheckFailed(method: String?)
         case decodeRecoveryBudgetExceeded(generation: UInt64)
         case readSourceSetupFailed(stream: String, errno: Int32?)
+        case inboundFrameLimitExceeded(observedBytes: Int, limitBytes: Int, generation: UInt64)
     }
 
     struct ExpectedAgentPIDRegistration: Equatable {
@@ -280,6 +295,26 @@ actor CodexAppServerClient {
     private struct TerminatingTransport {
         let process: SpawnedProcess?
         let expectedAgentPIDToClear: RegisteredExpectedAgentPID?
+    }
+
+    /// An oversized inbound frame detected while feeding stdout. Recorded from inside
+    /// `LineFramer.feed` callbacks and acted on only after `feed` returns, because
+    /// invalidating the transport mutates `stdoutFramer`.
+    private struct InboundFrameViolation {
+        let observedBytes: Int
+        let limitBytes: Int
+        let generation: UInt64
+    }
+
+    private static let transportLog = Logger(subsystem: "com.repoprompt.agents", category: "CodexAppServer")
+
+    static func isInboundFrameLimitError(_ error: Error) -> Bool {
+        guard let clientError = error as? ClientError,
+              case .inboundFrameTooLarge = clientError
+        else {
+            return false
+        }
+        return true
     }
 
     static func isTimeoutError(_ error: Error) -> Bool {
@@ -327,6 +362,34 @@ actor CodexAppServerClient {
         )
     }
 
+    /// Codex stdout framing. The shared framer checks the unfinished carry, which still holds a
+    /// CR that arrived without its LF, so its line and carry ceilings sit one byte above the frame
+    /// limit: an exactly-at-limit CRLF frame split between CR and LF stays acceptable. The payload
+    /// ceiling itself stays exact because `handleJSONLine` rejects any completed (terminator-
+    /// stripped) or flushed frame above `limitBytes`; an unfinished carry of exactly limit+1 bytes
+    /// is therefore caught when its terminator, the next chunk, or EOF arrives instead of at once.
+    /// No tail is retained on overflow because an oversized frame terminates the transport rather
+    /// than attempting tail recovery.
+    private static func makeStdoutFramer(limitBytes: Int) -> LineFramer {
+        let carryCeiling = limitBytes + 1
+        return LineFramer(limits: .init(
+            maxLineBytes: carryCeiling,
+            maxCarryBytes: carryCeiling,
+            tailRetainBytes: 0
+        ))
+    }
+
+    private func makeStdoutFramer() -> LineFramer {
+        Self.makeStdoutFramer(limitBytes: inboundFrameLimitBytes)
+    }
+
+    /// Read-only identity of the current app-server transport. It increments each time a new
+    /// process (or DEBUG test transport) is installed, so per-process capability memos can be
+    /// keyed to it and re-probed after a restart.
+    func currentTransportGeneration() -> UInt64 {
+        transportGeneration
+    }
+
     private static func shouldPoisonTransportOnTimeout(method: String) -> Bool {
         switch method {
         case "thread/start", "thread/resume":
@@ -349,8 +412,10 @@ actor CodexAppServerClient {
     private var notificationContinuations: [UUID: AsyncStream<Notification>.Continuation] = [:]
     private var serverRequestContinuations: [UUID: AsyncStream<ServerRequest>.Continuation] = [:]
     private var isInitialized = false
-    private var stdoutFramer = LineFramer()
-    private var stdoutTail = Data()
+    /// Inbound frame ceiling for this client; `Config.maxInboundFrameBytes` outside DEBUG test overrides.
+    private var inboundFrameLimitBytes = Config.maxInboundFrameBytes
+    private var stdoutFramer = CodexAppServerClient.makeStdoutFramer(limitBytes: Config.maxInboundFrameBytes)
+    private var pendingInboundFrameViolation: InboundFrameViolation?
     private var didTerminateTransport = false
     private var lastTransportTerminationReason: TransportTerminationReason?
     /// Per-transport decode-recovery attempts, used to cap CPU spent on malformed lines.
@@ -650,8 +715,8 @@ actor CodexAppServerClient {
         isInitialized = false
 
         // 6. Reset framer state for potential future restart.
-        stdoutFramer = LineFramer()
-        stdoutTail.removeAll(keepingCapacity: false)
+        stdoutFramer = makeStdoutFramer()
+        pendingInboundFrameViolation = nil
         decodeRecoveryAttemptsByGeneration.removeValue(forKey: transportGeneration)
 
         return TerminatingTransport(
@@ -1012,8 +1077,8 @@ actor CodexAppServerClient {
             environment: environment,
             workingDirectory: config.workingDirectory
         )
-        stdoutFramer = LineFramer()
-        stdoutTail.removeAll(keepingCapacity: false)
+        stdoutFramer = makeStdoutFramer()
+        pendingInboundFrameViolation = nil
         didTerminateTransport = false
         transportGeneration &+= 1
         decodeRecoveryAttemptsByGeneration[transportGeneration] = 0
@@ -1066,7 +1131,7 @@ actor CodexAppServerClient {
         stdoutConsumerTask = Task { [weak self] in
             for await chunk in channel.stream {
                 guard let self else { break }
-                await handleStdoutChunk(chunk)
+                await handleStdoutChunk(chunk, generation: generation)
             }
             // Stream ended — could be genuine EOF or cancellation/finish from teardown.
             // Only trigger teardown on genuine EOF (not cancellation), and scope to
@@ -1107,13 +1172,19 @@ actor CodexAppServerClient {
         }
     }
 
-    private func handleStdoutChunk(_ data: Data) async {
-        appendTail(&stdoutTail, chunk: data, limit: 128 * 1024)
+    /// Feeds one stdout chunk from the consumer task that owns `generation`.
+    ///
+    /// Chunks from a superseded or terminated transport are dropped. Completed lines that
+    /// precede an overflow in the same chunk are self-contained frames and still route; an
+    /// oversized frame is acted on only after `feed` returns.
+    private func handleStdoutChunk(_ data: Data, generation: UInt64) {
+        guard generation == transportGeneration, !didTerminateTransport else { return }
         stdoutFramer.feed(data, onDiagnostic: { [self] diagnostic in
             handleStdoutFramerDiagnostic(diagnostic)
         }, onLine: { [self] lineData in
             handleJSONLine(lineData)
         })
+        terminateTransportForPendingInboundFrameViolation()
     }
 
     /// Called when the stdout consumer task's channel stream ends (EOF or explicit finish).
@@ -1128,18 +1199,58 @@ actor CodexAppServerClient {
     }
 
     private func handleStdoutFramerDiagnostic(_ diagnostic: LineFramer.Diagnostic) {
-        guard config.enableDebugLogging else { return }
         switch diagnostic {
         case let .overflow(droppedBytes, retainedBytes):
-            if let (sample, truncated) = makeUTF8Sample(from: stdoutTail, limit: 180) {
-                let preview = truncated ? "\(sample)…" : sample
-                print("[CodexAppServer] stdout LineFramer overflow: dropped \(droppedBytes) bytes, retained \(retainedBytes) bytes, tail sample: \(preview)")
-            } else {
-                print("[CodexAppServer] stdout LineFramer overflow: dropped \(droppedBytes) bytes, retained \(retainedBytes) bytes")
-            }
+            // Recorded regardless of debug logging: an unfinished frame above the ceiling
+            // can never complete, so its request must fail instead of staying pending.
+            recordInboundFrameViolation(observedBytes: droppedBytes + retainedBytes)
         case .nonJSONCandidateQuoteStateReset:
+            guard config.enableDebugLogging else { return }
             print("[CodexAppServer] stdout LineFramer reset quote state for non-JSON candidate")
         }
+    }
+
+    private func recordInboundFrameViolation(observedBytes: Int) {
+        guard pendingInboundFrameViolation == nil else { return }
+        pendingInboundFrameViolation = InboundFrameViolation(
+            observedBytes: observedBytes,
+            limitBytes: inboundFrameLimitBytes,
+            generation: transportGeneration
+        )
+    }
+
+    /// Ends the transport generation that produced a recorded oversized frame. Every pending
+    /// request fails exactly once with `.inboundFrameTooLarge`. Logs sizes, generation, and
+    /// pending method names only, never payload content.
+    private func terminateTransportForPendingInboundFrameViolation() {
+        guard let violation = pendingInboundFrameViolation else { return }
+        pendingInboundFrameViolation = nil
+        let pendingMethods = pendingRequestMetadata.values
+            .filter { $0.transportGeneration == violation.generation }
+            .map(\.method)
+            .sorted()
+            .joined(separator: ",")
+        Self.transportLog.error(
+            "Codex app-server inbound frame exceeded limit: observedBytes=\(violation.observedBytes, privacy: .public) limitBytes=\(violation.limitBytes, privacy: .public) generation=\(violation.generation, privacy: .public) pendingMethods=[\(pendingMethods, privacy: .public)]; terminating transport"
+        )
+        if config.enableDebugLogging {
+            print("[CodexAppServer] inbound frame exceeded limit: observedBytes=\(violation.observedBytes) limitBytes=\(violation.limitBytes) generation=\(violation.generation) pendingMethods=[\(pendingMethods)]; terminating transport")
+        }
+        scheduleTransportCleanup(
+            invalidateTransport(
+                flushStdout: false,
+                expectedGeneration: violation.generation,
+                requestFailure: .inboundFrameTooLarge(
+                    observedBytes: violation.observedBytes,
+                    limitBytes: violation.limitBytes
+                ),
+                reason: .inboundFrameLimitExceeded(
+                    observedBytes: violation.observedBytes,
+                    limitBytes: violation.limitBytes,
+                    generation: violation.generation
+                )
+            )
+        )
     }
 
     // SEARCH-HELPER: JSON decode, recovery, concatenated, embedded tail, JSON-RPC
@@ -1153,6 +1264,14 @@ actor CodexAppServerClient {
     /// - ClaudeNativeProcessSessionController.recoverConcatenatedInboundMessagesIfNeeded
     /// - ClaudeNativeProcessSessionController.recoverEmbeddedInboundTailIfNeeded
     private func handleJSONLine(_ lineData: Data) {
+        // Size-check before trimming, decoding, or recovery. `LineFramer` only bounds the
+        // unfinished carry, so a line completed within one chunk can exceed the ceiling.
+        // Once a violation is recorded, later lines of the doomed generation are ignored.
+        guard pendingInboundFrameViolation == nil else { return }
+        guard lineData.count <= inboundFrameLimitBytes else {
+            recordInboundFrameViolation(observedBytes: lineData.count)
+            return
+        }
         guard let trimmed = trimmedASCIIWhitespace(lineData) else { return }
         guard let json = try? JSONSerialization.jsonObject(with: trimmed) as? [String: Any] else {
             // Primary decode failed — attempt recovery heuristics.
@@ -1668,6 +1787,34 @@ actor CodexAppServerClient {
 
         func debugIngestRawStdoutLine(_ line: Data) {
             handleJSONLine(line)
+            terminateTransportForPendingInboundFrameViolation()
+        }
+
+        /// Feeds raw bytes through the real stdout framing path for the current transport generation.
+        func debugIngestRawStdoutChunk(_ chunk: Data) {
+            handleStdoutChunk(chunk, generation: transportGeneration)
+        }
+
+        /// Feeds raw bytes as if delivered by the consumer task of `generation`.
+        func debugIngestRawStdoutChunk(_ chunk: Data, generation: UInt64) {
+            handleStdoutChunk(chunk, generation: generation)
+        }
+
+        /// Overrides the inbound frame ceiling so tests can use kilobyte-scale fixtures.
+        /// Rebuilds the stdout framer; call before ingesting a frame.
+        func debugSetMaxInboundFrameBytes(_ limitBytes: Int) {
+            inboundFrameLimitBytes = max(1, limitBytes)
+            stdoutFramer = makeStdoutFramer()
+            pendingInboundFrameViolation = nil
+        }
+
+        func debugInboundFrameLimitBytes() -> Int {
+            inboundFrameLimitBytes
+        }
+
+        /// Runs the stdout-EOF teardown for the current generation, as the consumer task does.
+        func debugSimulateStdoutEOF() async {
+            await handleStdoutEOF(generation: transportGeneration)
         }
 
         static func debugMaxDecodeRecoveryAttemptsPerGeneration() -> Int {
@@ -1697,6 +1844,8 @@ actor CodexAppServerClient {
             isInitialized = true
             didTerminateTransport = false
             lastTransportTerminationReason = nil
+            stdoutFramer = makeStdoutFramer()
+            pendingInboundFrameViolation = nil
             transportGeneration &+= 1
             decodeRecoveryAttemptsByGeneration[transportGeneration] = 0
         }
