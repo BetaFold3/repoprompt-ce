@@ -400,8 +400,16 @@ actor WorkspaceCodemapBindingEngine {
     private var manifestAdoptionOperations: [PipelineScope: ManifestAdoptionOperation] = [:]
     private var drainingManifestAdoptionTasks: [UUID: Task<ManifestAdoptionOutcome, Never>] = [:]
     private var projectionJobs: [WorkspaceCodemapRootEpoch: ProjectionPreloadJob] = [:]
-    private var latestOverlayContributionGenerationByRootEpoch: [
-        WorkspaceCodemapRootEpoch: WorkspaceCodemapSelectionGraphContributionGeneration
+    /// Overlay contribution watermark owned by exactly one eligible engine session. A new
+    /// registration installs a fresh entry in the same actor turn as its session, so a retired
+    /// session's watermark can never compare against a replacement overlay's restarted sequence.
+    private struct ProjectionContributionObservation {
+        let sessionID: UUID
+        var latestGeneration: WorkspaceCodemapSelectionGraphContributionGeneration?
+    }
+
+    private var projectionContributionObservations: [
+        WorkspaceCodemapRootEpoch: ProjectionContributionObservation
     ] = [:]
     private var projectionAdmissionQueue: [ProjectionAdmissionWaiter] = []
     private var activeProjectionJobIDs: Set<UUID> = []
@@ -435,6 +443,11 @@ actor WorkspaceCodemapBindingEngine {
         private var debugProjectionQueueWaitSampleOrdinalByRootEpoch: [
             WorkspaceCodemapRootEpoch: UInt64
         ] = [:]
+        /// Root-attributed twins of the engine-wide `capabilityResolutions` and
+        /// `repositoryAuthorityChanges` counters. They are cumulative per root epoch across engine
+        /// session replacement and are removed only when the root epoch is released.
+        private var debugCapabilityResolutionsByRootEpoch: [WorkspaceCodemapRootEpoch: UInt64] = [:]
+        private var debugRepositoryAuthorityChangesByRootEpoch: [WorkspaceCodemapRootEpoch: UInt64] = [:]
     #endif
 
     init(
@@ -513,6 +526,12 @@ actor WorkspaceCodemapBindingEngine {
         let attempt = RegistrationAttempt(id: UUID(), registration: registration, cancelled: false)
         roots[rootEpoch] = .registering(attempt)
         incrementCounter(\.capabilityResolutions)
+        #if DEBUG
+            debugCapabilityResolutionsByRootEpoch[rootEpoch] = addingSaturating(
+                debugCapabilityResolutionsByRootEpoch[rootEpoch] ?? 0,
+                1
+            )
+        #endif
         var capabilityState = await capabilityService.resolve(root: registration.capabilityRequest)
         guard !Task.isCancelled, registrationAttemptIsCurrent(attempt, rootEpoch: rootEpoch) else {
             await releaseCapabilityAfterRegistrationFailure(attempt, rootEpoch: rootEpoch)
@@ -596,8 +615,9 @@ actor WorkspaceCodemapBindingEngine {
             finishRegistrationAttempt(attempt, rootEpoch: rootEpoch)
             return .failed
         }
+        let sessionID = UUID()
         roots[rootEpoch] = .eligible(Session(
-            id: UUID(),
+            id: sessionID,
             registration: registration,
             capability: capability,
             manifestWriterSession: manifestWriterSession,
@@ -606,9 +626,26 @@ actor WorkspaceCodemapBindingEngine {
             generation: 1,
             invalidationGeneration: 1
         ))
+        projectionContributionObservations[rootEpoch] = ProjectionContributionObservation(
+            sessionID: sessionID,
+            latestGeneration: nil
+        )
         activateProjectionDemands(rootEpoch: rootEpoch)
         emit(.capabilityEligible, rootEpoch: rootEpoch)
         return .registered(adoptedReadyCount: 0)
+    }
+
+    /// Immutable identity of the eligible, non-latched engine session serving exactly
+    /// `registration`. Callers capture it once so later overlay observations are bound to their
+    /// originating session rather than to whichever session is current at callback time.
+    func projectionSessionID(
+        for registration: WorkspaceCodemapBindingRootRegistration
+    ) -> UUID? {
+        guard case let .eligible(session)? = roots[registration.capabilityRequest.rootEpoch],
+              session.registration == registration,
+              session.projectionAuthorityFailure == nil
+        else { return nil }
+        return session.id
     }
 
     /// Hands an already-public, Git-eligible root to the projection preloader.
@@ -996,6 +1033,10 @@ actor WorkspaceCodemapBindingEngine {
 
     func unloadRoot(rootEpoch: WorkspaceCodemapRootEpoch) async {
         revokeProjectionDemands(rootEpoch: rootEpoch, status: .cancelled)
+        #if DEBUG
+            debugCapabilityResolutionsByRootEpoch.removeValue(forKey: rootEpoch)
+            debugRepositoryAuthorityChangesByRootEpoch.removeValue(forKey: rootEpoch)
+        #endif
         if case .registering? = roots[rootEpoch] {
             roots.removeValue(forKey: rootEpoch)
             pruneAdmissionHistory()
@@ -1018,6 +1059,7 @@ actor WorkspaceCodemapBindingEngine {
             drainingProjectionRootEpochs[jobID] == rootEpoch ? task : nil
         }
         roots.removeValue(forKey: rootEpoch)
+        projectionContributionObservations.removeValue(forKey: rootEpoch)
         detachManifestWriters(rootEpoch: rootEpoch)
         detachManifestAdoptionOperations(rootEpoch: rootEpoch)
         let cancellationBatch = synchronouslyCancelRequests(requestIDs)
@@ -1051,6 +1093,8 @@ actor WorkspaceCodemapBindingEngine {
             }
             debugProjectionAdmissionHolds.removeAll()
             debugProjectionAdmissionEnqueuedAtNanoseconds.removeAll()
+            debugCapabilityResolutionsByRootEpoch.removeAll()
+            debugRepositoryAuthorityChangesByRootEpoch.removeAll()
         #endif
         let rootEpochs = Array(roots.keys)
         for rootEpoch in rootEpochs {
@@ -1064,6 +1108,7 @@ actor WorkspaceCodemapBindingEngine {
         }
         let requestIDs = Array(queuedRequests.keys) + Array(activeRequests.keys)
         roots.removeAll()
+        projectionContributionObservations.removeAll()
         let writerTasks = cancelAllManifestWriters()
         let cancellationBatch = synchronouslyCancelRequests(requestIDs)
         adoptionReservations.removeAll()
@@ -1163,14 +1208,24 @@ actor WorkspaceCodemapBindingEngine {
 
     func prepareCompletedProjectionSuccessor(
         rootEpoch: WorkspaceCodemapRootEpoch,
-        liveSnapshot: WorkspaceCodemapLiveGraphSnapshot
+        liveSnapshot: WorkspaceCodemapLiveGraphSnapshot,
+        expectedSessionID: UUID
     ) async -> WorkspaceCodemapProjectionSuccessorSeal? {
-        guard liveSnapshot.rootEpoch == rootEpoch else { return nil }
-        observeOverlayContributionGeneration(
-            liveSnapshot.contributionGeneration,
-            rootEpoch: rootEpoch
-        )
+        // Provenance is validated before observation so a snapshot carried for a retired engine
+        // session can never advance the replacement session's contribution watermark.
+        guard liveSnapshot.rootEpoch == rootEpoch,
+              case let .eligible(session)? = roots[rootEpoch],
+              session.id == expectedSessionID,
+              liveSnapshot.catalogGeneration == session.registration.catalogGeneration,
+              liveSnapshot.repositoryAuthority == session.capability.repositoryAuthority,
+              observeOverlayContributionGeneration(
+                  liveSnapshot.contributionGeneration,
+                  rootEpoch: rootEpoch,
+                  expectedSessionID: expectedSessionID
+              )
+        else { return nil }
         guard let job = projectionJobs[rootEpoch],
+              job.sessionID == expectedSessionID,
               job.phase == .complete,
               let predecessorProof = job.coverageProof,
               projectionJobAuthorityIsCurrent(job),
@@ -1207,7 +1262,7 @@ actor WorkspaceCodemapBindingEngine {
               job.generation == seal.predecessorProof.generation,
               job.coverageProof == seal.predecessorProof,
               projectionJobAuthorityIsCurrent(job),
-              latestOverlayContributionGenerationByRootEpoch[rootEpoch] ==
+              latestObservedContributionGeneration(for: job) ==
               seal.successorProof.generation.contributionGeneration,
               seal.predecessorProof.successor(
                   contributionGeneration: seal.successorProof.generation.contributionGeneration
@@ -1222,15 +1277,23 @@ actor WorkspaceCodemapBindingEngine {
         return true
     }
 
+    /// Records a current-session overlay advance and restarts completed coverage behind it.
+    ///
+    /// `expectedSessionID` is the engine session the caller's observation originated from; a
+    /// retired session's advance is rejected before it can touch the replacement's watermark.
     @discardableResult
     func restartCompletedProjectionForOverlayAdvance(
         rootEpoch: WorkspaceCodemapRootEpoch,
-        contributionGeneration: WorkspaceCodemapSelectionGraphContributionGeneration
+        contributionGeneration: WorkspaceCodemapSelectionGraphContributionGeneration,
+        expectedSessionID: UUID
     ) -> Bool {
-        observeOverlayContributionGeneration(contributionGeneration, rootEpoch: rootEpoch)
-        guard case let .eligible(session)? = roots[rootEpoch],
-              session.projectionAuthorityFailure == nil,
-              let job = projectionJobs[rootEpoch],
+        guard observeOverlayContributionGeneration(
+            contributionGeneration,
+            rootEpoch: rootEpoch,
+            expectedSessionID: expectedSessionID
+        ) else { return false }
+        guard let job = projectionJobs[rootEpoch],
+              job.sessionID == expectedSessionID,
               job.phase == .complete,
               job.task == nil,
               let proof = job.coverageProof,
@@ -1812,6 +1875,26 @@ actor WorkspaceCodemapBindingEngine {
             return (released, snapshot.metrics, snapshot.queueWaitMilliseconds)
         }
 
+        func debugRootAttributedCounters(
+            rootEpoch: WorkspaceCodemapRootEpoch
+        ) -> (capabilityResolutions: UInt64, repositoryAuthorityChanges: UInt64) {
+            (
+                debugCapabilityResolutionsByRootEpoch[rootEpoch] ?? 0,
+                debugRepositoryAuthorityChangesByRootEpoch[rootEpoch] ?? 0
+            )
+        }
+
+        func debugProjectionContributionObservation(
+            rootEpoch: WorkspaceCodemapRootEpoch
+        ) -> (
+            sessionID: UUID,
+            latestGeneration: WorkspaceCodemapSelectionGraphContributionGeneration?
+        )? {
+            projectionContributionObservations[rootEpoch].map {
+                ($0.sessionID, $0.latestGeneration)
+            }
+        }
+
         func debugProjectionAdmissionSnapshot(
             rootEpoch: WorkspaceCodemapRootEpoch
         ) -> (
@@ -1847,6 +1930,8 @@ actor WorkspaceCodemapBindingEngine {
                     "projection_catalog_pages": current.counters.projectionCatalogPages,
                     "projection_catalog_candidates": current.counters.projectionCatalogCandidates,
                     "projection_budget_rejections": current.counters.projectionBudgetRejections,
+                    "capability_resolutions": current.counters.capabilityResolutions,
+                    "repository_authority_changes": current.counters.repositoryAuthorityChanges,
                     "retained_path_bytes": current.projectionResources.retainedPathBytes,
                     "retained_source_bytes": current.projectionResources.retainedSourceBytes,
                     "retained_projection_bytes": current.projectionResources.retainedProjectionBytes,
@@ -3870,20 +3955,40 @@ actor WorkspaceCodemapBindingEngine {
         guard job.phase == .complete, let proof = job.coverageProof else { return true }
         let contributionGeneration = proof.generation.contributionGeneration
         guard job.generation?.contributionGeneration == contributionGeneration else { return false }
-        return latestOverlayContributionGenerationByRootEpoch[job.rootEpoch]
+        return latestObservedContributionGeneration(for: job)
             .map { $0 == contributionGeneration } ?? true
     }
 
+    /// The watermark is readable only by a job of the session that owns it.
+    private func latestObservedContributionGeneration(
+        for job: ProjectionPreloadJob
+    ) -> WorkspaceCodemapSelectionGraphContributionGeneration? {
+        guard let observation = projectionContributionObservations[job.rootEpoch],
+              observation.sessionID == job.sessionID
+        else { return nil }
+        return observation.latestGeneration
+    }
+
+    /// Advances the session-owned watermark monotonically. Observation is deliberately independent
+    /// of job phase and worker state so an advance seen while a worker is active is retained for
+    /// the worker's finish boundary.
     private func observeOverlayContributionGeneration(
         _ generation: WorkspaceCodemapSelectionGraphContributionGeneration,
-        rootEpoch: WorkspaceCodemapRootEpoch
-    ) {
-        if let current = latestOverlayContributionGenerationByRootEpoch[rootEpoch],
-           current >= generation
-        {
-            return
+        rootEpoch: WorkspaceCodemapRootEpoch,
+        expectedSessionID: UUID
+    ) -> Bool {
+        guard case let .eligible(session)? = roots[rootEpoch],
+              session.id == expectedSessionID,
+              session.projectionAuthorityFailure == nil,
+              var observation = projectionContributionObservations[rootEpoch],
+              observation.sessionID == expectedSessionID
+        else { return false }
+        if let current = observation.latestGeneration, current >= generation {
+            return true
         }
-        latestOverlayContributionGenerationByRootEpoch[rootEpoch] = generation
+        observation.latestGeneration = generation
+        projectionContributionObservations[rootEpoch] = observation
+        return true
     }
 
     private func projectionCandidateIsCurrent(
@@ -4271,12 +4376,13 @@ actor WorkspaceCodemapBindingEngine {
            job.id == jobID,
            job.phase == .complete,
            let proofGeneration = job.coverageProof?.generation.contributionGeneration,
-           let latestGeneration = latestOverlayContributionGenerationByRootEpoch[rootEpoch],
+           let latestGeneration = latestObservedContributionGeneration(for: job),
            proofGeneration < latestGeneration
         {
             _ = restartCompletedProjectionForOverlayAdvance(
                 rootEpoch: rootEpoch,
-                contributionGeneration: latestGeneration
+                contributionGeneration: latestGeneration,
+                expectedSessionID: job.sessionID
             )
         }
         scheduleQueuedRequests()
@@ -7383,6 +7489,7 @@ actor WorkspaceCodemapBindingEngine {
             registration: session.registration,
             state: .unresolved
         ))
+        projectionContributionObservations.removeValue(forKey: rootEpoch)
         detachManifestWriters(rootEpoch: rootEpoch)
         detachManifestAdoptionOperations(rootEpoch: rootEpoch)
         let cancellationBatch = synchronouslyCancelRequests(requestIDs + queuedIDs)
@@ -7652,6 +7759,15 @@ actor WorkspaceCodemapBindingEngine {
     ) {
         if failure.isRootWide {
             incrementCounter(\.repositoryAuthorityChanges)
+            #if DEBUG
+                // A late worker for an already released root must not recreate its entry.
+                if roots[rootEpoch] != nil {
+                    debugRepositoryAuthorityChangesByRootEpoch[rootEpoch] = addingSaturating(
+                        debugRepositoryAuthorityChangesByRootEpoch[rootEpoch] ?? 0,
+                        1
+                    )
+                }
+            #endif
             emit(
                 .repositoryAuthorityChanged,
                 rootEpoch: rootEpoch,

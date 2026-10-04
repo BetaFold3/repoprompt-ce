@@ -1,3 +1,4 @@
+import CryptoKit
 import Darwin
 import Foundation
 import MCP
@@ -1862,6 +1863,97 @@ final class MCPCodeStructureWorktreeTests: XCTestCase {
         XCTAssertEqual(repairCountAfterRepeat, 1, "A later expansion on the replacement must not reset again.")
     }
 
+    func testReferrersExpansionAfterCompletedBaselineRecoversFromIndexOnlyStage() async throws {
+        try await assertReferrersExpansionRecoversAfterRepositoryMutation(.stageExistingNonSource)
+    }
+
+    func testReferrersExpansionAfterCompletedBaselineRecoversFromEmptyCommit() async throws {
+        try await assertReferrersExpansionRecoversAfterRepositoryMutation(.emptyCommit)
+    }
+
+    func testReferrersExpansionAfterCompletedBaselineRecoversFromOverlappedCreateAndStage() async throws {
+        try await assertReferrersExpansionRecoversAfterRepositoryMutation(.createAndStage)
+    }
+
+    func testReferrersExpansionAfterCompletedBaselineIncludesUnstagedStoreCreateWithoutRepair() async throws {
+        try await assertReferrersExpansionRecoversAfterRepositoryMutation(.createUnstaged)
+    }
+
+    func testRootAttributedCodemapCountersIsolateRootsAndSurviveSessionRepair() async throws {
+        let repositories = try ReviewGitRepositoryFixture(name: #function)
+        let files = [
+            "Sources/Source.swift": "struct Source {\n    let target: Target\n}\n",
+            "Sources/Target.swift": "struct Target { func targetMethod() {} }\n",
+            "Notes.txt": "notes\n"
+        ]
+        let rootA = try repositories.makeRepository(named: "alpha", files: files)
+        let rootB = try repositories.makeRepository(named: "beta", files: files)
+        addTeardownBlock { repositories.cleanup() }
+        for root in [rootA, rootB] {
+            try repositories.write("notes changed\n", to: "Notes.txt", at: root)
+            try repositories.settleIndex(at: root)
+        }
+        let window = try await makeWindow(
+            root: rootA,
+            additionalRoots: [rootB],
+            projectionPreloadLaunchPolicy: .enabled
+        )
+        let store = window.workspaceFileContextStore
+        let targetA = try await fileRecord(
+            at: rootA.appendingPathComponent("Sources/Target.swift"),
+            store: store,
+            rootScope: .visibleWorkspace
+        )
+        let targetB = try await fileRecord(
+            at: rootB.appendingPathComponent("Sources/Target.swift"),
+            store: store,
+            rootScope: .visibleWorkspace
+        )
+        XCTAssertNotEqual(targetA.rootID, targetB.rootID)
+        for target in [targetA, targetB] {
+            let baseline = try await referrersDTO(window: window, record: target)
+            XCTAssertEqual(baseline.status, "ready", "baseline \(baseline.issues)")
+        }
+        let baselineAttributionA = await store.debugCodemapRootAttribution(rootID: targetA.rootID)
+        let baselineA = try XCTUnwrap(baselineAttributionA)
+        let baselineAttributionB = await store.debugCodemapRootAttribution(rootID: targetB.rootID)
+        let baselineB = try XCTUnwrap(baselineAttributionB)
+        XCTAssertNotEqual(baselineA.rootEpoch, baselineB.rootEpoch)
+        for baseline in [baselineA, baselineB] {
+            XCTAssertEqual(baseline.storeSessionRepairs, 0)
+            XCTAssertEqual(baseline.repositoryAuthorityChanges, 0)
+            XCTAssertGreaterThanOrEqual(try XCTUnwrap(baseline.capabilityResolutions), 1)
+        }
+
+        // An authority change and session repair on B leave A's attribution untouched.
+        try repositories.stage("Notes.txt", at: rootB)
+        let repairedB = try await referrersDTO(window: window, record: targetB)
+        XCTAssertEqual(repairedB.status, "ready", "B repair \(repairedB.issues)")
+        let afterBAttributionA = await store.debugCodemapRootAttribution(rootID: targetA.rootID)
+        XCTAssertEqual(afterBAttributionA, baselineA)
+        let afterBAttributionB = await store.debugCodemapRootAttribution(rootID: targetB.rootID)
+        let afterB = try XCTUnwrap(afterBAttributionB)
+        XCTAssertEqual(afterB.rootEpoch, baselineB.rootEpoch)
+        XCTAssertEqual(afterB.storeSessionRepairs, 1)
+        XCTAssertEqual(afterB.capabilityResolutions, baselineB.capabilityResolutions.map { $0 + 1 })
+        XCTAssertGreaterThanOrEqual(try XCTUnwrap(afterB.repositoryAuthorityChanges), 1)
+
+        // A's replacement session keeps A's cumulative counts and still leaves B untouched.
+        try repositories.stage("Notes.txt", at: rootA)
+        let repairedA = try await referrersDTO(window: window, record: targetA)
+        XCTAssertEqual(repairedA.status, "ready", "A repair \(repairedA.issues)")
+        let afterAAttributionB = await store.debugCodemapRootAttribution(rootID: targetB.rootID)
+        XCTAssertEqual(afterAAttributionB, afterB)
+        let afterAAttributionA = await store.debugCodemapRootAttribution(rootID: targetA.rootID)
+        let afterA = try XCTUnwrap(afterAAttributionA)
+        XCTAssertEqual(afterA.rootEpoch, baselineA.rootEpoch)
+        XCTAssertEqual(afterA.storeSessionRepairs, 1)
+        XCTAssertEqual(afterA.capabilityResolutions, baselineA.capabilityResolutions.map { $0 + 1 })
+        XCTAssertGreaterThanOrEqual(try XCTUnwrap(afterA.repositoryAuthorityChanges), 1)
+        let storeWideRepairs = await store.codemapRootSessionRepairCountForTesting()
+        XCTAssertEqual(storeWideRepairs, 2)
+    }
+
     func testProjectionAuthorityFailurePersistsAcrossPollingAndResetsOnceByTicket() async throws {
         let repositories = try ReviewGitRepositoryFixture(name: #function)
         let root = try makeReferrersRepository(repositories)
@@ -3259,6 +3351,131 @@ final class MCPCodeStructureWorktreeTests: XCTestCase {
         )
     }
 
+    /// A completed baseline referrers expansion leaves complete projection coverage on the original
+    /// engine session; a real repository mutation then spends exactly one root-session repair, and the
+    /// replacement session must reach ready coverage without inheriting the retired session's overlay
+    /// contribution watermark.
+    private func assertReferrersExpansionRecoversAfterRepositoryMutation(
+        _ mutation: ReferrersRecoveryMutation,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) async throws {
+        let repositories = try ReviewGitRepositoryFixture(name: "referrers-recovery-\(mutation.rawValue)")
+        var files = [
+            "Sources/Source.swift": "struct Source {\n    let target: Target\n}\n",
+            "Sources/Target.swift": "struct Target { func targetMethod() {} }\n"
+        ]
+        if mutation == .stageExistingNonSource {
+            files["Notes.txt"] = "notes\n"
+        }
+        let root = try repositories.makeRepository(named: "repository", files: files)
+        addTeardownBlock { repositories.cleanup() }
+        if mutation == .stageExistingNonSource {
+            // Only the index advances after the baseline.
+            try repositories.write("notes changed\n", to: "Notes.txt", at: root)
+            try repositories.settleIndex(at: root)
+        }
+        let window = try await makeWindow(root: root, projectionPreloadLaunchPolicy: .enabled)
+        let store = window.workspaceFileContextStore
+        let target = try await fileRecord(
+            at: root.appendingPathComponent("Sources/Target.swift"),
+            store: store,
+            rootScope: .visibleWorkspace
+        )
+
+        let baseline = try await referrersDTO(window: window, record: target)
+        XCTAssertEqual(baseline.status, "ready", "baseline \(baseline.issues)", file: file, line: line)
+        XCTAssertEqual(baseline.files.map(\.path), referrerPaths, file: file, line: line)
+        let baselineRepairs = await store.codemapRootSessionRepairCountForTesting()
+        XCTAssertEqual(baselineRepairs, 0, "The baseline must not reset.", file: file, line: line)
+        let expectedRepairs = mutation == .createUnstaged ? 0 : 1
+        let gitStateBefore = try mutation == .createUnstaged
+            ? referrersGitState(repositories, root: root)
+            : nil
+
+        var expected = Set(referrerPaths)
+        switch mutation {
+        case .stageExistingNonSource:
+            try repositories.stage("Notes.txt", at: root)
+        case .emptyCommit:
+            _ = try repositories.runGit(["commit", "--allow-empty", "-m", "Empty"], at: root)
+        case .createAndStage:
+            let addedPath = "Sources/Added.swift"
+            try await store.createFile(
+                rootID: target.rootID,
+                relativePath: addedPath,
+                content: "struct Added {\n    let target: Target\n    func addedLabel() { target.targetMethod() }\n}\n",
+                validating: .visibleWorkspace
+            )
+            try repositories.stage(addedPath, at: root)
+            expected.insert("repository/\(addedPath)")
+        case .createUnstaged:
+            let addedPath = "Sources/Added.swift"
+            try await store.createFile(
+                rootID: target.rootID,
+                relativePath: addedPath,
+                content: "struct Added {\n    let target: Target\n    func addedLabel() { target.targetMethod() }\n}\n",
+                validating: .visibleWorkspace
+            )
+            expected.insert("repository/\(addedPath)")
+        }
+
+        let clock = ContinuousClock()
+        let started = clock.now
+        let recovered = try await referrersDTO(window: window, record: target)
+        let elapsed = clock.now - started
+        let repairs = await store.codemapRootSessionRepairCountForTesting()
+        let diagnostics = "mutation=\(mutation.rawValue) status=\(recovered.status) elapsed=\(elapsed) " +
+            "repairs=\(repairs) issues=\(recovered.issues)"
+        XCTAssertEqual(recovered.status, "ready", diagnostics, file: file, line: line)
+        XCTAssertEqual(Set(recovered.files.map(\.path)), expected, diagnostics, file: file, line: line)
+        XCTAssertLessThan(elapsed, .seconds(10), diagnostics, file: file, line: line)
+        XCTAssertEqual(repairs, expectedRepairs, "Root resets: \(diagnostics)", file: file, line: line)
+
+        let repeated = try await referrersDTO(window: window, record: target)
+        let repeatedRepairs = await store.codemapRootSessionRepairCountForTesting()
+        let repeatedDiagnostics = "repeat status=\(repeated.status) repairs=\(repeatedRepairs) " +
+            "issues=\(repeated.issues)"
+        XCTAssertEqual(repeated.status, "ready", repeatedDiagnostics, file: file, line: line)
+        XCTAssertEqual(Set(repeated.files.map(\.path)), expected, repeatedDiagnostics, file: file, line: line)
+        XCTAssertEqual(repeatedRepairs, expectedRepairs, "The repeat must not reset again.", file: file, line: line)
+        if let gitStateBefore {
+            let gitStateAfter = try referrersGitState(repositories, root: root)
+            XCTAssertEqual(
+                gitStateAfter,
+                gitStateBefore,
+                "An unstaged store create must leave HEAD, tree, and index bytes/stat unchanged.",
+                file: file,
+                line: line
+            )
+        }
+    }
+
+    /// HEAD, HEAD tree, index SHA-256, and index lstat identity (size, inode, mtime, ctime).
+    private func referrersGitState(
+        _ repositories: ReviewGitRepositoryFixture,
+        root: URL
+    ) throws -> [String] {
+        let index = try repositories.gitPath("index", at: root)
+        var status = stat()
+        guard lstat(index.path, &status) == 0 else {
+            throw NSError(domain: "MCPCodeStructureWorktreeTests", code: 6)
+        }
+        let digest = try SHA256.hash(data: Data(contentsOf: index))
+            .map { String(format: "%02x", $0) }
+            .joined()
+        return try [
+            repositories.head(at: root),
+            repositories.runGit(["rev-parse", "HEAD^{tree}"], at: root)
+                .trimmingCharacters(in: .whitespacesAndNewlines),
+            digest,
+            "\(status.st_size)",
+            "\(status.st_ino)",
+            "\(status.st_mtimespec.tv_sec).\(status.st_mtimespec.tv_nsec)",
+            "\(status.st_ctimespec.tv_sec).\(status.st_ctimespec.tv_nsec)"
+        ]
+    }
+
     private func codeStructureToolInvoker(
         window: WindowState
     ) async throws -> (String) async throws -> ToolResultDTOs.CodeStructureReplyDTO {
@@ -3446,6 +3663,7 @@ final class MCPCodeStructureWorktreeTests: XCTestCase {
 
     private func makeWindow(
         root: URL,
+        additionalRoots: [URL] = [],
         projectionPreloadLaunchPolicy: WorkspaceFileContextStore.CodemapProjectionPreloadLaunchPolicyForTesting = .disabled,
         capabilityHooks: WorkspaceCodemapGitCapabilityServiceHooks = .none,
         prepareStore: (WorkspaceFileContextStore) async -> Void = { _ in },
@@ -3478,7 +3696,7 @@ final class MCPCodeStructureWorktreeTests: XCTestCase {
 
         let workspace = window.workspaceManager.createWorkspace(
             name: "Code Structure Worktree \(UUID().uuidString.prefix(8))",
-            repoPaths: [root.path],
+            repoPaths: ([root] + additionalRoots).map(\.path),
             ephemeral: true
         )
         await window.workspaceManager.switchWorkspace(
@@ -3488,10 +3706,12 @@ final class MCPCodeStructureWorktreeTests: XCTestCase {
         )
         let activeWorkspace = try XCTUnwrap(window.workspaceManager.activeWorkspace)
         window.promptManager.loadComposeTabsFromWorkspace(activeWorkspace, syncPromptText: true)
-        _ = try await WorkspaceRootLoadTestSupport.loadRootMatchingCurrentFileSystemSettings(
-            in: window,
-            path: root.path
-        )
+        for loadedRoot in [root] + additionalRoots {
+            _ = try await WorkspaceRootLoadTestSupport.loadRootMatchingCurrentFileSystemSettings(
+                in: window,
+                path: loadedRoot.path
+            )
+        }
         return window
     }
 
@@ -3942,6 +4162,13 @@ private final class CodeStructureDemandResultPause: @unchecked Sendable {
     func release() {
         fence.release()
     }
+}
+
+private enum ReferrersRecoveryMutation: String {
+    case stageExistingNonSource
+    case emptyCommit
+    case createAndStage
+    case createUnstaged
 }
 
 /// Engine counters that must stay flat while a session's projection authority failure is latched.

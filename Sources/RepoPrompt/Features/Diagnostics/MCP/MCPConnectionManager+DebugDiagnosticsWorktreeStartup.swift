@@ -261,11 +261,15 @@ import MCP
                             message: "The scoped Git codemap engine is not ready."
                         )
                     }
+                    let rootAttribution = await resolved.store.debugCodemapRootAttribution(
+                        rootID: scope.rootID
+                    )
                     return debugDiagnosticsResult([
                         "ok": true,
                         "op": op,
                         "action": action,
-                        "codemap_projection": debugCodemapProjectionPayload(snapshot)
+                        "codemap_projection": debugCodemapProjectionPayload(snapshot),
+                        "codemap_root_attribution": debugCodemapRootAttributionPayload(rootAttribution)
                     ])
                 case "codemap_root_snapshot":
                     let targetRootID = try debugRequiredUUID(arguments, key: "target_root_id")
@@ -285,12 +289,17 @@ import MCP
                     let snapshot = await resolved.store.debugCodemapProjectionAdmissionSnapshot(
                         rootID: targetRootID
                     )
+                    let storeRootSessionRepairs = await resolved.store.debugCodemapRootSessionRepairCount()
+                    let rootAttribution = await resolved.store.debugCodemapRootAttribution(
+                        rootID: targetRootID
+                    )
                     return debugDiagnosticsResult([
                         "ok": true,
                         "op": op,
                         "action": action,
                         "target_root_id": targetRootID.uuidString,
                         "engine_present": enginePresent,
+                        "codemap_root_attribution": debugCodemapRootAttributionPayload(rootAttribution),
                         "codemap_projection": snapshot.map { debugCodemapProjectionPayload($0) } ?? [
                             "hold_count": 0,
                             "queued_projection_batch_count": 0,
@@ -299,6 +308,9 @@ import MCP
                             "projection_batches_started": 0,
                             "projection_catalog_candidates": 0,
                             "projection_budget_rejections": 0,
+                            "capability_resolutions": 0,
+                            "repository_authority_changes": 0,
+                            "store_root_session_repairs": storeRootSessionRepairs,
                             "retained_path_bytes": 0,
                             "retained_source_bytes": 0,
                             "retained_projection_bytes": 0,
@@ -625,6 +637,23 @@ import MCP
                 "reserved_load_flight_count": snapshot.reservedLoadFlightCount,
                 "is_drained": snapshot.isDrained
             ]
+        }
+
+        /// Root-epoch-attributed counters. Unlike the engine-wide aggregates in
+        /// `codemap_projection`, these cannot be changed by another root sharing the engine.
+        private nonisolated func debugCodemapRootAttributionPayload(
+            _ attribution: WorkspaceFileContextStore.DebugCodemapRootAttribution?
+        ) -> Any {
+            guard let attribution else { return NSNull() }
+            return [
+                "scope": "root_epoch",
+                "root_id": attribution.rootEpoch.rootID.uuidString,
+                "root_lifetime_id": attribution.rootEpoch.rootLifetimeID.uuidString,
+                "root_capability_resolutions": attribution.capabilityResolutions.map { $0 as Any } ?? NSNull(),
+                "root_repository_authority_changes":
+                    attribution.repositoryAuthorityChanges.map { $0 as Any } ?? NSNull(),
+                "root_store_session_repairs": attribution.storeSessionRepairs
+            ] as [String: Any]
         }
 
         private nonisolated func debugCodemapProjectionPayload(

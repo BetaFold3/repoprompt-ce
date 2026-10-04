@@ -2,9 +2,9 @@
 
 Scope: read when the task touches codemap Git source-authority evidence, typed issuance/revalidation failures, artifact or projection demand recovery, or `get_code_structure` authority-related issues.
 Authority: Authoritative
-Last-verified: 2026-10-03
+Last-verified: 2026-10-04
 
-Status: Implementation complete. OracleA and OracleB approved the scoped remediation in fresh re-review lanes on 2026-10-03; neither reported a P0/P1 defect. **Mandatory live acceptance remains pending.** The validation below is deterministic evidence, not proof of running-app behavior.
+Status: The prior plan is implemented at HEAD `cf704272`. OracleA and OracleB completed initial review and fresh scoped re-review on 2026-10-03; neither reported a P0/P1 defect in that prior remediation. Later live evidence refuted acceptance. **Mandatory live acceptance FAILED on the old build and is pending on remediation.** The current delta passed initial review remediation and two fresh, delta-scoped OracleA/B re-review rounds on 2026-10-04. All P1 findings are explicitly closed; fresh-build live proof remains pending.
 
 ## Ownership and boundaries
 
@@ -85,6 +85,47 @@ The service logs only root identity, names-only failure leaf, and changed-compon
 
 Never log source/metadata contents, absolute paths, ref/config values, fingerprints, evidence digests, or raw error text. MCP artifact rejection detail is `binding_rejected.repository_authority_changed`, retryable within the existing code/phase schema. Its message is outcome-neutral ("Repository authority changed; retry the request.") because the rejection does not establish whether a reset ran. Projection failure uses `projection_unavailable` / `projection`; exhausted-budget foreground output supplies retry guidance. A failure observation alone does not establish that a repair completed.
 
+## 2026-10-04 follow-up: failed live acceptance and session provenance
+
+**Mandatory live acceptance FAILED on the old build; remediation acceptance is pending.** The following reproduction/trace results are supplied follow-up evidence, not new runs by this documentation pass:
+
+- `/tmp/rpce-codemap-e2e-20261004`: 62/62 main-repository directory/status calls returned ready. The small two-file control returned baseline referrers, then timed out after index advance; its unchanged repeat and subsequent commit request were stale. Directory-churn success did not prove authority-repair/expansion acceptance.
+- `/private/tmp/rpce-codemap-authority-gk6e4aom`: durable-harness baseline against old-binary PID 38667 recorded 17 requests: 6 passed, 11 failed. The catalog-only baseline failed, so catalog mutation was **untested**. The earlier empty-commit run compared index bytes only; without full index-stat evidence it did **not** prove pure metadata-only drift.
+- Conductor reproductions `b748040f-e8a5-435e-a9ea-28f7c0f4e361`, `031c6bb8-fe07-4fa6-9cdd-2dda916e54b6`, and `be91f38b-c718-4f33-a1c0-4c0d319e2e14` confirmed the mechanism: root reset reused the root epoch, a retained contribution watermark of 4 was compared with the replacement overlay's generation 3, the worker restarted completed projection, and same-key graph supersession left subsequent requests persistently stale. Temporary diagnostic probes were removed.
+
+**Implemented delta invariant:** contribution generations are comparable only within their originating eligible engine session, not merely a reusable root epoch. The engine installs a fresh session-tagged observation alongside registration, maintains monotonic observations for that session, and removes them on invalidation/unload/shutdown. Observation/restart and successor preparation require the original `expectedSessionID`; snapshot root/catalog/repository authority is checked before feeding its observation. Store setup captures the engine projection session once and carries it through overlay observers and successor preparation; callbacks must not substitute whichever session is current later. Store observer-currentness fences apply before coverage wait/freeze after suspension. Worker-finish handling uses the job's own session, including advances observed while it was active.
+
+This is a session-provenance change, not a new recovery owner or budget. Store-owned detachment/shared cleanup, foreground-only root repair, the shared once-per-root operation allowance, retained-ticket fencing, and the original deadline remain unchanged. These are targeted source spot-checks, **not a review verdict**.
+
+## Review remediation outcome
+
+Both current-delta initial reviews completed. OracleA reported three P1 **harness** findings: post-hoc write guarding, stale-process/new-bundle provenance, and engine-global counter isolation. OracleB reported no P0/P1 finding, with P2 counter-isolation, optional-lock probe contamination, and catalog-only coverage issues plus minor P3 items. Neither identified a blocking engine/store defect. OracleA explicitly closed all three in fresh round 1. That round identified P1 CR-04: interruption during final verification could persist a passing harness summary. Both Oracles explicitly closed CR-04 in fresh round 2 after the completion flag and interruption regression were added. Neither reported a remaining P0/P1; this is code-review closure, not live acceptance.
+
+A deterministic catalog-only regression and a two-root counter-attribution regression now pass. OracleB's nil-setup, redundant-guard, and aggregate-fallback P3 items remain deferred, along with minor diagnostic/forensic refinements reported during re-review; they did not trigger additional review loops.
+
+## Live authority harness
+
+`Scripts/live_codemap_authority_e2e.py` is an explicit, isolated-fixture reproduction against an **already-running CE DEBUG app**, not the packaged-app release gate. Read its current `--help` before use; no remediation live pass is established. Dependencies: Python 3, Git, `gitleaks >= 8.19` with the `dir` command, `xcrun swiftc`, and CE debug CLI tooling.
+
+```bash
+python3 Scripts/live_codemap_authority_e2e.py --confirm-isolated-fixtures \
+  --window-id <positive-window-id> --context-id <context-uuid> --app-pid <running-pid> \
+  --churn --cadence --require-authority-counters
+```
+
+- Supply both routing IDs and an explicit PID; optional `--cli` must resolve to CE debug tooling. Every targeted call carries both IDs, including each newly created fixture's own context. Global read-only window discovery for new-fixture routing is a separately authorized exception, not permission to switch an existing workspace.
+- The script creates only isolated fixture repositories/workspaces and retains raw evidence. Before dispatching an edit, it validates the absolute physical owned-fixture path and performs a read-only binding preflight; write protection is preventive, not merely a post-hoc check. It never launches/stops/relaunches the app, changes settings, switches existing workspaces, or mutates the product repository. Fixture/window creation requires the explicit fixture opt-in; cleanup is not automatic.
+- It records/checks before-and-after PID/process, app/CLI hashes, debug-build provenance/hash, and harness/helper hashes. The process-start lower bound must be strictly later than provenance build time and executable mtime/ctime; same-second or newer-bundle evidence is rejected. This conservative minimum guard is not an OS executable-mapping hash. Record source/artifact provenance separately: a commit ID alone cannot identify dirty-at-build source bytes.
+- First failures remain failures; later unchanged repeats do not erase them. Each query must return exact ready structure, empty issues/no retry, exact files and seed/related roles, relationship depth/direction, expected types/methods, and elapsed time **under 10 seconds CLI-inclusive** (startup, binding, server, transport). This conservative bound does not change the original server deadline. Structure-only success is explicitly distinct from authority acceptance.
+- Five lanes separate index-only, catalog-only, metadata-only, settled combined, and original-overlap changes. A failed baseline blocks that lane's mutation coverage. Pure metadata-only classification requires changed HEAD with unchanged tree, index SHA, and full index stat, not byte equality alone.
+- `--churn` adds 20 paired root/`.git` directory changes; observational Git/status probes are lock-free. `--cadence` adds a **lock-free** 60-second `git --no-optional-locks status` cadence every two seconds with periodic structure calls, explicitly **not ordinary/default-status acceptance proof**. The plain-status live gate remains separate. Directory identity/timestamp and unchanged Git evidence must be proven; sleep or elapsed time alone is not idle/background acceptance.
+- `--require-authority-counters` implies required diagnostics and **fails closed** on unavailable/unvalidated root attribution. Strict root/epoch parsing is implemented and covered by negative tests. Success also requires completed post-run settings and build-identity verification; interruption records failure and re-raises rather than certifying incomplete evidence. Root-ID/lifetime and counter validity, Git OID/index SHA/full-stat transitions, exact root repair deltas, and idle controls must be established by actual snapshots, not inferred from structure-only success.
+- The existing DEBUG gate `agent_mode.worktree_startup_benchmark_diagnostics_enabled` must be enabled **separately with explicit approval**, with its original value recorded and restored after the run, including failure. The script only reads it; `--diagnostics` and `--require-diagnostics` never enable it.
+
+The existing DEBUG snapshot now exposes sibling `codemap_root_attribution` with `scope: root_epoch`, `root_id`, `root_lifetime_id`, and `root_capability_resolutions`, `root_repository_authority_changes`, `root_store_session_repairs`. Counts are cumulative for that root epoch across session resets, cleared on root release, and exclude other roots' activity. Engine-held fields are nullable when unavailable: missing/null attribution must fail closed, never become fallback zero evidence. Before/after comparisons must match the original root ID/lifetime, not merely a window or replacement session.
+
+Existing `capability_resolutions` / `repository_authority_changes` remain engine-wide and `store_root_session_repairs` remains store-wide: **diagnostic-only aggregates, not acceptance counters**. Single-window/single-root inventory cannot prove shared-engine isolation. Never equate authority observations with repairs or infer repair counts from notices; use validated root-attributed snapshots.
+
 ## Validation mapping and acceptance status
 
 For future changes, use the [validation workflow](workflows/validation.md) and coordinated tests:
@@ -96,18 +137,33 @@ For future changes, use the [validation workflow](workflows/validation.md) and c
 | Engine lifecycle, projection, manifest compatibility, and warm-adoption authority drift (issuance short-circuit, batch revalidation, reservation/lease release, lazy re-adoption) | `make dev-test FILTER=CodemapBindingEngine` | 68 tests green |
 | Adjacent store/presentation/preload/overlay/graph/automatic-selection boundaries | `make dev-test FILTER="'Codemap\|MCPCodeStructure'"` | 391 tests green in one run, including the rows above |
 
-These results are handoff evidence from the initial-review remediation, not a full-root test result or live-app proof. The existing synthetic fresh-demand test is compatibility coverage, not proof of real-Git recovery.
+These results are historical handoff evidence for the prior implementation at `cf704272`, not a full-root test result, current-delta review, or live-app proof. The existing synthetic fresh-demand test is compatibility coverage, not proof of real-Git recovery.
+
+The orchestrator's 2026-10-04 log checks establish the following bounded **pre-review-remediation** evidence; this documentation pass did not rerun implementation tests, lint, format checks, ledger verification, or the live harness:
+
+| Scope | Conductor ticket | Evidence |
+|---|---|---|
+| Red control: current three integration tests against HEAD production | `2840640e-9d38-419c-882b-560968481440` | 3 tests, 12 assertion failures; all stale |
+| Focused repaired delta | `b6e53aa3-d4f3-487c-8b70-1f2aaf4f7471` | 11 tests, 0 failures (8 overlay + 3 new integration) |
+| Broader scoped validation | `796f55ae-ff97-45ef-98e4-cb841c371f32` | 396 tests, 0 failures, 0 skipped |
+| Strict suite with `RPCE_RUN_CODEMAP_E2E=1` | `bccc75d4-aa16-416e-a67f-acf8e6a77d2b` | 9 tests, 0 failures, 0 skipped; deterministic suite, not running-app acceptance |
+| Lint | `e260437c-e0a0-4419-8226-1250fc5d4090` | Worker reported exit 0; orchestrator checked logs |
+| Non-mutating format check | `f054eb4e-3ab5-45d8-b1bc-7754357fc6ac` | Worker reported exit 0; orchestrator checked logs |
+
+Post-remediation validation: focused 13 tests passed (`01e3df4e-29c4-4bf8-bfe4-1f96d10b4ee5`); 398 boundary tests passed with no skips (`54f198aa-138b-4222-8fe6-4b198bef5140`); nine strict worktree-inheritance tests passed (`3133451c-0bda-41be-9f39-71d9aa92de82`). After fixing one `hoistTry` test-helper formatting finding, all 53 MCP worktree tests passed (`2fe9b5e7-1f78-4b70-b202-fd47166d82d7`); lint (`eb7326a2-7314-4d29-a81d-054559bc5ebd`) and format-check (`4cae592a-e7f6-4c8f-89c1-efe6e02efa64`) passed. The final Python-only interruption delta passed all 28 harness self-tests. No full-root run or engine-test failing-first run is claimed; the real-Git integration red control remains the causal regression evidence.
+
+**Ledger verification is not green:** it fails on the pre-existing missing HEAD row `AgentDelegationPolicyTests/testPairReviewRemediationGuidanceMatchesDelegationAudienceAcrossProviders`. The orchestrator checked the HEAD ledger's absence and the test's presence at HEAD line 1122. All seven new rows reconcile according to the worker's inventory check; the pre-existing omission remains unfixed and unwaived. Scoped test results do not establish live acceptance.
 
 **Gate 15 history:** retained-ready-seed `expand: referrers` after index advance originally failed with **47 restarts, zero repairs, and a 10-second timeout**. The approved extension plan chose foreground projection-ticket repair with a session latch, shared reset budget, and store ownership. That choice keeps one store-owned reset owner, keeps reset bounded per operation, and avoids an autonomous background invalidator; it was a planning decision, **not an implementation review**. The implemented regression `testReferrersExpansionFromRetainedSeedRecoversAfterIndexAdvance` asserts ready referrers output before 10 seconds, exactly one repair, a stale old seed ticket, and no additional repair on repeat; it is covered by the reported green MCP run.
 
 **Outstanding — do not mark full acceptance complete:**
 
-- OracleA and OracleB completed initial review and one fresh delta-scoped re-review. All targeted implementation findings were closed; nonblocking documentation precision issues were clarified without another review round. Optional minor test/helper and diagnostic refinements remain deferred.
-- Post-remediation `make dev-build` passed (ticket `66c77a29-dbcd-4262-a6c0-a3d8d5c8dc6a`), including app/helper packaging checks. No visible app launch was authorized; packaging is not live acceptance.
+- Historical OracleA/B initial review and re-review closed the prior targeted findings; documentation precision was clarified without another review round. Optional minor refinements were deferred. **Current-delta review remediation is closed after two fresh OracleA/B re-review rounds.** All P1 findings were explicitly closed; deferred minor observations remain recorded.
+- Historical `make dev-build` ticket `66c77a29-dbcd-4262-a6c0-a3d8d5c8dc6a` passed app/helper packaging checks, not live acceptance. Build `dc89b734` predates review remediation. Current package build `afceb477-0d81-456e-a068-6fb60291406a` passed full signing, architecture, and embedded-helper checks. On 2026-10-04 the user chose to relaunch personally and approved temporary benchmark diagnostics with restoration afterward. Matched running-process/source identity is still required; the old-binary failures above cannot be replaced by a packaging result.
 - Record a live CE build revision matching the tested source, then exercise 20 consecutive Swift `get_code_structure` calls interleaved with `git status --porcelain`: structure returned, zero authority rejection issues, zero directory-churn repairs.
-- Verify live `git add` and `git commit` each lead to one observed authority change and one repair, with later calls needing none.
+- Verify settled live `git add` and `git commit` phases each lead to exactly one store-owned repair, with unchanged repeats needing none. Use root-attributed observations and repair deltas separately; there is no universal one-observation-per-repair rule. Prove full index-stat/SHA and tree stability before classifying an empty commit as metadata-only.
 - Run a live 60-second `git status` loop every two seconds with periodic structure calls; expect zero churn repairs.
 - Verify a live multi-file request spanning `git add` succeeds after one reset or returns one bounded retryable authority issue without looping; confirm retained-seed expansion and idle-background behavior.
 - Use live leaf diagnostics to confirm or refute the original running-binary failure mechanism.
 
-Implementation completion and deterministic greens do not discharge these live gates. Raw working evidence remains local/untracked; the archived original plan preserves historical proposals, not current acceptance status.
+Prior implementation/review completion and deterministic greens do not discharge these live gates. **No remediation live pass is established.** Implementation validation, strict harness parsing, and OracleA/B review remediation are complete. Fresh-build live acceptance awaits the user's relaunch; full ledger verification remains blocked by the pre-existing missing row above. Raw working evidence remains local/untracked; the archived original plan preserves historical proposals, not current acceptance status.

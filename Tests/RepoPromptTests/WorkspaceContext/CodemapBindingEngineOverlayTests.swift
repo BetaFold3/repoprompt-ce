@@ -159,9 +159,12 @@ final class CodemapBindingEngineOverlayTests: CodemapBindingEngineTestCase {
         let bundle = try XCTUnwrap(frozenBundle)
         defer { bundle.close() }
         let liveSnapshot = try bundle.graphSnapshot()
+        let registeredSessionID = await fixture.engine.projectionSessionID(for: fixture.registration)
+        let sessionID = try XCTUnwrap(registeredSessionID)
         let preparedSeal = await fixture.engine.prepareCompletedProjectionSuccessor(
             rootEpoch: fixture.rootEpoch,
-            liveSnapshot: liveSnapshot
+            liveSnapshot: liveSnapshot,
+            expectedSessionID: sessionID
         )
         let seal = try XCTUnwrap(preparedSeal)
         let fencedStatus = await fixture.engine.projectionDemandStatus(retainedTicket)
@@ -175,7 +178,8 @@ final class CodemapBindingEngineOverlayTests: CodemapBindingEngineTestCase {
         XCTAssertTrue(committed)
         let duplicate = await fixture.engine.prepareCompletedProjectionSuccessor(
             rootEpoch: fixture.rootEpoch,
-            liveSnapshot: liveSnapshot
+            liveSnapshot: liveSnapshot,
+            expectedSessionID: sessionID
         )
         XCTAssertNil(duplicate)
         let accounting = await fixture.engine.accounting()
@@ -250,20 +254,25 @@ final class CodemapBindingEngineOverlayTests: CodemapBindingEngineTestCase {
         let bundle = try XCTUnwrap(frozenBundle)
         defer { bundle.close() }
         let liveSnapshot = try bundle.graphSnapshot()
+        let registeredSessionID = await fixture.engine.projectionSessionID(for: fixture.registration)
+        let sessionID = try XCTUnwrap(registeredSessionID)
         let preparedSeal = await fixture.engine.prepareCompletedProjectionSuccessor(
             rootEpoch: fixture.rootEpoch,
-            liveSnapshot: liveSnapshot
+            liveSnapshot: liveSnapshot,
+            expectedSessionID: sessionID
         )
         let seal = try XCTUnwrap(preparedSeal)
 
         let restarted = await fixture.engine.restartCompletedProjectionForOverlayAdvance(
             rootEpoch: fixture.rootEpoch,
-            contributionGeneration: liveSnapshot.contributionGeneration
+            contributionGeneration: liveSnapshot.contributionGeneration,
+            expectedSessionID: sessionID
         )
         XCTAssertTrue(restarted)
         let duplicateRestart = await fixture.engine.restartCompletedProjectionForOverlayAdvance(
             rootEpoch: fixture.rootEpoch,
-            contributionGeneration: liveSnapshot.contributionGeneration
+            contributionGeneration: liveSnapshot.contributionGeneration,
+            expectedSessionID: sessionID
         )
         XCTAssertFalse(duplicateRestart)
         let successorCompleted = await fixture.engine.waitForCurrentProjectionCoverage(
@@ -283,6 +292,197 @@ final class CodemapBindingEngineOverlayTests: CodemapBindingEngineTestCase {
         await fixture.engine.releaseProjectionDemand(retainedTicket)
         accounting = await fixture.engine.accounting()
         XCTAssertEqual(accounting.retainedProjectionDemandCount, 0)
+    }
+
+    func testReplacementSessionOwnsFreshContributionWatermarkAndRejectsRetiredWrites() async throws {
+        let fixture = try await makeSingleCandidateProjectionFixture(name: #function)
+        _ = await fixture.engine.registerRoot(fixture.registration)
+        _ = await fixture.engine.scheduleProjectionPreload(rootEpoch: fixture.rootEpoch)
+        let retiredCompleted = await waitForEngineCondition {
+            let accounting = await fixture.engine.accounting()
+            return accounting.projectionRoots.first?.phase == .complete &&
+                accounting.activeProjectionBatchCount == 0
+        }
+        XCTAssertTrue(retiredCompleted)
+        let retiredRegistration = await fixture.engine.projectionSessionID(for: fixture.registration)
+        let retiredSessionID = try XCTUnwrap(retiredRegistration)
+
+        // Advance the retired session's overlay and watermark above the replacement's restarted sequence.
+        guard case .ready = await fixture.engine.demand(fixture.demand(path: "Sources/Live.swift")) else {
+            return XCTFail("Expected live publication to advance the retired overlay.")
+        }
+        let retiredBundle = await fixture.engine.freeze(rootEpoch: fixture.rootEpoch)
+        let retiredSnapshot = try XCTUnwrap(retiredBundle).graphSnapshot()
+        retiredBundle?.close()
+        let retiredRestart = await fixture.engine.restartCompletedProjectionForOverlayAdvance(
+            rootEpoch: fixture.rootEpoch,
+            contributionGeneration: retiredSnapshot.contributionGeneration,
+            expectedSessionID: retiredSessionID
+        )
+        XCTAssertTrue(retiredRestart)
+        let retiredRecovered = await fixture.engine.waitForCurrentProjectionCoverage(rootEpoch: fixture.rootEpoch)
+        XCTAssertTrue(retiredRecovered)
+        let retiredObservation = await fixture.engine.debugProjectionContributionObservation(
+            rootEpoch: fixture.rootEpoch
+        )
+        XCTAssertEqual(retiredObservation?.sessionID, retiredSessionID)
+        XCTAssertEqual(retiredObservation?.latestGeneration, retiredSnapshot.contributionGeneration)
+        XCTAssertGreaterThan(retiredSnapshot.contributionGeneration.rawValue, 1)
+
+        _ = await fixture.engine.invalidateRepositoryAuthority(rootEpoch: fixture.rootEpoch)
+        let invalidatedObservation = await fixture.engine.debugProjectionContributionObservation(
+            rootEpoch: fixture.rootEpoch
+        )
+        XCTAssertNil(invalidatedObservation)
+        guard case .registered = await fixture.engine.registerRoot(fixture.registration) else {
+            return XCTFail("Expected the same registration to install a replacement engine session.")
+        }
+        let replacementRegistration = await fixture.engine.projectionSessionID(for: fixture.registration)
+        let replacementSessionID = try XCTUnwrap(replacementRegistration)
+        XCTAssertNotEqual(replacementSessionID, retiredSessionID)
+        let freshObservation = await fixture.engine.debugProjectionContributionObservation(
+            rootEpoch: fixture.rootEpoch
+        )
+        XCTAssertEqual(freshObservation?.sessionID, replacementSessionID)
+        XCTAssertNil(freshObservation?.latestGeneration)
+
+        // Late retired-session observer and snapshot writes are rejected before observation.
+        let lateRestart = await fixture.engine.restartCompletedProjectionForOverlayAdvance(
+            rootEpoch: fixture.rootEpoch,
+            contributionGeneration: retiredSnapshot.contributionGeneration,
+            expectedSessionID: retiredSessionID
+        )
+        XCTAssertFalse(lateRestart)
+        let lateSeal = await fixture.engine.prepareCompletedProjectionSuccessor(
+            rootEpoch: fixture.rootEpoch,
+            liveSnapshot: retiredSnapshot,
+            expectedSessionID: retiredSessionID
+        )
+        XCTAssertNil(lateSeal)
+        let afterLateObservation = await fixture.engine.debugProjectionContributionObservation(
+            rootEpoch: fixture.rootEpoch
+        )
+        XCTAssertEqual(afterLateObservation?.sessionID, replacementSessionID)
+        XCTAssertNil(afterLateObservation?.latestGeneration)
+
+        // The replacement completes at its own restarted sequence in exactly one schedule, with no
+        // watermark-driven restart or supersession inherited from the retired session.
+        let beforeReplacement = await fixture.engine.accounting()
+        _ = await fixture.engine.scheduleProjectionPreload(rootEpoch: fixture.rootEpoch)
+        let replacementCompleted = await waitForEngineCondition {
+            let accounting = await fixture.engine.accounting()
+            return accounting.projectionRoots.first?.phase == .complete &&
+                accounting.activeProjectionBatchCount == 0
+        }
+        XCTAssertTrue(replacementCompleted)
+        let replacementCurrent = await fixture.engine.waitForCurrentProjectionCoverage(rootEpoch: fixture.rootEpoch)
+        XCTAssertTrue(replacementCurrent)
+        let afterReplacement = await fixture.engine.accounting()
+        XCTAssertEqual(
+            afterReplacement.counters.projectionPreloadsScheduled,
+            beforeReplacement.counters.projectionPreloadsScheduled + 1
+        )
+        XCTAssertEqual(
+            afterReplacement.counters.projectionCoveragesSuperseded,
+            beforeReplacement.counters.projectionCoveragesSuperseded
+        )
+        let demand = await fixture.engine.acquireProjectionDemand(
+            rootEpoch: fixture.rootEpoch,
+            fileIDs: [fixture.fileIDs.id(for: "Sources/Preload.swift")],
+            catalogGeneration: 1,
+            ingressGeneration: 1,
+            deadlineUptimeNanoseconds: .max,
+            owner: WorkspaceCodemapLiveDemandOwner()
+        )
+        guard case let .acquired(ticket, status) = demand, case let .ready(proof) = status else {
+            return XCTFail("Expected replacement projection demand to be ready: \(demand)")
+        }
+        XCTAssertLessThan(proof.generation.contributionGeneration, retiredSnapshot.contributionGeneration)
+        await fixture.engine.releaseProjectionDemand(ticket)
+    }
+
+    func testActiveWorkerRetainsCurrentSessionOverlayAdvanceMonotonically() async throws {
+        let overlay = WorkspaceCodemapLiveOverlay()
+        let recorder = EngineProjectionRecorder()
+        let publicationGate = EngineAsyncGate()
+        let publisher = EngineProjectionGenerationRacePublisher(
+            gate: publicationGate,
+            recorder: recorder
+        )
+        let fixture = try await makeSingleCandidateProjectionFixture(
+            name: #function,
+            overlay: overlay,
+            recorder: recorder,
+            publishProjectionOverride: { snapshot in
+                await publisher.publish(snapshot)
+            }
+        )
+        addTeardownBlock { publicationGate.release() }
+        _ = await fixture.engine.registerRoot(fixture.registration)
+        _ = await fixture.engine.scheduleProjectionPreload(rootEpoch: fixture.rootEpoch)
+        let publicationEntered = await publicationGate.waitUntilEntered()
+        XCTAssertTrue(publicationEntered)
+        let registeredSessionID = await fixture.engine.projectionSessionID(for: fixture.registration)
+        let sessionID = try XCTUnwrap(registeredSessionID)
+
+        guard case .ready = await fixture.engine.demand(fixture.demand(path: "Sources/Live.swift")) else {
+            publicationGate.release()
+            return XCTFail("Expected a live overlay advance while the worker is active.")
+        }
+        let advancedSnapshot = await overlay.snapshot(rootEpoch: fixture.rootEpoch)
+        let advanced = try XCTUnwrap(advancedSnapshot).contributionGeneration
+        XCTAssertGreaterThan(advanced.rawValue, 1)
+
+        // The active worker cannot restart, but the current-session advance is still recorded.
+        let activeRestart = await fixture.engine.restartCompletedProjectionForOverlayAdvance(
+            rootEpoch: fixture.rootEpoch,
+            contributionGeneration: advanced,
+            expectedSessionID: sessionID
+        )
+        XCTAssertFalse(activeRestart)
+        var observation = await fixture.engine.debugProjectionContributionObservation(rootEpoch: fixture.rootEpoch)
+        XCTAssertEqual(observation?.sessionID, sessionID)
+        XCTAssertEqual(observation?.latestGeneration, advanced)
+
+        // A lower same-session observation never regresses the watermark.
+        _ = await fixture.engine.restartCompletedProjectionForOverlayAdvance(
+            rootEpoch: fixture.rootEpoch,
+            contributionGeneration: .init(rawValue: 1),
+            expectedSessionID: sessionID
+        )
+        // A foreign session's observation is rejected without mutation.
+        let foreignRestart = await fixture.engine.restartCompletedProjectionForOverlayAdvance(
+            rootEpoch: fixture.rootEpoch,
+            contributionGeneration: .init(rawValue: advanced.rawValue + 100),
+            expectedSessionID: UUID()
+        )
+        XCTAssertFalse(foreignRestart)
+        observation = await fixture.engine.debugProjectionContributionObservation(rootEpoch: fixture.rootEpoch)
+        XCTAssertEqual(observation?.sessionID, sessionID)
+        XCTAssertEqual(observation?.latestGeneration, advanced)
+
+        publicationGate.release()
+        let completed = await waitForEngineCondition {
+            let accounting = await fixture.engine.accounting()
+            return accounting.projectionRoots.first?.phase == .complete &&
+                accounting.activeProjectionBatchCount == 0
+        }
+        XCTAssertTrue(completed)
+        let current = await fixture.engine.waitForCurrentProjectionCoverage(rootEpoch: fixture.rootEpoch)
+        XCTAssertTrue(current)
+        let demand = await fixture.engine.acquireProjectionDemand(
+            rootEpoch: fixture.rootEpoch,
+            fileIDs: [fixture.fileIDs.id(for: "Sources/Preload.swift")],
+            catalogGeneration: 1,
+            ingressGeneration: 1,
+            deadlineUptimeNanoseconds: .max,
+            owner: WorkspaceCodemapLiveDemandOwner()
+        )
+        guard case let .acquired(ticket, status) = demand, case let .ready(proof) = status else {
+            return XCTFail("Expected coverage at the retained advance to be ready: \(demand)")
+        }
+        XCTAssertEqual(proof.generation.contributionGeneration, advanced)
+        await fixture.engine.releaseProjectionDemand(ticket)
     }
 
     func testProjectionResourceBudgetExposesTypedTerminalCoverage() async throws {
@@ -549,5 +749,55 @@ final class CodemapBindingEngineOverlayTests: CodemapBindingEngineTestCase {
         XCTAssertEqual(dimension, .retainedProjectionBytes)
         XCTAssertGreaterThan(attempted, 1)
         XCTAssertEqual(limit, 1)
+    }
+
+    /// One-candidate projection catalog (`Sources/Preload.swift`) plus an uncataloged live file
+    /// (`Sources/Live.swift`) whose demand advances the overlay contribution sequence.
+    private func makeSingleCandidateProjectionFixture(
+        name: String,
+        overlay: WorkspaceCodemapLiveOverlay? = nil,
+        recorder: EngineProjectionRecorder = EngineProjectionRecorder(),
+        publishProjectionOverride: (@Sendable (
+            WorkspaceCodemapProjectionSnapshot
+        ) async -> WorkspaceCodemapProjectionSnapshotDisposition)? = nil
+    ) async throws -> EngineFixture {
+        let repository = try makeRepositoryFixture(name: name)
+        let root = try repository.makeRepository(
+            named: "repository",
+            files: [
+                "Sources/Preload.swift": SwiftFixtureSource.emptyStruct("Preload"),
+                "Sources/Live.swift": SwiftFixtureSource.emptyStruct("Live")
+            ]
+        )
+        let runtime = try CodeMapArtifactRuntime(
+            rootURL: makeSecureDirectory(in: repository.sandbox, named: "artifacts"),
+            builder: CodeMapArtifactBuilderClient(build: { _, _, _ in .readyNoSymbols })
+        )
+        return try await makeEngineFixture(
+            root: root,
+            runtime: runtime,
+            overlay: overlay,
+            projectionCatalogFactory: { rootEpoch, fileIDs in
+                let path = "Sources/Preload.swift"
+                return EngineProjectionCatalogStub(
+                    rootEpoch: rootEpoch,
+                    entries: [WorkspaceCodemapProjectionCatalogCandidate(
+                        identity: WorkspaceCodemapArtifactBindingIdentity(
+                            rootID: rootEpoch.rootID,
+                            rootLifetimeID: rootEpoch.rootLifetimeID,
+                            fileID: fileIDs.id(for: path),
+                            standardizedRootPath: root.path,
+                            standardizedRelativePath: path,
+                            standardizedFullPath: root.appendingPathComponent(path).path
+                        )!,
+                        language: .swift,
+                        requestGeneration: 1,
+                        pathGeneration: 1
+                    )],
+                    recorder: recorder,
+                    publishProjectionOverride: publishProjectionOverride
+                ).client
+            }
+        )
     }
 }

@@ -467,6 +467,8 @@ actor WorkspaceFileContextStore {
     private struct CodemapProjectionRecoveryObserver {
         let id: UUID
         let authority: CodemapRootAuthority
+        /// Engine session the observer originated from, captured once at creation.
+        let engineSessionID: UUID
         var latestSignalSerial: UInt64
         var lastRecoveredContributionGeneration: WorkspaceCodemapSelectionGraphContributionGeneration?
         var recoveringSignalSerial: UInt64?
@@ -573,6 +575,8 @@ actor WorkspaceFileContextStore {
         var routeToken: WorkspaceCodemapBindingIntegrationRouteToken?
         var runtime: CodeMapArtifactRuntime?
         var engine: WorkspaceCodemapBindingEngine?
+        /// Engine projection session registered by this store session's setup.
+        var engineProjectionSessionID: UUID?
         var setupTask: Task<CodemapSetupDisposition, Never>?
         var setupDisposition: CodemapSetupDisposition?
         var pathGenerationsByRelativePath: [String: UInt64] = [:]
@@ -1431,7 +1435,41 @@ actor WorkspaceFileContextStore {
             queueWaitMilliseconds: [UInt64]
         )? {
             guard let owner = debugCodemapBindingEngine(rootID: rootID) else { return nil }
-            return await owner.engine.debugProjectionAdmissionSnapshot(rootEpoch: owner.rootEpoch)
+            var snapshot = await owner.engine.debugProjectionAdmissionSnapshot(rootEpoch: owner.rootEpoch)
+            snapshot.metrics["store_root_session_repairs"] = debugCodemapRootSessionRepairCount()
+            return snapshot
+        }
+
+        /// Store-wide count of codemap root-session repairs (all roots), for live diagnostics.
+        func debugCodemapRootSessionRepairCount() -> UInt64 {
+            UInt64(codemapRootSessionRepairCountStorageForTesting)
+        }
+
+        /// Counters attributed to exactly one loaded root epoch. Engine-held values are `nil` when
+        /// the current store session's engine is absent or bound to a different epoch.
+        struct DebugCodemapRootAttribution: Equatable {
+            let rootEpoch: WorkspaceCodemapRootEpoch
+            let capabilityResolutions: UInt64?
+            let repositoryAuthorityChanges: UInt64?
+            let storeSessionRepairs: UInt64
+        }
+
+        func debugCodemapRootAttribution(rootID: UUID) async -> DebugCodemapRootAttribution? {
+            guard let lifetimeID = rootStatesByID[rootID]?.lifetimeID else { return nil }
+            let rootEpoch = WorkspaceCodemapRootEpoch(rootID: rootID, rootLifetimeID: lifetimeID)
+            var engineCounters: (capabilityResolutions: UInt64, repositoryAuthorityChanges: UInt64)?
+            if let owner = debugCodemapBindingEngine(rootID: rootID), owner.rootEpoch == rootEpoch {
+                engineCounters = await owner.engine.debugRootAttributedCounters(rootEpoch: rootEpoch)
+            }
+            guard rootStatesByID[rootID]?.lifetimeID == lifetimeID else { return nil }
+            return DebugCodemapRootAttribution(
+                rootEpoch: rootEpoch,
+                capabilityResolutions: engineCounters?.capabilityResolutions,
+                repositoryAuthorityChanges: engineCounters?.repositoryAuthorityChanges,
+                storeSessionRepairs: UInt64(
+                    codemapRootSessionRepairCountByRootEpochForTesting[rootEpoch] ?? 0
+                )
+            )
         }
 
         func debugCodemapEnginePresent(rootID: UUID) -> Bool {
@@ -2400,6 +2438,9 @@ actor WorkspaceFileContextStore {
         private var codemapPresentationCandidateRequestCountForTesting = 0
         private var codemapArtifactDemandRequestCountForTesting = 0
         private var codemapRootSessionRepairCountStorageForTesting = 0
+        /// Root-attributed twin of the store-wide repair count; survives session repair (same root
+        /// epoch) and is removed when the root epoch is released.
+        private var codemapRootSessionRepairCountByRootEpochForTesting: [WorkspaceCodemapRootEpoch: Int] = [:]
         private var codemapPresentationFreezeRequestCountForTesting = 0
         private var codemapSetupTaskCreationCountForTesting = 0
         private var codemapDemandTaskCreationCountForTesting = 0
@@ -10139,6 +10180,9 @@ actor WorkspaceFileContextStore {
             codemapAuthorityGenerationsByRootEpoch.removeValue(forKey: rootEpoch)
             codemapProjectionInvalidationGenerationsByRootEpoch.removeValue(forKey: rootEpoch)
             terminalNonGitCodemapCacheByEpoch.removeValue(forKey: rootEpoch)
+            #if DEBUG
+                codemapRootSessionRepairCountByRootEpochForTesting.removeValue(forKey: rootEpoch)
+            #endif
             codemapPathFenceTokensByID = codemapPathFenceTokensByID.filter {
                 $0.value.rootEpoch != rootEpoch
             }
@@ -14667,6 +14711,7 @@ actor WorkspaceFileContextStore {
 
         #if DEBUG
             codemapRootSessionRepairCountStorageForTesting += 1
+            codemapRootSessionRepairCountByRootEpochForTesting[ticket.rootEpoch, default: 0] += 1
         #endif
         let cleanup = detachCodemapSession(rootEpoch: ticket.rootEpoch)
         if let cleanup {
@@ -14710,6 +14755,7 @@ actor WorkspaceFileContextStore {
 
         #if DEBUG
             codemapRootSessionRepairCountStorageForTesting += 1
+            codemapRootSessionRepairCountByRootEpochForTesting[ticket.rootEpoch, default: 0] += 1
         #endif
         let cleanup = detachCodemapSession(rootEpoch: ticket.rootEpoch)
         if let cleanup {
@@ -16335,11 +16381,14 @@ actor WorkspaceFileContextStore {
         #else
             let registrationResult = engineRegistrationResult
         #endif
+        let engineProjectionSessionID = await engine.projectionSessionID(for: registration)
         guard codemapAuthorityIsCurrent(authority), !Task.isCancelled else {
             _ = await registry.unregister(routeToken)
             await fenceLateCodemapSetup(engine: engine, authority: authority)
             return .unavailable(.staleCurrentness)
         }
+        codemapSessionsByRootEpoch[authority.rootEpoch]?.engineProjectionSessionID =
+            engineProjectionSessionID
 
         switch registrationResult {
         case .registered, .exactDuplicate:
@@ -16387,6 +16436,7 @@ actor WorkspaceFileContextStore {
                 codemapSessionsByRootEpoch[authority.rootEpoch]?.routeToken = nil
                 codemapSessionsByRootEpoch[authority.rootEpoch]?.runtime = nil
                 codemapSessionsByRootEpoch[authority.rootEpoch]?.engine = nil
+                codemapSessionsByRootEpoch[authority.rootEpoch]?.engineProjectionSessionID = nil
             }
         }
         await publishCodemapSetupDisposition(disposition, authority: authority)
@@ -16861,11 +16911,16 @@ actor WorkspaceFileContextStore {
             codemapSessionsByRootEpoch[rootEpoch] = session
             return
         }
+        guard let engineSessionID = session.engineProjectionSessionID else {
+            codemapSessionsByRootEpoch[rootEpoch] = session
+            return
+        }
 
         let observerID = UUID()
         session.projectionRecoveryObserver = CodemapProjectionRecoveryObserver(
             id: observerID,
             authority: authority,
+            engineSessionID: engineSessionID,
             latestSignalSerial: latestSignalSerial,
             lastRecoveredContributionGeneration: nil,
             recoveringSignalSerial: nil,
@@ -16905,12 +16960,14 @@ actor WorkspaceFileContextStore {
         var armedObserver = observer
         armedObserver.recoveringSignalSerial = observer.latestSignalSerial
         session.projectionRecoveryObserver = armedObserver
+        let engineSessionID = observer.engineSessionID
         let task = Task { [weak self] in
             await self?.runCodemapProjectionRecoveryObserver(
                 rootEpoch: rootEpoch,
                 observerID: observerID,
                 authority: authority,
                 engine: engine,
+                engineSessionID: engineSessionID,
                 contributionGeneration: contributionGeneration
             )
             return ()
@@ -16931,6 +16988,7 @@ actor WorkspaceFileContextStore {
         observerID: UUID,
         authority: CodemapRootAuthority,
         engine: WorkspaceCodemapBindingEngine,
+        engineSessionID: UUID,
         contributionGeneration: WorkspaceCodemapSelectionGraphContributionGeneration
     ) async {
         #if DEBUG
@@ -16951,11 +17009,27 @@ actor WorkspaceFileContextStore {
         }
         _ = await engine.restartCompletedProjectionForOverlayAdvance(
             rootEpoch: rootEpoch,
-            contributionGeneration: contributionGeneration
+            contributionGeneration: contributionGeneration,
+            expectedSessionID: engineSessionID
         )
-        let recovered = await engine.waitForCurrentProjectionCoverage(rootEpoch: rootEpoch)
+        var recovered = false
+        if codemapProjectionRecoveryObserverIsCurrent(
+            rootEpoch: rootEpoch,
+            observerID: observerID,
+            authority: authority,
+            engineSessionID: engineSessionID
+        ) {
+            recovered = await engine.waitForCurrentProjectionCoverage(rootEpoch: rootEpoch)
+        }
         var latestObservedContributionGeneration = contributionGeneration
+        // A retired observer must not freeze or feed a publication for a replacement session.
         if !Task.isCancelled,
+           codemapProjectionRecoveryObserverIsCurrent(
+               rootEpoch: rootEpoch,
+               observerID: observerID,
+               authority: authority,
+               engineSessionID: engineSessionID
+           ),
            let bundle = await engine.freeze(rootEpoch: rootEpoch)
         {
             latestObservedContributionGeneration =
@@ -16969,6 +17043,22 @@ actor WorkspaceFileContextStore {
             latestObservedContributionGeneration: latestObservedContributionGeneration,
             recoveredCurrentCoverage: recovered && !Task.isCancelled && codemapAuthorityIsCurrent(authority)
         )
+    }
+
+    private func codemapProjectionRecoveryObserverIsCurrent(
+        rootEpoch: WorkspaceCodemapRootEpoch,
+        observerID: UUID,
+        authority: CodemapRootAuthority,
+        engineSessionID: UUID
+    ) -> Bool {
+        guard let session = codemapSessionsByRootEpoch[rootEpoch],
+              session.authority == authority,
+              session.engineProjectionSessionID == engineSessionID,
+              let observer = session.projectionRecoveryObserver,
+              observer.id == observerID,
+              observer.engineSessionID == engineSessionID
+        else { return false }
+        return codemapAuthorityIsCurrent(authority)
     }
 
     private func finishCodemapProjectionRecoveryObserver(
@@ -17309,12 +17399,17 @@ actor WorkspaceFileContextStore {
             }
         }
 
-        let preparedSeal = state.workerTask == nil && state.pendingSnapshot == nil
-            ? await engine.prepareCompletedProjectionSuccessor(
+        var preparedSeal: WorkspaceCodemapProjectionSuccessorSeal?
+        if state.workerTask == nil,
+           state.pendingSnapshot == nil,
+           let engineSessionID = session.engineProjectionSessionID
+        {
+            preparedSeal = await engine.prepareCompletedProjectionSuccessor(
                 rootEpoch: snapshot.rootEpoch,
-                liveSnapshot: snapshot
+                liveSnapshot: snapshot,
+                expectedSessionID: engineSessionID
             )
-            : nil
+        }
         if let seal = preparedSeal,
            state.desiredKey == WorkspaceCodemapSelectionGraphRuntimeKey(
                generation: seal.predecessorProof.generation
