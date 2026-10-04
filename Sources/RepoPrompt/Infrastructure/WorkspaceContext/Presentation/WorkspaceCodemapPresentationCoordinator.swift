@@ -204,6 +204,8 @@ struct WorkspaceCodemapPresentationCoordinator {
         WorkspaceCodemapAutomaticSelectionPublicationReceipt
     ) async throws -> Void
     let structureAttemptDidBegin: @Sendable (Int) -> Void
+    /// Receives one terminal diagnostic record per structure invocation; nil disables tracing.
+    let structureDiagnosticSink: WorkspaceCodemapStructureDiagnostics.Sink?
 
     init(
         store: WorkspaceFileContextStore,
@@ -217,12 +219,38 @@ struct WorkspaceCodemapPresentationCoordinator {
         ) async throws -> Void = { _ in },
         structureAttemptDidBegin: @escaping @Sendable (Int) -> Void = { _ in }
     ) {
+        self.init(
+            store: store,
+            policy: policy,
+            waiter: waiter,
+            beforePublicationRevalidation: beforePublicationRevalidation,
+            afterAutomaticCandidateReconstruction: afterAutomaticCandidateReconstruction,
+            structureAttemptDidBegin: structureAttemptDidBegin,
+            structureDiagnosticSink: WorkspaceCodemapStructureDiagnostics.processSink
+        )
+    }
+
+    /// Internal seam with an explicit diagnostic sink (tests); production uses the process opt-in.
+    init(
+        store: WorkspaceFileContextStore,
+        policy: WorkspaceCodemapPresentationRequestPolicy = .default,
+        waiter: WorkspaceCodemapPresentationWaiter = .production,
+        beforePublicationRevalidation: @escaping @Sendable (
+            WorkspaceCodemapOperationPresentationPublicationReceipt
+        ) async -> Void = { _ in },
+        afterAutomaticCandidateReconstruction: @escaping @Sendable (
+            WorkspaceCodemapAutomaticSelectionPublicationReceipt
+        ) async throws -> Void = { _ in },
+        structureAttemptDidBegin: @escaping @Sendable (Int) -> Void = { _ in },
+        structureDiagnosticSink: WorkspaceCodemapStructureDiagnostics.Sink?
+    ) {
         self.store = store
         self.policy = policy
         self.waiter = waiter
         self.beforePublicationRevalidation = beforePublicationRevalidation
         self.afterAutomaticCandidateReconstruction = afterAutomaticCandidateReconstruction
         self.structureAttemptDidBegin = structureAttemptDidBegin
+        self.structureDiagnosticSink = structureDiagnosticSink
     }
 
     func presentation(
@@ -1701,6 +1729,40 @@ extension WorkspaceCodemapPresentationCoordinator {
         rootScope: WorkspaceLookupRootScope = .visibleWorkspace,
         logicalRootDisplayNamesByRootID: [UUID: String] = [:]
     ) async throws -> WorkspaceCodemapStructurePresentation {
+        var trace = WorkspaceCodemapStructureDiagnosticTrace(
+            isEnabled: structureDiagnosticSink != nil,
+            direction: direction,
+            requestedSeedCount: seedFileIDs.count,
+            maximumAttemptCount: policy.maximumStructurePublicationAttempts,
+            totalWait: policy.maximumTotalWait
+        )
+        do {
+            let presentation = try await structurePresentationAttempts(
+                seedFileIDs: seedFileIDs,
+                direction: direction,
+                traversalLimits: traversalLimits,
+                outputLimits: outputLimits,
+                rootScope: rootScope,
+                logicalRootDisplayNamesByRootID: logicalRootDisplayNamesByRootID,
+                trace: &trace
+            )
+            if let record = trace.finish(returning: presentation) { structureDiagnosticSink?(record) }
+            return presentation
+        } catch {
+            if let record = trace.finish(throwing: error) { structureDiagnosticSink?(record) }
+            throw error
+        }
+    }
+
+    private func structurePresentationAttempts(
+        seedFileIDs: [UUID],
+        direction: WorkspaceCodemapStructureTraversalDirection?,
+        traversalLimits: WorkspaceCodemapStructureTraversalLimits,
+        outputLimits: WorkspaceCodemapStructureOutputLimits,
+        rootScope: WorkspaceLookupRootScope,
+        logicalRootDisplayNamesByRootID: [UUID: String],
+        trace: inout WorkspaceCodemapStructureDiagnosticTrace
+    ) async throws -> WorkspaceCodemapStructurePresentation {
         if direction == nil,
            let published = await store.publishedCodemapStructurePresentation(
                seedFileIDs: seedFileIDs,
@@ -1710,10 +1772,12 @@ extension WorkspaceCodemapPresentationCoordinator {
            )
         {
             try Task.checkCancellation()
+            trace.decide(.publishedFastPath)
             return published
         }
         let clock = ContinuousClock()
         let deadline = clock.now.advanced(by: policy.maximumTotalWait)
+        trace.setDeadline(deadline)
         var lastStaleReason: WorkspaceCodemapStructurePublicationStaleReason?
         var publicationRevocationForRetry: WorkspaceCodemapStructurePublicationRevocation?
         let recoveryState = WorkspaceCodemapDemandRecoveryState()
@@ -1721,6 +1785,7 @@ extension WorkspaceCodemapPresentationCoordinator {
         for attemptIndex in 0 ..< policy.maximumStructurePublicationAttempts {
             try Task.checkCancellation()
             structureAttemptDidBegin(attemptIndex)
+            trace.beginAttempt(attemptIndex)
             let ownership = WorkspaceCodemapOperationPresentationOwnership()
             do {
                 let attempt = try await makeStructureAttempt(
@@ -1733,28 +1798,44 @@ extension WorkspaceCodemapPresentationCoordinator {
                     ownership: ownership,
                     clock: clock,
                     deadline: deadline,
-                    recoveryState: recoveryState
+                    recoveryState: recoveryState,
+                    trace: &trace
+                )
+                trace.record(
+                    .attemptResult,
+                    code: attempt.staleReason.map { WorkspaceCodemapStructureDiagnosticClassifier.code(for: $0) }
+                        ?? WorkspaceCodemapStructureDiagnosticClassifier.code(for: attempt.presentation.outcome),
+                    details: [
+                        .flag(.receipt, attempt.receipt != nil),
+                        .flag(.unrestartable, attempt.unrestartablePresentation != nil),
+                        .count(.entries, attempt.presentation.entries.count),
+                        .count(.issues, attempt.presentation.issues.count)
+                    ]
                 )
                 if let staleReason = attempt.staleReason {
                     lastStaleReason = staleReason
                     publicationRevocationForRetry = nil
-                    await release(ownership)
+                    await release(ownership, recordingInto: &trace)
                     if attemptIndex + 1 < policy.maximumStructurePublicationAttempts,
                        clock.now < deadline
                     {
                         continue
                     }
+                    trace.decide(
+                        attempt.unrestartablePresentation == nil ? .staleAfterAttempt : .unrestartableAfterAttempt
+                    )
                     return attempt.unrestartablePresentation
                         ?? .stale(staleReason, requestedSeedCount: seedFileIDs.count)
                 }
                 guard let receipt = attempt.receipt else {
-                    await release(ownership)
+                    await release(ownership, recordingInto: &trace)
                     if let publicationRevocationForRetry,
                        receiptlessRetryWasEmptiedByPublicationRevocation(
                            attempt.presentation,
                            revokedOutputFileIDs: publicationRevocationForRetry.outputFileIDs
                        )
                     {
+                        trace.decide(.staleAfterReceiptlessRevocation)
                         return .stale(
                             publicationRevocationForRetry.reason,
                             requestedSeedCount: seedFileIDs.count
@@ -1764,15 +1845,21 @@ extension WorkspaceCodemapPresentationCoordinator {
                     // authoritative busy, budget, unavailable, or terminal
                     // result. Do not mask it unless the revoked receipt's files
                     // are now the only candidate-admission failures.
+                    trace.decide(.attemptPresentationWithoutReceipt)
                     return attempt.presentation
                 }
+                let hookStarted = trace.mark()
                 await beforePublicationRevalidation(receipt.presentation)
-                switch await store.revalidateCodemapStructureForPublication(
+                trace.recordDuration(.publicationHook, since: hookStarted)
+                let revalidation = await store.revalidateCodemapStructureForPublication(
                     receipt,
                     rootScope: rootScope
-                ) {
+                )
+                trace.record(.revalidation, code: WorkspaceCodemapStructureDiagnosticClassifier.code(for: revalidation))
+                switch revalidation {
                 case .current:
-                    await release(ownership)
+                    await release(ownership, recordingInto: &trace)
+                    trace.decide(.revalidatedCurrent)
                     return attempt.presentation
                 case let .stale(reason):
                     lastStaleReason = reason
@@ -1780,21 +1867,127 @@ extension WorkspaceCodemapPresentationCoordinator {
                         reason: reason,
                         outputFileIDs: Set(receipt.outputFileIDs)
                     )
-                    await release(ownership)
+                    await release(ownership, recordingInto: &trace)
                     if attemptIndex + 1 < policy.maximumStructurePublicationAttempts,
                        clock.now < deadline
                     {
                         continue
                     }
+                    trace.decide(.staleAfterRevalidation)
                     return .stale(reason, requestedSeedCount: seedFileIDs.count)
                 }
             } catch {
-                await release(ownership)
+                await release(ownership, recordingInto: &trace)
                 if Task.isCancelled || error is CancellationError { throw CancellationError() }
                 throw error
             }
         }
+        trace.decide(.attemptsExhausted)
         return .stale(lastStaleReason ?? .output, requestedSeedCount: seedFileIDs.count)
+    }
+
+    /// Existing ownership release with its duration recorded after it completes.
+    private func release(
+        _ ownership: WorkspaceCodemapOperationPresentationOwnership,
+        recordingInto trace: inout WorkspaceCodemapStructureDiagnosticTrace
+    ) async {
+        let started = trace.mark()
+        await release(ownership)
+        trace.recordDuration(.cleanup, since: started)
+    }
+
+    private static func diagnosticDemandDetails(
+        _ batch: DemandBatch
+    ) -> [WorkspaceCodemapStructureDiagnosticDetail] {
+        var ready = 0
+        var pending = 0
+        var unavailable = 0
+        for result in batch.resultsByFileID.values {
+            switch result {
+            case .ready: ready += 1
+            case .pending: pending += 1
+            case .unavailable: unavailable += 1
+            }
+        }
+        return [
+            .count(.ready, ready),
+            .count(.pending, pending),
+            .count(.unavailable, unavailable),
+            .count(.resets, batch.resetRootEpochs.count),
+            .flag(.deadlineReached, batch.deadlineReached),
+            .flag(.roundLimitReached, batch.defensiveRoundLimitReached)
+        ]
+    }
+
+    private static func diagnosticProjectionWait(
+        _ outcome: ProjectionDemandWaitOutcome
+    ) -> WorkspaceCodemapStructureDiagnosticClassifier.ProjectionWait {
+        switch outcome {
+        case .ready: .ready
+        case .busy: .busy
+        case .timeout: .timeout
+        case let .unavailable(reason, _): .unavailable(reason)
+        case .stale: .stale
+        case .cancelled: .cancelled
+        }
+    }
+
+    /// The first non-ready projection outcome (the one the attempt acts on), or `ready`.
+    private static func diagnosticProjectionCode(
+        _ outcomes: [ProjectionDemandWaitOutcome]
+    ) -> WorkspaceCodemapStructureDiagnosticCode {
+        for outcome in outcomes {
+            if case .ready = outcome { continue }
+            return WorkspaceCodemapStructureDiagnosticClassifier.code(for: diagnosticProjectionWait(outcome))
+        }
+        return WorkspaceCodemapStructureDiagnosticClassifier.code(
+            for: WorkspaceCodemapStructureDiagnosticClassifier.ProjectionWait.ready
+        )
+    }
+
+    private static func diagnosticProjectionDetails(
+        _ outcomes: [ProjectionDemandWaitOutcome]
+    ) -> [WorkspaceCodemapStructureDiagnosticDetail] {
+        var ready = 0
+        for outcome in outcomes {
+            if case .ready = outcome { ready += 1 }
+        }
+        return [.count(.roots, outcomes.count), .count(.ready, ready)]
+    }
+
+    /// The first freeze or render failure code, or nil when every frozen bundle rendered.
+    private static func diagnosticFreezeRenderCode(
+        _ issues: [WorkspaceCodemapStructureIssue]
+    ) -> WorkspaceCodemapStructureDiagnosticCode? {
+        for issue in issues {
+            switch issue {
+            case .freezeUnavailable, .renderUnavailable:
+                return WorkspaceCodemapStructureDiagnosticClassifier.code(for: issue)
+            default:
+                continue
+            }
+        }
+        return nil
+    }
+
+    private static func diagnosticFreezeRenderDetails(
+        bundleCount: Int,
+        issues: [WorkspaceCodemapStructureIssue]
+    ) -> [WorkspaceCodemapStructureDiagnosticDetail] {
+        var freezeUnavailable = 0
+        var renderUnavailable = 0
+        for issue in issues {
+            switch issue {
+            case .freezeUnavailable: freezeUnavailable += 1
+            case .renderUnavailable: renderUnavailable += 1
+            default: break
+            }
+        }
+        return [
+            .count(.bundles, bundleCount),
+            .count(.freezeUnavailable, freezeUnavailable),
+            .count(.renderUnavailable, renderUnavailable)
+        ]
     }
 
     private func receiptlessRetryWasEmptiedByPublicationRevocation(
@@ -1826,7 +2019,8 @@ extension WorkspaceCodemapPresentationCoordinator {
         ownership: WorkspaceCodemapOperationPresentationOwnership,
         clock: ContinuousClock,
         deadline: ContinuousClock.Instant,
-        recoveryState: WorkspaceCodemapDemandRecoveryState
+        recoveryState: WorkspaceCodemapDemandRecoveryState,
+        trace: inout WorkspaceCodemapStructureDiagnosticTrace
     ) async throws -> WorkspaceCodemapStructureAttempt {
         let seedDemandLimit = min(
             policy.maximumCandidateDemandCount,
@@ -1837,6 +2031,11 @@ extension WorkspaceCodemapPresentationCoordinator {
             rootScope: rootScope,
             maximumUniqueFileCount: seedDemandLimit
         )
+        trace.record(.seedAdmission, details: [
+            .count(.admitted, seedAdmission.fileIDs.count),
+            .count(.issues, seedAdmission.issues.count),
+            .flag(.limitExceeded, seedAdmission.didExceedLimit)
+        ])
         var issues = seedAdmission.issues.map(WorkspaceCodemapStructureIssue.candidate)
         guard !seedAdmission.didExceedLimit else {
             issues.append(.seedDemandLimit(
@@ -1864,6 +2063,10 @@ extension WorkspaceCodemapPresentationCoordinator {
             logicalRootDisplayNamesByRootID: logicalRootDisplayNamesByRootID
         )
         issues.append(contentsOf: seedCollection.issues.map(WorkspaceCodemapStructureIssue.candidate))
+        trace.record(.seedCandidates, details: [
+            .count(.candidates, seedCollection.candidates.count),
+            .count(.issues, seedCollection.issues.count)
+        ])
         let seedCountsByRoot = Dictionary(
             grouping: seedCollection.candidates,
             by: \.rootEpoch
@@ -1938,6 +2141,7 @@ extension WorkspaceCodemapPresentationCoordinator {
             deadline: deadline,
             recoveryState: recoveryState
         )
+        trace.record(.seedDemand, details: Self.diagnosticDemandDetails(seedDemand))
         var readyTicketsByFileID: [UUID: WorkspaceCodemapArtifactDemandTicket] = [:]
         var graphSeeds: [WorkspaceCodemapStoreSelectionGraphSourceIdentity] = []
         for candidate in seedCollection.candidates {
@@ -2090,6 +2294,11 @@ extension WorkspaceCodemapPresentationCoordinator {
                 )
                 projectionOutcomes.append((outcome, acquired.sourceTickets, acquired.ticket))
             }
+            trace.record(
+                .projection,
+                code: Self.diagnosticProjectionCode(projectionOutcomes.map(\.outcome)),
+                details: Self.diagnosticProjectionDetails(projectionOutcomes.map(\.outcome))
+            )
 
             for (waitOutcome, sourceTickets, projectionTicket) in projectionOutcomes {
                 switch waitOutcome {
@@ -2159,11 +2368,16 @@ extension WorkspaceCodemapPresentationCoordinator {
                             staleReason: nil
                         )
                     }
-                    switch await store.prepareCodemapProjectionRootSessionRetry(
+                    let preparation = await store.prepareCodemapProjectionRootSessionRetry(
                         projectionTicket,
                         reason: reason,
                         deadline: deadline
-                    ) {
+                    )
+                    trace.record(
+                        .projectionRootSessionRetry,
+                        code: WorkspaceCodemapStructureDiagnosticClassifier.code(for: preparation)
+                    )
+                    switch preparation {
                     case .prepared, .stale:
                         let staleFileID = sourceTickets.first?.fileID
                             ?? graphSeeds.first { $0.ticket.rootEpoch == projectionTicket.rootEpoch }?
@@ -2260,6 +2474,7 @@ extension WorkspaceCodemapPresentationCoordinator {
                     limits: traversalLimits
                 )
             )
+            var traversalQueryCount = 1
             for round in 0 ..< policy.maximumReadinessRounds {
                 let awaitsExactReadiness = switch disposition {
                 case .pending, .unavailable(.graphNotBuilt), .unavailable(.definitionUniverse): true
@@ -2276,7 +2491,13 @@ extension WorkspaceCodemapPresentationCoordinator {
                         limits: traversalLimits
                     )
                 )
+                traversalQueryCount += 1
             }
+            trace.record(
+                .initialTraversal,
+                code: WorkspaceCodemapStructureDiagnosticClassifier.code(for: disposition),
+                details: [.count(.queries, traversalQueryCount)]
+            )
 
             var traversalResult: WorkspaceCodemapStructureTraversalResult?
             switch disposition {
@@ -2377,6 +2598,10 @@ extension WorkspaceCodemapPresentationCoordinator {
                         clock: clock,
                         deadline: deadline,
                         recoveryState: recoveryState
+                    )
+                    trace.record(
+                        .targetDemand,
+                        details: [.count(.targets, targetIDs.count)] + Self.diagnosticDemandDetails(targetDemand)
                     )
                     if let resetRootEpoch = targetDemand.resetRootEpochs.sorted(
                         by: workspaceCodemapRootEpochPrecedes
@@ -2498,6 +2723,7 @@ extension WorkspaceCodemapPresentationCoordinator {
                             limits: traversalLimits
                         )
                     )
+                    var targetTraversalQueryCount = 1
                     for round in 0 ..< policy.maximumReadinessRounds {
                         let awaitsExactReadiness = switch revalidated {
                         case .pending, .unavailable(.graphNotBuilt), .unavailable(.definitionUniverse): true
@@ -2519,7 +2745,13 @@ extension WorkspaceCodemapPresentationCoordinator {
                                 limits: traversalLimits
                             )
                         )
+                        targetTraversalQueryCount += 1
                     }
+                    trace.record(
+                        .targetTraversal,
+                        code: WorkspaceCodemapStructureDiagnosticClassifier.code(for: revalidated),
+                        details: [.count(.queries, targetTraversalQueryCount)]
+                    )
                     switch revalidated {
                     case let .readyPartial(result):
                         if !result.partialReasons.isEmpty {
@@ -2638,6 +2870,11 @@ extension WorkspaceCodemapPresentationCoordinator {
             ))
             orderedCandidates = Array(orderedCandidates.prefix(outputLimits.maximumFileCount))
         }
+        trace.record(.presentationCandidates, details: [
+            .count(.candidates, candidateCollection.candidates.count),
+            .count(.issues, candidateCollection.issues.count),
+            .count(.ordered, orderedCandidates.count)
+        ])
 
         var requestsByRoot: [WorkspaceCodemapRootEpoch: [WorkspaceCodemapPresentationRequest]] = [:]
         for candidate in orderedCandidates {
@@ -2678,6 +2915,12 @@ extension WorkspaceCodemapPresentationCoordinator {
                 }
             }
         }
+
+        trace.record(
+            .freezeRender,
+            code: Self.diagnosticFreezeRenderCode(issues),
+            details: Self.diagnosticFreezeRenderDetails(bundleCount: bundleReceipts.count, issues: issues)
+        )
 
         let separatorTokens = TokenCalculationService.estimateTokens(for: "\n\n")
         var structureEntries: [WorkspaceCodemapStructureRenderedEntry] = []

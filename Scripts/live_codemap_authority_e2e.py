@@ -11,8 +11,12 @@ Git-status cadence, not the separate ordinary/default-status baseline.
 Requires Python 3, git, gitleaks >= 8.19 (dir command), xcrun swiftc, and rpce-cli-debug.
 Every demand must finish UNDER 10 seconds measured CLI-inclusive (startup,
 bind_context, server, transport); the original server deadline is unchanged.
-No app lifecycle, agents, settings mutations, existing workspace switches,
-cleanup, or product Git mutations. Raw evidence/workspaces are retained.
+No app lifecycle, agents, settings mutations, existing-window workspace switches,
+cleanup, or product Git mutations. Each fixture workspace is created ONCE without
+switching; only the harness-created window is switched, once, after it settles.
+The metadata-only empty commit uses a disposable GIT_INDEX_FILE copy (original-
+index isolation), proven first on a new unregistered offline fixture. Raw
+evidence/workspaces are retained.
 This focused reproduction is NOT the packaged-app codemap release gate.
 """
 from __future__ import annotations
@@ -30,6 +34,7 @@ import re
 import shlex
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -49,6 +54,11 @@ LANES = ("index-only", "catalog-only", "metadata-only", "separated-combined", "o
 STAT_FIELDS = ("dev", "ino", "mode", "size", "mtime_ns", "ctime_ns")
 COUNTER_FIELDS = ("capability_resolutions", "repository_authority_changes", "store_root_session_repairs")
 ROOT_COUNTER_FIELDS = ("root_capability_resolutions", "root_repository_authority_changes", "root_store_session_repairs")
+PRIMARY_ROOT_KIND, GIT_DATA_ROOT_KIND = "primary_workspace", "workspace_git_data"
+# CE default workspace storage (WorkspaceStoragePaths.defaultRoot); a custom storage root fails closed.
+WORKSPACE_STORAGE_ROOT = Path.home()/"Library"/"Application Support"/"RepoPrompt CE"/"Workspaces"
+SETTLED_READINESS_STATES = ("ready", "degraded")
+READINESS_OBSERVATIONS, READINESS_INTERVAL_SECONDS = 20, .5
 
 
 def stamp():
@@ -110,11 +120,12 @@ class Runner:
                         GIT_COMMITTER_NAME="Fixture E2E", GIT_AUTHOR_EMAIL="fixture-e2e@example.invalid",
                         GIT_COMMITTER_EMAIL="fixture-e2e@example.invalid")
 
-    def run(self, label, argv, *, timeout=TIMEOUT):
+    def run(self, label, argv, *, timeout=TIMEOUT, env=None):
         started, tick = stamp(), time.monotonic()
         out, err, code, timed_out = b"", b"", None, False
+        overrides = dict(env or {})
         try:
-            process = subprocess.Popen(argv, cwd=self.artifact, env=self.env,
+            process = subprocess.Popen(argv, cwd=self.artifact, env={**self.env, **overrides},
                                        stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
             try:
                 out, err = process.communicate(timeout=timeout)
@@ -130,7 +141,7 @@ class Runner:
         except OSError as error:
             err = str(error).encode()
         record = dict(label=label, argv=list(map(str, argv)), command=shlex.join(map(str, argv)),
-                      started_at=started, finished_at=stamp(), elapsed_seconds=time.monotonic()-tick,
+                      env_overrides=overrides, started_at=started, finished_at=stamp(), elapsed_seconds=time.monotonic()-tick,
                       returncode=code, timed_out=timed_out, timeout_seconds=timeout,
                       stdout=out.decode(errors="replace"), stderr=err.decode(errors="replace"))
         with self.lock:
@@ -160,6 +171,8 @@ class Runner:
             if (not isinstance(roots, list) or any(not isinstance(p, str) for p in roots)
                     or [str(Path(p).resolve()) for p in roots] != [str(self.expected_root)]):
                 raise ValueError("binding does not have exactly the owned fixture root")
+            return roots[0]  # the app's admitted LOGICAL spelling of the owned root (e.g. /tmp/... on macOS)
+        return None
 
     def check_edit_path(self, payload):
         root = self.owned_fixture(self.expected_root)
@@ -170,12 +183,38 @@ class Runner:
         if (not path.is_absolute() or path.parent != root or path.resolve() != path
                 or path.is_symlink() or path.name != "ControlAuthorityAdded.swift"):
             raise ValueError("edit path is not the absolute owned fixture source")
+        return path
+
+    def edit_admission(self, physical, logical_root):
+        """Admission spelling = VERIFIED binding root + owned leaf, proven to be the SAME owned file. No alias guessing."""
+        root = self.owned_fixture(self.expected_root)
+        if (not isinstance(logical_root, str) or not os.path.isabs(logical_root)
+                or os.path.normpath(logical_root) != logical_root):
+            raise ValueError("binding root is not an absolute normalized logical spelling")
+        logical = Path(logical_root)/physical.name
+        try:
+            # lstat: the logical root itself must be the owned directory, not a (retargetable) symlink to it.
+            alias, owned = os.lstat(logical_root), os.lstat(root)
+            leaves = [os.lstat(path) if os.path.lexists(path) else None for path in (logical, physical)]
+            resolved_root = Path(logical_root).resolve(strict=True)
+        except OSError as error:
+            raise ValueError("logical edit root identity cannot be proven") from error
+        same_directory = {"dev": owned.st_dev, "ino": owned.st_ino}
+        if (not stat.S_ISDIR(alias.st_mode) or {"dev": alias.st_dev, "ino": alias.st_ino} != same_directory
+                or resolved_root != root or logical.resolve(strict=False) != physical or (leaves[0] is None) != (leaves[1] is None)
+                or any(leaf is not None and not stat.S_ISREG(leaf.st_mode) for leaf in leaves)
+                or (leaves[0] is not None and (leaves[0].st_dev, leaves[0].st_ino) != (leaves[1].st_dev, leaves[1].st_ino))):
+            raise ValueError("logical edit path is not proven to be the same harness-owned file")
+        return logical, {"binding_logical_root": logical_root, "dispatched_path": str(logical),
+                         "physical_root": str(root), "physical_path": str(physical),
+                         "same_directory": same_directory, "leaf_present": leaves[0] is not None}
 
     def call(self, label, tool, payload):
         routed = {**payload, "_windowID": self.window, "context_id": self.context}
         # Reuse the benchmark's atomic binding verification, but explicitly route
         # BOTH the binding and tool JSON. Never trust -w/-t alone.
         bind = {"op": "bind", "window_id": self.window, "_windowID": self.window, "context_id": self.context}
+        logical_root = None
         if tool == "apply_edits":
             self.check_edit_path(routed)
             # A read-only bind preflight must succeed BEFORE any mutation is dispatched.
@@ -185,33 +224,176 @@ class Runner:
             document = json.loads(preflight["stdout"])
             if not isinstance(document, dict) or not tool_ok(document):
                 raise ValueError("write preflight binding failed")
-            self.check_binding(document.get("binding"))
-            self.check_edit_path(routed)
-            # Absolute physical ownership cannot be redirected by a later root switch.
-            # The tool also admits this absolute path against its CURRENT mutation scope.
+            logical_root = self.check_binding(document.get("binding"))
+            physical = self.check_edit_path(routed)
+            # The app admits absolute paths by its loaded root's LOGICAL spelling (/tmp/..., not /private/tmp/...).
+            # Dispatch that spelling only after proving it is the same owned file; the tool also admits it
+            # against its CURRENT mutation scope, so a later root switch cannot redirect the write.
+            admission, proof = self.edit_admission(physical, logical_root)
+            bench.save_json(self.artifact/"edit-admissions"/f"{bench.safe_name(label)}.json",
+                            {"label": label, **proof}, exclusive=True)
+            routed = {**routed, "path": str(admission)}
         command = f"call bind_context {json.dumps(bind)} && call {tool} {json.dumps(routed)}"
         raw = self.run(label, [str(self.cli), "--raw-json", "-w", str(self.window), "-e", command])
         binding, value = bench.parse_atomic_cli_output(raw["stdout"], expected_context_id=self.context,
                                                        expected_window_id=self.window)
-        self.check_binding(binding)
+        executed_root = self.check_binding(binding)
+        if tool == "apply_edits" and executed_root != logical_root:
+            raise ValueError("edit executed under a different logical root spelling than the proven admission")
         if not tool_ok(value):
             raise ValueError(f"{label}: exit-zero tool error: {value}")
         return value, raw["elapsed_seconds"]
 
-    def git(self, root, label, *args):
+    def git(self, root, label, *args, env=None):
         self.owned_fixture(root)
-        return self.run(label, ["git", "-c", "core.hooksPath=/dev/null", "-c", "commit.gpgsign=false",
-                               "-c", "tag.gpgsign=false", "-C", str(root), *args])["stdout"]
+        argv = ["git", "-c", "core.hooksPath=/dev/null", "-c", "commit.gpgsign=false",
+                "-c", "tag.gpgsign=false", "-C", str(root), *args]
+        return self.run(label, argv, **({"env": env} if env else {}))["stdout"]
+
+
+def global_windows(runner, label):
+    # Explicitly approved bootstrap exception: global read-only window inventory only.
+    raw = runner.run(label, [str(runner.cli), "--raw-json", "-e", "windows"])
+    listing = json.loads(raw["stdout"])
+    windows = listing.get("windows") if isinstance(listing, dict) else None
+    if not isinstance(listing, dict) or not tool_ok(listing) or not isinstance(windows, list):
+        raise ValueError("invalid global window-discovery JSON")
+    ids = [window.get("window_id") if isinstance(window, dict) else None for window in windows]
+    if any(type(item) is not int or item <= 0 for item in ids) or len(set(ids)) != len(ids):
+        raise ValueError("global window discovery returned invalid or duplicate window IDs")
+    return windows
+
+
+def created_workspace(value, name, root, existing_window_ids, bootstrap_window):
+    """Validate the create reply BEFORE anything is switched; retain the NEW window identity."""
+    if not isinstance(value, dict) or value.get("action") != "create" or value.get("status") != "ok":
+        raise ValueError("unexpected manage_workspaces create reply")
+    window = value.get("window_id")
+    if type(window) is not int or window <= 0 or window in existing_window_ids or window == bootstrap_window:
+        raise ValueError("create did not return a NEW harness-owned window; nothing will be switched")
+    workspaces = value.get("workspaces")
+    workspace = workspaces[0] if isinstance(workspaces, list) and len(workspaces) == 1 else None
+    paths = workspace.get("repo_paths") if isinstance(workspace, dict) else None
+    if (not isinstance(workspace, dict) or not isinstance(workspace.get("id"), str) or workspace.get("name") != name
+            or not isinstance(paths, list) or any(not isinstance(path, str) for path in paths)
+            or [str(Path(path).resolve()) for path in paths] != [str(root)]
+            or workspace.get("showing_window_ids") != []):
+        raise ValueError("created workspace identity/root mismatch, or it was already switched")
+    return {"workspace_id": bench.validate_uuid(workspace["id"], "created workspace_id"), "workspace_name": name,
+            "window_id": window, "root_path": str(root), "bootstrap_window_id": bootstrap_window,
+            "pre_create_window_ids": sorted(existing_window_ids), "switched": False}
+
+
+def loading_observation(value, window_id):
+    payload = diagnostic_record(value, "workspace_loading_snapshot")
+    loading = payload.get("workspace_loading")
+    readiness = loading.get("readiness") if isinstance(loading, dict) else None
+    switch = loading.get("workspace_switch") if isinstance(loading, dict) else None
+    overlay = switch.get("overlay") if isinstance(switch, dict) else None
+    if (type(payload.get("window_id")) is not int or payload["window_id"] != window_id
+            or not isinstance(readiness, dict) or not isinstance(readiness.get("state"), str)
+            or not isinstance(overlay, dict) or type(overlay.get("is_visible")) is not bool):
+        raise ValueError("malformed workspace_loading_snapshot for the owned new window")
+    workspace_id = payload.get("workspace_id")
+    try:
+        workspace_id = bench.validate_uuid(workspace_id, "observed workspace") if isinstance(workspace_id, str) else None
+    except bench.BenchmarkError:
+        workspace_id = None
+    readiness_workspace = readiness.get("workspace_id")
+    observation = {"workspace_id": workspace_id, "state": readiness["state"],
+                   "generation": readiness.get("generation"), "overlay_visible": overlay["is_visible"]}
+    observation["settled"] = (readiness["state"] in SETTLED_READINESS_STATES and workspace_id is not None
+                              and isinstance(readiness_workspace, str) and readiness_workspace.upper() == workspace_id
+                              and type(observation["generation"]) is int and not overlay["is_visible"])
+    return observation
+
+
+def await_owned_window_settled(runner, owned, label, receipt):
+    """Bounded READ-ONLY observation routed through the bootstrap binding with an explicit window_id.
+
+    Observational, NOT atomic: a restore/switch that races the single later switch fails closed.
+    """
+    previous = None
+    for attempt in range(READINESS_OBSERVATIONS):
+        if attempt:
+            time.sleep(READINESS_INTERVAL_SECONDS)
+        value, _ = runner.call(f"{label}-{attempt}", bench.DEBUG_TOOL,
+                               {"op": "workspace_loading_snapshot", "window_id": owned["window_id"]})
+        observation = loading_observation(value, owned["window_id"])
+        receipt["observations"].append(observation)
+        key = ((observation["workspace_id"], observation["state"], observation["generation"])
+               if observation["settled"] else None)
+        if key is not None and key == previous:
+            receipt.update(settled=True, workspace_id=key[0], state=key[1], generation=key[2])
+            return receipt
+        previous = key
+    raise ValueError("owned new window did not report a stable settled workspace within the bounded observation; "
+                     "switch not dispatched")
+
+
+def bind_settled_owned_window(runner, owned, receipt, label):
+    windows = [window for window in global_windows(runner, label) if window["window_id"] == owned["window_id"]]
+    window = windows[0] if len(windows) == 1 else {}
+    workspace, tabs, context = window.get("workspace"), window.get("tabs"), window.get("active_context_id")
+    matches = [tab for tab in tabs if isinstance(tab, dict) and tab.get("context_id") == context] if isinstance(tabs, list) else []
+    if (not isinstance(workspace, dict) or not isinstance(workspace.get("id"), str)
+            or workspace["id"].upper() != receipt.get("workspace_id") or not isinstance(context, str) or len(matches) != 1
+            or not isinstance(matches[0].get("workspace_id"), str)
+            or matches[0]["workspace_id"].upper() != receipt["workspace_id"]):
+        raise ValueError("owned new window changed after readiness observation or lacks one active context; "
+                         "switch not dispatched")
+    receipt["bound_context_id"] = bench.validate_uuid(context, "owned window context")
+    return receipt["bound_context_id"]
+
+
+def switch_owned_window(runner, owned, label):
+    window = owned["window_id"]
+    if window in owned["pre_create_window_ids"] or window == owned["bootstrap_window_id"] or runner.window != window:
+        raise ValueError("refusing to switch a window this harness did not create")
+    # Exactly one explicit switch; a block/race propagates as a failure and is never retried.
+    value, _ = runner.call(label, "manage_workspaces",
+                           {"action": "switch", "workspace": owned["workspace_id"], "window_id": window})
+    if not isinstance(value, dict) or value.get("action") != "switch" or value.get("status") != "ok":
+        raise ValueError("owned-window switch did not report ok; not retried")
+    owned["switched"] = True
+
+
+def open_owned_fixture_workspace(runner, name, root, bootstrap, snapshots, extra=None):
+    """Create ONCE without switching, then switch only the harness-created window after it settles."""
+    runner.window, runner.context = bootstrap
+    runner.expected_root = None
+    workspace_name = f"RPCE Search Bench Codemap Authority {runner.artifact.name} {name}"
+    existing = {window["window_id"] for window in global_windows(runner, name+"-windows-before-create")}
+    value, _ = runner.call(name+"-create-workspace", "manage_workspaces",
+                          {"action": "create", "name": workspace_name, "folder_path": str(root),
+                           "open_in_new_window": True, "switch_to_created": False})
+    owned = created_workspace(value, workspace_name, root, existing, bootstrap[0])
+    scope = {"workspace_id": owned["workspace_id"], "workspace_name": workspace_name,
+             "window_id": owned["window_id"], "root_path": str(root)}
+    data = snapshots[name] = {**(extra or {}), "owned": owned, "scope": scope}
+    readiness = data["owned_window_readiness"] = {
+        "policy": "read-only workspace_loading_snapshot via bootstrap binding with explicit owned window_id; "
+                  "observational, NOT atomic; races fail closed at the single switch",
+        "bound": {"observations": READINESS_OBSERVATIONS, "interval_seconds": READINESS_INTERVAL_SECONDS,
+                  "stable_consecutive": 2, "settled_states": list(SETTLED_READINESS_STATES)},
+        "observations": [], "settled": False}
+    bench.save_json(runner.artifact/"lanes.json", snapshots)
+    try:
+        await_owned_window_settled(runner, owned, name+"-owned-window-readiness", readiness)
+        context = bind_settled_owned_window(runner, owned, readiness, name+"-discover-owned-window")
+        runner.window, runner.context = owned["window_id"], context
+        switch_owned_window(runner, owned, name+"-switch-owned-window")
+    finally:
+        bench.save_json(runner.artifact/"lanes.json", snapshots)
+    scope["context_id"] = discover_created_context(runner, scope)
+    runner.window, runner.context = scope["window_id"], scope["context_id"]
+    runner.expected_root = root
+    return data, scope
 
 
 def discover_created_context(runner, scope):
-    # Explicitly approved bootstrap exception: global read-only inventory only.
-    # There is no context ID to route to until the newly created window is found.
-    raw = runner.run("discover-"+scope["workspace_id"], [str(runner.cli), "--raw-json", "-e", "windows"])
-    listing = json.loads(raw["stdout"])
-    if not tool_ok(listing) or not isinstance(listing.get("windows"), list):
-        raise ValueError("invalid global window-discovery JSON")
-    windows = [w for w in listing["windows"] if w.get("window_id") == scope["window_id"]]
+    # There is no fixture context ID to route to until the switched owned window is rediscovered.
+    windows = [w for w in global_windows(runner, "discover-"+scope["workspace_id"]) if w["window_id"] == scope["window_id"]]
     if len(windows) != 1:
         raise ValueError("created window identity missing or ambiguous")
     tabs = [t for t in windows[0]["tabs"] if t.get("workspace_id") == scope["workspace_id"]]
@@ -220,7 +402,7 @@ def discover_created_context(runner, scope):
     return bench.validate_uuid(tabs[0]["context_id"], "fixture context")
 
 
-def commit(runner, root, label, empty=False):
+def commit(runner, root, label, empty=False, isolated_index=False):
     # No write-tree probes: those can themselves change index cache-tree metadata.
     before = index_state(root)
     runner.git(root, label+"-status", "--no-optional-locks", "status", "--short")
@@ -236,7 +418,51 @@ def commit(runner, root, label, empty=False):
     bench.save_json(runner.artifact/f"{label}-observer-proof.json", proof, exclusive=True)
     if before != after:
         raise ValueError("commit preflight observers changed index SHA/full stat; mutation not dispatched")
-    runner.git(root, label, "commit", "--no-gpg-sign", *(["--allow-empty"] if empty else []), "-m", label)
+    argv = ["commit", "--no-gpg-sign", *(["--allow-empty"] if empty else []), "-m", label]
+    if not isolated_index:
+        runner.git(root, label, *argv)
+        return None
+    # Original-index isolation (explicit): a real `git commit` (never commit-tree) reads and refreshes
+    # a disposable byte-identical GIT_INDEX_FILE copy OUTSIDE the fixture, so the original .git/index
+    # SHA/full stat cannot be rewritten; HEAD/ref metadata still advances.
+    isolated = runner.artifact/f"{label}-isolated-index"
+    if isolated.exists() or isolated.is_symlink() or root in isolated.parents:
+        raise ValueError("isolated index copy path is not new and outside the fixture; mutation not dispatched")
+    with isolated.open("xb") as handle:
+        handle.write((root/".git/index").read_bytes())
+    copied = digest(isolated)
+    if copied != after["index_sha256"] or index_state(root) != after:
+        raise ValueError("isolated index copy is not byte-identical to the unchanged original; mutation not dispatched")
+    runner.git(root, label, *argv, env={"GIT_INDEX_FILE": str(isolated)})
+    final = index_state(root)
+    proof = {"mode": "isolated-index-copy",
+             "label": "original-index isolation: git commit used a disposable GIT_INDEX_FILE copy outside the fixture",
+             "isolated_index_path": str(isolated), "isolated_index_sha256_before": copied,
+             "isolated_index_sha256_after": digest(isolated), "original_before": after, "original_after": final,
+             "original_index_unchanged": final == after}
+    bench.save_json(runner.artifact/f"{label}-index-isolation-proof.json", proof, exclusive=True)
+    return proof
+
+
+def offline_index_isolation_probe(runner):
+    """Prove original-index isolation on a NEW offline fixture that is never registered with the app."""
+    label = "offline-index-isolation-probe"
+    root = runner.artifact/"fixtures"/label
+    root.mkdir()
+    (root/"Notes.txt").write_text("offline isolation probe baseline\n")
+    runner.git(root, label+"-init", "init", "--initial-branch=main", "--template="+str(runner.artifact/"empty-template"))
+    runner.git(root, label+"-stage", "add", "--", "Notes.txt")
+    runner.git(root, label+"-baseline", "commit", "--no-gpg-sign", "-m", label+"-baseline")
+    before = git_state(runner, root, label+"-before")
+    isolation = commit(runner, root, label+"-empty-commit", empty=True, isolated_index=True)
+    after = git_state(runner, root, label+"-after")
+    proof = metadata_proof(before, after)
+    proven = proof["coverage"] == "proven" and isolation.get("original_index_unchanged") is True
+    record = {"fixture": str(root), "registered_with_app": False, "git_before": before, "git_after": after,
+              "metadata_proof": proof, "original_index_isolation": isolation,
+              "coverage": "proven" if proven else "unproven"}
+    bench.save_json(runner.artifact/f"{label}.json", record, exclusive=True)
+    return record
 
 
 def stat_record(path):
@@ -422,7 +648,15 @@ def scope_identity(scope):
             "root_path": str(Path(scope["root_path"]).resolve())}
 
 
-def single_root_inventory(value, scope):
+def workspace_git_data_path(scope):
+    name, workspace_id = scope.get("workspace_name"), scope.get("workspace_id")
+    if not isinstance(name, str) or not name.strip() or not isinstance(workspace_id, str):
+        raise ValueError("workspace git_data auxiliary cannot be attributed without the created workspace name/UUID")
+    directory = f"Workspace-{name.replace('/', '_').strip()}-{bench.validate_uuid(workspace_id, 'workspace_id')}"
+    return str((WORKSPACE_STORAGE_ROOT/directory/"_git_data").resolve(strict=False))
+
+
+def owned_root_inventory(value, scope):
     payload = diagnostic_record(value, "mcp_read_search_runtime_snapshot")
     runtime = payload.get("runtime")
     if not isinstance(runtime, dict):
@@ -434,15 +668,38 @@ def single_root_inventory(value, scope):
     window = windows[0]
     if not isinstance(window, dict):
         raise ValueError("invalid window inventory")
+    roots = window.get("roots")
     if (type(window.get("window_id")) is not int or window["window_id"] != scope["window_id"]
-            or type(window.get("root_count")) is not int or window["root_count"] != 1
-            or type(window.get("omitted_root_count")) is not int or window["omitted_root_count"] != 0
-            or not isinstance(window.get("roots"), list) or len(window["roots"]) != 1):
-        raise ValueError("selected window must contain exactly one loaded, non-omitted owned root")
-    identity = bench.runtime_root_identity({"roots": window["roots"]}, scope["root_path"])
-    if "root_id" in scope and identity["id"] != scope["root_id"]:
+            or type(window.get("root_count")) is not int or type(window.get("omitted_root_count")) is not int
+            or window["omitted_root_count"] != 0 or not isinstance(roots, list) or window["root_count"] != len(roots)):
+        raise ValueError("selected window root inventory is incomplete: root_count must equal returned roots, no omissions")
+    owned_path = str(Path(scope["root_path"]).resolve(strict=False))
+    primary, auxiliary, seen = [], [], set()
+    for root in roots:
+        fields = [root.get(key) if isinstance(root, dict) else None for key in ("root_id", "root_kind", "root_path")]
+        if any(not isinstance(field, str) or not field for field in fields) or not Path(fields[2]).is_absolute():
+            raise ValueError("invalid loaded-root identity")
+        root_id, kind = bench.validate_uuid(fields[0], "loaded root_id"), fields[1]
+        if root_id in seen:
+            raise ValueError("duplicate loaded root ID")
+        seen.add(root_id)
+        identity = {"id": root_id, "path": str(Path(fields[2]).resolve(strict=False)), "type": kind}
+        if kind == PRIMARY_ROOT_KIND:
+            # Retain the app's admitted logical spelling; ownership is still judged on the canonical physical path.
+            primary.append({**identity, "logical_path": fields[2]})
+        elif kind == GIT_DATA_ROOT_KIND:
+            auxiliary.append(identity)
+        else:
+            raise ValueError(f"unrecognized loaded root kind: {kind}")
+    if len(primary) != 1 or primary[0]["path"] != owned_path:
+        raise ValueError("selected window must contain exactly one primary root at the owned physical fixture path")
+    if len(auxiliary) > 1 or any(item["path"] != workspace_git_data_path(scope) for item in auxiliary):
+        raise ValueError("auxiliary root is not this workspace UUID's git_data in current workspace storage")
+    if "root_id" in scope and primary[0]["id"] != scope["root_id"]:
         raise ValueError("loaded root identity changed")
-    return {"window_id": window["window_id"], "root_count": 1, "omitted_root_count": 0, **identity}
+    workspace_id = bench.validate_uuid(scope["workspace_id"], "workspace_id") if auxiliary else None
+    return {"window_id": window["window_id"], "root_count": len(roots), "omitted_root_count": 0, **primary[0],
+            "auxiliary_roots": [{**item, "workspace_id": workspace_id} for item in auxiliary]}
 
 
 def projection_counters(value):
@@ -496,8 +753,12 @@ def counter_check(before, after, repairs, idle=False):
                 raise ValueError("real engine snapshot and verified single-owned-root-in-window scope required")
             identity = scope_identity(record["scope"])
             for inventory in (record.get("inventory_before"), record.get("inventory_after")):
-                if (not isinstance(inventory, dict) or type(inventory.get("root_count")) is not int
-                        or inventory["root_count"] != 1 or type(inventory.get("omitted_root_count")) is not int
+                auxiliary = inventory.get("auxiliary_roots") if isinstance(inventory, dict) else None
+                if (not isinstance(auxiliary, list) or len(auxiliary) > 1
+                        or any(not isinstance(item, dict) or item.get("type") != GIT_DATA_ROOT_KIND
+                               or item.get("id") == identity["root_id"] for item in auxiliary)
+                        or type(inventory.get("root_count")) is not int
+                        or inventory["root_count"] != 1+len(auxiliary) or type(inventory.get("omitted_root_count")) is not int
                         or inventory["omitted_root_count"] != 0 or inventory.get("window_id") != identity["window_id"]
                         or inventory.get("id") != identity["root_id"] or inventory.get("path") != identity["root_path"]):
                     raise ValueError("single-owned-root inventory proof missing or changed")
@@ -541,11 +802,14 @@ def diagnostics(runner, scope, label, enabled):
         root_args = {"op": "mcp_read_search_runtime_snapshot", "window_id": runner.window,
                      "recent_publication_limit": 0, "root_limit": 256}
         roots, _ = runner.call(label+"-roots-before", bench.DEBUG_TOOL, root_args)
-        inventory_before = single_root_inventory(roots, scope)
+        inventory_before = owned_root_inventory(roots, scope)
         scope.setdefault("root_id", inventory_before["id"])
         expected = scope_identity(scope)
+        # Swift `scope` resolves by expected_root_path (requireRootID=false) against the standardized loaded-root
+        # path: send the inventory's admitted logical spelling. Every other action stays root_id-scoped.
         value, _ = runner.call(label+"-scope", bench.DEBUG_TOOL,
-                              bench.diagnostic_payload({"scope": scope}, "scope"))
+                              bench.diagnostic_payload({"scope": scope}, "scope",
+                                                       expected_root_path=inventory_before["logical_path"]))
         actual = diagnostic_record(value, "worktree_startup_benchmark", "scope")
         if scope_identity({**actual, "root_path": inventory_before["path"]}) != expected:
             raise ValueError("diagnostic workspace/window/context/root scope changed")
@@ -561,7 +825,7 @@ def diagnostics(runner, scope, label, enabled):
             snapshot = diagnostic_record(response, "worktree_startup_benchmark", "codemap_projection_snapshot").get("codemap_projection")
             aggregate_counters, aggregate_error = None, str(error)
         roots, _ = runner.call(label+"-roots-after", bench.DEBUG_TOOL, root_args)
-        inventory_after = single_root_inventory(roots, scope)
+        inventory_after = owned_root_inventory(roots, scope)
         if inventory_before != inventory_after:
             raise ValueError("single-owned-root inventory changed across engine snapshot")
         return {"available": True, "root_id": scope["root_id"], "scope": expected,
@@ -645,6 +909,15 @@ def idle_background(runner, root, data, enabled, reference=None):
 
 
 def lane(runner, name, bootstrap, results, snapshots, enabled, args):
+    extra = {}
+    if name == "metadata-only":
+        # Original-index isolation must be proven on a NEW unregistered offline fixture before any live mutation.
+        probe = extra["offline_index_isolation_probe"] = offline_index_isolation_probe(runner)
+        if probe.get("coverage") != "proven":
+            snapshots[name] = {**extra, "run_label": "unproven-metadata-commit", "coverage": "unproven",
+                               "blocked": "original-index isolation unproven offline; no live workspace or mutation dispatched"}
+            bench.save_json(runner.artifact/"lanes.json", snapshots)
+            return
     root = runner.artifact/"fixtures"/name
     root.mkdir()
     for filename, content in {"ControlPayload.swift": PAYLOAD, "ControlConsumer.swift": CONSUMER, "Notes.txt": "tracked baseline\n"}.items():
@@ -657,18 +930,7 @@ def lane(runner, name, bootstrap, results, snapshots, enabled, args):
     commit(runner, root, name+"-baseline-commit")
     if name == "index-only":
         (root/"Notes.txt").write_text("changed BEFORE registration and baseline; stage only later\n")
-    runner.window, runner.context = bootstrap
-    runner.expected_root = None
-    value, _ = runner.call(name+"-create-workspace", "manage_workspaces",
-                          {"action": "create", "name": f"RPCE Search Bench Codemap Authority {runner.artifact.name} {name}",
-                           "folder_path": str(root), "open_in_new_window": True})
-    workspace = value["workspaces"][0]
-    scope = {"workspace_id": workspace["id"], "window_id": value["window_id"], "root_path": str(root)}
-    data = snapshots[name] = {"scope": scope}
-    bench.save_json(runner.artifact/"lanes.json", snapshots)
-    scope["context_id"] = discover_created_context(runner, scope)
-    runner.window, runner.context = scope["window_id"], scope["context_id"]
-    runner.expected_root = root
+    data, scope = open_owned_fixture_workspace(runner, name, root, bootstrap, snapshots, extra)
     if not phase_query(runner, root, data, "baseline", name+"-baseline", results, enabled):
         data["blocked"] = "baseline was not ready; retained-ready precondition absent"
         return
@@ -677,7 +939,8 @@ def lane(runner, name, bootstrap, results, snapshots, enabled, args):
     if name == "index-only":
         runner.git(root, name+"-add-notes", "add", "--", "Notes.txt")
     elif name == "metadata-only":
-        commit(runner, root, name+"-empty-commit", empty=True)
+        isolation = commit(runner, root, name+"-empty-commit", empty=True, isolated_index=True)
+        snapshots[name].update(metadata_commit_mode="isolated-index-copy", original_index_isolation=isolation)
         snapshots[name]["git_after_mutation"] = git_state(runner, root, name+"-head-after")
         proof = metadata_proof(snapshots[name]["git_before"], snapshots[name]["git_after_mutation"])
         snapshots[name]["metadata_proof"] = proof
@@ -909,11 +1172,15 @@ def main(argv=None):
                "started_at": stamp(), "status": "running", "post_run_verification_completed": False,
                "demand_bound": {"seconds_exclusive": 10, "measurement": "CLI-inclusive: startup + bind_context + server + transport",
                                 "server_deadline": "unchanged; no overrides or retries"},
-               "git_probe_policy": "GIT_OPTIONAL_LOCKS=0; cadence is lock-free, NOT ordinary/default status baseline",
+               "git_probe_policy": "GIT_OPTIONAL_LOCKS=0; cadence is lock-free, NOT ordinary/default status baseline; "
+                                   "metadata-only empty commit uses original-index isolation (disposable GIT_INDEX_FILE copy, "
+                                   "proven first offline); other commits are normal git commit",
                "counter_policy": "Only actual gated snapshots; log notices are not repair counts",
                "counter_acceptance": {"required": args.require_authority_counters, "coverage": "unproven",
                                       "reason": "Per-phase root-attributed capture and comparisons not completed"},
-               "routing_exception": "User-approved global read-only windows discovery once per new workspace; every targeted call has both IDs"}
+               "routing_exception": "User-approved global read-only windows discovery per new workspace: before create "
+                                    "(new-window ownership), after readiness (owned-window context), after the single "
+                                    "owned-window switch (fixture context); every targeted call has both IDs"}
     try:
         bench.secure_write(artifact/"harness-source.py", Path(__file__).read_bytes(), exclusive=True)
         bench.secure_write(artifact/"benchmark-helper-source.py", Path(bench.__file__).read_bytes(), exclusive=True)

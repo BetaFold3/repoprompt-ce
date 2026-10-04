@@ -1879,6 +1879,143 @@ final class MCPCodeStructureWorktreeTests: XCTestCase {
         try await assertReferrersExpansionRecoversAfterRepositoryMutation(.createUnstaged)
     }
 
+    /// Live catalog-only lane counterpart: MCP `apply_edits` creates a third top-level source and, as
+    /// in production, selects it, so the window's automatic codemap consumer works the same root while
+    /// the next MCP referrers expansion publishes. That expansion and an unchanged repeat must return
+    /// all three files ready within 10 seconds, with no root reset and no Git drift.
+    func testReferrersExpansionAfterCompletedBaselineIncludesApplyEditsCreatedSelectedSource() async throws {
+        let fixture = try await makeControlReferrersFixtureAfterReadyBaseline(
+            name: "referrers-apply-edits-create-select"
+        )
+        let window = fixture.window
+        let store = window.workspaceFileContextStore
+
+        let addedURL = fixture.root.appendingPathComponent(Self.controlAddedFileName)
+        let edit = try await applyEditsCreateControlSource(fixture.invoke, at: addedURL)
+        XCTAssertEqual(try String(contentsOf: addedURL, encoding: .utf8), Self.controlAddedSource, "\(edit)")
+        XCTAssertTrue(
+            activeSelectionContainsControlAddedSource(window),
+            "The production apply_edits create must select the new source: \(edit)"
+        )
+
+        let countsBefore = await store.codemapPresentationOperationCountsForTesting()
+        let clock = ContinuousClock()
+        let started = clock.now
+        let recovered = try await controlPayloadReferrers(fixture.invoke)
+        let elapsed = clock.now - started
+        let repairs = await store.codemapRootSessionRepairCountForTesting()
+        let countsAfter = await store.codemapPresentationOperationCountsForTesting()
+        let diagnostics = "status=\(recovered.status) elapsed=\(elapsed) repairs=\(repairs) " +
+            "issues=\(recovered.issues) \(automaticConsumerSummary(window)) " +
+            "artifactDemandRequests+=\(countsAfter.artifactDemandRequests - countsBefore.artifactDemandRequests) " +
+            "candidateRequests+=\(countsAfter.presentationCandidateRequests - countsBefore.presentationCandidateRequests) " +
+            "graphWorkerStarts+=\(countsAfter.graphWorkerStarts - countsBefore.graphWorkerStarts)"
+        XCTAssertEqual(recovered.status, "ready", diagnostics)
+        XCTAssertEqual(Set(recovered.files.map(\.path)), Self.controlExpandedPaths, diagnostics)
+        XCTAssertLessThan(elapsed, .seconds(10), diagnostics)
+        XCTAssertEqual(repairs, 0, "Root resets: \(diagnostics)")
+
+        try await assertControlUnchangedRepeatReadyWithoutGitDrift(fixture, context: "apply_edits create")
+
+        // Fixture faithfulness: the window's production automatic codemap consumer received the
+        // selected new source, so the expansions above ran beside it rather than in isolation.
+        let consumerSummary = automaticConsumerSummary(window)
+        XCTAssertTrue(window.workspaceFilesViewModel.codemapAutoEnabled, consumerSummary)
+        XCTAssertTrue(
+            window.workspaceFilesViewModel.selectedFiles.contains {
+                $0.standardizedFullPath.hasSuffix("/\(Self.controlAddedFileName)")
+            },
+            "The automatic consumer must observe the created selection: \(consumerSummary)"
+        )
+    }
+
+    /// Coordinator-level pair for the live catalog-only lane. The same third source is created either
+    /// through MCP `apply_edits` (which selects it and engages the automatic codemap consumer) or through
+    /// the store without selection; the next referrers structure publication must be ready with all
+    /// three files in both cases. Timing-only hooks record each attempt and the final typed reason.
+    func testReferrersStructureAfterSourceCreatePublishesWithAndWithoutCreatedSelection() async throws {
+        for create in [ControlReferrersCreate.applyEditsCreateAndSelect, .storeCreateWithoutSelection] {
+            try await assertControlReferrersStructurePublishes(after: create)
+        }
+    }
+
+    /// Cancelling the structure task after its first attempt begins still emits one record: the
+    /// attempt's completed checkpoints, ownership cleanup, and a `cancelled` terminal. The caller
+    /// still receives `CancellationError`, and the next MCP query is ready without root resets.
+    func testStructureDiagnosticsRecordCancelledAttemptCleanupAndRethrowCancellation() async throws {
+        let fixture = try await makeControlReferrersFixtureAfterReadyBaseline(
+            name: "referrers-diagnostics-cancellation"
+        )
+        let store = fixture.window.workspaceFileContextStore
+        let payload = try await fileRecord(
+            at: fixture.root.appendingPathComponent("ControlPayload.swift"),
+            store: store,
+            rootScope: .visibleWorkspace
+        )
+        let diagnosticRecords = CodemapLockedValues<WorkspaceCodemapStructureDiagnosticRecord>()
+        let coordinator = WorkspaceCodemapPresentationCoordinator(
+            store: store,
+            structureAttemptDidBegin: { _ in
+                withUnsafeCurrentTask { $0?.cancel() }
+            },
+            structureDiagnosticSink: { diagnosticRecords.append($0) }
+        )
+        let task = Task {
+            try await coordinator.structurePresentation(
+                seedFileIDs: [payload.id],
+                direction: .referrers,
+                traversalLimits: WorkspaceCodemapStructureTraversalLimits(
+                    maximumDepth: 1,
+                    maximumNodeCount: 10,
+                    maximumEdgeCount: 500,
+                    maximumByteCount: 8 * 1024 * 1024
+                ),
+                outputLimits: WorkspaceCodemapStructureOutputLimits(
+                    maximumFileCount: 10,
+                    maximumCodemapTokenCount: 6000
+                ),
+                rootScope: .visibleWorkspace
+            )
+        }
+        do {
+            let presentation = try await task.value
+            XCTFail("Cancelled structure presentation must throw, got \(presentation.outcome)")
+        } catch {
+            XCTAssertTrue(error is CancellationError, "\(error)")
+        }
+
+        let records = diagnosticRecords.values
+        XCTAssertEqual(records.count, 1)
+        let record = try XCTUnwrap(records.first)
+        let logLines = record.logLines(emissionSequence: 1)
+        XCTAssertEqual(record.terminal.disposition, .cancelled, "\(logLines)")
+        XCTAssertTrue(record.terminal.cancelled, "\(logLines)")
+        XCTAssertNil(record.terminal.outcome, "\(logLines)")
+        XCTAssertNil(record.terminal.staleReason, "\(logLines)")
+        XCTAssertEqual(record.terminal.attemptsStarted, 1, "\(logLines)")
+        XCTAssertEqual(record.terminal.finalAttempt, 0, "\(logLines)")
+        XCTAssertEqual(record.terminal.finalPhase, .cleanup, "\(logLines)")
+        XCTAssertEqual(record.droppedCheckpointCount, 0, "\(logLines)")
+        // Seed admission and candidate collection complete; artifact demand observes cancellation
+        // before requesting anything, and the attempt's ownership is still released.
+        XCTAssertEqual(
+            record.checkpoints.map(\.phase),
+            [.attemptBegin, .seedAdmission, .seedCandidates, .cleanup],
+            "\(logLines)"
+        )
+        XCTAssertTrue(
+            record.tokens.contains("terminal=cancelled") && record.tokens.contains("cancelled=true"),
+            "\(logLines)"
+        )
+        assertControlDiagnosticLogLinesPrivacySafe(logLines, context: "cancellation")
+
+        let followUp = try await controlPayloadReferrers(fixture.invoke)
+        let repairs = await store.codemapRootSessionRepairCountForTesting()
+        XCTAssertEqual(followUp.status, "ready", "\(followUp.issues)")
+        XCTAssertEqual(Set(followUp.files.map(\.path)), Self.controlBaselinePaths, "\(followUp.issues)")
+        XCTAssertEqual(repairs, 0)
+    }
+
     func testRootAttributedCodemapCountersIsolateRootsAndSurviveSessionRepair() async throws {
         let repositories = try ReviewGitRepositoryFixture(name: #function)
         let files = [
@@ -2383,10 +2520,12 @@ final class MCPCodeStructureWorktreeTests: XCTestCase {
 
         try repositories.stage("Notes.txt", at: root)
         let structureAttempts = CodemapLockedValues<Int>()
+        let diagnosticRecords = CodemapLockedValues<WorkspaceCodemapStructureDiagnosticRecord>()
         let coordinator = WorkspaceCodemapPresentationCoordinator(
             store: store,
             policy: WorkspaceCodemapPresentationRequestPolicy(maximumStructurePublicationAttempts: 1),
-            structureAttemptDidBegin: { structureAttempts.append($0) }
+            structureAttemptDidBegin: { structureAttempts.append($0) },
+            structureDiagnosticSink: { diagnosticRecords.append($0) }
         )
         let exhausted = try await coordinator.structurePresentation(
             seedFileIDs: [target.id],
@@ -2413,6 +2552,7 @@ final class MCPCodeStructureWorktreeTests: XCTestCase {
         )
         let repairCount = await store.codemapRootSessionRepairCountForTesting()
         XCTAssertEqual(repairCount, 1, "The final attempt still spends exactly one root reset.")
+        assertUnrestartableProjectionResetDiagnosticRecord(diagnosticRecords.values)
 
         let dto = MCPServerViewModel.codeStructureReplyDTO(
             presentation: exhausted,
@@ -3503,6 +3643,460 @@ final class MCPCodeStructureWorktreeTests: XCTestCase {
         }
     }
 
+    // Live catalog-only lane fixture: two committed top-level sources with a builtin method-call
+    // relationship plus a tracked non-source file; the lane creates a third referrer.
+    private static let controlAddedFileName = "ControlAuthorityAdded.swift"
+    private static let controlAddedSource = "struct ControlAuthorityAdded {\n    let payload: ControlPayload\n" +
+        "    func authorityAddedLabel() -> String { payload.controlLabel() }\n}\n"
+    private static let controlReferrersFiles = [
+        "ControlPayload.swift": "struct ControlPayload {\n    let identifier: Int\n" +
+            "    func controlLabel() -> String { \"payload-\\(identifier)\" }\n}\n",
+        "ControlConsumer.swift": "struct ControlConsumer {\n    let payload: ControlPayload\n" +
+            "    func consumeControl(_ value: ControlPayload) -> String { value.controlLabel() }\n}\n",
+        "Notes.txt": "tracked baseline\n"
+    ]
+    private static let controlBaselinePaths: Set<String> = [
+        "repository/ControlPayload.swift",
+        "repository/ControlConsumer.swift"
+    ]
+    private static let controlExpandedPaths = controlBaselinePaths.union(["repository/ControlAuthorityAdded.swift"])
+
+    private typealias WindowToolInvoker = (String, [String: Value]) async throws -> Value
+
+    /// Invokes real window MCP tools through one tab-bound connection, as the live harness does.
+    private func boundWindowToolInvoker(
+        window: WindowState,
+        clientName: String
+    ) async throws -> WindowToolInvoker {
+        let workspace = try XCTUnwrap(window.workspaceManager.activeWorkspace)
+        let tabID = try XCTUnwrap(workspace.activeComposeTabID)
+        let connectionID = UUID()
+        try window.mcpServer.bindTabForConnection(
+            connectionID: connectionID,
+            clientName: clientName,
+            tabID: tabID,
+            workspaceID: workspace.id,
+            windowID: window.windowID
+        )
+        let tools = await window.mcpServer.windowMCPTools
+        return { name, arguments in
+            let tool = try XCTUnwrap(tools.first { $0.name == name }, "Missing window MCP tool \(name)")
+            return try await ServerNetworkManager.withConnectionID(connectionID) {
+                try await tool(arguments)
+            }
+        }
+    }
+
+    /// The live harness request: top-level seed, default output limits, depth-1 referrers.
+    private func controlPayloadReferrers(
+        _ invoke: WindowToolInvoker
+    ) async throws -> ToolResultDTOs.CodeStructureReplyDTO {
+        let value = try await invoke(MCPWindowToolName.getCodeStructure, [
+            "scope": .string("paths"),
+            "paths": .array([.string("ControlPayload.swift")]),
+            "limits": .object(["max_files": .int(10), "max_codemap_tokens": .int(6000)]),
+            "expand": .object(["direction": .string("referrers"), "max_depth": .int(1)])
+        ])
+        return try JSONDecoder().decode(
+            ToolResultDTOs.CodeStructureReplyDTO.self,
+            from: JSONEncoder().encode(value)
+        )
+    }
+
+    private func applyEditsCreateControlSource(
+        _ invoke: WindowToolInvoker,
+        at url: URL
+    ) async throws -> Value {
+        try await invoke(MCPWindowToolName.applyEdits, [
+            "path": .string(url.path),
+            "rewrite": .string(Self.controlAddedSource),
+            "on_missing": .string("create")
+        ])
+    }
+
+    private func activeSelectionContainsControlAddedSource(_ window: WindowState) -> Bool {
+        window.selectionCoordinator.activeSelectionSnapshot(flushPendingUI: false).selection.selectedPaths
+            .contains { $0.hasSuffix("/\(Self.controlAddedFileName)") }
+    }
+
+    private func automaticConsumerSummary(_ window: WindowState) -> String {
+        let viewModel = window.workspaceFilesViewModel
+        let selected = viewModel.selectedFiles.map { ($0.standardizedFullPath as NSString).lastPathComponent }
+        let automatic = viewModel.autoCodemapFiles.map { ($0.standardizedFullPath as NSString).lastPathComponent }
+        return "autoEnabled=\(viewModel.codemapAutoEnabled) selected=\(selected.sorted()) " +
+            "autoCodemaps=\(automatic.sorted()) " +
+            "autoRetryPending=\(viewModel.automaticCodemapReadinessRetryPendingForTesting)"
+    }
+
+    private struct ControlReferrersFixture {
+        let repositories: ReviewGitRepositoryFixture
+        let root: URL
+        let window: WindowState
+        let invoke: WindowToolInvoker
+        let gitStateBefore: [String]
+    }
+
+    /// Builds the live-lane fixture with production preload and returns it after a ready MCP referrers
+    /// baseline with zero root resets, capturing the Git state the scenario must leave unchanged.
+    private func makeControlReferrersFixtureAfterReadyBaseline(
+        name: String,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) async throws -> ControlReferrersFixture {
+        let repositories = try ReviewGitRepositoryFixture(name: name)
+        let root = try repositories.makeRepository(named: "repository", files: Self.controlReferrersFiles)
+        addTeardownBlock { repositories.cleanup() }
+        let window = try await makeWindow(root: root, projectionPreloadLaunchPolicy: .enabled)
+        let invoke = try await boundWindowToolInvoker(window: window, clientName: "code-structure-\(name)")
+        let baseline = try await controlPayloadReferrers(invoke)
+        XCTAssertEqual(baseline.status, "ready", "\(name) baseline \(baseline.issues)", file: file, line: line)
+        XCTAssertEqual(Set(baseline.files.map(\.path)), Self.controlBaselinePaths, file: file, line: line)
+        let baselineRepairs = await window.workspaceFileContextStore.codemapRootSessionRepairCountForTesting()
+        XCTAssertEqual(baselineRepairs, 0, "\(name) baseline must not reset.", file: file, line: line)
+        return try ControlReferrersFixture(
+            repositories: repositories,
+            root: root,
+            window: window,
+            invoke: invoke,
+            gitStateBefore: referrersGitState(repositories, root: root)
+        )
+    }
+
+    /// An unchanged MCP repeat stays ready with all three files and zero resets, and the created
+    /// untracked source leaves HEAD, tree, and index bytes/stat unchanged.
+    private func assertControlUnchangedRepeatReadyWithoutGitDrift(
+        _ fixture: ControlReferrersFixture,
+        context: String,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) async throws {
+        let repeated = try await controlPayloadReferrers(fixture.invoke)
+        let repairs = await fixture.window.workspaceFileContextStore.codemapRootSessionRepairCountForTesting()
+        let diagnostics = "\(context) repeat status=\(repeated.status) repairs=\(repairs) " +
+            "issues=\(repeated.issues) \(automaticConsumerSummary(fixture.window))"
+        XCTAssertEqual(repeated.status, "ready", diagnostics, file: file, line: line)
+        XCTAssertEqual(Set(repeated.files.map(\.path)), Self.controlExpandedPaths, diagnostics, file: file, line: line)
+        XCTAssertEqual(repairs, 0, "The repeat must not reset: \(diagnostics)", file: file, line: line)
+        let gitStateAfter = try referrersGitState(fixture.repositories, root: fixture.root)
+        XCTAssertEqual(
+            gitStateAfter,
+            fixture.gitStateBefore,
+            "\(context) must leave HEAD, tree, and index bytes/stat unchanged.",
+            file: file,
+            line: line
+        )
+    }
+
+    private func assertControlReferrersStructurePublishes(
+        after create: ControlReferrersCreate,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) async throws {
+        let fixture = try await makeControlReferrersFixtureAfterReadyBaseline(
+            name: "referrers-control-\(create.rawValue)",
+            file: file,
+            line: line
+        )
+        let root = fixture.root
+        let window = fixture.window
+        let store = window.workspaceFileContextStore
+        let payload = try await fileRecord(
+            at: root.appendingPathComponent("ControlPayload.swift"),
+            store: store,
+            rootScope: .visibleWorkspace
+        )
+        let consumer = try await fileRecord(
+            at: root.appendingPathComponent("ControlConsumer.swift"),
+            store: store,
+            rootScope: .visibleWorkspace
+        )
+        let rootEpoch = try await WorkspaceCodemapRootEpoch(
+            rootID: payload.rootID,
+            rootLifetimeID: store.rootLifetimeIDForTesting(rootID: payload.rootID)
+        )
+
+        let addedURL = root.appendingPathComponent(Self.controlAddedFileName)
+        switch create {
+        case .applyEditsCreateAndSelect:
+            _ = try await applyEditsCreateControlSource(fixture.invoke, at: addedURL)
+        case .storeCreateWithoutSelection:
+            try await store.createFile(
+                rootID: payload.rootID,
+                relativePath: Self.controlAddedFileName,
+                content: Self.controlAddedSource,
+                validating: .visibleWorkspace
+            )
+        }
+        XCTAssertEqual(
+            activeSelectionContainsControlAddedSource(window),
+            create == .applyEditsCreateAndSelect,
+            "\(create) must differ from its pair only in selecting the created source",
+            file: file,
+            line: line
+        )
+        let added = try await fileRecord(at: addedURL, store: store, rootScope: .visibleWorkspace)
+        let names = [payload.id: "payload", consumer.id: "consumer", added.id: "added"]
+        let countsBefore = await store.codemapPresentationOperationCountsForTesting()
+        let engineBefore = try await engineCounters(store: store)
+
+        // Timing-only observation: each hook records and returns; none rejects or delays publication
+        // beyond the store reads it performs. The diagnostic sink only captures the terminal record.
+        let events = CodemapLockedValues<String>()
+        let diagnosticRecords = CodemapLockedValues<WorkspaceCodemapStructureDiagnosticRecord>()
+        let clock = ContinuousClock()
+        let started = clock.now
+        let coordinator = WorkspaceCodemapPresentationCoordinator(
+            store: store,
+            beforePublicationRevalidation: { receipt in
+                var tickets: [String] = []
+                for ticket in receipt.demandTickets {
+                    let retains = await store.codemapArtifactDemandRetainCountForTesting(ticket)
+                    tickets.append(
+                        "\(names[ticket.fileID] ?? "other"):gen=\(ticket.requestGeneration)" +
+                            ":catalog=\(ticket.catalogGeneration):retains=\(retains)"
+                    )
+                }
+                let graph = await store.codemapGraphPublicationRecoveryStateForTesting(rootEpoch: rootEpoch)
+                events.append(
+                    "revalidate@\(clock.now - started) tickets=\(tickets.sorted()) " +
+                        "flight=\(graph.flightActive) observer=\(graph.observerActive)"
+                )
+            },
+            structureAttemptDidBegin: { attempt in
+                events.append("attempt\(attempt)@\(clock.now - started)")
+            },
+            structureDiagnosticSink: { diagnosticRecords.append($0) }
+        )
+        let presentation = try await coordinator.structurePresentation(
+            seedFileIDs: [payload.id],
+            direction: .referrers,
+            traversalLimits: WorkspaceCodemapStructureTraversalLimits(
+                maximumDepth: 1,
+                maximumNodeCount: 10,
+                maximumEdgeCount: 500,
+                maximumByteCount: 8 * 1024 * 1024
+            ),
+            outputLimits: WorkspaceCodemapStructureOutputLimits(
+                maximumFileCount: 10,
+                maximumCodemapTokenCount: 6000
+            ),
+            rootScope: .visibleWorkspace
+        )
+        let elapsed = clock.now - started
+        let repairs = await store.codemapRootSessionRepairCountForTesting()
+        let countsAfter = await store.codemapPresentationOperationCountsForTesting()
+        let engineAfter = try await engineCounters(store: store)
+        let diagnostics = "\(create) outcome=\(presentation.outcome) elapsed=\(elapsed) repairs=\(repairs) " +
+            "issues=\(presentation.issues) events=\(events.values) " +
+            "graphWorkerStarts+=\(countsAfter.graphWorkerStarts - countsBefore.graphWorkerStarts) " +
+            "artifactDemandRequests+=\(countsAfter.artifactDemandRequests - countsBefore.artifactDemandRequests) " +
+            "demandTasks+=\(countsAfter.demandTasksCreated - countsBefore.demandTasksCreated) " +
+            "fullRootGraphFreezes+=\(countsAfter.fullRootGraphFreezes - countsBefore.fullRootGraphFreezes) " +
+            "observers+=\(countsAfter.projectionRecoveryObserversStarted - countsBefore.projectionRecoveryObserversStarted) " +
+            "coveragesCompleted\(counterDelta(engineBefore, engineAfter, \.projectionCoveragesCompleted)) " +
+            "coveragesSuperseded\(counterDelta(engineBefore, engineAfter, \.projectionCoveragesSuperseded)) " +
+            "coveragesCancelled\(counterDelta(engineBefore, engineAfter, \.projectionCoveragesCancelled)) " +
+            "catalogPages\(counterDelta(engineBefore, engineAfter, \.projectionCatalogPages)) " +
+            automaticConsumerSummary(window)
+        XCTAssertEqual(presentation.outcome, .ready, diagnostics, file: file, line: line)
+        XCTAssertEqual(
+            Set(presentation.entries.map(\.entry.fileID)),
+            [payload.id, consumer.id, added.id],
+            diagnostics,
+            file: file,
+            line: line
+        )
+        XCTAssertLessThan(elapsed, .seconds(10), diagnostics, file: file, line: line)
+        XCTAssertEqual(repairs, 0, "Root resets: \(diagnostics)", file: file, line: line)
+        assertControlDiagnosticRecordRevalidatedCurrent(
+            diagnosticRecords.values,
+            attemptsBegun: events.values.count { $0.hasPrefix("attempt") },
+            context: diagnostics,
+            file: file,
+            line: line
+        )
+        try await assertControlUnchangedRepeatReadyWithoutGitDrift(
+            fixture,
+            context: create.rawValue,
+            file: file,
+            line: line
+        )
+    }
+
+    /// The coordinator-emitted record for a projection reset spent on the only allowed attempt names
+    /// the typed projection cause, the prepared root-session retry, and the unrestartable terminal.
+    private func assertUnrestartableProjectionResetDiagnosticRecord(
+        _ records: [WorkspaceCodemapStructureDiagnosticRecord],
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) {
+        XCTAssertEqual(records.count, 1, file: file, line: line)
+        guard let record = records.first else { return }
+        let logLines = record.logLines(emissionSequence: 1)
+        let context = "record=\(logLines)"
+        XCTAssertEqual(record.terminal.disposition, .unrestartableAfterAttempt, context, file: file, line: line)
+        XCTAssertEqual(record.terminal.outcome?.rawValue, "unavailable", context, file: file, line: line)
+        XCTAssertNil(record.terminal.staleReason, context, file: file, line: line)
+        XCTAssertEqual(
+            record.terminal.issueCodes.map(\.rawValue),
+            ["projection_unavailable.repository_authority_changed"],
+            context,
+            file: file,
+            line: line
+        )
+        XCTAssertEqual(record.terminal.attemptsStarted, 1, context, file: file, line: line)
+        XCTAssertFalse(record.terminal.cancelled, context, file: file, line: line)
+        XCTAssertEqual(
+            record.checkpoints.map(\.phase),
+            [
+                .attemptBegin, .seedAdmission, .seedCandidates, .seedDemand, .projection,
+                .projectionRootSessionRetry, .attemptResult, .cleanup
+            ],
+            context,
+            file: file,
+            line: line
+        )
+        XCTAssertEqual(
+            record.checkpoints.first { $0.phase == .projection }?.code?.rawValue,
+            "unavailable.repository_authority_changed",
+            context,
+            file: file,
+            line: line
+        )
+        XCTAssertEqual(
+            record.checkpoints.first { $0.phase == .projectionRootSessionRetry }?.code?.rawValue,
+            "prepared",
+            context,
+            file: file,
+            line: line
+        )
+        let attemptResult = record.checkpoints.first { $0.phase == .attemptResult }
+        XCTAssertTrue(
+            attemptResult?.code?.rawValue.hasPrefix("publication.") == true,
+            "The restart-needing attempt reports its typed stale leaf: \(context)",
+            file: file,
+            line: line
+        )
+        XCTAssertEqual(
+            attemptResult?.details.contains(.flag(.unrestartable, true)),
+            true,
+            context,
+            file: file,
+            line: line
+        )
+        assertControlDiagnosticLogLinesPrivacySafe(logLines, context: context, file: file, line: line)
+    }
+
+    /// The enabled diagnostic sink receives exactly one record that matches the published result:
+    /// a current revalidation after the full final-attempt phase sequence, nothing dropped, and log
+    /// lines carrying only fixed codes, numbers, and booleans (no fixture names, paths, or UUIDs).
+    private func assertControlDiagnosticRecordRevalidatedCurrent(
+        _ records: [WorkspaceCodemapStructureDiagnosticRecord],
+        attemptsBegun: Int,
+        context: String,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) {
+        XCTAssertEqual(records.count, 1, "One terminal record per invocation: \(context)", file: file, line: line)
+        guard let record = records.first else { return }
+        let logLines = record.logLines(emissionSequence: 1)
+        let recordContext = "\(context) record=\(logLines)"
+        XCTAssertEqual(record.terminal.disposition, .revalidatedCurrent, recordContext, file: file, line: line)
+        XCTAssertEqual(record.terminal.outcome?.rawValue, "ready", recordContext, file: file, line: line)
+        XCTAssertNil(record.terminal.staleReason, recordContext, file: file, line: line)
+        XCTAssertEqual(record.terminal.issueCodes, [], recordContext, file: file, line: line)
+        XCTAssertFalse(record.terminal.cancelled, recordContext, file: file, line: line)
+        XCTAssertFalse(record.terminal.deadlinePassed, recordContext, file: file, line: line)
+        XCTAssertEqual(record.terminal.attemptsStarted, attemptsBegun, recordContext, file: file, line: line)
+        XCTAssertEqual(record.terminal.finalAttempt, attemptsBegun - 1, recordContext, file: file, line: line)
+        XCTAssertEqual(record.terminal.finalPhase, .cleanup, recordContext, file: file, line: line)
+        XCTAssertEqual(record.direction.rawValue, "referrers", recordContext, file: file, line: line)
+        XCTAssertEqual(record.requestedSeedCount, 1, recordContext, file: file, line: line)
+        XCTAssertEqual(record.droppedCheckpointCount, 0, recordContext, file: file, line: line)
+
+        let finalAttempt = record.checkpoints.filter { $0.attempt == record.terminal.finalAttempt }
+        XCTAssertEqual(
+            finalAttempt.map(\.phase),
+            [
+                .attemptBegin, .seedAdmission, .seedCandidates, .seedDemand, .projection,
+                .initialTraversal, .targetDemand, .targetTraversal, .presentationCandidates,
+                .freezeRender, .attemptResult, .publicationHook, .revalidation, .cleanup
+            ],
+            recordContext,
+            file: file,
+            line: line
+        )
+        XCTAssertEqual(
+            finalAttempt.first { $0.phase == .attemptResult }?.code?.rawValue,
+            "ready",
+            recordContext,
+            file: file,
+            line: line
+        )
+        XCTAssertEqual(
+            finalAttempt.first { $0.phase == .revalidation }?.code?.rawValue,
+            "current",
+            recordContext,
+            file: file,
+            line: line
+        )
+        XCTAssertEqual(
+            finalAttempt.first { $0.phase == .targetDemand }?.details.first,
+            .count(.targets, 2),
+            recordContext,
+            file: file,
+            line: line
+        )
+        assertControlDiagnosticLogLinesPrivacySafe(logLines, context: recordContext, file: file, line: line)
+    }
+
+    private func assertControlDiagnosticLogLinesPrivacySafe(
+        _ logLines: [String],
+        context: String,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) {
+        XCTAssertFalse(logLines.isEmpty, context, file: file, line: line)
+        let allowed = Set("abcdefghijklmnopqrstuvwxyz0123456789_.=@;:,{} ")
+        // The charset already excludes path separators and UUID hyphens; also reject fixture names.
+        let forbidden = ["controlpayload", "controlconsumer", "controlauthorityadded", "swift"]
+        for logLine in logLines {
+            XCTAssertTrue(logLine.hasPrefix("code_structure_diagnostics schema=1 rec=1 part="), logLine, file: file, line: line)
+            XCTAssertLessThanOrEqual(
+                logLine.utf8.count,
+                WorkspaceCodemapStructureDiagnosticRecord.defaultMaximumLineBytes,
+                logLine,
+                file: file,
+                line: line
+            )
+            XCTAssertTrue(
+                logLine.allSatisfy { allowed.contains($0) },
+                "Unexpected character in diagnostic line \(logLine): \(context)",
+                file: file,
+                line: line
+            )
+            for fragment in forbidden {
+                XCTAssertFalse(
+                    logLine.lowercased().contains(fragment),
+                    "Diagnostic line leaked \(fragment): \(logLine)",
+                    file: file,
+                    line: line
+                )
+            }
+        }
+    }
+
+    /// Signed engine-counter delta for diagnostics; never traps if a counter source is replaced.
+    private func counterDelta(
+        _ before: WorkspaceCodemapBindingEngineCounters,
+        _ after: WorkspaceCodemapBindingEngineCounters,
+        _ counter: KeyPath<WorkspaceCodemapBindingEngineCounters, UInt64>
+    ) -> String {
+        let old = before[keyPath: counter]
+        let new = after[keyPath: counter]
+        return new >= old ? "+=\(new - old)" : "-=\(old - new)"
+    }
+
     private func demandTicket(
         from result: WorkspaceCodemapArtifactDemandResult
     ) -> WorkspaceCodemapArtifactDemandTicket? {
@@ -4169,6 +4763,13 @@ private enum ReferrersRecoveryMutation: String {
     case emptyCommit
     case createAndStage
     case createUnstaged
+}
+
+/// How the live catalog-only lane's third source is created: through the production MCP edit path,
+/// which also selects it, or directly through the store without touching selection.
+private enum ControlReferrersCreate: String {
+    case applyEditsCreateAndSelect
+    case storeCreateWithoutSelection
 }
 
 /// Engine counters that must stay flat while a session's projection authority failure is latched.
