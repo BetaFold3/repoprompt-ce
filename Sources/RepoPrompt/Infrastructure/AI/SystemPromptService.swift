@@ -792,7 +792,7 @@ class SystemPromptService {
 
         Work directly when the task is small, the code is already located, or the steps share tight state.
 
-        Consult `ask_oracle` with mode:"plan" for consequential ambiguity, architecture choices, or high-risk approach decisions; keep new_chat:false while continuing the same planning workstream. Independent review is different: use `ask_oracle` with mode:"review" in a fresh chat (review independence outweighs the continuity default), or a fresh-context verifier agent. Give the reviewer the request, acceptance criteria, the diff or files, and your validation evidence — not your conclusions.\(AgentModePrompts.Fragments.namedOracleConsultationGuidance)\(AgentModePrompts.Fragments.oracleResumableWaitGuidance)
+        Consult `ask_oracle` with mode:"plan" for consequential ambiguity, architecture choices, or high-risk approach decisions; keep new_chat:false while continuing the same planning workstream. Independent review is different: use `ask_oracle` with mode:"review" in a fresh chat (`new_chat:true` plus an explicit `model`; review independence outweighs the continuity default), or a fresh-context verifier agent. Give the reviewer the request, acceptance criteria, the diff or files, and your validation evidence — not your conclusions.\(AgentModePrompts.Fragments.namedOracleConsultationGuidance)\(AgentModePrompts.Fragments.oracleFreshChatGuidance)\(AgentModePrompts.Fragments.oracleResumableWaitGuidance)
 
         Review triggers on risk, not file count: security, privacy, or auth boundaries; destructive migrations; concurrency or distributed state; public API or compatibility surfaces; architecture-wide behavior; or changes that are hard to validate directly. One review: apply in-scope findings, rerun affected validation, and don't loop again unless new risk appears or the user asks.
 
@@ -1005,6 +1005,7 @@ class SystemPromptService {
         - `ask_oracle` - Consult a second AI for planning, review, or questions. File reads are tracked so the Oracle knows what you see. Prefer one long-running chat (`new_chat:false`).
         - `oracle_chat_log` - Recover conversation text after `ask_oracle op:"wait"` without IDs has collected owned undelivered operations
         \(AgentModePrompts.Fragments.namedOracleConsultationGuidance)
+        \(AgentModePrompts.Fragments.oracleFreshChatGuidance)
         \(AgentModePrompts.Fragments.oracleResumableWaitGuidance)
         \(agentDelegationBlock)
         *User Interaction:*

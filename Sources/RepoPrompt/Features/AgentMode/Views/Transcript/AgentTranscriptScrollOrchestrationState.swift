@@ -19,6 +19,9 @@ struct TranscriptPresentationViewState {
     var showCompressedHistory = false
     var transcriptBlockExpansion: [String: Bool] = [:]
     var transcriptBlockDefaultExpansion: [String: Bool] = [:]
+    /// Blocks whose expansion the user chose explicitly (in-memory only, like the two maps
+    /// above). See `AgentTranscriptGroupExpansionPolicy`.
+    var transcriptBlockManualExpansionIDs: Set<String> = []
     var composerBottomInset: CGFloat = 0
     var transcriptBottomClearance: CGFloat = 0
     var didChatChange = false

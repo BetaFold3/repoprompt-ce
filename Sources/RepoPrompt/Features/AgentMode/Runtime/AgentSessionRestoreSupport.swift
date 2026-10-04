@@ -272,7 +272,9 @@ enum AgentSessionRestoreSupport {
             containsFailure: summary.containsFailure || didCancelRunningWork,
             containsWarning: summary.containsWarning,
             shortNarration: summary.shortNarration,
-            collapsedDisplay: summary.collapsedDisplay.map(sanitizedColdRestoredCollapsedDisplay(_:))
+            collapsedDisplay: summary.collapsedDisplay.map(sanitizedColdRestoredCollapsedDisplay(_:)),
+            // Interrupted running work is not a failed execution; only retained failures count.
+            failedToolCount: summary.failedToolCount
         )
     }
 

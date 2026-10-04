@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/repoprompt/repoprompt-ce/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/repoprompt/repoprompt-ce/actions/workflows/ci.yml?query=branch%3Amain)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
-![Platform: macOS 26+](https://img.shields.io/badge/platform-macOS%2026%2B-black)
+![Platform: macOS 26.7+](https://img.shields.io/badge/platform-macOS%2026.7%2B-black)
 
 **A free, open-source native macOS app and agent orchestrator for context engineering.**
 
@@ -16,6 +16,8 @@ files, curate context, run agent sessions, and orchestrate work through a shared
 native macOS interface.
 
 ## Get Started
+
+Supported operating systems: **macOS 26.7 and newer**. Older macOS versions are outside the supported and required validation range, even where compatibility code remains.
 
 Choose one of these setup paths. You do not need to open Xcode.
 
@@ -93,7 +95,7 @@ another Mac or redistributed.
 
 ### Source-build requirements
 
-- macOS 26 or later
+- macOS 26.7 or later
 - Xcode 26, or matching Command Line Tools with the macOS 26 SDK
 
 ### Develop in Xcode

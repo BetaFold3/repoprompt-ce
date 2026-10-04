@@ -228,14 +228,17 @@ struct AgentRunMCPToolService {
             return UInt64(clamped * 1_000_000_000)
         }
 
+        /// Arithmetic only: the caller supplies `now` from the start's single authorization clock.
         static func ompQualificationAuthorizationRemainingNanoseconds(
-            deadlineUptimeNanoseconds: UInt64?
+            deadlineUptimeNanoseconds: UInt64?,
+            nowUptimeNanoseconds: UInt64
         ) -> UInt64 {
             guard let deadlineUptimeNanoseconds else {
                 return ompQualificationAuthorizationCleanupDeadlineNanoseconds
             }
-            let now = DispatchTime.now().uptimeNanoseconds
-            return deadlineUptimeNanoseconds > now ? deadlineUptimeNanoseconds - now : 0
+            return deadlineUptimeNanoseconds > nowUptimeNanoseconds
+                ? deadlineUptimeNanoseconds - nowUptimeNanoseconds
+                : 0
         }
 
         /// Process-global DEBUG seams for fast, deterministic status-update tests; reset in tearDown.
@@ -371,6 +374,13 @@ struct AgentRunMCPToolService {
     let startRun: StartRun
     var currentSnapshotProvider: (@Sendable (_ sessionID: UUID, _ agentModeVM: AgentModeViewModel) async -> AgentRunMCPSnapshot?)?
     #if DEBUG
+        /// Monotonic uptime read for OMP qualification authorization admission and accounting only:
+        /// deadline arming, every remaining-budget calculation, and the start receipt. Configure
+        /// before `execute`; each start snapshots it once. Lease expiry and real waits keep real time.
+        var ompQualificationMonotonicNowNanoseconds: @Sendable () -> UInt64 = {
+            DispatchTime.now().uptimeNanoseconds
+        }
+
         var testAgentModeViewModel: AgentModeViewModel?
         var testAfterOMPQualificationInitialSnapshot: (() async -> Void)?
         var testBeforeOMPQualificationConsume: (() async -> Void)?
@@ -388,6 +398,11 @@ struct AgentRunMCPToolService {
         var testBeforeProviderDispatch: (() async -> Void)?
         var testAfterProviderStartBeforeBookkeeping: (() async -> Void)?
         var testOMPQualificationTerminalCategory: ((String) -> Void)?
+        /// Observes a consumed qualification start at rollback-cleanup entry, before any
+        /// remaining-time or authorization wait computation. The terminal-category hook runs only
+        /// after rollback and target discard, so it cannot show whether the first deadline had
+        /// already resolved the receipt before cleanup began.
+        var testBeforeOMPQualificationRollbackCleanup: ((OhMyPiAgentModeSmokeGate.StartContext?) -> Void)?
         var testOMPQualificationOwnerVerifier: ((
             _ connectionID: UUID,
             _ ownerProcessID: Int32,
@@ -661,6 +676,7 @@ struct AgentRunMCPToolService {
             var ompQualificationProviderDispatchStarted = false
             var ompQualificationTransactionSucceeded = false
             var ompQualificationAuthorizationDeadlineUptimeNanoseconds: UInt64?
+            let ompQualificationNow = ompQualificationMonotonicNowNanoseconds
             let ompQualificationApplyEditsReviewRequested: Bool
             if let rawReviewRequest = args["_omp_qualification_apply_edits_review"] {
                 guard rawReviewRequest.boolValue == true else {
@@ -745,12 +761,14 @@ struct AgentRunMCPToolService {
                 ompQualificationStartContext = nil
                 let dispatchStarted = ompQualificationProviderDispatchStarted
                 let cleanup: @MainActor () async -> Void = {
+                    testBeforeOMPQualificationRollbackCleanup?(context)
                     let authorizationOutcome: OhMyPiAgentModeSmokeGate.StartAuthorizationReceipt.Outcome?
                     if !dispatchStarted {
                         authorizationOutcome = context?.authorizationReceipt.resolve(.denied)
                     } else {
                         let remainingNanoseconds = Self.ompQualificationAuthorizationRemainingNanoseconds(
-                            deadlineUptimeNanoseconds: ompQualificationAuthorizationDeadlineUptimeNanoseconds
+                            deadlineUptimeNanoseconds: ompQualificationAuthorizationDeadlineUptimeNanoseconds,
+                            nowUptimeNanoseconds: ompQualificationNow()
                         )
                         let observedOutcome: OhMyPiAgentModeSmokeGate.StartAuthorizationReceipt.Outcome? = if let context,
                                                                                                               remainingNanoseconds > 0
@@ -834,7 +852,7 @@ struct AgentRunMCPToolService {
                 let budget = Self.ompQualificationAuthorizationDeadlineNanoseconds(
                     requestTimeoutSeconds: timeoutSeconds
                 )
-                let now = DispatchTime.now().uptimeNanoseconds
+                let now = ompQualificationNow()
                 ompQualificationAuthorizationDeadlineUptimeNanoseconds = now.addingReportingOverflow(budget).overflow
                     ? UInt64.max
                     : now + budget
@@ -1159,7 +1177,8 @@ struct AgentRunMCPToolService {
                 let context = OhMyPiAgentModeSmokeGate.StartContext(
                     transaction: consumption.transaction,
                     expectedWorkspaceID: requestedWorkspaceUUID,
-                    authorizationDeadlineUptimeNanoseconds: ompQualificationAuthorizationDeadlineUptimeNanoseconds
+                    authorizationDeadlineUptimeNanoseconds: ompQualificationAuthorizationDeadlineUptimeNanoseconds,
+                    monotonicNowNanoseconds: ompQualificationNow
                 )
                 ompQualificationStartContext = context
                 ompQualificationInvocationContext = context
@@ -1482,7 +1501,8 @@ struct AgentRunMCPToolService {
                 }
                 guard let context = ompQualificationStartContext,
                       Self.ompQualificationAuthorizationRemainingNanoseconds(
-                          deadlineUptimeNanoseconds: ompQualificationAuthorizationDeadlineUptimeNanoseconds
+                          deadlineUptimeNanoseconds: ompQualificationAuthorizationDeadlineUptimeNanoseconds,
+                          nowUptimeNanoseconds: ompQualificationNow()
                       ) > 0
                 else {
                     ompQualificationStartContext?.authorizationReceipt.resolve(.denied)
@@ -1633,7 +1653,8 @@ struct AgentRunMCPToolService {
                     )
                 }
                 let remainingNanoseconds = Self.ompQualificationAuthorizationRemainingNanoseconds(
-                    deadlineUptimeNanoseconds: ompQualificationAuthorizationDeadlineUptimeNanoseconds
+                    deadlineUptimeNanoseconds: ompQualificationAuthorizationDeadlineUptimeNanoseconds,
+                    nowUptimeNanoseconds: ompQualificationNow()
                 )
                 let observedAuthorizationOutcome = remainingNanoseconds > 0
                     ? await context.authorizationReceipt.wait(timeoutNanoseconds: remainingNanoseconds)

@@ -1,6 +1,11 @@
 import Foundation
 
 enum AgentOracleAuthoritativeChatIDPolicy {
+    /// An explicitly scoped lane route (a persisted Oracle failure diagnostic's lane chat). It
+    /// never invalidates or replaces an authoritative root `chat_id`, but it identifies specific
+    /// chats, so a result carrying one never allows identity-free latest-chat fallback.
+    static let scopedLaneChatIDKey = "lane_chat_id"
+
     static func extract(fromSerializedJSON json: String?) -> String? {
         guard let json else { return nil }
         let trimmed = json.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -27,10 +32,15 @@ enum AgentOracleAuthoritativeChatIDPolicy {
               let data = trimmed.data(using: .utf8),
               let object = try? JSONSerialization.jsonObject(with: data, options: []) as? [String: Any]
         else { return false }
-        return !containsChatID(in: object)
+        return !containsChatID(in: object, includingScopedLaneChatIDs: true)
     }
 
-    private static func containsChatID(in value: Any, excludingAuthoritativeRoot: Bool = false) -> Bool {
+    /// Root extraction ignores scoped lane routes; latest-fallback eligibility counts them.
+    private static func containsChatID(
+        in value: Any,
+        excludingAuthoritativeRoot: Bool = false,
+        includingScopedLaneChatIDs: Bool = false
+    ) -> Bool {
         if let dictionary = value as? [String: Any] {
             for (key, nested) in dictionary {
                 if key == "chat_id" || key == "chatID" {
@@ -39,10 +49,13 @@ enum AgentOracleAuthoritativeChatIDPolicy {
                     }
                     return true
                 }
-                if containsChatID(in: nested) { return true }
+                if includingScopedLaneChatIDs, key == scopedLaneChatIDKey {
+                    return true
+                }
+                if containsChatID(in: nested, includingScopedLaneChatIDs: includingScopedLaneChatIDs) { return true }
             }
         } else if let array = value as? [Any] {
-            return array.contains { containsChatID(in: $0) }
+            return array.contains { containsChatID(in: $0, includingScopedLaneChatIDs: includingScopedLaneChatIDs) }
         }
         return false
     }

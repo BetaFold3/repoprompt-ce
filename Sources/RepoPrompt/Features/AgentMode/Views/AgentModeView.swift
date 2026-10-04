@@ -369,6 +369,32 @@ struct AgentModeChatDetailView: View {
         nonmutating set { presentation.transcriptBlockDefaultExpansion = newValue }
     }
 
+    private var transcriptBlockManualExpansionIDs: Set<String> {
+        get { presentation.transcriptBlockManualExpansionIDs }
+        nonmutating set { presentation.transcriptBlockManualExpansionIDs = newValue }
+    }
+
+    private var transcriptGroupExpansionState: AgentTranscriptGroupExpansionPolicy.State {
+        get {
+            .init(
+                expansion: transcriptBlockExpansion,
+                defaults: transcriptBlockDefaultExpansion,
+                manualIDs: transcriptBlockManualExpansionIDs
+            )
+        }
+        nonmutating set {
+            if transcriptBlockExpansion != newValue.expansion {
+                transcriptBlockExpansion = newValue.expansion
+            }
+            if transcriptBlockDefaultExpansion != newValue.defaults {
+                transcriptBlockDefaultExpansion = newValue.defaults
+            }
+            if transcriptBlockManualExpansionIDs != newValue.manualIDs {
+                transcriptBlockManualExpansionIDs = newValue.manualIDs
+            }
+        }
+    }
+
     private var hasUserInteractedWithScroll: Bool {
         get { scrollEngine.hasUserInteractedWithScroll }
         nonmutating set { scrollEngine.hasUserInteractedWithScroll = newValue }
@@ -1666,40 +1692,52 @@ struct AgentModeChatDetailView: View {
         }
     }
 
-    private func persistedTranscriptBlockExpansion(for block: AgentTranscriptRenderBlock) -> Bool {
-        guard transcriptBlockSupportsExpansion(block) else { return false }
-        return transcriptBlockExpansion[block.id] ?? (block.defaultPresentation == .expanded)
+    private func transcriptGroupExpansionInput(
+        for block: AgentTranscriptRenderBlock
+    ) -> AgentTranscriptGroupExpansionPolicy.BlockInput {
+        .init(
+            id: block.id,
+            supportsExpansion: transcriptBlockSupportsExpansion(block),
+            defaultExpanded: block.defaultPresentation == .expanded
+        )
     }
 
     private func isDynamicToolSummaryBlock(_ block: AgentTranscriptRenderBlock) -> Bool {
         block.kind == .activityCluster || block.kind == .groupedHistory
     }
 
+    /// Dynamic tool-summary blocks in the live run's latest turn. They are collapsed by default,
+    /// not locked: an explicit user expansion is honored while calls keep arriving.
     private func isDynamicSummaryLockTarget(_ block: AgentTranscriptRenderBlock) -> Bool {
         block.turnID == dynamicSummaryLockTargetTurnID
             && isDynamicToolSummaryBlock(block)
     }
 
-    private func isTranscriptBlockExpanded(
-        _ block: AgentTranscriptRenderBlock,
-        respectDynamicSummaryLock: Bool = true
-    ) -> Bool {
-        if respectDynamicSummaryLock,
-           isDynamicSummaryLockTarget(block)
-        {
-            return false
-        }
-        guard transcriptBlockSupportsExpansion(block) else { return false }
-        return persistedTranscriptBlockExpansion(for: block)
+    private func isTranscriptBlockExpanded(_ block: AgentTranscriptRenderBlock) -> Bool {
+        AgentTranscriptGroupExpansionPolicy.effectiveExpansion(
+            of: transcriptGroupExpansionInput(for: block),
+            in: transcriptGroupExpansionState,
+            isDefaultCollapseTarget: isDynamicSummaryLockTarget(block)
+        )
     }
 
-    private func expandedDynamicToolSummaryBlockCount(assumeUnlocked: Bool = false) -> Int {
-        visibleTranscriptBlocks.reduce(into: 0) { count, block in
-            guard isDynamicToolSummaryBlock(block) else { return }
-            if isTranscriptBlockExpanded(block, respectDynamicSummaryLock: !assumeUnlocked) {
-                count += 1
-            }
-        }
+    private func toggleTranscriptBlockExpansion(_ block: AgentTranscriptRenderBlock) {
+        transcriptGroupExpansionState = AgentTranscriptGroupExpansionPolicy.toggled(
+            transcriptGroupExpansionState,
+            block: transcriptGroupExpansionInput(for: block),
+            isDefaultCollapseTarget: isDynamicSummaryLockTarget(block)
+        )
+    }
+
+    /// Dynamic blocks that collapse automatically when a run becomes active; explicit choices are
+    /// excluded because they never collapse automatically.
+    private func automaticallyCollapsingDynamicToolSummaryBlockCount() -> Int {
+        AgentTranscriptGroupExpansionPolicy.automaticallyCollapsingCount(
+            transcriptGroupExpansionState,
+            blocks: visibleTranscriptBlocks
+                .filter(isDynamicToolSummaryBlock)
+                .map(transcriptGroupExpansionInput(for:))
+        )
     }
 
     private func renderedRows(for block: AgentTranscriptRenderBlock) -> [AgentChatItem] {
@@ -2216,7 +2254,7 @@ struct AgentModeChatDetailView: View {
                     }
                     clearPinnedIdleTransitionManualDetach()
                     guard !wasActive, isActive else { return }
-                    let expandedDynamicBlockCount = expandedDynamicToolSummaryBlockCount(assumeUnlocked: true)
+                    let expandedDynamicBlockCount = automaticallyCollapsingDynamicToolSummaryBlockCount()
                     guard expandedDynamicBlockCount > 0 else { return }
                     #if DEBUG
                         if isStressHarnessEnabled {
@@ -2287,6 +2325,7 @@ struct AgentModeChatDetailView: View {
                         pendingCompressionRestoreStrategy = nil
                         transcriptBlockExpansion.removeAll()
                         transcriptBlockDefaultExpansion.removeAll()
+                        transcriptBlockManualExpansionIDs.removeAll()
                         assistantExpansionStore.reset()
                         assistantSearchVM.clear()
                         isAssistantSearchActive = false
@@ -2807,17 +2846,14 @@ struct AgentModeChatDetailView: View {
         switch block.kind {
         case .activityCluster:
             let supportsExpansion = transcriptBlockSupportsExpansion(block)
-            let persistedExpansion = persistedTranscriptBlockExpansion(for: block)
-            let summaryLockTarget = isDynamicSummaryLockTarget(block)
-            let isExpanded = supportsExpansion && !summaryLockTarget && persistedExpansion
+            let isExpanded = isTranscriptBlockExpanded(block)
             transcriptBlockRow {
                 VStack(alignment: .leading, spacing: 8) {
-                    if !supportsExpansion || summaryLockTarget {
+                    if !supportsExpansion {
                         clusterSummaryLabel(for: block, isExpanded: isExpanded)
                     } else {
                         Button {
-                            transcriptBlockExpansion[block.id] = !persistedExpansion
-                            transcriptBlockDefaultExpansion[block.id] = block.defaultPresentation == .expanded
+                            toggleTranscriptBlockExpansion(block)
                         } label: {
                             clusterSummaryLabel(for: block, isExpanded: isExpanded)
                         }
@@ -2827,11 +2863,15 @@ struct AgentModeChatDetailView: View {
                         let useScroll = block.rows.count > 5
                         Group {
                             if useScroll {
-                                ScrollView {
-                                    expandedClusterContent(block: block, renderContext: renderContext)
+                                AgentTranscriptInnerFollowScrollView(
+                                    maxHeight: 220,
+                                    followsNewest: isDynamicSummaryLockTarget(block),
+                                    newestEntryID: block.rows.last.map(\.id.uuidString),
+                                    bottomAnchorID: "\(block.id)#inner-bottom"
+                                ) {
+                                    expandedClusterContent(block: block, renderContext: renderContext, lazy: true)
                                         .frame(maxWidth: .infinity, alignment: .leading)
                                 }
-                                .frame(maxHeight: 220)
                             } else {
                                 expandedClusterContent(block: block, renderContext: renderContext)
                                     .frame(maxWidth: .infinity, alignment: .leading)
@@ -2857,17 +2897,14 @@ struct AgentModeChatDetailView: View {
             .accessibilityIdentifier("agentTranscript.collapsedHistoryRange")
         case .groupedHistory:
             let supportsExpansion = transcriptBlockSupportsExpansion(block)
-            let persistedExpansion = persistedTranscriptBlockExpansion(for: block)
-            let summaryLockTarget = isDynamicSummaryLockTarget(block)
-            let isExpanded = supportsExpansion && !summaryLockTarget && persistedExpansion
+            let isExpanded = isTranscriptBlockExpanded(block)
             transcriptBlockRow {
                 VStack(alignment: .leading, spacing: 8) {
-                    if !supportsExpansion || summaryLockTarget {
+                    if !supportsExpansion {
                         groupedHistorySummaryLabel(for: block, isExpanded: isExpanded)
                     } else {
                         Button {
-                            transcriptBlockExpansion[block.id] = !persistedExpansion
-                            transcriptBlockDefaultExpansion[block.id] = block.defaultPresentation == .expanded
+                            toggleTranscriptBlockExpansion(block)
                         } label: {
                             groupedHistorySummaryLabel(for: block, isExpanded: isExpanded)
                         }
@@ -2878,11 +2915,18 @@ struct AgentModeChatDetailView: View {
                         let useScroll = totalRows > 5
                         Group {
                             if useScroll {
-                                ScrollView {
-                                    expandedGroupedContent(sections: groupedHistory.sections, renderContext: renderContext)
+                                let entries = AgentTranscriptGroupInspection.entries(for: groupedHistory.sections)
+                                // The live grouped prefix grows as older calls fold into it, so it
+                                // follows like a live activity cluster.
+                                AgentTranscriptInnerFollowScrollView(
+                                    maxHeight: 260,
+                                    followsNewest: isDynamicSummaryLockTarget(block),
+                                    newestEntryID: entries.last?.id,
+                                    bottomAnchorID: "\(block.id)#inner-bottom"
+                                ) {
+                                    lazyGroupedContent(entries: entries, renderContext: renderContext)
                                         .frame(maxWidth: .infinity, alignment: .leading)
                                 }
-                                .frame(maxHeight: 260)
                             } else {
                                 expandedGroupedContent(sections: groupedHistory.sections, renderContext: renderContext)
                                     .frame(maxWidth: .infinity, alignment: .leading)
@@ -3090,13 +3134,15 @@ struct AgentModeChatDetailView: View {
                 for: block.clusterSummary,
                 fallbackCount: block.clusterSummary?.toolCount ?? block.rows.count,
                 fallbackText: nil
-            )
+            ),
+            failedCount: block.clusterSummary?.failedToolCount
         )
     }
 
     private func groupedHistorySummaryLabel(for block: AgentTranscriptRenderBlock, isExpanded: Bool) -> some View {
         collapsedSummaryLabelContent(
-            display: collapsedSummaryDisplay(for: block.groupedHistory?.summary)
+            display: collapsedSummaryDisplay(for: block.groupedHistory?.summary),
+            failedCount: block.groupedHistory?.summary.toolSummary?.failedToolCount
         )
     }
 
@@ -3141,12 +3187,21 @@ struct AgentModeChatDetailView: View {
     }
 
     private func collapsedSummaryLabelContent(
-        display: AgentTranscriptCollapsedSummaryDisplay
+        display: AgentTranscriptCollapsedSummaryDisplay,
+        failedCount: Int? = nil
     ) -> some View {
         collapsedSummaryCard {
             VStack(alignment: .leading, spacing: 3) {
                 HStack(spacing: 6) {
                     collapsedSummaryTitleRow(title: display.title, count: display.count)
+                    if let failureSuffix = AgentTranscriptToolFailureCount.headerSuffix(failedCount: failedCount) {
+                        // Precomputed at the projection boundary; never derived from JSON here.
+                        Text(failureSuffix.trimmingCharacters(in: .whitespaces))
+                            .font(fontPreset.swiftUIFont(sizeAtNormal: 10.5, weight: .medium))
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                            .fixedSize()
+                    }
                     if display.narrationText != nil, let toolGroupText = display.toolGroupText {
                         Text(toolGroupText)
                             .font(fontPreset.swiftUIFont(sizeAtNormal: 10.5, weight: .medium))
@@ -3244,16 +3299,64 @@ struct AgentModeChatDetailView: View {
         return labels.joined(separator: ", ")
     }
 
-    private func expandedClusterContent(block: AgentTranscriptRenderBlock, renderContext: TranscriptRenderContext) -> some View {
-        VStack(alignment: .leading, spacing: 6) {
-            ForEach(block.rows) { item in
-                transcriptRowView(
-                    item: item,
-                    block: block,
-                    renderContext: renderContext,
-                    autoExpandEnabled: toolCardAutoExpandEnabled(for: item, in: block)
-                )
+    @ViewBuilder
+    private func expandedClusterContent(
+        block: AgentTranscriptRenderBlock,
+        renderContext: TranscriptRenderContext,
+        lazy: Bool = false
+    ) -> some View {
+        if lazy {
+            // Capped branch: only rows near the inner viewport are built. Offscreen rows are
+            // recreated, so an inner card expanded far away can collapse (accepted).
+            LazyVStack(alignment: .leading, spacing: 6) {
+                expandedClusterRows(block: block, renderContext: renderContext)
             }
+        } else {
+            VStack(alignment: .leading, spacing: 6) {
+                expandedClusterRows(block: block, renderContext: renderContext)
+            }
+        }
+    }
+
+    private func expandedClusterRows(block: AgentTranscriptRenderBlock, renderContext: TranscriptRenderContext) -> some View {
+        ForEach(block.rows) { item in
+            transcriptRowView(
+                item: item,
+                block: block,
+                renderContext: renderContext,
+                autoExpandEnabled: toolCardAutoExpandEnabled(for: item, in: block)
+            )
+        }
+    }
+
+    private func lazyGroupedContent(
+        entries: [AgentTranscriptGroupInspectionEntry],
+        renderContext: TranscriptRenderContext
+    ) -> some View {
+        LazyVStack(alignment: .leading, spacing: 0) {
+            ForEach(entries) { entry in
+                groupInspectionEntryView(entry, renderContext: renderContext)
+                    .padding(.top, entry.topSpacing)
+            }
+        }
+        .padding(.bottom, entries.isEmpty ? 0 : AgentTranscriptGroupInspection.sectionVerticalPadding)
+    }
+
+    @ViewBuilder
+    private func groupInspectionEntryView(
+        _ entry: AgentTranscriptGroupInspectionEntry,
+        renderContext: TranscriptRenderContext
+    ) -> some View {
+        switch entry.content {
+        case let .sectionHeader(section):
+            groupedHistorySectionHeader(section: section)
+        case let .row(item, childBlock):
+            transcriptRowView(
+                item: item,
+                block: childBlock,
+                renderContext: renderContext,
+                autoExpandEnabled: toolCardAutoExpandEnabled(for: item, in: childBlock)
+            )
         }
     }
 
@@ -3270,37 +3373,8 @@ struct AgentModeChatDetailView: View {
         renderContext: TranscriptRenderContext
     ) -> some View {
         VStack(alignment: .leading, spacing: 6) {
-            // Section header — compact inline
-            if section.title != nil || section.clusterSummary != nil {
-                HStack(spacing: 5) {
-                    if let icon = section.icon {
-                        Image(systemName: icon)
-                            .font(.system(size: 9))
-                            .foregroundStyle(.tertiary)
-                    }
-                    if let title = section.title {
-                        Text(title)
-                            .font(fontPreset.swiftUIFont(sizeAtNormal: 10, weight: .semibold))
-                            .foregroundStyle(.secondary)
-                    }
-                    if let summary = section.clusterSummary, summary.toolCount > 0 {
-                        Text("\(summary.toolCount)")
-                            .font(fontPreset.swiftUIFont(sizeAtNormal: 9, weight: .semibold))
-                            .foregroundColor(.secondary)
-                            .padding(.horizontal, 4)
-                            .padding(.vertical, 1)
-                            .background(Color.secondary.opacity(0.10))
-                            .cornerRadius(3)
-                    }
-                    // Inline tool chips in section header
-                    if let toolGroups = section.clusterSummary?.toolGroups, !toolGroups.isEmpty {
-                        Text("·")
-                            .font(.system(size: 8))
-                            .foregroundStyle(.quaternary)
-                        clusterToolChips(groups: toolGroups)
-                    }
-                    Spacer(minLength: 0)
-                }
+            if AgentTranscriptGroupInspection.hasSectionHeader(section) {
+                groupedHistorySectionHeader(section: section)
             }
             // Child blocks — compact spacing
             ForEach(section.childBlocks) { childBlock in
@@ -3317,6 +3391,39 @@ struct AgentModeChatDetailView: View {
             }
         }
         .padding(.vertical, 2)
+    }
+
+    /// Section header — compact inline. Shared by the eager and lazy grouped-history layouts.
+    private func groupedHistorySectionHeader(section: AgentTranscriptGroupedSection) -> some View {
+        HStack(spacing: 5) {
+            if let icon = section.icon {
+                Image(systemName: icon)
+                    .font(.system(size: 9))
+                    .foregroundStyle(.tertiary)
+            }
+            if let title = section.title {
+                Text(title)
+                    .font(fontPreset.swiftUIFont(sizeAtNormal: 10, weight: .semibold))
+                    .foregroundStyle(.secondary)
+            }
+            if let summary = section.clusterSummary, summary.toolCount > 0 {
+                Text("\(summary.toolCount)")
+                    .font(fontPreset.swiftUIFont(sizeAtNormal: 9, weight: .semibold))
+                    .foregroundColor(.secondary)
+                    .padding(.horizontal, 4)
+                    .padding(.vertical, 1)
+                    .background(Color.secondary.opacity(0.10))
+                    .cornerRadius(3)
+            }
+            // Inline tool chips in section header
+            if let toolGroups = section.clusterSummary?.toolGroups, !toolGroups.isEmpty {
+                Text("·")
+                    .font(.system(size: 8))
+                    .foregroundStyle(.quaternary)
+                clusterToolChips(groups: toolGroups)
+            }
+            Spacer(minLength: 0)
+        }
     }
 
     /// Tool type chips — renders pre-computed groups from the model, no grouping logic here.
@@ -3477,32 +3584,13 @@ struct AgentModeChatDetailView: View {
         AgentTranscriptSummaryTextFormatter.summaryTitle(for: summary, fallbackCount: fallbackCount)
     }
 
+    /// Seeds defaults, follows default flips only for blocks without an explicit choice, and
+    /// prunes state (including explicit choices) for blocks that are gone.
     private func syncTranscriptBlockExpansion(for blocks: [AgentTranscriptRenderBlock]) {
-        let validIDs = Set(blocks.map(\.id))
-        var nextExpansion = transcriptBlockExpansion.filter { validIDs.contains($0.key) }
-        var nextDefaults = transcriptBlockDefaultExpansion.filter { validIDs.contains($0.key) }
-        for block in blocks {
-            guard transcriptBlockSupportsExpansion(block) else {
-                nextExpansion.removeValue(forKey: block.id)
-                nextDefaults.removeValue(forKey: block.id)
-                continue
-            }
-            let defaultExpanded = block.defaultPresentation == .expanded
-            if let existingExpansion = nextExpansion[block.id],
-               let previousDefault = nextDefaults[block.id]
-            {
-                if previousDefault != defaultExpanded,
-                   existingExpansion == previousDefault
-                {
-                    nextExpansion[block.id] = defaultExpanded
-                }
-            } else {
-                nextExpansion[block.id] = defaultExpanded
-            }
-            nextDefaults[block.id] = defaultExpanded
-        }
-        transcriptBlockExpansion = nextExpansion
-        transcriptBlockDefaultExpansion = nextDefaults
+        transcriptGroupExpansionState = AgentTranscriptGroupExpansionPolicy.synchronized(
+            transcriptGroupExpansionState,
+            blocks: blocks.map(transcriptGroupExpansionInput(for:))
+        )
     }
 
     // MARK: - Handoff

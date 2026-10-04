@@ -5053,7 +5053,8 @@ enum AgentTranscriptIO {
             containsRunningWork: toolExecutions.contains { $0.status == .running || $0.status == .pending },
             containsFailure: toolExecutions.contains { $0.status == .failed || $0.status == .cancelled },
             containsWarning: toolExecutions.contains { $0.status == .warning },
-            shortNarration: shortNarration
+            shortNarration: shortNarration,
+            failedToolCount: AgentTranscriptToolFailureCount.storedFailedCount(toolExecutions)
         )
         return AgentTranscriptClusterSummary(
             toolCount: summary.toolCount,
@@ -5068,7 +5069,8 @@ enum AgentTranscriptIO {
             collapsedDisplay: AgentTranscriptSummaryTextFormatter.collapsedDisplay(
                 for: summary,
                 fallbackCount: summary.toolCount
-            )
+            ),
+            failedToolCount: summary.failedToolCount
         )
     }
 
@@ -7988,7 +7990,8 @@ enum AgentTranscriptProjectionBuilder {
                 containsRunningWork: toolSummary.containsRunningWork,
                 containsFailure: toolSummary.containsFailure,
                 containsWarning: toolSummary.containsWarning,
-                shortNarration: toolSummary.shortNarration
+                shortNarration: toolSummary.shortNarration,
+                failedToolCount: toolSummary.failedToolCount
             )
             : nil
         let hiddenToolCardCount = max(0, summary.hiddenToolCardCount - max(placeholderCount, placeholderNames.count))
@@ -8036,7 +8039,8 @@ enum AgentTranscriptProjectionBuilder {
             containsRunningWork: toolSummary.containsRunningWork,
             containsFailure: toolSummary.containsFailure,
             containsWarning: toolSummary.containsWarning,
-            shortNarration: toolSummary.shortNarration
+            shortNarration: toolSummary.shortNarration,
+            failedToolCount: toolSummary.failedToolCount
         )
         let retaxedToolSummary = AgentTranscriptClusterSummary(
             toolCount: retaxedToolSummaryBase.toolCount,
@@ -8051,7 +8055,8 @@ enum AgentTranscriptProjectionBuilder {
             collapsedDisplay: AgentTranscriptSummaryTextFormatter.collapsedDisplay(
                 for: retaxedToolSummaryBase,
                 fallbackCount: retaxedToolSummaryBase.toolCount
-            )
+            ),
+            failedToolCount: retaxedToolSummaryBase.failedToolCount
         )
         let retaxedSummary = AgentTranscriptGroupedHistorySummary(
             hiddenToolCardCount: summary.hiddenToolCardCount,
@@ -8303,7 +8308,8 @@ enum AgentTranscriptProjectionBuilder {
             containsRunningWork: containsRunningWork,
             containsFailure: containsFailure,
             containsWarning: containsWarning,
-            shortNarration: shortNarration
+            shortNarration: shortNarration,
+            failedToolCount: AgentTranscriptToolFailureCount.storedFailedCount(toolExecutions)
         )
         let renderedSummary = AgentTranscriptClusterSummary(
             toolCount: summary.toolCount,
@@ -8318,7 +8324,8 @@ enum AgentTranscriptProjectionBuilder {
             collapsedDisplay: AgentTranscriptSummaryTextFormatter.collapsedDisplay(
                 for: summary,
                 fallbackCount: summary.toolCount
-            )
+            ),
+            failedToolCount: summary.failedToolCount
         )
         context.clusterSummaryByRowIDs[cacheKey] = renderedSummary
         return renderedSummary

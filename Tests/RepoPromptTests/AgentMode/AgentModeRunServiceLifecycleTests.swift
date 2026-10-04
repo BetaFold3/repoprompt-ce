@@ -3462,9 +3462,27 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
             attachments: [],
             delegatedQuestionStageID: stageID
         )
-        // The fake server never answers the first prompt, so the turn stays running.
-        try await waitUntil("ACP prompt write must acknowledge the stage while the turn runs") {
-            recorder.events.contains(acknowledged)
+        // The fake server never answers the first prompt, so the turn stays running. Cold ACP startup
+        // (environment resolution and server launch) precedes the write, so observe the event with a
+        // cancellation-cooperative condition loop; the bound is only a hang safeguard, never a speed oracle.
+        do {
+            try await withLifecycleTimeout(
+                "ACP prompt write must acknowledge the stage while the turn runs",
+                timeoutSeconds: lifecycleAwaitTimeoutSeconds
+            ) {
+                while true {
+                    try Task.checkCancellation()
+                    if recorder.events.contains(acknowledged) { return }
+                    try await Task.sleep(nanoseconds: 10_000_000)
+                }
+            }
+        } catch {
+            await harness.service.cancelRun(
+                tabID: session.tabID,
+                session: session,
+                completion: .terminalPublished
+            )
+            throw error
         }
         XCTAssertTrue(session.runState.isActive, "Acknowledged before the turn completed")
 

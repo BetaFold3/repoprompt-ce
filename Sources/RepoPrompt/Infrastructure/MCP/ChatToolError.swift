@@ -97,7 +97,7 @@ struct ChatToolError: LocalizedError, Codable {
         let largest = estimate.contributors.prefix(4)
             .map { "\($0.name)=\($0.tokens)" }
             .joined(separator: ", ")
-        let remedies = "Prune the workspace selection; retry the continuation with selection_mode:none; or start a fresh chat with a concise summary."
+        let remedies = "Prune the workspace selection; retry with selection_mode:none or explicit_slices on the same chat_id or a fresh chat; or start a fresh chat with a concise summary."
         let window = estimate.contextWindowTokens ?? 0
         return .init(
             code: .oracleContextOverflow,
