@@ -1,0 +1,748 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <title>Knowledge Work Harness — Technical Implementation Report</title>
+  <style>
+    :root {
+      --bg: #f4f6f8;
+      --surface: #ffffff;
+      --surface-2: #f8fafc;
+      --text: #172033;
+      --muted: #5c687a;
+      --line: #dbe2ea;
+      --accent: #4f46e5;
+      --accent-soft: #eef2ff;
+      --good: #0f766e;
+      --good-soft: #ecfdf5;
+      --warn: #b45309;
+      --warn-soft: #fff7ed;
+      --danger: #b42318;
+      --danger-soft: #fef3f2;
+      --code: #111827;
+      --code-text: #e5e7eb;
+      --shadow: 0 14px 40px rgba(25, 34, 52, 0.08);
+      --radius: 16px;
+    }
+
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #0f131b;
+        --surface: #171c26;
+        --surface-2: #1c2330;
+        --text: #edf1f7;
+        --muted: #aeb8c7;
+        --line: #303848;
+        --accent: #a5b4fc;
+        --accent-soft: #252a4f;
+        --good: #5eead4;
+        --good-soft: #123832;
+        --warn: #fdba74;
+        --warn-soft: #432b17;
+        --danger: #fda4af;
+        --danger-soft: #461f26;
+        --code: #0b0f16;
+        --code-text: #e5e7eb;
+        --shadow: 0 16px 45px rgba(0, 0, 0, 0.28);
+      }
+    }
+
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font: 16px/1.62 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    a { color: var(--accent); }
+    code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; }
+    code {
+      background: var(--surface-2);
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      padding: 0.08rem 0.35rem;
+      font-size: 0.9em;
+    }
+    pre {
+      margin: 0;
+      padding: 1rem 1.1rem;
+      overflow-x: auto;
+      background: var(--code);
+      color: var(--code-text);
+      border-radius: 12px;
+      font-size: 0.86rem;
+      line-height: 1.55;
+    }
+    pre code { border: 0; background: transparent; padding: 0; color: inherit; }
+    h1, h2, h3 { line-height: 1.2; letter-spacing: -0.02em; }
+    h2 { margin-top: 0; font-size: clamp(1.45rem, 2.5vw, 2rem); }
+    h3 { margin: 1.35rem 0 0.5rem; font-size: 1.13rem; }
+    p { margin: 0.55rem 0 1rem; }
+    ul, ol { padding-left: 1.3rem; }
+    li + li { margin-top: 0.35rem; }
+
+    .hero {
+      color: white;
+      background:
+        radial-gradient(circle at 85% 15%, rgba(94, 234, 212, 0.25), transparent 30%),
+        linear-gradient(135deg, #312e81 0%, #4338ca 45%, #0f766e 125%);
+      padding: 4.5rem 1.25rem 5.5rem;
+    }
+    .hero-inner, .layout { max-width: 1180px; margin: 0 auto; }
+    .eyebrow {
+      text-transform: uppercase;
+      letter-spacing: 0.12em;
+      font-size: 0.76rem;
+      font-weight: 750;
+      opacity: 0.82;
+    }
+    .hero h1 {
+      max-width: 900px;
+      margin: 0.45rem 0 1rem;
+      font-size: clamp(2.2rem, 5vw, 4.3rem);
+    }
+    .hero .lead {
+      max-width: 850px;
+      font-size: clamp(1.05rem, 2vw, 1.35rem);
+      opacity: 0.93;
+    }
+    .meta-row { display: flex; flex-wrap: wrap; gap: 0.55rem; margin-top: 1.5rem; }
+    .meta-chip {
+      border: 1px solid rgba(255,255,255,0.32);
+      background: rgba(255,255,255,0.12);
+      border-radius: 999px;
+      padding: 0.35rem 0.72rem;
+      font-size: 0.84rem;
+      backdrop-filter: blur(8px);
+    }
+
+    .layout {
+      display: grid;
+      grid-template-columns: 230px minmax(0, 1fr);
+      gap: 1.5rem;
+      padding: 0 1.25rem 4rem;
+      margin-top: -2.4rem;
+      align-items: start;
+    }
+    nav {
+      position: sticky;
+      top: 1rem;
+      background: var(--surface);
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      box-shadow: var(--shadow);
+      padding: 1rem;
+    }
+    nav strong { display: block; margin: 0 0 0.55rem; }
+    nav a {
+      display: block;
+      padding: 0.34rem 0.4rem;
+      border-radius: 7px;
+      color: var(--muted);
+      text-decoration: none;
+      font-size: 0.9rem;
+    }
+    nav a:hover { background: var(--accent-soft); color: var(--accent); }
+    main { min-width: 0; }
+    section {
+      background: var(--surface);
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      box-shadow: var(--shadow);
+      padding: clamp(1.25rem, 3vw, 2.25rem);
+      margin-bottom: 1.25rem;
+      scroll-margin-top: 1rem;
+    }
+
+    .grid { display: grid; gap: 1rem; }
+    .grid.two { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .grid.three { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+    .card {
+      background: var(--surface-2);
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      padding: 1rem;
+    }
+    .card h3 { margin-top: 0; }
+    .metric {
+      font-size: 1.9rem;
+      font-weight: 780;
+      letter-spacing: -0.04em;
+      color: var(--accent);
+    }
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.3rem;
+      border-radius: 999px;
+      padding: 0.25rem 0.6rem;
+      font-weight: 700;
+      font-size: 0.77rem;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+    }
+    .badge.good { background: var(--good-soft); color: var(--good); }
+    .badge.warn { background: var(--warn-soft); color: var(--warn); }
+    .badge.danger { background: var(--danger-soft); color: var(--danger); }
+    .badge.info { background: var(--accent-soft); color: var(--accent); }
+    .callout {
+      border-left: 4px solid var(--accent);
+      background: var(--accent-soft);
+      border-radius: 0 10px 10px 0;
+      padding: 0.8rem 1rem;
+      margin: 1rem 0;
+    }
+    .callout.good { border-color: var(--good); background: var(--good-soft); }
+    .callout.warn { border-color: var(--warn); background: var(--warn-soft); }
+    .callout.danger { border-color: var(--danger); background: var(--danger-soft); }
+
+    .flow {
+      display: grid;
+      grid-template-columns: 1.1fr 0.8fr 1.1fr;
+      gap: 0.8rem;
+      align-items: stretch;
+      margin: 1rem 0;
+    }
+    .flow-box {
+      border: 1px solid var(--line);
+      background: var(--surface-2);
+      border-radius: 12px;
+      padding: 1rem;
+    }
+    .flow-box.center {
+      display: grid;
+      place-items: center;
+      text-align: center;
+      color: var(--accent);
+      font-weight: 750;
+    }
+
+    .step {
+      display: grid;
+      grid-template-columns: 2.35rem minmax(0,1fr);
+      gap: 0.85rem;
+      margin: 1.1rem 0;
+    }
+    .step-number {
+      width: 2.35rem;
+      height: 2.35rem;
+      border-radius: 50%;
+      display: grid;
+      place-items: center;
+      background: var(--accent);
+      color: white;
+      font-weight: 800;
+    }
+    .step h3 { margin: 0 0 0.35rem; }
+
+    table { width: 100%; border-collapse: collapse; font-size: 0.91rem; }
+    th, td { text-align: left; vertical-align: top; border-bottom: 1px solid var(--line); padding: 0.7rem 0.55rem; }
+    th { color: var(--muted); font-size: 0.78rem; text-transform: uppercase; letter-spacing: 0.05em; }
+    tr:last-child td { border-bottom: 0; }
+    .table-wrap { overflow-x: auto; }
+    details {
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      margin: 0.65rem 0;
+      background: var(--surface-2);
+    }
+    summary { cursor: pointer; padding: 0.8rem 1rem; font-weight: 700; }
+    details > div { padding: 0 1rem 1rem; }
+    .small { color: var(--muted); font-size: 0.88rem; }
+    .checklist { list-style: none; padding: 0; }
+    .checklist li { position: relative; padding-left: 1.65rem; }
+    .checklist li::before { content: "□"; position: absolute; left: 0; color: var(--accent); font-weight: 800; }
+    .footer { color: var(--muted); text-align: center; padding: 1rem 1rem 3rem; font-size: 0.85rem; }
+
+    @media (max-width: 900px) {
+      .layout { grid-template-columns: 1fr; margin-top: -2rem; }
+      nav { position: static; }
+      nav .links { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .grid.two, .grid.three, .flow { grid-template-columns: 1fr; }
+      .flow-box.center { min-height: 3.5rem; }
+    }
+    @media (max-width: 560px) {
+      nav .links { grid-template-columns: 1fr; }
+      .hero { padding-top: 3rem; }
+      section { padding: 1.1rem; }
+    }
+    @media print {
+      :root { color-scheme: light; }
+      body { background: white; }
+      .hero { padding: 1.5rem 0; background: white; color: #172033; }
+      .layout { display: block; margin: 0; padding: 0; }
+      nav { display: none; }
+      section { box-shadow: none; break-inside: avoid; margin: 0 0 0.8rem; }
+      a { color: inherit; text-decoration: none; }
+    }
+  </style>
+</head>
+<body>
+  <header class="hero">
+    <div class="hero-inner">
+      <div class="eyebrow">RepoPrompt CE · Technical implementation report</div>
+      <h1>Knowledge Work Harness</h1>
+      <p class="lead">RepoPrompt can now send one sealed evidence packet to two independent Oracle models, verify that both lanes received the same input and intended participant profile, distinguish complete answers from interrupted ones, and support an adaptive 0–2 round critique-and-synthesis workflow.</p>
+      <div class="meta-row">
+        <span class="meta-chip">Report date: 2026-07-30</span>
+        <span class="meta-chip">Branch: feat/duo-duel-oracles</span>
+        <span class="meta-chip">Parallel foundation: e6b6802d</span>
+        <span class="meta-chip">Current implementation: uncommitted</span>
+      </div>
+    </div>
+  </header>
+
+  <div class="layout">
+    <nav aria-label="Report contents">
+      <strong>Contents</strong>
+      <div class="links">
+        <a href="#executive">Executive summary</a>
+        <a href="#expect">What to expect</a>
+        <a href="#architecture">How it works</a>
+        <a href="#changes">What changed</a>
+        <a href="#decisions">Major decisions</a>
+        <a href="#testing">Test it step by step</a>
+        <a href="#validation">Validation evidence</a>
+        <a href="#limits">Boundaries and risks</a>
+        <a href="#actions">Your action items</a>
+        <a href="#inventory">File inventory</a>
+      </div>
+    </nav>
+
+    <main>
+      <section id="executive">
+        <span class="badge good">Implementation complete, not committed</span>
+        <h2>Executive summary</h2>
+        <p>The work turns the already-landed parallel Oracle feature into a trustworthy knowledge-work substrate. The key addition is <strong>packet mode</strong>: instead of letting each Oracle inherit the active workspace’s files, tree, Code Maps, git context, and meta prompts, RepoPrompt constructs a deliberately sealed request containing only the supplied question/evidence packet, a lean participant system prompt, and that lane’s own conversation history.</p>
+        <p>The result is not merely “ask two models.” Each response includes machine-checkable evidence about which model and preset ran, whether the packet and system prompt matched the other lane, whether workspace context was excluded, and whether the answer truly completed or was cancelled, preempted, failed, or partial.</p>
+
+        <div class="grid three">
+          <div class="card">
+            <div class="metric">2</div>
+            <strong>independent Oracle lanes</strong>
+            <p class="small">Built on the landed parallel-consultation foundation and its two-stream per-tab cap.</p>
+          </div>
+          <div class="card">
+            <div class="metric">0–2</div>
+            <strong>critique rounds</strong>
+            <p class="small">Zero by default; escalate only when disagreement or missing perspectives justify it.</p>
+          </div>
+          <div class="card">
+            <div class="metric">80</div>
+            <strong>focused tests reported green</strong>
+            <p class="small">Across eight suites during implementation; build, lint, guardrails, and diff checks also passed.</p>
+          </div>
+        </div>
+
+        <div class="callout warn">
+          <strong>Important boundary:</strong> RepoPrompt now enforces or exposes the evidence-integrity invariants, but it does not yet contain a coded <code>DuelRun</code> state machine. Round selection, anonymized cross-critique, synthesis, and note writing are delivered as a user Markdown workflow template in <code>docs/spec/knowledge-duel-v1.md</code>.
+        </div>
+      </section>
+
+      <section id="expect">
+        <h2>What you can expect from this change</h2>
+        <div class="grid two">
+          <div class="card">
+            <h3>What should now work</h3>
+            <ul>
+              <li>Ask <strong>OracleA</strong> and <strong>OracleB</strong> the same self-contained question at the same time.</li>
+              <li>Keep their first answers independent, with no answer-to-answer contamination.</li>
+              <li>Use a lean, tool-free <strong>Knowledge Oracle</strong> participant profile.</li>
+              <li>Prove both lanes were constructed from the same packet bytes and effective system prompt.</li>
+              <li>Prove the lanes resolved to explicit, distinct model identities before synthesis.</li>
+              <li>Continue a lane for critique without silently changing its model or participant profile.</li>
+              <li>Reject an ordinary workspace chat being adopted as a supposedly clean packet lane.</li>
+              <li>Reject cancelled, preempted, failed, partial, or unknown results from normal synthesis.</li>
+              <li>Produce a durable <code>*.duel.md</code> note in the active workspace through the workflow.</li>
+            </ul>
+          </div>
+          <div class="card">
+            <h3>What is not automatic yet</h3>
+            <ul>
+              <li>The application does not automatically decide whether to run 0, 1, or 2 critique rounds.</li>
+              <li>There is no persisted, restartable duel-run object or dedicated duel UI.</li>
+              <li>Cross-review anonymization is prompt-enforced rather than code-enforced.</li>
+              <li>Web research is not available to the pure Oracle participants; common web evidence must be collected by the orchestrator and inserted into the packet.</li>
+              <li>A packet lane cannot be resumed after app restart because participant bindings are intentionally in-memory and fail closed.</li>
+              <li>The workflow template must be installed in the user workflow directory before one-command use.</li>
+            </ul>
+          </div>
+        </div>
+
+        <h3>Model choice remains configuration, not implementation</h3>
+        <p>Your current pairing—Claude Fable 5 xhigh as OracleA and GPT 5.6 Sol xhigh as OracleB—is appropriate, but no code depends on those names or providers. The harness uses exact model-preset identities and verifies the model identity echoed by each call. You can repoint OracleA or OracleB later without changing the knowledge-harness implementation.</p>
+      </section>
+
+      <section id="architecture">
+        <h2>How the harness works</h2>
+        <div class="flow" aria-label="Knowledge duel architecture">
+          <div class="flow-box">
+            <strong>1. Orchestrator</strong>
+            <p>Builds one question-plus-evidence packet. It may read selected documents or gather common web evidence before the Oracle calls.</p>
+          </div>
+          <div class="flow-box center">same frozen packet<br>⇢ ⇢</div>
+          <div class="flow-box">
+            <strong>2. Two independent participants</strong>
+            <p>OracleA and OracleB answer in fresh chats under the same lean Knowledge Oracle system prompt, with no tools and no workspace context.</p>
+          </div>
+        </div>
+        <div class="flow">
+          <div class="flow-box">
+            <strong>3. Verification gate</strong>
+            <p>Checks terminal outcome, explicit preset identity, distinct model IDs, matching packet hash, matching system-prompt hash, and <code>packet_context_clean</code>.</p>
+          </div>
+          <div class="flow-box center">0 rounds by default<br>0–2 maximum</div>
+          <div class="flow-box">
+            <strong>4. Judge and synthesis</strong>
+            <p>The orchestrator compares answers, optionally requests anonymized critiques, then writes synthesis first and preserves the raw audit trail below it.</p>
+          </div>
+        </div>
+
+        <h3>The packet receipt</h3>
+        <p>Each packet-mode result includes a construction receipt. These fields attest to what RepoPrompt assembled locally; they are not cryptographic proof that a remote provider honored the content.</p>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Field</th><th>What it proves or reports</th><th>How the orchestrator uses it</th></tr></thead>
+            <tbody>
+              <tr><td><code>packet_sha256</code></td><td>Hash of the exact trimmed packet text using the versioned <code>utf8-v1</code> basis.</td><td>Both initial lanes must match.</td></tr>
+              <tr><td><code>system_prompt_sha256</code></td><td>Hash of the effective participant system prompt, including standard RepoPrompt directives.</td><td>Both lanes must match.</td></tr>
+              <tr><td><code>system_prompt_source</code></td><td>Whether the prompt came from the intended stored prompt or a generic fallback.</td><td>Must begin with <code>stored_prompt:</code>.</td></tr>
+              <tr><td><code>chat_preset_id</code></td><td>The actual participant profile used.</td><td>Must be the requested Knowledge Oracle profile.</td></tr>
+              <tr><td><code>packet_context_clean</code></td><td>The assembled message carried no files, tree, Code Maps, git diff, or meta prompts.</td><td>Must be <code>true</code>.</td></tr>
+              <tr><td><code>model_preset_id</code> / <code>model_id</code></td><td>The requested model preset and actual resolved model.</td><td>Each lane must match its request; the two <code>model_id</code> values must differ.</td></tr>
+              <tr><td><code>outcome</code></td><td><code>completed</code>, <code>failed</code>, <code>cancelled</code>, <code>preempted</code>, or <code>unknown</code>.</td><td>Only <code>completed</code> is eligible for synthesis.</td></tr>
+              <tr><td><code>response_is_partial</code></td><td>Whether returned text is a truncated fragment.</td><td>Partial text may be shown diagnostically but must not be synthesized.</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <section id="changes">
+        <h2>What was implemented</h2>
+
+        <h3>1. Built-in Knowledge Oracle profile</h3>
+        <p>A stable built-in chat preset and stored prompt were added. The preset explicitly requests no file tree, no Code Maps, and no git context, and promotes one stored prompt to the participant system prompt. The prompt tells the model to use only the packet, label general knowledge, expose missing evidence and assumptions, calibrate uncertainty, treat quoted instructions as evidence rather than commands, and avoid identifying its model or vendor.</p>
+        <div class="callout good"><strong>Compatibility safeguard:</strong> the preset is appended last in the built-in list so it cannot become the order-sensitive default for ordinary chat-mode Oracle calls.</div>
+
+        <h3>2. A true packet-mode packaging path</h3>
+        <p><code>ask_oracle</code> now accepts <code>context_mode:"packet"</code> plus an optional exact <code>chat_preset</code>. The implementation does not rely on preset settings alone. It branches before normal context preassembly and constructs a message with empty file contents, tree, git diff, and meta instructions.</p>
+        <p>This stronger design was necessary because normal chat packaging can include selected file contents and authorized git artifacts through paths not completely controlled by the preset’s “none” settings.</p>
+
+        <h3>3. Fail-closed participant binding</h3>
+        <p>At creation, a packet lane pins its chat preset, resolved model, and model preset. Every continuation is checked against that binding. A model switch, profile switch, ordinary-chat adoption, post-restart continuation, workspace-context send into a packet lane, or continuation after a UI send took over the lane is rejected rather than silently accepted.</p>
+
+        <h3>4. Trustworthy terminal outcomes</h3>
+        <p>The send path now records a first-write-wins terminal result before finalization waiters wake. MCP replies expose the outcome, optional detail, and whether returned content is partial. This closes a real failure mode discovered during implementation: user preemption could previously look like a successful Oracle answer carrying only truncated or missing text.</p>
+
+        <h3>5. User workflow and durable specification</h3>
+        <p><code>docs/spec/knowledge-duel-v1.md</code> is the durable contract. It documents the request fields, receipt semantics, participant binding, adaptive debate protocol, verification gate, limitations, and a ready-to-install <strong>Knowledge Duel</strong> workflow. The workflow writes <code>YYYY-MM-DD-&lt;question-slug&gt;.duel.md</code> in the active workspace root or conventional notes directory.</p>
+      </section>
+
+      <section id="decisions">
+        <h2>Major turns and decisions</h2>
+        <p class="small">These are the decisions that materially changed the design, based on the session record, third-party review, and independent Oracle reviews.</p>
+
+        <details open>
+          <summary>Extend RepoPrompt instead of building a separate knowledge app</summary>
+          <div><p>RepoPrompt already owns multi-provider Oracle calls, model presets, no-tools participant execution, context packaging, conversation persistence, exports, and workspace-native notes. A separate app would reproduce that foundation while making it harder to carry a synthesis directly into coding work. A separate product only becomes attractive if mobile/web, multi-user collaboration, or large-scale web capture becomes the primary requirement.</p></div>
+        </details>
+
+        <details>
+          <summary>The participant profile belongs in ChatPreset, not an Agent Mode role</summary>
+          <div><p>An Agent Mode “knowledge” role would shape the orchestrator, not the Oracle participants. The smallest correct seam is the existing combination of model preset, chat preset, and one stored prompt promoted to the system prompt. A lean orchestrator role remains optional future work.</p></div>
+        </details>
+
+        <details>
+          <summary>The manual pilot was retired as a formal gate</summary>
+          <div><p>Your years of manually asking two frontier models and synthesizing their blind spots already established the product value. The plan therefore adopted zero rounds by default with adaptive escalation to one or, rarely, two rounds. Future calibration can come from real persisted duel artifacts rather than a separate 20–30-question study.</p></div>
+        </details>
+
+        <details>
+          <summary>Detached start/wait infrastructure was rejected</summary>
+          <div><p>The landed parallel-Oracle work already supports two concurrent sessions with exact correlation and a two-stream cap. A general job registry would add lifecycle, expiry, cancellation, reconnect, and UI obligations without demonstrated need. The chosen design uses synchronous calls plus a stage barrier.</p></div>
+        </details>
+
+        <details>
+          <summary>“No context” configuration was not trusted as a seal</summary>
+          <div><p>This was the most important implementation pivot. Setting tree, Code Maps, and git to none looked sufficient but was not: selected file contents and authorized git artifacts can still enter normal packaging. Packet mode therefore bypasses preassembly. The guarantee comes from the code path, while the preset remains the participant profile.</p></div>
+        </details>
+
+        <details>
+          <summary>Cancellation characterization became a bug fix</summary>
+          <div><p>The plan originally asked only to characterize what callers observe when a lane is cancelled or preempted. Testing found that preemption could be indistinguishable from success. The scope correctly expanded to structured terminal outcomes so truncated output cannot enter synthesis unnoticed.</p></div>
+        </details>
+
+        <details>
+          <summary>Participant binding was pulled forward from a future DuelRun</summary>
+          <div><p>Independent Oracle reviewers identified model/profile drift as a correctness-critical invariant. Because continuations re-resolve model and preset rather than inheriting them from the chat, prompt guidance alone was insufficient. Binding is now enforced in the send path, before a later state-machine feature exists.</p></div>
+        </details>
+
+        <details>
+          <summary>A coded DuelRun was deliberately not built</summary>
+          <div><p>The implementation now enforces or exposes the invariants that could corrupt evidence: packet identity, profile identity, participant identity, lane integrity, and completion state. The remaining prompt-level behaviors—round cap and anonymization—affect answer quality rather than silently changing the evidence. Shipping the workflow first keeps scope proportional while real use informs whether a durable state machine is worthwhile.</p></div>
+        </details>
+      </section>
+
+      <section id="testing">
+        <h2>How to test and see the effect</h2>
+        <p>The following progression starts with safe automated checks, then moves to a live single-lane packet inspection, and finally to the full dual-Oracle experience. Commands that launch or relaunch the visible app should be run by you when convenient because they can stop an existing RepoPrompt instance.</p>
+
+        <div class="step">
+          <div class="step-number">1</div>
+          <div>
+            <h3>Review the current scope</h3>
+            <pre><code>git status --short
+git diff --stat
+git diff --check</code></pre>
+            <p><strong>Expected:</strong> before this report, the implementation was 14 files with 2,368 additions and 34 deletions: 11 modified files and 3 untracked files. <code>git diff --check</code> should be clean.</p>
+          </div>
+        </div>
+
+        <div class="step">
+          <div class="step-number">2</div>
+          <div>
+            <h3>Run the smallest focused validation</h3>
+            <pre><code>make dev-test FILTER=KnowledgeOraclePresetTests
+make dev-test FILTER=OraclePacketModeTests
+make dev-test FILTER=AgentOraclePillRoutingTests
+make dev-swift-build PRODUCT=RepoPrompt
+make dev-lint</code></pre>
+            <p><strong>Expected:</strong> the profile tests confirm the stable preset and prompt; packet tests confirm sealing, receipts, conversation-history behavior, binding, fail-closed preset resolution, and service validation; routing tests confirm terminal outcomes and concurrent-lane behavior.</p>
+          </div>
+        </div>
+
+        <div class="step">
+          <div class="step-number">3</div>
+          <div>
+            <h3>Build and launch the debug app</h3>
+            <pre><code>make dev-build
+# When you are ready to replace/relaunch the visible debug app:
+make dev-run</code></pre>
+            <p><strong>Expected:</strong> a coordinated debug package is built. <code>make dev-run</code> launches it through the developer daemon and may stop an existing RepoPrompt instance.</p>
+          </div>
+        </div>
+
+        <div class="step">
+          <div class="step-number">4</div>
+          <div>
+            <h3>Confirm OracleA and OracleB are selectable</h3>
+            <p>In an Agent Mode session, ask the orchestrator to call <code>oracle_utils</code> with <code>op:"models"</code>. Confirm OracleA resolves to Claude Fable 5 xhigh and OracleB resolves to GPT 5.6 Sol xhigh, or to whatever pair you intentionally configured.</p>
+            <p><strong>Expected:</strong> both presets appear under available/selectable models with distinct exact preset UUIDs. The implementation does not require these specific model families; distinct verified identities are what matter.</p>
+          </div>
+        </div>
+
+        <div class="step">
+          <div class="step-number">5</div>
+          <div>
+            <h3>Run one packet-mode consultation</h3>
+            <p>Have Agent Mode make a fresh <code>ask_oracle</code> call with an explicit model preset, <code>mode:"chat"</code>, <code>new_chat:true</code>, and <code>context_mode:"packet"</code>. The <code>chat_preset</code> may be omitted to use the built-in Knowledge Oracle.</p>
+            <pre><code>{
+  "message": "Question: …\n\nEvidence packet:\n…",
+  "mode": "chat",
+  "new_chat": true,
+  "model": "&lt;exact OracleA preset UUID&gt;",
+  "chat_name": "Packet smoke A",
+  "context_mode": "packet"
+}</code></pre>
+            <p><strong>Expected receipt:</strong> <code>outcome:"completed"</code>, <code>response_is_partial:false</code>, <code>packet_context_clean:true</code>, <code>system_prompt_source</code> beginning with <code>stored_prompt:</code>, and non-empty packet/system-prompt hashes.</p>
+          </div>
+        </div>
+
+        <div class="step">
+          <div class="step-number">6</div>
+          <div>
+            <h3>Demonstrate that workspace context is sealed</h3>
+            <p>Select files, enable a visible tree/Code Maps configuration, and have git changes present in the tab. Then send an unrelated, self-contained packet in packet mode without quoting those workspace materials.</p>
+            <p><strong>Expected:</strong> <code>packet_context_clean:true</code>; the response should use only the packet. For a stronger check, place a unique harmless sentinel in a selected test document and confirm it is absent from the participant response. The automated packet suite is the authoritative structural proof.</p>
+          </div>
+        </div>
+
+        <div class="step">
+          <div class="step-number">7</div>
+          <div>
+            <h3>Run the two-lane independence test</h3>
+            <p>Issue OracleA and OracleB calls together in one tool-call batch. Use identical message text, fresh separate chats, explicit distinct model preset UUIDs, and packet mode.</p>
+            <ul class="checklist">
+              <li>Both outcomes are <code>completed</code>.</li>
+              <li>Both responses are non-empty and non-partial.</li>
+              <li><code>packet_sha256</code> is identical.</li>
+              <li><code>system_prompt_sha256</code> is identical.</li>
+              <li><code>packet_context_clean</code> is true in both.</li>
+              <li>Each echoed <code>model_preset_id</code> matches its request.</li>
+              <li>The two echoed <code>model_id</code> values differ.</li>
+            </ul>
+            <p><strong>Visible effect:</strong> the Oracle UI should show two concurrently streaming sessions under the landed parallel-Oracle controls.</p>
+          </div>
+        </div>
+
+        <div class="step">
+          <div class="step-number">8</div>
+          <div>
+            <h3>Exercise fail-closed continuation</h3>
+            <p>Continue one packet lane using its returned <code>chat_id</code>, the same <code>context_mode:"packet"</code>, and the same model preset. It should work and retain that lane’s conversation history. Then deliberately retry with the other model preset or with workspace context.</p>
+            <p><strong>Expected:</strong> the valid continuation completes; the model/profile switch or workspace continuation is rejected before transport with an actionable binding error.</p>
+          </div>
+        </div>
+
+        <div class="step">
+          <div class="step-number">9</div>
+          <div>
+            <h3>Exercise terminal outcomes</h3>
+            <p>Start a slower Oracle response, then cancel or replace it from the UI while the MCP caller is waiting.</p>
+            <p><strong>Expected:</strong> the result is reported as <code>cancelled</code> or <code>preempted</code>, with <code>response_is_partial:true</code> when a fragment exists. The orchestrator must refuse to synthesize it. The sibling lane remains unaffected.</p>
+          </div>
+        </div>
+
+        <div class="step">
+          <div class="step-number">10</div>
+          <div>
+            <h3>Install and use the Knowledge Duel workflow</h3>
+            <p>Copy the workflow block from <code>docs/spec/knowledge-duel-v1.md</code> into:</p>
+            <pre><code>~/Library/Application Support/RepoPrompt CE/Workflows/knowledge-duel.md</code></pre>
+            <p>Then invoke the <strong>Knowledge Duel</strong> workflow in Agent Mode with a real question and its evidence. Start with zero critique rounds; let the orchestrator propose one only when the answers materially disagree or expose complementary blind spots.</p>
+            <p><strong>Expected artifact:</strong> a workspace-native <code>YYYY-MM-DD-&lt;question-slug&gt;.duel.md</code> note with synthesis first and an audit appendix containing the raw answers, any critiques, hashes, model identities, outcome data, and de-anonymized mapping.</p>
+          </div>
+        </div>
+      </section>
+
+      <section id="validation">
+        <h2>Validation evidence</h2>
+        <p><span class="badge info">Observed in implementation session</span> These checks were reported by the implementation session and were not rerun while generating this HTML report.</p>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Check</th><th>Reported result</th><th>Coverage</th></tr></thead>
+            <tbody>
+              <tr><td>Eight focused XCTest suites</td><td><span class="badge good">80 tests passed</span></td><td>Knowledge preset, packet sealing and receipts, binding, terminal outcomes, model selection, tool schema, workflow/policy behavior.</td></tr>
+              <tr><td><code>make dev-swift-build PRODUCT=RepoPrompt</code></td><td><span class="badge good">Passed</span></td><td>RepoPrompt product compilation.</td></tr>
+              <tr><td><code>make dev-format</code> + <code>make dev-lint</code></td><td><span class="badge good">Clean</span></td><td>Swift formatting and strict lint.</td></tr>
+              <tr><td><code>make guardrails</code></td><td><span class="badge good">Passed</span></td><td>Repository source-layout and policy guardrails.</td></tr>
+              <tr><td><code>git diff --check</code></td><td><span class="badge good">Clean</span></td><td>Whitespace/conflict-marker hygiene.</td></tr>
+              <tr><td>Test contract ledger</td><td><span class="badge warn">Returned to known baseline</span></td><td>16 implementation rows added; unrelated existing drift remains at missing=3/stale=2 for WorkspaceProjectedPathSearchTests.</td></tr>
+              <tr><td>Full root XCTest suite</td><td><span class="badge warn">Not run for final implementation</span></td><td>Known branch baseline includes two unrelated GitBlobIdentityServiceTests failures.</td></tr>
+              <tr><td>Independent Oracle review</td><td><span class="badge good">Two lanes, before and after</span></td><td>Design and diff reviewed using independent OracleA/OracleB lanes; substantive findings were folded into packet sealing, outcomes, binding, and compatibility behavior.</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3>Mutation-testing highlight</h3>
+        <p>During hardening, the guard against adopting an ordinary workspace chat as a packet lane was temporarily disabled. The relevant test did not fail cleanly—it hung until timeout—so the test was changed to race against a deadline. This turns a future regression into a fast, legible failure rather than a stalled test run.</p>
+      </section>
+
+      <section id="limits">
+        <h2>Boundaries, risks, and technical debt</h2>
+        <div class="grid two">
+          <div class="card">
+            <h3>Fail-closed limitations</h3>
+            <ul>
+              <li>Packet bindings are in-memory; app restart requires new participant chats.</li>
+              <li>A UI send into a packet lane invalidates the lane for future packet continuation.</li>
+              <li>Unknown or non-completed terminal outcomes are not synthesizable.</li>
+              <li>Hashes attest to local construction, not remote provider receipt or compliance.</li>
+              <li>Provider truncation finish reasons are not yet separately surfaced under a locally completed outcome.</li>
+            </ul>
+          </div>
+          <div class="card">
+            <h3>Pre-existing stream lifecycle debt</h3>
+            <ul>
+              <li><code>scheduleFinalizationWatchdog</code> has no initial arming site and is currently inert.</li>
+              <li>The inactivity watchdog arms only after the first text/reasoning event; a provider that emits nothing can hold a slot until UI cancellation.</li>
+              <li>Cancelling an MCP request cancels its waiter, not the provider stream itself.</li>
+              <li>The headless stream registry remains keyed by tab and should be re-keyed before future duel/web work adopts that path.</li>
+            </ul>
+          </div>
+        </div>
+        <div class="callout warn">
+          <strong>Ordinary chat is not packet mode.</strong> Selecting the Knowledge Oracle preset in the UI does not by itself seal context. The guarantee comes only from <code>ask_oracle</code> with <code>context_mode:"packet"</code>.
+        </div>
+        <div class="callout">
+          <strong>Web evidence policy:</strong> for comparable answers, the orchestrator should collect sources first and give both models the same dated evidence packet. Independent per-model research may improve discovery diversity later, but it makes disagreements harder to interpret.
+        </div>
+      </section>
+
+      <section id="actions">
+        <h2>Action items for you</h2>
+        <div class="grid two">
+          <div class="card">
+            <span class="badge danger">Before commit</span>
+            <h3>Review and commit the implementation</h3>
+            <ol>
+              <li>Review the 14-file implementation diff and this HTML report.</li>
+              <li>Decide whether <code>docs/spec/knowledge-duel-v1.md</code> and this report should ship in the same commit.</li>
+              <li>Stage only intended files.</li>
+              <li>Run the repository-local contribution preflight after staging.</li>
+            </ol>
+            <pre><code>.agents/skills/rpce-contribution-check/scripts/preflight.sh commit</code></pre>
+            <p class="small">The preflight may report the already-known unrelated ledger drift; do not silently “fix” unrelated rows in this change.</p>
+          </div>
+          <div class="card">
+            <span class="badge info">To use the feature</span>
+            <h3>Install the workflow and run a real duel</h3>
+            <ol>
+              <li>Build and launch the updated debug app.</li>
+              <li>Confirm OracleA and OracleB are selectable and distinct.</li>
+              <li>Install the workflow from the spec into your RepoPrompt CE user Workflows directory.</li>
+              <li>Run a real question with a self-contained packet.</li>
+              <li>Check the verification receipt before trusting the synthesis.</li>
+            </ol>
+          </div>
+        </div>
+
+        <h3>Recommended first real exercise</h3>
+        <p>Choose a question where you already have a meaningful document or design packet. Run zero critique rounds first. If the initial answers disagree materially, ask for one anonymized critique round focused on factual errors, unsupported assumptions, missing evidence, and strongest surviving claims. Reserve the second round for a specific unresolved verification target—not for general “debate.”</p>
+
+        <h3>Future work, only if real usage justifies it</h3>
+        <ul>
+          <li>Add a coded <code>DuelRun</code> state machine for budgets, deadlines, recovery, stage persistence, anonymization mapping, and automatic note finalization.</li>
+          <li>Add a lean knowledge-orchestrator Agent Mode profile; keep it separate from the participant profile.</li>
+          <li>Add provider-neutral common web evidence capture.</li>
+          <li>Fix the silent-before-first-token and inert-finalization watchdog issues.</li>
+          <li>Re-key headless stream ownership by run ID before reusing the headless path.</li>
+        </ul>
+      </section>
+
+      <section id="inventory">
+        <h2>Change inventory and provenance</h2>
+        <p><strong>Observed repository state before adding this report:</strong> branch <code>feat/duo-duel-oracles</code>, 11 modified and 3 untracked implementation files, totaling 2,368 additions and 34 deletions. The parallel-consultation foundation is already committed as <code>e6b6802d</code>; the packet/profile/outcome work below is uncommitted.</p>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>File or group</th><th>State</th><th>Role</th><th>Purpose</th></tr></thead>
+            <tbody>
+              <tr><td><code>ChatPreset.swift</code></td><td>Modified</td><td>Source</td><td>Stable built-in Knowledge Oracle profile and IDs.</td></tr>
+              <tr><td><code>PromptViewModel.swift</code></td><td>Modified</td><td>Source</td><td>Stored participant prompt, lifecycle registration, and sealed packet packaging branch.</td></tr>
+              <tr><td><code>OracleViewModel.swift</code></td><td>Modified</td><td>Source</td><td>Context policy, packet receipts, participant bindings, terminal run records, and lifecycle cleanup.</td></tr>
+              <tr><td><code>OracleViewModel+MCP.swift</code></td><td>Modified</td><td>Source</td><td>Packet preset resolution, binding enforcement, send overrides, receipt and outcome echoes.</td></tr>
+              <tr><td><code>ChatSendReply.swift</code></td><td>Modified</td><td>Source/API contract</td><td>Optional terminal outcome, detail, and partial-response fields without changing unrelated reply shapes.</td></tr>
+              <tr><td><code>MCPOracleToolService.swift</code></td><td>Modified</td><td>Source/API contract</td><td>Packet arguments, validation, and forwarding.</td></tr>
+              <tr><td><code>MCPOracleToolProvider.swift</code></td><td>Modified</td><td>Tool schema/docs</td><td>Advertises packet mode, chat preset, receipts, and completed-only synthesis rule.</td></tr>
+              <tr><td><code>KnowledgeOraclePresetTests.swift</code></td><td>Untracked</td><td>Test</td><td>Stable preset/prompt configuration and default-chat ordering.</td></tr>
+              <tr><td><code>OraclePacketModeTests.swift</code></td><td>Untracked</td><td>Test</td><td>Sealing, receipt hashes, history, binding, adoption/restart/UI invalidation, and validation.</td></tr>
+              <tr><td><code>AgentOraclePillRoutingTests.swift</code></td><td>Modified</td><td>Test</td><td>Terminal outcomes, preemption/cancellation, and concurrent-stream behavior.</td></tr>
+              <tr><td><code>ToolCatalogSnapshotTests.swift</code></td><td>Modified</td><td>Test</td><td>New tool-schema contract.</td></tr>
+              <tr><td><code>test-suite-contract-ledger.tsv</code></td><td>Modified</td><td>Test inventory</td><td>Registers new regression contracts.</td></tr>
+              <tr><td><code>source_layout_guardrails.sh</code></td><td>Modified</td><td>Guardrail</td><td>Allows the new test placement under the repository source-layout rules.</td></tr>
+              <tr><td><code>docs/spec/knowledge-duel-v1.md</code></td><td>Untracked</td><td>Specification</td><td>Durable tool contract, protocol, workflow template, and limitations.</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3>Evidence and limitations of this report</h3>
+        <ul>
+          <li><strong>Observed in code:</strong> current working-tree source, tests, tool schema, and specification.</li>
+          <li><strong>Observed in git:</strong> status, diff statistics, recent commit history, and the committed parallel-Oracle foundation.</li>
+          <li><strong>Observed in session:</strong> original use case, user decisions, third-party feedback, dual-Oracle review findings, debugging turns, and reported validation output.</li>
+          <li><strong>Not rerun for this report:</strong> compilation, tests, lint, guardrails, or a live visible-app smoke test.</li>
+          <li><strong>Duration:</strong> not measured reliably and therefore not reported.</li>
+          <li><strong>Dependencies/migrations:</strong> no dependency, database, schema, or environment-variable changes were observed.</li>
+        </ul>
+      </section>
+    </main>
+  </div>
+
+  <footer class="footer">
+    Generated from repository state and AI-agent session evidence on 2026-07-30. This page is self-contained and print-friendly.
+  </footer>
+</body>
+</html>

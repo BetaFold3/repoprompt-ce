@@ -36,4 +36,16 @@ if [[ -n "${TOOLCHAINS:-}" ]]; then
     swift_env+=("TOOLCHAINS=$TOOLCHAINS")
 fi
 
+# Xcode 27 / Swift 6.4 defaults to swiftbuild, whose .build/out layout and
+# cached XCFramework diagnostics differ from the native SwiftPM engine used by
+# our packaging and XCTest artifact tooling. Keep build, test (including list
+# and --skip-build), and --show-bin-path on the same explicit engine.
+case "${1:-}" in
+    build|test)
+        swift_command="$1"
+        shift
+        set -- "$swift_command" --build-system native "$@"
+        ;;
+esac
+
 exec /usr/bin/env -i "${swift_env[@]}" /usr/bin/swift "$@"

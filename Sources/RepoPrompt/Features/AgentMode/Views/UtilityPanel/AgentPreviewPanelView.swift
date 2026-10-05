@@ -1,5 +1,5 @@
 import AppKit
-import Markdown
+import struct Markdown.Document
 import SwiftUI
 
 // SEARCH-HELPER: AgentPreviewPanelView, preview segment, semi-rendered markdown, secure html preview

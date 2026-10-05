@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import contextlib
 import io
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -558,6 +559,38 @@ class OutputSummarizerTests(unittest.TestCase):
             payload = state.list_jobs(None)
 
         self.assertNotIn("outputSummary", payload["jobs"][0])
+
+
+class CanonicalSwiftCommandTests(unittest.TestCase):
+    def test_build_and_test_pin_native_engine_without_changing_other_arguments(self) -> None:
+        # Intercept only exec: exercise the actual shell argument construction
+        # without starting Swift or depending on the installed Xcode version.
+        for arguments in (
+            ["build", "-c", "debug", "--product", "RepoPrompt"],
+            ["build", "--show-bin-path"],
+            ["build", "--build-tests"],
+            ["test", "list", "--skip-build"],
+            ["test", "--skip-build", "--filter", "Suite/test with spaces"],
+            ["--version"],
+            [],
+        ):
+            with self.subTest(arguments=arguments):
+                result = subprocess.run(
+                    [
+                        "/bin/bash", "-c",
+                        'exec() { printf "%s\\0" "$@"; }; wrapper="$1"; shift; source "$wrapper" "$@"',
+                        "canonical-swift-test", str(SCRIPT_DIR / "canonical_swift.sh"),
+                        *arguments,
+                    ],
+                    check=True, capture_output=True,
+                )
+                argv = result.stdout.decode().split("\0")[:-1]
+                swift_index = argv.index("/usr/bin/swift")
+                expected = list(arguments)
+                if arguments and arguments[0] in {"build", "test"}:
+                    expected[1:1] = ["--build-system", "native"]
+                self.assertEqual(argv[swift_index + 1:], expected)
+                self.assertEqual(argv[:2], ["/usr/bin/env", "-i"])
 
 
 class JobTicketEnvEligibilityTests(unittest.TestCase):
