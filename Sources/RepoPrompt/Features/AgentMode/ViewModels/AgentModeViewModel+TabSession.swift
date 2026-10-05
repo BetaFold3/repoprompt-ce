@@ -540,6 +540,10 @@ extension AgentModeViewModel {
         }
 
         private(set) var runLifecycleTracker = AgentRunLifecycleTracker()
+        /// Monotonic count of run attempts begun on this tab. Unlike `activeRunOwnership`, terminal
+        /// teardown never clears it, so work captured under one attempt can still tell that a later
+        /// attempt took the tab after that attempt has ended and released its controller and run ID.
+        private(set) var runAttemptGeneration: UInt64 = 0
         var activeRunOwnership: AgentRunOwnership? {
             runLifecycleTracker.activeOwnership
         }
@@ -1520,6 +1524,7 @@ extension AgentModeViewModel {
         @discardableResult
         func beginRunAttempt(source: String, attemptID: UUID = UUID()) -> AgentRunOwnership {
             assert(runAttemptTerminalResources == nil || runAttemptTerminalResources?.isClaimed == true)
+            runAttemptGeneration &+= 1
             runAttemptTerminalResources = nil
             terminalCommitInProgress = false
             lastTerminalCommitRevision = nil

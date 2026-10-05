@@ -697,6 +697,12 @@ final class CodexNativeSessionController {
     private var isBindingSession = false
     private var bufferedInbound: [BufferedInbound] = []
     private let maxBufferedInbound = 128
+    #if DEBUG
+        /// When set, replaces the detached background memory-mode retry and receives its thread ID.
+        var test_backgroundMemoryModeRetryObserver: ((String) -> Void)?
+        /// Called when a failed or cancelled start/resume begins cancelling its binding window.
+        var test_bindingCleanupObserver: (() -> Void)?
+    #endif
 
     var events: AsyncStream<Event> {
         eventsStream
@@ -1119,6 +1125,9 @@ final class CodexNativeSessionController {
         reasoningEffort: String?,
         serviceTier: String?
     ) async throws -> SessionRef {
+        // Stop before any process, binding, or RPC work (for example a missing-rollout fallback
+        // start reached after Stop) must not create a thread or fail as a lifecycle error.
+        try Task.checkCancellation()
         let resumeThreadID: String? = try existing.map { sessionRef in
             let threadID = sessionRef.conversationID.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !threadID.isEmpty else {
@@ -1180,12 +1189,16 @@ final class CodexNativeSessionController {
                     fallbackEffort: reasoningEffort,
                     transportGeneration: transportGeneration
                 )
+                // A response that settles after Stop must not bind the thread or issue more RPCs.
+                try Task.checkCancellation()
                 snapshot = try await reconcileResumedSnapshot(
                     resumed.snapshot,
                     resumeThreadID: resumeThreadID,
                     responseIncludedTurns: resumed.responseIncludedTurns,
                     transportGeneration: transportGeneration
                 )
+                // A turn listing that settled (or degraded) after Stop must not lead to more RPCs.
+                try Task.checkCancellation()
             } else {
                 var params: [String: Any] = [:]
                 if let model {
@@ -1214,12 +1227,16 @@ final class CodexNativeSessionController {
                     requestParams["approvalsReviewer"] = options.approvalReviewerProvider().appServerRequestValue
                     return requestParams
                 }
+                try Task.checkCancellation()
                 snapshot = Self.parseThreadSnapshot(from: result, fallbackEffort: reasoningEffort)
             }
 
             try await disableThreadMemoryMode(threadID: snapshot.conversationID)
 
             let sessionRef = try await eventHandlingMutex.withLock {
+                // Last cancellation point before apply, after any wait for the lock; the catch
+                // below cancels the binding window.
+                try Task.checkCancellation()
                 try ensureBindingCanComplete()
                 let sessionRef = applyThreadSnapshot(snapshot)
                 await finishBindingAndDrainBufferedInbound()
@@ -1228,9 +1245,7 @@ final class CodexNativeSessionController {
             try markStartOrResumeSucceeded()
             return sessionRef
         } catch {
-            try? await eventHandlingMutex.withLock {
-                cancelBindingSession()
-            }
+            await cancelBindingSessionIgnoringTaskCancellation()
             markStartOrResumeFailed()
             if expectedMCPClientName != nil {
                 await client.clearExpectedAgentPIDRegistration()
@@ -1563,6 +1578,9 @@ final class CodexNativeSessionController {
         guard !threadID.isEmpty else { throw CodexAppServerClient.ClientError.invalidResponse }
         do {
             try await disableThreadMemoryModeForeground(threadID: threadID)
+        } catch let cancellation as CancellationError {
+            // A cancelled start (Stop) is not an optional-capability failure: no background retry.
+            throw cancellation
         } catch {
             // Memory mode is an optional app-server capability. It should never keep
             // Agent Mode stuck in the startup/"Initializing…" phase after the thread
@@ -1579,6 +1597,9 @@ final class CodexNativeSessionController {
             do {
                 try await sendThreadMemoryModeDisableRequest(threadID: threadID)
                 return
+            } catch let cancellation as CancellationError {
+                // Cancellation is not a failed attempt; it ends startup instead of retrying.
+                throw cancellation
             } catch {
                 lastError = error
             }
@@ -1587,6 +1608,12 @@ final class CodexNativeSessionController {
     }
 
     private func scheduleBackgroundThreadMemoryModeDisable(threadID: String) {
+        #if DEBUG
+            if let observer = test_backgroundMemoryModeRetryObserver {
+                observer(threadID)
+                return
+            }
+        #endif
         Task.detached(priority: .utility) { [client] in
             do {
                 try await Self.sendThreadMemoryModeDisableRequest(
@@ -2544,6 +2571,20 @@ final class CodexNativeSessionController {
         isBindingSession = false
         bufferedInbound.removeAll(keepingCapacity: false)
         commandExecutionMirrorStateByItemID.removeAll(keepingCapacity: true)
+    }
+
+    /// `AsyncMutex` refuses a contended lock to a cancelled waiter, so a cancelled start would skip
+    /// the cleanup and leave the binding window open. An unstructured task does not inherit the
+    /// caller's cancellation, so the binding is always cancelled.
+    private func cancelBindingSessionIgnoringTaskCancellation() async {
+        #if DEBUG
+            test_bindingCleanupObserver?()
+        #endif
+        await Task {
+            try? await self.eventHandlingMutex.withLock {
+                self.cancelBindingSession()
+            }
+        }.value
     }
 
     private func finishBindingAndDrainBufferedInbound() async {
@@ -3865,6 +3906,14 @@ final class CodexNativeSessionController {
             appServerCapabilities.turnsList
         }
 
+        var test_isBindingSession: Bool {
+            isBindingSession
+        }
+
+        var test_bufferedInboundCount: Int {
+            bufferedInbound.count
+        }
+
         func test_refreshActiveTurnForInterruptIfPossible() async -> InterruptActiveTurnRefreshResult {
             await refreshActiveTurnForInterruptIfPossible()
         }
@@ -4034,6 +4083,19 @@ final class CodexNativeSessionController {
             ensureEventsStreamReady()
             try? await eventHandlingMutex.withLock {
                 self.beginBindingSession()
+            }
+        }
+
+        /// Runs `body` while holding the event-handling mutex, so a test can force contention.
+        func test_holdEventHandlingMutex(_ body: @escaping @Sendable () async -> Void) async {
+            try? await eventHandlingMutex.withLock {
+                await body()
+            }
+        }
+
+        var test_eventHandlingMutexWaiterCount: Int {
+            get async {
+                await eventHandlingMutex.test_waiterCount
             }
         }
 

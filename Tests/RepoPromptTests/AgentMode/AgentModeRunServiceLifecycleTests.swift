@@ -2661,7 +2661,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         await harness.service.cancelRun(tabID: session.tabID, session: session)
     }
 
-    func testCodexRepeatedResumeTimeoutFallsBackToFreshStartForSavedThreadID() async {
+    func testCodexRepeatedResumeTimeoutKeepsSavedThreadAndResumesSameThreadOnRetry() async {
         let recorder = LifecycleRecorder()
         let controller = LifecycleNoopCodexController(
             recorder: recorder,
@@ -2672,42 +2672,872 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         session.selectedAgent = .codexExec
         session.codexConversationID = "saved-thread"
         session.codexRolloutPath = "/tmp/saved-thread.jsonl"
+        let resumeFailureItems: () -> [AgentChatItem] = {
+            session.items.filter { $0.kind == .error && $0.text.hasPrefix("Codex native resume failed:") }
+        }
 
-        let firstOutcome = await harness.service.startRun(
+        for attempt in 1 ... 2 {
+            let outcome = await harness.service.startRun(
+                tabID: session.tabID,
+                session: session,
+                initialUserMessage: "resume \(attempt)",
+                initialMessageForRun: "resume \(attempt)",
+                attachments: []
+            )
+
+            guard case .failed? = outcome else {
+                return XCTFail("Attempt \(attempt): expected the timed-out resume to fail the run, got \(String(describing: outcome))")
+            }
+            XCTAssertEqual(controller.startReferences.count, attempt)
+            XCTAssertEqual(controller.startReferences[attempt - 1]?.conversationID, "saved-thread", "Attempt \(attempt)")
+            XCTAssertEqual(session.codexConversationID, "saved-thread", "Attempt \(attempt)")
+            XCTAssertEqual(session.codexRolloutPath, "/tmp/saved-thread.jsonl", "Attempt \(attempt)")
+            XCTAssertEqual(session.codexResumeTimeoutState.consecutiveTimeouts, attempt)
+            XCTAssertEqual(resumeFailureItems().count, attempt)
+            let failureText = resumeFailureItems().last?.text ?? ""
+            XCTAssertTrue(failureText.contains("Your saved thread was kept."), "Attempt \(attempt): \(failureText)")
+            if attempt == 1 {
+                XCTAssertTrue(failureText.contains("Send again to retry the same thread."), failureText)
+                XCTAssertFalse(failureText.contains("Handoff"), failureText)
+            } else {
+                XCTAssertTrue(failureText.contains("timed out resuming this thread 2 times in a row"), failureText)
+                XCTAssertTrue(failureText.contains("Handoff"), failureText)
+            }
+        }
+        XCTAssertFalse(session.items.contains { $0.text.contains("Started a fresh thread") })
+
+        let retryOutcome = await harness.service.startRun(
             tabID: session.tabID,
             session: session,
-            initialUserMessage: "first resume",
-            initialMessageForRun: "first resume",
+            initialUserMessage: "resume 3",
+            initialMessageForRun: "resume 3",
             attachments: []
         )
 
-        guard case .failed? = firstOutcome else {
-            return XCTFail("Expected the first timed-out resume to fail the run")
+        XCTAssertEqual(retryOutcome, .sent)
+        XCTAssertEqual(controller.startReferences.count, 3)
+        XCTAssertEqual(controller.startReferences[2]?.conversationID, "saved-thread")
+        XCTAssertEqual(session.codexConversationID, "saved-thread")
+        XCTAssertEqual(session.codexRolloutPath, "/tmp/saved-thread.jsonl")
+        XCTAssertEqual(session.codexResumeTimeoutState.consecutiveTimeouts, 0)
+        XCTAssertFalse(session.items.contains { $0.text.contains("Started a fresh thread") })
+        await harness.service.cancelRun(tabID: session.tabID, session: session)
+    }
+
+    func testCodexResumeCancelledByStopShowsNoFailureItem() async throws {
+        let recorder = LifecycleRecorder()
+        let controller = LifecycleNoopCodexController(recorder: recorder)
+        let resumeGate = LifecycleResumeGate(honorsCancellation: true)
+        controller.resumeGate = resumeGate
+        let harness = makeHarness(recorder: recorder, codexController: controller)
+        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        session.selectedAgent = .codexExec
+        session.codexConversationID = "saved-thread"
+        session.codexRolloutPath = "/tmp/saved-thread.jsonl"
+        let priorTimeoutState = AgentModeViewModel.CodexResumeTimeoutState(
+            conversationID: "saved-thread",
+            rolloutPath: "/tmp/saved-thread.jsonl",
+            consecutiveTimeouts: 1
+        )
+        session.codexResumeTimeoutState = priorTimeoutState
+
+        let runTask = Task { @MainActor in
+            await harness.service.startRun(
+                tabID: session.tabID,
+                session: session,
+                initialUserMessage: "resume",
+                initialMessageForRun: "resume",
+                attachments: []
+            )
         }
+        await resumeGate.waitUntilEntered()
+        await harness.service.cancelRun(tabID: session.tabID, session: session)
+        let outcome = await runTask.value
+
+        XCTAssertEqual(outcome, .cancelled)
         XCTAssertEqual(controller.startReferences.count, 1)
         XCTAssertEqual(controller.startReferences[0]?.conversationID, "saved-thread")
+        XCTAssertFalse(session.items.contains { $0.kind == .error }, "Stop must not surface a failure: \(session.items.map(\.text))")
+        XCTAssertFalse(session.items.contains { $0.text.contains("CancellationError") })
         XCTAssertEqual(session.codexConversationID, "saved-thread")
-        XCTAssertEqual(session.codexResumeTimeoutState.consecutiveTimeouts, 1)
+        XCTAssertEqual(session.codexRolloutPath, "/tmp/saved-thread.jsonl")
+        XCTAssertEqual(session.codexResumeTimeoutState, priorTimeoutState, "Stop must not reset the timeout count.")
+        XCTAssertNil(session.codexController)
+        XCTAssertTrue(session.codexNeedsReconnect)
+        try await waitUntil("cancelled resume controller should shut down") {
+            recorder.contains("codex:shutdown")
+        }
+        XCTAssertFalse(recorder.contains("codex:send"))
 
-        let secondOutcome = await harness.service.startRun(
+        controller.resumeGate = nil
+        let retryOutcome = await harness.service.startRun(
             tabID: session.tabID,
             session: session,
-            initialUserMessage: "second resume",
-            initialMessageForRun: "second resume",
+            initialUserMessage: "retry",
+            initialMessageForRun: "retry",
             attachments: []
         )
-
-        XCTAssertEqual(secondOutcome, .sent)
-        XCTAssertEqual(controller.startReferences.count, 3)
+        XCTAssertEqual(retryOutcome, .sent)
+        XCTAssertEqual(controller.startReferences.count, 2)
         XCTAssertEqual(controller.startReferences[1]?.conversationID, "saved-thread")
-        XCTAssertNil(controller.startReferences[2])
-        XCTAssertEqual(session.codexConversationID, "lifecycle")
         XCTAssertEqual(session.codexResumeTimeoutState.consecutiveTimeouts, 0)
-        XCTAssertTrue(session.items.contains {
-            $0.kind == .system
-                && $0.text.contains("couldn't resume the previous thread after repeated timeout")
-        })
         await harness.service.cancelRun(tabID: session.tabID, session: session)
+    }
+
+    func testCodexResumeFailureBeforeStopStaysVisible() async {
+        struct Row {
+            let name: String
+            let error: Error
+            let guidance: String
+            let seededTimeouts: Int
+            let consecutiveTimeouts: Int
+        }
+        let rows = [
+            Row(
+                name: "resume-timeout",
+                error: LifecycleCodexResumeTimeoutError(),
+                guidance: "Send again to retry the same thread.",
+                seededTimeouts: 0,
+                consecutiveTimeouts: 1
+            ),
+            Row(
+                name: "inbound-frame-limit",
+                error: CodexAppServerClient.ClientError.inboundFrameTooLarge(
+                    observedBytes: 33_554_433,
+                    limitBytes: 33_554_432
+                ),
+                guidance: "Update Codex and retry",
+                // A nonzero seed tells the genuine failure's reset apart from an untouched count.
+                seededTimeouts: 1,
+                consecutiveTimeouts: 0
+            )
+        ]
+
+        for row in rows {
+            let recorder = LifecycleRecorder()
+            let controller = LifecycleNoopCodexController(recorder: recorder)
+            let resumeGate = LifecycleResumeGate(honorsCancellation: true)
+            let deliveryGate = LifecyclePublicationGate()
+            controller.resumeGate = resumeGate
+            controller.resumeDeliveryGate = deliveryGate
+            let harness = makeHarness(recorder: recorder, codexController: controller)
+            let session = AgentModeViewModel.TabSession(tabID: UUID())
+            session.selectedAgent = .codexExec
+            session.codexConversationID = "saved-thread"
+            session.codexRolloutPath = "/tmp/saved-thread.jsonl"
+            session.codexResumeTimeoutState = .init(
+                conversationID: "saved-thread",
+                rolloutPath: "/tmp/saved-thread.jsonl",
+                consecutiveTimeouts: row.seededTimeouts
+            )
+
+            let runTask = Task { @MainActor in
+                await harness.service.startRun(
+                    tabID: session.tabID,
+                    session: session,
+                    initialUserMessage: "resume",
+                    initialMessageForRun: "resume",
+                    attachments: []
+                )
+            }
+            await resumeGate.waitUntilEntered()
+            // The genuine failure settles first; the later cancellation cannot replace it.
+            await resumeGate.settle(.failure(row.error))
+            await harness.service.cancelRun(tabID: session.tabID, session: session)
+            // Deliver only after Stop, so the coordinator classifies with its task already cancelled.
+            await deliveryGate.release()
+            let outcome = await runTask.value
+
+            guard case .failed? = outcome else {
+                XCTFail("\(row.name): expected the settled failure to fail the run, got \(String(describing: outcome))")
+                continue
+            }
+            let failureItems = session.items.filter {
+                $0.kind == .error && $0.text.hasPrefix("Codex native resume failed:")
+            }
+            XCTAssertEqual(failureItems.count, 1, "\(row.name): \(session.items.map(\.text))")
+            XCTAssertTrue(failureItems.first?.text.contains(row.error.localizedDescription) == true, row.name)
+            XCTAssertTrue(failureItems.first?.text.contains(row.guidance) == true, row.name)
+            XCTAssertEqual(session.codexConversationID, "saved-thread", row.name)
+            XCTAssertEqual(session.codexRolloutPath, "/tmp/saved-thread.jsonl", row.name)
+            XCTAssertEqual(session.codexResumeTimeoutState.consecutiveTimeouts, row.consecutiveTimeouts, row.name)
+            XCTAssertNil(session.codexController, row.name)
+            XCTAssertFalse(recorder.contains("codex:send"), row.name)
+        }
+    }
+
+    func testCodexResumeLateSuccessAfterCancelIsDiscarded() async throws {
+        let recorder = LifecycleRecorder()
+        let controller = LifecycleNoopCodexController(recorder: recorder)
+        // Ignores cancellation: the resume response arrives only after Stop.
+        let resumeGate = LifecycleResumeGate(honorsCancellation: false)
+        controller.resumeGate = resumeGate
+        let harness = makeHarness(recorder: recorder, codexController: controller)
+        let coordinator = harness.host.test_codexCoordinator
+        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        session.selectedAgent = .codexExec
+        session.codexConversationID = "saved-thread"
+        session.codexRolloutPath = "/tmp/saved-thread.jsonl"
+
+        let runTask = Task { @MainActor in
+            await harness.service.startRun(
+                tabID: session.tabID,
+                session: session,
+                initialUserMessage: "resume",
+                initialMessageForRun: "resume",
+                attachments: []
+            )
+        }
+        await resumeGate.waitUntilEntered()
+        await harness.service.cancelRun(tabID: session.tabID, session: session)
+        await resumeGate.settle(.success(()))
+        let outcome = await runTask.value
+
+        XCTAssertEqual(outcome, .cancelled)
+        XCTAssertEqual(controller.startReferences.count, 1)
+        XCTAssertTrue(controller.sentTexts.isEmpty, "A late resume success must not dispatch the user's text.")
+        XCTAssertFalse(recorder.contains("codex:send"))
+        XCTAssertEqual(
+            coordinator.test_readySessionToolTrackingRequestCount(tabID: session.tabID),
+            0,
+            "A discarded late success must not start tool tracking."
+        )
+        XCTAssertNil(session.codexController)
+        XCTAssertTrue(session.codexNeedsReconnect, "The discarded start result must not be applied.")
+        XCTAssertFalse(session.items.contains { $0.kind == .error }, "\(session.items.map(\.text))")
+        XCTAssertEqual(session.codexConversationID, "saved-thread")
+        XCTAssertEqual(session.codexRolloutPath, "/tmp/saved-thread.jsonl")
+        try await waitUntil("late-success controller should shut down") {
+            recorder.contains("codex:shutdown")
+        }
+
+        // Contrast: an uncancelled resume of the same thread applies and requests tool tracking.
+        controller.resumeGate = nil
+        let retryOutcome = await harness.service.startRun(
+            tabID: session.tabID,
+            session: session,
+            initialUserMessage: "retry",
+            initialMessageForRun: "retry",
+            attachments: []
+        )
+        XCTAssertEqual(retryOutcome, .sent)
+        XCTAssertEqual(controller.startReferences.count, 2)
+        XCTAssertEqual(controller.startReferences[1]?.conversationID, "saved-thread")
+        XCTAssertEqual(controller.sentTexts, ["retry"])
+        XCTAssertGreaterThan(coordinator.test_readySessionToolTrackingRequestCount(tabID: session.tabID), 0)
+        XCTAssertFalse(session.codexNeedsReconnect)
+        await harness.service.cancelRun(tabID: session.tabID, session: session)
+    }
+
+    func testCodexResumeTaskCancelledWithoutStopInvalidatesItsOwnController() async throws {
+        enum Row: String, CaseIterable {
+            case ownAttempt = "send created the run attempt: terminalizes"
+            case joinedAttempt = "send joined an existing run attempt: restores attachments, leaves the attempt to its owner"
+        }
+
+        for row in Row.allCases {
+            let recorder = LifecycleRecorder()
+            let controller = LifecycleNoopCodexController(recorder: recorder)
+            let resumeGate = LifecycleResumeGate(honorsCancellation: true)
+            controller.resumeGate = resumeGate
+            let harness = makeHarness(recorder: recorder, codexController: controller)
+            let session = AgentModeViewModel.TabSession(tabID: UUID())
+            session.selectedAgent = .codexExec
+            session.codexConversationID = "saved-thread"
+            session.codexRolloutPath = "/tmp/saved-thread.jsonl"
+            let priorTimeoutState = AgentModeViewModel.CodexResumeTimeoutState(
+                conversationID: "saved-thread",
+                rolloutPath: "/tmp/saved-thread.jsonl",
+                consecutiveTimeouts: 1
+            )
+            session.codexResumeTimeoutState = priorTimeoutState
+            // The joined row's attempt belongs to an owner outside this send, so the send must not
+            // terminalize it (`terminalizeRejectedSend == false`).
+            let ownerAttempt = row == .joinedAttempt
+                ? session.beginRunAttempt(source: "test.joinedAttemptOwner")
+                : nil
+            // Reserved by the joined attempt's owner; the harness reserve hook reserves nothing itself.
+            let reservedAttachment = AgentImageAttachment(source: .localFile(path: "/tmp/joined-attempt.png"))
+            if row == .joinedAttempt {
+                session.attachmentTurnState = .reserved(reservationID: UUID(), attachments: [reservedAttachment])
+            }
+
+            let runTask = Task { @MainActor in
+                await harness.service.startRun(
+                    tabID: session.tabID,
+                    session: session,
+                    initialUserMessage: "resume",
+                    initialMessageForRun: "resume",
+                    attachments: []
+                )
+            }
+            await resumeGate.waitUntilEntered()
+            XCTAssertTrue(session.codexController === controller, row.rawValue)
+            // Cancel the run's task without Stop: no Stop teardown detaches the controller first, so
+            // only the cancelled start's own cleanup can release the attempt's controller.
+            session.agentTask?.cancel()
+            let outcome = await runTask.value
+
+            XCTAssertEqual(outcome, .cancelled, row.rawValue)
+            XCTAssertNil(session.codexController, "The cancelled start invalidates its own controller. \(row.rawValue)")
+            XCTAssertTrue(session.codexNeedsReconnect, row.rawValue)
+            try await waitUntil("the cancelled start's controller should shut down (\(row.rawValue))") {
+                recorder.contains("codex:shutdown")
+            }
+            XCTAssertFalse(session.items.contains { $0.kind == .error }, "\(row.rawValue): \(session.items.map(\.text))")
+            XCTAssertEqual(session.codexResumeTimeoutState, priorTimeoutState, "Cancellation leaves the count alone. \(row.rawValue)")
+            XCTAssertEqual(session.codexConversationID, "saved-thread", row.rawValue)
+            XCTAssertEqual(session.codexRolloutPath, "/tmp/saved-thread.jsonl", row.rawValue)
+            XCTAssertEqual(controller.startReferences.count, 1, row.rawValue)
+            XCTAssertFalse(recorder.contains("codex:send"), row.rawValue)
+
+            if let ownerAttempt {
+                XCTAssertEqual(session.activeRunOwnership, ownerAttempt, "The joined attempt stays with its owner.")
+                XCTAssertEqual(session.pendingImageAttachments.map(\.id), [reservedAttachment.id], "Attachments return to the composer.")
+                XCTAssertEqual(session.attachmentTurnState, .idle)
+                XCTAssertFalse(recorder.contains(prefix: "commit:"), "A joined send publishes no terminal commit: \(recorder.events)")
+                await harness.service.cancelRun(tabID: session.tabID, session: session)
+            }
+        }
+    }
+
+    func testCodexMissingRolloutSettledBeforeStopDoesNotStartFreshThread() async {
+        struct Row {
+            let name: String
+            let stopsBeforeDelivery: Bool
+        }
+        let rows = [
+            Row(name: "missing rollout, then Stop", stopsBeforeDelivery: true),
+            Row(name: "contrast: missing rollout without Stop", stopsBeforeDelivery: false)
+        ]
+
+        for row in rows {
+            let recorder = LifecycleRecorder()
+            let controller = LifecycleNoopCodexController(recorder: recorder)
+            let resumeGate = LifecycleResumeGate(honorsCancellation: true)
+            let deliveryGate = LifecyclePublicationGate()
+            controller.resumeGate = resumeGate
+            controller.resumeDeliveryGate = deliveryGate
+            let harness = makeHarness(recorder: recorder, codexController: controller)
+            let session = AgentModeViewModel.TabSession(tabID: UUID())
+            session.selectedAgent = .codexExec
+            session.codexConversationID = "saved-thread"
+            session.codexRolloutPath = "/tmp/saved-thread.jsonl"
+
+            let runTask = Task { @MainActor in
+                await harness.service.startRun(
+                    tabID: session.tabID,
+                    session: session,
+                    initialUserMessage: "resume",
+                    initialMessageForRun: "resume",
+                    attachments: []
+                )
+            }
+            await resumeGate.waitUntilEntered()
+            await resumeGate.settle(.failure(LifecycleCodexMissingRolloutError()))
+            if row.stopsBeforeDelivery {
+                await harness.service.cancelRun(tabID: session.tabID, session: session)
+            }
+            await deliveryGate.release()
+            let outcome = await runTask.value
+
+            guard row.stopsBeforeDelivery else {
+                // Without Stop the missing rollout falls back to one fresh thread start.
+                XCTAssertEqual(outcome, .sent, row.name)
+                XCTAssertEqual(controller.startReferences.map { $0?.conversationID }, ["saved-thread", nil], row.name)
+                XCTAssertEqual(session.codexConversationID, "lifecycle", row.name)
+                XCTAssertTrue(session.items.contains { $0.text.contains("Started a fresh thread.") }, row.name)
+                XCTAssertEqual(controller.sentTexts, ["resume"], row.name)
+                await harness.service.cancelRun(tabID: session.tabID, session: session)
+                continue
+            }
+            XCTAssertEqual(outcome, .cancelled, row.name)
+            XCTAssertEqual(
+                controller.startReferences.map { $0?.conversationID },
+                ["saved-thread"],
+                "\(row.name): no fresh thread start after Stop"
+            )
+            XCTAssertEqual(session.codexConversationID, "saved-thread", row.name)
+            XCTAssertEqual(session.codexRolloutPath, "/tmp/saved-thread.jsonl", row.name)
+            XCTAssertFalse(session.items.contains { $0.kind == .error }, "\(row.name): \(session.items.map(\.text))")
+            XCTAssertFalse(session.items.contains { $0.text.contains("Started a fresh thread.") }, row.name)
+            XCTAssertTrue(controller.sentTexts.isEmpty, row.name)
+            XCTAssertNil(session.codexController, row.name)
+        }
+    }
+
+    func testCodexStoppedResumeSettlingDuringSuccessorStartupLeavesSuccessorUntouched() async {
+        enum SuccessorStage {
+            /// The successor's own resume is still pending.
+            case starting
+            /// The successor resumed and dispatched its text; its run is still active.
+            case ready
+            /// The successor dispatched and its run attempt ended, leaving its ready controller.
+            case finished
+            /// The successor was stopped during its own resume. Stop released its run attempt, run ID,
+            /// and controller, so no current session state names it anymore.
+            case stoppedWhileStarting
+            /// The successor dispatched and was then stopped, releasing its run attempt, run ID, and
+            /// controller.
+            case stoppedAfterDispatch
+
+            var dispatches: Bool {
+                self == .ready || self == .finished || self == .stoppedAfterDispatch
+            }
+
+            var isStopped: Bool {
+                self == .stoppedWhileStarting || self == .stoppedAfterDispatch
+            }
+        }
+        struct Row {
+            let name: String
+            let honorsCancellation: Bool
+            /// Settles the stopped attempt's resume before Stop (a genuine first-settled error).
+            let settledBeforeStop: Result<Void, Error>?
+            /// Settles the stopped attempt's resume after the successor has started.
+            let settledAfterSuccessor: Result<Void, Error>?
+            let successorStage: SuccessorStage
+            /// Text the stopped attempt's own error item must contain, when it reports one.
+            let expectedErrorText: String?
+        }
+        let rows = [
+            Row(
+                name: "cancellation, successor starting",
+                honorsCancellation: true,
+                settledBeforeStop: nil,
+                settledAfterSuccessor: nil,
+                successorStage: .starting,
+                expectedErrorText: nil
+            ),
+            Row(
+                name: "late success, successor starting",
+                honorsCancellation: false,
+                settledBeforeStop: nil,
+                settledAfterSuccessor: .success(()),
+                successorStage: .starting,
+                expectedErrorText: nil
+            ),
+            Row(
+                name: "late success, successor ready",
+                honorsCancellation: false,
+                settledBeforeStop: nil,
+                settledAfterSuccessor: .success(()),
+                successorStage: .ready,
+                expectedErrorText: nil
+            ),
+            Row(
+                name: "late success, successor finished",
+                honorsCancellation: false,
+                settledBeforeStop: nil,
+                settledAfterSuccessor: .success(()),
+                successorStage: .finished,
+                expectedErrorText: nil
+            ),
+            Row(
+                name: "timeout settled before Stop, successor starting",
+                honorsCancellation: true,
+                settledBeforeStop: .failure(LifecycleCodexResumeTimeoutError()),
+                settledAfterSuccessor: nil,
+                successorStage: .starting,
+                expectedErrorText: "Your saved thread was kept. Send again to retry the same thread."
+            ),
+            Row(
+                name: "auth error settled before Stop, successor starting",
+                honorsCancellation: true,
+                settledBeforeStop: .failure(LifecycleCodexManagedAuthError()),
+                settledAfterSuccessor: nil,
+                successorStage: .starting,
+                expectedErrorText: LifecycleCodexManagedAuthError().localizedDescription
+            ),
+            Row(
+                name: "cancellation, successor stopped while starting",
+                honorsCancellation: true,
+                settledBeforeStop: nil,
+                settledAfterSuccessor: nil,
+                successorStage: .stoppedWhileStarting,
+                expectedErrorText: nil
+            ),
+            Row(
+                name: "late success, successor stopped while starting",
+                honorsCancellation: false,
+                settledBeforeStop: nil,
+                settledAfterSuccessor: .success(()),
+                successorStage: .stoppedWhileStarting,
+                expectedErrorText: nil
+            ),
+            Row(
+                name: "timeout settled before Stop, successor stopped while starting",
+                honorsCancellation: true,
+                settledBeforeStop: .failure(LifecycleCodexResumeTimeoutError()),
+                settledAfterSuccessor: nil,
+                successorStage: .stoppedWhileStarting,
+                expectedErrorText: "Your saved thread was kept. Send again to retry the same thread."
+            ),
+            Row(
+                name: "auth error settled before Stop, successor stopped while starting",
+                honorsCancellation: true,
+                settledBeforeStop: .failure(LifecycleCodexManagedAuthError()),
+                settledAfterSuccessor: nil,
+                successorStage: .stoppedWhileStarting,
+                expectedErrorText: LifecycleCodexManagedAuthError().localizedDescription
+            ),
+            Row(
+                name: "timeout settled before Stop, successor stopped after dispatch",
+                honorsCancellation: true,
+                settledBeforeStop: .failure(LifecycleCodexResumeTimeoutError()),
+                settledAfterSuccessor: nil,
+                successorStage: .stoppedAfterDispatch,
+                expectedErrorText: "Your saved thread was kept. Send again to retry the same thread."
+            ),
+            Row(
+                name: "late success, successor stopped after dispatch",
+                honorsCancellation: false,
+                settledBeforeStop: nil,
+                settledAfterSuccessor: .success(()),
+                successorStage: .stoppedAfterDispatch,
+                expectedErrorText: nil
+            )
+        ]
+
+        for row in rows {
+            let recorder = LifecycleRecorder()
+            let stoppedController = LifecycleNoopCodexController(recorder: recorder)
+            let stoppedGate = LifecycleResumeGate(honorsCancellation: row.honorsCancellation)
+            let stoppedDeliveryGate = LifecyclePublicationGate()
+            stoppedController.resumeGate = stoppedGate
+            stoppedController.resumeDeliveryGate = stoppedDeliveryGate
+            let successorController = LifecycleNoopCodexController(recorder: recorder)
+            let successorGate = LifecycleResumeGate(honorsCancellation: true)
+            successorController.resumeGate = successorGate
+            let authRecovery = LifecycleGatedAuthRecovery(result: .recovered)
+            let harness = makeHarness(
+                recorder: recorder,
+                codexControllerSequence: LifecycleCodexControllerSequence([stoppedController, successorController]),
+                codexAuthRecovery: authRecovery
+            )
+            let session = AgentModeViewModel.TabSession(tabID: UUID())
+            session.selectedAgent = .codexExec
+            session.codexConversationID = "saved-thread"
+            session.codexRolloutPath = "/tmp/saved-thread.jsonl"
+            session.codexResumeTimeoutState = .init(
+                conversationID: "saved-thread",
+                rolloutPath: "/tmp/saved-thread.jsonl",
+                consecutiveTimeouts: 1
+            )
+
+            let stoppedRun = Task { @MainActor in
+                await harness.service.startRun(
+                    tabID: session.tabID,
+                    session: session,
+                    initialUserMessage: "first",
+                    initialMessageForRun: "first",
+                    attachments: []
+                )
+            }
+            await stoppedGate.waitUntilEntered()
+            if let settledBeforeStop = row.settledBeforeStop {
+                await stoppedGate.settle(settledBeforeStop)
+            }
+            await harness.service.cancelRun(tabID: session.tabID, session: session)
+            XCTAssertNil(session.codexController, "\(row.name): Stop detaches the stopped attempt's controller")
+
+            let successorRun = Task { @MainActor in
+                await harness.service.startRun(
+                    tabID: session.tabID,
+                    session: session,
+                    initialUserMessage: "second",
+                    initialMessageForRun: "second",
+                    attachments: []
+                )
+            }
+            await successorGate.waitUntilEntered()
+            XCTAssertTrue(session.codexController === successorController, row.name)
+            if row.successorStage.dispatches {
+                await successorGate.settle(.success(()))
+                let successorOutcome = await successorRun.value
+                XCTAssertEqual(successorOutcome, .sent, row.name)
+                XCTAssertEqual(successorController.sentTexts, ["second"], row.name)
+            }
+            if row.successorStage == .finished, let successorOwnership = session.activeRunOwnership {
+                // The successor's run ends while its ready controller stays attached.
+                XCTAssertTrue(session.endRunAttempt(ifCurrent: successorOwnership, source: "test.successorFinished"), row.name)
+                session.runState = .completed
+            }
+            if row.successorStage.isStopped {
+                // The successor is stopped before the stopped attempt's outcome is delivered.
+                await harness.service.cancelRun(tabID: session.tabID, session: session)
+                if row.successorStage == .stoppedWhileStarting {
+                    let successorOutcome = await successorRun.value
+                    XCTAssertEqual(successorOutcome, .cancelled, row.name)
+                }
+                XCTAssertNil(session.codexController, "\(row.name): Stop detaches the successor's controller")
+                XCTAssertNil(session.activeRunOwnership, "\(row.name): the successor's run attempt ended")
+                XCTAssertNil(session.runID, "\(row.name): the successor's run ID is cleared")
+                // Probes: the successor's Stop already marked reconnect and may have dropped its retry
+                // turn, so reset both to values that a stale attempt's cleanup would visibly change.
+                session.codexNeedsReconnect = false
+                session.codexPendingAuthRetryTurn = .init(text: "successor-probe", images: [])
+            }
+
+            let successorOwnership = session.activeRunOwnership
+            let successorRunID = session.runID
+            let successorSlotController = session.codexController
+            let successorNeedsReconnect = session.codexNeedsReconnect
+            let successorTimeoutState = session.codexResumeTimeoutState
+            let successorAuthRetryTurn = session.codexPendingAuthRetryTurn
+            let successorRunState = session.runState
+            XCTAssertEqual(session.agentTask != nil, row.successorStage == .starting, row.name)
+            // Once the successor's own task has returned, a later handle stands in for it, so the stopped
+            // send's run wrapper is seen to leave whichever task the tab holds alone.
+            if session.agentTask == nil {
+                session.agentTask = Task {}
+            }
+            let taskHandleBeforeDelivery = session.agentTask
+            let handoffOutcomesBeforeDelivery = recorder.events.count(where: { $0.hasPrefix("handoff:") })
+            let itemCountBeforeDelivery = session.items.count
+            XCTAssertEqual(
+                successorOwnership == nil,
+                row.successorStage == .finished || row.successorStage.isStopped,
+                row.name
+            )
+            XCTAssertEqual(successorRunID == nil, row.successorStage.isStopped, row.name)
+
+            // The stopped attempt's settled outcome is delivered only now, after the successor took the tab.
+            if let settledAfterSuccessor = row.settledAfterSuccessor {
+                await stoppedGate.settle(settledAfterSuccessor)
+            }
+            await stoppedDeliveryGate.release()
+            let stoppedOutcome = await stoppedRun.value
+
+            guard case .stale = stoppedOutcome else {
+                XCTFail("\(row.name): expected the superseded send to return stale, got \(String(describing: stoppedOutcome))")
+                continue
+            }
+            XCTAssertEqual(session.activeRunOwnership, successorOwnership, "\(row.name): successor run attempt")
+            XCTAssertEqual(session.runID, successorRunID, "\(row.name): successor run ID")
+            XCTAssertTrue(session.codexController === successorSlotController, "\(row.name): successor controller slot")
+            XCTAssertEqual(session.codexNeedsReconnect, successorNeedsReconnect, "\(row.name): successor reconnect flag")
+            XCTAssertEqual(session.codexResumeTimeoutState, successorTimeoutState, "\(row.name): resume-timeout count")
+            XCTAssertEqual(session.codexPendingAuthRetryTurn, successorAuthRetryTurn, "\(row.name): successor auth-retry turn")
+            XCTAssertEqual(session.runState, successorRunState, "\(row.name): successor run state")
+            XCTAssertEqual(session.agentTask, taskHandleBeforeDelivery, "\(row.name): the stopped send's run wrapper keeps the tab's task handle")
+            XCTAssertEqual(
+                recorder.events.count(where: { $0.hasPrefix("handoff:") }),
+                handoffOutcomesBeforeDelivery,
+                "\(row.name): the stopped send's run wrapper records no pending-handoff outcome"
+            )
+            XCTAssertTrue(stoppedController.sentTexts.isEmpty, row.name)
+            XCTAssertEqual(
+                successorController.sentTexts,
+                row.successorStage.dispatches ? ["second"] : [],
+                "\(row.name): the stopped send must not dispatch through the successor's controller"
+            )
+            let refreshCount = await authRecovery.refreshCount
+            XCTAssertEqual(refreshCount, 0, "\(row.name): a superseded attempt must not spend the successor's auth recovery")
+            let deliveredItems = Array(session.items.dropFirst(itemCountBeforeDelivery))
+            if let expectedErrorText = row.expectedErrorText {
+                let failureItems = deliveredItems.filter {
+                    $0.kind == .error && $0.text.hasPrefix("Codex native resume failed:")
+                }
+                XCTAssertEqual(failureItems.count, 1, "\(row.name): \(deliveredItems.map(\.text))")
+                XCTAssertEqual(
+                    deliveredItems.count(where: { $0.kind == .error }),
+                    1,
+                    "\(row.name): only the stopped attempt's own failure item: \(deliveredItems.map(\.text))"
+                )
+                XCTAssertTrue(
+                    failureItems.first?.text.contains(expectedErrorText) == true,
+                    "\(row.name): the genuine error stays visible: \(deliveredItems.map(\.text))"
+                )
+            } else {
+                XCTAssertFalse(deliveredItems.contains { $0.kind == .error }, "\(row.name): \(deliveredItems.map(\.text))")
+            }
+
+            if row.successorStage == .starting {
+                await successorGate.settle(.success(()))
+                let successorOutcome = await successorRun.value
+                XCTAssertEqual(successorOutcome, .sent, row.name)
+            }
+            XCTAssertEqual(
+                successorController.sentTexts,
+                row.successorStage == .stoppedWhileStarting ? [] : ["second"],
+                row.name
+            )
+            XCTAssertTrue(stoppedController.sentTexts.isEmpty, row.name)
+            XCTAssertEqual(session.codexConversationID, "saved-thread", row.name)
+            await harness.service.cancelRun(tabID: session.tabID, session: session)
+        }
+    }
+
+    func testCodexManagedAuthRecoveryDuringResumeHonorsStopAndDiscardsLateSuccess() async throws {
+        enum StopPoint {
+            case duringRefresh
+            case duringRecoveredResume
+            case none
+        }
+        struct Row {
+            let name: String
+            let refreshResult: CodexManagedAuthRefreshResult
+            let stopPoint: StopPoint
+            let recoveredResumeHonorsCancellation: Bool
+            let expectedControllersHandedOut: Int
+        }
+        let loginGuidance = "Sign in to Codex again to continue."
+        let rows = [
+            Row(
+                name: "Stop during refresh, refresh recovers",
+                refreshResult: .recovered,
+                stopPoint: .duringRefresh,
+                recoveredResumeHonorsCancellation: true,
+                expectedControllersHandedOut: 1
+            ),
+            Row(
+                name: "Stop during refresh, refresh requires login",
+                refreshResult: .requiresUserLogin(message: loginGuidance),
+                stopPoint: .duringRefresh,
+                recoveredResumeHonorsCancellation: true,
+                expectedControllersHandedOut: 1
+            ),
+            Row(
+                name: "Stop cancels the recovered resume",
+                refreshResult: .recovered,
+                stopPoint: .duringRecoveredResume,
+                recoveredResumeHonorsCancellation: true,
+                expectedControllersHandedOut: 2
+            ),
+            Row(
+                name: "recovered resume succeeds after Stop",
+                refreshResult: .recovered,
+                stopPoint: .duringRecoveredResume,
+                recoveredResumeHonorsCancellation: false,
+                expectedControllersHandedOut: 2
+            ),
+            Row(
+                name: "contrast: recovered resume without Stop",
+                refreshResult: .recovered,
+                stopPoint: .none,
+                recoveredResumeHonorsCancellation: false,
+                expectedControllersHandedOut: 2
+            )
+        ]
+
+        for row in rows {
+            let recorder = LifecycleRecorder()
+            let failingController = LifecycleNoopCodexController(
+                recorder: recorder,
+                resumeErrorsBeforeSuccess: [LifecycleCodexManagedAuthError()]
+            )
+            let recoveredController = LifecycleNoopCodexController(recorder: recorder)
+            let recoveredGate = LifecycleResumeGate(honorsCancellation: row.recoveredResumeHonorsCancellation)
+            recoveredController.resumeGate = recoveredGate
+            let refreshGate = LifecyclePublicationGate()
+            let authRecovery = LifecycleGatedAuthRecovery(
+                result: row.refreshResult,
+                gate: row.stopPoint == .duringRefresh ? refreshGate : nil
+            )
+            let sequence = LifecycleCodexControllerSequence([failingController, recoveredController])
+            let harness = makeHarness(
+                recorder: recorder,
+                codexControllerSequence: sequence,
+                codexAuthRecovery: authRecovery
+            )
+            let coordinator = harness.host.test_codexCoordinator
+            let session = AgentModeViewModel.TabSession(tabID: UUID())
+            session.selectedAgent = .codexExec
+            session.codexConversationID = "saved-thread"
+            session.codexRolloutPath = "/tmp/saved-thread.jsonl"
+            let priorTimeoutState = AgentModeViewModel.CodexResumeTimeoutState(
+                conversationID: "saved-thread",
+                rolloutPath: "/tmp/saved-thread.jsonl",
+                consecutiveTimeouts: 1
+            )
+            session.codexResumeTimeoutState = priorTimeoutState
+
+            let runTask = Task { @MainActor in
+                await harness.service.startRun(
+                    tabID: session.tabID,
+                    session: session,
+                    initialUserMessage: "resume",
+                    initialMessageForRun: "resume",
+                    attachments: []
+                )
+            }
+            switch row.stopPoint {
+            case .duringRefresh:
+                await authRecovery.waitUntilEntered()
+                await harness.service.cancelRun(tabID: session.tabID, session: session)
+                await refreshGate.release()
+            case .duringRecoveredResume:
+                await recoveredGate.waitUntilEntered()
+                await harness.service.cancelRun(tabID: session.tabID, session: session)
+                if !row.recoveredResumeHonorsCancellation {
+                    await recoveredGate.settle(.success(()))
+                }
+            case .none:
+                await recoveredGate.waitUntilEntered()
+                await recoveredGate.settle(.success(()))
+            }
+            let outcome = await runTask.value
+
+            let refreshCount = await authRecovery.refreshCount
+            XCTAssertEqual(refreshCount, 1, row.name)
+            XCTAssertEqual(sequence.handedOut, row.expectedControllersHandedOut, "\(row.name): replacement controllers")
+            XCTAssertEqual(failingController.startReferences.count, 1, row.name)
+            XCTAssertEqual(session.codexConversationID, "saved-thread", row.name)
+            XCTAssertEqual(session.codexRolloutPath, "/tmp/saved-thread.jsonl", row.name)
+            XCTAssertTrue(failingController.sentTexts.isEmpty, row.name)
+
+            if row.stopPoint == .none {
+                // Without Stop the recovered resume is applied, requests tool tracking, and the
+                // send dispatches on the same run, so the Stop rows' missing apply, tracking, and
+                // dispatch come from the cancellation guards.
+                XCTAssertEqual(outcome, .sent, row.name)
+                XCTAssertEqual(recoveredController.sentTexts, ["resume"], row.name)
+                XCTAssertFalse(
+                    session.items.contains { $0.kind == .error },
+                    "\(row.name): a recovered refresh leaves no error: \(session.items.map(\.text))"
+                )
+                XCTAssertTrue(session.codexController === recoveredController, row.name)
+                XCTAssertTrue(recoveredController.hasActiveThread, row.name)
+                XCTAssertEqual(recoveredController.startReferences.count, 1, row.name)
+                XCTAssertGreaterThan(coordinator.test_readySessionToolTrackingRequestCount(tabID: session.tabID), 0, row.name)
+                XCTAssertEqual(session.codexResumeTimeoutState.consecutiveTimeouts, 0, row.name)
+                await harness.service.cancelRun(tabID: session.tabID, session: session)
+                continue
+            }
+            XCTAssertTrue(recoveredController.sentTexts.isEmpty, row.name)
+            XCTAssertFalse(recorder.contains("codex:send"), row.name)
+            XCTAssertEqual(coordinator.test_readySessionToolTrackingRequestCount(tabID: session.tabID), 0, row.name)
+            XCTAssertNil(session.codexController, "\(row.name): no recovered controller stays attached")
+            XCTAssertTrue(session.codexNeedsReconnect, row.name)
+            if case .requiresUserLogin = row.refreshResult {
+                // An unrecoverable refresh is a genuine failure of the settled auth error, so it stays
+                // visible even though Stop arrived during the refresh.
+                guard case .failed? = outcome else {
+                    XCTFail("\(row.name): expected the auth failure to fail the run, got \(String(describing: outcome))")
+                    continue
+                }
+                let failureItems = session.items.filter {
+                    $0.kind == .error && $0.text.hasPrefix("Codex native resume failed:")
+                }
+                XCTAssertEqual(failureItems.count, 1, "\(row.name): \(session.items.map(\.text))")
+                XCTAssertTrue(failureItems.first?.text.contains(loginGuidance) == true, row.name)
+                continue
+            }
+            // A recovered refresh resolves the auth error, so Stop stays quiet.
+            XCTAssertEqual(outcome, .cancelled, row.name)
+            XCTAssertFalse(
+                session.items.contains { $0.kind == .error },
+                "\(row.name): Stop stays quiet: \(session.items.map(\.text))"
+            )
+            XCTAssertEqual(session.codexResumeTimeoutState, priorTimeoutState, "\(row.name): Stop leaves the count alone")
+            if row.stopPoint == .duringRecoveredResume {
+                XCTAssertEqual(recoveredController.startReferences.count, 1, row.name)
+                try await waitUntil("\(row.name): both controllers shut down") {
+                    recorder.events.count(where: { $0 == "codex:shutdown" }) >= 2
+                }
+            }
+        }
     }
 
     func testCodexResumeInboundFrameLimitFailureInvalidatesControllerAndKeepsSavedThread() async throws {
@@ -2715,6 +3545,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
             let name: String
             let resumeError: Error
             let invalidatesController: Bool
+            let guidance: String?
         }
         let rows = [
             Row(
@@ -2723,13 +3554,15 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
                     observedBytes: 33_554_433,
                     limitBytes: 33_554_432
                 ),
-                invalidatesController: true
+                invalidatesController: true,
+                guidance: "Codex sent more than 32 MB of thread history, which this Codex version can't skip. Update Codex and retry, or use Handoff to continue in a new thread."
             ),
             // Contrast: an ordinary resume failure only marks reconnect and keeps the controller.
             Row(
                 name: "generic-resume-failure",
                 resumeError: LifecycleTestError.expectedCodexStartFailure,
-                invalidatesController: false
+                invalidatesController: false,
+                guidance: nil
             )
         ]
 
@@ -2763,11 +3596,15 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
             XCTAssertEqual(session.codexRolloutPath, "/tmp/saved-thread.jsonl", row.name)
             XCTAssertTrue(session.codexNeedsReconnect, row.name)
             XCTAssertEqual(session.codexResumeTimeoutState.consecutiveTimeouts, 0, row.name)
-            XCTAssertTrue(session.items.contains {
-                $0.kind == .error
-                    && $0.text.hasPrefix("Codex native resume failed:")
-                    && $0.text.contains(row.resumeError.localizedDescription)
-            }, row.name)
+            let failureText = session.items.last {
+                $0.kind == .error && $0.text.hasPrefix("Codex native resume failed:")
+            }?.text ?? ""
+            XCTAssertTrue(failureText.contains(row.resumeError.localizedDescription), "\(row.name): \(failureText)")
+            if let guidance = row.guidance {
+                XCTAssertTrue(failureText.hasSuffix(guidance), "\(row.name): \(failureText)")
+            } else {
+                XCTAssertFalse(failureText.contains("Handoff"), "\(row.name): \(failureText)")
+            }
             XCTAssertFalse(session.items.contains { $0.text.contains("Started a fresh thread") }, row.name)
             if row.invalidatesController {
                 XCTAssertNil(session.codexController, row.name)
@@ -3170,6 +4007,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
             $0.kind == .error
                 && $0.text.hasPrefix("Codex native resume failed:")
                 && $0.text.contains("system-error state")
+                && $0.text.hasSuffix("Codex reports this thread is in an error state. Your saved thread was kept. Retry, or use Handoff.")
         })
         XCTAssertFalse(session.items.contains { $0.text.contains("Started a fresh thread") })
 
@@ -5494,6 +6332,8 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         idleWaiter: @escaping LifecycleMCPIdleWaiter = { _ in },
         cancelMCPTools: @escaping (_ runID: UUID, _ reason: String) -> Void = { _, _ in },
         codexController: LifecycleNoopCodexController? = nil,
+        codexControllerSequence: LifecycleCodexControllerSequence? = nil,
+        codexAuthRecovery: (any CodexManagedAuthRecovering)? = nil,
         claudeController: LifecycleFakeNativeController? = nil,
         claudeControllerFactory: ClaudeAgentModeCoordinator.ClaudeControllerFactory? = nil,
         headlessProviderFactory: AgentModeViewModel.HeadlessProviderFactory? = nil,
@@ -5549,7 +6389,9 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         let host = AgentModeViewModel(
             testWindowID: 1,
             testWorkspacePath: FileManager.default.currentDirectoryPath,
-            codexControllerFactory: { _, _, _, _, _, _ in codexController },
+            codexControllerFactory: { _, _, _, _, _, _ in
+                codexControllerSequence?.next() ?? codexController
+            },
             claudeControllerFactory: claudeControllerFactory ?? { _, _, _, _ in
                 recorder.record("factory:claude")
                 return claudeController
@@ -5558,7 +6400,8 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
             acpProviderFactory: acpProviderFactory,
             acpControllerFactory: trackedACPControllerFactory,
             connectionPolicyInstaller: policyInstaller,
-            mcpServerEnabler: serverEnabler
+            mcpServerEnabler: serverEnabler,
+            testCodexAuthRecovery: codexAuthRecovery
         )
         lifecycleHosts.append(host)
         let dependencies = AgentModeRunService.Dependencies(
@@ -6184,6 +7027,121 @@ private actor LifecyclePublicationGate {
     }
 }
 
+/// One resume settlement: the first of `settle(_:)` or (when honoring cancellation) task
+/// cancellation wins, like a real request continuation.
+private actor LifecycleResumeGate {
+    private let honorsCancellation: Bool
+    private var settledOutcome: Result<Void, Error>?
+    private var continuation: CheckedContinuation<Result<Void, Error>, Never>?
+    private var entered = false
+    private var enteredWaiters: [CheckedContinuation<Void, Never>] = []
+
+    init(honorsCancellation: Bool) {
+        self.honorsCancellation = honorsCancellation
+    }
+
+    func wait() async -> Result<Void, Error> {
+        let honorsCancellation = honorsCancellation
+        return await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                entered = true
+                let waiters = enteredWaiters
+                enteredWaiters.removeAll()
+                waiters.forEach { $0.resume() }
+                if let settledOutcome {
+                    continuation.resume(returning: settledOutcome)
+                } else {
+                    self.continuation = continuation
+                }
+            }
+        } onCancel: {
+            guard honorsCancellation else { return }
+            Task { await self.settle(.failure(CancellationError())) }
+        }
+    }
+
+    func settle(_ outcome: Result<Void, Error>) {
+        guard settledOutcome == nil else { return }
+        settledOutcome = outcome
+        continuation?.resume(returning: outcome)
+        continuation = nil
+    }
+
+    func waitUntilEntered() async {
+        guard !entered else { return }
+        await withCheckedContinuation { enteredWaiters.append($0) }
+    }
+}
+
+/// Hands out Codex controllers in order; the last one repeats once the list is exhausted. Lets a
+/// test give a stopped attempt and its successor (or an auth-recovered replacement) distinct
+/// controllers.
+final class LifecycleCodexControllerSequence {
+    private let controllers: [LifecycleNoopCodexController]
+    private(set) var handedOut = 0
+
+    init(_ controllers: [LifecycleNoopCodexController]) {
+        precondition(!controllers.isEmpty)
+        self.controllers = controllers
+    }
+
+    func next() -> LifecycleNoopCodexController {
+        let controller = controllers[min(handedOut, controllers.count - 1)]
+        handedOut += 1
+        return controller
+    }
+}
+
+/// Managed-auth recovery double: counts refreshes and, when gated, holds each refresh until the
+/// gate is released so a test can place Stop inside the refresh.
+private actor LifecycleGatedAuthRecovery: CodexManagedAuthRecovering {
+    private let result: CodexManagedAuthRefreshResult
+    private let gate: LifecyclePublicationGate?
+    private(set) var refreshCount = 0
+    private var enteredWaiters: [CheckedContinuation<Void, Never>] = []
+
+    init(result: CodexManagedAuthRefreshResult, gate: LifecyclePublicationGate? = nil) {
+        self.result = result
+        self.gate = gate
+    }
+
+    func refreshManagedAccount() async -> CodexManagedAuthRefreshResult {
+        refreshCount += 1
+        let waiters = enteredWaiters
+        enteredWaiters.removeAll()
+        waiters.forEach { $0.resume() }
+        if let gate {
+            await gate.wait()
+        }
+        return result
+    }
+
+    func startManagedChatgptLogin(
+        openURL: @MainActor @escaping @Sendable (URL) -> Void
+    ) async -> CodexManagedChatgptLoginResult {
+        .failed(message: "Lifecycle tests never start a ChatGPT login.")
+    }
+
+    func waitUntilEntered() async {
+        guard refreshCount == 0 else { return }
+        await withCheckedContinuation { enteredWaiters.append($0) }
+    }
+}
+
+/// A missing-rollout resume failure, as the Codex app-server reports it.
+private struct LifecycleCodexMissingRolloutError: LocalizedError {
+    var errorDescription: String? {
+        "failed to load rollout `/tmp/saved-thread.jsonl`: No such file or directory (os error 2)"
+    }
+}
+
+/// A recoverable managed-auth failure, as the Codex app-server reports it.
+private struct LifecycleCodexManagedAuthError: LocalizedError {
+    var errorDescription: String? {
+        "Codex app-server rejected the request: external auth is active."
+    }
+}
+
 private actor LifecycleTimeoutGate<Value: Sendable> {
     private var continuation: CheckedContinuation<Value, Error>?
 
@@ -6363,6 +7321,11 @@ final class LifecycleNoopCodexController: CodexSessionControlling {
     fileprivate var snapshotGate: LifecyclePublicationGate?
     /// Runs inside a successful start/resume, before the result is returned to the coordinator.
     var onThreadEstablished: (() -> Void)?
+    /// When set, every resume waits for this gate's settlement before succeeding or throwing.
+    fileprivate var resumeGate: LifecycleResumeGate?
+    /// When set, a settled gated resume waits here (ignoring cancellation) before delivering its
+    /// outcome, so a test can place Stop between settlement and delivery.
+    fileprivate var resumeDeliveryGate: LifecyclePublicationGate?
     /// Text of every `startUserTurn` / `steerUserTurn` dispatch, in order.
     private(set) var sentTexts: [String] = []
 
@@ -6411,15 +7374,32 @@ final class LifecycleNoopCodexController: CodexSessionControlling {
     func ensureEventsStreamReady() {}
 
     func startOrResume(existing: CodexNativeSessionController.SessionRef?, baseInstructions: String) async throws -> CodexNativeSessionController.SessionRef {
-        try establishThread(existing: existing, model: nil, reasoningEffort: nil)
+        try await settleGatedResumeIfNeeded(existing: existing)
+        return try establishThread(existing: existing, model: nil, reasoningEffort: nil)
     }
 
     func startOrResume(existing: CodexNativeSessionController.SessionRef?, baseInstructions: String, model: String?, reasoningEffort: String?) async throws -> CodexNativeSessionController.SessionRef {
-        try establishThread(existing: existing, model: model, reasoningEffort: reasoningEffort)
+        try await settleGatedResumeIfNeeded(existing: existing)
+        return try establishThread(existing: existing, model: model, reasoningEffort: reasoningEffort)
     }
 
     func startOrResume(existing: CodexNativeSessionController.SessionRef?, baseInstructions: String, model: String?, reasoningEffort: String?, serviceTier: String?) async throws -> CodexNativeSessionController.SessionRef {
-        try establishThread(existing: existing, model: model, reasoningEffort: reasoningEffort)
+        try await settleGatedResumeIfNeeded(existing: existing)
+        return try establishThread(existing: existing, model: model, reasoningEffort: reasoningEffort)
+    }
+
+    private func settleGatedResumeIfNeeded(existing: CodexNativeSessionController.SessionRef?) async throws {
+        guard existing != nil, let resumeGate else { return }
+        recorder.record("codex:resume-gated")
+        let outcome = await resumeGate.wait()
+        if let resumeDeliveryGate {
+            await resumeDeliveryGate.wait()
+        }
+        if case let .failure(error) = outcome {
+            startReferences.append(existing)
+            hasActiveThread = false
+            throw error
+        }
     }
 
     private func establishThread(

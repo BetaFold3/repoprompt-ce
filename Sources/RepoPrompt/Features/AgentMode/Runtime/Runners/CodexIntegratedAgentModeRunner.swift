@@ -34,13 +34,19 @@ final class CodexIntegratedAgentModeRunner {
             createdOwnership = true
             session.recordRunProgress(ownership: ownership, kind: .stageTransition, stage: .preparingRuntime)
         }
+        let attemptGeneration = session.runAttemptGeneration
         let attachmentReservationID = hooks.reserveAttachmentsForTurn(attachments, session)
 
         let sendTask = Task<CodexAgentModeCoordinator.NativeSendOutcome, Never> { [weak self, weak session] in
             guard let self, let session else {
                 return .cancelled
             }
-            defer { session.agentTask = nil }
+            defer {
+                // A send outliving Stop must not clear a successor run's task handle.
+                if !Self.isSupersededBySuccessor(ownership, attemptGeneration: attemptGeneration, session: session) {
+                    session.agentTask = nil
+                }
+            }
             #if DEBUG || EDIT_FLOW_PERF
                 let codexTurnMCPServerEnableState = EditFlowPerf.begin(EditFlowPerf.Stage.MCPWindowToolCatalog.codexTurnMCPServerEnable)
             #endif
@@ -57,7 +63,10 @@ final class CodexIntegratedAgentModeRunner {
                 attachmentReservationID: attachmentReservationID,
                 terminalizeRejectedSend: createdOwnership
             )
-            hooks.recordPendingHandoffSendOutcome(session, outcome.didSend)
+            // The pending handoff is tab-wide; a superseded send leaves the successor's staging alone.
+            if !Self.isSupersededBySuccessor(ownership, attemptGeneration: attemptGeneration, session: session) {
+                hooks.recordPendingHandoffSendOutcome(session, outcome.didSend)
+            }
             // Delegated child-question notices acknowledge only on an actual send. A queued
             // fallback (`didSend == true`) has not reached the model yet, so its stage is released
             // and the notices stay deliverable; the release also removes the stage's runtime
@@ -88,5 +97,19 @@ final class CodexIntegratedAgentModeRunner {
             }
         }
         return await sendTask.value
+    }
+
+    /// True once a later run attempt took the tab (Stop, then a new send, while this send was still
+    /// starting), whether that attempt still owns the tab or has already ended and released it.
+    private static func isSupersededBySuccessor(
+        _ ownership: AgentRunOwnership,
+        attemptGeneration: UInt64,
+        session: AgentModeViewModel.TabSession
+    ) -> Bool {
+        if session.runAttemptGeneration != attemptGeneration {
+            return true
+        }
+        guard let currentOwnership = session.activeRunOwnership else { return false }
+        return currentOwnership != ownership
     }
 }

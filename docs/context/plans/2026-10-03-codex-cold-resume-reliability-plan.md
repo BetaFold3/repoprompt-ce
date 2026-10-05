@@ -1,10 +1,10 @@
 # Codex cold-resume reliability plan (oversized `thread/resume`, metadata-only resume, same-thread identity)
 
-Scope: read when the task touches Codex app-server stdout framing or overflow handling, `thread/resume` parameters or `excludeTurns`, `thread/turns/list`, Codex thread lifecycle reconciliation after resume, `readThreadSnapshot` readers, the repeated-resume-timeout fresh-thread fallback, or presentation of cancelled Codex native starts.
+Scope: read when the task touches Codex app-server stdout framing or overflow handling, `thread/resume` parameters or `excludeTurns`, `thread/turns/list`, Codex thread lifecycle reconciliation after resume, `readThreadSnapshot` readers, repeated-resume-timeout handling (the fresh-thread fallback is removed in Phase 3), or presentation of cancelled Codex native starts.
 Authority: Reference
-Last-verified: 2026-10-03
+Last-verified: 2026-10-05
 
-Status: Phases 1 and 2 implemented; OracleA and OracleB completed independent review and one fresh scoped re-review, with no remaining P0/P1 findings. Nonblocking follow-ups remain. The baseline documentation gate was repaired on 2026-10-04; commit and push safety preflight passed. Phase 3 remains unimplemented. The automatic repeated-timeout fresh-thread fallback and cancellation presentation therefore remain unchanged, and end-to-end cold-resume reliability is not yet accepted.
+Status: All three phases are implemented. OracleA and OracleB completed independent Phase 3 review and three fresh scoped re-review rounds, with no remaining P0/P1 findings. The final-source full-root run passed 6,331 tests across 589 suites with six suite retries; build and lint passed. Nonblocking review follow-ups and the pre-existing unrelated Pair-guidance ledger omission remain. The live §7.3 acceptance check remains outstanding, so end-to-end cold-resume reliability is not yet accepted and this plan is not archived. The records below distinguish historical failures, reviewer closure, and final validation.
 
 ## Phase 1–2 implementation record
 
@@ -29,7 +29,174 @@ Status: Phases 1 and 2 implemented; OracleA and OracleB completed independent re
 - OracleB R1-02 (P2, plausible) asked whether an identified resumed blocker ending failed/interrupted strands queued input. A subsequent read-only trace found `turnCompleted` calls `abandonCodexFallbackQueueBlockedByTerminalTurn` before finalization: matching non-completed blockers clear the queue, mark MCP entries stale, restore manual drafts/attachments, and publish the cancellation notice. Managed-auth recovery has a separate early-return path and controller replacement abandons the queue. `testNilCompletionDoesNotDrainAndFailedCompletionAbandonsBlockedHead` covers the shared failed-blocker cleanup, but not the exact cold-resume failed/interrupted scenario. This is a factual answer, not a new Oracle closure or dedicated runtime proof.
 - Additional nonblocking review follow-ups: post-read pump lineage revalidation before identity mutation, the now-stateful dispatch-planning helper, and duplicated resumed-wait predicates. No further minor-finding review loop was run.
 
-The sections below retain the phased contract with implementation clarifications; Phase 3 and full reliability acceptance are still pending.
+## Phase 3 implementation record (2026-10-04; subsequent review and remediation below)
+
+- **Replacement removed (U1).** `CodexAgentModeCoordinator.swift` no longer has `.repeatedResumeTimeout`, its threshold, the skip/rewrite branches, the fresh-start retry, or their helpers and message. `allowResumeTimeoutFallback` is gone from every source call site (`ensureCodexNativeSession`, its recursive calls, `/compact`, `/goal`, recovery, managed-auth recovery). `CodexNativeSessionFallbackReason` keeps only `.missingRollout`; that fallback is unchanged.
+- **Catch restructure.** The start block captures `startController` and whether the attempt is a resume. `error is CancellationError` is the first branch, before auth recovery, and is repeated in the nested auth-recovery catch. `discardCancelledCodexNativeSessionStart` logs one line, invalidates only the captured controller (`resume-cancelled`/`start-cancelled`), appends nothing, and leaves the counter alone. Everything else goes to `handleCodexNativeSessionStartFailure`, which classifies by error type only (`codexNativeSessionFailureKind`):
+  - Timeout: record the count (resume only) and invalidate.
+  - Frame limit: reset the count and invalidate.
+  - System error or other: reset the count, and call `markCodexReconnectNeeded` only if the attempt still owns the controller slot.
+  - The item keeps `codexNativeSessionFailurePrefix` and appends the §5 guidance (`codexNativeSessionFailureGuidance`); the frame-limit size comes from `Config.maxInboundFrameBytes`.
+  - Guidance applies to resume attempts only. Fresh-start failures keep the prefix and description, and a fresh-start timeout leaves the count unchanged.
+- **Late-success guards.** After `startCodexNativeSession` returns, on both the normal and auth-recovered paths, `guard !Task.isCancelled` discards the result through the same captured-controller cleanup: no apply, no tool tracking, no dispatch. Auth recovery replaces the controller only while the slot still holds the attempt's controller; otherwise it reports the original error. `sendCodexNativeMessage` returns `.cancelled` when its task is cancelled with no reported start failure. It finalizes an owned run as interrupted, or restores attachments, instead of reporting a missing thread.
+- **Timeout state.** `CodexResumeTimeoutState` only drives messages and is not reset on Stop (documented in `AgentModeViewModel+Types.swift`).
+- **Controller.** `startOrResume` calls `Task.checkCancellation()` after the resume response, after the start response, and as the first statement of the `eventHandlingMutex` apply block. The catch cancels binding through `cancelBindingSessionIgnoringTaskCancellation`. That helper runs on an unstructured task because `AsyncMutex` throws for a cancelled contended waiter. `disableThreadMemoryMode` and `disableThreadMemoryModeForeground` rethrow `CancellationError` without a foreground or background retry.
+- **DEBUG hooks.** `test_readySessionToolTrackingRequestCount(tabID:)` on the coordinator. On the controller: `test_backgroundMemoryModeRetryObserver` (when set, it short-circuits the detached retry and records the thread ID), `test_isBindingSession`, and `test_bufferedInboundCount`.
+- **Tests.** In `AgentModeRunServiceLifecycleTests`:
+  - Deliberate contract replacement (rename): `testCodexRepeatedResumeTimeoutFallsBackToFreshStartForSavedThreadID` -> `testCodexRepeatedResumeTimeoutKeepsSavedThreadAndResumesSameThreadOnRetry`.
+  - New: `testCodexResumeCancelledByStopShowsNoFailureItem`, `testCodexResumeFailureBeforeStopStaysVisible` (timeout and frame-limit rows), and `testCodexResumeLateSuccessAfterCancelIsDiscarded`.
+  - Strengthened guidance assertions in the frame-limit and system-error tests.
+  - New `LifecycleResumeGate`: first settlement wins, with optional cancellation honoring.
+  - `testCodexRolloutWithoutThreadIDCannotUseRepeatedTimeoutFreshStartFallback` keeps its ID, but its ledger oracle now describes stale timeout state.
+  - In `CodexNativeResumeLifecycleTests`, new: `testCancellationBeforeApplyThrowsCancellationAndCancelsBinding` (after resume response, after start response, before apply) and `testMemoryModeCancellationIsRethrownWithoutRetryWhileFailureStillDegrades`.
+  - Ledger rows were updated surgically, and the root scenario total rose from 37,587 to 37,600 (lifecycle 173 -> 181 across 124 -> 127 rows; controller suite 58 -> 63 across 25 -> 27 rows).
+- **Validation (synthetic only, no real user turn or visible app lifecycle).**
+  - Controller suite: 27/27 (`63273427-5b9b-49b5-b48c-9476797e78a1`).
+  - Lifecycle suite: the first run passed 126/127. The unchanged ACP prompt-write acknowledgement test hit its 0.5 s readiness timeout (`5bfdf408-85f1-4d08-bb4c-9a362d83adae`); this is the same test as the Phase 2 record. The rerun passed 127/127 (`c18cf58b-b042-45f1-94a8-b73e75133f7e`), and so did the run after the final test edit (`96232ad7-9a76-4ec0-b81e-7e321923f6d7`).
+  - Adjacent Codex suites (goal config/memory-mode retry, event recovery, liveness, hidden-tool boundary, fallback FIFO): 125/125 (`75e8bcf6-2367-46db-8b40-ac0a860072b8`).
+  - No dedicated coordinator auth-recovery or missing-rollout suite exists. Their contracts run inside the lifecycle suite.
+  - Build passed (`6106ca15-a6eb-44f3-93b9-44f1cba6b470`). Lint passed (`279aa51e-a616-4ddd-985d-b094db083acf`) after removing one redundant `throws`.
+  - `verify-ledger` reconciles every Phase 3 ID. It still reports the pre-existing missing Pair-guidance row from `9d48a9e8`.
+- **Notes for review.**
+  - The pre-existing auth `.recovered` invalidation used `preserveRunID: false`; the R2 remediation record below fixes it.
+  - Start-path timeouts show no guidance.
+  - The retained rollout-integrity test name mentions the removed fallback.
+
+## Phase 3 initial-review remediation record (2026-10-04; subsequent R1–R3 outcomes below)
+
+Inputs: the OracleA initial review (CR3-01 P1, CR3-02 P2, and the auth-recovery acceptance gap) and the OracleB initial review against snapshot 2026-10-04/2137 (B3-01 to B3-09). Severities are left to re-review. C3-xx and PH3-xx labels came from reconstructed review deliveries that are not review authority, so the items that cited them are recorded below as independent code observations.
+
+- **Captured run ownership (CR3-01, B3-03).**
+  - `ensureCodexNativeSession` captures `CodexStartAttemptIdentity` (run attempt and run ID) before its first suspension.
+  - `codexStartAttemptOwnsSessionState` gates every timeout-count change, controller invalidation, reconnect mark and managed-auth recovery. That covers the failure handler, the cancellation discard and both auth branches. It holds while no other attempt or run ID is active and the slot is empty or still holds the attempt's controller.
+  - A superseded attempt still appends its own genuine error item.
+  - A late success is applied only while `codexControllerSlotHolds` the attempt's exact controller, on both the normal and the recovered path.
+  - `sendCodexNativeMessage` captures `sendRunOwnership` at entry. After ensure, `codexSendIsSupersededBySuccessor` returns `.stale` without touching reconnect, auth-retry, terminal or dispatch state. It fires when another attempt owns the tab, or when the send's task was cancelled with no attempt active and a later run has already installed a controller.
+  - `CodexIntegratedAgentModeRunner` leaves `agentTask` and the pending-handoff outcome alone once superseded.
+- **Real-client cancellation ordering (B3-01).** The cancellation handler in `CodexAppServerClient.request` marks a per-request `RequestCancellationMarker` synchronously. A failure that settles the request after that point settles as `CancellationError`: transport invalidation, an error response, a timeout, or an explicit fail. Earlier failures and success responses are unchanged.
+- **Stop before the fallback or the start (independent code observation, not an Oracle finding).** `startCodexNativeSession` checks cancellation before the missing-rollout fallback. `startOrResume` checks it before any process, binding or RPC work.
+- **Turn listing after Stop (B3-05).** `startOrResume` checks cancellation after `reconcileResumedSnapshot`.
+- **Contended binding cleanup (CR3-02).** No behavior change. New DEBUG hooks: `test_bindingCleanupObserver`, `test_holdEventHandlingMutex`, `test_eventHandlingMutexWaiterCount` (backed by `AsyncMutex.test_waiterCount`), and the `testCodexAuthRecovery` injection on `AgentModeViewModel`.
+- **New tests.** In `AgentModeRunServiceLifecycleTests`:
+  - `testCodexStoppedResumeSettlingDuringSuccessorStartupLeavesSuccessorUntouched`: 6 rows. Cancellation, late success, timeout and auth error against a starting successor; late success against a ready successor and against a finished one.
+  - `testCodexManagedAuthRecoveryDuringResumeHonorsStopAndDiscardsLateSuccess`: 5 rows. Stop during a refresh that recovers, and during one that needs login; Stop cancelling the recovered resume, and the recovered resume succeeding after Stop; an uncancelled contrast.
+  - `testCodexResumeTaskCancelledWithoutStopInvalidatesItsOwnController`: 2 rows. Send-created attempt, and joined attempt; the joined row restores attachments and does not terminalize.
+  - `testCodexMissingRolloutSettledBeforeStopDoesNotStartFreshThread`: 2 rows.
+
+  In `CodexNativeResumeLifecycleTests`:
+  - `testCancelledStartupCancelsBindingAfterWaitingForContendedEventMutex`: 2 rows.
+  - `testStopDuringRealResumeRequestSettlesAsCancellationBeforeShutdownCanFailIt`: 2 rows × 10 iterations, over the real client.
+  - `testCancelledStartOrResumeEntryMakesNoRequestOrBinding`: 3 rows.
+  - `testStopDuringStartupTurnListingSendsNoMemoryModeRequest`: 2 rows.
+
+  Changed: `testCodexResumeFailureBeforeStopStaysVisible` now seeds the count, so the timeout row goes from 0 to 1 and the frame row from 1 to 0.
+- **Ledger.** The root scenario total went from 37,600 to 37,624. Lifecycle: 181 -> 196 across 127 -> 131 rows. Controller suite: 63 -> 72 across 27 -> 31 rows. `verify-ledger` reports only the pre-existing missing Pair-guidance row.
+- **Validation (synthetic only).** In run order:
+  - `aff8d3f0-…`: the lifecycle suite passed 130/131. The unchanged ACP prompt-write acknowledgement test hit its 0.5 s readiness timeout, the same flake as in the earlier records. The xctest process then died of SIGPIPE in the new real-client test, because the debug transport had no stdin reader. The test now injects a no-op frame writer.
+  - `b4e306f1-…`: the real-client Stop row failed in 1 of 10 iterations with `processNotRunning`, reproducing B3-01 before the client fix.
+  - `cbf36fc5-…`: 302/302 across the focused Codex suites after the fix.
+  - Mutation run `8110ab8a-…`: 162 tests with 20 failures, confined to the six targeted tests. The six mutants were: plain `try? withLock` cleanup; a discard that never invalidates; a send fence that is always false; and each of the three new cancellation checks removed. Mutation run `c475537a-…`: always terminalizing a cancelled joined send failed the joined row (4 assertions).
+  - `7dc66ab2-…`: 302/302 on the restored sources. `f80d2cf3-…`: the joined-attempt row passed.
+  - Build: `89ae4c43-…`.
+  - Lint `0f93b3e5-…` first failed with two `redundantThrows` and one `preferCountWhere` in the new tests, plus cascaded `indent`/`trailingSpace` reports in an unchanged raw-string literal. After the fix, lint passed (`c7d56b8e-…`). It passed again (`0255d442-…`) after one optional-interpolation warning in the new successor test was fixed.
+  - `make dev-test-parallel` (589 suites and 6,331 tests per run):
+    - `4c5cbc4e-…`: every test passed after five first-attempt retries, but the integrity check failed (`source dirty digest`) because this record was edited during the run. Result discarded.
+    - `c2de3433-…`: failed. `AgentRunMCPToolServiceWaitTests/testOMPQualificationAuthorizationUsesSingleAbsoluteDeadline` failed on both attempts. It passed in isolation (`ef1e0240-…`, 52/52), and it also failed a first attempt in a parallel run on 2026-10-03, before Phase 3. Four other suites passed on retry.
+    - `7a831fa7-…`: passed with 0 failures after three first-attempt retries, all passing on retry:
+      - the lifecycle suite: the ACP prompt-write flake and `testPreDeniedOhMyPiReceiptPreventsBootstrapAfterGateAuthorization`;
+      - the OMP smoke-script suite timed out;
+      - `WorkspaceFileContextStoreTests`.
+
+      The Codex suites passed on their first attempt.
+- **Open for review (not changed here).**
+  - Auth `.recovered`: fixed in the R2 remediation record below. The recovered replacement now keeps the run ID, and the contrast row asserts the dispatch.
+  - Independent code observation (transport-closed recovery): the transport-closed fallback task's recovery calls `invalidateCodexControllerForReconnect`, which cancels that same task. This is present at HEAD. With Phase 3 the cancelled recovery resume is quiet, and the run fails with the generic recovery message. This is from code trace only and needs a design decision.
+  - Independent code observation (fallback-start classification): a failed fresh start after a missing-rollout fallback is still classified as a resume failure, for both guidance and count.
+  - B3-07: the frame-limit guidance omits that the saved thread was kept, and takes its size from `Config.maxInboundFrameBytes` rather than the error's limit.
+  - B3-08: the retained `…CannotUseRepeatedTimeoutFreshStartFallback` name and its `repeated_timeout_fallback` ledger tag are unchanged.
+  - B3-09: Stop waits behind a contended event mutex during binding cleanup, and a background memory-mode retry scheduled before a late cancellation can still send.
+  - B3-02: unchanged. Ensure creates the controller before capturing it, and `startCodexNativeSession` never creates one.
+
+## Phase 3 R1 remediation record (2026-10-05; OracleA R2 closed CR3-01)
+
+Input: OracleA R1 kept CR3-01 open. A successor that ran and was then stopped before the stopped attempt's outcome arrived leaves no run attempt, run ID or controller behind. So `codexStartAttemptOwnsSessionState` and `codexSendIsSupersededBySuccessor` both treated the stale attempt as current, and it could change the timeout count, mark reconnect, re-enter auth and send cleanup, and return a non-stale outcome. OracleB's R1 nonblocking findings are not part of this remediation.
+
+- **Run-attempt generation.** No existing session field survives terminal teardown at attempt granularity: `lastObservedRunID` tracks runs and is unset at send entry for a fresh run. So `TabSession.runAttemptGeneration` (`UInt64`) increments in `beginRunAttempt` and is never cleared. Three boundaries compare it:
+  - `CodexStartAttemptIdentity` captures it, and `codexStartAttemptOwnsSessionState` rejects a changed generation before its ownership, run-ID and slot checks.
+  - `sendCodexNativeMessage` captures it at entry next to `sendRunOwnership`, and `codexSendIsSupersededBySuccessor` treats a changed generation as superseded, so the send returns `.stale`.
+  - `CodexIntegratedAgentModeRunner` captures it after taking ownership, and `isSupersededBySuccessor` treats a changed generation as superseded. The stale run wrapper therefore leaves `agentTask` and the pending-handoff outcome alone.
+- **"A stopped, no successor" is unchanged.** The generation stays the same, so a genuine first-settled failure still advances or resets the count and fails the run (`testCodexResumeFailureBeforeStopStaysVisible`, not modified). `cancelRun` begins a synthetic attempt only when the run is not already terminal-committed, so a repeated Stop does not bump the generation.
+- **Tests.** `testCodexStoppedResumeSettlingDuringSuccessorStartupLeavesSuccessorUntouched` grows from 6 to 12 rows. The new rows stop the successor before the stopped attempt's outcome is delivered:
+  - while the successor is starting: cancellation, late success, timeout, and auth error;
+  - after it has dispatched: timeout, and late success.
+
+  The stopped rows assert that no controller, run attempt or run ID remains. They then set reconnect to false and the auth-retry turn to a probe value, because the successor's own Stop already marked reconnect. Every row now asserts that the task handle is unchanged (a stand-in handle when none remains) and that no handoff outcome is recorded. The error rows also assert exactly one error item. Ledger: 6 -> 12 scenarios; the root total goes from 37,624 to 37,630.
+- **Validation (synthetic only).**
+  - Red before the source change, `d966b9bc-…`: 8 failures. The six stopped rows returned `.cancelled` or `.failed` instead of `.stale`, and the finished row lost its task handle and recorded a handoff outcome.
+  - Focused Codex suites, `fbbf3f62-…`: 300/302. The extended successor test and the no-successor test passed. The two failures were the ACP prompt-write flake and `testPreDeniedOhMyPiReceiptPreventsBootstrapAfterGateAuthorization` (OMP on the ACP path; it also failed first attempts in earlier parallel runs). Lifecycle reruns: `4698003f-…` 130/131 (ACP flake only) and `1a12f95c-…` 131/131.
+  - Boundary mutants, each restored afterwards:
+    - M9, ownership helper (`9139978b-…`): 7 failures (timeout state ×3, reconnect ×3, visible error ×1);
+    - M10, send fence (`a44c666b-…`): 6 outcome failures;
+    - M11, run wrapper (`558e84a7-…`): 14 failures (task handle and handoff outcome in the finished row and the six stopped rows).
+  - Lint `a7647723-…` and build `f68a0163-…` passed.
+  - `make dev-test-parallel`, 589 suites and 6,331 tests per run:
+    - `15a2532b-…`: failed. `AgentRunMCPToolServiceWaitTests/testOMPQualificationAuthorizationUsesSingleAbsoluteDeadline` failed both attempts, as in `c2de3433-…` before this change. It passed in isolation (`59877ed4-…`, 52/52).
+    - `9ddbed7c-…`: passed with 0 failures after five first-attempt retries, all passing on retry: the lifecycle suite (ACP flake), the same OMP deadline test, `MCPCodeStructureWorktreeTests`, `OMPAgentModeSmokeScriptTests`, and `RemoteAgentSessionTests`. Every Codex suite passed on its first attempt.
+
+## Phase 3 R2 remediation record (2026-10-05; both R3 lanes closed R1-01)
+
+Input: OracleB R2 escalated its Phase 3 R1-01 to P1. That numbering is OracleB's Phase 3 series, separate from the Phase 1–2 R1-01 above. When managed auth had expired during a cold resume and the refresh succeeded, the `"managed-auth-recovery-during-start"` invalidation cleared `session.runID`. The recovered resume was applied, but `sendCodexNativeMessage` then failed the run with "Codex native send failed: run not ready" and dispatched nothing.
+
+- **Fix.** That invalidation now passes `preserveRunID: true`, as `attemptCodexRecovery` already does for its in-run replacement.
+  - The replacement serves the same run: `prepareCodexController()` builds it and its event listener under the captured run ID.
+  - The ownership check just before the invalidation has confirmed that the session's run ID is the attempt's.
+  - Preserving keeps only what is already there, so a Stop that has cleared the run ID leaves it cleared.
+  - `preserveExistingRunID` is unchanged and stays `false` for ordinary sends.
+- **Unchanged paths.**
+  - Stop during the refresh still discards before the invalidation.
+  - A cancelled or late-succeeding recovered resume still goes through `discardCancelledCodexNativeSessionStart`, and Stop's own teardown clears the run ID.
+  - The successor rows still assert that the refresh never runs.
+- **Tests.** The contrast row of `testCodexManagedAuthRecoveryDuringResumeHonorsStopAndDiscardsLateSuccess` now asserts a `.sent` outcome, `recoveredController.sentTexts == ["resume"]`, and no error item. The ledger row's tags, oracle, failure risk and notes are updated. Its scenario count (5) and the root total are unchanged.
+- **Validation (synthetic only).**
+  - Red with the fix reverted, `307e3ff2-…`: 3 failures, all in the contrast row:
+    - the outcome was `.failed("Codex native send failed: run not ready")`;
+    - `sentTexts` was empty;
+    - the "run not ready" error item appeared.
+
+    The fix was restored and hash-checked, and no mutant markers remain.
+  - Focused Codex suites, `fd60c29a-…`: 301/302. The auth-recovery, successor and no-successor tests passed. The one failure was `testACPDelegatedQuestionStageIsAcknowledgedAtThePromptWriteNotAtTurnCompletion` (the ACP prompt-write test). An earlier lifecycle-only run, `0c2fe622-…` (its filter was not quoted), had the same single failure.
+  - Lint `32872fc0-…` and build `baf26962-…` passed.
+  - `make dev-test-parallel`, `752f0ce5-…` (589 suites, 6,331 tests): **failed**.
+    - The lifecycle suite's only test failure, on both attempts, was the ACP prompt-write test hitting its 0.5 s timeout. The harness classified both attempts as `CRASH`: each process exited 1 after printing a complete 131-test summary, with `timed_out: false`. `parallel_xctest_runner.py` labels any nonzero exit `CRASH`, even with a summary; these records do not establish a signal crash.
+    - Four other suites passed on retry: `MCPAskOracleWorktreeTests`, `MCPCodeStructureWorktreeTests` and `OMPAgentModeSmokeScriptTests` after timeouts, and `WorkspaceCodemapLocalGitClassificationTests` after a crash.
+  - Follow-up checks on the ACP test, with the fix in place:
+    - a lifecycle-suite rerun, `ea9d2a2f-…`, had the same single failure;
+    - run alone, the test failed once (`0a06e7d7-…`) and passed once (`a36824f6-…`), with a machine load average of about 8 to 11.
+
+    Its body is unchanged from HEAD, and it doesn't use the Codex start path.
+  - Main's lifecycle rerun `b66d2d86-4291-45ae-baa0-90f49d49d04e` failed two methods (four assertions): ACP prompt-write readiness and `testPreDeniedOhMyPiReceiptPreventsBootstrapAfterGateAuthorization`. All Codex cases passed. The OMP test also failed before the auth fix in `fbbf3f62-9a27-4f9e-854c-9feb2044f1ef`, and passed alone on final source in `b0cf2430-b521-4116-bd48-57754c7744c4` (1/1). This bounds attribution but does not establish the cause of the ACP/OMP instability.
+  - Final unchanged-source `make dev-test-parallel`, `370f0ed5-102b-4878-a58e-2bd6cf481eb9`: **passed 6,331/6,331 tests across 589/589 suites, zero final failures, with six suite retries**. The lifecycle, MCP agent wait, git worktree creation receipt, MCP code-structure worktree, OMP smoke-script, and remote-session suites all passed on their second attempt. This is a pass under the runner's retry policy, not a clean first attempt. No source or documentation edits were made during this run.
+- **Open, not changed here.**
+  - OracleB R2 retained:
+    - R1-02 (P2): during a Stop of event-task recovery, an unmarked settlement still adds a failure item;
+    - R1-03's `items.last` heuristic (P3);
+    - R1-04 (P3).
+  - OracleB R2 raised:
+    - N2-01 (P3): the generation also counts attempts that are not real successors;
+    - N2-02 (P3): three copies of the superseded check.
+  - B3-07, B3-08 and B3-09 remain as listed above.
+
+## Phase 3 final review and acceptance record (2026-10-05)
+
+- Only OracleA and OracleB performed code review. Every re-review used a fresh lane scoped to prior findings and their evidence. R1's patch-file slice did not package the raw delta; R2 and R3 embedded the actual delta directly, resolving that review-material omission. Preset identities were verified on delivery.
+- OracleA explicitly closed CR3-01 in R2 (local evidence identifier: `oracle-review-2026-10-05-091333-phase-3-r2-oraclea-2-9baa.md`). In R3, chat `phase-3-r3-oraclea-55AA59`, it closed R1-01 and retained closure of CR3-01/CR3-02, with no fix-induced P0/P1 regression.
+- OracleB R3, chat `phase-3-r3-oracleb-3F4CC2`, explicitly closed R1-01 and accepted the code, retaining the earlier closures and nonblocking findings above. Neither lane has an open P0/P1. Review acceptance is not live reliability acceptance.
+- Both R3 reviews saw the failed final-source full-root attempt. The subsequent passing run `370f0ed5-102b-4878-a58e-2bd6cf481eb9` supplies that missing evidence without further code changes. The OMP attribution and harness classification requested by OracleB are recorded above.
+- Nonblocking R3 notes remain follow-ups, not another review loop: ownership permits an already-nil run ID; the `run_id_preserved` test tag is inferred through dispatch; real-error failure after recovered resume and the in-run auth-recovery variant lack dedicated new coverage.
+- The existing unrelated ledger omission remains: `root/RepoPromptTests.AgentDelegationPolicyTests/testPairReviewRemediationGuidanceMatchesDelegationAudienceAcrossProviders`. No ledger regeneration or unrelated test change was made.
+- No real user turn or visible app lifecycle was exercised. §7.3 requires owner-approved, fingerprinted packaged-app verification before claiming end-to-end cold-resume reliability.
+
+The sections below retain the phased contract with implementation clarifications; code review is complete, while full live reliability acceptance remains pending.
 Decision process: two independent Oracle lanes (OracleE and OracleD) received the same brief with verified file:line evidence and four binding user decisions. Material disagreements were relayed anonymously for two challenge rounds (§8). Every point converged except one narrow item (§8.6), which is recorded with both positions and a recommendation.
 
 ## 1. Outcome and scope
