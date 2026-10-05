@@ -54,4 +54,11 @@ actor AsyncMutex {
         // Resume with true — caller IS granted the lock.
         next.continuation.resume(returning: true)
     }
+
+    #if DEBUG
+        /// Number of tasks queued for the lock (excludes the current holder).
+        var test_waiterCount: Int {
+            waiters.count
+        }
+    #endif
 }

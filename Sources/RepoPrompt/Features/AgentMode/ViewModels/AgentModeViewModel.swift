@@ -2466,6 +2466,7 @@ final class AgentModeViewModel: ObservableObject {
             testCodexStallWatchdogRecoveryThreshold: TimeInterval? = nil,
             testCodexStallWatchdogInactivityThreshold: TimeInterval? = nil,
             testCodexTransportClosedRecoveryGraceInterval: TimeInterval? = nil,
+            testCodexAuthRecovery: (any CodexManagedAuthRecovering)? = nil,
             testUsesProductionAgentDefaultsAndModelPolling: Bool = false,
             remoteHostRegistry: RemoteHostRegistry = .shared,
             remoteHostCatalog: RemoteHostCatalog = .shared,
@@ -2525,6 +2526,7 @@ final class AgentModeViewModel: ObservableObject {
                 codexControllerFactory: codexControllerFactory,
                 connectionPolicyInstaller: connectionPolicyInstaller,
                 shouldManageCodexTooling: shouldManageCodexTooling,
+                authRecovery: testCodexAuthRecovery ?? CodexManagedAuthRecoveryService.shared,
                 activeToolQuery: testCodexActiveToolQuery
                     ?? { [weak testMCPServer] runID in
                         testMCPServer?.hasActiveToolExecutions(runID: runID) ?? false

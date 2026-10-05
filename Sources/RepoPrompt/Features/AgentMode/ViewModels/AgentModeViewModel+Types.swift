@@ -728,6 +728,9 @@ extension AgentModeViewModel {
         var requiresColdTeardownOnCancel: Bool = false
     }
 
+    /// Consecutive `thread/resume` timeouts for one saved target. It only drives failure guidance
+    /// and never changes which request is sent. It resets on success, a target change, or a
+    /// failure that is neither a timeout nor a cancellation; Stop leaves it unchanged.
     struct CodexResumeTimeoutState: Equatable {
         var conversationID: String?
         var rolloutPath: String?

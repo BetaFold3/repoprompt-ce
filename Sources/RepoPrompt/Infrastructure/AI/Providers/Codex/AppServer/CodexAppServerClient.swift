@@ -290,6 +290,32 @@ actor CodexAppServerClient {
     private struct PendingRequestMetadata {
         let method: String
         let transportGeneration: UInt64
+        let cancellationMarker: RequestCancellationMarker
+    }
+
+    /// Set synchronously by a request's cancellation handler, before the actor hop that removes the
+    /// pending request. A failure that reaches the request after that point (transport teardown,
+    /// timeout, write failure, or an error response) settles it as `CancellationError`, because the
+    /// caller's cancellation came first. A failure that settled earlier is unaffected.
+    private final class RequestCancellationMarker: @unchecked Sendable {
+        private let lock = NSLock()
+        private var cancelled = false
+
+        func markCancelled() {
+            lock.lock()
+            cancelled = true
+            lock.unlock()
+        }
+
+        var isCancelled: Bool {
+            lock.lock()
+            defer { lock.unlock() }
+            return cancelled
+        }
+    }
+
+    private static func settlementError(_ error: Error, for metadata: PendingRequestMetadata?) -> Error {
+        metadata?.cancellationMarker.isCancelled == true ? CancellationError() : error
     }
 
     private struct TerminatingTransport {
@@ -686,10 +712,11 @@ actor CodexAppServerClient {
         }
         timeoutTasks.removeAll()
         let requests = pendingRequests
+        let requestMetadata = pendingRequestMetadata
         pendingRequests.removeAll()
         pendingRequestMetadata.removeAll()
-        for continuation in requests.values {
-            continuation.resume(throwing: requestFailure)
+        for (requestID, continuation) in requests {
+            continuation.resume(throwing: Self.settlementError(requestFailure, for: requestMetadata[requestID]))
         }
 
         // 4. Finish all notification and serverRequest subscriber streams.
@@ -857,12 +884,14 @@ actor CodexAppServerClient {
         if let params {
             payload["params"] = params
         }
+        let cancellationMarker = RequestCancellationMarker()
         return try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { continuation in
                 pendingRequests[requestID] = continuation
                 pendingRequestMetadata[requestID] = PendingRequestMetadata(
                     method: method,
-                    transportGeneration: generation
+                    transportGeneration: generation,
+                    cancellationMarker: cancellationMarker
                 )
                 if let deadline {
                     scheduleTimeout(for: requestID, after: deadline)
@@ -878,6 +907,7 @@ actor CodexAppServerClient {
                 }
             }
         } onCancel: {
+            cancellationMarker.markCancelled()
             Task { await self.cancelPendingRequestIfPresent(id: requestID) }
         }
     }
@@ -1347,13 +1377,13 @@ actor CodexAppServerClient {
                     method: metadata?.method ?? "<unknown>",
                     errorObject: error
                 ) else {
-                    continuation.resume(throwing: ClientError.invalidResponse)
+                    continuation.resume(throwing: Self.settlementError(ClientError.invalidResponse, for: metadata))
                     return
                 }
                 if config.enableDebugLogging {
                     print("[CodexAppServer] Error for request \(idString): \(failure.message)")
                 }
-                continuation.resume(throwing: ClientError.requestFailed(failure))
+                continuation.resume(throwing: Self.settlementError(ClientError.requestFailed(failure), for: metadata))
                 return
             }
             if let method = json["method"] as? String,
@@ -1713,12 +1743,12 @@ actor CodexAppServerClient {
             )
             scheduleTransportCleanup(terminatingTransport)
         }
-        continuation.resume(throwing: ClientError.requestFailed(.init(
+        continuation.resume(throwing: Self.settlementError(ClientError.requestFailed(.init(
             method: metadata?.method ?? "<unknown>",
             code: nil,
             message: "Request timed out after \(timeout)s",
             data: nil
-        )))
+        )), for: metadata))
     }
 
     private func cancelTimeout(for requestID: String) {
@@ -1735,9 +1765,9 @@ actor CodexAppServerClient {
 
     private func failPendingRequestIfPresent(id: String, error: Error) {
         timeoutTasks.removeValue(forKey: id)?.cancel()
-        pendingRequestMetadata.removeValue(forKey: id)
+        let metadata = pendingRequestMetadata.removeValue(forKey: id)
         if let continuation = pendingRequests.removeValue(forKey: id) {
-            continuation.resume(throwing: error)
+            continuation.resume(throwing: Self.settlementError(error, for: metadata))
         }
     }
 

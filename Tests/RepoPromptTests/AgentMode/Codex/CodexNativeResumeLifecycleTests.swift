@@ -559,6 +559,395 @@ final class CodexNativeResumeLifecycleTests: XCTestCase {
         XCTAssertFalse(controller.hasActiveThread, "The failed resume must not bind the thread.")
     }
 
+    // MARK: - Cancellation before apply (Phase 3)
+
+    func testCancellationBeforeApplyThrowsCancellationAndCancelsBinding() async throws {
+        struct Row {
+            let name: String
+            let gatedMethod: String
+            let resumes: Bool
+            let expectedMethods: [String]
+        }
+        let rows = [
+            Row(name: "after resume response", gatedMethod: "thread/resume", resumes: true, expectedMethods: ["thread/resume"]),
+            Row(name: "after start response", gatedMethod: "thread/start", resumes: false, expectedMethods: ["thread/start"]),
+            Row(
+                name: "before apply",
+                gatedMethod: "thread/memoryMode/set",
+                resumes: true,
+                expectedMethods: ["thread/resume", "thread/memoryMode/set"]
+            )
+        ]
+        for row in rows {
+            let gate = ResumeTestGate()
+            let script = ResumeRequestScript { method, _, callIndex in
+                // The first gated request answers successfully although the starting task was
+                // cancelled while it was in flight: its response raced Stop.
+                if method == row.gatedMethod, callIndex == 0 {
+                    await gate.enterAndWait()
+                }
+                switch method {
+                case "thread/resume":
+                    return threadResponse(status: ["type": "idle"], turns: [])
+                case "thread/start":
+                    return threadResponse(id: "fresh-thread", status: ["type": "idle"], turns: nil)
+                default:
+                    return [:]
+                }
+            }
+            let (controller, _) = await makeController(script: script)
+            var backgroundRetryThreadIDs: [String] = []
+            controller.test_backgroundMemoryModeRetryObserver = { backgroundRetryThreadIDs.append($0) }
+
+            let startup = Task { () -> CodexNativeSessionController.SessionRef in
+                if row.resumes {
+                    return try await self.resume(controller)
+                }
+                return try await controller.startOrResume(existing: nil, baseInstructions: "Agent")
+            }
+            await gate.waitUntilEntered()
+            await controller.test_bufferNotificationDuringBinding(lifecycleNotification("turn/started", turnID: "turn-x"))
+            XCTAssertTrue(controller.test_isBindingSession, row.name)
+            XCTAssertEqual(controller.test_bufferedInboundCount, 1, row.name)
+            startup.cancel()
+            await gate.release()
+
+            do {
+                _ = try await startup.value
+                XCTFail("\(row.name): expected the cancelled startup to throw")
+            } catch is CancellationError {
+                // Expected.
+            } catch {
+                XCTFail("\(row.name): expected CancellationError, got \(error)")
+            }
+            XCTAssertEqual(script.methods, row.expectedMethods, "\(row.name): no RPC may follow the cancelled response")
+            XCTAssertFalse(controller.hasActiveThread, row.name)
+            XCTAssertNil(controller.lastKnownRuntimeStatus, "\(row.name): the snapshot must not be applied")
+            XCTAssertFalse(controller.test_isBindingSession, "\(row.name): the binding window must be cancelled")
+            XCTAssertEqual(controller.test_bufferedInboundCount, 0, "\(row.name): buffered inbound must be discarded")
+            XCTAssertTrue(backgroundRetryThreadIDs.isEmpty, row.name)
+
+            // The lifecycle returned to fresh, so the same controller can still resume.
+            let ref = try await resume(controller)
+            XCTAssertEqual(ref.conversationID, "saved-thread", row.name)
+            XCTAssertTrue(controller.hasActiveThread, row.name)
+            await controller.shutdown()
+        }
+    }
+
+    func testMemoryModeCancellationIsRethrownWithoutRetryWhileFailureStillDegrades() async throws {
+        struct Row {
+            let name: String
+            let cancelsStartup: Bool
+        }
+        for row in [Row(name: "cancelled", cancelsStartup: true), Row(name: "failed", cancelsStartup: false)] {
+            let gate = ResumeTestGate()
+            let script = ResumeRequestScript { method, _, _ in
+                switch method {
+                case "thread/resume":
+                    return threadResponse(status: ["type": "idle"], turns: [])
+                case "thread/memoryMode/set":
+                    guard row.cancelsStartup else {
+                        throw ResumeLifecycleTestError.memoryModeUnavailable
+                    }
+                    // The in-flight request observes the cancelled task, as a real request does.
+                    await gate.enterAndWait()
+                    try Task.checkCancellation()
+                    return [:]
+                default:
+                    return [:]
+                }
+            }
+            let (controller, _) = await makeController(script: script)
+            var backgroundRetryThreadIDs: [String] = []
+            controller.test_backgroundMemoryModeRetryObserver = { backgroundRetryThreadIDs.append($0) }
+
+            let startup = Task { try await self.resume(controller) }
+            if row.cancelsStartup {
+                await gate.waitUntilEntered()
+                startup.cancel()
+                await gate.release()
+                do {
+                    _ = try await startup.value
+                    XCTFail("Expected the cancelled memory-mode request to fail startup")
+                } catch is CancellationError {
+                    // Expected.
+                } catch {
+                    XCTFail("Expected CancellationError, got \(error)")
+                }
+                XCTAssertEqual(
+                    script.requests("thread/memoryMode/set").count,
+                    1,
+                    "Cancellation is not a failed attempt and is not retried in the foreground."
+                )
+                XCTAssertTrue(backgroundRetryThreadIDs.isEmpty, "Cancellation must not schedule the background retry.")
+                XCTAssertFalse(controller.hasActiveThread)
+                XCTAssertFalse(controller.test_isBindingSession)
+            } else {
+                // Contrast: an ordinary failure keeps the optional-capability degradation.
+                let ref = try await startup.value
+                XCTAssertEqual(ref.conversationID, "saved-thread")
+                XCTAssertTrue(controller.hasActiveThread)
+                XCTAssertEqual(script.requests("thread/memoryMode/set").count, 2)
+                XCTAssertEqual(backgroundRetryThreadIDs, ["saved-thread"])
+            }
+            await controller.shutdown()
+        }
+    }
+
+    func testCancelledStartupCancelsBindingAfterWaitingForContendedEventMutex() async throws {
+        struct Row {
+            let name: String
+            let gatedMethod: String
+            let cancelsWhileApplyWaitsForLock: Bool
+            let expectedMethods: [String]
+        }
+        let rows = [
+            Row(
+                name: "cancelled after resume response",
+                gatedMethod: "thread/resume",
+                cancelsWhileApplyWaitsForLock: false,
+                expectedMethods: ["thread/resume"]
+            ),
+            Row(
+                name: "cancelled while apply waits for the lock",
+                gatedMethod: "thread/memoryMode/set",
+                cancelsWhileApplyWaitsForLock: true,
+                expectedMethods: ["thread/resume", "thread/memoryMode/set"]
+            )
+        ]
+        for row in rows {
+            let requestGate = ResumeTestGate()
+            let script = ResumeRequestScript { method, _, callIndex in
+                if method == row.gatedMethod, callIndex == 0 {
+                    await requestGate.enterAndWait()
+                }
+                switch method {
+                case "thread/resume":
+                    return threadResponse(status: ["type": "idle"], turns: [])
+                default:
+                    return [:]
+                }
+            }
+            let (controller, _) = await makeController(script: script)
+            var backgroundRetryThreadIDs: [String] = []
+            controller.test_backgroundMemoryModeRetryObserver = { backgroundRetryThreadIDs.append($0) }
+            let cleanupStarted = ResumeTestFlag()
+            controller.test_bindingCleanupObserver = { cleanupStarted.set() }
+
+            let startup = Task { try await self.resume(controller) }
+            let startupFinished = ResumeTestFlag()
+            let startupWatcher = Task {
+                _ = await startup.result
+                startupFinished.set()
+            }
+            await requestGate.waitUntilEntered()
+            await controller.test_bufferNotificationDuringBinding(lifecycleNotification("turn/started", turnID: "turn-x"))
+            XCTAssertTrue(controller.test_isBindingSession, row.name)
+            XCTAssertEqual(controller.test_bufferedInboundCount, 1, row.name)
+
+            // Another task holds the event mutex for the rest of the startup.
+            let holderGate = ResumeTestGate()
+            let holder = Task {
+                await controller.test_holdEventHandlingMutex { await holderGate.enterAndWait() }
+            }
+            await holderGate.waitUntilEntered()
+
+            if row.cancelsWhileApplyWaitsForLock {
+                await requestGate.release()
+                let applyQueued = await waitForCondition {
+                    await controller.test_eventHandlingMutexWaiterCount == 1
+                }
+                XCTAssertTrue(applyQueued, "\(row.name): the apply step must queue behind the holder")
+                startup.cancel()
+            } else {
+                startup.cancel()
+                await requestGate.release()
+            }
+
+            // Release the holder only once the binding cleanup is queued behind it (or startup has
+            // already finished, which happens only if the cleanup gave up on the contended lock).
+            let cleanupQueuedOrStartupFinished = await waitForCondition {
+                if startupFinished.isSet { return true }
+                guard cleanupStarted.isSet else { return false }
+                return await controller.test_eventHandlingMutexWaiterCount >= 1
+            }
+            XCTAssertTrue(cleanupQueuedOrStartupFinished, row.name)
+            XCTAssertFalse(startupFinished.isSet, "\(row.name): startup must wait for its binding cleanup")
+            XCTAssertTrue(cleanupStarted.isSet, row.name)
+            let queuedWaiterCount = await controller.test_eventHandlingMutexWaiterCount
+            XCTAssertEqual(queuedWaiterCount, 1, "\(row.name): only the binding cleanup waits for the lock")
+            XCTAssertTrue(controller.test_isBindingSession, "\(row.name): cleanup cannot run while the lock is held")
+            await holderGate.release()
+            await holder.value
+
+            do {
+                _ = try await startup.value
+                XCTFail("\(row.name): expected the cancelled startup to throw")
+            } catch is CancellationError {
+                // Expected.
+            } catch {
+                XCTFail("\(row.name): expected CancellationError, got \(error)")
+            }
+            await startupWatcher.value
+            XCTAssertEqual(script.methods, row.expectedMethods, row.name)
+            XCTAssertFalse(controller.hasActiveThread, row.name)
+            XCTAssertNil(controller.lastKnownRuntimeStatus, "\(row.name): the snapshot must not be applied")
+            XCTAssertFalse(controller.test_isBindingSession, "\(row.name): the binding window must close after the lock frees")
+            XCTAssertEqual(controller.test_bufferedInboundCount, 0, "\(row.name): buffered inbound must be discarded")
+            XCTAssertTrue(backgroundRetryThreadIDs.isEmpty, row.name)
+
+            let ref = try await resume(controller)
+            XCTAssertEqual(ref.conversationID, "saved-thread", row.name)
+            XCTAssertTrue(controller.hasActiveThread, row.name)
+            await controller.shutdown()
+        }
+    }
+
+    func testStopDuringRealResumeRequestSettlesAsCancellationBeforeShutdownCanFailIt() async throws {
+        struct Row {
+            let name: String
+            let cancelsBeforeShutdown: Bool
+        }
+        let rows = [
+            Row(name: "Stop: cancel the task, then shut the controller down", cancelsBeforeShutdown: true),
+            Row(name: "contrast: controller shutdown without cancellation", cancelsBeforeShutdown: false)
+        ]
+        for row in rows {
+            // Several fresh pairs cover executor interleavings between the request's cancellation
+            // handler and the shutdown that fails every still-pending request.
+            for iteration in 0 ..< 10 {
+                let label = "\(row.name) #\(iteration)"
+                let (controller, client) = await makeRealTransportController()
+                let startup = Task { try await self.resume(controller) }
+                let requestPending = await waitForCondition { await client.debugPendingRequestCount() == 1 }
+                XCTAssertTrue(requestPending, "\(label): thread/resume must be pending on the real client")
+                if row.cancelsBeforeShutdown {
+                    // Stop's order: cancel the run task, then shut the detached controller down.
+                    startup.cancel()
+                }
+                await controller.shutdown()
+                do {
+                    _ = try await startup.value
+                    XCTFail("\(label): expected the pending resume to fail")
+                } catch is CancellationError {
+                    XCTAssertTrue(row.cancelsBeforeShutdown, "\(label): only Stop's cancellation may settle quietly")
+                } catch {
+                    XCTAssertFalse(
+                        row.cancelsBeforeShutdown,
+                        "\(label): Stop must settle as CancellationError before shutdown fails the request, got \(error)"
+                    )
+                }
+                let pendingAfter = await client.debugPendingRequestCount()
+                XCTAssertEqual(pendingAfter, 0, label)
+                XCTAssertFalse(controller.hasActiveThread, label)
+                XCTAssertFalse(controller.test_isBindingSession, label)
+            }
+        }
+    }
+
+    func testCancelledStartOrResumeEntryMakesNoRequestOrBinding() async throws {
+        struct Row {
+            let name: String
+            let existing: CodexNativeSessionController.SessionRef?
+            let shutsDownFirst: Bool
+        }
+        let savedThread = CodexNativeSessionController.SessionRef(
+            conversationID: "saved-thread",
+            rolloutPath: "/tmp/saved-thread.jsonl",
+            model: nil,
+            reasoningEffort: nil
+        )
+        let rows = [
+            // The missing-rollout fallback's fresh start, reached after Stop.
+            Row(name: "fresh start on a cancelled task", existing: nil, shutsDownFirst: false),
+            Row(name: "resume on a cancelled task", existing: savedThread, shutsDownFirst: false),
+            // Stop's teardown already shut the controller down; this must not fail as a lifecycle error.
+            Row(name: "fresh start after Stop shut the controller down", existing: nil, shutsDownFirst: true)
+        ]
+        for row in rows {
+            let script = ResumeRequestScript { method, _, _ in
+                switch method {
+                case "thread/resume", "thread/start":
+                    threadResponse(status: ["type": "idle"], turns: [])
+                default:
+                    [:]
+                }
+            }
+            let (controller, _) = await makeController(script: script)
+            if row.shutsDownFirst {
+                await controller.shutdown()
+            }
+            let existing = row.existing
+            let attempt = Task { () async throws -> CodexNativeSessionController.SessionRef in
+                withUnsafeCurrentTask { $0?.cancel() }
+                return try await controller.startOrResume(existing: existing, baseInstructions: "Agent")
+            }
+            do {
+                _ = try await attempt.value
+                XCTFail("\(row.name): expected the cancelled call to throw")
+            } catch is CancellationError {
+                // Expected.
+            } catch {
+                XCTFail("\(row.name): expected CancellationError, got \(error)")
+            }
+            XCTAssertEqual(script.methods, [], "\(row.name): no RPC after cancellation")
+            XCTAssertFalse(controller.test_isBindingSession, row.name)
+            XCTAssertFalse(controller.hasActiveThread, row.name)
+            await controller.shutdown()
+        }
+    }
+
+    func testStopDuringStartupTurnListingSendsNoMemoryModeRequest() async throws {
+        struct Row {
+            let name: String
+            let listingFails: Bool
+        }
+        let rows = [
+            Row(name: "turn listing succeeds after Stop", listingFails: false),
+            // A non-transport failure normally degrades to an unresolved identity and continues.
+            Row(name: "turn listing degrades after Stop", listingFails: true)
+        ]
+        for row in rows {
+            let listGate = ResumeTestGate()
+            let script = ResumeRequestScript { method, _, _ in
+                switch method {
+                case "thread/resume":
+                    return threadResponse(status: ["type": "active", "activeFlags": []], turns: [])
+                case "thread/turns/list":
+                    await listGate.enterAndWait()
+                    if row.listingFails {
+                        throw ResumeLifecycleTestError.resumeUnavailable
+                    }
+                    return ["data": []]
+                default:
+                    return [:]
+                }
+            }
+            let (controller, _) = await makeController(script: script)
+            var backgroundRetryThreadIDs: [String] = []
+            controller.test_backgroundMemoryModeRetryObserver = { backgroundRetryThreadIDs.append($0) }
+            let startup = Task { try await self.resume(controller) }
+            await listGate.waitUntilEntered()
+            startup.cancel()
+            await listGate.release()
+            do {
+                _ = try await startup.value
+                XCTFail("\(row.name): expected the cancelled startup to throw")
+            } catch is CancellationError {
+                // Expected.
+            } catch {
+                XCTFail("\(row.name): expected CancellationError, got \(error)")
+            }
+            XCTAssertEqual(script.methods, ["thread/resume", "thread/turns/list"], row.name)
+            XCTAssertFalse(controller.hasActiveThread, row.name)
+            XCTAssertNil(controller.lastKnownRuntimeStatus, row.name)
+            XCTAssertFalse(controller.test_isBindingSession, row.name)
+            XCTAssertTrue(backgroundRetryThreadIDs.isEmpty, row.name)
+            await controller.shutdown()
+        }
+    }
+
     func testThreadStatusNotificationUpdatesLastKnownRuntimeStatus() async throws {
         let script = ResumeRequestScript { method, _, _ in
             guard method == "thread/resume" else { return [:] }
@@ -958,6 +1347,33 @@ final class CodexNativeResumeLifecycleTests: XCTestCase {
         return (controller, client)
     }
 
+    /// A controller whose requests go through the real `CodexAppServerClient` request path over
+    /// the debug test transport, and which stops that client on shutdown as Agent Mode does. Frames
+    /// are accepted without a reader (the debug transport has none), so requests stay pending.
+    private func makeRealTransportController() async -> (CodexNativeSessionController, CodexAppServerClient) {
+        let client = CodexAppServerClient(writeFrameHandler: { _, _ in }, livenessProbe: { _ in true })
+        await client.debugInstallTestTransport()
+        let options = CodexNativeSessionController.Options(
+            requestTimeout: 30,
+            configOverridesProvider: { [:] },
+            launchEnvironmentProvider: { [:] },
+            approvalPolicyProvider: { .never },
+            sandboxModeProvider: { .readOnly },
+            approvalReviewerProvider: { .user },
+            authTokensRefreshHandler: nil
+        )
+        let controller = CodexNativeSessionController(
+            client: client,
+            runID: UUID(),
+            tabID: UUID(),
+            windowID: 1,
+            workspacePath: "/tmp/workspace",
+            options: options,
+            clientShutdownBehavior: .stopOnShutdown
+        )
+        return (controller, client)
+    }
+
     private func resume(_ controller: CodexNativeSessionController) async throws -> CodexNativeSessionController.SessionRef {
         try await controller.startOrResume(
             existing: .init(
@@ -968,6 +1384,15 @@ final class CodexNativeResumeLifecycleTests: XCTestCase {
             ),
             baseInstructions: "Agent"
         )
+    }
+
+    /// Polls `condition` until it holds or about five seconds pass.
+    private func waitForCondition(_ condition: () async -> Bool) async -> Bool {
+        for _ in 0 ..< 5000 {
+            if await condition() { return true }
+            try? await Task.sleep(nanoseconds: 1_000_000)
+        }
+        return false
     }
 
     private func assertResumeUnavailable(
@@ -1050,6 +1475,7 @@ private func lifecycleNotification(
 
 private enum ResumeLifecycleTestError: Error {
     case resumeUnavailable
+    case memoryModeUnavailable
 }
 
 private final class ControllerBox: @unchecked Sendable {
@@ -1100,6 +1526,23 @@ private final class ResumeRequestScript: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         return recorded.filter { $0.method == method }
+    }
+}
+
+private final class ResumeTestFlag: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value = false
+
+    func set() {
+        lock.lock()
+        value = true
+        lock.unlock()
+    }
+
+    var isSet: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return value
     }
 }
 
