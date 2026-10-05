@@ -58,7 +58,7 @@ enum RepoPromptMCPInstructions {
 
         DELEGATION: Follow the system prompt's named control tool when a fresh Agent Mode session or read-only probe is useful.
 
-        EXPORT SHARING: Set `export_response: true` on `context_builder` or `ask_oracle`. The result includes `oracle_export_path` and `oracle_export_instruction`. Pass the exported path or instruction in the delegated child's `message`; the child can open it with `read_file`.
+        EXPORT SHARING: Set `export_response: true` on `context_builder` or a single `ask_oracle` send; for `consultations` lanes, use `response_mode` tail or none. The result includes `oracle_export_path` and `oracle_export_instruction`. Pass the exported path or instruction in the delegated child's `message`; the child can open it with `read_file`.
         """
     }
 

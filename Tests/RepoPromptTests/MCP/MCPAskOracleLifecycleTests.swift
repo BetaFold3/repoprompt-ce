@@ -360,7 +360,8 @@ final class MCPAskOracleLifecycleTests: XCTestCase {
     private func batchConsultations(
         fixture: Fixture,
         count: Int,
-        responseModeForLast: String? = nil
+        responseModeForLast: String? = nil,
+        responseModesByIndex: [Int: String] = [:]
     ) -> Value {
         .array((0 ..< count).map { index in
             var lane: [String: Value] = [
@@ -371,6 +372,9 @@ final class MCPAskOracleLifecycleTests: XCTestCase {
             ]
             if index == count - 1, let responseModeForLast {
                 lane["response_mode"] = .string(responseModeForLast)
+            }
+            if let responseMode = responseModesByIndex[index] {
+                lane["response_mode"] = .string(responseMode)
             }
             return .object(lane)
         })
@@ -1631,6 +1635,78 @@ final class MCPAskOracleLifecycleTests: XCTestCase {
                 XCTAssertEqual(fixture.store.test_recordCount(), 0)
                 XCTAssertEqual(fixture.harness.openedStreamCount, 0)
             }
+
+            // Rejections are actionable: export_response points at per-lane response_mode
+            // export, misplaced lane fields point inside consultations[], and request_id is
+            // only mentioned when the caller actually supplied it.
+            let laneExportGuidance = [
+                "export_response is single-send only",
+                "response_mode",
+                "\"tail\"",
+                "oracle_export_path",
+                "oracle_export_instruction"
+            ]
+            let diagnosticCases: [(args: [String: Value], contains: [String], excludes: [String])] = [
+                (
+                    [
+                        "consultations": batchConsultations(fixture: fixture, count: 1),
+                        "timeout_seconds": .int(0),
+                        "export_response": .bool(true)
+                    ],
+                    ["Unsupported args: export_response."] + laneExportGuidance
+                        + ["\"model\":\"<preset UUID>\",\"response_mode\":\"tail\"}]}"],
+                    ["request_id"]
+                ),
+                (
+                    [
+                        "consultations": batchConsultations(fixture: fixture, count: 1),
+                        "timeout_seconds": .int(0),
+                        "export_response": .bool(true),
+                        "request_id": .string(UUID().uuidString)
+                    ],
+                    laneExportGuidance + ["request_id is also unsupported", "op:\"wait\""],
+                    []
+                ),
+                (
+                    [
+                        "consultations": batchConsultations(fixture: fixture, count: 1),
+                        "timeout_seconds": .int(0),
+                        "message": .string("misplaced root message")
+                    ],
+                    ["Unsupported args: message.", "inside each consultations[] item", "\"model\":\"<preset UUID>\"}]}"],
+                    ["request_id", "export_response is single-send only", "\"response_mode\":\"tail\""]
+                ),
+                (
+                    [
+                        "consultations": .array([
+                            .object([
+                                "message": .string("lane"),
+                                "model": .string(fixture.preset.id.uuidString),
+                                "export_response": .bool(true)
+                            ])
+                        ]),
+                        "timeout_seconds": .int(0)
+                    ],
+                    ["consultations[0] only accepts", "Unsupported: export_response"] + laneExportGuidance,
+                    ["request_id"]
+                )
+            ]
+            for diagnosticCase in diagnosticCases {
+                do {
+                    _ = try await fixture.call(diagnosticCase.args)
+                    XCTFail("invalid batch must fail before admission: \(diagnosticCase.args.keys.sorted())")
+                } catch {
+                    let message = error.localizedDescription
+                    for fragment in diagnosticCase.contains {
+                        XCTAssertTrue(message.contains(fragment), "missing \(fragment) in: \(message)")
+                    }
+                    for fragment in diagnosticCase.excludes {
+                        XCTAssertFalse(message.contains(fragment), "unexpected \(fragment) in: \(message)")
+                    }
+                }
+                XCTAssertEqual(fixture.store.test_recordCount(), 0)
+                XCTAssertEqual(fixture.harness.openedStreamCount, 0)
+            }
         }
     }
 
@@ -2311,11 +2387,18 @@ final class MCPAskOracleLifecycleTests: XCTestCase {
     func testQueuedBatchCancellationSpendsNothingAndDeliversIndexedTerminalLane() async throws {
         try await withFixture { fixture in
             try fixture.activateAgentRunForBatch()
+            fixture.window.mcpServer.setOracleExportOverrideForTesting { request in
+                OracleExportFile(
+                    path: "/tmp/oracle-batch-\(request.chatID ?? "chat").md",
+                    instruction: "read batch lane \(request.chatID ?? "chat")"
+                )
+            }
             let batch = try await fixture.call([
                 "consultations": batchConsultations(
                     fixture: fixture,
                     count: 3,
-                    responseModeForLast: "tail"
+                    responseModeForLast: "tail",
+                    responseModesByIndex: [1: "none"]
                 ),
                 "timeout_seconds": .int(0)
             ])
@@ -2355,6 +2438,28 @@ final class MCPAskOracleLifecycleTests: XCTestCase {
             try await fixture.waitUntilTerminal(operationIDs[0])
             try await fixture.waitUntilTerminal(operationIDs[1])
             XCTAssertEqual(fixture.harness.openedStreamCount, 2, "cancelled queued work never starts a provider")
+
+            // Per-lane presentation: the full lane stays inline, while the trimmed lane is
+            // the batch export path and carries its own shareable export fields.
+            let completed = try await fixture.call([
+                "op": .string("wait"),
+                "operation_ids": .array(operationIDs[0 ... 1].map { .string($0.uuidString) }),
+                "timeout_seconds": .int(0)
+            ])
+            let completedLanes = try lanes(in: completed)
+            XCTAssertEqual(completedLanes.map { $0["index"]?.intValue }, [0, 1])
+            XCTAssertEqual(completedLanes[0]["response"]?.stringValue, "first")
+            XCTAssertNil(completedLanes[0]["oracle_export_path"])
+            XCTAssertNil(completedLanes[0]["oracle_export_instruction"])
+            let trimmedLane = completedLanes[1]
+            XCTAssertEqual(trimmedLane["status"]?.stringValue, "completed")
+            XCTAssertEqual(trimmedLane["response_mode"]?.stringValue, "none")
+            XCTAssertNil(trimmedLane["response"])
+            let exportPath = try XCTUnwrap(trimmedLane["oracle_export_path"]?.stringValue)
+            XCTAssertTrue(exportPath.hasPrefix("/tmp/oracle-batch-"))
+            XCTAssertEqual(trimmedLane["export_path"]?.stringValue, exportPath)
+            let exportInstruction = try XCTUnwrap(trimmedLane["oracle_export_instruction"]?.stringValue)
+            XCTAssertTrue(exportInstruction.hasPrefix("read batch lane "))
         }
     }
 

@@ -1115,7 +1115,18 @@ final class AgentDelegationPolicyTests: XCTestCase {
                 XCTAssertTrue(prompt.contains("main → worker → sub-worker"), label)
                 XCTAssertTrue(prompt.contains("prefer a Pair worker"), label)
                 XCTAssertTrue(prompt.contains("oracle_export_path"), label)
+                // Tool names are provider-qualified for some agents, so match the
+                // provider-neutral scoping phrases.
+                XCTAssertTrue(prompt.contains("sends only and is rejected with `consultations`"), label)
+                XCTAssertTrue(prompt.contains("set that lane's `response_mode` to `tail` or `none`"), label)
             }
+            let nilRolePrompt = SystemPromptService.agentModePrompt(agentKind: agentKind)
+            XCTAssertTrue(
+                nilRolePrompt.contains(
+                    "export_response:true on a single send (a consultations lane uses response_mode tail or none)"
+                ),
+                "\(agentKind.rawValue)/nil-role"
+            )
         }
     }
 
@@ -1178,6 +1189,7 @@ final class AgentDelegationPolicyTests: XCTestCase {
                 }
                 XCTAssertFalse(prompt.contains("prefer a Pair worker"), label)
                 XCTAssertFalse(prompt.contains("oracle_export_instruction"), label)
+                XCTAssertFalse(prompt.contains("To share a batch lane"), label)
                 XCTAssertFalse(prompt.contains("When to dispatch"), label)
                 XCTAssertFalse(prompt.contains("spawn_agent"), label)
             }

@@ -354,6 +354,15 @@ enum AgentModePrompts {
         // caller-facing copy outside of the `.both` fragments — only that
         // audience sees both tools.
 
+        /// Shared by every delegating audience's export guidance: `export_response` is a
+        /// single-send `ask_oracle` argument, while batch lanes export via `response_mode`.
+        static let batchLaneExportNote = """
+        - `export_response` is for single `ask_oracle` sends only and is rejected with \
+        `consultations`. To share a batch lane, set that lane's `response_mode` to \
+        `tail` or `none`; its result includes its own `oracle_export_path` and \
+        `oracle_export_instruction`.
+        """
+
         /// Guidance for callers that have `agent_run` (top-level agent
         /// surface / external MCP client). Never names `agent_explore`.
         static let agentRunExportGuidance = """
@@ -363,6 +372,7 @@ enum AgentModePrompts {
         field is a ready-made sentence ("Read the Oracle export at `<path>` with \
         `read_file` …") you can emit verbatim at the head of that `message`. \
         The child agent already has `read_file`; it will open the export itself.
+        \(batchLaneExportNote)
         """
 
         /// Guidance for non-explore sub-agents that see `agent_explore`
@@ -375,6 +385,7 @@ enum AgentModePrompts {
         Oracle export at `<path>` with `read_file` …") you can emit verbatim at \
         the head of that message. The child already has `read_file`; it will \
         open the export itself.
+        \(batchLaneExportNote)
         """
 
         /// Proactive-use guidance for callers that see `agent_run`
@@ -432,6 +443,7 @@ enum AgentModePrompts {
         `oracle_export_instruction` field is a ready-made "Read the Oracle \
         export at `<path>` with `read_file` …" sentence you can emit verbatim \
         at the head of that message.
+        \(batchLaneExportNote)
         """
 
         /// Bounded-delegation contract shown to callers that can still start agents.

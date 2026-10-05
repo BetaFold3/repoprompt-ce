@@ -116,6 +116,10 @@ final class ClaudeAgentModeCoordinator {
         case ready
         case retry
         case deferred
+        /// A genuine Auto effort change cannot apply until the controller's current turn
+        /// settles. Dispatch may await a just-interrupted turn's authoritative completion;
+        /// other callers keep treating this as deferred.
+        case awaitingTurnIdle
     }
 
     private static let logger = Logger(subsystem: "com.repoprompt.agents", category: "ClaudeSteering")
@@ -130,6 +134,7 @@ final class ClaudeAgentModeCoordinator {
     private let hasActiveMCPTools: MCPActiveToolQuery
     private let hasActiveChildAgentRunWaits: ActiveAgentRunWaitQuery
     private let steeringInterruptSafePointTimeoutSeconds: TimeInterval
+    private var interruptedTurnSettlementTimeoutSeconds: TimeInterval = 5.0
 
     /// Per-tab tool tracking handler for Claude sessions.
     /// Each tab gets its own handler instance to isolate correlation state across concurrent sessions.
@@ -1070,6 +1075,10 @@ final class ClaudeAgentModeCoordinator {
             toolHandlerByTabID[session.tabID]?.currentTrackedRunID
         }
 
+        func test_setInterruptedTurnSettlementTimeoutSeconds(_ seconds: TimeInterval) {
+            interruptedTurnSettlementTimeoutSeconds = seconds
+        }
+
         func test_setStopToolTrackingGate(_ gate: (() async -> Void)?) {
             testStopToolTrackingGate = gate
         }
@@ -1707,6 +1716,15 @@ final class ClaudeAgentModeCoordinator {
                     continue
                 case .deferred:
                     return false
+                case .awaitingTurnIdle:
+                    guard await awaitInterruptedTurnSettlement(
+                        session: session,
+                        controller: controller,
+                        dispatchReservation: dispatchReservation
+                    ) else {
+                        return false
+                    }
+                    continue
                 }
                 guard sessionOwnsClaudeController(controller, for: session) else {
                     continue
@@ -1744,6 +1762,15 @@ final class ClaudeAgentModeCoordinator {
                     continue
                 case .deferred:
                     return false
+                case .awaitingTurnIdle:
+                    guard await awaitInterruptedTurnSettlement(
+                        session: session,
+                        controller: controller,
+                        dispatchReservation: dispatchReservation
+                    ) else {
+                        return false
+                    }
+                    continue
                 }
                 guard sessionOwnsClaudeController(controller, for: session) else {
                     continue
@@ -1826,6 +1853,46 @@ final class ClaudeAgentModeCoordinator {
         session.appendItem(errorItem)
         finalizeSession(session, state: .failed, save: true)
         return false
+    }
+
+    /// An acknowledged interrupt does not end the provider turn; the authoritative
+    /// result does. When a genuine Auto effort change needs the controller idle, wait a
+    /// bounded time for that settlement while this dispatch still owns the reservation
+    /// and controller. Returning false is a real delivery failure (timeout, cancellation,
+    /// supersession, or ownership loss), so callers restore drafts as before.
+    private func awaitInterruptedTurnSettlement(
+        session: AgentModeViewModel.TabSession,
+        controller: any NativeAgentRuntimeControlling,
+        dispatchReservation: DispatchReservation
+    ) async -> Bool {
+        let deadline = ContinuousClock.now.advanced(
+            by: .milliseconds(Int64(interruptedTurnSettlementTimeoutSeconds * 1000))
+        )
+        while true {
+            guard dispatchReservationIsCurrent(dispatchReservation, for: session),
+                  sessionOwnsClaudeController(controller, for: session)
+            else {
+                return false
+            }
+            let stillInFlight = await controller.hasTurnInFlight
+            guard dispatchReservationIsCurrent(dispatchReservation, for: session),
+                  sessionOwnsClaudeController(controller, for: session)
+            else {
+                return false
+            }
+            guard stillInFlight else { return true }
+            guard ContinuousClock.now < deadline else {
+                Self.logger.error(
+                    "Claude Auto steering timed out awaiting interrupted turn settlement tab=\(session.tabID.uuidString, privacy: .public) runID=\(dispatchReservation.runID.uuidString, privacy: .public)"
+                )
+                return false
+            }
+            do {
+                try await Task.sleep(nanoseconds: 25_000_000)
+            } catch {
+                return false
+            }
+        }
     }
 
     private func interruptClaudeTurnIfNeeded(
@@ -2341,12 +2408,29 @@ final class ClaudeAgentModeCoordinator {
         ) else {
             return .deferred
         }
+
+        // Same controller, same launch settings, and the desired effort already
+        // acknowledged: nothing needs to change, so an in-flight (for example, just
+        // interrupted and still settling) turn does not have to reach idle first.
+        let controllerIdentifier = ObjectIdentifier(expectedController as AnyObject)
+        let effortLevel = currentClaudeEffortLevel(for: session)
+        if !hasEffectiveClaudeControllerLaunchSettingsMismatch(for: session),
+           let acknowledged = controllerEffortEvidenceByTabID[session.tabID],
+           acknowledged.controllerIdentifier == controllerIdentifier,
+           acknowledged.acknowledgedEffort == effortLevel
+        {
+            if let active = currentPermissionAcknowledgement(for: session) {
+                publishClaudePermissionState(.acknowledged(active), for: session)
+            }
+            return .ready
+        }
+
         guard !hasTurnInFlight else {
             markAutoIntentPending(
                 for: session,
                 reason: "Effort change pending — applies before the next turn."
             )
-            return .deferred
+            return .awaitingTurnIdle
         }
 
         guard !hasEffectiveClaudeControllerLaunchSettingsMismatch(for: session) else {
@@ -2355,18 +2439,6 @@ final class ClaudeAgentModeCoordinator {
                 reason: "Claude Auto model, backend, or permission change pending — applies before the next turn."
             )
             return .retry
-        }
-
-        let controllerIdentifier = ObjectIdentifier(expectedController as AnyObject)
-        let effortLevel = currentClaudeEffortLevel(for: session)
-        if let acknowledged = controllerEffortEvidenceByTabID[session.tabID],
-           acknowledged.controllerIdentifier == controllerIdentifier,
-           acknowledged.acknowledgedEffort == effortLevel
-        {
-            if let active = currentPermissionAcknowledgement(for: session) {
-                publishClaudePermissionState(.acknowledged(active), for: session)
-            }
-            return .ready
         }
 
         let model = effectiveClaudeModel(for: session)

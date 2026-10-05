@@ -1176,7 +1176,10 @@ struct MCPOracleToolService {
             .sorted()
         if !unsupported.isEmpty {
             throw MCPError.invalidParams(
-                "ask_oracle consultations is mutually exclusive with the single-send parameter set and accepts only consultations, require_distinct, op, and timeout_seconds. Unsupported args: \(unsupported.joined(separator: ", ")). Batch request_id is unsupported."
+                Self.batchUnsupportedArgsMessage(
+                    unsupported: unsupported,
+                    requestIDSupplied: args["request_id"] != nil
+                )
             )
         }
         if args["request_id"] != nil {
@@ -1307,6 +1310,29 @@ struct MCPOracleToolService {
         let responseMode: OracleResponseMode
     }
 
+    /// Batch roots are strict and reject before admission; the message names the supported
+    /// shape and only mentions `request_id` or export guidance when the caller supplied them.
+    static func batchUnsupportedArgsMessage(unsupported: [String], requestIDSupplied: Bool) -> String {
+        var message = "ask_oracle consultations is mutually exclusive with the single-send parameter set and accepts only consultations, require_distinct, op, and timeout_seconds. Unsupported args: \(unsupported.joined(separator: ", "))."
+        if unsupported.contains("export_response") {
+            message += " " + batchLaneExportGuidance
+        }
+        let laneFields: Set = ["message", "model", "mode", "chat_name", "response_mode"]
+        if unsupported.contains(where: laneFields.contains) {
+            message += " Put message, model, mode, chat_name, and response_mode inside each consultations[] item."
+        }
+        if requestIDSupplied {
+            message += " request_id is also unsupported for batches; recover accepted lanes with op:\"wait\" rather than resending."
+        }
+        // Only suggest a trimmed response_mode when the caller was trying to export;
+        // otherwise the correction would silently change full-response presentation.
+        let exampleResponseMode = unsupported.contains("export_response") ? ",\"response_mode\":\"tail\"" : ""
+        message += " Example: {\"consultations\":[{\"message\":\"...\",\"model\":\"<preset UUID>\"\(exampleResponseMode)}]}."
+        return message
+    }
+
+    static let batchLaneExportGuidance = "export_response is single-send only. To export a batch lane, set that lane's response_mode to \"tail\" or \"none\"; its result then includes oracle_export_path and oracle_export_instruction."
+
     private func parseConsultationItem(
         _ object: [String: Value],
         index: Int
@@ -1314,9 +1340,11 @@ struct MCPOracleToolService {
         let allowed: Set = ["message", "model", "mode", "chat_name", "response_mode"]
         let unsupported = object.keys.filter { !allowed.contains($0) }.sorted()
         if !unsupported.isEmpty {
-            throw MCPError.invalidParams(
-                "consultations[\(index)] only accepts: message, model, mode, chat_name, response_mode. Unsupported: \(unsupported.joined(separator: ", "))"
-            )
+            var message = "consultations[\(index)] only accepts: message, model, mode, chat_name, response_mode. Unsupported: \(unsupported.joined(separator: ", "))"
+            if unsupported.contains("export_response") {
+                message += ". " + Self.batchLaneExportGuidance
+            }
+            throw MCPError.invalidParams(message)
         }
 
         let message = (object["message"]?.stringValue ?? "")

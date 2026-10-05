@@ -400,6 +400,530 @@ extension AgentModeRunServiceLifecycleTests {
         )
     }
 
+    func testAutoSteeringSurvivesInterruptAcknowledgementBeforeOldTurnCompletion() async {
+        await assertSteeringSurvivesInterruptAcknowledgementBeforeOldTurnCompletion(
+            profile: .providerOverride(.claude(.auto))
+        )
+    }
+
+    func testFullAccessSteeringSurvivesInterruptAcknowledgementBeforeOldTurnCompletion() async {
+        await assertSteeringSurvivesInterruptAcknowledgementBeforeOldTurnCompletion(
+            profile: .providerOverride(.claude(.fullAccess))
+        )
+    }
+
+    private func assertSteeringSurvivesInterruptAcknowledgementBeforeOldTurnCompletion(
+        profile: AgentProviderPermissionProfile
+    ) async {
+        let recorder = LifecycleRecorder()
+        let initialResponse = expectation(description: "Runner consumes the initial turn")
+        let oldCompletionProcessed = expectation(description: "Runner consumes old completion or publishes terminal state")
+        var observedInitialResponse = false
+        var observedOldCompletion = false
+        var observeTerminalPublication = true
+        var terminalStates: [AgentSessionRunState] = []
+        let controller = LifecycleFakeNativeController(
+            recorder: recorder,
+            emittedAssistantTextOnSend: "initial response",
+            interruptOutcome: .acknowledged
+        )
+        let harness = makeHarness(
+            recorder: recorder,
+            claudeController: controller,
+            publishTerminalCommit: { session, _ in
+                guard observeTerminalPublication else { return }
+                terminalStates.append(session.runState)
+                if !observedOldCompletion {
+                    observedOldCompletion = true
+                    oldCompletionProcessed.fulfill()
+                }
+            },
+            handleHeadlessStreamResult: { result in
+                if result.text == "initial response", !observedInitialResponse {
+                    observedInitialResponse = true
+                    initialResponse.fulfill()
+                }
+                if result.text == "after old completion", !observedOldCompletion {
+                    observedOldCompletion = true
+                    oldCompletionProcessed.fulfill()
+                }
+            },
+            autoSignalACPRouting: true
+        )
+        let effortService = harness.host.providerBindingService
+        let model = "opus"
+        let previousEffort = effortService.claudeEffortLevel(forModelRaw: model, agentKind: .claudeCode)
+        effortService.setClaudeEffortLevel(.high, forModelRaw: model, agentKind: .claudeCode)
+        defer {
+            effortService.setClaudeEffortLevel(previousEffort, forModelRaw: model, agentKind: .claudeCode)
+        }
+
+        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        session.selectedAgent = .claudeCode
+        session.selectedModelRaw = model
+        session.permissionProfile = profile
+        harness.host.test_installLiveSession(session)
+        let outcome = await harness.service.startRun(
+            tabID: session.tabID,
+            session: session,
+            initialUserMessage: "initial request",
+            initialMessageForRun: "initial request",
+            attachments: []
+        )
+        XCTAssertNil(outcome)
+        let agentTask = session.agentTask
+        await fulfillment(of: [initialResponse], timeout: 5)
+        guard let oldTurnID = session.claudeExpectedTurnIDs.first else {
+            XCTFail("The initial turn must be registered before steering")
+            observeTerminalPublication = false
+            await harness.service.cancelRun(
+                tabID: session.tabID, session: session, completion: .terminalTeardownCompleted
+            )
+            await agentTask?.value
+            return
+        }
+
+        // The real controller acknowledges interrupt before its authoritative result.
+        // Hold that result until the steering flush has made its readiness decision;
+        // no sleeps or scheduling luck determine which side of the race wins.
+        await controller.setTurnInFlight(true)
+        let instruction = makeClaudeSteeringInstruction(session: session, text: "coordination instruction")
+        session.pendingClaudeSteeringInstructions.append(instruction)
+        let accepted = await harness.service.submitQueuedClaudeSteeringIfSupported(session: session)
+        XCTAssertTrue(accepted)
+        await session.claudeSteeringFlushTask?.value
+
+        let turnStillInFlight = await controller.hasTurnInFlight
+        XCTAssertTrue(turnStillInFlight, "Interrupt ACK must not masquerade as old-turn completion")
+        XCTAssertEqual(recorder.events.count(where: { $0 == "claude:interrupt:interrupt" }), 1)
+        XCTAssertFalse(recorder.contains("draft:coordination instruction"), "Accepted steering must not be restored as a draft")
+        XCTAssertTrue(
+            session.claudeSupersedingProtectedTurnIDs.contains(oldTurnID),
+            "Accepted steering must keep protection until the old completion is consumed"
+        )
+
+        await controller.emitCancelledTurnCompletion(turnID: oldTurnID)
+        // FIFO sentinel distinguishes a swallowed old result from premature termination.
+        await controller.emitAssistantText("after old completion")
+        await fulfillment(of: [oldCompletionProcessed], timeout: 5)
+
+        let sentMessages = await controller.recordedSentMessages()
+        XCTAssertEqual(sentMessages, ["initial request", "coordination instruction"])
+        XCTAssertEqual(recorder.events.count(where: { $0 == "delivered" }), 1)
+        XCTAssertTrue(terminalStates.isEmpty, "The interrupted old turn must not publish a cancelled run")
+        XCTAssertEqual(session.runState, .running)
+        XCTAssertFalse(session.claudeExpectedTurnIDs.contains(oldTurnID))
+        XCTAssertEqual(session.claudeExpectedTurnIDs.count, 1, "Only the follow-up turn should remain outstanding")
+        XCTAssertTrue(session.pendingClaudeSteeringInstructions.isEmpty)
+
+        observeTerminalPublication = false
+        await harness.service.cancelRun(
+            tabID: session.tabID, session: session, completion: .terminalTeardownCompleted
+        )
+        await agentTask?.value
+    }
+
+    private enum InterruptedTurnSettlement {
+        case completes
+        case completesThenEffortApplicationFails
+        case completesThenFollowUpSendFails
+        case runCancelled
+        case timesOut
+    }
+
+    func testAutoSteeringAppliesEffortChangeAfterInterruptedTurnSettles() async {
+        await assertAutoSteeringEffortChangeAwaitsInterruptedTurnSettlement(.completes)
+    }
+
+    func testAutoSteeringCancelledWhileAwaitingInterruptedTurnSettlementRestoresDraft() async {
+        await assertAutoSteeringEffortChangeAwaitsInterruptedTurnSettlement(.runCancelled)
+    }
+
+    func testAutoSteeringRestoresDraftWhenInterruptedTurnNeverSettles() async {
+        await assertAutoSteeringEffortChangeAwaitsInterruptedTurnSettlement(.timesOut)
+    }
+
+    func testAutoSteeringEffortFailureAfterConsumedInterruptedTurnCancelsStrandedRun() async {
+        await assertAutoSteeringEffortChangeAwaitsInterruptedTurnSettlement(.completesThenEffortApplicationFails)
+    }
+
+    func testAutoSteeringSendFailureAfterConsumedInterruptedTurnCommitsFailedRun() async {
+        await assertAutoSteeringEffortChangeAwaitsInterruptedTurnSettlement(.completesThenFollowUpSendFails)
+    }
+
+    private func assertAutoSteeringEffortChangeAwaitsInterruptedTurnSettlement(
+        _ settlement: InterruptedTurnSettlement
+    ) async {
+        let recorder = LifecycleRecorder()
+        let initialResponse = expectation(description: "Runner consumes the initial turn")
+        let observesOldCompletion = settlement == .completes
+            || settlement == .completesThenEffortApplicationFails
+            || settlement == .completesThenFollowUpSendFails
+        let oldCompletionProcessed = observesOldCompletion
+            ? expectation(description: "Runner consumes old completion or publishes terminal state")
+            : nil
+        // Holds the post-settlement effort application until the runner has provably
+        // consumed the protected old completion, so the failure (of the apply itself, or of
+        // the send that follows it) lands after it.
+        let applyGate = settlement == .completesThenEffortApplicationFails
+            || settlement == .completesThenFollowUpSendFails
+            ? LifecycleAsyncGate()
+            : nil
+        var observedInitialResponse = false
+        var observedOldCompletion = false
+        var observeTerminalPublication = true
+        var terminalStates: [AgentSessionRunState] = []
+        let controller = LifecycleFakeNativeController(
+            recorder: recorder,
+            failSendsAfterSuccessCount: settlement == .completesThenFollowUpSendFails ? 1 : nil,
+            failApplyCount: settlement == .completesThenEffortApplicationFails ? 1 : 0,
+            emittedAssistantTextOnSend: "initial response",
+            interruptOutcome: .acknowledged,
+            rejectsEffortApplicationWhileTurnInFlight: true,
+            applyGate: applyGate
+        )
+        let harness = makeHarness(
+            recorder: recorder,
+            claudeController: controller,
+            publishTerminalCommit: { session, _ in
+                guard observeTerminalPublication else { return }
+                terminalStates.append(session.runState)
+                if !observedOldCompletion {
+                    observedOldCompletion = true
+                    oldCompletionProcessed?.fulfill()
+                }
+            },
+            handleHeadlessStreamResult: { result in
+                if result.text == "initial response", !observedInitialResponse {
+                    observedInitialResponse = true
+                    initialResponse.fulfill()
+                }
+                if result.text == "after old completion", !observedOldCompletion {
+                    observedOldCompletion = true
+                    oldCompletionProcessed?.fulfill()
+                }
+            },
+            autoSignalACPRouting: true
+        )
+        // Only the timeout case relies on the deadline; every other case uses a deadline
+        // far beyond its bounded expectations, so passing proves settlement, cancellation,
+        // or failure handling ended the wait rather than the timeout.
+        harness.host.claudeCoordinator.test_setInterruptedTurnSettlementTimeoutSeconds(
+            settlement == .timesOut ? 0.05 : 60
+        )
+        let effortService = harness.host.providerBindingService
+        let model = "opus"
+        let previousEffort = effortService.claudeEffortLevel(forModelRaw: model, agentKind: .claudeCode)
+        effortService.setClaudeEffortLevel(.high, forModelRaw: model, agentKind: .claudeCode)
+        defer {
+            effortService.setClaudeEffortLevel(previousEffort, forModelRaw: model, agentKind: .claudeCode)
+        }
+
+        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        session.selectedAgent = .claudeCode
+        session.selectedModelRaw = model
+        session.permissionProfile = .providerOverride(.claude(.auto))
+        harness.host.test_installLiveSession(session)
+        let outcome = await harness.service.startRun(
+            tabID: session.tabID,
+            session: session,
+            initialUserMessage: "initial request",
+            initialMessageForRun: "initial request",
+            attachments: []
+        )
+        XCTAssertNil(outcome)
+        let agentTask = session.agentTask
+        let drainRun: () async -> Void = {
+            await self.awaitWithinLifecycleBound("Runner task drains", operation: { _ = await agentTask?.value }) {
+                await harness.service.cancelRun(
+                    tabID: session.tabID, session: session, completion: .terminalTeardownCompleted
+                )
+                agentTask?.cancel()
+            }
+        }
+        let cleanUpRun: () async -> Void = {
+            observeTerminalPublication = false
+            if session.runState.isActive {
+                await harness.service.cancelRun(
+                    tabID: session.tabID, session: session, completion: .terminalTeardownCompleted
+                )
+            }
+            await drainRun()
+            await applyGate?.release()
+            await controller.releaseInFlightObservationWaiters()
+        }
+        await fulfillment(of: [initialResponse], timeout: 5)
+        guard let oldTurnID = session.claudeExpectedTurnIDs.first else {
+            XCTFail("The initial turn must be registered before steering")
+            await cleanUpRun()
+            return
+        }
+
+        // A genuine High→Low Auto change cannot apply while the interrupted turn is
+        // still in flight (the fake rejects it like the real controller).
+        await controller.setTurnInFlight(true)
+        effortService.setClaudeEffortLevel(.low, forModelRaw: model, agentKind: .claudeCode)
+        let instruction = makeClaudeSteeringInstruction(session: session, text: "coordination instruction")
+        session.pendingClaudeSteeringInstructions.append(instruction)
+        let accepted = await harness.service.submitQueuedClaudeSteeringIfSupported(session: session)
+        XCTAssertTrue(accepted)
+        let flushTask = session.claudeSteeringFlushTask
+        let drainFlush: () async -> Void = {
+            await self.awaitWithinLifecycleBound("Steering flush completes", operation: { _ = await flushTask?.value }) {
+                flushTask?.cancel()
+                await applyGate?.release()
+                await controller.setTurnInFlight(false)
+            }
+        }
+
+        if settlement != .timesOut {
+            // Readiness saw the interrupted turn in flight, then the settlement wait polled
+            // it again: dispatch is provably waiting, not failed. The 60 s deadline keeps
+            // these intermediate checks free of a deadline race.
+            await awaitWithinLifecycleBound(
+                "Dispatch awaits interrupted turn settlement",
+                operation: { await controller.waitForInFlightObservationsAfterInterrupt(2) }
+            ) {
+                await controller.releaseInFlightObservationWaiters()
+            }
+            let sentWhileWaiting = await controller.recordedSentMessages()
+            XCTAssertEqual(sentWhileWaiting, ["initial request"])
+            XCTAssertEqual(recorder.events.count(where: { $0 == "claude:interrupt:interrupt" }), 1)
+            XCTAssertFalse(recorder.contains("draft:coordination instruction"), "Waiting for settlement is not a failure")
+            XCTAssertTrue(session.claudeSupersedingProtectedTurnIDs.contains(oldTurnID))
+        }
+
+        switch settlement {
+        case .completes:
+            await controller.emitCancelledTurnCompletion(turnID: oldTurnID)
+            await controller.emitAssistantText("after old completion")
+            if let oldCompletionProcessed {
+                await fulfillment(of: [oldCompletionProcessed], timeout: 5)
+            }
+            await drainFlush()
+
+            let sentMessages = await controller.recordedSentMessages()
+            XCTAssertEqual(sentMessages, ["initial request", "coordination instruction"])
+            let appliedEfforts = await controller.recordedAppliedEffortLevels()
+            XCTAssertEqual(appliedEfforts, [.low])
+            XCTAssertFalse(recorder.contains("claude:apply-rejected-turn-in-flight"))
+            assertOrderedEvents(
+                ["claude:apply:low", "claude:send", "delivered"],
+                in: recorder,
+                afterFirstMatchOf: "claude:interrupt:interrupt"
+            )
+            if case let .acknowledged(acknowledgement) = session.claudePermissionSessionState {
+                XCTAssertEqual(acknowledgement.acknowledgedEffort, .low)
+            } else {
+                XCTFail("Expected acknowledged Low effort before the follow-up send")
+            }
+            XCTAssertFalse(recorder.contains("draft:coordination instruction"))
+            XCTAssertEqual(recorder.events.count(where: { $0 == "delivered" }), 1)
+            XCTAssertTrue(terminalStates.isEmpty, "The interrupted old turn must not publish a cancelled run")
+            XCTAssertEqual(session.runState, .running)
+            XCTAssertFalse(session.claudeExpectedTurnIDs.contains(oldTurnID))
+            XCTAssertEqual(session.claudeExpectedTurnIDs.count, 1, "Only the follow-up turn should remain outstanding")
+            XCTAssertTrue(session.pendingClaudeSteeringInstructions.isEmpty)
+
+        case .completesThenEffortApplicationFails:
+            await controller.emitCancelledTurnCompletion(turnID: oldTurnID)
+            await controller.emitAssistantText("after old completion")
+            if let oldCompletionProcessed {
+                await fulfillment(of: [oldCompletionProcessed], timeout: 5)
+            }
+            // Precondition: the runner consumed the old completion as protected, so no
+            // further event will ever end this attempt on its own.
+            XCTAssertTrue(terminalStates.isEmpty, "The protected old completion must not end the run")
+            XCTAssertFalse(session.claudeExpectedTurnIDs.contains(oldTurnID))
+            await applyGate?.release()
+            await drainFlush()
+
+            // Asserted before draining the runner: the flush itself must end the stranded
+            // attempt, not the drain's timeout cleanup.
+            XCTAssertEqual(terminalStates, [.cancelled], "The stranded attempt must publish exactly one terminal state")
+            XCTAssertEqual(session.runState, .cancelled, "No run may stay running with no expected turns")
+            XCTAssertTrue(session.claudeExpectedTurnIDs.isEmpty)
+            XCTAssertNil(session.claudeSteeringFlushTask)
+            let sentMessages = await controller.recordedSentMessages()
+            XCTAssertEqual(sentMessages, ["initial request"], "A failed effort apply must not dispatch the steering")
+            let appliedEfforts = await controller.recordedAppliedEffortLevels()
+            XCTAssertEqual(appliedEfforts, [.low])
+            XCTAssertEqual(recorder.events.count(where: { $0 == "draft:coordination instruction" }), 1)
+            XCTAssertFalse(recorder.contains("delivered"))
+            XCTAssertTrue(session.pendingClaudeSteeringInstructions.isEmpty)
+            await drainRun()
+            XCTAssertEqual(terminalStates, [.cancelled], "Draining the runner must not publish a second terminal state")
+            XCTAssertFalse(session.items.contains { $0.kind == .error }, "An effort deferral is a cancellation, not a failure")
+
+        case .completesThenFollowUpSendFails:
+            await controller.emitCancelledTurnCompletion(turnID: oldTurnID)
+            await controller.emitAssistantText("after old completion")
+            if let oldCompletionProcessed {
+                await fulfillment(of: [oldCompletionProcessed], timeout: 5)
+            }
+            XCTAssertTrue(terminalStates.isEmpty, "The protected old completion must not end the run")
+            XCTAssertFalse(session.claudeExpectedTurnIDs.contains(oldTurnID))
+            await applyGate?.release()
+            await drainFlush()
+
+            // The coordinator's send failure sets only a raw .failed state; the flush must
+            // commit it so the attempt ends and publishes exactly once.
+            XCTAssertEqual(terminalStates, [.failed], "The stranded send failure must publish exactly one failed terminal")
+            XCTAssertEqual(session.runState, .failed)
+            XCTAssertEqual(session.lastTerminalCommitRevision?.terminalState, .failed)
+            XCTAssertNil(session.activeRunOwnership, "The failed attempt must be ended, not left owning the run")
+            XCTAssertTrue(session.claudeExpectedTurnIDs.isEmpty)
+            XCTAssertNil(session.claudeSteeringFlushTask)
+            XCTAssertEqual(recorder.events.count(where: { $0 == "claude:send-failed" }), 1)
+            let sentMessages = await controller.recordedSentMessages()
+            XCTAssertEqual(sentMessages, ["initial request"], "The failed follow-up must not be recorded as written")
+            let appliedEfforts = await controller.recordedAppliedEffortLevels()
+            XCTAssertEqual(appliedEfforts, [.low])
+            XCTAssertEqual(recorder.events.count(where: { $0 == "draft:coordination instruction" }), 1)
+            XCTAssertFalse(recorder.contains("delivered"))
+            XCTAssertTrue(session.pendingClaudeSteeringInstructions.isEmpty)
+            let sendErrors = session.items.filter { $0.kind == .error }.map(\.text)
+            XCTAssertEqual(sendErrors.count, 1, "The send error must be recorded once: \(sendErrors)")
+            XCTAssertTrue(
+                sendErrors.first?.hasPrefix("Claude native send failed:") == true,
+                "The real send error must stay diagnosable: \(sendErrors)"
+            )
+            await drainRun()
+            XCTAssertEqual(terminalStates, [.failed], "Draining the runner must not publish a second terminal state")
+            XCTAssertEqual(session.runState, .failed)
+
+        case .runCancelled:
+            observeTerminalPublication = false
+            await harness.service.cancelRun(
+                tabID: session.tabID, session: session, completion: .terminalTeardownCompleted
+            )
+            // The injected deadline is 60 s, so a flush that finishes within this bound
+            // was interrupted by cancellation/ownership loss, not by the timeout.
+            await drainFlush()
+            await drainRun()
+
+            let sentMessages = await controller.recordedSentMessages()
+            XCTAssertEqual(sentMessages, ["initial request"], "A cancelled wait must not dispatch the steering")
+            let appliedEfforts = await controller.recordedAppliedEffortLevels()
+            XCTAssertTrue(appliedEfforts.isEmpty)
+            XCTAssertEqual(recorder.events.count(where: { $0 == "draft:coordination instruction" }), 1)
+            XCTAssertFalse(recorder.contains("delivered"))
+
+        case .timesOut:
+            await drainFlush()
+
+            let observations = await controller.inFlightObservationCountAfterInterrupt()
+            XCTAssertGreaterThanOrEqual(observations, 2, "Dispatch must wait on settlement before timing out")
+            XCTAssertEqual(recorder.events.count(where: { $0 == "claude:interrupt:interrupt" }), 1)
+            let sentMessages = await controller.recordedSentMessages()
+            XCTAssertEqual(sentMessages, ["initial request"], "An unsettled turn must not receive the steering")
+            let appliedEfforts = await controller.recordedAppliedEffortLevels()
+            XCTAssertTrue(appliedEfforts.isEmpty)
+            XCTAssertEqual(recorder.events.count(where: { $0 == "draft:coordination instruction" }), 1)
+            XCTAssertFalse(recorder.contains("delivered"))
+            XCTAssertFalse(
+                session.claudeSupersedingProtectedTurnIDs.contains(oldTurnID),
+                "A real delivery failure releases the superseding protection it claimed"
+            )
+            XCTAssertTrue(session.pendingClaudeSteeringInstructions.isEmpty)
+            // The old turn is still outstanding, so its unprotected completion ends the
+            // run; the stranded-run cancellation must leave this attempt untouched.
+            XCTAssertTrue(session.claudeExpectedTurnIDs.contains(oldTurnID))
+            XCTAssertEqual(session.runState, .running)
+            XCTAssertTrue(terminalStates.isEmpty)
+        }
+
+        await cleanUpRun()
+    }
+
+    /// Awaits `operation` for at most `timeout`. On timeout it records a failure, runs
+    /// `unblock` so the operation can finish, and still drains the waiter task so no
+    /// suspended work outlives the test.
+    private func awaitWithinLifecycleBound(
+        _ description: String,
+        timeout: TimeInterval = 5,
+        operation: @escaping () async -> Void,
+        unblock: () async -> Void
+    ) async {
+        let completed = expectation(description: description)
+        let completion = LifecycleCompletionFlag()
+        let waiter = Task {
+            await operation()
+            await completion.set()
+            completed.fulfill()
+        }
+        await fulfillment(of: [completed], timeout: timeout)
+        let operationFinished = await completion.isSet
+        if !operationFinished {
+            await unblock()
+        }
+        await waiter.value
+    }
+
+    func testLiveAutoSettingsAcknowledgeMatchingEffortInFlightButKeepLaunchMismatchPending() async {
+        let recorder = LifecycleRecorder()
+        let controller = LifecycleFakeNativeController(
+            recorder: recorder,
+            label: "live-auto-boundary"
+        )
+        let harness = makeHarness(recorder: recorder, claudeController: controller)
+        let effortService = harness.host.providerBindingService
+        let model = "opus"
+        let previousEffort = effortService.claudeEffortLevel(forModelRaw: model, agentKind: .claudeCode)
+        effortService.setClaudeEffortLevel(.high, forModelRaw: model, agentKind: .claudeCode)
+        defer {
+            effortService.setClaudeEffortLevel(previousEffort, forModelRaw: model, agentKind: .claudeCode)
+        }
+        let session = await makeInitializedAutoSession(harness: harness, controller: controller, model: model)
+        let coordinator = harness.host.claudeCoordinator
+        await controller.setTurnInFlight(true)
+
+        // A genuine change cannot apply mid-turn and stays pending.
+        effortService.setClaudeEffortLevel(.low, forModelRaw: model, agentKind: .claudeCode)
+        await coordinator.applyCurrentClaudeModelAndEffortIfPossible(for: session, reason: "test_live_low_in_flight")
+        guard case .pendingNextTurn = session.claudePermissionSessionState else {
+            return XCTFail("Expected a pending Low intent while the turn is in flight")
+        }
+
+        // Returning to the acknowledged effort on the same controller and launch settings
+        // needs no application, so the in-flight turn does not keep it pending.
+        effortService.setClaudeEffortLevel(.high, forModelRaw: model, agentKind: .claudeCode)
+        await coordinator.applyCurrentClaudeModelAndEffortIfPossible(for: session, reason: "test_live_high_in_flight")
+        guard case let .acknowledged(acknowledgement) = session.claudePermissionSessionState else {
+            return XCTFail("Expected the already-acknowledged High effort to be acknowledged again")
+        }
+        XCTAssertEqual(acknowledgement.acknowledgedEffort, .high)
+
+        // Matching effort evidence never masks a launch-settings mismatch, in flight or idle.
+        guard let launchSettings = coordinator.test_controllerLaunchSettings(for: session) else {
+            return XCTFail("Expected recorded controller launch settings")
+        }
+        coordinator.test_setControllerLaunchSettings(
+            ClaudeAgentModeCoordinator.ControllerLaunchSettings(
+                runtimeVariant: launchSettings.runtimeVariant,
+                workspacePath: "/stale/launch/workspace",
+                permissionMode: launchSettings.permissionMode,
+                allowNativeBashTool: launchSettings.allowNativeBashTool,
+                mcpStrictMode: launchSettings.mcpStrictMode,
+                sessionProfile: launchSettings.sessionProfile,
+                toolSearchEnabled: launchSettings.toolSearchEnabled,
+                autoPermissionValidationKey: launchSettings.autoPermissionValidationKey
+            ),
+            for: session
+        )
+        await coordinator.applyCurrentClaudeModelAndEffortIfPossible(for: session, reason: "test_live_mismatch_in_flight")
+        guard case .pendingNextTurn = session.claudePermissionSessionState else {
+            return XCTFail("A launch-settings mismatch must stay pending while the turn is in flight")
+        }
+        await controller.setTurnInFlight(false)
+        await coordinator.applyCurrentClaudeModelAndEffortIfPossible(for: session, reason: "test_live_mismatch_idle")
+        guard case .pendingNextTurn = session.claudePermissionSessionState else {
+            return XCTFail("A launch-settings mismatch must stay pending while idle")
+        }
+        let appliedEfforts = await controller.recordedAppliedEffortLevels()
+        XCTAssertTrue(appliedEfforts.isEmpty, "No scenario may apply effort to the live controller")
+    }
+
     func testRetainedAutoControllerAppliesDeferredEffortBeforeNextSend() async {
         let recorder = LifecycleRecorder()
         let controller = LifecycleFakeNativeController(
@@ -2116,6 +2640,14 @@ extension AgentModeRunServiceLifecycleTests {
     }
 }
 
+actor LifecycleCompletionFlag {
+    private(set) var isSet = false
+
+    func set() {
+        isSet = true
+    }
+}
+
 actor LifecycleAsyncGate {
     private var arrived = false
     private var released = false
@@ -2159,6 +2691,7 @@ actor LifecycleFakeNativeController: NativeAgentRuntimeControlling {
     private var activeSession: Bool
     private var turnInFlight: Bool
     private let failSend: Bool
+    private let failSendsAfterSuccessCount: Int?
     private var remainingApplyFailures: Int
     private let failStart: Bool
     private let failResumeStart: Bool
@@ -2171,6 +2704,13 @@ actor LifecycleFakeNativeController: NativeAgentRuntimeControlling {
     private let sendUserMessageGate: LifecycleAsyncGate?
     private let shutdownGate: LifecycleAsyncGate?
     private let emittedAssistantTextOnSend: String?
+    private let interruptOutcome: NativeAgentRuntimeInterruptOutcome
+    private let rejectsEffortApplicationWhileTurnInFlight: Bool
+    private let applyGate: LifecycleAsyncGate?
+    private var sentMessages: [String] = []
+    private var interruptCount = 0
+    private var inFlightObservationsAfterInterrupt = 0
+    private var inFlightObservationWaiters: [(threshold: Int, continuation: CheckedContinuation<Void, Never>)] = []
     private let sessionID: String
     private let promptCacheRetention: AgentMCPWaitPolicy.ParentPromptCacheRetention
     private let stream: AsyncStream<NativeAgentRuntimeEvent>
@@ -2189,6 +2729,7 @@ actor LifecycleFakeNativeController: NativeAgentRuntimeControlling {
         hasActiveSession: Bool = true,
         hasTurnInFlight: Bool = false,
         failSend: Bool = false,
+        failSendsAfterSuccessCount: Int? = nil,
         failApplyCount: Int = 0,
         failStart: Bool = false,
         failResumeStart: Bool = false,
@@ -2199,6 +2740,9 @@ actor LifecycleFakeNativeController: NativeAgentRuntimeControlling {
         sendUserMessageGate: LifecycleAsyncGate? = nil,
         shutdownGate: LifecycleAsyncGate? = nil,
         emittedAssistantTextOnSend: String? = nil,
+        interruptOutcome: NativeAgentRuntimeInterruptOutcome = .noTurnInFlight,
+        rejectsEffortApplicationWhileTurnInFlight: Bool = false,
+        applyGate: LifecycleAsyncGate? = nil,
         sessionID: String = "lifecycle-claude-session",
         promptCacheRetention: AgentMCPWaitPolicy.ParentPromptCacheRetention = .standard
     ) {
@@ -2207,6 +2751,7 @@ actor LifecycleFakeNativeController: NativeAgentRuntimeControlling {
         activeSession = hasActiveSession
         turnInFlight = hasTurnInFlight
         self.failSend = failSend
+        self.failSendsAfterSuccessCount = failSendsAfterSuccessCount
         remainingApplyFailures = failApplyCount
         self.failStart = failStart
         self.failResumeStart = failResumeStart
@@ -2217,6 +2762,9 @@ actor LifecycleFakeNativeController: NativeAgentRuntimeControlling {
         self.sendUserMessageGate = sendUserMessageGate
         self.shutdownGate = shutdownGate
         self.emittedAssistantTextOnSend = emittedAssistantTextOnSend
+        self.interruptOutcome = interruptOutcome
+        self.rejectsEffortApplicationWhileTurnInFlight = rejectsEffortApplicationWhileTurnInFlight
+        self.applyGate = applyGate
         self.sessionID = sessionID
         self.promptCacheRetention = promptCacheRetention
         var capturedContinuation: AsyncStream<NativeAgentRuntimeEvent>.Continuation?
@@ -2234,7 +2782,37 @@ actor LifecycleFakeNativeController: NativeAgentRuntimeControlling {
     }
 
     var hasTurnInFlight: Bool {
-        turnInFlight
+        if interruptCount > 0, turnInFlight {
+            inFlightObservationsAfterInterrupt += 1
+            let ready = inFlightObservationWaiters.filter { $0.threshold <= inFlightObservationsAfterInterrupt }
+            inFlightObservationWaiters.removeAll { $0.threshold <= inFlightObservationsAfterInterrupt }
+            for waiter in ready {
+                waiter.continuation.resume()
+            }
+        }
+        return turnInFlight
+    }
+
+    /// Suspends until the coordinator has observed the interrupted turn as still in flight
+    /// `count` times after the interrupt, proving it is waiting on settlement without sleeps.
+    func waitForInFlightObservationsAfterInterrupt(_ count: Int) async {
+        guard inFlightObservationsAfterInterrupt < count else { return }
+        await withCheckedContinuation { continuation in
+            inFlightObservationWaiters.append((threshold: count, continuation: continuation))
+        }
+    }
+
+    func inFlightObservationCountAfterInterrupt() -> Int {
+        inFlightObservationsAfterInterrupt
+    }
+
+    /// Resumes every pending observation waiter so test cleanup never leaves a suspended task.
+    func releaseInFlightObservationWaiters() {
+        let waiters = inFlightObservationWaiters
+        inFlightObservationWaiters.removeAll()
+        for waiter in waiters {
+            waiter.continuation.resume()
+        }
     }
 
     var events: AsyncStream<NativeAgentRuntimeEvent> {
@@ -2328,6 +2906,13 @@ actor LifecycleFakeNativeController: NativeAgentRuntimeControlling {
         recorder.record("\(label):apply")
         recorder.record("\(label):apply:\(effortLevel?.rawValue ?? "nil")")
         appliedEffortLevels.append(effortLevel)
+        if let applyGate {
+            await applyGate.arriveAndWait()
+        }
+        if rejectsEffortApplicationWhileTurnInFlight, turnInFlight {
+            recorder.record("\(label):apply-rejected-turn-in-flight")
+            throw AIProviderError.invalidConfiguration(detail: "Auto effort cannot change while a turn is in flight")
+        }
         if remainingApplyFailures > 0 {
             remainingApplyFailures -= 1
             throw AIProviderError.invalidConfiguration(detail: "Expected effort application failure")
@@ -2378,7 +2963,12 @@ actor LifecycleFakeNativeController: NativeAgentRuntimeControlling {
         if failSend {
             throw LifecycleTestError.expectedClaudeSendFailure
         }
+        if let failSendsAfterSuccessCount, sentMessages.count >= failSendsAfterSuccessCount {
+            recorder.record("\(label):send-failed")
+            throw LifecycleTestError.expectedClaudeSendFailure
+        }
         let turnID = UUID()
+        sentMessages.append(text)
         if let emittedAssistantTextOnSend {
             streamContinuation.yield(.stream(AIStreamResult(
                 type: "assistant",
@@ -2409,9 +2999,22 @@ actor LifecycleFakeNativeController: NativeAgentRuntimeControlling {
         streamContinuation.yield(.turnCompleted(turnID: turnID, status: .completed))
     }
 
+    func recordedSentMessages() -> [String] {
+        sentMessages
+    }
+
+    func emitCancelledTurnCompletion(turnID: UUID) {
+        turnInFlight = false
+        if pendingTurnCompletionID == turnID {
+            pendingTurnCompletionID = nil
+        }
+        streamContinuation.yield(.turnCompleted(turnID: turnID, status: .cancelled))
+    }
+
     func interruptTurn(reason: String) async -> NativeAgentRuntimeInterruptOutcome {
         recorder.record("\(label):interrupt:\(reason)")
-        return .noTurnInFlight
+        interruptCount += 1
+        return interruptOutcome
     }
 
     func shutdown() async {

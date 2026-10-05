@@ -1098,12 +1098,83 @@ final class AgentModeRunService {
                     }
                     // Restore ALL remaining queued drafts (including the one that failed)
                     restoreAllQueuedClaudeSteeringDrafts(tabID: tabID, session: session, strategy: .prependAlways)
+                    await cancelClaudeRunStrandedBySteeringFailureIfNeeded(
+                        tabID: tabID,
+                        session: session,
+                        runID: runID,
+                        runAttemptID: runAttemptID
+                    )
                     return
                 }
             }
         }
 
         return true
+    }
+
+    /// A failed steering dispatch normally leaves the interrupted turn outstanding, so its
+    /// now-unprotected completion ends the run. If the runner already consumed that
+    /// completion as protected (for example after interrupted-turn settlement), no event
+    /// will ever arrive and the attempt would stay live with nothing in flight. Finish only
+    /// that still-current, uncommitted attempt:
+    /// - still running (dispatch deferred or abandoned without a send error): cancel it,
+    ///   matching an aborted steer;
+    /// - raw `.failed` from the coordinator's send failure (it records the error and run
+    ///   state but owns no terminal commit): commit that failure through the terminal barrier
+    ///   so the attempt ends, publishes once, and its runner drains.
+    /// This runs inside the flush task, so it detaches the task first and never cancels or
+    /// awaits itself.
+    private func cancelClaudeRunStrandedBySteeringFailureIfNeeded(
+        tabID: UUID,
+        session: AgentModeViewModel.TabSession,
+        runID: UUID,
+        runAttemptID: UUID
+    ) async {
+        guard session.selectedAgent.usesClaudeNativeRuntime,
+              session.runID == runID,
+              let ownership = session.activeRunOwnership,
+              ownership.attemptID == runAttemptID,
+              session.lastTerminalCommitRevision?.ownership != ownership,
+              !session.terminalCommitInProgress,
+              session.claudeExpectedTurnIDs.isEmpty
+        else {
+            return
+        }
+        switch session.runState {
+        case .running:
+            steeringDebugLog("[AgentRunSteeringWake] Claude flush cancelling stranded run tab=\(tabID) runID=\(runID) attempt=\(runAttemptID)")
+            session.claudeSteeringFlushTask = nil
+            await cancelRun(tabID: tabID, session: session)
+        case .failed:
+            steeringDebugLog("[AgentRunSteeringWake] Claude flush committing stranded send failure tab=\(tabID) runID=\(runID) attempt=\(runAttemptID)")
+            session.claudeSteeringFlushTask = nil
+            let runnerTask = session.agentTask
+            // The coordinator already appended the diagnosable send error; commit the
+            // failure without duplicating it.
+            await terminalCommitBarrier.commit(.init(
+                session: session,
+                ownership: ownership,
+                expectedRunID: runID,
+                terminalState: .failed,
+                source: "runService.claudeSteeringSendFailure",
+                attachmentDisposition: .deleteFiles,
+                finalizeNonCodexUsage: true,
+                supportsFollowUp: false,
+                notifyTurnComplete: false,
+                providerDrainGeneration: session.providerTerminalDrainGeneration,
+                prepareProviderState: {
+                    session.pendingSupersedingTurnCompletions = 0
+                    session.claudeSupersedingProtectedTurnIDs.removeAll()
+                    session.claudeExpectedTurnIDs.removeAll()
+                    return nil
+                }
+            ))
+            // The runner is parked on an event stream that will never yield for this
+            // attempt; cancelling ends its loop, and its own finalize is a duplicate commit.
+            runnerTask?.cancel()
+        default:
+            return
+        }
     }
 
     private func isCurrentClaudeSteeringAttempt(

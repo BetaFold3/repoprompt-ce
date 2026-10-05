@@ -70,6 +70,11 @@ final class RepoPromptMCPInstructionsTests: XCTestCase {
                 )
                 XCTAssertFalse(try Self.containsIdentifier("bind_context", in: variant.rendered), label)
                 try Self.assertExportHandoff(in: variant.rendered, label: label)
+                XCTAssertTrue(variant.rendered.contains("a single `ask_oracle` send"), label)
+                XCTAssertTrue(
+                    variant.rendered.contains("for `consultations` lanes, use `response_mode` tail or none"),
+                    label
+                )
             case .unknown:
                 try Self.assertIdentifiers(
                     [

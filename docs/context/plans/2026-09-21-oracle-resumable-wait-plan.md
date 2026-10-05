@@ -66,6 +66,8 @@ Line references identify the checkout inspected on 2026-09-21; they are not a gu
 
 `response_mode` and `export_response` are frozen at send; wait and cancel reject all send args. Private `_`-prefixed routing args keep their current handling.
 
+`export_response` is single-send only. Batch roots and lanes reject it before admission, with no receipt or provider spend. A batch lane exports through `response_mode` `tail` or `none`, which returns that lane's own `oracle_export_path` and `oracle_export_instruction`. There is no full-inline batch export. Batch rejection messages name the supported root and lane shape and the per-lane export path, and mention `request_id` only when the caller supplied it. The tool description, schema, shared Agent Mode MCP instructions, and delegating-audience export prompts state the same scope.
+
 The native MCP text projection must preserve resumable values losslessly as one compact JSON text block, without Markdown fences or duplicated response bodies. `ToolOutputFormatter` recognizes a root `operation_id`, `wait`, or `wait_policy`, or `results` containing operation IDs; legacy non-resumable results keep their Markdown presentation. Service-level receipt tests alone do not establish this formatter boundary. The post-live correction is implemented, tested, and approved by OracleB and the user-authorized OracleE replacement; the live gates recorded in §13 remain open.
 
 **Completed single send**: today's flat result plus `status:"completed"`, `operation_id`, and a root `wait_policy`.
