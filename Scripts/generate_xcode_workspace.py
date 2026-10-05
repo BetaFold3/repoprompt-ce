@@ -608,8 +608,8 @@ This directory is disposable. Regenerate it with `make xcode-generate`; do not e
 The root Swift package reference provides source browsing and indexing. Its native Xcode
 test action is not the supported test workflow; the delegated scheme preserves conductor
 coordination across the root and extracted RepoPromptCore package tests. The vendored Sparkle
-XCFramework also declares an omitted dSYMs directory; this generator deliberately does
-not mutate `Vendor/` to compensate. Use the convenience schemes above.
+XCFramework metadata does not declare the omitted debug-symbol bundles. This generator
+does not mutate `Vendor/`. Use the convenience schemes above.
 
 Xcode does not expand project macros reliably for every external runnable field. The
 generated app scheme records the current worktree root as the working directory and the

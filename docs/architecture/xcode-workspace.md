@@ -27,7 +27,7 @@ The native `RepoPrompt` product scheme retains the shipped product, target, and 
 - `RepoPrompt CE Gateway` delegates to conductor to build and run `.build/debug/repoprompt-gateway`.
 - `RepoPrompt CE Tests` delegates to the conductor test runner. Root tests import `RepoPromptApp`, `RepoPromptGateway`, and the required `RepoPromptCore` products; the scheme remains the supported coordinated test path across the root and extracted Core package targets.
 
-The native product schemes are useful for source navigation and indexing. Use `RepoPrompt CE Tests` for the supported full test workflow; optional `REPOPROMPT_XCODE_TEST_FILTER` narrows the delegated run. Sparkle's vendored XCFramework declares a `dSYMs` directory that is not present in the repository, so native Xcode package builds involving the app can fail before compilation. The generator deliberately does not mutate `Vendor/`; the packaged app convenience scheme remains the supported app build.
+The native product schemes are useful for source navigation and indexing. Use `RepoPrompt CE Tests` for the supported full test workflow; optional `REPOPROMPT_XCODE_TEST_FILTER` narrows the delegated run. Sparkle's vendored XCFramework omits debug-symbol bundles and removes their `DebugSymbolsPath` declaration from its outer metadata, so build tools do not require an absent `dSYMs` directory. The generator does not mutate `Vendor/`; the packaged app convenience scheme remains the supported app build.
 
 ## Boundaries
 

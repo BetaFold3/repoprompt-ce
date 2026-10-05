@@ -18,6 +18,14 @@ Vendored contents:
 
 The vendored binaries are copied without source modification from the upstream release asset.
 
+The checkout omits upstream debug-symbol bundles. The outer
+`Sparkle.xcframework/Info.plist` therefore removes the upstream
+`DebugSymbolsPath = dSYMs` declaration so build tools do not require an absent
+path. Preserve this metadata adjustment when refreshing the vendored package
+unless the matching symbol bundles are also included. No framework binary or
+embedded framework metadata is changed; `SHA256SUMS` remains the checksum of the
+original upstream archive.
+
 [`INSTALLED_MANIFEST.tsv`](INSTALLED_MANIFEST.tsv) records the complete installed
 framework and trusted command-line tool tree, including entry types, symlink
 targets, and SHA-256 checksums for regular files. Release preflight verifies that
