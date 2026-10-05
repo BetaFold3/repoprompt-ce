@@ -857,7 +857,12 @@ class LifecycleQueueTests(LifecycleTestCase):
         while time.monotonic() < deadline:
             with state.condition:
                 job = state.jobs[ticket]
-                if job.state in conductor.TERMINAL_STATES:
+                # Step 2 timing publishes, then persists, after the terminal
+                # transition; wait for publication here. Persistence is drained by
+                # the state's fixture cleanup before its temporary directory goes.
+                if job.state in conductor.TERMINAL_STATES and (
+                    job.telemetry is None or job.phase_metrics is not None
+                ):
                     return job
             time.sleep(0.01)
         with state.condition:
@@ -884,7 +889,59 @@ class LifecycleQueueTests(LifecycleTestCase):
             daemon_meta_path=state_dir / "daemon.json",
             running_processes_path=state_dir / "running.json",
         )
-        return conductor.DaemonState(paths)
+        state = conductor.DaemonState(paths)
+        # Callers register ``tmp.cleanup`` first; cleanups run LIFO, so this
+        # drains timing persistence into ``state_dir`` before it is removed.
+        self.addCleanup(self.drain_job_telemetry, state)
+        return state
+
+    def drain_job_telemetry(self, state: conductor.DaemonState) -> None:
+        self.assertTrue(state._await_job_telemetry(10.0), "job timing persistence did not drain")
+
+    def test_global_slot_fixture_cleanup_waits_for_timing_persistence(self) -> None:
+        observed: dict[str, object] = {}
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+
+        def assert_persisted_before_removal() -> None:
+            # Cleanups run LIFO: after the fixture drain, before ``tmp.cleanup``.
+            if "job" not in observed:
+                return  # the test body already failed before its job existed
+            state, job = observed["state"], observed["job"]
+            with state.condition:
+                self.assertTrue(job.telemetry_persisted)
+                self.assertIsNone(job.telemetry_persist_error)
+            self.assertTrue((state.paths.jobs_dir / f"{job.ticket}.timings.json").is_file())
+
+        self.addCleanup(assert_persisted_before_removal)
+        root = Path(tmp.name)
+        state = self.make_state_for_global_slot(root, "daemon", root / "shared")
+        observed["state"] = state
+        release = threading.Event()
+        persist = state._persist_job_telemetry
+
+        def gated_persist(*args, **kwargs):
+            self.assertTrue(release.wait(10.0))
+            return persist(*args, **kwargs)
+
+        state._persist_job_telemetry = gated_persist
+        lock_root = root / "machine-locks"
+        with mock.patch.object(conductor, "GLOBAL_HEAVY_SLOT_POLL_SECONDS", 0.01), mock.patch.object(
+            conductor, "machine_lock_dir", return_value=lock_root
+        ):
+            payload = state.enqueue(
+                {"operation": "fake-sleep", "args": {"seconds": 0.01, "lanes": ["build"], "message": "gated"}}
+            )
+            job = self.wait_for_terminal_job(state, payload["ticket"])
+        observed["job"] = job
+
+        with state.condition:
+            self.assertEqual(job.state, "completed", job.result_summary)
+            self.assertIsNotNone(job.phase_metrics)
+            self.assertTrue(job.telemetry_persist_claimed)
+            self.assertFalse(job.telemetry_persisted)
+        # Runs first among cleanups: persistence is still gated when the drain starts.
+        self.addCleanup(threading.Timer(0.2, release.set).start)
 
     def test_global_heavy_slot_serializes_build_lane_jobs_across_daemons(self) -> None:
         tmp = tempfile.TemporaryDirectory()

@@ -1,0 +1,42 @@
+{
+  "description": "Incremental compile with carriage-return progress redraws, ANSI erase sequences, CRLF and bare CR across reads, split UTF-8, two links, .pcm warnings, EOF without newline.",
+  "originNs": 0,
+  "steps": [
+    {"boundary": "command_start", "atMs": 0, "metadata": {"command": "/repo/Scripts/canonical_swift.sh build --build-tests"}},
+    {"atMs": 100, "chunk": "[0/1] Planning build\r\n[1/1] Planning build\r"},
+    {"atMs": 150, "chunk": "\nBuilding for debugging...\r\n\u001b[2K\r[2/10] Write sources\u001b[2K\r[3/10] Emitting module RepoPromptApp\u001b[2K\r[4/10] Compiling RepoPromptApp Alpha.swift\u001b[2K\r[4/11] Compiling RepoPromptApp Alpha.swift\u001b[2K\r[5/11] Compiling RepoPromptApp Beta.swift, Gamma.swift\r"},
+    {"atMs": 200, "chunkB64": "G1sySw1bNi8xMV0gQ29tcGlsaW5nIFJlcG9Qcm9tcHRUZXN0cyDD"},
+    {"atMs": 210, "chunkB64": "hGxwaGFUZXN0cy5zd2lmdA0="},
+    {"atMs": 300, "chunk": "\n[7/11] Compiling RepoPromptTests BetaTests.swift\r\n"},
+    {"atMs": 400, "chunk": "[8/11] Linking RepoPrompt\r\n[9/11] Linking RepoPrompt\r\n"},
+    {"atMs": 450, "chunk": "warning: (arm64) /x/ModuleCache/ABC/Foundation-1.pcm: No such file or directory\r\nwarning: (arm64) /x/ModuleCache/ABC/Dispatch-2.pcm: No such file or directory\r\n"},
+    {"atMs": 500, "chunk": "[10/11] Linking RepoPromptCEPackageTests\r\n"},
+    {"atMs": 1500, "chunk": "Build complete! (1.20s)"},
+    {"eof": true, "atMs": 1500}
+  ],
+  "expect": {
+    "status": "complete",
+    "commandCount": 1,
+    "output.records": 18,
+    "segments.#": 1,
+    "segments.0.openedBy": "command",
+    "segments.0.timeToFirstBuildWork": {"ns": 150000000, "quality": "observed_wall"},
+    "segments.0.planning": {"ns": 50000000, "quality": "observed_wall"},
+    "segments.0.compileRecords": 5,
+    "segments.0.writeRecords": 1,
+    "segments.0.modules": {
+      "RepoPromptApp": {"compiledFiles": 3, "exact": true, "emittedModule": true},
+      "RepoPromptTests": {"compiledFiles": 2, "exact": true, "emittedModule": false}
+    },
+    "segments.0.compiledFilesExact": true,
+    "segments.0.modulesPartial": false,
+    "segments.0.linkedProducts": ["RepoPrompt", "RepoPromptCEPackageTests"],
+    "segments.0.linkToBuildComplete": {"ns": 1000000000, "quality": "observed_wall"},
+    "segments.0.reportedBuild": {"ns": 1200000000, "quality": "reported_duration"},
+    "segments.0.preCompletionResidual": {"ns": 300000000, "quality": "observed_wall", "signed": true},
+    "segments.0.pcmWarnings": 2,
+    "segments.0.buildCompleteToFirstSuite": {"ns": null, "quality": "unavailable"},
+    "segments.0.xctestObserved": {"ns": null, "quality": "unavailable"},
+    "intervals.spawn": {"ns": null, "quality": "unavailable", "reason": "missing_start_and_end"}
+  }
+}

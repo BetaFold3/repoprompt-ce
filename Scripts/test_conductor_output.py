@@ -4,13 +4,19 @@
 from __future__ import annotations
 
 import contextlib
+import fcntl
 import io
+import json
+import os
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
+from unittest import mock
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
@@ -607,6 +613,767 @@ class JobTicketEnvEligibilityTests(unittest.TestCase):
         self.assertTrue(conductor.job_ticket_env_eligible(["/repo/Scripts/package_app.sh", "debug"]))
         self.assertTrue(conductor.job_ticket_env_eligible(["python3", "Scripts/debug_app_process.py"]))
         self.assertTrue(conductor.job_ticket_env_eligible([]))
+
+
+# ---------------------------------------------------------------------------
+# Step 2 passive timing integration
+
+metrics = conductor.PIPELINE_METRICS
+
+TELEMETRY_STREAMS = {
+    "lf-lines": [b"[1/3] Compiling Foo a.swift\n", b"[2/3] Compiling Foo b.swift\n[3/3] Linking foo\n", b""],
+    "bare-cr-progress": [b"[1/4] Compiling A a.swift\r[2/4] Comp", b"iling A b.swift\r", b"\n[3/4] Linking a\n", b""],
+    "crlf-across-reads": [b"Build complete! (0.10s)\r", b"\nTest Suite 'All tests' started at 2026-10-05 10:00:00.000.\r\n", b""],
+    "split-utf8-and-tail": [b"\xe2\x9c", b"\x93 done\n\xff bad\rTest Case '-[A.B testC]' started.\n", b"unterminated", b""],
+    "xctest-methods": [
+        b"Test Case '-[A.B testOne]' started.\nTest Case '-[A.B testOne]' passed (0.001 seconds).\n",
+        b"Test Case '-[A.B testTwo]' started.\nTest Case '-[A.B testTwo]' failed (0.002 seconds).\n",
+        b"",
+    ],
+    "onlcr-pty": [b"[1/2] Compiling P p.swift\r\r\n[2/2] Linking p\r\n", b"$ next\r\n", b""],
+}
+
+
+def timing_paths(root: Path) -> conductor.Paths:
+    jobs_dir = root / "jobs"
+    jobs_dir.mkdir(parents=True, exist_ok=True)
+    return conductor.Paths(
+        repo_root=root,
+        repo_hash="test",
+        state_dir=root,
+        socket_path=root / "conductor.sock",
+        pid_path=root / "conductor.pid",
+        lock_path=root / "conductor.lock",
+        jobs_dir=jobs_dir,
+        daemon_log_path=root / "daemon.log",
+        daemon_meta_path=root / "daemon.json",
+        running_processes_path=root / "running.json",
+    )
+
+
+def timing_state(root: Path, timing: str = "on") -> conductor.DaemonState:
+    env = {key: value for key, value in os.environ.items() if key != "RPCE_CONDUCTOR_TIMING"}
+    if timing == "off":
+        env["RPCE_CONDUCTOR_TIMING"] = "off"
+    with mock.patch.dict(os.environ, env, clear=True):
+        return conductor.DaemonState(timing_paths(root))
+
+
+def timing_job(state: conductor.DaemonState, ticket: str, operation: str = "build") -> conductor.Job:
+    job = conductor.Job(
+        ticket=ticket,
+        request_key=None,
+        fingerprint="fingerprint",
+        operation=operation,
+        args={},
+        lanes=["style"],
+        timeout=None,
+        verbose=False,
+        env={},
+        created_at=conductor.now(),
+        log_path=state.paths.jobs_dir / f"{ticket}.log",
+        state="running",
+        telemetry=state.attach_job_telemetry(operation),
+    )
+    state.jobs[ticket] = job
+    return job
+
+
+def capture_pump(state: conductor.DaemonState, job: conductor.Job, chunks: list[bytes], observed: bool) -> dict:
+    writes: list[bytes] = []
+    progress: list[str] = []
+    sink = mock.Mock()
+    sink.write.side_effect = writes.append
+    original_progress = state._record_xctest_progress_locked
+
+    def record_progress(target: conductor.Job, text: str) -> Any:
+        progress.append(text)
+        return original_progress(target, text)
+
+    with mock.patch.object(state, "_record_xctest_progress_locked", side_effect=record_progress):
+        if observed:
+            cursor = state._output_telemetry_cursor(job.ticket)
+            assert cursor is not None
+            state._pump_output_observed(job.ticket, iter(chunks).__next__, sink, cursor)
+        else:
+            state._pump_output(job.ticket, iter(chunks).__next__, sink)
+    return {
+        "writes": writes,
+        "flushes": sink.flush.call_count,
+        "tail": list(job.tail),
+        "progress": progress,
+        "xctest": (job.xctest_started_count, job.xctest_last_progress_test, job.xctest_last_progress_action),
+    }
+
+
+class GuardedRecorderLock:
+    """Recorder lock proxy that records any acquisition under the scheduler lock."""
+
+    def __init__(self, inner: Any, state: conductor.DaemonState, held: threading.local, violations: list[str]) -> None:
+        self.inner = inner
+        self.state = state
+        self.held = held
+        self.violations = violations
+
+    def __enter__(self) -> Any:
+        if self.state.lock._is_owned():
+            self.violations.append("recorder lock taken while holding self.condition")
+        result = self.inner.__enter__()
+        self.held.depth = getattr(self.held, "depth", 0) + 1
+        return result
+
+    def __exit__(self, *exc: Any) -> Any:
+        self.held.depth -= 1
+        return self.inner.__exit__(*exc)
+
+
+class GuardedSchedulerLock:
+    """Scheduler lock/condition proxy that records acquisition under a recorder lock."""
+
+    def __init__(self, inner: Any, held: threading.local, violations: list[str]) -> None:
+        self.inner = inner
+        self.held = held
+        self.violations = violations
+
+    def __enter__(self) -> Any:
+        if getattr(self.held, "depth", 0):
+            self.violations.append("self.condition taken while holding the recorder lock")
+        return self.inner.__enter__()
+
+    def __exit__(self, *exc: Any) -> Any:
+        return self.inner.__exit__(*exc)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.inner, name)
+
+
+@unittest.skipIf(metrics is None, "swift_pipeline_metrics.py is unavailable")
+class PhaseTimingIntegrationTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+
+    def make_state(self, name: str, timing: str = "on") -> conductor.DaemonState:
+        state = timing_state(self.root / name, timing)
+        # Persistence finishes after ``job_wait`` (A009); drain before the tempdir goes.
+        self.addCleanup(state._await_job_telemetry, 10.0)
+        return state
+
+    def settled(self, state: conductor.DaemonState, waited: dict) -> dict:
+        """Private drain, then the job's status: timing is published after the result."""
+        self.assertEqual(waited["state"], "completed")
+        self.assertIsNotNone(waited.get("outputSummary"))
+        self.assertTrue(state._await_job_telemetry(10.0, state.jobs[waited["ticket"]]))
+        return state.job_status(waited["ticket"], None)
+
+    def install_lock_guards(self, state: conductor.DaemonState) -> list[str]:
+        violations: list[str] = []
+        held = threading.local()
+        state.condition = GuardedSchedulerLock(state.condition, held, violations)
+        state.lock = GuardedSchedulerLock(state.lock, held, violations)
+        original_attach = state.attach_job_telemetry
+
+        def attach(operation: str, accepted_ns: Optional[int] = None) -> Any:
+            recorder = original_attach(operation, accepted_ns)
+            if recorder is not None:
+                recorder._lock = GuardedRecorderLock(recorder._lock, state, held, violations)
+            return recorder
+
+        state.attach_job_telemetry = attach  # type: ignore[method-assign]
+        return violations
+
+    def run_child_job(self, state: conductor.DaemonState, child: str, request_extra: Optional[dict] = None) -> dict:
+        argv = [sys.executable, "-u", "-c", child]
+        request = {"operation": "build", "args": {}, "env": {}}
+        request.update(request_extra or {})
+        with mock.patch.object(
+            state.registry,
+            "prepare",
+            side_effect=lambda _request: (argv, ["style"], state.paths.repo_root, {"PATH": os.environ.get("PATH", "")}, 30.0),
+        ), mock.patch.object(conductor, "operation_requires_global_heavy_slot", return_value=False):
+            enqueued = state.enqueue(request)
+            return state.job_wait(enqueued["ticket"], None, 30.0)
+
+    CHILD = (
+        "import sys\n"
+        "print('[1/3] Compiling Foo a.swift', flush=True)\n"
+        "sys.stdout.write('[2/3] Compiling Foo b.swift\\r[3/3] Linking foo\\r\\n'); sys.stdout.flush()\n"
+        "sys.stdout.write('Build complete! (0.10s)\\nno newline'); sys.stdout.flush()\n"
+    )
+
+    def test_helper_is_loaded_next_to_conductor_and_digest_is_reported(self) -> None:
+        self.assertEqual(Path(metrics.__file__).resolve(), Path(conductor.__file__).resolve().with_name("swift_pipeline_metrics.py"))
+        self.assertTrue(str(conductor.CONDUCTOR_DIGEST).startswith("sha256:"))
+        state = self.make_state("status")
+        status = state.status_payload()
+        self.assertEqual(status["conductorDigest"], conductor.CONDUCTOR_DIGEST)
+        self.assertTrue(status["timingEnabled"])
+        self.assertEqual(status["protocolVersion"], 15)
+        self.assertFalse(self.make_state("off", timing="off").status_payload()["timingEnabled"])
+
+    def test_observed_pump_preserves_raw_bytes_tail_and_progress_for_every_stream(self) -> None:
+        for name, chunks in TELEMETRY_STREAMS.items():
+            with self.subTest(stream=name):
+                legacy_state = self.make_state(f"legacy-{name}", timing="off")
+                legacy = capture_pump(legacy_state, timing_job(legacy_state, "t"), chunks, observed=False)
+                observed_state = self.make_state(f"observed-{name}")
+                observed_job = timing_job(observed_state, "t")
+                observed = capture_pump(observed_state, observed_job, chunks, observed=True)
+                self.assertEqual(observed, legacy)
+                self.assertEqual(observed["writes"], [chunk for chunk in chunks if chunk])
+                # Telemetry equals the reference splitter fed the same reads.
+                splitter = metrics.RecordSplitter()
+                reference = metrics.PipelineRecorder(origin_ns=0)
+                for chunk in chunks[:-1]:
+                    reference.observe_records(splitter.feed(chunk, 0))
+                reference.observe_records(splitter.finish(0))
+                payload = observed_job.telemetry.finalize()
+                self.assertTrue(payload["output"]["complete"])
+                self.assertEqual(payload["output"]["records"], reference.finalize()["output"]["records"])
+
+    def test_receipt_timestamp_precedes_write_flush_and_scheduler_lock(self) -> None:
+        state = self.make_state("order")
+        job = timing_job(state, "t")
+        order: list[str] = []
+        chunks = [b"[1/2] Compiling A a.swift\n", b"partial\r", b""]
+        reads = iter(chunks)
+        real_monotonic_ns = time.monotonic_ns
+
+        def read_chunk() -> bytes:
+            order.append("read")
+            return next(reads)
+
+        def stamp() -> int:
+            order.append("stamp-locked" if state.lock._is_owned() else "stamp")
+            return real_monotonic_ns()
+
+        sink = mock.Mock()
+        sink.write.side_effect = lambda _chunk: order.append("write")
+        sink.flush.side_effect = lambda: order.append("flush")
+        cursor = state._output_telemetry_cursor(job.ticket)
+        with mock.patch.object(conductor.time, "monotonic_ns", side_effect=stamp):
+            state._pump_output_observed(job.ticket, read_chunk, sink, cursor)
+        self.assertEqual(order[:4], ["read", "stamp", "write", "flush"])
+        self.assertEqual(order[4:8], ["read", "stamp", "write", "flush"])
+        self.assertEqual(order[8:10], ["read", "stamp"])
+        self.assertNotIn("stamp-locked", order)
+        payload = job.telemetry.finalize()
+        self.assertEqual(payload["output"]["records"], 2)
+
+    def test_read_process_output_uses_legacy_pump_without_a_recorder(self) -> None:
+        for timing, attach in (("off", True), ("on", False)):
+            with self.subTest(timing=timing, attach=attach):
+                state = self.make_state(f"dispatch-{timing}", timing)
+                job = timing_job(state, "t")
+                if not attach:
+                    job.telemetry = None
+                transport = mock.Mock()
+                transport.read_chunk.side_effect = [b"line\n", b""]
+                with mock.patch.object(state, "_pump_output_observed") as observed:
+                    state._read_process_output(job.ticket, mock.Mock(), io.BytesIO(), transport)
+                observed.assert_not_called()
+                self.assertEqual(list(job.tail), ["line\n"])
+                transport.close_reader.assert_called_once()
+
+    def test_end_to_end_job_records_boundaries_persists_and_reports_phase_metrics(self) -> None:
+        state = self.make_state("e2e")
+        violations = self.install_lock_guards(state)
+        client = [
+            {"name": "artifact_evaluation", "durationNs": 1500, "counters": {"bytesHashed": 7}},
+            {"name": 5, "durationNs": 1},
+            "junk",
+        ]
+        payload = self.settled(state, self.run_child_job(state, self.CHILD, {"clientMetrics": client}))
+
+        self.assertEqual(violations, [])
+        self.assertEqual(payload["state"], "completed")
+        self.assertEqual(payload["conductorDigest"], conductor.CONDUCTOR_DIGEST)
+        phase = payload["phaseMetrics"]
+        self.assertEqual(phase["schema"], 1)
+        self.assertEqual(phase["status"], "complete", phase)
+        for name in ("queueWait", "prepare", "spawn", "spawnToFirstOutput", "processObserved", "postRunProvenance", "exitToLaneRelease", "acceptedToLaneRelease"):
+            self.assertIsInstance(phase["intervals"][name]["ns"], int, name)
+        self.assertEqual(phase["intervals"]["sourceSnapshot"]["quality"], "not_applicable")
+        self.assertEqual(phase["output"]["records"], 5)
+        self.assertTrue(phase["output"]["complete"])
+        self.assertEqual(phase["commandCount"], 1)
+        operations = {(item["name"], item["origin"]): item for item in phase["operations"]}
+        self.assertEqual(operations[("output_summary", "daemon.summary")]["calls"], 1)
+        self.assertIn(("retention_pass", "daemon.enqueue"), operations)
+        self.assertIn(("retention_pass", "daemon.lane_release"), operations)
+        self.assertEqual(operations[("output_reader_cpu", "daemon.reader")]["total"]["quality"], "measured_cpu")
+        client_op = operations[("artifact_evaluation", "client")]
+        self.assertEqual(client_op["total"], {"ns": 1500, "quality": "reported_duration"})
+        self.assertEqual(client_op["counters"], {"bytesHashed": 7})
+        self.assertEqual(phase["invalidInputs"], 0)
+
+        ticket = payload["ticket"]
+        jobs_dir = state.paths.jobs_dir
+        events = [json.loads(line) for line in (jobs_dir / f"{ticket}.timing-events.jsonl").read_text().splitlines()]
+        boundaries = [event["name"] for event in events if event["k"] == "boundary"]
+        self.assertEqual(
+            boundaries,
+            ["request_accepted", "lane_dispatched", "prepare_start", "prepare_end", "command_start",
+             "popen_before", "popen_after", "exit_observed", "provenance_start", "provenance_end", "lane_released"],
+        )
+        self.assertTrue(set(boundaries) <= metrics.KNOWN_BOUNDARIES)
+        timings = json.loads((jobs_dir / f"{ticket}.timings.json").read_text())
+        self.assertEqual(timings["conductorDigest"], conductor.CONDUCTOR_DIGEST)
+        self.assertEqual(timings["phaseMetrics"], phase)
+        self.assertIsNone(timings["runner"])
+        rows, malformed = metrics.RotatingJsonl(conductor.timing_history_path(state.paths)).read_rows()
+        self.assertEqual(malformed, 0)
+        self.assertEqual([row["ticket"] for row in rows], [ticket])
+        self.assertEqual(rows[0]["conductorDigest"], conductor.CONDUCTOR_DIGEST)
+        self.assertEqual(rows[0]["exitCode"], 0)
+        # Status listings stay compact: no phaseMetrics without include_summary.
+        self.assertNotIn("phaseMetrics", state.list_jobs(None)["jobs"][0])
+
+    def test_kill_switch_produces_identical_output_and_no_timing_artifacts(self) -> None:
+        on_state = self.make_state("on")
+        off_state = self.make_state("off", timing="off")
+        on = self.run_child_job(on_state, self.CHILD)
+        off = self.run_child_job(off_state, self.CHILD)
+        self.assertEqual(off["phaseMetrics"], {"schema": 1, "status": "disabled"})
+        self.assertIsNone(off_state.jobs[off["ticket"]].telemetry)
+        self.assertEqual(
+            Path(on["logPath"]).read_bytes(), Path(off["logPath"]).read_bytes()
+        )
+        self.assertEqual(on["logTail"], off["logTail"])
+        self.assertEqual(on["outputSummary"], off["outputSummary"])
+        self.assertEqual(sorted(path.name for path in off_state.paths.jobs_dir.iterdir()), [f"{off['ticket']}.log"])
+        self.assertFalse((off_state.paths.state_dir / "metrics").exists())
+
+    def test_telemetry_failures_never_change_job_result_or_output(self) -> None:
+        baseline = self.run_child_job(self.make_state("baseline", timing="off"), self.CHILD)
+
+        classifier_state = self.make_state("classifier")
+        with mock.patch.object(metrics, "classify_record", side_effect=RuntimeError("boom")):
+            failed = self.settled(classifier_state, self.run_child_job(classifier_state, self.CHILD))
+        self.assertEqual(failed["state"], "completed")
+        self.assertEqual(Path(failed["logPath"]).read_bytes(), Path(baseline["logPath"]).read_bytes())
+        self.assertEqual(failed["logTail"], baseline["logTail"])
+        self.assertEqual(failed["phaseMetrics"]["status"], "partial")
+        self.assertFalse(failed["phaseMetrics"]["output"]["complete"])
+        self.assertIn("RuntimeError", failed["phaseMetrics"]["output"]["error"])
+
+        persist_state = self.make_state("persist")
+        with mock.patch.object(metrics, "write_events_jsonl", side_effect=OSError("disk full")):
+            persisted = self.settled(persist_state, self.run_child_job(persist_state, self.CHILD))
+        self.assertEqual(persisted["state"], "completed")
+        self.assertEqual(persisted["exitCode"], 0)
+        self.assertIn("disk full", persisted["phaseMetricsPersistError"])
+        self.assertEqual(persisted["phaseMetrics"]["status"], "complete")
+        self.assertFalse((persist_state.paths.state_dir / "metrics").exists())
+
+        recorder_state = self.make_state("recorder")
+        with mock.patch.object(metrics.PipelineRecorder, "record_boundary", side_effect=RuntimeError("x")):
+            boundary_failed = self.run_child_job(recorder_state, self.CHILD)
+        self.assertEqual(boundary_failed["state"], "completed")
+        self.assertEqual(Path(boundary_failed["logPath"]).read_bytes(), Path(baseline["logPath"]).read_bytes())
+
+    def test_slot_wait_records_contention_only_when_a_foreign_holder_blocks(self) -> None:
+        state = self.make_state("slots")
+        lock_root = self.root / "machine-locks"
+        lock_root.mkdir(mode=0o700)
+        with mock.patch.object(conductor, "machine_lock_dir", return_value=lock_root), mock.patch.object(
+            conductor, "GLOBAL_HEAVY_SLOT_POLL_SECONDS", 0.01
+        ):
+            free_job = timing_job(state, "free")
+            slot = state._acquire_global_slot("free", "heavy")
+            state._release_global_slot(slot)
+
+            busy_job = timing_job(state, "busy")
+            holder = (lock_root / "global-heavy-0.lock").open("a+")
+            fcntl.flock(holder.fileno(), fcntl.LOCK_EX)
+            releaser = threading.Timer(0.1, lambda: (fcntl.flock(holder.fileno(), fcntl.LOCK_UN), holder.close()))
+            releaser.start()
+            slot = state._acquire_global_slot("busy", "heavy")
+            releaser.join()
+            state._release_global_slot(slot)
+
+        free = free_job.telemetry.finalize()["slotWaits"]
+        busy = busy_job.telemetry.finalize()["slotWaits"]
+        self.assertEqual([(item["slot"], item["contended"]) for item in free], [("heavy", False)])
+        self.assertEqual([(item["slot"], item["contended"]) for item in busy], [("heavy", True)])
+        self.assertGreaterEqual(busy[0]["ns"], 50_000_000)
+
+    def test_retention_removes_timing_files_of_pruned_and_orphaned_tickets(self) -> None:
+        state = self.make_state("retention")
+        jobs_dir = state.paths.jobs_dir
+        kept = timing_job(state, "kept")
+        kept.state = "completed"
+        kept.finished_at = conductor.now()
+        pruned = timing_job(state, "pruned")
+        pruned.state = "completed"
+        pruned.finished_at = conductor.now() - conductor.TERMINAL_RETENTION_SECONDS - 10
+        old = time.time() - conductor.TERMINAL_RETENTION_SECONDS - 10
+        for ticket in ("kept", "pruned", "orphan", "fresh-orphan"):
+            for suffix in conductor.TIMING_FILE_SUFFIXES:
+                path = jobs_dir / f"{ticket}{suffix}"
+                path.write_text("{}")
+                if ticket != "fresh-orphan":
+                    os.utime(path, (old, old))
+        with state.condition:
+            state._retention_pass_locked()
+        remaining = sorted(path.name for path in jobs_dir.iterdir() if "timing" in path.name)
+        expected = sorted(f"{ticket}{suffix}" for ticket in ("kept", "fresh-orphan") for suffix in conductor.TIMING_FILE_SUFFIXES)
+        self.assertEqual(remaining, expected)
+        self.assertNotIn("pruned", state.jobs)
+
+    def test_metrics_command_reads_history_client_side_with_filters(self) -> None:
+        state = self.make_state("cli")
+        history = metrics.RotatingJsonl(conductor.timing_history_path(state.paths))
+        for ticket, kind in (("a", "build"), ("b", "test"), ("c", "build")):
+            history.append({"ticket": ticket, "kind": kind, "status": "complete", "intervals": {"queueWait": {"ns": 2_000_000, "quality": "measured_wall"}}})
+        with mock.patch.object(conductor, "request_daemon", side_effect=AssertionError("no daemon")):
+            with contextlib.redirect_stdout(io.StringIO()) as output:
+                self.assertEqual(conductor.handle_metrics_command(state.paths, ["--kind", "build", "--last", "1", "--json"]), 0)
+            report = json.loads(output.getvalue())
+            self.assertEqual([row["ticket"] for row in report["rows"]], ["c"])
+            self.assertEqual(report["totalRows"], 3)
+            with contextlib.redirect_stdout(io.StringIO()) as output:
+                self.assertEqual(conductor.handle_metrics_command(state.paths, ["--ticket", "b"]), 0)
+        text = output.getvalue()
+        self.assertIn("1 of 3 rows", text)
+        self.assertIn("queue=2.0ms", text)
+        with self.assertRaises(conductor.ConductorError):
+            conductor.handle_metrics_command(state.paths, ["--last", "-1"])
+        self.assertIn("./conductor metrics [--last N] [--kind K] [--ticket T] [--json]", conductor.HELP)
+        self.assertIn("RPCE_CONDUCTOR_TIMING=off", conductor.HELP)
+
+    def test_client_metrics_are_outside_request_identity(self) -> None:
+        state = self.make_state("identity")
+        request = {"operation": "build", "args": {}, "env": {}}
+        with_metrics = dict(request, clientMetrics=[{"name": "artifact_evaluation", "durationNs": 5}])
+        self.assertEqual(state.registry.fingerprint(request), state.registry.fingerprint(with_metrics))
+        collected: list[dict] = []
+        sink = conductor.client_metrics_sink(collected)
+        for index in range(conductor.CLIENT_METRICS_MAX_ITEMS + 5):
+            sink("op", index, {"bytesHashed": 1})
+        sink("missing", None)
+        self.assertEqual(len(collected), conductor.CLIENT_METRICS_MAX_ITEMS)
+        self.assertEqual(collected[0], {"name": "op", "durationNs": 0, "counters": {"bytesHashed": 1}})
+
+    def test_artifact_fingerprint_sink_counts_bytes_and_files_without_changing_result(self) -> None:
+        artifact = self.root / "products" / "Example.xctest"
+        executable = artifact / "Contents" / "MacOS" / "Example"
+        executable.parent.mkdir(parents=True)
+        executable.write_bytes(b"x" * 3000)
+        (artifact / "Contents" / "Info.plist").write_bytes(b"y" * 200)
+        bundle = self.root / "products" / "Resources.bundle"
+        bundle.mkdir()
+        (bundle / "data").write_bytes(b"z" * 50)
+        calls: list[tuple] = []
+        plain = conductor.test_artifact_fingerprint(artifact)
+        explicit = conductor.test_artifact_fingerprint(artifact, sink=lambda *call: calls.append(call))
+        with conductor.artifact_operation_sink(lambda *call: calls.append(call)):
+            ambient = conductor.test_artifact_fingerprint(artifact)
+        self.assertEqual(plain, explicit)
+        self.assertEqual(plain, ambient)
+        self.assertEqual([call[0] for call in calls], ["artifact_fingerprint", "artifact_fingerprint"])
+        self.assertEqual(calls[0][2], {"bytesHashed": 3250, "filesHashed": 3})
+        self.assertIsInstance(calls[0][1], int)
+        failing = conductor.test_artifact_fingerprint(artifact, sink=mock.Mock(side_effect=RuntimeError("sink")))
+        self.assertEqual(failing, plain)
+
+    def test_runner_writes_its_own_timings_and_hides_the_path_from_descendants(self) -> None:
+        target = self.root / "jobs-runner"
+        target.mkdir()
+        path = target / "t.runner-timings.json"
+        env = {conductor.TIMING_RUNNER_PATH_ENV_KEY: str(path), "REPOPROMPT_CONDUCTOR_JOB_TICKET": "t"}
+        with mock.patch.dict(os.environ, env), contextlib.redirect_stderr(io.StringIO()):
+            code = conductor.run_operation_runner(json.dumps({"kind": "no-such-kind", "repoRoot": str(self.root)}))
+            self.assertNotIn(conductor.TIMING_RUNNER_PATH_ENV_KEY, os.environ)
+        self.assertEqual(code, 2)
+        runner = json.loads(path.read_text())
+        self.assertEqual(runner["process"], "runner")
+        self.assertEqual(runner["ticket"], "t")
+        self.assertEqual(runner["conductorDigest"], conductor.CONDUCTOR_DIGEST)
+        self.assertEqual(runner["phaseMetrics"]["process"], "runner")
+        self.assertEqual(conductor.read_runner_timings(path), runner)
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(conductor.run_operation_runner(json.dumps({"kind": "no-such-kind"})), 2)
+
+    def test_runner_timing_path_is_only_given_to_conductor_runner_children(self) -> None:
+        state = self.make_state("runner-env")
+        seen: list[dict] = []
+        real_popen = conductor.subprocess.Popen
+        runner_argv = state.registry._internal_argv("app_status", {})
+        plain_argv = [sys.executable, "-c", "pass"]
+
+        def capture(argv: Any, *args: Any, **kwargs: Any) -> Any:
+            if argv in (runner_argv, plain_argv):
+                seen.append(dict(kwargs["env"]))
+                return real_popen(plain_argv, *args, **kwargs)
+            return real_popen(argv, *args, **kwargs)
+
+        tickets: list[str] = []
+        for argv in (runner_argv, plain_argv):
+            with mock.patch.object(
+                state.registry, "prepare", return_value=(argv, ["style"], self.root, {}, 30.0)
+            ), mock.patch.object(conductor, "operation_requires_global_heavy_slot", return_value=False), mock.patch.object(
+                conductor.subprocess, "Popen", side_effect=capture
+            ):
+                enqueued = state.enqueue({"operation": "build", "args": {}, "env": {}})
+                tickets.append(enqueued["ticket"])
+                self.assertEqual(state.job_wait(enqueued["ticket"], None, 30.0)["state"], "completed")
+        self.assertEqual(len(seen), 2)
+        self.assertEqual(
+            seen[0][conductor.TIMING_RUNNER_PATH_ENV_KEY],
+            str(state.paths.jobs_dir / f"{tickets[0]}.runner-timings.json"),
+        )
+        self.assertNotIn(conductor.TIMING_RUNNER_PATH_ENV_KEY, seen[1])
+
+    # -- review r2 Step 2 P1 regressions ----------------------------------------
+
+    def hold_history_lock(self, state: conductor.DaemonState) -> Any:
+        history = conductor.timing_history_path(state.paths)
+        history.parent.mkdir(parents=True, exist_ok=True)
+        holder = history.with_name(history.name + ".lock").open("a+")
+        fcntl.flock(holder.fileno(), fcntl.LOCK_EX)
+        self.addCleanup(holder.close)
+        return holder
+
+    def test_held_history_lock_never_delays_the_job_result(self) -> None:
+        # OracleA-009: optional persistence must not gate the result or summary.
+        state = self.make_state("history-lock")
+        state.timing_history.lock_timeout = 30.0
+        holder = self.hold_history_lock(state)
+        safety = threading.Timer(8.0, lambda: fcntl.flock(holder.fileno(), fcntl.LOCK_UN))
+        safety.start()
+        self.addCleanup(safety.cancel)
+        started = time.monotonic()
+        waited = self.run_child_job(state, self.CHILD)
+        elapsed = time.monotonic() - started
+        job = state.jobs[waited["ticket"]]
+        self.assertLess(elapsed, 3.0)
+        self.assertEqual((waited["state"], waited["exitCode"]), ("completed", 0))
+        self.assertIsNotNone(waited["outputSummary"])
+        self.assertFalse(job.telemetry_persisted)  # still blocked on the history lock
+        self.assertIn(waited["phaseMetrics"]["status"], {"pending", "complete"})
+        fcntl.flock(holder.fileno(), fcntl.LOCK_UN)
+        status = self.settled(state, waited)
+        self.assertNotIn("phaseMetricsPersistError", status)
+        self.assertEqual(status["phaseMetrics"]["status"], "complete")
+        rows, _ = metrics.RotatingJsonl(conductor.timing_history_path(state.paths)).read_rows()
+        self.assertEqual([row["ticket"] for row in rows], [waited["ticket"]])
+
+        # A lock held past the bounded deadline becomes a persistence error.
+        stuck = self.make_state("history-lock-timeout")
+        stuck.timing_history.lock_timeout = 0.2
+        self.hold_history_lock(stuck)
+        waited = self.run_child_job(stuck, self.CHILD)
+        status = self.settled(stuck, waited)
+        self.assertEqual(status["exitCode"], 0)
+        self.assertIn("history lock busy", status["phaseMetricsPersistError"])
+        self.assertTrue((stuck.paths.jobs_dir / f"{waited['ticket']}.timings.json").exists())
+
+    def enqueue_blocked(self, state: conductor.DaemonState, lane: str) -> conductor.Job:
+        """Enqueue a job that stays queued: its lane is held by a foreign ticket."""
+        argv = [sys.executable, "-c", "pass"]
+        with state.condition:
+            state.active_lanes[lane] = "blocker"
+        with mock.patch.object(
+            state.registry, "prepare", return_value=(argv, [lane], state.paths.repo_root, {}, 30.0)
+        ), mock.patch.object(conductor, "operation_requires_global_heavy_slot", return_value=False):
+            ticket = state.enqueue({"operation": "build", "args": {}, "env": {}})["ticket"]
+        job = state.jobs[ticket]
+        self.assertEqual(job.state, "queued")
+        return job
+
+    def assert_undispatched_timing_persisted(self, state: conductor.DaemonState, job: conductor.Job) -> None:
+        self.assertEqual((job.state, job.exit_code), ("canceled", 130))
+        self.assertIsNone(job.telemetry_dispatch_ns)
+        self.assertTrue(state._await_job_telemetry(10.0))  # private drain; no status/wait query
+        self.assertIsNone(job.telemetry_persist_error)
+        jobs_dir = state.paths.jobs_dir
+        timings = json.loads((jobs_dir / f"{job.ticket}.timings.json").read_text())
+        self.assertTrue((jobs_dir / f"{job.ticket}.timing-events.jsonl").exists())
+        phase = timings["phaseMetrics"]
+        self.assertEqual(job.phase_metrics, phase)
+        self.assertEqual(phase["intervals"]["queueWait"]["quality"], "unavailable")
+        self.assertEqual(phase["intervals"]["acceptedToLaneRelease"]["quality"], "unavailable")
+        rows, _ = metrics.RotatingJsonl(conductor.timing_history_path(state.paths)).read_rows()
+        self.assertEqual([(row["ticket"], row["exitCode"]) for row in rows], [(job.ticket, 130)])
+
+    def test_queued_cancel_persists_timing_without_a_status_or_wait_query(self) -> None:
+        # OracleA-008: terminal before dispatch, never queried.
+        state = self.make_state("queued-cancel")
+        violations = self.install_lock_guards(state)
+        job = self.enqueue_blocked(state, "style")
+        state.job_cancel(job.ticket, None)
+        self.assert_undispatched_timing_persisted(state, job)
+        self.assertEqual(violations, [])
+
+    def test_queued_supersede_persists_timing_without_a_status_or_wait_query(self) -> None:
+        state = self.make_state("queued-supersede")
+        job = self.enqueue_blocked(state, "liveApp")
+        with state.condition:
+            superseded, _ = state._supersede_live_app_jobs_locked(mock.Mock(ticket="newer"), "app relaunch")
+        self.assertEqual([(item["ticket"], item["cancellationState"]) for item in superseded], [(job.ticket, "canceled")])
+        self.assert_undispatched_timing_persisted(state, job)
+
+    def test_queued_force_stop_persists_timing_without_a_status_or_wait_query(self) -> None:
+        state = self.make_state("queued-stop")
+        job = self.enqueue_blocked(state, "style")
+        state.stop(force=True)
+        self.assert_undispatched_timing_persisted(state, job)
+
+    @contextlib.contextmanager
+    def failing_timing_worker(self, failure: str) -> Any:
+        """Fail only the timing worker's thread construction or start; other threads run."""
+        real_thread = threading.Thread
+
+        class SelectiveThread(real_thread):  # type: ignore[misc, valid-type]
+            def __init__(self, *args: Any, **kwargs: Any) -> None:
+                if failure == "construct" and str(kwargs.get("name", "")).startswith("timing-"):
+                    raise RuntimeError("injected timing worker construction failure")
+                super().__init__(*args, **kwargs)
+
+            def start(self) -> None:
+                if failure == "start" and self.name.startswith("timing-"):
+                    raise RuntimeError("can't start new thread (injected)")
+                super().start()
+
+        with mock.patch.object(conductor.threading, "Thread", SelectiveThread):
+            yield
+
+    def assert_timing_worker_failure_recorded(self, state: conductor.DaemonState, job: conductor.Job) -> None:
+        self.assertEqual((job.state, job.exit_code), ("canceled", 130))
+        self.assertNotIn(job.ticket, state.queue)
+        self.assertEqual(state._telemetry_completions, 0)
+        self.assertTrue(job.telemetry_persisted)
+        self.assertIn("timing worker", job.telemetry_persist_error)
+        self.assertTrue(state._await_job_telemetry(1.0))
+        status = state.job_status(job.ticket, None)
+        self.assertEqual(status["state"], "canceled")
+        self.assertEqual(status["phaseMetrics"], {"schema": 1, "status": "failed", "telemetryError": job.telemetry_persist_error})
+        self.assertEqual(status["phaseMetricsPersistError"], job.telemetry_persist_error)
+        self.assertFalse((state.paths.jobs_dir / f"{job.ticket}.timings.json").exists())
+        self.assertFalse(conductor.timing_history_path(state.paths).exists())
+
+    def test_timing_worker_failure_never_escapes_queued_cancel(self) -> None:
+        # R3-S2-P1-01: optional timing must not turn a cancellation into an RPC error.
+        for failure in ("construct", "start"):
+            with self.subTest(failure=failure):
+                state = self.make_state(f"cancel-worker-{failure}")
+                violations = self.install_lock_guards(state)
+                job = self.enqueue_blocked(state, "style")
+                with self.failing_timing_worker(failure):
+                    payload = state.job_cancel(job.ticket, None)
+                self.assertEqual((payload["state"], payload["exitCode"]), ("canceled", 130))
+                self.assert_timing_worker_failure_recorded(state, job)
+                self.assertEqual(violations, [])
+
+    def test_timing_worker_failure_never_escapes_queued_supersession(self) -> None:
+        for failure in ("construct", "start"):
+            with self.subTest(failure=failure):
+                state = self.make_state(f"supersede-worker-{failure}")
+                violations = self.install_lock_guards(state)
+                jobs = [self.enqueue_blocked(state, "liveApp") for _ in range(2)]
+                with self.failing_timing_worker(failure), state.condition:
+                    superseded, _ = state._supersede_live_app_jobs_locked(mock.Mock(ticket="newer"), "app relaunch")
+                self.assertEqual(
+                    [(item["ticket"], item["cancellationState"]) for item in superseded],
+                    [(job.ticket, "canceled") for job in jobs],
+                )
+                for job in jobs:
+                    self.assert_timing_worker_failure_recorded(state, job)
+                self.assertEqual(violations, [])
+
+    def test_timing_worker_failure_never_escapes_queued_force_stop(self) -> None:
+        for failure in ("construct", "start"):
+            with self.subTest(failure=failure):
+                state = self.make_state(f"stop-worker-{failure}")
+                violations = self.install_lock_guards(state)
+                jobs = [self.enqueue_blocked(state, "style") for _ in range(3)]
+                server = mock.Mock()
+                state.server = server
+                with self.failing_timing_worker(failure):
+                    payload = state.stop(force=True)
+                self.assertTrue(payload["shutdownRequested"])
+                deadline = time.monotonic() + 5.0
+                while not server.shutdown.called and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                server.shutdown.assert_called_once_with()  # the original shutdown thread still ran
+                for job in jobs:
+                    self.assert_timing_worker_failure_recorded(state, job)
+                self.assertEqual(violations, [])
+
+    def test_launchd_plist_forwards_the_kill_switch_and_status_reports_the_mode(self) -> None:
+        # OracleA-007 / RV-R2-S2-P1-01: launchd does not inherit the client environment.
+        paths = timing_paths(self.root / "launchd")
+        script = Path(conductor.__file__).resolve()
+        for setting in ("off", "on", None):
+            env = {key: value for key, value in os.environ.items() if key != conductor.TIMING_ENV_KEY}
+            if setting is not None:
+                env[conductor.TIMING_ENV_KEY] = setting
+            with self.subTest(setting=setting), mock.patch.dict(os.environ, env, clear=True):
+                bootstrapped: list[list[str]] = []
+                with mock.patch.object(conductor, "bootout_daemon_launchd"), mock.patch.object(
+                    conductor, "run_launchctl", side_effect=lambda args: bootstrapped.append(list(args)) or 0
+                ), mock.patch.object(conductor, "spawn_daemon_direct") as direct:
+                    conductor.spawn_daemon(paths, script)
+                direct.assert_not_called()
+                plist_path = conductor.daemon_launchd_plist_path(paths)
+                self.assertEqual(bootstrapped, [["bootstrap", f"gui/{os.getuid()}", str(plist_path)]])
+                with plist_path.open("rb") as handle:
+                    environment = conductor.plistlib.load(handle)["EnvironmentVariables"]
+                expected = {
+                    "REPOPROMPT_DEV_DAEMON_STATE_DIR": str(paths.state_dir),
+                    "REPOPROMPT_DEV_DAEMON_SOCKET": str(paths.socket_path),
+                }
+                if setting is not None:
+                    expected[conductor.TIMING_ENV_KEY] = setting
+                self.assertEqual(environment, expected)
+                # The daemon started with that environment reports the effective mode.
+                with mock.patch.dict(os.environ, environment):
+                    started = conductor.DaemonState(timing_paths(self.root / f"launchd-{setting}"))
+                status = started.status_payload()
+                self.assertEqual(status["timingEnabled"], setting != "off")
+                self.assertEqual(status["timing"]["setting"], setting)
+                self.assertEqual(status["timing"]["readAt"], "daemon start")
+                with contextlib.redirect_stdout(io.StringIO()) as rendered:
+                    conductor.render_daemon_status(status)
+                source = f"RPCE_CONDUCTOR_TIMING={setting}" if setting is not None else "RPCE_CONDUCTOR_TIMING unset"
+                mode = "disabled" if setting == "off" else "enabled"
+                self.assertIn(f"timing:   {mode} ({source} at daemon start)", rendered.getvalue())
+        # The kill switch never enters request identity or job environments.
+        state = self.make_state("identity-env")
+        request = {"operation": "build", "args": {}, "env": {conductor.TIMING_ENV_KEY: "off"}}
+        self.assertNotIn(conductor.TIMING_ENV_KEY, state.registry._request_env_snapshot(request))
+        self.assertNotIn(conductor.TIMING_ENV_KEY, conductor.OperationRegistry.PASSTHROUGH_ENV_KEYS)
+
+    def test_daemon_start_reports_a_running_daemon_timing_mismatch_without_restarting(self) -> None:
+        paths = timing_paths(self.root / "mismatch")
+        running = self.make_state("mismatch-running").status_payload()  # enabled, variable unset
+        env = dict(os.environ, **{conductor.TIMING_ENV_KEY: "off"})
+        with mock.patch.dict(os.environ, env, clear=True), mock.patch.object(
+            conductor, "ensure_daemon", return_value=running
+        ) as ensure, mock.patch.object(conductor, "spawn_daemon") as spawn, mock.patch.object(
+            conductor, "request_daemon"
+        ) as request:
+            with contextlib.redirect_stdout(io.StringIO()) as out, contextlib.redirect_stderr(io.StringIO()) as err:
+                self.assertEqual(conductor.handle_daemon_command(paths, ["start", "--json"]), 0)
+        ensure.assert_called_once_with(paths, start_if_needed=True)
+        spawn.assert_not_called()
+        request.assert_not_called()
+        notice = json.loads(out.getvalue())["timingNotice"]
+        self.assertEqual(err.getvalue().strip(), notice)
+        self.assertIn("has timing enabled (RPCE_CONDUCTOR_TIMING unset at its start)", notice)
+        self.assertIn("asks for disabled", notice)
+        self.assertIn("was not restarted", notice)
+        self.assertIsNone(conductor.daemon_timing_notice(running, {}))
+        self.assertIsNone(conductor.daemon_timing_notice(running, {conductor.TIMING_ENV_KEY: "on"}))
+        self.assertIsNone(conductor.daemon_timing_notice({"pid": 1}, {conductor.TIMING_ENV_KEY: "off"}))
+        # A daemon whose helper failed to load names that cause, not the variable.
+        no_helper = dict(running, timingEnabled=False, timing=dict(running["timing"], enabled=False, helperLoaded=False))
+        self.assertIn("(timing helper not loaded at its start)", conductor.daemon_timing_notice(no_helper, {}))
+        with contextlib.redirect_stdout(io.StringIO()) as rendered:
+            conductor.render_daemon_status(no_helper)
+        self.assertIn("timing:   disabled (timing helper not loaded at daemon start)", rendered.getvalue())
 
 
 if __name__ == "__main__":

@@ -1,0 +1,165 @@
+{
+  "version": 1,
+  "description": "Comparison gates for Scripts/conductor_benchmark.py compare. Exit 0 qualified, 1 established regression, 2 inconclusive, 3 harness failure. Captures must be complete (state complete, no errors), cover every measured block of every profile workload, and report exactly the metric/equivalence inventory that the current versioned adapter contract requires for the pinned manifest and recorded settings (a recorded inventory that differs from it, an unpinned manifest, or another adapter version is a harness failure) with finite values; otherwise the result is a harness failure. Every profile gate must match at least one measured metric, or the result is inconclusive. Captures made with smoke overrides (--samples, --artifact-scale, --rss-jobs) or below the manifest/minimum sample counts are never acceptance evidence. A metric without a profile gate must show no regression: its paired/unpaired bootstrap 95% CI upper bound must stay within max(relativeFloor x baseline median, absoluteFloor). Minimum samples follow the workload's sampling class (plan Step 1: 30 paired samples for fast workloads, at least 10 fresh-process pairs for retained-memory and artifact workloads). A suspected regression is established only by a confirming batch from an independent, clean, complete capture of the same targets. requireGolden lists the arms whose summary digests must equal summary-golden.json and whose exact PTY visible tail (output.pty.fidelity.exact_tail_sha256) must equal the manifest's pinned expectedTailSha256. contamination is the predeclared foreign-CPU gate: samples are grouped in run order into windows of at least windowSeconds, and any measured sample in a window whose average foreign CPU (host busy CPUs minus the capture's own CPU, including reaped descendants) exceeds maxForeignCores makes its workload inconclusive, as do missing counters; it can never make a result pass. The Mach host counters publish about once per second, so a window shorter than several seconds is quantization noise; 10 s windows bound it near 10%. referenceMax values are reference-host targets, enforced only with --enforce-reference-targets.",
+  "classes": {
+    "fast_python_ms": {
+      "relativeFloor": 0.05,
+      "absoluteFloor": 2.0
+    },
+    "artifact_ms": {
+      "relativeFloor": 0.05,
+      "absoluteFloor": 100.0
+    },
+    "memory_mib": {
+      "relativeFloor": 0.05,
+      "absoluteFloor": 0.25
+    },
+    "count": {
+      "relativeFloor": 0.0,
+      "absoluteFloor": 0.0
+    }
+  },
+  "contamination": {
+    "maxForeignCores": 4.0,
+    "windowSeconds": 10.0
+  },
+  "profiles": {
+    "no-regression": {
+      "description": "Behavior-preserving change: default workloads equivalent and not slower.",
+      "workloads": [
+        "output",
+        "summary",
+        "mem",
+        "cli"
+      ],
+      "requireGolden": [
+        "baseline"
+      ]
+    },
+    "no-regression-full": {
+      "description": "Behavior-preserving change: all workloads equivalent and not slower.",
+      "workloads": [
+        "output",
+        "summary",
+        "mem",
+        "cli",
+        "artifact",
+        "rss"
+      ],
+      "requireGolden": [
+        "baseline"
+      ]
+    },
+    "calibration-output": {
+      "description": "Output-only A/A calibration of the no-regression floors (the same target in both arms). Calibration evidence only; it never qualifies Step 1 or any step.",
+      "workloads": [
+        "output"
+      ]
+    },
+    "step3-output-summary": {
+      "description": "Plan Step 3 gates. Tail and summary digests may change (OD7, SUMMARY_VERSION 2); XCTest progress evidence must not. Two distinct tail allowances: output.*.tail_sha256 is the timed variants' tail evidence (512-byte normalized PTY suffix, full pipe tail); output.pty.fidelity.exact_tail_sha256 is the complete exact PTY visible tail, which OD7 changes shape (CR-segmented, ANSI-stripped, capped entries). The baseline must still match the pinned v1 expected tail. Classification equivalence and lock-hold p99 are proven by self-tests and profiled runs, not here.",
+      "workloads": [
+        "output",
+        "summary",
+        "mem"
+      ],
+      "allowChangedEquivalence": [
+        "output.*.tail_sha256",
+        "output.pty.fidelity.exact_tail_sha256",
+        "summary.*.sha256",
+        "mem.seen_*.payload_sha256"
+      ],
+      "gates": [
+        {
+          "metric": "output.*.w0.cpu_ms",
+          "maxRatio": 0.5,
+          "referenceMax": 50.0
+        },
+        {
+          "metric": "output.*.w4.cpu_ms",
+          "maxRatio": 0.25,
+          "referenceMax": 100.0
+        },
+        {
+          "metric": "output.*.w4.wall_ms",
+          "maxRatio": 0.25,
+          "referenceMax": 250.0
+        },
+        {
+          "metric": "summary.fixture.total_cpu_ms",
+          "maxRatio": 0.65
+        },
+        {
+          "metric": "mem.seen_growth_100k_1m_mib",
+          "maxValue": 1.0
+        }
+      ],
+      "requireGolden": [
+        "baseline"
+      ]
+    },
+    "step4-ledger": {
+      "description": "Plan Step 4: ledger-attributable retained heap <= 4 MiB after 200 jobs and >= 95% below baseline.",
+      "workloads": [
+        "mem"
+      ],
+      "gates": [
+        {
+          "metric": "mem.ledger_retained_n200_mib",
+          "maxValue": 4.0,
+          "maxRatio": 0.05
+        }
+      ]
+    },
+    "step6-launcher": {
+      "description": "Plan Step 6: cli median at least 15 ms lower, no p90 regression beyond 10% and 10 ms; <= 60 ms is a reference-host target.",
+      "workloads": [
+        "cli"
+      ],
+      "gates": [
+        {
+          "metric": "cli.*_ms",
+          "minImprovement": 15.0,
+          "maxP90Increase": {
+            "ratio": 0.1,
+            "absolute": 10.0
+          },
+          "referenceMax": 60.0
+        }
+      ]
+    },
+    "step7-artifact": {
+      "description": "Plan Step 7: artifact wall and integrity time <= 0.70x baseline; per test-artifact job 2 fingerprints, 2 source snapshots, 1 toolchain query.",
+      "workloads": [
+        "artifact"
+      ],
+      "gates": [
+        {
+          "metric": "artifact.run_wall_ms",
+          "maxRatio": 0.7
+        },
+        {
+          "metric": "artifact.integrity_ms",
+          "maxRatio": 0.7
+        },
+        {
+          "metric": "artifact.fingerprint_calls",
+          "exact": 2
+        },
+        {
+          "metric": "artifact.source_snapshot_calls",
+          "exact": 2
+        },
+        {
+          "metric": "artifact.toolchain_calls",
+          "exact": 1
+        }
+      ]
+    }
+  },
+  "minSamples": {
+    "fast": 30,
+    "memory": 10,
+    "artifact": 10
+  }
+}

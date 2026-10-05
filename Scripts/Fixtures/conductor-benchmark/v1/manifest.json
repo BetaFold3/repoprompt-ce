@@ -1,0 +1,73 @@
+{
+  "fixtureVersion": 1,
+  "description": "Conductor benchmark fixture v1: seeds and sizes only; large inputs are generated at runtime by Scripts/conductor_benchmark.py.",
+  "output": {
+    "seed": 20261004,
+    "sizeBytes": 5242880,
+    "sha256": "01be10d274e2deaa4eed53b6f2db9ab44802aa717c593e460bdaec4d8da51a3c",
+    "generator": "SplitMix64 swift-build/XCTest log v1",
+    "ptyFidelity": {
+      "generator": "generate_pty_fidelity_fixture v1 (36 visible-tail entries; ONLCR-translated size within the 1024-byte PTY output queue)",
+      "sizeBytes": 915,
+      "sha256": "92494dc3531b3da9f00da09a4e9e7248f3d42d372262ef9c0c394aa790117d8a",
+      "expectedTailSha256": "7928c4cdba813492ed1e27ec52062b397d163dbf16aa8b4cb1ba87940fe082ac",
+      "expectedTailSource": "canonical JSON digest of the parent conductor's 30-entry job tail for the exact PTY delivery; equals the LF-record/splitlines reference model"
+    }
+  },
+  "summary": {
+    "modes": [
+      [
+        "test",
+        "completed",
+        0
+      ],
+      [
+        "test",
+        "failed",
+        1
+      ],
+      [
+        "lint",
+        "completed",
+        0
+      ],
+      [
+        "lint",
+        "failed",
+        1
+      ]
+    ],
+    "input": "output fixture after PTY ONLCR translation",
+    "golden": "summary-golden.json"
+  },
+  "mem": {
+    "ledgerJobs": [
+      56
+    ],
+    "ledgerJobsFull": [
+      56,
+      200
+    ],
+    "seenLines": [
+      100000
+    ],
+    "seenLinesFull": [
+      100000,
+      1000000
+    ]
+  },
+  "artifact": {
+    "executableBytes": 490733568,
+    "dsymBytes": 660602880,
+    "dsymPath": "Contents/MacOS/RepoPromptCEPackageTests.dSYM/Contents/Resources/DWARF/RepoPromptCEPackageTests"
+  },
+  "rss": {
+    "retainedJobs": 56,
+    "outputLinesPerJob": 2000
+  },
+  "samples": {
+    "fast": 30,
+    "memory": 10,
+    "artifact": 10
+  }
+}

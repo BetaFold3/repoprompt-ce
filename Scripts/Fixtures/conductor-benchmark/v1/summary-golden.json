@@ -1,0 +1,11 @@
+{
+  "digests": {
+    "summary.lint.completed.sha256": "9df0157c9d9a36890f637d6e22ce8b75e7b8081a503608bccc6442fc05c7d117",
+    "summary.lint.failed.sha256": "b3c5dfbd5461780d24e6fcaf1f8145e3389e6f694da9fb0b1db545cdb1cba17e",
+    "summary.test.completed.sha256": "23edf8ad68089080d06b2077ccc983d2353aaef0237c3f73387d62a12385817a",
+    "summary.test.failed.sha256": "11676406099059b19096bb0a479a1d34ca9744329a2e852a31c7ad416551a939"
+  },
+  "fixtureVersion": 1,
+  "source": "OutputSummarizer.summarize_file at parent ee811f46 (conductorDigest 3582ec18a2c11799279c9e37fabb1b394cd6393a0e382119cf3913e8ab379cde)",
+  "summaryVersion": 1
+}

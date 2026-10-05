@@ -1,0 +1,52 @@
+{
+  "description": "Debug packaging: ==> headings are context only, three product builds without their own command lines open build_start segments, xtrace commands without Swift activity never materialize segments, negative signed residual.",
+  "originNs": 0,
+  "steps": [
+    {"boundary": "command_start", "atMs": 0, "metadata": {"command": "/repo/Scripts/package_app.sh debug"}},
+    {"atMs": 10, "chunk": "==> [2026-10-05 11:02:59] Loading release metadata (previous: 0s, total: 0s)\n==> [2026-10-05 11:02:59] Checking build environment (previous: 0s, total: 0s)\n+ /repo/Scripts/doctor.sh --quiet \nUsing signing identity: Example Identity\n==> [2026-10-05 11:03:00] Patching KeyboardShortcuts resource lookup (previous: 1s, total: 1s)\n==> [2026-10-05 11:03:00] Building RepoPrompt (debug, host-native) (previous: 0s, total: 1s)\n"},
+    {"atMs": 1000, "chunk": "Building for debugging...\n[0/3] Write swift-version--58304C5D6DBC2206.txt\n[3/6] Compiling RepoPromptApp AgentPreviewPanelView.swift\n[4/6] Emitting module RepoPromptApp\n[16/19] Compiling RepoPrompt RepoPromptExecutable.swift\n[18/19] Linking RepoPrompt\n[19/19] Applying RepoPrompt\n"},
+    {"atMs": 23000, "chunk": "Build of product 'RepoPrompt' complete! (22.37s)\n==> [2026-10-05 11:03:23] Building repoprompt-mcp (debug, host-native) (previous: 23s, total: 24s)\nBuilding for debugging...\n"},
+    {"atMs": 23500, "chunk": "[0/3] Write swift-version--58304C5D6DBC2206.txt\n"},
+    {"atMs": 24300, "chunk": "Build of product 'repoprompt-mcp' complete! (1.23s)\n"},
+    {"atMs": 24310, "chunk": "==> [2026-10-05 11:03:25] Building repoprompt-gateway (debug, host-native) (previous: 2s, total: 26s)\nBuilding for debugging...\n"},
+    {"atMs": 25400, "chunk": "[0/3] Write swift-version--58304C5D6DBC2206.txt\nBuild of product 'repoprompt-gateway' complete! (1.04s)\n"},
+    {"atMs": 25500, "chunk": "==> [2026-10-05 11:03:26] Resolving build artifact paths (previous: 1s, total: 27s)\n+ /repo/Scripts/canonical_swift.sh build -c debug --show-bin-path \nBUILD_DIR=/repo/.build/arm64-apple-macosx/debug\n==> [2026-10-05 11:03:27] Creating app bundle layout (previous: 1s, total: 28s)\n+ rm -rf /tmp/RepoPrompt\\ CE\\ Dev.app \n+ mkdir -p /tmp/RepoPrompt\\ CE\\ Dev.app/Contents/MacOS \n+ cp /repo/.build/arm64-apple-macosx/debug/RepoPrompt /tmp/RepoPrompt\\ CE\\ Dev.app/Contents/MacOS/RepoPrompt \n"},
+    {"atMs": 30000, "chunk": "==> [2026-10-05 11:03:34] Completed packaging in 35s\n"},
+    {"eof": true, "atMs": 30000}
+  ],
+  "expect": {
+    "status": "complete",
+    "commandCount": 6,
+    "ignoredCommandMarkers": 0,
+    "segments.#": 3,
+    "segments.0.openedBy": "build_start",
+    "segments.0.command": null,
+    "segments.0.context": "[2026-10-05 11:03:00] Building RepoPrompt (debug, host-native) (previous: 0s, total: 1s)",
+    "segments.0.openOffsetNs": 1000000000,
+    "segments.0.timeToFirstBuildWork": {"ns": 0, "quality": "observed_wall"},
+    "segments.0.buildProduct": "RepoPrompt",
+    "segments.0.reportedBuild": {"ns": 22370000000, "quality": "reported_duration"},
+    "segments.0.preCompletionResidual": {"ns": -370000000, "quality": "observed_wall", "signed": true},
+    "segments.0.linkedProducts": ["RepoPrompt"],
+    "segments.0.linkToBuildComplete": {"ns": 22000000000, "quality": "observed_wall"},
+    "segments.0.segmentWall": {"ns": 22000000000, "quality": "observed_wall"},
+    "segments.0.modules": {
+      "RepoPrompt": {"compiledFiles": 1, "exact": true, "emittedModule": false},
+      "RepoPromptApp": {"compiledFiles": 1, "exact": true, "emittedModule": true}
+    },
+    "segments.1.openedBy": "build_start",
+    "segments.1.context": "[2026-10-05 11:03:23] Building repoprompt-mcp (debug, host-native) (previous: 23s, total: 24s)",
+    "segments.1.openOffsetNs": 23000000000,
+    "segments.1.buildProduct": "repoprompt-mcp",
+    "segments.1.reportedBuild": {"ns": 1230000000, "quality": "reported_duration"},
+    "segments.1.preCompletionResidual": {"ns": 70000000, "quality": "observed_wall", "signed": true},
+    "segments.1.linkToBuildComplete": {"ns": null, "quality": "unavailable"},
+    "segments.2.openedBy": "build_start",
+    "segments.2.context": "[2026-10-05 11:03:25] Building repoprompt-gateway (debug, host-native) (previous: 2s, total: 26s)",
+    "segments.2.openOffsetNs": 24310000000,
+    "segments.2.buildProduct": "repoprompt-gateway",
+    "segments.2.preCompletionResidual": {"ns": 50000000, "quality": "observed_wall", "signed": true},
+    "segments.2.segmentWall": {"ns": 1190000000, "quality": "observed_wall"},
+    "segments.2.buildCompleteToFirstSuite": {"ns": null, "quality": "unavailable"}
+  }
+}

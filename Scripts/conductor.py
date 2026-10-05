@@ -18,6 +18,7 @@ import difflib
 import errno
 import fcntl
 import hashlib
+import importlib.util
 import json
 import math
 import os
@@ -35,9 +36,115 @@ import time
 import uuid
 from collections import deque
 from pathlib import Path
-from typing import Any, Deque, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Deque, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from debug_app_process import ProcessIdentityError, matching_processes, terminate_matching_processes
+
+
+def _load_pipeline_metrics() -> Optional[Any]:
+    """Load ``swift_pipeline_metrics.py`` from this file's directory, or ``None``.
+
+    Loaded by explicit path so a conductor copy never picks up another checkout's
+    helper from ``sys.path``. Telemetry is optional: any failure leaves the
+    conductor fully functional with timing disabled.
+    """
+    try:
+        path = Path(__file__).resolve().with_name("swift_pipeline_metrics.py")
+        existing = sys.modules.get("swift_pipeline_metrics")
+        if existing is not None and Path(getattr(existing, "__file__", "") or "").resolve() == path:
+            return existing
+        name = (
+            "swift_pipeline_metrics"
+            if existing is None
+            else "_rpce_swift_pipeline_metrics_" + hashlib.sha256(str(path).encode("utf-8")).hexdigest()[:12]
+        )
+        if name in sys.modules:
+            return sys.modules[name]
+        spec = importlib.util.spec_from_file_location(name, path)
+        if spec is None or spec.loader is None:
+            return None
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[name] = module
+        try:
+            spec.loader.exec_module(module)
+        except BaseException:
+            sys.modules.pop(name, None)
+            raise
+        return module
+    except Exception:
+        return None
+
+
+PIPELINE_METRICS = _load_pipeline_metrics()
+
+
+def compute_conductor_digest() -> Optional[str]:
+    """Informational content digest of the conductor implementation files."""
+    script = Path(__file__).resolve()
+    paths = [script]
+    for name in ("swift_pipeline_metrics.py", "debug_app_process.py"):
+        candidate = script.with_name(name)
+        if candidate.is_file():
+            paths.append(candidate)
+    if PIPELINE_METRICS is not None:
+        try:
+            return PIPELINE_METRICS.content_digest(paths)
+        except Exception:
+            return None
+    try:
+        return "sha256:" + hashlib.sha256(script.read_bytes()).hexdigest()
+    except OSError:
+        return None
+
+
+# Computed once at module load: a daemon reports the bytes it started with.
+CONDUCTOR_DIGEST = compute_conductor_digest()
+TIMING_RUNNER_PATH_ENV_KEY = "RPCE_CONDUCTOR_RUNNER_TIMINGS_PATH"
+# Kill switch, read once at daemon start; forwarded into the launchd plist.
+TIMING_ENV_KEY = "RPCE_CONDUCTOR_TIMING"
+# Daemon exit waits at most this long for already-started timing persistence
+# (never on a client request path).
+TIMING_DRAIN_SECONDS = 2.0
+CLIENT_METRICS_MAX_ITEMS = 16
+TIMING_FILE_SUFFIXES = (".timing-events.jsonl", ".timings.json", ".runner-timings.json")
+_ARTIFACT_OPERATION_SINK = threading.local()
+
+
+@contextlib.contextmanager
+def artifact_operation_sink(sink: Optional[Any]) -> Any:
+    """Route fingerprint/evaluation timing on this thread to ``sink`` (or nowhere)."""
+    previous = getattr(_ARTIFACT_OPERATION_SINK, "sink", None)
+    _ARTIFACT_OPERATION_SINK.sink = sink
+    try:
+        yield
+    finally:
+        _ARTIFACT_OPERATION_SINK.sink = previous
+
+
+def _resolve_operation_sink(sink: Optional[Any]) -> Optional[Any]:
+    return sink if sink is not None else getattr(_ARTIFACT_OPERATION_SINK, "sink", None)
+
+
+def _emit_operation(sink: Optional[Any], name: str, duration_ns: int, counters: Optional[Dict[str, int]] = None) -> None:
+    if sink is None:
+        return
+    try:
+        sink(name, duration_ns, counters)
+    except Exception:
+        pass
+
+
+def timing_history_path(paths: "Paths") -> Path:
+    return paths.state_dir / "metrics" / "build-metrics.jsonl"
+
+
+def read_runner_timings(path: Path) -> Optional[Dict[str, Any]]:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return value if isinstance(value, dict) else None
+
 
 PROTOCOL_VERSION = 15
 TERMINAL_STATES = {"completed", "failed", "canceled"}
@@ -150,6 +257,11 @@ Job commands:
   ./conductor job wait --request-key <key> [--timeout <seconds>] [--json] [--full-log]
   ./conductor job cancel <ticket> [--json]
   ./conductor job cancel --request-key <key> [--json]
+
+Timing metrics:
+  ./conductor metrics [--last N] [--kind K] [--ticket T] [--json]   # reads <state dir>/metrics/build-metrics.jsonl
+  RPCE_CONDUCTOR_TIMING=off, read at daemon start, disables per-job timing (overhead kill switch);
+    a running daemon keeps its mode (shown by 'daemon status'): stop it when idle, then start with the variable
 
 Operation commands:
   ./conductor doctor
@@ -492,6 +604,7 @@ def build_ticket_payload(
     job: "Job",
     env: Dict[str, str],
     snapshot: Optional[Dict[str, Any]] = None,
+    sink: Optional[Any] = None,
 ) -> Optional[Dict[str, Any]]:
     if snapshot is None:
         snapshot = source_snapshot(repo_root, env)
@@ -507,7 +620,7 @@ def build_ticket_payload(
         "source_snapshot": snapshot,
         "env_gates": artifact_env_gates(env),
         "toolchain": toolchain,
-        "artifact_fingerprint": test_artifact_fingerprint(artifact_path),
+        "artifact_fingerprint": test_artifact_fingerprint(artifact_path, sink=sink),
     }
 
 
@@ -554,7 +667,21 @@ def discover_test_artifact_executable(artifact_path: Path) -> Optional[Path]:
     return None
 
 
-def test_artifact_fingerprint(artifact_path: Path) -> Dict[str, Any]:
+def test_artifact_fingerprint(artifact_path: Path, sink: Optional[Any] = None) -> Dict[str, Any]:
+    """Fingerprint the test artifact; ``sink`` (or the thread's ambient sink) gets
+    one ``artifact_fingerprint`` operation with bytes/files hashed and duration."""
+    sink = _resolve_operation_sink(sink)
+    if sink is None:
+        return _test_artifact_fingerprint(artifact_path, None)
+    counters = {"bytesHashed": 0, "filesHashed": 0}
+    start = time.monotonic_ns()
+    try:
+        return _test_artifact_fingerprint(artifact_path, counters)
+    finally:
+        _emit_operation(sink, "artifact_fingerprint", time.monotonic_ns() - start, counters)
+
+
+def _test_artifact_fingerprint(artifact_path: Path, counters: Optional[Dict[str, int]]) -> Dict[str, Any]:
     executable = discover_test_artifact_executable(artifact_path)
     if executable is None:
         raise ArtifactUnavailableError(
@@ -566,6 +693,10 @@ def test_artifact_fingerprint(artifact_path: Path) -> Dict[str, Any]:
         with executable.open("rb") as handle:
             for chunk in iter(lambda: handle.read(1024 * 1024), b""):
                 digest.update(chunk)
+                if counters is not None:
+                    counters["bytesHashed"] += len(chunk)
+        if counters is not None:
+            counters["filesHashed"] += 1
     except OSError as exc:
         raise ArtifactUnavailableError(
             f"root test artifact executable is unreadable ({exc}); run `make dev-test` first"
@@ -605,6 +736,10 @@ def test_artifact_fingerprint(artifact_path: Path) -> Dict[str, Any]:
                     with path.open("rb") as handle:
                         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
                             file_digest.update(chunk)
+                            if counters is not None:
+                                counters["bytesHashed"] += len(chunk)
+                    if counters is not None:
+                        counters["filesHashed"] += 1
                     manifest_lines.append(
                         f"{relative_path}\0{file_metadata.st_size}\0{file_metadata.st_mtime_ns}\0"
                         f"{file_digest.hexdigest()}\n"
@@ -643,8 +778,8 @@ def artifact_fingerprint_differences(
     return differences
 
 
-def verify_test_artifact_fingerprint(artifact_path: Path, recorded: Any) -> Dict[str, Any]:
-    current = test_artifact_fingerprint(artifact_path)
+def verify_test_artifact_fingerprint(artifact_path: Path, recorded: Any, sink: Optional[Any] = None) -> Dict[str, Any]:
+    current = test_artifact_fingerprint(artifact_path, sink=sink)
     differences = artifact_fingerprint_differences(recorded, current)
     if differences:
         raise ArtifactUnavailableError(
@@ -684,6 +819,25 @@ def evaluate_test_artifact(
     repo_root: Path,
     jobs_dir: Path,
     env: Dict[str, str],
+    sink: Optional[Any] = None,
+) -> Dict[str, Any]:
+    """Evaluate the root test artifact; ``sink`` (or the thread's ambient sink)
+    gets one ``artifact_evaluation`` operation plus the nested fingerprint."""
+    sink = _resolve_operation_sink(sink)
+    if sink is None:
+        return _evaluate_test_artifact(repo_root, jobs_dir, env, None)
+    start = time.monotonic_ns()
+    try:
+        return _evaluate_test_artifact(repo_root, jobs_dir, env, sink)
+    finally:
+        _emit_operation(sink, "artifact_evaluation", time.monotonic_ns() - start)
+
+
+def _evaluate_test_artifact(
+    repo_root: Path,
+    jobs_dir: Path,
+    env: Dict[str, str],
+    sink: Optional[Any],
 ) -> Dict[str, Any]:
     ticket_path = jobs_dir / "build-ticket-root.json"
     try:
@@ -703,7 +857,7 @@ def evaluate_test_artifact(
             "root test artifact is missing; run `make dev-test` first"
         )
     current_fingerprint = verify_test_artifact_fingerprint(
-        artifact_path, ticket.get("artifact_fingerprint")
+        artifact_path, ticket.get("artifact_fingerprint"), sink=sink
     )
     current_source = source_snapshot(repo_root, env)
     ticket_source_value = ticket.get("source_snapshot")
@@ -1996,6 +2150,17 @@ class Job:
     diagnostic_paths: List[Path] = dataclasses.field(default_factory=list, repr=False)
     output_summary: Optional[Dict[str, Any]] = None
     tail: Deque[str] = dataclasses.field(default_factory=lambda: deque(maxlen=LOG_TAIL_LINES))
+    # Step 2 passive timing. ``telemetry`` is set once at creation and never
+    # replaced; its private lock is never taken while holding ``condition``.
+    telemetry: Optional[Any] = dataclasses.field(default=None, repr=False, compare=False)
+    telemetry_dispatch_ns: Optional[int] = None
+    telemetry_lane_released: bool = False
+    telemetry_persist_claimed: bool = False
+    telemetry_persisted: bool = False
+    telemetry_persist_error: Optional[str] = None
+    phase_metrics: Optional[Dict[str, Any]] = dataclasses.field(default=None, repr=False)
+    # (wall ns, thread CPU ns) of the published summary, set with ``output_summary``.
+    output_summary_timing: Optional[Tuple[int, int]] = dataclasses.field(default=None, repr=False)
 
     def to_payload(self, include_tail: bool = True, include_summary: bool = True) -> Dict[str, Any]:
         queue_wait_seconds = None
@@ -2060,9 +2225,24 @@ class Job:
             payload["diagnostics"] = list(self.diagnostics)
         if include_summary and self.output_summary is not None:
             payload["outputSummary"] = self.output_summary
+        payload["conductorDigest"] = CONDUCTOR_DIGEST
+        if include_summary:
+            payload["phaseMetrics"] = self.phase_metrics_payload()
+            if self.telemetry_persist_error is not None:
+                payload["phaseMetricsPersistError"] = self.telemetry_persist_error
         if include_tail:
             payload["logTail"] = list(self.tail)
         return payload
+
+    def phase_metrics_payload(self) -> Dict[str, Any]:
+        if self.phase_metrics is not None:
+            return self.phase_metrics
+        if self.telemetry is None:
+            return {"schema": 1, "status": "disabled"}
+        if self.telemetry_persisted:
+            # Completion ended without a payload (worker not started or finalize failed).
+            return {"schema": 1, "status": "failed", "telemetryError": self.telemetry_persist_error}
+        return {"schema": 1, "status": "pending" if self.state in TERMINAL_STATES else "running"}
 
 
 class OperationRegistry:
@@ -2433,6 +2613,258 @@ class DaemonState:
         self.active_lanes: Dict[str, str] = {}
         self.shutdown_requested = False
         self.server: Optional[socketserver.BaseServer] = None
+        # Kill switch read once at daemon start (``RPCE_CONDUCTOR_TIMING=off``).
+        self.timing_setting: Optional[str] = os.environ.get(TIMING_ENV_KEY)
+        if self.timing_setting is not None:
+            self.timing_setting = self.timing_setting[:64]
+        self.timing_enabled = PIPELINE_METRICS is not None and PIPELINE_METRICS.timing_enabled(os.environ)
+        self.timing_history: Optional[Any] = None
+        self._telemetry_completions = 0  # background completions of never-dispatched jobs
+        if self.timing_enabled:
+            try:
+                self.timing_history = PIPELINE_METRICS.RotatingJsonl(timing_history_path(paths))
+            except Exception:
+                self.timing_history = None
+
+    # -- Step 2 passive timing ------------------------------------------------
+    # Lock order: recorder methods are only called without ``self.condition``
+    # held; the recorder never calls back into the daemon. Every hook is
+    # fail-neutral: telemetry errors never change job state or output.
+
+    def attach_job_telemetry(self, operation: str, accepted_ns: Optional[int] = None) -> Optional[Any]:
+        """Create a job recorder (or ``None`` when timing is off) and record acceptance."""
+        if not self.timing_enabled:
+            return None
+        try:
+            accepted = time.monotonic_ns() if accepted_ns is None else accepted_ns
+            recorder = PIPELINE_METRICS.PipelineRecorder(
+                origin_ns=accepted,
+                process="daemon",
+                wall_anchor=(time.time_ns(), time.monotonic_ns()),
+                not_applicable_intervals=() if operation == "test" else ("sourceSnapshot",),
+            )
+            recorder.record_boundary(PIPELINE_METRICS.REQUEST_ACCEPTED, accepted)
+            return recorder
+        except Exception:
+            return None
+
+    @staticmethod
+    def _telemetry_boundary(
+        recorder: Optional[Any],
+        name: str,
+        at_ns: Optional[int] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        if recorder is None:
+            return
+        try:
+            recorder.record_boundary(name, time.monotonic_ns() if at_ns is None else at_ns, metadata)
+        except Exception:
+            pass
+
+    @staticmethod
+    def _telemetry_operation(
+        recorder: Optional[Any],
+        name: str,
+        duration_ns: Optional[int],
+        counters: Optional[Dict[str, int]] = None,
+        origin: str = "",
+        quality: Optional[str] = None,
+    ) -> None:
+        if recorder is None:
+            return
+        try:
+            if quality is None:
+                recorder.record_operation(name, duration_ns, counters, origin)
+            else:
+                recorder.record_operation(name, duration_ns, counters, origin, quality=quality)
+        except Exception:
+            pass
+
+    @staticmethod
+    def _telemetry_sink(recorder: Optional[Any], origin: str) -> Optional[Any]:
+        if recorder is None:
+            return None
+        try:
+            return recorder.operation_sink(origin)
+        except Exception:
+            return None
+
+    def _record_client_metrics(self, recorder: Optional[Any], raw: Any) -> None:
+        """Advisory client-reported durations; bounded and never part of request identity."""
+        if recorder is None or not isinstance(raw, list):
+            return
+        for item in raw[:CLIENT_METRICS_MAX_ITEMS]:
+            if not isinstance(item, dict):
+                continue
+            name = item.get("name")
+            duration = item.get("durationNs")
+            counters = item.get("counters")
+            if not isinstance(name, str) or isinstance(duration, bool) or not isinstance(duration, int):
+                continue
+            clean_counters = None
+            if isinstance(counters, dict):
+                clean_counters = {
+                    str(key)[:64]: value
+                    for key, value in list(counters.items())[:8]
+                    if isinstance(value, int) and not isinstance(value, bool)
+                }
+            self._telemetry_operation(
+                recorder,
+                name[:64],
+                duration,
+                clean_counters,
+                "client",
+                quality=PIPELINE_METRICS.REPORTED_DURATION,
+            )
+
+    def complete_job_telemetry(
+        self,
+        job: Job,
+        operations: Sequence[Tuple[str, Optional[int], Optional[Dict[str, int]], str]] = (),
+    ) -> Optional[Dict[str, Any]]:
+        """Finalize, publish and persist ``job``'s timing once; return the ``phaseMetrics`` payload.
+
+        Called only by the thread that owns the job's terminal transition (the
+        job thread after lane release, or the background completion of a job
+        that was never dispatched), never by a client request. ``phaseMetrics``
+        is published before persistence, and the job result never waits for
+        either: client reads see ``pending`` until this publishes. Persistence
+        runs outside every lock; only the first caller persists.
+        """
+        recorder = job.telemetry
+        if recorder is None:
+            return None
+        with self.condition:
+            summary_timing = job.output_summary_timing
+        if summary_timing is not None:
+            # The published summary's cost, whichever thread produced it.
+            operations = [("output_summary", summary_timing[0], {"threadCpuNs": summary_timing[1]}, "daemon.summary"), *operations]
+        try:
+            for name, duration_ns, counters, origin in operations:
+                self._telemetry_operation(recorder, name, duration_ns, counters, origin)
+            payload = recorder.finalize()
+        except Exception as exc:
+            with self.condition:
+                if not job.telemetry_persist_claimed:
+                    job.telemetry_persist_claimed = True
+                    job.telemetry_persist_error = f"finalize: {type(exc).__name__}: {exc}"[:256]
+                    job.telemetry_persisted = True
+                    self.condition.notify_all()
+            return None
+        with self.condition:
+            claim = not job.telemetry_persist_claimed
+            job.telemetry_persist_claimed = True
+            if job.phase_metrics is None:
+                job.phase_metrics = payload
+            kind = job.operation
+            exit_code = job.exit_code
+            finished_at = job.finished_at
+            self.condition.notify_all()
+        if claim:
+            error = self._persist_job_telemetry(job.ticket, recorder, payload, kind, exit_code, finished_at)
+            with self.condition:
+                job.telemetry_persist_error = error
+                job.telemetry_persisted = True
+                self.condition.notify_all()
+        return payload
+
+    def _complete_undispatched_telemetry_locked(self, job: Job) -> None:
+        """A job made terminal before dispatch: complete its timing off the scheduler lock.
+
+        Intervals it never reached stay unavailable; nothing waits for this.
+        """
+        if job.telemetry is None or job.telemetry_dispatch_ns is not None or job.telemetry_persist_claimed:
+            return
+        self._telemetry_completions += 1
+
+        def complete() -> None:
+            try:
+                self.complete_job_telemetry(job)
+            finally:
+                with self.condition:
+                    self._telemetry_completions -= 1
+                    self.condition.notify_all()
+
+        try:
+            threading.Thread(target=complete, name=f"timing-{job.ticket}", daemon=True).start()
+        except Exception as exc:  # noqa: BLE001 - optional timing never changes the lifecycle
+            # No worker will run: undo the accounting and record a terminal error
+            # without touching the recorder (its lock is never taken under ``condition``).
+            self._telemetry_completions -= 1
+            job.telemetry_persist_claimed = True
+            job.telemetry_persist_error = f"timing worker not started: {type(exc).__name__}: {exc}"[:256]
+            job.telemetry_persisted = True
+            self.condition.notify_all()
+
+    def _await_job_telemetry(self, timeout: float, job: Optional[Job] = None) -> bool:
+        """Private drain for tests, qualification and daemon exit; never on a client path.
+
+        Waits until ``job`` (or every terminal or persisting job) has persisted
+        its timing; returns ``False`` when ``timeout`` expires first.
+        """
+        deadline = time.monotonic() + timeout
+        with self.condition:
+            while True:
+                if job is not None:
+                    pending = job.telemetry is not None and not job.telemetry_persisted
+                else:
+                    # Jobs some thread will still persist: claimed, queued for
+                    # background completion, or dispatched and already terminal.
+                    pending = self._telemetry_completions > 0 or any(
+                        item.telemetry is not None
+                        and not item.telemetry_persisted
+                        and (
+                            item.telemetry_persist_claimed
+                            or (item.telemetry_dispatch_ns is not None and item.state in TERMINAL_STATES)
+                        )
+                        for item in self.jobs.values()
+                    )
+                if not pending:
+                    return True
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                self.condition.wait(min(remaining, 0.1))
+
+    def _persist_job_telemetry(
+        self,
+        ticket: str,
+        recorder: Any,
+        payload: Dict[str, Any],
+        kind: str,
+        exit_code: Optional[int],
+        finished_at: Optional[float],
+    ) -> Optional[str]:
+        try:
+            jobs_dir = self.paths.jobs_dir
+            PIPELINE_METRICS.write_events_jsonl(jobs_dir / f"{ticket}.timing-events.jsonl", recorder.events())
+            runner = read_runner_timings(jobs_dir / f"{ticket}.runner-timings.json")
+            PIPELINE_METRICS.atomic_write_json(
+                jobs_dir / f"{ticket}.timings.json",
+                {
+                    "schema": 1,
+                    "ticket": ticket,
+                    "kind": kind,
+                    "conductorDigest": CONDUCTOR_DIGEST,
+                    "phaseMetrics": payload,
+                    "runner": runner,
+                },
+            )
+            if self.timing_history is not None:
+                row = PIPELINE_METRICS.history_row(
+                    payload,
+                    ticket=ticket,
+                    kind=kind,
+                    finished_wall_ns=int(finished_at * 1_000_000_000) if finished_at is not None else None,
+                    conductor_digest=CONDUCTOR_DIGEST,
+                    exit_code=exit_code,
+                )
+                row["runnerConductorDigest"] = runner.get("conductorDigest") if isinstance(runner, dict) else None
+                self.timing_history.append(row)
+        except Exception as exc:
+            return f"{type(exc).__name__}: {exc}"[:256]
+        return None
 
     def _global_heavy_slot_paths(self, env: Optional[Dict[str, str]] = None) -> List[Path]:
         return global_heavy_slot_paths(env)
@@ -2468,6 +2900,14 @@ class DaemonState:
                 "queueDepth": len(self.queue),
                 "retainedTerminalCount": terminal_count,
                 "shutdownRequested": self.shutdown_requested,
+                "conductorDigest": CONDUCTOR_DIGEST,
+                "timingEnabled": self.timing_enabled,
+                "timing": {
+                    "enabled": self.timing_enabled,
+                    "setting": self.timing_setting,
+                    "helperLoaded": PIPELINE_METRICS is not None,
+                    "readAt": "daemon start",
+                },
             }
 
     def _job_payload_locked(self, job: Job, include_tail: bool = True, include_summary: bool = True) -> Dict[str, Any]:
@@ -2530,6 +2970,7 @@ class DaemonState:
         return blockers
 
     def enqueue(self, request: Dict[str, Any]) -> Dict[str, Any]:
+        accepted_ns = time.monotonic_ns()
         raw_args = request.get("args") or {}
         if not isinstance(raw_args, dict):
             raise ConductorError("request args must be an object")
@@ -2552,8 +2993,16 @@ class DaemonState:
         request_key = request.get("requestKey")
         verbose = bool(request.get("verbose"))
         timeout_value = request.get("timeout")
-        _argv, lanes, _cwd, _env, effective_timeout = self.registry.prepare(normalized_request)
+        telemetry = self.attach_job_telemetry(operation, accepted_ns)
+        if telemetry is None:
+            _argv, lanes, _cwd, _env, effective_timeout = self.registry.prepare(normalized_request)
+        else:
+            self._record_client_metrics(telemetry, request.get("clientMetrics"))
+            with artifact_operation_sink(self._telemetry_sink(telemetry, "daemon.enqueue_prepare")):
+                _argv, lanes, _cwd, _env, effective_timeout = self.registry.prepare(normalized_request)
         env_snapshot = self.registry._request_env_snapshot(normalized_request)
+        retention_ns: Optional[int] = None
+        retention_cpu_ns = 0
 
         with self.condition:
             if self.shutdown_requested:
@@ -2591,6 +3040,7 @@ class DaemonState:
                 global_xctest_slot_wait_seconds=(
                     0.0 if operation_requires_global_xctest_slot(operation, args) else None
                 ),
+                telemetry=telemetry,
                 artifact_scope=args.get("artifactScope"),
                 artifact_scope_differences=list(args.get("artifactScopeDifferences") or []),
                 artifact_scope_message=args.get("artifactScopeMessage"),
@@ -2611,13 +3061,24 @@ class DaemonState:
             self.queue.append(ticket)
             if request_key:
                 self.request_keys[request_key] = ticket
-            self._retention_pass_locked()
+            if telemetry is None:
+                self._retention_pass_locked()
+            else:
+                retention_start = time.monotonic_ns()
+                retention_cpu_start = time.thread_time_ns()
+                self._retention_pass_locked()
+                retention_cpu_ns = time.thread_time_ns() - retention_cpu_start
+                retention_ns = time.monotonic_ns() - retention_start
             self._schedule_locked()
             self.condition.notify_all()
             payload = self._job_payload_locked(job, include_tail=False, include_summary=False)
             payload["reused"] = False
             payload["supersededJobs"] = superseded_jobs
-            return payload
+        if retention_ns is not None:
+            self._telemetry_operation(
+                telemetry, "retention_pass", retention_ns, {"threadCpuNs": retention_cpu_ns}, "daemon.enqueue"
+            )
+        return payload
 
     def _supersede_live_app_jobs_locked(self, new_job: Job, intent: str) -> Tuple[List[Dict[str, Any]], bool]:
         superseded: List[Dict[str, Any]] = []
@@ -2638,6 +3099,7 @@ class DaemonState:
                 with contextlib.suppress(ValueError):
                     self.queue.remove(old_job.ticket)
                 self._append_system_line_locked(old_job, f"job superseded before start by {intent} {new_job.ticket}\n")
+                self._complete_undispatched_telemetry_locked(old_job)
                 cancellation_state = "canceled"
             else:
                 guard_delayed_launch = guard_delayed_launch or is_launch_capable_job(old_job.operation, old_job.args)
@@ -2754,6 +3216,7 @@ class DaemonState:
                 with contextlib.suppress(ValueError):
                     self.queue.remove(job.ticket)
                 self._append_system_line_locked(job, "job canceled before start\n")
+                self._complete_undispatched_telemetry_locked(job)
                 self._schedule_locked()
                 self.condition.notify_all()
                 self._retention_pass_locked()
@@ -2784,6 +3247,7 @@ class DaemonState:
                         with contextlib.suppress(ValueError):
                             self.queue.remove(job.ticket)
                         self._append_system_line_locked(job, "job canceled by daemon stop --force before start\n")
+                        self._complete_undispatched_telemetry_locked(job)
                     elif job.state == "running":
                         running_tickets.append(job.ticket)
                         self._terminate_process_group_locked(job, reason="daemon stop --force")
@@ -2846,6 +3310,8 @@ class DaemonState:
         for job in to_start:
             job.state = "running"
             job.started_at = now()
+            if job.telemetry is not None:
+                job.telemetry_dispatch_ns = time.monotonic_ns()
             for lane in job.lanes:
                 self.active_lanes[lane] = job.ticket
             thread = threading.Thread(target=self._run_job, args=(job.ticket,), daemon=True)
@@ -2877,6 +3343,10 @@ class DaemonState:
             if job:
                 setattr(job, wait_attr, 0.0)
             env = dict(job.env) if job else {}
+            telemetry = job.telemetry if job else None
+        self._telemetry_boundary(telemetry, "slot_wait_start", metadata={"slot": slot_label})
+        contended = False
+        outcome = "not_acquired"
         lock_paths = paths_getter(env)
         ensure_private_dir(machine_lock_dir())
         lock_files = [(path, path.open("a+", encoding="utf-8")) for path in lock_paths]
@@ -2911,6 +3381,8 @@ class DaemonState:
                         raise
                 if selected_file is not None and selected_path is not None:
                     break
+                # Every configured slot refused a non-blocking flock: a foreign holder exists.
+                contended = True
                 holders = [format_display_lock_holder(read_display_lock_metadata(path)) for path, _file in lock_files]
                 with self.condition:
                     job = self.jobs.get(ticket)
@@ -2948,13 +3420,22 @@ class DaemonState:
                         f"acquired global {slot_label} slot {selected_path} after {format_duration(waited)}\n",
                     )
                     self.condition.notify_all()
+            outcome = "acquired"
             return selected_file
+        except BaseException:
+            outcome = "error"
+            raise
         finally:
             for _path, lock_file in lock_files:
                 if lock_file is selected_file:
                     continue
                 with contextlib.suppress(OSError):
                     lock_file.close()
+            self._telemetry_boundary(
+                telemetry,
+                "slot_wait_end",
+                metadata={"slot": slot_label, "contended": contended, "outcome": outcome},
+            )
 
     def _acquire_global_heavy_slot(self, ticket: str) -> Optional[Any]:
         return self._acquire_global_slot(ticket, "heavy")
@@ -2994,9 +3475,13 @@ class DaemonState:
         watchdog: Optional[threading.Thread] = None
         global_heavy_slot: Optional[Any] = None
         global_xctest_slot: Optional[Any] = None
+        telemetry: Optional[Any] = None
+        provenance_scope = contextlib.ExitStack()
         try:
             with self.lock:
                 job = self.jobs[ticket]
+                telemetry = job.telemetry
+                dispatch_ns = job.telemetry_dispatch_ns
                 request = {
                     "operation": job.operation,
                     "args": job.args,
@@ -3012,15 +3497,29 @@ class DaemonState:
                     job.result_summary = "canceled before process start"
                     job.finished_at = now()
                     self._append_system_line_locked(job, "job canceled before process start\n")
-                    return
+                    canceled_before_start = True
+                else:
+                    canceled_before_start = False
+            if dispatch_ns is not None:
+                self._telemetry_boundary(telemetry, "lane_dispatched", dispatch_ns)
+            if canceled_before_start:
+                return
             if job.operation == "test":
                 # Snapshot failures must never break the runner; a missing start
                 # snapshot simply withholds the build ticket (fail-closed).
+                self._telemetry_boundary(telemetry, "source_snapshot_start")
                 try:
                     root_test_start_snapshot = source_snapshot(self.paths.repo_root, job.env)
                 except Exception:
                     root_test_start_snapshot = None
-            argv, _lanes, cwd, env, effective_timeout = self.registry.prepare(request)
+                self._telemetry_boundary(telemetry, "source_snapshot_end")
+            self._telemetry_boundary(telemetry, "prepare_start")
+            if telemetry is None:
+                argv, _lanes, cwd, env, effective_timeout = self.registry.prepare(request)
+            else:
+                with artifact_operation_sink(self._telemetry_sink(telemetry, "daemon.run_prepare")):
+                    argv, _lanes, cwd, env, effective_timeout = self.registry.prepare(request)
+            self._telemetry_boundary(telemetry, "prepare_end")
             with self.condition:
                 job.artifact_scope = job.args.get("artifactScope")
                 job.artifact_scope_differences = list(job.args.get("artifactScopeDifferences") or [])
@@ -3029,6 +3528,10 @@ class DaemonState:
                 env["REPOPROMPT_CONDUCTOR_JOB_TICKET"] = job.ticket
             else:
                 env.pop("REPOPROMPT_CONDUCTOR_JOB_TICKET", None)
+            env.pop(TIMING_RUNNER_PATH_ENV_KEY, None)
+            if telemetry is not None and "__operation_runner" in argv[2:4]:
+                # Only the conductor's own runner reads this; SwiftPM never sees it.
+                env[TIMING_RUNNER_PATH_ENV_KEY] = str(self.paths.jobs_dir / f"{job.ticket}.runner-timings.json")
             if operation_requires_global_heavy_slot(job.operation, job.args):
                 global_heavy_slot = self._acquire_global_heavy_slot(job.ticket)
                 if global_heavy_slot is None:
@@ -3043,6 +3546,8 @@ class DaemonState:
                     self._append_tail_locked(job, start_line)
                 log_file.write(start_line.encode("utf-8", errors="replace"))
                 log_file.flush()
+                if telemetry is not None:
+                    self._telemetry_boundary(telemetry, "command_start", metadata={"command": format_argv(argv)})
                 output_transport = self._create_process_output_transport(job)
                 job.progress_transport = output_transport.kind
                 if job.operation == "test-artifact":
@@ -3053,8 +3558,11 @@ class DaemonState:
                             "test artifact fingerprint is unavailable; run `make dev-test` first"
                         )
                     verify_test_artifact_fingerprint(
-                        Path(artifact_path_value), artifact_fingerprint
+                        Path(artifact_path_value),
+                        artifact_fingerprint,
+                        sink=self._telemetry_sink(telemetry, "daemon.pre_popen_verify"),
                     )
+                self._telemetry_boundary(telemetry, "popen_before")
                 process = subprocess.Popen(
                     argv,
                     cwd=str(cwd),
@@ -3064,6 +3572,7 @@ class DaemonState:
                     stderr=output_transport.popen_stderr,
                     start_new_session=True,
                 )
+                self._telemetry_boundary(telemetry, "popen_after")
                 output_transport.attach_process(process)
                 with self.condition:
                     job.process_started_at = now()
@@ -3154,6 +3663,10 @@ class DaemonState:
                             self._append_system_line_locked(job, job.error + "\n")
                     if exit_code == 0:
                         exit_code = 124
+                if telemetry is not None:
+                    self._telemetry_boundary(
+                        telemetry, "exit_observed", metadata={"exitCode": exit_code, "timedOut": job.timed_out}
+                    )
                 with self.condition:
                     job.process_finished_at = now()
                 if job.cancel_requested:
@@ -3187,6 +3700,11 @@ class DaemonState:
                             job.measurement_invalid = True
                             job.error = "XCTest progress stall watchdog did not finish bounded diagnostics"
                             self._append_system_line_locked(job, job.error + "\n")
+                self._telemetry_boundary(telemetry, "provenance_start")
+                if telemetry is not None:
+                    provenance_scope.enter_context(
+                        artifact_operation_sink(self._telemetry_sink(telemetry, "daemon.post_run_provenance"))
+                    )
                 ticket_payload = None
                 ticket_error = None
                 ticket_withheld_reason = None
@@ -3289,6 +3807,8 @@ class DaemonState:
                             artifact_mutated = True
                     if artifact_mutated:
                         artifact_post_differences.append("artifact mutated during run")
+                provenance_scope.close()
+                self._telemetry_boundary(telemetry, "provenance_end")
                 with self.condition:
                     if ticket_error:
                         self._append_system_line_locked(job, f"could not compute root build ticket: {ticket_error}\n")
@@ -3360,11 +3880,15 @@ class DaemonState:
                     job.finished_at = now()
                     self._append_system_line_locked(job, f"daemon runner error: {exc}\n")
         finally:
+            provenance_scope.close()
             self._release_global_slot(global_xctest_slot)
             self._release_global_slot(global_heavy_slot)
             if output_transport is not None:
                 output_transport.close_all()
             refresh_after_release = False
+            lane_release_ns: Optional[int] = None
+            retention_ns: Optional[int] = None
+            retention_cpu_ns = 0
             with self.condition:
                 if job is not None:
                     refresh_after_release = job.state in TERMINAL_STATES and job.output_summary is None
@@ -3372,10 +3896,34 @@ class DaemonState:
                         if self.active_lanes.get(lane) == job.ticket:
                             del self.active_lanes[lane]
                     self._write_running_processes_locked()
-                    self._retention_pass_locked()
+                    if telemetry is None:
+                        self._retention_pass_locked()
+                    else:
+                        lane_release_ns = time.monotonic_ns()
+                        retention_cpu_start = time.thread_time_ns()
+                        self._retention_pass_locked()
+                        retention_cpu_ns = time.thread_time_ns() - retention_cpu_start
+                        retention_ns = time.monotonic_ns() - lane_release_ns
                 self._schedule_locked()
                 self.condition.notify_all()
-            if job is not None and refresh_after_release:
+            if job is not None and telemetry is not None:
+                # Recorded after the scheduler lock; the lane-released flag is set
+                # only afterwards so finalization never precedes these records.
+                self._telemetry_boundary(telemetry, "lane_released", lane_release_ns)
+                self._telemetry_operation(
+                    telemetry, "retention_pass", retention_ns, {"threadCpuNs": retention_cpu_ns}, "daemon.lane_release"
+                )
+                with self.condition:
+                    job.telemetry_lane_released = True
+                    self.condition.notify_all()
+                if refresh_after_release:
+                    # Same summary work as the legacy thread, run on this job
+                    # thread: the summary is published first, then timing is
+                    # finalized, published and persisted without blocking it.
+                    self._refresh_output_summary(job, complete_telemetry=True)
+                else:
+                    self.complete_job_telemetry(job)
+            elif job is not None and refresh_after_release:
                 threading.Thread(target=self._refresh_output_summary, args=(job,), daemon=True).start()
 
     @staticmethod
@@ -3399,6 +3947,111 @@ class DaemonState:
                 self._record_xctest_progress_locked(job, text)
                 self.condition.notify_all()
 
+    def _pump_output(
+        self,
+        ticket: str,
+        read_chunk: Any,
+        sink: Any,
+    ) -> None:
+        """Relay raw output chunks to ``sink`` and complete lines to the job.
+
+        ``read_chunk`` returns the next chunk, or ``b""`` at EOF. ``sink`` receives
+        every chunk unchanged (``write`` then ``flush``). This is the reader-loop
+        seam for later output-path changes; its unit tests call it directly, while
+        ``Scripts/conductor_benchmark.py`` measures the path through
+        ``_read_process_output`` so revisions without this seam remain comparable.
+        """
+        pending = bytearray()
+        try:
+            while True:
+                chunk = read_chunk()
+                if not chunk:
+                    break
+                sink.write(chunk)
+                sink.flush()
+                for line in self._take_complete_output_lines(pending, chunk):
+                    self._submit_process_output_line(ticket, line)
+        finally:
+            if pending:
+                self._submit_process_output_line(ticket, bytes(pending))
+
+    def _submit_observed_output_line(self, ticket: str, line: bytes, cursor: Any, receive_ns: int) -> None:
+        """``_submit_process_output_line`` plus telemetry on the already-decoded
+        text, observed before (never under) ``self.condition``."""
+        text = line.decode("utf-8", errors="replace")
+        if cursor.active:
+            cursor.observe_line(line, text, receive_ns)
+        with self.condition:
+            job = self.jobs.get(ticket)
+            if job:
+                self._append_tail_locked(job, text)
+                self._record_xctest_progress_locked(job, text)
+                self.condition.notify_all()
+
+    def _pump_output_observed(self, ticket: str, read_chunk: Any, sink: Any, cursor: Any) -> None:
+        """``_pump_output`` with receive timestamps and a telemetry cursor.
+
+        Reads, raw writes/flushes, LF framing, decoding and locked submissions
+        are identical to the legacy loop. Each read is timestamped immediately
+        after ``read_chunk()`` returns, before write, flush or any lock. Cursor
+        failures disable only telemetry (the cursor contains its exceptions).
+        """
+        monotonic_ns = time.monotonic_ns
+        reader_cpu_start = time.thread_time_ns()
+        pending = bytearray()
+        eof_ns: Optional[int] = None
+        try:
+            while True:
+                chunk = read_chunk()
+                receive_ns = monotonic_ns()
+                if not chunk:
+                    eof_ns = receive_ns
+                    break
+                sink.write(chunk)
+                sink.flush()
+                for line in self._take_complete_output_lines(pending, chunk):
+                    self._submit_observed_output_line(ticket, line, cursor, receive_ns)
+                if pending and cursor.active:
+                    cursor.scan_pending(pending, receive_ns)
+        finally:
+            if eof_ns is None:
+                eof_ns = monotonic_ns()
+            if pending:
+                tail = bytes(pending)
+                text = tail.decode("utf-8", errors="replace")
+                cursor.finish(tail, text, eof_ns)
+                with self.condition:
+                    job = self.jobs.get(ticket)
+                    if job:
+                        self._append_tail_locked(job, text)
+                        self._record_xctest_progress_locked(job, text)
+                        self.condition.notify_all()
+            else:
+                cursor.finish(None, None, eof_ns)
+            # Whole reader-thread CPU (legacy output work included), for decomposition.
+            self._telemetry_operation(
+                cursor.recorder,
+                "output_reader_cpu",
+                time.thread_time_ns() - reader_cpu_start,
+                None,
+                "daemon.reader",
+                quality=PIPELINE_METRICS.MEASURED_CPU,
+            )
+
+    def _output_telemetry_cursor(self, ticket: str) -> Optional[Any]:
+        if not self.timing_enabled:
+            return None
+        try:
+            with self.condition:
+                job = self.jobs.get(ticket)
+                recorder = job.telemetry if job is not None else None
+            if recorder is None:
+                return None
+            cursor = PIPELINE_METRICS.OutputTelemetryCursor(recorder)
+        except Exception:
+            return None
+        return cursor if cursor.active else None
+
     def _read_process_output(
         self,
         ticket: str,
@@ -3406,19 +4059,13 @@ class DaemonState:
         log_file: Any,
         output_transport: ProcessOutputTransport,
     ) -> None:
-        pending = bytearray()
         try:
-            while True:
-                chunk = output_transport.read_chunk(process)
-                if not chunk:
-                    break
-                log_file.write(chunk)
-                log_file.flush()
-                for line in self._take_complete_output_lines(pending, chunk):
-                    self._submit_process_output_line(ticket, line)
+            cursor = self._output_telemetry_cursor(ticket)
+            if cursor is None:
+                self._pump_output(ticket, lambda: output_transport.read_chunk(process), log_file)
+            else:
+                self._pump_output_observed(ticket, lambda: output_transport.read_chunk(process), log_file, cursor)
         finally:
-            if pending:
-                self._submit_process_output_line(ticket, bytes(pending))
             output_transport.close_reader()
 
     @staticmethod
@@ -3876,7 +4523,18 @@ class DaemonState:
             )
         self._terminate_xctest_stalled_job(job)
 
-    def _refresh_output_summary(self, job: Job) -> None:
+    def _refresh_output_summary(self, job: Job, complete_telemetry: bool = False) -> None:
+        """Summarize a terminal job's log and publish the summary.
+
+        Timing never delays the summary: the published summary's duration is
+        stored with it (no recorder call) and only ``complete_telemetry`` (the
+        job thread) finalizes and persists, after publication. Client request
+        paths never wait on timing.
+        """
+        telemetry = job.telemetry
+        if telemetry is not None:
+            summary_start = time.monotonic_ns()
+            summary_cpu_start = time.thread_time_ns()
         summary = OutputSummarizer.summarize_file(
             job.operation,
             job.args,
@@ -3885,10 +4543,24 @@ class DaemonState:
             job.timed_out,
             job.log_path,
         )
+        summary_timing = None
+        if telemetry is not None:
+            summary_timing = (time.monotonic_ns() - summary_start, time.thread_time_ns() - summary_cpu_start)
         with self.condition:
             current = self.jobs.get(job.ticket)
             if current is job and current.output_summary is None:
                 current.output_summary = summary
+                current.output_summary_timing = summary_timing
+                self.condition.notify_all()
+        if complete_telemetry:
+            self.complete_job_telemetry(job)
+
+    def _publish_phase_metrics(self, job: Job, phase_metrics: Optional[Dict[str, Any]]) -> None:
+        if phase_metrics is None:
+            return
+        with self.condition:
+            if job.phase_metrics is None:
+                job.phase_metrics = phase_metrics
                 self.condition.notify_all()
 
     def _append_tail_locked(self, job: Job, text: str) -> None:
@@ -4200,6 +4872,9 @@ class DaemonState:
             for diagnostic_path in job.diagnostic_paths:
                 with contextlib.suppress(FileNotFoundError):
                     diagnostic_path.unlink()
+            for suffix in TIMING_FILE_SUFFIXES:
+                with contextlib.suppress(OSError):
+                    (self.paths.jobs_dir / f"{ticket}{suffix}").unlink()
             for key, mapped_ticket in list(self.request_keys.items()):
                 if mapped_ticket == ticket:
                     del self.request_keys[key]
@@ -4232,6 +4907,19 @@ class DaemonState:
                 if age > TERMINAL_RETENTION_SECONDS:
                     with contextlib.suppress(FileNotFoundError):
                         diagnostic_path.unlink()
+
+        with contextlib.suppress(FileNotFoundError):
+            for timing_path in self.paths.jobs_dir.glob("*timing*"):
+                suffix = next((value for value in TIMING_FILE_SUFFIXES if timing_path.name.endswith(value)), None)
+                if suffix is None or timing_path.name[: -len(suffix)] in self.jobs:
+                    continue
+                try:
+                    age = now() - timing_path.stat().st_mtime
+                except OSError:
+                    continue
+                if age > TERMINAL_RETENTION_SECONDS:
+                    with contextlib.suppress(FileNotFoundError):
+                        timing_path.unlink()
 
 
 class ThreadedUnixServer(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
@@ -4331,6 +5019,10 @@ def run_daemon(paths: Paths) -> int:
             for path in (paths.socket_path, paths.pid_path, paths.daemon_meta_path, paths.running_processes_path):
                 with contextlib.suppress(FileNotFoundError):
                     path.unlink()
+        # After the files are gone, so ``daemon stop`` timing is unchanged: let
+        # already-started timing persistence finish (bounded; optional data).
+        with contextlib.suppress(Exception):
+            state._await_job_telemetry(TIMING_DRAIN_SECONDS)
     return 0
 
 
@@ -4425,6 +5117,60 @@ def bootout_daemon_launchd(paths: Paths) -> None:
     run_launchctl(["bootout", f"gui/{uid}/{daemon_launchd_label(paths)}"])
 
 
+def daemon_launchd_environment(paths: Paths, environ: Optional[Mapping[str, str]] = None) -> Dict[str, str]:
+    """The launchd job's environment: launchd does not inherit the client's.
+
+    The timing kill switch is forwarded verbatim when the client sets it; it
+    never enters job request identity or job child environments.
+    """
+    source = os.environ if environ is None else environ
+    env = {
+        "REPOPROMPT_DEV_DAEMON_STATE_DIR": str(paths.state_dir),
+        "REPOPROMPT_DEV_DAEMON_SOCKET": str(paths.socket_path),
+    }
+    setting = source.get(TIMING_ENV_KEY)
+    if setting is not None:
+        env[TIMING_ENV_KEY] = setting
+    return env
+
+
+def daemon_timing_source(payload: Dict[str, Any]) -> str:
+    """Why a daemon status payload has its timing mode, as read at daemon start."""
+    timing = payload.get("timing") if isinstance(payload.get("timing"), dict) else {}
+    if timing.get("helperLoaded") is False:
+        return "timing helper not loaded"
+    setting = timing.get("setting")
+    return f"{TIMING_ENV_KEY}={setting}" if setting is not None else f"{TIMING_ENV_KEY} unset"
+
+
+def requested_timing_enabled(environ: Optional[Mapping[str, str]] = None) -> bool:
+    """The timing mode this client's environment would give a newly started daemon."""
+    source = os.environ if environ is None else environ
+    return source.get(TIMING_ENV_KEY, "").strip().lower() != "off"
+
+
+def daemon_timing_notice(payload: Dict[str, Any], environ: Optional[Mapping[str, str]] = None) -> Optional[str]:
+    """Explain a running daemon whose timing mode differs from this client's request.
+
+    The mode is read only at daemon start; a running daemon is never restarted
+    implicitly (that could cancel jobs), so the operator decides.
+    """
+    running = payload.get("timingEnabled")
+    if not isinstance(running, bool):
+        return None
+    requested = requested_timing_enabled(environ)
+    if requested == running:
+        return None
+    started_with = daemon_timing_source(payload)
+    wanted = "enabled" if requested else "disabled"
+    return (
+        f"timing: the running daemon (pid {payload.get('pid')}) has timing "
+        f"{'enabled' if running else 'disabled'} ({started_with} at its start); this environment asks for {wanted}. "
+        "The mode is read only at daemon start and the daemon was not restarted. To change it, stop the idle daemon "
+        f"('./conductor daemon stop') and start it again with the desired {TIMING_ENV_KEY}."
+    )
+
+
 def write_daemon_launchd_plist(paths: Paths, script: Path) -> Path:
     plist_path = daemon_launchd_plist_path(paths)
     payload = {
@@ -4442,10 +5188,7 @@ def write_daemon_launchd_plist(paths: Paths, script: Path) -> Path:
         "WorkingDirectory": str(paths.repo_root),
         "StandardOutPath": str(paths.daemon_log_path),
         "StandardErrorPath": str(paths.daemon_log_path),
-        "EnvironmentVariables": {
-            "REPOPROMPT_DEV_DAEMON_STATE_DIR": str(paths.state_dir),
-            "REPOPROMPT_DEV_DAEMON_SOCKET": str(paths.socket_path),
-        },
+        "EnvironmentVariables": daemon_launchd_environment(paths),
     }
     plist_path.write_bytes(plistlib.dumps(payload, fmt=plistlib.FMT_XML, sort_keys=False))
     with contextlib.suppress(OSError):
@@ -4612,6 +5355,9 @@ def render_daemon_status(payload: Dict[str, Any], shorthand: bool = False) -> No
     print(f"protocol: {payload.get('protocolVersion')}")
     print(f"socket:   {payload.get('socketPath')}")
     print(f"state:    {payload.get('stateDir')}")
+    if isinstance(payload.get("timingEnabled"), bool):
+        mode = "enabled" if payload["timingEnabled"] else "disabled"
+        print(f"timing:   {mode} ({daemon_timing_source(payload)} at daemon start)")
     active = payload.get("activeJobsByLane") or {}
     if active:
         print("active lanes:")
@@ -4959,11 +5705,16 @@ def handle_daemon_command(paths: Paths, argv: List[str]) -> int:
     json_mode, rest = parse_json_flag(argv[1:])
     if sub == "start":
         payload = ensure_daemon(paths, start_if_needed=True)
+        notice = daemon_timing_notice(payload)
         if json_mode:
+            if notice is not None:
+                payload = dict(payload, timingNotice=notice)
             print_json(payload)
         else:
             print("daemon running")
             render_daemon_status(payload)
+        if notice is not None:
+            print(notice, file=sys.stderr)
         return 0
     if sub == "status":
         try:
@@ -5026,6 +5777,54 @@ def handle_status_command(paths: Paths, argv: List[str]) -> int:
         print_json(payload)
     else:
         render_daemon_status(payload, shorthand=True)
+    return 0
+
+
+def _format_span_ms(value: Any) -> str:
+    if isinstance(value, dict) and isinstance(value.get("ns"), int):
+        return f"{value['ns'] / 1_000_000:.1f}ms"
+    if isinstance(value, dict) and value.get("quality") == "not_applicable":
+        return "n/a"
+    return "?"
+
+
+def handle_metrics_command(paths: Paths, argv: List[str]) -> int:
+    """Client-side read of the per-job timing history; never contacts the daemon."""
+    parser = argparse.ArgumentParser(prog="conductor metrics")
+    parser.add_argument("--last", type=int, default=20)
+    parser.add_argument("--kind")
+    parser.add_argument("--ticket")
+    parser.add_argument("--json", action="store_true")
+    ns = parser.parse_args(argv)
+    if ns.last < 0:
+        raise ConductorError("metrics --last must be non-negative")
+    if PIPELINE_METRICS is None:
+        raise ConductorError("timing metrics are unavailable: Scripts/swift_pipeline_metrics.py could not be loaded")
+    history = PIPELINE_METRICS.RotatingJsonl(timing_history_path(paths))
+    rows, malformed = history.read_rows()
+    selected = PIPELINE_METRICS.filter_history(rows, last=ns.last, kind=ns.kind, ticket=ns.ticket)
+    if ns.json:
+        print_json(
+            {
+                "historyPath": str(history.path),
+                "totalRows": len(rows),
+                "malformedLines": malformed,
+                "rows": list(selected),
+            }
+        )
+        return 0
+    print(f"timing history: {history.path} ({len(selected)} of {len(rows)} rows; {malformed} malformed)")
+    for row in selected:
+        intervals = row.get("intervals") if isinstance(row.get("intervals"), dict) else {}
+        finished = row.get("finishedAtWallNs")
+        finished_text = iso_timestamp(finished / 1_000_000_000) if isinstance(finished, int) else "?"
+        print(
+            f"{str(row.get('ticket'))[:8]}  {row.get('kind')}  {row.get('status')}  exit={row.get('exitCode')}  "
+            f"queue={_format_span_ms(intervals.get('queueWait'))}  "
+            f"process={_format_span_ms(intervals.get('processObserved'))}  "
+            f"total={_format_span_ms(intervals.get('acceptedToLaneRelease'))}  "
+            f"segments={len(row.get('segments') or [])}  finished={finished_text}"
+        )
     return 0
 
 
@@ -6333,6 +7132,42 @@ def operation_parallel_root_test(repo_root: Path, args: Dict[str, Any]) -> int:
 
 def run_operation_runner(payload_json: str) -> int:
     payload = json.loads(payload_json)
+    # Popped so descendants never inherit (and overwrite) this job's runner file.
+    timings_path = os.environ.pop(TIMING_RUNNER_PATH_ENV_KEY, None)
+    recorder: Optional[Any] = None
+    if timings_path and PIPELINE_METRICS is not None and PIPELINE_METRICS.timing_enabled(os.environ):
+        try:
+            started = time.monotonic_ns()
+            recorder = PIPELINE_METRICS.PipelineRecorder(
+                origin_ns=started, process="runner", wall_anchor=(time.time_ns(), started)
+            )
+        except Exception:
+            recorder = None
+    if recorder is None:
+        return _run_operation_runner(payload)
+    start = time.monotonic_ns()
+    try:
+        with artifact_operation_sink(recorder.operation_sink("runner")):
+            return _run_operation_runner(payload)
+    finally:
+        try:
+            recorder.record_operation("runner_operation", time.monotonic_ns() - start, None, "runner")
+            PIPELINE_METRICS.atomic_write_json(
+                Path(str(timings_path)),
+                {
+                    "schema": 1,
+                    "process": "runner",
+                    "kind": str(payload.get("kind")),
+                    "ticket": os.environ.get("REPOPROMPT_CONDUCTOR_JOB_TICKET"),
+                    "conductorDigest": CONDUCTOR_DIGEST,
+                    "phaseMetrics": recorder.finalize(),
+                },
+            )
+        except Exception:
+            pass
+
+
+def _run_operation_runner(payload: Dict[str, Any]) -> int:
     kind = payload.get("kind")
     args = payload.get("args") or {}
     repo_root = Path(payload.get("repoRoot") or resolve_repo_root()).resolve()
@@ -6360,11 +7195,26 @@ def run_operation_runner(payload_json: str) -> int:
     return 2
 
 
+def client_metrics_sink(collected: List[Dict[str, Any]]) -> Any:
+    """Collect bounded client-side operation timings for ``clientMetrics``."""
+
+    def sink(name: str, duration_ns: Optional[int], counters: Optional[Dict[str, int]] = None, **_kwargs: Any) -> None:
+        if len(collected) >= CLIENT_METRICS_MAX_ITEMS or duration_ns is None:
+            return
+        item: Dict[str, Any] = {"name": str(name)[:64], "durationNs": int(duration_ns)}
+        if counters:
+            item["counters"] = {str(key)[:64]: int(value) for key, value in list(counters.items())[:8]}
+        collected.append(item)
+
+    return sink
+
+
 def enqueue_and_maybe_wait(
     paths: Paths,
     operation: str,
     args: Dict[str, Any],
     global_flags: argparse.Namespace,
+    client_metrics: Optional[List[Dict[str, Any]]] = None,
 ) -> int:
     ensure_daemon(paths, start_if_needed=True)
     request = {
@@ -6376,6 +7226,9 @@ def enqueue_and_maybe_wait(
         "verbose": global_flags.verbose,
         "env": OperationRegistry.client_env_snapshot(),
     }
+    if client_metrics:
+        # Advisory and outside the fingerprint material (request identity).
+        request["clientMetrics"] = list(client_metrics)[:CLIENT_METRICS_MAX_ITEMS]
     enqueue_payload = request_daemon(paths, request, timeout=10.0)
     if global_flags.async_mode:
         if global_flags.json:
@@ -6418,6 +7271,7 @@ def handle_real_operation(paths: Paths, operation: str, argv: List[str]) -> int:
         raise ConductorError("timeout must be non-negative")
 
     args: Dict[str, Any] = {}
+    client_metrics: Optional[List[Dict[str, Any]]] = None
     if operation in {
         "doctor",
         "guardrails",
@@ -6486,7 +7340,11 @@ def handle_real_operation(paths: Paths, operation: str, argv: List[str]) -> int:
             False,
             {"env": client_env},
         )
-        args.update(evaluate_test_artifact(paths.repo_root, paths.jobs_dir, effective_env))
+        client_sink = None
+        if PIPELINE_METRICS is not None and PIPELINE_METRICS.timing_enabled(os.environ):
+            client_metrics = []
+            client_sink = client_metrics_sink(client_metrics)
+        args.update(evaluate_test_artifact(paths.repo_root, paths.jobs_dir, effective_env, sink=client_sink))
     elif operation in {"test", "provider-test", "core-test"}:
         parser = argparse.ArgumentParser(prog=f"conductor {operation}")
         mode = parser.add_mutually_exclusive_group()
@@ -6597,6 +7455,8 @@ def handle_real_operation(paths: Paths, operation: str, argv: List[str]) -> int:
     else:
         raise ConductorError(f"unknown operation '{operation}'")
 
+    if client_metrics:
+        return enqueue_and_maybe_wait(paths, operation, args, global_flags, client_metrics=client_metrics)
     return enqueue_and_maybe_wait(paths, operation, args, global_flags)
 
 
@@ -6629,6 +7489,8 @@ def main(argv: List[str]) -> int:
         return handle_status_command(paths, argv[1:])
     if command == "job":
         return handle_job_command(paths, argv[1:])
+    if command == "metrics":
+        return handle_metrics_command(paths, argv[1:])
     if command in {"sleep", "fake-sleep"}:
         return handle_sleep_operation(paths, command, argv[1:])
     if command in IMPLEMENTED_OPERATIONS:
