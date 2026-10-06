@@ -45,7 +45,9 @@ class PumpOutputSeamTests(unittest.TestCase):
 
         self.assertEqual(writes, chunks[:-1])
         self.assertEqual(sink.flush.call_count, len(chunks) - 1)
-        self.assertEqual(list(self.job.tail), ["alpha\r", " beta\n", "gamma\n", "✓ tail"])
+        # Step 3 (OD7) exact shape: CR-segmented records, each terminated by "\n"
+        # except the unterminated final record.
+        self.assertEqual(list(self.job.tail), ["alpha\n", " beta\n", "gamma\n", "✓ tail"])
 
     def test_pump_flushes_pending_partial_line_when_the_reader_raises(self) -> None:
         reads = iter([b"done\npartial"])
@@ -195,6 +197,147 @@ class ExactTailEvidenceTests(unittest.TestCase):
                 bench.run_pty_fidelity(conductor, {"scratchDir": tmp, "fidelityFixturePath": str(fixture)})
 
 
+class StepThreeTailModelTests(unittest.TestCase):
+    """The harness's independent OD7 tail model agrees with the conductor's real path."""
+
+    def test_pinned_fidelity_digest_is_the_model_over_the_exact_pty_delivery(self) -> None:
+        fidelity = bench.generate_pty_fidelity_fixture()
+        self.assertEqual(
+            bench.canonical_json_digest(bench.step3_tail_model(bench.onlcr(fidelity))),
+            EXPECTED_STEP3_PTY_TAIL,
+        )
+
+    def test_model_matches_conductor_tail_over_shapes(self) -> None:
+        cases = {
+            "cr-crlf-lf": b"a\rb\r\nc\nd",
+            "ansi": b"\x1b[31mred\x1b[0m\n\x1b[1mbold",
+            "long": b"x" * 9000 + b"\n" + "é".encode() * 3000 + b"\n",
+            "many": b"".join(f"{index}\n".encode() for index in range(100)),
+            "budget": b"".join((b"y" * 5000 + b"\n") for _ in range(40)),
+            "empty-records": b"\n\n\r\r\n\n",
+            "invalid-utf8": b"bad \xff byte\npartial \xe2\x9c",
+        }
+        for name, data in cases.items():
+            with self.subTest(name), tempfile.TemporaryDirectory() as tmp:
+                state = make_state(Path(tmp))
+                job = bench.make_job(conductor, state.paths, "model", "build", {})
+                state.jobs[job.ticket] = job
+                chunks = [data[index:index + 7] for index in range(0, len(data), 7)] + [b""]
+                state._pump_output(job.ticket, iter(chunks).__next__, io.BytesIO())
+                self.assertEqual(list(job.tail), bench.step3_tail_model(data))
+                self.assertLessEqual(len(job.tail), 30)
+                self.assertLessEqual(sum(len(entry.encode()) for entry in job.tail), 64 * 1024)
+
+
+# The Step 3 conductor loads its output helper by explicit path; loadable copies need it.
+STEP3_REQUIRED_HELPERS = ("Scripts/conductor_output.py",)
+
+
+class StepThreeTailEnforcementTests(unittest.TestCase):
+    """S3-R0-05: a Step 3 tail must equal the independent model, outside the measurement."""
+
+    DATA = (
+        b"\x1b[1malpha\x1b[0m\r\nprogress 1\rprogress 2\r\n"
+        + b"".join(b"line %d\r\n" % index for index in range(40))
+        + b"\xe2\x9c\x93 done"
+    )
+
+    def wrong_tails(self) -> dict:
+        good = bench.step3_tail_model(self.DATA)
+        return {
+            "empty": [],
+            "first-entry-removed": good[1:],
+            "last-entry-removed": good[:-1],
+            "boundaries-merged": [good[0] + good[1]] + good[2:],
+            "boundary-moved": [good[0][:-2], good[0][-2:] + good[1]] + good[2:],
+            "content-changed": good[:-1] + [good[-1].upper()],
+            "raw-suffix-instead": [self.DATA[-200:].decode("utf-8", errors="replace")],
+        }
+
+    def test_model_conformance_rejects_wrong_tails(self) -> None:
+        bench.verify_step3_tail(bench.step3_tail_model(self.DATA), self.DATA, "pipe")
+        for name, tail in self.wrong_tails().items():
+            with self.subTest(mutation=name), self.assertRaises(bench.HarnessError):
+                bench.verify_step3_tail(tail, self.DATA, "pipe")
+
+    def test_step3_pty_evidence_requires_conformance(self) -> None:
+        good = bench.step3_tail_model(self.DATA)
+        evidence = bench.pty_tail_evidence(good, self.DATA, [], step3=True)
+        self.assertEqual(evidence["normalizedTailSha256"], bench.canonical_json_digest(good))
+        for name, tail in self.wrong_tails().items():
+            with self.subTest(mutation=name), self.assertRaises(bench.HarnessError):
+                bench.pty_tail_evidence(tail, self.DATA, [], step3=True)
+
+    def test_collection_fails_when_the_target_tail_is_wrong_for_pipe_and_pty(self) -> None:
+        data = bench.generate_output_fixture(13, 64 * 1024)
+        output = conductor.CONDUCTOR_OUTPUT
+        real_entries = output.tail_entries
+
+        def merged(records: object) -> list:
+            entries = real_entries(records)
+            return [(entries[0][0] + entries[1][0], entries[0][1] + entries[1][1])] + entries[2:] if len(entries) > 1 else entries
+
+        mutations = {
+            "empty": mock.patch.object(output.OutputTail, "extend_sized", lambda self, entries: None),
+            "boundaries-merged": mock.patch.object(output, "tail_entries", side_effect=merged),
+            "entry-dropped": mock.patch.object(output, "tail_entries", side_effect=lambda records: real_entries(records)[1:]),
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            fixture = Path(tmp) / "fixture.log"
+            fixture.write_bytes(data)
+            spec = {"scratchDir": tmp}
+            for transport in ("pipe", "pty"):
+                result = bench._run_output_variant(conductor, spec, fixture, data, transport, 0)
+                self.assertEqual(result["tail_model"], bench.STEP3_TAIL_MODEL_VALIDATED)
+                for name, patcher in mutations.items():
+                    with self.subTest(transport=transport, mutation=name), patcher:
+                        with self.assertRaises(bench.HarnessError) as raised:
+                            bench._run_output_variant(conductor, spec, fixture, data, transport, 0)
+                        self.assertIn("independent model", str(raised.exception))
+
+    def test_step3_targets_are_detected_by_helper_or_shipped_file(self) -> None:
+        self.assertTrue(bench.is_step3_target(conductor))
+        with tempfile.TemporaryDirectory() as tmp:
+            module_file = Path(tmp) / "conductor.py"
+            module_file.write_text("", encoding="utf-8")
+            legacy = mock.Mock(spec=["__file__"], __file__=str(module_file))
+            self.assertFalse(bench.is_step3_target(legacy))
+            (Path(tmp) / "conductor_output.py").write_text("", encoding="utf-8")
+            self.assertTrue(bench.is_step3_target(legacy))  # shipped but not loaded: still validated
+
+    def test_comparison_rejects_step3_arms_without_validation_records(self) -> None:
+        validated = {variant: {"tailModel": bench.STEP3_TAIL_MODEL_VALIDATED} for variant in bench.STEP3_TAIL_VARIANTS}
+        unvalidated = dict(validated, **{"output.pty.w4": {"tailModel": bench.LEGACY_TAIL_MODEL}})
+        capture = {
+            "arms": [
+                {"name": "parent", "files": {"Scripts/conductor.py": "a"}},
+                {"name": "candidate", "files": {"Scripts/conductor.py": "b", "Scripts/conductor_output.py": "c"}},
+            ],
+            "samples": [
+                {"arm": "parent", "workload": "output", "ok": True, "block": 0, "info": {}},
+                {"arm": "candidate", "workload": "output", "ok": True, "block": 0, "info": validated},
+                {"arm": "candidate", "workload": "output", "ok": True, "block": 1, "info": unvalidated},
+                {"arm": "candidate", "workload": "output", "ok": True, "block": 2, "info": {}},
+            ],
+        }
+        self.assertEqual(bench.tail_model_problems("baseline", capture, "parent"), [])
+        problems = bench.tail_model_problems("candidate", capture, "candidate")
+        self.assertEqual([problem.split(":")[0] for problem in problems], ["candidate output block 1", "candidate output block 2"])
+        self.assertIn("output.pty.w4", problems[0])
+
+    def test_evaluate_comparison_fails_an_unvalidated_step3_arm(self) -> None:
+        capture = synthetic_capture("/c.json", {"A": {"output.pipe.w0.cpu_ms": series(10.0)}, "B": {"output.pipe.w0.cpu_ms": series(10.0)}})
+        capture["arms"][1]["files"] = {"Scripts/conductor.py": "b", "Scripts/conductor_output.py": "c"}
+        report = bench.evaluate_comparison(capture, "A", capture, "B", ComparisonTests.GATES, "changed")
+        self.assertTrue(any("Step 3 tail not validated" in failure for failure in report["harnessFailures"]))
+        self.assertEqual(report["outcome"], "harness_failure")
+        for sample in capture["samples"]:
+            if sample["arm"] == "B":
+                sample["info"] = {variant: {"tailModel": bench.STEP3_TAIL_MODEL_VALIDATED} for variant in bench.STEP3_TAIL_VARIANTS}
+        report = bench.evaluate_comparison(capture, "A", capture, "B", ComparisonTests.GATES, "changed")
+        self.assertFalse(any("Step 3 tail" in failure for failure in report["harnessFailures"]))
+
+
 class TargetLoadingTests(unittest.TestCase):
     def make_target(self, root: Path, optional: tuple[str, ...] = ()) -> Path:
         (root / "Scripts").mkdir(parents=True)
@@ -251,6 +394,28 @@ class TargetLoadingTests(unittest.TestCase):
             result = subprocess.run([sys.executable, "-c", probe], capture_output=True, text=True, check=True)
             self.assertIn("refused", result.stdout)
 
+    def test_staged_target_loads_its_own_output_helper_and_a_broken_one_fails_the_worker(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            source = self.make_target(Path(tmp) / "source", bench.OPTIONAL_TARGET_FILES)
+            staged = bench.stage_target("arm", source, Path(tmp) / "staging", bench.target_digest(source))
+            self.assertTrue((staged / "Scripts" / "conductor_output.py").is_file())
+            probe = (
+                "import sys, json; sys.path.insert(0, %r); import conductor_benchmark as b; "
+                "from pathlib import Path; m = b.load_target_module(Path(%r)); "
+                "print(json.dumps(m.CONDUCTOR_OUTPUT.__file__))"
+            ) % (str(SCRIPT_DIR), str(staged))
+            result = subprocess.run([sys.executable, "-c", probe], capture_output=True, text=True, check=True)
+            self.assertEqual(Path(json.loads(result.stdout)).resolve(), (staged / "Scripts" / "conductor_output.py").resolve())
+            # The output helper is required: a broken copy is a harness failure, never a silent fallback.
+            (source / "Scripts" / "conductor_output.py").write_text("raise RuntimeError('broken output helper')\n", encoding="utf-8")
+            worker = subprocess.run(
+                [sys.executable, str(SCRIPT_DIR / "conductor_benchmark.py"), "__worker",
+                 json.dumps({"targetRoot": str(source), "workload": "output"})],
+                capture_output=True, text=True,
+            )
+            self.assertEqual(worker.returncode, bench.EXIT_HARNESS_FAILURE)
+            self.assertIn("broken output helper", worker.stdout)
+
     def test_pre_timing_target_reports_no_loaded_digest(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = self.make_target(Path(tmp) / "target")
@@ -262,7 +427,7 @@ class TargetLoadingTests(unittest.TestCase):
 
     def test_worker_loads_target_and_its_dependency_from_the_target_only(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            root = self.make_target(Path(tmp) / "target")
+            root = self.make_target(Path(tmp) / "target", STEP3_REQUIRED_HELPERS)
             probe = (
                 "import sys, json; sys.path.insert(0, %r); import conductor_benchmark as b; "
                 "from pathlib import Path; m = b.load_target_module(Path(%r)); "
@@ -275,7 +440,7 @@ class TargetLoadingTests(unittest.TestCase):
 
     def test_loader_compiles_conductor_from_source_and_staging_preserves_bytes(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            source = self.make_target(Path(tmp) / "source")
+            source = self.make_target(Path(tmp) / "source", STEP3_REQUIRED_HELPERS)
             staged = bench.stage_target("arm", source, Path(tmp) / "staging", bench.target_digest(source))
             self.assertEqual(bench.target_digest(staged)["files"], bench.target_digest(source)["files"])
             self.assertTrue(list((staged / "Scripts" / "__pycache__").glob("debug_app_process.*.pyc")))
@@ -330,9 +495,19 @@ class AdapterTests(unittest.TestCase):
         self.assertEqual(pty["progress"]["started"], data.count(b"' started."))
         self.assertGreaterEqual(pty["bytes_read"], len(bench.onlcr(data)))
         self.assertEqual((pipe["watchdog_threads"], pty["watchdog_threads"]), (0, 1))
-        self.assertTrue(pty["tail_evidence"]["suffixOfStream"])
-        self.assertEqual(pty["tail_evidence"]["suffixBytes"], bench.PTY_TAIL_EVIDENCE_BYTES)
+        # Step 3 tails are CR-segmented and ANSI-stripped, so not raw suffixes: the PTY
+        # tail must equal the independent model over the received bytes, and its
+        # evidence is the model over the written stream (stable under tty retries).
+        self.assertEqual(
+            pty["tail_evidence"],
+            {
+                "suffixOfStream": False,
+                "step3Model": True,
+                "normalizedTailSha256": bench.canonical_json_digest(bench.step3_tail_model(bench.onlcr(data))),
+            },
+        )
         self.assertEqual(pipe["tail_evidence"], pipe["tail_sha256"])
+        self.assertEqual(pipe["tail_sha256"], bench.canonical_json_digest(bench.step3_tail_model(data)))
 
     def test_pty_fidelity_run_reports_the_pinned_exact_tail_through_the_real_job_path(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -342,8 +517,11 @@ class AdapterTests(unittest.TestCase):
             results = [bench.run_pty_fidelity(conductor, spec) for _ in range(5)]
         translated = len(bench.onlcr(bench.generate_pty_fidelity_fixture()))
         for digest, info in results:
-            self.assertEqual(digest, EXPECTED_PTY_TAIL)
-            self.assertEqual(info, {"bytesRead": translated, "tailEntries": conductor.LOG_TAIL_LINES})
+            self.assertEqual(digest, EXPECTED_STEP3_PTY_TAIL)
+            self.assertEqual(
+                info,
+                {"bytesRead": translated, "tailEntries": conductor.LOG_TAIL_LINES, "tailModel": bench.STEP3_TAIL_MODEL_VALIDATED},
+            )
 
     def test_output_adapter_reports_exactly_its_inventory(self) -> None:
         data = bench.generate_output_fixture(5, 64 * 1024)
@@ -355,7 +533,7 @@ class AdapterTests(unittest.TestCase):
             spec = {"scratchDir": tmp, "fixturePath": str(fixture), "fidelityFixturePath": str(fidelity)}
             result = bench.adapter_output(conductor, spec)
         self.assertIsNone(bench.sample_inventory_problem(result, bench.workload_inventory("output", MANIFEST, False, False)))
-        self.assertEqual(result["equivalence"][bench.PTY_FIDELITY_KEY], EXPECTED_PTY_TAIL)
+        self.assertEqual(result["equivalence"][bench.PTY_FIDELITY_KEY], EXPECTED_STEP3_PTY_TAIL)
 
     def test_pty_variant_runs_the_real_watchdog_until_the_process_finishes(self) -> None:
         data = bench.generate_output_fixture(11, 64 * 1024)
@@ -376,13 +554,40 @@ class AdapterTests(unittest.TestCase):
         self.assertEqual(started, ["bench-output"])
 
     def test_summary_of_the_fixture_matches_the_parent_golden(self) -> None:
+        """Step 3: the streamed, prechecked summary is the parent's v1 summary plus the
+        SUMMARY_VERSION 2 fields; only deduplication saturation (OD7) may differ, and
+        only as upper-bound omitted counts in the sections that report it."""
         manifest = bench.load_manifest()
         data = bench.generate_output_fixture(manifest["output"]["seed"], manifest["output"]["sizeBytes"])
+        golden = json.loads(bench.SUMMARY_GOLDEN_PATH.read_text(encoding="utf-8"))["digests"]
         with tempfile.TemporaryDirectory() as tmp:
             log = Path(tmp) / "summary.log"
             log.write_bytes(bench.onlcr(data))
             result = bench.adapter_summary(conductor, {"manifest": manifest, "summaryLogPath": str(log), "logsDir": None})
-        self.assertEqual(set(result["info"]["goldenMatch"].values()), {True})
+            for operation, state, exit_code in bench.summary_modes(manifest):
+                with self.subTest(operation=operation, state=state):
+                    capped = conductor.OutputSummarizer.summarize_file(operation, {}, state, exit_code, False, log)
+                    with mock.patch.object(conductor, "SUMMARY_SEEN_MAX_ENTRIES", 10**9):
+                        exact = conductor.OutputSummarizer.summarize_file(operation, {}, state, exit_code, False, log)
+                    self.assertEqual(
+                        bench.canonical_json_digest(v1_summary_projection(exact)),
+                        golden[f"summary.{operation}.{state}.sha256"],
+                    )
+                    self.assertFalse(exact["deduplicationLimited"])
+                    self.assertEqual(capped["version"], 2)
+                    self.assertEqual(len(capped["sections"]), len(exact["sections"]))
+                    for capped_section, exact_section in zip(capped["sections"], exact["sections"]):
+                        if capped_section["deduplicationLimited"]:
+                            self.assertEqual(capped_section["omittedLineCountQuality"], "upper_bound")
+                            self.assertGreaterEqual(capped_section["omittedLineCount"], exact_section["omittedLineCount"])
+                            capped_section = dict(capped_section, omittedLineCount=exact_section["omittedLineCount"])
+                        # This fixture saturates only first-lines sections, so no displayed line changes (OD15 unused).
+                        self.assertFalse(capped_section["displayedLinesMayRepeat"])
+                        self.assertEqual(v1_section(capped_section), v1_section(exact_section))
+                    self.assertEqual(capped["deduplicationLimited"], any(item["deduplicationLimited"] for item in capped["sections"]))
+                    self.assertFalse(capped["displayedLinesMayRepeat"])
+                    self.assertEqual(capped["omittedLineCountQuality"], "exact")
+        self.assertEqual(result["info"]["goldenMatch"], {key: False for key in golden})
         inventory = bench.workload_inventory("summary", manifest, False, False)
         self.assertIsNone(bench.sample_inventory_problem(result, inventory))
 
@@ -471,9 +676,25 @@ class AdapterTests(unittest.TestCase):
 
 DIGESTS = {"A": "digest-a", "B": "digest-b"}
 MANIFEST = bench.load_manifest()
+SUMMARY_V2_FIELDS = ("deduplicationLimited", "omittedLineCountQuality", "displayedLinesMayRepeat")
+
+
+def v1_section(section: dict) -> dict:
+    return {key: value for key, value in section.items() if key not in SUMMARY_V2_FIELDS}
+
+
+def v1_summary_projection(summary: dict) -> dict:
+    """A SUMMARY_VERSION 2 summary without its v2-only fields, as version 1."""
+    projected = {key: value for key, value in summary.items() if key not in SUMMARY_V2_FIELDS}
+    projected["version"] = 1
+    projected["sections"] = [v1_section(section) for section in summary["sections"]]
+    return projected
 MANIFEST_SHA256 = bench.sha256_file(bench.MANIFEST_PATH)
 SUMMARY_GOLDEN = json.loads(bench.SUMMARY_GOLDEN_PATH.read_text(encoding="utf-8"))["digests"]
 EXPECTED_PTY_TAIL = MANIFEST["output"]["ptyFidelity"]["expectedTailSha256"]
+# The Step 3 (OD7) visible tail of the same exact PTY delivery; equals the harness's
+# independent ``step3_tail_model`` (asserted in StepThreeTailModelTests).
+EXPECTED_STEP3_PTY_TAIL = "23c6f6af26f02d3252361be1f5f4659c995a175f620ca6aba0fd9a954f50184f"
 NCPU = 8
 
 
@@ -1038,7 +1259,7 @@ class RunCommandTests(unittest.TestCase):
         for name in ("a", "b"):
             target = self.root / f"target {name}"
             (target / "Scripts").mkdir(parents=True)
-            for relative in bench.TARGET_FILES:
+            for relative in bench.present_target_files(bench.REPO_ROOT):
                 shutil.copy2(bench.REPO_ROOT / relative, target / relative)
             self.targets.append((name, target))
         self.output = self.root / "captures"

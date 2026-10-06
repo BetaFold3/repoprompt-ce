@@ -371,7 +371,7 @@ class LifecycleQueueTests(LifecycleTestCase):
         job = self.make_job(state, "job-devnull", "build", {}, ["build"], job_state="running")
         state.jobs[job.ticket] = job
         fake_stdout = mock.Mock()
-        fake_stdout.readline.side_effect = [b""]
+        fake_stdout.read1.side_effect = [b""]
         fake_process = mock.Mock()
         fake_process.pid = os.getpid()
         fake_process.stdout = fake_stdout
@@ -395,7 +395,7 @@ class LifecycleQueueTests(LifecycleTestCase):
         job = self.make_job(state, "job-timeout-sigkill", "build", {}, ["build"], job_state="running")
         state.jobs[job.ticket] = job
         fake_stdout = mock.Mock()
-        fake_stdout.readline.side_effect = [b""]
+        fake_stdout.read1.side_effect = [b""]
         fake_process = mock.Mock()
         fake_process.pid = os.getpid()
         fake_process.stdout = fake_stdout
@@ -1768,6 +1768,7 @@ raise SystemExit(
             scripts.mkdir(parents=True)
             shutil.copy2(Path(conductor.__file__), scripts / "conductor.py")
             shutil.copy2(SCRIPT_DIR / "debug_app_process.py", scripts / "debug_app_process.py")
+            shutil.copy2(SCRIPT_DIR / "conductor_output.py", scripts / "conductor_output.py")
             ledger = scripts / "Fixtures" / "test-suite-contract-ledger.tsv"
             ledger.parent.mkdir(parents=True)
             ledger.write_text(
@@ -2976,9 +2977,17 @@ class XCTestStallWatchdogTests(LifecycleTestCase):
         self.assertEqual(job.xctest_last_progress_action, "skipped")
         self.assertIsNone(job.xctest_current_test)
         self.assertEqual(job.xctest_previous_test, second)
-        self.assertEqual(len(job.tail), 4)
-        self.assertTrue(job.tail[0].endswith("\r\n"))
-        self.assertFalse(job.tail[-1].endswith("\n"))
+        # Step 3 (OD7) tail: ANSI-stripped records, each "\n"-terminated except the
+        # unterminated final record.
+        self.assertEqual(
+            list(job.tail),
+            [
+                f"Test Case '{first}' started.\n",
+                f"Test Case '{first}' passed (0.001 seconds).\n",
+                f"Test Case '{second}' started.\n",
+                f"Test Case '{second}' skipped (0.001 seconds).",
+            ],
+        )
         transport.close_reader.assert_called_once_with()
 
     def test_watchdog_trigger_snapshot_is_immutable_after_later_progress(self) -> None:
@@ -3843,6 +3852,352 @@ class XCTestStallWatchdogTests(LifecycleTestCase):
             conductor.handle_real_operation(state.paths, "test", ["--xctest-stall-wake-probe"])
 
 
+class XCTestOutputContractLifecycleTests(LifecycleTestCase):
+    """OD16 through the real job lifecycle: a PTY child, the reader, the monitor and finalization."""
+
+    START_A = b"Test Case '-[M.S testA]' started.\n"
+    # argv: payload path, comma-separated flags, go-file path. Flags: exit (no tick
+    # loop), ignore-term, spawn (a TERM-ignoring descendant in the job's process
+    # group that holds the PTY), wait-go (after the payload, wait up to 15 s for the
+    # go file), relay (then write one "after-failure" line).
+    CHILD = textwrap.dedent(
+        """\
+        import os, signal, subprocess, sys, time
+        flags = sys.argv[2].split(",")
+        if "ignore-term" in flags:
+            signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        if "spawn" in flags:
+            subprocess.Popen([sys.executable, "-c", "import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(60)"])
+        data = open(sys.argv[1], "rb").read()
+        out = sys.stdout.buffer
+        for index in range(0, len(data), 8192):
+            out.write(data[index:index + 8192])
+            out.flush()
+        if "wait-go" in flags:
+            deadline = time.monotonic() + 15.0
+            while not os.path.exists(sys.argv[3]) and time.monotonic() < deadline:
+                time.sleep(0.005)
+        if "relay" in flags:
+            out.write(b"after-failure\\n")
+            out.flush()
+        while "exit" not in flags:
+            out.write(b"tick\\n")
+            out.flush()
+            time.sleep(0.01)
+        """
+    )
+
+    @staticmethod
+    def pending(count: int) -> bytes:
+        markers = b"".join(b"\x0bTest Case '-[M.S t%d]' started." % index for index in range(count))
+        return b"q" * 70000 + markers + b"\x0b\n"
+
+    def run_child(self, ticket: str, payload: bytes, mode: str = "exit") -> tuple[conductor.Job, Path, float]:
+        tmp, state = self.make_state()
+        self.addCleanup(tmp.cleanup)
+        root = state.paths.repo_root
+        ConductorTestContractTests.initialize_git_repo(self, root)
+        ConductorTestContractTests.create_test_artifact(self, root)
+        payload_path = state.paths.jobs_dir / f"{ticket}.payload"
+        payload_path.write_bytes(payload)
+        go_path = state.paths.jobs_dir / f"{ticket}.go"
+        argv = [sys.executable, "-u", "-c", self.CHILD, str(payload_path), mode, str(go_path)]
+        job = self.make_job(state, ticket, "test", {}, ["build"], job_state="running")
+        job.timeout = 20.0
+        state.jobs[job.ticket] = job
+        state.active_lanes = {"build": job.ticket}
+
+        def prepare(_request: dict) -> tuple[list[str], list[str], Path, dict[str, str], float]:
+            return argv, ["build"], root, os.environ.copy(), 20.0
+
+        started = time.monotonic()
+        with mock.patch.object(conductor, "operation_requires_global_heavy_slot", return_value=False), mock.patch.object(
+            state.registry, "prepare", side_effect=prepare
+        ), mock.patch.object(
+            conductor,
+            "artifact_toolchain_snapshot",
+            return_value={"swift_version": "Swift test", "arch": "testarch", "config": "debug"},
+        ), mock.patch.multiple(
+            conductor,
+            TERMINATE_GRACE_SECONDS=0.2,
+            KILL_GRACE_SECONDS=1.0,
+            PROCESS_TREE_POLL_SECONDS=0.01,
+        ):
+            state._run_job(job.ticket)
+        elapsed = time.monotonic() - started
+        self.assertFalse(state._process_tree_alive_locked(job))
+        self.assertEqual(job.progress_transport, "pty")
+        return job, state.paths.jobs_dir / "build-ticket-root.json", elapsed
+
+    def assert_failed_visibly(self, job: conductor.Job, ticket_path: Path, boundary: str) -> str:
+        reason = job.error or ""
+        self.assertEqual(job.state, "failed")
+        self.assertEqual(job.exit_code, conductor.XCTEST_STALL_FAILURE_EXIT_CODE)
+        self.assertTrue(reason.startswith("XCTest output contract failure (OD16): "), reason)
+        self.assertLess(len(reason), 300)
+        self.assertNotIn("9999", reason)
+        self.assertNotIn("nnnn", reason)
+        self.assertEqual(job.result_summary, reason)
+        self.assertEqual(job.xctest_output_failure, reason)
+        self.assertTrue(job.measurement_invalid)
+        self.assertFalse(job.timed_out)
+        self.assertEqual([d["boundary"] for d in job.diagnostics if d.get("kind") == "xctest-output-contract"], [boundary])
+        self.assertFalse(ticket_path.exists(), "no success artifact from a failed job")
+        payload = job.to_payload()
+        self.assertEqual((payload["state"], payload["error"], payload["measurementInvalid"]), ("failed", reason, True))
+        # The client renders the bounded reason without echoing the oversized output.
+        with contextlib.redirect_stdout(io.StringIO()) as rendered:
+            conductor.print_terminal_job_output(payload)
+        self.assertIn(f"Error:    {reason}\n", rendered.getvalue())
+        self.assertNotIn("9" * 200, rendered.getvalue())
+        log = job.log_path.read_bytes()
+        # The reason is its own log line, even after an unterminated oversized line.
+        self.assertIn(b"\n" + reason.encode() + b"\n", log)
+        return log.decode("utf-8", errors="replace")
+
+    def test_d1_and_d2_fail_the_job_although_the_child_exits_zero(self) -> None:
+        cases = {
+            "d1a-huge-parenthetical": (self.START_A + b"Test Case '-[M.S testA]' passed (" + b"9" * 70000 + b").\n", "segment"),
+            "d1b-huge-name": (b"Test Case '-[M.S t" + b"n" * 70000 + b"]' started.\n", "segment"),
+            "d1-eof-without-newline": (self.START_A + b"Test Case '-[M.S testA]' passed (" + b"9" * 70000 + b").", "segment"),
+            "d2c-seventeen-pending": (self.START_A + self.pending(17), "pending"),
+        }
+        for name, (payload, boundary) in cases.items():
+            with self.subTest(case=name):
+                job, ticket_path, _elapsed = self.run_child(f"od16-{name}", payload)
+                self.assert_failed_visibly(job, ticket_path, boundary)
+                self.assertNotEqual(job.xctest_last_progress_action, "passed")
+                if name == "d2c-seventeen-pending":
+                    self.assertEqual(job.xctest_current_test, "-[M.S testA]")  # none of the 17 applied
+
+    def test_at_bound_and_non_marker_records_complete_and_publish_normally(self) -> None:
+        cases = {
+            "d2b-sixteen-pending": self.START_A + self.pending(16),
+            "non-marker-large": self.START_A + b"Test Case '" + b"x" * 70000 + b" no end\n" + b"' started.".rjust(70000, b"y") + b"\n",
+        }
+        for name, payload in cases.items():
+            with self.subTest(case=name):
+                job, ticket_path, _elapsed = self.run_child(f"od16-ok-{name}", payload)
+                self.assertEqual((job.state, job.exit_code), ("completed", 0), job.result_summary)
+                self.assertIsNone(job.xctest_output_failure)
+                self.assertFalse(job.measurement_invalid)
+                self.assertTrue(ticket_path.is_file())
+                expected = "-[M.S t15]" if name == "d2b-sixteen-pending" else "-[M.S testA]"
+                self.assertEqual(job.xctest_current_test, expected)
+
+    def test_the_first_failure_keeps_its_reason(self) -> None:
+        tmp, state = self.make_state()
+        self.addCleanup(tmp.cleanup)
+        job = self.make_job(state, "od16-first", "test", {}, ["build"], job_state="running")
+        state.jobs[job.ticket] = job
+        state._fail_xctest_output_contract(job.ticket, "pending", 3)
+        reason = job.error
+        with state.condition:
+            job.xctest_deadline_phase = "startup"
+            job.xctest_progress_deadline = 0.0
+            # A due stall deadline never overrides the output contract failure.
+            self.assertIsNone(state._claim_xctest_stall_locked(job, observed_at=1e9))
+        self.assertFalse(job.xctest_watchdog_triggered)
+        state._fail_xctest_output_contract(job.ticket, "segment", 9)
+        self.assertEqual((job.error, job.xctest_output_failure, len(job.diagnostics)), (reason, reason, 1))
+        # An earlier stall claim keeps its own error; the output failure is still recorded.
+        stalled = self.make_job(state, "od16-after-stall", "test", {}, ["build"], job_state="running")
+        state.jobs[stalled.ticket] = stalled
+        stalled.measurement_invalid = True
+        stalled.error = "XCTest STARTUP deadline fired after 1.000s; active test method=<none>"
+        state._fail_xctest_output_contract(stalled.ticket, "segment", 2)
+        self.assertEqual(stalled.error, "XCTest STARTUP deadline fired after 1.000s; active test method=<none>")
+        self.assertTrue((stalled.xctest_output_failure or "").startswith("XCTest output contract failure (OD16): "))
+        self.assertEqual(stalled.diagnostics[-1]["boundary"], "segment")
+
+    def test_failure_terminates_a_child_that_keeps_writing_and_drains_its_output(self) -> None:
+        # S3-R3-01: synchronized instead of scheduling-dependent. The child writes
+        # "after-failure" only once the failure is recorded (go file), and the
+        # monitor's termination starts only after the reader relayed that line.
+        original_fail = conductor.DaemonState._fail_xctest_output_contract
+        original_submit = conductor.DaemonState._submit_output_records
+        original_terminate = conductor.DaemonState._terminate_xctest_stalled_job
+        for mode in ("run", "ignore-term"):
+            with self.subTest(mode=mode):
+                relayed = threading.Event()
+                waited: list[bool] = []
+
+                def fail(state_self, ticket, *args, **kwargs):
+                    original_fail(state_self, ticket, *args, **kwargs)
+                    (state_self.paths.jobs_dir / f"{ticket}.go").touch()
+
+                def submit(state_self, ticket, records, *args, **kwargs):
+                    if any("after-failure" in str(record[2]) for record in records):
+                        relayed.set()
+                    return original_submit(state_self, ticket, records, *args, **kwargs)
+
+                def terminate(state_self, job, *args, **kwargs):
+                    waited.append(relayed.wait(10.0))
+                    return original_terminate(state_self, job, *args, **kwargs)
+
+                with mock.patch.multiple(
+                    conductor.DaemonState,
+                    _fail_xctest_output_contract=fail,
+                    _submit_output_records=submit,
+                    _terminate_xctest_stalled_job=terminate,
+                ):
+                    job, ticket_path, elapsed = self.run_child(
+                        f"od16-{mode}", self.START_A + self.pending(17), f"{mode},wait-go,relay"
+                    )
+                log = self.assert_failed_visibly(job, ticket_path, "pending")
+                self.assertEqual(waited, [True])  # the monitor terminated only after the relay
+                self.assertLess(elapsed, 15.0)  # terminated by the monitor, not the 20 s job timeout
+                # The reader kept relaying output after the failure until the child died.
+                self.assertIn("after-failure", log[log.index("XCTest output contract failure"):])
+
+    # OracleA round 3 (S3-R0-03): a reader still alive after both bounded joins
+    # must not let the job succeed, and resuming it later must not revive success.
+
+    def held(self, method: str):
+        """Patch ``DaemonState.<method>`` so its first call blocks (the reader) until released."""
+        original = getattr(conductor.DaemonState, method)
+        entered, release = threading.Event(), threading.Event()
+        threads: list[threading.Thread] = []
+
+        def wrapper(state_self, *args, **kwargs):
+            if not entered.is_set():
+                threads.append(threading.current_thread())
+                entered.set()
+                self.assertTrue(release.wait(30.0))
+            return original(state_self, *args, **kwargs)
+
+        return mock.patch.object(conductor.DaemonState, method, wrapper), entered, release, threads
+
+    def run_with_held_reader(self, ticket: str, payload: bytes, method: str, mode: str = "exit", on_hold=None):
+        patch, entered, release, threads = self.held(method)
+        errors: list[object] = []
+        before = set(threading.enumerate())
+        if on_hold is not None:
+            original_wait = entered.wait
+
+        try:
+            with patch, mock.patch.object(conductor, "OUTPUT_READER_JOIN_SECONDS", 0.2), mock.patch.object(
+                threading, "excepthook", errors.append
+            ):
+                if on_hold is not None:
+                    starter = threading.Thread(target=lambda: (original_wait(20.0), on_hold()), daemon=True)
+                    starter.start()
+                job, ticket_path, elapsed = self.run_child(ticket, payload, mode)
+                self.assertTrue(entered.is_set())
+                self.assertEqual(len(threads), 1)
+                # Held beyond both joins: the reader is still alive after _run_job returned.
+                self.assertTrue(threads[0].is_alive())
+                self.assertGreaterEqual(elapsed, 0.4)
+                outcome = (job.state, job.exit_code, job.error, ticket_path.exists())
+                release.set()
+                threads[0].join(10.0)
+                self.assertFalse(threads[0].is_alive())
+                deadline = time.monotonic() + 5.0
+                while time.monotonic() < deadline and [t for t in threading.enumerate() if t not in before and t.is_alive()]:
+                    time.sleep(0.01)
+                self.assertEqual([t.name for t in threading.enumerate() if t not in before and t.is_alive()], [])
+        finally:
+            release.set()
+        self.assertEqual(errors, [])  # the resumed reader ended without an exception
+        return job, ticket_path, outcome
+
+    def assert_reader_incomplete_failure(self, job: conductor.Job, ticket_path: Path, outcome) -> str:
+        state_, exit_code, error, ticket_existed = outcome
+        self.assertEqual((state_, exit_code), ("failed", conductor.XCTEST_STALL_FAILURE_EXIT_CODE))
+        self.assertTrue((error or "").startswith("XCTest output reader did not finish within 0.4s"), error)
+        self.assertLess(len(error), 300)
+        self.assertFalse(ticket_existed, "no success artifact before the reader resumed")
+        # After the reader resumed and finished: still failed, same reason, no ticket.
+        self.assertEqual((job.state, job.exit_code, job.error, job.result_summary), ("failed", exit_code, error, error))
+        self.assertTrue(job.measurement_invalid)
+        self.assertFalse(ticket_path.exists(), "a resumed reader never publishes a success artifact")
+        incomplete = [d for d in job.diagnostics if d.get("kind") == "xctest-output-reader-incomplete"]
+        self.assertEqual([(d["joinSeconds"], d["outcomeChanged"]) for d in incomplete], [(0.4, True)])
+        with contextlib.redirect_stdout(io.StringIO()) as rendered:
+            conductor.print_terminal_job_output(job.to_payload())
+        self.assertIn(f"Error:    {error}\n", rendered.getvalue())
+        log = job.log_path.read_bytes()
+        self.assertIn(b"\n" + error.encode() + b"\n", log)
+        return log.decode("utf-8", errors="replace")
+
+    def test_a_reader_held_before_its_failure_report_beyond_both_joins_fails_the_job(self) -> None:
+        cases = {
+            "d2c": (self.START_A + self.pending(17), "pending"),
+            # The log then ends mid-line, so the guard's reason starts a new line.
+            "d1-eof-without-newline": (self.START_A + b"Test Case '-[M.S testA]' passed (" + b"9" * 70000 + b").", "segment"),
+        }
+        for name, (payload, boundary) in cases.items():
+            with self.subTest(case=name):
+                job, ticket_path, outcome = self.run_with_held_reader(
+                    f"od16-held-{name}", payload, "_fail_xctest_output_contract"
+                )
+                self.assert_reader_incomplete_failure(job, ticket_path, outcome)
+                # The late OD16 report is recorded but changes neither the outcome nor its reason.
+                self.assertTrue((job.xctest_output_failure or "").startswith("XCTest output contract failure (OD16): "))
+                self.assertEqual(
+                    [d["boundary"] for d in job.diagnostics if d.get("kind") == "xctest-output-contract"], [boundary]
+                )
+                self.assertEqual(job.xctest_current_test, "-[M.S testA]")  # nothing of the failed record applied
+
+    def test_a_reader_held_without_any_od16_failure_still_cannot_succeed(self) -> None:
+        payload = self.START_A + b"Test Case '-[M.S testA]' passed (0.001 seconds).\n"
+        job, ticket_path, outcome = self.run_with_held_reader("od16-held-ok", payload, "_submit_output_records")
+        self.assert_reader_incomplete_failure(job, ticket_path, outcome)
+        self.assertIsNone(job.xctest_output_failure)
+        self.assertEqual(job.xctest_last_progress_action, "passed")  # applied late, outcome unchanged
+
+    def test_the_reader_guard_terminates_remaining_job_processes(self) -> None:
+        # The root exits 0 after the reader is held, leaving a TERM-ignoring
+        # descendant that holds the PTY; the guard's TERM/KILL escalation ends it
+        # (run_child asserts the process tree is gone).
+        holder: dict[str, object] = {}
+
+        def on_hold() -> None:
+            state_self, job = holder["state"], holder["job"]
+            with state_self.condition:
+                # The conductor knows the descendant while the root is alive.
+                self.assertTrue(state_self._process_tree_alive_locked(job))
+            (state_self.paths.jobs_dir / "od16-held-tree.go").touch()
+
+        original_make_job = self.make_job
+
+        def make_job(state, *args, **kwargs):
+            job = original_make_job(state, *args, **kwargs)
+            holder["state"], holder["job"] = state, job
+            return job
+
+        payload = self.START_A + self.pending(17)
+        with mock.patch.object(self, "make_job", make_job):
+            job, ticket_path, outcome = self.run_with_held_reader(
+                "od16-held-tree", payload, "_fail_xctest_output_contract", "exit,spawn,wait-go", on_hold
+            )
+        log = self.assert_reader_incomplete_failure(job, ticket_path, outcome)
+        self.assertIn("killing process tree: XCTest output reader incomplete; SIGKILL after grace period", log)
+
+    def test_the_reader_guard_keeps_a_decided_outcome_and_spares_other_operations(self) -> None:
+        tmp, state = self.make_state()
+        self.addCleanup(tmp.cleanup)
+        cases = {
+            "nonzero-exit": (1, {}),
+            "timed-out": (0, {"timed_out": True, "error": "timed out after 1.0s"}),
+            "stalled": (0, {"measurement_invalid": True, "error": "XCTest STARTUP deadline fired"}),
+            "canceled": (0, {"cancel_requested": True}),
+        }
+        for name, (exit_code, fields) in cases.items():
+            with self.subTest(case=name):
+                job = self.make_job(state, f"guard-{name}", "test", {}, ["build"], job_state="running")
+                state.jobs[job.ticket] = job
+                for field, value in fields.items():
+                    setattr(job, field, value)
+                before = (job.measurement_invalid, job.error)
+                state._fail_incomplete_xctest_output_reader(job, exit_code)
+                self.assertEqual((job.measurement_invalid, job.error), before)
+                self.assertEqual([d["outcomeChanged"] for d in job.diagnostics], [False])
+        # Only classifying (watchdog-enabled) jobs are guarded.
+        build = self.make_job(state, "guard-build", "build", {}, ["build"], job_state="running")
+        self.assertFalse(state._xctest_watchdog_enabled(build))
+
+
 class ProcessTreeCancellationTests(LifecycleTestCase):
     def wait_until(self, predicate, timeout: float = 5.0) -> bool:
         deadline = time.monotonic() + timeout
@@ -4300,6 +4655,7 @@ class RunScriptTransitionTests(unittest.TestCase):
             run_script = scripts / "run.sh"
             shutil.copy2(SCRIPT_DIR / "run.sh", run_script)
             shutil.copy2(SCRIPT_DIR / "conductor.py", scripts / "conductor.py")
+            shutil.copy2(SCRIPT_DIR / "conductor_output.py", scripts / "conductor_output.py")
             run_script.chmod(0o755)
             package_script = scripts / "package_app.sh"
             package_script.write_text("#!/usr/bin/env bash\necho package failed\nexit 23\n", encoding="utf-8")
@@ -4351,6 +4707,7 @@ class RunScriptTransitionTests(unittest.TestCase):
             run_script = scripts / "run.sh"
             shutil.copy2(SCRIPT_DIR / "run.sh", run_script)
             shutil.copy2(SCRIPT_DIR / "conductor.py", scripts / "conductor.py")
+            shutil.copy2(SCRIPT_DIR / "conductor_output.py", scripts / "conductor_output.py")
             run_script.chmod(0o755)
             event_log = root / "events.log"
             launched_marker = root / "launched"
@@ -4470,6 +4827,7 @@ class RunScriptTransitionTests(unittest.TestCase):
             run_script = scripts / "run.sh"
             shutil.copy2(SCRIPT_DIR / "run.sh", run_script)
             shutil.copy2(SCRIPT_DIR / "conductor.py", scripts / "conductor.py")
+            shutil.copy2(SCRIPT_DIR / "conductor_output.py", scripts / "conductor_output.py")
             run_script.chmod(0o755)
             event_log = root / "events.log"
             launched_marker = root / "launched"

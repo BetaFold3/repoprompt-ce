@@ -24,6 +24,7 @@ import math
 import os
 import plistlib
 import re
+import select
 import signal
 import shutil
 import socket
@@ -36,53 +37,60 @@ import time
 import uuid
 from collections import deque
 from pathlib import Path
-from typing import Any, Deque, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Deque, Dict, FrozenSet, List, Mapping, Optional, Sequence, Tuple
 
 from debug_app_process import ProcessIdentityError, matching_processes, terminate_matching_processes
 
 
-def _load_pipeline_metrics() -> Optional[Any]:
-    """Load ``swift_pipeline_metrics.py`` from this file's directory, or ``None``.
+def _load_sibling_helper(stem: str) -> Any:
+    """Load ``<stem>.py`` from this file's directory by explicit path.
 
-    Loaded by explicit path so a conductor copy never picks up another checkout's
-    helper from ``sys.path``. Telemetry is optional: any failure leaves the
-    conductor fully functional with timing disabled.
+    A conductor copy never picks up another checkout's helper from
+    ``sys.path``. Raises when the helper cannot be loaded.
+    """
+    path = Path(__file__).resolve().with_name(f"{stem}.py")
+    existing = sys.modules.get(stem)
+    if existing is not None and Path(getattr(existing, "__file__", "") or "").resolve() == path:
+        return existing
+    name = stem if existing is None else f"_rpce_{stem}_" + hashlib.sha256(str(path).encode("utf-8")).hexdigest()[:12]
+    if name in sys.modules:
+        return sys.modules[name]
+    spec = importlib.util.spec_from_file_location(name, path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"cannot load {path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    try:
+        spec.loader.exec_module(module)
+    except BaseException:
+        sys.modules.pop(name, None)
+        raise
+    return module
+
+
+def _load_pipeline_metrics() -> Optional[Any]:
+    """``swift_pipeline_metrics.py`` from this file's directory, or ``None``.
+
+    Telemetry is optional: any failure leaves the conductor fully functional
+    with timing disabled.
     """
     try:
-        path = Path(__file__).resolve().with_name("swift_pipeline_metrics.py")
-        existing = sys.modules.get("swift_pipeline_metrics")
-        if existing is not None and Path(getattr(existing, "__file__", "") or "").resolve() == path:
-            return existing
-        name = (
-            "swift_pipeline_metrics"
-            if existing is None
-            else "_rpce_swift_pipeline_metrics_" + hashlib.sha256(str(path).encode("utf-8")).hexdigest()[:12]
-        )
-        if name in sys.modules:
-            return sys.modules[name]
-        spec = importlib.util.spec_from_file_location(name, path)
-        if spec is None or spec.loader is None:
-            return None
-        module = importlib.util.module_from_spec(spec)
-        sys.modules[name] = module
-        try:
-            spec.loader.exec_module(module)
-        except BaseException:
-            sys.modules.pop(name, None)
-            raise
-        return module
+        return _load_sibling_helper("swift_pipeline_metrics")
     except Exception:
         return None
 
 
 PIPELINE_METRICS = _load_pipeline_metrics()
+# Step 3 output records (splitter, tail, batches). Required: the output path and
+# summaries depend on it, so a load failure is fatal rather than silently degraded.
+CONDUCTOR_OUTPUT = _load_sibling_helper("conductor_output")
 
 
 def compute_conductor_digest() -> Optional[str]:
     """Informational content digest of the conductor implementation files."""
     script = Path(__file__).resolve()
     paths = [script]
-    for name in ("swift_pipeline_metrics.py", "debug_app_process.py"):
+    for name in ("swift_pipeline_metrics.py", "debug_app_process.py", "conductor_output.py"):
         candidate = script.with_name(name)
         if candidate.is_file():
             paths.append(candidate)
@@ -151,7 +159,9 @@ TERMINAL_STATES = {"completed", "failed", "canceled"}
 LANE_NAMES = {"build", "debugArtifact", "liveApp", "release", "style"}
 LOG_TAIL_LINES = 30
 BUILD_CACHE_DIAGNOSTIC_MAX_ROWS = 12
-SUMMARY_VERSION = 1
+SUMMARY_VERSION = 2
+# Per-section deduplication memory; beyond it omitted counts become upper bounds.
+SUMMARY_SEEN_MAX_ENTRIES = 4096
 SUMMARY_SUCCESS_MAX_LINES = 25
 SUMMARY_FAILURE_MAX_LINES = 100
 SUMMARY_MAX_CHARS = 16000
@@ -164,9 +174,13 @@ MAX_TERMINAL_JOBS = 200
 TERMINAL_RETENTION_SECONDS = 24 * 60 * 60
 STARTUP_TIMEOUT_SECONDS = 10.0
 WAIT_POLL_SECONDS = 1.0
+# Client bound on re-polling a terminal job whose summary another caller is computing.
+SUMMARY_PENDING_WAIT_SECONDS = 60.0
 TERMINATE_GRACE_SECONDS = 3.0
 KILL_GRACE_SECONDS = 2.0
 PROCESS_TREE_POLL_SECONDS = 0.05
+# Each of the two bounded output-reader joins after a job's root process exits.
+OUTPUT_READER_JOIN_SECONDS = 2.0
 XCTEST_WAKE_PROBE_PAUSE_SECONDS = 0.25
 XCTEST_WAKE_PROGRESS_WAIT_SECONDS = 10.0
 XCTEST_STALL_DIAGNOSTIC_MAX_PROCESSES = 64
@@ -348,6 +362,45 @@ XCTEST_PROGRESS_RE = re.compile(
 )
 XCTEST_CASE_NAME_RE = re.compile(r"^-\[([^\s\]]+)\s+([^\s\]]+)\]$")
 XCTEST_ANSI_SGR_RE = re.compile(r"\x1b\[[0-9:;]*m")
+# Literals every recognized XCTest progress line contains: a marker line starts
+# with the first, and the startup transition is a substring test for the second.
+XCTEST_PROGRESS_KEYWORDS = ("Test Case '", "Build complete!")
+
+# The output helper's bounds and over-cap scanner grammar must equal this file's.
+if (
+    CONDUCTOR_OUTPUT.TAIL_MAX_ENTRIES != LOG_TAIL_LINES
+    or CONDUCTOR_OUTPUT.SEGMENT_SGR_PATTERN != XCTEST_ANSI_SGR_RE.pattern
+    or CONDUCTOR_OUTPUT.XCTEST_MARKER_PATTERN != XCTEST_PROGRESS_RE.pattern
+):
+    raise ImportError(
+        "conductor_output.py disagrees with conductor.py on the tail bound or the XCTest SGR or marker grammar"
+    )
+
+
+def _xctest_segment_item(content: Optional[str], found: FrozenSet[str]) -> Optional[Tuple[str, Any]]:
+    """``(matchable_line, marker)`` for one segment of an over-cap output record.
+
+    ``content`` is the segment exactly as ``_record_xctest_progress_locked``
+    normalizes a line (SGR-stripped, then whitespace-stripped), or ``None`` when
+    it exceeds ``CONDUCTOR_OUTPUT.SEGMENT_MAX_CHARS``. A line over the bound
+    that would match ``XCTEST_PROGRESS_RE`` fails the scanner instead (OD16) and
+    never arrives here, so for ``None`` only the ``Build complete!`` substring
+    test applies, which ``found`` answers exactly.
+    """
+    if content is not None:
+        if XCTEST_PROGRESS_KEYWORDS[0] not in content and XCTEST_PROGRESS_KEYWORDS[1] not in content:
+            return None
+        marker = XCTEST_PROGRESS_RE.match(content)
+        if marker is not None or XCTEST_PROGRESS_KEYWORDS[1] in content:
+            return (content, marker)
+        return None
+    if XCTEST_PROGRESS_KEYWORDS[1] in found:
+        return (XCTEST_PROGRESS_KEYWORDS[1], None)
+    return None
+
+
+def _xctest_segment_scanner() -> Any:
+    return CONDUCTOR_OUTPUT.SegmentScanner(_xctest_segment_item, XCTEST_PROGRESS_KEYWORDS, marker_shape=True)
 
 
 def _test_ledger_path(repo_root: Path) -> Path:
@@ -1158,11 +1211,12 @@ class ProcessOutputTransport:
         if self.kind == "pipe":
             if pipe_stream is None:
                 return b""
-            return pipe_stream.readline()
+            # Whatever is available (one raw read), never a fill-the-buffer read.
+            return pipe_stream.read1(CONDUCTOR_OUTPUT.READ_CHUNK_BYTES)
         if master_fd is None:
             return b""
         try:
-            return os.read(master_fd, 64 * 1024)
+            return os.read(master_fd, CONDUCTOR_OUTPUT.READ_CHUNK_BYTES)
         except OSError as exc:
             if exc.errno == errno.EIO:
                 return b""
@@ -1171,6 +1225,29 @@ class ProcessOutputTransport:
                     if self.master_fd is None:
                         return b""
             raise
+
+    def read_available(self, max_bytes: int = CONDUCTOR_OUTPUT.READ_CHUNK_BYTES) -> Optional[bytes]:
+        """One PTY read of at most ``max_bytes`` already-available bytes, else ``None`` (OD14).
+
+        Never waits: ``select`` with a zero timeout gates a single read. ``None``
+        means nothing is available right now, the reader was closed, the descriptor
+        cannot be polled, or the read failed; the next blocking ``read_chunk`` then
+        observes EOF, cancellation or the error exactly as without coalescing.
+        """
+        if self.kind != "pty":
+            return None
+        with self.close_lock:
+            master_fd = self.master_fd
+        if master_fd is None:
+            return None
+        try:
+            ready, _, _ = select.select([master_fd], [], [], 0)
+            if not ready:
+                return None
+            chunk = os.read(master_fd, max(1, min(int(max_bytes), CONDUCTOR_OUTPUT.READ_CHUNK_BYTES)))
+        except (OSError, ValueError):
+            return None
+        return chunk or None
 
     def close_slave(self) -> None:
         with self.close_lock:
@@ -1711,26 +1788,60 @@ def clean_summary_line(line: str) -> str:
     return cleaned
 
 
+class VisibleSummaryLine(str):
+    """An over-cap log record already cleaned of ``ANSI_RE`` (one pass over the whole
+    record): its first ``SUMMARY_LINE_MAX_CHARS + 1`` visible characters, so
+    ``clean_summary_line`` of the whole record is this text, cut the same way."""
+
+
+if CONDUCTOR_OUTPUT.CSI_RE.pattern != ANSI_RE.pattern:
+    raise ImportError("conductor_output.py disagrees with conductor.py on the summary ANSI grammar")
+
+
 class SummarySectionBuilder:
-    def __init__(self, title: str, max_lines: int, keep_last: bool = False) -> None:
+    """One summary section with bounded deduplication memory.
+
+    ``seen`` holds at most ``max_seen`` lines. Behavior is exact until it is
+    full; afterwards an unseen line can no longer be told apart from an earlier
+    omitted duplicate, so it is still checked against the displayed lines but
+    ``omittedLineCount`` becomes an upper bound (``deduplicationLimited``).
+    A ``keep_last`` section can then also re-display an older line that has
+    left its window; when such a line evicts another, the section discloses
+    ``displayedLinesMayRepeat`` (OD15). First-lines sections never evict, so
+    their displayed lines stay exact.
+    """
+
+    def __init__(self, title: str, max_lines: int, keep_last: bool = False, max_seen: Optional[int] = None) -> None:
         self.title = title
         self.max_lines = max_lines
         self.keep_last = keep_last
+        self.max_seen = SUMMARY_SEEN_MAX_ENTRIES if max_seen is None else max_seen
         self.lines: List[str] = []
         self.seen: set[str] = set()
         self.omitted = 0
+        self.deduplication_limited = False
+        self.displayed_lines_may_repeat = False
 
     def add(self, line: str) -> None:
         cleaned = clean_summary_line(line)
         if not cleaned or cleaned in self.seen:
             return
-        self.seen.add(cleaned)
+        unverified = False
+        if len(self.seen) < self.max_seen:
+            self.seen.add(cleaned)
+        elif cleaned in self.lines:
+            return
+        else:
+            self.deduplication_limited = True
+            unverified = True
         if len(self.lines) < self.max_lines:
             self.lines.append(cleaned)
         elif self.keep_last:
             self.lines.pop(0)
             self.lines.append(cleaned)
             self.omitted += 1
+            if unverified:
+                self.displayed_lines_may_repeat = True
         else:
             self.omitted += 1
 
@@ -1746,6 +1857,9 @@ class SummarySectionBuilder:
             "lines": list(self.lines),
             "truncated": self.omitted > 0,
             "omittedLineCount": self.omitted,
+            "deduplicationLimited": self.deduplication_limited,
+            "omittedLineCountQuality": "upper_bound" if self.deduplication_limited else "exact",
+            "displayedLinesMayRepeat": self.displayed_lines_may_repeat,
         }
 
 
@@ -1774,6 +1888,8 @@ class OutputSummarizer:
         r"(Stopping existing RepoPrompt|Waiting for existing RepoPrompt|Launching .*RepoPrompt\.app|Confirming launched RepoPrompt|Observed launched RepoPrompt|Guarding against a delayed RepoPrompt|Delayed launch guard confirmed|RepoPrompt(?: CE debug app)? stop confirmed|RepoPrompt was (not running|already stopped))"
     )
     SOURCE_CHANGED_DURING_BUILD_RE = re.compile(r"input file .* was modified during the build", re.IGNORECASE)
+    # Tests compare against the unconditional (pre-Step-3) classification.
+    KEYWORD_PRECHECK = True
 
     @classmethod
     def summarize_file(
@@ -1785,9 +1901,17 @@ class OutputSummarizer:
         timed_out: bool,
         log_path: Path,
     ) -> Dict[str, Any]:
+        # The raw log streams through the shared record splitter (Step 3): records
+        # end at LF, CR LF or a bare CR, exactly like universal-newline reading.
+        # An over-cap record yields its cleaned visible prefix over the whole record.
         try:
-            with log_path.open("r", encoding="utf-8", errors="replace") as handle:
-                return cls.summarize_lines(operation, args, state, exit_code, timed_out, handle)
+            texts = CONDUCTOR_OUTPUT.iter_file_texts(
+                log_path,
+                over_cap=VisibleSummaryLine,
+                visible_chars=SUMMARY_LINE_MAX_CHARS + 1,
+                visible_pattern=CONDUCTOR_OUTPUT.CSI_RE,
+            )
+            return cls.summarize_lines(operation, args, state, exit_code, timed_out, texts)
         except OSError as exc:
             return cls._minimal_summary(operation, state, exit_code, f"could not read log for summary: {exc}")
 
@@ -1831,27 +1955,71 @@ class OutputSummarizer:
         previous_context: Deque[str] = deque(maxlen=SUMMARY_CONTEXT_BEFORE)
         pending_context: List[Tuple[str, int]] = []
         style_operation = operation in {"format", "format-check", "lint", "check-format-tools", "install-format-tools", "format-tools-status"}
+        precheck = cls.KEYWORD_PRECHECK
 
         for raw_line in lines_iterable:
             line_count += 1
-            line = clean_summary_line(str(raw_line))
+            if type(raw_line) is str:
+                line = clean_summary_line(raw_line)
+            elif type(raw_line) is VisibleSummaryLine:
+                # Already cleaned over the whole record: only the length cut remains.
+                line = str(raw_line)
+                if len(line) > SUMMARY_LINE_MAX_CHARS:
+                    line = line[: SUMMARY_LINE_MAX_CHARS - 1] + "…"
+            else:
+                line = clean_summary_line(str(raw_line))
             tail.append(line)
 
-            if "Stopping existing RepoPrompt" in line:
-                launch_lifecycle["transitionStarted"] = True
-            if "Launching " in line and "RepoPrompt.app" in line:
-                launch_lifecycle["transitionStarted"] = True
-                launch_lifecycle["launchRequested"] = True
-            if "Observed launched RepoPrompt" in line:
-                launch_lifecycle["launchConfirmed"] = True
-            if cls.SOURCE_CHANGED_DURING_BUILD_RE.search(line):
+            # Casefolded keyword precheck: each gate is implied by every
+            # alternative of its regex, so a closed gate proves a non-match.
+            # It is exact for ASCII lines (casefold is ASCII lowercase and
+            # IGNORECASE cannot match a different ASCII letter); other lines
+            # run every regex. Each regex runs at most once per record.
+            if precheck and line.isascii():
+                low = line.casefold()
+                g_error = "error:" in low
+                g_warning = "warning:" in low
+                g_repoprompt = "repoprompt" in low
+                g_kill = "killing process " in low or "terminating process " in low
+                g_source = "was modified during the build" in low
+                g_swift = g_error or "swiftcompile failed" in low or "compileswift failed" in low
+                g_failure = (
+                    g_error or g_kill or "failed" in low or "fatal error" in low or "exception" in low
+                    or "timed out" in low or "process exited with status" in low or "traceback" in low
+                    or "permission denied" in low or "no such file or directory" in low
+                )
+                g_timeout = g_kill or "canceled" in low or "timed out after" in low or "deadline triggered" in low
+                g_test = (
+                    g_error or "test case '" in low or "executed " in low or "xctassert" in low or "failing tests:" in low
+                )
+                g_lifecycle = g_repoprompt or "delayed launch guard confirmed" in low
+                g_style = style_operation and (
+                    g_error or g_warning or "swiftformat" in low or "swiftlint" in low or "linting" in low
+                    or "missing required" in low or "install-format-tools" in low
+                )
+            else:
+                g_error = g_warning = g_repoprompt = g_source = g_swift = g_failure = True
+                g_timeout = g_test = g_lifecycle = True
+                g_style = style_operation
+
+            if g_repoprompt:
+                if "Stopping existing RepoPrompt" in line:
+                    launch_lifecycle["transitionStarted"] = True
+                if "Launching " in line and "RepoPrompt.app" in line:
+                    launch_lifecycle["transitionStarted"] = True
+                    launch_lifecycle["launchRequested"] = True
+                if "Observed launched RepoPrompt" in line:
+                    launch_lifecycle["launchConfirmed"] = True
+            if g_source and cls.SOURCE_CHANGED_DURING_BUILD_RE.search(line):
                 launch_lifecycle["sourceChangedDuringBuild"] = True
 
-            if cls.WARNING_RE.search(line):
+            swift_error = g_swift and cls.SWIFT_ERROR_RE.search(line) is not None
+            failure_match = g_failure and cls.FAILURE_RE.search(line) is not None
+            if g_warning and cls.WARNING_RE.search(line):
                 warning_count += 1
                 if failure or line.startswith("WARNING:"):
                     sections["Warnings"].add(line)
-            if cls.SWIFT_ERROR_RE.search(line) or cls.FAILURE_RE.search(line):
+            if swift_error or failure_match:
                 error_count += 1
 
             if pending_context:
@@ -1863,21 +2031,23 @@ class OutputSummarizer:
                 pending_context = next_pending
 
             matched_titles: List[str] = []
-            if cls.PHASE_RE.search(line):
+            first = line[:1]
+            # Anchored patterns: exact first-character gates (``\s`` is str.isspace).
+            if first in "=$+" and cls.PHASE_RE.search(line):
                 sections["Phases"].add(line)
-            if cls.APP_LIFECYCLE_RE.search(line):
+            if g_lifecycle and cls.APP_LIFECYCLE_RE.search(line):
                 sections["App lifecycle"].add(line)
-            if cls.ARTIFACT_RE.search(line):
+            if (first in "CAORBMWT" or first.isspace()) and cls.ARTIFACT_RE.search(line):
                 sections["Artifacts"].add(line)
-            if cls.TIMEOUT_RE.search(line):
+            if g_timeout and cls.TIMEOUT_RE.search(line):
                 matched_titles.append("Timeout or cancellation")
-            if cls.TEST_FAILURE_RE.search(line):
+            if g_test and cls.TEST_FAILURE_RE.search(line):
                 matched_titles.append("Test failures")
-            if cls.SWIFT_ERROR_RE.search(line):
+            if swift_error:
                 matched_titles.append("Swift compiler errors")
-            if style_operation and cls.STYLE_FINDING_RE.search(line):
+            if g_style and cls.STYLE_FINDING_RE.search(line):
                 matched_titles.append("Style findings")
-            if cls.FAILURE_RE.search(line):
+            if failure_match:
                 matched_titles.append("Failure highlights")
 
             for title in matched_titles:
@@ -1947,6 +2117,8 @@ class OutputSummarizer:
                 truncated = True
 
         omitted_line_count = max(0, line_count - rendered_line_count)
+        deduplication_limited = any(builder.deduplication_limited for builder in sections.values())
+        may_repeat = any(builder.displayed_lines_may_repeat for builder in sections.values())
         return {
             "version": SUMMARY_VERSION,
             "operation": operation,
@@ -1960,6 +2132,13 @@ class OutputSummarizer:
             "launchLifecycle": launch_lifecycle,
             "sections": payload_sections,
             "truncated": truncated,
+            # Any section's deduplication saturated (its counts are upper bounds),
+            # and whether a keep-last section may show a repeated older line.
+            "deduplicationLimited": deduplication_limited,
+            "displayedLinesMayRepeat": may_repeat,
+            # Describes the top-level ``omittedLineCount`` (log lines minus
+            # rendered lines), which is always exact.
+            "omittedLineCountQuality": "exact",
         }
 
     @classmethod
@@ -1992,9 +2171,15 @@ class OutputSummarizer:
                     "lines": [clean_summary_line(note)],
                     "truncated": False,
                     "omittedLineCount": 0,
+                    "deduplicationLimited": False,
+                    "omittedLineCountQuality": "exact",
+                    "displayedLinesMayRepeat": False,
                 }
             ],
             "truncated": False,
+            "deduplicationLimited": False,
+            "displayedLinesMayRepeat": False,
+            "omittedLineCountQuality": "exact",
         }
 
 
@@ -2146,10 +2331,24 @@ class Job:
     xctest_last_progress_observed_at: Optional[float] = None
     xctest_watchdog_triggered: bool = False
     xctest_process_finished: bool = False
+    # OD16: the bounded reason the output reader could not classify XCTest progress.
+    xctest_output_failure: Optional[str] = None
     diagnostics: List[Dict[str, Any]] = dataclasses.field(default_factory=list)
     diagnostic_paths: List[Path] = dataclasses.field(default_factory=list, repr=False)
     output_summary: Optional[Dict[str, Any]] = None
-    tail: Deque[str] = dataclasses.field(default_factory=lambda: deque(maxlen=LOG_TAIL_LINES))
+    # Summary single-flight (Step 3): none | running | complete | failed. The
+    # claimant computes outside ``condition``; joiners wait on ``summary_event``.
+    summary_state: str = "none"
+    summary_event: Optional[threading.Event] = dataclasses.field(default=None, repr=False, compare=False)
+    # Retention pin (Step 3): summary work and its status/wait consumers hold one
+    # each until their payload is built; retention defers a pinned job and
+    # reruns when the last pin is released.
+    summary_pins: int = dataclasses.field(default=0, repr=False, compare=False)
+    retention_deferred: bool = dataclasses.field(default=False, repr=False, compare=False)
+    # CR-segmented, ANSI-stripped entries: at most 30 entries / 64 KiB, 4 KiB each.
+    tail: Any = dataclasses.field(
+        default_factory=lambda: CONDUCTOR_OUTPUT.OutputTail(max_entries=LOG_TAIL_LINES)
+    )
     # Step 2 passive timing. ``telemetry`` is set once at creation and never
     # replaced; its private lock is never taken while holding ``condition``.
     telemetry: Optional[Any] = dataclasses.field(default=None, repr=False, compare=False)
@@ -3173,15 +3372,28 @@ class DaemonState:
             raise ConductorError(f"unknown job '{ticket}'")
         return job
 
+    def _pin_job_locked(self, job: Job) -> None:
+        job.summary_pins += 1
+
+    def _unpin_job_locked(self, job: Job) -> None:
+        job.summary_pins -= 1
+        if job.summary_pins <= 0 and job.retention_deferred:
+            job.retention_deferred = False
+            self._retention_pass_locked()
+
     def job_status(self, ticket: Optional[str], request_key: Optional[str]) -> Dict[str, Any]:
         with self.lock:
             job = self.resolve_job_locked(ticket, request_key)
             if job.state not in TERMINAL_STATES or job.output_summary is not None:
                 return self._job_payload_locked(job, include_tail=True)
-        self._refresh_output_summary(job)
-        with self.lock:
-            return self._job_payload_locked(self.resolve_job_locked(ticket, request_key), include_tail=True)
-
+            self._pin_job_locked(job)
+        try:
+            self._refresh_output_summary(job)
+            with self.lock:
+                return self._job_payload_locked(job, include_tail=True)
+        finally:
+            with self.lock:
+                self._unpin_job_locked(job)
 
     def job_wait(self, ticket: Optional[str], request_key: Optional[str], timeout: Optional[float]) -> Dict[str, Any]:
         deadline = now() + timeout if timeout is not None else None
@@ -3198,11 +3410,20 @@ class DaemonState:
                 payload = self._job_payload_locked(job, include_tail=True)
                 payload["waitTimedOut"] = False
                 return payload
-        self._refresh_output_summary(job)
-        with self.condition:
-            payload = self._job_payload_locked(self.resolve_job_locked(ticket, request_key), include_tail=True)
-            payload["waitTimedOut"] = False
-            return payload
+            self._pin_job_locked(job)
+        try:
+            self._refresh_output_summary(job, deadline=deadline)
+            with self.condition:
+                payload = self._job_payload_locked(job, include_tail=True)
+                payload["waitTimedOut"] = False
+                if job.output_summary is None and job.summary_state == "running":
+                    # This wait's deadline ended while another caller is still
+                    # summarizing: clients must not scan the log themselves.
+                    payload["summaryPending"] = True
+                return payload
+        finally:
+            with self.condition:
+                self._unpin_job_locked(job)
 
     def job_cancel(self, ticket: Optional[str], request_key: Optional[str]) -> Dict[str, Any]:
         with self.condition:
@@ -3684,12 +3905,15 @@ class DaemonState:
                                 )
                             if descendants_alive:
                                 raise ConductorError("canceled job descendants remained alive after SIGKILL escalation")
-                reader.join(timeout=2.0)
+                reader.join(timeout=OUTPUT_READER_JOIN_SECONDS)
                 if reader.is_alive():
                     output_transport.close_reader()
-                    reader.join(timeout=2.0)
+                    reader.join(timeout=OUTPUT_READER_JOIN_SECONDS)
                 else:
                     output_transport.close_reader()
+                if reader.is_alive() and self._xctest_watchdog_enabled(job):
+                    # OD16: success requires the classifying reader to have finished.
+                    self._fail_incomplete_xctest_output_reader(job, exit_code)
                 with self.condition:
                     job.xctest_process_finished = True
                     self.condition.notify_all()
@@ -3926,80 +4150,287 @@ class DaemonState:
             elif job is not None and refresh_after_release:
                 threading.Thread(target=self._refresh_output_summary, args=(job,), daemon=True).start()
 
-    @staticmethod
-    def _take_complete_output_lines(pending: bytearray, chunk: bytes) -> List[bytes]:
-        pending.extend(chunk)
-        lines: List[bytes] = []
-        while True:
-            newline = pending.find(b"\n")
-            if newline < 0:
-                return lines
-            end = newline + 1
-            lines.append(bytes(pending[:end]))
-            del pending[:end]
+    def _xctest_progress_transitions(self, records: Sequence[Any]) -> List[Tuple[int, str, Any]]:
+        """Recognized XCTest progress lines of ``records``, in order (outside the lock).
 
-    def _submit_process_output_line(self, ticket: str, line: bytes) -> None:
-        text = line.decode("utf-8", errors="replace")
+        Each entry is ``(receive_ns, matchable_line, marker)`` with exactly the
+        line normalization and match of ``_record_xctest_progress_locked``;
+        whether it changes job state is decided under the lock by
+        ``_apply_xctest_progress_line_locked``.
+        """
+        transitions: List[Tuple[int, str, Any]] = []
+        sgr_sub = XCTEST_ANSI_SGR_RE.sub
+        match = XCTEST_PROGRESS_RE.match
+        for record in records:
+            if record[4]:
+                # Over cap: the scanner classified the whole record before any
+                # byte was dropped (no items once the scanner failed, OD16).
+                receive_ns = record[1]
+                transitions.extend((receive_ns, line, marker) for line, marker in record[7])
+                continue
+            text = record[2]
+            if "\x1b" in text:
+                text = sgr_sub("", text)
+            if "Test Case '" not in text and "Build complete!" not in text:
+                continue
+            # SGR sequences hold no line separators, so stripping them before
+            # ``splitlines`` equals today's per-line strip.
+            for raw_line in text.splitlines():
+                matchable_line = raw_line.strip()
+                marker = match(matchable_line)
+                if marker is not None or "Build complete!" in matchable_line:
+                    transitions.append((record[1], matchable_line, marker))
+        return transitions
+
+    def _submit_output_records(
+        self,
+        ticket: str,
+        records: List[Any],
+        receive_wall: float,
+        watchdog: bool,
+        cursor: Optional[Any],
+        walls: Optional[Mapping[int, float]] = None,
+    ) -> None:
+        """Steps 3–5 of the Step 3 reader contract for one read's (or one coalesced group's) records.
+
+        Telemetry, tail normalization and XCTest classification run outside
+        ``self.condition``. Each batch (at most 256 records / 64 KiB) then takes
+        the lock once, extends the tail, applies every recognized XCTest
+        transition individually and in order with its record's receive time,
+        and notifies once. ``walls`` maps a coalesced read's receive time to its
+        wall time; records of any other read use ``receive_wall``.
+        """
+        if cursor is not None and cursor.active:
+            cursor.observe_split_records(records)
+        output = CONDUCTOR_OUTPUT
+        for batch in output.record_batches(records):
+            entries = output.tail_entries(batch)
+            transitions = self._xctest_progress_transitions(batch) if watchdog else ()
+            with self.condition:
+                job = self.jobs.get(ticket)
+                if job is None:
+                    continue
+                job.tail.extend_sized(entries)
+                for receive_ns, matchable_line, marker in transitions:
+                    self._apply_xctest_progress_line_locked(
+                        job,
+                        matchable_line,
+                        marker,
+                        receive_ns / 1_000_000_000,
+                        receive_wall if walls is None else walls.get(receive_ns, receive_wall),
+                    )
+                self.condition.notify_all()
+
+    def _fail_xctest_output_contract(self, ticket: str, kind: str, record_seq: int, line_open: bool = False) -> None:
+        """OD16: fail the job visibly when over-cap XCTest output exceeds the scanner's bounds.
+
+        ``kind`` is ``SegmentScanner.failure``: ``"segment"`` (D1, a normalized
+        marker line over ``SEGMENT_MAX_CHARS``) or ``"pending"`` (D2, more than
+        ``SEGMENT_MAX_PENDING_ITEMS`` items in one over-cap record). The reason is
+        bounded and echoes no output. A running job becomes measurement-invalid,
+        so it finalizes as failed (exit ``XCTEST_STALL_FAILURE_EXIT_CODE``) even
+        when the child exits 0, and publishes no success artifact; an earlier
+        stall claim keeps its own error. The XCTest monitor thread owns
+        terminating the process tree, so the reader keeps draining output.
+        ``line_open`` (the raw log ends mid-line) starts the system line on a
+        new log line, so it never joins the oversized output in summaries.
+        """
+        output = CONDUCTOR_OUTPUT
+        if kind == "segment":
+            limit = output.SEGMENT_MAX_CHARS
+            reason = (
+                f"XCTest output contract failure (OD16): a normalized XCTest progress marker in over-cap "
+                f"output record {record_seq} exceeds {limit} characters and cannot be applied within the "
+                "conductor's bounds"
+            )
+        else:
+            limit = output.SEGMENT_MAX_PENDING_ITEMS
+            reason = (
+                f"XCTest output contract failure (OD16): over-cap output record {record_seq} holds more "
+                f"than {limit} XCTest progress lines, which are not applied before the record completes"
+            )
         with self.condition:
             job = self.jobs.get(ticket)
-            if job:
-                self._append_tail_locked(job, text)
-                self._record_xctest_progress_locked(job, text)
-                self.condition.notify_all()
+            if job is None or job.xctest_output_failure is not None:
+                return
+            job.xctest_output_failure = reason
+            if line_open:
+                try:
+                    with job.log_path.open("ab") as handle:
+                        handle.write(b"\n")
+                except OSError:
+                    pass
+            job.diagnostics.append(
+                {
+                    "kind": "xctest-output-contract",
+                    "boundary": kind,
+                    "recordSeq": record_seq,
+                    "limit": limit,
+                    "capturedAt": now(),
+                }
+            )
+            self._append_system_line_locked(job, reason + "\n")
+            if job.state == "running" and not job.measurement_invalid:
+                job.measurement_invalid = True
+                job.error = reason
+            self.condition.notify_all()
+
+    def _fail_incomplete_xctest_output_reader(self, job: Job, exit_code: int) -> None:
+        """OD16 completion guard: an XCTest job succeeds only after its output reader finished.
+
+        Called by ``_run_job`` when the reader of a classifying (watchdog-enabled)
+        job is still alive after both bounded joins and the reader close. Such a
+        reader may still hold output it has read but not classified, including an
+        unreported OD16 failure, so the job must not succeed. It is not waited for
+        further. One bounded diagnostic and system line are always recorded. A job
+        that would otherwise succeed (exit 0, not canceled, timed out or already
+        measurement-invalid) becomes measurement-invalid, so it finalizes as failed
+        (exit ``XCTEST_STALL_FAILURE_EXIT_CODE``) and publishes no success artifact;
+        an outcome already decided keeps its own reason. Remaining job processes get
+        the bounded TERM/KILL escalation. When the reader resumes, its descriptor is
+        closed (EOF), and a late OD16 report records only its diagnostic.
+        """
+        waited = 2 * OUTPUT_READER_JOIN_SECONDS
+        reason = (
+            f"XCTest output reader did not finish within {waited:.1f}s after the process exited; "
+            "its output is not fully classified, so the job cannot succeed (OD16)"
+        )
+        with self.condition:
+            changes_outcome = exit_code == 0 and not (
+                job.cancel_requested or job.timed_out or job.measurement_invalid
+            )
+            job.diagnostics.append(
+                {
+                    "kind": "xctest-output-reader-incomplete",
+                    "joinSeconds": waited,
+                    "outcomeChanged": changes_outcome,
+                    "capturedAt": now(),
+                }
+            )
+            try:
+                with job.log_path.open("rb") as handle:
+                    handle.seek(0, os.SEEK_END)
+                    if handle.tell():
+                        handle.seek(-1, os.SEEK_END)
+                        line_open = handle.read(1) not in (b"\n", b"\r")
+                    else:
+                        line_open = False
+            except OSError:
+                line_open = False
+            self._append_system_line_locked(job, ("\n" if line_open else "") + reason + "\n")
+            if changes_outcome:
+                job.measurement_invalid = True
+                job.error = reason
+            if self._process_tree_alive_locked(job) or self._process_group_id_alive_locked(job):
+                cleanup = "XCTest output reader incomplete"
+                self._terminate_process_group_locked(job, reason=cleanup)
+                if self._wait_for_process_tree_exit_locked(
+                    job, now() + TERMINATE_GRACE_SECONDS, signal_for_new=signal.SIGTERM
+                ):
+                    self._kill_process_group_locked(job, reason=f"{cleanup}; SIGKILL after grace period")
+                    if self._wait_for_process_tree_exit_locked(
+                        job, now() + KILL_GRACE_SECONDS, signal_for_new=signal.SIGKILL
+                    ):
+                        self._append_system_line_locked(
+                            job, f"{cleanup} cleanup could not confirm descendant exit after SIGKILL\n"
+                        )
+            self.condition.notify_all()
+
+    def _submit_output_group(
+        self,
+        ticket: str,
+        splitter: Any,
+        records: List[Any],
+        receive_wall: float,
+        classify: bool,
+        cursor: Optional[Any],
+        walls: Optional[Mapping[int, float]] = None,
+    ) -> bool:
+        """Submit one group's records; returns whether XCTest classification continues.
+
+        Once the splitter latches a scanner failure (OD16), the records before
+        the failed one keep their transitions, the job fails, and every later
+        record (the failed one included) feeds telemetry and the tail only.
+        """
+        failure = splitter.segment_failure if classify else None
+        if failure is None:
+            if records:
+                self._submit_output_records(ticket, records, receive_wall, classify, cursor, walls)
+            return classify
+        kind, failed_seq = failure
+        cut = 0
+        while cut < len(records) and records[cut][0] < failed_seq:
+            cut += 1
+        if cut:
+            self._submit_output_records(ticket, records[:cut], receive_wall, True, cursor, walls)
+        # Every raw byte of the group is already in the log.
+        line_open = splitter.line_open or bool(records and records[-1][3] == "eof")
+        self._fail_xctest_output_contract(ticket, kind, failed_seq, line_open)
+        if cut < len(records):
+            self._submit_output_records(ticket, records[cut:], receive_wall, False, cursor, walls)
+        return False
 
     def _pump_output(
         self,
         ticket: str,
         read_chunk: Any,
         sink: Any,
+        cursor: Optional[Any] = None,
+        read_available: Optional[Any] = None,
     ) -> None:
-        """Relay raw output chunks to ``sink`` and complete lines to the job.
+        """Relay raw output chunks to ``sink`` and output records to the job.
 
-        ``read_chunk`` returns the next chunk, or ``b""`` at EOF. ``sink`` receives
-        every chunk unchanged (``write`` then ``flush``). This is the reader-loop
-        seam for later output-path changes; its unit tests call it directly, while
-        ``Scripts/conductor_benchmark.py`` measures the path through
-        ``_read_process_output`` so revisions without this seam remain comparable.
-        """
-        pending = bytearray()
-        try:
-            while True:
-                chunk = read_chunk()
-                if not chunk:
-                    break
-                sink.write(chunk)
-                sink.flush()
-                for line in self._take_complete_output_lines(pending, chunk):
-                    self._submit_process_output_line(ticket, line)
-        finally:
-            if pending:
-                self._submit_process_output_line(ticket, bytes(pending))
+        ``read_chunk`` returns the next available chunk, or ``b""`` at EOF.
+        Per read: the receive time is captured immediately, the raw chunk is
+        written and flushed unchanged, then the shared splitter's records feed
+        telemetry (``cursor``, optional), the tail and XCTest progress through
+        ``_submit_output_records``. A record completed by a later read takes that
+        read's receive time; an unterminated final record is flushed at EOF or on
+        a reader error. With the watchdog enabled, a record beyond the 64 KiB cap
+        is classified as a bounded stream before bytes are dropped; its
+        transitions ride on the record and take the receive time of the read
+        that completes it, like any line. A marker line over
+        ``SEGMENT_MAX_CHARS`` or more than ``SEGMENT_MAX_PENDING_ITEMS`` items in
+        one record fails the job instead (OD16, ``_fail_xctest_output_contract``):
+        nothing is applied early or from a partial line, classification stops,
+        and the raw bytes, records and tail continue unchanged until EOF.
 
-    def _submit_observed_output_line(self, ticket: str, line: bytes, cursor: Any, receive_ns: int) -> None:
-        """``_submit_process_output_line`` plus telemetry on the already-decoded
-        text, observed before (never under) ``self.condition``."""
-        text = line.decode("utf-8", errors="replace")
-        if cursor.active:
-            cursor.observe_line(line, text, receive_ns)
-        with self.condition:
-            job = self.jobs.get(ticket)
-            if job:
-                self._append_tail_locked(job, text)
-                self._record_xctest_progress_locked(job, text)
-                self.condition.notify_all()
-
-    def _pump_output_observed(self, ticket: str, read_chunk: Any, sink: Any, cursor: Any) -> None:
-        """``_pump_output`` with receive timestamps and a telemetry cursor.
-
-        Reads, raw writes/flushes, LF framing, decoding and locked submissions
-        are identical to the legacy loop. Each read is timestamped immediately
-        after ``read_chunk()`` returns, before write, flush or any lock. Cursor
-        failures disable only telemetry (the cursor contains its exceptions).
+        OD14 coalescing (``read_available``, PTY only): after a blocking read,
+        further reads are taken only while ``read_available`` returns data that
+        is already there, up to ``COALESCE_MAX_BYTES`` / ``COALESCE_MAX_READS`` /
+        ``COALESCE_MAX_NS`` per group. Each further read asks for at most the
+        group's remaining bytes, and none starts once the group's time budget
+        (measured from the first read's receive time) is spent; only the work of
+        a read already taken can end after it. Each read is still timestamped on
+        return, written and flushed to ``sink`` unchanged before the next read
+        (one flush per read, never per group), and fed to the splitter
+        with its own receive time (and wall time for transitions); only the
+        submission (lock, tail, transitions, notify) is shared by the group.
+        A scanner failure ends a group, so the job fails right after the reads
+        that caused it. This is the reader-loop seam: its unit tests call it
+        directly, while ``Scripts/conductor_benchmark.py`` measures the path
+        through ``_read_process_output``.
         """
         monotonic_ns = time.monotonic_ns
-        reader_cpu_start = time.thread_time_ns()
-        pending = bytearray()
+        wall_time = time.time
+        reader_cpu_start = time.thread_time_ns() if cursor is not None else 0
+        with self.condition:
+            job = self.jobs.get(ticket)
+            watchdog = job is not None and self._xctest_watchdog_enabled(job)
+        splitter = CONDUCTOR_OUTPUT.RecordSplitter(segment_scanner=_xctest_segment_scanner if watchdog else None)
+        # XCTest classification of submitted records; off after an OD16 failure.
+        classify = watchdog
+        feed = splitter.feed
+        output = CONDUCTOR_OUTPUT
+        max_bytes = output.COALESCE_MAX_BYTES
+        max_reads = output.COALESCE_MAX_READS
+        max_ns = output.COALESCE_MAX_NS
         eof_ns: Optional[int] = None
+        # Records read but not yet submitted, kept so a failure mid-group still
+        # delivers them (before the splitter's own final records).
+        group_records: List[Any] = []
+        group_wall = 0.0
+        group_walls: Optional[Dict[int, float]] = None
         try:
             while True:
                 chunk = read_chunk()
@@ -4007,36 +4438,66 @@ class DaemonState:
                 if not chunk:
                     eof_ns = receive_ns
                     break
+                receive_wall = wall_time()
                 sink.write(chunk)
                 sink.flush()
-                for line in self._take_complete_output_lines(pending, chunk):
-                    self._submit_observed_output_line(ticket, line, cursor, receive_ns)
-                if pending and cursor.active:
-                    cursor.scan_pending(pending, receive_ns)
+                group_records = feed(chunk, receive_ns)
+                group_wall = receive_wall
+                group_walls = None
+                if read_available is not None and not (classify and splitter.segment_failure is not None):
+                    group_bytes = len(chunk)
+                    group_reads = 1
+                    while group_bytes < max_bytes and group_reads < max_reads:
+                        # Budgets are checked before a read starts: never start one
+                        # after the time budget is spent, and never ask for more than
+                        # the bytes left in the group.
+                        if monotonic_ns() - receive_ns >= max_ns:
+                            break
+                        more = read_available(max_bytes - group_bytes)
+                        if not more:
+                            break
+                        more_ns = monotonic_ns()
+                        more_wall = wall_time()
+                        sink.write(more)
+                        sink.flush()
+                        more_records = feed(more, more_ns)
+                        if more_records:
+                            if group_walls is None:
+                                group_walls = {receive_ns: receive_wall}
+                            group_walls[more_ns] = more_wall
+                            group_records.extend(more_records)
+                        group_bytes += len(more)
+                        group_reads += 1
+                        if classify and splitter.segment_failure is not None:
+                            break
+                records, group_records = group_records, []
+                classify = self._submit_output_group(
+                    ticket, splitter, records, group_wall, classify, cursor, group_walls
+                )
         finally:
             if eof_ns is None:
                 eof_ns = monotonic_ns()
-            if pending:
-                tail = bytes(pending)
-                text = tail.decode("utf-8", errors="replace")
-                cursor.finish(tail, text, eof_ns)
-                with self.condition:
-                    job = self.jobs.get(ticket)
-                    if job:
-                        self._append_tail_locked(job, text)
-                        self._record_xctest_progress_locked(job, text)
-                        self.condition.notify_all()
-            else:
-                cursor.finish(None, None, eof_ns)
-            # Whole reader-thread CPU (legacy output work included), for decomposition.
-            self._telemetry_operation(
-                cursor.recorder,
-                "output_reader_cpu",
-                time.thread_time_ns() - reader_cpu_start,
-                None,
-                "daemon.reader",
-                quality=PIPELINE_METRICS.MEASURED_CPU,
-            )
+            try:
+                if group_records or (classify and splitter.segment_failure is not None):
+                    records, group_records = group_records, []
+                    classify = self._submit_output_group(
+                        ticket, splitter, records, group_wall, classify, cursor, group_walls
+                    )
+                records = splitter.finish(eof_ns)
+                if records or (classify and splitter.segment_failure is not None):
+                    classify = self._submit_output_group(ticket, splitter, records, wall_time(), classify, cursor)
+            finally:
+                if cursor is not None:
+                    cursor.finish_split()
+                    # Whole reader-thread CPU (output work included), for decomposition.
+                    self._telemetry_operation(
+                        cursor.recorder,
+                        "output_reader_cpu",
+                        time.thread_time_ns() - reader_cpu_start,
+                        None,
+                        "daemon.reader",
+                        quality=PIPELINE_METRICS.MEASURED_CPU,
+                    )
 
     def _output_telemetry_cursor(self, ticket: str) -> Optional[Any]:
         if not self.timing_enabled:
@@ -4061,10 +4522,11 @@ class DaemonState:
     ) -> None:
         try:
             cursor = self._output_telemetry_cursor(ticket)
-            if cursor is None:
-                self._pump_output(ticket, lambda: output_transport.read_chunk(process), log_file)
-            else:
-                self._pump_output_observed(ticket, lambda: output_transport.read_chunk(process), log_file, cursor)
+            # OD14: only a real PTY transport coalesces available reads.
+            read_available = output_transport.read_available if output_transport.kind == "pty" else None
+            self._pump_output(
+                ticket, lambda: output_transport.read_chunk(process), log_file, cursor, read_available
+            )
         finally:
             output_transport.close_reader()
 
@@ -4206,43 +4668,65 @@ class DaemonState:
         progress_observed_at = now() if observed_at is None else observed_at
         for raw_line in text.splitlines():
             matchable_line = XCTEST_ANSI_SGR_RE.sub("", raw_line.rstrip("\r\n")).strip()
-            if "Build complete!" in matchable_line and job.xctest_progress_sequence == 0:
-                job.xctest_deadline_phase = "startup"
-                job.xctest_progress_deadline = timestamp + XCTEST_STARTUP_DEADLINE_SECONDS
-                continue
             marker = XCTEST_PROGRESS_RE.match(matchable_line)
-            if marker is None:
-                continue
-            test_name, action = marker.groups()
-            if action != "started" and job.xctest_progress_sequence == 0:
-                continue
-            matched = True
-            job.xctest_progress_sequence += 1
-            job.xctest_last_progress_test = test_name
-            job.xctest_last_progress_action = action
-            job.xctest_last_progress_observed_at = progress_observed_at
-            if action == "started":
-                job.xctest_started_count += 1
-                job.xctest_deadline_phase = "active-method"
-                active_method_budget = self._set_xctest_active_method_budget_locked(job, test_name)
-                job.xctest_progress_deadline = timestamp + active_method_budget
-                if job.xctest_current_test and job.xctest_current_test != test_name:
-                    job.xctest_previous_test = job.xctest_current_test
-                job.xctest_current_test = test_name
-            else:
-                job.xctest_deadline_phase = "between-method"
-                job.xctest_progress_deadline = timestamp + XCTEST_BETWEEN_METHOD_DEADLINE_SECONDS
-                job.xctest_previous_test = test_name
-                if job.xctest_current_test == test_name:
-                    job.xctest_current_test = None
+            if self._apply_xctest_progress_line_locked(job, matchable_line, marker, timestamp, progress_observed_at):
+                matched = True
         return matched
+
+    def _apply_xctest_progress_line_locked(
+        self,
+        job: Job,
+        matchable_line: str,
+        marker: Any,
+        timestamp: float,
+        progress_observed_at: float,
+    ) -> bool:
+        """Today's per-line XCTest transition body, unchanged.
+
+        ``marker`` is ``XCTEST_PROGRESS_RE.match(matchable_line)``. ``timestamp``
+        (monotonic seconds) drives deadlines and ``progress_observed_at`` (wall
+        seconds) is reported; the output reader passes the read's receive time.
+        Each recognized transition increments ``xctest_progress_sequence``.
+        """
+        if "Build complete!" in matchable_line and job.xctest_progress_sequence == 0:
+            job.xctest_deadline_phase = "startup"
+            job.xctest_progress_deadline = timestamp + XCTEST_STARTUP_DEADLINE_SECONDS
+            return False
+        if marker is None:
+            return False
+        test_name, action = marker.groups()
+        if action != "started" and job.xctest_progress_sequence == 0:
+            return False
+        job.xctest_progress_sequence += 1
+        job.xctest_last_progress_test = test_name
+        job.xctest_last_progress_action = action
+        job.xctest_last_progress_observed_at = progress_observed_at
+        if action == "started":
+            job.xctest_started_count += 1
+            job.xctest_deadline_phase = "active-method"
+            active_method_budget = self._set_xctest_active_method_budget_locked(job, test_name)
+            job.xctest_progress_deadline = timestamp + active_method_budget
+            if job.xctest_current_test and job.xctest_current_test != test_name:
+                job.xctest_previous_test = job.xctest_current_test
+            job.xctest_current_test = test_name
+        else:
+            job.xctest_deadline_phase = "between-method"
+            job.xctest_progress_deadline = timestamp + XCTEST_BETWEEN_METHOD_DEADLINE_SECONDS
+            job.xctest_previous_test = test_name
+            if job.xctest_current_test == test_name:
+                job.xctest_current_test = None
+        return True
 
     def _claim_xctest_stall_locked(
         self,
         job: Job,
         observed_at: Optional[float] = None,
     ) -> Optional[XCTestStallClaim]:
-        if not self._xctest_watchdog_enabled(job) or job.xctest_watchdog_triggered:
+        if (
+            not self._xctest_watchdog_enabled(job)
+            or job.xctest_watchdog_triggered
+            or job.xctest_output_failure is not None
+        ):
             return None
         timestamp = time.monotonic() if observed_at is None else observed_at
         deadline = job.xctest_progress_deadline
@@ -4300,6 +4784,11 @@ class DaemonState:
                     or job.xctest_process_finished
                 ):
                     return
+                if job.xctest_output_failure is not None:
+                    # OD16: the reader failed the job; terminate it here so the
+                    # reader keeps draining output until EOF.
+                    job.xctest_watchdog_triggered = True
+                    break
                 deadline = job.xctest_progress_deadline
                 if deadline is None:
                     self.condition.wait()
@@ -4313,6 +4802,7 @@ class DaemonState:
                     continue
             self._handle_xctest_stall(ticket, claim)
             return
+        self._terminate_xctest_stalled_job(job, cleanup="XCTest output contract failure")
 
     def _xctest_process_snapshot_locked(
         self,
@@ -4417,11 +4907,11 @@ class DaemonState:
                 self.condition.wait(timeout=remaining)
             return job.xctest_progress_sequence > progress_sequence
 
-    def _terminate_xctest_stalled_job(self, job: Job) -> None:
+    def _terminate_xctest_stalled_job(self, job: Job, cleanup: str = "XCTest phase deadline") -> None:
         with self.condition:
             if job.state != "running":
                 return
-            self._terminate_process_group_locked(job, reason=job.error or "XCTest phase deadline fired")
+            self._terminate_process_group_locked(job, reason=job.error or f"{cleanup} fired")
             descendants_alive = self._wait_for_process_tree_exit_locked(
                 job,
                 now() + TERMINATE_GRACE_SECONDS,
@@ -4430,7 +4920,7 @@ class DaemonState:
             if descendants_alive:
                 self._kill_process_group_locked(
                     job,
-                    reason="XCTest phase deadline cleanup; SIGKILL after grace period",
+                    reason=f"{cleanup} cleanup; SIGKILL after grace period",
                 )
                 descendants_alive = self._wait_for_process_tree_exit_locked(
                     job,
@@ -4440,7 +4930,9 @@ class DaemonState:
             if descendants_alive:
                 self._append_system_line_locked(
                     job,
-                    "XCTest deadline watchdog cleanup could not confirm descendant exit after SIGKILL\n",
+                    "XCTest deadline watchdog cleanup could not confirm descendant exit after SIGKILL\n"
+                    if cleanup == "XCTest phase deadline"
+                    else f"{cleanup} cleanup could not confirm descendant exit after SIGKILL\n",
                 )
             self.condition.notify_all()
 
@@ -4523,35 +5015,82 @@ class DaemonState:
             )
         self._terminate_xctest_stalled_job(job)
 
-    def _refresh_output_summary(self, job: Job, complete_telemetry: bool = False) -> None:
-        """Summarize a terminal job's log and publish the summary.
+    def _refresh_output_summary(
+        self,
+        job: Job,
+        complete_telemetry: bool = False,
+        deadline: Optional[float] = None,
+    ) -> None:
+        """Summarize a terminal job's log once and publish the summary (single-flight).
+
+        The first caller claims the work under ``self.condition`` and scans the
+        log outside it; racing callers join the claimant's event and stop waiting
+        at their own ``deadline`` (wall seconds; ``None`` waits for the result).
+        Every exception publishes a minimal error summary and releases the claim.
+        Claimant and joiners each pin the job against retention for the call.
 
         Timing never delays the summary: the published summary's duration is
         stored with it (no recorder call) and only ``complete_telemetry`` (the
         job thread) finalizes and persists, after publication. Client request
         paths never wait on timing.
         """
-        telemetry = job.telemetry
-        if telemetry is not None:
-            summary_start = time.monotonic_ns()
-            summary_cpu_start = time.thread_time_ns()
-        summary = OutputSummarizer.summarize_file(
-            job.operation,
-            job.args,
-            job.state,
-            job.exit_code,
-            job.timed_out,
-            job.log_path,
-        )
-        summary_timing = None
-        if telemetry is not None:
-            summary_timing = (time.monotonic_ns() - summary_start, time.thread_time_ns() - summary_cpu_start)
         with self.condition:
-            current = self.jobs.get(job.ticket)
-            if current is job and current.output_summary is None:
-                current.output_summary = summary
-                current.output_summary_timing = summary_timing
+            if job.output_summary is not None:
+                claimed = False
+                event = None
+            elif job.summary_state == "running" and job.summary_event is not None:
+                claimed = False
+                event = job.summary_event
+            else:
+                claimed = True
+                event = job.summary_event = threading.Event()
+                job.summary_state = "running"
+            if event is not None:
+                self._pin_job_locked(job)
+        if not claimed:
+            if event is not None:
+                try:
+                    event.wait(None if deadline is None else max(0.0, deadline - now()))
+                finally:
+                    with self.condition:
+                        self._unpin_job_locked(job)
+            if complete_telemetry:
+                self.complete_job_telemetry(job)
+            return
+        summary: Optional[Dict[str, Any]] = None
+        summary_timing = None
+        final_state = "failed"
+        try:
+            telemetry = job.telemetry
+            if telemetry is not None:
+                summary_start = time.monotonic_ns()
+                summary_cpu_start = time.thread_time_ns()
+            summary = OutputSummarizer.summarize_file(
+                job.operation,
+                job.args,
+                job.state,
+                job.exit_code,
+                job.timed_out,
+                job.log_path,
+            )
+            if telemetry is not None:
+                summary_timing = (time.monotonic_ns() - summary_start, time.thread_time_ns() - summary_cpu_start)
+            final_state = "complete"
+        except BaseException as exc:
+            summary = OutputSummarizer._minimal_summary(
+                job.operation, job.state, job.exit_code, f"summary failed: {type(exc).__name__}: {exc}"
+            )
+            if not isinstance(exc, Exception):
+                raise
+        finally:
+            with self.condition:
+                if job.output_summary is None and summary is not None:
+                    job.output_summary = summary
+                    job.output_summary_timing = summary_timing
+                job.summary_state = final_state
                 self.condition.notify_all()
+                self._unpin_job_locked(job)
+            event.set()
         if complete_telemetry:
             self.complete_job_telemetry(job)
 
@@ -4564,11 +5103,7 @@ class DaemonState:
                 self.condition.notify_all()
 
     def _append_tail_locked(self, job: Job, text: str) -> None:
-        lines = text.splitlines(keepends=True)
-        if not lines:
-            return
-        for line in lines:
-            job.tail.append(line)
+        job.tail.append_text(text)
 
     def _append_system_line_locked(self, job: Job, text: str) -> None:
         self._append_tail_locked(job, text)
@@ -4856,13 +5391,20 @@ class DaemonState:
         cutoff = now() - TERMINAL_RETENTION_SECONDS
         terminal = [job for job in self.jobs.values() if job.state in TERMINAL_STATES]
         prune: set[str] = set()
+        due: List[Job] = []
         for job in terminal:
             if job.finished_at is not None and job.finished_at < cutoff:
-                prune.add(job.ticket)
+                due.append(job)
         terminal_sorted = sorted(terminal, key=lambda job: job.finished_at or job.created_at)
         excess = max(0, len(terminal_sorted) - MAX_TERMINAL_JOBS)
-        for job in terminal_sorted[:excess]:
-            prune.add(job.ticket)
+        due.extend(terminal_sorted[:excess])
+        for job in due:
+            if job.summary_pins > 0:
+                # Summary work or a status/wait payload still uses this job and
+                # its log; the last unpin reruns this pass.
+                job.retention_deferred = True
+            else:
+                prune.add(job.ticket)
         for ticket in prune:
             job = self.jobs.pop(ticket, None)
             if not job:
@@ -5448,12 +5990,18 @@ def _with_artifact_scope_summary(payload: Dict[str, Any], summary: Dict[str, Any
             "lines": [detail],
             "truncated": False,
             "omittedLineCount": 0,
+            "deduplicationLimited": False,
+            "omittedLineCountQuality": "exact",
+            "displayedLinesMayRepeat": False,
         },
     )
     enriched["sections"] = sections
     if passed:
         enriched["headline"] = message
     return enriched
+
+
+SUMMARY_PENDING_NOTE = "output summary is still being generated by the conductor; see the full log path above"
 
 
 def output_summary_for_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -5463,7 +6011,15 @@ def output_summary_for_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     if isinstance(summary, dict) and (not requires_lifecycle_classification or isinstance(summary.get("launchLifecycle"), dict)):
         return _with_artifact_scope_summary(payload, summary)
     log_path = payload.get("logPath")
-    if log_path:
+    if payload.get("summaryPending") and not isinstance(summary, dict):
+        # The daemon is scanning this log (single flight); never scan it again here.
+        generated = OutputSummarizer._minimal_summary(
+            str(payload.get("operation") or ""),
+            str(payload.get("state") or ""),
+            payload.get("exitCode"),
+            SUMMARY_PENDING_NOTE,
+        )
+    elif log_path:
         generated = OutputSummarizer.summarize_file(
             str(payload.get("operation") or ""),
             payload.get("args") or {},
@@ -5510,7 +6066,7 @@ def payload_with_output_summary(payload: Dict[str, Any], include_log_tail: bool 
     if include_log_tail:
         if needs_tail_trim:
             enriched["logTail"] = tail[-LOG_TAIL_LINES:]
-    elif isinstance(enriched.get("outputSummary"), dict):
+    elif isinstance(enriched.get("outputSummary"), dict) and not enriched.get("summaryPending"):
         enriched.pop("logTail", None)
     return enriched
 
@@ -5557,7 +6113,15 @@ def render_output_summary(summary: Dict[str, Any]) -> None:
             print(f"  {line}")
         if section.get("truncated"):
             omitted = int(section.get("omittedLineCount") or 0)
-            print(f"  ... omitted {omitted} matching line(s); see full log path above")
+            if section.get("omittedLineCountQuality") == "upper_bound":
+                print(
+                    f"  ... omitted at most {omitted} matching line(s) (deduplication limited: the count is an upper bound); "
+                    "see full log path above"
+                )
+            else:
+                print(f"  ... omitted {omitted} matching line(s); see full log path above")
+        if section.get("displayedLinesMayRepeat"):
+            print("  ... deduplication limited: these lines may repeat older lines of this section")
     if summary.get("truncated"):
         print()
         print("Summary truncated; see full log for complete output.")
@@ -6002,6 +6566,7 @@ def wait_for_terminal(
     printed_progress: Deque[str] = deque(maxlen=200)
     printed_progress_set: set[str] = set()
     last_progress_at = now()
+    pending_since: Optional[float] = None
     while True:
         payload = request_daemon(
             paths,
@@ -6050,6 +6615,13 @@ def wait_for_terminal(
                 print(f"[{time.strftime('%H:%M:%S')}] still running; log: {payload.get('logPath')}")
                 last_progress_at = now()
         if payload.get("state") in TERMINAL_STATES:
+            if payload.get("summaryPending"):
+                # Another caller's summary scan is still running: each poll joins
+                # it for up to WAIT_POLL_SECONDS. After the bound, return without
+                # it (rendered as a pending note, never a second scan).
+                pending_since = now() if pending_since is None else pending_since
+                if now() - pending_since < SUMMARY_PENDING_WAIT_SECONDS:
+                    continue
             return payload
 
 

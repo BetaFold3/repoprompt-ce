@@ -2,9 +2,9 @@
 
 Scope: read when the task touches Swift build/test wall-time measurement, conductor per-job phase timing, the Swift or conductor benchmark harnesses, debug dSYM generation (`SWIFT_DRIVER_DSYMUTIL_EXEC`, `RPCE_DEBUG_DSYM`), the test-artifact fingerprint or its validation sites, conductor output handling, log summaries, the XCTest runtime-ledger cache, retention, the conductor launcher/bytecode, debug packaging Swift invocations, or diagnosis of slow test-module recompiles and the pre-test residual.
 Authority: Reference
-Last-verified: 2026-10-05
+Last-verified: 2026-10-06
 
-Status: Steps 1 and 2 are owner-accepted for commit and progression under OD12, which replaces the 5 ms parser budget with 90 ms per 5 MiB and accepts this checkpoint without further qualification runs. Phase 0 is complete (§11). Both OracleA and OracleB approve the scoped r4 implementation; all blocking code findings are closed by their owning lanes. Five shared re-review rounds were used, and no production or test code changed after r4. The Oracles' earlier withholding of empirical phase acceptance remains part of the record; OD12 is an owner decision, not a new Oracle verdict or a claim that missing measurements passed. Step 1's clean no-regression qualification, Step 2's full integrated/null-job qualification and repeatable Swift timing remain follow-up evidence, not blockers for this checkpoint. Steps 3–10 may proceed next in §4 order, with their own requirements unchanged. Steps 3–12 are not implemented and the debug dSYM policy is unchanged.
+Status: Steps 1 and 2 are owner-accepted for commit and progression under OD12, which replaces the 5 ms parser budget with 90 ms per 5 MiB and accepts this checkpoint without further qualification runs. Phase 0 is complete (§11). Both OracleA and OracleB approve the scoped Steps 1–2 r4 implementation; all blocking code findings are closed by their owning lanes. Five shared re-review rounds were used for Steps 1–2, and no production or test code changed after r4. The Oracles' earlier withholding of empirical phase acceptance remains part of the record; OD12 is an owner decision, not a new Oracle verdict or a claim that missing measurements passed. Step 1's clean no-regression qualification, Step 2's full integrated/null-job qualification and repeatable Swift timing remain follow-up evidence, not blockers for this checkpoint. Steps 3–10 may proceed next in §4 order, with their own requirements unchanged. Under OD13, Step 3 has completed **four of five shared re-review rounds**. Both fresh round-4 lanes approve the remediation code on the frozen r4 snapshot. OracleA explicitly closed S3-R0-03 as fixed, not downgraded, and S3-R3-01 as fixed; all earlier closures remain. There are no open P0/P1 findings. OD16 authorizes explicit, visible job failure at pathological D1/D2 limits; the r4 reader-completion guard prevents an otherwise successful classifying job from publishing success before its reader finishes. OracleA's new S3-R4-01 test-readiness finding is nonblocking P2 and deferred; OracleB's P3 observations are recorded below. **Step 3 is owner-accepted for commit and progression under OD17.** Current-r4 qualification passes pipe, summary, lock and classification-equivalence gates; the clean PTY output misses and narrowly contaminated memory result remain recorded as non-blocking follow-up. This is explicit measured acceptance, not a claim that those gates passed or a new Oracle empirical verdict. Step 4 may proceed next in §4 order. Steps 4–12 are not yet implemented; their own gates remain unchanged and debug dSYM policy is unchanged.
 Decision process: this revision replaces the earlier Swift-only plan. Two independent Oracle lanes (OracleE and OracleD) received the same brief: the owner's answers, the Phase 0 results, the verified Python conductor findings, and the earlier plan. Material disagreements were relayed anonymously for two challenge rounds, and both lanes ended CONVERGED. Two disputes were settled by owner decisions and one by code verification; §9 records each. The filename is kept so existing links stay valid.
 
 ## 1. Outcome, scope, and owner decisions
@@ -35,6 +35,11 @@ Owner decisions (authoritative; they replace the earlier assumptions A1–A5):
 | OD10 | On 2026-10-05 the owner explicitly approved narrow pre-existing validation repairs: exact documentation allowlist entries for this plan and the already-committed knowledge-work report; an exact installer-test expectation matching the existing AppleEvents entitlement; and local-only Scope/routing repairs for `docs/context/review-policy.md`. No signing behavior, assertions, or policy rules may be weakened. The local policy and its validation-workflow link remain unstaged. |
 | OD11 | On 2026-10-05 the owner explicitly answered “No, meet 5 ms first” when offered a commit with performance qualification deferred. The gate remained binding until superseded by OD12. A bounded worker investigation was authorized to find the smallest contract-preserving optimization. A subsequent request to permit a native-parser feasibility prototype timed out; no native architecture expansion is authorized. |
 | OD12 | On 2026-10-05 the owner explicitly instructed: “consider it 90ms as acceptance, record it, commit. Then confirm me we can work from step 3->10 next, right?” The parser budget is now 90 ms of added CPU per 5 MiB, replacing OD9/OD11's 5 ms budget. The owner accepts the current reviewed Steps 1–2 checkpoint for commit and progression on the disclosed evidence, including the 82.047 ms median reader-path diagnostic, without requiring another measurement schedule. Outstanding Step 1 no-regression, full Step 2 integrated/null-job and Swift-repeatability evidence is carried forward as follow-up rather than a blocker for this checkpoint. This is explicit owner acceptance of incomplete empirical qualification, not a claim that a clean end-to-end 90 ms gate passed or a change to either Oracle's historical verdict. Follow-up evidence is to be revisited with the next relevant before/after measurements; Steps 3–10 retain their own gates and dependency order. No native parser, broader rewrite or gate changes for later steps are authorized. |
+| OD14 | On 2026-10-06 the owner answered the main agent's timed-out two-part Step 3 decision request with “Approve. Also remember to address OracleA findings if you deem those are valid and not downgraded.” Asked whether approval meant bounded experimentation rather than relaxing performance gates, the main agent confirmed it did, with all gates unchanged; the owner then answered “yes, use your own judgement and I trust your recs.” OD14 authorizes **bounded PTY available-read coalescing** only: each OS read keeps its own receive timestamp, its raw bytes are written and flushed unchanged before the next read, recognized XCTest transitions stay individual and ordered, and the 256-record / 64 KiB batch caps hold. Coalescing never waits for data (no fill-buffer blocking) and keeps cancellation and watchdog responsiveness bounded. Every Step 3 performance gate still applies unchanged. OD14 grants no acceptance waiver, no gate change and no separate terminal-state or watchdog notification architecture. |
+| OD15 | Same provenance as OD14, including the owner's confirmation that the approval covers disclosed repeated summary lines after saturation. It narrowly extends OD7: once a summary section's 4,096-entry deduplication memory saturates, a keep-last section (Phases, App lifecycle) may display an older line again. It must disclose this explicitly, through `displayedLinesMayRepeat` on the section and summary and a terminal note. First-lines sections must keep exact displayed lines. OD15 changes nothing else about displayed lines, does not close any review finding and waives no acceptance evidence. |
+| OD16 | On 2026-10-06 the owner explicitly authorized the recommended remedy for S3-R0-03. Replying to the recommendation “explicit, visible job failure at pathological input limits”, the owner wrote “do it.” OD16 replaces silent marker loss (D1) and early application (D2) with explicit, visible job failure at the previously documented bounds. **D1:** a normalized XCTest-marker segment of an over-cap record exceeds 65,536 characters. **D2:** more than 16 transitions are pending in one over-cap record. The trigger is exact: D1 fails only when the oversized segment would match the parent's `XCTEST_PROGRESS_RE`, so ordinary large non-XCTest lines never fail. D2 fails on the 17th pending item. The failure goes through the real job lifecycle. The job becomes measurement-invalid and finalizes `failed` with exit 70, even if the child exits 0. Its reason is bounded and echoes no output. The existing XCTest monitor terminates the process tree while the reader keeps draining, and no success artifact is published. Pending transitions are never applied early, and no partial identity is used. Otherwise, transition semantics, completing-read times, bounded memory, OD14 coalescing limits and per-read raw write/flush are unchanged. Summary-only reading never classifies output or fails a job. Main records the r4 incomplete-reader guard as necessary fail-closed implementation of OD16, not a separate owner waiver: if a classifying reader still lives after the existing joins/close, its unread or unsubmitted output cannot establish whether D1/D2 occurred. An otherwise successful job therefore fails even if its input would eventually prove ordinary. This fallback preserves decided failure/cancellation outcomes and adds no unbounded reader wait; it does not promise the pre-existing macOS PTY close itself is bounded. OD16 changes no performance gate, waives no acceptance evidence and closes no finding; only the main-owned review lanes rule on S3-R0-03. |
+| OD17 | On 2026-10-06, after main recommended accepting Step 3's measured gains, explicitly carrying the three missed PTY targets and narrowly contaminated memory result as non-blocking follow-up, committing Step 3 and proceeding to Step 4, the owner replied: “I approve (was away from keyboard at the time).” This resolves the prior timed-out acceptance request. The owner accepts the reviewed r4 implementation for commit and progression: PTY CPU improves 22.0% at w0 and 55.7% at w4, and w4 wall improves 24.4%; the original 50%/75% targets did not pass. Memory growth meets the numeric limit but remains inconclusive due to a 4.03-core window against the 4.0 cutoff. No benchmark thresholds, sample minima or contamination labels are rewritten. These shortfalls are non-blocking follow-up, not fabricated passing evidence. Both Oracle code approvals and all existing correctness contracts remain in force; later steps retain their own requirements. |
+| OD13 | On 2026-10-05 the owner explicitly requested implementation of Steps 3–12. Steps run in §4 order through scoped workers, one step at a time; each worker owns only its step's production/test changes and evidence. Review ownership is the main agent's: it alone calls OracleA and OracleB, with a cap of 5 re-review rounds per step; workers do not review. A step is committed only after its own gates pass and both Oracle reviews approve. No gate is waived or relaxed by this authorization; OD12 applies only to the Steps 1–2 checkpoint. |
 
 Not in scope:
 
@@ -213,12 +218,22 @@ New `Scripts/conductor_output.py`: a streaming record splitter and normalizer, s
   5. Call `notify_all` once if any records arrived.
 
   Only notifications are coalesced. A record completed by a later read takes that read's timestamp. Watchdog change detection uses the sequence, not timestamp equality, and deadlines still use receive times. Batches are at most 256 records or 64 KiB.
+
+  **OD14 amendment (PTY only).** After a blocking read, the reader may take further reads while `select(timeout=0)` reports data, never waiting for more, up to 64 KiB, 64 reads or 5 ms per group. Budgets are checked before a read starts. Each further read requests at most the group's remaining bytes, and none starts once 5 ms have passed since the first read's receive time. Only the processing of a read already taken can end after the budget. Steps 1–2 still run per read, so each read keeps its receive time (and wall time), its unchanged write and flush, and its order. Steps 3–5 run once per group. An OD16 over-cap failure ends a group, so the job fails right after the reads that caused it. The pipe is unchanged.
+- **Over-cap records (S3-R0-03; D1/D2 bounds under OD16, r3).** Before any bytes are dropped, a record that exceeds the 64 KiB cap streams through bounded whole-record views.
+  - With the watchdog enabled, it is classified segment by segment in `str.splitlines` terms, with segment content capped at 64 Ki characters. Its transitions ride on the record and take the receive time of the read that completes it, like any line.
+  - **OD16 bounds.** Exceeding either bound fails the job visibly:
+    - D1: a segment whose normalized content exceeds 65,536 characters and would match `XCTEST_PROGRESS_RE`. It is decided exactly in bounded memory, from a 12-character head, a 16-character stripped end and the `)`-free run state.
+    - D2: a 17th pending item in one record.
+  - On failure, nothing pending is applied, early or later, and classification stops for the rest of the job. Records before the failing one keep their transitions; later records still feed the raw log, telemetry and tail. Over-cap `Build complete!` segments and markers at or under 65,536 characters keep normal semantics.
+  - **Reader completion (r4).** A classifying job can succeed only after its output reader has finished. If the reader is still alive after `_run_job`'s two bounded joins (`OUTPUT_READER_JOIN_SECONDS` each) and the reader close, a job that would otherwise succeed becomes measurement-invalid: it fails with exit 70, gets a bounded reason, and publishes no ticket. An outcome already decided keeps its own reason. Remaining job processes get the bounded TERM/KILL escalation. The reader is not waited for further.
+  - Its tail entry and summary line come from the first visible characters of the whole record, with ANSI removed in one pass exactly as from the full text, not from the kept 64 KiB.
 - **Tail.** 30 records and 64 KiB total; each displayed record is ANSI-stripped and capped at 4 KiB (OD7).
 - **Summaries.**
   - `summarize_file` streams the raw log through the same splitter.
   - Each classification regex runs once per record, behind a casefolded keyword precheck that covers every regex alternative, with a fixture per alternative.
-  - `SummarySectionBuilder.seen` is bounded to 4,096 entries per section. Behavior is exact before saturation; afterwards the summary exposes `deduplicationLimited` and `omittedLineCountQuality: exact | upper_bound`, and `SUMMARY_VERSION` goes from 1 to 2.
-  - **Single-flight:** `summary_state: none | running | complete | failed` plus an event. The first caller claims the work under the lock and computes outside it. Racing callers join and honor their own deadlines. Every exception publishes a minimal error summary and releases the pin.
+  - `SummarySectionBuilder.seen` is bounded to 4,096 entries per section. Behavior is exact before saturation; afterwards the summary exposes `deduplicationLimited` and `omittedLineCountQuality: exact | upper_bound`, and `SUMMARY_VERSION` goes from 1 to 2. Under OD15, a keep-last section may show an older line again after saturation; it then sets `displayedLinesMayRepeat`, and the terminal prints a note. The top-level `omittedLineCountQuality` is always `exact`, because the top-level count is exact; upper bounds are rendered as "at most N".
+  - **Single-flight:** `summary_state: none | running | complete | failed` plus an event. The first caller claims the work under the lock and computes outside it. Racing callers join and honor their own deadlines. Every exception publishes a minimal error summary and releases the pin. A `job_wait` whose deadline expires while it is joining returns `summaryPending`. The client then shows a minimal pending summary without rescanning the log, and re-polls for at most 60 s. Summary pins, held from claim or join through payload construction and released on every path, defer retention of the job and its log; the last unpin reruns retention.
 
 Gates (`dev-conductor-bench-compare` plus self-tests):
 
@@ -229,7 +244,7 @@ Gates (`dev-conductor-bench-compare` plus self-tests):
 | Lock behavior | p99 batch hold ≤5 ms, measured in separate profiled runs; no progress loss or reordering |
 | Summary | CPU at least 35% lower on the fixed corpus; exactly one scan per completed log |
 | Summary memory | Caps hold at 1M unique records; retained growth from 100k to 1M records under 1 MiB |
-| Classification equivalence | Identical ordered `(kind, testName)` sequences against today's classifier over the fixture and retained logs. Allowed differences: events previously hidden behind bare `\r`, each listed explicitly |
+| Classification equivalence | Identical ordered `(kind, testName)` sequences against today's classifier over the fixture and retained logs. Allowed differences: events previously hidden behind bare `\r`, each listed explicitly. Under OD16, input beyond the D1/D2 bounds fails the job visibly instead; the corpus must produce no OD16 failure |
 
 Tests:
 
@@ -724,3 +739,458 @@ Follow-up evidence (the first three items are non-blocking for the Steps 1–2 c
 - Step 11 findings.
 - Step 12 packaging gate.
 - The Step 4 footprint review.
+
+### Step 3 implementation checkpoint (2026-10-05, OD13)
+
+Status: implemented in the working tree; **not accepted, not staged, not committed**. Steps 4–12 are blocked until Step 3 is accepted. This section records the r0 implementation and its reviews; the r1 remediation and its evidence follow in "Step 3 remediation r1" below. Raw evidence is local under `.agent-artifacts/step3/` (`EVIDENCE.md`, compare reports, capture copies, scripts and checksums) and is not contribution material.
+
+Implementation, from parent `506af898` (snapshot and `PARENT-SHA256SUMS` captured before edits):
+
+- New `Scripts/conductor_output.py`: the shared record splitter, OD7 tail entries and bounded `OutputTail`, and batches of at most 256 records / 64 KiB (the byte bound is enforced conservatively as 16 Ki decoded characters). The conductor loads it by explicit path as a required helper, and it is part of `conductorDigest`, so captures detect changes to output code.
+- `Scripts/conductor.py`: the pipe reads with `read1(64 KiB)`, and the PTY keeps `os.read(64 KiB)`. Each read is timestamped, then written and flushed, then split, normalized and classified outside the lock. Each batch locks once, applies every XCTest transition in order through the extracted per-line body with the record's receive time, and notifies once. Summaries stream through the same splitter, with each regex run once per record behind a casefolded keyword precheck (applied only to ASCII lines). `seen` is bounded to 4,096 entries per section, `SUMMARY_VERSION` is 2, and summaries are single-flight.
+- `Scripts/swift_pipeline_metrics.py`: telemetry consumes the shared records. `Scripts/conductor_benchmark.py` is harness v6: it stages and verifies the helper and adds an independent Step 3 tail model for PTY evidence.
+- Tests: new contract tests, and old tail-shape assertions replaced with the exact new shapes; none are loosened.
+- Interpretations to confirm in review:
+  - Delimited tail entries end with `\n`; an unterminated final record has none.
+  - The keyword precheck is applied only to ASCII lines.
+  - "Releases the pin" is read as releasing the summary claim and event.
+  - A `job_wait` that reaches its deadline while joining a running summary returns without `outputSummary`, with `waitTimedOut` false.
+
+Final gate capture `step3-gate-2` (`make dev-conductor-bench-full`, workloads output/summary/mem, 30 fast and 10 memory pairs, 914 s). It used the parent target `73709b0d…` and the candidate target `5b534314…` (loaded implementation `sha256:e16f4670…`), with harness `ddeb526b…`, and is byte-identical to the working tree. `dev-conductor-bench-compare PROFILE=step3-output-summary` returned **exit 2**: the gate failures below, plus contamination.
+
+| Gate metric | Parent median | Candidate median | Ratio | Required | Result |
+|---|---|---|---|---|---|
+| `output.pipe.w0.cpu_ms` | 191.5 | 75.5 | 0.39 | ≤0.5 | numerical threshold met; inconclusive (contaminated) |
+| `output.pipe.w4.cpu_ms` | 3,123.3 | 79.4 | 0.025 | ≤0.25 | numerical threshold met; inconclusive (contaminated) |
+| `output.pipe.w4.wall_ms` | 1,534.3 | 84.7 | 0.055 | ≤0.25 | numerical threshold met; inconclusive (contaminated) |
+| `output.pty.w0.cpu_ms` | 188.6 | 204.7 | 1.085 | ≤0.5 | **fail** |
+| `output.pty.w4.cpu_ms` | 349.9 | 673.0 | 1.92 | ≤0.25 | **fail** |
+| `output.pty.w4.wall_ms` | 261.3 | 434.2 | 1.66 | ≤0.25 | **fail** |
+| `summary.fixture.total_cpu_ms` | 4,296.2 | 996.8 | 0.23 | ≤0.65 | pass |
+| `mem.seen_growth_100k_1m_mib` | 127.56 | −0.000 | — | ≤1.0 MiB | numerical threshold met; inconclusive (contaminated) |
+
+Contamination caveats:
+
+- The 60-second preflight passed (2.96 foreign cores).
+- During the capture, some output windows reached 4.75 foreign cores and some memory windows 5.08, above the 4.0 limit. The comparison therefore labels output and memory inconclusive for both arms, and `output.pty.w0.wall_ms` is also inconclusive.
+- Summary windows stayed within the limit.
+- The PTY failures and the `seen` result lie far from their thresholds, but no contaminated window is claimed as clean qualification.
+- The earlier capture `step3-gate-1`, taken before optimizing the splitter and tail, showed the same pattern (PTY w0/w4 CPU ratios 1.20/1.94; memory contaminated).
+
+PTY diagnosis. These are measured hypotheses from this host; they are not a mathematical lower bound and not proof that no optimization exists:
+
+- **Read size.** The macOS PTY delivered about 1 KiB per read: about 5,188 reads per 5 MiB, against 80 for the pipe. Both arms read the same counts.
+- **Wakeups.** With per-batch notification, each read woke every parked waiter: about 5,191 notifies produced about 20,664 waiter wakeups. Parent sent about 69,518 per-line notifies, but its waiters were rarely parked between lines, which produced about 11,839 wakeups.
+- **Thread CPU, 4 waiters, median of 5 runs.**
+
+  | Thread | Candidate | Parent |
+  |---|---|---|
+  | Reader | 312 ms | 209 ms |
+  | Waiters | 299 ms | 127 ms |
+  | Watchdog | 77 ms | 33 ms |
+
+- **In-process reader CPU** with 1 KiB reads and no waiters: candidate 121 ms against parent 107 ms. Splitter and tail optimizations within the contract reduced it from 141 ms.
+- **Transition density.** About 93% of 1 KiB fixture reads carry an XCTest transition, so notifying only on progress would likely not change this fixture.
+- **Open options.** Changing the PTY gates, the per-read batching, or the waiter wake structure requires an owner/review decision; none is authorized.
+
+Evidence outside the benchmark, scoped as stated:
+
+- **Classification equivalence (qualified).** Parent and candidate ran separately through the real `_pump_output` with the watchdog enabled, at 4,093-byte and 64 KiB reads. Inputs were 83 logs, about 36.9 MB: fixture raw/ONLCR, PTY fidelity, a synthetic 60k-test XCTest-dense log, and 79 retained conductor logs. The 170,812 ordered `(kind, testName)` transitions are identical, and no allowed difference was needed. Across 498 summaries in 6 modes, the candidate with `seen` uncapped and projected to v1 is byte-identical to parent. With the cap, only 18 synthetic-fixture summaries differ, and only by an upper-bound `omittedLineCount` with `deduplicationLimited`/`upper_bound` set.
+- **Lock (qualified for the stated scope).** Reader-thread hold per acquisition was measured in-process with 64 KiB reads, 4 waiters and 5 repeats over the fixture and the dense log. The p99 was 89–200 µs and the maximum 0.4 ms, against the 5 ms gate. The candidate took 330–646 acquisitions per run, against parent's 69,516–132,003. Final sequence, started count and last test/action matched parent in every run. This was not measured through a real PTY.
+- **Single flight and one scan.** A race test of completion, status and wait gives exactly one `summarize_file` call; a joiner honors its deadline; an exception publishes a minimal error summary with state `failed`. The end-to-end lifecycle test asserts one `output_summary` operation.
+- **Functional.**
+  - `make conductor-selftest` exited 0 on the final bytes: 12 suites plus the context checker, including 77 output, 68 benchmark, 67 metrics and 143 lifecycle tests.
+  - `make guardrails` exited 0, with the pre-existing route-count warning.
+  - `git diff --check` is clean.
+  - Overhead with timing on was not re-measured.
+
+Step 3 review index (main-owned, OD13):
+
+| Item | State |
+|---|---|
+| Initial OracleA review | Changes requested; snapshot `2026-10-05/2234` |
+| Initial OracleB review | Complete replacement initial review: no P0/P1 on supplied material; P2 remediation/verification requested; snapshot `2026-10-05/2234` |
+| Reviewed snapshot per lane | Initial: `2026-10-05/2234`. Round 1: frozen r1b `.agent-artifacts/step3-review-r1/files/` and `SHA256SUMS`. Round 2: frozen r2 `.agent-artifacts/step3-review-r2/files/` and `SHA256SUMS`; OracleA received `r1-to-r2.patch`, OracleB received `r0-to-r2.patch` to repair its incomplete round-1 delivery. Both confirmed complete embedded receipt. |
+| Reviewed snapshot (round 3) | Frozen r3 `.agent-artifacts/step3-review-r3/files/` and `SHA256SUMS`, with `r2-to-r3.patch` and `plan-frozen-r2-to-r3.patch`; both lanes verified |
+| Reviewed snapshot (round 4) | Frozen r4 `.agent-artifacts/step3-review-r4/files/` and `SHA256SUMS`; full `r3-to-r4.patch` and focused evidence embedded in both fresh lanes. Both preset identities and complete receipt verified by main. |
+| Re-review rounds used | 4 / 5. Both round-4 code verdicts approve; no open P0/P1. Whole-phase acceptance remains blocked by missing qualification. |
+| Closed OracleA findings | Round 1: S3-R0-01 (under OD15), S3-R0-02/04/05/06. Round 2: S3-R1-01/02. Round 4: S3-R0-03 explicitly fixed, not downgraded; S3-R3-01 fixed. All earlier closures retained. |
+| Open OracleA P1 findings | None. Round 4 approves remediation code. New S3-R4-01 is nonblocking P2 (descendant signal-handler readiness in the escalation test), explicitly deferrable without another review round. |
+| Open OracleB P0/P1 findings | None. Round 4 approves r4 code with no own or fix-induced P0/P1/P2; S3R3-B-N02 closed, other noted P3s deferred. OracleB does not close OracleA findings; OracleA's own explicit closures above establish their disposition. |
+| Decisions relied on | OD7; OD12 for predecessor acceptance only; OD13 for this workstream; OD14 and OD15 for r1; OD16 for r3 and r4 |
+| Acceptance | Owner-accepted for commit and progression under OD17. Both lanes approve r4 code; pipe, summary, lock and equivalence passed. The three clean PTY misses and narrowly contaminated memory result are explicitly non-blocking follow-up, not passes. |
+| Reviewed bytes | Local `.agent-artifacts/step3-review-r0/files/` and `SHA256SUMS`; snapshot `2026-10-05/2234` |
+| OracleA record | Initial `prompt-exports/oracle-review-2026-10-05-225040-oraclea-step3-initia-4c07.md`; round 1 `prompt-exports/oracle-review-2026-10-06-101543-oraclea-step3-r1-sco-14c0.md`; round 2 `prompt-exports/oracle-review-2026-10-06-103654-oraclea-step3-r2-emb-80c6.md`; round 3 `prompt-exports/oracle-review-2026-10-06-144642-oraclea-step3-r3-od1-e463.md`; round 4 `prompt-exports/oracle-review-2026-10-06-152604-oraclea-step3-r4-rea-6aea.md`. |
+| OracleB record | Complete initial `prompt-exports/oracle-review-2026-10-05-230954-oracleb-step3-initia-a68a.md`; complete round 2 `prompt-exports/oracle-review-2026-10-06-104018-oracleb-step3-r2-emb-70ec.md`; round 3 `prompt-exports/oracle-review-2026-10-06-145536-oracleb-step3-r3-od1-1277.md`. Round 4 `prompt-exports/oracle-review-2026-10-06-154201-oracleb-step3-r4-rea-15a0.md`. The incomplete round-1 export is retained as historical evidence only. |
+| Historical r1 remediation bytes | r1a, measured by every r1 capture: `.agent-artifacts/step3-r1/CANDIDATE-SHA256SUMS` (`conductor.py` `36143188…`, `conductor_output.py` `e846c1eb…`, `conductor_benchmark.py` `f7bb6907…`). Reviewed r1b, with the over-cap fix: `.agent-artifacts/step3-r1/CANDIDATE-SHA256SUMS-r1b` (`conductor.py` `0d90033d…`, `conductor_output.py` `0e566ce5…`, `test_conductor_output.py` `ace20f36…`; the other files are unchanged) |
+| r1 evidence and re-review packet | `.agent-artifacts/step3-r1/EVIDENCE.md`; `.agent-artifacts/step3-r1/packet/MANIFEST.md` and `PACKET-SHA256SUMS` (r1b); the r1a packet is archived intact in `.agent-artifacts/step3-r1/packet-r1a/` |
+| Reviewed r2 remediation bytes and evidence | `.agent-artifacts/step3-r2/CANDIDATE-SHA256SUMS`, `EVIDENCE.md` and `r1b-to-r2.diff`. The frozen r1b review snapshot `.agent-artifacts/step3-review-r1/` is unchanged. Main's independent r1b `make conductor-selftest` exited 0 (`.agent-artifacts/step3-review-r1/selftest-main.log`) |
+| Reviewed r3 (OD16) bytes and evidence | `.agent-artifacts/step3-r3/CANDIDATE-SHA256SUMS`, `EVIDENCE.md`, `r2-to-r3.diff` and `context/`. The frozen r2 review snapshot `.agent-artifacts/step3-review-r2/` is unchanged. Main's independent r3 `make conductor-selftest` exited 0 (`.agent-artifacts/step3-r3/validation/selftest-main.log`) |
+| Reviewed r4 bytes and evidence | `.agent-artifacts/step3-r4/CANDIDATE-SHA256SUMS`, `EVIDENCE.md`, `r3-to-r4.diff` and `context/`. The frozen r3 review snapshot `.agent-artifacts/step3-review-r3/` verified unchanged before editing and is not modified |
+| Evidence storage | `.agent-artifacts/` is retained local working evidence, not durable contribution storage. The packet copies the material the lanes requested, with checksums, for main's re-review. |
+
+The first OracleB delivery (`prompt-exports/oracle-review-2026-10-05-225041-oracleb-step3-initia-71af.md`) started mid-finding and omitted its opening findings in both export and chat log. It is incomplete and not counted as approval. A fresh same-preset initial review of the unchanged snapshot produced the complete replacement above. Both completed review preset identities were verified. No substitute reviewer was used.
+
+The main agent independently reran `make conductor-selftest`: exit 0, recorded in local `.agent-artifacts/steps3-12-orchestration/step3-selftest-main.log`. The seven candidate production/test/harness checksums matched the implementation worker's evidence. The main context checker and its 23 tests also passed; the existing route-count warning remains.
+
+**Historical r0 stop and required decisions (superseded by OD14/OD15).** The main agent asked whether to authorize (1) bounded PTY read coalescing while preserving individual receive times, raw bytes, ordered transitions, batch caps and all performance gates, and (2) an explicit OD7 extension allowing disclosed repeated older displayed lines after dedup saturation. The request timed out after 300 seconds with no answers. Neither change is authorized. No gate is waived, and no claim of optimization impossibility is made. Steps 4–12 remain blocked. No files are staged or committed. (Superseded on 2026-10-06: the owner approved both changes as OD14 and OD15; see Step 3 remediation r1.)
+
+At the historical r0 stop, the review lanes differed on the severity/scope of summary deduplication, client rescan and retention protection. The following r0 state is superseded by the round-2 index above: OracleA's P1s remain open; OracleB's lower severity or informational treatment is not closure. No targeted remediation or re-review has occurred, so this is not yet a post-remediation contract-dispute determination. Safe independent future work includes bounded reproduction/remediation of the remaining correctness findings and evidence curation; changing summary semantics or PTY batching requires the unanswered decisions.
+
+The historical r0 stop-record update and correction of contaminated table labels postdated that reviewed snapshot. They are documentation-only and have not received delta review. Production, test and harness bytes remain at the reviewed snapshot. Raw evidence and review exports remain local, unstaged working material.
+
+### Step 3 remediation r1 (2026-10-06, OD14/OD15)
+
+Status: **reviewed in round 1 of 5 on the frozen r1b bytes; not accepted, not staged, not committed.** The round-1 dispositions are in the review index above. OracleA closed S3-R0-01/02/04/05/06; S3-R0-03 stays open; S3-R1-01/02 are new and remediated in r2 (below); OracleB's round-1 delivery is incomplete. No finding is approved or closed by this document; only the main-owned OracleA and OracleB lanes can do that. r1 starts from the reviewed r0 bytes (`.agent-artifacts/step3-review-r0/`, snapshot `2026-10-05/2234`) and HEAD `506af898`. Its first bytes (r1a) are bound by `.agent-artifacts/step3-r1/CANDIDATE-SHA256SUMS`. The round-1 reviewed bytes (r1b, with the pre-review over-cap fix below) are bound by `CANDIDATE-SHA256SUMS-r1b`. Evidence is in `.agent-artifacts/step3-r1/EVIDENCE.md`, and the re-review packet is `.agent-artifacts/step3-r1/packet/`. The r0 evidence in `.agent-artifacts/step3/` is unchanged.
+
+Every finding was reproduced on r0 before editing; S3-R0-03 was also checked against parent, which keeps the transitions. The r1 tests target each finding, and 37 mutations that revert or break a remediation are all killed.
+
+| Finding | r1 remediation (scope) |
+|---|---|
+| S3-R0-01 / OracleB SEEN-01 | Under OD15, a keep-last section sets `displayedLinesMayRepeat` when an unverified line evicts after saturation, and the terminal prints a note. A repeat-evicted keep-last regression covers it; first-lines sections stay exact. |
+| S3-R0-02 / OracleB WAIT-01 | `summaryPending` payload flag. The client shows a minimal pending summary with no rescan (including render) and keeps the legacy scan fallback. `wait_for_terminal` re-polls a pending terminal payload for at most 60 s (`WAIT_POLL_SECONDS` is 1 s, so the path is common). |
+| S3-R0-03 | A bounded streaming `SegmentScanner` classifies over-cap records before truncation: incremental UTF-8, SGR carry, `str.isspace` stripping, every `splitlines` separator, a rolling keyword window and a 64 Ki-character content cap. In r1a, segments were applied with the receive time of the read that completed them; in r1b, they apply when the record completes (see r1b below). |
+| S3-R0-04 | Narrow summary pins through payload construction, released on every path. Retention defers pinned jobs, and the last unpin reruns it. The Step 5 worker refactor is not implemented. |
+| S3-R0-05 | Harness `@6`: Step 3 targets must match the independent tail model for pipe and PTY. Empty, deleted and boundary-mutated tails are rejected, and comparisons reject Step 3 arms without validated tails. |
+| S3-R0-06 / SCHEMA-01 | Upper-bound counts render as "at most N … (deduplication limited …)". The artifact-scope section carries every v2 field, and the top-level quality is `exact`. |
+| OracleB EQ-01, TEST-01, BATCH-01, COUPLE-01 | Prefilter-vs-regex test; per-alternative precheck fixtures; mid-record cancellation, joiner-deadline and claimant `BaseException` tests; exact UTF-8 batch bytes; load-time coupling checks. |
+| OracleB DEAD-01 | **Deferred**: the legacy cursor methods and duplicate splitter remain in `swift_pipeline_metrics.py`. |
+| OracleB DOC-01 | Review-index fields added above. |
+
+Contract changes, made deliberately and reflected in tests:
+
+- the top-level `omittedLineCountQuality` is always `exact`;
+- new `displayedLinesMayRepeat` and `summaryPending` fields;
+- harness output adapter `@6`, with a `tailModel` per variant.
+
+The r0 interpretation "releases the pin" is replaced by real pins. r0's deadline-joiner interpretation (no `outputSummary`, `waitTimedOut` false) is replaced by `summaryPending` with a bounded client re-wait.
+
+OD14 is implemented as amended in §4 Step 3 and covers the PTY only. A first r1 build flushed once per group; that contradicted the per-read flush contract, so its partial capture was stopped and discarded.
+
+r1a disclosed four bounded over-cap divergences, none exercised by the fixtures:
+
+- D1: a marker whose stripped content exceeds 64 Ki characters is not recognized;
+- D2: segments are applied when they complete, earlier than parent's application at the LF;
+- D3: tail entries derive from the kept 64 KiB prefix;
+- D4: summary lines of over-cap records with heavy leading ANSI may differ from parent.
+
+**r1b (2026-10-06, before the first re-review).** Main asked that these be resolved where feasible without expanding scope. Each was reproduced, parent vs candidate in separate processes, with inputs under 1 MiB (`repro/overcap_divergences.py`, `overcap-before.log` / `overcap-after.log`).
+
+- **D3 and D4 resolved.** A bounded `VisiblePrefix` streams every byte of an over-cap record. It keeps the first N characters of the whole record with ANSI removed in one pass. This matches whole-text substitution exactly; the substitution is not idempotent, so it is never applied twice. The tail uses 4,097 characters with `ANSI_RE`; the summary uses 401 with the summary's CSI-only grammar.
+  - Tail entries now equal the independent OD7 full-record model.
+  - `summarize_file` output equals parent's (v1 projection) on ANSI-heavy over-cap lines.
+- **D2 addressed only within a bound; the remainder is open.** Segment items ride on the record, so they take the receive and wall time of the read that completes it, matching parent. To bound memory, at most 16 pending items wait. Beyond that, the pending items are applied early with the current read's time: same transitions, order and final state, but earlier timestamps. The reproduction `D2c` shows this.
+- **D1 not resolved; contract decision needed.**
+  - Counterexample: `Test Case '-[M.S t` + 70,000 × `n` + `]' started.` Parent applies `started` with a 70,017-character test name; r1b applies nothing. A 70,000-character parenthetical with a short name also diverges.
+  - The greedy name in `XCTEST_PROGRESS_RE` can grow without limit (a parenthetical may itself contain `' passed (`), so the worker's current in-memory scanner cannot retain every exact identity within its cap. This is a limitation of that design, not proof that a lossless disk-backed design is impossible.
+  - Alternatives: (1) keep the bound and disclose it; (2) make names up to 64 Ki characters exact for any parenthetical length (about 50 lines of XCTest-specific scanner logic; the long-name case still diverges); (3) truncate names (changes identity); (4) unbounded content (breaks the 64 KiB pending contract).
+  - Implementation position: (1).
+- **D2 bound: contract decision needed.** Alternatives: early application beyond the bound (r1b), unbounded buffering, or folding pending transitions, which must replay the per-`started` budget and clamp side effects. Implementation position: the r1b bound, disclosed.
+- **r1b validation.**
+  - 13 new mutations bring the total to 50, all killed.
+  - The focused suites pass, and `make conductor-selftest` exits 0.
+  - Classification equivalence is re-run and qualified, with the same totals as r1a.
+  - Guardrails, the context check and `git diff --check` pass.
+
+Evidence (`.agent-artifacts/step3-r1/`). Every performance, lock, thread and timing result below measured the r1a bytes. The results remain valid records of r1a but are not r1b evidence. r1b touches measured hot paths: a per-record over-cap check in `tail_entries`, 9-field records in the bulk splitter, and per-line type dispatch in the summary loop. No capture was run for r1b. The parent-506af898 baseline and the r1 effects are reported separately:
+
+| Gate metric | Parent 506af898 | r1 | Ratio | Required | r0 ratio | Result |
+|---|---|---|---|---|---|---|
+| `output.pipe.w0.cpu_ms` | 208.4 | 80.2 | 0.385 | ≤0.5 | 0.39 | threshold met; inconclusive (contaminated) |
+| `output.pipe.w4.cpu_ms` | 4,172.5 | 86.7 | 0.021 | ≤0.25 | 0.025 | threshold met; inconclusive |
+| `output.pipe.w4.wall_ms` | 2,022.2 | 129.5 | 0.064 | ≤0.25 | 0.055 | threshold met; inconclusive |
+| `output.pty.w0.cpu_ms` | 214.0 | 153.5 | 0.718 | ≤0.5 | 1.085 | **fail** |
+| `output.pty.w4.cpu_ms` | 511.0 | 166.9 | 0.327 | ≤0.25 | 1.92 | **fail** |
+| `output.pty.w4.wall_ms` | 340.6 | 183.9 | 0.540 | ≤0.25 | 1.66 | **fail** |
+| `summary.fixture.total_cpu_ms` | 4,314.0 | 1,009.7 | 0.234 | ≤0.65 | 0.23 | threshold met; inconclusive |
+| `mem.seen_growth_100k_1m_mib` | 127.56 | −0.000 | — | ≤1.0 MiB | — | threshold met; inconclusive |
+
+- **Gate capture** `step3-r1-gate-a`, via `make dev-conductor-bench-full` (output/summary/mem). `compare --profile step3-output-summary` returned exit 2. Foreign CPU exceeded the 4.0-core limit in every workload: output median 6.55 / max 7.55, summary max 6.07, memory max 6.26. No harness failures; every candidate variant has a `step3-validated` tail. With `--enforce-reference-targets`, pipe w0 CPU (80.2 > 50), PTY w0 CPU and PTY w4 CPU also miss their reference targets.
+- **OD14 delta** `step3-r1-od14-delta`: the r1 tree with only the coalescing wiring disabled, compared with r1, output only. It is contaminated (median 4.75 foreign cores).
+  - PTY w0 CPU 223.1 → 151.4 ms; w4 CPU 793.5 → 162.0 ms; w4 wall 472.3 → 193.2 ms. Every CI excludes zero.
+  - Pipe is unchanged; its CIs include zero.
+- **PTY thread attribution**, diagnostic:
+
+  | Thread | r1 w4 | Parent w4 |
+  |---|---|---|
+  | Reader | 146.4 ms | 231.6 ms |
+  | Waiters | 7.6 ms | 170.5 ms |
+  | Watchdog | 2.0 ms | 44.1 ms |
+
+  The remaining cost is reader work over about 5,190 one-KiB reads. Meeting w0 ≤0.5× needs about 43 ms less reader CPU. The contract-kept per-read flush accounts for about 13 ms. No further rewrite was attempted, and no gate was changed.
+- **Lock, real PTY with the ledger included**: 5 runs, 4 `job_wait` clients and the real watchdog.
+  - Reader p99 is 121 µs (fixture) and 129 µs (XCTest-dense), against the 5 ms gate.
+  - The only holds above 5 ms are the pre-existing first-`started` ledger load (45–50 ms, Step 4 scope), once per run in both arms.
+  - Final progress is identical to parent, with no watchdog trigger.
+- **Classification equivalence**: qualified over 83 inputs (36.9 MB).
+  - 170,812 ordered transitions are identical to parent at 4,093 B, 64 KiB, 1 KiB, and 1 KiB with OD14 coalescing.
+  - 498 summaries: r1 uncapped, projected to v1, is byte-identical to parent. 18 capped summaries differ only by declared saturation, with no displayed-line differences.
+- **Timing-on overhead**: diagnostic replay using the Step 2 method.
+  - r1 adds 72.1 ms per 5 MiB with 1 KiB reads and 66.6 ms with 64 KiB reads, within OD12's 90 ms; parent adds 81.8–82.7 ms.
+  - The replay excludes transport and persistence.
+- **Functional** (r1a; the r1b results are listed above):
+  - `make conductor-selftest` exited 0 (12 suites; 107 output, 74 benchmark and 143 lifecycle tests).
+  - `make guardrails` and `Scripts/check-agent-context` exited 0, with the pre-existing route-count warning.
+  - `git diff --check` is clean.
+
+Unsatisfied requirements:
+
+- the three PTY output gates fail;
+- no clean, uncontaminated capture exists, so pipe, summary and memory remain inconclusive;
+- the historical r1a reference targets are missed when `--enforce-reference-targets` is enabled; these conditional targets are not a new universal prerequisite;
+- DEAD-01 is deferred;
+- r1b performance is unmeasured;
+- the D1 and D2-bound contract decisions are open, so the over-cap path still has known, disclosed divergences from parent.
+
+No acceptance waiver, gate change or separate terminal-state or watchdog notification architecture is claimed or authorized.
+
+### Step 3 remediation r2 (2026-10-06, S3-R1-01/02 only)
+
+Status: **reviewed in round 2 of 5 on the frozen r2 bytes; not accepted, not staged, not committed.** OracleA explicitly closed S3-R1-01/02. S3-R0-03 remains P1/open, without downgrade. OracleB's complete delivery reports no own P0/P1 and closes all its P2s. This document records those lane dispositions; it does not independently close findings. r2 starts from the frozen r1b review snapshot `.agent-artifacts/step3-review-r1/files/`, which is preserved unchanged. Evidence is in `.agent-artifacts/step3-r2/`. No performance capture was run, so r2 performance is unmeasured; the r1a captures remain historical only.
+
+| Finding | r2 change |
+|---|---|
+| S3-R1-01 | `VisiblePrefix._add` returns on an empty visible fragment, so ANSI-only input (for example, an unterminated over-cap record of `ESC[0m`) keeps no fragments; retained parts stay at most one per visible piece up to the character limit. |
+| S3-R1-02 | Coalescing budgets are checked before a read starts. `ProcessOutputTransport.read_available(max_bytes)` reads at most the group's remaining bytes, so a group's total never exceeds 64 KiB when its first read does not. The 5 ms check (from the first read's receive time) runs before each further read instead of after it, so no read starts once the budget is spent; only the processing of a read already taken can end later. The benchmark's counting wrapper forwards the allowance. |
+
+r2 also corrects the `conductor_output.py` coalescing header, which said flushes were shared, to per-read write and flush. The pump docstring is updated the same way. D1/D2 code and semantics are unchanged.
+
+A test fixture changed deliberately. The group-ending segment-items test used to overflow the pending record through the byte overshoot that S3-R1-02 removes. It now overflows in a later group: within one group, the byte budget keeps a record started in that group under the 64 KiB cap. The time-bound expectation now follows the before-read check.
+
+r2 validation, on the final r2 bytes:
+
+- Mutations: 56 in total, none survived. These are the 50 r1b mutations (C05 retargeted to the moved check) plus R01–R06. R01–R06 cover kept empty fragments, no byte allowance, an after-read-only time check (the r1b behavior), a transport ignoring the allowance, an allowance off by one, and a harness dropping the allowance.
+- `make conductor-selftest` exited 0: 12 suites, including 118 output, 74 benchmark and 143 lifecycle tests.
+- Classification equivalence (r2 runner copy, whose coalesced fake honors the allowance) is qualified with the same totals as r1b: 83 inputs, 170,812 identical transitions, and 18 saturation-only summaries.
+- `make guardrails`, `Scripts/check-agent-context` (pre-existing route-count warning) and `git diff --check` pass.
+
+Bytes and evidence:
+
+- r2 bytes are in `.agent-artifacts/step3-r2/CANDIDATE-SHA256SUMS` (`fc6e8824…`): `conductor.py` `2a8d4155…`, `conductor_output.py` `043a5a99…`, `conductor_benchmark.py` `393267c4…`, `test_conductor_output.py` `77ff006e…`. The other five files are unchanged from r1b.
+- The delta against the frozen r1b snapshot is in `r1b-to-r2.diff`. Production lines changed (+/−): `conductor.py` +15/−8, `conductor_output.py` +6/−2, `conductor_benchmark.py` +2/−2; tests: `test_conductor_output.py` +86/−10.
+- Evidence summary: `.agent-artifacts/step3-r2/EVIDENCE.md`.
+
+### Step 3 round-2 outcome and contract-dispute stop (2026-10-06)
+
+Both main-owned fresh review lanes completed on the frozen r2 snapshot. Their preset identities were verified, and each explicitly acknowledged the embedded delta, current source, prior findings and gate configuration. OracleB's complete r0→r2 review repairs the incomplete round-1 delivery; no substitute reviewer was used. Two shared re-review rounds have been used. No production, test or harness bytes changed after these reviews.
+
+**OracleA's remaining finding, S3-R0-03 (P1/open, no downgrade):**
+
+> Requirement: Preserve recognized transitions and completing-read timestamps. OD14 permits bounded available-read coalescing, not these semantic exceptions; OD15 concerns summary deduplication only.
+
+> Disposition: Ordinary over-cap cases are repaired, but the owning P1 remains open. Tests asserting discarded markers or early application demonstrate implementation behavior, not authorization. Main’s stop on decision-dependent remedies is appropriate. The worker’s bounded-scanner recommendation and the unanswered diagnostic-failure request do not amend the contract.
+
+The scenarios are concrete: D1 loses a valid `started` marker with a long name, or a `passed` marker with a short name and long parenthetical, when normalized content exceeds 65,536 characters. D2 applies more than 16 pending embedded transitions on an earlier read instead of the enclosing record's completing read, changing deadline anchors and potentially watchdog behavior.
+
+**Implementation position:** the current scanner keeps memory bounded by dropping recognition above its content cap and applying excess pending transitions early. The worker recommends retaining and disclosing those bounds. That position conflicts with the preserved contract and is not authorized. A narrow OracleA planning consultation identified raw-log-backed deferred replay and disk-backed exact identity as a possible lossless direction, requiring a consumer audit and potentially broader architecture; it was not implemented or validated. This record does not claim lossless handling is globally impossible.
+
+**OracleB's advisory position, verbatim:**
+
+> Both are unauthorized. Neither is on Step 3's list of allowed differences, and there is no Decision.
+
+> OracleB's position: D1 conflicts with reader-contract step 4 and with "no progress loss". My materiality view is still P2 for D1 and P3 for D2, because neither can be produced by real XCTest output. That view is advice only and does not affect OracleA's P1.
+
+OracleB has no own P0/P1 and closed every own P2. OracleA explicitly closed S3-R1-01/02 and retained all earlier closures. Main does not adopt OracleB's severity as a downgrade of OracleA's finding. The corpus equivalence result does not cover these counterexamples.
+
+**Decision boundary and recommendation:** main asked for explicit authorization to fail the diagnostic job visibly at the D1/D2 limits, rather than silently discard markers or move watchdog timestamps. That request timed out without an answer. Broad approval of bounded experimentation and trust in recommendations is not recorded as this contract change. The recommended decision remains fail-visible handling at the documented bounds; the alternative is retaining exact semantics and separately scoping a lossless design. Neither is implemented or authorized by this record. Performance gates remain unchanged whichever option is chosen.
+
+**Acceptance evidence remains separate:** there is no clean current-r2 output, summary, memory or affected lock qualification. Historical r1a PTY ratios 0.718 / 0.327 / 0.540 missed the 0.5 / 0.25 / 0.25 gates, and all r1 captures were contaminated. Those results neither qualify nor measure failure on r2. OD12's historical diagnostic timing treatment is unchanged; reference-host thresholds remain conditional on `--enforce-reference-targets`.
+
+**Final independent validation:** main reran `make conductor-selftest` on r2: exit 0, 12 Python suites plus all 23 context-checker tests; the output, benchmark, metrics and lifecycle suites include 118, 74, 67 and 143 tests respectively. Log: `.agent-artifacts/step3-review-r2/selftest-main.log`. Main also reran `Scripts/check-agent-context`, `Scripts/test-check-agent-context` (23 passed), `make guardrails` and `git diff --check`; all passed after removing a trailing blank line introduced by this documentation update. The existing route-count warning remains. All nine candidate code/harness checksums match `CANDIDATE-SHA256SUMS`; the pre-existing unrelated documentation diff is unchanged, the index is empty and HEAD remains `506af898d9ed2b059a86b6317dd4949e3c06ca33`. All three delegated sessions completed, and no Oracle operations remain pending. These functional results do not replace performance qualification or resolve D1/D2. No Swift app build, live-app validation or commit preflight was run for this stopped checkpoint.
+
+**Deferred minor findings:** S3R0-DEAD-01 (legacy metrics cursor/splitter and stale wording) is deferred because it is non-blocking cleanup outside the two r2 repairs; reconsider in a future explicitly scoped Step 3 maintenance delta after the contract is settled, not as a prerequisite or a new refactor now. S3R1-B-N01 (the summary claimant's existing inline scan ignores its caller deadline) remains deferred as preexisting behavior. S3R2-B-N01's module-docstring wording remains reported, not looped on; the plan's last-verified date is updated here.
+
+**Stop:** S3-R0-03 survived both re-reviews and is recorded as a contract dispute, not another implementation slip. Step 3 is not accepted; Steps 4–12 remain unimplemented and blocked. Nothing is staged or committed. This final review-index/stop-record update is documentation-only and postdates the reviewed snapshot; it has not received another Oracle review. Raw evidence and review exports remain local working material.
+
+### Step 3 remediation r3 (2026-10-06, OD16 only)
+
+Status: **reviewed in round 3 of 5 on the frozen r3 snapshot; not accepted, not staged, not committed** (outcome in the r4 section). r3 implements only OD16 for S3-R0-03 D1/D2 on the r2 bytes. At the r3 review, S3-R0-03 remained open on the delayed-reader lifecycle gap; OracleA subsequently closed it on r4, as recorded below. The frozen r2 review snapshot `.agent-artifacts/step3-review-r2/files/` verifies unchanged against its `SHA256SUMS`, and its working copy is `.agent-artifacts/step3-r3/base-r2/` (`BASE-r2-SHA256SUMS`). No performance capture was run: r3 performance is unmeasured and no gate changed.
+
+| Area | r3 change |
+|---|---|
+| D1 (scanner) | `SegmentScanner(marker_shape=True)` checks every segment over `SEGMENT_MAX_CHARS` against `XCTEST_PROGRESS_RE` exactly, in bounded state. The state is a 12-character head (`Test Case '` plus a non-empty name), a 16-character stripped end (`' ACTION.` or `).`) and, for `).`, the `)`-free run that must start at `' ACTION (`. Only such a segment fails the scanner (`failure = "segment"`). Other oversized segments keep r2 handling: only their `Build complete!` substring test applies. A long unterminated `ESC[` literal directly after the head counts as part of the name. `conductor.py` refuses to import a `conductor_output.py` whose `XCTEST_MARKER_PATTERN` differs from `XCTEST_PROGRESS_RE`. |
+| D2 (scanner) | A 17th pending item fails the scanner (`failure = "pending"`). Up to 16 items still wait for the completing read. |
+| Splitter | The first failure latches `segment_failure = (kind, record seq)` and drops the scanner, so scanning stops for the rest of the stream. The failed record and every later record carry no items. `take_segment_items` and `_submit_segment_items` (early application) are removed. |
+| Pump | `_submit_output_group` submits records before the failed one with their transitions, fails the job, then submits the rest without classification (raw log, telemetry and tail continue). A failure ends a coalescing group; a failure in a group's first read skips coalescing. Per-read write and flush, receive times and OD14 limits are unchanged. |
+| Lifecycle | `_fail_xctest_output_contract` records a bounded reason that names the boundary, record sequence and limit but echoes no output. It adds a diagnostic `{kind: "xctest-output-contract", boundary, recordSeq, limit}` and a system line (on a new log line if the raw log ends mid-line), and marks a running job measurement-invalid. The XCTest monitor then terminates the process tree through `_terminate_xctest_stalled_job(cleanup="XCTest output contract failure")`, while the reader drains to EOF. Finalization reports `failed` with exit 70 even when the child exits 0, so no build ticket is published. The first failure keeps its reason, a stall claim never replaces it, and an earlier stall keeps its own error. |
+
+Tests:
+- Output suite (118 → 123 tests):
+  - Exact 16/17-pending and 65,536/65,537-character boundaries for name and parenthetical markers, both decorated and at EOF without a newline, at chunk sizes 977, 4,093 and 65,536.
+  - Marker-shape equality with the parent regex on 33 hand cases plus 160 fuzz cases, with both outcomes asserted.
+  - Large non-marker records never fail.
+  - Records before the failure keep their transitions, and later records feed only the tail.
+  - Boundedness of shape and failed scanners.
+  - Summaries never classify or fail.
+  - Pump group cuts, including a first-read failure that skips coalescing.
+  - The property test checks both outcomes against a reference scan.
+- Lifecycle suite (143 → 147 tests), each with a real PTY child:
+  - D1a, D1b, D1 at EOF without a newline, and D2c each fail visibly although the child exits 0: `failed`, exit 70, bounded reason, single diagnostic, no build ticket, rendered `Error:` line, no raw-output echo, reason on its own log line.
+  - D2b at the bound and a large non-marker record complete and publish normally.
+  - The first failure keeps its reason.
+  - A child that keeps writing, or ignores SIGTERM, is terminated within the grace periods, and its later output is still drained.
+
+Validation on the final r3 bytes (`.agent-artifacts/step3-r3/`):
+- **Mutations.** 73 in total, all killed (`mutation/mutation-results-r3-final.log`).
+  - M03, V09, V10 and C03 are retired because they mutated the removed early-application path; C07 and M20 are re-anchored; O01–O21 are new.
+  - An earlier full run on the same production bytes left O20 (a first-read failure coalesces) surviving. Its test was replaced, and the superseded log is kept.
+- **`make conductor-selftest`.** Exit 0: 12 suites, including 123 output, 74 benchmark, 67 metrics and 147 lifecycle tests.
+- **Classification equivalence** (r3 runner copy, which also records OD16 failures). Qualified: 83 inputs, 170,812 identical transitions, 18 saturation-only summaries and 0 OD16 failures. These are the same totals as r2.
+- **Over-cap repro.**
+  - D1a, D1b and D2c are FAIL-VISIBLE (`failed`, 70).
+  - D1c, D2, D2b and the D3/D4 tail and summary cases match the parent.
+- **Checks.** `make guardrails`, `Scripts/check-agent-context` and `git diff --check` pass.
+
+Disclosures:
+- Exit 70 is shared with existing XCTest stall and measurement-invalid failures. The diagnostic kind and reason distinguish OD16.
+- The log gains conductor-inserted bytes: the system line, as for stalls, plus one newline when the raw output ends mid-line. Child bytes are unchanged.
+- A failed record's transitions are withheld whole, including those before the failing point; earlier records keep theirs.
+- Over-cap `Build complete!` items count toward the 16-item pending bound, as in r2.
+- Jobs without the XCTest watchdog have no scanner and cannot fail this way.
+- If a reader latches a failure after the job has already finalized, it records the diagnostic and system line but does not change the job state.
+- The deferred minor findings (S3R0-DEAD-01, S3R1-B-N01 and S3R2-B-N01) are untouched.
+
+Bytes and evidence:
+- r3 bytes: `.agent-artifacts/step3-r3/CANDIDATE-SHA256SUMS`.
+  - Changed from r2: `conductor.py` `1845714c…`, `conductor_output.py` `13db6f1f…`, `test_conductor_output.py` `9e55cf99…`, `test_conductor_lifecycle.py` `5a0f8650…`.
+  - The other five code files are unchanged from r2.
+- Complete r2→r3 delta: `r2-to-r3.diff`.
+  - Production `diff -u` lines (+/−): `conductor.py` +131/−44, `conductor_output.py` +141/−18.
+  - Tests: `test_conductor_output.py` +314/−52, `test_conductor_lifecycle.py` +153/−0.
+  - The diff also contains this plan's OD16 updates.
+- Focused excerpts: `context/`. Evidence summary: `EVIDENCE.md`.
+
+### Step 3 round-3 outcome and remediation r4 (2026-10-06, reader-completion guard)
+
+**Round 3 (3 of 5, frozen r3 snapshot `.agent-artifacts/step3-review-r3/`).** Both main-owned lanes completed, and their preset identities were verified. Main's independent r3 `make conductor-selftest` exited 0 (`.agent-artifacts/step3-r3/validation/selftest-main.log`); that is r3 evidence.
+
+- **OracleA:**
+  - Retains all earlier closures (S3-R0-01/02/04/05/06, S3-R1-01/02).
+  - Finds D1/D2 remediated under OD16.
+  - Keeps **S3-R0-03 P1/open, without downgrade, on a new lifecycle basis.** `_run_job` continued after its two bounded reader joins without requiring the reader to have finished. A reader delayed before reporting an OD16 failure could therefore let the job finalize `completed` and publish the root build ticket. The late report then changed no state.
+  - Raises S3-R3-01 (P2, test): the post-failure `tick` assertion depended on scheduling.
+- **OracleB:**
+  - Approves the r3 code with no own or fix-induced P0/P1/P2. This is code approval only: it neither closes nor downgrades OracleA's finding, and Step 3 acceptance remains unqualified.
+  - Reports P3s S3R3-B-N01–N04 and requests helper context.
+
+Main agrees that the delayed-reader race is a valid in-scope OD16 correctness gap. Records:
+- OracleA: `prompt-exports/oracle-review-2026-10-06-144642-oraclea-step3-r3-od1-e463.md`
+- OracleB: `prompt-exports/oracle-review-2026-10-06-145536-oracleb-step3-r3-od1-1277.md`
+
+**r4 status: reviewed in round 4 of 5; remediation code approved by both lanes, but Step 3 not accepted, staged or committed.** r4 changes only the reader-completion guard and the S3-R3-01 test. OracleA explicitly closed S3-R0-03 and S3-R3-01; final dispositions are below. The frozen r3 snapshot verified unchanged before editing and is not modified. No performance capture was run: r4 performance is unmeasured and no gate changed.
+
+| Area | r4 change |
+|---|---|
+| Reader-completion guard (S3-R0-03) | The two reader joins use `OUTPUT_READER_JOIN_SECONDS` (2.0 s, unchanged). If the reader of a classifying (watchdog-enabled) job is still alive after both joins and the reader close, `_fail_incomplete_xctest_output_reader` runs before `xctest_process_finished`, provenance, finalization and ticket publication. It always records a bounded diagnostic `{kind: "xctest-output-reader-incomplete", joinSeconds, outcomeChanged}` and a system line (on a new log line if the log ends mid-line). A job that would otherwise succeed (exit 0, not canceled, timed out or already measurement-invalid) becomes measurement-invalid. It then finalizes `failed` with exit 70 and its bounded reason, and publishes no ticket. Outcomes already decided keep their reasons. Remaining verified job processes get the bounded TERM/KILL escalation. There is no further or unbounded wait. A resumed reader finds its descriptor closed (EOF); its late transitions and OD16 report change no outcome, reason or ticket, because finalization and ticket writes do not run again. Jobs without the watchdog have no scanner and are not guarded. |
+| S3-R3-01 (test) | The relay test is synchronized. The child writes `after-failure` only after the failure is recorded (a go file), and the monitor's termination proceeds only after the reader has submitted that line. The test asserts this ordering, the relayed line after the reason, the failed outcome and a dead tree. Coverage is not weakened. |
+
+New lifecycle tests (147 → 151; the r3 relay test is rewritten):
+- **Held reader before the OD16 report** (D2c, and D1 at EOF without a newline). The reader is held in `_fail_xctest_output_contract` beyond both joins (patched to 0.2 s), then released.
+  - Before release: `failed`/70, the guard reason, and no ticket.
+  - After release: the same outcome and reason, still no ticket, and the late OD16 report recorded.
+  - Clean-up: no new live threads, and no thread exceptions.
+- **Held reader without any OD16 failure** (in `_submit_output_records`). The job still fails, and its transitions are applied late without changing the outcome.
+- **Guard tree cleanup.** The root exits 0 after spawning a TERM-ignoring descendant that holds the PTY; the guard's KILL escalation ends it.
+- **Precedence unit test.** Nonzero exit, timeout, stall and cancel keep their reasons (`outcomeChanged: false`).
+
+Validation on the final r4 bytes (`.agent-artifacts/step3-r4/`):
+- **Mutations.** 80 in total, all killed (`mutation/mutation-results-r4-final.log`).
+  - These are the 73 r3 mutations plus G01–G07: no guard, no invalidation, overriding a decided outcome, no tree cleanup, no KILL escalation, a reason joining an open line, and a reader that stops after a failure (S3-R3-01).
+  - O11 is re-anchored to its r3 context line because the guard repeats its two lines.
+  - G06 first survived; adding the EOF-without-newline held case killed it (`mutation-guard-prelim.log`, `mutation-G06-rerun.log`).
+- **Repetition.** The OD16 lifecycle class passed 15 of 15 separate-process runs.
+- **`make conductor-selftest`.** Exit 0: 12 suites, including 123 output, 74 benchmark, 67 metrics and 151 lifecycle tests.
+- **Not rerun.** Classification equivalence and the over-cap repro, because the pump and scanner bytes are unchanged; their r3 report rows and provenance are in `context/`.
+- **Checks.** `make guardrails`, `Scripts/check-agent-context` and `git diff --check` pass.
+
+OracleB's round-3 P3s (reported, not fixed):
+- **N01.** `xctest_watchdog_triggered` is not in `to_payload`, rendering or telemetry. Its only other read is the benchmark harness's error text, so an OD16 failure is never presented to users as a stall. Deferred.
+- **N02.** r4 removes its success case: a guarded job whose reader outlives the joins can no longer finalize `completed`. A post-finalization OD16 report remains possible for an already unsuccessful job; OracleA's round-3 review explicitly permits late diagnostic-only reporting for an already unsuccessful job, and its round-4 review closes the false-success gap.
+- **N03 and N04.** Deferred, along with S3R0-DEAD-01, S3R1-B-N01 and S3R2-B-N01. N03's disclosure precision: the conductor-inserted newline splits the child's open line in the raw log and in later summaries.
+
+Pre-existing behavior, not changed by r4, reported for main:
+- On macOS, closing a PTY master while the reader is blocked in `os.read` does not return until every holder of the slave closes it (`preexisting/pty_master_close_blocks.log`).
+- In the parent and in r2–r4, `close_reader()` after the first join can therefore wait as long as a live descendant holds the PTY without writing. The job stays `running` instead of succeeding.
+- Bounding that wait would mean ending lingering descendants of normally exiting jobs, a broader contract change that needs a decision.
+- The guard's cleanup also reaches only descendants the conductor has verified: orphans it never tracked are as unreachable as on other normal-exit paths.
+
+Bytes and evidence:
+- r4 bytes: `.agent-artifacts/step3-r4/CANDIDATE-SHA256SUMS`.
+  - Changed from r3: `conductor.py` `58e139e4…` (+68/−2) and `test_conductor_lifecycle.py` `acb257ae…` (+199/−6).
+  - The other seven code files are unchanged.
+- Complete delta from the frozen r3 snapshot, plan included: `r3-to-r4.diff`.
+- Focused context, including every OracleB-requested helper, read site, timing, mutation patch, equivalence row and repro provenance: `context/`.
+- Summary: `EVIDENCE.md`.
+
+### Step 3 round-4 outcome (2026-10-06)
+
+**Code remediation approved by both required lanes; whole Step 3 acceptance remains blocked.** Both fresh round-4 reviews confirmed receipt of the complete frozen-r3→r4 delta and requested evidence. Main verified both exact preset identities and the candidate hashes. No production, harness or test code changed after the frozen r4 review snapshot.
+
+- **OracleA:** explicitly closes **S3-R0-03 as fixed, not downgraded**, and **S3-R3-01 as fixed**. All earlier closures remain. Its code verdict is approved with a nonblocking test finding.
+- **OracleB:** approves r4 code, with no own or fix-induced P0/P1/P2; closes S3R3-B-N02 and retains prior closures. This does not substitute for OracleA's explicit closures.
+- **Rounds:** 4/5 used; no new round for minor observations. Records:
+  - `prompt-exports/oracle-review-2026-10-06-152604-oraclea-step3-r4-rea-6aea.md`
+  - `prompt-exports/oracle-review-2026-10-06-154201-oracleb-step3-r4-rea-15a0.md`
+- **Frozen reviewed bytes:** `.agent-artifacts/step3-review-r4/files/`, `SHA256SUMS` and `r3-to-r4.patch`. The worker's original plan hash remains bound to that snapshot; this outcome-record update postdates it and is documentation-only, not an additional reviewed code change.
+
+**Validation:** main's independent r4 `make conductor-selftest` exited **0**, with 12 Python suites including 123 output, 74 benchmark, 67 metrics and 151 lifecycle tests. The separate context checker passed all 23 tests. Main also ran `make guardrails`, `Scripts/check-agent-context`, `Scripts/test-check-agent-context` and `git diff --check`; all passed, with the existing route-count warning. Worker evidence records 80/80 killed mutations and 15/15 focused lifecycle runs. Main's log and explicit exit/hash provenance are in `.agent-artifacts/step3-r4/validation/selftest-main.log` and `selftest-main-evidence.md`. r3 classification equivalence and reproductions were not rerun for r4; their unchanged pump/scanner coverage is carried forward only as disclosed focused evidence.
+
+**Deferred findings, not hidden acceptance blockers:**
+- **S3-R4-01 (OracleA P2):** the TERM-resistant descendant test does not acknowledge that its signal handler is installed before escalation. A heavily delayed child could die on TERM and fail the expected KILL assertion. OracleA explicitly permits deferral and says not to open another round solely for it. Synchronize readiness in the next necessary lifecycle-test change; retain the escalation assertions.
+- **OracleB S3R4-B-N01/N02/N03 (P3):** thread death after a reader exception is not distinguished from normal completion; a resumed reader can attempt to use a closed sink; raw-log diagnostic insertion can race late writes. These are disclosed fault/late-reader limitations, not fixes included in r4. Avoid claiming all late-reader positions preserve full raw output or end without thread exceptions.
+- **OracleB S3R4-B-N04 (P3):** the guard also fails ordinary input whose reader remains incomplete. Main's implementation rationale is recorded under OD16 above; this is necessary to prevent unreported OD16 failures from publishing success, not a performance waiver.
+- **OracleB S3R4-B-N05 (P3 documentation):** this update removes contradictory round counts, distinguishes Steps 1–2 r4 from Step 3 r4, records current dispositions, and attributes OracleA's late-failure position to its actual reviews.
+- **OracleB S3R4-B-N06 (P3):** repeated termination logic and limited non-watchdog integration coverage are deferred; no unrelated refactor is added. Earlier deferred P3s remain listed in their owning round records.
+
+**Remaining stop (at round 4; superseded by the qualification below):** no clean current-r4 output, summary, memory or affected lock qualification had been captured. Historical r1a PTY ratios missed gates and all captures were contaminated; they neither qualify r4 nor establish current-r4 performance failure. Performance gates, sample/contamination policy and conditional reference targets remain unchanged. Both lanes withhold whole-phase acceptance. The pre-existing macOS PTY-close block is a separate shutdown-policy issue, not reopened as a Step 3 gate; r4 makes no four-second end-to-end shutdown guarantee.
+
+Step 3 is therefore not staged or committed, and Steps 4–12 remain unimplemented and blocked pending empirical acceptance. No Swift application build, live-app operation or commit preflight was run for this checkpoint. All delegated sessions completed; no Oracle operation or validation process is left pending.
+
+### Step 3 current-r4 qualification (2026-10-06)
+
+**Result: PTY output gates fail on a clean capture; pipe, summary, lock and equivalence pass; memory is inconclusive. The owner subsequently accepted this measured checkpoint under OD17.** This is measurement evidence only. It is not an Oracle verdict or empirical-acceptance claim. No code, harness, gate, sample minimum or contamination rule changed. Local evidence: `.agent-artifacts/step3-r4-qualification/` (`MANIFEST.md`, `SHA256SUMS` `f7429866…`).
+
+**Method.**
+- Targets: baseline is the immediate parent `506af898` (`.agent-artifacts/step3/parent-506af898`, equal to HEAD). Candidate is the current tree, re-verified byte-equal to frozen r4 (`step3-review-r4/SHA256SUMS` `71693777…`, all 7 code/test files).
+- Both arms ran under the same current harness (`conductor_benchmark.py` `393267c4…`, harness digest `f025d31f…`).
+- Capture A was contaminated (foreign cores up to 4.78) and exited inconclusive. It was followed by one retry, capture B.
+- `--enforce-reference-targets` was not used.
+- No app or daemon was stopped. Foreign load (Storage.appex, the CE Dev app, editors and browsers) is recorded in `preflight/`.
+
+| Gate (capture B; n = 30 fast, 10 mem) | Parent | r4 | Ratio / value | Threshold | Validity | Result |
+|---|---|---|---|---|---|---|
+| Pipe w0 CPU ms | 190.487 | 77.119 | 0.405 | ≤0.50 | clean (max 3.63) | pass |
+| Pipe w4 CPU / wall ms | 3,118.264 / 1,533.675 | 81.144 / 87.108 | 0.026 / 0.057 | ≤0.25 | clean | pass |
+| PTY w0 CPU ms | 187.199 | 146.005 | 0.780 | ≤0.50 | clean | **fail** |
+| PTY w4 CPU ms | 351.088 | 155.657 | 0.443 | ≤0.25 | clean | **fail** |
+| PTY w4 wall ms | 263.021 | 198.744 | 0.756 | ≤0.25 | clean | **fail** |
+| Summary fixture CPU ms | 4,272.126 | 997.956 | 0.234 | ≤0.65 | clean (max 3.64) | pass |
+| Single scan per log | — | — | `test_racing_status_wait_and_completion_scan_once` | self-test | r4 selftest exit 0 | pass |
+| Memory growth 100k→1M MiB | 127.564 | −0.000 | −0.000 | <1.0 | 1 sample at 4.03 > 4.0 | **inconclusive** (threshold met) |
+| Lock p99 batch hold | 6.8–12.6 µs | 106.8–131.0 µs | max p99 131.0 µs | ≤5 ms | real PTY, ledger, watchdog, 4 waiters | pass |
+| Progress loss/reorder | identical | identical | log = transport bytes | none | 5 runs × 2 inputs | pass |
+| Classification equivalence | — | — | 83 inputs; 170,812 transitions × 4 read modes identical; 18 saturation-only diffs; 0 OD16 failures | qualified | r3 script | pass |
+
+**Lock profile.** The only hold above 5 ms in either arm is the pre-existing first-`started` ledger load (44–51 ms, Step 4 scope), once per run. The r1 lock profiler had to be copied with one fix: its `read_available` wrapper now forwards the S3-R1-02 byte allowance. Its crashed outputs are kept as invalid.
+
+**Timing-on (OD12 diagnostic, treatment unchanged).** Added reader CPU per 5 MiB is 71.7 ms (r4, 1 KiB), 68.5 (64 KiB) and 84.1 (per line), against the parent's 81.0 and 81.6. Every arm stays ≤90 ms.
+
+**PTY attribution (bounded; nothing coded).**
+- r4's PTY cost is the reader thread: 143 of 146 ms process CPU at w0, and 149 of 158 at w4.
+- A diagnostic transport-only floor (cat → PTY → the target's own `read_chunk`, discarding output) is 48 ms wall and 18 ms CPU in both arms. Wall is therefore reader-bound, not producer-bound.
+- The reader's ≈143 ms splits into:
+  - ≈18 ms transport;
+  - ≈13 ms contract per-read write+flush;
+  - ≈87 ms per-record processing (in-process 1 KiB replay; parent 49.9 ms);
+  - ≈25 ms group, select, lock and GIL overhead.
+- Processing is led by visible-tail construction (`tail_entries`) and the regex splitter (`feed`).
+- Required reductions:
+  - w0 CPU: −52.4 ms, to ≤93.6;
+  - w4 CPU: −67.9 ms, to ≤87.8;
+  - w4 wall: −133.0 ms, to ≤65.8. That is ≤18 ms above the transport floor, including the 13 ms flush.
+- Smallest plausible contract-preserving fix: build tail entries only for records that can survive into each group's tail, and use bytes fast paths instead of per-read regex splitting.
+- Projected effect (estimate, not measured): about −25 to −45 ms. All three PTY gates would still fail; even parent-cost per-record work would leave w0 at about 105–110 ms.
+
+**Main's decision recommendation:** accept the reviewed Step 3 implementation at its measured gains, carrying the three missed PTY targets and narrowly contaminated memory result as non-blocking follow-up rather than authorizing a deeper rewrite. Clean PTY improvements are 22.0% (w0 CPU), 55.7% (w4 CPU) and 24.4% (w4 wall); this is not a claim that the original 50%/75% targets passed. The proposed optimization's projected savings remain estimates, not proof that the original targets are impossible.
+
+Main asked explicitly whether to approve this measured acceptance, commit Step 3 and proceed to Step 4. The request initially timed out after 300 seconds with no answer; the owner subsequently approved it explicitly, recorded as OD17. The user's request to resolve the gates was not silently treated as a waiver. Main verified the 60-file evidence manifest, the clean output/summary and contaminated-memory labels in capture B, and the lock summary. Reviewed r4 code remains byte-identical, the unrelated tracked documentation diff is unchanged, HEAD is still `506af898d9ed2b059a86b6317dd4949e3c06ca33`, and the index is empty. All worker processes finished. Only this owning plan changed; no additional code review round was used. That historical acceptance block is now resolved by OD17; Step 4 may proceed in plan order.

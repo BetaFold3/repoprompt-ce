@@ -46,7 +46,7 @@ import types
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
-HARNESS_VERSION = 5
+HARNESS_VERSION = 6
 CAPTURE_SCHEMA_VERSION = 3
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parent
@@ -58,7 +58,7 @@ TARGET_FILES = ("Scripts/conductor.py", "Scripts/debug_app_process.py", "conduct
 # Staged and digested only when the target has them (Step 2+ conductors load the timing
 # helper by explicit path from their own directory). Absent files leave the digest of a
 # required-files-only target unchanged, so earlier targets keep their conductorDigest.
-OPTIONAL_TARGET_FILES = ("Scripts/swift_pipeline_metrics.py",)
+OPTIONAL_TARGET_FILES = ("Scripts/swift_pipeline_metrics.py", "Scripts/conductor_output.py")
 FAST_WORKLOADS = ("output", "summary", "mem", "cli")
 FULL_WORKLOADS = FAST_WORKLOADS + ("artifact", "rss")
 TARGET_MODULE_NAME = "rpce_bench_target_conductor"
@@ -84,7 +84,7 @@ EXIT_INCONCLUSIVE = 2
 EXIT_HARNESS_FAILURE = 3
 
 ADAPTER_VERSIONS = {
-    "output": "read_process_output+pty_xctest_watchdog+pty_exact_tail_fidelity@3",
+    "output": "read_process_output+pty_xctest_watchdog+pty_exact_tail_fidelity+step3_tail_model_enforced+pty_available_read_counting@6",
     "summary": "summarize_file+frozen_retained_corpus@2",
     "mem": "record_progress_ledger+section_seen@1",
     "cli": "launcher_subprocess@1",
@@ -301,14 +301,58 @@ def verify_transport_stream(transport_kind: str, written: bytes, read: bytes) ->
     return inserted
 
 
-def pty_tail_evidence(tail: Iterable[str], read: bytes, inserted: Sequence[int]) -> Dict[str, Any]:
+STEP3_TAIL_MODEL_VALIDATED = "step3-validated"
+LEGACY_TAIL_MODEL = "legacy"
+STEP3_TAIL_VARIANTS = tuple(f"output.{transport}.w{waiters}" for transport, waiters in OUTPUT_VARIANTS) + ("output.pty.fidelity",)
+
+
+def is_step3_target(mod: Any) -> bool:
+    """Whether a loaded target implements the Step 3 output path (its tail must follow OD7).
+
+    Either signal suffices, so a target cannot leave the validation by not
+    loading the helper it ships.
+    """
+    if getattr(mod, "CONDUCTOR_OUTPUT", None) is not None:
+        return True
+    module_file = getattr(mod, "__file__", None)
+    return bool(module_file) and Path(module_file).with_name("conductor_output.py").is_file()
+
+
+def verify_step3_tail(tail: Iterable[str], read: bytes, context: str) -> None:
+    """A Step 3 target's tail must equal the independent model over the bytes it received."""
+    entries = list(tail)
+    expected = step3_tail_model(read)
+    if entries == expected:
+        return
+    index = next(
+        (position for position, (got, want) in enumerate(zip(entries, expected)) if got != want),
+        min(len(entries), len(expected)),
+    )
+    raise HarnessError(
+        f"{context}: Step 3 tail does not match the independent model "
+        f"({len(entries)} entries vs {len(expected)}; first difference at entry {index})"
+    )
+
+
+def pty_tail_evidence(tail: Iterable[str], read: bytes, inserted: Sequence[int], step3: bool = False) -> Dict[str, Any]:
     """Arm-comparable evidence for a PTY job tail.
 
-    The tail must be a suffix of the bytes the target received; the tty-retried
-    CRs at their exact offsets are removed, and the last fixed number of bytes
-    are digested so window shifts caused by retried CRs cannot vary the result.
+    A Step 3 target's tail must equal the independent model over the received
+    bytes (else ``HarnessError``); its evidence is the model over the written
+    stream (tty-retried CRs removed), which is stable. A legacy tail must be a
+    suffix of the bytes the target received; the tty-retried CRs at their exact
+    offsets are removed, and the last fixed number of bytes are digested so
+    window shifts caused by retried CRs cannot vary the result.
     """
-    joined = "".join(tail).encode("utf-8", errors="surrogateescape")
+    entries = list(tail)
+    if step3:
+        verify_step3_tail(entries, read, "pty")
+        return {
+            "suffixOfStream": False,
+            "step3Model": True,
+            "normalizedTailSha256": canonical_json_digest(step3_tail_model(remove_offsets(read, inserted))),
+        }
+    joined = "".join(entries).encode("utf-8", errors="surrogateescape")
     if not read.endswith(joined):
         return {"suffixOfStream": False, "tailSha256": sha256_bytes(joined)}
     start = len(read) - len(joined)
@@ -321,6 +365,59 @@ def pty_tail_evidence(tail: Iterable[str], read: bytes, inserted: Sequence[int])
         "suffixBytes": PTY_TAIL_EVIDENCE_BYTES,
         "suffixSha256": sha256_bytes(normalized[-PTY_TAIL_EVIDENCE_BYTES:]),
     }
+
+
+STEP3_TAIL_ENTRIES = 30
+STEP3_TAIL_MAX_BYTES = 64 * 1024
+STEP3_TAIL_ENTRY_MAX_BYTES = 4 * 1024
+_STEP3_DELIMITERS = re.compile(rb"(\r\n|\r|\n)")
+_STEP3_ANSI = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]|\x1b[@-Z\\-_]")
+
+
+def step3_tail_model(read: bytes) -> List[str]:
+    """Independent reference model of the plan Step 3 visible tail (OD7).
+
+    Records end at CR LF, a bare CR or LF; each entry is the record decoded with
+    replacement, ANSI-stripped, capped at 4 KiB including its ``\\n`` terminator
+    (an unterminated final record has none) with a trailing ellipsis, and the tail
+    keeps the last 30 entries within 64 KiB.
+    """
+    parts = _STEP3_DELIMITERS.split(read)
+    records: List[Tuple[bytes, bool]] = []
+    if parts[-1]:
+        records.append((parts[-1], False))
+    index = len(parts) - 3
+    while index >= 0 and len(records) < STEP3_TAIL_ENTRIES:
+        records.append((parts[index], True))
+        index -= 2
+    entries: List[str] = []
+    total = 0
+    for data, terminated in records:  # newest first
+        text = _STEP3_ANSI.sub("", data.decode("utf-8", errors="replace"))
+        terminator = "\n" if terminated else ""
+        limit = STEP3_TAIL_ENTRY_MAX_BYTES - len(terminator)
+        encoded = text.encode("utf-8")
+        if len(encoded) > limit:
+            text = encoded[: limit - 3].decode("utf-8", errors="ignore") + "…"
+        entry = text + terminator
+        size = len(entry.encode("utf-8"))
+        if total + size > STEP3_TAIL_MAX_BYTES:
+            break
+        total += size
+        entries.append(entry)
+    entries.reverse()
+    return entries
+
+
+def remove_offsets(data: bytes, offsets: Sequence[int]) -> bytes:
+    """``data`` without the bytes at ``offsets`` (the tty-retried CRs)."""
+    pieces = []
+    start = 0
+    for offset in sorted(offsets):
+        pieces.append(data[start:offset])
+        start = offset + 1
+    pieces.append(data[start:])
+    return b"".join(pieces)
 
 
 def verify_pty_output_mode(fd: int) -> None:
@@ -398,7 +495,7 @@ def load_target_module(root: Path) -> Any:
     scripts = (root / "Scripts").resolve()
     sys.path[:] = [entry for entry in sys.path if Path(entry or ".").resolve() != SCRIPT_DIR]
     sys.path.insert(0, str(scripts))
-    for name in ("debug_app_process", "swift_pipeline_metrics", TARGET_MODULE_NAME):
+    for name in ("debug_app_process", "swift_pipeline_metrics", "conductor_output", TARGET_MODULE_NAME):
         sys.modules.pop(name, None)
     source_path = scripts / "conductor.py"
     try:
@@ -421,6 +518,12 @@ def load_target_module(root: Path) -> Any:
         helper_file = Path(getattr(helper, "__file__", "") or "").resolve()
         if helper is None or helper_file != scripts / "swift_pipeline_metrics.py":
             raise HarnessError(f"target timing helper did not load from {scripts}: {helper_file if helper else None}")
+    if "CONDUCTOR_OUTPUT" in module.__dict__:
+        # Step 3+ targets: the output helper must be the target's own copy.
+        output_helper = module.__dict__["CONDUCTOR_OUTPUT"]
+        output_file = Path(getattr(output_helper, "__file__", "") or "").resolve()
+        if output_file != scripts / "conductor_output.py":
+            raise HarnessError(f"target output helper did not load from {scripts}: {output_file}")
     return module
 
 
@@ -558,6 +661,7 @@ def adapter_output(mod: Any, spec: Dict[str, Any]) -> Dict[str, Any]:
             "ttyRetriedCR": result["tty_retried_cr"],
             "rawTailSha256": result["tail_sha256"],
             "watchdogThreads": result["watchdog_threads"],
+            "tailModel": result["tail_model"],
         }
     equivalence[PTY_FIDELITY_KEY], info["output.pty.fidelity"] = run_pty_fidelity(mod, spec)
     return {"metrics": metrics, "equivalence": equivalence, "info": info}
@@ -579,7 +683,11 @@ def run_pty_fidelity(mod: Any, spec: Dict[str, Any]) -> Tuple[str, Dict[str, Any
         raise HarnessError(
             f"PTY fidelity delivery was not exact ({result['tty_retried_cr']} retried CRs, {result['bytes_read']} bytes)"
         )
-    return result["tail_sha256"], {"bytesRead": result["bytes_read"], "tailEntries": result["tail_entries"]}
+    return result["tail_sha256"], {
+        "bytesRead": result["bytes_read"],
+        "tailEntries": result["tail_entries"],
+        "tailModel": result["tail_model"],
+    }
 
 
 def _run_output_variant(
@@ -622,6 +730,18 @@ def _run_output_variant(
             return chunk
 
         transport.read_chunk = counting_read_chunk
+        original_read_available = getattr(transport, "read_available", None)
+        if original_read_available is not None:
+            # OD14 targets take further already-available PTY reads; each counts
+            # as one transport read, exactly like a blocking read.
+            def counting_read_available(*args: Any) -> Optional[bytes]:
+                chunk = original_read_available(*args)  # forwards the byte allowance
+                if chunk:
+                    chunk_counter["count"] += 1
+                    received.extend(chunk)
+                return chunk
+
+            transport.read_available = counting_read_available
         watchdog: Optional[threading.Thread] = None
         if transport_kind == "pty" and not state._xctest_watchdog_enabled(job):
             raise HarnessError("target did not enable the XCTest watchdog for the PTY variant")
@@ -681,6 +801,10 @@ def _run_output_variant(
                 f"{transport_kind}: log bytes ({len(logged)}) differ from transport bytes ({len(received)})"
             )
         retried = verify_transport_stream(transport_kind, raw, logged)
+        # Outside the measured interval: a Step 3 tail must conform exactly (pipe and PTY).
+        step3 = is_step3_target(mod)
+        if step3:
+            verify_step3_tail(job.tail, logged, f"{transport_kind} w{waiters}")
         tail_sha256 = canonical_json_digest(list(job.tail))
         return {
             "wall_ms": wall_ms,
@@ -691,7 +815,8 @@ def _run_output_variant(
             "watchdog_threads": 0 if watchdog is None else 1,
             "tail_sha256": tail_sha256,
             "tail_entries": len(job.tail),
-            "tail_evidence": tail_sha256 if transport_kind == "pipe" else pty_tail_evidence(job.tail, logged, retried),
+            "tail_model": STEP3_TAIL_MODEL_VALIDATED if step3 else LEGACY_TAIL_MODEL,
+            "tail_evidence": tail_sha256 if transport_kind == "pipe" else pty_tail_evidence(job.tail, logged, retried, step3),
             "progress": {
                 "sequence": job.xctest_progress_sequence,
                 "started": job.xctest_started_count,
@@ -2148,6 +2273,8 @@ def capture_problems(
             else:
                 inventories[workload] = inventory
         harness.extend(completeness_problems(label, capture, arm, inventories))
+        if "output" in inventories:
+            harness.extend(tail_model_problems(label, capture, arm))
         policy_problem, contaminated = contamination_problems(label, capture, arm, workloads, gates)
         harness.extend(policy_problem)
         inconclusive.extend(contaminated)
@@ -2166,6 +2293,30 @@ def capture_problems(
     if held:
         inconclusive.append(f"{label} samples for {held} ran while machine slots were held")
     return harness, inconclusive
+
+
+def tail_model_problems(label: str, capture: Dict[str, Any], arm: str) -> List[str]:
+    """A Step 3 arm (it stages ``conductor_output.py``) must prove every output tail was validated.
+
+    Tail digests may legitimately change across arms (OD7), so a Step 3 tail is
+    accepted only with the collection-time record that it equals the independent
+    model; captures without that record are rejected rather than trusted.
+    """
+    entry = next((item for item in capture.get("arms", []) if item.get("name") == arm), None)
+    if entry is None or "Scripts/conductor_output.py" not in (entry.get("files") or {}):
+        return []
+    problems = []
+    for sample in capture.get("samples", []):
+        if sample.get("arm") != arm or sample.get("workload") != "output" or not sample.get("ok"):
+            continue
+        info = sample.get("info") or {}
+        missing = [
+            variant for variant in STEP3_TAIL_VARIANTS
+            if (info.get(variant) or {}).get("tailModel") != STEP3_TAIL_MODEL_VALIDATED
+        ]
+        if missing:
+            problems.append(f"{label} output block {sample.get('block')}: Step 3 tail not validated against the model for {missing}")
+    return problems
 
 
 def arm_digest(capture: Dict[str, Any], arm: str) -> Optional[str]:

@@ -1371,6 +1371,31 @@ class OutputTelemetryCursor:
         except Exception as exc:  # noqa: BLE001
             self._disable(exc)
 
+    def observe_split_records(self, records: Iterable[Sequence[Any]]) -> None:
+        """Records already split by the conductor's shared output splitter (Step 3).
+
+        Each record is ``(seq, receive_ns, text, delimiter, truncated,
+        dropped_bytes, ...)`` in stream order; text is never re-split or
+        re-decoded. Close with :meth:`finish_split`.
+        """
+        if not self.active:
+            return
+        try:
+            observe = self._observe_record
+            for record in records:
+                if record[4]:
+                    self._truncated += 1
+                    self._dropped += record[5]
+                    observe(record[2], record[1], True)
+                else:
+                    observe(record[2], record[1])
+        except Exception as exc:  # noqa: BLE001 - containment by design
+            self._disable(exc)
+
+    def finish_split(self) -> None:
+        """EOF for a cursor fed through :meth:`observe_split_records`."""
+        self._close(None)
+
     def finish(self, tail: bytes | None, tail_text: str | None, receive_ns: int) -> None:
         """EOF: the legacy unterminated tail (if any) and its decoded text."""
         if self.active:

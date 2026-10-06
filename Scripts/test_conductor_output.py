@@ -4,8 +4,10 @@
 from __future__ import annotations
 
 import contextlib
+import errno
 import fcntl
 import io
+import itertools
 import json
 import os
 import subprocess
@@ -684,19 +686,18 @@ def capture_pump(state: conductor.DaemonState, job: conductor.Job, chunks: list[
     progress: list[str] = []
     sink = mock.Mock()
     sink.write.side_effect = writes.append
-    original_progress = state._record_xctest_progress_locked
+    original_apply = state._apply_xctest_progress_line_locked
 
-    def record_progress(target: conductor.Job, text: str) -> Any:
-        progress.append(text)
-        return original_progress(target, text)
+    def record_progress(target: conductor.Job, line: str, marker: Any, timestamp: float, observed_at: float) -> Any:
+        progress.append(line)
+        return original_apply(target, line, marker, timestamp, observed_at)
 
-    with mock.patch.object(state, "_record_xctest_progress_locked", side_effect=record_progress):
+    with mock.patch.object(state, "_apply_xctest_progress_line_locked", side_effect=record_progress):
+        cursor = None
         if observed:
             cursor = state._output_telemetry_cursor(job.ticket)
             assert cursor is not None
-            state._pump_output_observed(job.ticket, iter(chunks).__next__, sink, cursor)
-        else:
-            state._pump_output(job.ticket, iter(chunks).__next__, sink)
+        state._pump_output(job.ticket, iter(chunks).__next__, sink, cursor)
     return {
         "writes": writes,
         "flushes": sink.flush.call_count,
@@ -853,7 +854,7 @@ class PhaseTimingIntegrationTests(unittest.TestCase):
         sink.flush.side_effect = lambda: order.append("flush")
         cursor = state._output_telemetry_cursor(job.ticket)
         with mock.patch.object(conductor.time, "monotonic_ns", side_effect=stamp):
-            state._pump_output_observed(job.ticket, read_chunk, sink, cursor)
+            state._pump_output(job.ticket, read_chunk, sink, cursor)
         self.assertEqual(order[:4], ["read", "stamp", "write", "flush"])
         self.assertEqual(order[4:8], ["read", "stamp", "write", "flush"])
         self.assertEqual(order[8:10], ["read", "stamp"])
@@ -861,18 +862,20 @@ class PhaseTimingIntegrationTests(unittest.TestCase):
         payload = job.telemetry.finalize()
         self.assertEqual(payload["output"]["records"], 2)
 
-    def test_read_process_output_uses_legacy_pump_without_a_recorder(self) -> None:
-        for timing, attach in (("off", True), ("on", False)):
+    def test_read_process_output_passes_no_cursor_without_a_recorder(self) -> None:
+        # Step 3: one bounded pump for every job; telemetry only adds a cursor.
+        for timing, attach, expect_cursor in (("off", True, False), ("on", False, False), ("on", True, True)):
             with self.subTest(timing=timing, attach=attach):
-                state = self.make_state(f"dispatch-{timing}", timing)
+                state = self.make_state(f"dispatch-{timing}-{attach}", timing)
                 job = timing_job(state, "t")
                 if not attach:
                     job.telemetry = None
                 transport = mock.Mock()
                 transport.read_chunk.side_effect = [b"line\n", b""]
-                with mock.patch.object(state, "_pump_output_observed") as observed:
+                with mock.patch.object(state, "_pump_output", wraps=state._pump_output) as pump:
                     state._read_process_output(job.ticket, mock.Mock(), io.BytesIO(), transport)
-                observed.assert_not_called()
+                pump.assert_called_once()
+                self.assertEqual(pump.call_args.args[3] is not None, expect_cursor)
                 self.assertEqual(list(job.tail), ["line\n"])
                 transport.close_reader.assert_called_once()
 
@@ -1374,6 +1377,1598 @@ class PhaseTimingIntegrationTests(unittest.TestCase):
         with contextlib.redirect_stdout(io.StringIO()) as rendered:
             conductor.render_daemon_status(no_helper)
         self.assertIn("timing:   disabled (timing helper not loaded at daemon start)", rendered.getvalue())
+
+
+
+# ---------------------------------------------------------------------------
+# Step 3: shared streaming splitter, batched reader, bounded tail, summaries.
+
+OUT = conductor.CONDUCTOR_OUTPUT
+
+
+def split_all(chunks: list[bytes], **kwargs: Any) -> list:
+    splitter = OUT.RecordSplitter(**kwargs)
+    records: list = []
+    for index, chunk in enumerate(chunks):
+        records.extend(splitter.feed(chunk, index + 1))
+    records.extend(splitter.finish(len(chunks) + 1))
+    return records
+
+
+def shape(records: list) -> list[tuple]:
+    return [(record.text, record.delimiter) for record in records]
+
+
+class Step3SplitterTests(unittest.TestCase):
+    def test_helper_is_loaded_next_to_conductor_and_is_part_of_the_digest(self) -> None:
+        self.assertEqual(Path(OUT.__file__).resolve(), Path(conductor.__file__).resolve().with_name("conductor_output.py"))
+        # conductorDigest (implementation identity) covers the output helper's bytes.
+        with tempfile.TemporaryDirectory() as tmp:
+            scripts = Path(tmp)
+            for name in ("conductor.py", "swift_pipeline_metrics.py", "debug_app_process.py", "conductor_output.py"):
+                (scripts / name).write_bytes((SCRIPT_DIR / name).read_bytes())
+            with mock.patch.object(conductor, "__file__", str(scripts / "conductor.py")):
+                before = conductor.compute_conductor_digest()
+                self.assertEqual(before, conductor.CONDUCTOR_DIGEST)
+                with (scripts / "conductor_output.py").open("a", encoding="utf-8") as handle:
+                    handle.write("\n# changed\n")
+                self.assertNotEqual(conductor.compute_conductor_digest(), before)
+
+    def test_delimiters_and_cr_swallows_one_lf_across_reads(self) -> None:
+        records = split_all([b"a\r", b"\nb\r", b"\r\nc\n\r", b"\n\nd"])
+        self.assertEqual(shape(records), [("a", "cr"), ("b", "cr"), ("", "crlf"), ("c", "lf"), ("", "cr"), ("", "lf"), ("d", "eof")])
+        self.assertEqual([record.seq for record in records], list(range(7)))
+
+    def test_bare_cr_emits_immediately_with_its_receive_time(self) -> None:
+        splitter = OUT.RecordSplitter()
+        self.assertEqual(shape(splitter.feed(b"progress 1\r", 10)), [("progress 1", "cr")])
+        self.assertEqual(splitter.feed(b"\n", 20), [])  # the swallowed LF emits nothing
+        self.assertEqual(splitter.feed(b"\n", 30)[0][1:4], (30, "", "lf"))
+
+    def test_split_utf8_crlf_and_record_completed_by_a_later_read(self) -> None:
+        splitter = OUT.RecordSplitter()
+        self.assertEqual(splitter.feed(b"\xe2\x9c", 1), [])
+        self.assertEqual(splitter.feed(b"\x93 done\r", 2)[0][1:4], (2, "✓ done", "cr"))
+        self.assertEqual(splitter.feed(b"\nx\r", 3)[0][1:4], (3, "x", "cr"))
+        self.assertEqual(splitter.feed(b"\n", 4), [])
+        self.assertEqual(splitter.feed(b"y\r", 5)[0][1:4], (5, "y", "cr"))
+        self.assertEqual(splitter.feed(b"z", 6), [])  # the CR did not swallow a non-LF byte
+        self.assertEqual(splitter.finish(7)[0][1:4], (7, "z", "eof"))
+        self.assertEqual(splitter.finish(8), [])
+
+    def test_bulk_path_equals_the_reference_loop_and_universal_newlines(self) -> None:
+        import random
+
+        rng = random.Random(3)
+        alphabet = [b"a", b"\xc3\xa9", b"\xe2\x9c\x93", b"\xff", b"\r", b"\n", b"\r\n", b"\x1b[31m", b" ", b"\x0c"]
+        for trial in range(40):
+            data = b"".join(rng.choice(alphabet) for _ in range(rng.randrange(1, 30000)))
+            cuts = sorted(rng.sample(range(1, len(data)), min(len(data) - 1, rng.randrange(0, 12)))) if len(data) > 1 else []
+            chunks = [data[start:end] for start, end in zip([0] + cuts, cuts + [len(data)])]
+            with self.subTest(trial=trial):
+                bulk = split_all(chunks)
+                with mock.patch.object(OUT, "_BULK_MIN_BYTES", 1 << 40):
+                    slow = split_all(chunks)
+                self.assertEqual([record[2:] for record in bulk], [record[2:] for record in slow])
+                self.assertEqual([record.seq for record in bulk], list(range(len(bulk))))
+                # Universal-newline text reading (the parent summarizer) splits identically.
+                universal = [line.rstrip("\n") for line in io.TextIOWrapper(io.BytesIO(data), encoding="utf-8", errors="replace")]
+                self.assertEqual([record.text for record in bulk], universal)
+
+    def test_dense_empty_records(self) -> None:
+        records = split_all([b"\n" * 5000, b"\r\n" * 3000, b"\r" * 2000])
+        self.assertEqual(len(records), 10000)
+        self.assertTrue(all(record.text == "" for record in records))
+        self.assertEqual({record.delimiter for record in records}, {"lf", "crlf", "cr"})
+
+    def test_unterminated_multi_megabyte_output_is_capped_with_diagnostics(self) -> None:
+        splitter = OUT.RecordSplitter()
+        payload = bytes(range(32, 127)) * 40000  # ~3.6 MiB, no delimiter
+        for start in range(0, len(payload), OUT.READ_CHUNK_BYTES):
+            self.assertEqual(splitter.feed(payload[start:start + OUT.READ_CHUNK_BYTES], 1), [])
+            self.assertLessEqual(len(splitter._pending), OUT.MAX_PENDING_RECORD_BYTES)
+        record = splitter.feed(b"\nnext\n", 2)[0]
+        self.assertTrue(record.truncated)
+        self.assertEqual(record.text.encode(), payload[: OUT.MAX_PENDING_RECORD_BYTES])
+        self.assertEqual(record.dropped_bytes, len(payload) - OUT.MAX_PENDING_RECORD_BYTES)
+        self.assertEqual(record.suffix.encode(), payload[-OUT.TRUNCATED_SUFFIX_BYTES:])
+        self.assertEqual((splitter.truncated_records, splitter.dropped_bytes), (1, record.dropped_bytes))
+        self.assertEqual(shape(splitter.finish(3)), [])
+        self.assertFalse(OUT.RecordSplitter().feed(b"ok\n", 1)[0].truncated)
+
+    def test_batches_hold_at_most_256_records_and_64_kib_in_order(self) -> None:
+        records = split_all([b"x\n" * 1000 + ("é" * 3000 + "\n").encode() * 60 + b"y" * 200000 + b"\n" + b"z\n" * 10])
+        batches = list(OUT.record_batches(records))
+        self.assertEqual([record for batch in batches for record in batch], records)
+        for batch in batches:
+            self.assertLessEqual(len(batch), OUT.BATCH_MAX_RECORDS)
+            size = sum(len(record.text.encode()) for record in batch)
+            self.assertTrue(size <= OUT.BATCH_MAX_BYTES or len(batch) == 1, size)
+
+
+class Step3TailTests(unittest.TestCase):
+    def test_entries_are_ansi_stripped_capped_and_terminated_except_eof(self) -> None:
+        self.assertEqual(OUT.tail_entry("\x1b[1;31merror\x1b[0m: x\x1b[K"), ("error: x\n", 9))
+        self.assertEqual(OUT.tail_entry("last", terminated=False), ("last", 4))
+        long_entry, size = OUT.tail_entry("é" * 5000)
+        self.assertEqual(size, len(long_entry.encode()))
+        self.assertLessEqual(size, OUT.TAIL_ENTRY_MAX_BYTES)
+        self.assertTrue(long_entry.endswith("…\n"))
+        self.assertTrue(long_entry.startswith("é" * 2000))
+
+    def test_tail_keeps_the_last_30_entries_within_64_kib(self) -> None:
+        tail = OUT.OutputTail()
+        tail.extend_sized(OUT.tail_entry(str(index)) for index in range(100))
+        self.assertEqual(list(tail), [f"{index}\n" for index in range(70, 100)])
+        tail.extend_sized(OUT.tail_entry("w" * 10000) for _ in range(20))
+        self.assertEqual(len(tail), 16)  # 16 * 4 KiB = 64 KiB
+        self.assertEqual(tail.byte_count, sum(len(entry.encode()) for entry in tail))
+        self.assertLessEqual(tail.byte_count, OUT.TAIL_MAX_BYTES)
+
+    def test_system_lines_join_the_same_bounded_tail(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            state = timing_state(Path(tmp), "off")
+            job = timing_job(state, "t")
+            state._pump_output(job.ticket, iter([b"one\r\ntwo", b""]).__next__, io.BytesIO())
+            with state.condition:
+                state._append_tail_locked(job, "\x1b[2mconductor: done\x1b[0m\nsecond")
+            self.assertEqual(list(job.tail), ["one\n", "two", "conductor: done\n", "second"])
+
+
+def xctest_job(state: conductor.DaemonState, ticket: str = "x") -> conductor.Job:
+    job = timing_job(state, ticket, operation="test")
+    job.telemetry = None
+    return job
+
+
+class Step3ReaderTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.state = timing_state(Path(self.tmp.name), "off")
+
+    def pump(self, job: conductor.Job, chunks: list[bytes], stamps: Optional[list[int]] = None) -> bytes:
+        sink = io.BytesIO()
+        reads = iter(chunks)
+        if stamps is None:
+            self.state._pump_output(job.ticket, reads.__next__, sink)
+        else:
+            clock = iter(stamps)
+            with mock.patch.object(conductor.time, "monotonic_ns", side_effect=lambda: next(clock)):
+                self.state._pump_output(job.ticket, reads.__next__, sink)
+        return sink.getvalue()
+
+    def test_passed_and_started_in_one_chunk_apply_both_transitions_in_order(self) -> None:
+        job = xctest_job(self.state)
+        applied: list[tuple] = []
+        original = self.state._apply_xctest_progress_line_locked
+
+        def record(target: Any, line: str, marker: Any, timestamp: float, observed_at: float) -> bool:
+            before = target.xctest_progress_sequence
+            result = original(target, line, marker, timestamp, observed_at)
+            applied.append((line, before, target.xctest_progress_sequence, timestamp))
+            return result
+
+        chunk = (
+            b"Test Case '-[M.S testA]' started.\n"
+            b"\x1b[32mTest Case '-[M.S testA]' passed (0.001 seconds).\x1b[0m\r\n"
+            b"Test Case '-[M.S testB]' started.\n"
+        )
+        with mock.patch.object(self.state, "_apply_xctest_progress_line_locked", side_effect=record):
+            self.pump(job, [chunk, b""], stamps=[7_000_000_000, 9_000_000_000, 9_000_000_000])
+        self.assertEqual([item[0] for item in applied], [
+            "Test Case '-[M.S testA]' started.",
+            "Test Case '-[M.S testA]' passed (0.001 seconds).",
+            "Test Case '-[M.S testB]' started.",
+        ])
+        self.assertEqual([(item[1], item[2]) for item in applied], [(0, 1), (1, 2), (2, 3)])
+        self.assertEqual({item[3] for item in applied}, {7.0})
+        self.assertEqual(job.xctest_started_count, 2)
+        self.assertEqual((job.xctest_current_test, job.xctest_previous_test), ("-[M.S testB]", "-[M.S testA]"))
+        self.assertEqual(job.xctest_deadline_phase, "active-method")
+        self.assertEqual(job.xctest_progress_deadline, 7.0 + job.xctest_active_method_budget_seconds)
+
+    def test_record_split_across_reads_takes_the_completing_reads_time(self) -> None:
+        job = xctest_job(self.state)
+        self.pump(job, [b"Test Case '-[M.S tes", b"tC]' started.\n", b""], stamps=[1_000_000_000, 5_000_000_000, 6_000_000_000])
+        self.assertEqual(job.xctest_current_test, "-[M.S testC]")
+        self.assertEqual(job.xctest_progress_deadline, 5.0 + job.xctest_active_method_budget_seconds)
+
+    def test_delayed_lock_acquisition_keeps_the_receive_time(self) -> None:
+        job = xctest_job(self.state)
+        locked = threading.Event()
+        release = threading.Event()
+
+        def hold() -> None:
+            with self.state.condition:
+                locked.set()
+                release.wait(5)
+
+        reads = iter([b"Build complete! (1s)\nTest Case '-[M.S testD]' started.\n", b""])
+        stamps: list[int] = []
+
+        def read_chunk() -> bytes:
+            chunk = next(reads)
+            if chunk:
+                holder = threading.Thread(target=hold)
+                holder.start()
+                locked.wait(5)
+                threading.Timer(0.3, release.set).start()
+            return chunk
+
+        real = time.monotonic_ns
+
+        def stamp() -> int:
+            value = real()
+            stamps.append(value)
+            return value
+
+        before_wall = time.time()
+        with mock.patch.object(conductor.time, "monotonic_ns", side_effect=stamp):
+            self.state._pump_output(job.ticket, read_chunk, io.BytesIO())
+        self.assertGreaterEqual(real() - stamps[0], 250_000_000)  # the lock really was delayed
+        self.assertEqual(job.xctest_progress_deadline, stamps[0] / 1e9 + job.xctest_active_method_budget_seconds)
+        self.assertLess(job.xctest_last_progress_observed_at - before_wall, 0.2)
+
+    def test_reader_error_flushes_the_pending_record_through_progress(self) -> None:
+        job = xctest_job(self.state)
+        reads = iter([b"x\nTest Case '-[M.S testE]' started."])
+
+        def read_chunk() -> bytes:
+            try:
+                return next(reads)
+            except StopIteration:
+                raise OSError("reader failed")
+
+        with self.assertRaises(OSError):
+            self.state._pump_output(job.ticket, read_chunk, io.BytesIO())
+        self.assertEqual(job.xctest_current_test, "-[M.S testE]")
+        # (A diagnostic system line about the absent runtime ledger may follow.)
+        self.assertEqual(list(job.tail)[:2], ["x\n", "Test Case '-[M.S testE]' started."])
+
+    def test_raw_log_is_byte_identical_and_lock_is_taken_once_per_batch(self) -> None:
+        import random
+
+        rng = random.Random(11)
+        data = b"".join(rng.choice([b"line\n", b"\r", b"\r\n", b"\xe2\x9c\x93", b"\x1b[1m", b"\xff", b"x" * 300]) for _ in range(20000))
+        chunks = [data[start:start + 4093] for start in range(0, len(data), 4093)] + [b""]
+        job = xctest_job(self.state)
+        entries: list[int] = []
+        notifies: list[int] = []
+        inner = self.state.condition
+
+        class Counting:
+            def __enter__(self) -> Any:
+                entries.append(1)
+                return inner.__enter__()
+
+            def __exit__(self, *exc: Any) -> Any:
+                return inner.__exit__(*exc)
+
+            def notify_all(self) -> None:
+                notifies.append(1)
+                inner.notify_all()
+
+        records = split_all(chunks[:-1])
+        self.state.condition = Counting()  # type: ignore[assignment]
+        try:
+            raw = self.pump(job, chunks)
+        finally:
+            self.state.condition = inner
+        self.assertEqual(raw, data)
+        splitter = OUT.RecordSplitter()
+        expected_batches = 0
+        for chunk in chunks[:-1]:
+            expected_batches += len(list(OUT.record_batches(splitter.feed(chunk, 0))))
+        expected_batches += len(list(OUT.record_batches(splitter.finish(0))))
+        self.assertEqual(len(notifies), expected_batches)
+        self.assertEqual(len(entries), expected_batches + 1)  # plus the one watchdog check
+        self.assertEqual(list(job.tail), [entry for entry, _size in OUT.tail_entries(records)][-30:])
+
+
+SUMMARY_PRECHECK_LINES = [
+    "ERROR: x", "error: lower", "something FAILED", "x failed with 2", "process exited with status 3", "fatal error: y",
+    "Traceback (most recent call last):", "ValueError Exception", "Permission denied", "No such file or directory",
+    "it timed out", "killing process group 1", "terminating process tree 2", "Killing Process Tree 3",
+    "a.swift:1:2: error: bad", "error: emit-module command failed", "Command SwiftCompile failed", "Command CompileSwift failed",
+    "a.swift:3:4: warning: w", "WARNING: upper", "Warning: mixed", "Test Case '-[A b]' failed (0.1 seconds).", "XCTAssertEqual failed",
+    "x.swift:1: error: -[ATest t] : XCTAssert", "Executed 3 tests, with 1 failure (0 unexpected) in 0.1 seconds",
+    "Failing tests:", "error: Exited with unexpected signal code 11", "error: terminated(1)", "SwiftFormat failed", "SwiftLint", "linting",
+    "Missing required tool swiftformat", "Run 'make install-format-tools'", "ERROR: Missing required Swift style tools",
+    "timed out after 10s", "XCTest STARTUP deadline triggered", "canceled", "CANCELED by user", "==> phase", "$ make", "+ step",
+    "Created: x", "APP_BUNDLE=/a", "COMPAT_APP_BUNDLE=/b", "CLI_PATH=/c", "Output written to: d", "Agent Mode diagnostics enabled",
+    "Resolved rpce-cli-debug: e", "Build cache diagnostics", "Current .build: f", "Managed worktree container: g",
+    "Worktree .build total: h", "Top .build directories: i", "   12.5 GiB  .build", "\t3 KB x",
+    "Stopping existing RepoPrompt", "Waiting for existing RepoPrompt", "Launching /x/RepoPrompt.app", "Confirming launched RepoPrompt",
+    "Observed launched RepoPrompt", "Guarding against a delayed RepoPrompt", "Delayed launch guard confirmed",
+    "RepoPrompt CE debug app stop confirmed", "RepoPrompt stop confirmed", "RepoPrompt was not running", "RepoPrompt was already stopped",
+    "terminating process group 7", "Terminating Process Group 8",
+    "input file 'a.swift' was modified during the build", "INPUT FILE b WAS MODIFIED DURING THE BUILD",
+    "plain line", "", "ERRORS: none", "failedness", "   ", "Ｅrror: fullwidth", "ﬁle error： full colon", "KILLING PROCESS GROUP 4",
+    "timed out after 3s (killing process tree 9)", "KILLING process group 5", "ſwiftformat", "résumé error: é", "日本 warning: 語",
+]
+
+
+class Step3SummaryTests(unittest.TestCase):
+    def test_summary_version_is_2(self) -> None:
+        self.assertEqual(conductor.SUMMARY_VERSION, 2)
+        summary = summarize("build", "failed", 1, ["error: x"])
+        self.assertEqual(summary["version"], 2)
+        self.assertEqual((summary["deduplicationLimited"], summary["omittedLineCountQuality"]), (False, "exact"))
+
+    def test_keyword_precheck_equals_unconditional_matching(self) -> None:
+        lines = SUMMARY_PRECHECK_LINES + [line.lower() for line in SUMMARY_PRECHECK_LINES] + [line.upper() for line in SUMMARY_PRECHECK_LINES]
+        for operation in ("build", "lint", "test", "app"):
+            for state, exit_code in (("completed", 0), ("failed", 1)):
+                with self.subTest(operation=operation, state=state):
+                    for single in lines:
+                        prechecked = summarize(operation, state, exit_code, [single])
+                        with mock.patch.object(conductor.OutputSummarizer, "KEYWORD_PRECHECK", False):
+                            unconditional = summarize(operation, state, exit_code, [single])
+                        self.assertEqual(prechecked, unconditional, single)
+                    prechecked = summarize(operation, state, exit_code, lines)
+                    with mock.patch.object(conductor.OutputSummarizer, "KEYWORD_PRECHECK", False):
+                        self.assertEqual(prechecked, summarize(operation, state, exit_code, lines))
+
+    def test_streamed_file_summary_equals_universal_newline_lines(self) -> None:
+        data = "\r\n".join(SUMMARY_PRECHECK_LINES).encode() + b"\rprogress\r\n\xff tail"
+        with tempfile.TemporaryDirectory() as tmp:
+            log = Path(tmp) / "job.log"
+            log.write_bytes(data)
+            streamed = conductor.OutputSummarizer.summarize_file("build", {}, "failed", 1, False, log)
+            with log.open("r", encoding="utf-8", errors="replace") as handle:
+                reference = conductor.OutputSummarizer.summarize_lines("build", {}, "failed", 1, False, handle)
+        self.assertEqual(streamed, reference)
+
+    def test_seen_is_bounded_at_one_million_unique_records(self) -> None:
+        builder = conductor.SummarySectionBuilder("Failure highlights", 10)
+        for index in range(1_000_000):
+            builder.add(f"error: {index}")
+        self.assertEqual(len(builder.seen), conductor.SUMMARY_SEEN_MAX_ENTRIES)
+        payload = builder.payload()
+        self.assertTrue(payload["deduplicationLimited"])
+        self.assertEqual(payload["omittedLineCountQuality"], "upper_bound")
+        self.assertEqual(payload["omittedLineCount"], 1_000_000 - 10)  # all unique: the bound is exact here
+        self.assertEqual(payload["lines"], [f"error: {index}" for index in range(10)])
+
+    def test_dedup_is_exact_before_saturation_and_flags_after(self) -> None:
+        lines = [f"error: {index % 6}" for index in range(60)]
+        with mock.patch.object(conductor, "SUMMARY_SEEN_MAX_ENTRIES", 6):
+            exact = summarize("build", "failed", 1, lines)
+        self.assertFalse(exact["deduplicationLimited"])
+        with mock.patch.object(conductor, "SUMMARY_SEEN_MAX_ENTRIES", 10**9):
+            self.assertEqual(exact, summarize("build", "failed", 1, lines))
+        with mock.patch.object(conductor, "SUMMARY_SEEN_MAX_ENTRIES", 3):
+            limited = summarize("build", "failed", 1, lines)
+        self.assertTrue(limited["deduplicationLimited"])
+        # The top-level count (log lines minus rendered lines) stays exact; sections carry the bound.
+        self.assertEqual(limited["omittedLineCountQuality"], "exact")
+        failures = next(item for item in limited["sections"] if item["title"] == "Failure highlights")
+        exact_failures = next(item for item in exact["sections"] if item["title"] == "Failure highlights")
+        self.assertEqual(failures["omittedLineCountQuality"], "upper_bound")
+        self.assertFalse(failures["displayedLinesMayRepeat"])  # first-lines sections never evict
+        self.assertEqual(failures["lines"], exact_failures["lines"])
+        self.assertGreaterEqual(failures["omittedLineCount"], exact_failures["omittedLineCount"])
+
+
+class Step3SummarySingleFlightTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.state = timing_state(Path(self.tmp.name), "off")
+        self.job = timing_job(self.state, "s")
+        self.job.log_path.write_bytes(b"error: boom\n")
+        self.job.state = "failed"
+        self.job.exit_code = 1
+
+    def test_racing_status_wait_and_completion_scan_once(self) -> None:
+        gate = threading.Event()
+        calls: list[int] = []
+        real = conductor.OutputSummarizer.summarize_file
+
+        def slow(*args: Any) -> dict:
+            calls.append(1)
+            gate.wait(5)
+            return real(*args)
+
+        results: dict = {}
+        with mock.patch.object(conductor.OutputSummarizer, "summarize_file", side_effect=slow):
+            threads = [threading.Thread(target=lambda: self.state._refresh_output_summary(self.job, complete_telemetry=True))]
+            threads[0].start()
+            deadline = time.monotonic() + 5
+            while not calls and time.monotonic() < deadline:
+                time.sleep(0.005)
+            self.assertEqual(self.job.summary_state, "running")
+            threads.append(threading.Thread(target=lambda: results.__setitem__("status", self.state.job_status("s", None))))
+            threads.append(threading.Thread(target=lambda: results.__setitem__("wait", self.state.job_wait("s", None, None))))
+            for thread in threads[1:]:
+                thread.start()
+            started = time.monotonic()
+            self.state._refresh_output_summary(self.job, deadline=conductor.now() + 0.1)
+            self.assertLess(time.monotonic() - started, 2.0)  # a joiner honors its own deadline
+            self.assertIsNone(self.job.output_summary)
+            gate.set()
+            for thread in threads:
+                thread.join(10)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(self.job.summary_state, "complete")
+        self.assertTrue(self.job.summary_event.is_set())
+        self.assertEqual(results["status"]["outputSummary"], self.job.output_summary)
+        self.assertEqual(results["wait"]["outputSummary"], self.job.output_summary)
+        self.assertIn("error: boom", section(self.job.output_summary, "Failure highlights"))
+        self.state._refresh_output_summary(self.job)
+        self.assertEqual(len(calls), 1)
+
+    def test_exception_publishes_a_minimal_error_summary_and_releases_the_claim(self) -> None:
+        with mock.patch.object(conductor.OutputSummarizer, "summarize_file", side_effect=RuntimeError("scan broke")):
+            payload = self.state.job_wait("s", None, 5.0)
+        self.assertEqual(self.job.summary_state, "failed")
+        self.assertTrue(self.job.summary_event.is_set())
+        self.assertIn("summary failed: RuntimeError: scan broke", json.dumps(payload["outputSummary"]))
+        self.assertEqual(payload["outputSummary"]["deduplicationLimited"], False)
+        self.assertEqual(payload["outputSummary"]["omittedLineCountQuality"], "exact")
+
+
+def reference_progress_lines(text: str) -> list[tuple[str, Any]]:
+    """The parent's per-line XCTest normalization over one complete decoded line/record."""
+    items = []
+    for raw_line in text.splitlines():
+        line = conductor.XCTEST_ANSI_SGR_RE.sub("", raw_line).strip()
+        marker = conductor.XCTEST_PROGRESS_RE.match(line)
+        if marker is not None or "Build complete!" in line:
+            items.append((line, None if marker is None else marker.groups()))
+    return items
+
+
+def reference_scan(text: str) -> tuple[list[tuple[str, Any]], Optional[str]]:
+    """OD16 over one over-cap record: the parent's items, or the bound it fails at.
+
+    A normalized line over ``SEGMENT_MAX_CHARS`` that the parent would match as
+    a marker fails with ``"segment"``; more than ``SEGMENT_MAX_PENDING_ITEMS``
+    items fail with ``"pending"``. Either way no item survives. Over the bound,
+    a non-marker line is only its ``Build complete!`` substring test.
+    """
+    items: list = []
+    for raw_line in text.splitlines():
+        line = conductor.XCTEST_ANSI_SGR_RE.sub("", raw_line).strip()
+        marker = conductor.XCTEST_PROGRESS_RE.match(line)
+        if len(line) > OUT.SEGMENT_MAX_CHARS:
+            if marker is not None:
+                return [], "segment"
+            if "Build complete!" in line:
+                items.append(("Build complete!", None))
+        elif marker is not None or "Build complete!" in line:
+            items.append((line, None if marker is None else marker.groups()))
+        if len(items) > OUT.SEGMENT_MAX_PENDING_ITEMS:
+            return [], "pending"
+    return items, None
+
+
+def scanned_items(data: bytes, chunk: int) -> tuple[list[tuple[str, Any]], Optional[str]]:
+    """Every item one over-cap record yields through the splitter, and its OD16 failure."""
+    splitter = OUT.RecordSplitter(segment_scanner=conductor._xctest_segment_scanner)
+    items: list = []
+    for start in range(0, len(data), chunk):
+        for record in splitter.feed(data[start:start + chunk], 0):
+            items.extend(record.segment_items)
+    for record in splitter.finish(0):
+        items.extend(record.segment_items)
+    failure = splitter.segment_failure
+    if failure is not None:
+        assert failure[1] == 0, failure  # the record being scanned
+    return (
+        [(line, None if marker is None else marker.groups()) for line, marker in items],
+        None if failure is None else failure[0],
+    )
+
+
+class Step3OverCapProgressTests(unittest.TestCase):
+    """S3-R0-03: XCTest progress in records beyond the 64 KiB cap is classified before truncation."""
+
+    PASS_A = b"Test Case '-[M.S testA]' started.\nTest Case '-[M.S testA]' passed (0.1 seconds).\n"
+    START_B = b"Test Case '-[M.S testB]' started."
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.state = timing_state(Path(self.tmp.name), "off")
+
+    def pump(self, chunks: list[bytes], stamps: Optional[list[int]] = None) -> tuple[conductor.Job, bytes, list[tuple]]:
+        job = xctest_job(self.state)
+        applied: list[tuple] = []
+        original = self.state._apply_xctest_progress_line_locked
+
+        def record(target: Any, line: str, marker: Any, timestamp: float, observed_at: float) -> bool:
+            result = original(target, line, marker, timestamp, observed_at)
+            applied.append((line, target.xctest_progress_sequence, timestamp))
+            return result
+
+        sink = io.BytesIO()
+        reads = iter(chunks + [b""])
+        with mock.patch.object(self.state, "_apply_xctest_progress_line_locked", side_effect=record):
+            if stamps is None:
+                self.state._pump_output(job.ticket, reads.__next__, sink)
+            else:
+                clock = iter(stamps)
+                with mock.patch.object(conductor.time, "monotonic_ns", side_effect=lambda: next(clock)):
+                    self.state._pump_output(job.ticket, reads.__next__, sink)
+        return job, sink.getvalue(), applied
+
+    def assert_b_active(self, job: conductor.Job, applied: list[tuple], read_time: Optional[float] = None) -> None:
+        self.assertEqual(job.xctest_current_test, "-[M.S testB]")
+        self.assertEqual(job.xctest_previous_test, "-[M.S testA]")
+        self.assertEqual(job.xctest_deadline_phase, "active-method")
+        self.assertEqual(job.xctest_started_count, 2)
+        self.assertEqual(job.xctest_progress_sequence, 3)
+        self.assertEqual([line for line, _seq, _ts in applied if "testB" in line], [self.START_B.decode()])
+        if read_time is not None:
+            self.assertEqual(job.xctest_progress_deadline, read_time + job.xctest_active_method_budget_seconds)
+
+    def test_over_cap_whitespace_ansi_and_separators_keep_the_transition(self) -> None:
+        cases = {
+            "spaces": b" " * 65536 + self.START_B + b"\n",
+            "tabs-and-unicode-spaces": ("\t\u3000\xa0" * 30000).encode() + self.START_B + b"   \n",
+            "ansi": b"\x1b[0m" * 20000 + self.START_B + b"\n",
+            "ansi-between-spaces": b" \x1b[1;32m " * 12000 + self.START_B + b"\x1b[0m" * 9000 + b"\n",
+            "long-sgr-parameters": b"\x1b[" + b"1" * 70000 + b"m" + self.START_B + b"\n",
+            "trailing-spaces": self.START_B + b" " * 70000 + b"\n",
+        }
+        for separator in ("\x0b", "\x0c", "\x1c", "\x1d", "\x1e", "\x85", "\u2028", "\u2029"):
+            cases[f"after-{ord(separator):#x}"] = b"x" * 70000 + separator.encode() + self.START_B + b"\n"
+        for name, data in cases.items():
+            for chunk in (13, 1021, 4096, 65536):
+                chunks = [data[index:index + chunk] for index in range(0, len(data), chunk)]
+                with self.subTest(case=name, chunk=chunk):
+                    job, raw, applied = self.pump([self.PASS_A] + chunks)
+                    self.assertEqual(raw, self.PASS_A + data)  # raw bytes unchanged
+                    self.assert_b_active(job, applied)
+                    # The tail entry is the OD7 entry of the whole record, not of its kept bytes.
+                    self.assertEqual(job.tail[-1], OUT.tail_entry(data[:-1].decode("utf-8", errors="replace"))[0])
+
+    def test_segment_of_an_over_cap_record_takes_the_completing_reads_time_in_order(self) -> None:
+        # A long record whose B marker ends at an embedded separator while the record
+        # itself stays pending: like the parent's per-line application at the LF, B
+        # applies when the record completes, with that read's time, after A.
+        data = b"y" * 70000 + b"\x0b" + self.START_B + b"\x0bz"
+        reads = [self.PASS_A, data[:65000], data[65000:], b"" + b"w" * 10, b"\nTest Case '-[M.S testB]' passed (1 seconds).\n"]
+        stamps = [1_000_000_000, 2_000_000_000, 3_000_000_000, 4_000_000_000, 5_000_000_000, 6_000_000_000]
+        job, raw, applied = self.pump(reads, stamps=stamps)
+        self.assertEqual(raw, b"".join(reads))
+        self.assertEqual([(line, seq) for line, seq, _ts in applied], [
+            ("Test Case '-[M.S testA]' started.", 1),
+            ("Test Case '-[M.S testA]' passed (0.1 seconds).", 2),
+            ("Test Case '-[M.S testB]' started.", 3),
+            ("Test Case '-[M.S testB]' passed (1 seconds).", 4),
+        ])
+        self.assertEqual([ts for _line, _seq, ts in applied], [1.0, 1.0, 5.0, 5.0])
+        self.assertEqual((job.xctest_current_test, job.xctest_deadline_phase), (None, "between-method"))
+
+    def test_segment_started_before_the_cap_applies_when_the_record_completes(self) -> None:
+        data = self.START_B + b"\x0b" + b"q" * 70000
+        job, _raw, applied = self.pump([self.PASS_A, data[:2000], data[2000:], b"\n"],
+                                       stamps=[1_000_000_000, 2_000_000_000, 3_000_000_000, 4_000_000_000, 5_000_000_000])
+        self.assert_b_active(job, applied, read_time=4.0)
+
+    def assert_od16_failure(self, job: conductor.Job, boundary: str, record_seq: int) -> None:
+        """The job is failed visibly with a bounded reason that echoes no output."""
+        reason = job.xctest_output_failure or ""
+        self.assertTrue(reason.startswith("XCTest output contract failure (OD16): "), reason)
+        self.assertLess(len(reason), 300)
+        for echoed in ("nnnn", "9999", "qqqq", "-[M.S t"):
+            self.assertNotIn(echoed, reason)
+        self.assertTrue(job.measurement_invalid)
+        self.assertEqual(job.error, reason)
+        self.assertIn(reason + "\n", list(job.tail))
+        diagnostic = job.diagnostics[-1]
+        self.assertEqual(
+            {key: diagnostic[key] for key in ("kind", "boundary", "recordSeq", "limit")},
+            {
+                "kind": "xctest-output-contract",
+                "boundary": boundary,
+                "recordSeq": record_seq,
+                "limit": OUT.SEGMENT_MAX_CHARS if boundary == "segment" else OUT.SEGMENT_MAX_PENDING_ITEMS,
+            },
+        )
+        # It finalizes as failed even when the child exits 0.
+        with self.state.condition:
+            self.state._finalize_process_exit_locked(job, 0)
+        self.assertEqual((job.state, job.exit_code), ("failed", conductor.XCTEST_STALL_FAILURE_EXIT_CODE))
+        self.assertEqual(job.result_summary, reason)
+
+    def assert_no_od16_failure(self, job: conductor.Job) -> None:
+        self.assertIsNone(job.xctest_output_failure)
+        self.assertFalse(job.measurement_invalid)
+        self.assertEqual(job.diagnostics, [])
+
+    def test_pending_items_up_to_the_bound_wait_for_the_record_and_one_more_fails_the_job(self) -> None:
+        # D2b (16 items) keeps normal semantics; D2c (17) fails visibly, applying none early.
+        bound = OUT.SEGMENT_MAX_PENDING_ITEMS
+        start_a = b"Test Case '-[M.S testA]' started.\n"
+        for count in (bound, bound + 1):
+            for terminator in (b"\n", b""):
+                with self.subTest(count=count, eof_without_newline=not terminator):
+                    markers = b"".join(b"\x0bTest Case '-[M.S t%d]' started." % index for index in range(count))
+                    data = b"q" * 70000 + markers + b"\x0b"
+                    stamps = [1_000_000_000, 2_000_000_000, 3_000_000_000, 4_000_000_000, 5_000_000_000]
+                    reads = [start_a, data, b"tail" + terminator]
+                    job, raw, applied = self.pump(reads, stamps=stamps)
+                    self.assertEqual(raw, b"".join(reads))
+                    started = [(line, ts) for line, _seq, ts in applied if "testA" not in line]
+                    if count == bound:
+                        self.assert_no_od16_failure(job)
+                        self.assertEqual([line for line, _ts in started],
+                                         [f"Test Case '-[M.S t{index}]' started." for index in range(count)])
+                        # Every item takes the completing read's time (3.0), or EOF's (4.0).
+                        self.assertEqual({ts for _line, ts in started}, {3.0 if terminator else 4.0})
+                        self.assertEqual(job.xctest_current_test, f"-[M.S t{count - 1}]")
+                        self.assertEqual(job.xctest_progress_sequence, 1 + count)
+                    else:
+                        self.assertEqual(started, [])
+                        self.assertEqual((job.xctest_current_test, job.xctest_progress_sequence), ("-[M.S testA]", 1))
+                        self.assert_od16_failure(job, "pending", 1)
+
+    def test_over_cap_tail_entries_equal_the_whole_record_entry(self) -> None:
+        import random
+
+        rng = random.Random(41)
+        pieces = [
+            b"\x1b[0m", b"\x1b[1;31m", b"\x1b[", b"1;", b"!", b"m", b"\x1b", b"\x1bA", b"\x1b[", b"[31m", b"Z",
+            b"\xe2\x9c\x93", b"\xe2\x9c", b"\xff", b"text ", b"\xc3\xa9" * 7, b"\x1b[" + b"2;" * 900,
+        ]
+        for trial in range(40):
+            body = bytearray()
+            target = 66000 + trial * 977
+            while len(body) < target:
+                body += rng.choice(pieces) if rng.random() < 0.97 else b"v" * rng.randrange(1, 6000)
+            body = bytes(body).replace(b"\r", b"").replace(b"\n", b"")
+            for terminator in (b"\n", b""):
+                data = body + terminator
+                expected = OUT.tail_entry(body.decode("utf-8", errors="replace"), terminated=bool(terminator))
+                for chunk in (509, 4096, 65536):
+                    with self.subTest(trial=trial, terminated=bool(terminator), chunk=chunk):
+                        records = split_all([data[i:i + chunk] for i in range(0, len(data), chunk)])
+                        self.assertEqual(len(records), 1)
+                        self.assertTrue(records[0].truncated)
+                        self.assertEqual(OUT.tail_entries(records), [expected])
+
+    def test_build_complete_in_an_over_bound_segment_starts_the_startup_deadline(self) -> None:
+        data = b"z" * 40000 + b"Build complete! (3s)" + b"z" * 40000 + b"\n"
+        job, _raw, applied = self.pump([data[:30000], data[30000:]], stamps=[1_000_000_000, 2_000_000_000, 3_000_000_000])
+        self.assertEqual(job.xctest_deadline_phase, "startup")
+        self.assertEqual(job.xctest_progress_deadline, 2.0 + conductor.XCTEST_STARTUP_DEADLINE_SECONDS)
+        self.assertEqual(job.xctest_progress_sequence, 0)
+        self.assertEqual([line for line, _seq, _ts in applied], ["Build complete!"])
+
+    def test_build_complete_split_across_reads_in_an_over_bound_segment(self) -> None:
+        data = b"z" * 70000 + b"Build complete! (3s)" + b"z" * 10 + b"\n"
+        for split in range(70000, 70016):
+            with self.subTest(split=split):
+                job, _raw, applied = self.pump([data[:split], data[split:]])
+                self.assertEqual(job.xctest_deadline_phase, "startup")
+                self.assertEqual([line for line, _seq, _ts in applied], ["Build complete!"])
+
+    @staticmethod
+    def bounded_marker(kind: str, chars: int) -> str:
+        """A marker whose normalized line has ``chars`` characters (D1b name / D1a parenthetical)."""
+        if kind == "name":
+            line = "Test Case '-[M.S t" + "n" * (chars - 29) + "]' started."
+        else:
+            line = "Test Case '-[M.S testA]' passed (" + "9" * (chars - 35) + ")."
+        assert len(line) == chars
+        return line
+
+    def test_marker_lines_at_the_segment_bound_apply_and_beyond_it_fail_the_job(self) -> None:
+        bound = OUT.SEGMENT_MAX_CHARS
+        start_a = b"Test Case '-[M.S testA]' started.\n"
+        for kind in ("name", "parenthetical"):
+            for chars in (bound, bound + 1):
+                for decoration, terminator in (((b"", b""), b"\n"), ((b"\x1b[1m  ", b"\x1b[0m \t"), b""), ((b"", b""), b"")):
+                    line = self.bounded_marker(kind, chars).encode()
+                    data = decoration[0] + line + decoration[1] + terminator
+                    for chunk in (977, 4093, 65536):
+                        with self.subTest(kind=kind, chars=chars, decorated=bool(decoration[0]),
+                                          eof_without_newline=not terminator, chunk=chunk):
+                            chunks = [data[i:i + chunk] for i in range(0, len(data), chunk)]
+                            job, raw, applied = self.pump([start_a] + chunks)
+                            self.assertEqual(raw, start_a + data)
+                            # The tail entry is still the whole-record entry.
+                            self.assertEqual(job.tail[-1], OUT.tail_entry(
+                                (data[:-1] if terminator else data).decode(), terminated=bool(terminator))[0])
+                            if chars == bound:
+                                self.assert_no_od16_failure(job)
+                                self.assertEqual(job.xctest_progress_sequence, 2)
+                                self.assertEqual(applied[-1][0], line.decode())
+                                self.assertEqual(job.xctest_current_test,
+                                                 line.decode()[11:-10] if kind == "name" else None)
+                            else:
+                                self.assertEqual([entry[1] for entry in applied], [1])  # testA only
+                                self.assertEqual(job.xctest_current_test, "-[M.S testA]")
+                                self.assert_od16_failure(job, "segment", 1)
+
+    def test_over_bound_marker_shape_equals_the_parent_regex(self) -> None:
+        # OD16 D1 trigger precision: a stripped line over the bound fails exactly when
+        # the parent's ``XCTEST_PROGRESS_RE`` would match it, never for other text.
+        import random
+
+        rng = random.Random(16)
+        big = 70000
+        lines = [
+            "Test Case '" + "x" * big + "' started.",
+            "Test Case '" + "x" * big + "' skipped.",
+            "Test Case '-[M.S t]' failed (" + "9" * big + ").",
+            "Test Case 'a' started (" + "9" * big + ").",
+            "Test Case '" + "x" * big + "' started ().",
+            "Test Case '" + "x" * big + "' passed (1) x' failed (2).",
+            "Test Case '" + "(" * big + "' started.",
+            "Test Case '" + ")" * big + "' started (x).",
+            "Test Case '" + "' started (" * 9000 + "x).",
+            "Test Case 'x' passed (" + "((" * (big // 2) + ").",
+            "Test Case '" + "x" * big + "' started.\x1b[0m",
+            "\x1b[1mTest \x1b[0mCase '" + "x" * big + "' passed\x1b[32m (1s).",
+            "Test Case '" + " " * big + "x' started.",
+            "Test Case '" + "x" * big,
+            "Test Case 'x' started" + " y" * (big // 2),
+            "x" * big + "' started.",
+            "Test Case '" + "x" * big + "' started",
+            "Test Case '" + "x" * big + "' started. done",
+            "Test Case '-[M.S t]' passed (" + "9" * big + ")",
+            "Test Case '-[M.S t]' passed (" + "9" * big + ") x).",
+            "Test Case '-[M.S t]' passed (" + "9" * big + "x.",
+            "Test Case '' started (" + "9" * big + ").",
+            "Test Case '' started." + " " * big,
+            "Test case '" + "x" * big + "' started.",
+            "xTest Case '" + "x" * big + "' started.",
+            "Test Case '" + "x" * big + "' Started.",
+            "Test Case '" + "x" * big + "'  started.",
+            "Test Case '" + "x" * big + "' started (1) (2).",
+            "Test Case '" + "x" * big + "' started (1)).",
+            "Test Case '\x1b[" + "1" * big + "' started.",
+            "Test Case 'q\x1b[" + "1" * big + "' started.",
+            "Test Case 'q' started (\x1b[" + "1" * big + ").",
+            "\x1b[" + "1" * big + "Test Case 'q' started.",
+        ]
+        tokens = ["'", " ", "(", ")", ".", "x", "' started", "' passed", " (", ").", "Test Case '", "\x1b[1m", "\t"]
+        for _ in range(160):
+            parts = [rng.choice(["Test Case '", "Test Case '", " Test Case '", "Test Case "])]
+            parts += [rng.choice(tokens) for _ in range(rng.randrange(0, 8))]
+            parts.append(rng.choice(["' started", "' passed", "' failed", "' skipped", "' start"]))
+            parts += [rng.choice(["", " (", " (1s)", " (", "("])]
+            parts += [rng.choice(tokens) for _ in range(rng.randrange(0, 4))]
+            parts.append(rng.choice([".", ").", "", ". ", ".x"]))
+            filler = rng.choice(["x", "9", " ", "(", ")", "'"]) * big
+            parts.insert(rng.randrange(1, len(parts) + 1), filler)
+            lines.append("".join(parts))
+        outcomes = {True: 0, False: 0}
+        for index, line in enumerate(lines):
+            normalized = conductor.XCTEST_ANSI_SGR_RE.sub("", line).strip()
+            expected = len(normalized) > OUT.SEGMENT_MAX_CHARS and conductor.XCTEST_PROGRESS_RE.match(normalized) is not None
+            outcomes[expected] += 1
+            data = ("q\x0b" + line + "\x0bq").encode()
+            for chunk in ((7, 4093, 65536) if index < 33 else (4093,)):
+                with self.subTest(index=index, chunk=chunk):
+                    items, failure = scanned_items(data, chunk)
+                    self.assertEqual(failure, "segment" if expected else None)
+                    if not expected:
+                        self.assertEqual((items, failure), reference_scan(data.decode()))
+        self.assertGreater(outcomes[True], 20, outcomes)
+        self.assertGreater(outcomes[False], 20, outcomes)
+
+    def test_large_non_marker_records_never_fail_the_job(self) -> None:
+        records = [
+            b"Test Case '" + b"x" * 200000 + b"\n",
+            b"Test Case '-[M.S t]' passed (" + b"9" * 200000 + b") x).\n",
+            b"y" * 70000 + (b"Test Case '" * 2000) + b"\n",
+            b"\x1b[31m" * 30000 + b"error: " + b"z" * 70000 + b"\n",
+            b"x" * 100000 + b"' started.\n",
+        ]
+        for chunk in (4093, 65536):
+            with self.subTest(chunk=chunk):
+                data = b"".join(records) + b"Test Case '-[M.S testZ]' started.\n"
+                job, raw, applied = self.pump([data[i:i + chunk] for i in range(0, len(data), chunk)])
+                self.assertEqual(raw, data)
+                self.assert_no_od16_failure(job)
+                self.assertEqual([line for line, _seq, _ts in applied], ["Test Case '-[M.S testZ]' started."])
+                self.assertEqual(job.xctest_current_test, "-[M.S testZ]")
+
+    def test_records_before_the_failure_keep_transitions_and_later_records_feed_only_the_tail(self) -> None:
+        markers = b"".join(b"\x0bTest Case '-[M.S t%d]' started." % index for index in range(17))
+        later = b"Test Case '-[M.S testZ]' started.\n"
+        data = b"Test Case '-[M.S testA]' started.\n" + b"q" * 70000 + markers + b"\n" + later
+        for chunk in (len(data), 4096):
+            with self.subTest(chunk=chunk):
+                job, raw, applied = self.pump([data[i:i + chunk] for i in range(0, len(data), chunk)])
+                self.assertEqual(raw, data)
+                self.assertEqual([line for line, _seq, _ts in applied], ["Test Case '-[M.S testA]' started."])
+                self.assertEqual(job.tail[-1], later.decode())  # classification stopped; the tail did not
+                self.assert_od16_failure(job, "pending", 1)
+
+    def test_marker_shape_and_failed_scanners_stay_bounded(self) -> None:
+        scanner = conductor._xctest_segment_scanner()
+        piece = ("' started (" + "x" * 4000 + ") " + " " * 3000).encode()
+        scanner.feed(b"Test Case '")
+        for _ in range(300):  # about 2 MiB in one segment
+            scanner.feed(piece)
+            self.assertLessEqual(len(scanner._shape_end), 16)
+            self.assertLessEqual(len(scanner._shape_spaces), 16)
+            self.assertLessEqual(len(scanner._run_tail), 10)
+            self.assertEqual(len(scanner._shape_head), 12)
+            self.assertLessEqual(sum(map(len, scanner._content)), OUT.SEGMENT_MAX_CHARS)
+        self.assertEqual(scanner._content, [])  # over the bound: no content kept
+        self.assertEqual(scanner.finish(), [])
+        self.assertIsNone(scanner.failure)  # ends with ") " stripped to ")": no final dot
+        # A failed splitter scans no further record and keeps no items.
+        splitter = OUT.RecordSplitter(segment_scanner=conductor._xctest_segment_scanner)
+        markers = b"".join(b"\x0bTest Case '-[M.S t%d]' started." % index for index in range(17))
+        records = splitter.feed(b"q" * 70000 + markers, 0)
+        self.assertEqual((records, splitter.segment_failure), ([], None))  # the 17th segment has not ended
+        records = splitter.feed(b"\x0b", 0)
+        self.assertEqual((records, splitter.segment_failure), ([], ("pending", 0)))
+        self.assertIsNone(splitter._scanner)
+        self.assertIsNone(splitter._scanner_factory)
+        records = splitter.feed(b"\n" + b"q" * 70000 + b"\x0bTest Case '-[M.S t]' started.\n", 0)
+        self.assertEqual([(record.truncated, record.segment_items) for record in records], [(True, ()), (True, ())])
+        self.assertEqual(splitter.segment_failure, ("pending", 0))
+
+    def test_summaries_never_classify_or_fail(self) -> None:
+        # Summary-only reading has no scanner: OD16 inputs summarize like any text.
+        log = Path(self.tmp.name) / "od16.log"
+        markers = b"".join(b"\x0bTest Case '-[M.S t%d]' started." % index for index in range(17))
+        log.write_bytes(
+            self.bounded_marker("parenthetical", OUT.SEGMENT_MAX_CHARS + 1).encode() + b"\n"
+            + b"q" * 70000 + markers + b"\nerror: boom\n"
+        )
+        for state, exit_code in (("completed", 0), ("failed", 1)):
+            with self.subTest(state=state):
+                summary = conductor.OutputSummarizer.summarize_file("test", {}, state, exit_code, False, log)
+                self.assertNotIn("OD16", json.dumps(summary))
+                with contextlib.redirect_stdout(io.StringIO()):
+                    conductor.render_output_summary(summary)
+        self.assertEqual(len(list(OUT.iter_file_texts(log, over_cap=str, visible_chars=10))), 3)
+
+    def test_scanner_items_equal_the_parent_normalization_of_the_whole_record(self) -> None:
+        import random
+
+        rng = random.Random(29)
+        pieces = [
+            b" ", b"\t", b"\x0b", b"\x0c", b"\x1c", b"\xc2\x85", b"\xe2\x80\xa8", b"\x1b[", b"\x1b[0m", b"\x1b[1;3",
+            b"m", b"\x1b", b"12", b";", b"\xe3\x80\x80", b"\xff", b"\xe2\x9c", b"x" * 997, b" " * 3001,
+            b"Test Case '-[M.S t1]' started.", b"Test Case '-[M.S t2]' passed (0.2 seconds).", b"Build complete!",
+            b"Test Case '", b"' failed (1 seconds).", b"Build ", b"complete!", b"\x1b[32mTest\x1b[0m Case '-[A b]' skipped.",
+        ]
+        item_pieces = [piece for piece in pieces if b"Test Case '" in piece or b"Build complete!" in piece]
+        other_pieces = [piece for piece in pieces if piece not in item_pieces]
+        outcomes: dict = {}
+        for trial in range(60):
+            # Item density varies, so trials stay within the pending bound or exceed it.
+            density = (0.0, 0.01, 0.2, 0.5)[trial % 4]
+            body = bytearray()
+            while len(body) < 66000 + trial * 1000:
+                body += rng.choice(item_pieces if rng.random() < density else other_pieces)
+            data = bytes(body)
+            reference = reference_scan(data.decode("utf-8", errors="replace"))
+            outcomes.setdefault(reference[1], 0)
+            outcomes[reference[1]] += 1
+            for chunk in (1023, 4093, 65536):
+                with self.subTest(trial=trial, chunk=chunk):
+                    self.assertEqual(scanned_items(data, chunk), reference)
+        self.assertGreater(outcomes.get(None, 0), 10, outcomes)
+        self.assertGreater(outcomes.get("pending", 0), 10, outcomes)
+
+    def test_records_within_the_cap_do_not_use_the_scanner(self) -> None:
+        created: list[int] = []
+
+        def factory() -> Any:
+            created.append(1)
+            return conductor._xctest_segment_scanner()
+
+        splitter = OUT.RecordSplitter(segment_scanner=factory)
+        records = splitter.feed(b"a" * 65536 + b"\n" + self.START_B + b"\n", 0)
+        self.assertEqual(created, [])
+        self.assertEqual([record.segment_items for record in records], [(), ()])
+        self.assertFalse(any(record.truncated for record in records))
+
+    def test_without_the_scanner_the_transition_would_be_lost(self) -> None:
+        # Guards the regression test itself: the truncated text alone has no marker.
+        records = split_all([b" " * 65536 + self.START_B + b"\n"])
+        self.assertTrue(records[0].truncated)
+        self.assertEqual(self.state._xctest_progress_transitions([records[0]._replace(segment_items=())]), [])
+
+    def test_prefilter_equals_the_per_line_regex(self) -> None:
+        # OracleB S3R0-EQ-01: the record-level literal prefilter never hides a match.
+        lines = [
+            "Test Case '-[A b]' started.", "  Test Case '-[A b]' passed (0.1 seconds).  ", "\x1b[1mTest Case '-[A b]' failed.\x1b[0m",
+            "Test\x1b[0m Case '-[A b]' skipped.", "Test \x1b[32mCase\x1b[0m '-[A b]' started.", "Test Case \x1b[1m'-[A b]' started.",
+            "test case '-[A b]' started.", "Test Suite 'All tests' started.", "Build complete! (1s)", "x\x0bTest Case '-[A b]' started.",
+            "Test Case '-[A b]' started.\u2028Build complete!", "Test Case '-[A b]' started (0.1 seconds).", "Build\x1b[0m complete!",
+        ]
+        for line in lines:
+            with self.subTest(line=line):
+                record = conductor.CONDUCTOR_OUTPUT.OutputRecord(0, 5, line, "lf")
+                got = [(text, None if marker is None else marker.groups())
+                       for _ts, text, marker in self.state._xctest_progress_transitions([record])]
+                self.assertEqual(got, reference_progress_lines(line))
+
+
+class Step3OverCapVisibleTextTests(unittest.TestCase):
+    """D3/D4: over-cap tail entries and summary lines equal those of the whole record."""
+
+    PIECES = [
+        b"\x1b", b"\x1b[", b"[", b"0", b"1;", b";", b"?", b" ", b"!", b"/", b"m", b"K", b"A", b"\\", b"_", b"~",
+        b"\x7f", b"x", b"\xe2\x9c\x93", b"\xe2", b"\x9c", b"\xff", b"\xc3\xa9", b"\x1b[0m", b"\x1b[38;5;1m",
+    ]
+
+    def test_visible_prefix_equals_one_pass_substitution_of_the_whole_text(self) -> None:
+        import random
+
+        rng = random.Random(7)
+        for pattern in (OUT.ANSI_RE, OUT.CSI_RE):
+            for trial in range(300):
+                data = b"".join(rng.choice(self.PIECES) for _ in range(rng.randrange(0, 160)))
+                if rng.random() < 0.2:
+                    data = b"\x1b[" + b"1" * rng.randrange(0, 40) + b" " * rng.randrange(0, 5) + data
+                whole = pattern.sub("", data.decode("utf-8", errors="replace"))
+                for max_chars in (1, 2, 3, 7, 40, 1000):
+                    chunk = rng.choice((1, 2, 3, 5, 64))
+                    with self.subTest(pattern=pattern.pattern, trial=trial, max_chars=max_chars, chunk=chunk):
+                        prefix = OUT.VisiblePrefix(max_chars, pattern)
+                        for start in range(0, len(data), chunk):
+                            prefix.feed(data[start:start + chunk])
+                        self.assertEqual(prefix.finish(), whole[:max_chars])
+
+    def test_visible_prefix_carry_stays_bounded(self) -> None:
+        prefix = OUT.VisiblePrefix(10)
+        prefix.feed(b"ab\x1b[")
+        for _ in range(200):
+            prefix.feed(b"1;" * 500)
+            self.assertLessEqual(len(prefix._carry), 10 + 2)
+        prefix.feed(b"\x07tail")  # BEL is no final byte: the whole candidate is literal
+        self.assertEqual(prefix.finish(), "ab\x1b[1;1;1;")
+        completed = OUT.VisiblePrefix(10)
+        completed.feed(b"ab\x1b[" + b"1;" * 50000 + b"mcd")
+        self.assertEqual(completed.finish(), "abcd")
+
+    def test_ansi_only_input_retains_no_fragments(self) -> None:
+        # S3-R1-01: an unterminated over-cap record of complete ANSI sequences must
+        # not grow the collector, whatever the read sizes.
+        for pieces in ((b"\x1b[0m",), (b"\x1b[0m" * 1000,), (b"\x1b[1;3", b"1m"), (b"\x1b", b"[0", b"m")):
+            with self.subTest(pieces=pieces):
+                prefix = OUT.VisiblePrefix(OUT.TAIL_VISIBLE_CHARS)
+                for _ in range(5000):
+                    for piece in pieces:
+                        prefix.feed(piece)
+                    self.assertEqual(len(prefix._parts), 0)
+                prefix.feed(b"\x1b[0mabc")
+                self.assertEqual(len(prefix._parts), 1)
+                self.assertEqual(prefix.finish(), "abc")
+        splitter = OUT.RecordSplitter()
+        for _ in range(2000):
+            splitter.feed(b"\x1b[0m" * 256, 0)
+        self.assertEqual(splitter._visible._parts, [])
+        self.assertEqual(splitter.finish(0)[0].visible, "")
+
+    def test_records_within_the_cap_have_no_visible_prefix(self) -> None:
+        records = split_all([b"\x1b[0mshort\n", b"x" * 70000 + b"\n"])
+        self.assertEqual([record.visible for record in records], [None, "x" * OUT.TAIL_VISIBLE_CHARS])
+        self.assertEqual([record.visible for record in split_all([b"x" * 70000 + b"\n"], visible_chars=0)], [None])
+
+    def summaries(self, data: bytes) -> tuple[dict, dict]:
+        with tempfile.TemporaryDirectory() as tmp:
+            log = Path(tmp) / "o.log"
+            log.write_bytes(data)
+            got = conductor.OutputSummarizer.summarize_file("test", {}, "failed", 1, False, log)
+            # The parent's reader: universal-newline text lines, cleaned line by line.
+            with log.open("r", encoding="utf-8", errors="replace") as handle:
+                want = conductor.OutputSummarizer.summarize_lines("test", {}, "failed", 1, False, handle)
+        return got, want
+
+    def test_over_cap_summary_lines_equal_the_whole_line_classification(self) -> None:
+        cases = {
+            "ansi-then-error": b"\x1b[31m" * 15000 + b"ERROR: boom\n",
+            "ansi-then-long-error": b"\x1b[2K" * 20000 + b"Sources/A.swift:1:2: error: bad " + b"z" * 500 + b"\n",
+            "long-csi-then-test-failure": b"\x1b[" + b"0;" * 40000 + b"mTest Case '-[M.S t]' failed (1.0 seconds).\r\n",
+            "unterminated-candidate": b"\x1b[" + b"1;" * 40000 + b"\x07 FAILED here\r",
+            "escape-escape": b"\x1b" + b"\x1b[0m" * 17000 + b"[31m==> phase\n",
+            "non-csi-escape-stays": b"\x1b[0m" * 17000 + b"\x1bMERROR: kept escape\n",
+            "multibyte-at-cut": b"\x1b[0m" * 16383 + b"abc" + "é".encode() * 300 + b" timed out after 3s",
+        }
+        for name, line in cases.items():
+            with self.subTest(case=name):
+                got, want = self.summaries(b"start\n" + line + b"\nok\n")
+                self.assertEqual(got, want)
+
+    def test_visible_summary_line_is_only_cut_never_cleaned_again(self) -> None:
+        # A literal ESC left by the whole-record pass stays in the classified line:
+        # cleaning it again would expose an anchored phase marker.
+        def phases(line: str) -> Optional[dict]:
+            summary = conductor.OutputSummarizer.summarize_lines("build", {}, "failed", 1, False, [line])
+            return next((s for s in summary["sections"] if s["title"] == "Phases"), None)
+
+        self.assertIsNone(phases(conductor.VisibleSummaryLine("\x1b[0m==> phase")))
+        self.assertIsNotNone(phases("\x1b[0m==> phase"))
+        summary = conductor.OutputSummarizer.summarize_lines(
+            "build", {}, "failed", 1, False, [conductor.VisibleSummaryLine("==> " + "r" * 500)]
+        )
+        phase = next(s for s in summary["sections"] if s["title"] == "Phases")
+        self.assertEqual(phase["lines"], [("==> " + "r" * 500)[: conductor.SUMMARY_LINE_MAX_CHARS - 1] + "…"])
+
+
+class Step3BatchAndCancellationTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.state = timing_state(Path(self.tmp.name), "off")
+
+    def test_batches_count_utf8_bytes_exactly(self) -> None:
+        ascii_records = OUT.RecordSplitter().feed(b"".join(b"%05d" % index + b"x" * 250 + b"\n" for index in range(255)), 0)
+        self.assertEqual(len(list(OUT.record_batches(ascii_records))), 1)  # one 64 KiB read, one lock
+        wide = OUT.RecordSplitter().feed(("\U0001f600" * 1000 + "\n").encode() * 40, 0)
+        batches = list(OUT.record_batches(wide))
+        self.assertEqual([record for batch in batches for record in batch], wide)
+        for batch in batches:
+            self.assertLessEqual(sum(OUT.utf8_size(record.text) for record in batch), OUT.BATCH_MAX_BYTES)
+        self.assertEqual([len(batch) for batch in batches], [16, 16, 8])
+
+    def test_cancellation_mid_record_flushes_the_pending_record(self) -> None:
+        # Cancellation closes the reader: the next read returns EOF (or raises) with a
+        # partial record pending. It is flushed through tail and progress; raw is exact.
+        for ending in ("eof", "error"):
+            with self.subTest(ending=ending):
+                job = xctest_job(self.state, f"c-{ending}")
+                chunks = [b"\x1b[1mfirst\x1b[0m\r\nTest Case '-[M.S testC]' sta", b"rted."]
+                reads = iter(chunks)
+
+                def read_chunk() -> bytes:
+                    try:
+                        return next(reads)
+                    except StopIteration:
+                        if ending == "error":
+                            raise OSError(errno.EBADF, "closed by cancellation")
+                        return b""
+
+                sink = io.BytesIO()
+                if ending == "error":
+                    with self.assertRaises(OSError):
+                        self.state._pump_output(job.ticket, read_chunk, sink)
+                else:
+                    self.state._pump_output(job.ticket, read_chunk, sink)
+                self.assertEqual(sink.getvalue(), b"".join(chunks))
+                self.assertEqual(list(job.tail)[:2], ["first\n", "Test Case '-[M.S testC]' started."])
+                self.assertEqual(job.xctest_current_test, "-[M.S testC]")
+
+
+class FlushCountingSink(io.BytesIO):
+    def __init__(self, fail_on_write: Optional[int] = None) -> None:
+        super().__init__()
+        self.flushes = 0
+        self.writes = 0
+        self.fail_on_write = fail_on_write
+
+    def write(self, data: Any) -> int:
+        self.writes += 1
+        if self.fail_on_write is not None and self.writes == self.fail_on_write:
+            raise OSError(errno.ENOSPC, "fixture write failure")
+        return super().write(data)
+
+    def flush(self) -> None:
+        self.flushes += 1
+        super().flush()
+
+
+class Step3PtyCoalescingTests(unittest.TestCase):
+    """OD14: bounded available-read coalescing keeps per-read times, raw bytes and order."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.state = timing_state(Path(self.tmp.name), "off")
+
+    def run_pump(
+        self,
+        blocking: list[bytes],
+        available: Any,
+        *,
+        step_ns: int = 1_000,
+        sink: Optional[io.BytesIO] = None,
+        ticket: str = "co",
+    ) -> dict:
+        """Pump with fake per-read clocks; returns the event log and job state.
+
+        ``available`` is a list (``None`` entries mean "nothing available now") or a
+        callable. Each successful read is stamped by exactly one ``monotonic_ns`` /
+        ``time.time`` call, recorded with the read it follows.
+        """
+        job = xctest_job(self.state, ticket)
+        events: list[tuple] = []
+        allowances: list[int] = []
+        clock = {"ns": 1_000_000_000, "wall": 5_000.0}
+        stamps: list[tuple[int, float]] = []
+        blocking_reads = iter(blocking + [b""])
+        available_reads = iter(available) if isinstance(available, list) else None
+
+        def read_chunk() -> bytes:
+            chunk = held.pop() if held else next(blocking_reads)
+            events.append(("read", chunk))
+            return chunk
+
+        held: list[bytes] = []  # the unread rest of a chunk longer than the allowance
+
+        def read_available(max_bytes: int) -> Optional[bytes]:
+            allowances.append(max_bytes)
+            if held:
+                chunk: Optional[bytes] = held.pop()
+            elif available_reads is None:
+                chunk = available()
+            else:
+                chunk = next(available_reads, None)
+            if chunk and len(chunk) > max_bytes:  # like os.read(fd, max_bytes)
+                chunk, rest = chunk[:max_bytes], chunk[max_bytes:]
+                held.append(rest)
+            events.append(("available", chunk))
+            return chunk
+
+        def monotonic_ns() -> int:
+            clock["ns"] += step_ns
+            return clock["ns"]
+
+        def wall() -> float:
+            clock["wall"] += 1.0
+            stamps.append((clock["ns"], clock["wall"]))
+            return clock["wall"]
+
+        original_apply = self.state._apply_xctest_progress_line_locked
+        original_records = self.state._submit_output_records
+        original_fail = self.state._fail_xctest_output_contract
+        classify_flags: list[bool] = []
+
+        def apply(target: Any, line: str, marker: Any, timestamp: float, observed_at: float) -> bool:
+            events.append(("apply", line, timestamp, observed_at))
+            return original_apply(target, line, marker, timestamp, observed_at)
+
+        def submit_records(*args: Any) -> None:
+            events.append(("records", [record.text for record in args[1]]))
+            classify_flags.append(args[3])
+            return original_records(*args)
+
+        def fail(ticket_: str, kind: str, record_seq: int, line_open: bool = False) -> None:
+            events.append(("fail", kind, record_seq))
+            return original_fail(ticket_, kind, record_seq, line_open)
+
+        sink = sink if sink is not None else FlushCountingSink()
+        sink_flush = sink.flush
+
+        def flush() -> None:
+            events.append(("flush",))
+            sink_flush()
+
+        sink.flush = flush  # type: ignore[method-assign]
+        error: Optional[BaseException] = None
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(mock.patch.object(conductor.time, "monotonic_ns", side_effect=monotonic_ns))
+            stack.enter_context(mock.patch.object(conductor.time, "time", side_effect=wall))
+            stack.enter_context(mock.patch.object(self.state, "_apply_xctest_progress_line_locked", side_effect=apply))
+            stack.enter_context(mock.patch.object(self.state, "_submit_output_records", side_effect=submit_records))
+            stack.enter_context(mock.patch.object(self.state, "_fail_xctest_output_contract", side_effect=fail))
+            try:
+                self.state._pump_output(job.ticket, read_chunk, sink, None, read_available)
+            except OSError as exc:
+                error = exc
+        read_stamps = iter(stamps)
+        reads = []
+        for event in events:
+            if event[0] in {"read", "available"} and event[1]:
+                reads.append((event[1], next(read_stamps)))
+        if error is None:
+            # Every read's raw bytes are written and flushed before anything else happens.
+            for index, event in enumerate(events):
+                if event[0] in {"read", "available"} and event[1]:
+                    self.assertEqual(events[index + 1], ("flush",), f"read {index} not flushed first")
+        return {"job": job, "events": events, "sink": sink, "error": error, "reads": reads, "allowances": allowances,
+                "classify": classify_flags}
+
+    @staticmethod
+    def kinds(events: list[tuple]) -> list[str]:
+        return [event[0] for event in events if event[0] != "flush"]
+
+    def test_each_coalesced_read_keeps_its_receive_time_wall_time_and_bytes(self) -> None:
+        blocking = [b"Test Case '-[M.S testA]' started.\nTest Case '-[M.S testA]' pas"]
+        available = [b"sed (0.1 seconds).\nTest Case '-[M.S testB]' st", b"arted.\n", None]
+        result = self.run_pump(blocking, available)
+        (_r1, (ns1, wall1)), (_r2, (ns2, wall2)), (_r3, (ns3, wall3)) = result["reads"]
+        applied = [event[1:] for event in result["events"] if event[0] == "apply"]
+        self.assertEqual(applied, [
+            ("Test Case '-[M.S testA]' started.", ns1 / 1e9, wall1),
+            ("Test Case '-[M.S testA]' passed (0.1 seconds).", ns2 / 1e9, wall2),
+            ("Test Case '-[M.S testB]' started.", ns3 / 1e9, wall3),
+        ])
+        self.assertTrue(ns1 < ns2 < ns3 and wall1 < wall2 < wall3)
+        # One group: one flush and one submission, exact raw bytes in read order.
+        self.assertEqual([event for event in result["events"] if event[0] == "records"], [("records", [
+            "Test Case '-[M.S testA]' started.",
+            "Test Case '-[M.S testA]' passed (0.1 seconds).",
+            "Test Case '-[M.S testB]' started.",
+        ])])
+        self.assertEqual(result["sink"].getvalue(), blocking[0] + available[0] + available[1])
+        self.assertEqual(result["sink"].flushes, 3)
+        self.assertEqual(result["job"].xctest_progress_deadline, ns3 / 1e9 + result["job"].xctest_active_method_budget_seconds)
+        self.assertEqual(result["job"].xctest_last_progress_observed_at, wall3)
+
+    def test_groups_end_at_the_read_byte_and_time_bounds(self) -> None:
+        line = b"x" * 99 + b"\n"
+        for name, chunk, step_ns, expected in (
+            ("reads", line, 1_000, OUT.COALESCE_MAX_READS),
+            ("bytes", b"y" * 4095 + b"\n", 1_000, OUT.COALESCE_MAX_BYTES // 4096),
+            # The clock advances 1 ms per call, and each further read costs two calls
+            # (the budget check before it, its receive time after it); the k-th
+            # check sees (2k - 1) ms, so reads stop at the first k with 2k - 1 >= 5.
+            ("time", line, 1_000_000, next(k for k in itertools.count(1) if (2 * k - 1) * 1_000_000 >= OUT.COALESCE_MAX_NS)),
+        ):
+            with self.subTest(bound=name):
+                remaining = {"count": 500}
+
+                def available() -> Optional[bytes]:
+                    if remaining["count"] == 0:
+                        return None
+                    remaining["count"] -= 1
+                    return chunk
+
+                result = self.run_pump([chunk] * 3, available, step_ns=step_ns, ticket=f"b-{name}")
+                sizes = [len(event[1]) for event in result["events"] if event[0] == "records"]
+                self.assertEqual(sizes, [expected] * 3)
+                self.assertEqual(remaining["count"], 500 - 3 * (expected - 1))
+                self.assertEqual(result["sink"].getvalue(), chunk * (3 * expected))
+                self.assertEqual(result["sink"].flushes, 3 * expected)
+
+    def test_uneven_reads_never_exceed_the_group_byte_budget(self) -> None:
+        # 60 KiB first, then 8 KiB chunks: the next read may take only the 4 KiB
+        # left in the group, and the rest of that chunk opens the next group.
+        first = b"f" * (60 * 1024 - 1) + b"\n"
+        chunk = b"e" * (8 * 1024 - 1) + b"\n"
+        stream = [chunk] * 20
+        result = self.run_pump([first, b"g\n"], lambda: stream.pop() if stream else None)
+        self.assertEqual(result["allowances"][0], 4 * 1024)
+        self.assertTrue(all(0 < allowance <= OUT.COALESCE_MAX_BYTES for allowance in result["allowances"]))
+        groups: list[int] = []
+        for event in result["events"]:
+            if event[0] == "read" and event[1]:
+                groups.append(len(event[1]))
+            elif event[0] == "available" and event[1]:
+                groups[-1] += len(event[1])
+        self.assertEqual(groups[0], OUT.COALESCE_MAX_BYTES)
+        self.assertTrue(all(size <= OUT.COALESCE_MAX_BYTES for size in groups), groups)
+        taken = b"".join(event[1] for event in result["events"] if event[0] in {"read", "available"} and event[1])
+        self.assertEqual(result["sink"].getvalue(), taken)  # every byte taken is relayed, in order
+        self.assertEqual(taken, first + chunk * 20 + b"g\n")
+
+    def test_no_further_read_starts_after_the_time_budget(self) -> None:
+        # The first read's own processing already used the budget (6 ms per clock
+        # call): no available read is even attempted, so nothing is consumed early.
+        result = self.run_pump([b"one\n", b"two\n"], lambda: b"never\n", step_ns=6_000_000)
+        self.assertNotIn("available", self.kinds(result["events"]))
+        self.assertEqual(result["allowances"], [])
+        self.assertEqual(list(result["job"].tail)[:2], ["one\n", "two\n"])
+
+    def test_unavailable_data_ends_a_group_without_waiting(self) -> None:
+        result = self.run_pump([b"one\n", b"two\n"], [None, b"three\n", None])
+        self.assertEqual(self.kinds(result["events"]), [
+            "read", "available", "records", "read", "available", "available", "records", "read",
+        ])
+        self.assertEqual(list(result["job"].tail)[:3], ["one\n", "two\n", "three\n"])
+
+    @staticmethod
+    def pending_markers(last: str) -> tuple[bytes, list[str]]:
+        """One more VT-separated marker than an over-cap record may hold pending (OD16 D2)."""
+        names = [f"-[M.S t{index}]" for index in range(OUT.SEGMENT_MAX_PENDING_ITEMS)] + [last]
+        lines = [f"Test Case '{name}' started." for name in names]
+        return "".join(line + "\x0b" for line in lines).encode(), lines
+
+    def test_a_scanner_failure_ends_a_group_after_exactly_the_preceding_records(self) -> None:
+        markers, _lines = self.pending_markers("-[M.S testX]")
+        # Within one group the byte budget keeps a record started in that group under
+        # the 64 KiB cap, so the record overflows in a later group: group 2 starts with
+        # a small blocking read and overflows on an available read, whose OD16 failure
+        # ends it although more data ("w" * 10) is available.
+        first = b"Test Case '-[M.S testA]' started.\n" + markers + b"y" * 60000
+        overflow = b"y" * 10000
+        result = self.run_pump([first, b"y" * 100, b"\n"], [None, overflow, b"w" * 10, None, None])
+        events = [event for event in result["events"] if event[0] in {"records", "fail", "available", "read"}]
+        self.assertEqual(self.kinds(events), [
+            "read", "available", "records", "read", "available", "fail",
+            "read", "available", "available", "records", "read", "records",
+        ])
+        self.assertEqual(events[2][1], ["Test Case '-[M.S testA]' started."])
+        self.assertEqual(events[5], ("fail", "pending", 1))
+        # Nothing pending is applied, early or later; later records feed only the tail.
+        self.assertEqual([event[1] for event in result["events"] if event[0] == "apply"],
+                         ["Test Case '-[M.S testA]' started."])
+        self.assertEqual(result["classify"], [True, False, False])
+        job = result["job"]
+        self.assertEqual(job.xctest_current_test, "-[M.S testA]")
+        self.assertTrue(job.measurement_invalid)
+        self.assertTrue((job.error or "").startswith("XCTest output contract failure (OD16): "))
+        self.assertEqual(result["sink"].getvalue(), first + b"y" * 100 + overflow + b"\n" + b"w" * 10)
+
+    def test_segment_items_within_the_bound_ride_on_the_record_through_a_group(self) -> None:
+        # The record overflows in the second group and completes in a coalesced read.
+        first = b"Test Case '-[M.S testA]' started.\n" + b"Test Case '-[M.S testX]' started.\x0b" + b"y" * 60000
+        result = self.run_pump([first, b"y" * 10000], [None, b"w\n", None])
+        self.assertEqual(self.kinds(result["events"]).count("fail"), 0)
+        self.assertEqual(self.kinds([e for e in result["events"] if e[0] != "apply"])[:7],
+                         ["read", "available", "records", "read", "available", "available", "records"])
+        _r3, (ns3, wall3) = result["reads"][2]
+        applied = [event[1:] for event in result["events"] if event[0] == "apply"]
+        self.assertEqual(applied[-1], ("Test Case '-[M.S testX]' started.", ns3 / 1e9, wall3))
+        self.assertEqual(result["job"].xctest_current_test, "-[M.S testX]")
+
+    def test_a_scanner_failure_in_a_groups_first_read_skips_coalescing(self) -> None:
+        # The record pends in group 1; group 2's first (blocking) read overflows it and
+        # fails, so group 2 takes no available read although "z\n" is there.
+        markers, _lines = self.pending_markers("-[M.S testX]")
+        result = self.run_pump([b"y" * 60000, b"\x0b" + markers + b"y" * 6000], [None, b"z\n", None])
+        self.assertEqual(self.kinds([e for e in result["events"] if e[0] != "apply"]),
+                         ["read", "available", "read", "fail", "read", "records"])
+        self.assertEqual(result["allowances"], [OUT.COALESCE_MAX_BYTES - 60000])  # group 1 only
+        self.assertEqual(result["classify"], [False])
+        self.assertEqual(result["sink"].getvalue(), b"y" * 60000 + b"\x0b" + markers + b"y" * 6000)
+
+    def test_a_failure_mid_group_still_delivers_the_earlier_reads(self) -> None:
+        sink = FlushCountingSink(fail_on_write=3)
+        result = self.run_pump([b"one\n"], [b"two\n", b"three\n", b"four\n"], sink=sink)
+        self.assertIsInstance(result["error"], OSError)
+        self.assertEqual(list(result["job"].tail), ["one\n", "two\n"])
+        self.assertEqual(sink.getvalue(), b"one\ntwo\n")
+        self.assertEqual(sink.flushes, 2)
+
+    def test_transport_read_available_never_waits_and_tolerates_closure(self) -> None:
+        transport = conductor.ProcessOutputTransport.create("pty")
+        self.addCleanup(transport.close_all)
+        self.assertIsNone(conductor.ProcessOutputTransport.create("pipe").read_available())
+        started = time.monotonic()
+        self.assertIsNone(transport.read_available())
+        self.assertLess(time.monotonic() - started, 0.5)
+        os.write(transport.slave_fd, b"hello")
+        received = b""
+        deadline = time.monotonic() + 5
+        while received != b"hello" and time.monotonic() < deadline:
+            received += transport.read_available() or b""
+        self.assertEqual(received, b"hello")
+        # The byte allowance bounds a real read (S3-R1-02).
+        os.write(transport.slave_fd, b"abcdefgh")
+        pieces: list[bytes] = []
+        deadline = time.monotonic() + 5
+        while b"".join(pieces) != b"abcdefgh" and time.monotonic() < deadline:
+            piece = transport.read_available(3)
+            if piece:
+                self.assertLessEqual(len(piece), 3)
+                pieces.append(piece)
+        self.assertEqual(b"".join(pieces), b"abcdefgh")
+        with mock.patch.object(conductor.select, "select", side_effect=ValueError("filedescriptor out of range")):
+            self.assertIsNone(transport.read_available())
+        with mock.patch.object(conductor.select, "select", return_value=([transport.master_fd], [], [])), \
+                mock.patch.object(conductor.os, "read", side_effect=OSError(errno.EIO, "eof")):
+            self.assertIsNone(transport.read_available())
+        transport.close_reader()
+        self.assertIsNone(transport.read_available())
+
+    def test_read_process_output_coalesces_only_real_pty_transports(self) -> None:
+        for kind in ("pty", "pipe"):
+            with self.subTest(kind=kind):
+                job = xctest_job(self.state, f"wire-{kind}")
+                transport = mock.Mock(kind=kind)
+                transport.read_chunk.side_effect = [b"a\n", b"b\n", b""]
+                transport.read_available.return_value = None
+                self.state._read_process_output(job.ticket, mock.Mock(), io.BytesIO(), transport)
+                if kind == "pty":
+                    self.assertEqual(transport.read_available.call_count, 2)
+                else:
+                    transport.read_available.assert_not_called()
+                self.assertEqual(list(job.tail)[:2], ["a\n", "b\n"])
+                transport.close_reader.assert_called_once()
+
+
+class Step3SummaryDisclosureTests(unittest.TestCase):
+    """S3-R0-01 (OD15) and S3-R0-06: saturated deduplication is disclosed in payload and terminal."""
+
+    def test_keep_last_repeat_after_saturation_is_disclosed(self) -> None:
+        lines = ["a", "b", "c", "d", "b"]
+        limited = conductor.SummarySectionBuilder("Phases", 2, keep_last=True, max_seen=1)
+        exact = conductor.SummarySectionBuilder("Phases", 2, keep_last=True, max_seen=10**9)
+        limited.extend(lines)
+        exact.extend(lines)
+        self.assertEqual(exact.lines, ["c", "d"])
+        self.assertEqual(limited.lines, ["d", "b"])  # the repeated older line OD15 permits
+        payload = limited.payload()
+        self.assertEqual(
+            (payload["deduplicationLimited"], payload["omittedLineCountQuality"], payload["displayedLinesMayRepeat"]),
+            (True, "upper_bound", True),
+        )
+        self.assertFalse(exact.payload()["displayedLinesMayRepeat"])
+
+    def test_keep_last_without_eviction_and_first_lines_sections_stay_exact(self) -> None:
+        roomy = conductor.SummarySectionBuilder("Phases", 10, keep_last=True, max_seen=1)
+        roomy.extend(["a", "b", "c", "b", "c"])
+        self.assertEqual(roomy.lines, ["a", "b", "c"])
+        self.assertFalse(roomy.payload()["displayedLinesMayRepeat"])
+        first = conductor.SummarySectionBuilder("Failure highlights", 2, max_seen=1)
+        first.extend(["a", "b", "c", "d", "b"])
+        self.assertEqual(first.lines, ["a", "b"])
+        self.assertFalse(first.payload()["displayedLinesMayRepeat"])
+
+    def test_production_limit_phase_repeat_is_disclosed_in_payload_and_terminal(self) -> None:
+        lines = [f"+ step {index}" for index in range(conductor.SUMMARY_SEEN_MAX_ENTRIES + 50)] + ["+ step 4100"]
+        summary = summarize("build", "failed", 1, lines)
+        phases = next(item for item in summary["sections"] if item["title"] == "Phases")
+        self.assertEqual(phases["lines"][-1], "+ step 4100")
+        self.assertTrue(phases["displayedLinesMayRepeat"])
+        self.assertTrue(summary["displayedLinesMayRepeat"])
+        self.assertEqual(summary["omittedLineCountQuality"], "exact")
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            conductor.render_output_summary(summary)
+        text = out.getvalue()
+        self.assertIn("omitted at most ", text)
+        self.assertIn("the count is an upper bound", text)
+        self.assertIn("these lines may repeat older lines of this section", text)
+
+    def test_exact_counts_render_unqualified(self) -> None:
+        summary = summarize("build", "failed", 1, [f"+ step {index}" for index in range(40)])
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            conductor.render_output_summary(summary)
+        self.assertIn("... omitted 20 matching line(s); see full log path above", out.getvalue())
+        self.assertNotIn("at most", out.getvalue())
+        self.assertNotIn("may repeat", out.getvalue())
+
+    def test_artifact_scope_section_carries_the_v2_fields(self) -> None:
+        payload = {"artifactScope": "current", "artifactScopeMessage": "artifact_scope: current", "state": "completed"}
+        enriched = conductor._with_artifact_scope_summary(payload, summarize("build", "completed", 0, ["x"]))
+        scope = enriched["sections"][0]
+        self.assertEqual(scope["title"], "Artifact scope")
+        self.assertEqual(
+            {key: scope[key] for key in ("deduplicationLimited", "omittedLineCountQuality", "displayedLinesMayRepeat")},
+            {"deduplicationLimited": False, "omittedLineCountQuality": "exact", "displayedLinesMayRepeat": False},
+        )
+
+
+class Step3SummaryPendingAndPinTests(unittest.TestCase):
+    """S3-R0-02 (pending summary, one scan) and S3-R0-04 (retention pins)."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.state = timing_state(Path(self.tmp.name), "off")
+        self.job = timing_job(self.state, "s")
+        self.job.log_path.write_bytes(b"error: boom\n")
+        self.job.state = "failed"
+        self.job.exit_code = 1
+        self.job.finished_at = conductor.now()
+        self.calls: list[str] = []
+        self.gate = threading.Event()
+        self.real = conductor.OutputSummarizer.summarize_file
+
+    def slow(self, *args: Any) -> dict:
+        self.calls.append(threading.current_thread().name)
+        if threading.current_thread().name == "claimant":
+            self.gate.wait(10)
+        return self.real(*args)
+
+    def start_claimant(self) -> threading.Thread:
+        claimant = threading.Thread(target=self.state._refresh_output_summary, args=(self.job,), name="claimant")
+        claimant.start()
+        deadline = time.monotonic() + 5
+        while not self.calls and time.monotonic() < deadline:
+            time.sleep(0.005)
+        self.assertEqual(self.calls, ["claimant"])
+        return claimant
+
+    def test_deadline_limited_wait_marks_the_summary_pending_and_clients_never_rescan(self) -> None:
+        with mock.patch.object(conductor.OutputSummarizer, "summarize_file", side_effect=self.slow):
+            claimant = self.start_claimant()
+            payload = self.state.job_wait("s", None, 0.05)
+            self.assertEqual((payload["waitTimedOut"], payload.get("summaryPending")), (False, True))
+            self.assertNotIn("outputSummary", payload)
+            enriched = conductor.payload_with_output_summary(payload)
+            summary = conductor.output_summary_for_payload(payload)
+            with contextlib.redirect_stdout(io.StringIO()) as out:
+                conductor.print_terminal_job_output(payload)
+                conductor.render_job(payload)
+            self.assertEqual(self.calls, ["claimant"])  # no client-side scan anywhere
+            self.assertIn(conductor.SUMMARY_PENDING_NOTE, json.dumps(enriched["outputSummary"]))
+            self.assertIn("logTail", enriched)  # the live tail stays while the summary is pending
+            self.assertIn(conductor.SUMMARY_PENDING_NOTE, json.dumps(summary))
+            self.assertIn("still being generated", out.getvalue())
+            self.gate.set()
+            claimant.join(10)
+            final = self.state.job_wait("s", None, 0.05)
+        self.assertEqual(self.calls, ["claimant"])
+        self.assertNotIn("summaryPending", final)
+        self.assertIn("error: boom", section(final["outputSummary"], "Failure highlights"))
+
+    def test_legacy_payload_without_the_pending_flag_still_scans_client_side(self) -> None:
+        payload = {"ticket": "s", "operation": "build", "state": "failed", "exitCode": 1, "logPath": str(self.job.log_path)}
+        with mock.patch.object(conductor.OutputSummarizer, "summarize_file", side_effect=self.slow):
+            summary = conductor.output_summary_for_payload(payload)
+        self.assertEqual(len(self.calls), 1)
+        self.assertIn("error: boom", section(summary, "Failure highlights"))
+
+    def test_wait_for_terminal_rewaits_a_pending_summary_within_its_bound(self) -> None:
+        pending = {"ticket": "s", "state": "failed", "exitCode": 1, "summaryPending": True, "waitTimedOut": False}
+        done = dict(pending, summaryPending=None, outputSummary={"headline": "x", "sections": []})
+        done.pop("summaryPending")
+        replies = iter([pending, pending, done])
+        with mock.patch.object(conductor, "request_daemon", side_effect=lambda *a, **k: next(replies)) as request:
+            final = conductor.wait_for_terminal(Path("/nonexistent"), "s", None, json_mode=True)
+        self.assertEqual(final, done)
+        self.assertEqual(request.call_count, 3)
+        clock = iter([0.0, 0.0, 0.0, 10.0, 70.0, 70.0, 70.0])
+        bounded_replies = iter([pending] * 20)  # an unbounded re-wait exhausts these and errors
+        with mock.patch.object(conductor, "request_daemon", side_effect=lambda *a, **k: next(bounded_replies)) as request, \
+                mock.patch.object(conductor, "now", side_effect=lambda: next(clock)):
+            final = conductor.wait_for_terminal(Path("/nonexistent"), "s", None, json_mode=True)
+        self.assertTrue(final["summaryPending"])  # bounded: returned without a summary, never scanned
+        self.assertEqual(request.call_count, 3)
+
+    def prune_conditions(self) -> dict:
+        return {
+            "age": lambda: setattr(self.job, "finished_at", conductor.now() - conductor.TERMINAL_RETENTION_SECONDS - 5),
+            "count": lambda: mock.patch.object(conductor, "MAX_TERMINAL_JOBS", 0).start(),
+        }
+
+    def test_retention_never_prunes_a_job_during_summary_or_its_payload(self) -> None:
+        for boundary in ("age", "count"):
+            for consumer in ("status", "wait"):
+                with self.subTest(boundary=boundary, consumer=consumer):
+                    self.setUp()
+                    self.addCleanup(mock.patch.stopall)
+                    self.prune_conditions()[boundary]()
+                    results: dict = {}
+
+                    def run() -> None:
+                        try:
+                            if consumer == "status":
+                                results["payload"] = self.state.job_status("s", None)
+                            else:
+                                results["payload"] = self.state.job_wait("s", None, 30.0)
+                        except Exception as exc:  # noqa: BLE001
+                            results["error"] = exc
+
+                    with mock.patch.object(conductor.OutputSummarizer, "summarize_file", side_effect=self.slow):
+                        claimant = self.start_claimant()
+                        consumer_thread = threading.Thread(target=run)
+                        consumer_thread.start()
+                        deadline = time.monotonic() + 5
+                        while self.job.summary_pins < 2 and time.monotonic() < deadline:
+                            time.sleep(0.005)
+                        with self.state.condition:
+                            self.state._retention_pass_locked()
+                        self.assertIn("s", self.state.jobs)
+                        self.assertTrue(self.job.log_path.exists())
+                        self.assertTrue(self.job.retention_deferred)
+                        self.gate.set()
+                        claimant.join(10)
+                        consumer_thread.join(10)
+                    mock.patch.stopall()
+                    self.assertNotIn("error", results)
+                    self.assertIn("error: boom", section(results["payload"]["outputSummary"], "Failure highlights"))
+                    self.assertEqual(self.calls, ["claimant"])
+                    self.assertEqual(self.job.summary_pins, 0)
+                    self.assertNotIn("s", self.state.jobs)  # the last unpin reran the deferred retention
+                    self.assertFalse(self.job.log_path.exists())
+
+    def test_pins_are_released_on_failure_and_base_exception_paths(self) -> None:
+        class Abort(BaseException):
+            pass
+
+        with mock.patch.object(conductor.OutputSummarizer, "summarize_file", side_effect=RuntimeError("scan broke")):
+            payload = self.state.job_status("s", None)
+        self.assertIn("summary failed: RuntimeError", json.dumps(payload["outputSummary"]))
+        self.assertEqual(self.job.summary_pins, 0)
+        other = timing_job(self.state, "t")
+        other.state, other.exit_code = "failed", 1
+        with mock.patch.object(conductor.OutputSummarizer, "summarize_file", side_effect=Abort()):
+            with self.assertRaises(Abort):
+                self.state.job_wait("t", None, 5.0)
+        self.assertEqual(other.summary_state, "failed")
+        self.assertTrue(other.summary_event.is_set())
+        self.assertIn("summary failed: Abort", json.dumps(other.output_summary))
+        self.assertEqual(other.summary_pins, 0)
 
 
 if __name__ == "__main__":
