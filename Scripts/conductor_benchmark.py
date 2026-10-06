@@ -46,7 +46,7 @@ import types
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
-HARNESS_VERSION = 6
+HARNESS_VERSION = 7
 CAPTURE_SCHEMA_VERSION = 3
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parent
@@ -86,10 +86,10 @@ EXIT_HARNESS_FAILURE = 3
 ADAPTER_VERSIONS = {
     "output": "read_process_output+pty_xctest_watchdog+pty_exact_tail_fidelity+step3_tail_model_enforced+pty_available_read_counting@6",
     "summary": "summarize_file+frozen_retained_corpus@2",
-    "mem": "record_progress_ledger+section_seen@1",
+    "mem": "record_progress_ledger+step4_pin_release_seam+section_seen@2",
     "cli": "launcher_subprocess@1",
     "artifact": "client_evaluate+enqueue+run_job@1",
-    "rss": "enqueue_run_job_retained_footprint@1",
+    "rss": "enqueue_run_job_retained_footprint+ledger_budget_source_check@2",
 }
 
 
@@ -887,6 +887,21 @@ def first_ledger_case(ledger_root: Path) -> Tuple[str, str]:
     raise HarnessError(f"no ledger row with a runtime in {path}")
 
 
+def _pin_ledger_snapshot(state: Any, job: Any) -> None:
+    """Step 4+ targets pin the shared ledger snapshot before process start, outside the
+    condition (``_run_job``); earlier targets load lazily on the first started marker."""
+    pin = getattr(state, "_pin_xctest_method_runtimes", None)
+    if pin is not None:
+        pin(job)
+
+
+def _release_ledger_snapshot_locked(state: Any, job: Any) -> None:
+    """Step 4+ targets release the job's pin at the terminal transition (``_run_job``)."""
+    release = getattr(state, "_release_xctest_method_runtimes_locked", None)
+    if release is not None:
+        release(job)
+
+
 def _retained_jobs_mib(
     mod: Any, scratch: str, ledger_root: Path, count_points: Sequence[int], text: str, tag: str
 ) -> Dict[int, float]:
@@ -894,6 +909,7 @@ def _retained_jobs_mib(
         paths = target_paths(mod, Path(tmp), repo_root=ledger_root)
         state = mod.DaemonState(paths)
         results: Dict[int, float] = {}
+        budget_sources: List[Optional[str]] = []
         gc.collect()
         tracemalloc.start()
         try:
@@ -902,16 +918,20 @@ def _retained_jobs_mib(
                 job = make_job(mod, paths, f"bench-{tag}-{index:04d}", "test", {"filter": "BenchProbe"})
                 with state.condition:
                     state.jobs[job.ticket] = job
+                if tag == "ledger":
+                    _pin_ledger_snapshot(state, job)
+                with state.condition:
                     state._record_xctest_progress_locked(job, text)
+                    budget_sources.append(job.xctest_active_method_budget_source)
                     job.state = "completed"
+                    _release_ledger_snapshot_locked(state, job)
                 if index + 1 in count_points:
                     gc.collect()
                     results[index + 1] = (tracemalloc.get_traced_memory()[0] - base) / 2**20
         finally:
             tracemalloc.stop()
-        loaded = [job.xctest_method_runtimes for job in state.jobs.values()]
-        if tag == "ledger" and not all(loaded):
-            raise HarnessError("ledger workload jobs did not load the XCTest runtime ledger")
+        if tag == "ledger" and any(source != "ledger-derived" for source in budget_sources):
+            raise HarnessError("ledger workload jobs did not take a ledger-derived active-method budget")
         del state
         return results
 
@@ -940,11 +960,16 @@ def adapter_mem(mod: Any, spec: Dict[str, Any]) -> Dict[str, Any]:
             job = make_job(mod, paths, f"bench-load-{index}", "test", {"filter": "BenchProbe"})
             with state.condition:
                 state.jobs[job.ticket] = job
-                start = time.perf_counter()
+            start = time.perf_counter()
+            _pin_ledger_snapshot(state, job)
+            with state.condition:
                 state._record_xctest_progress_locked(job, started)
-                load_times.append((time.perf_counter() - start) * 1000.0)
+            load_times.append((time.perf_counter() - start) * 1000.0)
             info["ledgerEntries"] = len(job.xctest_method_runtimes or {})
         metrics["mem.ledger_load_ms"] = statistics.median(load_times)
+        cache = getattr(state, "runtime_ledger_cache", None)
+        # Parses for these 5 unchanged-identity jobs (Step 4 cache counter; earlier targets parse per job, uncounted).
+        info["ledgerParsesFor5Jobs"] = cache.parse_count if cache is not None else None
     equivalence: Dict[str, Any] = {}
     seen_points = list(manifest["seenLinesFull" if full else "seenLines"])
     seen_mib: Dict[int, float] = {}
@@ -1161,9 +1186,11 @@ def adapter_rss_worker(mod: Any, spec: Dict[str, Any]) -> Dict[str, Any]:
         bad = [entry for entry in states if entry != ("completed", 0)]
         if bad:
             raise HarnessError(f"{len(bad)} retained rss jobs did not complete: {bad[:3]}")
-        loaded = sum(1 for job in state.jobs.values() if job.xctest_method_runtimes)
+        # Step 4 targets release the pinned snapshot at the terminal transition, so the
+        # retained jobs prove ledger use through their ledger-derived budget instead.
+        loaded = sum(1 for job in state.jobs.values() if job.xctest_active_method_budget_source == "ledger-derived")
         if loaded != len(states):
-            raise HarnessError(f"only {loaded} of {len(states)} rss jobs loaded the runtime ledger")
+            raise HarnessError(f"only {loaded} of {len(states)} rss jobs took a ledger-derived budget")
         gc.collect()
         _handshake("retained")
         return {"metrics": {}, "equivalence": {}, "info": {"retainedJobs": len(state.jobs), "ledgerLoadedJobs": loaded}}

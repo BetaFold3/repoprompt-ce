@@ -2688,6 +2688,9 @@ class XCTestStallWatchdogTests(LifecycleTestCase):
         job = self.make_job(state, "missing-ledger", "test", {}, ["build"], job_state="running")
         state.jobs[job.ticket] = job
 
+        # Step 4: the ledger is consulted once, at the pre-start pin, not per marker.
+        state._pin_xctest_method_runtimes(job)
+        self.assertIsNone(job.xctest_method_runtimes)
         for method in ["testOne", "testTwo"]:
             state._record_xctest_progress_locked(
                 job,
@@ -2712,7 +2715,8 @@ class XCTestStallWatchdogTests(LifecycleTestCase):
         )
         job = self.make_job(state, "negative-runtime", "test", {}, ["build"], job_state="running")
 
-        runtimes = state._load_xctest_method_runtimes_locked(job)
+        state._pin_xctest_method_runtimes(job)
+        runtimes = job.xctest_method_runtimes
         state._record_xctest_progress_locked(
             job,
             "Test Case '-[RepoPromptTests.NegativeRuntimeTests testMalformed]' started.\n",
@@ -3892,12 +3896,24 @@ class XCTestOutputContractLifecycleTests(LifecycleTestCase):
         markers = b"".join(b"\x0bTest Case '-[M.S t%d]' started." % index for index in range(count))
         return b"q" * 70000 + markers + b"\x0b\n"
 
-    def run_child(self, ticket: str, payload: bytes, mode: str = "exit") -> tuple[conductor.Job, Path, float]:
+    def run_child(
+        self, ticket: str, payload: bytes, mode: str = "exit", ledger: bool = True
+    ) -> tuple[conductor.Job, Path, float]:
         tmp, state = self.make_state()
         self.addCleanup(tmp.cleanup)
+        self.last_state = state
         root = state.paths.repo_root
         ConductorTestContractTests.initialize_git_repo(self, root)
         ConductorTestContractTests.create_test_artifact(self, root)
+        if ledger:
+            # A curated ledger exists in real checkouts. No row matches M.S, so budgets stay
+            # default-sourced. Without it, Step 4's pre-start "ledger unavailable" diagnostic
+            # (a FAILURE_RE line) precedes the child's output; see the missing-ledger test.
+            ledger_path = conductor._test_ledger_path(root)
+            ledger_path.parent.mkdir(parents=True, exist_ok=True)
+            ledger_path.write_text(
+                "suite\tmethod\truntime_seconds\ttarget\nOther.Suite\ttestOther\t1.0\troot\n", encoding="utf-8"
+            )
         payload_path = state.paths.jobs_dir / f"{ticket}.payload"
         payload_path.write_bytes(payload)
         go_path = state.paths.jobs_dir / f"{ticket}.go"
@@ -3930,6 +3946,13 @@ class XCTestOutputContractLifecycleTests(LifecycleTestCase):
         return job, state.paths.jobs_dir / "build-ticket-root.json", elapsed
 
     def assert_failed_visibly(self, job: conductor.Job, ticket_path: Path, boundary: str) -> str:
+        rendered, log = self.assert_failed_visibly_contract(job, ticket_path, boundary)
+        # With no FAILURE_RE line before the oversized record, no summary section holds it.
+        self.assertNotIn("9" * 200, rendered)
+        return log
+
+    def assert_failed_visibly_contract(self, job: conductor.Job, ticket_path: Path, boundary: str) -> tuple[str, str]:
+        """OD16's visible failure: state, exit, bounded output-free reason, no artifact, own log line."""
         reason = job.error or ""
         self.assertEqual(job.state, "failed")
         self.assertEqual(job.exit_code, conductor.XCTEST_STALL_FAILURE_EXIT_CODE)
@@ -3949,11 +3972,38 @@ class XCTestOutputContractLifecycleTests(LifecycleTestCase):
         with contextlib.redirect_stdout(io.StringIO()) as rendered:
             conductor.print_terminal_job_output(payload)
         self.assertIn(f"Error:    {reason}\n", rendered.getvalue())
-        self.assertNotIn("9" * 200, rendered.getvalue())
         log = job.log_path.read_bytes()
         # The reason is its own log line, even after an unterminated oversized line.
         self.assertIn(b"\n" + reason.encode() + b"\n", log)
-        return log.decode("utf-8", errors="replace")
+        return rendered.getvalue(), log.decode("utf-8", errors="replace")
+
+    def test_missing_ledger_d1_failure_keeps_the_od16_contract_and_bounds_summary_context(self) -> None:
+        payload = self.START_A + b"Test Case '-[M.S testA]' passed (" + b"9" * 70000 + b").\n"
+        writes: list[tuple[bytes, bool]] = []
+        with record_log_writes(lambda: self.last_state, writes):
+            job, ticket_path, _elapsed = self.run_child("od16-d1-no-ledger", payload, ledger=False)
+        rendered, log = self.assert_failed_visibly_contract(job, ticket_path, "segment")
+        # Fallback: one diagnostic, default budget (clamped to the 20 s job timeout).
+        self.assertEqual(log.count("XCTest runtime ledger unavailable"), 1)
+        self.assertEqual(job.xctest_active_method_budget_source, "default")
+        self.assertEqual(job.xctest_active_method_budget_seconds, 20.0)
+        self.assertEqual(log.count("XCTest active-method budget clamped from 180.000s to job timeout 20.000s"), 1)
+        # Order: start line, diagnostic, then the child's output.
+        start = log.index("$ ")
+        diagnostic = log.index("XCTest runtime ledger unavailable")
+        self.assertLess(start, diagnostic)
+        self.assertLess(diagnostic, log.index("Test Case '-[M.S testA]' started."))
+        # Both system lines are written to the log outside the condition.
+        for needle in (b"XCTest runtime ledger unavailable", b"budget clamped"):
+            owners = [owned for data, owned in writes if needle in data]
+            self.assertEqual(owners, [False], needle)
+        # The diagnostic is a FAILURE_RE line, so ordinary summary context may show the
+        # oversized record, but only as a bounded display line; the reason stays output-free.
+        self.assertIn("XCTest runtime ledger unavailable", rendered)
+        longest = max(len(line) for line in rendered.splitlines())
+        self.assertLessEqual(longest, conductor.SUMMARY_LINE_MAX_CHARS + 8)
+        self.assertNotIn("9" * conductor.SUMMARY_LINE_MAX_CHARS, rendered)
+        self.assertLessEqual(len(rendered), conductor.SUMMARY_MAX_CHARS + 4096)
 
     def test_d1_and_d2_fail_the_job_although_the_child_exits_zero(self) -> None:
         cases = {
@@ -5176,6 +5226,573 @@ class StopConfirmationTests(unittest.TestCase):
 
         self.assertEqual(code, 1)
         self.assertGreater(terminate.call_count, 0)
+
+
+RUNTIME_LEDGER_HEADER = "suite\tmethod\truntime_seconds\ttarget\n"
+LEDGER_SUITE = "RepoPromptTests.RuntimeLedgerCacheTests"
+
+
+@contextlib.contextmanager
+def record_log_writes(state_of, writes: list):  # type: ignore[no-untyped-def]
+    """Record every write to a job log (``jobs/*.log`` opened for append) with whether the
+    writing thread then owned ``state_of().lock``."""
+    real_open = Path.open
+
+    class Recording:
+        def __init__(self, handle):  # type: ignore[no-untyped-def]
+            self._handle = handle
+
+        def write(self, data):  # type: ignore[no-untyped-def]
+            writes.append((bytes(data), bool(state_of().lock._is_owned())))
+            return self._handle.write(data)
+
+        def __enter__(self):  # type: ignore[no-untyped-def]
+            self._handle.__enter__()
+            return self
+
+        def __exit__(self, *exc):  # type: ignore[no-untyped-def]
+            return self._handle.__exit__(*exc)
+
+        def __getattr__(self, name):  # type: ignore[no-untyped-def]
+            return getattr(self._handle, name)
+
+    def recording_open(path, mode="r", *args, **kwargs):  # type: ignore[no-untyped-def]
+        handle = real_open(path, mode, *args, **kwargs)
+        if "a" in mode and path.suffix == ".log" and path.parent.name == "jobs":
+            return Recording(handle)
+        return handle
+
+    with mock.patch.object(Path, "open", recording_open):
+        yield
+
+
+def parent_runtime_ledger_reference(rows: list[dict]) -> dict:
+    """Frozen copy of the f6bc1a8e per-job loop (``_load_xctest_method_runtimes_locked``)."""
+    runtimes: dict = {}
+    for row in rows:
+        suite = str(row.get("suite") or "").strip()
+        method = str(row.get("method") or "").strip()
+        raw_runtime = str(row.get("runtime_seconds") or "").strip()
+        if not suite or not method or not raw_runtime:
+            continue
+        try:
+            runtime = float(raw_runtime)
+        except ValueError:
+            continue
+        if not conductor.math.isfinite(runtime) or runtime < 0:
+            continue
+        runtimes.setdefault((suite, method), runtime)
+    return runtimes
+
+
+class RuntimeLedgerCacheTests(LifecycleTestCase):
+    """Plan Step 4: one shared, immutable runtime-ledger snapshot per daemon."""
+
+    def write_ledger(self, root: Path, rows: str) -> Path:
+        ledger = conductor._test_ledger_path(root)
+        ledger.parent.mkdir(parents=True, exist_ok=True)
+        ledger.write_text(RUNTIME_LEDGER_HEADER + rows, encoding="utf-8")
+        return ledger
+
+    def make_cache(self, rows: str) -> tuple[Path, conductor.RuntimeLedgerCache]:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        ledger = self.write_ledger(Path(tmp.name), rows)
+        return ledger, conductor.RuntimeLedgerCache(ledger)
+
+    @staticmethod
+    def rows(count: int, runtime: float = 1.0) -> str:
+        return "".join(f"{LEDGER_SUITE}\ttest{index}\t{runtime}\troot\n" for index in range(count))
+
+    @staticmethod
+    def resident_snapshots(sentinel: tuple[str, str]) -> int:
+        import gc
+        import types
+
+        gc.collect()
+        return sum(
+            1 for item in gc.get_objects() if isinstance(item, types.MappingProxyType) and sentinel in item
+        )
+
+    def test_parse_semantics_match_the_parent_loader(self) -> None:
+        rows = (
+            "S\tincomplete\t\troot\n"
+            "\tnoSuite\t1.0\troot\n"
+            "S\tm3\t-0.5\troot\n"
+            "S\tm3\t2.0\troot\n"
+            "S\tm4\tnan\troot\n"
+            "S\tm4\tinf\troot\n"
+            "S\tm4\t-inf\troot\n"
+            "S\tm4\tabc\troot\n"
+            "S\tm4\t3.5\troot\n"
+            "S\tm4\t9.0\tcore\n"
+            " S \t m5 \t 0.25 \tprovider\n"
+            "S\tm6\t0\troot\n"
+        )
+        ledger, cache = self.make_cache(rows)
+        load = cache.load()
+        self.assertIsNone(load.diagnostic)
+        expected = {("S", "m3"): 2.0, ("S", "m4"): 3.5, ("S", "m5"): 0.25, ("S", "m6"): 0.0}
+        self.assertEqual(dict(load.runtimes), expected)
+        self.assertEqual(
+            dict(load.runtimes), parent_runtime_ledger_reference(conductor._read_test_ledger_rows(ledger.parents[2]))
+        )
+
+    def test_curated_ledger_snapshot_equals_the_parent_loader(self) -> None:
+        repo_root = SCRIPT_DIR.parent
+        cache = conductor.RuntimeLedgerCache(conductor._test_ledger_path(repo_root))
+        load = cache.load()
+        self.assertIsNone(load.diagnostic)
+        reference = parent_runtime_ledger_reference(conductor._read_test_ledger_rows(repo_root))
+        self.assertGreater(len(reference), 0)
+        self.assertEqual(dict(load.runtimes), reference)
+
+    def test_unchanged_identity_parses_once_and_shares_one_immutable_snapshot(self) -> None:
+        ledger, cache = self.make_cache(self.rows(3))
+        first = cache.load().runtimes
+        for _ in range(4):
+            self.assertIs(cache.load().runtimes, first)
+        self.assertEqual(cache.parse_count, 1)
+        self.assertIsInstance(first, conductor.MappingProxyType)
+        with self.assertRaises(TypeError):
+            first[(LEDGER_SUITE, "test0")] = 9.0  # type: ignore[index]
+        status = os.stat(ledger.resolve())
+        self.assertEqual(
+            cache._identity(),
+            (str(ledger.resolve()), status.st_dev, status.st_ino, status.st_size, status.st_mtime_ns, status.st_ctime_ns),
+        )
+
+    def test_identity_change_installs_a_new_snapshot_and_leaves_the_old_one_intact(self) -> None:
+        ledger, cache = self.make_cache(self.rows(1, runtime=1.0))
+        first = cache.load().runtimes
+        self.write_ledger(ledger.parents[2], self.rows(2, runtime=4.0))
+        second = cache.load().runtimes
+        self.assertIsNot(second, first)
+        self.assertEqual(dict(first), {(LEDGER_SUITE, "test0"): 1.0})
+        self.assertEqual(second[(LEDGER_SUITE, "test1")], 4.0)
+        self.assertIs(cache.load().runtimes, second)
+        self.assertEqual(cache.parse_count, 2)
+
+        # Identical bytes under a new inode are a new identity (atomic replace).
+        replacement = ledger.with_name("replacement.tsv")
+        shutil.copyfile(ledger, replacement)
+        os.replace(replacement, ledger)
+        third = cache.load().runtimes
+        self.assertIsNot(third, second)
+        self.assertEqual(dict(third), dict(second))
+        self.assertEqual(cache.parse_count, 3)
+
+    def test_symlinked_ledger_is_keyed_by_its_resolved_target(self) -> None:
+        ledger, _cache = self.make_cache(self.rows(1, runtime=1.0))
+        other = ledger.with_name("other.tsv")
+        other.write_text(RUNTIME_LEDGER_HEADER + self.rows(1, runtime=7.0), encoding="utf-8")
+        link = ledger.with_name("link.tsv")
+        link.symlink_to(ledger)
+        cache = conductor.RuntimeLedgerCache(link)
+        self.assertEqual(cache.load().runtimes[(LEDGER_SUITE, "test0")], 1.0)
+        link.unlink()
+        link.symlink_to(other)
+        self.assertEqual(cache.load().runtimes[(LEDGER_SUITE, "test0")], 7.0)
+        self.assertEqual(cache.parse_count, 2)
+
+    def run_concurrent_loads(
+        self, cache: conductor.RuntimeLedgerCache, parse: object
+    ) -> tuple[list, list[BaseException]]:
+        entered = threading.Event()
+        release = threading.Event()
+        results: list = [None] * 8
+        errors: list[BaseException] = []
+
+        def blocking(rows):  # type: ignore[no-untyped-def]
+            entered.set()
+            self.assertTrue(release.wait(10))
+            return parse(rows)  # type: ignore[operator]
+
+        def load(index: int) -> None:
+            try:
+                results[index] = cache.load()
+            except BaseException as exc:  # noqa: BLE001 - recorded for the assertion
+                errors.append(exc)
+
+        with mock.patch.object(conductor, "_parse_xctest_method_runtimes", side_effect=blocking):
+            leader = threading.Thread(target=load, args=(0,))
+            leader.start()
+            self.assertTrue(entered.wait(5))
+            joiners = [threading.Thread(target=load, args=(index,)) for index in range(1, 8)]
+            for thread in joiners:
+                thread.start()
+            for thread in joiners:
+                thread.join(0.05)
+                self.assertTrue(thread.is_alive(), "a joiner finished before the in-flight load")
+            release.set()
+            for thread in [leader, *joiners]:
+                thread.join(10)
+                self.assertFalse(thread.is_alive())
+        return results, errors
+
+    def test_concurrent_loads_share_one_in_flight_parse(self) -> None:
+        _ledger, cache = self.make_cache(self.rows(3))
+        results, errors = self.run_concurrent_loads(cache, conductor._parse_xctest_method_runtimes)
+        self.assertEqual(errors, [])
+        self.assertEqual(cache.parse_count, 1)
+        snapshot = results[0].runtimes
+        self.assertIsNotNone(snapshot)
+        for result in results:
+            self.assertIs(result.runtimes, snapshot)
+            self.assertIsNone(result.diagnostic)
+        self.assertIsNone(cache._flight)
+        self.assertIs(cache.load().runtimes, snapshot)
+        self.assertEqual(cache.parse_count, 1)
+
+    def test_loader_exception_releases_joiners_with_the_fallback_and_clears_the_flight(self) -> None:
+        _ledger, cache = self.make_cache(self.rows(2))
+
+        def failing(_rows):  # type: ignore[no-untyped-def]
+            raise RuntimeError("parser boom")
+
+        results, errors = self.run_concurrent_loads(cache, failing)
+        self.assertEqual([str(error) for error in errors], ["parser boom"])
+        joined = [result for result in results if result is not None]
+        self.assertEqual(len(joined), 7)
+        for result in joined:
+            self.assertIsNone(result.runtimes)
+            self.assertIn("runtime ledger loader failed", result.diagnostic)
+            self.assertIn("using flat 180.000s active-method defaults", result.diagnostic)
+        self.assertIsNone(cache._flight)
+        self.assertIsNone(cache._current)
+        recovered = cache.load()
+        self.assertIsNone(recovered.diagnostic)
+        self.assertEqual(len(recovered.runtimes), 2)
+
+    def change_ledger_on_identity_calls(
+        self, ledger: Path, cache: conductor.RuntimeLedgerCache, change_on: set[int]
+    ) -> tuple[conductor.RuntimeLedgerLoad, list[int]]:
+        real_identity = cache._identity
+        calls: list[int] = []
+
+        def identity():  # type: ignore[no-untyped-def]
+            calls.append(len(calls) + 1)
+            if len(calls) in change_on:
+                self.write_ledger(ledger.parents[2], self.rows(len(calls) + 1, runtime=float(len(calls))))
+            return real_identity()
+
+        with mock.patch.object(cache, "_identity", side_effect=identity):
+            load = cache.load()
+        return load, calls
+
+    def test_change_during_load_retries_once_and_caches_the_retried_identity(self) -> None:
+        ledger, cache = self.make_cache(self.rows(1))
+        load, calls = self.change_ledger_on_identity_calls(ledger, cache, {2})
+        # Stat before (1), changed stat after the first read (2), stable stat after the retry (3).
+        self.assertEqual(calls, [1, 2, 3])
+        self.assertIsNone(load.diagnostic)
+        self.assertEqual(len(load.runtimes), 3)
+        self.assertEqual(load.runtimes[(LEDGER_SUITE, "test0")], 2.0)
+        self.assertEqual(cache.parse_count, 1)
+        self.assertIs(cache.load().runtimes, load.runtimes)
+        self.assertEqual(cache.parse_count, 1)
+
+    def test_repeated_change_during_load_falls_back_to_the_flat_budget(self) -> None:
+        ledger, cache = self.make_cache(self.rows(1))
+        load, calls = self.change_ledger_on_identity_calls(ledger, cache, {2, 3})
+        self.assertEqual(calls, [1, 2, 3])
+        self.assertIsNone(load.runtimes)
+        self.assertIn("ledger changed during load (retried once)", load.diagnostic)
+        self.assertIn("using flat 180.000s active-method defaults", load.diagnostic)
+        self.assertEqual(cache.parse_count, 0)
+        self.assertIsNone(cache._current)
+        recovered = cache.load()
+        self.assertIsNone(recovered.diagnostic)
+        self.assertEqual(len(recovered.runtimes), 4)
+        self.assertEqual(cache.parse_count, 1)
+
+    def test_unreadable_ledger_falls_back_on_every_load_and_drops_the_current_snapshot(self) -> None:
+        ledger, cache = self.make_cache(self.rows(1))
+        self.assertIsNotNone(cache.load().runtimes)
+        ledger.unlink()
+        for _ in range(2):
+            load = cache.load()
+            self.assertIsNone(load.runtimes)
+            self.assertIn(f"XCTest runtime ledger unavailable at {ledger}", load.diagnostic)
+        self.assertIsNone(cache._current)
+        ledger.write_bytes(RUNTIME_LEDGER_HEADER.encode() + b"S\tm\t\xff\troot\n")
+        undecodable = cache.load()
+        self.assertIsNone(undecodable.runtimes)
+        self.assertIn("codec can't decode", undecodable.diagnostic)
+        self.write_ledger(ledger.parents[2], self.rows(2))
+        self.assertEqual(len(cache.load().runtimes), 2)
+
+    def test_pinned_snapshot_survives_a_ledger_update_with_at_most_two_resident(self) -> None:
+        tmp, state = self.make_state()
+        self.addCleanup(tmp.cleanup)
+        sentinel = (LEDGER_SUITE, "testSentinel")
+        self.write_ledger(state.paths.repo_root, f"{LEDGER_SUITE}\ttestSentinel\t1.0\troot\n")
+        job = self.make_job(state, "pinned", "test", {}, ["build"], job_state="running")
+        state.jobs[job.ticket] = job
+        state._pin_xctest_method_runtimes(job)
+        self.assertEqual(self.resident_snapshots(sentinel), 1)
+
+        self.write_ledger(state.paths.repo_root, f"{LEDGER_SUITE}\ttestSentinel\t40.0\troot\nS\tm\t1\troot\n")
+        self.assertEqual(state.runtime_ledger_cache.load().runtimes[sentinel], 40.0)
+        self.assertEqual(self.resident_snapshots(sentinel), 2)
+        # The active job keeps the snapshot it pinned.
+        with state.condition:
+            state._record_xctest_progress_locked(job, f"Test Case '-[{LEDGER_SUITE} testSentinel]' started.\n", 1.0)
+        self.assertEqual(job.xctest_active_method_budget_seconds, 90.0)
+
+        with state.condition:
+            state._release_xctest_method_runtimes_locked(job)
+        self.assertIsNone(job.xctest_method_runtimes)
+        self.assertEqual(self.resident_snapshots(sentinel), 1)
+
+    def test_budget_lookup_uses_the_pinned_snapshot_without_ledger_io(self) -> None:
+        tmp, state = self.make_state()
+        self.addCleanup(tmp.cleanup)
+        ledger = self.write_ledger(state.paths.repo_root, f"{LEDGER_SUITE}\ttestPinned\t40.0\troot\n")
+        job = self.make_job(state, "no-io", "test", {}, ["build"], job_state="running")
+        state.jobs[job.ticket] = job
+        state._pin_xctest_method_runtimes(job)
+        ledger.unlink()
+        with mock.patch.object(state.runtime_ledger_cache, "load", side_effect=AssertionError("ledger I/O")):
+            with state.condition:
+                state._record_xctest_progress_locked(job, f"Test Case '-[{LEDGER_SUITE} testPinned]' started.\n", 1.0)
+        self.assertEqual(job.xctest_active_method_budget_seconds, 190.0)
+        self.assertEqual(job.xctest_active_method_budget_source, "ledger-derived")
+
+    def test_jobs_that_do_not_consult_the_ledger_never_load_it(self) -> None:
+        tmp, state = self.make_state()
+        self.addCleanup(tmp.cleanup)
+        self.write_ledger(state.paths.repo_root, self.rows(1))
+        jobs = [
+            self.make_job(state, "build", "build", {}, ["build"]),
+            self.make_job(state, "override", "test", {"xctestStallSeconds": 5.0}, ["build"]),
+            self.make_job(state, "list", "test", {"list": True}, ["build"]),
+            self.make_job(state, "disabled", "test", {"xctestDeadlines": False}, ["build"]),
+        ]
+        for job in jobs:
+            state._pin_xctest_method_runtimes(job)
+            self.assertIsNone(job.xctest_method_runtimes)
+        self.assertEqual(state.runtime_ledger_cache.parse_count, 0)
+
+    def run_ledger_job(
+        self,
+        state: conductor.DaemonState,
+        ticket: str,
+        child_code: str,
+        extra: contextlib.ExitStack | None = None,
+        timeout: float | None = None,
+    ) -> conductor.Job:
+        argv = [sys.executable, "-u", "-c", child_code]
+        job = self.make_job(state, ticket, "test", {}, ["build"], job_state="running")
+        job.timeout = timeout
+        state.jobs[job.ticket] = job
+        state.active_lanes = {"build": job.ticket}
+
+        def prepare(_request: dict) -> tuple[list[str], list[str], Path, dict[str, str], float]:
+            return argv, ["build"], state.paths.repo_root, os.environ.copy(), 10.0
+
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(mock.patch.object(conductor, "operation_requires_global_heavy_slot", return_value=False))
+            stack.enter_context(mock.patch.object(conductor, "operation_requires_global_xctest_slot", return_value=False))
+            stack.enter_context(mock.patch.object(conductor, "source_snapshot", return_value=None))
+            stack.enter_context(mock.patch.object(state.registry, "prepare", side_effect=prepare))
+            stack.enter_context(
+                mock.patch.multiple(
+                    conductor, TERMINATE_GRACE_SECONDS=0.05, KILL_GRACE_SECONDS=0.2, PROCESS_TREE_POLL_SECONDS=0.01
+                )
+            )
+            if extra is not None:
+                stack.enter_context(extra)
+            state._run_job(job.ticket)
+        return job
+
+    def test_run_job_pins_before_popen_outside_the_condition_and_releases_at_completion(self) -> None:
+        tmp, state = self.make_state()
+        self.addCleanup(tmp.cleanup)
+        ledger = self.write_ledger(state.paths.repo_root, f"{LEDGER_SUITE}\ttestFast\t40.0\troot\n")
+        resolved = str(ledger.resolve())
+        io_events: list[tuple[str, bool]] = []
+        popen_pins: list[object] = []
+        real_open = open
+        real_identity = state.runtime_ledger_cache._identity
+        real_parse = conductor._parse_xctest_method_runtimes
+        real_popen = conductor.subprocess.Popen
+
+        def owned() -> bool:
+            return bool(state.lock._is_owned())
+
+        def recording_open(file, *args, **kwargs):  # type: ignore[no-untyped-def]
+            if str(file) == resolved:
+                io_events.append(("open", owned()))
+            return real_open(file, *args, **kwargs)
+
+        def recording_identity():  # type: ignore[no-untyped-def]
+            io_events.append(("stat", owned()))
+            return real_identity()
+
+        def recording_parse(rows):  # type: ignore[no-untyped-def]
+            io_events.append(("parse", owned()))
+            return real_parse(rows)
+
+        def recording_popen(*args, **kwargs):  # type: ignore[no-untyped-def]
+            argv = args[0] if args else kwargs.get("args")
+            if isinstance(argv, list) and argv[:3] == [sys.executable, "-u", "-c"]:
+                current = state.jobs.get(ticket_holder[0])
+                popen_pins.append(None if current is None else current.xctest_method_runtimes)
+            return real_popen(*args, **kwargs)
+
+        child = (
+            f"print(\"Test Case '-[{LEDGER_SUITE} testFast]' started.\", flush=True)\n"
+            f"print(\"Test Case '-[{LEDGER_SUITE} testFast]' passed (0.001 seconds).\", flush=True)\n"
+        )
+        ticket_holder = [""]
+        jobs = []
+        for ticket in ("ledger-first", "ledger-second"):
+            ticket_holder[0] = ticket
+            extra = contextlib.ExitStack()
+            extra.enter_context(mock.patch.object(conductor, "open", side_effect=recording_open, create=True))
+            extra.enter_context(mock.patch.object(state.runtime_ledger_cache, "_identity", side_effect=recording_identity))
+            extra.enter_context(mock.patch.object(conductor, "_parse_xctest_method_runtimes", side_effect=recording_parse))
+            extra.enter_context(mock.patch.object(conductor.subprocess, "Popen", side_effect=recording_popen))
+            jobs.append(self.run_ledger_job(state, ticket, child, extra))
+
+        for job in jobs:
+            self.assertEqual(job.state, "completed", job.error)
+            self.assertEqual(job.xctest_active_method_budget_source, "ledger-derived")
+            self.assertEqual(job.xctest_active_method_budget_seconds, 190.0)
+            self.assertIsNone(job.xctest_method_runtimes)
+        # Pinned before process start, and both jobs pinned the same snapshot.
+        self.assertEqual(len(popen_pins), 2)
+        self.assertIsNotNone(popen_pins[0])
+        self.assertIs(popen_pins[0], popen_pins[1])
+        # One read and one parse for the unchanged identity; a stat per job; none under the condition.
+        self.assertEqual([kind for kind, _ in io_events if kind != "stat"], ["open", "parse"])
+        self.assertEqual(sum(1 for kind, _ in io_events if kind == "stat"), 3)
+        self.assertFalse(any(is_owned for _kind, is_owned in io_events), io_events)
+        self.assertEqual(state.runtime_ledger_cache.parse_count, 1)
+
+    def test_run_job_releases_the_pin_on_cancellation_and_on_runner_errors(self) -> None:
+        tmp, state = self.make_state()
+        self.addCleanup(tmp.cleanup)
+        self.write_ledger(state.paths.repo_root, f"{LEDGER_SUITE}\ttestSlow\t1.0\troot\n")
+        pinned: list[object] = []
+        real_pin = state._pin_xctest_method_runtimes
+
+        def pin_then_cancel(job: conductor.Job) -> None:
+            real_pin(job)
+            pinned.append(job.xctest_method_runtimes)
+            with state.condition:
+                job.cancel_requested = True
+
+        extra = contextlib.ExitStack()
+        extra.enter_context(mock.patch.object(state, "_pin_xctest_method_runtimes", side_effect=pin_then_cancel))
+        canceled = self.run_ledger_job(state, "ledger-cancel", "import time\ntime.sleep(30)\n", extra)
+        self.assertEqual(canceled.state, "canceled")
+        self.assertIsNotNone(pinned[0])
+        self.assertIsNone(canceled.xctest_method_runtimes)
+
+        def failing_transport(_job: conductor.Job) -> conductor.ProcessOutputTransport:
+            pinned.append(_job.xctest_method_runtimes)
+            raise RuntimeError("transport boom")
+
+        extra = contextlib.ExitStack()
+        extra.enter_context(mock.patch.object(state, "_create_process_output_transport", side_effect=failing_transport))
+        failed = self.run_ledger_job(state, "ledger-error", "print('unused')\n", extra)
+        self.assertEqual(failed.state, "failed")
+        self.assertEqual(failed.exit_code, 1)
+        self.assertIn("transport boom", failed.error or "")
+        self.assertIs(pinned[1], pinned[0])
+        self.assertIsNone(failed.xctest_method_runtimes)
+        self.assertEqual(state.runtime_ledger_cache.parse_count, 1)
+
+    def test_clamped_budget_diagnostic_is_written_outside_the_condition_in_reader_order(self) -> None:
+        tmp, state = self.make_state()
+        self.addCleanup(tmp.cleanup)
+        self.write_ledger(state.paths.repo_root, f"{LEDGER_SUITE}\ttestClamp\t40.0\troot\n")
+        child = (
+            "import time\n"
+            f"print(\"Test Case '-[{LEDGER_SUITE} testClamp]' started.\", flush=True)\n"
+            f"print(\"Test Case '-[{LEDGER_SUITE} testClamp]' passed (0.001 seconds).\", flush=True)\n"
+            "time.sleep(0.3)\n"
+            f"print(\"Test Case '-[{LEDGER_SUITE} testUnknown]' started.\", flush=True)\n"
+            f"print(\"Test Case '-[{LEDGER_SUITE} testUnknown]' passed (0.001 seconds).\", flush=True)\n"
+        )
+        writes: list[tuple[bytes, bool]] = []
+        with record_log_writes(lambda: state, writes):
+            job = self.run_ledger_job(state, "clamped", child, timeout=20.0)
+        self.assertEqual(job.state, "completed", job.error)
+        clamp_ledger = (
+            "XCTest active-method budget clamped from 190.000s to job timeout 20.000s "
+            f"for method=-[{LEDGER_SUITE} testClamp]; source=ledger-derived\n"
+        )
+        clamp_default = (
+            "XCTest active-method budget clamped from 180.000s to job timeout 20.000s "
+            f"for method=-[{LEDGER_SUITE} testUnknown]; source=default\n"
+        )
+        # The tail gets each line under the condition, in transition order.
+        self.assertEqual([entry for entry in job.tail if "budget clamped" in entry], [clamp_ledger, clamp_default])
+        # The log gets each exactly once, after its marker's read and before the next marker.
+        log = job.log_path.read_text(encoding="utf-8")
+        self.assertEqual((log.count(clamp_ledger), log.count(clamp_default)), (1, 1))
+        self.assertLess(log.index(f"-[{LEDGER_SUITE} testClamp]' started."), log.index(clamp_ledger))
+        self.assertLess(log.index(clamp_ledger), log.index(f"-[{LEDGER_SUITE} testUnknown]' started."))
+        self.assertLess(log.index(f"-[{LEDGER_SUITE} testUnknown]' started."), log.index(clamp_default))
+        clamp_writes = [owned for data, owned in writes if b"budget clamped" in data]
+        self.assertEqual(clamp_writes, [False, False])
+        self.assertIsNone(job.deferred_log_lines)
+
+    def test_direct_progress_callers_flush_queued_clamp_lines_after_the_condition(self) -> None:
+        tmp, state = self.make_state()
+        self.addCleanup(tmp.cleanup)
+        job = self.make_job(state, "direct", "test", {}, ["build"], job_state="running")
+        job.timeout = 20.0
+        state.jobs[job.ticket] = job
+        writes: list[tuple[bytes, bool]] = []
+        with record_log_writes(lambda: state, writes):
+            with state.condition:
+                state._record_xctest_progress_locked(job, f"Test Case '-[{LEDGER_SUITE} testA]' started.\n", 1.0)
+                self.assertEqual(len(job.deferred_log_lines), 1)
+                self.assertIn("budget clamped", list(job.tail)[-1])
+            self.assertFalse(job.log_path.exists())
+            state._flush_deferred_log_lines(job)
+            state._flush_deferred_log_lines(job)
+        self.assertEqual(job.log_path.read_text(encoding="utf-8").count("budget clamped"), 1)
+        self.assertEqual([owned for _data, owned in writes], [False])
+        self.assertIsNone(job.deferred_log_lines)
+
+    def test_run_job_flushes_a_left_over_queue_at_its_end(self) -> None:
+        tmp, state = self.make_state()
+        self.addCleanup(tmp.cleanup)
+        self.write_ledger(state.paths.repo_root, self.rows(1))
+        real_pin = state._pin_xctest_method_runtimes
+
+        def pin_and_queue(job: conductor.Job) -> None:
+            real_pin(job)
+            with state.condition:
+                state._append_deferred_system_line_locked(job, "queued by a direct caller\n")
+
+        extra = contextlib.ExitStack()
+        extra.enter_context(mock.patch.object(state, "_pin_xctest_method_runtimes", side_effect=pin_and_queue))
+        job = self.run_ledger_job(state, "left-over", "import time\ntime.sleep(0.2)\n", extra)
+        self.assertEqual(job.state, "completed", job.error)
+        self.assertEqual(job.log_path.read_text(encoding="utf-8").count("queued by a direct caller\n"), 1)
+        self.assertIsNone(job.deferred_log_lines)
+
+    def test_every_ledger_consulting_operation_holds_the_build_lane(self) -> None:
+        """The "at most 2 resident snapshots" bound: pinning jobs are mutually exclusive by lane."""
+        tmp, state = self.make_state()
+        self.addCleanup(tmp.cleanup)
+        operations = sorted(
+            name
+            for name in ("test", "test-artifact", "test-parallel", "provider-test", "core-test", "build", "lint")
+            if state._xctest_watchdog_enabled(self.make_job(state, name, name, {"filter": "X"}, []))
+        )
+        self.assertEqual(operations, ["core-test", "provider-test", "test", "test-artifact"])
+        with mock.patch.object(conductor, "evaluate_test_artifact", return_value={}):
+            for operation in operations:
+                request = {"operation": operation, "args": {"filter": "X"}, "timeout": None, "verbose": False, "env": {}}
+                _argv, lanes, _cwd, _env, _timeout = state.registry.prepare(request)
+                self.assertIn("build", lanes, operation)
 
 
 if __name__ == "__main__":

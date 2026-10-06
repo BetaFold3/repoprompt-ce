@@ -19,6 +19,7 @@ import errno
 import fcntl
 import hashlib
 import importlib.util
+import io
 import json
 import math
 import os
@@ -37,7 +38,8 @@ import time
 import uuid
 from collections import deque
 from pathlib import Path
-from typing import Any, Deque, Dict, FrozenSet, List, Mapping, Optional, Sequence, Tuple
+from types import MappingProxyType
+from typing import Any, Deque, Dict, FrozenSet, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 from debug_app_process import ProcessIdentityError, matching_processes, terminate_matching_processes
 
@@ -410,6 +412,136 @@ def _test_ledger_path(repo_root: Path) -> Path:
 def _read_test_ledger_rows(repo_root: Path) -> List[Dict[str, str]]:
     with _test_ledger_path(repo_root).open("r", encoding="utf-8", newline="") as handle:
         return list(csv.DictReader(handle, delimiter="\t"))
+
+
+def _parse_xctest_method_runtimes(rows: Iterable[Mapping[str, Any]]) -> Dict[Tuple[str, str], float]:
+    """``(suite, method) -> runtime_seconds``: incomplete, negative and non-finite rows are ignored; the first valid row wins."""
+    runtimes: Dict[Tuple[str, str], float] = {}
+    for row in rows:
+        suite = str(row.get("suite") or "").strip()
+        method = str(row.get("method") or "").strip()
+        raw_runtime = str(row.get("runtime_seconds") or "").strip()
+        if not suite or not method or not raw_runtime:
+            continue
+        try:
+            runtime = float(raw_runtime)
+        except ValueError:
+            continue
+        if not math.isfinite(runtime) or runtime < 0:
+            continue
+        runtimes.setdefault((suite, method), runtime)
+    return runtimes
+
+
+RuntimeLedgerIdentity = Tuple[str, int, int, int, int, int]
+
+
+@dataclasses.dataclass(frozen=True)
+class RuntimeLedgerLoad:
+    """One ledger lookup: a shared immutable snapshot, or ``None`` (flat budget) with a diagnostic."""
+
+    runtimes: Optional[Mapping[Tuple[str, str], float]]
+    diagnostic: Optional[str] = None
+
+
+class _RuntimeLedgerFlight:
+    __slots__ = ("event", "result")
+
+    def __init__(self) -> None:
+        self.event = threading.Event()
+        self.result: Optional[RuntimeLedgerLoad] = None
+
+
+class RuntimeLedgerCache:
+    """Daemon-owned XCTest runtime-ledger snapshot (plan Step 4).
+
+    Holds one current immutable snapshot (a ``MappingProxyType``), keyed by the
+    resolved path, device, inode, size, ``mtime_ns`` and ``ctime_ns``. ``load``
+    runs outside the daemon condition: stat, read and parse happen under this
+    cache's private single-flight, never under ``DaemonState.condition``. Callers
+    that join an in-flight load take the leader's result. A read whose identity
+    changes between the stat before and the stat after is retried once; a second
+    change, or an unreadable ledger, falls back to the flat budget with a
+    diagnostic and leaves no current snapshot. Snapshots are never mutated, so
+    an active job keeps the one it pinned while a newer one becomes current.
+    """
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self._lock = threading.Lock()
+        self._current: Optional[Tuple[RuntimeLedgerIdentity, Mapping[Tuple[str, str], float]]] = None
+        self._flight: Optional[_RuntimeLedgerFlight] = None
+        self.parse_count = 0
+
+    def _identity(self) -> RuntimeLedgerIdentity:
+        resolved = self.path.resolve()
+        status = os.stat(resolved)
+        return (str(resolved), status.st_dev, status.st_ino, status.st_size, status.st_mtime_ns, status.st_ctime_ns)
+
+    def _fallback(self, reason: str) -> RuntimeLedgerLoad:
+        return RuntimeLedgerLoad(
+            None,
+            f"XCTest runtime ledger unavailable at {self.path}; "
+            f"using flat {XCTEST_ACTIVE_METHOD_DEADLINE_SECONDS:.3f}s active-method defaults: {reason}\n",
+        )
+
+    def load(self) -> RuntimeLedgerLoad:
+        try:
+            identity = self._identity()
+        except OSError as exc:
+            with self._lock:
+                if self._flight is None:
+                    self._current = None
+            return self._fallback(str(exc))
+        with self._lock:
+            current = self._current
+            if current is not None and current[0] == identity:
+                return RuntimeLedgerLoad(current[1])
+            flight = self._flight
+            leader = flight is None
+            if flight is None:
+                flight = self._flight = _RuntimeLedgerFlight()
+        if not leader:
+            flight.event.wait()
+            assert flight.result is not None
+            return flight.result
+        result: Optional[RuntimeLedgerLoad] = None
+        installed: Optional[Tuple[RuntimeLedgerIdentity, Mapping[Tuple[str, str], float]]] = None
+        try:
+            installed, result = self._read_snapshot(identity)
+        finally:
+            if result is None:
+                # An unexpected loader error: joiners fall back; the leader's caller sees the exception.
+                result = self._fallback("runtime ledger loader failed")
+            with self._lock:
+                self._current = installed
+                self._flight = None
+            flight.result = result
+            flight.event.set()
+        return result
+
+    def _read_snapshot(
+        self, before: RuntimeLedgerIdentity
+    ) -> Tuple[Optional[Tuple[RuntimeLedgerIdentity, Mapping[Tuple[str, str], float]]], RuntimeLedgerLoad]:
+        for _attempt in range(2):
+            try:
+                with open(before[0], "rb") as handle:
+                    data = handle.read()
+                after = self._identity()
+            except OSError as exc:
+                return None, self._fallback(str(exc))
+            if after == before:
+                try:
+                    rows = csv.DictReader(io.StringIO(data.decode("utf-8"), newline=""), delimiter="\t")
+                    snapshot: Mapping[Tuple[str, str], float] = MappingProxyType(_parse_xctest_method_runtimes(rows))
+                except (csv.Error, UnicodeError) as exc:
+                    return None, self._fallback(str(exc))
+                finally:
+                    with self._lock:
+                        self.parse_count += 1
+                return (after, snapshot), RuntimeLedgerLoad(snapshot)
+            before = after
+        return None, self._fallback("ledger changed during load (retried once)")
 
 
 def _ledger_filter_rows(repo_root: Path, operation: str) -> List[Tuple[str, str]]:
@@ -2321,9 +2453,14 @@ class Job:
     xctest_progress_deadline: Optional[float] = None
     xctest_active_method_budget_seconds: Optional[float] = None
     xctest_active_method_budget_source: Optional[str] = None
-    xctest_method_runtimes: Optional[Dict[Tuple[str, str], float]] = dataclasses.field(
+    # Step 4: the shared, immutable runtime-ledger snapshot pinned before process
+    # start (``None``: not pinned, released, or flat-budget fallback).
+    xctest_method_runtimes: Optional[Mapping[Tuple[str, str], float]] = dataclasses.field(
         default=None, repr=False
     )
+    # Step 4: system lines added to the tail under the condition whose log write
+    # is deferred until the condition is released (budget-clamp diagnostics).
+    deferred_log_lines: Optional[List[str]] = dataclasses.field(default=None, repr=False, compare=False)
     xctest_current_test: Optional[str] = None
     xctest_previous_test: Optional[str] = None
     xctest_last_progress_test: Optional[str] = None
@@ -2812,6 +2949,7 @@ class DaemonState:
         self.active_lanes: Dict[str, str] = {}
         self.shutdown_requested = False
         self.server: Optional[socketserver.BaseServer] = None
+        self.runtime_ledger_cache = RuntimeLedgerCache(_test_ledger_path(paths.repo_root))
         # Kill switch read once at daemon start (``RPCE_CONDUCTOR_TIMING=off``).
         self.timing_setting: Optional[str] = os.environ.get(TIMING_ENV_KEY)
         if self.timing_setting is not None:
@@ -3767,6 +3905,7 @@ class DaemonState:
                     self._append_tail_locked(job, start_line)
                 log_file.write(start_line.encode("utf-8", errors="replace"))
                 log_file.flush()
+                self._pin_xctest_method_runtimes(job)
                 if telemetry is not None:
                     self._telemetry_boundary(telemetry, "command_start", metadata={"command": format_argv(argv)})
                 output_transport = self._create_process_output_transport(job)
@@ -4109,12 +4248,17 @@ class DaemonState:
             self._release_global_slot(global_heavy_slot)
             if output_transport is not None:
                 output_transport.close_all()
+            if job is not None and job.deferred_log_lines:
+                # Defensive: the reader writes its own queue after every batch.
+                self._flush_deferred_log_lines(job)
             refresh_after_release = False
             lane_release_ns: Optional[int] = None
             retention_ns: Optional[int] = None
             retention_cpu_ns = 0
             with self.condition:
                 if job is not None:
+                    # Every _run_job exit is the job's terminal transition here.
+                    self._release_xctest_method_runtimes_locked(job)
                     refresh_after_release = job.state in TERMINAL_STATES and job.output_summary is None
                     for lane in list(job.lanes):
                         if self.active_lanes.get(lane) == job.ticket:
@@ -4206,6 +4350,7 @@ class DaemonState:
         for batch in output.record_batches(records):
             entries = output.tail_entries(batch)
             transitions = self._xctest_progress_transitions(batch) if watchdog else ()
+            deferred: Optional[List[str]] = None
             with self.condition:
                 job = self.jobs.get(ticket)
                 if job is None:
@@ -4219,7 +4364,10 @@ class DaemonState:
                         receive_ns / 1_000_000_000,
                         receive_wall if walls is None else walls.get(receive_ns, receive_wall),
                     )
+                deferred = self._take_deferred_log_lines_locked(job)
                 self.condition.notify_all()
+            # Before the next batch and the next read, as when these lines were written under the lock.
+            self._write_deferred_log_lines(job, deferred)
 
     def _fail_xctest_output_contract(self, ticket: str, kind: str, record_seq: int, line_open: bool = False) -> None:
         """OD16: fail the job visibly when over-cap XCTest output exceeds the scanner's bounds.
@@ -4595,44 +4743,77 @@ class DaemonState:
         kind = "pty" if self._xctest_watchdog_enabled(job) else "pipe"
         return ProcessOutputTransport.create(kind)
 
-    def _load_xctest_method_runtimes_locked(self, job: Job) -> Dict[Tuple[str, str], float]:
-        if job.xctest_method_runtimes is not None:
-            return job.xctest_method_runtimes
+    def _pin_xctest_method_runtimes(self, job: Job) -> None:
+        """Pin the shared runtime-ledger snapshot to ``job`` before process start (Step 4).
 
-        job.xctest_method_runtimes = {}
-        ledger_path = _test_ledger_path(self.paths.repo_root)
+        Called without ``self.condition``: the cache stats, reads and parses under
+        its own single-flight. Only a watchdog-enabled job without an explicit
+        ``--xctest-stall-seconds`` budget consults the ledger. A fallback writes its
+        diagnostic to the log outside the condition and adds it to the tail under it.
+        """
+        if not self._xctest_watchdog_enabled(job) or job.args.get("xctestStallSeconds") is not None:
+            return
+        load = self.runtime_ledger_cache.load()
+        if load.diagnostic:
+            with contextlib.suppress(OSError), job.log_path.open("ab") as handle:
+                handle.write(load.diagnostic.encode("utf-8", errors="replace"))
+        with self.condition:
+            if load.diagnostic:
+                self._append_tail_locked(job, load.diagnostic)
+            job.xctest_method_runtimes = load.runtimes
+
+    @staticmethod
+    def _release_xctest_method_runtimes_locked(job: Job) -> None:
+        """The terminal transition drops the job's pinned ledger snapshot (Step 4)."""
+        job.xctest_method_runtimes = None
+
+    def _append_deferred_system_line_locked(self, job: Job, text: str) -> None:
+        """Add ``text`` to the tail now and queue its log write for after the condition (Step 4).
+
+        Whoever releases the condition after queueing writes the queue with
+        ``_write_deferred_log_lines`` (the output reader after each batch,
+        ``_run_job`` at its end, or ``_flush_deferred_log_lines``), so no file I/O
+        happens under the condition and the log keeps the reader's write order.
+        """
+        self._append_tail_locked(job, text)
+        if job.deferred_log_lines is None:
+            job.deferred_log_lines = [text]
+        else:
+            job.deferred_log_lines.append(text)
+
+    @staticmethod
+    def _take_deferred_log_lines_locked(job: Job) -> Optional[List[str]]:
+        lines = job.deferred_log_lines
+        job.deferred_log_lines = None
+        return lines
+
+    @staticmethod
+    def _write_deferred_log_lines(job: Optional[Job], lines: Optional[List[str]]) -> None:
+        """Append queued system lines in order, outside the condition (as ``_append_system_line_locked`` did)."""
+        if job is None or not lines:
+            return
         try:
-            rows = _read_test_ledger_rows(self.paths.repo_root)
-        except (OSError, csv.Error, UnicodeError) as exc:
-            self._append_system_line_locked(
-                job,
-                f"XCTest runtime ledger unavailable at {ledger_path}; "
-                f"using flat {XCTEST_ACTIVE_METHOD_DEADLINE_SECONDS:.3f}s active-method defaults: {exc}\n",
-            )
-            return job.xctest_method_runtimes
+            with job.log_path.open("ab") as handle:
+                for text in lines:
+                    handle.write(text.encode("utf-8", errors="replace"))
+        except OSError:
+            pass
 
-        for row in rows:
-            suite = str(row.get("suite") or "").strip()
-            method = str(row.get("method") or "").strip()
-            raw_runtime = str(row.get("runtime_seconds") or "").strip()
-            if not suite or not method or not raw_runtime:
-                continue
-            try:
-                runtime = float(raw_runtime)
-            except ValueError:
-                continue
-            if not math.isfinite(runtime) or runtime < 0:
-                continue
-            job.xctest_method_runtimes.setdefault((suite, method), runtime)
-        return job.xctest_method_runtimes
+    def _flush_deferred_log_lines(self, job: Job) -> None:
+        """Write ``job``'s queued system lines; call without ``self.condition``."""
+        with self.condition:
+            lines = self._take_deferred_log_lines_locked(job)
+        self._write_deferred_log_lines(job, lines)
 
     def _set_xctest_active_method_budget_locked(self, job: Job, test_name: str) -> float:
         flag_override = job.args.get("xctestStallSeconds")
         runtime: Optional[float] = None
         if flag_override is None:
             case_key = parse_xctest_case_name(test_name)
-            if case_key is not None:
-                runtime = self._load_xctest_method_runtimes_locked(job).get(case_key)
+            runtimes = job.xctest_method_runtimes
+            if case_key is not None and runtimes is not None:
+                # The pinned snapshot only: no ledger I/O under the condition.
+                runtime = runtimes.get(case_key)
         budget, source, clamped = xctest_active_method_budget(
             runtime,
             float(flag_override) if flag_override is not None else None,
@@ -4648,7 +4829,7 @@ class DaemonState:
                 None,
                 floor_seconds=_xctest_active_method_floor(job.env),
             )
-            self._append_system_line_locked(
+            self._append_deferred_system_line_locked(
                 job,
                 f"XCTest active-method budget clamped from {unclamped_budget:.3f}s "
                 f"to job timeout {budget:.3f}s for method={test_name}; source={source}\n",
@@ -4661,6 +4842,12 @@ class DaemonState:
         text: str,
         observed_at: Optional[float] = None,
     ) -> bool:
+        """Apply ``text``'s XCTest progress lines under the condition.
+
+        A clamped active-method budget queues its diagnostic's log write
+        (Step 4): after releasing the condition, the caller writes it with
+        ``_flush_deferred_log_lines`` (``_run_job`` also flushes at the end).
+        """
         if not self._xctest_watchdog_enabled(job):
             return False
         matched = False

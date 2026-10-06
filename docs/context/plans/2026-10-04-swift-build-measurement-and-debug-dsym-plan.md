@@ -4,7 +4,7 @@ Scope: read when the task touches Swift build/test wall-time measurement, conduc
 Authority: Reference
 Last-verified: 2026-10-06
 
-Status: Steps 1 and 2 are owner-accepted for commit and progression under OD12, which replaces the 5 ms parser budget with 90 ms per 5 MiB and accepts this checkpoint without further qualification runs. Phase 0 is complete (§11). Both OracleA and OracleB approve the scoped Steps 1–2 r4 implementation; all blocking code findings are closed by their owning lanes. Five shared re-review rounds were used for Steps 1–2, and no production or test code changed after r4. The Oracles' earlier withholding of empirical phase acceptance remains part of the record; OD12 is an owner decision, not a new Oracle verdict or a claim that missing measurements passed. Step 1's clean no-regression qualification, Step 2's full integrated/null-job qualification and repeatable Swift timing remain follow-up evidence, not blockers for this checkpoint. Steps 3–10 may proceed next in §4 order, with their own requirements unchanged. Under OD13, Step 3 has completed **four of five shared re-review rounds**. Both fresh round-4 lanes approve the remediation code on the frozen r4 snapshot. OracleA explicitly closed S3-R0-03 as fixed, not downgraded, and S3-R3-01 as fixed; all earlier closures remain. There are no open P0/P1 findings. OD16 authorizes explicit, visible job failure at pathological D1/D2 limits; the r4 reader-completion guard prevents an otherwise successful classifying job from publishing success before its reader finishes. OracleA's new S3-R4-01 test-readiness finding is nonblocking P2 and deferred; OracleB's P3 observations are recorded below. **Step 3 is owner-accepted for commit and progression under OD17.** Current-r4 qualification passes pipe, summary, lock and classification-equivalence gates; the clean PTY output misses and narrowly contaminated memory result remain recorded as non-blocking follow-up. This is explicit measured acceptance, not a claim that those gates passed or a new Oracle empirical verdict. Step 4 may proceed next in §4 order. Steps 4–12 are not yet implemented; their own gates remain unchanged and debug dSYM policy is unchanged.
+Status: Steps 1 and 2 are owner-accepted for commit and progression under OD12, which replaces the 5 ms parser budget with 90 ms per 5 MiB and accepts this checkpoint without further qualification runs. Phase 0 is complete (§11). Both OracleA and OracleB approve the scoped Steps 1–2 r4 implementation; all blocking code findings are closed by their owning lanes. Five shared re-review rounds were used for Steps 1–2, and no production or test code changed after r4. The Oracles' earlier withholding of empirical phase acceptance remains part of the record; OD12 is an owner decision, not a new Oracle verdict or a claim that missing measurements passed. Step 1's clean no-regression qualification, Step 2's full integrated/null-job qualification and repeatable Swift timing remain follow-up evidence, not blockers for this checkpoint. Steps 3–10 may proceed next in §4 order, with their own requirements unchanged. Under OD13, Step 3 has completed **four of five shared re-review rounds**. Both fresh round-4 lanes approve the remediation code on the frozen r4 snapshot. OracleA explicitly closed S3-R0-03 as fixed, not downgraded, and S3-R3-01 as fixed; all earlier closures remain. There are no open P0/P1 findings. OD16 authorizes explicit, visible job failure at pathological D1/D2 limits; the r4 reader-completion guard prevents an otherwise successful classifying job from publishing success before its reader finishes. OracleA's new S3-R4-01 test-readiness finding is nonblocking P2 and deferred; OracleB's P3 observations are recorded below. **Step 3 is owner-accepted for commit and progression under OD17.** Current-r4 qualification passes pipe, summary, lock and classification-equivalence gates; the clean PTY output misses and narrowly contaminated memory result remain recorded as non-blocking follow-up. This is explicit measured acceptance, not a claim that those gates passed or a new Oracle empirical verdict. Step 3 is committed as `f6bc1a8e`. Step 4 remediation r1 is approved by both main-owned round-1 lanes: OracleA closes S4-R0-LOCK-IO and S4-R0-FALLBACK-COVERAGE; OracleB closes S4-R0-01–05. Both P1s are fixed, not downgraded. Its numerical gates pass on the unchanged measured path; main's independent selftest and guardrails pass. Step 4 is accepted and staged; staged-index preflight passed, but the signed commit failed because the configured 1Password agent returned an error. No Step 4 commit exists yet. OD6's review is discharged with idle exit and job history still deferred; no new gate or campaign is required. One shared re-review round of five was used. Steps 5–12 are not yet implemented; their own gates remain unchanged and debug dSYM policy is unchanged.
 Decision process: this revision replaces the earlier Swift-only plan. Two independent Oracle lanes (OracleE and OracleD) received the same brief: the owner's answers, the Phase 0 results, the verified Python conductor findings, and the earlier plan. Material disagreements were relayed anonymously for two challenge rounds, and both lanes ended CONVERGED. Two disputes were settled by owner decisions and one by code verification; §9 records each. The filename is kept so existing links stay valid.
 
 ## 1. Outcome, scope, and owner decisions
@@ -558,7 +558,7 @@ No material disagreement remains open.
 
 ## 10. Open questions for the owner
 
-1. **Idle exit and job-history review (OD6):** with 7 resident daemons, the Step 4 trigger is expected to fire. Should idle exit be planned then, or should daemons be stopped manually (`./conductor daemon stop` in idle worktrees)? Recommended: decide after the Step 4 footprint measurement.
+1. **Idle exit and job-history review (OD6): discharged by main.** Step 4's 86.8 MiB physical footprint fires the review trigger. Both lanes reviewed it; main keeps the existing idle-exit and job-history deferral unchanged. OracleB explicitly withdrew its initial request for a new owner decision. An optional later footprint/heap re-check may inform separately authorized work, but has no deadline and is not a gate before Step 5.
 2. **Delayed-case app crash check:** run once with just-in-time approval for the record? Recommended: yes, once, not gating.
 3. **Switch name:** `RPCE_DEBUG_DSYM=on|off`, unset meaning off. Recommended as written. One lane proposed `on|skip`; the difference is cosmetic.
 
@@ -1194,3 +1194,122 @@ Step 3 is therefore not staged or committed, and Steps 4–12 remain unimplement
 **Main's decision recommendation:** accept the reviewed Step 3 implementation at its measured gains, carrying the three missed PTY targets and narrowly contaminated memory result as non-blocking follow-up rather than authorizing a deeper rewrite. Clean PTY improvements are 22.0% (w0 CPU), 55.7% (w4 CPU) and 24.4% (w4 wall); this is not a claim that the original 50%/75% targets passed. The proposed optimization's projected savings remain estimates, not proof that the original targets are impossible.
 
 Main asked explicitly whether to approve this measured acceptance, commit Step 3 and proceed to Step 4. The request initially timed out after 300 seconds with no answer; the owner subsequently approved it explicitly, recorded as OD17. The user's request to resolve the gates was not silently treated as a waiver. Main verified the 60-file evidence manifest, the clean output/summary and contaminated-memory labels in capture B, and the lock summary. Reviewed r4 code remains byte-identical, the unrelated tracked documentation diff is unchanged, HEAD is still `506af898d9ed2b059a86b6317dd4949e3c06ca33`, and the index is empty. All worker processes finished. Only this owning plan changed; no additional code review round was used. That historical acceptance block is now resolved by OD17; Step 4 may proceed in plan order.
+
+### Step 4 implementation checkpoint (2026-10-06, OD13)
+
+Status (r0, frozen under `.agent-artifacts/step4-review-r0/`): **implemented; both initial reviews requested changes; remediation r1 follows below. Not accepted, not staged, not committed.** The parent is HEAD `f6bc1a8e` (Step 3 commit). Raw evidence is local under `.agent-artifacts/step4/`: `PARENT-SHA256SUMS`, `CANDIDATE-SHA256SUMS`, `delta-scripts.patch`, the `parent-f6bc1a8e/` target, mutation, footprint and bench outputs. It is not contribution material.
+
+Implementation (`Scripts/conductor.py`):
+
+- `RuntimeLedgerCache` is daemon-owned (`DaemonState.runtime_ledger_cache`). It keeps one current `MappingProxyType` snapshot keyed by `(resolved path, st_dev, st_ino, st_size, st_mtime_ns, st_ctime_ns)`.
+- **Loading.** `load()` runs under a private lock plus a single-flight event, never under `self.condition`. Joiners take the leader's result. The cache stats before and after the read, retries once on a change, and otherwise falls back. Unreadable, undecodable and changed-twice ledgers fall back to the flat budget with the existing "XCTest runtime ledger unavailable …" diagnostic and leave no current snapshot. An unexpected loader exception propagates to the leader; joiners get a fallback and the flight is always cleared.
+- **Parsing.** `_parse_xctest_method_runtimes` is the parent loop, extracted unchanged. A row lacking a suite, method or runtime is ignored, as is a negative, non-finite or unparsable runtime; the first valid row wins.
+- **Pin.** `_pin_xctest_method_runtimes` runs in `_run_job` after the start line and before `Popen`, outside the condition, and only for watchdog-enabled jobs without `--xctest-stall-seconds`. A fallback diagnostic is written to the log outside the condition; only the tail update and pin assignment take the condition.
+- **Release.** `_run_job`'s `finally` calls `_release_xctest_method_runtimes_locked` under the condition before lane release and scheduling. This covers completion, failure, cancellation, timeout and runner exceptions.
+- **Budget.** `_set_xctest_active_method_budget_locked` reads only the pinned snapshot. Its ledger I/O and the old `_load_xctest_method_runtimes_locked` are removed.
+- **Residency.** Every watchdog-enabled operation (`test`, `test-artifact`, `provider-test`, `core-test`) uses the `build` lane, so at most one job per daemon holds a pin. Resident snapshots are therefore the current one plus at most one older pinned one, which matches "at most 2". No counterexample was found.
+
+Behavior changes for review:
+
+- The fallback diagnostic now appears once per consulting job, right after the `$ argv` line, instead of at the first started marker. That includes jobs that fail before any marker. Because the line matches `OutputSummarizer.FAILURE_RE` (`No such file or directory`), it adds one error count, and the "Failure highlights" section of every summary now includes the following four lines as context. That covers success summaries as well, since success clears only "Recent output". Each context line stays within the Step 3 display cap of 400 characters. Normal checkouts are unaffected, because the ledger is tracked (OD3).
+- This exposed the OD16 lifecycle fixture `XCTestOutputContractLifecycleTests.run_child`, which had no ledger: its oversized record entered summary context. The fixture now writes a realistic ledger whose row does not match `M.S`. Budgets stay `default`-sourced, and every assertion is unchanged.
+- Two tests that asserted the old lazy load, `test_missing_runtime_ledger_logs_once_and_uses_default` and `test_negative_runtime_ledger_entry_is_ignored`, now pin first. Their assertions are unchanged.
+- r0 left the pre-existing clamp diagnostic in `_set_xctest_active_method_budget_locked` appending to the job log under the condition. Both reviews raised this as P1; remediation r1 below moves the write out of the condition.
+
+Harness adapter, the minimum needed for both arms (`Scripts/conductor_benchmark.py`, `HARNESS_VERSION` 7):
+
+- `mem@2` pins and releases through the target's production seam when present; older targets keep their lazy path. Control jobs never pin. The ledger arm checks `ledger-derived` budgets instead of the released field, and records `ledgerParsesFor5Jobs`.
+- `rss@2` checks ledger use by budget source.
+- The `step4-ledger` profile and gates are unchanged.
+
+Gates and evidence (host as in Step 3; Python 3.14.7):
+
+| Gate / check | Parent `f6bc1a8e` | Candidate | Limit | Result |
+|---|---|---|---|---|
+| `mem.ledger_retained_n200_mib` (median, 10 fresh-process pairs) | 310.231 MiB | 1.600 MiB (0.52%) | ≤4 MiB and ≤5% | `step4-ledger` compare **exit 0 (qualified)** |
+| `mem.ledger_retained_n56_mib` | 86.871 MiB | 1.566 MiB | — | no regression |
+| `mem.ledger_load_ms` (5 jobs, median) | 40.856 ms | 0.024 ms (cache-hit median: the one cold parse per identity, ~40 ms, runs before `Popen`, outside the condition) | — | no regression; not a faster parse |
+| Parses per unchanged identity | per job | 1 for 5 jobs in all 10 samples; 1 across sequential `_run_job` tests | 1 | pass |
+| Snapshot equivalence | 5,310 entries | 5,310 entries; equals the parent loader on the curated ledger | identical | pass |
+| No ledger I/O under `condition` | — | real `_run_job` boundary: every stat/open/parse saw `RLock._is_owned()` false; pinned before `Popen` | none | pass |
+| Contamination | — | 20 windows, median 1.54, max 3.53 foreign cores | ≤4.0 | clean |
+
+The capture `step4-mem-full-20261006` was one capture, with no retry used. It ran only the `mem` workload (`--full`, 417 s). Its 60-second preflight measured 4.59 foreign cores on the first attempt (no capture created), then 2.86. The harness digest is `e24d195c…`; arm conductor digests are parent `6300c81a…` and candidate `a2ef50e0…`. The `no-regression` profile on the same capture exits 2 only because the `output`, `summary` and `cli` workloads were not captured. That profile is not a Step 4 gate, and this is not a pass.
+
+**OD6 review trigger: fires; review only, no implementation.** A fresh real `__daemon` was run per arm: direct spawn, isolated state and socket, real machine slots, 56 retained `test` jobs through `./conductor test` on the `rss` fixture repo, and `/usr/bin/footprint`. All jobs completed, every log had a started marker, and none logged a fallback.
+
+| Arm | Fresh | After 56 jobs | RSS after |
+|---|---|---|---|
+| Parent | 41.9 MiB | 169.1 MiB | 180.0 MiB |
+| Candidate | 42.8 MiB | **86.8 MiB** | 99.4 MiB |
+
+The candidate exceeds 70 MiB. Its dirty memory is MALLOC_SMALL 37 MB, MALLOC_LARGE 26 MB and VM_ALLOCATE 20 MB (`footprint/footprint-*-detail.txt`). Nine conductor daemons were resident on the host (≥5). That count was observed in-session with `pgrep -fl __daemon | grep -c conductor.py`; no count artifact was saved. Both OD6 conditions hold, so idle exit and job history go to main's review.
+
+Validation:
+
+- `make conductor-selftest` exits 0 on the frozen candidate bytes, across 12 suites plus the context checker.
+- 16 focused `RuntimeLedgerCacheTests` cover: parent-equivalent parsing, including the curated ledger; one immutable snapshot per identity; inode and symlink keys; single-flight joiners; leader-exception release; retry-once; double-change fallback; unreadable and undecodable fallbacks; at most 2 resident; budget lookup with no I/O; the non-consulting job kinds; the real `_run_job` boundary; and release on completion, cancellation and runner error.
+- Mutation check: all 8 mutants are killed — no terminal release, no single-flight, no retry, I/O under the condition, no identity cache, no pre-start pin, no stat-after, last-row-wins.
+- `test_conductor_benchmark` passes 74 tests.
+- Main's own runs, initial-only evidence on the r0 bytes: `selftest-main.log` (exit 0) and `guardrails-main.log` (exit 0, one route-count warning) under `.agent-artifacts/step4/`.
+
+### Step 4 initial review outcome (2026-10-06)
+
+- **OracleA: changes requested.** S4-R0-LOCK-IO (P1): the budget clamp still writes the log under the condition. S4-R0-FALLBACK-COVERAGE (P2): the fixture change removed `_run_job` coverage of the missing-ledger path. The numerical gates are supported by the evidence.
+- **OracleB: changes requested.** S4-R0-01 (P1), the same clamp I/O. S4-R0-02 (P3): missing-ledger `_run_job` coverage is gone, and the plan's "failure summaries" wording was too narrow. S4-R0-03 (P3): the "at most 2 resident" bound rests on an unguarded lane invariant. S4-R0-04 (P3): the `mem.ledger_load_ms` label. S4-R0-05 (P3): missing index fields. No new `mem` capture is needed if the measured path is unchanged.
+- **OD6 review discussion.** Both lanes find both triggers fired, and both recommend keeping idle exit and job history deferred. OracleB suggests an owner question and Decision; OracleA, a separately authorized bounded follow-up. The existing OD6 scope is unchanged: the trigger requires review, not implementation, so no new Decision or owner waiver is needed. An optional re-check, after Steps 5–6, of footprint at 56 jobs and at the 200-job cap, with live-heap vs. footprint attribution, may inform a later decision. It is not a mandatory gate or campaign, and it has no deadline. Main states this in the fresh review.
+
+### Step 4 remediation r1 (2026-10-06, S4-R0-LOCK-IO / S4-R0-01, S4-R0-FALLBACK-COVERAGE / S4-R0-02, optional S4-R0-03–05)
+
+Raw evidence: `.agent-artifacts/step4-r1/`. Frozen r0 stays under `.agent-artifacts/step4-review-r0/`.
+
+- **Clamp diagnostic outside the condition.** `_set_xctest_active_method_budget_locked` now calls `_append_deferred_system_line_locked`. That appends the line to the tail under the condition, as before, and queues its log write on `Job.deferred_log_lines`. The queue is bounded: at most one line per transition in a batch, and it is taken every batch.
+  - **Flush points.**
+    - The output reader takes the queue under the same per-batch lock, then writes it after release: before the next batch and the next read.
+    - `_flush_deferred_log_lines` serves direct `_record_xctest_progress_locked` callers. Only tests call it; the benchmark `mem` adapter's jobs have no timeout, so they never clamp.
+    - `_run_job`'s `finally` flushes defensively after transports close.
+  - **Unchanged.** Diagnostic text, the raw-chunk write and flush, the reader's per-read order (raw bytes, then that read's clamp lines, then the next read), OD14 coalescing and OD16 failure handling. The OD16 failure line still follows the clamps of earlier records.
+  - **Ordering note.** A system line written by another thread (watchdog, termination) was never deterministically ordered against reader writes. It may now land between a clamp's tail append and its log write.
+- **Evidence.**
+  - On real `_run_job`, the parent `f6bc1a8e` and r1 produce byte-identical logs for the normal and the clamped scenarios (`logbytes/compare.txt`).
+  - Missing-ledger logs differ only by r0's earlier diagnostic position and its resolved path.
+- **Tests (`RuntimeLedgerCacheTests`).**
+  - A real-I/O clamped `_run_job` regression checks: tail order; each clamp logged once; log order started A < clamp A < started B < clamp B; and every clamp write made with `RLock._is_owned()` false.
+  - A direct-caller flush test checks that the line is queued, then logged once, after the condition.
+  - A terminal-flush test.
+  - A lane-invariant test for S4-R0-03: exactly `test`, `test-artifact`, `provider-test` and `core-test` are watchdog operations, and `registry.prepare` gives each the `build` lane.
+- **Missing-ledger coverage (`XCTestOutputContractLifecycleTests`).**
+  - `assert_failed_visibly` is split, with no assertion removed. `assert_failed_visibly_contract` holds the OD16 contract: failed, exit 70, a bounded output-free reason, no ticket artifact, measurement invalid, and its own log line. The 200-nines check remains for existing callers.
+  - A new D1 `_run_job` test runs without a ledger. It checks: the full contract; one fallback diagnostic; a `default` budget clamped to the 20 s timeout; log order `$ argv` < diagnostic < first child output; both system writes made outside the condition; and every rendered summary line within the 400-character cap.
+  - The prior failing assertion, reproduced on frozen r0 with the fixture ledger removed (`prior-fixture-failure.log`), was line 3959 `assertNotIn("9" * 200, rendered)` in cases `d1a-huge-parenthetical` and `d1-eof-without-newline`. The oversized record appeared only as display-capped "Failure highlights" context after the diagnostic (≤399 nines plus `…`). The reason stayed output-free. That check guards incidental summary context, not the OD16 contract, and it stays in place with the realistic fixture.
+- **Measurement binding.** The cache, pin, release and `mem` adapter are unchanged. `Job` gained one field defaulting to `None`, and the clamp branch never runs in `mem`. The r0 `step4-mem-full-20261006` capture therefore stands for the measured path; the conductor digest delta is disclosed in the r1 hashes. No new capture was taken.
+- **Validation:**
+  - `make conductor-selftest`;
+  - mutations R1-M1–M9: all killed (`mutation/results.txt`);
+  - guardrails, the context check and `git diff --check`, results in `.agent-artifacts/step4-r1/`.
+
+Step 4 review index (main-owned, OD13):
+
+| Item | State |
+|---|---|
+| Decisions relied on | OD6 (footprint review trigger; idle exit and history deferred), OD13 (review policy), OD17 (parent `f6bc1a8e` acceptance) |
+| Initial OracleA review | Changes requested: S4-R0-LOCK-IO P1 (open), S4-R0-FALLBACK-COVERAGE P2 (open). Record: `prompt-exports/oracle-review-2026-10-06-180247-oraclea-step4-initia-f0f4.md` |
+| Initial OracleB review | Changes requested: S4-R0-01 P1 (open), S4-R0-02–05 P3 (open). Record: `prompt-exports/oracle-review-2026-10-06-181036-oracleb-step4-initia-d3c1.md` |
+| Re-review rounds used | 1 / 5; both fresh round-1 lanes approve |
+| Open findings | No P0/P1. Initial findings closed by their owning lanes. Nonblocking test-timing observation S4-R1-TEST-SYNC (OracleA P2) / S4-R1-01 (OracleB P3) deferred. S4-R1-02 documentation upkeep addressed below |
+| r0 bytes | `CANDIDATE-SHA256SUMS` (`conductor.py` `82521297…`, `conductor_benchmark.py` `39be6365…`, `test_conductor_lifecycle.py` `e99efc5f…`); delta `delta-scripts.patch` `f69be751…` |
+| r1 bytes | Frozen `.agent-artifacts/step4-review-r1/files/`, `SHA256SUMS`, `r0-r1.patch`; identical code to `.agent-artifacts/step4-r1/R1-SHA256SUMS`. This outcome update is documentation-only after freeze |
+| Round-1 OracleA | Approved; S4-R0-LOCK-IO closed as fixed, not downgraded; S4-R0-FALLBACK-COVERAGE closed as fixed. Record: `prompt-exports/oracle-review-2026-10-06-183203-oraclea-step4-r1-cla-f992.md` |
+| Round-1 OracleB | Approved; S4-R0-01 closed as fixed, not downgraded; S4-R0-02–05 closed. Record: `prompt-exports/oracle-review-2026-10-06-183756-oracleb-step4-r1-cla-ae14.md` |
+
+### Step 4 round-1 acceptance (2026-10-06)
+
+Main verified both exact preset identities and complete-delta receipts. Both lanes approve the frozen r1 code; neither identifies a remaining blocking code defect. OracleA identifies no mandatory acceptance gap beyond pre-commit work; OracleB confirms the Step 4 gates pass for r1, with staged-index contribution preflight required before commit.
+
+Main independently ran `make conductor-selftest` (exit 0; 12 suites including 123 output, 74 benchmark, 67 metrics and 171 lifecycle tests), `make guardrails` (exit 0), `Scripts/check-agent-context` (exit 0, existing route-count warning), and `git diff --check` (exit 0). Logs are `.agent-artifacts/step4-r1/{selftest-main,guardrails-main,context-main}.log`. The six-entry hash manifest matched before and after validation, and the unrelated tracked documentation diff matches the session-start capture. Worker evidence records all 9 remediation mutations killed. No Swift application build or live-app validation was run for this Python-only step.
+
+The r0 clean ledger capture is carried forward only for the unchanged measured path, as explicitly accepted by both lanes: 200-job ledger-retained heap is 1.600 MiB versus 310.231 MiB, a 99.48% reduction, with one parse per unchanged identity. The added `Job` field defaults to `None` in both control and ledger arms; their adapter jobs have no timeout and cannot enter the changed clamp path. This is not a new r1 capture or an unchanged conductor digest claim.
+
+**Nonblocking finding:** S4-R1-TEST-SYNC (OracleA P2) and S4-R1-01 (OracleB P3) identify the same potential test flake: the clamp-order test uses a 300 ms child delay rather than a handshake. A delayed reader may receive both methods in one group, making its ordering assertion fail although production behavior is correct. Both lanes explicitly permit deferral and say not to open another round solely for it. Keep the finding for the next necessary edit to that test; no assertions are weakened here. S4-R1-02's index/OD6 provenance upkeep is addressed by this update.
+
+**OD6 disposition by main:** review discharged; existing deferral unchanged. OracleB explicitly withdraws its initial required-owner-question framing. No idle exit, persisted history, mandatory 200-job footprint campaign, or new owner waiver is introduced. Step 5 may proceed after Step 4's isolated commit. Main staged only `Scripts/conductor.py`, `Scripts/conductor_benchmark.py`, `Scripts/test_conductor_lifecycle.py` and this plan. Staged code blobs match the frozen reviewed snapshot. Staged-index preflight passed (`.agent-artifacts/step4-r1/preflight-commit.log`), but `git commit` failed with `error: 1Password: agent returned an error` / `fatal: failed to write commit object`. HEAD remains `f6bc1a8e`; signing configuration is unchanged. Main asked the owner to unlock or repair the signing agent; the question timed out with no answer. The four files remain staged, unrelated edits remain unstaged, and no worker or validation process is running. Step 5 is not started. This status update is documentation-only and is restaged with a fresh preflight before handoff.
