@@ -156,6 +156,21 @@ def read_runner_timings(path: Path) -> Optional[Dict[str, Any]]:
     return value if isinstance(value, dict) else None
 
 
+def generated_job_file_ticket(name: str) -> Optional[str]:
+    """The daemon-generated ticket owning file ``name``, or ``None``.
+
+    Orphan sweeps delete only ``<uuid ticket><exact generated suffix>`` names;
+    anything else in the jobs directory (build tickets, workdirs, foreign
+    files) is never touched.
+    """
+    for suffix in GENERATED_JOB_FILE_SUFFIXES:
+        if name.endswith(suffix):
+            stem = name[: -len(suffix)]
+            if JOB_TICKET_RE.match(stem):
+                return stem
+    return None
+
+
 PROTOCOL_VERSION = 15
 TERMINAL_STATES = {"completed", "failed", "canceled"}
 LANE_NAMES = {"build", "debugArtifact", "liveApp", "release", "style"}
@@ -174,6 +189,13 @@ PROGRESS_HEARTBEAT_SECONDS = 30.0
 PROGRESS_MAX_LINES_PER_POLL = 6
 MAX_TERMINAL_JOBS = 200
 TERMINAL_RETENTION_SECONDS = 24 * 60 * 60
+# Step 5 maintenance worker: orphan sweeps (and retries of failed unlinks) run at
+# most this often; retries are bounded so a persistently failing unlink cannot grow memory.
+ORPHAN_SWEEP_INTERVAL_SECONDS = 60.0
+MAINTENANCE_RETRY_LIMIT = 1024
+# The only per-ticket files retention ever deletes: logs, XCTest stall diagnostics, timing sidecars.
+GENERATED_JOB_FILE_SUFFIXES = (".log", ".xctest-stall.json", ".xctest-stall.sample.txt") + TIMING_FILE_SUFFIXES
+JOB_TICKET_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\Z")
 STARTUP_TIMEOUT_SECONDS = 10.0
 WAIT_POLL_SECONDS = 1.0
 # Client bound on re-polling a terminal job whose summary another caller is computing.
@@ -2957,6 +2979,18 @@ class DaemonState:
         self.timing_enabled = PIPELINE_METRICS is not None and PIPELINE_METRICS.timing_enabled(os.environ)
         self.timing_history: Optional[Any] = None
         self._telemetry_completions = 0  # background completions of never-dispatched jobs
+        # Step 5 retention: ``_retention_pass_locked`` decides evictions in memory;
+        # one on-demand maintenance worker does every scan, stat and unlink outside
+        # ``condition``. Lock order is ``condition`` -> ``_maintenance_cv``; the
+        # worker never takes ``condition`` while holding ``_maintenance_cv``.
+        self._maintenance_cv = threading.Condition(threading.Lock())
+        self._maintenance_items: List[Tuple[str, Tuple[Path, ...]]] = []
+        self._maintenance_retry: Dict[Path, str] = {}  # failed exact unlinks: path -> ticket
+        self._maintenance_thread: Optional[threading.Thread] = None
+        self._maintenance_busy = False
+        self._orphan_sweep_requested = False
+        self._last_orphan_sweep: Optional[float] = None  # monotonic start of the last sweep
+        self._maintenance_error: Optional[str] = None
         if self.timing_enabled:
             try:
                 self.timing_history = PIPELINE_METRICS.RotatingJsonl(timing_history_path(paths))
@@ -3067,7 +3101,9 @@ class DaemonState:
         that was never dispatched), never by a client request. ``phaseMetrics``
         is published before persistence, and the job result never waits for
         either: client reads see ``pending`` until this publishes. Persistence
-        runs outside every lock; only the first caller persists.
+        runs outside every lock; only the first caller persists. Both callers
+        hold a retention pin across this call (Step 5), so persistence never
+        recreates a pruned timing sidecar.
         """
         recorder = job.telemetry
         if recorder is None:
@@ -3110,10 +3146,13 @@ class DaemonState:
         """A job made terminal before dispatch: complete its timing off the scheduler lock.
 
         Intervals it never reached stay unavailable; nothing waits for this.
+        The worker pins the job against retention until it has persisted (Step 5),
+        so a late timing write can never recreate a pruned sidecar.
         """
         if job.telemetry is None or job.telemetry_dispatch_ns is not None or job.telemetry_persist_claimed:
             return
         self._telemetry_completions += 1
+        self._pin_job_locked(job)
 
         def complete() -> None:
             try:
@@ -3122,6 +3161,7 @@ class DaemonState:
                 with self.condition:
                     self._telemetry_completions -= 1
                     self.condition.notify_all()
+                    self._unpin_job_locked(job)
 
         try:
             threading.Thread(target=complete, name=f"timing-{job.ticket}", daemon=True).start()
@@ -3133,6 +3173,7 @@ class DaemonState:
             job.telemetry_persist_error = f"timing worker not started: {type(exc).__name__}: {exc}"[:256]
             job.telemetry_persisted = True
             self.condition.notify_all()
+            self._unpin_job_locked(job)
 
     def _await_job_telemetry(self, timeout: float, job: Optional[Job] = None) -> bool:
         """Private drain for tests, qualification and daemon exit; never on a client path.
@@ -3444,11 +3485,18 @@ class DaemonState:
                 termination_sent = bool(old_job.process_pid or old_job.process_pgid)
                 if termination_sent:
                     self._terminate_process_group_locked(old_job, reason=reason)
-                threading.Thread(
-                    target=self._escalate_canceled_job_after_grace,
-                    args=(old_job.ticket, reason, termination_sent),
-                    daemon=True,
-                ).start()
+                # Step 5: pinned until the escalation's last write; released in its
+                # ``finally`` (or here when the thread cannot start).
+                self._pin_job_locked(old_job)
+                try:
+                    threading.Thread(
+                        target=self._escalate_canceled_job_after_grace,
+                        args=(old_job.ticket, reason, termination_sent, old_job),
+                        daemon=True,
+                    ).start()
+                except BaseException:
+                    self._unpin_job_locked(old_job)
+                    raise
                 cancellation_state = "cancellation-requested"
             superseded.append(
                 {
@@ -3460,29 +3508,36 @@ class DaemonState:
             )
         return superseded, guard_delayed_launch
 
-    def _escalate_canceled_job_after_grace(self, ticket: str, reason: str, termination_sent: bool) -> None:
+    def _escalate_canceled_job_after_grace(
+        self, ticket: str, reason: str, termination_sent: bool, pinned_job: Optional[Job] = None
+    ) -> None:
+        """Escalate a superseded running job; releases ``pinned_job``'s retention pin last."""
         with self.condition:
-            job = self.jobs.get(ticket)
-            while job and job.state == "running" and not job.process_pid:
-                self.condition.wait(timeout=PROCESS_TREE_POLL_SECONDS)
+            try:
                 job = self.jobs.get(ticket)
-            if not job or job.state != "running":
-                return
-            if not termination_sent:
-                self._terminate_process_group_locked(job, reason=reason)
-            descendants_alive = self._wait_for_process_tree_exit_locked(
-                job,
-                now() + TERMINATE_GRACE_SECONDS,
-                signal_for_new=signal.SIGTERM,
-            )
-            if descendants_alive:
-                self._kill_process_group_locked(job, reason=f"{reason}; SIGKILL after grace period")
-                self._wait_for_process_tree_exit_locked(
+                while job and job.state == "running" and not job.process_pid:
+                    self.condition.wait(timeout=PROCESS_TREE_POLL_SECONDS)
+                    job = self.jobs.get(ticket)
+                if not job or job.state != "running":
+                    return
+                if not termination_sent:
+                    self._terminate_process_group_locked(job, reason=reason)
+                descendants_alive = self._wait_for_process_tree_exit_locked(
                     job,
-                    now() + KILL_GRACE_SECONDS,
-                    signal_for_new=signal.SIGKILL,
+                    now() + TERMINATE_GRACE_SECONDS,
+                    signal_for_new=signal.SIGTERM,
                 )
-            self.condition.notify_all()
+                if descendants_alive:
+                    self._kill_process_group_locked(job, reason=f"{reason}; SIGKILL after grace period")
+                    self._wait_for_process_tree_exit_locked(
+                        job,
+                        now() + KILL_GRACE_SECONDS,
+                        signal_for_new=signal.SIGKILL,
+                    )
+                self.condition.notify_all()
+            finally:
+                if pinned_job is not None:
+                    self._unpin_job_locked(pinned_job)
 
     def list_jobs(self, state_filter: Optional[str]) -> Dict[str, Any]:
         with self.lock:
@@ -3511,6 +3566,16 @@ class DaemonState:
         return job
 
     def _pin_job_locked(self, job: Job) -> None:
+        """Protect ``job`` and its files from retention until the matching unpin.
+
+        Holders: ``_run_job`` from dispatch through summary and timing
+        finalization, its reader/watchdog/summary threads, the undispatched
+        timing worker, the cancellation owners that wait on the condition
+        (``_cancel_running_job_locked``, supersession escalation, ``stop --force``
+        cleanup), and status/wait/summary calls. Every pin is released in a
+        ``finally`` after the holder's last write, so no late write can recreate a
+        pruned file.
+        """
         job.summary_pins += 1
 
     def _unpin_job_locked(self, job: Job) -> None:
@@ -3518,6 +3583,27 @@ class DaemonState:
         if job.summary_pins <= 0 and job.retention_deferred:
             job.retention_deferred = False
             self._retention_pass_locked()
+
+    def _start_job_owned_thread(self, job: Job, target: Any, args: Tuple[Any, ...]) -> threading.Thread:
+        """Start a daemon thread that writes ``job``'s files, pinned until ``target`` returns."""
+        with self.condition:
+            self._pin_job_locked(job)
+
+        def run() -> None:
+            try:
+                target(*args)
+            finally:
+                with self.condition:
+                    self._unpin_job_locked(job)
+
+        try:
+            thread = threading.Thread(target=run, daemon=True)
+            thread.start()
+        except BaseException:
+            with self.condition:
+                self._unpin_job_locked(job)
+            raise
+        return thread
 
     def job_status(self, ticket: Optional[str], request_key: Optional[str]) -> Dict[str, Any]:
         with self.lock:
@@ -3588,35 +3674,53 @@ class DaemonState:
 
     def stop(self, force: bool) -> Dict[str, Any]:
         running_tickets: List[str] = []
-        with self.condition:
-            active_or_queued = [job for job in self.jobs.values() if job.state in {"queued", "running"}]
-            if active_or_queued and not force:
-                raise ConductorError(
-                    "daemon has active or queued jobs; use 'daemon stop --force' to cancel them before stopping"
-                )
-            self.shutdown_requested = True
-            if force:
-                for job in list(active_or_queued):
-                    job.cancel_requested = True
-                    if job.state == "queued":
-                        job.state = "canceled"
-                        job.finished_at = now()
-                        job.exit_code = 130
-                        job.result_summary = "canceled by daemon stop --force"
-                        with contextlib.suppress(ValueError):
-                            self.queue.remove(job.ticket)
-                        self._append_system_line_locked(job, "job canceled by daemon stop --force before start\n")
-                        self._complete_undispatched_telemetry_locked(job)
-                    elif job.state == "running":
-                        running_tickets.append(job.ticket)
-                        self._terminate_process_group_locked(job, reason="daemon stop --force")
-                self._write_running_processes_locked()
-                self.condition.notify_all()
-            payload = self.status_payload()
-        if force and running_tickets:
-            threading.Thread(target=self._force_shutdown_when_canceled, args=(running_tickets,), daemon=True).start()
-        else:
-            threading.Thread(target=self._shutdown_server_soon, daemon=True).start()
+        # Step 5: every pin acquired below is owned here until the force-shutdown
+        # thread has started; from then on that thread releases them after its
+        # last write. Any failure before the handoff releases exactly these pins.
+        running_jobs: List[Job] = []
+        handed_off = False
+        try:
+            with self.condition:
+                active_or_queued = [job for job in self.jobs.values() if job.state in {"queued", "running"}]
+                if active_or_queued and not force:
+                    raise ConductorError(
+                        "daemon has active or queued jobs; use 'daemon stop --force' to cancel them before stopping"
+                    )
+                self.shutdown_requested = True
+                if force:
+                    for job in list(active_or_queued):
+                        job.cancel_requested = True
+                        if job.state == "queued":
+                            job.state = "canceled"
+                            job.finished_at = now()
+                            job.exit_code = 130
+                            job.result_summary = "canceled by daemon stop --force"
+                            with contextlib.suppress(ValueError):
+                                self.queue.remove(job.ticket)
+                            self._append_system_line_locked(job, "job canceled by daemon stop --force before start\n")
+                            self._complete_undispatched_telemetry_locked(job)
+                        elif job.state == "running":
+                            running_tickets.append(job.ticket)
+                            # Step 5: pinned until the force-shutdown cleanup's last write.
+                            self._pin_job_locked(job)
+                            running_jobs.append(job)
+                            self._terminate_process_group_locked(job, reason="daemon stop --force")
+                    self._write_running_processes_locked()
+                    self.condition.notify_all()
+                payload = self.status_payload()
+            if force and running_tickets:
+                threading.Thread(
+                    target=self._force_shutdown_when_canceled, args=(running_tickets, running_jobs), daemon=True
+                ).start()
+                handed_off = True
+            else:
+                threading.Thread(target=self._shutdown_server_soon, daemon=True).start()
+        except BaseException:
+            if running_jobs and not handed_off:
+                with self.condition:
+                    for job in running_jobs:
+                        self._unpin_job_locked(job)
+            raise
         return payload
 
     def _shutdown_server_soon(self) -> None:
@@ -3624,25 +3728,30 @@ class DaemonState:
         if self.server is not None:
             self.server.shutdown()
 
-    def _force_shutdown_when_canceled(self, tickets: List[str]) -> None:
+    def _force_shutdown_when_canceled(self, tickets: List[str], pinned_jobs: Sequence[Job] = ()) -> None:
+        """Escalate ``stop --force`` cleanup; releases ``pinned_jobs``' retention pins after the last write."""
         with self.condition:
-            for ticket in tickets:
-                job = self.jobs.get(ticket)
-                if not job or job.state != "running":
-                    continue
-                descendants_alive = self._wait_for_process_tree_exit_locked(
-                    job,
-                    now() + TERMINATE_GRACE_SECONDS,
-                    signal_for_new=signal.SIGTERM,
-                )
-                if descendants_alive:
-                    self._kill_process_group_locked(job, reason="daemon stop --force; SIGKILL after grace period")
-                    self._wait_for_process_tree_exit_locked(
+            try:
+                for ticket in tickets:
+                    job = self.jobs.get(ticket)
+                    if not job or job.state != "running":
+                        continue
+                    descendants_alive = self._wait_for_process_tree_exit_locked(
                         job,
-                        now() + KILL_GRACE_SECONDS,
-                        signal_for_new=signal.SIGKILL,
+                        now() + TERMINATE_GRACE_SECONDS,
+                        signal_for_new=signal.SIGTERM,
                     )
-            self.condition.notify_all()
+                    if descendants_alive:
+                        self._kill_process_group_locked(job, reason="daemon stop --force; SIGKILL after grace period")
+                        self._wait_for_process_tree_exit_locked(
+                            job,
+                            now() + KILL_GRACE_SECONDS,
+                            signal_for_new=signal.SIGKILL,
+                        )
+                self.condition.notify_all()
+            finally:
+                for job in pinned_jobs:
+                    self._unpin_job_locked(job)
         time.sleep(0.2)
         if self.server is not None:
             self.server.shutdown()
@@ -3836,9 +3945,14 @@ class DaemonState:
         global_xctest_slot: Optional[Any] = None
         telemetry: Optional[Any] = None
         provenance_scope = contextlib.ExitStack()
+        owner_pinned = False
         try:
             with self.lock:
                 job = self.jobs[ticket]
+                # Step 5: a running job is never evicted; this pin extends that
+                # through the terminal transition, summary and timing persistence.
+                self._pin_job_locked(job)
+                owner_pinned = True
                 telemetry = job.telemetry
                 dispatch_ns = job.telemetry_dispatch_ns
                 request = {
@@ -3962,19 +4076,12 @@ class DaemonState:
                         self._terminate_process_group_locked(job, reason="cancellation requested before PID assignment")
                     self.condition.notify_all()
 
-                reader = threading.Thread(
-                    target=self._read_process_output,
-                    args=(job.ticket, process, log_file, output_transport),
-                    daemon=True,
+                # Both may outlive their bounded joins; each pins the job until it returns.
+                reader = self._start_job_owned_thread(
+                    job, self._read_process_output, (job.ticket, process, log_file, output_transport)
                 )
-                reader.start()
                 if self._xctest_watchdog_enabled(job):
-                    watchdog = threading.Thread(
-                        target=self._monitor_xctest_stall,
-                        args=(job.ticket,),
-                        daemon=True,
-                    )
-                    watchdog.start()
+                    watchdog = self._start_job_owned_thread(job, self._monitor_xctest_stall, (job.ticket,))
                 try:
                     exit_code = process.wait(timeout=effective_timeout)
                 except subprocess.TimeoutExpired:
@@ -4243,56 +4350,65 @@ class DaemonState:
                     job.finished_at = now()
                     self._append_system_line_locked(job, f"daemon runner error: {exc}\n")
         finally:
-            provenance_scope.close()
-            self._release_global_slot(global_xctest_slot)
-            self._release_global_slot(global_heavy_slot)
-            if output_transport is not None:
-                output_transport.close_all()
-            if job is not None and job.deferred_log_lines:
-                # Defensive: the reader writes its own queue after every batch.
-                self._flush_deferred_log_lines(job)
-            refresh_after_release = False
-            lane_release_ns: Optional[int] = None
-            retention_ns: Optional[int] = None
-            retention_cpu_ns = 0
-            with self.condition:
-                if job is not None:
-                    # Every _run_job exit is the job's terminal transition here.
-                    self._release_xctest_method_runtimes_locked(job)
-                    refresh_after_release = job.state in TERMINAL_STATES and job.output_summary is None
-                    for lane in list(job.lanes):
-                        if self.active_lanes.get(lane) == job.ticket:
-                            del self.active_lanes[lane]
-                    self._write_running_processes_locked()
-                    if telemetry is None:
-                        self._retention_pass_locked()
-                    else:
-                        lane_release_ns = time.monotonic_ns()
-                        retention_cpu_start = time.thread_time_ns()
-                        self._retention_pass_locked()
-                        retention_cpu_ns = time.thread_time_ns() - retention_cpu_start
-                        retention_ns = time.monotonic_ns() - lane_release_ns
-                self._schedule_locked()
-                self.condition.notify_all()
-            if job is not None and telemetry is not None:
-                # Recorded after the scheduler lock; the lane-released flag is set
-                # only afterwards so finalization never precedes these records.
-                self._telemetry_boundary(telemetry, "lane_released", lane_release_ns)
-                self._telemetry_operation(
-                    telemetry, "retention_pass", retention_ns, {"threadCpuNs": retention_cpu_ns}, "daemon.lane_release"
-                )
+            try:
+                provenance_scope.close()
+                self._release_global_slot(global_xctest_slot)
+                self._release_global_slot(global_heavy_slot)
+                if output_transport is not None:
+                    output_transport.close_all()
+                if job is not None and job.deferred_log_lines:
+                    # Defensive: the reader writes its own queue after every batch.
+                    self._flush_deferred_log_lines(job)
+                refresh_after_release = False
+                lane_release_ns: Optional[int] = None
+                retention_ns: Optional[int] = None
+                retention_cpu_ns = 0
                 with self.condition:
-                    job.telemetry_lane_released = True
+                    if job is not None:
+                        # Every _run_job exit is the job's terminal transition here.
+                        self._release_xctest_method_runtimes_locked(job)
+                        refresh_after_release = job.state in TERMINAL_STATES and job.output_summary is None
+                        for lane in list(job.lanes):
+                            if self.active_lanes.get(lane) == job.ticket:
+                                del self.active_lanes[lane]
+                        self._write_running_processes_locked()
+                        if telemetry is None:
+                            self._retention_pass_locked()
+                        else:
+                            lane_release_ns = time.monotonic_ns()
+                            retention_cpu_start = time.thread_time_ns()
+                            self._retention_pass_locked()
+                            retention_cpu_ns = time.thread_time_ns() - retention_cpu_start
+                            retention_ns = time.monotonic_ns() - lane_release_ns
+                    self._schedule_locked()
                     self.condition.notify_all()
-                if refresh_after_release:
-                    # Same summary work as the legacy thread, run on this job
-                    # thread: the summary is published first, then timing is
-                    # finalized, published and persisted without blocking it.
-                    self._refresh_output_summary(job, complete_telemetry=True)
-                else:
-                    self.complete_job_telemetry(job)
-            elif job is not None and refresh_after_release:
-                threading.Thread(target=self._refresh_output_summary, args=(job,), daemon=True).start()
+                if job is not None and telemetry is not None:
+                    # Recorded after the scheduler lock; the lane-released flag is set
+                    # only afterwards so finalization never precedes these records.
+                    self._telemetry_boundary(telemetry, "lane_released", lane_release_ns)
+                    self._telemetry_operation(
+                        telemetry, "retention_pass", retention_ns, {"threadCpuNs": retention_cpu_ns}, "daemon.lane_release"
+                    )
+                    with self.condition:
+                        job.telemetry_lane_released = True
+                        self.condition.notify_all()
+                    if refresh_after_release:
+                        # Same summary work as the legacy thread, run on this job
+                        # thread: the summary is published first, then timing is
+                        # finalized, published and persisted without blocking it.
+                        self._refresh_output_summary(job, complete_telemetry=True)
+                    else:
+                        self.complete_job_telemetry(job)
+                elif job is not None and refresh_after_release:
+                    self._start_job_owned_thread(job, self._refresh_output_summary, (job,))
+            finally:
+                if owner_pinned and job is not None:
+                    # Released last: summary, timing persistence and every writer it
+                    # started are done or hold their own pins (Step 5). Writers it did
+                    # not start (job cancel, supersession escalation, force-stop
+                    # cleanup) pin the job themselves until their last write.
+                    with self.condition:
+                        self._unpin_job_locked(job)
 
     def _xctest_progress_transitions(self, records: Sequence[Any]) -> List[Tuple[int, str, Any]]:
         """Recognized XCTest progress lines of ``records``, in order (outside the lock).
@@ -5322,27 +5438,33 @@ class DaemonState:
             pass
 
     def _cancel_running_job_locked(self, job: Job, reason: str) -> None:
-        pid_deadline = now() + 1.0
-        while job.state == "running" and not job.process_pid and now() < pid_deadline:
-            self.condition.wait(timeout=PROCESS_TREE_POLL_SECONDS)
-        if job.state != "running":
-            return
-        self._terminate_process_group_locked(job, reason=reason)
-        descendants_alive = self._wait_for_process_tree_exit_locked(
-            job,
-            now() + TERMINATE_GRACE_SECONDS,
-            signal_for_new=signal.SIGTERM,
-        )
-        if descendants_alive:
-            self._kill_process_group_locked(job, reason=f"{reason}; SIGKILL after grace period")
-            self._wait_for_process_tree_exit_locked(
+        # Step 5: the condition waits below let ``_run_job`` finish and unpin; this
+        # pin keeps the job (and its log) until the last cancellation write.
+        self._pin_job_locked(job)
+        try:
+            pid_deadline = now() + 1.0
+            while job.state == "running" and not job.process_pid and now() < pid_deadline:
+                self.condition.wait(timeout=PROCESS_TREE_POLL_SECONDS)
+            if job.state != "running":
+                return
+            self._terminate_process_group_locked(job, reason=reason)
+            descendants_alive = self._wait_for_process_tree_exit_locked(
                 job,
-                now() + KILL_GRACE_SECONDS,
-                signal_for_new=signal.SIGKILL,
+                now() + TERMINATE_GRACE_SECONDS,
+                signal_for_new=signal.SIGTERM,
             )
-        completion_deadline = now() + KILL_GRACE_SECONDS
-        while job.state == "running" and now() < completion_deadline:
-            self.condition.wait(timeout=PROCESS_TREE_POLL_SECONDS)
+            if descendants_alive:
+                self._kill_process_group_locked(job, reason=f"{reason}; SIGKILL after grace period")
+                self._wait_for_process_tree_exit_locked(
+                    job,
+                    now() + KILL_GRACE_SECONDS,
+                    signal_for_new=signal.SIGKILL,
+                )
+            completion_deadline = now() + KILL_GRACE_SECONDS
+            while job.state == "running" and now() < completion_deadline:
+                self.condition.wait(timeout=PROCESS_TREE_POLL_SECONDS)
+        finally:
+            self._unpin_job_locked(job)
 
     def _refresh_process_tree_locked(self, job: Job) -> Tuple[Dict[int, Tuple[int, str]], Dict[int, int]]:
         snapshot = process_table_snapshot()
@@ -5575,6 +5697,14 @@ class DaemonState:
         self._signal_process_tree_locked(job, signal.SIGKILL)
 
     def _retention_pass_locked(self) -> None:
+        """Decide evictions in memory only (24 h / ``MAX_TERMINAL_JOBS``); never touch the filesystem.
+
+        Runs under ``self.condition`` on every transition. An evicted job's exact
+        generated files are handed to the maintenance worker, which also runs a
+        coalesced orphan sweep at most once per ``ORPHAN_SWEEP_INTERVAL_SECONDS``.
+        A pinned job is never evicted; its last unpin reruns this pass. An
+        evicted ticket then reads as unknown, as before.
+        """
         cutoff = now() - TERMINAL_RETENTION_SECONDS
         terminal = [job for job in self.jobs.values() if job.state in TERMINAL_STATES]
         prune: set[str] = set()
@@ -5587,69 +5717,175 @@ class DaemonState:
         due.extend(terminal_sorted[:excess])
         for job in due:
             if job.summary_pins > 0:
-                # Summary work or a status/wait payload still uses this job and
-                # its log; the last unpin reruns this pass.
+                # Summary work, timing finalization, a job-owned writer or a
+                # status/wait payload still uses this job and its files; the
+                # last unpin reruns this pass.
                 job.retention_deferred = True
             else:
                 prune.add(job.ticket)
+        removals: List[Tuple[str, Tuple[Path, ...]]] = []
         for ticket in prune:
             job = self.jobs.pop(ticket, None)
             if not job:
                 continue
-            with contextlib.suppress(FileNotFoundError):
-                job.log_path.unlink()
-            for diagnostic_path in job.diagnostic_paths:
-                with contextlib.suppress(FileNotFoundError):
-                    diagnostic_path.unlink()
-            for suffix in TIMING_FILE_SUFFIXES:
-                with contextlib.suppress(OSError):
-                    (self.paths.jobs_dir / f"{ticket}{suffix}").unlink()
+            removals.append(
+                (
+                    ticket,
+                    (
+                        job.log_path,
+                        *job.diagnostic_paths,
+                        *(self.paths.jobs_dir / f"{ticket}{suffix}" for suffix in TIMING_FILE_SUFFIXES),
+                    ),
+                )
+            )
             for key, mapped_ticket in list(self.request_keys.items()):
                 if mapped_ticket == ticket:
                     del self.request_keys[key]
+        self._signal_maintenance_locked(removals)
 
-        retained_logs = {job.log_path.name for job in self.jobs.values()}
-        with contextlib.suppress(FileNotFoundError):
-            for log_path in self.paths.jobs_dir.glob("*.log"):
-                if log_path.name not in retained_logs:
-                    try:
-                        age = now() - log_path.stat().st_mtime
-                    except OSError:
-                        continue
-                    if age > TERMINAL_RETENTION_SECONDS:
-                        with contextlib.suppress(FileNotFoundError):
-                            log_path.unlink()
+    # -- Step 5 maintenance worker ---------------------------------------------
+    # Signaled by retention passes; started on demand and exits when no work is
+    # due, so at most one runs per daemon. It never holds ``self.condition``
+    # while it scans, stats or unlinks. Failures are retried by later sweeps,
+    # recorded only in ``_maintenance_error`` and never change a job.
 
-        retained_diagnostics = {
-            diagnostic_path.name
-            for job in self.jobs.values()
-            for diagnostic_path in job.diagnostic_paths
-        }
-        with contextlib.suppress(FileNotFoundError):
-            for diagnostic_path in self.paths.jobs_dir.glob("*.xctest-stall.*"):
-                if diagnostic_path.name in retained_diagnostics:
-                    continue
+    def _orphan_sweep_due_locked(self, monotonic_now: float) -> bool:
+        """Under ``_maintenance_cv``: a requested sweep whose interval has elapsed."""
+        return self._orphan_sweep_requested and (
+            self._last_orphan_sweep is None
+            or monotonic_now - self._last_orphan_sweep >= ORPHAN_SWEEP_INTERVAL_SECONDS
+        )
+
+    def _signal_maintenance_locked(self, removals: Sequence[Tuple[str, Tuple[Path, ...]]]) -> None:
+        """Queue exact removals, request a sweep and wake (or start) the worker; no I/O."""
+        with self._maintenance_cv:
+            self._maintenance_items.extend(removals)
+            self._orphan_sweep_requested = True
+            if self._maintenance_thread is not None:
+                # The running worker re-checks for due work before it exits.
+                self._maintenance_cv.notify_all()
+                return
+            if not self._maintenance_items and not self._orphan_sweep_due_locked(time.monotonic()):
+                return  # coalesced: the request waits for a later signal once due
+            thread = threading.Thread(target=self._maintenance_loop, name="conductor-maintenance", daemon=True)
+            self._maintenance_thread = thread
+            try:
+                thread.start()
+            except Exception as exc:  # noqa: BLE001 - cleanup never changes the lifecycle
+                # Work stays queued; the next signal tries to start a worker again.
+                self._maintenance_thread = None
+                self._maintenance_error = f"maintenance worker not started: {type(exc).__name__}: {exc}"[:256]
+
+    def _maintenance_loop(self) -> None:
+        current = threading.current_thread()
+        try:
+            while True:
+                with self._maintenance_cv:
+                    monotonic_now = time.monotonic()
+                    sweep = self._orphan_sweep_due_locked(monotonic_now)
+                    if not self._maintenance_items and not sweep:
+                        self._maintenance_thread = None
+                        self._maintenance_cv.notify_all()
+                        return
+                    work = [
+                        (ticket, path) for ticket, paths in self._maintenance_items for path in paths
+                    ]
+                    self._maintenance_items = []
+                    if sweep:
+                        self._orphan_sweep_requested = False
+                        self._last_orphan_sweep = monotonic_now
+                        work.extend((ticket, path) for path, ticket in self._maintenance_retry.items())
+                        self._maintenance_retry.clear()
+                    self._maintenance_busy = True
+                failed: List[Tuple[str, Path]] = []
+                sweep_failed = False
+                error: Optional[str] = None
                 try:
-                    age = now() - diagnostic_path.stat().st_mtime
-                except OSError:
-                    continue
-                if age > TERMINAL_RETENTION_SECONDS:
-                    with contextlib.suppress(FileNotFoundError):
-                        diagnostic_path.unlink()
+                    for ticket, path in work:
+                        if not self._unlink_generated_job_file(ticket, path):
+                            failed.append((ticket, path))
+                    if sweep:
+                        sweep_failed = not self._sweep_orphaned_job_files()
+                except Exception as exc:  # noqa: BLE001 - retried by a later sweep
+                    error = f"{type(exc).__name__}: {exc}"[:256]
+                    failed = work
+                    sweep_failed = sweep
+                finally:
+                    with self._maintenance_cv:
+                        self._maintenance_busy = False
+                        for ticket, path in failed:
+                            self._maintenance_retry[path] = ticket
+                        while len(self._maintenance_retry) > MAINTENANCE_RETRY_LIMIT:
+                            # Oldest first; an aged orphan is still caught by name.
+                            del self._maintenance_retry[next(iter(self._maintenance_retry))]
+                        if failed or sweep_failed:
+                            self._orphan_sweep_requested = True
+                            self._maintenance_error = error or "cleanup incomplete; retried by a later sweep"
+                        self._maintenance_cv.notify_all()
+        finally:
+            with self._maintenance_cv:
+                if self._maintenance_thread is current:
+                    self._maintenance_thread = None
+                self._maintenance_busy = False
+                self._maintenance_cv.notify_all()
 
-        with contextlib.suppress(FileNotFoundError):
-            for timing_path in self.paths.jobs_dir.glob("*timing*"):
-                suffix = next((value for value in TIMING_FILE_SUFFIXES if timing_path.name.endswith(value)), None)
-                if suffix is None or timing_path.name[: -len(suffix)] in self.jobs:
-                    continue
-                try:
-                    age = now() - timing_path.stat().st_mtime
-                except OSError:
-                    continue
-                if age > TERMINAL_RETENTION_SECONDS:
-                    with contextlib.suppress(FileNotFoundError):
-                        timing_path.unlink()
+    def _unlink_generated_job_file(self, ticket: str, path: Path) -> bool:
+        """Remove one exact generated file of ``ticket``; ``False`` means retry later."""
+        if path.parent != self.paths.jobs_dir or path.name not in {
+            f"{ticket}{suffix}" for suffix in GENERATED_JOB_FILE_SUFFIXES
+        }:
+            return True  # not a generated file of this ticket: never deleted
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError:
+            return False
+        return True
 
+    def _sweep_orphaned_job_files(self) -> bool:
+        """Remove aged generated files of tickets the daemon no longer holds; ``False`` means retry later."""
+        with self.condition:
+            retained = set(self.jobs)  # in-memory snapshot only
+        cutoff = now() - TERMINAL_RETENTION_SECONDS
+        complete = True
+        try:
+            entries = list(os.scandir(self.paths.jobs_dir))
+        except FileNotFoundError:
+            return True
+        except OSError:
+            return False
+        for entry in entries:
+            ticket = generated_job_file_ticket(entry.name)
+            if ticket is None or ticket in retained:
+                continue
+            try:
+                if entry.is_dir(follow_symlinks=False) or entry.stat(follow_symlinks=False).st_mtime >= cutoff:
+                    continue
+            except OSError:
+                continue
+            try:
+                os.unlink(entry.path)
+            except FileNotFoundError:
+                pass
+            except OSError:
+                complete = False
+        return complete
+
+    def _await_maintenance(self, timeout: float) -> bool:
+        """Private drain for tests, qualification and daemon exit; never on a client path.
+
+        Waits until no worker runs; ``True`` when no queued removal remains.
+        A sweep that is requested but not yet due is not waited for.
+        """
+        deadline = time.monotonic() + timeout
+        with self._maintenance_cv:
+            while self._maintenance_thread is not None or self._maintenance_busy:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                self._maintenance_cv.wait(min(remaining, 0.1))
+            return not self._maintenance_items
 
 class ThreadedUnixServer(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
     daemon_threads = True
@@ -5752,6 +5988,10 @@ def run_daemon(paths: Paths) -> int:
         # already-started timing persistence finish (bounded; optional data).
         with contextlib.suppress(Exception):
             state._await_job_telemetry(TIMING_DRAIN_SECONDS)
+        # Then let queued retention removals finish (bounded); anything left is
+        # an aged orphan for a later daemon's sweep.
+        with contextlib.suppress(Exception):
+            state._await_maintenance(TIMING_DRAIN_SECONDS)
     return 0
 
 

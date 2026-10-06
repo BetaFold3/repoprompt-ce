@@ -4,7 +4,7 @@ Scope: read when the task touches Swift build/test wall-time measurement, conduc
 Authority: Reference
 Last-verified: 2026-10-06
 
-Status: Steps 1 and 2 are owner-accepted for commit and progression under OD12, which replaces the 5 ms parser budget with 90 ms per 5 MiB and accepts this checkpoint without further qualification runs. Phase 0 is complete (§11). Both OracleA and OracleB approve the scoped Steps 1–2 r4 implementation; all blocking code findings are closed by their owning lanes. Five shared re-review rounds were used for Steps 1–2, and no production or test code changed after r4. The Oracles' earlier withholding of empirical phase acceptance remains part of the record; OD12 is an owner decision, not a new Oracle verdict or a claim that missing measurements passed. Step 1's clean no-regression qualification, Step 2's full integrated/null-job qualification and repeatable Swift timing remain follow-up evidence, not blockers for this checkpoint. Steps 3–10 may proceed next in §4 order, with their own requirements unchanged. Under OD13, Step 3 has completed **four of five shared re-review rounds**. Both fresh round-4 lanes approve the remediation code on the frozen r4 snapshot. OracleA explicitly closed S3-R0-03 as fixed, not downgraded, and S3-R3-01 as fixed; all earlier closures remain. There are no open P0/P1 findings. OD16 authorizes explicit, visible job failure at pathological D1/D2 limits; the r4 reader-completion guard prevents an otherwise successful classifying job from publishing success before its reader finishes. OracleA's new S3-R4-01 test-readiness finding is nonblocking P2 and deferred; OracleB's P3 observations are recorded below. **Step 3 is owner-accepted for commit and progression under OD17.** Current-r4 qualification passes pipe, summary, lock and classification-equivalence gates; the clean PTY output misses and narrowly contaminated memory result remain recorded as non-blocking follow-up. This is explicit measured acceptance, not a claim that those gates passed or a new Oracle empirical verdict. Step 3 is committed as `f6bc1a8e`. Step 4 remediation r1 is approved by both main-owned round-1 lanes: OracleA closes S4-R0-LOCK-IO and S4-R0-FALLBACK-COVERAGE; OracleB closes S4-R0-01–05. Both P1s are fixed, not downgraded. Its numerical gates pass on the unchanged measured path; main's independent selftest and guardrails pass. Step 4 is accepted and staged; staged-index preflight passed, but the signed commit failed because the configured 1Password agent returned an error. No Step 4 commit exists yet. OD6's review is discharged with idle exit and job history still deferred; no new gate or campaign is required. One shared re-review round of five was used. Steps 5–12 are not yet implemented; their own gates remain unchanged and debug dSYM policy is unchanged.
+Status: Steps 1 and 2 are owner-accepted for commit and progression under OD12, which replaces the 5 ms parser budget with 90 ms per 5 MiB and accepts this checkpoint without further qualification runs. Phase 0 is complete (§11). Both OracleA and OracleB approve the scoped Steps 1–2 r4 implementation; all blocking code findings are closed by their owning lanes. Five shared re-review rounds were used for Steps 1–2, and no production or test code changed after r4. The Oracles' earlier withholding of empirical phase acceptance remains part of the record; OD12 is an owner decision, not a new Oracle verdict or a claim that missing measurements passed. Step 1's clean no-regression qualification, Step 2's full integrated/null-job qualification and repeatable Swift timing remain follow-up evidence, not blockers for this checkpoint. Steps 3–10 may proceed next in §4 order, with their own requirements unchanged. Under OD13, Step 3 has completed **four of five shared re-review rounds**. Both fresh round-4 lanes approve the remediation code on the frozen r4 snapshot. OracleA explicitly closed S3-R0-03 as fixed, not downgraded, and S3-R3-01 as fixed; all earlier closures remain. There are no open P0/P1 findings. OD16 authorizes explicit, visible job failure at pathological D1/D2 limits; the r4 reader-completion guard prevents an otherwise successful classifying job from publishing success before its reader finishes. OracleA's new S3-R4-01 test-readiness finding is nonblocking P2 and deferred; OracleB's P3 observations are recorded below. **Step 3 is owner-accepted for commit and progression under OD17.** Current-r4 qualification passes pipe, summary, lock and classification-equivalence gates; the clean PTY output misses and narrowly contaminated memory result remain recorded as non-blocking follow-up. This is explicit measured acceptance, not a claim that those gates passed or a new Oracle empirical verdict. Step 3 is committed as `f6bc1a8e`. Step 4 remediation r1 is approved by both main-owned round-1 lanes: OracleA closes S4-R0-LOCK-IO and S4-R0-FALLBACK-COVERAGE; OracleB closes S4-R0-01–05. Both P1s are fixed, not downgraded. Its numerical gates pass on the unchanged measured path; main's independent selftest and guardrails pass. Step 4 is accepted and committed as `86e3e024`; a first signed-commit attempt failed on the 1Password agent, and the signed retry succeeded. OD6's review is discharged with idle exit and job history still deferred; no new gate or campaign is required. One shared re-review round of five was used. **Step 5 r0 drew changes requested from OracleA (S5-R0-OWNERSHIP, P1) and a conditional approval from OracleB (conditional on C1/C2). In re-review round 1 of 5 on frozen r1, OracleA closed S5-R0-OWNERSHIP as fixed but opened P1 S5-R1-STOP-PIN-ROLLBACK, and OracleB approved. Remediation r2 is implemented and independently validated on parent `86e3e024`. In round 2, OracleA explicitly closed S5-R1-STOP-PIN-ROLLBACK as fixed and lifted its acceptance withholding. OracleB's first round-2 attempt failed before completion; the owner requested a plainly worded fresh-lane retry on the same preset. That retry approved r2 and closed S5-R1-01 as fixed. Both lanes approve Step 5 and its acceptance evidence; no P0/P1 remains open. Step 5 is accepted, pending staged-index preflight and commit.** Steps 6–12 are not yet implemented; their own gates remain unchanged and debug dSYM policy is unchanged.
 Decision process: this revision replaces the earlier Swift-only plan. Two independent Oracle lanes (OracleE and OracleD) received the same brief: the owner's answers, the Phase 0 results, the verified Python conductor findings, and the earlier plan. Material disagreements were relayed anonymously for two challenge rounds, and both lanes ended CONVERGED. Two disputes were settled by owner decisions and one by code verification; §9 records each. The filename is kept so existing links stay valid.
 
 ## 1. Outcome, scope, and owner decisions
@@ -1312,4 +1312,210 @@ The r0 clean ledger capture is carried forward only for the unchanged measured p
 
 **Nonblocking finding:** S4-R1-TEST-SYNC (OracleA P2) and S4-R1-01 (OracleB P3) identify the same potential test flake: the clamp-order test uses a 300 ms child delay rather than a handshake. A delayed reader may receive both methods in one group, making its ordering assertion fail although production behavior is correct. Both lanes explicitly permit deferral and say not to open another round solely for it. Keep the finding for the next necessary edit to that test; no assertions are weakened here. S4-R1-02's index/OD6 provenance upkeep is addressed by this update.
 
-**OD6 disposition by main:** review discharged; existing deferral unchanged. OracleB explicitly withdraws its initial required-owner-question framing. No idle exit, persisted history, mandatory 200-job footprint campaign, or new owner waiver is introduced. Step 5 may proceed after Step 4's isolated commit. Main staged only `Scripts/conductor.py`, `Scripts/conductor_benchmark.py`, `Scripts/test_conductor_lifecycle.py` and this plan. Staged code blobs match the frozen reviewed snapshot. Staged-index preflight passed (`.agent-artifacts/step4-r1/preflight-commit.log`), but `git commit` failed with `error: 1Password: agent returned an error` / `fatal: failed to write commit object`. HEAD remains `f6bc1a8e`; signing configuration is unchanged. Main asked the owner to unlock or repair the signing agent; the question timed out with no answer. The four files remain staged, unrelated edits remain unstaged, and no worker or validation process is running. Step 5 is not started. This status update is documentation-only and is restaged with a fresh preflight before handoff.
+**OD6 disposition by main:** review discharged; existing deferral unchanged. OracleB explicitly withdraws its initial required-owner-question framing. No idle exit, persisted history, mandatory 200-job footprint campaign, or new owner waiver is introduced. Step 5 may proceed after Step 4's isolated commit. Main staged only `Scripts/conductor.py`, `Scripts/conductor_benchmark.py`, `Scripts/test_conductor_lifecycle.py` and this plan. Staged code blobs match the frozen reviewed snapshot. Staged-index preflight passed (`.agent-artifacts/step4-r1/preflight-commit.log`). The first `git commit` failed with `error: 1Password: agent returned an error` / `fatal: failed to write commit object`, and HEAD stayed `f6bc1a8e`. Signing configuration was not changed. The later signed retry succeeded: Step 4 is commit `86e3e024ec82e76bd6d4f40092ec2ebdebb40b46`, and that historical block is resolved. Step 5 proceeds from that parent (checkpoint below).
+
+### Step 5 implementation checkpoint (2026-10-06, OD13)
+
+Status: **implemented; awaiting main-owned review. Not approved, accepted, staged or committed.** The parent is HEAD `86e3e024` (Step 4 commit). Raw evidence is local under `.agent-artifacts/step5/`; it is not contribution material.
+
+Implementation (`Scripts/conductor.py`):
+
+- **Decision under the lock.** `_retention_pass_locked` keeps the 24 h / 200-job decision, pin deferral, `self.jobs` eviction and request-key cleanup, all in memory. It hands each evicted ticket's exact paths (log, recorded diagnostics, the three timing sidecars) to the worker and requests an orphan sweep. It does no scan, stat or unlink.
+- **One maintenance worker.** `_signal_maintenance_locked` queues work under a private `_maintenance_cv` (lock order: `condition` → `_maintenance_cv`). It starts `conductor-maintenance` on demand when work is due; at most one runs, and it exits when nothing is due. Queued exact removals run at once. Orphan sweeps are coalesced to at most one per `ORPHAN_SWEEP_INTERVAL_SECONDS` (60 s); a request that is not yet due waits for a later transition, so no worker or timer idles for the interval. The sweep snapshots `self.jobs` keys under the condition, then scans with `os.scandir`, `lstat`s and unlinks outside every daemon lock.
+- **Exact families.** `generated_job_file_ticket` accepts only a lowercase hyphenated UUID ticket (any version; production mints `uuid4`) plus one of `.log`, `.xctest-stall.json`, `.xctest-stall.sample.txt`, `.timing-events.jsonl`, `.timings.json`, `.runner-timings.json`. Exact removals also require `path.parent == jobs_dir` and a name equal to that ticket plus one of those suffixes. Directories are never removed.
+- **Pins across full ownership.** `_run_job` pins its job in its first lock block and unpins in an outer `finally`, after lane release, summary and timing persistence. The output reader, the XCTest watchdog and the timing-off summary thread start through `_start_job_owned_thread`, which pins before `start()` and unpins in the thread's `finally`, or immediately if `start()` raises. The undispatched timing worker pins before its thread starts and unpins in its `finally`, or in the start-failure branch. Status, wait and summary pins are unchanged. A pinned due job is deferred, and its last unpin reruns the pass. *Correction (r1):* r0 did not pin the three cancellation owners, which write after condition waits (S5-R0-OWNERSHIP / S5-R0-01); "full ownership" was overstated until r1.
+- **Failures.** A failed exact unlink is kept in a bounded retry map (1,024 paths, oldest dropped; an aged one is still found by name) and retried by the next due sweep. A failed scan requests another sweep. A worker that cannot start leaves its work queued for the next signal. Errors are recorded only in `_maintenance_error`; job state, exit code, `measurement_invalid` and tickets never change.
+- **Daemon exit.** After the existing timing drain, `run_daemon` waits at most `TIMING_DRAIN_SECONDS` in `_await_maintenance` for queued removals.
+- **Unchanged.** Policy (24 h / 200 jobs). Unknown status for an evicted ticket. The `retention_pass` operation name and origins, which now time only the in-memory decision. `RotatingJsonl` history rotation, which already ran outside the condition. OD14 raw read/flush, OD16 visible failure and the Step 4 ledger cache.
+
+Behavior changes for review:
+
+- **Narrower orphan sweeps.** The parent globbed `*.log`, `*.xctest-stall.*` and `*timing*`, and deleted any aged unretained match. Non-generated aged names such as `notes.log` or `<uuid>.xctest-stall.extra` now survive; the parent deleted both in the gate-1 run below.
+- **Asynchronous deletion.** An evicted ticket is unknown immediately; its files disappear shortly afterwards. The parent ran a sweep on every transition; now a sweep may wait up to 60 s, plus until the next transition. Exact removals of evicted jobs are not delayed by the sweep interval, but they can queue behind a busy worker (an in-progress unlink or sweep).
+- **Pins on running jobs.** Running jobs now hold pins. They were never evictable, so this changes no decision.
+- **Pre-existing, out of scope.** `_invalidate_root_build_ticket_locked` unlinks `build-ticket-root.json` under the lock when a root-ticket-invalidating job starts. It is not retention and is unchanged; it appears separately in the gate-1 counts.
+- **Test adjustments.** Assertions are unchanged and deliberately target the async contract. The two existing retention tests drain `_await_maintenance` before their file assertions. The orphan fixture uses UUID tickets. The lifecycle supersede test selects the escalation `Thread` call by target rather than the last call, because the enqueue now also constructs the maintenance worker.
+
+Gates and evidence (host: 28 cores, Python 3.14.7; the one-minute load average was 5.2–5.4 throughout; 9 conductor daemons were resident):
+
+| Gate / check | Parent `86e3e024` | Candidate | Limit | Result |
+|---|---|---|---|---|
+| Jobs-dir scan/stat/unlink under the scheduler lock, through every production caller (6 real `build` jobs, a queued cancel, status/wait pins with `MAX_TERMINAL_JOBS`=3, 30 expired and 100 orphan families) | 1,502 events (804 `os.remove`, 42 `os.scandir`, 662 `os.stat`) | **0**; 796 removes, 1 scan, all off the lock | 0 | pass |
+| `status_payload` during a blocked cleanup (640 files, 2 ms injected per unlink), 5 ABAB fresh-process runs | median 1,952 ms | median 0.057 ms first probe, max 0.193 ms | ≤50 ms | pass |
+| `enqueue` during the same blocked cleanup (trigger / concurrent probe) | 1,953 / 1,953 ms | max 0.483 / 0.146 ms | ≤50 ms | pass |
+| Scheduler-lock hold per retention pass, with 200 retained jobs plus 1,000 fresh orphan names (50 passes × 5 runs) | median p50 10.7 ms, p95 11.8 ms | median p50 0.017 ms, p95 0.022 ms | — | improvement |
+| Cleanup completeness | 640/640 removed | 640/640 removed; drained | all | pass |
+
+- **Gate 1 run** (`ab/lock_io_qualify.py`, `ab/q1-final/`). It uses `sys.addaudithook` for `os.remove`, `os.scandir`, `os.listdir` and `glob.glob`, and wraps `os.stat` and `os.lstat`, recording whether the calling thread owned the scheduler `RLock`. `DirEntry.stat` cannot be intercepted; it runs in the same worker function after the off-lock scan.
+- **Root build-ticket unlinks.** The pre-existing `build-ticket-root.json` unlink occurred 6 times under the lock in each arm, once per job, and is excluded from the retention count.
+- **Latency runs** (`ab/retention_ab.py`, `ab/summary.md`) use an injected slow disk, not a real stall.
+- **Contamination.** It was not measured with the Step 1 harness's foreign-core metric. These are targeted lock-behavior A/B captures, not a benchmark-harness campaign.
+
+Tests (`Scripts/test_conductor_output.py`, `Step5RetentionMaintenanceTests`):
+
+- the name predicate;
+- the off-lock exact-family cleanup, with foreign files, a foreign recorded diagnostic path and a generated-name directory;
+- status, enqueue and list within 50 ms while an unlink is blocked, plus a bounded drain that reports the stuck work;
+- one coalesced sweep per interval, without delaying exact removals or idling a worker;
+- failed-unlink retry by a later sweep, while the evicted ticket stays unknown and the surviving job is unchanged;
+- a worker start failure, with work kept queued;
+- dispatched and undispatched timing finalization staying pinned until persisted, with no sidecar recreated;
+- a job-owned reader that outlives `_run_job` keeping its job pinned.
+
+Validation:
+
+- **Mutation.** 10 mutants are each killed by their intended test, and the unmutated control passes (`mutation/results.txt`): synchronous I/O under the lock, no owner pin, no undispatched pin, no sweep interval, no retry, a suffix-only predicate, no exact-item guard, an uncaught start failure, an unpinned reader, and a worker holding the lock. A first harness attempt was invalid (import error) and is kept under `mutation/invalid-attempt1/`.
+- **Repeat runs.** 25 repeats of the focused tests had 0 failures.
+- **Repository checks.** `make conductor-selftest` exits 0 (12 suites, including 132 output and 171 lifecycle tests). `make guardrails` exits 0. `Scripts/check-agent-context` exits 0 with the existing route-count warning. `git diff --check` exits 0. Logs are under `tests/`.
+
+Step 5 review index (main-owned, OD13):
+
+| Item | State |
+|---|---|
+| Decisions relied on | OD6 (deferral unchanged; no idle exit or history), OD13 (review policy), OD14/OD16 and Step 4 (preserved) |
+| Candidate bytes | `CANDIDATE-SHA256SUMS` and `delta.patch` under `.agent-artifacts/step5/` |
+| Initial reviews (frozen r0, `.agent-artifacts/step5-review-r0/`) | OracleA: code **changes requested**, S5-R0-OWNERSHIP P1 open; acceptance withheld on correctness, with both numerical gates supported. OracleB: code **approve**, conditional on C1/C2 confirmation; S5-R0-01 P2 (same gap); S5-R0-02–05 P3 |
+| Remediation r1 | Below; candidate bytes `.agent-artifacts/step5-r1/R1-SHA256SUMS`, frozen for review as `.agent-artifacts/step5-review-r1/files/` |
+| Round 1 (frozen r1) | **OracleA:** S5-R0-OWNERSHIP **closed, fixed (not downgraded)**. New **P1 S5-R1-STOP-PIN-ROLLBACK** (open): `stop(force=True)` could raise after acquiring pins but before its thread-start rollback. Code changes requested; acceptance withheld pending that fix and the `conductorDigest` clarification. **OracleB:** code **approve**. S5-R0-01, S5-R0-02 and S5-R0-05 closed, fixed. C1/C2 confirmed, so the approval is unconditional. S5-R0-03/04 remain deferred P3s. New P3 S5-R1-01 is the same gap as OracleA's P1; new P3 S5-R1-02 (route the cancellation threads through `_start_job_owned_thread`) is deferred. The optional `_append_system_line_locked` eviction guard is deferred. Both lanes asked for the `conductorDigest` provenance. |
+| Remediation r2 | Below; candidate bytes `.agent-artifacts/step5-r2/R2-SHA256SUMS` |
+| Re-review rounds | 2 of 5 completed; OracleB round 2 required one failed provider attempt and a successful fresh-lane retry on identical code |
+| Round 2 (frozen r2) | Both lanes approve code and acceptance. OracleA closes S5-R1-STOP-PIN-ROLLBACK as fixed, not downgraded or waived; S5-R0-OWNERSHIP remains closed. OracleB's successful fresh-lane retry closes S5-R1-01 as fixed and resolves the digest clarification. Its new S5-R2-01 is a nonblocking P3, deferred. No P0/P1 remains open. Review records and failed-attempt provenance are below |
+
+### Step 5 remediation r1 (2026-10-06, OD13)
+
+Status: **reviewed in round 1 of 5 on the frozen r1 bytes; dispositions are in the Step 5 review index above, and r2 follows below. Not approved, accepted, staged or committed.** The text below is the r1 record as submitted; closures belong to the main-owned lanes. The parent is still HEAD `86e3e024`. The frozen r0 snapshot `.agent-artifacts/step5-review-r0/files/` is unchanged. r1 evidence is under `.agent-artifacts/step5-r1/`, and every result cited here is bound to `final/` and conductor `d5c18b76…`. Earlier r1 runs on `1679dae6…` differ only by one comment (`final/comment-only-delta-from-1679dae6.diff`). Invalid attempts are kept with READMEs.
+
+**S5-R0-OWNERSHIP / S5-R0-01 (fix, not downgrade).** Each cancellation owner now pins its job for the whole operation and releases the pin in a `finally` after its last possible write. This follows the existing Step 5 pin design: the job can't be evicted while pinned, the last unpin reruns retention, writes are not skipped and no diagnostics are dropped.
+
+- **`_cancel_running_job_locked`** pins on entry. Its body (pid wait, terminate, condition waits, kill, completion loop) runs in a `try`, and the `finally` unpins. Every early return and exception passes through that `finally`.
+- **Supersession.** `_supersede_live_app_jobs_locked` pins the old running job before starting `_escalate_canceled_job_after_grace`, and passes the job to it. If `Thread.start()` raises, it unpins and re-raises. The escalation thread's whole body under `self.condition` sits in a `try`, with the unpin in its `finally`.
+- **`stop(force=True)`** pins each running job before starting `_force_shutdown_when_canceled`. If the start fails, it unpins all of them and re-raises. The thread's loop under `self.condition` unpins in its `finally`, before the existing sleep and `server.shutdown`.
+- **Reentrant waits.** `condition.wait` inside `_wait_for_process_tree_exit_locked` releases every recursion level of the `RLock`. While the owner is suspended there, `_run_job` can finish and drop its own pin, but this pin keeps the job retained. Inventory: no other caller of `_wait_for_process_tree_exit_locked` is unpinned. The `_run_job` callers hold the owner pin, the OD16 incomplete-reader path runs in `_run_job` or the pinned reader, `_terminate_xctest_stalled_job` runs in the pinned watchdog, and `_signal_stop` never waits.
+- **Outcomes unchanged.** Job outcome (`canceled`/130), signal escalation and process cleanup are unchanged. Thread-start failures still propagate.
+
+**Regression tests** (`Scripts/test_conductor_output.py`, `Step5OwnershipPinTests`). The three owner tests are deterministic, with no timing sleeps:
+
+1. Run a real job with a real sleeping child.
+2. Suspend the owner at its first condition wait, inside `_wait_for_process_tree_exit_locked`.
+3. Let the real `_run_job` finish.
+4. Force retention with `MAX_TERMINAL_JOBS`=0.
+5. Require the pass to defer the job while the log still exists.
+6. Resume and require the "SIGKILL after grace period" line.
+7. Require eviction only after the owner's release, with no file left for the ticket.
+
+They cover job cancel, supersession escalation and force-stop cleanup. Further S5-R0-02 tests:
+
+- the watchdog thread and the timing-off summary thread stay pinned until they return;
+- a real enqueue-minted ticket's log name and the real `_capture_xctest_stall_diagnostics` names (`<ticket>.xctest-stall.json`, `<ticket>.xctest-stall.sample.txt`) are accepted by the orphan predicate.
+
+**Repro** (`repro/cancel_recreation_repro.py`; `repro/summary.txt` for r0/`1679dae6`, `final/repro/summary.txt` for `d5c18b76`). The repro suspends each owner and forces retention on a real `DaemonState`.
+
+| Arm | Pins while the owner is suspended | Result |
+|---|---|---|
+| Frozen r0 | 0 | Evicted before resume, then the log was **recreated** after eviction, in all three owners |
+| r1 | 1 | Eviction deferred; nothing left or recreated, in all three owners |
+
+**C1/C2 (confirmation; no production change).** The grep on `d5c18b76` is in `final/c1c2-sites.txt`.
+
+- **C1.** Tickets are minted only by `ticket = str(uuid.uuid4())` in `enqueue`, and the log path is `jobs_dir / f"{ticket}.log"`.
+- **C2.** The only `xctest-stall` writers are `snapshot_path = jobs_dir / f"{job.ticket}.xctest-stall.json"` and `sample_path = … .xctest-stall.sample.txt` in `_capture_xctest_stall_diagnostics`. These are the only `diagnostic_paths.append` sites.
+- **Timing sidecars.** `.timing-events.jsonl` and `.timings.json` come from the telemetry persister. `.runner-timings.json` reaches the runner through `RPCE_CONDUCTOR_RUNNER_TIMINGS_PATH`.
+- **Other names.** Other `jobs_dir` names (`build-ticket-root.json`, `parallel-xctest-<run>*`) are not generated job families and are never touched.
+
+**S5-R0-05.** The "uuid4" and "never delayed" wording above is corrected.
+
+*Main's interpretation (not an owner waiver):* `RotatingJsonl` history rotation stays on its existing persisting thread, which already runs outside `self.condition`. The Step 5 requirement is no retention I/O under the scheduler lock, so no rotation-worker change is needed.
+
+**Deferred:** S5-R0-03 (write-only `_maintenance_error`) and S5-R0-04 (a finished worker's `finally` clearing the busy flag), as minor P3s. No other cleanup was done.
+
+**Validation** (`final/`):
+
+- **Mutation** (`final/mutation/results.txt`): 0 survivors or invalid results out of 17. The unmutated control passes.
+  - The frozen r0 `conductor.py` fails all three owner tests.
+  - The new mutants are each killed by their intended test: M11 no cancel pin, M12 no supersession pin, M13 no force-stop pin, M14 unpinned watchdog, M15 unpinned summary thread.
+  - M1–M10 are still killed.
+- **Repeats.** 25 repeats of the Step 5 classes plus the two retention tests had 0 failures.
+- **Affected suites.** 138 output tests and 171 lifecycle tests pass. The lifecycle file is unchanged since r0.
+- **Gate 1, rerun on `d5c18b76` because the pins touch the cancel path.** Both the frozen probe and an r1 variant with one added running-job cancel recorded **0** retention scan/stat/unlink events under the scheduler lock. Outcomes are unchanged: the variant's running cancel is `canceled`/130. The pre-existing root build-ticket unlinks under the lock are 6 and 7, one per build job.
+- **Gate 2, bounded rerun** (3 runs per scenario, not a campaign). Status and enqueue during the blocked cleanup have a worst case of 0.416 ms (limit 50 ms). All 640 files were removed and drained. Per-pass lock hold has a p50 of 0.017 ms.
+- **Repository checks.** `make conductor-selftest`, `make guardrails`, `Scripts/check-agent-context` and `git diff --check`: logs and exit codes are in `final/tests/`.
+
+### Step 5 remediation r2 (2026-10-06, OD13)
+
+Status: **round 2 complete; both lanes approve code and acceptance. OracleA explicitly closed S5-R1-STOP-PIN-ROLLBACK as fixed; OracleB's fresh-lane retry closed S5-R1-01 as fixed. Accepted, pending staged-index preflight and commit.** The parent is still HEAD `86e3e024`. The frozen r1 snapshot `.agent-artifacts/step5-review-r1/files/` is unchanged. r2 evidence is under `.agent-artifacts/step5-r2/`.
+
+**S5-R1-STOP-PIN-ROLLBACK / S5-R1-01 (narrow fix).**
+
+- **`stop()`.** One `try`/`except BaseException` now spans the whole interval from the first pin to the handoff. That covers the condition block, the per-job loop (queued processing and terminate for the first and later running jobs), the running-processes ledger write, the payload, and thread construction and start.
+  - `handed_off` is set only after `Thread.start()` returns. From then on the force-shutdown thread alone releases the pins, in its `finally`, after its last write.
+  - Before the handoff, any failure releases exactly the jobs this call pinned (`running_jobs`, appended right after each pin) under the condition, then re-raises. Another holder's pin is never released.
+  - Propagation is preserved. No job state, `cancel_requested`, `shutdown_requested` or exit code is rewritten. A non-force stop and a force stop with no running job acquire no pin, so their paths are unchanged.
+- **`_start_job_owned_thread`.** Thread construction moved inside the existing rollback `try`. It was the only remaining step between pin and handoff that the rollback did not cover.
+- **Supersession.** Construction and start were already inside its rollback. No code changed; it now has tests.
+- **Not changed:**
+  - OracleB's optional S5-R1-02 refactor and the `_append_system_line_locked` guard are deferred.
+  - The undispatched timing worker's start handler still catches `Exception` only, as in r0; it is not part of this finding.
+
+**Tests** (`Step5PinHandoffRollbackTests`). These use synthetic jobs and no child processes, and inject a `BaseException` subclass so the fix can't rely on `except Exception`.
+
+- **`stop(force=True)` setup.** The fixture is running R1, queued Q, running R2 (already holding another holder's pin) and running R3. Faults are injected at:
+  - terminate of the first running job;
+  - terminate of a later running job (a partial multi-job acquisition);
+  - queued-job processing;
+  - the ledger write;
+  - payload construction;
+  - thread construction;
+  - thread start.
+
+  Each test records the pins at the fault (proving they were acquired) and then requires the injected exception to propagate. Afterwards R1 and R3 must have 0 pins, R2 must keep exactly its other pin, and no retention deferral may be left behind. Outcomes already reached before the fault stay as they were.
+- **Supersession escalation and `_start_job_owned_thread`.** Thread construction and start failures release only the caller's pin, keep the other holder's pin, and never run the target.
+
+**Mutation** (`step5-r2/mutation/results.txt`): **24 executions (21 mutants, 2 frozen revisions, 1 control)**. All results are as expected: every mutant and frozen bad revision is rejected, and the control passes.
+
+- The frozen r1 conductor fails exactly the five pre-handoff `stop()` faults and the owned-thread construction case. It passes the `stop()` and supersession thread construction/start tests, as expected, because r1 already rolled those back.
+- The frozen r0 conductor fails all owner and rollback tests.
+- New mutants, each killed by its intended tests:
+  - M16: no `stop()` setup rollback;
+  - M17: `handed_off` set before `start()`;
+  - M18: rollback catches `Exception` only;
+  - M19: no supersession start rollback;
+  - M20: owned thread constructed outside the rollback;
+  - M21: no owned-thread start rollback.
+- M13's search text was re-indented to the new `stop()` body. M1–M15 are still killed.
+
+**`conductorDigest` provenance (clarification; no new measurement).**
+
+- **What it is.** `CONDUCTOR_DIGEST` is not a file SHA. It is computed once at module load by `compute_conductor_digest()`, which calls `swift_pipeline_metrics.content_digest()` over `conductor.py`, `swift_pipeline_metrics.py`, `debug_app_process.py` and `conductor_output.py`. The hash is `sha256(b"rpce-conductor-digest-v1\0" + for each file sorted by path: len(name)‖name‖len(bytes)‖bytes)`, with lengths as 8-byte big-endian.
+- **Recomputed independently** (`step5-r2/digest/recompute_digest.py`, `digest-reconciliation.txt`):
+
+  | Bytes | Composite digest | Matches |
+  |---|---|---|
+  | Exact r1 tested copies (`step5-r1/final/ab/candidate-tree`, `final/repro/r1final-scripts`) | `sha256:eb7b3db7…` | Every r1-final Gate 1/Gate 2 JSON; the module's own `CONDUCTOR_DIGEST` imported from that copy |
+  | Frozen r1 `conductor.py` (`d5c18b76…`) with the HEAD helpers | `eb7b3db7…` | Same |
+  | r1 before the comment edit (`1679dae6…`) | `178ea770…` | That run's JSONs |
+  | r0 (`23c00ad4…`) | `e883b2ec…` | r0 JSONs |
+  | Parent (`16b4e8fc…`) | `6ad9fb4f…` | Parent JSONs |
+
+- **Helpers.** The three helpers are identical to HEAD (`c7bb7e3d…` `swift_pipeline_metrics.py`, `53875b77…` `debug_app_process.py`, `13db6f1f…` `conductor_output.py`).
+- **Result.** No mismatch was found.
+
+**Performance.** r2 changes no successful operation sequence. `stop()` and the owned-thread starter run the same calls in the same order inside a broader `try`, and `stop()` is on neither gate's measured path. The r1 gate evidence therefore carries over. As a bounded corroboration on r2 (`step5-r2/ab/`, digest `31e266f6…`), the frozen Gate 1 probe and the running-cancel variant both recorded **0** retention events under the lock. Outcomes were unchanged, and the root build-ticket unlinks were 6 and 7, as before. Gate 2 was not rerun.
+
+**Validation** (`step5-r2/tests/`):
+
+- 147 output tests and 171 lifecycle tests pass.
+- 25 repeats of the Step 5 classes plus the two retention tests had 0 failures.
+- `make conductor-selftest`, `make guardrails`, `Scripts/check-agent-context` and `git diff --check` exit codes are in `checks-exit.txt`.
+
+### Step 5 round-2 outcome and recovered provider failure (2026-10-06)
+
+Main verified both requested preset identities. OracleA completed initially; OracleB completed on a fresh-lane retry requested by the owner. Both reviewed the same frozen r2 code. This records two completed approvals, not an inference from the failed attempt.
+
+- **OracleA:** approves the scoped r2 remediation, explicitly closes **S5-R1-STOP-PIN-ROLLBACK as fixed, not downgraded or waived**, retains the S5-R0-OWNERSHIP closure, and lifts this lane's Step 5 acceptance withholding. It resolves the composite-digest clarification and requests no further remediation or measurement campaign. Record: `prompt-exports/oracle-review-2026-10-06-210459-oraclea-step5-r2-for-e5a1.md`.
+- **OracleB:** fresh round-2 chat `oracleb-step5-r2-force-p-39240B`, operation `82F186EB-178F-46C1-9B49-26EDC74C8D76`, failed with `oracle_stream_failed`. The provider reported that safeguards flagged the message, detail `[reasoning_extraction]`; export was skipped because the operation failed. This produces no code-review verdict. Its earlier r1 approval does not cover the r2 delta. That failed attempt was not counted as approval. The owner then explicitly requested rephrasing and a fresh lane. Main submitted a plainly worded code-review request for public conclusions and evidence, retaining the prior published findings verbatim and the same r1-to-r2 delta, evidence and OracleB preset; no substitute reviewer was used.
+- **Frozen reviewed r2:** `.agent-artifacts/step5-review-r2/files/`, `R2-SHA256SUMS`, `r1-r2.patch`, `delta.patch`. Code hashes are conductor `735a0fa6…`, output tests `30e8a25a…`, lifecycle tests `10a69e6f…`. This outcome-only plan update postdates the snapshot; no code changed.
+- **Main validation:** `make conductor-selftest` exited 0, including 147 output, 171 lifecycle, 74 benchmark and 67 metrics tests; `make guardrails`, `Scripts/check-agent-context` and `git diff --check` passed, with the existing route-count warning. Logs: `.agent-artifacts/step5-r2/{selftest-main,guardrails-main,context-main}.log`. All four source/plan hashes matched before and after validation. The unrelated tracked documentation diff matches the session-start capture.
+- **Provenance:** main independently ran the supplied digest recomputation after inspecting its formula. Both the actual r1 test copy and frozen r1 plus unchanged helpers reproduce `eb7b3db7…`; current r2 reproduces `31e266f6…`. Evidence: `step5-r2/digest/main-recomputed.txt`. Gate 1 has r2 corroboration; Gate 2 remains carried-forward r1 evidence, not a new capture.
+- **OracleB recovered outcome:** fresh chat `oracleb-step5-r2-retry-p-CF6035`, operation `24E63C60-BBA1-46E3-8940-8338FB56B669`, completed on the requested preset. It approves code and Step 5 acceptance, closes S5-R1-01 as fixed, preserves prior closures and confirms the digest binding. Record: `prompt-exports/oracle-review-2026-10-06-212511-oracleb-step5-r2-ret-68c7.md`.
+- **Minor deferrals:** S5-R0-03 (maintenance error observability), S5-R0-04 (busy-flag finalization), S5-R1-02 (optional cancellation-owner helper refactor), and new S5-R2-01 (undispatched telemetry start rollback catches `Exception`, not `BaseException`) remain nonblocking P3s. The last is unchanged since r0 and was disclosed before r2; main defers it under the instruction not to loop on new minor findings. No code changed after the reviewed snapshot. The optional append guard and docstring refinement remain deferred.
+- **Commit boundary:** both required reviews and Step 5 acceptance are complete. Stage only the four Step 5 files, run staged-index contribution preflight and commit before Step 6. These outcome/index and mutation-count wording changes implement the reviewers' recording recommendations; they change no code, contract or gate. Steps 6–12 have not started implementation. All workers and validation processes finished; no Oracle operation remains pending. No Swift build, live-app or launchd validation was run for Step 5.

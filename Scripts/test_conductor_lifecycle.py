@@ -743,8 +743,14 @@ class LifecycleQueueTests(LifecycleTestCase):
         ), mock.patch.object(conductor.threading, "Thread") as thread_factory:
             state.enqueue({"operation": "app", "args": {"subcommand": "stop"}})
             terminate.assert_not_called()
-            target = thread_factory.call_args.kwargs["target"]
-            args = thread_factory.call_args.kwargs["args"]
+            # Step 5: the enqueue's retention pass may also construct the maintenance worker.
+            escalations = [
+                call for call in thread_factory.call_args_list
+                if call.kwargs.get("target") == state._escalate_canceled_job_after_grace
+            ]
+            self.assertEqual(len(escalations), 1)
+            target = escalations[0].kwargs["target"]
+            args = escalations[0].kwargs["args"]
             self.assertFalse(args[2])
             worker = real_thread(target=target, args=args)
             worker.start()

@@ -1012,16 +1012,20 @@ class PhaseTimingIntegrationTests(unittest.TestCase):
         pruned.state = "completed"
         pruned.finished_at = conductor.now() - conductor.TERMINAL_RETENTION_SECONDS - 10
         old = time.time() - conductor.TERMINAL_RETENTION_SECONDS - 10
-        for ticket in ("kept", "pruned", "orphan", "fresh-orphan"):
+        # Orphan sweeps match only daemon-generated (uuid) tickets (Step 5).
+        orphan, fresh_orphan = "0d6f2c1e-5a7b-4c3d-9e8f-102938475601", "0d6f2c1e-5a7b-4c3d-9e8f-102938475602"
+        for ticket in ("kept", "pruned", orphan, fresh_orphan):
             for suffix in conductor.TIMING_FILE_SUFFIXES:
                 path = jobs_dir / f"{ticket}{suffix}"
                 path.write_text("{}")
-                if ticket != "fresh-orphan":
+                if ticket != fresh_orphan:
                     os.utime(path, (old, old))
         with state.condition:
             state._retention_pass_locked()
+        # Step 5: the pass only decides; the maintenance worker deletes off the lock.
+        self.assertTrue(state._await_maintenance(10.0))
         remaining = sorted(path.name for path in jobs_dir.iterdir() if "timing" in path.name)
-        expected = sorted(f"{ticket}{suffix}" for ticket in ("kept", "fresh-orphan") for suffix in conductor.TIMING_FILE_SUFFIXES)
+        expected = sorted(f"{ticket}{suffix}" for ticket in ("kept", fresh_orphan) for suffix in conductor.TIMING_FILE_SUFFIXES)
         self.assertEqual(remaining, expected)
         self.assertNotIn("pruned", state.jobs)
 
@@ -2950,6 +2954,7 @@ class Step3SummaryPendingAndPinTests(unittest.TestCase):
                     self.assertEqual(self.calls, ["claimant"])
                     self.assertEqual(self.job.summary_pins, 0)
                     self.assertNotIn("s", self.state.jobs)  # the last unpin reran the deferred retention
+                    self.assertTrue(self.state._await_maintenance(10.0))  # Step 5: deletion is off-lock
                     self.assertFalse(self.job.log_path.exists())
 
     def test_pins_are_released_on_failure_and_base_exception_paths(self) -> None:
@@ -2969,6 +2974,724 @@ class Step3SummaryPendingAndPinTests(unittest.TestCase):
         self.assertTrue(other.summary_event.is_set())
         self.assertIn("summary failed: Abort", json.dumps(other.output_summary))
         self.assertEqual(other.summary_pins, 0)
+
+
+
+class Step5RetentionMaintenanceTests(unittest.TestCase):
+    """Step 5: retention decides under the scheduler lock; one worker does the file work."""
+
+    T1 = "0d6f2c1e-5a7b-4c3d-9e8f-000000000001"
+    T2 = "0d6f2c1e-5a7b-4c3d-9e8f-000000000002"
+    T3 = "0d6f2c1e-5a7b-4c3d-9e8f-000000000003"
+    ORPHAN = "0d6f2c1e-5a7b-4c3d-9e8f-0000000000aa"
+    FRESH_ORPHAN = "0d6f2c1e-5a7b-4c3d-9e8f-0000000000bb"
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.old = time.time() - conductor.TERMINAL_RETENTION_SECONDS - 60
+
+    def make_state(self, name: str, timing: str = "off") -> conductor.DaemonState:
+        state = timing_state(self.root / name, timing)
+        self.addCleanup(state._await_maintenance, 10.0)
+        self.addCleanup(state._await_job_telemetry, 10.0)
+        return state
+
+    def write_family(self, state: conductor.DaemonState, ticket: str, aged: bool = True) -> list[Path]:
+        paths = [state.paths.jobs_dir / f"{ticket}{suffix}" for suffix in conductor.GENERATED_JOB_FILE_SUFFIXES]
+        for path in paths:
+            path.write_text("x")
+            if aged:
+                os.utime(path, (self.old, self.old))
+        return paths
+
+    def terminal_job(
+        self, state: conductor.DaemonState, ticket: str, expired: bool = True, aged: bool = True
+    ) -> conductor.Job:
+        job = timing_job(state, ticket)
+        job.state, job.exit_code = "completed", 0
+        job.finished_at = conductor.now() - (conductor.TERMINAL_RETENTION_SECONDS + 10 if expired else 0)
+        paths = self.write_family(state, ticket, aged=aged)
+        job.diagnostic_paths = [path for path in paths if ".xctest-stall." in path.name]
+        return job
+
+    def names(self, state: conductor.DaemonState) -> list[str]:
+        return sorted(path.name for path in state.paths.jobs_dir.iterdir())
+
+    def generated_names(self, ticket: str) -> list[str]:
+        return sorted(f"{ticket}{suffix}" for suffix in conductor.GENERATED_JOB_FILE_SUFFIXES)
+
+    def run_pass(self, state: conductor.DaemonState) -> None:
+        with state.condition:
+            state._retention_pass_locked()
+
+    def rewind_sweep_interval(self, state: conductor.DaemonState) -> None:
+        with state._maintenance_cv:
+            state._last_orphan_sweep -= conductor.ORPHAN_SWEEP_INTERVAL_SECONDS
+
+    def io_guard(self, state: conductor.DaemonState, block_unlink: Optional[threading.Event] = None):
+        """Record jobs-dir scans/stats/unlinks and whether the caller held the scheduler lock."""
+        jobs_dir = str(state.paths.jobs_dir)
+        calls: list[tuple[str, bool]] = []
+        entered = threading.Event()
+        real = {
+            "os.scandir": os.scandir, "os.unlink": os.unlink, "os.stat": os.stat, "os.lstat": os.lstat,
+            "Path.unlink": Path.unlink, "Path.stat": Path.stat, "Path.glob": Path.glob, "Path.iterdir": Path.iterdir,
+        }
+
+        def wrap(name: str, fn: Any) -> Any:
+            def guarded(target: Any, *args: Any, **kwargs: Any) -> Any:
+                if str(target).startswith(jobs_dir):
+                    calls.append((name, state.lock._is_owned()))
+                    if block_unlink is not None and "unlink" in name and not entered.is_set():
+                        entered.set()
+                        block_unlink.wait(10.0)
+                return fn(target, *args, **kwargs)
+
+            return guarded
+
+        stack = contextlib.ExitStack()
+        for name, fn in real.items():
+            owner, attr = (os, name[3:]) if name.startswith("os.") else (Path, name[5:])
+            stack.enter_context(mock.patch.object(owner, attr, wrap(name, fn)))
+        return stack, calls, entered
+
+    def test_generated_name_predicate_accepts_only_exact_families_of_uuid_tickets(self) -> None:
+        t = self.T1
+        accepted = [f"{t}{suffix}" for suffix in conductor.GENERATED_JOB_FILE_SUFFIXES]
+        self.assertEqual(
+            sorted(accepted),
+            sorted(f"{t}{s}" for s in (".log", ".xctest-stall.json", ".xctest-stall.sample.txt", ".timing-events.jsonl", ".timings.json", ".runner-timings.json")),
+        )
+        for name in accepted:
+            self.assertEqual(conductor.generated_job_file_ticket(name), t, name)
+        for name in (
+            f"{t}.log.bak", f"{t}.xctest-stall.extra", f"{t}.timings.json.tmp", f"{t}.json", f"{t}",
+            f"{t.upper()}.log", f"x{t}.log", f"{t}x.log", "notes.log", "kept.log", "build-ticket-root.json",
+            "daemon.log", ".log", f"{t[:-1]}.timings.json",
+        ):
+            self.assertIsNone(conductor.generated_job_file_ticket(name), name)
+
+    def test_cleanup_runs_off_the_scheduler_lock_and_deletes_only_exact_generated_families(self) -> None:
+        state = self.make_state("offlock")
+        jobs_dir = state.paths.jobs_dir
+        for ticket in (self.T1, self.T2):
+            self.terminal_job(state, ticket)
+        # A recorded path that is not this ticket's generated file is never deleted.
+        state.jobs[self.T2].diagnostic_paths.append(jobs_dir / "build-ticket-root.json")
+        self.terminal_job(state, self.T3, expired=False)
+        self.write_family(state, self.ORPHAN)
+        self.write_family(state, self.FRESH_ORPHAN, aged=False)
+        foreign = [f"{self.ORPHAN}.log.bak", f"{self.ORPHAN}.xctest-stall.extra", "notes.log", "build-ticket-root.json"]
+        for name in foreign:
+            (jobs_dir / name).write_text("keep")
+            os.utime(jobs_dir / name, (self.old, self.old))
+        (jobs_dir / f"{self.T1[:-1]}9.log").mkdir()  # a directory with a generated name is never removed
+        stack, calls, _entered = self.io_guard(state)
+        with stack:
+            self.run_pass(state)
+            self.assertTrue(state._await_maintenance(10.0))
+        self.assertEqual([call for call in calls if call[1]], [])  # nothing under the scheduler lock
+        self.assertIn("os.scandir", {name for name, _ in calls})  # the guard observed the sweep
+        self.assertTrue(any("unlink" in name for name, _ in calls))
+        self.assertEqual(sorted(state.jobs), [self.T3])
+        self.assertEqual(
+            self.names(state),
+            sorted([*self.generated_names(self.T3), *self.generated_names(self.FRESH_ORPHAN), *foreign, f"{self.T1[:-1]}9.log"]),
+        )
+
+    def test_status_and_enqueue_stay_within_50ms_while_cleanup_is_blocked(self) -> None:
+        state = self.make_state("blocked")
+        self.terminal_job(state, self.T1)
+        state.active_lanes["style"] = "occupied"  # enqueued jobs stay queued; no child process runs
+        release = threading.Event()
+        self.addCleanup(release.set)
+        request = {"operation": "build", "args": {}, "env": {}}
+        prepared = ([sys.executable, "-c", "pass"], ["style"], state.paths.repo_root, {}, 30.0)
+        stack, _calls, entered = self.io_guard(state, block_unlink=release)
+        with stack, mock.patch.object(state.registry, "prepare", return_value=prepared):
+            trigger = threading.Thread(target=state.enqueue, args=(request,), daemon=True)
+            trigger.start()
+            self.assertTrue(entered.wait(5.0), "the worker never started the blocked unlink")
+            latencies: dict[str, float] = {}
+
+            def measure(label: str, call: Any) -> None:
+                start = time.perf_counter()
+                call()
+                latencies[label] = time.perf_counter() - start
+
+            for label, call in (
+                ("status", state.status_payload),
+                ("enqueue", lambda: state.enqueue(request)),
+                ("list", lambda: state.list_jobs(None)),
+            ):
+                probe = threading.Thread(target=measure, args=(label, call), daemon=True)
+                probe.start()
+                probe.join(1.0)
+                self.assertFalse(probe.is_alive(), f"{label} blocked behind cleanup")
+                self.assertLessEqual(latencies[label], 0.05, latencies)
+            trigger.join(1.0)
+            self.assertFalse(trigger.is_alive())
+            self.assertNotIn(self.T1, state.jobs)  # evicted before its files are gone
+            self.assertTrue((state.paths.jobs_dir / f"{self.T1}.log").exists())
+            self.assertFalse(state._await_maintenance(0.05))  # bounded drain reports the stuck cleanup
+            release.set()
+            self.assertTrue(state._await_maintenance(10.0))
+        self.assertFalse(any(name.startswith(self.T1) for name in self.names(state)))
+
+    def test_orphan_sweeps_coalesce_to_one_per_interval_without_delaying_exact_removals(self) -> None:
+        state = self.make_state("coalesce")
+        scans: list[str] = []
+        real_scandir = os.scandir
+
+        def counting_scandir(path: Any) -> Any:
+            if str(path) == str(state.paths.jobs_dir) and threading.current_thread().name == "conductor-maintenance":
+                scans.append(threading.current_thread().name)
+            return real_scandir(path)
+
+        with mock.patch.object(os, "scandir", counting_scandir):
+            self.run_pass(state)
+            self.assertTrue(state._await_maintenance(10.0))
+            self.assertEqual(scans, ["conductor-maintenance"])
+            self.write_family(state, self.ORPHAN)
+            self.terminal_job(state, self.T1)
+            for _ in range(5):
+                self.run_pass(state)
+                self.assertTrue(state._await_maintenance(10.0))
+            self.assertEqual(len(scans), 1)  # coalesced: one sweep in the interval
+            self.assertFalse(any(name.startswith(self.T1) for name in self.names(state)))  # not delayed
+            self.assertEqual(self.names(state), self.generated_names(self.ORPHAN))
+            with state._maintenance_cv:
+                self.assertTrue(state._orphan_sweep_requested)
+                self.assertIsNone(state._maintenance_thread)  # idle: no worker waits for the interval
+            self.rewind_sweep_interval(state)
+            self.run_pass(state)
+            self.assertTrue(state._await_maintenance(10.0))
+        self.assertEqual(len(scans), 2)
+        self.assertEqual(self.names(state), [])
+
+    def test_failed_cleanup_is_retried_by_a_later_sweep_and_never_changes_jobs(self) -> None:
+        state = self.make_state("retry")
+        # Fresh files of an evicted ticket (as after a 200-job eviction): only the
+        # exact retry can remove them; the age-gated orphan sweep never would.
+        self.terminal_job(state, self.T1, aged=False)
+        survivor = self.terminal_job(state, self.T2, expired=False)
+        stuck = state.paths.jobs_dir / f"{self.T1}.log"
+        real_unlink = Path.unlink
+        failures: list[Path] = []
+
+        def failing_unlink(path: Path, *args: Any, **kwargs: Any) -> None:
+            if path == stuck and not failures:
+                failures.append(path)
+                raise PermissionError(errno.EACCES, "denied", str(path))
+            real_unlink(path, *args, **kwargs)
+
+        with mock.patch.object(Path, "unlink", failing_unlink):
+            self.run_pass(state)
+            self.assertTrue(state._await_maintenance(10.0))
+        self.assertEqual(failures, [stuck])
+        self.assertEqual(self.names(state), sorted([stuck.name, *self.generated_names(self.T2)]))
+        with self.assertRaisesRegex(conductor.ConductorError, "unknown job"):
+            state.job_status(self.T1, None)  # evicted ticket stays unknown
+        self.assertEqual((survivor.state, survivor.exit_code), ("completed", 0))
+        with state._maintenance_cv:
+            self.assertEqual(state._maintenance_retry, {stuck: self.T1})
+            self.assertIn("retried", state._maintenance_error)
+        self.run_pass(state)  # within the interval: no retry yet
+        self.assertTrue(state._await_maintenance(10.0))
+        self.assertTrue(stuck.exists())
+        self.rewind_sweep_interval(state)
+        self.run_pass(state)
+        self.assertTrue(state._await_maintenance(10.0))
+        self.assertFalse(stuck.exists())
+        with state._maintenance_cv:
+            self.assertEqual(state._maintenance_retry, {})
+        self.assertEqual((survivor.state, survivor.exit_code), ("completed", 0))
+
+    def test_worker_start_failure_keeps_removals_queued_for_the_next_signal(self) -> None:
+        state = self.make_state("start")
+        self.terminal_job(state, self.T1)
+        real_start = threading.Thread.start
+        refused: list[str] = []
+
+        def refusing_start(thread: threading.Thread) -> None:
+            if thread.name == "conductor-maintenance" and not refused:
+                refused.append(thread.name)
+                raise RuntimeError("can't start new thread")
+            real_start(thread)
+
+        with mock.patch.object(threading.Thread, "start", refusing_start):
+            self.run_pass(state)  # never raises into the transition
+        self.assertEqual(refused, ["conductor-maintenance"])
+        self.assertNotIn(self.T1, state.jobs)
+        self.assertIn("not started", state._maintenance_error)
+        self.assertFalse(state._await_maintenance(0.05))  # queued work, no worker
+        self.assertTrue((state.paths.jobs_dir / f"{self.T1}.log").exists())
+        self.run_pass(state)
+        self.assertTrue(state._await_maintenance(10.0))
+        self.assertEqual(self.names(state), [])
+
+    def gate_persistence(self, state: conductor.DaemonState) -> tuple[threading.Event, threading.Event]:
+        entered, release = threading.Event(), threading.Event()
+        self.addCleanup(release.set)
+        real_persist = state._persist_job_telemetry
+
+        def gated(*args: Any) -> Any:
+            entered.set()
+            release.wait(10.0)
+            return real_persist(*args)
+
+        state._persist_job_telemetry = gated  # type: ignore[method-assign]
+        return entered, release
+
+    def assert_pinned_then_pruned_without_recreation(
+        self, state: conductor.DaemonState, ticket: str, entered: threading.Event, release: threading.Event
+    ) -> None:
+        self.assertTrue(entered.wait(10.0))
+        with mock.patch.object(conductor, "MAX_TERMINAL_JOBS", 0):
+            self.run_pass(state)
+            job = state.jobs.get(ticket)
+            self.assertIsNotNone(job)  # finalization still owns the job
+            self.assertTrue(job.retention_deferred)
+            release.set()
+            deadline = time.monotonic() + 10.0
+            while ticket in state.jobs and time.monotonic() < deadline:
+                time.sleep(0.005)
+            self.assertNotIn(ticket, state.jobs)  # the finalizer's last unpin reran retention
+        self.assertTrue(job.telemetry_persisted)
+        self.assertIsNone(job.telemetry_persist_error)
+        self.assertTrue(state._await_maintenance(10.0))
+        self.assertEqual([name for name in self.names(state) if name.startswith(ticket)], [])
+
+    def test_dispatched_job_finalization_pins_until_timing_is_persisted(self) -> None:
+        state = self.make_state("dispatched", timing="on")
+        entered, release = self.gate_persistence(state)
+        argv = [sys.executable, "-c", "print('done')"]
+        with mock.patch.object(
+            state.registry, "prepare",
+            side_effect=lambda _request: (argv, ["style"], state.paths.repo_root, {"PATH": os.environ.get("PATH", "")}, 30.0),
+        ), mock.patch.object(conductor, "operation_requires_global_heavy_slot", return_value=False):
+            enqueued = state.enqueue({"operation": "build", "args": {}, "env": {}})
+            waited = state.job_wait(enqueued["ticket"], None, 30.0)
+        self.assertEqual(waited["state"], "completed")
+        self.assertIsNotNone(waited.get("outputSummary"))  # the summary pin is already released
+        self.assert_pinned_then_pruned_without_recreation(state, enqueued["ticket"], entered, release)
+
+    def test_job_owned_reader_that_outlives_run_job_keeps_the_job_pinned(self) -> None:
+        state = self.make_state("reader")
+        entered, release = threading.Event(), threading.Event()
+        self.addCleanup(release.set)
+        real_reader = conductor.DaemonState._read_process_output
+
+        def held_reader(state_self: conductor.DaemonState, *args: Any) -> None:
+            entered.set()
+            release.wait(10.0)
+            real_reader(state_self, *args)
+
+        argv = [sys.executable, "-c", "print('done')"]
+        with mock.patch.object(conductor.DaemonState, "_read_process_output", held_reader), mock.patch.object(
+            conductor, "OUTPUT_READER_JOIN_SECONDS", 0.05
+        ), mock.patch.object(
+            state.registry, "prepare",
+            side_effect=lambda _request: (argv, ["style"], state.paths.repo_root, {"PATH": os.environ.get("PATH", "")}, 30.0),
+        ), mock.patch.object(conductor, "operation_requires_global_heavy_slot", return_value=False):
+            ticket = state.enqueue({"operation": "build", "args": {}, "env": {}})["ticket"]
+            waited = state.job_wait(ticket, None, 30.0)
+            self.assertTrue(entered.is_set())
+            self.assertIn(waited["state"], conductor.TERMINAL_STATES)
+            job = state.jobs[ticket]
+            deadline = time.monotonic() + 10.0
+            while job.summary_pins > 1 and time.monotonic() < deadline:  # _run_job finished; only the reader holds one
+                time.sleep(0.005)
+            self.assertEqual(job.summary_pins, 1)
+            with mock.patch.object(conductor, "MAX_TERMINAL_JOBS", 0):
+                self.run_pass(state)
+                self.assertIn(ticket, state.jobs)
+                self.assertTrue(job.retention_deferred)
+                release.set()
+                while ticket in state.jobs and time.monotonic() < deadline:
+                    time.sleep(0.005)
+                self.assertNotIn(ticket, state.jobs)
+        self.assertTrue(state._await_maintenance(10.0))
+        self.assertEqual([name for name in self.names(state) if name.startswith(ticket)], [])
+
+    def test_undispatched_timing_completion_pins_until_persisted(self) -> None:
+        state = self.make_state("undispatched", timing="on")
+        state.active_lanes["style"] = "occupied"
+        entered, release = self.gate_persistence(state)
+        prepared = ([sys.executable, "-c", "pass"], ["style"], state.paths.repo_root, {}, 30.0)
+        with mock.patch.object(state.registry, "prepare", return_value=prepared):
+            ticket = state.enqueue({"operation": "build", "args": {}, "env": {}})["ticket"]
+        canceled = state.job_cancel(ticket, None)
+        self.assertEqual((canceled["state"], canceled["exitCode"]), ("canceled", 130))
+        self.assert_pinned_then_pruned_without_recreation(state, ticket, entered, release)
+
+
+
+class Step5OwnershipPinTests(unittest.TestCase):
+    """Step 5 r1: every owner that can still write a job's files keeps it pinned (S5-R0-OWNERSHIP / S5-R0-01/02)."""
+
+    CANCEL_OWNERS = ("owner-cancel", "_escalate_canceled_job_after_grace", "_force_shutdown_when_canceled")
+    SLEEPER = "import time; print('ready', flush=True); time.sleep(60)"
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+
+    def make_state(self, name: str, timing: str) -> conductor.DaemonState:
+        state = timing_state(self.root / name, timing)
+        self.addCleanup(state._await_maintenance, 10.0)
+        self.addCleanup(state._await_job_telemetry, 10.0)
+        return state
+
+    def names(self, state: conductor.DaemonState, ticket: str) -> list[str]:
+        return sorted(path.name for path in state.paths.jobs_dir.iterdir() if path.name.startswith(ticket))
+
+    def track_run_job(self) -> dict:
+        """Patch ``_run_job`` so each ticket's real runner signals when it has fully returned."""
+        done: dict = {}
+        real = conductor.DaemonState._run_job
+
+        def tracked_run_job(state_self: conductor.DaemonState, ticket: str) -> None:
+            event = done.setdefault(ticket, threading.Event())
+            try:
+                real(state_self, ticket)
+            finally:
+                event.set()
+
+        patcher = mock.patch.object(conductor.DaemonState, "_run_job", tracked_run_job)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return done
+
+    def prepare_patches(self, state: conductor.DaemonState, child_lanes: list[str]) -> contextlib.ExitStack:
+        def prepare(request: dict) -> tuple:
+            env = {"PATH": os.environ.get("PATH", "")}
+            if request.get("operation") == "app":  # the superseding job stays queued behind "release"
+                return ([sys.executable, "-c", "pass"], ["liveApp", "release"], state.paths.repo_root, env, 30.0)
+            return ([sys.executable, "-u", "-c", self.SLEEPER], child_lanes, state.paths.repo_root, env, 60.0)
+
+        stack = contextlib.ExitStack()
+        stack.enter_context(mock.patch.object(state.registry, "prepare", side_effect=prepare))
+        stack.enter_context(mock.patch.object(conductor, "operation_requires_global_heavy_slot", return_value=False))
+        return stack
+
+    def suspend_cancellation_wait(self, state: conductor.DaemonState) -> tuple[threading.Event, threading.Event]:
+        """Suspend the cancellation owner at its first process-tree wait, releasing the condition like the real wait."""
+        entered, resume = threading.Event(), threading.Event()
+        self.addCleanup(resume.set)
+        real = state._wait_for_process_tree_exit_locked
+
+        def wait(job: conductor.Job, deadline: float, signal_for_new: Any) -> bool:
+            name = threading.current_thread().name
+            if not entered.is_set() and any(owner in name for owner in self.CANCEL_OWNERS):
+                entered.set()
+                while not resume.is_set():
+                    state.condition.wait(0.01)
+                return True  # still "alive": the owner escalates and writes its SIGKILL lines
+            return real(job, deadline, signal_for_new)
+
+        state._wait_for_process_tree_exit_locked = wait  # type: ignore[method-assign]
+        return entered, resume
+
+    def wait_until(self, predicate: Any, timeout: float = 15.0) -> bool:
+        deadline = time.monotonic() + timeout
+        while not predicate() and time.monotonic() < deadline:
+            time.sleep(0.005)
+        return bool(predicate())
+
+    def run_cancellation_owner(self, owner: str) -> None:
+        state = self.make_state(owner, timing="on")
+        done = self.track_run_job()
+        entered, resume = self.suspend_cancellation_wait(state)
+        lanes = ["liveApp"] if owner == "supersede" else ["style"]
+        with self.prepare_patches(state, lanes):
+            ticket = state.enqueue({"operation": "build", "args": {}, "env": {}})["ticket"]
+            job = state.jobs[ticket]
+            self.assertTrue(self.wait_until(lambda: job.process_pid and "ready\n" in "".join(job.tail)))
+            owner_thread = None
+            if owner == "cancel":
+                owner_thread = threading.Thread(target=state.job_cancel, args=(ticket, None), name="owner-cancel")
+                owner_thread.start()
+            elif owner == "supersede":
+                state.active_lanes["release"] = "occupied"
+                superseded = state.enqueue({"operation": "app", "args": {"subcommand": "stop"}, "env": {}})
+                self.assertEqual([item["ticket"] for item in superseded["supersededJobs"]], [ticket])
+            else:
+                state.stop(force=True)
+            self.assertTrue(entered.wait(15.0), "the cancellation owner never reached its wait")
+            # The real runner finishes and releases its own pin while the owner is suspended.
+            self.assertTrue(done.setdefault(ticket, threading.Event()).wait(15.0))
+            self.assertTrue(self.wait_until(lambda: job.summary_pins <= 1))
+            self.assertEqual(job.summary_pins, 1)  # only the cancellation owner's pin remains
+            self.assertEqual((job.state, job.exit_code), ("canceled", 130))
+            with mock.patch.object(conductor, "MAX_TERMINAL_JOBS", 0):
+                with state.condition:
+                    state._retention_pass_locked()
+                self.assertIn(ticket, state.jobs)
+                self.assertTrue(job.retention_deferred)
+                self.assertTrue(state._await_maintenance(10.0))
+                self.assertTrue(job.log_path.exists())
+                resume.set()
+                self.assertTrue(self.wait_until(lambda: ticket not in state.jobs))  # released after the last write
+                if owner_thread is not None:
+                    owner_thread.join(15.0)
+                    self.assertFalse(owner_thread.is_alive())
+                self.assertTrue(state._await_maintenance(10.0))
+        self.assertIn("SIGKILL after grace period", "".join(job.tail))  # the late write happened while pinned
+        self.assertEqual(self.names(state, ticket), [])  # pruned afterwards and never recreated
+        self.assertEqual((job.state, job.exit_code), ("canceled", 130))
+
+    def test_job_cancel_pins_until_its_last_escalation_write(self) -> None:
+        self.run_cancellation_owner("cancel")
+
+    def test_supersession_escalation_pins_until_its_last_write(self) -> None:
+        self.run_cancellation_owner("supersede")
+
+    def test_force_stop_cleanup_pins_until_its_last_write(self) -> None:
+        self.run_cancellation_owner("force")
+
+    def run_held_owned_thread(self, method: str, timing: str, extra: contextlib.ExitStack) -> conductor.Job:
+        """Hold one job-owned thread past ``_run_job``; it alone must keep the job pinned."""
+        state = self.make_state(method, timing=timing)
+        done = self.track_run_job()
+        entered, release = threading.Event(), threading.Event()
+        self.addCleanup(release.set)
+        real = getattr(conductor.DaemonState, method)
+
+        def held(state_self: conductor.DaemonState, *args: Any, **kwargs: Any) -> Any:
+            if not entered.is_set():
+                entered.set()
+                release.wait(15.0)
+                if method == "_monitor_xctest_stall":
+                    return None  # the watchdog's own work is not under test
+            return real(state_self, *args, **kwargs)
+
+        with extra, mock.patch.object(conductor.DaemonState, method, held), self.prepare_patches(state, ["style"]):
+            state.registry.prepare.side_effect = lambda _request: (
+                [sys.executable, "-c", "print('done')"], ["style"], state.paths.repo_root,
+                {"PATH": os.environ.get("PATH", "")}, 30.0,
+            )
+            ticket = state.enqueue({"operation": "build", "args": {}, "env": {}})["ticket"]
+            job = state.jobs[ticket]
+            self.assertTrue(entered.wait(15.0))
+            self.assertTrue(done.setdefault(ticket, threading.Event()).wait(15.0))
+            self.assertTrue(self.wait_until(lambda: job.summary_pins <= 1))
+            self.assertEqual(job.summary_pins, 1)  # only the held thread's pin remains
+            with mock.patch.object(conductor, "MAX_TERMINAL_JOBS", 0):
+                with state.condition:
+                    state._retention_pass_locked()
+                self.assertIn(ticket, state.jobs)
+                self.assertTrue(job.retention_deferred)
+                release.set()
+                self.assertTrue(self.wait_until(lambda: ticket not in state.jobs))
+                self.assertTrue(state._await_maintenance(10.0))
+        self.assertEqual(self.names(state, ticket), [])
+        return job
+
+    def test_watchdog_thread_pins_until_it_returns(self) -> None:
+        extra = contextlib.ExitStack()
+        extra.enter_context(mock.patch.object(conductor.DaemonState, "_xctest_watchdog_enabled", return_value=True))
+        extra.enter_context(mock.patch.object(conductor, "XCTEST_WATCHDOG_JOIN_SECONDS", 0.05))
+        job = self.run_held_owned_thread("_monitor_xctest_stall", "on", extra)
+        # The runner's bounded join gave up; the existing visible outcome is unchanged.
+        self.assertEqual(job.error, "XCTest progress stall watchdog did not finish bounded diagnostics")
+
+    def test_timing_off_summary_thread_pins_until_it_returns(self) -> None:
+        job = self.run_held_owned_thread("_refresh_output_summary", "off", contextlib.ExitStack())
+        self.assertIsNotNone(job.output_summary)
+        self.assertEqual((job.state, job.exit_code), ("completed", 0))
+
+    def test_predicate_accepts_real_minted_tickets_and_watchdog_diagnostic_names(self) -> None:
+        state = self.make_state("names", timing="off")
+        state.active_lanes["style"] = "occupied"  # stays queued: names only, no child
+        with self.prepare_patches(state, ["style"]):
+            payload = state.enqueue({"operation": "build", "args": {}, "env": {}})
+        ticket = payload["ticket"]
+        job = state.jobs[ticket]
+        self.assertEqual(conductor.generated_job_file_ticket(Path(payload["logPath"]).name), ticket)
+        self.assertEqual(job.log_path.parent, state.paths.jobs_dir)
+
+        def fake_sample(argv: list, **_kwargs: Any) -> subprocess.CompletedProcess:
+            Path(argv[argv.index("-file") + 1]).write_text("sample")
+            return subprocess.CompletedProcess(argv, 0, "", "")
+
+        with mock.patch.object(conductor.subprocess, "run", side_effect=fake_sample):
+            state._capture_xctest_stall_diagnostics(job, {}, (os.getpid(), "token"))
+        self.assertEqual(
+            sorted(path.name for path in job.diagnostic_paths),
+            sorted([f"{ticket}.xctest-stall.json", f"{ticket}.xctest-stall.sample.txt"]),
+        )
+        for path in job.diagnostic_paths:
+            self.assertEqual(path.parent, state.paths.jobs_dir)
+            self.assertEqual(conductor.generated_job_file_ticket(path.name), ticket)
+            self.assertTrue(path.exists())
+
+
+class InjectedSetupFault(BaseException):
+    """A non-``Exception`` fault: rollback must not depend on ``except Exception``."""
+
+
+class Step5PinHandoffRollbackTests(unittest.TestCase):
+    """Step 5 r2: a pin acquired for a cancellation thread is released if setup fails before handoff (S5-R1-STOP-PIN-ROLLBACK / S5-R1-01)."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.state = timing_state(Path(self.tmp.name) / "state", "off")
+        self.addCleanup(self.state._await_maintenance, 10.0)
+        self.real_thread = threading.Thread
+
+    def job(self, n: int, job_state: str, lanes: tuple = ("style",)) -> conductor.Job:
+        ticket = f"5e7f0000-0000-4000-8000-{n:012d}"
+        job = conductor.Job(
+            ticket=ticket, request_key=None, fingerprint="f", operation="build", args={}, lanes=list(lanes),
+            timeout=None, verbose=False, env={}, created_at=conductor.now(),
+            log_path=self.state.paths.jobs_dir / f"{ticket}.log", state=job_state,
+        )
+        self.state.jobs[ticket] = job
+        if job_state == "queued":
+            self.state.queue.append(ticket)
+        return job
+
+    def failing_thread_factory(self, target_name: str, mode: str, on_fault: Any) -> Any:
+        """``threading.Thread`` replacement failing construction or ``start()`` for one target only."""
+        real_thread = self.real_thread
+
+        def factory(*args: Any, **kwargs: Any) -> threading.Thread:
+            target = kwargs.get("target")
+            if getattr(target, "__name__", "") != target_name:
+                return real_thread(*args, **kwargs)
+            if mode == "construct":
+                on_fault()
+                raise InjectedSetupFault("thread construction")
+            thread = real_thread(*args, **kwargs)
+
+            def refuse_start() -> None:
+                on_fault()
+                raise InjectedSetupFault("thread start")
+
+            thread.start = refuse_start  # type: ignore[method-assign]
+            return thread
+
+        return factory
+
+    def run_failing_stop(self, fault: str) -> tuple[list[int], list[int], list[conductor.Job]]:
+        """Force-stop with running R1, queued Q, running R2 (already pinned by another holder), running R3.
+
+        Returns (pins at the fault, pins afterwards, [R1, Q, R2, R3]).
+        """
+        r1, q, r2, r3 = self.job(1, "running"), self.job(2, "queued"), self.job(3, "running"), self.job(4, "running")
+        r2.summary_pins = 1  # e.g. a status/wait pin: must survive the rollback
+        running = (r1, r2, r3)
+        at_fault: list[int] = []
+        terminated: list[str] = []
+
+        def snapshot() -> None:
+            at_fault.extend(job.summary_pins for job in running)
+
+        def terminate(job: conductor.Job, reason: str) -> None:
+            terminated.append(job.ticket)
+            if (fault == "terminate-first" and job is r1) or (fault == "terminate-later" and job is r2):
+                snapshot()
+                raise InjectedSetupFault(fault)
+
+        def raising(*_args: Any, **_kwargs: Any) -> Any:
+            snapshot()
+            raise InjectedSetupFault(fault)
+
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(mock.patch.object(self.state, "_terminate_process_group_locked", side_effect=terminate))
+            if fault == "queued":
+                stack.enter_context(
+                    mock.patch.object(self.state, "_complete_undispatched_telemetry_locked", side_effect=raising)
+                )
+            elif fault == "ledger":
+                stack.enter_context(mock.patch.object(self.state, "_write_running_processes_locked", side_effect=raising))
+            elif fault == "payload":
+                stack.enter_context(mock.patch.object(self.state, "status_payload", side_effect=raising))
+            elif fault in {"thread-construct", "thread-start"}:
+                mode = "construct" if fault == "thread-construct" else "start"
+                stack.enter_context(
+                    mock.patch.object(
+                        conductor.threading, "Thread",
+                        self.failing_thread_factory("_force_shutdown_when_canceled", mode, snapshot),
+                    )
+                )
+            with self.assertRaises(InjectedSetupFault) as raised:
+                self.state.stop(force=True)
+        self.assertEqual(str(raised.exception), {"thread-construct": "thread construction", "thread-start": "thread start"}.get(fault, fault))
+        self.assertTrue(self.state.shutdown_requested)
+        return at_fault, [job.summary_pins for job in running], [r1, q, r2, r3]
+
+    def assert_rolled_back(self, fault: str, expected_at_fault: list[int]) -> list[conductor.Job]:
+        at_fault, after, jobs = self.run_failing_stop(fault)
+        self.assertEqual(at_fault, expected_at_fault)  # the pins really were acquired before the fault
+        self.assertEqual(after, [0, 1, 0])  # every acquired pin released; the other holder's pin kept
+        for job in jobs:
+            self.assertFalse(job.retention_deferred)
+        return jobs
+
+    def test_stop_rolls_back_the_pin_when_terminating_the_first_running_job_fails(self) -> None:
+        r1, q, r2, r3 = self.assert_rolled_back("terminate-first", [1, 1, 0])
+        self.assertEqual((r1.state, r1.cancel_requested), ("running", True))  # no outcome is rewritten
+        self.assertEqual((q.state, r3.cancel_requested), ("queued", False))
+
+    def test_stop_rolls_back_every_pin_of_a_partial_multi_job_acquisition(self) -> None:
+        r1, q, r2, r3 = self.assert_rolled_back("terminate-later", [1, 2, 0])
+        self.assertEqual((q.state, q.exit_code), ("canceled", 130))  # processed before the fault, unchanged
+        self.assertEqual(r3.cancel_requested, False)
+
+    def test_stop_rolls_back_pins_when_queued_job_processing_fails(self) -> None:
+        self.assert_rolled_back("queued", [1, 1, 0])
+
+    def test_stop_rolls_back_pins_when_the_running_ledger_write_fails(self) -> None:
+        self.assert_rolled_back("ledger", [1, 2, 1])
+
+    def test_stop_rolls_back_pins_when_payload_construction_fails(self) -> None:
+        self.assert_rolled_back("payload", [1, 2, 1])
+
+    def test_stop_rolls_back_pins_when_the_cleanup_thread_cannot_be_constructed(self) -> None:
+        self.assert_rolled_back("thread-construct", [1, 2, 1])
+
+    def test_stop_rolls_back_pins_when_the_cleanup_thread_cannot_start(self) -> None:
+        self.assert_rolled_back("thread-start", [1, 2, 1])
+
+    def test_supersession_rolls_back_its_pin_when_the_escalation_thread_cannot_start(self) -> None:
+        for mode in ("construct", "start"):
+            with self.subTest(mode=mode):
+                old = self.job(10 + (mode == "start"), "running", lanes=("liveApp",))
+                old.summary_pins = 1  # another holder's pin
+                new = self.job(20 + (mode == "start"), "queued", lanes=("liveApp", "release"))
+                self.state.queue.remove(new.ticket)
+                del self.state.jobs[new.ticket]  # the superseding job is not yet registered
+                at_fault: list[int] = []
+                factory = self.failing_thread_factory(
+                    "_escalate_canceled_job_after_grace", mode, lambda: at_fault.append(old.summary_pins)
+                )
+                with mock.patch.object(conductor.threading, "Thread", factory):
+                    with self.state.condition, self.assertRaises(InjectedSetupFault):
+                        self.state._supersede_live_app_jobs_locked(new, "stop")
+                self.assertEqual(at_fault, [2])
+                self.assertEqual(old.summary_pins, 1)
+                self.assertEqual((old.state, old.cancel_requested), ("running", True))
+                del self.state.jobs[old.ticket]  # isolate the next mode
+
+    def test_job_owned_thread_rolls_back_its_pin_when_it_cannot_be_constructed_or_started(self) -> None:
+        for mode in ("construct", "start"):
+            with self.subTest(mode=mode):
+                job = self.job(30 + (mode == "start"), "running")
+                job.summary_pins = 1
+                ran: list[bool] = []
+                at_fault: list[int] = []
+                factory = self.failing_thread_factory("run", mode, lambda: at_fault.append(job.summary_pins))
+                with mock.patch.object(conductor.threading, "Thread", factory), self.assertRaises(InjectedSetupFault):
+                    self.state._start_job_owned_thread(job, lambda: ran.append(True), ())
+                self.assertEqual(at_fault, [2])
+                self.assertEqual(job.summary_pins, 1)
+                self.assertEqual(ran, [])
 
 
 if __name__ == "__main__":
