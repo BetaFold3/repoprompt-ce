@@ -881,36 +881,234 @@ def discover_test_artifact_executable(artifact_path: Path) -> Optional[Path]:
     return None
 
 
-def test_artifact_fingerprint(artifact_path: Path, sink: Optional[Any] = None) -> Dict[str, Any]:
+# Step 7: request args derived only by the daemon's execution-time evaluation.
+# Enqueue strips them from every client request before request identity.
+TEST_ARTIFACT_DERIVED_ARG_KEYS = (
+    "artifactPath",
+    "artifactFingerprint",
+    "artifactScope",
+    "artifactScopeDifferences",
+    "artifactScopeMessage",
+    "artifactTicketSourceSnapshot",
+    "buildTicketId",
+)
+TEST_ARTIFACT_PENDING_SCOPE_MESSAGE = (
+    "artifact_scope: pending — validated after XCTest slot admission, before launch"
+)
+# The required root-ticket ``artifact_fingerprint`` fields and value kinds
+# (unchanged, unversioned format; extra fields are ignored as before).
+_TICKET_ARTIFACT_FINGERPRINT_FIELDS = (
+    ("executable_path", str),
+    ("size", int),
+    ("mtime_ns", int),
+    ("sha256", str),
+    ("closure_manifest_sha256", str),
+    ("closure_file_count", int),
+)
+
+
+def host_artifact_arch() -> str:
+    """The host architecture for cheap artifact discovery (``uname -m`` without a subprocess)."""
+    return os.uname().machine
+
+
+def _read_root_build_ticket(jobs_dir: Path) -> Dict[str, Any]:
+    ticket_path = jobs_dir / "build-ticket-root.json"
+    try:
+        ticket = json.loads(ticket_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        raise ArtifactUnavailableError(
+            "test artifact build ticket is missing or unreadable; run `make dev-test` first"
+        )
+    if not isinstance(ticket, dict):
+        raise ArtifactUnavailableError(
+            "test artifact build ticket is missing or unreadable; run `make dev-test` first"
+        )
+    return ticket
+
+
+def _valid_ticket_artifact_fingerprint_shape(value: Any) -> bool:
+    if not isinstance(value, dict):
+        return False
+    for key, kind in _TICKET_ARTIFACT_FINGERPRINT_FIELDS:
+        field = value.get(key)
+        if not isinstance(field, kind) or isinstance(field, bool):
+            return False
+    return True
+
+
+def admit_test_artifact(repo_root: Path, jobs_dir: Path, sink: Optional[Any] = None) -> None:
+    """Step 7 cheap admission shared by the client and enqueue.
+
+    Parses the root ticket, checks the required fingerprint shape, and checks that
+    the artifact bundle and executable exist. It never hashes, takes a source
+    snapshot or runs ``swift --version``: the one authoritative
+    ``evaluate_test_artifact`` runs at execution, after slot admission. Source
+    drift is never rejected here (stale artifacts are runnable by design). ``sink``
+    (or the thread's ambient sink) gets one ``artifact_admission`` operation.
+    """
+    sink = _resolve_operation_sink(sink)
+    start = time.monotonic_ns()
+    try:
+        ticket = _read_root_build_ticket(jobs_dir)
+        if not _valid_ticket_artifact_fingerprint_shape(ticket.get("artifact_fingerprint")):
+            raise ArtifactUnavailableError(
+                "test artifact build ticket has no valid artifact fingerprint; run `make dev-test` first"
+            )
+        artifact_path = discover_root_test_artifact(repo_root, host_artifact_arch())
+        if artifact_path is None:
+            raise ArtifactUnavailableError("root test artifact is missing; run `make dev-test` first")
+        if discover_test_artifact_executable(artifact_path) is None:
+            raise ArtifactUnavailableError(
+                "root test artifact executable is missing; run `make dev-test` first"
+            )
+    finally:
+        _emit_operation(sink, "artifact_admission", time.monotonic_ns() - start)
+
+
+class ArtifactObservations:
+    """Execution-local filesystem identities observed while fingerprinting (Step 7).
+
+    Never persisted and never part of a ticket or fingerprint. An identity is
+    (device, inode, file type, size, mtime_ns, ctime_ns). Hashed files are
+    bracketed by path/descriptor observations; every enumerated directory is
+    observed before it is listed, so an entry added, removed or renamed in it
+    changes its identity. ``verify`` rechecks metadata only: at the end of the
+    fingerprint pass and immediately before launch. These fences detect
+    observable instability; they are not an atomic snapshot and never replace or
+    skip a full hash. Unrelated churn in an observed directory also rejects.
+    """
+
+    def __init__(self) -> None:
+        self._entries: Dict[str, Tuple[bool, Tuple[int, ...]]] = {}
+
+    def __len__(self) -> int:
+        return len(self._entries)
+
+    @staticmethod
+    def identity(metadata: os.stat_result) -> Tuple[int, ...]:
+        return (
+            metadata.st_dev,
+            metadata.st_ino,
+            stat.S_IFMT(metadata.st_mode),
+            metadata.st_size,
+            metadata.st_mtime_ns,
+            metadata.st_ctime_ns,
+        )
+
+    @staticmethod
+    def _metadata(path: str, directory: bool) -> os.stat_result:
+        # Directories follow links (the products directory may sit under the
+        # `.build/debug` link); hashed files are never links, so a swap shows.
+        return os.stat(path) if directory else os.lstat(path)
+
+    def observe_directory(self, path: Path) -> None:
+        self._record(str(path), True, self.identity(self._metadata(str(path), True)))
+
+    def record_file(self, path: Path, identity: Tuple[int, ...]) -> None:
+        self._record(str(path), False, identity)
+
+    def _record(self, key: str, directory: bool, identity: Tuple[int, ...]) -> None:
+        existing = self._entries.get(key)
+        if existing is not None and existing != (directory, identity):
+            raise ArtifactUnavailableError(
+                f"root test artifact changed while it was being fingerprinted ({key}); "
+                "run `make dev-test` first"
+            )
+        self._entries[key] = (directory, identity)
+
+    def verify(self, when: str) -> None:
+        for key, (directory, identity) in self._entries.items():
+            try:
+                current = self.identity(self._metadata(key, directory))
+            except OSError as exc:
+                raise ArtifactUnavailableError(
+                    f"root test artifact changed {when} ({key}: {exc}); run `make dev-test` first"
+                ) from exc
+            if current != identity:
+                raise ArtifactUnavailableError(
+                    f"root test artifact changed {when} ({key}); run `make dev-test` first"
+                )
+
+
+def _hash_artifact_file(
+    path: Path,
+    counters: Optional[Dict[str, int]],
+    observations: Optional[ArtifactObservations],
+) -> Tuple[os.stat_result, str]:
+    """SHA-256 one artifact file. With ``observations``, bracket the read with
+    path lstat, fstat, fstat, path lstat; all four identities and the byte count
+    must agree, and the identity is kept for the later metadata fences."""
+    if observations is None:
+        metadata = path.stat()
+    else:
+        metadata = os.lstat(path)
+    digest = hashlib.sha256()
+    bytes_read = 0
+    with path.open("rb") as handle:
+        opened = os.fstat(handle.fileno()) if observations is not None else None
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+            bytes_read += len(chunk)
+            if counters is not None:
+                counters["bytesHashed"] += len(chunk)
+        read_end = os.fstat(handle.fileno()) if observations is not None else None
+    if counters is not None:
+        counters["filesHashed"] += 1
+    if observations is not None:
+        identity = ArtifactObservations.identity(metadata)
+        after = os.lstat(path)
+        stable = (
+            stat.S_ISREG(metadata.st_mode)
+            and bytes_read == metadata.st_size
+            and all(
+                ArtifactObservations.identity(observed) == identity
+                for observed in (opened, read_end, after)
+                if observed is not None
+            )
+        )
+        if not stable:
+            raise ArtifactUnavailableError(
+                f"root test artifact changed while it was being fingerprinted ({path}); "
+                "run `make dev-test` first"
+            )
+        observations.record_file(path, identity)
+    return metadata, digest.hexdigest()
+
+
+def test_artifact_fingerprint(
+    artifact_path: Path,
+    sink: Optional[Any] = None,
+    *,
+    observations: Optional[ArtifactObservations] = None,
+) -> Dict[str, Any]:
     """Fingerprint the test artifact; ``sink`` (or the thread's ambient sink) gets
-    one ``artifact_fingerprint`` operation with bytes/files hashed and duration."""
+    one ``artifact_fingerprint`` operation with bytes/files hashed and duration.
+    ``observations`` (Step 7) adds read/enumeration stability checks and an
+    end-of-pass metadata fence; the returned fingerprint is unchanged."""
     sink = _resolve_operation_sink(sink)
     if sink is None:
-        return _test_artifact_fingerprint(artifact_path, None)
+        return _test_artifact_fingerprint(artifact_path, None, observations)
     counters = {"bytesHashed": 0, "filesHashed": 0}
     start = time.monotonic_ns()
     try:
-        return _test_artifact_fingerprint(artifact_path, counters)
+        return _test_artifact_fingerprint(artifact_path, counters, observations)
     finally:
         _emit_operation(sink, "artifact_fingerprint", time.monotonic_ns() - start, counters)
 
 
-def _test_artifact_fingerprint(artifact_path: Path, counters: Optional[Dict[str, int]]) -> Dict[str, Any]:
+def _test_artifact_fingerprint(
+    artifact_path: Path,
+    counters: Optional[Dict[str, int]],
+    observations: Optional[ArtifactObservations] = None,
+) -> Dict[str, Any]:
     executable = discover_test_artifact_executable(artifact_path)
     if executable is None:
         raise ArtifactUnavailableError(
             "root test artifact executable is missing; run `make dev-test` first"
         )
     try:
-        metadata = executable.stat()
-        digest = hashlib.sha256()
-        with executable.open("rb") as handle:
-            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-                digest.update(chunk)
-                if counters is not None:
-                    counters["bytesHashed"] += len(chunk)
-        if counters is not None:
-            counters["filesHashed"] += 1
+        metadata, executable_sha256 = _hash_artifact_file(executable, counters, observations)
     except OSError as exc:
         raise ArtifactUnavailableError(
             f"root test artifact executable is unreadable ({exc}); run `make dev-test` first"
@@ -918,6 +1116,9 @@ def _test_artifact_fingerprint(artifact_path: Path, counters: Optional[Dict[str,
 
     try:
         products_dir = artifact_path.parent
+        if observations is not None:
+            # Before enumerating `*.bundle` roots: a sibling added later shows here.
+            observations.observe_directory(products_dir)
         closure_roots = [artifact_path] if artifact_path.is_dir() else []
         closure_roots.extend(
             path
@@ -930,6 +1131,8 @@ def _test_artifact_fingerprint(artifact_path: Path, counters: Optional[Dict[str,
             raise error
 
         for closure_root in closure_roots:
+            if observations is not None:
+                observations.observe_directory(closure_root)
             for directory, directory_names, file_names in os.walk(
                 closure_root,
                 topdown=True,
@@ -940,28 +1143,26 @@ def _test_artifact_fingerprint(artifact_path: Path, counters: Optional[Dict[str,
                 directory_names[:] = [
                     name for name in directory_names if not (directory_path / name).is_symlink()
                 ]
+                if observations is not None:
+                    # Top-down: each retained child is observed before the walk lists it.
+                    for name in directory_names:
+                        observations.observe_directory(directory_path / name)
                 for file_name in file_names:
                     path = directory_path / file_name
                     if path == executable or path.is_symlink() or not path.is_file():
                         continue
-                    file_metadata = path.stat()
+                    file_metadata, file_sha256 = _hash_artifact_file(path, counters, observations)
                     relative_path = path.relative_to(products_dir).as_posix()
-                    file_digest = hashlib.sha256()
-                    with path.open("rb") as handle:
-                        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-                            file_digest.update(chunk)
-                            if counters is not None:
-                                counters["bytesHashed"] += len(chunk)
-                    if counters is not None:
-                        counters["filesHashed"] += 1
                     manifest_lines.append(
                         f"{relative_path}\0{file_metadata.st_size}\0{file_metadata.st_mtime_ns}\0"
-                        f"{file_digest.hexdigest()}\n"
+                        f"{file_sha256}\n"
                     )
         manifest_lines.sort()
         closure_digest = hashlib.sha256(
             "".join(manifest_lines).encode("utf-8", errors="surrogateescape")
         ).hexdigest()
+        if observations is not None:
+            observations.verify("while it was being fingerprinted")
     except OSError as exc:
         raise ArtifactUnavailableError(
             f"root test artifact closure is unreadable ({exc}); run `make dev-test` first"
@@ -970,7 +1171,7 @@ def _test_artifact_fingerprint(artifact_path: Path, counters: Optional[Dict[str,
         "executable_path": str(executable.resolve()),
         "size": metadata.st_size,
         "mtime_ns": metadata.st_mtime_ns,
-        "sha256": digest.hexdigest(),
+        "sha256": executable_sha256,
         "closure_manifest_sha256": closure_digest,
         "closure_file_count": len(manifest_lines),
     }
@@ -992,8 +1193,14 @@ def artifact_fingerprint_differences(
     return differences
 
 
-def verify_test_artifact_fingerprint(artifact_path: Path, recorded: Any, sink: Optional[Any] = None) -> Dict[str, Any]:
-    current = test_artifact_fingerprint(artifact_path, sink=sink)
+def verify_test_artifact_fingerprint(
+    artifact_path: Path,
+    recorded: Any,
+    sink: Optional[Any] = None,
+    *,
+    observations: Optional[ArtifactObservations] = None,
+) -> Dict[str, Any]:
+    current = test_artifact_fingerprint(artifact_path, sink=sink, observations=observations)
     differences = artifact_fingerprint_differences(recorded, current)
     if differences:
         raise ArtifactUnavailableError(
@@ -1034,15 +1241,18 @@ def evaluate_test_artifact(
     jobs_dir: Path,
     env: Dict[str, str],
     sink: Optional[Any] = None,
+    *,
+    observations: Optional[ArtifactObservations] = None,
 ) -> Dict[str, Any]:
     """Evaluate the root test artifact; ``sink`` (or the thread's ambient sink)
-    gets one ``artifact_evaluation`` operation plus the nested fingerprint."""
+    gets one ``artifact_evaluation`` operation plus the nested fingerprint.
+    ``observations`` collects the identities rechecked before launch (Step 7)."""
     sink = _resolve_operation_sink(sink)
     if sink is None:
-        return _evaluate_test_artifact(repo_root, jobs_dir, env, None)
+        return _evaluate_test_artifact(repo_root, jobs_dir, env, None, observations)
     start = time.monotonic_ns()
     try:
-        return _evaluate_test_artifact(repo_root, jobs_dir, env, sink)
+        return _evaluate_test_artifact(repo_root, jobs_dir, env, sink, observations)
     finally:
         _emit_operation(sink, "artifact_evaluation", time.monotonic_ns() - start)
 
@@ -1052,18 +1262,9 @@ def _evaluate_test_artifact(
     jobs_dir: Path,
     env: Dict[str, str],
     sink: Optional[Any],
+    observations: Optional[ArtifactObservations] = None,
 ) -> Dict[str, Any]:
-    ticket_path = jobs_dir / "build-ticket-root.json"
-    try:
-        ticket = json.loads(ticket_path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        raise ArtifactUnavailableError(
-            "test artifact build ticket is missing or unreadable; run `make dev-test` first"
-        )
-    if not isinstance(ticket, dict):
-        raise ArtifactUnavailableError(
-            "test artifact build ticket is missing or unreadable; run `make dev-test` first"
-        )
+    ticket = _read_root_build_ticket(jobs_dir)
     current_toolchain = artifact_toolchain_snapshot(repo_root, env)
     artifact_path = discover_root_test_artifact(repo_root, current_toolchain.get("arch", ""))
     if artifact_path is None:
@@ -1071,7 +1272,7 @@ def _evaluate_test_artifact(
             "root test artifact is missing; run `make dev-test` first"
         )
     current_fingerprint = verify_test_artifact_fingerprint(
-        artifact_path, ticket.get("artifact_fingerprint"), sink=sink
+        artifact_path, ticket.get("artifact_fingerprint"), sink=sink, observations=observations
     )
     current_source = source_snapshot(repo_root, env)
     ticket_source_value = ticket.get("source_snapshot")
@@ -2803,7 +3004,10 @@ class OperationRegistry:
         if operation == "test-artifact":
             if not args.get("filter"):
                 raise ConductorError("test-artifact requires --filter")
-            args.update(evaluate_test_artifact(self.repo_root, self.jobs_dir, env))
+            # Step 7: cheap admission only. The one authoritative evaluation runs in
+            # `_run_job` after lane and XCTest-slot admission; the argv has no
+            # hash-derived input.
+            admit_test_artifact(self.repo_root, self.jobs_dir)
             return [canonical_swift, "test", "--skip-build", "--filter", str(args["filter"])], ["build"], cwd, env, effective_timeout
         if operation == "test-parallel":
             if not args.get("parallelRunId"):
@@ -3374,6 +3578,9 @@ class DaemonState:
         if not isinstance(raw_args, dict):
             raise ConductorError("request args must be an object")
         args = dict(raw_args)
+        # Step 7: only the execution-time evaluation may set artifact-derived args.
+        for key in TEST_ARTIFACT_DERIVED_ARG_KEYS:
+            args.pop(key, None)
         operation = str(request.get("operation") or "")
         if operation == "test-parallel":
             for key in (
@@ -3440,9 +3647,10 @@ class DaemonState:
                     0.0 if operation_requires_global_xctest_slot(operation, args) else None
                 ),
                 telemetry=telemetry,
-                artifact_scope=args.get("artifactScope"),
-                artifact_scope_differences=list(args.get("artifactScopeDifferences") or []),
-                artifact_scope_message=args.get("artifactScopeMessage"),
+                artifact_scope="pending" if operation == "test-artifact" else None,
+                artifact_scope_message=(
+                    TEST_ARTIFACT_PENDING_SCOPE_MESSAGE if operation == "test-artifact" else None
+                ),
                 test_evidence_scope=(
                     parallel_test_evidence_scope(args.get("filter"))
                     if operation == "test-parallel"
@@ -3966,6 +4174,7 @@ class DaemonState:
         global_xctest_slot: Optional[Any] = None
         telemetry: Optional[Any] = None
         provenance_scope = contextlib.ExitStack()
+        artifact_observations: Optional[ArtifactObservations] = None
         owner_pinned = False
         try:
             with self.lock:
@@ -4014,10 +4223,9 @@ class DaemonState:
                 with artifact_operation_sink(self._telemetry_sink(telemetry, "daemon.run_prepare")):
                     argv, _lanes, cwd, env, effective_timeout = self.registry.prepare(request)
             self._telemetry_boundary(telemetry, "prepare_end")
-            with self.condition:
-                job.artifact_scope = job.args.get("artifactScope")
-                job.artifact_scope_differences = list(job.args.get("artifactScopeDifferences") or [])
-                job.artifact_scope_message = job.args.get("artifactScopeMessage")
+            # The evaluation sees the prepared environment, before job-ticket and
+            # timing keys are added for the child.
+            artifact_env = dict(env)
             if job_ticket_env_eligible(argv):
                 env["REPOPROMPT_CONDUCTOR_JOB_TICKET"] = job.ticket
             else:
@@ -4034,6 +4242,33 @@ class DaemonState:
                 global_xctest_slot = self._acquire_global_xctest_slot(job.ticket)
                 if global_xctest_slot is None:
                     return
+            if job.operation == "test-artifact":
+                # Step 7: the one authoritative evaluation (toolchain, source scope,
+                # full fingerprint), after lane and XCTest-slot admission and outside
+                # the condition. Its identities feed the immediate pre-launch fence.
+                artifact_observations = ArtifactObservations()
+                with artifact_operation_sink(self._telemetry_sink(telemetry, "daemon.run_evaluate")):
+                    evaluation = evaluate_test_artifact(
+                        self.paths.repo_root,
+                        self.paths.jobs_dir,
+                        artifact_env,
+                        observations=artifact_observations,
+                    )
+                with self.condition:
+                    job.args.update(evaluation)
+                    job.artifact_scope = evaluation["artifactScope"]
+                    job.artifact_scope_differences = list(evaluation["artifactScopeDifferences"])
+                    job.artifact_scope_message = evaluation["artifactScopeMessage"]
+                    canceled_after_validation = bool(job.cancel_requested)
+                    if canceled_after_validation:
+                        job.state = "canceled"
+                        job.exit_code = 130
+                        job.result_summary = "canceled before process start"
+                        job.finished_at = now()
+                        self._append_system_line_locked(job, "job canceled before process start\n")
+                        self.condition.notify_all()
+                if canceled_after_validation:
+                    return
             start_line = f"$ {format_argv(argv)}\n"
             with job.log_path.open("ab") as log_file:
                 with self.lock:
@@ -4046,16 +4281,19 @@ class DaemonState:
                 output_transport = self._create_process_output_transport(job)
                 job.progress_transport = output_transport.kind
                 if job.operation == "test-artifact":
-                    artifact_path_value = job.args.get("artifactPath")
-                    artifact_fingerprint = job.args.get("artifactFingerprint")
-                    if not isinstance(artifact_path_value, str) or artifact_fingerprint is None:
+                    if artifact_observations is None or not isinstance(job.args.get("artifactPath"), str):
                         raise ArtifactUnavailableError(
-                            "test artifact fingerprint is unavailable; run `make dev-test` first"
+                            "test artifact was not validated before launch; run `make dev-test` first"
                         )
-                    verify_test_artifact_fingerprint(
-                        Path(artifact_path_value),
-                        artifact_fingerprint,
-                        sink=self._telemetry_sink(telemetry, "daemon.pre_popen_verify"),
+                    # Step 7: metadata-only fence of the identities captured while
+                    # hashing; no second pre-launch hash (OD5: two full hashes per run).
+                    fence_start = time.monotonic_ns()
+                    artifact_observations.verify("after validation, before launch")
+                    _emit_operation(
+                        self._telemetry_sink(telemetry, "daemon.pre_popen_fence"),
+                        "artifact_metadata_fence",
+                        time.monotonic_ns() - fence_start,
+                        {"pathsChecked": len(artifact_observations)},
                     )
                 self._telemetry_boundary(telemetry, "popen_before")
                 process = subprocess.Popen(
@@ -4276,6 +4514,7 @@ class DaemonState:
                         )
 
                 artifact_post_differences: List[str] = []
+                artifact_integrity_failure: Optional[str] = None
                 if job.operation == "test-artifact":
                     post_snapshot = source_snapshot(self.paths.repo_root, env)
                     recorded_snapshot = job.args.get("artifactTicketSourceSnapshot")
@@ -4285,19 +4524,29 @@ class DaemonState:
                     ]
                     artifact_path_value = job.args.get("artifactPath")
                     artifact_fingerprint = job.args.get("artifactFingerprint")
-                    artifact_mutated = False
                     if isinstance(artifact_path_value, str) and artifact_fingerprint is not None:
                         try:
-                            post_fingerprint = test_artifact_fingerprint(Path(artifact_path_value))
-                            artifact_mutated = bool(
-                                artifact_fingerprint_differences(
-                                    artifact_fingerprint, post_fingerprint
-                                )
+                            # One full, stability-checked fingerprint; its observations
+                            # only fence this pass.
+                            post_fingerprint = test_artifact_fingerprint(
+                                Path(artifact_path_value), observations=ArtifactObservations()
                             )
-                        except ArtifactUnavailableError:
-                            artifact_mutated = True
-                    if artifact_mutated:
-                        artifact_post_differences.append("artifact mutated during run")
+                            changed = artifact_fingerprint_differences(
+                                artifact_fingerprint, post_fingerprint
+                            )
+                            if changed:
+                                artifact_integrity_failure = (
+                                    "test artifact changed during the run; changed: " + ", ".join(changed)
+                                )
+                                artifact_post_differences.append("artifact mutated during run")
+                        except ArtifactUnavailableError as exc:
+                            artifact_integrity_failure = f"post-run artifact integrity unavailable: {exc}"
+                            artifact_post_differences.append("post-run artifact integrity unavailable")
+                    else:
+                        artifact_integrity_failure = (
+                            "post-run artifact integrity unavailable: no validated artifact fingerprint"
+                        )
+                        artifact_post_differences.append("post-run artifact integrity unavailable")
                 provenance_scope.close()
                 self._telemetry_boundary(telemetry, "provenance_end")
                 with self.condition:
@@ -4321,6 +4570,22 @@ class DaemonState:
                     if parallel_integrity_error:
                         job.error = parallel_integrity_error
                         job.result_summary = parallel_integrity_error
+                    if artifact_integrity_failure:
+                        # Step 7: a post-run byte change invalidates an otherwise
+                        # successful result (65, the artifact-unavailable status).
+                        # An earlier failure, timeout or cancellation stays primary;
+                        # the integrity line and stale scope are attached.
+                        self._append_system_line_locked(
+                            job, f"artifact integrity failure: {artifact_integrity_failure}\n"
+                        )
+                        if job.state == "completed":
+                            job.state = "failed"
+                            job.exit_code = 65
+                            job.error = artifact_integrity_failure
+                            job.result_summary = (
+                                "test artifact integrity failed after execution; "
+                                "run `make dev-test` first"
+                            )
                     if (
                         job.operation == "test-artifact"
                         and job.process_started_at is not None
@@ -8355,16 +8620,12 @@ def handle_real_operation(paths: Paths, operation: str, argv: List[str]) -> int:
         if ns.xctest_stall_wake_probe:
             args["xctestStallWakeProbe"] = True
         preflight_test_filter(paths.repo_root, operation, ns.filter)
-        client_env = OperationRegistry.client_env_snapshot()
-        effective_env = OperationRegistry(paths.repo_root, paths.jobs_dir).request_environment(
-            False,
-            {"env": client_env},
-        )
         client_sink = None
         if PIPELINE_METRICS is not None and PIPELINE_METRICS.timing_enabled(os.environ):
             client_metrics = []
             client_sink = client_metrics_sink(client_metrics)
-        args.update(evaluate_test_artifact(paths.repo_root, paths.jobs_dir, effective_env, sink=client_sink))
+        # Step 7: cheap admission only; the daemon evaluates once at execution.
+        admit_test_artifact(paths.repo_root, paths.jobs_dir, sink=client_sink)
     elif operation in {"test", "provider-test", "core-test"}:
         parser = argparse.ArgumentParser(prog=f"conductor {operation}")
         mode = parser.add_mutually_exclusive_group()

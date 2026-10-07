@@ -46,7 +46,7 @@ import types
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
-HARNESS_VERSION = 8
+HARNESS_VERSION = 9
 CAPTURE_SCHEMA_VERSION = 3
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parent
@@ -90,7 +90,7 @@ ADAPTER_VERSIONS = {
     "summary": "summarize_file+frozen_retained_corpus@2",
     "mem": "record_progress_ledger+step4_pin_release_seam+section_seen@2",
     "cli": "launcher_subprocess@1",
-    "artifact": "client_evaluate+enqueue+run_job@1",
+    "artifact": "client_validation_by_target_capability+enqueue+run_job@2",
     "rss": "enqueue_run_job_retained_footprint+ledger_budget_source_check@2",
 }
 
@@ -1091,14 +1091,29 @@ TRACKED_ARTIFACT_FUNCTIONS = (
     "source_snapshot",
     "artifact_toolchain_snapshot",
 )
+# Present only in targets that have it (Step 7+ cheap client/enqueue admission).
+OPTIONAL_TRACKED_ARTIFACT_FUNCTIONS = ("admit_test_artifact",)
 
 
 def install_artifact_tracker(mod: Any) -> _CallTracker:
     tracker = _CallTracker()
     for name in TRACKED_ARTIFACT_FUNCTIONS:
         setattr(mod, name, tracker.wrap(name, getattr(mod, name)))
+    for name in OPTIONAL_TRACKED_ARTIFACT_FUNCTIONS:
+        if callable(getattr(mod, name, None)):
+            setattr(mod, name, tracker.wrap(name, getattr(mod, name)))
     mod.hashlib = _HashCounter(mod.hashlib, tracker)
     return tracker
+
+
+def artifact_client_validation(mod: Any) -> str:
+    """How the target's own ``test-artifact`` client validates before enqueue.
+
+    Decided by the target's capability, never by the harness: a target with
+    ``admit_test_artifact`` (Step 7+) admits cheaply; an earlier target runs its
+    full ``evaluate_test_artifact`` and sends the derived args, as its client did.
+    """
+    return "cheap_admission" if callable(getattr(mod, "admit_test_artifact", None)) else "full_evaluation"
 
 
 def mint_root_ticket(mod: Any, repo_root: Path, jobs_dir: Path, env: Dict[str, str]) -> None:
@@ -1122,10 +1137,14 @@ def adapter_artifact(mod: Any, spec: Dict[str, Any]) -> Dict[str, Any]:
         )
         mint_root_ticket(mod, repo_root, paths.jobs_dir, effective_env)
         state = mod.DaemonState(paths)
+        client_validation = artifact_client_validation(mod)
         tracker = install_artifact_tracker(mod)
         start = time.perf_counter()
         args: Dict[str, Any] = {"filter": spec["artifactFilter"]}
-        args.update(mod.evaluate_test_artifact(paths.repo_root, paths.jobs_dir, effective_env))
+        if client_validation == "cheap_admission":
+            mod.admit_test_artifact(paths.repo_root, paths.jobs_dir)
+        else:
+            args.update(mod.evaluate_test_artifact(paths.repo_root, paths.jobs_dir, effective_env))
         request = {
             "type": "enqueue",
             "operation": "test-artifact",
@@ -1155,7 +1174,12 @@ def adapter_artifact(mod: Any, spec: Dict[str, Any]) -> Dict[str, Any]:
         "artifact.source_snapshot_calls": float(tracker.calls.get("source_snapshot", 0)),
         "artifact.bytes_hashed": float(fingerprint_bytes),
     }
-    info = {"calls": tracker.calls, "bytesByOrigin": tracker.bytes, "fixtureBytes": spec["artifactFixtureBytes"]}
+    info = {
+        "calls": tracker.calls,
+        "bytesByOrigin": tracker.bytes,
+        "fixtureBytes": spec["artifactFixtureBytes"],
+        "clientValidation": client_validation,
+    }
     return {"metrics": metrics, "equivalence": {}, "info": info}
 
 

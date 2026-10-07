@@ -1304,6 +1304,101 @@ class ConductorTestContractTests(LifecycleTestCase):
         resource.write_text("resource version one\n", encoding="utf-8")
         return resource
 
+    # Step 7 helpers: the daemon evaluates the artifact itself, after slot admission.
+    ARTIFACT_TOOLCHAIN = {"swift_version": "Swift test", "arch": "testarch", "config": "debug"}
+    PASSING_ARTIFACT_RUN = (
+        "print(\"Test Case '-[RepoPromptTests.AlphaTests testOne]' started.\", flush=True); "
+        "print(\"Test Case '-[RepoPromptTests.AlphaTests testOne]' passed (0.001 seconds).\", flush=True)"
+    )
+
+    def artifact_host(self) -> contextlib.ExitStack:
+        stack = contextlib.ExitStack()
+        stack.enter_context(
+            mock.patch.object(conductor, "artifact_toolchain_snapshot", return_value=dict(self.ARTIFACT_TOOLCHAIN))
+        )
+        stack.enter_context(mock.patch.object(conductor, "host_artifact_arch", return_value="testarch"))
+        return stack
+
+    def mint_artifact_ticket(self, state: conductor.DaemonState) -> dict:
+        ticket_job = self.make_job(state, f"built-{uuid.uuid4().hex[:8]}", "test", {}, ["build"])
+        with self.artifact_host():
+            ticket = conductor.build_ticket_payload(state.paths.repo_root, ticket_job, os.environ.copy())
+        self.assertIsNotNone(ticket)
+        conductor.write_build_ticket(state.paths.jobs_dir / "build-ticket-root.json", ticket or {})
+        return ticket or {}
+
+    def artifact_fixture(self, resource: bool = True) -> tuple[conductor.DaemonState, Path, Path | None]:
+        tmp, state = self.make_state()
+        self.addCleanup(tmp.cleanup)
+        self.initialize_git_repo(state.paths.repo_root)
+        executable = self.create_test_artifact(state.paths.repo_root)
+        resource_path = self.create_test_resource_bundle(state.paths.repo_root) if resource else None
+        if resource_path is not None:
+            nested = resource_path.parent / "nested" / "inner.txt"
+            nested.parent.mkdir()
+            nested.write_text("inner\n", encoding="utf-8")
+        self.mint_artifact_ticket(state)
+        return state, executable, resource_path
+
+    def run_artifact_job(
+        self,
+        state: conductor.DaemonState,
+        command: list[str],
+        *,
+        args: dict | None = None,
+        timeout: float = 30.0,
+        extra: contextlib.ExitStack | None = None,
+    ) -> conductor.Job:
+        job = self.make_job(
+            state,
+            f"artifact-{uuid.uuid4().hex[:8]}",
+            "test-artifact",
+            dict(args or {"filter": "AlphaTests"}),
+            ["build"],
+            job_state="running",
+        )
+        state.jobs[job.ticket] = job
+        with self.artifact_host(), (extra or contextlib.ExitStack()):
+            with (
+                mock.patch.object(
+                    state.registry,
+                    "prepare",
+                    return_value=(command, ["build"], state.paths.repo_root, os.environ.copy(), timeout),
+                ),
+                mock.patch.object(state, "_xctest_watchdog_enabled", return_value=False),
+                mock.patch.object(conductor, "machine_lock_dir", return_value=state.paths.repo_root / "machine-locks"),
+            ):
+                state._run_job(job.ticket)
+        return job
+
+    @staticmethod
+    def mutate_same_size_preserving_mtime(path: Path) -> None:
+        original = path.read_bytes()
+        original_stat = path.stat()
+        mutated = bytearray(original)
+        mutated[0] = (mutated[0] + 1) % 256
+        path.write_bytes(bytes(mutated))
+        os.utime(path, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
+
+    @staticmethod
+    def job_launch_probe(launch: object = None) -> mock.Mock:
+        """A Popen stand-in recording only job launches (``start_new_session``);
+        snapshot helpers such as git run for real. Without ``launch`` a job launch fails."""
+        real_popen = conductor.subprocess.Popen
+        launches: list[list[str]] = []
+
+        def popen(argv: object, *args: object, **kwargs: object) -> object:
+            if not kwargs.get("start_new_session"):
+                return real_popen(argv, *args, **kwargs)
+            launches.append(list(argv))  # type: ignore[call-overload]
+            if launch is None:
+                raise RuntimeError("job process must not be created")
+            return launch(argv, *args, **kwargs)  # type: ignore[operator]
+
+        probe = mock.Mock(side_effect=popen)
+        probe.launches = launches
+        return probe
+
     def test_parallel_runner_uses_absolute_xcrun_and_explicit_environment(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -1847,6 +1942,110 @@ raise SystemExit(
             with self.assertRaisesRegex(conductor.ArtifactUnavailableError, "artifact closure"):
                 conductor.evaluate_test_artifact(state.paths.repo_root, state.paths.jobs_dir, env)
 
+    def hooked_fingerprint(self, artifact_path: Path, hook: object, observations: object) -> dict:
+        """Fingerprint with ``hook(n)`` run on the n-th digest update (after that chunk was read)."""
+        real_hashlib = conductor.hashlib
+        updates = [0]
+
+        class Digest:
+            def __init__(self, data: bytes = b"") -> None:
+                self.real = real_hashlib.sha256(data)
+
+            def update(self, chunk: bytes) -> None:
+                updates[0] += 1
+                hook(updates[0])  # type: ignore[operator]
+                self.real.update(chunk)
+
+            def hexdigest(self) -> str:
+                return self.real.hexdigest()
+
+        fake = mock.Mock(wraps=real_hashlib)
+        fake.sha256 = Digest
+        with mock.patch.object(conductor, "hashlib", fake):
+            return conductor.test_artifact_fingerprint(artifact_path, observations=observations)
+
+    def test_fingerprint_observations_reject_mutation_during_hashing(self) -> None:
+        # Digest update 1 is the executable, 2 the bundle's fixture.txt, 3 nested/inner.txt.
+        def during_read(executable: Path, resource: Path) -> None:
+            self.mutate_same_size_preserving_mtime(resource)
+
+        def hashed_executable_changed_later(executable: Path, resource: Path) -> None:
+            self.mutate_same_size_preserving_mtime(executable)
+
+        def path_replaced_with_open_descriptor(executable: Path, resource: Path) -> None:
+            replacement = resource.with_name("replacement")
+            shutil.copy2(resource, replacement)
+            os.replace(replacement, resource)
+
+        def sibling_bundle_added(executable: Path, resource: Path) -> None:
+            (resource.parent.parent / "Late_Resources.bundle").mkdir()
+
+        def member_added_after_enumeration(executable: Path, resource: Path) -> None:
+            (resource.parent / "late.txt").write_text("late\n", encoding="utf-8")
+
+        def nested_member_added_after_enumeration(executable: Path, resource: Path) -> None:
+            (resource.parent / "nested" / "late.txt").write_text("late\n", encoding="utf-8")
+
+        cases = (
+            (during_read, 2, "fixture.txt"),
+            (hashed_executable_changed_later, 2, "RepoPromptCEPackageTests"),
+            (path_replaced_with_open_descriptor, 2, "fixture.txt"),
+            (sibling_bundle_added, 2, "debug"),
+            (member_added_after_enumeration, 3, "RepoPromptCE_RepoPromptTests.bundle"),
+            (nested_member_added_after_enumeration, 3, "nested"),
+        )
+        for mutate, at_update, named in cases:
+            with self.subTest(mutation=mutate.__name__):
+                tmp, state = self.make_state()
+                self.addCleanup(tmp.cleanup)
+                executable = self.create_test_artifact(state.paths.repo_root)
+                resource = self.create_test_resource_bundle(state.paths.repo_root)
+                nested = resource.parent / "nested" / "inner.txt"
+                nested.parent.mkdir()
+                nested.write_text("inner\n", encoding="utf-8")
+                artifact_path = executable.parents[2]
+                baseline = conductor.test_artifact_fingerprint(artifact_path)
+
+                def hook(update: int, m=mutate, n=at_update, e=executable, r=resource) -> None:
+                    if update == n:
+                        m(e, r)
+
+                with self.assertRaisesRegex(conductor.ArtifactUnavailableError, "while it was being fingerprinted") as raised:
+                    self.hooked_fingerprint(artifact_path, hook, conductor.ArtifactObservations())
+                self.assertIn(named, str(raised.exception))
+                if mutate is path_replaced_with_open_descriptor:
+                    # Same bytes and mtime: only the identity fence can see the swap.
+                    self.assertEqual(conductor.test_artifact_fingerprint(artifact_path), baseline)
+
+    def test_fingerprint_observations_keep_payload_and_symlink_exclusions(self) -> None:
+        tmp, state = self.make_state()
+        self.addCleanup(tmp.cleanup)
+        executable = self.create_test_artifact(state.paths.repo_root)
+        resource = self.create_test_resource_bundle(state.paths.repo_root)
+        nested = resource.parent / "nested" / "inner.txt"
+        nested.parent.mkdir()
+        nested.write_text("inner\n", encoding="utf-8")
+        (resource.parent / "link.txt").symlink_to(resource)
+        (resource.parent / "linkdir").symlink_to(nested.parent, target_is_directory=True)
+        dsym = executable.with_name(executable.name + ".dSYM") / "Contents" / "Info.plist"
+        dsym.parent.mkdir(parents=True)
+        dsym.write_text("<plist/>\n", encoding="utf-8")
+        artifact_path = executable.parents[2]
+        observations = conductor.ArtifactObservations()
+
+        plain = conductor.test_artifact_fingerprint(artifact_path)
+        observed = conductor.test_artifact_fingerprint(artifact_path, observations=observations)
+
+        self.assertEqual(observed, plain)
+        self.assertEqual(
+            set(plain),
+            {"executable_path", "size", "mtime_ns", "sha256", "closure_manifest_sha256", "closure_file_count"},
+        )
+        # fixture.txt, nested/inner.txt and the (still hashed, Step 8 territory) dSYM plist.
+        self.assertEqual(plain["closure_file_count"], 3)
+        self.assertGreater(len(observations), 3)
+        observations.verify("in test")
+
     def test_test_artifact_scope_is_current_then_stale_after_source_mutation(self) -> None:
         tmp, state = self.make_state()
         self.addCleanup(tmp.cleanup)
@@ -1890,91 +2089,153 @@ raise SystemExit(
                 conductor.evaluate_test_artifact(state.paths.repo_root, state.paths.jobs_dir, env)
 
     def test_daemon_reverifies_artifact_after_xctest_slot_before_popen(self) -> None:
-        tmp, state = self.make_state()
-        self.addCleanup(tmp.cleanup)
-        self.initialize_git_repo(state.paths.repo_root)
-        self.create_test_artifact(state.paths.repo_root)
-        resource = self.create_test_resource_bundle(state.paths.repo_root)
-        toolchain = {"swift_version": "Swift test", "arch": "testarch", "config": "debug"}
-        env = os.environ.copy()
-        ticket_job = self.make_job(state, "built", "test", {}, ["build"])
-        with mock.patch.object(conductor, "artifact_toolchain_snapshot", return_value=toolchain):
-            ticket = conductor.build_ticket_payload(state.paths.repo_root, ticket_job, env)
-            conductor.write_build_ticket(state.paths.jobs_dir / "build-ticket-root.json", ticket or {})
-            args = {"filter": "AlphaTests"}
-            args.update(conductor.evaluate_test_artifact(state.paths.repo_root, state.paths.jobs_dir, env))
-        job = self.make_job(state, "slot-race", "test-artifact", args, ["build"], job_state="running")
-        state.jobs[job.ticket] = job
+        # Step 7: the one authoritative evaluation runs after the slot, so a change
+        # made while waiting for it is caught by the full hash before launch.
+        state, _executable, resource = self.artifact_fixture()
+        assert resource is not None
         slot_file = (state.paths.repo_root / "xctest-slot.lock").open("a+")
         self.addCleanup(slot_file.close)
 
         def acquire_after_mutation(_ticket: str) -> object:
-            resource.write_text("mutated while waiting for slot\n", encoding="utf-8")
+            self.mutate_same_size_preserving_mtime(resource)
             return slot_file
 
-        with (
-            mock.patch.object(
-                state.registry,
-                "prepare",
-                return_value=(["swift", "test"], ["build"], state.paths.repo_root, env, 5.0),
-            ),
-            mock.patch.object(state, "_acquire_global_xctest_slot", side_effect=acquire_after_mutation),
-            mock.patch.object(state, "_xctest_watchdog_enabled", return_value=False),
-            mock.patch.object(conductor.subprocess, "Popen") as popen,
-        ):
-            state._run_job(job.ticket)
+        extra = contextlib.ExitStack()
+        extra.enter_context(
+            mock.patch.object(state, "_acquire_global_xctest_slot", side_effect=acquire_after_mutation)
+        )
+        popen = self.job_launch_probe()
+        extra.enter_context(mock.patch.object(conductor.subprocess, "Popen", popen))
+        job = self.run_artifact_job(state, ["swift", "test"], extra=extra)
 
-        popen.assert_not_called()
+        self.assertEqual(popen.launches, [])
         self.assertEqual(job.state, "failed")
         self.assertEqual(job.exit_code, 65)
         self.assertIn("artifact closure", job.error or "")
 
-    def test_test_artifact_claims_xctest_slot_not_heavy_and_records_run_duration(self) -> None:
-        tmp, state = self.make_state()
-        self.addCleanup(tmp.cleanup)
-        snapshot = {"head": "head", "porcelain_sha256": "clean", "dirty_file_sha256": {}}
-        executable = self.create_test_artifact(state.paths.repo_root)
-        artifact_path = executable.parents[2]
-        artifact_fingerprint = conductor.test_artifact_fingerprint(artifact_path)
-        job = self.make_job(
-            state,
-            "artifact-slot",
-            "test-artifact",
-            {
-                "filter": "AlphaTests",
-                "artifactScope": "current",
-                "artifactScopeDifferences": [],
-                "artifactScopeMessage": "artifact_scope: current",
-                "artifactTicketSourceSnapshot": snapshot,
-                "artifactPath": str(artifact_path),
-                "artifactFingerprint": artifact_fingerprint,
-            },
-            ["build"],
-            job_state="running",
-        )
-        state.jobs[job.ticket] = job
-        command = [
-            sys.executable,
-            "-u",
-            "-c",
-            (
-                "print(\"Test Case '-[RepoPromptTests.AlphaTests testOne]' started.\", flush=True); "
-                "print(\"Test Case '-[RepoPromptTests.AlphaTests testOne]' passed (0.001 seconds).\", flush=True)"
-            ),
-        ]
-        lock_root = state.paths.repo_root / "machine-locks"
+    def test_prelaunch_metadata_fence_rejects_changes_after_evaluation_without_popen(self) -> None:
+        def same_size_restored_mtime(executable: Path, resource: Path) -> None:
+            self.mutate_same_size_preserving_mtime(resource)
 
-        with (
-            mock.patch.object(
-                state.registry,
-                "prepare",
-                return_value=(command, ["build"], state.paths.repo_root, os.environ.copy(), 5.0),
-            ),
-            mock.patch.object(state, "_xctest_watchdog_enabled", return_value=False),
-            mock.patch.object(conductor, "machine_lock_dir", return_value=lock_root),
-            mock.patch.object(conductor, "source_snapshot", return_value=snapshot),
+        def replace_executable_path(executable: Path, resource: Path) -> None:
+            replacement = executable.with_name("replacement")
+            shutil.copy2(executable, replacement)
+            os.replace(replacement, executable)
+
+        def add_bundle_member(executable: Path, resource: Path) -> None:
+            (resource.parent / "late.txt").write_text("late\n", encoding="utf-8")
+
+        def remove_bundle_member(executable: Path, resource: Path) -> None:
+            resource.unlink()
+
+        def add_sibling_bundle(executable: Path, resource: Path) -> None:
+            sibling = resource.parent.parent / "Late_Resources.bundle"
+            sibling.mkdir()
+            (sibling / "late.txt").write_text("late\n", encoding="utf-8")
+
+        def add_nested_member(executable: Path, resource: Path) -> None:
+            (resource.parent / "nested" / "late.txt").write_text("late\n", encoding="utf-8")
+
+        for mutate in (
+            same_size_restored_mtime,
+            replace_executable_path,
+            add_bundle_member,
+            remove_bundle_member,
+            add_sibling_bundle,
+            add_nested_member,
         ):
+            with self.subTest(mutation=mutate.__name__):
+                state, executable, resource = self.artifact_fixture()
+                assert resource is not None
+                fingerprints: list[object] = []
+                real_fingerprint = conductor.test_artifact_fingerprint
+
+                def counted(*args: object, **kwargs: object) -> object:
+                    fingerprints.append(args[0])
+                    return real_fingerprint(*args, **kwargs)
+
+                extra = contextlib.ExitStack()
+                # The pin runs after the start line and evaluation, immediately before Popen.
+                extra.enter_context(
+                    mock.patch.object(
+                        state,
+                        "_pin_xctest_method_runtimes",
+                        side_effect=lambda _job, e=executable, r=resource, m=mutate: m(e, r),
+                    )
+                )
+                extra.enter_context(mock.patch.object(conductor, "test_artifact_fingerprint", side_effect=counted))
+                popen = self.job_launch_probe()
+                extra.enter_context(mock.patch.object(conductor.subprocess, "Popen", popen))
+                job = self.run_artifact_job(state, ["swift", "test"], extra=extra)
+
+                self.assertEqual(popen.launches, [])
+                self.assertEqual(job.state, "failed")
+                self.assertEqual(job.exit_code, 65)
+                self.assertIn("after validation, before launch", job.error or "")
+                # Metadata only: the evaluation's hash is the only pre-launch fingerprint.
+                self.assertEqual(len(fingerprints), 1)
+
+    def test_cancel_during_evaluation_finishes_canceled_without_popen(self) -> None:
+        state, _executable, _resource = self.artifact_fixture()
+        real_evaluate = conductor.evaluate_test_artifact
+
+        def evaluate_then_cancel(*args: object, **kwargs: object) -> dict:
+            result = real_evaluate(*args, **kwargs)
+            with state.condition:
+                for candidate in state.jobs.values():
+                    candidate.cancel_requested = True
+            return result
+
+        extra = contextlib.ExitStack()
+        extra.enter_context(mock.patch.object(conductor, "evaluate_test_artifact", side_effect=evaluate_then_cancel))
+        popen = self.job_launch_probe()
+        extra.enter_context(mock.patch.object(conductor.subprocess, "Popen", popen))
+        job = self.run_artifact_job(state, ["swift", "test"], extra=extra)
+
+        self.assertEqual(popen.launches, [])
+        self.assertEqual(job.state, "canceled")
+        self.assertEqual(job.exit_code, 130)
+        self.assertEqual(job.result_summary, "canceled before process start")
+
+    def test_cancel_before_xctest_slot_runs_no_full_validation(self) -> None:
+        state, _executable, _resource = self.artifact_fixture()
+        job = self.make_job(state, "cancel-slot", "test-artifact", {"filter": "AlphaTests"}, ["build"], job_state="running")
+        state.jobs[job.ticket] = job
+        real_prepare = state.registry.prepare
+
+        def prepare_then_cancel(request: dict) -> object:
+            result = real_prepare(request)
+            with state.condition:
+                job.cancel_requested = True
+            return result
+
+        forbidden = AssertionError("no full validation before the XCTest slot")
+        with (
+            self.artifact_host(),
+            mock.patch.object(state.registry, "prepare", side_effect=prepare_then_cancel),
+            mock.patch.object(conductor, "evaluate_test_artifact", side_effect=forbidden) as evaluate,
+            mock.patch.object(conductor, "test_artifact_fingerprint", side_effect=forbidden) as fingerprint,
+            mock.patch.object(conductor, "source_snapshot", side_effect=forbidden) as snapshot,
+            mock.patch.object(conductor.subprocess, "Popen") as popen,
+            mock.patch.object(conductor, "machine_lock_dir", return_value=state.paths.repo_root / "machine-locks"),
+        ):
+            conductor.artifact_toolchain_snapshot.side_effect = forbidden
             state._run_job(job.ticket)
+            toolchain_calls = conductor.artifact_toolchain_snapshot.call_count
+
+        self.assertEqual(job.state, "canceled")
+        self.assertEqual(job.exit_code, 130)
+        self.assertEqual(job.result_summary, "canceled before global xctest slot")
+        for probe in (evaluate, fingerprint, snapshot, popen):
+            probe.assert_not_called()
+        self.assertEqual(toolchain_calls, 0)
+
+    def test_test_artifact_claims_xctest_slot_not_heavy_and_records_run_duration(self) -> None:
+        state, _executable, _resource = self.artifact_fixture(resource=False)
+        lock_root = state.paths.repo_root / "machine-locks"
+        command = [sys.executable, "-u", "-c", self.PASSING_ARTIFACT_RUN]
+
+        job = self.run_artifact_job(state, command)
 
         payload = job.to_payload()
         self.assertEqual(job.state, "completed", job.result_summary)
@@ -1989,109 +2250,128 @@ raise SystemExit(
         self.assertEqual(summarized["outputSummary"]["sections"][0]["title"], "Artifact scope")
 
     def test_test_artifact_post_run_source_change_marks_final_scope_stale(self) -> None:
-        tmp, state = self.make_state()
-        self.addCleanup(tmp.cleanup)
-        source = self.initialize_git_repo(state.paths.repo_root)
-        self.create_test_artifact(state.paths.repo_root)
-        toolchain = {"swift_version": "Swift test", "arch": "testarch", "config": "debug"}
-        env = os.environ.copy()
-        ticket_job = self.make_job(state, "built", "test", {}, ["build"])
-        with mock.patch.object(conductor, "artifact_toolchain_snapshot", return_value=toolchain):
-            ticket = conductor.build_ticket_payload(state.paths.repo_root, ticket_job, env)
-            conductor.write_build_ticket(state.paths.jobs_dir / "build-ticket-root.json", ticket or {})
-            args = {"filter": "AlphaTests"}
-            args.update(conductor.evaluate_test_artifact(state.paths.repo_root, state.paths.jobs_dir, env))
-        job = self.make_job(state, "post-source-race", "test-artifact", args, ["build"], job_state="running")
-        state.jobs[job.ticket] = job
+        # Source-only drift stays a successful, stale-scoped pass (never 65 or 67).
+        state, _executable, _resource = self.artifact_fixture(resource=False)
+        source = state.paths.repo_root / "Tracked.swift"
         command = [
             sys.executable,
             "-u",
             "-c",
-            (
-                "from pathlib import Path; import sys; Path(sys.argv[1]).write_text('let value = 2\\n'); "
-                "print(\"Test Case '-[RepoPromptTests.AlphaTests testOne]' started.\"); "
-                "print(\"Test Case '-[RepoPromptTests.AlphaTests testOne]' passed (0.001 seconds).\")"
-            ),
+            "from pathlib import Path; import sys; Path(sys.argv[1]).write_text('let value = 2\\n'); "
+            + self.PASSING_ARTIFACT_RUN,
             str(source),
         ]
-        lock_root = state.paths.repo_root / "machine-locks"
 
-        with (
-            mock.patch.object(
-                state.registry,
-                "prepare",
-                return_value=(command, ["build"], state.paths.repo_root, env, 5.0),
-            ),
-            mock.patch.object(state, "_xctest_watchdog_enabled", return_value=False),
-            mock.patch.object(conductor, "machine_lock_dir", return_value=lock_root),
-        ):
-            state._run_job(job.ticket)
-
-        self.assertEqual(job.state, "completed", job.result_summary)
-        self.assertEqual(job.artifact_scope, "stale")
-        self.assertIn("post-run dirty digest", job.artifact_scope_differences)
-        self.assertNotIn("passed", job.artifact_scope_message or "")
-
-    def test_test_artifact_mutated_during_run_marks_scope_stale_without_failing(self) -> None:
-        tmp, state = self.make_state()
-        self.addCleanup(tmp.cleanup)
-        self.initialize_git_repo(state.paths.repo_root)
-        self.create_test_artifact(state.paths.repo_root)
-        resource = self.create_test_resource_bundle(state.paths.repo_root)
-        toolchain = {"swift_version": "Swift test", "arch": "testarch", "config": "debug"}
-        env = os.environ.copy()
-        ticket_job = self.make_job(state, "built", "test", {}, ["build"])
-        with mock.patch.object(conductor, "artifact_toolchain_snapshot", return_value=toolchain):
-            ticket = conductor.build_ticket_payload(state.paths.repo_root, ticket_job, env)
-            conductor.write_build_ticket(state.paths.jobs_dir / "build-ticket-root.json", ticket or {})
-            args = {"filter": "AlphaTests"}
-            args.update(conductor.evaluate_test_artifact(state.paths.repo_root, state.paths.jobs_dir, env))
-        job = self.make_job(state, "artifact-race", "test-artifact", args, ["build"], job_state="running")
-        state.jobs[job.ticket] = job
-        command = [
-            sys.executable,
-            "-u",
-            "-c",
-            (
-                "from pathlib import Path; import sys; Path(sys.argv[1]).write_text('mutated during run\\n'); "
-                "print(\"Test Case '-[RepoPromptTests.AlphaTests testOne]' started.\"); "
-                "print(\"Test Case '-[RepoPromptTests.AlphaTests testOne]' passed (0.001 seconds).\")"
-            ),
-            str(resource),
-        ]
-        lock_root = state.paths.repo_root / "machine-locks"
-
-        with (
-            mock.patch.object(
-                state.registry,
-                "prepare",
-                return_value=(command, ["build"], state.paths.repo_root, env, 5.0),
-            ),
-            mock.patch.object(state, "_xctest_watchdog_enabled", return_value=False),
-            mock.patch.object(conductor, "machine_lock_dir", return_value=lock_root),
-        ):
-            state._run_job(job.ticket)
+        job = self.run_artifact_job(state, command)
 
         self.assertEqual(job.state, "completed", job.result_summary)
         self.assertEqual(job.exit_code, 0)
         self.assertEqual(job.artifact_scope, "stale")
-        self.assertIn("artifact mutated during run", job.artifact_scope_differences)
-        self.assertIn("current source was NOT validated", job.artifact_scope_message or "")
+        self.assertIn("post-run dirty digest", job.artifact_scope_differences)
+        self.assertNotIn("artifact mutated during run", job.artifact_scope_differences)
+        self.assertNotIn("passed", job.artifact_scope_message or "")
 
-    def test_enqueued_artifact_job_real_prepare_copies_stale_scope_to_result(self) -> None:
-        tmp, state = self.make_state()
-        self.addCleanup(tmp.cleanup)
-        source = self.initialize_git_repo(state.paths.repo_root)
-        self.create_test_artifact(state.paths.repo_root)
-        toolchain = {"swift_version": "Swift test", "arch": "testarch", "config": "debug"}
-        env = os.environ.copy()
-        ticket_job = self.make_job(state, "built", "test", {}, ["build"])
-        with mock.patch.object(conductor, "artifact_toolchain_snapshot", return_value=toolchain):
-            ticket = conductor.build_ticket_payload(state.paths.repo_root, ticket_job, env)
-            conductor.write_build_ticket(state.paths.jobs_dir / "build-ticket-root.json", ticket or {})
+    def test_test_artifact_mutated_during_run_fails_65_with_stale_scope(self) -> None:
+        # Step 7 deliberately supersedes the earlier completed/0 contract: a post-run
+        # byte change invalidates an otherwise successful run.
+        mutations = {
+            "resource-rewrite": "Path(sys.argv[2]).write_text('mutated during run\\n')",
+            "executable-rewrite": "Path(sys.argv[1]).write_bytes(b'other executable')",
+            "member-added": "Path(sys.argv[2]).with_name('added.txt').write_text('new\\n')",
+            "member-removed": "Path(sys.argv[2]).unlink()",
+        }
+        for name, statement in mutations.items():
+            with self.subTest(mutation=name):
+                state, executable, resource = self.artifact_fixture()
+                command = [
+                    sys.executable,
+                    "-u",
+                    "-c",
+                    f"from pathlib import Path; import sys; {statement}; " + self.PASSING_ARTIFACT_RUN,
+                    str(executable),
+                    str(resource),
+                ]
 
+                job = self.run_artifact_job(state, command)
+
+                self.assertEqual(job.state, "failed", job.result_summary)
+                self.assertEqual(job.exit_code, 65)
+                self.assertIn("test artifact changed during the run", job.error or "")
+                self.assertEqual(
+                    job.result_summary,
+                    "test artifact integrity failed after execution; run `make dev-test` first",
+                )
+                self.assertEqual(job.artifact_scope, "stale")
+                self.assertIn("artifact mutated during run", job.artifact_scope_differences)
+                self.assertIn("current source was NOT validated", job.artifact_scope_message or "")
+                self.assertIn("artifact integrity failure:", "".join(job.tail))
+
+    def test_test_artifact_unreadable_after_run_fails_65_as_integrity_unavailable(self) -> None:
+        state, _executable, resource = self.artifact_fixture()
+        assert resource is not None
+        self.addCleanup(lambda: resource.chmod(0o644) if resource.exists() else None)
+        command = [
+            sys.executable,
+            "-u",
+            "-c",
+            "import os, sys; os.chmod(sys.argv[1], 0); " + self.PASSING_ARTIFACT_RUN,
+            str(resource),
+        ]
+
+        job = self.run_artifact_job(state, command)
+
+        self.assertEqual(job.state, "failed", job.result_summary)
+        self.assertEqual(job.exit_code, 65)
+        self.assertIn("post-run artifact integrity unavailable", job.error or "")
+        self.assertIn("post-run artifact integrity unavailable", job.artifact_scope_differences)
+        self.assertEqual(job.artifact_scope, "stale")
+
+    def test_test_artifact_integrity_failure_keeps_earlier_primary_outcome(self) -> None:
+        sleeper = [sys.executable, "-u", "-c", "import time; time.sleep(30)"]
+        cases = {
+            "process-failure": ([sys.executable, "-u", "-c", "raise SystemExit(3)"], 30.0, False),
+            "timeout": (sleeper, 0.5, False),
+            "cancellation": ([sys.executable, "-u", "-c", self.PASSING_ARTIFACT_RUN], 30.0, True),
+        }
+        expected = {
+            "process-failure": ("failed", 3, "process exited with status 3"),
+            "timeout": ("failed", 124, "timed out after 0.5s"),
+            "cancellation": ("canceled", 130, None),
+        }
+        for name, (command, timeout, cancel) in cases.items():
+            with self.subTest(outcome=name):
+                state, _executable, resource = self.artifact_fixture()
+                assert resource is not None
+                real_popen = conductor.subprocess.Popen
+
+                def popen_then_mutate(argv: object, *args: object, c=cancel, r=resource, **kwargs: object) -> object:
+                    process = real_popen(argv, *args, **kwargs)
+                    r.write_text("mutated during run\n", encoding="utf-8")
+                    if c:
+                        for job_entry in state.jobs.values():
+                            job_entry.cancel_requested = True
+                    return process
+
+                popen = self.job_launch_probe(popen_then_mutate)
+                extra = contextlib.ExitStack()
+                extra.enter_context(mock.patch.object(conductor.subprocess, "Popen", popen))
+                job = self.run_artifact_job(state, command, timeout=timeout, extra=extra)
+
+                state_name, exit_code, error = expected[name]
+                self.assertEqual(job.state, state_name, job.result_summary)
+                self.assertEqual(job.exit_code, exit_code)
+                if error is not None:
+                    self.assertIn(error, job.error or "")
+                    self.assertNotIn("integrity failed after execution", job.result_summary or "")
+                else:
+                    self.assertEqual(job.result_summary, "canceled")
+                self.assertIn("artifact mutated during run", job.artifact_scope_differences)
+                self.assertEqual(job.artifact_scope, "stale")
+                self.assertIn("artifact integrity failure:", "".join(job.tail))
+
+    def fake_swift_popen(self, state: conductor.DaemonState) -> mock.Mock:
         fake_bin = state.paths.jobs_dir / "fake-bin"
-        fake_bin.mkdir()
+        fake_bin.mkdir(exist_ok=True)
         swift = fake_bin / "swift"
         swift.write_text(
             "#!/usr/bin/env python3\n"
@@ -2099,35 +2379,235 @@ raise SystemExit(
             "print(\"Test Case '-[RepoPromptTests.AlphaTests testOne]' passed (0.001 seconds).\")\n",
             encoding="utf-8",
         )
-        swift.chmod(0o755)
-        lock_root = state.paths.repo_root / "machine-locks"
         real_popen = conductor.subprocess.Popen
 
         def launch_fake_swift(argv: object, *args: object, **kwargs: object) -> subprocess.Popen[bytes]:
             command = list(argv) if isinstance(argv, (list, tuple)) else argv
-            if (
-                isinstance(command, list)
-                and command
-                and Path(command[0]).name in {"swift", "canonical_swift.sh"}
-            ):
+            if isinstance(command, list) and command and Path(command[0]).name in {"swift", "canonical_swift.sh"}:
                 command = [sys.executable, str(swift), *command[1:]]
             return real_popen(command, *args, **kwargs)
 
+        return self.job_launch_probe(launch_fake_swift)
+
+    def enqueue_and_run_artifact(
+        self,
+        state: conductor.DaemonState,
+        args: dict,
+        between: object = None,
+        popen: mock.Mock | None = None,
+    ) -> conductor.Job:
+        popen = popen or self.fake_swift_popen(state)
         with (
-            mock.patch.object(conductor, "artifact_toolchain_snapshot", return_value=toolchain),
-            mock.patch.object(conductor.subprocess, "Popen", side_effect=launch_fake_swift),
+            self.artifact_host(),
+            mock.patch.object(conductor.subprocess, "Popen", popen),
             mock.patch.object(state, "_schedule_locked"),
             mock.patch.object(state, "_xctest_watchdog_enabled", return_value=False),
-            mock.patch.object(conductor, "machine_lock_dir", return_value=lock_root),
+            mock.patch.object(conductor, "machine_lock_dir", return_value=state.paths.repo_root / "machine-locks"),
         ):
-            payload = state.enqueue({"operation": "test-artifact", "args": {"filter": "AlphaTests"}})
+            payload = state.enqueue({"operation": "test-artifact", "args": args})
             job = state.jobs[payload["ticket"]]
-            self.assertEqual(job.artifact_scope, "current")
-            source.write_text("let value = 2\n", encoding="utf-8")
+            if callable(between):
+                between(job)
             job.state = "running"
             state.queue.remove(job.ticket)
             state._run_job(job.ticket)
+        return job
 
+    def test_enqueue_strips_forged_derived_fields_before_identity_and_evaluation(self) -> None:
+        state, _executable, _resource = self.artifact_fixture()
+        ticket = json.loads((state.paths.jobs_dir / "build-ticket-root.json").read_text(encoding="utf-8"))
+        forged = {
+            "artifactPath": str(state.paths.repo_root / "forged.xctest"),
+            "artifactFingerprint": {"sha256": "forged"},
+            "artifactScope": "current",
+            "artifactScopeDifferences": ["forged"],
+            "artifactScopeMessage": "artifact_scope: current",
+            "artifactTicketSourceSnapshot": {"head": "forged"},
+            "buildTicketId": "forged-ticket",
+        }
+        self.assertEqual(set(forged), set(conductor.TEST_ARTIFACT_DERIVED_ARG_KEYS))
+        observed: dict[str, object] = {}
+
+        def capture(job: conductor.Job) -> None:
+            observed["args"] = dict(job.args)
+            observed["fingerprint"] = job.fingerprint
+            observed["scope"] = (job.artifact_scope, job.artifact_scope_message)
+
+        job = self.enqueue_and_run_artifact(state, {"filter": "AlphaTests", **forged}, between=capture)
+
+        self.assertEqual(observed["args"], {"filter": "AlphaTests"})
+        self.assertEqual(
+            observed["fingerprint"],
+            state.registry.fingerprint({"operation": "test-artifact", "args": {"filter": "AlphaTests"}}),
+        )
+        self.assertEqual(observed["scope"], ("pending", conductor.TEST_ARTIFACT_PENDING_SCOPE_MESSAGE))
+        self.assertEqual(job.state, "completed", job.result_summary)
+        self.assertEqual(job.args["buildTicketId"], ticket["ticket_id"])
+        self.assertEqual(job.args["artifactFingerprint"], ticket["artifact_fingerprint"])
+        self.assertEqual(Path(job.args["artifactPath"]).name, "RepoPromptCEPackageTests.xctest")
+        self.assertEqual(job.artifact_scope, "current")
+        self.assertEqual(job.artifact_scope_differences, [])
+
+    def test_queued_artifact_replacement_is_judged_at_execution(self) -> None:
+        # Not re-minted: the execution-time hash rejects it before process creation.
+        state, executable, _resource = self.artifact_fixture()
+        popen = self.fake_swift_popen(state)
+        job = self.enqueue_and_run_artifact(
+            state,
+            {"filter": "AlphaTests"},
+            between=lambda _job: executable.write_bytes(b"replaced while queued"),
+            popen=popen,
+        )
+        self.assertEqual(job.state, "failed")
+        self.assertEqual(job.exit_code, 65)
+        self.assertIn("executable fingerprint", job.error or "")
+        self.assertEqual(popen.launches, [])
+
+        # Re-minted while queued: the job runs against the new artifact, never enqueue-time data.
+        state, executable, _resource = self.artifact_fixture()
+        replacement: dict[str, dict] = {}
+
+        def rebuild(_job: conductor.Job) -> None:
+            executable.write_bytes(b"rebuilt while queued")
+            replacement["ticket"] = self.mint_artifact_ticket(state)
+
+        job = self.enqueue_and_run_artifact(state, {"filter": "AlphaTests"}, between=rebuild)
+        self.assertEqual(job.state, "completed", job.result_summary)
+        self.assertEqual(job.args["buildTicketId"], replacement["ticket"]["ticket_id"])
+        self.assertEqual(job.args["artifactFingerprint"], replacement["ticket"]["artifact_fingerprint"])
+
+    def test_test_artifact_job_hashes_twice_and_never_at_client_or_enqueue(self) -> None:
+        state, executable, resource = self.artifact_fixture()
+        assert resource is not None
+        artifact_root = executable.parents[2]
+        counts = {"executable_hashes": 0, "closure_walks": 0, "source_snapshots": 0, "toolchain": 0}
+        real_hash = conductor._hash_artifact_file
+        real_walk = os.walk
+        real_snapshot = conductor.source_snapshot
+
+        def counted_hash(path: Path, *args: object, **kwargs: object) -> object:
+            if path == executable:
+                counts["executable_hashes"] += 1
+            return real_hash(path, *args, **kwargs)
+
+        def counted_walk(top: object, *args: object, **kwargs: object) -> object:
+            if Path(top) == artifact_root:
+                counts["closure_walks"] += 1
+            return real_walk(top, *args, **kwargs)
+
+        def counted_snapshot(*args: object, **kwargs: object) -> object:
+            counts["source_snapshots"] += 1
+            return real_snapshot(*args, **kwargs)
+
+        def counted_toolchain(*_args: object, **_kwargs: object) -> dict:
+            counts["toolchain"] += 1
+            return dict(self.ARTIFACT_TOOLCHAIN)
+
+        def snapshot_counts() -> dict:
+            return dict(counts)
+
+        captured: dict[str, dict] = {}
+        with (
+            mock.patch.object(conductor, "_hash_artifact_file", side_effect=counted_hash),
+            mock.patch.object(conductor.os, "walk", side_effect=counted_walk),
+            mock.patch.object(conductor, "source_snapshot", side_effect=counted_snapshot),
+            mock.patch.object(conductor, "host_artifact_arch", return_value="testarch"),
+            mock.patch.object(conductor, "artifact_toolchain_snapshot", side_effect=counted_toolchain),
+            mock.patch.object(conductor, "preflight_test_filter"),
+            mock.patch.object(
+                conductor,
+                "enqueue_and_maybe_wait",
+                side_effect=lambda _paths, _operation, args, *_rest, **_kw: captured.setdefault("args", dict(args)) and 0,
+            ),
+        ):
+            self.assertEqual(
+                conductor.handle_real_operation(state.paths, "test-artifact", ["--filter", "AlphaTests"]), 0
+            )
+            after_client = snapshot_counts()
+            popen = self.fake_swift_popen(state)
+            with (
+                mock.patch.object(conductor.subprocess, "Popen", popen),
+                mock.patch.object(state, "_schedule_locked"),
+                mock.patch.object(state, "_xctest_watchdog_enabled", return_value=False),
+                mock.patch.object(conductor, "machine_lock_dir", return_value=state.paths.repo_root / "machine-locks"),
+            ):
+                payload = state.enqueue({"operation": "test-artifact", "args": captured["args"]})
+                after_enqueue = snapshot_counts()
+                job = state.jobs[payload["ticket"]]
+                job.state = "running"
+                state.queue.remove(job.ticket)
+                state._run_job(job.ticket)
+
+        zero = {"executable_hashes": 0, "closure_walks": 0, "source_snapshots": 0, "toolchain": 0}
+        self.assertEqual(captured["args"], {"filter": "AlphaTests"})
+        self.assertEqual(after_client, zero)
+        self.assertEqual(after_enqueue, zero)
+        self.assertEqual(job.state, "completed", job.result_summary)
+        self.assertEqual(len(popen.launches), 1)
+        self.assertEqual(popen.launches[0][1:], ["test", "--skip-build", "--filter", "AlphaTests"])
+        self.assertEqual(
+            counts,
+            {"executable_hashes": 2, "closure_walks": 2, "source_snapshots": 2, "toolchain": 1},
+        )
+
+    def test_artifact_admission_is_cheap_and_keeps_the_unversioned_ticket(self) -> None:
+        forbidden = AssertionError("admission must not hash, snapshot or probe the toolchain")
+        state, executable, _resource = self.artifact_fixture()
+        ticket_path = state.paths.jobs_dir / "build-ticket-root.json"
+        ticket = json.loads(ticket_path.read_text(encoding="utf-8"))
+        guards = contextlib.ExitStack()
+        guards.enter_context(mock.patch.object(conductor, "host_artifact_arch", return_value="testarch"))
+        for name in ("_hash_artifact_file", "test_artifact_fingerprint", "source_snapshot", "artifact_toolchain_snapshot"):
+            guards.enter_context(mock.patch.object(conductor, name, side_effect=forbidden))
+        with guards:
+            # Unknown extras, including an explicit version, change nothing in Step 7;
+            # source-stale artifacts stay admissible.
+            ticket_path.write_text(json.dumps({**ticket, "fingerprint_version": 2, "extra": True}), encoding="utf-8")
+            (state.paths.repo_root / "Tracked.swift").write_text("let value = 99\n", encoding="utf-8")
+            conductor.admit_test_artifact(state.paths.repo_root, state.paths.jobs_dir)
+
+            fingerprint = ticket["artifact_fingerprint"]
+            rejected = {
+                "missing ticket": None,
+                "malformed ticket": "{not json",
+                "non-object ticket": "[]",
+                "missing fingerprint": json.dumps({**ticket, "artifact_fingerprint": None}),
+                "missing field": json.dumps(
+                    {**ticket, "artifact_fingerprint": {k: v for k, v in fingerprint.items() if k != "sha256"}}
+                ),
+                "wrong kind": json.dumps({**ticket, "artifact_fingerprint": {**fingerprint, "size": "7"}}),
+                "bool size": json.dumps({**ticket, "artifact_fingerprint": {**fingerprint, "size": True}}),
+            }
+            for name, content in rejected.items():
+                with self.subTest(case=name):
+                    if content is None:
+                        ticket_path.unlink(missing_ok=True)
+                    else:
+                        ticket_path.write_text(content, encoding="utf-8")
+                    with self.assertRaisesRegex(conductor.ArtifactUnavailableError, "run `make dev-test` first"):
+                        conductor.admit_test_artifact(state.paths.repo_root, state.paths.jobs_dir)
+
+            ticket_path.write_text(json.dumps(ticket), encoding="utf-8")
+            executable.unlink()
+            with self.assertRaisesRegex(conductor.ArtifactUnavailableError, "executable is missing"):
+                conductor.admit_test_artifact(state.paths.repo_root, state.paths.jobs_dir)
+            shutil.rmtree(executable.parents[2])
+            with self.assertRaisesRegex(conductor.ArtifactUnavailableError, "root test artifact is missing"):
+                conductor.admit_test_artifact(state.paths.repo_root, state.paths.jobs_dir)
+
+    def test_enqueued_artifact_job_real_prepare_copies_stale_scope_to_result(self) -> None:
+        # Step 7: enqueue scope is pending; execution decides current/stale.
+        state, _executable, _resource = self.artifact_fixture(resource=False)
+        source = state.paths.repo_root / "Tracked.swift"
+        enqueue_scope: list[object] = []
+
+        def change_source_while_queued(job: conductor.Job) -> None:
+            enqueue_scope.append(job.artifact_scope)
+            source.write_text("let value = 2\n", encoding="utf-8")
+
+        job = self.enqueue_and_run_artifact(state, {"filter": "AlphaTests"}, between=change_source_while_queued)
+
+        self.assertEqual(enqueue_scope, ["pending"])
         self.assertEqual(job.state, "completed", job.result_summary)
         self.assertEqual(job.artifact_scope, "stale")
         self.assertIn("dirty digest", job.artifact_scope_differences)
@@ -5797,7 +6277,7 @@ class RuntimeLedgerCacheTests(LifecycleTestCase):
             if state._xctest_watchdog_enabled(self.make_job(state, name, name, {"filter": "X"}, []))
         )
         self.assertEqual(operations, ["core-test", "provider-test", "test", "test-artifact"])
-        with mock.patch.object(conductor, "evaluate_test_artifact", return_value={}):
+        with mock.patch.object(conductor, "admit_test_artifact", return_value=None):
             for operation in operations:
                 request = {"operation": operation, "args": {"filter": "X"}, "timeout": None, "verbose": False, "env": {}}
                 _argv, lanes, _cwd, _env, _timeout = state.registry.prepare(request)

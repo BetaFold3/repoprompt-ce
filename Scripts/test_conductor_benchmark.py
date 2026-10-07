@@ -11,6 +11,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import types
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -658,6 +659,15 @@ class AdapterTests(unittest.TestCase):
                 self.assertFalse(result["ok"])
                 self.assertIn(type(failure).__name__, result["error"])
 
+    def test_artifact_client_validation_follows_target_capability(self) -> None:
+        # A pre-Step-7 target keeps its full client evaluation; the harness never
+        # grants it the candidate's cheap admission.
+        parent_like = types.SimpleNamespace(evaluate_test_artifact=lambda *_args: {})
+        candidate_like = types.SimpleNamespace(evaluate_test_artifact=lambda *_args: {}, admit_test_artifact=lambda *_args: None)
+        self.assertEqual(bench.artifact_client_validation(parent_like), "full_evaluation")
+        self.assertEqual(bench.artifact_client_validation(candidate_like), "cheap_admission")
+        self.assertEqual(bench.artifact_client_validation(conductor), "cheap_admission")
+
     @unittest.skipUnless(shutil.which("swift") and shutil.which("git"), "artifact path needs swift --version and git")
     def test_artifact_worker_counts_real_validation_sites_and_bytes(self) -> None:
         sizes = (300_000, 500_000)
@@ -676,7 +686,14 @@ class AdapterTests(unittest.TestCase):
         self.assertTrue(result["ok"], result.get("error"))
         metrics = result["metrics"]
         calls = metrics["artifact.fingerprint_calls"]
-        self.assertGreaterEqual(calls, 1)
+        # This (Step 7+) target admits cheaply at the client and enqueue, then
+        # validates once at execution: plan Step 7's per-job counts.
+        self.assertEqual(result["info"]["clientValidation"], "cheap_admission")
+        self.assertEqual(calls, 2.0)
+        self.assertEqual(metrics["artifact.evaluate_calls"], 1.0)
+        self.assertEqual(metrics["artifact.source_snapshot_calls"], 2.0)
+        self.assertEqual(metrics["artifact.toolchain_calls"], 1.0)
+        self.assertGreaterEqual(result["info"]["calls"].get("admit_test_artifact", 0), 2)
         hashed_files = sum(sizes) + len("<plist/>\n")
         # Every fingerprint hashes the executable and closure content plus a small manifest digest.
         self.assertGreaterEqual(metrics["artifact.bytes_hashed"], calls * hashed_files)
