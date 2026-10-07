@@ -92,7 +92,7 @@ def compute_conductor_digest() -> Optional[str]:
     """Informational content digest of the conductor implementation files."""
     script = Path(__file__).resolve()
     paths = [script]
-    for name in ("swift_pipeline_metrics.py", "debug_app_process.py", "conductor_output.py"):
+    for name in ("swift_pipeline_metrics.py", "debug_app_process.py", "conductor_output.py", "conductor_entry.py"):
         candidate = script.with_name(name)
         if candidate.is_file():
             paths.append(candidate)
@@ -109,6 +109,13 @@ def compute_conductor_digest() -> Optional[str]:
 
 # Computed once at module load: a daemon reports the bytes it started with.
 CONDUCTOR_DIGEST = compute_conductor_digest()
+
+
+def conductor_entry_script() -> Path:
+    """The cached-import entry that the launcher, job runners and the daemon execute."""
+    return Path(__file__).resolve().with_name("conductor_entry.py")
+
+
 TIMING_RUNNER_PATH_ENV_KEY = "RPCE_CONDUCTOR_RUNNER_TIMINGS_PATH"
 # Kill switch, read once at daemon start; forwarded into the launchd plist.
 TIMING_ENV_KEY = "RPCE_CONDUCTOR_TIMING"
@@ -1898,7 +1905,21 @@ def verify_daemon_pid_identity(paths: Paths, pid: int) -> bool:
     expected_start = metadata.get("processStart")
     if expected_start and process_start_token(pid) != expected_start:
         return False
-    command = process_command(pid)
+    return daemon_command_matches(process_command(pid), paths)
+
+
+def daemon_command_matches(command: str, paths: Paths) -> bool:
+    """Whether ``ps`` command text is this checkout's daemon.
+
+    A daemon started through the entry must end with exactly the arguments
+    ``spawn_daemon`` passes. The interpreter path is not compared, because
+    ``ps`` may show a framework Python's re-executed binary. A daemon started
+    directly from ``conductor.py`` by an earlier conductor keeps the legacy
+    check.
+    """
+    entry_arguments = f" {conductor_entry_script()} __daemon --repo-root {paths.repo_root}"
+    if command.endswith(entry_arguments):
+        return True
     return "conductor.py" in command and "__daemon" in command and str(paths.repo_root) in command
 
 
@@ -2687,7 +2708,7 @@ class OperationRegistry:
     def __init__(self, repo_root: Path, jobs_dir: Optional[Path] = None) -> None:
         self.repo_root = repo_root
         self.jobs_dir = jobs_dir or compute_paths(repo_root).jobs_dir
-        self.script_path = Path(__file__).resolve()
+        self.script_path = conductor_entry_script()
 
     @classmethod
     def client_env_snapshot(cls) -> Dict[str, str]:
@@ -6223,7 +6244,7 @@ def ensure_daemon(paths: Paths, start_if_needed: bool = True) -> Dict[str, Any]:
                 f"daemon pid {locked_live_pid} is alive but the socket is unresponsive; "
                 "run './conductor daemon stop --force' before starting a replacement"
             )
-        script = Path(__file__).resolve()
+        script = conductor_entry_script()
         spawn_daemon(paths, script)
         deadline = now() + STARTUP_TIMEOUT_SECONDS
         last_error: Optional[Exception] = None
@@ -8497,19 +8518,27 @@ def main(argv: List[str]) -> int:
     raise ConductorError(f"unknown command '{command}'. Run './conductor --help' for usage.")
 
 
-if __name__ == "__main__":
+def cli_main(argv: List[str]) -> int:
+    """``main`` with the command line's exit-code mapping.
+
+    Shared by direct execution and ``conductor_entry.py``.
+    """
     try:
-        raise SystemExit(main(sys.argv[1:]))
+        return main(argv)
     except KeyboardInterrupt:
-        raise SystemExit(130)
+        return 130
     except FilterPreflightError as exc:
         print(f"conductor: {exc}", file=sys.stderr)
-        raise SystemExit(64)
+        return 64
     except ArtifactUnavailableError as exc:
         print(f"conductor: {exc}", file=sys.stderr)
-        raise SystemExit(65)
+        return 65
     except ConductorError as exc:
         print(f"conductor: {exc}", file=sys.stderr)
-        raise SystemExit(1)
+        return 1
     except BrokenPipeError:
-        raise SystemExit(1)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(cli_main(sys.argv[1:]))

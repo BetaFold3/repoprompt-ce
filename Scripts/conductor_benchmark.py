@@ -46,7 +46,7 @@ import types
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
-HARNESS_VERSION = 7
+HARNESS_VERSION = 8
 CAPTURE_SCHEMA_VERSION = 3
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parent
@@ -58,7 +58,9 @@ TARGET_FILES = ("Scripts/conductor.py", "Scripts/debug_app_process.py", "conduct
 # Staged and digested only when the target has them (Step 2+ conductors load the timing
 # helper by explicit path from their own directory). Absent files leave the digest of a
 # required-files-only target unchanged, so earlier targets keep their conductorDigest.
-OPTIONAL_TARGET_FILES = ("Scripts/swift_pipeline_metrics.py", "Scripts/conductor_output.py")
+# Step 6+ launchers exec the cached-import entry instead of conductor.py.
+OPTIONAL_TARGET_FILES = ("Scripts/swift_pipeline_metrics.py", "Scripts/conductor_output.py", "Scripts/conductor_entry.py")
+ENTRY_FILE = "Scripts/conductor_entry.py"
 FAST_WORKLOADS = ("output", "summary", "mem", "cli")
 FULL_WORKLOADS = FAST_WORKLOADS + ("artifact", "rss")
 TARGET_MODULE_NAME = "rpce_bench_target_conductor"
@@ -463,7 +465,10 @@ def stage_target(name: str, root: Path, staging_root: Path, expected: Dict[str, 
 
     Every arm then runs from an identical, writable layout: the dependency's
     bytecode is precompiled once (as an ordinary import would cache it) and
-    ``conductor.py`` is compiled from source per process.
+    ``conductor.py`` is never precompiled. Workers compile it from source; the
+    ``cli`` workload runs the target's own launcher, so only a target with the
+    Step 6 entry caches it (checked-hash) in its own staged copy. The entry
+    always runs as ``__main__`` and is not precompiled either.
     """
     staged = staging_root / name
     (staged / "Scripts").mkdir(parents=True)
@@ -471,7 +476,11 @@ def stage_target(name: str, root: Path, staging_root: Path, expected: Dict[str, 
         shutil.copy2(root / relative, staged / relative)
     if target_digest(staged)["files"] != expected["files"]:
         raise HarnessError(f"staged copy of target {name} does not match its source bytes")
-    dependencies = [str(staged / relative) for relative in expected["files"] if relative.endswith(".py") and relative != "Scripts/conductor.py"]
+    dependencies = [
+        str(staged / relative)
+        for relative in expected["files"]
+        if relative.endswith(".py") and relative not in ("Scripts/conductor.py", ENTRY_FILE)
+    ]
     subprocess.run(
         [sys.executable, "-c", "import py_compile, sys; [py_compile.compile(p, doraise=True) for p in sys.argv[1:]]", *dependencies],
         check=True,
@@ -481,13 +490,15 @@ def stage_target(name: str, root: Path, staging_root: Path, expected: Dict[str, 
 
 
 def load_target_module(root: Path) -> Any:
-    """Load ``<root>/Scripts/conductor.py`` the way production executes it.
+    """Load ``<root>/Scripts/conductor.py`` for the worker workloads.
 
-    The daemon, job runners, and the launcher all run ``conductor.py`` as
-    ``__main__``, which CPython always compiles from source and never caches,
-    while ``debug_app_process`` is an ordinary (bytecode-cached) import. Loading
-    mirrors exactly that, so every arm pays the same compile and allocation cost
-    regardless of whether its directory has or permits a ``__pycache__``.
+    Before Step 6 the daemon, job runners, and the launcher all ran
+    ``conductor.py`` as ``__main__``, which CPython compiles from source and
+    never caches, while ``debug_app_process`` is an ordinary (bytecode-cached)
+    import. Workers keep compiling from source for every arm, so each arm pays
+    the same compile and allocation cost regardless of whether its directory has
+    or permits a ``__pycache__``. Worker metrics do not time this load; the
+    ``cli`` workload measures the launcher, including any cached import.
 
     Must run in a fresh worker process: the harness directory is removed from
     ``sys.path`` so ``debug_app_process`` resolves inside the target only.
@@ -532,6 +543,13 @@ RUNNER_DIGEST_PROBE = (
     "g = runpy.run_path(sys.argv[2], run_name='rpce_runner_digest_probe'); "
     "print(json.dumps(g.get('CONDUCTOR_DIGEST')))"
 )
+# Step 6+ runners import the conductor through the entry's loader.
+ENTRY_RUNNER_DIGEST_PROBE = (
+    "import json, runpy, sys; sys.path.insert(0, sys.argv[1]); "
+    "g = runpy.run_path(sys.argv[2], run_name='rpce_runner_digest_probe'); "
+    "m = g['load_conductor'](sys.argv[1]); "
+    "print(json.dumps(getattr(m, 'CONDUCTOR_DIGEST', None)))"
+)
 
 
 def loaded_conductor_digests(staged: Path) -> Dict[str, Any]:
@@ -540,15 +558,22 @@ def loaded_conductor_digests(staged: Path) -> Dict[str, Any]:
     ``daemon`` is the value in a harness worker, which loads the target the way the
     daemon-side workloads run it; ``runner`` is the value in a fresh interpreter that
     executes ``Scripts/conductor.py`` from its own directory, as job runners and the
-    launcher do. Pre-Step-2 conductors define no digest (``None``). Never gated: the
-    harness's own byte digest (``conductorDigest``) remains the arm identity.
+    launcher do (through ``conductor_entry.py`` when the target has it). Pre-Step-2
+    conductors define no digest (``None``). Never gated: the harness's own byte
+    digest (``conductorDigest``) remains the arm identity.
     """
     staged = staged.resolve()
     scripts = staged / "Scripts"
     result: Dict[str, Any] = {"informational": True}
+    entry = staged / ENTRY_FILE
+    runner = (
+        [sys.executable, "-c", ENTRY_RUNNER_DIGEST_PROBE, str(scripts), str(entry)]
+        if entry.is_file()
+        else [sys.executable, "-c", RUNNER_DIGEST_PROBE, str(scripts), str(scripts / "conductor.py")]
+    )
     probes = {
         "daemon": [sys.executable, str(Path(__file__).resolve()), "__loaded_digest", str(staged)],
-        "runner": [sys.executable, "-c", RUNNER_DIGEST_PROBE, str(scripts), str(scripts / "conductor.py")],
+        "runner": runner,
     }
     for role, argv in probes.items():
         try:
@@ -1731,7 +1756,10 @@ def command_run(ns: argparse.Namespace) -> int:
         "adapters": {name: ADAPTER_VERSIONS[name] for name in workloads},
         "arms": [{"name": name, **digests_before[name]} for name, _ in arms],
         "harnessDigest": harness_digest(),
-        "targetLoading": "staged copy; conductor.py compiled from source per process (as __main__); dependency bytecode precompiled",
+        "targetLoading": (
+            "staged copy; workers compile conductor.py from source per process; cli runs the target's own launcher "
+            "(a Step 6 entry caches checked-hash bytecode in its staged copy); dependency bytecode precompiled"
+        ),
         "contentionStart": machine_slot_contention(),
         "samples": [],
         "errors": [],

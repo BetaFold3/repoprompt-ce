@@ -3633,7 +3633,7 @@ class XCTestStallWatchdogTests(LifecycleTestCase):
             [
                 sys.executable,
                 "-u",
-                str(Path(conductor.__file__).resolve()),
+                str(Path(conductor.__file__).resolve().with_name("conductor_entry.py")),
                 "__operation_runner",
             ],
         )
@@ -4711,6 +4711,7 @@ class RunScriptTransitionTests(unittest.TestCase):
             run_script = scripts / "run.sh"
             shutil.copy2(SCRIPT_DIR / "run.sh", run_script)
             shutil.copy2(SCRIPT_DIR / "conductor.py", scripts / "conductor.py")
+            shutil.copy2(SCRIPT_DIR / "conductor_entry.py", scripts / "conductor_entry.py")
             shutil.copy2(SCRIPT_DIR / "conductor_output.py", scripts / "conductor_output.py")
             run_script.chmod(0o755)
             package_script = scripts / "package_app.sh"
@@ -4763,6 +4764,7 @@ class RunScriptTransitionTests(unittest.TestCase):
             run_script = scripts / "run.sh"
             shutil.copy2(SCRIPT_DIR / "run.sh", run_script)
             shutil.copy2(SCRIPT_DIR / "conductor.py", scripts / "conductor.py")
+            shutil.copy2(SCRIPT_DIR / "conductor_entry.py", scripts / "conductor_entry.py")
             shutil.copy2(SCRIPT_DIR / "conductor_output.py", scripts / "conductor_output.py")
             run_script.chmod(0o755)
             event_log = root / "events.log"
@@ -4883,6 +4885,7 @@ class RunScriptTransitionTests(unittest.TestCase):
             run_script = scripts / "run.sh"
             shutil.copy2(SCRIPT_DIR / "run.sh", run_script)
             shutil.copy2(SCRIPT_DIR / "conductor.py", scripts / "conductor.py")
+            shutil.copy2(SCRIPT_DIR / "conductor_entry.py", scripts / "conductor_entry.py")
             shutil.copy2(SCRIPT_DIR / "conductor_output.py", scripts / "conductor_output.py")
             run_script.chmod(0o755)
             event_log = root / "events.log"

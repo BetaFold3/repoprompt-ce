@@ -18,4 +18,4 @@ print(json.dumps({
 PY
 )"
 
-exec python3 -u "$ROOT_DIR/Scripts/conductor.py" __operation_runner "$PAYLOAD"
+exec python3 -u "$ROOT_DIR/Scripts/conductor_entry.py" __operation_runner "$PAYLOAD"

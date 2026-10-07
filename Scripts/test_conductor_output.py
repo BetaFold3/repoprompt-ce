@@ -6,6 +6,7 @@ from __future__ import annotations
 import contextlib
 import errno
 import fcntl
+import importlib.util
 import io
 import itertools
 import json
@@ -1409,14 +1410,18 @@ class Step3SplitterTests(unittest.TestCase):
         # conductorDigest (implementation identity) covers the output helper's bytes.
         with tempfile.TemporaryDirectory() as tmp:
             scripts = Path(tmp)
-            for name in ("conductor.py", "swift_pipeline_metrics.py", "debug_app_process.py", "conductor_output.py"):
+            for name in ("conductor.py", "swift_pipeline_metrics.py", "debug_app_process.py", "conductor_output.py", "conductor_entry.py"):
                 (scripts / name).write_bytes((SCRIPT_DIR / name).read_bytes())
             with mock.patch.object(conductor, "__file__", str(scripts / "conductor.py")):
                 before = conductor.compute_conductor_digest()
                 self.assertEqual(before, conductor.CONDUCTOR_DIGEST)
-                with (scripts / "conductor_output.py").open("a", encoding="utf-8") as handle:
-                    handle.write("\n# changed\n")
-                self.assertNotEqual(conductor.compute_conductor_digest(), before)
+                # Step 6: the cached-import entry is covered too.
+                for name in ("conductor_output.py", "conductor_entry.py"):
+                    with (scripts / name).open("a", encoding="utf-8") as handle:
+                        handle.write("\n# changed\n")
+                    changed = conductor.compute_conductor_digest()
+                    self.assertNotEqual(changed, before, name)
+                    before = changed
 
     def test_delimiters_and_cr_swallows_one_lf_across_reads(self) -> None:
         records = split_all([b"a\r", b"\nb\r", b"\r\nc\n\r", b"\n\nd"])
@@ -3692,6 +3697,368 @@ class Step5PinHandoffRollbackTests(unittest.TestCase):
                 self.assertEqual(at_fault, [2])
                 self.assertEqual(job.summary_pins, 1)
                 self.assertEqual(ran, [])
+
+
+# ---------------------------------------------------------------------------
+# Step 6: cached-import entry with checked-hash bytecode.
+
+ENTRY_SOURCES = ("conductor.py", "conductor_entry.py", "debug_app_process.py", "swift_pipeline_metrics.py", "conductor_output.py")
+CACHED_SOURCES = ("conductor.py", "debug_app_process.py", "swift_pipeline_metrics.py", "conductor_output.py")
+HELP_TITLE = "conductor — RepoPrompt CE developer daemon"
+EDITED_HELP_TITLE = "conductor — RepoPrompt CE DEVELOPER daemon"  # same encoded size
+
+
+class Step6ConductorEntryTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.fresh_copy()
+
+    def fresh_copy(self) -> None:
+        """A private checkout copy with no ``__pycache__`` and an isolated TMPDIR."""
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name).resolve()
+        self.repo = self.root / "repo"
+        self.scripts = self.repo / "Scripts"
+        self.scripts.mkdir(parents=True)
+        for name in ENTRY_SOURCES:
+            (self.scripts / name).write_bytes((SCRIPT_DIR / name).read_bytes())
+        launcher = self.repo / "conductor"
+        launcher.write_bytes((SCRIPT_DIR.parent / "conductor").read_bytes())
+        launcher.chmod(0o755)
+        self.tmpdir = self.root / "tmpdir"
+        self.tmpdir.mkdir()
+        socket_dir = self.root / "sock"
+        socket_dir.mkdir(mode=0o700)
+        self.env = {
+            key: value
+            for key, value in os.environ.items()
+            if key not in {"PYTHONDONTWRITEBYTECODE", "PYTHONPYCACHEPREFIX", "PYTHONPATH"}
+        }
+        self.env.update(
+            REPOPROMPT_DEV_DAEMON_STATE_DIR=str(self.root / "state"),
+            REPOPROMPT_DEV_DAEMON_SOCKET=str(socket_dir / "c.sock"),
+            TMPDIR=str(self.tmpdir),
+        )
+
+    def cfile(self, name: str = "conductor.py") -> Path:
+        return Path(importlib.util.cache_from_source(str(self.scripts / name)))
+
+    def header(self, name: str = "conductor.py") -> tuple[bool, int]:
+        data = self.cfile(name).read_bytes()[:16]
+        return data[:4] == importlib.util.MAGIC_NUMBER, int.from_bytes(data[4:8], "little")
+
+    def run_entry(self, *args: str, env: Optional[dict] = None) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            [sys.executable, str(self.scripts / "conductor_entry.py"), *args],
+            cwd=str(self.repo), env=env or self.env, capture_output=True, text=True, timeout=60,
+        )
+
+    def run_probe(self, code: str, env: Optional[dict] = None) -> subprocess.CompletedProcess:
+        prelude = (
+            "import json, runpy, sys\n"
+            f"scripts = {str(self.scripts)!r}\n"
+            "sys.path.insert(0, scripts)\n"
+            "entry = runpy.run_path(scripts + '/conductor_entry.py', run_name='rpce_entry_probe')\n"
+        )
+        return subprocess.run(
+            [sys.executable, "-c", prelude + code], cwd=str(self.repo), env=env or self.env,
+            capture_output=True, text=True, timeout=60,
+        )
+
+    def edit_help_preserving_size_and_mtime(self) -> None:
+        path = self.scripts / "conductor.py"
+        before = path.stat()
+        source = path.read_bytes()
+        self.assertEqual(source.count(HELP_TITLE.encode()), 1)
+        edited = source.replace(HELP_TITLE.encode(), EDITED_HELP_TITLE.encode())
+        self.assertEqual(len(edited), len(source))
+        path.write_bytes(edited)
+        os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns))
+        after = path.stat()
+        self.assertEqual((after.st_size, after.st_mtime_ns), (before.st_size, before.st_mtime_ns))
+
+    def timestamp_compile_all(self) -> None:
+        import py_compile
+
+        for name in CACHED_SOURCES:
+            py_compile.compile(
+                str(self.scripts / name), doraise=True, invalidation_mode=py_compile.PycInvalidationMode.TIMESTAMP
+            )
+            self.assertEqual(self.header(name), (True, 0))
+
+    def test_entry_imports_rpce_conductor_and_matches_direct_execution(self) -> None:
+        probe = self.run_probe(
+            "m = entry['load_conductor'](scripts)\n"
+            "import importlib.machinery\n"
+            "print(json.dumps([m.__name__, sys.modules['rpce_conductor'] is m, m.__file__, m.__cached__,\n"
+            "    type(m.__spec__.loader) is importlib.machinery.SourceFileLoader,\n"
+            "    m.Job.__module__, m.conductor_entry_script() == m.Path(scripts, 'conductor_entry.py').resolve()]))\n"
+        )
+        self.assertEqual(probe.returncode, 0, probe.stderr)
+        name, registered, module_file, cached, source_loader, dataclass_module, entry_path = json.loads(probe.stdout)
+        self.assertEqual((name, registered, source_loader, dataclass_module, entry_path), ("rpce_conductor", True, True, "rpce_conductor", True))
+        self.assertEqual(Path(module_file), self.scripts / "conductor.py")
+        self.assertEqual(Path(cached), self.cfile())
+        # The CLI (help, a ConductorError exit and argparse usage) is identical either way.
+        for args in (["--help"], ["job", "status", "--request-key", "missing"], ["build", "--timeout", "x"]):
+            with self.subTest(args=args):
+                via_entry = self.run_entry(*args)
+                direct = subprocess.run(
+                    [sys.executable, str(self.scripts / "conductor.py"), *args],
+                    cwd=str(self.repo), env=self.env, capture_output=True, text=True, timeout=60,
+                )
+                self.assertEqual(
+                    (via_entry.returncode, via_entry.stdout, via_entry.stderr),
+                    (direct.returncode, direct.stdout, direct.stderr),
+                )
+        self.assertEqual(self.run_entry("--help").returncode, 0)
+        failure = self.run_entry("job", "status", "--request-key", "missing")
+        self.assertEqual(failure.returncode, 1)
+        self.assertTrue(failure.stderr.startswith("conductor: "), failure.stderr)
+        usage = self.run_entry("build", "--timeout", "x")
+        self.assertEqual(usage.returncode, 2)
+        self.assertIn("usage: conductor.py", usage.stderr)
+
+    def test_root_launcher_bootstraps_checked_hash_bytecode_once(self) -> None:
+        self.assertFalse((self.scripts / "__pycache__").exists())
+        first = subprocess.run([str(self.repo / "conductor"), "--help"], cwd=str(self.repo), env=self.env, capture_output=True, text=True, timeout=60)
+        self.assertEqual(first.returncode, 0, first.stderr)
+        self.assertIn(HELP_TITLE, first.stdout)
+        # Running conductor.py as __main__ never caches it, so a conductor pyc proves the launcher used the entry.
+        for name in CACHED_SOURCES:
+            with self.subTest(name=name):
+                self.assertEqual(self.header(name), (True, 0b11))
+        self.assertFalse(list((self.scripts / "__pycache__").glob("conductor_entry.*")))
+        written = {name: self.cfile(name).stat().st_mtime_ns for name in CACHED_SOURCES}
+        second = subprocess.run([str(self.repo / "conductor"), "--help"], cwd=str(self.repo), env=self.env, capture_output=True, text=True, timeout=60)
+        self.assertEqual(second.returncode, 0, second.stderr)
+        self.assertEqual({name: self.cfile(name).stat().st_mtime_ns for name in CACHED_SOURCES}, written)
+
+    def test_same_size_same_mtime_edit_runs_new_code(self) -> None:
+        for prior in ("timestamp", "checked-hash"):
+            with self.subTest(prior=prior):
+                self.fresh_copy()
+                if prior == "timestamp":
+                    self.timestamp_compile_all()  # as an ordinary `import conductor` caches it
+                else:
+                    self.assertEqual(self.run_entry("--help").returncode, 0)
+                    self.assertEqual(self.header(), (True, 0b11))
+                self.edit_help_preserving_size_and_mtime()
+                if prior == "timestamp":
+                    # Control: an ordinary import trusts the timestamp pyc and runs the old code.
+                    stale = subprocess.run(
+                        [sys.executable, "-c", f"import sys; sys.path.insert(0, {str(self.scripts)!r}); import conductor; print(conductor.HELP)"],
+                        cwd=str(self.repo), env=self.env, capture_output=True, text=True, timeout=60,
+                    )
+                    self.assertIn(HELP_TITLE, stale.stdout, stale.stderr)
+                result = self.run_entry("--help")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn(EDITED_HELP_TITLE, result.stdout)
+                self.assertNotIn(HELP_TITLE, result.stdout)
+                self.assertEqual(self.header(), (True, 0b11))
+
+    def test_missing_malformed_or_foreign_bytecode_is_recompiled(self) -> None:
+        magic = importlib.util.MAGIC_NUMBER
+        foreign = bytes([magic[0] ^ 0xFF]) + magic[1:]
+        # Header-field cases keep the real hash and loadable body, so only that field is wrong.
+        cases = {
+            "empty": lambda data: b"",
+            "truncated header": lambda data: magic[:3],
+            "garbage": lambda data: b"\x00not bytecode\x00" * 8,
+            "other interpreter": lambda data: foreign + data[4:],
+            "unchecked hash": lambda data: data[:4] + (0b01).to_bytes(4, "little") + data[8:],
+            "timestamp": lambda data: data[:4] + (0).to_bytes(4, "little") + data[8:],
+            "missing": None,
+        }
+        for label, content in cases.items():
+            with self.subTest(case=label):
+                self.fresh_copy()
+                self.assertEqual(self.run_entry("--help").returncode, 0)
+                cfile = self.cfile()
+                data = cfile.read_bytes()
+                cfile.unlink()
+                if content is None:
+                    self.assertEqual(self.run_entry("--help").returncode, 0)  # missing: rebuilt
+                    self.assertEqual(self.header(), (True, 0b11))
+                    continue
+                cfile.write_bytes(content(data))
+                result = self.run_entry("--help")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn(HELP_TITLE, result.stdout)
+                self.assertEqual(self.header(), (True, 0b11))
+
+    def test_valid_checked_hash_header_with_corrupt_body_is_recompiled(self) -> None:
+        import marshal
+
+        def loadable(name: str) -> bool:
+            try:
+                return isinstance(marshal.loads(self.cfile(name).read_bytes()[16:]), type(loadable.__code__))
+            except (EOFError, ValueError, TypeError):
+                return False
+
+        bodies = {
+            "truncated body": lambda body: body[: len(body) // 2],
+            "garbage body": lambda body: b"\xff" * 64,
+            "non-code body": lambda body: marshal.dumps(42),
+        }
+        # The entry loads conductor.py; debug_app_process is a plain import; conductor_output loads by explicit path.
+        for name in ("conductor.py", "debug_app_process.py", "conductor_output.py"):
+            for label, corrupt in bodies.items():
+                with self.subTest(source=name, case=label):
+                    self.fresh_copy()
+                    self.assertEqual(self.run_entry("--help").returncode, 0)
+                    cfile = self.cfile(name)
+                    data = cfile.read_bytes()
+                    corrupted = data[:16] + corrupt(data[16:])  # the header still matches the source hash
+                    cfile.write_bytes(corrupted)
+                    self.assertFalse(loadable(name))
+                    # Control: an ordinary import fails on this cache.
+                    plain = subprocess.run(
+                        [sys.executable, "-c", f"import sys; sys.path.insert(0, {str(self.scripts)!r}); import conductor"],
+                        cwd=str(self.repo), env=self.env, capture_output=True, text=True, timeout=60,
+                    )
+                    self.assertNotEqual(plain.returncode, 0)
+                    cfile.write_bytes(corrupted)  # unchanged by the failed import, but restore regardless
+                    result = self.run_entry("--help")
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertIn(HELP_TITLE, result.stdout)
+                    self.assertEqual(self.header(name), (True, 0b11))
+                    self.assertTrue(loadable(name))
+        # Unwritable: the corrupt cache is bypassed through the fresh private prefix, never loaded.
+        self.fresh_copy()
+        self.assertEqual(self.run_entry("--help").returncode, 0)
+        data = self.cfile().read_bytes()
+        corrupted = data[:16] + data[16 : 16 + (len(data) - 16) // 2]
+        self.cfile().write_bytes(corrupted)
+        pycache = self.scripts / "__pycache__"
+        pycache.chmod(0o555)
+        self.addCleanup(pycache.chmod, 0o755)
+        result = self.run_entry("--help")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(HELP_TITLE, result.stdout)
+        self.assertEqual(self.cfile().read_bytes(), corrupted)
+        self.assertEqual(list(self.tmpdir.iterdir()), [])
+
+    def test_unwritable_cache_uses_a_fresh_empty_private_prefix_removed_at_exit(self) -> None:
+        self.timestamp_compile_all()
+        self.edit_help_preserving_size_and_mtime()  # the old cache would now run stale code
+        stale_bytes = self.cfile().read_bytes()
+        pycache = self.scripts / "__pycache__"
+        pycache.chmod(0o555)
+        self.addCleanup(pycache.chmod, 0o755)
+        probe = self.run_probe(
+            "import os\n"
+            "ok = entry['ensure_checked_hash_bytecode'](scripts)\n"
+            "prefix = sys.pycache_prefix\n"
+            "state = [ok, prefix, sorted(os.listdir(prefix)), sys.dont_write_bytecode]\n"
+            "m = entry['load_conductor'](scripts)\n"
+            "print(json.dumps(state + [m.HELP.splitlines()[0], sorted(os.listdir(prefix))]))\n"
+        )
+        self.assertEqual(probe.returncode, 0, probe.stderr)
+        ok, prefix, listed_before, no_writes, title, listed_after = json.loads(probe.stdout)
+        self.assertFalse(ok)
+        self.assertEqual(Path(prefix).parent, self.tmpdir)
+        self.assertTrue(Path(prefix).name.startswith("rpce-conductor-pycache-"))
+        self.assertEqual((listed_before, no_writes, listed_after), ([], True, []))
+        self.assertEqual(title, EDITED_HELP_TITLE)
+        self.assertFalse(Path(prefix).exists())  # removed at exit
+        self.assertEqual(self.cfile().read_bytes(), stale_bytes)
+        # The real launcher path behaves the same and leaves nothing behind.
+        result = self.run_entry("--help")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(EDITED_HELP_TITLE, result.stdout)
+        self.assertEqual(list(self.tmpdir.iterdir()), [])
+
+    def test_disabled_bytecode_writes_never_use_a_stale_cache(self) -> None:
+        env = dict(self.env, PYTHONDONTWRITEBYTECODE="1")
+        self.timestamp_compile_all()
+        self.edit_help_preserving_size_and_mtime()
+        stale_bytes = self.cfile().read_bytes()
+        result = self.run_entry("--help", env=env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(EDITED_HELP_TITLE, result.stdout)
+        self.assertEqual(self.cfile().read_bytes(), stale_bytes)
+        self.assertEqual(list(self.tmpdir.iterdir()), [])
+        # Valid checked-hash caches are still used when writes are disabled.
+        self.assertEqual(self.run_entry("--help").returncode, 0)
+        probe = self.run_probe("print(json.dumps([entry['ensure_checked_hash_bytecode'](scripts), sys.pycache_prefix]))", env=env)
+        self.assertEqual(json.loads(probe.stdout), [True, None], probe.stderr)
+
+    def test_concurrent_first_imports_each_run_and_leave_valid_bytecode(self) -> None:
+        gate = (
+            "import runpy, sys\n"
+            "sys.stdin.read(1)\n"
+            f"scripts = {str(self.scripts)!r}\n"
+            "sys.path.insert(0, scripts)\n"
+            "sys.argv = [scripts + '/conductor_entry.py', '--help']\n"
+            "runpy.run_path(sys.argv[0], run_name='__main__')\n"
+        )
+        processes = [
+            subprocess.Popen(
+                [sys.executable, "-c", gate], cwd=str(self.repo), env=self.env,
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            )
+            for _ in range(8)
+        ]
+        for process in processes:  # release every child only once all are waiting
+            assert process.stdin is not None
+            process.stdin.write(b"x")
+            process.stdin.close()
+        for process in processes:
+            stdout, stderr = process.communicate(timeout=60)
+            self.assertEqual(process.returncode, 0, stderr.decode())
+            self.assertIn(HELP_TITLE, stdout.decode())
+        for name in CACHED_SOURCES:
+            self.assertEqual(self.header(name), (True, 0b11))
+        leftovers = [path.name for path in (self.scripts / "__pycache__").iterdir() if not path.name.endswith(".pyc")]
+        self.assertEqual(leftovers, [])
+
+    def test_runners_and_daemon_starts_use_the_entry_with_sys_executable(self) -> None:
+        entry = conductor.conductor_entry_script()
+        self.assertEqual(entry, (SCRIPT_DIR / "conductor_entry.py").resolve())
+        registry = conductor.OperationRegistry(self.repo, self.root / "jobs")
+        self.assertEqual(registry._internal_argv("app_status", {})[:4], [sys.executable, "-u", str(entry), "__operation_runner"])
+        paths = timing_paths(self.root / "daemon")
+        plist = conductor.plistlib.loads(conductor.write_daemon_launchd_plist(paths, entry).read_bytes())
+        self.assertEqual(plist["ProgramArguments"], [sys.executable, str(entry), "__daemon", "--repo-root", str(paths.repo_root)])
+        with mock.patch.object(conductor.subprocess, "Popen") as popen:
+            conductor.spawn_daemon_direct(paths, entry)
+        self.assertEqual(popen.call_args.args[0], [sys.executable, str(entry), "__daemon", "--repo-root", str(paths.repo_root)])
+
+        class Spawned(Exception):
+            pass
+
+        with mock.patch.object(conductor, "spawn_daemon", side_effect=Spawned) as spawn:
+            with self.assertRaises(Spawned):
+                conductor.ensure_daemon(paths)  # start and every replacement path
+        spawn.assert_called_once_with(paths, entry)
+
+    def test_daemon_identity_requires_exact_entry_arguments_or_legacy_direct_daemon(self) -> None:
+        paths = timing_paths(self.root / "identity")
+        root = paths.repo_root
+        entry = conductor.conductor_entry_script()
+        framework = "/opt/homebrew/Frameworks/Python.framework/Versions/3.14/Resources/Python.app/Contents/MacOS/Python"
+        cases = {
+            f"{framework} {entry} __daemon --repo-root {root}": True,
+            f"/usr/bin/python3 {entry} __daemon --repo-root {root}": True,
+            f"/usr/bin/python3 /x/Scripts/conductor.py __daemon --repo-root {root}": True,  # legacy direct daemon
+            f"/usr/bin/python3 {entry} __daemon --repo-root {root}/other": False,
+            f"/usr/bin/python3 /elsewhere/Scripts/conductor_entry.py __daemon --repo-root {root}": False,
+            f"/usr/bin/python3 {entry} __daemon --repo-root {root} --extra": False,
+            f"/usr/bin/python3 {entry} __operation_runner --repo-root {root}": False,
+            f"/usr/bin/python3 {entry} status {root}": False,
+            "": False,
+        }
+        for command, expected in cases.items():
+            with self.subTest(command=command):
+                self.assertIs(conductor.daemon_command_matches(command, paths), expected)
+        paths.daemon_meta_path.write_text(
+            json.dumps({"pid": 4242, "repoRoot": str(root), "repoHash": paths.repo_hash}), encoding="utf-8"
+        )
+        for command, expected in ((f"{framework} {entry} __daemon --repo-root {root}", True), (f"python3 {entry} status", False)):
+            with self.subTest(verify=command), mock.patch.object(conductor, "process_command", return_value=command):
+                self.assertIs(conductor.verify_daemon_pid_identity(paths, 4242), expected)
+
 
 
 if __name__ == "__main__":

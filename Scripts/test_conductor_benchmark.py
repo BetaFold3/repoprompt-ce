@@ -453,6 +453,39 @@ class TargetLoadingTests(unittest.TestCase):
             self.assertEqual(json.loads(result.stdout), [None, bench.TARGET_MODULE_NAME, True])
             self.assertFalse(list((staged / "Scripts" / "__pycache__").glob("conductor.*.pyc")))
 
+    def test_cli_caches_conductor_only_through_a_targets_own_step6_entry(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            candidate_source = self.make_target(Path(tmp) / "candidate", bench.OPTIONAL_TARGET_FILES)
+            legacy_source = self.make_target(Path(tmp) / "legacy", STEP3_REQUIRED_HELPERS)
+            (legacy_source / "conductor").write_text(  # the parent (pre-Step-6) launcher
+                '#!/usr/bin/env bash\nset -euo pipefail\nSCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"\n'
+                'exec python3 "$SCRIPT_DIR/Scripts/conductor.py" "$@"\n',
+                encoding="utf-8",
+            )
+            self.assertIn(bench.ENTRY_FILE, bench.target_digest(candidate_source)["files"])
+            self.assertNotIn(bench.ENTRY_FILE, bench.target_digest(legacy_source)["files"])
+            staging = Path(tmp) / "staging"
+            staged = {
+                name: bench.stage_target(name, source, staging, bench.target_digest(source))
+                for name, source in (("candidate", candidate_source), ("legacy", legacy_source))
+            }
+            for name, root in staged.items():
+                pycache = root / "Scripts" / "__pycache__"
+                self.assertFalse(list(pycache.glob("conductor.*.pyc")), name)
+                self.assertFalse(list(pycache.glob("conductor_entry.*.pyc")), name)
+                scratch = Path(tmp) / f"scratch-{name}"
+                scratch.mkdir()
+                sample = bench.run_cli_sample(root, scratch)
+                self.assertTrue(sample["ok"], sample)
+            candidate_pyc = list((staged["candidate"] / "Scripts" / "__pycache__").glob("conductor.*.pyc"))
+            self.assertEqual(len(candidate_pyc), 1)
+            self.assertEqual(int.from_bytes(candidate_pyc[0].read_bytes()[4:8], "little"), 0b11)  # checked-hash
+            self.assertFalse(list((staged["legacy"] / "Scripts" / "__pycache__").glob("conductor.*.pyc")))
+            # The candidate's runner digest comes through its entry, and equals the worker-loaded value.
+            loaded = bench.loaded_conductor_digests(staged["candidate"])
+            self.assertIsInstance(loaded["runner"], str)
+            self.assertEqual(loaded["runner"], loaded["daemon"])
+
     def test_target_digest_covers_every_target_file(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = self.make_target(Path(tmp) / "target")
