@@ -219,7 +219,19 @@ XCTEST_STALL_SAMPLE_MAX_BYTES = 128 * 1024
 XCTEST_STALL_FAILURE_EXIT_CODE = 70
 XCTEST_ZERO_TESTS_FAILURE_EXIT_CODE = 66
 XCTEST_SOURCE_ARTIFACT_INTEGRITY_EXIT_CODE = 67
-PARALLEL_TEST_CANDIDATE_SCHEMA_VERSION = 2
+# Step 8 (fingerprint v2) is one atomic compatibility transition, not equal
+# schema numbers: unversioned root tickets are legacy schema 1 and the current
+# root schema is 2; the parallel candidate advances from 2 to 3. Both envelopes
+# carry the top-level ``fingerprint_version``; the six nested
+# ``artifact_fingerprint`` keys are unchanged.
+ROOT_BUILD_TICKET_SCHEMA_VERSION = 2
+PARALLEL_TEST_CANDIDATE_SCHEMA_VERSION = 3
+ARTIFACT_FINGERPRINT_VERSION = 2
+ROOT_BUILD_TICKET_LEGACY_SCHEMAS = frozenset({None, 1})
+PARALLEL_TEST_CANDIDATE_LEGACY_SCHEMAS = frozenset({1, 2})
+# Domain separation: old (v1) readers always reject a v2 closure digest, and back.
+ARTIFACT_CLOSURE_DIGEST_PREFIX = b"rpce-runtime-closure-v2\0"
+FINGERPRINT_V2_LEGACY_MESSAGE = "ticket predates fingerprint v2 — re-mint with a source-validating run"
 PARALLEL_TEST_CANDIDATE_KIND = "repoprompt-root-parallel-test-candidate"
 PARALLEL_XCTEST_RUNTIME_GATE_KEYS = (
     "DEVELOPER_DIR",
@@ -829,6 +841,8 @@ def build_ticket_payload(
     if artifact_path is None:
         raise ArtifactUnavailableError("root test artifact is missing; run `make dev-test` first")
     return {
+        "schema_version": ROOT_BUILD_TICKET_SCHEMA_VERSION,
+        "fingerprint_version": ARTIFACT_FINGERPRINT_VERSION,
         "ticket_id": job.ticket,
         "created_at": now(),
         "source_snapshot": snapshot,
@@ -892,11 +906,11 @@ TEST_ARTIFACT_DERIVED_ARG_KEYS = (
     "artifactTicketSourceSnapshot",
     "buildTicketId",
 )
-TEST_ARTIFACT_PENDING_SCOPE_MESSAGE = (
-    "artifact_scope: pending — validated after XCTest slot admission, before launch"
-)
+# Neutral until execution-time evaluation completes; a terminal ``pending``
+# (failure or cancellation before evaluation) is never validation evidence.
+TEST_ARTIFACT_PENDING_SCOPE_MESSAGE = "artifact_scope: pending — not evaluated yet; not validation evidence"
 # The required root-ticket ``artifact_fingerprint`` fields and value kinds
-# (unchanged, unversioned format; extra fields are ignored as before).
+# (the six nested keys are unchanged by Step 8; unknown top-level fields are ignored).
 _TICKET_ARTIFACT_FINGERPRINT_FIELDS = (
     ("executable_path", str),
     ("size", int),
@@ -912,6 +926,76 @@ def host_artifact_arch() -> str:
     return os.uname().machine
 
 
+class _MalformedEnvelopeVersion(ValueError):
+    pass
+
+
+def _envelope_version(document: Dict[str, Any], key: str) -> Optional[int]:
+    if key not in document:
+        return None
+    value = document[key]
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise _MalformedEnvelopeVersion(key)
+    return value
+
+
+def artifact_envelope_version_problem(
+    document: Dict[str, Any],
+    *,
+    current_schema: int,
+    legacy_schemas: FrozenSet[Optional[int]],
+    label: str,
+    legacy_label: str,
+) -> Optional[str]:
+    """Classify a ticket/candidate envelope before any structural check or hashing.
+
+    Returns ``None`` only for the current ``(current_schema, fingerprint v2)``
+    envelope. Malformed versions (bool, float, string, null, nonpositive), future
+    versions, recognized historical envelopes and inconsistent combinations each
+    get a specific message. Nothing is upgraded in place. No filesystem access.
+    """
+    try:
+        schema = _envelope_version(document, "schema_version")
+        fingerprint = _envelope_version(document, "fingerprint_version")
+    except _MalformedEnvelopeVersion as exc:
+        return f"{label} {exc.args[0]} is malformed; re-mint with a source-validating run"
+    if (schema is not None and schema > current_schema) or (
+        fingerprint is not None and fingerprint > ARTIFACT_FINGERPRINT_VERSION
+    ):
+        return (
+            f"{label} version is unsupported (schema {schema}, fingerprint {fingerprint}); "
+            "re-mint using this conductor"
+        )
+    if schema in legacy_schemas and fingerprint in (None, 1):
+        return f"{legacy_label} {FINGERPRINT_V2_LEGACY_MESSAGE}"
+    if schema == current_schema and fingerprint == ARTIFACT_FINGERPRINT_VERSION:
+        return None
+    return (
+        f"{label} version combination is invalid (schema {schema}, fingerprint {fingerprint}); "
+        "re-mint with a source-validating run"
+    )
+
+
+def root_build_ticket_version_problem(ticket: Dict[str, Any]) -> Optional[str]:
+    return artifact_envelope_version_problem(
+        ticket,
+        current_schema=ROOT_BUILD_TICKET_SCHEMA_VERSION,
+        legacy_schemas=ROOT_BUILD_TICKET_LEGACY_SCHEMAS,
+        label="test artifact build ticket",
+        legacy_label="test artifact build",
+    )
+
+
+def parallel_test_candidate_version_problem(candidate: Dict[str, Any]) -> Optional[str]:
+    return artifact_envelope_version_problem(
+        candidate,
+        current_schema=PARALLEL_TEST_CANDIDATE_SCHEMA_VERSION,
+        legacy_schemas=PARALLEL_TEST_CANDIDATE_LEGACY_SCHEMAS,
+        label="parallel test candidate",
+        legacy_label="parallel test candidate",
+    )
+
+
 def _read_root_build_ticket(jobs_dir: Path) -> Dict[str, Any]:
     ticket_path = jobs_dir / "build-ticket-root.json"
     try:
@@ -924,6 +1008,10 @@ def _read_root_build_ticket(jobs_dir: Path) -> Dict[str, Any]:
         raise ArtifactUnavailableError(
             "test artifact build ticket is missing or unreadable; run `make dev-test` first"
         )
+    # Step 8: the version envelope is judged before any artifact work or launch.
+    problem = root_build_ticket_version_problem(ticket)
+    if problem is not None:
+        raise ArtifactUnavailableError(f"{problem}; run `make dev-test` first")
     return ticket
 
 
@@ -1126,6 +1214,11 @@ def _test_artifact_fingerprint(
             if path.is_dir() and not path.is_symlink()
         )
         manifest_lines: List[str] = []
+        # Step 8: the sole exclusion is the executable's own adjacent dSYM, pruned
+        # only when it is a real (no-follow) directory at exactly that location. A
+        # regular file of that name and every other `.dSYM` stay content-hashed.
+        excluded_parent = executable.parent
+        excluded_name = executable.name + ".dSYM"
 
         def raise_walk_error(error: OSError) -> None:
             raise error
@@ -1143,6 +1236,9 @@ def _test_artifact_fingerprint(
                 directory_names[:] = [
                     name for name in directory_names if not (directory_path / name).is_symlink()
                 ]
+                if directory_path == excluded_parent and excluded_name in directory_names:
+                    if stat.S_ISDIR(os.lstat(directory_path / excluded_name).st_mode):
+                        directory_names.remove(excluded_name)
                 if observations is not None:
                     # Top-down: each retained child is observed before the walk lists it.
                     for name in directory_names:
@@ -1159,7 +1255,8 @@ def _test_artifact_fingerprint(
                     )
         manifest_lines.sort()
         closure_digest = hashlib.sha256(
-            "".join(manifest_lines).encode("utf-8", errors="surrogateescape")
+            ARTIFACT_CLOSURE_DIGEST_PREFIX
+            + "".join(manifest_lines).encode("utf-8", errors="surrogateescape")
         ).hexdigest()
         if observations is not None:
             observations.verify("while it was being fingerprinted")
@@ -1382,9 +1479,13 @@ def read_parallel_test_candidate(
         ) from exc
     if not isinstance(candidate, dict):
         raise ParallelTestIntegrityError("parallel test candidate must be a JSON object")
+    # Step 8: version classification precedes the strict key set, so a historical
+    # candidate gets the specific re-mint diagnostic.
+    _require_current_parallel_candidate(candidate)
 
     expected_keys = {
         "schema_version",
+        "fingerprint_version",
         "kind",
         "run_id",
         "ticket_id",
@@ -1447,11 +1548,20 @@ def read_parallel_test_candidate(
     return candidate
 
 
+def _require_current_parallel_candidate(candidate: Any) -> None:
+    if not isinstance(candidate, dict):
+        raise ParallelTestIntegrityError("parallel test candidate must be a JSON object")
+    problem = parallel_test_candidate_version_problem(candidate)
+    if problem is not None:
+        raise ParallelTestIntegrityError(problem)
+
+
 def verify_parallel_test_candidate(
     repo_root: Path,
     candidate: Dict[str, Any],
     env: Dict[str, str],
 ) -> None:
+    _require_current_parallel_candidate(candidate)
     differences: List[str] = []
     current_source = source_snapshot(repo_root, env)
     differences.extend(
@@ -1497,7 +1607,11 @@ def verify_parallel_test_candidate(
 
 
 def parallel_build_ticket_payload(candidate: Dict[str, Any]) -> Dict[str, Any]:
+    # Projects only a current candidate, into the root (not candidate) schema.
+    _require_current_parallel_candidate(candidate)
     return {
+        "schema_version": ROOT_BUILD_TICKET_SCHEMA_VERSION,
+        "fingerprint_version": ARTIFACT_FINGERPRINT_VERSION,
         "ticket_id": candidate["ticket_id"],
         "created_at": now(),
         "source_snapshot": candidate["source_snapshot"],
@@ -8357,6 +8471,7 @@ def operation_parallel_root_test(repo_root: Path, args: Dict[str, Any]) -> int:
     runner_started_at = now()
     candidate = {
         "schema_version": PARALLEL_TEST_CANDIDATE_SCHEMA_VERSION,
+        "fingerprint_version": ARTIFACT_FINGERPRINT_VERSION,
         "kind": PARALLEL_TEST_CANDIDATE_KIND,
         "run_id": run_id,
         "ticket_id": ticket_id,

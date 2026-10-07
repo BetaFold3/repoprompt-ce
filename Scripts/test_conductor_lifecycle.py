@@ -6,11 +6,13 @@ from __future__ import annotations
 import contextlib
 import errno
 import fcntl
+import hashlib
 import io
 import json
 import os
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -1649,6 +1651,7 @@ raise SystemExit(
         )
         candidate = {
             "schema_version": conductor.PARALLEL_TEST_CANDIDATE_SCHEMA_VERSION,
+            "fingerprint_version": conductor.ARTIFACT_FINGERPRINT_VERSION,
             "kind": conductor.PARALLEL_TEST_CANDIDATE_KIND,
             "run_id": run_id,
             "ticket_id": job.ticket,
@@ -1745,6 +1748,9 @@ raise SystemExit(
         self.assertEqual(ticket["artifact_fingerprint"]["size"], len(b"test executable"))
         self.assertIn("closure_manifest_sha256", ticket["artifact_fingerprint"])
         self.assertEqual(ticket["artifact_fingerprint"]["closure_file_count"], 0)
+        # Step 8: root schema 2 with top-level fingerprint v2; six nested keys unchanged.
+        self.assertEqual((ticket["schema_version"], ticket["fingerprint_version"]), (2, 2))
+        self.assertEqual(len(ticket["artifact_fingerprint"]), 6)
 
     def test_root_test_withholds_ticket_when_source_changes_during_successful_run(self) -> None:
         tmp, state = self.make_state()
@@ -2041,10 +2047,402 @@ raise SystemExit(
             set(plain),
             {"executable_path", "size", "mtime_ns", "sha256", "closure_manifest_sha256", "closure_file_count"},
         )
-        # fixture.txt, nested/inner.txt and the (still hashed, Step 8 territory) dSYM plist.
-        self.assertEqual(plain["closure_file_count"], 3)
-        self.assertGreater(len(observations), 3)
+        # fixture.txt and nested/inner.txt; Step 8 prunes the executable's own adjacent dSYM.
+        self.assertEqual(plain["closure_file_count"], 2)
+        self.assertGreater(len(observations), 2)
         observations.verify("in test")
+
+    # Step 8 (fingerprint v2) helpers and tests.
+    LEGACY_V2_MESSAGE = "ticket predates fingerprint v2 — re-mint with a source-validating run"
+
+    def sink_fingerprint(
+        self, artifact_path: Path, observations: object = None
+    ) -> tuple[dict, dict]:
+        """Fingerprint through the production sink; returns (fingerprint, content counters)."""
+        events: list[tuple[str, dict]] = []
+        fingerprint = conductor.test_artifact_fingerprint(
+            artifact_path,
+            sink=lambda name, _duration, counters: events.append((name, dict(counters or {}))),
+            observations=observations,  # type: ignore[arg-type]
+        )
+        self.assertEqual([name for name, _ in events], ["artifact_fingerprint"])
+        return fingerprint, events[0][1]
+
+    @staticmethod
+    def regular_file_bytes(root: Path) -> tuple[int, int]:
+        """Independent no-follow enumeration: (content bytes, files) of regular files."""
+        total = files = 0
+        for directory, _names, file_names in os.walk(root, followlinks=False):
+            for name in file_names:
+                metadata = os.lstat(Path(directory) / name)
+                if stat.S_ISREG(metadata.st_mode):
+                    total += metadata.st_size
+                    files += 1
+        return total, files
+
+    def fingerprint_fixture(self) -> tuple[conductor.DaemonState, Path, Path, Path]:
+        tmp, state = self.make_state()
+        self.addCleanup(tmp.cleanup)
+        executable = self.create_test_artifact(state.paths.repo_root)
+        resource = self.create_test_resource_bundle(state.paths.repo_root)
+        return state, executable, resource, executable.parents[2]
+
+    @staticmethod
+    def write_dsym(directory: Path, name: str, payload: bytes) -> Path:
+        dwarf = directory / name / "Contents" / "Resources" / "DWARF" / name.removesuffix(".dSYM")
+        dwarf.parent.mkdir(parents=True, exist_ok=True)
+        dwarf.write_bytes(payload)
+        (directory / name / "Contents" / "Info.plist").write_text("<plist/>\n", encoding="utf-8")
+        return dwarf
+
+    def test_fingerprint_v2_excludes_only_the_exact_real_adjacent_dsym(self) -> None:
+        _state, executable, _resource, artifact_path = self.fingerprint_fixture()
+        baseline, baseline_counters = self.sink_fingerprint(artifact_path)
+        baseline_observations = conductor.ArtifactObservations()
+        conductor.test_artifact_fingerprint(artifact_path, observations=baseline_observations)
+        dsym = executable.with_name(executable.name + ".dSYM")
+
+        def create() -> None:
+            self.write_dsym(executable.parent, dsym.name, b"dwarf one " * 4096)
+
+        def regenerate() -> None:
+            self.write_dsym(executable.parent, dsym.name, b"regenerated dwarf, longer " * 8192)
+            relocations = dsym / "Contents" / "Resources" / "Relocations" / "aarch64" / "x.yml"
+            relocations.parent.mkdir(parents=True)
+            relocations.write_text("relocations\n", encoding="utf-8")
+
+        def delete() -> None:
+            shutil.rmtree(dsym)
+
+        for step in (create, regenerate, delete):
+            with self.subTest(step=step.__name__):
+                step()
+                plain, counters = self.sink_fingerprint(artifact_path)
+                observations = conductor.ArtifactObservations()
+                observed = conductor.test_artifact_fingerprint(artifact_path, observations=observations)
+                self.assertEqual(plain, baseline)
+                self.assertEqual(observed, baseline)
+                # Same content bytes and files: nothing beneath the dSYM is read or observed.
+                self.assertEqual(counters, baseline_counters)
+                self.assertEqual(len(observations), len(baseline_observations))
+                observations.verify("in test")
+
+    def test_fingerprint_v2_content_bytes_drop_by_exactly_the_excluded_subtree(self) -> None:
+        _state, executable, resource, artifact_path = self.fingerprint_fixture()
+        dsym = executable.with_name(executable.name + ".dSYM")
+        self.write_dsym(executable.parent, dsym.name, b"d" * 300_001)
+        (dsym / "Contents" / "Resources" / "empty").mkdir()
+        (dsym / "Contents" / "link.txt").symlink_to(resource)
+        other = self.write_dsym(resource.parent, "Other.dSYM", b"o" * 70_003)
+
+        _fingerprint, counters = self.sink_fingerprint(artifact_path)
+
+        roots = [artifact_path, resource.parent]
+        inclusive_bytes = sum(self.regular_file_bytes(root)[0] for root in roots)
+        inclusive_files = sum(self.regular_file_bytes(root)[1] for root in roots)
+        excluded_bytes, excluded_files = self.regular_file_bytes(dsym)
+        self.assertEqual(excluded_files, 2)
+        self.assertEqual(inclusive_bytes - counters["bytesHashed"], excluded_bytes)
+        self.assertEqual(inclusive_files - counters["filesHashed"], excluded_files)
+        # The other dSYM's content is still read.
+        self.assertGreaterEqual(counters["bytesHashed"], other.stat().st_size + executable.stat().st_size)
+
+    def test_fingerprint_v2_keeps_other_dsyms_regular_file_and_symlink_rules(self) -> None:
+        def adjacent(executable: Path) -> str:
+            return executable.name + ".dSYM"
+
+        included = {
+            "bundle-dsym": lambda e, r: self.write_dsym(r.parent, "Other.dSYM", b"other\n"),
+            "other-dsym-next-to-executable": lambda e, r: self.write_dsym(e.parent, "Helper.dSYM", b"helper\n"),
+            "same-name-dsym-not-adjacent": lambda e, r: self.write_dsym(e.parents[1], adjacent(e), b"moved\n"),
+            "same-name-dsym-in-bundle": lambda e, r: self.write_dsym(r.parent, adjacent(e), b"bundle\n"),
+            "regular-file-at-exact-name": lambda e, r: (
+                e.with_name(adjacent(e)).write_text("plain file\n", encoding="utf-8"),
+                e.with_name(adjacent(e)),
+            )[1],
+        }
+        for name, create in included.items():
+            with self.subTest(included=name):
+                _state, executable, resource, artifact_path = self.fingerprint_fixture()
+                before = conductor.test_artifact_fingerprint(artifact_path)
+                member = create(executable, resource)
+                after = conductor.test_artifact_fingerprint(artifact_path)
+                self.assertGreater(after["closure_file_count"], before["closure_file_count"])
+                self.assertNotEqual(after["closure_manifest_sha256"], before["closure_manifest_sha256"])
+                self.mutate_same_size_preserving_mtime(member)
+                mutated = conductor.test_artifact_fingerprint(artifact_path)
+                self.assertNotEqual(mutated["closure_manifest_sha256"], after["closure_manifest_sha256"])
+                for key in ("executable_path", "size", "mtime_ns", "sha256"):
+                    self.assertEqual(mutated[key], before[key])
+
+        for name in ("symlink-directory-at-exact-name", "symlink-file-at-exact-name"):
+            with self.subTest(excluded=name):
+                state, executable, resource, artifact_path = self.fingerprint_fixture()
+                baseline = conductor.test_artifact_fingerprint(artifact_path)
+                outside = state.paths.repo_root / "outside"
+                target = self.write_dsym(outside, adjacent(executable), b"outside dwarf\n")
+                link = executable.with_name(adjacent(executable))
+                if name == "symlink-directory-at-exact-name":
+                    link.symlink_to(outside / adjacent(executable), target_is_directory=True)
+                else:
+                    link.symlink_to(target)
+                self.assertEqual(conductor.test_artifact_fingerprint(artifact_path), baseline)
+                self.mutate_same_size_preserving_mtime(target)
+                observations = conductor.ArtifactObservations()
+                self.assertEqual(
+                    conductor.test_artifact_fingerprint(artifact_path, observations=observations), baseline
+                )
+
+    def test_fingerprint_v2_keeps_executable_and_retained_file_sensitivity(self) -> None:
+        def executable_bytes(e: Path, r: Path) -> None:
+            self.mutate_same_size_preserving_mtime(e)
+
+        def renamed(e: Path, r: Path) -> None:
+            r.rename(r.with_name("renamed.txt"))
+
+        def resized(e: Path, r: Path) -> None:
+            r.write_text("resource version one, longer\n", encoding="utf-8")
+
+        def touched(e: Path, r: Path) -> None:
+            metadata = r.stat()
+            os.utime(r, ns=(metadata.st_atime_ns, metadata.st_mtime_ns + 1_000_000_000))
+
+        def same_size_content(e: Path, r: Path) -> None:
+            self.mutate_same_size_preserving_mtime(r)
+
+        expected = {
+            executable_bytes: ("sha256",),
+            renamed: ("closure_manifest_sha256",),
+            resized: ("closure_manifest_sha256",),
+            touched: ("closure_manifest_sha256",),
+            same_size_content: ("closure_manifest_sha256",),
+        }
+        for mutate, changed in expected.items():
+            with self.subTest(mutation=mutate.__name__):
+                _state, executable, resource, artifact_path = self.fingerprint_fixture()
+                self.write_dsym(executable.parent, executable.name + ".dSYM", b"dwarf\n")
+                before = conductor.test_artifact_fingerprint(artifact_path)
+                mutate(executable, resource)
+                after = conductor.test_artifact_fingerprint(artifact_path)
+                self.assertEqual(
+                    {key for key in before if before[key] != after[key]}, set(changed)
+                )
+
+    def test_fingerprint_v2_closure_digest_is_domain_separated(self) -> None:
+        prefix = b"rpce-runtime-closure-v2\0"
+        self.assertEqual(conductor.ARTIFACT_CLOSURE_DIGEST_PREFIX, prefix)
+        tmp, state = self.make_state()
+        self.addCleanup(tmp.cleanup)
+        executable = self.create_test_artifact(state.paths.repo_root)
+        self.write_dsym(executable.parent, executable.name + ".dSYM", b"dwarf\n")
+        # Empty manifest (the only member is the excluded dSYM): the prefix still applies.
+        empty = conductor.test_artifact_fingerprint(executable.parents[2])
+        self.assertEqual(empty["closure_file_count"], 0)
+        self.assertEqual(empty["closure_manifest_sha256"], hashlib.sha256(prefix).hexdigest())
+        self.assertNotEqual(empty["closure_manifest_sha256"], hashlib.sha256(b"").hexdigest())
+
+        resource = self.create_test_resource_bundle(state.paths.repo_root)
+        metadata = resource.stat()
+        manifest = (
+            f"RepoPromptCE_RepoPromptTests.bundle/fixture.txt\0{metadata.st_size}\0{metadata.st_mtime_ns}\0"
+            f"{hashlib.sha256(resource.read_bytes()).hexdigest()}\n"
+        ).encode("utf-8")
+        current = conductor.test_artifact_fingerprint(executable.parents[2])
+        self.assertEqual(current["closure_file_count"], 1)
+        self.assertEqual(current["closure_manifest_sha256"], hashlib.sha256(prefix + manifest).hexdigest())
+        self.assertNotEqual(current["closure_manifest_sha256"], hashlib.sha256(manifest).hexdigest())
+        self.assertEqual(current["sha256"], hashlib.sha256(b"test executable").hexdigest())
+
+    @staticmethod
+    def with_envelope(document: dict, changes: dict) -> dict:
+        updated = dict(document)
+        for key, value in changes.items():
+            if value is Ellipsis:
+                updated.pop(key, None)
+            else:
+                updated[key] = value
+        return updated
+
+    S, F = "schema_version", "fingerprint_version"
+    ROOT_ENVELOPE_CASES = {
+        "unversioned-legacy": ({S: ..., F: ...}, LEGACY_V2_MESSAGE),
+        "schema-1": ({S: 1, F: ...}, LEGACY_V2_MESSAGE),
+        "schema-1-fingerprint-1": ({S: 1, F: 1}, LEGACY_V2_MESSAGE),
+        "fingerprint-1-only": ({S: ..., F: 1}, LEGACY_V2_MESSAGE),
+        "bool-schema": ({S: True}, "schema_version is malformed"),
+        "float-fingerprint": ({F: 2.0}, "fingerprint_version is malformed"),
+        "string-schema": ({S: "2"}, "schema_version is malformed"),
+        "null-fingerprint": ({F: None}, "fingerprint_version is malformed"),
+        "zero-schema": ({S: 0}, "schema_version is malformed"),
+        "negative-fingerprint": ({F: -2}, "fingerprint_version is malformed"),
+        "future-schema": ({S: 3}, "version is unsupported"),
+        "future-fingerprint": ({F: 3}, "version is unsupported"),
+        "current-schema-missing-fingerprint": ({F: ...}, "version combination is invalid"),
+        "legacy-schema-with-fingerprint-2": ({S: 1}, "version combination is invalid"),
+        "unversioned-with-fingerprint-2": ({S: ...}, "version combination is invalid"),
+    }
+    CANDIDATE_ENVELOPE_CASES = {
+        "step7-schema-2": ({S: 2, F: ...}, LEGACY_V2_MESSAGE),
+        "schema-1": ({S: 1, F: ...}, LEGACY_V2_MESSAGE),
+        "schema-2-fingerprint-1": ({S: 2, F: 1}, LEGACY_V2_MESSAGE),
+        "missing-schema": ({S: ...}, "version combination is invalid"),
+        "missing-both": ({S: ..., F: ...}, "version combination is invalid"),
+        "current-schema-missing-fingerprint": ({F: ...}, "version combination is invalid"),
+        "schema-2-fingerprint-2": ({S: 2}, "version combination is invalid"),
+        "future-schema": ({S: 4}, "version is unsupported"),
+        "bool-fingerprint": ({F: True}, "fingerprint_version is malformed"),
+        "string-schema": ({S: "3"}, "schema_version is malformed"),
+    }
+
+    def test_root_ticket_versions_are_judged_before_any_artifact_work(self) -> None:
+        state, _executable, _resource = self.artifact_fixture()
+        ticket_path = state.paths.jobs_dir / "build-ticket-root.json"
+        ticket = json.loads(ticket_path.read_text(encoding="utf-8"))
+        self.assertEqual((ticket["schema_version"], ticket["fingerprint_version"]), (2, 2))
+        self.assertEqual(len(ticket["artifact_fingerprint"]), 6)
+        forbidden = AssertionError("version rejection must precede hashing, snapshots and toolchain probes")
+        guards = contextlib.ExitStack()
+        guards.enter_context(mock.patch.object(conductor, "host_artifact_arch", return_value="testarch"))
+        for name in ("_hash_artifact_file", "test_artifact_fingerprint", "source_snapshot", "artifact_toolchain_snapshot"):
+            guards.enter_context(mock.patch.object(conductor, name, side_effect=forbidden))
+        with guards:
+            conductor.admit_test_artifact(state.paths.repo_root, state.paths.jobs_dir)
+            for name, (changes, message) in self.ROOT_ENVELOPE_CASES.items():
+                with self.subTest(envelope=name):
+                    ticket_path.write_text(json.dumps(self.with_envelope(ticket, changes)), encoding="utf-8")
+                    for check in (
+                        lambda: conductor.admit_test_artifact(state.paths.repo_root, state.paths.jobs_dir),
+                        lambda: conductor.evaluate_test_artifact(
+                            state.paths.repo_root, state.paths.jobs_dir, os.environ.copy()
+                        ),
+                    ):
+                        with self.assertRaises(conductor.ArtifactUnavailableError) as raised:
+                            check()
+                        self.assertIn(message, str(raised.exception))
+                        self.assertIn("run `make dev-test` first", str(raised.exception))
+
+    def test_legacy_root_ticket_fails_65_before_hashing_or_launch(self) -> None:
+        state, _executable, _resource = self.artifact_fixture()
+        ticket_path = state.paths.jobs_dir / "build-ticket-root.json"
+        ticket = json.loads(ticket_path.read_text(encoding="utf-8"))
+        legacy = self.with_envelope(ticket, {self.S: ..., self.F: ...})
+        ticket_path.write_text(json.dumps(legacy), encoding="utf-8")
+        real_hash = conductor._hash_artifact_file
+        hashed: list[Path] = []
+
+        def counted_hash(path: Path, *args: object, **kwargs: object) -> object:
+            hashed.append(path)
+            return real_hash(path, *args, **kwargs)
+
+        # Enqueue admission rejects it (cheaply) ...
+        with (
+            self.artifact_host(),
+            mock.patch.object(conductor, "_hash_artifact_file", side_effect=counted_hash),
+            mock.patch.object(state, "_schedule_locked"),
+        ):
+            with self.assertRaisesRegex(conductor.ArtifactUnavailableError, self.LEGACY_V2_MESSAGE):
+                state.enqueue({"operation": "test-artifact", "args": {"filter": "AlphaTests"}})
+        # ... and a legacy ticket written after a current one was admitted at enqueue is
+        # rejected at execution, before hashing or launch; scope stays a neutral pending.
+        ticket_path.write_text(json.dumps(ticket), encoding="utf-8")
+        popen = self.fake_swift_popen(state)
+        with mock.patch.object(conductor, "_hash_artifact_file", side_effect=counted_hash):
+            job = self.enqueue_and_run_artifact(
+                state,
+                {"filter": "AlphaTests"},
+                between=lambda _job: ticket_path.write_text(json.dumps(legacy), encoding="utf-8"),
+                popen=popen,
+            )
+
+        self.assertEqual(job.state, "failed")
+        self.assertEqual(job.exit_code, 65)
+        self.assertIn(self.LEGACY_V2_MESSAGE, job.error or "")
+        self.assertEqual(popen.launches, [])
+        self.assertEqual(hashed, [])
+        self.assertEqual(job.artifact_scope, "pending")
+        self.assertNotIn("validated", job.artifact_scope_message or "")
+        self.assertIn("not validation evidence", job.artifact_scope_message or "")
+
+    def test_parallel_candidate_versions_precede_strict_keys_and_all_consumers(self) -> None:
+        tmp, state = self.make_state()
+        self.addCleanup(tmp.cleanup)
+        self.initialize_git_repo(state.paths.repo_root)
+        self.create_test_artifact(state.paths.repo_root)
+        run_id = str(uuid.uuid4())
+        job = self.make_job(state, "parallel-versions", "test-parallel", {"parallelRunId": run_id}, ["build"])
+        candidate_path, candidate = self.write_parallel_candidate(state, job, run_id, dict(self.ARTIFACT_TOOLCHAIN))
+        self.assertEqual((candidate["schema_version"], candidate["fingerprint_version"]), (3, 2))
+
+        def read() -> dict:
+            return conductor.read_parallel_test_candidate(
+                candidate_path, expected_run_id=run_id, expected_ticket_id=job.ticket, expected_filter=None
+            )
+
+        self.assertEqual(read(), candidate)
+        projected = conductor.parallel_build_ticket_payload(candidate)
+        self.assertEqual((projected["schema_version"], projected["fingerprint_version"]), (2, 2))
+        self.assertEqual(projected["artifact_fingerprint"], candidate["artifact_fingerprint"])
+        self.assertEqual(len(projected["artifact_fingerprint"]), 6)
+        self.assertNotIn("kind", projected)
+        self.assertIsNone(conductor.root_build_ticket_version_problem(projected))
+
+        forbidden = AssertionError("candidate version rejection must precede snapshots, probes and hashing")
+        for name, (changes, message) in self.CANDIDATE_ENVELOPE_CASES.items():
+            with self.subTest(envelope=name):
+                changed = self.with_envelope(candidate, changes)
+                conductor.write_build_ticket(candidate_path, changed)
+                with self.assertRaises(conductor.ParallelTestIntegrityError) as raised:
+                    read()
+                self.assertIn(message, str(raised.exception))
+                self.assertNotIn("schema mismatch", str(raised.exception))
+                with contextlib.ExitStack() as guards:
+                    for spy in ("source_snapshot", "artifact_toolchain_snapshot", "test_artifact_fingerprint"):
+                        guards.enter_context(mock.patch.object(conductor, spy, side_effect=forbidden))
+                    with self.assertRaisesRegex(conductor.ParallelTestIntegrityError, message):
+                        conductor.verify_parallel_test_candidate(state.paths.repo_root, changed, os.environ.copy())
+                    with self.assertRaisesRegex(conductor.ParallelTestIntegrityError, message):
+                        conductor.parallel_build_ticket_payload(changed)
+
+        # The strict candidate key set still applies to current envelopes.
+        conductor.write_build_ticket(candidate_path, {**candidate, "extra": True})
+        with self.assertRaisesRegex(conductor.ParallelTestIntegrityError, r"schema mismatch; missing=\[\]; extra=\['extra'\]"):
+            read()
+
+    def test_parallel_job_with_legacy_candidate_fails_67_without_ticket(self) -> None:
+        tmp, state = self.make_state()
+        self.addCleanup(tmp.cleanup)
+        self.initialize_git_repo(state.paths.repo_root)
+        self.create_test_artifact(state.paths.repo_root)
+        run_id = str(uuid.uuid4())
+        job = self.make_job(
+            state, "parallel-legacy", "test-parallel", {"workers": 2, "parallelRunId": run_id}, ["build"],
+            job_state="running",
+        )
+        candidate_path, candidate = self.write_parallel_candidate(state, job, run_id, dict(self.ARTIFACT_TOOLCHAIN))
+        conductor.write_build_ticket(candidate_path, self.with_envelope(candidate, {self.S: 2, self.F: ...}))
+        job.args["parallelCandidate"] = str(candidate_path)
+        state.jobs[job.ticket] = job
+        ticket_path = state.paths.jobs_dir / "build-ticket-root.json"
+        ticket_path.write_text('{"ticket_id":"old"}\n', encoding="utf-8")
+        with (
+            mock.patch.object(
+                state.registry,
+                "prepare",
+                return_value=(
+                    [sys.executable, "-c", "raise SystemExit(0)"], ["build"], state.paths.repo_root,
+                    os.environ.copy(), 5.0,
+                ),
+            ),
+            mock.patch.object(conductor, "operation_requires_global_heavy_slot", return_value=False),
+            mock.patch.object(conductor, "operation_requires_global_xctest_slot", return_value=False),
+            mock.patch.object(conductor, "artifact_toolchain_snapshot", return_value=dict(self.ARTIFACT_TOOLCHAIN)),
+        ):
+            state._run_job(job.ticket)
+
+        self.assertEqual(job.state, "failed")
+        self.assertEqual(job.exit_code, conductor.XCTEST_SOURCE_ARTIFACT_INTEGRITY_EXIT_CODE)
+        self.assertIn(self.LEGACY_V2_MESSAGE, job.error or "")
+        self.assertFalse(ticket_path.exists())
 
     def test_test_artifact_scope_is_current_then_stale_after_source_mutation(self) -> None:
         tmp, state = self.make_state()
@@ -2279,6 +2677,13 @@ raise SystemExit(
             "executable-rewrite": "Path(sys.argv[1]).write_bytes(b'other executable')",
             "member-added": "Path(sys.argv[2]).with_name('added.txt').write_text('new\\n')",
             "member-removed": "Path(sys.argv[2]).unlink()",
+            # S7-R0-04: same size, mtime restored; only content hashing can see it.
+            "same-size-restored-mtime": (
+                "import os; p = Path(sys.argv[2]); s = p.stat(); b = bytearray(p.read_bytes()); "
+                "b[0] = (b[0] + 1) % 256; p.write_bytes(bytes(b)); "
+                "os.utime(p, ns=(s.st_atime_ns, s.st_mtime_ns)); "
+                "assert (p.stat().st_size, p.stat().st_mtime_ns) == (s.st_size, s.st_mtime_ns)"
+            ),
         }
         for name, statement in mutations.items():
             with self.subTest(mutation=name):
@@ -2550,7 +2955,7 @@ raise SystemExit(
             {"executable_hashes": 2, "closure_walks": 2, "source_snapshots": 2, "toolchain": 1},
         )
 
-    def test_artifact_admission_is_cheap_and_keeps_the_unversioned_ticket(self) -> None:
+    def test_artifact_admission_is_cheap_and_accepts_unknown_ticket_extras(self) -> None:
         forbidden = AssertionError("admission must not hash, snapshot or probe the toolchain")
         state, executable, _resource = self.artifact_fixture()
         ticket_path = state.paths.jobs_dir / "build-ticket-root.json"
@@ -2560,9 +2965,10 @@ raise SystemExit(
         for name in ("_hash_artifact_file", "test_artifact_fingerprint", "source_snapshot", "artifact_toolchain_snapshot"):
             guards.enter_context(mock.patch.object(conductor, name, side_effect=forbidden))
         with guards:
-            # Unknown extras, including an explicit version, change nothing in Step 7;
-            # source-stale artifacts stay admissible.
-            ticket_path.write_text(json.dumps({**ticket, "fingerprint_version": 2, "extra": True}), encoding="utf-8")
+            # Unknown top-level extras are still ignored on the current (schema 2,
+            # fingerprint v2) root ticket; source-stale artifacts stay admissible.
+            self.assertEqual((ticket["schema_version"], ticket["fingerprint_version"]), (2, 2))
+            ticket_path.write_text(json.dumps({**ticket, "extra": True, "policy": {"x": 1}}), encoding="utf-8")
             (state.paths.repo_root / "Tracked.swift").write_text("let value = 99\n", encoding="utf-8")
             conductor.admit_test_artifact(state.paths.repo_root, state.paths.jobs_dir)
 
@@ -2713,6 +3119,8 @@ raise SystemExit(
             Path(args["parallelCandidate"]).read_text(encoding="utf-8")
         )
         self.assertEqual(candidate["run_id"], run_id)
+        self.assertEqual((candidate["schema_version"], candidate["fingerprint_version"]), (3, 2))
+        self.assertEqual(len(candidate["artifact_fingerprint"]), 6)
         self.assertEqual(candidate["ticket_id"], "parallel-ticket")
         self.assertEqual(candidate["evidence_scope"], "full-root")
         self.assertEqual(candidate["source_snapshot"], snapshot)
@@ -2906,6 +3314,7 @@ raise SystemExit(
                 self.assertIsNotNone(job.run_phase_seconds)
                 ticket = json.loads(ticket_path.read_text(encoding="utf-8"))
                 self.assertEqual(ticket["ticket_id"], job.ticket)
+                self.assertEqual((ticket["schema_version"], ticket["fingerprint_version"]), (2, 2))
                 self.assertEqual(
                     ticket["artifact_fingerprint"],
                     candidate["artifact_fingerprint"],

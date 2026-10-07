@@ -694,8 +694,11 @@ class AdapterTests(unittest.TestCase):
         self.assertEqual(metrics["artifact.source_snapshot_calls"], 2.0)
         self.assertEqual(metrics["artifact.toolchain_calls"], 1.0)
         self.assertGreaterEqual(result["info"]["calls"].get("admit_test_artifact", 0), 2)
-        hashed_files = sum(sizes) + len("<plist/>\n")
-        # Every fingerprint hashes the executable and closure content plus a small manifest digest.
+        # Step 8: the executable's adjacent dSYM (sizes[1]) is pruned; the executable
+        # and the bundle Info.plist remain.
+        hashed_files = sizes[0] + len("<plist/>\n")
+        # Every fingerprint hashes the executable and closure content plus a small
+        # manifest digest and the closure domain prefix (aggregate hash input).
         self.assertGreaterEqual(metrics["artifact.bytes_hashed"], calls * hashed_files)
         self.assertLess(metrics["artifact.bytes_hashed"], calls * (hashed_files + 4096))
         self.assertGreaterEqual(metrics["artifact.run_wall_ms"], metrics["artifact.integrity_ms"] * 0.5)
