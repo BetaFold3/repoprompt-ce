@@ -178,7 +178,7 @@ def generated_job_file_ticket(name: str) -> Optional[str]:
     return None
 
 
-PROTOCOL_VERSION = 16
+PROTOCOL_VERSION = 17
 TERMINAL_STATES = {"completed", "failed", "canceled"}
 LANE_NAMES = {"build", "debugArtifact", "liveApp", "release", "style"}
 LOG_TAIL_LINES = 30
@@ -3043,8 +3043,9 @@ class OperationRegistry:
         "REPOPROMPT_DEV_HEAVY_SLOTS",
         "REPOPROMPT_DEV_XCTEST_SLOTS",
     ]
-    # Step 10: validated in the client and normalized (unset -> "off") in every request snapshot.
-    DEBUG_SYMBOL_ENV_KEYS = [DEBUG_DSYM_POLICY_ENV_KEY]
+    # Step 10: RPCE_DEBUG_DSYM is validated in the client and normalized (unset -> "off") in every
+    # request snapshot. RPCE_INDEX_STORE is forwarded verbatim; canonical_swift.sh validates it.
+    DEBUG_SYMBOL_ENV_KEYS = [DEBUG_DSYM_POLICY_ENV_KEY, "RPCE_INDEX_STORE"]
     TELEMETRY_ENV_KEYS = [
         "REPOPROMPT_ENABLE_SENTRY",
         "REPOPROMPT_SENTRY_DSN",

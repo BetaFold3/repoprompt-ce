@@ -92,7 +92,8 @@ class LifecycleQueueTests(LifecycleTestCase):
     def test_protocol_version_bump_replaces_older_daemons(self) -> None:
         # 16: Step 10 adds the `dsym` operation and forwards RPCE_DEBUG_DSYM; an
         # idle protocol-15 daemon would reject one and silently drop the other.
-        self.assertEqual(conductor.PROTOCOL_VERSION, 16)
+        # 17: forwards RPCE_INDEX_STORE, which an idle protocol-16 daemon would drop.
+        self.assertEqual(conductor.PROTOCOL_VERSION, 17)
 
     def test_ensure_daemon_stops_and_replaces_idle_protocol_15_daemon(self) -> None:
         tmp, state = self.make_state()

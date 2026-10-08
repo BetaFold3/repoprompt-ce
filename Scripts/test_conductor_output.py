@@ -584,20 +584,13 @@ class CanonicalSwiftCommandTests(unittest.TestCase):
             [],
         ):
             with self.subTest(arguments=arguments):
-                result = subprocess.run(
-                    [
-                        "/bin/bash", "-c",
-                        'exec() { printf "%s\\0" "$@"; }; wrapper="$1"; shift; source "$wrapper" "$@"',
-                        "canonical-swift-test", str(SCRIPT_DIR / "canonical_swift.sh"),
-                        *arguments,
-                    ],
-                    check=True, capture_output=True,
-                )
+                result = self.run_wrapper(arguments)[0]
+                self.assertEqual(result.returncode, 0)
                 argv = result.stdout.decode().split("\0")[:-1]
                 swift_index = argv.index("/usr/bin/swift")
                 expected = list(arguments)
                 if arguments and arguments[0] in {"build", "test"}:
-                    expected[1:1] = ["--build-system", "native"]
+                    expected[1:1] = ["--build-system", "native", "--disable-index-store"]
                 self.assertEqual(argv[swift_index + 1:], expected)
                 self.assertEqual(argv[:2], ["/usr/bin/env", "-i"])
 
@@ -605,7 +598,8 @@ class CanonicalSwiftCommandTests(unittest.TestCase):
 
     def run_wrapper(self, arguments, extra_env=None, wrapper=None):
         env = {key: value for key, value in os.environ.items()
-               if key not in {"RPCE_DEBUG_DSYM", "REPOPROMPT_ENABLE_SENTRY", "SWIFT_DRIVER_DSYMUTIL_EXEC"}}
+               if key not in {"RPCE_DEBUG_DSYM", "RPCE_INDEX_STORE", "REPOPROMPT_ENABLE_SENTRY",
+                              "SWIFT_DRIVER_DSYMUTIL_EXEC"}}
         env.update(extra_env or {})
         result = subprocess.run(
             [
@@ -628,7 +622,8 @@ class CanonicalSwiftCommandTests(unittest.TestCase):
         hooks = [item for item in child_env if item.startswith("SWIFT_DRIVER_DSYMUTIL_EXEC=")]
         self.assertEqual(hooks, ["SWIFT_DRIVER_DSYMUTIL_EXEC=/usr/bin/true"])
         self.assertFalse(any(item.startswith("RPCE_DEBUG_DSYM=") for item in child_env))
-        self.assertEqual(swift_args, ["build", "--build-system", "native", "--product", "RepoPrompt"])
+        self.assertEqual(swift_args, ["build", "--build-system", "native", "--disable-index-store",
+                                      "--product", "RepoPrompt"])
         stderr = result.stderr.decode()
         self.assertEqual(stderr.count("rpce-debug-dsym:"), 1)
         self.assertIn("requested=off effective=off reason=debug_skip", stderr)
@@ -662,8 +657,11 @@ class CanonicalSwiftCommandTests(unittest.TestCase):
                 self.assertFalse(any(item.startswith("RPCE_DEBUG_DSYM=") for item in child_env))
                 stderr = result.stderr.decode()
                 self.assertIn(reason, stderr)
+                self.assertEqual(stderr.count("rpce-debug-dsym:"), 1)
                 self.assertEqual("warning=skip-not-applied" in stderr, warned)
                 self.assertEqual(swift_args[0], arguments[0])
+                # Index store: requested dSYM on stays index-disabled; ineligible configurations are untouched.
+                self.assertEqual("--disable-index-store" in swift_args, reason == "reason=requested_on")
         _, sentry_env, _ = self.run_wrapper(["build"], {"REPOPROMPT_ENABLE_SENTRY": "1"})
         self.assertIn("REPOPROMPT_ENABLE_SENTRY=1", sentry_env)
 
@@ -674,6 +672,68 @@ class CanonicalSwiftCommandTests(unittest.TestCase):
                 self.assertEqual(result.returncode, 2)
                 self.assertIsNone(child_env)
                 self.assertIn(b"must be 'on' or 'off'", result.stderr)
+
+    # Step 3 (2026-10-08 follow-ups): index store policy.
+
+    def test_index_store_policy_is_argv_only_and_on_adds_nothing(self) -> None:
+        arguments = ["build", "--product", "RepoPrompt"]
+        disabled = ["build", "--build-system", "native", "--disable-index-store", "--product", "RepoPrompt"]
+        for extra, expected in (({}, disabled), ({"RPCE_INDEX_STORE": "off"}, disabled),
+                                ({"RPCE_INDEX_STORE": "off", "RPCE_DEBUG_DSYM": "on"}, disabled),
+                                ({"RPCE_INDEX_STORE": "on"}, ["build", "--build-system", "native", "--product", "RepoPrompt"]),
+                                ({"RPCE_INDEX_STORE": "on", "RPCE_DEBUG_DSYM": "on"},
+                                 ["build", "--build-system", "native", "--product", "RepoPrompt"])):
+            with self.subTest(extra=extra):
+                result, child_env, swift_args = self.run_wrapper(arguments, extra)
+                self.assertEqual(result.returncode, 0)
+                self.assertEqual(swift_args, expected)
+                self.assertFalse(any(item.startswith("RPCE_INDEX_STORE=") for item in child_env))
+                self.assertEqual(result.stderr.decode().count("rpce-debug-dsym:"), 1)
+        for arguments in (["--version"], ["package", "resolve"]):
+            with self.subTest(arguments=arguments):
+                _, _, swift_args = self.run_wrapper(arguments)
+                self.assertEqual(swift_args, arguments)
+
+    def test_queries_and_test_invocations_share_the_index_store_argv_prefix(self) -> None:
+        for extra in ({}, {"RPCE_DEBUG_DSYM": "on"}, {"RPCE_INDEX_STORE": "on"}):
+            prefixes = set()
+            for arguments in (["build", "--product", "RepoPrompt"], ["build", "-c", "debug", "--show-bin-path"],
+                              ["test", "list", "--skip-build"], ["test", "--skip-build", "--filter", "X"]):
+                with self.subTest(extra=extra, arguments=arguments):
+                    _, _, swift_args = self.run_wrapper(arguments, extra)
+                    prefixes.add(tuple(swift_args[1:4]) if "--disable-index-store" in swift_args else tuple(swift_args[1:3]))
+            self.assertEqual(len(prefixes), 1)
+
+    def test_invalid_index_store_policy_exits_2_before_swift(self) -> None:
+        for value in ("", "ON", "bogus"):
+            with self.subTest(value=value):
+                result, child_env, _ = self.run_wrapper(["build"], {"RPCE_INDEX_STORE": value})
+                self.assertEqual(result.returncode, 2)
+                self.assertIsNone(child_env)
+                self.assertIn(b"RPCE_INDEX_STORE must be 'on' or 'off'", result.stderr)
+                self.assertNotIn(b"rpce-debug-dsym:", result.stderr)
+
+    def test_index_store_eligibility_recheck_fails_loudly(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            wrapper = Path(tmp) / "canonical_swift.sh"
+            wrapper.write_bytes((SCRIPT_DIR / "canonical_swift.sh").read_bytes())
+            helper = Path(tmp) / "debug_dsym.py"
+            for recheck, code in ("raise SystemExit(5)", 5), ("print('maybe')", 70):
+                with self.subTest(recheck=recheck):
+                    helper.write_text("import os\nif os.environ.get('RPCE_DEBUG_DSYM') == 'off':\n    "
+                                      f"{recheck}\nprint('on')\n")
+                    result, child_env, _ = self.run_wrapper(["build"], {"RPCE_DEBUG_DSYM": "on"}, wrapper=wrapper)
+                    self.assertEqual(result.returncode, code)
+                    self.assertIsNone(child_env)
+                    self.assertIn(b"index store eligibility", result.stderr)
+
+    def test_conductor_forwards_index_store_policy_verbatim(self) -> None:
+        self.assertIn("RPCE_INDEX_STORE", conductor.OperationRegistry.PASSTHROUGH_ENV_KEYS)
+        for value in ("on", "off", "", "bogus"):
+            with self.subTest(value=value), mock.patch.dict(os.environ, {"RPCE_INDEX_STORE": value}):
+                self.assertEqual(conductor.OperationRegistry.client_env_snapshot()["RPCE_INDEX_STORE"], value)
+                request = {"operation": "build", "args": {}, "env": {"RPCE_INDEX_STORE": value}}
+                self.assertEqual(conductor.OperationRegistry._request_env_snapshot(request)["RPCE_INDEX_STORE"], value)
 
     def test_classifier_failure_fails_before_swift(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -905,7 +965,7 @@ class PhaseTimingIntegrationTests(unittest.TestCase):
         status = state.status_payload()
         self.assertEqual(status["conductorDigest"], conductor.CONDUCTOR_DIGEST)
         self.assertTrue(status["timingEnabled"])
-        self.assertEqual(status["protocolVersion"], 16)
+        self.assertEqual(status["protocolVersion"], 17)
         self.assertFalse(self.make_state("off", timing="off").status_payload()["timingEnabled"])
 
     def test_observed_pump_preserves_raw_bytes_tail_and_progress_for_every_stream(self) -> None:

@@ -4,7 +4,7 @@ Scope: read when the task touches the 2026-10-08 Swift compile follow-ups: the s
 Authority: Reference
 Last-verified: 2026-10-08
 
-Status: Steps 1–2 complete; Steps 3–4 not started. Step 2 evidence: `.agent-artifacts/swift-compile-time/step2-results.md` and `step2-review-disposition.md`. Results and review evidence: `.agent-artifacts/swift-compile-time/step1-results.md` and `step1-review-disposition.md`. Planned with OracleA and OracleD (one challenge round; converged). Timebox about 1 day.
+Status: Steps 1–3 complete; Step 4 not started. Step 3 evidence: `.agent-artifacts/swift-compile-time/step3-results.md` and `step3-review-disposition.md`. Step 2 evidence: `.agent-artifacts/swift-compile-time/step2-results.md` and `step2-review-disposition.md`. Results and review evidence: `.agent-artifacts/swift-compile-time/step1-results.md` and `step1-review-disposition.md`. Planned with OracleA and OracleD (one challenge round; converged). Timebox about 1 day.
 
 ## Goal
 Answer three questions cheaply, keep only what helps, and stop:
@@ -58,7 +58,7 @@ Starting evidence (2026-10-08, symbols off, noisy host): an app body edit builds
   - (d) Advisory: two app-edit runs per setting with the order reversed, plus the first post-toggle rebuild time, reported with ranges.
 - Done when: the change is committed locally, (a)–(c) pass, the stale `.build/arm64-apple-macosx/debug/index` (743 MB) is deleted, and (d) is reported for the owner to accept.
 - Rollback: `RPCE_INDEX_STORE=on`, or revert the commit.
-- Step 3 — todo | rounds 0/2 | open: — | downgraded: — | assumed: no editor reads the SwiftPM index store (Q1) | deferred: —
+- Step 3 — done | rounds 0/2 | open: — | downgraded: — | assumed: Q1 no known index-store consumer (owner question timed out; repo/host probe only) | deferred: OracleB S3-2–S3-5 optional normalization/diagnostics/other-tree cleanup/helper reuse; advisory timing owner acceptance
 
 ### Step 4 — Owner summary and closure (~0.5 h)
 - Change: add a short results paragraph to this plan's Status (verdicts and medians with ranges only), then move the plan to `docs/context/plans/completed/`. Record any durable fact in `development.md`.

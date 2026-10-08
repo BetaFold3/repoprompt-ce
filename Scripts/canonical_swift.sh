@@ -36,15 +36,32 @@ if [[ -n "${TOOLCHAINS:-}" ]]; then
     swift_env+=("TOOLCHAINS=$TOOLCHAINS")
 fi
 
+# Index store policy (RPCE_INDEX_STORE=on|off; unset means off). No known
+# consumer reads SwiftPM's index store, so qualified debug build/test
+# invocations get --disable-index-store; on adds nothing. Any other value,
+# including the empty string, exits 2 before Swift. The policy variable never
+# reaches Swift (env -i); only argv changes, so toggling costs one rebuild.
+if [[ -z "${RPCE_INDEX_STORE+set}" ]]; then
+    index_policy=off
+else
+    index_policy="$RPCE_INDEX_STORE"
+fi
+if [[ "$index_policy" != on && "$index_policy" != off ]]; then
+    echo "canonical_swift.sh: RPCE_INDEX_STORE must be 'on' or 'off' (unset means off); got '$index_policy'" >&2
+    exit 2
+fi
+
 # Xcode 27 / Swift 6.4 defaults to swiftbuild, whose .build/out layout and
 # cached XCFramework diagnostics differ from the native SwiftPM engine used by
 # our packaging and XCTest artifact tooling. Keep build, test (including list
 # and --skip-build), and --show-bin-path on the same explicit engine.
+index_candidate=""
 case "${1:-}" in
     build|test)
         swift_command="$1"
         shift
         set -- "$swift_command" --build-system native "$@"
+        index_candidate=1
         ;;
 esac
 
@@ -75,5 +92,30 @@ case "$dsym_effective" in
         exit 70
         ;;
 esac
+
+# Index eligibility is the dSYM debug-skip qualification (debug configuration,
+# no Sentry), independent of the requested dSYM policy. Effective on is
+# ambiguous, so re-ask the same classifier with only RPCE_DEBUG_DSYM=off for
+# that one quiet subprocess; the single banner above stays authoritative.
+if [[ "$index_policy" == off && -n "$index_candidate" ]]; then
+    index_effective="$dsym_effective"
+    if [[ "$dsym_effective" == on ]]; then
+        index_effective="$(RPCE_DEBUG_DSYM=off "$dsym_python" -I -S "$(dirname "${BASH_SOURCE[0]}")/debug_dsym.py" wrapper-policy -- "$@" 2>/dev/null)" || {
+            index_status=$?
+            echo "canonical_swift.sh: index store eligibility classification failed (exit $index_status)" >&2
+            exit "$index_status"
+        }
+    fi
+    case "$index_effective" in
+        off)
+            set -- "$1" "$2" "$3" --disable-index-store "${@:4}"
+            ;;
+        on) ;;
+        *)
+            echo "canonical_swift.sh: unexpected index store eligibility result '$index_effective'" >&2
+            exit 70
+            ;;
+    esac
+fi
 
 exec /usr/bin/env -i "${swift_env[@]}" /usr/bin/swift "$@"
