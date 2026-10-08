@@ -396,6 +396,7 @@ allowed_tracked_docs=(
   "docs/context/plans/2026-10-03-oracle-shim-auth-and-knowledge-workers-plan.md"
   "docs/context/plans/2026-10-03-oracle-failure-inspection-plan.md"
   "docs/context/plans/completed/2026-10-04-swift-build-measurement-and-debug-dsym-plan.md"
+  "docs/context/plans/2026-10-08-swift-compile-follow-ups-plan.md"
   "docs/context/oracle-failure-inspection.md"
   "docs/context/plans/agent-focus-delivery-reliability.md"
   "docs/context/plans/agent-mode-qol-shortcut-focus-toolbar-motion.md"
