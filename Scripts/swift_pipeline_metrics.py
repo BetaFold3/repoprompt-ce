@@ -351,7 +351,7 @@ _ANSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]|\x1b[@-Z\\-_]")
 _EVENT_ENCODER = json.JSONEncoder(separators=(",", ":"), ensure_ascii=False)
 _LEADING_ANSI_RE = re.compile(r"(?:\x1b\[[0-?]*[ -/]*[@-~]|\x1b[@-Z\\-_])+")
 # First visible characters that can begin a marker (see ``classify_record``).
-_MARKER_FIRST_CHARS = frozenset("[$+=BT \t")
+_MARKER_FIRST_CHARS = frozenset("[$+=BTr \t")
 _STEP_RE = re.compile(r"\[(\d+)/(\d+)\] (\S+)(?: (.*))?$")
 _BUILD_COMPLETE_RE = re.compile(r"Build (?:of product '([^']*)' )?complete! \((\d+(?:\.\d+)?)s\)")
 _SUITE_RE = re.compile(
@@ -381,6 +381,7 @@ K_SUITE = "suite"
 K_METHOD = "method"
 K_EXECUTED = "executed"
 K_PCM_WARNING = "pcm_warning"
+K_DSYM_POLICY = "dsym_policy"
 BUILD_STEP_KINDS = frozenset({K_PLANNING, K_WRITE, K_COMPILE, K_EMIT_MODULE, K_LINK, K_STEP})
 
 
@@ -467,6 +468,10 @@ def classify_record(text: str) -> Marker | None:
         if match is not None:
             return Marker(K_BUILD_COMPLETE, name=match.group(1) or "", seconds=match.group(2))
         return None
+    if first == "r":
+        if text.startswith(DSYM_BANNER_PREFIX):
+            return Marker(K_DSYM_POLICY, text=text)
+        return _pcm_marker(text)
     if first == "T":
         if text.startswith("Test Suite '"):
             match = _SUITE_RE.match(text)
@@ -482,6 +487,28 @@ def classify_record(text: str) -> Marker | None:
 
 
 _PCM_MARKER = Marker(K_PCM_WARNING)
+
+# Step 10: ``Scripts/canonical_swift.sh`` prints exactly one authoritative
+# ``rpce-debug-dsym: requested=<on|off> effective=<on|off> reason=<token>
+# configuration=<token> ...`` line per eligible Swift invocation. It is the
+# only source of a segment's ``dsymPolicy``: no filesystem inference.
+DSYM_BANNER_PREFIX = "rpce-debug-dsym: "
+DSYM_POLICY_UNKNOWN = "unknown"  # a malformed banner
+DSYM_POLICY_MIXED = "mixed"  # distinct banners inside one segment
+_DSYM_BANNER_RE = re.compile(
+    r"rpce-debug-dsym: requested=(on|off) effective=(on|off) reason=([a-z_]{1,40}) "
+    r"configuration=(debug|release|unknown|conflicting|malformed)(?: warning=skip-not-applied)?"
+    r"(?: \([^()\r\n]{0,200}\))?$"
+)
+
+
+def parse_dsym_banner(text: str) -> dict[str, str] | str:
+    """The banner's exact ``requested``/``effective``/``reason``, or ``"unknown"`` when malformed."""
+    match = _DSYM_BANNER_RE.match(text.rstrip("\r\n"))
+    if match is None:
+        return DSYM_POLICY_UNKNOWN
+    requested, effective, reason, _configuration = match.groups()
+    return {"requested": requested, "effective": effective, "reason": reason}
 
 
 def _pcm_marker(text: str) -> Marker | None:
@@ -599,7 +626,7 @@ class _Segment:
         "reported_build_ns", "build_product", "compile_records", "write_records",
         "modules", "modules_dropped", "first_suite_ns", "first_suite_printed", "suite_depth",
         "xctest_end_ns", "xctest_end_printed", "first_method_ns", "suites_started",
-        "executed_reported_ns", "pcm_warnings",
+        "executed_reported_ns", "pcm_warnings", "dsym_policy",
     )
 
     def __init__(self, index: int, opened_by: str, command: str | None, context: str | None, open_ns: int) -> None:
@@ -629,6 +656,7 @@ class _Segment:
         self.suites_started = 0
         self.executed_reported_ns: int | None = None
         self.pcm_warnings = 0
+        self.dsym_policy: dict[str, str] | str | None = None
 
     @property
     def has_build_activity(self) -> bool:
@@ -1047,6 +1075,14 @@ class PipelineRecorder:
         elif kind == K_PCM_WARNING:
             segment.pcm_warnings += 1
             self._emit("pcm_warning", ns, segment=segment.index)
+        elif kind == K_DSYM_POLICY:
+            if segment.in_xctest:
+                return  # test output, not the wrapper
+            policy = parse_dsym_banner(marker.text)
+            if segment.dsym_policy is None:
+                segment.dsym_policy = policy
+            elif segment.dsym_policy != policy:
+                segment.dsym_policy = DSYM_POLICY_MIXED
 
     def _module(self, segment: _Segment, module: str) -> _ModuleAggregate | None:
         aggregate = segment.modules.get(module)
@@ -1158,8 +1194,9 @@ class PipelineRecorder:
             "modulesPartial": segment.modules_dropped > 0,
             "compiledFilesExact": segment.modules_dropped == 0 and all(agg.exact for agg in segment.modules.values()),
             "pcmWarnings": segment.pcm_warnings,
-            # Step 10 fills these; ``None`` means unknown, never a default policy.
-            "dsymPolicy": self._dsym_policy,
+            # Step 10: the wrapper banner's exact policy; ``None`` means no banner
+            # was observed (unknown), never a default policy.
+            "dsymPolicy": segment.dsym_policy if segment.dsym_policy is not None else self._dsym_policy,
             "symbolEvidence": None,
         }
 

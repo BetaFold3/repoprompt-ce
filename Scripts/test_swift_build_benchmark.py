@@ -375,7 +375,8 @@ class RequestValidationTests(unittest.TestCase):
         patches = dict(validate_request=[bench.SCENARIOS["null-test"]], load_fixture_manifest={},
                        collect_host=dict(FIXTURE_HOST), thermal_state="nominal",
                        resolve_main_repo=(Path("/nonexistent-main"), {}), git_ok="abc",
-                       verify_probe_membership={}, check_capabilities={}, load_conductor=object(),
+                       verify_probe_membership={}, check_capabilities={}, check_full_dsym_target=None,
+                       load_conductor=object(),
                        benchmark_root=Path("/nonexistent-bench"))
         for error, expected in ((TypeError("unhashable"), bench.EXIT_HARNESS_FAILURE),
                                 (KeyboardInterrupt(), KeyboardInterrupt), (SystemExit(9), SystemExit)):
@@ -2605,6 +2606,59 @@ class BoundaryTests(unittest.TestCase):
         text = (bench.REPO_ROOT / "Scripts" / "conductor.py").read_text()
         self.assertIn(bench.DIAG_ROUTE_MARKER, text)
         self.assertIn(bench.DIAG_CLI_FLAG, text)
+
+    def test_default_skip_targets_are_refused_and_legacy_full_targets_accepted(self):
+        """A Step 10 default-skip wrapper would run unset (= off) arms labeled full/on: refuse it."""
+        commit = ["-c", "user.email=t@e", "-c", "user.name=t", "-c", "commit.gpgsign=false", "commit", "-q"]
+        legacy = "#!/bin/bash\nexec /usr/bin/env -i \"${swift_env[@]}\" /usr/bin/swift \"$@\"\n"
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            git(["init", "-q"], repo)
+            with self.assertRaisesRegex(bench.HarnessError, "no readable"):
+                bench.check_full_dsym_target(repo, "HEAD")
+            (repo / "Scripts").mkdir()
+            (repo / "Scripts" / "canonical_swift.sh").write_text(legacy)
+            git(["add", "-A"], repo)
+            git([*commit, "-m", "legacy"], repo)
+            legacy_rev = git(["rev-parse", "HEAD"], repo).strip()
+            (repo / "Scripts" / "canonical_swift.sh").write_text(
+                "#!/bin/bash\nswift_env+=(\"SWIFT_DRIVER_DSYMUTIL_EXEC=/usr/bin/true\")\n" + legacy)
+            git([*commit, "-am", "skip"], repo)
+            skip_rev = git(["rev-parse", "HEAD"], repo).strip()
+            (repo / "Scripts" / "canonical_swift.sh").write_text(legacy)
+            (repo / "Scripts" / "debug_dsym.py").write_text("# helper\n")
+            git(["add", "-A"], repo)
+            git([*commit, "-m", "helper"], repo)
+            helper_rev = git(["rev-parse", "HEAD"], repo).strip()
+            self.assertIsNone(bench.check_full_dsym_target(repo, legacy_rev))
+            for rev in (skip_rev, helper_rev):
+                with self.subTest(rev=rev), self.assertRaisesRegex(bench.HarnessError, "private lean Step 10 recipe"):
+                    bench.check_full_dsym_target(repo, rev)
+            patches = dict(validate_request=[bench.SCENARIOS["null-test"]], load_fixture_manifest={},
+                           collect_host=dict(FIXTURE_HOST), thermal_state="nominal",
+                           resolve_main_repo=(repo, {}), git_ok=skip_rev, verify_probe_membership={},
+                           check_capabilities={})
+            with mock.patch.multiple(bench, **{name: mock.DEFAULT for name in patches}) as mocks, \
+                    mock.patch.object(bench, "load_conductor", side_effect=AssertionError("mutation path reached")), \
+                    mock.patch.object(bench, "WorktreeOwner", side_effect=AssertionError("mutation path reached")), \
+                    mock.patch("sys.stderr") as stderr:
+                for name, value in patches.items():
+                    mocks[name].return_value = value
+                self.assertEqual(bench.main(["run", "--instrumentation", "full"]), bench.EXIT_HARNESS_FAILURE)
+            self.assertIn("skips debug dSYM generation by default",
+                          "".join(str(call.args[0]) for call in stderr.write.call_args_list if call.args))
+
+    def test_the_accepted_legacy_full_baseline_stays_supported(self):
+        accepted = "d8c5c6abc93b7d30ef85db4b160e96e013e78478"
+        present = subprocess.run(["git", "cat-file", "-e", f"{accepted}^{{commit}}"], cwd=str(bench.REPO_ROOT),
+                                 capture_output=True).returncode == 0
+        if not present:
+            self.skipTest("accepted legacy baseline commit is not in this clone")
+        self.assertIsNone(bench.check_full_dsym_target(bench.REPO_ROOT, accepted))
+
+    def test_the_working_wrapper_is_recognized_as_default_skip(self):
+        text = (bench.REPO_ROOT / "Scripts" / "canonical_swift.sh").read_text()
+        self.assertTrue(any(marker in text for marker in bench.DEFAULT_SKIP_WRAPPER_MARKERS))
 
 
 class ExtractTests(unittest.TestCase):

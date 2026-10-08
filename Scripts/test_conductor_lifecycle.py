@@ -90,15 +90,17 @@ class LifecycleTestCase(unittest.TestCase):
 
 class LifecycleQueueTests(LifecycleTestCase):
     def test_protocol_version_bump_replaces_older_daemons(self) -> None:
-        self.assertEqual(conductor.PROTOCOL_VERSION, 15)
+        # 16: Step 10 adds the `dsym` operation and forwards RPCE_DEBUG_DSYM; an
+        # idle protocol-15 daemon would reject one and silently drop the other.
+        self.assertEqual(conductor.PROTOCOL_VERSION, 16)
 
-    def test_ensure_daemon_stops_and_replaces_idle_protocol_3_daemon(self) -> None:
+    def test_ensure_daemon_stops_and_replaces_idle_protocol_15_daemon(self) -> None:
         tmp, state = self.make_state()
         self.addCleanup(tmp.cleanup)
         fake_proc = mock.Mock()
         fake_proc.poll.return_value = None
         old_payload = {
-            "protocolVersion": 3,
+            "protocolVersion": 15,
             "runningJobs": [],
             "queuedJobs": [],
         }
@@ -137,7 +139,7 @@ class LifecycleQueueTests(LifecycleTestCase):
             requests.append(message)
             if message["type"] == "status":
                 return {
-                    "protocolVersion": 3,
+                    "protocolVersion": 15,
                     "runningJobs": [],
                     "queuedJobs": [],
                 }
@@ -171,7 +173,7 @@ class LifecycleQueueTests(LifecycleTestCase):
             if len(requests) == 1:
                 raise conductor.ConductorError("down before start lock")
             return {
-                "protocolVersion": 3,
+                "protocolVersion": 15,
                 "runningJobs": [{"ticket": "active"}],
                 "queuedJobs": [],
             }
@@ -6840,6 +6842,121 @@ class RuntimeLedgerCacheTests(LifecycleTestCase):
                 request = {"operation": operation, "args": {"filter": "X"}, "timeout": None, "verbose": False, "env": {}}
                 _argv, lanes, _cwd, _env, _timeout = state.registry.prepare(request)
                 self.assertIn("build", lanes, operation)
+
+
+# ---------------------------------------------------------------------------
+# Step 10 (lean): debug dSYM policy forwarding and ticket-preserving ``dsym`` dispatch.
+
+
+class DebugSymbolPolicyTests(LifecycleTestCase):
+    def setUp(self) -> None:
+        super().setUp()
+        self.tmp, self.state = self.make_state()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = self.state.paths.repo_root
+
+    def test_unset_and_off_are_one_request_identity_and_child_value(self) -> None:
+        registry = self.state.registry
+        base = {"operation": "swift-build", "args": {"product": "RepoPrompt"}, "timeout": None, "verbose": False}
+        unset, off, on = (dict(base, env=env) for env in ({}, {"RPCE_DEBUG_DSYM": "off"}, {"RPCE_DEBUG_DSYM": "on"}))
+        self.assertEqual(registry._request_env_snapshot(unset)["RPCE_DEBUG_DSYM"], "off")
+        self.assertEqual(registry.fingerprint(unset), registry.fingerprint(off))
+        self.assertNotEqual(registry.fingerprint(unset), registry.fingerprint(on))
+        self.assertEqual(registry.prepare(unset)[3]["RPCE_DEBUG_DSYM"], "off")
+        self.assertEqual(registry.prepare(on)[3]["RPCE_DEBUG_DSYM"], "on")
+        self.assertIn("RPCE_DEBUG_DSYM", conductor.OperationRegistry.PASSTHROUGH_ENV_KEYS)
+        # Ticket and candidate identity never include the policy: no new artifact env gate.
+        self.assertNotIn("RPCE_DEBUG_DSYM", conductor.artifact_env_gates({"RPCE_DEBUG_DSYM": "on"}))
+        self.assertNotIn("RPCE_DEBUG_DSYM", conductor.PARALLEL_XCTEST_RUNTIME_GATE_KEYS)
+
+    def test_conductor_policy_constants_match_the_helper(self) -> None:
+        import debug_dsym
+
+        self.assertEqual(conductor.DEBUG_DSYM_POLICY_ENV_KEY, debug_dsym.POLICY_ENV_KEY)
+        self.assertEqual(conductor.DEBUG_DSYM_POLICY_VALUES, debug_dsym.POLICY_VALUES)
+        self.assertEqual(conductor.DEBUG_DSYM_PRODUCTS, debug_dsym.PRODUCT_SELECTORS)
+        self.assertEqual(conductor.DEBUG_SYMBOL_POLICY_EXIT_CODE, debug_dsym.POLICY_EXIT_INVALID)
+
+    def test_invalid_policy_is_rejected_in_the_client_and_at_enqueue(self) -> None:
+        for value in ("", "ON", "1", "skip"):
+            with self.subTest(value=value):
+                with mock.patch.dict(os.environ, {"RPCE_DEBUG_DSYM": value}):
+                    with self.assertRaises(conductor.DebugSymbolPolicyError):
+                        conductor.OperationRegistry.client_env_snapshot()
+                with mock.patch.object(self.state, "_schedule_locked"), \
+                        self.assertRaises(conductor.DebugSymbolPolicyError):
+                    self.state.enqueue({"type": "enqueue", "operation": "swift-build",
+                                        "args": {"product": "RepoPrompt"}, "env": {"RPCE_DEBUG_DSYM": value}})
+                self.assertEqual(self.state.jobs, {})
+
+    def test_client_rejects_an_invalid_policy_with_exit_2_before_contacting_a_daemon(self) -> None:
+        with (
+            mock.patch.dict(os.environ, {"RPCE_DEBUG_DSYM": "maybe"}),
+            mock.patch.object(conductor, "ensure_daemon") as ensure,
+            mock.patch.object(conductor, "request_daemon") as request,
+            mock.patch.object(conductor, "compute_paths", return_value=self.state.paths),
+            contextlib.redirect_stderr(io.StringIO()) as stderr,
+        ):
+            code = conductor.cli_main(["swift-build", "--product", "RepoPrompt"])
+            sleep_code = conductor.cli_main(["sleep", "0", "--lane", "build"])
+        self.assertEqual((code, sleep_code), (2, 2))
+        ensure.assert_not_called()
+        request.assert_not_called()
+        self.assertIn("RPCE_DEBUG_DSYM must be 'on' or 'off'", stderr.getvalue())
+
+    def test_dsym_resources_argv_and_ticket_policy(self) -> None:
+        request = {"operation": "dsym", "args": {"product": "root-tests"}, "timeout": None, "verbose": False, "env": {}}
+        argv, lanes, cwd, env, _timeout = self.state.registry.prepare(request)
+        self.assertEqual(lanes, ["build"])
+        self.assertEqual(cwd, self.root)
+        self.assertEqual(argv, [sys.executable, "-I", "-B", str(self.root / "Scripts" / "debug_dsym.py"), "regenerate",
+                                "--product", "root-tests", "--package-root", str(self.root)])
+        self.assertEqual(env["RPCE_DEBUG_DSYM"], "off")
+        self.assertTrue(conductor.operation_requires_global_heavy_slot("dsym", {}))
+        self.assertFalse(conductor.operation_requires_global_xctest_slot("dsym", {}))
+        self.assertFalse(conductor.operation_invalidates_root_build_ticket("dsym", {"product": "all"}))
+        with self.assertRaises(conductor.ConductorError):
+            self.state.registry.prepare(dict(request, args={"product": "everything"}))
+
+    def test_dsym_dispatch_preserves_the_root_build_ticket(self) -> None:
+        scripts = self.root / "Scripts"
+        scripts.mkdir()
+        shutil.copy2(SCRIPT_DIR / "debug_dsym.py", scripts / "debug_dsym.py")
+        ticket_path = self.state.paths.jobs_dir / "build-ticket-root.json"
+        conductor.write_build_ticket(ticket_path, {"ticket_id": "keep"})
+        before = ticket_path.read_bytes()
+        job = self.make_job(self.state, "dsym-job", "dsym", {"product": "all"}, ["build"], job_state="running")
+        self.state.jobs[job.ticket] = job
+        with (
+            mock.patch.object(conductor, "operation_requires_global_heavy_slot", return_value=False),
+            mock.patch.object(self.state, "_xctest_watchdog_enabled", return_value=False),
+        ):
+            self.state._run_job(job.ticket)
+        # No native debug build exists here: regeneration fails without building anything.
+        self.assertEqual((job.state, job.exit_code), ("failed", 1), job.result_summary)
+        self.assertEqual(ticket_path.read_bytes(), before)
+        self.assertIn("no native debug build exists", job.log_path.read_text(encoding="utf-8"))
+        self.assertFalse((self.root / ".build").exists())
+
+    def test_dsym_cli_parsing(self) -> None:
+        captured: dict = {}
+
+        def capture(_paths, operation, args, _flags, *rest):
+            captured[operation] = dict(args)
+            return 0
+
+        with mock.patch.object(conductor, "enqueue_and_maybe_wait", side_effect=capture):
+            conductor.handle_real_operation(self.state.paths, "dsym", [])
+        self.assertEqual(captured, {"dsym": {"product": "all"}})
+        with mock.patch.object(conductor, "enqueue_and_maybe_wait", side_effect=capture):
+            conductor.handle_real_operation(self.state.paths, "dsym", ["--product", "repoprompt-mcp"])
+        self.assertEqual(captured["dsym"], {"product": "repoprompt-mcp"})
+        with mock.patch.object(conductor, "enqueue_and_maybe_wait") as never, self.assertRaises(SystemExit), \
+                contextlib.redirect_stderr(io.StringIO()):
+            conductor.handle_real_operation(self.state.paths, "dsym", ["--product", "everything"])
+        never.assert_not_called()
+        self.assertIn("dsym", conductor.IMPLEMENTED_OPERATIONS)
+        self.assertNotIn("dsym-check", conductor.IMPLEMENTED_OPERATIONS)
 
 
 if __name__ == "__main__":

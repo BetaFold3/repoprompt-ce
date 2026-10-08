@@ -601,6 +601,100 @@ class CanonicalSwiftCommandTests(unittest.TestCase):
                 self.assertEqual(argv[swift_index + 1:], expected)
                 self.assertEqual(argv[:2], ["/usr/bin/env", "-i"])
 
+    # Step 10: debug dSYM policy in the wrapper (classifier, banner, exact hook only).
+
+    def run_wrapper(self, arguments, extra_env=None, wrapper=None):
+        env = {key: value for key, value in os.environ.items()
+               if key not in {"RPCE_DEBUG_DSYM", "REPOPROMPT_ENABLE_SENTRY", "SWIFT_DRIVER_DSYMUTIL_EXEC"}}
+        env.update(extra_env or {})
+        result = subprocess.run(
+            [
+                "/bin/bash", "-c",
+                'exec() { printf "%s\\0" "$@"; }; wrapper="$1"; shift; source "$wrapper" "$@"',
+                "canonical-swift-test", str(wrapper or SCRIPT_DIR / "canonical_swift.sh"), *arguments,
+            ],
+            check=False, capture_output=True, env=env,
+        )
+        argv = result.stdout.decode().split("\0")[:-1]
+        if not argv:
+            return result, None, []
+        swift_index = argv.index("/usr/bin/swift")
+        return result, argv[2:swift_index], argv[swift_index + 1:]
+
+    def test_unset_policy_is_debug_skip_with_the_exact_hook_and_one_banner(self) -> None:
+        result, child_env, swift_args = self.run_wrapper(["build", "--product", "RepoPrompt"],
+                                                         {"SWIFT_DRIVER_DSYMUTIL_EXEC": "/caller/value"})
+        self.assertEqual(result.returncode, 0)
+        hooks = [item for item in child_env if item.startswith("SWIFT_DRIVER_DSYMUTIL_EXEC=")]
+        self.assertEqual(hooks, ["SWIFT_DRIVER_DSYMUTIL_EXEC=/usr/bin/true"])
+        self.assertFalse(any(item.startswith("RPCE_DEBUG_DSYM=") for item in child_env))
+        self.assertEqual(swift_args, ["build", "--build-system", "native", "--product", "RepoPrompt"])
+        stderr = result.stderr.decode()
+        self.assertEqual(stderr.count("rpce-debug-dsym:"), 1)
+        self.assertIn("requested=off effective=off reason=debug_skip", stderr)
+        self.assertNotIn(b"rpce-debug-dsym", result.stdout)
+
+    def test_eligible_debug_invocations_share_one_child_environment(self) -> None:
+        environments = set()
+        for arguments in (["build", "--product", "RepoPrompt"], ["build", "--build-tests"], ["build", "--show-bin-path"],
+                          ["test", "list", "--skip-build"], ["test", "--skip-build", "--filter", "X"],
+                          ["build", "-c", "debug", "--product", "repoprompt-mcp"]):
+            for extra in ({}, {"RPCE_DEBUG_DSYM": "off"}):
+                with self.subTest(arguments=arguments, extra=extra):
+                    result, child_env, _ = self.run_wrapper(arguments, extra)
+                    self.assertEqual(result.returncode, 0)
+                    environments.add(tuple(child_env))
+        self.assertEqual(len(environments), 1)
+
+    def test_full_environment_cases_add_no_hook(self) -> None:
+        cases = (
+            (["build"], {"RPCE_DEBUG_DSYM": "on"}, "reason=requested_on", False),
+            (["build", "-c", "release", "--product", "RepoPrompt"], {}, "reason=configuration_release", True),
+            (["build", "-c", "debug", "-c", "release"], {"RPCE_DEBUG_DSYM": "off"}, "reason=configuration_conflicting", True),
+            (["build", "--unknown-option", "x"], {}, "reason=configuration_unknown", True),
+            (["build"], {"REPOPROMPT_ENABLE_SENTRY": "1"}, "reason=sentry", True),
+        )
+        for arguments, extra, reason, warned in cases:
+            with self.subTest(arguments=arguments, extra=extra):
+                result, child_env, swift_args = self.run_wrapper(arguments, extra)
+                self.assertEqual(result.returncode, 0)
+                self.assertFalse(any(item.startswith("SWIFT_DRIVER_DSYMUTIL_EXEC=") for item in child_env))
+                self.assertFalse(any(item.startswith("RPCE_DEBUG_DSYM=") for item in child_env))
+                stderr = result.stderr.decode()
+                self.assertIn(reason, stderr)
+                self.assertEqual("warning=skip-not-applied" in stderr, warned)
+                self.assertEqual(swift_args[0], arguments[0])
+        _, sentry_env, _ = self.run_wrapper(["build"], {"REPOPROMPT_ENABLE_SENTRY": "1"})
+        self.assertIn("REPOPROMPT_ENABLE_SENTRY=1", sentry_env)
+
+    def test_invalid_policy_exits_2_before_swift(self) -> None:
+        for value in ("", "ON", "true", "skip"):
+            with self.subTest(value=value):
+                result, child_env, _ = self.run_wrapper(["build"], {"RPCE_DEBUG_DSYM": value})
+                self.assertEqual(result.returncode, 2)
+                self.assertIsNone(child_env)
+                self.assertIn(b"must be 'on' or 'off'", result.stderr)
+
+    def test_classifier_failure_fails_before_swift(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            wrapper = Path(tmp) / "canonical_swift.sh"
+            wrapper.write_bytes((SCRIPT_DIR / "canonical_swift.sh").read_bytes())
+            result, child_env, _ = self.run_wrapper(["build"], wrapper=wrapper)  # no adjacent helper
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIsNone(child_env)
+            (Path(tmp) / "debug_dsym.py").write_text("import sys\nprint('maybe')\n")
+            result, child_env, _ = self.run_wrapper(["build"], wrapper=wrapper)
+            self.assertEqual(result.returncode, 70)
+            self.assertIsNone(child_env)
+
+    def test_final_exec_line_is_unchanged_and_the_wrapper_never_touches_symbols(self) -> None:
+        text = (SCRIPT_DIR / "canonical_swift.sh").read_text()
+        lines = [line for line in text.splitlines() if line.strip()]
+        self.assertEqual(lines[-1], 'exec /usr/bin/env -i "${swift_env[@]}" /usr/bin/swift "$@"')
+        code = "\n".join(line for line in lines if not line.lstrip().startswith("#"))
+        for forbidden in ("rm ", "rmdir", "mv ", "xcrun", "dsymutil ", "find "):
+            self.assertNotIn(forbidden, code)
+
 
 class JobTicketEnvEligibilityTests(unittest.TestCase):
     def test_direct_swift_invocations_do_not_receive_job_ticket_env(self) -> None:
@@ -811,7 +905,7 @@ class PhaseTimingIntegrationTests(unittest.TestCase):
         status = state.status_payload()
         self.assertEqual(status["conductorDigest"], conductor.CONDUCTOR_DIGEST)
         self.assertTrue(status["timingEnabled"])
-        self.assertEqual(status["protocolVersion"], 15)
+        self.assertEqual(status["protocolVersion"], 16)
         self.assertFalse(self.make_state("off", timing="off").status_payload()["timingEnabled"])
 
     def test_observed_pump_preserves_raw_bytes_tail_and_progress_for_every_stream(self) -> None:

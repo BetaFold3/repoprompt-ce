@@ -178,7 +178,7 @@ def generated_job_file_ticket(name: str) -> Optional[str]:
     return None
 
 
-PROTOCOL_VERSION = 15
+PROTOCOL_VERSION = 16
 TERMINAL_STATES = {"completed", "failed", "canceled"}
 LANE_NAMES = {"build", "debugArtifact", "liveApp", "release", "style"}
 LOG_TAIL_LINES = 30
@@ -278,6 +278,7 @@ IMPLEMENTED_OPERATIONS = {
     "check-format-tools",
     "install-format-tools",
     "swift-build",
+    "dsym",
     "build",
     "package",
     "test",
@@ -330,6 +331,7 @@ Operation commands:
   ./conductor check-format-tools     # fail if style tools are missing
   ./conductor install-format-tools   # explicit Homebrew install of missing style tools
   ./conductor swift-build --product RepoPrompt|repoprompt-mcp|repoprompt-gateway|all
+  ./conductor dsym [--product all|RepoPrompt|repoprompt-mcp|repoprompt-gateway|root-tests]   # regenerate debug dSYMs; never builds
   ./conductor build [--fast]
   ./conductor package debug|release
   ./conductor test [--list | --filter <filter>] [--test-product <product>] [--no-xctest-deadlines] [--xctest-stall-seconds <seconds>] [--xctest-stall-wake-probe]
@@ -363,6 +365,11 @@ Global operation flags:
   --timeout <seconds>  override operation timeout
   --verbose            execution verbosity: pass VERBOSE=1 to delegated scripts where applicable
   --full-log           human output rendering: replay raw full job log at completion
+
+Debug symbols:
+  RPCE_DEBUG_DSYM=on|off (unset means off) skips dSYM generation for debug Swift builds only;
+    release, Sentry and unrecognized configurations keep full symbols; any other value exits 2
+  on affects future links only; dsym regenerates symbols for existing debug binaries
 
 XCTest controls:
   deadlines default on; disable with --no-xctest-deadlines or REPOPROMPT_DEV_XCTEST_DEADLINES=0
@@ -398,6 +405,30 @@ class FilterPreflightError(ConductorError):
 
 class ArtifactUnavailableError(ConductorError):
     pass
+
+
+class DebugSymbolPolicyError(ConductorError):
+    """``RPCE_DEBUG_DSYM`` is invalid; rejected (exit 2) before any mutation."""
+
+
+# Step 10 debug dSYM policy switch. ``Scripts/debug_dsym.py`` owns classification
+# (its POLICY_VALUES must equal these); the conductor only validates, forwards and
+# normalizes the request value so unset and ``off`` are one request identity.
+DEBUG_DSYM_POLICY_ENV_KEY = "RPCE_DEBUG_DSYM"
+DEBUG_DSYM_POLICY_VALUES = ("on", "off")
+DEBUG_DSYM_PRODUCTS = ("all", "RepoPrompt", "repoprompt-mcp", "repoprompt-gateway", "root-tests")
+DEBUG_SYMBOL_POLICY_EXIT_CODE = 2
+
+
+def normalize_debug_dsym_policy(env: Mapping[str, str]) -> str:
+    """The normalized ``RPCE_DEBUG_DSYM`` (unset -> ``off``) or DebugSymbolPolicyError."""
+    value = env.get(DEBUG_DSYM_POLICY_ENV_KEY)
+    if value is None:
+        return "off"
+    if value in DEBUG_DSYM_POLICY_VALUES:
+        return value
+    shown = repr(value) if len(value) <= 32 else repr(value[:32]) + "..."
+    raise DebugSymbolPolicyError(f"{DEBUG_DSYM_POLICY_ENV_KEY} must be 'on' or 'off' (unset means off); got {shown}")
 
 
 XCTEST_PROGRESS_RE = re.compile(
@@ -2729,7 +2760,10 @@ def operation_invalidates_root_build_ticket(operation: str, args: Dict[str, Any]
 
 
 def operation_requires_global_heavy_slot(operation: str, args: Dict[str, Any]) -> bool:
-    if operation in {"swift-build", "build", "package", "test", "test-parallel", "provider-test", "core-test", "install-debug-cli"}:
+    if operation in {
+        "swift-build", "dsym", "build", "package", "test", "test-parallel", "provider-test", "core-test",
+        "install-debug-cli",
+    }:
         return True
     if operation in {"sleep", "fake-sleep"} and "build" in set(args.get("lanes") or []):
         return True
@@ -3009,6 +3043,8 @@ class OperationRegistry:
         "REPOPROMPT_DEV_HEAVY_SLOTS",
         "REPOPROMPT_DEV_XCTEST_SLOTS",
     ]
+    # Step 10: validated in the client and normalized (unset -> "off") in every request snapshot.
+    DEBUG_SYMBOL_ENV_KEYS = [DEBUG_DSYM_POLICY_ENV_KEY]
     TELEMETRY_ENV_KEYS = [
         "REPOPROMPT_ENABLE_SENTRY",
         "REPOPROMPT_SENTRY_DSN",
@@ -3027,6 +3063,7 @@ class OperationRegistry:
             + STYLE_ENV_KEYS
             + TEST_ENV_KEYS
             + CONDUCTOR_ENV_KEYS
+            + DEBUG_SYMBOL_ENV_KEYS
             + TELEMETRY_ENV_KEYS
         )
     )
@@ -3043,6 +3080,7 @@ class OperationRegistry:
             value = os.environ.get(key)
             if value is not None:
                 snapshot[key] = value
+        normalize_debug_dsym_policy(snapshot)  # Step 10: reject an invalid policy before any request
         return snapshot
 
     @classmethod
@@ -3058,6 +3096,8 @@ class OperationRegistry:
             if not isinstance(value, str):
                 raise ConductorError(f"request env value for {key} must be a string")
             snapshot[key] = value
+        # Step 10: unset and "off" are one identity (fingerprint, job env, child env).
+        snapshot[DEBUG_DSYM_POLICY_ENV_KEY] = normalize_debug_dsym_policy(snapshot)
         return snapshot
 
     def prepare(self, request: Dict[str, Any]) -> Tuple[List[str], List[str], Path, Dict[str, str], Optional[float]]:
@@ -3109,6 +3149,15 @@ class OperationRegistry:
             if product == "all":
                 return self._internal_argv("swift_build_all", {}), lanes, cwd, env, effective_timeout
             return [canonical_swift, "build", "--product", str(product)], lanes, cwd, env, effective_timeout
+        if operation == "dsym":
+            # Never builds and writes only adjacent dSYMs, outside every artifact
+            # fingerprint closure: the root build ticket stays valid.
+            product = args.get("product") or "all"
+            if product not in DEBUG_DSYM_PRODUCTS:
+                raise ConductorError(f"dsym --product must be one of {', '.join(DEBUG_DSYM_PRODUCTS)}")
+            argv = [sys.executable, "-I", "-B", script("debug_dsym.py"), "regenerate", "--product", str(product),
+                    "--package-root", str(self.repo_root)]
+            return argv, ["build"], cwd, env, effective_timeout
         if operation == "build":
             argv = [script("package_app.sh"), "debug"]
             if args.get("fastPackage"):
@@ -7365,6 +7414,7 @@ def handle_sleep_operation(paths: Paths, operation: str, argv: List[str]) -> int
     if invalid_lanes:
         raise ConductorError(f"unknown lane(s): {', '.join(invalid_lanes)}")
 
+    env_snapshot = OperationRegistry.client_env_snapshot()  # Step 10: validates before any daemon contact
     ensure_daemon(paths, start_if_needed=True)
     request = {
         "type": "enqueue",
@@ -7378,7 +7428,7 @@ def handle_sleep_operation(paths: Paths, operation: str, argv: List[str]) -> int
         "requestKey": global_flags.request_key,
         "timeout": global_flags.timeout,
         "verbose": global_flags.verbose,
-        "env": OperationRegistry.client_env_snapshot(),
+        "env": env_snapshot,
     }
     enqueue_payload = request_daemon(paths, request, timeout=10.0)
     if global_flags.async_mode:
@@ -8647,6 +8697,7 @@ def enqueue_and_maybe_wait(
     global_flags: argparse.Namespace,
     client_metrics: Optional[List[Dict[str, Any]]] = None,
 ) -> int:
+    env_snapshot = OperationRegistry.client_env_snapshot()  # Step 10: validates before any daemon contact
     ensure_daemon(paths, start_if_needed=True)
     request = {
         "type": "enqueue",
@@ -8655,7 +8706,7 @@ def enqueue_and_maybe_wait(
         "requestKey": global_flags.request_key,
         "timeout": global_flags.timeout,
         "verbose": global_flags.verbose,
-        "env": OperationRegistry.client_env_snapshot(),
+        "env": env_snapshot,
     }
     if client_metrics:
         # Advisory and outside the fingerprint material (request identity).
@@ -8725,6 +8776,11 @@ def handle_real_operation(paths: Paths, operation: str, argv: List[str]) -> int:
     elif operation == "swift-build":
         parser = argparse.ArgumentParser(prog="conductor swift-build")
         parser.add_argument("--product", required=True, choices=["RepoPrompt", "repoprompt-mcp", "repoprompt-gateway", "all"])
+        ns = parser.parse_args(rest)
+        args["product"] = ns.product
+    elif operation == "dsym":
+        parser = argparse.ArgumentParser(prog="conductor dsym")
+        parser.add_argument("--product", default="all", choices=list(DEBUG_DSYM_PRODUCTS))
         ns = parser.parse_args(rest)
         args["product"] = ns.product
     elif operation == "package":
@@ -8950,6 +9006,9 @@ def cli_main(argv: List[str]) -> int:
     except ArtifactUnavailableError as exc:
         print(f"conductor: {exc}", file=sys.stderr)
         return 65
+    except DebugSymbolPolicyError as exc:
+        print(f"conductor: {exc}", file=sys.stderr)
+        return DEBUG_SYMBOL_POLICY_EXIT_CODE
     except ConductorError as exc:
         print(f"conductor: {exc}", file=sys.stderr)
         return 1

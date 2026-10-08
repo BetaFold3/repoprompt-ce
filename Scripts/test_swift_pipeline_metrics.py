@@ -268,6 +268,62 @@ class ClassifierTests(unittest.TestCase):
         self.assertFalse(metrics.is_swift_command("/usr/bin/python3 /repo/Scripts/swift_style.sh.py"))
 
 
+class DsymPolicyTelemetryTests(unittest.TestCase):
+    """Step 10: each segment records the wrapper banner's exact effective policy; nothing is inferred."""
+
+    def segments(self, lines):
+        recorder = metrics.PipelineRecorder(origin_ns=0)
+        recorder.observe_records([metrics.OutputRecord(i, 10 + i, text, "lf") for i, text in enumerate(lines)])
+        return recorder.finalize()["segments"]
+
+    def build(self, argv, banner):
+        return [f"$ /r/Scripts/canonical_swift.sh {' '.join(argv)}", *([banner] if banner is not None else []),
+                "Building for debugging...", "Build complete! (0.10s)"]
+
+    def test_segments_record_the_wrapper_banner_policy(self) -> None:
+        import debug_dsym
+
+        cases = (
+            (["build"], None, None, ("off", "off", "debug_skip")),
+            (["build"], "off", None, ("off", "off", "debug_skip")),
+            (["build"], "on", None, ("on", "on", "requested_on")),
+            (["build"], "off", "1", ("off", "on", "sentry")),
+            (["build", "-c", "release"], None, None, ("off", "on", "configuration_release")),
+            (["build", "--brand-new-option", "x"], None, None, ("off", "on", "configuration_unknown")),
+            (["build", "-c"], None, None, ("off", "on", "configuration_malformed")),
+        )
+        lines = []
+        for argv, requested, sentry, _ in cases:
+            lines += self.build(argv, debug_dsym.classify_policy(argv, requested, sentry).banner())
+        policies = [segment["dsymPolicy"] for segment in self.segments(lines)]
+        self.assertEqual(policies, [dict(zip(("requested", "effective", "reason"), want)) for *_, want in cases])
+        # A release (or any full-environment) invocation is never labeled effective off.
+        self.assertEqual([policy["effective"] for policy in policies[3:]], ["on"] * 4)
+
+    def test_unknown_and_mixed_are_reported_never_invented(self) -> None:
+        good = "rpce-debug-dsym: requested=off effective=off reason=debug_skip configuration=debug"
+        lines = (self.build(["build"], None)
+                 + self.build(["build"], "rpce-debug-dsym: requested=maybe effective=off reason=x configuration=debug")
+                 + self.build(["build"], "rpce-debug-dsym: requested=off effective=off")
+                 + self.build(["build"], good)[:2]
+                 + ["rpce-debug-dsym: requested=on effective=on reason=requested_on configuration=debug",
+                    "Building for debugging..."])
+        self.assertEqual([segment["dsymPolicy"] for segment in self.segments(lines)],
+                         [None, metrics.DSYM_POLICY_UNKNOWN, metrics.DSYM_POLICY_UNKNOWN, metrics.DSYM_POLICY_MIXED])
+
+    def test_banner_text_printed_by_tests_is_not_the_wrapper(self) -> None:
+        lines = ["$ /r/Scripts/canonical_swift.sh test",
+                 "rpce-debug-dsym: requested=off effective=off reason=debug_skip configuration=debug",
+                 "Test Suite 'All' started at 2026-10-05 10:00:00.000.",
+                 "rpce-debug-dsym: requested=on effective=on reason=requested_on configuration=debug",
+                 "Test Suite 'All' passed at 2026-10-05 10:00:01.000."]
+        self.assertEqual(self.segments(lines)[0]["dsymPolicy"]["effective"], "off")
+
+    def test_other_r_lines_keep_pcm_detection(self) -> None:
+        self.assertIs(metrics.classify_record("rebuilding: /x/M.pcm: No such file"), metrics._PCM_MARKER)
+        self.assertIsNone(metrics.classify_record("remark: nothing"))
+
+
 class RecorderBoundsTests(SpanInvariantMixin, unittest.TestCase):
     def method_records(self, count: int, name_width: int = 1):
         filler = "x" * name_width
@@ -488,6 +544,7 @@ class OutputTelemetryCursorTests(SpanInvariantMixin, unittest.TestCase):
         b"Test Case '-[A b]' started.", b"\x1b[32mTest Case '-[A c]' passed (0.1 seconds).",
         b"warning: /x/M.pcm: No such file", b"\t Executed 2 tests, with 0 failures (0 unexpected) in 0.1 (0.2) seconds",
         b"y" * 70_000,
+        b"rpce-debug-dsym: requested=off effective=off reason=debug_skip configuration=debug (regenerate)",
     ]
 
     def assert_equivalent(self, case: dict, *, piece_size: int | None = None, max_pending: int = metrics.MAX_PENDING_RECORD_BYTES):

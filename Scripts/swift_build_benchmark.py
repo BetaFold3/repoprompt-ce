@@ -2393,6 +2393,41 @@ def check_capabilities(recipes: Sequence[Recipe], main_root: Path, commit: str) 
     return evidence
 
 
+# Step 10 default-skip markers: a target wrapper that applies RPCE_DEBUG_DSYM
+# (unset means off) is not legacy-full-only, so this harness would mislabel it.
+DEFAULT_SKIP_WRAPPER_MARKERS = ("RPCE_DEBUG_DSYM", "SWIFT_DRIVER_DSYMUTIL_EXEC", "debug_dsym")
+DEFAULT_SKIP_HELPER = "Scripts/debug_dsym.py"
+
+
+def check_full_dsym_target(main_root: Path, commit: str) -> None:
+    """Fail closed unless the target commit's wrapper is the legacy full-dSYM wrapper.
+
+    Both arms run with RPCE_DEBUG_DSYM unset and the manifest records
+    ``effectiveDsymPolicy: on``; a default-skip target would silently produce
+    skip captures labeled full. Refused before any worktree or daemon mutation.
+    """
+    def show(rel: str) -> Optional[bytes]:
+        try:
+            result = subprocess.run(["git", "show", f"{commit}:{rel}"], cwd=str(main_root), capture_output=True,
+                                    timeout=60)
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise HarnessError(f"cannot read {rel} at {commit[:12]}: {exc}") from exc
+        return result.stdout if result.returncode == 0 else None
+
+    wrapper = show("Scripts/canonical_swift.sh")
+    if wrapper is None:
+        raise HarnessError(f"target {commit[:12]} has no readable Scripts/canonical_swift.sh; its dSYM policy cannot "
+                           f"be proven {WRAPPER_CAPABILITY}; refused before any mutation")
+    text = wrapper.decode("utf-8", "replace")
+    found = [marker for marker in DEFAULT_SKIP_WRAPPER_MARKERS if marker in text]
+    if found or show(DEFAULT_SKIP_HELPER) is not None:
+        raise HarnessError(
+            f"target {commit[:12]} skips debug dSYM generation by default (Step 10 policy switch: "
+            f"{', '.join(found) or DEFAULT_SKIP_HELPER}); this {WRAPPER_CAPABILITY} harness would label its captures "
+            "full while the wrapper skips. Refused before any mutation: compare default-skip refs with the private "
+            "lean Step 10 recipe instead")
+
+
 def resolve_main_repo(raw: Optional[str]) -> Tuple[Path, Dict[str, Any]]:
     """The explicit original checkout: worktree authority, state root and passive idle-check target."""
     root = Path(os.path.realpath(Path(raw).expanduser() if raw else REPO_ROOT))
@@ -2518,6 +2553,7 @@ def cmd_run(ns: argparse.Namespace) -> int:
         package_swift = git_ok(["show", f"{commit}:Package.swift"], main_root)
         membership = verify_probe_membership(package_swift, manifest)
         capabilities = check_capabilities(recipes, main_root, commit)
+        check_full_dsym_target(main_root, commit)
     except HarnessError as exc:
         print(f"swift-bench: refused before any mutation: {exc}", file=sys.stderr)
         return EXIT_HARNESS_FAILURE

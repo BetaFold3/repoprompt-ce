@@ -48,4 +48,32 @@ case "${1:-}" in
         ;;
 esac
 
+# Debug dSYM policy (RPCE_DEBUG_DSYM=on|off; unset means off). The classifier
+# inspects only the build configuration of this exact argument vector, prints
+# one stderr banner, and answers the effective value on stdout. Every eligible
+# debug invocation (build, test, list, --show-bin-path) gets the same added
+# hook so SwiftPM's environment-keyed caches stay byte-identical; the policy
+# variable itself never reaches Swift (env -i). The wrapper never touches
+# symbol files: `make dev-dsym` regenerates them for existing binaries. An
+# invalid policy value exits 2 and any classifier failure exits before Swift.
+dsym_python=/usr/bin/python3
+if [[ ! -x "$dsym_python" ]]; then
+    dsym_python="$(command -v python3 || true)"
+fi
+if [[ -z "$dsym_python" ]]; then
+    echo "canonical_swift.sh: python3 is required to classify RPCE_DEBUG_DSYM" >&2
+    exit 70
+fi
+dsym_effective="$("$dsym_python" -I -S "$(dirname "${BASH_SOURCE[0]}")/debug_dsym.py" wrapper-policy -- "$@")" || exit $?
+case "$dsym_effective" in
+    off)
+        swift_env+=("SWIFT_DRIVER_DSYMUTIL_EXEC=/usr/bin/true")
+        ;;
+    on) ;;
+    *)
+        echo "canonical_swift.sh: unexpected debug dSYM policy result '$dsym_effective'" >&2
+        exit 70
+        ;;
+esac
+
 exec /usr/bin/env -i "${swift_env[@]}" /usr/bin/swift "$@"

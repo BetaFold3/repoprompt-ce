@@ -1,4 +1,4 @@
-.PHONY: help doctor setup install-format-tools format-tools-status format format-check lint install-debug-cli uninstall-debug-cli debug-cli-status resolve build run test guardrails conductor-selftest ci-app-test-runner-selftest release-selftest release-sync-cli-version release-preflight release-artifact install-local-production xcode xcode-open xcode-generate xcode-check xcode-validate xcode-generator-test xcode-clean dev-status dev-build dev-swift-build dev-run dev-launch-existing dev-test dev-test-artifact dev-test-parallel dev-test-impacted dev-test-shard-plan dev-test-list dev-provider-test dev-provider-test-list dev-core-test dev-core-test-list dev-smoke dev-smoke-launch dev-format dev-format-check dev-lint dev-format-tools-status dev-check-format-tools dev-install-format-tools dev-release-preflight dev-release-artifact dev-install-local-production dev-stop-app dev-daemon-stop dev-conductor-bench dev-conductor-bench-full dev-conductor-bench-compare dev-bench dev-bench-compare dev-bench-clean dev-metrics clean
+.PHONY: help doctor setup install-format-tools format-tools-status format format-check lint install-debug-cli uninstall-debug-cli debug-cli-status resolve build run test guardrails conductor-selftest ci-app-test-runner-selftest release-selftest release-sync-cli-version release-preflight release-artifact install-local-production xcode xcode-open xcode-generate xcode-check xcode-validate xcode-generator-test xcode-clean dev-status dev-build dev-swift-build dev-dsym dev-run dev-launch-existing dev-test dev-test-artifact dev-test-parallel dev-test-impacted dev-test-shard-plan dev-test-list dev-provider-test dev-provider-test-list dev-core-test dev-core-test-list dev-smoke dev-smoke-launch dev-format dev-format-check dev-lint dev-format-tools-status dev-check-format-tools dev-install-format-tools dev-release-preflight dev-release-artifact dev-install-local-production dev-stop-app dev-daemon-stop dev-conductor-bench dev-conductor-bench-full dev-conductor-bench-compare dev-bench dev-bench-compare dev-bench-clean dev-metrics clean
 
 PRODUCT ?= all
 
@@ -16,6 +16,7 @@ help:
 	@printf '  %-30s %s\n' 'dev-status' 'Show conductor daemon status'
 	@printf '  %-30s %s\n' 'dev-build' 'Coordinated debug app package build; FAST=1 opts into fast verification'
 	@printf '  %-30s %s\n' 'dev-swift-build' 'Coordinated Swift build; override with PRODUCT=name'
+	@printf '  %-30s %s\n' 'dev-dsym' 'Regenerate debug dSYMs for built products (never builds); PRODUCT=all|RepoPrompt|repoprompt-mcp|repoprompt-gateway|root-tests'
 	@printf '  %-30s %s\n' 'dev-run' 'Coordinated debug app build and launch'
 	@printf '  %-30s %s\n' 'dev-launch-existing' 'Launch existing coordinated debug app without building'
 	@printf '  %-30s %s\n' 'dev-test' 'Coordinated test run; override with FILTER=name'
@@ -133,6 +134,7 @@ conductor-selftest:
 	python3 Scripts/test_agent_mode_file_tools_benchmark.py
 	python3 Scripts/test_conductor_benchmark.py
 	python3 Scripts/test_swift_pipeline_metrics.py
+	python3 Scripts/test_debug_dsym.py
 	python3 Scripts/test_swift_build_benchmark.py
 	python3 Scripts/test_conductor_lifecycle.py
 	python3 Scripts/test_local_production_installer.py
@@ -186,6 +188,9 @@ dev-build:
 
 dev-swift-build:
 	./conductor swift-build --product $(PRODUCT)
+
+dev-dsym:
+	./conductor dsym --product $(PRODUCT)
 
 dev-run:
 	./conductor run
