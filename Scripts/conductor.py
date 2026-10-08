@@ -895,6 +895,17 @@ def discover_test_artifact_executable(artifact_path: Path) -> Optional[Path]:
     return None
 
 
+# Step 9 (OD23): the only Swift driver diagnostics a coordinated root debug
+# ``test`` may request, mapped from the additive boolean
+# ``benchmarkDriverDiagnostics`` (absent means false). No arbitrary flags.
+BENCHMARK_DRIVER_DIAGNOSTICS_ARG = "benchmarkDriverDiagnostics"
+BENCHMARK_DRIVER_DIAGNOSTIC_SWIFT_ARGS = (
+    "-Xswiftc",
+    "-driver-show-incremental",
+    "-Xswiftc",
+    "-driver-time-compilation",
+)
+
 # Step 7: request args derived only by the daemon's execution-time evaluation.
 # Enqueue strips them from every client request before request identity.
 TEST_ARTIFACT_DERIVED_ARG_KEYS = (
@@ -3064,6 +3075,7 @@ class OperationRegistry:
 
         if operation in {"test", "test-artifact", "provider-test", "core-test"}:
             self._validate_xctest_stall_options(args)
+        self._validate_benchmark_driver_diagnostics(operation, args)
 
         env = self.request_environment(verbose, request)
         effective_timeout = self._default_timeout(operation, args)
@@ -3114,6 +3126,8 @@ class OperationRegistry:
                 argv.append("list")
             elif args.get("filter"):
                 argv.extend(["--filter", str(args["filter"])])
+            if args.get(BENCHMARK_DRIVER_DIAGNOSTICS_ARG) is True:
+                argv.extend(BENCHMARK_DRIVER_DIAGNOSTIC_SWIFT_ARGS)
             return argv, ["build"], cwd, env, effective_timeout
         if operation == "test-artifact":
             if not args.get("filter"):
@@ -3198,6 +3212,19 @@ class OperationRegistry:
                 return self._internal_argv("release_preflight_missing", {}), ["release"], cwd, env, effective_timeout
 
         raise ConductorError(f"invalid arguments for operation '{operation}'")
+
+    @staticmethod
+    def _validate_benchmark_driver_diagnostics(operation: Any, args: Dict[str, Any]) -> None:
+        if BENCHMARK_DRIVER_DIAGNOSTICS_ARG not in args:
+            return
+        if args.get(BENCHMARK_DRIVER_DIAGNOSTICS_ARG) is not True:
+            raise ConductorError("benchmarkDriverDiagnostics must be true when present")
+        if operation != "test":
+            raise ConductorError("--benchmark-driver-diagnostics is only supported for the root debug test operation")
+        if args.get("list"):
+            raise ConductorError("--benchmark-driver-diagnostics cannot be combined with --list")
+        if args.get("testProduct"):
+            raise ConductorError("--benchmark-driver-diagnostics cannot be combined with --test-product")
 
     @staticmethod
     def _validate_xctest_stall_options(args: Dict[str, Any]) -> None:
@@ -4551,7 +4578,11 @@ class DaemonState:
                 ticket_payload = None
                 ticket_error = None
                 ticket_withheld_reason = None
-                if exit_code == 0 and job.operation == "test":
+                if exit_code == 0 and job.operation == "test" and job.args.get(BENCHMARK_DRIVER_DIAGNOSTICS_ARG) is True:
+                    # Diagnostic driver flags change the compile command line; such a
+                    # build never mints the root ticket that test-artifact reuses.
+                    ticket_withheld_reason = "ticket withheld: benchmark driver diagnostics build"
+                elif exit_code == 0 and job.operation == "test":
                     try:
                         root_test_end_snapshot = source_snapshot(self.paths.repo_root, env)
                         if root_test_start_snapshot is None or root_test_end_snapshot is None:
@@ -8750,6 +8781,7 @@ def handle_real_operation(paths: Paths, operation: str, argv: List[str]) -> int:
         parser.add_argument("--no-xctest-deadlines", action="store_true")
         parser.add_argument("--xctest-stall-seconds", type=float)
         parser.add_argument("--xctest-stall-wake-probe", action="store_true")
+        parser.add_argument("--benchmark-driver-diagnostics", action="store_true")
         ns = parser.parse_args(rest)
         if ns.xctest_stall_seconds is not None and (
             not math.isfinite(ns.xctest_stall_seconds) or ns.xctest_stall_seconds <= 0
@@ -8759,6 +8791,13 @@ def handle_real_operation(paths: Paths, operation: str, argv: List[str]) -> int:
             raise ConductorError("--xctest-stall-wake-probe requires --xctest-stall-seconds")
         if ns.no_xctest_deadlines and (ns.xctest_stall_seconds is not None or ns.xctest_stall_wake_probe):
             raise ConductorError("--no-xctest-deadlines cannot be combined with XCTest stall diagnostics")
+        if ns.benchmark_driver_diagnostics:
+            if operation != "test":
+                raise ConductorError("--benchmark-driver-diagnostics is only supported for the root debug test operation")
+            if ns.list:
+                raise ConductorError("--benchmark-driver-diagnostics cannot be combined with --list")
+            if ns.test_product:
+                raise ConductorError("--benchmark-driver-diagnostics cannot be combined with --test-product")
         if ns.list and (ns.xctest_stall_seconds is not None or ns.xctest_stall_wake_probe):
             raise ConductorError("--list cannot be combined with XCTest stall diagnostics")
         if ns.list and ns.test_product:
@@ -8776,6 +8815,8 @@ def handle_real_operation(paths: Paths, operation: str, argv: List[str]) -> int:
             args["xctestStallSeconds"] = ns.xctest_stall_seconds
         if ns.xctest_stall_wake_probe:
             args["xctestStallWakeProbe"] = True
+        if ns.benchmark_driver_diagnostics:
+            args[BENCHMARK_DRIVER_DIAGNOSTICS_ARG] = True
         if ns.filter:
             preflight_test_filter(paths.repo_root, operation, ns.filter)
     elif operation == "run":

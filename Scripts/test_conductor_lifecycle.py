@@ -1259,6 +1259,120 @@ class ConductorTestContractTests(LifecycleTestCase):
         self.assertEqual(overridden[-1], 7.0)
         self.assertEqual(core_filtered[-1], conductor.FILTERED_TEST_TIMEOUT_SECONDS)
 
+    # Step 9 (OD23): fixed benchmark driver-diagnostics route for the root debug test.
+
+    def test_benchmark_driver_diagnostics_cli_registers_only_for_root_test(self) -> None:
+        tmp, state = self.make_state()
+        self.addCleanup(tmp.cleanup)
+        with mock.patch.object(conductor, "enqueue_and_maybe_wait", return_value=0) as enqueue, mock.patch.object(
+            conductor, "preflight_test_filter"
+        ):
+            code = conductor.handle_real_operation(
+                state.paths, "test", ["--filter", "AlphaTests", "--benchmark-driver-diagnostics"]
+            )
+            plain = conductor.handle_real_operation(state.paths, "test", ["--filter", "AlphaTests"])
+        self.assertEqual((code, plain), (0, 0))
+        self.assertEqual(
+            enqueue.call_args_list[0].args[2], {"filter": "AlphaTests", "benchmarkDriverDiagnostics": True}
+        )
+        # Legacy/default requests never carry the key.
+        self.assertEqual(enqueue.call_args_list[1].args[2], {"filter": "AlphaTests"})
+        rejected = [
+            ("provider-test", ["--filter", "AlphaTests", "--benchmark-driver-diagnostics"], "root debug test"),
+            ("core-test", ["--benchmark-driver-diagnostics"], "root debug test"),
+            ("test", ["--list", "--benchmark-driver-diagnostics"], "--list"),
+            ("test", ["--test-product", "X", "--benchmark-driver-diagnostics"], "--test-product"),
+        ]
+        for operation, argv, text in rejected:
+            with self.subTest(operation=operation, argv=argv):
+                with mock.patch.object(conductor, "enqueue_and_maybe_wait") as never, mock.patch.object(
+                    conductor, "preflight_test_filter"
+                ):
+                    with self.assertRaisesRegex(conductor.ConductorError, text):
+                        conductor.handle_real_operation(state.paths, operation, argv)
+                never.assert_not_called()
+        for operation in ("test-artifact", "build", "swift-build", "test-parallel"):
+            with self.subTest(operation=operation):
+                with mock.patch.object(conductor, "enqueue_and_maybe_wait") as never, self.assertRaises(SystemExit), \
+                        contextlib.redirect_stderr(io.StringIO()):
+                    conductor.handle_real_operation(state.paths, operation, ["--benchmark-driver-diagnostics"])
+                never.assert_not_called()
+
+    def test_benchmark_driver_diagnostics_command_construction_is_fixed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            registry = conductor.OperationRegistry(Path(tmp))
+            diag = registry.prepare(
+                {"operation": "test", "args": {"filter": "AlphaTests", "benchmarkDriverDiagnostics": True}}
+            )
+            plain = registry.prepare({"operation": "test", "args": {"filter": "AlphaTests"}})
+        canonical = str(Path(tmp) / "Scripts" / "canonical_swift.sh")
+        self.assertEqual(
+            diag[0],
+            [canonical, "test", "--filter", "AlphaTests", "-Xswiftc", "-driver-show-incremental", "-Xswiftc",
+             "-driver-time-compilation"],
+        )
+        self.assertEqual(plain[0], [canonical, "test", "--filter", "AlphaTests"])
+        self.assertEqual(diag[1:2], plain[1:2])
+        self.assertEqual(diag[-1], plain[-1])
+
+    def test_benchmark_driver_diagnostics_is_validated_daemon_side_before_enqueue(self) -> None:
+        tmp, state = self.make_state()
+        self.addCleanup(tmp.cleanup)
+        cases = [
+            ({"operation": "test", "args": {"benchmarkDriverDiagnostics": False}}, "must be true"),
+            ({"operation": "test", "args": {"benchmarkDriverDiagnostics": "-Xfoo"}}, "must be true"),
+            ({"operation": "provider-test", "args": {"benchmarkDriverDiagnostics": True}}, "root debug test"),
+            ({"operation": "core-test", "args": {"benchmarkDriverDiagnostics": True}}, "root debug test"),
+            ({"operation": "build", "args": {"benchmarkDriverDiagnostics": True}}, "root debug test"),
+            ({"operation": "test-artifact", "args": {"filter": "A", "benchmarkDriverDiagnostics": True}}, "root debug test"),
+            ({"operation": "test", "args": {"list": True, "benchmarkDriverDiagnostics": True}}, "--list"),
+            ({"operation": "test", "args": {"testProduct": "X", "benchmarkDriverDiagnostics": True}}, "--test-product"),
+        ]
+        for request, text in cases:
+            with self.subTest(request=request):
+                with mock.patch.object(state, "_schedule_locked"):
+                    with self.assertRaisesRegex(conductor.ConductorError, text):
+                        state.enqueue(dict(request))
+                self.assertEqual(state.jobs, {})
+                self.assertEqual(state.queue, [])
+
+    def test_benchmark_driver_diagnostics_is_part_of_request_identity_and_dedup(self) -> None:
+        tmp, state = self.make_state()
+        self.addCleanup(tmp.cleanup)
+        plain = {"operation": "test", "args": {"filter": "AlphaTests"}, "requestKey": "bench-key"}
+        diag = {"operation": "test", "args": {"filter": "AlphaTests", "benchmarkDriverDiagnostics": True},
+                "requestKey": "bench-key"}
+        self.assertNotEqual(state.registry.fingerprint(plain), state.registry.fingerprint(diag))
+        with mock.patch.object(state, "_schedule_locked"), mock.patch.object(
+            conductor, "admit_test_artifact", return_value=None
+        ):
+            first = state.enqueue(dict(plain))
+            # An active job with the same key but different identity is never reused.
+            with self.assertRaisesRegex(conductor.ConductorError, "request-key mismatch"):
+                state.enqueue(dict(diag))
+            again = state.enqueue(dict(plain))
+        self.assertTrue(again["reused"])
+        self.assertEqual(again["ticket"], first["ticket"])
+        self.assertNotIn("benchmarkDriverDiagnostics", state.jobs[first["ticket"]].args)
+
+    def test_benchmark_harness_pins_conductor_error_strings(self) -> None:
+        import swift_build_benchmark as bench
+
+        tmp, state = self.make_state()
+        self.addCleanup(tmp.cleanup)
+        with self.assertRaises(conductor.ConductorError) as missing:
+            state.resolve_job_locked(None, "unknown-key")
+        self.assertIn(bench.REQUEST_KEY_NOT_FOUND_TEXT, str(missing.exception))
+        job = self.make_job(state, "busy", "test", {}, ["build"], job_state="running")
+        state.jobs[job.ticket] = job
+        with self.assertRaises(conductor.ConductorError) as refused:
+            state.stop(force=False)
+        self.assertIn(bench.STOP_REFUSED_ACTIVE_TEXT, str(refused.exception))
+        self.assertFalse(state.shutdown_requested)
+        self.assertEqual(bench.ARTIFACT_DERIVED_ARG_KEYS, conductor.TEST_ARTIFACT_DERIVED_ARG_KEYS)
+        self.assertEqual(bench.DIAG_ROUTE_MARKER, "BENCHMARK_DRIVER_DIAGNOSTIC_SWIFT_ARGS")
+        self.assertEqual(bench.DIAG_ARG_KEY, conductor.BENCHMARK_DRIVER_DIAGNOSTICS_ARG)
+
     def initialize_git_repo(self, root: Path) -> Path:
         source = root / "Tracked.swift"
         subprocess.run(["git", "init", "-q"], cwd=root, check=True)
@@ -1788,6 +1902,41 @@ raise SystemExit(
         self.assertEqual(job.state, "completed", job.result_summary)
         self.assertFalse(ticket_path.exists())
         self.assertIn("ticket withheld: source changed during run", "".join(job.tail))
+
+    def test_benchmark_driver_diagnostics_test_never_mints_the_root_ticket(self) -> None:
+        tmp, state = self.make_state()
+        self.addCleanup(tmp.cleanup)
+        self.initialize_git_repo(state.paths.repo_root)
+        self.create_test_artifact(state.paths.repo_root)
+        ticket_path = state.paths.jobs_dir / "build-ticket-root.json"
+        ticket_path.write_text('{"ticket_id":"old"}\n', encoding="utf-8")
+        job = self.make_job(
+            state, "driver-diag", "test", {"benchmarkDriverDiagnostics": True}, ["build"],
+            job_state="running",
+        )
+        state.jobs[job.ticket] = job
+        command = [sys.executable, "-u", "-c", "pass"]
+
+        with (
+            mock.patch.object(
+                state.registry,
+                "prepare",
+                return_value=(command, ["build"], state.paths.repo_root, os.environ.copy(), 5.0),
+            ),
+            mock.patch.object(conductor, "operation_requires_global_heavy_slot", return_value=False),
+            mock.patch.object(state, "_xctest_watchdog_enabled", return_value=False),
+            mock.patch.object(
+                conductor,
+                "artifact_toolchain_snapshot",
+                return_value={"swift_version": "Swift test", "arch": "testarch", "config": "debug"},
+            ),
+        ):
+            state._run_job(job.ticket)
+
+        self.assertEqual(job.state, "completed", job.result_summary)
+        # The prior ticket is invalidated at start and no new ticket is minted.
+        self.assertFalse(ticket_path.exists())
+        self.assertIn("ticket withheld: benchmark driver diagnostics build", "".join(job.tail))
 
     def test_failed_root_test_invalidates_prior_build_ticket_at_start(self) -> None:
         tmp, state = self.make_state()

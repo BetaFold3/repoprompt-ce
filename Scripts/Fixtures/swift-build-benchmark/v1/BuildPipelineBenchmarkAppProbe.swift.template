@@ -1,0 +1,7 @@
+// Scratch-only probe rendered by Scripts/swift_build_benchmark.py (fixture v1).
+// It exists only inside disposable benchmark worktrees and is never committed.
+enum BuildPipelineBenchmarkAppProbe {
+    static func value() -> Int {
+        {{BODY_VARIANT}}
+    }
+}

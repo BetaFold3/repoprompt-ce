@@ -1,0 +1,14 @@
+// Scratch-only probe rendered by Scripts/swift_build_benchmark.py (fixture v1).
+// It exists only inside disposable benchmark worktrees and is never committed.
+import XCTest
+
+final class BuildPipelineBenchmarkProbeTests: XCTestCase {
+    func testBenchmarkProbe() {
+        let variant = {{BODY_VARIANT}}
+        XCTAssertEqual(variant, {{BODY_VARIANT}})
+    }
+}
+
+extension XCTestCase {
+    func {{BROAD_MEMBER}}() {}
+}

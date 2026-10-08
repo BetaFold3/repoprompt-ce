@@ -1,4 +1,4 @@
-.PHONY: help doctor setup install-format-tools format-tools-status format format-check lint install-debug-cli uninstall-debug-cli debug-cli-status resolve build run test guardrails conductor-selftest ci-app-test-runner-selftest release-selftest release-sync-cli-version release-preflight release-artifact install-local-production xcode xcode-open xcode-generate xcode-check xcode-validate xcode-generator-test xcode-clean dev-status dev-build dev-swift-build dev-run dev-launch-existing dev-test dev-test-artifact dev-test-parallel dev-test-impacted dev-test-shard-plan dev-test-list dev-provider-test dev-provider-test-list dev-core-test dev-core-test-list dev-smoke dev-smoke-launch dev-format dev-format-check dev-lint dev-format-tools-status dev-check-format-tools dev-install-format-tools dev-release-preflight dev-release-artifact dev-install-local-production dev-stop-app dev-daemon-stop dev-conductor-bench dev-conductor-bench-full dev-conductor-bench-compare dev-metrics clean
+.PHONY: help doctor setup install-format-tools format-tools-status format format-check lint install-debug-cli uninstall-debug-cli debug-cli-status resolve build run test guardrails conductor-selftest ci-app-test-runner-selftest release-selftest release-sync-cli-version release-preflight release-artifact install-local-production xcode xcode-open xcode-generate xcode-check xcode-validate xcode-generator-test xcode-clean dev-status dev-build dev-swift-build dev-run dev-launch-existing dev-test dev-test-artifact dev-test-parallel dev-test-impacted dev-test-shard-plan dev-test-list dev-provider-test dev-provider-test-list dev-core-test dev-core-test-list dev-smoke dev-smoke-launch dev-format dev-format-check dev-lint dev-format-tools-status dev-check-format-tools dev-install-format-tools dev-release-preflight dev-release-artifact dev-install-local-production dev-stop-app dev-daemon-stop dev-conductor-bench dev-conductor-bench-full dev-conductor-bench-compare dev-bench dev-bench-compare dev-bench-clean dev-metrics clean
 
 PRODUCT ?= all
 
@@ -35,6 +35,9 @@ help:
 	@printf '  %-30s %s\n' 'dev-conductor-bench' 'Capture conductor benchmarks (output summary mem cli; ~10 min paired); TARGET_A=name=root TARGET_B=name=root CAPTURE_ID LOGS_DIR WORKLOADS CLASS_SAMPLES'
 	@printf '  %-30s %s\n' 'dev-conductor-bench-full' 'Capture conductor benchmarks including artifact and rss (~26 min paired at manifest counts)'
 	@printf '  %-30s %s\n' 'dev-conductor-bench-compare' 'Gate BASELINE vs CANDIDATE capture[#arm]; PROFILE CONFIRM_BASELINE CONFIRM_CANDIDATE REPORT; make exits 2 for any failure, the printed line has the harness code'
+	@printf '  %-30s %s\n' 'dev-bench' 'Swift build A/A capture in two same-SHA worktrees; INSTRUMENTATION=full required; REF NAME SCENARIOS BLOCKS CALIBRATION MAIN_REPO'
+	@printf '  %-30s %s\n' 'dev-bench-compare' 'Paired Swift build comparison of one capture: BASELINE=<capture>#arm CANDIDATE=<same capture>#arm; CONFIRM_BASELINE CONFIRM_CANDIDATE (distinct capture) TREATMENT SCENARIOS REPORT MAIN_REPO'
+	@printf '  %-30s %s\n' 'dev-bench-clean' 'Resume cleanup of the recorded Swift benchmark worktrees after ownership checks; MAIN_REPO'
 	@printf '  %-30s %s\n' 'dev-metrics' 'Show per-job conductor timing history (client-side, no daemon); LAST=N KIND=op TICKET=id JSON=1'
 	@printf '\n%s\n' 'Style targets:'
 	@printf '  %-30s %s\n' 'format' 'Format Swift files directly'
@@ -130,6 +133,7 @@ conductor-selftest:
 	python3 Scripts/test_agent_mode_file_tools_benchmark.py
 	python3 Scripts/test_conductor_benchmark.py
 	python3 Scripts/test_swift_pipeline_metrics.py
+	python3 Scripts/test_swift_build_benchmark.py
 	python3 Scripts/test_conductor_lifecycle.py
 	python3 Scripts/test_local_production_installer.py
 	python3 Scripts/test_security_inventory.py
@@ -282,6 +286,27 @@ dev-conductor-bench-compare:
 		$(if $(CONFIRM_BASELINE),--confirm-baseline '$(CONFIRM_BASELINE)') $(if $(CONFIRM_CANDIDATE),--confirm-candidate '$(CONFIRM_CANDIDATE)') \
 		$(if $(REPORT),--report '$(REPORT)'); \
 	code=$$?; echo "conductor-bench-compare exit $$code"; exit $$code
+
+# Swift build benchmarks: a slot-free foreground orchestrator that submits
+# coordinated jobs to two disposable same-SHA worktrees' own daemons. It never
+# holds a lane or machine slot and never builds in this checkout.
+dev-bench:
+	@test "$(INSTRUMENTATION)" = full || { echo 'usage: make dev-bench INSTRUMENTATION=full [REF=<commit>] [NAME=label] [SCENARIOS="null-test test-body ..."] [BLOCKS=5] [CALIBRATION=<capture>] [MAIN_REPO=<checkout>]' >&2; exit 3; }
+	@python3 Scripts/swift_build_benchmark.py run --instrumentation '$(INSTRUMENTATION)' $(if $(DSYM_MODE),--dsym-mode '$(DSYM_MODE)') \
+		$(if $(REF),--ref '$(REF)') $(if $(NAME),--name '$(NAME)') $(if $(SCENARIOS),--scenarios '$(SCENARIOS)') $(if $(BLOCKS),--blocks '$(BLOCKS)') \
+		$(if $(CALIBRATION),--calibration '$(CALIBRATION)') $(if $(MAIN_REPO),--main-repo '$(MAIN_REPO)'); \
+	code=$$?; echo "swift-bench exit $$code"; exit $$code
+
+dev-bench-compare:
+	@test -n "$(BASELINE)" && test -n "$(CANDIDATE)" || { echo 'usage: make dev-bench-compare BASELINE=<capture>#arm CANDIDATE=<same capture>#arm [CONFIRM_BASELINE= CONFIRM_CANDIDATE=] [TREATMENT=manifest.json] [MAIN_REPO=<checkout>]' >&2; exit 3; }
+	@python3 Scripts/swift_build_benchmark.py compare --baseline '$(BASELINE)' --candidate '$(CANDIDATE)' \
+		$(if $(CONFIRM_BASELINE),--confirm-baseline '$(CONFIRM_BASELINE)') $(if $(CONFIRM_CANDIDATE),--confirm-candidate '$(CONFIRM_CANDIDATE)') \
+		$(if $(TREATMENT),--treatment-manifest '$(TREATMENT)') $(if $(SCENARIOS),--scenarios '$(SCENARIOS)') $(if $(REPORT),--report '$(REPORT)') \
+		$(if $(MAIN_REPO),--main-repo '$(MAIN_REPO)'); \
+	code=$$?; echo "swift-bench-compare exit $$code"; exit $$code
+
+dev-bench-clean:
+	@python3 Scripts/swift_build_benchmark.py clean $(if $(MAIN_REPO),--main-repo '$(MAIN_REPO)'); code=$$?; echo "swift-bench-clean exit $$code"; exit $$code
 
 # Reads <state>/metrics/build-metrics.jsonl client-side; never contacts or starts the daemon.
 dev-metrics:

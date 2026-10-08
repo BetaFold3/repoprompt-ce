@@ -1,0 +1,5 @@
+// Scratch-only input-set probe rendered by Scripts/swift_build_benchmark.py (fixture v1).
+// It exists only inside disposable benchmark worktrees and is never committed.
+enum BuildPipelineBenchmarkInputProbe {
+    static let value = {{BODY_VARIANT}}
+}

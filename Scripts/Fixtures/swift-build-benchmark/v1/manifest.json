@@ -1,0 +1,35 @@
+{
+  "fixtureVersion": "v1",
+  "description": "Scratch-only probe templates for Scripts/swift_build_benchmark.py (build-pipeline plan Step 9). They are rendered only into disposable benchmark worktrees; the curated XCTest ledger and production sources are never edited.",
+  "probes": {
+    "test-probe": {
+      "template": "BuildPipelineBenchmarkProbeTests.swift.template",
+      "templateSha256": "0a8ff66c6ba0593e8e7295db3d0fc83546a31e0b04b2ef345193a065926dbe49",
+      "target": "RepoPromptTests",
+      "targetPath": "Tests/RepoPromptTests",
+      "insertPath": "Tests/RepoPromptTests/BuildPipelineBenchmarkProbeTests.swift",
+      "suite": "BuildPipelineBenchmarkProbeTests",
+      "installedAtSetup": true
+    },
+    "app-probe": {
+      "template": "BuildPipelineBenchmarkAppProbe.swift.template",
+      "templateSha256": "7886b267a035274e631faf3bd5f529ec4fe62d74f69a98adf8fa5db8a4d0545f",
+      "target": "RepoPromptApp",
+      "targetPath": "Sources/RepoPrompt",
+      "insertPath": "Sources/RepoPrompt/Support/BuildPipelineBenchmarkAppProbe.swift",
+      "installedAtSetup": true
+    },
+    "input-probe": {
+      "template": "BuildPipelineBenchmarkInputProbe.swift.template",
+      "templateSha256": "dcba338de72c94831b80248be55f323a6b809fb02752357a33acb0a98fef246d",
+      "target": "RepoPromptTests",
+      "targetPath": "Tests/RepoPromptTests",
+      "insertPath": "Tests/RepoPromptTests/BuildPipelineBenchmarkInputProbe.swift",
+      "installedAtSetup": false
+    }
+  },
+  "variants": {
+    "BODY_VARIANT": ["1", "2"],
+    "BROAD_MEMBER": ["rpceBenchmarkBroadProbeA", "rpceBenchmarkBroadProbeB"]
+  }
+}
