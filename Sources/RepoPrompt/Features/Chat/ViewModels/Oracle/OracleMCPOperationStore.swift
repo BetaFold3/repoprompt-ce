@@ -133,6 +133,21 @@ final class OracleMCPOperationStore: ObservableObject {
         case cancelled
     }
 
+    /// One lane's result from a bounded delivery observation. `pending` means the shared
+    /// single-flight delivery is still running (never cancelled or duplicated by the observer);
+    /// its outcome is `.steering`, `.deadline`, or `.cancelled`. `failed` is the delivery's own
+    /// throw, after which the record has already reverted to `undelivered` for retry.
+    enum DeliveryObservation {
+        case delivered([String: Value])
+        case failed(Error)
+        case pending(WaitOutcome)
+    }
+
+    typealias DeliveryFinalizer = @MainActor (
+        _ result: inout [String: Value],
+        _ request: FinalizationRequest
+    ) async throws -> Void
+
     /// Invocation-owned wake source (an `OracleMCPWaitScope` in `MCPServerViewModel`).
     /// The store never learns run identity; it only observes a sticky flag and a wake callback.
     struct ExternalWake {
@@ -267,18 +282,13 @@ final class OracleMCPOperationStore: ObservableObject {
 
     // MARK: - Private state
 
+    /// Finalization progress. `finalized` caches the once-only result; whether the parent has
+    /// actually received it is tracked separately by `Record.collectedAt`, because a bounded
+    /// observer may leave while the shared finalization is still running.
     private enum Delivery {
         case undelivered
         case delivering(Task<[String: Value], Error>)
-        case delivered([String: Value], Date)
-
-        var state: DeliveryState {
-            switch self {
-            case .undelivered: .undelivered
-            case .delivering: .delivering
-            case .delivered: .delivered
-            }
-        }
+        case finalized([String: Value])
     }
 
     private final class Record {
@@ -302,7 +312,21 @@ final class OracleMCPOperationStore: ObservableObject {
         var startupRejection: ChatToolError?
         var rejectedRequestKeyWasReleased = false
         var delivery: Delivery = .undelivered
+        /// When an observer first returned the finalized result to a caller. Only collection
+        /// (not background finalization) counts as delivered for recovery, retention, and UI.
+        var collectedAt: Date?
+        /// When the current in-flight finalization started (nil unless `.delivering`).
+        var deliveryStartedAt: Date?
         var startupTask: Task<ChatToolError?, Never>?
+
+        /// Public delivery state: `delivered` means collected; a finalized result nobody has
+        /// collected yet still reads `undelivered`.
+        var deliveryState: DeliveryState {
+            if collectedAt != nil { return .delivered }
+            if case .delivering = delivery { return .delivering }
+            return .undelivered
+        }
+
         var completionTask: Task<Void, Never>?
         let batchIndex: Int?
         var batchActiveRunProvider: (@MainActor () -> UUID?)?
@@ -354,6 +378,26 @@ final class OracleMCPOperationStore: ObservableObject {
         let externalWake: ExternalWake?
     }
 
+    /// A bounded observer of in-flight deliveries. It never owns the delivery task: the task
+    /// resumes observers from `finishDelivery`, so an observer can leave on deadline, steering,
+    /// or cancellation without awaiting, cancelling, or duplicating shared finalization.
+    private struct DeliveryWaiter {
+        let id: UUID
+        var inFlight: Set<UUID>
+        var observations: [UUID: DeliveryObservation]
+        let continuation: CheckedContinuation<[UUID: DeliveryObservation], Never>
+        var deadline: ContinuousClock.Instant
+        var deadlineTask: Task<Void, Never>?
+        let externalWake: ExternalWake?
+        let steeringGraceSeconds: TimeInterval
+        var steeringWoken: Bool
+    }
+
+    private enum DeliveryStart {
+        case cached([String: Value])
+        case inFlight(Task<[String: Value], Error>)
+    }
+
     private let dependencies: Dependencies
     private var records: [UUID: Record] = [:]
     private var creationOrder: [UUID] = []
@@ -365,6 +409,7 @@ final class OracleMCPOperationStore: ObservableObject {
     private var tombstoneOrder: [UUID] = []
     private var tombstoneByRequestKey: [RequestKey: UUID] = [:]
     private var waiters: [UUID: Waiter] = [:]
+    private var deliveryWaiters: [UUID: DeliveryWaiter] = [:]
     private var batchQueuesByTabID: [UUID: BatchQueueState] = [:]
     private var batchCapacityWaiters: [UUID: CheckedContinuation<Void, Never>] = [:]
     private var isTornDown = false
@@ -890,7 +935,7 @@ final class OracleMCPOperationStore: ObservableObject {
         purge()
         return creationOrder.compactMap { id -> UUID? in
             guard let record = records[id], record.owner.admits(caller: caller) else { return nil }
-            if case .delivered = record.delivery { return nil }
+            if record.collectedAt != nil { return nil }
             return id
         }
     }
@@ -965,7 +1010,7 @@ final class OracleMCPOperationStore: ObservableObject {
         return Summary(
             operationID: record.operationID,
             phase: record.phase,
-            delivery: record.delivery.state,
+            delivery: record.deliveryState,
             createdAt: record.createdAt,
             terminalAt: record.terminalAt,
             deliveredAt: deliveredAt(record),
@@ -1113,13 +1158,124 @@ final class OracleMCPOperationStore: ObservableObject {
         return makeBaseLane(record)
     }
 
-    /// Single-flight delivery: returns the cached result, awaits an in-progress delivery, or
-    /// runs `finalize` exactly once for a completed lane. Cancelled and failed lanes are never
-    /// finalized (no export). A throw reverts to `undelivered` for retry.
-    func deliver(
+    #if DEBUG
+        /// Single-flight delivery: returns the cached result, awaits an in-progress delivery, or
+        /// runs `finalize` exactly once for a completed lane. Cancelled and failed lanes are never
+        /// finalized (no export). A throw reverts to `undelivered` for retry. This waits for the
+        /// delivery without bound, so it is test-only; tool observers use `observeDelivery`.
+        func deliver(
+            _ operationID: UUID,
+            finalize: @escaping DeliveryFinalizer
+        ) async throws -> [String: Value] {
+            let result = switch try beginDelivery(operationID, finalize: finalize) {
+            case let .cached(result):
+                result
+            case let .inFlight(task):
+                try await task.value
+            }
+            noteCollected([operationID])
+            return result
+        }
+    #endif
+
+    /// Bounded, wakeable observation of the single-flight deliveries for terminal operations.
+    /// Starts (or joins) each delivery, then returns once every lane delivered or failed, the
+    /// deadline passes, or the task is cancelled. A steering/question wake — already requested
+    /// at entry or arriving while parked — shortens the remaining bound to at most
+    /// `steeringGraceSeconds`, so a fast finalization still wins while a stalled one cannot
+    /// hold the invocation open. Lanes still finalizing report `.pending(_)`; their shared
+    /// delivery continues exactly once and a later observation collects the cached result.
+    /// No observer waits on a finalization past the point it has run `staleFinalizationAgeSeconds`
+    /// plus `staleFinalizationBoundSeconds` (an already-stale one gets only the bound), so a stuck
+    /// export cannot make any wait spend its full timeout. Observation never stamps collection: the caller does, via `noteCollected`,
+    /// once the result is actually being returned.
+    func observeDelivery(
+        of operationIDs: [UUID],
+        timeoutSeconds: TimeInterval,
+        steeringGraceSeconds: TimeInterval,
+        staleFinalizationAgeSeconds: TimeInterval = .infinity,
+        staleFinalizationBoundSeconds: TimeInterval = 0,
+        externalWake: ExternalWake?,
+        finalize: @escaping DeliveryFinalizer
+    ) async -> [UUID: DeliveryObservation] {
+        guard !operationIDs.isEmpty else { return [:] }
+        if Task.isCancelled {
+            return Dictionary(uniqueKeysWithValues: operationIDs.map { ($0, .pending(.cancelled)) })
+        }
+
+        let waiterID = UUID()
+        return await withTaskCancellationHandler {
+            await withCheckedContinuation { (continuation: CheckedContinuation<[UUID: DeliveryObservation], Never>) in
+                // Start/join and register in one synchronous MainActor segment so a delivery
+                // cannot finish between the in-flight check and observer registration.
+                var observations: [UUID: DeliveryObservation] = [:]
+                var inFlight: Set<UUID> = []
+                for operationID in operationIDs {
+                    do {
+                        switch try beginDelivery(operationID, finalize: finalize) {
+                        case let .cached(result):
+                            observations[operationID] = .delivered(result)
+                        case .inFlight:
+                            inFlight.insert(operationID)
+                        }
+                    } catch {
+                        observations[operationID] = .failed(error)
+                    }
+                }
+                if inFlight.isEmpty {
+                    continuation.resume(returning: observations)
+                    return
+                }
+                // Teardown releases observers already parked, but delivery itself never depended
+                // on the store being live (it never cancels delivery tasks), so a later
+                // observation still parks within its own bound.
+
+                let steeringAtEntry = externalWake?.isRequested() == true
+                var boundSeconds = max(0, timeoutSeconds)
+                if steeringAtEntry {
+                    boundSeconds = min(boundSeconds, max(0, steeringGraceSeconds))
+                }
+                // Per lane: wait until the finalization would turn stale, plus the stale bound.
+                // An already-stale lane gets only the bound; a young one cannot hold this
+                // observer past its own stale point either.
+                for operationID in inFlight {
+                    let age = finalizationAge(records[operationID]) ?? 0
+                    let laneBound = max(0, staleFinalizationAgeSeconds - age) + max(0, staleFinalizationBoundSeconds)
+                    boundSeconds = min(boundSeconds, laneBound)
+                }
+                let waiter = DeliveryWaiter(
+                    id: waiterID,
+                    inFlight: inFlight,
+                    observations: observations,
+                    continuation: continuation,
+                    deadline: ContinuousClock.now.advanced(by: .seconds(boundSeconds)),
+                    deadlineTask: nil,
+                    externalWake: externalWake,
+                    steeringGraceSeconds: steeringGraceSeconds,
+                    steeringWoken: steeringAtEntry
+                )
+                deliveryWaiters[waiterID] = waiter
+                scheduleDeliveryDeadline(waiterID)
+                if !steeringAtEntry {
+                    externalWake?.subscribe { [weak self] in
+                        self?.steerDeliveryWaiter(waiterID)
+                    }
+                }
+            }
+        } onCancel: {
+            Task { @MainActor [weak self] in
+                self?.resumeDeliveryWaiter(waiterID, remainingOutcome: .cancelled)
+            }
+        }
+    }
+
+    /// Returns the cached result, the in-progress delivery task, or creates the one delivery
+    /// task for a terminal lane. The task records its own outcome, so delivery bookkeeping
+    /// never depends on any observer staying attached.
+    private func beginDelivery(
         _ operationID: UUID,
-        finalize: @escaping @MainActor (_ result: inout [String: Value], _ request: FinalizationRequest) async throws -> Void
-    ) async throws -> [String: Value] {
+        finalize: @escaping DeliveryFinalizer
+    ) throws -> DeliveryStart {
         guard let record = records[operationID] else {
             throw ChatToolError.oracleOperationNotFound("operation \(operationID.uuidString) is unknown")
         }
@@ -1127,38 +1283,131 @@ final class OracleMCPOperationStore: ObservableObject {
             throw ChatToolError.internalError("operation \(operationID.uuidString) is not terminal")
         }
         switch record.delivery {
-        case let .delivered(result, _):
-            return result
+        case let .finalized(result):
+            return .cached(result)
         case let .delivering(task):
-            return try await task.value
+            return .inFlight(task)
         case .undelivered:
             let base = makeBaseLane(record)
             let request = record.finalization
             let shouldFinalize = record.phase == .ready
-            let task = Task<[String: Value], Error> { @MainActor in
+            let task = Task<[String: Value], Error> { @MainActor [weak self] in
                 var result = base
                 if shouldFinalize {
-                    try await finalize(&result, request)
+                    do {
+                        try await finalize(&result, request)
+                    } catch {
+                        self?.finishDelivery(operationID, outcome: .failure(error))
+                        throw error
+                    }
                 }
+                self?.finishDelivery(operationID, outcome: .success(result))
                 return result
             }
+            // The task body cannot run before this synchronous MainActor segment ends.
             record.delivery = .delivering(task)
+            record.deliveryStartedAt = dependencies.now()
             bumpRevision()
-            do {
-                let result = try await task.value
-                // Re-read: eviction or teardown may have removed the record while finalizing.
-                if let current = records[operationID] {
-                    current.delivery = .delivered(result, dependencies.now())
-                    bumpRevision()
-                }
-                return result
-            } catch {
-                if let current = records[operationID] {
-                    current.delivery = .undelivered
-                    bumpRevision()
-                }
-                throw error
+            return .inFlight(task)
+        }
+    }
+
+    private func finishDelivery(_ operationID: UUID, outcome: Result<[String: Value], Error>) {
+        // Re-read: eviction or teardown may have removed the record while finalizing.
+        if let current = records[operationID], case .delivering = current.delivery {
+            current.deliveryStartedAt = nil
+            switch outcome {
+            case let .success(result):
+                current.delivery = .finalized(result)
+            case .failure:
+                current.delivery = .undelivered
             }
+            bumpRevision()
+        }
+        let observation: DeliveryObservation = switch outcome {
+        case let .success(result): .delivered(result)
+        case let .failure(error): .failed(error)
+        }
+        for waiterID in Array(deliveryWaiters.keys) {
+            guard var waiter = deliveryWaiters[waiterID],
+                  waiter.inFlight.remove(operationID) != nil
+            else { continue }
+            waiter.observations[operationID] = observation
+            deliveryWaiters[waiterID] = waiter
+            if waiter.inFlight.isEmpty {
+                resumeDeliveryWaiter(waiterID, remainingOutcome: .settled)
+            }
+        }
+    }
+
+    private func scheduleDeliveryDeadline(_ waiterID: UUID) {
+        guard var waiter = deliveryWaiters[waiterID] else { return }
+        waiter.deadlineTask?.cancel()
+        let deadline = waiter.deadline
+        waiter.deadlineTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(until: deadline, clock: .continuous)
+            guard !Task.isCancelled else { return }
+            self?.expireDeliveryWaiter(waiterID)
+        }
+        deliveryWaiters[waiterID] = waiter
+    }
+
+    private func expireDeliveryWaiter(_ waiterID: UUID) {
+        guard let waiter = deliveryWaiters[waiterID] else { return }
+        resumeDeliveryWaiter(waiterID, remainingOutcome: waiter.steeringWoken ? .steering : .deadline)
+    }
+
+    /// A wake while parked keeps completion-beats-wake for fast finalization but caps the
+    /// remaining bound at the steering grace.
+    private func steerDeliveryWaiter(_ waiterID: UUID) {
+        guard var waiter = deliveryWaiters[waiterID], !waiter.steeringWoken else { return }
+        waiter.steeringWoken = true
+        let graceDeadline = ContinuousClock.now.advanced(by: .seconds(max(0, waiter.steeringGraceSeconds)))
+        waiter.deadline = min(waiter.deadline, graceDeadline)
+        deliveryWaiters[waiterID] = waiter
+        scheduleDeliveryDeadline(waiterID)
+    }
+
+    private func resumeDeliveryWaiter(_ waiterID: UUID, remainingOutcome: WaitOutcome) {
+        guard let waiter = deliveryWaiters.removeValue(forKey: waiterID) else { return }
+        waiter.deadlineTask?.cancel()
+        waiter.externalWake?.unsubscribe()
+        var observations = waiter.observations
+        for operationID in waiter.inFlight {
+            observations[operationID] = .pending(remainingOutcome)
+        }
+        waiter.continuation.resume(returning: observations)
+    }
+
+    /// Seconds the lane's in-flight finalization has been running, or nil when it is not
+    /// finalizing.
+    func finalizationAgeSeconds(for operationID: UUID) -> Int? {
+        finalizationAge(records[operationID]).map { Int($0) }
+    }
+
+    private func finalizationAge(_ record: Record?) -> TimeInterval? {
+        guard let record, case .delivering = record.delivery, let startedAt = record.deliveryStartedAt else {
+            return nil
+        }
+        return max(0, dependencies.now().timeIntervalSince(startedAt))
+    }
+
+    /// Stamps first collection for lanes whose finalized result the caller is returning to the
+    /// parent right now. Called only after the caller's last suspension, never for a cancelled
+    /// or discarded observation, so a background finalization or a dropped result stays in
+    /// id-less recovery.
+    func noteCollected(_ operationIDs: [UUID]) {
+        var changed = false
+        for operationID in operationIDs {
+            guard let record = records[operationID],
+                  case .finalized = record.delivery,
+                  record.collectedAt == nil
+            else { continue }
+            record.collectedAt = dependencies.now()
+            changed = true
+        }
+        if changed {
+            bumpRevision()
         }
     }
 
@@ -1172,15 +1421,12 @@ final class OracleMCPOperationStore: ObservableObject {
         var evicted: [Record] = []
         for id in creationOrder {
             guard let record = records[id], record.phase.isTerminal else { continue }
-            switch record.delivery {
-            case let .delivered(_, at):
-                if now.timeIntervalSince(at) > Self.deliveredRetentionSeconds {
+            if let collectedAt = record.collectedAt {
+                if now.timeIntervalSince(collectedAt) > Self.deliveredRetentionSeconds {
                     evicted.append(record)
                 }
-            case .undelivered, .delivering:
-                if now.timeIntervalSince(record.terminalAt ?? record.createdAt) > Self.undeliveredRetentionSeconds {
-                    evicted.append(record)
-                }
+            } else if now.timeIntervalSince(record.terminalAt ?? record.createdAt) > Self.undeliveredRetentionSeconds {
+                evicted.append(record)
             }
         }
         for record in evicted {
@@ -1194,8 +1440,8 @@ final class OracleMCPOperationStore: ObservableObject {
         if terminal.count > Self.maxTerminalRecords {
             // Oldest delivered first, then oldest undelivered.
             terminal.sort { lhs, rhs in
-                let lhsDelivered = lhs.delivery.state == .delivered
-                let rhsDelivered = rhs.delivery.state == .delivered
+                let lhsDelivered = lhs.collectedAt != nil
+                let rhsDelivered = rhs.collectedAt != nil
                 if lhsDelivered != rhsDelivered { return lhsDelivered }
                 return lhs.createdAt < rhs.createdAt
             }
@@ -1269,6 +1515,9 @@ final class OracleMCPOperationStore: ObservableObject {
         for waiterID in Array(waiters.keys) {
             resumeWaiter(waiterID, outcome: .cancelled)
         }
+        for waiterID in Array(deliveryWaiters.keys) {
+            resumeDeliveryWaiter(waiterID, remainingOutcome: .cancelled)
+        }
     }
 
     // MARK: - Helpers
@@ -1283,15 +1532,14 @@ final class OracleMCPOperationStore: ObservableObject {
     }
 
     private func deliveredAt(_ record: Record) -> Date? {
-        if case let .delivered(_, at) = record.delivery { return at }
-        return nil
+        record.collectedAt
     }
 
     private func makeSnapshot(_ record: Record) -> Snapshot {
         Snapshot(
             operationID: record.operationID,
             phase: record.phase,
-            delivery: record.delivery.state,
+            delivery: record.deliveryState,
             createdAt: record.createdAt,
             terminalAt: record.terminalAt,
             deliveredAt: deliveredAt(record),
@@ -1425,6 +1673,10 @@ final class OracleMCPOperationStore: ObservableObject {
 
         func test_waiterCount() -> Int {
             waiters.count
+        }
+
+        func test_deliveryWaiterCount() -> Int {
+            deliveryWaiters.count
         }
 
         func test_ownsPin(_ operationID: UUID) -> Bool {

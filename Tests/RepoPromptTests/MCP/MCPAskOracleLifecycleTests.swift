@@ -328,7 +328,13 @@ final class MCPAskOracleLifecycleTests: XCTestCase {
 
     @MainActor
     private final class AskResultBox {
-        var result: Result<[String: Value], Error>?
+        var result: Result<[String: Value], Error>? {
+            didSet {
+                if returnedAt == nil { returnedAt = ContinuousClock.now }
+            }
+        }
+
+        private(set) var returnedAt: ContinuousClock.Instant?
     }
 
     private func withFixture(
@@ -1007,7 +1013,7 @@ final class MCPAskOracleLifecycleTests: XCTestCase {
 
             server.test_endToolExecution(executionID: execution.executionID)
             let drained = await drainTask.value
-            XCTAssertTrue(drained)
+            XCTAssertEqual(drained, .drained)
             XCTAssertFalse(server.test_oracleWaitScopeExists(executionID: execution.executionID))
             XCTAssertFalse(server.hasActiveToolExecutions(runID: fixture.runID))
 
@@ -2634,6 +2640,400 @@ final class MCPAskOracleLifecycleTests: XCTestCase {
             XCTAssertNotNil(delivered[1]["export_failed_warning"])
             XCTAssertEqual(fixture.store.snapshot(firstID)?.delivery, .delivered)
             XCTAssertEqual(fixture.store.snapshot(secondID)?.delivery, .delivered)
+        }
+    }
+
+    /// Regression for a steering rejection behind an answered Oracle whose once-only export
+    /// stalled: a timeout-zero poll and a steering wake must both return pending promptly,
+    /// the shared export must run exactly once, and a later wait must collect its result.
+    func testStalledFinalizationKeepsPollAndSteeringBoundedAndExportsOnce() async throws {
+        try await withFixture { fixture in
+            let exportGate = TestReleaseFence(name: "ask_oracle stalled export gate")
+            defer { exportGate.release() }
+            let exportCounter = ExportCounter()
+            fixture.window.mcpServer.setOracleExportOverrideForTesting { request in
+                exportCounter.count += 1
+                await exportGate.enterAndWait()
+                return OracleExportFile(path: "/tmp/oracle-\(request.chatID ?? "chat").md", instruction: "read it")
+            }
+            let pending = try await fixture.ask([
+                "timeout_seconds": .int(0),
+                "response_mode": .string("tail")
+            ])
+            let operationID = try operationID(in: pending)
+            try await fixture.harness.waitUntilOpen(count: 1)
+            fixture.harness.finish(index: 0, text: "Answer held behind a stalled export")
+            try await fixture.waitUntilTerminal(operationID)
+            let server = fixture.window.mcpServer
+            let store = fixture.store
+
+            // A watchdog turns a liveness regression into a failure instead of a suite hang.
+            final class WatchdogFlag { var fired = false }
+            let watchdogFlag = WatchdogFlag()
+            let watchdog = Task { @MainActor in
+                try? await Task.sleep(for: .seconds(10))
+                guard !Task.isCancelled else { return }
+                watchdogFlag.fired = true
+                exportGate.release()
+            }
+            defer { watchdog.cancel() }
+
+            // 1. An id-less timeout-zero poll starts the export, which stalls; the poll still returns.
+            let pollRegistered = await server.test_beginResolvedToolExecution(
+                metadata: fixture.metadata,
+                resolvedContext: nil,
+                toolName: MCPWindowToolName.askOracle,
+                toolArgs: ["op": .string("wait")]
+            )
+            let pollExecution = try XCTUnwrap(pollRegistered)
+            let pollStart = ContinuousClock.now
+            let polled = try await MCPServerViewModel.$currentToolExecutionID.withValue(pollExecution.executionID) {
+                try await fixture.call(["op": .string("wait"), "timeout_seconds": .int(0)])
+            }
+            let pollElapsed = pollStart.duration(to: ContinuousClock.now)
+            XCTAssertFalse(watchdogFlag.fired, "the poll only returned after the watchdog released the export")
+            guard !watchdogFlag.fired else { return }
+            server.test_endToolExecution(executionID: pollExecution.executionID)
+            await exportGate.waitUntilEntered(timeout: 5)
+            XCTAssertLessThan(pollElapsed, .seconds(3), "a timeout-zero poll gets only the one-second delivery minimum")
+            XCTAssertEqual(polled["wait"]?.objectValue?["result"]?.stringValue, "polled")
+            let polledLane = try XCTUnwrap(try lanes(in: polled).first)
+            XCTAssertEqual(polledLane["status"]?.stringValue, "pending")
+            XCTAssertEqual(polledLane["pending"]?.objectValue?["stream_state"]?.stringValue, "terminal")
+            XCTAssertNotNil(polledLane["pending"]?.objectValue?["finalizing_seconds"])
+            XCTAssertNil(polledLane["response"])
+            XCTAssertEqual(polled["note"]?.stringValue, MCPOracleToolService.finalizingNote)
+            XCTAssertEqual(store.snapshot(operationID)?.delivery, .delivering)
+            XCTAssertEqual(store.test_deliveryWaiterCount(), 0)
+
+            // 2. A long wait parks on the same stalled delivery; the steering drain still succeeds.
+            let waitRegistered = await server.test_beginResolvedToolExecution(
+                metadata: fixture.metadata,
+                resolvedContext: nil,
+                toolName: MCPWindowToolName.askOracle,
+                toolArgs: ["op": .string("wait")]
+            )
+            let waitExecution = try XCTUnwrap(waitRegistered)
+            let resultBox = AskResultBox()
+            let waitTask = Task { @MainActor in
+                do {
+                    let result = try await MCPServerViewModel.$currentToolExecutionID.withValue(waitExecution.executionID) {
+                        try await fixture.call([
+                            "op": .string("wait"),
+                            "operation_ids": .array([.string(operationID.uuidString)]),
+                            "timeout_seconds": .int(30)
+                        ])
+                    }
+                    resultBox.result = .success(result)
+                } catch {
+                    resultBox.result = .failure(error)
+                }
+            }
+            try await AsyncTestWait.waitUntil("wait observes the stalled delivery", timeout: 5) {
+                await MainActor.run { store.test_deliveryWaiterCount() == 1 }
+            }
+            let steerStart = ContinuousClock.now
+            let drainTask = Task { @MainActor in
+                await server.wakeAndDrainAgentRunWaitersOwnedByActiveRun(
+                    runID: fixture.runID,
+                    source: "lifecycle-test-stalled-finalization-drain",
+                    timeoutSeconds: 2
+                ) { _ in nil }
+            }
+            try await AsyncTestWait.waitUntil("steered wait returns within the drain", timeout: 2) {
+                await MainActor.run { resultBox.result != nil }
+            }
+            await waitTask.value
+            XCTAssertLessThan(
+                try steerStart.duration(to: XCTUnwrap(resultBox.returnedAt)),
+                .milliseconds(1500),
+                "the steered wait must return well inside the two-second drain"
+            )
+            watchdog.cancel()
+            XCTAssertFalse(watchdogFlag.fired, "the steered wait only returned after the watchdog released the export")
+            // Emulates runTool cleanup after the tool result is produced.
+            server.test_endToolExecution(executionID: waitExecution.executionID)
+            let drained = await drainTask.value
+            XCTAssertEqual(drained, .drained)
+            let steered = try XCTUnwrap(resultBox.result).get()
+            XCTAssertEqual(steered["wait"]?.objectValue?["result"]?.stringValue, "interrupted_by_steering")
+            XCTAssertEqual(steered["_meta"]?.objectValue?["wake_reason"]?.stringValue, MCPOracleToolService.steeringWakeReason)
+            XCTAssertEqual(try lanes(in: steered).first?["status"]?.stringValue, "pending")
+            XCTAssertEqual(store.snapshot(operationID)?.delivery, .delivering)
+            XCTAssertEqual(store.test_deliveryWaiterCount(), 0)
+            XCTAssertEqual(exportCounter.count, 1, "observers never restart or duplicate the shared export")
+
+            // 3. The shared finalization completes once with no observer attached. That is not
+            // collection: the id-less (post-compaction) recovery wait still finds and returns it.
+            exportGate.release()
+            try await AsyncTestWait.waitUntil("shared delivery finished", timeout: 5) {
+                await MainActor.run { store.snapshot(operationID)?.delivery != .delivering }
+            }
+            XCTAssertEqual(store.snapshot(operationID)?.delivery, .undelivered)
+            let collected = try await fixture.call(["op": .string("wait")])
+            XCTAssertEqual(collected["wait"]?.objectValue?["result"]?.stringValue, "completed")
+            let collectedLane = try XCTUnwrap(try lanes(in: collected).first)
+            XCTAssertEqual(collectedLane["status"]?.stringValue, "completed")
+            XCTAssertEqual(collectedLane["response_mode"]?.stringValue, "tail")
+            XCTAssertNotNil(collectedLane["oracle_export_path"])
+            XCTAssertEqual(store.snapshot(operationID)?.delivery, .delivered)
+            XCTAssertEqual(exportCounter.count, 1)
+            XCTAssertEqual(fixture.harness.openedStreamCount, 1)
+        }
+    }
+
+    /// The originating bounded send that observes its own answer while finalization stalls
+    /// returns a resumable pending stub on steering instead of holding the run.
+    func testSingleSendStalledFinalizationReturnsPendingOnSteering() async throws {
+        try await withFixture { fixture in
+            let exportGate = TestReleaseFence(name: "ask_oracle single-send export gate")
+            defer { exportGate.release() }
+            let exportCounter = ExportCounter()
+            fixture.window.mcpServer.setOracleExportOverrideForTesting { request in
+                exportCounter.count += 1
+                await exportGate.enterAndWait()
+                return OracleExportFile(path: "/tmp/oracle-\(request.chatID ?? "chat").md", instruction: "read it")
+            }
+            let server = fixture.window.mcpServer
+            let registered = await server.test_beginResolvedToolExecution(
+                metadata: fixture.metadata,
+                resolvedContext: nil,
+                toolName: MCPWindowToolName.askOracle
+            )
+            let execution = try XCTUnwrap(registered)
+            let resultBox = AskResultBox()
+            let askTask = Task { @MainActor in
+                do {
+                    let result = try await MCPServerViewModel.$currentToolExecutionID.withValue(execution.executionID) {
+                        try await fixture.ask(["timeout_seconds": .int(30), "response_mode": .string("none")])
+                    }
+                    resultBox.result = .success(result)
+                } catch {
+                    resultBox.result = .failure(error)
+                }
+            }
+            try await fixture.harness.waitUntilOpen(count: 1)
+            let operationID = try XCTUnwrap(fixture.store.test_creationOrder().first)
+            fixture.harness.finish(index: 0, text: "Single-send answer")
+            await exportGate.waitUntilEntered(timeout: 5)
+            try await AsyncTestWait.waitUntil("send observes the stalled delivery", timeout: 5) {
+                await MainActor.run { fixture.store.test_deliveryWaiterCount() == 1 }
+            }
+
+            let steerStart = ContinuousClock.now
+            let drainTask = Task { @MainActor in
+                await server.wakeAndDrainAgentRunWaitersOwnedByActiveRun(
+                    runID: fixture.runID,
+                    source: "lifecycle-test-single-send-stalled-finalization",
+                    timeoutSeconds: 2
+                ) { _ in nil }
+            }
+            try await AsyncTestWait.waitUntil("steered send returns within the drain", timeout: 2) {
+                await MainActor.run { resultBox.result != nil }
+            }
+            await askTask.value
+            XCTAssertLessThan(
+                try steerStart.duration(to: XCTUnwrap(resultBox.returnedAt)),
+                .milliseconds(1500),
+                "the steered send must return well inside the two-second drain"
+            )
+            server.test_endToolExecution(executionID: execution.executionID)
+            let drained = await drainTask.value
+            XCTAssertEqual(drained, .drained)
+
+            let steered = try XCTUnwrap(resultBox.result).get()
+            XCTAssertEqual(steered["status"]?.stringValue, "pending")
+            XCTAssertEqual(steered["pending"]?.objectValue?["reason"]?.stringValue, "interrupted_by_steering")
+            XCTAssertEqual(steered["pending"]?.objectValue?["stream_state"]?.stringValue, "terminal")
+            XCTAssertEqual(steered["_meta"]?.objectValue?["wake_reason"]?.stringValue, MCPOracleToolService.steeringWakeReason)
+            XCTAssertEqual(try self.operationID(in: steered), operationID)
+            XCTAssertNotNil(steered["resume"])
+            XCTAssertEqual(steered["note"]?.stringValue, MCPOracleToolService.finalizingNote)
+            XCTAssertNil(steered["response"])
+            XCTAssertLessThanOrEqual(
+                try encodedByteCount(steered),
+                MCPOracleToolService.pendingStubByteCeiling,
+                "terminal steering pending stub exceeded the byte ceiling"
+            )
+
+            exportGate.release()
+            let collected = try await fixture.call([
+                "op": .string("wait"),
+                "operation_ids": .array([.string(operationID.uuidString)])
+            ])
+            XCTAssertEqual(collected["wait"]?.objectValue?["result"]?.stringValue, "completed")
+            let lane = try XCTUnwrap(try lanes(in: collected).first)
+            XCTAssertEqual(lane["response_mode"]?.stringValue, "none")
+            XCTAssertNotNil(lane["oracle_export_path"])
+            XCTAssertEqual(exportCounter.count, 1)
+        }
+    }
+
+    /// A lane evicted while its stalled finalization is observed reports as expired, never as
+    /// pending or resumable.
+    func testEvictionDuringStalledFinalizationReportsExpiredLaneNotPending() async throws {
+        try await withFixture { fixture in
+            let exportGate = TestReleaseFence(name: "ask_oracle eviction export gate")
+            defer { exportGate.release() }
+            let exportCounter = ExportCounter()
+            fixture.window.mcpServer.setOracleExportOverrideForTesting { request in
+                exportCounter.count += 1
+                await exportGate.enterAndWait()
+                return OracleExportFile(path: "/tmp/oracle-\(request.chatID ?? "chat").md", instruction: "read it")
+            }
+            let pending = try await fixture.ask([
+                "timeout_seconds": .int(0),
+                "response_mode": .string("tail")
+            ])
+            let operationID = try operationID(in: pending)
+            try await fixture.harness.waitUntilOpen(count: 1)
+            fixture.harness.finish(index: 0, text: "Answer evicted mid-finalization")
+            try await fixture.waitUntilTerminal(operationID)
+            let store = fixture.store
+
+            let resultBox = AskResultBox()
+            let waitTask = Task { @MainActor in
+                do {
+                    let result = try await fixture.call([
+                        "op": .string("wait"),
+                        "operation_ids": .array([.string(operationID.uuidString)]),
+                        "timeout_seconds": .int(2)
+                    ])
+                    resultBox.result = .success(result)
+                } catch {
+                    resultBox.result = .failure(error)
+                }
+            }
+            try await AsyncTestWait.waitUntil("wait observes the stalled delivery", timeout: 2) {
+                await MainActor.run { store.test_deliveryWaiterCount() == 1 }
+            }
+            store.purge(now: Date().addingTimeInterval(OracleMCPOperationStore.undeliveredRetentionSeconds + 60))
+            XCTAssertNil(store.snapshot(operationID), "the stalled lane must be evicted for this test")
+            await waitTask.value
+
+            let result = try XCTUnwrap(resultBox.result).get()
+            let wait = try XCTUnwrap(result["wait"]?.objectValue)
+            XCTAssertEqual(wait["result"]?.stringValue, "completed_with_errors")
+            XCTAssertEqual(wait["pending_operation_ids"]?.arrayValue?.count, 0)
+            XCTAssertNil(wait["retryable_operation_ids"])
+            XCTAssertNil(result["resume"], "an evicted lane must not be advertised as resumable")
+            let lane = try XCTUnwrap(try lanes(in: result).first)
+            XCTAssertEqual(
+                lane["error"]?.objectValue?["code"]?.stringValue,
+                ChatToolErrorCode.oracleOperationExpired.rawValue
+            )
+            XCTAssertEqual(exportCounter.count, 1)
+        }
+    }
+
+    /// The originating send whose lane is evicted while its stalled finalization is observed
+    /// throws the typed expiry error with the recovery chat_id, not a pending stub.
+    func testSingleSendEvictionDuringStalledFinalizationThrowsExpired() async throws {
+        try await withFixture { fixture in
+            let exportGate = TestReleaseFence(name: "ask_oracle single-send eviction export gate")
+            defer { exportGate.release() }
+            let exportCounter = ExportCounter()
+            fixture.window.mcpServer.setOracleExportOverrideForTesting { request in
+                exportCounter.count += 1
+                await exportGate.enterAndWait()
+                return OracleExportFile(path: "/tmp/oracle-\(request.chatID ?? "chat").md", instruction: "read it")
+            }
+            let resultBox = AskResultBox()
+            let askTask = Task { @MainActor in
+                do {
+                    let result = try await fixture.ask(["timeout_seconds": .int(3), "response_mode": .string("none")])
+                    resultBox.result = .success(result)
+                } catch {
+                    resultBox.result = .failure(error)
+                }
+            }
+            try await fixture.harness.waitUntilOpen(count: 1)
+            let operationID = try XCTUnwrap(fixture.store.test_creationOrder().first)
+            fixture.harness.finish(index: 0, text: "Single-send answer evicted mid-finalization")
+            await exportGate.waitUntilEntered(timeout: 5)
+            try await AsyncTestWait.waitUntil("send observes the stalled delivery", timeout: 5) {
+                await MainActor.run { fixture.store.test_deliveryWaiterCount() == 1 }
+            }
+            fixture.store.purge(now: Date().addingTimeInterval(OracleMCPOperationStore.undeliveredRetentionSeconds + 60))
+            XCTAssertNil(fixture.store.snapshot(operationID), "the stalled lane must be evicted for this test")
+            await askTask.value
+
+            switch try XCTUnwrap(resultBox.result) {
+            case let .success(result):
+                XCTFail("expected a typed expiry error, got \(result)")
+            case let .failure(error):
+                let toolError = try XCTUnwrap(error as? ChatToolError, "unexpected error \(error)")
+                XCTAssertEqual(toolError.code, .oracleOperationExpired)
+                XCTAssertEqual(toolError.details?["operation_id"], operationID.uuidString)
+                XCTAssertNotNil(toolError.details?["chat_id"])
+            }
+            XCTAssertEqual(exportCounter.count, 1)
+        }
+    }
+
+    /// Collection is committed only after the invocation's final suspension: a send cancelled
+    /// while its completion progress is in flight leaves the finalized lane recoverable.
+    func testCancellationDuringCompletionProgressLeavesDeliveredLaneRecoverable() async throws {
+        for batch in [false, true] {
+            try await withFixture(batch ? "collect-after-progress-batch" : "collect-after-progress-single") { fixture in
+                if batch {
+                    _ = try fixture.activateAgentRunForBatch()
+                }
+                let exportCounter = ExportCounter()
+                fixture.window.mcpServer.setOracleExportOverrideForTesting { request in
+                    exportCounter.count += 1
+                    return OracleExportFile(path: "/tmp/oracle-\(request.chatID ?? "chat").md", instruction: "read it")
+                }
+                let progressGate = TestReleaseFence(name: "ask_oracle completion progress gate")
+                defer { progressGate.release() }
+                fixture.window.mcpServer.setStageProgressObserverForTesting { _, stage in
+                    guard stage == "complete" else { return }
+                    await progressGate.enterAndWait()
+                }
+                defer { fixture.window.mcpServer.setStageProgressObserverForTesting(nil) }
+
+                let resultBox = AskResultBox()
+                let sendTask = Task { @MainActor in
+                    do {
+                        let result = if batch {
+                            try await fixture.call([
+                                "consultations": batchConsultations(fixture: fixture, count: 1, responseModeForLast: "tail")
+                            ])
+                        } else {
+                            try await fixture.ask(["timeout_seconds": .int(30), "response_mode": .string("tail")])
+                        }
+                        resultBox.result = .success(result)
+                    } catch {
+                        resultBox.result = .failure(error)
+                    }
+                }
+                try await fixture.harness.waitUntilOpen(count: 1)
+                let operationID = try XCTUnwrap(fixture.store.test_creationOrder().first)
+                fixture.harness.finish(index: 0, text: "Answer cancelled at completion progress")
+                await progressGate.waitUntilEntered(timeout: 5)
+                XCTAssertEqual(
+                    fixture.store.snapshot(operationID)?.delivery,
+                    .undelivered,
+                    "nothing is collected before the final suspension"
+                )
+                sendTask.cancel()
+                progressGate.release()
+                await sendTask.value
+                fixture.window.mcpServer.setStageProgressObserverForTesting(nil)
+                XCTAssertEqual(
+                    fixture.store.snapshot(operationID)?.delivery,
+                    .undelivered,
+                    "a cancelled invocation collects nothing"
+                )
+
+                let recovered = try await fixture.call(["op": .string("wait")])
+                XCTAssertEqual(recovered["wait"]?.objectValue?["result"]?.stringValue, "completed")
+                let lane = try XCTUnwrap(try lanes(in: recovered).first)
+                XCTAssertEqual(lane["operation_id"]?.stringValue, operationID.uuidString)
+                XCTAssertNotNil(lane["oracle_export_path"])
+                XCTAssertEqual(fixture.store.snapshot(operationID)?.delivery, .delivered)
+                XCTAssertEqual(exportCounter.count, 1, "recovery replays the cached result without exporting again")
+            }
         }
     }
 

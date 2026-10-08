@@ -13,9 +13,40 @@ final class AgentRunWaitDrainIntegrationTests: XCTestCase {
             XCTAssertTrue(harness.server.test_oracleWaitScopeExists(executionID: executionID))
             let drained = await harness.drain(source: "test-oracle-only-drain")
 
-            XCTAssertTrue(drained)
+            XCTAssertEqual(drained, .drained)
             XCTAssertFalse(harness.server.test_oracleWaitScopeExists(executionID: executionID))
             XCTAssertFalse(harness.server.hasActiveToolExecutions(runID: harness.parentRunID))
+        }
+    }
+
+    func testRealDrainTimeoutReportsOracleOnlyBlockerWithoutChildAttribution() async throws {
+        try await AgentRunWaitDrainTestHarness.withHarness { harness in
+            // An Oracle invocation that never returns after its wake (for example, suspended in
+            // result finalization) is the only blocker; no child agent_run wait exists.
+            let executionID = try await harness.beginOracleResumableWait()
+            XCTAssertFalse(harness.server.hasActiveChildAgentRunWaits(runID: harness.parentRunID))
+
+            let outcome = await harness.drain(source: "test-oracle-only-timeout", timeoutSeconds: 0.2)
+
+            guard case let .timedOut(blockers) = outcome else {
+                return XCTFail("Expected a timed-out drain, got \(outcome)")
+            }
+            XCTAssertEqual(blockers.childAgentRunWaitCount, 0)
+            XCTAssertNil(blockers.oldestChildAgentRunWaitAgeSeconds)
+            XCTAssertEqual(blockers.oracleInvocationCount, 1)
+            XCTAssertNotNil(blockers.oldestOracleInvocationAgeSeconds)
+            XCTAssertTrue(harness.server.oracleWaitScopeSteeringRequested(executionID: executionID))
+            XCTAssertTrue(
+                harness.server.test_oracleWaitScopeExists(executionID: executionID),
+                "a timed-out drain never force-unregisters still-active Oracle work"
+            )
+            let message = CodexAgentModeCoordinator.activeSendDrainFailureMessage(blockers)
+            XCTAssertTrue(message.contains("1 ask_oracle invocation"))
+            XCTAssertFalse(message.contains("agent_run.wait"))
+
+            harness.server.test_endToolExecution(executionID: executionID)
+            let drained = await harness.drain(source: "test-oracle-only-timeout-recovered")
+            XCTAssertEqual(drained, .drained)
         }
     }
 
@@ -49,7 +80,7 @@ final class AgentRunWaitDrainIntegrationTests: XCTestCase {
             harness.endOracleExecutionOnWake(execution.executionID)
 
             let drainedBeforeResolutionCompleted = await drainTask.value
-            XCTAssertTrue(drainedBeforeResolutionCompleted)
+            XCTAssertEqual(drainedBeforeResolutionCompleted, .drained)
             XCTAssertFalse(harness.server.test_oracleWaitScopeExists(executionID: execution.executionID))
             XCTAssertFalse(harness.server.hasActiveToolExecutions(runID: harness.parentRunID))
 
@@ -83,7 +114,7 @@ final class AgentRunWaitDrainIntegrationTests: XCTestCase {
             }
             harness.endOracleExecutionOnWake(batchExecution.executionID)
             let batchDrained = await batchDrainTask.value
-            XCTAssertTrue(batchDrained)
+            XCTAssertEqual(batchDrained, .drained)
             XCTAssertFalse(
                 harness.server.test_oracleWaitScopeExists(executionID: batchExecution.executionID)
             )
@@ -99,7 +130,7 @@ final class AgentRunWaitDrainIntegrationTests: XCTestCase {
             harness.endOracleExecutionOnWake(executionID)
 
             let drained = await harness.drain(source: "test-mixed-child-oracle-drain")
-            XCTAssertTrue(drained)
+            XCTAssertEqual(drained, .drained)
             let childValue = try await childWait.value
             XCTAssertEqual(
                 childValue.objectValue?["wait"]?.objectValue?["result"]?.stringValue,
@@ -120,7 +151,7 @@ final class AgentRunWaitDrainIntegrationTests: XCTestCase {
             XCTAssertEqual(harness.activeScopeCount(), 1)
 
             let drained = await harness.drain(source: "test-real-wait-scope-drain")
-            XCTAssertTrue(drained)
+            XCTAssertEqual(drained, .drained)
 
             let interruptedValue = try await firstWait.value
             let interruptedObject = try XCTUnwrap(interruptedValue.objectValue)
@@ -356,11 +387,14 @@ final class AgentRunWaitDrainTestHarness {
         throw AgentRunWaitDrainHarnessError.timedOutWaitingForBlockedScope
     }
 
-    func drain(source: String) async -> Bool {
+    func drain(
+        source: String,
+        timeoutSeconds: TimeInterval = 1
+    ) async -> MCPServerViewModel.AgentRunWaitDrainOutcome {
         await server.wakeAndDrainAgentRunWaitersOwnedByActiveRun(
             runID: parentRunID,
             source: source,
-            timeoutSeconds: 1
+            timeoutSeconds: timeoutSeconds
         ) { [fixture] sessionID in
             guard sessionID == fixture.sessionID else { return nil }
             return (fixture.runningSnapshot, fixture.cursor)

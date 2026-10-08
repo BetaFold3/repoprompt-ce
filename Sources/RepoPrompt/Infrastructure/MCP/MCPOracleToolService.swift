@@ -216,6 +216,12 @@ struct MCPOracleToolService {
     static let pendingStubByteCeiling = 700
 
     static let pendingNote = "Oracle still running; nothing was resent. Use ask_oracle with resume args. Never resend."
+    /// Envelope note when some pending lanes are still running and others have answered with
+    /// finalization still in flight.
+    static let mixedFinalizingNote = "Some Oracle lanes are still running; lanes with pending.finalizing_seconds already answered and are finalizing. Nothing was resent. Use ask_oracle with resume args; if a finalizing lane stays pending, use oracle_chat_log with its chat_id. Never resend."
+    /// Pending note when every pending lane has already answered and only its once-only
+    /// finalization (presentation/export) is still running.
+    static let finalizingNote = "Oracle answered; result still finalizing; nothing was resent. Resume to collect it; if it stays pending, use oracle_chat_log with chat_id. Never resend."
     private static let cancelNote = "Cancel never delivers a result. Collect each lane's final state with ask_oracle op:\"wait\"."
     nonisolated static let steeringWakeReason = "steering_requested"
 
@@ -398,11 +404,9 @@ struct MCPOracleToolService {
             // Tool-task cancellation affects only this observer; the stream keeps running.
             throw CancellationError()
         }
-        let parkedMS = Int(Self.seconds(observationStart.duration(to: clock.now)) * 1000)
 
-        let result: [String: Value]
-        let outcomeLabel: String
-        var stubBytes = 0
+        var effectiveOutcome = outcome
+        var deliveredResult: [String: Value]?
         if operationStore.allSettled([operationID]) {
             if observation.started.startupTask != nil,
                let startupError = operationStore.startupRejection(for: operationID)
@@ -411,19 +415,54 @@ struct MCPOracleToolService {
                 // Bound terminal delivery never joins independent post-bind startup work.
                 throw startupError
             }
-            do {
-                result = try await deliverOperation(operationID)
-            } catch {
+            let owner = operationStore.snapshot(operationID)?.owner
+            let deliveries = try await observeDeliveries(
+                [operationID],
+                observationRemaining: Self.remainingTimeout(
+                    selection: selection,
+                    elapsed: observationStart.duration(to: clock.now)
+                ),
+                connectionID: connectionID,
+                invocation: invocation
+            )
+            switch deliveries[operationID] {
+            case let .delivered(delivered):
+                deliveredResult = delivered
+            case let .failed(error):
+                // A record that vanished during the delivery hop was not a completed lane.
+                if operationStore.snapshot(operationID) == nil {
+                    throw evictedDuringDeliveryError(operationID, owner: owner)
+                }
                 throw ChatToolError(
                     code: .internalError,
                     message: "ask_oracle could not deliver operation \(operationID.uuidString): \(error.localizedDescription). Retry with op:\"wait\" and this operation_id; the completed lane was not consumed.",
                     details: ["operation_id": operationID.uuidString]
                 )
+            case .pending(.cancelled):
+                throw CancellationError()
+            case let .pending(deliveryOutcome):
+                // Answered, but once-only finalization is still running: report pending and
+                // let a later wait collect the cached result.
+                guard operationStore.snapshot(operationID) != nil else {
+                    throw evictedDuringDeliveryError(operationID, owner: owner)
+                }
+                effectiveOutcome = deliveryOutcome
+            case nil:
+                throw MCPError.internalError("ask_oracle lost the delivery observation for \(operationID.uuidString)")
             }
+        }
+        // Includes delivery observation, so a stalled finalization is visible in diagnostics.
+        let parkedMS = Int(Self.seconds(observationStart.duration(to: clock.now)) * 1000)
+
+        let result: [String: Value]
+        let outcomeLabel: String
+        var stubBytes = 0
+        let wakeReason = waitWakeReason(outcome: effectiveOutcome, invocation: invocation)
+        if let deliveredResult {
+            result = deliveredResult
             outcomeLabel = result["status"]?.stringValue ?? "completed"
         } else {
-            let wakeReason = waitWakeReason(outcome: outcome, invocation: invocation)
-            let reason = Self.pendingReason(outcome: outcome, selection: selection, wakeReason: wakeReason)
+            let reason = Self.pendingReason(outcome: effectiveOutcome, selection: selection, wakeReason: wakeReason)
             result = pendingStub(
                 operationID,
                 reason: reason,
@@ -444,11 +483,38 @@ struct MCPOracleToolService {
             operationCount: 1,
             stubBytes: stubBytes,
             progressPresent: result["pending"]?.objectValue?["progress"] != nil,
-            wakeReason: result["status"]?.stringValue == "pending" ? waitWakeReason(outcome: outcome, invocation: invocation)?.wireValue : nil
+            wakeReason: result["status"]?.stringValue == "pending" ? wakeReason?.wireValue : nil
         )
 
         await sendStageProgress(connectionID, askOracleToolName, "complete", "Oracle complete")
+        if deliveredResult != nil {
+            commitCollection([operationID])
+        }
         return Self.agentFacingOracleResult(attached)
+    }
+
+    /// Stamps collection for lanes this invocation is returning. Call only after the
+    /// invocation's final suspension; a cancelled invocation collects nothing, so its lanes stay
+    /// in id-less recovery.
+    private func commitCollection(_ operationIDs: [UUID]) {
+        guard !operationIDs.isEmpty, !Task.isCancelled else { return }
+        operationStore.noteCollected(operationIDs)
+    }
+
+    /// Typed error for an originating send whose lane was evicted during delivery observation.
+    private func evictedDuringDeliveryError(
+        _ operationID: UUID,
+        owner: OracleMCPOperationStore.OwnerScope?
+    ) -> ChatToolError {
+        if let owner, case let .expired(tombstone) = operationStore.lookup(operationID, caller: owner) {
+            var details = ["operation_id": operationID.uuidString]
+            details["chat_id"] = tombstone.chatShortID
+            return ChatToolError.oracleOperationExpired(
+                "operation_id \(operationID.uuidString) was evicted while its result was finalizing. Read the chat with oracle_chat_log; do not resend.",
+                details: details
+            )
+        }
+        return ChatToolError.oracleOperationNotFound("operation \(operationID.uuidString) is unknown")
     }
 
     private struct StartedAskOracleOperation {
@@ -621,21 +687,67 @@ struct MCPOracleToolService {
         )
     }
 
-    /// Delivers a terminal operation exactly once (single-flight in the store) and records the
-    /// UI identity sidecar for tool cards.
-    private func deliverOperation(_ operationID: UUID) async throws -> [String: Value] {
-        let tabID = operationStore.snapshot(operationID)?.owner.tabID
-        let result = try await operationStore.deliver(operationID) { result, request in
-            try await finalizeAskOracleResult(&result, request: request)
+    /// Minimum time a terminal lane's once-only finalization (presentation and optional
+    /// export) may take inside an invocation whose answer wait is already spent, such as a
+    /// timeout-zero poll. Mirrors the one-second `agent_run` response presentation budget.
+    static let deliveryMinimumObservationSeconds: TimeInterval = 1.0
+    /// After a steering or delegated-question wake, finalization still in flight may hold the
+    /// invocation at most this long. It must stay well below the two-second Codex active-send
+    /// drain so the steer is not rejected behind a stalled export.
+    static let steeringDeliveryGraceSeconds: TimeInterval = 0.5
+    /// A finalization running at least this long is treated as stuck: no observer waits on it
+    /// beyond this age plus `deliveryMinimumObservationSeconds`, whatever its own budget.
+    static let staleFinalizationSeconds: TimeInterval = 30
+
+    /// Observes the single-flight deliveries (store-owned, exactly once per operation) of
+    /// terminal operations within the invocation's remaining bound and wake scope, and records
+    /// the UI identity sidecar for every delivered lane. A lane still finalizing comes back
+    /// `.pending`; its shared delivery keeps running and a later wait collects the cached result.
+    private func observeDeliveries(
+        _ operationIDs: [UUID],
+        observationRemaining: TimeInterval,
+        connectionID: UUID,
+        invocation: OracleWaitInvocation
+    ) async throws -> [UUID: OracleMCPOperationStore.DeliveryObservation] {
+        guard !operationIDs.isEmpty else { return [:] }
+        let tabIDs = Dictionary(uniqueKeysWithValues: operationIDs.map {
+            ($0, operationStore.snapshot($0)?.owner.tabID)
+        })
+        let wake = externalWake(for: invocation)
+        let capture = HeartbeatCapture<[UUID: OracleMCPOperationStore.DeliveryObservation]>()
+        _ = try await withHeartbeat(
+            connectionID,
+            askOracleToolName,
+            "finalizing",
+            "Finalizing Oracle response..."
+        ) {
+            let observations = await operationStore.observeDelivery(
+                of: operationIDs,
+                timeoutSeconds: max(observationRemaining, Self.deliveryMinimumObservationSeconds),
+                steeringGraceSeconds: Self.steeringDeliveryGraceSeconds,
+                staleFinalizationAgeSeconds: Self.staleFinalizationSeconds,
+                staleFinalizationBoundSeconds: Self.deliveryMinimumObservationSeconds,
+                externalWake: wake
+            ) { result, request in
+                try await finalizeAskOracleResult(&result, request: request)
+            }
+            await capture.store(observations)
+            return [:]
         }
-        if let tabID {
-            noteOracleResultIdentity(result, tabID)
+        guard let observations = capture.value else {
+            throw MCPError.internalError("ask_oracle lost its typed delivery observation")
         }
-        recordDiagnosticsEvent("mcp.oracle.finalize", fields: [
-            "status": result["status"]?.stringValue ?? "unknown",
-            "exported": (result["oracle_export_path"] != nil) ? "1" : "0"
-        ])
-        return result
+        for operationID in operationIDs {
+            guard case let .delivered(result) = observations[operationID] else { continue }
+            if let tabID = tabIDs[operationID] ?? nil {
+                noteOracleResultIdentity(result, tabID)
+            }
+            recordDiagnosticsEvent("mcp.oracle.finalize", fields: [
+                "status": result["status"]?.stringValue ?? "unknown",
+                "exported": (result["oracle_export_path"] != nil) ? "1" : "0"
+            ])
+        }
+        return observations
     }
 
     /// Pending stub (plan §3.2). Never carries `response`; model identity comes from the same
@@ -686,6 +798,9 @@ struct MCPOracleToolService {
             "stream_state": .string(streamState),
             "elapsed_seconds": .int(operationStore.elapsedSeconds(for: operationID) ?? 0)
         ]
+        if let finalizingSeconds = operationStore.finalizationAgeSeconds(for: operationID) {
+            pending["finalizing_seconds"] = .int(finalizingSeconds)
+        }
         if let progress = operationStore.progress(for: operationID) {
             var progressFields: [String: Value] = [:]
             if let outputChars = progress.outputChars {
@@ -704,7 +819,7 @@ struct MCPOracleToolService {
         stub["pending"] = .object(pending)
         if includeResume {
             stub["resume"] = Self.resumeValue([operationID])
-            stub["note"] = .string(Self.pendingNote)
+            stub["note"] = .string(snapshot.phase.isTerminal ? Self.finalizingNote : Self.pendingNote)
             if let wakeReason {
                 stub["_meta"] = .object(["wake_reason": .string(wakeReason.wireValue)])
             }
@@ -845,7 +960,7 @@ struct MCPOracleToolService {
         )
         operationStore.purge()
         let targetIDs = requestedIDs ?? operationStore.undeliveredOperationIDs(owner: caller)
-        return try await observeAskOracleOperations(
+        let observed = try await observeAskOracleOperations(
             targetIDs: targetIDs,
             caller: caller,
             selection: selection,
@@ -854,6 +969,15 @@ struct MCPOracleToolService {
             invocation: invocation,
             op: "wait"
         )
+        commitCollection(observed.deliveredIDs)
+        return observed.value
+    }
+
+    /// An observed envelope plus the lanes it delivers. The caller commits collection for
+    /// `deliveredIDs` only after its own final suspension.
+    private struct ObservedOracleOperations {
+        let value: Value
+        let deliveredIDs: [UUID]
     }
 
     private func observeAskOracleOperations(
@@ -864,7 +988,7 @@ struct MCPOracleToolService {
         connectionID: UUID,
         invocation: OracleWaitInvocation,
         op: String
-    ) async throws -> Value {
+    ) async throws -> ObservedOracleOperations {
         var lanesByID: [UUID: Value] = [:]
         var observable: [UUID] = []
         var hasLaneErrors = false
@@ -910,33 +1034,17 @@ struct MCPOracleToolService {
         if outcome == .cancelled {
             throw CancellationError()
         }
-        let parkedMS = Int(Self.seconds(observationStart.duration(to: clock.now)) * 1000)
 
         // Re-authorize and re-resolve after every suspension. An evicted lane or a delivery
         // failure is lane-local; it never discards successful earlier lanes.
-        var pendingIDs: [UUID] = []
-        var retryableIDs: [UUID] = []
-        var stubBytes = 0
-        var progressPresent = false
-        let wakeReason = waitWakeReason(outcome: outcome, invocation: invocation)
-        let laneReason = Self.pendingReason(outcome: outcome, selection: selection, wakeReason: wakeReason)
+        var terminalIDs: [UUID] = []
+        var nonterminalIDs: Set<UUID> = []
         for id in observable {
             switch operationStore.lookup(id, caller: caller) {
             case let .found(snapshot) where snapshot.phase.isTerminal:
-                do {
-                    let delivered = try await deliverOperation(id)
-                    lanesByID[id] = .object(delivered)
-                } catch {
-                    retryableIDs.append(id)
-                    hasLaneErrors = true
-                    lanesByID[id] = deliveryFailureLane(id, error: error)
-                }
+                terminalIDs.append(id)
             case .found:
-                pendingIDs.append(id)
-                let stub = pendingStub(id, reason: laneReason, includeResume: false, wakeReason: nil)
-                stubBytes += Self.approximateByteCount(.object(stub))
-                progressPresent = progressPresent || stub["pending"]?.objectValue?["progress"] != nil
-                lanesByID[id] = .object(stub)
+                nonterminalIDs.insert(id)
             case let .expired(tombstone):
                 lanesByID[id] = Self.expiredLane(tombstone)
                 hasLaneErrors = true
@@ -946,12 +1054,77 @@ struct MCPOracleToolService {
             }
         }
 
+        // Terminal lanes are collected through their once-only delivery, bounded by what is
+        // left of this observation (at least the delivery minimum) and by the wake scope.
+        let deliveries = try await observeDeliveries(
+            terminalIDs,
+            observationRemaining: max(0, timeoutSeconds - Self.seconds(observationStart.duration(to: clock.now))),
+            connectionID: connectionID,
+            invocation: invocation
+        )
+        var effectiveOutcome = outcome
+        for id in terminalIDs {
+            guard case let .pending(deliveryOutcome) = deliveries[id] else { continue }
+            if deliveryOutcome == .cancelled {
+                throw CancellationError()
+            }
+            if deliveryOutcome == .steering {
+                effectiveOutcome = .steering
+            } else if effectiveOutcome == .settled {
+                effectiveOutcome = deliveryOutcome
+            }
+        }
+        // Includes delivery observation, so a stalled finalization is visible in diagnostics.
+        let parkedMS = Int(Self.seconds(observationStart.duration(to: clock.now)) * 1000)
+
+        var pendingIDs: [UUID] = []
+        var retryableIDs: [UUID] = []
+        var stubBytes = 0
+        var progressPresent = false
+        let wakeReason = waitWakeReason(outcome: effectiveOutcome, invocation: invocation)
+        let laneReason = Self.pendingReason(outcome: effectiveOutcome, selection: selection, wakeReason: wakeReason)
+        for id in observable where nonterminalIDs.contains(id) || deliveries[id] != nil {
+            switch deliveries[id] {
+            case let .delivered(delivered):
+                lanesByID[id] = .object(delivered)
+            case let .failed(error):
+                hasLaneErrors = true
+                // Eviction during the delivery hop is expiry, not a retryable delivery failure.
+                switch operationStore.lookup(id, caller: caller) {
+                case let .expired(tombstone):
+                    lanesByID[id] = Self.expiredLane(tombstone)
+                case .notFound:
+                    lanesByID[id] = Self.unknownLane(id)
+                case .found:
+                    retryableIDs.append(id)
+                    lanesByID[id] = deliveryFailureLane(id, error: error)
+                }
+            case .pending, nil:
+                // Still running, or answered with finalization still in flight. Re-resolve:
+                // a lane evicted during the delivery hop is expired, never pending/resumable.
+                switch operationStore.lookup(id, caller: caller) {
+                case let .expired(tombstone):
+                    hasLaneErrors = true
+                    lanesByID[id] = Self.expiredLane(tombstone)
+                case .notFound:
+                    hasLaneErrors = true
+                    lanesByID[id] = Self.unknownLane(id)
+                case .found:
+                    pendingIDs.append(id)
+                    let stub = pendingStub(id, reason: laneReason, includeResume: false, wakeReason: nil)
+                    stubBytes += Self.approximateByteCount(.object(stub))
+                    progressPresent = progressPresent || stub["pending"]?.objectValue?["progress"] != nil
+                    lanesByID[id] = .object(stub)
+                }
+            }
+        }
+
         // Precedence: all terminal → lane-local errors → steering → poll → deadline.
         let waitResult = if pendingIDs.isEmpty, retryableIDs.isEmpty, !hasLaneErrors {
             "completed"
         } else if pendingIDs.isEmpty {
             "completed_with_errors"
-        } else if outcome == .steering {
+        } else if effectiveOutcome == .steering {
             laneReason
         } else if selection.mode == .poll {
             "polled"
@@ -966,6 +1139,10 @@ struct MCPOracleToolService {
         if !retryableIDs.isEmpty {
             wait["retryable_operation_ids"] = .array(retryableIDs.map { .string($0.uuidString) })
         }
+        let deliveredIDs = terminalIDs.filter { id in
+            if case .delivered = deliveries[id] { return true }
+            return false
+        }
         var envelope: [String: Value] = [
             "results": .array(targetIDs.compactMap { lanesByID[$0] }),
             "wait": .object(wait)
@@ -973,7 +1150,12 @@ struct MCPOracleToolService {
         let resumeIDs = pendingIDs + retryableIDs
         if !resumeIDs.isEmpty {
             envelope["resume"] = Self.resumeValue(resumeIDs)
-            envelope["note"] = .string(Self.pendingNote)
+            let finalizingCount = pendingIDs.count { deliveries[$0] != nil }
+            envelope["note"] = .string(
+                finalizingCount == 0 ? Self.pendingNote
+                    : finalizingCount == pendingIDs.count ? Self.finalizingNote
+                    : Self.mixedFinalizingNote
+            )
         }
         if let wakeReason, !pendingIDs.isEmpty {
             envelope["_meta"] = .object(["wake_reason": .string(wakeReason.wireValue)])
@@ -988,7 +1170,10 @@ struct MCPOracleToolService {
             progressPresent: progressPresent,
             wakeReason: pendingIDs.isEmpty ? nil : wakeReason?.wireValue
         )
-        return Self.agentFacingOracleResult(AgentMCPWaitPolicy.attaching(selection, to: .object(envelope)))
+        return ObservedOracleOperations(
+            value: Self.agentFacingOracleResult(AgentMCPWaitPolicy.attaching(selection, to: .object(envelope))),
+            deliveredIDs: deliveredIDs
+        )
     }
 
     // MARK: op:"cancel" (plan §3.8)
@@ -1288,7 +1473,7 @@ struct MCPOracleToolService {
             selection: selection,
             elapsed: observationStart.duration(to: clock.now)
         )
-        let result = try await observeAskOracleOperations(
+        let observed = try await observeAskOracleOperations(
             targetIDs: operationIDs,
             caller: caller,
             selection: selection,
@@ -1299,7 +1484,8 @@ struct MCPOracleToolService {
         )
 
         await sendStageProgress(connectionID, askOracleToolName, "complete", "Oracle consultations complete")
-        return result
+        commitCollection(observed.deliveredIDs)
+        return observed.value
     }
 
     private struct AskOracleConsultationItem {

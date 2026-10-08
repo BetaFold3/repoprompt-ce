@@ -1508,7 +1508,7 @@ final class CodexAgentModeCoordinatorLivenessTests: XCTestCase {
                 XCTAssertEqual(source, "codex-native-active-send")
                 let drained = await harness.drain(source: source)
                 ordering.recordDrainCompletion(
-                    succeeded: drained,
+                    succeeded: drained.isDrained,
                     activeScopeCount: harness.activeScopeCount()
                 )
                 return drained
@@ -1554,8 +1554,14 @@ final class CodexAgentModeCoordinatorLivenessTests: XCTestCase {
     }
 
     func testActiveCodexNativeSendFailsWithoutSendingWhenAgentRunDrainFails() async {
+        let blockers = MCPServerViewModel.AgentRunWaitDrainBlockers(
+            childAgentRunWaitCount: 1,
+            oldestChildAgentRunWaitAgeSeconds: 12,
+            oracleInvocationCount: 0,
+            oldestOracleInvocationAgeSeconds: nil
+        )
         let controller = LivenessFakeCodexController(snapshot: .active(activeFlags: []))
-        let viewModel = makeViewModel(controller: controller) { _, _ in false }
+        let viewModel = makeViewModel(controller: controller) { _, _ in .timedOut(blockers) }
         guard let session = preparedCodexSession(in: viewModel, controller: controller) else {
             return XCTFail("Expected the Codex test session to materialize")
         }
@@ -1569,7 +1575,71 @@ final class CodexAgentModeCoordinatorLivenessTests: XCTestCase {
         guard case let .failed(message) = outcome else {
             return XCTFail("Expected failed outcome, got \(outcome)")
         }
-        XCTAssertTrue(message.contains("agent_run.wait"))
+        XCTAssertEqual(
+            message,
+            "Codex did not send because 1 child agent_run.wait scope (oldest 12s) did not finish after steering wake."
+        )
+        XCTAssertFalse(message.contains("ask_oracle"))
+        XCTAssertEqual(controller.startUserTurnCountSync(), 0)
+        XCTAssertTrue(controller.steerUserTurnIDsSync().isEmpty)
+        XCTAssertEqual(session.runState, .running)
+    }
+
+    func testActiveCodexNativeSendAttributesOracleOnlyDrainFailure() async {
+        let blockers = MCPServerViewModel.AgentRunWaitDrainBlockers(
+            childAgentRunWaitCount: 0,
+            oldestChildAgentRunWaitAgeSeconds: nil,
+            oracleInvocationCount: 2,
+            oldestOracleInvocationAgeSeconds: 806
+        )
+        let controller = LivenessFakeCodexController(snapshot: .active(activeFlags: []))
+        let viewModel = makeViewModel(controller: controller) { _, _ in .timedOut(blockers) }
+        guard let session = preparedCodexSession(in: viewModel, controller: controller) else {
+            return XCTFail("Expected the Codex test session to materialize")
+        }
+
+        let outcome = await viewModel.test_codexCoordinator.sendCodexNativeMessage(
+            session: session,
+            text: "hello",
+            attachments: []
+        )
+
+        guard case let .failed(message) = outcome else {
+            return XCTFail("Expected failed outcome, got \(outcome)")
+        }
+        XCTAssertEqual(
+            message,
+            "Codex did not send because 2 ask_oracle invocations (oldest 806s) did not finish after steering wake."
+        )
+        XCTAssertFalse(message.contains("agent_run.wait"), "an Oracle-only blocker must not be attributed to child waits")
+        XCTAssertEqual(controller.startUserTurnCountSync(), 0)
+        XCTAssertTrue(controller.steerUserTurnIDsSync().isEmpty)
+        XCTAssertEqual(session.runState, .running)
+        XCTAssertEqual(
+            CodexAgentModeCoordinator.activeSendDrainFailureMessage(MCPServerViewModel.AgentRunWaitDrainBlockers(
+                childAgentRunWaitCount: 2,
+                oldestChildAgentRunWaitAgeSeconds: 3,
+                oracleInvocationCount: 1,
+                oldestOracleInvocationAgeSeconds: 4
+            )),
+            "Codex did not send because 2 child agent_run.wait scopes (oldest 3s) and 1 ask_oracle invocation (oldest 4s) did not finish after steering wake."
+        )
+    }
+
+    func testActiveCodexNativeSendTreatsCancelledDrainAsCancelledWithoutSending() async {
+        let controller = LivenessFakeCodexController(snapshot: .active(activeFlags: []))
+        let viewModel = makeViewModel(controller: controller) { _, _ in .cancelled }
+        guard let session = preparedCodexSession(in: viewModel, controller: controller) else {
+            return XCTFail("Expected the Codex test session to materialize")
+        }
+
+        let outcome = await viewModel.test_codexCoordinator.sendCodexNativeMessage(
+            session: session,
+            text: "hello",
+            attachments: []
+        )
+
+        XCTAssertEqual(outcome, .cancelled)
         XCTAssertEqual(controller.startUserTurnCountSync(), 0)
         XCTAssertTrue(controller.steerUserTurnIDsSync().isEmpty)
         XCTAssertEqual(session.runState, .running)

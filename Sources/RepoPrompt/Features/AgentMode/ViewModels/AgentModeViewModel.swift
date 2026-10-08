@@ -90,7 +90,10 @@ final class AgentModeViewModel: ObservableObject {
     typealias MCPRunToolCanceller = (_ runID: UUID, _ reason: String?) -> Int
     typealias CodexActiveToolQuery = (_ runID: UUID) -> Bool
     typealias CodexAgentRunWaitQuery = (_ runID: UUID) -> Bool
-    typealias CodexAgentRunWaitDrain = @MainActor (_ runID: UUID, _ source: String) async -> Bool
+    typealias CodexAgentRunWaitDrain = @MainActor (
+        _ runID: UUID,
+        _ source: String
+    ) async -> MCPServerViewModel.AgentRunWaitDrainOutcome
 
     // MARK: - Published Session Proxies
 
@@ -2369,7 +2372,7 @@ final class AgentModeViewModel: ObservableObject {
         )
         providerBindingService = AgentModeProviderBindingService()
         codexCoordinator.setActiveAgentRunWaitDrain { [weak self] runID, source in
-            guard let self, let mcpServer = self.mcpServer else { return true }
+            guard let self, let mcpServer = self.mcpServer else { return .drained }
             return await mcpServer.wakeAndDrainAgentRunWaitersOwnedByActiveRun(
                 runID: runID,
                 source: source,
@@ -2537,7 +2540,7 @@ final class AgentModeViewModel: ObservableObject {
                     },
                 activeAgentRunWaitDrain: testCodexActiveAgentRunWaitDrain
                     ?? { [weak testMCPServer] runID, source in
-                        guard let testMCPServer else { return true }
+                        guard let testMCPServer else { return .drained }
                         return await testMCPServer.wakeAndDrainAgentRunWaitersOwnedByActiveRun(
                             runID: runID,
                             source: source,

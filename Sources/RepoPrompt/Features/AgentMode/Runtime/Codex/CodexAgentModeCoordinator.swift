@@ -393,7 +393,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         authRecovery: any CodexManagedAuthRecovering = CodexManagedAuthRecoveryService.shared,
         activeToolQuery: @escaping ActiveToolQuery = { _ in false },
         activeAgentRunWaitQuery: @escaping ActiveAgentRunWaitQuery = { _ in false },
-        activeAgentRunWaitDrain: @escaping ActiveAgentRunWaitDrain = { _, _ in true },
+        activeAgentRunWaitDrain: @escaping ActiveAgentRunWaitDrain = { _, _ in .drained },
         leaseRoutingTimeoutMs: Int = 2000,
         idleShutdownDelayNanos: UInt64 = 300_000_000_000,
         stallWatchdogPollIntervalNanos: UInt64 = 5_000_000_000,
@@ -4734,6 +4734,36 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         return .steer(identity)
     }
 
+    /// Names the run-owned MCP scopes that were still active when the steering drain ended.
+    /// Counts and ages only; the transcript keeps this as the durable rejection record.
+    nonisolated static func activeSendDrainFailureMessage(
+        _ blockers: MCPServerViewModel.AgentRunWaitDrainBlockers
+    ) -> String {
+        var parts: [String] = []
+        if blockers.childAgentRunWaitCount > 0 {
+            var part = blockers.childAgentRunWaitCount == 1
+                ? "1 child agent_run.wait scope"
+                : "\(blockers.childAgentRunWaitCount) child agent_run.wait scopes"
+            if let age = blockers.oldestChildAgentRunWaitAgeSeconds {
+                part += " (oldest \(age)s)"
+            }
+            parts.append(part)
+        }
+        if blockers.oracleInvocationCount > 0 {
+            var part = blockers.oracleInvocationCount == 1
+                ? "1 ask_oracle invocation"
+                : "\(blockers.oracleInvocationCount) ask_oracle invocations"
+            if let age = blockers.oldestOracleInvocationAgeSeconds {
+                part += " (oldest \(age)s)"
+            }
+            parts.append(part)
+        }
+        guard !parts.isEmpty else {
+            return "Codex did not send because run-owned MCP wait scopes did not drain after steering wake."
+        }
+        return "Codex did not send because \(parts.joined(separator: " and ")) did not finish after steering wake."
+    }
+
     @discardableResult
     func sendCodexNativeMessage(
         session: AgentModeViewModel.TabSession,
@@ -4753,8 +4783,8 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         let activeSendRunID = wasRunAlreadyActive ? session.runID : nil
         let shouldDrainActiveAgentRunWaits = fallbackContext?.origin.isMCP != true
         if let activeSendRunID, shouldDrainActiveAgentRunWaits {
-            let drained = await activeAgentRunWaitDrain(activeSendRunID, "codex-native-active-send")
-            if Task.isCancelled {
+            let drainOutcome = await activeAgentRunWaitDrain(activeSendRunID, "codex-native-active-send")
+            if Task.isCancelled || drainOutcome == .cancelled {
                 viewModel?.finalizeAttachmentsForTurn(
                     for: session,
                     reservationID: attachmentReservationID,
@@ -4762,8 +4792,8 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 )
                 return .cancelled
             }
-            guard drained else {
-                let message = "Codex did not send because child agent_run.wait scopes did not drain after steering wake."
+            if case let .timedOut(blockers) = drainOutcome {
+                let message = Self.activeSendDrainFailureMessage(blockers)
                 logCodex("[AgentModeVM] sendCodexNativeMessage: \(message)")
                 viewModel?.finalizeAttachmentsForTurn(
                     for: session,
@@ -4784,7 +4814,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                     reservationID: attachmentReservationID,
                     disposition: .restoreToPending
                 )
-                return .stale(reason: "Codex did not send because the active run changed while waiting for child agent_run.wait scopes to drain.")
+                return .stale(reason: "Codex did not send because the active run changed while waiting for run-owned MCP wait scopes to drain.")
             }
         }
         session.waitingPrompt = nil

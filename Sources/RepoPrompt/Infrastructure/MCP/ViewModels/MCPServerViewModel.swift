@@ -414,6 +414,7 @@ final class MCPServerViewModel: ObservableObject {
         private var oracleCancelOverrideForTesting:
             (@MainActor (_ chatID: UUID, _ queryID: UUID) async -> OracleViewModel.CancelAIResponseOutcome)?
         private var beforeAskOraclePreparationForTesting: (@MainActor @Sendable () async -> Void)?
+        private var stageProgressObserverForTesting: (@MainActor (_ tool: String, _ stage: String) async -> Void)?
         private var oracleExportOverrideForTesting:
             MCPOracleToolService.ExportOracleResponse?
         var requestMetadataOverrideForTesting: RequestMetadata?
@@ -454,6 +455,14 @@ final class MCPServerViewModel: ObservableObject {
             _ override: MCPOracleToolService.ExportOracleResponse?
         ) {
             oracleExportOverrideForTesting = override
+        }
+
+        /// Runs before each Oracle service stage-progress send, so tests can hold an invocation
+        /// at its final suspension.
+        func setStageProgressObserverForTesting(
+            _ observer: (@MainActor (_ tool: String, _ stage: String) async -> Void)?
+        ) {
+            stageProgressObserverForTesting = observer
         }
 
         func setRequestMetadataOverrideForTesting(_ metadata: RequestMetadata?) {
@@ -611,6 +620,11 @@ final class MCPServerViewModel: ObservableObject {
             requireTargetWindow: { [self] in try requireTargetWindow() },
             rawExplicitTabID: { [self] args in rawExplicitTabID(args: args) },
             sendStageProgress: { [self] connectionID, tool, stage, message in
+                #if DEBUG
+                    if let observer = stageProgressObserverForTesting {
+                        await observer(tool, stage)
+                    }
+                #endif
                 await sendStageProgress(connectionID: connectionID, tool: tool, stage: stage, message: message)
             },
             withHeartbeat: { [self] connectionID, tool, stage, message, operation in
@@ -2597,18 +2611,59 @@ final class MCPServerViewModel: ObservableObject {
         steeringDebugLog("[AgentRunSteeringWake] parent wake yielded source=\(source) parentRunID=\(runID)")
     }
 
+    /// Sanitized snapshot of what still blocked a steering drain at its deadline: counts and
+    /// ages only, never tool arguments, prompts, or session content.
+    struct AgentRunWaitDrainBlockers: Equatable {
+        /// Child `agent_run` wait scopes (`op:"wait"` invocations) owned by the run.
+        let childAgentRunWaitCount: Int
+        let oldestChildAgentRunWaitAgeSeconds: Int?
+        /// Bounded `ask_oracle` invocations (send, batch, or `op:"wait"`) owned by the run.
+        /// Steering caps their own waits at a sub-second grace, so one still open at the drain
+        /// deadline is suspended outside any wakeable wait.
+        let oracleInvocationCount: Int
+        let oldestOracleInvocationAgeSeconds: Int?
+    }
+
+    enum AgentRunWaitDrainOutcome: Equatable {
+        case drained
+        case cancelled
+        case timedOut(AgentRunWaitDrainBlockers)
+
+        var isDrained: Bool {
+            self == .drained
+        }
+    }
+
+    @MainActor
+    func agentRunWaitDrainBlockers(runID: UUID, now: Date = Date()) -> AgentRunWaitDrainBlockers {
+        let childScopes = agentRunWaitScopesByToken.values.filter { $0.parentRunID == runID }
+        let oracleScopes = oracleWaitScopesByExecutionID.values.filter { $0.runID == runID }
+        let oracleAges = oracleScopes.compactMap { scope in
+            activeToolExecutionsByID[scope.executionID].map { now.timeIntervalSince($0.startedAt) }
+        }
+        return AgentRunWaitDrainBlockers(
+            // Same source as the drain guard, so the message never disagrees with the decision.
+            childAgentRunWaitCount: childAgentRunWaitCountsByParentRunID[runID]?.values.reduce(0, +) ?? 0,
+            oldestChildAgentRunWaitAgeSeconds: childScopes
+                .map { Int(max(0, now.timeIntervalSince($0.startedAt))) }
+                .max(),
+            oracleInvocationCount: oracleScopes.count,
+            oldestOracleInvocationAgeSeconds: oracleAges.map { Int(max(0, $0)) }.max()
+        )
+    }
+
     @MainActor
     func wakeAndDrainAgentRunWaitersOwnedByActiveRun(
         runID: UUID,
         source: String,
         timeoutSeconds: TimeInterval,
         publicationForSessionID: (UUID) -> (snapshot: AgentRunMCPSnapshot, cursor: AgentRunSessionStore.WaitCursor)?
-    ) async -> Bool {
+    ) async -> AgentRunWaitDrainOutcome {
         guard hasActiveChildAgentRunWaits(runID: runID)
             || hasActiveOracleResumableWaits(runID: runID)
         else {
             steeringDebugLog("[AgentRunSteeringWake] parent drain fast-idle source=\(source) parentRunID=\(runID)")
-            return true
+            return .drained
         }
 
         let deadline = Date().addingTimeInterval(max(0, timeoutSeconds))
@@ -2623,19 +2678,19 @@ final class MCPServerViewModel: ObservableObject {
                 || hasActiveOracleResumableWaits(runID: runID)
             else {
                 steeringDebugLog("[AgentRunSteeringWake] parent drain completed source=\(source) parentRunID=\(runID)")
-                return true
+                return .drained
             }
             guard timeoutSeconds > 0, Date() < deadline else {
-                let oracleCount = oracleWaitScopesByExecutionID.values.count { $0.runID == runID }
-                steeringDebugLog("[AgentRunSteeringWake] parent drain timed out source=\(source) parentRunID=\(runID) timeout=\(timeoutSeconds) remaining=\(debugChildAgentRunWaits(for: runID)) oracleWaits=\(oracleCount)")
-                return false
+                let blockers = agentRunWaitDrainBlockers(runID: runID)
+                steeringDebugLog("[AgentRunSteeringWake] parent drain timed out source=\(source) parentRunID=\(runID) timeout=\(timeoutSeconds) remaining=\(debugChildAgentRunWaits(for: runID)) blockers=\(blockers)")
+                return .timedOut(blockers)
             }
 
             do {
                 try await Task.sleep(nanoseconds: 25_000_000)
             } catch {
                 steeringDebugLog("[AgentRunSteeringWake] parent drain cancelled source=\(source) parentRunID=\(runID)")
-                return false
+                return .cancelled
             }
         }
     }

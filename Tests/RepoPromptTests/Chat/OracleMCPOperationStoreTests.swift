@@ -643,6 +643,290 @@ final class OracleMCPOperationStoreTests: XCTestCase {
         XCTAssertNil(replay["wait_policy"], "cached lanes never carry wait_policy; each invocation attaches its own")
     }
 
+    @MainActor
+    private final class WakeProbe {
+        var requested = false
+        var onWake: (@MainActor () -> Void)?
+        var subscribeCount = 0
+        var unsubscribeCount = 0
+
+        var externalWake: OracleMCPOperationStore.ExternalWake {
+            OracleMCPOperationStore.ExternalWake(
+                isRequested: { self.requested },
+                subscribe: {
+                    self.subscribeCount += 1
+                    self.onWake = $0
+                },
+                unsubscribe: {
+                    self.unsubscribeCount += 1
+                    self.onWake = nil
+                }
+            )
+        }
+
+        func wake() {
+            requested = true
+            let wake = onWake
+            onWake = nil
+            wake?()
+        }
+    }
+
+    func testBoundedDeliveryObservationLeavesStalledFinalizationRunningOnce() async throws {
+        let harness = Harness()
+        let (operationID, ticket) = try reserveAndBind(harness)
+        harness.finalize(ticket.queryID)
+        try await settle(harness, operationID: operationID)
+
+        final class Counter { var finalizeCalls = 0 }
+        let counter = Counter()
+        let gate = TestReleaseFence(name: "stalled finalization")
+        defer { gate.release() }
+        let finalize: OracleMCPOperationStore.DeliveryFinalizer = { result, _ in
+            counter.finalizeCalls += 1
+            await gate.enterAndWait()
+            result["oracle_export_path"] = .string("/tmp/export.md")
+        }
+
+        // A watchdog turns a liveness regression into a failure instead of a suite hang.
+        final class WatchdogFlag { var fired = false }
+        let watchdogFlag = WatchdogFlag()
+        let watchdog = Task { @MainActor in
+            try? await Task.sleep(for: .seconds(10))
+            guard !Task.isCancelled else { return }
+            watchdogFlag.fired = true
+            gate.release()
+        }
+        defer { watchdog.cancel() }
+
+        // Deadline: the observer leaves; the shared delivery keeps running.
+        let started = ContinuousClock.now
+        let deadlineObservation = await harness.store.observeDelivery(
+            of: [operationID],
+            timeoutSeconds: 0.1,
+            steeringGraceSeconds: 0.1,
+            externalWake: nil,
+            finalize: finalize
+        )
+        XCTAssertLessThan(started.duration(to: ContinuousClock.now), .seconds(2))
+        XCTAssertFalse(watchdogFlag.fired, "the deadline observer only returned after the watchdog released the gate")
+        guard case .pending(.deadline) = deadlineObservation[operationID] else {
+            return XCTFail("expected pending(deadline), got \(String(describing: deadlineObservation[operationID]))")
+        }
+        await gate.waitUntilEntered(timeout: 5)
+        XCTAssertEqual(harness.store.snapshot(operationID)?.delivery, .delivering)
+        XCTAssertEqual(harness.store.test_deliveryWaiterCount(), 0)
+
+        // Steering while parked caps the remaining bound at the grace and reports steering.
+        let probe = WakeProbe()
+        let steeredTask = Task { @MainActor in
+            await harness.store.observeDelivery(
+                of: [operationID],
+                timeoutSeconds: 30,
+                steeringGraceSeconds: 0.1,
+                externalWake: probe.externalWake
+            ) { _, _ in
+                XCTFail("a joined observer must not start a second finalization")
+            }
+        }
+        try await AsyncTestWait.waitUntil("delivery observer parked", timeout: 2) {
+            await MainActor.run { harness.store.test_deliveryWaiterCount() == 1 && probe.onWake != nil }
+        }
+        probe.wake()
+        let steered = await steeredTask.value
+        XCTAssertFalse(watchdogFlag.fired, "the steered observer only returned after the watchdog released the gate")
+        guard case .pending(.steering) = steered[operationID] else {
+            return XCTFail("expected pending(steering), got \(String(describing: steered[operationID]))")
+        }
+        XCTAssertEqual(probe.unsubscribeCount, 1)
+        XCTAssertEqual(harness.store.snapshot(operationID)?.delivery, .delivering)
+        XCTAssertEqual(counter.finalizeCalls, 1)
+
+        // A finalization just short of the stale age holds a long-budget observer only until it
+        // turns stale plus the stale bound.
+        harness.now = harness.now.addingTimeInterval(29.9)
+        let youngStarted = ContinuousClock.now
+        let youngObservation = await harness.store.observeDelivery(
+            of: [operationID],
+            timeoutSeconds: 30,
+            steeringGraceSeconds: 0.1,
+            staleFinalizationAgeSeconds: 30,
+            staleFinalizationBoundSeconds: 0.1,
+            externalWake: nil
+        ) { _, _ in
+            XCTFail("a joined observer must not start a second finalization")
+        }
+        XCTAssertLessThan(youngStarted.duration(to: ContinuousClock.now), .seconds(2))
+        guard case .pending(.deadline) = youngObservation[operationID] else {
+            return XCTFail("expected pending(deadline) at the stale point, got \(String(describing: youngObservation[operationID]))")
+        }
+
+        // A finalization running past the stale age gets only the stale bound, even from an
+        // observer with a long budget, and reports its age.
+        harness.now = harness.now.addingTimeInterval(30.1)
+        // Truncated whole seconds; tolerate floating-point accumulation in the fake clock.
+        XCTAssertTrue((59 ... 60).contains(harness.store.finalizationAgeSeconds(for: operationID) ?? -1))
+        let staleStarted = ContinuousClock.now
+        let staleObservation = await harness.store.observeDelivery(
+            of: [operationID],
+            timeoutSeconds: 30,
+            steeringGraceSeconds: 0.1,
+            staleFinalizationAgeSeconds: 30,
+            staleFinalizationBoundSeconds: 0.1,
+            externalWake: nil
+        ) { _, _ in
+            XCTFail("a joined observer must not start a second finalization")
+        }
+        XCTAssertLessThan(staleStarted.duration(to: ContinuousClock.now), .seconds(2))
+        guard case .pending(.deadline) = staleObservation[operationID] else {
+            return XCTFail("expected stale pending(deadline), got \(String(describing: staleObservation[operationID]))")
+        }
+        XCTAssertEqual(counter.finalizeCalls, 1)
+
+        watchdog.cancel()
+        XCTAssertFalse(watchdogFlag.fired, "the stale observer only returned after the watchdog released the gate")
+
+        // Release: the one shared finalization completes with no observer attached. That caches
+        // the result but is not collection, so id-less recovery still targets the lane.
+        gate.release()
+        try await AsyncTestWait.waitUntil("background finalization finished", timeout: 5) {
+            await MainActor.run { harness.store.snapshot(operationID)?.delivery != .delivering }
+        }
+        XCTAssertEqual(harness.store.snapshot(operationID)?.delivery, .undelivered)
+        XCTAssertNil(harness.store.finalizationAgeSeconds(for: operationID), "a finished finalization has no age")
+        XCTAssertFalse(harness.store.summary(for: operationID)?.isCollected ?? true)
+        XCTAssertEqual(harness.store.undeliveredOperationIDs(owner: makeOwner()), [operationID])
+
+        // Every later read is cached; the first one to return it is the collection.
+        let delivered = try await harness.store.deliver(operationID) { _, _ in
+            XCTFail("cached delivery must not finalize again")
+        }
+        XCTAssertEqual(delivered["oracle_export_path"]?.stringValue, "/tmp/export.md")
+        XCTAssertEqual(harness.store.snapshot(operationID)?.delivery, .delivered)
+        let replay = await harness.store.observeDelivery(
+            of: [operationID],
+            timeoutSeconds: 0,
+            steeringGraceSeconds: 0,
+            externalWake: nil
+        ) { _, _ in
+            XCTFail("cached delivery must not finalize again")
+        }
+        guard case let .delivered(replayed) = replay[operationID] else {
+            return XCTFail("expected cached delivery, got \(String(describing: replay[operationID]))")
+        }
+        XCTAssertEqual(replayed, delivered)
+        XCTAssertEqual(counter.finalizeCalls, 1)
+    }
+
+    func testBoundedDeliveryObservationFastFinalizationBeatsEarlySteeringAndReportsFailure() async throws {
+        let harness = Harness()
+        let (completedID, completedTicket) = try reserveAndBind(harness)
+        harness.finalize(completedTicket.queryID)
+        try await settle(harness, operationID: completedID)
+
+        let probe = WakeProbe()
+        probe.requested = true
+        let observed = await harness.store.observeDelivery(
+            of: [completedID],
+            timeoutSeconds: 30,
+            steeringGraceSeconds: 1,
+            externalWake: probe.externalWake
+        ) { result, _ in
+            await Task.yield()
+            result["finalized"] = .bool(true)
+        }
+        guard case let .delivered(result) = observed[completedID] else {
+            return XCTFail("completion must beat an earlier steering request, got \(String(describing: observed[completedID]))")
+        }
+        XCTAssertEqual(result["finalized"]?.boolValue, true)
+        XCTAssertEqual(probe.subscribeCount, 0, "an already-requested wake is not re-subscribed")
+        XCTAssertEqual(
+            harness.store.snapshot(completedID)?.delivery,
+            .undelivered,
+            "observation never stamps collection; the returning caller does"
+        )
+        harness.store.noteCollected([completedID])
+        XCTAssertEqual(harness.store.snapshot(completedID)?.delivery, .delivered)
+
+        let (failingID, failingTicket) = try reserveAndBind(harness)
+        harness.finalize(failingTicket.queryID)
+        try await settle(harness, operationID: failingID)
+        let failed = await harness.store.observeDelivery(
+            of: [failingID],
+            timeoutSeconds: 5,
+            steeringGraceSeconds: 1,
+            externalWake: nil
+        ) { _, _ in
+            throw ChatToolError.internalError("export exploded")
+        }
+        guard case let .failed(error) = failed[failingID] else {
+            return XCTFail("expected failed delivery, got \(String(describing: failed[failingID]))")
+        }
+        XCTAssertTrue(error.localizedDescription.contains("export exploded"))
+        XCTAssertEqual(harness.store.snapshot(failingID)?.delivery, .undelivered)
+        XCTAssertEqual(harness.store.test_deliveryWaiterCount(), 0)
+
+        // The bounded observer retries a reverted delivery with a fresh finalization.
+        let retried = await harness.store.observeDelivery(
+            of: [failingID],
+            timeoutSeconds: 5,
+            steeringGraceSeconds: 1,
+            externalWake: nil
+        ) { result, _ in
+            result["retried"] = .bool(true)
+        }
+        guard case let .delivered(retriedResult) = retried[failingID] else {
+            return XCTFail("expected retried delivery, got \(String(describing: retried[failingID]))")
+        }
+        XCTAssertEqual(retriedResult["retried"]?.boolValue, true)
+    }
+
+    func testCancelledDeliveryObservationDoesNotCollectFinishedLanes() async throws {
+        let harness = Harness()
+        let (fastID, fastTicket) = try reserveAndBind(harness)
+        harness.finalize(fastTicket.queryID)
+        try await settle(harness, operationID: fastID)
+        let (stalledID, stalledTicket) = try reserveAndBind(
+            harness,
+            finalization: makeFinalization(message: "stalled")
+        )
+        harness.finalize(stalledTicket.queryID)
+        try await settle(harness, operationID: stalledID)
+
+        let gate = TestReleaseFence(name: "cancelled observation stalled lane")
+        defer { gate.release() }
+        let observeTask = Task { @MainActor in
+            await harness.store.observeDelivery(
+                of: [fastID, stalledID],
+                timeoutSeconds: 30,
+                steeringGraceSeconds: 1,
+                externalWake: nil
+            ) { result, request in
+                if request.message == "stalled" {
+                    await gate.enterAndWait()
+                }
+                result["finalized"] = .bool(true)
+            }
+        }
+        await gate.waitUntilEntered(timeout: 5)
+        try await AsyncTestWait.waitUntil("fast lane finalized while the other stalls", timeout: 5) {
+            await MainActor.run {
+                harness.store.snapshot(fastID)?.delivery == .undelivered
+                    && harness.store.finalizationAgeSeconds(for: fastID) == nil
+            }
+        }
+        observeTask.cancel()
+        let observed = await observeTask.value
+        guard case .delivered = observed[fastID], case .pending(.cancelled) = observed[stalledID] else {
+            return XCTFail("expected delivered + pending(cancelled), got \(observed)")
+        }
+
+        // The caller throws a cancelled observation away, so the finished lane stays recoverable.
+        XCTAssertEqual(harness.store.snapshot(fastID)?.delivery, .undelivered)
+        XCTAssertEqual(Set(harness.store.undeliveredOperationIDs(owner: makeOwner())), [fastID, stalledID])
+        XCTAssertEqual(harness.store.test_deliveryWaiterCount(), 0)
+    }
+
     func testFailedFinalizeRevertsToUndeliveredForRetry() async throws {
         let harness = Harness()
         let (operationID, ticket) = try reserveAndBind(harness)
