@@ -4,7 +4,7 @@ Scope: read when the task touches the 2026-10-08 Swift compile follow-ups: the s
 Authority: Reference
 Last-verified: 2026-10-08
 
-Status: Step 1 complete; Steps 2–4 not started. Results and review evidence: `.agent-artifacts/swift-compile-time/step1-results.md` and `step1-review-disposition.md`. Planned with OracleA and OracleD (one challenge round; converged). Timebox about 1 day.
+Status: Steps 1–2 complete; Steps 3–4 not started. Step 2 evidence: `.agent-artifacts/swift-compile-time/step2-results.md` and `step2-review-disposition.md`. Results and review evidence: `.agent-artifacts/swift-compile-time/step1-results.md` and `step1-review-disposition.md`. Planned with OracleA and OracleD (one challenge round; converged). Timebox about 1 day.
 
 ## Goal
 Answer three questions cheaply, keep only what helps, and stop:
@@ -43,7 +43,7 @@ Starting evidence (2026-10-08, symbols off, noisy host): an app body edit builds
   - Emit-module skipped: yes or no.
   - For the largest areas (Features/AgentMode, Infrastructure/AI, Infrastructure/MCP, Infrastructure/Process), p = the area's share of app-edit commits, and the estimated average saving p × (D − L) is reported.
   - Verdict: stop the split line if emit-module still runs on a Core body edit, or if no area reaches ≥ 3 s. Otherwise, recommend one bounded follow-up investigation for that area (not an extraction).
-- Step 2 — todo | rounds 0/2 | open: — | downgraded: — | assumed: ≥3 s threshold (Q3); 6-month window (Q4) | deferred: —
+- Step 2 — done | rounds 1/2 | open: — | downgraded: — | assumed: ≥3 s threshold (Q3); 6-month window (Q4); cut split follow-up (exclusive 1.38 s; inclusive 4.36 s), owner question timed out | deferred: OracleB S2-R4 author-only recount; results in step2-results.md
 
 ### Step 3 — Index store off by default, `RPCE_INDEX_STORE=on` to opt in (~1.5 h)
 - Change:
