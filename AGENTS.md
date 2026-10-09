@@ -9,20 +9,20 @@ RepoPrompt CE is a Swift Package macOS app and agent orchestrator. Read only the
 - Lint: `make dev-lint` · Format Swift: `make dev-format`
 - Run locally: `make dev-run`
 - Repository guardrails: `make guardrails` · Agent-context structure: `Scripts/check-agent-context`
-- Before commit: `.agents/skills/rpce-contribution-check/scripts/preflight.sh commit`
-- Before push: `.agents/skills/rpce-contribution-check/scripts/preflight.sh push`
+- Before push (origin is a public fork): `gitleaks git --no-banner --redact --log-opts="@{u}..HEAD" .` (use `origin/main..HEAD` when the branch has no upstream)
 
 ## Invariants (pinned — apply always)
 - Use coordinated `make dev-*` operations for builds, tests, style, packaging, and app lifecycle; use direct `make`, `swift`, or `./Scripts` fallbacks only when the daemon is unavailable or a routed workflow explicitly requires them.
 - If conductor reports `global-wait`, wait on its ticket; don't start duplicate direct Swift/Xcode work.
 - The Finder launcher requires Python 3 and does not provide an uncoordinated no-Python fallback; use the coordinated launcher with Python 3 instead.
 - Obtain explicit user approval immediately before any force-push, history rewrite, branch or fork deletion, credential rotation, other GitHub-visible destructive mutation, visible app launch/relaunch, or stopping a visible app. Don't treat earlier task authorization as this approval; ask at the action boundary.
-- Read the [contribution-check skill](.agents/skills/rpce-contribution-check/SKILL.md) before every commit or push. Stage only intended files and rerun commit preflight after every staging change.
+- Stage only intended files. Before any push, run the secret scan above and stop if it reports a finding. This is a private-use fork: the [contribution-check skill](.agents/skills/rpce-contribution-check/SKILL.md) and its `preflight.sh` lanes are optional and run only when the user asks.
 - Don't stage or merge local `docs/investigations/*.md` reports unless intentionally requested; keep raw working evidence local instead.
 - Don't use production `rp-cli` or `rp-cli-debug` to validate CE; use `rpce-cli-debug` instead.
 - Don't run `make dev-format` unless Swift formatting mutation is intended; use `make dev-format-check` for a non-mutating check.
 - Don't change release metadata, signing identities, bundle IDs, Sparkle keys, or release channels unless a maintainer explicitly requests it; follow the release workflow instead.
-- Don't weaken assertions, skip tests, or overwrite the curated XCTest ledger to make a change pass; fix the implementation or deliberately update the changed contract.
+- Don't weaken assertions or skip tests to make a change pass; fix the implementation or deliberately update the changed contract.
+- The XCTest ledger `Scripts/Fixtures/test-suite-contract-ledger.tsv` is frozen. Don't update it for test changes, and don't delete or regenerate it: conductor filter checks, test deadlines and `dev-test-parallel` serial tags still read it.
 
 ## Decision rules
 | Situation | Use |
@@ -42,7 +42,7 @@ RepoPrompt CE is a Swift Package macOS app and agent orchestrator. Read only the
 | Xcode workspace generation | `Scripts/generate_xcode_workspace.py`, `.github/workflows/xcode-workspace.yml` | [Xcode workspace](docs/architecture/xcode-workspace.md) | disposable workspace boundaries |
 | Worktree creation or local-file copying | worktree APIs, `.worktreeinclude` | [worktrees](docs/worktrees.md) | copy and safety semantics |
 | Release, signing, packaging, or update channels | `version.env`, `AppBundle/**`, `Scripts/release*`, release workflows | [releasing](docs/releasing.md) and [readiness](docs/open-source-readiness.md) | maintainer-owned release process |
-| Issues, pull requests, commits, or pushes | `.github/**`, Git-visible operations | [contributing](CONTRIBUTING.md) and [contribution check](.agents/skills/rpce-contribution-check/SKILL.md) | contribution and safety gates |
+| Issues, pull requests, commits, or pushes | `.github/**`, Git-visible operations | [contributing](CONTRIBUTING.md) and [contribution check](.agents/skills/rpce-contribution-check/SKILL.md) | upstream contribution rules; optional checks for this fork |
 | Agent-context maintenance | `AGENTS.md`, `CLAUDE.md`, `docs/context/**` | [doc gardening](docs/context/workflows/doc-gardening.md) | semantic freshness review |
 | OpenAI direct API model visibility, trusted metadata, configured-model projection, static wire-ID ownership, or GPT model additions | `Sources/RepoPrompt/Infrastructure/AI/ModelCatalog/Providers/APIModelCatalog.swift`, `Sources/RepoPrompt/Infrastructure/AI/ModelCatalog/Providers/OpenAIAPIModelMetadata*.swift`, `Sources/RepoPrompt/Infrastructure/AI/ModelCatalog/Providers/OpenAIConfiguredModelProjection.swift`, `Sources/RepoPrompt/Infrastructure/AI/AIModel.swift`, `Sources/RepoPrompt/Features/Settings/ViewModels/APISettingsViewModel.swift`, `Sources/RepoPrompt/Features/Settings/Views/APISettingsView.swift`, `Sources/RepoPrompt/Features/Settings/Views/CLIProvidersSettingsView.swift`, `Sources/RepoPrompt/Infrastructure/AI/Providers/OpenAIResponseRequestPlan.swift` | [GPT model catalog](docs/context/gpt-model-catalog.md) | OpenAI visibility/capability authority, override compatibility, trust, projection, identity, and withdrawal invariants |
 | Agent Mode transcript Preview deep links, path detection, or tool-result linkification | `Sources/RepoPrompt/Features/AgentMode/Services/UtilityPanel/AgentTranscriptPreviewLinkResolver.swift`, `Sources/RepoPrompt/Features/AgentMode/Views/AgentModeView.swift`, `Sources/RepoPrompt/Features/AgentMode/Views/AgentModeDetailWithSidebarView.swift`, `Sources/RepoPrompt/Features/AgentMode/Views/AgentMessageBubble.swift`, `Sources/RepoPrompt/Features/AgentMode/Views/ToolCards/ToolResultMarkdownContent.swift`, `Sources/RepoPrompt/Infrastructure/UI/Markdown/**`, `Sources/RepoPrompt/Infrastructure/UI/Components/CollapsibleUserMessage.swift`, `Sources/RepoPrompt/Infrastructure/UI/TextField/TextKitView.swift` | [transcript preview deep links](docs/context/transcript-preview-deep-links.md) | routing, provenance, reveal, detection, and tool-result scope invariants |

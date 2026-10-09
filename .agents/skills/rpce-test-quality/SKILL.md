@@ -38,16 +38,15 @@ Redesign or omit invocation-only, no-crash, non-nil-only, source-shape, symbol-p
 
 - List authoritative executable IDs with `make dev-test-list` and `make dev-provider-test-list`.
 - Use exact ledger IDs shaped as `root/RepoPromptTests.<Suite>/testMethod` or `provider/RepoPromptClaudeCompatibleProviderTests.<Suite>/testMethod`.
-- For every executable add, rename, consolidation, or removal, edit `Scripts/Fixtures/test-suite-contract-ledger.tsv` surgically in the same patch. Never regenerate or overwrite the curated ledger.
+- The ledger `Scripts/Fixtures/test-suite-contract-ledger.tsv` is frozen in this private-use fork. Don't edit it for test adds, renames, consolidations or removals, and don't regenerate or delete it.
 - Count `scenario_count` as distinct input, boundary, outcome, fixture, or lifecycle scenarios—not assertions. Preserve affected-suite and repository scenario totals across consolidation unless removal is explicitly justified.
-- Use reviewed metadata and `current_disposition=retain` for new/retained rows or `consolidated_replacement` for live replacements. Delete stale old rows, keep live-row `replacement_method_id` blank, and record exact old-to-new/removed mappings in replacement notes and the handoff.
-- Run `python3 Scripts/test_suite_optimizer.py verify-ledger --ledger Scripts/Fixtures/test-suite-contract-ledger.tsv`. It checks schema, duplicates, and exact live-ID reconciliation only; it does not validate scenario totals or metadata completeness.
+- Record exact old-to-new or removed test IDs in the handoff.
 
 ## Author and Validate
 
 Assert exact outcomes and negative boundaries. Keep one coherent contract per test; use labeled tables only for equivalent cases. Control time, randomness, locale, environment, resources, ordering, and concurrency; use gates, clocks, or continuations instead of sleeps. Use temporary resources and verify important cleanup or ownership. Add production seams only when narrow, deterministic, behavior-preserving, and justified.
 
-For ordinary changes, run the smallest focused daemon test, the affected target's authoritative list command, and ledger verification; follow repository style/guardrails as applicable. Do not launch the app for ordinary logic.
+For ordinary changes, run the smallest focused daemon test and the affected target's authoritative list command; follow repository style/guardrails as applicable. Do not launch the app for ordinary logic.
 
 For optimization/performance campaigns, additionally preserve append-only inventory, baseline, focused, and full-root artifacts plus the scoreboard. Use 3–5 comparable normal samples; never count diagnostic or wake-probe runs as timing samples.
 
@@ -58,6 +57,6 @@ Report:
 - protected contract, plausible defect, layer, and oracle;
 - exact added/renamed/consolidated/removed IDs and old-to-new/removed mappings;
 - scenario-count rationale and before/after affected-suite plus repository totals for consolidations;
-- surgical ledger update and exact validation commands/results;
+- exact validation commands/results;
 - campaign artifact paths, scoreboard entry, and sample validity when applicable;
 - coverage omitted, removed, moved to diagnostics, or replaced by a guardrail, with justification.

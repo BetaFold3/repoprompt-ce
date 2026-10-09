@@ -1,11 +1,11 @@
 ---
 name: rpce-contribution-check
-description: Validate RepoPrompt CE contributions before committing or pushing. Use whenever an agent is about to create a commit, push the current branch, rewrite history, delete a branch or fork, or change GitHub-visible repository state. Enforces staged-index and outgoing-range secret scanning, repository guardrails, clean push boundaries, an explicit PR-ready lane for path-selected heavyweight validation, and explicit approval for destructive Git or visible live-app operations.
+description: Optional upstream-contribution checks for RepoPrompt CE. In this private-use fork, use only when the user explicitly asks for a contribution check, PR-ready validation, or this preflight; ordinary commits need no preflight, and pushes need only the secret scan listed in AGENTS.md. Covers staged-index and outgoing-range secret scanning, repository guardrails, clean push boundaries, an explicit PR-ready lane for path-selected heavyweight validation, and explicit approval for destructive Git or visible live-app operations.
 ---
 
 # RepoPrompt CE Contribution Check
 
-Run the repository-local safety preflight before every commit and push. Read `AGENTS.md` first and use daemon-coordinated validation where available. Use the explicit `pr-ready` lane when computed-outgoing-range path-selected local validation evidence is required.
+This fork is private-use: run these lanes only when the user asks. The required pre-push step is the secret scan in `AGENTS.md`. When asked, read `AGENTS.md` first and use daemon-coordinated validation where available. Use the explicit `pr-ready` lane when computed-outgoing-range path-selected local validation evidence is required.
 
 ## Before committing
 

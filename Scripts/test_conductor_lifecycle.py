@@ -1245,7 +1245,7 @@ class ConductorTestContractTests(LifecycleTestCase):
                 conductor.preflight_test_filter(root, "test", "RepoPromptTests.UncuratedTests")
 
         self.assertIn("Suite 'UncuratedTests' found in sources but not in the curated ledger", stderr.getvalue())
-        self.assertIn("surgical ledger update", stderr.getvalue())
+        self.assertIn("the ledger is frozen; running with default deadlines", stderr.getvalue())
 
     def test_filtered_test_timeout_defaults_to_twenty_minutes(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

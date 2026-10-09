@@ -723,7 +723,7 @@ def preflight_test_filter(repo_root: Path, operation: str, filter_value: str) ->
     if _source_contains_suite(test_root, candidate):
         print(
             f"Suite '{candidate}' found in sources but not in the curated ledger — "
-            "remember the surgical ledger update (docs/testing.md).",
+            "the ledger is frozen; running with default deadlines.",
             file=sys.stderr,
         )
         return

@@ -39,7 +39,7 @@ For ordinary iteration, prefer the impacted lane over a full root run:
 make dev-test-impacted RANGE=origin/main...HEAD
 ```
 
-This calls `Scripts/test_suite_optimizer.py impacted` with the curated ledger, obtains changed files from `git diff --name-only`, prints exact selected XCTest IDs with reasons, includes a small smoke-floor suite set, reports heavy/opt-in tests skipped by `execution_tier`, and then invokes conductor with an exact XCTest filter. The selector is conservative: broad build/tooling/package/ledger boundaries report `full_root_required=true` instead of pretending a narrow subset is sufficient. Set `INCLUDE_HEAVY=1` only when intentionally running selected `codemap_e2e`, `scale`, `diagnostic`, `live_smoke`, or `release` rows and after setting any required environment gate.
+This calls `Scripts/test_suite_optimizer.py impacted` with the curated ledger, obtains changed files from `git diff --name-only`, prints exact selected XCTest IDs with reasons, includes a small smoke-floor suite set, reports heavy/opt-in tests skipped by `execution_tier`, and then invokes conductor with an exact XCTest filter. It selects from the frozen ledger, so it can miss tests added after the freeze. The selector is conservative: broad build/tooling/package/ledger boundaries report `full_root_required=true` instead of pretending a narrow subset is sufficient. Set `INCLUDE_HEAVY=1` only when intentionally running selected `codemap_e2e`, `scale`, `diagnostic`, `live_smoke`, or `release` rows and after setting any required environment gate.
 
 Unfiltered `make dev-test-parallel` is the explicit PR-ready/full-root local lane. Any `FILTER` is labeled filtered and is never full-root evidence. Serial `make dev-test` remains the supported focused iteration path and fallback for environments where the parallel lane is unavailable. Do not use a green impacted or filtered run as evidence that broad package, build graph, conductor, ledger-schema, or generated-workspace changes are fully validated.
 
@@ -104,9 +104,15 @@ provider/RepoPromptClaudeCompatibleProviderTests.<Suite>/testMethod
 
 Treat these strings as exact, case-sensitive identifiers.
 
-## Maintain the contract ledger surgically
+## Contract ledger (frozen)
 
-Every executable add, rename, consolidation, or removal requires an atomic, surgical update to `Scripts/Fixtures/test-suite-contract-ledger.tsv`. Never regenerate or overwrite the curated ledger. In particular, do not point `inventory --force` at it.
+`Scripts/Fixtures/test-suite-contract-ledger.tsv` is frozen in this private-use fork. Don't add, rename or remove rows for test changes, and don't regenerate, overwrite or delete it. Conductor still reads it:
+- filter checks: suites missing from the ledger still run if they exist in test sources, with a warning;
+- active-method deadlines: unlisted methods get the flat 180 s budget;
+- `dev-test-parallel` serial-isolation tags;
+- impacted and shard planning.
+
+Expect `verify-ledger`, `dev-test-impacted` and shard plans to drift from the live tests over time. Don't treat that drift as a failure to fix. The schema below describes the existing rows.
 
 The TSV header order is fixed. Every live row carries identity/location fields (`method_id`, `target`, `file`, `suite`, `method`, `domain`, `layer`, `execution_tier`), contract fields (`primary_contract_id`, `secondary_contract_tags`, `validation_class`, `scenario_count`, `fixture_ids`, `observable_oracle`, `failure_risk`), cost/ownership fields (`runtime_seconds`, `resource_cost_tags`, `shared_state_tags`, `lifecycle_owner`), and disposition fields (`current_disposition`, `replacement_method_id`, `preserved_scenario_delta`, `notes`).
 
@@ -121,32 +127,13 @@ The TSV header order is fixed. Every live row carries identity/location fields (
 - `live_smoke` — packaged/running-app smoke coverage;
 - `release` — release/signing/artifact-sensitive validation.
 
-For every new or touched row:
-
-- use reviewed, specific contract, oracle, risk, validation-class, and lifecycle values rather than `unreviewed`;
-- set optional fixture/resource/shared-state tags when applicable and leave them blank only when none apply;
-- use `current_disposition=retain` for a new independent test or a reviewed retained test;
-- use `current_disposition=consolidated_replacement` for a live method replacing multiple old methods;
-- do not introduce `retain_pending_review`; it is initial-scaffold debt;
-- keep `replacement_method_id` blank on live rows because stale removed rows cannot remain in an exact-ID ledger;
-- use `preserved_scenario_delta=0` when scenarios are preserved, including table consolidation; justify any nonzero delta in `notes` and the handoff.
-
 ### Scenario count
 
 `scenario_count` is the number of distinct input, boundary, outcome, fixture, or lifecycle scenarios protected by the method. It is **not** the assertion count. Consolidating methods into a table lowers executable method count without lowering scenario count unless coverage is deliberately removed.
 
-### Atomic rename, consolidation, and removal workflow
+## Verify exact-ID reconciliation (optional)
 
-1. Before editing, capture the authoritative target list, the exact old IDs, and scenario totals.
-2. Change the XCTest declarations and ledger rows in the same patch.
-3. **Rename:** replace the old live row with the new exact ID and record `old ID -> new ID` in `notes` and the handoff.
-4. **Consolidate:** delete every obsolete row, add the live replacement row(s), set each replacement's `scenario_count` to the preserved scenario total, and enumerate every exact old ID in `notes`. Record the complete `old IDs -> new ID` mapping in the handoff.
-5. **Remove without replacement:** delete the stale row and record `old ID -> removed` plus the duplicate, obsolete/non-contractual, or intentionally-unprotected rationale in the handoff. Campaign removals also go in the append-only scoreboard.
-6. Re-list, recount, and verify. No obsolete ID may remain, and no new ID may be absent.
-
-## Verify exact-ID reconciliation
-
-Run:
+Only when the user asks for a ledger reconciliation, run:
 
 ```bash
 python3 Scripts/test_suite_optimizer.py verify-ledger \
@@ -191,10 +178,7 @@ At minimum, provide:
 
 1. the focused root or provider test command and result;
 2. the affected target's authoritative list command and result;
-3. the `verify-ledger` command and result;
-4. required style/guardrail validation from `AGENTS.md` when applicable.
-
-Default `.agents/skills/rpce-contribution-check/scripts/preflight.sh push` is a safety-only gate; test changes still need the smallest focused daemon tests, authoritative list commands, and ledger verification above. Use `.agents/skills/rpce-contribution-check/scripts/preflight.sh pr-ready` for computed-outgoing-range path-selected local evidence, not routine iteration.
+3. required style validation from `AGENTS.md` when applicable.
 
 Ordinary additions, fixes, renames, and removals do not need timing artifacts merely because the harness exists.
 
@@ -1004,8 +988,7 @@ python3 Scripts/worktree_startup_live_benchmark.py cleanup --help
 
 - Protected contract, plausible defect, chosen layer, and observable oracle.
 - Added/renamed/consolidated/removed exact IDs, including complete `old -> new/removed` mappings.
-- Surgical ledger update confirmed; curated ledger was not regenerated or overwritten.
 - `scenario_count` rationale and before/after affected-suite plus root/provider/repository totals for consolidations.
-- Exact focused test, list, ledger verification, style, and guardrail commands with exit results.
+- Exact focused test, list and style commands with exit results.
 - For campaigns only: append-only inventory/baseline/focused/root artifact paths, scoreboard entry, sample validity, and timing comparison.
 - Any coverage deliberately omitted, removed, moved to diagnostics, or replaced by a guardrail, with justification.
