@@ -243,6 +243,21 @@ struct MCPOracleToolService {
         "op", "operation_ids"
     ]
 
+    /// Self-correcting suffix for strict wait/cancel rejections that carried a send payload
+    /// (`message` or `consultations`). Presentation/target keys alone never trigger it, so a real
+    /// wait with a stray key is not invited to resend. The control is still rejected.
+    private static func controlSendArgumentsHint(op: AskOracleOp, unsupported: [String]) -> String {
+        let payloadKeys = ["message", "consultations"].filter(unsupported.contains)
+        guard !payloadKeys.isEmpty else { return "" }
+        let subject = payloadKeys.count == 1
+            ? "\(payloadKeys[0]) is a send argument"
+            : "\(payloadKeys.joined(separator: " and ")) are send arguments"
+        let controlShape = op == .wait
+            ? "pass only operation_ids (optional) and timeout_seconds (optional)"
+            : "pass only operation_ids"
+        return " \(subject): to send, omit op and operation_ids; to \(op.rawValue), \(controlShape). Nothing was started or cancelled."
+    }
+
     enum AskOracleOp: String {
         case send
         case wait
@@ -346,6 +361,7 @@ struct MCPOracleToolService {
         _ = try Self.parseAskOracleTimeout(rawTimeout)
         let requestID = try Self.parseRequestID(args)
         try validateCommonOracleArgs(args)
+        try validateExplicitSlicesBeforeAdmission(args)
         if let responseModeValue = args["response_mode"], responseModeValue.stringValue == nil {
             throw MCPError.invalidParams("response_mode must be a string")
         }
@@ -942,6 +958,7 @@ struct MCPOracleToolService {
         if !unsupported.isEmpty {
             throw MCPError.invalidParams(
                 "ask_oracle op:\"wait\" only accepts operation_ids and timeout_seconds; presentation was frozen at send. Unsupported args: \(unsupported.joined(separator: ", "))."
+                    + Self.controlSendArgumentsHint(op: .wait, unsupported: unsupported)
             )
         }
         let rawTimeout = args["timeout_seconds"]
@@ -1185,6 +1202,7 @@ struct MCPOracleToolService {
         if !unsupported.isEmpty {
             throw MCPError.invalidParams(
                 "ask_oracle op:\"cancel\" only accepts operation_ids. Unsupported args: \(unsupported.joined(separator: ", "))."
+                    + Self.controlSendArgumentsHint(op: .cancel, unsupported: unsupported)
             )
         }
         guard let operationIDs = try Self.parseOperationIDs(args["operation_ids"], required: true) else {
@@ -2247,6 +2265,102 @@ struct MCPOracleToolService {
             )
         }
         return mode
+    }
+
+    /// Runs before an operation is reserved: rejects the whole send when any explicit slice would
+    /// be silently dropped by the shared slice parser. Selection-mode/target rules stay in
+    /// `parseSelectionMode`, which runs during startup preparation.
+    private func validateExplicitSlicesBeforeAdmission(_ args: [String: Value]) throws {
+        let rawMode = args["selection_mode"]?.stringValue?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        guard rawMode == OracleViewModel.OracleSelectionMode.explicitSlices.rawValue,
+              let slices = args["slices"]?.arrayValue,
+              !slices.isEmpty
+        else { return }
+        try validateExplicitSliceEntries(slices)
+    }
+
+    private static func nonNullValue(_ value: Value?) -> Value? {
+        if let value, case .null = value { return nil }
+        return value
+    }
+
+    /// An entry is valid with at least one usable representation (non-empty `ranges` of objects or
+    /// non-empty `lines`); explicit JSON null counts as absent, and present non-null keys must have
+    /// the right type.
+    private func validateExplicitSliceEntries(_ slices: [Value]) throws {
+        var problems: [String] = []
+        for (index, entry) in slices.enumerated() {
+            guard let object = entry.objectValue else {
+                problems.append("slices[\(index)]: must be an object")
+                continue
+            }
+            let path = object["path"]?.stringValue?
+                .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            let label = path.isEmpty ? "slices[\(index)]" : "slices[\(index)] (\(path))"
+            var entryProblems: [String] = []
+            if path.isEmpty {
+                entryProblems.append("path must be a non-empty string")
+            }
+            var shapeProblems: [String] = []
+            var emptyRepresentations: [String] = []
+            var hasUsableRepresentation = false
+            let rangesValue = Self.nonNullValue(object["ranges"])
+            let linesValue = Self.nonNullValue(object["lines"])
+            if let rangesValue {
+                if let ranges = rangesValue.arrayValue {
+                    if ranges.isEmpty {
+                        emptyRepresentations.append("ranges must be a non-empty array")
+                    } else {
+                        let nonObjectIndices = ranges.indices.filter { ranges[$0].objectValue == nil }
+                        hasUsableRepresentation = hasUsableRepresentation || nonObjectIndices.isEmpty
+                        shapeProblems += nonObjectIndices.map {
+                            #"ranges[\#($0)] must be an object like {"start_line":10,"end_line":40}"#
+                        }
+                    }
+                } else {
+                    shapeProblems.append("ranges must be an array")
+                }
+            }
+            if let linesValue {
+                if let lines = linesValue.stringValue {
+                    if lines.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                        emptyRepresentations.append("lines must be a non-empty string")
+                    } else {
+                        hasUsableRepresentation = true
+                    }
+                } else {
+                    shapeProblems.append("lines must be a string")
+                }
+            }
+            entryProblems += shapeProblems
+            if !hasUsableRepresentation, shapeProblems.isEmpty {
+                if !emptyRepresentations.isEmpty {
+                    entryProblems += emptyRepresentations
+                } else {
+                    let misplacedKeys = ["start_line", "end_line", "start", "end"]
+                        .filter { Self.nonNullValue(object[$0]) != nil }
+                    if misplacedKeys.isEmpty {
+                        entryProblems.append("missing ranges or lines; a path alone is rejected")
+                    } else {
+                        entryProblems.append(
+                            "\(misplacedKeys.joined(separator: "/")) must be inside ranges, not on the slice"
+                        )
+                    }
+                }
+                if path.contains("#L") { entryProblems.append("use lines instead of a #L suffix") }
+            }
+            if !entryProblems.isEmpty {
+                problems.append("\(label): \(entryProblems.joined(separator: "; "))")
+            }
+        }
+        guard problems.isEmpty else {
+            throw MCPError.invalidParams(
+                "Invalid explicit Oracle slices: \(problems.joined(separator: " | ")). "
+                    + #"Each slice needs ranges or lines, for example {"path":"Sources/App.swift","ranges":[{"start_line":10,"end_line":40}]} or {"path":"Sources/App.swift","lines":"10-40"}. No consultation was started."#
+            )
+        }
     }
 
     private func parseMaxOutputTokens(_ args: [String: Value]) throws -> Int? {

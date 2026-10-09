@@ -425,6 +425,47 @@ final class MCPAskOracleLifecycleTests: XCTestCase {
                     XCTAssertFalse(error.localizedDescription.isEmpty)
                 }
             }
+            // Strict controls stay rejected but tell a caller who meant to send how to recover.
+            let consultations: Value = .array([.object([
+                "message": .string("batch lane"),
+                "model": .string(fixture.preset.name)
+            ])])
+            let controlHints: [(op: String, args: [String: Value], expected: String)] = [
+                (
+                    "wait",
+                    ["op": .string("wait"), "consultations": consultations],
+                    "ask_oracle op:\"wait\" only accepts operation_ids and timeout_seconds; presentation was frozen at send. Unsupported args: consultations. consultations is a send argument: to send, omit op and operation_ids; to wait, pass only operation_ids (optional) and timeout_seconds (optional). Nothing was started or cancelled."
+                ),
+                (
+                    "cancel",
+                    [
+                        "op": .string("cancel"),
+                        "operation_ids": .array([.string(UUID().uuidString)]),
+                        "consultations": consultations
+                    ],
+                    "ask_oracle op:\"cancel\" only accepts operation_ids. Unsupported args: consultations. consultations is a send argument: to send, omit op and operation_ids; to cancel, pass only operation_ids. Nothing was started or cancelled."
+                )
+            ]
+            for control in controlHints {
+                do {
+                    _ = try await fixture.call(control.args)
+                    XCTFail("op:\(control.op) with consultations must stay rejected")
+                } catch {
+                    let description = error.localizedDescription
+                    XCTAssertTrue(description.contains(control.expected), "\(control.op): \(description)")
+                }
+            }
+            // A real wait with a stray presentation key is rejected without an invitation to resend.
+            do {
+                _ = try await fixture.call(["op": .string("wait"), "response_mode": .string("tail")])
+                XCTFail("op:wait with response_mode must stay rejected")
+            } catch {
+                let description = error.localizedDescription
+                XCTAssertTrue(description.contains("Unsupported args: response_mode."), description)
+                XCTAssertFalse(description.contains("send argument"), description)
+                XCTAssertFalse(description.contains("to send"), description)
+            }
+
             let duplicate = UUID().uuidString
             do {
                 _ = try await fixture.call([

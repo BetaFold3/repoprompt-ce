@@ -3118,6 +3118,176 @@ import XCTest
             }
         }
 
+        /// Explicit slices that the shared parser would silently drop (path-only, misplaced line keys,
+        /// empty ranges) reject the whole send before admission instead of shrinking the context.
+        func testAskOracleExplicitSlicesRejectDroppableEntriesBeforeAdmission() async throws {
+            try await MCPSharedServerTestLease.shared.withLease { lease in
+                let fixture = try await PersistentMCPTestFixture.make(lease: lease)
+                let capture = OracleSliceSelectionCapture()
+                do {
+                    try await activateWorkspace(fixture.contextA)
+                    let selectedFile = fixture.contextA.fileURL
+                    try write(
+                        "let first = \"slice_first\"\nlet middle = \"slice_middle\"\nlet last = \"slice_last\"\n",
+                        to: selectedFile
+                    )
+                    let endpoint = try fixture.endpointA()
+                    try await configureAgentModeEndpoint(
+                        endpoint,
+                        context: makeFrozenContext(
+                            fixture: fixture,
+                            selection: StoredSelection(codemapAutoEnabled: false),
+                            bindings: []
+                        ),
+                        fixture: fixture
+                    )
+                    fixture.contextA.window.mcpServer.setOracleChatSendOverrideForTesting {
+                        _, _, tabContext in
+                        let context = try XCTUnwrap(tabContext)
+                        capture.record(context.packaging.selection)
+                        return [
+                            "chat_id": .string(UUID().uuidString),
+                            "short_id": .string("slice-validation-capture"),
+                            "mode": .string("chat"),
+                            "response": .string("captured")
+                        ]
+                    }
+
+                    let connectionID = endpoint.connectionID
+                    func ask(slices: [Value]) async throws {
+                        let args: [String: Value] = [
+                            "message": .string("Review this exact send-local context."),
+                            "new_chat": .bool(true),
+                            "model": .string("FreshContextOracle"),
+                            "selection_mode": .string("explicit_slices"),
+                            "slices": .array(slices)
+                        ]
+                        _ = try await ServerNetworkManager.withConnectionID(connectionID) {
+                            try await fixture.contextA.window.mcpServer.executeAskOracleForTesting(args: args)
+                        }
+                    }
+
+                    let path = selectedFile.path
+                    let validRanges: Value = .object([
+                        "path": .string(path),
+                        "ranges": .array([.object(["start_line": .int(2), "end_line": .int(2)])])
+                    ])
+                    let pathOnly: Value = .object(["path": .string(path)])
+                    let rejectedCases: [(name: String, slices: [Value], expected: [String])] = [
+                        ("path-only", [pathOnly], [
+                            "slices[0] (\(path)): missing ranges or lines; a path alone is rejected"
+                        ]),
+                        ("misplaced line keys", [.object([
+                            "path": .string(path),
+                            "start_line": .int(2),
+                            "end_line": .int(2)
+                        ])], [
+                            "slices[0] (\(path)): start_line/end_line must be inside ranges, not on the slice"
+                        ]),
+                        ("mixed valid and path-only", [validRanges, pathOnly], [
+                            "slices[1] (\(path)): missing ranges or lines"
+                        ]),
+                        ("empty ranges", [.object([
+                            "path": .string(path),
+                            "ranges": .array([])
+                        ])], [
+                            "slices[0] (\(path)): ranges must be a non-empty array"
+                        ]),
+                        ("non-object range item", [.object([
+                            "path": .string(path),
+                            "ranges": .array([.int(2)])
+                        ])], [
+                            #"slices[0] (\#(path)): ranges[0] must be an object like {"start_line":10,"end_line":40}"#
+                        ]),
+                        ("wrong types", [
+                            .string(path),
+                            .object(["path": .string(path), "ranges": .string("1-2")]),
+                            .object(["path": .string(path), "lines": .int(5)])
+                        ], [
+                            "slices[0]: must be an object | slices[1] (\(path)): ranges must be an array | slices[2] (\(path)): lines must be a string."
+                        ])
+                    ]
+                    // The real admission observable: sendChat is overridden, so chat-session counts
+                    // cannot move; a rejected-before-admission send must not reserve an operation.
+                    let operationStore = fixture.contextA.window.oracleViewModel.mcpOperationStore
+                    @MainActor func operationFootprint() -> Int {
+                        operationStore.test_recordCount() + operationStore.test_tombstoneCount()
+                    }
+                    let footprintBefore = operationFootprint()
+                    for rejected in rejectedCases {
+                        do {
+                            try await ask(slices: rejected.slices)
+                            XCTFail("Expected \(rejected.name) slices to be rejected before admission")
+                        } catch {
+                            let description = error.localizedDescription
+                            for fragment in rejected.expected + [
+                                "Invalid explicit Oracle slices",
+                                #"{"path":"Sources/App.swift","ranges":[{"start_line":10,"end_line":40}]}"#,
+                                "No consultation was started."
+                            ] {
+                                XCTAssertTrue(description.contains(fragment), "\(rejected.name): \(description)")
+                            }
+                            if rejected.name == "mixed valid and path-only" {
+                                XCTAssertFalse(description.contains("slices[0]"), description)
+                            }
+                        }
+                    }
+                    XCTAssertTrue(capture.selections.isEmpty, "Rejected slices must not reach sendChat")
+                    XCTAssertEqual(
+                        operationFootprint(),
+                        footprintBefore,
+                        "Rejected slices must not reserve an Oracle operation"
+                    )
+
+                    // Shape-valid but range-free lines reach the resolver backstop during startup.
+                    do {
+                        try await ask(slices: [validRanges, .object(["path": .string(path), "lines": .string(",")])])
+                        XCTFail("Expected a range-free lines slice to hit the resolver backstop")
+                    } catch {
+                        XCTAssertTrue(
+                            error.localizedDescription.contains(
+                                "selection_mode:explicit_slices: one or more slices resolved to no line ranges; no consultation was started"
+                            ),
+                            error.localizedDescription
+                        )
+                    }
+                    XCTAssertTrue(capture.selections.isEmpty, "Backstopped slices must not reach sendChat")
+
+                    let acceptedSlices: [Value] = [
+                        validRanges,
+                        .object(["path": .string(path), "lines": .string("2-2")]),
+                        .object(["path": .string(path), "ranges": .null, "lines": .string("2-2")]),
+                        .object(["path": .string(path), "ranges": .array([]), "lines": .string("2-2")]),
+                        .object([
+                            "path": .string(path),
+                            "ranges": .array([.object(["start_line": .int(2), "end_line": .int(2)])]),
+                            "lines": .string("")
+                        ])
+                    ]
+                    let footprintBeforeAccepted = operationFootprint()
+                    for slice in acceptedSlices {
+                        try await ask(slices: [slice])
+                    }
+                    XCTAssertGreaterThan(
+                        operationFootprint(),
+                        footprintBeforeAccepted,
+                        "Accepted sends reserve operations, so the footprint assertion above is not vacuous"
+                    )
+                    XCTAssertEqual(capture.selections.count, acceptedSlices.count)
+                    for selection in capture.selections {
+                        XCTAssertEqual(selection.slices[path], [LineRange(start: 2, end: 2)])
+                    }
+
+                    fixture.contextA.window.mcpServer.setOracleChatSendOverrideForTesting(nil)
+                    await fixture.cleanup()
+                } catch {
+                    fixture.contextA.window.mcpServer.setOracleChatSendOverrideForTesting(nil)
+                    await fixture.cleanup()
+                    throw error
+                }
+            }
+        }
+
         /// Plan A1 downstream check: a fresh review with send-local context is packaged by the real
         /// Oracle send path and reaches the provider transport instead of being rejected as empty.
         func testAskOracleFreshReviewSelectionModesReachTransportThroughRealPackaging() async throws {
@@ -5204,6 +5374,15 @@ import XCTest
 
         func record(context: OracleViewModel.OracleSendTabContext, message: AIMessage) {
             turns.append(Turn(context: context, message: message))
+        }
+    }
+
+    @MainActor
+    private final class OracleSliceSelectionCapture {
+        private(set) var selections: [StoredSelection] = []
+
+        func record(_ selection: StoredSelection) {
+            selections.append(selection)
         }
     }
 

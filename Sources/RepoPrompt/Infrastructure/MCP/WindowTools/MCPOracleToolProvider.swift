@@ -81,6 +81,8 @@ final class MCPOracleToolProvider: MCPWindowToolProviding {
             On a single send, pass `export_response: true` to write the response to a shareable file and get back shareable `oracle_export_path` / `oracle_export_instruction` values. `export_response` is single-send only and is rejected with `consultations`; to export a batch lane, set that lane's `response_mode` to `tail` or `none`, which auto-exports it and returns that lane's own `oracle_export_path` / `oracle_export_instruction`. To hand the export to a child agent, include `oracle_export_path` inside the `message` (or `messages`) you send on your next delegation call; your system prompt names the specific delegation tool available to you.
 
             After compaction, first call `op:"wait"` without `operation_ids` to recover owned undelivered results. Use `oracle_chat_log` with a known `chat_id` only to recover conversation text when no operation can be collected; never reconstruct a lost operation by resending.
+
+            Recipes: wait = `{"op":"wait","operation_ids":["<operation_id from the send>"]}`; cancel = `{"op":"cancel","operation_ids":["<operation_id>"]}`; slice = `{"path":"Sources/App.swift","ranges":[{"start_line":10,"end_line":40}]}`. Omit `op` when sending; set it only to wait or cancel. When a result includes `resume`, send exactly that object as the next call; do not merge it into the original send arguments.
             """,
             annotations: .repoPromptLocalEphemeralState,
             inputSchema: .object(
@@ -127,7 +129,7 @@ final class MCPOracleToolProvider: MCPWindowToolProviding {
                         enum: ["current", "none", "explicit_slices"]
                     ),
                     "slices": .array(
-                        description: "Send-local file/range specs used only with selection_mode:explicit_slices. Uses manage_selection slice vocabulary and never mutates shared selection.",
+                        description: "Send-local file/range specs used only with selection_mode:explicit_slices. Uses manage_selection slice vocabulary and never mutates shared selection. Each slice needs `ranges` or `lines`; a path alone is rejected.",
                         items: .object(
                             properties: [
                                 "path": .string(description: "Relative or absolute file path"),

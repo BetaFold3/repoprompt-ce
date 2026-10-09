@@ -593,6 +593,15 @@ final class MCPServerViewModel: ObservableObject {
                 guard parsed.sliceErrors.isEmpty else {
                     throw MCPError.invalidParams(parsed.sliceErrors.joined(separator: "; "))
                 }
+                // Backstop: every requested entry must parse to at least one range (e.g. lines:","
+                // passes shape validation but yields none), so no slice is silently dropped.
+                guard parsed.sliceInputs.count == (slices.arrayValue?.count ?? 0),
+                      parsed.sliceInputs.allSatisfy({ !$0.ranges.isEmpty })
+                else {
+                    throw MCPError.invalidParams(
+                        "selection_mode:explicit_slices: one or more slices resolved to no line ranges; no consultation was started"
+                    )
+                }
                 let built = await buildStoredSelection(
                     from: parsed,
                     mode: "slices",

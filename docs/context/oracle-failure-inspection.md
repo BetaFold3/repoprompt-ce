@@ -16,6 +16,8 @@ The implementation covers A/B/C below. Both OracleA and OracleB approved the ori
   - it keeps the `chat_name` display-only sentence.
 
   Listed presets are *configured*, not availability-checked.
+- **Slice entries** (`validateExplicitSlicesBeforeAdmission`): before an operation is reserved, every `explicit_slices` entry needs a non-empty `path` and a usable `ranges` (non-empty array of objects) or `lines` (non-empty string); JSON `null` counts as absent. Otherwise the whole send is rejected, naming each bad `slices[i]` with a copyable example. The Oracle slice resolver also rejects a send in which any requested slice resolves to no line ranges, so no slice is dropped silently. `manage_selection` parsing is unchanged.
+- **Wait and cancel stay strict.** Send arguments are still rejected, never reinterpreted. When the rejected call carries `message` or `consultations`, the error adds how to send (omit `op` and `operation_ids`) and says nothing was started or cancelled.
 - **Guidance**: one shared `AgentModePrompts.Fragments.oracleFreshChatGuidance` fragment appears exactly once in every prompt family that recommends fresh Oracle lanes. Named-Oracle guidance reuses an exact UUID the session already holds, and keeps its identity checks. The tool description, schema, Knowledge description and the context-overflow remedy all state the same rule. These descriptions are pinned by `ToolCatalogSnapshotTests` hashes and `OracleFreshChatGuidanceTests`.
 
 ## Patch B — failed Oracle card diagnosability
