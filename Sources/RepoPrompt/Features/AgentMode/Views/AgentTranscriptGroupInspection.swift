@@ -3,6 +3,10 @@ import SwiftUI
 // Oracle failure inspection plan, Patch C: live group expansion and large-group rendering for
 // dynamic tool-summary blocks (activity clusters and grouped history). Everything here is
 // presentation-only and in-memory; a transcript reload returns every block to its default.
+// Capped expanded groups render every row eagerly (transcript inner-scroll hang fix, Step 2):
+// a lazy stack inside the content-sized capped inner scroll view is the leading suspect for the
+// 2026-10-04 main-thread hang. None may return without a harness that reproduces nonconvergence
+// with the 2026-10-04 lazy layout and shows the replacement settles.
 
 // MARK: - C1. Explicit-choice provenance
 
@@ -124,7 +128,7 @@ enum AgentTranscriptGroupExpansionPolicy {
 
 // MARK: - C4. Flattened grouped-history entries
 
-/// One lazily rendered line of an expanded grouped-history block.
+/// One eagerly rendered line of an expanded, capped grouped-history block.
 struct AgentTranscriptGroupInspectionEntry: Identifiable, Equatable {
     enum Content: Equatable {
         case sectionHeader(AgentTranscriptGroupedSection)
@@ -138,9 +142,9 @@ struct AgentTranscriptGroupInspectionEntry: Identifiable, Equatable {
     let topSpacing: CGFloat
 }
 
-/// Flattens grouped-history sections so a `LazyVStack` virtualizes rows; a lazy wrapper around
-/// eager sections would still build every row. Grouped sections render a heading and their
-/// child rows, so entries carry those two kinds with stable identity.
+/// Flattens grouped-history sections into one eager, non-lazy stack of entries. The entries
+/// still supply stable row identity and the inner-follow token (`entries.last?.id`). Grouped
+/// sections render a heading and their child rows, so entries carry those two kinds.
 enum AgentTranscriptGroupInspection {
     static let sectionSpacing: CGFloat = 8
     static let sectionVerticalPadding: CGFloat = 2

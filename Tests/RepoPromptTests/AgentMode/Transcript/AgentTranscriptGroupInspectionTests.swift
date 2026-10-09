@@ -2,7 +2,7 @@ import Foundation
 @testable import RepoPromptApp
 import XCTest
 
-/// Oracle failure inspection plan, Patch C: live group expansion, flattened lazy entries,
+/// Oracle failure inspection plan, Patch C: live group expansion, flattened entries,
 /// bottom-sticky inner follow, and the header failure-count suffix.
 final class AgentTranscriptGroupInspectionTests: XCTestCase {
     private typealias Policy = AgentTranscriptGroupExpansionPolicy

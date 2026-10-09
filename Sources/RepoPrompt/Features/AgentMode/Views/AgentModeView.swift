@@ -2877,7 +2877,7 @@ struct AgentModeChatDetailView: View {
                                     newestEntryID: block.rows.last.map(\.id.uuidString),
                                     bottomAnchorID: "\(block.id)#inner-bottom"
                                 ) {
-                                    expandedClusterContent(block: block, renderContext: renderContext, lazy: true)
+                                    expandedClusterContent(block: block, renderContext: renderContext)
                                         .frame(maxWidth: .infinity, alignment: .leading)
                                 }
                             } else {
@@ -2932,7 +2932,7 @@ struct AgentModeChatDetailView: View {
                                     newestEntryID: entries.last?.id,
                                     bottomAnchorID: "\(block.id)#inner-bottom"
                                 ) {
-                                    lazyGroupedContent(entries: entries, renderContext: renderContext)
+                                    flattenedGroupedContent(entries: entries, renderContext: renderContext)
                                         .frame(maxWidth: .infinity, alignment: .leading)
                                 }
                             } else {
@@ -3307,22 +3307,14 @@ struct AgentModeChatDetailView: View {
         return labels.joined(separator: ", ")
     }
 
-    @ViewBuilder
+    /// Eager in both the capped and uncapped branches: a lazy stack inside the content-sized
+    /// capped inner scroll view is the leading suspect for the 2026-10-04 main-thread hang.
     private func expandedClusterContent(
         block: AgentTranscriptRenderBlock,
-        renderContext: TranscriptRenderContext,
-        lazy: Bool = false
+        renderContext: TranscriptRenderContext
     ) -> some View {
-        if lazy {
-            // Capped branch: only rows near the inner viewport are built. Offscreen rows are
-            // recreated, so an inner card expanded far away can collapse (accepted).
-            LazyVStack(alignment: .leading, spacing: 6) {
-                expandedClusterRows(block: block, renderContext: renderContext)
-            }
-        } else {
-            VStack(alignment: .leading, spacing: 6) {
-                expandedClusterRows(block: block, renderContext: renderContext)
-            }
+        VStack(alignment: .leading, spacing: 6) {
+            expandedClusterRows(block: block, renderContext: renderContext)
         }
     }
 
@@ -3337,11 +3329,13 @@ struct AgentModeChatDetailView: View {
         }
     }
 
-    private func lazyGroupedContent(
+    /// Capped grouped history renders its flattened entries eagerly (see the file-header note in
+    /// `AgentTranscriptGroupInspection.swift`); do not reintroduce a lazy stack here.
+    private func flattenedGroupedContent(
         entries: [AgentTranscriptGroupInspectionEntry],
         renderContext: TranscriptRenderContext
     ) -> some View {
-        LazyVStack(alignment: .leading, spacing: 0) {
+        VStack(alignment: .leading, spacing: 0) {
             ForEach(entries) { entry in
                 groupInspectionEntryView(entry, renderContext: renderContext)
                     .padding(.top, entry.topSpacing)
@@ -3401,7 +3395,7 @@ struct AgentModeChatDetailView: View {
         .padding(.vertical, 2)
     }
 
-    /// Section header — compact inline. Shared by the eager and lazy grouped-history layouts.
+    /// Section header — compact inline. Shared by the nested and flattened grouped-history layouts.
     private func groupedHistorySectionHeader(section: AgentTranscriptGroupedSection) -> some View {
         HStack(spacing: 5) {
             if let icon = section.icon {
