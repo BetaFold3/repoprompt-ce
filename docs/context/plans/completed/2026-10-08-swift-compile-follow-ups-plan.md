@@ -4,7 +4,7 @@ Scope: read when the task touches the 2026-10-08 Swift compile follow-ups: the s
 Authority: Reference
 Last-verified: 2026-10-08
 
-Status: Steps 1–3 complete; Step 4 not started. Step 3 evidence: `.agent-artifacts/swift-compile-time/step3-results.md` and `step3-review-disposition.md`. Step 2 evidence: `.agent-artifacts/swift-compile-time/step2-results.md` and `step2-review-disposition.md`. Results and review evidence: `.agent-artifacts/swift-compile-time/step1-results.md` and `step1-review-disposition.md`. Planned with OracleA and OracleD (one challenge round; converged). Timebox about 1 day.
+Status: Steps 1–4 complete. Results (noisy host): (1) Type-check is a marginal candidate incremental lever inferred from 807 ms of cold emit-module warnings, including a 525 ms private-method check; the visible declaration-only subtotal is 282 ms (below the plan's ~0.5 s bar; sub-200 ms work omitted), and incremental savings are unverified. (2) A Core body edit skipped the `RepoPromptApp` emit-module job 3/3: Core-edit median 11.151 [11.050–11.294] s, app-edit median 19.856 [19.721–19.907] s (full focused conductor test, n=3 each). Features/AgentMode's optimistic commit-weighted estimate of 4.36 s per app edit meets the plan's follow-up screen; the stricter exclusive-edit proxy is 1.38 s. Further split work is cut on the main agent's recommendation (owner question timed out; reversible assumption, not an owner Decision). (3) Index store off by default, adopted assuming no known consumer (Q1 unanswered; opt-in rollback retained): app edit off 20.54 [20.414–20.667] s vs on 20.55 [20.539–20.560] s, no measurable edit-speed gain (n=2 reversed-order pairs); 744 MiB stale index removed. Evidence: `.agent-artifacts/swift-compile-time/step{1,2,3,4}-results.md` and `step{1,2,3,4}-review-disposition.md`. Planned with OracleA and OracleD (one challenge round; converged). Timebox about 1 day.
 
 ## Goal
 Answer three questions cheaply, keep only what helps, and stop:
@@ -31,7 +31,7 @@ Starting evidence (2026-10-08, symbols off, noisy host): an app body edit builds
   Save the output in the evidence directory, then delete the scratch directory.
 - Validation: warnings appear (if the flag spelling is rejected, the build fails at once; fix the spelling and rerun). Dedupe by location. Classify each top item as declaration-level (stored-property or global initializer, default argument, `@inlinable`; these are type-checked by emit-module on every edit) or body-level (cold builds and the edited file only).
 - Done when: a top-10 list with its classification is in the evidence directory, plus a one-line verdict: "type-check is / is not an incremental lever" (a lever only if declaration-level items total ≥ ~0.5 s).
-- Step 1 — done | rounds 1/2 | open: — | downgraded: — | assumed: direct one-off run allowed (Q2); incremental recurrence inferred from cold-job attribution | deferred: OracleB N3 (qualify body-skipping guidance in Step 4); hotspot fixes out of scope
+- Step 1 — done | rounds 1/2 | open: — | downgraded: — | assumed: direct one-off run allowed (Q2); incremental recurrence inferred from cold-job attribution | deferred: hotspot fixes out of scope (OracleB N3 addressed in Step 4 `development.md` guidance)
 
 ### Step 2 — Split stand-in and edit locality (~1.5 h)
 - Change: none to the repository. `RepoPromptCore`'s `RepoPromptShared` (imported by 44 app files) stands in for an extracted module.
@@ -64,7 +64,7 @@ Starting evidence (2026-10-08, symbols off, noisy host): an app body edit builds
 - Change: add a short results paragraph to this plan's Status (verdicts and medians with ranges only), then move the plan to `docs/context/plans/completed/`. Record any durable fact in `development.md`.
 - Validation: `Scripts/check-agent-context`.
 - Done when: the owner has the three verdicts and the plan is archived.
-- Step 4 — todo | rounds 0/2 | open: — | downgraded: — | assumed: — | deferred: —
+- Step 4 — done | rounds 0/2 | open: — | downgraded: — | assumed: prior Q1–Q4 and cut-follow-up assumptions retained; advisory owner acceptance pending | deferred: no new work; prior optional follow-ups remain in evidence
 
 ## Decisions (owner, 2026-10-08)
 - Scope: re-scope the original ideas to the evidence (cheap flag experiments, slow-type-check scan, split feasibility pilot).
