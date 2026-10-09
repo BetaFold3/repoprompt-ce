@@ -34,6 +34,27 @@ The bounded 2026-10-08 pre-test investigation found an edit-associated interval 
 
 The 2026-10-08 Swift compile follow-ups measured the `RepoPromptApp` emit-module bottleneck on a noisy host. In one cold build, among bodies warned at ≥200 ms, only `WindowRoutingService.updateCachedTools()` appeared in the emit-module job (525 ms; cause unconfirmed). Its visible type-check warnings totalled 807 ms (282 ms declaration-only), which identifies a marginal candidate lever from visible warnings, not an upper bound on total work; incremental savings are unverified. No hotspot was fixed and no code was extracted. An interface-neutral body-only `RepoPromptShared` edit can leave that shared `.swiftmodule` unchanged, so the app's emit-module job is skipped (3/3; full focused conductor-test medians, n=3 each: Core edit 11.151 s vs app edit 19.856 s). Commit-weighted savings estimates for a split are only an optimistic interface-locality proxy. With the index store off, app edits showed no measurable speed gain (n=2 per setting). On 2026-10-09 that build↔test emit-only rework was traced to the PTY/pipe diagnostic-color argv difference and fixed by the wrapper pin above. Measurement was advisory, with single samples: settled build→test→build reran with 0 production module emissions (12.1 s / 13.1 s, previously 32.9 s / 34.2 s).
 
+The 2026-10-09 module-split assessment closes splitting `RepoPromptApp` as a build-speed project. All findings are advisory, from a noisy host.
+
+The baseline is a focused `make dev-test` after a body-only app edit: about 23.5 s (median of 3).
+- About 13.8 s is RepoPromptApp's emit-module job, the critical path.
+- The rest is fixed overhead a split would not remove:
+  - planning: about 3.9 s, of which about 2.8 s is app-driver planning that may partly scale with module size;
+  - linking: about 1.6 s;
+  - `swiftpm-xctest-helper` on the freshly linked bundle: about 2.8–3.1 s;
+  - the null-run floor: about 2.1 s.
+
+Cheap levers are exhausted:
+- The emit-module job already passes `-experimental-skip-non-inlinable-function-bodies-without-types`.
+- The bridging PCH stays disabled. It was previously measured 34.9% slower, and `Scripts/generate_xcode_workspace.py` requires `-disable-bridging-pch`.
+- `make dev-test-parallel WORKERS=1` is slower than `make dev-test` for a focused edit loop: about 30.8 s vs 23.9 s, and 9.7 s vs 2.2 s null. It still runs the helper via `swift test list`, and it re-plans SwiftPM in both its build and list steps. Running `make dev-test` right after it costs one re-plan (about 4 s); nothing recompiles.
+
+Extraction is blocked by coupling. A name-reference inventory found one file-level dependency cycle covering about 561 files and 457k lines, about two-thirds of the app, spanning AgentMode, AI, MCP, WorkspaceContext, VCS, App, Settings and others.
+- Neither `Infrastructure/AI` nor `Features/AgentMode` can be extracted mechanically. `AgentProviderKind`, for example, is declared in AgentMode but used throughout AI.
+- Only small leaf areas such as `Infrastructure/AI/Prompts` and `Infrastructure/AI/Pricing` are separable, and they offer little build-time gain.
+
+Revisit a split only as deliberate architecture work that first breaks that cycle. Raw evidence stays local under `.agent-artifacts/swift-compile-time/`.
+
 ### Parallel source-validating root tests
 
 `make dev-test-parallel` is the promoted full-root contribution lane (`WORKERS=8` by default; `FILTER=<suite-regex>` is optional). It needs no prior ticket: the conductor invalidates any old root ticket, snapshots source, runs `Scripts/canonical_swift.sh build --build-tests`, rejects source drift, fingerprints the discovered root XCTest artifact, and then runs the direct-`xctest` worker pool. After the runner exits it rechecks source, environment gates, toolchain, artifact path, and artifact fingerprint before atomically recording a compatible artifact-provenance ticket. Per-job workdirs, test censuses, and strict candidate manifests live under the conductor jobs directory.
