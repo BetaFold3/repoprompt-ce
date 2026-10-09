@@ -2591,12 +2591,15 @@ struct AgentModeChatDetailView: View {
                 alignment: hasTranscriptContent ? .topLeading : .center
             )
         #if DEBUG
-            .onPreferenceChange(AgentToolCardRenderStatePreferenceKey.self) { states in
-                AgentTranscriptUpdateBurstProbe.note(.toolCardRenderStateDelivery)
-                visibleToolCardRenderStatesByID = states
-                AgentTranscriptUpdateBurstProbe.note(.toolCardRenderStateAssignment)
-                publishStressTelemetrySnapshot()
-            }
+            .modifier(
+                AgentToolCardRenderStateObservation(isEnabled: stressHarness != nil) { states in
+                    AgentTranscriptUpdateBurstProbe.note(.toolCardRenderStateDelivery)
+                    guard states != visibleToolCardRenderStatesByID else { return }
+                    visibleToolCardRenderStatesByID = states
+                    AgentTranscriptUpdateBurstProbe.note(.toolCardRenderStateAssignment)
+                    publishStressTelemetrySnapshot()
+                }
+            )
         #endif
     }
 
@@ -6357,6 +6360,32 @@ struct AgentModeChatDetailView: View {
         return "Use this workflow to structure your next message."
     }
 }
+
+#if DEBUG
+    /// Binds the DEBUG tool-card render-state preference reader only when a stress harness
+    /// consumes it, so ordinary DEBUG transcripts carry no bound observer for that key.
+    /// Tool cards still emit the preference unconditionally (owner decision OD5).
+    ///
+    /// `isEnabled` comes from the chat detail view's constructor-injected `stressHarness`,
+    /// which `WindowState` fixes at composition time, so it does not toggle for an existing
+    /// window. If an input with a different harness presence were ever supplied under the
+    /// same view identity, the `if`/`else` branch switch would give the wrapped transcript
+    /// content a new structural identity and reset its view state.
+    private struct AgentToolCardRenderStateObservation: ViewModifier {
+        let isEnabled: Bool
+        let onChange: @MainActor ([UUID: AgentToolCardRenderState]) -> Void
+
+        func body(content: Content) -> some View {
+            if isEnabled {
+                content.onPreferenceChange(AgentToolCardRenderStatePreferenceKey.self) { states in
+                    onChange(states)
+                }
+            } else {
+                content
+            }
+        }
+    }
+#endif
 
 private struct AgentRunningElapsedText: View {
     let startedAt: Date
