@@ -116,6 +116,10 @@ class AppDelegate: NSObject, ObservableObject, NSApplicationDelegate {
                     CLISymlinkManagerUserSpace.ensureLocalSymlink()
                 }
             }
+            // Starts after this launch callback returns; idempotent.
+            DispatchQueue.main.async {
+                MainThreadStallWatchdog.startIfNeeded()
+            }
             return
         #else
             sparkleManager.startUpdater()

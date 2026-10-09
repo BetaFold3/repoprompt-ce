@@ -313,15 +313,46 @@ struct AgentTranscriptInnerFollowScrollView<Content: View>: View {
             .coordinateSpace(.named(coordinateSpaceName))
             .frame(maxHeight: maxHeight)
             .modifier(AgentTranscriptInnerBottomTracking { position in
+                #if DEBUG
+                    AgentTranscriptUpdateBurstProbe.note(.innerGeometryDelivery)
+                    if followState.lastPosition == position {
+                        AgentTranscriptUpdateBurstProbe.note(.innerDuplicatePosition)
+                    }
+                    let wasPinned = followState.isPinned
+                #endif
                 followState.record(position)
+                #if DEBUG
+                    if followState.isPinned != wasPinned {
+                        AgentTranscriptUpdateBurstProbe.note(.innerPinTransition)
+                    }
+                #endif
             })
             .onChange(of: followsNewest) { _, isLive in
                 followState.setLive(isLive)
             }
             .onChange(of: newestEntryID) { _, _ in
-                guard let ticket = followState.scheduleFollow() else { return }
+                #if DEBUG
+                    AgentTranscriptUpdateBurstProbe.note(.innerNewestEntryChange)
+                #endif
+                guard let ticket = followState.scheduleFollow() else {
+                    #if DEBUG
+                        AgentTranscriptUpdateBurstProbe.note(.innerFollowRejected)
+                    #endif
+                    return
+                }
+                #if DEBUG
+                    AgentTranscriptUpdateBurstProbe.note(.innerFollowScheduled)
+                #endif
                 DispatchQueue.main.async {
-                    guard followState.shouldExecuteFollow(ticket) else { return }
+                    guard followState.shouldExecuteFollow(ticket) else {
+                        #if DEBUG
+                            AgentTranscriptUpdateBurstProbe.note(.innerFollowRejected)
+                        #endif
+                        return
+                    }
+                    #if DEBUG
+                        AgentTranscriptUpdateBurstProbe.note(.innerFollowExecuted)
+                    #endif
                     proxy.scrollTo(bottomAnchorID, anchor: .bottom)
                 }
             }

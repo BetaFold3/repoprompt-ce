@@ -2507,6 +2507,9 @@ struct AgentModeChatDetailView: View {
         .onScrollGeometryChange(for: AgentTranscriptScrollMetrics.self, of: { geometry in
             scrollMetrics(from: geometry)
         }, action: { _, newMetrics in
+            #if DEBUG
+                AgentTranscriptUpdateBurstProbe.note(.outerScrollGeometryAction)
+            #endif
             let oldMetrics = applyScrollMetrics(newMetrics)
             recordRehydrateLayoutSampleIfNeeded(metrics: newMetrics)
             recordPendingBottomScrollOutcomeLayoutMutationIfNeeded(oldMetrics: oldMetrics, newMetrics: newMetrics)
@@ -2589,7 +2592,9 @@ struct AgentModeChatDetailView: View {
             )
         #if DEBUG
             .onPreferenceChange(AgentToolCardRenderStatePreferenceKey.self) { states in
+                AgentTranscriptUpdateBurstProbe.note(.toolCardRenderStateDelivery)
                 visibleToolCardRenderStatesByID = states
+                AgentTranscriptUpdateBurstProbe.note(.toolCardRenderStateAssignment)
                 publishStressTelemetrySnapshot()
             }
         #endif
@@ -2822,6 +2827,9 @@ struct AgentModeChatDetailView: View {
 
     @ViewBuilder
     private func transcriptBlockRows(blocks: [AgentTranscriptRenderBlock]) -> some View {
+        #if DEBUG
+            let _ = AgentTranscriptUpdateBurstProbe.note(.transcriptBlockRowsBody)
+        #endif
         let isContextBuilderQuestionActive = isContextBuilderQuestionPresented
         let renderMetadata = transcriptRenderMetadata(for: blocks)
         let renderContext = TranscriptRenderContext(
