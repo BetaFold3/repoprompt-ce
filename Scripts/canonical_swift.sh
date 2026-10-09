@@ -60,7 +60,8 @@ case "${1:-}" in
     build|test)
         swift_command="$1"
         shift
-        set -- "$swift_command" --build-system native "$@"
+        # Pin color off: SwiftPM's TTY-dependent default changes compiler argv between pipe (build) and PTY (test) jobs, forcing module re-emission.
+        set -- "$swift_command" --build-system native --no-color-diagnostics "$@"
         index_candidate=1
         ;;
 esac

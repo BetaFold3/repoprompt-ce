@@ -590,7 +590,7 @@ class CanonicalSwiftCommandTests(unittest.TestCase):
                 swift_index = argv.index("/usr/bin/swift")
                 expected = list(arguments)
                 if arguments and arguments[0] in {"build", "test"}:
-                    expected[1:1] = ["--build-system", "native", "--disable-index-store"]
+                    expected[1:1] = ["--build-system", "native", "--disable-index-store", "--no-color-diagnostics"]
                 self.assertEqual(argv[swift_index + 1:], expected)
                 self.assertEqual(argv[:2], ["/usr/bin/env", "-i"])
 
@@ -623,7 +623,7 @@ class CanonicalSwiftCommandTests(unittest.TestCase):
         self.assertEqual(hooks, ["SWIFT_DRIVER_DSYMUTIL_EXEC=/usr/bin/true"])
         self.assertFalse(any(item.startswith("RPCE_DEBUG_DSYM=") for item in child_env))
         self.assertEqual(swift_args, ["build", "--build-system", "native", "--disable-index-store",
-                                      "--product", "RepoPrompt"])
+                                      "--no-color-diagnostics", "--product", "RepoPrompt"])
         stderr = result.stderr.decode()
         self.assertEqual(stderr.count("rpce-debug-dsym:"), 1)
         self.assertIn("requested=off effective=off reason=debug_skip", stderr)
@@ -677,12 +677,14 @@ class CanonicalSwiftCommandTests(unittest.TestCase):
 
     def test_index_store_policy_is_argv_only_and_on_adds_nothing(self) -> None:
         arguments = ["build", "--product", "RepoPrompt"]
-        disabled = ["build", "--build-system", "native", "--disable-index-store", "--product", "RepoPrompt"]
+        disabled = ["build", "--build-system", "native", "--disable-index-store", "--no-color-diagnostics",
+                    "--product", "RepoPrompt"]
         for extra, expected in (({}, disabled), ({"RPCE_INDEX_STORE": "off"}, disabled),
                                 ({"RPCE_INDEX_STORE": "off", "RPCE_DEBUG_DSYM": "on"}, disabled),
-                                ({"RPCE_INDEX_STORE": "on"}, ["build", "--build-system", "native", "--product", "RepoPrompt"]),
+                                ({"RPCE_INDEX_STORE": "on"},
+                                 ["build", "--build-system", "native", "--no-color-diagnostics", "--product", "RepoPrompt"]),
                                 ({"RPCE_INDEX_STORE": "on", "RPCE_DEBUG_DSYM": "on"},
-                                 ["build", "--build-system", "native", "--product", "RepoPrompt"])):
+                                 ["build", "--build-system", "native", "--no-color-diagnostics", "--product", "RepoPrompt"])):
             with self.subTest(extra=extra):
                 result, child_env, swift_args = self.run_wrapper(arguments, extra)
                 self.assertEqual(result.returncode, 0)
@@ -701,6 +703,7 @@ class CanonicalSwiftCommandTests(unittest.TestCase):
                               ["test", "list", "--skip-build"], ["test", "--skip-build", "--filter", "X"]):
                 with self.subTest(extra=extra, arguments=arguments):
                     _, _, swift_args = self.run_wrapper(arguments, extra)
+                    self.assertIn("--no-color-diagnostics", swift_args)
                     prefixes.add(tuple(swift_args[1:4]) if "--disable-index-store" in swift_args else tuple(swift_args[1:3]))
             self.assertEqual(len(prefixes), 1)
 

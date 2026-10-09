@@ -96,7 +96,8 @@ FLAG_OPTIONS = frozenset({
     "--enable-parseable-module-interfaces", "--enable-dead-strip", "--disable-dead-strip",
     "--disable-local-rpath", "--enable-local-rpath", "--ignore-lock", "--disable-keychain",
     "--enable-keychain", "--netrc", "--disable-netrc", "--enable-netrc", "--use-integrated-swift-driver",
-    "--experimental-explicit-module-build", "--emit-swift-module-separately",
+    "--experimental-explicit-module-build", "--emit-swift-module-separately", "--no-color-diagnostics",
+    "--color-diagnostics",
 })
 CONFIGURATION_OPTIONS = frozenset({"-c", "--configuration"})
 
