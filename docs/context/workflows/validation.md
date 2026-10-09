@@ -11,6 +11,7 @@ Run the smallest coordinated check that can fail for the behavior you changed. D
 | Change boundary | Validation route |
 |---|---|
 | Agent guidance or `docs/context/` | Run `Scripts/check-agent-context` and `Scripts/test-check-agent-context`. |
+| Ordered plan-phase execution, review gates, or review ownership | Follow the [phase review policy](../review-policy.md). |
 | Repository/source layout or durable docs | Run `make guardrails`. |
 | Canonical Swift environment, debug dSYM helpers or conductor symbol operations | Run `make conductor-selftest` and focused policy/regeneration tests. For policy/toolchain rollout, record an off-mode test-breakpoint/local-value and actual-crash symbolication before/after in-place `dev-dsym`, ten alternating same-tree test-edit runs per mode with off faster, reported null medians (flag off >0.5 s slower), and one default-off `make dev-build` plus `make dev-test`. Disclose any test filter and crash return-address adjustment. See [debug symbols](development.md#debug-symbols) for the qualified behavior and rollback. Automated C1–C5, fine-client A/A, calibration, bootstrap and thermal gates are not required by the owner's lean contract. |
 | Swift behavior (iteration and focused validation) | Run `make dev-lint` and `make dev-test FILTER=<SuiteName>`; run `make dev-format` first only when formatting mutation is intended. |
