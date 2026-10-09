@@ -361,6 +361,100 @@ final class AgentTranscriptGroupInspectionTests: XCTestCase {
         XCTAssertTrue(superseded.shouldExecuteFollow(second), "Content growth alone does not cancel the follow")
     }
 
+    // MARK: - C3 inner follow tracker parity (transcript inner-scroll hang fix, Step 3)
+
+    @MainActor
+    func testInnerFollowTrackerMatchesStateThroughGrowthUnpinAndRepin() {
+        let driver = InnerFollowParityDriver(isLive: true)
+        driver.record(offset: 0, distance: 400)
+        XCTAssertFalse(driver.isPinned, "Starting at the top of a long list stays unpinned")
+        XCTAssertNil(driver.scheduleFollow("top"), "No follow from the top")
+
+        driver.record(offset: 600, distance: 0)
+        XCTAssertTrue(driver.isPinned)
+        XCTAssertNotNil(driver.scheduleFollow("growth"))
+        driver.record(offset: 600, distance: 44)
+        XCTAssertTrue(driver.isPinned, "Growth below an unmoved offset keeps following")
+        XCTAssertTrue(driver.executes("growth"))
+        driver.record(offset: 644, distance: 0)
+        XCTAssertTrue(driver.executes("growth"))
+
+        XCTAssertNotNil(driver.scheduleFollow("preUnpin"))
+        XCTAssertFalse(driver.executes("growth"), "A newer follow supersedes the older ticket")
+        XCTAssertTrue(driver.executes("preUnpin"))
+
+        driver.record(offset: 560, distance: 84)
+        XCTAssertFalse(driver.isPinned, "Scrolling up unpins")
+        XCTAssertFalse(driver.executes("preUnpin"), "Unpinning cancels a ticket taken before it")
+        XCTAssertNil(driver.scheduleFollow("unpinned"), "A detached reader is never followed")
+
+        driver.record(offset: 643, distance: 1)
+        XCTAssertTrue(driver.isPinned, "Returning to the bottom re-pins")
+        XCTAssertFalse(driver.executes("preUnpin"), "Re-pinning never revives a cancelled ticket")
+        XCTAssertNotNil(driver.scheduleFollow("repinned"))
+        XCTAssertTrue(driver.executes("repinned"))
+        XCTAssertFalse(driver.executes("preUnpin"))
+    }
+
+    @MainActor
+    func testInnerFollowTrackerMatchesStateThroughRunCompletionAndSupersededTickets() {
+        let driver = InnerFollowParityDriver(isLive: true)
+        driver.record(offset: 600, distance: 0)
+        XCTAssertNotNil(driver.scheduleFollow("first"))
+        XCTAssertNotNil(driver.scheduleFollow("second"))
+        XCTAssertFalse(driver.executes("first"), "Only the latest scheduled follow runs")
+        XCTAssertTrue(driver.executes("second"))
+        driver.record(offset: 600, distance: 44)
+        XCTAssertTrue(driver.executes("second"), "Content growth alone does not cancel the follow")
+
+        driver.setLive(false)
+        XCTAssertFalse(driver.executes("second"), "The run ending cancels an outstanding follow")
+        XCTAssertNil(driver.scheduleFollow("ended"), "No follow once the run ends")
+        driver.setLive(false)
+        driver.record(offset: 644, distance: 0)
+        XCTAssertTrue(driver.isPinned)
+        XCTAssertNil(driver.scheduleFollow("endedPinned"), "Being pinned alone does not follow after the run ends")
+
+        driver.setLive(true)
+        XCTAssertFalse(driver.executes("second"), "Going live again does not revive a cancelled follow")
+        XCTAssertNotNil(driver.scheduleFollow("live"))
+        XCTAssertTrue(driver.executes("live"))
+
+        let idle = InnerFollowParityDriver(isLive: false)
+        idle.record(offset: 0, distance: 0)
+        XCTAssertNil(idle.scheduleFollow("idle"), "A group that is not live never follows")
+        idle.setLive(true)
+        XCTAssertNotNil(idle.scheduleFollow("started"))
+        XCTAssertTrue(idle.executes("started"))
+    }
+
+    @MainActor
+    func testInnerFollowTrackerMatchesStateAtPinToleranceAndScrollUpBoundaries() {
+        let driver = InnerFollowParityDriver(isLive: true)
+        driver.record(offset: 0, distance: 6.5)
+        XCTAssertFalse(driver.isPinned, "Just outside the 6-point tolerance does not pin")
+        driver.record(offset: 0.5, distance: 6)
+        XCTAssertTrue(driver.isPinned, "Exactly 6 points from the bottom pins")
+        XCTAssertNotNil(driver.scheduleFollow("edge"))
+
+        driver.record(offset: 600, distance: 0)
+        driver.record(offset: 594, distance: 6)
+        XCTAssertTrue(driver.isPinned, "Scrolling up within the tolerance stays pinned")
+        XCTAssertTrue(driver.executes("edge"))
+        driver.record(offset: 593.5, distance: 6.5)
+        XCTAssertTrue(driver.isPinned, "An upward move of exactly 0.5 points is not a scroll-up")
+        XCTAssertTrue(driver.executes("edge"))
+        driver.record(offset: 592.75, distance: 7.25)
+        XCTAssertFalse(driver.isPinned, "More than 0.5 points upward outside the tolerance unpins")
+        XCTAssertFalse(driver.executes("edge"))
+
+        driver.record(offset: 593, distance: 7)
+        XCTAssertFalse(driver.isPinned, "Scrolling down short of the tolerance stays unpinned")
+        driver.record(offset: 594, distance: 6)
+        XCTAssertTrue(driver.isPinned, "Re-pins exactly at the tolerance")
+        XCTAssertFalse(driver.executes("edge"))
+    }
+
     // MARK: - C5 failure-count suffix
 
     func testFailureCountCountsEachFailedExecutionOnceAndExcludesPendingAndCancelled() {
@@ -470,6 +564,75 @@ final class AgentTranscriptGroupInspectionTests: XCTestCase {
     }
 
     // MARK: - Helpers
+
+    /// Drives a plain `AgentTranscriptInnerFollowState` and an `AgentTranscriptInnerFollowTracker`
+    /// through the same operations, asserting equal state and equal results for every issued
+    /// ticket after each one. Queries return the plain state's result.
+    @MainActor
+    private final class InnerFollowParityDriver {
+        private var plain: AgentTranscriptInnerFollowState
+        private let tracker: AgentTranscriptInnerFollowTracker
+        private var tickets: [(name: String, ticket: Int)] = []
+        private var step = 0
+
+        init(isLive: Bool, file: StaticString = #filePath, line: UInt = #line) {
+            plain = AgentTranscriptInnerFollowState(isLive: isLive)
+            tracker = AgentTranscriptInnerFollowTracker(isLive: isLive)
+            verify("init(isLive: \(isLive))", file: file, line: line)
+        }
+
+        var isPinned: Bool {
+            plain.isPinned
+        }
+
+        func record(offset: CGFloat, distance: CGFloat, file: StaticString = #filePath, line: UInt = #line) {
+            let position = AgentTranscriptInnerFollowPolicy.Position(offsetY: offset, distanceToBottom: distance)
+            plain.record(position)
+            tracker.record(position)
+            verify("record(\(offset), \(distance))", file: file, line: line)
+        }
+
+        func setLive(_ live: Bool, file: StaticString = #filePath, line: UInt = #line) {
+            plain.setLive(live)
+            tracker.setLive(live)
+            verify("setLive(\(live))", file: file, line: line)
+        }
+
+        func scheduleFollow(_ name: String, file: StaticString = #filePath, line: UInt = #line) -> Int? {
+            let expected = plain.scheduleFollow()
+            let actual = tracker.scheduleFollow()
+            XCTAssertEqual(actual, expected, "scheduleFollow(\(name))", file: file, line: line)
+            if let expected {
+                tickets.append((name, expected))
+            }
+            verify("scheduleFollow(\(name))", file: file, line: line)
+            return expected
+        }
+
+        func executes(_ name: String, file: StaticString = #filePath, line: UInt = #line) -> Bool {
+            guard let ticket = tickets.last(where: { $0.name == name })?.ticket else {
+                XCTFail("No ticket named \(name)", file: file, line: line)
+                return false
+            }
+            let expected = plain.shouldExecuteFollow(ticket)
+            XCTAssertEqual(tracker.shouldExecuteFollow(ticket), expected, "ticket \(name)", file: file, line: line)
+            return expected
+        }
+
+        private func verify(_ operation: String, file: StaticString, line: UInt) {
+            step += 1
+            XCTAssertEqual(tracker.state, plain, "step \(step) \(operation): state", file: file, line: line)
+            for (name, ticket) in tickets {
+                XCTAssertEqual(
+                    tracker.shouldExecuteFollow(ticket),
+                    plain.shouldExecuteFollow(ticket),
+                    "step \(step) \(operation): ticket \(name)",
+                    file: file,
+                    line: line
+                )
+            }
+        }
+    }
 
     private static let failedLaneEnvelope =
         #"{"results":[{"index":0,"status":"completed","chat_id":"lane-0","response":"done"},{"index":1,"ok":false,"status":"failed","chat_id":"lane-1","error":{"code":"oracle_stream_failed","message":"Lane one stream failed"}}],"wait":{"result":"completed_with_errors","pending_operation_ids":[]}}"#

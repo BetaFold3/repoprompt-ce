@@ -272,11 +272,41 @@ struct AgentTranscriptInnerFollowState: Equatable {
     }
 }
 
+/// Stable reference owner of one inner follow scroll view's `AgentTranscriptInnerFollowState`.
+/// Deliberately neither `ObservableObject` nor `@Observable`: the view holds it in `@State` only
+/// to keep the instance stable, so geometry callbacks and `onChange` handlers mutate, and
+/// deferred follows read, follow state without writing SwiftUI state. Each method forwards one-to-one to the wrapped state's
+/// transition; there are no lifecycle additions.
+@MainActor
+final class AgentTranscriptInnerFollowTracker {
+    private(set) var state: AgentTranscriptInnerFollowState
+
+    init(isLive: Bool) {
+        state = AgentTranscriptInnerFollowState(isLive: isLive)
+    }
+
+    func record(_ position: AgentTranscriptInnerFollowPolicy.Position) {
+        state.record(position)
+    }
+
+    func setLive(_ live: Bool) {
+        state.setLive(live)
+    }
+
+    func scheduleFollow() -> Int? {
+        state.scheduleFollow()
+    }
+
+    func shouldExecuteFollow(_ ticket: Int) -> Bool {
+        state.shouldExecuteFollow(ticket)
+    }
+}
+
 /// Capped inner scroll view for an expanded group. While `followsNewest` (an expanded group in
 /// the live run's latest turn) and the user is at the inner bottom, a newly arriving row scrolls
 /// into view; scrolling up stops following until the user returns to the bottom. Bottom tracking
 /// uses `onScrollGeometryChange` on macOS 15+ and a geometry-reader preference on macOS 14; both
-/// feed the same `AgentTranscriptInnerFollowState`.
+/// feed the same `AgentTranscriptInnerFollowTracker`, which SwiftUI does not observe.
 struct AgentTranscriptInnerFollowScrollView<Content: View>: View {
     let maxHeight: CGFloat
     let followsNewest: Bool
@@ -284,7 +314,8 @@ struct AgentTranscriptInnerFollowScrollView<Content: View>: View {
     let bottomAnchorID: String
     private let content: Content
 
-    @State private var followState: AgentTranscriptInnerFollowState
+    /// `@State` only keeps the tracker instance stable; mutations through it are not SwiftUI state writes.
+    @State private var followTracker: AgentTranscriptInnerFollowTracker
 
     init(
         maxHeight: CGFloat,
@@ -298,7 +329,7 @@ struct AgentTranscriptInnerFollowScrollView<Content: View>: View {
         self.newestEntryID = newestEntryID
         self.bottomAnchorID = bottomAnchorID
         self.content = content()
-        _followState = State(initialValue: AgentTranscriptInnerFollowState(isLive: followsNewest))
+        _followTracker = State(initialValue: AgentTranscriptInnerFollowTracker(isLive: followsNewest))
     }
 
     private var coordinateSpaceName: String {
@@ -319,26 +350,26 @@ struct AgentTranscriptInnerFollowScrollView<Content: View>: View {
             .modifier(AgentTranscriptInnerBottomTracking { position in
                 #if DEBUG
                     AgentTranscriptUpdateBurstProbe.note(.innerGeometryDelivery)
-                    if followState.lastPosition == position {
+                    if followTracker.state.lastPosition == position {
                         AgentTranscriptUpdateBurstProbe.note(.innerDuplicatePosition)
                     }
-                    let wasPinned = followState.isPinned
+                    let wasPinned = followTracker.state.isPinned
                 #endif
-                followState.record(position)
+                followTracker.record(position)
                 #if DEBUG
-                    if followState.isPinned != wasPinned {
+                    if followTracker.state.isPinned != wasPinned {
                         AgentTranscriptUpdateBurstProbe.note(.innerPinTransition)
                     }
                 #endif
             })
             .onChange(of: followsNewest) { _, isLive in
-                followState.setLive(isLive)
+                followTracker.setLive(isLive)
             }
             .onChange(of: newestEntryID) { _, _ in
                 #if DEBUG
                     AgentTranscriptUpdateBurstProbe.note(.innerNewestEntryChange)
                 #endif
-                guard let ticket = followState.scheduleFollow() else {
+                guard let ticket = followTracker.scheduleFollow() else {
                     #if DEBUG
                         AgentTranscriptUpdateBurstProbe.note(.innerFollowRejected)
                     #endif
@@ -348,7 +379,7 @@ struct AgentTranscriptInnerFollowScrollView<Content: View>: View {
                     AgentTranscriptUpdateBurstProbe.note(.innerFollowScheduled)
                 #endif
                 DispatchQueue.main.async {
-                    guard followState.shouldExecuteFollow(ticket) else {
+                    guard followTracker.shouldExecuteFollow(ticket) else {
                         #if DEBUG
                             AgentTranscriptUpdateBurstProbe.note(.innerFollowRejected)
                         #endif
