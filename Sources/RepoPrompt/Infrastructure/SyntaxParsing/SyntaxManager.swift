@@ -9,13 +9,17 @@ import CryptoKit
 import Foundation
 import SwiftTreeSitter
 import TreeSitterC
+import TreeSitterCPP
+import TreeSitterCSharp
 import TreeSitterDart
 import TreeSitterGo
 import TreeSitterJava
 import TreeSitterJavaScript
+import TreeSitterPHP
 import TreeSitterPython
 import TreeSitterRuby
 import TreeSitterRust
+import TreeSitterSwift
 import TreeSitterTSX
 import TreeSitterTypeScript
 
@@ -212,7 +216,11 @@ final class SyntaxManager: CodeMapSyntaxQuerying {
                 CodeMapLanguageRecipe(
                     stableLanguageID: .php,
                     displayName: "PHP",
-                    makeLanguage: { tree_sitter_php().map(Language.init(language:)) },
+                    makeLanguage: {
+                        // TreeSitterPHP declares a non-const, unprototyped entry point.
+                        guard let language = tree_sitter_php() else { return nil }
+                        return Language(language: UnsafePointer(language))
+                    },
                     grammarRevision: "0a99deca13c4af1fb9adcb03c958bfc9f4c740a9",
                     queryText: phpCodeMapQuery
                 )
@@ -220,7 +228,11 @@ final class SyntaxManager: CodeMapSyntaxQuerying {
                 CodeMapLanguageRecipe(
                     stableLanguageID: .ruby,
                     displayName: "Ruby",
-                    makeLanguage: { tree_sitter_ruby().map(Language.init(language:)) },
+                    makeLanguage: {
+                        // TreeSitterRuby declares a non-const, unprototyped entry point.
+                        guard let language = tree_sitter_ruby() else { return nil }
+                        return Language(language: UnsafePointer(language))
+                    },
                     grammarRevision: "7a010836b74351855148818d5cb8170dc4df8e6a",
                     queryText: rubyCodeMapQuery
                 )

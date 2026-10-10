@@ -19,7 +19,6 @@ Sources/
     AI/Prompts/                  # PromptFactory, code/legacy prompt examples, and the provider-neutral workflow prompt catalog (Workflows/)
     AI/Pricing/                  # OpenAI pricing catalog, parser, seed, and store
   RepoPrompt/                    # internal RepoPromptApp implementation library target (not a package product)
-    Support/                     # Obj-C bridging header / bridging-header-sensitive support owned by RepoPromptApp
     App/                         # lifecycle, launch/configuration, commands, composition wiring, app notifications, root app views/view models
       Notifications/
       Sparkle/
@@ -94,7 +93,7 @@ The old IDE-era Prompt selected-files panel is also removed. Do not add back `Pr
 - `Sources/RepoPromptExecutable` is restricted to the shipped executable entry. Do not add lifecycle, feature, infrastructure, startup, or composition logic there.
 - New product-flow code goes under `Sources/RepoPrompt/Features/<FeatureName>`.
 - New app lifecycle, launch/configuration, command, root view/view-model, notification-name, and composition-root wiring goes under `Sources/RepoPrompt/App` in the `RepoPromptApp` target.
-- Keep bridging-header-sensitive support under `Sources/RepoPrompt/Support`, owned by `RepoPromptApp`, unless `Package.swift` is updated in the same change.
+- There is no Objective-C bridging header. Swift reaches C code through explicit module imports (`RepoPromptC`, `CSwiftPCRE2`, tree-sitter grammar modules); expose new C entry points through public headers in `Sources/RepoPromptC/include`.
 - New cross-cutting service/platform code goes under `Sources/RepoPrompt/Infrastructure/<Area>`.
 - Native Remote Control host discovery/client transport and persistence belong under `Infrastructure/RemoteHosts`; app-owned pairing keys, discovery authority, and approval routing belong under `Infrastructure/Security/RemotePairing`; gateway admission/relay stays in `RepoPromptGateway`; shared signed discovery wire DTOs stay in `RepoPromptRemoteWire`; onboarding presentation stays under `Features/Settings`.
 - Provider-neutral workflow prompt catalog metadata and renderers go under `Sources/RepoPromptAgentCore/AI/Prompts/Workflows/`; do not add new workflow prompts under provider-specific command names or bundled `AppResources/Services/AI/Prompts` mirrors.

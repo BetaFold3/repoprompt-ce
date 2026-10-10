@@ -39,6 +39,13 @@
 #ifndef _WILDMATCH_H_
 #define _WILDMATCH_H_
 
+/*
+ * RepoPrompt gitignore wrappers. SwiftPM's umbrella include directory does not
+ * notice new headers in existing module caches; editing this header forces
+ * stale RepoPromptC caches to rebuild.
+ */
+#include "repo_gitignore.h"
+
 #ifdef __cplusplus
 extern "C" {
 #endif

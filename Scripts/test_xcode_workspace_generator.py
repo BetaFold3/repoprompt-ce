@@ -330,22 +330,6 @@ class XcodeWorkspaceGeneratorTests(unittest.TestCase):
         with self.assertRaisesRegex(generator.GeneratorError, "RepoPromptTests must depend"):
             generator.validate_manifest(old_test_dependency, generator.REPO_ROOT)
 
-        duplicate_bridging_header_owner = deepcopy(self.manifest)
-        target_map = {
-            target["name"]: target for target in duplicate_bridging_header_owner["targets"]
-        }
-        target_map["RepoPrompt"]["settings"] = target_map["RepoPromptApp"]["settings"]
-        with self.assertRaisesRegex(generator.GeneratorError, "must not own"):
-            generator.validate_manifest(duplicate_bridging_header_owner, generator.REPO_ROOT)
-
-        missing_bridging_header_owner = deepcopy(self.manifest)
-        target_map = {
-            target["name"]: target for target in missing_bridging_header_owner["targets"]
-        }
-        target_map["RepoPromptApp"]["settings"] = []
-        with self.assertRaisesRegex(generator.GeneratorError, "RepoPromptApp must own"):
-            generator.validate_manifest(missing_bridging_header_owner, generator.REPO_ROOT)
-
         missing_remote_wire_target = deepcopy(self.manifest)
         missing_remote_wire_target["targets"] = [
             target

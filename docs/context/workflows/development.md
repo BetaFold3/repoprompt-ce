@@ -46,7 +46,7 @@ The baseline is a focused `make dev-test` after a body-only app edit: about 23.5
 
 Cheap levers are exhausted:
 - The emit-module job already passes `-experimental-skip-non-inlinable-function-bodies-without-types`.
-- The bridging PCH stays disabled. It was previously measured 34.9% slower, and `Scripts/generate_xcode_workspace.py` requires `-disable-bridging-pch`.
+- There is no bridging PCH to tune: the Objective-C bridging header is retired, and C code is reached through module imports.
 - `make dev-test-parallel WORKERS=1` is slower than `make dev-test` for a focused edit loop: about 30.8 s vs 23.9 s, and 9.7 s vs 2.2 s null. It still runs the helper via `swift test list`, and it re-plans SwiftPM in both its build and list steps. Running `make dev-test` right after it costs one re-plan (about 4 s); nothing recompiles.
 
 Extraction is blocked by coupling. A name-reference inventory found one file-level dependency cycle covering about 561 files and 457k lines, about two-thirds of the app, spanning AgentMode, AI, MCP, WorkspaceContext, VCS, App, Settings and others.

@@ -96,7 +96,21 @@ Step 1 — done | rounds 0/2 | open: | downgraded: | assumed: A1 | deferred: ful
 - Give the wildmatch/gitignore functions a public `RepoPromptC` header, import the grammar modules, and add a narrow C shim for ptrace only if one is needed.
 - Then remove the bridge and its flags, and relax the Xcode generator's flag requirement, in the same change.
 
-Step 2 — todo | rounds 0/2 | open: | downgraded: | assumed: | deferred:
+Probe result: name-matching closure over the Platform candidate folders kept 77 of 118 files (16.7k lines) with no app dependencies, and every bridging-header group has a module route (wildmatch/gitignore need a new public `RepoPromptC` header, `ptrace` a C shim), so the direction holds; evidence `slice2-probe/`.
+
+#### Step 2a — retire the bridging header in place
+Intent: reach all C code through module imports inside `RepoPromptApp` before any C-using file moves. Budget used: about 1.5 hours (cumulative ~3.5 hours).
+
+Result: deleted the bridging header and its flags; 13 Swift files now import `RepoPromptC`, `CSwiftPCRE2` or tree-sitter grammar modules, wildmatch/gitignore got a public `repo_gitignore.h`, and `ptrace(PT_DENY_ATTACH…)` moved unchanged into a `RepoPromptC` shim; build, focused suites, full tests (flaky suites pass alone), discovery and ledger are unchanged, so Step 2b follows. The Facts lines about the bridge are now historical.
+
+Decisions: PHP/Ruby grammar call sites unwrap the non-const pointer with `guard let` (same nil behavior); `wildmatch.h` includes `repo_gitignore.h` so build trees with an older cached `RepoPromptC` module rebuild it — if a tree still reports `cannot find 'repo_wildmatch' in scope` after pulling, delete `.build/*/debug/ModuleCache/*/RepoPromptC-*.pcm`; the generator's bridge checks were removed, not inverted.
+
+Step 2a — done | rounds 0/2 | open: | downgraded: | assumed: | deferred: OracleB P3-2 generator check against a returning bridge
+
+#### Step 2b — create `RepoPromptPlatform`
+Intent: move the dependency-closed generic primitives (minus app-specific files such as `Shortcuts.swift`).
+
+Step 2b — todo | rounds 0/2 | open: | downgraded: | assumed: | deferred:
 
 ### Slice 3 — `RepoPromptUI`
 Move reusable components, markdown rendering, typography (`FontScaleManager`, `FontScalePreset`) and UI environment keys. Product-specific adapters stay in App. Small codecs and models that Workspace or AgentCore use move down rather than up.

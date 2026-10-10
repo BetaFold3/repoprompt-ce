@@ -141,14 +141,6 @@ def validate_manifest(manifest: dict, repo_root: Path) -> None:
         "RepoPromptApp"
     ]:
         raise GeneratorError("Target 'RepoPrompt' must depend only on 'RepoPromptApp'")
-    repo_prompt_unsafe_flags = [
-        setting.get("kind", {}).get("unsafeFlags", {}).get("_0", [])
-        for setting in repo_prompt.get("settings", [])
-    ]
-    if any("-import-objc-header" in flags for flags in repo_prompt_unsafe_flags):
-        raise GeneratorError(
-            "Target 'RepoPrompt' must not own the RepoPromptApp Objective-C bridging header"
-        )
 
     repo_prompt_app = targets["RepoPromptApp"]
     if repo_prompt_app.get("type") != "regular":
@@ -212,23 +204,6 @@ def validate_manifest(manifest: dict, repo_root: Path) -> None:
         raise GeneratorError(
             "RepoPromptTests must depend on RepoPromptApp, RepoPromptAgentCore, RepoPromptGateway, "
             "RepoPromptRemoteWire, and the RepoPromptCore Shared, ClientKit, and MCP products"
-        )
-
-    unsafe_flags: list[list[str]] = []
-    for setting in repo_prompt_app.get("settings", []):
-        value = setting.get("kind", {}).get("unsafeFlags", {}).get("_0")
-        if isinstance(value, list):
-            unsafe_flags.append(value)
-    expected_header = repo_root / "Sources/RepoPrompt/Support/RepoPrompt-Bridging-Header.h"
-    if not any(
-        len(flags) == 3
-        and flags[0] == "-import-objc-header"
-        and Path(flags[1]) == expected_header
-        and flags[2] == "-disable-bridging-pch"
-        for flags in unsafe_flags
-    ):
-        raise GeneratorError(
-            "RepoPromptApp must own the Objective-C bridging-header unsafe flags"
         )
 
     expected_resources = {("CodeMap/Fixtures", True), ("CodeMap/Goldens", True)}
