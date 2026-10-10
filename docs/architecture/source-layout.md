@@ -15,6 +15,9 @@ Packages/
 Sources/
   RepoPromptExecutable/          # thin shipped RepoPrompt executable target; sole @main and delegation only
     RepoPromptExecutable.swift
+  RepoPromptAgentCore/           # internal agent runtime/AI library target (not a product); RepoPromptApp depends on it
+    AI/Prompts/                  # PromptFactory, code/legacy prompt examples, and the provider-neutral workflow prompt catalog (Workflows/)
+    AI/Pricing/                  # OpenAI pricing catalog, parser, seed, and store
   RepoPrompt/                    # internal RepoPromptApp implementation library target (not a package product)
     Support/                     # Obj-C bridging header / bridging-header-sensitive support owned by RepoPromptApp
     App/                         # lifecycle, launch/configuration, commands, composition wiring, app notifications, root app views/view models
@@ -36,8 +39,7 @@ Sources/
       WorkspaceFiles/            # workspace root shell, selection, and file-list projection view models; no native tree visualization
       Workspaces/                # workspace manager UI and view models
     Infrastructure/
-      AI/                        # AI provider/model/prompt/query substrate
-        Prompts/Workflows/       # provider-neutral RepoPrompt workflow prompt catalog and renderers
+      AI/                        # AI provider/model/prompt/query substrate (Prompts/AgentModePrompts.swift stays here)
       Concurrency/               # cross-cutting async primitives
       Diffing/                   # diff parsing/application/generation substrate
       FileSystem/                # filesystem seams/services
@@ -64,6 +66,8 @@ Tests/
 ```
 
 The external target graph is intentionally stable at its boundary: the executable products and emitted binaries remain `RepoPrompt`, `repoprompt-mcp`, and `repoprompt-gateway`. The `RepoPrompt` executable target delegates to the internal `RepoPromptApp` target, while the `RepoPromptMCP` executable target contains only its process entry and delegates to the `RepoPromptMCPCore` package product. `RepoPromptApp` is not declared as a library product or separate Xcode convenience scheme. Root app and gateway tests import their root targets plus the required `RepoPromptCore` products.
+
+`RepoPromptAgentCore` is the first lower-layer module of the app split (see the [module split contract](../context/plans/2026-10-10-app-module-split-contract.md)). It is an internal, static library target with no product. It may depend only on the `RepoPromptShared` package product and system frameworks for now; later slices add `RepoPromptWorkspace` and `RepoPromptPlatform`. It must never depend on `RepoPromptApp`, the executables, `RepoPromptGateway`, or the future `RepoPromptUI` module, and it has no bridging header. Declarations default to `internal`; mark `package` only what `RepoPromptApp` uses. `RepoPromptTests` depends on it and every `@testable import RepoPromptApp` file also has `@testable import RepoPromptAgentCore`.
 
 The legacy top-level layer buckets under `Sources/RepoPrompt` have been pruned and must not be recreated:
 
@@ -93,7 +97,7 @@ The old IDE-era Prompt selected-files panel is also removed. Do not add back `Pr
 - Keep bridging-header-sensitive support under `Sources/RepoPrompt/Support`, owned by `RepoPromptApp`, unless `Package.swift` is updated in the same change.
 - New cross-cutting service/platform code goes under `Sources/RepoPrompt/Infrastructure/<Area>`.
 - Native Remote Control host discovery/client transport and persistence belong under `Infrastructure/RemoteHosts`; app-owned pairing keys, discovery authority, and approval routing belong under `Infrastructure/Security/RemotePairing`; gateway admission/relay stays in `RepoPromptGateway`; shared signed discovery wire DTOs stay in `RepoPromptRemoteWire`; onboarding presentation stays under `Features/Settings`.
-- Provider-neutral workflow prompt catalog metadata and renderers go under `Sources/RepoPrompt/Infrastructure/AI/Prompts/Workflows/`; do not add new workflow prompts under provider-specific command names or bundled `AppResources/Services/AI/Prompts` mirrors.
+- Provider-neutral workflow prompt catalog metadata and renderers go under `Sources/RepoPromptAgentCore/AI/Prompts/Workflows/`; do not add new workflow prompts under provider-specific command names or bundled `AppResources/Services/AI/Prompts` mirrors.
 - New reusable SwiftUI components, text/markdown helpers, and UI services should prefer a narrow feature owner first; otherwise use `Sources/RepoPrompt/Infrastructure/UI/<Area>`.
 - New generic extensions/helpers should prefer a narrow feature or infrastructure owner first; otherwise use `Sources/RepoPrompt/Infrastructure/Utilities`.
 - New app-visible diagnostic surfaces go under `Sources/RepoPrompt/Features/Diagnostics` and must have a documented purpose and entry point.
@@ -104,7 +108,7 @@ The old IDE-era Prompt selected-files panel is also removed. Do not add back `Pr
 - New app-local MCP/socket/routing helpers go under `Sources/RepoPrompt/Infrastructure/MCP`, not `Sources/RepoPrompt/Shared`.
 - New importable CLI implementation code goes under `Packages/RepoPromptCore/Sources/RepoPromptMCPCore`; `Sources/RepoPromptMCP` remains the thin executable entry only.
 - New test doubles, fixtures, parser inputs, sample projects, benchmark-only fixture data, and XCTest-only helpers go under `Tests/RepoPromptTests`, not the app target.
-- Do not create directories named `Tests`, `TestSupport`, or `Fixtures` under `Sources/RepoPrompt`.
+- Do not create directories named `Tests`, `TestSupport`, or `Fixtures` under `Sources/RepoPrompt` or `Sources/RepoPromptAgentCore`.
 - Do not put parser fixtures or sample parser inputs under `Sources/RepoPrompt/Infrastructure/SyntaxParsing`; keep only production parser/query code there.
 - Keep `App/WindowState.swift` in `App` until there is a separate composition-root refactor; physical moves must preserve initialization order.
 
@@ -168,9 +172,10 @@ The guardrail script verifies:
 - the shipped `RepoPrompt` executable source root contains only its entry file, declares exactly one `@main`, and the current `RepoPromptApp` implementation target declares none;
 - the shipped `RepoPromptMCP` executable source root contains only `main.swift` and delegates implementation to the `RepoPromptMCPCore` package product;
 - `Package.swift` keeps the current implementation target named `RepoPromptApp` at `Sources/RepoPrompt`, with the `RepoPrompt` executable as its thin sole-dependent entry target;
+- `RepoPromptAgentCore` exists as a library target at `Sources/RepoPromptAgentCore` and declares no `@main`;
 - the RemoteWire import guardrail keeps `RepoPromptRemoteWire` dependency-free and permits only `Foundation` and `CryptoKit` imports, never app, gateway, MCP, NIO, logging, or shared implementation modules;
 - old top-level layer buckets are absent or contain no files;
-- no `Tests`, `TestSupport`, or `Fixtures` directories exist under `Sources/RepoPrompt`;
+- no `Tests`, `TestSupport`, or `Fixtures` directories exist under `Sources/RepoPrompt` or `Sources/RepoPromptAgentCore`;
 - `MCPControlMessages.swift` and `MCPFilesystemIdentity.swift` exist only under `Packages/RepoPromptCore/Sources/RepoPromptShared/MCP`, and the `MCPExternalClientEvent` wire DTO is declared only there;
 - parser fixtures/sample inputs do not live under app syntax parsing source;
 - the narrow `TreeSitterScannerSupport` compatibility target has exactly its approved JavaScript/Python scanner snapshots and helper headers, matches curated checksums, remains wired in `Package.swift`, preserves the seven migrated grammar pins/products in `Package.swift` and `Package.resolved`, and keeps the seven retired local grammar directories absent;
@@ -191,7 +196,7 @@ The guardrail script verifies:
 - The old top-level layer buckets were pruned as part of Work Item 11.
 - The native file-tree visualization, IDE-era search view-model layer, and eager root materialization seams were removed. Textual project structure maps and MCP `get_file_tree` output remain supported compatibility surfaces.
 - The Claude-compatible Agent Mode provider family was extracted into the `RepoPromptClaudeCompatibleProvider` package product under `Packages/RepoPromptAgentProviders/`; see `docs/architecture/provider-plugins.md` for the bridge/adapter layout and rules for adding new providers.
-- Workflow prompt generation now lives in the provider-neutral catalog under `Sources/RepoPrompt/Infrastructure/AI/Prompts/Workflows/`; the old provider-specific `ClaudeCodeCommands` surface and duplicated bundled prompt mirror under `AppResources/Services/AI/Prompts/` should not be restored.
+- Workflow prompt generation now lives in the provider-neutral catalog under `Sources/RepoPromptAgentCore/AI/Prompts/Workflows/`; the old provider-specific `ClaudeCodeCommands` surface and duplicated bundled prompt mirror under `AppResources/Services/AI/Prompts/` should not be restored.
 
 ## Contributor validation commands
 

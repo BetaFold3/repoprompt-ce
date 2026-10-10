@@ -147,7 +147,7 @@ enum OpenAIPricingRefreshFailure: Equatable {
 ///   request answered with 304 is a failure. Failures keep the last-good catalog with stale provenance.
 /// - Only fetched catalogs persist (normalized JSON under one `UserDefaults` key, replaced atomically);
 ///   the seed is bundled. A newer seed wins over an older persisted document.
-final class OpenAIPricingStore: OpenAIPricingProviding, @unchecked Sendable {
+package final class OpenAIPricingStore: OpenAIPricingProviding, @unchecked Sendable {
     // swiftformat:disable:next redundantSendable
     struct Configuration: Sendable {
         var endpoint: URL = OpenAIPricingSeed.sourceURL
@@ -164,7 +164,7 @@ final class OpenAIPricingStore: OpenAIPricingProviding, @unchecked Sendable {
     }
 
     static let storageKey = "OpenAIPricingCatalogV1"
-    static let shared = OpenAIPricingStore(defaults: .standard)
+    package static let shared = OpenAIPricingStore(defaults: .standard)
 
     /// Persisted only for fetched catalogs.
     private struct PersistedRecord: Codable, Equatable {
@@ -262,7 +262,7 @@ final class OpenAIPricingStore: OpenAIPricingProviding, @unchecked Sendable {
 
     // MARK: OpenAIPricingProviding
 
-    func currentSnapshot() -> OpenAIPricingSnapshot {
+    package func currentSnapshot() -> OpenAIPricingSnapshot {
         let current = now()
         lock.lock()
         defer { lock.unlock() }
@@ -270,7 +270,7 @@ final class OpenAIPricingStore: OpenAIPricingProviding, @unchecked Sendable {
     }
 
     @discardableResult
-    func noteCodexDispatch() -> Bool {
+    package func noteCodexDispatch() -> Bool {
         refreshIfDue()
     }
 

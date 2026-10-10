@@ -2,6 +2,7 @@ import Darwin
 import Dispatch
 import Foundation
 import Logging
+@testable import RepoPromptAgentCore
 @testable import RepoPromptApp
 import XCTest
 

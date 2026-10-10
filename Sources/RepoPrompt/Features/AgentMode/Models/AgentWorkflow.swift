@@ -1,3 +1,4 @@
+import RepoPromptAgentCore
 import SwiftUI
 
 // MARK: - Agent Workflow

@@ -1,4 +1,5 @@
 import Foundation
+@testable import RepoPromptAgentCore
 @testable import RepoPromptApp
 
 /// A final-authority hook that always authorizes.

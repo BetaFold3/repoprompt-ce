@@ -1,4 +1,5 @@
 import Combine
+@testable import RepoPromptAgentCore
 @testable import RepoPromptApp
 import XCTest
 

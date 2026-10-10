@@ -1,6 +1,7 @@
 import Foundation
 import JSONSchema
 import MCP
+@testable import RepoPromptAgentCore
 @testable import RepoPromptApp
 import RepoPromptShared
 import XCTest

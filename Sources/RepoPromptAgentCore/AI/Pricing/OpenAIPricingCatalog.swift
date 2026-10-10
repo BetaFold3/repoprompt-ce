@@ -6,7 +6,7 @@ import Foundation
 /// The only pricing basis this component supports: OpenAI Standard (global) list prices in
 /// USD per one million tokens. It is a comparison basis, never a reconstruction of an invoice,
 /// subscription charge, actual service tier, regional uplift, or tool fee.
-enum OpenAIPricingBasis: String, Codable, Equatable {
+package enum OpenAIPricingBasis: String, Codable, Equatable {
     case standardGlobalListPriceUSDPerMillionTokens
 }
 
@@ -15,13 +15,13 @@ enum OpenAIPricingBasis: String, Codable, Equatable {
 /// `nil` means the official table lists no amount (a `-` cell). That is unknown or
 /// non-applicable, never numeric zero; a listed `$0.00` or `Free` is a real zero.
 // swiftformat:disable:next redundantSendable
-struct OpenAIPricingRates: Codable, Equatable, Sendable {
-    let input: Decimal?
-    let cachedInput: Decimal?
-    let cacheWrite: Decimal?
-    let output: Decimal?
+package struct OpenAIPricingRates: Codable, Equatable, Sendable {
+    package let input: Decimal?
+    package let cachedInput: Decimal?
+    package let cacheWrite: Decimal?
+    package let output: Decimal?
 
-    init(
+    package init(
         input: Decimal?,
         cachedInput: Decimal?,
         cacheWrite: Decimal?,
@@ -41,7 +41,7 @@ struct OpenAIPricingRates: Codable, Equatable, Sendable {
         case input, cachedInput, cacheWrite, output
     }
 
-    init(from decoder: Decoder) throws {
+    package init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         input = try Self.decodeRate(container, .input)
         cachedInput = try Self.decodeRate(container, .cachedInput)
@@ -49,7 +49,7 @@ struct OpenAIPricingRates: Codable, Equatable, Sendable {
         output = try Self.decodeRate(container, .output)
     }
 
-    func encode(to encoder: Encoder) throws {
+    package func encode(to encoder: Encoder) throws {
         var container = encoder.container(keyedBy: CodingKeys.self)
         try Self.encodeRate(input, &container, .input)
         try Self.encodeRate(cachedInput, &container, .cachedInput)
@@ -110,8 +110,8 @@ enum OpenAIPricingDecimal {
 }
 
 // swiftformat:disable:next redundantSendable
-struct OpenAIPricingContextBand: Codable, Equatable, Sendable {
-    enum Kind: String, Codable, Equatable {
+package struct OpenAIPricingContextBand: Codable, Equatable, Sendable {
+    package enum Kind: String, Codable, Equatable {
         /// The model lists one set of rates for every context length.
         case all
         /// Rates below the model's context threshold.
@@ -120,19 +120,19 @@ struct OpenAIPricingContextBand: Codable, Equatable, Sendable {
         case longContext
     }
 
-    let kind: Kind
-    let rates: OpenAIPricingRates
+    package let kind: Kind
+    package let rates: OpenAIPricingRates
 }
 
 /// Per-dimension lower/upper rate bounds across every eligible band, for conditional range
 /// pricing when the caller cannot attribute usage to one band. A dimension is `nil` when any
 /// eligible band lacks it, so a missing rate never collapses into the cheaper band.
 // swiftformat:disable:next redundantSendable
-struct OpenAIPricingRateEnvelope: Equatable, Sendable {
-    let input: ClosedRange<Decimal>?
-    let cachedInput: ClosedRange<Decimal>?
-    let cacheWrite: ClosedRange<Decimal>?
-    let output: ClosedRange<Decimal>?
+package struct OpenAIPricingRateEnvelope: Equatable, Sendable {
+    package let input: ClosedRange<Decimal>?
+    package let cachedInput: ClosedRange<Decimal>?
+    package let cacheWrite: ClosedRange<Decimal>?
+    package let output: ClosedRange<Decimal>?
 
     static let unavailable = OpenAIPricingRateEnvelope(
         input: nil,
@@ -145,13 +145,13 @@ struct OpenAIPricingRateEnvelope: Equatable, Sendable {
 /// Normalized pricing for one exact model ID. Band distinctions are preserved rather than
 /// flattened; callers choose a band only with positive context attribution.
 // swiftformat:disable:next redundantSendable
-struct OpenAIModelPricing: Codable, Equatable, Sendable {
+package struct OpenAIModelPricing: Codable, Equatable, Sendable {
     let modelID: String
     /// Ordered short → long. Either `[.all]`, `[.shortContext]`, or `[.shortContext, .longContext]`.
     let bands: [OpenAIPricingContextBand]
     /// The official context qualifier (for example `272_000` from `(<272K context length)`).
     /// `nil` when the document states none, even if two bands are listed.
-    let contextThresholdTokens: Int?
+    package let contextThresholdTokens: Int?
 
     init(
         modelID: String,
@@ -164,7 +164,7 @@ struct OpenAIModelPricing: Codable, Equatable, Sendable {
     }
 
     /// Rates usable as a point estimate without band attribution; non-nil only for a single `.all` band.
-    var flatRates: OpenAIPricingRates? {
+    package var flatRates: OpenAIPricingRates? {
         guard bands.count == 1, let band = bands.first, band.kind == .all else {
             return nil
         }
@@ -175,7 +175,7 @@ struct OpenAIModelPricing: Codable, Equatable, Sendable {
     ///
     /// Returns `nil` when the choice cannot be made safely: two listed bands without an
     /// official threshold, or usage at or above a threshold whose long band is not listed.
-    func band(forContextTokens contextTokens: Int) -> OpenAIPricingContextBand? {
+    package func band(forContextTokens contextTokens: Int) -> OpenAIPricingContextBand? {
         if let flat = bands.first, bands.count == 1, flat.kind == .all {
             return flat
         }
@@ -190,7 +190,7 @@ struct OpenAIModelPricing: Codable, Equatable, Sendable {
 
     /// Bounds across all eligible bands, available only when the band set is complete
     /// (`.all`, or both short and long). Ranges bound the stated token-price assumptions only.
-    var rateEnvelope: OpenAIPricingRateEnvelope {
+    package var rateEnvelope: OpenAIPricingRateEnvelope {
         let kinds = Set(bands.map(\.kind))
         let complete = kinds == [.all] || kinds == [.shortContext, .longContext]
         guard complete, !bands.isEmpty else {
@@ -380,16 +380,16 @@ struct OpenAIPricingCatalog: Codable, Equatable, Sendable {
 }
 
 // swiftformat:disable:next redundantSendable
-struct OpenAIModelPricingResolution: Equatable, Sendable {
+package struct OpenAIModelPricingResolution: Equatable, Sendable {
     let requestedModelID: String
-    let resolvedModelID: String
+    package let resolvedModelID: String
     let matchedViaAlias: Bool
-    let pricing: OpenAIModelPricing
+    package let pricing: OpenAIModelPricing
 }
 
 // MARK: - Snapshot and provider seam
 
-enum OpenAIPricingSourceKind: String, Codable, Equatable {
+package enum OpenAIPricingSourceKind: String, Codable, Equatable {
     /// The reviewed literal seed bundled with the app.
     case bundledSeed
     /// A previously fetched, validated catalog restored from local persistence.
@@ -401,33 +401,33 @@ enum OpenAIPricingSourceKind: String, Codable, Equatable {
 /// Immutable, versioned pricing state captured at dispatch. A later refresh produces a new
 /// snapshot and never mutates one already captured.
 // swiftformat:disable:next redundantSendable
-struct OpenAIPricingSnapshot: Equatable, Sendable {
+package struct OpenAIPricingSnapshot: Equatable, Sendable {
     let catalog: OpenAIPricingCatalog
-    let sourceKind: OpenAIPricingSourceKind
+    package let sourceKind: OpenAIPricingSourceKind
     /// Document date: `Last-Modified` for fetched content, the review date for the seed.
-    let capturedAt: Date
+    package let capturedAt: Date
     /// Last successful validation (200 or valid 304); the review date for the seed.
-    let validatedAt: Date
+    package let validatedAt: Date
     /// True when validation is older than the refresh interval at snapshot creation, or when
     /// the most recent refresh attempt after `validatedAt` failed.
-    let isStale: Bool
+    package let isStale: Bool
 
-    var pricingVersion: String {
+    package var pricingVersion: String {
         catalog.pricingVersion
     }
 
-    var basis: OpenAIPricingBasis {
+    package var basis: OpenAIPricingBasis {
         catalog.basis
     }
 
-    func rates(forModelID modelID: String) -> OpenAIModelPricingResolution? {
+    package func rates(forModelID modelID: String) -> OpenAIModelPricingResolution? {
         catalog.resolve(modelID: modelID)
     }
 }
 
 /// Seam held by Codex dispatch. Methods are synchronous, nonisolated, and lock-guarded, so
 /// they are safe from `@MainActor` and never wait on network or persistence.
-protocol OpenAIPricingProviding: AnyObject, Sendable {
+package protocol OpenAIPricingProviding: AnyObject, Sendable {
     /// Immediate: seed, persisted last-good, or fetched catalog. Never blocks.
     func currentSnapshot() -> OpenAIPricingSnapshot
     /// Schedules at most one bounded background refresh when validation is due.

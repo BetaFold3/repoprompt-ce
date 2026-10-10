@@ -1,5 +1,6 @@
 import Foundation
 import Logging
+@testable import RepoPromptAgentCore
 @testable import RepoPromptApp
 @testable import RepoPromptGateway
 import RepoPromptRemoteWire

@@ -27,6 +27,7 @@ fi
 STYLE_PATHS=(
     "Package.swift"
     "Sources/RepoPrompt"
+    "Sources/RepoPromptAgentCore"
     "Sources/RepoPromptExecutable"
     "Sources/RepoPromptMCP"
     "Sources/RepoPromptGateway"
@@ -46,16 +47,16 @@ EXCLUDED_SWIFT_PREFIXES=(
 )
 
 EXCLUDED_SWIFT_FILES=(
-    "Sources/RepoPrompt/Infrastructure/AI/Prompts/Workflows/WorkflowPromptSharedFragments.swift"
-    "Sources/RepoPrompt/Infrastructure/AI/Prompts/Workflows/WorkflowPrompt+Build.swift"
-    "Sources/RepoPrompt/Infrastructure/AI/Prompts/Workflows/WorkflowPrompt+DeepPlan.swift"
-    "Sources/RepoPrompt/Infrastructure/AI/Prompts/Workflows/WorkflowPrompt+Investigate.swift"
-    "Sources/RepoPrompt/Infrastructure/AI/Prompts/Workflows/WorkflowPrompt+Optimize.swift"
-    "Sources/RepoPrompt/Infrastructure/AI/Prompts/Workflows/WorkflowPrompt+OracleExport.swift"
-    "Sources/RepoPrompt/Infrastructure/AI/Prompts/Workflows/WorkflowPrompt+Orchestrate.swift"
-    "Sources/RepoPrompt/Infrastructure/AI/Prompts/Workflows/WorkflowPrompt+Refactor.swift"
-    "Sources/RepoPrompt/Infrastructure/AI/Prompts/Workflows/WorkflowPrompt+Reminder.swift"
-    "Sources/RepoPrompt/Infrastructure/AI/Prompts/Workflows/WorkflowPrompt+Review.swift"
+    "Sources/RepoPromptAgentCore/AI/Prompts/Workflows/WorkflowPromptSharedFragments.swift"
+    "Sources/RepoPromptAgentCore/AI/Prompts/Workflows/WorkflowPrompt+Build.swift"
+    "Sources/RepoPromptAgentCore/AI/Prompts/Workflows/WorkflowPrompt+DeepPlan.swift"
+    "Sources/RepoPromptAgentCore/AI/Prompts/Workflows/WorkflowPrompt+Investigate.swift"
+    "Sources/RepoPromptAgentCore/AI/Prompts/Workflows/WorkflowPrompt+Optimize.swift"
+    "Sources/RepoPromptAgentCore/AI/Prompts/Workflows/WorkflowPrompt+OracleExport.swift"
+    "Sources/RepoPromptAgentCore/AI/Prompts/Workflows/WorkflowPrompt+Orchestrate.swift"
+    "Sources/RepoPromptAgentCore/AI/Prompts/Workflows/WorkflowPrompt+Refactor.swift"
+    "Sources/RepoPromptAgentCore/AI/Prompts/Workflows/WorkflowPrompt+Reminder.swift"
+    "Sources/RepoPromptAgentCore/AI/Prompts/Workflows/WorkflowPrompt+Review.swift"
 )
 
 fail(){ echo "ERROR: $*" >&2; exit 1; }

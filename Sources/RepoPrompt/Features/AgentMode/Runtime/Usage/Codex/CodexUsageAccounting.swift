@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptAgentCore
 
 // MARK: - Codex accounting inputs (plan §4.1)
 

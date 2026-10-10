@@ -113,7 +113,7 @@ The remote-by-default policy avoids breaking checkouts that do not have a siblin
 | Agent Mode transcript mutation, tool-card UI, run-state ownership | core |
 | Native process control (`ClaudeNativeProcessSessionController`) | core (this wave) |
 | Provider-neutral runtime contract (`NativeAgentRuntimeControlling`) | core |
-| Provider-neutral RepoPrompt workflow prompt catalog and renderers (`Infrastructure/AI/Prompts/Workflows`) | core |
+| Provider-neutral RepoPrompt workflow prompt catalog and renderers (`RepoPromptAgentCore/AI/Prompts/Workflows`) | core |
 | Headless wrapper (`ClaudeCodeAgentProvider`) | core (delegates pure rules to package) |
 | `AgentModel` raw values, option DTOs, defaults | core (adapter forwards plugin DTOs back to these) |
 | Claude family grammar and persisted Anthropic models registry | core (`ClaudeModelFamilyCatalog`, `AnthropicAPIModelsClient`, `AnthropicDiscoveredModelStore`) |
@@ -350,7 +350,7 @@ Add the relevant focused suite before any catalog/codec change, and snapshot mod
 - `Sources/RepoPrompt/Infrastructure/AI/Providers/HeadlessCLIStreamBridge.swift` and `Sources/RepoPrompt/Infrastructure/AI/Providers/OhMyPi/OhMyPiCLIProvider.swift` — shared one-shot lifecycle plus the tool-free OMP Oracle adapter.
 - `Sources/RepoPrompt/Features/AgentMode/Providers/ClaudeCompatible/` — Agent-Mode facade and adapter trio.
 - `Sources/RepoPrompt/Features/AgentMode/Runtime/Native/NativeAgentRuntimeContracts.swift` — provider-neutral runtime contract.
-- `Sources/RepoPrompt/Infrastructure/AI/Prompts/Workflows/` — provider-neutral RepoPrompt workflow prompt catalog, metadata, variants, and renderers shared by installs and MCP prompt registration.
+- `Sources/RepoPromptAgentCore/AI/Prompts/Workflows/` — provider-neutral RepoPrompt workflow prompt catalog, metadata, variants, and renderers shared by installs and MCP prompt registration.
 - `Sources/RepoPrompt/Features/AgentMode/Runtime/Providers/AgentRuntimeProviderService.swift` — `AgentProviderKind` and headless factory.
 - `Sources/RepoPrompt/Features/AgentMode/ViewModels/AgentModeViewModel.swift` — `makeClaudeCompatibleNativeController(...)`.
 - `Sources/RepoPrompt/Features/AgentMode/Runtime/Claude/ClaudeAgentModeCoordinator.swift` — interactive Claude-compatible coordinator.

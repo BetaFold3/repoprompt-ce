@@ -1,5 +1,6 @@
 import Darwin
 import Foundation
+@testable import RepoPromptAgentCore
 @testable import RepoPromptApp
 import SwiftTreeSitter
 import XCTest

@@ -1,4 +1,5 @@
 import Darwin
+@testable import RepoPromptAgentCore
 @testable import RepoPromptApp
 import XCTest
 

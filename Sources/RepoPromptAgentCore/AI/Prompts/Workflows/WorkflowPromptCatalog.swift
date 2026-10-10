@@ -1,22 +1,22 @@
 import Foundation
 
-struct WorkflowPromptArgument: Equatable {
-    let name: String
-    let description: String
-    let required: Bool
+package struct WorkflowPromptArgument: Equatable {
+    package let name: String
+    package let description: String
+    package let required: Bool
 }
 
-struct WorkflowPromptDescriptor: Equatable {
-    let id: RepoPromptWorkflowID
-    let description: String
-    let arguments: [WorkflowPromptArgument]
+package struct WorkflowPromptDescriptor: Equatable {
+    package let id: RepoPromptWorkflowID
+    package let description: String
+    package let arguments: [WorkflowPromptArgument]
 
-    var name: String {
+    package var name: String {
         id.commandName
     }
 }
 
-enum WorkflowPromptCatalog {
+package enum WorkflowPromptCatalog {
     static let descriptorsByID: [RepoPromptWorkflowID: WorkflowPromptDescriptor] = Dictionary(uniqueKeysWithValues: descriptors.map { ($0.id, $0) })
 
     static let descriptors: [WorkflowPromptDescriptor] = [
@@ -115,8 +115,8 @@ enum WorkflowPromptCatalog {
         )
     ]
 
-    static let mcpPromptDescriptors: [WorkflowPromptDescriptor] = RepoPromptWorkflowID.mcpPromptOrder.map { descriptor(for: $0) }
-    static let installDescriptors: [WorkflowPromptDescriptor] = RepoPromptWorkflowID.installOrder.map { descriptor(for: $0) }
+    package static let mcpPromptDescriptors: [WorkflowPromptDescriptor] = RepoPromptWorkflowID.mcpPromptOrder.map { descriptor(for: $0) }
+    package static let installDescriptors: [WorkflowPromptDescriptor] = RepoPromptWorkflowID.installOrder.map { descriptor(for: $0) }
 
     static func descriptor(for id: RepoPromptWorkflowID) -> WorkflowPromptDescriptor {
         guard let descriptor = descriptorsByID[id] else {

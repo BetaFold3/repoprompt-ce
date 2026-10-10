@@ -1,5 +1,6 @@
 #if DEBUG
     import Foundation
+    @testable import RepoPromptAgentCore
     import XCTest
     @_spi(TestSupport) @testable import RepoPromptApp
 

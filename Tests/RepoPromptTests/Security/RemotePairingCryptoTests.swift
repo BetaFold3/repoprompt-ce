@@ -1,5 +1,6 @@
 import CryptoKit
 import Foundation
+@testable import RepoPromptAgentCore
 @testable import RepoPromptApp
 import XCTest
 

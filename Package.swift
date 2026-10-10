@@ -48,6 +48,7 @@ var packageDependencies: [Package.Dependency] = [
 ]
 
 var repoPromptAppDependencies: [Target.Dependency] = [
+    "RepoPromptAgentCore",
     .product(name: "RepoPromptShared", package: "RepoPromptCore"),
     "RepoPromptRemoteWire",
     "RepoPromptC", "CSwiftPCRE2", "TreeSitterScannerSupport",
@@ -81,9 +82,13 @@ var repoPromptAppDependencies: [Target.Dependency] = [
     .product(name: "RepoPromptClaudeCompatibleProvider", package: "RepoPromptAgentProviders")
 ]
 
-var repoPromptAppSwiftSettings: [SwiftSetting] = [
+/// Shared by RepoPromptApp and the lower app-split library targets so compile conditions stay aligned.
+let repoPromptLayerSwiftSettings: [SwiftSetting] = [
     .define("DEBUG", .when(configuration: .debug)),
-    .enableUpcomingFeature("BareSlashRegexLiterals"),
+    .enableUpcomingFeature("BareSlashRegexLiterals")
+]
+
+var repoPromptAppSwiftSettings: [SwiftSetting] = repoPromptLayerSwiftSettings + [
     .unsafeFlags([
         "-import-objc-header", "\(packageRoot)/Sources/RepoPrompt/Support/RepoPrompt-Bridging-Header.h",
         "-disable-bridging-pch"
@@ -92,6 +97,7 @@ var repoPromptAppSwiftSettings: [SwiftSetting] = [
 
 var repoPromptTestDependencies: [Target.Dependency] = [
     "RepoPromptApp",
+    "RepoPromptAgentCore",
     "RepoPromptGateway",
     "RepoPromptRemoteWire",
     .product(name: "RepoPromptShared", package: "RepoPromptCore"),
@@ -135,6 +141,14 @@ let package = Package(
             dependencies: repoPromptAppDependencies,
             path: "Sources/RepoPrompt",
             swiftSettings: repoPromptAppSwiftSettings
+        ),
+        .target(
+            name: "RepoPromptAgentCore",
+            dependencies: [
+                .product(name: "RepoPromptShared", package: "RepoPromptCore")
+            ],
+            path: "Sources/RepoPromptAgentCore",
+            swiftSettings: repoPromptLayerSwiftSettings
         ),
         .target(
             name: "RepoPromptRemoteWire",

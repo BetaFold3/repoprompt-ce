@@ -1,5 +1,6 @@
 import Combine
 import Foundation
+@testable import RepoPromptAgentCore
 @_spi(TestSupport) @testable import RepoPromptApp
 import XCTest
 

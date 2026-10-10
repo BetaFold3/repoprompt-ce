@@ -109,10 +109,12 @@ class XcodeWorkspaceGeneratorTests(unittest.TestCase):
 
         self.assertEqual(targets["RepoPromptApp"]["type"], "regular")
         self.assertEqual(targets["RepoPromptApp"]["path"], "Sources/RepoPrompt")
+        self.assertEqual(targets["RepoPromptAgentCore"]["type"], "regular")
+        self.assertEqual(targets["RepoPromptAgentCore"]["path"], "Sources/RepoPromptAgentCore")
         self.assertEqual(targets["RepoPromptRemoteWire"].get("dependencies", []), [])
         self.assertEqual(
             set(generator._by_name_dependencies(targets["RepoPromptTests"])),
-            {"RepoPromptApp", "RepoPromptGateway", "RepoPromptRemoteWire"},
+            {"RepoPromptApp", "RepoPromptAgentCore", "RepoPromptGateway", "RepoPromptRemoteWire"},
         )
         self.assertEqual(
             generator._product_dependencies(targets["RepoPromptTests"]),

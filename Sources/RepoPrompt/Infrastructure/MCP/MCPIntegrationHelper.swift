@@ -1,5 +1,6 @@
 import AppKit
 import Foundation
+import RepoPromptAgentCore
 
 /// Centralised helpers for installing the RepoPrompt MCP server
 /// into third-party editors and copying the JSON configuration.

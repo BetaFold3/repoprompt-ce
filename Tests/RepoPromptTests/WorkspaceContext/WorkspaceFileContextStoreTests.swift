@@ -1,6 +1,7 @@
 import Combine
 import CoreServices
 import CryptoKit
+@testable import RepoPromptAgentCore
 @testable import RepoPromptApp
 import XCTest
 

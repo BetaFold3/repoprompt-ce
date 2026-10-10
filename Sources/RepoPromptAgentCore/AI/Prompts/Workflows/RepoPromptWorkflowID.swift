@@ -1,6 +1,6 @@
 import Foundation
 
-enum RepoPromptWorkflowID: String, CaseIterable {
+package enum RepoPromptWorkflowID: String, CaseIterable {
     case build
     case investigate
     case deepPlan
@@ -11,7 +11,7 @@ enum RepoPromptWorkflowID: String, CaseIterable {
     case orchestrate
     case optimize
 
-    var commandName: String {
+    package var commandName: String {
         switch self {
         case .build: "rp-build"
         case .investigate: "rp-investigate"
@@ -37,7 +37,7 @@ enum RepoPromptWorkflowID: String, CaseIterable {
         .optimize
     ]
 
-    static let installOrder: [RepoPromptWorkflowID] = [
+    package static let installOrder: [RepoPromptWorkflowID] = [
         .investigate,
         .build,
         .reminder,

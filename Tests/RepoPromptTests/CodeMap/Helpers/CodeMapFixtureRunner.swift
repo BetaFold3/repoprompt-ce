@@ -1,4 +1,5 @@
 import Foundation
+@testable import RepoPromptAgentCore
 @testable import RepoPromptApp
 
 struct CodeMapFixture {

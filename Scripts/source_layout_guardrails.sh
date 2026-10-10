@@ -27,6 +27,7 @@ required_dirs=(
   "Sources/RepoPrompt/Features"
   "Sources/RepoPrompt/Infrastructure"
   "Sources/RepoPrompt/Infrastructure/SyntaxParsing"
+  "Sources/RepoPromptAgentCore"
   "Packages/RepoPromptCore/Sources/RepoPromptShared/MCP"
   "Packages/RepoPromptCore/Sources/RepoPromptMCPClientKit"
   "Packages/RepoPromptCore/Sources/RepoPromptMCPCore"
@@ -53,9 +54,11 @@ if [[ -n "$unexpected_repo_prompt_executable_files" ]]; then
   fail "thin RepoPrompt executable target contains implementation files"
   printf '%s\n' "$unexpected_repo_prompt_executable_files" >&2
 fi
-repo_prompt_app_main_declarations="$(grep -R -n -E '^[[:space:]]*@main([[:space:]]|$)' Sources/RepoPrompt --include='*.swift' || true)"
+# Library source roots of the app split; add each new root here once.
+library_source_roots=("Sources/RepoPrompt" "Sources/RepoPromptAgentCore")
+repo_prompt_app_main_declarations="$(grep -R -n -E '^[[:space:]]*@main([[:space:]]|$)' "${library_source_roots[@]}" --include='*.swift' || true)"
 if [[ -n "$repo_prompt_app_main_declarations" ]]; then
-  fail "RepoPromptApp implementation target must not declare @main"
+  fail "RepoPromptApp/RepoPromptAgentCore library targets must not declare @main"
   printf '%s\n' "$repo_prompt_app_main_declarations" >&2
 fi
 repo_prompt_entry_main_count="$(grep -c -E '^[[:space:]]*@main([[:space:]]|$)' "$repo_prompt_entry" || true)"
@@ -160,6 +163,7 @@ package = json.loads(subprocess.check_output(["swift", "package", "dump-package"
 targets = {target["name"]: target for target in package["targets"]}
 repo_prompt = targets.get("RepoPrompt", {})
 repo_prompt_app = targets.get("RepoPromptApp", {})
+repo_prompt_agent_core = targets.get("RepoPromptAgentCore", {})
 repo_prompt_dependencies = repo_prompt.get("dependencies", [])
 repo_prompt_app_dependencies = repo_prompt_app.get("dependencies", [])
 repo_prompt_app_products = {
@@ -183,6 +187,10 @@ if repo_prompt_app.get("type") != "regular":
     errors.append("RepoPromptApp target must remain an internal library target")
 if repo_prompt_app.get("path") != "Sources/RepoPrompt":
     errors.append("RepoPromptApp target must retain the Sources/RepoPrompt implementation path")
+if repo_prompt_agent_core.get("type") != "regular":
+    errors.append("RepoPromptAgentCore target must exist as an internal library target")
+if repo_prompt_agent_core.get("path") != "Sources/RepoPromptAgentCore":
+    errors.append("RepoPromptAgentCore target must use the Sources/RepoPromptAgentCore path")
 
 for identity, (url, revision, product) in expected_packages.items():
     manifest_pin = f'.package(url: "{url}", revision: "{revision}")'
@@ -212,7 +220,7 @@ if errors:
     raise SystemExit("\n".join(errors))
 PY
 )"; then
-  fail "TreeSitter grammar pin/product or scanner-support manifest contract drifted"
+  fail "TreeSitter grammar pin/product, scanner-support, or target-topology manifest contract drifted"
   printf '%s\n' "$tree_sitter_scanner_support_manifest_output" >&2
 fi
 
@@ -255,8 +263,8 @@ done
 
 # 2. Test-only directories must stay out of the app source target.
 print_matches \
-  "Tests/TestSupport/Fixtures directory found under Sources/RepoPrompt" \
-  find Sources/RepoPrompt -type d \( -name Tests -o -name TestSupport -o -name Fixtures \) -print
+  "Tests/TestSupport/Fixtures directory found under app or AgentCore sources" \
+  find "${library_source_roots[@]}" -type d \( -name Tests -o -name TestSupport -o -name Fixtures \) -print
 
 # 3. MCPControlMessages.swift has exactly one source of truth.
 mcp_control_files=()

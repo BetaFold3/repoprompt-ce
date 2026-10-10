@@ -1,6 +1,7 @@
 #if DEBUG
     import Darwin
     import Foundation
+    @testable import RepoPromptAgentCore
     @testable import RepoPromptApp
 
     #if RPCE_BENCHMARK_TESTS

@@ -1,4 +1,5 @@
 import Foundation
+@testable import RepoPromptAgentCore
 @testable import RepoPromptApp
 
 /// Captured edit-tool payloads, shaped the way the real emitters shape them.

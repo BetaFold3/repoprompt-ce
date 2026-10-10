@@ -1,5 +1,6 @@
 import AppKit
 import Markdown
+@testable import RepoPromptAgentCore
 @testable import RepoPromptApp
 import XCTest
 

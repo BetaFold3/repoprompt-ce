@@ -2,6 +2,7 @@
     import CryptoKit
     import Darwin
     import Foundation
+    @testable import RepoPromptAgentCore
     @testable import RepoPromptApp
 
     enum WorkspaceCodeMapPhase4BenchmarkMetric: String, CaseIterable {

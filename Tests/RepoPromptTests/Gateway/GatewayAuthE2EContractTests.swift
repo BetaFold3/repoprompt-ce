@@ -2,6 +2,7 @@ import CryptoKit
 import Foundation
 import Logging
 import NIOCore
+@testable import RepoPromptAgentCore
 @testable import RepoPromptApp
 @testable import RepoPromptGateway
 import RepoPromptRemoteWire

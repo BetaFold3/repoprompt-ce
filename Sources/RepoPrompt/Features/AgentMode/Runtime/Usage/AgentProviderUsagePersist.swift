@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptAgentCore
 
 // MARK: - Raw persisted value
 

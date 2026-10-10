@@ -83,7 +83,13 @@ Advisory: several weeks of focused work, with AgentCore about half of it. Each s
 ### Slice 1 — Pilot: seed `RepoPromptAgentCore` with Prompts + Pricing
 Move `Infrastructure/AI/Prompts/**` (excluding `AgentModePrompts.swift`) and `Infrastructure/AI/Pricing/**`. Add their imports and the minimal `package` access. This proves the target, access, test-import and guardrail mechanics with almost no risk.
 
-Step 1 — todo | rounds 0/2 | open: | downgraded: | assumed: | deferred:
+Intent: prove target, access, test-import and tooling mechanics on a dependency-free leaf. Budget used: about 2 hours of the ~0.5 day expected (cumulative: ~2 hours).
+
+Result: moved all 46 files into `Sources/RepoPromptAgentCore/AI/{Prompts,Pricing}` with only `RepoPromptShared` as a dependency and about 30 declarations made `package`; build, focused suites, release packaging, lint and format pass, test discovery is unchanged (6464) and the ledger is byte-identical, so the mechanics work and Slice 2 follows.
+
+Decisions: the new root mirrors the app path (`AI/Prompts`, `AI/Pricing`) to leave room for `AgentMode/` later; pre-existing `public` on `PromptFactory`/`CodeExamples` was left as is; test imports sit at SwiftFormat's sorted position rather than after the app import; guardrails only check the new root's existence, path and `@main`/fixture rules, not imports; Swift settings shared through `repoPromptLayerSwiftSettings`; evidence lives in the main checkout's `.agent-artifacts/.../module-split-architecture/slice1/`.
+
+Step 1 — done | rounds 0/2 | open: | downgraded: | assumed: A1 | deferred: full `make dev-test` ran before the import lines were reordered (targeted suites rerun after)
 
 ### Slice 2 — `RepoPromptPlatform` and bridging-header retirement
 - Move dependency-verified primitives in small groups: concurrency, process, regex, networking, filesystem primitives, syntax parsing, utilities, secure-storage mechanics, the PCRE2 wrapper and recording-level instrumentation.
@@ -129,4 +135,4 @@ Step 6 — todo | rounds 0/2 | open: | downgraded: | assumed: | deferred:
 - No upstream sync: this is a private-use fork that has diverged.
 
 ## Assumed
-- None yet.
+- A1 (Slice 1): `make guardrails` fails in this worktree only on `Scripts/check-agent-context` for two plans (`2026-10-05-transcript-inner-scroll-hang-fix-plan.md`, `2026-10-09-oracle-call-contract-hardening-plan.md`) that are orphaned at HEAD; another session's uncommitted edit in the main checkout links them. Treated as pre-existing and not fixed here; undo by linking them from a routed doc if that edit never lands.

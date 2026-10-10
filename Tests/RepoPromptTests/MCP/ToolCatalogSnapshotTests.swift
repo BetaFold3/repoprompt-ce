@@ -3,6 +3,7 @@ import Darwin
 import Foundation
 import MCP
 import Ontology
+@testable import RepoPromptAgentCore
 @testable import RepoPromptApp
 import RepoPromptShared
 import XCTest

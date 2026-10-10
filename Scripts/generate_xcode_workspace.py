@@ -117,6 +117,7 @@ def validate_manifest(manifest: dict, repo_root: Path) -> None:
     required_targets = (
         "RepoPrompt",
         "RepoPromptApp",
+        "RepoPromptAgentCore",
         "RepoPromptMCP",
         "RepoPromptGateway",
         "RepoPromptRemoteWire",
@@ -157,6 +158,14 @@ def validate_manifest(manifest: dict, repo_root: Path) -> None:
             "Target 'RepoPromptApp' must retain the existing Sources/RepoPrompt implementation"
         )
 
+    repo_prompt_agent_core = targets["RepoPromptAgentCore"]
+    if repo_prompt_agent_core.get("type") != "regular":
+        raise GeneratorError("Target 'RepoPromptAgentCore' must remain an internal library target")
+    if repo_prompt_agent_core.get("path") != "Sources/RepoPromptAgentCore":
+        raise GeneratorError(
+            "Target 'RepoPromptAgentCore' must use the Sources/RepoPromptAgentCore implementation"
+        )
+
     repo_prompt_remote_wire = targets["RepoPromptRemoteWire"]
     if repo_prompt_remote_wire.get("dependencies", []):
         raise GeneratorError("Target 'RepoPromptRemoteWire' must have no dependencies")
@@ -191,16 +200,17 @@ def validate_manifest(manifest: dict, repo_root: Path) -> None:
     repo_prompt_tests = targets["RepoPromptTests"]
     expected_test_targets = {
         "RepoPromptApp",
+        "RepoPromptAgentCore",
         "RepoPromptGateway",
         "RepoPromptRemoteWire",
     }
     if (
-        len(repo_prompt_tests.get("dependencies", [])) != 6
+        len(repo_prompt_tests.get("dependencies", [])) != 7
         or set(_by_name_dependencies(repo_prompt_tests)) != expected_test_targets
         or _product_dependencies(repo_prompt_tests) != expected_core_products
     ):
         raise GeneratorError(
-            "RepoPromptTests must depend on RepoPromptApp, RepoPromptGateway, "
+            "RepoPromptTests must depend on RepoPromptApp, RepoPromptAgentCore, RepoPromptGateway, "
             "RepoPromptRemoteWire, and the RepoPromptCore Shared, ClientKit, and MCP products"
         )
 
