@@ -53,7 +53,7 @@ Extraction is blocked by coupling. A name-reference inventory found one file-lev
 - Neither `Infrastructure/AI` nor `Features/AgentMode` can be extracted mechanically. `AgentProviderKind`, for example, is declared in AgentMode but used throughout AI.
 - Only small leaf areas such as `Infrastructure/AI/Prompts` and `Infrastructure/AI/Pricing` are separable, and they offer little build-time gain.
 
-Revisit a split only as deliberate architecture work that first breaks that cycle. Raw evidence stays local under `.agent-artifacts/swift-compile-time/`.
+Revisit a split only as deliberate architecture work that first breaks that cycle. Raw evidence stays local under `.agent-artifacts/swift-compile-time/`. That architecture work is now directed by the [RepoPromptApp module split contract](../plans/2026-10-10-app-module-split-contract.md); it expects no build-speed or runtime-speed gain.
 
 ### Parallel source-validating root tests
 
