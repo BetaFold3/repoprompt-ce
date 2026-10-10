@@ -140,6 +140,22 @@ final class AgentModeRunService {
             _ stageID: UUID?,
             _ didSend: Bool
         ) -> Void = { _, _, _ in }
+        /// Attention notifications only (App/Notifications): reads the completed attempt and its
+        /// final assistant text at terminal commit. Never mutates run state; nil skips the event.
+        var captureAttentionTurnCompletion: (
+            _ session: AgentModeViewModel.TabSession,
+            _ revision: AgentRunTerminalCommitRevision
+        ) -> AttentionNotificationAdmission.Capture? = { _, _ in nil }
+        /// Attention notifications only: called once per accepted commit that produced a capture,
+        /// after successor selection settled. `providerSuccessorDeclined` is true only when the
+        /// selected provider successor declined after an accepted publication. Must not await or
+        /// mutate run state.
+        var settleAttentionTurnCompletion: (
+            _ session: AgentModeViewModel.TabSession,
+            _ revision: AgentRunTerminalCommitRevision,
+            _ capture: AttentionNotificationAdmission.Capture,
+            _ providerSuccessorDeclined: Bool
+        ) -> Void = { _, _, _, _ in }
     }
 
     private let dependencies: Dependencies
@@ -148,6 +164,10 @@ final class AgentModeRunService {
     #if DEBUG
         func test_acpRunner() -> ACPIntegratedAgentModeRunner {
             acpRunner
+        }
+
+        func test_terminalCommitBarrier() -> AgentRunTerminalCommitBarrier {
+            terminalCommitBarrier
         }
 
         func test_attachmentFinalizationHook() -> (

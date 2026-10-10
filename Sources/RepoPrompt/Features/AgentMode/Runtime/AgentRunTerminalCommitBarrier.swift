@@ -313,8 +313,12 @@ final class AgentRunTerminalCommitBarrier {
         session.lastTerminalPublicationResult = nil
 
         hooks.updateBindings(session)
+        var attentionCapture: AttentionNotificationAdmission.Capture?
         if request.notifyTurnComplete {
             hooks.notifyAgentTurnComplete(session)
+            if request.terminalState == .completed {
+                attentionCapture = hooks.captureAttentionTurnCompletion(session, revision)
+            }
         }
         hooks.scheduleSave(session.tabID)
         session.lastTerminalPublicationResult = await hooks.publishTerminalCommit(
@@ -327,10 +331,11 @@ final class AgentRunTerminalCommitBarrier {
             revision: revision,
             publicationResult: session.lastTerminalPublicationResult
         )
+        var providerSuccessorDeclined = false
         if let providerSuccessor,
            let publicationResult = session.lastTerminalPublicationResult
         {
-            notifyProviderSuccessor(
+            providerSuccessorDeclined = notifyProviderSuccessor(
                 providerSuccessor,
                 revision: revision,
                 publicationResult: publicationResult
@@ -344,6 +349,9 @@ final class AgentRunTerminalCommitBarrier {
         session.terminalCommitInProgress = false
         recordTerminalBarrierState(false, request: request)
         request.postCommit()
+        if let attentionCapture {
+            hooks.settleAttentionTurnCompletion(session, revision, attentionCapture, providerSuccessorDeclined)
+        }
 
         if let followUpInstruction {
             hooks.startFollowUpRun(session.tabID, followUpInstruction)
@@ -362,17 +370,20 @@ final class AgentRunTerminalCommitBarrier {
         return revision
     }
 
+    /// Returns true only when the provider explicitly declined its successor after an accepted
+    /// publication (an observation for attention notifications; consumption is unchanged).
+    @discardableResult
     private func notifyProviderSuccessor(
         _ providerSuccessor: ProviderSuccessor,
         revision: AgentRunTerminalCommitRevision,
         publicationResult: AgentRunTerminalPublicationResult
-    ) {
+    ) -> Bool {
         if case .accepted = publicationResult {
             guard !consumedProviderSuccessorIDs.contains(providerSuccessor.id) else {
-                return
+                return false
             }
             guard providerSuccessor.consumeAfterPublication(revision, publicationResult) else {
-                return
+                return true
             }
             consumedProviderSuccessorIDs.insert(providerSuccessor.id)
             consumedProviderSuccessorOrder.append(providerSuccessor.id)
@@ -380,9 +391,10 @@ final class AgentRunTerminalCommitBarrier {
                 let expiredID = consumedProviderSuccessorOrder.removeFirst()
                 consumedProviderSuccessorIDs.remove(expiredID)
             }
-            return
+            return false
         }
         _ = providerSuccessor.consumeAfterPublication(revision, publicationResult)
+        return false
     }
 
     private func takeQueuedFollowUpIfReady(

@@ -526,6 +526,9 @@ final class AgentModeViewModel: ObservableObject {
     /// Runtime-only delegated `ask_user` notice registry (see AgentModeViewModel+DelegatedQuestions.swift).
     var delegatedQuestionNotices = AgentDelegatedQuestionNoticeRegistry()
 
+    /// Outbound attention-notification admission (see AgentModeViewModel+AttentionNotifications.swift).
+    var attentionNotificationAdmission: AttentionNotificationAdmission = .shared
+
     private struct AgentRunOracleReviewKey: Hashable {
         let sessionID: UUID
         let runID: UUID
@@ -838,6 +841,11 @@ final class AgentModeViewModel: ObservableObject {
 
         func test_initializeRunService() {
             _ = runService
+        }
+
+        /// The production terminal commit barrier wired with this view model's run hooks.
+        func test_terminalCommitBarrier() -> AgentRunTerminalCommitBarrier {
+            runService.test_terminalCommitBarrier()
         }
 
         func test_attachmentFinalizationHook() -> (
@@ -3102,6 +3110,17 @@ final class AgentModeViewModel: ObservableObject {
             },
             recordDelegatedQuestionNoticeSendOutcome: { [weak self] session, stageID, didSend in
                 self?.recordDelegatedQuestionNoticeSendOutcome(for: session, stageID: stageID, didSend: didSend)
+            },
+            captureAttentionTurnCompletion: { [weak self] session, revision in
+                self?.captureAttentionTurnCompletion(for: session, revision: revision)
+            },
+            settleAttentionTurnCompletion: { [weak self] session, revision, capture, providerSuccessorDeclined in
+                self?.settleAttentionTurnCompletion(
+                    for: session,
+                    revision: revision,
+                    capture: capture,
+                    providerSuccessorDeclined: providerSuccessorDeclined
+                )
             }
         )
         let toolTrackingHooks = makeToolTrackingHooks()
@@ -19099,13 +19118,16 @@ final class AgentModeViewModel: ObservableObject {
                 interactionID: interaction.id,
                 provenance: controllerProvenance
             )
-            guard !audience.pausesTimeout else { return }
-            schedulePendingAskUserTimeout(
-                for: session,
-                interactionID: interaction.id,
-                timeoutSeconds: interaction.timeoutSeconds,
-                startedAt: interaction.askedAt
-            )
+            if !audience.pausesTimeout {
+                schedulePendingAskUserTimeout(
+                    for: session,
+                    interactionID: interaction.id,
+                    timeoutSeconds: interaction.timeoutSeconds,
+                    startedAt: interaction.askedAt
+                )
+            }
+            // Attention notifications: capture only after routing and timeout scheduling.
+            captureAttentionQuestion(for: session, interactionID: interaction.id, audience: audience)
         }
     }
 
@@ -19672,7 +19694,7 @@ final class AgentModeViewModel: ObservableObject {
 
     /// Status-aware assistant preview: active runs only show text from the current turn,
     /// terminal runs show the logical trailing response from the latest turn.
-    private func mcpResolvedAssistantPreview(session: TabSession, status: AgentRunMCPSnapshot.Status) -> String? {
+    func mcpResolvedAssistantPreview(session: TabSession, status: AgentRunMCPSnapshot.Status) -> String? {
         switch status {
         case .expired:
             return nil
