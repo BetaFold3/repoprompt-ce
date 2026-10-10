@@ -68,6 +68,19 @@ Slice 2 result: The disabled admission seam passed 15 fenced stub tests, 139 lif
 
 Review follow-up: Static tracing found only the Codex fallback successor factory; a temporary decline leaves its queue nonempty and a successful claim starts new ownership synchronously, so neither can pass the admission fence; eligible roots publish synchronously as accepted, making R3 a synthetic noneligible publication case (evidence: `slice-2-provider-successor-search.txt`, `slice-2-publication-scope.txt`).
 
+### Slice 3
+Add isolated plain-text Telegram rendering, single-attempt HTTP delivery and noninteractive secure token storage, with stubbed failure/leak and multipart tests before production wiring; budget used so far: about two hours elapsed, one committed source slice and three scoped worker sessions.
+
+Step 3 — done | rounds 1/2 | open: none | downgraded: none | assumed: no real HTTP calls or live-session delivery; server errors and offline drops may mean unknown delivery; full names share the completion's three-part budget | deferred: settings UI, paced pre-send admission, event-time system idle sampling, integration and phone acceptance; R1-2 capacity-filling splits can divide words
+
+Material implementation choices: Use the existing HTTPClient and secure-storage backend, fixed Telegram endpoint and plain JSON, and keep raw URL/request/error/response details out of diagnostics; split without loss for questions and cap completions at three numbered parts with a visible marker only when truncated; treat all API server errors and offline drops as unknown rather than claim non-delivery, with no retry.
+
+Budget used so far: about three hours elapsed including shared-slot and review waits, two completed source slices and four scoped worker sessions; no real sends, credential access or app lifecycle actions.
+
+Slice 3 result: Isolated rendering, HTTP delivery and secure token storage passed 45 focused stub tests after a reproduced paragraph-loss regression was fixed, with lint and guardrails passing and both review lanes clearing P0/P1 in one re-review round, so the next slice joins pacing to admission while live delivery remains disconnected (evidence: `slice-3-fixes-renderer-red.txt`, `slice-3-fixes-renderer-green.txt`, `slice-3-parent-final-client.txt`, `slice-3-final-TelegramBotTokenStoreTests.txt`, `slice-3-final-SecureStorageAccountCatalogTests.txt`, `slice-3-oracleA-rereview-1.md`, `slice-3-oracleB-rereview-1.md`).
+
+Review follow-up: Shared ephemeral storage and noninteractive reason semantics were confirmed from the existing factory and Keychain query; the redirect test checks the SDK selector and refusal directly, not a live URLSession redirect; the final cheap P3 outcome fixes were rerun without a review round solely for P3 (evidence: `slice-3-storage-authority.txt`, `slice-3-parent-final-client.txt`).
+
 ## Decisions
 - Review recovery (Slice 2): authorize one additional fresh, bounded OracleB retry after the initial reply and normal retry omitted findings and a complete verdict (owner answer 2026-10-10).
 - Orphaned-child questions: never notify.
