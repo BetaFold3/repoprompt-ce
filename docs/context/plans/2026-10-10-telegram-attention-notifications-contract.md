@@ -81,7 +81,21 @@ Slice 3 result: Isolated rendering, HTTP delivery and secure token storage passe
 
 Review follow-up: Shared ephemeral storage and noninteractive reason semantics were confirmed from the existing factory and Keychain query; the redirect test checks the SDK selector and refusal directly, not a live URLSession redirect; the final cheap P3 outcome fixes were rerun without a review round solely for P3 (evidence: `slice-3-storage-authority.txt`, `slice-3-parent-final-client.txt`).
 
+### Slice 4
+Join paced single-attempt Telegram delivery to event admission behind deterministic HTTP and queue fences, keeping production disconnected; budget used so far: about three hours elapsed, two committed source slices and four scoped worker sessions.
+
+Step 4 — done | rounds 0/2 | open: none | downgraded: none | assumed: queued events revalidate after pacing and before their first POST; admitted attempts retain their credential snapshot, with no withdrawal promise after admission; no live settings or secure-storage reads in tests | deferred: settings must share one pacer across replacements and route Send test through the same queue (B S4-1); sanitized part-failure reason for settings (B S4-4); shared test-double file move (B S4-5); settings and live wiring, root restore/handoff/schedule and remote-child integration, R1 selected follow-up abort recovery, phone acceptance
+
+Material implementation choices: Keep the FIFO and duplicate-pending ownership inside the existing admission authority rather than add a separate permit ledger; retain one event's queue head through all its parts, so a hanging request holds later notifications only, not run or question processing; share pacing state across credential replacements, with one-second private-chat spacing and conservative three-second spacing for groups/channel usernames; keep shared test doubles together rather than introduce a support file solely for an organizational finding (planning evidence: `slice-4-plan.md`).
+
+Budget used so far: about four hours elapsed including shared-slot and review waits, three completed source slices and five scoped worker sessions, reusing the Pair worker for fixes; no real sends, credential access or app lifecycle actions.
+
+Slice 4 result: Paced queued admission passed 29 stub tests after the new coverage test's premature outcome read was corrected, with lint and guardrails passing and both review lanes clearing P0/P1, so the next slice proves restored and projected session eligibility and selected follow-up abort recovery before settings enable production (evidence: `slice-4-final-AttentionNotificationAdmissionTests.txt`, `slice-4-fixes-paced-delivery-run-3.txt`, `slice-4-fixes-lint-2.txt`, `slice-4-guardrails.txt`, `slice-4-oracleA-initial.md`, `slice-4-oracleB-initial.md`).
+
+Review follow-up: Added post-admission credential-retention and snapshot-redaction tests without changing reviewed production behavior, so no round was run solely for P2/P3; the final accepted test ticket waited 22 minutes 36 seconds for another worktree's heavy slot and then passed in 13.4 seconds, not a delivery-latency measurement.
+
 ## Decisions
+- Commit signing: permit unsigned local commits for this contract after the Slice 4 1Password failure; owner will arrange later amendment/re-signing at the desk, with separate history-rewrite approval at that action boundary (owner answer 2026-10-10).
 - Review recovery (Slice 2): authorize one additional fresh, bounded OracleB retry after the initial reply and normal retry omitted findings and a complete verdict (owner answer 2026-10-10).
 - Orphaned-child questions: never notify.
 - Externally MCP-controlled roots: do not notify.

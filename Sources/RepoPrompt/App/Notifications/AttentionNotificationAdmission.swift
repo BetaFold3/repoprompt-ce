@@ -6,7 +6,9 @@ import Foundation
 // adapter (`AgentModeViewModel+AttentionNotifications.swift`) is admitted at most once, in one
 // synchronous main-actor step, after its event-specific fences still hold; admitted events are
 // handed to an injectable delivery off the main actor and never awaited by the run or question
-// paths. Transport, secure storage, and settings are later slices: production keeps the seam
+// paths. Submitted events form one FIFO: only its head prepares (paces) and is admitted, and an
+// admitted head stays active through its whole delivery attempt, so a hanging delivery holds later
+// notifications only. Settings and live wiring are later slices: production keeps the seam
 // disabled with no delivery.
 
 /// Identity of one attention event. Each key is admitted at most once per app lifetime.
@@ -41,7 +43,14 @@ enum AttentionNotificationDeliveryOutcome: Equatable {
 
 /// One delivery attempt per admitted event. Called off the main actor; never retried.
 protocol AttentionNotificationDelivering: Sendable {
+    /// Awaited by the queue head before admission (for example, first-message pacing). The event
+    /// is still revalidated after it returns, so it must not send anything.
+    func prepareForAdmission() async
     func deliver(_ event: AttentionNotificationEvent) async -> AttentionNotificationDeliveryOutcome
+}
+
+extension AttentionNotificationDelivering {
+    func prepareForAdmission() async {}
 }
 
 enum AttentionNotificationSuppression: String, Equatable {
@@ -49,6 +58,8 @@ enum AttentionNotificationSuppression: String, Equatable {
     case disabled
     /// Disabled, or disabled and re-enabled, between capture and admission.
     case enableChanged
+    /// The delivery configuration was replaced or removed between capture and admission.
+    case configurationChanged
     /// Child at any depth, unknown/conflicting lineage, MCP-controlled, or no identity.
     case ineligibleSession
     /// A queued follow-up or provider successor took over from the completed turn.
@@ -63,13 +74,14 @@ enum AttentionNotificationSuppression: String, Equatable {
 @MainActor
 final class AttentionNotificationAdmission {
     struct Environment {
-        /// Delivery for admitted events; nil keeps the seam a no-op.
+        /// Initial delivery for admitted events; nil keeps the seam a no-op. Later changes go
+        /// through `setDeliveryConfiguration(_:)`.
         var delivery: (any AttentionNotificationDelivering)?
         /// Seconds since the last Mac input event, or nil when unreadable without a permission
         /// prompt (then idle never suppresses).
         var idleSeconds: @MainActor () -> TimeInterval?
-        /// Deterministic fence between capture and admission (tests pause here). Production is a
-        /// no-op; admission still re-validates every fence after it returns.
+        /// Deterministic fence between the head's preparation (pacing) and admission (tests pause
+        /// here). Production is a no-op; admission still re-validates every fence after it returns.
         var beforeAdmission: @MainActor (AttentionNotificationEventKey) async -> Void
 
         init(
@@ -87,6 +99,10 @@ final class AttentionNotificationAdmission {
     struct Capture {
         let event: AttentionNotificationEvent
         let enableGeneration: UInt64
+        /// The delivery configured at the event and its generation. A capture is only ever sent
+        /// through this snapshot, and only while it is still the configured one.
+        let delivery: (any AttentionNotificationDelivering)?
+        let deliveryGeneration: UInt64
         /// Idle seconds read at event time (nil when unreadable).
         let idleSecondsAtEvent: TimeInterval?
         /// Event-specific fences (session object, binding generation, exact pending interaction or
@@ -113,10 +129,24 @@ final class AttentionNotificationAdmission {
     private(set) var records: [AttentionNotificationEventKey: Record] = [:]
     private(set) var lastSuppression: AttentionNotificationSuppression?
     private(set) var lastDeliveryOutcome: AttentionNotificationDeliveryOutcome?
-    var environment: Environment
+    /// The configured delivery (an immutable credential/client snapshot) and its generation,
+    /// bumped on every replacement or removal.
+    private(set) var delivery: (any AttentionNotificationDelivering)?
+    private(set) var deliveryGeneration: UInt64 = 0
+    /// Submitted, undecided events: the active head (if any) plus the FIFO behind it.
+    private(set) var pendingEventKeys: Set<AttentionNotificationEventKey> = []
+    /// The queue head being prepared, admitted, or delivered; later events wait behind it.
+    private(set) var activeEventKey: AttentionNotificationEventKey?
+    private var queuedCaptures: [Capture] = []
+    private let idleSeconds: @MainActor () -> TimeInterval?
+    private let beforeAdmission: @MainActor (AttentionNotificationEventKey) async -> Void
 
+    /// Keeps only the idle reader and the pre-admission fence; `delivery` is the sole retained
+    /// delivery snapshot.
     init(environment: Environment = Environment()) {
-        self.environment = environment
+        delivery = environment.delivery
+        idleSeconds = environment.idleSeconds
+        beforeAdmission = environment.beforeAdmission
     }
 
     func setEnabled(_ enabled: Bool) {
@@ -125,9 +155,16 @@ final class AttentionNotificationAdmission {
         enableGeneration &+= 1
     }
 
+    /// Replaces or removes the delivery configuration. Captures taken under an earlier
+    /// configuration are never admitted, so old events never switch to new credentials.
+    func setDeliveryConfiguration(_ delivery: (any AttentionNotificationDelivering)?) {
+        self.delivery = delivery
+        deliveryGeneration &+= 1
+    }
+
     /// Whether an adapter should capture at all. Cheap; avoids lineage and text work when off.
     var acceptsCaptures: Bool {
-        isEnabled && environment.delivery != nil
+        isEnabled && delivery != nil
     }
 
     /// Starts a capture for the adapter, reading event-time idle and the enable generation.
@@ -138,7 +175,9 @@ final class AttentionNotificationAdmission {
         Capture(
             event: event,
             enableGeneration: enableGeneration,
-            idleSecondsAtEvent: environment.idleSeconds(),
+            delivery: delivery,
+            deliveryGeneration: deliveryGeneration,
+            idleSecondsAtEvent: idleSeconds(),
             isStillCurrent: isStillCurrent
         )
     }
@@ -150,28 +189,60 @@ final class AttentionNotificationAdmission {
         lastSuppression = reason
     }
 
-    /// Schedules admission behind the pre-admission fence. Never blocks the caller.
+    /// Queues the event behind earlier submissions. Never blocks the caller. A key already
+    /// decided or already pending is ignored before any asynchronous work.
     func submit(_ capture: Capture) {
-        guard records[capture.event.key] == nil else { return }
-        let fence = environment.beforeAdmission
+        let key = capture.event.key
+        guard records[key] == nil, !pendingEventKeys.contains(key) else { return }
+        pendingEventKeys.insert(key)
+        queuedCaptures.append(capture)
+        startNextIfIdle()
+    }
+
+    /// Starts the queue head: preparation (pacing), then the pre-admission fence, then the
+    /// synchronous admission. A suppressed head releases at once; an admitted head is released
+    /// when its delivery outcome is recorded.
+    private func startNextIfIdle() {
+        guard activeEventKey == nil, !queuedCaptures.isEmpty else { return }
+        let capture = queuedCaptures.removeFirst()
+        let key = capture.event.key
+        activeEventKey = key
+        let fence = beforeAdmission
         Task { @MainActor [weak self] in
-            await fence(capture.event.key)
-            self?.admit(capture)
+            await capture.delivery?.prepareForAdmission()
+            await fence(key)
+            guard let self, !admit(capture) else { return }
+            releaseActiveEvent(key)
         }
+    }
+
+    /// Releases the head only if `key` still owns it, then starts the next event.
+    private func releaseActiveEvent(_ key: AttentionNotificationEventKey) {
+        guard activeEventKey == key else { return }
+        activeEventKey = nil
+        pendingEventKeys.remove(key)
+        startNextIfIdle()
     }
 
     /// The single synchronous admission boundary. Returns true when the event was handed to
     /// delivery. Nothing here awaits; the delivery runs in a detached task.
-    @discardableResult
-    func admit(_ capture: Capture) -> Bool {
+    private func admit(_ capture: Capture) -> Bool {
         let key = capture.event.key
         guard records[key] == nil else { return false }
-        guard isEnabled, let delivery = environment.delivery else {
+        guard isEnabled else {
             suppress(key, reason: capture.enableGeneration == enableGeneration ? .disabled : .enableChanged)
             return false
         }
         guard capture.enableGeneration == enableGeneration else {
             suppress(key, reason: .enableChanged)
+            return false
+        }
+        guard capture.deliveryGeneration == deliveryGeneration else {
+            suppress(key, reason: .configurationChanged)
+            return false
+        }
+        guard let delivery = capture.delivery else {
+            suppress(key, reason: .disabled)
             return false
         }
         guard capture.isStillCurrent() else {
@@ -197,5 +268,6 @@ final class AttentionNotificationAdmission {
     ) {
         records[key] = .delivered(outcome)
         lastDeliveryOutcome = outcome
+        releaseActiveEvent(key)
     }
 }

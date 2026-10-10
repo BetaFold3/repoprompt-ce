@@ -387,9 +387,10 @@ final class AttentionNotificationAdmissionTests: XCTestCase {
 
     // MARK: - Kill: at-most-once admission
 
-    /// Exercises the admission record guard directly (terminal-barrier duplicate recovery never
-    /// re-captures): one capture submitted twice behind the held fence delivers once, and a replay
-    /// after the recorded outcome never reaches the fence or delivery again.
+    /// Exercises the pending-key and record guards directly (terminal-barrier duplicate recovery
+    /// never re-captures): one capture submitted twice is queued once before any asynchronous work,
+    /// reaches the held fence once, and delivers once; a replay after the recorded outcome is never
+    /// queued, never reaches the fence, and never delivers again.
     func testSameCaptureSubmittedTwiceBehindFenceDeliversOnceAndReplayIsIgnored() async throws {
         let fence = AdmissionFence()
         let fixture = makeFixture(fence: fence)
@@ -406,23 +407,30 @@ final class AttentionNotificationAdmissionTests: XCTestCase {
 
         fixture.admission.submit(capture)
         fixture.admission.submit(capture)
-        try await waitForPauses(fence, 2)
-        XCTAssertNil(fixture.admission.records[key], "Both submissions are held before admission")
+        XCTAssertEqual(fixture.admission.pendingEventKeys, [key], "The duplicate is rejected before any asynchronous work")
+        XCTAssertEqual(fixture.admission.activeEventKey, key)
+        try await waitForPauses(fence, 1)
+        for _ in 0 ..< 50 {
+            await Task.yield()
+        }
+        XCTAssertEqual(fence.pauseCount, 1, "Only one submission reaches the fence")
+        XCTAssertNil(fixture.admission.records[key], "The submission is held before admission")
 
         fence.release()
-        // Each held submission admits synchronously right after passing the fence.
-        try await waitUntil("both held submissions to reach admission") { fence.passedCount == 2 }
         try await waitForRecord(fixture.admission, key) { $0 == .delivered(.sent) }
+        XCTAssertEqual(fence.passedCount, 1)
+        XCTAssertTrue(fixture.admission.pendingEventKeys.isEmpty, "The recorded outcome releases the key")
+        XCTAssertNil(fixture.admission.activeEventKey)
         var attempts = await fixture.delivery.events.count
         XCTAssertEqual(attempts, 1)
 
         fixture.admission.submit(capture)
-        XCTAssertFalse(fixture.admission.admit(capture), "A replay after the outcome is never admitted")
-        XCTAssertEqual(fixture.admission.records[key], .delivered(.sent))
+        XCTAssertTrue(fixture.admission.pendingEventKeys.isEmpty, "A replay after the outcome is never queued")
+        XCTAssertNil(fixture.admission.activeEventKey)
         for _ in 0 ..< 50 {
             await Task.yield()
         }
-        XCTAssertEqual(fence.pauseCount, 2, "A replay after the outcome never schedules admission")
+        XCTAssertEqual(fence.pauseCount, 1, "A replay after the outcome never schedules admission")
         attempts = await fixture.delivery.events.count
         XCTAssertEqual(attempts, 1)
         XCTAssertEqual(fixture.admission.records[key], .delivered(.sent))
@@ -507,6 +515,8 @@ final class AttentionNotificationAdmissionTests: XCTestCase {
 
     func testDisabledByDefaultAndIdleThreshold() async throws {
         XCTAssertFalse(AttentionNotificationAdmission.shared.acceptsCaptures, "Production stays disabled with no delivery")
+        XCTAssertFalse(AttentionNotificationAdmission.shared.isEnabled)
+        XCTAssertNil(AttentionNotificationAdmission.shared.delivery, "Production configures no sender")
 
         for (idle, expected) in [(TimeInterval(10), AttentionNotificationAdmission.Record.suppressed(.userActive)), (301, .delivered(.sent))] {
             let fixture = makeFixture(idleSeconds: { idle })
@@ -522,33 +532,50 @@ final class AttentionNotificationAdmissionTests: XCTestCase {
 
     // MARK: - Hanging and failing delivery
 
+    /// Over the paced Telegram path with a stub HTTP client: a hanging request holds later
+    /// notifications only (serialized delivery), never the commit, successor start, question
+    /// installation or its timeout. The question queued behind it is stale when the head releases
+    /// and never posts.
     func testHangingDeliveryNeverDelaysCommitSuccessorQuestionInstallationOrTimeout() async throws {
-        let delivery = StubDelivery(mode: .hang)
-        let fixture = makeFixture(delivery: delivery)
+        let clock = ManualPacingClock()
+        let http = PacedStubHTTPClient(replies: [.hang(then: .fail(PacedTelegramTestSupport.leakyURLError(.timedOut)))])
+        let pacer = TelegramAttentionPacer(clock: clock.pacingClock)
+        let fixture = makeFixture(configuredDelivery: PacedTelegramTestSupport.delivery(http: http, pacer: pacer))
+        addTeardownBlock { http.releaseHangs() }
         var followUps: [String] = []
         let barrier = makeBarrier(fixture.vm, startFollowUpRun: { _, text in followUps.append(text) })
         let root = makeSession(fixture.vm)
 
-        // Turn 1 settles idle and its delivery hangs.
+        // Turn 1 settles idle and its single POST hangs.
         let first = beginTurn(root.session, user: "one", assistant: "first")
         _ = await barrier.commit(completedRequest(root.session, first, supportsFollowUp: true))
-        try await waitForAttempts(delivery, 1)
+        try await waitUntil("the first POST to start") { http.requestCount == 1 }
         let firstKey = AttentionNotificationEventKey.turnCompleted(sessionID: root.sessionID, attemptID: first.attemptID)
         XCTAssertEqual(fixture.admission.records[firstKey], .admitted)
+        XCTAssertEqual(fixture.admission.activeEventKey, firstKey)
 
-        // Turn 2 commits and starts its queued successor while turn 1's delivery still hangs.
+        // Turn 2 commits and starts its queued successor while turn 1's request still hangs.
         root.session.pendingInstructions = ["three"]
         let second = beginTurn(root.session, user: "two", assistant: "second")
         let revision = await barrier.commit(completedRequest(root.session, second, supportsFollowUp: true))
         XCTAssertNotNil(revision)
         XCTAssertEqual(followUps, ["three"])
         XCTAssertFalse(root.session.terminalCommitInProgress)
+        XCTAssertEqual(
+            fixture.admission.records[.turnCompleted(sessionID: root.sessionID, attemptID: second.attemptID)],
+            .suppressed(.successorTookOver)
+        )
 
-        // A question installs and its timeout completes while its own delivery remains fenced.
+        // A question installs and is queued behind the hanging head; its timeout completes.
         let interaction = makeInteraction(timeoutSeconds: 60)
+        let questionKey = AttentionNotificationEventKey.question(sessionID: root.sessionID, interactionID: interaction.id)
         let task = Task { try await fixture.vm.askUser(tabID: root.tabID, interaction: interaction) }
-        try await waitForAttempts(delivery, 2)
+        try await waitUntil("the question to queue behind the hanging head") {
+            fixture.admission.pendingEventKeys.contains(questionKey)
+        }
         XCTAssertEqual(root.session.pendingAskUser?.interaction.id, interaction.id)
+        XCTAssertEqual(fixture.admission.activeEventKey, firstKey)
+        XCTAssertNil(fixture.admission.records[questionKey])
         fixture.vm.schedulePendingAskUserTimeout(
             for: root.session,
             interactionID: interaction.id,
@@ -558,9 +585,110 @@ final class AttentionNotificationAdmissionTests: XCTestCase {
         let response = try await task.value
         XCTAssertTrue(response.timedOut)
         XCTAssertEqual(fixture.admission.records[firstKey], .admitted)
+        XCTAssertEqual(http.requestCount, 1, "Nothing else posts while the head hangs")
 
-        await delivery.releaseHang()
+        http.releaseHangs()
         try await waitForRecord(fixture.admission, firstKey) { $0 == .delivered(.unknown) }
+        let questionRecord = try await waitForRecord(fixture.admission, questionKey)
+        XCTAssertEqual(questionRecord, .suppressed(.eventNoLongerCurrent), "The stale queued question never posts")
+        XCTAssertEqual(http.requestCount, 1, "One attempt for the hanging event; none for the stale question")
+        XCTAssertTrue(fixture.admission.pendingEventKeys.isEmpty)
+        XCTAssertNil(fixture.admission.activeEventKey)
+    }
+
+    /// Over the paced Telegram path with a stub HTTP client: the queue head waits in first-message
+    /// pacing before admission; a question resolved, a run ended, a rebind, a disable, or a
+    /// configuration replacement/removal during that wait yields zero POSTs on any configuration.
+    func testQuestionChangedWhilePacingBeforeAdmissionNeverPostsOverHTTP() async throws {
+        enum Change: String, CaseIterable {
+            case answered, skipped, timedOut, cancelledByRunEnd, rebound, disabled, configurationReplaced, configurationRemoved
+        }
+        for change in Change.allCases {
+            let clock = ManualPacingClock(holdsWaits: true)
+            let http = PacedStubHTTPClient()
+            let replacementHTTP = PacedStubHTTPClient()
+            let pacer = TelegramAttentionPacer(clock: clock.pacingClock)
+            // An earlier request was just initiated, so the next head must wait before admission.
+            await pacer.markRequestInitiated(spacing: TelegramAttentionPacer.privateChatSpacing)
+            let fixture = makeFixture(configuredDelivery: PacedTelegramTestSupport.delivery(http: http, pacer: pacer))
+            addTeardownBlock {
+                clock.releaseWaits()
+                http.releaseHangs()
+            }
+            let root = makeSession(fixture.vm)
+            let ownership = beginTurn(root.session, user: "ask", assistant: nil)
+            let interaction = makeInteraction(timeoutSeconds: 60)
+            let key = AttentionNotificationEventKey.question(sessionID: root.sessionID, interactionID: interaction.id)
+            let task = Task { try await fixture.vm.askUser(tabID: root.tabID, interaction: interaction) }
+            try await waitUntil("\(change): the head to wait in pacing") { clock.waits.count == 1 }
+            XCTAssertEqual(fixture.admission.activeEventKey, key, change.rawValue)
+            XCTAssertNil(fixture.admission.records[key], change.rawValue)
+
+            var expected = AttentionNotificationSuppression.eventNoLongerCurrent
+            switch change {
+            case .answered:
+                try fixture.vm.submitAskUserResponse(
+                    tabID: root.tabID,
+                    interactionID: interaction.id,
+                    draftsByQuestionID: ["choice": AgentAskUserDraft(selectedOptionLabels: ["A"])]
+                )
+                _ = try await task.value
+            case .skipped:
+                fixture.vm.skipAskUser(tabID: root.tabID, interactionID: interaction.id)
+                _ = try await task.value
+            case .timedOut:
+                fixture.vm.schedulePendingAskUserTimeout(
+                    for: root.session,
+                    interactionID: interaction.id,
+                    timeoutSeconds: 0,
+                    startedAt: Date()
+                )
+                let response = try await task.value
+                XCTAssertTrue(response.timedOut, change.rawValue)
+            case .cancelledByRunEnd:
+                _ = await fixture.vm.test_terminalCommitBarrier().commit(.init(
+                    session: root.session,
+                    ownership: ownership,
+                    expectedRunID: root.session.runID,
+                    terminalState: .cancelled,
+                    source: "test.attention.cancel",
+                    attachmentDisposition: .deleteFiles,
+                    finalizeNonCodexUsage: false,
+                    supportsFollowUp: false,
+                    notifyTurnComplete: false
+                ))
+                XCTAssertNil(root.session.pendingAskUser, change.rawValue)
+                _ = try? await task.value
+            case .rebound:
+                root.session.testInstallPersistentSessionBinding(sessionID: UUID())
+            case .disabled:
+                fixture.admission.setEnabled(false)
+                expected = .enableChanged
+            case .configurationReplaced:
+                fixture.admission.setDeliveryConfiguration(PacedTelegramTestSupport.delivery(
+                    http: replacementHTTP,
+                    pacer: pacer,
+                    token: PacedTelegramTestSupport.replacementToken
+                ))
+                expected = .configurationChanged
+            case .configurationRemoved:
+                fixture.admission.setDeliveryConfiguration(nil)
+                expected = .configurationChanged
+            }
+            clock.releaseWaits()
+
+            let record = try await waitForRecord(fixture.admission, key)
+            XCTAssertEqual(record, .suppressed(expected), change.rawValue)
+            XCTAssertEqual(http.requestCount, 0, change.rawValue)
+            XCTAssertEqual(replacementHTTP.requestCount, 0, "\(change): an old capture never uses new credentials")
+            XCTAssertTrue(fixture.admission.pendingEventKeys.isEmpty, change.rawValue)
+            XCTAssertNil(fixture.admission.activeEventKey, change.rawValue)
+
+            if root.session.pendingAskUser?.interaction.id == interaction.id {
+                fixture.vm.skipAskUser(tabID: root.tabID, interactionID: interaction.id)
+                _ = try? await task.value
+            }
+        }
     }
 
     func testFailingDeliveryRecordsOneFailedAttemptWithoutRetry() async throws {
@@ -598,8 +726,10 @@ final class AttentionNotificationAdmissionTests: XCTestCase {
         let session: AgentModeViewModel.TabSession
     }
 
+    /// `configuredDelivery` replaces the stub delivery (then `Fixture.delivery` records nothing).
     private func makeFixture(
         delivery: StubDelivery = StubDelivery(mode: .succeed),
+        configuredDelivery: (any AttentionNotificationDelivering)? = nil,
         fence: AdmissionFence? = nil,
         idleSeconds: @escaping @MainActor () -> TimeInterval? = { nil }
     ) -> Fixture {
@@ -611,7 +741,7 @@ final class AttentionNotificationAdmissionTests: XCTestCase {
             }
         )
         let admission = AttentionNotificationAdmission(environment: .init(
-            delivery: delivery,
+            delivery: configuredDelivery ?? delivery,
             idleSeconds: idleSeconds,
             beforeAdmission: { key in await fence?.pause(key) }
         ))
