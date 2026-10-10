@@ -441,7 +441,8 @@ final class AttentionNotificationAdmissionTests: XCTestCase {
     func testProductionBarrierDeliversColdStartedRootOnceAcrossRepeatedTerminalPublication() async throws {
         let fixture = makeFixture()
         let barrier = fixture.vm.test_terminalCommitBarrier()
-        // A cold-started UI root: hydrated from disk, parentless, with no index entry.
+        // Fixture root (loaded flag set by `makeSession`); real cold restore is covered by
+        // `testColdRestoredWorkspaceTabRootNotifiesCompletionAndQuestion`.
         let root = makeSession(fixture.vm)
         XCTAssertEqual(fixture.vm.mcpDelegationLineage(for: root.session), .resolved(depth: 0))
         let ownership = beginTurn(root.session, user: "go", assistant: "Cold root answer")
@@ -712,6 +713,231 @@ final class AttentionNotificationAdmissionTests: XCTestCase {
         XCTAssertEqual(fixture.admission.records[key], .delivered(.failed))
     }
 
+    // MARK: - Production-constructed roots and projected children (Slice 5)
+
+    /// A root restored on a cold window: a second view model restores the workspace compose tab
+    /// through `ensureSessionReady`, which binds the tab's durable session from the workspace and
+    /// hydrates it from the temporary store. Lineage and eligibility come from production state
+    /// only; nothing here sets parent or loaded flags.
+    func testColdRestoredWorkspaceTabRootNotifiesCompletionAndQuestion() async throws {
+        let storageURL = try makeTemporaryStore()
+        let workspace = makeStoreWorkspace(storageURL)
+        let sessionID: UUID
+        do {
+            let writer = makeStoreViewModel(windowID: 5501, storageURL: storageURL)
+            writer.test_establishPersistenceWorkspace(workspace)
+            let writerTabID = UUID()
+            writer.test_setCurrentTabIDOverride(writerTabID)
+            let source = try await writer.ensureSessionReady(tabID: writerTabID)
+            sessionID = try XCTUnwrap(writer.ensureSessionBoundToTab(source))
+            source.appendItem(.user("Earlier question"))
+            source.appendItem(.assistant("Earlier answer"))
+            let saved = await writer.flushSave(for: writerTabID)
+            XCTAssertTrue(saved)
+        }
+
+        let tabID = UUID()
+        var restoredWorkspace = workspace
+        restoredWorkspace.composeTabs = [ComposeTabState(id: tabID, name: "Restored root", activeAgentSessionID: sessionID)]
+        restoredWorkspace.activeComposeTabID = tabID
+        let restored = makeStoreViewModel(windowID: 5502, storageURL: storageURL)
+        let wired = wireWorkspace(restored, workspace: restoredWorkspace)
+        let attention = installAdmission(on: restored)
+        let session = try await restored.ensureSessionReady(tabID: tabID)
+        XCTAssertEqual(session.activeAgentSessionID, sessionID)
+        XCTAssertTrue(session.items.contains { $0.text == "Earlier answer" }, "Hydrated from the store")
+        XCTAssertEqual(restored.mcpDelegationLineage(for: session), .resolved(depth: 0))
+
+        let ownership = beginTurn(session, user: "Continue", assistant: "Restored root answer")
+        _ = await restored.test_terminalCommitBarrier().commit(completedRequest(session, ownership))
+        let completionKey = AttentionNotificationEventKey.turnCompleted(sessionID: sessionID, attemptID: ownership.attemptID)
+        try await waitForRecord(attention.admission, completionKey) { $0 == .delivered(.sent) }
+
+        let interaction = makeInteraction(timeoutSeconds: 60)
+        let task = Task { try await restored.askUser(tabID: tabID, interaction: interaction) }
+        let questionKey = AttentionNotificationEventKey.question(sessionID: sessionID, interactionID: interaction.id)
+        try await waitForRecord(attention.admission, questionKey) { $0 == .delivered(.sent) }
+        restored.skipAskUser(tabID: tabID, interactionID: interaction.id)
+        _ = try await task.value
+
+        let events = await attention.delivery.events
+        XCTAssertEqual(events.map(\.key), [completionKey, questionKey])
+        XCTAssertEqual(events.first?.content, .turnCompleted(finalAssistantText: "Restored root answer"))
+        XCTAssertEqual(events.map(\.workspaceName), ["Attention Store", "Attention Store"])
+        let restoredName = restored.resolvedSessionDisplayName(for: tabID)
+        XCTAssertFalse(restoredName.isEmpty)
+        XCTAssertEqual(events.map(\.sessionName), [restoredName, restoredName])
+        withExtendedLifetime(wired) {}
+    }
+
+    /// A UI handoff destination is a root as soon as `prepareHandoffHeadless` returns, before any
+    /// readiness call. The UI's local handoff (`performHandoff` in `AgentModeViewModel+Handoff.swift`)
+    /// calls `prepareHandoffToNewTab(sourceTabID:...)`, which calls this same `prepareHandoffHeadless`
+    /// and then only foregrounds the destination tab.
+    func testUIHandoffDestinationIsARootThatNotifiesItsCompletion() async throws {
+        let storageURL = try makeTemporaryStore()
+        let sourceTabID = UUID()
+        let sourceSessionID = UUID()
+        let workspace = makeStoreWorkspace(
+            storageURL,
+            composeTabs: [ComposeTabState(id: sourceTabID, name: "Source", activeAgentSessionID: sourceSessionID)]
+        )
+        let vm = makeStoreViewModel(windowID: 5511, storageURL: storageURL)
+        let wired = wireWorkspace(vm, workspace: workspace)
+        let attention = installAdmission(on: vm)
+        let source = try await vm.ensureSessionReady(tabID: sourceTabID)
+        XCTAssertEqual(source.activeAgentSessionID, sourceSessionID)
+        source.appendItem(.user("Source question"))
+        source.appendItem(.assistant("Source answer"))
+
+        let destinationTabID = try await vm.prepareHandoffHeadless(
+            sourceTabID: sourceTabID,
+            upToItemID: nil,
+            destinationAgent: source.selectedAgent,
+            destinationModelRaw: source.selectedModelRaw,
+            destinationReasoningEffortRaw: source.selectedReasoningEffortRaw
+        )
+        let destination = try XCTUnwrap(vm.sessions[destinationTabID])
+        let destinationSessionID = try XCTUnwrap(destination.activeAgentSessionID)
+        XCTAssertNotEqual(destinationSessionID, sourceSessionID)
+        // Root straight from the production handoff, without a test-added readiness step.
+        XCTAssertEqual(vm.mcpDelegationLineage(for: destination), .resolved(depth: 0))
+        XCTAssertTrue(vm.isAttentionNotificationRoot(destination))
+        let ready = try await vm.ensureSessionReady(tabID: destinationTabID)
+        XCTAssertTrue(ready === destination)
+        XCTAssertEqual(vm.mcpDelegationLineage(for: destination), .resolved(depth: 0))
+
+        let ownership = beginTurn(destination, user: "Continue after handoff", assistant: "Handoff answer")
+        _ = await vm.test_terminalCommitBarrier().commit(completedRequest(destination, ownership))
+        let key = AttentionNotificationEventKey.turnCompleted(sessionID: destinationSessionID, attemptID: ownership.attemptID)
+        try await waitForRecord(attention.admission, key) { $0 == .delivered(.sent) }
+        let events = await attention.delivery.events
+        XCTAssertEqual(events.map(\.key), [key])
+        XCTAssertEqual(events.first?.content, .turnCompleted(finalAssistantText: "Handoff answer"))
+        XCTAssertEqual(events.first?.workspaceName, "Attention Store")
+        let destinationName = vm.resolvedSessionDisplayName(for: destinationTabID)
+        XCTAssertFalse(destinationName.isEmpty)
+        XCTAssertEqual(events.first?.sessionName, destinationName)
+        withExtendedLifetime(wired) {}
+    }
+
+    /// The production scheduled-send path (install, then Send now through the coordinator; no timer
+    /// fires) accepts the dispatch with a stubbed run start, and the completion comes from a test
+    /// attempt on the same session object: it stays an eligible root and that completion notifies.
+    /// The install passes the `isNewSessionStart` the composer computes for a never-sent session.
+    func testScheduledSendDispatchedRootNotifiesItsCompletion() async throws {
+        let storageURL = try makeTemporaryStore()
+        let vm = makeStoreViewModel(windowID: 5521, storageURL: storageURL)
+        vm.test_establishPersistenceWorkspace(makeStoreWorkspace(storageURL))
+        let attention = installAdmission(on: vm)
+        let tabID = UUID()
+        vm.test_setCurrentTabIDOverride(tabID)
+        let session = try await vm.ensureSessionReady(tabID: tabID)
+        let sessionID = try XCTUnwrap(vm.ensureSessionBoundToTab(session))
+        let now = Date()
+        // The deadline never fires on its own (sleep ends immediately): only Send now dispatches.
+        let coordinator = AgentScheduledSendCoordinator(clock: SchedulerClock(
+            now: { now },
+            sleepUntil: { _ in throw CancellationError() },
+            probe: { .none }
+        ))
+        vm.attachScheduledSendCoordinator(coordinator)
+        addTeardownBlock { @MainActor in vm.detachScheduledSendCoordinator() }
+        vm.scheduledDispatchRunStarter = { _, _, _, _ in .sent }
+
+        // As `executeComposerScheduleAttempt` computes it for an existing session.
+        let isNewSessionStart = AgentModeViewModel.sessionIsUntouchedForScheduling(session)
+        XCTAssertTrue(isNewSessionStart, "A never-sent session schedules as a new session start")
+        let scheduleID = try await vm.installScheduledSend(
+            text: "Scheduled turn",
+            on: session,
+            notBefore: now.addingTimeInterval(3600),
+            runAlongsideOtherSessions: false,
+            isNewSessionStart: isNewSessionStart
+        ).get()
+        let refusal = await vm.sendScheduledSendNow(tabID: tabID, scheduleID: scheduleID, runAlongsideOtherSessions: false)
+        XCTAssertNil(refusal)
+        try await waitUntil("scheduled dispatch accepted") { session.lastScheduledDispatch?.scheduleID == scheduleID }
+        XCTAssertTrue(session.items.contains { $0.kind == .user && $0.text == "Scheduled turn" })
+        XCTAssertEqual(vm.mcpDelegationLineage(for: session), .resolved(depth: 0))
+
+        let ownership = beginTurn(session, user: nil, assistant: "Scheduled answer")
+        _ = await vm.test_terminalCommitBarrier().commit(completedRequest(session, ownership))
+        let key = AttentionNotificationEventKey.turnCompleted(sessionID: sessionID, attemptID: ownership.attemptID)
+        try await waitForRecord(attention.admission, key) { $0 == .delivered(.sent) }
+        let events = await attention.delivery.events
+        XCTAssertEqual(events.map(\.key), [key])
+        XCTAssertEqual(events.first?.content, .turnCompleted(finalAssistantText: "Scheduled answer"))
+    }
+
+    /// A remote child materialized by the production projection records its local parent, so its
+    /// lineage is depth 1 and it is not an attention root. This exercises the local terminal-commit
+    /// and `askUser` authorities on the projected record only; real remote event dispatch
+    /// (`applyRunState`) is not covered here. Neither its completion nor its question is admitted.
+    func testProjectedRemoteChildCompletionAndQuestionAreNeverAdmitted() async throws {
+        let storageURL = try makeTemporaryStore()
+        let parentTabID = UUID()
+        let parentSessionID = UUID()
+        let workspace = makeStoreWorkspace(
+            storageURL,
+            composeTabs: [ComposeTabState(id: parentTabID, name: "Remote parent", activeAgentSessionID: parentSessionID)]
+        )
+        let vm = makeStoreViewModel(windowID: 5531, storageURL: storageURL)
+        let wired = wireWorkspace(vm, workspace: workspace)
+        let attention = installAdmission(on: vm)
+        let parent = try await vm.ensureSessionReady(tabID: parentTabID)
+        let parentBinding = AgentSessionRemoteHostBinding(
+            hostID: "host-attention",
+            hostDisplayName: "Studio Mac",
+            remoteSessionID: UUID().uuidString
+        )
+        parent.remoteHost = parentBinding
+        XCTAssertEqual(vm.mcpDelegationLineage(for: parent), .resolved(depth: 0))
+
+        let childRemoteID = UUID()
+        let materialized = await vm.materializeRemoteChildSession(
+            RemoteAgentSessionDescriptor(
+                sessionID: childRemoteID.uuidString,
+                name: "Remote worker",
+                stateRaw: "idle",
+                agentKindRaw: AgentProviderKind.codexExec.rawValue,
+                parentSessionID: parentBinding.remoteSessionID
+            ),
+            parentSession: parent,
+            parentRemoteHost: parentBinding
+        )
+        let child = try XCTUnwrap(materialized)
+        XCTAssertEqual(child.activeAgentSessionID, childRemoteID)
+        XCTAssertEqual(child.parentSessionID, parentSessionID, "The projection records the local parent")
+        XCTAssertEqual(vm.mcpDelegationLineage(for: child), .resolved(depth: 1))
+        XCTAssertFalse(vm.isAttentionNotificationRoot(child))
+        XCTAssertEqual(vm.delegatedQuestionAudience(for: child, provenance: .unverified), .user)
+
+        // A question during the turn, then the turn completes. The terminal commit cancels the
+        // pending question locally, so no remote-host response path is involved.
+        let ownership = beginTurn(child, user: "remote", assistant: "Remote child answer")
+        let interaction = makeInteraction(timeoutSeconds: 60)
+        let task = Task { try await vm.askUser(tabID: child.tabID, interaction: interaction) }
+        let record = try await waitForRecord(
+            attention.admission,
+            .question(sessionID: childRemoteID, interactionID: interaction.id)
+        )
+        XCTAssertEqual(record, .suppressed(.ineligibleSession))
+
+        _ = await vm.test_terminalCommitBarrier().commit(completedRequest(child, ownership))
+        XCTAssertEqual(
+            attention.admission.records[.turnCompleted(sessionID: childRemoteID, attemptID: ownership.attemptID)],
+            .suppressed(.ineligibleSession)
+        )
+        do {
+            _ = try await task.value
+            XCTFail("The terminal commit cancels the pending question")
+        } catch is CancellationError {}
+        let attempts = await attention.delivery.events.count
+        XCTAssertEqual(attempts, 0)
+        withExtendedLifetime(wired) {}
+    }
+
     // MARK: - Helpers
 
     private struct Fixture {
@@ -802,7 +1028,7 @@ final class AttentionNotificationAdmissionTests: XCTestCase {
     @discardableResult
     private func beginTurn(
         _ session: AgentModeViewModel.TabSession,
-        user: String,
+        user: String?,
         assistant: String?
     ) -> AgentRunOwnership {
         if session.runID == nil {
@@ -810,7 +1036,9 @@ final class AttentionNotificationAdmissionTests: XCTestCase {
         }
         session.runState = .running
         let ownership = session.beginRunAttempt(source: "test.attention")
-        session.appendItem(.user(user, sequenceIndex: session.nextSequenceIndex))
+        if let user {
+            session.appendItem(.user(user, sequenceIndex: session.nextSequenceIndex))
+        }
         if let assistant {
             session.appendItem(.assistant(assistant, sequenceIndex: session.nextSequenceIndex))
         }
@@ -920,6 +1148,77 @@ final class AttentionNotificationAdmissionTests: XCTestCase {
         )
         manager.workspaces = workspaces
         return (manager, prompt)
+    }
+
+    /// Stub-delivery admission on a view model built by a production-path fixture.
+    private func installAdmission(
+        on vm: AgentModeViewModel
+    ) -> (admission: AttentionNotificationAdmission, delivery: StubDelivery) {
+        let delivery = StubDelivery(mode: .succeed)
+        let admission = AttentionNotificationAdmission(environment: .init(
+            delivery: delivery,
+            idleSeconds: { nil },
+            beforeAdmission: { _ in }
+        ))
+        admission.setEnabled(true)
+        vm.attentionNotificationAdmission = admission
+        addTeardownBlock { @MainActor in
+            for (tabID, session) in vm.sessions {
+                if let interactionID = session.pendingAskUser?.interaction.id {
+                    vm.skipAskUser(tabID: tabID, interactionID: interactionID)
+                }
+            }
+        }
+        return (admission, delivery)
+    }
+
+    private func makeTemporaryStore() throws -> URL {
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("AttentionNotificationAdmissionTests", isDirectory: true)
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+        addTeardownBlock {
+            try? FileManager.default.removeItem(at: url)
+        }
+        return url
+    }
+
+    private func makeStoreWorkspace(_ storageURL: URL, composeTabs: [ComposeTabState] = []) -> WorkspaceModel {
+        WorkspaceModel(
+            name: "Attention Store",
+            repoPaths: [storageURL.path],
+            customStoragePath: storageURL,
+            ephemeralFlag: true,
+            composeTabs: composeTabs,
+            activeComposeTabID: composeTabs.first?.id
+        )
+    }
+
+    private func makeStoreViewModel(windowID: Int, storageURL: URL) -> AgentModeViewModel {
+        AgentModeViewModel(
+            testWindowID: windowID,
+            testWorkspacePath: storageURL.path,
+            testWorkspaceDirectory: storageURL,
+            codexControllerFactory: { _, _, _, _, _, _ in
+                LifecycleNoopCodexController(recorder: LifecycleRecorder())
+            }
+        )
+    }
+
+    private struct WiredWorkspace {
+        let manager: WorkspaceManagerViewModel
+        let prompt: PromptViewModel
+    }
+
+    /// Active workspace, compose tabs, and persistence target wired as a window would.
+    private func wireWorkspace(_ vm: AgentModeViewModel, workspace: WorkspaceModel) -> WiredWorkspace {
+        let (manager, prompt) = makeWorkspaceManager(workspaces: [workspace])
+        prompt.attachWorkspaceManager(manager)
+        manager.activeWorkspace = workspace
+        prompt.loadComposeTabsFromWorkspace(workspace)
+        vm.test_setSidebarAutoArchiveDependencies(promptManager: prompt, workspaceManager: manager)
+        vm.test_establishPersistenceWorkspace(workspace)
+        return WiredWorkspace(manager: manager, prompt: prompt)
     }
 
     private func makeInteraction(timeoutSeconds: TimeInterval) -> AgentAskUserInteraction {

@@ -94,6 +94,17 @@ Slice 4 result: Paced queued admission passed 29 stub tests after the new covera
 
 Review follow-up: Added post-admission credential-retention and snapshot-redaction tests without changing reviewed production behavior, so no round was run solely for P2/P3; the final accepted test ticket waited 22 minutes 36 seconds for another worktree's heavy slot and then passed in 13.4 seconds, not a delivery-latency measurement.
 
+### Slice 5
+Prove eligible restored, handoff and scheduled roots and ineligible projected children using existing production paths, and reproduce the selected-follow-up-abort gap before choosing a repair; budget used so far: about four hours elapsed, three committed source slices and five scoped worker sessions.
+
+Step 5 — done | rounds 0/2 | open: none | downgraded: none | assumed: temporary-store and stub-provider integration is not live app acceptance; no lineage, question audience or terminal-order changes | deferred: R1 experiment did not reproduce pre-ownership abort because availability changed before the queued start; projected-child lineage proof uses local authorities, while actual remote event dispatch bypasses capture; remote-root classification/coverage remains unresolved; duplicated fixture helper and older fixture test ID retained (B S5-6/7); follow-up repair only after a stable reproduction; settings and live wiring, phone acceptance
+
+Budget used so far: about five hours elapsed including review and shared-slot waits, four completed code/test slices and six scoped worker sessions, reusing the Pair worker for fixes; no real sends, secure-store access or app lifecycle actions.
+
+Slice 5 result: Four production-construction tests added six notification scenarios and passed the 20-test admission suite plus lint and executable discovery after scope/branch assertions were tightened, but the attempted unavailable-provider experiment actually started its follow-up and did not reproduce abandonment, so the next slice resolves that experiment and remote-event authority before live wiring (evidence: `slice-5-fixes-admission-run-1.txt`, `slice-5-fixes-lint.txt`, `slice-5-dev-test-list-full.txt`, `slice-5-r1-experiment-raw.txt`, `slice-5-oracleA-initial.md`, `slice-5-oracleB-initial.md`).
+
+Review follow-up: Both lanes cleared P0/P1, cheap coverage and wording findings were fixed without production changes or a round solely for P2/P3, and the shared data service's hydration path was confirmed to read/decode the session file rather than serve a transcript cache; the test remains a second view model in one process, not live app cold-start acceptance (evidence: `slice-5-parent-restore-authority.txt`).
+
 ## Decisions
 - Commit signing: permit unsigned local commits for this contract after the Slice 4 1Password failure; owner will arrange later amendment/re-signing at the desk, with separate history-rewrite approval at that action boundary (owner answer 2026-10-10).
 - Review recovery (Slice 2): authorize one additional fresh, bounded OracleB retry after the initial reply and normal retry omitted findings and a complete verdict (owner answer 2026-10-10).
