@@ -408,6 +408,17 @@ Decisions: the session index store's delegate call that built the sidebar restor
 
 Step 5s — done | rounds 0/2 | open: | downgraded: | assumed: | deferred:
 
+#### Step 5t — agent CLI launch failures reach Sentry through an installed recorder
+Intent: the Cursor, OpenCode and OMP launch resolvers record path-resolution failures through a helper that calls App's Sentry bootstrap directly with a Sentry provider-kind type. So have the helper take the agent provider kind and pass a plain failure value to a recorder that App installs right after starting telemetry, with the Sentry breadcrumb and counter moved verbatim into an App extension, so event names, attributes and enablement stay the same.
+
+Budget used: about 1 hour (cumulative ~41.5 hours).
+
+Result: the Cursor, OpenCode and OMP launch resolvers now report path-resolution failures as a plain agent value to a recorder that App installs right after starting telemetry, App's Sentry extension records the same breadcrumb and counter, and no agent file names Sentry. Build, format, lint and the three resolver suites (66 tests) pass. OracleA found nothing. OracleB's P2 asked for proof that the provider-kind mapping is unchanged; the existing initializer maps each kind to its same-named case, and that is now in evidence.
+
+Decisions: an installed recorder hook, as in Step 4b, rather than threading a closure through every resolver constructor; the second telemetry start site is the runtime consent toggle, which runs after the hook is installed. The agent perf diagnostics' baseline inventory names App types only inside strings, so it joins AgentCore with the perf diagnostics without a code change. At the cut, App will need `package` access to the recorder hook, `AgentCLIPathResolutionFailure` and its three properties, and `AgentProviderKind`.
+
+Step 5t — done | rounds 0/2 | open: | downgraded: | assumed: | deferred:
+
 ### Slice 6 — `RepoPromptAgentCore` extraction
 Move the now-acyclic AI, agent models, providers, runtime, services, history, recommendations and non-UI remote-host code. Remove the temporary typealiases. Check the release compile flags once for cross-module optimization; don't change them.
 

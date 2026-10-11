@@ -28,28 +28,26 @@ enum AgentCLILaunchDiagnostics {
         return "\(message) \(hint)"
     }
 
+    /// Set once by App composition at launch, before any resolver runs; records nothing when unset.
+    nonisolated(unsafe) static var pathResolutionFailureRecorder: ((AgentCLIPathResolutionFailure) -> Void)?
+
     static func recordPathResolutionFailure(
-        providerKind: SentryTelemetryBootstrap.ProviderKind,
+        providerKind: AgentProviderKind,
         shellEnvironmentSource: ShellEnvironmentSource?,
         candidateCount: Int
     ) {
-        SentryTelemetryBootstrap.addBreadcrumb(
-            .cliPath,
-            action: .cliPathResolutionFailed,
-            attributes: [
-                .providerKind(providerKind),
-                .shellEnvironmentSource(shellEnvironmentSource),
-                .resultCount(candidateCount),
-                .outcome(.failed)
-            ]
-        )
-        SentryTelemetryBootstrap.increment(
-            .cliPathResolutionFailures,
-            attributes: [
-                .providerKind(providerKind),
-                .shellEnvironmentSource(shellEnvironmentSource),
-                .resultCount(candidateCount)
-            ]
+        pathResolutionFailureRecorder?(
+            AgentCLIPathResolutionFailure(
+                providerKind: providerKind,
+                shellEnvironmentSource: shellEnvironmentSource,
+                candidateCount: candidateCount
+            )
         )
     }
+}
+
+struct AgentCLIPathResolutionFailure {
+    let providerKind: AgentProviderKind
+    let shellEnvironmentSource: ShellEnvironmentSource?
+    let candidateCount: Int
 }

@@ -77,6 +77,7 @@ struct RepoPromptSwiftUIApp: App {
         }
 
         SentryTelemetryBootstrap.start()
+        AgentCLILaunchDiagnostics.pathResolutionFailureRecorder = SentryTelemetryBootstrap.recordAgentCLIPathResolutionFailure
 
         // Bind UI-facing settings to the persisted store before any scene or window work.
         // Kept after telemetry start so the settings store's first load stays where it was.
