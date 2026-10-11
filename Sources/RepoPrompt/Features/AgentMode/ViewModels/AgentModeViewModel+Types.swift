@@ -13,15 +13,6 @@ enum AgentSidebarThreadKey: Hashable, Equatable {
     }
 }
 
-@MainActor
-protocol AgentModeRunInteractionStateObserving: AnyObject {
-    func agentModeViewModel(
-        _ viewModel: AgentModeViewModel,
-        didChangeRunInteractionStateFor session: AgentModeViewModel.TabSession,
-        reason: AgentModeViewModel.RunInteractionStateChangeReason
-    )
-}
-
 extension AgentModeViewModel {
     typealias TabSession = AgentTabSession
 
@@ -95,11 +86,7 @@ extension AgentModeViewModel {
 
     typealias AgentInteractionTransport = RepoPromptApp.AgentInteractionTransport
 
-    enum UIRefreshScope: String, Equatable, Hashable {
-        case full
-        case transcriptRuntime
-        case runtimeMetrics
-    }
+    typealias UIRefreshScope = AgentUIRefreshScope
 
     struct AssistantPresentationRequest: Equatable {
         let tabID: UUID

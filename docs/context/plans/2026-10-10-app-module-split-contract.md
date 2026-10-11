@@ -386,6 +386,17 @@ Decisions: `MCPServerViewModel.swift` is now a third typealias site to remove at
 
 Step 5q — done | rounds 0/2 | open: | downgraded: | assumed: | deferred:
 
+#### Step 5r — Codex and Claude coordinators reach the view model through `AgentSessionHost`
+Intent: the Codex and Claude coordinators hold the App view model weakly and call about 40 of its members, all expressible in agent types, and the Codex coordinator observes run-interaction changes through an App protocol whose view-model parameter it ignores. So declare `@MainActor` host protocols in agent code (a shared `AgentSessionHost` plus one per coordinator, listing only the members each calls), have the view model conform in App, move the observer protocol to agent code with a host-typed parameter, and type the coordinators' references by protocol, with the same calls, arguments and ordering, and no behavior change.
+
+Budget used: about 1.5 hours (cumulative ~39 hours).
+
+Result: the Codex and Claude coordinators now reach the view model only through agent host protocols. `AgentSessionHost` holds the 4 shared members, and the Codex and Claude protocols hold 25 and 7 more, with three small extensions repeating the view model's default arguments. The view model conforms in a one-line App file. The run-interaction observer protocol and the UI refresh scope enum moved to agent code. Build, format, lint and the 10 affected suites (341 tests) pass. Across the agent seed, only the changes-panel environment still names the view model. OracleA found nothing. OracleB's P2 asked where each protocol signature type lives; all are agent types, so nothing changed.
+
+Decisions: the coordinators keep the `viewModel` property name and the `attach(viewModel:)` label, so no call expression changed. The changes-panel live environment and the transcript preview link resolver are used only by App views and view models, so they stay in App at the cut. The oracle-review context type in the Codex protocol comes from a file the coordinator already used, and that file's prompt-packaging tie belongs to the packaging seam, which is still to do.
+
+Step 5r — done | rounds 0/2 | open: | downgraded: | assumed: | deferred: OracleB P3-2 (rename `viewModel`/`attach(viewModel:)`/observer method to host terms, or drop the unused observer parameter) and P3-3 (inject `providerBindingService` into the Claude coordinator) to Slice 6
+
 ### Slice 6 — `RepoPromptAgentCore` extraction
 Move the now-acyclic AI, agent models, providers, runtime, services, history, recommendations and non-UI remote-host code. Remove the temporary typealiases. Check the release compile flags once for cross-module optimization; don't change them.
 

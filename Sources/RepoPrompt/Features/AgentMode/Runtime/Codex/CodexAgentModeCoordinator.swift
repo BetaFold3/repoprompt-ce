@@ -246,7 +246,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             || session.codexAnonymousActiveTurn?.turnKind == .compact
     }
 
-    private weak var viewModel: AgentModeViewModel?
+    private weak var viewModel: (any CodexAgentModeCoordinatorHost)?
     private var terminalCommitBarrier: AgentRunTerminalCommitBarrier?
     private var toolTrackingByTabID: [UUID: AgentToolTrackingController] = [:]
     #if DEBUG
@@ -462,7 +462,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         }
     }
 
-    func attach(viewModel: AgentModeViewModel) {
+    func attach(viewModel: any CodexAgentModeCoordinatorHost) {
         self.viewModel = viewModel
     }
 
@@ -8303,7 +8303,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
     }
 
     func agentModeViewModel(
-        _ viewModel: AgentModeViewModel,
+        _ viewModel: any AgentSessionHost,
         didChangeRunInteractionStateFor session: AgentTabSession,
         reason: AgentRunInteractionStateChangeReason
     ) {

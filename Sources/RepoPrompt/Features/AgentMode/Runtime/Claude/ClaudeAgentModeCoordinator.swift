@@ -125,7 +125,7 @@ final class ClaudeAgentModeCoordinator {
     private static let logger = Logger(subsystem: "com.repoprompt.agents", category: "ClaudeSteering")
     private static let flagSettingsLogger = Logger(subsystem: "com.repoprompt.agents", category: "ClaudeFlagSettings")
 
-    private weak var viewModel: AgentModeViewModel?
+    private weak var viewModel: (any ClaudeAgentModeCoordinatorHost)?
     private let windowID: Int
     private let workspacePathProvider: (AgentTabSession) throws -> String?
     private let claudeControllerFactory: ClaudeControllerFactory
@@ -248,7 +248,7 @@ final class ClaudeAgentModeCoordinator {
         return true
     }
 
-    func attach(viewModel: AgentModeViewModel) {
+    func attach(viewModel: any ClaudeAgentModeCoordinatorHost) {
         self.viewModel = viewModel
     }
 
