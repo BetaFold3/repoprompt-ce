@@ -254,6 +254,17 @@ Decisions: suite selection now also matches test classes declared inside `#if DE
 
 Step 5e — done | rounds 0/2 | open: | downgraded: | assumed: | deferred: OracleB P3-1 — `normalizedToolCardName` still calls `MCPIntegrationHelper.canonicalRepoPromptToolName`; the MCP split must place that name lookup at agent level
 
+#### Step 5f — app actions split out of `MCPIntegrationHelper`
+Intent: agent code uses `MCPIntegrationHelper` in 24 files for tool-name canonicalization and provider MCP configuration, and the helper's only App ties are the deep-link installers (`NSWorkspace`), the clipboard copy (`NSPasteboard`) and the `CLIPathInstaller` forwarders, so move those into an App extension file and drop AppKit from the helper, with no behavior change.
+
+Budget used: about 0.5 hours (cumulative ~23 hours).
+
+Result: `MCPIntegrationHelper+AppActions.swift` now holds the two deep-link installers, the clipboard copy and the 12 command-line forwarders, and the helper imports only Foundation and AgentCore. A move check leaves only imports, the extension wrapper and one `private` → internal relaxation. Build, format, lint and 9 affected suites (110 tests, 0 failures) pass, and both reviewers found nothing above P3. The next step handles the MCP leases and the server hosting interface.
+
+Decisions: the new extension file stays in App at the cut, so the helper members it uses (`mcpConfigDict`, `repoPromptMCPConfiguration`, `jsonSnippet`, `setMCPServerInstalled`) will need `package` access then; `setMCPServerInstalled` stays in the helper because the helper's own installers call it.
+
+Step 5f — done | rounds 0/2 | open: | downgraded: | assumed: | deferred:
+
 ### Slice 6 — `RepoPromptAgentCore` extraction
 Move the now-acyclic AI, agent models, providers, runtime, services, history, recommendations and non-UI remote-host code. Remove the temporary typealiases. Check the release compile flags once for cross-module optimization; don't change them.
 
