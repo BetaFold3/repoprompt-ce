@@ -463,6 +463,15 @@ Decisions: `AgentRunOracleReviewContext.swift` stays in App with prompt packagin
 
 Step 5x — done | rounds 0/2 | open: | downgraded: | assumed: | deferred:
 
+#### Step 5y — Slice 5 gates
+Intent: run the slice-end gates on the Step 5x tree.
+
+Budget used: about 1 hour of machine time (cumulative ~45.7 hours).
+
+Result: the slice-end gates on the Step 5x tree pass (6464 identical test names, unchanged ledger, guardrails failing only on A1, Xcode checks and the universal release build passing, and full-suite failures that either match the Step 4d baseline, pass when rerun alone, or fail identically on the pre-split baseline `f457e535`), so Slice 5 is complete and Slice 6 follows.
+
+Step 5y — done | rounds 0/2 | open: | downgraded: | assumed: A1 | deferred:
+
 ### Slice 6 — `RepoPromptAgentCore` extraction
 Move the now-acyclic AI, agent models, providers, runtime, services, history, recommendations and non-UI remote-host code. Remove the temporary typealiases. Check the release compile flags once for cross-module optimization; don't change them.
 
