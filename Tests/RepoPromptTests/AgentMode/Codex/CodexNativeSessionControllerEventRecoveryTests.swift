@@ -966,7 +966,8 @@ final class CodexNativeSessionControllerEventRecoveryTests: XCTestCase {
             runID: UUID(),
             tabID: UUID(),
             windowID: 1,
-            workspacePath: nil
+            workspacePath: nil,
+            options: .agentModeDefault(forceExperimentalSteering: false, goalSupportEnabledProvider: { CodexGoalSupport.isEnabled })
         )
 
         let started = try XCTUnwrap(controller.test_parseToolLifecycleEvent(
@@ -1596,7 +1597,8 @@ final class CodexNativeSessionControllerEventRecoveryTests: XCTestCase {
             runID: UUID(),
             tabID: UUID(),
             windowID: 1,
-            workspacePath: nil
+            workspacePath: nil,
+            options: .agentModeDefault(forceExperimentalSteering: false, goalSupportEnabledProvider: { CodexGoalSupport.isEnabled })
         )
     }
 

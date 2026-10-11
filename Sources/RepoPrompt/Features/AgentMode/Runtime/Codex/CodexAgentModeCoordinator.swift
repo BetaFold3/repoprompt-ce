@@ -391,6 +391,11 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
     }
 
     private let preferenceDefaults: UserDefaults
+    private let computerUseEnabled: @MainActor () -> Bool
+    private let goalSupportEnabled: @MainActor () -> Bool
+    private let reasoningSummariesEnabled: @MainActor () -> Bool
+    private let showBuiltInWorkflowCleanupGuidance: @MainActor () -> Bool
+    private let globalCodeMapsDisabled: @MainActor () -> Bool
 
     init(
         windowID: Int,
@@ -400,6 +405,11 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         shouldManageCodexTooling: Bool,
         runCoordinator: AgentRunCoordinator,
         authRecovery: any CodexManagedAuthRecovering,
+        computerUseEnabled: @escaping @MainActor () -> Bool,
+        goalSupportEnabled: @escaping @MainActor () -> Bool,
+        reasoningSummariesEnabled: @escaping @MainActor () -> Bool,
+        showBuiltInWorkflowCleanupGuidance: @escaping @MainActor () -> Bool,
+        globalCodeMapsDisabled: @escaping @MainActor () -> Bool,
         activeToolQuery: @escaping ActiveToolQuery = { _ in false },
         activeAgentRunWaitQuery: @escaping ActiveAgentRunWaitQuery = { _ in false },
         activeAgentRunWaitDrain: @escaping ActiveAgentRunWaitDrain = { _, _ in .drained },
@@ -421,6 +431,11 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         self.shouldManageCodexTooling = shouldManageCodexTooling
         self.runCoordinator = runCoordinator
         self.authRecovery = authRecovery
+        self.computerUseEnabled = computerUseEnabled
+        self.goalSupportEnabled = goalSupportEnabled
+        self.reasoningSummariesEnabled = reasoningSummariesEnabled
+        self.showBuiltInWorkflowCleanupGuidance = showBuiltInWorkflowCleanupGuidance
+        self.globalCodeMapsDisabled = globalCodeMapsDisabled
         self.activeToolQuery = activeToolQuery
         self.activeAgentRunWaitQuery = activeAgentRunWaitQuery
         self.activeAgentRunWaitDrain = activeAgentRunWaitDrain
@@ -1534,7 +1549,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             if session.permissionProfile == .mcpSafeDefaults {
                 return CodexComputerUseWorkflow.safeManagedDisabledMessage
             }
-            guard CodexComputerUseWorkflow.isEnabled else {
+            guard computerUseEnabled() else {
                 return CodexComputerUseWorkflow.disabledMessage
             }
             guard !runState.isActive || runState == .waitingForUser else {
@@ -1542,7 +1557,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             }
             return nil
         case .goal:
-            guard CodexGoalSupport.isEnabled else {
+            guard goalSupportEnabled() else {
                 return CodexGoalSupport.disabledMessage
             }
             if runState.isActive,
@@ -1681,7 +1696,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 let goal = try await controller.setThreadGoalStatus(.active)
                 return .succeeded("Resumed Codex goal: \(Self.shortObjective(goal.objective))")
             case let .setObjective(objective):
-                let includeBuiltInCleanupGuidance = GlobalSettingsStore.shared.showBuiltInWorkflowCleanupGuidance()
+                let includeBuiltInCleanupGuidance = showBuiltInWorkflowCleanupGuidance()
                 let composition: GoalObjectiveComposition
                 switch Self.composeGoalObjective(
                     rawObjective: objective,
@@ -2901,9 +2916,9 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         case .compact:
             !session.runState.isActive && hasKnownCodexThread(session)
         case .goal:
-            CodexGoalSupport.isEnabled
+            goalSupportEnabled()
         case .computerUse:
-            CodexComputerUseWorkflow.isEnabled
+            computerUseEnabled()
         }
     }
 
@@ -4233,9 +4248,9 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             await failCodexStartupForWorkspaceResolution(session: session, error: error)
             return
         }
-        let wantsGoalSupport = session.profile == .standard && CodexGoalSupport.isEnabled
-        let wantsReasoningSummaries = CodexReasoningSummaries.isEnabled
-        let codexComputerUseFeatureEnabled = CodexComputerUseWorkflow.isEnabled
+        let wantsGoalSupport = session.profile == .standard && goalSupportEnabled()
+        let wantsReasoningSummaries = reasoningSummariesEnabled()
+        let codexComputerUseFeatureEnabled = computerUseEnabled()
         let permissionProfileAllowsComputerUse = session.permissionProfile != .mcpSafeDefaults
         if !codexComputerUseFeatureEnabled
             || session.profile == .knowledge
@@ -4503,7 +4518,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         let basePrompt = SystemPromptService.agentModePrompt(
             agentKind: .codexExec,
             taskLabelKind: session.mcpControlContext?.taskLabelKind,
-            codeMapsDisabled: GlobalSettingsStore.shared.globalCodeMapsDisabled(),
+            codeMapsDisabled: globalCodeMapsDisabled(),
             sessionProfile: session.profile,
             delegationAudience: (viewModel?.mcpDelegationRunToolPolicy(for: session) ?? .leaf).promptAudience
         )

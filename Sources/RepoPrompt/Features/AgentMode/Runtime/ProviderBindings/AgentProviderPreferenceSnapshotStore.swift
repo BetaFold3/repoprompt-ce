@@ -51,16 +51,23 @@ final class AgentProviderPreferenceSnapshotStore {
     let securePermissions: AgentPermissionSecureStore?
 
     private let codexMCPServerEntriesProvider: CodexMCPServerEntriesProvider
+    private let codexBooleanPreferenceIsEnabled: @MainActor (CodexAgentModeBooleanPreference) -> Bool
+    private let codexBooleanPreferenceSetEnabled: @MainActor (CodexAgentModeBooleanPreference, Bool) -> Void
     private var revisionByProviderID: [AgentProviderBindingID: Int]
 
+    /// The two Codex preference closures must read and write the store that `defaults` names.
     init(
-        defaults: UserDefaults = .standard,
-        securePermissions: AgentPermissionSecureStore? = nil,
-        codexMCPServerEntries: @escaping CodexMCPServerEntriesProvider = { MCPIntegrationHelper.codexMCPServerEntries() }
+        defaults: UserDefaults,
+        securePermissions: AgentPermissionSecureStore?,
+        codexMCPServerEntries: @escaping CodexMCPServerEntriesProvider,
+        codexBooleanPreferenceIsEnabled: @escaping @MainActor (CodexAgentModeBooleanPreference) -> Bool,
+        codexBooleanPreferenceSetEnabled: @escaping @MainActor (CodexAgentModeBooleanPreference, Bool) -> Void
     ) {
         self.defaults = defaults
         self.securePermissions = securePermissions ?? (defaults === UserDefaults.standard ? AgentPermissionSecureStore.shared : nil)
         codexMCPServerEntriesProvider = codexMCPServerEntries
+        self.codexBooleanPreferenceIsEnabled = codexBooleanPreferenceIsEnabled
+        self.codexBooleanPreferenceSetEnabled = codexBooleanPreferenceSetEnabled
         revisionByProviderID = Dictionary(uniqueKeysWithValues: AgentProviderBindingID.allCases.map { ($0, 0) })
     }
 
@@ -213,11 +220,11 @@ final class AgentProviderPreferenceSnapshotStore {
         case let .searchTool(enabled):
             CodexAgentToolPreferences.setSearchToolEnabled(enabled, defaults: defaults)
         case let .computerUse(enabled):
-            CodexAgentModeBooleanPreference.computerUse.setEnabled(enabled, defaults: defaults)
+            codexBooleanPreferenceSetEnabled(.computerUse, enabled)
         case let .goalSupport(enabled):
-            CodexAgentModeBooleanPreference.goalSupport.setEnabled(enabled, defaults: defaults)
+            codexBooleanPreferenceSetEnabled(.goalSupport, enabled)
         case let .reasoningSummaries(enabled):
-            CodexAgentModeBooleanPreference.reasoningSummaries.setEnabled(enabled, defaults: defaults)
+            codexBooleanPreferenceSetEnabled(.reasoningSummaries, enabled)
         case let .mcpServer(normalizedName, enabled):
             CodexAgentToolPreferences.setMCPServerEnabled(
                 normalizedName: normalizedName,
@@ -718,15 +725,15 @@ final class AgentProviderPreferenceSnapshotStore {
     }
 
     private func codexComputerUseEnabled() -> Bool {
-        CodexAgentModeBooleanPreference.computerUse.isEnabled(defaults: defaults)
+        codexBooleanPreferenceIsEnabled(.computerUse)
     }
 
     private func codexGoalSupportEnabled() -> Bool {
-        CodexAgentModeBooleanPreference.goalSupport.isEnabled(defaults: defaults)
+        codexBooleanPreferenceIsEnabled(.goalSupport)
     }
 
     private func codexReasoningSummariesEnabled() -> Bool {
-        CodexAgentModeBooleanPreference.reasoningSummaries.isEnabled(defaults: defaults)
+        codexBooleanPreferenceIsEnabled(.reasoningSummaries)
     }
 
     private func claudeEffortLevel(

@@ -323,9 +323,20 @@ Step 5k — done | rounds 0/2 | open: | downgraded: | assumed: | deferred: `Code
 #### Step 5l — Codex and Claude settings reads injected
 Intent: the Codex and Claude coordinators, the Codex native session controller default and the provider preference snapshot store read `GlobalSettingsStore` directly or through the settings-backed Codex accessors, so move those accessors and the standard-defaults routing of `CodexAgentModeBooleanPreference` into App extensions, and give the consumers synchronous `@MainActor` closures that App supplies and calls exactly where the old reads happened, with no behavior change.
 
-Budget used: about 0 hours so far (cumulative ~30 hours).
+Budget used: about 1.5 hours (cumulative ~31.5 hours).
 
-Step 5l — doing | rounds 0/2 | open: | downgraded: | assumed: | deferred:
+Result: agent code no longer reads `GlobalSettingsStore` or the settings-backed Codex accessors. The accessors and the preference routing moved verbatim into App files (`Features/Settings/Models/CodexSettingsAccessors.swift`, `AgentProviderPreferences+AppComposition.swift`). The Codex coordinator now takes five settings closures, the Claude coordinator one, and the snapshot store two, all supplied by App and called at the old read points. The Codex session controller now requires explicit options. Build, format, lint and the 50 affected suites pass. One run had the same intermittent lifecycle failure as Steps 5c and 5i, and it passed alone and in a full rerun. Neither reviewer found anything above P2. The P2's scan found five more coordinator reads, which were fixed. The next step injects the per-model overrides that the chat providers read through `AIModel`.
+
+Decisions: plain closures rather than a settings protocol, following an OracleA plan consult, because these are separate reads, not orchestration. The snapshot store keeps its old three-argument call shape through an App convenience init, so its 16 construction sites are unchanged. The Codex session controller now requires `options` and no longer takes `forceExperimentalSteering`, which no caller passed. The five sites that relied on its fallback now pass the same options explicitly. Precondition message text that mentions `GlobalSettingsStore` was left unchanged.
+
+Step 5l — done | rounds 0/2 | open: | downgraded: | assumed: | deferred: OracleB P3-1 (shared closure helpers) and P3-2 (fallback-options test helper) declined
+
+#### Step 5m — per-model overrides injected into chat providers
+Intent: `AIModel.canStream`, `AIModel.usesResponsesAPI` and `AIMessage.effectiveTemperature` read the App-owned `ModelOverridesSettings.shared`, and their only agent-code callers are the API chat providers, the queries service and the OpenAI configured-model projection. So keep `ModelOverridesSettings` in App, give those members explicit-override core forms with App convenience wrappers keeping today's signatures, and inject a narrow override reader that App supplies, so each caller reads the same override at the same point, with no behavior change.
+
+Budget used: about 0 hours so far (cumulative ~31.5 hours).
+
+Step 5m — doing | rounds 0/2 | open: | downgraded: | assumed: | deferred:
 
 ### Slice 6 — `RepoPromptAgentCore` extraction
 Move the now-acyclic AI, agent models, providers, runtime, services, history, recommendations and non-UI remote-host code. Remove the temporary typealiases. Check the release compile flags once for cross-module optimization; don't change them.

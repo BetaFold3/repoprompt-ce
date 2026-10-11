@@ -135,6 +135,7 @@ final class ClaudeAgentModeCoordinator {
     private let hasActiveMCPTools: MCPActiveToolQuery
     private let hasActiveChildAgentRunWaits: ActiveAgentRunWaitQuery
     private let steeringInterruptSafePointTimeoutSeconds: TimeInterval
+    private let globalCodeMapsDisabled: @MainActor () -> Bool
     private var interruptedTurnSettlementTimeoutSeconds: TimeInterval = 5.0
 
     /// Per-tab tool tracking handler for Claude sessions.
@@ -167,6 +168,7 @@ final class ClaudeAgentModeCoordinator {
         windowID: Int,
         workspacePathProvider: @escaping (AgentTabSession) throws -> String?,
         mcpHost: any AgentMCPHosting,
+        globalCodeMapsDisabled: @escaping @MainActor () -> Bool,
         claudeControllerFactory: ClaudeControllerFactory? = nil,
         awaitNoActiveMCPTools: MCPToolIdleWaiter? = nil,
         toolEndedCount: @escaping MCPToolEndedCountProvider = { _ in 0 },
@@ -191,6 +193,7 @@ final class ClaudeAgentModeCoordinator {
         self.hasActiveMCPTools = hasActiveMCPTools
         self.hasActiveChildAgentRunWaits = hasActiveChildAgentRunWaits
         self.steeringInterruptSafePointTimeoutSeconds = steeringInterruptSafePointTimeoutSeconds
+        self.globalCodeMapsDisabled = globalCodeMapsDisabled
     }
 
     private static func makeDefaultController(
@@ -2597,7 +2600,7 @@ final class ClaudeAgentModeCoordinator {
         SystemPromptService.agentModePrompt(
             agentKind: session.selectedAgent,
             taskLabelKind: session.mcpControlContext?.taskLabelKind,
-            codeMapsDisabled: GlobalSettingsStore.shared.globalCodeMapsDisabled(),
+            codeMapsDisabled: globalCodeMapsDisabled(),
             sessionProfile: session.profile,
             delegationAudience: (viewModel?.mcpDelegationRunToolPolicy(for: session) ?? .leaf).promptAudience
         )

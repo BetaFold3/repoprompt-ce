@@ -338,6 +338,7 @@ final class CodexNativeSessionControllerTurnDispatchTests: XCTestCase {
             tabID: UUID(),
             windowID: 1,
             workspacePath: "/tmp/workspace",
+            options: .agentModeDefault(forceExperimentalSteering: false, goalSupportEnabledProvider: { CodexGoalSupport.isEnabled }),
             requestExecutor: { method, params, timeout in
                 try recorder.handle(method: method, params: params, timeout: timeout)
             }

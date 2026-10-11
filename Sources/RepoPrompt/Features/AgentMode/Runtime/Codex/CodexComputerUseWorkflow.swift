@@ -93,11 +93,6 @@ private enum CodexNativeFeatureGate: Hashable {
 enum CodexGoalSupport {
     static let disabledMessage = "Codex goal support is turned off. Re-enable Codex Goals in settings or set app_settings key 'agent_mode.codex_goal_support_enabled' to true to use /goal."
 
-    @MainActor
-    static var isEnabled: Bool {
-        GlobalSettingsStore.shared.codexGoalSupportEnabled()
-    }
-
     static func isEnabled(defaults: UserDefaults) -> Bool {
         CodexNativeFeatureGate.goals.isEnabled(defaults: defaults)
     }
@@ -132,11 +127,6 @@ enum CodexComputerUseWorkflow {
     static let commandName = "computer-use"
     static let disabledMessage = "Codex computer use is turned off. Enable Codex Computer Use in settings or set app_settings key 'agent_mode.codex_computer_use_enabled' to true to use /computer-use."
     static let safeManagedDisabledMessage = "/computer-use isn't available in Safe Managed (MCP-initiated) Codex sessions."
-
-    @MainActor
-    static var isEnabled: Bool {
-        GlobalSettingsStore.shared.codexComputerUseEnabled()
-    }
 
     static func isEnabled(defaults: UserDefaults) -> Bool {
         precondition(

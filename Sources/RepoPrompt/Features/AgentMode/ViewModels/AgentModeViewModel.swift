@@ -2314,6 +2314,11 @@ final class AgentModeViewModel: ObservableObject {
             shouldManageCodexTooling: true,
             runCoordinator: AgentRunCoordinator.shared,
             authRecovery: CodexManagedAuthRecoveryService.shared,
+            computerUseEnabled: { CodexComputerUseWorkflow.isEnabled },
+            goalSupportEnabled: { CodexGoalSupport.isEnabled },
+            reasoningSummariesEnabled: { CodexReasoningSummaries.isEnabled },
+            showBuiltInWorkflowCleanupGuidance: { GlobalSettingsStore.shared.showBuiltInWorkflowCleanupGuidance() },
+            globalCodeMapsDisabled: { GlobalSettingsStore.shared.globalCodeMapsDisabled() },
             activeToolQuery: { [weak mcpServer] runID in
                 mcpServer?.hasActiveToolExecutions(runID: runID) ?? false
             },
@@ -2329,6 +2334,7 @@ final class AgentModeViewModel: ObservableObject {
             windowID: windowID,
             workspacePathProvider: sessionWorkspacePathProvider,
             mcpHost: ServerNetworkManager.shared,
+            globalCodeMapsDisabled: { GlobalSettingsStore.shared.globalCodeMapsDisabled() },
             awaitNoActiveMCPTools: { [weak mcpServer] runID in
                 guard let mcpServer else { return }
                 try await mcpServer.awaitNoActiveToolExecutions(runID: runID)
@@ -2510,6 +2516,11 @@ final class AgentModeViewModel: ObservableObject {
                 shouldManageCodexTooling: shouldManageCodexTooling,
                 runCoordinator: AgentRunCoordinator.shared,
                 authRecovery: testCodexAuthRecovery ?? CodexManagedAuthRecoveryService.shared,
+                computerUseEnabled: { CodexComputerUseWorkflow.isEnabled },
+                goalSupportEnabled: { CodexGoalSupport.isEnabled },
+                reasoningSummariesEnabled: { CodexReasoningSummaries.isEnabled },
+                showBuiltInWorkflowCleanupGuidance: { GlobalSettingsStore.shared.showBuiltInWorkflowCleanupGuidance() },
+                globalCodeMapsDisabled: { GlobalSettingsStore.shared.globalCodeMapsDisabled() },
                 activeToolQuery: testCodexActiveToolQuery
                     ?? { [weak testMCPServer] runID in
                         testMCPServer?.hasActiveToolExecutions(runID: runID) ?? false
@@ -2541,6 +2552,7 @@ final class AgentModeViewModel: ObservableObject {
                 windowID: testWindowID,
                 workspacePathProvider: sessionWorkspacePathProvider,
                 mcpHost: ServerNetworkManager.shared,
+                globalCodeMapsDisabled: { GlobalSettingsStore.shared.globalCodeMapsDisabled() },
                 claudeControllerFactory: claudeControllerFactory,
                 toolEndedCount: { [weak testMCPServer] runID in
                     testMCPServer?.toolEndedCount(runID: runID) ?? 0

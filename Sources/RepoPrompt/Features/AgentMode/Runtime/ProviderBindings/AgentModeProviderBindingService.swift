@@ -4,10 +4,6 @@ import Foundation
 final class AgentModeProviderBindingService {
     let preferences: AgentProviderPreferenceSnapshotStore
 
-    convenience init() {
-        self.init(preferences: AgentProviderPreferenceSnapshotStore())
-    }
-
     init(preferences: AgentProviderPreferenceSnapshotStore) {
         self.preferences = preferences
     }

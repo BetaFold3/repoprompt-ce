@@ -7,11 +7,6 @@ extension Notification.Name {
 enum CodexReasoningSummaries {
     static let defaultsKey = "enableCodexReasoningSummaries"
 
-    @MainActor
-    static var isEnabled: Bool {
-        GlobalSettingsStore.shared.codexReasoningSummariesEnabled()
-    }
-
     static func isEnabled(defaults: UserDefaults) -> Bool {
         isEnabled(persistedValue: defaults.object(forKey: defaultsKey) as? Bool)
     }

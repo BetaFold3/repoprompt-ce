@@ -517,7 +517,7 @@ final class CodexNativeSessionController {
             approvalReviewerProvider: @escaping () -> CodexAgentToolPreferences.ApprovalReviewer = { CodexAgentToolPreferences.approvalReviewer() },
             shellToolEnabled: Bool? = nil,
             suppressThirdPartyMCPServers: Bool = false,
-            goalSupportEnabledProvider: @escaping @MainActor () -> Bool = { CodexGoalSupport.isEnabled },
+            goalSupportEnabledProvider: @escaping @MainActor () -> Bool,
             reasoningSummariesEnabledProvider: @escaping @MainActor () -> Bool = { false },
             computerUseEnabledProvider: @escaping @MainActor () -> Bool = { false }
         ) -> Options {
@@ -816,8 +816,7 @@ final class CodexNativeSessionController {
         tabID: UUID,
         windowID: Int,
         workspacePath: String?,
-        forceExperimentalSteering: Bool = false,
-        options: Options? = nil,
+        options: Options,
         clientShutdownBehavior: ClientShutdownBehavior = .none,
         expectedMCPClientName: String? = nil,
         requestExecutor: (@Sendable (String, [String: Any]?, TimeInterval?) async throws -> [String: Any])? = nil
@@ -827,7 +826,7 @@ final class CodexNativeSessionController {
         self.tabID = tabID
         self.windowID = windowID
         self.workspacePath = workspacePath
-        self.options = options ?? Self.Options.agentModeDefault(forceExperimentalSteering: forceExperimentalSteering)
+        self.options = options
         self.clientShutdownBehavior = clientShutdownBehavior
         self.expectedMCPClientName = expectedMCPClientName
         self.requestExecutor = requestExecutor

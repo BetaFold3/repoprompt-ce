@@ -360,7 +360,8 @@ final class CodexNativeSessionControllerGoalConfigTests: XCTestCase {
             forceExperimentalSteering: false,
             approvalPolicyProvider: { .never },
             sandboxModeProvider: { .readOnly },
-            approvalReviewerProvider: { .user }
+            approvalReviewerProvider: { .user },
+            goalSupportEnabledProvider: { CodexGoalSupport.isEnabled }
         )
     }
 

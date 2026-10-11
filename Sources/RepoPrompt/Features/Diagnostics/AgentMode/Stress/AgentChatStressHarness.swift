@@ -1427,7 +1427,8 @@ import RepoPromptWorkspace
                 runID: UUID(),
                 tabID: UUID(),
                 windowID: windowID,
-                workspacePath: configuration.workspaceRootPaths.first
+                workspacePath: configuration.workspaceRootPaths.first,
+                options: .agentModeDefault(forceExperimentalSteering: false, goalSupportEnabledProvider: { CodexGoalSupport.isEnabled })
             )
             let recorder = PersistedCodexFixtureEventRecorder()
             let eventTask = Task {
