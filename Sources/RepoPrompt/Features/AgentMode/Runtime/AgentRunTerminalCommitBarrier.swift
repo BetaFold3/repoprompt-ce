@@ -162,7 +162,7 @@ final class AgentRunTerminalCommitBarrier {
                 revision: existingRevision,
                 publicationResult: session.lastTerminalPublicationResult
             ) {
-                hooks.startFollowUpRun(session.tabID, followUpInstruction)
+                hooks.startFollowUpRun(session.tabID, followUpInstruction, nil)
             }
             if let providerSuccessor = request.providerSuccessor,
                providerSuccessor.id == existingRevision.providerSuccessorID,
@@ -349,12 +349,19 @@ final class AgentRunTerminalCommitBarrier {
         session.terminalCommitInProgress = false
         recordTerminalBarrierState(false, request: request)
         request.postCommit()
+        var followUpStartObservation: AgentModeRunService.Hooks.FollowUpStartObservation?
         if let attentionCapture {
-            hooks.settleAttentionTurnCompletion(session, revision, attentionCapture, providerSuccessorDeclined)
+            followUpStartObservation = hooks.settleAttentionTurnCompletion(
+                session,
+                revision,
+                attentionCapture,
+                providerSuccessorDeclined,
+                followUpInstruction != nil
+            )
         }
 
         if let followUpInstruction {
-            hooks.startFollowUpRun(session.tabID, followUpInstruction)
+            hooks.startFollowUpRun(session.tabID, followUpInstruction, followUpStartObservation)
         }
         if request.completion == .terminalTeardownCompleted {
             await teardownTask?.value

@@ -5666,7 +5666,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
             makeTerminalPublicationEnvelope: { _, _, _, _ in
                 .init(epoch: epoch, snapshot: .expired(sessionID: sessionID))
             },
-            startFollowUpRun: { _, text in recorder.record("follow-up:\(text)") }
+            startFollowUpRun: { _, text, _ in recorder.record("follow-up:\(text)") }
         )
         let barrier = AgentRunTerminalCommitBarrier(hooks: hooks)
         let session = AgentModeViewModel.TabSession(tabID: UUID())
@@ -6496,7 +6496,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
             AgentSessionRunState,
             UUID?
         ) -> AgentRunTerminalPublicationEnvelope?)? = nil,
-        startFollowUpRun: ((UUID, String) -> Void)? = nil,
+        startFollowUpRun: ((UUID, String, AgentModeRunService.Hooks.FollowUpStartObservation?) -> Void)? = nil,
         handleHeadlessStreamResult: ((AIStreamResult) async -> Void)? = nil
     ) -> AgentModeRunService.Hooks {
         let flushPendingAssistantDelta = flushPendingAssistantDelta ?? { _ in
@@ -6543,7 +6543,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
                 await publishTerminalCommit(session, revision)
                 return .accepted(successorEpoch: nil)
             },
-            startFollowUpRun: startFollowUpRun ?? { _, _ in },
+            startFollowUpRun: startFollowUpRun ?? { _, _, _ in },
             restoreDraftText: { _, text, _, _ in recorder.record("draft:\(text)") },
             augmentUserMessageForProviderSend: { text, _, _, _ in text },
             stageResumeRecoveryHandoffIfNeeded: { _ in },

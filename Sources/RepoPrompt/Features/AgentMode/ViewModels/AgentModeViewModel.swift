@@ -3078,9 +3078,10 @@ final class AgentModeViewModel: ObservableObject {
                 }
                 return result
             },
-            startFollowUpRun: { [weak self] tabID, initialMessage in
+            startFollowUpRun: { [weak self] tabID, initialMessage, afterStart in
                 Task { [weak self] in
                     await self?.startAgentRun(tabID: tabID, initialMessage: initialMessage)
+                    afterStart?()
                 }
             },
             restoreDraftText: { [weak self] tabID, text, message, strategy in
@@ -3114,12 +3115,13 @@ final class AgentModeViewModel: ObservableObject {
             captureAttentionTurnCompletion: { [weak self] session, revision in
                 self?.captureAttentionTurnCompletion(for: session, revision: revision)
             },
-            settleAttentionTurnCompletion: { [weak self] session, revision, capture, providerSuccessorDeclined in
+            settleAttentionTurnCompletion: { [weak self] session, revision, capture, providerSuccessorDeclined, genericFollowUpScheduled in
                 self?.settleAttentionTurnCompletion(
                     for: session,
                     revision: revision,
                     capture: capture,
-                    providerSuccessorDeclined: providerSuccessorDeclined
+                    providerSuccessorDeclined: providerSuccessorDeclined,
+                    genericFollowUpScheduled: genericFollowUpScheduled
                 )
             }
         )

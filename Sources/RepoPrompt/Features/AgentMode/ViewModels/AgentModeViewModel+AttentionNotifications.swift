@@ -4,7 +4,8 @@ import Foundation
 // (docs/context/plans/2026-10-10-telegram-attention-notifications-contract.md, Direction 1).
 //
 // Captures root turn completions at terminal commit (admitted only after successor selection
-// settled with no follow-up or provider successor) and root `ask_user` questions after routing
+// settled with no provider successor, or after a scheduled generic follow-up's start returned and the
+// completion is still the current settled-idle event) and root `ask_user` questions after routing
 // and timeout scheduling (admitted only while that exact interaction is still pending). Reuses the
 // live delegation lineage, MCP control, question audience, terminal-text, and question-rendering
 // authorities; it never changes them, never awaits, and never mutates run or question state.
@@ -14,8 +15,10 @@ extension AgentModeViewModel {
     /// A root session the user drives: durable identity, no MCP control context, and a live
     /// lineage that resolves to depth 0. Children at any depth (including orphaned children whose
     /// questions fall back to the user), Knowledge workers, unknown or conflicting lineage, and
-    /// MCP-controlled roots are excluded. A remote host binding alone does not exclude a root: the
-    /// local terminal commit and `askUser` remain the event authorities.
+    /// MCP-controlled roots are excluded. Events come only from the executing host's local hooks (its
+    /// terminal commit barrier and `askUser`), so Telegram is configured on the Mac that runs the
+    /// session. An observing client's projected remote session is updated from the remote transport,
+    /// never through those hooks, so nothing is captured or proxied for it there.
     func isAttentionNotificationRoot(_ session: TabSession) -> Bool {
         guard session.activeAgentSessionID != nil,
               !isMCPControlled(tabID: session.tabID),
@@ -70,20 +73,31 @@ extension AgentModeViewModel {
         for session: TabSession,
         revision: AgentRunTerminalCommitRevision,
         capture: AttentionNotificationAdmission.Capture,
-        providerSuccessorDeclined: Bool
-    ) {
-        // A queued follow-up or provider successor selected at this commit means the session did
-        // not settle idle; that successor's own completion is the event. A provider successor that
-        // declined after an accepted publication never started, so this completion still counts
-        // (admission re-checks settled idle). A generic follow-up selected but aborted before its
-        // run starts stays silent.
+        providerSuccessorDeclined: Bool,
+        genericFollowUpScheduled: Bool
+    ) -> AgentModeRunService.Hooks.FollowUpStartObservation? {
+        let admission = attentionNotificationAdmission
+        // A generic follow-up actually handed to its start: decide only after that start returns.
+        // A follow-up that took over makes this capture no longer current (newer attempt or
+        // commit); one refused before ownership leaves this completion settled idle, so it sends.
+        // Nothing is recorded until then.
+        if genericFollowUpScheduled, revision.successorKind != nil, revision.providerSuccessorID == nil {
+            return { [weak admission] in
+                admission?.submit(capture)
+            }
+        }
+        // Preserve the existing fail-closed decision for a selected but unscheduled generic
+        // follow-up; it has no after-start observation. Provider successors suppress this
+        // completion unless they explicitly declined after accepted publication, in which case
+        // admission still re-checks settled idle.
         let successorTookOver = revision.successorKind != nil
             && !(providerSuccessorDeclined && revision.providerSuccessorID != nil)
         guard !successorTookOver else {
-            attentionNotificationAdmission.suppress(capture.event.key, reason: .successorTookOver)
-            return
+            admission.suppress(capture.event.key, reason: .successorTookOver)
+            return nil
         }
-        attentionNotificationAdmission.submit(capture)
+        admission.submit(capture)
+        return nil
     }
 
     // MARK: - ask_user

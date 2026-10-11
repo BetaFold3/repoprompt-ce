@@ -105,7 +105,32 @@ Slice 5 result: Four production-construction tests added six notification scenar
 
 Review follow-up: Both lanes cleared P0/P1, cheap coverage and wording findings were fixed without production changes or a round solely for P2/P3, and the shared data service's hydration path was confirmed to read/decode the session file rather than serve a transcript cache; the test remains a second view model in one process, not live app cold-start acceptance (evidence: `slice-5-parent-restore-authority.txt`).
 
+### Slice 6
+Resolve the selected-follow-up-abort experiment with retained fixture dependencies and classify actual remote-event ownership from existing authorities before choosing any repair; budget used so far: about five hours elapsed, four committed code/test slices and six scoped worker sessions.
+
+Step 6 — done | rounds 0/2 | open: none | downgraded: none | assumed: temporary experiments removed; no global preference, lineage, question audience, terminal-order or remote-contract changes; direct tab reservation is a refusal fixture, not real deletion | deferred: notification-only follow-up repair, settings/live wiring and phone acceptance until coverage is clarified
+
+Budget used so far: about five and a half hours elapsed, four committed code/test slices and seven scoped worker sessions, reusing the integration worker for two temporary experiments; no real sends, secure-store access or visible app actions.
+
+Slice 6 result: Strong retention refuted the weak-lifetime hypothesis because the same settings object changed availability, then a fenced reserved-tab fixture proved that a selected follow-up refused before ownership leaves the completed idle root incorrectly suppressed (21 tests, only the deliberate delivery assertion failed; 20 committed tests passed), while source tracing proved remote projections lack reliable completion/question authority, so live wiring waits for the owner to choose where remote notifications must be configured (evidence: `slice-6-r1-test-run-full.txt`, `slice-6-r1-observations.txt`, `slice-6-r1-reserved-fixture.diff`, `slice-6-r1-reserved-test-run-full.txt`, `slice-6-r1-reserved-observations.txt`, `slice-6-remote-authorities.txt`, `slice-6-plan.md`).
+
+Material interpretation requiring owner answer: Notifying only on the executing host preserves trusted local authorities; a remotely observed UI root is not necessarily MCP-controlled, but enabling only its observing client cannot safely cover it from current projections without crossing the remote-contract boundary. Both temporary fixtures were removed and source remains unchanged; this experiment-only slice needs no code review or commit.
+
+Owner question `telegram_remote_notification_configuration` timed out after 328 seconds on 2026-10-10; the owner answered “Configure on the executing Mac” on 2026-10-11, clearing the coverage block without authorizing proxy alerts or remote-contract changes. All seven scoped worker sessions completed before the pause.
+
+### Slice 7
+Repair the reproduced selected-follow-up pre-ownership refusal using notification-only outcome observation and existing current-event fences, without changing terminal ordering; budget used so far: about five and a half hours of work including waits, four committed code/test slices and seven scoped worker sessions.
+
+Step 7 — done | rounds 0/2 | open: none | downgraded: none | assumed: notifier remains disconnected; permanent reservation regression proves refusal, not deletion; executing-host-only configuration | deferred: unchanged selected-but-unscheduled and other nil-observation start paths (B S7-2); a remaining queued instruction prevents settled-idle admission by contract; generic suppression detail/pre-filter optimization (B S7-3); settings/live wiring, event-time idle sampling and approved phone acceptance
+
+Budget used so far: about six hours of work including waits, five completed code/test slices and seven scoped worker sessions, reusing the integration worker; no real sends, secure-store access, app lifecycle actions or pushes.
+
+Slice 7 result: An after-start notification observation turned the Slice 6 refusal regression from one expected failure into one original-attempt delivery and passed 21 admission, 139 lifecycle and 23 fallback tests plus lint/guardrails/context checks, with both lanes clearing P0/P1 and no terminal-order changes, so the next slice adds settings and executing-host service wiring against stub HTTP (evidence: `slice-7-parent-final-admission.txt`, `slice-7-test-lifecycle-run-1.txt`, `slice-7-test-codex-fallback-fifo-run-1.txt`, `slice-7-parent-final-lint.txt`, `slice-7-OracleA-initial.md`, `slice-7-OracleB-initial.md`).
+
+Material implementation choices: Keep the callback inside the existing follow-up start task and submit the original immutable capture only after start returns; do not add a capture map or overwrite a tombstone, and retain fail-closed behavior for unchanged unscheduled/replayed starts. Static tracing confirms every provider runner claims ownership and clears the original commit before spawning provider work, closing B S7-1 without new provider fixtures; correct suppression comments but defer the optional queue pre-filter because it is not needed for admission correctness (evidence: `slice-7-provider-start-authority.txt`). Comment-only follow-ups changed no reviewed behavior and the final 21-test admission run and lint were repeated without a round solely for P2/P3.
+
 ## Decisions
+- Remote configuration: configure Telegram on the executing Mac, not the observing client (owner answer 2026-10-11); no proxy notification or remote-contract expansion.
 - Commit signing: permit unsigned local commits for this contract after the Slice 4 1Password failure; owner will arrange later amendment/re-signing at the desk, with separate history-rewrite approval at that action boundary (owner answer 2026-10-10).
 - Review recovery (Slice 2): authorize one additional fresh, bounded OracleB retry after the initial reply and normal retry omitted findings and a complete verdict (owner answer 2026-10-10).
 - Orphaned-child questions: never notify.

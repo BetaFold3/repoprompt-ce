@@ -62,7 +62,8 @@ enum AttentionNotificationSuppression: String, Equatable {
     case configurationChanged
     /// Child at any depth, unknown/conflicting lineage, MCP-controlled, or no identity.
     case ineligibleSession
-    /// A queued follow-up or provider successor took over from the completed turn.
+    /// A provider successor was selected, or a generic follow-up was selected but not scheduled.
+    /// Actually scheduled generic starts are observed later and use the current-event fence.
     case successorTookOver
     /// The session, its binding, or the event itself is no longer current at admission.
     case eventNoLongerCurrent

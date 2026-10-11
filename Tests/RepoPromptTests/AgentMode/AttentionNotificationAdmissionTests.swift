@@ -9,31 +9,61 @@ import XCTest
 final class AttentionNotificationAdmissionTests: XCTestCase {
     // MARK: - Kill: queued successor chains
 
+    /// A scheduled follow-up defers the original completion's decision until its start returns. Once
+    /// the follow-up took over, the original is no longer current whether the observation lands
+    /// after the start or only after the successor already completed; repeated observations add
+    /// nothing.
     func testQueuedFollowUpChainNotifiesOnlyTheFinalTurnWithItsOwnText() async throws {
-        let fixture = makeFixture()
-        var followUps: [String] = []
-        let barrier = makeBarrier(fixture.vm, startFollowUpRun: { _, text in followUps.append(text) })
-        let root = makeSession(fixture.vm)
-        root.session.pendingInstructions = ["second"]
+        enum Observation: String, CaseIterable {
+            case afterSuccessorStarted, afterSuccessorCompleted
+        }
+        for observation in Observation.allCases {
+            let fixture = makeFixture()
+            var followUps: [String] = []
+            var afterStart: AgentModeRunService.Hooks.FollowUpStartObservation?
+            let barrier = makeBarrier(fixture.vm, startFollowUpRun: { _, text, observe in
+                followUps.append(text)
+                afterStart = observe
+            })
+            let root = makeSession(fixture.vm)
+            root.session.pendingInstructions = ["second"]
 
-        let first = beginTurn(root.session, user: "first", assistant: "Intermediate answer A")
-        let firstCommit = await barrier.commit(completedRequest(root.session, first, supportsFollowUp: true))
-        let firstRevision = try XCTUnwrap(firstCommit)
-        XCTAssertEqual(firstRevision.successorKind, .relatedFollowUp)
-        XCTAssertEqual(followUps, ["second"])
-        let firstKey = AttentionNotificationEventKey.turnCompleted(sessionID: root.sessionID, attemptID: first.attemptID)
-        XCTAssertEqual(fixture.admission.records[firstKey], .suppressed(.successorTookOver))
+            let first = beginTurn(root.session, user: "first", assistant: "Intermediate answer A")
+            let firstCommit = await barrier.commit(completedRequest(root.session, first, supportsFollowUp: true))
+            let firstRevision = try XCTUnwrap(firstCommit)
+            XCTAssertEqual(firstRevision.successorKind, .relatedFollowUp, observation.rawValue)
+            XCTAssertEqual(followUps, ["second"], observation.rawValue)
+            let observeFirstStart = try XCTUnwrap(afterStart, "A scheduled follow-up carries its start observation")
+            let firstKey = AttentionNotificationEventKey.turnCompleted(sessionID: root.sessionID, attemptID: first.attemptID)
+            XCTAssertNil(fixture.admission.records[firstKey], "Nothing is decided before the start returns")
+            XCTAssertTrue(fixture.admission.pendingEventKeys.isEmpty, observation.rawValue)
 
-        // The follow-up turn (as `startAgentRun` would run it) settles idle.
-        let second = beginTurn(root.session, user: "second", assistant: "Final answer B")
-        _ = await barrier.commit(completedRequest(root.session, second, supportsFollowUp: true))
+            // The follow-up turn starts (as `startAgentRun` would run it).
+            let second = beginTurn(root.session, user: "second", assistant: "Final answer B")
+            let secondKey = AttentionNotificationEventKey.turnCompleted(sessionID: root.sessionID, attemptID: second.attemptID)
+            if observation == .afterSuccessorStarted {
+                observeFirstStart()
+                observeFirstStart()
+                let record = try await waitForRecord(fixture.admission, firstKey)
+                XCTAssertEqual(record, .suppressed(.eventNoLongerCurrent), observation.rawValue)
+            }
+            _ = await barrier.commit(completedRequest(root.session, second, supportsFollowUp: true))
+            try await waitForRecord(fixture.admission, secondKey) { $0 == .delivered(.sent) }
+            if observation == .afterSuccessorCompleted {
+                observeFirstStart()
+                observeFirstStart()
+                let record = try await waitForRecord(fixture.admission, firstKey)
+                XCTAssertEqual(record, .suppressed(.eventNoLongerCurrent), observation.rawValue)
+            }
+            observeFirstStart()
 
-        try await waitForAttempts(fixture.delivery, 1)
-        let events = await fixture.delivery.events
-        XCTAssertEqual(events.map(\.key), [.turnCompleted(sessionID: root.sessionID, attemptID: second.attemptID)])
-        XCTAssertEqual(events.first?.content, .turnCompleted(finalAssistantText: "Final answer B"))
-        XCTAssertEqual(events.first?.sessionName, fixture.vm.resolvedSessionDisplayName(for: root.tabID))
-        try await waitForRecord(fixture.admission, events[0].key) { $0 == .delivered(.sent) }
+            XCTAssertTrue(fixture.admission.pendingEventKeys.isEmpty, observation.rawValue)
+            XCTAssertEqual(fixture.admission.records[firstKey], .suppressed(.eventNoLongerCurrent), observation.rawValue)
+            let events = await fixture.delivery.events
+            XCTAssertEqual(events.map(\.key), [secondKey], observation.rawValue)
+            XCTAssertEqual(events.first?.content, .turnCompleted(finalAssistantText: "Final answer B"), observation.rawValue)
+            XCTAssertEqual(events.first?.sessionName, fixture.vm.resolvedSessionDisplayName(for: root.tabID))
+        }
     }
 
     func testProviderSuccessorChainNotifiesOnlyTheSettledSuccessorTurn() async throws {
@@ -96,6 +126,85 @@ final class AttentionNotificationAdmissionTests: XCTestCase {
         let events = await fixture.delivery.events
         XCTAssertEqual(events.map(\.key), [key])
         XCTAssertEqual(events.first?.content, .turnCompleted(finalAssistantText: "Final answer, no successor"))
+    }
+
+    /// A selected follow-up refused before ownership leaves the completed turn settled idle, so its
+    /// deferred notification is decided after the actual start returns: sent exactly once with that
+    /// turn's text, or suppressed when enablement, configuration, or binding changed in the deferred
+    /// window or the user was active at the event. This is a refusal fixture, not a real deletion:
+    /// the existing internal removal reservation makes the production `startAgentRun` refuse before
+    /// ownership; no removal operation runs.
+    func testSelectedFollowUpRefusedBeforeOwnershipNotifiesTheSettledCompletionOnce() async throws {
+        enum DeferredChange: String, CaseIterable {
+            case none, disabled, configurationReplaced, rebound, userActiveAtEvent
+        }
+        for change in DeferredChange.allCases {
+            let fixture = makeFixture(idleSeconds: { change == .userActiveAtEvent ? 10 : nil })
+            let root = makeSession(fixture.vm)
+            // Codex uses the fixture's no-op stub, so even a regressed refusal launches no provider.
+            root.session.selectedAgent = .codexExec
+            root.session.pendingInstructions = ["queued follow-up"]
+            let ownership = beginTurn(root.session, user: "first", assistant: "Answer before the refused follow-up")
+            let commit = await fixture.vm.test_terminalCommitBarrier()
+                .commit(completedRequest(root.session, ownership, supportsFollowUp: true))
+            let revision = try XCTUnwrap(commit)
+            let key = AttentionNotificationEventKey.turnCompleted(sessionID: root.sessionID, attemptID: ownership.attemptID)
+            XCTAssertEqual(revision.successorKind, .relatedFollowUp, change.rawValue)
+            XCTAssertTrue(root.session.mcpFollowUpRunPending, "The queued start has not run yet")
+            XCTAssertNil(fixture.admission.records[key], "Nothing is decided before the start returns")
+
+            switch change {
+            case .none, .userActiveAtEvent:
+                break
+            case .disabled:
+                fixture.admission.setEnabled(false)
+            case .configurationReplaced:
+                fixture.admission.setDeliveryConfiguration(StubDelivery(mode: .succeed))
+            case .rebound:
+                root.session.testInstallPersistentSessionBinding(sessionID: UUID())
+            }
+            let reservation = UUID()
+            fixture.vm.reservedComposeTabIDs[root.tabID] = reservation
+            defer {
+                if fixture.vm.reservedComposeTabIDs[root.tabID] == reservation {
+                    fixture.vm.reservedComposeTabIDs.removeValue(forKey: root.tabID)
+                }
+            }
+
+            // Only the returned start submits the capture, so a decided record proves it ran.
+            let record = try await waitForRecord(fixture.admission, key) { $0 != .admitted }
+            fixture.vm.reservedComposeTabIDs.removeValue(forKey: root.tabID)
+
+            // Refusal: the start returned without taking over the completed turn.
+            XCTAssertFalse(root.session.mcpFollowUpRunPending, change.rawValue)
+            XCTAssertEqual(root.session.runState, .completed, change.rawValue)
+            XCTAssertNil(root.session.activeRunOwnership, change.rawValue)
+            XCTAssertTrue(root.session.pendingInstructions.isEmpty, change.rawValue)
+            XCTAssertTrue(root.session.codexFallbackQueue.isEmpty, change.rawValue)
+            XCTAssertEqual(root.session.lastTerminalCommitRevision?.commitID, revision.commitID, change.rawValue)
+            XCTAssertTrue(fixture.vm.sessions[root.tabID] === root.session, change.rawValue)
+
+            let events = await fixture.delivery.events
+            switch change {
+            case .none:
+                XCTAssertEqual(record, .delivered(.sent))
+                XCTAssertEqual(events.map(\.key), [key])
+                XCTAssertEqual(events.first?.content, .turnCompleted(finalAssistantText: "Answer before the refused follow-up"))
+                XCTAssertEqual(events.first?.sessionName, fixture.vm.resolvedSessionDisplayName(for: root.tabID))
+            case .disabled:
+                XCTAssertEqual(record, .suppressed(.enableChanged))
+                XCTAssertTrue(events.isEmpty)
+            case .configurationReplaced:
+                XCTAssertEqual(record, .suppressed(.configurationChanged))
+                XCTAssertTrue(events.isEmpty)
+            case .rebound:
+                XCTAssertEqual(record, .suppressed(.eventNoLongerCurrent))
+                XCTAssertTrue(events.isEmpty)
+            case .userActiveAtEvent:
+                XCTAssertEqual(record, .suppressed(.userActive))
+                XCTAssertTrue(events.isEmpty)
+            }
+        }
     }
 
     /// A completion without new assistant text never carries an earlier turn's text, and long final
@@ -534,18 +643,23 @@ final class AttentionNotificationAdmissionTests: XCTestCase {
     // MARK: - Hanging and failing delivery
 
     /// Over the paced Telegram path with a stub HTTP client: a hanging request holds later
-    /// notifications only (serialized delivery), never the commit, successor start, question
-    /// installation or its timeout. The question queued behind it is stale when the head releases
-    /// and never posts.
+    /// notifications only (serialized delivery), never the commit, the actual successor start,
+    /// question installation or its timeout. The successor runs through the production barrier and
+    /// `startAgentRun` on the no-op Codex stub (no provider process). Events queued behind the hanging
+    /// head are stale when it releases and never post.
     func testHangingDeliveryNeverDelaysCommitSuccessorQuestionInstallationOrTimeout() async throws {
         let clock = ManualPacingClock()
         let http = PacedStubHTTPClient(replies: [.hang(then: .fail(PacedTelegramTestSupport.leakyURLError(.timedOut)))])
         let pacer = TelegramAttentionPacer(clock: clock.pacingClock)
-        let fixture = makeFixture(configuredDelivery: PacedTelegramTestSupport.delivery(http: http, pacer: pacer))
+        let codex = LifecycleRecorder()
+        let fixture = makeFixture(
+            configuredDelivery: PacedTelegramTestSupport.delivery(http: http, pacer: pacer),
+            codexRecorder: codex
+        )
         addTeardownBlock { http.releaseHangs() }
-        var followUps: [String] = []
-        let barrier = makeBarrier(fixture.vm, startFollowUpRun: { _, text in followUps.append(text) })
+        let barrier = fixture.vm.test_terminalCommitBarrier()
         let root = makeSession(fixture.vm)
+        root.session.selectedAgent = .codexExec
 
         // Turn 1 settles idle and its single POST hangs.
         let first = beginTurn(root.session, user: "one", assistant: "first")
@@ -555,17 +669,25 @@ final class AttentionNotificationAdmissionTests: XCTestCase {
         XCTAssertEqual(fixture.admission.records[firstKey], .admitted)
         XCTAssertEqual(fixture.admission.activeEventKey, firstKey)
 
-        // Turn 2 commits and starts its queued successor while turn 1's request still hangs.
+        // Turn 2 commits and its queued successor actually starts while turn 1's request still hangs.
         root.session.pendingInstructions = ["three"]
         let second = beginTurn(root.session, user: "two", assistant: "second")
         let revision = await barrier.commit(completedRequest(root.session, second, supportsFollowUp: true))
-        XCTAssertNotNil(revision)
-        XCTAssertEqual(followUps, ["three"])
+        XCTAssertEqual(revision?.successorKind, .relatedFollowUp)
         XCTAssertFalse(root.session.terminalCommitInProgress)
-        XCTAssertEqual(
-            fixture.admission.records[.turnCompleted(sessionID: root.sessionID, attemptID: second.attemptID)],
-            .suppressed(.successorTookOver)
-        )
+        let secondKey = AttentionNotificationEventKey.turnCompleted(sessionID: root.sessionID, attemptID: second.attemptID)
+        XCTAssertNil(fixture.admission.records[secondKey], "Decided only after the successor start returns")
+        try await waitUntil("the successor to reach the stub provider") { codex.contains("codex:send") }
+        try await waitUntil("the returned successor start to submit turn 2 behind the hanging head") {
+            fixture.admission.pendingEventKeys.contains(secondKey)
+        }
+        XCTAssertTrue(root.session.runState.isActive, "The successor took over the session")
+        XCTAssertNotNil(root.session.activeRunOwnership)
+        XCTAssertNotEqual(root.session.activeRunOwnership?.attemptID, second.attemptID)
+        XCTAssertEqual(http.requestCount, 1)
+        XCTAssertEqual(fixture.admission.records[firstKey], .admitted)
+        XCTAssertEqual(fixture.admission.activeEventKey, firstKey)
+        XCTAssertNil(fixture.admission.records[secondKey])
 
         // A question installs and is queued behind the hanging head; its timeout completes.
         let interaction = makeInteraction(timeoutSeconds: 60)
@@ -590,9 +712,11 @@ final class AttentionNotificationAdmissionTests: XCTestCase {
 
         http.releaseHangs()
         try await waitForRecord(fixture.admission, firstKey) { $0 == .delivered(.unknown) }
+        let secondRecord = try await waitForRecord(fixture.admission, secondKey)
+        XCTAssertEqual(secondRecord, .suppressed(.eventNoLongerCurrent), "The started successor took over turn 2")
         let questionRecord = try await waitForRecord(fixture.admission, questionKey)
         XCTAssertEqual(questionRecord, .suppressed(.eventNoLongerCurrent), "The stale queued question never posts")
-        XCTAssertEqual(http.requestCount, 1, "One attempt for the hanging event; none for the stale question")
+        XCTAssertEqual(http.requestCount, 1, "One attempt for the hanging event; none for stale queued events")
         XCTAssertTrue(fixture.admission.pendingEventKeys.isEmpty)
         XCTAssertNil(fixture.admission.activeEventKey)
     }
@@ -953,17 +1077,19 @@ final class AttentionNotificationAdmissionTests: XCTestCase {
     }
 
     /// `configuredDelivery` replaces the stub delivery (then `Fixture.delivery` records nothing).
+    /// Codex runs use the no-op stub controller; `codexRecorder` observes its provider sends.
     private func makeFixture(
         delivery: StubDelivery = StubDelivery(mode: .succeed),
         configuredDelivery: (any AttentionNotificationDelivering)? = nil,
         fence: AdmissionFence? = nil,
-        idleSeconds: @escaping @MainActor () -> TimeInterval? = { nil }
+        idleSeconds: @escaping @MainActor () -> TimeInterval? = { nil },
+        codexRecorder: LifecycleRecorder = LifecycleRecorder()
     ) -> Fixture {
         let vm = AgentModeViewModel(
             testWindowID: 1,
             testWorkspacePath: FileManager.default.currentDirectoryPath,
             codexControllerFactory: { _, _, _, _, _, _ in
-                LifecycleNoopCodexController(recorder: LifecycleRecorder())
+                LifecycleNoopCodexController(recorder: codexRecorder)
             }
         )
         let admission = AttentionNotificationAdmission(environment: .init(
@@ -1068,10 +1194,11 @@ final class AttentionNotificationAdmissionTests: XCTestCase {
     }
 
     /// A real terminal commit barrier whose attention hooks are the production view-model adapter;
-    /// other hooks are inert so follow-up starts are only recorded.
+    /// other hooks are inert so follow-up starts are only recorded (a test models the start and
+    /// invokes its observation).
     private func makeBarrier(
         _ vm: AgentModeViewModel,
-        startFollowUpRun: @escaping (UUID, String) -> Void = { _, _ in }
+        startFollowUpRun: @escaping (UUID, String, AgentModeRunService.Hooks.FollowUpStartObservation?) -> Void = { _, _, _ in }
     ) -> AgentRunTerminalCommitBarrier {
         AgentRunTerminalCommitBarrier(hooks: AgentModeRunService.Hooks(
             estimateRuntimeTokens: { $0.count },
@@ -1113,12 +1240,13 @@ final class AttentionNotificationAdmissionTests: XCTestCase {
             captureAttentionTurnCompletion: { [weak vm] session, revision in
                 vm?.captureAttentionTurnCompletion(for: session, revision: revision)
             },
-            settleAttentionTurnCompletion: { [weak vm] session, revision, capture, providerSuccessorDeclined in
+            settleAttentionTurnCompletion: { [weak vm] session, revision, capture, providerSuccessorDeclined, genericFollowUpScheduled in
                 vm?.settleAttentionTurnCompletion(
                     for: session,
                     revision: revision,
                     capture: capture,
-                    providerSuccessorDeclined: providerSuccessorDeclined
+                    providerSuccessorDeclined: providerSuccessorDeclined,
+                    genericFollowUpScheduled: genericFollowUpScheduled
                 )
             }
         ))

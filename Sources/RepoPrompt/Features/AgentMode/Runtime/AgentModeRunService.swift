@@ -113,7 +113,11 @@ final class AgentModeRunService {
             AgentRunTerminalCommitRevision,
             AgentRunEpochTransitionKind?
         ) async -> AgentRunTerminalPublicationResult
-        let startFollowUpRun: (UUID, String) -> Void
+        /// Attention notifications only: observes that a generic follow-up start returned (whether it
+        /// started, refused, or failed). Synchronous, never throws, and claims nothing about the outcome.
+        typealias FollowUpStartObservation = @MainActor () -> Void
+        /// Starts a follow-up run. A non-nil `afterStart` is invoked once, after the start returns.
+        let startFollowUpRun: (_ tabID: UUID, _ text: String, _ afterStart: FollowUpStartObservation?) -> Void
         /// Restore queued steering draft text back to the composer.
         let restoreDraftText: (_ tabID: UUID, _ text: String, _ message: String, _ strategy: DraftRestorationStrategy) -> Void
         /// Augment queued steering text with skill context, tagged files, and attachment rendering before submit.
@@ -148,14 +152,17 @@ final class AgentModeRunService {
         ) -> AttentionNotificationAdmission.Capture? = { _, _ in nil }
         /// Attention notifications only: called once per accepted commit that produced a capture,
         /// after successor selection settled. `providerSuccessorDeclined` is true only when the
-        /// selected provider successor declined after an accepted publication. Must not await or
+        /// selected provider successor declined after an accepted publication;
+        /// `genericFollowUpScheduled` is true only when this commit actually hands a queued follow-up
+        /// to `startFollowUpRun`. A returned observation is passed to that start. Must not await or
         /// mutate run state.
         var settleAttentionTurnCompletion: (
             _ session: AgentModeViewModel.TabSession,
             _ revision: AgentRunTerminalCommitRevision,
             _ capture: AttentionNotificationAdmission.Capture,
-            _ providerSuccessorDeclined: Bool
-        ) -> Void = { _, _, _, _ in }
+            _ providerSuccessorDeclined: Bool,
+            _ genericFollowUpScheduled: Bool
+        ) -> FollowUpStartObservation? = { _, _, _, _, _ in nil }
     }
 
     private let dependencies: Dependencies
@@ -879,7 +886,7 @@ final class AgentModeRunService {
                 session.pendingInstructions.insert(contentsOf: providerTexts, at: 0)
             }
             session.mcpFollowUpRunPending = true
-            hooks.startFollowUpRun(tabID, first)
+            hooks.startFollowUpRun(tabID, first, nil)
             return
         }
         session.pendingInstructions.insert(contentsOf: providerTexts, at: 0)
