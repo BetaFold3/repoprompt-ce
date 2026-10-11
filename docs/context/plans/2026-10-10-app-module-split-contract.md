@@ -195,7 +195,20 @@ Still inside `RepoPromptApp`:
 - split `MCPIntegrationHelper` and `ToolResultDTOs` by responsibility, and inject `AgentMCPHosting` so that headless runs keep MCP hosting;
 - enumerate every interface member and constructor call site before Slice 6.
 
-Step 5 — todo | rounds 0/2 | open: | downgraded: | assumed: | deferred:
+Probe result: the name scan over the agent seed (all of `Infrastructure/AI` except `AgentModePrompts.swift`, non-view `Features/AgentMode`, and `Infrastructure/RemoteHosts`; 284 files / 142k lines) closes only 63 files today, and its outside references are 79 names in 93 files — the `TabSession` namespace (526 uses) and its ~35 sibling records in `AgentModeViewModel+Types.swift`, two coordinators that own the view model, MCP helpers and leases (50 files), settings reads and writes (8), packaging records (7), diagnostics (8), four files importing `RepoPromptUI`, and small pull-ins (key manager, executable identity, pairing validation) — while `TabSession` itself holds no owner pointer and talks to its owner only through three callbacks, so there is no kill result and the slice proceeds by in-place steps (evidence `slice5-probe/`).
+
+Decisions: hoist only the small `PromptSection` order contract that `AIMessage` stores, keeping prompt assembly and packaging in App; keep each hoisted type's behavior and object identity, and use domain-prefixed names with same-type aliases until Slice 6.
+
+#### Step 5a — `TabSession` sibling records hoisted
+Intent: move the nested `AgentModeViewModel` types that `TabSession` and the runtime name (sibling records in `AgentModeViewModel+Types.swift`, factory and control aliases, the record-based payload and transcript-presentation helpers) to top-level `Agent…` declarations in their own files, leaving same-type typealiases so every existing spelling still compiles, with no behavior change.
+
+Budget used: about 1.5 hours (cumulative ~19 hours).
+
+Result: 26 sibling records, 9 factory and control aliases and the record-only transcript-presentation algorithm now live in five top-level files under `Features/AgentMode/Runtime` (`Session/AgentSession{Persistence,RunState,Transcript}Records.swift`, `AgentModeRuntimeFactories.swift`, `Transcript/AgentTranscriptPresentationBuilder.swift`), and the view model keeps same-type aliases and thin forwarders. A move check leaves only renames, imports, five re-qualified references and the forwarders. Build, 19 affected suites (519 tests, 0 failures), format and lint pass, and both reviewers found nothing above P3, so the next step hoists `TabSession` with its remaining sibling records.
+
+Decisions: `commonEqualTurnPrefixCount` is internal on the builder because the view model's `persistableSnapshot` still calls it through a forwarder; the two aliases whose hoisted type keeps its old name use a `RepoPromptApp.` qualifier, so Slice 6 removes aliases in the same change that moves the types.
+
+Step 5a — done | rounds 0/2 | open: | downgraded: | assumed: | deferred: OracleB P3-1 — hoisted records still name `AgentModeViewModel.AgentRunEpochTransitionIntent`, `.AgentInteractionTransport`, `.AgentExecutionWorktreeSelection`, `TabSession.PersistedLoadDisposition` and `MCPServerViewModel.AgentRunWaitDrainOutcome`; resolve in 5b and the MCP step, and switch runtime callers off the view-model forwarders before Slice 6
 
 ### Slice 6 — `RepoPromptAgentCore` extraction
 Move the now-acyclic AI, agent models, providers, runtime, services, history, recommendations and non-UI remote-host code. Remove the temporary typealiases. Check the release compile flags once for cross-module optimization; don't change them.

@@ -60,26 +60,7 @@ extension AgentModeViewModel {
         let stagedCodexComputerUseActivationID: UUID?
     }
 
-    /// View-model projection of a provider-accepted scheduled turn whose durable finalization is
-    /// owned by the process coordinator. Carries the shared recovery identity and immutable
-    /// evidence for UI only; it owns no retry policy, persistence revision, or release decision.
-    struct ScheduledSendPendingFinalization: Equatable {
-        let key: AgentScheduledSendRecoveryKey
-        let lease: AgentScheduledSendAdmissionLease
-        let attempt: AgentScheduledSendPersist.Attempt
-        let receipt: AgentScheduledSendProvenance
-        /// Immutable snapshot of the accepted user item (already stamped with `receipt`).
-        let acceptedItem: AgentChatItem
-        var status: AgentScheduledSendRecoveryPhase
-
-        var scheduleID: UUID {
-            lease.scheduleID
-        }
-
-        var admittedUpdatedAt: Date {
-            lease.admittedUpdatedAt
-        }
-    }
+    typealias ScheduledSendPendingFinalization = AgentScheduledSendPendingFinalization
 
     struct AgentComposerSubmitClaim {
         let attempt: AgentComposerSubmitAttempt
@@ -118,14 +99,7 @@ extension AgentModeViewModel {
         case rejected(AgentComposerSubmitClaimRejection)
     }
 
-    enum RunInteractionStateChangeReason: String, Equatable {
-        case userInputResponseSubmitted
-        case pendingQuestionCancelled
-        case pendingApprovalCancelled
-        case approvalResponseSubmitted
-        case permissionsResponseSubmitted
-        case mcpElicitationResponseSubmitted
-    }
+    typealias RunInteractionStateChangeReason = AgentRunInteractionStateChangeReason
 
     enum AgentInteractionTransport: Equatable {
         case ui
@@ -147,13 +121,7 @@ extension AgentModeViewModel {
         let flushGeneration: UInt64
     }
 
-    struct PersistentBindingTransitionToken: Equatable {
-        let tabID: UUID
-        let sessionIdentity: ObjectIdentifier
-        let binding: AgentPersistentSessionBindingIdentity?
-        let transitionGeneration: UInt64
-        let sourceItemsRevision: Int
-    }
+    typealias PersistentBindingTransitionToken = AgentPersistentBindingTransitionToken
 
     struct PersistedHydrationCommitToken: Equatable {
         let transition: PersistentBindingTransitionToken
@@ -187,98 +155,11 @@ extension AgentModeViewModel {
         let saveRequestGeneration: UInt64
     }
 
-    /// Owner-fenced record of a committed peer transcript reset discovered by this owner's own
-    /// save. The complete local working view stays in the `TabSession` (retained, never given a
-    /// fresh stamp); only an explicitly confirmed paired reload replaces it.
-    struct StaleResetRecovery: Equatable {
-        /// Replacement permit captured when the user confirms "Reload latest…": the payload may
-        /// only be applied while the local view is exactly what the user saw when confirming.
-        struct ConsentRevision: Equatable {
-            let sourceItemsRevision: Int
-            let persistenceMutationGeneration: UInt64
-        }
+    typealias StaleResetRecovery = AgentStaleResetRecovery
 
-        enum Phase: Equatable {
-            /// The old run is being stopped through the ordinary cancellation/terminal lifecycle.
-            /// A non-nil problem means the single stop attempt did not reach quiescence.
-            case stopping(problem: String?)
-            /// Ingestion is quiescent; the retained view is unsavable until an explicit reload.
-            /// A non-nil problem reports the last failed reload attempt.
-            case retained(problem: String?)
-            /// One confirmed paired read is in flight under the captured permit.
-            case reloading(attemptID: UUID, consent: ConsentRevision)
-        }
+    typealias StaleResetRemovalAdmission = AgentStaleResetRemovalAdmission
 
-        let id: UUID
-        let tabID: UUID
-        let sessionIdentity: ObjectIdentifier
-        let binding: AgentPersistentSessionBindingIdentity
-        let bindingTransitionGeneration: UInt64
-        let workspaceID: UUID
-        let workspaceOwner: SessionIndexOwner?
-        /// The rejected lifetime/reset state, kept for comparison only (never save authority).
-        let rejectedPersistenceState: AgentSessionPersistenceState
-        /// Reset generation reported by the failed save; a replacement must cover it.
-        let observedResetGeneration: UInt64
-        var phase: Phase
-    }
-
-    /// Removal admission recorded by the pre-destructive preflight for every target tab: the
-    /// recovery episode (if any) the user consented to discard. The final removal boundary
-    /// revalidates the tab against it; an episode first discovered after the preflight is not
-    /// covered and vetoes the removal.
-    struct StaleResetRemovalAdmission: Equatable {
-        let id: UUID
-        /// The removal operation this admission belongs to.
-        let operationID: UUID
-        /// Session object and binding the admission was granted for; a replaced owner or a
-        /// changed binding is not covered.
-        let sessionIdentity: ObjectIdentifier
-        let binding: AgentPersistentSessionBindingIdentity?
-        let transitionGeneration: UInt64
-        let consentedEpisodeID: UUID?
-        /// Set when the owning operation's commit begins: rebinding and new work are refused and
-        /// no debounced save is scheduled (the operation's final save owns durability).
-        var isReserved: Bool = false
-        /// How the operation's final save for this owner settled.
-        enum FinalSaveKind: Equatable {
-            /// Nothing was dirty (or persistence is suppressed): the live state is the durable state.
-            case clean
-            /// A snapshot was durably written; `finalSaveRevision`/`finalSaveMutationGeneration`
-            /// identify exactly that snapshot, not the live state observed afterwards.
-            case written
-            /// The save discovered a committed peer reset: the owner entered stop-and-retain and is
-            /// judged by consent, never by settlement.
-            case recovery
-            /// Dirty state that could not be written (no authority, missing file, deferred).
-            case unsaved
-        }
-
-        /// Content revision of the snapshot the operation's final save made durable (or of the
-        /// clean live state); a live revision that differs is not settled.
-        var finalSaveRevision: Int?
-        /// Persistence-mutation generation of that same snapshot.
-        var finalSaveMutationGeneration: UInt64?
-        var finalSaveKind: FinalSaveKind?
-        /// Set after the operation's final save: no later save may run for this owner.
-        var isFinalSaveCompleted: Bool = false
-        /// Set synchronously by the final batch commit: the owner is retired for removal.
-        var isCommitted: Bool = false
-
-        /// No debounced save may be scheduled once the operation owns durability for this owner.
-        var blocksScheduledSaves: Bool {
-            isReserved || isFinalSaveCompleted || isCommitted
-        }
-    }
-
-    /// Result of one paired load operation. `attemptID` is the immutable identity of the load
-    /// that produced it; callers compare it with the session's current attempt before acting on
-    /// the outcome, so an obsolete (cancelled or superseded) load can never change a newer
-    /// load's readiness or published outcome.
-    struct PersistedLoadOutcome: Equatable {
-        let attemptID: UUID?
-        let disposition: TabSession.PersistedLoadDisposition
-    }
+    typealias PersistedLoadOutcome = AgentPersistedLoadOutcome
 
     /// Operation-owned compose-tab removal batch: the complete requested tab set with each
     /// target's ownership state captured before the first admission await (a live owner with its
@@ -496,39 +377,7 @@ extension AgentModeViewModel {
         let expectedCurrentEpoch: AgentRunTurnEpoch?
     }
 
-    struct AgentMCPControlContext: Equatable {
-        let sessionID: UUID
-        let activationID: UUID
-        let registration: AgentRunSessionStore.Registration
-        var currentEpoch: AgentRunTurnEpoch?
-        var preparedEpoch: AgentRunTurnEpoch?
-        var pendingEpochTransition: AgentRunEpochTransitionIntent?
-        let originatingConnectionID: UUID?
-        let interactionTransport: AgentInteractionTransport
-        let suppressUserNotifications: Bool
-        let forceAutoEditEnabled: Bool
-        let autoEditEnabledBeforeOverride: Bool
-        /// The task label kind for this MCP-controlled run (e.g. explore, engineer).
-        /// Used to customize tool advertisement and system prompts for role-specific behavior.
-        let taskLabelKind: AgentModelCatalog.TaskLabelKind?
-
-        func replacingRegistration(_ registration: AgentRunSessionStore.Registration) -> Self {
-            Self(
-                sessionID: sessionID,
-                activationID: activationID,
-                registration: registration,
-                currentEpoch: currentEpoch,
-                preparedEpoch: preparedEpoch,
-                pendingEpochTransition: pendingEpochTransition,
-                originatingConnectionID: originatingConnectionID,
-                interactionTransport: interactionTransport,
-                suppressUserNotifications: suppressUserNotifications,
-                forceAutoEditEnabled: forceAutoEditEnabled,
-                autoEditEnabledBeforeOverride: autoEditEnabledBeforeOverride,
-                taskLabelKind: taskLabelKind
-            )
-        }
-    }
+    typealias AgentMCPControlContext = RepoPromptApp.AgentMCPControlContext
 
     /// Internal for cross-file AgentModeViewModel extension access after the mechanical file split.
     enum MCPActiveInstructionDeliverySignalTiming: Equatable {
@@ -641,53 +490,15 @@ extension AgentModeViewModel {
         var adoptedSessionProfile: AgentSessionProfile?
     }
 
-    struct AutoEditPermissionGuidance: Equatable {
-        enum Provider: Equatable {
-            case codex
-            case claude
-        }
+    typealias AutoEditPermissionGuidance = AgentAutoEditPermissionGuidance
 
-        enum Action: Equatable {
-            case setCodexReadOnly
-            case setClaudeRequireApproval
-        }
+    typealias NonCodexTurnTokenAccumulator = AgentNonCodexTurnTokenAccumulator
 
-        let provider: Provider
-        let message: String
-        let actionTitle: String
-        let action: Action
-    }
+    typealias AttachmentTurnDisposition = AgentAttachmentTurnDisposition
 
-    struct NonCodexTurnTokenAccumulator {
-        var estimatedUserInputTokens: Int = 0
-        var estimatedToolInputTokens: Int = 0
-        var estimatedToolOutputTokens: Int = 0
-        /// Exact stream-derived context snapshot for the current turn (from usage events),
-        /// tracked separately from the session-wide display value to prevent billed-turn
-        /// aggregates from overwriting it.
-        var observedContextUsedTokens: Int?
+    typealias AttachmentTurnState = AgentAttachmentTurnState
 
-        var estimatedInputTokens: Int {
-            estimatedUserInputTokens + estimatedToolInputTokens + estimatedToolOutputTokens
-        }
-    }
-
-    enum AttachmentTurnDisposition: Equatable {
-        case restoreToPending
-        case deleteFiles
-        case keepFiles
-    }
-
-    enum AttachmentTurnState: Equatable {
-        case idle
-        case reserved(reservationID: UUID, attachments: [AgentImageAttachment])
-        case consumed(reservationID: UUID, attachments: [AgentImageAttachment])
-    }
-
-    struct CodexComputerUseActivation: Equatable {
-        let id: UUID
-        let createdAt: Date
-    }
+    typealias CodexComputerUseActivation = AgentCodexComputerUseActivation
 
     struct NativeSlashPreparedUserTurn: Equatable {
         let command: CodexAgentModeCoordinator.NativeSlashCommand
@@ -697,219 +508,23 @@ extension AgentModeViewModel {
         let shouldEnableCodexComputerUse: Bool
     }
 
-    struct PendingHandoffState: Equatable {
-        var payload: String?
-        var createdAt: Date?
-        var sourceItemID: UUID?
-        /// True only for a freshly-created handoff tab. Keeps agent selection editable
-        /// until the destination tab successfully sends its first real user turn.
-        var defersProviderLockUntilSend: Bool = false
-        var isStagedForSend: Bool = false
+    typealias PendingHandoffState = AgentPendingHandoffState
 
-        var hasPayload: Bool {
-            guard let payload else { return false }
-            return !payload.isEmpty
-        }
+    typealias CodexWatchdogState = AgentCodexWatchdogState
 
-        mutating func clearAfterSend() {
-            payload = nil
-            createdAt = nil
-            sourceItemID = nil
-            defersProviderLockUntilSend = false
-            isStagedForSend = false
-        }
-    }
+    typealias CodexResumeTimeoutState = AgentCodexResumeTimeoutState
 
-    struct CodexWatchdogState: Equatable {
-        var lastProgressAt: Date?
-        var suppressUntil: Date?
-        var ambiguousActiveProbeCount: Int = 0
-        var isPausedAfterWarning: Bool = false
-        var warnedSinceLastProgress: Bool = false
-        var requiresColdTeardownOnCancel: Bool = false
-    }
+    typealias CodexNativeToolLivenessState = AgentCodexNativeToolLivenessState
 
-    /// Consecutive `thread/resume` timeouts for one saved target. It only drives failure guidance
-    /// and never changes which request is sent. It resets on success, a target change, or a
-    /// failure that is neither a timeout nor a cancellation; Stop leaves it unchanged.
-    struct CodexResumeTimeoutState: Equatable {
-        var conversationID: String?
-        var rolloutPath: String?
-        var consecutiveTimeouts: Int = 0
-    }
+    typealias BashLiveExecutionState = AgentBashLiveExecutionState
 
-    struct CodexNativeToolLivenessState: Equatable {
-        struct Key: Hashable {
-            let invocationID: UUID?
-            let fallbackSignature: String
-        }
+    typealias SourceItemsMutation = AgentSourceItemsMutation
 
-        struct Execution: Equatable {
-            let toolName: String
-            let startedAt: Date
-            var lastSignalAt: Date
-            var processID: String?
-            var sawRunningUpdate: Bool = false
-        }
+    typealias AgentTranscriptAutoFollowArmingState = RepoPromptApp.AgentTranscriptAutoFollowArmingState
 
-        var inFlight: [Key: Execution] = [:]
-    }
+    typealias PendingSourceItemsMutationSummary = AgentPendingSourceItemsMutationSummary
 
-    struct BashLiveExecutionState: Equatable {
-        private static let runningStatusWords: Set<String> = ["running", "in_progress", "inprogress", "in-progress", "pending"]
-
-        let executionKey: String
-        let transcriptItemID: UUID
-        let toolName: String
-        let invocationID: UUID?
-        let fallbackSignature: String
-        var processID: String?
-        var command: String?
-        var statusWord: String?
-        var exitCode: Int?
-        var output: String?
-        var isSummaryOnly: Bool
-        var lastSignalAt: Date
-
-        var isRunning: Bool {
-            guard let statusWord = statusWord?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
-                  !statusWord.isEmpty
-            else {
-                return exitCode == nil
-            }
-            return Self.runningStatusWords.contains(statusWord)
-        }
-
-        var parsedResult: BashToolResultParser.ParsedResult {
-            .init(
-                isRunning: isRunning,
-                command: command,
-                statusWord: statusWord,
-                exitCode: exitCode,
-                output: output,
-                processID: processID,
-                isSummaryOnly: isSummaryOnly
-            )
-        }
-
-        var renderedResultJSON: String {
-            BashToolResultParser.resultJSON(
-                statusWord: statusWord ?? (isRunning ? "running" : "completed"),
-                command: command,
-                processID: processID,
-                output: output,
-                exitCode: exitCode,
-                summaryOnly: isSummaryOnly
-            )
-        }
-    }
-
-    enum SourceItemsMutation {
-        case append(index: Int, itemKind: AgentChatItemKind)
-        case replace(index: Int, previousKind: AgentChatItemKind, currentKind: AgentChatItemKind)
-        case mutate(index: Int, itemKind: AgentChatItemKind)
-        case remove(index: Int, itemKind: AgentChatItemKind)
-        case replaceAll
-        case structural
-
-        var changedIndexRange: ClosedRange<Int>? {
-            switch self {
-            case let .append(index, _),
-                 let .replace(index, _, _),
-                 let .mutate(index, _),
-                 let .remove(index, _):
-                index ... index
-            case .replaceAll, .structural:
-                nil
-            }
-        }
-
-        var touchesUserItem: Bool {
-            switch self {
-            case let .append(_, itemKind),
-                 let .mutate(_, itemKind),
-                 let .remove(_, itemKind):
-                itemKind == .user
-            case let .replace(_, previousKind, currentKind):
-                previousKind == .user || currentKind == .user
-            case .replaceAll, .structural:
-                true
-            }
-        }
-
-        var isStructural: Bool {
-            switch self {
-            case .remove, .replaceAll, .structural:
-                true
-            case .append, .replace, .mutate:
-                false
-            }
-        }
-    }
-
-    enum AgentTranscriptAutoFollowArmingState: String, Codable, Equatable {
-        case armed
-        case disarmedAfterManualDetach
-    }
-
-    struct PendingSourceItemsMutationSummary: Equatable {
-        var earliestChangedIndex: Int
-        var latestChangedIndex: Int
-        var containsRemoval: Bool
-        var containsReplaceAll: Bool
-        var containsUserMutation: Bool
-        var containsStructuralMutation: Bool
-
-        init(_ mutation: SourceItemsMutation) {
-            let changedRange = mutation.changedIndexRange
-            earliestChangedIndex = changedRange?.lowerBound ?? 0
-            latestChangedIndex = changedRange?.upperBound ?? Int.max
-            containsRemoval = {
-                if case .remove = mutation { return true }
-                return false
-            }()
-            containsReplaceAll = {
-                if case .replaceAll = mutation { return true }
-                return false
-            }()
-            containsUserMutation = mutation.touchesUserItem
-            containsStructuralMutation = mutation.isStructural
-        }
-
-        mutating func merge(_ mutation: SourceItemsMutation) {
-            if let changedRange = mutation.changedIndexRange {
-                earliestChangedIndex = min(earliestChangedIndex, changedRange.lowerBound)
-                latestChangedIndex = max(latestChangedIndex, changedRange.upperBound)
-            } else {
-                earliestChangedIndex = 0
-                latestChangedIndex = Int.max
-            }
-            if case .remove = mutation {
-                containsRemoval = true
-            }
-            if case .replaceAll = mutation {
-                containsReplaceAll = true
-            }
-            containsUserMutation = containsUserMutation || mutation.touchesUserItem
-            containsStructuralMutation = containsStructuralMutation || mutation.isStructural
-        }
-
-        var allowsIncrementalFinalTurnRebuild: Bool {
-            !containsRemoval
-                && !containsReplaceAll
-                && !containsUserMutation
-                && !containsStructuralMutation
-        }
-    }
-
-    struct DerivedTranscriptSyncState: Equatable {
-        let sourceItemsRevision: Int
-        let nextSequenceIndex: Int
-        let runState: AgentSessionRunState
-        let selectedAgent: AgentProviderKind
-        let hidePendingQuestionToolCall: Bool
-        let projectionProtection: AgentTranscriptProjectionProtection
-    }
+    typealias DerivedTranscriptSyncState = AgentDerivedTranscriptSyncState
 
     struct PersistableTranscriptSnapshot {
         let transcript: AgentTranscript
@@ -1030,29 +645,9 @@ extension AgentModeViewModel {
         }
     }
 
-    struct BuiltTranscriptPresentation {
-        let transcript: AgentTranscript
-        let baseProjection: AgentTranscriptProjection
-        let fullProjection: AgentTranscriptProjection
-        let workingProjection: AgentTranscriptProjection
-        let projection: AgentTranscriptProjection
-        let turnProjectionCaches: [UUID: AgentTranscriptTurnProjectionCache]
-        let archivedSnapshot: AgentArchivedTranscriptSnapshot
-        let projectionProtection: AgentTranscriptProjectionProtection
-        let canonicalVisibleRowCount: Int
-        let projectionCounts: AgentTranscriptProjectionCounts
-        let analyticsSnapshot: AgentTranscriptAnalyticsSnapshot
-        let sanitizedActivityCount: Int
-        let performanceSnapshot: AgentTranscriptPerformanceSnapshot
-        let rawToolResultPayloadRenderRevisionByItemID: [UUID: Int]
-    }
+    typealias BuiltTranscriptPresentation = AgentBuiltTranscriptPresentation
 
-    enum DerivedTranscriptRefreshReason: String {
-        case liveMutation
-        case saveSession
-        case coldLoad
-        case manualRefresh
-    }
+    typealias DerivedTranscriptRefreshReason = AgentDerivedTranscriptRefreshReason
 
     /// Internal for cross-file AgentModeViewModel extension access after the mechanical file split.
     struct SessionTreeNode {
@@ -1090,22 +685,7 @@ extension AgentModeViewModel {
         }
     }
 
-    enum InitialStartLocation: Equatable {
-        case local
-        case newWorktree
-        case existingWorktree(AgentExecutionWorktreeSelection)
-
-        var label: String {
-            switch self {
-            case .local:
-                "Work locally"
-            case .newWorktree:
-                "New worktree"
-            case let .existingWorktree(selection):
-                selection.label
-            }
-        }
-    }
+    typealias InitialStartLocation = AgentInitialStartLocation
 
     enum ExecutionLocationChangeConfirmation: Equatable {
         case startedThreadRestart
