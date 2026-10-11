@@ -106,12 +106,6 @@ private extension WorkspaceSelectionHost {
     }
 }
 
-extension WorkspaceManagerViewModel: WorkspaceSelectionHost {
-    func committedSelectionRevision(for identity: WorkspaceSelectionIdentity) -> UInt64 {
-        selectionRevisionForMCP(workspaceID: identity.workspaceID, tabID: identity.tabID)
-    }
-}
-
 /// Window-scoped coordinator that makes compose-tab `StoredSelection` the runtime
 /// selection source while the WorkspaceFiles UI adapter still owns checkbox state.
 @MainActor

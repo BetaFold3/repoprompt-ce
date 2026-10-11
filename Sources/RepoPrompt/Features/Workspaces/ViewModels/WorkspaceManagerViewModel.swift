@@ -8988,3 +8988,5 @@ class WorkspaceManagerViewModel: ObservableObject {
         }
     }
 }
+
+extension WorkspaceManagerViewModel: WorkspaceSearchReadinessProviding {}

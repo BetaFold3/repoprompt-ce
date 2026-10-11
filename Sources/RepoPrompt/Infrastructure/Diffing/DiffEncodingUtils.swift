@@ -3,26 +3,9 @@ import MCP
 
 /// Pure helpers (no AppKit/SwiftUI) that were previously duplicated.
 enum DiffEncodingUtils {
-    /// Returns: encoded original lines, detected indent type ("s"|"t"), and
-    /// `usesSpaces` convenience flag.
-    static func encodedOriginal(of fileVM: FileViewModel) async throws
-        -> ([String], String, Bool)
-    {
-        let original = await fileVM.latestContent ?? ""
-        let (lines, _) = String.splitContentPreservingLineEndings(original)
-        let (indent, _) = String.detectIndentationTypeFromLines(lines) // defaults to ("s", 4)
-        let usesSpaces = indent == "s"
-        let encodedOriginal = lines.map {
-            String.encodeIndentationWithConversion(
-                $0,
-                desiredIndentationType: indent
-            )
-        }
-        return (encodedOriginal, indent, usesSpaces)
-    }
-
-    /// Helper to encode arbitrary raw text into `[String]` using the same rules
-    /// as `encodedOriginal(of:)`.
+    /// Helper to encode arbitrary raw text into `[String]` by splitting it into lines
+    /// with `DiffParserUtils.splitContentToLines` (the App adapter `encodedOriginal(of:)`
+    /// uses the same rules).
     static func encode(_ raw: String, usesSpaces: Bool) -> [String] {
         DiffParserUtils.splitContentToLines(raw, usesSpaces)
     }

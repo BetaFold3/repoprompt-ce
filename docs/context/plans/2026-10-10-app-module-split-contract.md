@@ -144,7 +144,16 @@ Step 3b — done | rounds 0/2 | open: | downgraded: | assumed: A2 | deferred: Or
 ### Slice 4 — `RepoPromptWorkspace`
 Move workspace context, indexing and search, VCS and worktrees, domain diff and edit operations, workspace persistence, and non-UI CodeMap and workspace-file code. Prompt packaging (`ChatPreset`, `CopyPreset`, `PromptSection`) and anything that needs `AIModel` stay above, with only their workspace-only parts extracted down.
 
-Step 4 — todo | rounds 0/2 | open: | downgraded: | assumed: | deferred:
+Probe result: the name scan over the workspace seed (WorkspaceContext, VCS, FileSystem, Persistence, Diffing, Search, and non-view CodeMap/WorkspaceFiles/Workspaces code plus `StandardizedPath`, `SyntaxManager` and `CheckoutPathIdentity`; 235 files / 164k lines) closes only 74 files today, but its references outside the seed are just 39 names in 29 files used by 45 seed files — view-model convenience overloads, typed declarations living in view-model, prompt and diagnostics files, the search readiness call, worktree-startup and MCP diagnostics, MCP storage constants and DTO adapters, and preset persistence — so there is no kill result and the slice proceeds by in-place seams; the two `String(reflecting:)` sort keys compare values of one type, so their order holds if each type moves whole (evidence `slice4-probe/`).
+
+#### Step 4a — model and view-model seams in place
+Intent: hoist the typed declarations that workspace code uses out of view-model, prompt, AI-message and agent files into their own files, move view-model convenience overloads out of workspace files into App extensions, and put the search readiness wait and check behind a narrow protocol, with no behavior change. Budget used: about 2 hours including the probe (cumulative ~11 hours).
+
+Result: hoisted 11 typed declarations (with the supporting types their stored members need) into their own workspace-side files with identical text, moved the separable view-model convenience members of `CodeMapExtractor`, `FileSearchActor`, `SortingUtils`, `DiffEncodingUtils` and the frozen path records into App adapter files under `Features/WorkspaceFiles/ViewModels/Adapters/`, spelled `TokenCalculationService`'s slice types directly, moved the `WorkspaceSelectionHost` conformance to an adapter, and put the search readiness calls behind `WorkspaceSearchReadinessProviding`; build, 25 affected suites (616 tests), format and lint pass, and the next step handles the diagnostics coupling.
+
+Decisions: `FileSystemItemType` and `FileTreeItem` stay with the view models because their cases wrap them; view-model uses that are part of a type's core (`DiffParser`'s stored `WorkspaceFilesViewModel`, `CodeMapExtractor`'s renderer, `SearchFileDescriptor.init(file:)`) stay for the rescan to place.
+
+Step 4a — done | rounds 0/2 | open: | downgraded: | assumed: | deferred: OracleB F1 — frozen path-record adapter initializers need a verbatim `package` init at the cut (don't route through the re-standardizing public init); pre-existing dropped `isExplicitSubtree` in the short `generateFileTreeForRoots(option:)` overload
 
 ### Slice 5 — AgentCore seams, in place
 Still inside `RepoPromptApp`:
