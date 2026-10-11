@@ -1139,7 +1139,7 @@ actor AgentSessionDataService {
     }
 
     private func metadataIndex(
-        for workspace: WorkspaceModel,
+        for workspace: some AgentWorkspaceStorageReference,
         mode: AgentSessionMetadataIndexLoadMode
     ) async throws -> AgentSessionMetadataIndex? {
         let folder = try ensureAgentSessionsFolder(for: workspace)
@@ -1157,7 +1157,7 @@ actor AgentSessionDataService {
         }
     }
 
-    func fastMetadataRecordsIfAvailable(for workspace: WorkspaceModel) async throws -> FastMetadataRecordsResult? {
+    func fastMetadataRecordsIfAvailable(for workspace: some AgentWorkspaceStorageReference) async throws -> FastMetadataRecordsResult? {
         let folder = try ensureAgentSessionsFolder(for: workspace)
         let key = canonicalMetadataFolderKey(folder)
         if let cached = metadataIndexCacheByFolder[key] {
@@ -1195,7 +1195,7 @@ actor AgentSessionDataService {
         }
     }
 
-    func metadataRecordForSessionID(_ id: UUID, for workspace: WorkspaceModel) async throws -> AgentSessionMetadataRecord? {
+    func metadataRecordForSessionID(_ id: UUID, for workspace: some AgentWorkspaceStorageReference) async throws -> AgentSessionMetadataRecord? {
         let folder = try ensureAgentSessionsFolder(for: workspace)
         let fileURL = agentSessionFileURL(id: id, in: folder)
         guard FileManager.default.fileExists(atPath: fileURL.path) else {
@@ -1210,7 +1210,7 @@ actor AgentSessionDataService {
     }
 
     private func metadataRecords(
-        for workspace: WorkspaceModel,
+        for workspace: some AgentWorkspaceStorageReference,
         limit: Int? = nil
     ) async throws -> [AgentSessionMetadataRecord] {
         let index = try await metadataIndex(for: workspace, mode: .backfillIfMissing)
@@ -1219,11 +1219,11 @@ actor AgentSessionDataService {
         return Array(records.prefix(max(limit, 0)))
     }
 
-    func indexedAgentSessionMetadataRecords(for workspace: WorkspaceModel) async throws -> [AgentSessionMetadataRecord] {
+    func indexedAgentSessionMetadataRecords(for workspace: some AgentWorkspaceStorageReference) async throws -> [AgentSessionMetadataRecord] {
         try await metadataRecords(for: workspace)
     }
 
-    func sidebarStreamMetadataRecords(for workspace: WorkspaceModel) async throws -> [AgentSessionMetadataRecord] {
+    func sidebarStreamMetadataRecords(for workspace: some AgentWorkspaceStorageReference) async throws -> [AgentSessionMetadataRecord] {
         let folder = try ensureAgentSessionsFolder(for: workspace)
         if let index = await readMetadataIndexIfAvailable(folder: folder) {
             scheduleMetadataIndexReconciliationIfNeeded(
@@ -1580,7 +1580,7 @@ actor AgentSessionDataService {
     /// value and must not replace it after a missing-file or deletion failure.
     func prepareInitialAgentSessionPersistence(
         sessionID: UUID,
-        for workspace: WorkspaceModel
+        for workspace: some AgentWorkspaceStorageReference
     ) async throws -> AgentSessionPersistenceState {
         await acquireSessionPersistence(for: sessionID)
         defer { releaseSessionPersistence(for: sessionID) }
@@ -1600,7 +1600,7 @@ actor AgentSessionDataService {
     /// caller must adopt both values together; the state cannot safely authorize an older snapshot.
     func loadAgentSessionForEditing(
         id sessionID: UUID,
-        for workspace: WorkspaceModel
+        for workspace: some AgentWorkspaceStorageReference
     ) async throws -> AgentSessionEditableLoad? {
         await acquireSessionPersistence(for: sessionID)
         defer { releaseSessionPersistence(for: sessionID) }
@@ -1632,7 +1632,7 @@ actor AgentSessionDataService {
     /// owners must use the persistence-state overload below.
     func saveAgentSession(
         _ session: AgentSession,
-        for workspace: WorkspaceModel,
+        for workspace: some AgentWorkspaceStorageReference,
         preparation: SavePreparation = .canonicalize,
         trustedCanonicalItemCount: Int? = nil,
         intentionallyRemovingFinalizedScheduledSendItems removals: [AgentScheduledSendFinalizedItemRemoval] = [],
@@ -1658,7 +1658,7 @@ actor AgentSessionDataService {
     /// that owner may use for later saves; failures never refresh or transfer ownership.
     func saveAgentSession(
         _ session: AgentSession,
-        for workspace: WorkspaceModel,
+        for workspace: some AgentWorkspaceStorageReference,
         preparation: SavePreparation = .canonicalize,
         trustedCanonicalItemCount: Int? = nil,
         intentionallyRemovingFinalizedScheduledSendItems removals: [AgentScheduledSendFinalizedItemRemoval] = [],
@@ -1682,7 +1682,7 @@ actor AgentSessionDataService {
 
     private func saveAgentSessionLocked(
         _ session: AgentSession,
-        for workspace: WorkspaceModel,
+        for workspace: some AgentWorkspaceStorageReference,
         preparation: SavePreparation,
         trustedCanonicalItemCount: Int?,
         intentionallyRemovingFinalizedScheduledSendItems removals: [AgentScheduledSendFinalizedItemRemoval],
@@ -1832,7 +1832,7 @@ actor AgentSessionDataService {
     /// scheduling owners must use the persistence-stamp overload below.
     func mutateScheduledSend(
         sessionID: UUID,
-        for workspace: WorkspaceModel,
+        for workspace: some AgentWorkspaceStorageReference,
         mutation: AgentScheduledSendMutation
     ) async throws -> AgentScheduledSendMutationResult {
         await acquireSessionPersistence(for: sessionID)
@@ -1848,7 +1848,7 @@ actor AgentSessionDataService {
     /// Fenced schedule-only mutation for an editable owner.
     func mutateScheduledSend(
         sessionID: UUID,
-        for workspace: WorkspaceModel,
+        for workspace: some AgentWorkspaceStorageReference,
         persistenceStamp: AgentSessionPersistenceStamp,
         mutation: AgentScheduledSendMutation
     ) async throws -> AgentScheduledSendMutationResult {
@@ -1864,7 +1864,7 @@ actor AgentSessionDataService {
 
     private func performScheduledSendMutation(
         sessionID: UUID,
-        for workspace: WorkspaceModel,
+        for workspace: some AgentWorkspaceStorageReference,
         persistenceStamp: AgentSessionPersistenceStamp?,
         mutation: AgentScheduledSendMutation
     ) async throws -> AgentScheduledSendMutationResult {
@@ -1974,7 +1974,7 @@ actor AgentSessionDataService {
     /// replacement. Matching retries are persistence-idempotent and never authorize provider work.
     func finalizeScheduledSend(
         sessionID: UUID,
-        for workspace: WorkspaceModel,
+        for workspace: some AgentWorkspaceStorageReference,
         expectedUpdatedAt: Date,
         expectedAttempt: AgentScheduledSendPersist.Attempt,
         acceptedUserItem: AgentChatItem,
@@ -2004,7 +2004,7 @@ actor AgentSessionDataService {
     /// Provider-handoff callers must use the persistence-stamp overload below.
     func prepareScheduledSendRecovery(
         sessionID: UUID,
-        for workspace: WorkspaceModel,
+        for workspace: some AgentWorkspaceStorageReference,
         expectedUpdatedAt: Date,
         expectedAttempt: AgentScheduledSendPersist.Attempt
     ) async throws -> AgentScheduledSendRecoveryContext {
@@ -2022,7 +2022,7 @@ actor AgentSessionDataService {
     /// Fenced recovery preparation for an editable owner.
     func prepareScheduledSendRecovery(
         sessionID: UUID,
-        for workspace: WorkspaceModel,
+        for workspace: some AgentWorkspaceStorageReference,
         persistenceStamp: AgentSessionPersistenceStamp,
         expectedUpdatedAt: Date,
         expectedAttempt: AgentScheduledSendPersist.Attempt
@@ -2040,7 +2040,7 @@ actor AgentSessionDataService {
 
     private func prepareScheduledSendRecoveryLocked(
         sessionID: UUID,
-        for workspace: WorkspaceModel,
+        for workspace: some AgentWorkspaceStorageReference,
         persistenceStamp: AgentSessionPersistenceStamp?,
         expectedUpdatedAt: Date,
         expectedAttempt: AgentScheduledSendPersist.Attempt
@@ -2197,7 +2197,7 @@ actor AgentSessionDataService {
 
     private func performScheduledSendFinalization(
         sessionID: UUID,
-        for workspace: WorkspaceModel,
+        for workspace: some AgentWorkspaceStorageReference,
         expectedUpdatedAt: Date,
         expectedAttempt: AgentScheduledSendPersist.Attempt,
         acceptedUserItem: AgentChatItem,
@@ -2363,7 +2363,7 @@ actor AgentSessionDataService {
     func renameAgentSession(
         id: UUID,
         to newName: String,
-        for workspace: WorkspaceModel
+        for workspace: some AgentWorkspaceStorageReference
     ) async throws {
         let validatedName = AgentSession.validatedName(newName)
         guard !validatedName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
@@ -2373,7 +2373,7 @@ actor AgentSessionDataService {
         _ = try await saveAgentSession(session, for: workspace)
     }
 
-    func rawLastRunStateForAgentSession(id: UUID, for workspace: WorkspaceModel) async throws -> String? {
+    func rawLastRunStateForAgentSession(id: UUID, for workspace: some AgentWorkspaceStorageReference) async throws -> String? {
         let agentSessionsFolder = try ensureAgentSessionsFolder(for: workspace)
         let fileURL = agentSessionsFolder.appendingPathComponent(agentSessionFilename(for: id))
         guard FileManager.default.fileExists(atPath: fileURL.path) else { return nil }
@@ -2573,7 +2573,7 @@ actor AgentSessionDataService {
     }
 
     /// Returns a list of AgentSession files in the workspace's AgentSessions folder, sorted by mod date desc.
-    func listAgentSessions(for workspace: WorkspaceModel) async throws -> [URL] {
+    func listAgentSessions(for workspace: some AgentWorkspaceStorageReference) async throws -> [URL] {
         let agentSessionsFolder = try ensureAgentSessionsFolder(for: workspace)
 
         let contents = try FileManager.default.contentsOfDirectory(
@@ -2596,7 +2596,7 @@ actor AgentSessionDataService {
     }
 
     /// Get metadata for recent agent sessions without loading full content.
-    func recentSessions(for workspace: WorkspaceModel, limit: Int = 10) async throws -> [AgentSessionMeta] {
+    func recentSessions(for workspace: some AgentWorkspaceStorageReference, limit: Int = 10) async throws -> [AgentSessionMeta] {
         do {
             return try await metadataRecords(for: workspace, limit: limit).map {
                 $0.agentSessionMeta()
@@ -2640,7 +2640,7 @@ actor AgentSessionDataService {
 
     /// Get lightweight metadata for agent sessions without loading full transcript content.
     func listAgentSessionsMeta(
-        for workspace: WorkspaceModel,
+        for workspace: some AgentWorkspaceStorageReference,
         limit: Int? = nil
     ) async throws -> [AgentSessionMeta] {
         do {
@@ -2699,7 +2699,7 @@ actor AgentSessionDataService {
     /// Resolves a session reference (UUID string only) to a session ID.
     func resolveAgentSessionID(
         reference: String,
-        for workspace: WorkspaceModel
+        for workspace: some AgentWorkspaceStorageReference
     ) async throws -> UUID? {
         let trimmed = reference.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return nil }
@@ -2709,7 +2709,7 @@ actor AgentSessionDataService {
 
     func loadAgentSession(
         reference: String,
-        for workspace: WorkspaceModel
+        for workspace: some AgentWorkspaceStorageReference
     ) async throws -> AgentSession? {
         guard let sessionID = try await resolveAgentSessionID(reference: reference, for: workspace) else {
             return nil
@@ -2718,7 +2718,7 @@ actor AgentSessionDataService {
     }
 
     /// Find an agent session by its ID for a workspace.
-    func findAgentSession(id: UUID, for workspace: WorkspaceModel) async throws -> AgentSession? {
+    func findAgentSession(id: UUID, for workspace: some AgentWorkspaceStorageReference) async throws -> AgentSession? {
         let files = try await listAgentSessions(for: workspace)
 
         for fileURL in files {
@@ -2732,7 +2732,7 @@ actor AgentSessionDataService {
     }
 
     /// Load an agent session by ID without scanning the session directory.
-    func loadAgentSession(id: UUID, for workspace: WorkspaceModel) async throws -> AgentSession? {
+    func loadAgentSession(id: UUID, for workspace: some AgentWorkspaceStorageReference) async throws -> AgentSession? {
         let agentSessionsFolder = try ensureAgentSessionsFolder(for: workspace)
         let filename = "AgentSession-\(id.uuidString).json"
         let fileURL = agentSessionsFolder.appendingPathComponent(filename)
@@ -2745,7 +2745,7 @@ actor AgentSessionDataService {
     }
 
     /// Find an agent session by compose tab ID.
-    func findAgentSessionForTab(_ tabID: UUID, for workspace: WorkspaceModel) async throws -> AgentSession? {
+    func findAgentSessionForTab(_ tabID: UUID, for workspace: some AgentWorkspaceStorageReference) async throws -> AgentSession? {
         if let records = try? await metadataRecords(for: workspace),
            let best = records
            .filter({ $0.composeTabID == tabID })
@@ -2825,7 +2825,7 @@ actor AgentSessionDataService {
     }
 
     /// Delete an agent session by ID under the same per-session gate as saves and CAS.
-    func deleteAgentSession(id: UUID, for workspace: WorkspaceModel) async throws {
+    func deleteAgentSession(id: UUID, for workspace: some AgentWorkspaceStorageReference) async throws {
         let agentSessionsFolder = try ensureAgentSessionsFolder(for: workspace)
         let fileURL = agentSessionsFolder.appendingPathComponent(agentSessionFilename(for: id))
         try await deleteAgentSessionFile(fileURL)
@@ -2833,7 +2833,7 @@ actor AgentSessionDataService {
 
     func deletionCandidates(
         forComposeTabID tabID: UUID,
-        for workspace: WorkspaceModel
+        for workspace: some AgentWorkspaceStorageReference
     ) async throws -> [AgentSessionDeletionCandidate] {
         let agentSessionsFolder = try ensureAgentSessionsFolder(for: workspace)
         var candidateFilesByPath: [String: URL] = [:]
@@ -2874,7 +2874,7 @@ actor AgentSessionDataService {
 
     func deleteAgentSession(
         ifCurrent candidate: AgentSessionDeletionCandidate,
-        for workspace: WorkspaceModel
+        for workspace: some AgentWorkspaceStorageReference
     ) async throws -> AgentSessionConditionalDeletionResult {
         let state = candidate.persistenceState
         let sessionID = state.stamp.sessionID
@@ -2910,7 +2910,7 @@ actor AgentSessionDataService {
         return .deleted
     }
 
-    func deleteAgentSessions(forComposeTabID tabID: UUID, for workspace: WorkspaceModel) async throws {
+    func deleteAgentSessions(forComposeTabID tabID: UUID, for workspace: some AgentWorkspaceStorageReference) async throws {
         let agentSessionsFolder = try ensureAgentSessionsFolder(for: workspace)
         var candidateFilesByPath: [String: URL] = [:]
         if let index = await readMetadataIndexIfAvailable(folder: agentSessionsFolder) {
@@ -2963,7 +2963,7 @@ actor AgentSessionDataService {
     // MARK: - Folder Helpers
 
     /// Creates (if needed) and returns the "AgentSessions" subfolder for the given workspace.
-    private func ensureAgentSessionsFolder(for workspace: WorkspaceModel) throws -> URL {
+    private func ensureAgentSessionsFolder(for workspace: some AgentWorkspaceStorageReference) throws -> URL {
         let baseFolder = try workspaceFolderURL(for: workspace)
         let agentSessionsFolder = baseFolder.appendingPathComponent("AgentSessions")
 
@@ -2974,7 +2974,7 @@ actor AgentSessionDataService {
     }
 
     /// Return the main folder for the workspace (with custom or default path).
-    private func workspaceFolderURL(for workspace: WorkspaceModel) throws -> URL {
+    private func workspaceFolderURL(for workspace: some AgentWorkspaceStorageReference) throws -> URL {
         if let customURL = workspace.customStoragePath {
             return customURL
         } else {

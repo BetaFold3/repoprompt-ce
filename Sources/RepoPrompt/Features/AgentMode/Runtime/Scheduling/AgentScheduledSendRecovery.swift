@@ -22,8 +22,8 @@ struct AgentSessionTranscriptResetReceipt: Hashable {
 struct AgentScheduledSendRecoveryContext {
     let sessionID: UUID
     let workspaceID: UUID
-    /// Pinned workspace model required by the data service's existing folder/index paths.
-    let workspace: WorkspaceModel
+    /// Pinned workspace storage reference required by the data service's existing folder/index paths.
+    let workspace: any AgentWorkspaceStorageReference
     let fileURL: URL
     let agentSessionsFolderURL: URL
     /// Process-local explicit-deletion generation observed at preparation.

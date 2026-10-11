@@ -67,14 +67,14 @@ enum AgentSidebarScheduledSendStatus: Equatable {
 }
 
 struct AgentSessionSidebarBuildRequest {
-    let workspace: WorkspaceModel
+    let workspace: any AgentWorkspaceStorageReference
     let tabNameByID: [UUID: String]
     let validTabIDs: Set<UUID>
     let boundSessionIDByTabID: [UUID: UUID]
     let prioritizedTabID: UUID?
 
     init(
-        workspace: WorkspaceModel,
+        workspace: any AgentWorkspaceStorageReference,
         tabNameByID: [UUID: String],
         validTabIDs: Set<UUID>,
         boundSessionIDByTabID: [UUID: UUID] = [:],
@@ -99,7 +99,7 @@ struct AgentSessionSidebarBuildResult {
 }
 
 struct AgentSessionHydrationRequest {
-    let workspace: WorkspaceModel
+    let workspace: any AgentWorkspaceStorageReference
     let tabID: UUID
     let sessionID: UUID
     let resolvedDisplayName: String

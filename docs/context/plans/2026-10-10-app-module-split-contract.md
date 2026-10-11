@@ -397,6 +397,17 @@ Decisions: the coordinators keep the `viewModel` property name and the `attach(v
 
 Step 5r — done | rounds 0/2 | open: | downgraded: | assumed: | deferred: OracleB P3-2 (rename `viewModel`/`attach(viewModel:)`/observer method to host terms, or drop the unused observer parameter) and P3-3 (inject `providerBindingService` into the Claude coordinator) to Slice 6
 
+#### Step 5s — agent session persistence takes a workspace storage reference
+Intent: the agent session data service, its restore and scheduled-send recovery records and the session index store name the App `WorkspaceModel` but read only its `id`, `name` and `customStoragePath`. So declare a read-only agent protocol with those three members, have `WorkspaceModel` conform in App, and type the agent parameters and stored fields by that protocol, so the roughly 350 App and test call sites passing a workspace stay unchanged, with no behavior change.
+
+Budget used: about 1.5 hours (cumulative ~40.5 hours).
+
+Result: the agent session data service, the restore and scheduled-send recovery records and the session index store now take the agent protocol `AgentWorkspaceStorageReference` (`id`, `name`, `customStoragePath`) instead of `WorkspaceModel`, which conforms in a one-line App file, and no App or test call site changed. Build, format, lint and the affected suites pass. OracleA found nothing. OracleB raised only small notes, which got evidence, one comment and a reworded doc comment.
+
+Decisions: the session index store's delegate call that built the sidebar restore order from a full `WorkspaceModel` is gone; the view model now builds that order itself and passes it to `installOwner`, so the store needs no App type, and the order is still computed from the same workspace before the store clears its state. The protocol is not `Sendable`, because `WorkspaceModel` declares no `Sendable` conformance and the build shows no new warnings. The protocol and the members App calls will need `package` access at the cut.
+
+Step 5s — done | rounds 0/2 | open: | downgraded: | assumed: | deferred:
+
 ### Slice 6 — `RepoPromptAgentCore` extraction
 Move the now-acyclic AI, agent models, providers, runtime, services, history, recommendations and non-UI remote-host code. Remove the temporary typealiases. Check the release compile flags once for cross-module optimization; don't change them.
 

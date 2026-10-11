@@ -30,10 +30,6 @@ protocol AgentWorkspaceSessionIndexStoreDelegate: AnyObject {
     /// `lastKnownWorkspaceSnapshot`.
     var enforcesActiveWorkspaceIDForSessionIndexOwnership: Bool { get }
 
-    /// Builds the frozen sidebar restore order for a workspace. Mirrors
-    /// `AgentModeViewModel.makeSidebarRestoreFrozenOrder(for:)`.
-    func makeSidebarRestoreFrozenOrder(for workspace: WorkspaceModel) -> [UUID: Int]
-
     /// Called when `sessionIndex`, `sessionListSortDates`, or
     /// `sessionListCacheReady` changes. The delegate dispatches to
     /// `syncSidebarUIState` and `scheduleSidebarAutoArchiveIfReady` as
@@ -114,7 +110,7 @@ final class AgentWorkspaceSessionIndexStore: ObservableObject {
     // MARK: - Workspace switch / owner creation
 
     @discardableResult
-    func receiveWorkspaceSwitchNotification(_ workspace: WorkspaceModel?) -> SessionIndexOwner {
+    func receiveWorkspaceSwitchNotification(_ workspace: (any AgentWorkspaceStorageReference)?) -> SessionIndexOwner {
         sessionIndexActivationEpoch &+= 1
         let owner = SessionIndexOwner(
             workspaceID: workspace?.id,
@@ -128,7 +124,7 @@ final class AgentWorkspaceSessionIndexStore: ObservableObject {
 
     func isWorkspaceActivationCurrent(
         _ owner: SessionIndexOwner,
-        workspace: WorkspaceModel?
+        workspace: (any AgentWorkspaceStorageReference)?
     ) -> Bool {
         guard latestSessionIndexOwner == owner,
               owner.workspaceID == workspace?.id
@@ -214,8 +210,10 @@ final class AgentWorkspaceSessionIndexStore: ObservableObject {
     /// Installs a new owner, clearing all data and overlay state. The caller
     /// (the view model) is responsible for calling
     /// `cancelSessionIndexRefresh(releaseFrozenOrder: false)` before this and
-    /// resetting `lastSidebarContentFingerprint` after.
-    func installOwner(_ owner: SessionIndexOwner, workspace: WorkspaceModel?) {
+    /// resetting `lastSidebarContentFingerprint` after. The caller passes the
+    /// frozen sidebar restore order for a non-nil workspace and `nil` when the
+    /// workspace is nil.
+    func installOwner(_ owner: SessionIndexOwner, sidebarRestoreFrozenOrder: [UUID: Int]?) {
         suppressDelegateNotifications = true
         defer {
             suppressDelegateNotifications = false
@@ -229,8 +227,8 @@ final class AgentWorkspaceSessionIndexStore: ObservableObject {
         sessionIndex.removeAll()
         sessionListSortDates.removeAll()
         sessionListCacheReady = false
-        if let workspace {
-            sidebarRestoreFrozenOrderByTabID = delegate?.makeSidebarRestoreFrozenOrder(for: workspace) ?? [:]
+        if let sidebarRestoreFrozenOrder {
+            sidebarRestoreFrozenOrderByTabID = sidebarRestoreFrozenOrder
             sidebarRestoreFrozenOrderOwner = owner
         } else {
             sidebarRestoreFrozenOrderByTabID.removeAll()

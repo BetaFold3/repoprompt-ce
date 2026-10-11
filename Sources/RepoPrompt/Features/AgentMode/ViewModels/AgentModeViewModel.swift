@@ -11964,7 +11964,10 @@ final class AgentModeViewModel: ObservableObject {
     ) {
         guard sessionIndexStore.isWorkspaceActivationCurrent(owner, workspace: workspace) else { return }
         cancelSessionIndexRefresh(releaseFrozenOrder: false)
-        sessionIndexStore.installOwner(owner, workspace: workspace)
+        sessionIndexStore.installOwner(
+            owner,
+            sidebarRestoreFrozenOrder: workspace.map { makeSidebarRestoreFrozenOrder(for: $0) }
+        )
         lastSidebarContentFingerprint = nil
     }
 
@@ -20545,6 +20548,7 @@ extension AgentModeViewModel: AgentWorkspaceSessionIndexStoreDelegate {
         return workspaceManager != nil
     }
 
+    /// Must derive only from the `workspace` argument; it runs before `installOwner` clears store state.
     func makeSidebarRestoreFrozenOrder(for workspace: WorkspaceModel) -> [UUID: Int] {
         var orderByTabID: [UUID: Int] = [:]
         for (index, tab) in persistedSidebarTabs(for: workspace).enumerated() where orderByTabID[tab.id] == nil {
