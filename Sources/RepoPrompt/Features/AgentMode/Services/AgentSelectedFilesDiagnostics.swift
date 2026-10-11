@@ -1,56 +1,9 @@
 import Foundation
 
-enum AgentSelectedFilesDiagnostics {
-    static func timestampMSIfEnabled() -> Double? {
-        #if DEBUG
-            AgentModePerfDiagnostics.timestampMSIfEnabled()
-        #else
-            nil
-        #endif
-    }
-
-    static func elapsedFields(since startMS: Double?) -> [String: String] {
-        #if DEBUG
-            guard let startMS else { return [:] }
-            return ["duration": AgentModePerfDiagnostics.formatElapsedMS(since: startMS)]
-        #else
-            [:]
-        #endif
-    }
-
-    static func event(
-        _ name: String,
-        fields: [String: String] = [:],
-        includeStack: Bool = false
-    ) {
-        #if DEBUG
-            guard AgentModePerfDiagnostics.isEnabled else { return }
-            var fields = fields
-            if includeStack {
-                fields["stack"] = compactCallStack()
-            }
-            AgentModePerfDiagnostics.event("selectedFiles.\(name)", fields: fields)
-        #endif
-    }
-
-    static func durationEvent(
-        _ name: String,
-        startMS: Double?,
-        fields: [String: String] = [:]
-    ) {
-        #if DEBUG
-            AgentModePerfDiagnostics.durationEvent("selectedFiles.\(name)", startMS: startMS, fields: fields)
-        #endif
-    }
-
-    static func shortID(_ id: UUID?) -> String {
-        #if DEBUG
-            AgentModePerfDiagnostics.shortID(id)
-        #else
-            "nil"
-        #endif
-    }
-
+/// Agent-typed field helpers for `AgentSelectedFilesDiagnostics`. The dependency-free recording
+/// helpers (`event`, `durationEvent`, `timestampMSIfEnabled`, `elapsedFields`, `shortID`) live in
+/// `Infrastructure/WorkspaceContext/AgentSelectedFilesDiagnosticsCore.swift`.
+extension AgentSelectedFilesDiagnostics {
     static func selectionFields(_ selection: StoredSelection) -> [String: String] {
         #if DEBUG
             let nonEmptySlices = selection.slices.filter { !$0.value.isEmpty }
@@ -90,18 +43,5 @@ enum AgentSelectedFilesDiagnostics {
         #else
             [:]
         #endif
-    }
-
-    private static func compactCallStack() -> String {
-        Thread.callStackSymbols
-            .dropFirst(3)
-            .prefix(10)
-            .map { symbol in
-                symbol
-                    .replacingOccurrences(of: "\n", with: " ")
-                    .replacingOccurrences(of: "\t", with: " ")
-                    .trimmingCharacters(in: .whitespacesAndNewlines)
-            }
-            .joined(separator: " <- ")
     }
 }

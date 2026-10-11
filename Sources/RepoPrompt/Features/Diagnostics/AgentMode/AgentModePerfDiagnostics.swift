@@ -1,7 +1,7 @@
 import Foundation
 
 #if DEBUG
-    import os
+    import RepoPromptPlatform
 
     /// Debug-only, opt-in instrumentation for steady-state Agent Mode performance hot paths.
     ///
@@ -11,23 +11,15 @@ import Foundation
     /// - the hidden MCP diagnostics op: `__repoprompt_debug_diagnostics` with `{ "op": "agent_perf_metrics", "enable": true }`
     ///
     /// This file is compiled behind `#if DEBUG`; release builds do not include the logger.
+    /// The generic recording mechanism (enablement, timestamps, event/counter buffers, os_log)
+    /// lives in `PerfDiagnosticsRecorder`; this type adds Agent Mode instrumentation and reporting.
+    /// App-owned state below is guarded by the recorder lock via `withLockedState`.
     enum AgentModePerfDiagnostics {
-        private static let logger = Logger(subsystem: "com.repoprompt.agent-perf", category: "agent-mode")
-        private static let defaultsKey = "enableAgentModePerfDiagnostics"
-        private static let environmentKey = "RP_AGENT_MODE_PERF_DIAGNOSTICS"
-        private static let osLogDefaultsKey = "emitAgentModePerfDiagnosticsToOSLog"
-        private static let osLogEnvironmentKey = "RP_AGENT_MODE_PERF_OSLOG"
-        private static let enabledEnvironmentValues: Set<String> = ["1", "true", "yes", "on"]
-        private static let bufferLimit = 1000
-        private static let structuredEventLimit = 5000
+        private typealias Recorder = PerfDiagnosticsRecorder
+        private typealias AgentPerfEventRecord = PerfDiagnosticsRecorder.EventRecord
+        private static let bufferLimit = Recorder.bufferLimit
+        private static let structuredEventLimit = Recorder.structuredEventLimit
         private static let sessionSnapshotLimit = 500
-        private static let bufferLock = NSLock()
-        private static var processOverrideEnabled: Bool?
-        private static var recentMetricLines: [String] = []
-        private static var eventRecords: [AgentPerfEventRecord] = []
-        private static var nextEventSequence = 0
-        private static var droppedEventRecordCount = 0
-        private static var counters: [String: Int] = [:]
         private static var latestSessionSnapshots: [String: [String: Any]] = [:]
         private static var latestSessionSnapshotOrder: [String] = []
         private static var pendingSidebarDeleteByTabID: [UUID: PendingSidebarDelete] = [:]
@@ -62,57 +54,44 @@ import Foundation
             let fields: [String: String]
         }
 
-        private struct AgentPerfEventRecord {
-            let sequence: Int
-            let timestampMS: Double
-            let name: String
-            let fields: [String: String]
-        }
-
         static var isEnabled: Bool {
-            if let override = debugProcessOverrideEnabled {
-                return override
-            }
-            return defaultsEnabled || environmentEnabled
+            Recorder.isEnabled
         }
 
         static var defaultsEnabled: Bool {
-            UserDefaults.standard.bool(forKey: defaultsKey)
+            Recorder.defaultsEnabled
         }
 
         static var environmentEnabled: Bool {
-            environmentFlagEnabled(environmentKey)
+            Recorder.environmentEnabled
         }
 
         static var debugProcessOverrideEnabled: Bool? {
-            bufferLock.lock()
-            defer { bufferLock.unlock() }
-            return processOverrideEnabled
+            Recorder.debugProcessOverrideEnabled
         }
 
         static var osLogEnabled: Bool {
-            UserDefaults.standard.bool(forKey: osLogDefaultsKey) || environmentFlagEnabled(osLogEnvironmentKey)
+            Recorder.osLogEnabled
         }
 
         static func timestampMSIfEnabled() -> Double? {
-            guard isEnabled else { return nil }
-            return timestampMS()
+            Recorder.timestampMSIfEnabled()
         }
 
         static func timestampMS() -> Double {
-            CFAbsoluteTimeGetCurrent() * 1000
+            Recorder.timestampMS()
         }
 
         static func elapsedMS(since startMS: Double) -> Double {
-            timestampMS() - startMS
+            Recorder.elapsedMS(since: startMS)
         }
 
         static func formatMS(_ value: Double) -> String {
-            String(format: "%.1fms", value)
+            Recorder.formatMS(value)
         }
 
         static func formatElapsedMS(since startMS: Double) -> String {
-            formatMS(elapsedMS(since: startMS))
+            Recorder.formatElapsedMS(since: startMS)
         }
 
         static func durationEvent(
@@ -121,10 +100,11 @@ import Foundation
             tabID: UUID? = nil,
             fields: [String: String] = [:]
         ) {
-            guard let startMS else { return }
             var renderedFields = fields
-            renderedFields["duration"] = formatElapsedMS(since: startMS)
-            event(name, tabID: tabID, fields: renderedFields)
+            if let tabID {
+                renderedFields["tabID"] = shortID(tabID)
+            }
+            Recorder.durationEvent(name, startMS: startMS, fields: renderedFields)
         }
 
         static func counterKey(_ base: String, source: String?) -> String {
@@ -141,43 +121,26 @@ import Foundation
         }
 
         static func shortID(_ id: UUID?) -> String {
-            id?.uuidString.prefix(8).description ?? "nil"
+            Recorder.shortID(id)
         }
 
         static func increment(_ key: String, tabID: UUID? = nil, by amount: Int = 1) {
             guard isEnabled else { return }
-            bufferLock.lock()
-            incrementLocked(key, by: amount)
-            if let tabID {
-                incrementLocked("\(key).tab.\(tabID.uuidString)", by: amount)
+            Recorder.withLockedState { state in
+                state.counters[key, default: 0] += amount
+                if let tabID {
+                    state.counters["\(key).tab.\(tabID.uuidString)", default: 0] += amount
+                }
             }
-            bufferLock.unlock()
         }
 
         static func event(_ name: String, tabID: UUID? = nil, fields: [String: String] = [:]) {
-            guard isEnabled else { return }
+            // `Recorder.event` performs the single enablement check.
             var renderedFields = fields
             if let tabID {
                 renderedFields["tabID"] = shortID(tabID)
             }
-            let timestamp = timestampMS()
-            let renderedMessage = renderEvent(name, fields: renderedFields)
-            bufferLock.lock()
-            incrementLocked("event.\(name)")
-            appendRecentMetricLineLocked(renderedMessage, timestampMS: timestamp)
-            appendEventRecordLocked(
-                AgentPerfEventRecord(
-                    sequence: nextEventSequence,
-                    timestampMS: timestamp,
-                    name: name,
-                    fields: renderedFields
-                )
-            )
-            nextEventSequence &+= 1
-            bufferLock.unlock()
-            if osLogEnabled {
-                logger.debug("\(renderedMessage, privacy: .public)")
-            }
+            Recorder.event(name, fields: renderedFields)
         }
 
         static func recordConversationReplay(
@@ -247,9 +210,9 @@ import Foundation
                 didEmitAgentCleanupComplete: false,
                 didEmitFullCleanupComplete: false
             )
-            bufferLock.lock()
-            pendingSidebarDeleteByTabID[context.tabID] = pending
-            bufferLock.unlock()
+            Recorder.withLockedState { _ in
+                pendingSidebarDeleteByTabID[context.tabID] = pending
+            }
             event("sidebar.delete.requested", fields: sidebarDeleteFields(for: pending))
             return deleteID
         }
@@ -298,10 +261,9 @@ import Foundation
 
         static func cancelSidebarDeleteTracking(tabID: UUID, source: String, fields: [String: String] = [:]) {
             guard isEnabled else { return }
-            let pending: PendingSidebarDelete?
-            bufferLock.lock()
-            pending = pendingSidebarDeleteByTabID.removeValue(forKey: tabID)
-            bufferLock.unlock()
+            let pending: PendingSidebarDelete? = Recorder.withLockedState { _ in
+                pendingSidebarDeleteByTabID.removeValue(forKey: tabID)
+            }
             var eventFields = fields
             eventFields["source"] = source
             if let pending {
@@ -319,16 +281,16 @@ import Foundation
             snapshot["tabID"] = key
             snapshot["shortTabID"] = shortID(tabID)
             snapshot["recordedAtMS"] = timestampMS()
-            bufferLock.lock()
-            if latestSessionSnapshots[key] == nil {
-                latestSessionSnapshotOrder.append(key)
+            Recorder.withLockedState { _ in
+                if latestSessionSnapshots[key] == nil {
+                    latestSessionSnapshotOrder.append(key)
+                }
+                latestSessionSnapshots[key] = snapshot
+                while latestSessionSnapshotOrder.count > sessionSnapshotLimit {
+                    let staleKey = latestSessionSnapshotOrder.removeFirst()
+                    latestSessionSnapshots.removeValue(forKey: staleKey)
+                }
             }
-            latestSessionSnapshots[key] = snapshot
-            while latestSessionSnapshotOrder.count > sessionSnapshotLimit {
-                let staleKey = latestSessionSnapshotOrder.removeFirst()
-                latestSessionSnapshots.removeValue(forKey: staleKey)
-            }
-            bufferLock.unlock()
 
             let stringFields = fields.reduce(into: [String: String]()) { partial, entry in
                 partial[entry.key] = String(describing: entry.value)
@@ -337,42 +299,42 @@ import Foundation
         }
 
         static func setDebugProcessOverrideEnabled(_ enabled: Bool?) {
-            bufferLock.lock()
-            processOverrideEnabled = enabled
-            bufferLock.unlock()
+            Recorder.setDebugProcessOverrideEnabled(enabled)
         }
 
         static func clearRecentMetrics() {
-            bufferLock.lock()
-            recentMetricLines.removeAll(keepingCapacity: true)
-            eventRecords.removeAll(keepingCapacity: true)
-            nextEventSequence = 0
-            droppedEventRecordCount = 0
-            counters.removeAll(keepingCapacity: true)
-            latestSessionSnapshots.removeAll(keepingCapacity: true)
-            latestSessionSnapshotOrder.removeAll(keepingCapacity: true)
-            pendingSidebarDeleteByTabID.removeAll(keepingCapacity: true)
-            bufferLock.unlock()
+            Recorder.withLockedState { state in
+                state.recentMetricLines.removeAll(keepingCapacity: true)
+                state.eventRecords.removeAll(keepingCapacity: true)
+                state.nextEventSequence = 0
+                state.droppedEventRecordCount = 0
+                state.counters.removeAll(keepingCapacity: true)
+                latestSessionSnapshots.removeAll(keepingCapacity: true)
+                latestSessionSnapshotOrder.removeAll(keepingCapacity: true)
+                pendingSidebarDeleteByTabID.removeAll(keepingCapacity: true)
+            }
         }
 
         static func recentMetricLinesSnapshot(limit requestedLimit: Int) -> [String] {
             let limit = max(1, min(requestedLimit, bufferLimit))
-            bufferLock.lock()
-            let lines = Array(recentMetricLines.suffix(limit))
-            bufferLock.unlock()
-            return lines
+            return Recorder.withLockedState { state in
+                Array(state.recentMetricLines.suffix(limit))
+            }
         }
 
         static func debugStateSnapshot(lineLimit: Int) -> [String: Any] {
             let limit = max(1, min(lineLimit, bufferLimit))
-            bufferLock.lock()
-            let lines = Array(recentMetricLines.suffix(limit))
-            let countersSnapshot = counters
-            let sessionSnapshots = latestSessionSnapshots
-            let structuredCount = eventRecords.count
-            let structuredDropped = droppedEventRecordCount
-            let pendingSidebarDeleteCount = pendingSidebarDeleteByTabID.count
-            bufferLock.unlock()
+            let (lines, countersSnapshot, sessionSnapshots, structuredCount, structuredDropped, pendingSidebarDeleteCount) =
+                Recorder.withLockedState { state in
+                    (
+                        Array(state.recentMetricLines.suffix(limit)),
+                        state.counters,
+                        latestSessionSnapshots,
+                        state.eventRecords.count,
+                        state.droppedEventRecordCount,
+                        pendingSidebarDeleteByTabID.count
+                    )
+                }
             return [
                 "enabled": isEnabled,
                 "defaults_enabled": defaultsEnabled,
@@ -404,14 +366,9 @@ import Foundation
             let eventNameFilter = eventNames.map { Set($0.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty }) }
             let lineLimit = max(1, min(requestedLineLimit, bufferLimit))
 
-            let records: [AgentPerfEventRecord]
-            let countersSnapshot: [String: Int]
-            let droppedCount: Int
-            bufferLock.lock()
-            records = eventRecords
-            countersSnapshot = counters
-            droppedCount = droppedEventRecordCount
-            bufferLock.unlock()
+            let (records, countersSnapshot, droppedCount) = Recorder.withLockedState { state in
+                (state.eventRecords, state.counters, state.droppedEventRecordCount)
+            }
 
             let windowResult = recordsInWindow(
                 records,
@@ -589,17 +546,16 @@ import Foundation
         ) {
             guard isEnabled else { return }
             let nowMS = timestampMS()
-            let emissions: [SidebarDeleteEmission]
-            bufferLock.lock()
-            if var pending = pendingSidebarDeleteByTabID[tabID] {
-                if hasEmitted(pending) {
-                    emissions = [
-                        SidebarDeleteEmission(
-                            eventName: duplicateEventName,
-                            fields: sidebarDeleteFields(for: pending, extraFields: fields.merging(["source": source]) { _, new in new })
-                        )
-                    ]
-                } else {
+            let emissions: [SidebarDeleteEmission] = Recorder.withLockedState { _ in
+                if var pending = pendingSidebarDeleteByTabID[tabID] {
+                    if hasEmitted(pending) {
+                        return [
+                            SidebarDeleteEmission(
+                                eventName: duplicateEventName,
+                                fields: sidebarDeleteFields(for: pending, extraFields: fields.merging(["source": source]) { _, new in new })
+                            )
+                        ]
+                    }
                     markEmitted(&pending)
                     if pending.didEmitVisibleRemoved, pending.didEmitFullCleanupComplete {
                         pendingSidebarDeleteByTabID.removeValue(forKey: tabID)
@@ -610,7 +566,7 @@ import Foundation
                     milestoneFields["source"] = source
                     var durationFields = milestoneFields
                     durationFields["duration"] = formatMS(nowMS - pending.startMS)
-                    emissions = [
+                    return [
                         SidebarDeleteEmission(
                             eventName: milestoneEventName,
                             fields: sidebarDeleteFields(for: pending, extraFields: milestoneFields)
@@ -621,13 +577,11 @@ import Foundation
                         )
                     ]
                 }
-            } else {
                 var orphanFields = fields
                 orphanFields["tabID"] = tabID.uuidString
                 orphanFields["source"] = source
-                emissions = [SidebarDeleteEmission(eventName: orphanEventName, fields: orphanFields)]
+                return [SidebarDeleteEmission(eventName: orphanEventName, fields: orphanFields)]
             }
-            bufferLock.unlock()
 
             for emission in emissions {
                 event(emission.eventName, fields: emission.fields)
@@ -650,50 +604,6 @@ import Foundation
             fields["wasRunning"] = String(pending.wasRunning)
             fields["isMCPControlled"] = String(pending.isMCPControlled)
             return fields
-        }
-
-        private static func environmentFlagEnabled(_ key: String) -> Bool {
-            let rawValue = ProcessInfo.processInfo.environment[key]?
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-                .lowercased()
-            return rawValue.map { enabledEnvironmentValues.contains($0) } ?? false
-        }
-
-        private static func incrementLocked(_ key: String, by amount: Int = 1) {
-            counters[key, default: 0] += amount
-        }
-
-        private static func appendRecentMetricLineLocked(_ message: String, timestampMS: Double) {
-            let line = "t+\(formatMS(timestampMS)) \(message)"
-            recentMetricLines.append(line)
-            if recentMetricLines.count > bufferLimit {
-                recentMetricLines.removeFirst(recentMetricLines.count - bufferLimit)
-            }
-        }
-
-        private static func appendEventRecordLocked(_ record: AgentPerfEventRecord) {
-            eventRecords.append(record)
-            if eventRecords.count > structuredEventLimit {
-                let dropCount = eventRecords.count - structuredEventLimit
-                eventRecords.removeFirst(dropCount)
-                droppedEventRecordCount += dropCount
-            }
-        }
-
-        private static func renderEvent(_ name: String, fields: [String: String]) -> String {
-            guard !fields.isEmpty else { return name }
-            let suffix = fields.keys.sorted().map { key in
-                "\(key)=\(sanitize(fields[key] ?? ""))"
-            }.joined(separator: " ")
-            return "\(name) \(suffix)"
-        }
-
-        private static func sanitize(_ raw: String) -> String {
-            raw
-                .replacingOccurrences(of: "\n", with: "\\n")
-                .replacingOccurrences(of: "\r", with: "\\r")
-                .replacingOccurrences(of: "\t", with: "\\t")
-                .replacingOccurrences(of: " ", with: "_")
         }
     }
 

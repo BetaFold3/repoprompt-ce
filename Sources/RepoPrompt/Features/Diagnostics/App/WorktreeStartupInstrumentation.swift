@@ -265,16 +265,19 @@ enum WorktreeStartupPhase: String, Equatable {
 
             func recordRouteControlOwnership(
                 controlID: UUID,
-                scope: DebugWorktreeStartupBenchmarkScope
+                windowID: Int,
+                workspaceID: UUID,
+                contextID: UUID,
+                rootID: UUID
             ) {
                 lock.lock()
                 if routeControlOwnership == nil {
                     routeControlOwnership = RouteControlOwnership(
                         controlID: controlID,
-                        windowID: scope.windowID,
-                        workspaceID: scope.workspaceID,
-                        contextID: scope.contextID,
-                        rootID: scope.rootID,
+                        windowID: windowID,
+                        workspaceID: workspaceID,
+                        contextID: contextID,
+                        rootID: rootID,
                         revoked: false
                     )
                 }

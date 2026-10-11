@@ -21,6 +21,7 @@ Sources/
   RepoPromptPlatform/            # internal generic-primitives library target (not a product); depends on no other app module
     Infrastructure/
       Concurrency/               # cross-cutting async primitives
+      Diagnostics/               # dependency-free DEBUG recording mechanisms (PerfDiagnosticsRecorder); domain instrumentation and reporting stay with owners
       FileSystem/                # dependency-free filesystem primitives (LRU/path caches, pattern pool, spill-backed artifact store)
       Networking/                # HTTP and decoding substrate
       Process/                   # process/CLI launch, environment, termination, and stream-framing substrate

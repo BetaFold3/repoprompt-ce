@@ -90,7 +90,7 @@ actor FileSystemService {
             deltas: deltas
         )
         #if DEBUG
-            MCPApplyEditsRebaseProbeRecorder.recordServicePublication(
+            WorkspacePublicationDebugObserver.servicePublication(
                 rootToken: diagnosticRootToken,
                 source: source,
                 deltas: deltas

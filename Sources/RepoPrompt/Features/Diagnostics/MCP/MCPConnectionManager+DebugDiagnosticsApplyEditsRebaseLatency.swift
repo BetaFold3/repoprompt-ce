@@ -245,10 +245,32 @@ import RepoPromptShared
     enum MCPApplyEditsRebaseProbeRecorder {
         private static let lock = NSLock()
         private nonisolated(unsafe) static var statesByProbeID: [UUID: MCPApplyEditsRebaseProbeState] = [:]
+        private nonisolated(unsafe) static var publicationObserverInstalled = false
 
         static func register(_ state: MCPApplyEditsRebaseProbeState) -> Bool {
             lock.lock()
             defer { lock.unlock() }
+            // Before any probe registers, the publication recorders match no states,
+            // so installing the workspace publication hooks lazily here is behavior-identical.
+            if !publicationObserverInstalled {
+                publicationObserverInstalled = true
+                WorkspacePublicationDebugObserver.install(
+                    WorkspacePublicationDebugObserver.Hooks(
+                        servicePublication: { rootToken, source, deltas in
+                            recordServicePublication(rootToken: rootToken, source: source, deltas: deltas)
+                        },
+                        publisherIngress: { rootID, source, deltas in
+                            recordPublisherIngress(rootID: rootID, source: source, deltas: deltas)
+                        },
+                        storeModification: { rootID, fileID, generation in
+                            recordStoreModification(rootID: rootID, fileID: fileID, generation: generation)
+                        },
+                        appliedIndexModification: { rootID, fileIDs, generation in
+                            recordAppliedIndexModification(rootID: rootID, fileIDs: fileIDs, generation: generation)
+                        }
+                    )
+                )
+            }
             guard statesByProbeID[state.probeID] == nil else { return false }
             statesByProbeID[state.probeID] = state
             return true

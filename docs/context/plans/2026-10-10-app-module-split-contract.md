@@ -155,6 +155,17 @@ Decisions: `FileSystemItemType` and `FileTreeItem` stay with the view models bec
 
 Step 4a — done | rounds 0/2 | open: | downgraded: | assumed: | deferred: OracleB F1 — frozen path-record adapter initializers need a verbatim `package` init at the cut (don't route through the re-standardizing public init); pre-existing dropped `isExplicitSubtree` in the short `generateFileTreeForRoots(option:)` overload
 
+#### Step 4b — diagnostics seams in place
+Intent: remove the three places where workspace code reaches app diagnostics — the worktree-startup recorder's benchmark-scope parameter, the file-system service's direct call into the MCP apply-edits rebase probe, and the binding projection's selected-files events that run through the agent perf logger — by passing values, a DEBUG observer the MCP diagnostics install, and a generic event-recording core split out of the agent perf logger, with event names and enablement unchanged. The remaining workspace diagnostics (edit-flow timing, worktree-startup instrumentation, MCP work counts, restore and root-load logs) already depend on nothing above the workspace and move with it.
+
+Budget used: about 1.5 hours (cumulative ~12.5 hours).
+
+Result: the worktree-startup recorder now takes plain values, the file-system service and the file-context store report publications through a DEBUG `WorkspacePublicationDebugObserver` that the MCP rebase probe installs on first registration (review found three store calls the intent had missed), and the generic recording core `PerfDiagnosticsRecorder` now lives in `RepoPromptPlatform` with the agent perf logger forwarding to it; a rescan finds no app diagnostics names left in the workspace seed paths, and build, 10 affected suites (305 tests, 0 failures), format and lint pass, so the next step plans the remaining non-diagnostics adapters from a rescan.
+
+Decisions: the recorder moved to Platform now rather than at the cut, so the compiler already proves it independent; the agent perf logger keeps its own state under the recorder's lock through `withLockedState`, which keeps every snapshot and clear atomic as before.
+
+Step 4b — done | rounds 0/2 | open: | downgraded: | assumed: | deferred: OracleB F3 — narrow the recorder's exposed `State` if the cut shows users beyond the agent perf logger
+
 ### Slice 5 — AgentCore seams, in place
 Still inside `RepoPromptApp`:
 - hoist `TabSession` to `AgentTabSession`, together with the nested types the runtime uses, keeping the same object, owner, callbacks and ordering;

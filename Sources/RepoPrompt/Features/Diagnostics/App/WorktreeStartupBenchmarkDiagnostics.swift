@@ -427,7 +427,13 @@
                 currentControlIDByScope[scope] = lease.id
                 if let preparationID, var preparationRecord {
                     preparationRecord.routeControlID = lease.id
-                    preparationRecord.recorder.recordRouteControlOwnership(controlID: lease.id, scope: scope)
+                    preparationRecord.recorder.recordRouteControlOwnership(
+                        controlID: lease.id,
+                        windowID: scope.windowID,
+                        workspaceID: scope.workspaceID,
+                        contextID: scope.contextID,
+                        rootID: scope.rootID
+                    )
                     preparationsByID[preparationID] = preparationRecord
                 }
                 lock.unlock()

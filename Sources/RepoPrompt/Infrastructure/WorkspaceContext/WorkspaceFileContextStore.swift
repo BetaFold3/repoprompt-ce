@@ -5962,7 +5962,7 @@ actor WorkspaceFileContextStore {
         #endif
         guard isRootLifetimeCurrent(rootID: root.id, expectedLifetimeID: expectedLifetimeID) else { return }
         #if DEBUG
-            MCPApplyEditsRebaseProbeRecorder.recordPublisherIngress(
+            WorkspacePublicationDebugObserver.publisherIngress(
                 rootID: root.id,
                 source: publication.source,
                 deltas: publication.deltas
@@ -19378,7 +19378,7 @@ actor WorkspaceFileContextStore {
                 if publishedCanonicalModification {
                     publishAppliedIndexEvent(root: state.root, modifiedFileIDs: [file.id])
                     #if DEBUG
-                        MCPApplyEditsRebaseProbeRecorder.recordStoreModification(
+                        WorkspacePublicationDebugObserver.storeModification(
                             rootID: rootID,
                             fileID: file.id,
                             generation: appliedIndexGenerationsByRootID[rootID] ?? 0
@@ -22358,7 +22358,7 @@ actor WorkspaceFileContextStore {
         )
         let generation = nextAppliedIndexGeneration(forRootID: root.id)
         #if DEBUG
-            MCPApplyEditsRebaseProbeRecorder.recordAppliedIndexModification(
+            WorkspacePublicationDebugObserver.appliedIndexModification(
                 rootID: root.id,
                 fileIDs: modifiedFileIDs,
                 generation: generation
