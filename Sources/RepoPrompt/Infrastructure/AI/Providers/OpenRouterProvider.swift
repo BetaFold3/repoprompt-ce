@@ -3,9 +3,11 @@ import SwiftOpenAI
 
 class OpenRouterProvider: AIProvider {
     private let cachedApiKey: String
+    private let modelOverrides: any AIModelOverrideReading
 
-    init(apiKey: String) {
+    init(apiKey: String, modelOverrides: any AIModelOverrideReading) {
         cachedApiKey = apiKey
+        self.modelOverrides = modelOverrides
     }
 
     private func getConfiguration() -> OpenRouterConfiguration {
@@ -44,7 +46,7 @@ class OpenRouterProvider: AIProvider {
 
     func streamMessage(_ aiMessage: AIMessage, model: AIModel, maxTokens: Int?) async throws -> AsyncThrowingStream<AIStreamResult, Error> {
         // If model streaming is disabled, use completeMessage instead
-        if !model.canStream {
+        if !model.canStream(overrides: modelOverrides) {
             let result = try await completeMessage(aiMessage, model: model, maxTokens: maxTokens)
             return AsyncThrowingStream { continuation in
                 continuation.yield(AIStreamResult(type: "content", text: result.text, reasoning: nil, promptTokens: nil, completionTokens: nil))
@@ -60,7 +62,7 @@ class OpenRouterProvider: AIProvider {
         let effectiveMaxTokens = config.useCustomSettings ? (maxTokens ?? config.baseConfig.maxTokens) : 8192
 
         // Honour global & per-model overrides
-        let effectiveTemperature = aiMessage.effectiveTemperature(for: model)
+        let effectiveTemperature = aiMessage.effectiveTemperature(for: model, overrides: modelOverrides)
 
         let parameters = ChatCompletionParameters(
             messages: messages,
@@ -119,7 +121,7 @@ class OpenRouterProvider: AIProvider {
         let effectiveMaxTokens = config.useCustomSettings ? (maxTokens ?? config.baseConfig.maxTokens) : maxTokens
 
         // Honour global & per-model overrides
-        let effectiveTemperature = aiMessage.effectiveTemperature(for: model)
+        let effectiveTemperature = aiMessage.effectiveTemperature(for: model, overrides: modelOverrides)
 
         let parameters = ChatCompletionParameters(
             messages: messages,

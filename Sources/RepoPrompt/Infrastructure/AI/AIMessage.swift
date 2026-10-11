@@ -331,12 +331,12 @@ struct AIMessage {
 
     /// Returns the final temperature to send for a specific model,
     /// respecting global on/off and per-model overrides.
-    func effectiveTemperature(for model: AIModel) -> Double? {
+    func effectiveTemperature(for model: AIModel, overrides: any AIModelOverrideReading) -> Double? {
         if disableTemperatureOverrides {
             return nil
         }
         // 1) Explicit per-model override stored by the user.
-        if let override = ModelOverridesSettings.shared
+        if let override = overrides
             .temperatureOverride(for: model.rawValue)
         {
             return override

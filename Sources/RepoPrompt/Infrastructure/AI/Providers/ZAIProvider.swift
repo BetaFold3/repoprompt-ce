@@ -17,13 +17,14 @@ final class ZAIProvider: OpenAIProvider {
 
     let endpoint: Endpoint
 
-    init(apiKey: String, endpoint: Endpoint = .generalAPI) {
+    init(apiKey: String, endpoint: Endpoint = .generalAPI, modelOverrides: any AIModelOverrideReading) {
         self.endpoint = endpoint
         super.init(
             apiKey: apiKey,
             baseURL: endpoint.baseURL,
             configuredMaxTokens: nil,
-            overrideVersion: "v4"
+            overrideVersion: "v4",
+            modelOverrides: modelOverrides
         )
     }
 

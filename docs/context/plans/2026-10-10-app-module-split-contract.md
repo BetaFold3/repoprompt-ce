@@ -334,9 +334,13 @@ Step 5l — done | rounds 0/2 | open: | downgraded: | assumed: | deferred: Oracl
 #### Step 5m — per-model overrides injected into chat providers
 Intent: `AIModel.canStream`, `AIModel.usesResponsesAPI` and `AIMessage.effectiveTemperature` read the App-owned `ModelOverridesSettings.shared`, and their only agent-code callers are the API chat providers, the queries service and the OpenAI configured-model projection. So keep `ModelOverridesSettings` in App, give those members explicit-override core forms with App convenience wrappers keeping today's signatures, and inject a narrow override reader that App supplies, so each caller reads the same override at the same point, with no behavior change.
 
-Budget used: about 0 hours so far (cumulative ~31.5 hours).
+Budget used: about 1.5 hours (cumulative ~33 hours).
 
-Step 5m — doing | rounds 0/2 | open: | downgraded: | assumed: | deferred:
+Result: agent code no longer reads `ModelOverridesSettings`. The four override members now have core forms that take an injected `AIModelOverrideReading`, and App wrappers with the old names keep App, UI and test callers unchanged. The API chat providers, the provider factory, the provider pool and the queries service take the reader as a required dependency. App passes a stateless reader that looks up the settings singleton at call time. Build, format, lint and the 47 affected suites pass; one run had an unrelated Cursor provider disposal-count failure that passed alone and in a full rerun. Neither reviewer found anything above P3.
+
+Decisions: a narrow `Sendable` reader protocol rather than closures, because three related lookups travel through about 15 types and one actor, at the same read points and with no isolation change. The seven `OpenAIProvider` subclasses forward the reader through `super.init`, which raised the step to 24 source files. Azure's `static let` default descriptors became a function over a process-wide, lock-guarded, compute-once cache that ignores later arguments, mirroring the old first-access snapshot. Two helpers with no callers were deleted: `inferredSupportsStreaming` and `CustomProviderConfiguration.toProvider(apiKey:)`. OracleB's concern about hidden agent-code uses of the App wrappers was settled by a broader grep that found none.
+
+Step 5m — done | rounds 0/2 | open: | downgraded: | assumed: | deferred: OracleB P3-2 (Azure cache argument ignored after first call; revisit in Slice 6) deferred; P3-3 (convenience inits copy defaults) declined
 
 ### Slice 6 — `RepoPromptAgentCore` extraction
 Move the now-acyclic AI, agent models, providers, runtime, services, history, recommendations and non-UI remote-host code. Remove the temporary typealiases. Check the release compile flags once for cross-module optimization; don't change them.

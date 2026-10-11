@@ -22,8 +22,10 @@ enum AnthropicProviderResponseError: LocalizedError, Equatable {
 class AnthropicProvider: AIProvider {
     private let service: AnthropicService
     private let requestEncoder: AnthropicRequestEncoder
+    private let modelOverrides: any AIModelOverrideReading
 
-    init(apiKey: String, betaHeaders: [String] = ["messages-2023-12-15", "prompt-caching-2024-07-31", "output-128k-2025-02-19"]) {
+    init(apiKey: String, betaHeaders: [String] = ["messages-2023-12-15", "prompt-caching-2024-07-31", "output-128k-2025-02-19"], modelOverrides: any AIModelOverrideReading) {
+        self.modelOverrides = modelOverrides
         service = AnthropicServiceFactory.service(apiKey: apiKey, betaHeaders: betaHeaders)
         requestEncoder = AnthropicRequestEncoder(
             apiKey: apiKey,
@@ -74,13 +76,13 @@ class AnthropicProvider: AIProvider {
             modelID: model.modelName,
             requestedMaxTokens: maxTokens,
             fallbackMaxTokens: fallbackMaxTokens,
-            temperature: aiMessage.effectiveTemperature(for: model) ?? defaultTemperature
+            temperature: aiMessage.effectiveTemperature(for: model, overrides: modelOverrides) ?? defaultTemperature
         )
     }
 
     func streamMessage(_ aiMessage: AIMessage, model: AIModel, maxTokens: Int? = nil) async throws -> AsyncThrowingStream<AIStreamResult, Error> {
         // Check if streaming is enabled for the model
-        if !model.canStream {
+        if !model.canStream(overrides: modelOverrides) {
             let result = try await completeMessage(aiMessage, model: model, maxTokens: maxTokens)
             return AsyncThrowingStream { continuation in
                 continuation.yield(AIStreamResult(type: "content", text: result.text, reasoning: nil, promptTokens: nil, completionTokens: nil))

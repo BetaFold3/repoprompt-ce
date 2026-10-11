@@ -949,12 +949,12 @@ public enum AIModel: Equatable, Hashable {
     // MARK: - Responses-API flag
 
     /// Returns **true** for built-in `o3-pro` variants.
-    /// For *custom-provider* models it defers to `ModelOverridesSettings`.
+    /// For *custom-provider* models it defers to the injected per-model overrides.
     /// All other models return `false`.
-    var usesResponsesAPI: Bool {
+    func usesResponsesAPI(overrides: any AIModelOverrideReading) -> Bool {
         // Delegate to base for tier variants
         if case let .openAIServiceTierVariant(base, _) = self {
-            return base.usesResponsesAPI
+            return base.usesResponsesAPI(overrides: overrides)
         }
         // 1. Built-in support
         if [
@@ -999,7 +999,7 @@ public enum AIModel: Equatable, Hashable {
 
         // 2. Custom provider override
         if isCustomProviderModel,
-           let override = ModelOverridesSettings.shared.responsesOverride(for: rawValue)
+           let override = overrides.responsesOverride(for: rawValue)
         {
             return override
         }
@@ -1127,12 +1127,12 @@ public enum AIModel: Equatable, Hashable {
     }
 
     /// New helper: whether this model can stream.
-    var canStream: Bool {
+    func canStream(overrides: any AIModelOverrideReading) -> Bool {
         // Delegate to base for tier variants
         if case let .openAIServiceTierVariant(base, _) = self {
-            return base.canStream
+            return base.canStream(overrides: overrides)
         }
-        if let override = ModelOverridesSettings.shared.streamOverride(for: rawValue) {
+        if let override = overrides.streamOverride(for: rawValue) {
             return override
         }
         // Explicitly disable streaming for all Pro variants
@@ -2513,12 +2513,17 @@ public enum AIModel: Equatable, Hashable {
     /// Returns nil when the temperature is not determinable (e.g., API uses its own default).
     /// - Parameters:
     ///   - explicitTemperature: Optional explicit temperature (e.g., from benchmark settings)
-    ///   - includeOverrides: Whether per-model overrides should be considered (default: true)
+    ///   - includeOverrides: Whether per-model overrides should be considered
+    ///   - overrides: Source of per-model overrides
     /// - Returns: The resolved temperature value, or nil if unknown
-    func resolveTemperature(explicitTemperature: Double? = nil, includeOverrides: Bool = true) -> Double? {
+    func resolveTemperature(
+        explicitTemperature: Double?,
+        includeOverrides: Bool,
+        overrides: any AIModelOverrideReading
+    ) -> Double? {
         // 1. Per-model override from settings
         if includeOverrides,
-           let override = ModelOverridesSettings.shared.temperatureOverride(for: rawValue)
+           let override = overrides.temperatureOverride(for: rawValue)
         {
             return override
         }

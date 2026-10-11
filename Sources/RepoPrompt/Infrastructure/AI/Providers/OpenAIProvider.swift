@@ -10,8 +10,10 @@ class OpenAIProvider: AIProvider {
     private let overrideVersion: String? // Add property for API version override
     private let includeUsageInStream: Bool // Whether to include usage in streamed responses
     private let serviceTier: String? // Service tier for Responses API (auto/default/flex/priority)
+    private let modelOverrides: any AIModelOverrideReading
 
-    init(apiKey: String? = nil, baseURL: URL? = nil, configuredMaxTokens: Int? = nil, overrideVersion: String? = nil, includeUsageInStream: Bool = true, serviceTier: String? = nil) {
+    init(apiKey: String? = nil, baseURL: URL? = nil, configuredMaxTokens: Int? = nil, overrideVersion: String? = nil, includeUsageInStream: Bool = true, serviceTier: String? = nil, modelOverrides: any AIModelOverrideReading) {
+        self.modelOverrides = modelOverrides
         cachedApiKey = apiKey
         cachedBaseURL = baseURL
         self.configuredMaxTokens = configuredMaxTokens
@@ -137,7 +139,7 @@ class OpenAIProvider: AIProvider {
     // MARK: - Helper to decide whether to route via Responses-API
 
     private func shouldUseResponsesAPI(for model: AIModel) -> Bool {
-        model.usesResponsesAPI
+        model.usesResponsesAPI(overrides: modelOverrides)
     }
 
     func buildForegroundResponseParameters(
@@ -163,7 +165,7 @@ class OpenAIProvider: AIProvider {
         let finalMaxTokens = resolvedMaxTokens(for: model, override: maxTokens)
 
         // Honour user / model override that disables streaming entirely
-        let forceCompletion = !model.canStream
+        let forceCompletion = !model.canStream(overrides: modelOverrides)
 
         // Route via Responses-API when required
         if shouldUseResponsesAPI(for: model) {
@@ -188,7 +190,7 @@ class OpenAIProvider: AIProvider {
         }
 
         // Handle other non-streaming models via completeMessage
-        if !model.canStream {
+        if !model.canStream(overrides: modelOverrides) {
             let result = try await completeMessage(aiMessage, model: model, maxTokens: finalMaxTokens)
             return AsyncThrowingStream { continuation in
                 continuation.yield(AIStreamResult(type: "content", text: result.text, reasoning: nil, promptTokens: nil, completionTokens: result.completionTokens))
@@ -234,7 +236,7 @@ class OpenAIProvider: AIProvider {
         }
 
         // Apply temperature from AIMessage if provided for models that support it
-        if let messageTemperature = aiMessage.effectiveTemperature(for: effectiveModel),
+        if let messageTemperature = aiMessage.effectiveTemperature(for: effectiveModel, overrides: modelOverrides),
            ![.o3, .o1Mini, .o1Preview].contains(effectiveModel)
         {
             parameters.temperature = messageTemperature
@@ -407,7 +409,7 @@ class OpenAIProvider: AIProvider {
         }
 
         // Apply user-defined temperature if override is enabled for models that support it
-        if let messageTemperature = aiMessage.effectiveTemperature(for: effectiveModel),
+        if let messageTemperature = aiMessage.effectiveTemperature(for: effectiveModel, overrides: modelOverrides),
            ![.o3, .o1Mini, .o1Preview].contains(effectiveModel)
         {
             parameters.temperature = messageTemperature
@@ -549,7 +551,7 @@ class OpenAIProvider: AIProvider {
 
         // Only apply temperature for non-reasoning models (reasoning models don't support it)
         if plan.reasoningEffort == nil,
-           let temperature = aiMessage.effectiveTemperature(for: plan.baseModel)
+           let temperature = aiMessage.effectiveTemperature(for: plan.baseModel, overrides: modelOverrides)
         {
             parameters.temperature = temperature
         }

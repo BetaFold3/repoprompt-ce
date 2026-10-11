@@ -9,13 +9,14 @@ import Foundation
 import SwiftOpenAI
 
 final class GrokProvider: OpenAIProvider {
-    init(apiKey: String) {
+    init(apiKey: String, modelOverrides: any AIModelOverrideReading) {
         let baseURL = URL(string: "https://api.x.ai")! // Per user instruction
         super.init(
             apiKey: apiKey,
             baseURL: baseURL,
             configuredMaxTokens: nil, // Grok models might have their own defaults, or can be set per model
-            overrideVersion: "v1" // Assuming /v1 for OpenAI compatibility
+            overrideVersion: "v1", // Assuming /v1 for OpenAI compatibility
+            modelOverrides: modelOverrides
         )
     }
 

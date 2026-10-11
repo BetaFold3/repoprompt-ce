@@ -12,6 +12,7 @@ actor DisposableProviderPool {
     private let mcpHost: any AgentMCPHosting
     private let routingWaiter: MCPRoutingWaiter
     private let codexAuthRecovery: any CodexManagedAuthRecovering
+    private let modelOverrides: any AIModelOverrideReading
 
     /// Caches for fallback if KeyManager returns invalid/empty values.
     /// Key-based providers (OpenAI, Anthropic, etc.) will store their key here.
@@ -24,12 +25,14 @@ actor DisposableProviderPool {
         keyManager: KeyManager,
         mcpHost: any AgentMCPHosting,
         routingWaiter: MCPRoutingWaiter,
-        codexAuthRecovery: any CodexManagedAuthRecovering
+        codexAuthRecovery: any CodexManagedAuthRecovering,
+        modelOverrides: any AIModelOverrideReading
     ) {
         self.keyManager = keyManager
         self.mcpHost = mcpHost
         self.routingWaiter = routingWaiter
         self.codexAuthRecovery = codexAuthRecovery
+        self.modelOverrides = modelOverrides
     }
 
     /// Returns a brand-new provider every time it's called.
@@ -57,6 +60,7 @@ actor DisposableProviderPool {
                 mcpHost: mcpHost,
                 routingWaiter: routingWaiter,
                 codexAuthRecovery: codexAuthRecovery,
+                modelOverrides: modelOverrides,
                 ollamaURL: ollamaURL,
                 azureConfiguration: azureConfiguration,
                 model: model.rawValue
@@ -88,6 +92,7 @@ actor DisposableProviderPool {
                 mcpHost: mcpHost,
                 routingWaiter: routingWaiter,
                 codexAuthRecovery: codexAuthRecovery,
+                modelOverrides: modelOverrides,
                 ollamaURL: typedURL,
                 azureConfiguration: azureConfiguration
             )
@@ -100,6 +105,7 @@ actor DisposableProviderPool {
                 mcpHost: mcpHost,
                 routingWaiter: routingWaiter,
                 codexAuthRecovery: codexAuthRecovery,
+                modelOverrides: modelOverrides,
                 ollamaURL: fallbackURL,
                 azureConfiguration: azureConfiguration
             )
@@ -119,6 +125,7 @@ actor DisposableProviderPool {
                 mcpHost: mcpHost,
                 routingWaiter: routingWaiter,
                 codexAuthRecovery: codexAuthRecovery,
+                modelOverrides: modelOverrides,
                 ollamaURL: ollamaURL,
                 azureConfiguration: directConfig
             )
@@ -141,6 +148,7 @@ actor DisposableProviderPool {
                     mcpHost: mcpHost,
                     routingWaiter: routingWaiter,
                     codexAuthRecovery: codexAuthRecovery,
+                    modelOverrides: modelOverrides,
                     ollamaURL: ollamaURL,
                     azureConfiguration: config
                 )
@@ -157,6 +165,7 @@ actor DisposableProviderPool {
                 mcpHost: mcpHost,
                 routingWaiter: routingWaiter,
                 codexAuthRecovery: codexAuthRecovery,
+                modelOverrides: modelOverrides,
                 ollamaURL: ollamaURL,
                 azureConfiguration: cachedConfig
             )
@@ -168,6 +177,7 @@ actor DisposableProviderPool {
                 mcpHost: mcpHost,
                 routingWaiter: routingWaiter,
                 codexAuthRecovery: codexAuthRecovery,
+                modelOverrides: modelOverrides,
                 ollamaURL: ollamaURL,
                 azureConfiguration: nil
             )
@@ -204,6 +214,7 @@ actor DisposableProviderPool {
             mcpHost: mcpHost,
             routingWaiter: routingWaiter,
             codexAuthRecovery: codexAuthRecovery,
+            modelOverrides: modelOverrides,
             ollamaURL: ollamaURL,
             azureConfiguration: azureConfiguration,
             model: model.rawValue

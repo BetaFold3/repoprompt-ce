@@ -7,6 +7,7 @@ class AIProviderFactory {
         mcpHost: any AgentMCPHosting,
         routingWaiter: MCPRoutingWaiter,
         codexAuthRecovery: any CodexManagedAuthRecovering,
+        modelOverrides: any AIModelOverrideReading,
         ollamaURL: URL? = nil,
         azureConfiguration: AzureOpenAIConfiguration? = nil
     ) async throws -> AIProvider {
@@ -18,6 +19,7 @@ class AIProviderFactory {
                 mcpHost: mcpHost,
                 routingWaiter: routingWaiter,
                 codexAuthRecovery: codexAuthRecovery,
+                modelOverrides: modelOverrides,
                 ollamaURL: ollamaURL,
                 azureConfiguration: config
             )
@@ -31,6 +33,7 @@ class AIProviderFactory {
                 mcpHost: mcpHost,
                 routingWaiter: routingWaiter,
                 codexAuthRecovery: codexAuthRecovery,
+                modelOverrides: modelOverrides,
                 ollamaURL: ollamaURL,
                 azureConfiguration: azureConfiguration
             )
@@ -45,6 +48,7 @@ class AIProviderFactory {
             mcpHost: mcpHost,
             routingWaiter: routingWaiter,
             codexAuthRecovery: codexAuthRecovery,
+            modelOverrides: modelOverrides,
             ollamaURL: ollamaURL,
             azureConfiguration: azureConfiguration
         )
@@ -56,13 +60,14 @@ class AIProviderFactory {
         mcpHost: any AgentMCPHosting,
         routingWaiter: MCPRoutingWaiter,
         codexAuthRecovery: any CodexManagedAuthRecovering,
+        modelOverrides: any AIModelOverrideReading,
         ollamaURL: URL? = nil,
         azureConfiguration: AzureOpenAIConfiguration? = nil,
         model: String? = nil
     ) async throws -> AIProvider {
         switch providerType {
         case .anthropic:
-            return AnthropicProvider(apiKey: key)
+            return AnthropicProvider(apiKey: key, modelOverrides: modelOverrides)
         case .openAI:
             let raw = UserDefaults.standard.string(forKey: "customBaseURLOpenAI")
             let split = OpenAIURLHelper.splitBaseURLAndVersion(raw)
@@ -70,29 +75,29 @@ class AIProviderFactory {
             let storedVersion = UserDefaults.standard.string(forKey: "customOpenAIVersionOverride")
             let finalVersion = storedVersion ?? split.version
             let serviceTier = UserDefaults.standard.string(forKey: "openAIServiceTier")
-            return OpenAIProvider(apiKey: key, baseURL: baseURL, configuredMaxTokens: nil, overrideVersion: finalVersion, serviceTier: serviceTier)
+            return OpenAIProvider(apiKey: key, baseURL: baseURL, configuredMaxTokens: nil, overrideVersion: finalVersion, serviceTier: serviceTier, modelOverrides: modelOverrides)
         case .ollama:
             let baseURL = ollamaURL ?? URL(string: "http://localhost:11434")!
-            return OllamaProvider(baseURL: baseURL)
+            return OllamaProvider(baseURL: baseURL, modelOverrides: modelOverrides)
         case .azure:
             guard let config = azureConfiguration else {
                 return BlankProvider()
             }
-            return AzureOpenAIProvider(configuration: config)
+            return AzureOpenAIProvider(configuration: config, modelOverrides: modelOverrides)
         case .openRouter:
-            return OpenRouterProvider(apiKey: key)
+            return OpenRouterProvider(apiKey: key, modelOverrides: modelOverrides)
         case .gemini:
-            return GeminiProvider(apiKey: key)
+            return GeminiProvider(apiKey: key, modelOverrides: modelOverrides)
         case .deepseek:
-            return DeepSeekProvider(apiKey: key)
+            return DeepSeekProvider(apiKey: key, modelOverrides: modelOverrides)
         case .fireworks: // <-- Add Fireworks case
-            return FireworksProvider(apiKey: key)
+            return FireworksProvider(apiKey: key, modelOverrides: modelOverrides)
         case .grok: // <-- Add Grok case
-            return GrokProvider(apiKey: key)
+            return GrokProvider(apiKey: key, modelOverrides: modelOverrides)
         case .groq: // <-- Add Groq case
-            return GroqProvider(apiKey: key)
+            return GroqProvider(apiKey: key, modelOverrides: modelOverrides)
         case .zAI:
-            return ZAIProvider(apiKey: key)
+            return ZAIProvider(apiKey: key, modelOverrides: modelOverrides)
         case .claudeCode: // <-- Add Claude Code case
             return try ClaudeCodeProvider()
         case .codex:
@@ -144,7 +149,8 @@ class AIProviderFactory {
                     baseURL: baseURL,
                     configuredMaxTokens: configuredMaxTokens,
                     overrideVersion: version,
-                    includeUsageInStream: false
+                    includeUsageInStream: false,
+                    modelOverrides: modelOverrides
                 )
             }
 
@@ -157,7 +163,8 @@ class AIProviderFactory {
                 customHeaders: config.headers,
                 configuredMaxTokens: configuredMaxTokens,
                 includeContentTypeHeader: config.includeContentTypeHeader,
-                apiVersion: version
+                apiVersion: version,
+                modelOverrides: modelOverrides
             )
         }
     }

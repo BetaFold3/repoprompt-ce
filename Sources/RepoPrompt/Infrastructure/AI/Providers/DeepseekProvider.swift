@@ -9,13 +9,14 @@ import Foundation
 import SwiftOpenAI
 
 final class DeepSeekProvider: OpenAIProvider {
-    init(apiKey: String) {
+    init(apiKey: String, modelOverrides: any AIModelOverrideReading) {
         let baseURL = URL(string: "https://api.deepseek.com")!
         super.init(
             apiKey: apiKey,
             baseURL: baseURL,
             configuredMaxTokens: nil,
-            overrideVersion: "v1"
+            overrideVersion: "v1",
+            modelOverrides: modelOverrides
         )
     }
 

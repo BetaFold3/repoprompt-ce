@@ -300,7 +300,7 @@ final class PromptCanonicalCodemapPackagingTests: XCTestCase {
         let secureService = SecureKeysService(secureStorage: TestSecureStorageBackend())
         let keyManager = KeyManager(secureService: secureService)
         let apiSettings = APISettingsViewModel(
-            aiQueriesService: AIQueriesService(keyManager: keyManager, mcpHost: ServerNetworkManager.shared, routingWaiter: .shared, codexAuthRecovery: CodexManagedAuthRecoveryService.shared),
+            aiQueriesService: AIQueriesService(keyManager: keyManager, mcpHost: ServerNetworkManager.shared, routingWaiter: .shared, codexAuthRecovery: CodexManagedAuthRecoveryService.shared, modelOverrides: AppModelOverrideReader()),
             keyManager: keyManager,
             loadStoredDataOnInit: false
         )

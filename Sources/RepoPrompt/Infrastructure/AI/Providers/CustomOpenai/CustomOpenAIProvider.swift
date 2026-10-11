@@ -73,6 +73,7 @@ class CustomOpenAIProvider: AIProvider, AIModelGetter {
     private let apiVersion: String?
     private let httpClient: HTTPClient
     private let streamingHttpClient: HTTPClient
+    private let modelOverrides: any AIModelOverrideReading
 
     /// Shared response structures
     struct ModelsResponse: Codable {
@@ -202,7 +203,8 @@ class CustomOpenAIProvider: AIProvider, AIModelGetter {
         includeContentTypeHeader: Bool = false,
         apiVersion: String? = nil,
         httpClient: HTTPClient = DefaultHTTPClient.aiClient,
-        streamingHttpClient: HTTPClient = DefaultHTTPClient.aiStreamingClient
+        streamingHttpClient: HTTPClient = DefaultHTTPClient.aiStreamingClient,
+        modelOverrides: any AIModelOverrideReading
     ) {
         self.baseURL = baseURL.hasSuffix("/") ? String(baseURL.dropLast()) : baseURL
         self.apiKey = apiKey
@@ -214,6 +216,7 @@ class CustomOpenAIProvider: AIProvider, AIModelGetter {
         self.apiVersion = apiVersion
         self.httpClient = httpClient
         self.streamingHttpClient = streamingHttpClient
+        self.modelOverrides = modelOverrides
     }
 
     private func urlFor(path: String) -> URL? {
@@ -513,7 +516,7 @@ class CustomOpenAIProvider: AIProvider, AIModelGetter {
                 messages: messages,
                 modelName: model.modelName,
                 maxTokens: maxTokens,
-                temperature: aiMessage.effectiveTemperature(for: model)
+                temperature: aiMessage.effectiveTemperature(for: model, overrides: modelOverrides)
             )
 
             let response = try await httpClient.data(for: request)
@@ -539,7 +542,7 @@ class CustomOpenAIProvider: AIProvider, AIModelGetter {
     /// streamMessage now accepts temperature as a param
     func streamMessage(_ aiMessage: AIMessage, model: AIModel, maxTokens: Int?) async throws -> AsyncThrowingStream<AIStreamResult, Error> {
         // Check if stream is supported by the model
-        if !model.canStream {
+        if !model.canStream(overrides: modelOverrides) {
             let completeText = try await completeMessage(aiMessage, model: model, maxTokens: maxTokens)
             return AsyncThrowingStream { continuation in
                 continuation.yield(AIStreamResult(type: "content", text: completeText.text, reasoning: nil, promptTokens: nil, completionTokens: nil))
@@ -574,7 +577,7 @@ class CustomOpenAIProvider: AIProvider, AIModelGetter {
                             modelName: model.modelName,
                             stream: true,
                             maxTokens: maxTokens,
-                            temperature: aiMessage.effectiveTemperature(for: model)
+                            temperature: aiMessage.effectiveTemperature(for: model, overrides: modelOverrides)
                         )
                         let (bytes, httpResponse) = try await self.streamingHttpClient.bytes(for: request)
 

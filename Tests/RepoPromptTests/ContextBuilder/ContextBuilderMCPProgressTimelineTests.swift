@@ -185,6 +185,7 @@ final class ContextBuilderMCPProgressTimelineTests: XCTestCase {
                         mcpHost: ServerNetworkManager.shared,
                         routingWaiter: .shared,
                         codexAuthRecovery: CodexManagedAuthRecoveryService.shared,
+                        modelOverrides: AppModelOverrideReader(),
                         sendPromptOverride: { _, _ in
                             let stream = AsyncThrowingStream<ChatStreamOutput, Error> { continuation in
                                 continuation.yield(ChatStreamOutput(

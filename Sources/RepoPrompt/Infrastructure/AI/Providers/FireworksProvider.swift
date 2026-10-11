@@ -9,13 +9,14 @@ import Foundation
 import SwiftOpenAI
 
 final class FireworksProvider: OpenAIProvider {
-    init(apiKey: String) {
+    init(apiKey: String, modelOverrides: any AIModelOverrideReading) {
         let baseURL = URL(string: "https://api.fireworks.ai/inference")!
         super.init(
             apiKey: apiKey,
             baseURL: baseURL,
             configuredMaxTokens: nil, // Use model-specific max tokens
-            overrideVersion: "v1"
+            overrideVersion: "v1",
+            modelOverrides: modelOverrides
         )
     }
 

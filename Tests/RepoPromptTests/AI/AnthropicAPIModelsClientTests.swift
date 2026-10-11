@@ -18,7 +18,7 @@ final class AnthropicAPIModelsClientTests: XCTestCase {
             "claude-future-1"
         ])
         let viewModel = APISettingsViewModel(
-            aiQueriesService: AIQueriesService(keyManager: keyManager, mcpHost: ServerNetworkManager.shared, routingWaiter: .shared, codexAuthRecovery: CodexManagedAuthRecoveryService.shared),
+            aiQueriesService: AIQueriesService(keyManager: keyManager, mcpHost: ServerNetworkManager.shared, routingWaiter: .shared, codexAuthRecovery: CodexManagedAuthRecoveryService.shared, modelOverrides: AppModelOverrideReader()),
             keyManager: keyManager,
             loadStoredDataOnInit: false,
             apiModelCatalog: APIModelCatalog(),
@@ -52,7 +52,7 @@ final class AnthropicAPIModelsClientTests: XCTestCase {
             "second-key": ["claude-second-private"]
         ])
         let viewModel = APISettingsViewModel(
-            aiQueriesService: AIQueriesService(keyManager: keyManager, mcpHost: ServerNetworkManager.shared, routingWaiter: .shared, codexAuthRecovery: CodexManagedAuthRecoveryService.shared),
+            aiQueriesService: AIQueriesService(keyManager: keyManager, mcpHost: ServerNetworkManager.shared, routingWaiter: .shared, codexAuthRecovery: CodexManagedAuthRecoveryService.shared, modelOverrides: AppModelOverrideReader()),
             keyManager: keyManager,
             loadStoredDataOnInit: false,
             apiModelCatalog: APIModelCatalog(),
@@ -87,7 +87,7 @@ final class AnthropicAPIModelsClientTests: XCTestCase {
             secureService: SecureKeysService(secureStorage: secureStorage)
         )
         let viewModel = APISettingsViewModel(
-            aiQueriesService: AIQueriesService(keyManager: keyManager, mcpHost: ServerNetworkManager.shared, routingWaiter: .shared, codexAuthRecovery: CodexManagedAuthRecoveryService.shared),
+            aiQueriesService: AIQueriesService(keyManager: keyManager, mcpHost: ServerNetworkManager.shared, routingWaiter: .shared, codexAuthRecovery: CodexManagedAuthRecoveryService.shared, modelOverrides: AppModelOverrideReader()),
             keyManager: keyManager,
             loadStoredDataOnInit: false,
             apiModelCatalog: APIModelCatalog()

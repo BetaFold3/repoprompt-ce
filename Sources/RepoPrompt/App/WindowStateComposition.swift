@@ -57,7 +57,8 @@ enum WindowStateCompositionFactory {
                 keyManager: keyManager,
                 mcpHost: ServerNetworkManager.shared,
                 routingWaiter: .shared,
-                codexAuthRecovery: CodexManagedAuthRecoveryService.shared
+                codexAuthRecovery: CodexManagedAuthRecoveryService.shared,
+                modelOverrides: AppModelOverrideReader()
             )
 
         // 3) API Settings

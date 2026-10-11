@@ -86,19 +86,4 @@ struct CustomProviderConfiguration: Codable {
             enabledModels.remove(model)
         }
     }
-
-    func toProvider(apiKey: String) -> CustomOpenAIProvider {
-        // Note: The factory currently doesn't use this method directly for instantiation.
-        // If it did, we would need to pass self.maxTokens and includeContentTypeHeader here.
-        CustomOpenAIProvider(
-            baseURL: url,
-            apiKey: apiKey,
-            defaultModel: defaultModel,
-            defaultTemperature: Self.defaultTemperature,
-            customHeaders: headers,
-            configuredMaxTokens: maxTokens,
-            includeContentTypeHeader: includeContentTypeHeader,
-            apiVersion: apiVersion
-        )
-    }
 }

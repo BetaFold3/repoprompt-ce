@@ -8,8 +8,8 @@
 import Foundation
 
 final class OllamaProvider: OpenAIProvider {
-    init(baseURL: URL) {
+    init(baseURL: URL, modelOverrides: any AIModelOverrideReading) {
         // Ollama runs locally. No API key is required, just the base URL.
-        super.init(baseURL: baseURL)
+        super.init(baseURL: baseURL, modelOverrides: modelOverrides)
     }
 }

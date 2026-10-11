@@ -2924,7 +2924,7 @@ final class SettingsJSONOnlyPersistenceTests: XCTestCase {
             secureService: SecureKeysService(secureStorage: TestSecureStorageBackend())
         )
         return APISettingsViewModel(
-            aiQueriesService: AIQueriesService(keyManager: keyManager, mcpHost: ServerNetworkManager.shared, routingWaiter: .shared, codexAuthRecovery: CodexManagedAuthRecoveryService.shared),
+            aiQueriesService: AIQueriesService(keyManager: keyManager, mcpHost: ServerNetworkManager.shared, routingWaiter: .shared, codexAuthRecovery: CodexManagedAuthRecoveryService.shared, modelOverrides: AppModelOverrideReader()),
             keyManager: keyManager,
             loadStoredDataOnInit: false
         )

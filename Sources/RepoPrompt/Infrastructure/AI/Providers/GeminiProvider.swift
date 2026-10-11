@@ -1,13 +1,14 @@
 import Foundation
 
 final class GeminiProvider: OpenAIProvider {
-    init(apiKey: String) {
+    init(apiKey: String, modelOverrides: any AIModelOverrideReading) {
         let baseURL = URL(string: "https://generativelanguage.googleapis.com")!
         super.init(
             apiKey: apiKey,
             baseURL: baseURL,
             configuredMaxTokens: nil,
-            overrideVersion: "v1beta"
+            overrideVersion: "v1beta",
+            modelOverrides: modelOverrides
         )
     }
 

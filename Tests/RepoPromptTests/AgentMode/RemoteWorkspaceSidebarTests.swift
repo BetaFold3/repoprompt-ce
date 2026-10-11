@@ -2437,7 +2437,7 @@ final class RemoteWorkspaceSidebarTests: XCTestCase {
             secureService: SecureKeysService(secureStorage: TestSecureStorageBackend())
         )
         let apiSettings = APISettingsViewModel(
-            aiQueriesService: AIQueriesService(keyManager: keyManager, mcpHost: ServerNetworkManager.shared, routingWaiter: .shared, codexAuthRecovery: CodexManagedAuthRecoveryService.shared),
+            aiQueriesService: AIQueriesService(keyManager: keyManager, mcpHost: ServerNetworkManager.shared, routingWaiter: .shared, codexAuthRecovery: CodexManagedAuthRecoveryService.shared, modelOverrides: AppModelOverrideReader()),
             keyManager: keyManager,
             loadStoredDataOnInit: false
         )

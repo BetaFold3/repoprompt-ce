@@ -146,7 +146,7 @@ final class AnthropicDiscoveredModelStoreTests: XCTestCase {
         let loader = FailingAnthropicDescriptorLoaderProbe()
         let catalog = APIModelCatalog()
         let viewModel = APISettingsViewModel(
-            aiQueriesService: AIQueriesService(keyManager: keyManager, mcpHost: ServerNetworkManager.shared, routingWaiter: .shared, codexAuthRecovery: CodexManagedAuthRecoveryService.shared),
+            aiQueriesService: AIQueriesService(keyManager: keyManager, mcpHost: ServerNetworkManager.shared, routingWaiter: .shared, codexAuthRecovery: CodexManagedAuthRecoveryService.shared, modelOverrides: AppModelOverrideReader()),
             keyManager: keyManager,
             loadStoredDataOnInit: false,
             apiModelCatalog: catalog,
@@ -189,7 +189,7 @@ final class AnthropicDiscoveredModelStoreTests: XCTestCase {
         )
         let snapshotsGate = AnthropicSnapshotsCreatedGate()
         let viewModel = APISettingsViewModel(
-            aiQueriesService: AIQueriesService(keyManager: keyManager, mcpHost: ServerNetworkManager.shared, routingWaiter: .shared, codexAuthRecovery: CodexManagedAuthRecoveryService.shared),
+            aiQueriesService: AIQueriesService(keyManager: keyManager, mcpHost: ServerNetworkManager.shared, routingWaiter: .shared, codexAuthRecovery: CodexManagedAuthRecoveryService.shared, modelOverrides: AppModelOverrideReader()),
             keyManager: keyManager,
             loadStoredDataOnInit: false,
             apiModelCatalog: catalog,
@@ -243,7 +243,7 @@ final class AnthropicDiscoveredModelStoreTests: XCTestCase {
         let validationProbe = SequencedAnthropicKeyValidationProbe(results: [false, true])
         let snapshotsGate = AnthropicSnapshotsCreatedGate()
         let viewModel = APISettingsViewModel(
-            aiQueriesService: AIQueriesService(keyManager: keyManager, mcpHost: ServerNetworkManager.shared, routingWaiter: .shared, codexAuthRecovery: CodexManagedAuthRecoveryService.shared),
+            aiQueriesService: AIQueriesService(keyManager: keyManager, mcpHost: ServerNetworkManager.shared, routingWaiter: .shared, codexAuthRecovery: CodexManagedAuthRecoveryService.shared, modelOverrides: AppModelOverrideReader()),
             keyManager: keyManager,
             loadStoredDataOnInit: false,
             apiModelCatalog: catalog,
@@ -305,7 +305,7 @@ final class AnthropicDiscoveredModelStoreTests: XCTestCase {
             newModels: [model("claude-new")]
         )
         let viewModel = APISettingsViewModel(
-            aiQueriesService: AIQueriesService(keyManager: keyManager, mcpHost: ServerNetworkManager.shared, routingWaiter: .shared, codexAuthRecovery: CodexManagedAuthRecoveryService.shared),
+            aiQueriesService: AIQueriesService(keyManager: keyManager, mcpHost: ServerNetworkManager.shared, routingWaiter: .shared, codexAuthRecovery: CodexManagedAuthRecoveryService.shared, modelOverrides: AppModelOverrideReader()),
             keyManager: keyManager,
             loadStoredDataOnInit: false,
             apiModelCatalog: catalog,
@@ -348,7 +348,7 @@ final class AnthropicDiscoveredModelStoreTests: XCTestCase {
         let store = AnthropicDiscoveredModelStore(defaults: defaults)
         XCTAssertTrue(store.replace(with: [model("claude-retained")]))
         let viewModel = APISettingsViewModel(
-            aiQueriesService: AIQueriesService(keyManager: keyManager, mcpHost: ServerNetworkManager.shared, routingWaiter: .shared, codexAuthRecovery: CodexManagedAuthRecoveryService.shared),
+            aiQueriesService: AIQueriesService(keyManager: keyManager, mcpHost: ServerNetworkManager.shared, routingWaiter: .shared, codexAuthRecovery: CodexManagedAuthRecoveryService.shared, modelOverrides: AppModelOverrideReader()),
             keyManager: keyManager,
             loadStoredDataOnInit: false,
             apiModelCatalog: APIModelCatalog(),

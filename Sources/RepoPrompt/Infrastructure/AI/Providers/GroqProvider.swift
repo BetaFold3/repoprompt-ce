@@ -9,13 +9,14 @@ import Foundation
 import SwiftOpenAI
 
 final class GroqProvider: OpenAIProvider {
-    init(apiKey: String) {
+    init(apiKey: String, modelOverrides: any AIModelOverrideReading) {
         let baseURL = URL(string: "https://api.groq.com/openai")!
         super.init(
             apiKey: apiKey,
             baseURL: baseURL,
             configuredMaxTokens: 16384, // Set max output tokens to 16,384
-            overrideVersion: "v1"
+            overrideVersion: "v1",
+            modelOverrides: modelOverrides
         )
     }
 

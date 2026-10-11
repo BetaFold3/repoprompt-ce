@@ -128,10 +128,14 @@ public struct AzureOpenAIConfiguration: Codable, Equatable {
         )
     }
 
-    static func inferredEndpoint(for modelID: String, baseModelID: String? = nil) -> ModelDescriptor.EndpointKind {
+    static func inferredEndpoint(
+        for modelID: String,
+        baseModelID: String? = nil,
+        overrides: any AIModelOverrideReading
+    ) -> ModelDescriptor.EndpointKind {
         let candidates = [baseModelID, modelID].compactMap(\.self)
         for name in candidates {
-            if let equivalent = AIModel.fromModelName(name), equivalent.usesResponsesAPI {
+            if let equivalent = AIModel.fromModelName(name), equivalent.usesResponsesAPI(overrides: overrides) {
                 return .responses
             }
             let lowered = name.lowercased()
@@ -140,16 +144,6 @@ public struct AzureOpenAIConfiguration: Codable, Equatable {
             }
         }
         return .chatCompletions
-    }
-
-    static func inferredSupportsStreaming(for modelID: String, baseModelID: String? = nil) -> Bool {
-        if let baseModelID, let equivalent = AIModel.fromModelName(baseModelID) {
-            return equivalent.canStream
-        }
-        if let equivalent = AIModel.fromModelName(modelID) {
-            return equivalent.canStream
-        }
-        return !modelID.lowercased().contains("no-stream")
     }
 }
 
@@ -352,6 +346,7 @@ final class AzureOpenAIProvider: AIProvider {
     }
 
     private let configuration: AzureOpenAIConfiguration
+    private let modelOverrides: any AIModelOverrideReading
     private lazy var urlSessionConfiguration: URLSessionConfiguration = {
         let config = URLSessionConfiguration.default
         config.timeoutIntervalForRequest = 21600 // 6 hours
@@ -365,8 +360,9 @@ final class AzureOpenAIProvider: AIProvider {
         debugEnabled: Self.enableDebugLogging
     )
 
-    init(configuration: AzureOpenAIConfiguration) {
+    init(configuration: AzureOpenAIConfiguration, modelOverrides: any AIModelOverrideReading) {
         self.configuration = configuration
+        self.modelOverrides = modelOverrides
     }
 
     // MARK: - Helpers
@@ -377,7 +373,7 @@ final class AzureOpenAIProvider: AIProvider {
             let normalizedName = Self.normalizedModelName(from: name)
             var descriptor = configuration.descriptor(for: name)
                 ?? configuration.descriptor(for: normalizedName)
-                ?? Self.defaultDescriptor(for: name)
+                ?? Self.defaultDescriptor(for: name, overrides: modelOverrides)
             var deploymentID = descriptor?.id ?? name
 
             let descriptorMatchesRequested = descriptor.map {
@@ -390,7 +386,7 @@ final class AzureOpenAIProvider: AIProvider {
                     if baseModel != aiModel {
                         let baseName = Self.normalizedModelName(from: baseModel.modelName)
                         let baseDescriptor = configuration.descriptor(for: baseName)
-                            ?? Self.defaultDescriptor(for: baseName)
+                            ?? Self.defaultDescriptor(for: baseName, overrides: modelOverrides)
 
                         if let baseDescriptor {
                             let variantDisplay = AIModel.azureCustom(name: normalizedName).displayName
@@ -429,7 +425,7 @@ final class AzureOpenAIProvider: AIProvider {
             return true
         }
         if let baseModel {
-            return baseModel.usesResponsesAPI
+            return baseModel.usesResponsesAPI(overrides: modelOverrides)
         }
         return false
     }
@@ -455,7 +451,7 @@ final class AzureOpenAIProvider: AIProvider {
         }
 
         if let baseModel {
-            return baseModel.canStream
+            return baseModel.canStream(overrides: modelOverrides)
         }
 
         return true
@@ -575,7 +571,7 @@ final class AzureOpenAIProvider: AIProvider {
             model: .custom(deploymentID)
         )
 
-        if let temperature = message.effectiveTemperature(for: baseModel ?? model) {
+        if let temperature = message.effectiveTemperature(for: baseModel ?? model, overrides: modelOverrides) {
             params.temperature = temperature
         }
 
@@ -626,7 +622,7 @@ final class AzureOpenAIProvider: AIProvider {
             parameters.instructions = message.systemPrompt
         }
 
-        if let temperature = message.effectiveTemperature(for: baseModel ?? model) {
+        if let temperature = message.effectiveTemperature(for: baseModel ?? model, overrides: modelOverrides) {
             parameters.temperature = temperature
         }
 
@@ -894,15 +890,48 @@ final class AzureOpenAIProvider: AIProvider {
 // MARK: - Deployment discovery helpers ------------------------------------------------------------
 
 extension AzureOpenAIProvider {
-    static let defaultModelDescriptors: [AzureOpenAIConfiguration.ModelDescriptor] = {
+    /// Process-wide compute-once storage for `defaultModelDescriptors(overrides:)`.
+    private final class DefaultModelDescriptorsCache: @unchecked Sendable {
+        private let lock = NSLock()
+        private var descriptors: [AzureOpenAIConfiguration.ModelDescriptor]?
+
+        func value(
+            orCompute compute: () -> [AzureOpenAIConfiguration.ModelDescriptor]
+        ) -> [AzureOpenAIConfiguration.ModelDescriptor] {
+            lock.lock()
+            defer { lock.unlock() }
+            if let descriptors {
+                return descriptors
+            }
+            let computed = compute()
+            descriptors = computed
+            return computed
+        }
+    }
+
+    private static let defaultModelDescriptorsCache = DefaultModelDescriptorsCache()
+
+    /// Mirrors the former `static let`: computed once at first access from the overrides
+    /// passed on that first call; later calls return the stored list and ignore `overrides`.
+    static func defaultModelDescriptors(
+        overrides: any AIModelOverrideReading
+    ) -> [AzureOpenAIConfiguration.ModelDescriptor] {
+        defaultModelDescriptorsCache.value {
+            makeDefaultModelDescriptors(overrides: overrides)
+        }
+    }
+
+    private static func makeDefaultModelDescriptors(
+        overrides: any AIModelOverrideReading
+    ) -> [AzureOpenAIConfiguration.ModelDescriptor] {
         let openAIModels = AIModel.modelsForProvider(.openAI)
             .sorted { lhs, rhs in lhs.displayName.lowercased() < rhs.displayName.lowercased() }
 
         let descriptors = openAIModels.map { model in
             let rawID = model.rawValue
             let display = AIModel.azureCustom(name: rawID).displayName
-            let usesResponses = model.usesResponsesAPI
-            let streams = model.canStream
+            let usesResponses = model.usesResponsesAPI(overrides: overrides)
+            let streams = model.canStream(overrides: overrides)
 
             return AzureOpenAIConfiguration.ModelDescriptor(
                 id: rawID,
@@ -916,10 +945,13 @@ extension AzureOpenAIProvider {
         }
 
         return descriptors
-            .map { normalizedDescriptor($0) }
-    }()
+            .map { normalizedDescriptor($0, overrides: overrides) }
+    }
 
-    static func mergedWithDefaultDescriptors(_ descriptors: [AzureOpenAIConfiguration.ModelDescriptor]) -> [AzureOpenAIConfiguration.ModelDescriptor] {
+    static func mergedWithDefaultDescriptors(
+        _ descriptors: [AzureOpenAIConfiguration.ModelDescriptor],
+        overrides: any AIModelOverrideReading
+    ) -> [AzureOpenAIConfiguration.ModelDescriptor] {
         var merged: [String: AzureOpenAIConfiguration.ModelDescriptor] = [:]
 
         for descriptor in descriptors {
@@ -927,7 +959,7 @@ extension AzureOpenAIProvider {
             merged[key] = descriptor
         }
 
-        for descriptor in defaultModelDescriptors {
+        for descriptor in defaultModelDescriptors(overrides: overrides) {
             let key = normalizedModelName(from: descriptor.id).lowercased()
             if merged[key] == nil {
                 merged[key] = descriptor
@@ -935,17 +967,24 @@ extension AzureOpenAIProvider {
         }
 
         return merged.values
-            .map { normalizedDescriptor($0) }
+            .map { normalizedDescriptor($0, overrides: overrides) }
             .sorted { $0.displayName.lowercased() < $1.displayName.lowercased() }
     }
 
-    private static func normalizedDescriptor(_ descriptor: AzureOpenAIConfiguration.ModelDescriptor) -> AzureOpenAIConfiguration.ModelDescriptor {
+    private static func normalizedDescriptor(
+        _ descriptor: AzureOpenAIConfiguration.ModelDescriptor,
+        overrides: any AIModelOverrideReading
+    ) -> AzureOpenAIConfiguration.ModelDescriptor {
         let normalizedID = Self.normalizedModelName(from: descriptor.id)
         let openAIModel = AIModel.fromModelName(normalizedID)
-        let inferredEndpoint = descriptor.endpoint ?? AzureOpenAIConfiguration.inferredEndpoint(for: descriptor.id, baseModelID: descriptor.baseModelID)
-        let usesResponses = descriptor.supportsResponses ?? openAIModel?.usesResponsesAPI ?? (inferredEndpoint == .responses)
+        let inferredEndpoint = descriptor.endpoint ?? AzureOpenAIConfiguration.inferredEndpoint(
+            for: descriptor.id,
+            baseModelID: descriptor.baseModelID,
+            overrides: overrides
+        )
+        let usesResponses = descriptor.supportsResponses ?? openAIModel?.usesResponsesAPI(overrides: overrides) ?? (inferredEndpoint == .responses)
         let endpoint: AzureOpenAIConfiguration.ModelDescriptor.EndpointKind = usesResponses ? .responses : .chatCompletions
-        let supportsStreaming = descriptor.supportsStreaming ?? openAIModel?.canStream
+        let supportsStreaming = descriptor.supportsStreaming ?? openAIModel?.canStream(overrides: overrides)
         let resolvedBaseModelID: String = if let explicitBase = descriptor.baseModelID, !explicitBase.isEmpty {
             explicitBase
         } else if let openAIModel {
@@ -969,9 +1008,12 @@ extension AzureOpenAIProvider {
         )
     }
 
-    private static func defaultDescriptor(for identifier: String) -> AzureOpenAIConfiguration.ModelDescriptor? {
+    private static func defaultDescriptor(
+        for identifier: String,
+        overrides: any AIModelOverrideReading
+    ) -> AzureOpenAIConfiguration.ModelDescriptor? {
         let normalized = normalizedModelName(from: identifier).lowercased()
-        return defaultModelDescriptors.first {
+        return defaultModelDescriptors(overrides: overrides).first {
             normalizedModelName(from: $0.id).lowercased() == normalized
         }
     }
@@ -989,7 +1031,8 @@ extension AzureOpenAIProvider {
     static func discoverDeployments(
         baseURL: URL,
         apiKey: String,
-        apiVersions: [String]
+        apiVersions: [String],
+        overrides: any AIModelOverrideReading
     ) async throws -> [AzureOpenAIConfiguration.ModelDescriptor] {
         let orderedVersions = apiVersions.reduce(into: [String]()) { acc, version in
             let trimmed = version.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -1039,10 +1082,14 @@ extension AzureOpenAIProvider {
                     let descriptors = deployments.map { deployment -> AzureOpenAIConfiguration.ModelDescriptor in
                         let normalizedID = Self.normalizedModelName(from: deployment.id)
                         let openAIModel = AIModel.fromModelName(normalizedID)
-                        let inferredEndpoint = AzureOpenAIConfiguration.inferredEndpoint(for: deployment.id, baseModelID: deployment.model)
-                        let usesResponses = openAIModel?.usesResponsesAPI ?? (inferredEndpoint == .responses)
+                        let inferredEndpoint = AzureOpenAIConfiguration.inferredEndpoint(
+                            for: deployment.id,
+                            baseModelID: deployment.model,
+                            overrides: overrides
+                        )
+                        let usesResponses = openAIModel?.usesResponsesAPI(overrides: overrides) ?? (inferredEndpoint == .responses)
                         let endpoint: AzureOpenAIConfiguration.ModelDescriptor.EndpointKind = usesResponses ? .responses : .chatCompletions
-                        let supportsStreaming = openAIModel?.canStream
+                        let supportsStreaming = openAIModel?.canStream(overrides: overrides)
                         let resolvedBaseModelID = openAIModel?.rawValue ?? deployment.model ?? normalizedID
                         let displayName = AIModel.azureCustom(name: normalizedID).displayName
 

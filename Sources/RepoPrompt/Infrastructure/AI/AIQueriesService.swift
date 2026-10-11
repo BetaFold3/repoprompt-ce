@@ -243,6 +243,7 @@ public class AIQueriesService {
     private let mcpHost: any AgentMCPHosting
     private let routingWaiter: MCPRoutingWaiter
     private let codexAuthRecovery: any CodexManagedAuthRecovering
+    private let modelOverrides: any AIModelOverrideReading
     private let sendPromptOverride: SendPromptOverride?
     private var currentModel: AIModel
 
@@ -251,6 +252,7 @@ public class AIQueriesService {
         mcpHost: any AgentMCPHosting,
         routingWaiter: MCPRoutingWaiter,
         codexAuthRecovery: any CodexManagedAuthRecovering,
+        modelOverrides: any AIModelOverrideReading,
         sendPromptOverride: SendPromptOverride? = nil
     ) {
         currentModel = .claude4Sonnet
@@ -258,12 +260,14 @@ public class AIQueriesService {
         self.mcpHost = mcpHost
         self.routingWaiter = routingWaiter
         self.codexAuthRecovery = codexAuthRecovery
+        self.modelOverrides = modelOverrides
         self.sendPromptOverride = sendPromptOverride
         providerPool = DisposableProviderPool(
             keyManager: keyManager,
             mcpHost: mcpHost,
             routingWaiter: routingWaiter,
-            codexAuthRecovery: codexAuthRecovery
+            codexAuthRecovery: codexAuthRecovery,
+            modelOverrides: modelOverrides
         )
     }
 
@@ -275,6 +279,7 @@ public class AIQueriesService {
         mcpHost: any AgentMCPHosting,
         routingWaiter: MCPRoutingWaiter,
         codexAuthRecovery: any CodexManagedAuthRecovering,
+        modelOverrides: any AIModelOverrideReading,
         sendPromptOverride: SendPromptOverride? = nil
     ) {
         currentModel = model
@@ -282,12 +287,14 @@ public class AIQueriesService {
         self.mcpHost = mcpHost
         self.routingWaiter = routingWaiter
         self.codexAuthRecovery = codexAuthRecovery
+        self.modelOverrides = modelOverrides
         self.sendPromptOverride = sendPromptOverride
         providerPool = DisposableProviderPool(
             keyManager: keyManager,
             mcpHost: mcpHost,
             routingWaiter: routingWaiter,
-            codexAuthRecovery: codexAuthRecovery
+            codexAuthRecovery: codexAuthRecovery,
+            modelOverrides: modelOverrides
         )
     }
 
@@ -298,17 +305,20 @@ public class AIQueriesService {
         }
     }
 
-    static func shouldEagerlyFlushReasoningSummaries(for model: AIModel) -> Bool {
+    static func shouldEagerlyFlushReasoningSummaries(
+        for model: AIModel,
+        overrides: any AIModelOverrideReading
+    ) -> Bool {
         switch model {
         case let .openAIServiceTierVariant(base, _):
-            return shouldEagerlyFlushReasoningSummaries(for: base)
+            return shouldEagerlyFlushReasoningSummaries(for: base, overrides: overrides)
         case .openaiCustom:
             return false
         default:
             if model.providerType == .codex {
                 return true
             }
-            return model.providerType == .openAI && model.usesResponsesAPI
+            return model.providerType == .openAI && model.usesResponsesAPI(overrides: overrides)
         }
     }
 
@@ -365,7 +375,7 @@ public class AIQueriesService {
                         var wasCancelled = false
                         var sawMessageStop = false
                         var lastTokenInfo: ChatTokenInfo?
-                        let shouldEagerlyFlushReasoning = Self.shouldEagerlyFlushReasoningSummaries(for: model)
+                        let shouldEagerlyFlushReasoning = Self.shouldEagerlyFlushReasoningSummaries(for: model, overrides: self.modelOverrides)
 
                         // Loop through the partial stream
                         streamLoop: for try await result in providerStream {
@@ -514,10 +524,10 @@ public class AIQueriesService {
 
     func testAnthropicAPI(with apiKey: String? = nil) async throws -> Bool {
         if let providedKey = apiKey {
-            let provider = try await AIProviderFactory.createProvider(for: .anthropic, key: providedKey, mcpHost: mcpHost, routingWaiter: routingWaiter, codexAuthRecovery: codexAuthRecovery) as! AnthropicProvider
+            let provider = try await AIProviderFactory.createProvider(for: .anthropic, key: providedKey, mcpHost: mcpHost, routingWaiter: routingWaiter, codexAuthRecovery: codexAuthRecovery, modelOverrides: modelOverrides) as! AnthropicProvider
             return try await withTimeout(seconds: 30) { try await provider.testAPIKey() }
         } else {
-            let provider = try await AIProviderFactory.createProvider(for: .anthropic, keyManager: keyManager, mcpHost: mcpHost, routingWaiter: routingWaiter, codexAuthRecovery: codexAuthRecovery) as! AnthropicProvider
+            let provider = try await AIProviderFactory.createProvider(for: .anthropic, keyManager: keyManager, mcpHost: mcpHost, routingWaiter: routingWaiter, codexAuthRecovery: codexAuthRecovery, modelOverrides: modelOverrides) as! AnthropicProvider
             return try await withTimeout(seconds: 30) { try await provider.testAPIKey() }
         }
     }
@@ -544,7 +554,8 @@ public class AIQueriesService {
             apiKey: key,
             baseURL: base,
             configuredMaxTokens: nil,
-            overrideVersion: version
+            overrideVersion: version,
+            modelOverrides: modelOverrides
         )
         return try await withTimeout(seconds: 30) { try await provider.testAPIKey() }
     }
@@ -562,29 +573,29 @@ public class AIQueriesService {
     }
 
     func testOllamaAPI(url: URL, model: AIModel = .ollama) async throws -> Bool {
-        let provider = try await AIProviderFactory.createProvider(for: .ollama, keyManager: keyManager, mcpHost: mcpHost, routingWaiter: routingWaiter, codexAuthRecovery: codexAuthRecovery, ollamaURL: url) as! OpenAIProvider
+        let provider = try await AIProviderFactory.createProvider(for: .ollama, keyManager: keyManager, mcpHost: mcpHost, routingWaiter: routingWaiter, codexAuthRecovery: codexAuthRecovery, modelOverrides: modelOverrides, ollamaURL: url) as! OpenAIProvider
         return try await withTimeout(seconds: 30) { try await provider.testAPIKey(model: model) }
     }
 
     func testAzureOpenAIAPI(configuration: AzureOpenAIConfiguration) async throws -> Bool {
-        let provider = try await AIProviderFactory.createProvider(for: .azure, keyManager: keyManager, mcpHost: mcpHost, routingWaiter: routingWaiter, codexAuthRecovery: codexAuthRecovery, azureConfiguration: configuration) as! AzureOpenAIProvider
+        let provider = try await AIProviderFactory.createProvider(for: .azure, keyManager: keyManager, mcpHost: mcpHost, routingWaiter: routingWaiter, codexAuthRecovery: codexAuthRecovery, modelOverrides: modelOverrides, azureConfiguration: configuration) as! AzureOpenAIProvider
         return try await withTimeout(seconds: 30) { try await provider.testAPIKey() }
     }
 
     func testGeminiAPI(with apiKey: String? = nil) async throws -> Bool {
         let provider: GeminiProvider = if let apiKey {
-            try await AIProviderFactory.createProvider(for: .gemini, key: apiKey, mcpHost: mcpHost, routingWaiter: routingWaiter, codexAuthRecovery: codexAuthRecovery) as! GeminiProvider
+            try await AIProviderFactory.createProvider(for: .gemini, key: apiKey, mcpHost: mcpHost, routingWaiter: routingWaiter, codexAuthRecovery: codexAuthRecovery, modelOverrides: modelOverrides) as! GeminiProvider
         } else {
-            try await AIProviderFactory.createProvider(for: .gemini, keyManager: keyManager, mcpHost: mcpHost, routingWaiter: routingWaiter, codexAuthRecovery: codexAuthRecovery) as! GeminiProvider
+            try await AIProviderFactory.createProvider(for: .gemini, keyManager: keyManager, mcpHost: mcpHost, routingWaiter: routingWaiter, codexAuthRecovery: codexAuthRecovery, modelOverrides: modelOverrides) as! GeminiProvider
         }
         return try await withTimeout(seconds: 30) { try await provider.testAPIKey() }
     }
 
     func testOpenRouterAPI(with apiKey: String? = nil, model: AIModel = .openrouterGpt5) async throws -> Bool {
         let provider: OpenRouterProvider = if let apiKey {
-            try await AIProviderFactory.createProvider(for: .openRouter, key: apiKey, mcpHost: mcpHost, routingWaiter: routingWaiter, codexAuthRecovery: codexAuthRecovery) as! OpenRouterProvider
+            try await AIProviderFactory.createProvider(for: .openRouter, key: apiKey, mcpHost: mcpHost, routingWaiter: routingWaiter, codexAuthRecovery: codexAuthRecovery, modelOverrides: modelOverrides) as! OpenRouterProvider
         } else {
-            try await AIProviderFactory.createProvider(for: .openRouter, keyManager: keyManager, mcpHost: mcpHost, routingWaiter: routingWaiter, codexAuthRecovery: codexAuthRecovery) as! OpenRouterProvider
+            try await AIProviderFactory.createProvider(for: .openRouter, keyManager: keyManager, mcpHost: mcpHost, routingWaiter: routingWaiter, codexAuthRecovery: codexAuthRecovery, modelOverrides: modelOverrides) as! OpenRouterProvider
         }
 
         do {
@@ -601,9 +612,9 @@ public class AIQueriesService {
     /// NEW: testDeepSeekAPI
     func testDeepSeekAPI(with apiKey: String? = nil) async throws -> Bool {
         let provider: DeepSeekProvider = if let apiKey {
-            try await AIProviderFactory.createProvider(for: .deepseek, key: apiKey, mcpHost: mcpHost, routingWaiter: routingWaiter, codexAuthRecovery: codexAuthRecovery) as! DeepSeekProvider
+            try await AIProviderFactory.createProvider(for: .deepseek, key: apiKey, mcpHost: mcpHost, routingWaiter: routingWaiter, codexAuthRecovery: codexAuthRecovery, modelOverrides: modelOverrides) as! DeepSeekProvider
         } else {
-            try await AIProviderFactory.createProvider(for: .deepseek, keyManager: keyManager, mcpHost: mcpHost, routingWaiter: routingWaiter, codexAuthRecovery: codexAuthRecovery) as! DeepSeekProvider
+            try await AIProviderFactory.createProvider(for: .deepseek, keyManager: keyManager, mcpHost: mcpHost, routingWaiter: routingWaiter, codexAuthRecovery: codexAuthRecovery, modelOverrides: modelOverrides) as! DeepSeekProvider
         }
         return try await withTimeout(seconds: 30) { try await provider.testAPIKey(model: .deepseekChat) }
     }
@@ -611,9 +622,9 @@ public class AIQueriesService {
     /// Test Fireworks API key
     func testFireworksAPI(with apiKey: String? = nil) async throws -> Bool {
         let provider: FireworksProvider = if let apiKey {
-            try await AIProviderFactory.createProvider(for: .fireworks, key: apiKey, mcpHost: mcpHost, routingWaiter: routingWaiter, codexAuthRecovery: codexAuthRecovery) as! FireworksProvider
+            try await AIProviderFactory.createProvider(for: .fireworks, key: apiKey, mcpHost: mcpHost, routingWaiter: routingWaiter, codexAuthRecovery: codexAuthRecovery, modelOverrides: modelOverrides) as! FireworksProvider
         } else {
-            try await AIProviderFactory.createProvider(for: .fireworks, keyManager: keyManager, mcpHost: mcpHost, routingWaiter: routingWaiter, codexAuthRecovery: codexAuthRecovery) as! FireworksProvider
+            try await AIProviderFactory.createProvider(for: .fireworks, keyManager: keyManager, mcpHost: mcpHost, routingWaiter: routingWaiter, codexAuthRecovery: codexAuthRecovery, modelOverrides: modelOverrides) as! FireworksProvider
         }
         return try await withTimeout(seconds: 30) { try await provider.testAPIKey() }
     }
@@ -621,27 +632,27 @@ public class AIQueriesService {
     /// Test Grok API key
     func testGrokAPI(with apiKey: String? = nil) async throws -> Bool { // NEW
         let provider: GrokProvider = if let apiKey {
-            try await AIProviderFactory.createProvider(for: .grok, key: apiKey, mcpHost: mcpHost, routingWaiter: routingWaiter, codexAuthRecovery: codexAuthRecovery) as! GrokProvider
+            try await AIProviderFactory.createProvider(for: .grok, key: apiKey, mcpHost: mcpHost, routingWaiter: routingWaiter, codexAuthRecovery: codexAuthRecovery, modelOverrides: modelOverrides) as! GrokProvider
         } else {
-            try await AIProviderFactory.createProvider(for: .grok, keyManager: keyManager, mcpHost: mcpHost, routingWaiter: routingWaiter, codexAuthRecovery: codexAuthRecovery) as! GrokProvider
+            try await AIProviderFactory.createProvider(for: .grok, keyManager: keyManager, mcpHost: mcpHost, routingWaiter: routingWaiter, codexAuthRecovery: codexAuthRecovery, modelOverrides: modelOverrides) as! GrokProvider
         }
         return try await withTimeout(seconds: 30) { try await provider.testAPIKey(model: .grokCodeFast1) }
     }
 
     func testGroqAPI(with apiKey: String? = nil) async throws -> Bool { // NEW
         let provider: GroqProvider = if let apiKey {
-            try await AIProviderFactory.createProvider(for: .groq, key: apiKey, mcpHost: mcpHost, routingWaiter: routingWaiter, codexAuthRecovery: codexAuthRecovery) as! GroqProvider
+            try await AIProviderFactory.createProvider(for: .groq, key: apiKey, mcpHost: mcpHost, routingWaiter: routingWaiter, codexAuthRecovery: codexAuthRecovery, modelOverrides: modelOverrides) as! GroqProvider
         } else {
-            try await AIProviderFactory.createProvider(for: .groq, keyManager: keyManager, mcpHost: mcpHost, routingWaiter: routingWaiter, codexAuthRecovery: codexAuthRecovery) as! GroqProvider
+            try await AIProviderFactory.createProvider(for: .groq, keyManager: keyManager, mcpHost: mcpHost, routingWaiter: routingWaiter, codexAuthRecovery: codexAuthRecovery, modelOverrides: modelOverrides) as! GroqProvider
         }
         return try await withTimeout(seconds: 30) { try await provider.testAPIKey(model: .groqKimi) }
     }
 
     func testZAIAPI(with apiKey: String? = nil) async throws -> Bool {
         let provider: ZAIProvider = if let apiKey {
-            try await AIProviderFactory.createProvider(for: .zAI, key: apiKey, mcpHost: mcpHost, routingWaiter: routingWaiter, codexAuthRecovery: codexAuthRecovery) as! ZAIProvider
+            try await AIProviderFactory.createProvider(for: .zAI, key: apiKey, mcpHost: mcpHost, routingWaiter: routingWaiter, codexAuthRecovery: codexAuthRecovery, modelOverrides: modelOverrides) as! ZAIProvider
         } else {
-            try await AIProviderFactory.createProvider(for: .zAI, keyManager: keyManager, mcpHost: mcpHost, routingWaiter: routingWaiter, codexAuthRecovery: codexAuthRecovery) as! ZAIProvider
+            try await AIProviderFactory.createProvider(for: .zAI, keyManager: keyManager, mcpHost: mcpHost, routingWaiter: routingWaiter, codexAuthRecovery: codexAuthRecovery, modelOverrides: modelOverrides) as! ZAIProvider
         }
         return try await withTimeout(seconds: 30) { try await provider.testAPIKey() }
     }
@@ -652,13 +663,13 @@ public class AIQueriesService {
         } else {
             try await keyManager.getAPIKey(for: .zAI) ?? ""
         }
-        let provider = ZAIProvider(apiKey: key, endpoint: .codingPlan)
+        let provider = ZAIProvider(apiKey: key, endpoint: .codingPlan, modelOverrides: modelOverrides)
         let hasCodingPlanAccess = try await withTimeout(seconds: 30) { try await provider.testAPIKey(model: .zaiGLM47) }
         if hasCodingPlanAccess {
             return true
         }
 
-        let generalProvider = ZAIProvider(apiKey: key, endpoint: .generalAPI)
+        let generalProvider = ZAIProvider(apiKey: key, endpoint: .generalAPI, modelOverrides: modelOverrides)
         let hasGeneralAccess = try await withTimeout(seconds: 30) { try await generalProvider.testAPIKey() }
         if hasGeneralAccess {
             throw AIProviderError.invalidConfiguration(
@@ -691,7 +702,8 @@ public class AIQueriesService {
             url: url,
             apiKey: apiKey,
             model: model,
-            timeout: 30.0
+            timeout: 30.0,
+            modelOverrides: modelOverrides
         )
     }
 }
@@ -710,7 +722,8 @@ extension OpenAIProvider {
         url: String,
         apiKey: String,
         model: String,
-        timeout: TimeInterval = 8.0
+        timeout: TimeInterval = 8.0,
+        modelOverrides: any AIModelOverrideReading
     ) async throws -> Bool {
         // ── 1. Normalize and split base + version ────────────────────────────────
         let split = OpenAIURLHelper.splitBaseURLAndVersion(url)
@@ -723,7 +736,8 @@ extension OpenAIProvider {
             apiKey: apiKey,
             baseURL: baseURL,
             configuredMaxTokens: 16, // keep the test cheap
-            overrideVersion: split.version
+            overrideVersion: split.version,
+            modelOverrides: modelOverrides
         )
 
         // ── 3. Perform a tiny completion call ───────────────────────────────

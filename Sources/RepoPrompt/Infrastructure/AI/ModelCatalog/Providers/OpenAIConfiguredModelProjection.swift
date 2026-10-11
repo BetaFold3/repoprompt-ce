@@ -80,12 +80,13 @@ enum OpenAIConfiguredModelProjection {
 
     static func legacyServiceTierVariants(
         for baseModels: Set<AIModel>,
-        enabled: Bool
+        enabled: Bool,
+        overrides: any AIModelOverrideReading
     ) -> Set<AIModel> {
         guard enabled else { return [] }
         let eligibleBases = baseModels.filter { model in
             guard model.providerType == .openAI,
-                  model.usesResponsesAPI,
+                  model.usesResponsesAPI(overrides: overrides),
                   !model.isOpenAIServiceTierVariant
             else {
                 return false
