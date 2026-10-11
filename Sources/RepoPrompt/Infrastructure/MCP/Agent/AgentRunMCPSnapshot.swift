@@ -575,23 +575,3 @@ extension AgentRunMCPSnapshot.Interaction.Kind {
         }
     }
 }
-
-extension AgentModeViewModel.MCPInstructionDispatch {
-    /// Human-readable explanation of how an instruction was delivered.
-    var deliveryExplanation: String? {
-        switch self {
-        case .startedRun:
-            "Started a new run."
-        case .deliveredIntoWaitingContinuation:
-            "Delivered immediately into the pending prompt."
-        case .queuedFollowUp:
-            "Queued as the next turn once the active run reaches a safe handoff point."
-        case .dispatchedCodexTurn:
-            "Delivered to the active Codex run."
-        case .queuedClaudeInterrupt:
-            "Queued for Claude and requested an interrupt at the next decision point."
-        case .queuedACPInterrupt:
-            "Queued for ACP and will cancel the active prompt before sending steering."
-        }
-    }
-}

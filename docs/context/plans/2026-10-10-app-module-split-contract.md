@@ -356,9 +356,24 @@ Step 5n — done | rounds 0/2 | open: | downgraded: | assumed: | deferred:
 #### Step 5o — OMP qualification gate composed in App
 Intent: the DEBUG OMP qualification gate is agent instrumentation that the run service, tab session and OMP connection check use, but its process-wide instance falls back to cancelling runs through the App window list, and two agent-code defaults read that instance. So require the cancellation handler, move the instance and the window-based handler into App composition, and inject the two reads (the run service's start authorizer and the OMP connection-availability check, including its users in the OMP thinking resolver, sweep client and CLI provider), with no behavior change.
 
-Budget used: about 0 hours so far (cumulative ~34 hours).
+Budget used: about 1.5 hours (cumulative ~35.5 hours).
 
-Step 5o — doing | rounds 0/2 | open: | downgraded: | assumed: | deferred:
+Result: agent code no longer reaches the App window list or the gate's process-wide instance. The gate now requires a cancellation handler. The instance, the window-based handler and the DEBUG connection override are in App composition, and the run-service authorizer and the OMP connection check are injected as required closures. Build, format, lint, the 46 affected suites (873 tests) and an ad-hoc-signed release package pass. Neither reviewer found anything above P2. OracleB's P2 asked for a wider leftover-symbol search, which found no agent-code caller of the App wrappers.
+
+Decisions: the run service's authorizer default refuses rather than asserting, because tests that omit it rely on that default. The only production assignment is the DEBUG block in `AgentModeViewModel.makeRunService()`. The gate's App convenience init keeps its clock parameters because a test passes a monotonic clock without a handler. The gate file refers only to Foundation, its own nested types and its App extension, so it can join AgentCore in Slice 6, with `package` access for the gate API that App uses.
+
+Step 5o — done | rounds 0/2 | open: | downgraded: | assumed: | deferred: OracleB P3-1 (narrow the convenience init) and P3-4 (shared connection-state closure) deferred
+
+#### Step 5p — agent-run MCP state records freed of App types
+Intent: the agent runtime holds `AgentRunMCPSnapshot`, `AgentRunSessionStore` registrations and `AgentMCPWaitPolicy` metadata, but those files name App types only through a delivery-text extension on an App view-model enum, an App request-metadata wrapper used only by App MCP tool services, and an alias for `AgentTabSession`. So move the first two verbatim into App files and name `AgentTabSession` directly, so the three files can join AgentCore, with no behavior change.
+
+Budget used: about 1 hour (cumulative ~36.5 hours).
+
+Result: the three agent-run MCP state files no longer name App types. The delivery-text extension now sits beside its App enum, the request-context wrapper is an App extension used only by App MCP services, and the wait policy names `AgentTabSession` directly. Build, format, lint and the 23 affected suites (408 tests) pass. OracleA found nothing, and OracleB raised only two P3 notes about evidence and records, both handled without code changes.
+
+Decisions: at the cut, `AgentMCPWaitPolicy+RequestContext.swift` and the `deliveryExplanation` extension stay in App even though the first sits in a folder whose other files move. `AgentMCPWaitPolicy`, its `ParentFamily` and `ParentPromptCacheRetention` aliases, and the policy members that `MCPServerViewModel` and the MCP tool services call will need `package` access. The first review send was a batch that failed before starting, so each lane was retried once as a single send.
+
+Step 5p — done | rounds 0/2 | open: | downgraded: | assumed: | deferred:
 
 ### Slice 6 — `RepoPromptAgentCore` extraction
 Move the now-acyclic AI, agent models, providers, runtime, services, history, recommendations and non-UI remote-host code. Remove the temporary typealiases. Check the release compile flags once for cross-module optimization; don't change them.
