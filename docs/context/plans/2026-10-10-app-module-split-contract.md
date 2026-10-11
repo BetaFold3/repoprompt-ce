@@ -298,6 +298,24 @@ Decisions: the lease takes only the coordinator, so it can't register on one wai
 
 Step 5i — done | rounds 0/2 | open: | downgraded: | assumed: | deferred: interim `ServerNetworkManager.shared`, `MCPRoutingWaiter.shared` and `AgentRunCoordinator.shared` arguments at agent-mode run service, Codex coordinator, provider service and OMP CLI provider sites
 
+#### Step 5j — agent-mode owners take the host from the view model
+Intent: the Codex and Claude coordinators, the agent-mode run service with its ACP runner, the Claude tool-tracking handler and the provider service still pass `ServerNetworkManager.shared` or the shared waiter and coordinator themselves, so give each the dependencies it uses as required initializer arguments, supplied by the view model or the App composition file (which now builds the provider service), and drop the run coordinator's uncalled `makeProvider`, with no behavior change.
+
+Budget used: about 1.5 hours (cumulative ~28 hours).
+
+Result: the Codex and Claude coordinators, the run service with its ACP runner, the Claude tool-tracking handler and the provider service now take their host, waiter or run coordinator as required arguments from the view model or the App composition file, and none of the touched agent owner files names the server or those statics. Build, format, lint and the 17 affected suites pass; the one cross-suite failure (the chat-switch model-base assertion after the list-agents suite) fails the same way on the tree before this step, so it is pre-existing. Neither reviewer found anything above P2. The next step lifts the remaining server references out of `Infrastructure/AI`.
+
+Decisions: the Codex coordinator and the run service take only the run coordinator and read its host, so observers and policies can't land on different servers. Creating the provider service now also creates the server and waiter objects, and the view model reads the server in its initializer; nothing those creations reach uses the shared provider service or coordinator, so this can't recurse. The review fix that merged the two arguments changed wiring, not behavior, so it was not re-reviewed.
+
+Step 5j — done | rounds 0/2 | open: | downgraded: | assumed: | deferred: pre-existing order dependence between `AgentManageMCPToolServiceListAgentsTests` and `AgentModeChatSwitchActivationTests` (shared Codex model-base registry), outside this contract
+
+#### Step 5k — `Infrastructure/AI` providers and services take the host
+Intent: the chat-provider factory and its CLI providers, the Cursor, OpenCode and OMP headless providers and model-polling services, the OMP thinking sweep, the Codex non-agent client helper and its users still reach `ServerNetworkManager.shared` (or the shared waiter) through default arguments, so give each the host it uses as a required dependency supplied from App, move their process-wide instances that need it into the App composition file, and delete the uncalled debug Codex hook, with no behavior change.
+
+Budget used: about 0 hours so far (cumulative ~28 hours).
+
+Step 5k — doing | rounds 0/2 | open: | downgraded: | assumed: | deferred:
+
 ### Slice 6 — `RepoPromptAgentCore` extraction
 Move the now-acyclic AI, agent models, providers, runtime, services, history, recommendations and non-UI remote-host code. Remove the temporary typealiases. Check the release compile flags once for cross-module optimization; don't change them.
 

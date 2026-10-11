@@ -84,3 +84,7 @@ extension MCPRoutingWaiter {
 extension AgentRunCoordinator {
     static let shared = AgentRunCoordinator(mcpHost: ServerNetworkManager.shared, routingWaiter: .shared)
 }
+
+extension AgentRuntimeProviderService {
+    static let shared = AgentRuntimeProviderService(mcpHost: ServerNetworkManager.shared, routingWaiter: .shared)
+}

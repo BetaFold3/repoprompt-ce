@@ -219,13 +219,17 @@ enum AgentProviderKind: String, CaseIterable, Hashable {
 
 /// Factory/service responsible for instantiating provider runtimes.
 final class AgentRuntimeProviderService {
-    static let shared = AgentRuntimeProviderService()
-
     /// Enable debug logging for agent provider runtimes (enabled for debugging cancellation)
     static var enableDebugLogging = false
     private static let logger = Logger(label: "com.repoprompt.agent.runtime.provider")
 
-    private init() {}
+    private let mcpHost: any AgentMCPHosting
+    private let routingWaiter: MCPRoutingWaiter
+
+    init(mcpHost: any AgentMCPHosting, routingWaiter: MCPRoutingWaiter) {
+        self.mcpHost = mcpHost
+        self.routingWaiter = routingWaiter
+    }
 
     static func claudeProcessConfiguration(for config: ClaudeCodeAgentConfig) -> CLIProcessConfiguration {
         var processConfig = CLIProcessConfiguration(
@@ -246,7 +250,7 @@ final class AgentRuntimeProviderService {
     ///   - agent: The provider kind to create
     ///   - modelString: Optional model string override
     ///   - runType: The type of run — determines CLI tool config
-    /// - Note: MCP tool restrictions are handled via ServerNetworkManager connection policies,
+    /// - Note: MCP tool restrictions are handled via the MCP host's connection policies,
     ///   not via CLI flags. Use installClientConnectionPolicy before starting the agent run.
     /// - Important: OpenCode and Cursor use their ACP runtimes for headless
     ///   discovery while keeping broader chat-provider wiring separate.
@@ -277,7 +281,7 @@ final class AgentRuntimeProviderService {
             )
             let processConfig = Self.claudeProcessConfiguration(for: config)
             let runner = CLIProcessRunner(config: processConfig)
-            let wrappedProvider = ClaudeCodeAgentProvider(runner: runner, config: config, mcpHost: ServerNetworkManager.shared)
+            let wrappedProvider = ClaudeCodeAgentProvider(runner: runner, config: config, mcpHost: mcpHost)
             let runtimeConfig = ClaudeCompatiblePluginBridge.runtimeConfig(from: config, mode: .discovery)
             if Self.enableDebugLogging {
                 Self.logger.debug("Created ClaudeCompatibleHeadlessProviderAdapter")
@@ -303,7 +307,7 @@ final class AgentRuntimeProviderService {
             if Self.enableDebugLogging {
                 Self.logger.debug("Created CodexExecAgentProvider")
             }
-            return CodexExecAgentProvider(runner: runner, config: config, mcpHost: ServerNetworkManager.shared)
+            return CodexExecAgentProvider(runner: runner, config: config, mcpHost: mcpHost)
         case .openCode:
             let config = OpenCodeAgentConfig(
                 modelString: modelString,
@@ -339,8 +343,8 @@ final class AgentRuntimeProviderService {
             }
             return OhMyPiACPHeadlessAgentProvider(
                 config: config,
-                mcpHost: ServerNetworkManager.shared,
-                routingWaiter: .shared,
+                mcpHost: mcpHost,
+                routingWaiter: routingWaiter,
                 workspacePath: workspacePath
             )
         }

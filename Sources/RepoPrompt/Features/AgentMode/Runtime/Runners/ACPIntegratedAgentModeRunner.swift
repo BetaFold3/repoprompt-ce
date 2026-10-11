@@ -95,6 +95,7 @@ final class ACPIntegratedAgentModeRunner {
     private let hooks: AgentModeRunService.Hooks
     private let terminalCommitBarrier: AgentRunTerminalCommitBarrier
     private let toolTrackingHooks: AgentToolTrackingHooks
+    private let mcpHost: any AgentMCPHosting
     private let providerFactory: AgentACPProviderFactory
     private let controllerFactory: AgentACPControllerFactory
     private var toolTrackingByTabID: [UUID: AgentToolTrackingController] = [:]
@@ -188,12 +189,14 @@ final class ACPIntegratedAgentModeRunner {
         hooks: AgentModeRunService.Hooks,
         terminalCommitBarrier: AgentRunTerminalCommitBarrier,
         toolTrackingHooks: AgentToolTrackingHooks,
+        mcpHost: any AgentMCPHosting,
         providerFactory: @escaping AgentACPProviderFactory,
         controllerFactory: @escaping AgentACPControllerFactory
     ) {
         self.hooks = hooks
         self.terminalCommitBarrier = terminalCommitBarrier
         self.toolTrackingHooks = toolTrackingHooks
+        self.mcpHost = mcpHost
         self.providerFactory = providerFactory
         self.controllerFactory = controllerFactory
     }
@@ -1949,7 +1952,7 @@ final class ACPIntegratedAgentModeRunner {
         resetACPToolCorrelation(for: session.tabID)
         toolTrackingRunIDByTabID[session.tabID] = runID
         let controller = toolTrackingByTabID[session.tabID] ?? {
-            let c = AgentToolTrackingController(mcpHost: ServerNetworkManager.shared)
+            let c = AgentToolTrackingController(mcpHost: mcpHost)
             toolTrackingByTabID[session.tabID] = c
             return c
         }()

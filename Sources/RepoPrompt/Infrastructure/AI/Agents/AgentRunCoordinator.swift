@@ -97,21 +97,6 @@ final class AgentRunCoordinator {
         return lease
     }
 
-    /// Factory for headless agent providers (Claude Code, Codex Exec, etc.)
-    func makeProvider(
-        agentKind: AgentProviderKind,
-        modelString: String?,
-        runType: AgentRunType = .discover,
-        workspacePath: String? = nil
-    ) throws -> HeadlessAgentProvider {
-        try AgentRuntimeProviderService.shared.makeProvider(
-            for: agentKind,
-            modelString: modelString,
-            runType: runType,
-            workspacePath: workspacePath
-        )
-    }
-
     /// Run the provider and return its streaming result as-is.
     func runStream(provider: HeadlessAgentProvider, message: AgentMessage, runID: UUID?) async throws -> AsyncThrowingStream<AIStreamResult, Error> {
         try await provider.streamAgentMessage(message, runID: runID)

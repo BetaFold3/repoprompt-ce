@@ -43,7 +43,7 @@ final class ClaudeAgentToolTrackingHandler {
 
     // MARK: - Tracker State
 
-    private let trackingController = AgentToolTrackingController(mcpHost: ServerNetworkManager.shared)
+    private let trackingController: AgentToolTrackingController
     private let maxExplicitProviderAckObservationCount = 24
 
     // MARK: - Correlation State (moved from TabSession)
@@ -71,7 +71,8 @@ final class ClaudeAgentToolTrackingHandler {
 
     var hooks: AgentToolTrackingHooks
 
-    init(hooks: AgentToolTrackingHooks = .noOp) {
+    init(mcpHost: any AgentMCPHosting, hooks: AgentToolTrackingHooks = .noOp) {
+        trackingController = AgentToolTrackingController(mcpHost: mcpHost)
         self.hooks = hooks
     }
 

@@ -259,6 +259,12 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
     private let codexControllerFactory: CodexControllerFactory
     private let connectionPolicyInstaller: ConnectionPolicyInstaller
     private let shouldManageCodexTooling: Bool
+    private let runCoordinator: AgentRunCoordinator
+    /// The host the run coordinator registers policies on, so observers and policies share one server.
+    private var mcpHost: any AgentMCPHosting {
+        runCoordinator.mcpHost
+    }
+
     private let activeToolQuery: ActiveToolQuery
     private let activeAgentRunWaitQuery: ActiveAgentRunWaitQuery
     private var activeAgentRunWaitDrain: ActiveAgentRunWaitDrain
@@ -392,6 +398,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         codexControllerFactory: @escaping CodexControllerFactory,
         connectionPolicyInstaller: @escaping ConnectionPolicyInstaller,
         shouldManageCodexTooling: Bool,
+        runCoordinator: AgentRunCoordinator,
         authRecovery: any CodexManagedAuthRecovering = CodexManagedAuthRecoveryService.shared,
         activeToolQuery: @escaping ActiveToolQuery = { _ in false },
         activeAgentRunWaitQuery: @escaping ActiveAgentRunWaitQuery = { _ in false },
@@ -412,6 +419,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         self.codexControllerFactory = codexControllerFactory
         self.connectionPolicyInstaller = connectionPolicyInstaller
         self.shouldManageCodexTooling = shouldManageCodexTooling
+        self.runCoordinator = runCoordinator
         self.authRecovery = authRecovery
         self.activeToolQuery = activeToolQuery
         self.activeAgentRunWaitQuery = activeAgentRunWaitQuery
@@ -2928,15 +2936,16 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         for session: AgentTabSession
     ) {
         let runID = session.runID
+        let mcpHost = mcpHost
         guard let controller = toolTrackingByTabID.removeValue(forKey: session.tabID) else {
             guard let runID else { return }
-            Task { await ServerNetworkManager.shared.unregisterToolObservers(for: runID) }
+            Task { await mcpHost.unregisterToolObservers(for: runID) }
             return
         }
         Task {
             await controller.stopTracking()
             if let runID {
-                await ServerNetworkManager.shared.unregisterToolObservers(for: runID)
+                await mcpHost.unregisterToolObservers(for: runID)
             }
         }
     }
@@ -2947,13 +2956,13 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         let runID = session.runID
         guard let controller = toolTrackingByTabID.removeValue(forKey: session.tabID) else {
             if let runID {
-                await ServerNetworkManager.shared.unregisterToolObservers(for: runID)
+                await mcpHost.unregisterToolObservers(for: runID)
             }
             return
         }
         await controller.stopTracking()
         if let runID {
-            await ServerNetworkManager.shared.unregisterToolObservers(for: runID)
+            await mcpHost.unregisterToolObservers(for: runID)
         }
     }
 
@@ -2963,16 +2972,16 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
     ) async {
         guard let runID else { return }
         guard let controller = toolTrackingByTabID[session.tabID] else {
-            await ServerNetworkManager.shared.unregisterToolObservers(for: runID)
+            await mcpHost.unregisterToolObservers(for: runID)
             return
         }
         guard controller.trackedRunID == runID else {
-            await ServerNetworkManager.shared.unregisterToolObservers(for: runID)
+            await mcpHost.unregisterToolObservers(for: runID)
             return
         }
         toolTrackingByTabID.removeValue(forKey: session.tabID)
         await controller.stopTracking()
-        await ServerNetworkManager.shared.unregisterToolObservers(for: runID)
+        await mcpHost.unregisterToolObservers(for: runID)
     }
 
     func handleProviderSwitch(
@@ -3397,7 +3406,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         )
         return MCPBootstrapLease(
             spec: leaseSpec,
-            runCoordinator: .shared,
+            runCoordinator: runCoordinator,
             mcpServerEnabler: { [weak viewModel] in
                 await viewModel?.ensureMCPServerEnabledForThreadStart()
             },
@@ -5232,7 +5241,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
     func ensureCodexToolTrackingIfNeeded(for session: AgentTabSession, runID: UUID) async {
         guard shouldManageCodexTooling else { return }
         let controller = toolTrackingByTabID[session.tabID] ?? {
-            let c = AgentToolTrackingController(mcpHost: ServerNetworkManager.shared)
+            let c = AgentToolTrackingController(mcpHost: mcpHost)
             toolTrackingByTabID[session.tabID] = c
             return c
         }()

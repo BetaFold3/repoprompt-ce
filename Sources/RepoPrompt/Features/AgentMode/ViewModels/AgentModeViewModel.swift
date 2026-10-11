@@ -2312,6 +2312,7 @@ final class AgentModeViewModel: ObservableObject {
             codexControllerFactory: codexControllerFactory,
             connectionPolicyInstaller: connectionPolicyInstaller,
             shouldManageCodexTooling: true,
+            runCoordinator: AgentRunCoordinator.shared,
             activeToolQuery: { [weak mcpServer] runID in
                 mcpServer?.hasActiveToolExecutions(runID: runID) ?? false
             },
@@ -2326,6 +2327,7 @@ final class AgentModeViewModel: ObservableObject {
         claudeCoordinator = ClaudeAgentModeCoordinator(
             windowID: windowID,
             workspacePathProvider: sessionWorkspacePathProvider,
+            mcpHost: ServerNetworkManager.shared,
             awaitNoActiveMCPTools: { [weak mcpServer] runID in
                 guard let mcpServer else { return }
                 try await mcpServer.awaitNoActiveToolExecutions(runID: runID)
@@ -2505,6 +2507,7 @@ final class AgentModeViewModel: ObservableObject {
                 codexControllerFactory: codexControllerFactory,
                 connectionPolicyInstaller: connectionPolicyInstaller,
                 shouldManageCodexTooling: shouldManageCodexTooling,
+                runCoordinator: AgentRunCoordinator.shared,
                 authRecovery: testCodexAuthRecovery ?? CodexManagedAuthRecoveryService.shared,
                 activeToolQuery: testCodexActiveToolQuery
                     ?? { [weak testMCPServer] runID in
@@ -2536,6 +2539,7 @@ final class AgentModeViewModel: ObservableObject {
             claudeCoordinator = ClaudeAgentModeCoordinator(
                 windowID: testWindowID,
                 workspacePathProvider: sessionWorkspacePathProvider,
+                mcpHost: ServerNetworkManager.shared,
                 claudeControllerFactory: claudeControllerFactory,
                 toolEndedCount: { [weak testMCPServer] runID in
                     testMCPServer?.toolEndedCount(runID: runID) ?? 0
@@ -3086,7 +3090,8 @@ final class AgentModeViewModel: ObservableObject {
         return AgentModeRunService(
             dependencies: dependencies,
             hooks: hooks,
-            toolTrackingHooks: toolTrackingHooks
+            toolTrackingHooks: toolTrackingHooks,
+            runCoordinator: AgentRunCoordinator.shared
         )
     }
 

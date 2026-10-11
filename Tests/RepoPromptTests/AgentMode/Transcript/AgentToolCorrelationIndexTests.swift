@@ -110,7 +110,7 @@
         }
 
         func testClaudeCompletionObserverUsesConstantWorkInvocationIndex() throws {
-            let handler = ClaudeAgentToolTrackingHandler()
+            let handler = ClaudeAgentToolTrackingHandler(mcpHost: ServerNetworkManager.shared)
             let short = makeSession(priorTurnCount: 1)
             let long = makeSession(priorTurnCount: 2000)
 
@@ -132,7 +132,7 @@
         }
 
         func testRunningSteeringUserItemPreservesInFlightToolCorrelation() {
-            let handler = ClaudeAgentToolTrackingHandler()
+            let handler = ClaudeAgentToolTrackingHandler(mcpHost: ServerNetworkManager.shared)
             let session = AgentModeViewModel.TabSession(tabID: UUID())
             let invocationID = UUID()
             session.setItemsSilently([

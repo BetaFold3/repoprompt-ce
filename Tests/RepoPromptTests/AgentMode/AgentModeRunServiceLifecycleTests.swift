@@ -6486,7 +6486,8 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
                     publishTerminalCommit: publishTerminalCommit,
                     handleHeadlessStreamResult: handleHeadlessStreamResult
                 ),
-                toolTrackingHooks: toolTrackingHooks
+                toolTrackingHooks: toolTrackingHooks,
+                runCoordinator: AgentRunCoordinator.shared
             ),
             host: host
         )

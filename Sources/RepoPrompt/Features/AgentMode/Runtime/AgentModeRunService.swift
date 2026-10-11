@@ -144,6 +144,7 @@ final class AgentModeRunService {
 
     private let dependencies: Dependencies
     private let hooks: Hooks
+    private let runCoordinator: AgentRunCoordinator
 
     #if DEBUG
         func test_acpRunner() -> ACPIntegratedAgentModeRunner {
@@ -177,10 +178,12 @@ final class AgentModeRunService {
     init(
         dependencies: Dependencies,
         hooks: Hooks,
-        toolTrackingHooks: AgentToolTrackingHooks
+        toolTrackingHooks: AgentToolTrackingHooks,
+        runCoordinator: AgentRunCoordinator
     ) {
         self.dependencies = dependencies
         self.hooks = hooks
+        self.runCoordinator = runCoordinator
         let terminalCommitBarrier = AgentRunTerminalCommitBarrier(hooks: hooks)
         self.terminalCommitBarrier = terminalCommitBarrier
         dependencies.codexCoordinator.installTerminalCommitBarrier(terminalCommitBarrier)
@@ -203,6 +206,7 @@ final class AgentModeRunService {
             hooks: hooks,
             terminalCommitBarrier: terminalCommitBarrier,
             toolTrackingHooks: toolTrackingHooks,
+            mcpHost: runCoordinator.mcpHost,
             providerFactory: dependencies.acpProviderFactory,
             controllerFactory: dependencies.acpControllerFactory
         )
@@ -340,6 +344,7 @@ final class AgentModeRunService {
         let expectedPIDPolicyArmer = dependencies.expectedPIDPolicyArmer
         let taskLabelKind = session.mcpControlContext?.taskLabelKind
         let delegationPolicy = dependencies.delegationRunToolPolicyResolver(session)
+        let runCoordinator = runCoordinator
         let makeLease: (_ runID: UUID) -> MCPBootstrapLease = { runID in
             self.dependencies.bindPendingOracleReviewContext(tabID, runID)
             let leaseSpec = MCPBootstrapLeaseSpec.agentMode(
@@ -355,7 +360,7 @@ final class AgentModeRunService {
             )
             let lease = MCPBootstrapLease(
                 spec: leaseSpec,
-                runCoordinator: .shared,
+                runCoordinator: runCoordinator,
                 mcpServerEnabler: mcpServerEnabler,
                 policyInstaller: MCPBootstrapLease.agentModePolicyInstaller(connectionPolicyInstaller),
                 expectedPIDPolicyArmer: expectedPIDPolicyArmer

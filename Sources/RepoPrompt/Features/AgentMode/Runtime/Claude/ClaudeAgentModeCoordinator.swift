@@ -129,6 +129,7 @@ final class ClaudeAgentModeCoordinator {
     private let windowID: Int
     private let workspacePathProvider: (AgentTabSession) throws -> String?
     private let claudeControllerFactory: ClaudeControllerFactory
+    private let mcpHost: any AgentMCPHosting
     private let awaitNoActiveMCPTools: MCPToolIdleWaiter?
     private let toolEndedCount: MCPToolEndedCountProvider
     private let hasActiveMCPTools: MCPActiveToolQuery
@@ -165,6 +166,7 @@ final class ClaudeAgentModeCoordinator {
     init(
         windowID: Int,
         workspacePathProvider: @escaping (AgentTabSession) throws -> String?,
+        mcpHost: any AgentMCPHosting,
         claudeControllerFactory: ClaudeControllerFactory? = nil,
         awaitNoActiveMCPTools: MCPToolIdleWaiter? = nil,
         toolEndedCount: @escaping MCPToolEndedCountProvider = { _ in 0 },
@@ -174,7 +176,16 @@ final class ClaudeAgentModeCoordinator {
     ) {
         self.windowID = windowID
         self.workspacePathProvider = workspacePathProvider
-        self.claudeControllerFactory = claudeControllerFactory ?? Self.makeDefaultController
+        self.mcpHost = mcpHost
+        self.claudeControllerFactory = claudeControllerFactory ?? { runID, tabID, windowID, launchSettings in
+            try Self.makeDefaultController(
+                runID: runID,
+                tabID: tabID,
+                windowID: windowID,
+                launchSettings: launchSettings,
+                mcpHost: mcpHost
+            )
+        }
         self.awaitNoActiveMCPTools = awaitNoActiveMCPTools
         self.toolEndedCount = toolEndedCount
         self.hasActiveMCPTools = hasActiveMCPTools
@@ -186,7 +197,8 @@ final class ClaudeAgentModeCoordinator {
         runID: UUID,
         tabID: UUID,
         windowID: Int,
-        launchSettings: ControllerLaunchSettings
+        launchSettings: ControllerLaunchSettings,
+        mcpHost: any AgentMCPHosting
     ) throws -> any NativeAgentRuntimeControlling {
         let coreConfig = try ClaudeCodeAgentConfig.agentMode(
             runtimeVariant: launchSettings.runtimeVariant,
@@ -208,7 +220,7 @@ final class ClaudeAgentModeCoordinator {
                 windowID: windowID,
                 workspacePath: launchSettings.workspacePath,
                 config: coreConfig,
-                mcpHost: ServerNetworkManager.shared,
+                mcpHost: mcpHost,
                 commandSelection: coreConfig.commandSelection
             )
         }
@@ -388,7 +400,7 @@ final class ClaudeAgentModeCoordinator {
             existing.hooks = toolTrackingHooks
             return existing
         }
-        let handler = ClaudeAgentToolTrackingHandler(hooks: toolTrackingHooks)
+        let handler = ClaudeAgentToolTrackingHandler(mcpHost: mcpHost, hooks: toolTrackingHooks)
         toolHandlerByTabID[session.tabID] = handler
         return handler
     }
