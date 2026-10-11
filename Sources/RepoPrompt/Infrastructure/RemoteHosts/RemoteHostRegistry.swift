@@ -232,7 +232,7 @@ final class RemoteHostRegistry: @unchecked Sendable {
               isValidHostFingerprint(record.id),
               !record.displayName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
               isValidGatewayURL(record.gatewayURL),
-              RemotePairingIdentityStore.isValidDeviceID(record.deviceID),
+              RemotePairingCrypto.isValidDeviceID(record.deviceID),
               !record.grantedScopes.isEmpty,
               record.grantedScopes.allSatisfy({ scope in
                   scope.trimmingCharacters(in: .whitespacesAndNewlines) == scope && !scope.isEmpty

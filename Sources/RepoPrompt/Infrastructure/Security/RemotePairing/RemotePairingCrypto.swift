@@ -83,6 +83,15 @@ enum RemotePairingCrypto {
         return digest.count == 64 && digest.allSatisfy(\.isHexDigit)
     }
 
+    static func isValidDeviceID(_ id: String) -> Bool {
+        guard id.hasPrefix("remote:") else { return false }
+        let suffix = id.dropFirst("remote:".count)
+        guard (8 ... 64).contains(suffix.count) else { return false }
+        return suffix.allSatisfy { character in
+            character.isHexDigit && String(character).lowercased() == String(character)
+        }
+    }
+
     static func deviceID(forRawPublicKey rawRepresentation: Data) throws -> String {
         guard let fingerprint = fingerprint(forRawPublicKey: rawRepresentation),
               let digest = fingerprint.split(separator: ":").last

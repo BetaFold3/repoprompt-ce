@@ -430,6 +430,28 @@ Decisions: `RemoteScope.swift` joins AgentCore with the crypto file, while the c
 
 Step 5u — done | rounds 0/2 | open: | downgraded: | assumed: | deferred:
 
+#### Step 5v — classify what is left of the agent seed
+Intent: before building more seams, rescan the agent seed and settle which files stay in App because only App code uses them and they need App-domain types, which dependency-free App files simply join AgentCore, and which agent files still need a seam, with no code change.
+
+Budget used: about 1 hour (cumulative ~43 hours).
+
+Result: with App-domain files held in App, the seed closes except for five agent files: the Cursor model menu builder (needs the Cursor parameter picker view model), the run's Oracle review context (prompt packaging's frozen git review context), the tab session (the apply-edits approval record), the model preset (the App preset file store) and the remote-host registry (one static device-ID check on the host pairing identity store).
+
+Decisions: these stay in App because only App code uses them and they need view models, settings or prompt packaging: `AutoRecommendationEngine`, `AgentHandoffActionSupport`, `AgentProviderContextBuilder`, `AgentSelectedFilesDiagnostics`, `AgentPreviewMarkdownImageProvider` and `AgentContextExportResolver`, plus the changes-panel environment and transcript preview link resolver from Step 5r; so the prompt-packaging, settings and selection-coordinator groups need no seam. These dependency-free App files join AgentCore at the cut: the tool-card data types `ClusterToolCategory`, `ToolArgsDTOs` and `ToolJSON`; `ContextBuilderDefaults`; the agent perf diagnostics with its baseline inventory and the OMP smoke gate; `PromptAssemblyBuilder`; `AgentModePrompts`; the agent MCP run state (`AgentMCPToolHelpers`, `AgentMCPWaitPolicy`, `AgentRunMCPSnapshot`, `AgentRunSessionStore`); the MCP connection and integration types (`MCPBootstrapLease`, `MCPClientIdentity`, `MCPConfigExportService`, `MCPIntegrationHelper`, `MCPRoutingWaiter`, `MCPToolObserverDiagnostics`, `RepoPromptMCPServerConfiguration`, `ToolResultDTOs`, `MCPWindowToolNames` and the two tool policies); `NewlineDelimitedSocketReader`, `ExecutableFileIdentity` and `KeyManager`; and `RemotePairingCrypto` with `RemoteScope`. MCP server composition, window tools, approvals and the host pairing identity store, authority and device records stay in App. The run leases and the remote-host pairing client move with their folders. The probe works by name, so the cut's compiler pass stays the final check.
+
+Step 5v — done | rounds 0/2 | open: | downgraded: | assumed: | deferred:
+
+#### Step 5w — the device-ID check moves to the pairing crypto
+Intent: the agent remote-host registry names the App host pairing identity store only for its pure static device-ID check, so move that check verbatim next to the device-ID derivation in `RemotePairingCrypto` and point its three callers there, with no behavior change.
+
+Budget used: about 0.5 hours (cumulative ~43.5 hours).
+
+Result: the device-ID check now lives in `RemotePairingCrypto` with its three callers pointed there, so the agent remote-host registry no longer names the host pairing identity store and four agent files still need a seam. Build, format, lint and the eight pairing suites (36 tests) pass. OracleA found nothing, and OracleB asked only for the access record below.
+
+Decisions: at the cut, App also needs `package` access to `RemotePairingCrypto.isValidDeviceID`, `deviceID(forRawPublicKey:)` and `fingerprint(forRawPublicKey:)`.
+
+Step 5w — done | rounds 0/2 | open: | downgraded: | assumed: | deferred:
+
 ### Slice 6 — `RepoPromptAgentCore` extraction
 Move the now-acyclic AI, agent models, providers, runtime, services, history, recommendations and non-UI remote-host code. Remove the temporary typealiases. Check the release compile flags once for cross-module optimization; don't change them.
 

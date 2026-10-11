@@ -512,7 +512,7 @@ final class MCPRemotePairingToolProvider: MCPWindowToolProviding {
         let derived = try RemotePairingCrypto.deviceID(forRawPublicKey: publicKeyRawRepresentation)
         let trimmed = raw?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         guard !trimmed.isEmpty else { return derived }
-        guard RemotePairingIdentityStore.isValidDeviceID(trimmed) else {
+        guard RemotePairingCrypto.isValidDeviceID(trimmed) else {
             throw MCPError.invalidParams("device_id must match remote:<lowercase-hex>.")
         }
         guard trimmed == derived else {

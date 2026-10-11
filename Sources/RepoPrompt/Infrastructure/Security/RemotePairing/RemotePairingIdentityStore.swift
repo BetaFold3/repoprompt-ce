@@ -239,7 +239,7 @@ final class RemotePairingIdentityStore: @unchecked Sendable {
 
     static func validateDeviceRecord(_ record: PairedDeviceRecord) -> Bool {
         guard record.schemaVersion == PairedDeviceRecord.currentSchemaVersion,
-              isValidDeviceID(record.id),
+              RemotePairingCrypto.isValidDeviceID(record.id),
               !record.displayName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
               !record.scopes.isEmpty,
               RemotePairingCrypto.fingerprint(forRawPublicKey: record.publicKeyRawRepresentation) != nil
@@ -247,15 +247,6 @@ final class RemotePairingIdentityStore: @unchecked Sendable {
             return false
         }
         return true
-    }
-
-    static func isValidDeviceID(_ id: String) -> Bool {
-        guard id.hasPrefix("remote:") else { return false }
-        let suffix = id.dropFirst("remote:".count)
-        guard (8 ... 64).contains(suffix.count) else { return false }
-        return suffix.allSatisfy { character in
-            character.isHexDigit && String(character).lowercased() == String(character)
-        }
     }
 
     private func hostPrivateKeyLocked() throws -> P256.Signing.PrivateKey {
