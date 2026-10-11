@@ -705,7 +705,8 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
                 resumeSessionID: nil,
                 attachments: [],
                 taskLabelKind: nil
-            )
+            ),
+            mcpHost: ServerNetworkManager.shared
         )
         registerACPController(successorController)
         var unpublishedController: ACPAgentSessionController?
@@ -717,7 +718,8 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
             acpControllerFactory: { provider, request in
                 let controller = try ACPAgentSessionController(
                     provider: provider,
-                    runRequest: request
+                    runRequest: request,
+                    mcpHost: ServerNetworkManager.shared
                 )
                 unpublishedController = controller
                 return controller
@@ -1087,7 +1089,8 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
                 resumeSessionID: nil,
                 attachments: [],
                 taskLabelKind: nil
-            )
+            ),
+            mcpHost: ServerNetworkManager.shared
         )
         registerACPController(successor)
         let session = AgentModeViewModel.TabSession(tabID: UUID())
@@ -1165,7 +1168,8 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
                 resumeSessionID: nil,
                 attachments: [],
                 taskLabelKind: nil
-            )
+            ),
+            mcpHost: ServerNetworkManager.shared
         )
         registerACPController(successor)
         let session = AgentModeViewModel.TabSession(tabID: UUID())
@@ -1313,7 +1317,8 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
                     resumeSessionID: nil,
                     attachments: [],
                     taskLabelKind: nil
-                )
+                ),
+                mcpHost: ServerNetworkManager.shared
             )
         } else {
             nil
@@ -1918,7 +1923,8 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
                 resumeSessionID: nil,
                 attachments: [],
                 taskLabelKind: nil
-            )
+            ),
+            mcpHost: ServerNetworkManager.shared
         )
         session.runID = successorRunID
         session.runState = .running
@@ -6394,7 +6400,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         }
         let baseACPControllerFactory = acpControllerFactory ?? { provider, request in
             recorder.record("factory:acp-controller")
-            return try ACPAgentSessionController(provider: provider, runRequest: request)
+            return try ACPAgentSessionController(provider: provider, runRequest: request, mcpHost: ServerNetworkManager.shared)
         }
         let trackedACPControllerFactory: AgentModeViewModel.ACPControllerFactory = { [weak self] provider, request in
             let controller = try baseACPControllerFactory(provider, request)
@@ -6686,6 +6692,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         let controller = try ACPAgentSessionController(
             provider: provider,
             runRequest: request,
+            mcpHost: ServerNetworkManager.shared,
             diagnosticSink: { event in
                 guard case let .outboundJSON(line) = event,
                       let data = line.data(using: .utf8),

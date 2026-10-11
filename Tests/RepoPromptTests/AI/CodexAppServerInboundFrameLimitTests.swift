@@ -305,6 +305,7 @@ final class CodexAppServerInboundFrameLimitTests: XCTestCase {
 
     private func makeClient(limit: Int? = CodexAppServerInboundFrameLimitTests.testLimit) async -> CodexAppServerClient {
         let client = CodexAppServerClient(
+            mcpHost: ServerNetworkManager.shared,
             writeFrameHandler: { _, _ in },
             livenessProbe: { _ in true },
             expectedAgentPIDRegistrar: .init(register: { _, _, _ in }, clear: { _, _, _ in })

@@ -26,6 +26,7 @@ final class CursorACPHeadlessAgentProvider: HeadlessAgentProvider {
             try ACPAgentSessionController(
                 provider: provider,
                 runRequest: request,
+                mcpHost: ServerNetworkManager.shared,
                 diagnosticSink: diagnosticSink
             )
         }

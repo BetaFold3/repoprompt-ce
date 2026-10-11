@@ -679,7 +679,8 @@ final class CursorACPLaunchResolverTests: XCTestCase {
         let provider = FixedLaunchACPProvider(launchConfiguration: launch, workingDirectory: directory.path)
         let controller = try ACPAgentSessionController(
             provider: provider,
-            runRequest: makeRunRequest(workspacePath: directory.path)
+            runRequest: makeRunRequest(workspacePath: directory.path),
+            mcpHost: ServerNetworkManager.shared
         )
         #if DEBUG
             let runID = UUID()

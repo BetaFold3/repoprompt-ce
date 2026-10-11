@@ -23,7 +23,8 @@ final class ClaudeNativeTurnTeardownTests: XCTestCase {
             config: .discovery(
                 commandName: "/usr/bin/false",
                 runtimeVariant: .glm
-            )
+            ),
+            mcpHost: ServerNetworkManager.shared
         )
     }
 

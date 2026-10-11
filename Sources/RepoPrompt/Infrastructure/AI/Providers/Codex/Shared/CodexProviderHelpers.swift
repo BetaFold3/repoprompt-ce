@@ -28,7 +28,7 @@ enum CodexProviderHelpers {
     /// and model polling because failures become sticky across otherwise unrelated work.
     static func makeOwnedNonAgentAppServerClient() -> CodexAppServerClient {
         let _ = MCPIntegrationHelper.ensureCodexServerForDiscovery()
-        return CodexAppServerClient()
+        return CodexAppServerClient(mcpHost: ServerNetworkManager.shared)
     }
 
     struct CodexExecutableResolution: Equatable {

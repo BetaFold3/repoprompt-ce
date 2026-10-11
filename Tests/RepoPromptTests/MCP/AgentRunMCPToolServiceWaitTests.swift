@@ -1581,7 +1581,8 @@ final class AgentRunMCPToolServiceWaitTests: XCTestCase {
                     resumeSessionID: nil,
                     attachments: [],
                     taskLabelKind: nil
-                )
+                ),
+                mcpHost: ServerNetworkManager.shared
             )
             successorSession.acpController = successorController
             XCTAssertTrue(OhMyPiAgentModeSmokeGate.shared.authorizeProviderStart(
@@ -1712,7 +1713,8 @@ final class AgentRunMCPToolServiceWaitTests: XCTestCase {
                             resumeSessionID: nil,
                             attachments: [],
                             taskLabelKind: nil
-                        )
+                        ),
+                        mcpHost: ServerNetworkManager.shared
                     )
                     session.ompQualificationStartContext = context
                     session.runID = successorRunID

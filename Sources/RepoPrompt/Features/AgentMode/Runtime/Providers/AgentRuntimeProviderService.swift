@@ -277,7 +277,7 @@ final class AgentRuntimeProviderService {
             )
             let processConfig = Self.claudeProcessConfiguration(for: config)
             let runner = CLIProcessRunner(config: processConfig)
-            let wrappedProvider = ClaudeCodeAgentProvider(runner: runner, config: config)
+            let wrappedProvider = ClaudeCodeAgentProvider(runner: runner, config: config, mcpHost: ServerNetworkManager.shared)
             let runtimeConfig = ClaudeCompatiblePluginBridge.runtimeConfig(from: config, mode: .discovery)
             if Self.enableDebugLogging {
                 Self.logger.debug("Created ClaudeCompatibleHeadlessProviderAdapter")
@@ -303,7 +303,7 @@ final class AgentRuntimeProviderService {
             if Self.enableDebugLogging {
                 Self.logger.debug("Created CodexExecAgentProvider")
             }
-            return CodexExecAgentProvider(runner: runner, config: config)
+            return CodexExecAgentProvider(runner: runner, config: config, mcpHost: ServerNetworkManager.shared)
         case .openCode:
             let config = OpenCodeAgentConfig(
                 modelString: modelString,
@@ -337,7 +337,7 @@ final class AgentRuntimeProviderService {
             if Self.enableDebugLogging {
                 Self.logger.debug("Created OhMyPiACPHeadlessAgentProvider")
             }
-            return OhMyPiACPHeadlessAgentProvider(config: config, workspacePath: workspacePath)
+            return OhMyPiACPHeadlessAgentProvider(config: config, mcpHost: ServerNetworkManager.shared, workspacePath: workspacePath)
         }
     }
 }

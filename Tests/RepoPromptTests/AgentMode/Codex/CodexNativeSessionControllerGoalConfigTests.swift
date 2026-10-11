@@ -95,7 +95,7 @@ final class CodexNativeSessionControllerGoalConfigTests: XCTestCase {
 
         let recordURL = directory.appendingPathComponent("requests.jsonl")
         let executableURL = try makeFakeCodexAppServer(in: directory, recordURL: recordURL)
-        let client = CodexAppServerClient()
+        let client = CodexAppServerClient(mcpHost: ServerNetworkManager.shared)
         await client.updateConfig(
             CodexAppServerClient.Config(
                 commandName: executableURL.path,
@@ -121,7 +121,7 @@ final class CodexNativeSessionControllerGoalConfigTests: XCTestCase {
 
         let recordURL = directory.appendingPathComponent("requests.jsonl")
         let executableURL = try makeFakeCodexAppServer(in: directory, recordURL: recordURL)
-        let client = CodexAppServerClient()
+        let client = CodexAppServerClient(mcpHost: ServerNetworkManager.shared)
         await client.updateConfig(
             CodexAppServerClient.Config(
                 commandName: executableURL.path,
@@ -379,7 +379,7 @@ final class CodexNativeSessionControllerGoalConfigTests: XCTestCase {
             recordURL: recordURL,
             ignoreMemoryModeRequests: ignoreMemoryModeRequests
         )
-        let client = CodexAppServerClient()
+        let client = CodexAppServerClient(mcpHost: ServerNetworkManager.shared)
         await client.updateConfig(
             CodexAppServerClient.Config(
                 commandName: executableURL.path,

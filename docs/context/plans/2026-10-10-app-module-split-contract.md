@@ -276,6 +276,17 @@ Decisions: the protocol is a non-isolated `Sendable` async protocol rather than 
 
 Step 5g — done | rounds 0/2 | open: | downgraded: | assumed: | deferred: OracleB P3-1 — move `ExecutableFileIdentity` below App before the cut; P3-2 — when callers switch to the protocol, write the actor's default arguments out exactly, and give any convenience overload a different signature; P3-4 — owner-suite coverage comes from the slice-end full test run; P3-6 — redundant `manager` alias in the tracker and tests; carried from 5a — `MCPServerViewModel.AgentRunWaitDrainOutcome` in `AgentModeRuntimeFactories.swift`
 
+#### Step 5h — host into session controllers and providers
+Intent: the Claude native session controller, the Codex app-server client, the ACP session controller and the Claude, Codex exec and OMP headless providers still read `ServerNetworkManager.shared`, so give each a required `mcpHost` initializer argument used for those calls and the tool-tracking controllers they own, with construction sites passing the server or their owner's host, and no behavior change.
+
+Budget used: about 1 hour (cumulative ~25 hours).
+
+Result: the six classes now take a required `mcpHost` and no longer mention `ServerNetworkManager`; the two providers build their tool-tracking controllers from it, and the OMP provider passes it to the ACP controllers it creates. Build, format, lint and the 32 suites in test files that construct these classes (0 failures) pass, and neither reviewer found anything above P3. The next step lifts the interim `ServerNetworkManager.shared` arguments out of the runtime owners: the tool-tracking owners, the provider service, the coordinators, the polling services and the bootstrap lease, routing waiter and run coordinator.
+
+Decisions: Swift defaults can't refer to another parameter, so the Codex client's PID registrar and the OMP provider's route check and controller factory became optional parameters whose defaults are built in `init` from the host; explicit arguments behave as before. An engineer worker did the threading, and I removed two unused stored properties after its run.
+
+Step 5h — done | rounds 0/2 | open: | downgraded: | assumed: | deferred: OracleB P3-4 — interim `mcpHost: ServerNetworkManager.shared` sites inside agent code (provider service, Claude coordinator, tool-tracking owners, Cursor/OpenCode/OMP polling and headless defaults, OMP CLI provider and thinking sweep, Codex helpers and the debug test hook) move up in the next steps
+
 ### Slice 6 — `RepoPromptAgentCore` extraction
 Move the now-acyclic AI, agent models, providers, runtime, services, history, recommendations and non-UI remote-host code. Remove the temporary typealiases. Check the release compile flags once for cross-module optimization; don't change them.
 

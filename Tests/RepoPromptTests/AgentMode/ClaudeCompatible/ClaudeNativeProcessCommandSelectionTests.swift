@@ -121,6 +121,7 @@ final class ClaudeNativeProcessCommandSelectionTests: XCTestCase {
             windowID: 1,
             workspacePath: nil,
             config: config,
+            mcpHost: ServerNetworkManager.shared,
             commandSelection: .configuredExactPath("/tmp/claude")
         )
         let automatic = ClaudeNativeProcessSessionController(
@@ -128,7 +129,8 @@ final class ClaudeNativeProcessCommandSelectionTests: XCTestCase {
             tabID: UUID(),
             windowID: 1,
             workspacePath: nil,
-            config: config
+            config: config,
+            mcpHost: ServerNetworkManager.shared
         )
 
         let configuredRequiresReplacement = await configured.requiresReplacementAfterTerminalStartupFailure
@@ -157,7 +159,8 @@ final class ClaudeNativeProcessCommandSelectionTests: XCTestCase {
             tabID: UUID(),
             windowID: 1,
             workspacePath: nil,
-            config: config
+            config: config,
+            mcpHost: ServerNetworkManager.shared
         )
         let environment = [
             "HOME": fixture.root.path,
@@ -209,7 +212,8 @@ final class ClaudeNativeProcessCommandSelectionTests: XCTestCase {
             tabID: UUID(),
             windowID: 1,
             workspacePath: nil,
-            config: config
+            config: config,
+            mcpHost: ServerNetworkManager.shared
         )
         let environment = [
             "HOME": fixture.root.path,

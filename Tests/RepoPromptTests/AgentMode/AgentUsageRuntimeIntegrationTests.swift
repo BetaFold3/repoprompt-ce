@@ -1361,7 +1361,8 @@ final class AgentUsageRuntimeIntegrationTests: XCTestCase {
         )
         let controller = try ClaudeNativeProcessSessionController(
             runID: UUID(), tabID: UUID(), windowID: 1, workspacePath: nil,
-            config: .discovery(commandName: "/usr/bin/false", runtimeVariant: .standard)
+            config: .discovery(commandName: "/usr/bin/false", runtimeVariant: .standard),
+            mcpHost: ServerNetworkManager.shared
         )
         fixture.session.claudeController = controller
         let launch = await controller.test_beginSyntheticUsageLaunch()
@@ -1424,7 +1425,8 @@ final class AgentUsageRuntimeIntegrationTests: XCTestCase {
 
         let controller = try ClaudeNativeProcessSessionController(
             runID: UUID(), tabID: fixture.tabID, windowID: 1, workspacePath: nil,
-            config: .discovery(commandName: "/usr/bin/false", runtimeVariant: .standard)
+            config: .discovery(commandName: "/usr/bin/false", runtimeVariant: .standard),
+            mcpHost: ServerNetworkManager.shared
         )
         await controller.test_setInitializeResponse([
             "account": ["apiProvider": "firstParty", "subscriptionType": "Claude Max"]
@@ -1880,7 +1882,8 @@ final class AgentUsageRuntimeIntegrationTests: XCTestCase {
         )
         let controller = try ClaudeNativeProcessSessionController(
             runID: UUID(), tabID: UUID(), windowID: 1, workspacePath: nil,
-            config: .discovery(commandName: "/usr/bin/false", runtimeVariant: .standard)
+            config: .discovery(commandName: "/usr/bin/false", runtimeVariant: .standard),
+            mcpHost: ServerNetworkManager.shared
         )
         await controller.test_setInitializeResponse(["account": ["apiProvider": "firstParty", "subscriptionType": "Claude Max"]])
         fixture.session.claudeController = controller

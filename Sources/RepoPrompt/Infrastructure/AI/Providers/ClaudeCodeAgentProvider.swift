@@ -32,7 +32,8 @@ final class ClaudeCodeAgentProvider: HeadlessAgentProvider {
     private let config: ClaudeCodeAgentConfig
     private let environmentResolver: any ClaudeCodeLaunchEnvironmentResolving
     private let configService = MCPConfigExportService.shared
-    private let toolTracking = AgentToolTrackingController(mcpHost: ServerNetworkManager.shared)
+    private let mcpHost: any AgentMCPHosting
+    private let toolTracking: AgentToolTrackingController
     private var streamTask: Task<Void, Never>?
 
     private var enableDebugLogging: Bool {
@@ -45,11 +46,14 @@ final class ClaudeCodeAgentProvider: HeadlessAgentProvider {
     init(
         runner: CLIProcessRunner,
         config: ClaudeCodeAgentConfig,
+        mcpHost: any AgentMCPHosting,
         environmentResolver: any ClaudeCodeLaunchEnvironmentResolving = ClaudeCodeLaunchEnvironmentResolver()
     ) {
         self.runner = runner
         self.config = config
         self.environmentResolver = environmentResolver
+        self.mcpHost = mcpHost
+        toolTracking = AgentToolTrackingController(mcpHost: mcpHost)
     }
 
     // MARK: - HeadlessAgentProvider
@@ -63,7 +67,7 @@ final class ClaudeCodeAgentProvider: HeadlessAgentProvider {
             if enableDebugLogging {
                 print("[DEBUG] ClaudeCodeAgent: Verifying MCP server is running")
             }
-            let isRunning = await ServerNetworkManager.shared.isRunning()
+            let isRunning = await mcpHost.isRunning()
             if enableDebugLogging {
                 print("[DEBUG] ClaudeCodeAgent: MCP server running: \(isRunning)")
             }
@@ -377,6 +381,7 @@ final class ClaudeCodeAgentProvider: HeadlessAgentProvider {
                             ) { _, resolverValue in resolverValue }
                             let expectedPIDRunID = context.runID
                             let expectedPIDClientName = self.config.runtimeVariant.agentKind.mcpClientNameHint
+                            let expectedPIDMCPHost = self.mcpHost
                             let stream = try await self.runner.runStreaming(
                                 args: args,
                                 stdin: userMessage, // Pass the user message via stdin
@@ -386,15 +391,17 @@ final class ClaudeCodeAgentProvider: HeadlessAgentProvider {
                                 additionalRemovedKeys: context.launchEnvironment?.removedEnvironmentKeys ?? [],
                                 onProcessStarted: { pid in
                                     guard let expectedPIDClientName else { return }
-                                    await ServerNetworkManager.shared.registerExpectedAgentPID(
+                                    await expectedPIDMCPHost.registerExpectedAgentPID(
                                         pid,
                                         for: expectedPIDClientName,
-                                        runID: expectedPIDRunID
+                                        runID: expectedPIDRunID,
+                                        expectedProcessExecutablePath: nil,
+                                        expectedProcessExecutableIdentity: nil
                                     )
                                 },
                                 onProcessTerminated: { pid in
                                     guard let expectedPIDClientName else { return }
-                                    await ServerNetworkManager.shared.clearExpectedAgentPID(
+                                    await expectedPIDMCPHost.clearExpectedAgentPID(
                                         pid,
                                         for: expectedPIDClientName,
                                         runID: expectedPIDRunID

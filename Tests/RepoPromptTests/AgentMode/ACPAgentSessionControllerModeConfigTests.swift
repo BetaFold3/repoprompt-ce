@@ -978,6 +978,7 @@ final class ACPAgentSessionControllerModeConfigTests: XCTestCase {
                 additionalConfigOptionValues: [.ohMyPiThinking("ultra")],
                 includeRepoPromptMCPServer: false
             ),
+            mcpHost: ServerNetworkManager.shared,
             workspacePath: workspace.path,
             providerFactory: { _ in fakeProvider }
         )
@@ -1657,6 +1658,7 @@ final class ACPAgentSessionControllerModeConfigTests: XCTestCase {
         let controller = try ACPAgentSessionController(
             provider: provider,
             runRequest: request,
+            mcpHost: ServerNetworkManager.shared,
             diagnosticSink: { event in
                 if case let .info(message) = event {
                     diagnostics?.append(message)

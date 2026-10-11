@@ -1162,7 +1162,7 @@ final class CodexFallbackFIFOTests: XCTestCase {
         recorder: MismatchRetryNativeControllerRecorder
     ) -> CodexNativeSessionController {
         CodexNativeSessionController(
-            client: CodexAppServerClient(),
+            client: CodexAppServerClient(mcpHost: ServerNetworkManager.shared),
             runID: UUID(),
             tabID: UUID(),
             windowID: 1,

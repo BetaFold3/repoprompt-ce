@@ -208,6 +208,7 @@ final class ClaudeAgentModeCoordinator {
                 windowID: windowID,
                 workspacePath: launchSettings.workspacePath,
                 config: coreConfig,
+                mcpHost: ServerNetworkManager.shared,
                 commandSelection: coreConfig.commandSelection
             )
         }

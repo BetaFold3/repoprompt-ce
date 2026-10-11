@@ -41,6 +41,7 @@ final class ClaudeNativeApprovalAndResumeTests: XCTestCase {
                 commandName: "/usr/bin/false",
                 runtimeVariant: .glm
             ),
+            mcpHost: ServerNetworkManager.shared,
             environmentResolver: resolver
         )
 
@@ -64,7 +65,8 @@ final class ClaudeNativeApprovalAndResumeTests: XCTestCase {
             config: .discovery(
                 commandName: "/usr/bin/false",
                 runtimeVariant: .glm
-            )
+            ),
+            mcpHost: ServerNetworkManager.shared
         )
         let directGLM = ClaudeCodeLaunchEnvironment(
             effectiveModel: "sonnet",
@@ -117,6 +119,7 @@ final class ClaudeNativeApprovalAndResumeTests: XCTestCase {
                 runtimeVariant: .standard,
                 permissionMode: "auto"
             ),
+            mcpHost: ServerNetworkManager.shared,
             environmentResolver: resolver
         )
 
@@ -146,7 +149,8 @@ final class ClaudeNativeApprovalAndResumeTests: XCTestCase {
             config: .discovery(
                 commandName: "/usr/bin/false",
                 runtimeVariant: .standard
-            )
+            ),
+            mcpHost: ServerNetworkManager.shared
         )
         await controller.test_attachSpawnedProcess(child, initialized: false)
 
@@ -179,7 +183,8 @@ final class ClaudeNativeApprovalAndResumeTests: XCTestCase {
             config: .discovery(
                 commandName: "/usr/bin/false",
                 runtimeVariant: .standard
-            )
+            ),
+            mcpHost: ServerNetworkManager.shared
         )
         await uninitializedController.test_attachSpawnedProcess(
             uninitializedChild,
@@ -205,7 +210,8 @@ final class ClaudeNativeApprovalAndResumeTests: XCTestCase {
             config: .discovery(
                 commandName: "/usr/bin/false",
                 runtimeVariant: .standard
-            )
+            ),
+            mcpHost: ServerNetworkManager.shared
         )
         await initializedController.test_attachSpawnedProcess(
             initializedChild,
@@ -246,6 +252,7 @@ final class ClaudeNativeApprovalAndResumeTests: XCTestCase {
                 commandName: "/usr/bin/false",
                 runtimeVariant: .standard
             ),
+            mcpHost: ServerNetworkManager.shared,
             managedSettingsURL: managedSettingsURL
         )
 

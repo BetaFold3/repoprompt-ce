@@ -13,7 +13,8 @@ final class CodexExecAgentProvider: HeadlessAgentProvider {
     private let runner: CLIProcessRunner
     private let config: CodexExecAgentConfig
     private let configService = MCPConfigExportService.shared
-    private let toolTracking = AgentToolTrackingController(mcpHost: ServerNetworkManager.shared)
+    private let mcpHost: any AgentMCPHosting
+    private let toolTracking: AgentToolTrackingController
     private var streamTask: Task<Void, Never>?
     private var codexItemInvocationIDs: [String: UUID] = [:]
 
@@ -21,9 +22,11 @@ final class CodexExecAgentProvider: HeadlessAgentProvider {
         config.enableDebugLogging
     }
 
-    init(runner: CLIProcessRunner, config: CodexExecAgentConfig) {
+    init(runner: CLIProcessRunner, config: CodexExecAgentConfig, mcpHost: any AgentMCPHosting) {
         self.runner = runner
         self.config = config
+        self.mcpHost = mcpHost
+        toolTracking = AgentToolTrackingController(mcpHost: mcpHost)
         if enableDebugLogging {
             print("[DEBUG] CodexExec: Initialized provider with model: \(config.modelString ?? "default")")
         }
@@ -98,7 +101,7 @@ final class CodexExecAgentProvider: HeadlessAgentProvider {
         if enableDebugLogging {
             print("[DEBUG] CodexExec: Verifying MCP server is running")
         }
-        guard await ServerNetworkManager.shared.isRunning() else {
+        guard await mcpHost.isRunning() else {
             throw AIProviderError.invalidConfiguration(detail: "Could not start MCP server. Check MCP settings and try again.")
         }
         if enableDebugLogging {
@@ -222,20 +225,23 @@ final class CodexExecAgentProvider: HeadlessAgentProvider {
                                     }
 
                                     let expectedPIDRunID = context.runID
+                                    let expectedPIDMCPHost = self.mcpHost
                                     let stream = try await self.runner.runStreaming(
                                         args: args,
                                         stdin: combinedPrompt,
                                         outputMode: .none,
                                         timeout: 6000,
                                         onProcessStarted: { pid in
-                                            await ServerNetworkManager.shared.registerExpectedAgentPID(
+                                            await expectedPIDMCPHost.registerExpectedAgentPID(
                                                 pid,
                                                 for: Self.codexMCPClientID,
-                                                runID: expectedPIDRunID
+                                                runID: expectedPIDRunID,
+                                                expectedProcessExecutablePath: nil,
+                                                expectedProcessExecutableIdentity: nil
                                             )
                                         },
                                         onProcessTerminated: { pid in
-                                            await ServerNetworkManager.shared.clearExpectedAgentPID(
+                                            await expectedPIDMCPHost.clearExpectedAgentPID(
                                                 pid,
                                                 for: Self.codexMCPClientID,
                                                 runID: expectedPIDRunID

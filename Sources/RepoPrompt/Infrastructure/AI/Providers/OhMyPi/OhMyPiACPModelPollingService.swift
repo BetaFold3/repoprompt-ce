@@ -25,7 +25,7 @@ struct OhMyPiACPControllerModelDiscoveryClient: OhMyPiACPModelDiscoveryClient {
             return ACPAgentProviderFactory.makeProvider(for: agent, modelString: modelString)
         },
         controllerFactory: @escaping ControllerFactory = { provider, runRequest in
-            try ACPAgentSessionController(provider: provider, runRequest: runRequest)
+            try ACPAgentSessionController(provider: provider, runRequest: runRequest, mcpHost: ServerNetworkManager.shared)
         }
     ) {
         self.providerFactory = providerFactory

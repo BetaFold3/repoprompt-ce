@@ -4021,7 +4021,7 @@ final class CodexNativeSessionController {
 
         static func test_parseExecCommandEndEventResultJSON(params: [String: Any]) -> String? {
             let controller = CodexNativeSessionController(
-                client: CodexAppServerClient(),
+                client: CodexAppServerClient(mcpHost: ServerNetworkManager.shared),
                 runID: UUID(),
                 tabID: UUID(),
                 windowID: 1,

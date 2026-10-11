@@ -1326,7 +1326,7 @@ final class CodexNativeResumeLifecycleTests: XCTestCase {
         script: ResumeRequestScript,
         requestTimeout: TimeInterval? = 30
     ) async -> (CodexNativeSessionController, CodexAppServerClient) {
-        let client = CodexAppServerClient(livenessProbe: { _ in true })
+        let client = CodexAppServerClient(mcpHost: ServerNetworkManager.shared, livenessProbe: { _ in true })
         await client.debugInstallTestTransport()
         let options = CodexNativeSessionController.Options(
             requestTimeout: requestTimeout,
@@ -1355,7 +1355,7 @@ final class CodexNativeResumeLifecycleTests: XCTestCase {
     /// the debug test transport, and which stops that client on shutdown as Agent Mode does. Frames
     /// are accepted without a reader (the debug transport has none), so requests stay pending.
     private func makeRealTransportController() async -> (CodexNativeSessionController, CodexAppServerClient) {
-        let client = CodexAppServerClient(writeFrameHandler: { _, _ in }, livenessProbe: { _ in true })
+        let client = CodexAppServerClient(mcpHost: ServerNetworkManager.shared, writeFrameHandler: { _, _ in }, livenessProbe: { _ in true })
         await client.debugInstallTestTransport()
         let options = CodexNativeSessionController.Options(
             requestTimeout: 30,

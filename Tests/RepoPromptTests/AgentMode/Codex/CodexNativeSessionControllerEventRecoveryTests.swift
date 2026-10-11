@@ -962,7 +962,7 @@ final class CodexNativeSessionControllerEventRecoveryTests: XCTestCase {
 
     func testNormalizedCommandExecutionLifecycleParsesAsBashCallAndResult() throws {
         let controller = CodexNativeSessionController(
-            client: CodexAppServerClient(),
+            client: CodexAppServerClient(mcpHost: ServerNetworkManager.shared),
             runID: UUID(),
             tabID: UUID(),
             windowID: 1,
@@ -1592,7 +1592,7 @@ final class CodexNativeSessionControllerEventRecoveryTests: XCTestCase {
 
     private func makeController() -> CodexNativeSessionController {
         CodexNativeSessionController(
-            client: CodexAppServerClient(),
+            client: CodexAppServerClient(mcpHost: ServerNetworkManager.shared),
             runID: UUID(),
             tabID: UUID(),
             windowID: 1,

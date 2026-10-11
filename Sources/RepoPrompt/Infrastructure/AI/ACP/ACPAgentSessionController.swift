@@ -335,6 +335,7 @@ actor ACPAgentSessionController {
     private var autoApproveAllToolPermissions: Bool
     private var expectedMCPRunID: UUID?
     private var registeredExpectedAgentPID: pid_t?
+    private let mcpHost: any AgentMCPHosting
     #if DEBUG
         private let rawACPCaptureURL: URL?
     #endif
@@ -342,6 +343,7 @@ actor ACPAgentSessionController {
     init(
         provider: any ACPAgentProvider,
         runRequest: ACPRunRequest,
+        mcpHost: any AgentMCPHosting,
         diagnosticSink: DiagnosticSink? = nil,
         requestTimeouts: RequestTimeouts = .default,
         dynamicModelPublicationPolicy: ACPDynamicModelPublicationPolicy = .standard,
@@ -360,6 +362,7 @@ actor ACPAgentSessionController {
             loadSessionIDConfidence: runRequest.resumeSessionID?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false ? .candidate : .unavailable
         )
         self.runRequest = runRequest
+        self.mcpHost = mcpHost
         let sessionConfiguration = try provider.makeSessionConfiguration(
             for: runRequest,
             mcpServer: .repoPrompt
@@ -1954,7 +1957,7 @@ actor ACPAgentSessionController {
 
     private func registerExpectedAgentPIDIfNeeded(_ pid: pid_t) async {
         guard let clientName = mcpClientNameHint else { return }
-        await ServerNetworkManager.shared.registerExpectedAgentPID(
+        await mcpHost.registerExpectedAgentPID(
             pid,
             for: clientName,
             runID: expectedMCPRunID,
@@ -1967,7 +1970,7 @@ actor ACPAgentSessionController {
 
     private func clearExpectedAgentPIDIfNeeded() async {
         guard let registeredExpectedAgentPID, let clientName = mcpClientNameHint else { return }
-        await ServerNetworkManager.shared.clearExpectedAgentPID(registeredExpectedAgentPID, for: clientName, runID: expectedMCPRunID)
+        await mcpHost.clearExpectedAgentPID(registeredExpectedAgentPID, for: clientName, runID: expectedMCPRunID)
         self.registeredExpectedAgentPID = nil
         log("Cleared expected MCP parent PID for \(clientName) runID=\(expectedMCPRunID?.uuidString ?? "nil")")
     }
@@ -2411,9 +2414,10 @@ actor ACPAgentSessionController {
                 fields["error_type"] = boundedRunDiagnosticField(String(reflecting: type(of: error)))
                 fields["error_code"] = String((error as NSError).code)
             }
-            await ServerNetworkManager.shared.debugRecordRunRoutingEvent(
+            await mcpHost.debugRecordRunRoutingEvent(
                 runID: runID,
                 event: event,
+                connectionID: nil,
                 fields: fields
             )
         #endif

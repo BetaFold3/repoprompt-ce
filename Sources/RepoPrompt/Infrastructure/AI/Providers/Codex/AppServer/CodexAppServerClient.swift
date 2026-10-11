@@ -272,14 +272,22 @@ actor CodexAppServerClient {
         let register: @Sendable (_ pid: pid_t, _ clientName: String, _ runID: UUID) async -> Void
         let clear: @Sendable (_ pid: pid_t, _ clientName: String, _ runID: UUID) async -> Void
 
-        static let serverNetworkManager = ExpectedAgentPIDRegistrar(
-            register: { pid, clientName, runID in
-                await ServerNetworkManager.shared.registerExpectedAgentPID(pid, for: clientName, runID: runID)
-            },
-            clear: { pid, clientName, runID in
-                await ServerNetworkManager.shared.clearExpectedAgentPID(pid, for: clientName, runID: runID)
-            }
-        )
+        static func mcpHost(_ mcpHost: any AgentMCPHosting) -> ExpectedAgentPIDRegistrar {
+            ExpectedAgentPIDRegistrar(
+                register: { pid, clientName, runID in
+                    await mcpHost.registerExpectedAgentPID(
+                        pid,
+                        for: clientName,
+                        runID: runID,
+                        expectedProcessExecutablePath: nil,
+                        expectedProcessExecutableIdentity: nil
+                    )
+                },
+                clear: { pid, clientName, runID in
+                    await mcpHost.clearExpectedAgentPID(pid, for: clientName, runID: runID)
+                }
+            )
+        }
     }
 
     private struct RegisteredExpectedAgentPID: Equatable {
@@ -464,18 +472,21 @@ actor CodexAppServerClient {
         emergencyTerminateTransportForDeinit()
     }
 
+    /// `mcpHost` only builds the default PID registrar; an explicit
+    /// `expectedAgentPIDRegistrar` takes precedence.
     init(
+        mcpHost: any AgentMCPHosting,
         writeFrameHandler: @escaping @Sendable (Int32, Data) throws -> Void = { descriptor, frame in
             try FDWriteSupport.writeAll(frame, to: descriptor)
         },
         livenessProbe: @escaping @Sendable (SpawnedProcess) -> Bool = { process in
             CodexAppServerClient.defaultProcessAppearsAlive(process)
         },
-        expectedAgentPIDRegistrar: ExpectedAgentPIDRegistrar = .serverNetworkManager
+        expectedAgentPIDRegistrar: ExpectedAgentPIDRegistrar? = nil
     ) {
         self.writeFrameHandler = writeFrameHandler
         self.livenessProbe = livenessProbe
-        self.expectedAgentPIDRegistrar = expectedAgentPIDRegistrar
+        self.expectedAgentPIDRegistrar = expectedAgentPIDRegistrar ?? .mcpHost(mcpHost)
     }
 
     func updateConfig(_ config: Config) {

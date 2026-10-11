@@ -23,20 +23,32 @@ final class OhMyPiACPHeadlessAgentProvider: HeadlessAgentProvider {
 
     init(
         config: OhMyPiAgentConfig,
+        mcpHost: any AgentMCPHosting,
         workspacePath: String? = nil,
         providerFactory: ProviderFactory? = nil,
-        routeCheck: @escaping RouteCheck = { runID in
-            await OhMyPiACPHeadlessAgentProvider.prePromptMCPRouteIsReady(runID: runID)
-        },
-        controllerFactory: @escaping ControllerFactory = { provider, request, diagnosticSink in
+        routeCheck: RouteCheck? = nil,
+        controllerFactory: ControllerFactory? = nil
+    ) {
+        self.config = config
+        let routeCheck: RouteCheck = routeCheck ?? { runID in
+            await OhMyPiACPHeadlessAgentProvider.prePromptMCPRouteIsReady(
+                runID: runID,
+                verifyLiveRoute: { runID in
+                    await mcpHost.hasAuthoritativeLiveRunRoute(
+                        runID: runID,
+                        expectedClientName: AgentProviderKind.ohMyPiMCPClientID
+                    )
+                }
+            )
+        }
+        let controllerFactory: ControllerFactory = controllerFactory ?? { provider, request, diagnosticSink in
             try ACPAgentSessionController(
                 provider: provider,
                 runRequest: request,
+                mcpHost: mcpHost,
                 diagnosticSink: diagnosticSink
             )
         }
-    ) {
-        self.config = config
         let resolvedProviderFactory = providerFactory ?? { config in
             OhMyPiACPAgentProvider(config: config)
         }
@@ -124,12 +136,7 @@ final class OhMyPiACPHeadlessAgentProvider: HeadlessAgentProvider {
                 timeoutSeconds: timeoutSeconds
             )
         },
-        verifyLiveRoute: @escaping LiveRouteVerifier = { runID in
-            await ServerNetworkManager.shared.hasAuthoritativeLiveRunRoute(
-                runID: runID,
-                expectedClientName: AgentProviderKind.ohMyPiMCPClientID
-            )
-        }
+        verifyLiveRoute: @escaping LiveRouteVerifier
     ) async -> Bool {
         switch await waitForRoutingOutcome(runID, timeoutSeconds) {
         case .notRouted:

@@ -333,7 +333,7 @@ final class CodexNativeSessionControllerTurnDispatchTests: XCTestCase {
 
     private func makeController(recorder: TurnRequestRecorder) -> CodexNativeSessionController {
         CodexNativeSessionController(
-            client: CodexAppServerClient(),
+            client: CodexAppServerClient(mcpHost: ServerNetworkManager.shared),
             runID: UUID(),
             tabID: UUID(),
             windowID: 1,

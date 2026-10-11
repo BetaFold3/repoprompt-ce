@@ -17,7 +17,7 @@ final class OhMyPiCLIProvider: AIProvider {
     init(
         headlessProviderFactory: @escaping HeadlessProviderFactory = { config, workspacePath in
             AnyHeadlessAgentProvider(
-                OhMyPiACPHeadlessAgentProvider(config: config, workspacePath: workspacePath)
+                OhMyPiACPHeadlessAgentProvider(config: config, mcpHost: ServerNetworkManager.shared, workspacePath: workspacePath)
             )
         },
         modelSnapshotResolver: @escaping ModelSnapshotResolver = {

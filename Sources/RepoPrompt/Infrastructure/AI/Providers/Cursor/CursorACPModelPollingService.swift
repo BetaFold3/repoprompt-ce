@@ -128,7 +128,7 @@ struct CursorACPControllerModelDiscoveryClient: CursorACPModelDiscoveryClient {
             return ACPAgentProviderFactory.makeProvider(for: agent, modelString: modelString)
         },
         controllerFactory: @escaping ControllerFactory = { provider, runRequest in
-            try ACPAgentSessionController(provider: provider, runRequest: runRequest)
+            try ACPAgentSessionController(provider: provider, runRequest: runRequest, mcpHost: ServerNetworkManager.shared)
         },
         parameterCatalog: CursorModelParameterCatalog = .shared,
         parameterizedModelsEnabled: @escaping @Sendable () -> Bool = {

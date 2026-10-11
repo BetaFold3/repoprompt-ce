@@ -28,6 +28,7 @@ final class ACPSynchronousMCPStartupTests: XCTestCase {
         let controller = try ACPAgentSessionController(
             provider: provider,
             runRequest: request,
+            mcpHost: ServerNetworkManager.shared,
             requestTimeouts: .init(bootstrapSeconds: 10)
         )
         addTeardownBlock {
@@ -68,6 +69,7 @@ final class ACPSynchronousMCPStartupTests: XCTestCase {
         let controller = try ACPAgentSessionController(
             provider: provider,
             runRequest: request,
+            mcpHost: ServerNetworkManager.shared,
             requestTimeouts: .init(bootstrapSeconds: 10)
         )
         addTeardownBlock {
@@ -126,6 +128,7 @@ final class ACPSynchronousMCPStartupTests: XCTestCase {
         let controller = try ACPAgentSessionController(
             provider: provider,
             runRequest: request,
+            mcpHost: ServerNetworkManager.shared,
             requestTimeouts: .init(bootstrapSeconds: 10)
         )
         addTeardownBlock {

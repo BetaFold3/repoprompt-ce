@@ -129,6 +129,7 @@ struct OhMyPiThinkingCapabilityControllerSessionFactory:
             try ACPAgentSessionController(
                 provider: provider,
                 runRequest: request,
+                mcpHost: ServerNetworkManager.shared,
                 requestTimeouts: timeouts,
                 dynamicModelPublicationPolicy: .capabilityOnly,
                 ohMyPiThinkingCapabilityPublisher: publisher

@@ -808,6 +808,7 @@ final class CursorParameterizedModelControllerTests: XCTestCase {
                 attachments: [],
                 taskLabelKind: nil
             ),
+            mcpHost: ServerNetworkManager.shared,
             diagnosticSink: { event in
                 if case let .info(message) = event {
                     diagnostics?.append(message)
@@ -848,7 +849,7 @@ final class CursorParameterizedModelControllerTests: XCTestCase {
         let client = CursorACPControllerModelDiscoveryClient(
             providerFactory: { _, _ in provider },
             controllerFactory: { provider, request in
-                try ACPAgentSessionController(provider: provider, runRequest: request)
+                try ACPAgentSessionController(provider: provider, runRequest: request, mcpHost: ServerNetworkManager.shared)
             },
             parameterCatalog: catalog,
             parameterizedModelsEnabled: { parameterizedModelsEnabled },

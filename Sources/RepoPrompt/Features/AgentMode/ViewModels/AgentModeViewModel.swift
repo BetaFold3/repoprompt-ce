@@ -2236,7 +2236,7 @@ final class AgentModeViewModel: ObservableObject {
             return FileManager.default.temporaryDirectory
         }
         let codexControllerFactory: CodexAgentModeCoordinator.CodexControllerFactory = { runID, tabID, windowID, workspacePath, permissionProfile, sessionProfile, _, computerUseEnabled in
-            let client = CodexAppServerClient()
+            let client = CodexAppServerClient(mcpHost: ServerNetworkManager.shared)
             let isKnowledge = sessionProfile == .knowledge
             let options = CodexNativeSessionController.Options.agentModeDefault(
                 forceExperimentalSteering: true,
@@ -2269,7 +2269,7 @@ final class AgentModeViewModel: ObservableObject {
             ACPAgentProviderFactory.makeProvider(for: agent, modelString: modelString)
         }
         acpControllerFactory = { provider, runRequest in
-            try ACPAgentSessionController(provider: provider, runRequest: runRequest)
+            try ACPAgentSessionController(provider: provider, runRequest: runRequest, mcpHost: ServerNetworkManager.shared)
         }
         connectionPolicyInstaller = { clientName, windowID, restrictedTools, oneShot, reason, ttl, tabID, runID, additionalTools, allowedToolsOverride, sessionProfile, purpose, taskLabelKind, allowsAgentExternalControlTools, requiresExpectedAgentPID in
             await Self.defaultConnectionPolicyInstaller(
@@ -2403,7 +2403,7 @@ final class AgentModeViewModel: ObservableObject {
                 ACPAgentProviderFactory.makeProvider(for: agent, modelString: modelString)
             },
             acpControllerFactory: @escaping ACPControllerFactory = { provider, runRequest in
-                try ACPAgentSessionController(provider: provider, runRequest: runRequest)
+                try ACPAgentSessionController(provider: provider, runRequest: runRequest, mcpHost: ServerNetworkManager.shared)
             },
             connectionPolicyInstaller: @escaping ConnectionPolicyInstaller = { clientName, windowID, restrictedTools, oneShot, reason, ttl, tabID, runID, additionalTools, allowedToolsOverride, sessionProfile, purpose, taskLabelKind, allowsAgentExternalControlTools, requiresExpectedAgentPID in
                 await AgentModeViewModel.defaultConnectionPolicyInstaller(

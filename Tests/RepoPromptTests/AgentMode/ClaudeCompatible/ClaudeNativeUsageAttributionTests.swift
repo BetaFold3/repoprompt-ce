@@ -22,7 +22,8 @@ final class ClaudeNativeUsageAttributionTests: XCTestCase {
             tabID: UUID(),
             windowID: 1,
             workspacePath: nil,
-            config: .discovery(commandName: "/usr/bin/false", runtimeVariant: .standard)
+            config: .discovery(commandName: "/usr/bin/false", runtimeVariant: .standard),
+            mcpHost: ServerNetworkManager.shared
         )
     }
 

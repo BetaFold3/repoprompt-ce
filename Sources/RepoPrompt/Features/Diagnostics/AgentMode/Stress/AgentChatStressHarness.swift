@@ -1423,7 +1423,7 @@ import RepoPromptWorkspace
                 return []
             }
             let controller = CodexNativeSessionController(
-                client: CodexAppServerClient(),
+                client: CodexAppServerClient(mcpHost: ServerNetworkManager.shared),
                 runID: UUID(),
                 tabID: UUID(),
                 windowID: windowID,

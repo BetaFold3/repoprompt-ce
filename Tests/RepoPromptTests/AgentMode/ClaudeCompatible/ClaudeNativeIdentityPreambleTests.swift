@@ -26,7 +26,8 @@ final class ClaudeNativeIdentityPreambleTests: XCTestCase {
             tabID: UUID(),
             windowID: 1,
             workspacePath: nil,
-            config: .agentMode(commandName: "claude", modelString: nil, runtimeVariant: variant)
+            config: .agentMode(commandName: "claude", modelString: nil, runtimeVariant: variant),
+            mcpHost: ServerNetworkManager.shared
         )
     }
 

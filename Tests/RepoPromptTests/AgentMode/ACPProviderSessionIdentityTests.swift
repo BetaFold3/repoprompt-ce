@@ -16,7 +16,7 @@ final class ACPProviderSessionIdentityTests: XCTestCase {
             commandPath: scriptURL.path,
             environment: ["ACP_RUNTIME_SESSION_ID": "cursor-runtime-id"]
         )
-        let controller = try ACPAgentSessionController(provider: provider, runRequest: request)
+        let controller = try ACPAgentSessionController(provider: provider, runRequest: request, mcpHost: ServerNetworkManager.shared)
         let stream = await controller.currentEventsStream()
 
         let bootstrap = try await controller.bootstrap()
@@ -46,7 +46,7 @@ final class ACPProviderSessionIdentityTests: XCTestCase {
             commandPath: scriptURL.path,
             environment: ["ACP_RECORD_PATH": recordURL.path]
         )
-        let controller = try ACPAgentSessionController(provider: provider, runRequest: request)
+        let controller = try ACPAgentSessionController(provider: provider, runRequest: request, mcpHost: ServerNetworkManager.shared)
 
         let bootstrap = try await controller.bootstrap()
         await controller.shutdown()
@@ -76,7 +76,7 @@ final class ACPProviderSessionIdentityTests: XCTestCase {
                 "ACP_RUNTIME_SESSION_ID": "fresh-runtime-id"
             ]
         )
-        let controller = try ACPAgentSessionController(provider: provider, runRequest: request)
+        let controller = try ACPAgentSessionController(provider: provider, runRequest: request, mcpHost: ServerNetworkManager.shared)
 
         let bootstrap = try await controller.bootstrap()
         await controller.shutdown()
@@ -108,7 +108,7 @@ final class ACPProviderSessionIdentityTests: XCTestCase {
                 "ACP_RUNTIME_SESSION_ID": "must-not-open"
             ]
         )
-        let controller = try ACPAgentSessionController(provider: provider, runRequest: request)
+        let controller = try ACPAgentSessionController(provider: provider, runRequest: request, mcpHost: ServerNetworkManager.shared)
 
         do {
             _ = try await controller.bootstrap()
