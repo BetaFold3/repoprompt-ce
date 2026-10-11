@@ -17,6 +17,7 @@
 //  - Oracle picker: /RepoPrompt/Views/Settings/AIModelDropDown.swift
 //
 
+import RepoPromptUI
 import SwiftUI
 
 /// Single source of truth for agent-mode model configuration: Oracle model,

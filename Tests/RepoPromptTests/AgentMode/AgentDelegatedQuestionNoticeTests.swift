@@ -3,6 +3,7 @@ import MCP
 @testable import RepoPromptAgentCore
 @testable import RepoPromptApp
 @testable import RepoPromptPlatform
+@testable import RepoPromptUI
 import XCTest
 
 /// Delegated `ask_user` notice content (plan §6.3): identifiers, questions, constraints, and the

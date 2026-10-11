@@ -1,5 +1,6 @@
 import AppKit
 import Foundation
+import RepoPromptUI
 
 /// One insertable snippet sourced from the user's saved prompt library.
 struct SnippetPaletteItem: Equatable, Identifiable {

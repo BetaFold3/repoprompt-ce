@@ -6,6 +6,7 @@ import Foundation
 @testable import RepoPromptMCPCore
 @testable import RepoPromptPlatform
 import RepoPromptShared
+@testable import RepoPromptUI
 import XCTest
 
 final class PersistentMCPResponseDeliveryTests: XCTestCase {

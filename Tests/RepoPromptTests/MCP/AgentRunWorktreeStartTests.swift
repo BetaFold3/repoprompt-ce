@@ -5,6 +5,7 @@ import MCP
 @testable import RepoPromptAgentCore
 @testable import RepoPromptApp
 @testable import RepoPromptPlatform
+@testable import RepoPromptUI
 import XCTest
 
 private final class AgentRunWorktreeStartGitSeedRepository: @unchecked Sendable {

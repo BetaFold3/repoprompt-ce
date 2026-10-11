@@ -1,6 +1,7 @@
 @testable import RepoPromptAgentCore
 @testable import RepoPromptApp
 @testable import RepoPromptPlatform
+@testable import RepoPromptUI
 import XCTest
 
 /// Literal, well-formed URLs for the matrix below, parsed in one place so the test

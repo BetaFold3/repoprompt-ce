@@ -2,6 +2,7 @@ import AppKit
 import Combine
 import Foundation
 import RepoPromptPlatform
+import RepoPromptUI
 import SwiftUI
 #if DEBUG || EDIT_FLOW_PERF
     import os

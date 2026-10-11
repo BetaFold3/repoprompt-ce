@@ -1,6 +1,7 @@
 import Combine
 import Foundation
 import os
+import RepoPromptUI
 import SwiftUI
 
 /// Free helper function not tied to any actor

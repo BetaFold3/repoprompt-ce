@@ -1,6 +1,7 @@
 @testable import RepoPromptAgentCore
 @testable import RepoPromptApp
 @testable import RepoPromptPlatform
+@testable import RepoPromptUI
 import XCTest
 
 /// Oracle failure inspection plan, Patch B (B1–B3, B5): the shared failure projection, its

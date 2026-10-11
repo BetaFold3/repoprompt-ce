@@ -5,6 +5,7 @@
 //  Created by Eric Provencher on 2025-05-16.
 //
 
+import RepoPromptUI
 import SwiftUI
 
 struct PromptSettingsView: View {

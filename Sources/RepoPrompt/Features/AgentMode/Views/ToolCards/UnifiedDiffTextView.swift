@@ -1,4 +1,5 @@
 import AppKit
+import RepoPromptUI
 import SwiftUI
 
 private final class EdgeForwardingScrollView: NSScrollView {

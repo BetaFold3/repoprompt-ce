@@ -37,7 +37,8 @@ enum RepoRoot {
     static let librarySourceRoots = [
         "Sources/RepoPrompt",
         "Sources/RepoPromptAgentCore",
-        "Sources/RepoPromptPlatform"
+        "Sources/RepoPromptPlatform",
+        "Sources/RepoPromptUI"
     ]
 
     static func relativePath(for fileURL: URL, relativeTo rootURL: URL) -> String {

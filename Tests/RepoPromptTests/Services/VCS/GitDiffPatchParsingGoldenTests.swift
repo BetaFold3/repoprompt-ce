@@ -1,6 +1,7 @@
 @testable import RepoPromptAgentCore
 @testable import RepoPromptApp
 @testable import RepoPromptPlatform
+@testable import RepoPromptUI
 import XCTest
 
 /// Golden coverage for the changed-line surface that ships inside MCP `git` tool replies and the

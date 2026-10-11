@@ -1,3 +1,4 @@
+import RepoPromptUI
 import SwiftUI
 
 /// Optimized workspace row that minimizes re-renders

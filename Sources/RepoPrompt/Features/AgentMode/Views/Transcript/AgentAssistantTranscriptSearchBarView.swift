@@ -1,3 +1,4 @@
+import RepoPromptUI
 import SwiftUI
 
 /// Compact chrome for Workstream 5 item 1's assistant-only transcript search: query field,

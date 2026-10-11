@@ -1,4 +1,5 @@
 import AppKit
+import RepoPromptUI
 import SwiftUI
 
 /// The Changes segment: fixed global compare/search chrome, one ordered multi-repository list, and

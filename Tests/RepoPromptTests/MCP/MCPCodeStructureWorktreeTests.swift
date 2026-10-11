@@ -6,6 +6,7 @@ import MCP
 @testable import RepoPromptApp
 @testable import RepoPromptPlatform
 import RepoPromptShared
+@testable import RepoPromptUI
 import XCTest
 
 private extension ToolResultDTOs.CodeStructureReplyDTO {

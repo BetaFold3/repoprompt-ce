@@ -1,4 +1,5 @@
 import AppKit
+import RepoPromptUI
 import SwiftUI
 
 // MARK: - Simple Code Block

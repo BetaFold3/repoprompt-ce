@@ -5,6 +5,7 @@
 //  Created by Eric Provencher on 2025-04-01.
 //
 
+import RepoPromptUI
 import SwiftUI
 
 struct HoverButtonStyle: ButtonStyle {

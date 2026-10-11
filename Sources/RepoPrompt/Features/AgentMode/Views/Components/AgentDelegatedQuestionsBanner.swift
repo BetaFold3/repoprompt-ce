@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptUI
 import SwiftUI
 
 /// Notice above a parent agent's composer listing child questions addressed to this agent

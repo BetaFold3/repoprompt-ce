@@ -1,4 +1,5 @@
 import Combine
+import RepoPromptUI
 import SwiftUI
 
 /// Consolidated settings view for Agent Mode — the "Overview" tab.

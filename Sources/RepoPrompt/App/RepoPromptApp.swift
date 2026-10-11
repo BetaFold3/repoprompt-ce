@@ -3,6 +3,7 @@ import Darwin
 import Foundation
 import Logging
 import RepoPromptPlatform
+import RepoPromptUI
 import Sparkle
 import SwiftUI
 

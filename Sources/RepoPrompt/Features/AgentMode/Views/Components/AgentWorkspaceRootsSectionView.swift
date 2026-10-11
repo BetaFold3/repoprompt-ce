@@ -1,4 +1,5 @@
 import AppKit
+import RepoPromptUI
 import SwiftUI
 
 /// Always-visible workspace roots section for Agent Mode sidebar.

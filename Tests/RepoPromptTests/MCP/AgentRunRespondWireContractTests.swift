@@ -4,6 +4,7 @@ import MCP
 @testable import RepoPromptGateway
 @testable import RepoPromptPlatform
 import RepoPromptRemoteWire
+@testable import RepoPromptUI
 import XCTest
 
 final class AgentRunRespondWireContractTests: XCTestCase {

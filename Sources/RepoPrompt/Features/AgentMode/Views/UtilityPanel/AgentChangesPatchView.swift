@@ -1,3 +1,4 @@
+import RepoPromptUI
 import SwiftUI
 
 /// One expanded file's diff body.

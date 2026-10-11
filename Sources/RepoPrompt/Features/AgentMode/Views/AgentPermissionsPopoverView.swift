@@ -1,3 +1,4 @@
+import RepoPromptUI
 import SwiftUI
 
 /// Quick-access popover for sub-agent permission policy in Agent Mode.

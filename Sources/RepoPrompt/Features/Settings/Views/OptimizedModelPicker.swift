@@ -1,4 +1,5 @@
 import Combine
+import RepoPromptUI
 import SwiftUI
 
 /// AppKit-backed model picker that snapshots models at open and renders Provider → Models nesting.

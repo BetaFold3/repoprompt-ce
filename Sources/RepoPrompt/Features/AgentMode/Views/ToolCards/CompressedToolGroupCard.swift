@@ -1,3 +1,4 @@
+import RepoPromptUI
 import SwiftUI
 
 /// Ultra-lightweight, non-expandable summary card for a group of compressed tool/thinking items.

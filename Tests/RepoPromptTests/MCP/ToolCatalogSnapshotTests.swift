@@ -7,6 +7,7 @@ import Ontology
 @testable import RepoPromptApp
 @testable import RepoPromptPlatform
 import RepoPromptShared
+@testable import RepoPromptUI
 import XCTest
 
 @MainActor

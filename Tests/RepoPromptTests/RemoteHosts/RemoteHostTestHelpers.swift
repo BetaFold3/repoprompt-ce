@@ -5,6 +5,7 @@ import Foundation
 @testable import RepoPromptApp
 @testable import RepoPromptPlatform
 import RepoPromptRemoteWire
+@testable import RepoPromptUI
 import XCTest
 
 final class InMemoryRemoteClientKeychain: RemoteClientKeychainStoring, @unchecked Sendable {

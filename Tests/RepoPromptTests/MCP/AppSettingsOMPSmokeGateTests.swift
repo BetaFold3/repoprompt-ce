@@ -6,6 +6,7 @@
     @testable import RepoPromptApp
     @testable import RepoPromptPlatform
     import RepoPromptShared
+    @testable import RepoPromptUI
     import XCTest
 
     private final class QualificationMonotonicClock: @unchecked Sendable {

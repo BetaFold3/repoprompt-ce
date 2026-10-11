@@ -1,5 +1,6 @@
 import AppKit
 import Foundation
+import RepoPromptUI
 import SwiftUI
 
 /// Width-aware TextKit height measurement for unified-diff cards.

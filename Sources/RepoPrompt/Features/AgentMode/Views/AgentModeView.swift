@@ -1,5 +1,6 @@
 import Combine
 import OSLog
+import RepoPromptUI
 import SwiftUI
 
 /// Agent Mode view - a chat-style interface for long-running agent interactions

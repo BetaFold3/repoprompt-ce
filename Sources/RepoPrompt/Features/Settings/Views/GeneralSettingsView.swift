@@ -1,4 +1,5 @@
 import AppKit
+import RepoPromptUI
 import SwiftUI
 
 enum AppearanceMode: String, CaseIterable, Identifiable {

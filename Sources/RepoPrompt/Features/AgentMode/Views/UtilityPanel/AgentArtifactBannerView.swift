@@ -1,3 +1,4 @@
+import RepoPromptUI
 import SwiftUI
 
 /// The quiet "the agent just wrote you a document" line in the Changes panel.

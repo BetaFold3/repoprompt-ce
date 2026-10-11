@@ -1,6 +1,7 @@
 @testable import RepoPromptAgentCore
 @testable import RepoPromptApp
 @testable import RepoPromptPlatform
+@testable import RepoPromptUI
 import XCTest
 
 #if REPOPROMPT_SENTRY_ENABLED

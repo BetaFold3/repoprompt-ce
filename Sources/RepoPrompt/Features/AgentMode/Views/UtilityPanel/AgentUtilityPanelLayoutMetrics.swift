@@ -1,3 +1,4 @@
+import RepoPromptUI
 import SwiftUI
 
 /// Pure width arithmetic for the right-side utility panel.

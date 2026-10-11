@@ -3,6 +3,7 @@ import Foundation
 @_spi(TestSupport) @testable import RepoPromptApp
 @testable import RepoPromptPlatform
 import RepoPromptRemoteWire
+@testable import RepoPromptUI
 import XCTest
 
 final class RemoteAgentSessionControllerSettleTests: XCTestCase {

@@ -4,6 +4,7 @@
     @testable import RepoPromptAgentCore
     @testable import RepoPromptApp
     @testable import RepoPromptPlatform
+    @testable import RepoPromptUI
 
     #if RPCE_BENCHMARK_TESTS
         enum WorkspaceFileSearchIndexBenchmarkRuntimeConfiguration {

@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptUI
 
 // MARK: - Canonical Settings Keys
 

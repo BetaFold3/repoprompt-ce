@@ -2,6 +2,7 @@ import MCP
 @testable import RepoPromptAgentCore
 @testable import RepoPromptApp
 @testable import RepoPromptPlatform
+@testable import RepoPromptUI
 import XCTest
 
 final class MCPFileActionPartialSuccessTests: XCTestCase {

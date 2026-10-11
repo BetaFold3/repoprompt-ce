@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptUI
 
 /// Resolves transcript document paths through the same checkout-aware mapping used by Changes
 /// artifacts. The result remains a logical-root reference so Preview follows active worktree

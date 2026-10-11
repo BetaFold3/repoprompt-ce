@@ -3,6 +3,7 @@ import Foundation
 @testable import RepoPromptAgentCore
 @testable import RepoPromptApp
 @testable import RepoPromptPlatform
+@testable import RepoPromptUI
 
 final class ReviewGitRepositoryFixture {
     let sandbox: URL

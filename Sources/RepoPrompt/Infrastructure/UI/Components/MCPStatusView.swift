@@ -5,6 +5,7 @@
 //  Created by RepoPrompt MCP integration
 //
 
+import RepoPromptUI
 import SwiftUI
 
 /// A comprehensive MCP server status dashboard view.

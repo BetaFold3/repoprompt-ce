@@ -1,3 +1,4 @@
+import RepoPromptUI
 import SwiftUI
 
 /// A compact, live-updating connections counter button that opens the full status view

@@ -2,6 +2,7 @@
 
 import Foundation
 import MCP
+import RepoPromptUI
 
 #if DEBUG
     extension ServerNetworkManager {

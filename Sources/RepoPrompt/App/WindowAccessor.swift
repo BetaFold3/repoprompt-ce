@@ -6,6 +6,7 @@
 //
 
 import AppKit
+import RepoPromptUI
 import SwiftUI
 
 struct WindowAccessor: NSViewRepresentable {

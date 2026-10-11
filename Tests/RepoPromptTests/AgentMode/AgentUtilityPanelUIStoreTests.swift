@@ -2,6 +2,7 @@ import Combine
 @testable import RepoPromptAgentCore
 @testable import RepoPromptApp
 @testable import RepoPromptPlatform
+@testable import RepoPromptUI
 import XCTest
 
 /// The active-tab facade for utility panel state.

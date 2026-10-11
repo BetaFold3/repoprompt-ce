@@ -29,6 +29,18 @@ Sources/
       SyntaxParsing/             # tree-sitter query strings and query resource loading
       Utilities/                 # dependency-free generic utilities/extensions
     ThirdParty/                  # vendored SwiftPCRE2 wrapper
+  RepoPromptUI/                  # internal reusable-UI library target (not a product); may depend on RepoPromptPlatform only among app modules (currently none) plus the Markdown, Neon, and SwiftTreeSitter packages
+    Components/                  # reusable SwiftUI/AppKit components, button styles, tooltips, debouncing/work-item gates
+    Diagnostics/                 # DEBUG font-scale event recording
+    Markdown/                    # markdown compile/render views, code highlighting, file-link detection and interaction
+    Mentions/                    # mention models, assets, and picker style
+    Services/                    # generic UI services (open panel, input monitor, async user waiter)
+    SyntaxHighlighting/          # Neon token styles for code highlighting
+    TextField/                   # TextKit text views, mention text view/overlay, undo-safe replacement
+    Tooltip/                     # tooltip overlay and anchor geometry
+    Typography/                  # FontScaleManager, FontScalePreset, transcript code font resolver/fingerprint
+    WebPreview/                  # secure HTML preview view, configuration, navigation policy, repo URL scheme
+    UIDisplayPreferences.swift   # live display preferences forwarded by the App settings owner
   RepoPrompt/                    # internal RepoPromptApp implementation library target (not a package product)
     App/                         # lifecycle, launch/configuration, commands, composition wiring, app notifications, root app views/view models
       Notifications/
@@ -56,8 +68,8 @@ Sources/
       Persistence/               # shared persistence helpers such as preset file storage
       Process/                   # app-owned CLI installation and executable identity
       Security/                  # app key management and Remote Control pairing
-      SyntaxParsing/             # syntax highlighting and syntax manager
-      UI/                        # reusable UI components, text/markdown/tooltip/mention substrate, UI services
+      SyntaxParsing/             # syntax manager
+      UI/                        # app-specific UI: agent cards/menus, approval overlays, composer chrome, workspace-backed mention/text-field adapters
       Utilities/                 # app-specific utilities (paths, checkout identity, shortcuts)
       VCS/                       # git/VCS substrate
       WorkspaceContext/          # context store, indexing, path lookup, slices, search, token accounting
@@ -73,9 +85,11 @@ Tests/
 
 The external target graph is intentionally stable at its boundary: the executable products and emitted binaries remain `RepoPrompt`, `repoprompt-mcp`, and `repoprompt-gateway`. The `RepoPrompt` executable target delegates to the internal `RepoPromptApp` target, while the `RepoPromptMCP` executable target contains only its process entry and delegates to the `RepoPromptMCPCore` package product. `RepoPromptApp` is not declared as a library product or separate Xcode convenience scheme. Root app and gateway tests import their root targets plus the required `RepoPromptCore` products.
 
-`RepoPromptAgentCore` is the first lower-layer module of the app split (see the [module split contract](../context/plans/2026-10-10-app-module-split-contract.md)). It is an internal, static library target with no product. It may depend only on the `RepoPromptShared` package product and system frameworks for now; later slices add `RepoPromptWorkspace` and `RepoPromptPlatform` as dependencies when AgentCore code needs them. It must never depend on `RepoPromptApp`, the executables, `RepoPromptGateway`, or the future `RepoPromptUI` module, and it has no bridging header. Declarations default to `internal`; mark `package` only what `RepoPromptApp` uses. `RepoPromptTests` depends on it and every `@testable import RepoPromptApp` file also has `@testable import RepoPromptAgentCore`.
+`RepoPromptAgentCore` is the first lower-layer module of the app split (see the [module split contract](../context/plans/2026-10-10-app-module-split-contract.md)). It is an internal, static library target with no product. It may depend only on the `RepoPromptShared` package product and system frameworks for now; later slices add `RepoPromptWorkspace` and `RepoPromptPlatform` as dependencies when AgentCore code needs them. It must never depend on `RepoPromptApp`, the executables, `RepoPromptGateway`, or `RepoPromptUI`, and it has no bridging header. Declarations default to `internal`; mark `package` only what `RepoPromptApp` uses. `RepoPromptTests` depends on it and every `@testable import RepoPromptApp` file also has `@testable import RepoPromptAgentCore`.
 
-`RepoPromptPlatform` holds dependency-free generic primitives: concurrency, process/CLI launch, regex and the SwiftPCRE2 wrapper, networking, filesystem caches and the spill-backed artifact store, secure-storage and code-signing mechanics, tree-sitter query strings, and generic utilities. It is an internal, static library target with no product and depends on no other app module: only the `RepoPromptShared` package product, the `RepoPromptC` and `CSwiftPCRE2` C targets, and system frameworks. It must never depend on `RepoPromptApp`, `RepoPromptAgentCore`, the future `RepoPromptWorkspace`/`RepoPromptUI` modules, the executables, or `RepoPromptGateway`. Code that needs app, product, or domain declarations stays in the app (for example `GitignoreCompiler`, `IgnoreDebugMetricsRecorder`, `CodeMapSecureFileRemoval`, `Shortcuts`, and `RemoteScope`). Declarations default to `internal`; mark `package` only what another target uses. `RepoPromptApp` and `RepoPromptTests` depend on it, and every `@testable import RepoPromptApp` file also has `@testable import RepoPromptPlatform`.
+`RepoPromptPlatform` holds dependency-free generic primitives: concurrency, process/CLI launch, regex and the SwiftPCRE2 wrapper, networking, filesystem caches and the spill-backed artifact store, secure-storage and code-signing mechanics, tree-sitter query strings, and generic utilities. It is an internal, static library target with no product and depends on no other app module: only the `RepoPromptShared` package product, the `RepoPromptC` and `CSwiftPCRE2` C targets, and system frameworks. It must never depend on `RepoPromptApp`, `RepoPromptAgentCore`, `RepoPromptUI`, the future `RepoPromptWorkspace` module, the executables, or `RepoPromptGateway`. Code that needs app, product, or domain declarations stays in the app (for example `GitignoreCompiler`, `IgnoreDebugMetricsRecorder`, `CodeMapSecureFileRemoval`, `Shortcuts`, and `RemoteScope`). Declarations default to `internal`; mark `package` only what another target uses. `RepoPromptApp` and `RepoPromptTests` depend on it, and every `@testable import RepoPromptApp` file also has `@testable import RepoPromptPlatform`.
+
+`RepoPromptUI` holds reusable presentation code: typography (`FontScaleManager`, `FontScalePreset`, the transcript code-font resolver), `UIDisplayPreferences`, markdown rendering, tooltips, generic components and text views, syntax highlighting, and the secure HTML preview. It is an internal, static library target with no product. Among app modules it may depend only on `RepoPromptPlatform` (currently it needs none); its package dependencies are `Markdown`, `Neon`, and `SwiftTreeSitter`. It must never depend on `RepoPromptApp`, `RepoPromptAgentCore`, the future `RepoPromptWorkspace`, the executables, or `RepoPromptGateway`, and `GlobalSettingsStore` stays in the app: `RepoPromptSwiftUIApp.init` binds `FontScaleManager` to the store and forwards display preferences into `UIDisplayPreferences`. Product-feature views and adapters over agent, MCP, approval, or workspace types stay in the app (for example `CheckRecommendationsButton`, `NotificationsButtonView`, `SnippetPaletteHelper`, and `AgentSidebarSizing`). Declarations default to `internal`; mark `package` only what another target uses. `RepoPromptApp` and `RepoPromptTests` depend on it, and every `@testable import RepoPromptApp` file also has `@testable import RepoPromptUI`.
 
 The legacy top-level layer buckets under `Sources/RepoPrompt` have been pruned and must not be recreated:
 
@@ -106,7 +120,7 @@ The old IDE-era Prompt selected-files panel is also removed. Do not add back `Pr
 - New cross-cutting service/platform code goes under `Sources/RepoPrompt/Infrastructure/<Area>`; dependency-free generic primitives that use no app declarations go under `Sources/RepoPromptPlatform/Infrastructure/<Area>`.
 - Native Remote Control host discovery/client transport and persistence belong under `Infrastructure/RemoteHosts`; app-owned pairing keys, discovery authority, and approval routing belong under `Infrastructure/Security/RemotePairing`; gateway admission/relay stays in `RepoPromptGateway`; shared signed discovery wire DTOs stay in `RepoPromptRemoteWire`; onboarding presentation stays under `Features/Settings`.
 - Provider-neutral workflow prompt catalog metadata and renderers go under `Sources/RepoPromptAgentCore/AI/Prompts/Workflows/`; do not add new workflow prompts under provider-specific command names or bundled `AppResources/Services/AI/Prompts` mirrors.
-- New reusable SwiftUI components, text/markdown helpers, and UI services should prefer a narrow feature owner first; otherwise use `Sources/RepoPrompt/Infrastructure/UI/<Area>`.
+- New reusable SwiftUI components, text/markdown helpers, and UI services should prefer a narrow feature owner first; otherwise use `Sources/RepoPromptUI/<Area>` when they need no app declarations (settings stores, view models, agent/MCP/workspace types), or `Sources/RepoPrompt/Infrastructure/UI/<Area>` when they do.
 - New generic extensions/helpers should prefer a narrow feature or infrastructure owner first; otherwise use `Sources/RepoPromptPlatform/Infrastructure/Utilities` when they need no app declarations, or `Sources/RepoPrompt/Infrastructure/Utilities` when they do.
 - New app-visible diagnostic surfaces go under `Sources/RepoPrompt/Features/Diagnostics` and must have a documented purpose and entry point.
 - New app/client protocol definitions shared by multiple executables go under `Packages/RepoPromptCore/Sources/RepoPromptShared`, except for the documented remote-control wire exception below.
@@ -116,7 +130,7 @@ The old IDE-era Prompt selected-files panel is also removed. Do not add back `Pr
 - New app-local MCP/socket/routing helpers go under `Sources/RepoPrompt/Infrastructure/MCP`, not `Sources/RepoPrompt/Shared`.
 - New importable CLI implementation code goes under `Packages/RepoPromptCore/Sources/RepoPromptMCPCore`; `Sources/RepoPromptMCP` remains the thin executable entry only.
 - New test doubles, fixtures, parser inputs, sample projects, benchmark-only fixture data, and XCTest-only helpers go under `Tests/RepoPromptTests`, not the app target.
-- Do not create directories named `Tests`, `TestSupport`, or `Fixtures` under `Sources/RepoPrompt`, `Sources/RepoPromptAgentCore`, or `Sources/RepoPromptPlatform`.
+- Do not create directories named `Tests`, `TestSupport`, or `Fixtures` under `Sources/RepoPrompt`, `Sources/RepoPromptAgentCore`, `Sources/RepoPromptPlatform`, or `Sources/RepoPromptUI`.
 - Do not put parser fixtures or sample parser inputs under `Sources/RepoPrompt/Infrastructure/SyntaxParsing` or `Sources/RepoPromptPlatform/Infrastructure/SyntaxParsing`; keep only production parser/query code there.
 - Keep `App/WindowState.swift` in `App` until there is a separate composition-root refactor; physical moves must preserve initialization order.
 
@@ -182,9 +196,10 @@ The guardrail script verifies:
 - `Package.swift` keeps the current implementation target named `RepoPromptApp` at `Sources/RepoPrompt`, with the `RepoPrompt` executable as its thin sole-dependent entry target;
 - `RepoPromptAgentCore` exists as a library target at `Sources/RepoPromptAgentCore` and declares no `@main`;
 - `RepoPromptPlatform` exists as a library target at `Sources/RepoPromptPlatform` and declares no `@main`;
+- `RepoPromptUI` exists as a library target at `Sources/RepoPromptUI` and declares no `@main`;
 - the RemoteWire import guardrail keeps `RepoPromptRemoteWire` dependency-free and permits only `Foundation` and `CryptoKit` imports, never app, gateway, MCP, NIO, logging, or shared implementation modules;
 - old top-level layer buckets are absent or contain no files;
-- no `Tests`, `TestSupport`, or `Fixtures` directories exist under `Sources/RepoPrompt`, `Sources/RepoPromptAgentCore`, or `Sources/RepoPromptPlatform`;
+- no `Tests`, `TestSupport`, or `Fixtures` directories exist under `Sources/RepoPrompt`, `Sources/RepoPromptAgentCore`, `Sources/RepoPromptPlatform`, or `Sources/RepoPromptUI`;
 - `MCPControlMessages.swift` and `MCPFilesystemIdentity.swift` exist only under `Packages/RepoPromptCore/Sources/RepoPromptShared/MCP`, and the `MCPExternalClientEvent` wire DTO is declared only there;
 - parser fixtures/sample inputs do not live under app or Platform syntax parsing source;
 - the narrow `TreeSitterScannerSupport` compatibility target has exactly its approved JavaScript/Python scanner snapshots and helper headers, matches curated checksums, remains wired in `Package.swift`, preserves the seven migrated grammar pins/products in `Package.swift` and `Package.resolved`, and keeps the seven retired local grammar directories absent;

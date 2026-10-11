@@ -5,6 +5,7 @@
 //  Created by RepoPrompt on 2026-02-05.
 //
 
+import RepoPromptUI
 import SwiftUI
 
 // MARK: - Agent Onboarding Wizard View

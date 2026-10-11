@@ -1,3 +1,4 @@
+import RepoPromptUI
 import SwiftUI
 
 // MARK: - Unified Diff View

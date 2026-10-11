@@ -1,6 +1,7 @@
 @testable import RepoPromptAgentCore
 @testable import RepoPromptApp
 @testable import RepoPromptPlatform
+@testable import RepoPromptUI
 import XCTest
 
 /// Projection coverage for the Changes panel's diff models.

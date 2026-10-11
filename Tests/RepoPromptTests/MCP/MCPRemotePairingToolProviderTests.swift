@@ -5,6 +5,7 @@ import MCP
 @testable import RepoPromptApp
 @testable import RepoPromptPlatform
 import RepoPromptRemoteWire
+@testable import RepoPromptUI
 import XCTest
 
 @MainActor

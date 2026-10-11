@@ -1,4 +1,5 @@
 import AppKit
+import RepoPromptUI
 import SwiftUI
 
 /// Curated fixed-pitch font picker for transcript code/diff rendering.

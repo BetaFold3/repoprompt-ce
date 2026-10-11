@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptUI
 
 /// Extracts user-facing workspace paths from links emitted for the secure Preview web view.
 enum AgentPreviewLinkRouter {

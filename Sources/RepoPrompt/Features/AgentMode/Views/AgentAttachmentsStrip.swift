@@ -1,5 +1,6 @@
 import AppKit
 import ImageIO
+import RepoPromptUI
 import SwiftUI
 
 struct AgentAttachmentStripSnapshot: Equatable {

@@ -1,5 +1,6 @@
 import Combine
 import Foundation
+import RepoPromptUI
 import SwiftUI
 
 enum FileTreeOption: String, CaseIterable, Identifiable, Codable {

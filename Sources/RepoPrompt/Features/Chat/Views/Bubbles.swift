@@ -6,6 +6,7 @@
 //
 
 import AppKit
+import RepoPromptUI
 import SwiftUI
 
 // MARK: - Token Usage Indicator

@@ -2,6 +2,7 @@
 //  Changelog.swift
 import Foundation
 import MarkdownUI
+import RepoPromptUI
 import SwiftUI
 
 struct Version: Identifiable {

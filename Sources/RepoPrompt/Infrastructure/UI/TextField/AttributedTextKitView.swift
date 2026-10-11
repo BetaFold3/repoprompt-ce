@@ -1,5 +1,6 @@
 import AppKit
 import Combine
+import RepoPromptUI
 import SwiftUI
 
 /// A drop-in replacement for `TextKitView` that supports "@" mentions.

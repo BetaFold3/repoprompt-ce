@@ -7,6 +7,7 @@ included:
   - Sources/RepoPrompt
   - Sources/RepoPromptAgentCore
   - Sources/RepoPromptPlatform
+  - Sources/RepoPromptUI
   - Sources/RepoPromptExecutable
   - Sources/RepoPromptMCP
   - Packages/RepoPromptCore/Package.swift
@@ -85,6 +86,7 @@ custom_rules:
     name: "SwiftUI .help Modifier"
     included:
       - 'Sources/RepoPrompt/.*\.swift$'
+      - 'Sources/RepoPromptUI/.*\.swift$'
     regex: '\.help\s*\('
     match_kinds:
       - identifier

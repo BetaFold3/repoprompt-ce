@@ -1,0 +1,371 @@
+import AppKit
+import SwiftUI
+
+/// A SwiftUI-labelled button that presents an AppKit `NSMenu`.
+///
+/// Use this instead of SwiftUI `Menu` for long-lived model pickers that sit in highly
+/// reactive views. AppKit owns menu tracking, so unrelated SwiftUI invalidations do
+/// not tear down the open picker.
+///
+/// Every action dismisses the entire menu. Items that own submenus cannot also invoke
+/// actions because AppKit uses an action-less parent item for submenu tracking. This
+/// makes `StableMenuButton` unsuitable for multi-step configuration; use adjacent
+/// launcher chips or a popover for settings that require more than one choice.
+package struct StableMenuButton<Label: View>: View {
+    package enum TriggerStyle {
+        case automatic
+        case borderless
+        case plain
+    }
+
+    let items: () -> [StableMenuItem]
+    let triggerStyle: TriggerStyle
+    let onOpen: @MainActor () -> Void
+    @ViewBuilder let label: () -> Label
+
+    @StateObject private var presenter = StableMenuPresenter()
+
+    package init(
+        items: @escaping () -> [StableMenuItem],
+        triggerStyle: TriggerStyle = .automatic,
+        onOpen: @escaping @MainActor () -> Void = {},
+        @ViewBuilder label: @escaping () -> Label
+    ) {
+        self.items = items
+        self.triggerStyle = triggerStyle
+        self.onOpen = onOpen
+        self.label = label
+    }
+
+    package var body: some View {
+        switch triggerStyle {
+        case .automatic:
+            button
+        case .borderless:
+            button.buttonStyle(.borderless)
+        case .plain:
+            button.buttonStyle(.plain)
+        }
+    }
+
+    private var button: some View {
+        Button {
+            onOpen()
+            presenter.present(items())
+        } label: {
+            label()
+        }
+        .background(
+            StableMenuAnchorView(presenter: presenter)
+                .allowsHitTesting(false)
+        )
+    }
+}
+
+package enum StableMenuItemStyle: Equatable {
+    case normal
+    case warning
+}
+
+package struct StableMenuItem {
+    private enum Kind {
+        case action(() -> Void)
+        case submenu([StableMenuItem])
+        case lazySubmenu(onOpen: () -> Void, items: () -> [StableMenuItem])
+        case separator
+        case header
+    }
+
+    private let kind: Kind
+    let title: String
+    let isEnabled: Bool
+    let isSelected: Bool
+    let imageSystemName: String?
+    let style: StableMenuItemStyle
+    let toolTip: String?
+
+    private init(
+        title: String,
+        kind: Kind,
+        isEnabled: Bool = true,
+        isSelected: Bool = false,
+        imageSystemName: String? = nil,
+        style: StableMenuItemStyle = .normal,
+        toolTip: String? = nil
+    ) {
+        self.title = title
+        self.kind = kind
+        self.isEnabled = isEnabled
+        self.isSelected = isSelected
+        self.imageSystemName = imageSystemName
+        self.style = style
+        self.toolTip = toolTip
+    }
+
+    package static func action(
+        _ title: String,
+        isEnabled: Bool = true,
+        isSelected: Bool = false,
+        imageSystemName: String? = nil,
+        style: StableMenuItemStyle = .normal,
+        toolTip: String? = nil,
+        _ action: @escaping () -> Void
+    ) -> StableMenuItem {
+        StableMenuItem(
+            title: title,
+            kind: .action(action),
+            isEnabled: isEnabled,
+            isSelected: isSelected,
+            imageSystemName: imageSystemName,
+            style: style,
+            toolTip: toolTip
+        )
+    }
+
+    package static func submenu(
+        _ title: String,
+        isSelected: Bool = false,
+        imageSystemName: String? = nil,
+        style: StableMenuItemStyle = .normal,
+        toolTip: String? = nil,
+        items: [StableMenuItem]
+    ) -> StableMenuItem {
+        StableMenuItem(
+            title: title,
+            kind: .submenu(items),
+            isSelected: isSelected,
+            imageSystemName: imageSystemName,
+            style: style,
+            toolTip: toolTip
+        )
+    }
+
+    package static func lazySubmenu(
+        _ title: String,
+        isSelected: Bool = false,
+        imageSystemName: String? = nil,
+        style: StableMenuItemStyle = .normal,
+        toolTip: String? = nil,
+        onOpen: @escaping () -> Void,
+        items: @escaping () -> [StableMenuItem]
+    ) -> StableMenuItem {
+        StableMenuItem(
+            title: title,
+            kind: .lazySubmenu(onOpen: onOpen, items: items),
+            isSelected: isSelected,
+            imageSystemName: imageSystemName,
+            style: style,
+            toolTip: toolTip
+        )
+    }
+
+    package static func header(_ title: String) -> StableMenuItem {
+        StableMenuItem(title: title, kind: .header, isEnabled: false)
+    }
+
+    package static func message(_ title: String) -> StableMenuItem {
+        StableMenuItem(title: title, kind: .header, isEnabled: false)
+    }
+
+    package static var separator: StableMenuItem {
+        StableMenuItem(title: "", kind: .separator, isEnabled: false)
+    }
+
+    var submenuItems: [StableMenuItem]? {
+        switch kind {
+        case let .submenu(items):
+            items
+        case let .lazySubmenu(_, items):
+            items()
+        default:
+            nil
+        }
+    }
+
+    #if DEBUG
+        /// Test seam for verifying the value routed by a generated action item.
+        @discardableResult
+        func performActionForTesting() -> Bool {
+            guard case let .action(action) = kind else { return false }
+            action()
+            return true
+        }
+
+        func makeMenuItemForTesting() -> NSMenuItem {
+            makeMenuItem()
+        }
+    #endif
+
+    fileprivate func makeMenuItem(fontPreset: FontScalePreset = .current) -> NSMenuItem {
+        switch kind {
+        case .separator:
+            return .separator()
+        case .header:
+            let item = NSMenuItem(title: title, action: nil, keyEquivalent: "")
+            item.isEnabled = false
+            configureImage(on: item)
+            configureTitle(on: item, fontPreset: fontPreset)
+            item.toolTip = toolTip
+            return item
+        case let .action(action):
+            let item = NSMenuItem(title: title, action: #selector(StableMenuActionBox.invoke), keyEquivalent: "")
+            let actionBox = StableMenuActionBox(action: action)
+            item.target = actionBox
+            item.representedObject = actionBox
+            item.isEnabled = isEnabled
+            item.state = isSelected ? .on : .off
+            configureImage(on: item)
+            configureTitle(on: item, fontPreset: fontPreset)
+            item.toolTip = toolTip
+            return item
+        case let .submenu(childItems):
+            let item = NSMenuItem(title: title, action: nil, keyEquivalent: "")
+            item.isEnabled = isEnabled
+            item.state = isSelected ? .on : .off
+            item.submenu = NSMenu.stableMenu(from: childItems, fontPreset: fontPreset)
+            configureImage(on: item)
+            configureTitle(on: item, fontPreset: fontPreset)
+            item.toolTip = toolTip
+            return item
+        case let .lazySubmenu(onOpen, items):
+            let item = NSMenuItem(title: title, action: nil, keyEquivalent: "")
+            item.isEnabled = isEnabled
+            item.state = isSelected ? .on : .off
+            let submenu = NSMenu()
+            submenu.autoenablesItems = false
+            let delegate = StableMenuSubmenuDelegate(
+                onOpen: onOpen,
+                items: items,
+                fontPreset: fontPreset
+            )
+            submenu.delegate = delegate
+            item.representedObject = delegate
+            item.submenu = submenu
+            configureImage(on: item)
+            configureTitle(on: item, fontPreset: fontPreset)
+            item.toolTip = toolTip
+            return item
+        }
+    }
+
+    private func configureImage(on item: NSMenuItem) {
+        guard let imageSystemName,
+              let image = NSImage(systemSymbolName: imageSystemName, accessibilityDescription: title)
+        else {
+            return
+        }
+        if style == .warning,
+           let warningImage = image.withSymbolConfiguration(.init(paletteColors: [.systemOrange]))
+        {
+            warningImage.isTemplate = false
+            item.image = warningImage
+        } else {
+            image.isTemplate = true
+            item.image = image
+        }
+    }
+
+    private func configureTitle(on item: NSMenuItem, fontPreset: FontScalePreset) {
+        var attributes: [NSAttributedString.Key: Any] = [
+            .font: fontPreset.nsFont(sizeAtNormal: CGFloat(NSFont.systemFontSize), rounded: false)
+        ]
+        if style == .warning {
+            attributes[.foregroundColor] = NSColor.systemOrange
+        }
+        item.attributedTitle = NSAttributedString(string: title, attributes: attributes)
+    }
+}
+
+private final class StableMenuSubmenuDelegate: NSObject, NSMenuDelegate {
+    private let onOpen: () -> Void
+    private let items: () -> [StableMenuItem]
+    private let fontPreset: FontScalePreset
+
+    init(
+        onOpen: @escaping () -> Void,
+        items: @escaping () -> [StableMenuItem],
+        fontPreset: FontScalePreset
+    ) {
+        self.onOpen = onOpen
+        self.items = items
+        self.fontPreset = fontPreset
+    }
+
+    func menuWillOpen(_ menu: NSMenu) {
+        onOpen()
+    }
+
+    func menuNeedsUpdate(_ menu: NSMenu) {
+        menu.removeAllItems()
+        for item in items() {
+            menu.addItem(item.makeMenuItem(fontPreset: fontPreset))
+        }
+    }
+}
+
+private extension NSMenu {
+    static func stableMenu(from items: [StableMenuItem], fontPreset: FontScalePreset = .current) -> NSMenu {
+        let menu = NSMenu()
+        menu.autoenablesItems = false
+        for item in items {
+            menu.addItem(item.makeMenuItem(fontPreset: fontPreset))
+        }
+        return menu
+    }
+}
+
+@MainActor
+private final class StableMenuPresenter: NSObject, ObservableObject, NSMenuDelegate {
+    weak var anchorView: NSView?
+    private var retainedMenu: NSMenu?
+
+    func present(_ items: [StableMenuItem]) {
+        guard !items.isEmpty else { return }
+        guard let anchorView else { return }
+
+        retainedMenu?.cancelTracking()
+        let menu = NSMenu.stableMenu(from: items, fontPreset: FontScalePreset.current)
+        menu.delegate = self
+        retainedMenu = menu
+
+        let popupPoint = NSPoint(x: 0, y: anchorView.bounds.height + 2)
+        menu.popUp(positioning: nil, at: popupPoint, in: anchorView)
+    }
+
+    func menuDidClose(_ menu: NSMenu) {
+        guard retainedMenu === menu else { return }
+        retainedMenu = nil
+    }
+}
+
+private final class StableMenuActionBox: NSObject {
+    let action: () -> Void
+
+    init(action: @escaping () -> Void) {
+        self.action = action
+    }
+
+    @objc func invoke() {
+        action()
+    }
+}
+
+@MainActor
+private struct StableMenuAnchorView: NSViewRepresentable {
+    @ObservedObject var presenter: StableMenuPresenter
+
+    func makeNSView(context: Context) -> NSView {
+        let view = NSView(frame: .zero)
+        presenter.anchorView = view
+        return view
+    }
+
+    func updateNSView(_ nsView: NSView, context: Context) {
+        presenter.anchorView = nsView
+    }
+
+    static func dismantleNSView(_ nsView: NSView, coordinator: ()) {
+        // Do not cancel tracking here. SwiftUI may rebuild the trigger while the AppKit
+        // menu is open; retaining the menu through `StableMenuPresenter` is the point.
+    }
+}

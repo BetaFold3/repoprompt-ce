@@ -1,3 +1,4 @@
+import RepoPromptUI
 import SwiftUI
 
 // MARK: - Workspace Switch Loading Overlay

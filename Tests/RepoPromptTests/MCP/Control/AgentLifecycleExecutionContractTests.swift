@@ -4,6 +4,7 @@ import MCP
 @testable import RepoPromptApp
 @testable import RepoPromptPlatform
 import RepoPromptShared
+@testable import RepoPromptUI
 import XCTest
 
 /// Plan §6.1/§6.3/§8: provider-family automatic lifecycle waits share one numeric authority,

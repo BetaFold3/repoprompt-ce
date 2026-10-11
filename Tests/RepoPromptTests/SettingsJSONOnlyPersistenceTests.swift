@@ -2,6 +2,7 @@ import Combine
 import Foundation
 @testable import RepoPromptAgentCore
 @testable import RepoPromptPlatform
+@testable import RepoPromptUI
 import XCTest
 @_spi(TestSupport) @testable import RepoPromptApp
 

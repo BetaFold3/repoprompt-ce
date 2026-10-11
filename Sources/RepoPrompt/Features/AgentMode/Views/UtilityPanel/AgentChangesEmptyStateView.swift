@@ -1,3 +1,4 @@
+import RepoPromptUI
 import SwiftUI
 
 /// The Changes segment's "nothing to show" card.

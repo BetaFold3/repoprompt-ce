@@ -1,4 +1,5 @@
 import AppKit
+import RepoPromptUI
 import SwiftUI
 
 struct UnifiedDiffDocument: Equatable, Hashable {

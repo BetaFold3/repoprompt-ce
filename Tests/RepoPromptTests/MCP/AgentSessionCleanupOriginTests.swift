@@ -3,6 +3,7 @@ import MCP
 @testable import RepoPromptAgentCore
 @_spi(TestSupport) @testable import RepoPromptApp
 @testable import RepoPromptPlatform
+@testable import RepoPromptUI
 import XCTest
 
 /// Plan §6.4: `agent_manage.cleanup_sessions` eligibility is provenance-scoped —

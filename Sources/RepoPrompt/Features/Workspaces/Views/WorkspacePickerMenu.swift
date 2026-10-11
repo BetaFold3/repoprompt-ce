@@ -1,3 +1,4 @@
+import RepoPromptUI
 import SwiftUI
 
 /// Compact, font‑scale aware workspace picker.

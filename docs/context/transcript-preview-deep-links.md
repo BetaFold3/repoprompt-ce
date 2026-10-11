@@ -28,9 +28,9 @@ Last-verified: 2026-08-30
 ## Owning source seams
 
 - Routing and reveal: `Sources/RepoPrompt/Features/AgentMode/Services/UtilityPanel/AgentTranscriptPreviewLinkResolver.swift`, `Sources/RepoPrompt/Features/AgentMode/Views/AgentModeView.swift`, `Sources/RepoPrompt/Features/AgentMode/Views/AgentModeDetailWithSidebarView.swift`, and `Sources/RepoPrompt/App/Notifications/AppNotifications.swift`.
-- Detection and rendered Markdown interaction: `Sources/RepoPrompt/Infrastructure/UI/Markdown/MarkdownFilePathLinkDetector.swift`, `EnhancedMarkdownCompiler.swift`, `MarkdownTextView.swift`, `EnhancedMarkdownView.swift`, and `MarkdownFileLinkInteraction.swift`.
-- User and badge surfaces: `Sources/RepoPrompt/Features/AgentMode/Views/AgentMessageBubble.swift` and `Sources/RepoPrompt/Infrastructure/UI/Components/CollapsibleUserMessage.swift`.
-- Tool results: `Sources/RepoPrompt/Features/AgentMode/Views/ToolCards/ToolResultMarkdownContent.swift` and `Sources/RepoPrompt/Infrastructure/UI/TextField/TextKitView.swift`.
+- Detection and rendered Markdown interaction: `Sources/RepoPromptUI/Markdown/MarkdownFilePathLinkDetector.swift`, `EnhancedMarkdownCompiler.swift`, `MarkdownTextView.swift`, `EnhancedMarkdownView.swift`, and `MarkdownFileLinkInteraction.swift`.
+- User and badge surfaces: `Sources/RepoPrompt/Features/AgentMode/Views/AgentMessageBubble.swift` and `Sources/RepoPromptUI/Components/CollapsibleUserMessage.swift`.
+- Tool results: `Sources/RepoPrompt/Features/AgentMode/Views/ToolCards/ToolResultMarkdownContent.swift` and `Sources/RepoPromptUI/TextField/TextKitView.swift`.
 
 ## Smallest validation routes
 

@@ -1,3 +1,4 @@
+import RepoPromptUI
 import SwiftUI
 
 /// Chrome for the right utility panel: header, segmented control, and content.

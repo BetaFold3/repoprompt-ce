@@ -10,6 +10,7 @@
 //  Claude tools runtime section, CLI Providers inline permissions
 //
 
+import RepoPromptUI
 import SwiftUI
 
 struct AgentProviderPermissionLevelSection: View {

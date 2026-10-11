@@ -5,6 +5,7 @@
 //  Created by Eric Provencher on 2024-10-30.
 //
 
+import RepoPromptUI
 import SwiftUI
 
 struct TrashButton: View {

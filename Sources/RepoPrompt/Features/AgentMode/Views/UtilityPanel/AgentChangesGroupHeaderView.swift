@@ -1,3 +1,4 @@
+import RepoPromptUI
 import SwiftUI
 
 /// Repository-local identity and compare controls for one ordered Changes group.

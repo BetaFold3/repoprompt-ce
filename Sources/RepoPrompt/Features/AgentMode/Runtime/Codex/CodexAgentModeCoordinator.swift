@@ -1,6 +1,7 @@
 import Foundation
 import MCP
 import RepoPromptPlatform
+import RepoPromptUI
 #if canImport(Darwin)
     import Darwin
 #endif

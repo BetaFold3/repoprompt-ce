@@ -1,6 +1,7 @@
 import Foundation
 import JSONSchema
 import MCP
+import RepoPromptUI
 
 /// Global, non-window-scoped MCP service for allowlisted RepoPrompt app settings.
 ///

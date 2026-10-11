@@ -1,3 +1,4 @@
+import RepoPromptUI
 import SwiftUI
 
 /// A button that triggers the recommendation wizard to open for a specific window.

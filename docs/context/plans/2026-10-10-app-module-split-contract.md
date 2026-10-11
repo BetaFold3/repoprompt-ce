@@ -131,9 +131,15 @@ Decisions: forwarding through one observable instead of SwiftUI environment valu
 Step 3a — done | rounds 0/2 | open: | downgraded: | assumed: | deferred: owner-approved smoke launch (font scale survives relaunch, app_settings font change, tooltips toggle, code font re-highlight) not run
 
 #### Step 3b — create `RepoPromptUI` and move the closed set
-Intent: move the files that close over Platform after 3a, with compiler-driven `package` access, test imports and tooling, as in Step 2b.
+Intent: move the files that close over Platform after 3a, with compiler-driven `package` access, test imports and tooling, as in Step 2b. Planned set: 67 files / ~14.6k lines (`slice3-probe/move3b.txt`); `CheckRecommendationsButton`, `NotificationsButtonView` and `SnippetPaletteHelper` close too but stay in App as product-feature UI.
 
-Step 3b — todo | rounds 0/2 | open: | downgraded: | assumed: | deferred:
+Budget used: about 2.5 hours (cumulative ~9 hours).
+
+Result: moved 66 files (~14.5k lines) into `Sources/RepoPromptUI`, which depends on no app module and only on the `Markdown`, `Neon` and `SwiftTreeSitter` packages, with 342 compiler-driven `package` declarations; build, the focused suites, the full suite (its failures match the Step 2a and 2b runs, and rerunning them leaves only the known baseline failure), identical discovery (6464 names), the unchanged ledger, format, lint, guardrails (A1 only) and the Xcode checks pass, and the universal release package build passes, so Slice 3 is complete and Slice 4 (Workspace) follows.
+
+Decisions: `AgentSidebarSizing` moved back to App after review because only Agent views use it; the font-scale DEBUG instrumentation moved with typography as UI-domain instrumentation with unchanged event names; the declared-but-unused Platform dependency was dropped, to be added when UI code first needs Platform; no guardrail checks module dependencies yet, as decided in Slice 1.
+
+Step 3b — done | rounds 0/2 | open: | downgraded: | assumed: A2 | deferred: OracleB F1 — `CodexAgentModeCoordinator` uses `MentionSuggestion` from UI; move `MentionModels` down during Slice 4/5
 
 ### Slice 4 — `RepoPromptWorkspace`
 Move workspace context, indexing and search, VCS and worktrees, domain diff and edit operations, workspace persistence, and non-UI CodeMap and workspace-file code. Prompt packaging (`ChatPreset`, `CopyPreset`, `PromptSection`) and anything that needs `AIModel` stay above, with only their workspace-only parts extracted down.
@@ -168,3 +174,4 @@ Step 6 — todo | rounds 0/2 | open: | downgraded: | assumed: | deferred:
 
 ## Assumed
 - A1 (Slice 1): `make guardrails` fails in this worktree only on `Scripts/check-agent-context` for two plans (`2026-10-05-transcript-inner-scroll-hang-fix-plan.md`, `2026-10-09-oracle-call-contract-hardening-plan.md`) that are orphaned at HEAD; another session's uncommitted edit in the main checkout links them. Treated as pre-existing and not fixed here; undo by linking them from a routed doc if that edit never lands.
+- A2 (Step 3b): "UI depends on Platform only" limits which app modules UI may use, so third-party packages (`Markdown`, `Neon`, `SwiftTreeSitter`) are allowed, as they already are for Platform. Undo by keeping the markdown and highlighting files in App, which would return most of Slice 3 to App.

@@ -1,6 +1,7 @@
 import Foundation
 import Markdown
 import MCP
+import RepoPromptUI
 import SwiftUI
 
 struct ToolMarkdownExpandedContent: View {

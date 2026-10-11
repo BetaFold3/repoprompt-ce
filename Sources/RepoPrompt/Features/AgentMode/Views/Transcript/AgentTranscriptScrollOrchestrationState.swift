@@ -1,3 +1,4 @@
+import RepoPromptUI
 import SwiftUI
 
 // These types split AgentModeChatDetailView's transcript scroll state into

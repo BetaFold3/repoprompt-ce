@@ -1,3 +1,4 @@
+import RepoPromptUI
 import SwiftUI
 
 func performAgentToolCardExpansionStateUpdateWithoutAnimation(_ update: () -> Void) {

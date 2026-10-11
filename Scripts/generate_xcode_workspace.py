@@ -119,6 +119,7 @@ def validate_manifest(manifest: dict, repo_root: Path) -> None:
         "RepoPromptApp",
         "RepoPromptAgentCore",
         "RepoPromptPlatform",
+        "RepoPromptUI",
         "RepoPromptMCP",
         "RepoPromptGateway",
         "RepoPromptRemoteWire",
@@ -167,6 +168,14 @@ def validate_manifest(manifest: dict, repo_root: Path) -> None:
             "Target 'RepoPromptPlatform' must use the Sources/RepoPromptPlatform implementation"
         )
 
+    repo_prompt_ui = targets["RepoPromptUI"]
+    if repo_prompt_ui.get("type") != "regular":
+        raise GeneratorError("Target 'RepoPromptUI' must remain an internal library target")
+    if repo_prompt_ui.get("path") != "Sources/RepoPromptUI":
+        raise GeneratorError(
+            "Target 'RepoPromptUI' must use the Sources/RepoPromptUI implementation"
+        )
+
     repo_prompt_remote_wire = targets["RepoPromptRemoteWire"]
     if repo_prompt_remote_wire.get("dependencies", []):
         raise GeneratorError("Target 'RepoPromptRemoteWire' must have no dependencies")
@@ -203,17 +212,18 @@ def validate_manifest(manifest: dict, repo_root: Path) -> None:
         "RepoPromptApp",
         "RepoPromptAgentCore",
         "RepoPromptPlatform",
+        "RepoPromptUI",
         "RepoPromptGateway",
         "RepoPromptRemoteWire",
     }
     if (
-        len(repo_prompt_tests.get("dependencies", [])) != 8
+        len(repo_prompt_tests.get("dependencies", [])) != 9
         or set(_by_name_dependencies(repo_prompt_tests)) != expected_test_targets
         or _product_dependencies(repo_prompt_tests) != expected_core_products
     ):
         raise GeneratorError(
             "RepoPromptTests must depend on RepoPromptApp, RepoPromptAgentCore, RepoPromptPlatform, "
-            "RepoPromptGateway, RepoPromptRemoteWire, and the RepoPromptCore Shared, ClientKit, and MCP products"
+            "RepoPromptUI, RepoPromptGateway, RepoPromptRemoteWire, and the RepoPromptCore Shared, ClientKit, and MCP products"
         )
 
     expected_resources = {("CodeMap/Fixtures", True), ("CodeMap/Goldens", True)}

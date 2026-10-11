@@ -1,3 +1,4 @@
+import RepoPromptUI
 import SwiftUI
 
 /// Quiet, local-only working-tree section filters.

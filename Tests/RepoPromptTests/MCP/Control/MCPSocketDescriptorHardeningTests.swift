@@ -5,6 +5,7 @@ import MCP
 @testable import RepoPromptApp
 @testable import RepoPromptPlatform
 import RepoPromptShared
+@testable import RepoPromptUI
 import XCTest
 
 final class MCPSocketDescriptorHardeningTests: XCTestCase {

@@ -1,5 +1,6 @@
 import AppKit
 import Combine
+import RepoPromptUI
 import SwiftUI
 
 @MainActor

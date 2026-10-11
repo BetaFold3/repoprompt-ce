@@ -1,6 +1,7 @@
 import AppKit
 import Foundation
 import ImageIO
+import RepoPromptUI
 
 // SEARCH-HELPER: rendered Markdown local image provider, preview image containment, image byte cap
 

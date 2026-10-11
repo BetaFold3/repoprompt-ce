@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptUI
 import SwiftUI
 
 struct ReadFileResultCard: View {

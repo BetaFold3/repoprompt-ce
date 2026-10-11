@@ -1,3 +1,4 @@
+import RepoPromptUI
 import SwiftUI
 
 // SEARCH-HELPER: AgentPreviewDocumentPickerView, preview document browser, previewable file list

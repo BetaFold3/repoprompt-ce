@@ -1,4 +1,5 @@
 import CoreGraphics
+import RepoPromptUI
 
 enum AgentTranscriptCollapsedCardMetrics {
     static var collapsedHeight: CGFloat {

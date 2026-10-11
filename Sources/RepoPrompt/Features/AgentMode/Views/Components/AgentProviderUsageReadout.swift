@@ -1,3 +1,4 @@
+import RepoPromptUI
 import SwiftUI
 
 /// Provider usage readout (latest-request cache-hit share and accumulated estimated cost) for one Agent Mode session.

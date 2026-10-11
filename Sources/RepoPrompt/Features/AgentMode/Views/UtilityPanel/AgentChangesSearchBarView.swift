@@ -1,4 +1,5 @@
 import AppKit
+import RepoPromptUI
 import SwiftUI
 
 /// Fixed, repository-spanning in-diff search chrome.

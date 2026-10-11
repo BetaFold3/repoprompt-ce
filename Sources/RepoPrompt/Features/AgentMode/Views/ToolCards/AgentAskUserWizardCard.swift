@@ -1,3 +1,4 @@
+import RepoPromptUI
 import SwiftUI
 
 /// Structured multi-question ask_user card shared by Agent Mode and Context Builder.

@@ -19,6 +19,7 @@
 
 import Combine
 import Foundation
+import RepoPromptUI
 import SwiftUI
 
 @MainActor

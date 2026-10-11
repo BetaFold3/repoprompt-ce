@@ -1,3 +1,4 @@
+import RepoPromptUI
 import SwiftUI
 
 /// Compact "deep link" row used by Agent Mode sidebar popovers (Models,

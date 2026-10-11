@@ -1,4 +1,5 @@
 import AppKit
+import RepoPromptUI
 import SwiftUI
 
 /// Sidebar vibrancy wrapper so the Settings search bar area blends with the

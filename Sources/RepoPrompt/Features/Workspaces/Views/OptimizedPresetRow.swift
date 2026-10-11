@@ -1,3 +1,4 @@
+import RepoPromptUI
 import SwiftUI
 
 /// Optimized preset row that minimizes re-renders

@@ -5,6 +5,7 @@
 //  Settings view for managing workspace operation permissions.
 //
 
+import RepoPromptUI
 import SwiftUI
 
 struct PermissionsSettingsView: View {

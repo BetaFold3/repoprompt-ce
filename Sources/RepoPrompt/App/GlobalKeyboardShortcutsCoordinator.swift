@@ -1,6 +1,7 @@
 import AppKit
 import Foundation
 import KeyboardShortcuts
+import RepoPromptUI
 #if DEBUG
     import OSLog
 #endif

@@ -4,6 +4,7 @@
 //  Created by RepoPrompt Code Assistant on 2025-07-07.
 
 import AppKit
+import RepoPromptUI
 import SwiftUI
 
 /// A single bell-shaped toolbar item that aggregates dismissible docs/tutorial notifications.

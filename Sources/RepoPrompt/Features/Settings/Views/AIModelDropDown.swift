@@ -1,4 +1,5 @@
 import Combine
+import RepoPromptUI
 import SwiftUI
 
 struct AIModelDropdown: View {

@@ -5,6 +5,7 @@
 //  Created by Eric Provencher on 2025-03-21.
 //
 
+import RepoPromptUI
 import SwiftUI
 
 /// Slimmed Advanced Settings page. Controls are grouped into focused sections

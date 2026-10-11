@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptUI
 
 /// AI-model adapter for the shared Oh My Pi presentation projector.
 enum OhMyPiModelMenuBuilder {

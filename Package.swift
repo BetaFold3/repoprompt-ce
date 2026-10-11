@@ -48,6 +48,7 @@ var packageDependencies: [Package.Dependency] = [
 var repoPromptAppDependencies: [Target.Dependency] = [
     "RepoPromptAgentCore",
     "RepoPromptPlatform",
+    "RepoPromptUI",
     .product(name: "RepoPromptShared", package: "RepoPromptCore"),
     "RepoPromptRemoteWire",
     "RepoPromptC", "CSwiftPCRE2", "TreeSitterScannerSupport",
@@ -93,6 +94,7 @@ var repoPromptTestDependencies: [Target.Dependency] = [
     "RepoPromptApp",
     "RepoPromptAgentCore",
     "RepoPromptPlatform",
+    "RepoPromptUI",
     "RepoPromptGateway",
     "RepoPromptRemoteWire",
     .product(name: "RepoPromptShared", package: "RepoPromptCore"),
@@ -153,6 +155,16 @@ let package = Package(
                 "CSwiftPCRE2"
             ],
             path: "Sources/RepoPromptPlatform",
+            swiftSettings: repoPromptLayerSwiftSettings
+        ),
+        .target(
+            name: "RepoPromptUI",
+            dependencies: [
+                .product(name: "Markdown", package: "swift-markdown"),
+                .product(name: "Neon", package: "Neon"),
+                .product(name: "SwiftTreeSitter", package: "SwiftTreeSitter")
+            ],
+            path: "Sources/RepoPromptUI",
             swiftSettings: repoPromptLayerSwiftSettings
         ),
         .target(

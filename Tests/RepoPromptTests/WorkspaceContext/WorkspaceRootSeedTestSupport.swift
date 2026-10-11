@@ -2,6 +2,7 @@ import Foundation
 @testable import RepoPromptAgentCore
 @testable import RepoPromptApp
 @testable import RepoPromptPlatform
+@testable import RepoPromptUI
 
 enum WorkspaceRootSeedTestSupport {
     static func oid(_ scalar: Character = "1") -> GitObjectID {

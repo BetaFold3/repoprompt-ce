@@ -4,6 +4,7 @@ import Foundation
 @testable import RepoPromptApp
 @testable import RepoPromptPlatform
 import RepoPromptShared
+@testable import RepoPromptUI
 import XCTest
 
 final class UnixSocketMCPTerminalCleanupTests: XCTestCase {
