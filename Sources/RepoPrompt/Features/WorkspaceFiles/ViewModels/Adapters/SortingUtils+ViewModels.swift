@@ -230,3 +230,36 @@ func sortSelectedFiles(
         }
     }
 }
+
+func sortFolderItems(
+    _ folderItems: [FileTreeItem],
+    by method: SortMethod,
+    folderTokenInfo: [String: TokenInfo]
+) -> [FileTreeItem] {
+    folderItems.sorted { lhs, rhs in
+        switch (lhs, rhs) {
+        case let (.folder(pathL, _), .folder(pathR, _)):
+            let lTokens = folderTokenInfo[pathL]?.count ?? 0
+            let rTokens = folderTokenInfo[pathR]?.count ?? 0
+
+            switch method {
+            case .tokenAscending:
+                return lTokens < rTokens
+            case .tokenDescending:
+                return lTokens > rTokens
+            case .nameAscending:
+                return pathL < pathR
+            case .nameDescending:
+                return pathL > pathR
+            default:
+                return pathL < pathR
+            }
+
+        case (.folder, .file), (.file, .folder):
+            return false
+
+        case (.file, .file):
+            return false
+        }
+    }
+}

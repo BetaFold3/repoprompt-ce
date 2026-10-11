@@ -166,6 +166,17 @@ Decisions: the recorder moved to Platform now rather than at the cut, so the com
 
 Step 4b — done | rounds 0/2 | open: | downgraded: | assumed: | deferred: OracleB F3 — narrow the recorder's exposed `State` if the cut shows users beyond the agent perf logger
 
+#### Step 4c — remaining adapter seams in place
+Intent: a rescan of the live code (evidence `step4c-probe/`) leaves 26 outside names, of which the diagnostics files, `MCPFilesystemConstants` and `AgentSessionWorktreeBinding` depend on nothing outside the seed and simply join the move, several are scanner false positives (`compare`, `insertionIndex`, `fileName`), and the workspace-switch providers, preset store and `WorkspaceSelectionCoordinator` have no workspace users and stay in App; the rest are split in place — hoist `StoredSelection`, and move the view-model tree renderers of `CodeMapExtractor`, the `FileViewModel` members of `SearchMatch`, `FileTreeItem` with its sorting helper, the `WorkspaceFilesViewModel`-bound `DiffParser` class, and the git diff DTO adapter into App files.
+
+Budget used: about 1 hour (cumulative ~13.5 hours).
+
+Result: the six splits moved code verbatim (a block-order move check leaves only ten `private` → internal relaxations for helpers now shared across files, plus file scaffolding), and the rescan leaves no workspace reference to App code except the files that join the move, scanner false positives and files that stay in App; build, 15 affected suites (361 tests, 0 failures), format and lint pass, so the seams for Slice 4 are complete and the next step is the move itself.
+
+Decisions: the moved `CodeMapExtractor` renderers got their own adapter file (`CodeMapExtractor+FileTreeRendering.swift`) instead of growing the existing one by 1,570 lines, and the `DiffParser` class lives in `WorkspaceFilesDiffParser.swift` because a module cannot hold two files of the same name.
+
+Step 4c — done | rounds 0/2 | open: | downgraded: | assumed: | deferred: OracleB P3-1 — at the cut, give `SearchFileDescriptor` a verbatim `package` memberwise init for `init(file:)` (don't route through `init(record:…)`); OracleB P3-3 — at the cut, keep the `countOnly` reset in a descriptor-based search in Workspace so `searchWithErrors` and `SearchContentResult` can return to `private`
+
 ### Slice 5 — AgentCore seams, in place
 Still inside `RepoPromptApp`:
 - hoist `TabSession` to `AgentTabSession`, together with the nested types the runtime uses, keeping the same object, owner, callbacks and ordering;
