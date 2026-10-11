@@ -324,6 +324,38 @@ extension AgentModeViewModel {
         /// Task that drains `pendingACPSteeringInstructions` one-by-one, waiting for MCP tool idle between each.
         var acpSteeringFlushTask: Task<Void, Never>?
 
+        /// Attention notifications only: which source rows are a run attempt's own output. Rows at or
+        /// after `minimumSourceSequenceIndex` (the next index when the attempt began), plus the one
+        /// earlier assistant row this attempt's authoritative final content actually replaced.
+        /// Runtime-only; never persisted, published, or used by transcript or MCP authorities.
+        struct AttentionTextProvenance: Equatable {
+            let attemptID: UUID
+            let minimumSourceSequenceIndex: Int
+            var rewrittenPreBoundaryAssistantRowID: UUID?
+        }
+
+        var attentionTextProvenance: AttentionTextProvenance?
+        /// Attention notifications only: one settled completion capture held while ACP steering
+        /// handoff work could still start a later attempt for it.
+        var attentionDeferredCompletion: AttentionNotificationAdmission.Capture?
+        /// Attention notifications only: ACP follow-up starts registered for observation whose start
+        /// has not returned yet.
+        var attentionOutstandingFollowUpStartIDs: Set<UUID> = []
+
+        /// Records that `attemptID`'s authoritative final content replaced an assistant row that
+        /// predates the attempt. Call only after the replacement; it verifies the row now holds `text`.
+        func recordAttentionFinalContentRewrite(attemptID: UUID, rowID: UUID, text: String) {
+            guard var provenance = attentionTextProvenance,
+                  provenance.attemptID == attemptID,
+                  let row = items.first(where: { $0.id == rowID }),
+                  row.kind == .assistant,
+                  row.text == text,
+                  row.sequenceIndex < provenance.minimumSourceSequenceIndex
+            else { return }
+            provenance.rewrittenPreBoundaryAssistantRowID = rowID
+            attentionTextProvenance = provenance
+        }
+
         /// Number of upcoming turnCompleted events that should be treated as intermediate
         /// because we successfully queued a follow-up prompt during the same run.
         var pendingSupersedingTurnCompletionsUpdatedAt: Date?
@@ -1549,6 +1581,10 @@ extension AgentModeViewModel {
                 bindingTransitionGeneration: bindingTransitionGeneration,
                 attemptID: attemptID,
                 turnEpoch: turnEpoch
+            )
+            attentionTextProvenance = AttentionTextProvenance(
+                attemptID: ownership.attemptID,
+                minimumSourceSequenceIndex: nextSequenceIndex
             )
             #if DEBUG
                 AgentModePerfDiagnostics.increment("run.lifecycle.attempt.started")

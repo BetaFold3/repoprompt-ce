@@ -207,6 +207,373 @@ final class AttentionNotificationAdmissionTests: XCTestCase {
         }
     }
 
+    // MARK: - Kill: ACP late steering
+
+    /// ACP late steering end to end: real view-model user turns on a fake local ACP process.
+    /// Steering A is held after its prompt returned while B waits behind the active flush, so A's
+    /// attempt commits before the flush hands B to a follow-up start. In either order of A's
+    /// admission and B's start, only B's completion notifies, once, with B's own text. When B's start
+    /// is refused (production `startAgentRun` refusal via the internal removal reservation), or no B
+    /// was queued and the flush finishes without a successor, A's original capture notifies once with
+    /// A's text.
+    func testACPLateSteeringNotifiesOnlyTheSettledTurnWithItsOwnText() async throws {
+        enum Schedule: String, CaseIterable {
+            case admissionBeforeLaterStart, laterStartBeforeAdmission, laterStartRefused, flushFinishedWithoutSuccessor
+        }
+        for schedule in Schedule.allCases {
+            let name = schedule.rawValue
+            let fixture = try makeACPLateSteeringFixture()
+            let session = fixture.live.session
+            let tabID = fixture.live.tabID
+
+            _ = fixture.vm.submitUserTurn(text: "Root turn", tabID: tabID)
+            try await waitUntil("\(name): root prompt held", timeout: .seconds(30)) {
+                fixture.fakeCount("prompt") >= 1 && session.runState == .running
+                    && session.acpController != nil && session.activeRunAttemptID != nil
+            }
+            let attemptA = try XCTUnwrap(session.activeRunAttemptID, name)
+
+            // Steering A through the actual ACP route: the flush cancels the root prompt and A's
+            // steering prompt is held on the wire.
+            _ = await ACPActiveSteeringPromptTestHook.$afterPromptReturned.withValue({ @MainActor in
+                await fixture.gate.pass()
+            }) {
+                fixture.vm.submitUserTurn(text: "Steering A", tabID: tabID)
+            }
+            try await waitUntil("\(name): steering A held", timeout: .seconds(30)) {
+                fixture.fakeCount("cancel") >= 1 && fixture.fakeCount("prompt") >= 2
+                    && session.pendingACPSteeringInstructions.isEmpty && session.acpSteeringFlushTask != nil
+                    && session.pendingSupersedingTurnCompletions == 0 && session.runState == .running
+            }
+
+            // B is accepted behind the active flush.
+            if schedule != .flushFinishedWithoutSuccessor {
+                _ = fixture.vm.submitUserTurn(text: "Steering B", tabID: tabID)
+                await Task { @MainActor in }.value
+                XCTAssertEqual(session.pendingACPSteeringInstructions.count, 1, name)
+                XCTAssertNotNil(session.acpSteeringFlushTask, name)
+            }
+
+            // A completes on the wire; its attempt commits while the flush is held after A's prompt.
+            XCTAssertTrue(fixture.control("complete Answer A"), name)
+            try await waitUntil("\(name): A committed while the flush is held", timeout: .seconds(30)) {
+                fixture.gate.arrivals >= 1
+                    && session.lastTerminalCommitRevision?.ownership.attemptID == attemptA
+                    && !session.terminalCommitInProgress && session.runState == .completed
+            }
+            let keyA = AttentionNotificationEventKey.turnCompleted(sessionID: fixture.live.sessionID, attemptID: attemptA)
+            let laterStartOwned: () -> Bool = {
+                session.activeRunOwnership.map { $0.attemptID != attemptA } ?? false
+            }
+
+            switch schedule {
+            case .admissionBeforeLaterStart:
+                // While the flush continuation is still held, A is held outside admission: no record
+                // and nothing pending, so releasing the admission fence first cannot send it.
+                XCTAssertEqual(session.attentionDeferredCompletion?.event.key, keyA, name)
+                XCTAssertNil(fixture.admission.records[keyA], name)
+                XCTAssertFalse(fixture.admission.pendingEventKeys.contains(keyA), name)
+                fixture.fence.release()
+                fixture.gate.release()
+                try await waitUntil("\(name): later start owned", timeout: .seconds(30)) { laterStartOwned() }
+            case .laterStartBeforeAdmission:
+                fixture.gate.release()
+                try await waitUntil("\(name): later start owned", timeout: .seconds(30)) { laterStartOwned() }
+                fixture.fence.release()
+            case .laterStartRefused, .flushFinishedWithoutSuccessor:
+                fixture.fence.release()
+                let reservation = UUID()
+                fixture.vm.reservedComposeTabIDs[tabID] = reservation
+                fixture.gate.release()
+                let record = try await waitForRecord(fixture.admission, keyA) { $0 != .admitted }
+                fixture.vm.reservedComposeTabIDs.removeValue(forKey: tabID)
+                XCTAssertNil(session.acpSteeringFlushTask, name)
+                XCTAssertEqual(record, .delivered(.sent), name)
+                let events = await fixture.delivery.events
+                XCTAssertEqual(events.map(\.key), [keyA], name)
+                XCTAssertEqual(events.map(\.content), [.turnCompleted(finalAssistantText: "Answer A")], name)
+                XCTAssertEqual(fixture.fakeCount("prompt"), 2, "\(name): the refused start never prompted")
+                XCTAssertEqual(session.runState, .completed, name)
+                XCTAssertEqual(session.lastTerminalCommitRevision?.ownership.attemptID, attemptA, name)
+                XCTAssertTrue(session.pendingACPSteeringInstructions.isEmpty, name)
+                XCTAssertTrue(session.pendingInstructions.isEmpty, name)
+                continue
+            }
+            let attemptB = try XCTUnwrap(session.activeRunOwnership?.attemptID, name)
+            let keyB = AttentionNotificationEventKey.turnCompleted(sessionID: fixture.live.sessionID, attemptID: attemptB)
+
+            // B completes through its actual prompt on the fake process.
+            try await waitUntil("\(name): B prompt held", timeout: .seconds(30)) { fixture.fakeCount("prompt") >= 3 }
+            XCTAssertTrue(fixture.control("complete Answer B"), name)
+            try await waitUntil("\(name): A and B decided", timeout: .seconds(30)) {
+                session.runState == .completed
+                    && (fixture.admission.records[keyA].map { $0 != .admitted } ?? false)
+                    && (fixture.admission.records[keyB].map { $0 != .admitted } ?? false)
+            }
+            XCTAssertEqual(fixture.admission.records[keyA], .suppressed(.eventNoLongerCurrent), "\(name): A with B pending never notifies")
+            let events = await fixture.delivery.events
+            XCTAssertEqual(events.map(\.key), [keyB], "\(name): exactly the final turn notifies")
+            XCTAssertEqual(
+                events.map(\.content),
+                [.turnCompleted(finalAssistantText: "Answer B")],
+                "\(name): the final turn notifies once with its own text"
+            )
+        }
+    }
+
+    /// The view model's own ACP fallback: steering accepted while the run was active finds the
+    /// attempt already committed, so the view model starts it directly. A refused start (production
+    /// `startAgentRun` refusal via the internal removal reservation) leaves the completion settled
+    /// idle: its original capture notifies once with that turn's text. No provider process launches.
+    func testACPFallbackStartRefusedNotifiesTheOriginalCompletionOnce() async throws {
+        let fixture = makeFixture()
+        let root = makeSession(fixture.vm)
+        let session = root.session
+        session.selectedAgent = .openCode
+        let ownership = beginTurn(session, user: "go", assistant: nil)
+        let controller = try ACPAgentSessionController(
+            provider: ACPLateSteeringProvider(commandPath: "/usr/bin/true", environment: [:]),
+            runRequest: ACPRunRequest(
+                agentKind: .openCode,
+                modelString: nil,
+                workspacePath: FileManager.default.currentDirectoryPath,
+                resumeSessionID: nil,
+                attachments: [],
+                taskLabelKind: nil
+            )
+        )
+        session.acpController = controller
+
+        // B is accepted for live ACP steering while the run is active; A's answer lands after it.
+        _ = fixture.vm.submitUserTurn(text: "steer B", tabID: root.tabID)
+        XCTAssertEqual(session.pendingACPSteeringInstructions.count, 1)
+        session.appendItem(.assistant("ACP answer A", sequenceIndex: session.nextSequenceIndex))
+        let reservation = UUID()
+        fixture.vm.reservedComposeTabIDs[root.tabID] = reservation
+
+        // The attempt commits before the queued steering's flush runs.
+        let commit = await fixture.vm.test_terminalCommitBarrier().commit(completedRequest(session, ownership))
+        let revision = try XCTUnwrap(commit)
+        let key = AttentionNotificationEventKey.turnCompleted(sessionID: root.sessionID, attemptID: ownership.attemptID)
+        let record = try await waitForRecord(fixture.admission, key) { $0 != .admitted }
+        try await waitUntil("the fallback start returned") {
+            session.pendingACPSteeringInstructions.isEmpty && !session.mcpFollowUpRunPending
+        }
+        fixture.vm.reservedComposeTabIDs.removeValue(forKey: root.tabID)
+
+        XCTAssertEqual(record, .delivered(.sent))
+        let events = await fixture.delivery.events
+        XCTAssertEqual(events.map(\.key), [key])
+        XCTAssertEqual(events.map(\.content), [.turnCompleted(finalAssistantText: "ACP answer A")])
+        XCTAssertEqual(session.runState, .completed)
+        XCTAssertNil(session.activeRunOwnership)
+        XCTAssertEqual(session.lastTerminalCommitRevision?.commitID, revision.commitID)
+        XCTAssertTrue(session.pendingInstructions.isEmpty)
+        session.acpController = nil
+        await controller.shutdown()
+    }
+
+    /// A selected generic follow-up refused before ownership while an ACP follow-up start is still
+    /// outstanding holds the original capture instead of deciding it. When that ACP start returns
+    /// refused too, the capture is released and notifies once with that turn's text. Refusal fixture
+    /// via the internal removal reservation; no provider process launches.
+    func testGenericFollowUpRefusedDuringACPHandoffHoldsThenNotifiesOnce() async throws {
+        let fixture = makeFixture()
+        let root = makeSession(fixture.vm)
+        let session = root.session
+        // Codex uses the fixture's no-op stub, so even a regressed refusal launches no provider.
+        session.selectedAgent = .codexExec
+        session.pendingInstructions = ["queued follow-up"]
+        let ownership = beginTurn(session, user: "first", assistant: "Answer during the ACP handoff")
+        let observeACPStart = fixture.vm.beginAttentionFollowUpObservation(for: session)
+        let commit = await fixture.vm.test_terminalCommitBarrier()
+            .commit(completedRequest(session, ownership, supportsFollowUp: true))
+        let revision = try XCTUnwrap(commit)
+        XCTAssertEqual(revision.successorKind, .relatedFollowUp)
+        let key = AttentionNotificationEventKey.turnCompleted(sessionID: root.sessionID, attemptID: ownership.attemptID)
+        let reservation = UUID()
+        fixture.vm.reservedComposeTabIDs[root.tabID] = reservation
+        defer {
+            if fixture.vm.reservedComposeTabIDs[root.tabID] == reservation {
+                fixture.vm.reservedComposeTabIDs.removeValue(forKey: root.tabID)
+            }
+        }
+
+        // The refused generic start returned: the capture is held, not decided.
+        try await waitUntil("the refused generic start held the capture") {
+            session.attentionDeferredCompletion?.event.key == key
+        }
+        fixture.vm.reservedComposeTabIDs.removeValue(forKey: root.tabID)
+        XCTAssertNil(fixture.admission.records[key])
+        XCTAssertTrue(fixture.admission.pendingEventKeys.isEmpty)
+        XCTAssertEqual(session.runState, .completed)
+        XCTAssertNil(session.activeRunOwnership)
+        XCTAssertTrue(session.pendingInstructions.isEmpty)
+
+        // The ACP start returns refused: the original capture is decided once.
+        observeACPStart()
+        let record = try await waitForRecord(fixture.admission, key) { $0 != .admitted }
+        observeACPStart()
+        XCTAssertEqual(record, .delivered(.sent))
+        let events = await fixture.delivery.events
+        XCTAssertEqual(events.map(\.key), [key])
+        XCTAssertEqual(events.map(\.content), [.turnCompleted(finalAssistantText: "Answer during the ACP handoff")])
+        XCTAssertNil(session.attentionDeferredCompletion)
+        XCTAssertTrue(session.attentionOutstandingFollowUpStartIDs.isEmpty)
+        XCTAssertEqual(session.lastTerminalCommitRevision?.commitID, revision.commitID)
+    }
+
+    /// A completion settled while ACP steering is queued is held outside admission until the last
+    /// observed handoff returned; repeated observations decide it once, and admission still rejects
+    /// an enablement or binding change made while it was held.
+    func testHeldACPCompletionIsDecidedOnceAfterTheLastHandoffReturned() async throws {
+        enum HeldChange: String, CaseIterable {
+            case none, disabled, rebound
+        }
+        for change in HeldChange.allCases {
+            let fixture = makeFixture()
+            let barrier = makeBarrier(fixture.vm)
+            let root = makeSession(fixture.vm)
+            let session = root.session
+            let ownership = beginTurn(session, user: "go", assistant: "Held answer")
+            session.pendingACPSteeringInstructions = [.init(
+                id: UUID(),
+                targetRunID: session.runID,
+                targetRunAttemptID: ownership.attemptID,
+                providerText: "steer",
+                interruptedPromptProviderText: nil,
+                attachments: [],
+                taggedFileAttachments: [],
+                draftText: "steer",
+                optimisticUserItemID: nil,
+                createdAt: Date()
+            )]
+            _ = await barrier.commit(completedRequest(session, ownership))
+            let key = AttentionNotificationEventKey.turnCompleted(sessionID: root.sessionID, attemptID: ownership.attemptID)
+            XCTAssertNil(fixture.admission.records[key], change.rawValue)
+            XCTAssertTrue(fixture.admission.pendingEventKeys.isEmpty, "\(change.rawValue): held outside the queue")
+
+            // The handoff dequeues the steering and starts a follow-up; progress alone does not release.
+            let observeStart = fixture.vm.beginAttentionFollowUpObservation(for: session)
+            session.pendingACPSteeringInstructions.removeAll()
+            fixture.vm.attentionCompletionProgress(for: session)
+            XCTAssertNil(fixture.admission.records[key], change.rawValue)
+            XCTAssertTrue(fixture.admission.pendingEventKeys.isEmpty, change.rawValue)
+
+            switch change {
+            case .none:
+                break
+            case .disabled:
+                fixture.admission.setEnabled(false)
+            case .rebound:
+                session.testInstallPersistentSessionBinding(sessionID: UUID())
+            }
+            observeStart()
+            observeStart()
+            let record = try await waitForRecord(fixture.admission, key) { $0 != .admitted }
+            observeStart()
+            let events = await fixture.delivery.events
+            switch change {
+            case .none:
+                XCTAssertEqual(record, .delivered(.sent))
+                XCTAssertEqual(events.map(\.content), [.turnCompleted(finalAssistantText: "Held answer")])
+            case .disabled:
+                XCTAssertEqual(record, .suppressed(.enableChanged))
+                XCTAssertTrue(events.isEmpty)
+            case .rebound:
+                XCTAssertEqual(record, .suppressed(.eventNoLongerCurrent))
+                XCTAssertTrue(events.isEmpty)
+            }
+            XCTAssertNil(session.attentionDeferredCompletion, change.rawValue)
+            XCTAssertTrue(session.attentionOutstandingFollowUpStartIDs.isEmpty, change.rawValue)
+        }
+    }
+
+    /// Late steering places B's queued user row before A's answer, so B's authoritative final content
+    /// (through the guarded stream handler) replaces A's earlier row in place. That replaced row is
+    /// B's output: B notifies with the latest replacement while A keeps the text captured at its own
+    /// commit. A stale attempt's event changes neither the transcript nor the provenance; a new attempt
+    /// and the actual chat reset carry none of it forward.
+    func testFinalContentReplacingAnEarlierRowNotifiesThatAttemptsText() async throws {
+        let fixture = makeFixture()
+        let barrier = makeBarrier(fixture.vm)
+        let root = makeSession(fixture.vm)
+        let session = root.session
+
+        let attemptA = beginTurn(session, user: "A", assistant: nil)
+        session.appendItem(.user("B", sequenceIndex: session.nextSequenceIndex))
+        session.appendItem(.assistant("Answer A", sequenceIndex: session.nextSequenceIndex))
+        _ = await barrier.commit(completedRequest(session, attemptA))
+        let keyA = AttentionNotificationEventKey.turnCompleted(sessionID: root.sessionID, attemptID: attemptA.attemptID)
+        try await waitForRecord(fixture.admission, keyA) { $0 == .delivered(.sent) }
+
+        let attemptB = beginTurn(session, user: nil, assistant: nil)
+        let runID = try XCTUnwrap(session.runID)
+        let itemsBeforeStale = session.items
+        await fixture.vm.test_handleStreamResult(
+            AIStreamResult(type: "final_content", text: "Stale final"),
+            session: session,
+            runID: runID,
+            runAttemptID: attemptA.attemptID
+        )
+        XCTAssertEqual(session.items, itemsBeforeStale, "A stale attempt's event changes nothing")
+        XCTAssertEqual(
+            session.attentionTextProvenance,
+            .init(attemptID: attemptB.attemptID, minimumSourceSequenceIndex: session.nextSequenceIndex)
+        )
+        for text in ["Final B draft", "Final B"] {
+            await fixture.vm.test_handleStreamResult(
+                AIStreamResult(type: "final_content", text: text),
+                session: session,
+                runID: runID,
+                runAttemptID: attemptB.attemptID
+            )
+        }
+        let replaced = try XCTUnwrap(session.items.last)
+        XCTAssertEqual(replaced.kind, .assistant)
+        XCTAssertEqual(replaced.text, "Final B")
+        XCTAssertEqual(session.attentionTextProvenance?.rewrittenPreBoundaryAssistantRowID, replaced.id)
+
+        _ = await barrier.commit(completedRequest(session, attemptB))
+        let keyB = AttentionNotificationEventKey.turnCompleted(sessionID: root.sessionID, attemptID: attemptB.attemptID)
+        try await waitForRecord(fixture.admission, keyB) { $0 == .delivered(.sent) }
+        let events = await fixture.delivery.events
+        XCTAssertEqual(events.map(\.key), [keyA, keyB])
+        XCTAssertEqual(events.map(\.content), [
+            .turnCompleted(finalAssistantText: "Answer A"),
+            .turnCompleted(finalAssistantText: "Final B")
+        ])
+
+        // A new attempt starts with no replaced row; its own replacement is cleared by the reset.
+        let attemptC = beginTurn(session, user: nil, assistant: nil)
+        XCTAssertNil(session.attentionTextProvenance?.rewrittenPreBoundaryAssistantRowID)
+        await fixture.vm.test_handleStreamResult(
+            AIStreamResult(type: "final_content", text: "Final C"),
+            session: session,
+            runID: runID,
+            runAttemptID: attemptC.attemptID
+        )
+        XCTAssertEqual(session.attentionTextProvenance?.rewrittenPreBoundaryAssistantRowID, replaced.id)
+        // C settles while an ACP follow-up start is still outstanding, so its completion is held;
+        // the reset decides it as no longer current and keeps the outstanding observation.
+        let observeACPStart = fixture.vm.beginAttentionFollowUpObservation(for: session)
+        _ = await barrier.commit(completedRequest(session, attemptC))
+        let keyC = AttentionNotificationEventKey.turnCompleted(sessionID: root.sessionID, attemptID: attemptC.attemptID)
+        XCTAssertEqual(session.attentionDeferredCompletion?.event.key, keyC)
+        XCTAssertNil(fixture.admission.records[keyC])
+        fixture.vm.clearChat(tabID: root.tabID)
+        XCTAssertEqual(session.nextSequenceIndex, 0)
+        XCTAssertNil(session.attentionTextProvenance)
+        XCTAssertNil(session.attentionDeferredCompletion)
+        XCTAssertEqual(fixture.admission.records[keyC], .suppressed(.eventNoLongerCurrent))
+        XCTAssertTrue(fixture.admission.pendingEventKeys.isEmpty)
+        XCTAssertEqual(session.attentionOutstandingFollowUpStartIDs.count, 1)
+        observeACPStart()
+        XCTAssertTrue(session.attentionOutstandingFollowUpStartIDs.isEmpty)
+        let finalEvents = await fixture.delivery.events
+        XCTAssertEqual(finalEvents.map(\.key), [keyA, keyB])
+    }
+
     /// A completion without new assistant text never carries an earlier turn's text, and long final
     /// text is captured whole (splitting belongs to the transport) (OracleB F2).
     func testCompletionTextIsOnlyThatTurnsFinalTextAndLongTextIsCapturedWhole() async throws {
@@ -219,6 +586,8 @@ final class AttentionNotificationAdmissionTests: XCTestCase {
         _ = await barrier.commit(completedRequest(root.session, first))
         let firstKey = AttentionNotificationEventKey.turnCompleted(sessionID: root.sessionID, attemptID: first.attemptID)
         try await waitForRecord(fixture.admission, firstKey) { $0 == .delivered(.sent) }
+        // Parity with the live terminal resolver for an ordinary turn (no steering or rewrite).
+        let resolvedFirst = fixture.vm.mcpResolvedAssistantPreview(session: root.session, status: .completed)
 
         let second = beginTurn(root.session, user: "silent", assistant: nil)
         _ = await barrier.commit(completedRequest(root.session, second))
@@ -232,6 +601,7 @@ final class AttentionNotificationAdmissionTests: XCTestCase {
         }
         XCTAssertEqual(firstText?.count, longText.count)
         XCTAssertEqual(firstText, longText)
+        XCTAssertEqual(firstText, resolvedFirst, "Same text as mcpResolvedAssistantPreview for .completed")
         XCTAssertEqual(events.last?.content, .turnCompleted(finalAssistantText: nil))
     }
 
@@ -1113,6 +1483,176 @@ final class AttentionNotificationAdmissionTests: XCTestCase {
         return Fixture(vm: vm, admission: admission, delivery: delivery)
     }
 
+    private struct ACPLateSteeringFixture {
+        let vm: AgentModeViewModel
+        let admission: AttentionNotificationAdmission
+        let delivery: StubDelivery
+        let fence: AdmissionFence
+        let gate: ACPPromptReturnGate
+        let live: LiveSession
+        /// Writes one control line (`complete <text>`) to the fake process.
+        let control: (String) -> Bool
+        /// Count of recorded fake-process events (`prompt`, `cancel`, `complete`).
+        let fakeCount: (String) -> Int
+    }
+
+    /// A view model whose OpenCode ACP runs use the fake local ACP process (`ACPLateSteeringFakeServer`)
+    /// through the production controller, with stub delivery and a pre-admission fence. Teardown
+    /// releases every hold, stops runs, controllers, and the process, and removes its files.
+    private func makeACPLateSteeringFixture() throws -> ACPLateSteeringFixture {
+        let fileManager = FileManager.default
+        let root = fileManager.temporaryDirectory
+            .appendingPathComponent("AttentionACP-\(UUID().uuidString)", isDirectory: true)
+        let controlPath = root.appendingPathComponent("control.fifo").path
+        let recordURL = root.appendingPathComponent("record.jsonl")
+        let pidURL = root.appendingPathComponent("pid.txt")
+        let scriptURL = root.appendingPathComponent("fake_acp.py")
+        try fileManager.createDirectory(at: root, withIntermediateDirectories: true)
+        guard mkfifo(controlPath, 0o600) == 0 else {
+            XCTFail("mkfifo failed errno=\(errno)")
+            throw CancellationError()
+        }
+        try ACPLateSteeringFakeServer.script.write(to: scriptURL, atomically: true, encoding: .utf8)
+        try fileManager.setAttributes([.posixPermissions: 0o755], ofItemAtPath: scriptURL.path)
+
+        let provider = ACPLateSteeringProvider(
+            commandPath: scriptURL.path,
+            environment: [
+                "FAKE_ACP_RECORD_PATH": recordURL.path,
+                "FAKE_ACP_CONTROL_PATH": controlPath,
+                "FAKE_ACP_PID_PATH": pidURL.path
+            ]
+        )
+        let controllers = ACPControllerTracker()
+        let vm = AgentModeViewModel(
+            testWindowID: 1,
+            testWorkspacePath: root.path,
+            testWorkspaceDirectory: root,
+            codexControllerFactory: { _, _, _, _, _, _ in
+                LifecycleNoopCodexController(recorder: LifecycleRecorder())
+            },
+            acpProviderFactory: { agent, _ in
+                guard agent == .openCode else { return nil }
+                return provider
+            },
+            acpControllerFactory: { provider, request in
+                let controller = try ACPAgentSessionController(provider: provider, runRequest: request)
+                controllers.add(controller)
+                return controller
+            },
+            connectionPolicyInstaller: { clientName, windowID, restrictedTools, oneShot, reason, ttl, tabID, runID, additionalTools, allowedToolsOverride, sessionProfile, purpose, taskLabelKind, allowsAgentExternalControlTools, requiresExpectedAgentPID in
+                // The production installer's call, then the routing signal the fake process cannot send.
+                await ServerNetworkManager.shared.installClientConnectionPolicy(
+                    for: clientName,
+                    windowID: windowID,
+                    restrictedTools: restrictedTools,
+                    oneShot: oneShot,
+                    reason: reason,
+                    ttl: ttl,
+                    tabID: tabID,
+                    runID: runID,
+                    additionalTools: additionalTools,
+                    allowedToolsOverride: allowedToolsOverride,
+                    sessionProfile: sessionProfile,
+                    purpose: purpose,
+                    taskLabelKind: taskLabelKind,
+                    allowsAgentExternalControlTools: allowsAgentExternalControlTools,
+                    requiresExpectedAgentPID: requiresExpectedAgentPID
+                )
+                if let runID {
+                    await MCPRoutingWaiter.notifyRouted(runID: runID)
+                }
+            }
+        )
+        let delivery = StubDelivery(mode: .succeed)
+        let fence = AdmissionFence()
+        let gate = ACPPromptReturnGate()
+        let admission = AttentionNotificationAdmission(environment: .init(
+            delivery: delivery,
+            idleSeconds: { 301 },
+            beforeAdmission: { key in await fence.pause(key) }
+        ))
+        admission.setEnabled(true)
+        vm.attentionNotificationAdmission = admission
+        let live = makeSession(vm)
+        live.session.selectedAgent = .openCode
+
+        addTeardownBlock { @MainActor in
+            fence.release()
+            gate.release()
+            let session = live.session
+            if session.runState.isActive {
+                await Self.boundedTeardownStep("cancelAgentRun") { await vm.cancelAgentRun(tabID: live.tabID) }
+            }
+            if let agentTask = session.agentTask {
+                await Self.boundedTeardownStep("agentTask") { await agentTask.value }
+            }
+            await Self.boundedTeardownStep("prepareForWindowClose") { await vm.prepareForWindowClose() }
+            for controller in controllers.all() {
+                await Self.boundedTeardownStep("controller shutdown") { await controller.shutdown() }
+            }
+            if let pidText = try? String(contentsOf: pidURL, encoding: .utf8),
+               let pid = pid_t(pidText.trimmingCharacters(in: .whitespacesAndNewlines))
+            {
+                let clock = ContinuousClock()
+                let deadline = clock.now.advanced(by: .seconds(30))
+                while kill(pid, 0) == 0, clock.now < deadline {
+                    await Task.yield()
+                }
+                if kill(pid, 0) == 0 {
+                    _ = kill(pid, SIGKILL)
+                    XCTFail("fake ACP process \(pid) did not exit")
+                }
+            }
+            await ServerNetworkManager.shared.cleanupRunRoutingState(forTabID: live.tabID, windowID: 1)
+            try? fileManager.removeItem(at: root)
+        }
+
+        return ACPLateSteeringFixture(
+            vm: vm,
+            admission: admission,
+            delivery: delivery,
+            fence: fence,
+            gate: gate,
+            live: live,
+            control: { line in
+                let fd = open(controlPath, O_WRONLY | O_NONBLOCK)
+                guard fd >= 0 else { return false }
+                defer { close(fd) }
+                let bytes = Array((line + "\n").utf8)
+                return bytes.withUnsafeBytes { write(fd, $0.baseAddress, $0.count) } == bytes.count
+            },
+            fakeCount: { event in
+                guard let text = try? String(contentsOf: recordURL, encoding: .utf8) else { return 0 }
+                return text.split(separator: "\n").count(where: { line in
+                    let record = try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any]
+                    return record?["event"] as? String == event
+                })
+            }
+        )
+    }
+
+    /// Runs one teardown step with a bounded, yield-based wait (no sleeps); cancels and fails on timeout.
+    private static func boundedTeardownStep(
+        _ description: String,
+        _ operation: @escaping @MainActor () async -> Void
+    ) async {
+        let done = ACPTeardownFlag()
+        let task = Task { @MainActor in
+            await operation()
+            done.isSet = true
+        }
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: .seconds(30))
+        while !done.isSet, clock.now < deadline {
+            await Task.yield()
+        }
+        if !done.isSet {
+            task.cancel()
+            XCTFail("teardown step did not return: \(description)")
+        }
+    }
+
     private func makeSession(
         _ vm: AgentModeViewModel,
         parent: UUID? = nil,
@@ -1493,4 +2033,199 @@ private final class AdmissionFence {
         paused.forEach { $0.resume() }
         paused.removeAll()
     }
+}
+
+/// Holds an ACP steering flush continuation after its prompt returned (via
+/// `ACPActiveSteeringPromptTestHook`); once released, later arrivals pass straight through.
+@MainActor
+private final class ACPPromptReturnGate {
+    private var held: [CheckedContinuation<Void, Never>] = []
+    private var isReleased = false
+    private(set) var arrivals = 0
+
+    func pass() async {
+        arrivals += 1
+        if !isReleased {
+            await withCheckedContinuation { held.append($0) }
+        }
+    }
+
+    func release() {
+        isReleased = true
+        held.forEach { $0.resume() }
+        held.removeAll()
+    }
+}
+
+@MainActor
+private final class ACPTeardownFlag {
+    var isSet = false
+}
+
+private final class ACPControllerTracker: @unchecked Sendable {
+    private let lock = NSLock()
+    private var controllers: [ACPAgentSessionController] = []
+
+    func add(_ controller: ACPAgentSessionController) {
+        lock.withLock { controllers.append(controller) }
+    }
+
+    func all() -> [ACPAgentSessionController] {
+        lock.withLock { controllers }
+    }
+}
+
+/// OpenCode-identified ACP provider for a local fake command; session updates go through the
+/// default ACP normalizer.
+private struct ACPLateSteeringProvider: ACPAgentProvider {
+    let providerID: ACPProviderID = .openCode
+    let commandPath: String
+    let environment: [String: String]
+
+    func support(for _: ACPRunRequest) async throws -> ACPSupportResult {
+        .supported
+    }
+
+    func makeLaunchConfiguration(for request: ACPRunRequest) throws -> ACPLaunchConfiguration {
+        ACPLaunchConfiguration(
+            providerID: providerID,
+            command: commandPath,
+            arguments: [],
+            environment: environment,
+            workingDirectory: request.workspacePath,
+            additionalPathHints: [],
+            enableDebugLogging: false
+        )
+    }
+
+    func makeSessionConfiguration(
+        for request: ACPRunRequest,
+        mcpServer _: RepoPromptMCPServerConfiguration
+    ) throws -> ACPSessionConfiguration {
+        ACPSessionConfiguration(
+            mode: .new,
+            workingDirectory: request.workspacePath ?? FileManager.default.temporaryDirectory.path,
+            mcpServers: []
+        )
+    }
+
+    func buildPromptBlocks(for message: AgentMessage, request _: ACPRunRequest) throws -> [[String: Any]] {
+        [["type": "text", "text": message.userMessage]]
+    }
+
+    func normalizeSessionUpdate(_ payload: [String: Any], sessionID _: String) -> [NormalizedAgentRuntimeEvent] {
+        ACPDefaultSessionUpdateNormalizer.normalize(payload, providerID: providerID)
+    }
+
+    func normalizeError(_ error: Error) -> Error {
+        error
+    }
+}
+
+/// Fake local ACP process: holds every `session/prompt` until a `complete <text>` control line
+/// arrives on its FIFO (then streams that text and answers `end_turn`); `session/cancel` answers
+/// every held prompt `cancelled`. Records prompts, cancels, and completions as JSON lines.
+private enum ACPLateSteeringFakeServer {
+    static let script = #"""
+    #!/usr/bin/env python3
+    import json
+    import os
+    import select
+    import sys
+
+    record_path = os.environ["FAKE_ACP_RECORD_PATH"]
+    control_path = os.environ["FAKE_ACP_CONTROL_PATH"]
+    with open(os.environ["FAKE_ACP_PID_PATH"], "w", encoding="utf-8") as handle:
+        handle.write(str(os.getpid()))
+
+    control_fd = os.open(control_path, os.O_RDONLY | os.O_NONBLOCK)
+    keepalive_fd = os.open(control_path, os.O_WRONLY | os.O_NONBLOCK)
+    stdin_fd = sys.stdin.fileno()
+    session_id = "fake-acp-session"
+    held = []
+    current = {"model": "model-a", "mode": "ask"}
+
+    def record(entry):
+        with open(record_path, "a", encoding="utf-8") as handle:
+            handle.write(json.dumps(entry) + "\n")
+
+    def send(payload):
+        sys.stdout.write(json.dumps(payload) + "\n")
+        sys.stdout.flush()
+
+    def respond(request_id, result):
+        send({"jsonrpc": "2.0", "id": request_id, "result": result})
+
+    def config_options():
+        return [
+            {"id": "model", "name": "Model", "category": "model", "type": "select",
+             "currentValue": current["model"],
+             "options": [{"value": "model-a", "name": "Model A"}, {"value": "model-b", "name": "Model B"}]},
+            {"id": "mode", "name": "Session Mode", "category": "mode", "type": "select",
+             "currentValue": current["mode"],
+             "options": [{"value": "ask", "name": "Ask"},
+                         {"value": "repoprompt_acp", "name": "RepoPrompt"},
+                         {"value": "repoprompt_acp_full_access", "name": "RepoPrompt Full Access"}]}
+        ]
+
+    def handle_request(line):
+        global held
+        try:
+            request = json.loads(line)
+        except Exception:
+            return
+        method = request.get("method")
+        params = request.get("params") or {}
+        request_id = request.get("id")
+        if method == "initialize":
+            respond(request_id, {"agentCapabilities": {"loadSession": True}, "authMethods": []})
+        elif method == "session/new":
+            respond(request_id, {"sessionId": session_id, "configOptions": config_options()})
+        elif method == "session/set_config_option":
+            if params.get("configId") in current:
+                current[params.get("configId")] = params.get("value")
+            respond(request_id, {"configOptions": config_options()})
+        elif method == "session/prompt":
+            held.append(request_id)
+            record({"event": "prompt", "id": request_id})
+        elif method == "session/cancel":
+            answered = list(held)
+            for held_id in answered:
+                respond(held_id, {"stopReason": "cancelled", "usage": {"inputTokens": 1, "outputTokens": 0}})
+            held = []
+            record({"event": "cancel", "answered": answered})
+        elif request_id is not None:
+            respond(request_id, {})
+
+    def handle_control(line):
+        command, _, text = line.partition(" ")
+        if command != "complete" or not held:
+            record({"event": "unexpected_control", "text": line})
+            return
+        request_id = held.pop(0)
+        send({"jsonrpc": "2.0", "method": "session/update", "params": {
+            "sessionId": session_id,
+            "update": {"sessionUpdate": "agent_message_chunk", "messageId": "fake-%s" % request_id,
+                       "content": {"type": "text", "text": text}}}})
+        respond(request_id, {"stopReason": "end_turn", "usage": {"inputTokens": 1, "outputTokens": 1}})
+        record({"event": "complete", "id": request_id})
+
+    stdin_buffer = b""
+    control_buffer = b""
+    while True:
+        readable, _, _ = select.select([stdin_fd, control_fd], [], [])
+        if stdin_fd in readable:
+            chunk = os.read(stdin_fd, 65536)
+            if not chunk:
+                break
+            stdin_buffer += chunk
+            while b"\n" in stdin_buffer:
+                line, stdin_buffer = stdin_buffer.split(b"\n", 1)
+                handle_request(line.decode("utf-8", "replace"))
+        if control_fd in readable:
+            control_buffer += os.read(control_fd, 65536)
+            while b"\n" in control_buffer:
+                line, control_buffer = control_buffer.split(b"\n", 1)
+                handle_control(line.decode("utf-8", "replace").strip())
+    """#
 }

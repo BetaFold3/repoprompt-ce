@@ -644,6 +644,11 @@ final class ACPIntegratedAgentModeRunner {
             log("active steering session/prompt begin attempt=\(runAttemptID)", runID: runID)
             try await controller.prompt(agentMessage, request: runRequest)
             log("active steering session/prompt completed attempt=\(runAttemptID)", runID: runID)
+            #if DEBUG
+                if let hold = ACPActiveSteeringPromptTestHook.afterPromptReturned {
+                    await hold()
+                }
+            #endif
             let identity = await controller.currentProviderSessionIdentity()
             applyProviderSessionIdentity(identity, session: session)
             // A successful prompt return means the steering prompt was delivered and
@@ -2910,3 +2915,11 @@ final class ACPIntegratedAgentModeRunner {
         }
     }
 }
+
+#if DEBUG
+    /// Test-only, task-local hold at the existing await after an active ACP steering prompt
+    /// returned (before the flush continues). Nil — the default — is a no-op.
+    enum ACPActiveSteeringPromptTestHook {
+        @TaskLocal static var afterPromptReturned: (@MainActor @Sendable () async -> Void)?
+    }
+#endif

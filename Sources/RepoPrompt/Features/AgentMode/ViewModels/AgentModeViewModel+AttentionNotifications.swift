@@ -51,7 +51,7 @@ extension AgentModeViewModel {
             workspaceName: attentionNotificationWorkspaceName(forTabID: session.tabID),
             sessionName: resolvedSessionDisplayName(for: session.tabID),
             content: .turnCompleted(
-                finalAssistantText: mcpResolvedAssistantPreview(session: session, status: .completed)
+                finalAssistantText: attentionTurnCompletionText(for: session, attemptID: revision.ownership.attemptID)
             )
         )
         let sessionFence = attentionNotificationSessionFence(for: session, sessionID: sessionID)
@@ -59,13 +59,14 @@ extension AgentModeViewModel {
         return admission.makeCapture(event: event) { [weak self, weak session] in
             guard let self, let session, sessionFence(self, session) else { return false }
             // Still this exact completed commit and settled idle: no newer commit or run attempt,
-            // and no follow-up queued after capture.
+            // no follow-up queued after capture, and no ACP steering handoff still in flight.
             return session.lastTerminalCommitRevision?.commitID == commitID
                 && !session.terminalCommitInProgress
                 && session.runState == .completed
                 && session.activeRunOwnership == nil
                 && session.pendingInstructions.isEmpty
                 && session.codexFallbackQueue.isEmpty
+                && !attentionCompletionAwaitsACPHandoff(session)
         }
     }
 
@@ -79,11 +80,12 @@ extension AgentModeViewModel {
         let admission = attentionNotificationAdmission
         // A generic follow-up actually handed to its start: decide only after that start returns.
         // A follow-up that took over makes this capture no longer current (newer attempt or
-        // commit); one refused before ownership leaves this completion settled idle, so it sends.
-        // Nothing is recorded until then.
+        // commit); one refused before ownership leaves this completion settled idle, so it sends,
+        // or is held while an ACP steering handoff is still outstanding. Nothing is recorded until then.
         if genericFollowUpScheduled, revision.successorKind != nil, revision.providerSuccessorID == nil {
-            return { [weak admission] in
-                admission?.submit(capture)
+            return { [weak self, weak session] in
+                guard let self, let session else { return }
+                submitOrDeferAttentionCompletion(capture, for: session)
             }
         }
         // Preserve the existing fail-closed decision for a selected but unscheduled generic
@@ -96,8 +98,88 @@ extension AgentModeViewModel {
             admission.suppress(capture.event.key, reason: .successorTookOver)
             return nil
         }
-        admission.submit(capture)
+        submitOrDeferAttentionCompletion(capture, for: session)
         return nil
+    }
+
+    /// This attempt's own final assistant text, read once at its terminal commit through the shared
+    /// terminal assembler: the source suffix starting at the attempt's sequence floor, or at the
+    /// earlier row its final content replaced (keeping the rows after it as separators). Nil when
+    /// the attempt's provenance is missing (cleared by a transcript reset) or belongs to another
+    /// attempt.
+    private func attentionTurnCompletionText(for session: TabSession, attemptID: UUID) -> String? {
+        guard let provenance = session.attentionTextProvenance, provenance.attemptID == attemptID else {
+            return nil
+        }
+        let ordered = session.items.sorted { lhs, rhs in
+            if lhs.sequenceIndex == rhs.sequenceIndex {
+                return lhs.timestamp < rhs.timestamp
+            }
+            return lhs.sequenceIndex < rhs.sequenceIndex
+        }
+        let start = provenance.rewrittenPreBoundaryAssistantRowID
+            .flatMap { rowID in ordered.firstIndex(where: { $0.id == rowID }) }
+            ?? ordered.firstIndex(where: { $0.sequenceIndex >= provenance.minimumSourceSequenceIndex })
+            ?? ordered.endIndex
+        return AgentTranscriptIO.terminalAssistantResponseText(from: Array(ordered[start...]))
+    }
+
+    // MARK: - ACP steering handoff
+
+    /// Queued ACP steering, an active flush, or an observed follow-up start that has not returned
+    /// can still hand a settled completion to a later attempt.
+    private func attentionCompletionAwaitsACPHandoff(_ session: TabSession) -> Bool {
+        !session.pendingACPSteeringInstructions.isEmpty
+            || session.acpSteeringFlushTask != nil
+            || !session.attentionOutstandingFollowUpStartIDs.isEmpty
+    }
+
+    /// Submits now, or holds this session's single candidate outside the admission queue until the
+    /// ACP handoff progressed. A newer completion replaces (and decides) an older held one.
+    private func submitOrDeferAttentionCompletion(
+        _ capture: AttentionNotificationAdmission.Capture,
+        for session: TabSession
+    ) {
+        let admission = attentionNotificationAdmission
+        guard attentionCompletionAwaitsACPHandoff(session) else {
+            admission.submit(capture)
+            return
+        }
+        if let held = session.attentionDeferredCompletion, held.event.key != capture.event.key {
+            admission.suppress(held.event.key, reason: .eventNoLongerCurrent)
+        }
+        session.attentionDeferredCompletion = capture
+    }
+
+    /// Re-evaluates the held completion after ACP handoff work progressed: once nothing can still
+    /// hand it to a later attempt, it is submitted (admission re-checks it is still current).
+    func attentionCompletionProgress(for session: TabSession) {
+        guard let capture = session.attentionDeferredCompletion,
+              !attentionCompletionAwaitsACPHandoff(session)
+        else { return }
+        session.attentionDeferredCompletion = nil
+        attentionNotificationAdmission.submit(capture)
+    }
+
+    /// Transcript reset (clear chat, route activation, hydration): a held completion is no longer
+    /// current, so it is decided now. Notification-only; outstanding start observations are kept.
+    func discardAttentionDeferredCompletion(for session: TabSession) {
+        guard let held = session.attentionDeferredCompletion else { return }
+        session.attentionDeferredCompletion = nil
+        attentionNotificationAdmission.suppress(held.event.key, reason: .eventNoLongerCurrent)
+    }
+
+    /// Registers one ACP-steering follow-up start. The returned observation, called after the start
+    /// returns (started, refused, or failed), releases it and re-evaluates; repeats are no-ops.
+    func beginAttentionFollowUpObservation(
+        for session: TabSession
+    ) -> AgentModeRunService.Hooks.FollowUpStartObservation {
+        let startID = UUID()
+        session.attentionOutstandingFollowUpStartIDs.insert(startID)
+        return { [weak self, weak session] in
+            guard let session, session.attentionOutstandingFollowUpStartIDs.remove(startID) != nil else { return }
+            self?.attentionCompletionProgress(for: session)
+        }
     }
 
     // MARK: - ask_user

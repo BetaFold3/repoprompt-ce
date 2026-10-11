@@ -163,6 +163,14 @@ final class AgentModeRunService {
             _ providerSuccessorDeclined: Bool,
             _ genericFollowUpScheduled: Bool
         ) -> FollowUpStartObservation? = { _, _, _, _, _ in nil }
+        /// Attention notifications only: registers one ACP-steering follow-up start and returns the
+        /// observation passed to it. Must not await or mutate run state.
+        var beginAttentionFollowUpObservation: (
+            _ session: AgentModeViewModel.TabSession
+        ) -> FollowUpStartObservation? = { _ in nil }
+        /// Attention notifications only: ACP steering handoff work progressed (a flush finished).
+        /// Must not await or mutate run state.
+        var attentionCompletionProgress: (_ session: AgentModeViewModel.TabSession) -> Void = { _ in }
     }
 
     private let dependencies: Dependencies
@@ -604,6 +612,7 @@ final class AgentModeRunService {
                         _ = await self.submitQueuedACPSteeringIfSupported(session: session)
                     }
                 }
+                hooks.attentionCompletionProgress(session)
             }
 
             while true {
@@ -886,7 +895,7 @@ final class AgentModeRunService {
                 session.pendingInstructions.insert(contentsOf: providerTexts, at: 0)
             }
             session.mcpFollowUpRunPending = true
-            hooks.startFollowUpRun(tabID, first, nil)
+            hooks.startFollowUpRun(tabID, first, hooks.beginAttentionFollowUpObservation(session))
             return
         }
         session.pendingInstructions.insert(contentsOf: providerTexts, at: 0)

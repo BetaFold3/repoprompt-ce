@@ -3123,6 +3123,12 @@ final class AgentModeViewModel: ObservableObject {
                     providerSuccessorDeclined: providerSuccessorDeclined,
                     genericFollowUpScheduled: genericFollowUpScheduled
                 )
+            },
+            beginAttentionFollowUpObservation: { [weak self] session in
+                self?.beginAttentionFollowUpObservation(for: session)
+            },
+            attentionCompletionProgress: { [weak self] session in
+                self?.attentionCompletionProgress(for: session)
             }
         )
         let toolTrackingHooks = makeToolTrackingHooks()
@@ -5290,6 +5296,8 @@ final class AgentModeViewModel: ObservableObject {
         session.worktreeBindings = agentSession.worktreeBindings
         session.worktreeMergeOperations = agentSession.worktreeMergeOperations
         session.nextSequenceIndex = payload.transcript.nextSequenceIndex
+        session.attentionTextProvenance = nil
+        discardAttentionDeferredCompletion(for: session)
         session.lastActivityAt = agentSession.savedAt
         session.lastUserMessageAt = payload.lastUserMessageAt
         if let lastUserMessageAt = payload.lastUserMessageAt {
@@ -5663,6 +5671,8 @@ final class AgentModeViewModel: ObservableObject {
         session.clearDerivedTranscriptCaches()
         session.hasSentFirstMessage = false
         session.nextSequenceIndex = 0
+        session.attentionTextProvenance = nil
+        discardAttentionDeferredCompletion(for: session)
         session.runState = .idle
         session.clearClaudeReasoningStatus(clearDisplayedStatus: true)
         session.setRunningStatus(nil, source: nil)
@@ -16411,10 +16421,15 @@ final class AgentModeViewModel: ObservableObject {
                     return
                 }
                 let queued = session.pendingACPSteeringInstructions.remove(at: queuedIndex)
+                // Attention notifications only: a completion deferred behind this queued steering is
+                // re-evaluated once this handoff settled (after the direct start returned).
+                defer { attentionCompletionProgress(for: session) }
                 if session.runState.isActive {
                     session.pendingInstructions.insert(queued.providerText, at: 0)
                 } else if session.runState == .completed, session.acpController != nil {
+                    let afterStart = beginAttentionFollowUpObservation(for: session)
                     await startAgentRun(tabID: session.tabID, initialMessage: queued.providerText)
+                    afterStart()
                 } else {
                     // ACP steering should never bounce back into the composer. If the
                     // active-steering queue was rejected before the run service could take it,
@@ -18038,6 +18053,12 @@ final class AgentModeViewModel: ObservableObject {
                     updated.text = content
                     updated.isStreaming = false
                     session.replaceItem(at: index, with: updated)
+                    // Notification-only provenance for a replaced row that predates this attempt.
+                    session.recordAttentionFinalContentRewrite(
+                        attemptID: runAttemptID,
+                        rowID: updated.id,
+                        text: content
+                    )
                 } else {
                     let assistantItem = AgentChatItem.assistant(content, sequenceIndex: session.nextSequenceIndex)
                     session.appendItem(assistantItem)
@@ -19833,6 +19854,8 @@ final class AgentModeViewModel: ObservableObject {
         session.pendingTaggedFileAttachments.removeAll()
         session.attachmentsPendingProviderConsumptionCleanup.removeAll()
         session.nextSequenceIndex = 0
+        session.attentionTextProvenance = nil
+        discardAttentionDeferredCompletion(for: session)
         session.lastActivityAt = Date()
         session.lastUserMessageAt = nil
         session.isDirty = true
