@@ -1,3 +1,4 @@
+import RepoPromptAgentCore
 import SwiftUI
 
 // Oracle failure inspection plan, Patch C: live group expansion and large-group rendering for

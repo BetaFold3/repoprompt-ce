@@ -1,0 +1,291 @@
+import Foundation
+
+@MainActor
+package final class ClaudeContextUsageEstimator: ContextUsageEstimating {
+    package let agent: AgentProviderKind = .claudeCode
+    private let tokenEstimator: (String) -> Int
+    private let contextUsageBuilder: ProviderTurnContextUsageBuilder
+
+    package init(
+        tokenEstimator: @escaping (String) -> Int,
+        contextUsageBuilder: @escaping ProviderTurnContextUsageBuilder
+    ) {
+        self.tokenEstimator = tokenEstimator
+        self.contextUsageBuilder = contextUsageBuilder
+    }
+
+    @discardableResult
+    package func enqueueUserTurnEstimate(
+        messageForProvider: String,
+        session: AgentTabSession
+    ) -> Int {
+        let estimate = max(0, tokenEstimator(messageForProvider))
+        session.pendingNonCodexUserInputTokenQueue.append(estimate)
+        return estimate
+    }
+
+    @discardableResult
+    package func replaceNextQueuedUserTurnEstimate(
+        messageForProvider: String,
+        session: AgentTabSession
+    ) -> Int? {
+        guard !session.pendingNonCodexUserInputTokenQueue.isEmpty else { return nil }
+        let estimate = max(0, tokenEstimator(messageForProvider))
+        session.pendingNonCodexUserInputTokenQueue[0] = estimate
+        return estimate
+    }
+
+    package func dequeueQueuedUserTurnEstimate(session: AgentTabSession) -> Int? {
+        guard !session.pendingNonCodexUserInputTokenQueue.isEmpty else { return nil }
+        return session.pendingNonCodexUserInputTokenQueue.removeFirst()
+    }
+
+    package func beginTurn(session: AgentTabSession, initialMessage: String) {
+        let userTokens = dequeueQueuedUserTurnEstimate(session: session) ?? tokenEstimate(for: initialMessage)
+        session.activeNonCodexTurnTokenAccumulator = AgentNonCodexTurnTokenAccumulator(
+            estimatedUserInputTokens: max(0, userTokens),
+            estimatedToolInputTokens: 0,
+            estimatedToolOutputTokens: 0
+        )
+        if userTokens > 0 {
+            session.isDirty = true
+        }
+    }
+
+    package func addUserInputTokens(_ tokens: Int, session: AgentTabSession) {
+        guard tokens > 0 else { return }
+        var accumulator = session.activeNonCodexTurnTokenAccumulator ?? AgentNonCodexTurnTokenAccumulator()
+        accumulator.estimatedUserInputTokens += tokens
+        session.activeNonCodexTurnTokenAccumulator = accumulator
+        session.isDirty = true
+    }
+
+    package func addToolInputPayload(_ payload: String?, session: AgentTabSession) {
+        let tokens = tokenEstimate(for: payload)
+        guard tokens > 0 else { return }
+        var accumulator = session.activeNonCodexTurnTokenAccumulator ?? AgentNonCodexTurnTokenAccumulator()
+        accumulator.estimatedToolInputTokens += tokens
+        session.activeNonCodexTurnTokenAccumulator = accumulator
+        session.isDirty = true
+    }
+
+    package func addToolOutputPayload(_ payload: String?, session: AgentTabSession) {
+        let tokens = tokenEstimate(for: payload)
+        guard tokens > 0 else { return }
+        var accumulator = session.activeNonCodexTurnTokenAccumulator ?? AgentNonCodexTurnTokenAccumulator()
+        accumulator.estimatedToolOutputTokens += tokens
+        session.activeNonCodexTurnTokenAccumulator = accumulator
+        session.isDirty = true
+    }
+
+    @discardableResult
+    package func ingestUsageSignal(
+        promptTokens: Int?,
+        completionTokens _: Int?,
+        contextUsedTokens: Int?,
+        modelContextWindow: Int?,
+        session: AgentTabSession
+    ) -> ContextUsageSnapshot? {
+        let prompt = max(0, promptTokens ?? 0)
+        let existing = session.codexContextUsage
+        let resolvedWindow = modelContextWindow ?? existing?.modelContextWindow
+        let contextUsed = ClaudeContextUsedTokensBound.normalizedReading(
+            contextUsedTokens,
+            canonicalWindow: resolvedWindow
+        ) ?? 0
+
+        // Record exact stream-derived context in the per-turn accumulator so
+        // finalizeTurn can persist it without relying on session-wide state.
+        if contextUsed > 0 {
+            var accumulator = session.activeNonCodexTurnTokenAccumulator ?? AgentNonCodexTurnTokenAccumulator()
+            accumulator.observedContextUsedTokens = contextUsed
+            session.activeNonCodexTurnTokenAccumulator = accumulator
+        }
+
+        let usedSignal: Int? = {
+            if contextUsed > 0 {
+                return contextUsed
+            }
+            if prompt > 0 {
+                return prompt
+            }
+            return nil
+        }()
+        let resolvedUsed = usedSignal ?? existing?.lastTotalTokens
+        guard resolvedUsed != nil || resolvedWindow != nil else { return nil }
+
+        session.codexContextUsage = AgentContextUsage(
+            modelContextWindow: resolvedWindow,
+            configuredContextWindow: session.claudeConfiguredContextWindow,
+            lastTotalTokens: resolvedUsed,
+            totalTotalTokens: resolvedUsed ?? existing?.totalTotalTokens
+        )
+        return updateSnapshot(
+            from: session.codexContextUsage,
+            source: .claudeUsageEvent,
+            confidence: contextUsed > 0 ? .exact : .bestEffort,
+            session: session
+        )
+    }
+
+    @discardableResult
+    package func ingestTurnFinalizationSignal(
+        contextUsedTokens: Int?,
+        modelContextWindow: Int?,
+        session: AgentTabSession
+    ) -> ContextUsageSnapshot? {
+        let existing = session.codexContextUsage
+        let resolvedWindow = modelContextWindow ?? existing?.modelContextWindow
+        let resolvedContextUsed = ClaudeContextUsedTokensBound.normalizedReading(
+            contextUsedTokens,
+            canonicalWindow: resolvedWindow
+        ) ?? 0
+        let resolvedUsed = resolvedContextUsed > 0 ? resolvedContextUsed : existing?.lastTotalTokens
+        guard resolvedUsed != nil || resolvedWindow != nil else { return nil }
+
+        session.codexContextUsage = AgentContextUsage(
+            modelContextWindow: resolvedWindow,
+            configuredContextWindow: session.claudeConfiguredContextWindow,
+            lastTotalTokens: resolvedUsed,
+            totalTotalTokens: resolvedUsed ?? existing?.totalTotalTokens
+        )
+        return updateSnapshot(
+            from: session.codexContextUsage,
+            source: .turnFinalization,
+            confidence: resolvedContextUsed > 0 ? .exact : .bestEffort,
+            session: session
+        )
+    }
+
+    package func ingestStatusSignal(_ statusText: String?, session: AgentTabSession) {
+        guard let statusText = statusText?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !statusText.isEmpty
+        else { return }
+        let normalized = statusText.lowercased()
+        guard normalized.contains("compacting context") else { return }
+        session.contextCompactedAt = Date()
+        _ = updateSnapshot(
+            from: session.codexContextUsage,
+            source: .compactionSignal,
+            confidence: .bestEffort,
+            session: session
+        )
+    }
+
+    package func ingestSystemSignal(_ systemText: String?, session: AgentTabSession) {
+        guard let systemText = systemText?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !systemText.isEmpty
+        else { return }
+        let normalized = systemText.lowercased()
+        guard normalized.contains("context compacted") else { return }
+        session.contextCompactedAt = Date()
+        _ = updateSnapshot(
+            from: session.codexContextUsage,
+            source: .compactionSignal,
+            confidence: .bestEffort,
+            session: session
+        )
+    }
+
+    @discardableResult
+    package func finalizeTurn(
+        promptTokens: Int?,
+        completionTokens: Int?,
+        contextUsedTokens: Int?,
+        session: AgentTabSession
+    ) -> Bool {
+        let prompt = max(0, promptTokens ?? 0)
+        let completion = max(0, completionTokens ?? 0)
+        let accumulator = session.activeNonCodexTurnTokenAccumulator
+        let estimatedUser = accumulator?.estimatedUserInputTokens ?? 0
+        let estimatedToolInput = accumulator?.estimatedToolInputTokens ?? 0
+        let estimatedToolOutput = accumulator?.estimatedToolOutputTokens ?? 0
+        let resolvedContextUsed = ClaudeContextUsedTokensBound.normalizedReading(
+            contextUsedTokens,
+            canonicalWindow: session.codexContextUsage?.modelContextWindow
+        ) ?? 0
+        let hasUsage = prompt > 0
+            || completion > 0
+            || estimatedUser > 0
+            || estimatedToolInput > 0
+            || estimatedToolOutput > 0
+            || resolvedContextUsed > 0
+
+        guard hasUsage else {
+            if !session.providerTokenUsageByTurn.isEmpty, session.codexContextUsage == nil {
+                session.codexContextUsage = contextUsageBuilder(
+                    session.providerTokenUsageByTurn,
+                    nil,
+                    session.claudeConfiguredContextWindow
+                )
+                _ = updateSnapshot(
+                    from: session.codexContextUsage,
+                    source: .persistedTurns,
+                    confidence: .inferred,
+                    session: session
+                )
+            }
+            return false
+        }
+
+        session.activeNonCodexTurnTokenAccumulator = nil
+        // Prefer the exact stream-observed context for this turn over any session-wide
+        // display value. The previous fallback to session.codexContextUsage?.lastTotalTokens
+        // caused previous-turn context leakage into later persisted rows.
+        let accumulatorContextUsed = accumulator?.observedContextUsedTokens ?? 0
+        let persistedContextUsed = resolvedContextUsed > 0 ? resolvedContextUsed : (accumulatorContextUsed > 0 ? accumulatorContextUsed : 0)
+        let usage = AgentTokenUsagePersist(
+            promptTokens: prompt,
+            completionTokens: completion,
+            contextUsedTokens: persistedContextUsed > 0 ? persistedContextUsed : nil,
+            estimatedUserInputTokens: estimatedUser,
+            estimatedToolInputTokens: estimatedToolInput,
+            estimatedToolOutputTokens: estimatedToolOutput
+        )
+        session.providerTokenUsageByTurn.append(usage)
+        // Rebuild from persisted turns, but the builder only uses real Claude API values
+        // (contextUsedTokens, promptTokens). If it returns nil (no real values in any turn),
+        // preserve the existing codexContextUsage which may have been set by
+        // ingestUsageSignal with actual data.
+        let existingUsage = session.codexContextUsage
+        let rebuilt = contextUsageBuilder(
+            session.providerTokenUsageByTurn,
+            existingUsage?.modelContextWindow,
+            session.claudeConfiguredContextWindow
+        )
+        if let rebuilt {
+            session.codexContextUsage = rebuilt
+        }
+        _ = updateSnapshot(
+            from: session.codexContextUsage,
+            source: .turnFinalization,
+            confidence: (rebuilt ?? existingUsage)?.lastTotalTokens != nil ? .bestEffort : .inferred,
+            session: session
+        )
+        session.isDirty = true
+        return true
+    }
+
+    private func updateSnapshot(
+        from usage: AgentContextUsage?,
+        source: ContextUsageSnapshotSource,
+        confidence: ContextUsageSnapshotConfidence,
+        session: AgentTabSession
+    ) -> ContextUsageSnapshot? {
+        let next = ContextUsageSnapshot.fromAgentContextUsage(
+            usage,
+            source: source,
+            confidence: confidence,
+            compactedAt: session.contextCompactedAt
+        )
+        if session.contextUsageSnapshot != next {
+            session.contextUsageSnapshot = next
+            return next
+        }
+        return nil
+    }
+
+    private func tokenEstimate(for payload: String?) -> Int {
+        max(0, tokenEstimator(payload ?? ""))
+    }
+}

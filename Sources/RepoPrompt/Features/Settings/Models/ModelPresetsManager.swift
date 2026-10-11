@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptAgentCore
 
 // App-owned: persists model presets through `PresetFileStore`.
 

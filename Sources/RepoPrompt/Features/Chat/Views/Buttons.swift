@@ -5,6 +5,7 @@
 //  Created by Eric Provencher on 2024-10-30.
 //
 
+import RepoPromptAgentCore
 import RepoPromptUI
 import SwiftUI
 

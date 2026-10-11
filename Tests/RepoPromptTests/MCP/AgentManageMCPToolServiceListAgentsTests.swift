@@ -1,6 +1,6 @@
 import Foundation
 import MCP
-@testable import RepoPromptAgentCore
+@_spi(TestSupport) @testable import RepoPromptAgentCore
 @testable import RepoPromptWorkspace
 @_spi(TestSupport) @testable import RepoPromptApp
 @testable import RepoPromptPlatform

@@ -9,6 +9,7 @@
 
 import Foundation
 import OSLog
+import RepoPromptAgentCore
 import RepoPromptPlatform
 import RepoPromptShared
 

@@ -1,3 +1,4 @@
+import RepoPromptAgentCore
 import RepoPromptUI
 import SwiftUI
 

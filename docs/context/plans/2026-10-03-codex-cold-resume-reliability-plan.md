@@ -366,9 +366,9 @@ Effect on the callers:
 
 | File | Phase | Change |
 |---|---|---|
-| `Sources/RepoPrompt/Infrastructure/AI/Providers/Codex/AppServer/CodexAppServerClient.swift` | 1, 2 | Frame ceiling and factory; new error and termination cases; violation record and drain; generation-gated chunk ingestion; size-only diagnostics; DEBUG hooks; read-only generation accessor |
-| `Sources/RepoPrompt/Infrastructure/AI/Providers/Codex/AppServer/CodexNativeSessionController.swift` | 2, 3 | `excludeTurns` policy and memo; turns-list helper; `applyThreadSnapshot`; reconciliation; `lastKnownRuntimeStatus`; `routingRevision`; `readThreadSnapshot` internals; system-error error; cancellation checks; memory-mode rethrow |
-| `Sources/RepoPrompt/Features/AgentMode/Runtime/Codex/CodexAgentModeCoordinator.swift` | 1, 2, 3 | Frame-limit invalidation; unresolved-activity marker; fallback removal; catch restructure; guidance messages; late-success guard |
+| `Sources/RepoPromptAgentCore/AI/Providers/Codex/AppServer/CodexAppServerClient.swift` | 1, 2 | Frame ceiling and factory; new error and termination cases; violation record and drain; generation-gated chunk ingestion; size-only diagnostics; DEBUG hooks; read-only generation accessor |
+| `Sources/RepoPromptAgentCore/AI/Providers/Codex/AppServer/CodexNativeSessionController.swift` | 2, 3 | `excludeTurns` policy and memo; turns-list helper; `applyThreadSnapshot`; reconciliation; `lastKnownRuntimeStatus`; `routingRevision`; `readThreadSnapshot` internals; system-error error; cancellation checks; memory-mode rethrow |
+| `Sources/RepoPromptAgentCore/AgentMode/Runtime/Codex/CodexAgentModeCoordinator.swift` | 1, 2, 3 | Frame-limit invalidation; unresolved-activity marker; fallback removal; catch restructure; guidance messages; late-success guard |
 | `Sources/RepoPromptPlatform/Infrastructure/Process/ProcessStreamFraming.swift` | — | **Unchanged** |
 | `Tests/RepoPromptTests/AI/CodexAppServerInboundFrameLimitTests.swift` (new) | 1 | Transport suite |
 | `Tests/RepoPromptTests/AgentMode/Codex/CodexNativeResumeLifecycleTests.swift` (new) | 2, 3 | Controller suite using `requestExecutor` injection |

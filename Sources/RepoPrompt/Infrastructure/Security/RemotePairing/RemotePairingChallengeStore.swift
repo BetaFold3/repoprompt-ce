@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptAgentCore
 
 // App-owned: host-side pairing challenges carry `RemotePairingApprovalContext`.
 struct RemotePairingChallenge: Identifiable, Equatable {

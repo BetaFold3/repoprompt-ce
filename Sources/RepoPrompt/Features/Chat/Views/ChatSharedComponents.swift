@@ -7,6 +7,7 @@
 
 import AppKit
 import QuartzCore
+import RepoPromptAgentCore
 import SwiftUI
 
 struct LoadingIndicatorWithStop: View {

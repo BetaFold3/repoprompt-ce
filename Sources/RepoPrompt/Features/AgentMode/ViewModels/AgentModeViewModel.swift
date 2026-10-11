@@ -2,6 +2,7 @@ import Combine
 import CryptoKit
 import Foundation
 import MCP
+import RepoPromptAgentCore
 import RepoPromptUI
 import RepoPromptWorkspace
 import SwiftUI
@@ -2316,6 +2317,7 @@ final class AgentModeViewModel: ObservableObject {
             reasoningSummariesEnabled: { CodexReasoningSummaries.isEnabled },
             showBuiltInWorkflowCleanupGuidance: { GlobalSettingsStore.shared.showBuiltInWorkflowCleanupGuidance() },
             globalCodeMapsDisabled: { GlobalSettingsStore.shared.globalCodeMapsDisabled() },
+            codexModelPollingService: { CodexModelPollingService.shared },
             activeToolQuery: { [weak mcpServer] runID in
                 mcpServer?.hasActiveToolExecutions(runID: runID) ?? false
             },
@@ -2518,6 +2520,7 @@ final class AgentModeViewModel: ObservableObject {
                 reasoningSummariesEnabled: { CodexReasoningSummaries.isEnabled },
                 showBuiltInWorkflowCleanupGuidance: { GlobalSettingsStore.shared.showBuiltInWorkflowCleanupGuidance() },
                 globalCodeMapsDisabled: { GlobalSettingsStore.shared.globalCodeMapsDisabled() },
+                codexModelPollingService: { CodexModelPollingService.shared },
                 activeToolQuery: testCodexActiveToolQuery
                     ?? { [weak testMCPServer] runID in
                         testMCPServer?.hasActiveToolExecutions(runID: runID) ?? false

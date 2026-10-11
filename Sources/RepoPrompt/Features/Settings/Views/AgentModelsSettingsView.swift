@@ -17,6 +17,7 @@
 //  - Oracle picker: /RepoPrompt/Views/Settings/AIModelDropDown.swift
 //
 
+import RepoPromptAgentCore
 import RepoPromptUI
 import SwiftUI
 

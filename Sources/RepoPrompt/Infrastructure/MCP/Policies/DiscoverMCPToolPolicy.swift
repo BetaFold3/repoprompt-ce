@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptAgentCore
 
 /// MCP tool policy for Context Builder agent runs.
 /// Controls which tools are restricted and which special tools are granted.

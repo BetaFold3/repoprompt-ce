@@ -8,6 +8,7 @@
 import AppKit
 import Combine
 import Foundation
+import RepoPromptAgentCore
 
 /// Manages approval requests for workspace operations triggered by MCP clients.
 /// Similar to the MCP client connection approval flow, but for workspace modifications.

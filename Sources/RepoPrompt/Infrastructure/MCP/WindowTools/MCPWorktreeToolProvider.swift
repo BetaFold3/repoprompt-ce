@@ -1,6 +1,7 @@
 import Foundation
 import JSONSchema
 import MCP
+import RepoPromptAgentCore
 import RepoPromptWorkspace
 
 @MainActor

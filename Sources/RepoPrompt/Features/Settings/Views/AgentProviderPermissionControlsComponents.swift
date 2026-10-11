@@ -10,6 +10,7 @@
 //  Claude tools runtime section, CLI Providers inline permissions
 //
 
+import RepoPromptAgentCore
 import RepoPromptUI
 import SwiftUI
 

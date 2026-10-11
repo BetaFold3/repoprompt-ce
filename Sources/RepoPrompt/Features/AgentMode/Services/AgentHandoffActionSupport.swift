@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptAgentCore
 
 enum AgentHandoffActionSupport {
     enum Action: Equatable {

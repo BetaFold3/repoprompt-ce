@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptAgentCore
 
 // SEARCH-HELPER: AgentPreviewDocumentPicker, preview document picker, previewable file inventory
 

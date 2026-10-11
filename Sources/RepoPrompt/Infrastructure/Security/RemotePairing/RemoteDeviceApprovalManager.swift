@@ -1,6 +1,7 @@
 import AppKit
 import Combine
 import Foundation
+import RepoPromptAgentCore
 
 struct RemoteDeviceApprovalRequest: Identifiable, Equatable {
     let id: UUID

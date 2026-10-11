@@ -1,6 +1,7 @@
 import AppKit
 import Combine
 import Foundation
+import RepoPromptAgentCore
 
 protocol RemoteHostsRegistryManaging: AnyObject {
     var hasHosts: Bool { get }

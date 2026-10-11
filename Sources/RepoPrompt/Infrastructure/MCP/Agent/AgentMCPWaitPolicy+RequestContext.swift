@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptAgentCore
 import RepoPromptShared
 
 // App-owned: carries `MCPServerViewModel.RequestMetadata`.

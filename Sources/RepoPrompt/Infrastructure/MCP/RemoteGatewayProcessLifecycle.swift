@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptAgentCore
 
 struct RemoteGatewayLaunchConfiguration: Equatable {
     let bindHost: String

@@ -1,3 +1,4 @@
+import RepoPromptAgentCore
 import SwiftUI
 
 struct AgentApprovalCard: View {

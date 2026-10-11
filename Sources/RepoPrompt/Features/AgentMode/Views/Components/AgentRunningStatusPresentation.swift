@@ -1,3 +1,5 @@
+import RepoPromptAgentCore
+
 /// Formats known raw RepoPrompt tool names without rewriting ordinary status prose.
 enum AgentRunningStatusPresentation {
     static func displayText(for status: String?) -> String {

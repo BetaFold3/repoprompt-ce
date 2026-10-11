@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptAgentCore
 import RepoPromptWorkspace
 
 /// Pure, Sendable projection for the unified Git MCP provider.

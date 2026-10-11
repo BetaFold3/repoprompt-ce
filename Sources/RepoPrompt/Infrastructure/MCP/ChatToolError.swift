@@ -1,5 +1,6 @@
 import Foundation
 import MCP // for `Value`
+import RepoPromptAgentCore
 
 enum ChatToolErrorCode: String, Codable {
     case invalidParams = "invalid_params"

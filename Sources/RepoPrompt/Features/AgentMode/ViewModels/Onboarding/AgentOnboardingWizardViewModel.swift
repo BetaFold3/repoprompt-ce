@@ -8,6 +8,7 @@
 import AppKit
 import Combine
 import Foundation
+import RepoPromptAgentCore
 import RepoPromptUI
 
 // MARK: - Onboarding Step

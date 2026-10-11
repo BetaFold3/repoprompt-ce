@@ -1,6 +1,6 @@
 # Plan: Oh My Pi (OMP) as a Third ACP Provider — Managed Barebones Harness
 
-Scope: read when the task touches Oh My Pi/OMP provider integration, `ACPProviderID`/`ACPAgentProvider` seam extension for OMP, `Sources/RepoPrompt/Infrastructure/AI/Providers/OhMyPi/**`, or OMP Agent Mode wiring.
+Scope: read when the task touches Oh My Pi/OMP provider integration, `ACPProviderID`/`ACPAgentProvider` seam extension for OMP, `Sources/RepoPromptAgentCore/AI/Providers/OhMyPi/**`, or OMP Agent Mode wiring.
 Authority: Authoritative
 Last-verified: 2026-08-16
 
@@ -168,7 +168,7 @@ Case `.ohMyPi`, raw `"ohMyPi"` for `ACPProviderID`/`AgentProviderKind`/`AgentPro
 
 ## 5. Component inventory
 
-New `Sources/RepoPrompt/Infrastructure/AI/Providers/OhMyPi/`: `OhMyPiAgentConfig` (fixed managed args, `CLIPathHints.ohMyPi`, `includeRepoPromptMCPServer`), `OhMyPiACPLaunchResolver` (OpenCode-shaped: probe ACP subcommand exit via `omp acp --help`, managed global flags via `omp --help`, plus a version pin, `ExecutableFileIdentity` capture/revalidation, and `AsyncMutex` probe serialization), `OhMyPiACPAgentProvider` (Cursor-shaped session config; OpenCode-shaped prompt blocks incl. images; actionable error mapping), `OhMyPiACPEventNormalizer`, `OhMyPiACPHeadlessAgentProvider` (shared ACP bridge, native resume propagation, `.declineUnsupported`; doubles as the model-refresh/discovery probe), and `OhMyPiCLIProvider` (fresh tool-free Oracle request through `HeadlessCLIStreamBridge`, warm-first canonical model validation, strict success terminal).
+New `Sources/RepoPromptAgentCore/AI/Providers/OhMyPi/`: `OhMyPiAgentConfig` (fixed managed args, `CLIPathHints.ohMyPi`, `includeRepoPromptMCPServer`), `OhMyPiACPLaunchResolver` (OpenCode-shaped: probe ACP subcommand exit via `omp acp --help`, managed global flags via `omp --help`, plus a version pin, `ExecutableFileIdentity` capture/revalidation, and `AsyncMutex` probe serialization), `OhMyPiACPAgentProvider` (Cursor-shaped session config; OpenCode-shaped prompt blocks incl. images; actionable error mapping), `OhMyPiACPEventNormalizer`, `OhMyPiACPHeadlessAgentProvider` (shared ACP bridge, native resume propagation, `.declineUnsupported`; doubles as the model-refresh/discovery probe), and `OhMyPiCLIProvider` (fresh tool-free Oracle request through `HeadlessCLIStreamBridge`, warm-first canonical model validation, strict success terminal).
 
 Enum/seam sweeps (all compiler-enforced arms plus an `rg` inventory for string-keyed surfaces in the PR description): `ACPProviderID`, `AgentProviderKind` (+every switch; verified MCP routing hint `omp-coding-agent`, while ACP `agentInfo.name` remains `oh-my-pi`), `AgentProviderBindingID`, `ACPAgentProviderFactory`, `AgentModelCatalog` (`ohMyPiAvailable` arms, ordering after `.cursor`, defaults/options/validation, recommendation-filter false), `AgentModel` arms, `AgentModeMCPToolPolicy.grantedTools` (standard ACP grant; **Phase-1 product decision**: inventory whether RepoPrompt MCP exposes a policy-gated exec tool — otherwise OMP is a read/search/edit harness at MVP, documented), permission resolver arm, CLI override/profile plumbing, settings UI block (probe, install guidance, managed-profile explanation, permission reset).
 

@@ -139,7 +139,7 @@ Result: moved 66 files (~14.5k lines) into `Sources/RepoPromptUI`, which depends
 
 Decisions: `AgentSidebarSizing` moved back to App after review because only Agent views use it; the font-scale DEBUG instrumentation moved with typography as UI-domain instrumentation with unchanged event names; the declared-but-unused Platform dependency was dropped, to be added when UI code first needs Platform; no guardrail checks module dependencies yet, as decided in Slice 1.
 
-Step 3b — done | rounds 0/2 | open: | downgraded: | assumed: A2 | deferred: OracleB F1 — `CodexAgentModeCoordinator` uses `MentionSuggestion` from UI; move `MentionModels` down during Slice 4/5
+Step 3b — done | rounds 0/2 | open: | downgraded: | assumed: A2 | deferred: closed by 6a 1a
 
 ### Slice 4 — `RepoPromptWorkspace`
 Move workspace context, indexing and search, VCS and worktrees, domain diff and edit operations, workspace persistence, and non-UI CodeMap and workspace-file code. Prompt packaging (`ChatPreset`, `CopyPreset`, `PromptSection`) and anything that needs `AIModel` stay above, with only their workspace-only parts extracted down.
@@ -186,7 +186,7 @@ Result: `RepoPromptWorkspace` now holds the 250 files (about 162k lines) with `R
 
 Decisions: accepted the 2,284 `package` declarations instead of moving instrumentation back into App, because they are the compiler-required surface for a 162k-line module that App uses everywhere and trimming would mean redesign; `WorkspaceModel`, the workspace-switch providers and registry, the preset store and `WorkspaceSelectionCoordinator` stay in App because they own prompt packaging, compose tabs or view-model orchestration; source-scanning tests had their paths updated (and the auto-codemap invariant test now scans both the App and Workspace folders) so their coverage follows the moved files; the Step 4b recorder-`State` deferral is closed because only the agent perf logger uses it.
 
-Step 4d — done | rounds 0/2 | open: | downgraded: | assumed: | deferred: OracleB (3b) F1 — move `MentionModels`/`MentionSuggestion` down in Slice 5 if AgentCore needs it
+Step 4d — done | rounds 0/2 | open: | downgraded: | assumed: | deferred: closed by 6a 1a
 
 ### Slice 5 — AgentCore seams, in place
 Still inside `RepoPromptApp`:
@@ -475,7 +475,16 @@ Step 5y — done | rounds 0/2 | open: | downgraded: | assumed: A1 | deferred:
 ### Slice 6 — `RepoPromptAgentCore` extraction
 Move the now-acyclic AI, agent models, providers, runtime, services, history, recommendations and non-UI remote-host code. Remove the temporary typealiases. Check the release compile flags once for cross-module optimization; don't change them.
 
-Step 6 — todo | rounds 0/2 | open: | downgraded: | assumed: | deferred:
+#### Step 6a — move the agent move set into `RepoPromptAgentCore`
+Intent: `git mv` the 325 self-contained agent files (about 155k lines, list in `step6a/moveset.txt`) into `Sources/RepoPromptAgentCore` with Workspace and Platform as its only app-module dependencies, compiler-required `package` access and the module-qualified aliases repointed, then run the slice gates.
+
+Budget used: about 6 hours (cumulative ~51.7 hours).
+
+Result: the 324-file agent move set plus `ErrorExtensions.swift` now lives in `RepoPromptAgentCore` (no App or UI dependency, compiler-required `package` access, seven aliases repointed), the slice gates pass (6464 identical test names, only baseline failures, unchanged ledger, guardrails failing only on A1, Xcode checks passing), the review scans found no affected module-qualified string, App-only flag or rebinding, and the ad-hoc-signed universal release package build completes with exit 0 in about 27 minutes, so alias removal follows.
+
+Decisions: four approved fixes: `nativeSlashCommandSuggestions` moved verbatim into an App extension of the Codex coordinator (1a); `AgentPreviewLinkRouter` stays in App (2a); the coordinator gets `CodexModelPollingService` from a required init closure called where `.shared` was read (3a); `ErrorExtensions.swift` joins AgentCore with `package` `asFriendlyString` (4a). Guardrails give AgentCore the same checks as Platform, UI and Workspace (required directory, no `@main`, manifest type and path); the round-0 forbidden-dependency and import checks were removed, and `source-layout.md` keeps the allowed dependencies as prose. `RepoPromptRemoteWire` and the third-party packages (swift-log, MCP, SwiftAnthropic, SwiftOpenAI, `RepoPromptClaudeCompatibleProvider`) are AgentCore dependencies alongside Workspace, Platform and `RepoPromptShared`.
+
+Step 6a — done | rounds 0/2 | open: | downgraded: | assumed: A1 | deferred: 5m OracleB P3-2; 5r OracleB P3-2, P3-3
 
 ## Decisions
 - Purpose: architecture and enforced boundaries, not build or runtime speed.

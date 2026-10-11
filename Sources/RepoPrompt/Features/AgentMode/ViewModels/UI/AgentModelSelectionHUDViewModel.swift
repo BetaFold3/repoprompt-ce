@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptAgentCore
 
 enum AgentModelSelectionHUDMode: String, CaseIterable, Identifiable {
     case switchModel

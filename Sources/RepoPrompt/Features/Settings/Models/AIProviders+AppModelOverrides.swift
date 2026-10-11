@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptAgentCore
 import RepoPromptPlatform
 
 // App composition for agent-code providers and helpers that read per-model overrides.

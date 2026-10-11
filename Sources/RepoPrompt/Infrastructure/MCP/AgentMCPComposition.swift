@@ -1,5 +1,6 @@
 import Foundation
 import MCP
+import RepoPromptAgentCore
 
 extension ServerNetworkManager: AgentMCPHosting {
     /// Builds the server-owned observer inside the actor so registration stays a single

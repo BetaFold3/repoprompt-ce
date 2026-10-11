@@ -1,3 +1,4 @@
+import RepoPromptAgentCore
 import SwiftUI
 
 /// Style variants for log entry rows

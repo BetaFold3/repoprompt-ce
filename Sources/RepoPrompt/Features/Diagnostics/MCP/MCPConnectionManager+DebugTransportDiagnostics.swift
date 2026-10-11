@@ -2,6 +2,7 @@
 
 import Foundation
 import MCP
+import RepoPromptAgentCore
 import RepoPromptWorkspace
 
 #if DEBUG

@@ -1,5 +1,6 @@
 import AppKit
 import ImageIO
+import RepoPromptAgentCore
 import RepoPromptUI
 import SwiftUI
 

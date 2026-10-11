@@ -75,7 +75,7 @@ Phases 1–4 are implemented. Identity-verified fresh OracleA and OracleB R1 rev
 
 ## Owning seams and focused validation
 
-- Model and persistence: `Sources/RepoPrompt/Features/AgentMode/Models/AgentScheduledSend.swift`, `Runtime/AgentSession.swift`, `Runtime/AgentSessionDataService.swift`, and `Runtime/AgentSessionMetadataIndex.swift`.
-- Admission and dispatch: `Runtime/Scheduling/AgentScheduledSendCoordinator.swift` and `ViewModels/AgentModeViewModel+ScheduledSend.swift`.
-- UI and projection: `Views/AgentInputBar.swift`, `Views/Components/ScheduleSendMenuButton.swift`, `AgentScheduledSendBanner.swift`, `AgentScheduledMessagesView.swift`, `ViewModels/UI/AgentScheduledMessagesViewModel.swift`, and `ViewModels/AgentModeSidebarSessionBuilder.swift`.
+- Model and persistence (AgentCore, under `Sources/RepoPromptAgentCore/AgentMode/`): `Models/AgentScheduledSend.swift`, `Runtime/AgentSession.swift`, `Runtime/AgentSessionDataService.swift`, and `Runtime/AgentSessionMetadataIndex.swift`.
+- Admission and dispatch: `Sources/RepoPromptAgentCore/AgentMode/Runtime/Scheduling/AgentScheduledSendCoordinator.swift` (with `AgentScheduledSendRecovery.swift`) and the App's `Sources/RepoPrompt/Features/AgentMode/ViewModels/AgentModeViewModel+ScheduledSend.swift`.
+- UI and projection (App, under `Sources/RepoPrompt/Features/AgentMode/`): `Views/AgentInputBar.swift`, `Views/Components/ScheduleSendMenuButton.swift`, `AgentScheduledSendBanner.swift`, `AgentScheduledMessagesView.swift`, `ViewModels/UI/AgentScheduledMessagesViewModel.swift`, and `ViewModels/AgentModeSidebarSessionBuilder.swift`.
 - Smallest regression routes are `make dev-test FILTER=AgentScheduledSendPersistenceTests`, `AgentScheduledSendCoordinatorTests`, `AgentScheduledSendDispatchTests`, `AgentModeSidebarSessionBuilderTests`, and `AgentScheduledMessagesViewModelTests`.

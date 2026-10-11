@@ -19,6 +19,7 @@
 
 import Combine
 import Foundation
+import RepoPromptAgentCore
 import RepoPromptUI
 import SwiftUI
 

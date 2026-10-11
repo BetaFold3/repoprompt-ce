@@ -1,6 +1,7 @@
 import CryptoKit
 import Darwin
 import Foundation
+import RepoPromptAgentCore
 import RepoPromptPlatform
 import RepoPromptRemoteWire
 

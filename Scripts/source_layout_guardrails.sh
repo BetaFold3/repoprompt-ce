@@ -337,7 +337,8 @@ print_matches \
   grep -R -n -E 'WorkspaceFilesViewModel|FileViewModel|FolderViewModel' \
     Sources/RepoPrompt/Features/AgentMode/ViewModels \
     Sources/RepoPrompt/Features/ContextBuilder/ViewModels \
-    Sources/RepoPrompt/Infrastructure/MCP
+    Sources/RepoPrompt/Infrastructure/MCP \
+    Sources/RepoPromptAgentCore
 
 # 6. Removed native tree visualization, IDE-mode tree search, and eager root materialization
 # seams must not return. Keep unique deleted symbols global, but scope generic names to

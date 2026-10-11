@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptAgentCore
 
 // App-owned: model choice depends on `PromptViewModel.FileEditFormat`.
 

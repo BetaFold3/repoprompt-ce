@@ -9,6 +9,7 @@
 import Foundation
 import Logging
 import MCP
+import RepoPromptAgentCore
 import RepoPromptShared
 import RepoPromptWorkspace
 

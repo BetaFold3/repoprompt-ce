@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptAgentCore
 
 /// Tools that are hidden from normal MCP connections unless explicitly granted via `additionalTools`
 /// in a connection policy. These include special-purpose tools and legacy compatibility surfaces.

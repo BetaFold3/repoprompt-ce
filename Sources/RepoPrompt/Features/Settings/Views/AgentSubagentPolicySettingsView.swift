@@ -18,6 +18,7 @@
 //  - Direct:  /RepoPrompt/Views/Settings/AgentDirectProviderPermissionsView.swift
 //
 
+import RepoPromptAgentCore
 import SwiftUI
 
 /// Sub-agent sandbox override policy pane. Applies when another agent launches a

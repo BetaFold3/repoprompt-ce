@@ -144,7 +144,15 @@ let package = Package(
         .target(
             name: "RepoPromptAgentCore",
             dependencies: [
-                .product(name: "RepoPromptShared", package: "RepoPromptCore")
+                "RepoPromptPlatform",
+                "RepoPromptWorkspace",
+                .product(name: "RepoPromptShared", package: "RepoPromptCore"),
+                "RepoPromptRemoteWire",
+                .product(name: "Logging", package: "swift-log"),
+                .product(name: "MCP", package: "swift-sdk"),
+                .product(name: "SwiftAnthropic", package: "SwiftAnthropic"),
+                .product(name: "SwiftOpenAI", package: "SwiftOpenAI"),
+                .product(name: "RepoPromptClaudeCompatibleProvider", package: "RepoPromptAgentProviders")
             ],
             path: "Sources/RepoPromptAgentCore",
             swiftSettings: repoPromptLayerSwiftSettings

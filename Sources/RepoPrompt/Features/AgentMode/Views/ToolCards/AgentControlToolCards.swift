@@ -1,3 +1,4 @@
+import RepoPromptAgentCore
 import SwiftUI
 
 struct AgentReasoningEffortBadgePresentation: Equatable {

@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptAgentCore
 
 /// The authority used to populate handoff destinations.
 enum AgentHandoffDestinationSource: Equatable {

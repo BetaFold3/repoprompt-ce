@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptAgentCore
 
 func toolResultHasPayload(_ item: AgentChatItem) -> Bool {
     guard let raw = item.toolResultJSON?.trimmingCharacters(in: .whitespacesAndNewlines) else {

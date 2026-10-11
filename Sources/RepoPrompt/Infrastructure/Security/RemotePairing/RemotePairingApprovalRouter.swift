@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptAgentCore
 
 enum RemotePairingApprovalRouterError: Error, Equatable {
     case approvalWindowUnavailable

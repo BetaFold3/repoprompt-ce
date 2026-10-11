@@ -1,6 +1,7 @@
 import CryptoKit
 import Foundation
 import MCP
+import RepoPromptAgentCore
 import RepoPromptWorkspace
 
 @MainActor

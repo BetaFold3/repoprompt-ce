@@ -19,7 +19,7 @@ Quick model picker changes the active session's model. Quick handoff creates a n
 
 ## Owning source seams
 
-- Pure catalog flattening and ranking: `Sources/RepoPrompt/Features/AgentMode/Models/ModelSelection/AgentModelSelectionIndex.swift`.
+- Pure catalog flattening and ranking: `Sources/RepoPromptAgentCore/AgentMode/Models/ModelSelection/AgentModelSelectionIndex.swift`.
 - HUD state, rendering, and presentation-driven focus assertion: `ViewModels/UI/AgentModelSelectionHUDViewModel.swift` and `Views/Components/AgentModelSelectionHUDView.swift`.
 - Presentation, live revalidation, and commits: `ViewModels/AgentModeViewModel+ModelSelectionHUD.swift`.
 - Shared MCP-only model-control interactivity, current-session commit ordering, cache-only remote catalog access, last-reply lookup, and source-pinned handoff config: `ViewModels/AgentModeViewModel+Handoff.swift`; composer props consume the same predicate in `AgentModeViewModel+ComposerUI.swift`.

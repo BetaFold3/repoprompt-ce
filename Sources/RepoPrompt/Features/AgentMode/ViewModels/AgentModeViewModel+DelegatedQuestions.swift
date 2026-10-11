@@ -1,5 +1,6 @@
 import Foundation
 import MCP
+import RepoPromptAgentCore
 
 // Delegated `ask_user` escalation (docs/context/plans/2026-10-02-oracle-errors-and-delegated-ask-user-plan.md §6;
 // owning contract: docs/context/agent-mcp-delegation-depth.md "Delegated questions").

@@ -1,7 +1,7 @@
 import Darwin
 import Foundation
 import MCP
-@testable import RepoPromptAgentCore
+@_spi(TestSupport) @testable import RepoPromptAgentCore
 @testable import RepoPromptPlatform
 @testable import RepoPromptUI
 @testable import RepoPromptWorkspace

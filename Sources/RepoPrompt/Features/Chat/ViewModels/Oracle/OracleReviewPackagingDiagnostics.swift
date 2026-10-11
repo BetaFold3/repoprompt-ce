@@ -1,5 +1,6 @@
 import CryptoKit
 import Foundation
+import RepoPromptAgentCore
 import RepoPromptWorkspace
 
 enum OracleSendOrigin: String {

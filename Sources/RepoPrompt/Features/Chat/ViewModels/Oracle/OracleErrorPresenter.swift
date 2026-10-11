@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptAgentCore
 
 /// Oracle-specific advice. Shared error formatting stays provider-neutral.
 enum OracleErrorPresenter {

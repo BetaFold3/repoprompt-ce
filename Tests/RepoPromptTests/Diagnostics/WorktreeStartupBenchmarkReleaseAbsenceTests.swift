@@ -6,8 +6,8 @@ final class WorktreeStartupBenchmarkReleaseAbsenceTests: XCTestCase {
         let root = try RepoRoot.url()
         let files = [
             "Sources/RepoPromptWorkspace/Diagnostics/WorktreeStartupInstrumentation.swift",
-            "Sources/RepoPrompt/Features/Diagnostics/AgentMode/OhMyPiAgentModeSmokeGate.swift",
-            "Sources/RepoPrompt/Features/AgentMode/Models/ModelSelection/AgentModelCatalog.swift",
+            "Sources/RepoPromptAgentCore/Diagnostics/AgentMode/OhMyPiAgentModeSmokeGate.swift",
+            "Sources/RepoPromptAgentCore/AgentMode/Models/ModelSelection/AgentModelCatalog.swift",
             "Sources/RepoPrompt/Features/Settings/ViewModels/APISettingsViewModel.swift",
             "Sources/RepoPrompt/Features/Diagnostics/App/WorktreeStartupBenchmarkDiagnostics.swift",
             "Sources/RepoPromptWorkspace/VCS/GitWorkspacePolicyCanonicalizationDiagnostics.swift",
@@ -17,15 +17,15 @@ final class WorktreeStartupBenchmarkReleaseAbsenceTests: XCTestCase {
             "Sources/RepoPrompt/Infrastructure/MCP/WindowTools/MCPAgentControlToolProvider.swift",
             "Sources/RepoPrompt/Infrastructure/MCP/AppSettingsMCPService.swift",
             "Sources/RepoPrompt/Infrastructure/MCP/MCPConnectionManager.swift",
-            "Sources/RepoPrompt/Infrastructure/MCP/MCPBootstrapLease.swift",
+            "Sources/RepoPromptAgentCore/MCP/MCPBootstrapLease.swift",
             "Sources/RepoPrompt/Features/Diagnostics/MCP/MCPConnectionManager+DebugTransportDiagnostics.swift",
             "Sources/RepoPrompt/Infrastructure/MCP/Agent/AgentRunMCPToolService.swift",
             "Sources/RepoPrompt/Infrastructure/MCP/Agent/AgentExternalMCPRunStarter.swift",
-            "Sources/RepoPrompt/Features/AgentMode/Runtime/AgentModeRunService.swift",
-            "Sources/RepoPrompt/Features/AgentMode/Runtime/Runners/ACPIntegratedAgentModeRunner.swift",
-            "Sources/RepoPrompt/Infrastructure/AI/ACP/ACPAgentSessionController.swift",
+            "Sources/RepoPromptAgentCore/AgentMode/Runtime/AgentModeRunService.swift",
+            "Sources/RepoPromptAgentCore/AgentMode/Runtime/Runners/ACPIntegratedAgentModeRunner.swift",
+            "Sources/RepoPromptAgentCore/AI/ACP/ACPAgentSessionController.swift",
             "Sources/RepoPrompt/Features/AgentMode/ViewModels/AgentModeViewModel.swift",
-            "Sources/RepoPrompt/Features/AgentMode/Runtime/Session/AgentTabSession.swift"
+            "Sources/RepoPromptAgentCore/AgentMode/Runtime/Session/AgentTabSession.swift"
         ]
         let sources = try files.map { path in
             try String(contentsOf: root.appendingPathComponent(path), encoding: .utf8)
@@ -72,7 +72,7 @@ final class WorktreeStartupBenchmarkReleaseAbsenceTests: XCTestCase {
         }
         let runnerSource = try String(
             contentsOf: root.appendingPathComponent(
-                "Sources/RepoPrompt/Features/AgentMode/Runtime/Runners/ACPIntegratedAgentModeRunner.swift"
+                "Sources/RepoPromptAgentCore/AgentMode/Runtime/Runners/ACPIntegratedAgentModeRunner.swift"
             ),
             encoding: .utf8
         )
@@ -98,7 +98,7 @@ final class WorktreeStartupBenchmarkReleaseAbsenceTests: XCTestCase {
 
         let serviceSource = try String(
             contentsOf: root.appendingPathComponent(
-                "Sources/RepoPrompt/Features/AgentMode/Runtime/AgentModeRunService.swift"
+                "Sources/RepoPromptAgentCore/AgentMode/Runtime/AgentModeRunService.swift"
             ),
             encoding: .utf8
         )

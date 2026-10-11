@@ -51,7 +51,7 @@ class OMPACPLiveSpikeTests(unittest.TestCase):
     def test_managed_omp_environment_matches_production_swift_constant(self) -> None:
         swift = (
             SCRIPT_DIR.parent
-            / "Sources/RepoPrompt/Infrastructure/AI/Providers/OhMyPi/OhMyPiAgentConfig.swift"
+            / "Sources/RepoPromptAgentCore/AI/Providers/OhMyPi/OhMyPiAgentConfig.swift"
         ).read_text(encoding="utf-8")
         managed_environment_lines = [
             line.strip() for line in swift.splitlines() if "static let managedEnvironment" in line

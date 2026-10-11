@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptAgentCore
 
 #if DEBUG
     /// Debug-only wrappers for Agent Mode transcript/code text derivation metrics.

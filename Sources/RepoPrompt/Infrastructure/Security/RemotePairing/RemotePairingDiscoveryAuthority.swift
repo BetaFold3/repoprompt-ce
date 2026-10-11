@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptAgentCore
 import RepoPromptRemoteWire
 
 struct RemotePairingApprovalContext: Equatable {

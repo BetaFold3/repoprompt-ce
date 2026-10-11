@@ -1,6 +1,7 @@
 import Foundation
 import Markdown
 import MCP
+import RepoPromptAgentCore
 import RepoPromptUI
 import SwiftUI
 

@@ -2766,7 +2766,7 @@ Primary metric eligible: no
 - Wave head verified before validation: clean working tree, `HEAD=4423bf1d`.
 - Members/files changed:
   - `f3dca88d` Optimize worktree API smoke selection settles — `Tests/RepoPromptTests/MCP/WorktreeAPISmokeHarnessTests.swift`.
-  - `39b40a31` Optimize ACP startup fake discovery gates — `Sources/RepoPrompt/Infrastructure/AI/Providers/Cursor/CursorACPModelPollingService.swift`, `Sources/RepoPrompt/Infrastructure/AI/Providers/OpenCode/OpenCodeACPModelPollingService.swift`, `Tests/RepoPromptTests/ContextBuilder/ContextBuilderModelStartupSelectionTests.swift`.
+  - `39b40a31` Optimize ACP startup fake discovery gates — `Sources/RepoPromptAgentCore/AI/Providers/Cursor/CursorACPModelPollingService.swift`, `Sources/RepoPromptAgentCore/AI/Providers/OpenCode/OpenCodeACPModelPollingService.swift`, `Tests/RepoPromptTests/ContextBuilder/ContextBuilderModelStartupSelectionTests.swift`.
   - `4423bf1d` Optimize mention coordinator debounce tests — `Sources/RepoPrompt/Infrastructure/UI/TextField/MentionCoordinator.swift`, `Tests/RepoPromptTests/Mentions/MentionCoordinatorTests.swift`.
 - Per-member root deltas were not individually measured. No pre-change focused optimizer artifacts were captured for these three members, so the after-only focused artifacts below are recorded as post-change evidence and the aggregate root delta is deferred to a future wave/root gate.
 - No complete-root gate was run in this pass. Raw conductor logs remain outside the repository and were not committed.

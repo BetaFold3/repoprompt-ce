@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptAgentCore
 import SwiftUI
 
 // MARK: - Settings Managing Protocol

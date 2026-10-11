@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptAgentCore
 
 /// The only time transcript search spends: injected so debounce/flash timing is deterministic in
 /// tests instead of relying on real sleeps, which would make the suite slow and flaky.

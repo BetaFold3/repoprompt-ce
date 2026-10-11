@@ -15,7 +15,7 @@ Last-verified: 2026-10-03
 
 ## Lineage
 
-- Depth is derived on demand from the existing `parentSessionID` chain and is never persisted. `AgentDelegationPolicy` (`Sources/RepoPrompt/Features/AgentMode/Runtime/AgentDelegationPolicy.swift`) holds the pure rules; `AgentModeViewModel` supplies the live and index lookups.
+- Depth is derived on demand from the existing `parentSessionID` chain and is never persisted. `AgentDelegationPolicy` (`Sources/RepoPromptAgentCore/AgentMode/Runtime/AgentDelegationPolicy.swift`) holds the pure rules; `AgentModeViewModel` supplies the live and index lookups.
 - A session's parent is reconciled across every claim for its durable identity: each live record bound to it and its owner-validated session-index entry. The caller resolved from its run-scoped tab is one of those records.
   - A live record with a parent claims that parent. A hydrated live record without a parent claims root. An unhydrated live record without a parent makes no claim, because its persisted parent may not have loaded yet.
   - An index entry claims its recorded parent, or root when it records none.
@@ -112,7 +112,7 @@ A nil audience keeps the legacy role-derived copy for direct callers. Tool descr
 
 ## Delegated questions
 
-A child's `ask_user` is addressed to whoever controls that child. `AgentDelegatedQuestionAudience` (`Sources/RepoPrompt/Features/AgentMode/Runtime/AgentDelegatedQuestionAudience.swift`) resolves the audience. It uses the same reconciled parent lookup (`mcpDelegationParentLookup`) and lineage that depth uses, so there is no second lineage reader. Design rationale and owner decisions: [delegated `ask_user` escalation plan](plans/2026-10-02-oracle-errors-and-delegated-ask-user-plan.md) §6.
+A child's `ask_user` is addressed to whoever controls that child. `AgentDelegatedQuestionAudience` (`Sources/RepoPromptAgentCore/AgentMode/Runtime/AgentDelegatedQuestionAudience.swift`) resolves the audience. It uses the same reconciled parent lookup (`mcpDelegationParentLookup`) and lineage that depth uses, so there is no second lineage reader. Design rationale and owner decisions: [delegated `ask_user` escalation plan](plans/2026-10-02-oracle-errors-and-delegated-ask-user-plan.md) §6.
 
 | Asking session | Audience | Behavior |
 |---|---|---|

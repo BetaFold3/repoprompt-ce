@@ -1,3 +1,4 @@
+import RepoPromptAgentCore
 import SwiftUI
 
 // MARK: - Scroll Placement & Reason

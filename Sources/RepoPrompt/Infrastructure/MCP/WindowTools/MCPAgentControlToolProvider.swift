@@ -3,6 +3,7 @@ import JSONSchema
 import MCP
 import Ontology
 import OrderedCollections
+import RepoPromptAgentCore
 import RepoPromptShared
 
 @MainActor

@@ -1,4 +1,5 @@
 import MCP
+import RepoPromptAgentCore
 
 /// Per-connection `tools/list` annotation adjustment for app-owned Agent Mode runs.
 ///

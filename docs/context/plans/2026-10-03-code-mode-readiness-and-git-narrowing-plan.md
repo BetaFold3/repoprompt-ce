@@ -37,7 +37,7 @@ Non-goals: Pi provider integration; Context Builder changes; Knowledge policy ch
 | Successful window-tool calls return Markdown content only: `CallTool.Result(content: contentBlocks, isError: false)`. | `Sources/RepoPrompt/Infrastructure/MCP/MCPConnectionManager.swift:13102-13103` |
 | No server code produces `structuredContent` or `outputSchema`; they appear only in result readers. | `AgentTranscriptServices.swift:365`, `ToolJSON.swift:9`, `RepoPromptGateway/Wire/RemoteWireMCPBridge.swift:33` |
 | The pinned SDK already supports both fields. | `.build/checkouts/swift-sdk/Sources/MCP/Server/Tools.swift:23` (`Tool.outputSchema`), `:407` (`CallTool.Result.structuredContent`) |
-| Typed DTOs exist and are encoded to `Value` before formatting. | `Sources/RepoPrompt/Infrastructure/MCP/ToolResultDTOs.swift:107-159` (`SearchResultDTO`), `:246` (`FileTreeDTO`), `:282` (`CodeStructureReplyDTO`), `:731` (`ReadFileReply`), `:2115` (`GitToolReplyDTO`); `Tool.swift:31-46` |
+| Typed DTOs exist and are encoded to `Value` before formatting. | `Sources/RepoPromptAgentCore/MCP/ToolResultDTOs.swift:107-159` (`SearchResultDTO`), `:246` (`FileTreeDTO`), `:282` (`CodeStructureReplyDTO`), `:731` (`ReadFileReply`), `:2115` (`GitToolReplyDTO`); `Tool.swift:31-46` |
 | Hidden `_rawJSON` returns compact JSON text. | `MCPToolArgsNormalizer.swift:161-163,203-205`; `ToolOutputFormatter.swift:977-1021` |
 | Custom client capabilities must be strings; non-string experimental entries are stripped at the socket boundary. | `MCPInitializeCompatibility.swift:22-24`; `docs/context/workflows/development.md:87-96` |
 | Connection lanes are independent `AsyncLimiter`s; there is no cross-lane drain. | `MCPConnectionManager.swift:1535-1545`, `:1821-1836` |

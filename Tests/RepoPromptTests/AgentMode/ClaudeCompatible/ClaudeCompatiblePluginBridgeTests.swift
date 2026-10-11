@@ -9,7 +9,7 @@ import XCTest
 final class ClaudeCompatiblePluginBridgeTests: XCTestCase {
     func testOnlyBridgeImportsProviderPackage() throws {
         let repoRoot = try RepoRoot.url()
-        let expected = "Sources/RepoPrompt/Infrastructure/AI/Providers/ClaudeCode/ClaudeCompatibleProviderRuntimeBridge.swift"
+        let expected = "Sources/RepoPromptAgentCore/AI/Providers/ClaudeCode/ClaudeCompatibleProviderRuntimeBridge.swift"
         let imports = try RepoRoot.librarySourceRoots.flatMap { root in
             try sourceFilesImportingProviderPackage(
                 under: repoRoot.appendingPathComponent(root, isDirectory: true),

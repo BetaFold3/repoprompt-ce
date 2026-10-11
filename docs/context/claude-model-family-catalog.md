@@ -8,13 +8,13 @@ Last-verified: 2026-09-24
 
 Keep these authorities separate:
 
-- `Sources/RepoPrompt/Infrastructure/AI/ModelCatalog/Providers/ClaudeModelFamilyCatalog.swift` is the core, keyless authority for supported family/major anchors, point-release grammar, family effort metadata, CLI context windows, and API request-shape traits.
-- `Sources/RepoPrompt/Infrastructure/AI/ModelCatalog/Providers/AnthropicAPIModelsClient.swift` fetches and validates official `GET /v1/models` descriptors.
-- `Sources/RepoPrompt/Infrastructure/AI/ModelCatalog/Providers/AnthropicDiscoveredModelStore.swift` is the persisted descriptor authority.
-- `Sources/RepoPrompt/Infrastructure/AI/ModelCatalog/Providers/ClaudeCodeAIModelCatalog.swift` combines static Claude Code entries, Anthropic registry entries, and verified CLI-discovered point releases for Oracle/picker presentation while retaining grammar-based validation.
-- `Sources/RepoPrompt/Infrastructure/AI/Providers/ClaudeCode/ClaudeCLIModelDiscoveryProbe.swift` owns initialization-only CLI discovery; `ClaudeCLIModelDiscoveryService.swift` owns shared refresh lifecycle and status. `Sources/RepoPrompt/Infrastructure/AI/ModelCatalog/Providers/ClaudeCLIDiscoveredModelStore.swift` owns its separate scoped cache.
-- `Sources/RepoPrompt/Features/AgentMode/Providers/ClaudeCompatible/ClaudeCompatibleModelCatalogAdapter.swift` overlays those dynamic entries only for standard `.claudeCode`.
-- `Sources/RepoPrompt/Infrastructure/AI/Providers/Anthropic/AnthropicModelFamilyTraits.swift` applies exact-ID overrides before family traits; `AnthropicModelConfiguration.swift` and `AnthropicRequestPlan.swift` turn those traits into native API requests.
+- `Sources/RepoPromptAgentCore/AI/ModelCatalog/Providers/ClaudeModelFamilyCatalog.swift` is the core, keyless authority for supported family/major anchors, point-release grammar, family effort metadata, CLI context windows, and API request-shape traits.
+- `Sources/RepoPromptAgentCore/AI/ModelCatalog/Providers/AnthropicAPIModelsClient.swift` fetches and validates official `GET /v1/models` descriptors.
+- `Sources/RepoPromptAgentCore/AI/ModelCatalog/Providers/AnthropicDiscoveredModelStore.swift` is the persisted descriptor authority.
+- `Sources/RepoPromptAgentCore/AI/ModelCatalog/Providers/ClaudeCodeAIModelCatalog.swift` combines static Claude Code entries, Anthropic registry entries, and verified CLI-discovered point releases for Oracle/picker presentation while retaining grammar-based validation.
+- `Sources/RepoPromptAgentCore/AI/Providers/ClaudeCode/ClaudeCLIModelDiscoveryProbe.swift` owns initialization-only CLI discovery; `ClaudeCLIModelDiscoveryService.swift` owns shared refresh lifecycle and status. `Sources/RepoPromptAgentCore/AI/ModelCatalog/Providers/ClaudeCLIDiscoveredModelStore.swift` owns its separate scoped cache.
+- `Sources/RepoPromptAgentCore/AgentMode/Providers/ClaudeCompatible/ClaudeCompatibleModelCatalogAdapter.swift` overlays those dynamic entries only for standard `.claudeCode`.
+- `Sources/RepoPromptAgentCore/AI/Providers/Anthropic/AnthropicModelFamilyTraits.swift` applies exact-ID overrides before family traits; `AnthropicModelConfiguration.swift` and `AnthropicRequestPlan.swift` turn those traits into native API requests.
 
 The in-repo `RepoPromptClaudeCompatibleProvider` package remains the static Claude-compatible catalog and runtime seam. Dynamic registry, grammar, persistence, and request shaping are app-core concerns. The overlay never extends GLM, Kimi, or custom Claude-compatible backend catalogs.
 

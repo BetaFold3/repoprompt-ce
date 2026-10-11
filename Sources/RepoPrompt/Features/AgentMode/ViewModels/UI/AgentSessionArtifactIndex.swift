@@ -1,5 +1,6 @@
 import Combine
 import Foundation
+import RepoPromptAgentCore
 
 /// The newest-first list of documents an agent wrote in one tab's session.
 ///

@@ -913,8 +913,8 @@
                 source("Sources/RepoPrompt/Infrastructure/MCP/UnixSocketMCPTransport.swift"),
                 source("Packages/RepoPromptCore/Sources/RepoPromptShared/MCP/JSONRPCBridgeLedger.swift"),
                 source("Packages/RepoPromptCore/Sources/RepoPromptMCPCore/RepoPromptMCPCore.swift"),
-                source("Sources/RepoPrompt/Infrastructure/AI/Agents/AgentToolTracker.swift"),
-                source("Sources/RepoPrompt/Features/AgentMode/Runtime/AgentRunTerminalCommitBarrier.swift")
+                source("Sources/RepoPromptAgentCore/AI/Agents/AgentToolTracker.swift"),
+                source("Sources/RepoPromptAgentCore/AgentMode/Runtime/AgentRunTerminalCommitBarrier.swift")
             ].joined(separator: "\n")
             for hook in [
                 "frame_accepted",

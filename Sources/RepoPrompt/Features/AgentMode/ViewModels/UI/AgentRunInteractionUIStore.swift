@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptAgentCore
 
 struct AgentRunInteractionUISnapshot: Equatable {
     var currentTabID: UUID?

@@ -1,5 +1,6 @@
 import Foundation
 import MCP
+import RepoPromptAgentCore
 import RepoPromptWorkspace
 
 extension Value {

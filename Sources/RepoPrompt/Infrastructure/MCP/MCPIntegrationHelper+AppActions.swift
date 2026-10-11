@@ -1,5 +1,6 @@
 import AppKit
 import Foundation
+import RepoPromptAgentCore
 
 /// App-level MCP integration actions: deep links into other apps, the clipboard,
 /// and command-line installers.

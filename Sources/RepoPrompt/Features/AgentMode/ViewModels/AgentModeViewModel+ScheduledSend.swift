@@ -1,5 +1,6 @@
 import Combine
 import Foundation
+import RepoPromptAgentCore
 
 // MARK: - VM ↔ UI contract (Agent Mode scheduled sends, plan §3.3/§3.4)
 

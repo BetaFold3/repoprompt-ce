@@ -1,4 +1,5 @@
 import MCP
+import RepoPromptAgentCore
 
 /// Connection-specific MCP tool metadata adjustments for Codex compatibility.
 ///

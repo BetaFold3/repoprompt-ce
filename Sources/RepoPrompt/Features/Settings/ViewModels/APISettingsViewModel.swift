@@ -1,5 +1,6 @@
 import Combine
 import Darwin
+import RepoPromptAgentCore
 import RepoPromptPlatform
 import SwiftUI
 

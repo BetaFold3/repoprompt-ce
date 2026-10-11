@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptAgentCore
 
 extension AgentModeViewModel {
     func makeUtilityPanelUISnapshot() -> AgentUtilityPanelUISnapshot {

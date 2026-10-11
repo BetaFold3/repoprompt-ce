@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptAgentCore
 
 enum OhMyPiThinkingSelectionProbeTrigger {
     #if DEBUG

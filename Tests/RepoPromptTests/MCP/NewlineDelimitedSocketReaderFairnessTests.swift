@@ -275,7 +275,7 @@ final class NewlineDelimitedSocketReaderFairnessTests: XCTestCase {
 
         let appCopy = try Data(
             contentsOf: root.appendingPathComponent(
-                "Sources/RepoPrompt/Infrastructure/MCP/AppShared/NewlineDelimitedSocketReader.swift"
+                "Sources/RepoPromptAgentCore/MCP/AppShared/NewlineDelimitedSocketReader.swift"
             )
         )
         let clientKitCopy = try Data(

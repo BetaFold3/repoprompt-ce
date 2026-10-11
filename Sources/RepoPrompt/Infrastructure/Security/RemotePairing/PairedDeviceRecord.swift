@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptAgentCore
 
 struct WebPushSubscriptionRecord: Codable, Equatable {
     var endpoint: String

@@ -1,5 +1,6 @@
 import Foundation
 import MCP
+import RepoPromptAgentCore
 
 enum ContextBuilderResponseType: String {
     case plan

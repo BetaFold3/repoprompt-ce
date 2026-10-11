@@ -1,4 +1,5 @@
 import MCP
+import RepoPromptAgentCore
 
 struct CursorAgentParameterMetadataBuilder {
     static let includeParametersFlag = "include_model_parameters"

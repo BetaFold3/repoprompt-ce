@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptAgentCore
 
 /// App-owned `AIModelOverrideReading` backed by `ModelOverridesSettings`.
 ///

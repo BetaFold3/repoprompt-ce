@@ -1,5 +1,6 @@
 import Combine
 import OSLog
+import RepoPromptAgentCore
 import RepoPromptUI
 import RepoPromptWorkspace
 import SwiftUI

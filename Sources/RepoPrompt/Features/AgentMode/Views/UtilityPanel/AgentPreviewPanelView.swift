@@ -1,5 +1,6 @@
 import AppKit
 import struct Markdown.Document
+import RepoPromptAgentCore
 import RepoPromptUI
 import SwiftUI
 

@@ -1,0 +1,14 @@
+import Foundation
+
+/// Global effective availability used by non-window OMP request surfaces.
+///
+/// Window-owned settings view models keep using their published connection state, while
+/// global services and one-shot providers share this persisted connection + DEBUG override.
+package enum OhMyPiConnectionAvailability {
+    package static func isEffectivelyConnected(
+        userDefaults: UserDefaults = .standard,
+        debugOverride: Bool
+    ) -> Bool {
+        userDefaults.bool(forKey: "OhMyPiCLIConnected") || debugOverride
+    }
+}

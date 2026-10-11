@@ -1,5 +1,6 @@
 import Foundation
 import OSLog
+import RepoPromptAgentCore
 import RepoPromptRemoteWire
 
 @MainActor

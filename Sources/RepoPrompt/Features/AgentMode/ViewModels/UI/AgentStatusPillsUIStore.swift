@@ -1,5 +1,6 @@
 import Combine
 import Foundation
+import RepoPromptAgentCore
 
 struct AgentExecutionLocationProps: Equatable {
     let tabID: UUID

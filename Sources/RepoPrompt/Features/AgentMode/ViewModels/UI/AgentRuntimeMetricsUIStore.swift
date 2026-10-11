@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptAgentCore
 
 @MainActor
 final class AgentRuntimeMetricsUIStore: ObservableObject {

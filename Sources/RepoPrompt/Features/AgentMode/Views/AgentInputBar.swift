@@ -8,6 +8,7 @@
 
 import AppKit
 import Combine
+import RepoPromptAgentCore
 import RepoPromptUI
 import RepoPromptWorkspace
 import SwiftUI

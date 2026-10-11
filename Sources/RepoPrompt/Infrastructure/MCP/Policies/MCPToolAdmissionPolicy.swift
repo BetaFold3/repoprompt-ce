@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptAgentCore
 
 enum MCPToolAdmissionClass: String, CaseIterable {
     /// Mutating, lifecycle, approval, and interactive tools. The connection lane remains

@@ -1,6 +1,7 @@
 import Combine
 import Foundation
 import OSLog
+import RepoPromptAgentCore
 import RepoPromptWorkspace
 
 // SEARCH-HELPER: AgentDocumentPreviewViewModel, preview document resolution, live reload, containment

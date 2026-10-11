@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptAgentCore
 
 private struct AgentModelSelectionHUDCommitError: LocalizedError {
     let message: String

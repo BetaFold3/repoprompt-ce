@@ -6,6 +6,7 @@
 //
 
 import Foundation
+import RepoPromptAgentCore
 import RepoPromptShared
 import SwiftUI
 

@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptAgentCore
 
 extension CodexReasoningSummaries {
     @MainActor

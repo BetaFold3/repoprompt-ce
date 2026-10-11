@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptAgentCore
 import RepoPromptWorkspace
 
 /// Sendable read-file slicing and reply projection used by the MainActor provider.

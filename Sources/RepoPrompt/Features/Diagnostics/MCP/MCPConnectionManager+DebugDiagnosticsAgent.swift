@@ -2,6 +2,7 @@
 
 import Foundation
 import MCP
+import RepoPromptAgentCore
 
 #if DEBUG
     extension ServerNetworkManager {

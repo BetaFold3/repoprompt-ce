@@ -930,7 +930,7 @@ final class MCPSocketDescriptorHardeningTests: XCTestCase {
             let caseLabel = "testAppAndClientKitReadersShareFairOneShotTerminalCancellationLifecycle"
             let root = try RepoRoot.url()
             let appReader = try Self.sourceText(
-                "Sources/RepoPrompt/Infrastructure/MCP/AppShared/NewlineDelimitedSocketReader.swift",
+                "Sources/RepoPromptAgentCore/MCP/AppShared/NewlineDelimitedSocketReader.swift",
                 relativeTo: root
             )
             let clientKitReader = try Self.sourceText(

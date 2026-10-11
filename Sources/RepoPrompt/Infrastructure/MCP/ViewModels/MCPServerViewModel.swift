@@ -12,6 +12,7 @@ import JSONSchema
 import Logging
 import MCP
 import Ontology
+import RepoPromptAgentCore
 import RepoPromptPlatform
 import RepoPromptShared
 import RepoPromptWorkspace
@@ -2622,8 +2623,8 @@ final class MCPServerViewModel: ObservableObject {
         steeringDebugLog("[AgentRunSteeringWake] parent wake yielded source=\(source) parentRunID=\(runID)")
     }
 
-    typealias AgentRunWaitDrainBlockers = RepoPromptApp.AgentRunWaitDrainBlockers
-    typealias AgentRunWaitDrainOutcome = RepoPromptApp.AgentRunWaitDrainOutcome
+    typealias AgentRunWaitDrainBlockers = RepoPromptAgentCore.AgentRunWaitDrainBlockers
+    typealias AgentRunWaitDrainOutcome = RepoPromptAgentCore.AgentRunWaitDrainOutcome
 
     @MainActor
     func agentRunWaitDrainBlockers(runID: UUID, now: Date = Date()) -> AgentRunWaitDrainBlockers {

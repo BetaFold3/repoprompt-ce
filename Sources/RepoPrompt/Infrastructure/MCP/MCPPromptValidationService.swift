@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptAgentCore
 
 /// Actor that coordinates validation of installed workspace skills and Codex prompts.
 /// Ensures validations are serialized to avoid concurrent file writes.

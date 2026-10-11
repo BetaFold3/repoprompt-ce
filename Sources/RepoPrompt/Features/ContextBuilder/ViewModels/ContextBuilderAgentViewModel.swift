@@ -1,5 +1,6 @@
 import AppKit
 import Combine
+import RepoPromptAgentCore
 import RepoPromptPlatform
 import RepoPromptWorkspace
 import SwiftUI

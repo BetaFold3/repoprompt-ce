@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptAgentCore
 import RepoPromptPlatform
 
 // App-owned: records agent CLI path-resolution failures installed as

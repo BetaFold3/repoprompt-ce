@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptAgentCore
 
 /// File-backed store for copy/chat/model presets.
 ///

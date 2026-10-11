@@ -1,6 +1,7 @@
 #if DEBUG
     import Foundation
     import MCP
+    @_spi(TestSupport) import RepoPromptAgentCore
 
     // MARK: - Stress Harness Helpers
 

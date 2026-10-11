@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptAgentCore
 import RepoPromptWorkspace
 
 enum AgentSidebarThreadKey: Hashable, Equatable {
@@ -84,7 +85,7 @@ extension AgentModeViewModel {
 
     typealias RunInteractionStateChangeReason = AgentRunInteractionStateChangeReason
 
-    typealias AgentInteractionTransport = RepoPromptApp.AgentInteractionTransport
+    typealias AgentInteractionTransport = RepoPromptAgentCore.AgentInteractionTransport
 
     typealias UIRefreshScope = AgentUIRefreshScope
 
@@ -347,9 +348,9 @@ extension AgentModeViewModel {
     /// provider binding layer's top-level permission profile model.
     typealias AgentPermissionProfile = AgentProviderPermissionProfile
 
-    typealias AgentRunEpochTransitionIntent = RepoPromptApp.AgentRunEpochTransitionIntent
+    typealias AgentRunEpochTransitionIntent = RepoPromptAgentCore.AgentRunEpochTransitionIntent
 
-    typealias AgentMCPControlContext = RepoPromptApp.AgentMCPControlContext
+    typealias AgentMCPControlContext = RepoPromptAgentCore.AgentMCPControlContext
 
     /// Internal for cross-file AgentModeViewModel extension access after the mechanical file split.
     enum MCPActiveInstructionDeliverySignalTiming: Equatable {
@@ -492,7 +493,7 @@ extension AgentModeViewModel {
 
     typealias SourceItemsMutation = AgentSourceItemsMutation
 
-    typealias AgentTranscriptAutoFollowArmingState = RepoPromptApp.AgentTranscriptAutoFollowArmingState
+    typealias AgentTranscriptAutoFollowArmingState = RepoPromptAgentCore.AgentTranscriptAutoFollowArmingState
 
     typealias PendingSourceItemsMutationSummary = AgentPendingSourceItemsMutationSummary
 
@@ -628,7 +629,7 @@ extension AgentModeViewModel {
         var stashedTabIDs: Set<UUID> = []
     }
 
-    typealias AgentExecutionWorktreeSelection = RepoPromptApp.AgentExecutionWorktreeSelection
+    typealias AgentExecutionWorktreeSelection = RepoPromptAgentCore.AgentExecutionWorktreeSelection
 
     typealias InitialStartLocation = AgentInitialStartLocation
 

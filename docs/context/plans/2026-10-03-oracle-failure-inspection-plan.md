@@ -267,7 +267,7 @@ No input-schema parameters are added. Old clients see strictly fewer rejections.
 
 ### B1. One shared pure projection
 
-Add `Sources/RepoPrompt/Features/AgentMode/Runtime/Transcript/OracleToolResultInspection.swift`. It contains immutable values plus synchronous, non-throwing helpers used by both persistence and the card, so live and reloaded cards cannot diverge. It holds no sessions, view models, operation-store references, or caches.
+Add `Sources/RepoPromptAgentCore/AgentMode/Runtime/Transcript/OracleToolResultInspection.swift`. It contains immutable values plus synchronous, non-throwing helpers used by both persistence and the card, so live and reloaded cards cannot diverge. It holds no sessions, view models, operation-store references, or caches.
 
 Diagnostic selection is deterministic: take the first failure diagnostic in source order. In priority:
 1. a structured `errors[]` entry with a non-empty message;

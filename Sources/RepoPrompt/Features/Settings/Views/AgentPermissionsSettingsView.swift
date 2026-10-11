@@ -29,6 +29,7 @@
 //  - Components:  /RepoPrompt/Views/Settings/AgentPermissionSettingsComponents.swift
 //
 
+import RepoPromptAgentCore
 import SwiftUI
 
 /// Settings page that shows top-level CLI provider permissions and the sub-agent

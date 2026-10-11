@@ -6,6 +6,7 @@
 //
 
 import Foundation
+import RepoPromptAgentCore
 
 /// Instructions text returned in the MCP Initialize response.
 /// Tailored per `MCPRunPurpose` so each connection only sees guidance for its available tools.

@@ -5,6 +5,7 @@
 //  Created by RepoPrompt on 2026-02-05.
 //
 
+import RepoPromptAgentCore
 import RepoPromptUI
 import SwiftUI
 

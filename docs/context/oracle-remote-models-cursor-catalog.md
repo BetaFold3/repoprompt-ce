@@ -8,15 +8,15 @@ Last-verified: 2026-09-03
 
 The implementation is split deliberately; do not introduce a parallel model or parameter authority.
 
-- Oracle model identity and provider routing: `Sources/RepoPrompt/Infrastructure/AI/AIModel.swift` and `Sources/RepoPrompt/Infrastructure/AI/Providers/AIProviderFactory.swift`.
-- Dynamic ACP model authority: `Sources/RepoPrompt/Features/AgentMode/Models/ModelSelection/AgentACPModelRegistry.swift` and `Sources/RepoPrompt/Infrastructure/AI/ModelCatalog/Providers/ACPAIModelCatalog.swift`.
-- OMP Oracle execution: `Sources/RepoPrompt/Infrastructure/AI/Providers/OhMyPi/OhMyPiCLIProvider.swift` and the OMP ACP headless provider.
-- Shared one-shot lifecycle: `Sources/RepoPrompt/Infrastructure/AI/Providers/HeadlessCLIStreamBridge.swift`.
-- OMP model grouping/presentation: `Sources/RepoPrompt/Features/AgentMode/Models/ModelSelection/OhMyPiModelMenuProjector.swift` is the shared raw-wire projector; `Sources/RepoPrompt/Features/Settings/Views/OhMyPiModelMenuBuilder.swift` is its settings/Oracle adapter.
-- OMP destination intent and typed execution metadata: `Sources/RepoPrompt/Infrastructure/AI/Models/OhMyPiThinkingSelections.swift`, destination/tab/preset owners, and `Sources/RepoPrompt/Infrastructure/AI/AIMessage.swift`.
+- Oracle model identity and provider routing: `Sources/RepoPromptAgentCore/AI/AIModel.swift` and `Sources/RepoPromptAgentCore/AI/Providers/AIProviderFactory.swift`.
+- Dynamic ACP model authority: `Sources/RepoPromptAgentCore/AgentMode/Models/ModelSelection/AgentACPModelRegistry.swift` and `Sources/RepoPromptAgentCore/AI/ModelCatalog/Providers/ACPAIModelCatalog.swift`.
+- OMP Oracle execution: `Sources/RepoPromptAgentCore/AI/Providers/OhMyPi/OhMyPiCLIProvider.swift` and the OMP ACP headless provider.
+- Shared one-shot lifecycle: `Sources/RepoPromptAgentCore/AI/Providers/HeadlessCLIStreamBridge.swift`.
+- OMP model grouping/presentation: `Sources/RepoPromptAgentCore/AgentMode/Models/ModelSelection/OhMyPiModelMenuProjector.swift` is the shared raw-wire projector; `Sources/RepoPrompt/Features/Settings/Views/OhMyPiModelMenuBuilder.swift` is its settings/Oracle adapter.
+- OMP destination intent and typed execution metadata: `Sources/RepoPromptAgentCore/AI/Models/OhMyPiThinkingSelections.swift`, destination/tab/preset owners, and `Sources/RepoPromptAgentCore/AI/AIMessage.swift`.
 - OMP thinking capability authority: the separate `OhMyPiThinkingCapabilityRegistry.swift`, `OhMyPiThinkingCapabilityResolver.swift`, and shared row-only `OhMyPiThinkingMenuBuilder.swift`; never fold capability state into the dynamic model registry.
-- Cursor parameter persistence and catalog authority: `Sources/RepoPrompt/Infrastructure/AI/Providers/Cursor/CursorModelParameterStore.swift` and `CursorModelParameterCatalog.swift`.
-- Cursor discovery/recovery: `Sources/RepoPrompt/Infrastructure/AI/Providers/Cursor/CursorACPModelPollingService.swift`.
+- Cursor parameter persistence and catalog authority: `Sources/RepoPromptAgentCore/AI/Providers/Cursor/CursorModelParameterStore.swift` and `CursorModelParameterCatalog.swift`.
+- Cursor discovery/recovery: `Sources/RepoPromptAgentCore/AI/Providers/Cursor/CursorACPModelPollingService.swift`.
 - Cursor parameter application and bracket grammar: the Cursor parameterized-model controller and `CursorBracketModelID.swift`.
 - MCP projection: `Sources/RepoPrompt/Infrastructure/MCP/Agent/CursorAgentParameterMetadataBuilder.swift` and `AgentManageMCPToolService.swift`.
 - Tool schema and remote forwarding: `Sources/RepoPrompt/Infrastructure/MCP/WindowTools/MCPAgentControlToolProvider.swift` and `Sources/RepoPromptGateway/Wire/RemoteCommandTranslator.swift`.

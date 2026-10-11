@@ -1,4 +1,5 @@
 import AppKit
+import RepoPromptAgentCore
 import RepoPromptUI
 import SwiftUI
 

@@ -1,5 +1,6 @@
 import Combine
 import Foundation
+import RepoPromptAgentCore
 
 @MainActor
 final class AgentComposerUIStore: ObservableObject {

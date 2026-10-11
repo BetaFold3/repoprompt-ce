@@ -10,6 +10,7 @@ import Darwin
 import Foundation
 import Logging
 import OSLog
+import RepoPromptAgentCore
 import RepoPromptRemoteWire
 import RepoPromptShared
 import SwiftUI

@@ -41,8 +41,8 @@ The seam intentionally stops short of dynamic plugin loading. It is static Swift
 
 Two thin facades sit between core and the package so lower-level infrastructure files (for example `ClaudeCodeLaunchEnvironmentResolver`) do not depend upward on Agent Mode:
 
-- **`ClaudeCompatibleProviderRuntimeBridge`** (`Sources/RepoPrompt/Infrastructure/AI/Providers/ClaudeCode/ClaudeCompatibleProviderRuntimeBridge.swift`) is the single core import point for `RepoPromptClaudeCompatibleProvider`. It owns the package's type aliases, DTO conversions, and pure runtime helpers (prompt delivery, environment building, model normalization, headless argument construction, launch-environment resolution, catalog snapshots, stream-result mapping).
-- **`ClaudeCompatiblePluginBridge`** (`Sources/RepoPrompt/Features/AgentMode/Providers/ClaudeCompatible/ClaudeCompatiblePluginBridge.swift`) is the Agent-Mode-facing facade. It maps `AgentProviderKind` to the package's `ClaudeCompatibleProviderPluginID`, derives availability, builds runtime configs from Agent Mode / discovery contexts, and forwards every other helper to the infrastructure bridge.
+- **`ClaudeCompatibleProviderRuntimeBridge`** (`Sources/RepoPromptAgentCore/AI/Providers/ClaudeCode/ClaudeCompatibleProviderRuntimeBridge.swift`) is the single core import point for `RepoPromptClaudeCompatibleProvider`. It owns the package's type aliases, DTO conversions, and pure runtime helpers (prompt delivery, environment building, model normalization, headless argument construction, launch-environment resolution, catalog snapshots, stream-result mapping).
+- **`ClaudeCompatiblePluginBridge`** (`Sources/RepoPromptAgentCore/AgentMode/Providers/ClaudeCompatible/ClaudeCompatiblePluginBridge.swift`) is the Agent-Mode-facing facade. It maps `AgentProviderKind` to the package's `ClaudeCompatibleProviderPluginID`, derives availability, builds runtime configs from Agent Mode / discovery contexts, and forwards every other helper to the infrastructure bridge.
 
 Anywhere outside these two files, core code interacts with Claude-compatible plugin DTOs through one of the bridges, not through a raw package import.
 
@@ -166,7 +166,7 @@ A configured path is validated before launch. Failure produces a typed error and
 
 ### `ClaudeCompatibleProviderRuntimeBridge` (infrastructure)
 
-Path: `Sources/RepoPrompt/Infrastructure/AI/Providers/ClaudeCode/ClaudeCompatibleProviderRuntimeBridge.swift`.
+Path: `Sources/RepoPromptAgentCore/AI/Providers/ClaudeCode/ClaudeCompatibleProviderRuntimeBridge.swift`.
 
 This is the only file in core that `import RepoPromptClaudeCompatibleProvider`. It is responsible for:
 
@@ -187,7 +187,7 @@ Files that depend on this bridge (illustrative):
 
 ### `ClaudeCompatiblePluginBridge` (Agent Mode feature facade)
 
-Path: `Sources/RepoPrompt/Features/AgentMode/Providers/ClaudeCompatible/ClaudeCompatiblePluginBridge.swift`.
+Path: `Sources/RepoPromptAgentCore/AgentMode/Providers/ClaudeCompatible/ClaudeCompatiblePluginBridge.swift`.
 
 Responsibilities the infrastructure bridge cannot cleanly own because they require Agent-Mode-only concepts:
 
@@ -200,7 +200,7 @@ Everything else is a thin pass-through to `ClaudeCompatibleProviderRuntimeBridge
 
 ## Adapter trio
 
-The Agent Mode side of the bridge ships three small adapters under `Sources/RepoPrompt/Features/AgentMode/Providers/ClaudeCompatible/`.
+The Agent Mode side of the bridge ships three small adapters under `Sources/RepoPromptAgentCore/AgentMode/Providers/ClaudeCompatible/`.
 
 ### `ClaudeCompatibleNativeSessionAdapter`
 
@@ -221,7 +221,7 @@ The Agent Mode side of the bridge ships three small adapters under `Sources/Repo
 
 ## Provider-neutral native runtime contract
 
-Path: `Sources/RepoPrompt/Features/AgentMode/Runtime/Native/NativeAgentRuntimeContracts.swift`.
+Path: `Sources/RepoPromptAgentCore/AgentMode/Runtime/Native/NativeAgentRuntimeContracts.swift`.
 
 This is an **app-internal** contract, not the external plugin API. It still uses core models (`AIStreamResult`, `AgentApprovalRequest`, `AgentApprovalDecision`) because adapters translate plugin DTOs first. The current shape:
 
@@ -258,7 +258,7 @@ The associated event/session/turn types are currently `typealias`es over the Cla
 
 ## Oh My Pi managed ACP integration
 
-Oh My Pi (OMP) is implemented as an app-internal ACP provider under `Sources/RepoPrompt/Infrastructure/AI/Providers/OhMyPi/`, not through the Claude-compatible package seam. Its stable identities are `ACPProviderID.ohMyPi`, `AgentProviderKind.ohMyPi`, and `AgentProviderBindingID.ohMyPi` (raw `"ohMyPi"`); the executable is `omp`, the runtime kind is `"omp_acp"`, and the verified MCP `clientInfo.name` is `"omp-coding-agent"`. OMP preserves expected-PID and pre-prompt Agent Mode MCP routing.
+Oh My Pi (OMP) is implemented as an app-internal ACP provider under `Sources/RepoPromptAgentCore/AI/Providers/OhMyPi/`, not through the Claude-compatible package seam. Its stable identities are `ACPProviderID.ohMyPi`, `AgentProviderKind.ohMyPi`, and `AgentProviderBindingID.ohMyPi` (raw `"ohMyPi"`); the executable is `omp`, the runtime kind is `"omp_acp"`, and the verified MCP `clientInfo.name` is `"omp-coding-agent"`. OMP preserves expected-PID and pre-prompt Agent Mode MCP routing.
 
 RepoPrompt owns one fixed OMP launch/preflight profile shared by Agent Mode and Oracle one-shots. New processes receive exactly:
 
@@ -292,7 +292,7 @@ The recommended pattern when adding (for example) a hypothetical `acmeAgent` fam
 1. **Decide the runtime shape.**
    - Interactive native CLI: implement `NativeAgentRuntimeControlling` for the new family, building an adapter analogous to `ClaudeCompatibleNativeSessionAdapter`.
    - Headless-only CLI: build a `HeadlessAgentProvider` and (optionally) wrap it in a per-family adapter for parity. One-shot AI-query adapters can reuse `HeadlessCLIStreamBridge` while retaining provider-specific prompt, config, model, and event semantics.
-   - ACP-based: follow `Sources/RepoPrompt/Features/AgentMode/Providers/ACP/ACPAgentProvider.swift` instead — ACP runtimes do not yet flow through the Claude-compatible plugin seam.
+   - ACP-based: follow `Sources/RepoPromptAgentCore/AgentMode/Providers/ACP/ACPAgentProvider.swift` instead — ACP runtimes do not yet flow through the Claude-compatible plugin seam.
 
 2. **Add (or reuse) a provider package.**
    - For an external family with its own SDK/codec, add a new library product under `Packages/RepoPromptAgentProviders/Sources/RepoPromptAcmeProvider/` and register a Swift target in the package manifest.
@@ -346,13 +346,13 @@ Add the relevant focused suite before any catalog/codec change, and snapshot mod
 - `Package.swift` — root manifest and product wiring.
 - `Packages/RepoPromptAgentProviders/Package.swift` — provider package manifest.
 - `Packages/RepoPromptAgentProviders/Sources/RepoPromptClaudeCompatibleProvider/` — plugin DTOs, codec, translator, prompt delivery, environment builder, catalog, headless arg builder, launch-env resolver.
-- `Sources/RepoPrompt/Infrastructure/AI/Providers/ClaudeCode/ClaudeCompatibleProviderRuntimeBridge.swift` — single package import point.
-- `Sources/RepoPrompt/Infrastructure/AI/Providers/HeadlessCLIStreamBridge.swift` and `Sources/RepoPrompt/Infrastructure/AI/Providers/OhMyPi/OhMyPiCLIProvider.swift` — shared one-shot lifecycle plus the tool-free OMP Oracle adapter.
-- `Sources/RepoPrompt/Features/AgentMode/Providers/ClaudeCompatible/` — Agent-Mode facade and adapter trio.
-- `Sources/RepoPrompt/Features/AgentMode/Runtime/Native/NativeAgentRuntimeContracts.swift` — provider-neutral runtime contract.
+- `Sources/RepoPromptAgentCore/AI/Providers/ClaudeCode/ClaudeCompatibleProviderRuntimeBridge.swift` — single package import point.
+- `Sources/RepoPromptAgentCore/AI/Providers/HeadlessCLIStreamBridge.swift` and `Sources/RepoPromptAgentCore/AI/Providers/OhMyPi/OhMyPiCLIProvider.swift` — shared one-shot lifecycle plus the tool-free OMP Oracle adapter.
+- `Sources/RepoPromptAgentCore/AgentMode/Providers/ClaudeCompatible/` — Agent-Mode facade and adapter trio.
+- `Sources/RepoPromptAgentCore/AgentMode/Runtime/Native/NativeAgentRuntimeContracts.swift` — provider-neutral runtime contract.
 - `Sources/RepoPromptAgentCore/AI/Prompts/Workflows/` — provider-neutral RepoPrompt workflow prompt catalog, metadata, variants, and renderers shared by installs and MCP prompt registration.
-- `Sources/RepoPrompt/Features/AgentMode/Runtime/Providers/AgentRuntimeProviderService.swift` — `AgentProviderKind` and headless factory.
+- `Sources/RepoPromptAgentCore/AgentMode/Runtime/Providers/AgentRuntimeProviderService.swift` — `AgentProviderKind` and headless factory.
 - `Sources/RepoPrompt/Features/AgentMode/ViewModels/AgentModeViewModel.swift` — `makeClaudeCompatibleNativeController(...)`.
-- `Sources/RepoPrompt/Features/AgentMode/Runtime/Claude/ClaudeAgentModeCoordinator.swift` — interactive Claude-compatible coordinator.
+- `Sources/RepoPromptAgentCore/AgentMode/Runtime/Claude/ClaudeAgentModeCoordinator.swift` — interactive Claude-compatible coordinator.
 - SwiftPM package manifest docs: <https://docs.swift.org/package-manager/PackageDescription/PackageDescription.html>
 - Xcode local package override workflow: <https://developer.apple.com/documentation/xcode/editing-a-package-dependency-as-a-local-package>

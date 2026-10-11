@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptAgentCore
 
 // MARK: - Stale transcript-reset recovery (stop-and-retain + explicitly confirmed paired reload)
 

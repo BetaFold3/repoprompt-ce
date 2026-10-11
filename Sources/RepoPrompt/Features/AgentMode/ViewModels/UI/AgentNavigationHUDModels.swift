@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptAgentCore
 
 /// Internal mode for the Agent Session Switcher HUD.
 enum AgentNavigationHUDMode: String, Equatable, CaseIterable, Identifiable {

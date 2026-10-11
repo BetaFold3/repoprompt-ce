@@ -1,5 +1,6 @@
 import Combine
 import Foundation
+import RepoPromptAgentCore
 import RepoPromptUI
 
 struct RecommendationActionRevisionGuard: Equatable {

@@ -1,6 +1,7 @@
 import Foundation
 import MCP
 import OSLog
+import RepoPromptAgentCore
 import RepoPromptWorkspace
 
 /// Applies opt-in inline-text presentation after Agent Run/Explore has produced
