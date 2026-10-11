@@ -210,6 +210,17 @@ Decisions: `commonEqualTurnPrefixCount` is internal on the builder because the v
 
 Step 5a — done | rounds 0/2 | open: | downgraded: | assumed: | deferred: OracleB P3-1 — hoisted records still name `AgentModeViewModel.AgentRunEpochTransitionIntent`, `.AgentInteractionTransport`, `.AgentExecutionWorktreeSelection`, `TabSession.PersistedLoadDisposition` and `MCPServerViewModel.AgentRunWaitDrainOutcome`; resolve in 5b and the MCP step, and switch runtime callers off the view-model forwarders before Slice 6
 
+#### Step 5b — `TabSession` hoisted to `AgentTabSession`
+Intent: move the `TabSession` class and the resend record it stores out of `AgentModeViewModel` into a top-level `AgentTabSession` in its own file, spelling its view-model alias references as the hoisted `Agent…` names, and hoist the three records Step 5a deferred (`AgentInteractionTransport`, `AgentRunEpochTransitionIntent`, `AgentExecutionWorktreeSelection`), leaving same-type aliases, with the same object, owner, callbacks and ordering.
+
+Budget used: about 1 hour (cumulative ~20 hours).
+
+Result: `AgentTabSession` and `AgentRemoteResendPayload` now live in `Features/AgentMode/Runtime/Session/AgentTabSession.swift`, and the three deferred records live in `AgentSessionRunStateRecords.swift`. An ordered line diff against the old nested bodies shows only alias-to-name spellings and one call that now goes straight to the transcript builder. Build, 23 affected suites (592 tests, 0 failures), format and lint pass, and both reviewers found nothing above P3, so the next step classifies the remaining view-model and window-state uses from a rescan.
+
+Decisions: the emptied `AgentModeViewModel+TabSession.swift` was deleted and its two aliases joined the others in `AgentModeViewModel+Types.swift`, so Slice 6 removes aliases from one file; a source-scanning release-absence test and one plan citation now point at the new file.
+
+Step 5b — done | rounds 0/2 | open: | downgraded: | assumed: | deferred:
+
 ### Slice 6 — `RepoPromptAgentCore` extraction
 Move the now-acyclic AI, agent models, providers, runtime, services, history, recommendations and non-UI remote-host code. Remove the temporary typealiases. Check the release compile flags once for cross-module optimization; don't change them.
 

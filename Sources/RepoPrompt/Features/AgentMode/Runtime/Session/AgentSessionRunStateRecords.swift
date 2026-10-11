@@ -16,9 +16,9 @@ struct AgentMCPControlContext: Equatable {
     let registration: AgentRunSessionStore.Registration
     var currentEpoch: AgentRunTurnEpoch?
     var preparedEpoch: AgentRunTurnEpoch?
-    var pendingEpochTransition: AgentModeViewModel.AgentRunEpochTransitionIntent?
+    var pendingEpochTransition: AgentRunEpochTransitionIntent?
     let originatingConnectionID: UUID?
-    let interactionTransport: AgentModeViewModel.AgentInteractionTransport
+    let interactionTransport: AgentInteractionTransport
     let suppressUserNotifications: Bool
     let forceAutoEditEnabled: Bool
     let autoEditEnabledBeforeOverride: Bool
@@ -202,7 +202,7 @@ struct AgentBashLiveExecutionState: Equatable {
 enum AgentInitialStartLocation: Equatable {
     case local
     case newWorktree
-    case existingWorktree(AgentModeViewModel.AgentExecutionWorktreeSelection)
+    case existingWorktree(AgentExecutionWorktreeSelection)
 
     var label: String {
         switch self {
@@ -213,5 +213,45 @@ enum AgentInitialStartLocation: Equatable {
         case let .existingWorktree(selection):
             selection.label
         }
+    }
+}
+
+enum AgentInteractionTransport: Equatable {
+    case ui
+    case mcp(sessionID: UUID, originatingConnectionID: UUID?)
+}
+
+struct AgentRunEpochTransitionIntent: Equatable {
+    let token: UUID
+    let kind: AgentRunEpochTransitionKind
+    let expectedCurrentEpoch: AgentRunTurnEpoch?
+}
+
+struct AgentExecutionWorktreeSelection: Equatable, Identifiable {
+    let repositoryID: String
+    let repoKey: String
+    let worktreeID: String
+    let path: String
+    let name: String?
+    let branch: String?
+    let head: String?
+    let isDetached: Bool
+    let label: String
+    let colorHex: String?
+    let isLocked: Bool
+    let lockReason: String?
+    let isPrunable: Bool
+    let prunableReason: String?
+
+    var id: String {
+        presentationID
+    }
+
+    /// Stable SwiftUI identity for picker presentation. Selection semantics
+    /// remain repositoryID + worktreeID; this ID also includes the normalized
+    /// path so malformed duplicate Git records cannot collide in ForEach.
+    var presentationID: String {
+        let checkoutPath = CheckoutPathIdentity.canonicalPathOrOriginal(path)
+        return "\(repositoryID)::\(worktreeID)::\(checkoutPath)"
     }
 }

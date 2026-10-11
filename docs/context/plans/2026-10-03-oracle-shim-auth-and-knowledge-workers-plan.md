@@ -85,7 +85,7 @@ Non-goals:
   - Session `D4B05D54…` is saved with `profile: "standard"` and provider `codexExec`.
   - Its two standard Codex workers each made one native `search` call.
   - Knowledge sessions do save `profile: "knowledge"`: nine such saved sessions exist.
-- New MCP children are blank standard tabs (`AgentModeViewModel.swift:7973-7985`). A session's profile can change only while its tab is still an untouched placeholder (`AgentModeViewModel+TabSession.swift:245-264`).
+- New MCP children are blank standard tabs (`AgentModeViewModel.swift:7973-7985`). A session's profile can change only while its tab is still an untouched placeholder (`AgentTabSession.swift:241-260`).
 - Under the general delegation contract, depth-0 and depth-1 non-explore sessions may delegate (`AgentDelegationPolicy.swift`). Depth-0 callers keep existing session-addressed access, and only workers are restricted to deeper targets ([bounded MCP delegation](../agent-mcp-delegation-depth.md)).
 - `agent_run` operations are exactly `start`, `poll`, `wait`, `cancel`, `steer`, and `respond` (`AgentRunMCPToolService.swift:425-438`).
 - `AgentSessionMetadataIndex` saves each session's profile (`AgentSessionMetadataIndex.swift:171-173`).

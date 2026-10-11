@@ -120,5 +120,5 @@ struct AgentStaleResetRemovalAdmission: Equatable {
 /// load's readiness or published outcome.
 struct AgentPersistedLoadOutcome: Equatable {
     let attemptID: UUID?
-    let disposition: AgentModeViewModel.TabSession.PersistedLoadDisposition
+    let disposition: AgentTabSession.PersistedLoadDisposition
 }

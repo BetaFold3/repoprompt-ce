@@ -35,6 +35,10 @@ protocol AgentModeRunInteractionStateObserving: AnyObject {
 }
 
 extension AgentModeViewModel {
+    typealias TabSession = AgentTabSession
+
+    typealias RemoteResendPayload = AgentRemoteResendPayload
+
     enum UserTurnSubmissionResult: Equatable {
         case submitted
         case scheduled(id: UUID)
@@ -101,10 +105,7 @@ extension AgentModeViewModel {
 
     typealias RunInteractionStateChangeReason = AgentRunInteractionStateChangeReason
 
-    enum AgentInteractionTransport: Equatable {
-        case ui
-        case mcp(sessionID: UUID, originatingConnectionID: UUID?)
-    }
+    typealias AgentInteractionTransport = RepoPromptApp.AgentInteractionTransport
 
     enum UIRefreshScope: String, Equatable, Hashable {
         case full
@@ -371,11 +372,7 @@ extension AgentModeViewModel {
     /// provider binding layer's top-level permission profile model.
     typealias AgentPermissionProfile = AgentProviderPermissionProfile
 
-    struct AgentRunEpochTransitionIntent: Equatable {
-        let token: UUID
-        let kind: AgentRunEpochTransitionKind
-        let expectedCurrentEpoch: AgentRunTurnEpoch?
-    }
+    typealias AgentRunEpochTransitionIntent = RepoPromptApp.AgentRunEpochTransitionIntent
 
     typealias AgentMCPControlContext = RepoPromptApp.AgentMCPControlContext
 
@@ -656,34 +653,7 @@ extension AgentModeViewModel {
         var stashedTabIDs: Set<UUID> = []
     }
 
-    struct AgentExecutionWorktreeSelection: Equatable, Identifiable {
-        let repositoryID: String
-        let repoKey: String
-        let worktreeID: String
-        let path: String
-        let name: String?
-        let branch: String?
-        let head: String?
-        let isDetached: Bool
-        let label: String
-        let colorHex: String?
-        let isLocked: Bool
-        let lockReason: String?
-        let isPrunable: Bool
-        let prunableReason: String?
-
-        var id: String {
-            presentationID
-        }
-
-        /// Stable SwiftUI identity for picker presentation. Selection semantics
-        /// remain repositoryID + worktreeID; this ID also includes the normalized
-        /// path so malformed duplicate Git records cannot collide in ForEach.
-        var presentationID: String {
-            let checkoutPath = CheckoutPathIdentity.canonicalPathOrOriginal(path)
-            return "\(repositoryID)::\(worktreeID)::\(checkoutPath)"
-        }
-    }
+    typealias AgentExecutionWorktreeSelection = RepoPromptApp.AgentExecutionWorktreeSelection
 
     typealias InitialStartLocation = AgentInitialStartLocation
 

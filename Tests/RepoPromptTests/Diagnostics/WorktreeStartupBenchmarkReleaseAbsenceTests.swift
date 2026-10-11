@@ -25,7 +25,7 @@ final class WorktreeStartupBenchmarkReleaseAbsenceTests: XCTestCase {
             "Sources/RepoPrompt/Features/AgentMode/Runtime/Runners/ACPIntegratedAgentModeRunner.swift",
             "Sources/RepoPrompt/Infrastructure/AI/ACP/ACPAgentSessionController.swift",
             "Sources/RepoPrompt/Features/AgentMode/ViewModels/AgentModeViewModel.swift",
-            "Sources/RepoPrompt/Features/AgentMode/ViewModels/AgentModeViewModel+TabSession.swift"
+            "Sources/RepoPrompt/Features/AgentMode/Runtime/Session/AgentTabSession.swift"
         ]
         let sources = try files.map { path in
             try String(contentsOf: root.appendingPathComponent(path), encoding: .utf8)
