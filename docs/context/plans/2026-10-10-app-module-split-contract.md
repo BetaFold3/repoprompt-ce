@@ -353,6 +353,13 @@ Decisions: the transitive rescan (evidence `step5n/probe/`) only shows which fil
 
 Step 5n — done | rounds 0/2 | open: | downgraded: | assumed: | deferred:
 
+#### Step 5o — OMP qualification gate composed in App
+Intent: the DEBUG OMP qualification gate is agent instrumentation that the run service, tab session and OMP connection check use, but its process-wide instance falls back to cancelling runs through the App window list, and two agent-code defaults read that instance. So require the cancellation handler, move the instance and the window-based handler into App composition, and inject the two reads (the run service's start authorizer and the OMP connection-availability check, including its users in the OMP thinking resolver, sweep client and CLI provider), with no behavior change.
+
+Budget used: about 0 hours so far (cumulative ~34 hours).
+
+Step 5o — doing | rounds 0/2 | open: | downgraded: | assumed: | deferred:
+
 ### Slice 6 — `RepoPromptAgentCore` extraction
 Move the now-acyclic AI, agent models, providers, runtime, services, history, recommendations and non-UI remote-host code. Remove the temporary typealiases. Check the release compile flags once for cross-module optimization; don't change them.
 

@@ -186,6 +186,7 @@ final class ContextBuilderMCPProgressTimelineTests: XCTestCase {
                         routingWaiter: .shared,
                         codexAuthRecovery: CodexManagedAuthRecoveryService.shared,
                         modelOverrides: AppModelOverrideReader(),
+                        ohMyPiConnectionState: { OhMyPiConnectionAvailability.isEffectivelyConnected() },
                         sendPromptOverride: { _, _ in
                             let stream = AsyncThrowingStream<ChatStreamOutput, Error> { continuation in
                                 continuation.yield(ChatStreamOutput(

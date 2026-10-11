@@ -200,7 +200,6 @@
             case alreadyConsumed
         }
 
-        static let shared = OhMyPiAgentModeSmokeGate()
         static let maximumDuration: TimeInterval = 600
         @TaskLocal static var invocationStartContext: StartContext?
 
@@ -214,7 +213,7 @@
 
         private let lock = NSLock()
         private let notificationCenter: NotificationCenter
-        private let cancellationHandler: (@Sendable (Snapshot, String) -> Void)?
+        private let cancellationHandler: @Sendable (Snapshot, String) -> Void
         private let wallClock: @Sendable () -> Date
         private let monotonicNowNanoseconds: @Sendable () -> UInt64
         private var lease: StoredLease?
@@ -222,7 +221,7 @@
 
         init(
             notificationCenter: NotificationCenter = .default,
-            cancellationHandler: (@Sendable (Snapshot, String) -> Void)? = nil,
+            cancellationHandler: @escaping @Sendable (Snapshot, String) -> Void,
             wallClock: @escaping @Sendable () -> Date = Date.init,
             monotonicNowNanoseconds: @escaping @Sendable () -> UInt64 = { DispatchTime.now().uptimeNanoseconds }
         ) {
@@ -673,30 +672,8 @@
         }
 
         private func cancelBoundRunIfNeeded(_ snapshot: Snapshot, reason: String) {
-            guard let sessionID = snapshot.sessionID else { return }
-            if let cancellationHandler {
-                cancellationHandler(snapshot, reason)
-                return
-            }
-            Task { @MainActor in
-                for window in WindowStatesManager.shared.allWindows {
-                    guard let runID = snapshot.runID,
-                          let session = window.agentModeViewModel.mcpControlledSession(sessionID: sessionID),
-                          session.runID == runID,
-                          session.runState.isActive
-                    else { continue }
-                    window.mcpServer.cancelActiveToolsForRun(runID: runID, reason: reason)
-                    let target = window.agentModeViewModel.makeRunCancelTarget(
-                        tabID: session.tabID,
-                        session: session
-                    )
-                    _ = await window.agentModeViewModel.cancelAgentRun(
-                        target: target,
-                        completion: .terminalPublished
-                    )
-                    break
-                }
-            }
+            guard snapshot.sessionID != nil else { return }
+            cancellationHandler(snapshot, reason)
         }
 
         private func publishChange() {

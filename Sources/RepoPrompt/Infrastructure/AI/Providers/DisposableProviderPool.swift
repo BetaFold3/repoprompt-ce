@@ -13,6 +13,7 @@ actor DisposableProviderPool {
     private let routingWaiter: MCPRoutingWaiter
     private let codexAuthRecovery: any CodexManagedAuthRecovering
     private let modelOverrides: any AIModelOverrideReading
+    private let ohMyPiConnectionState: OhMyPiCLIProvider.ConnectionStateProvider
 
     /// Caches for fallback if KeyManager returns invalid/empty values.
     /// Key-based providers (OpenAI, Anthropic, etc.) will store their key here.
@@ -26,13 +27,15 @@ actor DisposableProviderPool {
         mcpHost: any AgentMCPHosting,
         routingWaiter: MCPRoutingWaiter,
         codexAuthRecovery: any CodexManagedAuthRecovering,
-        modelOverrides: any AIModelOverrideReading
+        modelOverrides: any AIModelOverrideReading,
+        ohMyPiConnectionState: @escaping OhMyPiCLIProvider.ConnectionStateProvider
     ) {
         self.keyManager = keyManager
         self.mcpHost = mcpHost
         self.routingWaiter = routingWaiter
         self.codexAuthRecovery = codexAuthRecovery
         self.modelOverrides = modelOverrides
+        self.ohMyPiConnectionState = ohMyPiConnectionState
     }
 
     /// Returns a brand-new provider every time it's called.
@@ -61,6 +64,7 @@ actor DisposableProviderPool {
                 routingWaiter: routingWaiter,
                 codexAuthRecovery: codexAuthRecovery,
                 modelOverrides: modelOverrides,
+                ohMyPiConnectionState: ohMyPiConnectionState,
                 ollamaURL: ollamaURL,
                 azureConfiguration: azureConfiguration,
                 model: model.rawValue
@@ -93,6 +97,7 @@ actor DisposableProviderPool {
                 routingWaiter: routingWaiter,
                 codexAuthRecovery: codexAuthRecovery,
                 modelOverrides: modelOverrides,
+                ohMyPiConnectionState: ohMyPiConnectionState,
                 ollamaURL: typedURL,
                 azureConfiguration: azureConfiguration
             )
@@ -106,6 +111,7 @@ actor DisposableProviderPool {
                 routingWaiter: routingWaiter,
                 codexAuthRecovery: codexAuthRecovery,
                 modelOverrides: modelOverrides,
+                ohMyPiConnectionState: ohMyPiConnectionState,
                 ollamaURL: fallbackURL,
                 azureConfiguration: azureConfiguration
             )
@@ -126,6 +132,7 @@ actor DisposableProviderPool {
                 routingWaiter: routingWaiter,
                 codexAuthRecovery: codexAuthRecovery,
                 modelOverrides: modelOverrides,
+                ohMyPiConnectionState: ohMyPiConnectionState,
                 ollamaURL: ollamaURL,
                 azureConfiguration: directConfig
             )
@@ -149,6 +156,7 @@ actor DisposableProviderPool {
                     routingWaiter: routingWaiter,
                     codexAuthRecovery: codexAuthRecovery,
                     modelOverrides: modelOverrides,
+                    ohMyPiConnectionState: ohMyPiConnectionState,
                     ollamaURL: ollamaURL,
                     azureConfiguration: config
                 )
@@ -166,6 +174,7 @@ actor DisposableProviderPool {
                 routingWaiter: routingWaiter,
                 codexAuthRecovery: codexAuthRecovery,
                 modelOverrides: modelOverrides,
+                ohMyPiConnectionState: ohMyPiConnectionState,
                 ollamaURL: ollamaURL,
                 azureConfiguration: cachedConfig
             )
@@ -178,6 +187,7 @@ actor DisposableProviderPool {
                 routingWaiter: routingWaiter,
                 codexAuthRecovery: codexAuthRecovery,
                 modelOverrides: modelOverrides,
+                ohMyPiConnectionState: ohMyPiConnectionState,
                 ollamaURL: ollamaURL,
                 azureConfiguration: nil
             )
@@ -215,6 +225,7 @@ actor DisposableProviderPool {
             routingWaiter: routingWaiter,
             codexAuthRecovery: codexAuthRecovery,
             modelOverrides: modelOverrides,
+            ohMyPiConnectionState: ohMyPiConnectionState,
             ollamaURL: ollamaURL,
             azureConfiguration: azureConfiguration,
             model: model.rawValue

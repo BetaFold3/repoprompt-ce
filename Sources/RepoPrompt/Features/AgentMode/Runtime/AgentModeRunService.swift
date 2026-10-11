@@ -33,8 +33,8 @@ final class AgentModeRunService {
             var ompQualificationAuthorizer: (
                 OhMyPiAgentModeSmokeGate.StartTransaction,
                 UUID
-            ) -> OhMyPiAgentModeSmokeGate.ProviderStartAuthorizationDecision = {
-                OhMyPiAgentModeSmokeGate.shared.providerStartAuthorizationDecision(transaction: $0, runID: $1)
+            ) -> OhMyPiAgentModeSmokeGate.ProviderStartAuthorizationDecision = { _, _ in
+                .refused(reason: "omp_qualification_authorizer_unconfigured")
             }
 
             var ompQualificationActiveWorkspaceID: () -> UUID? = { nil }

@@ -1415,7 +1415,8 @@ final class OhMyPiThinkingMenuBuilderTests: XCTestCase {
             client: SweepClient(results: [rawModel: .failed("fixture failure")]),
             registry: capabilityRegistry,
             statusStore: OhMyPiThinkingCapabilityProbeStatusStore(),
-            runtimeVersion: { "99.0.0" }
+            runtimeVersion: { "99.0.0" },
+            isAvailable: { OhMyPiConnectionAvailability.isEffectivelyConnected() }
         )
         events.removeAll()
         let unknownItems = OhMyPiThinkingMenuBuilder.stableMenuItems(
@@ -1534,7 +1535,7 @@ final class OhMyPiThinkingMenuBuilderTests: XCTestCase {
             secureService: SecureKeysService(secureStorage: TestSecureStorageBackend())
         )
         let apiSettings = APISettingsViewModel(
-            aiQueriesService: AIQueriesService(keyManager: keyManager, mcpHost: ServerNetworkManager.shared, routingWaiter: .shared, codexAuthRecovery: CodexManagedAuthRecoveryService.shared, modelOverrides: AppModelOverrideReader()),
+            aiQueriesService: AIQueriesService(keyManager: keyManager, mcpHost: ServerNetworkManager.shared, routingWaiter: .shared, codexAuthRecovery: CodexManagedAuthRecoveryService.shared, modelOverrides: AppModelOverrideReader(), ohMyPiConnectionState: { OhMyPiConnectionAvailability.isEffectivelyConnected() }),
             keyManager: keyManager,
             loadStoredDataOnInit: false
         )

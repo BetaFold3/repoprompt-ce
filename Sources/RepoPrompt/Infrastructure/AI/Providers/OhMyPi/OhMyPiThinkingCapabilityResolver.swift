@@ -159,9 +159,7 @@ actor OhMyPiThinkingCapabilityResolver {
         runtimeVersion: @escaping @Sendable () -> String? = {
             OhMyPiRuntimeVersionRegistry.shared.currentVersion
         },
-        isAvailable: @escaping @Sendable () -> Bool = {
-            OhMyPiConnectionAvailability.isEffectivelyConnected()
-        },
+        isAvailable: @escaping @Sendable () -> Bool,
         now: @escaping @Sendable () -> Date = { Date() }
     ) {
         self.client = client

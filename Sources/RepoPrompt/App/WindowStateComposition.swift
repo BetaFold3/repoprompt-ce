@@ -58,7 +58,8 @@ enum WindowStateCompositionFactory {
                 mcpHost: ServerNetworkManager.shared,
                 routingWaiter: .shared,
                 codexAuthRecovery: CodexManagedAuthRecoveryService.shared,
-                modelOverrides: AppModelOverrideReader()
+                modelOverrides: AppModelOverrideReader(),
+                ohMyPiConnectionState: { OhMyPiConnectionAvailability.isEffectivelyConnected() }
             )
 
         // 3) API Settings

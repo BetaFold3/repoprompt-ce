@@ -110,8 +110,10 @@ extension CursorACPModelPollingService {
 extension OhMyPiThinkingCapabilityResolver {
     static let shared = OhMyPiThinkingCapabilityResolver(
         client: OhMyPiThinkingCapabilityControllerSweepClient(
-            sessionFactory: OhMyPiThinkingCapabilityControllerSessionFactory(mcpHost: ServerNetworkManager.shared)
-        )
+            sessionFactory: OhMyPiThinkingCapabilityControllerSessionFactory(mcpHost: ServerNetworkManager.shared),
+            isAvailable: { OhMyPiConnectionAvailability.isEffectivelyConnected() }
+        ),
+        isAvailable: { OhMyPiConnectionAvailability.isEffectivelyConnected() }
     )
 }
 
@@ -128,3 +130,60 @@ extension CodexManagedAuthRecoveryService {
         CodexProviderHelpers.makeOwnedNonAgentAppServerClient(mcpHost: ServerNetworkManager.shared)
     }
 }
+
+extension OhMyPiConnectionAvailability {
+    /// App-composed availability that includes the DEBUG qualification-lease override.
+    static func isEffectivelyConnected(userDefaults: UserDefaults = .standard) -> Bool {
+        isEffectivelyConnected(userDefaults: userDefaults, debugOverride: currentDebugOverride)
+    }
+
+    private static var currentDebugOverride: Bool {
+        #if DEBUG
+            OhMyPiAgentModeSmokeGate.shared.isEnabled
+        #else
+            false
+        #endif
+    }
+}
+
+#if DEBUG
+    extension OhMyPiAgentModeSmokeGate {
+        static let shared = OhMyPiAgentModeSmokeGate()
+
+        /// App composition: cancels the bound run through the window registry when a
+        /// qualification lease ends.
+        convenience init(
+            notificationCenter: NotificationCenter = .default,
+            wallClock: @escaping @Sendable () -> Date = Date.init,
+            monotonicNowNanoseconds: @escaping @Sendable () -> UInt64 = { DispatchTime.now().uptimeNanoseconds }
+        ) {
+            self.init(
+                notificationCenter: notificationCenter,
+                cancellationHandler: { snapshot, reason in
+                    guard let sessionID = snapshot.sessionID else { return }
+                    Task { @MainActor in
+                        for window in WindowStatesManager.shared.allWindows {
+                            guard let runID = snapshot.runID,
+                                  let session = window.agentModeViewModel.mcpControlledSession(sessionID: sessionID),
+                                  session.runID == runID,
+                                  session.runState.isActive
+                            else { continue }
+                            window.mcpServer.cancelActiveToolsForRun(runID: runID, reason: reason)
+                            let target = window.agentModeViewModel.makeRunCancelTarget(
+                                tabID: session.tabID,
+                                session: session
+                            )
+                            _ = await window.agentModeViewModel.cancelAgentRun(
+                                target: target,
+                                completion: .terminalPublished
+                            )
+                            break
+                        }
+                    }
+                },
+                wallClock: wallClock,
+                monotonicNowNanoseconds: monotonicNowNanoseconds
+            )
+        }
+    }
+#endif

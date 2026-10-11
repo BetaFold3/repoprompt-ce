@@ -2885,6 +2885,9 @@ final class AgentModeViewModel: ObservableObject {
         )
         #if DEBUG
             var dependencies = baseDependencies
+            dependencies.ompQualificationAuthorizer = {
+                OhMyPiAgentModeSmokeGate.shared.providerStartAuthorizationDecision(transaction: $0, runID: $1)
+            }
             dependencies.ompQualificationActiveWorkspaceID = { [weak self] in
                 self?.workspaceManager?.activeWorkspace?.id
             }

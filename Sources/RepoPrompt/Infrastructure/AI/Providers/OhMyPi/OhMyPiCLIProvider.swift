@@ -21,9 +21,7 @@ final class OhMyPiCLIProvider: AIProvider {
         modelSnapshotResolver: @escaping ModelSnapshotResolver = {
             await AgentACPModelRegistry.shared.resolvedSnapshotAfterWarmingStandardStore(for: .ohMyPi)
         },
-        connectionStateProvider: @escaping ConnectionStateProvider = {
-            OhMyPiConnectionAvailability.isEffectivelyConnected()
-        }
+        connectionStateProvider: @escaping ConnectionStateProvider
     ) {
         self.headlessProviderFactory = headlessProviderFactory ?? { config, workspacePath in
             AnyHeadlessAgentProvider(

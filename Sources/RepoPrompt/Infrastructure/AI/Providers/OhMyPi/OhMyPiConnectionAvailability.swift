@@ -7,16 +7,8 @@ import Foundation
 enum OhMyPiConnectionAvailability {
     static func isEffectivelyConnected(
         userDefaults: UserDefaults = .standard,
-        debugOverride: Bool = currentDebugOverride
+        debugOverride: Bool
     ) -> Bool {
         userDefaults.bool(forKey: "OhMyPiCLIConnected") || debugOverride
-    }
-
-    private static var currentDebugOverride: Bool {
-        #if DEBUG
-            OhMyPiAgentModeSmokeGate.shared.isEnabled
-        #else
-            false
-        #endif
     }
 }

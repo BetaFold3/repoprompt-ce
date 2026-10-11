@@ -219,9 +219,7 @@ struct OhMyPiThinkingCapabilityControllerSweepClient: OhMyPiThinkingCapabilitySw
         registry: OhMyPiThinkingCapabilityRegistry = .shared,
         runtimeVersionRegistry: OhMyPiRuntimeVersionRegistry = .shared,
         sessionFactory: any OhMyPiThinkingCapabilitySessionFactory,
-        isAvailable: @escaping @Sendable () -> Bool = {
-            OhMyPiConnectionAvailability.isEffectivelyConnected()
-        },
+        isAvailable: @escaping @Sendable () -> Bool,
         now: @escaping @Sendable () -> Date = { Date() }
     ) {
         self.registry = registry

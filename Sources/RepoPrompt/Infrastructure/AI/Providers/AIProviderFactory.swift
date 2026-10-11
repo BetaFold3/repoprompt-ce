@@ -8,6 +8,7 @@ class AIProviderFactory {
         routingWaiter: MCPRoutingWaiter,
         codexAuthRecovery: any CodexManagedAuthRecovering,
         modelOverrides: any AIModelOverrideReading,
+        ohMyPiConnectionState: @escaping OhMyPiCLIProvider.ConnectionStateProvider,
         ollamaURL: URL? = nil,
         azureConfiguration: AzureOpenAIConfiguration? = nil
     ) async throws -> AIProvider {
@@ -20,6 +21,7 @@ class AIProviderFactory {
                 routingWaiter: routingWaiter,
                 codexAuthRecovery: codexAuthRecovery,
                 modelOverrides: modelOverrides,
+                ohMyPiConnectionState: ohMyPiConnectionState,
                 ollamaURL: ollamaURL,
                 azureConfiguration: config
             )
@@ -34,6 +36,7 @@ class AIProviderFactory {
                 routingWaiter: routingWaiter,
                 codexAuthRecovery: codexAuthRecovery,
                 modelOverrides: modelOverrides,
+                ohMyPiConnectionState: ohMyPiConnectionState,
                 ollamaURL: ollamaURL,
                 azureConfiguration: azureConfiguration
             )
@@ -49,6 +52,7 @@ class AIProviderFactory {
             routingWaiter: routingWaiter,
             codexAuthRecovery: codexAuthRecovery,
             modelOverrides: modelOverrides,
+            ohMyPiConnectionState: ohMyPiConnectionState,
             ollamaURL: ollamaURL,
             azureConfiguration: azureConfiguration
         )
@@ -61,6 +65,7 @@ class AIProviderFactory {
         routingWaiter: MCPRoutingWaiter,
         codexAuthRecovery: any CodexManagedAuthRecovering,
         modelOverrides: any AIModelOverrideReading,
+        ohMyPiConnectionState: @escaping OhMyPiCLIProvider.ConnectionStateProvider,
         ollamaURL: URL? = nil,
         azureConfiguration: AzureOpenAIConfiguration? = nil,
         model: String? = nil
@@ -108,7 +113,11 @@ class AIProviderFactory {
         case .cursor:
             return CursorCLIProvider(mcpHost: mcpHost)
         case .ohMyPi:
-            return OhMyPiCLIProvider(mcpHost: mcpHost, routingWaiter: routingWaiter)
+            return OhMyPiCLIProvider(
+                mcpHost: mcpHost,
+                routingWaiter: routingWaiter,
+                connectionStateProvider: ohMyPiConnectionState
+            )
         case .customProvider:
             let config = try CustomProviderConfiguration.load()
 
