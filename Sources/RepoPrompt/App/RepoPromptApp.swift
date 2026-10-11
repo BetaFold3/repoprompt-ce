@@ -77,6 +77,11 @@ struct RepoPromptSwiftUIApp: App {
 
         SentryTelemetryBootstrap.start()
 
+        // Bind UI-facing settings to the persisted store before any scene or window work.
+        // Kept after telemetry start so the settings store's first load stays where it was.
+        FontScaleManager.shared.bind(to: GlobalSettingsStore.shared)
+        GlobalSettingsStore.shared.forwardDisplayPreferences(to: .shared)
+
         ProcessDebugLogging.log(
             prefix: "MCPStartup",
             "RepoPromptApp.init scheduling ServerNetworkManager.start",

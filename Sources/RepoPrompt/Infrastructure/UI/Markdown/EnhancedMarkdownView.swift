@@ -705,14 +705,14 @@ struct EnhancedCodeBlock: View {
     @State private var isCopyHovering = false
 
     @ObservedObject private var fontScale = FontScaleManager.shared
-    @ObservedObject private var globalSettings = GlobalSettingsStore.shared
+    @ObservedObject private var displayPreferences = UIDisplayPreferences.shared
     private var scaledCodeFontSize: CGFloat {
         let baseFontSize: CGFloat = 12.0
         return baseFontSize * fontScale.preset.scaleFactor
     }
 
     private var preferredCodeFontPostScriptName: String? {
-        globalSettings.transcriptCodeFontPostScriptName()
+        displayPreferences.transcriptCodeFontPostScriptName
     }
 
     private var codeFontFingerprint: TranscriptCodeFontFingerprint? {
@@ -762,7 +762,7 @@ struct EnhancedCodeBlock: View {
             .onChange(of: fontScale.preset) { _, _ in
                 if isFinalized { generateHighlightedCode() }
             }
-            .onChange(of: globalSettings.transcriptCodeFontPostScriptName()) { _, _ in
+            .onChange(of: displayPreferences.transcriptCodeFontPostScriptName) { _, _ in
                 if isFinalized { generateHighlightedCode() }
             }
     }

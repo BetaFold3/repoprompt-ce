@@ -69,15 +69,6 @@ enum TranscriptCodeFontResolver {
         return makeResolved(font: system, didFallBack: trimmed?.isEmpty == false)
     }
 
-    /// Convenience: resolve using the live UI preference + point size.
-    @MainActor
-    static func resolveFromSettings(pointSize: CGFloat) -> Resolved {
-        resolve(
-            preferredPostScriptName: GlobalSettingsStore.shared.transcriptCodeFontPostScriptName(),
-            pointSize: pointSize
-        )
-    }
-
     /// Whether `postScriptName` names an installed fixed-pitch face.
     static func isValidFixedPitchFace(_ postScriptName: String) -> Bool {
         let trimmed = postScriptName.trimmingCharacters(in: .whitespacesAndNewlines)

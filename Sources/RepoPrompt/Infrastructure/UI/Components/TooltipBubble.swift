@@ -97,9 +97,9 @@ private struct HoverTooltipModifier: ViewModifier {
     /// Forces AnchorGeometryView to re-report when hover starts (fixes ScrollView offset staleness).
     @State private var anchorRefreshID: UInt64 = 0
 
-    @ObservedObject private var globalSettings = GlobalSettingsStore.shared
+    @ObservedObject private var displayPreferences = UIDisplayPreferences.shared
     private var showTooltips: Bool {
-        globalSettings.showTooltips()
+        displayPreferences.showTooltips
     }
 
     private var preset: FontScalePreset {

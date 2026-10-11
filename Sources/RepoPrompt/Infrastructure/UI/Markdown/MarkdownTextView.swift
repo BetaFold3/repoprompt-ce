@@ -446,14 +446,14 @@ struct MarkdownTextView: View, Equatable {
     private let allowsStreamingSegmentation: Bool
     @Environment(\.markdownFileLinkOpener) private var markdownFileLinkOpener
     @ObservedObject private var fontScale = FontScaleManager.shared
-    @ObservedObject private var globalSettings = GlobalSettingsStore.shared
+    @ObservedObject private var displayPreferences = UIDisplayPreferences.shared
     private var fontPreset: FontScalePreset {
         fontScale.preset
     }
 
     private var resolvedCodeFont: TranscriptCodeFontResolver.Resolved {
         TranscriptCodeFontResolver.resolve(
-            preferredPostScriptName: globalSettings.transcriptCodeFontPostScriptName(),
+            preferredPostScriptName: displayPreferences.transcriptCodeFontPostScriptName,
             pointSize: CGFloat(fontPreset.rawValue)
         )
     }
@@ -495,8 +495,8 @@ struct MarkdownTextView: View, Equatable {
             lhs.renderCadence == rhs.renderCadence &&
             lhs.allowsStreamingSegmentation == rhs.allowsStreamingSegmentation &&
             lhs.fontScale.preset.scaleFactor == rhs.fontScale.preset.scaleFactor &&
-            lhs.globalSettings.transcriptCodeFontPostScriptName()
-            == rhs.globalSettings.transcriptCodeFontPostScriptName()
+            lhs.displayPreferences.transcriptCodeFontPostScriptName
+            == rhs.displayPreferences.transcriptCodeFontPostScriptName
     }
 
     var body: some View {

@@ -119,7 +119,21 @@ Step 2b — done | rounds 0/2 | open: | downgraded: | assumed: | deferred: recor
 ### Slice 3 — `RepoPromptUI`
 Move reusable components, markdown rendering, typography (`FontScaleManager`, `FontScalePreset`) and UI environment keys. Product-specific adapters stay in App. Small codecs and models that Workspace or AgentCore use move down rather than up.
 
-Step 3 — todo | rounds 0/2 | open: | downgraded: | assumed: | deferred:
+Probe result: the name-closure scan over the 91 UI candidates (`Infrastructure/UI/**`, `FontScaleManager`, `FontPreset`) on the live tree closes 43 files / 6.2k lines as-is; removing the `GlobalSettingsStore` reads from typography, the code-font resolver, the tooltip modifier and the two markdown views lifts that to 67 files / 14.9k lines including all markdown, so the direction holds and starts with an in-place repair; the remaining 26 are agent, MCP, approval, mention and workspace-backed adapters that stay in App (evidence `slice3-probe/`).
+
+#### Step 3a — settings seams in place
+Intent: make typography, tooltips and markdown rendering independent of `GlobalSettingsStore` inside `RepoPromptApp`, with unchanged values, persistence and live updates. Budget used: about 1.25 hours including the probe (cumulative ~6.5 hours).
+
+Result: `FontScaleManager` now persists through a three-call `FontScaleSettingsStoring` protocol bound once in `RepoPromptSwiftUIApp.init` (after telemetry start, before scenes), and a new `UIDisplayPreferences` observable receives `showTooltips` and the transcript code font from a `didSet` on the store's scalar preferences; the tooltip modifier and both markdown views read it, two unused store-reading helpers were deleted, and build, the affected suites (115 tests), format and lint pass, so Step 3b can move these files.
+
+Decisions: forwarding through one observable instead of SwiftUI environment values, because environment injection would have to reach every window, popover and hosting-view root and a missed root would silently show defaults; the views now re-render only when the two forwarded values change, not on every settings change; unit tests run with the manager unbound and the preferences at their defaults, which no existing test depends on.
+
+Step 3a — done | rounds 0/2 | open: | downgraded: | assumed: | deferred: owner-approved smoke launch (font scale survives relaunch, app_settings font change, tooltips toggle, code font re-highlight) not run
+
+#### Step 3b — create `RepoPromptUI` and move the closed set
+Intent: move the files that close over Platform after 3a, with compiler-driven `package` access, test imports and tooling, as in Step 2b.
+
+Step 3b — todo | rounds 0/2 | open: | downgraded: | assumed: | deferred:
 
 ### Slice 4 — `RepoPromptWorkspace`
 Move workspace context, indexing and search, VCS and worktrees, domain diff and edit operations, workspace persistence, and non-UI CodeMap and workspace-file code. Prompt packaging (`ChatPreset`, `CopyPreset`, `PromptSection`) and anything that needs `AIModel` stay above, with only their workspace-only parts extracted down.

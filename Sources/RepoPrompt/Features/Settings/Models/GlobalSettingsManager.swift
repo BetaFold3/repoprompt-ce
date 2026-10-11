@@ -367,7 +367,11 @@ class GlobalSettingsStore: ObservableObject {
     @Published private(set) var sessionDismissedPersistenceBlockReason: GlobalSettingsPersistenceBlockReason?
 
     private var globalDefaults = GlobalDefaults(discoverAgentRaw: nil, discoverModelsByAgent: nil)
-    private var scalarPreferences = GlobalScalarPreferences()
+    private var scalarPreferences = GlobalScalarPreferences() {
+        didSet { pushDisplayPreferences() }
+    }
+
+    private weak var displayPreferencesTarget: UIDisplayPreferences?
 
     private static let defaultBackgroundAgentComposeTabHardLimit = 500
     private static let defaultComposeTabSoftLimit = 50
@@ -846,6 +850,20 @@ class GlobalSettingsStore: ObservableObject {
             settings.transcriptCodeFontPostScriptName = normalized
         }
         CodeHighlightCache.shared.clear()
+    }
+
+    /// Forwards display preferences read by shared UI components to `target` and keeps
+    /// it in sync with every subsequent scalar-preference change (writes and reloads).
+    func forwardDisplayPreferences(to target: UIDisplayPreferences) {
+        displayPreferencesTarget = target
+        pushDisplayPreferences()
+    }
+
+    private func pushDisplayPreferences() {
+        displayPreferencesTarget?.apply(
+            showTooltips: showTooltips(),
+            transcriptCodeFontPostScriptName: transcriptCodeFontPostScriptName()
+        )
     }
 
     func experimentalAttributedTextEditor() -> Bool {
@@ -2596,5 +2614,12 @@ class GlobalSettingsStore: ObservableObject {
             print("⚠️ Failed to save global settings JSON at \(fileStore.fileURL.path): \(error)")
             return false
         }
+    }
+}
+
+extension GlobalSettingsStore: FontScaleSettingsStoring {
+    /// Protocol witness forwarding to the committing `setFontScaleBodySize(_:commit:)`.
+    func persistFontScaleBodySize(_ rawValue: Double) {
+        setFontScaleBodySize(rawValue, commit: true)
     }
 }

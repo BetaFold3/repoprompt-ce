@@ -1,9 +1,18 @@
 import Foundation
 import SwiftUI
 
+/// Settings persistence used by `FontScaleManager`. The App layer binds the shared
+/// settings store at launch so app_settings and the app share one store.
+@MainActor
+protocol FontScaleSettingsStoring: AnyObject {
+    func fontScaleBodySize() -> Double
+    func persistFontScaleBodySize(_ rawValue: Double)
+    func reloadFontScaleBodySizeFromDisk() -> Double?
+}
+
 /// Centralised manager for app-wide font scaling.
 /// - Owns the current FontScalePreset
-/// - Persists through GlobalSettingsStore so app_settings and the app share one store
+/// - Persists through the bound `FontScaleSettingsStoring` store
 /// - Publishes changes so SwiftUI views can update without each view
 ///   individually observing UserDefaults (avoids layout feedback loops).
 @MainActor
@@ -22,11 +31,19 @@ final class FontScaleManager: ObservableObject {
     private static let externalChangeNotificationRawName = "com.repoprompt.fontScaleDidChange"
     private static let externalChangeNotificationName = CFNotificationName(externalChangeNotificationRawName as CFString)
 
-    private let store: GlobalSettingsStore
+    private var store: (any FontScaleSettingsStoring)?
     private var didRegisterExternalChangeObserver = false
 
-    private init(store: GlobalSettingsStore? = nil) {
-        let store = store ?? GlobalSettingsStore.shared
+    private init() {
+        preset = .normal
+    }
+
+    /// Binds the persistence store, seeds the preset from it and starts observing
+    /// external changes. Idempotent: only the first call has any effect.
+    func bind(to store: any FontScaleSettingsStoring) {
+        guard self.store == nil else {
+            return
+        }
         self.store = store
         let initial = FontScalePreset(rawValue: store.fontScaleBodySize()) ?? .normal
         preset = initial
@@ -131,7 +148,7 @@ final class FontScaleManager: ObservableObject {
     }
 
     /// Reconciles the live manager after app_settings has already persisted the
-    /// canonical value through its injected GlobalSettingsStore. This path is
+    /// canonical value through its injected settings store. This path is
     /// intentionally applied even for no-op persistent sets so stale visible UI can
     /// catch up to the shared settings document.
     func applyAppSettingsRawValue(
@@ -157,7 +174,7 @@ final class FontScaleManager: ObservableObject {
     }
 
     func reloadAfterExternalChange() {
-        guard let rawValue = store.reloadFontScaleBodySizeFromDisk() else {
+        guard let rawValue = store?.reloadFontScaleBodySizeFromDisk() else {
             #if DEBUG
                 FontScalePerfDiagnostics.event("fontScale.externalReload.noRawValue")
             #endif
@@ -278,7 +295,7 @@ final class FontScaleManager: ObservableObject {
                     fields: ["source": source, "raw": String(newPreset.rawValue)]
                 )
             #endif
-            store.setFontScaleBodySize(newPreset.rawValue)
+            store?.persistFontScaleBodySize(newPreset.rawValue)
         }
 
         if broadcastExternalChange, changed || bypassFreeze {

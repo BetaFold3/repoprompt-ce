@@ -217,7 +217,7 @@ extension FontScalePreset {
 
 extension FontScalePreset {
     /// Internal backing store for the cached preset.
-    /// FontScaleManager seeds this from GlobalSettingsStore during app startup.
+    /// FontScaleManager seeds this from its bound settings store during app startup.
     private static var _cachedCurrent: FontScalePreset = .normal
 
     /// Convenience: latest cached preset’s row height (28 pt @ Normal).
@@ -231,27 +231,6 @@ extension FontScalePreset {
     /// True when the cached preset is still the default `.normal`.
     static var isDefaultPreset: Bool {
         _cachedCurrent == .normal
-    }
-
-    /// Refreshes the cached preset from the JSON-backed global settings store.
-    @MainActor
-    static func refreshCachedPreset() {
-        #if DEBUG
-            let previous = _cachedCurrent
-        #endif
-        let stored = GlobalSettingsStore.shared.fontScaleBodySize()
-        _cachedCurrent = FontScalePreset(rawValue: stored) ?? .normal
-        #if DEBUG
-            FontScalePerfDiagnostics.event(
-                "fontScale.cache.refresh",
-                fields: [
-                    "previous": String(describing: previous),
-                    "new": String(describing: _cachedCurrent),
-                    "changed": String(previous != _cachedCurrent),
-                    "raw": String(stored)
-                ]
-            )
-        #endif
     }
 
     /// Updates the cached preset directly when the live manager already resolved
