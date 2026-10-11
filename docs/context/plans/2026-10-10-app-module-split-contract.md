@@ -419,6 +419,17 @@ Decisions: an installed recorder hook, as in Step 4b, rather than threading a cl
 
 Step 5t — done | rounds 0/2 | open: | downgraded: | assumed: | deferred:
 
+#### Step 5u — the remote-pairing crypto file no longer holds the host challenge store
+Intent: the agent remote-host pairing client, registry and payload use only the pure fingerprint and device-ID functions of `RemotePairingCrypto`, but its file also holds the host-side challenge and challenge store, which carry the App approval context. So move the challenge struct and store verbatim into their own App file, leaving the crypto file free of App types, with no behavior change.
+
+Budget used: about 0.5 hours (cumulative ~42 hours).
+
+Result: the pairing challenge and its store now live in their own App file, moved verbatim, so `RemotePairingCrypto.swift` names no App type except the dependency-free `RemoteScope`. Build, format, lint and the eight pairing suites (36 tests) pass. OracleA found nothing, and OracleB asked only for evidence and record lines, which were added.
+
+Decisions: `RemoteScope.swift` joins AgentCore with the crypto file, while the challenge store, discovery authority, identity store and device records stay in App as host-side pairing. At the cut, App will need `package` access to `RemotePairingCrypto.randomChallenge()`, `maximumPairingChallengeTTL`, `RemotePairingCryptoError` and `RemoteScope`. The crypto file mentions `RepoPromptRemoteWire` only in a comment, so AgentCore gains no dependency from it.
+
+Step 5u — done | rounds 0/2 | open: | downgraded: | assumed: | deferred:
+
 ### Slice 6 — `RepoPromptAgentCore` extraction
 Move the now-acyclic AI, agent models, providers, runtime, services, history, recommendations and non-UI remote-host code. Remove the temporary typealiases. Check the release compile flags once for cross-module optimization; don't change them.
 
