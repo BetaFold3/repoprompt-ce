@@ -117,8 +117,8 @@ final class AgentModeProviderBindingService {
     }
 
     func autoEditGuidance(
-        for session: AgentModeViewModel.TabSession
-    ) -> AgentModeViewModel.AutoEditPermissionGuidance? {
+        for session: AgentTabSession
+    ) -> AgentAutoEditPermissionGuidance? {
         autoEditGuidance(
             agent: session.selectedAgent,
             autoEditEnabled: session.autoEditEnabled
@@ -128,12 +128,12 @@ final class AgentModeProviderBindingService {
     func autoEditGuidance(
         agent: AgentProviderKind,
         autoEditEnabled: Bool
-    ) -> AgentModeViewModel.AutoEditPermissionGuidance? {
+    ) -> AgentAutoEditPermissionGuidance? {
         guard autoEditEnabled == false else { return nil }
 
         if agent == .codexExec {
             guard CodexAgentToolPreferences.permissionLevel(defaults: preferences.defaults, secureStore: preferences.securePermissions) != .readOnly else { return nil }
-            return AgentModeViewModel.AutoEditPermissionGuidance(
+            return AgentAutoEditPermissionGuidance(
                 provider: .codex,
                 message: "Codex sandbox allows file edits — set Read Only",
                 actionTitle: "Set Read Only",
@@ -143,7 +143,7 @@ final class AgentModeProviderBindingService {
 
         if agent.usesClaudeTooling {
             guard ClaudeAgentToolPreferences.permissionLevel(defaults: preferences.defaults, secureStore: preferences.securePermissions) != .requireApproval else { return nil }
-            return AgentModeViewModel.AutoEditPermissionGuidance(
+            return AgentAutoEditPermissionGuidance(
                 provider: .claude,
                 message: "Claude sandbox allows file edits — set Require Approval",
                 actionTitle: "Set Require Approval",
@@ -156,7 +156,7 @@ final class AgentModeProviderBindingService {
 
     @discardableResult
     func applyAutoEditGuidanceAction(
-        _ action: AgentModeViewModel.AutoEditPermissionGuidance.Action
+        _ action: AgentAutoEditPermissionGuidance.Action
     ) -> AgentProviderBindingID {
         switch action {
         case .setCodexReadOnly:
@@ -168,11 +168,11 @@ final class AgentModeProviderBindingService {
 
     func providerPreferenceChanged(
         providerID: AgentProviderBindingID,
-        sessions: [AgentModeViewModel.TabSession],
+        sessions: [AgentTabSession],
         currentTabID: UUID?,
         codexCoordinator: CodexAgentModeCoordinator,
         scheduleSave: @escaping (UUID) -> Void,
-        updateActiveBindings: @escaping (AgentModeViewModel.TabSession) -> Void,
+        updateActiveBindings: @escaping (AgentTabSession) -> Void,
         refreshGuidance: @escaping () -> Void
     ) {
         var shouldRefreshActiveBindings = false

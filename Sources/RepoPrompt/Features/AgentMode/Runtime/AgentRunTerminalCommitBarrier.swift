@@ -32,7 +32,7 @@ final class AgentRunTerminalCommitBarrier {
     }
 
     struct Request {
-        let session: AgentModeViewModel.TabSession
+        let session: AgentTabSession
         let ownership: AgentRunOwnership
         let expectedRunID: UUID?
         let terminalState: AgentSessionRunState
@@ -41,7 +41,7 @@ final class AgentRunTerminalCommitBarrier {
         let errorText: String?
         let attachmentReservationID: UUID?
         let capturedAttachments: [AgentImageAttachment]
-        let attachmentDisposition: AgentModeViewModel.AttachmentTurnDisposition
+        let attachmentDisposition: AgentAttachmentTurnDisposition
         let finalizeNonCodexUsage: Bool
         let supportsFollowUp: Bool
         let providerSuccessor: ProviderSuccessor?
@@ -53,7 +53,7 @@ final class AgentRunTerminalCommitBarrier {
 
         @MainActor
         init(
-            session: AgentModeViewModel.TabSession,
+            session: AgentTabSession,
             ownership: AgentRunOwnership,
             expectedRunID: UUID?,
             terminalState: AgentSessionRunState,
@@ -62,7 +62,7 @@ final class AgentRunTerminalCommitBarrier {
             errorText: String? = nil,
             attachmentReservationID: UUID? = nil,
             capturedAttachments: [AgentImageAttachment]? = nil,
-            attachmentDisposition: AgentModeViewModel.AttachmentTurnDisposition,
+            attachmentDisposition: AgentAttachmentTurnDisposition,
             finalizeNonCodexUsage: Bool,
             supportsFollowUp: Bool,
             providerSuccessor: ProviderSuccessor? = nil,
@@ -387,7 +387,7 @@ final class AgentRunTerminalCommitBarrier {
     }
 
     private func takeQueuedFollowUpIfReady(
-        session: AgentModeViewModel.TabSession,
+        session: AgentTabSession,
         revision: AgentRunTerminalCommitRevision,
         publicationResult: AgentRunTerminalPublicationResult?
     ) -> String? {
@@ -418,7 +418,7 @@ final class AgentRunTerminalCommitBarrier {
 
     func awaitTerminalPublication(
         for ownership: AgentRunOwnership,
-        session: AgentModeViewModel.TabSession
+        session: AgentTabSession
     ) async {
         while session.terminalCommitInProgress {
             if let revision = session.lastTerminalCommitRevision,
@@ -432,7 +432,7 @@ final class AgentRunTerminalCommitBarrier {
 
     func awaitTerminalTeardown(
         for ownership: AgentRunOwnership,
-        session: AgentModeViewModel.TabSession
+        session: AgentTabSession
     ) async {
         await awaitTerminalPublication(for: ownership, session: session)
         guard session.lastTerminalCommitRevision?.ownership == ownership else { return }

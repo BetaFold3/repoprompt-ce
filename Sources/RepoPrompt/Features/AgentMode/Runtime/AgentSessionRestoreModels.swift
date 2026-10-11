@@ -117,7 +117,7 @@ struct AgentSessionHydrationPayload {
     let persistenceState: AgentSessionPersistenceState
     let canonicalLiveItems: [AgentChatItem]
     let transcript: AgentTranscript
-    let builtPresentation: AgentModeViewModel.BuiltTranscriptPresentation
+    let builtPresentation: AgentBuiltTranscriptPresentation
     let normalizedRunState: AgentSessionRunState
     let normalizedSelection: AgentModelCatalog.NormalizedAgentSelection
     let lastUserMessageAt: Date?

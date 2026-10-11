@@ -43,7 +43,7 @@ extension MCPBootstrapLeaseSpec {
 
 extension MCPBootstrapLease {
     static func agentModePolicyInstaller(
-        _ connectionPolicyInstaller: @escaping AgentModeViewModel.ConnectionPolicyInstaller
+        _ connectionPolicyInstaller: @escaping AgentConnectionPolicyInstaller
     ) -> (MCPBootstrapLeaseSpec) async -> Void {
         { leaseSpec in
             guard let clientName = leaseSpec.clientName else { return }

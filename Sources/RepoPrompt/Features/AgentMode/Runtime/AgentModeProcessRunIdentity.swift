@@ -2,11 +2,11 @@ import Foundation
 
 @MainActor
 enum AgentModeProcessRunIdentity {
-    static func existingProcessRunID(for session: AgentModeViewModel.TabSession) -> UUID? {
+    static func existingProcessRunID(for session: AgentTabSession) -> UUID? {
         session.runID
     }
 
-    static func mostRecentTranscriptProcessRunID(for session: AgentModeViewModel.TabSession) -> UUID? {
+    static func mostRecentTranscriptProcessRunID(for session: AgentTabSession) -> UUID? {
         session.transcript.turns.last?.responseSpans.reversed().compactMap(\.runID).first
     }
 
@@ -14,7 +14,7 @@ enum AgentModeProcessRunIdentity {
     static func retainProcessRunID(
         _ runID: UUID,
         inTranscriptTurnID turnID: UUID,
-        for session: AgentModeViewModel.TabSession
+        for session: AgentTabSession
     ) -> Bool {
         guard let turnIndex = session.transcript.turns.firstIndex(where: { $0.id == turnID }),
               let spanIndex = session.transcript.turns[turnIndex].responseSpans.indices.last
@@ -32,13 +32,13 @@ enum AgentModeProcessRunIdentity {
         return true
     }
 
-    static func startFreshProcessRun(for session: AgentModeViewModel.TabSession) -> UUID {
+    static func startFreshProcessRun(for session: AgentTabSession) -> UUID {
         let runID = UUID()
         session.runID = runID
         return runID
     }
 
-    static func clearProcessRunID(for session: AgentModeViewModel.TabSession) {
+    static func clearProcessRunID(for session: AgentTabSession) {
         session.runID = nil
     }
 }

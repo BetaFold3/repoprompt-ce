@@ -3,7 +3,7 @@ import Foundation
 /// Snapshot of a session needed for background cleanup after workspace switch.
 struct WorkspaceSwitchSessionCleanupTarget {
     let tabID: UUID
-    let session: AgentModeViewModel.TabSession
+    let session: AgentTabSession
     let boundSessionID: UUID?
     let runID: UUID?
 }
@@ -26,7 +26,7 @@ protocol WorkspaceSwitchSessionProviderDelegate: AnyObject {
     /// clears mcpControlContext, etc.). The session is already detached
     /// from the active workspace.
     func teardownMCPControlForDiscardedSession(
-        _ session: AgentModeViewModel.TabSession,
+        _ session: AgentTabSession,
         cleanupSessionStore: Bool,
         publishChanges: Bool,
         deactivateLiveControlContext: Bool
@@ -35,7 +35,7 @@ protocol WorkspaceSwitchSessionProviderDelegate: AnyObject {
     /// Cleanup MCP run routing for a discarded session.
     func cleanupMCPRunRoutingForDiscardedSession(
         boundSessionID: UUID?,
-        liveSession: AgentModeViewModel.TabSession,
+        liveSession: AgentTabSession,
         explicitRunID: UUID?,
         reason: String
     ) async
@@ -216,7 +216,7 @@ final class AgentModeWorkspaceSwitchCleanupProvider {
     }
 }
 
-extension AgentModeViewModel.TabSession {
+extension AgentTabSession {
     func disposeProviderIfPresent() async {
         let provider = provider
         self.provider = nil

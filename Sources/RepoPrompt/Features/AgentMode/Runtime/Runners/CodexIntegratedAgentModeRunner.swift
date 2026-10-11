@@ -3,12 +3,12 @@ import RepoPromptWorkspace
 
 @MainActor
 final class CodexIntegratedAgentModeRunner {
-    private let mcpServerEnabler: AgentModeViewModel.MCPServerEnabler
+    private let mcpServerEnabler: AgentMCPServerEnabler
     private let codexCoordinator: CodexAgentModeCoordinator
     private let hooks: AgentModeRunService.Hooks
 
     init(
-        mcpServerEnabler: @escaping AgentModeViewModel.MCPServerEnabler,
+        mcpServerEnabler: @escaping AgentMCPServerEnabler,
         codexCoordinator: CodexAgentModeCoordinator,
         hooks: AgentModeRunService.Hooks
     ) {
@@ -19,10 +19,10 @@ final class CodexIntegratedAgentModeRunner {
 
     func startRun(
         tabID: UUID,
-        session: AgentModeViewModel.TabSession,
+        session: AgentTabSession,
         initialMessageForRun: String,
         attachments: [AgentImageAttachment],
-        fallbackContext: AgentModeViewModel.TabSession.CodexFallbackSubmissionContext?,
+        fallbackContext: AgentTabSession.CodexFallbackSubmissionContext?,
         delegatedQuestionStageID: UUID? = nil
     ) async -> CodexAgentModeCoordinator.NativeSendOutcome {
         let ownership: AgentRunOwnership
@@ -105,7 +105,7 @@ final class CodexIntegratedAgentModeRunner {
     private static func isSupersededBySuccessor(
         _ ownership: AgentRunOwnership,
         attemptGeneration: UInt64,
-        session: AgentModeViewModel.TabSession
+        session: AgentTabSession
     ) -> Bool {
         if session.runAttemptGeneration != attemptGeneration {
             return true

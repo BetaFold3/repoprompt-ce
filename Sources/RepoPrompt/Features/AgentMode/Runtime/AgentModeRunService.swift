@@ -4,20 +4,20 @@ import Foundation
 final class AgentModeRunService {
     struct Dependencies {
         let windowID: Int
-        let headlessProviderFactory: AgentModeViewModel.HeadlessProviderFactory
-        let acpProviderFactory: AgentModeViewModel.ACPProviderFactory
-        let acpControllerFactory: AgentModeViewModel.ACPControllerFactory
-        let connectionPolicyInstaller: AgentModeViewModel.ConnectionPolicyInstaller
+        let headlessProviderFactory: AgentHeadlessProviderFactory
+        let acpProviderFactory: AgentACPProviderFactory
+        let acpControllerFactory: AgentACPControllerFactory
+        let connectionPolicyInstaller: AgentConnectionPolicyInstaller
         let expectedPIDPolicyArmer: (MCPBootstrapLeaseSpec) async -> Bool
-        let mcpServerEnabler: AgentModeViewModel.MCPServerEnabler
-        let workspacePathProvider: (AgentModeViewModel.TabSession) throws -> String?
+        let mcpServerEnabler: AgentMCPServerEnabler
+        let workspacePathProvider: (AgentTabSession) throws -> String?
         let codexCoordinator: CodexAgentModeCoordinator
         let claudeCoordinator: ClaudeAgentModeCoordinator
         let shouldManageCodexTooling: Bool
         let providerRuntimePermissionResolver: (_ agent: AgentProviderKind, _ profile: AgentProviderPermissionProfile) -> AgentProviderRuntimePermissionBinding
         /// Bounded-delegation run policy (advertisement flag, leaf restrictions) for a session's
         /// current role and lineage, resolved when the run's MCP lease is prepared.
-        let delegationRunToolPolicyResolver: (AgentModeViewModel.TabSession) -> AgentDelegationPolicy.RunToolPolicy
+        let delegationRunToolPolicyResolver: (AgentTabSession) -> AgentDelegationPolicy.RunToolPolicy
         /// Promotes an immutable launch review snapshot to the exact process run before its MCP
         /// bootstrap lease can expose nested tools.
         let bindPendingOracleReviewContext: (_ tabID: UUID, _ runID: UUID) -> Void
@@ -38,7 +38,7 @@ final class AgentModeRunService {
             }
 
             var ompQualificationActiveWorkspaceID: () -> UUID? = { nil }
-            var ompQualificationInvocationContext: (AgentModeViewModel.TabSession) -> OhMyPiAgentModeSmokeGate.StartContext? = { _ in
+            var ompQualificationInvocationContext: (AgentTabSession) -> OhMyPiAgentModeSmokeGate.StartContext? = { _ in
                 OhMyPiAgentModeSmokeGate.invocationStartContext
             }
 
@@ -71,45 +71,45 @@ final class AgentModeRunService {
 
     struct Hooks {
         let estimateRuntimeTokens: (String) -> Int
-        let addUserInputTokensToActiveNonCodexTurn: (Int, AgentModeViewModel.TabSession) -> Void
-        let startNonCodexTurnAccountingIfNeeded: (AgentModeViewModel.TabSession, String) -> Void
-        let reserveAttachmentsForTurn: ([AgentImageAttachment], AgentModeViewModel.TabSession) -> UUID?
-        let markAttachmentsConsumed: (AgentModeViewModel.TabSession, UUID?) -> Void
-        let stageConsumedAttachmentFilesForDeferredCleanup: ([AgentImageAttachment], AgentModeViewModel.TabSession) -> Void
-        let consumeDeferredAttachmentCleanup: (AgentModeViewModel.TabSession, Bool) -> Void
+        let addUserInputTokensToActiveNonCodexTurn: (Int, AgentTabSession) -> Void
+        let startNonCodexTurnAccountingIfNeeded: (AgentTabSession, String) -> Void
+        let reserveAttachmentsForTurn: ([AgentImageAttachment], AgentTabSession) -> UUID?
+        let markAttachmentsConsumed: (AgentTabSession, UUID?) -> Void
+        let stageConsumedAttachmentFilesForDeferredCleanup: ([AgentImageAttachment], AgentTabSession) -> Void
+        let consumeDeferredAttachmentCleanup: (AgentTabSession, Bool) -> Void
         let finalizeAttachmentsForTurn: (
-            AgentModeViewModel.TabSession,
+            AgentTabSession,
             UUID?,
             [AgentImageAttachment],
-            AgentModeViewModel.AttachmentTurnDisposition
+            AgentAttachmentTurnDisposition
         ) -> Void
         let finalizeAbandonedAttachmentsForTurn: ([AgentImageAttachment]) -> Void
         let setAgentRunActive: (UUID, Bool) -> Void
-        let updateBindings: (AgentModeViewModel.TabSession) -> Void
+        let updateBindings: (AgentTabSession) -> Void
         let requestUIRefresh: (UUID, Bool) -> Void
         let scheduleSave: (UUID) -> Void
-        let notifyAgentTurnComplete: (AgentModeViewModel.TabSession) -> Void
-        let handleHeadlessStreamResult: (AIStreamResult, AgentModeViewModel.TabSession, UUID, UUID) async -> Void
-        let buildHeadlessAgentMessage: (AgentModeViewModel.TabSession, String, UUID, [AgentImageAttachment]) -> AgentMessage
-        let finalizeStreamingItems: (AgentModeViewModel.TabSession) -> Void
-        let finalizePendingToolCalls: (AgentModeViewModel.TabSession, AgentSessionRunState) -> Void
-        let finalizePendingToolCallsWithUpperBound: (AgentModeViewModel.TabSession, AgentSessionRunState, Int?) -> Void
-        let finalizeNonCodexTurnUsage: (AgentModeViewModel.TabSession, Int?, Int?, Int?) -> Void
-        let cancelPendingQuestion: (AgentModeViewModel.TabSession) -> Void
-        let cancelPendingApproval: (AgentModeViewModel.TabSession) -> Void
-        let cancelPendingApplyEditsReview: (AgentModeViewModel.TabSession, String) -> Void
-        let cancelPendingWorktreeMergeReview: (AgentModeViewModel.TabSession, String) -> Void
-        let flushPendingAssistantDelta: (AgentModeViewModel.TabSession) -> Void
-        let clearPendingAssistantDelta: (AgentModeViewModel.TabSession) -> Void
-        let prepareTerminalPublication: (AgentModeViewModel.TabSession) -> Void
+        let notifyAgentTurnComplete: (AgentTabSession) -> Void
+        let handleHeadlessStreamResult: (AIStreamResult, AgentTabSession, UUID, UUID) async -> Void
+        let buildHeadlessAgentMessage: (AgentTabSession, String, UUID, [AgentImageAttachment]) -> AgentMessage
+        let finalizeStreamingItems: (AgentTabSession) -> Void
+        let finalizePendingToolCalls: (AgentTabSession, AgentSessionRunState) -> Void
+        let finalizePendingToolCallsWithUpperBound: (AgentTabSession, AgentSessionRunState, Int?) -> Void
+        let finalizeNonCodexTurnUsage: (AgentTabSession, Int?, Int?, Int?) -> Void
+        let cancelPendingQuestion: (AgentTabSession) -> Void
+        let cancelPendingApproval: (AgentTabSession) -> Void
+        let cancelPendingApplyEditsReview: (AgentTabSession, String) -> Void
+        let cancelPendingWorktreeMergeReview: (AgentTabSession, String) -> Void
+        let flushPendingAssistantDelta: (AgentTabSession) -> Void
+        let clearPendingAssistantDelta: (AgentTabSession) -> Void
+        let prepareTerminalPublication: (AgentTabSession) -> Void
         let makeTerminalPublicationEnvelope: (
-            AgentModeViewModel.TabSession,
+            AgentTabSession,
             AgentRunOwnership,
             AgentSessionRunState,
             UUID?
         ) -> AgentRunTerminalPublicationEnvelope?
         let publishTerminalCommit: (
-            AgentModeViewModel.TabSession,
+            AgentTabSession,
             AgentRunTerminalCommitRevision,
             AgentRunEpochTransitionKind?
         ) async -> AgentRunTerminalPublicationResult
@@ -121,22 +121,22 @@ final class AgentModeRunService {
             _ text: String,
             _ attachments: [AgentImageAttachment],
             _ taggedFileAttachments: [AgentTaggedFileAttachment],
-            _ session: AgentModeViewModel.TabSession?
+            _ session: AgentTabSession?
         ) async -> String
         /// Stages a transcript handoff for fresh-session resume recovery.
-        let stageResumeRecoveryHandoffIfNeeded: (_ session: AgentModeViewModel.TabSession) async -> Void
+        let stageResumeRecoveryHandoffIfNeeded: (_ session: AgentTabSession) async -> Void
         /// Prepends a staged handoff payload to provider-facing text.
-        let prependPendingHandoffIfNeeded: (_ text: String, _ session: AgentModeViewModel.TabSession) -> String
+        let prependPendingHandoffIfNeeded: (_ text: String, _ session: AgentTabSession) -> String
         /// Records whether a staged handoff payload was accepted by the provider send attempt.
-        let recordPendingHandoffSendOutcome: (_ session: AgentModeViewModel.TabSession, _ didSend: Bool) -> Void
+        let recordPendingHandoffSendOutcome: (_ session: AgentTabSession, _ didSend: Bool) -> Void
         /// Wakes MCP waiters once a steering instruction has actually been delivered to the provider.
-        let signalMCPInstructionDelivered: (_ session: AgentModeViewModel.TabSession) async -> Void
+        let signalMCPInstructionDelivered: (_ session: AgentTabSession) async -> Void
         /// Commits or rolls back exactly the delegated child-question notices staged into this
         /// turn's first input (`stageID` from `AgentModeViewModel.startAgentRun`). Runners call it at
         /// the actual provider submission outcome of the input that carried them (never at a
         /// queued fallback or optimistic pre-dispatch point); a nil or superseded stage is a no-op.
         var recordDelegatedQuestionNoticeSendOutcome: (
-            _ session: AgentModeViewModel.TabSession,
+            _ session: AgentTabSession,
             _ stageID: UUID?,
             _ didSend: Bool
         ) -> Void = { _, _, _ in }
@@ -151,10 +151,10 @@ final class AgentModeRunService {
         }
 
         func test_attachmentFinalizationHook() -> (
-            AgentModeViewModel.TabSession,
+            AgentTabSession,
             UUID?,
             [AgentImageAttachment],
-            AgentModeViewModel.AttachmentTurnDisposition
+            AgentAttachmentTurnDisposition
         ) -> Void {
             hooks.finalizeAttachmentsForTurn
         }
@@ -218,11 +218,11 @@ final class AgentModeRunService {
     @discardableResult
     func startRun(
         tabID: UUID,
-        session: AgentModeViewModel.TabSession,
+        session: AgentTabSession,
         initialUserMessage: String,
         initialMessageForRun: String,
         attachments: [AgentImageAttachment],
-        codexFallbackContext: AgentModeViewModel.TabSession.CodexFallbackSubmissionContext? = nil,
+        codexFallbackContext: AgentTabSession.CodexFallbackSubmissionContext? = nil,
         providerHandoffAuthorization: (@MainActor () -> Bool)? = nil,
         delegatedQuestionStageID: UUID? = nil
     ) async -> CodexAgentModeCoordinator.NativeSendOutcome? {
@@ -484,7 +484,7 @@ final class AgentModeRunService {
     /// Attempts to submit a prompt into an already-active ACP session.
     @discardableResult
     func submitActiveACPPromptIfSupported(
-        session: AgentModeViewModel.TabSession,
+        session: AgentTabSession,
         messageForRun: String,
         attachments: [AgentImageAttachment],
         targetRunID: UUID?,
@@ -543,7 +543,7 @@ final class AgentModeRunService {
     }
 
     @discardableResult
-    func submitQueuedACPSteeringIfSupported(session: AgentModeViewModel.TabSession) async -> Bool {
+    func submitQueuedACPSteeringIfSupported(session: AgentTabSession) async -> Bool {
         guard session.selectedAgent.acpProviderID != nil,
               session.runState == .running
         else {
@@ -726,7 +726,7 @@ final class AgentModeRunService {
         return description.isEmpty ? String(describing: error) : description
     }
 
-    private func failBeforeProviderStartup(session: AgentModeViewModel.TabSession, message: String) async {
+    private func failBeforeProviderStartup(session: AgentTabSession, message: String) async {
         let ownership = session.activeRunOwnership ?? session.beginRunAttempt(source: "runService.startupFailure")
         hooks.recordPendingHandoffSendOutcome(session, false)
         await terminalCommitBarrier.commit(.init(
@@ -748,7 +748,7 @@ final class AgentModeRunService {
     }
 
     private func isCurrentACPSteeringAttempt(
-        session: AgentModeViewModel.TabSession,
+        session: AgentTabSession,
         runID: UUID,
         runAttemptID: UUID,
         controller: ACPAgentSessionController
@@ -762,8 +762,8 @@ final class AgentModeRunService {
 
     private func requeueQueuedACPSteeringAsFollowUp(
         tabID: UUID,
-        session: AgentModeViewModel.TabSession,
-        matching shouldRequeue: (AgentModeViewModel.TabSession.ACPSteeringInstruction) -> Bool,
+        session: AgentTabSession,
+        matching shouldRequeue: (AgentTabSession.ACPSteeringInstruction) -> Bool,
         reason: String
     ) {
         let instructions = session.pendingACPSteeringInstructions.filter(shouldRequeue)
@@ -774,8 +774,8 @@ final class AgentModeRunService {
 
     private func requeueLeadingACPSteeringAsFollowUp(
         tabID: UUID,
-        session: AgentModeViewModel.TabSession,
-        while shouldRequeue: (AgentModeViewModel.TabSession.ACPSteeringInstruction) -> Bool,
+        session: AgentTabSession,
+        while shouldRequeue: (AgentTabSession.ACPSteeringInstruction) -> Bool,
         reason: String
     ) {
         let instructions = Array(session.pendingACPSteeringInstructions.prefix(while: shouldRequeue))
@@ -786,7 +786,7 @@ final class AgentModeRunService {
 
     private func requeueAllQueuedACPSteeringAsFollowUp(
         tabID: UUID,
-        session: AgentModeViewModel.TabSession,
+        session: AgentTabSession,
         reason: String
     ) {
         let instructions = session.pendingACPSteeringInstructions
@@ -796,7 +796,7 @@ final class AgentModeRunService {
     }
 
     private func coalescedACPProviderText(
-        for instructions: [AgentModeViewModel.TabSession.ACPSteeringInstruction]
+        for instructions: [AgentTabSession.ACPSteeringInstruction]
     ) -> String {
         let steeringTexts = instructions
             .map { $0.providerText.trimmingCharacters(in: .whitespacesAndNewlines) }
@@ -844,9 +844,9 @@ final class AgentModeRunService {
     }
 
     private func requeueACPSteeringAsFollowUp(
-        _ instructions: [AgentModeViewModel.TabSession.ACPSteeringInstruction],
+        _ instructions: [AgentTabSession.ACPSteeringInstruction],
         tabID: UUID,
-        session: AgentModeViewModel.TabSession,
+        session: AgentTabSession,
         reason: String
     ) {
         var providerTexts = [coalescedACPProviderText(for: instructions)]
@@ -873,7 +873,7 @@ final class AgentModeRunService {
     /// scoped to unprotected expected turn IDs rather than queued-message count so
     /// coalesced/stacked steering does not over-increment.
     func protectCurrentClaudeTurnForAcceptedSteeringIfNeeded(
-        session: AgentModeViewModel.TabSession,
+        session: AgentTabSession,
         steeringID: UUID
     ) {
         guard session.selectedAgent.usesClaudeNativeRuntime,
@@ -900,8 +900,8 @@ final class AgentModeRunService {
     }
 
     private func releaseUnconsumedClaudeSupersedingProtection(
-        for instructions: [AgentModeViewModel.TabSession.ClaudeSteeringInstruction],
-        session: AgentModeViewModel.TabSession
+        for instructions: [AgentTabSession.ClaudeSteeringInstruction],
+        session: AgentTabSession
     ) {
         let protectedTurnIDs = Set(instructions.flatMap(\.supersedingProtectedTurnIDs))
         guard !protectedTurnIDs.isEmpty else { return }
@@ -919,7 +919,7 @@ final class AgentModeRunService {
     }
 
     private func awaitClaudeChildAgentRunWaitScopesDrained(
-        session: AgentModeViewModel.TabSession,
+        session: AgentTabSession,
         runID: UUID,
         runAttemptID: UUID,
         timeoutSeconds: TimeInterval? = nil
@@ -945,7 +945,7 @@ final class AgentModeRunService {
     }
 
     @discardableResult
-    func submitQueuedClaudeSteeringIfSupported(session: AgentModeViewModel.TabSession) async -> Bool {
+    func submitQueuedClaudeSteeringIfSupported(session: AgentTabSession) async -> Bool {
         guard session.selectedAgent.usesClaudeNativeRuntime,
               session.runState == .running
         else {
@@ -1126,7 +1126,7 @@ final class AgentModeRunService {
     /// awaits itself.
     private func cancelClaudeRunStrandedBySteeringFailureIfNeeded(
         tabID: UUID,
-        session: AgentModeViewModel.TabSession,
+        session: AgentTabSession,
         runID: UUID,
         runAttemptID: UUID
     ) async {
@@ -1178,7 +1178,7 @@ final class AgentModeRunService {
     }
 
     private func isCurrentClaudeSteeringAttempt(
-        session: AgentModeViewModel.TabSession,
+        session: AgentTabSession,
         runID: UUID,
         runAttemptID: UUID
     ) -> Bool {
@@ -1191,9 +1191,9 @@ final class AgentModeRunService {
     /// Concatenates queued Claude steering draft texts and restores them to the composer.
     private func restoreQueuedClaudeSteeringDrafts(
         tabID: UUID,
-        session: AgentModeViewModel.TabSession,
+        session: AgentTabSession,
         strategy: DraftRestorationStrategy,
-        matching shouldRestore: (AgentModeViewModel.TabSession.ClaudeSteeringInstruction) -> Bool
+        matching shouldRestore: (AgentTabSession.ClaudeSteeringInstruction) -> Bool
     ) {
         let instructions = session.pendingClaudeSteeringInstructions.filter(shouldRestore)
         let drafts = instructions
@@ -1208,9 +1208,9 @@ final class AgentModeRunService {
     /// Restores only the leading stale instructions so newer queued work remains eligible for a new flush task.
     private func restoreLeadingQueuedClaudeSteeringDrafts(
         tabID: UUID,
-        session: AgentModeViewModel.TabSession,
+        session: AgentTabSession,
         strategy: DraftRestorationStrategy,
-        while shouldRestore: (AgentModeViewModel.TabSession.ClaudeSteeringInstruction) -> Bool
+        while shouldRestore: (AgentTabSession.ClaudeSteeringInstruction) -> Bool
     ) {
         let instructions = Array(session.pendingClaudeSteeringInstructions.prefix(while: shouldRestore))
         guard !instructions.isEmpty else { return }
@@ -1235,7 +1235,7 @@ final class AgentModeRunService {
 
     private func restoreAllQueuedDraftsForExecutionLocationChange(
         tabID: UUID,
-        session: AgentModeViewModel.TabSession,
+        session: AgentTabSession,
         strategy: DraftRestorationStrategy
     ) {
         let drafts = (
@@ -1252,7 +1252,7 @@ final class AgentModeRunService {
     /// Concatenates all queued Claude steering draft texts and restores them to the composer.
     private func restoreAllQueuedClaudeSteeringDrafts(
         tabID: UUID,
-        session: AgentModeViewModel.TabSession,
+        session: AgentTabSession,
         strategy: DraftRestorationStrategy
     ) {
         restoreQueuedClaudeSteeringDrafts(
@@ -1265,7 +1265,7 @@ final class AgentModeRunService {
 
     func cancelRun(
         tabID: UUID,
-        session: AgentModeViewModel.TabSession,
+        session: AgentTabSession,
         intent: CancellationIntent = .userStop,
         completion: CancellationCompletion = .terminalPublished
     ) async {
@@ -1422,7 +1422,7 @@ final class AgentModeRunService {
     }
 
     private func cancelToolsBeforeStoppingProvider(
-        session: AgentModeViewModel.TabSession,
+        session: AgentTabSession,
         reason: String
     ) {
         guard let runID = session.runID else { return }
@@ -1437,7 +1437,7 @@ final class AgentModeRunService {
     @discardableResult
     func handleProviderToolStreamEvent(
         _ result: AIStreamResult,
-        session: AgentModeViewModel.TabSession
+        session: AgentTabSession
     ) -> Bool {
         guard let event = AgentToolStreamEvent.from(result) else { return false }
         let agent = session.selectedAgent

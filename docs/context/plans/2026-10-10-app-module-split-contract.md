@@ -221,6 +221,17 @@ Decisions: the emptied `AgentModeViewModel+TabSession.swift` was deleted and its
 
 Step 5b — done | rounds 0/2 | open: | downgraded: | assumed: | deferred:
 
+#### Step 5c — agent code spells the hoisted names
+Intent: a rescan (evidence `step5c-probe/`) shows 574 of the remaining view-model references in the agent seed are old spellings through the Step 5a/5b aliases, so rewrite them to the hoisted `Agent…` names (and the two transcript forwarders to the builder) and move the saved `AgentContextUsage` record out of the view-model file unchanged, so the next rescan shows only genuine view-model dependencies.
+
+Budget used: about 1 hour (cumulative ~21 hours).
+
+Result: 574 references in 20 agent files now use the hoisted names and `AgentContextUsage` has its own file. A mechanical check shows every changed file equals its base with only the alias map applied, apart from three realigned lines and the moved record. Build, format, lint and 34 affected suites (765 tests) pass, except that each of two runs had one different timing-dependent failure, and both suites pass alone. Both reviewers found nothing above P3, so the next step rescans and classifies the genuine view-model uses.
+
+Decisions: the two intermittent failures (`AgentModeRunServiceLifecycleTests.testPreDeniedOhMyPiReceiptPreventsBootstrapAfterGateAuthorization`, `RemoteAgentSessionTests.testStaleRecoveryPausesOnDisconnectResumesSameSessionAndDefersToTransientRecovery`) are treated as host-load flakes because the compiled program is unchanged apart from one equivalent direct call; the view-model debug-log statics stay for the diagnostics step.
+
+Step 5c — done | rounds 0/2 | open: | downgraded: | assumed: | deferred:
+
 ### Slice 6 — `RepoPromptAgentCore` extraction
 Move the now-acyclic AI, agent models, providers, runtime, services, history, recommendations and non-UI remote-host code. Remove the temporary typealiases. Check the release compile flags once for cross-module optimization; don't change them.
 

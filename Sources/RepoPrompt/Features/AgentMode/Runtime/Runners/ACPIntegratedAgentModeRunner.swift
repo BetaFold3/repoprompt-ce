@@ -53,9 +53,9 @@ final class ACPIntegratedAgentModeRunner {
     }
 
     private final class WeakTabSession {
-        weak var value: AgentModeViewModel.TabSession?
+        weak var value: AgentTabSession?
 
-        init(_ value: AgentModeViewModel.TabSession) {
+        init(_ value: AgentTabSession) {
             self.value = value
         }
     }
@@ -95,8 +95,8 @@ final class ACPIntegratedAgentModeRunner {
     private let hooks: AgentModeRunService.Hooks
     private let terminalCommitBarrier: AgentRunTerminalCommitBarrier
     private let toolTrackingHooks: AgentToolTrackingHooks
-    private let providerFactory: AgentModeViewModel.ACPProviderFactory
-    private let controllerFactory: AgentModeViewModel.ACPControllerFactory
+    private let providerFactory: AgentACPProviderFactory
+    private let controllerFactory: AgentACPControllerFactory
     private var toolTrackingByTabID: [UUID: AgentToolTrackingController] = [:]
     private var toolTrackingRunIDByTabID: [UUID: UUID] = [:]
     private var acpProviderInvocationByTrackerInvocationIDByTabID: [UUID: [UUID: UUID]] = [:]
@@ -188,8 +188,8 @@ final class ACPIntegratedAgentModeRunner {
         hooks: AgentModeRunService.Hooks,
         terminalCommitBarrier: AgentRunTerminalCommitBarrier,
         toolTrackingHooks: AgentToolTrackingHooks,
-        providerFactory: @escaping AgentModeViewModel.ACPProviderFactory,
-        controllerFactory: @escaping AgentModeViewModel.ACPControllerFactory
+        providerFactory: @escaping AgentACPProviderFactory,
+        controllerFactory: @escaping AgentACPControllerFactory
     ) {
         self.hooks = hooks
         self.terminalCommitBarrier = terminalCommitBarrier
@@ -200,7 +200,7 @@ final class ACPIntegratedAgentModeRunner {
 
     func startRun(
         tabID: UUID,
-        session: AgentModeViewModel.TabSession,
+        session: AgentTabSession,
         initialUserMessage: String,
         initialMessageForRun: String,
         attachments: [AgentImageAttachment],
@@ -572,7 +572,7 @@ final class ACPIntegratedAgentModeRunner {
     }
 
     func submitActivePrompt(
-        session: AgentModeViewModel.TabSession,
+        session: AgentTabSession,
         messageForRun: String,
         attachments: [AgentImageAttachment],
         runRequest: ACPRunRequest,
@@ -662,7 +662,7 @@ final class ACPIntegratedAgentModeRunner {
     }
 
     private func isStartupStillCurrent(
-        session: AgentModeViewModel.TabSession,
+        session: AgentTabSession,
         runID: UUID? = nil,
         runAttemptID: UUID
     ) -> Bool {
@@ -678,7 +678,7 @@ final class ACPIntegratedAgentModeRunner {
     }
 
     private func finalizeUnpublishedControllerStartup(
-        session: AgentModeViewModel.TabSession,
+        session: AgentTabSession,
         runID: UUID,
         runAttemptID: UUID,
         controller: ACPAgentSessionController,
@@ -724,7 +724,7 @@ final class ACPIntegratedAgentModeRunner {
 
     private func failBeforeProviderSend(
         tabID _: UUID,
-        session: AgentModeViewModel.TabSession,
+        session: AgentTabSession,
         runID: UUID,
         runAttemptID: UUID,
         attachmentReservationID: UUID?,
@@ -756,7 +756,7 @@ final class ACPIntegratedAgentModeRunner {
     }
 
     private func cancelBeforeProviderSend(
-        session: AgentModeViewModel.TabSession,
+        session: AgentTabSession,
         runID: UUID,
         runAttemptID: UUID,
         attachmentReservationID: UUID?
@@ -1466,7 +1466,7 @@ final class ACPIntegratedAgentModeRunner {
 
     private func continueRun(
         tabID: UUID,
-        session: AgentModeViewModel.TabSession,
+        session: AgentTabSession,
         runID: UUID,
         runAttemptID: UUID,
         initialMessageForRun: String,
@@ -1575,7 +1575,7 @@ final class ACPIntegratedAgentModeRunner {
     }
 
     private func runPromptTurn(
-        session: AgentModeViewModel.TabSession,
+        session: AgentTabSession,
         runID: UUID,
         runAttemptID: UUID,
         initialMessageForRun: String,
@@ -1673,7 +1673,7 @@ final class ACPIntegratedAgentModeRunner {
     /// prompt returned or threw, before finalization — releases the stage when no write happened
     /// and otherwise just joins the acknowledgement. A nil stage is a no-op.
     private func makeDelegatedQuestionPromptAcknowledgement(
-        session: AgentModeViewModel.TabSession,
+        session: AgentTabSession,
         stageID: UUID?
     ) -> (onSubmitted: (@Sendable () -> Void)?, settle: () async -> Void) {
         guard let stageID else { return (nil, {}) }
@@ -1703,7 +1703,7 @@ final class ACPIntegratedAgentModeRunner {
     private func applyProviderSessionIdentity(
         _ identity: ACPProviderSessionIdentity,
         invalidatedResumeSessionID: String? = nil,
-        session: AgentModeViewModel.TabSession
+        session: AgentTabSession
     ) {
         let providerSessionID = identity.loadSessionID ?? identity.runtimeSessionID
         var changed = false
@@ -1789,7 +1789,7 @@ final class ACPIntegratedAgentModeRunner {
 
     private func consumeEvents(
         _ events: AsyncStream<NormalizedAgentRuntimeEvent>,
-        session: AgentModeViewModel.TabSession,
+        session: AgentTabSession,
         runID: UUID,
         runAttemptID: UUID
     ) async -> ConsumeEventsOutcome {
@@ -1844,7 +1844,7 @@ final class ACPIntegratedAgentModeRunner {
 
     private func handleAcquireFailure(
         tabID _: UUID,
-        session: AgentModeViewModel.TabSession,
+        session: AgentTabSession,
         runID: UUID,
         runAttemptID: UUID,
         controller: ACPAgentSessionController,
@@ -1877,7 +1877,7 @@ final class ACPIntegratedAgentModeRunner {
     }
 
     private func finalize(
-        session: AgentModeViewModel.TabSession,
+        session: AgentTabSession,
         runID: UUID,
         runAttemptID: UUID,
         controller: ACPAgentSessionController?,
@@ -1938,7 +1938,7 @@ final class ACPIntegratedAgentModeRunner {
     // MARK: - Tool Tracking (per-tab, using shared AgentToolTrackingController)
 
     private func startToolTracking(
-        for session: AgentModeViewModel.TabSession,
+        for session: AgentTabSession,
         runID: UUID,
         clientNameHint: String
     ) async {
@@ -1971,7 +1971,7 @@ final class ACPIntegratedAgentModeRunner {
     }
 
     private func prepareToolTrackingTeardown(
-        for session: AgentModeViewModel.TabSession,
+        for session: AgentTabSession,
         matchingRunID: UUID? = nil
     ) -> AgentRunAttemptTerminalResources.Teardown? {
         prepareToolTrackingTeardown(
@@ -1984,7 +1984,7 @@ final class ACPIntegratedAgentModeRunner {
     private func prepareToolTrackingTeardown(
         tabID: UUID,
         matchingRunID: UUID? = nil,
-        session: AgentModeViewModel.TabSession? = nil
+        session: AgentTabSession? = nil
     ) -> AgentRunAttemptTerminalResources.Teardown? {
         if let matchingRunID, toolTrackingRunIDByTabID[tabID] != matchingRunID {
             return nil
@@ -2014,7 +2014,7 @@ final class ACPIntegratedAgentModeRunner {
     private func teardownToolTrackingAfterSessionLoss(
         tabID: UUID,
         runID: UUID,
-        session: AgentModeViewModel.TabSession? = nil
+        session: AgentTabSession? = nil
     ) async {
         let teardown = prepareToolTrackingTeardown(
             tabID: tabID,
@@ -2026,8 +2026,8 @@ final class ACPIntegratedAgentModeRunner {
 
     private func setRunningStatus(
         _ text: String?,
-        source: AgentModeViewModel.TabSession.RunningStatusSource?,
-        session: AgentModeViewModel.TabSession,
+        source: AgentTabSession.RunningStatusSource?,
+        session: AgentTabSession,
         urgent: Bool = false
     ) {
         let normalized = text?.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -2060,7 +2060,7 @@ final class ACPIntegratedAgentModeRunner {
         invocationID: UUID,
         toolName: String,
         args: [String: Value]?,
-        session: AgentModeViewModel.TabSession
+        session: AgentTabSession
     ) {
         guard AgentToolTrackingSupport.isRepoPromptTool(toolName) else { return }
         guard !AgentToolTrackingSupport.shouldHideToolFromTranscript(toolName) else { return }
@@ -2145,7 +2145,7 @@ final class ACPIntegratedAgentModeRunner {
         args: [String: Value]?,
         resultJSON: String,
         isError: Bool,
-        session: AgentModeViewModel.TabSession
+        session: AgentTabSession
     ) {
         if isError {
             recordOMPTrackerErrorCredit(for: session)
@@ -2209,7 +2209,7 @@ final class ACPIntegratedAgentModeRunner {
 
     private func indexedThenActiveTurnToolCandidates(
         indexedIndices: [Int],
-        session: AgentModeViewModel.TabSession,
+        session: AgentTabSession,
         where predicate: (AgentChatItem) -> Bool
     ) -> (indices: [Int], inspectedItemCount: Int, usedFallbackScan: Bool) {
         let indexedMatches = indexedIndices.filter { predicate(session.items[$0]) }
@@ -2225,7 +2225,7 @@ final class ACPIntegratedAgentModeRunner {
     }
 
     private func correlatedToolCallItemIndex(
-        in session: AgentModeViewModel.TabSession,
+        in session: AgentTabSession,
         storedToolName: String,
         invocationID: UUID?,
         argsJSON: String?,
@@ -2281,12 +2281,12 @@ final class ACPIntegratedAgentModeRunner {
         if let argsJSON,
            hasAccountableToolPayload(argsJSON)
         {
-            let normalizedToolName = AgentModeViewModel.TabSession.normalizedToolCorrelationName(storedToolName)
+            let normalizedToolName = AgentTabSession.normalizedToolCorrelationName(storedToolName)
             let placeholderCandidates = session.activeTurnToolItemIndices(where: { item in
                 item.kind == .toolCall
                     && self.isProviderPlaceholderInvocation(item.toolInvocationID, tabID: session.tabID)
                     && self.isPlaceholderToolArgs(item.toolArgsJSON)
-                    && AgentModeViewModel.TabSession.normalizedToolCorrelationName(item.toolName) == normalizedToolName
+                    && AgentTabSession.normalizedToolCorrelationName(item.toolName) == normalizedToolName
             })
             inspectedItemCount += placeholderCandidates.scannedItemCount
             if placeholderCandidates.indices.count == 1 {
@@ -2298,10 +2298,10 @@ final class ACPIntegratedAgentModeRunner {
             }
         }
         if allowNameOnlyFallback {
-            let normalizedToolName = AgentModeViewModel.TabSession.normalizedToolCorrelationName(storedToolName)
+            let normalizedToolName = AgentTabSession.normalizedToolCorrelationName(storedToolName)
             let fallback = session.activeTurnToolItemIndices(where: {
                 $0.kind == .toolCall
-                    && AgentModeViewModel.TabSession.normalizedToolCorrelationName($0.toolName) == normalizedToolName
+                    && AgentTabSession.normalizedToolCorrelationName($0.toolName) == normalizedToolName
             })
             inspectedItemCount += fallback.scannedItemCount
             MCPToolObserverAttributionContext.record(
@@ -2318,7 +2318,7 @@ final class ACPIntegratedAgentModeRunner {
     }
 
     private func correlatedToolResultItemIndex(
-        in session: AgentModeViewModel.TabSession,
+        in session: AgentTabSession,
         storedToolName: String,
         invocationID: UUID?,
         argsJSON: String?,
@@ -2416,10 +2416,10 @@ final class ACPIntegratedAgentModeRunner {
             }
         }
         if allowNameOnlyFallback {
-            let normalizedToolName = AgentModeViewModel.TabSession.normalizedToolCorrelationName(storedToolName)
+            let normalizedToolName = AgentTabSession.normalizedToolCorrelationName(storedToolName)
             let fallback = session.activeTurnToolItemIndices(where: {
                 $0.kind == .toolCall
-                    && AgentModeViewModel.TabSession.normalizedToolCorrelationName($0.toolName) == normalizedToolName
+                    && AgentTabSession.normalizedToolCorrelationName($0.toolName) == normalizedToolName
             })
             inspectedItemCount += fallback.scannedItemCount
             MCPToolObserverAttributionContext.record(
@@ -2518,12 +2518,12 @@ final class ACPIntegratedAgentModeRunner {
         return providerInvocationID
     }
 
-    private func isOMPToolTrackingActive(for session: AgentModeViewModel.TabSession) -> Bool {
+    private func isOMPToolTrackingActive(for session: AgentTabSession) -> Bool {
         guard session.selectedAgent == .ohMyPi, let runID = session.runID else { return false }
         return toolTrackingRunIDByTabID[session.tabID] == runID
     }
 
-    private func recordOMPTrackerErrorCredit(for session: AgentModeViewModel.TabSession) {
+    private func recordOMPTrackerErrorCredit(for session: AgentTabSession) {
         guard isOMPToolTrackingActive(for: session) else { return }
         // Credits only apply to provider failures that arrive later. Consuming an earlier
         // unmatched failure would hide evidence from an unrelated denied/cancelled call.
@@ -2534,7 +2534,7 @@ final class ACPIntegratedAgentModeRunner {
         toolCallID: UUID?,
         title: String,
         rawInput: String?,
-        session: AgentModeViewModel.TabSession
+        session: AgentTabSession
     ) {
         let tabID = session.tabID
         if let toolCallID {
@@ -2561,7 +2561,7 @@ final class ACPIntegratedAgentModeRunner {
         return pending
     }
 
-    private func materializePendingOMPProviderFailures(for session: AgentModeViewModel.TabSession) {
+    private func materializePendingOMPProviderFailures(for session: AgentTabSession) {
         materializeOMPProviderFailures(
             takePendingOMPProviderFailures(for: session.tabID),
             for: session
@@ -2570,7 +2570,7 @@ final class ACPIntegratedAgentModeRunner {
 
     private func materializeOMPProviderFailures(
         _ pending: [PendingOMPProviderFailure],
-        for session: AgentModeViewModel.TabSession
+        for session: AgentTabSession
     ) {
         guard !pending.isEmpty else { return }
         let tabID = session.tabID
@@ -2601,7 +2601,7 @@ final class ACPIntegratedAgentModeRunner {
     }
 
     private func toolInvocationSignature(toolName: String?, argsJSON: String?) -> String {
-        AgentModeViewModel.TabSession.canonicalToolInvocationSignature(
+        AgentTabSession.canonicalToolInvocationSignature(
             toolName: toolName,
             argsJSON: argsJSON
         )
@@ -2641,7 +2641,7 @@ final class ACPIntegratedAgentModeRunner {
 
     #if DEBUG
         func testInstallOMPToolTrackingAuthority(
-            session: AgentModeViewModel.TabSession,
+            session: AgentTabSession,
             runID: UUID
         ) {
             resetACPToolCorrelation(for: session.tabID)
@@ -2649,7 +2649,7 @@ final class ACPIntegratedAgentModeRunner {
         }
 
         func testMaterializePendingOMPProviderFailures(
-            session: AgentModeViewModel.TabSession
+            session: AgentTabSession
         ) {
             materializePendingOMPProviderFailures(for: session)
         }
@@ -2666,7 +2666,7 @@ final class ACPIntegratedAgentModeRunner {
         }
 
         func testPrepareToolTrackingTeardownState(
-            session: AgentModeViewModel.TabSession,
+            session: AgentTabSession,
             matchingRunID: UUID
         ) {
             _ = prepareToolTrackingTeardown(for: session, matchingRunID: matchingRunID)
@@ -2676,7 +2676,7 @@ final class ACPIntegratedAgentModeRunner {
             invocationID: UUID,
             toolName: String,
             args: [String: Value]?,
-            session: AgentModeViewModel.TabSession
+            session: AgentTabSession
         ) {
             handleTrackerToolCall(invocationID: invocationID, toolName: toolName, args: args, session: session)
         }
@@ -2687,7 +2687,7 @@ final class ACPIntegratedAgentModeRunner {
             args: [String: Value]?,
             resultJSON: String,
             isError: Bool,
-            session: AgentModeViewModel.TabSession
+            session: AgentTabSession
         ) {
             handleTrackerToolResult(
                 invocationID: invocationID,
@@ -2701,7 +2701,7 @@ final class ACPIntegratedAgentModeRunner {
 
         func testSyncACPSelectedModelFromRegistryIfNeeded(
             agentKind: AgentProviderKind,
-            session: AgentModeViewModel.TabSession
+            session: AgentTabSession
         ) -> Bool {
             syncACPSelectedModelFromRegistryIfNeeded(agentKind: agentKind, session: session)
         }
@@ -2711,7 +2711,7 @@ final class ACPIntegratedAgentModeRunner {
 
     private func syncACPSelectedModelFromRegistryIfNeeded(
         agentKind: AgentProviderKind,
-        session: AgentModeViewModel.TabSession
+        session: AgentTabSession
     ) -> Bool {
         guard let providerID = agentKind.acpProviderID,
               let snapshot = AgentACPModelRegistry.shared.resolvedSnapshot(for: providerID)
@@ -2740,7 +2740,7 @@ final class ACPIntegratedAgentModeRunner {
     @discardableResult
     func handleToolStreamEvent(
         _ event: AgentToolStreamEvent,
-        session: AgentModeViewModel.TabSession
+        session: AgentTabSession
     ) -> Bool {
         // For the exact managed OMP run, the MCP tracker is the transcript and token
         // authority. Provider titles are intentionally not inspected for identity.
