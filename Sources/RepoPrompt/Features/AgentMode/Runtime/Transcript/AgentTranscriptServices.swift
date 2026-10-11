@@ -6270,7 +6270,7 @@ enum AgentTranscriptProjectionBuilder {
         #if DEBUG
             let workingRowTail = Array(workingRows.suffix(8)).map(debugRowSummary).joined(separator: ", ")
             let workingBlockTail = Array(workingBlocks.suffix(8)).map(debugBlockSummary).joined(separator: " | ")
-            AgentModeViewModel.logCodexDebug(
+            CodexDebugLog.log(
                 "[AgentTranscriptProjection] build turns=\(transcript.turns.count) workingRows=\(workingRows.count) workingBlocks=\(workingBlocks.count) reusedPrefixTurns=\(reusablePrefix?.turnCount ?? 0) cacheHits=\(cacheHitCount) workingRowTail=[\(workingRowTail)] workingBlockTail=[\(workingBlockTail)]"
             )
             if AgentTranscriptDebugInstrumentation.isEnabled {

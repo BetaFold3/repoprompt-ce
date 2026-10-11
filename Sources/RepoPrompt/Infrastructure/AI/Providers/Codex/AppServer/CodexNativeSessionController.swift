@@ -140,10 +140,7 @@ final class CodexNativeSessionController {
     )
 
     private static func logCodexDebug(_ message: @autoclosure () -> String) {
-        #if DEBUG
-            guard UserDefaults.standard.bool(forKey: "enableCodexDebugLogging") else { return }
-            print(message())
-        #endif
+        CodexDebugLog.log(message())
     }
 
     private static let maxRunningAggregatedOutputCharacters = 24000

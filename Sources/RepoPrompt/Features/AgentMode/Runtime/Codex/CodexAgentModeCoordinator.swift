@@ -475,7 +475,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
     }
 
     private func logCodex(_ message: @autoclosure () -> String) {
-        AgentModeViewModel.logCodexDebug(message())
+        CodexDebugLog.log(message())
     }
 
     private func logCodexTranscriptOrdering(
@@ -4764,7 +4764,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
     /// Names the run-owned MCP scopes that were still active when the steering drain ended.
     /// Counts and ages only; the transcript keeps this as the durable rejection record.
     nonisolated static func activeSendDrainFailureMessage(
-        _ blockers: MCPServerViewModel.AgentRunWaitDrainBlockers
+        _ blockers: AgentRunWaitDrainBlockers
     ) -> String {
         var parts: [String] = []
         if blockers.childAgentRunWaitCount > 0 {
@@ -6418,7 +6418,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         session: AgentTabSession,
         sourceController: (any CodexSessionControlling)? = nil
     ) async {
-        AgentModeViewModel.logCodexDebug("[AgentModeVM][CodexUI] handleEvent \(debugCodexEventSummary(event)) tab=\(session.tabID)")
+        CodexDebugLog.log("[AgentModeVM][CodexUI] handleEvent \(debugCodexEventSummary(event)) tab=\(session.tabID)")
         if let sourceController {
             guard let activeController = session.codexController,
                   Self.sameCodexControllerInstance(activeController, sourceController)
@@ -6633,7 +6633,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 at: eventTimestamp
             )
             if AgentToolTrackingSupport.isExplicitRepoPromptTool(toolName) {
-                AgentModeViewModel.logCodexDebug("[AgentModeVM][CodexUI] skip native explicit RepoPrompt toolCall tool=\(toolName)")
+                CodexDebugLog.log("[AgentModeVM][CodexUI] skip native explicit RepoPrompt toolCall tool=\(toolName)")
                 return
             }
             guard !AgentToolTrackingSupport.shouldHideToolFromTranscript(toolName) else { return }
@@ -6648,7 +6648,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 ) != nil
                 if didUpdate {
                     updateBashLivenessTaskState(for: session)
-                    AgentModeViewModel.logCodexDebug("[AgentModeVM][CodexUI] ensure bash anchor/live-state tool=\(toolName) invocationID=\(invocationID?.uuidString ?? "nil") liveCount=\(session.bashLiveExecutionByKey.count) totalItems=\(session.items.count)")
+                    CodexDebugLog.log("[AgentModeVM][CodexUI] ensure bash anchor/live-state tool=\(toolName) invocationID=\(invocationID?.uuidString ?? "nil") liveCount=\(session.bashLiveExecutionByKey.count) totalItems=\(session.items.count)")
                     viewModel?.requestUIRefresh(tabID: session.tabID)
                 }
                 return
@@ -6660,14 +6660,14 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 sequenceIndex: session.nextSequenceIndex
             )
             session.appendItem(toolItem)
-            AgentModeViewModel.logCodexDebug("[AgentModeVM][CodexUI] append toolCall tool=\(toolName) invocationID=\(invocationID?.uuidString ?? "nil") argsChars=\(argsJSON?.count ?? 0) totalItems=\(session.items.count)")
+            CodexDebugLog.log("[AgentModeVM][CodexUI] append toolCall tool=\(toolName) invocationID=\(invocationID?.uuidString ?? "nil") argsChars=\(argsJSON?.count ?? 0) totalItems=\(session.items.count)")
             viewModel?.requestUIRefresh(tabID: session.tabID)
         case let .toolResult(toolName, invocationID, argsJSON, resultJSON, isError):
             guard session.runState.isActive else { return }
             clearCodexPendingAuthRetryTurn(session)
             sealAssistantBoundary(session)
             if AgentToolTrackingSupport.isExplicitRepoPromptTool(toolName) {
-                AgentModeViewModel.logCodexDebug("[AgentModeVM][CodexUI] skip native explicit RepoPrompt toolResult tool=\(toolName)")
+                CodexDebugLog.log("[AgentModeVM][CodexUI] skip native explicit RepoPrompt toolResult tool=\(toolName)")
                 return
             }
             let parsedBashResult = Self.normalizedExternalToolName(toolName) == "bash"
@@ -6750,7 +6750,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                     observedAt: eventTimestamp
                 ) {
                     updateBashLivenessTaskState(for: session)
-                    AgentModeViewModel.logCodexDebug("[AgentModeVM][CodexUI] finalize bash toolResult tool=\(toolName) invocationID=\(invocationID?.uuidString ?? "nil") liveCount=\(session.bashLiveExecutionByKey.count)")
+                    CodexDebugLog.log("[AgentModeVM][CodexUI] finalize bash toolResult tool=\(toolName) invocationID=\(invocationID?.uuidString ?? "nil") liveCount=\(session.bashLiveExecutionByKey.count)")
                     viewModel?.requestUIRefresh(tabID: session.tabID)
                     viewModel?.scheduleSave(for: session.tabID)
                 }
@@ -6822,7 +6822,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 isError: isError,
                 session: session
             )
-            AgentModeViewModel.logCodexDebug("[AgentModeVM][CodexUI] apply toolResult tool=\(toolName) invocationID=\(invocationID?.uuidString ?? "nil") isError=\(isError.map(String.init(describing:)) ?? "nil") resultChars=\(resultJSON.count) totalItems=\(session.items.count)")
+            CodexDebugLog.log("[AgentModeVM][CodexUI] apply toolResult tool=\(toolName) invocationID=\(invocationID?.uuidString ?? "nil") isError=\(isError.map(String.init(describing:)) ?? "nil") resultChars=\(resultJSON.count) totalItems=\(session.items.count)")
             viewModel?.requestUIRefresh(tabID: session.tabID)
         case let .commandExecutionRunning(runningUpdate):
             guard session.runState.isActive
@@ -6931,7 +6931,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                     errorMessage: failureMessage,
                     providerSuccessor: providerSuccessor
                 )
-                AgentModeViewModel.logCodexDebug("[AgentModeVM][CodexUI] compact turnCompleted turnID=\(turnID ?? "nil") status=\(status) runState=\(session.runState)")
+                CodexDebugLog.log("[AgentModeVM][CodexUI] compact turnCompleted turnID=\(turnID ?? "nil") status=\(status) runState=\(session.runState)")
                 return
             }
             if session.runState == .cancelled, status != .interrupted { return }
@@ -6952,7 +6952,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 errorMessage: failureMessage,
                 providerSuccessor: providerSuccessor
             )
-            AgentModeViewModel.logCodexDebug("[AgentModeVM][CodexUI] turnCompleted turnID=\(turnID ?? "nil") status=\(status) items=\(session.items.count) runState=\(session.runState)")
+            CodexDebugLog.log("[AgentModeVM][CodexUI] turnCompleted turnID=\(turnID ?? "nil") status=\(status) items=\(session.items.count) runState=\(session.runState)")
         case .contextCompacted:
             markCodexContextCompacted(session)
         case let .livenessActivity(activity):
@@ -7843,7 +7843,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         var applyResult: LiveBashRunningApplyResult = .noChange
         for update in updates {
             applyResult.merge(applyLiveBashRunningUpdate(update, session: session, observedAt: observedAt))
-            AgentModeViewModel.logCodexDebug("[AgentModeVM][CodexUI] commandExecutionRunning pre-finalize invocationID=\(update.invocationID?.uuidString ?? "nil") processID=\(update.processID ?? "nil") outputChars=\(update.appendedOutput?.count ?? 0)")
+            CodexDebugLog.log("[AgentModeVM][CodexUI] commandExecutionRunning pre-finalize invocationID=\(update.invocationID?.uuidString ?? "nil") processID=\(update.processID ?? "nil") outputChars=\(update.appendedOutput?.count ?? 0)")
         }
         #if DEBUG
             if AgentModePerfDiagnostics.isEnabled {
@@ -8142,7 +8142,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         var applyResult: LiveBashRunningApplyResult = .noChange
         for update in updates {
             applyResult.merge(applyLiveBashRunningUpdate(update, session: session, observedAt: observedAt))
-            AgentModeViewModel.logCodexDebug("[AgentModeVM][CodexUI] commandExecutionRunning invocationID=\(update.invocationID?.uuidString ?? "nil") processID=\(update.processID ?? "nil") outputChars=\(update.appendedOutput?.count ?? 0)")
+            CodexDebugLog.log("[AgentModeVM][CodexUI] commandExecutionRunning invocationID=\(update.invocationID?.uuidString ?? "nil") processID=\(update.processID ?? "nil") outputChars=\(update.appendedOutput?.count ?? 0)")
         }
         guard applyResult.didChange else {
             #if DEBUG
@@ -9224,7 +9224,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                             expectedTurnID: authoritativeTurnIdentity.turnID
                         )
                     } catch {
-                        AgentModeViewModel.logCodexDebug(
+                        CodexDebugLog.log(
                             "[AgentModeVM][CodexCancel] interrupt reconciliation failed: \(error.localizedDescription)"
                         )
                     }
@@ -9232,7 +9232,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                     do {
                         _ = try await controller.reconcileAndInterruptCurrentTurn()
                     } catch {
-                        AgentModeViewModel.logCodexDebug(
+                        CodexDebugLog.log(
                             "[AgentModeVM][CodexCancel] active-turn reconciliation failed: \(error.localizedDescription)"
                         )
                     }

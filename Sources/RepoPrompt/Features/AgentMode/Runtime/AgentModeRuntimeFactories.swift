@@ -26,4 +26,4 @@ typealias AgentCodexAgentRunWaitQuery = (_ runID: UUID) -> Bool
 typealias AgentCodexAgentRunWaitDrain = @MainActor (
     _ runID: UUID,
     _ source: String
-) async -> MCPServerViewModel.AgentRunWaitDrainOutcome
+) async -> AgentRunWaitDrainOutcome

@@ -375,6 +375,17 @@ Decisions: at the cut, `AgentMCPWaitPolicy+RequestContext.swift` and the `delive
 
 Step 5p — done | rounds 0/2 | open: | downgraded: | assumed: | deferred:
 
+#### Step 5q — wait-drain types and Codex debug log hoisted out of App
+Intent: the Codex coordinator, the runtime factory typealiases and the transcript services name these App types only to reach the steering wait-drain outcome and blocker types nested in `MCPServerViewModel` and the static `AgentModeViewModel.logCodexDebug`. So hoist the two types verbatim to top-level agent types, with App typealiases keeping the old qualified names, move the log body into an agent `CodexDebugLog` that the App method forwards to, and point agent callers at the new names, with no behavior change.
+
+Budget used: about 1 hour (cumulative ~37.5 hours).
+
+Result: agent code no longer names the two nested `MCPServerViewModel` drain types or `AgentModeViewModel.logCodexDebug`, which closes the drain-outcome item carried from Steps 5a and 5g. The drain types are top-level agent types, and Codex debug logging, including the native session controller's own copy, goes through one agent `CodexDebugLog`. Build, format, lint and the 11 affected suites (244 tests) pass. OracleA found nothing, and OracleB raised only P3 notes; one led to the logging consolidation and the others to records and searches.
+
+Decisions: `MCPServerViewModel.swift` is now a third typealias site to remove at the cut, alongside `AgentModeViewModel+Types.swift` and the sidebar view model. `CodexDebugLog` and `log` will need `package` access then, unless the App forwarder `AgentModeViewModel.logCodexDebug` is retired and its 18 callers call `CodexDebugLog.log` directly, which is the intended end state. The drain types now print a different qualified name, which matters only for a debug log.
+
+Step 5q — done | rounds 0/2 | open: | downgraded: | assumed: | deferred:
+
 ### Slice 6 — `RepoPromptAgentCore` extraction
 Move the now-acyclic AI, agent models, providers, runtime, services, history, recommendations and non-UI remote-host code. Remove the temporary typealiases. Check the release compile flags once for cross-module optimization; don't change them.
 
