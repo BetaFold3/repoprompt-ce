@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptPlatform
 
 @MainActor
 extension AgentModeViewModel {

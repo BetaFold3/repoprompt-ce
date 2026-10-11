@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptPlatform
 
 struct OpenCodeACPResolvedLaunch: Equatable {
     let command: String

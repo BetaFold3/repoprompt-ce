@@ -1,3 +1,4 @@
+import RepoPromptPlatform
 import SwiftUI
 
 struct SecureStorageRepairBanner: View {

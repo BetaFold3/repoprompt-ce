@@ -1,5 +1,6 @@
 import CryptoKit
 import Foundation
+import RepoPromptPlatform
 
 /// Initialization only: never sends a user message or performs model inference.
 enum ClaudeCLIModelDiscoveryProbe {

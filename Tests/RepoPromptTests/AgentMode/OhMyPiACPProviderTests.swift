@@ -1,6 +1,7 @@
 import Foundation
 @testable import RepoPromptAgentCore
 @testable import RepoPromptApp
+@testable import RepoPromptPlatform
 import XCTest
 
 private final class OMPRouteVerifierRecorder: @unchecked Sendable {

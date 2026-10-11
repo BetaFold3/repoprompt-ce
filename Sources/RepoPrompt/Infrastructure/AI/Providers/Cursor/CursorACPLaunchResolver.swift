@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptPlatform
 
 enum CursorACPLaunchCandidate: Equatable {
     case cursorAgentACP

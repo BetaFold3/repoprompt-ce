@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptPlatform
 
 extension SentryTelemetryBootstrap {
     enum Category: String, CaseIterable {

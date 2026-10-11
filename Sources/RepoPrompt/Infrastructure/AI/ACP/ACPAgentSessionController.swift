@@ -1,5 +1,6 @@
 import Darwin
 import Foundation
+import RepoPromptPlatform
 
 enum ACPDynamicModelPublicationPolicy {
     case standard

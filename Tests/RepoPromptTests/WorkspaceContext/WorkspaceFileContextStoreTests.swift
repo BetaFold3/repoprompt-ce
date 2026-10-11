@@ -3,6 +3,7 @@ import CoreServices
 import CryptoKit
 @testable import RepoPromptAgentCore
 @testable import RepoPromptApp
+@testable import RepoPromptPlatform
 import XCTest
 
 private enum CodemapInitializationResetBoundary: String, CaseIterable {

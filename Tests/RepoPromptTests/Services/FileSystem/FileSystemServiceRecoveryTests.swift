@@ -2,6 +2,7 @@ import Combine
 import CoreServices
 @testable import RepoPromptAgentCore
 @testable import RepoPromptApp
+@testable import RepoPromptPlatform
 import XCTest
 
 final class FileSystemServiceRecoveryTests: XCTestCase {

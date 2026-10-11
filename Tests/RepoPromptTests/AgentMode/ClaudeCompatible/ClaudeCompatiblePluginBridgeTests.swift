@@ -1,14 +1,19 @@
 import Foundation
 @testable import RepoPromptAgentCore
 @testable import RepoPromptApp
+@testable import RepoPromptPlatform
 import XCTest
 
 final class ClaudeCompatiblePluginBridgeTests: XCTestCase {
     func testOnlyBridgeImportsProviderPackage() throws {
         let repoRoot = try RepoRoot.url()
-        let sourcesRoot = repoRoot.appendingPathComponent("Sources/RepoPrompt", isDirectory: true)
         let expected = "Sources/RepoPrompt/Infrastructure/AI/Providers/ClaudeCode/ClaudeCompatibleProviderRuntimeBridge.swift"
-        let imports = try sourceFilesImportingProviderPackage(under: sourcesRoot, repoRoot: repoRoot)
+        let imports = try RepoRoot.librarySourceRoots.flatMap { root in
+            try sourceFilesImportingProviderPackage(
+                under: repoRoot.appendingPathComponent(root, isDirectory: true),
+                repoRoot: repoRoot
+            )
+        }.sorted()
 
         XCTAssertEqual(imports, [expected])
     }

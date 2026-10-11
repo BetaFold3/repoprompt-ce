@@ -1,5 +1,6 @@
 import Combine
 import Foundation
+import RepoPromptPlatform
 
 @MainActor
 final class SecureStorageRepairViewModel: ObservableObject {

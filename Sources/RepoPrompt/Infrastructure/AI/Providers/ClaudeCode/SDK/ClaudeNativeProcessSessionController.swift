@@ -1,6 +1,7 @@
 import Darwin
 import Foundation
 import OSLog
+import RepoPromptPlatform
 import RepoPromptShared
 
 final actor ClaudeNativeProcessSessionController {

@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptPlatform
 import Sparkle
 
 enum UpdateChannel: String, CaseIterable, Identifiable {

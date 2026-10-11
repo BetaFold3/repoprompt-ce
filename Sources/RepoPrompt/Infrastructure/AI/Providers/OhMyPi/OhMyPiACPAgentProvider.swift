@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptPlatform
 
 struct OhMyPiACPAgentProvider: ACPAgentProvider {
     private let config: OhMyPiAgentConfig

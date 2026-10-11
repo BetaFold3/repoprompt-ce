@@ -1,6 +1,7 @@
 import MCP
 @testable import RepoPromptAgentCore
 @testable import RepoPromptApp
+@testable import RepoPromptPlatform
 import XCTest
 
 final class OracleOperationToolCardRoutingTests: XCTestCase {

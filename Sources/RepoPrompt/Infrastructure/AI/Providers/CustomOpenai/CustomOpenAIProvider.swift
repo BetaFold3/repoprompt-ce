@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptPlatform
 
 /// Common chat completion parameters
 enum CompletionParams {

@@ -1,6 +1,7 @@
 #if DEBUG
     @testable import RepoPromptAgentCore
     @testable import RepoPromptApp
+    @testable import RepoPromptPlatform
     import XCTest
 
     final class MainThreadStallWatchdogCoreTests: XCTestCase {

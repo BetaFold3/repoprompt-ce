@@ -31,6 +31,15 @@ enum RepoRoot {
         }
     }
 
+    /// Production Swift library roots of the app split. Source-scanning guard tests
+    /// iterate these so a module move cannot silently drop coverage; keep in sync
+    /// with `library_source_roots` in `Scripts/source_layout_guardrails.sh`.
+    static let librarySourceRoots = [
+        "Sources/RepoPrompt",
+        "Sources/RepoPromptAgentCore",
+        "Sources/RepoPromptPlatform"
+    ]
+
     static func relativePath(for fileURL: URL, relativeTo rootURL: URL) -> String {
         let rootPath = rootURL.resolvingSymlinksInPath().standardizedFileURL.path
         let filePath = fileURL.resolvingSymlinksInPath().standardizedFileURL.path

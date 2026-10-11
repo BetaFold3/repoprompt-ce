@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptPlatform
 
 struct RepoPromptMCPServerConfiguration: Equatable, Hashable {
     struct EnvironmentEntry: Equatable, Hashable {

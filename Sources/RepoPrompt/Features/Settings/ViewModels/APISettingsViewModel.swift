@@ -1,5 +1,6 @@
 import Combine
 import Darwin
+import RepoPromptPlatform
 import SwiftUI
 
 #if DEBUG

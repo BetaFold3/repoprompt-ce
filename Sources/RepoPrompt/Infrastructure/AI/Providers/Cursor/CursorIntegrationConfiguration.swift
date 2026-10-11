@@ -1,6 +1,7 @@
 import CryptoKit
 import Darwin
 import Foundation
+import RepoPromptPlatform
 
 /// Cursor-specific MCP integration helpers.
 ///

@@ -3,6 +3,7 @@ import Darwin
 import Foundation
 @testable import RepoPromptAgentCore
 @testable import RepoPromptApp
+@testable import RepoPromptPlatform
 import RepoPromptRemoteWire
 import XCTest
 

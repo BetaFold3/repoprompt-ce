@@ -1,5 +1,6 @@
 @testable import RepoPromptAgentCore
 @testable import RepoPromptApp
+@testable import RepoPromptPlatform
 import XCTest
 
 /// Literal, well-formed URLs, parsed in one place so a malformed literal fails loudly

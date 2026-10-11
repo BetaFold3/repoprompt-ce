@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptPlatform
 
 final class ClaudeCodeCompatibleBackendStore: @unchecked Sendable {
     static let shared = ClaudeCodeCompatibleBackendStore()

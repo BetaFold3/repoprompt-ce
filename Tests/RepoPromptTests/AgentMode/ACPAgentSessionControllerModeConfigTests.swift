@@ -3,6 +3,7 @@ import Dispatch
 import Foundation
 @testable import RepoPromptAgentCore
 @_spi(TestSupport) @testable import RepoPromptApp
+@testable import RepoPromptPlatform
 import XCTest
 
 final class ACPAgentSessionControllerModeConfigTests: XCTestCase {

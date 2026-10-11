@@ -1,5 +1,6 @@
 @testable import RepoPromptAgentCore
 @testable import RepoPromptApp
+@testable import RepoPromptPlatform
 
 @MainActor
 enum WorkspaceRootLoadTestSupport {

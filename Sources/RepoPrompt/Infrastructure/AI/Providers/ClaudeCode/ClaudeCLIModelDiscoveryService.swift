@@ -1,6 +1,7 @@
 import AppKit
 import Combine
 import Foundation
+import RepoPromptPlatform
 
 /// App-wide, single-flight metadata discovery. Settings windows only observe it.
 @MainActor

@@ -2,6 +2,7 @@ import Combine
 import CoreServices
 import Dispatch
 import Foundation
+import RepoPromptPlatform
 #if DEBUG || EDIT_FLOW_PERF
     import os
 #endif

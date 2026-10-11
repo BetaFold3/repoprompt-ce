@@ -1,5 +1,6 @@
 @testable import RepoPromptAgentCore
 @testable import RepoPromptApp
+@testable import RepoPromptPlatform
 import XCTest
 
 /// Regression coverage for the crash-relaunch session clobber:

@@ -2,6 +2,7 @@ import Combine
 import Foundation
 @testable import RepoPromptAgentCore
 @testable import RepoPromptApp
+@testable import RepoPromptPlatform
 import XCTest
 
 /// Resolution, loading, and live-reload behaviour of the Preview segment's controller.

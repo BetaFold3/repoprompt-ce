@@ -7,6 +7,7 @@
 
 import CryptoKit
 import Foundation
+import RepoPromptPlatform
 import SwiftTreeSitter
 import TreeSitterC
 import TreeSitterCPP

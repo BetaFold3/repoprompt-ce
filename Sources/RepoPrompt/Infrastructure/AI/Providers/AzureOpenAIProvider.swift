@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptPlatform
 import SwiftOpenAI
 
 public struct AzureOpenAIConfiguration: Codable, Equatable {

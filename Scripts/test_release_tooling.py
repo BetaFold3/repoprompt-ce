@@ -116,7 +116,7 @@ class ReleaseToolingTests(unittest.TestCase):
 
         package_manifest = (root / "Package.swift").read_text(encoding="utf-8")
         policy = (
-            root / "Sources" / "RepoPrompt" / "Infrastructure" / "Security" / "RuntimeCodeSigningPolicy.swift"
+            root / "Sources" / "RepoPromptPlatform" / "Infrastructure" / "Security" / "RuntimeCodeSigningPolicy.swift"
         ).read_text(encoding="utf-8")
         entitlements = (root / "AppBundle" / "RepoPrompt.entitlements.template").read_text(encoding="utf-8")
         info_plist = plistlib.loads((root / "AppBundle" / "Info.plist.template").read_bytes())
@@ -1776,7 +1776,7 @@ fi
             "Packages/RepoPromptAgentProviders/.build",
             "Sources/CSwiftPCRE2",
             "Sources/RepoPromptC",
-            "Sources/RepoPrompt/ThirdParty/SwiftPCRE2",
+            "Sources/RepoPromptPlatform/ThirdParty/SwiftPCRE2",
             "Sources/RepoPromptAgentCore/AI/Prompts/Workflows/WorkflowPromptSharedFragments.swift",
             "Sources/RepoPromptAgentCore/AI/Prompts/Workflows/WorkflowPrompt+Build.swift",
             "Sources/RepoPromptAgentCore/AI/Prompts/Workflows/WorkflowPrompt+DeepPlan.swift",

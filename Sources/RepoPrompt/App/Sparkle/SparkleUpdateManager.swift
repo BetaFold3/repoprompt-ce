@@ -6,6 +6,7 @@
 //
 
 import Combine
+import RepoPromptPlatform
 import Sparkle
 import SwiftUI
 

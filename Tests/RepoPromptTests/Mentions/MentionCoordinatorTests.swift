@@ -1,6 +1,7 @@
 import AppKit
 @testable import RepoPromptAgentCore
 @testable import RepoPromptApp
+@testable import RepoPromptPlatform
 import SwiftUI
 import XCTest
 

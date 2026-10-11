@@ -2,6 +2,7 @@ import Foundation
 import MCP
 @testable import RepoPromptAgentCore
 @testable import RepoPromptApp
+@testable import RepoPromptPlatform
 import XCTest
 
 /// `agent_run` formatted output for pending `ask_user` snapshots. A structured question carries

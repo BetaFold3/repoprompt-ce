@@ -2,6 +2,7 @@ import MCP
 @testable import RepoPromptAgentCore
 @testable import RepoPromptApp
 @testable import RepoPromptGateway
+@testable import RepoPromptPlatform
 import RepoPromptRemoteWire
 import XCTest
 

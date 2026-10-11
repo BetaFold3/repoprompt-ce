@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptPlatform
 import RepoPromptRemoteWire
 
 enum TailscaleStatusError: Error, Equatable, LocalizedError {

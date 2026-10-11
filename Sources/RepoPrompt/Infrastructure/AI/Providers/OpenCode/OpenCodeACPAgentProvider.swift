@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptPlatform
 
 struct OpenCodeACPAgentProvider: ACPAgentProvider {
     private enum LaunchContract {

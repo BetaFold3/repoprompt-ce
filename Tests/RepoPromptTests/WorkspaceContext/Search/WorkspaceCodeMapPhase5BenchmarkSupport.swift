@@ -3,6 +3,7 @@
     import Foundation
     @testable import RepoPromptAgentCore
     @testable import RepoPromptApp
+    @testable import RepoPromptPlatform
 
     enum WorkspaceCodeMapPhase5BenchmarkMetric: String, CaseIterable {
         case runtimeConstruction

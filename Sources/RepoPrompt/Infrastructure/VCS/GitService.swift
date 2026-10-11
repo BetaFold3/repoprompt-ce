@@ -1,6 +1,7 @@
 import CryptoKit
 import Darwin
 import Foundation
+import RepoPromptPlatform
 
 enum GitPrefixControlEvidenceCacheMode {
     case automatic

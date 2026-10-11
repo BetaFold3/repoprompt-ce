@@ -1,6 +1,7 @@
 import Foundation
 @testable import RepoPromptAgentCore
 @testable import RepoPromptApp
+@testable import RepoPromptPlatform
 import XCTest
 
 /// Codex accounting (plan §4.1): optional-preserving `thread/tokenUsage/updated` companions,

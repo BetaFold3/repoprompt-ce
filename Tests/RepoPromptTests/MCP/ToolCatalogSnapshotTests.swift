@@ -5,6 +5,7 @@ import MCP
 import Ontology
 @testable import RepoPromptAgentCore
 @testable import RepoPromptApp
+@testable import RepoPromptPlatform
 import RepoPromptShared
 import XCTest
 

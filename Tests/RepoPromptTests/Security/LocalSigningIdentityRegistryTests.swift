@@ -1,6 +1,7 @@
 import Darwin
 @testable import RepoPromptAgentCore
 @testable import RepoPromptApp
+@testable import RepoPromptPlatform
 import XCTest
 
 final class LocalSigningIdentityRegistryTests: XCTestCase {

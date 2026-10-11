@@ -3,6 +3,7 @@ import Foundation
 import Markdown
 @testable import RepoPromptAgentCore
 @testable import RepoPromptApp
+@testable import RepoPromptPlatform
 import XCTest
 
 /// Contract tests for the semi-rendered Markdown decorator.

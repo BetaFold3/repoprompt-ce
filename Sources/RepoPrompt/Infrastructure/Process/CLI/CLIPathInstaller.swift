@@ -9,6 +9,7 @@
 
 import Foundation
 import OSLog
+import RepoPromptPlatform
 import RepoPromptShared
 
 enum CLIPathInstaller {

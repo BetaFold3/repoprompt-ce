@@ -2,6 +2,7 @@ import Foundation
 import MCP
 @testable import RepoPromptAgentCore
 @testable import RepoPromptApp
+@testable import RepoPromptPlatform
 import XCTest
 
 /// Plan §6.1: bounded TTL idempotency registry for `agent_run` `request_id`.

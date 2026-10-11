@@ -4,6 +4,7 @@
     import Foundation
     @testable import RepoPromptAgentCore
     @testable import RepoPromptApp
+    @testable import RepoPromptPlatform
 
     enum WorkspaceCodeMapPhase4BenchmarkMetric: String, CaseIterable {
         case canonicalBatchClassification

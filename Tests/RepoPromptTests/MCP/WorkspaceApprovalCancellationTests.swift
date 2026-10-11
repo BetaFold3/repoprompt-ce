@@ -1,6 +1,7 @@
 import AppKit
 @testable import RepoPromptAgentCore
 @testable import RepoPromptApp
+@testable import RepoPromptPlatform
 import XCTest
 
 /// Regression coverage for cancellation-aware workspace approval waits: a cancelled

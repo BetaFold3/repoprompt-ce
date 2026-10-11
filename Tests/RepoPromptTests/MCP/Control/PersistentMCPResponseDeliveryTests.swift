@@ -4,6 +4,7 @@ import Foundation
 @testable import RepoPromptApp
 @testable import RepoPromptMCPClientKit
 @testable import RepoPromptMCPCore
+@testable import RepoPromptPlatform
 import RepoPromptShared
 import XCTest
 

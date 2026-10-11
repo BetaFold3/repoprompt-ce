@@ -1,5 +1,6 @@
 import Foundation
 import OSLog
+import RepoPromptPlatform
 
 struct CodexTurnStartReceipt: Equatable {
     let provisionalSubmissionID: String

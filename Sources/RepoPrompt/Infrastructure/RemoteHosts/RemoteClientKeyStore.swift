@@ -1,5 +1,6 @@
 import CryptoKit
 import Foundation
+import RepoPromptPlatform
 
 protocol RemoteClientKeychainStoring: Sendable {
     func get(for key: String, accessMode: KeychainAccessMode) throws -> String

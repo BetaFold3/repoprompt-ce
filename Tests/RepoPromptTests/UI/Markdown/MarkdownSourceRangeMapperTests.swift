@@ -2,6 +2,7 @@ import Foundation
 import Markdown
 @testable import RepoPromptAgentCore
 @testable import RepoPromptApp
+@testable import RepoPromptPlatform
 import XCTest
 
 /// Pins the swift-markdown source-position semantics that

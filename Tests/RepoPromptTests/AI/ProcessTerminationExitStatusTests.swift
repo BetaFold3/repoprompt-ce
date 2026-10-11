@@ -2,6 +2,7 @@ import Darwin
 import Foundation
 @testable import RepoPromptAgentCore
 @testable import RepoPromptApp
+@testable import RepoPromptPlatform
 import XCTest
 
 /// Detailed exit-status decoding and real-child reaping through the shared

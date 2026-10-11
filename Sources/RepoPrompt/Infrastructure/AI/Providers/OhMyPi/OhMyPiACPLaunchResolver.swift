@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptPlatform
 
 struct OhMyPiACPResolvedLaunch: Equatable {
     let command: String

@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptPlatform
 
 enum ClaudeCodeCompatibleBackendID: String, CaseIterable, Codable, Hashable {
     case glmZAI

@@ -1,5 +1,6 @@
 @testable import RepoPromptAgentCore
 @testable import RepoPromptApp
+@testable import RepoPromptPlatform
 import XCTest
 
 /// Deterministic accounting contracts (plan §4, §8). Every qualified input here is a synthetic

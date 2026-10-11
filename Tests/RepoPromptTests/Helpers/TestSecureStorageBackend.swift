@@ -1,6 +1,7 @@
 import Foundation
 @testable import RepoPromptAgentCore
 @testable import RepoPromptApp
+@testable import RepoPromptPlatform
 
 final class TestSecureStorageBackend: SecureKeyValueStorageBackend, @unchecked Sendable {
     enum Operation: Equatable {

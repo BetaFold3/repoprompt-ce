@@ -2,6 +2,7 @@ import Combine
 import Foundation
 @testable import RepoPromptAgentCore
 @testable import RepoPromptApp
+@testable import RepoPromptPlatform
 import XCTest
 
 /// Behavior contract for the Changes panel's controller.

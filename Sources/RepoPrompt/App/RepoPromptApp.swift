@@ -2,6 +2,7 @@ import AppKit
 import Darwin
 import Foundation
 import Logging
+import RepoPromptPlatform
 import Sparkle
 import SwiftUI
 

@@ -2,6 +2,7 @@ import Foundation
 import MCP
 @testable import RepoPromptAgentCore
 @_spi(TestSupport) @testable import RepoPromptApp
+@testable import RepoPromptPlatform
 import XCTest
 
 /// Plan §6.1: `agent_run` service-level `request_id` idempotency. Duplicates are

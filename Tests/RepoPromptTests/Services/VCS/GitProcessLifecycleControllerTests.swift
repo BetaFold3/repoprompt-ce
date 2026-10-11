@@ -2,6 +2,7 @@ import Darwin
 import Foundation
 @testable import RepoPromptAgentCore
 @testable import RepoPromptApp
+@testable import RepoPromptPlatform
 import XCTest
 
 /// State-machine and escalation coverage for the PID/process-group based git

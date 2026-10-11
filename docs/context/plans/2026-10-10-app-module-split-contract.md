@@ -108,9 +108,13 @@ Decisions: PHP/Ruby grammar call sites unwrap the non-const pointer with `guard 
 Step 2a — done | rounds 0/2 | open: | downgraded: | assumed: | deferred: OracleB P3-2 generator check against a returning bridge
 
 #### Step 2b — create `RepoPromptPlatform`
-Intent: move the dependency-closed generic primitives (minus app-specific files such as `Shortcuts.swift`).
+Intent: move the dependency-closed generic primitives (minus app-specific files such as `Shortcuts.swift`). Budget used: about 1.75 hours (cumulative ~5.25 hours).
 
-Step 2b — todo | rounds 0/2 | open: | downgraded: | assumed: | deferred:
+Result: moved 72 files (~15.5k lines: concurrency, process/CLI, regex, networking, filesystem primitives, secure storage, syntax queries, string/collection utilities, the PCRE2 wrapper) into `Sources/RepoPromptPlatform`, which depends only on `RepoPromptShared`, `RepoPromptC` and `CSwiftPCRE2`, with 347 compiler-driven `package` declarations; build, focused and full tests (only the known baseline failure persists), discovery, ledger and the universal release package pass, so Slice 2 is complete and Slice 3 follows.
+
+Decisions: placement rule used — dependency-free files go to the lowest module unless they are UI or feature-domain code (`Shortcuts.swift`, `CodeMapSecureFileRemoval.swift`, `IgnoreDebugMetricsRecorder.swift`, `RemotePairing/RemoteScope.swift` stayed); product constants inside storage mechanics (`SecurityObfuscation`, `RuntimeCodeSigningPolicy`) moved with their Platform users; `GitignoreCompiler.swift` stayed because it calls the app-side metrics recorder; `StringExtensions.swift` imports AppKit explicitly; guard tests that scan source roots iterate `RepoRoot.librarySourceRoots`.
+
+Step 2b — done | rounds 0/2 | open: | downgraded: | assumed: | deferred: recording-level instrumentation and ~41 non-closed Platform candidates stay in App; check `String(reflecting:)` keys in `WorkspaceCodemap*` before Slice 4
 
 ### Slice 3 — `RepoPromptUI`
 Move reusable components, markdown rendering, typography (`FontScaleManager`, `FontScalePreset`) and UI environment keys. Product-specific adapters stay in App. Small codecs and models that Workspace or AgentCore use move down rather than up.

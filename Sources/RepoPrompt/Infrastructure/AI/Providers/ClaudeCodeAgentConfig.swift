@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptPlatform
 
 #if DEBUG
     private var claudeCodeAgentConfigDebugLoggingEnabled = false

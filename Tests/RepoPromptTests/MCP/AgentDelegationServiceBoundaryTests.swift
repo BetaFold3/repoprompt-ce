@@ -2,6 +2,7 @@ import Foundation
 import MCP
 @testable import RepoPromptAgentCore
 @_spi(TestSupport) @testable import RepoPromptApp
+@testable import RepoPromptPlatform
 import XCTest
 
 /// Service-level bounded-delegation boundaries: routed callers are re-admitted at commit/dispatch,

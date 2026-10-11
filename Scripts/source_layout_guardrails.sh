@@ -28,6 +28,7 @@ required_dirs=(
   "Sources/RepoPrompt/Infrastructure"
   "Sources/RepoPrompt/Infrastructure/SyntaxParsing"
   "Sources/RepoPromptAgentCore"
+  "Sources/RepoPromptPlatform"
   "Packages/RepoPromptCore/Sources/RepoPromptShared/MCP"
   "Packages/RepoPromptCore/Sources/RepoPromptMCPClientKit"
   "Packages/RepoPromptCore/Sources/RepoPromptMCPCore"
@@ -55,10 +56,10 @@ if [[ -n "$unexpected_repo_prompt_executable_files" ]]; then
   printf '%s\n' "$unexpected_repo_prompt_executable_files" >&2
 fi
 # Library source roots of the app split; add each new root here once.
-library_source_roots=("Sources/RepoPrompt" "Sources/RepoPromptAgentCore")
+library_source_roots=("Sources/RepoPrompt" "Sources/RepoPromptAgentCore" "Sources/RepoPromptPlatform")
 repo_prompt_app_main_declarations="$(grep -R -n -E '^[[:space:]]*@main([[:space:]]|$)' "${library_source_roots[@]}" --include='*.swift' || true)"
 if [[ -n "$repo_prompt_app_main_declarations" ]]; then
-  fail "RepoPromptApp/RepoPromptAgentCore library targets must not declare @main"
+  fail "RepoPromptApp/RepoPromptAgentCore/RepoPromptPlatform library targets must not declare @main"
   printf '%s\n' "$repo_prompt_app_main_declarations" >&2
 fi
 repo_prompt_entry_main_count="$(grep -c -E '^[[:space:]]*@main([[:space:]]|$)' "$repo_prompt_entry" || true)"
@@ -164,6 +165,7 @@ targets = {target["name"]: target for target in package["targets"]}
 repo_prompt = targets.get("RepoPrompt", {})
 repo_prompt_app = targets.get("RepoPromptApp", {})
 repo_prompt_agent_core = targets.get("RepoPromptAgentCore", {})
+repo_prompt_platform = targets.get("RepoPromptPlatform", {})
 repo_prompt_dependencies = repo_prompt.get("dependencies", [])
 repo_prompt_app_dependencies = repo_prompt_app.get("dependencies", [])
 repo_prompt_app_products = {
@@ -191,6 +193,10 @@ if repo_prompt_agent_core.get("type") != "regular":
     errors.append("RepoPromptAgentCore target must exist as an internal library target")
 if repo_prompt_agent_core.get("path") != "Sources/RepoPromptAgentCore":
     errors.append("RepoPromptAgentCore target must use the Sources/RepoPromptAgentCore path")
+if repo_prompt_platform.get("type") != "regular":
+    errors.append("RepoPromptPlatform target must exist as an internal library target")
+if repo_prompt_platform.get("path") != "Sources/RepoPromptPlatform":
+    errors.append("RepoPromptPlatform target must use the Sources/RepoPromptPlatform path")
 
 for identity, (url, revision, product) in expected_packages.items():
     manifest_pin = f'.package(url: "{url}", revision: "{revision}")'
@@ -263,7 +269,7 @@ done
 
 # 2. Test-only directories must stay out of the app source target.
 print_matches \
-  "Tests/TestSupport/Fixtures directory found under app or AgentCore sources" \
+  "Tests/TestSupport/Fixtures directory found under app, AgentCore, or Platform sources" \
   find "${library_source_roots[@]}" -type d \( -name Tests -o -name TestSupport -o -name Fixtures \) -print
 
 # 3. MCPControlMessages.swift has exactly one source of truth.
@@ -300,11 +306,11 @@ fi
 
 # 4. Parser fixtures and sample parser inputs must not live in app source.
 print_matches \
-  "parser fixture/test directory found under app syntax parsing source" \
-  find Sources/RepoPrompt/Infrastructure/SyntaxParsing -type d \( -iname '*fixture*' -o -iname '*test*' \) -print
+  "parser fixture/test directory found under app or Platform syntax parsing source" \
+  find Sources/RepoPrompt/Infrastructure/SyntaxParsing Sources/RepoPromptPlatform/Infrastructure/SyntaxParsing -type d \( -iname '*fixture*' -o -iname '*test*' \) -print
 print_matches \
-  "parser fixture-like sample input found under app syntax parsing source" \
-  find Sources/RepoPrompt/Infrastructure/SyntaxParsing -type f \( \
+  "parser fixture-like sample input found under app or Platform syntax parsing source" \
+  find Sources/RepoPrompt/Infrastructure/SyntaxParsing Sources/RepoPromptPlatform/Infrastructure/SyntaxParsing -type f \( \
     -iname '*fixture*' -o -iname '*test*' -o \
     -name '*.dart' -o -name '*.go' -o -name '*.java' -o -name '*.js' -o -name '*.jsx' -o \
     -name '*.py' -o -name '*.rb' -o -name '*.rs' -o -name '*.ts' -o -name '*.tsx' -o \
