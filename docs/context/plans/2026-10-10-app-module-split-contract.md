@@ -232,6 +232,17 @@ Decisions: the two intermittent failures (`AgentModeRunServiceLifecycleTests.tes
 
 Step 5c — done | rounds 0/2 | open: | downgraded: | assumed: | deferred:
 
+#### Step 5d — the session's own App ties cut
+Intent: a rescan (evidence `step5d-probe/`) leaves 84 outside names; the five that `AgentTabSession` itself stores (the provider usage snapshot nested in the runtime sidebar view model, the composer submit target and attempt, the worktree-merge review records, and the persistent binding identity) are plain records, so move them into runtime session and usage files, hoisting the nested snapshot to `AgentProviderUsageSnapshot` with an alias, with no behavior change.
+
+Budget used: about 1 hour (cumulative ~22 hours).
+
+Result: the five records now live in `Runtime/Session/AgentComposerSubmitRecords.swift`, `AgentWorktreeMergeReviewRecords.swift`, `AgentSessionPersistenceRecords.swift` and `Runtime/Usage/AgentProviderUsageSnapshot.swift`. Ordered diffs show only the hoisted name and one same-type field spelling. Build, format, lint and 10 affected suites (385 tests, 0 failures) pass, and both reviewers found nothing above P3, so `AgentTabSession` no longer names any view-model or UI type. The next step takes the tool-card normalization helpers the transcript services use.
+
+Decisions: the `ProviderUsageSnapshot` alias stays inside `AgentRuntimeSidebarViewModel`, because it aliases that class's nested name; Slice 6 alias removal must cover it as well as `AgentModeViewModel+Types.swift`.
+
+Step 5d — done | rounds 0/2 | open: | downgraded: | assumed: | deferred:
+
 ### Slice 6 — `RepoPromptAgentCore` extraction
 Move the now-acyclic AI, agent models, providers, runtime, services, history, recommendations and non-UI remote-host code. Remove the temporary typealiases. Check the release compile flags once for cross-module optimization; don't change them.
 

@@ -636,7 +636,7 @@ final class AgentTabSession: ObservableObject {
 
     private struct ProviderUsageProjectionCache {
         var key: ProviderUsageProjectionCacheKey
-        var value: AgentRuntimeSidebarViewModel.ProviderUsageSnapshot
+        var value: AgentProviderUsageSnapshot
     }
 
     private var providerUsageProjectionCache: ProviderUsageProjectionCache?
@@ -654,7 +654,7 @@ final class AgentTabSession: ObservableObject {
 
     func cachedProviderUsageProjection(
         selectedAgent: AgentProviderKind
-    ) -> AgentRuntimeSidebarViewModel.ProviderUsageSnapshot {
+    ) -> AgentProviderUsageSnapshot {
         let key = ProviderUsageProjectionCacheKey(
             selectedAgent: selectedAgent,
             expectedOwnerSessionID: activeAgentSessionID,
@@ -671,7 +671,7 @@ final class AgentTabSession: ObservableObject {
         if let cached = providerUsageProjectionCache, cached.key == key {
             return cached.value
         }
-        let value = AgentRuntimeSidebarViewModel.ProviderUsageSnapshot.projected(
+        let value = AgentProviderUsageSnapshot.projected(
             selectedAgent: selectedAgent,
             accounting: usageAccounting,
             expectedOwnerSessionID: activeAgentSessionID
