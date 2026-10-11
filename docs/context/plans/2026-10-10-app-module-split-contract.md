@@ -243,6 +243,17 @@ Decisions: the `ProviderUsageSnapshot` alias stays inside `AgentRuntimeSidebarVi
 
 Step 5d — done | rounds 0/2 | open: | downgraded: | assumed: | deferred:
 
+#### Step 5e — tool-name helpers out of tool-card views
+Intent: the transcript services and edit decoder call three pure string functions that live in SwiftUI tool-card files (`normalizedToolCardName`, `toolIcon`, `toolDisplayName`), so move them verbatim into a runtime file; the other tool-card helpers the runtime uses (`ToolJSON`, `ToolArgsDTOs`, `ClusterToolCategory`) already depend only on agent code and move whole at the cut.
+
+Budget used: about 0.5 hours (cumulative ~22.5 hours).
+
+Result: the three helpers now live in `Runtime/ToolTracking/AgentToolNaming.swift`, byte-identical to the removed lines under an ordered diff. Build, format, lint and 16 affected suites (362 tests, 0 failures) pass, and both reviewers found nothing above P3. The next step takes on the MCP helpers, the largest remaining group.
+
+Decisions: suite selection now also matches test classes declared inside `#if DEBUG` blocks; a backfill run found one suite that Steps 5b–5d had missed, and it passes.
+
+Step 5e — done | rounds 0/2 | open: | downgraded: | assumed: | deferred: OracleB P3-1 — `normalizedToolCardName` still calls `MCPIntegrationHelper.canonicalRepoPromptToolName`; the MCP split must place that name lookup at agent level
+
 ### Slice 6 — `RepoPromptAgentCore` extraction
 Move the now-acyclic AI, agent models, providers, runtime, services, history, recommendations and non-UI remote-host code. Remove the temporary typealiases. Check the release compile flags once for cross-module optimization; don't change them.
 

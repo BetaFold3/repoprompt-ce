@@ -2,34 +2,6 @@ import Foundation
 import RepoPromptShared
 import SwiftUI
 
-func normalizedToolCardName(_ name: String?) -> String? {
-    guard let raw = name?.trimmingCharacters(in: .whitespacesAndNewlines), !raw.isEmpty else { return nil }
-    let canonical = MCPIntegrationHelper.canonicalRepoPromptToolName(raw) ?? raw
-    // External tools can be namespaced (for example, "functions.bash").
-    // Route by suffix so tool cards stay consistent.
-    if let webCanonical = AgentWebToolCanonicalNames.canonicalToolCardName(canonical.lowercased()) {
-        return webCanonical
-    }
-    let suffix = canonical.split(separator: ".").last.map(String.init) ?? canonical
-    let lowered = suffix.lowercased()
-    if lowered == "local_shell" || lowered == "shell" || lowered == "unified_exec" || lowered == "exec_command" || lowered == "run_shell_command" {
-        return "bash"
-    }
-    if let webCanonical = AgentWebToolCanonicalNames.canonicalToolCardName(lowered) {
-        return webCanonical
-    }
-    if lowered == "filechange" || lowered == "file_change" {
-        return "apply_patch"
-    }
-    if lowered == "edit" || lowered == "edit file" {
-        return "edit"
-    }
-    if lowered == "request_user_input" || lowered == "requestuserinput" {
-        return "request_user_input"
-    }
-    return suffix
-}
-
 func isAutoExpandableEditToolResult(_ item: AgentChatItem) -> Bool {
     guard item.kind == .toolResult,
           let toolName = normalizedToolCardName(item.toolName)?.lowercased()
