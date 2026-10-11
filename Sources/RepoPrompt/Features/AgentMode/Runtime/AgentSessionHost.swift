@@ -48,11 +48,7 @@ protocol CodexAgentModeCoordinatorHost: AgentSessionHost {
         interactionID: UUID,
         fallbackResolvedBy: String
     )
-    @discardableResult
-    func mcpBindPendingAgentRunOracleReviewContext(
-        tabID: UUID,
-        runID: UUID
-    ) -> DelegatedAgentRunOracleReviewContext?
+    func bindPendingOracleReviewContext(tabID: UUID, runID: UUID)
     func canBuildOrPublishActiveTranscriptBindings(for session: AgentTabSession) -> Bool
     func requestAssistantPresentationRefresh(
         session: AgentTabSession,

@@ -1,5 +1,6 @@
 import Foundation
 
+/// Agent-owned value type used by the Cursor model menu builder; holds no App state.
 struct CursorModelParameterPickerViewModel {
     enum SelectionState: Equatable {
         case notSelected

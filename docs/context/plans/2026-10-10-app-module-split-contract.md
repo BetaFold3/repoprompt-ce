@@ -452,6 +452,17 @@ Decisions: at the cut, App also needs `package` access to `RemotePairingCrypto.i
 
 Step 5w — done | rounds 0/2 | open: | downgraded: | assumed: | deferred:
 
+#### Step 5x — close the last agent-seed seams
+Intent: after Step 5w, three of the four remaining agent files name App-domain types, and the fourth (the Cursor parameter picker) only needs a placement decision. The Codex coordinator asks the view model to bind a pending Oracle review context and ignores the returned App value, the tab session stores the apply-edits review value that sits in the App approval store's file, and `ModelPreset.swift` also holds the App presets manager that persists through the preset file store. So give the Codex host a void bind call that App forwards, move the two review value types verbatim into an agent file, and move the presets manager verbatim into an App settings file, with no behavior change.
+
+Budget used: about 1.2 hours (cumulative ~44.7 hours).
+
+Result: the Codex host now asks App to bind a pending Oracle review context through a void call, the two apply-edits review value types live in an agent file and `ModelPresetsManager` lives in an App settings file, all moved verbatim. A rescan shows the agent move set (325 files, about 155k lines) names nothing outside itself, so Slice 5's in-place work is complete. Build, format, lint and 13 affected suites (377 tests) pass, with an unchanged warning count. OracleA found nothing. OracleB raised only record and evidence notes, which were added, along with a one-line header on the Cursor picker.
+
+Decisions: `AgentRunOracleReviewContext.swift` stays in App with prompt packaging, now that no agent file names its types; its folder moves at the cut, so it needs an App location then, like `AgentMCPWaitPolicy+RequestContext.swift`. `CursorModelParameterPickerViewModel` joins AgentCore unchanged: despite its name it is a Foundation-only value struct with no App state, used by the agent Cursor menu builder. At the cut, App will need `package` access to `ApplyEditsApprovalScope` and `PendingApplyEditsReview` (types, properties and init), the `ModelPreset` members and `filteredForMode` that `ModelPresetsManager` uses, `CodexAgentModeCoordinatorHost.bindPendingOracleReviewContext`, and the Cursor picker members its App view uses.
+
+Step 5x — done | rounds 0/2 | open: | downgraded: | assumed: | deferred:
+
 ### Slice 6 — `RepoPromptAgentCore` extraction
 Move the now-acyclic AI, agent models, providers, runtime, services, history, recommendations and non-UI remote-host code. Remove the temporary typealiases. Check the release compile flags once for cross-module optimization; don't change them.
 
