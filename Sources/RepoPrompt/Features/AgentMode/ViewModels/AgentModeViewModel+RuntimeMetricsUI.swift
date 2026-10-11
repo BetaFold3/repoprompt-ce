@@ -7,7 +7,7 @@ extension AgentModeViewModel {
     func syncRuntimeMetricsUIState(
         liveSelectedFileCount: Int? = nil,
         liveSelectionSummary: AgentContextSelectionSummary? = nil,
-        providerUsage: AgentRuntimeSidebarViewModel.ProviderUsageSnapshot? = nil
+        providerUsage: AgentProviderUsageSnapshot? = nil
     ) {
         #if DEBUG
             test_syncRuntimeMetricsCallCount += 1
@@ -27,15 +27,15 @@ extension AgentModeViewModel {
     }
 
     func sidebarProviderUsage(
-        for session: TabSession?
-    ) -> AgentRuntimeSidebarViewModel.ProviderUsageSnapshot {
+        for session: AgentTabSession?
+    ) -> AgentProviderUsageSnapshot {
         guard let session else {
             return .unavailable(for: selectedAgent)
         }
         return session.cachedProviderUsageProjection(selectedAgent: session.selectedAgent)
     }
 
-    func sidebarConfiguredContextWindow(for session: TabSession?) -> Int? {
+    func sidebarConfiguredContextWindow(for session: AgentTabSession?) -> Int? {
         guard let session, session.selectedAgent.usesClaudeNativeRuntime else { return nil }
         let key = provisionalClaudeContextWindowKey(for: session)
         let sessionValue = key != nil && session.claudeConfiguredContextWindowKey == key
@@ -48,7 +48,7 @@ extension AgentModeViewModel {
     func syncSpawnResolvedClaudeConfiguredContextWindow(
         _ value: Int?,
         launchKey: ClaudeProvisionalContextWindowResolver.Key,
-        for session: TabSession
+        for session: AgentTabSession
     ) {
         session.claudeConfiguredContextWindow = value
         session.claudeConfiguredContextWindowKey = launchKey
@@ -102,7 +102,7 @@ extension AgentModeViewModel {
         syncRuntimeMetricsUIState()
     }
 
-    func provisionalClaudeContextWindowKey(for session: TabSession) -> ClaudeProvisionalContextWindowResolver.Key? {
+    func provisionalClaudeContextWindowKey(for session: AgentTabSession) -> ClaudeProvisionalContextWindowResolver.Key? {
         guard session.selectedAgent.usesClaudeNativeRuntime else { return nil }
         let workspacePath = AgentWorktreeRuntimeWorkspaceResolver.standardizedWorkspacePath(try? effectiveWorkspacePath(for: session))
         return ClaudeProvisionalContextWindowResolver.Key(

@@ -31,7 +31,7 @@ final class AgentModeSourceItemIntegrityTests: XCTestCase {
         let second = try retainedAgentRunToolResult(id: duplicateID, marker: "second", sequenceIndex: 1)
         let firstPayload = try XCTUnwrap(AgentToolResultPersistencePolicy.retainedEphemeralRawPayload(for: first))
         let secondPayload = try XCTUnwrap(AgentToolResultPersistencePolicy.retainedEphemeralRawPayload(for: second))
-        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        let session = AgentTabSession(tabID: UUID())
 
         session.setItemsSilently([first, second], reason: .testOverride)
 
@@ -49,7 +49,7 @@ final class AgentModeSourceItemIntegrityTests: XCTestCase {
         let duplicateID = UUID()
         let item = try retainedAgentRunToolResult(id: duplicateID, marker: "exact", sequenceIndex: 0)
         let payload = try XCTUnwrap(AgentToolResultPersistencePolicy.retainedEphemeralRawPayload(for: item))
-        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        let session = AgentTabSession(tabID: UUID())
 
         session.setItemsSilently([item, item], reason: .testOverride)
 

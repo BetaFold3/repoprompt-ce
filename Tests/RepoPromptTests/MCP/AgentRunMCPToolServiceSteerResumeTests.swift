@@ -362,7 +362,7 @@ final class AgentRunMCPToolServiceSteerResumeTests: XCTestCase {
 
     private func makeRegisteredSession(
         in window: WindowState
-    ) async throws -> AgentModeViewModel.TabSession {
+    ) async throws -> AgentTabSession {
         await window.promptManager.createBlankComposeTab(createAgentSession: false)
         let tabID = try XCTUnwrap(window.workspaceManager.activeWorkspace?.activeComposeTabID)
         return try await window.agentModeViewModel.ensureSessionReady(tabID: tabID)

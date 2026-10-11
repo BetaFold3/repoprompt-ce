@@ -88,8 +88,8 @@ final class RemoteAgentModeCoordinator {
     private var lastChildDiscoveryStartedAtByKey: [String: Date] = [:]
     private let childDiscoveryDebounceInterval: TimeInterval
     #if DEBUG
-        private var materializedRemoteChildAttachHandler: (@MainActor (AgentModeViewModel.TabSession) async throws -> Void)?
-        private var materializedRemoteWorkspaceAttachHandler: (@MainActor (AgentModeViewModel.TabSession) async throws -> Void)?
+        private var materializedRemoteChildAttachHandler: (@MainActor (AgentTabSession) async throws -> Void)?
+        private var materializedRemoteWorkspaceAttachHandler: (@MainActor (AgentTabSession) async throws -> Void)?
         private var childDiscoveryRequestObserver: ((UUID, Bool) -> Void)?
         private var syntheticSettlementRevertScanObserver: ((UUID) -> Void)?
         private var connectionStateDeliveryObserver: ((String, RemoteHostConnection.State) -> Void)?
@@ -133,7 +133,7 @@ final class RemoteAgentModeCoordinator {
         self.viewModel = viewModel
     }
 
-    func attachPersistedSessionIfNeeded(_ session: AgentModeViewModel.TabSession) {
+    func attachPersistedSessionIfNeeded(_ session: AgentTabSession) {
         guard session.remoteHost != nil else { return }
         guard !(session.parentSessionID != nil && session.runState.isTerminalForCommit) else { return }
         do {
@@ -151,7 +151,7 @@ final class RemoteAgentModeCoordinator {
     }
 
     func startRemoteSession(
-        session: AgentModeViewModel.TabSession,
+        session: AgentTabSession,
         message: String,
         modelSelectionRaw: String?,
         sessionName: String?,
@@ -188,7 +188,7 @@ final class RemoteAgentModeCoordinator {
         }
     }
 
-    func steer(session: AgentModeViewModel.TabSession, text: String) async throws {
+    func steer(session: AgentTabSession, text: String) async throws {
         let controller = try controller(for: session)
         // Self-heal: a session can reach steer without observation ever attaching —
         // e.g. a restored terminal child session that attachPersistedSessionIfNeeded
@@ -205,7 +205,7 @@ final class RemoteAgentModeCoordinator {
     }
 
     func fork(
-        session: AgentModeViewModel.TabSession,
+        session: AgentTabSession,
         upToClientItemID clientItemID: UUID,
         destinationAgent: String,
         destinationModelID: String,
@@ -239,7 +239,7 @@ final class RemoteAgentModeCoordinator {
                 hostID: binding.hostID,
                 remoteSessionID: descriptor.sessionID
             )
-        var materializedSession: AgentModeViewModel.TabSession?
+        var materializedSession: AgentTabSession?
         if !alreadyExists {
             workspacePickupInFlightKeys.insert(pickupKey)
             defer { workspacePickupInFlightKeys.remove(pickupKey) }
@@ -283,7 +283,7 @@ final class RemoteAgentModeCoordinator {
     }
 
     func extractHandoff(
-        session: AgentModeViewModel.TabSession,
+        session: AgentTabSession,
         upToClientItemID clientItemID: UUID,
         maxTranscriptItems: Int? = nil,
         maxToolArgsCharacters: Int? = nil
@@ -296,7 +296,7 @@ final class RemoteAgentModeCoordinator {
         )
     }
 
-    func canForkRemoteSession(session: AgentModeViewModel.TabSession) -> Bool {
+    func canForkRemoteSession(session: AgentTabSession) -> Bool {
         guard let hostID = session.remoteHost?.hostID,
               catalogProvider(hostID) != nil
         else { return false }
@@ -308,19 +308,19 @@ final class RemoteAgentModeCoordinator {
     }
 
     func hostRowID(
-        for session: AgentModeViewModel.TabSession,
+        for session: AgentTabSession,
         clientItemID: UUID
     ) -> UUID? {
         hostRowIDByClientItemIDByTabID[session.tabID]?[clientItemID]
     }
 
-    func cancel(session: AgentModeViewModel.TabSession) async throws {
+    func cancel(session: AgentTabSession) async throws {
         let controller = try controller(for: session)
         try await controller.cancel()
     }
 
     func submitApprovalDecision(
-        session: AgentModeViewModel.TabSession,
+        session: AgentTabSession,
         interactionID: String,
         decision: AgentApprovalDecision
     ) {
@@ -330,7 +330,7 @@ final class RemoteAgentModeCoordinator {
     }
 
     func submitAskUserResponse(
-        session: AgentModeViewModel.TabSession,
+        session: AgentTabSession,
         interactionID: String,
         response: AgentAskUserResponse
     ) {
@@ -339,7 +339,7 @@ final class RemoteAgentModeCoordinator {
     }
 
     func submitUserInputResponse(
-        session: AgentModeViewModel.TabSession,
+        session: AgentTabSession,
         request: AgentRequestUserInputRequest,
         response: AgentRequestUserInputResponse
     ) {
@@ -349,7 +349,7 @@ final class RemoteAgentModeCoordinator {
     }
 
     func submitMCPElicitationResponse(
-        session: AgentModeViewModel.TabSession,
+        session: AgentTabSession,
         request: AgentMCPElicitationRequest,
         response: AgentMCPElicitationResponse
     ) {
@@ -416,7 +416,7 @@ final class RemoteAgentModeCoordinator {
     }
 
     private func submitResponse(
-        session: AgentModeViewModel.TabSession,
+        session: AgentTabSession,
         interactionID: String,
         payload: RemoteInteractionResponsePayload,
         restorable: RestorableInteractionState
@@ -445,7 +445,7 @@ final class RemoteAgentModeCoordinator {
         }
     }
 
-    private func controller(for session: AgentModeViewModel.TabSession) throws -> RemoteAgentSessionController {
+    private func controller(for session: AgentTabSession) throws -> RemoteAgentSessionController {
         if let existing = controllersByTabID[session.tabID] {
             return existing
         }
@@ -475,7 +475,7 @@ final class RemoteAgentModeCoordinator {
         }
     }
 
-    private func scheduleForkCapabilityProbe(for session: AgentModeViewModel.TabSession) {
+    private func scheduleForkCapabilityProbe(for session: AgentTabSession) {
         guard let hostID = session.remoteHost?.hostID,
               forkCapabilityProbeTasksByHostID[hostID] == nil
         else { return }
@@ -653,7 +653,7 @@ final class RemoteAgentModeCoordinator {
     private func applyTranscriptRows(
         _ rows: [AgentChatItem],
         removedIDs: [UUID] = [],
-        to session: AgentModeViewModel.TabSession
+        to session: AgentTabSession
     ) {
         guard !rows.isEmpty || !removedIDs.isEmpty else { return }
         let remoteSessionID = session.remoteHost?.remoteSessionID ?? "remote"
@@ -728,7 +728,7 @@ final class RemoteAgentModeCoordinator {
         _ runState: AgentSessionRunState,
         pendingInteraction: RemotePendingInteraction?,
         statusText: String?,
-        to session: AgentModeViewModel.TabSession
+        to session: AgentTabSession
     ) {
         let wasTerminal = Self.isTerminalRunState(session.runState)
         if let pendingInteraction {
@@ -807,7 +807,7 @@ final class RemoteAgentModeCoordinator {
         }
     }
 
-    private func applyTerminal(status: String, to session: AgentModeViewModel.TabSession) {
+    private func applyTerminal(status: String, to session: AgentTabSession) {
         clearAskUserStash(tabID: session.tabID)
         clearPendingInteractions(session)
         switch status {
@@ -832,7 +832,7 @@ final class RemoteAgentModeCoordinator {
     }
 
     private func requestFirstActiveChildSessionDiscovery(
-        for session: AgentModeViewModel.TabSession,
+        for session: AgentTabSession,
         reason: String
     ) {
         guard let context = childDiscoveryContext(for: session),
@@ -843,7 +843,7 @@ final class RemoteAgentModeCoordinator {
     }
 
     private func requestChildSessionDiscovery(
-        for session: AgentModeViewModel.TabSession,
+        for session: AgentTabSession,
         reason _: String,
         immediate: Bool = false
     ) {
@@ -1014,7 +1014,7 @@ final class RemoteAgentModeCoordinator {
         }
     }
 
-    private func attachMaterializedRemoteChildSession(_ session: AgentModeViewModel.TabSession) async throws {
+    private func attachMaterializedRemoteChildSession(_ session: AgentTabSession) async throws {
         #if DEBUG
             if let materializedRemoteChildAttachHandler {
                 try await materializedRemoteChildAttachHandler(session)
@@ -1025,7 +1025,7 @@ final class RemoteAgentModeCoordinator {
         try await controller.attachAndCatchUp()
     }
 
-    private func childDiscoveryContext(for session: AgentModeViewModel.TabSession) -> RemoteChildDiscoveryContext? {
+    private func childDiscoveryContext(for session: AgentTabSession) -> RemoteChildDiscoveryContext? {
         guard let remoteHost = session.remoteHost,
               session.activeAgentSessionID != nil
         else { return nil }
@@ -1039,7 +1039,7 @@ final class RemoteAgentModeCoordinator {
         )
     }
 
-    private func childDiscoveryKey(for session: AgentModeViewModel.TabSession) -> String? {
+    private func childDiscoveryKey(for session: AgentTabSession) -> String? {
         guard let remoteHost = session.remoteHost else { return nil }
         let parentRemoteSessionID = remoteHost.remoteSessionID.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !parentRemoteSessionID.isEmpty else { return nil }
@@ -1239,7 +1239,7 @@ final class RemoteAgentModeCoordinator {
     func pickUpWorkspaceSession(
         descriptor: RemoteAgentSessionDescriptor,
         hostRecord: PairedHostRecord
-    ) async -> AgentModeViewModel.TabSession? {
+    ) async -> AgentTabSession? {
         let remoteSessionID = descriptor.sessionID.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !remoteSessionID.isEmpty else { return nil }
         let key = WorkspacePickupKey(hostID: hostRecord.id, remoteSessionID: remoteSessionID)
@@ -1277,7 +1277,7 @@ final class RemoteAgentModeCoordinator {
         return session
     }
 
-    private func attachMaterializedRemoteWorkspaceSession(_ session: AgentModeViewModel.TabSession) async throws {
+    private func attachMaterializedRemoteWorkspaceSession(_ session: AgentTabSession) async throws {
         #if DEBUG
             if let materializedRemoteWorkspaceAttachHandler {
                 try await materializedRemoteWorkspaceAttachHandler(session)
@@ -1428,7 +1428,7 @@ final class RemoteAgentModeCoordinator {
         runState == .completed || runState == .cancelled || runState == .failed
     }
 
-    private func applyChannel(_ state: RemoteChannelState, to session: AgentModeViewModel.TabSession) {
+    private func applyChannel(_ state: RemoteChannelState, to session: AgentTabSession) {
         switch state.kind {
         case .connected:
             let hadSurfacedDegradation = !(surfacedChannelReasonsByTabID[session.tabID] ?? []).isEmpty
@@ -1460,7 +1460,7 @@ final class RemoteAgentModeCoordinator {
         agentKindRaw: String?,
         modelRaw: String?,
         reasoningEffortRaw: String?,
-        to session: AgentModeViewModel.TabSession
+        to session: AgentTabSession
     ) {
         guard let model = Self.normalizedMetadataString(modelRaw) else { return }
         let hostID = session.remoteHost?.hostID
@@ -1496,7 +1496,7 @@ final class RemoteAgentModeCoordinator {
     }
 
     private func optimisticallyClearPendingInteraction(
-        _ session: AgentModeViewModel.TabSession,
+        _ session: AgentTabSession,
         interactionID: String
     ) -> RestorableInteractionState {
         let restorable = RestorableInteractionState(
@@ -1621,7 +1621,7 @@ final class RemoteAgentModeCoordinator {
     }
 
     private func clearPendingInteractions(
-        _ session: AgentModeViewModel.TabSession,
+        _ session: AgentTabSession,
         matching interactionID: String? = nil,
         preserving preservedInteractionID: String? = nil
     ) {
@@ -1650,7 +1650,7 @@ final class RemoteAgentModeCoordinator {
         }
     }
 
-    private func surfaceChannelReasonIfNeeded(_ reason: String, to session: AgentModeViewModel.TabSession) {
+    private func surfaceChannelReasonIfNeeded(_ reason: String, to session: AgentTabSession) {
         var reasons = surfacedChannelReasonsByTabID[session.tabID, default: []]
         guard reasons.insert(reason).inserted else { return }
         surfacedChannelReasonsByTabID[session.tabID] = reasons
@@ -1672,7 +1672,7 @@ final class RemoteAgentModeCoordinator {
 
     private func adoptHostSessionNameIfAllowed(
         _ sessionName: String?,
-        for session: AgentModeViewModel.TabSession,
+        for session: AgentTabSession,
         tabID: UUID
     ) {
         guard session.remoteHost != nil,
@@ -1700,13 +1700,13 @@ final class RemoteAgentModeCoordinator {
         appendSystemMessage(message, to: session)
     }
 
-    private func appendSystemMessage(_ message: String, to session: AgentModeViewModel.TabSession) {
+    private func appendSystemMessage(_ message: String, to session: AgentTabSession) {
         session.appendItem(.system(message))
         viewModel?.requestUIRefresh(tabID: session.tabID, urgent: true)
         viewModel?.scheduleSave(for: session.tabID)
     }
 
-    private func updateSessionIndex(for session: AgentModeViewModel.TabSession) {
+    private func updateSessionIndex(for session: AgentTabSession) {
         guard let viewModel,
               let sessionID = session.activeAgentSessionID,
               let remoteHost = session.remoteHost
@@ -1778,7 +1778,7 @@ final class RemoteAgentModeCoordinator {
     }
 
     #if DEBUG
-        func test_controller(for session: AgentModeViewModel.TabSession) throws -> RemoteAgentSessionController {
+        func test_controller(for session: AgentTabSession) throws -> RemoteAgentSessionController {
             try controller(for: session)
         }
 
@@ -1790,7 +1790,7 @@ final class RemoteAgentModeCoordinator {
             await deliver(state, hostID: hostID)
         }
 
-        func test_applyChannel(_ state: RemoteChannelState, to session: AgentModeViewModel.TabSession) {
+        func test_applyChannel(_ state: RemoteChannelState, to session: AgentTabSession) {
             applyChannel(state, to: session)
         }
 
@@ -1809,7 +1809,7 @@ final class RemoteAgentModeCoordinator {
         /// Internal for respond-wiring tests.
         func test_installController(
             _ controller: RemoteAgentSessionController,
-            for session: AgentModeViewModel.TabSession,
+            for session: AgentTabSession,
             hostID: String
         ) {
             if session.remoteHost == nil {
@@ -1875,7 +1875,7 @@ final class RemoteAgentModeCoordinator {
         func test_applyTranscriptRows(
             _ rows: [AgentChatItem],
             removedIDs: [UUID] = [],
-            to session: AgentModeViewModel.TabSession
+            to session: AgentTabSession
         ) {
             applyTranscriptRows(rows, removedIDs: removedIDs, to: session)
         }
@@ -1884,12 +1884,12 @@ final class RemoteAgentModeCoordinator {
             _ runState: AgentSessionRunState,
             pendingInteraction: RemotePendingInteraction? = nil,
             statusText: String? = nil,
-            to session: AgentModeViewModel.TabSession
+            to session: AgentTabSession
         ) {
             applyRunState(runState, pendingInteraction: pendingInteraction, statusText: statusText, to: session)
         }
 
-        func test_applyTerminal(status: String, to session: AgentModeViewModel.TabSession) {
+        func test_applyTerminal(status: String, to session: AgentTabSession) {
             applyTerminal(status: status, to: session)
         }
 
@@ -1914,13 +1914,13 @@ final class RemoteAgentModeCoordinator {
         }
 
         func test_setMaterializedRemoteChildAttachHandler(
-            _ handler: (@MainActor (AgentModeViewModel.TabSession) async throws -> Void)?
+            _ handler: (@MainActor (AgentTabSession) async throws -> Void)?
         ) {
             materializedRemoteChildAttachHandler = handler
         }
 
         func test_setMaterializedRemoteWorkspaceAttachHandler(
-            _ handler: (@MainActor (AgentModeViewModel.TabSession) async throws -> Void)?
+            _ handler: (@MainActor (AgentTabSession) async throws -> Void)?
         ) {
             materializedRemoteWorkspaceAttachHandler = handler
         }

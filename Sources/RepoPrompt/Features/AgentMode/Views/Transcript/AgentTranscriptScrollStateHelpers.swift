@@ -3,7 +3,7 @@ import Foundation
 import RepoPromptAgentCore
 
 struct AgentTranscriptScrollRuntimeState {
-    let armingState: AgentModeViewModel.AgentTranscriptAutoFollowArmingState
+    let armingState: AgentTranscriptAutoFollowArmingState
     let isPinnedToLiveBottom: Bool
     let isDetachedFromLiveBottom: Bool
     let isUserInteractingWithScroll: Bool

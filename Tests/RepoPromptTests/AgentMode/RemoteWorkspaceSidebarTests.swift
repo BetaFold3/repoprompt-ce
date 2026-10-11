@@ -1448,7 +1448,7 @@ final class RemoteWorkspaceSidebarTests: XCTestCase {
         let first = AgentChatItem.user("First failed turn", sequenceIndex: session.nextSequenceIndex)
         session.appendItem(first)
         session.pendingRemoteOptimisticUserItemIDs.insert(first.id)
-        let firstPayload = AgentModeViewModel.RemoteResendPayload(
+        let firstPayload = AgentRemoteResendPayload(
             providerText: first.text,
             wasStart: true,
             modelSelectionRaw: nil,
@@ -1613,7 +1613,7 @@ final class RemoteWorkspaceSidebarTests: XCTestCase {
             hostID: fixture.host.id
         )
 
-        let replacementSession = AgentModeViewModel.TabSession(tabID: UUID())
+        let replacementSession = AgentTabSession(tabID: UUID())
         fixture.viewModel.test_installLiveSession(replacementSession)
         replacementSession.remoteHost = binding(host: fixture.host, remoteSessionID: "")
         replacementSession.runState = .failed
@@ -1876,7 +1876,7 @@ final class RemoteWorkspaceSidebarTests: XCTestCase {
             testWorkspacePath: FileManager.default.currentDirectoryPath,
             codexControllerFactory: { _, _, _, _, _, _ in LifecycleNoopCodexController(recorder: LifecycleRecorder()) }
         )
-        let restoredSession = AgentModeViewModel.TabSession(tabID: session.tabID)
+        let restoredSession = AgentTabSession(tabID: session.tabID)
         restoredViewModel.test_installLiveSession(restoredSession)
         _ = restoredViewModel.test_installPersistentSessionBinding(sessionID: sessionID, on: restoredSession)
         let didHydrate = await restoredViewModel.test_applyPersistedHydration(
@@ -1902,7 +1902,7 @@ final class RemoteWorkspaceSidebarTests: XCTestCase {
             codexControllerFactory: { _, _, _, _, _, _ in LifecycleNoopCodexController(recorder: LifecycleRecorder()) },
             testRemoteCoordinator: resendCoordinator
         )
-        let selectedSession = AgentModeViewModel.TabSession(tabID: session.tabID)
+        let selectedSession = AgentTabSession(tabID: session.tabID)
         selectedViewModel.test_installLiveSession(selectedSession)
         _ = selectedViewModel.test_installPersistentSessionBinding(
             sessionID: sessionID,
@@ -2310,7 +2310,7 @@ final class RemoteWorkspaceSidebarTests: XCTestCase {
         fixture: Fixture,
         startErrors: [RemoteClientError] = []
     ) async throws -> (
-        session: AgentModeViewModel.TabSession,
+        session: AgentTabSession,
         userItemID: UUID,
         connection: ResendRecordingConnection
     ) {
@@ -2363,7 +2363,7 @@ final class RemoteWorkspaceSidebarTests: XCTestCase {
     private func prepareFailedAdoptedTurn(
         fixture: Fixture,
         text: String
-    ) async throws -> (session: AgentModeViewModel.TabSession, userItemID: UUID, connection: ResendRecordingConnection) {
+    ) async throws -> (session: AgentTabSession, userItemID: UUID, connection: ResendRecordingConnection) {
         let session = try! await fixture.viewModel.ensureSessionReady(tabID: fixture.initialTabID)
         session.remoteHost = binding(host: fixture.host, remoteSessionID: "remote-abc123")
         session.hasSentFirstMessage = true

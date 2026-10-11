@@ -60,7 +60,7 @@ struct AgentStagedSlashCommandPill: View {
 struct AgentAutoEditGuidanceBubble: View {
     let agentModeVM: AgentModeViewModel
     let runState: AgentSessionRunState
-    let guidance: AgentModeViewModel.AutoEditPermissionGuidance
+    let guidance: AgentAutoEditPermissionGuidance
 
     @ObservedObject private var fontScale = FontScaleManager.shared
     private var fontPreset: FontScalePreset {

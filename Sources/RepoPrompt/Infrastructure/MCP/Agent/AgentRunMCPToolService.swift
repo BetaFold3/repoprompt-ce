@@ -139,7 +139,7 @@ private struct SteerControlIdentity {
 }
 
 private struct SteerControlResolution {
-    let session: AgentModeViewModel.TabSession
+    let session: AgentTabSession
     let reactivatedTarget: AgentModeViewModel.MCPSessionTarget?
     let reactivatedControlIdentity: SteerControlIdentity?
 }
@@ -388,14 +388,14 @@ struct AgentRunMCPToolService {
         var testBeforeOMPQualificationConsume: (() async -> Void)?
         var testBeforeExplicitTabWorktreeValidation: (() -> Void)?
         var testWorktreePreparationFailure: Error?
-        var testBeforeWorktreePreparationFailureCleanup: ((AgentModeViewModel.TabSession) async -> Void)?
+        var testBeforeWorktreePreparationFailureCleanup: ((AgentTabSession) async -> Void)?
         var testBeforeOMPQualificationProviderDispatch: (() async -> Void)?
         var testBeforeOMPQualificationContextIdentityCheck: ((
             OhMyPiAgentModeSmokeGate.StartContext,
-            AgentModeViewModel.TabSession
+            AgentTabSession
         ) async -> Void)?
         var testAfterOMPQualificationPreDispatchIdentityCheck: (() async -> Void)?
-        var testBeforeOMPQualificationTargetDiscardCAS: ((AgentModeViewModel.TabSession?) async -> Void)?
+        var testBeforeOMPQualificationTargetDiscardCAS: ((AgentTabSession?) async -> Void)?
         var testBeforeProviderAvailabilityPreflight: (() -> Void)?
         var testBeforeProviderDispatch: (() async -> Void)?
         var testAfterProviderStartBeforeBookkeeping: (() async -> Void)?

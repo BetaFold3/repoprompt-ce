@@ -608,7 +608,7 @@ final class AgentRuntimeSidebarViewModelTests: XCTestCase {
         XCTAssertEqual(viewModel.snapshot.effectiveContextWindowTokens, 1_000_000)
 
         let vm = makeViewModel(testWorkspacePath: "/tmp/repoprompt-sidebar-key-shadow")
-        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        let session = AgentTabSession(tabID: UUID())
         session.selectedAgent = .claudeCode
         session.selectedModelRaw = "claude-fable-5"
         vm.test_installLiveSession(session)
@@ -644,7 +644,7 @@ final class AgentRuntimeSidebarViewModelTests: XCTestCase {
 
     func testClaudeConfiguredWindowKeyGatePreventsFamilyTransitionStaleShadow() throws {
         let vm = makeViewModel(testWorkspacePath: "/tmp/repoprompt-sidebar-family-transition")
-        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        let session = AgentTabSession(tabID: UUID())
         vm.test_installLiveSession(session)
         vm.test_setCurrentTabIDOverride(session.tabID)
 
@@ -705,7 +705,7 @@ final class AgentRuntimeSidebarViewModelTests: XCTestCase {
 
     func testSpawnResolvedWindowMatchedKeyNudgesWithoutSnapshotChurn() throws {
         let vm = makeViewModel(testWorkspacePath: "/tmp/repoprompt-sidebar-launch-key-matched")
-        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        let session = AgentTabSession(tabID: UUID())
         session.selectedAgent = .claudeCode
         session.selectedModelRaw = "claude-fable-5"
         vm.test_installLiveSession(session)
@@ -733,10 +733,10 @@ final class AgentRuntimeSidebarViewModelTests: XCTestCase {
 
     func testProvisionalCompletionStoresCacheWithoutSyncForInactiveKey() throws {
         let vm = makeViewModel(testWorkspacePath: "/tmp/repoprompt-sidebar-completion-inactive")
-        let sessionA = AgentModeViewModel.TabSession(tabID: UUID())
+        let sessionA = AgentTabSession(tabID: UUID())
         sessionA.selectedAgent = .claudeCode
         sessionA.selectedModelRaw = "claude-fable-5"
-        let sessionB = AgentModeViewModel.TabSession(tabID: UUID())
+        let sessionB = AgentTabSession(tabID: UUID())
         sessionB.selectedAgent = .claudeCodeGLM
         sessionB.selectedModelRaw = "sonnet"
         vm.test_installLiveSession(sessionA)
@@ -753,10 +753,10 @@ final class AgentRuntimeSidebarViewModelTests: XCTestCase {
 
     func testProvisionalCompletionSyncsAfterInflightSwitchBackToMatchingKey() throws {
         let vm = makeViewModel(testWorkspacePath: "/tmp/repoprompt-sidebar-completion-switchback")
-        let sessionA = AgentModeViewModel.TabSession(tabID: UUID())
+        let sessionA = AgentTabSession(tabID: UUID())
         sessionA.selectedAgent = .claudeCode
         sessionA.selectedModelRaw = "claude-fable-5"
-        let sessionB = AgentModeViewModel.TabSession(tabID: UUID())
+        let sessionB = AgentTabSession(tabID: UUID())
         sessionB.selectedAgent = .claudeCodeGLM
         sessionB.selectedModelRaw = "sonnet"
         vm.test_installLiveSession(sessionA)
@@ -777,7 +777,7 @@ final class AgentRuntimeSidebarViewModelTests: XCTestCase {
 
     func testLateProvisionalCompletionPreservesSpawnValueClearsInFlightAndNudgesWithoutRevisionChurn() throws {
         let vm = makeViewModel(testWorkspacePath: "/tmp/repoprompt-sidebar-completion-spawn-wins")
-        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        let session = AgentTabSession(tabID: UUID())
         session.selectedAgent = .claudeCode
         session.selectedModelRaw = "claude-fable-5"
         vm.test_installLiveSession(session)
@@ -799,7 +799,7 @@ final class AgentRuntimeSidebarViewModelTests: XCTestCase {
 
     func testLateProvisionalCompletionPreservesSpawnNil() throws {
         let vm = makeViewModel(testWorkspacePath: "/tmp/repoprompt-sidebar-completion-spawn-nil-wins")
-        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        let session = AgentTabSession(tabID: UUID())
         session.selectedAgent = .customClaudeCompatible
         session.selectedModelRaw = "custom-slot"
         vm.test_installLiveSession(session)
@@ -817,7 +817,7 @@ final class AgentRuntimeSidebarViewModelTests: XCTestCase {
 
     func testRestoredUsageNilConfiguredUsesEagerParameterWithoutMutatingUsage() throws {
         let vm = makeViewModel(testWorkspacePath: "/tmp/repoprompt-sidebar-stale-cache")
-        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        let session = AgentTabSession(tabID: UUID())
         session.selectedAgent = .claudeCode
         session.selectedModelRaw = "claude-fable-5"
         vm.test_installLiveSession(session)
@@ -883,7 +883,7 @@ final class AgentRuntimeSidebarViewModelTests: XCTestCase {
     }
 
     func testProviderUsagePresentationFormatsCompletePartialUnknownZeroAndTinyValues() {
-        typealias Usage = AgentRuntimeSidebarViewModel.ProviderUsageSnapshot
+        typealias Usage = AgentProviderUsageSnapshot
         let execution = UUID()
 
         func latest(_ ratio: Decimal) -> AgentUsageLatestRequestCacheHit {
@@ -959,7 +959,7 @@ final class AgentRuntimeSidebarViewModelTests: XCTestCase {
     }
 
     func testProviderUsageProjectionAllowsOnlyOwnedLosslessHydratedClaudeRecords() throws {
-        typealias Usage = AgentRuntimeSidebarViewModel.ProviderUsageSnapshot
+        typealias Usage = AgentProviderUsageSnapshot
         let owner = UUID()
         let trackingStartedAt = Date(timeIntervalSince1970: 1_789_344_000)
         let record = makeProviderUsageRecord(
@@ -1106,7 +1106,7 @@ final class AgentRuntimeSidebarViewModelTests: XCTestCase {
     }
 
     func testProviderUsageUnavailableExplanationsDistinguishGatedOwnershipAndUnsupportedStates() throws {
-        typealias Usage = AgentRuntimeSidebarViewModel.ProviderUsageSnapshot
+        typealias Usage = AgentProviderUsageSnapshot
         let owner = UUID()
         let noUsage = Usage.claudeNoUsageRecordedReason
         let dash = "CH — · Est. —"
@@ -1230,7 +1230,7 @@ final class AgentRuntimeSidebarViewModelTests: XCTestCase {
 
     func testScopedRuntimeRefreshPublishesUsageMutationsAndHydrationWithoutContextRegression() throws {
         let vm = makeViewModel(testWorkspacePath: "/tmp/repoprompt-sidebar-provider-usage")
-        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        let session = AgentTabSession(tabID: UUID())
         session.selectedAgent = .claudeCode
         session.selectedModelRaw = vm.selectedModelRaw
         vm.test_installLiveSession(session)
@@ -1281,7 +1281,7 @@ final class AgentRuntimeSidebarViewModelTests: XCTestCase {
             .accepted
         )
         XCTAssertNil(
-            AgentRuntimeSidebarViewModel.ProviderUsageSnapshot.projected(
+            AgentProviderUsageSnapshot.projected(
                 selectedAgent: .codexExec,
                 accounting: session.usageAccounting,
                 expectedOwnerSessionID: owner
@@ -1546,12 +1546,12 @@ final class AgentRuntimeSidebarViewModelTests: XCTestCase {
 
     private func makeDivergedClaudeLaunchKeyState() throws -> (
         vm: AgentModeViewModel,
-        session: AgentModeViewModel.TabSession,
+        session: AgentTabSession,
         launchKey: ClaudeProvisionalContextWindowResolver.Key,
         currentKey: ClaudeProvisionalContextWindowResolver.Key
     ) {
         let vm = makeViewModel(testWorkspacePath: "/tmp/repoprompt-sidebar-launch-key-race")
-        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        let session = AgentTabSession(tabID: UUID())
         session.selectedAgent = .claudeCode
         session.selectedModelRaw = "claude-fable-5"
         vm.test_installLiveSession(session)

@@ -94,7 +94,7 @@ extension AgentModeViewModel {
         )
     }
 
-    func runLocationSelection(for session: TabSession?) -> AgentRunLocation {
+    func runLocationSelection(for session: AgentTabSession?) -> AgentRunLocation {
         guard let remoteHost = session?.remoteHost else { return .thisMac }
         return .host(hostID: remoteHost.hostID)
     }
@@ -123,7 +123,7 @@ extension AgentModeViewModel {
         return remoteHost.normalizedRemoteSessionID == nil && session.runState == .failed
     }
 
-    func isEligibleForInitialRunLocation(tabID: UUID, session: TabSession?) -> Bool {
+    func isEligibleForInitialRunLocation(tabID: UUID, session: AgentTabSession?) -> Bool {
         isEligibleForInitialStartLocation(tabID: tabID, session: session)
     }
 
@@ -158,7 +158,7 @@ extension AgentModeViewModel {
             return nil
         }
         let indicator = primaryExecutionWorktreeIndicator(forTabID: tabID)
-        let selection: InitialStartLocation = indicator.map { indicator in
+        let selection: AgentInitialStartLocation = indicator.map { indicator in
             .existingWorktree(
                 AgentExecutionWorktreeSelection(
                     repositoryID: indicator.repositoryID,
@@ -198,7 +198,7 @@ extension AgentModeViewModel {
         return props
     }
 
-    func isEligibleForInitialStartLocation(tabID: UUID, session: TabSession?) -> Bool {
+    func isEligibleForInitialStartLocation(tabID: UUID, session: AgentTabSession?) -> Bool {
         guard workspaceManager?.activeWorkspace?.isSystemWorkspace != true else {
             return false
         }
@@ -228,12 +228,12 @@ extension AgentModeViewModel {
         return localSessionMutationDisabledReason(for: session)
     }
 
-    func localSessionMutationDisabledReason(for session: TabSession) -> String? {
+    func localSessionMutationDisabledReason(for session: AgentTabSession) -> String? {
         guard let remoteHost = session.remoteHost else { return nil }
         return "Managed on \(remoteHost.hostDisplayName)"
     }
 
-    private func executionLocationMutationDisabledReason(for session: TabSession) -> String? {
+    private func executionLocationMutationDisabledReason(for session: AgentTabSession) -> String? {
         if !session.hasLoadedPersistedState {
             return "Load this thread before changing its execution location."
         }
@@ -246,7 +246,7 @@ extension AgentModeViewModel {
         return nil
     }
 
-    func selectInitialStartLocation(_ selection: InitialStartLocation, for tabID: UUID) {
+    func selectInitialStartLocation(_ selection: AgentInitialStartLocation, for tabID: UUID) {
         guard tabID == currentTabID,
               isEligibleForInitialStartLocation(tabID: tabID, session: sessions[tabID])
         else {
@@ -264,14 +264,14 @@ extension AgentModeViewModel {
         syncStatusPillsUIState()
     }
 
-    private func hasSubmittedTurn(_ session: TabSession) -> Bool {
+    private func hasSubmittedTurn(_ session: AgentTabSession) -> Bool {
         session.hasSentFirstMessage
             || session.items.contains { $0.kind == .user }
             || session.transcript.turns.contains { $0.request != nil }
     }
 
     @discardableResult
-    func applyHostRunLocation(hostID: String, to session: TabSession) -> Bool {
+    func applyHostRunLocation(hostID: String, to session: AgentTabSession) -> Bool {
         guard session.remoteHost == nil,
               !hasSubmittedTurn(session),
               let host = try? remoteHostRegistry.host(id: hostID),
@@ -295,7 +295,7 @@ extension AgentModeViewModel {
 
     @discardableResult
     func applyWorkspaceDefaultRunLocationIfNeeded(
-        to session: TabSession,
+        to session: AgentTabSession,
         workspace: WorkspaceModel? = nil
     ) -> Bool {
         guard let hostID = (workspace ?? workspaceManager?.activeWorkspace)?.defaultRemoteHostID else {

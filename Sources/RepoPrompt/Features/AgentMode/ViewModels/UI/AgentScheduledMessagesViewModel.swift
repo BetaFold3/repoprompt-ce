@@ -127,7 +127,7 @@ final class AgentScheduledMessagesViewModel: ObservableObject {
 
     private struct HydratedSession {
         let sessionID: UUID
-        let session: AgentModeViewModel.TabSession
+        let session: AgentTabSession
     }
 
     private static func hydratedSessions(

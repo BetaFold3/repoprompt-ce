@@ -126,7 +126,7 @@ extension AgentModeViewModel {
 
     @discardableResult
     private func updateMatchingBranchSwitchBindingMetadata(
-        session: TabSession,
+        session: AgentTabSession,
         row: AgentWorkspaceRootRow,
         result: GitBranchSwitchResult
     ) -> Bool {

@@ -16,7 +16,7 @@ import XCTest
 @MainActor
 final class CodexUsageAccountingTests: XCTestCase {
     private typealias Counters = CodexUsageObservation.Counters
-    private typealias Usage = AgentRuntimeSidebarViewModel.ProviderUsageSnapshot
+    private typealias Usage = AgentProviderUsageSnapshot
 
     private let owner = UUID()
     private let execution = UUID()

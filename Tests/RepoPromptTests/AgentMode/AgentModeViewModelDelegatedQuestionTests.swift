@@ -1203,7 +1203,7 @@ final class AgentModeViewModelDelegatedQuestionTests: XCTestCase {
     private struct LiveSession {
         let tabID: UUID
         let sessionID: UUID
-        let session: AgentModeViewModel.TabSession
+        let session: AgentTabSession
     }
 
     private func makeViewModel(codexController: LifecycleNoopCodexController? = nil) -> AgentModeViewModel {
@@ -1378,7 +1378,7 @@ final class AgentModeViewModelDelegatedQuestionTests: XCTestCase {
         session.parentSessionID = parent
         session.hasLoadedPersistedState = true
         if controlled, parent != nil || originatingConnectionID != nil || forceControlContext {
-            session.mcpControlContext = AgentModeViewModel.AgentMCPControlContext(
+            session.mcpControlContext = AgentMCPControlContext(
                 sessionID: sessionID,
                 activationID: UUID(),
                 registration: .init(sessionID: sessionID, generation: 0),

@@ -207,8 +207,8 @@ final class AgentModeWorkspaceSwitchCleanupTests: XCTestCase {
         XCTAssertEqual(newSession.runState, .running)
     }
 
-    private func makeMCPControlContext(sessionID: UUID) -> AgentModeViewModel.AgentMCPControlContext {
-        AgentModeViewModel.AgentMCPControlContext(
+    private func makeMCPControlContext(sessionID: UUID) -> AgentMCPControlContext {
+        AgentMCPControlContext(
             sessionID: sessionID,
             activationID: UUID(),
             registration: .init(sessionID: sessionID, generation: 0),

@@ -1905,7 +1905,7 @@ struct AgentModeChatDetailView: View {
             && scrollMetrics.distanceToBottom > Self.scrollToBottomSuccessDistanceThreshold
     }
 
-    private var currentAutoFollowArmingState: AgentModeViewModel.AgentTranscriptAutoFollowArmingState {
+    private var currentAutoFollowArmingState: AgentTranscriptAutoFollowArmingState {
         guard let currentTabID else {
             return .armed
         }
@@ -1920,7 +1920,7 @@ struct AgentModeChatDetailView: View {
         currentAutoFollowArmingState == .armed
     }
 
-    private func setCurrentAutoFollowArmingState(_ state: AgentModeViewModel.AgentTranscriptAutoFollowArmingState) {
+    private func setCurrentAutoFollowArmingState(_ state: AgentTranscriptAutoFollowArmingState) {
         guard let currentTabID,
               transcriptSnapshot.followBindingState.armingState != state
         else {
@@ -4881,7 +4881,7 @@ struct AgentModeChatDetailView: View {
         #endif
     }
 
-    private func currentFollowArmingState(for tabID: UUID) -> AgentModeViewModel.AgentTranscriptAutoFollowArmingState {
+    private func currentFollowArmingState(for tabID: UUID) -> AgentTranscriptAutoFollowArmingState {
         if transcriptSnapshot.followBindingState.tabID == tabID {
             return transcriptSnapshot.followBindingState.armingState
         }

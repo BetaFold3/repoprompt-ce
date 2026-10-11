@@ -240,7 +240,7 @@ final class RemoteAgentSessionTests: XCTestCase {
             activeWorkspace: workspace
         )
 
-        let liveSession = AgentModeViewModel.TabSession(tabID: UUID())
+        let liveSession = AgentTabSession(tabID: UUID())
         liveSession.remoteHost = makeBinding(hostID: "host-live", remoteSessionID: "remote-live")
         viewModel.test_installLiveSession(liveSession)
 
@@ -2116,7 +2116,7 @@ final class RemoteAgentSessionTests: XCTestCase {
     @MainActor
     func testChannelClosingReasonSurfacesAsBannerAndDedupedSystemRows() {
         let coordinator = RemoteAgentModeCoordinator()
-        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        let session = AgentTabSession(tabID: UUID())
         session.remoteHost = makeBinding()
         session.runState = .running
 
@@ -2138,7 +2138,7 @@ final class RemoteAgentSessionTests: XCTestCase {
     @MainActor
     func testIdleChannelDegradeThenConnectedAppendsOneRestoredRow() {
         let coordinator = RemoteAgentModeCoordinator()
-        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        let session = AgentTabSession(tabID: UUID())
         session.remoteHost = makeBinding()
         session.runState = .completed
 
@@ -2157,7 +2157,7 @@ final class RemoteAgentSessionTests: XCTestCase {
     @MainActor
     func testConnectedWithoutSurfacedDegradationAppendsNoRestoredRow() {
         let coordinator = RemoteAgentModeCoordinator()
-        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        let session = AgentTabSession(tabID: UUID())
         session.remoteHost = makeBinding()
 
         coordinator.test_applyChannel(.init(kind: .connected), to: session)
@@ -2169,7 +2169,7 @@ final class RemoteAgentSessionTests: XCTestCase {
     @MainActor
     func testRepeatedDegradeRecoverCyclesAppendTwoPairedSequencesWithoutSpam() {
         let coordinator = RemoteAgentModeCoordinator()
-        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        let session = AgentTabSession(tabID: UUID())
         session.remoteHost = makeBinding()
 
         for _ in 0 ..< 2 {
@@ -2562,7 +2562,7 @@ final class RemoteAgentSessionTests: XCTestCase {
 
     @MainActor
     func testApplyTranscriptRowsPreservesNewerOptimisticUserTimestamp() {
-        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        let session = AgentTabSession(tabID: UUID())
         session.remoteHost = makeBinding(remoteSessionID: "remote-session-optimistic")
         let optimisticTimestamp = Date(timeIntervalSince1970: 1_700_000_000)
         let projectedTimestamp = Date(timeIntervalSince1970: 2)
@@ -2612,7 +2612,7 @@ final class RemoteAgentSessionTests: XCTestCase {
 
     @MainActor
     func testApplyTranscriptRowsKeepsLastUserMessageAtWhenOnlySyntheticUserRows() {
-        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        let session = AgentTabSession(tabID: UUID())
         session.remoteHost = makeBinding(remoteSessionID: "remote-session-synthetic-only")
         let existingLastUserMessageAt = Date(timeIntervalSince1970: 1_700_000_000)
         let syntheticTimestamp = Date(timeIntervalSince1970: 3)
@@ -2716,7 +2716,7 @@ final class RemoteAgentSessionTests: XCTestCase {
 
     @MainActor
     func testPostTerminalTranscriptRowsPreserveExplicitFailedToolResult() throws {
-        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        let session = AgentTabSession(tabID: UUID())
         session.remoteHost = makeBinding(remoteSessionID: "remote-session-tools-explicit-failed")
         session.runState = .completed
         let failedJSON = #"{"status":"failed","summary_only":true,"marker":"preserve"}"#
@@ -3129,7 +3129,7 @@ final class RemoteAgentSessionTests: XCTestCase {
     }
 
     @MainActor
-    private func systemMessages(in session: AgentModeViewModel.TabSession) -> [String] {
+    private func systemMessages(in session: AgentTabSession) -> [String] {
         session.items.filter { $0.kind == .system }.map(\.text)
     }
 

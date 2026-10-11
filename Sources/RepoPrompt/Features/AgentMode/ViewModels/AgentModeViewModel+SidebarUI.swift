@@ -227,7 +227,7 @@ extension AgentModeViewModel {
     // 4. Tab close / stash cleanup calls `cleanupSidebarRunAttention(tabIDs:)`
     //    so we don't keep stale entries for tabs that no longer exist.
 
-    func observeSidebarRunStateTransition(for session: TabSession) {
+    func observeSidebarRunStateTransition(for session: AgentTabSession) {
         let tabID = session.tabID
         let newState = session.runState
         let oldState = sidebarObservedRunStateByTabID[tabID]

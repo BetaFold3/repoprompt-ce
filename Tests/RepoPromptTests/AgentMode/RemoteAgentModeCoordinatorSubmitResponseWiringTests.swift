@@ -241,7 +241,7 @@ final class RemoteAgentModeCoordinatorSubmitResponseWiringTests: XCTestCase {
     private struct SubmitResponseFixture {
         let tabID: UUID
         let viewModel: AgentModeViewModel
-        let session: AgentModeViewModel.TabSession
+        let session: AgentTabSession
         let coordinator: RemoteAgentModeCoordinator
     }
 }

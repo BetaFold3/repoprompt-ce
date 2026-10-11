@@ -462,7 +462,7 @@ extension AgentModeRunServiceLifecycleTests {
             effortService.setClaudeEffortLevel(previousEffort, forModelRaw: model, agentKind: .claudeCode)
         }
 
-        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        let session = AgentTabSession(tabID: UUID())
         session.selectedAgent = .claudeCode
         session.selectedModelRaw = model
         session.permissionProfile = profile
@@ -623,7 +623,7 @@ extension AgentModeRunServiceLifecycleTests {
             effortService.setClaudeEffortLevel(previousEffort, forModelRaw: model, agentKind: .claudeCode)
         }
 
-        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        let session = AgentTabSession(tabID: UUID())
         session.selectedAgent = .claudeCode
         session.selectedModelRaw = model
         session.permissionProfile = .providerOverride(.claude(.auto))
@@ -2171,7 +2171,7 @@ extension AgentModeRunServiceLifecycleTests {
             emittedAssistantTextOnSend: "replacement answer"
         )
         var factoryRunIDs: [UUID] = []
-        var transcriptSession: AgentModeViewModel.TabSession?
+        var transcriptSession: AgentTabSession?
         var observedAttemptIDs: [UUID?] = []
         let harness = makeHarness(
             recorder: recorder,
@@ -2190,7 +2190,7 @@ extension AgentModeRunServiceLifecycleTests {
             },
             autoSignalACPRouting: true
         )
-        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        let session = AgentTabSession(tabID: UUID())
         session.selectedAgent = .claudeCode
         session.providerSessionID = "provider-session-to-resume"
         session.appendItem(.user("prior request", sequenceIndex: session.nextSequenceIndex))
@@ -2577,7 +2577,7 @@ extension AgentModeRunServiceLifecycleTests {
         harness: LifecycleHarness,
         controller: LifecycleFakeNativeController,
         model: String
-    ) async -> AgentModeViewModel.TabSession {
+    ) async -> AgentTabSession {
         let session = makeRunningClaudeSession(controller: controller)
         session.claudeController = nil
         session.selectedModelRaw = model
@@ -2620,7 +2620,7 @@ extension AgentModeRunServiceLifecycleTests {
     }
 
     private func setClaudeControllerLaunchSettings(
-        for session: AgentModeViewModel.TabSession,
+        for session: AgentTabSession,
         coordinator: ClaudeAgentModeCoordinator,
         workspacePath: String? = URL(
             fileURLWithPath: FileManager.default.currentDirectoryPath

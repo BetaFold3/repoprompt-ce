@@ -161,7 +161,7 @@ final class CodexAgentModeCoordinatorHiddenToolBoundaryTests: XCTestCase {
         in viewModel: AgentModeViewModel,
         controller: HiddenToolBoundaryFakeCodexController,
         runID: UUID = UUID()
-    ) -> AgentModeViewModel.TabSession? {
+    ) -> AgentTabSession? {
         guard let session = viewModel.session(for: UUID(), createIfNeeded: true) else {
             XCTFail("Expected the Codex test session to materialize")
             return nil
@@ -190,7 +190,7 @@ final class CodexAgentModeCoordinatorHiddenToolBoundaryTests: XCTestCase {
         return session
     }
 
-    private func assistantTexts(in session: AgentModeViewModel.TabSession) -> [String] {
+    private func assistantTexts(in session: AgentTabSession) -> [String] {
         session.items.filter { $0.kind == .assistant }.map(\.text)
     }
 }

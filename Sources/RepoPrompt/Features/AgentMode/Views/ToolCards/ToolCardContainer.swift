@@ -13,7 +13,7 @@ func performAgentToolCardExpansionStateUpdateWithoutAnimation(_ update: () -> Vo
 extension EnvironmentValues {
     @Entry var agentToolCardAutoExpandEnabled: Bool = true
 
-    @Entry var agentLiveBashExecutionByItemID: [UUID: AgentModeViewModel.BashLiveExecutionState] = [:]
+    @Entry var agentLiveBashExecutionByItemID: [UUID: AgentBashLiveExecutionState] = [:]
 
     @Entry var agentRecentAssistantItemIDs: Set<UUID> = []
 

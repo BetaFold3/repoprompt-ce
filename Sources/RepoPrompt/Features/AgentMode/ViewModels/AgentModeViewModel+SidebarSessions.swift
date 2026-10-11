@@ -644,7 +644,7 @@ extension AgentModeViewModel {
     func pickUpRemoteWorkspaceSession(
         _ descriptor: RemoteAgentSessionDescriptor,
         hostRecord: PairedHostRecord
-    ) async -> TabSession? {
+    ) async -> AgentTabSession? {
         let session = await remoteCoordinator.pickUpWorkspaceSession(
             descriptor: descriptor,
             hostRecord: hostRecord

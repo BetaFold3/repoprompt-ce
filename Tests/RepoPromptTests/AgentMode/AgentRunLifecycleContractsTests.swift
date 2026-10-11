@@ -141,7 +141,7 @@ final class AgentRunLifecycleContractsTests: XCTestCase {
 
     @MainActor
     func testSessionLivenessDoesNotCreateTranscriptOrContextBuilderLogRows() {
-        let agentSession = AgentModeViewModel.TabSession(tabID: UUID())
+        let agentSession = AgentTabSession(tabID: UUID())
         let agentOwnership = agentSession.beginRunAttempt(source: "test")
         agentSession.recordRunProgress(
             ownership: agentOwnership,

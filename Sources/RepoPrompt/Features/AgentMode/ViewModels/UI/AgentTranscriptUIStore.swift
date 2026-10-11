@@ -8,9 +8,9 @@ struct AgentTranscriptUISnapshot: Equatable {
     var presentationRevision: Int
     var followBindingState: AgentModeViewModel.ActiveTranscriptFollowBindingState
     var activeSessionLoadInProgressTabID: UUID?
-    var activeBashLiveExecutionByItemID: [UUID: AgentModeViewModel.BashLiveExecutionState]
+    var activeBashLiveExecutionByItemID: [UUID: AgentBashLiveExecutionState]
     var runtimeFooterByItemID: [UUID: AgentMessageRuntimeFooter]
-    var fallbackFollowArmingState: AgentModeViewModel.AgentTranscriptAutoFollowArmingState
+    var fallbackFollowArmingState: AgentTranscriptAutoFollowArmingState
     var archivedBlocks: [AgentTranscriptRenderBlock]
 
     static let empty = AgentTranscriptUISnapshot(

@@ -813,7 +813,7 @@ final class AgentStaleResetOwnershipTests: XCTestCase {
         let originalSessionID = try XCTUnwrap(original.activeAgentSessionID)
 
         // While the operation's teardown is held, the tab's owner object is replaced.
-        let replacement = AgentModeViewModel.TabSession(tabID: tabID)
+        let replacement = AgentTabSession(tabID: tabID)
         viewModel.test_composeTabsWillCloseBeforeFinalSaveHook = { [viewModel, replacement] held in
             guard held.tabID == tabID else { return }
             viewModel.test_installLiveSession(replacement)
@@ -899,7 +899,7 @@ final class AgentStaleResetOwnershipTests: XCTestCase {
 
         await fixture.promptManager.closeComposeTab(tabID)
         XCTAssertNil(viewModel.sessions[tabID])
-        let replacement = AgentModeViewModel.TabSession(tabID: tabID)
+        let replacement = AgentTabSession(tabID: tabID)
         replacement.autoEditEnabled = false
         viewModel.test_installLiveSession(replacement)
         XCTAssertTrue(viewModel.session(for: tabID, createIfNeeded: false) === replacement)
@@ -1094,7 +1094,7 @@ final class AgentStaleResetOwnershipTests: XCTestCase {
 
         // The preflight's discovery save for the dirty target is suspended; the tab's owner is
         // replaced meanwhile (no reservation exists yet).
-        let replacement = AgentModeViewModel.TabSession(tabID: tabID)
+        let replacement = AgentTabSession(tabID: tabID)
         let holds = DiscardRequestRecorder()
         viewModel.test_saveSessionBeforeWriteHook = { [viewModel, replacement, holds] held in
             guard held === original, holds.requests.isEmpty else { return }
@@ -1169,7 +1169,7 @@ final class AgentStaleResetOwnershipTests: XCTestCase {
 
         // While the operation is suspended in early teardown, the owner is replaced by a session
         // with an active run.
-        let replacement = AgentModeViewModel.TabSession(tabID: tabID)
+        let replacement = AgentTabSession(tabID: tabID)
         let replacementRunID = UUID()
         viewModel.test_composeTabRemovalEarlyTeardownHook = { [viewModel, replacement] held in
             guard held === original else { return }
@@ -1570,7 +1570,7 @@ final class AgentStaleResetOwnershipTests: XCTestCase {
         let workspace: WorkspaceModel
         let storageURL: URL
         let tabID: UUID
-        let session: AgentModeViewModel.TabSession
+        let session: AgentTabSession
 
         struct MissingPersistedSession: Error {}
 

@@ -4,7 +4,7 @@ import RepoPromptAgentCore
 
 struct AgentExecutionLocationProps: Equatable {
     let tabID: UUID
-    let selection: AgentModeViewModel.InitialStartLocation
+    let selection: AgentInitialStartLocation
     let indicator: AgentWorktreeIndicator?
     let isInitialSelection: Bool
     let isEnabled: Bool
@@ -29,7 +29,7 @@ struct AgentStatusPillsSnapshot: Equatable {
     let stagedSlashCommand: AgentStagedSlashCommandProps?
     let selectedAgent: AgentProviderKind
     let profile: AgentSessionProfile
-    let autoEditPermissionGuidance: AgentModeViewModel.AutoEditPermissionGuidance?
+    let autoEditPermissionGuidance: AgentAutoEditPermissionGuidance?
     let runState: AgentSessionRunState
     let autoEditEnabled: Bool
     let interviewFirst: Bool

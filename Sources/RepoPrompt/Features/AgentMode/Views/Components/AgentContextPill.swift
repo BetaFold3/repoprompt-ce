@@ -70,7 +70,7 @@ struct AgentContextPill: View {
 
     /// Provider usage (CH share / provider-estimated cost) is a separate readout from context
     /// occupancy: it shares no denominator with the wheel and never feeds ratio math.
-    private var providerUsagePresentation: AgentRuntimeSidebarViewModel.ProviderUsageSnapshot.Presentation {
+    private var providerUsagePresentation: AgentProviderUsageSnapshot.Presentation {
         runtimeVM.snapshot.providerUsage.presentation
     }
 

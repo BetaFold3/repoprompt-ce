@@ -391,8 +391,8 @@ extension ACPAgentSessionControllerModeConfigTests {
     @MainActor
     func testOhMyPiTabsAndModelDestinationsRemainIndependent() {
         let wireID = "google-antigravity/shared-model"
-        let firstTab = AgentModeViewModel.TabSession(tabID: UUID())
-        let secondTab = AgentModeViewModel.TabSession(tabID: UUID())
+        let firstTab = AgentTabSession(tabID: UUID())
+        let secondTab = AgentTabSession(tabID: UUID())
         firstTab.selectedAgent = .ohMyPi
         secondTab.selectedAgent = .ohMyPi
         firstTab.selectedModelRaw = wireID

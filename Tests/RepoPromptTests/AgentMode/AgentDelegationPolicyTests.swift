@@ -1207,7 +1207,7 @@ final class AgentDelegationPolicyTests: XCTestCase {
     private struct LiveSession {
         let tabID: UUID
         let sessionID: UUID
-        let session: AgentModeViewModel.TabSession
+        let session: AgentTabSession
     }
 
     private func resolve(_ sessionID: UUID, _ parents: [UUID: Policy.ParentLookup]) -> Policy.LineageResolution {
@@ -1242,7 +1242,7 @@ final class AgentDelegationPolicyTests: XCTestCase {
         // Adopt while the record is still an untouched placeholder (before any control context).
         XCTAssertTrue(session.adoptSessionProfile(profile))
         if controlled, parent != nil || role != nil {
-            session.mcpControlContext = AgentModeViewModel.AgentMCPControlContext(
+            session.mcpControlContext = AgentMCPControlContext(
                 sessionID: sessionID,
                 activationID: UUID(),
                 registration: .init(sessionID: sessionID, generation: 0),

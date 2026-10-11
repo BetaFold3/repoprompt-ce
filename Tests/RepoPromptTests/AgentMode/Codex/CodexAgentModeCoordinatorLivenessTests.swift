@@ -1558,7 +1558,7 @@ final class CodexAgentModeCoordinatorLivenessTests: XCTestCase {
     }
 
     func testActiveCodexNativeSendFailsWithoutSendingWhenAgentRunDrainFails() async {
-        let blockers = MCPServerViewModel.AgentRunWaitDrainBlockers(
+        let blockers = AgentRunWaitDrainBlockers(
             childAgentRunWaitCount: 1,
             oldestChildAgentRunWaitAgeSeconds: 12,
             oracleInvocationCount: 0,
@@ -1590,7 +1590,7 @@ final class CodexAgentModeCoordinatorLivenessTests: XCTestCase {
     }
 
     func testActiveCodexNativeSendAttributesOracleOnlyDrainFailure() async {
-        let blockers = MCPServerViewModel.AgentRunWaitDrainBlockers(
+        let blockers = AgentRunWaitDrainBlockers(
             childAgentRunWaitCount: 0,
             oldestChildAgentRunWaitAgeSeconds: nil,
             oracleInvocationCount: 2,
@@ -1620,7 +1620,7 @@ final class CodexAgentModeCoordinatorLivenessTests: XCTestCase {
         XCTAssertTrue(controller.steerUserTurnIDsSync().isEmpty)
         XCTAssertEqual(session.runState, .running)
         XCTAssertEqual(
-            CodexAgentModeCoordinator.activeSendDrainFailureMessage(MCPServerViewModel.AgentRunWaitDrainBlockers(
+            CodexAgentModeCoordinator.activeSendDrainFailureMessage(AgentRunWaitDrainBlockers(
                 childAgentRunWaitCount: 2,
                 oldestChildAgentRunWaitAgeSeconds: 3,
                 oracleInvocationCount: 1,
@@ -1845,7 +1845,7 @@ final class CodexAgentModeCoordinatorLivenessTests: XCTestCase {
         XCTAssertEqual(session.usageAccounting?.codexUnmeasuredWorkCount, 1, "shutdown marks the still-open dispatched turn before the generation rotates")
         XCTAssertEqual(session.usageAccounting?.codexSessionCostEstimate?.coverage, .partial)
         XCTAssertNil(session.usageAccounting?.record?.semanticViolation)
-        let projection = AgentRuntimeSidebarViewModel.ProviderUsageSnapshot.projected(
+        let projection = AgentProviderUsageSnapshot.projected(
             selectedAgent: .codexExec,
             accounting: session.usageAccounting,
             expectedOwnerSessionID: session.activeAgentSessionID
@@ -1860,7 +1860,7 @@ final class CodexAgentModeCoordinatorLivenessTests: XCTestCase {
     /// Enables fixture-local Codex usage accounting without mutating the prepared run's persistent
     /// binding, with offline pricing and a fresh-thread origin for the generation the fixture
     /// pre-assigned its thread to (an existing thread would start prospectively).
-    private func enableCodexUsageAccounting(_ session: AgentModeViewModel.TabSession) {
+    private func enableCodexUsageAccounting(_ session: AgentTabSession) {
         // Install accounting directly so this focused fixture does not mutate the persistent binding
         // after `beginRunAttempt`; doing so would intentionally stale the run ownership under test.
         session.usageAccounting = AgentUsageAccumulator(
@@ -1889,7 +1889,7 @@ final class CodexAgentModeCoordinatorLivenessTests: XCTestCase {
 
     private func makeViewModel(
         controller: LivenessFakeCodexController,
-        drain: AgentModeViewModel.CodexAgentRunWaitDrain? = nil
+        drain: AgentCodexAgentRunWaitDrain? = nil
     ) -> AgentModeViewModel {
         let viewModel = AgentModeViewModel(
             codexControllerFactory: { _, _, _, _, _, _ in controller },
@@ -1906,7 +1906,7 @@ final class CodexAgentModeCoordinatorLivenessTests: XCTestCase {
         in viewModel: AgentModeViewModel,
         controller: LivenessFakeCodexController,
         runID: UUID = UUID()
-    ) -> AgentModeViewModel.TabSession? {
+    ) -> AgentTabSession? {
         guard let session = viewModel.session(for: UUID(), createIfNeeded: true) else {
             XCTFail("Expected the Codex test session to materialize")
             return nil

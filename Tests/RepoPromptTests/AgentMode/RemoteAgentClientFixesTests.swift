@@ -220,7 +220,7 @@ final class RemoteAgentClientFixesTests: XCTestCase {
             testWorkspacePath: FileManager.default.currentDirectoryPath,
             codexControllerFactory: { _, _, _, _, _, _ in ClientFixesNoopCodexController() }
         )
-        let session = AgentModeViewModel.TabSession(tabID: tabID)
+        let session = AgentTabSession(tabID: tabID)
         viewModel.test_installLiveSession(session)
         _ = viewModel.test_installPersistentSessionBinding(sessionID: sessionID, on: session)
 
@@ -322,7 +322,7 @@ final class RemoteAgentClientFixesTests: XCTestCase {
             codexControllerFactory: { _, _, _, _, _, _ in ClientFixesNoopCodexController() },
             testRemoteCoordinator: coordinator
         )
-        let session = AgentModeViewModel.TabSession(tabID: tabID)
+        let session = AgentTabSession(tabID: tabID)
         viewModel.test_installLiveSession(session)
         _ = viewModel.test_installPersistentSessionBinding(sessionID: sessionID, on: session)
 
@@ -459,7 +459,7 @@ final class RemoteAgentClientFixesTests: XCTestCase {
             codexControllerFactory: { _, _, _, _, _, _ in ClientFixesNoopCodexController() },
             testRemoteCoordinator: coordinator
         )
-        let session = AgentModeViewModel.TabSession(tabID: tabID)
+        let session = AgentTabSession(tabID: tabID)
         viewModel.test_installLiveSession(session)
         _ = viewModel.test_installPersistentSessionBinding(sessionID: sessionID, on: session)
         let didApplyHydration = await viewModel.test_applyPersistedHydration(payload, to: session)
@@ -560,7 +560,7 @@ final class RemoteAgentClientFixesTests: XCTestCase {
             testWorkspacePath: FileManager.default.currentDirectoryPath,
             codexControllerFactory: { _, _, _, _, _, _ in ClientFixesNoopCodexController() }
         )
-        let session = AgentModeViewModel.TabSession(tabID: tabID)
+        let session = AgentTabSession(tabID: tabID)
         viewModel.test_installLiveSession(session)
         _ = viewModel.test_installPersistentSessionBinding(sessionID: sessionID, on: session)
 
@@ -1001,8 +1001,8 @@ final class RemoteAgentClientFixesTests: XCTestCase {
     }
 
     @MainActor
-    private func makeSession(remoteSessionID: String) -> AgentModeViewModel.TabSession {
-        let session = AgentModeViewModel.TabSession(tabID: UUID())
+    private func makeSession(remoteSessionID: String) -> AgentTabSession {
+        let session = AgentTabSession(tabID: UUID())
         session.remoteHost = Self.makeBinding(remoteSessionID: remoteSessionID)
         return session
     }
@@ -1109,7 +1109,7 @@ final class RemoteAgentClientFixesTests: XCTestCase {
     private struct RemoteMetadataFixture {
         let tabID: UUID
         let viewModel: AgentModeViewModel
-        let session: AgentModeViewModel.TabSession
+        let session: AgentTabSession
         let coordinator: RemoteAgentModeCoordinator
     }
 

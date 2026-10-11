@@ -130,7 +130,7 @@ final class AgentRunMCPToolServiceWaitTests: XCTestCase {
             for installsSuccessor in [false, true] {
                 let tabID = UUID()
                 let sessionID = UUID()
-                let session = AgentModeViewModel.TabSession(tabID: tabID)
+                let session = AgentTabSession(tabID: tabID)
                 session.testInstallPersistentSessionBinding(sessionID: sessionID)
                 viewModel.test_installLiveSession(session)
                 let target = AgentModeViewModel.MCPSessionTarget(
@@ -141,7 +141,7 @@ final class AgentRunMCPToolServiceWaitTests: XCTestCase {
                 let oldGenerationID = UUID()
                 session.mcpStartInvocationGenerationID = oldGenerationID
                 var successorGenerationID: UUID?
-                var successorControlContext: AgentModeViewModel.AgentMCPControlContext?
+                var successorControlContext: AgentMCPControlContext?
 
                 do {
                     _ = try await AgentExternalMCPRunStarter.start(
@@ -226,7 +226,7 @@ final class AgentRunMCPToolServiceWaitTests: XCTestCase {
             let viewModel = window.agentModeViewModel
             let tabID = UUID()
             let sessionID = UUID()
-            let session = AgentModeViewModel.TabSession(tabID: tabID)
+            let session = AgentTabSession(tabID: tabID)
             session.testInstallPersistentSessionBinding(sessionID: sessionID)
             viewModel.test_installLiveSession(session)
             let target = AgentModeViewModel.MCPSessionTarget(
@@ -253,7 +253,7 @@ final class AgentRunMCPToolServiceWaitTests: XCTestCase {
             session.mcpStartInvocationGenerationID = oldContext.generationID
             session.ompQualificationStartContext = oldContext
 
-            var activatedControlContext: AgentModeViewModel.AgentMCPControlContext?
+            var activatedControlContext: AgentMCPControlContext?
             var successorContext: OhMyPiAgentModeSmokeGate.StartContext?
             do {
                 _ = try await OhMyPiAgentModeSmokeGate.$invocationStartContext.withValue(oldContext) {
@@ -319,7 +319,7 @@ final class AgentRunMCPToolServiceWaitTests: XCTestCase {
             let viewModel = window.agentModeViewModel
             let tabID = UUID()
             let sessionID = UUID()
-            let session = AgentModeViewModel.TabSession(tabID: tabID)
+            let session = AgentTabSession(tabID: tabID)
             session.testInstallPersistentSessionBinding(sessionID: sessionID)
             viewModel.test_installLiveSession(session)
             let target = AgentModeViewModel.MCPSessionTarget(
@@ -560,7 +560,7 @@ final class AgentRunMCPToolServiceWaitTests: XCTestCase {
         let tabID = try XCTUnwrap(activeWorkspace.activeComposeTabID)
         window.apiSettingsViewModel.isOhMyPiConnected = true
         let viewModel = makeViewModel(windowID: window.windowID)
-        let session = AgentModeViewModel.TabSession(tabID: tabID)
+        let session = AgentTabSession(tabID: tabID)
         session.selectedAgent = .ohMyPi
         viewModel.test_installLiveSession(session)
         var providerDispatchCount = 0
@@ -1322,7 +1322,7 @@ final class AgentRunMCPToolServiceWaitTests: XCTestCase {
             var providerDispatchCount = 0
             var replacementLease: OhMyPiAgentModeSmokeGate.Snapshot?
             var replacementContext: OhMyPiAgentModeSmokeGate.StartContext?
-            var replacementSession: AgentModeViewModel.TabSession?
+            var replacementSession: AgentTabSession?
             let viewModel = makeViewModel(windowID: window.windowID)
             let liveSnapshots = LiveSnapshots()
             let recorder = WaitScopeRecorder()
@@ -1446,7 +1446,7 @@ final class AgentRunMCPToolServiceWaitTests: XCTestCase {
             let viewModel = makeViewModel(windowID: window.windowID)
             let liveSnapshots = LiveSnapshots()
             let recorder = WaitScopeRecorder()
-            var pausedSession: AgentModeViewModel.TabSession?
+            var pausedSession: AgentTabSession?
             var paused = false
             var resumeContinuation: CheckedContinuation<Void, Never>?
             var terminalCategories: [String] = []
@@ -1665,7 +1665,7 @@ final class AgentRunMCPToolServiceWaitTests: XCTestCase {
             let viewModel = makeViewModel(windowID: window.windowID)
             var terminalCategories: [String] = []
             var replacementSnapshot: OhMyPiAgentModeSmokeGate.Snapshot?
-            var successorSession: AgentModeViewModel.TabSession?
+            var successorSession: AgentTabSession?
             var successorContext: OhMyPiAgentModeSmokeGate.StartContext?
             var successorController: ACPAgentSessionController?
             var successorItems: [AgentChatItem] = []
@@ -1913,7 +1913,7 @@ final class AgentRunMCPToolServiceWaitTests: XCTestCase {
             let successorRunID = UUID()
             var providerDispatchCount = 0
             var terminalCategories: [String] = []
-            var authorizedSession: AgentModeViewModel.TabSession?
+            var authorizedSession: AgentTabSession?
             let liveSnapshots = LiveSnapshots()
             let recorder = WaitScopeRecorder()
             var service = makeService(
@@ -2327,7 +2327,7 @@ final class AgentRunMCPToolServiceWaitTests: XCTestCase {
 
             let liveSnapshots = LiveSnapshots()
             let runID = UUID()
-            var startedSession: AgentModeViewModel.TabSession?
+            var startedSession: AgentTabSession?
             var waitCursor: AgentRunSessionStore.WaitCursor?
             var waitingSnapshot: AgentRunMCPSnapshot?
             var service = AgentRunMCPToolService(
@@ -3868,7 +3868,7 @@ final class AgentRunMCPToolServiceWaitTests: XCTestCase {
 
 private struct RunningSessionFixture {
     let sessionID: UUID
-    let session: AgentModeViewModel.TabSession
+    let session: AgentTabSession
     let registration: AgentRunSessionStore.Registration
     let epoch: AgentRunTurnEpoch
     let cursor: AgentRunSessionStore.WaitCursor

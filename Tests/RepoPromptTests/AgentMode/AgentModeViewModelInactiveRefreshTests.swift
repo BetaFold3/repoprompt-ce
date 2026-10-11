@@ -701,7 +701,7 @@ final class AgentModeViewModelInactiveRefreshTests: XCTestCase {
         ])
         viewModel.workspaceManager = manager
 
-        let conflictingSession = AgentModeViewModel.TabSession(tabID: authoritativeTabID)
+        let conflictingSession = AgentTabSession(tabID: authoritativeTabID)
         XCTAssertNil(viewModel.test_ensureSessionBoundToTab(conflictingSession))
         XCTAssertNil(conflictingSession.activeAgentSessionID)
         XCTAssertEqual(
@@ -709,11 +709,11 @@ final class AgentModeViewModelInactiveRefreshTests: XCTestCase {
             authoritativeSessionID
         )
 
-        let missingTabSession = AgentModeViewModel.TabSession(tabID: UUID())
+        let missingTabSession = AgentTabSession(tabID: UUID())
         XCTAssertNil(viewModel.test_ensureSessionBoundToTab(missingTabSession))
         XCTAssertNil(missingTabSession.activeAgentSessionID)
 
-        let installableSession = AgentModeViewModel.TabSession(tabID: installableTabID)
+        let installableSession = AgentTabSession(tabID: installableTabID)
         let installedSessionID = try XCTUnwrap(
             viewModel.test_ensureSessionBoundToTab(installableSession)
         )

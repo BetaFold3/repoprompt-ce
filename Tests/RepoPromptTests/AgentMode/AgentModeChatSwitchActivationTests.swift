@@ -1542,7 +1542,7 @@ final class AgentModeChatSwitchActivationTests: XCTestCase {
         _ presentation: AgentTranscriptPresentationSnapshot,
         tabID: UUID,
         sessionID: UUID,
-        session: AgentModeViewModel.TabSession,
+        session: AgentTabSession,
         expectedTexts: [String],
         file: StaticString = #filePath,
         line: UInt = #line
@@ -1569,8 +1569,8 @@ final class AgentModeChatSwitchActivationTests: XCTestCase {
         let tabBID: UUID
         let sessionAID: UUID
         let sessionBID: UUID
-        let sessionA: AgentModeViewModel.TabSession
-        let sessionB: AgentModeViewModel.TabSession
+        let sessionA: AgentTabSession
+        let sessionB: AgentTabSession
         let tabATexts: [String]
         let tabBTexts: [String]
     }

@@ -309,7 +309,7 @@ final class AgentChatTitlebarSafetyTests: XCTestCase {
         let tabAID: UUID
         let tabBID: UUID
         let sessionAID: UUID
-        let sessionA: AgentModeViewModel.TabSession
+        let sessionA: AgentTabSession
 
         @MainActor
         func tab(_ id: UUID) -> ComposeTabState? {

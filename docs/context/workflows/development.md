@@ -49,11 +49,11 @@ Cheap levers are exhausted:
 - There is no bridging PCH to tune: the Objective-C bridging header is retired, and C code is reached through module imports.
 - `make dev-test-parallel WORKERS=1` is slower than `make dev-test` for a focused edit loop: about 30.8 s vs 23.9 s, and 9.7 s vs 2.2 s null. It still runs the helper via `swift test list`, and it re-plans SwiftPM in both its build and list steps. Running `make dev-test` right after it costs one re-plan (about 4 s); nothing recompiles.
 
-Extraction is blocked by coupling. A name-reference inventory found one file-level dependency cycle covering about 561 files and 457k lines, about two-thirds of the app, spanning AgentMode, AI, MCP, WorkspaceContext, VCS, App, Settings and others.
+At the time, extraction was blocked by coupling. A name-reference inventory found one file-level dependency cycle covering about 561 files and 457k lines, about two-thirds of the app, spanning AgentMode, AI, MCP, WorkspaceContext, VCS, App, Settings and others.
 - Neither `Infrastructure/AI` nor `Features/AgentMode` can be extracted mechanically. `AgentProviderKind`, for example, is declared in AgentMode but used throughout AI.
 - Only small leaf areas such as `Infrastructure/AI/Prompts` and `Infrastructure/AI/Pricing` are separable, and they offer little build-time gain.
 
-Revisit a split only as deliberate architecture work that first breaks that cycle. Raw evidence stays local under `.agent-artifacts/swift-compile-time/`. That architecture work is now directed by the [RepoPromptApp module split contract](../plans/2026-10-10-app-module-split-contract.md); it expects no build-speed or runtime-speed gain.
+That cycle was later broken as deliberate architecture work: the app is now split into the Platform, Workspace, AgentCore, UI and App targets described in [source layout](../../architecture/source-layout.md), with no expected build-speed or runtime-speed gain. Raw evidence stays local under `.agent-artifacts/swift-compile-time/`.
 
 ### Parallel source-validating root tests
 

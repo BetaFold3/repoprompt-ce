@@ -161,7 +161,7 @@ final class AgentManageMCPToolServiceForkTests: XCTestCase {
     private func destinationSession(
         from value: Value,
         fixture: Fixture
-    ) throws -> AgentModeViewModel.TabSession {
+    ) throws -> AgentTabSession {
         let sessionIDRaw = try XCTUnwrap(value.objectValue?["session"]?.objectValue?["session_id"]?.stringValue)
         let sessionID = try XCTUnwrap(UUID(uuidString: sessionIDRaw))
         return try XCTUnwrap(fixture.viewModel.sessions.values.first { $0.activeAgentSessionID == sessionID })
@@ -359,7 +359,7 @@ final class AgentManageMCPToolServiceForkTests: XCTestCase {
         let viewModel: AgentModeViewModel
         let service: AgentManageMCPToolService
         let sourceSessionID: UUID
-        let sourceSession: AgentModeViewModel.TabSession
+        let sourceSession: AgentTabSession
         let sourceTexts: [String]
         let destination: Destination
     }

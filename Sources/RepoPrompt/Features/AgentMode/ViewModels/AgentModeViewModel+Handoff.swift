@@ -267,7 +267,7 @@ extension AgentModeViewModel {
         identity: ObjectIdentifier,
         hostID: String?,
         remoteSessionID: String?
-    ) throws -> TabSession {
+    ) throws -> AgentTabSession {
         guard let session = sessions[tabID],
               ObjectIdentifier(session) == identity,
               session.remoteHost?.hostID == hostID,

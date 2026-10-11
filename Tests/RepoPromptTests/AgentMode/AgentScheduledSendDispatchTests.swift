@@ -780,7 +780,7 @@ final class AgentScheduledSendDispatchTests: XCTestCase {
         // A second window in the same process hydrates the same session mid-dispatch.
         let other = try await makeHarness(windowID: 4309, workspace: owner.workspace, storageURL: owner.storageURL)
         other.viewModel.attachScheduledSendCoordinator(coordinator)
-        let otherSession = AgentModeViewModel.TabSession(tabID: UUID())
+        let otherSession = AgentTabSession(tabID: UUID())
         other.viewModel.installHydratedScheduledSend(from: diskDuringDispatch, into: otherSession)
         XCTAssertEqual(
             otherSession.pendingScheduledSendRecord?.state,
@@ -815,7 +815,7 @@ final class AgentScheduledSendDispatchTests: XCTestCase {
         dispatching.attempt = AgentScheduledSendPersist.Attempt(attemptID: UUID(), itemID: itemID, startedAt: Date())
         let persisted = AgentSession(id: UUID(), name: "Restart", scheduledSend: .v1(dispatching))
 
-        let sessionWithItem = AgentModeViewModel.TabSession(tabID: UUID())
+        let sessionWithItem = AgentTabSession(tabID: UUID())
         sessionWithItem.appendItem(.user("maybe sent", id: itemID))
         harness.viewModel.installHydratedScheduledSend(from: persisted, into: sessionWithItem)
         let withItem = try XCTUnwrap(sessionWithItem.pendingScheduledSendRecord)
@@ -828,7 +828,7 @@ final class AgentScheduledSendDispatchTests: XCTestCase {
         XCTAssertEqual(props.status, .needsConfirmation(.deliveryUnknown))
         XCTAssertEqual(props.recoveryMessage, withItem.lastFailureMessage, "The banner receives the duplicate warning")
 
-        let sessionWithoutItem = AgentModeViewModel.TabSession(tabID: UUID())
+        let sessionWithoutItem = AgentTabSession(tabID: UUID())
         harness.viewModel.installHydratedScheduledSend(from: persisted, into: sessionWithoutItem)
         let withoutItem = try XCTUnwrap(sessionWithoutItem.pendingScheduledSendRecord)
         XCTAssertEqual(withoutItem.state, .needsConfirmation)
@@ -848,13 +848,13 @@ final class AgentScheduledSendDispatchTests: XCTestCase {
             scheduledSend: .v1(scheduled),
             lastScheduledDispatch: provenance
         )
-        let deliveredSession = AgentModeViewModel.TabSession(tabID: UUID())
+        let deliveredSession = AgentTabSession(tabID: UUID())
         harness.viewModel.installHydratedScheduledSend(from: delivered, into: deliveredSession)
         XCTAssertNil(deliveredSession.scheduledSend, "A record already recorded as provenance is dropped")
         XCTAssertEqual(deliveredSession.lastScheduledDispatch, provenance)
 
         let intact = AgentSession(id: UUID(), name: "Intact", scheduledSend: .v1(scheduled))
-        let intactSession = AgentModeViewModel.TabSession(tabID: UUID())
+        let intactSession = AgentTabSession(tabID: UUID())
         harness.viewModel.installHydratedScheduledSend(from: intact, into: intactSession)
         XCTAssertEqual(intactSession.pendingScheduledSendRecord, scheduled)
         XCTAssertEqual(intactSession.scheduledSendPersistedUpdatedAt, scheduled.updatedAt)
@@ -2774,7 +2774,7 @@ final class AgentScheduledSendDispatchTests: XCTestCase {
         let workspace: WorkspaceModel
         let storageURL: URL
         let tabID: UUID
-        let session: AgentModeViewModel.TabSession
+        let session: AgentTabSession
 
         struct MissingPersistedSession: Error {}
 

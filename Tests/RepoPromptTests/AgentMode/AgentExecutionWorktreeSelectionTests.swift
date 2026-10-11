@@ -52,8 +52,8 @@ final class AgentExecutionWorktreeSelectionTests: XCTestCase {
         lockReason: String? = nil,
         isPrunable: Bool = false,
         prunableReason: String? = nil
-    ) -> AgentModeViewModel.AgentExecutionWorktreeSelection {
-        AgentModeViewModel.AgentExecutionWorktreeSelection(
+    ) -> AgentExecutionWorktreeSelection {
+        AgentExecutionWorktreeSelection(
             repositoryID: repositoryID,
             repoKey: repoKey,
             worktreeID: worktreeID,

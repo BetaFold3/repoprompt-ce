@@ -95,7 +95,7 @@ extension ModelDestination {
 // MARK: - Agent Tab Destination
 
 extension ModelDestination {
-    static func agentTab(_ session: AgentModeViewModel.TabSession) -> ModelDestination {
+    static func agentTab(_ session: AgentTabSession) -> ModelDestination {
         ModelDestination(
             id: "agentTab.\(session.tabID.uuidString)",
             getter: { session.selectedModelRaw },

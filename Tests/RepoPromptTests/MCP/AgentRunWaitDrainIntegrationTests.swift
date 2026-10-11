@@ -394,7 +394,7 @@ final class AgentRunWaitDrainTestHarness {
     func drain(
         source: String,
         timeoutSeconds: TimeInterval = 1
-    ) async -> MCPServerViewModel.AgentRunWaitDrainOutcome {
+    ) async -> AgentRunWaitDrainOutcome {
         await server.wakeAndDrainAgentRunWaitersOwnedByActiveRun(
             runID: parentRunID,
             source: source,

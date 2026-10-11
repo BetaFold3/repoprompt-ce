@@ -31,7 +31,7 @@
             includeInvocationID: Bool
         ) throws -> MCPToolObserverAttribution {
             let viewModel = makeViewModel()
-            let session = AgentModeViewModel.TabSession(tabID: UUID())
+            let session = AgentTabSession(tabID: UUID())
             var items: [AgentChatItem] = []
             items.reserveCapacity(priorTurnCount * 2 + 2)
             var sequenceIndex = 0
@@ -326,7 +326,7 @@
             @MainActor
             private func runCrawlRefreshBenchmarkSample(
                 viewModel: AgentModeViewModel,
-                session: AgentModeViewModel.TabSession,
+                session: AgentTabSession,
                 seed: CrawlRefreshSeed,
                 expectedItemCount: Int,
                 ordinal: Int,
@@ -512,7 +512,7 @@
             }
 
             @MainActor
-            private func ephemeralPayloadBytes(in session: AgentModeViewModel.TabSession) -> Int {
+            private func ephemeralPayloadBytes(in session: AgentTabSession) -> Int {
                 session.ephemeralToolResultPayloadByItemID.values.reduce(0) { $0 + $1.utf8.count }
             }
 

@@ -185,7 +185,7 @@ final class ClaudeCompactionRunningStatusTests: XCTestCase {
 
     private struct Harness {
         let viewModel: AgentModeViewModel
-        let session: AgentModeViewModel.TabSession
+        let session: AgentTabSession
         let runID: UUID
         let runAttemptID: UUID
         /// The session-owned apply_edits approval setup task, held at the store's initial-setup hook.

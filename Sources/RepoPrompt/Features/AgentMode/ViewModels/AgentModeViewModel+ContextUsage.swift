@@ -12,26 +12,26 @@ extension AgentModeViewModel {
         }
     }
 
-    func applyCodexNativeContextUsage(_ usage: AgentContextUsage, session: TabSession) {
+    func applyCodexNativeContextUsage(_ usage: AgentContextUsage, session: AgentTabSession) {
         session.codexContextUsage = usage
         _ = codexContextUsageEstimator.ingestNativeContextUsage(usage, session: session)
     }
 
-    func refreshCodexContextUsageSnapshot(for session: TabSession) {
+    func refreshCodexContextUsageSnapshot(for session: AgentTabSession) {
         _ = codexContextUsageEstimator.ingestNativeContextUsage(session.codexContextUsage, session: session)
     }
 
-    func clearContextUsageSnapshot(for session: TabSession) {
+    func clearContextUsageSnapshot(for session: AgentTabSession) {
         session.contextUsageSnapshot = nil
         session.contextCompactedAt = nil
     }
 
-    func dequeuePendingNonCodexUserTokens(for session: TabSession) -> Int? {
+    func dequeuePendingNonCodexUserTokens(for session: AgentTabSession) -> Int? {
         guard !session.pendingNonCodexUserInputTokenQueue.isEmpty else { return nil }
         return session.pendingNonCodexUserInputTokenQueue.removeFirst()
     }
 
-    func startNonCodexTurnAccountingIfNeeded(for session: TabSession, initialMessage: String) {
+    func startNonCodexTurnAccountingIfNeeded(for session: AgentTabSession, initialMessage: String) {
         guard let estimator = nonCodexContextUsageEstimator(for: session.selectedAgent) else { return }
         if session.activeNonCodexTurnTokenAccumulator != nil {
             finalizeNonCodexTurnUsageIfNeeded(for: session, promptTokens: nil, completionTokens: nil, contextUsedTokens: nil)
@@ -39,23 +39,23 @@ extension AgentModeViewModel {
         estimator.beginTurn(session: session, initialMessage: initialMessage)
     }
 
-    func addUserInputTokensToActiveNonCodexTurn(_ tokens: Int, for session: TabSession) {
+    func addUserInputTokensToActiveNonCodexTurn(_ tokens: Int, for session: AgentTabSession) {
         guard let estimator = nonCodexContextUsageEstimator(for: session.selectedAgent) else { return }
         estimator.addUserInputTokens(tokens, session: session)
     }
 
-    func addToolInputTokens(_ payload: String?, for session: TabSession) {
+    func addToolInputTokens(_ payload: String?, for session: AgentTabSession) {
         guard let estimator = nonCodexContextUsageEstimator(for: session.selectedAgent) else { return }
         estimator.addToolInputPayload(payload, session: session)
     }
 
-    func addToolOutputTokens(_ payload: String?, for session: TabSession) {
+    func addToolOutputTokens(_ payload: String?, for session: AgentTabSession) {
         guard let estimator = nonCodexContextUsageEstimator(for: session.selectedAgent) else { return }
         estimator.addToolOutputPayload(payload, session: session)
     }
 
     func finalizeNonCodexTurnUsageIfNeeded(
-        for session: TabSession,
+        for session: AgentTabSession,
         promptTokens: Int?,
         completionTokens: Int?,
         contextUsedTokens: Int?

@@ -11,11 +11,11 @@
     @MainActor
     final class AgentToolCorrelationIndexTests: XCTestCase {
         func testIncrementalMutationAndFullReplacementKeepCorrelationIndexesAligned() throws {
-            let session = AgentModeViewModel.TabSession(tabID: UUID())
+            let session = AgentTabSession(tabID: UUID())
             let priorInvocationID = UUID()
             let activeInvocationID = UUID()
             let pendingArgs = #"{"path":"Sources/Active.swift"}"#
-            let pendingSignature = AgentModeViewModel.TabSession.canonicalToolInvocationSignature(
+            let pendingSignature = AgentTabSession.canonicalToolInvocationSignature(
                 toolName: "read_file",
                 argsJSON: pendingArgs
             )
@@ -76,7 +76,7 @@
         }
 
         func testActiveTurnPrefixRetentionPreservesToolCorrelationBoundary() {
-            let session = AgentModeViewModel.TabSession(tabID: UUID())
+            let session = AgentTabSession(tabID: UUID())
             let firstActiveInvocationID = UUID()
             let secondActiveInvocationID = UUID()
             session.setItemsSilently([
@@ -133,7 +133,7 @@
 
         func testRunningSteeringUserItemPreservesInFlightToolCorrelation() {
             let handler = ClaudeAgentToolTrackingHandler(mcpHost: ServerNetworkManager.shared)
-            let session = AgentModeViewModel.TabSession(tabID: UUID())
+            let session = AgentTabSession(tabID: UUID())
             let invocationID = UUID()
             session.setItemsSilently([
                 .user("active", sequenceIndex: 0),
@@ -168,7 +168,7 @@
 
         private func claudeCompletionAttribution(
             handler: ClaudeAgentToolTrackingHandler,
-            session: AgentModeViewModel.TabSession,
+            session: AgentTabSession,
             invocationID: UUID
         ) throws -> MCPToolObserverAttribution {
             let recorder = MCPToolObserverAttributionRecorder()
@@ -200,7 +200,7 @@
         }
 
         private func makeSession(priorTurnCount: Int) -> (
-            session: AgentModeViewModel.TabSession,
+            session: AgentTabSession,
             invocationID: UUID
         ) {
             var items: [AgentChatItem] = []
@@ -221,7 +221,7 @@
                 argsJSON: #"{"path":"Sources/Active.swift"}"#,
                 sequenceIndex: sequenceIndex
             ))
-            let session = AgentModeViewModel.TabSession(tabID: UUID())
+            let session = AgentTabSession(tabID: UUID())
             session.setItemsSilently(items, reason: .testOverride)
             return (session, invocationID)
         }

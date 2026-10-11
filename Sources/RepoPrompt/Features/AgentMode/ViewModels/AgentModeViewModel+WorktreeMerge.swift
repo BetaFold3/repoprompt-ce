@@ -529,7 +529,7 @@ extension AgentModeViewModel {
         )
     }
 
-    func cancelPendingWorktreeMergeReview(for session: TabSession, reason: String) {
+    func cancelPendingWorktreeMergeReview(for session: AgentTabSession, reason: String) {
         let operationID = session.pendingWorktreeMergeReview?.operationID
         guard let continuation = session.worktreeMergeReviewContinuation else {
             finishPendingWorktreeMergeReview(session: session)
@@ -547,7 +547,7 @@ extension AgentModeViewModel {
 
     private func requestWorktreeMergeReview(
         preview: GitWorktreeMergePreview,
-        session: TabSession,
+        session: AgentTabSession,
         timeoutSeconds: TimeInterval
     ) async -> WorktreeMergeReviewDecision {
         cancelPendingWorktreeMergeReview(for: session, reason: "Replaced by newer worktree merge review")
@@ -587,7 +587,7 @@ extension AgentModeViewModel {
         }
     }
 
-    private func finishPendingWorktreeMergeReview(session: TabSession) {
+    private func finishPendingWorktreeMergeReview(session: AgentTabSession) {
         session.worktreeMergeReviewTimeoutTask?.cancel()
         session.worktreeMergeReviewTimeoutTask = nil
         session.worktreeMergeReviewContinuation = nil
@@ -626,7 +626,7 @@ extension AgentModeViewModel {
         )
     }
 
-    private func worktreeMergeSession(sessionID: UUID) throws -> TabSession {
+    private func worktreeMergeSession(sessionID: UUID) throws -> AgentTabSession {
         guard let session = try authoritativeLiveSession(for: sessionID) else {
             throw MCPError.invalidParams("The requested agent session is not currently available.")
         }
@@ -635,7 +635,7 @@ extension AgentModeViewModel {
 
     private func worktreeMergeOperation(
         operationID: String,
-        in session: TabSession
+        in session: AgentTabSession
     ) throws -> AgentSessionWorktreeMergeOperation {
         guard let operation = session.worktreeMergeOperations.first(where: { $0.id == operationID }) else {
             throw MCPError.invalidParams("Unknown worktree merge operation_id: \(operationID)")
@@ -645,7 +645,7 @@ extension AgentModeViewModel {
 
     private func updateWorktreeMergeOperation(
         operationID: String,
-        in session: TabSession,
+        in session: AgentTabSession,
         mutate: (inout AgentSessionWorktreeMergeOperation) -> Void
     ) throws {
         try AgentWorktreeMergeCoordinator.update(
@@ -658,7 +658,7 @@ extension AgentModeViewModel {
 
     private func upsertWorktreeMergeOperation(
         _ operation: AgentSessionWorktreeMergeOperation,
-        in session: TabSession
+        in session: AgentTabSession
     ) {
         AgentWorktreeMergeCoordinator.upsert(operation, in: &session.worktreeMergeOperations)
         persistWorktreeMergeOperationsChange(in: session)
@@ -667,7 +667,7 @@ extension AgentModeViewModel {
     private func applyWorktreeMergeResult(
         _ result: GitWorktreeMergeApplyResult,
         operationID: String,
-        session: TabSession
+        session: AgentTabSession
     ) {
         try? updateWorktreeMergeOperation(operationID: operationID, in: session) { operation in
             AgentWorktreeMergeCoordinator.apply(result: result, to: &operation)
@@ -676,7 +676,7 @@ extension AgentModeViewModel {
 
     private func markWorktreeMergeOperationCancelled(
         operationID: String,
-        session: TabSession,
+        session: AgentTabSession,
         reason: String
     ) {
         try? updateWorktreeMergeOperation(operationID: operationID, in: session) { operation in
@@ -688,7 +688,7 @@ extension AgentModeViewModel {
 
     private func markWorktreeMergeOperationFailed(
         operationID: String,
-        session: TabSession,
+        session: AgentTabSession,
         error: Error
     ) {
         try? updateWorktreeMergeOperation(operationID: operationID, in: session) { operation in
@@ -698,7 +698,7 @@ extension AgentModeViewModel {
         }
     }
 
-    private func persistWorktreeMergeOperationsChange(in session: TabSession) {
+    private func persistWorktreeMergeOperationsChange(in session: AgentTabSession) {
         session.isDirty = true
         updateWorktreeMergeSummariesInIndex(for: session)
         syncSidebarUIState(refresh: true, reason: .metadataUpdated)
@@ -742,7 +742,7 @@ extension AgentModeViewModel {
     }
 
     private func refreshAfterWorktreeMergeMutation(
-        session: TabSession,
+        session: AgentTabSession,
         target: GitWorktreeMergeEndpoint
     ) async {
         await VCSService.shared.invalidateCache(for: target.url)

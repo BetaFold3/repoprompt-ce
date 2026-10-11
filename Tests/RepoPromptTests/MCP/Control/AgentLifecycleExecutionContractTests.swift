@@ -489,7 +489,7 @@ final class AgentLifecycleExecutionContractTests: XCTestCase {
 
     private func makeRegisteredSession(
         in window: WindowState
-    ) async throws -> AgentModeViewModel.TabSession {
+    ) async throws -> AgentTabSession {
         if window.workspaceManager.activeWorkspace == nil {
             let workspace = window.workspaceManager.createWorkspace(
                 name: "Lifecycle Contract \(UUID().uuidString.prefix(8))",

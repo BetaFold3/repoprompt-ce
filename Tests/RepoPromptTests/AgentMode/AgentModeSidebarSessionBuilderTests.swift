@@ -664,7 +664,7 @@ final class AgentModeSidebarSessionBuilderTests: XCTestCase {
 
     private func build(
         tabs: [ComposeTabState],
-        sessions: [UUID: AgentModeViewModel.TabSession] = [:],
+        sessions: [UUID: AgentTabSession] = [:],
         sessionIndex: [UUID: AgentSessionIndexEntry],
         delegatedQuestionAttention: [UUID: AgentDelegatedQuestionSidebarAttention] = [:]
     ) -> [AgentModeViewModel.SidebarSession] {
@@ -694,8 +694,8 @@ final class AgentModeSidebarSessionBuilderTests: XCTestCase {
         parentSessionID: UUID? = nil,
         lastUserMessageAt: Date?,
         hydrated: Bool = true
-    ) -> AgentModeViewModel.TabSession {
-        let session = AgentModeViewModel.TabSession(tabID: tabID)
+    ) -> AgentTabSession {
+        let session = AgentTabSession(tabID: tabID)
         session.testInstallPersistentSessionBinding(sessionID: sessionID)
         session.parentSessionID = parentSessionID
         session.hasLoadedPersistedState = hydrated

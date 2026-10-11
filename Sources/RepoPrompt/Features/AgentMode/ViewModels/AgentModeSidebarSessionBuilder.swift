@@ -5,7 +5,7 @@ import RepoPromptWorkspace
 @MainActor
 struct AgentModeSidebarSessionBuilder {
     typealias SidebarSession = AgentModeViewModel.SidebarSession
-    typealias TabSession = AgentModeViewModel.TabSession
+    typealias TabSession = AgentTabSession
 
     let allTabs: [ComposeTabState]
     let linkedTabs: [ComposeTabState]

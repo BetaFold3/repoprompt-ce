@@ -425,7 +425,7 @@ allowed_tracked_docs=(
   "docs/context/plans/2026-10-03-code-mode-readiness-and-git-narrowing-plan.md"
   "docs/context/plans/2026-10-05-transcript-inner-scroll-hang-fix-plan.md"
   "docs/context/plans/2026-10-09-oracle-call-contract-hardening-plan.md"
-  "docs/context/plans/2026-10-10-app-module-split-contract.md"
+  "docs/context/plans/completed/2026-10-10-app-module-split-contract.md"
   "docs/context/review-policy.md"
   "docs/context/plans/completed/2026-10-04-swift-build-measurement-and-debug-dsym-plan.md"
   "docs/context/plans/completed/2026-10-08-swift-compile-follow-ups-plan.md"

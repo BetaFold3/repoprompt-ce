@@ -356,7 +356,7 @@ final class CodexSteerAckTrackerTests: XCTestCase {
         source: String
     ) async throws -> (
         AgentModeViewModel,
-        AgentModeViewModel.TabSession,
+        AgentTabSession,
         UUID,
         AgentRunSessionStore.Registration
     ) {
@@ -502,7 +502,7 @@ final class CodexSteerAckTrackerTests: XCTestCase {
     }
 
     func testSerialDispatchGatePreservesIssuedOrderAcrossSuspension() async {
-        let gate = AgentModeViewModel.TabSession.CodexDispatchSerialGate()
+        let gate = AgentTabSession.CodexDispatchSerialGate()
         let first = gate.issueTicket()
         let second = gate.issueTicket()
         let firstEntered = await gate.awaitTurn(first)

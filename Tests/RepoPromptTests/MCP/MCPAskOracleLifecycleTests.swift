@@ -1090,7 +1090,7 @@ final class MCPAskOracleLifecycleTests: XCTestCase {
         ))
         child.hasLoadedPersistedState = true
         child.parentSessionID = parentSessionID
-        child.mcpControlContext = AgentModeViewModel.AgentMCPControlContext(
+        child.mcpControlContext = AgentMCPControlContext(
             sessionID: childSessionID,
             activationID: UUID(),
             registration: .init(sessionID: childSessionID, generation: 0),

@@ -1273,9 +1273,9 @@ final class AgentUsageRuntimeIntegrationTests: XCTestCase {
         // (the session's `deinit` is what ends it once the session itself goes away).
         do {
             let controller = UsageEvidenceFakeNativeController()
-            weak var weakSession: AgentModeViewModel.TabSession?
+            weak var weakSession: AgentTabSession?
             do {
-                let session = AgentModeViewModel.TabSession(tabID: UUID())
+                let session = AgentTabSession(tabID: UUID())
                 session.selectedAgent = .claudeCode
                 session.claudeController = controller
                 XCTAssertTrue(session.test_isUsageAccountingForwardingActive)
@@ -2065,7 +2065,7 @@ final class AgentUsageRuntimeIntegrationTests: XCTestCase {
 
     private func assertSessionAverage(
         _ expectedPercentage: String,
-        in projection: AgentRuntimeSidebarViewModel.ProviderUsageSnapshot,
+        in projection: AgentProviderUsageSnapshot,
         file: StaticString = #filePath,
         line: UInt = #line
     ) {
@@ -2175,7 +2175,7 @@ final class AgentUsageRuntimeIntegrationTests: XCTestCase {
 
     private struct Fixture {
         let viewModel: AgentModeViewModel
-        let session: AgentModeViewModel.TabSession
+        let session: AgentTabSession
         let prompt: PromptViewModel
         let workspaceManager: WorkspaceManagerViewModel
         let workspace: WorkspaceModel
@@ -2321,7 +2321,7 @@ final class AgentUsageRuntimeIntegrationTests: XCTestCase {
         viewModel.test_establishPersistenceWorkspace(workspace)
         viewModel.test_setCurrentTabIDOverride(tabID)
 
-        let session = AgentModeViewModel.TabSession(tabID: tabID)
+        let session = AgentTabSession(tabID: tabID)
         session.selectedAgent = .claudeCode
         viewModel.test_installLiveSession(session)
         _ = viewModel.test_installPersistentSessionBinding(sessionID: sessionID, on: session)

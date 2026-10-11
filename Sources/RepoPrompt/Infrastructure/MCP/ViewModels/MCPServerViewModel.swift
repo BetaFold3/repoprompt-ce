@@ -934,7 +934,7 @@ final class MCPServerViewModel: ObservableObject {
         }
 
         let sourceSessionID = snapshot.sourceAgentSessionID
-        let sourceSession: AgentModeViewModel.TabSession?
+        let sourceSession: AgentTabSession?
         let bindingState: AgentSessionWorktreeBindingState
         if let sourceSessionID {
             guard let hydrated = try? await targetWindow.agentModeViewModel.ensureSessionReady(tabID: sourceTabID) else {
@@ -2622,9 +2622,6 @@ final class MCPServerViewModel: ObservableObject {
         await Task.yield()
         steeringDebugLog("[AgentRunSteeringWake] parent wake yielded source=\(source) parentRunID=\(runID)")
     }
-
-    typealias AgentRunWaitDrainBlockers = RepoPromptAgentCore.AgentRunWaitDrainBlockers
-    typealias AgentRunWaitDrainOutcome = RepoPromptAgentCore.AgentRunWaitDrainOutcome
 
     @MainActor
     func agentRunWaitDrainBlockers(runID: UUID, now: Date = Date()) -> AgentRunWaitDrainBlockers {

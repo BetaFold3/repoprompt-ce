@@ -462,14 +462,14 @@ final class AgentRunWorktreeStartTests: AgentRunWorktreeStartGitSeedTestCase {
         let missingWorktree = root.appendingPathComponent("missing-worktree")
         let viewModel = makeViewModel(workspacePath: root.path)
 
-        let boundSession = AgentModeViewModel.TabSession(tabID: UUID())
+        let boundSession = AgentTabSession(tabID: UUID())
         boundSession.worktreeBindings = [makeBinding(logicalRoot: root.path, worktreeRoot: worktree.path)]
         XCTAssertEqual(try viewModel.effectiveWorkspacePath(for: boundSession), worktree.path)
 
-        let unboundSession = AgentModeViewModel.TabSession(tabID: UUID())
+        let unboundSession = AgentTabSession(tabID: UUID())
         XCTAssertEqual(try viewModel.effectiveWorkspacePath(for: unboundSession), root.path)
 
-        let missingSession = AgentModeViewModel.TabSession(tabID: UUID())
+        let missingSession = AgentTabSession(tabID: UUID())
         missingSession.worktreeBindings = [
             makeBinding(
                 logicalRoot: root.path,
@@ -3588,7 +3588,7 @@ final class AgentRunWorktreeStartTests: AgentRunWorktreeStartGitSeedTestCase {
             let directoryURL: URL
             let socketURL: URL
             private(set) var trackedTabID: UUID?
-            private(set) var trackedSession: AgentModeViewModel.TabSession?
+            private(set) var trackedSession: AgentTabSession?
             private(set) var firstObservedAgentTask: Task<Void, Never>?
             private(set) var acceptedSubmit = false
             private(set) var ownedSocketObserved = false
@@ -3636,7 +3636,7 @@ final class AgentRunWorktreeStartTests: AgentRunWorktreeStartGitSeedTestCase {
                 }
             }
 
-            func track(tabID: UUID, session: AgentModeViewModel.TabSession) {
+            func track(tabID: UUID, session: AgentTabSession) {
                 if let trackedTabID, let trackedSession {
                     XCTAssertEqual(trackedTabID, tabID)
                     XCTAssertTrue(trackedSession === session)
@@ -4306,8 +4306,8 @@ final class AgentRunWorktreeStartTests: AgentRunWorktreeStartGitSeedTestCase {
     private func makeMCPControlContext(
         sessionID: UUID,
         taskLabelKind: AgentModelCatalog.TaskLabelKind = .pair
-    ) -> AgentModeViewModel.AgentMCPControlContext {
-        AgentModeViewModel.AgentMCPControlContext(
+    ) -> AgentMCPControlContext {
+        AgentMCPControlContext(
             sessionID: sessionID,
             activationID: UUID(),
             registration: .init(sessionID: sessionID, generation: 0),

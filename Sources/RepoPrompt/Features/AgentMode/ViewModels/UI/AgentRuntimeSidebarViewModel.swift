@@ -21,8 +21,6 @@ final class AgentRuntimeSidebarViewModel: ObservableObject {
         }
     }
 
-    typealias ProviderUsageSnapshot = AgentProviderUsageSnapshot
-
     struct ContextSnapshot: Equatable {
         var updatedAt: Date?
         var usedTokens: Int?
@@ -38,7 +36,7 @@ final class AgentRuntimeSidebarViewModel: ObservableObject {
         var tokenStatsTotal: Int?
         var selectedAgent: AgentProviderKind?
         var selectedModelRaw: String?
-        var providerUsage: ProviderUsageSnapshot = .unavailable(for: nil)
+        var providerUsage: AgentProviderUsageSnapshot = .unavailable(for: nil)
 
         /// Canonical context window with agent-specific model metadata fallback when the provider
         /// hasn't reported one yet. With a known agent, encoded selections (`base:effort`)
@@ -159,7 +157,7 @@ final class AgentRuntimeSidebarViewModel: ObservableObject {
         selectedAgent: AgentProviderKind? = nil,
         selectedModelRaw: String? = nil,
         sessionConfiguredContextWindow: Int? = nil,
-        providerUsage: ProviderUsageSnapshot? = nil
+        providerUsage: AgentProviderUsageSnapshot? = nil
     ) {
         activeTranscriptFirstItemID = nil
         processedItemIDs.removeAll()
@@ -277,7 +275,7 @@ final class AgentRuntimeSidebarViewModel: ObservableObject {
         selectedAgent: AgentProviderKind? = nil,
         selectedModelRaw: String? = nil,
         sessionConfiguredContextWindow: Int? = nil,
-        providerUsage: ProviderUsageSnapshot? = nil
+        providerUsage: AgentProviderUsageSnapshot? = nil
     ) {
         resetIfTranscriptChanged(items: items)
         processNewItems(items)

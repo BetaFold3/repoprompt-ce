@@ -14,7 +14,7 @@ final class AgentRuntimeMetricsUIStore: ObservableObject {
         selectedAgent: AgentProviderKind,
         selectedModelRaw: String,
         sessionConfiguredContextWindow: Int? = nil,
-        providerUsage: AgentRuntimeSidebarViewModel.ProviderUsageSnapshot? = nil
+        providerUsage: AgentProviderUsageSnapshot? = nil
     ) {
         let previousSnapshot = runtimeVM.snapshot
         runtimeVM.update(

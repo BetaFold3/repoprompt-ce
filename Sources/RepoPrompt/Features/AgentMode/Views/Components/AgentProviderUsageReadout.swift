@@ -1,14 +1,15 @@
+import RepoPromptAgentCore
 import RepoPromptUI
 import SwiftUI
 
 /// Provider usage readout (latest-request cache-hit share and accumulated estimated cost) for one Agent Mode session.
 ///
-/// Renders `AgentRuntimeSidebarViewModel.ProviderUsageSnapshot.Presentation` verbatim: the projection
+/// Renders `AgentProviderUsageSnapshot.Presentation` verbatim: the projection
 /// owns scope, coverage and unavailable-reason wording, so both hosts (runtime sidebar card and the
 /// context-pill popover) stay identical. It is deliberately separate from `AgentContextIndicator`;
 /// billed-turn usage is never context occupancy and shares no denominator with it.
 struct AgentProviderUsageReadout: View {
-    let presentation: AgentRuntimeSidebarViewModel.ProviderUsageSnapshot.Presentation
+    let presentation: AgentProviderUsageSnapshot.Presentation
     /// When true, the expanded per-metric explanation is rendered inside the context popover.
     /// Compact hosts keep the same information in the tooltip and accessibility value.
     var showsVisibleNote = false

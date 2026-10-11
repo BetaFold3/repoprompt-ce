@@ -40,7 +40,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
     func testOMPTranscriptAuthoritySuppressesArbitraryProviderTitlesOnlyForMatchingRun() {
         let harness = makeHarness(recorder: LifecycleRecorder())
         let runner = harness.service.test_acpRunner()
-        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        let session = AgentTabSession(tabID: UUID())
         let runID = UUID()
         session.selectedAgent = .ohMyPi
         session.runID = runID
@@ -63,7 +63,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
     func testOMPPendingProviderFailuresAreDedupedBoundedAndMaterializedNeutrally() {
         let harness = makeHarness(recorder: LifecycleRecorder())
         let runner = harness.service.test_acpRunner()
-        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        let session = AgentTabSession(tabID: UUID())
         let runID = UUID()
         session.selectedAgent = .ohMyPi
         session.runID = runID
@@ -98,7 +98,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
     func testOMPProviderFailureBeforeCreditAndCreditBeforeFailurePreserveCardinality() {
         let harness = makeHarness(recorder: LifecycleRecorder())
         let runner = harness.service.test_acpRunner()
-        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        let session = AgentTabSession(tabID: UUID())
         let runID = UUID()
         session.selectedAgent = .ohMyPi
         session.runID = runID
@@ -179,7 +179,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
     func testOMPTeardownSynchronouslyIsolatesSuccessorRunState() {
         let harness = makeHarness(recorder: LifecycleRecorder())
         let runner = harness.service.test_acpRunner()
-        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        let session = AgentTabSession(tabID: UUID())
         session.selectedAgent = .ohMyPi
 
         let firstRunID = UUID()
@@ -232,7 +232,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         )
         let harness = makeHarness(recorder: LifecycleRecorder(), toolTrackingHooks: hooks)
         let runner = harness.service.test_acpRunner()
-        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        let session = AgentTabSession(tabID: UUID())
         let runID = UUID()
         session.selectedAgent = .ohMyPi
         session.runID = runID
@@ -258,7 +258,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
     func testTerminalCommitPreservesRebuiltToolCorrelationIndexes() async throws {
         let recorder = LifecycleRecorder()
         let barrier = AgentRunTerminalCommitBarrier(hooks: makeHooks(recorder: recorder))
-        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        let session = AgentTabSession(tabID: UUID())
         let invocationID = UUID()
         session.setItemsSilently([
             .user("prior", sequenceIndex: 0),
@@ -305,7 +305,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
                 recorder: recorder,
                 workspacePathProvider: { _ in throw LifecycleTestError.workspaceMissing }
             )
-            let session = AgentModeViewModel.TabSession(tabID: UUID())
+            let session = AgentTabSession(tabID: UUID())
             session.selectedAgent = agent
             session.beginRunAttempt(source: "test")
 
@@ -342,7 +342,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
 
     func testOhMyPiPreACPServiceFailureResolvesAuthorizationDenial() async throws {
         let recorder = LifecycleRecorder()
-        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        let session = AgentTabSession(tabID: UUID())
         session.selectedAgent = .ohMyPi
         let context = try installOMPQualificationContext(
             on: session,
@@ -373,7 +373,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         let recorder = LifecycleRecorder()
         let qualificationSessionID = UUID()
         let qualificationWorkspaceID = UUID()
-        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        let session = AgentTabSession(tabID: UUID())
         session.selectedAgent = .ohMyPi
         let context = try installOMPQualificationContext(
             on: session,
@@ -429,7 +429,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         let recorder = LifecycleRecorder()
         let qualificationSessionID = UUID()
         let qualificationWorkspaceID = UUID()
-        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        let session = AgentTabSession(tabID: UUID())
         session.selectedAgent = .ohMyPi
         let context = try installOMPQualificationContext(
             on: session,
@@ -481,7 +481,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         let recorder = LifecycleRecorder()
         let qualificationSessionID = UUID()
         let qualificationWorkspaceID = UUID()
-        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        let session = AgentTabSession(tabID: UUID())
         session.selectedAgent = .ohMyPi
         let context = try installOMPQualificationContext(
             on: session,
@@ -536,7 +536,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         let recorder = LifecycleRecorder()
         let qualificationSessionID = UUID()
         let qualificationWorkspaceID = UUID()
-        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        let session = AgentTabSession(tabID: UUID())
         session.selectedAgent = .ohMyPi
         let context = try installOMPQualificationContext(
             on: session,
@@ -603,7 +603,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         let qualificationSessionID = UUID()
         let qualificationWorkspaceID = UUID()
         let taskEntryGate = LifecyclePublicationGate()
-        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        let session = AgentTabSession(tabID: UUID())
         session.selectedAgent = .ohMyPi
         let context = try installOMPQualificationContext(
             on: session,
@@ -684,7 +684,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         let successorRunID = UUID()
         let successorAttemptID = UUID()
         let successorTaskGate = LifecyclePublicationGate()
-        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        let session = AgentTabSession(tabID: UUID())
         session.selectedAgent = .ohMyPi
         let context = try installOMPQualificationContext(
             on: session,
@@ -786,7 +786,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         let recorder = LifecycleRecorder()
         let qualificationSessionID = UUID()
         let qualificationWorkspaceID = UUID()
-        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        let session = AgentTabSession(tabID: UUID())
         session.selectedAgent = .ohMyPi
         let context = try installOMPQualificationContext(
             on: session,
@@ -859,7 +859,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         addTeardownBlock {
             await HeadlessAgentConnectionGate.completeConnection(blockerGateID)
         }
-        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        let session = AgentTabSession(tabID: UUID())
         session.selectedAgent = .ohMyPi
         _ = try installOMPQualificationContext(
             on: session,
@@ -936,7 +936,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         let recorder = LifecycleRecorder()
         let qualificationSessionID = UUID()
         let qualificationWorkspaceID = UUID()
-        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        let session = AgentTabSession(tabID: UUID())
         session.selectedAgent = .ohMyPi
         let context = try installOMPQualificationContext(
             on: session,
@@ -1005,7 +1005,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
             environment: ["ACP_RECORD_PATH": recordURL.path],
             recorder: recorder
         )
-        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        let session = AgentTabSession(tabID: UUID())
         session.selectedAgent = .ohMyPi
         _ = try installOMPQualificationContext(
             on: session,
@@ -1093,7 +1093,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
             mcpHost: ServerNetworkManager.shared
         )
         registerACPController(successor)
-        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        let session = AgentTabSession(tabID: UUID())
         session.selectedAgent = .ohMyPi
         _ = try installOMPQualificationContext(
             on: session,
@@ -1172,7 +1172,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
             mcpHost: ServerNetworkManager.shared
         )
         registerACPController(successor)
-        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        let session = AgentTabSession(tabID: UUID())
         session.selectedAgent = .ohMyPi
         _ = try installOMPQualificationContext(
             on: session,
@@ -1228,7 +1228,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
             commandPath: "/usr/bin/false",
             recorder: recorder
         )
-        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        let session = AgentTabSession(tabID: UUID())
         session.selectedAgent = .ohMyPi
         _ = try installOMPQualificationContext(
             on: session,
@@ -1300,7 +1300,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
             environment: ["ACP_RECORD_PATH": recordURL.path],
             recorder: recorder
         )
-        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        let session = AgentTabSession(tabID: UUID())
         session.selectedAgent = .ohMyPi
         _ = try installOMPQualificationContext(
             on: session,
@@ -1407,7 +1407,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
             environment: ["ACP_RECORD_PATH": recordURL.path],
             recorder: recorder
         )
-        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        let session = AgentTabSession(tabID: UUID())
         session.selectedAgent = .ohMyPi
         _ = try installOMPQualificationContext(
             on: session,
@@ -1474,7 +1474,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         let recorder = LifecycleRecorder()
         let qualificationSessionID = UUID()
         let qualificationWorkspaceID = UUID()
-        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        let session = AgentTabSession(tabID: UUID())
         session.selectedAgent = .ohMyPi
         let context = try installOMPQualificationContext(
             on: session,
@@ -1546,7 +1546,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         let recorder = LifecycleRecorder()
         let qualificationSessionID = UUID()
         let qualificationWorkspaceID = UUID()
-        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        let session = AgentTabSession(tabID: UUID())
         session.selectedAgent = .ohMyPi
         try _ = installOMPQualificationContext(
             on: session,
@@ -1616,7 +1616,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         var activeWorkspaceID = fingerprintedWorkspaceID
         var authorizationCalls = 0
         var providerBootstrapCount = 0
-        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        let session = AgentTabSession(tabID: UUID())
         session.selectedAgent = .ohMyPi
         _ = try installOMPQualificationContext(
             on: session,
@@ -1676,7 +1676,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         let qualificationSessionID = UUID()
         let replacementSessionID = UUID()
         let qualificationWorkspaceID = UUID()
-        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        let session = AgentTabSession(tabID: UUID())
         session.selectedAgent = .ohMyPi
         let context = try installOMPQualificationContext(
             on: session,
@@ -1758,7 +1758,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         let recorder = LifecycleRecorder()
         let qualificationSessionID = UUID()
         let qualificationWorkspaceID = UUID()
-        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        let session = AgentTabSession(tabID: UUID())
         session.selectedAgent = .ohMyPi
         let originalContext = try installOMPQualificationContext(
             on: session,
@@ -1825,7 +1825,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         let recorder = LifecycleRecorder()
         let qualificationSessionID = UUID()
         let qualificationWorkspaceID = UUID()
-        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        let session = AgentTabSession(tabID: UUID())
         session.selectedAgent = .ohMyPi
         let originalContext = try installOMPQualificationContext(
             on: session,
@@ -1894,7 +1894,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         let recorder = LifecycleRecorder()
         let qualificationSessionID = UUID()
         let qualificationWorkspaceID = UUID()
-        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        let session = AgentTabSession(tabID: UUID())
         session.selectedAgent = .ohMyPi
         let originalContext = try installOMPQualificationContext(
             on: session,
@@ -1984,7 +1984,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         let recorder = LifecycleRecorder()
         let qualificationSessionID = UUID()
         let qualificationWorkspaceID = UUID()
-        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        let session = AgentTabSession(tabID: UUID())
         session.selectedAgent = .ohMyPi
         let context = try installOMPQualificationContext(
             on: session,
@@ -2066,7 +2066,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         let recorder = LifecycleRecorder()
         let qualificationSessionID = UUID()
         let qualificationWorkspaceID = UUID()
-        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        let session = AgentTabSession(tabID: UUID())
         session.selectedAgent = .ohMyPi
         let context = try installOMPQualificationContext(
             on: session,
@@ -2120,7 +2120,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         let recorder = LifecycleRecorder()
         let qualificationSessionID = UUID()
         let qualificationWorkspaceID = UUID()
-        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        let session = AgentTabSession(tabID: UUID())
         session.selectedAgent = .ohMyPi
         let context = try installOMPQualificationContext(
             on: session,
@@ -2181,7 +2181,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         let qualificationSessionID = UUID()
         let qualificationWorkspaceID = UUID()
         let tabID = UUID()
-        var session: AgentModeViewModel.TabSession? = AgentModeViewModel.TabSession(tabID: tabID)
+        var session: AgentTabSession? = AgentTabSession(tabID: tabID)
         session?.selectedAgent = .ohMyPi
         let context = try installOMPQualificationContext(
             on: XCTUnwrap(session),
@@ -2275,7 +2275,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
             ownerProcessID: getpid(),
             sessionID: sessionID
         )
-        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        let session = AgentTabSession(tabID: UUID())
         session.selectedAgent = .ohMyPi
         session.ompQualificationStartContext = .init(
             transaction: oldConsumption.transaction,
@@ -2363,12 +2363,12 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         let workspaceID = UUID()
         let controlSessionID = UUID()
         let scriptURL = try makeHungACPBootstrapScript()
-        weak var weakSession: AgentModeViewModel.TabSession?
+        weak var weakSession: AgentTabSession?
         var bootstrapEntries = 0
         var stoppedTrackingRunIDs: [UUID] = []
 
         do {
-            let session = AgentModeViewModel.TabSession(tabID: UUID())
+            let session = AgentTabSession(tabID: UUID())
             weakSession = session
             session.selectedAgent = .ohMyPi
             _ = try installOMPQualificationContext(
@@ -2466,7 +2466,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         )
         XCTAssertEqual(persistedSelection.agent, .ohMyPi)
 
-        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        let session = AgentTabSession(tabID: UUID())
         session.hasLoadedPersistedState = true
         session.selectedAgent = persistedSelection.agent
         session.selectedModelRaw = persistedSelection.modelRaw
@@ -2525,7 +2525,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         let recorder = LifecycleRecorder()
         let codexController = LifecycleNoopCodexController(recorder: recorder, failSend: true)
         let harness = makeHarness(recorder: recorder, codexController: codexController)
-        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        let session = AgentTabSession(tabID: UUID())
         session.selectedAgent = .codexExec
 
         let freshOutcome = await harness.service.startRun(
@@ -2561,7 +2561,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         let recorder = LifecycleRecorder()
         let controller = LifecycleNoopCodexController(recorder: recorder)
         let harness = makeHarness(recorder: recorder, codexController: controller)
-        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        let session = AgentTabSession(tabID: UUID())
         session.selectedAgent = .codexExec
         session.codexNeedsReconnect = true
         // Whitespace-only persisted IDs normalize to "no usable metadata" and must
@@ -2598,7 +2598,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
             startFailuresBeforeSuccess: 1
         )
         let harness = makeHarness(recorder: recorder, codexController: controller)
-        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        let session = AgentTabSession(tabID: UUID())
         session.selectedAgent = .codexExec
         session.appendItem(.user("source question", sequenceIndex: session.nextSequenceIndex))
         session.appendItem(.assistant("source answer", sequenceIndex: session.nextSequenceIndex))
@@ -2646,7 +2646,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         let recorder = LifecycleRecorder()
         let controller = LifecycleNoopCodexController(recorder: recorder)
         let harness = makeHarness(recorder: recorder, codexController: controller)
-        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        let session = AgentTabSession(tabID: UUID())
         session.selectedAgent = .codexExec
         session.codexConversationID = "saved-thread"
         session.codexRolloutPath = "/tmp/saved-thread.jsonl"
@@ -2678,7 +2678,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
             resumeTimeoutFailuresBeforeSuccess: 2
         )
         let harness = makeHarness(recorder: recorder, codexController: controller)
-        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        let session = AgentTabSession(tabID: UUID())
         session.selectedAgent = .codexExec
         session.codexConversationID = "saved-thread"
         session.codexRolloutPath = "/tmp/saved-thread.jsonl"
@@ -2740,11 +2740,11 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         let resumeGate = LifecycleResumeGate(honorsCancellation: true)
         controller.resumeGate = resumeGate
         let harness = makeHarness(recorder: recorder, codexController: controller)
-        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        let session = AgentTabSession(tabID: UUID())
         session.selectedAgent = .codexExec
         session.codexConversationID = "saved-thread"
         session.codexRolloutPath = "/tmp/saved-thread.jsonl"
-        let priorTimeoutState = AgentModeViewModel.CodexResumeTimeoutState(
+        let priorTimeoutState = AgentCodexResumeTimeoutState(
             conversationID: "saved-thread",
             rolloutPath: "/tmp/saved-thread.jsonl",
             consecutiveTimeouts: 1
@@ -2831,7 +2831,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
             controller.resumeGate = resumeGate
             controller.resumeDeliveryGate = deliveryGate
             let harness = makeHarness(recorder: recorder, codexController: controller)
-            let session = AgentModeViewModel.TabSession(tabID: UUID())
+            let session = AgentTabSession(tabID: UUID())
             session.selectedAgent = .codexExec
             session.codexConversationID = "saved-thread"
             session.codexRolloutPath = "/tmp/saved-thread.jsonl"
@@ -2884,7 +2884,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         controller.resumeGate = resumeGate
         let harness = makeHarness(recorder: recorder, codexController: controller)
         let coordinator = harness.host.test_codexCoordinator
-        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        let session = AgentTabSession(tabID: UUID())
         session.selectedAgent = .codexExec
         session.codexConversationID = "saved-thread"
         session.codexRolloutPath = "/tmp/saved-thread.jsonl"
@@ -2951,11 +2951,11 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
             let resumeGate = LifecycleResumeGate(honorsCancellation: true)
             controller.resumeGate = resumeGate
             let harness = makeHarness(recorder: recorder, codexController: controller)
-            let session = AgentModeViewModel.TabSession(tabID: UUID())
+            let session = AgentTabSession(tabID: UUID())
             session.selectedAgent = .codexExec
             session.codexConversationID = "saved-thread"
             session.codexRolloutPath = "/tmp/saved-thread.jsonl"
-            let priorTimeoutState = AgentModeViewModel.CodexResumeTimeoutState(
+            let priorTimeoutState = AgentCodexResumeTimeoutState(
                 conversationID: "saved-thread",
                 rolloutPath: "/tmp/saved-thread.jsonl",
                 consecutiveTimeouts: 1
@@ -3029,7 +3029,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
             controller.resumeGate = resumeGate
             controller.resumeDeliveryGate = deliveryGate
             let harness = makeHarness(recorder: recorder, codexController: controller)
-            let session = AgentModeViewModel.TabSession(tabID: UUID())
+            let session = AgentTabSession(tabID: UUID())
             session.selectedAgent = .codexExec
             session.codexConversationID = "saved-thread"
             session.codexRolloutPath = "/tmp/saved-thread.jsonl"
@@ -3225,7 +3225,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
                 codexControllerSequence: LifecycleCodexControllerSequence([stoppedController, successorController]),
                 codexAuthRecovery: authRecovery
             )
-            let session = AgentModeViewModel.TabSession(tabID: UUID())
+            let session = AgentTabSession(tabID: UUID())
             session.selectedAgent = .codexExec
             session.codexConversationID = "saved-thread"
             session.codexRolloutPath = "/tmp/saved-thread.jsonl"
@@ -3452,11 +3452,11 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
                 codexAuthRecovery: authRecovery
             )
             let coordinator = harness.host.test_codexCoordinator
-            let session = AgentModeViewModel.TabSession(tabID: UUID())
+            let session = AgentTabSession(tabID: UUID())
             session.selectedAgent = .codexExec
             session.codexConversationID = "saved-thread"
             session.codexRolloutPath = "/tmp/saved-thread.jsonl"
-            let priorTimeoutState = AgentModeViewModel.CodexResumeTimeoutState(
+            let priorTimeoutState = AgentCodexResumeTimeoutState(
                 conversationID: "saved-thread",
                 rolloutPath: "/tmp/saved-thread.jsonl",
                 consecutiveTimeouts: 1
@@ -3583,7 +3583,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
                 resumeErrorsBeforeSuccess: [row.resumeError]
             )
             let harness = makeHarness(recorder: recorder, codexController: controller)
-            let session = AgentModeViewModel.TabSession(tabID: UUID())
+            let session = AgentTabSession(tabID: UUID())
             session.selectedAgent = .codexExec
             session.codexConversationID = "saved-thread"
             session.codexRolloutPath = "/tmp/saved-thread.jsonl"
@@ -3650,7 +3650,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         )
         controller.snapshotRuntimeStatus = .active(activeFlags: [])
         let harness = makeHarness(recorder: recorder, codexController: controller)
-        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        let session = AgentTabSession(tabID: UUID())
         session.selectedAgent = .codexExec
         session.codexConversationID = "saved-thread"
         session.codexRolloutPath = "/tmp/saved-thread.jsonl"
@@ -3699,7 +3699,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         // The thread keeps reporting active, so only the replayed turn's completion can release.
         controller.snapshotRuntimeStatus = .active(activeFlags: [])
         let harness = makeHarness(recorder: recorder, codexController: controller)
-        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        let session = AgentTabSession(tabID: UUID())
         session.selectedAgent = .codexExec
         session.codexConversationID = "saved-thread"
 
@@ -3746,7 +3746,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         let snapshotGate = LifecyclePublicationGate()
         controller.snapshotGate = snapshotGate
         let harness = makeHarness(recorder: recorder, codexController: controller)
-        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        let session = AgentTabSession(tabID: UUID())
         session.selectedAgent = .codexExec
         session.codexConversationID = "saved-thread"
 
@@ -3809,7 +3809,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         // The thread keeps reporting active, so only lifecycle completions can release the queue.
         controller.snapshotRuntimeStatus = .active(activeFlags: [])
         let harness = makeHarness(recorder: recorder, codexController: controller)
-        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        let session = AgentTabSession(tabID: UUID())
         session.selectedAgent = .codexExec
         session.codexConversationID = "saved-thread"
 
@@ -3884,7 +3884,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         )
         controller.snapshotRuntimeStatus = .active(activeFlags: [])
         let harness = makeHarness(recorder: recorder, codexController: controller)
-        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        let session = AgentTabSession(tabID: UUID())
         session.selectedAgent = .codexExec
         session.codexConversationID = "saved-thread"
 
@@ -3933,10 +3933,10 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         )
         controller.snapshotRuntimeStatus = .active(activeFlags: [])
         let harness = makeHarness(recorder: recorder, codexController: controller)
-        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        let session = AgentTabSession(tabID: UUID())
         session.selectedAgent = .codexExec
         session.codexConversationID = "saved-thread"
-        let staleIdentity = AgentModeViewModel.TabSession.CodexAuthoritativeTurnIdentity(
+        let staleIdentity = AgentTabSession.CodexAuthoritativeTurnIdentity(
             threadID: "saved-thread",
             turnID: "turn-stale",
             turnKind: .user,
@@ -3993,7 +3993,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
             ]
         )
         let harness = makeHarness(recorder: recorder, codexController: controller)
-        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        let session = AgentTabSession(tabID: UUID())
         session.selectedAgent = .codexExec
         session.codexConversationID = "saved-thread"
         session.codexRolloutPath = "/tmp/saved-thread.jsonl"
@@ -4042,7 +4042,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
             startedRolloutPath: "/tmp/ghost.jsonl"
         )
         let harness = makeHarness(recorder: recorder, codexController: controller)
-        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        let session = AgentTabSession(tabID: UUID())
         session.selectedAgent = .codexExec
 
         let outcome = await harness.service.startRun(
@@ -4067,7 +4067,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         let recorder = LifecycleRecorder()
         let controller = LifecycleNoopCodexController(recorder: recorder)
         let harness = makeHarness(recorder: recorder, codexController: controller)
-        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        let session = AgentTabSession(tabID: UUID())
         session.selectedAgent = .codexExec
         session.codexRolloutPath = "/tmp/missing-thread-id.jsonl"
 
@@ -4095,7 +4095,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         let recorder = LifecycleRecorder()
         let controller = LifecycleNoopCodexController(recorder: recorder)
         let harness = makeHarness(recorder: recorder, codexController: controller)
-        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        let session = AgentTabSession(tabID: UUID())
         session.selectedAgent = .codexExec
         session.codexRolloutPath = "/tmp/missing-thread-id.jsonl"
         session.codexResumeTimeoutState = .init(
@@ -4136,7 +4136,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
                 activatesThread: activatesThread
             )
             let harness = makeHarness(recorder: recorder, codexController: codexController)
-            let session = AgentModeViewModel.TabSession(tabID: UUID())
+            let session = AgentTabSession(tabID: UUID())
             session.selectedAgent = .codexExec
             session.runState = .running
             session.runID = UUID()
@@ -4237,7 +4237,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         XCTAssertEqual(resolvedSelection.ohMyPiThinkingSelections, expectedRoleThinking)
 
         let sessionID = UUID()
-        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        let session = AgentTabSession(tabID: UUID())
         session.testInstallPersistentSessionBinding(sessionID: sessionID)
         harness.host.test_installLiveSession(session)
         let target = AgentModeViewModel.MCPSessionTarget(
@@ -4313,7 +4313,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         ))
         XCTAssertEqual(session.ohMyPiThinkingSelections, expectedRoleThinking, "A nonempty session map must never be overwritten")
 
-        let resumed = AgentModeViewModel.TabSession(tabID: UUID())
+        let resumed = AgentTabSession(tabID: UUID())
         resumed.selectedAgent = .ohMyPi
         resumed.selectedModelRaw = selectedModelRaw
         harness.host.test_installLiveSession(resumed)
@@ -4332,7 +4332,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         ))
         XCTAssertTrue(resumed.ohMyPiThinkingSelections.isEmpty)
 
-        let compound = AgentModeViewModel.TabSession(tabID: UUID())
+        let compound = AgentTabSession(tabID: UUID())
         compound.selectedAgent = .ohMyPi
         compound.selectedModelRaw = selectedModelRaw
         harness.host.test_installLiveSession(compound)
@@ -4344,7 +4344,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         ))
         XCTAssertTrue(compound.ohMyPiThinkingSelections.isEmpty)
 
-        let nonOMP = AgentModeViewModel.TabSession(tabID: UUID())
+        let nonOMP = AgentTabSession(tabID: UUID())
         nonOMP.selectedAgent = .codexExec
         nonOMP.selectedModelRaw = selectedModelRaw
         harness.host.test_installLiveSession(nonOMP)
@@ -4387,7 +4387,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
                 throw LifecycleTestError.expectedACPDispatchStop
             }
         )
-        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        let session = AgentTabSession(tabID: UUID())
         session.selectedAgent = .ohMyPi
 
         let outcome = await harness.service.startRun(
@@ -4414,7 +4414,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
             let recorder = LifecycleRecorder()
             let codexController = LifecycleNoopCodexController(recorder: recorder)
             let harness = makeHarness(recorder: recorder, codexController: codexController)
-            let session = AgentModeViewModel.TabSession(tabID: UUID())
+            let session = AgentTabSession(tabID: UUID())
             session.selectedAgent = .codexExec
             session.testInstallPersistentSessionBinding(sessionID: UUID())
 
@@ -4446,7 +4446,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
                 failSend: true
             )
             let harness = makeHarness(recorder: recorder, claudeController: claudeController)
-            let session = AgentModeViewModel.TabSession(tabID: UUID())
+            let session = AgentTabSession(tabID: UUID())
             session.selectedAgent = .claudeCode
 
             let outcome = await harness.service.startRun(
@@ -4487,7 +4487,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
                     throw LifecycleTestError.expectedACPDispatchStop
                 }
             )
-            let session = AgentModeViewModel.TabSession(tabID: UUID())
+            let session = AgentTabSession(tabID: UUID())
             session.selectedAgent = .openCode
 
             let outcome = await harness.service.startRun(
@@ -4528,7 +4528,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
                     throw LifecycleTestError.expectedACPDispatchStop
                 }
             )
-            let session = AgentModeViewModel.TabSession(tabID: UUID())
+            let session = AgentTabSession(tabID: UUID())
             session.selectedAgent = .openCode
 
             let outcome = await harness.service.startRun(
@@ -4566,7 +4566,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
                     throw LifecycleTestError.unexpectedACPControllerCreation
                 }
             )
-            let session = AgentModeViewModel.TabSession(tabID: UUID())
+            let session = AgentTabSession(tabID: UUID())
             session.selectedAgent = .openCode
 
             let outcome = await harness.service.startRun(
@@ -4734,7 +4734,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
                 return provider
             }
         )
-        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        let session = AgentTabSession(tabID: UUID())
         session.selectedAgent = .cursor
 
         let outcome = await harness.service.startRun(
@@ -4773,7 +4773,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
             workspacePathProvider: { _ in workspace.path },
             acpProviderFactory: { _, _ in provider }
         )
-        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        let session = AgentTabSession(tabID: UUID())
         session.selectedAgent = .cursor
         let stageID = UUID()
         let acknowledged = "delegated-notice:\(stageID.uuidString):true"
@@ -4836,7 +4836,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
             workspacePathProvider: { _ in workspace.path },
             acpProviderFactory: { _, _ in provider }
         )
-        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        let session = AgentTabSession(tabID: UUID())
         session.selectedAgent = .cursor
         let stageID = UUID()
 
@@ -4871,7 +4871,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
             let recorder = LifecycleRecorder()
             let controller = LifecycleNoopCodexController(recorder: recorder)
             let harness = makeHarness(recorder: recorder, codexController: controller)
-            let session = AgentModeViewModel.TabSession(tabID: UUID())
+            let session = AgentTabSession(tabID: UUID())
             session.selectedAgent = .codexExec
             session.codexConversationID = "saved-thread"
             session.codexRolloutPath = "/tmp/saved-thread.jsonl"
@@ -4909,7 +4909,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
                 activatesThread: true
             )
             let harness = makeHarness(recorder: recorder, codexController: controller)
-            let session = AgentModeViewModel.TabSession(tabID: UUID())
+            let session = AgentTabSession(tabID: UUID())
             session.selectedAgent = .codexExec
             session.runState = .running
             session.runID = UUID()
@@ -4954,7 +4954,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
             acpProviderFactory: { _, _ in provider },
             testOMPQualificationLeaseCreated: { leases.append($0) }
         )
-        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        let session = AgentTabSession(tabID: UUID())
         session.selectedAgent = .cursor
 
         _ = await harness.service.startRun(
@@ -5013,7 +5013,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
                 return provider
             }
         )
-        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        let session = AgentTabSession(tabID: UUID())
         session.selectedAgent = .cursor
 
         let firstOutcome = await harness.service.startRun(
@@ -5084,7 +5084,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
                 }
             }
         )
-        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        let session = AgentTabSession(tabID: UUID())
         session.selectedAgent = .cursor
         session.selectedModelRaw = "model-b[fast=true]"
 
@@ -5151,7 +5151,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
             },
             autoSignalACPRouting: true
         )
-        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        let session = AgentTabSession(tabID: UUID())
         session.selectedAgent = .openCode
 
         let outcome = await harness.service.startRun(
@@ -5206,7 +5206,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
                 LifecycleNoopCodexController(recorder: recorder)
             }
         )
-        var session: AgentModeViewModel.TabSession? = .init(tabID: UUID())
+        var session: AgentTabSession? = .init(tabID: UUID())
         weak var weakViewModel = viewModel
         weak var weakSession = session
         let finalizer = try XCTUnwrap(viewModel).test_abandonedAttachmentFinalizer()
@@ -5230,7 +5230,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         try Data([0x89, 0x50, 0x4E, 0x47]).write(to: attachmentURL)
         let attachment = AgentImageAttachment(source: .localFile(path: attachmentURL.path))
         let reservationID = UUID()
-        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        let session = AgentTabSession(tabID: UUID())
         session.attachmentTurnState = .reserved(
             reservationID: reservationID,
             attachments: [attachment]
@@ -5269,7 +5269,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         let successorAttachment = AgentImageAttachment(source: .localFile(path: successorURL.path))
         let staleReservationID = UUID()
         let successorReservationID = UUID()
-        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        let session = AgentTabSession(tabID: UUID())
         session.attachmentTurnState = .consumed(
             reservationID: successorReservationID,
             attachments: [successorAttachment]
@@ -5323,7 +5323,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         let staleAttachment = AgentImageAttachment(source: .localFile(path: staleURL.path))
         let successorAttachment = AgentImageAttachment(source: .localFile(path: successorURL.path))
         let successorReservationID = UUID()
-        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        let session = AgentTabSession(tabID: UUID())
         session.attachmentTurnState = .reserved(
             reservationID: successorReservationID,
             attachments: [successorAttachment]
@@ -5420,7 +5420,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
     func testTerminalBarrierRejectsStaleOwnership() async {
         let recorder = LifecycleRecorder()
         let barrier = AgentRunTerminalCommitBarrier(hooks: makeHooks(recorder: recorder))
-        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        let session = AgentTabSession(tabID: UUID())
         session.runID = UUID()
         session.runState = .running
         let staleOwnership = session.beginRunAttempt(source: "test.stale")
@@ -5447,7 +5447,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
     func testNewAttemptResetsProviderDrainGenerationAcrossProviderFamilies() async {
         let recorder = LifecycleRecorder()
         let barrier = AgentRunTerminalCommitBarrier(hooks: makeHooks(recorder: recorder))
-        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        let session = AgentTabSession(tabID: UUID())
         session.runID = UUID()
         session.runState = .running
         let codexOwnership = session.beginRunAttempt(source: "test.codex")
@@ -5537,7 +5537,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
                 recorder.record("commit:\(revision.commitID.uuidString)")
             }
         )
-        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        let session = AgentTabSession(tabID: UUID())
         session.selectedAgent = .codexExec
         session.runState = .running
         session.runID = UUID()
@@ -5613,7 +5613,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
             }
         )
         let barrier = AgentRunTerminalCommitBarrier(hooks: hooks)
-        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        let session = AgentTabSession(tabID: UUID())
         session.runID = UUID()
         session.runState = .running
         let ownership = session.beginRunAttempt(source: "test.retryPublication")
@@ -5679,7 +5679,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
             startFollowUpRun: { _, text in recorder.record("follow-up:\(text)") }
         )
         let barrier = AgentRunTerminalCommitBarrier(hooks: hooks)
-        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        let session = AgentTabSession(tabID: UUID())
         session.runID = UUID()
         session.runState = .running
         session.pendingInstructions = ["continue"]
@@ -5721,7 +5721,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
             }
         )
         let barrier = AgentRunTerminalCommitBarrier(hooks: hooks)
-        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        let session = AgentTabSession(tabID: UUID())
         session.runID = UUID()
         session.runState = .running
         session.pendingInstructions = ["unrelated generic instruction"]
@@ -5772,7 +5772,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
                 recorder.record("commit:finish:\(revision.commitID.uuidString)")
             }
         )
-        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        let session = AgentTabSession(tabID: UUID())
         session.selectedAgent = .cursor
         session.runState = .running
         session.runID = UUID()
@@ -5827,7 +5827,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
             recorder: recorder,
             headlessProviderFactory: { _, _ in provider }
         )
-        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        let session = AgentTabSession(tabID: UUID())
         session.selectedAgent = .cursor
         session.runState = .running
         session.runID = UUID()
@@ -5867,7 +5867,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         let recorder = LifecycleRecorder()
         let teardownGate = LifecyclePublicationGate()
         let harness = makeHarness(recorder: recorder)
-        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        let session = AgentTabSession(tabID: UUID())
         session.selectedAgent = .cursor
         session.runState = .running
         session.runID = UUID()
@@ -5904,7 +5904,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         let recorder = LifecycleRecorder()
         let teardownGate = LifecyclePublicationGate()
         let harness = makeHarness(recorder: recorder)
-        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        let session = AgentTabSession(tabID: UUID())
         session.selectedAgent = .ohMyPi
         session.runState = .running
         let runID = UUID()
@@ -5976,7 +5976,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
             recorder: recorder,
             headlessProviderFactory: { _, _ in provider }
         )
-        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        let session = AgentTabSession(tabID: UUID())
         session.selectedAgent = .cursor
         session.runState = .running
         session.runID = UUID()
@@ -6019,7 +6019,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
             recorder: recorder,
             headlessProviderFactory: { _, _ in provider }
         )
-        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        let session = AgentTabSession(tabID: UUID())
         session.selectedAgent = .cursor
         session.runState = .running
         session.runID = UUID()
@@ -6063,7 +6063,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
             recorder: recorder,
             headlessProviderFactory: { _, _ in provider }
         )
-        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        let session = AgentTabSession(tabID: UUID())
         session.selectedAgent = .cursor
         session.runState = .running
         session.runID = UUID()
@@ -6106,7 +6106,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
                 codexController: codexController,
                 headlessProviderFactory: { _, _ in headlessProvider }
             )
-            let session = AgentModeViewModel.TabSession(tabID: UUID())
+            let session = AgentTabSession(tabID: UUID())
             session.runState = .running
             session.runID = UUID()
             session.beginRunAttempt(source: "test")
@@ -6210,7 +6210,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
             recorder: recorder,
             codexController: controller
         )
-        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        let session = AgentTabSession(tabID: UUID())
         let runID = UUID()
         session.selectedAgent = .codexExec
         session.runID = runID
@@ -6269,7 +6269,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
                 },
                 autoSignalACPRouting: true
             )
-            let session = AgentModeViewModel.TabSession(tabID: UUID())
+            let session = AgentTabSession(tabID: UUID())
             session.selectedAgent = .openCode
             session.selectedModelRaw = "model-b"
             session.permissionProfile = .providerOverride(.openCode(level))
@@ -6328,7 +6328,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
 
     @discardableResult
     private func installOMPQualificationContext(
-        on session: AgentModeViewModel.TabSession,
+        on session: AgentTabSession,
         sessionID: UUID,
         workspaceID: UUID,
         authorizationDeadlineUptimeNanoseconds: UInt64? = nil
@@ -6357,7 +6357,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
 
     func makeHarness(
         recorder: LifecycleRecorder,
-        workspacePathProvider: @escaping (AgentModeViewModel.TabSession) throws -> String? = { _ in FileManager.default.currentDirectoryPath },
+        workspacePathProvider: @escaping (AgentTabSession) throws -> String? = { _ in FileManager.default.currentDirectoryPath },
         idleWaiter: @escaping LifecycleMCPIdleWaiter = { _ in },
         cancelMCPTools: @escaping (_ runID: UUID, _ reason: String) -> Void = { _, _ in },
         codexController: LifecycleNoopCodexController? = nil,
@@ -6365,18 +6365,18 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         codexAuthRecovery: (any CodexManagedAuthRecovering)? = nil,
         claudeController: LifecycleFakeNativeController? = nil,
         claudeControllerFactory: ClaudeAgentModeCoordinator.ClaudeControllerFactory? = nil,
-        headlessProviderFactory: AgentModeViewModel.HeadlessProviderFactory? = nil,
-        acpProviderFactory: AgentModeViewModel.ACPProviderFactory? = nil,
-        acpControllerFactory: AgentModeViewModel.ACPControllerFactory? = nil,
-        flushPendingAssistantDelta: ((AgentModeViewModel.TabSession) -> Void)? = nil,
-        publishTerminalCommit: ((AgentModeViewModel.TabSession, AgentRunTerminalCommitRevision) async -> Void)? = nil,
+        headlessProviderFactory: AgentHeadlessProviderFactory? = nil,
+        acpProviderFactory: AgentACPProviderFactory? = nil,
+        acpControllerFactory: AgentACPControllerFactory? = nil,
+        flushPendingAssistantDelta: ((AgentTabSession) -> Void)? = nil,
+        publishTerminalCommit: ((AgentTabSession, AgentRunTerminalCommitRevision) async -> Void)? = nil,
         handleHeadlessStreamResult: ((AIStreamResult) async -> Void)? = nil,
         toolTrackingHooks: AgentToolTrackingHooks = .noOp,
         autoSignalACPRouting: Bool = false,
         expectedPIDPolicyArmer: @escaping (MCPBootstrapLeaseSpec) async -> Bool = { _ in true },
         ompQualificationAuthorizer: @escaping (OhMyPiAgentModeSmokeGate.StartTransaction, UUID) -> Bool = { _, _ in false },
         ompQualificationActiveWorkspaceID: @escaping () -> UUID? = { nil },
-        ompQualificationInvocationContext: ((AgentModeViewModel.TabSession) -> OhMyPiAgentModeSmokeGate.StartContext?)? = nil,
+        ompQualificationInvocationContext: ((AgentTabSession) -> OhMyPiAgentModeSmokeGate.StartContext?)? = nil,
         testBeforeOMPQualificationProviderAuthorization: @escaping () -> Void = {},
         testOMPQualificationProviderBootstrapEntry: @escaping () -> Void = {},
         testBeforeOMPQualificationAgentTaskEntry: @escaping () async -> Void = {},
@@ -6403,18 +6403,18 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
             recorder.record("factory:acp-controller")
             return try ACPAgentSessionController(provider: provider, runRequest: request, mcpHost: ServerNetworkManager.shared)
         }
-        let trackedACPControllerFactory: AgentModeViewModel.ACPControllerFactory = { [weak self] provider, request in
+        let trackedACPControllerFactory: AgentACPControllerFactory = { [weak self] provider, request in
             let controller = try baseACPControllerFactory(provider, request)
             self?.registerACPController(controller)
             return controller
         }
-        let policyInstaller: AgentModeViewModel.ConnectionPolicyInstaller = { clientName, _, _, _, _, _, _, runID, _, _, _, _, _, _, _ in
+        let policyInstaller: AgentConnectionPolicyInstaller = { clientName, _, _, _, _, _, _, runID, _, _, _, _, _, _, _ in
             recorder.record("policy:\(clientName):\(runID?.uuidString ?? "nil")")
             if autoSignalACPRouting, let runID {
                 await MCPRoutingWaiter.notifyRouted(runID: runID)
             }
         }
-        let serverEnabler: AgentModeViewModel.MCPServerEnabler = {}
+        let serverEnabler: AgentMCPServerEnabler = {}
         let host = AgentModeViewModel(
             testWindowID: 1,
             testWorkspacePath: FileManager.default.currentDirectoryPath,
@@ -6495,15 +6495,15 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
 
     private func makeHooks(
         recorder: LifecycleRecorder,
-        flushPendingAssistantDelta: ((AgentModeViewModel.TabSession) -> Void)? = nil,
-        publishTerminalCommit: ((AgentModeViewModel.TabSession, AgentRunTerminalCommitRevision) async -> Void)? = nil,
+        flushPendingAssistantDelta: ((AgentTabSession) -> Void)? = nil,
+        publishTerminalCommit: ((AgentTabSession, AgentRunTerminalCommitRevision) async -> Void)? = nil,
         publishTerminalCommitResult: ((
-            AgentModeViewModel.TabSession,
+            AgentTabSession,
             AgentRunTerminalCommitRevision,
             AgentRunEpochTransitionKind?
         ) async -> AgentRunTerminalPublicationResult)? = nil,
         makeTerminalPublicationEnvelope: ((
-            AgentModeViewModel.TabSession,
+            AgentTabSession,
             AgentRunOwnership,
             AgentSessionRunState,
             UUID?
@@ -6572,7 +6572,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
 
     private struct RetainedACPFixture {
         let host: AgentModeViewModel
-        let session: AgentModeViewModel.TabSession
+        let session: AgentTabSession
         let controller: ACPAgentSessionController
         let processID: pid_t
     }
@@ -6607,7 +6607,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
             ephemeralFlag: true
         )
         harness.host.test_establishPersistenceWorkspace(persistenceWorkspace)
-        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        let session = AgentTabSession(tabID: UUID())
         session.selectedAgent = .openCode
         session.runID = UUID()
         session.runState = .completed
@@ -6620,8 +6620,8 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         )
     }
 
-    func makeRunningClaudeSession(controller: LifecycleFakeNativeController) -> AgentModeViewModel.TabSession {
-        let session = AgentModeViewModel.TabSession(tabID: UUID())
+    func makeRunningClaudeSession(controller: LifecycleFakeNativeController) -> AgentTabSession {
+        let session = AgentTabSession(tabID: UUID())
         session.selectedAgent = .claudeCode
         session.runState = .running
         session.runID = UUID()
@@ -6631,10 +6631,10 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
     }
 
     func makeClaudeSteeringInstruction(
-        session: AgentModeViewModel.TabSession,
+        session: AgentTabSession,
         text: String
-    ) -> AgentModeViewModel.TabSession.ClaudeSteeringInstruction {
-        AgentModeViewModel.TabSession.ClaudeSteeringInstruction(
+    ) -> AgentTabSession.ClaudeSteeringInstruction {
+        AgentTabSession.ClaudeSteeringInstruction(
             id: UUID(),
             targetRunID: session.runID,
             targetRunAttemptID: session.activeRunAttemptID,
@@ -6647,8 +6647,8 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         )
     }
 
-    private func makeRunningACPSession(controller: ACPAgentSessionController) -> AgentModeViewModel.TabSession {
-        let session = AgentModeViewModel.TabSession(tabID: UUID())
+    private func makeRunningACPSession(controller: ACPAgentSessionController) -> AgentTabSession {
+        let session = AgentTabSession(tabID: UUID())
         session.selectedAgent = .openCode
         session.runState = .running
         session.runID = UUID()
@@ -6658,10 +6658,10 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
     }
 
     private func makeACPSteeringInstruction(
-        session: AgentModeViewModel.TabSession,
+        session: AgentTabSession,
         text: String
-    ) -> AgentModeViewModel.TabSession.ACPSteeringInstruction {
-        AgentModeViewModel.TabSession.ACPSteeringInstruction(
+    ) -> AgentTabSession.ACPSteeringInstruction {
+        AgentTabSession.ACPSteeringInstruction(
             id: UUID(),
             targetRunID: session.runID,
             targetRunAttemptID: session.activeRunAttemptID,

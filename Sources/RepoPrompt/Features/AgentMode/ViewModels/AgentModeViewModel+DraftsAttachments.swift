@@ -276,7 +276,7 @@ extension AgentModeViewModel {
     }
 
     @discardableResult
-    func reserveAttachmentsForTurn(_ attachments: [AgentImageAttachment], session: TabSession) -> UUID? {
+    func reserveAttachmentsForTurn(_ attachments: [AgentImageAttachment], session: AgentTabSession) -> UUID? {
         guard !attachments.isEmpty else {
             session.attachmentTurnState = .idle
             return nil
@@ -286,7 +286,7 @@ extension AgentModeViewModel {
         return reservationID
     }
 
-    func markAttachmentsConsumed(for session: TabSession, reservationID: UUID?) {
+    func markAttachmentsConsumed(for session: AgentTabSession, reservationID: UUID?) {
         switch session.attachmentTurnState {
         case .idle:
             return
@@ -299,7 +299,7 @@ extension AgentModeViewModel {
         }
     }
 
-    func stageConsumedAttachmentFilesForDeferredCleanup(_ attachments: [AgentImageAttachment], session: TabSession) {
+    func stageConsumedAttachmentFilesForDeferredCleanup(_ attachments: [AgentImageAttachment], session: AgentTabSession) {
         guard clearConsumedAttachmentsAfterProviderConsumption else { return }
         guard !attachments.isEmpty else { return }
         if session.attachmentsPendingProviderConsumptionCleanup.isEmpty {
@@ -311,7 +311,7 @@ extension AgentModeViewModel {
         session.attachmentsPendingProviderConsumptionCleanup.append(contentsOf: uniqueNewAttachments)
     }
 
-    func consumeDeferredAttachmentCleanup(for session: TabSession, shouldDeleteFiles: Bool) {
+    func consumeDeferredAttachmentCleanup(for session: AgentTabSession, shouldDeleteFiles: Bool) {
         let attachments = session.attachmentsPendingProviderConsumptionCleanup
         session.attachmentsPendingProviderConsumptionCleanup.removeAll()
         guard shouldDeleteFiles else { return }
@@ -319,9 +319,9 @@ extension AgentModeViewModel {
     }
 
     func finalizeAttachmentsForTurn(
-        for session: TabSession,
+        for session: AgentTabSession,
         reservationID: UUID? = nil,
-        disposition: AttachmentTurnDisposition
+        disposition: AgentAttachmentTurnDisposition
     ) {
         let attachments: [AgentImageAttachment]
         switch session.attachmentTurnState {

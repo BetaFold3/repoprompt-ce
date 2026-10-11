@@ -380,14 +380,14 @@ final class RemoteAgentModeCoordinatorDraftStashTests: XCTestCase {
     private struct DraftStashFixture {
         let tabID: UUID
         let viewModel: AgentModeViewModel
-        let session: AgentModeViewModel.TabSession
+        let session: AgentTabSession
         let coordinator: RemoteAgentModeCoordinator
     }
 
     private struct SuspendedRecover {
         let connection: DraftStashConnection
         let task: Task<Void, Never>
-        let session: AgentModeViewModel.TabSession
+        let session: AgentTabSession
 
         func finish() async {
             await connection.releaseSubscribe(throwing: DraftStashStubError())

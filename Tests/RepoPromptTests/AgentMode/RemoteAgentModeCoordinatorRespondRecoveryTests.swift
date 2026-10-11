@@ -290,7 +290,7 @@ final class RemoteAgentModeCoordinatorRespondRecoveryTests: XCTestCase {
     private struct RecoveryFixture {
         let tabID: UUID
         let viewModel: AgentModeViewModel
-        let session: AgentModeViewModel.TabSession
+        let session: AgentTabSession
         let coordinator: RemoteAgentModeCoordinator
     }
 }

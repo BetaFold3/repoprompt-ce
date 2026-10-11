@@ -75,7 +75,7 @@ final class AgentKnowledgeProviderPolicyTests: XCTestCase {
 
     @MainActor
     func testSessionProfileCanOnlyChangeBeforeProviderWorkStarts() {
-        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        let session = AgentTabSession(tabID: UUID())
         XCTAssertTrue(session.adoptSessionProfile(.knowledge))
         XCTAssertEqual(session.profile, .knowledge)
 
@@ -92,7 +92,7 @@ final class AgentKnowledgeProviderPolicyTests: XCTestCase {
             }
         )
 
-        let standardSession = AgentModeViewModel.TabSession(tabID: UUID())
+        let standardSession = AgentTabSession(tabID: UUID())
         viewModel.test_installLiveSession(standardSession)
         _ = viewModel.test_installPersistentSessionBinding(
             sessionID: UUID(),
@@ -109,7 +109,7 @@ final class AgentKnowledgeProviderPolicyTests: XCTestCase {
             requestedProfile: .knowledge
         ))
 
-        let knowledgeSession = AgentModeViewModel.TabSession(tabID: UUID())
+        let knowledgeSession = AgentTabSession(tabID: UUID())
         XCTAssertTrue(knowledgeSession.adoptSessionProfile(.knowledge))
         viewModel.test_installLiveSession(knowledgeSession)
         _ = viewModel.test_installPersistentSessionBinding(

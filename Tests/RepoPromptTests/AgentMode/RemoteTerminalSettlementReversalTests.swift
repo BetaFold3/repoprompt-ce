@@ -214,8 +214,8 @@ final class RemoteTerminalSettlementReversalTests: XCTestCase {
     }
 
     @MainActor
-    private func makeSession(remoteSessionID: String) -> AgentModeViewModel.TabSession {
-        let session = AgentModeViewModel.TabSession(tabID: UUID())
+    private func makeSession(remoteSessionID: String) -> AgentTabSession {
+        let session = AgentTabSession(tabID: UUID())
         session.remoteHost = makeBinding(remoteSessionID: remoteSessionID)
         return session
     }

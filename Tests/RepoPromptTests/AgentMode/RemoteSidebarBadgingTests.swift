@@ -523,7 +523,7 @@ final class RemoteSidebarBadgingTests: XCTestCase {
 
     private func build(
         tabs: [ComposeTabState],
-        sessions: [UUID: AgentModeViewModel.TabSession] = [:],
+        sessions: [UUID: AgentTabSession] = [:],
         sessionIndex: [UUID: AgentSessionIndexEntry],
         registeredRemoteHosts: [(id: String, displayName: String)] = [],
         pairedDeviceDisplayNameByBareID: [String: String] = [:]
@@ -559,8 +559,8 @@ final class RemoteSidebarBadgingTests: XCTestCase {
         tabID: UUID,
         sessionID: UUID,
         origin: AgentSessionOrigin
-    ) -> AgentModeViewModel.TabSession {
-        let session = AgentModeViewModel.TabSession(tabID: tabID)
+    ) -> AgentTabSession {
+        let session = AgentTabSession(tabID: tabID)
         session.testInstallPersistentSessionBinding(sessionID: sessionID)
         session.hasLoadedPersistedState = true
         session.origin = origin

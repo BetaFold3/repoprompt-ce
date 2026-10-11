@@ -49,12 +49,12 @@ extension AgentModeViewModel {
 
     /// Backend admission predicate: no provider work, reset, or rebinding while recovery owns the
     /// view or while an admitted removal operation has reserved the owner.
-    func staleResetRecoveryBlocksNewWork(_ session: TabSession) -> Bool {
+    func staleResetRecoveryBlocksNewWork(_ session: AgentTabSession) -> Bool {
         newWorkBlockedMessage(for: session) != nil
     }
 
     /// User-facing reason new work is refused for `session`, or `nil` when it is admissible.
-    func newWorkBlockedMessage(for session: TabSession) -> String? {
+    func newWorkBlockedMessage(for session: AgentTabSession) -> String? {
         if session.staleResetRecovery != nil {
             return Self.staleResetRecoveryBlockedMessage
         }
@@ -66,7 +66,7 @@ extension AgentModeViewModel {
         return nil
     }
 
-    func staleResetRecoveryProps(for session: TabSession) -> AgentStaleResetRecoveryProps? {
+    func staleResetRecoveryProps(for session: AgentTabSession) -> AgentStaleResetRecoveryProps? {
         guard let recovery = session.staleResetRecovery else { return nil }
         switch recovery.phase {
         case let .stopping(problem):
@@ -87,7 +87,7 @@ extension AgentModeViewModel {
     /// never restart the stop or replace its identity. Every mutation here precedes the first
     /// suspension.
     func handleStaleTranscriptResetForOwner(
-        _ session: TabSession,
+        _ session: AgentTabSession,
         saveToken: SessionSaveCommitToken,
         submittedState: AgentSessionPersistenceState,
         reportedResetGeneration: UInt64
@@ -130,7 +130,7 @@ extension AgentModeViewModel {
             return
         }
 
-        let recovery = StaleResetRecovery(
+        let recovery = AgentStaleResetRecovery(
             id: UUID(),
             tabID: session.tabID,
             sessionIdentity: ObjectIdentifier(session),
@@ -172,7 +172,7 @@ extension AgentModeViewModel {
         }
     }
 
-    private func staleResetRecoveryOwnerIsCurrent(_ recovery: StaleResetRecovery, session: TabSession) -> Bool {
+    private func staleResetRecoveryOwnerIsCurrent(_ recovery: AgentStaleResetRecovery, session: AgentTabSession) -> Bool {
         sessions[recovery.tabID] === session
             && ObjectIdentifier(session) == recovery.sessionIdentity
             && session.staleResetRecovery?.id == recovery.id
@@ -185,7 +185,7 @@ extension AgentModeViewModel {
             && session.persistenceRevokedSessionID != recovery.binding.sessionID
     }
 
-    func publishStaleResetRecoveryState(for session: TabSession) {
+    func publishStaleResetRecoveryState(for session: AgentTabSession) {
         syncComposerUIState(tabID: session.tabID)
         if session.tabID == currentTabID {
             updateBindingsFromSession(session)
@@ -195,7 +195,7 @@ extension AgentModeViewModel {
     }
 
     /// Run-state publications may refresh the recovery notice; they never launch hydration.
-    func refreshStaleResetRecoveryPresentationIfNeeded(for session: TabSession) {
+    func refreshStaleResetRecoveryPresentationIfNeeded(for session: AgentTabSession) {
         guard session.staleResetRecovery != nil else { return }
         syncComposerUIState(tabID: session.tabID)
     }
@@ -208,7 +208,7 @@ extension AgentModeViewModel {
     /// projections — no live attachment delivering events into the tab (the attachment is retired
     /// through the coordinator's stop lifecycle, which advances the tab's delivery generation so a
     /// delayed delivery from the old attachment is dropped even after a confirmed replacement).
-    func staleResetRecoveryIngestionIsQuiescent(_ session: TabSession) -> Bool {
+    func staleResetRecoveryIngestionIsQuiescent(_ session: AgentTabSession) -> Bool {
         !session.runState.isActive
             && !isTabRunning(session.tabID)
             && session.activeRunOwnership == nil
@@ -226,7 +226,7 @@ extension AgentModeViewModel {
     /// advances the tab's delivery generation — that detachment, not the host cancel, is what
     /// retires ingestion. The mirrored run state of the now-detached projection is frozen as
     /// cancelled locally.
-    func retireRemoteIngestion(for session: TabSession) async {
+    func retireRemoteIngestion(for session: AgentTabSession) async {
         let tabID = session.tabID
         if session.runState.isActive, remoteCoordinator.isAttached(tabID: tabID) {
             try? await remoteCoordinator.cancel(session: session)
@@ -344,7 +344,7 @@ extension AgentModeViewModel {
         }
 
         let attemptID = UUID()
-        let consent = StaleResetRecovery.ConsentRevision(
+        let consent = AgentStaleResetRecovery.ConsentRevision(
             sourceItemsRevision: session.sourceItemsRevision,
             persistenceMutationGeneration: session.persistenceMutationGeneration
         )
@@ -392,7 +392,7 @@ extension AgentModeViewModel {
     /// the exact consent revisions, quiescence, and the persisted lifetime are all re-checked
     /// here, after the read and before the first destructive mutation.
     func staleResetRecoveryReplacementPermitIsCurrent(
-        _ session: TabSession,
+        _ session: AgentTabSession,
         attemptID: UUID,
         payload: AgentSessionHydrationPayload
     ) -> Bool {
@@ -420,7 +420,7 @@ extension AgentModeViewModel {
     /// sidecars, and the discarded working copy's pending reset/removal bookkeeping are cleared
     /// so they cannot contaminate the loaded transcript. Composer text and pending attachments
     /// are deliberately untouched.
-    func prepareSessionForStaleResetRecoveryReplacement(_ session: TabSession) {
+    func prepareSessionForStaleResetRecoveryReplacement(_ session: AgentTabSession) {
         clearPendingAssistantDelta(session)
         session.pendingTranscriptResetReceipt = nil
         session.pendingFinalizedScheduledSendItemRemovals.removeAll()
@@ -436,7 +436,7 @@ extension AgentModeViewModel {
 
     /// The paired replacement committed: authority is installed by the caller; the recovery
     /// episode ends here. The retained (discarded) work no longer dirties the adopted snapshot.
-    func completeStaleResetRecoveryReplacement(_ session: TabSession) {
+    func completeStaleResetRecoveryReplacement(_ session: AgentTabSession) {
         session.staleResetRecoveryTask = nil
         session.staleResetRecovery = nil
         session.isDirty = false
@@ -621,7 +621,7 @@ extension AgentModeViewModel {
         else { return nil }
 
         var targets: [ComposeTabRemovalOperation.Target] = []
-        var admissions: [(TabSession, StaleResetRemovalAdmission)] = []
+        var admissions: [(AgentTabSession, AgentStaleResetRemovalAdmission)] = []
         for tabID in tabIDs.sorted(by: { $0.uuidString < $1.uuidString }) {
             if let owner = entryOwnersByTabID[tabID] {
                 let session = owner.session
@@ -629,7 +629,7 @@ extension AgentModeViewModel {
                       session.staleResetRemovalAdmission == nil,
                       session.staleResetRecovery?.id == consentByTabID[tabID]?.episodeID
                 else { return nil }
-                let admission = StaleResetRemovalAdmission(
+                let admission = AgentStaleResetRemovalAdmission(
                     id: UUID(),
                     operationID: operationID,
                     sessionIdentity: ObjectIdentifier(session),
@@ -811,7 +811,7 @@ extension AgentModeViewModel {
     /// settlement checks: relinquishes the consented episode, marks the admission committed (saves
     /// are refused from here on, so nothing can be discovered after the final save), and drops any
     /// debounced save. No suspension may occur between the batch check and this call.
-    func commitStaleResetRemoval(_ session: TabSession) {
+    func commitStaleResetRemoval(_ session: AgentTabSession) {
         session.invalidateStaleResetRecoveryForLifecycle()
         session.staleResetRemovalAdmission?.isReserved = true
         session.staleResetRemovalAdmission?.isCommitted = true
@@ -831,5 +831,5 @@ extension AgentModeViewModel {
 /// Main-actor box carrying one confirmed reload's operation-owned outcome out of its task.
 @MainActor
 private final class StaleResetReloadOutcomeBox {
-    var disposition: AgentModeViewModel.TabSession.PersistedLoadDisposition = .unresolved
+    var disposition: AgentTabSession.PersistedLoadDisposition = .unresolved
 }

@@ -15,10 +15,6 @@ enum AgentSidebarThreadKey: Hashable, Equatable {
 }
 
 extension AgentModeViewModel {
-    typealias TabSession = AgentTabSession
-
-    typealias RemoteResendPayload = AgentRemoteResendPayload
-
     enum UserTurnSubmissionResult: Equatable {
         case submitted
         case scheduled(id: UUID)
@@ -44,11 +40,9 @@ extension AgentModeViewModel {
         let stagedCodexComputerUseActivationID: UUID?
     }
 
-    typealias ScheduledSendPendingFinalization = AgentScheduledSendPendingFinalization
-
     struct AgentComposerSubmitClaim {
         let attempt: AgentComposerSubmitAttempt
-        let sourceSession: TabSession
+        let sourceSession: AgentTabSession
         let draftMutationGeneration: UInt64
     }
 
@@ -83,12 +77,6 @@ extension AgentModeViewModel {
         case rejected(AgentComposerSubmitClaimRejection)
     }
 
-    typealias RunInteractionStateChangeReason = AgentRunInteractionStateChangeReason
-
-    typealias AgentInteractionTransport = RepoPromptAgentCore.AgentInteractionTransport
-
-    typealias UIRefreshScope = AgentUIRefreshScope
-
     struct AssistantPresentationRequest: Equatable {
         let tabID: UUID
         let sessionIdentity: ObjectIdentifier
@@ -98,10 +86,8 @@ extension AgentModeViewModel {
         let flushGeneration: UInt64
     }
 
-    typealias PersistentBindingTransitionToken = AgentPersistentBindingTransitionToken
-
     struct PersistedHydrationCommitToken: Equatable {
-        let transition: PersistentBindingTransitionToken
+        let transition: AgentPersistentBindingTransitionToken
         let requestedSessionID: UUID
     }
 
@@ -132,12 +118,6 @@ extension AgentModeViewModel {
         let saveRequestGeneration: UInt64
     }
 
-    typealias StaleResetRecovery = AgentStaleResetRecovery
-
-    typealias StaleResetRemovalAdmission = AgentStaleResetRemovalAdmission
-
-    typealias PersistedLoadOutcome = AgentPersistedLoadOutcome
-
     /// Operation-owned compose-tab removal batch: the complete requested tab set with each
     /// target's ownership state captured before the first admission await (a live owner with its
     /// binding/transition identity, or explicit absence), the workspace owner captured at entry,
@@ -147,14 +127,14 @@ extension AgentModeViewModel {
     final class ComposeTabRemovalOperation {
         /// Ownership observed at admission entry, before any await.
         struct EntryOwner {
-            let session: TabSession
+            let session: AgentTabSession
             let binding: AgentPersistentSessionBindingIdentity?
             let transitionGeneration: UInt64
         }
 
         struct Target {
             let tabID: UUID
-            let session: TabSession
+            let session: AgentTabSession
             let binding: AgentPersistentSessionBindingIdentity?
             let transitionGeneration: UInt64
             let admissionID: UUID
@@ -163,7 +143,7 @@ extension AgentModeViewModel {
 
         struct CleanupDescriptor {
             let tabID: UUID
-            let session: TabSession?
+            let session: AgentTabSession?
             let boundSessionID: UUID?
             let runID: UUID?
             let approvalScope: ApplyEditsApprovalScope
@@ -348,10 +328,6 @@ extension AgentModeViewModel {
     /// provider binding layer's top-level permission profile model.
     typealias AgentPermissionProfile = AgentProviderPermissionProfile
 
-    typealias AgentRunEpochTransitionIntent = RepoPromptAgentCore.AgentRunEpochTransitionIntent
-
-    typealias AgentMCPControlContext = RepoPromptAgentCore.AgentMCPControlContext
-
     /// Internal for cross-file AgentModeViewModel extension access after the mechanical file split.
     enum MCPActiveInstructionDeliverySignalTiming: Equatable {
         /// The instruction can wake MCP waiters as soon as the local optimistic submit is accepted.
@@ -463,16 +439,6 @@ extension AgentModeViewModel {
         var adoptedSessionProfile: AgentSessionProfile?
     }
 
-    typealias AutoEditPermissionGuidance = AgentAutoEditPermissionGuidance
-
-    typealias NonCodexTurnTokenAccumulator = AgentNonCodexTurnTokenAccumulator
-
-    typealias AttachmentTurnDisposition = AgentAttachmentTurnDisposition
-
-    typealias AttachmentTurnState = AgentAttachmentTurnState
-
-    typealias CodexComputerUseActivation = AgentCodexComputerUseActivation
-
     struct NativeSlashPreparedUserTurn: Equatable {
         let command: CodexAgentModeCoordinator.NativeSlashCommand
         let argumentsText: String
@@ -480,24 +446,6 @@ extension AgentModeViewModel {
         let bubbleWorkflow: AgentWorkflowDefinition?
         let shouldEnableCodexComputerUse: Bool
     }
-
-    typealias PendingHandoffState = AgentPendingHandoffState
-
-    typealias CodexWatchdogState = AgentCodexWatchdogState
-
-    typealias CodexResumeTimeoutState = AgentCodexResumeTimeoutState
-
-    typealias CodexNativeToolLivenessState = AgentCodexNativeToolLivenessState
-
-    typealias BashLiveExecutionState = AgentBashLiveExecutionState
-
-    typealias SourceItemsMutation = AgentSourceItemsMutation
-
-    typealias AgentTranscriptAutoFollowArmingState = RepoPromptAgentCore.AgentTranscriptAutoFollowArmingState
-
-    typealias PendingSourceItemsMutationSummary = AgentPendingSourceItemsMutationSummary
-
-    typealias DerivedTranscriptSyncState = AgentDerivedTranscriptSyncState
 
     struct PersistableTranscriptSnapshot {
         let transcript: AgentTranscript
@@ -618,20 +566,12 @@ extension AgentModeViewModel {
         }
     }
 
-    typealias BuiltTranscriptPresentation = AgentBuiltTranscriptPresentation
-
-    typealias DerivedTranscriptRefreshReason = AgentDerivedTranscriptRefreshReason
-
     /// Internal for cross-file AgentModeViewModel extension access after the mechanical file split.
     struct SessionTreeNode {
         var parentSessionID: UUID?
         var composeTabIDs: Set<UUID> = []
         var stashedTabIDs: Set<UUID> = []
     }
-
-    typealias AgentExecutionWorktreeSelection = RepoPromptAgentCore.AgentExecutionWorktreeSelection
-
-    typealias InitialStartLocation = AgentInitialStartLocation
 
     enum ExecutionLocationChangeConfirmation: Equatable {
         case startedThreadRestart
@@ -656,7 +596,7 @@ extension AgentModeViewModel {
         let workflow: AgentWorkflowDefinition?
         let imageAttachments: [AgentImageAttachment]
         let taggedFileAttachments: [AgentTaggedFileAttachment]
-        let initialStartLocation: InitialStartLocation
+        let initialStartLocation: AgentInitialStartLocation
         let remoteHost: AgentSessionRemoteHostBinding?
 
         var isEmpty: Bool {

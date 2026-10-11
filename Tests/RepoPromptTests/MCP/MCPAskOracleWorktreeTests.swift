@@ -5150,8 +5150,8 @@ import XCTest
 
         private func makeAgentMCPControlContext(
             sessionID: UUID
-        ) -> AgentModeViewModel.AgentMCPControlContext {
-            AgentModeViewModel.AgentMCPControlContext(
+        ) -> AgentMCPControlContext {
+            AgentMCPControlContext(
                 sessionID: sessionID,
                 activationID: UUID(),
                 registration: .init(sessionID: sessionID, generation: 0),

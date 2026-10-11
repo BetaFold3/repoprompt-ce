@@ -4,6 +4,17 @@ Scope: read when the task touches splitting `RepoPromptApp` into new root-packag
 Authority: Reference
 Last-verified: 2026-10-10
 
+## Outcome (completed 2026-10-11)
+- Done-when met in six slices (about 55 hours): `RepoPromptPlatform`, `RepoPromptWorkspace`, `RepoPromptAgentCore`, `RepoPromptUI` and `RepoPromptApp` exist as internal static targets with only their allowed lower dependencies (UI currently needs none), and `source-layout.md` plus `make guardrails` describe and check the five roots.
+- The Objective-C bridging header is gone; C code is reached through module imports.
+- Behavior, saved data, test discovery (6464 identical names), the ledger checksum and tooling are unchanged; only baseline test failures remain, and the ad-hoc universal release package builds.
+- Decisions: hoisted nested types use domain-prefixed top-level names, and their temporary same-type aliases were removed in Step 6b. App singletons reach AgentCore through injected closures, and code that needs App or UI declarations stays in App. Release flags are SwiftPM's `-O` with whole-module optimization and the driver's default conservative cross-module optimization, unchanged.
+- Remaining deferrals:
+  - 5m P3-2: the Azure cache argument is ignored after the first call.
+  - 5r P3-2: rename the coordinators' `viewModel` and `attach(viewModel:)` to host terms.
+  - 5r P3-3: inject `providerBindingService` into the Claude coordinator.
+  - 5q: switch callers to `CodexDebugLog.log` directly; the `logCodexDebug` forwarder is kept. Assumption A1 (two orphan plans make `make guardrails` fail) is pre-existing.
+
 ## Goal
 Split the single `RepoPromptApp` target (~694k lines) into layered modules so the dependency direction is enforced by the compiler: runtime and engine code cannot reach into views and view models, and each lower layer can be built and tested without the app. This is architecture work. It is not expected to make builds or the running app faster.
 
@@ -485,6 +496,15 @@ Result: the 324-file agent move set plus `ErrorExtensions.swift` now lives in `R
 Decisions: four approved fixes: `nativeSlashCommandSuggestions` moved verbatim into an App extension of the Codex coordinator (1a); `AgentPreviewLinkRouter` stays in App (2a); the coordinator gets `CodexModelPollingService` from a required init closure called where `.shared` was read (3a); `ErrorExtensions.swift` joins AgentCore with `package` `asFriendlyString` (4a). Guardrails give AgentCore the same checks as Platform, UI and Workspace (required directory, no `@main`, manifest type and path); the round-0 forbidden-dependency and import checks were removed, and `source-layout.md` keeps the allowed dependencies as prose. `RepoPromptRemoteWire` and the third-party packages (swift-log, MCP, SwiftAnthropic, SwiftOpenAI, `RepoPromptClaudeCompatibleProvider`) are AgentCore dependencies alongside Workspace, Platform and `RepoPromptShared`.
 
 Step 6a — done | rounds 0/2 | open: | downgraded: | assumed: A1 | deferred: 5m OracleB P3-2; 5r OracleB P3-2, P3-3
+
+#### Step 6b — remove the temporary hoisting typealiases
+Intent: remove the temporary same-type typealiases left by the Slice 5 hoists and check the release compile flags once without changing them.
+
+Budget used: about 3 hours (cumulative ~54.7 hours).
+
+Result: the 41 temporary hoisting typealiases (30 in `AgentModeViewModel+Types.swift`, 8 view-model factory and control shims, `ProviderUsageSnapshot` and the two `MCPServerViewModel` drain aliases) are gone, every old spelling in App and Tests now names the hoisted type (mechanically checked as spelling-only apart from the deletions, one import and three `package` modifiers the compiler no longer needs), the pre-split aliases are kept, the gates pass (6464 identical test names, only baseline failures, unchanged ledger, guardrails failing only on A1, Xcode checks passing) along with the ad-hoc universal release package build, and the recorded release flags are `-O` with whole-module optimization and the driver's default conservative cross-module optimization, unchanged.
+
+Step 6b — done | rounds 0/2 | open: | downgraded: | assumed: A1 | deferred: 5m OracleB P3-2; 5r OracleB P3-2, P3-3; 5q direct CodexDebugLog.log callers (logCodexDebug forwarder kept)
 
 ## Decisions
 - Purpose: architecture and enforced boundaries, not build or runtime speed.

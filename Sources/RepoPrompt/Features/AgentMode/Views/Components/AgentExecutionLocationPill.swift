@@ -44,14 +44,14 @@ enum AgentExecutionLocationPickerLayout {
 
 struct AgentExecutionLocationPill: View {
     let props: AgentExecutionLocationProps
-    let loadExistingWorktrees: () async throws -> [AgentModeViewModel.AgentExecutionWorktreeSelection]
-    let selectLocation: (AgentModeViewModel.InitialStartLocation, AgentModeViewModel.ExecutionLocationChangeConfirmation?) async -> AgentModeViewModel.ExecutionLocationChangeResult
+    let loadExistingWorktrees: () async throws -> [AgentExecutionWorktreeSelection]
+    let selectLocation: (AgentInitialStartLocation, AgentModeViewModel.ExecutionLocationChangeConfirmation?) async -> AgentModeViewModel.ExecutionLocationChangeResult
 
     @State private var showPopover = false
-    @State private var existingWorktrees: [AgentModeViewModel.AgentExecutionWorktreeSelection] = []
+    @State private var existingWorktrees: [AgentExecutionWorktreeSelection] = []
     @State private var isLoadingExistingWorktrees = false
     @State private var optionError: String?
-    @State private var pendingConfirmedChoice: AgentModeViewModel.InitialStartLocation?
+    @State private var pendingConfirmedChoice: AgentInitialStartLocation?
     @State private var pendingConfirmation: AgentModeViewModel.ExecutionLocationChangeConfirmation?
     @State private var showLocationChangeConfirmation = false
     @ObservedObject private var fontScale = FontScaleManager.shared
@@ -267,7 +267,7 @@ struct AgentExecutionLocationPill: View {
     }
 
     private struct ExistingWorktreePickerRow: Identifiable {
-        let selection: AgentModeViewModel.AgentExecutionWorktreeSelection
+        let selection: AgentExecutionWorktreeSelection
         let title: String
         let subtitle: String
         let tooltip: String
@@ -278,7 +278,7 @@ struct AgentExecutionLocationPill: View {
             selection.presentationID
         }
 
-        init(selection: AgentModeViewModel.AgentExecutionWorktreeSelection) {
+        init(selection: AgentExecutionWorktreeSelection) {
             self.selection = selection
             let worktreeName = Self.worktreeName(for: selection)
             let branchOrHead = Self.branchOrHeadLabel(for: selection)
@@ -309,7 +309,7 @@ struct AgentExecutionLocationPill: View {
             isDisabled = selection.isPrunable
         }
 
-        private static func branchOrHeadLabel(for selection: AgentModeViewModel.AgentExecutionWorktreeSelection) -> String {
+        private static func branchOrHeadLabel(for selection: AgentExecutionWorktreeSelection) -> String {
             if let branch = selection.branch, !branch.isEmpty {
                 return branch
             }
@@ -319,7 +319,7 @@ struct AgentExecutionLocationPill: View {
             return selection.isDetached ? "Detached HEAD" : selection.label
         }
 
-        private static func worktreeName(for selection: AgentModeViewModel.AgentExecutionWorktreeSelection) -> String {
+        private static func worktreeName(for selection: AgentExecutionWorktreeSelection) -> String {
             if let name = selection.name, !name.isEmpty {
                 return name
             }
@@ -337,7 +337,7 @@ struct AgentExecutionLocationPill: View {
         }
     }
 
-    private func locationOption(_ selection: AgentModeViewModel.InitialStartLocation, icon: String) -> some View {
+    private func locationOption(_ selection: AgentInitialStartLocation, icon: String) -> some View {
         let title: String?
         let subtitle: String?
         if case .local = selection {
@@ -362,7 +362,7 @@ struct AgentExecutionLocationPill: View {
     }
 
     private func optionButton(
-        selection: AgentModeViewModel.InitialStartLocation,
+        selection: AgentInitialStartLocation,
         icon: String,
         title: String? = nil,
         subtitle: String?,
@@ -386,7 +386,7 @@ struct AgentExecutionLocationPill: View {
     }
 
     private struct ExecutionLocationOptionButton: View {
-        let selection: AgentModeViewModel.InitialStartLocation
+        let selection: AgentInitialStartLocation
         let icon: String
         let title: String
         let subtitle: String?
@@ -395,7 +395,7 @@ struct AgentExecutionLocationPill: View {
         let isDisabled: Bool
         let fontPreset: FontScalePreset
         let rowWidth: CGFloat
-        let applySelection: (AgentModeViewModel.InitialStartLocation) -> Void
+        let applySelection: (AgentInitialStartLocation) -> Void
 
         private var accessibilityIdentifier: String {
             switch selection {
@@ -480,7 +480,7 @@ struct AgentExecutionLocationPill: View {
         }
     }
 
-    private func isSelected(_ selection: AgentModeViewModel.InitialStartLocation) -> Bool {
+    private func isSelected(_ selection: AgentInitialStartLocation) -> Bool {
         switch (props.selection, selection) {
         case (.local, .local), (.newWorktree, .newWorktree):
             true
@@ -505,7 +505,7 @@ struct AgentExecutionLocationPill: View {
     }
 
     private func applySelection(
-        _ selection: AgentModeViewModel.InitialStartLocation,
+        _ selection: AgentInitialStartLocation,
         confirmedBy confirmation: AgentModeViewModel.ExecutionLocationChangeConfirmation? = nil
     ) {
         Task {

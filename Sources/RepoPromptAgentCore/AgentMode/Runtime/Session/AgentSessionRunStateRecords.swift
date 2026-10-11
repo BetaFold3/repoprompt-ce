@@ -177,7 +177,7 @@ package struct AgentPendingHandoffState: Equatable {
     }
 }
 
-package struct AgentCodexWatchdogState: Equatable {
+struct AgentCodexWatchdogState: Equatable {
     var lastProgressAt: Date?
     var suppressUntil: Date?
     var ambiguousActiveProbeCount: Int = 0
@@ -189,13 +189,13 @@ package struct AgentCodexWatchdogState: Equatable {
 /// Consecutive `thread/resume` timeouts for one saved target. It only drives failure guidance
 /// and never changes which request is sent. It resets on success, a target change, or a
 /// failure that is neither a timeout nor a cancellation; Stop leaves it unchanged.
-package struct AgentCodexResumeTimeoutState: Equatable {
+struct AgentCodexResumeTimeoutState: Equatable {
     var conversationID: String?
     var rolloutPath: String?
     var consecutiveTimeouts: Int = 0
 }
 
-package struct AgentCodexNativeToolLivenessState: Equatable {
+struct AgentCodexNativeToolLivenessState: Equatable {
     struct Key: Hashable {
         let invocationID: UUID?
         let fallbackSignature: String

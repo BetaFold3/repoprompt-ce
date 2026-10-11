@@ -592,7 +592,7 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
         }
 
         /// Delegated-question runtime notes recorded in a parent transcript.
-        static func delegatedQuestionNoticeNotes(in session: AgentModeViewModel.TabSession) -> [AgentChatItem] {
+        static func delegatedQuestionNoticeNotes(in session: AgentTabSession) -> [AgentChatItem] {
             session.items.filter {
                 $0.kind == .system && $0.text.hasPrefix(AgentDelegatedQuestionNoticeWire.noticeHeader)
             }
@@ -632,7 +632,7 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
             ))
             child.hasLoadedPersistedState = true
             child.parentSessionID = Fixture.agentSessionID
-            child.mcpControlContext = AgentModeViewModel.AgentMCPControlContext(
+            child.mcpControlContext = AgentMCPControlContext(
                 sessionID: childSessionID,
                 activationID: UUID(),
                 registration: .init(sessionID: childSessionID, generation: 0),
@@ -3529,7 +3529,7 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
 
         struct DelegationChain {
             /// The routed fixture tab's own session (a sub-worker, or a Knowledge root or worker).
-            let subWorker: AgentModeViewModel.TabSession
+            let subWorker: AgentTabSession
             let decision: AgentDelegationPolicy.Decision
             let runToolPolicy: AgentDelegationPolicy.RunToolPolicy
             var sessionProfile: AgentSessionProfile = .standard
@@ -3582,7 +3582,7 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
                 sessionID: UUID,
                 parentSessionID: UUID?,
                 role: AgentModelCatalog.TaskLabelKind?
-            ) throws -> AgentModeViewModel.TabSession {
+            ) throws -> AgentTabSession {
                 let session = try XCTUnwrap(viewModel.session(for: tabID, createIfNeeded: true))
                 guard session.activeAgentSessionID == sessionID else {
                     throw ClientFixtureError.delegationChainSeedFailed(tabID)
@@ -3590,7 +3590,7 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
                 session.hasLoadedPersistedState = true
                 session.parentSessionID = parentSessionID
                 if parentSessionID != nil {
-                    session.mcpControlContext = AgentModeViewModel.AgentMCPControlContext(
+                    session.mcpControlContext = AgentMCPControlContext(
                         sessionID: sessionID,
                         activationID: UUID(),
                         registration: .init(sessionID: sessionID, generation: 0),
@@ -3646,7 +3646,7 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
                 sessionID: UUID,
                 parentSessionID: UUID?,
                 profile: AgentSessionProfile
-            ) throws -> AgentModeViewModel.TabSession {
+            ) throws -> AgentTabSession {
                 let session = try XCTUnwrap(viewModel.session(for: tabID, createIfNeeded: true))
                 guard session.activeAgentSessionID == sessionID,
                       session.adoptSessionProfile(profile)
@@ -3656,7 +3656,7 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
                 session.hasLoadedPersistedState = true
                 session.parentSessionID = parentSessionID
                 if parentSessionID != nil {
-                    session.mcpControlContext = AgentModeViewModel.AgentMCPControlContext(
+                    session.mcpControlContext = AgentMCPControlContext(
                         sessionID: sessionID,
                         activationID: UUID(),
                         registration: .init(sessionID: sessionID, generation: 0),
@@ -3673,7 +3673,7 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
                 }
                 return session
             }
-            let routed: AgentModeViewModel.TabSession
+            let routed: AgentTabSession
             switch role {
             case .root:
                 routed = try hydrate(tabID: tabID, sessionID: agentSessionID, parentSessionID: nil, profile: .knowledge)

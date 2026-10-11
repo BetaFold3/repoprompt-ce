@@ -209,7 +209,7 @@ extension AgentModeViewModel {
     /// Reconciled audience for `session`'s `ask_user` (plan §6.1). Reuses the delegation lineage
     /// lookups; never guesses a parent. Remote-host projections are out of scope (unchanged).
     func delegatedQuestionAudience(
-        for session: TabSession,
+        for session: AgentTabSession,
         provenance: AgentDelegatedQuestionControllerProvenance
     ) -> AgentDelegatedQuestionAudience {
         let isControlled = isMCPControlled(tabID: session.tabID)
@@ -235,7 +235,7 @@ extension AgentModeViewModel {
     }
 
     /// The single live local record bound to `parentSessionID`; ambiguous bindings are not live.
-    func liveDelegatedQuestionParent(parentSessionID: UUID) -> TabSession? {
+    func liveDelegatedQuestionParent(parentSessionID: UUID) -> AgentTabSession? {
         let matches = sessions.values.filter {
             $0.activeAgentSessionID == parentSessionID && $0.remoteHost == nil
         }
@@ -254,7 +254,7 @@ extension AgentModeViewModel {
     /// the caller starts the normal timeout unless the audience pauses it.
     @discardableResult
     func installDelegatedQuestionRouting(
-        for session: TabSession,
+        for session: AgentTabSession,
         interactionID: UUID,
         provenance: AgentDelegatedQuestionControllerProvenance
     ) -> AgentDelegatedQuestionAudience {
@@ -365,7 +365,7 @@ extension AgentModeViewModel {
     }
 
     /// Cheap relevance gate for high-frequency binding updates.
-    func reconcileDelegatedQuestionNoticesIfRelevant(to session: TabSession) {
+    func reconcileDelegatedQuestionNoticesIfRelevant(to session: AgentTabSession) {
         guard !delegatedQuestionNotices.isEmpty, !delegatedQuestionNotices.isReconciling else { return }
         let tabID = session.tabID
         let sessionID = session.activeAgentSessionID
@@ -378,7 +378,7 @@ extension AgentModeViewModel {
 
     private func delegatedQuestionPendingChild(
         for record: AgentDelegatedQuestionNoticeRegistry.Record
-    ) -> TabSession? {
+    ) -> AgentTabSession? {
         guard let child = sessions[record.childTabID],
               child.activeAgentSessionID == record.key.childSessionID,
               child.remoteHost == nil,
@@ -391,7 +391,7 @@ extension AgentModeViewModel {
         return child
     }
 
-    private func delegatedQuestionChildName(_ child: TabSession, childSessionID: UUID) -> String {
+    private func delegatedQuestionChildName(_ child: AgentTabSession, childSessionID: UUID) -> String {
         if let name = workspaceManager?.composeTabName(with: child.tabID) {
             return name
         }
@@ -429,7 +429,7 @@ extension AgentModeViewModel {
 
     /// The live parent record whose *active* run is `runID` and whose identity is a notice parent.
     /// An idle parent that merely retains its process run ID (Claude) is never a destination.
-    private func delegatedQuestionParentSession(forRunID runID: UUID) -> TabSession? {
+    private func delegatedQuestionParentSession(forRunID runID: UUID) -> AgentTabSession? {
         let matches = sessions.values.filter { $0.runID == runID && $0.remoteHost == nil }
         guard matches.count == 1, let parent = matches.first,
               parent.runState.isActive,
@@ -443,7 +443,7 @@ extension AgentModeViewModel {
     }
 
     /// The live parent whose active run and run attempt still match `target`.
-    private func delegatedQuestionParentSession(for target: AgentDelegatedQuestionDeliveryTarget) -> TabSession? {
+    private func delegatedQuestionParentSession(for target: AgentDelegatedQuestionDeliveryTarget) -> AgentTabSession? {
         guard let parent = delegatedQuestionParentSession(forRunID: target.parentRunID),
               parent.activeRunAttemptID == target.runAttemptID
         else {
@@ -719,7 +719,7 @@ extension AgentModeViewModel {
     /// next turn. The user's message text and transcript item are never modified. The notices
     /// stay unacknowledged until `recordDelegatedQuestionNoticeSendOutcome` confirms the send of
     /// this exact stage. Notices reserved by an open tool-result handoff are never staged.
-    func stageDelegatedQuestionNoticesForTurnInput(_ text: String, session: TabSession) -> String {
+    func stageDelegatedQuestionNoticesForTurnInput(_ text: String, session: AgentTabSession) -> String {
         guard !delegatedQuestionNotices.records.isEmpty || delegatedQuestionNotices.stagedTurnNoticesByParentTabID[session.tabID] != nil else {
             return text
         }
@@ -776,7 +776,7 @@ extension AgentModeViewModel {
     /// and reconcile rolls the stage back if that run stops without reporting one.
     func settleDelegatedQuestionTurnStageAfterRunStart(
         _ stageID: UUID?,
-        session: TabSession,
+        session: AgentTabSession,
         startReportedNoSend: Bool
     ) {
         guard let stageID,
@@ -816,7 +816,7 @@ extension AgentModeViewModel {
     /// them is known. Only the stage identified by `stageID` is settled: a late outcome from an
     /// earlier, superseded start never commits or releases a newer stage. A nil `stageID` (the
     /// input carried no notices) is a no-op.
-    func recordDelegatedQuestionNoticeSendOutcome(for session: TabSession, stageID: UUID?, didSend: Bool) {
+    func recordDelegatedQuestionNoticeSendOutcome(for session: AgentTabSession, stageID: UUID?, didSend: Bool) {
         guard let stageID,
               let staged = delegatedQuestionNotices.stagedTurnNoticesByParentTabID[session.tabID],
               staged.stageID == stageID
@@ -851,7 +851,7 @@ extension AgentModeViewModel {
     /// Persists delivered notice text (what the model saw) as a labeled, ID-bearing runtime note
     /// in the parent transcript. Live state stays in the child's pendingAskUser, so this note is
     /// never read back as current state.
-    private func appendDelegatedQuestionNoticeNote(_ text: String, session: TabSession) {
+    private func appendDelegatedQuestionNoticeNote(_ text: String, session: AgentTabSession) {
         session.appendItem(.system(text, sequenceIndex: session.nextSequenceIndex))
         session.isDirty = true
         scheduleSave(for: session.tabID)
@@ -865,7 +865,7 @@ extension AgentModeViewModel {
     /// question the parent was handed. The returned result is never changed.
     private func appendDelegatedQuestionCoveredRecordNote(
         for keys: Set<AgentDelegatedQuestionNoticeKey>,
-        parent: TabSession
+        parent: AgentTabSession
     ) {
         guard !keys.isEmpty, let parentSessionID = parent.activeAgentSessionID else { return }
         let payloads = delegatedQuestionRecordsSorted(parentSessionID: parentSessionID)
@@ -878,7 +878,7 @@ extension AgentModeViewModel {
     /// Stage and commit in one step for inputs delivered synchronously to a waiting provider
     /// (instruction-continuation resume and queued instructions): returning the text is the
     /// handoff, so the stage created here commits immediately.
-    func deliverDelegatedQuestionNoticesWithImmediateInput(_ text: String, session: TabSession) -> String {
+    func deliverDelegatedQuestionNoticesWithImmediateInput(_ text: String, session: AgentTabSession) -> String {
         let staged = stageDelegatedQuestionNoticesForTurnInput(text, session: session)
         guard staged != text else { return staged }
         recordDelegatedQuestionNoticeSendOutcome(

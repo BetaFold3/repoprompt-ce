@@ -1385,7 +1385,7 @@ final class AgentDelegationServiceBoundaryTests: XCTestCase {
     private struct Node {
         let tabID: UUID
         let sessionID: UUID
-        let session: AgentModeViewModel.TabSession
+        let session: AgentTabSession
     }
 
     private struct Fixture {
@@ -1486,8 +1486,8 @@ final class AgentDelegationServiceBoundaryTests: XCTestCase {
         ))
     }
 
-    private func controlContext(sessionID: UUID, role: AgentModelCatalog.TaskLabelKind?) -> AgentModeViewModel.AgentMCPControlContext {
-        AgentModeViewModel.AgentMCPControlContext(
+    private func controlContext(sessionID: UUID, role: AgentModelCatalog.TaskLabelKind?) -> AgentMCPControlContext {
+        AgentMCPControlContext(
             sessionID: sessionID,
             activationID: UUID(),
             registration: .init(sessionID: sessionID, generation: 0),
@@ -1597,7 +1597,7 @@ final class AgentDelegationServiceBoundaryTests: XCTestCase {
         return args
     }
 
-    private func makeExtraSession(_ fixture: Fixture) async throws -> AgentModeViewModel.TabSession {
+    private func makeExtraSession(_ fixture: Fixture) async throws -> AgentTabSession {
         await fixture.window.promptManager.createBlankComposeTab(createAgentSession: false)
         let tabID = try XCTUnwrap(fixture.window.workspaceManager.activeWorkspace?.activeComposeTabID)
         return try await fixture.viewModel.ensureSessionReady(tabID: tabID)
@@ -1845,7 +1845,7 @@ final class AgentDelegationServiceBoundaryTests: XCTestCase {
     }
 
     private func assertEditApproval(
-        of session: AgentModeViewModel.TabSession,
+        of session: AgentTabSession,
         is autoEdit: Bool,
         in vm: AgentModeViewModel,
         label: String,

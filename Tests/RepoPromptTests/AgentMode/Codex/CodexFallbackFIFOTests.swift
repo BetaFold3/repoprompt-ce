@@ -1007,7 +1007,7 @@ final class CodexFallbackFIFOTests: XCTestCase {
             sequenceIndex: session.nextSequenceIndex
         )
         session.appendItem(userItem)
-        let context = AgentModeViewModel.TabSession.CodexFallbackSubmissionContext(
+        let context = AgentTabSession.CodexFallbackSubmissionContext(
             queueID: UUID(),
             providerText: "queued manual",
             images: [],
@@ -1079,7 +1079,7 @@ final class CodexFallbackFIFOTests: XCTestCase {
 
     private func makeRunningSession(
         controller: any CodexSessionControlling
-    ) -> (AgentModeViewModel, AgentModeViewModel.TabSession)? {
+    ) -> (AgentModeViewModel, AgentTabSession)? {
         let viewModel = AgentModeViewModel(
             codexControllerFactory: { _, _, _, _, _, _ in controller }
         )
@@ -1116,7 +1116,7 @@ final class CodexFallbackFIFOTests: XCTestCase {
     private func makeMCPRunningSession(
         controller: any CodexSessionControlling,
         prepareEpoch: Bool = true
-    ) async throws -> (AgentModeViewModel, AgentModeViewModel.TabSession, UUID) {
+    ) async throws -> (AgentModeViewModel, AgentTabSession, UUID) {
         let viewModel = AgentModeViewModel(
             codexControllerFactory: { _, _, _, _, _, _ in controller }
         )
@@ -1190,9 +1190,9 @@ final class CodexFallbackFIFOTests: XCTestCase {
 
     private func fallbackContext(
         queueID: UUID,
-        origin: AgentModeViewModel.TabSession.CodexFallbackOrigin,
+        origin: AgentTabSession.CodexFallbackOrigin,
         text: String
-    ) -> AgentModeViewModel.TabSession.CodexFallbackSubmissionContext {
+    ) -> AgentTabSession.CodexFallbackSubmissionContext {
         .init(
             queueID: queueID,
             providerText: text,
@@ -1207,11 +1207,11 @@ final class CodexFallbackFIFOTests: XCTestCase {
 
     private func fallbackQueueEntry(
         queueID: UUID,
-        origin: AgentModeViewModel.TabSession.CodexFallbackOrigin,
+        origin: AgentTabSession.CodexFallbackOrigin,
         text: String,
-        session: AgentModeViewModel.TabSession,
+        session: AgentTabSession,
         controller: any CodexSessionControlling
-    ) -> AgentModeViewModel.TabSession.CodexFallbackQueueEntry {
+    ) -> AgentTabSession.CodexFallbackQueueEntry {
         .init(
             id: queueID,
             providerText: text,

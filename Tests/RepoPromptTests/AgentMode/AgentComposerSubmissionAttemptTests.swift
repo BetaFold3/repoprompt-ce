@@ -53,8 +53,8 @@ final class AgentComposerSubmissionAttemptTests: XCTestCase {
 
     func testLatchSuppressesRapidSameTabCallbacksButAllowsAnotherTab() throws {
         var latch = AgentComposerSubmissionLatch()
-        let firstSession = AgentModeViewModel.TabSession(tabID: UUID())
-        let secondSession = AgentModeViewModel.TabSession(tabID: UUID())
+        let firstSession = AgentTabSession(tabID: UUID())
+        let secondSession = AgentTabSession(tabID: UUID())
         let firstTarget = makeTarget(session: firstSession)
         let secondTarget = makeTarget(session: secondSession)
 
@@ -68,7 +68,7 @@ final class AgentComposerSubmissionAttemptTests: XCTestCase {
 
     func testMatchingCompletionClearsOnlyUnchangedInput() throws {
         var latch = AgentComposerSubmissionLatch()
-        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        let session = AgentTabSession(tabID: UUID())
         latch.advanceInputRevision()
         let attempt = try XCTUnwrap(
             latch.begin(target: makeTarget(session: session), rawDraftSnapshot: "submitted draft")
@@ -89,7 +89,7 @@ final class AgentComposerSubmissionAttemptTests: XCTestCase {
 
     func testScheduledCompletionClearsOnlyUnchangedInput() throws {
         var latch = AgentComposerSubmissionLatch()
-        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        let session = AgentTabSession(tabID: UUID())
         latch.advanceInputRevision()
         let attempt = try XCTUnwrap(
             latch.begin(target: makeTarget(session: session), rawDraftSnapshot: "scheduled draft")
@@ -111,7 +111,7 @@ final class AgentComposerSubmissionAttemptTests: XCTestCase {
 
     func testNewerTypingAndDraftRestorationSurviveCompletion() throws {
         var latch = AgentComposerSubmissionLatch()
-        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        let session = AgentTabSession(tabID: UUID())
         latch.advanceInputRevision()
         let attempt = try XCTUnwrap(
             latch.begin(target: makeTarget(session: session), rawDraftSnapshot: "submitted draft")
@@ -133,8 +133,8 @@ final class AgentComposerSubmissionAttemptTests: XCTestCase {
 
     func testTabSwitchPreventsOldCompletionFromClearingCurrentDraft() throws {
         var latch = AgentComposerSubmissionLatch()
-        let sourceSession = AgentModeViewModel.TabSession(tabID: UUID())
-        let currentSession = AgentModeViewModel.TabSession(tabID: UUID())
+        let sourceSession = AgentTabSession(tabID: UUID())
+        let currentSession = AgentTabSession(tabID: UUID())
         let attempt = try XCTUnwrap(
             latch.begin(target: makeTarget(session: sourceSession), rawDraftSnapshot: "same text")
         )
@@ -152,7 +152,7 @@ final class AgentComposerSubmissionAttemptTests: XCTestCase {
 
     func testStaleCompletionCannotReleaseNewerAttempt() throws {
         var latch = AgentComposerSubmissionLatch()
-        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        let session = AgentTabSession(tabID: UUID())
         let target = makeTarget(session: session)
         let oldAttempt = try XCTUnwrap(
             latch.begin(target: target, rawDraftSnapshot: "old", attemptID: UUID())
@@ -175,7 +175,7 @@ final class AgentComposerSubmissionAttemptTests: XCTestCase {
 
     func testBlockedCompletionCannotOverwriteNewerNotice() throws {
         var latch = AgentComposerSubmissionLatch()
-        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        let session = AgentTabSession(tabID: UUID())
         let attempt = try XCTUnwrap(
             latch.begin(target: makeTarget(session: session), rawDraftSnapshot: "draft")
         )
@@ -192,7 +192,7 @@ final class AgentComposerSubmissionAttemptTests: XCTestCase {
         XCTAssertNil(effects.blockedMessage)
     }
 
-    private func makeTarget(session: AgentModeViewModel.TabSession) -> AgentComposerSubmitTarget {
+    private func makeTarget(session: AgentTabSession) -> AgentComposerSubmitTarget {
         AgentComposerSubmitTarget(
             tabID: session.tabID,
             route: .createAgentSessionFromSourceTab,

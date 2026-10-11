@@ -169,7 +169,7 @@ extension AgentModeViewModel {
         scheduledSendPendingConfirmationObserver = nil
     }
 
-    func notifyScheduledSendRunStateChanged(for session: TabSession) {
+    func notifyScheduledSendRunStateChanged(for session: AgentTabSession) {
         guard let coordinator = scheduledSendCoordinator,
               let sessionID = session.activeAgentSessionID
         else { return }
@@ -184,7 +184,7 @@ extension AgentModeViewModel {
         notifyScheduledSendBusyStateMayHaveChanged(tabIDs: [session.tabID])
     }
 
-    func notifyScheduledSendHydrationCompleted(for session: TabSession) {
+    func notifyScheduledSendHydrationCompleted(for session: AgentTabSession) {
         scheduledSendCoordinator?.recordDidChange()
         reconcileScheduledSendRecoveryProjection(for: session)
     }
@@ -238,7 +238,7 @@ extension AgentModeViewModel {
     /// Re-projects a session after another writer committed: hydrated sessions resync from disk,
     /// unhydrated ones hydrate (which installs the authoritative record). Never touches a
     /// session that owns a live attempt.
-    private func refreshScheduledSendProjection(for session: TabSession) {
+    private func refreshScheduledSendProjection(for session: AgentTabSession) {
         guard !session.ownsLiveScheduledAttempt else { return }
         if session.hasLoadedPersistedState {
             Task { @MainActor [weak self] in
@@ -285,7 +285,7 @@ extension AgentModeViewModel {
 
     /// Runs one complete schedule action for `session` after every earlier action finished.
     func runScheduledSendAction<T>(
-        on session: TabSession,
+        on session: AgentTabSession,
         _ body: @escaping @MainActor () async -> T
     ) async -> T {
         let previous = session.scheduledSendActionTask
@@ -305,7 +305,7 @@ extension AgentModeViewModel {
     // MARK: - Composer scheduling
 
     /// Whether the composer may schedule for this tab (local, unscheduled, not MCP-controlled).
-    func canScheduleSend(tabID: UUID?, session: TabSession?) -> Bool {
+    func canScheduleSend(tabID: UUID?, session: AgentTabSession?) -> Bool {
         guard let tabID else { return false }
         if let session {
             guard session.remoteHost == nil,
@@ -321,14 +321,14 @@ extension AgentModeViewModel {
     /// Semantic "first prompt" predicate shared by the composer control and the schedule
     /// implementation: a tab without a linked session, or a linked session that never carried a
     /// turn, schedules a workspace-gated new-session start (plan §1 item 4).
-    func scheduleTargetIsNewSessionStart(tabID: UUID?, session: TabSession?) -> Bool {
+    func scheduleTargetIsNewSessionStart(tabID: UUID?, session: AgentTabSession?) -> Bool {
         guard let tabID else { return false }
         guard hasLinkedAgentSession(for: tabID) else { return true }
         guard let session else { return false }
         return Self.sessionIsUntouchedForScheduling(session)
     }
 
-    static func sessionIsUntouchedForScheduling(_ session: TabSession) -> Bool {
+    static func sessionIsUntouchedForScheduling(_ session: AgentTabSession) -> Bool {
         session.items.isEmpty
             && session.transcript.turns.isEmpty
             && !session.hasSentFirstMessage
@@ -593,7 +593,7 @@ extension AgentModeViewModel {
     /// serialized schedule action; banner actions queued behind it observe the committed result.
     func installScheduledSend(
         text: String,
-        on session: TabSession,
+        on session: AgentTabSession,
         notBefore: Date,
         runAlongsideOtherSessions: Bool,
         isNewSessionStart: Bool
@@ -611,7 +611,7 @@ extension AgentModeViewModel {
 
     private func performInstallScheduledSend(
         text: String,
-        on session: TabSession,
+        on session: AgentTabSession,
         notBefore: Date,
         runAlongsideOtherSessions: Bool,
         isNewSessionStart: Bool
@@ -985,7 +985,7 @@ extension AgentModeViewModel {
     private func commitScheduledSendChange(
         _ updated: AgentScheduledSendPersist,
         previous: AgentScheduledSendPersist,
-        session: TabSession
+        session: AgentTabSession
     ) async -> String? {
         let expected = session.scheduledSendPersistedUpdatedAt
         session.scheduledSend = .v1(updated)
@@ -1012,7 +1012,7 @@ extension AgentModeViewModel {
     /// exists on disk but was not hydrated by this tab is not adoptable here, and a revoked
     /// lifetime is never re-acquired.
     func ensurePersistenceState(
-        for session: TabSession,
+        for session: AgentTabSession,
         sessionID: UUID,
         workspace: WorkspaceModel,
         context: SessionPersistenceContext? = nil
@@ -1067,7 +1067,7 @@ extension AgentModeViewModel {
     /// workspace that owns the schedule.
     @discardableResult
     func commitScheduledSend(
-        session: TabSession,
+        session: AgentTabSession,
         member: AgentScheduledSendMember?,
         expectedUpdatedAt: Date?,
         completedDispatch: AgentScheduledSendProvenance? = nil
@@ -1086,7 +1086,7 @@ extension AgentModeViewModel {
     /// Precise outcome of one durable schedule commit: the coordinator's acknowledged mutations
     /// distinguish a real commit from conflict, unavailability, deletion, and write failure.
     func commitScheduledSendDetailed(
-        session: TabSession,
+        session: AgentTabSession,
         member: AgentScheduledSendMember?,
         expectedUpdatedAt: Date?,
         completedDispatch: AgentScheduledSendProvenance? = nil
@@ -1192,7 +1192,7 @@ extension AgentModeViewModel {
         }
     }
 
-    private func scheduledSendPersistenceWorkspace(for session: TabSession) -> WorkspaceModel? {
+    private func scheduledSendPersistenceWorkspace(for session: AgentTabSession) -> WorkspaceModel? {
         guard let workspace = persistenceWorkspace else { return nil }
         if let pinned = session.scheduledSendWorkspaceID, pinned != workspace.id {
             print("[AgentModeVM][ScheduledSend] refusing to persist schedule for workspace \(pinned) into \(workspace.id)")
@@ -1223,7 +1223,7 @@ extension AgentModeViewModel {
     /// outcome lets callers that must act on a verified revision (Send now) distinguish an
     /// authoritative snapshot from a missing, failed, or stale-owner read.
     @discardableResult
-    func resyncScheduledSendFromDisk(session: TabSession) async -> ScheduledSendResyncOutcome {
+    func resyncScheduledSendFromDisk(session: AgentTabSession) async -> ScheduledSendResyncOutcome {
         guard let workspace = scheduledSendPersistenceWorkspace(for: session),
               let sessionID = session.activeAgentSessionID
         else { return .staleOwner }
@@ -1260,7 +1260,7 @@ extension AgentModeViewModel {
 
     /// A finalization committed elsewhere carries the accepted item's marker; mirror it locally so
     /// a second window never shows an unmarked bubble for a delivered scheduled message.
-    private func reconcileProvenanceForFinalizedItems(in session: TabSession, persisted: AgentSession) {
+    private func reconcileProvenanceForFinalizedItems(in session: AgentTabSession, persisted: AgentSession) {
         guard let receipt = persisted.lastScheduledDispatch else { return }
         let stampedIDs = Set(
             (persisted.transcript?.turns ?? []).compactMap { turn -> UUID? in
@@ -1280,7 +1280,7 @@ extension AgentModeViewModel {
     /// provenance and duplicate-item checks below observe the hydrated transcript.
     /// A `.dispatching` record whose session holds a live admission in this process (another
     /// window is mid-dispatch) is projected as-is and reconciled from the owner's commit.
-    func installHydratedScheduledSend(from agentSession: AgentSession, into session: TabSession) {
+    func installHydratedScheduledSend(from agentSession: AgentSession, into session: AgentTabSession) {
         if agentSession.fileURL != nil {
             // Projection of an on-disk incarnation: later saves must not recreate it after
             // deletion. Persistence state itself arrives only with the paired hydration load.
@@ -1350,7 +1350,7 @@ extension AgentModeViewModel {
 
     /// Called before a live session leaves `sessions`. Deleting the persisted session also
     /// abandons the record, so its managed attachment files are removed; stashing keeps both.
-    func releaseScheduledSendForRemovedSession(_ session: TabSession, deletesPersistedSession: Bool) {
+    func releaseScheduledSendForRemovedSession(_ session: AgentTabSession, deletesPersistedSession: Bool) {
         // Accepted-but-unfinalized work is process-owned; removing the tab detaches presentation only.
         guard deletesPersistedSession, let record = session.pendingScheduledSendRecord else { return }
         clearScheduledSendAttachmentFiles(record.attachments)
@@ -1371,7 +1371,7 @@ extension AgentModeViewModel {
         return URL(fileURLWithPath: path).standardizedFileURL.path
     }
 
-    private func removeUnsentScheduledUserItem(id itemID: UUID, from session: TabSession) {
+    private func removeUnsentScheduledUserItem(id itemID: UUID, from session: AgentTabSession) {
         guard let index = session.items.firstIndex(where: { $0.id == itemID && $0.kind == .user }),
               session.items[index].scheduledSend == nil
         else { return }
@@ -1381,7 +1381,7 @@ extension AgentModeViewModel {
         scheduleSave(for: session.tabID)
     }
 
-    func updateLocalSessionIndexScheduledSendSummary(for session: TabSession) {
+    func updateLocalSessionIndexScheduledSendSummary(for session: AgentTabSession) {
         guard session.hasLoadedPersistedState,
               let sessionID = session.activeAgentSessionID,
               var entry = ownerValidatedSessionIndex[sessionID]
@@ -1397,7 +1397,7 @@ extension AgentModeViewModel {
 
     // MARK: - Dispatch (plan §3.3)
 
-    private func scheduledDispatchPreflightFailure(record: AgentScheduledSendPersist, session: TabSession) -> String? {
+    private func scheduledDispatchPreflightFailure(record: AgentScheduledSendPersist, session: AgentTabSession) -> String? {
         if session.remoteHost != nil {
             return Self.scheduledSendRemoteUnsupportedMessage
         }
@@ -1427,7 +1427,7 @@ extension AgentModeViewModel {
 
     /// Busy evaluation that ignores this session's own in-flight scheduled attempt, for use by
     /// the dispatch path and the coordinator's final handoff validator.
-    private func scheduledSendBusyStateExcludingOwnAttempt(for session: TabSession) -> AgentScheduledSendBusyState {
+    private func scheduledSendBusyStateExcludingOwnAttempt(for session: AgentTabSession) -> AgentScheduledSendBusyState {
         let wasInFlight = session.isScheduledDispatchInFlight
         session.isScheduledDispatchInFlight = false
         defer { session.isScheduledDispatchInFlight = wasInFlight }
@@ -1467,7 +1467,7 @@ extension AgentModeViewModel {
 
     private func submitScheduledUserTurn(
         tabID: UUID,
-        session: TabSession,
+        session: AgentTabSession,
         record: AgentScheduledSendPersist,
         attempt: AgentScheduledSendPersist.Attempt,
         providerHandoffAuthorization: @escaping @MainActor () -> Bool
@@ -1504,7 +1504,7 @@ extension AgentModeViewModel {
         }
         if session.selectedAgent == .codexExec {
             let dispatchTicket = session.codexDispatchSerialGate.issueTicket()
-            let fallbackContext = TabSession.CodexFallbackSubmissionContext(
+            let fallbackContext = AgentTabSession.CodexFallbackSubmissionContext(
                 queueID: UUID(),
                 providerText: wrappedText,
                 images: record.attachments,
@@ -1546,7 +1546,7 @@ extension AgentModeViewModel {
     private func revertDispatchingAttempt(
         record: AgentScheduledSendPersist,
         dispatching: AgentScheduledSendPersist,
-        session: TabSession,
+        session: AgentTabSession,
         lease: AgentScheduledSendAdmissionLease
     ) async {
         var reverted = record
@@ -1564,7 +1564,7 @@ extension AgentModeViewModel {
 
     /// Undoes the run-preparation side effects of a handoff that was revoked before any provider
     /// work: staged handoff payload injection and the enqueued non-Codex token estimate.
-    private func rollBackRevokedHandoffPreparation(session: TabSession) {
+    private func rollBackRevokedHandoffPreparation(session: AgentTabSession) {
         if session.pendingHandoff.isStagedForSend {
             session.pendingHandoff.isStagedForSend = false
         }
@@ -1576,7 +1576,7 @@ extension AgentModeViewModel {
     private func stampScheduledSendProvenance(
         _ provenance: AgentScheduledSendProvenance,
         onItemID itemID: UUID,
-        in session: TabSession
+        in session: AgentTabSession
     ) {
         guard let index = session.items.firstIndex(where: { $0.id == itemID }),
               session.items[index].scheduledSend != provenance
@@ -1587,7 +1587,7 @@ extension AgentModeViewModel {
     }
 
     private func markScheduledSendFailed(
-        session: TabSession,
+        session: AgentTabSession,
         record: AgentScheduledSendPersist,
         message: String
     ) async {
@@ -1614,7 +1614,7 @@ extension AgentModeViewModel {
     /// attempt may adopt it: the dispatching owner, a peer window, or a reopened/hydrated tab. No
     /// owner-local state is required. Returns `true` when a projection was installed.
     @discardableResult
-    func adoptScheduledSendRecoveryProjection(for session: TabSession) -> Bool {
+    func adoptScheduledSendRecoveryProjection(for session: AgentTabSession) -> Bool {
         guard session.scheduledSendPendingFinalization == nil,
               let coordinator = scheduledSendCoordinator,
               let sessionID = session.activeAgentSessionID,
@@ -1623,7 +1623,7 @@ extension AgentModeViewModel {
               payload.attempt.attemptID == status.key.attemptID,
               session.pendingScheduledSendRecord?.attempt?.attemptID == payload.attempt.attemptID
         else { return false }
-        session.scheduledSendPendingFinalization = ScheduledSendPendingFinalization(
+        session.scheduledSendPendingFinalization = AgentScheduledSendPendingFinalization(
             key: status.key,
             lease: status.lease,
             attempt: payload.attempt,
@@ -1640,7 +1640,7 @@ extension AgentModeViewModel {
     /// coordinator's current state: installs it when absent, updates its phase, or adopts the
     /// file once the attempt settled. Never performs finalization, retries, or ownership release
     /// itself; those belong to the coordinator worker.
-    func reconcileScheduledSendRecoveryProjection(for session: TabSession) {
+    func reconcileScheduledSendRecoveryProjection(for session: AgentTabSession) {
         guard let sessionID = session.activeAgentSessionID else { return }
         guard let pending = session.scheduledSendPendingFinalization else {
             adoptScheduledSendRecoveryProjection(for: session)
@@ -1676,7 +1676,7 @@ extension AgentModeViewModel {
     /// action. A file that still carries this exact attempt (transiently unreadable commit) keeps
     /// the acceptance evidence as the local truth; a missing file was explicitly deleted.
     private func adoptSettledScheduledSendState(
-        session: TabSession,
+        session: AgentTabSession,
         attempt: AgentScheduledSendPersist.Attempt,
         receipt: AgentScheduledSendProvenance
     ) async {
@@ -1700,7 +1700,7 @@ extension AgentModeViewModel {
     /// projection so no candidate, normalization, or creation fallback can write it back. Items
     /// are untouched; the tab is torn down by the deletion flow that owns it. A failure that
     /// belongs to a previous binding of the tab never touches its current session.
-    func handleDurableSessionDeleted(_ session: TabSession, sessionID: UUID) {
+    func handleDurableSessionDeleted(_ session: AgentTabSession, sessionID: UUID) {
         guard session.activeAgentSessionID == sessionID else { return }
         // Ownership of the deleted incarnation is revoked for good: no fresh stamp for this ID.
         session.persistenceState = nil
@@ -1980,7 +1980,7 @@ extension AgentModeViewModel: AgentScheduledSendCoordinatorHost {
 
     private func performScheduledDispatch(
         tabID: UUID,
-        session: TabSession,
+        session: AgentTabSession,
         scheduleID: UUID,
         lease: AgentScheduledSendAdmissionLease
     ) async -> ScheduledDispatchOutcome {
@@ -2150,7 +2150,7 @@ extension AgentModeViewModel: AgentScheduledSendCoordinatorHost {
             // settled (explicit deletion during the provider await) in which case no projection
             // is installed and the file is adopted instead.
             if let status = coordinator.recoveryStatus(sessionID: lease.sessionID), status.key == recoveryKey {
-                session.scheduledSendPendingFinalization = ScheduledSendPendingFinalization(
+                session.scheduledSendPendingFinalization = AgentScheduledSendPendingFinalization(
                     key: recoveryKey,
                     lease: lease,
                     attempt: attempt,

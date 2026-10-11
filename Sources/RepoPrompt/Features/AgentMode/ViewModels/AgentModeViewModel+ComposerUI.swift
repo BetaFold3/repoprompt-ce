@@ -100,7 +100,7 @@ extension AgentModeViewModel {
 
     private func scheduledSendBlockingSessionName(
         for scheduledSend: AgentScheduledSendPersist,
-        session: TabSession
+        session: AgentTabSession
     ) -> String? {
         guard scheduledSend.firstEligibleAt != nil else { return nil }
         if !scheduledSend.isNewSessionStart {
@@ -115,7 +115,7 @@ extension AgentModeViewModel {
         return nil
     }
 
-    private func scheduledSendSessionName(_ session: TabSession) -> String? {
+    private func scheduledSendSessionName(_ session: AgentTabSession) -> String? {
         guard let sessionID = session.activeAgentSessionID,
               let name = sessionIndex[sessionID]?.name.trimmingCharacters(in: .whitespacesAndNewlines),
               !name.isEmpty
@@ -123,7 +123,7 @@ extension AgentModeViewModel {
         return name
     }
 
-    func makeComposerSubmitTarget(tabID: UUID?, session: TabSession?) -> AgentComposerSubmitTarget? {
+    func makeComposerSubmitTarget(tabID: UUID?, session: AgentTabSession?) -> AgentComposerSubmitTarget? {
         guard let tabID else { return nil }
         let existingSession = session ?? sessions[tabID]
         guard let resolvedSession = existingSession ?? self.session(for: tabID, createIfNeeded: true) else {

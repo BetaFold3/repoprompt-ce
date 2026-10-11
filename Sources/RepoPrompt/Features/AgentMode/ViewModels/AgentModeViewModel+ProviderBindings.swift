@@ -32,12 +32,12 @@ extension AgentModeViewModel {
         codexPermissionLevel: CodexAgentToolPreferences.PermissionLevel,
         claudePermissionLevel: ClaudeAgentToolPreferences.PermissionLevel,
         claudeBashToolEnabled: Bool
-    ) -> AutoEditPermissionGuidance? {
+    ) -> AgentAutoEditPermissionGuidance? {
         guard autoEditEnabled == false else { return nil }
 
         if agent == .codexExec {
             guard codexPermissionLevel != .readOnly else { return nil }
-            return AutoEditPermissionGuidance(
+            return AgentAutoEditPermissionGuidance(
                 provider: .codex,
                 message: "Codex sandbox allows file edits — set Read Only",
                 actionTitle: "Set Read Only",
@@ -47,7 +47,7 @@ extension AgentModeViewModel {
 
         if agent.usesClaudeTooling {
             guard claudePermissionLevel != .requireApproval else { return nil }
-            return AutoEditPermissionGuidance(
+            return AgentAutoEditPermissionGuidance(
                 provider: .claude,
                 message: "Claude sandbox allows file edits — set Require Approval",
                 actionTitle: "Set Require Approval",

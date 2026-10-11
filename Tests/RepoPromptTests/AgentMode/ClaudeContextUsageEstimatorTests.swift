@@ -10,7 +10,7 @@ import XCTest
 final class ClaudeContextUsageEstimatorTests: XCTestCase {
     func testUnknownWindowAcceptsFinalizesAndPersistsThreeHundredFiftyK() throws {
         let estimator = makeEstimator()
-        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        let session = AgentTabSession(tabID: UUID())
         session.claudeConfiguredContextWindow = 400_000
 
         _ = estimator.ingestUsageSignal(
@@ -40,7 +40,7 @@ final class ClaudeContextUsageEstimatorTests: XCTestCase {
 
     func testKnownTwoHundredKRejectsThreeHundredFiftyKAndPreservesPriorState() {
         let estimator = makeEstimator()
-        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        let session = AgentTabSession(tabID: UUID())
 
         _ = estimator.ingestUsageSignal(
             promptTokens: nil,
@@ -65,7 +65,7 @@ final class ClaudeContextUsageEstimatorTests: XCTestCase {
 
     func testTerminalOneMillionWindowPreservesEarlierUnknownWindowReadingThroughFinalization() throws {
         let estimator = makeEstimator()
-        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        let session = AgentTabSession(tabID: UUID())
 
         _ = estimator.ingestUsageSignal(
             promptTokens: nil,
