@@ -174,15 +174,6 @@ private extension Bundle {
     }
 }
 
-// MARK: - MCP Run Purpose
-
-/// Purpose of an MCP connection's run, used to route UI (e.g., ask_user) to the correct surface.
-public enum MCPRunPurpose: String, Sendable, Codable {
-    case discoverRun // Context Builder agent exploring codebase
-    case agentModeRun // Agent mode interactive session
-    case unknown // No policy or unspecified
-}
-
 /// App-verified trust principal for a bootstrap MCP connection.
 ///
 /// Gateway-only authorization must key off `.gateway`, never off the client-asserted

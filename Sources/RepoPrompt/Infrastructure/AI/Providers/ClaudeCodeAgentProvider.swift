@@ -32,7 +32,7 @@ final class ClaudeCodeAgentProvider: HeadlessAgentProvider {
     private let config: ClaudeCodeAgentConfig
     private let environmentResolver: any ClaudeCodeLaunchEnvironmentResolving
     private let configService = MCPConfigExportService.shared
-    private let toolTracking = AgentToolTrackingController()
+    private let toolTracking = AgentToolTrackingController(mcpHost: ServerNetworkManager.shared)
     private var streamTask: Task<Void, Never>?
 
     private var enableDebugLogging: Bool {

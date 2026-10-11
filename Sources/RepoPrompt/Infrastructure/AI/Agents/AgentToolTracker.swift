@@ -5,9 +5,14 @@ import RepoPromptWorkspace
 /// Observes MCP tool usage for a single agent session and emits uniform events.
 /// Tool observers are registered by runID (not connectionID) to survive connection handovers.
 actor AgentToolTracker {
+    private let mcpHost: any AgentMCPHosting
     private var trackedRunID: UUID?
     private var observerToken: UUID?
     private var hasUnregistered = false
+
+    init(mcpHost: any AgentMCPHosting) {
+        self.mcpHost = mcpHost
+    }
 
     /// Registers an enhanced tool event observer that receives args on call and result on completion.
     func registerEnhancedObserver(
@@ -16,17 +21,15 @@ actor AgentToolTracker {
         onCalled: @escaping @Sendable (UUID, String, [String: Value]?) async -> Void,
         onCompleted: @escaping @Sendable (UUID, String, [String: Value]?, String, Bool) async -> Void
     ) async {
-        let manager = ServerNetworkManager.shared
-
         // Register enhanced observer with args and results before waiting for
         // any MCP connection. Callers can await this method when they need the
         // observer installed before a provider readiness boundary returns.
-        let observer = ServerNetworkManager.ToolEventObserver(
+        let token = await mcpHost.registerToolEventObserver(
+            for: runID,
             onCalled: onCalled,
             onCompleted: onCompleted,
             observationPolicy: observationPolicy
         )
-        let token = await manager.registerToolEventObserver(for: runID, observer: observer)
         trackedRunID = runID
         observerToken = token
         hasUnregistered = false
@@ -40,7 +43,7 @@ actor AgentToolTracker {
         fallbackTimeoutSeconds: TimeInterval = 5.0,
         keepObserversOnTimeout: Bool = true
     ) async {
-        let manager = ServerNetworkManager.shared
+        let manager = mcpHost
         guard trackedRunID == runID, !hasUnregistered else { return }
 
         // Wait for connection (with cancellation checks)
@@ -91,7 +94,7 @@ actor AgentToolTracker {
     }
 
     /// Unregister exactly once to avoid double-cleanup races
-    private func unregisterObserverOnce(for runID: UUID, manager: ServerNetworkManager) async {
+    private func unregisterObserverOnce(for runID: UUID, manager: any AgentMCPHosting) async {
         guard !hasUnregistered, trackedRunID == runID else { return }
         let token = observerToken
         hasUnregistered = true
@@ -108,13 +111,13 @@ actor AgentToolTracker {
     /// Detaches the observer if one was registered.
     func stop() async {
         guard !hasUnregistered, let runID = trackedRunID else { return }
-        await unregisterObserverOnce(for: runID, manager: ServerNetworkManager.shared)
+        await unregisterObserverOnce(for: runID, manager: mcpHost)
     }
 
     /// Detaches the observer only if the tracker still owns the expected run.
     func stop(ifTracking runID: UUID?) async {
         guard let runID else { return }
-        await unregisterObserverOnce(for: runID, manager: ServerNetworkManager.shared)
+        await unregisterObserverOnce(for: runID, manager: mcpHost)
     }
 }
 
@@ -235,13 +238,17 @@ final class AgentToolEventDeliveryMailbox: @unchecked Sendable {
 /// - CodexAgentModeCoordinator: /RepoPrompt/Services/AgentMode/Codex/CodexAgentModeCoordinator.swift
 /// - ACPIntegratedAgentModeRunner: /RepoPrompt/Services/AgentMode/Runners/ACPIntegratedAgentModeRunner.swift
 final class AgentToolTrackingController {
-    private let tracker = AgentToolTracker()
+    private let tracker: AgentToolTracker
     private let eventDeliveryMailbox = AgentToolEventDeliveryMailbox()
     private var trackingTask: Task<Void, Never>?
     private var registrationTask: Task<Void, Never>?
     private var registrationRunID: UUID?
     private var trackingGeneration: UInt64 = 0
     private(set) var trackedRunID: UUID?
+
+    init(mcpHost: any AgentMCPHosting) {
+        tracker = AgentToolTracker(mcpHost: mcpHost)
+    }
 
     // MARK: - Callback-Based API (used by Claude, Codex, ACP)
 

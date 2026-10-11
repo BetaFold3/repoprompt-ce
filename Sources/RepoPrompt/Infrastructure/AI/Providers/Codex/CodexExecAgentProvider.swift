@@ -13,7 +13,7 @@ final class CodexExecAgentProvider: HeadlessAgentProvider {
     private let runner: CLIProcessRunner
     private let config: CodexExecAgentConfig
     private let configService = MCPConfigExportService.shared
-    private let toolTracking = AgentToolTrackingController()
+    private let toolTracking = AgentToolTrackingController(mcpHost: ServerNetworkManager.shared)
     private var streamTask: Task<Void, Never>?
     private var codexItemInvocationIDs: [String: UUID] = [:]
 

@@ -13,7 +13,7 @@
         func testPreExecutionDenialsAreOMPOptInAndZeroForCursorOpenCodeClaude() async {
             let manager = ServerNetworkManager.shared
             for provider in ["Cursor", "OpenCode", "Claude"] {
-                let controller = AgentToolTrackingController()
+                let controller = AgentToolTrackingController(mcpHost: ServerNetworkManager.shared)
                 let recorder = LockedEventRecorder()
                 let runID = UUID()
                 await controller.startTracking(
@@ -41,7 +41,7 @@
                 await controller.stopTracking()
             }
 
-            let ompController = AgentToolTrackingController()
+            let ompController = AgentToolTrackingController(mcpHost: ServerNetworkManager.shared)
             let ompRecorder = LockedEventRecorder()
             let ompRunID = UUID()
             let invocationID = UUID()
@@ -80,7 +80,7 @@
 
         func testDeniedCallFunnelPreservesPayloadIdentityAndNeverExecutesTool() async {
             let manager = ServerNetworkManager.shared
-            let controller = AgentToolTrackingController()
+            let controller = AgentToolTrackingController(mcpHost: ServerNetworkManager.shared)
             let recorder = LockedEventRecorder()
             let runID = UUID()
             let invocationID = UUID()
@@ -130,7 +130,7 @@
 
         func testDeniedCallPairSurvivesConcurrentObserverTeardown() async {
             let manager = ServerNetworkManager.shared
-            let controller = AgentToolTrackingController()
+            let controller = AgentToolTrackingController(mcpHost: ServerNetworkManager.shared)
             let recorder = LockedEventRecorder()
             let deliveryGate = AsyncDeliveryGate()
             let runID = UUID()
@@ -185,7 +185,7 @@
 
         func testToolObserverCallbacksReturnBeforeFIFOTranscriptDeliveryCompletes() async {
             let manager = ServerNetworkManager.shared
-            let controller = AgentToolTrackingController()
+            let controller = AgentToolTrackingController(mcpHost: ServerNetworkManager.shared)
             let recorder = LockedEventRecorder()
             let callbackGate = SynchronousCallbackGate()
             let runID = UUID()
@@ -267,7 +267,7 @@
 
         func testStopWaitsForCapturedObserverToEnterMailboxAndDrain() async {
             let manager = ServerNetworkManager.shared
-            let controller = AgentToolTrackingController()
+            let controller = AgentToolTrackingController(mcpHost: ServerNetworkManager.shared)
             let recorder = LockedEventRecorder()
             let deliveryGate = AsyncDeliveryGate()
             let runID = UUID()
@@ -321,7 +321,7 @@
 
         func testConcurrentRawUnregisterAndStopJoinCapturedDeliveryBarrier() async {
             let manager = ServerNetworkManager.shared
-            let controller = AgentToolTrackingController()
+            let controller = AgentToolTrackingController(mcpHost: ServerNetworkManager.shared)
             let recorder = LockedEventRecorder()
             let deliveryGate = AsyncDeliveryGate()
             let callbackGate = SynchronousCallbackGate()
@@ -413,7 +413,7 @@
 
         func testOverlappingStopAndStartUnregistersOldObserverAndReleasesCallbacks() async {
             let manager = ServerNetworkManager.shared
-            let controller = AgentToolTrackingController()
+            let controller = AgentToolTrackingController(mcpHost: ServerNetworkManager.shared)
             let firstRunID = UUID()
             let secondRunID = UUID()
             let recorder = LockedEventRecorder()

@@ -5231,7 +5231,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
     func ensureCodexToolTrackingIfNeeded(for session: AgentTabSession, runID: UUID) async {
         guard shouldManageCodexTooling else { return }
         let controller = toolTrackingByTabID[session.tabID] ?? {
-            let c = AgentToolTrackingController()
+            let c = AgentToolTrackingController(mcpHost: ServerNetworkManager.shared)
             toolTrackingByTabID[session.tabID] = c
             return c
         }()

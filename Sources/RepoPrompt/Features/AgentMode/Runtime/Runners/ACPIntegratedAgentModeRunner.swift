@@ -1949,7 +1949,7 @@ final class ACPIntegratedAgentModeRunner {
         resetACPToolCorrelation(for: session.tabID)
         toolTrackingRunIDByTabID[session.tabID] = runID
         let controller = toolTrackingByTabID[session.tabID] ?? {
-            let c = AgentToolTrackingController()
+            let c = AgentToolTrackingController(mcpHost: ServerNetworkManager.shared)
             toolTrackingByTabID[session.tabID] = c
             return c
         }()

@@ -43,7 +43,7 @@ final class ClaudeAgentToolTrackingHandler {
 
     // MARK: - Tracker State
 
-    private let trackingController = AgentToolTrackingController()
+    private let trackingController = AgentToolTrackingController(mcpHost: ServerNetworkManager.shared)
     private let maxExplicitProviderAckObservationCount = 24
 
     // MARK: - Correlation State (moved from TabSession)

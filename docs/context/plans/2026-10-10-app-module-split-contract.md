@@ -265,6 +265,17 @@ Decisions: the new extension file stays in App at the cut, so the helper members
 
 Step 5f — done | rounds 0/2 | open: | downgraded: | assumed: | deferred:
 
+#### Step 5g — MCP hosting interface
+Intent: agent runtime calls 13 `ServerNetworkManager` methods, so first test whether one `Sendable` async protocol that the server actor conforms to can cover all of them without pulling App types along (the kill result would be a signature that needs an App-only type graph), and move the shared `MCPRunPurpose` enum out of the connection manager; if it holds, make `AgentToolTracker` its first user through a required initializer argument, with owners passing the server for now.
+
+Budget used: about 1 hour (cumulative ~24 hours).
+
+Result: `AgentMCPHosting` covers all 13 server methods the runtime calls, and every type in its signatures sits in the agent seed, the MCP SDK or (for `ExecutableFileIdentity`) a file that needs only Workspace, so the kill result did not occur and Debug and Release both build. `MCPRunPurpose` moved verbatim, and `AgentToolTracker` and its controller now take the host as a required initializer argument. Build, format, lint and 8 affected suites (0 failures) pass, and neither reviewer found anything above P2; the one P2 was a miscounted method total in this intent. The next step threads the host into the providers and session controllers that still read the server directly.
+
+Decisions: the protocol is a non-isolated `Sendable` async protocol rather than the `@MainActor` protocol the ground rules mention, because the server is its own actor and a main-actor requirement would add a main-actor hop to every call; calls keep their current async shape. Tool-event registration goes through a callback overload, so the App-nested `ToolEventObserver` stays out of the protocol. Owners pass `ServerNetworkManager.shared` until their own initializers take the host.
+
+Step 5g — done | rounds 0/2 | open: | downgraded: | assumed: | deferred: OracleB P3-1 — move `ExecutableFileIdentity` below App before the cut; P3-2 — when callers switch to the protocol, write the actor's default arguments out exactly, and give any convenience overload a different signature; P3-4 — owner-suite coverage comes from the slice-end full test run; P3-6 — redundant `manager` alias in the tracker and tests; carried from 5a — `MCPServerViewModel.AgentRunWaitDrainOutcome` in `AgentModeRuntimeFactories.swift`
+
 ### Slice 6 — `RepoPromptAgentCore` extraction
 Move the now-acyclic AI, agent models, providers, runtime, services, history, recommendations and non-UI remote-host code. Remove the temporary typealiases. Check the release compile flags once for cross-module optimization; don't change them.
 
