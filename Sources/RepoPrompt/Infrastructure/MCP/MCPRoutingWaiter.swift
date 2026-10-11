@@ -14,7 +14,7 @@ actor MCPRoutingWaiter {
         case unregistered
     }
 
-    static let shared = MCPRoutingWaiter()
+    private let mcpHost: any AgentMCPHosting
 
     private let log = Logger(subsystem: "com.repoprompt.mcp", category: "RoutingWaiter")
 
@@ -36,6 +36,12 @@ actor MCPRoutingWaiter {
     }
 
     private var waitersByRunID: [UUID: WaitState] = [:]
+
+    /// The App's connection manager signals the process-wide instance, so runtime code must be
+    /// given that same instance.
+    init(mcpHost: any AgentMCPHosting) {
+        self.mcpHost = mcpHost
+    }
 
     // MARK: - Public API
 
@@ -114,9 +120,10 @@ actor MCPRoutingWaiter {
     func notifyRouted(runID: UUID) async {
         guard resolve(runID: runID, routed: true) else { return }
         #if DEBUG
-            await ServerNetworkManager.shared.debugRecordRunRoutingEvent(
+            await mcpHost.debugRecordRunRoutingEvent(
                 runID: runID,
                 event: "routing_waiter_signalled",
+                connectionID: nil,
                 fields: ["outcome": "routed"]
             )
         #endif
@@ -127,9 +134,10 @@ actor MCPRoutingWaiter {
     func notifyFailed(runID: UUID) async {
         guard resolve(runID: runID, routed: false) else { return }
         #if DEBUG
-            await ServerNetworkManager.shared.debugRecordRunRoutingEvent(
+            await mcpHost.debugRecordRunRoutingEvent(
                 runID: runID,
                 event: "routing_waiter_signalled",
+                connectionID: nil,
                 fields: ["outcome": "failed"]
             )
         #endif
@@ -235,68 +243,24 @@ actor MCPRoutingWaiter {
             waitersByRunID[runID]?.continuations.count ?? 0
         }
     #endif
-}
 
-// MARK: - Static Async Methods (for async callers)
+    // MARK: - Fire-and-Forget Signal Methods (for sync callers)
 
-extension MCPRoutingWaiter {
-    /// Register a runID before any routing signals are expected.
-    static func register(runID: UUID) async {
-        await shared.register(runID: runID)
-    }
-
-    /// Wait until the runID is routed or timeout/failure.
-    /// - Parameters:
-    ///   - runID: The run identifier to watch for routing.
-    ///   - timeoutSeconds: Maximum time to wait. If <= 0, waits indefinitely.
-    static func waitUntilRouted(runID: UUID, timeoutSeconds: TimeInterval) async -> Bool {
-        await shared.waitUntilRouted(runID: runID, timeoutSeconds: timeoutSeconds)
-    }
-
-    static func waitUntilRoutedOutcome(runID: UUID, timeoutSeconds: TimeInterval) async -> WaitOutcome {
-        await shared.waitUntilRoutedOutcome(runID: runID, timeoutSeconds: timeoutSeconds)
-    }
-
-    /// Notify that a runID was successfully routed (async version).
-    static func notifyRouted(runID: UUID) async {
-        await shared.notifyRouted(runID: runID)
-    }
-
-    /// Notify that a runID failed to route (async version).
-    static func notifyFailed(runID: UUID) async {
-        await shared.notifyFailed(runID: runID)
-    }
-
-    /// Clean up state for a completed runID.
-    static func cleanup(runID: UUID) async {
-        await shared.cleanup(runID: runID)
-    }
-
-    #if DEBUG
-        static func debugContinuationCount(runID: UUID) async -> Int {
-            await shared.debugContinuationCount(runID: runID)
-        }
-    #endif
-}
-
-// MARK: - Fire-and-Forget Signal Methods (for sync callers)
-
-extension MCPRoutingWaiter {
     /// Fire-and-forget notification that runID was successfully routed.
     /// Safe to call from @MainActor or any synchronous context.
     /// Uses Task.detached so the notification survives parent task cancellation.
-    nonisolated static func signalRouted(_ runID: UUID) {
+    nonisolated func signalRouted(_ runID: UUID) {
         Task.detached(priority: .utility) {
-            await shared.notifyRouted(runID: runID)
+            await self.notifyRouted(runID: runID)
         }
     }
 
     /// Fire-and-forget notification that routing failed or will never happen.
     /// Safe to call from @MainActor or any synchronous context.
     /// Uses Task.detached so the notification survives parent task cancellation.
-    nonisolated static func signalFailed(_ runID: UUID) {
+    nonisolated func signalFailed(_ runID: UUID) {
         Task.detached(priority: .utility) {
-            await shared.notifyFailed(runID: runID)
+            await self.notifyFailed(runID: runID)
         }
     }
 }

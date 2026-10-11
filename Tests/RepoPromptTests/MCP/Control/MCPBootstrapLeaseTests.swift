@@ -40,6 +40,7 @@ final class MCPBootstrapLeaseTests: XCTestCase {
                         allowsAgentExternalControlTools: false,
                         requiresExpectedAgentPID: true
                     ),
+                    runCoordinator: .shared,
                     policyInstaller: { _ in await recorder.recordInstall() },
                     expectedPIDPolicyArmer: { _ in await recorder.recordArm() },
                     policyClearer: { _ in await recorder.recordClear() }
@@ -136,7 +137,8 @@ final class MCPBootstrapLeaseTests: XCTestCase {
                         taskLabelKind: nil,
                         allowsAgentExternalControlTools: false,
                         requiresExpectedAgentPID: true
-                    )
+                    ),
+                    runCoordinator: .shared
                 )
 
                 await MCPRoutingWaiter.cleanup(runID: runID)
@@ -198,6 +200,7 @@ final class MCPBootstrapLeaseTests: XCTestCase {
                     allowsAgentExternalControlTools: false,
                     requiresExpectedAgentPID: false
                 ),
+                runCoordinator: .shared,
                 policyInstaller: { _ in await recorder.recordInstall() },
                 successfulRoutingPolicyClearer: { _ in await recorder.recordSuccessfulRoutingClear() },
                 policyClearer: { _ in await recorder.recordClear() }
@@ -302,6 +305,7 @@ final class MCPBootstrapLeaseTests: XCTestCase {
                     allowsAgentExternalControlTools: false,
                     requiresExpectedAgentPID: false
                 ),
+                runCoordinator: .shared,
                 policyInstaller: { _ in await recorder.recordInstall() },
                 successfulRoutingPolicyClearer: { _ in await recorder.recordSuccessfulRoutingClear() },
                 policyClearer: { _ in await recorder.recordClear() }
@@ -382,7 +386,8 @@ final class MCPBootstrapLeaseTests: XCTestCase {
                     taskLabelKind: nil,
                     allowsAgentExternalControlTools: false,
                     requiresExpectedAgentPID: false
-                )
+                ),
+                runCoordinator: .shared
             )
 
             let acquired = await lease.acquire()
@@ -436,6 +441,7 @@ final class MCPBootstrapLeaseTests: XCTestCase {
                     allowsAgentExternalControlTools: false,
                     requiresExpectedAgentPID: false
                 ),
+                runCoordinator: .shared,
                 policyInstaller: { _ in await recorder.recordInstall() },
                 successfulRoutingPolicyClearer: { _ in await recorder.recordSuccessfulRoutingClear() },
                 policyClearer: { _ in await recorder.recordClear() }
@@ -486,6 +492,7 @@ final class MCPBootstrapLeaseTests: XCTestCase {
                     allowsAgentExternalControlTools: false,
                     requiresExpectedAgentPID: true
                 ),
+                runCoordinator: .shared,
                 policyInstaller: { _ in await preRouteRecorder.recordInstall() },
                 expectedPIDPolicyArmer: { _ in true },
                 successfulRoutingPolicyClearer: { _ in await preRouteRecorder.recordSuccessfulRoutingClear() },
@@ -528,6 +535,7 @@ final class MCPBootstrapLeaseTests: XCTestCase {
                     allowsAgentExternalControlTools: false,
                     requiresExpectedAgentPID: false
                 ),
+                runCoordinator: .shared,
                 policyInstaller: { _ in await noRouteRecorder.recordInstall() },
                 successfulRoutingPolicyClearer: { _ in await noRouteRecorder.recordSuccessfulRoutingClear() },
                 policyClearer: { _ in await noRouteRecorder.recordClear() }
@@ -580,6 +588,7 @@ final class MCPBootstrapLeaseTests: XCTestCase {
                     allowsAgentExternalControlTools: false,
                     requiresExpectedAgentPID: true
                 ),
+                runCoordinator: .shared,
                 policyInstaller: { _ in await recorder.recordInstall() },
                 expectedPIDPolicyArmer: { _ in false },
                 policyClearer: { _ in await recorder.recordClear() }
@@ -627,6 +636,7 @@ final class MCPBootstrapLeaseTests: XCTestCase {
                     allowsAgentExternalControlTools: false,
                     requiresExpectedAgentPID: false
                 ),
+                runCoordinator: .shared,
                 policyInstaller: { _ in await recorder.recordInstall() },
                 policyClearer: { _ in await recorder.recordClear() }
             )
@@ -698,6 +708,7 @@ final class MCPBootstrapLeaseTests: XCTestCase {
                     allowsAgentExternalControlTools: false,
                     requiresExpectedAgentPID: false
                 ),
+                runCoordinator: .shared,
                 policyInstaller: { _ in await recorder.recordInstall() },
                 policyClearer: { _ in await recorder.recordClear() }
             )
@@ -831,7 +842,8 @@ final class MCPBootstrapLeaseTests: XCTestCase {
                         gateID: leaseGateID,
                         windowID: window.windowID,
                         agent: .cursor
-                    )
+                    ),
+                    runCoordinator: .shared
                 )
                 lease = resolvedLease
 

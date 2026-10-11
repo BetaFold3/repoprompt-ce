@@ -3958,7 +3958,10 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
                     allowsAgentExternalControlTools: delegationChain?.runToolPolicy.allowsAgentExternalControlTools ?? false,
                     additionalRestrictedTools: delegationChain?.runToolPolicy.additionalRestrictedTools ?? []
                 )
-                let resolvedLease = MCPBootstrapLease(spec: spec)
+                let resolvedLease = MCPBootstrapLease(
+                    spec: spec,
+                    runCoordinator: .shared
+                )
                 lease = resolvedLease
                 guard await resolvedLease.acquire() else {
                     throw ClientFixtureError.leaseAcquisitionFailed

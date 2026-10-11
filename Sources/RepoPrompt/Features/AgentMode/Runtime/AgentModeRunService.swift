@@ -355,6 +355,7 @@ final class AgentModeRunService {
             )
             let lease = MCPBootstrapLease(
                 spec: leaseSpec,
+                runCoordinator: .shared,
                 mcpServerEnabler: mcpServerEnabler,
                 policyInstaller: MCPBootstrapLease.agentModePolicyInstaller(connectionPolicyInstaller),
                 expectedPIDPolicyArmer: expectedPIDPolicyArmer

@@ -287,6 +287,17 @@ Decisions: Swift defaults can't refer to another parameter, so the Codex client'
 
 Step 5h — done | rounds 0/2 | open: | downgraded: | assumed: | deferred: OracleB P3-4 — interim `mcpHost: ServerNetworkManager.shared` sites inside agent code (provider service, Claude coordinator, tool-tracking owners, Cursor/OpenCode/OMP polling and headless defaults, OMP CLI provider and thinking sweep, Codex helpers and the debug test hook) move up in the next steps
 
+#### Step 5i — routing waiter, run coordinator and bootstrap lease take their dependencies
+Intent: the bootstrap lease, routing waiter and run coordinator reach the server and each other through `.shared`, so give them required initializer dependencies (host, waiter, coordinator), move the two process-wide instances and the waiter's static convenience calls into the App composition file, and have the OMP provider and agent-mode lease helpers take the waiter or host they use, with no behavior change.
+
+Budget used: about 1.5 hours (cumulative ~26.5 hours).
+
+Result: the routing waiter takes the host, the run coordinator takes the host and waiter, and the bootstrap lease takes the coordinator and reads both from it; the process-wide waiter and coordinator and the waiter's static calls now live in the App composition file, and none of the five touched agent files names the server or those statics. Build, format, lint and the 17 affected suites pass; one run had a single failure in the lifecycle test that also failed intermittently in Step 5c, and it passed alone and in a full rerun. Neither reviewer found anything above P3. The next step lifts the remaining interim server, waiter and coordinator arguments out of agent-mode owners and provider defaults.
+
+Decisions: the lease takes only the coordinator, so it can't register on one waiter and wait on another. First use of the waiter now also creates the server object, which has no side effects at creation. `agentModePolicyClearer` had no callers at HEAD and was deleted rather than given a host. The fire-and-forget signals became waiter instance methods that the App statics forward to.
+
+Step 5i — done | rounds 0/2 | open: | downgraded: | assumed: | deferred: interim `ServerNetworkManager.shared`, `MCPRoutingWaiter.shared` and `AgentRunCoordinator.shared` arguments at agent-mode run service, Codex coordinator, provider service and OMP CLI provider sites
+
 ### Slice 6 — `RepoPromptAgentCore` extraction
 Move the now-acyclic AI, agent models, providers, runtime, services, history, recommendations and non-UI remote-host code. Remove the temporary typealiases. Check the release compile flags once for cross-module optimization; don't change them.
 

@@ -5927,6 +5927,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
                 allowsAgentExternalControlTools: false,
                 requiresExpectedAgentPID: true
             ),
+            runCoordinator: .shared,
             policyInstaller: { _ in },
             expectedPIDPolicyArmer: { _ in true },
             policyClearer: { _ in }

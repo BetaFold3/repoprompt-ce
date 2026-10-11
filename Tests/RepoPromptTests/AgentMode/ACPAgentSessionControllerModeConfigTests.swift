@@ -979,6 +979,7 @@ final class ACPAgentSessionControllerModeConfigTests: XCTestCase {
                 includeRepoPromptMCPServer: false
             ),
             mcpHost: ServerNetworkManager.shared,
+            routingWaiter: .shared,
             workspacePath: workspace.path,
             providerFactory: { _ in fakeProvider }
         )

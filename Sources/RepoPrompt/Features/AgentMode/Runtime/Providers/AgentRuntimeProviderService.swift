@@ -337,7 +337,12 @@ final class AgentRuntimeProviderService {
             if Self.enableDebugLogging {
                 Self.logger.debug("Created OhMyPiACPHeadlessAgentProvider")
             }
-            return OhMyPiACPHeadlessAgentProvider(config: config, mcpHost: ServerNetworkManager.shared, workspacePath: workspacePath)
+            return OhMyPiACPHeadlessAgentProvider(
+                config: config,
+                mcpHost: ServerNetworkManager.shared,
+                routingWaiter: .shared,
+                workspacePath: workspacePath
+            )
         }
     }
 }

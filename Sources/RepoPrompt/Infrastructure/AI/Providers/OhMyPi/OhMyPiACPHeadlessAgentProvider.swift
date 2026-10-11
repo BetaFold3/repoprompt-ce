@@ -24,6 +24,7 @@ final class OhMyPiACPHeadlessAgentProvider: HeadlessAgentProvider {
     init(
         config: OhMyPiAgentConfig,
         mcpHost: any AgentMCPHosting,
+        routingWaiter: MCPRoutingWaiter,
         workspacePath: String? = nil,
         providerFactory: ProviderFactory? = nil,
         routeCheck: RouteCheck? = nil,
@@ -33,6 +34,12 @@ final class OhMyPiACPHeadlessAgentProvider: HeadlessAgentProvider {
         let routeCheck: RouteCheck = routeCheck ?? { runID in
             await OhMyPiACPHeadlessAgentProvider.prePromptMCPRouteIsReady(
                 runID: runID,
+                waitForRoutingOutcome: { runID, timeoutSeconds in
+                    await routingWaiter.waitUntilRoutedOutcome(
+                        runID: runID,
+                        timeoutSeconds: timeoutSeconds
+                    )
+                },
                 verifyLiveRoute: { runID in
                     await mcpHost.hasAuthoritativeLiveRunRoute(
                         runID: runID,
@@ -130,12 +137,7 @@ final class OhMyPiACPHeadlessAgentProvider: HeadlessAgentProvider {
     static func prePromptMCPRouteIsReady(
         runID: UUID,
         timeoutSeconds: TimeInterval = Double(ContextBuilderDefaults.mcpRoutingTimeoutMilliseconds) / 1000,
-        waitForRoutingOutcome: @escaping RoutingOutcomeWaiter = { runID, timeoutSeconds in
-            await MCPRoutingWaiter.waitUntilRoutedOutcome(
-                runID: runID,
-                timeoutSeconds: timeoutSeconds
-            )
-        },
+        waitForRoutingOutcome: @escaping RoutingOutcomeWaiter,
         verifyLiveRoute: @escaping LiveRouteVerifier
     ) async -> Bool {
         switch await waitForRoutingOutcome(runID, timeoutSeconds) {

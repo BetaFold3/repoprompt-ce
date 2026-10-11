@@ -1098,6 +1098,12 @@ final class OhMyPiACPProviderTests: XCTestCase {
         let recovered = await OhMyPiACPHeadlessAgentProvider.prePromptMCPRouteIsReady(
             runID: cleanedRunID,
             timeoutSeconds: 0,
+            waitForRoutingOutcome: { runID, timeoutSeconds in
+                await MCPRoutingWaiter.shared.waitUntilRoutedOutcome(
+                    runID: runID,
+                    timeoutSeconds: timeoutSeconds
+                )
+            },
             verifyLiveRoute: { await recoveredVerifier.verify($0) }
         )
         XCTAssertTrue(recovered)
@@ -1152,6 +1158,12 @@ final class OhMyPiACPProviderTests: XCTestCase {
         let rejectedFailure = await OhMyPiACPHeadlessAgentProvider.prePromptMCPRouteIsReady(
             runID: failedRunID,
             timeoutSeconds: 0,
+            waitForRoutingOutcome: { runID, timeoutSeconds in
+                await MCPRoutingWaiter.shared.waitUntilRoutedOutcome(
+                    runID: runID,
+                    timeoutSeconds: timeoutSeconds
+                )
+            },
             verifyLiveRoute: { await failedVerifier.verify($0) }
         )
         XCTAssertFalse(rejectedFailure, "A known routing failure must not be overridden by a live-route fallback")

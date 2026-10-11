@@ -66,21 +66,4 @@ extension MCPBootstrapLease {
             )
         }
     }
-
-    static func agentModePolicyClearer(
-        pendingPolicyClearer: (@Sendable () async -> Void)? = nil
-    ) -> (MCPBootstrapLeaseSpec) async -> Void {
-        if let pendingPolicyClearer {
-            return { _ in await pendingPolicyClearer() }
-        }
-
-        return { leaseSpec in
-            guard let clientName = leaseSpec.clientName else { return }
-            await ServerNetworkManager.shared.revokeClientConnectionPolicy(
-                for: clientName,
-                windowID: leaseSpec.windowID,
-                runID: leaseSpec.runID
-            )
-        }
-    }
 }

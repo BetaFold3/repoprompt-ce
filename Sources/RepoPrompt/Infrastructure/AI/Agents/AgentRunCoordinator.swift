@@ -29,23 +29,28 @@ final class AgentRunCoordinator {
         let gateRelease: HeadlessAgentConnectionGate.ReleaseResult
     }
 
-    static let shared = AgentRunCoordinator()
+    let mcpHost: any AgentMCPHosting
+    let routingWaiter: MCPRoutingWaiter
 
     private let log = Logger(subsystem: "com.repoprompt.agents", category: "AgentRunCoordinator")
 
     /// Default timeout for waiting for connection routing (10 seconds)
     private static let defaultRoutingTimeoutMs = 10000
 
-    private init() {}
+    /// `routingWaiter` must be the instance the App's connection manager signals when a run routes.
+    init(mcpHost: any AgentMCPHosting, routingWaiter: MCPRoutingWaiter) {
+        self.mcpHost = mcpHost
+        self.routingWaiter = routingWaiter
+    }
 
     /// Register routing state for a runID before any routing signals are expected.
     func registerRouting(runID: UUID) async {
-        await MCPRoutingWaiter.register(runID: runID)
+        await routingWaiter.register(runID: runID)
     }
 
     /// Cleanup routing state for a runID (idempotent backstop).
     func cleanupRouting(runID: UUID) async {
-        await MCPRoutingWaiter.cleanup(runID: runID)
+        await routingWaiter.cleanup(runID: runID)
     }
 
     /// Maps agent run type to MCP run purpose for UI routing (e.g., ask_user).
@@ -86,7 +91,7 @@ final class AgentRunCoordinator {
             requiresExpectedAgentPID: spec.agentKind.requiresExpectedPIDOwnedAgentModeMCPRouting
         )
 
-        let lease = MCPBootstrapLease(spec: leaseSpec)
+        let lease = MCPBootstrapLease(spec: leaseSpec, runCoordinator: self)
         let acquired = await lease.acquire()
         guard acquired else { throw CancellationError() }
         return lease
@@ -119,7 +124,7 @@ final class AgentRunCoordinator {
     /// end‑of‑run tab‑context commit/clear ordering.
     func cleanup(_ spec: AgentRunSpec, provider: HeadlessAgentProvider?) async {
         if let clientName = spec.agentKind.mcpClientNameHint {
-            await ServerNetworkManager.shared.clearClientConnectionPolicy(
+            await mcpHost.clearClientConnectionPolicy(
                 for: clientName,
                 windowID: spec.windowID,
                 runID: spec.runID
@@ -155,11 +160,12 @@ final class AgentRunCoordinator {
 
         // Event-driven wait with cancellation support:
         // On task cancellation, we signal failure immediately so the wait doesn't block until timeout.
+        let waiter = routingWaiter
         let routed = await withTaskCancellationHandler {
-            await MCPRoutingWaiter.waitUntilRouted(runID: runID, timeoutSeconds: timeoutSeconds)
+            await waiter.waitUntilRouted(runID: runID, timeoutSeconds: timeoutSeconds)
         } onCancel: {
             // Expedite: tell the waiter this run will never route (task was cancelled)
-            MCPRoutingWaiter.signalFailed(runID)
+            waiter.signalFailed(runID)
         }
 
         let gateKey = gateID ?? runID
@@ -174,5 +180,3 @@ final class AgentRunCoordinator {
         return GateRoutingReleaseResult(routed: routed, gateRelease: gateRelease)
     }
 }
-
-// Temporary overload removed; ServerNetworkManager now exposes installClientConnectionPolicy directly.
