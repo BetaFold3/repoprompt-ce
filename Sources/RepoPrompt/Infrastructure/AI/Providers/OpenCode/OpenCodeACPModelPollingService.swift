@@ -12,6 +12,7 @@ struct OpenCodeACPControllerModelDiscoveryClient: OpenCodeACPModelDiscoveryClien
     private let controllerFactory: ControllerFactory
 
     init(
+        mcpHost: any AgentMCPHosting,
         providerFactory: @escaping ProviderFactory = { agent, modelString in
             if agent == .openCode {
                 return OpenCodeACPAgentProvider(
@@ -27,12 +28,12 @@ struct OpenCodeACPControllerModelDiscoveryClient: OpenCodeACPModelDiscoveryClien
             }
             return ACPAgentProviderFactory.makeProvider(for: agent, modelString: modelString)
         },
-        controllerFactory: @escaping ControllerFactory = { provider, runRequest in
-            try ACPAgentSessionController(provider: provider, runRequest: runRequest, mcpHost: ServerNetworkManager.shared)
-        }
+        controllerFactory: ControllerFactory? = nil
     ) {
         self.providerFactory = providerFactory
-        self.controllerFactory = controllerFactory
+        self.controllerFactory = controllerFactory ?? { provider, runRequest in
+            try ACPAgentSessionController(provider: provider, runRequest: runRequest, mcpHost: mcpHost)
+        }
     }
 
     func discoverModels(workspacePath: String?) async throws -> ACPDiscoveredSessionModels? {
@@ -72,10 +73,6 @@ struct OpenCodeACPControllerModelDiscoveryClient: OpenCodeACPModelDiscoveryClien
 /// the lightweight discovery loop and writes normalized options through `AgentACPModelRegistry`,
 /// keeping Agent Mode and Discover UI paths as registry consumers rather than duplicate parsers.
 actor OpenCodeACPModelPollingService {
-    static let shared = OpenCodeACPModelPollingService(
-        client: OpenCodeACPControllerModelDiscoveryClient()
-    )
-
     struct Snapshot: Equatable {
         let models: ACPDiscoveredSessionModels
         let fetchedAt: Date

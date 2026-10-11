@@ -73,10 +73,6 @@ enum CodexManagedAuthRecoveryClassifier {
 }
 
 actor CodexManagedAuthRecoveryService: CodexManagedAuthRecovering {
-    static let shared = CodexManagedAuthRecoveryService {
-        CodexProviderHelpers.makeOwnedNonAgentAppServerClient()
-    }
-
     private let clientFactory: @Sendable () -> any CodexManagedAuthRPCClient
     private var inFlightRefreshTask: Task<CodexManagedAuthRefreshResult, Never>?
     private var inFlightLoginTask: Task<CodexManagedChatgptLoginResult, Never>?

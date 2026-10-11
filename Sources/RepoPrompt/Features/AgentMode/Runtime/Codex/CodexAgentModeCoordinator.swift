@@ -399,7 +399,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         connectionPolicyInstaller: @escaping ConnectionPolicyInstaller,
         shouldManageCodexTooling: Bool,
         runCoordinator: AgentRunCoordinator,
-        authRecovery: any CodexManagedAuthRecovering = CodexManagedAuthRecoveryService.shared,
+        authRecovery: any CodexManagedAuthRecovering,
         activeToolQuery: @escaping ActiveToolQuery = { _ in false },
         activeAgentRunWaitQuery: @escaping ActiveAgentRunWaitQuery = { _ in false },
         activeAgentRunWaitDrain: @escaping ActiveAgentRunWaitDrain = { _, _ in .drained },

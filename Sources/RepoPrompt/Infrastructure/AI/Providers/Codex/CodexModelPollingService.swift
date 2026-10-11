@@ -28,16 +28,10 @@ struct CodexModelCatalogStatus: Equatable {
 /// - Updating `AgentCodexModelRegistry` as the single canonical writer
 ///
 /// Related:
-/// - CodexProviderHelpers.makeOwnedNonAgentAppServerClient() (dedicated polling transport)
+/// - CodexProviderHelpers.makeOwnedNonAgentAppServerClient(mcpHost:) (dedicated polling transport)
 /// - AgentCodexModelRegistry (canonical registry updated by this service)
 /// - AgentModelCatalog (consumes registry for model option resolution)
 actor CodexModelPollingService {
-    static let shared = CodexModelPollingService(
-        client: CodexProviderHelpers.makeOwnedNonAgentAppServerClient(),
-        stopClientOnShutdown: true,
-        stopClientWhenIdle: true
-    )
-
     struct Snapshot: Equatable {
         let models: [CodexAppServerClient.RemoteModel]
         let fetchedAt: Date

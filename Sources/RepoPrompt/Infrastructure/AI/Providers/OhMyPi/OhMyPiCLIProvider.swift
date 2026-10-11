@@ -15,16 +15,9 @@ final class OhMyPiCLIProvider: AIProvider {
     private let connectionStateProvider: ConnectionStateProvider
 
     init(
-        headlessProviderFactory: @escaping HeadlessProviderFactory = { config, workspacePath in
-            AnyHeadlessAgentProvider(
-                OhMyPiACPHeadlessAgentProvider(
-                    config: config,
-                    mcpHost: ServerNetworkManager.shared,
-                    routingWaiter: .shared,
-                    workspacePath: workspacePath
-                )
-            )
-        },
+        mcpHost: any AgentMCPHosting,
+        routingWaiter: MCPRoutingWaiter,
+        headlessProviderFactory: HeadlessProviderFactory? = nil,
         modelSnapshotResolver: @escaping ModelSnapshotResolver = {
             await AgentACPModelRegistry.shared.resolvedSnapshotAfterWarmingStandardStore(for: .ohMyPi)
         },
@@ -32,7 +25,16 @@ final class OhMyPiCLIProvider: AIProvider {
             OhMyPiConnectionAvailability.isEffectivelyConnected()
         }
     ) {
-        self.headlessProviderFactory = headlessProviderFactory
+        self.headlessProviderFactory = headlessProviderFactory ?? { config, workspacePath in
+            AnyHeadlessAgentProvider(
+                OhMyPiACPHeadlessAgentProvider(
+                    config: config,
+                    mcpHost: mcpHost,
+                    routingWaiter: routingWaiter,
+                    workspacePath: workspacePath
+                )
+            )
+        }
         self.modelSnapshotResolver = modelSnapshotResolver
         self.connectionStateProvider = connectionStateProvider
     }

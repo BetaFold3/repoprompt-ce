@@ -4019,17 +4019,6 @@ final class CodexNativeSessionController {
             maxRunningAggregatedOutputCharacters
         }
 
-        static func test_parseExecCommandEndEventResultJSON(params: [String: Any]) -> String? {
-            let controller = CodexNativeSessionController(
-                client: CodexAppServerClient(mcpHost: ServerNetworkManager.shared),
-                runID: UUID(),
-                tabID: UUID(),
-                windowID: 1,
-                workspacePath: nil
-            )
-            return controller.parseExecCommandEndEvent(params: params)?.resultJSON
-        }
-
         struct TestToolLifecycleEvent: Equatable {
             let kind: String
             let name: String

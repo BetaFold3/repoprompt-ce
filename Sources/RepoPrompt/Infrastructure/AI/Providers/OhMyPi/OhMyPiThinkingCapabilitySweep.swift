@@ -124,24 +124,25 @@ struct OhMyPiThinkingCapabilityControllerSessionFactory:
     private let now: @Sendable () -> Date
 
     init(
+        mcpHost: any AgentMCPHosting,
         providerFactory: @escaping ProviderFactory = { OhMyPiACPAgentProvider(config: $0) },
-        controllerFactory: @escaping ControllerFactory = { provider, request, timeouts, publisher in
-            try ACPAgentSessionController(
-                provider: provider,
-                runRequest: request,
-                mcpHost: ServerNetworkManager.shared,
-                requestTimeouts: timeouts,
-                dynamicModelPublicationPolicy: .capabilityOnly,
-                ohMyPiThinkingCapabilityPublisher: publisher
-            )
-        },
+        controllerFactory: ControllerFactory? = nil,
         runtimeVersion: @escaping @Sendable () -> String? = {
             OhMyPiRuntimeVersionRegistry.shared.currentVersion
         },
         now: @escaping @Sendable () -> Date = { Date() }
     ) {
         self.providerFactory = providerFactory
-        self.controllerFactory = controllerFactory
+        self.controllerFactory = controllerFactory ?? { provider, request, timeouts, publisher in
+            try ACPAgentSessionController(
+                provider: provider,
+                runRequest: request,
+                mcpHost: mcpHost,
+                requestTimeouts: timeouts,
+                dynamicModelPublicationPolicy: .capabilityOnly,
+                ohMyPiThinkingCapabilityPublisher: publisher
+            )
+        }
         self.runtimeVersion = runtimeVersion
         self.now = now
     }
@@ -217,8 +218,7 @@ struct OhMyPiThinkingCapabilityControllerSweepClient: OhMyPiThinkingCapabilitySw
     init(
         registry: OhMyPiThinkingCapabilityRegistry = .shared,
         runtimeVersionRegistry: OhMyPiRuntimeVersionRegistry = .shared,
-        sessionFactory: any OhMyPiThinkingCapabilitySessionFactory =
-            OhMyPiThinkingCapabilityControllerSessionFactory(),
+        sessionFactory: any OhMyPiThinkingCapabilitySessionFactory,
         isAvailable: @escaping @Sendable () -> Bool = {
             OhMyPiConnectionAvailability.isEffectivelyConnected()
         },

@@ -97,7 +97,7 @@ final class WindowCloseCoordinatorLifecycleTests: XCTestCase {
             secureService: SecureKeysService(secureStorage: TestSecureStorageBackend())
         )
         let apiSettings = APISettingsViewModel(
-            aiQueriesService: AIQueriesService(keyManager: keyManager),
+            aiQueriesService: AIQueriesService(keyManager: keyManager, mcpHost: ServerNetworkManager.shared, routingWaiter: .shared, codexAuthRecovery: CodexManagedAuthRecoveryService.shared),
             keyManager: keyManager,
             loadStoredDataOnInit: false
         )
@@ -196,7 +196,7 @@ final class WindowCloseCoordinatorLifecycleTests: XCTestCase {
             secureService: SecureKeysService(secureStorage: TestSecureStorageBackend())
         )
         let viewModel = APISettingsViewModel(
-            aiQueriesService: AIQueriesService(keyManager: keyManager),
+            aiQueriesService: AIQueriesService(keyManager: keyManager, mcpHost: ServerNetworkManager.shared, routingWaiter: .shared, codexAuthRecovery: CodexManagedAuthRecoveryService.shared),
             keyManager: keyManager,
             storedDataLoadBoundary: {
                 await loadGate.arriveAndWait()

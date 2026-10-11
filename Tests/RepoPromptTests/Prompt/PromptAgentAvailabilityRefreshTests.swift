@@ -122,7 +122,7 @@ final class PromptAgentAvailabilityRefreshTests: XCTestCase {
     private func makeViewModel(fixture: AvailabilityFixture) -> APISettingsViewModel {
         let keyManager = KeyManager(secureService: fixture.secureService)
         return APISettingsViewModel(
-            aiQueriesService: AIQueriesService(keyManager: keyManager),
+            aiQueriesService: AIQueriesService(keyManager: keyManager, mcpHost: ServerNetworkManager.shared, routingWaiter: .shared, codexAuthRecovery: CodexManagedAuthRecoveryService.shared),
             keyManager: keyManager,
             loadStoredDataOnInit: false,
             compatibleBackendStore: fixture.backendStore

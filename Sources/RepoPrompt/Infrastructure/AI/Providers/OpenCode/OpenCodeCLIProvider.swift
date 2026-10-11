@@ -4,6 +4,11 @@ import Foundation
 /// Runs a fresh prompt-only-style ACP session per request while preserving OpenCode's raw model IDs.
 final class OpenCodeCLIProvider: AIProvider {
     private let activeProviders = ActiveOpenCodeCLIProviderStore<OpenCodeACPHeadlessAgentProvider>()
+    private let mcpHost: any AgentMCPHosting
+
+    init(mcpHost: any AgentMCPHosting) {
+        self.mcpHost = mcpHost
+    }
 
     #if DEBUG
         static func test_makeHeadlessConfig(modelName: String?) -> OpenCodeAgentConfig {
@@ -14,6 +19,7 @@ final class OpenCodeCLIProvider: AIProvider {
     func streamMessage(_ aiMessage: AIMessage, model: AIModel, maxTokens _: Int? = nil) async throws -> AsyncThrowingStream<AIStreamResult, Error> {
         let provider = OpenCodeACPHeadlessAgentProvider(
             config: Self.makeHeadlessConfig(modelName: openCodeModelName(for: model)),
+            mcpHost: mcpHost,
             workspacePath: nil
         )
         if let replacedProvider = activeProviders.replace(provider) {

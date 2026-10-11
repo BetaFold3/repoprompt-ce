@@ -4,6 +4,9 @@ class AIProviderFactory {
     static func createProvider(
         for providerType: AIProviderType,
         keyManager: KeyManager,
+        mcpHost: any AgentMCPHosting,
+        routingWaiter: MCPRoutingWaiter,
+        codexAuthRecovery: any CodexManagedAuthRecovering,
         ollamaURL: URL? = nil,
         azureConfiguration: AzureOpenAIConfiguration? = nil
     ) async throws -> AIProvider {
@@ -12,6 +15,9 @@ class AIProviderFactory {
             return try await createProvider(
                 for: providerType,
                 key: "",
+                mcpHost: mcpHost,
+                routingWaiter: routingWaiter,
+                codexAuthRecovery: codexAuthRecovery,
                 ollamaURL: ollamaURL,
                 azureConfiguration: config
             )
@@ -22,6 +28,9 @@ class AIProviderFactory {
             return try await createProvider(
                 for: providerType,
                 key: "",
+                mcpHost: mcpHost,
+                routingWaiter: routingWaiter,
+                codexAuthRecovery: codexAuthRecovery,
                 ollamaURL: ollamaURL,
                 azureConfiguration: azureConfiguration
             )
@@ -33,6 +42,9 @@ class AIProviderFactory {
         return try await createProvider(
             for: providerType,
             key: key,
+            mcpHost: mcpHost,
+            routingWaiter: routingWaiter,
+            codexAuthRecovery: codexAuthRecovery,
             ollamaURL: ollamaURL,
             azureConfiguration: azureConfiguration
         )
@@ -41,6 +53,9 @@ class AIProviderFactory {
     static func createProvider(
         for providerType: AIProviderType,
         key: String,
+        mcpHost: any AgentMCPHosting,
+        routingWaiter: MCPRoutingWaiter,
+        codexAuthRecovery: any CodexManagedAuthRecovering,
         ollamaURL: URL? = nil,
         azureConfiguration: AzureOpenAIConfiguration? = nil,
         model: String? = nil
@@ -82,13 +97,13 @@ class AIProviderFactory {
             return try ClaudeCodeProvider()
         case .codex:
             // Standard non-agent Codex chat owns a fresh app-server client per request.
-            return CodexCLIProvider()
+            return CodexCLIProvider(mcpHost: mcpHost, authRecovery: codexAuthRecovery)
         case .openCode:
-            return OpenCodeCLIProvider()
+            return OpenCodeCLIProvider(mcpHost: mcpHost)
         case .cursor:
-            return CursorCLIProvider()
+            return CursorCLIProvider(mcpHost: mcpHost)
         case .ohMyPi:
-            return OhMyPiCLIProvider()
+            return OhMyPiCLIProvider(mcpHost: mcpHost, routingWaiter: routingWaiter)
         case .customProvider:
             let config = try CustomProviderConfiguration.load()
 

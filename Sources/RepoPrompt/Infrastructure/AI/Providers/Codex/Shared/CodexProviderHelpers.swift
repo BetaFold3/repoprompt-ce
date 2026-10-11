@@ -26,9 +26,9 @@ enum CodexProviderHelpers {
     /// Returns a fresh app-server client for non-agent Codex flows.
     /// These flows should not share transport/process state across chat, health checks,
     /// and model polling because failures become sticky across otherwise unrelated work.
-    static func makeOwnedNonAgentAppServerClient() -> CodexAppServerClient {
+    static func makeOwnedNonAgentAppServerClient(mcpHost: any AgentMCPHosting) -> CodexAppServerClient {
         let _ = MCPIntegrationHelper.ensureCodexServerForDiscovery()
-        return CodexAppServerClient(mcpHost: ServerNetworkManager.shared)
+        return CodexAppServerClient(mcpHost: mcpHost)
     }
 
     struct CodexExecutableResolution: Equatable {

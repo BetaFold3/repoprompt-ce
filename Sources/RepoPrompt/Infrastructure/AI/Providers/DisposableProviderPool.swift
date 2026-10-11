@@ -9,6 +9,9 @@ import Foundation
 
 actor DisposableProviderPool {
     private let keyManager: KeyManager
+    private let mcpHost: any AgentMCPHosting
+    private let routingWaiter: MCPRoutingWaiter
+    private let codexAuthRecovery: any CodexManagedAuthRecovering
 
     /// Caches for fallback if KeyManager returns invalid/empty values.
     /// Key-based providers (OpenAI, Anthropic, etc.) will store their key here.
@@ -17,8 +20,16 @@ actor DisposableProviderPool {
     /// Azure providers store their entire configuration so we can re-use them if fetching fails.
     private var cachedAzureConfigs: [AIProviderType: AzureOpenAIConfiguration] = [:]
 
-    init(keyManager: KeyManager) {
+    init(
+        keyManager: KeyManager,
+        mcpHost: any AgentMCPHosting,
+        routingWaiter: MCPRoutingWaiter,
+        codexAuthRecovery: any CodexManagedAuthRecovering
+    ) {
         self.keyManager = keyManager
+        self.mcpHost = mcpHost
+        self.routingWaiter = routingWaiter
+        self.codexAuthRecovery = codexAuthRecovery
     }
 
     /// Returns a brand-new provider every time it's called.
@@ -43,6 +54,9 @@ actor DisposableProviderPool {
             return try await AIProviderFactory.createProvider(
                 for: providerType,
                 key: "",
+                mcpHost: mcpHost,
+                routingWaiter: routingWaiter,
+                codexAuthRecovery: codexAuthRecovery,
                 ollamaURL: ollamaURL,
                 azureConfiguration: azureConfiguration,
                 model: model.rawValue
@@ -71,6 +85,9 @@ actor DisposableProviderPool {
             return try await AIProviderFactory.createProvider(
                 for: .ollama,
                 key: "", // No actual API key for Ollama
+                mcpHost: mcpHost,
+                routingWaiter: routingWaiter,
+                codexAuthRecovery: codexAuthRecovery,
                 ollamaURL: typedURL,
                 azureConfiguration: azureConfiguration
             )
@@ -80,6 +97,9 @@ actor DisposableProviderPool {
             return try await AIProviderFactory.createProvider(
                 for: .ollama,
                 key: "",
+                mcpHost: mcpHost,
+                routingWaiter: routingWaiter,
+                codexAuthRecovery: codexAuthRecovery,
                 ollamaURL: fallbackURL,
                 azureConfiguration: azureConfiguration
             )
@@ -96,6 +116,9 @@ actor DisposableProviderPool {
             return try await AIProviderFactory.createProvider(
                 for: providerType,
                 key: "", // We already have config
+                mcpHost: mcpHost,
+                routingWaiter: routingWaiter,
+                codexAuthRecovery: codexAuthRecovery,
                 ollamaURL: ollamaURL,
                 azureConfiguration: directConfig
             )
@@ -115,6 +138,9 @@ actor DisposableProviderPool {
                 return try await AIProviderFactory.createProvider(
                     for: providerType,
                     key: "",
+                    mcpHost: mcpHost,
+                    routingWaiter: routingWaiter,
+                    codexAuthRecovery: codexAuthRecovery,
                     ollamaURL: ollamaURL,
                     azureConfiguration: config
                 )
@@ -128,6 +154,9 @@ actor DisposableProviderPool {
             return try await AIProviderFactory.createProvider(
                 for: providerType,
                 key: "",
+                mcpHost: mcpHost,
+                routingWaiter: routingWaiter,
+                codexAuthRecovery: codexAuthRecovery,
                 ollamaURL: ollamaURL,
                 azureConfiguration: cachedConfig
             )
@@ -136,6 +165,9 @@ actor DisposableProviderPool {
             return try await AIProviderFactory.createProvider(
                 for: providerType,
                 key: "",
+                mcpHost: mcpHost,
+                routingWaiter: routingWaiter,
+                codexAuthRecovery: codexAuthRecovery,
                 ollamaURL: ollamaURL,
                 azureConfiguration: nil
             )
@@ -169,6 +201,9 @@ actor DisposableProviderPool {
         return try await AIProviderFactory.createProvider(
             for: providerType,
             key: finalKey,
+            mcpHost: mcpHost,
+            routingWaiter: routingWaiter,
+            codexAuthRecovery: codexAuthRecovery,
             ollamaURL: ollamaURL,
             azureConfiguration: azureConfiguration,
             model: model.rawValue

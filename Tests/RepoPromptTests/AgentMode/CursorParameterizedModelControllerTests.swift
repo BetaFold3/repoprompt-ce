@@ -727,6 +727,7 @@ final class CursorParameterizedModelControllerTests: XCTestCase {
                 includeRepoPromptMCPServer: false,
                 cleanupProjectMCPApproval: false
             ),
+            mcpHost: ServerNetworkManager.shared,
             workspacePath: directory.path,
             providerFactory: { _ in provider }
         )
@@ -847,10 +848,8 @@ final class CursorParameterizedModelControllerTests: XCTestCase {
         )
         let catalog = CursorModelParameterCatalog()
         let client = CursorACPControllerModelDiscoveryClient(
+            mcpHost: ServerNetworkManager.shared,
             providerFactory: { _, _ in provider },
-            controllerFactory: { provider, request in
-                try ACPAgentSessionController(provider: provider, runRequest: request, mcpHost: ServerNetworkManager.shared)
-            },
             parameterCatalog: catalog,
             parameterizedModelsEnabled: { parameterizedModelsEnabled },
             extensionTimeoutSeconds: extensionTimeoutSeconds

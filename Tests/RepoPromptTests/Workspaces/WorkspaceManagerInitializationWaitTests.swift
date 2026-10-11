@@ -172,7 +172,7 @@ import XCTest
                 secureService: SecureKeysService(secureStorage: TestSecureStorageBackend())
             )
             let apiSettings = APISettingsViewModel(
-                aiQueriesService: AIQueriesService(keyManager: keyManager),
+                aiQueriesService: AIQueriesService(keyManager: keyManager, mcpHost: ServerNetworkManager.shared, routingWaiter: .shared, codexAuthRecovery: CodexManagedAuthRecoveryService.shared),
                 keyManager: keyManager,
                 loadStoredDataOnInit: false
             )

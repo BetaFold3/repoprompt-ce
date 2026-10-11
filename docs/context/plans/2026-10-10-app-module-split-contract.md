@@ -312,9 +312,20 @@ Step 5j — done | rounds 0/2 | open: | downgraded: | assumed: | deferred: pre-e
 #### Step 5k — `Infrastructure/AI` providers and services take the host
 Intent: the chat-provider factory and its CLI providers, the Cursor, OpenCode and OMP headless providers and model-polling services, the OMP thinking sweep, the Codex non-agent client helper and its users still reach `ServerNetworkManager.shared` (or the shared waiter) through default arguments, so give each the host it uses as a required dependency supplied from App, move their process-wide instances that need it into the App composition file, and delete the uncalled debug Codex hook, with no behavior change.
 
-Budget used: about 0 hours so far (cumulative ~28 hours).
+Budget used: about 2 hours (cumulative ~30 hours).
 
-Step 5k — doing | rounds 0/2 | open: | downgraded: | assumed: | deferred:
+Result: `Infrastructure/AI` no longer names the server or the shared waiter. The chat-provider factory, the request pool and the queries service take the host, waiter and Codex auth recovery from window composition. The headless providers, discovery clients, sweep and Codex helper take the host. Six process-wide instances now live in the App composition file, and the uncalled debug hook is gone. Build, format, lint, the 89 affected suites, the 42 suites rerun after review fixes, and the release package all pass. Neither reviewer found anything above P2. The P2's grep found three trigger defaults and one Codex coordinator default that now named App instances, and both were fixed. The next steps take the remaining settings reads out of agent code.
+
+Decisions: the factory, pool and queries service take the three dependencies as separate arguments rather than a new bundle type. The two OMP thinking trigger helpers, which only UI and view-model code calls, moved verbatim into an App file (`Infrastructure/UI/Agent/OhMyPiThinkingTriggers.swift`), so their `.shared` resolver default stays in App. The Codex coordinator's `CodexModelPollingService.shared` subscription stays a plain read for now, because injecting it at view-model init would create the polling client and run the Codex discovery setup earlier. A rescan (evidence `step5l-probe/`) leaves 76 outside names. 26 of their files, including `MCPIntegrationHelper`, the routing waiter, the bootstrap lease, `RepoPromptMCPServerConfiguration`, `ToolResultDTOs`, `KeyManager` and `ExecutableFileIdentity`, now depend only on agent code, so they can join at the cut. `AutoRecommendationEngine` has no agent-code users and stays in App.
+
+Step 5k — done | rounds 0/2 | open: | downgraded: | assumed: | deferred: `CodexModelPollingService.shared` read in the Codex coordinator body; OracleB P3-1 (dependency bundle) and P3-2 (health check reads statics) declined; the `MCPRoutingWaiter` type joins at the cut; `AgentRuntimeProviderService.enableDebugLogging` defaults in discovery clients and the sweep
+
+#### Step 5l — Codex and Claude settings reads injected
+Intent: the Codex and Claude coordinators, the Codex native session controller default and the provider preference snapshot store read `GlobalSettingsStore` directly or through the settings-backed Codex accessors, so move those accessors and the standard-defaults routing of `CodexAgentModeBooleanPreference` into App extensions, and give the consumers synchronous `@MainActor` closures that App supplies and calls exactly where the old reads happened, with no behavior change.
+
+Budget used: about 0 hours so far (cumulative ~30 hours).
+
+Step 5l — doing | rounds 0/2 | open: | downgraded: | assumed: | deferred:
 
 ### Slice 6 — `RepoPromptAgentCore` extraction
 Move the now-acyclic AI, agent models, providers, runtime, services, history, recommendations and non-UI remote-host code. Remove the temporary typealiases. Check the release compile flags once for cross-module optimization; don't change them.

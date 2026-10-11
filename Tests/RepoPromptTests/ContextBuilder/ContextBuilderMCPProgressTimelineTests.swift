@@ -182,6 +182,9 @@ final class ContextBuilderMCPProgressTimelineTests: XCTestCase {
                 aiQueriesServiceFactory: { keyManager in
                     AIQueriesService(
                         keyManager: keyManager,
+                        mcpHost: ServerNetworkManager.shared,
+                        routingWaiter: .shared,
+                        codexAuthRecovery: CodexManagedAuthRecoveryService.shared,
                         sendPromptOverride: { _, _ in
                             let stream = AsyncThrowingStream<ChatStreamOutput, Error> { continuation in
                                 continuation.yield(ChatStreamOutput(

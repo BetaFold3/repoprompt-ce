@@ -408,7 +408,7 @@ final class AgentToolTrackingController {
     }
 
     @MainActor private func shouldDeliverCallback(for runID: UUID) -> Bool {
-        // `ServerNetworkManager` fires observer callbacks synchronously, but the
+        // The MCP host fires observer callbacks synchronously, but the
         // controller hops them to the main actor for UI mutation. A fast tool can
         // complete and the run can stop tracking before that hop executes. Deliver
         // already-fired callbacks when no newer run has taken ownership; still drop

@@ -12,7 +12,7 @@ final class CursorCLIProviderTests: XCTestCase {
             results: [AIStreamResult(type: "content", text: "cursor text")],
             finishes: true
         )
-        let provider = CursorCLIProvider { config, workspacePath in
+        let provider = CursorCLIProvider(mcpHost: ServerNetworkManager.shared) { config, workspacePath in
             recorder.record(config: config, workspacePath: workspacePath)
             return AnyHeadlessAgentProvider(fake)
         }
@@ -32,7 +32,7 @@ final class CursorCLIProviderTests: XCTestCase {
         await provider.dispose()
         XCTAssertEqual(fake.disposalCount, 1)
 
-        let emptyProvider = CursorCLIProvider { _, _ in
+        let emptyProvider = CursorCLIProvider(mcpHost: ServerNetworkManager.shared) { _, _ in
             AnyHeadlessAgentProvider(CursorCLIProviderFake(results: [], finishes: true))
         }
         do {

@@ -24,6 +24,7 @@ final class CodexCLIProvider: AIProvider {
         let task: Task<Void, Never>
     }
 
+    private let mcpHost: any AgentMCPHosting
     private let workingDirectory: String?
     private let enableDebugLogging: Bool
     private let defaultRequestTimeout: TimeInterval
@@ -44,6 +45,7 @@ final class CodexCLIProvider: AIProvider {
     private var activeRequestClients: [UUID: CodexAppServerClient] = [:]
 
     init(
+        mcpHost: any AgentMCPHosting,
         workingDirectory: String? = nil,
         enableDebugLogging: Bool = false,
         defaultRequestTimeout: TimeInterval? = nil,
@@ -51,9 +53,10 @@ final class CodexCLIProvider: AIProvider {
         maxRetries: Int? = nil,
         logCollector: CLIProcessLogCollector? = nil,
         appServerReadyHook: (() async throws -> Void)? = nil,
-        authRecovery: any CodexManagedAuthRecovering = CodexManagedAuthRecoveryService.shared,
+        authRecovery: any CodexManagedAuthRecovering,
         sessionControllerFactory: ((Set<String>, TimeInterval) -> CodexSessionControlling)? = nil
     ) {
+        self.mcpHost = mcpHost
         self.workingDirectory = workingDirectory
         self.enableDebugLogging = enableDebugLogging
         self.defaultRequestTimeout = defaultRequestTimeout ?? (45 * 60)
@@ -784,7 +787,7 @@ final class CodexCLIProvider: AIProvider {
 
     private func makeRequestAppServerClient() -> CodexAppServerClient? {
         guard sessionControllerFactory == nil else { return nil }
-        return CodexProviderHelpers.makeOwnedNonAgentAppServerClient()
+        return CodexProviderHelpers.makeOwnedNonAgentAppServerClient(mcpHost: mcpHost)
     }
 
     private func withActiveRequestAppServerClient<T>(

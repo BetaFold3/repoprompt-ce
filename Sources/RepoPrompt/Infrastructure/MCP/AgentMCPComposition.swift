@@ -88,3 +88,43 @@ extension AgentRunCoordinator {
 extension AgentRuntimeProviderService {
     static let shared = AgentRuntimeProviderService(mcpHost: ServerNetworkManager.shared, routingWaiter: .shared)
 }
+
+extension OhMyPiACPModelPollingService {
+    static let shared = OhMyPiACPModelPollingService(
+        client: OhMyPiACPControllerModelDiscoveryClient(mcpHost: ServerNetworkManager.shared)
+    )
+}
+
+extension OpenCodeACPModelPollingService {
+    static let shared = OpenCodeACPModelPollingService(
+        client: OpenCodeACPControllerModelDiscoveryClient(mcpHost: ServerNetworkManager.shared)
+    )
+}
+
+extension CursorACPModelPollingService {
+    static let shared = CursorACPModelPollingService(
+        client: CursorACPControllerModelDiscoveryClient(mcpHost: ServerNetworkManager.shared)
+    )
+}
+
+extension OhMyPiThinkingCapabilityResolver {
+    static let shared = OhMyPiThinkingCapabilityResolver(
+        client: OhMyPiThinkingCapabilityControllerSweepClient(
+            sessionFactory: OhMyPiThinkingCapabilityControllerSessionFactory(mcpHost: ServerNetworkManager.shared)
+        )
+    )
+}
+
+extension CodexModelPollingService {
+    static let shared = CodexModelPollingService(
+        client: CodexProviderHelpers.makeOwnedNonAgentAppServerClient(mcpHost: ServerNetworkManager.shared),
+        stopClientOnShutdown: true,
+        stopClientWhenIdle: true
+    )
+}
+
+extension CodexManagedAuthRecoveryService {
+    static let shared = CodexManagedAuthRecoveryService {
+        CodexProviderHelpers.makeOwnedNonAgentAppServerClient(mcpHost: ServerNetworkManager.shared)
+    }
+}

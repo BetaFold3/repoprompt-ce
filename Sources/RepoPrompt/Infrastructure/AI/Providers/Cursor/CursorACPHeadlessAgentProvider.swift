@@ -20,18 +20,20 @@ final class CursorACPHeadlessAgentProvider: HeadlessAgentProvider {
 
     init(
         config: CursorAgentConfig,
+        mcpHost: any AgentMCPHosting,
         workspacePath: String? = nil,
         providerFactory: ProviderFactory? = nil,
-        controllerFactory: @escaping ControllerFactory = { provider, request, diagnosticSink in
+        controllerFactory: ControllerFactory? = nil
+    ) {
+        self.config = config
+        let controllerFactory: ControllerFactory = controllerFactory ?? { provider, request, diagnosticSink in
             try ACPAgentSessionController(
                 provider: provider,
                 runRequest: request,
-                mcpHost: ServerNetworkManager.shared,
+                mcpHost: mcpHost,
                 diagnosticSink: diagnosticSink
             )
         }
-    ) {
-        self.config = config
         let resolvedProviderFactory = providerFactory ?? { config in
             CursorACPAgentProvider(config: config)
         }

@@ -9,13 +9,14 @@ final class CursorCLIProvider: AIProvider {
     private let headlessProviderFactory: HeadlessProviderFactory
 
     init(
-        headlessProviderFactory: @escaping HeadlessProviderFactory = { config, workspacePath in
+        mcpHost: any AgentMCPHosting,
+        headlessProviderFactory: HeadlessProviderFactory? = nil
+    ) {
+        self.headlessProviderFactory = headlessProviderFactory ?? { config, workspacePath in
             AnyHeadlessAgentProvider(
-                CursorACPHeadlessAgentProvider(config: config, workspacePath: workspacePath)
+                CursorACPHeadlessAgentProvider(config: config, mcpHost: mcpHost, workspacePath: workspacePath)
             )
         }
-    ) {
-        self.headlessProviderFactory = headlessProviderFactory
     }
 
     #if DEBUG

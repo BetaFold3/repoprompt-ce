@@ -317,7 +317,7 @@ final class AgentRuntimeProviderService {
             if Self.enableDebugLogging {
                 Self.logger.debug("Created OpenCodeACPHeadlessAgentProvider")
             }
-            return OpenCodeACPHeadlessAgentProvider(config: config, workspacePath: workspacePath)
+            return OpenCodeACPHeadlessAgentProvider(config: config, mcpHost: mcpHost, workspacePath: workspacePath)
         case .cursor:
             let config = CursorAgentConfig(
                 commandName: agent.commandName,
@@ -329,7 +329,7 @@ final class AgentRuntimeProviderService {
             if Self.enableDebugLogging {
                 Self.logger.debug("Created CursorACPHeadlessAgentProvider")
             }
-            return CursorACPHeadlessAgentProvider(config: config, workspacePath: workspacePath)
+            return CursorACPHeadlessAgentProvider(config: config, mcpHost: mcpHost, workspacePath: workspacePath)
         case .ohMyPi:
             let config = OhMyPiAgentConfig(
                 commandName: agent.commandName,

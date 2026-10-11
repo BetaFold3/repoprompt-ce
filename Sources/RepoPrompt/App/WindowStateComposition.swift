@@ -53,7 +53,12 @@ enum WindowStateCompositionFactory {
         // 2) AI queries
         let keyManager = KeyManager()
         let aiQueriesService = aiQueriesServiceFactory?(keyManager)
-            ?? AIQueriesService(keyManager: keyManager)
+            ?? AIQueriesService(
+                keyManager: keyManager,
+                mcpHost: ServerNetworkManager.shared,
+                routingWaiter: .shared,
+                codexAuthRecovery: CodexManagedAuthRecoveryService.shared
+            )
 
         // 3) API Settings
         let apiSettingsViewModel = APISettingsViewModel(

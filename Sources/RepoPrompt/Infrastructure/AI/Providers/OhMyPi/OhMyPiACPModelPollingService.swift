@@ -12,6 +12,7 @@ struct OhMyPiACPControllerModelDiscoveryClient: OhMyPiACPModelDiscoveryClient {
     private let controllerFactory: ControllerFactory
 
     init(
+        mcpHost: any AgentMCPHosting,
         providerFactory: @escaping ProviderFactory = { agent, modelString in
             if agent == .ohMyPi {
                 return OhMyPiACPAgentProvider(
@@ -24,12 +25,12 @@ struct OhMyPiACPControllerModelDiscoveryClient: OhMyPiACPModelDiscoveryClient {
             }
             return ACPAgentProviderFactory.makeProvider(for: agent, modelString: modelString)
         },
-        controllerFactory: @escaping ControllerFactory = { provider, runRequest in
-            try ACPAgentSessionController(provider: provider, runRequest: runRequest, mcpHost: ServerNetworkManager.shared)
-        }
+        controllerFactory: ControllerFactory? = nil
     ) {
         self.providerFactory = providerFactory
-        self.controllerFactory = controllerFactory
+        self.controllerFactory = controllerFactory ?? { provider, runRequest in
+            try ACPAgentSessionController(provider: provider, runRequest: runRequest, mcpHost: mcpHost)
+        }
     }
 
     func discoverModels(workspacePath: String?) async throws -> ACPDiscoveredSessionModels? {
@@ -65,10 +66,6 @@ struct OhMyPiACPControllerModelDiscoveryClient: OhMyPiACPModelDiscoveryClient {
 /// Centralized OMP ACP dynamic-model polling. OMP models come exclusively from ACP
 /// configOptions; this service never manufactures static provider/model identifiers.
 actor OhMyPiACPModelPollingService {
-    static let shared = OhMyPiACPModelPollingService(
-        client: OhMyPiACPControllerModelDiscoveryClient()
-    )
-
     struct Snapshot: Equatable {
         let models: ACPDiscoveredSessionModels
         let fetchedAt: Date

@@ -71,10 +71,12 @@ final class CodexCLIProviderReconciliationTests: XCTestCase {
         events: [CodexNativeSessionController.Event]
     ) -> CodexCLIProvider {
         CodexCLIProvider(
+            mcpHost: ServerNetworkManager.shared,
             defaultRequestTimeout: 5,
             testRequestTimeout: 5,
             maxRetries: 0,
             appServerReadyHook: {},
+            authRecovery: CodexManagedAuthRecoveryService.shared,
             sessionControllerFactory: { _, _ in
                 ScriptedCodexProviderController(events: events)
             }

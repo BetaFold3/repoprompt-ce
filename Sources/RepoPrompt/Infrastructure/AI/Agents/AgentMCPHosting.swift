@@ -1,7 +1,7 @@
 import Foundation
 import MCP
 
-/// The MCP server capabilities the agent runtime uses. The App's `ServerNetworkManager`
+/// The MCP server capabilities the agent runtime uses. The App's MCP server
 /// actor implements it; runtime objects receive that instance through their initializers.
 protocol AgentMCPHosting: Sendable {
     func isRunning() async -> Bool

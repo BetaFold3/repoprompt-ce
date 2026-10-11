@@ -2313,6 +2313,7 @@ final class AgentModeViewModel: ObservableObject {
             connectionPolicyInstaller: connectionPolicyInstaller,
             shouldManageCodexTooling: true,
             runCoordinator: AgentRunCoordinator.shared,
+            authRecovery: CodexManagedAuthRecoveryService.shared,
             activeToolQuery: { [weak mcpServer] runID in
                 mcpServer?.hasActiveToolExecutions(runID: runID) ?? false
             },

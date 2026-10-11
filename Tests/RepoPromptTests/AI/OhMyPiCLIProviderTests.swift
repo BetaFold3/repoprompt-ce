@@ -15,6 +15,8 @@ final class OhMyPiCLIProviderTests: XCTestCase {
         let recorder = OhMyPiCLIRecorder()
         let fake = OhMyPiCLIFake(behavior: .terminal(text: "complete"))
         let provider = OhMyPiCLIProvider(
+            mcpHost: ServerNetworkManager.shared,
+            routingWaiter: .shared,
             headlessProviderFactory: { config, workspacePath in
                 recorder.recordFactory(config: config, workspacePath: workspacePath)
                 return AnyHeadlessAgentProvider(fake)
@@ -58,6 +60,8 @@ final class OhMyPiCLIProviderTests: XCTestCase {
     func testDisconnectedAndWithdrawnModelsFailClosedWithDistinctErrors() async throws {
         let disconnectedRecorder = OhMyPiCLIRecorder()
         let disconnected = OhMyPiCLIProvider(
+            mcpHost: ServerNetworkManager.shared,
+            routingWaiter: .shared,
             headlessProviderFactory: { _, _ in
                 XCTFail("Disconnected requests must not start OMP")
                 return AnyHeadlessAgentProvider(OhMyPiCLIFake(behavior: .empty))
@@ -87,6 +91,8 @@ final class OhMyPiCLIProviderTests: XCTestCase {
         XCTAssertEqual(disconnectedRecorder.steps, ["warm", "connection"])
 
         let withdrawn = OhMyPiCLIProvider(
+            mcpHost: ServerNetworkManager.shared,
+            routingWaiter: .shared,
             headlessProviderFactory: { _, _ in
                 XCTFail("Withdrawn models must not start OMP")
                 return AnyHeadlessAgentProvider(OhMyPiCLIFake(behavior: .empty))
@@ -269,6 +275,8 @@ final class OhMyPiCLIProviderTests: XCTestCase {
 
     private func makeProvider(fake: OhMyPiCLIFake) -> OhMyPiCLIProvider {
         OhMyPiCLIProvider(
+            mcpHost: ServerNetworkManager.shared,
+            routingWaiter: .shared,
             headlessProviderFactory: { _, _ in AnyHeadlessAgentProvider(fake) },
             modelSnapshotResolver: { Self.snapshot(rawValue: "provider/model") },
             connectionStateProvider: { true }

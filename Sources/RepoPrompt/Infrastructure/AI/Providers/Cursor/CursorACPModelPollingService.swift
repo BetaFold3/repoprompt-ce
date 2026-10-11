@@ -114,6 +114,7 @@ struct CursorACPControllerModelDiscoveryClient: CursorACPModelDiscoveryClient {
     private let extensionTimeoutSeconds: TimeInterval
 
     init(
+        mcpHost: any AgentMCPHosting,
         providerFactory: @escaping ProviderFactory = { agent, modelString in
             if agent == .cursor {
                 return CursorACPAgentProvider(
@@ -127,9 +128,7 @@ struct CursorACPControllerModelDiscoveryClient: CursorACPModelDiscoveryClient {
             }
             return ACPAgentProviderFactory.makeProvider(for: agent, modelString: modelString)
         },
-        controllerFactory: @escaping ControllerFactory = { provider, runRequest in
-            try ACPAgentSessionController(provider: provider, runRequest: runRequest, mcpHost: ServerNetworkManager.shared)
-        },
+        controllerFactory: ControllerFactory? = nil,
         parameterCatalog: CursorModelParameterCatalog = .shared,
         parameterizedModelsEnabled: @escaping @Sendable () -> Bool = {
             CursorParameterizedModels.isEnabled
@@ -137,7 +136,9 @@ struct CursorACPControllerModelDiscoveryClient: CursorACPModelDiscoveryClient {
         extensionTimeoutSeconds: TimeInterval = 10
     ) {
         self.providerFactory = providerFactory
-        self.controllerFactory = controllerFactory
+        self.controllerFactory = controllerFactory ?? { provider, runRequest in
+            try ACPAgentSessionController(provider: provider, runRequest: runRequest, mcpHost: mcpHost)
+        }
         self.parameterCatalog = parameterCatalog
         self.parameterizedModelsEnabled = parameterizedModelsEnabled
         self.extensionTimeoutSeconds = extensionTimeoutSeconds
@@ -232,10 +233,6 @@ struct CursorACPControllerModelDiscoveryClient: CursorACPModelDiscoveryClient {
 /// OpenCode model discovery path while preserving Cursor's static Auto fallback when no
 /// dynamic model metadata is available yet.
 actor CursorACPModelPollingService {
-    static let shared = CursorACPModelPollingService(
-        client: CursorACPControllerModelDiscoveryClient()
-    )
-
     struct Snapshot: Equatable {
         let models: ACPDiscoveredSessionModels
         let fetchedAt: Date

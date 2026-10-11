@@ -1045,6 +1045,7 @@ final class ACPAgentSessionControllerModeConfigTests: XCTestCase {
                     cleanupLegacyPersistentConfig: false,
                     toolProfile: .headless
                 ),
+                mcpHost: ServerNetworkManager.shared,
                 workspacePath: workspace.path,
                 providerFactory: { _ in fakeProvider }
             )
@@ -1080,6 +1081,7 @@ final class ACPAgentSessionControllerModeConfigTests: XCTestCase {
                     cleanupProjectMCPApproval: false,
                     sessionModeID: CursorAgentConfig.promptOnlySessionModeID
                 ),
+                mcpHost: ServerNetworkManager.shared,
                 workspacePath: workspace.path,
                 providerFactory: { _ in fakeProvider }
             )
