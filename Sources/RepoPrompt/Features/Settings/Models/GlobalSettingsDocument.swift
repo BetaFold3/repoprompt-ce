@@ -443,6 +443,9 @@ struct GlobalScalarPreferences: Codable, Equatable {
     var agentMode: AgentModeSettings?
     var telemetry: TelemetrySettings?
     var modelOverrides: ModelOverrideSettingsData?
+    /// Telegram attention notifications (enable flag and chat ID only; the bot token lives in
+    /// secure storage, never here).
+    var telegram: TelegramSettings?
 
     init(
         ui: UISettings? = nil,
@@ -452,7 +455,8 @@ struct GlobalScalarPreferences: Codable, Equatable {
         fileSystem: FileSystemSettings? = nil,
         agentMode: AgentModeSettings? = nil,
         telemetry: TelemetrySettings? = nil,
-        modelOverrides: ModelOverrideSettingsData? = nil
+        modelOverrides: ModelOverrideSettingsData? = nil,
+        telegram: TelegramSettings? = nil
     ) {
         self.ui = ui
         self.promptPackaging = promptPackaging
@@ -462,6 +466,7 @@ struct GlobalScalarPreferences: Codable, Equatable {
         self.agentMode = agentMode
         self.telemetry = telemetry
         self.modelOverrides = modelOverrides
+        self.telegram = telegram
     }
 
     struct UISettings: Codable, Equatable {
@@ -642,6 +647,16 @@ struct GlobalScalarPreferences: Codable, Equatable {
             self.enabled = enabled
             self.appHangReportsEnabled = appHangReportsEnabled
             self.performanceTracingEnabled = performanceTracingEnabled
+        }
+    }
+
+    struct TelegramSettings: Codable, Equatable {
+        var enabled: Bool?
+        var chatID: String?
+
+        init(enabled: Bool? = nil, chatID: String? = nil) {
+            self.enabled = enabled
+            self.chatID = chatID
         }
     }
 

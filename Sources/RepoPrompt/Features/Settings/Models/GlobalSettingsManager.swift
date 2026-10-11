@@ -1577,6 +1577,51 @@ class GlobalSettingsStore: ObservableObject {
         SentryTelemetryBootstrap.restartIfStarted()
     }
 
+    // MARK: - Telegram attention notifications
+
+    func telegramNotificationsEnabled() -> Bool {
+        scalarPreferences.telegram?.enabled ?? false
+    }
+
+    /// The saved chat ID, trimmed; nil when none is saved.
+    func telegramChatID() -> String? {
+        let trimmed = scalarPreferences.telegram?.chatID?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return trimmed.isEmpty ? nil : trimmed
+    }
+
+    /// Returns true only when the value was written to disk; on failure the in-memory value is
+    /// restored, so nothing unsaved is reported or activated.
+    @discardableResult
+    func setTelegramNotificationsEnabled(_ enabled: Bool) -> Bool {
+        updateTelegramScalarAndSave { $0.enabled = enabled }
+    }
+
+    /// Stores a trimmed chat ID (nil or blank clears it). Same write result as above.
+    @discardableResult
+    func setTelegramChatID(_ chatID: String?) -> Bool {
+        let trimmed = chatID?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return updateTelegramScalarAndSave { $0.chatID = trimmed.isEmpty ? nil : trimmed }
+    }
+
+    private func updateTelegramScalarAndSave(
+        _ mutation: (inout GlobalScalarPreferences.TelegramSettings) -> Void
+    ) -> Bool {
+        let before = scalarPreferences
+        updateScalarPreferences(commit: false) { preferences in
+            var settings = preferences.telegram ?? GlobalScalarPreferences.TelegramSettings()
+            mutation(&settings)
+            preferences.telegram = settings
+        }
+        if save() {
+            return true
+        }
+        if scalarPreferences != before {
+            objectWillChange.send()
+            scalarPreferences = before
+        }
+        return false
+    }
+
     func modelResponsesOverrides() -> [String: Bool] {
         scalarPreferences.modelOverrides?.responsesOverrides ?? [:]
     }

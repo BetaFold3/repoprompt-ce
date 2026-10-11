@@ -108,6 +108,10 @@ class AppDelegate: NSObject, ObservableObject, NSApplicationDelegate {
             }
         }
 
+        // Telegram attention notifications run on this (executing) Mac only; the launch guard
+        // denies UI-test, stress, and XCTest launches before any secure-storage or HTTP dependency.
+        TelegramAttentionNotificationService.shared.start(launch: .current(launchConfiguration))
+
         #if DEBUG
             sparkleManager.startUpdater()
             if !launchConfiguration.suppressesNonessentialLaunchSideEffects {

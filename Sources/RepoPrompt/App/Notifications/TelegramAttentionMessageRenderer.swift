@@ -31,6 +31,8 @@ enum TelegramAttentionMessageRenderer {
     static let truncationMarker = "\n… [truncated: reply longer than 3 messages]"
     static let noFinalTextBody = "(This turn ended without a final assistant message.)"
     static let emptyFinalTextBody = "(The final assistant message was empty.)"
+    /// The whole Send test message: fixed plain text, no names or content.
+    static let testMessage = "RepoPrompt Telegram notification test."
 
     static func render(_ event: AttentionNotificationEvent) -> [TelegramAttentionMessagePart] {
         let context = contextPrefix(workspaceName: event.workspaceName, sessionName: event.sessionName)
@@ -45,6 +47,8 @@ enum TelegramAttentionMessageRenderer {
                 body: context + contentLines.joined(separator: "\n"),
                 header: { label in header("RepoPrompt: question waiting", label) }
             )
+        case .test:
+            return [TelegramAttentionMessagePart(number: 1, count: 1, header: "", body: testMessage)]
         }
     }
 

@@ -1,4 +1,5 @@
 import Foundation
+import Observation
 
 // Outbound attention notifications (docs/context/plans/2026-10-10-telegram-attention-notifications-contract.md).
 //
@@ -8,8 +9,8 @@ import Foundation
 // handed to an injectable delivery off the main actor and never awaited by the run or question
 // paths. Submitted events form one FIFO: only its head prepares (paces) and is admitted, and an
 // admitted head stays active through its whole delivery attempt, so a hanging delivery holds later
-// notifications only. Settings and live wiring are later slices: production keeps the seam
-// disabled with no delivery.
+// notifications only. Production stays disabled with no delivery until the executing-Mac
+// `TelegramAttentionNotificationService` starts from guarded app launch and configures it.
 
 /// Identity of one attention event. Each key is admitted at most once per app lifetime.
 enum AttentionNotificationEventKey: Hashable {
@@ -17,6 +18,12 @@ enum AttentionNotificationEventKey: Hashable {
     case turnCompleted(sessionID: UUID, attemptID: UUID)
     /// A root `ask_user` interaction is waiting: durable session ID plus the interaction ID.
     case question(sessionID: UUID, interactionID: UUID)
+    /// A manual Send test from Settings: a dedicated identity, never a session or question.
+    case test(UUID)
+
+    var isManualTest: Bool {
+        if case .test = self { true } else { false }
+    }
 }
 
 /// Content captured at event time. Rendering and splitting into messages belong to the transport.
@@ -27,6 +34,8 @@ struct AttentionNotificationEvent: Equatable {
         /// Complete question content: every question, option (with description), and the
         /// selection constraints, in the shared `AgentDelegatedQuestionNoticePayload` wording.
         case question(contentLines: [String])
+        /// The fixed Send test message; carries no content.
+        case test
     }
 
     let key: AttentionNotificationEventKey
@@ -58,7 +67,8 @@ enum AttentionNotificationSuppression: String, Equatable {
     case disabled
     /// Disabled, or disabled and re-enabled, between capture and admission.
     case enableChanged
-    /// The delivery configuration was replaced or removed between capture and admission.
+    /// The delivery configuration was replaced or removed, or its saved notification settings
+    /// changed, between capture and admission.
     case configurationChanged
     /// Child at any depth, unknown/conflicting lineage, MCP-controlled, or no identity.
     case ineligibleSession
@@ -73,6 +83,7 @@ enum AttentionNotificationSuppression: String, Equatable {
 
 /// Main-actor admission for attention events (contract Direction 1).
 @MainActor
+@Observable
 final class AttentionNotificationAdmission {
     struct Environment {
         /// Initial delivery for admitted events; nil keeps the seam a no-op. Later changes go
@@ -96,9 +107,18 @@ final class AttentionNotificationAdmission {
         }
     }
 
+    /// Which admission checks a capture uses.
+    enum CapturePolicy: Equatable {
+        /// Agent Mode events: every enable, configuration, currency, and idle check.
+        case automatic
+        /// Settings Send test: skips the automatic enable and idle checks only.
+        case manualTest
+    }
+
     /// Captured event plus the fences admission re-validates.
     struct Capture {
         let event: AttentionNotificationEvent
+        let policy: CapturePolicy
         let enableGeneration: UInt64
         /// The delivery configured at the event and its generation. A capture is only ever sent
         /// through this snapshot, and only while it is still the configured one.
@@ -118,8 +138,11 @@ final class AttentionNotificationAdmission {
         case delivered(AttentionNotificationDeliveryOutcome)
     }
 
-    /// App-wide instance. Disabled with no delivery until the transport and settings slices.
-    static let shared = AttentionNotificationAdmission()
+    /// App-wide instance. Disabled with no delivery until the guarded Telegram service starts.
+    /// Idle time is read lazily, only when an automatic event is captured.
+    static let shared = AttentionNotificationAdmission(environment: Environment(
+        idleSeconds: { TelegramAttentionIdleReader.secondsSinceLastInput() }
+    ))
 
     static let minimumIdleSeconds: TimeInterval = 5 * 60
 
@@ -128,19 +151,25 @@ final class AttentionNotificationAdmission {
     private(set) var enableGeneration: UInt64 = 0
     /// Tombstones for every decided event, kept for the app lifetime.
     private(set) var records: [AttentionNotificationEventKey: Record] = [:]
+    /// The latest automatic-event suppression and delivery outcome. A manual Send test keeps only
+    /// its own record and never overwrites these.
     private(set) var lastSuppression: AttentionNotificationSuppression?
     private(set) var lastDeliveryOutcome: AttentionNotificationDeliveryOutcome?
     /// The configured delivery (an immutable credential/client snapshot) and its generation,
     /// bumped on every replacement or removal.
-    private(set) var delivery: (any AttentionNotificationDelivering)?
+    @ObservationIgnored private(set) var delivery: (any AttentionNotificationDelivering)?
     private(set) var deliveryGeneration: UInt64 = 0
     /// Submitted, undecided events: the active head (if any) plus the FIFO behind it.
     private(set) var pendingEventKeys: Set<AttentionNotificationEventKey> = []
     /// The queue head being prepared, admitted, or delivered; later events wait behind it.
     private(set) var activeEventKey: AttentionNotificationEventKey?
-    private var queuedCaptures: [Capture] = []
-    private let idleSeconds: @MainActor () -> TimeInterval?
-    private let beforeAdmission: @MainActor (AttentionNotificationEventKey) async -> Void
+    /// Synchronous check of the configuration's saved source, installed with each delivery and
+    /// read at final admission, so a saved change not yet adopted by the owner never sends
+    /// through the old snapshot.
+    @ObservationIgnored private var configurationIsCurrent: @MainActor (CapturePolicy) -> Bool = { _ in true }
+    @ObservationIgnored private var queuedCaptures: [Capture] = []
+    @ObservationIgnored private let idleSeconds: @MainActor () -> TimeInterval?
+    @ObservationIgnored private let beforeAdmission: @MainActor (AttentionNotificationEventKey) async -> Void
 
     /// Keeps only the idle reader and the pre-admission fence; `delivery` is the sole retained
     /// delivery snapshot.
@@ -158,8 +187,13 @@ final class AttentionNotificationAdmission {
 
     /// Replaces or removes the delivery configuration. Captures taken under an earlier
     /// configuration are never admitted, so old events never switch to new credentials.
-    func setDeliveryConfiguration(_ delivery: (any AttentionNotificationDelivering)?) {
+    /// `isCurrent` is checked at final admission for this configuration only.
+    func setDeliveryConfiguration(
+        _ delivery: (any AttentionNotificationDelivering)?,
+        isCurrent: @escaping @MainActor (CapturePolicy) -> Bool = { _ in true }
+    ) {
         self.delivery = delivery
+        configurationIsCurrent = isCurrent
         deliveryGeneration &+= 1
     }
 
@@ -175,6 +209,7 @@ final class AttentionNotificationAdmission {
     ) -> Capture {
         Capture(
             event: event,
+            policy: .automatic,
             enableGeneration: enableGeneration,
             delivery: delivery,
             deliveryGeneration: deliveryGeneration,
@@ -183,11 +218,30 @@ final class AttentionNotificationAdmission {
         )
     }
 
+    /// Queues a manual Send test through the same FIFO, pacing, and single attempt as automatic
+    /// events. It is sent only through the delivery configured now, and only while that is still
+    /// the configuration and `isStillCurrent` holds at admission. Returns the test's key.
+    func submitManualTest(isStillCurrent: @escaping @MainActor () -> Bool) -> AttentionNotificationEventKey {
+        let key = AttentionNotificationEventKey.test(UUID())
+        submit(Capture(
+            event: AttentionNotificationEvent(key: key, workspaceName: nil, sessionName: "", content: .test),
+            policy: .manualTest,
+            enableGeneration: enableGeneration,
+            delivery: delivery,
+            deliveryGeneration: deliveryGeneration,
+            idleSecondsAtEvent: nil,
+            isStillCurrent: isStillCurrent
+        ))
+        return key
+    }
+
     /// Records a decided-not-to-send event (first decision wins).
     func suppress(_ key: AttentionNotificationEventKey, reason: AttentionNotificationSuppression) {
         guard records[key] == nil else { return }
         records[key] = .suppressed(reason)
-        lastSuppression = reason
+        if !key.isManualTest {
+            lastSuppression = reason
+        }
     }
 
     /// Queues the event behind earlier submissions. Never blocks the caller. A key already
@@ -230,13 +284,15 @@ final class AttentionNotificationAdmission {
     private func admit(_ capture: Capture) -> Bool {
         let key = capture.event.key
         guard records[key] == nil else { return false }
-        guard isEnabled else {
-            suppress(key, reason: capture.enableGeneration == enableGeneration ? .disabled : .enableChanged)
-            return false
-        }
-        guard capture.enableGeneration == enableGeneration else {
-            suppress(key, reason: .enableChanged)
-            return false
+        if capture.policy == .automatic {
+            guard isEnabled else {
+                suppress(key, reason: capture.enableGeneration == enableGeneration ? .disabled : .enableChanged)
+                return false
+            }
+            guard capture.enableGeneration == enableGeneration else {
+                suppress(key, reason: .enableChanged)
+                return false
+            }
         }
         guard capture.deliveryGeneration == deliveryGeneration else {
             suppress(key, reason: .configurationChanged)
@@ -244,6 +300,10 @@ final class AttentionNotificationAdmission {
         }
         guard let delivery = capture.delivery else {
             suppress(key, reason: .disabled)
+            return false
+        }
+        guard configurationIsCurrent(capture.policy) else {
+            suppress(key, reason: .configurationChanged)
             return false
         }
         guard capture.isStillCurrent() else {
@@ -268,7 +328,9 @@ final class AttentionNotificationAdmission {
         for key: AttentionNotificationEventKey
     ) {
         records[key] = .delivered(outcome)
-        lastDeliveryOutcome = outcome
+        if !key.isManualTest {
+            lastDeliveryOutcome = outcome
+        }
         releaseActiveEvent(key)
     }
 }
