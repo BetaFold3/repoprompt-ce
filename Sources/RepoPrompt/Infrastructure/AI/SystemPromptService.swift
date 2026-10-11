@@ -1247,11 +1247,6 @@ class SystemPromptService {
         """
     }
 
-    static func predominantLanguage(from files: [FileViewModel]) -> String {
-        let extensions = files.compactMap { $0.fileExtension?.lowercased() }
-        return predominantLanguage(fromExtensions: extensions)
-    }
-
     static func predominantLanguage(from files: [WorkspaceFileRecord]) -> String {
         let extensions = files.map { file in
             let ext = (file.name as NSString).pathExtension.lowercased()
@@ -1274,16 +1269,6 @@ class SystemPromptService {
             "go": "Go", "rs": "Rust", "php": "PHP", "rb": "Ruby", "dart": "Dart"
         ]
         return map[mostCommon] ?? "Swift"
-    }
-
-    /// Determines the predominant language from selected files
-    @MainActor
-    static func getPredominantLanguage(from fileManager: WorkspaceFilesViewModel) -> (language: String, fileExtension: String) {
-        let files = fileManager.selectedFiles
-        let language = predominantLanguage(from: files)
-        // Keep the old signature for backward compatibility, but the extension is derived from language
-        let ext = fileExtension(for: language)
-        return (language: language, fileExtension: ext)
     }
 
     static func getFileRecommendationPrompt() -> String {

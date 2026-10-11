@@ -342,6 +342,17 @@ Decisions: a narrow `Sendable` reader protocol rather than closures, because thr
 
 Step 5m — done | rounds 0/2 | open: | downgraded: | assumed: | deferred: OracleB P3-2 (Azure cache argument ignored after first call; revisit in Slice 6) deferred; P3-3 (convenience inits copy defaults) declined
 
+#### Step 5n — prompt file-edit model choice moved to App
+Intent: `AIModel.swift` and `SystemPromptService.swift` name App view models only through `findBestAvailableModel` (called only by the prompt view model and a test), an uncalled `getPredominantLanguage(from:)`, and the `[FileViewModel]` language overload that only it called. So move the first verbatim into an App extension and delete the other two, with no behavior change.
+
+Budget used: about 1 hour including the rescan (cumulative ~34 hours).
+
+Result: `AIModel.swift` and `SystemPromptService.swift` no longer name App view models. `findBestAvailableModel` now lives unchanged in an App extension beside the prompt view model, and the two uncalled language helpers are gone. Build, format, lint and the 7 affected suites pass. OracleA found nothing. OracleB's P2 caught that the first draft of the intent placed prompt packaging and the workspace model in AgentCore, against done-when; the intent was corrected, and the P3s were fixed.
+
+Decisions: the transitive rescan (evidence `step5n/probe/`) only shows which files close mechanically without App types. Placement still follows done-when and the Diagnostics direction. View models, settings, prompt/chat packaging, MCP server composition, approvals, and diagnostic collectors, benchmarks and reporting stay in App, and their AgentCore users get seams. Agent domain instrumentation, such as the perf diagnostics, joins AgentCore. No re-review was run, because the fixes delete one more uncalled overload and edit comments and contract text.
+
+Step 5n — done | rounds 0/2 | open: | downgraded: | assumed: | deferred:
+
 ### Slice 6 — `RepoPromptAgentCore` extraction
 Move the now-acyclic AI, agent models, providers, runtime, services, history, recommendations and non-UI remote-host code. Remove the temporary typealiases. Check the release compile flags once for cross-module optimization; don't change them.
 
