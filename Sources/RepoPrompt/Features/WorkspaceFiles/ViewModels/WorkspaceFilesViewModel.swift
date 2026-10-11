@@ -3,6 +3,7 @@ import Combine
 import Foundation
 import RepoPromptPlatform
 import RepoPromptUI
+import RepoPromptWorkspace
 import SwiftUI
 #if DEBUG || EDIT_FLOW_PERF
     import os

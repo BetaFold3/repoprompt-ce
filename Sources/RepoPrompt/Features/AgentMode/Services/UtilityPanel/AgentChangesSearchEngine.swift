@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptWorkspace
 
 /// Pure literal matcher for the rendered Changes diff corpus.
 ///

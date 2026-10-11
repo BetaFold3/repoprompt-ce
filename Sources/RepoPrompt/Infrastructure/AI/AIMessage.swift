@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptWorkspace
 import SwiftOpenAI
 
 /// A single conversation entry

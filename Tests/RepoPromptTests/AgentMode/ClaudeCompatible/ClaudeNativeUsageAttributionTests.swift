@@ -3,6 +3,7 @@ import Foundation
 @testable import RepoPromptApp
 @testable import RepoPromptPlatform
 @testable import RepoPromptUI
+@testable import RepoPromptWorkspace
 import XCTest
 
 /// Dispatch-to-result ownership contracts of the Claude native controller (plan §3.2, gate G1).

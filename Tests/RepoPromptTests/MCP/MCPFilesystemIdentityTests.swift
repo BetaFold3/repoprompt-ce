@@ -4,6 +4,7 @@ import Foundation
 @testable import RepoPromptPlatform
 import RepoPromptShared
 @testable import RepoPromptUI
+@testable import RepoPromptWorkspace
 import XCTest
 
 final class MCPFilesystemIdentityTests: XCTestCase {
@@ -79,7 +80,7 @@ final class MCPFilesystemIdentityTests: XCTestCase {
             let caseLabel = "testAppAndHelperSourcesDelegateToSharedIdentity"
             let root = try RepoRoot.url()
             let paths = [
-                "Sources/RepoPrompt/Infrastructure/MCP/AppShared/MCPFilesystemConstants.swift",
+                "Sources/RepoPromptWorkspace/Persistence/MCPFilesystemConstants.swift",
                 "Packages/RepoPromptCore/Sources/RepoPromptMCPCore/Shared/MCPFilesystemConstants.swift"
             ]
 

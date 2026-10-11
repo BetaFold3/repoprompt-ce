@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptWorkspace
 
 /// Agent-typed field helpers for `AgentSelectedFilesDiagnostics`. The dependency-free recording
 /// helpers (`event`, `durationEvent`, `timestampMSIfEnabled`, `elapsedFields`, `shortID`) live in

@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptWorkspace
 
 protocol DiffChunkGenerator {
     func makeDiffChunks(

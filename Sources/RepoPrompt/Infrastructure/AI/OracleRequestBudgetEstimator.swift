@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptWorkspace
 
 /// A token-budget projection derived from the exact immutable `AIMessage` that will be sent.
 struct OracleRequestBudgetEstimate: Equatable {

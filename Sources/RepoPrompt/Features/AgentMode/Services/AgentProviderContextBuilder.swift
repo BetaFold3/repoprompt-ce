@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptWorkspace
 
 enum AgentProviderContextBuilder {
     static func initialFileTree(

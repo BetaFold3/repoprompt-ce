@@ -4,6 +4,7 @@ import MCP
 @testable import RepoPromptApp
 @testable import RepoPromptPlatform
 @testable import RepoPromptUI
+@testable import RepoPromptWorkspace
 import XCTest
 
 /// `agent_run` formatted output for pending `ask_user` snapshots. A structured question carries

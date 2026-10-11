@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptWorkspace
 
 struct ApplyEditsApprovalScope: Hashable {
     let windowID: Int

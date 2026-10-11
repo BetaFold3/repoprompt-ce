@@ -1,6 +1,7 @@
 import Combine
 import Foundation
 import RepoPromptPlatform
+import RepoPromptWorkspace
 
 /// A folder in the file tree, with subfolders and files.
 /// Keeps a single `children` array, sorted by the last known sort method.

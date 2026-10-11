@@ -4,6 +4,7 @@ import Foundation
 @testable import RepoPromptApp
 @testable import RepoPromptPlatform
 @testable import RepoPromptUI
+@testable import RepoPromptWorkspace
 import XCTest
 
 /// State-machine and escalation coverage for the PID/process-group based git

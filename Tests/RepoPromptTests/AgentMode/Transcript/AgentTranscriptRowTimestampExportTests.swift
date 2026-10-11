@@ -4,6 +4,7 @@ import Foundation
 @testable import RepoPromptPlatform
 import RepoPromptRemoteWire
 @testable import RepoPromptUI
+@testable import RepoPromptWorkspace
 import XCTest
 
 /// Wire contract for opt-in per-row `ts` timestamp attributes in the spartan

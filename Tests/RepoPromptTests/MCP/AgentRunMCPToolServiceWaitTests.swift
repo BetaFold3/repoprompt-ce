@@ -3,6 +3,7 @@ import MCP
 @testable import RepoPromptAgentCore
 @testable import RepoPromptPlatform
 @testable import RepoPromptUI
+@testable import RepoPromptWorkspace
 import XCTest
 @_spi(TestSupport) @testable import RepoPromptApp
 

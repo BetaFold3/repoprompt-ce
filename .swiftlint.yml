@@ -8,6 +8,7 @@ included:
   - Sources/RepoPromptAgentCore
   - Sources/RepoPromptPlatform
   - Sources/RepoPromptUI
+  - Sources/RepoPromptWorkspace
   - Sources/RepoPromptExecutable
   - Sources/RepoPromptMCP
   - Packages/RepoPromptCore/Package.swift
@@ -87,6 +88,7 @@ custom_rules:
     included:
       - 'Sources/RepoPrompt/.*\.swift$'
       - 'Sources/RepoPromptUI/.*\.swift$'
+      - 'Sources/RepoPromptWorkspace/.*\.swift$'
     regex: '\.help\s*\('
     match_kinds:
       - identifier

@@ -2,6 +2,7 @@
 @testable import RepoPromptApp
 @testable import RepoPromptPlatform
 @testable import RepoPromptUI
+@testable import RepoPromptWorkspace
 import XCTest
 
 /// Unit tests for the Item 8 worktree merge attention surfaces shared by the

@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptWorkspace
 
 /// Transport preference for MCP connections
 enum MCPTransportPreference: String, Codable {

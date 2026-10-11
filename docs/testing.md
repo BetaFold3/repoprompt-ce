@@ -62,7 +62,7 @@ RPCE_RUN_CODEMAP_E2E=1 make dev-test FILTER=ContextBuilderWorktreeInheritanceTes
 touch /tmp/RepoPromptCE-codemap-e2e-opt-in && make dev-test FILTER=ContextBuilderWorktreeInheritanceTests ; rm /tmp/RepoPromptCE-codemap-e2e-opt-in
 ```
 
-Run this strict gate when changes touch `Sources/RepoPrompt/Features/CodeMap/`, codemap paths in `Sources/RepoPrompt/Infrastructure/WorkspaceContext/`, `Sources/RepoPrompt/Infrastructure/SyntaxParsing/`, or `Sources/TreeSitterScannerSupport/`. CI and routine root gates do not set this flag. This local XCTest gate is separate from the packaged-app live codemap projection-demand gate documented later in this guide.
+Run this strict gate when changes touch `Sources/RepoPromptWorkspace/CodeMap/`, codemap paths in `Sources/RepoPromptWorkspace/WorkspaceContext/`, `Sources/RepoPromptWorkspace/SyntaxParsing/`, or `Sources/TreeSitterScannerSupport/`. CI and routine root gates do not set this flag. This local XCTest gate is separate from the packaged-app live codemap projection-demand gate documented later in this guide.
 
 ### Scale-sensitive contract gates
 
@@ -347,7 +347,7 @@ python3 Scripts/worktree_startup_live_benchmark.py plan \
   --owner-token "$OWNER_TOKEN" --dataset-label rpce-real-readiness-iteration-0 \
   --asserted-file-count '<exact-git-ls-files-count>' --base-ref HEAD \
   --search-marker WorkspaceRootSeedPlanner \
-  --read-path Sources/RepoPrompt/Infrastructure/WorkspaceContext/Search/WorkspaceRootSeedPlanner.swift \
+  --read-path Sources/RepoPromptWorkspace/WorkspaceContext/Search/WorkspaceRootSeedPlanner.swift \
   --read-marker 'import CryptoKit' --invocations-per-series 1 \
   --confirm-real-repository-benchmark --confirm-dedicated-workspace \
   --output /tmp/rpce-real-readiness-iteration-0.json
@@ -484,7 +484,7 @@ python3 Scripts/worktree_startup_live_benchmark.py plan \
   --asserted-file-count 100000 \
   --base-ref HEAD \
   --search-marker WorkspaceRootSeedPlanner \
-  --read-path Sources/RepoPrompt/Infrastructure/WorkspaceContext/Search/WorkspaceRootSeedPlanner.swift \
+  --read-path Sources/RepoPromptWorkspace/WorkspaceContext/Search/WorkspaceRootSeedPlanner.swift \
   --read-marker WorkspaceRootSeedPlanner \
   --invocations-per-series 3 \
   --output /tmp/rpce-worktree-startup-plan.json

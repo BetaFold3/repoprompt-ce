@@ -7,6 +7,7 @@
     @testable import RepoPromptPlatform
     import RepoPromptShared
     @testable import RepoPromptUI
+    @testable import RepoPromptWorkspace
     import XCTest
 
     final class MCPReadSearchLatencyDiagnosticsGuardTests: XCTestCase {
@@ -1865,7 +1866,7 @@
         }
 
         private func scenarioReadSearchBarrierDiagnosticsExposeBoundedPendingSuccessorState() throws {
-            let store = try source("Sources/RepoPrompt/Infrastructure/WorkspaceContext/WorkspaceFileContextStore.swift")
+            let store = try source("Sources/RepoPromptWorkspace/WorkspaceContext/WorkspaceFileContextStore.swift")
             for hook in [
                 "ScopedIngressBarrierRootFlightState",
                 "ScopedIngressBarrierPendingFlight",

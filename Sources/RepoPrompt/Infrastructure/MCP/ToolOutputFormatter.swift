@@ -1,5 +1,6 @@
 import Foundation
 import MCP
+import RepoPromptWorkspace
 
 extension Value {
     /// Decode this Value into a Decodable type by going through JSON.

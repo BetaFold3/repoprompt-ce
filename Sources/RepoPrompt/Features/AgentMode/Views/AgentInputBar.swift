@@ -9,6 +9,7 @@
 import AppKit
 import Combine
 import RepoPromptUI
+import RepoPromptWorkspace
 import SwiftUI
 import UniformTypeIdentifiers
 

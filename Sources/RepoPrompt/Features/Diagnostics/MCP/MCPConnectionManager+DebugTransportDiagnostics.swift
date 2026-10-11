@@ -2,6 +2,7 @@
 
 import Foundation
 import MCP
+import RepoPromptWorkspace
 
 #if DEBUG
     private actor MCPDebugDiagnosticsProbeStore {

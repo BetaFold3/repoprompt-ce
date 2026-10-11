@@ -1,6 +1,7 @@
 import Foundation
 import MCP
 import OSLog
+import RepoPromptWorkspace
 
 /// Applies opt-in inline-text presentation after Agent Run/Explore has produced
 /// its canonical response. Canonical snapshots and stored terminal text remain untouched.

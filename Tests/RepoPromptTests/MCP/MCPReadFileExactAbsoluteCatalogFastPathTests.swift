@@ -2,6 +2,7 @@
 @testable import RepoPromptApp
 @testable import RepoPromptPlatform
 @testable import RepoPromptUI
+@testable import RepoPromptWorkspace
 import XCTest
 
 final class MCPReadFileExactAbsoluteCatalogFastPathTests: XCTestCase {
@@ -24,9 +25,9 @@ final class MCPReadFileExactAbsoluteCatalogFastPathTests: XCTestCase {
             XCTAssertFalse(readFile.contains("resolveExactWorkspaceCatalogHit(path"), caseLabel)
             XCTAssertFalse(readFile.contains("resolveFolderInput(path"), caseLabel)
 
-            let serviceSource = try source("Sources/RepoPrompt/Infrastructure/WorkspaceContext/WorkspaceReadableFileService.swift")
+            let serviceSource = try source("Sources/RepoPromptWorkspace/WorkspaceContext/WorkspaceReadableFileService.swift")
             let resolver = try XCTUnwrap(serviceSource.slice(
-                from: "    func resolveReadFileRequest(\n",
+                from: "    package func resolveReadFileRequest(\n",
                 to: "    func resolveAlwaysReadableExternalFolderDisplayPath"
             ), caseLabel)
             try assertOrdered([
@@ -60,7 +61,7 @@ final class MCPReadFileExactAbsoluteCatalogFastPathTests: XCTestCase {
 
     func testFileTreeStartPathSourceOrderingUsesFolderResolverNotSelectionLookup() throws {
         let caseLabel = "testFileTreeStartPathSourceOrderingUsesFolderResolverNotSelectionLookup"
-        let storeSource = try source("Sources/RepoPrompt/Infrastructure/WorkspaceContext/WorkspaceFileContextStore.swift")
+        let storeSource = try source("Sources/RepoPromptWorkspace/WorkspaceContext/WorkspaceFileContextStore.swift")
         let startPathSnapshot = try XCTUnwrap(storeSource.slice(
             from: "    private func makeFileTreeSelectionSnapshot(\n        _ request: WorkspaceFileTreeSnapshotRequest,\n        selectedStoreFileIDs: Set<UUID>,\n        renderableCodemapFileIDs: Set<UUID>,\n        profile: PathLocateProfile\n    ) async -> FileTreeSelectionSnapshot {\n",
             to: "    private func resolveFileTreeStartFolder("
@@ -112,7 +113,7 @@ final class MCPReadFileExactAbsoluteCatalogFastPathTests: XCTestCase {
             XCTAssertEqual(input, "/tmp/blocked\0.swift", caseLabel)
             XCTAssertTrue(reason.contains("embedded NUL"), caseLabel)
 
-            let serviceSource = try source("Sources/RepoPrompt/Infrastructure/WorkspaceContext/WorkspaceReadableFileService.swift")
+            let serviceSource = try source("Sources/RepoPromptWorkspace/WorkspaceContext/WorkspaceReadableFileService.swift")
             let validation = try XCTUnwrap(serviceSource.range(of: "store.exactPathResolutionIssue("), caseLabel)
             let shortcut = try XCTUnwrap(serviceSource.range(of: "store.lookupCatalogFileForExplicitRequest(trimmed, rootRefs: roots)"), caseLabel)
             XCTAssertLessThan(validation.lowerBound, shortcut.lowerBound, caseLabel)

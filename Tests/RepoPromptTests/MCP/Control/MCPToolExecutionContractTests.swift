@@ -5,6 +5,7 @@ import MCP
 @testable import RepoPromptPlatform
 import RepoPromptShared
 @testable import RepoPromptUI
+@testable import RepoPromptWorkspace
 import XCTest
 
 final class MCPToolExecutionContractTests: XCTestCase {

@@ -1,5 +1,6 @@
 import CryptoKit
 import Foundation
+import RepoPromptWorkspace
 
 struct AgentContextExportSource: Equatable {
     let tabID: UUID?

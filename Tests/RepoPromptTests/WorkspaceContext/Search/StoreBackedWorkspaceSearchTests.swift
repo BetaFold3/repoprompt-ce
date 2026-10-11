@@ -3,6 +3,7 @@ import CoreServices
 @testable import RepoPromptApp
 @testable import RepoPromptPlatform
 @testable import RepoPromptUI
+@testable import RepoPromptWorkspace
 import XCTest
 
 final class StoreBackedWorkspaceSearchTests: XCTestCase {
@@ -2623,7 +2624,7 @@ final class StoreBackedWorkspaceSearchTests: XCTestCase {
 
     func testBroadSearchOrchestrationChecksScopeAndReadinessBeforeAndAfterAdmission() throws {
         let source = try String(
-            contentsOf: RepoRoot.url().appendingPathComponent("Sources/RepoPrompt/Features/Search/StoreBackedWorkspaceSearch.swift"),
+            contentsOf: RepoRoot.url().appendingPathComponent("Sources/RepoPromptWorkspace/Search/StoreBackedWorkspaceSearch.swift"),
             encoding: .utf8
         )
         try assertOrdered([
@@ -2669,7 +2670,7 @@ final class StoreBackedWorkspaceSearchTests: XCTestCase {
 
     func testSearchScopeParserKeepsRequiredResolutionOrder() throws {
         let source = try String(
-            contentsOf: RepoRoot.url().appendingPathComponent("Sources/RepoPrompt/Features/Search/StoreBackedWorkspaceSearch.swift"),
+            contentsOf: RepoRoot.url().appendingPathComponent("Sources/RepoPromptWorkspace/Search/StoreBackedWorkspaceSearch.swift"),
             encoding: .utf8
         )
         try assertOrdered([

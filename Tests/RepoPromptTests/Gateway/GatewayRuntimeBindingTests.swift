@@ -6,6 +6,7 @@ import Logging
 @testable import RepoPromptPlatform
 import RepoPromptRemoteWire
 @testable import RepoPromptUI
+@testable import RepoPromptWorkspace
 import XCTest
 
 private final class BindingRuntimeConnector: AppLinkConnecting, @unchecked Sendable {

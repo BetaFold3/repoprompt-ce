@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptWorkspace
 import SwiftUI
 
 /// Manager for copy presets - handles both built-in and user-defined presets

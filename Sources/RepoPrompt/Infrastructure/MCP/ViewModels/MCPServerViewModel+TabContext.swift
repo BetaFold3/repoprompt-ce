@@ -1,6 +1,7 @@
 import Combine
 import Foundation
 import MCP
+import RepoPromptWorkspace
 
 #if DEBUG
     private func tabContextLog(_ message: @autoclosure () -> String) {

@@ -1,5 +1,6 @@
 import Foundation
 import MCP
+import RepoPromptWorkspace
 
 @MainActor
 extension MCPWorktreeToolProvider {

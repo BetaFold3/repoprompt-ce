@@ -2,6 +2,7 @@
 @testable import RepoPromptApp
 @testable import RepoPromptPlatform
 @testable import RepoPromptUI
+@testable import RepoPromptWorkspace
 import XCTest
 
 /// Oracle failure inspection plan, Patch B (B4): failed-only Oracle card presentation.

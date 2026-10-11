@@ -4,6 +4,7 @@ import MCP
 @testable import RepoPromptApp
 @testable import RepoPromptPlatform
 @testable import RepoPromptUI
+@testable import RepoPromptWorkspace
 import XCTest
 
 /// Oracle shim-auth plan §3 integration tier: a Claude Code `ask_oracle` consultation runs the

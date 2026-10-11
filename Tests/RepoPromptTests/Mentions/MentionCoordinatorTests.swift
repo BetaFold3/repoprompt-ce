@@ -3,6 +3,7 @@ import AppKit
 @testable import RepoPromptApp
 @testable import RepoPromptPlatform
 @testable import RepoPromptUI
+@testable import RepoPromptWorkspace
 import SwiftUI
 import XCTest
 

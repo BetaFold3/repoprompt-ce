@@ -2,6 +2,7 @@ import AppKit
 import Combine
 import Foundation
 import RepoPromptUI
+import RepoPromptWorkspace
 import SwiftUI
 
 @MainActor

@@ -1,3 +1,5 @@
+@testable import RepoPromptWorkspace
+
 #if DEBUG
     import Combine
     import Foundation

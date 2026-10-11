@@ -4,6 +4,7 @@ import Markdown
 @testable import RepoPromptApp
 @testable import RepoPromptPlatform
 @testable import RepoPromptUI
+@testable import RepoPromptWorkspace
 import XCTest
 
 /// Pins the swift-markdown source-position semantics that

@@ -1,5 +1,6 @@
 import Foundation
 import MCP
+import RepoPromptWorkspace
 
 struct AgentRunMCPSnapshot: Equatable {
     static let startupPendingStatusText = "Queued to start"

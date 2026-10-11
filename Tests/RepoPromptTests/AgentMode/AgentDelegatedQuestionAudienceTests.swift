@@ -3,6 +3,7 @@ import Foundation
 @testable import RepoPromptApp
 @testable import RepoPromptPlatform
 @testable import RepoPromptUI
+@testable import RepoPromptWorkspace
 import XCTest
 
 /// Delegated `ask_user` audience policy (plan §6.1): who a session's question is addressed to.

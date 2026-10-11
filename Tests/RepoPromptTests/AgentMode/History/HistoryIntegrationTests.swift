@@ -3,6 +3,7 @@ import Foundation
 @testable import RepoPromptApp
 @testable import RepoPromptPlatform
 @testable import RepoPromptUI
+@testable import RepoPromptWorkspace
 import XCTest
 
 /// End-to-end history MCP tests against generated on-disk workspace/session fixtures.

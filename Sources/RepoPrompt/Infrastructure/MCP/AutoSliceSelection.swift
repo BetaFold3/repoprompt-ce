@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptWorkspace
 
 enum AutoSliceSelection {
     struct SliceEntry: Equatable {

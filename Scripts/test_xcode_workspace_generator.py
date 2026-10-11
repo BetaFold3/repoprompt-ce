@@ -115,6 +115,8 @@ class XcodeWorkspaceGeneratorTests(unittest.TestCase):
         self.assertEqual(targets["RepoPromptPlatform"]["path"], "Sources/RepoPromptPlatform")
         self.assertEqual(targets["RepoPromptUI"]["type"], "regular")
         self.assertEqual(targets["RepoPromptUI"]["path"], "Sources/RepoPromptUI")
+        self.assertEqual(targets["RepoPromptWorkspace"]["type"], "regular")
+        self.assertEqual(targets["RepoPromptWorkspace"]["path"], "Sources/RepoPromptWorkspace")
         self.assertEqual(targets["RepoPromptRemoteWire"].get("dependencies", []), [])
         self.assertEqual(
             set(generator._by_name_dependencies(targets["RepoPromptTests"])),
@@ -123,6 +125,7 @@ class XcodeWorkspaceGeneratorTests(unittest.TestCase):
                 "RepoPromptAgentCore",
                 "RepoPromptPlatform",
                 "RepoPromptUI",
+                "RepoPromptWorkspace",
                 "RepoPromptGateway",
                 "RepoPromptRemoteWire",
             },

@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptWorkspace
 
 enum FrozenVisibleGitCheckoutKind: Equatable, Hashable {
     case canonical

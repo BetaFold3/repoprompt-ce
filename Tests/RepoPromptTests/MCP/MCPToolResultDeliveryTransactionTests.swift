@@ -4,6 +4,7 @@ import MCP
 @testable import RepoPromptApp
 @testable import RepoPromptPlatform
 @testable import RepoPromptUI
+@testable import RepoPromptWorkspace
 import XCTest
 
 /// Final tool-result handoff boundary (plan §6.2): every registered participant is either settled

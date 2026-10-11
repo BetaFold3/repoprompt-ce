@@ -1,3 +1,4 @@
+import RepoPromptWorkspace
 import SwiftUI
 
 struct AgentRuntimeSidebarView: View {

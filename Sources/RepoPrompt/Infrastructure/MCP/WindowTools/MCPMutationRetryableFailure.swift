@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptWorkspace
 
 struct MCPMutationRetryableFailure: Error, Equatable {
     let errorCode: String

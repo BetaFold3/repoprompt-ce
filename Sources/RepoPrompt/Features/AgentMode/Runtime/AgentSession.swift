@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptWorkspace
 
 // MARK: - Agent Session Error
 

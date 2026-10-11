@@ -3,6 +3,7 @@ import JSONSchema
 import MCP
 import Ontology
 import RepoPromptPlatform
+import RepoPromptWorkspace
 
 private struct ContextBuilderToolResult: Codable {
     let tabID: String

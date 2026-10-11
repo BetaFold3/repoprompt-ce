@@ -2,6 +2,7 @@
 @testable import RepoPromptApp
 @testable import RepoPromptPlatform
 @testable import RepoPromptUI
+@testable import RepoPromptWorkspace
 import XCTest
 
 /// Field-local `providerUsage` preservation and accounting hydration contracts (plan §3.3, §8).

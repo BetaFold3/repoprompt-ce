@@ -3,6 +3,7 @@ import Combine
 import Foundation
 import Neon
 import RepoPromptPlatform
+import RepoPromptWorkspace
 import SwiftTreeSitter
 
 // MARK: - SVG-Safe Preview Types

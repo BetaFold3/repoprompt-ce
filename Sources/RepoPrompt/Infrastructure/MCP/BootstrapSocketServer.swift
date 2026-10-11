@@ -11,6 +11,7 @@ import Dispatch
 import Foundation
 import Logging
 import RepoPromptShared
+import RepoPromptWorkspace
 
 #if DEBUG
     private var bootstrapSocketServerDebugLoggingEnabled = ProcessInfo.processInfo.environment["REPOPROMPT_MCP_DEBUG"] == "1"

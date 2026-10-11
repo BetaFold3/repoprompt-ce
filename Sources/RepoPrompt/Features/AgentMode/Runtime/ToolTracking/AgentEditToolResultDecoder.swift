@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptWorkspace
 
 // SEARCH-HELPER: AgentEditToolResultDecoder, AgentEditToolFacts, AgentEditedFileFact, edit payload normalization
 

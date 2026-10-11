@@ -1,6 +1,7 @@
 // ResizableTextField.swift
 import AppKit
 import RepoPromptUI
+import RepoPromptWorkspace
 import SwiftUI
 import UniformTypeIdentifiers
 

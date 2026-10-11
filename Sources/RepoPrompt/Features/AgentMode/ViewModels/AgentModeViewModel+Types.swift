@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptWorkspace
 
 struct AgentPersistentSessionBindingIdentity: Equatable, Hashable {
     let tabID: UUID

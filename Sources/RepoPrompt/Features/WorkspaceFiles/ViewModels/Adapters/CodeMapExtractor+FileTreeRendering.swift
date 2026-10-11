@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptWorkspace
 
 /// File tree build result with marker flags
 struct FileTreeResult {

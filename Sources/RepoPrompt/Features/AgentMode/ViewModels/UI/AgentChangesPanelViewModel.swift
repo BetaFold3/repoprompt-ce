@@ -1,5 +1,6 @@
 import Combine
 import Foundation
+import RepoPromptWorkspace
 
 /// A cancellation-aware view-model-wide gate for repository search reads.
 ///

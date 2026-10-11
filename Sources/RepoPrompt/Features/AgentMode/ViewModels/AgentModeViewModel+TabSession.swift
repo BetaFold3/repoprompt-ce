@@ -2,6 +2,7 @@ import Combine
 import Foundation
 import RepoPromptAgentCore
 import RepoPromptShared
+import RepoPromptWorkspace
 
 extension AgentModeViewModel {
     /// A resend selector carries either a picked target (`windowID`, with an optional `workspaceID` guard

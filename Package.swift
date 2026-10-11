@@ -49,6 +49,7 @@ var repoPromptAppDependencies: [Target.Dependency] = [
     "RepoPromptAgentCore",
     "RepoPromptPlatform",
     "RepoPromptUI",
+    "RepoPromptWorkspace",
     .product(name: "RepoPromptShared", package: "RepoPromptCore"),
     "RepoPromptRemoteWire",
     "RepoPromptC", "CSwiftPCRE2", "TreeSitterScannerSupport",
@@ -95,6 +96,7 @@ var repoPromptTestDependencies: [Target.Dependency] = [
     "RepoPromptAgentCore",
     "RepoPromptPlatform",
     "RepoPromptUI",
+    "RepoPromptWorkspace",
     "RepoPromptGateway",
     "RepoPromptRemoteWire",
     .product(name: "RepoPromptShared", package: "RepoPromptCore"),
@@ -165,6 +167,33 @@ let package = Package(
                 .product(name: "SwiftTreeSitter", package: "SwiftTreeSitter")
             ],
             path: "Sources/RepoPromptUI",
+            swiftSettings: repoPromptLayerSwiftSettings
+        ),
+        .target(
+            name: "RepoPromptWorkspace",
+            dependencies: [
+                "RepoPromptPlatform",
+                .product(name: "RepoPromptShared", package: "RepoPromptCore"),
+                "RepoPromptC",
+                "TreeSitterScannerSupport",
+                .product(name: "SwiftTreeSitter", package: "SwiftTreeSitter"),
+                .product(name: "TreeSitterC", package: "tree-sitter-c"),
+                .product(name: "TreeSitterDart", package: "tree-sitter-dart"),
+                .product(name: "TreeSitterGo", package: "tree-sitter-go"),
+                .product(name: "TreeSitterJava", package: "tree-sitter-java"),
+                .product(name: "TreeSitterJavaScript", package: "tree-sitter-javascript"),
+                .product(name: "TreeSitterPython", package: "tree-sitter-python"),
+                .product(name: "TreeSitterRust", package: "tree-sitter-rust"),
+                .product(name: "TreeSitterTypeScript", package: "tree-sitter-typescript"),
+                .product(name: "TreeSitterRuby", package: "tree-sitter-ruby"),
+                .product(name: "TreeSitterSwift", package: "tree-sitter-swift"),
+                .product(name: "TreeSitterCSharp", package: "tree-sitter-c-sharp"),
+                .product(name: "TreeSitterCPP", package: "tree-sitter-cpp"),
+                .product(name: "TreeSitterPHP", package: "tree-sitter-php"),
+                .product(name: "UniversalCharsetDetection", package: "UniversalCharsetDetection"),
+                .product(name: "Cuchardet", package: "UniversalCharsetDetection")
+            ],
+            path: "Sources/RepoPromptWorkspace",
             swiftSettings: repoPromptLayerSwiftSettings
         ),
         .target(

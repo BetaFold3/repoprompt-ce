@@ -1,3 +1,5 @@
+@testable import RepoPromptWorkspace
+
 #if DEBUG && RPCE_BENCHMARK_TESTS
     import CryptoKit
     import Darwin

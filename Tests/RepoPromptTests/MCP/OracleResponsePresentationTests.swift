@@ -3,6 +3,7 @@ import MCP
 @testable import RepoPromptApp
 @testable import RepoPromptPlatform
 @testable import RepoPromptUI
+@testable import RepoPromptWorkspace
 import XCTest
 
 final class OracleResponsePresentationTests: XCTestCase {

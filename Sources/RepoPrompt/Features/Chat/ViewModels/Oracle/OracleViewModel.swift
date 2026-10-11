@@ -1,5 +1,6 @@
 import Combine
 import RepoPromptUI
+import RepoPromptWorkspace
 import SwiftUI
 
 #if DEBUG

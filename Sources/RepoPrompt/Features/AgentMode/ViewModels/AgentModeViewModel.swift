@@ -3,6 +3,7 @@ import CryptoKit
 import Foundation
 import MCP
 import RepoPromptUI
+import RepoPromptWorkspace
 import SwiftUI
 
 struct AgentContextUsage: Codable, Equatable {

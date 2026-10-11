@@ -9,6 +9,7 @@ import MCP
 import Ontology
 import OSLog
 import RepoPromptShared
+import RepoPromptWorkspace
 import SwiftUI
 
 #if DEBUG

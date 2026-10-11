@@ -8,6 +8,7 @@
 
 import Foundation
 import Logging
+import RepoPromptWorkspace
 
 private let log = Logger(label: "com.repoprompt.mcp.readiness")
 

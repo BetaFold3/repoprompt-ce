@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptWorkspace
 
 func sortItems(_ items: [FileSystemItemType], by method: SortMethod) -> [FileSystemItemType] {
     let (folders, files) = items.reduce(into: ([FileSystemItemType](), [FileSystemItemType]())) { result, item in

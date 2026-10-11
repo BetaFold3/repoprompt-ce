@@ -2,6 +2,7 @@
 @testable import RepoPromptApp
 @testable import RepoPromptPlatform
 @testable import RepoPromptUI
+@testable import RepoPromptWorkspace
 import XCTest
 
 /// Literal, well-formed URLs, parsed in one place so a malformed literal fails loudly

@@ -1,5 +1,6 @@
 import Foundation
 import RepoPromptAgentCore
+import RepoPromptWorkspace
 import SwiftAnthropic
 import SwiftOpenAI
 

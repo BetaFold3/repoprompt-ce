@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptWorkspace
 
 struct BenchmarkAuditIssue {
     enum Severity: String { case info, warning, error }

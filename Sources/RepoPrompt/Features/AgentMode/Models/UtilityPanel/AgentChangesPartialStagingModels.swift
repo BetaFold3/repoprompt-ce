@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptWorkspace
 
 /// Direction of an index-only partial mutation.
 enum AgentChangesPartialAction: Equatable {

@@ -10,6 +10,7 @@ import Foundation
 import Logging
 import MCP
 import RepoPromptShared
+import RepoPromptWorkspace
 
 // MARK: - Bundle helpers
 

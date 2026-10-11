@@ -3,6 +3,7 @@ import Foundation
 import OSLog
 import RepoPromptPlatform
 import RepoPromptShared
+import RepoPromptWorkspace
 
 final actor ClaudeNativeProcessSessionController {
     enum CommandProvenance: String, Equatable {

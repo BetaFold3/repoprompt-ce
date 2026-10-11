@@ -1,6 +1,7 @@
 import AppKit
 import Foundation
 import RepoPromptUI
+import RepoPromptWorkspace
 
 @MainActor
 final class FileTagMentionHelper {

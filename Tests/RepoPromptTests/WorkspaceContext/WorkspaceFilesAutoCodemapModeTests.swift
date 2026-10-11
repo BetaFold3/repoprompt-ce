@@ -2,6 +2,7 @@
 @testable import RepoPromptApp
 @testable import RepoPromptPlatform
 @testable import RepoPromptUI
+@testable import RepoPromptWorkspace
 import XCTest
 
 @MainActor
@@ -181,11 +182,11 @@ final class WorkspaceFilesAutoCodemapModeTests: XCTestCase {
         let relativePaths = [
             "Sources/RepoPrompt/Features/WorkspaceFiles/ViewModels/WorkspaceFilesViewModel.swift",
             "Sources/RepoPrompt/Features/Workspaces/ViewModels/WorkspaceManagerViewModel.swift",
-            "Sources/RepoPrompt/Features/Workspaces/WorkspaceCheckoutRefreshService.swift",
+            "Sources/RepoPromptWorkspace/Workspaces/WorkspaceCheckoutRefreshService.swift",
             "Sources/RepoPrompt/Features/AgentMode/ViewModels/AgentModeViewModel.swift",
             "Sources/RepoPrompt/Features/AgentMode/ViewModels/AgentModeViewModel+WorktreeMerge.swift",
             "Sources/RepoPrompt/Infrastructure/MCP/Agent/AgentMCPStartWorktreeCoordinator.swift",
-            "Sources/RepoPrompt/Infrastructure/WorkspaceContext/WorkspaceRootBindingProjection.swift"
+            "Sources/RepoPromptWorkspace/WorkspaceContext/WorkspaceRootBindingProjection.swift"
         ]
         let forbidden = [
             "initializeCodemapsForSessionWorktreeRoots",

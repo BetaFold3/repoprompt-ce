@@ -14,7 +14,7 @@ Status: **Focused original-fix E2E passed structure-only: 34/34 queries on PID 6
 - `Presentation/WorkspaceCodemapPresentationCoordinator.swift` owns foreground operation resources, retry/reset budgets, and deadlines.
 - `Models/WorkspaceCodemapArtifactDemandModels.swift` and `Models/WorkspaceCodemapProjectionPreloadModels.swift` define recovery mappings; `Infrastructure/MCP/ViewModels/MCPServerViewModel.swift` projects issues without changing the MCP issue schema.
 
-The workspace-context paths above are under `Sources/RepoPrompt/Infrastructure/WorkspaceContext/`. Code and tests establish current behavior. Do not add a second engine retirement owner, re-enable `.git` watcher events, remove index/metadata generations, or change unsupported-language/schema behavior as part of this recovery boundary.
+The workspace-context paths above are under `Sources/RepoPromptWorkspace/WorkspaceContext/`; the `Infrastructure/MCP` path is under `Sources/RepoPrompt/`. Code and tests establish current behavior. Do not add a second engine retirement owner, re-enable `.git` watcher events, remove index/metadata generations, or change unsupported-language/schema behavior as part of this recovery boundary.
 
 ## Evidence and adoption
 

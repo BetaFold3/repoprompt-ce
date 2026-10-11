@@ -1,4 +1,5 @@
 import RepoPromptUI
+import RepoPromptWorkspace
 import SwiftTreeSitter
 import SwiftUI
 

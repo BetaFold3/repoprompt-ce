@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptWorkspace
 
 /// Workspace-specific customization overrides for a copy preset
 /// These allow per-workspace deviations from the base preset configuration

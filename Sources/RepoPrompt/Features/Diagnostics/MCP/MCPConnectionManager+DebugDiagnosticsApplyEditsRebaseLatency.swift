@@ -4,6 +4,7 @@ import CryptoKit
 import Foundation
 import MCP
 import RepoPromptShared
+import RepoPromptWorkspace
 
 #if DEBUG
     final class MCPApplyEditsRebaseProbeState: @unchecked Sendable {

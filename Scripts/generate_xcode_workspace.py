@@ -120,6 +120,7 @@ def validate_manifest(manifest: dict, repo_root: Path) -> None:
         "RepoPromptAgentCore",
         "RepoPromptPlatform",
         "RepoPromptUI",
+        "RepoPromptWorkspace",
         "RepoPromptMCP",
         "RepoPromptGateway",
         "RepoPromptRemoteWire",
@@ -176,6 +177,14 @@ def validate_manifest(manifest: dict, repo_root: Path) -> None:
             "Target 'RepoPromptUI' must use the Sources/RepoPromptUI implementation"
         )
 
+    repo_prompt_workspace = targets["RepoPromptWorkspace"]
+    if repo_prompt_workspace.get("type") != "regular":
+        raise GeneratorError("Target 'RepoPromptWorkspace' must remain an internal library target")
+    if repo_prompt_workspace.get("path") != "Sources/RepoPromptWorkspace":
+        raise GeneratorError(
+            "Target 'RepoPromptWorkspace' must use the Sources/RepoPromptWorkspace implementation"
+        )
+
     repo_prompt_remote_wire = targets["RepoPromptRemoteWire"]
     if repo_prompt_remote_wire.get("dependencies", []):
         raise GeneratorError("Target 'RepoPromptRemoteWire' must have no dependencies")
@@ -213,17 +222,19 @@ def validate_manifest(manifest: dict, repo_root: Path) -> None:
         "RepoPromptAgentCore",
         "RepoPromptPlatform",
         "RepoPromptUI",
+        "RepoPromptWorkspace",
         "RepoPromptGateway",
         "RepoPromptRemoteWire",
     }
     if (
-        len(repo_prompt_tests.get("dependencies", [])) != 9
+        len(repo_prompt_tests.get("dependencies", [])) != 10
         or set(_by_name_dependencies(repo_prompt_tests)) != expected_test_targets
         or _product_dependencies(repo_prompt_tests) != expected_core_products
     ):
         raise GeneratorError(
             "RepoPromptTests must depend on RepoPromptApp, RepoPromptAgentCore, RepoPromptPlatform, "
-            "RepoPromptUI, RepoPromptGateway, RepoPromptRemoteWire, and the RepoPromptCore Shared, ClientKit, and MCP products"
+            "RepoPromptUI, RepoPromptWorkspace, RepoPromptGateway, RepoPromptRemoteWire, and the RepoPromptCore "
+            "Shared, ClientKit, and MCP products"
         )
 
     expected_resources = {("CodeMap/Fixtures", True), ("CodeMap/Goldens", True)}

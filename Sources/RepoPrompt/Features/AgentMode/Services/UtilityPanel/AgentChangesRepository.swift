@@ -1,5 +1,6 @@
 import Foundation
 import OSLog
+import RepoPromptWorkspace
 
 /// A view-model-owned, synchronously revocable epoch for index-mutation authority.
 final class AgentChangesIndexMutationLease: @unchecked Sendable {

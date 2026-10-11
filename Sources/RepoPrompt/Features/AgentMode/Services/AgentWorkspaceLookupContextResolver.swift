@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptWorkspace
 
 enum AgentWorkspaceLookupContextResolver {
     private struct CacheKey: Hashable {

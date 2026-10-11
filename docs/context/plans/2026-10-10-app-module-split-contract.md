@@ -177,6 +177,17 @@ Decisions: the moved `CodeMapExtractor` renderers got their own adapter file (`C
 
 Step 4c — done | rounds 0/2 | open: | downgraded: | assumed: | deferred: OracleB P3-1 — at the cut, give `SearchFileDescriptor` a verbatim `package` memberwise init for `init(file:)` (don't route through `init(record:…)`); OracleB P3-3 — at the cut, keep the `countOnly` reset in a descriptor-based search in Workspace so `searchWithErrors` and `SearchContentResult` can return to `private`
 
+#### Step 4d — create `RepoPromptWorkspace` and move the engine
+Intent: move the 250 files that now close over themselves (about 162k lines; list in `step4c-probe/moveset.txt`) into `Sources/RepoPromptWorkspace` with a Platform-only app dependency, applying the deferred verbatim `package` initializers and the descriptor-based search, then run the slice-end gates.
+
+Budget used: about 4 hours (cumulative ~17.5 hours).
+
+Result: `RepoPromptWorkspace` now holds the 250 files (about 162k lines) with `RepoPromptPlatform` as its only app-module dependency and no UI, agent, app, MCP SDK or Sentry import, App and tests reach it through 2,284 compiler-driven `package` declarations (93 of them verbatim initializers, including the deferred path-record and search-descriptor ones and the descriptor-based search that keeps the `countOnly` reset), an ordered per-file check shows the moved files changed only by `package`, added initializers and five explained lines, and build, the full suite (failures match the baseline and pass when rerun alone), identical discovery (6464 names), the unchanged ledger, format, lint, guardrails (A1 only) and the Xcode checks pass, and the universal release package build passes, so Slice 4 is complete and Slice 5 (AgentCore seams) follows.
+
+Decisions: accepted the 2,284 `package` declarations instead of moving instrumentation back into App, because they are the compiler-required surface for a 162k-line module that App uses everywhere and trimming would mean redesign; `WorkspaceModel`, the workspace-switch providers and registry, the preset store and `WorkspaceSelectionCoordinator` stay in App because they own prompt packaging, compose tabs or view-model orchestration; source-scanning tests had their paths updated (and the auto-codemap invariant test now scans both the App and Workspace folders) so their coverage follows the moved files; the Step 4b recorder-`State` deferral is closed because only the agent perf logger uses it.
+
+Step 4d — done | rounds 0/2 | open: | downgraded: | assumed: | deferred: OracleB (3b) F1 — move `MentionModels`/`MentionSuggestion` down in Slice 5 if AgentCore needs it
+
 ### Slice 5 — AgentCore seams, in place
 Still inside `RepoPromptApp`:
 - hoist `TabSession` to `AgentTabSession`, together with the nested types the runtime uses, keeping the same object, owner, callbacks and ordering;

@@ -1,6 +1,7 @@
 import Foundation
 import MCP
 import RepoPromptPlatform
+import RepoPromptWorkspace
 
 /// Shared pure helpers for workspace-oriented MCP window tools.
 ///

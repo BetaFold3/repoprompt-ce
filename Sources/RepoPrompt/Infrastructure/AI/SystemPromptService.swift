@@ -1,5 +1,6 @@
 import Foundation
 import RepoPromptAgentCore
+import RepoPromptWorkspace
 
 class SystemPromptService {
     static let chatCodeFence = "```"

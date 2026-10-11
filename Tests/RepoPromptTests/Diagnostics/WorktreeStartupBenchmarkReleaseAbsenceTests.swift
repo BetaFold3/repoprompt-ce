@@ -5,13 +5,13 @@ final class WorktreeStartupBenchmarkReleaseAbsenceTests: XCTestCase {
     func testReleaseProjectionOmitsDebugQualificationAndPermitsPublicOhMyPiStart() throws {
         let root = try RepoRoot.url()
         let files = [
-            "Sources/RepoPrompt/Features/Diagnostics/App/WorktreeStartupInstrumentation.swift",
+            "Sources/RepoPromptWorkspace/Diagnostics/WorktreeStartupInstrumentation.swift",
             "Sources/RepoPrompt/Features/Diagnostics/AgentMode/OhMyPiAgentModeSmokeGate.swift",
             "Sources/RepoPrompt/Features/AgentMode/Models/ModelSelection/AgentModelCatalog.swift",
             "Sources/RepoPrompt/Features/Settings/ViewModels/APISettingsViewModel.swift",
             "Sources/RepoPrompt/Features/Diagnostics/App/WorktreeStartupBenchmarkDiagnostics.swift",
-            "Sources/RepoPrompt/Infrastructure/VCS/GitWorkspacePolicyCanonicalizationDiagnostics.swift",
-            "Sources/RepoPrompt/Infrastructure/VCS/GitWorktreeInitializationModels.swift",
+            "Sources/RepoPromptWorkspace/VCS/GitWorkspacePolicyCanonicalizationDiagnostics.swift",
+            "Sources/RepoPromptWorkspace/VCS/GitWorktreeInitializationModels.swift",
             "Sources/RepoPrompt/Features/Diagnostics/MCP/MCPConnectionManager+DebugDiagnostics.swift",
             "Sources/RepoPrompt/Features/Diagnostics/MCP/MCPConnectionManager+DebugDiagnosticsWorktreeStartup.swift",
             "Sources/RepoPrompt/Infrastructure/MCP/WindowTools/MCPAgentControlToolProvider.swift",

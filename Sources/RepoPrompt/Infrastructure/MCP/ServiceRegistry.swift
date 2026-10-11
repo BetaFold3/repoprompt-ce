@@ -5,6 +5,8 @@
 //  Created by Eric Provencher on 2025-06-20.
 //
 
+import RepoPromptWorkspace
+
 /// Central registry for all `Service` instances that want to expose tools
 /// to external MCP clients.  Services register themselves at runtime.
 @MainActor

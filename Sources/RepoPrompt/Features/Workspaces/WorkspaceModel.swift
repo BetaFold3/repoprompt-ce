@@ -1,5 +1,6 @@
 import Foundation
 import OSLog
+import RepoPromptWorkspace
 
 struct WorkspaceRootSetKey: Hashable {
     let normalizedPaths: [String]

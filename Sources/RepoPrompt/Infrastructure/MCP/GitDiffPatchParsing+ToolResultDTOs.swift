@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptWorkspace
 
 extension GitDiffPatchParsing {
     /// Converts ParsedFileHunks to the DTO format.

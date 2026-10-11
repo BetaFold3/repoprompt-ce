@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptWorkspace
 
 /// Classifies every stored-selection representation that can carry a published Git artifact.
 ///

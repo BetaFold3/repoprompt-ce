@@ -2,6 +2,7 @@
 @testable import RepoPromptApp
 @testable import RepoPromptPlatform
 @testable import RepoPromptUI
+@testable import RepoPromptWorkspace
 import XCTest
 
 final class WorkspaceSelectionAutoCodemapInvariantTests: XCTestCase {
@@ -157,7 +158,9 @@ final class WorkspaceSelectionAutoCodemapInvariantTests: XCTestCase {
         let repoRoot = try RepoRoot.url()
         let sourceDirectories = [
             "Sources/RepoPrompt/Infrastructure/WorkspaceContext/Selection",
-            "Sources/RepoPrompt/Features/WorkspaceFiles"
+            "Sources/RepoPromptWorkspace/WorkspaceContext/Selection",
+            "Sources/RepoPrompt/Features/WorkspaceFiles",
+            "Sources/RepoPromptWorkspace/WorkspaceFiles"
         ]
         let forbiddenCalls = [
             "codemapFileAPIAggregate(",

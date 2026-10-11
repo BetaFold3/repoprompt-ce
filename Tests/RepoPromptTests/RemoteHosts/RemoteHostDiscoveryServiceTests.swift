@@ -5,6 +5,7 @@ import Foundation
 @testable import RepoPromptPlatform
 import RepoPromptRemoteWire
 @testable import RepoPromptUI
+@testable import RepoPromptWorkspace
 import XCTest
 
 final class RemoteHostDiscoveryServiceTests: XCTestCase {

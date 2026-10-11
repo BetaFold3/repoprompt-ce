@@ -1,5 +1,6 @@
 import AppKit
 import Foundation
+import RepoPromptWorkspace
 
 @MainActor
 struct WindowStateComposition {

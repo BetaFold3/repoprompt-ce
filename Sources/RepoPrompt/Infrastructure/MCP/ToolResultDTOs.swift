@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptWorkspace
 
 /// Namespace for MCP Tool result DTOs.
 /// Using a namespace avoids name collisions with existing private structs

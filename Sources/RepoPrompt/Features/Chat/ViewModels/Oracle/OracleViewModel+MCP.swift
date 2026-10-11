@@ -1,5 +1,6 @@
 import Foundation
 import MCP // <- required for `Value`
+import RepoPromptWorkspace
 
 // MARK: - MCP Tool helpers (moved from MCPServerViewModel)
 

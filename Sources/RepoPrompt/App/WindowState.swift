@@ -1,6 +1,7 @@
 import AppKit
 import Combine
 import Foundation
+import RepoPromptWorkspace
 import SwiftUI
 
 enum WindowKind: String, Codable {

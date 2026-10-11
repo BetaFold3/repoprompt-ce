@@ -1,5 +1,6 @@
 import Foundation
 import RepoPromptShared
+import RepoPromptWorkspace
 
 // MARK: - User-Facing Descriptions
 

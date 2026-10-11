@@ -6,6 +6,7 @@
 //
 
 import RepoPromptUI
+import RepoPromptWorkspace
 import SwiftUI
 
 /// Slimmed Advanced Settings page. Controls are grouped into focused sections

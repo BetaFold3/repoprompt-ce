@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptWorkspace
 import SwiftUI
 
 /// View-model summary describing the bound-worktree visual identity for one

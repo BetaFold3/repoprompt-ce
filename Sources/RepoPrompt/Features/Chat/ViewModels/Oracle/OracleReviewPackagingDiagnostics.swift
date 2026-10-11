@@ -1,5 +1,6 @@
 import CryptoKit
 import Foundation
+import RepoPromptWorkspace
 
 enum OracleSendOrigin: String {
     case askOracle

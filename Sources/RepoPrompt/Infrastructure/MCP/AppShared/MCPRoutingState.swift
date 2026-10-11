@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptWorkspace
 
 /// Persisted routing state for MCP client connections.
 /// Allows routing to survive app restarts and connection churn.

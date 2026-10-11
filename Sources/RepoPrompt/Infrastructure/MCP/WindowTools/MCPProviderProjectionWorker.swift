@@ -1,5 +1,6 @@
 import Foundation
 import MCP
+import RepoPromptWorkspace
 
 /// Runs immutable MCP reply projection work away from MainActor while preserving
 /// explicit MainActor handoff diagnostics for the capture and resume segments.

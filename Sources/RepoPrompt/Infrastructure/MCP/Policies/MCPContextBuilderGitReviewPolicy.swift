@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptWorkspace
 
 enum MCPContextBuilderGitReviewOperation: String {
     case status, diff, log, show, blame

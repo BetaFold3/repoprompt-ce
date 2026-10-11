@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptWorkspace
 
 enum AgentWorktreeRuntimeWorkspaceResolver {
     static func primaryExecutionBinding(

@@ -8,6 +8,7 @@ import NIOCore
 @testable import RepoPromptPlatform
 import RepoPromptRemoteWire
 @testable import RepoPromptUI
+@testable import RepoPromptWorkspace
 import XCTest
 
 /// End-to-end M4 contract over a real loopback WebSocket:

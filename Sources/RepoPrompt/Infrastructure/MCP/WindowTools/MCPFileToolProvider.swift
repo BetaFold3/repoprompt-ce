@@ -3,6 +3,7 @@ import JSONSchema
 import MCP
 import Ontology
 import RepoPromptPlatform
+import RepoPromptWorkspace
 
 @MainActor
 final class MCPFileToolProvider: MCPWindowToolProviding {

@@ -10,6 +10,7 @@ import Foundation
 import Logging
 import MCP
 import RepoPromptShared
+import RepoPromptWorkspace
 
 #if DEBUG
     private var unixSocketMCPTransportDebugLoggingEnabled = ProcessInfo.processInfo.environment["REPOPROMPT_MCP_DEBUG"] == "1"

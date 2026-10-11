@@ -14,6 +14,7 @@ import MCP
 import Ontology
 import RepoPromptPlatform
 import RepoPromptShared
+import RepoPromptWorkspace
 
 enum ReadFileAutoSelectionCoverageCertificateMissReason: String, CaseIterable, Hashable {
     case noCertificate = "no_certificate"

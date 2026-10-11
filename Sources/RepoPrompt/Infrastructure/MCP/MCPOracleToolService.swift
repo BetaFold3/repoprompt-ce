@@ -1,6 +1,7 @@
 import CryptoKit
 import Foundation
 import MCP
+import RepoPromptWorkspace
 
 @MainActor
 struct MCPOracleToolService {

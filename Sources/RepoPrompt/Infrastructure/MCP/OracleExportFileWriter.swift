@@ -1,5 +1,6 @@
 import Foundation
 import MCP
+import RepoPromptWorkspace
 
 struct GeneratedOracleExportCleanupReceipt: @unchecked Sendable {
     let logicalPath: String

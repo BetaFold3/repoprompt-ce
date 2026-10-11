@@ -1,5 +1,6 @@
 import Combine
 import Foundation
+import RepoPromptWorkspace
 
 struct WorkspaceSelectionIdentity: Hashable {
     let workspaceID: UUID

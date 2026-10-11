@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptWorkspace
 
 /// Parses and compiles one ordinary Git file patch for index-only partial mutation.
 ///

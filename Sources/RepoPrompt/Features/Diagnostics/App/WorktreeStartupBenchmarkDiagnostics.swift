@@ -1,3 +1,5 @@
+import RepoPromptWorkspace
+
 #if DEBUG
     import CryptoKit
     import Foundation

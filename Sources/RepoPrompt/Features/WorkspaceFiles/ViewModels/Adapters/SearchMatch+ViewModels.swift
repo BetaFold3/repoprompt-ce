@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptWorkspace
 
 extension FileSearchActor {
     /// Enhanced search with full options support (backward compatibility)
@@ -42,17 +43,19 @@ extension FileSearchActor {
 
 extension SearchFileDescriptor {
     init(file: FileViewModel) {
-        id = file.id
-        name = file.name
-        relativePath = file.relativePath
-        standardizedRelativePath = file.standardizedRelativePath
-        fullPath = file.fullPath
-        standardizedFullPath = file.standardizedFullPath
-        standardizedRootFolderPath = file.standardizedRootFolderPath
-        fileExtension = file.fileExtension
-        contentSnapshot = { policy in
-            await file.searchContentSnapshot(freshnessPolicy: policy)
-        }
+        self.init(
+            id: file.id,
+            name: file.name,
+            relativePath: file.relativePath,
+            standardizedRelativePath: file.standardizedRelativePath,
+            fullPath: file.fullPath,
+            standardizedFullPath: file.standardizedFullPath,
+            standardizedRootFolderPath: file.standardizedRootFolderPath,
+            fileExtension: file.fileExtension,
+            contentSnapshot: { policy in
+                await file.searchContentSnapshot(freshnessPolicy: policy)
+            }
+        )
     }
 }
 
@@ -65,16 +68,13 @@ extension FileSearchActor {
         options: SearchOptions = SearchOptions(),
         in files: [FileViewModel]
     ) async throws -> [SearchMatch] {
-        var materializingOptions = options
-        materializingOptions.countOnly = false
-        let result = try await searchWithErrors(
+        try await search(
             pattern: pattern,
             isRegex: isRegex,
             wasAutoCorrected: &wasAutoCorrected,
-            options: materializingOptions,
+            options: options,
             in: files.map(SearchFileDescriptor.init(file:))
         )
-        return result.matches
     }
 
     /// Finds file paths that match the supplied `pattern`.

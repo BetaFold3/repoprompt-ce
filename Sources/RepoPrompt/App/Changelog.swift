@@ -3,6 +3,7 @@
 import Foundation
 import MarkdownUI
 import RepoPromptUI
+import RepoPromptWorkspace
 import SwiftUI
 
 struct Version: Identifiable {

@@ -1,3 +1,5 @@
+@testable import RepoPromptWorkspace
+
 #if DEBUG
     @testable import RepoPromptAgentCore
     @testable import RepoPromptApp

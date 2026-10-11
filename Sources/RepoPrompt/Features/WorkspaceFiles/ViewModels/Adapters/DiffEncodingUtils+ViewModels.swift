@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptWorkspace
 
 extension DiffEncodingUtils {
     /// Returns: encoded original lines, detected indent type ("s"|"t"), and

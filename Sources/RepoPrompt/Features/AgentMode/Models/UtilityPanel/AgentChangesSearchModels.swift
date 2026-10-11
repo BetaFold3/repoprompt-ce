@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptWorkspace
 
 /// Lifecycle of one in-diff search generation.
 ///

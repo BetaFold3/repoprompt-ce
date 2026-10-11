@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptWorkspace
 
 class DiffParser {
     private let fileManager: WorkspaceFilesViewModel

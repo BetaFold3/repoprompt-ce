@@ -1,6 +1,7 @@
 import Darwin
 import Foundation
 import RepoPromptShared
+import RepoPromptWorkspace
 
 // MARK: - Scanner Protocol
 

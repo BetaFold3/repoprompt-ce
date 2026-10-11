@@ -30,6 +30,7 @@ STYLE_PATHS=(
     "Sources/RepoPromptAgentCore"
     "Sources/RepoPromptPlatform"
     "Sources/RepoPromptUI"
+    "Sources/RepoPromptWorkspace"
     "Sources/RepoPromptExecutable"
     "Sources/RepoPromptMCP"
     "Sources/RepoPromptGateway"

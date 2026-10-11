@@ -4,6 +4,7 @@ import Foundation
 @testable import RepoPromptApp
 @testable import RepoPromptPlatform
 @testable import RepoPromptUI
+@testable import RepoPromptWorkspace
 import XCTest
 
 /// PIDs recorded by a hanging fake Claude launch: the `/bin/sh` root, which `ProcessLauncher`

@@ -1,6 +1,7 @@
 import AppKit
 import Foundation
 import OSLog
+import RepoPromptWorkspace
 
 // MARK: - Scheduler seam
 

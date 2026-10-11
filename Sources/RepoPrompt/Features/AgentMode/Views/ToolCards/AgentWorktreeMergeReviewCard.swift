@@ -1,4 +1,5 @@
 import RepoPromptUI
+import RepoPromptWorkspace
 import SwiftUI
 
 // MARK: - Worktree Merge Review Card
