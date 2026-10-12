@@ -12,6 +12,9 @@ final class AgentComposerUIStore: ObservableObject {
     }
 
     func requestFocus(_ request: AgentComposerFocusRequest) {
+        #if DEBUG || EDIT_FLOW_PERF
+            AgentInteractionLatencyProbe.composerFocusRequested(requestID: request.id, tabID: request.tabID)
+        #endif
         focusRequest = request
     }
 

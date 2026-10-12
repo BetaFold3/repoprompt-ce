@@ -188,6 +188,10 @@ struct AgentInputBar: View {
         case let .discard(requestID):
             composerUI.consumeFocusRequest(id: requestID)
         case let .applyAndConsume(requestID):
+            #if DEBUG || EDIT_FLOW_PERF
+                // Token handed to the text field only; not composer readiness.
+                AgentInteractionLatencyProbe.composerFocusTokenApplied(requestID: requestID)
+            #endif
             composerFocusToken = requestID
             isFocused = true
             composerUI.consumeFocusRequest(id: requestID)

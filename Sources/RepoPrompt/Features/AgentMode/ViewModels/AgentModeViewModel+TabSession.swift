@@ -50,7 +50,7 @@ extension AgentModeViewModel {
                 guard !suppressSourceItemsChanged else { return }
                 repairStoredSourceItemsIfNeeded(diagnosticContext: "items.didSet")
                 rebuildSourceItemDerivedState()
-                onSourceItemsChanged?(self, .structural)
+                onSourceItemsChanged?(self, .structural, .itemsDidSet)
             }
         }
 
@@ -75,7 +75,8 @@ extension AgentModeViewModel {
         private var toolCorrelationIndexes = ToolCorrelationIndexes()
         private var nextEphemeralToolResultPayloadRevision: Int = 1
         var rawToolResultPayloadRenderRevisionByItemID: [UUID: Int] = [:]
-        var onSourceItemsChanged: ((TabSession, SourceItemsMutation) -> Void)?
+        /// The caller is the static source location of the mutation entry call (diagnostics only).
+        var onSourceItemsChanged: ((TabSession, SourceItemsMutation, SourceItemsMutationCaller) -> Void)?
         var onRunStateChanged: ((TabSession) -> Void)?
         #if DEBUG
             private(set) var test_incrementalRetentionCompactionCount = 0
@@ -1904,7 +1905,7 @@ extension AgentModeViewModel {
 
         private enum SourceItemsDispatch {
             case silent
-            case notify(AgentModeViewModel.SourceItemsMutation)
+            case notify(AgentModeViewModel.SourceItemsMutation, AgentModeViewModel.SourceItemsMutationCaller)
         }
 
         private func commitSourceItems(
@@ -1919,8 +1920,8 @@ extension AgentModeViewModel {
             rebuildSourceItemDerivedState()
             sourceItemsRevision &+= 1
             derivedTranscriptSyncState = nil
-            if case let .notify(mutation) = dispatch {
-                onSourceItemsChanged?(self, mutation)
+            if case let .notify(mutation, caller) = dispatch {
+                onSourceItemsChanged?(self, mutation, caller)
             }
         }
 
@@ -1951,7 +1952,8 @@ extension AgentModeViewModel {
         @discardableResult
         private func commitRepairedSourceItemsIfNeeded(
             _ candidateItems: [AgentChatItem],
-            diagnosticContext: String
+            diagnosticContext: String,
+            caller: AgentModeViewModel.SourceItemsMutationCaller
         ) -> Bool {
             let repair = AgentSourceItemIDRepair.repairDuplicateIDs(in: candidateItems)
             guard repair.didRepair else { return false }
@@ -1961,7 +1963,7 @@ extension AgentModeViewModel {
             )
             commitSourceItems(
                 repair.items,
-                dispatch: .notify(.structural),
+                dispatch: .notify(.structural, caller),
                 diagnosticContext: "\(diagnosticContext).commit"
             )
             return true
@@ -2186,11 +2188,12 @@ extension AgentModeViewModel {
         }
 
         private func finishIncrementalSourceItemsMutation(
-            _ mutation: AgentModeViewModel.SourceItemsMutation
+            _ mutation: AgentModeViewModel.SourceItemsMutation,
+            caller: AgentModeViewModel.SourceItemsMutationCaller
         ) {
             sourceItemsRevision &+= 1
             derivedTranscriptSyncState = nil
-            onSourceItemsChanged?(self, mutation)
+            onSourceItemsChanged?(self, mutation, caller)
         }
 
         #if DEBUG
@@ -2228,7 +2231,10 @@ extension AgentModeViewModel {
         func mutateItemsBatch(
             mutation: AgentModeViewModel.SourceItemsMutation = .structural,
             touchActivity: Bool = true,
-            _ body: (inout [AgentChatItem]) -> Void
+            _ body: (inout [AgentChatItem]) -> Void,
+            callerFileID: StaticString = #fileID,
+            callerFunction: StaticString = #function,
+            callerLine: UInt = #line
         ) -> Bool {
             let previousItems = items
             var updatedItems = previousItems
@@ -2236,7 +2242,10 @@ extension AgentModeViewModel {
             guard updatedItems != previousItems else { return false }
             commitSourceItems(
                 updatedItems,
-                dispatch: .notify(mutation),
+                dispatch: .notify(
+                    mutation,
+                    .init(fileID: callerFileID, function: callerFunction, line: callerLine)
+                ),
                 diagnosticContext: "mutateItemsBatch"
             )
             if touchActivity {
@@ -2408,22 +2417,41 @@ extension AgentModeViewModel {
             derivedTranscriptSyncState = nil
         }
 
-        func replaceItems(_ items: [AgentChatItem]) {
+        func replaceItems(
+            _ items: [AgentChatItem],
+            callerFileID: StaticString = #fileID,
+            callerFunction: StaticString = #function,
+            callerLine: UInt = #line
+        ) {
             setItemsSilently(items, reason: .testOverride)
             pendingTurnRuntimeAnchors.removeAll()
             agentMessageRuntimeFootersByItemID.removeAll()
             pendingSourceItemsMutationSummary = nil
-            onSourceItemsChanged?(self, .replaceAll)
+            onSourceItemsChanged?(
+                self,
+                .replaceAll,
+                .init(fileID: callerFileID, function: callerFunction, line: callerLine)
+            )
             lastActivityAt = Date()
             isDirty = true
         }
 
-        func appendItem(_ item: AgentChatItem) {
+        func appendItem(
+            _ item: AgentChatItem,
+            callerFileID: StaticString = #fileID,
+            callerFunction: StaticString = #function,
+            callerLine: UInt = #line
+        ) {
+            let caller = AgentModeViewModel.SourceItemsMutationCaller(
+                fileID: callerFileID,
+                function: callerFunction,
+                line: callerLine
+            )
             var newItem = item
             newItem.sequenceIndex = nextSequenceIndex
             nextSequenceIndex += 1
             let candidateItems = items + [newItem]
-            if commitRepairedSourceItemsIfNeeded(candidateItems, diagnosticContext: "appendItem") {
+            if commitRepairedSourceItemsIfNeeded(candidateItems, diagnosticContext: "appendItem", caller: caller) {
                 if newItem.kind == .user {
                     hasSentFirstMessage = true
                     lastUserMessageAt = newItem.timestamp
@@ -2438,7 +2466,7 @@ extension AgentModeViewModel {
             suppressSourceItemsChanged = false
             reconcileIncrementalEphemeralPayload(previousItem: nil, updatedItem: newItem)
             appendToolCorrelationIndexes(for: newItem, at: appendedIndex)
-            finishIncrementalSourceItemsMutation(.append(index: appendedIndex, itemKind: newItem.kind))
+            finishIncrementalSourceItemsMutation(.append(index: appendedIndex, itemKind: newItem.kind), caller: caller)
             if newItem.kind == .user {
                 hasSentFirstMessage = true
                 lastUserMessageAt = newItem.timestamp
@@ -2447,13 +2475,24 @@ extension AgentModeViewModel {
             isDirty = true
         }
 
-        func replaceItem(at index: Int, with updatedItem: AgentChatItem) {
+        func replaceItem(
+            at index: Int,
+            with updatedItem: AgentChatItem,
+            callerFileID: StaticString = #fileID,
+            callerFunction: StaticString = #function,
+            callerLine: UInt = #line
+        ) {
+            let caller = AgentModeViewModel.SourceItemsMutationCaller(
+                fileID: callerFileID,
+                function: callerFunction,
+                line: callerLine
+            )
             guard items.indices.contains(index) else { return }
             let previousItem = items[index]
             guard updatedItem != previousItem else { return }
             var candidateItems = items
             candidateItems[index] = updatedItem
-            if commitRepairedSourceItemsIfNeeded(candidateItems, diagnosticContext: "replaceItem") {
+            if commitRepairedSourceItemsIfNeeded(candidateItems, diagnosticContext: "replaceItem", caller: caller) {
                 lastActivityAt = Date()
                 isDirty = true
                 return
@@ -2465,13 +2504,25 @@ extension AgentModeViewModel {
             reconcileIncrementalEphemeralPayload(previousItem: previousItem, updatedItem: updatedItem)
             updateToolCorrelationIndexes(previousItem: previousItem, updatedItem: updatedItem, at: index)
             finishIncrementalSourceItemsMutation(
-                .replace(index: index, previousKind: previousItem.kind, currentKind: updatedItem.kind)
+                .replace(index: index, previousKind: previousItem.kind, currentKind: updatedItem.kind),
+                caller: caller
             )
             lastActivityAt = Date()
             isDirty = true
         }
 
-        func mutateItem(at index: Int, _ mutate: (inout AgentChatItem) -> Void) {
+        func mutateItem(
+            at index: Int,
+            _ mutate: (inout AgentChatItem) -> Void,
+            callerFileID: StaticString = #fileID,
+            callerFunction: StaticString = #function,
+            callerLine: UInt = #line
+        ) {
+            let caller = AgentModeViewModel.SourceItemsMutationCaller(
+                fileID: callerFileID,
+                function: callerFunction,
+                line: callerLine
+            )
             guard items.indices.contains(index) else { return }
             let previousItem = items[index]
             var updatedItem = previousItem
@@ -2479,7 +2530,7 @@ extension AgentModeViewModel {
             guard updatedItem != previousItem else { return }
             var candidateItems = items
             candidateItems[index] = updatedItem
-            if commitRepairedSourceItemsIfNeeded(candidateItems, diagnosticContext: "mutateItem") {
+            if commitRepairedSourceItemsIfNeeded(candidateItems, diagnosticContext: "mutateItem", caller: caller) {
                 lastActivityAt = Date()
                 isDirty = true
                 return
@@ -2490,13 +2541,18 @@ extension AgentModeViewModel {
             nextSequenceIndex = max(nextSequenceIndex, updatedItem.sequenceIndex + 1)
             reconcileIncrementalEphemeralPayload(previousItem: previousItem, updatedItem: updatedItem)
             updateToolCorrelationIndexes(previousItem: previousItem, updatedItem: updatedItem, at: index)
-            finishIncrementalSourceItemsMutation(.mutate(index: index, itemKind: updatedItem.kind))
+            finishIncrementalSourceItemsMutation(.mutate(index: index, itemKind: updatedItem.kind), caller: caller)
             lastActivityAt = Date()
             isDirty = true
         }
 
         @discardableResult
-        func removeItem(at index: Int) -> AgentChatItem? {
+        func removeItem(
+            at index: Int,
+            callerFileID: StaticString = #fileID,
+            callerFunction: StaticString = #function,
+            callerLine: UInt = #line
+        ) -> AgentChatItem? {
             guard items.indices.contains(index) else { return nil }
             let removed = items[index]
             suppressSourceItemsChanged = true
@@ -2504,13 +2560,26 @@ extension AgentModeViewModel {
             suppressSourceItemsChanged = false
             reconcileIncrementalEphemeralPayload(previousItem: removed, updatedItem: nil)
             rebuildToolCorrelationIndexes()
-            finishIncrementalSourceItemsMutation(.remove(index: index, itemKind: removed.kind))
+            finishIncrementalSourceItemsMutation(
+                .remove(index: index, itemKind: removed.kind),
+                caller: .init(fileID: callerFileID, function: callerFunction, line: callerLine)
+            )
             lastActivityAt = Date()
             isDirty = true
             return removed
         }
 
-        func updateLastItem(_ mutate: (inout AgentChatItem) -> Void) {
+        func updateLastItem(
+            _ mutate: (inout AgentChatItem) -> Void,
+            callerFileID: StaticString = #fileID,
+            callerFunction: StaticString = #function,
+            callerLine: UInt = #line
+        ) {
+            let caller = AgentModeViewModel.SourceItemsMutationCaller(
+                fileID: callerFileID,
+                function: callerFunction,
+                line: callerLine
+            )
             guard !items.isEmpty else { return }
             let index = items.count - 1
             let previousItem = items[index]
@@ -2519,7 +2588,7 @@ extension AgentModeViewModel {
             guard updatedItem != previousItem else { return }
             var candidateItems = items
             candidateItems[index] = updatedItem
-            if commitRepairedSourceItemsIfNeeded(candidateItems, diagnosticContext: "updateLastItem") {
+            if commitRepairedSourceItemsIfNeeded(candidateItems, diagnosticContext: "updateLastItem", caller: caller) {
                 lastActivityAt = Date()
                 isDirty = true
                 return
@@ -2531,7 +2600,8 @@ extension AgentModeViewModel {
             reconcileIncrementalEphemeralPayload(previousItem: previousItem, updatedItem: updatedItem)
             updateToolCorrelationIndexes(previousItem: previousItem, updatedItem: updatedItem, at: index)
             finishIncrementalSourceItemsMutation(
-                .replace(index: index, previousKind: previousItem.kind, currentKind: updatedItem.kind)
+                .replace(index: index, previousKind: previousItem.kind, currentKind: updatedItem.kind),
+                caller: caller
             )
             lastActivityAt = Date()
             isDirty = true

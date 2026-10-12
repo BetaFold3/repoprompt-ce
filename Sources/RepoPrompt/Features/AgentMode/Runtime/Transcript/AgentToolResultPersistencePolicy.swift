@@ -16,10 +16,38 @@ struct AgentSanitizedToolResult: Equatable {
     }
 }
 
+/// Outcome of the trusted activity-suffix sanitize path. Payload-free; diagnostics only.
+enum AgentSanitizeIncrementalPathReason: String, Equatable {
+    /// The activity-suffix path produced the result.
+    case activitySuffixSuccess
+    /// Persistent-storage sanitization never attempts the activity-suffix path.
+    case notRuntimePresentation
+    /// No trusted incremental final-turn start sequence index was supplied.
+    case trustedSuffixUnavailable
+    /// No previous sanitized transcript was supplied.
+    case previousSanitizedTranscriptUnavailable
+    case turnCountMismatch
+    /// The validated reusable prefix does not cover every turn before the final turn.
+    case reusedPrefixMismatch
+    case finalTurnMissing
+    case finalTurnIdentityMismatch
+    case requestMismatch
+    case spanCountMismatch
+    case spanIdentityMismatch
+    /// An unchanged span's activity count or first/last identity differs from the previous span.
+    case unchangedSpanMismatch
+    /// The changed-activity index lies beyond the previous span's activities.
+    case changedActivityIndexOutOfRange
+    /// The activity immediately before the changed suffix differs from the previous span.
+    case prefixBoundaryMismatch
+    case changedSuffixNotFound
+}
+
 struct AgentSanitizedTranscriptMetrics: Equatable {
     let transcript: AgentTranscript
     let sanitizedActivityCount: Int
     let reusedTurnCount: Int
+    let incrementalPathReason: AgentSanitizeIncrementalPathReason
 }
 
 struct AgentPersistedToolResultSummary: Equatable {
@@ -715,29 +743,48 @@ enum AgentToolResultPersistencePolicy {
         case .persistentStorage:
             0
         }
-        if purpose == .runtimePresentation,
-           let trustedIncrementalFinalTurnStartSequenceIndex,
-           let previousSanitizedTranscript,
-           transcript.turns.count == previousSanitizedTranscript.turns.count,
-           reusedTurnCount == max(0, transcript.turns.count - 1),
-           let currentFinalTurn = transcript.turns.last,
-           let previousFinalTurn = previousSanitizedTranscript.turns.last,
-           currentFinalTurn.id == previousFinalTurn.id
-        {
-            var sanitizedTranscript = transcript
-            if let sanitizedActivityCount = sanitizeFinalTurnIncrementally(
-                &sanitizedTranscript.turns[sanitizedTranscript.turns.count - 1],
-                previousSanitizedTurn: previousFinalTurn,
-                startingAtSequenceIndex: trustedIncrementalFinalTurnStartSequenceIndex,
-                preservedVisibleToolResultRowIDs: preservedVisibleToolResultRowIDs ?? [],
-                context: context
-            ) {
-                return AgentSanitizedTranscriptMetrics(
-                    transcript: sanitizedTranscript,
-                    sanitizedActivityCount: sanitizedActivityCount,
-                    reusedTurnCount: reusedTurnCount
-                )
+        let incrementalPathReason: AgentSanitizeIncrementalPathReason
+        if purpose != .runtimePresentation {
+            incrementalPathReason = .notRuntimePresentation
+        } else if let trustedIncrementalFinalTurnStartSequenceIndex {
+            if let previousSanitizedTranscript {
+                if transcript.turns.count != previousSanitizedTranscript.turns.count {
+                    incrementalPathReason = .turnCountMismatch
+                } else if reusedTurnCount != max(0, transcript.turns.count - 1) {
+                    incrementalPathReason = .reusedPrefixMismatch
+                } else if let currentFinalTurn = transcript.turns.last,
+                          let previousFinalTurn = previousSanitizedTranscript.turns.last
+                {
+                    if currentFinalTurn.id != previousFinalTurn.id {
+                        incrementalPathReason = .finalTurnIdentityMismatch
+                    } else {
+                        var sanitizedTranscript = transcript
+                        switch sanitizeFinalTurnIncrementally(
+                            &sanitizedTranscript.turns[sanitizedTranscript.turns.count - 1],
+                            previousSanitizedTurn: previousFinalTurn,
+                            startingAtSequenceIndex: trustedIncrementalFinalTurnStartSequenceIndex,
+                            preservedVisibleToolResultRowIDs: preservedVisibleToolResultRowIDs ?? [],
+                            context: context
+                        ) {
+                        case let .sanitized(sanitizedActivityCount):
+                            return AgentSanitizedTranscriptMetrics(
+                                transcript: sanitizedTranscript,
+                                sanitizedActivityCount: sanitizedActivityCount,
+                                reusedTurnCount: reusedTurnCount,
+                                incrementalPathReason: .activitySuffixSuccess
+                            )
+                        case let .rejected(reason):
+                            incrementalPathReason = reason
+                        }
+                    }
+                } else {
+                    incrementalPathReason = .finalTurnMissing
+                }
+            } else {
+                incrementalPathReason = .previousSanitizedTranscriptUnavailable
             }
+        } else {
+            incrementalPathReason = .trustedSuffixUnavailable
         }
         let containsSanitizableActivities: Bool = switch purpose {
         case .runtimePresentation:
@@ -749,7 +796,8 @@ enum AgentToolResultPersistencePolicy {
             return AgentSanitizedTranscriptMetrics(
                 transcript: transcript,
                 sanitizedActivityCount: 0,
-                reusedTurnCount: reusedTurnCount
+                reusedTurnCount: reusedTurnCount,
+                incrementalPathReason: incrementalPathReason
             )
         }
         let preservedRowIDs: Set<UUID> = switch purpose {
@@ -780,8 +828,14 @@ enum AgentToolResultPersistencePolicy {
         return AgentSanitizedTranscriptMetrics(
             transcript: sanitizedTranscript,
             sanitizedActivityCount: sanitizedActivityCount,
-            reusedTurnCount: reusedTurnCount
+            reusedTurnCount: reusedTurnCount,
+            incrementalPathReason: incrementalPathReason
         )
+    }
+
+    private enum IncrementalFinalTurnSanitizeOutcome {
+        case sanitized(Int)
+        case rejected(AgentSanitizeIncrementalPathReason)
     }
 
     private static func sanitizeFinalTurnIncrementally(
@@ -790,11 +844,12 @@ enum AgentToolResultPersistencePolicy {
         startingAtSequenceIndex: Int,
         preservedVisibleToolResultRowIDs: Set<UUID>,
         context: AgentToolResultProcessingContext?
-    ) -> Int? {
-        guard turn.request?.id == previousSanitizedTurn.request?.id,
-              turn.responseSpans.count == previousSanitizedTurn.responseSpans.count
-        else {
-            return nil
+    ) -> IncrementalFinalTurnSanitizeOutcome {
+        guard turn.request?.id == previousSanitizedTurn.request?.id else {
+            return .rejected(.requestMismatch)
+        }
+        guard turn.responseSpans.count == previousSanitizedTurn.responseSpans.count else {
+            return .rejected(.spanCountMismatch)
         }
 
         var updatedTurn = turn
@@ -804,7 +859,7 @@ enum AgentToolResultPersistencePolicy {
         for spanIndex in updatedTurn.responseSpans.indices {
             let currentSpan = turn.responseSpans[spanIndex]
             let previousSpan = previousSanitizedTurn.responseSpans[spanIndex]
-            guard currentSpan.id == previousSpan.id else { return nil }
+            guard currentSpan.id == previousSpan.id else { return .rejected(.spanIdentityMismatch) }
 
             if !reachedChangedSuffix {
                 let changedActivityIndex = lowerBoundActivityIndex(
@@ -816,18 +871,20 @@ enum AgentToolResultPersistencePolicy {
                           currentSpan.activities.first?.id == previousSpan.activities.first?.id,
                           currentSpan.activities.last?.id == previousSpan.activities.last?.id
                     else {
-                        return nil
+                        return .rejected(.unchangedSpanMismatch)
                     }
                     updatedTurn.responseSpans[spanIndex].activities = previousSpan.activities
                     continue
                 }
 
-                guard changedActivityIndex <= previousSpan.activities.count else { return nil }
+                guard changedActivityIndex <= previousSpan.activities.count else {
+                    return .rejected(.changedActivityIndexOutOfRange)
+                }
                 if changedActivityIndex > 0 {
                     guard currentSpan.activities[changedActivityIndex - 1].id
                         == previousSpan.activities[changedActivityIndex - 1].id
                     else {
-                        return nil
+                        return .rejected(.prefixBoundaryMismatch)
                     }
                 }
 
@@ -857,9 +914,9 @@ enum AgentToolResultPersistencePolicy {
             )
         }
 
-        guard reachedChangedSuffix else { return nil }
+        guard reachedChangedSuffix else { return .rejected(.changedSuffixNotFound) }
         turn = updatedTurn
-        return sanitizedActivityCount
+        return .sanitized(sanitizedActivityCount)
     }
 
     private static func lowerBoundActivityIndex(

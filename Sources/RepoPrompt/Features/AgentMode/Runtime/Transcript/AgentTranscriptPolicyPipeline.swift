@@ -75,7 +75,8 @@ enum AgentTranscriptPolicyPipeline {
         finalMetrics = .init(
             transcript: AgentTranscriptProjectionBuilder.refreshCompletedFullTurnGroupedHistoryCaches(in: finalMetrics.transcript),
             sanitizedActivityCount: finalMetrics.sanitizedActivityCount,
-            reusedTurnCount: finalMetrics.reusedTurnCount
+            reusedTurnCount: finalMetrics.reusedTurnCount,
+            incrementalPathReason: finalMetrics.incrementalPathReason
         )
         var finalProjection = AgentTranscriptProjectionBuilder.build(from: finalMetrics.transcript)
 
@@ -96,7 +97,8 @@ enum AgentTranscriptPolicyPipeline {
             finalMetrics = .init(
                 transcript: AgentTranscriptProjectionBuilder.refreshCompletedFullTurnGroupedHistoryCaches(in: finalMetrics.transcript),
                 sanitizedActivityCount: finalMetrics.sanitizedActivityCount,
-                reusedTurnCount: finalMetrics.reusedTurnCount
+                reusedTurnCount: finalMetrics.reusedTurnCount,
+                incrementalPathReason: finalMetrics.incrementalPathReason
             )
             finalProjection = AgentTranscriptProjectionBuilder.build(from: finalMetrics.transcript)
         }
@@ -115,7 +117,8 @@ enum AgentTranscriptPolicyPipeline {
         finalMetrics = .init(
             transcript: AgentTranscriptProjectionBuilder.refreshCompletedFullTurnGroupedHistoryCaches(in: finalMetrics.transcript),
             sanitizedActivityCount: finalMetrics.sanitizedActivityCount,
-            reusedTurnCount: finalMetrics.reusedTurnCount
+            reusedTurnCount: finalMetrics.reusedTurnCount,
+            incrementalPathReason: finalMetrics.incrementalPathReason
         )
         let finalProjection = AgentTranscriptProjectionBuilder.build(from: finalMetrics.transcript)
         let visibleToolResultRowIDs = AgentTranscriptProjectionBuilder.visibleToolResultRowIDs(in: finalProjection)

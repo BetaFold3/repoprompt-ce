@@ -282,6 +282,16 @@ final class AgentModeChatSwitchActivationTests: XCTestCase {
             XCTAssertEqual(session.selectedAgent, .openCode)
             XCTAssertEqual(session.selectedModelRaw, AgentModel.defaultModel.rawValue)
 
+            // Fixture contract: the options override below is this case's only Codex catalog,
+            // with no live catalog and seed-only base names. A live snapshot from the process-global polling
+            // service (subscribed when the restored last-used agent is Codex) would classify the
+            // static encoded option as withdrawn; that contract is covered by
+            // testCodexNormalizationPreservesWithdrawnAndNormalizesPresentCapabilities.
+            fixture.viewModel.updateCodexDynamicModels([])
+            XCTAssertTrue(
+                fixture.viewModel.codexDynamicModels.isEmpty,
+                "Fixture expects seeded encoded-ID semantics, not live-catalog withdrawal."
+            )
             fixture.viewModel.test_setModelOptionsOverride(
                 [
                     AgentModelOption(
@@ -1384,6 +1394,209 @@ final class AgentModeChatSwitchActivationTests: XCTestCase {
             }
         }
     }
+
+    // MARK: - D0 interaction-latency attribution (real PromptViewModel → notification → VM path)
+
+    #if DEBUG
+        func testInteractionLatencySupersededClickSwitchNeitherRetargetsNorAdvancesNewerClick() async throws {
+            try await withFixture { fixture in
+                let recorder = LatencyEventRecorder()
+                defer { recorder.tearDown() }
+                let windowID = fixture.window.windowID
+                let older = AgentInteractionLatencyProbe.beginTabActivation(
+                    tabID: fixture.tabBID,
+                    windowID: windowID,
+                    source: "sidebarRow"
+                )
+                let newer = AgentInteractionLatencyProbe.beginTabActivation(
+                    tabID: fixture.tabAID,
+                    windowID: windowID,
+                    source: "sidebarRow"
+                )
+
+                // The older click's switch runs late under its own task-local action.
+                await Self.switchTab(fixture, to: fixture.tabBID, as: older)
+                await Self.drainMainQueue()
+                XCTAssertEqual(fixture.window.promptManager.activeComposeTabID, fixture.tabBID)
+                XCTAssertEqual(recorder.names(for: newer), ["tabActivation.begin"])
+                XCTAssertEqual(AgentInteractionLatencyProbe.pendingInteractionCountForTesting, 1)
+
+                await Self.switchTab(fixture, to: fixture.tabAID, as: newer)
+                XCTAssertEqual(
+                    Array(recorder.names(for: newer).prefix(3)),
+                    ["tabActivation.begin", "tabActivation.handlerEntered", "tabActivation.firstPublish"]
+                )
+                // The real switch reports scheduling wait separately from work start.
+                let fields = try XCTUnwrap(recorder.fields(of: "tabActivation.firstPublish", for: newer))
+                let queueWait = try XCTUnwrap(fields["queueWaitMS"].flatMap(Double.init))
+                let clickToWorkStart = try XCTUnwrap(fields["clickToWorkStartMS"].flatMap(Double.init))
+                XCTAssertLessThanOrEqual(queueWait, clickToWorkStart)
+                XCTAssertNotNil(fields["handlerToWorkStartMS"])
+                XCTAssertTrue(["applyBindings", "none"].contains(fields["refreshPath"] ?? ""), "\(fields)")
+            }
+        }
+
+        func testInteractionLatencyRapidSameTargetClicksIgnoreSupersededSwitchWork() async throws {
+            try await withFixture { fixture in
+                let recorder = LatencyEventRecorder()
+                defer { recorder.tearDown() }
+                let windowID = fixture.window.windowID
+                let older = AgentInteractionLatencyProbe.beginTabActivation(
+                    tabID: fixture.tabBID,
+                    windowID: windowID,
+                    source: "sidebarRow"
+                )
+                let newer = AgentInteractionLatencyProbe.beginTabActivation(
+                    tabID: fixture.tabBID,
+                    windowID: windowID,
+                    source: "sidebarRow"
+                )
+
+                // The superseded click performs the real handler, refresh and publish for the
+                // shared target; none of it may stamp the newer click.
+                await Self.switchTab(fixture, to: fixture.tabBID, as: older)
+                await Self.drainMainQueue()
+                XCTAssertEqual(fixture.viewModel.activeTranscriptPresentation.tabID, fixture.tabBID)
+                XCTAssertEqual(recorder.names(for: newer), ["tabActivation.begin"])
+
+                // The newer click's own switch is a no-op: the tab is already active.
+                await Self.switchTab(fixture, to: fixture.tabBID, as: newer)
+                await Self.drainMainQueue()
+                XCTAssertEqual(recorder.names(for: newer), ["tabActivation.begin"])
+                XCTAssertEqual(AgentInteractionLatencyProbe.pendingInteractionCountForTesting, 1)
+
+                // An unrelated streaming mutation (no task-local action) refreshes and publishes the
+                // target tab; without its own handler the newer click must not be stamped or done.
+                let revisionBeforeStreaming = fixture.viewModel.activeTranscriptPresentation.revision
+                fixture.sessionB.appendItem(.assistant("Streaming update", sequenceIndex: 2))
+                await Self.drainMainQueue()
+                let streamedPresentation = fixture.viewModel.activeTranscriptPresentation
+                XCTAssertEqual(streamedPresentation.tabID, fixture.tabBID)
+                XCTAssertGreaterThan(streamedPresentation.revision, revisionBeforeStreaming)
+                AgentInteractionLatencyProbe.transcriptPresentationObservedBySwiftUI(
+                    tabID: streamedPresentation.tabID,
+                    windowID: windowID,
+                    revision: streamedPresentation.revision
+                )
+                XCTAssertEqual(recorder.names(for: newer), ["tabActivation.begin"])
+                XCTAssertEqual(AgentInteractionLatencyProbe.pendingInteractionCountForTesting, 1)
+            }
+        }
+
+        func testInteractionLatencyOtherWindowSwitchDoesNotCancelActivation() async throws {
+            try await withFixture { fixtureA in
+                try await withFixture { fixtureB in
+                    let recorder = LatencyEventRecorder()
+                    defer { recorder.tearDown() }
+                    XCTAssertNotEqual(fixtureA.window.windowID, fixtureB.window.windowID)
+                    let action = AgentInteractionLatencyProbe.beginTabActivation(
+                        tabID: fixtureA.tabBID,
+                        windowID: fixtureA.window.windowID,
+                        source: "sidebarRow"
+                    )
+
+                    // Window B's unrelated switch reaches every VM's notification sink.
+                    await fixtureB.window.promptManager.switchComposeTab(fixtureB.tabBID)
+                    await Self.drainMainQueue()
+                    XCTAssertEqual(fixtureB.window.promptManager.activeComposeTabID, fixtureB.tabBID)
+                    XCTAssertEqual(recorder.names(for: action), ["tabActivation.begin"])
+                    XCTAssertEqual(AgentInteractionLatencyProbe.pendingInteractionCountForTesting, 1)
+
+                    // The owning window's handler still advances it.
+                    AgentInteractionLatencyAction.$current.withValue(action) {
+                        AgentInteractionLatencyProbe.tabActivationHandlerEntered(
+                            tabID: fixtureA.tabBID,
+                            windowID: fixtureA.window.windowID
+                        )
+                    }
+                    XCTAssertEqual(recorder.names(for: action), ["tabActivation.begin", "tabActivation.handlerEntered"])
+                }
+            }
+        }
+
+        func testInteractionLatencyOlderNewSessionFocusRequestDoesNotCompleteNewerAction() async throws {
+            try await withFixture { fixture in
+                let recorder = LatencyEventRecorder()
+                defer { recorder.tearDown() }
+                let windowID = fixture.window.windowID
+                let older = AgentInteractionLatencyProbe.beginNewSession(windowID: windowID, source: "globalShortcut")
+                let newer = AgentInteractionLatencyProbe.beginNewSession(windowID: windowID, source: "globalShortcut")
+
+                await Task {
+                    await AgentInteractionLatencyProbe.run(as: older) {
+                        await fixture.viewModel.createAndActivateSessionTab(focusComposer: true)
+                    }
+                }.value
+                // Focus behavior is unchanged; only attribution is withheld.
+                let olderRequest = try XCTUnwrap(fixture.viewModel.ui.composer.focusRequest)
+                AgentInteractionLatencyProbe.composerFocusAcknowledged(token: olderRequest.id, via: "tokenAttempt")
+                XCTAssertEqual(recorder.names(for: newer), ["newSession.begin"])
+                XCTAssertFalse(AgentInteractionLatencyProbe.isAwaitingComposerFocus)
+
+                await Task {
+                    await AgentInteractionLatencyProbe.run(as: newer) {
+                        await fixture.viewModel.createAndActivateSessionTab(focusComposer: true)
+                    }
+                }.value
+                let newerRequest = try XCTUnwrap(fixture.viewModel.ui.composer.focusRequest)
+                XCTAssertNotEqual(newerRequest.id, olderRequest.id)
+                AgentInteractionLatencyProbe.composerFocusAcknowledged(token: newerRequest.id, via: "tokenAttempt")
+                XCTAssertEqual(
+                    recorder.names(for: newer),
+                    ["newSession.begin", "newSession.focusRequested", "newSession.composerReady"]
+                )
+            }
+        }
+
+        private static func switchTab(
+            _ fixture: Fixture,
+            to tabID: UUID,
+            as action: AgentInteractionLatencyAction?
+        ) async {
+            await Task {
+                await AgentInteractionLatencyProbe.run(as: action) {
+                    await fixture.window.promptManager.switchComposeTab(tabID)
+                }
+            }.value
+        }
+
+        /// Lets main-queue callbacks and spawned main-actor Tasks from a switch run.
+        private static func drainMainQueue() async {
+            for _ in 0 ..< 5 {
+                await Task.yield()
+                await withCheckedContinuation { continuation in
+                    DispatchQueue.main.async { continuation.resume() }
+                }
+            }
+        }
+
+        @MainActor
+        private final class LatencyEventRecorder {
+            private(set) var events: [AgentInteractionLatencyLedger.Event] = []
+
+            init() {
+                AgentInteractionLatencyProbe.resetForTesting()
+                AgentInteractionLatencyProbe.enabledOverrideForTesting = true
+                AgentInteractionLatencyProbe.eventSinkForTesting = { [weak self] event in
+                    self?.events.append(event)
+                }
+            }
+
+            func names(for action: AgentInteractionLatencyAction?) -> [String] {
+                guard let id = action?.id else { return [] }
+                return events.filter { $0.interactionID == id }.map(\.name)
+            }
+
+            func fields(of name: String, for action: AgentInteractionLatencyAction?) -> [String: String]? {
+                guard let id = action?.id else { return nil }
+                return events.first { $0.interactionID == id && $0.name == name }?.fields
+            }
+
+            func tearDown() {
+                AgentInteractionLatencyProbe.resetForTesting()
+            }
+        }
+    #endif
 
     private func configureHUDCodexProvider(_ fixture: Fixture) {
         fixture.window.apiSettingsViewModel.isCodexConnected = true

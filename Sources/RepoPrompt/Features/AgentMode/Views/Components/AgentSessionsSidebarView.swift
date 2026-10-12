@@ -437,7 +437,22 @@ struct AgentModeSessionsListView: View {
                                     }
                                     : nil,
                                 onSelect: {
-                                    Task { await promptManager.switchComposeTab(session.tabID) }
+                                    #if DEBUG || EDIT_FLOW_PERF
+                                        let latencyAction = session.tabID != currentTabID
+                                            ? AgentInteractionLatencyProbe.beginTabActivation(
+                                                tabID: session.tabID,
+                                                windowID: agentModeVM.interactionLatencyWindowID,
+                                                source: "sidebarRow"
+                                            )
+                                            : nil
+                                        Task {
+                                            await AgentInteractionLatencyProbe.run(as: latencyAction) {
+                                                await promptManager.switchComposeTab(session.tabID)
+                                            }
+                                        }
+                                    #else
+                                        Task { await promptManager.switchComposeTab(session.tabID) }
+                                    #endif
                                 },
                                 onTogglePin: {
                                     promptManager.toggleComposeTabPinned(session.tabID)

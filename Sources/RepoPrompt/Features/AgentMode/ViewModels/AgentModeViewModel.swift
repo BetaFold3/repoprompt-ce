@@ -607,6 +607,13 @@ final class AgentModeViewModel: ObservableObject {
     // MARK: - Dependencies
 
     private let windowID: Int
+    #if DEBUG || EDIT_FLOW_PERF
+        /// Owning window for D0 interaction-latency attribution from views.
+        var interactionLatencyWindowID: Int {
+            windowID
+        }
+    #endif
+
     /// Narrow window identity seam for cross-window scheduled-send commit notifications.
     var scheduledSendWindowID: Int {
         windowID
@@ -3785,6 +3792,11 @@ final class AgentModeViewModel: ObservableObject {
     private func onTabChanged(_ tabID: UUID?, allowDuringWorkspaceSwitch: Bool = false) {
         sessionActivationGeneration &+= 1
         let activationGeneration = sessionActivationGeneration
+        #if DEBUG || EDIT_FLOW_PERF
+            if let tabID {
+                AgentInteractionLatencyProbe.tabActivationHandlerEntered(tabID: tabID, windowID: windowID)
+            }
+        #endif
         let shouldDeferForWorkspaceSwitch = !allowDuringWorkspaceSwitch && workspaceManager?.isSwitchingWorkspace == true
         // Opening a session is the canonical "I've seen it" interaction —
         // clear any unseen-run-state badge the sidebar had queued for it.
@@ -3938,7 +3950,7 @@ final class AgentModeViewModel: ObservableObject {
 
     private func makeSession(for tabID: UUID) -> TabSession {
         let newSession = TabSession(tabID: tabID)
-        newSession.onSourceItemsChanged = { [weak self] session, mutation in
+        newSession.onSourceItemsChanged = { [weak self] session, mutation, caller in
             guard let self else { return }
             if mutation.touchesUserItem {
                 invalidateSidebarRestoreOrdering()
@@ -3947,7 +3959,7 @@ final class AgentModeViewModel: ObservableObject {
             // persistence from the source mutation itself so inactive presentation
             // deferral cannot make durability depend on derived UI refresh work.
             scheduleSave(for: session.tabID)
-            scheduleDerivedTranscriptRefresh(for: session, reason: .liveMutation, mutation: mutation)
+            scheduleDerivedTranscriptRefresh(for: session, reason: .liveMutation, mutation: mutation, caller: caller)
         }
         newSession.onRunStateChanged = { [weak self] session in
             guard let self else { return }
@@ -9784,6 +9796,9 @@ final class AgentModeViewModel: ObservableObject {
             tabID: tabID,
             revision: currentSnapshot.revision &+ 1
         )
+        #if DEBUG || EDIT_FLOW_PERF
+            AgentInteractionLatencyProbe.loadingPresentationPublished(tabID: tabID, windowID: windowID)
+        #endif
     }
 
     private var allowsHeadlessActiveTranscriptBindingPublication: Bool {
@@ -9839,6 +9854,9 @@ final class AgentModeViewModel: ObservableObject {
 
     @discardableResult
     private func publishTranscriptPresentation(from session: TabSession, forceRevision: Bool = false) -> Bool {
+        #if DEBUG || EDIT_FLOW_PERF
+            AgentInteractionLatencyProbe.transcriptPublishBegan(tabID: session.tabID, windowID: windowID)
+        #endif
         let currentSnapshot = activeTranscriptPresentation
         let candidateSnapshot = transcriptPresentationSnapshot(
             from: session,
@@ -9917,6 +9935,9 @@ final class AgentModeViewModel: ObservableObject {
             }
         #endif
         guard contentChanged || performanceChanged || forceRevision else {
+            #if DEBUG || EDIT_FLOW_PERF
+                AgentInteractionLatencyProbe.transcriptPublishSkipped(tabID: session.tabID, windowID: windowID)
+            #endif
             return false
         }
         #if DEBUG || EDIT_FLOW_PERF
@@ -9931,6 +9952,14 @@ final class AgentModeViewModel: ObservableObject {
             from: session,
             revision: nextRevision
         )
+        #if DEBUG || EDIT_FLOW_PERF
+            AgentInteractionLatencyProbe.transcriptPublished(
+                tabID: session.tabID,
+                windowID: windowID,
+                revision: nextRevision,
+                contentChanged: contentChanged
+            )
+        #endif
         if !isActiveUISyncSuppressed {
             syncRuntimeMetricsUIState()
             syncRunInteractionUIState()
@@ -10107,11 +10136,23 @@ final class AgentModeViewModel: ObservableObject {
             isRestoringState = true
             defer { isRestoringState = false }
 
-            catchUpDerivedTranscriptForActiveBindingIfNeeded(
+            #if DEBUG || EDIT_FLOW_PERF
+                AgentInteractionLatencyProbe.transcriptRefreshBegan(tabID: session.tabID, windowID: windowID)
+            #endif
+            let didCatchUpDerivedTranscript = catchUpDerivedTranscriptForActiveBindingIfNeeded(
                 for: session,
                 reason: .liveMutation,
                 validateProjectionIntegrity: true
             )
+            #if DEBUG || EDIT_FLOW_PERF
+                AgentInteractionLatencyProbe.transcriptRefreshEnded(
+                    tabID: session.tabID,
+                    windowID: windowID,
+                    didRefresh: didCatchUpDerivedTranscript
+                )
+            #else
+                _ = didCatchUpDerivedTranscript
+            #endif
             publishTranscriptPresentation(from: session, forceRevision: false)
 
             let nextLiveBashExecutionByItemID = session.bashLiveExecutionByTranscriptItemID
@@ -10931,7 +10972,8 @@ final class AgentModeViewModel: ObservableObject {
     private func scheduleDerivedTranscriptRefresh(
         for session: TabSession,
         reason: DerivedTranscriptRefreshReason,
-        mutation: SourceItemsMutation? = nil
+        mutation: SourceItemsMutation? = nil,
+        caller: SourceItemsMutationCaller? = nil
     ) {
         #if DEBUG
             let canScheduleAsyncRefresh = promptManager != nil || test_allowsScheduledDerivedTranscriptRefreshWithoutPromptManager
@@ -10945,12 +10987,17 @@ final class AgentModeViewModel: ObservableObject {
                 sourceItemCount: session.items.count
             )
         )
+        // Diagnostics only: the summary a non-live refresh discards, so its no-attempt
+        // diagnosis still reports flags and caller. Never consulted for admission.
+        let discardedPendingSummaryForDiagnostics = reason != .liveMutation
+            ? session.pendingSourceItemsMutationSummary
+            : nil
         if reason == .liveMutation, let mutation {
             if var pendingSummary = session.pendingSourceItemsMutationSummary {
-                pendingSummary.merge(mutation)
+                pendingSummary.merge(mutation, caller: caller)
                 session.pendingSourceItemsMutationSummary = pendingSummary
             } else {
-                session.pendingSourceItemsMutationSummary = PendingSourceItemsMutationSummary(mutation)
+                session.pendingSourceItemsMutationSummary = PendingSourceItemsMutationSummary(mutation, caller: caller)
             }
         } else if reason != .liveMutation {
             session.pendingSourceItemsMutationSummary = nil
@@ -10972,7 +11019,11 @@ final class AgentModeViewModel: ObservableObject {
             #if DEBUG || EDIT_FLOW_PERF
                 session.transcriptPerformanceSnapshot.refreshImmediateCount += 1
             #endif
-            refreshDerivedTranscriptState(for: session, reason: reason)
+            refreshDerivedTranscriptState(
+                for: session,
+                reason: reason,
+                discardedPendingSummaryForDiagnostics: discardedPendingSummaryForDiagnostics
+            )
             return
         }
 
@@ -11009,15 +11060,24 @@ final class AgentModeViewModel: ObservableObject {
         }
     }
 
+    /// `discardedPendingSummaryForDiagnostics` is the summary a caller already cleared for a
+    /// non-live refresh; it feeds only the no-attempt diagnosis, never admission.
     func refreshDerivedTranscriptState(
         for session: TabSession,
         reason: DerivedTranscriptRefreshReason = .manualRefresh,
-        publishActivePresentation: Bool = true
+        publishActivePresentation: Bool = true,
+        discardedPendingSummaryForDiagnostics: PendingSourceItemsMutationSummary? = nil
     ) {
         session.derivedTranscriptRefreshGeneration &+= 1
         session.derivedTranscriptRefreshTask?.cancel()
         session.derivedTranscriptRefreshTask = nil
         let pendingMutationSummary = reason == .liveMutation ? session.pendingSourceItemsMutationSummary : nil
+        #if DEBUG || EDIT_FLOW_PERF
+            // Diagnostics only: a non-live refresh still reports the summary it discards.
+            let diagnosticMutationSummary = reason == .liveMutation
+                ? pendingMutationSummary
+                : session.pendingSourceItemsMutationSummary ?? discardedPendingSummaryForDiagnostics
+        #endif
         session.pendingSourceItemsMutationSummary = nil
         session.pendingDerivedTranscriptRefreshReason = nil
         #if DEBUG || EDIT_FLOW_PERF
@@ -11081,6 +11141,15 @@ final class AgentModeViewModel: ObservableObject {
         #if DEBUG || EDIT_FLOW_PERF
             var performanceSnapshot = session.transcriptPerformanceSnapshot
             performanceSnapshot.lastSourceItemCount = workingItemsSnapshot.count
+            let diagnosticTabTag: String? = Self.transcriptDiagnosticTabTag(session.tabID)
+            var importDiagnosticOutcome = "not_attempted"
+            var importDiagnosticReason: String?
+            var importDiagnosticFlags: String?
+            var importDiagnosticCaller: String?
+            var importDiagnosticMergedCount: Int?
+            var importDiagnosticFinalTurnItemCount: Int?
+        #else
+            let diagnosticTabTag: String? = nil
         #endif
         let importPolicy = AgentTranscriptImportPolicy.liveSession(
             hidePendingQuestionToolCall: session.hasPendingQuestionUI
@@ -11117,7 +11186,7 @@ final class AgentModeViewModel: ObservableObject {
                     performanceSnapshot.frontierReuseAttemptCount += 1
                 }
             #endif
-            if let incrementallyUpdatedTranscript = AgentTranscriptIO.incrementallyUpdatedTranscriptForFinalTurn(
+            let incrementalImportResult = AgentTranscriptIO.incrementallyUpdatedTranscriptForFinalTurnWithDiagnostics(
                 existingTranscript: existingTranscript,
                 items: workingItemsSnapshot,
                 earliestChangedIndex: mutationSummary.earliestChangedIndex,
@@ -11125,7 +11194,8 @@ final class AgentModeViewModel: ObservableObject {
                 nextSequenceIndex: session.nextSequenceIndex,
                 policy: importPolicy,
                 protection: projectionProtection
-            ) {
+            )
+            if let incrementallyUpdatedTranscript = incrementalImportResult.transcript {
                 importedTranscript = incrementallyUpdatedTranscript
                 if workingItemsSnapshot.indices.contains(mutationSummary.earliestChangedIndex) {
                     trustedIncrementalFinalTurnStartSequenceIndex =
@@ -11161,12 +11231,32 @@ final class AgentModeViewModel: ObservableObject {
                 #endif
             }
             #if DEBUG || EDIT_FLOW_PERF
+                let incrementalImportShape = Self.incrementalImportDiagnosticShape(incrementalImportResult)
+                let incrementalImportCaller = Self.transcriptRefreshDiagnosticCaller(
+                    mutationSummary,
+                    preferEarliestChange: true
+                )
+                importDiagnosticOutcome = "incremental_\(incrementalImportOutcome)"
+                importDiagnosticReason = incrementalImportResult.rejection?.label
+                importDiagnosticFlags = DerivedTranscriptIncrementalNoAttemptDiagnosis.SummaryFlags(mutationSummary).label
+                importDiagnosticCaller = incrementalImportCaller.label
+                importDiagnosticMergedCount = incrementalImportCaller.mergedCount
+                importDiagnosticFinalTurnItemCount = incrementalImportResult.finalTurnItemCount
                 EditFlowPerf.end(
                     EditFlowPerf.Stage.Transcript.incrementalImport,
                     incrementalImportSignpost,
                     EditFlowPerf.Dimensions(
                         outcome: incrementalImportOutcome,
-                        sourceItemCount: workingItemsSnapshot.count
+                        sourceItemCount: workingItemsSnapshot.count,
+                        tabTag: diagnosticTabTag,
+                        finalTurnItemCount: incrementalImportResult.finalTurnItemCount,
+                        finalTurnStartIndex: incrementalImportShape.finalTurnStartIndex,
+                        earliestChangedIndex: mutationSummary.earliestChangedIndex,
+                        suffixTurnCount: incrementalImportShape.suffixTurnCount,
+                        fallbackReason: incrementalImportResult.rejection?.label,
+                        mutationFlags: importDiagnosticFlags,
+                        callerLabel: incrementalImportCaller.label,
+                        mergedMutationCount: incrementalImportCaller.mergedCount
                     )
                 )
                 let incrementalImportDurationMS = max(0, (CFAbsoluteTimeGetCurrent() - incrementalImportStartedAt) * 1000)
@@ -11181,6 +11271,20 @@ final class AgentModeViewModel: ObservableObject {
         } else {
             #if DEBUG || EDIT_FLOW_PERF
                 performanceSnapshot.lastIncrementalImportDurationMS = nil
+                // Diagnostics only: mirrors the admission guard above; never drives it.
+                let noAttemptDiagnosis = DerivedTranscriptIncrementalNoAttemptDiagnosis.diagnose(
+                    reason: reason,
+                    hasPendingQuestion: session.pendingAskUser != nil,
+                    summary: diagnosticMutationSummary
+                )
+                let noAttemptCaller = Self.transcriptRefreshDiagnosticCaller(
+                    diagnosticMutationSummary,
+                    preferEarliestChange: false
+                )
+                importDiagnosticReason = noAttemptDiagnosis?.primary.rawValue ?? "unclassified"
+                importDiagnosticFlags = noAttemptDiagnosis?.summaryFlags.label
+                importDiagnosticCaller = noAttemptCaller.label
+                importDiagnosticMergedCount = noAttemptCaller.mergedCount
             #endif
             importedTranscript = AgentTranscriptIO.rebuiltTranscriptPreservingCompactedPrefix(
                 existingTranscript: existingTranscript,
@@ -11211,11 +11315,29 @@ final class AgentModeViewModel: ObservableObject {
                 )
             }
         #endif
-        EditFlowPerf.end(
-            EditFlowPerf.Stage.Transcript.importTranscript,
-            importSignpost,
-            EditFlowPerf.Dimensions(status: reason.rawValue, sourceItemCount: workingItemsSnapshot.count)
-        )
+        #if DEBUG || EDIT_FLOW_PERF
+            EditFlowPerf.end(
+                EditFlowPerf.Stage.Transcript.importTranscript,
+                importSignpost,
+                EditFlowPerf.Dimensions(
+                    status: reason.rawValue,
+                    outcome: importDiagnosticOutcome,
+                    sourceItemCount: workingItemsSnapshot.count,
+                    tabTag: diagnosticTabTag,
+                    finalTurnItemCount: importDiagnosticFinalTurnItemCount,
+                    fallbackReason: importDiagnosticReason,
+                    mutationFlags: importDiagnosticFlags,
+                    callerLabel: importDiagnosticCaller,
+                    mergedMutationCount: importDiagnosticMergedCount
+                )
+            )
+        #else
+            EditFlowPerf.end(
+                EditFlowPerf.Stage.Transcript.importTranscript,
+                importSignpost,
+                EditFlowPerf.Dimensions(status: reason.rawValue, sourceItemCount: workingItemsSnapshot.count)
+            )
+        #endif
         #if DEBUG || EDIT_FLOW_PERF
             let importDurationMS = max(0, (CFAbsoluteTimeGetCurrent() - importStartedAt) * 1000)
             performanceSnapshot.lastImportDurationMS = importDurationMS
@@ -11243,7 +11365,8 @@ final class AgentModeViewModel: ObservableObject {
             projectionProtection: projectionProtection,
             isCompressedHistoryRevealed: session.isCompressedHistoryRevealed,
             isColdLoad: reason == .coldLoad,
-            trustedIncrementalFinalTurnStartSequenceIndex: trustedIncrementalFinalTurnStartSequenceIndex
+            trustedIncrementalFinalTurnStartSequenceIndex: trustedIncrementalFinalTurnStartSequenceIndex,
+            diagnosticTabTag: diagnosticTabTag
         )
         applyBuiltTranscriptPresentation(
             builtPresentation,
@@ -11671,6 +11794,80 @@ final class AgentModeViewModel: ObservableObject {
         )
     }
 
+    #if DEBUG || EDIT_FLOW_PERF
+        /// Coarse, content-free tab tag for stage dimensions (UUID prefix).
+        nonisolated static func transcriptDiagnosticTabTag(_ tabID: UUID) -> String {
+            String(tabID.uuidString.prefix(8))
+        }
+
+        /// Final-turn start index and suffix turn count carried by the importer diagnostics.
+        nonisolated static func incrementalImportDiagnosticShape(
+            _ result: AgentTranscriptIncrementalImportResult
+        ) -> (finalTurnStartIndex: Int?, suffixTurnCount: Int?) {
+            switch result {
+            case let .updated(_, finalTurnStartIndex, _):
+                (finalTurnStartIndex, 1)
+            case let .rejected(.changeBeforeFinalTurn(_, finalTurnStartIndex, _)):
+                (finalTurnStartIndex, nil)
+            case let .rejected(.suffixTurnCountMismatch(suffixTurnCount, finalTurnStartIndex, _)):
+                (finalTurnStartIndex, suffixTurnCount)
+            case let .rejected(.requestIDMismatch(finalTurnStartIndex, _)):
+                (finalTurnStartIndex, 1)
+            case .rejected:
+                (nil, nil)
+            }
+        }
+
+        /// DEBUG static caller attribution from a pending summary; nil outside DEBUG.
+        /// `preferEarliestChange` selects the caller that set the earliest changed index
+        /// (attempt rejected before the final turn); otherwise the first rejecting caller.
+        nonisolated static func transcriptRefreshDiagnosticCaller(
+            _ summary: PendingSourceItemsMutationSummary?,
+            preferEarliestChange: Bool
+        ) -> (label: String?, mergedCount: Int?) {
+            #if DEBUG
+                guard let attribution = summary?.debugAttribution else { return (nil, nil) }
+                let caller = preferEarliestChange
+                    ? attribution.earliestChangeCaller
+                    : attribution.firstRejectingCaller ?? attribution.firstCaller
+                return (caller.label, attribution.mergedMutationCount)
+            #else
+                return (nil, nil)
+            #endif
+        }
+
+        /// Records cumulative process-wide `BashToolResultParser` cache counters, one zero-work
+        /// span per table, so they reach both signposts and the DEBUG EditFlowPerf capture.
+        /// These are counter snapshots, not parser duration measurements; the snapshot is read
+        /// only when a span is live (signposts enabled or capture active).
+        nonisolated static func recordBashParserCacheCounterSnapshots() {
+            for table in ["metadata", "parsed"] {
+                let span = EditFlowPerf.begin(EditFlowPerf.Stage.Transcript.bashParserCache)
+                EditFlowPerf.end(
+                    EditFlowPerf.Stage.Transcript.bashParserCache,
+                    span,
+                    {
+                        let snapshot = BashToolResultParser.cacheCountersSnapshot()
+                        let counters = table == "metadata" ? snapshot.metadata : snapshot.parsed
+                        return EditFlowPerf.Dimensions(
+                            scanKind: table,
+                            hitCount: counters.hitCount,
+                            missCount: counters.missCount,
+                            evictedCount: counters.evictedEntryCount,
+                            entryCount: counters.currentEntryCount
+                        )
+                    }()
+                )
+            }
+        }
+    #endif
+
+    /// Diagnostics only: source items from the importer's final-turn start to the end;
+    /// nil when there is no final-turn start.
+    nonisolated static func transcriptDiagnosticFinalTurnItemCount(_ sourceItems: [AgentChatItem]) -> Int? {
+        AgentTranscriptIO.finalTurnStartIndex(in: sourceItems).map { sourceItems.count - $0 }
+    }
+
     nonisolated static func buildTranscriptPresentation(
         from transcript: AgentTranscript,
         sourceItems: [AgentChatItem],
@@ -11685,7 +11882,8 @@ final class AgentModeViewModel: ObservableObject {
         projectionProtection: AgentTranscriptProjectionProtection = .none,
         isCompressedHistoryRevealed: Bool = false,
         isColdLoad: Bool = false,
-        trustedIncrementalFinalTurnStartSequenceIndex: Int? = nil
+        trustedIncrementalFinalTurnStartSequenceIndex: Int? = nil,
+        diagnosticTabTag: String? = nil
     ) -> BuiltTranscriptPresentation {
         let processingContext = AgentToolResultProcessingContext()
         #if DEBUG || EDIT_FLOW_PERF
@@ -11693,7 +11891,11 @@ final class AgentModeViewModel: ObservableObject {
         #endif
         let projectionSignpost = EditFlowPerf.begin(
             EditFlowPerf.Stage.Transcript.projectionBuild,
-            EditFlowPerf.Dimensions(sourceItemCount: sourceItems.count)
+            EditFlowPerf.Dimensions(
+                sourceItemCount: sourceItems.count,
+                tabTag: diagnosticTabTag,
+                finalTurnItemCount: transcriptDiagnosticFinalTurnItemCount(sourceItems)
+            )
         )
         #if DEBUG || EDIT_FLOW_PERF
             let payloadCaptureStartedAt = CFAbsoluteTimeGetCurrent()
@@ -11745,7 +11947,11 @@ final class AgentModeViewModel: ObservableObject {
         #endif
         let sanitizeSignpost = EditFlowPerf.begin(
             EditFlowPerf.Stage.Transcript.sanitize,
-            EditFlowPerf.Dimensions(sourceItemCount: sourceItems.count)
+            EditFlowPerf.Dimensions(
+                sourceItemCount: sourceItems.count,
+                tabTag: diagnosticTabTag,
+                finalTurnItemCount: transcriptDiagnosticFinalTurnItemCount(sourceItems)
+            )
         )
         let sanitizeReusableTurnCount = commonEqualTurnPrefixCount(
             in: transcript,
@@ -11786,7 +11992,19 @@ final class AgentModeViewModel: ObservableObject {
             sanitizeSignpost,
             EditFlowPerf.Dimensions(
                 outcome: sanitizeMetrics.reusedTurnCount > 0 ? "reused_prefix" : "rebuilt",
-                sanitizedActivityCount: sanitizeMetrics.sanitizedActivityCount
+                sourceItemCount: sourceItems.count,
+                sanitizedActivityCount: sanitizeMetrics.sanitizedActivityCount,
+                tabTag: diagnosticTabTag,
+                finalTurnItemCount: transcriptDiagnosticFinalTurnItemCount(sourceItems),
+                fallbackReason: sanitizeMetrics.incrementalPathReason.rawValue
+            )
+        )
+        let projectionOnlySignpost = EditFlowPerf.begin(
+            EditFlowPerf.Stage.Transcript.projectionOnly,
+            EditFlowPerf.Dimensions(
+                sourceItemCount: sourceItems.count,
+                tabTag: diagnosticTabTag,
+                finalTurnItemCount: transcriptDiagnosticFinalTurnItemCount(sourceItems)
             )
         )
         let projectionReusableTurnCount = AgentTranscriptIO.validatedReusableFrozenPrefixTurnCount(in: sanitizedTranscript) ?? 0
@@ -11862,6 +12080,16 @@ final class AgentModeViewModel: ObservableObject {
         let projection = isCompressedHistoryRevealed ? fullProjection : workingProjection
         let projectionCounts = AgentTranscriptProjectionBuilder.projectionCounts(for: baseProjection)
         let canonicalVisibleRowCount = projectionCounts.canonicalVisibleRowCount
+        EditFlowPerf.end(
+            EditFlowPerf.Stage.Transcript.projectionOnly,
+            projectionOnlySignpost,
+            EditFlowPerf.Dimensions(
+                lineCount: canonicalVisibleRowCount,
+                sourceItemCount: sourceItems.count,
+                tabTag: diagnosticTabTag,
+                finalTurnItemCount: transcriptDiagnosticFinalTurnItemCount(sourceItems)
+            )
+        )
         #if DEBUG
             if AgentTranscriptDebugInstrumentation.isEnabled, let previousBaseProjection {
                 let previousRows = previousBaseProjection.archivedRows + previousBaseProjection.workingRows
@@ -11938,6 +12166,7 @@ final class AgentModeViewModel: ObservableObject {
                     regexCaptureCallCount: toolProcessingMetrics.regexCaptureCallCount
                 )
             )
+            recordBashParserCacheCounterSnapshots()
             EditFlowPerf.end(
                 EditFlowPerf.Stage.Transcript.projectionBuild,
                 projectionSignpost,
@@ -11946,7 +12175,9 @@ final class AgentModeViewModel: ObservableObject {
                     lineCount: canonicalVisibleRowCount,
                     sourceItemCount: sourceItems.count,
                     retainedPayloadCount: capturedPayloadByItemID.count,
-                    retainedPayloadBytes: capturedPayloadBytes
+                    retainedPayloadBytes: capturedPayloadBytes,
+                    tabTag: diagnosticTabTag,
+                    finalTurnItemCount: transcriptDiagnosticFinalTurnItemCount(sourceItems)
                 )
             )
             if isColdLoad {
@@ -12134,6 +12365,11 @@ final class AgentModeViewModel: ObservableObject {
             for: session,
             transcript: transcript
         )
+        #if DEBUG || EDIT_FLOW_PERF
+            let diagnosticTabTag: String? = Self.transcriptDiagnosticTabTag(session.tabID)
+        #else
+            let diagnosticTabTag: String? = nil
+        #endif
         let builtPresentation = Self.buildTranscriptPresentation(
             from: transcript,
             sourceItems: canonicalSourceItems,
@@ -12147,7 +12383,8 @@ final class AgentModeViewModel: ObservableObject {
             previousProjectionProtection: session.transcriptProjectionProtection,
             projectionProtection: projectionProtection,
             isCompressedHistoryRevealed: session.isCompressedHistoryRevealed,
-            isColdLoad: isColdLoad
+            isColdLoad: isColdLoad,
+            diagnosticTabTag: diagnosticTabTag
         )
         applyBuiltTranscriptPresentation(
             builtPresentation,

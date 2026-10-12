@@ -60,6 +60,64 @@ struct AgentConversationReplaySerialization: Equatable {
     let metrics: AgentConversationReplayMetrics
 }
 
+/// Why `AgentTranscriptIO.incrementallyUpdatedTranscriptForFinalTurn` fell back to a full import.
+/// Cases mirror the importer guards in evaluation order.
+enum AgentTranscriptIncrementalImportRejection: Equatable {
+    case emptyItems
+    case emptyExistingTranscript
+    case invalidFrontier
+    case noFinalTurnStart
+    case changeBeforeFinalTurn(earliestChangedIndex: Int, finalTurnStartIndex: Int, finalTurnItemCount: Int)
+    case suffixTurnCountMismatch(suffixTurnCount: Int, finalTurnStartIndex: Int, finalTurnItemCount: Int)
+    case requestIDMismatch(finalTurnStartIndex: Int, finalTurnItemCount: Int)
+
+    /// Stable payload-free label for logs and signposts.
+    var label: String {
+        switch self {
+        case .emptyItems: "emptyItems"
+        case .emptyExistingTranscript: "emptyExistingTranscript"
+        case .invalidFrontier: "invalidFrontier"
+        case .noFinalTurnStart: "noFinalTurnStart"
+        case .changeBeforeFinalTurn: "changeBeforeFinalTurn"
+        case .suffixTurnCountMismatch: "suffixTurnCountMismatch"
+        case .requestIDMismatch: "requestIDMismatch"
+        }
+    }
+
+    var finalTurnItemCount: Int? {
+        switch self {
+        case .emptyItems, .emptyExistingTranscript, .invalidFrontier, .noFinalTurnStart:
+            nil
+        case let .changeBeforeFinalTurn(_, _, count),
+             let .suffixTurnCountMismatch(_, _, count),
+             let .requestIDMismatch(_, count):
+            count
+        }
+    }
+}
+
+enum AgentTranscriptIncrementalImportResult: Equatable {
+    case updated(AgentTranscript, finalTurnStartIndex: Int, finalTurnItemCount: Int)
+    case rejected(AgentTranscriptIncrementalImportRejection)
+
+    var transcript: AgentTranscript? {
+        if case let .updated(transcript, _, _) = self { return transcript }
+        return nil
+    }
+
+    var rejection: AgentTranscriptIncrementalImportRejection? {
+        if case let .rejected(rejection) = self { return rejection }
+        return nil
+    }
+
+    var finalTurnItemCount: Int? {
+        switch self {
+        case let .updated(_, _, count): count
+        case let .rejected(rejection): rejection.finalTurnItemCount
+        }
+    }
+}
+
 #if DEBUG
     struct AgentTranscriptProtectedTailScanMetrics: Equatable {
         let transcriptTurnCount: Int
@@ -633,14 +691,40 @@ enum BashToolResultParser {
         case missing
     }
 
+    #if DEBUG || EDIT_FLOW_PERF
+        /// Process-wide counters for one `BashToolResultParser` cache table. Counts only; no payloads.
+        struct CacheTableCounters: Equatable {
+            var hitCount: Int = 0
+            var missCount: Int = 0
+            var evictedEntryCount: Int = 0
+            var currentEntryCount: Int = 0
+        }
+
+        struct CacheCountersSnapshot: Equatable {
+            let metadata: CacheTableCounters
+            let parsed: CacheTableCounters
+        }
+    #endif
+
     private final class Cache {
         private let lock = NSLock()
         private var metadataByRaw: [String: CacheEntry<Metadata>] = [:]
         private var parsedByKey: [ParsedCacheKey: CacheEntry<ParsedResult>] = [:]
+        #if DEBUG || EDIT_FLOW_PERF
+            private var metadataCounters = CacheTableCounters()
+            private var parsedCounters = CacheTableCounters()
+        #endif
 
         func metadata(raw: String, compute: () -> Metadata) -> Metadata {
             lock.lock()
             if let cached = metadataByRaw[raw] {
+                #if DEBUG || EDIT_FLOW_PERF
+                    if case .value = cached {
+                        metadataCounters.hitCount += 1
+                    } else {
+                        metadataCounters.missCount += 1
+                    }
+                #endif
                 lock.unlock()
                 switch cached {
                 case let .value(value):
@@ -649,15 +733,24 @@ enum BashToolResultParser {
                     return compute()
                 }
             }
+            #if DEBUG || EDIT_FLOW_PERF
+                metadataCounters.missCount += 1
+            #endif
             lock.unlock()
 
             let value = compute()
 
             lock.lock()
             if metadataByRaw.count > 255 {
+                #if DEBUG || EDIT_FLOW_PERF
+                    metadataCounters.evictedEntryCount += metadataByRaw.count
+                #endif
                 metadataByRaw.removeAll(keepingCapacity: true)
             }
             metadataByRaw[raw] = .value(value)
+            #if DEBUG || EDIT_FLOW_PERF
+                metadataCounters.currentEntryCount = metadataByRaw.count
+            #endif
             lock.unlock()
             return value
         }
@@ -666,6 +759,13 @@ enum BashToolResultParser {
             let key = ParsedCacheKey(raw: raw, argsJSON: argsJSON)
             lock.lock()
             if let cached = parsedByKey[key] {
+                #if DEBUG || EDIT_FLOW_PERF
+                    if case .value = cached {
+                        parsedCounters.hitCount += 1
+                    } else {
+                        parsedCounters.missCount += 1
+                    }
+                #endif
                 lock.unlock()
                 switch cached {
                 case let .value(value):
@@ -674,21 +774,45 @@ enum BashToolResultParser {
                     return compute()
                 }
             }
+            #if DEBUG || EDIT_FLOW_PERF
+                parsedCounters.missCount += 1
+            #endif
             lock.unlock()
 
             let value = compute()
 
             lock.lock()
             if parsedByKey.count > 255 {
+                #if DEBUG || EDIT_FLOW_PERF
+                    parsedCounters.evictedEntryCount += parsedByKey.count
+                #endif
                 parsedByKey.removeAll(keepingCapacity: true)
             }
             parsedByKey[key] = .value(value)
+            #if DEBUG || EDIT_FLOW_PERF
+                parsedCounters.currentEntryCount = parsedByKey.count
+            #endif
             lock.unlock()
             return value
         }
+
+        #if DEBUG || EDIT_FLOW_PERF
+            func countersSnapshot() -> CacheCountersSnapshot {
+                lock.lock()
+                defer { lock.unlock() }
+                return CacheCountersSnapshot(metadata: metadataCounters, parsed: parsedCounters)
+            }
+        #endif
     }
 
     private static let cache = Cache()
+
+    #if DEBUG || EDIT_FLOW_PERF
+        /// Thread-safe snapshot of the process-wide metadata and parsed-result cache counters.
+        static func cacheCountersSnapshot() -> CacheCountersSnapshot {
+            cache.countersSnapshot()
+        }
+    #endif
     private static let commandKeys: [String] = [
         "command", "cmd", "input", "text", "value", "argv", "args",
         "commandLine", "command_line", "cmdline", "cmd_line", "parsedCommand", "parsed_command",
@@ -2531,15 +2655,45 @@ enum AgentTranscriptIO {
         policy: AgentTranscriptImportPolicy = .canonical,
         protection: AgentTranscriptProjectionProtection = .none
     ) -> AgentTranscript? {
-        guard !items.isEmpty,
-              !existingTranscript.turns.isEmpty,
-              let frozenPrefixTurnCount = AgentTranscriptDurableFrontierSupport.validatedFrozenPrefixTurnCountForIncrementalReuse(
-                  in: existingTranscript
-              ),
-              let finalTurnStartIndex = finalTurnStartIndex(in: items),
-              earliestChangedIndex >= finalTurnStartIndex
-        else {
-            return nil
+        incrementallyUpdatedTranscriptForFinalTurnWithDiagnostics(
+            existingTranscript: existingTranscript,
+            items: items,
+            earliestChangedIndex: earliestChangedIndex,
+            terminalState: terminalState,
+            nextSequenceIndex: nextSequenceIndex,
+            policy: policy,
+            protection: protection
+        ).transcript
+    }
+
+    /// Diagnostic variant of `incrementallyUpdatedTranscriptForFinalTurn`. Same guards, same order,
+    /// same output; additionally reports which guard rejected the incremental path.
+    static func incrementallyUpdatedTranscriptForFinalTurnWithDiagnostics(
+        existingTranscript: AgentTranscript,
+        items: [AgentChatItem],
+        earliestChangedIndex: Int,
+        terminalState: AgentSessionRunState? = nil,
+        nextSequenceIndex: Int? = nil,
+        policy: AgentTranscriptImportPolicy = .canonical,
+        protection: AgentTranscriptProjectionProtection = .none
+    ) -> AgentTranscriptIncrementalImportResult {
+        guard !items.isEmpty else { return .rejected(.emptyItems) }
+        guard !existingTranscript.turns.isEmpty else { return .rejected(.emptyExistingTranscript) }
+        guard let frozenPrefixTurnCount = AgentTranscriptDurableFrontierSupport.validatedFrozenPrefixTurnCountForIncrementalReuse(
+            in: existingTranscript
+        ) else {
+            return .rejected(.invalidFrontier)
+        }
+        guard let finalTurnStartIndex = finalTurnStartIndex(in: items) else {
+            return .rejected(.noFinalTurnStart)
+        }
+        let finalTurnItemCount = items.count - finalTurnStartIndex
+        guard earliestChangedIndex >= finalTurnStartIndex else {
+            return .rejected(.changeBeforeFinalTurn(
+                earliestChangedIndex: earliestChangedIndex,
+                finalTurnStartIndex: finalTurnStartIndex,
+                finalTurnItemCount: finalTurnItemCount
+            ))
         }
         let suffixItems = Array(items[finalTurnStartIndex...])
         let rebuiltSuffixTranscript = buildTranscript(
@@ -2552,18 +2706,32 @@ enum AgentTranscriptIO {
         )
         guard rebuiltSuffixTranscript.turns.count == 1,
               let rebuiltFinalTurn = rebuiltSuffixTranscript.turns.first,
-              let existingFinalTurn = existingTranscript.turns.last,
-              existingFinalTurn.request?.id == rebuiltFinalTurn.request?.id
+              let existingFinalTurn = existingTranscript.turns.last
         else {
-            return nil
+            return .rejected(.suffixTurnCountMismatch(
+                suffixTurnCount: rebuiltSuffixTranscript.turns.count,
+                finalTurnStartIndex: finalTurnStartIndex,
+                finalTurnItemCount: finalTurnItemCount
+            ))
+        }
+        guard existingFinalTurn.request?.id == rebuiltFinalTurn.request?.id else {
+            return .rejected(.requestIDMismatch(
+                finalTurnStartIndex: finalTurnStartIndex,
+                finalTurnItemCount: finalTurnItemCount
+            ))
         }
         var updatedTranscript = existingTranscript
         updatedTranscript.turns[updatedTranscript.turns.count - 1] = rebuiltFinalTurn
         updatedTranscript.nextSequenceIndex = nextSequenceIndex ?? updatedTranscript.nextSequenceIndex
-        return AgentTranscriptCompactor.compact(
+        let compacted = AgentTranscriptCompactor.compact(
             updatedTranscript,
             mode: frozenPrefixTurnCount > 0 ? .preserveDurableFrontier : .recomputeAll,
             protection: protection
+        )
+        return .updated(
+            compacted,
+            finalTurnStartIndex: finalTurnStartIndex,
+            finalTurnItemCount: finalTurnItemCount
         )
     }
 
@@ -2825,7 +2993,9 @@ enum AgentTranscriptIO {
         return "{\"status\":\"\(status)\",\"reason\":\"\(reason)\"}"
     }
 
-    private static func finalTurnStartIndex(in items: [AgentChatItem]) -> Int? {
+    /// Final-turn boundary used by the incremental importer (last user item). Internal so
+    /// diagnostics can report final-turn size without duplicating the rule.
+    static func finalTurnStartIndex(in items: [AgentChatItem]) -> Int? {
         items.lastIndex(where: { $0.kind == .user })
     }
 

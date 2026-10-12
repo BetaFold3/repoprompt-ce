@@ -2172,6 +2172,13 @@ struct AgentModeChatDetailView: View {
                         agentModeVM.setCompressedHistoryVisibility(tabID: currentTabID, isRevealed: showCompressedHistory)
                         agentModeVM.setTranscriptWindowExpanded(tabID: currentTabID, isExpanded: isTranscriptWindowExpanded)
                     }
+                    #if DEBUG || EDIT_FLOW_PERF
+                        AgentInteractionLatencyProbe.transcriptPresentationObservedBySwiftUI(
+                            tabID: transcriptPresentation.tabID,
+                            windowID: agentModeVM.interactionLatencyWindowID,
+                            revision: transcriptPresentation.revision
+                        )
+                    #endif
                     debugLog("onAppear", details: "visibleBlocks=\(visibleTranscriptBlocks.count) rows=\(renderedTranscriptRows.count)")
                     syncTranscriptBlockExpansion(for: visibleTranscriptBlocks)
                     publishGroupingSnapshot()
@@ -2197,6 +2204,14 @@ struct AgentModeChatDetailView: View {
                     #endif
                 }
                 .onChange(of: transcriptPresentation) { oldSnapshot, newSnapshot in
+                    #if DEBUG || EDIT_FLOW_PERF
+                        // SwiftUI view-update observation only; not frame or pixel completion.
+                        AgentInteractionLatencyProbe.transcriptPresentationObservedBySwiftUI(
+                            tabID: newSnapshot.tabID,
+                            windowID: agentModeVM.interactionLatencyWindowID,
+                            revision: newSnapshot.revision
+                        )
+                    #endif
                     handleTranscriptPresentationChange(
                         from: oldSnapshot,
                         to: newSnapshot,

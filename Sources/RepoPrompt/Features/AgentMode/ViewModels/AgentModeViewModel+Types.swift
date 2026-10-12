@@ -846,6 +846,27 @@ extension AgentModeViewModel {
         }
     }
 
+    /// Static, content-free source location of the call into a `TabSession` source-items
+    /// mutation entry. Delivered through `onSourceItemsChanged`; recorded on the pending
+    /// mutation summary only in DEBUG.
+    struct SourceItemsMutationCaller {
+        let fileID: StaticString
+        let function: StaticString
+        let line: UInt
+
+        /// Direct `items` writes reach the callback through `items.didSet`, which has no caller context.
+        static let itemsDidSet = SourceItemsMutationCaller(fileID: "TabSession", function: "items.didSet", line: 0)
+
+        /// Bounded label: file basename, line, and function base name (no arguments, no payload).
+        var label: String {
+            let fileText = "\(fileID)"
+            let functionText = "\(function)"
+            let file = fileText.split(separator: "/").last.map(String.init) ?? fileText
+            let functionName = functionText.split(separator: "(").first.map(String.init) ?? functionText
+            return "\(file)_L\(line)_\(functionName)"
+        }
+    }
+
     enum AgentTranscriptAutoFollowArmingState: String, Codable, Equatable {
         case armed
         case disarmedAfterManualDetach
@@ -858,9 +879,27 @@ extension AgentModeViewModel {
         var containsReplaceAll: Bool
         var containsUserMutation: Bool
         var containsStructuralMutation: Bool
+        /// Diagnostics: a merged mutation had no `changedIndexRange` (resets `earliestChangedIndex` to 0).
+        /// Does not participate in admission or equality.
+        var containsUnrangedMutation: Bool
+        #if DEBUG
+            /// Bounded DEBUG attribution for merged mutations: fixed slots, never a growing list.
+            struct DebugAttribution {
+                var firstCaller: SourceItemsMutationCaller
+                /// Caller whose mutation first set the current `earliestChangedIndex` (lower index or unranged reset).
+                var earliestChangeCaller: SourceItemsMutationCaller
+                /// First caller whose mutation made the summary disallow incremental final-turn rebuild.
+                var firstRejectingCaller: SourceItemsMutationCaller?
+                var firstUnrangedCaller: SourceItemsMutationCaller?
+                var mergedMutationCount: Int
+            }
 
-        init(_ mutation: SourceItemsMutation) {
+            var debugAttribution: DebugAttribution?
+        #endif
+
+        init(_ mutation: SourceItemsMutation, caller: SourceItemsMutationCaller? = nil) {
             let changedRange = mutation.changedIndexRange
+            containsUnrangedMutation = changedRange == nil
             earliestChangedIndex = changedRange?.lowerBound ?? 0
             latestChangedIndex = changedRange?.upperBound ?? Int.max
             containsRemoval = {
@@ -873,15 +912,32 @@ extension AgentModeViewModel {
             }()
             containsUserMutation = mutation.touchesUserItem
             containsStructuralMutation = mutation.isStructural
+            #if DEBUG
+                if let caller {
+                    let rejectsIncremental = !allowsIncrementalFinalTurnRebuild
+                    debugAttribution = DebugAttribution(
+                        firstCaller: caller,
+                        earliestChangeCaller: caller,
+                        firstRejectingCaller: rejectsIncremental ? caller : nil,
+                        firstUnrangedCaller: changedRange == nil ? caller : nil,
+                        mergedMutationCount: 1
+                    )
+                }
+            #endif
         }
 
-        mutating func merge(_ mutation: SourceItemsMutation) {
+        mutating func merge(_ mutation: SourceItemsMutation, caller: SourceItemsMutationCaller? = nil) {
+            #if DEBUG
+                let previousEarliestChangedIndex = earliestChangedIndex
+                let previouslyAllowedIncremental = allowsIncrementalFinalTurnRebuild
+            #endif
             if let changedRange = mutation.changedIndexRange {
                 earliestChangedIndex = min(earliestChangedIndex, changedRange.lowerBound)
                 latestChangedIndex = max(latestChangedIndex, changedRange.upperBound)
             } else {
                 earliestChangedIndex = 0
                 latestChangedIndex = Int.max
+                containsUnrangedMutation = true
             }
             if case .remove = mutation {
                 containsRemoval = true
@@ -891,6 +947,23 @@ extension AgentModeViewModel {
             }
             containsUserMutation = containsUserMutation || mutation.touchesUserItem
             containsStructuralMutation = containsStructuralMutation || mutation.isStructural
+            #if DEBUG
+                if var attribution = debugAttribution {
+                    attribution.mergedMutationCount += 1
+                    if let caller {
+                        if earliestChangedIndex < previousEarliestChangedIndex {
+                            attribution.earliestChangeCaller = caller
+                        }
+                        if previouslyAllowedIncremental, !allowsIncrementalFinalTurnRebuild {
+                            attribution.firstRejectingCaller = caller
+                        }
+                        if mutation.changedIndexRange == nil, attribution.firstUnrangedCaller == nil {
+                            attribution.firstUnrangedCaller = caller
+                        }
+                    }
+                    debugAttribution = attribution
+                }
+            #endif
         }
 
         var allowsIncrementalFinalTurnRebuild: Bool {
@@ -898,6 +971,90 @@ extension AgentModeViewModel {
                 && !containsReplaceAll
                 && !containsUserMutation
                 && !containsStructuralMutation
+        }
+
+        /// Equality covers admission-bearing fields only; diagnostics never affect it.
+        static func == (lhs: Self, rhs: Self) -> Bool {
+            lhs.earliestChangedIndex == rhs.earliestChangedIndex
+                && lhs.latestChangedIndex == rhs.latestChangedIndex
+                && lhs.containsRemoval == rhs.containsRemoval
+                && lhs.containsReplaceAll == rhs.containsReplaceAll
+                && lhs.containsUserMutation == rhs.containsUserMutation
+                && lhs.containsStructuralMutation == rhs.containsStructuralMutation
+        }
+    }
+
+    /// Why a refresh made no incremental final-turn import attempt. Diagnostics only: mirrors,
+    /// but never drives, the admission guard in `refreshDerivedTranscriptState`.
+    struct DerivedTranscriptIncrementalNoAttemptDiagnosis: Equatable {
+        /// First failing admission guard, in the guard's evaluation order.
+        enum Primary: String {
+            case reasonNotLive
+            case pendingQuestion
+            case missingSummary
+            case summaryRejected
+        }
+
+        /// Every flag present on the pending summary, reported even when an earlier guard
+        /// already failed, so overlapping causes stay visible.
+        struct SummaryFlags: OptionSet, Equatable {
+            let rawValue: Int
+            static let removal = SummaryFlags(rawValue: 1 << 0)
+            static let replaceAll = SummaryFlags(rawValue: 1 << 1)
+            static let user = SummaryFlags(rawValue: 1 << 2)
+            static let structural = SummaryFlags(rawValue: 1 << 3)
+            static let unranged = SummaryFlags(rawValue: 1 << 4)
+
+            init(rawValue: Int) {
+                self.rawValue = rawValue
+            }
+
+            init(_ summary: PendingSourceItemsMutationSummary) {
+                var flags: SummaryFlags = []
+                if summary.containsRemoval { flags.insert(.removal) }
+                if summary.containsReplaceAll { flags.insert(.replaceAll) }
+                if summary.containsUserMutation { flags.insert(.user) }
+                if summary.containsStructuralMutation { flags.insert(.structural) }
+                if summary.containsUnrangedMutation { flags.insert(.unranged) }
+                self = flags
+            }
+
+            /// Static labels joined by `-` in a fixed order; nil when empty.
+            var label: String? {
+                let ordered: [(SummaryFlags, String)] = [
+                    (.removal, "removal"),
+                    (.replaceAll, "replaceAll"),
+                    (.user, "user"),
+                    (.structural, "structural"),
+                    (.unranged, "unranged")
+                ]
+                let labels = ordered.compactMap { contains($0.0) ? $0.1 : nil }
+                return labels.isEmpty ? nil : labels.joined(separator: "-")
+            }
+        }
+
+        let primary: Primary
+        let summaryFlags: SummaryFlags
+
+        /// Returns nil when the admission guard would attempt an incremental import.
+        static func diagnose(
+            reason: DerivedTranscriptRefreshReason,
+            hasPendingQuestion: Bool,
+            summary: PendingSourceItemsMutationSummary?
+        ) -> DerivedTranscriptIncrementalNoAttemptDiagnosis? {
+            let flags = summary.map(SummaryFlags.init) ?? []
+            let primary: Primary
+            if reason != .liveMutation {
+                primary = .reasonNotLive
+            } else if hasPendingQuestion {
+                primary = .pendingQuestion
+            } else if let summary {
+                guard !summary.allowsIncrementalFinalTurnRebuild else { return nil }
+                primary = .summaryRejected
+            } else {
+                primary = .missingSummary
+            }
+            return DerivedTranscriptIncrementalNoAttemptDiagnosis(primary: primary, summaryFlags: flags)
         }
     }
 
