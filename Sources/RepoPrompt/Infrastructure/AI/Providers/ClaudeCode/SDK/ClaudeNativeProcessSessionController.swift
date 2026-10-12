@@ -92,6 +92,9 @@ final actor ClaudeNativeProcessSessionController {
         case approvalCancelled(requestID: String)
         case turnCompleted(turnID: UUID, status: TurnStatus)
         case error(String)
+        /// In-band position marker requested by the consumer (`emitEventMarker`); carries no
+        /// provider output.
+        case marker(UUID)
     }
 
     // MARK: - Usage accounting ownership (plan §3.2)
@@ -517,6 +520,8 @@ final actor ClaudeNativeProcessSessionController {
 
     private var eventsContinuation: AsyncStream<Event>.Continuation?
     private var eventsStream: AsyncStream<Event>
+    /// Incremented whenever `eventsStream` is replaced.
+    private var eventsStreamGeneration: UInt64 = 0
     var events: AsyncStream<Event> {
         eventsStream
     }
@@ -718,6 +723,18 @@ final actor ClaudeNativeProcessSessionController {
         let stream = Self.makeEventsStream()
         eventsStream = stream.stream
         eventsContinuation = stream.continuation
+        eventsStreamGeneration &+= 1
+    }
+
+    func eventsSubscription() -> NativeAgentRuntimeEventsSubscription {
+        ensureEventsStreamReady()
+        return NativeAgentRuntimeEventsSubscription(events: eventsStream, generation: eventsStreamGeneration)
+    }
+
+    func emitEventMarker(_ id: UUID) -> UInt64? {
+        guard let eventsContinuation else { return nil }
+        eventsContinuation.yield(.marker(id))
+        return eventsStreamGeneration
     }
 
     /// Finish the old events stream and create a fresh one.  Call this when starting a new
@@ -729,6 +746,7 @@ final actor ClaudeNativeProcessSessionController {
         let stream = Self.makeEventsStream()
         eventsStream = stream.stream
         eventsContinuation = stream.continuation
+        eventsStreamGeneration &+= 1
     }
 
     func startOrResume(
@@ -3166,6 +3184,8 @@ final actor ClaudeNativeProcessSessionController {
         eventsContinuation = nil
     }
 
+    /// Unbounded buffering is required: consumers rely on every event, including `.marker`
+    /// run boundaries, being delivered in order without drops.
     private static func makeEventsStream() -> (stream: AsyncStream<Event>, continuation: AsyncStream<Event>.Continuation) {
         var capturedContinuation: AsyncStream<Event>.Continuation?
         let stream = AsyncStream<Event> { continuation in

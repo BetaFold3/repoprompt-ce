@@ -128,6 +128,35 @@ final class AttentionNotificationAdmissionTests: XCTestCase {
         XCTAssertEqual(events.first?.content, .turnCompleted(finalAssistantText: "Final answer, no successor"))
     }
 
+    /// Claude between-run output that landed below the run's user row (before the run's start
+    /// marker) is not part of that run's completion notification.
+    func testTurnCompletionTextExcludesBackgroundRowsBelowTheRunsUserRow() async throws {
+        let fixture = makeFixture()
+        let barrier = makeBarrier(fixture.vm)
+        let root = makeSession(fixture.vm)
+        root.session.selectedAgent = .claudeCode
+
+        let ownership = beginTurn(root.session, user: "go", assistant: nil)
+        await fixture.vm.test_handleBackgroundNativeStreamResult(
+            AIStreamResult(type: "content", text: "Old background output"), session: root.session
+        )
+        await fixture.vm.test_handleBackgroundNativeStreamResult(
+            AIStreamResult(type: "message_stop", text: ""), session: root.session
+        )
+        root.session.appendItem(.assistant("Run answer", sequenceIndex: root.session.nextSequenceIndex))
+        XCTAssertEqual(
+            root.session.items.filter { $0.kind == .assistant }.map(\.text),
+            ["Old background output", "Run answer"]
+        )
+        _ = await barrier.commit(completedRequest(root.session, ownership))
+
+        let key = AttentionNotificationEventKey.turnCompleted(sessionID: root.sessionID, attemptID: ownership.attemptID)
+        try await waitForRecord(fixture.admission, key) { $0 == .delivered(.sent) }
+        let events = await fixture.delivery.events
+        XCTAssertEqual(events.map(\.key), [key])
+        XCTAssertEqual(events.first?.content, .turnCompleted(finalAssistantText: "Run answer"))
+    }
+
     /// A selected follow-up refused before ownership leaves the completed turn settled idle, so its
     /// deferred notification is decided after the actual start returns: sent exactly once with that
     /// turn's text, or suppressed when enablement, configuration, or binding changed in the deferred

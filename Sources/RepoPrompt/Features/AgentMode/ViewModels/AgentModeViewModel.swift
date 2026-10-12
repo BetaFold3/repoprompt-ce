@@ -3129,6 +3129,12 @@ final class AgentModeViewModel: ObservableObject {
             },
             attentionCompletionProgress: { [weak self] session in
                 self?.attentionCompletionProgress(for: session)
+            },
+            handleBackgroundNativeStreamResult: { [weak self] result, sourceID, session in
+                await self?.handleBackgroundNativeStreamResult(result, sourceID: sourceID, session: session)
+            },
+            endBackgroundNativeMessage: { [weak self] sourceID, session in
+                self?.endBackgroundMessage(fromSource: sourceID, session: session)
             }
         )
         let toolTrackingHooks = makeToolTrackingHooks()
@@ -17983,6 +17989,14 @@ final class AgentModeViewModel: ObservableObject {
             await handleStreamResult(result, session: session, runID: runID, runAttemptID: runAttemptID)
         }
 
+        func test_handleBackgroundNativeStreamResult(
+            _ result: AIStreamResult,
+            sourceID: UUID? = nil,
+            session: TabSession
+        ) async {
+            await handleBackgroundNativeStreamResult(result, sourceID: sourceID, session: session)
+        }
+
         static func test_claudeReasoningStatusPreview(from rawBuffer: String) -> String? {
             claudeReasoningStatusPreview(from: rawBuffer)
         }
@@ -18008,21 +18022,87 @@ final class AgentModeViewModel: ObservableObject {
             )
             return
         }
+        await applyStreamResult(
+            result,
+            session: session,
+            delivery: .activeRun(runID: runID, runAttemptID: runAttemptID)
+        )
+    }
+
+    /// Applies native-runtime output that arrived while no run is consuming (for example a Claude
+    /// continuation after a background task finished). Transcript rows are appended and saved as
+    /// they arrive. Run state, running-status and reasoning-status text, and per-turn usage
+    /// finalization are untouched because no run owns them; a newer run may be active.
+    /// `sourceID` identifies the event stream (provider launch) that carried the result: a background
+    /// message is only ever continued by output from its own stream.
+    func handleBackgroundNativeStreamResult(_ result: AIStreamResult, sourceID: UUID?, session: TabSession) async {
+        await applyStreamResult(result, session: session, delivery: .background(sourceID: sourceID))
+    }
+
+    private enum StreamResultDelivery: Equatable {
+        case activeRun(runID: UUID, runAttemptID: UUID)
+        case background(sourceID: UUID?)
+    }
+
+    private func applyStreamResult(
+        _ result: AIStreamResult,
+        session: TabSession,
+        delivery: StreamResultDelivery
+    ) async {
         await MainActor.run {
-            guard session.runID == runID,
-                  session.activeRunAttemptID == runAttemptID else { return }
+            switch delivery {
+            case let .activeRun(runID, runAttemptID):
+                guard session.runID == runID,
+                      session.activeRunAttemptID == runAttemptID else { return }
+            case .background:
+                guard session.selectedAgent.usesClaudeNativeRuntime else { return }
+            }
+            let isBackground: Bool
+            let backgroundSourceID: UUID?
+            if case let .background(sourceID) = delivery {
+                isBackground = true
+                backgroundSourceID = sourceID
+            } else {
+                isBackground = false
+                backgroundSourceID = nil
+            }
+            if isBackground {
+                // Buffered text belongs to a run: materialize it first, so every row appended
+                // from here on is this background delivery's own.
+                flushPendingAssistantDelta(session)
+            }
+            let lastRowIDBeforeDelivery = session.items.last?.id
+            defer {
+                if isBackground {
+                    recordBackgroundRows(
+                        appendedAfter: lastRowIDBeforeDelivery, sourceID: backgroundSourceID, session: session
+                    )
+                }
+            }
             var shouldUpdateBindings = false
             switch result.type {
             case "content":
                 // Normal content text
                 guard let content = result.text, !content.isEmpty else { break }
-                shouldUpdateBindings = clearClaudeReasoningStatus(session) || shouldUpdateBindings
-                enqueueAssistantDelta(content, session: session)
+                if isBackground {
+                    // Applied at once to the background message's own row, never through the
+                    // shared buffer, so it cannot merge with a run's text.
+                    shouldUpdateBindings = applyBackgroundAssistantDelta(
+                        content,
+                        sourceID: backgroundSourceID,
+                        session: session
+                    ) || shouldUpdateBindings
+                } else {
+                    shouldUpdateBindings = clearClaudeReasoningStatus(session) || shouldUpdateBindings
+                    enqueueAssistantDelta(content, session: session)
+                }
 
             case "final_content":
                 // Final authoritative message content for the turn.
                 guard let content = result.text else { break }
-                shouldUpdateBindings = clearClaudeReasoningStatus(session) || shouldUpdateBindings
+                if !isBackground {
+                    shouldUpdateBindings = clearClaudeReasoningStatus(session) || shouldUpdateBindings
+                }
                 // Materialize any pending content delta first so we preserve ordering.
                 flushPendingAssistantDelta(session)
                 guard AgentDisplayableText.hasDisplayableBody(content) else { break }
@@ -18032,10 +18112,22 @@ final class AgentModeViewModel: ObservableObject {
                 // interleaved, which can prematurely finalize the streaming segment.
                 // Walk past system items but stop at tool calls, user messages, etc.
                 let tailAssistantIndex: Int? = {
-                    if let streamingAssistantIndex = self.resumableStreamingAssistantIndexAcrossTrailingUserInterjections(in: session) {
+                    if isBackground {
+                        // Between runs any other row is an earlier turn's answer: only this
+                        // background message's current row (streaming, or ended by an interleaved
+                        // system row or a run's terminal finalization) is replaced.
+                        return self.backgroundCurrentAssistantIndex(in: session, sourceID: backgroundSourceID)
+                    }
+                    if let streamingAssistantIndex = self.resumableStreamingAssistantIndexAcrossTrailingUserInterjections(
+                        in: session
+                    ) {
                         return streamingAssistantIndex
                     }
                     for i in session.items.indices.reversed() {
+                        // Between-run rows are never this run's answer nor its boundary.
+                        if session.backgroundRowIDs.contains(session.items[i].id) {
+                            continue
+                        }
                         switch session.items[i].kind {
                         case .assistant:
                             return i
@@ -18054,19 +18146,25 @@ final class AgentModeViewModel: ObservableObject {
                     updated.isStreaming = false
                     session.replaceItem(at: index, with: updated)
                     // Notification-only provenance for a replaced row that predates this attempt.
-                    session.recordAttentionFinalContentRewrite(
-                        attemptID: runAttemptID,
-                        rowID: updated.id,
-                        text: content
-                    )
+                    // Background output belongs to no attempt, so it records none.
+                    if case let .activeRun(_, runAttemptID) = delivery {
+                        session.recordAttentionFinalContentRewrite(
+                            attemptID: runAttemptID,
+                            rowID: updated.id,
+                            text: content
+                        )
+                    }
                 } else {
                     let assistantItem = AgentChatItem.assistant(content, sequenceIndex: session.nextSequenceIndex)
                     session.appendItem(assistantItem)
                 }
+                if isBackground {
+                    retireBackgroundCurrentAssistantRow(session, sourceID: backgroundSourceID)
+                }
                 shouldUpdateBindings = true
 
             case "reasoning":
-                guard ClaudeReasoningExtractionFeature.isEnabled else { break }
+                guard ClaudeReasoningExtractionFeature.isEnabled, !isBackground else { break }
                 // Claude provider-internal reasoning/thinking traces update only the
                 // transient running-status row. They are intentionally never added to
                 // the persisted chat transcript.
@@ -18086,7 +18184,7 @@ final class AgentModeViewModel: ObservableObject {
                 guard let toolName = result.toolName else { break }
                 let argsJSON = result.toolArgsJSON ?? result.toolArgs
                 flushPendingAssistantDelta(session)
-                endActiveAssistantSegment(session)
+                endAssistantSegment(session, background: isBackground, sourceID: backgroundSourceID)
                 endActiveReasoningSegment(session)
                 // Route provider-specific tool events through dedicated handlers.
                 if runService.handleProviderToolStreamEvent(result, session: session) {
@@ -18131,7 +18229,7 @@ final class AgentModeViewModel: ObservableObject {
                 let outputJSON = result.toolResultJSON ?? result.toolOutput ?? ""
                 let argsJSON = result.toolArgsJSON ?? result.toolArgs
                 flushPendingAssistantDelta(session)
-                endActiveAssistantSegment(session)
+                endAssistantSegment(session, background: isBackground, sourceID: backgroundSourceID)
                 endActiveReasoningSegment(session)
                 // Route provider-specific tool events through dedicated handlers.
                 if runService.handleProviderToolStreamEvent(result, session: session) {
@@ -18157,7 +18255,12 @@ final class AgentModeViewModel: ObservableObject {
                     updated.toolIsError = result.toolIsError
                     updated.text = outputJSON
                     session.replaceItem(at: index, with: updated)
-                } else if let index = session.items.lastIndex(where: { $0.kind == .toolCall && $0.toolName == toolName }) {
+                } else if let index = session.items.lastIndex(where: {
+                    // A name-only match stays within the same delivery's tool calls (for background
+                    // output, the same stream's).
+                    $0.kind == .toolCall && $0.toolName == toolName
+                        && session.isDeliveryRow($0.id, background: isBackground, sourceID: backgroundSourceID)
+                }) {
                     var updated = session.items[index]
                     updated.kind = .toolResult
                     updated.toolInvocationID = invocationID ?? updated.toolInvocationID
@@ -18189,7 +18292,7 @@ final class AgentModeViewModel: ObservableObject {
                 // Legacy tool usage event (e.g., "Using tool: read_file") - fallback for compatibility
                 if let eventText = result.text, eventText.hasPrefix("Using tool: ") {
                     flushPendingAssistantDelta(session)
-                    endActiveAssistantSegment(session)
+                    endAssistantSegment(session, background: isBackground, sourceID: backgroundSourceID)
                     endActiveReasoningSegment(session)
                     let toolName = String(eventText.dropFirst("Using tool: ".count))
                     if AgentToolTrackingSupport.shouldSuppressProviderToolEvent(toolName: toolName, invocationID: nil) {
@@ -18202,12 +18305,14 @@ final class AgentModeViewModel: ObservableObject {
                 }
 
             case "tool_progress":
+                guard !isBackground else { break }
                 if let progress = result.text?.trimmingCharacters(in: .whitespacesAndNewlines), !progress.isEmpty {
                     shouldUpdateBindings = setTransportRunningStatus(progress, session: session) || shouldUpdateBindings
                 }
 
             case "status":
                 nonCodexContextUsageEstimator(for: session.selectedAgent)?.ingestStatusSignal(result.text, session: session)
+                guard !isBackground else { break }
                 let statusText = session.selectedAgent.usesClaudeNativeRuntime
                     ? Self.claudeDisplayableStatusText(result.text)
                     : result.text?.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -18237,7 +18342,9 @@ final class AgentModeViewModel: ObservableObject {
 
             case "auth_status":
                 if let status = result.text?.trimmingCharacters(in: .whitespacesAndNewlines), !status.isEmpty {
-                    shouldUpdateBindings = setTransportRunningStatus(status, session: session, allowOverrideReasoning: true) || shouldUpdateBindings
+                    if !isBackground {
+                        shouldUpdateBindings = setTransportRunningStatus(status, session: session, allowOverrideReasoning: true) || shouldUpdateBindings
+                    }
                     let systemItem = AgentChatItem.system(status, sequenceIndex: session.nextSequenceIndex)
                     session.appendItem(systemItem)
                     shouldUpdateBindings = true
@@ -18245,6 +18352,7 @@ final class AgentModeViewModel: ObservableObject {
 
             case "session_state_changed":
                 // Claude Code lifecycle event — update run-state UI only, no transcript rows.
+                guard !isBackground else { break }
                 let state = result.text?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
                 switch state {
                 case "idle":
@@ -18266,6 +18374,7 @@ final class AgentModeViewModel: ObservableObject {
             case "task_progress":
                 // Claude Code task progress — update running status text, no transcript rows.
                 // Do not displace a visible Claude reasoning preview.
+                guard !isBackground else { break }
                 if let progressText = result.text?.trimmingCharacters(in: .whitespacesAndNewlines),
                    !progressText.isEmpty
                 {
@@ -18278,7 +18387,13 @@ final class AgentModeViewModel: ObservableObject {
                 if let text = result.text, !text.isEmpty {
                     nonCodexContextUsageEstimator(for: session.selectedAgent)?.ingestSystemSignal(text, session: session)
                     flushPendingAssistantDelta(session)
-                    endActiveAssistantSegment(session)
+                    // A system row interrupts a background message without ending it: its further
+                    // text and final content still go to its current row.
+                    let backgroundCurrentRowID = session.backgroundCurrentAssistantRowIDs[backgroundSourceID]
+                    endAssistantSegment(session, background: isBackground, sourceID: backgroundSourceID)
+                    if isBackground, let backgroundCurrentRowID {
+                        session.backgroundCurrentAssistantRowIDs[backgroundSourceID] = backgroundCurrentRowID
+                    }
                     // Filter out agent lifecycle messages that shouldn't appear in chat
                     let skipMessages = ["Agent initialized", "Agent completed", "Agent cancelled"]
                     guard !skipMessages.contains(text) else { break }
@@ -18292,22 +18407,27 @@ final class AgentModeViewModel: ObservableObject {
                 // finalization clears run state.
                 if let text = result.text, !text.isEmpty {
                     flushPendingAssistantDelta(session)
-                    endActiveAssistantSegment(session)
+                    endAssistantSegment(session, background: isBackground, sourceID: backgroundSourceID)
                     let errorItem = AgentChatItem.error(text, sequenceIndex: session.nextSequenceIndex)
                     session.appendItem(errorItem)
                     shouldUpdateBindings = true
                 }
 
             case "message_stop":
-                shouldUpdateBindings = clearClaudeReasoningStatus(session) || shouldUpdateBindings
-                shouldUpdateBindings = session.setRunningStatus(nil, source: nil) || shouldUpdateBindings
+                // Background output may arrive while a newer run shows its own status.
+                if !isBackground {
+                    shouldUpdateBindings = clearClaudeReasoningStatus(session) || shouldUpdateBindings
+                    shouldUpdateBindings = session.setRunningStatus(nil, source: nil) || shouldUpdateBindings
+                }
                 flushPendingAssistantDelta(session)
-                endActiveAssistantSegment(session)
+                endAssistantSegment(session, background: isBackground, sourceID: backgroundSourceID)
                 // Stream completed - assistant streaming segments already finalized above.
 
-                // Store provider session ID for resumption (native Claude or ACP runtimes).
+                // Store provider session ID for resumption (native Claude or ACP runtimes). Between
+                // runs only the tab's current event stream does: a replaced one may still drain.
                 if let sessionID = result.providerSessionID,
-                   session.selectedAgent.usesClaudeNativeRuntime || session.selectedAgent.acpProviderID != nil
+                   session.selectedAgent.usesClaudeNativeRuntime || session.selectedAgent.acpProviderID != nil,
+                   !isBackground || session.claudeAuthoritativeEventSourceID == backgroundSourceID
                 {
                     session.providerSessionID = sessionID
                     session.isDirty = true
@@ -18321,12 +18441,16 @@ final class AgentModeViewModel: ObservableObject {
                         modelContextWindow: result.modelContextWindow,
                         session: session
                     )
-                    finalizeNonCodexTurnUsageIfNeeded(
-                        for: session,
-                        promptTokens: result.promptTokens,
-                        completionTokens: result.completionTokens,
-                        contextUsedTokens: result.contextUsedTokens
-                    )
+                    // Between runs there is no user turn to finalize; a later run's own
+                    // accounting must not be closed by background output.
+                    if !isBackground {
+                        finalizeNonCodexTurnUsageIfNeeded(
+                            for: session,
+                            promptTokens: result.promptTokens,
+                            completionTokens: result.completionTokens,
+                            contextUsedTokens: result.contextUsedTokens
+                        )
+                    }
                 }
                 shouldUpdateBindings = true
 
@@ -18341,6 +18465,10 @@ final class AgentModeViewModel: ObservableObject {
 
             if shouldUpdateBindings {
                 requestUIRefresh(tabID: session.tabID)
+                if isBackground {
+                    // No terminal commit follows background output, so persist it now.
+                    scheduleSave(for: session.tabID)
+                }
             }
         }
     }
@@ -18466,17 +18594,98 @@ final class AgentModeViewModel: ObservableObject {
         }
     }
 
+    /// The run's streaming assistant row that further run text continues. Background (between-run)
+    /// rows of any kind are skipped: a run neither continues nor stops at them.
     private func resumableStreamingAssistantIndexAcrossTrailingUserInterjections(in session: TabSession) -> Int? {
         for index in session.items.indices.reversed() {
             let item = session.items[index]
-            if item.kind == .assistant, item.isStreaming {
-                return index
+            if session.backgroundRowIDs.contains(item.id) {
+                continue
+            }
+            if item.kind == .assistant {
+                return item.isStreaming ? index : nil
             }
             guard item.kind == .user else {
                 return nil
             }
         }
         return nil
+    }
+
+    /// `sourceID`'s stream's current background row, whether or not it is still streaming, when
+    /// only that stream's system rows, other streams' rows and a run's rows other than a user row
+    /// follow it. A newer prompt retires it: a message whose end never reached the background path
+    /// (the process exited, or its end belonged to the next run) is never continued by later output.
+    private func backgroundCurrentAssistantIndex(in session: TabSession, sourceID: UUID?) -> Int? {
+        guard let rowID = session.backgroundCurrentAssistantRowIDs[sourceID] else {
+            return nil
+        }
+        for index in session.items.indices.reversed() {
+            let item = session.items[index]
+            if item.kind == .user {
+                // Retired for good: a later transcript change that removes this prompt must not
+                // revive it.
+                session.backgroundCurrentAssistantRowIDs.removeValue(forKey: sourceID)
+                return nil
+            }
+            // A run's and another stream's rows are skipped; this stream's rows other than a system
+            // row end the search.
+            guard session.isBackgroundRow(item.id, from: sourceID) else { continue }
+            if item.id == rowID {
+                return index
+            }
+            guard item.kind == .system else { return nil }
+        }
+        return nil
+    }
+
+    /// Records the rows a background delivery appended after `anchorID` (the transcript's last row
+    /// before it applied; nil when the transcript was empty).
+    private func recordBackgroundRows(appendedAfter anchorID: UUID?, sourceID: UUID?, session: TabSession) {
+        var appendedIDs: [UUID] = []
+        var foundAnchor = anchorID == nil
+        for item in session.items.reversed() {
+            if item.id == anchorID {
+                foundAnchor = true
+                break
+            }
+            appendedIDs.append(item.id)
+        }
+        // Without the anchor (the transcript was replaced meanwhile) nothing is attributed.
+        guard foundAnchor else { return }
+        session.backgroundRowIDs.formUnion(appendedIDs)
+        if let sourceID {
+            for id in appendedIDs {
+                session.backgroundRowSourceIDs[id] = sourceID
+            }
+        }
+    }
+
+    /// Applies background (between-run) assistant text to that message's own row: its current row
+    /// from the same stream (also when an interleaved system row or a run's terminal finalization
+    /// ended its streaming), or a new background row.
+    private func applyBackgroundAssistantDelta(_ delta: String, sourceID: UUID?, session: TabSession) -> Bool {
+        // Buffered text belongs to a run; materialize it first so order and rows stay separate.
+        flushPendingAssistantDelta(session)
+        if let index = backgroundCurrentAssistantIndex(in: session, sourceID: sourceID) {
+            session.mutateItem(at: index) { item in
+                item.text += delta
+                item.isStreaming = true
+            }
+        } else {
+            guard AgentDisplayableText.hasDisplayableBody(delta) else { return false }
+            var assistantItem = AgentChatItem.assistant(delta, sequenceIndex: session.nextSequenceIndex)
+            assistantItem.isStreaming = true
+            session.appendItem(assistantItem)
+            session.backgroundCurrentAssistantRowIDs[sourceID] = assistantItem.id
+        }
+        session.assistantDeltaFlushGeneration &+= 1
+        requestAssistantPresentationRefresh(
+            session: session,
+            sourceItemsRevision: session.sourceItemsRevision,
+            flushGeneration: session.assistantDeltaFlushGeneration
+        )
+        return true
     }
 
     @discardableResult
@@ -18495,6 +18704,41 @@ final class AgentModeViewModel: ObservableObject {
         assistantItem.isStreaming = true
         session.appendItem(assistantItem)
         return true
+    }
+
+    /// Retires `sourceID`'s stream's current background row; other streams keep theirs.
+    private func retireBackgroundCurrentAssistantRow(_ session: TabSession, sourceID: UUID?) {
+        session.backgroundCurrentAssistantRowIDs.removeValue(forKey: sourceID)
+    }
+
+    /// A run took over `sourceID`'s stream: the background message it interrupted continues as the
+    /// run's output, so later between-run output of that stream starts a new message. Called in
+    /// stream order, after that stream's earlier between-run output was applied.
+    func endBackgroundMessage(fromSource sourceID: UUID, session: TabSession) {
+        guard session.backgroundCurrentAssistantRowIDs[sourceID] != nil else { return }
+        endAssistantSegment(session, background: true, sourceID: sourceID)
+    }
+
+    /// Ends the streaming segments of one delivery only: background output never ends a run's
+    /// segment, a run's output never ends a background message's, and one stream's background
+    /// output never ends another stream's. A background segment end also retires that stream's
+    /// current row.
+    private func endAssistantSegment(_ session: TabSession, background: Bool, sourceID: UUID? = nil) {
+        if background {
+            retireBackgroundCurrentAssistantRow(session, sourceID: sourceID)
+        }
+        // No shortcut for an empty set: a background segment end then ends nothing.
+        let backgroundRowIDs = session.backgroundRowIDs
+        let backgroundRowSourceIDs = session.backgroundRowSourceIDs
+        session.mutateItemsBatch(touchActivity: false) { items in
+            for index in items.indices where items[index].kind == .assistant && items[index].isStreaming {
+                let id = items[index].id
+                let isBackgroundRow = backgroundRowIDs.contains(id)
+                if isBackgroundRow == background, !isBackgroundRow || backgroundRowSourceIDs[id] == sourceID {
+                    items[index].isStreaming = false
+                }
+            }
+        }
     }
 
     func endActiveAssistantSegment(_ session: TabSession) {
@@ -19875,6 +20119,9 @@ final class AgentModeViewModel: ObservableObject {
         session.contextCompactedAt = nil
         session.activeReasoningItemID = nil
         session.reasoningItemIDsByGroupID.removeAll()
+        session.backgroundRowIDs.removeAll()
+        session.backgroundRowSourceIDs.removeAll()
+        session.backgroundCurrentAssistantRowIDs.removeAll()
         session.clearClaudeReasoningStatus(clearDisplayedStatus: true)
         session.setRunningStatus(nil, source: nil)
         session.codexReasoningSegmentsByKey.removeAll()

@@ -49,6 +49,14 @@ actor ClaudeCompatibleNativeSessionAdapter: NativeAgentRuntimeControlling {
         await controller.resetEventsStreamForNewRun()
     }
 
+    func eventsSubscription() async -> NativeAgentRuntimeEventsSubscription {
+        await controller.eventsSubscription()
+    }
+
+    func emitEventMarker(_ id: UUID) async -> UInt64? {
+        await controller.emitEventMarker(id)
+    }
+
     func startOrResume(
         existingSessionID: String?,
         model: String?,

@@ -1214,6 +1214,34 @@ extension AgentModeViewModel {
         var activeReasoningItemID: UUID?
         var reasoningItemIDsByGroupID: [String: UUID] = [:]
         var pendingAssistantDelta: String = ""
+        /// Rows of any kind appended by background (between-run) delivery. A run never resumes or
+        /// replaces them, even when they landed below its user row, and each delivery's lookups
+        /// skip the other's rows. Not persisted.
+        var backgroundRowIDs: Set<UUID> = []
+        /// The event stream (provider launch) each background row came from, for rows delivered
+        /// with a source. Background lookups of one stream skip another stream's rows.
+        var backgroundRowSourceIDs: [UUID: UUID] = [:]
+        /// Each stream's current background message row, keyed by source. Further text and
+        /// authoritative `final_content` from that stream go to it even after an interleaved system
+        /// row or a run's terminal finalization ended its streaming; that message's other segment
+        /// ends, a run taking over the stream, and a newer user row retire it.
+        var backgroundCurrentAssistantRowIDs: [UUID?: UUID] = [:]
+        /// The Claude event stream (the tab's current router) whose between-run output may update
+        /// session metadata. A replaced stream's output is still shown, but never overwrites the
+        /// newer launch's provider session ID.
+        var claudeAuthoritativeEventSourceID: UUID?
+
+        /// Whether `rowID` is a background row delivered from `sourceID`'s stream.
+        func isBackgroundRow(_ rowID: UUID, from sourceID: UUID?) -> Bool {
+            backgroundRowIDs.contains(rowID) && backgroundRowSourceIDs[rowID] == sourceID
+        }
+
+        /// Whether `rowID` belongs to a delivery: a run's rows are the non-background ones, and a
+        /// background delivery's are `sourceID`'s stream's background rows.
+        func isDeliveryRow(_ rowID: UUID, background: Bool, sourceID: UUID?) -> Bool {
+            background ? isBackgroundRow(rowID, from: sourceID) : !backgroundRowIDs.contains(rowID)
+        }
+
         var pendingCodexAssistantScope: CodexNativeSessionController.ItemScope?
         var codexAssistantRowIDByScope: [CodexNativeSessionController.ItemScope: UUID] = [:]
         var assistantDeltaFlushTask: Task<Void, Never>?
@@ -1223,6 +1251,8 @@ extension AgentModeViewModel {
         var terminalCommitInProgress: Bool = false
         var lastTerminalCommitRevision: AgentRunTerminalCommitRevision?
         var lastTerminalPublicationResult: AgentRunTerminalPublicationResult?
+        /// Commit whose queued follow-up instruction was already consumed (at most one per commit).
+        var terminalFollowUpTakenCommitID: UUID?
         var runAttemptTerminalResources: AgentRunAttemptTerminalResources?
         /// Handoff payload (injected into provider-facing text on first user send).
         /// Cleared only after the provider accepts the turn.

@@ -106,12 +106,14 @@ extension AgentModeViewModel {
     /// terminal assembler: the source suffix starting at the attempt's sequence floor, or at the
     /// earlier row its final content replaced (keeping the rows after it as separators). Nil when
     /// the attempt's provenance is missing (cleared by a transcript reset) or belongs to another
-    /// attempt.
+    /// attempt. Between-run (background) rows are never part of it, even when they landed after
+    /// the attempt's user row.
     private func attentionTurnCompletionText(for session: TabSession, attemptID: UUID) -> String? {
         guard let provenance = session.attentionTextProvenance, provenance.attemptID == attemptID else {
             return nil
         }
-        let ordered = session.items.sorted { lhs, rhs in
+        let backgroundRowIDs = session.backgroundRowIDs
+        let ordered = session.items.filter { !backgroundRowIDs.contains($0.id) }.sorted { lhs, rhs in
             if lhs.sequenceIndex == rhs.sequenceIndex {
                 return lhs.timestamp < rhs.timestamp
             }

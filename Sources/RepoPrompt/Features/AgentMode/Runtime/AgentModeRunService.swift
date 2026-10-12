@@ -171,6 +171,21 @@ final class AgentModeRunService {
         /// Attention notifications only: ACP steering handoff work progressed (a flush finished).
         /// Must not await or mutate run state.
         var attentionCompletionProgress: (_ session: AgentModeViewModel.TabSession) -> Void = { _ in }
+        /// Native-runtime output received while no run is consuming (for example a Claude
+        /// continuation after a background task finished). Appends transcript rows immediately,
+        /// without run-attempt ownership and without mutating run state. `sourceID` identifies the
+        /// event stream (one provider launch) that carried the result.
+        var handleBackgroundNativeStreamResult: (
+            _ result: AIStreamResult,
+            _ sourceID: UUID,
+            _ session: AgentModeViewModel.TabSession
+        ) async -> Void = { _, _, _ in }
+        /// A run took over the event stream `sourceID`: that stream's current background message
+        /// ends, so later between-run output of the stream starts a new message.
+        var endBackgroundNativeMessage: (
+            _ sourceID: UUID,
+            _ session: AgentModeViewModel.TabSession
+        ) -> Void = { _, _ in }
     }
 
     private let dependencies: Dependencies

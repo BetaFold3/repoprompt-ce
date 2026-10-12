@@ -19,6 +19,14 @@ protocol NativeAgentRuntimeControlling: Actor {
 
     func ensureEventsStreamReady() async
     func resetEventsStreamForNewRun() async
+    /// Ensures the events stream is live and returns it with its generation, read atomically.
+    /// The generation changes whenever the controller replaces its stream; `nil` means the
+    /// runtime does not track generations.
+    func eventsSubscription() async -> NativeAgentRuntimeEventsSubscription
+    /// Yields `.marker(id)` on the current events stream, in order with provider output, and
+    /// returns that stream's generation. Returns `nil` when no stream is live or the runtime does
+    /// not support markers.
+    func emitEventMarker(_ id: UUID) async -> UInt64?
     func startOrResume(
         existingSessionID: String?,
         model: String?,
@@ -43,6 +51,20 @@ extension NativeAgentRuntimeControlling {
     var usageAccountingEvents: AsyncStream<NativeUsageAccountingEvent> {
         AsyncStream { $0.finish() }
     }
+
+    func eventsSubscription() async -> NativeAgentRuntimeEventsSubscription {
+        await ensureEventsStreamReady()
+        return await NativeAgentRuntimeEventsSubscription(events: events, generation: nil)
+    }
+
+    func emitEventMarker(_: UUID) async -> UInt64? {
+        nil
+    }
+}
+
+struct NativeAgentRuntimeEventsSubscription {
+    let events: AsyncStream<NativeAgentRuntimeEvent>
+    let generation: UInt64?
 }
 
 // MARK: - Current Claude-compatible native runtime aliases

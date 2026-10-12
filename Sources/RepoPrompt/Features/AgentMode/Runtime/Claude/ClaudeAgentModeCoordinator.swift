@@ -291,14 +291,17 @@ final class ClaudeAgentModeCoordinator {
         }
     }
 
-    func events(for session: AgentModeViewModel.TabSession) async -> AsyncStream<NativeAgentRuntimeEvent>? {
+    /// The session's current controller together with its events stream and the stream's
+    /// generation, captured from the same controller so a caller can key long-lived consumption
+    /// on the controller's identity and the stream it reads.
+    func eventSubscription(
+        for session: AgentModeViewModel.TabSession
+    ) async -> (controller: any NativeAgentRuntimeControlling, subscription: NativeAgentRuntimeEventsSubscription)? {
         guard let controller = session.claudeController else { return nil }
-        // Ensure the stream has a live continuation before returning. This
-        // handles the case where the stream was finished by handleStdoutEOF
-        // or another path that called finishEventsStreamIfNeeded. Without
-        // this, the runner would immediately see "stream ended unexpectedly".
-        await controller.ensureEventsStreamReady()
-        return await controller.events
+        // The controller ensures the stream has a live continuation before returning. This
+        // handles the case where the stream was finished by handleStdoutEOF or another path
+        // that called finishEventsStreamIfNeeded.
+        return await (controller, controller.eventsSubscription())
     }
 
     func hasTurnInFlight(for session: AgentModeViewModel.TabSession) async -> Bool {
