@@ -189,7 +189,7 @@ Step D5 — done | rounds 1/2 | open: none | downgraded: none | assumed: focused
 
 ### D6 — Sidebar: one build per render pass
 
-Step D6 — todo | rounds 0/2 | open: none | downgraded: none | assumed: none | deferred: none
+Step D6 — done | rounds 0/2 | open: none | downgraded: none | assumed: share render-local rows only; observation parity verified per D6-final.md | deferred: live build counts/latency, parent-state invalidation measurements and optional API/test polish per D6-final.md
 
 Measured weight: about half the main-thread time of a 1 s new-session action, and part of the 1.4 s of non-refresh work after a session click.
 

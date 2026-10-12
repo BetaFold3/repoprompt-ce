@@ -135,6 +135,45 @@ extension AgentModeViewModel {
         searchText: String,
         diagnosticSource: String? = nil
     ) -> SidebarCollapseAllState {
+        sidebarCollapseAllState(
+            currentTabID: currentTabID,
+            searchText: searchText,
+            diagnosticSource: diagnosticSource
+        ) { source in
+            collapsibleSidebarThreadKeys(
+                for: tabs,
+                currentTabID: currentTabID,
+                searchText: searchText,
+                diagnosticSource: source
+            )
+        }
+    }
+
+    /// Row-based overload: evaluates collapse-all state from rows already built
+    /// by `filteredSidebarSessions(for:currentTabID:searchText:diagnosticSource:)`
+    /// with the same `currentTabID` and `searchText`, so one view body can share
+    /// a single filtered build between the top bar and the list.
+    func sidebarCollapseAllState(
+        filteredRows: [SidebarSession],
+        currentTabID: UUID?,
+        searchText: String,
+        diagnosticSource: String? = nil
+    ) -> SidebarCollapseAllState {
+        sidebarCollapseAllState(
+            currentTabID: currentTabID,
+            searchText: searchText,
+            diagnosticSource: diagnosticSource
+        ) { _ in
+            collapsibleSidebarThreadKeys(filteredRows: filteredRows)
+        }
+    }
+
+    private func sidebarCollapseAllState(
+        currentTabID: UUID?,
+        searchText: String,
+        diagnosticSource: String?,
+        collapsibleKeys: (String) -> [AgentSidebarThreadKey]
+    ) -> SidebarCollapseAllState {
         #if DEBUG
             let startMS = AgentModePerfDiagnostics.timestampMSIfEnabled()
         #endif
@@ -143,12 +182,7 @@ extension AgentModeViewModel {
         let keys: [AgentSidebarThreadKey]
         let state: SidebarCollapseAllState
         if trimmedSearch.isEmpty {
-            keys = collapsibleSidebarThreadKeys(
-                for: tabs,
-                currentTabID: currentTabID,
-                searchText: searchText,
-                diagnosticSource: source
-            )
+            keys = collapsibleKeys(source)
             if keys.isEmpty {
                 state = .hidden
             } else {

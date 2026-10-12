@@ -84,6 +84,23 @@ struct AgentModeSessionsSidebarView: View {
         #if DEBUG
             let _ = Self.recordBodyMetric()
         #endif
+        // Build the active filtered rows once per body and share them with the
+        // top-bar animation, the collapse-all button, and the list. The list
+        // observes the same sources (`sidebarUI`, `promptManager`, font scale),
+        // so any input that would invalidate it also re-evaluates this body.
+        let searchText = sidebarUI.snapshot.searchText
+        let filteredSessions = agentModeVM.filteredSidebarSessions(
+            for: promptManager.currentComposeTabs,
+            currentTabID: currentTabID,
+            searchText: searchText,
+            diagnosticSource: "sidebarBody"
+        )
+        let collapseAllState = agentModeVM.sidebarCollapseAllState(
+            filteredRows: filteredSessions,
+            currentTabID: currentTabID,
+            searchText: searchText,
+            diagnosticSource: "sidebarBody.collapseAllState"
+        )
         VStack(spacing: 0) {
             // Search box at top
             HStack(spacing: topBarSpacing) {
@@ -92,22 +109,18 @@ struct AgentModeSessionsSidebarView: View {
                 ScheduledMessagesSidebarButton(agentModeVM: agentModeVM, hitSize: collapseButtonHitSize) {
                     showingScheduledMessages = true
                 }
-                collapseAllThreadsButton
+                collapseAllThreadsButton(state: collapseAllState)
             }
             .padding(.horizontal, topBarHorizontalPadding)
             .padding(.vertical, topBarVerticalPadding)
-            .animation(.easeInOut(duration: 0.15), value: agentModeVM.sidebarCollapseAllState(
-                for: promptManager.currentComposeTabs,
-                currentTabID: currentTabID,
-                searchText: sidebarUI.snapshot.searchText,
-                diagnosticSource: "sidebarTopBar.animation"
-            ))
+            .animation(.easeInOut(duration: 0.15), value: collapseAllState)
 
             AgentModeSessionsListView(
                 agentModeVM: agentModeVM,
                 sidebarUI: sidebarUI,
                 promptManager: promptManager,
-                currentTabID: currentTabID
+                currentTabID: currentTabID,
+                filteredSessions: filteredSessions
             )
 
             // Always-visible workspace roots section at bottom
@@ -162,15 +175,7 @@ struct AgentModeSessionsSidebarView: View {
     }
 
     @ViewBuilder
-    private var collapseAllThreadsButton: some View {
-        let tabs = promptManager.currentComposeTabs
-        let search = sidebarUI.snapshot.searchText
-        let state = agentModeVM.sidebarCollapseAllState(
-            for: tabs,
-            currentTabID: currentTabID,
-            searchText: search,
-            diagnosticSource: "collapseAllButton.body"
-        )
+    private func collapseAllThreadsButton(state: AgentModeViewModel.SidebarCollapseAllState) -> some View {
         if state != .hidden {
             let tooltip = state == .canCollapse ? "Collapse all sub-agent threads" : "Expand all sub-agent threads"
             Button {
@@ -179,6 +184,8 @@ struct AgentModeSessionsSidebarView: View {
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) {
                     isCollapseAllThreadsButtonFlashing = false
                 }
+                // Re-read tabs and search at click time; the body-time rows may be stale.
+                let tabs = promptManager.currentComposeTabs
                 withAnimation(.easeInOut(duration: 0.15)) {
                     switch agentModeVM.sidebarCollapseAllState(
                         for: tabs,
@@ -276,6 +283,8 @@ struct AgentModeSessionsListView: View {
     @ObservedObject var sidebarUI: AgentSessionSidebarUIStore
     @ObservedObject var promptManager: PromptViewModel
     let currentTabID: UUID?
+    /// Active filtered rows built once by the parent sidebar body.
+    let filteredSessions: [AgentModeViewModel.SidebarSession]
     @State private var archivedSessionsExpanded = false
     @State private var showingClearArchivedConfirmation = false
     @ObservedObject private var fontScale = FontScaleManager.shared
@@ -338,12 +347,6 @@ struct AgentModeSessionsListView: View {
             let snapshotStartMS = AgentModePerfDiagnostics.timestampMSIfEnabled()
         #endif
         let sidebarSnapshot = sidebarUI.snapshot
-        let filteredSessions = agentModeVM.filteredSidebarSessions(
-            for: promptManager.currentComposeTabs,
-            currentTabID: currentTabID,
-            searchText: sidebarSnapshot.searchText,
-            diagnosticSource: "listSnapshot"
-        )
         let effectiveVisibleSessionCount = agentModeVM.effectiveSidebarVisibleSessionCount(
             filteredSessions: filteredSessions,
             currentTabID: currentTabID,
