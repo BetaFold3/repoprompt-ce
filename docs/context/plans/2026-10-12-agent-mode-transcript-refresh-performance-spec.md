@@ -201,7 +201,7 @@ Measured weight: about half the main-thread time of a 1 s new-session action, an
 
 ### D7 — Throttle background-tab derivation, with flush points (owner-approved 2026-10-12, gated on D1, D2, and the consumer audit)
 
-Step D7 — todo | rounds 0/2 | open: none | downgraded: none | assumed: none | deferred: none
+Step D7 — blocked | rounds 0/2 | open: D2 evidence gate and activation measurement unavailable; D7-consumer-audit.md | downgraded: none | assumed: keep existing scheduler until rebuilt-app evidence; remaining-gates.md | deferred: conditional throttle implementation and live no-regression validation
 
 Design:
 - Add a trailing delay of about 1.5 s for sessions that cannot publish active bindings. Use the existing generation and cancel logic.
@@ -228,7 +228,7 @@ Decision: approved by the owner after the audit, with this order: D0 → D1 → 
 
 ### D8 — Off-main derivation (conditional)
 
-Step D8 — todo | rounds 0/2 | open: none | downgraded: none | assumed: none | deferred: none
+Step D8 — blocked | rounds 0/2 | open: conditional trigger unmeasured after D0–D7; remaining-gates.md | downgraded: none | assumed: do not add off-main scheduler without measured need | deferred: optimized active-tab p95 and streaming-hitch qualification
 
 Pursue this only if, after D0–D7, the active-tab incremental refresh p95 is above 50 ms in an optimized build or streaming hitches miss their target.
 
