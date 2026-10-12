@@ -145,7 +145,7 @@ Use a non-structural mutation with an exact range for segment end. Either add a 
 
 ### D2 — Remove the causes of the 26 rejections (scope set by D0 data)
 
-Step D2 — todo | rounds 0/2 | open: none | downgraded: none | assumed: none | deferred: none
+Step D2 — blocked | rounds 0/2 | open: historical rejection causes unproven; D2-scout.md | downgraded: none | assumed: preserve all importer guards; independent D3–D6 may proceed | deferred: installed D0/live capture or deterministic reproduction to set fix scope
 
 - Give unranged mutations real ranges.
 - If background rows in earlier turns cause the rejections, check whether they affect the final turn's projection before excluding them.
