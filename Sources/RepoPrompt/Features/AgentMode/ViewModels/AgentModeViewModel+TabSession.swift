@@ -54,7 +54,30 @@ extension AgentModeViewModel {
             }
         }
 
-        var transcript: AgentTranscript = .empty
+        var transcript: AgentTranscript = .empty {
+            didSet {
+                guard rawInputSanitizeEvidence != nil,
+                      !Self.transcriptActivitiesMatch(oldValue, transcript)
+                else {
+                    return
+                }
+                rawInputSanitizeEvidence = nil
+            }
+        }
+
+        /// When non-nil, the exact pre-sanitize input and per-activity processing flags of the
+        /// build whose sanitized activities are installed in `transcript`. It makes no claim about
+        /// current source items or maps. Any write that changes `transcript`'s activities or
+        /// structure drops it. Retention that changes source items keeps it while a run is active
+        /// (the next build reuses its unchanged activities) and drops it otherwise, so an idle
+        /// session does not pin pre-retention raw payloads; the next full import re-seeds it.
+        /// Session-local, never persisted.
+        var rawInputSanitizeEvidence: AgentSanitizeRawInputEvidence?
+        #if DEBUG
+            /// Test seam: derive this session's transcript without incremental import or any
+            /// sanitize/projection reuse, keeping its durable compacted history.
+            var test_forcesColdDerivedTranscriptBuild = false
+        #endif
         var baseTranscriptProjection: AgentTranscriptProjection = .empty
         var fullTranscriptProjection: AgentTranscriptProjection = .empty
         var workingTranscriptProjection: AgentTranscriptProjection = .empty
@@ -2337,7 +2360,27 @@ extension AgentModeViewModel {
             case testOverride
         }
 
+        /// Same turn/span structure and identical activities. Span metadata (for example a
+        /// retained process `runID`) may differ: raw-input evidence only covers activities.
+        private static func transcriptActivitiesMatch(_ lhs: AgentTranscript, _ rhs: AgentTranscript) -> Bool {
+            guard lhs.turns.count == rhs.turns.count else { return false }
+            for (lhsTurn, rhsTurn) in zip(lhs.turns, rhs.turns) {
+                guard lhsTurn.id == rhsTurn.id,
+                      lhsTurn.responseSpans.count == rhsTurn.responseSpans.count
+                else {
+                    return false
+                }
+                for (lhsSpan, rhsSpan) in zip(lhsTurn.responseSpans, rhsTurn.responseSpans) {
+                    guard lhsSpan.id == rhsSpan.id, lhsSpan.activities == rhsSpan.activities else { return false }
+                }
+            }
+            return true
+        }
+
         func setItemsSilently(_ items: [AgentChatItem], reason: SilentItemReplacementReason) {
+            if !runState.isActive, reason == .retentionCompaction, rawInputSanitizeEvidence != nil, self.items != items {
+                dropRawInputSanitizeEvidenceAfterIdleRetention()
+            }
             #if DEBUG
                 if AgentTranscriptDebugInstrumentation.isEnabled {
                     AgentTranscriptDebugInstrumentation.sessionItemsReplacementHandler?(.init(
@@ -2388,11 +2431,19 @@ extension AgentModeViewModel {
             )
             sourceItemsRevision &+= 1
             derivedTranscriptSyncState = nil
+            dropRawInputSanitizeEvidenceAfterIdleRetention()
             #if DEBUG
                 test_incrementalRetentionCompactionCount += 1
             #endif
             assertSourceItemDerivedStateIsConsistent()
             return true
+        }
+
+        /// Retention changed source items: outside an active run, nothing refreshes soon enough
+        /// for the evidence's pre-retention raw payloads to pay for their memory.
+        private func dropRawInputSanitizeEvidenceAfterIdleRetention() {
+            guard !runState.isActive else { return }
+            rawInputSanitizeEvidence = nil
         }
 
         /// Compact any summary-only tool-result items in place and align
@@ -2457,6 +2508,7 @@ extension AgentModeViewModel {
                 }
             }
             if itemsDidMutate {
+                dropRawInputSanitizeEvidenceAfterIdleRetention()
                 sourceItemsRevision &+= 1
                 derivedTranscriptSyncState = nil
                 suppressSourceItemsChanged = true
@@ -2471,6 +2523,7 @@ extension AgentModeViewModel {
         }
 
         func clearDerivedTranscriptCaches() {
+            rawInputSanitizeEvidence = nil
             transcript = .empty
             baseTranscriptProjection = .empty
             fullTranscriptProjection = .empty

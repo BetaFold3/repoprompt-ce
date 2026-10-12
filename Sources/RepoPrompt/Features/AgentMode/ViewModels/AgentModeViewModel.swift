@@ -11168,9 +11168,15 @@ final class AgentModeViewModel: ObservableObject {
             EditFlowPerf.Stage.Transcript.importTranscript,
             EditFlowPerf.Dimensions(status: reason.rawValue, sourceItemCount: workingItemsSnapshot.count)
         )
+        #if DEBUG
+            let forcesColdDerivation = session.test_forcesColdDerivedTranscriptBuild
+        #else
+            let forcesColdDerivation = false
+        #endif
         let importedTranscript: AgentTranscript
         var trustedIncrementalFinalTurnStartSequenceIndex: Int?
         if reason == .liveMutation,
+           !forcesColdDerivation,
            session.pendingAskUser == nil,
            let mutationSummary = pendingMutationSummary,
            mutationSummary.allowsIncrementalFinalTurnRebuild
@@ -11362,9 +11368,10 @@ final class AgentModeViewModel: ObservableObject {
             precomputedEphemeralPayloadRevisionByItemID: session.ephemeralToolResultPayloadRevisionByItemID,
             selectedAgent: session.selectedAgent,
             previousPerformanceSnapshot: previousPerformanceSnapshotForBuild,
-            previousSanitizedTranscript: existingTranscript,
-            previousBaseProjection: session.baseTranscriptProjection,
-            previousTurnProjectionCaches: session.turnProjectionCaches,
+            previousSanitizedTranscript: forcesColdDerivation ? nil : existingTranscript,
+            previousRawInputEvidence: forcesColdDerivation ? nil : session.rawInputSanitizeEvidence,
+            previousBaseProjection: forcesColdDerivation ? nil : session.baseTranscriptProjection,
+            previousTurnProjectionCaches: forcesColdDerivation ? [:] : session.turnProjectionCaches,
             previousProjectionProtection: session.transcriptProjectionProtection,
             projectionProtection: projectionProtection,
             isCompressedHistoryRevealed: session.isCompressedHistoryRevealed,
@@ -11794,7 +11801,8 @@ final class AgentModeViewModel: ObservableObject {
             analyticsSnapshot: session.transcriptAnalyticsSnapshot,
             sanitizedActivityCount: 0,
             performanceSnapshot: session.transcriptPerformanceSnapshot,
-            rawToolResultPayloadRenderRevisionByItemID: session.rawToolResultPayloadRenderRevisionByItemID
+            rawToolResultPayloadRenderRevisionByItemID: session.rawToolResultPayloadRenderRevisionByItemID,
+            rawInputSanitizeEvidence: session.rawInputSanitizeEvidence
         )
     }
 
@@ -11880,6 +11888,7 @@ final class AgentModeViewModel: ObservableObject {
         selectedAgent: AgentProviderKind,
         previousPerformanceSnapshot: AgentTranscriptPerformanceSnapshot,
         previousSanitizedTranscript: AgentTranscript? = nil,
+        previousRawInputEvidence: AgentSanitizeRawInputEvidence? = nil,
         previousBaseProjection: AgentTranscriptProjection? = nil,
         previousTurnProjectionCaches: [UUID: AgentTranscriptTurnProjectionCache] = [:],
         previousProjectionProtection: AgentTranscriptProjectionProtection = .none,
@@ -11957,20 +11966,31 @@ final class AgentModeViewModel: ObservableObject {
                 finalTurnItemCount: transcriptDiagnosticFinalTurnItemCount(sourceItems)
             )
         )
-        let sanitizeReusableTurnCount = commonEqualTurnPrefixCount(
-            in: transcript,
-            previousTranscript: previousSanitizedTranscript
-        )
+        // Raw-input activity comparison needs the previous build's exact raw input, processing
+        // flags, and output; with that evidence it replaces the turn-prefix and trusted-suffix
+        // hints. Without it, a live mutation keeps the legacy prefix and trusted-suffix hints,
+        // while a full import takes one recording pass (no prefix hint) so evidence is re-seeded.
+        let usesRawInputActivityReuse = previousRawInputEvidence != nil && previousSanitizedTranscript != nil
+        let seedsRawInputEvidence = !usesRawInputActivityReuse && trustedIncrementalFinalTurnStartSequenceIndex == nil
+        let sanitizeReusableTurnCount = usesRawInputActivityReuse || seedsRawInputEvidence
+            ? 0
+            : commonEqualTurnPrefixCount(
+                in: transcript,
+                previousTranscript: previousSanitizedTranscript
+            )
         #if DEBUG || EDIT_FLOW_PERF
-            if sanitizeReusableTurnCount > 0 {
+            if sanitizeReusableTurnCount > 0 || usesRawInputActivityReuse {
                 performanceSnapshot.sanitizeReuseAttemptCount += 1
             }
         #endif
         let sanitizeMetrics = AgentToolResultPersistencePolicy.sanitizeTranscriptWithMetrics(
             transcript,
             previousSanitizedTranscript: previousSanitizedTranscript,
-            reusablePrefixTurnCount: sanitizeReusableTurnCount > 0 ? sanitizeReusableTurnCount : nil,
-            trustedIncrementalFinalTurnStartSequenceIndex: trustedIncrementalFinalTurnStartSequenceIndex,
+            previousRawInputEvidence: usesRawInputActivityReuse ? previousRawInputEvidence : nil,
+            reusablePrefixTurnCount: seedsRawInputEvidence ? 0 : (sanitizeReusableTurnCount > 0 ? sanitizeReusableTurnCount : nil),
+            trustedIncrementalFinalTurnStartSequenceIndex: usesRawInputActivityReuse
+                ? nil
+                : trustedIncrementalFinalTurnStartSequenceIndex,
             context: processingContext,
             purpose: .runtimePresentation
         )
@@ -11979,7 +11999,17 @@ final class AgentModeViewModel: ObservableObject {
             reusablePrefixTurnCount: sanitizeMetrics.reusedTurnCount
         )
         #if DEBUG || EDIT_FLOW_PERF
-            if sanitizeReusableTurnCount > 0 {
+            performanceSnapshot.lastSanitizeReusedActivityCount = usesRawInputActivityReuse
+                ? sanitizeMetrics.reusedActivityCount
+                : nil
+            if usesRawInputActivityReuse {
+                if sanitizeMetrics.reusedActivityCount > 0 {
+                    performanceSnapshot.sanitizeReuseSuccessCount += 1
+                } else {
+                    performanceSnapshot.sanitizeReuseFallbackCount += 1
+                }
+                performanceSnapshot.lastSanitizeReusedTurnCount = sanitizeMetrics.reusedTurnCount
+            } else if sanitizeReusableTurnCount > 0 {
                 if sanitizeMetrics.reusedTurnCount > 0 {
                     performanceSnapshot.sanitizeReuseSuccessCount += 1
                 } else {
@@ -11995,7 +12025,9 @@ final class AgentModeViewModel: ObservableObject {
             EditFlowPerf.Stage.Transcript.sanitize,
             sanitizeSignpost,
             EditFlowPerf.Dimensions(
-                outcome: sanitizeMetrics.reusedTurnCount > 0 ? "reused_prefix" : "rebuilt",
+                outcome: sanitizeMetrics.reusedActivityCount > 0
+                    ? "reused_activities"
+                    : (sanitizeMetrics.reusedTurnCount > 0 ? "reused_prefix" : "rebuilt"),
                 sourceItemCount: sourceItems.count,
                 sanitizedActivityCount: sanitizeMetrics.sanitizedActivityCount,
                 tabTag: diagnosticTabTag,
@@ -12205,7 +12237,12 @@ final class AgentModeViewModel: ObservableObject {
             ),
             sanitizedActivityCount: sanitizeMetrics.sanitizedActivityCount,
             performanceSnapshot: performanceSnapshot,
-            rawToolResultPayloadRenderRevisionByItemID: rawToolResultPayloadRenderRevisionByItemID
+            rawToolResultPayloadRenderRevisionByItemID: rawToolResultPayloadRenderRevisionByItemID,
+            // Only builds that processed (or replayed from evidence) every activity record flags;
+            // prefix or trusted-suffix reuse installs activities unchecked and never seeds evidence.
+            rawInputSanitizeEvidence: sanitizeMetrics.activityProcessingFlags.map {
+                AgentSanitizeRawInputEvidence(importedTranscript: transcript, activityProcessingFlags: $0)
+            }
         )
     }
 
@@ -12331,6 +12368,7 @@ final class AgentModeViewModel: ObservableObject {
             session.compactSummaryOnlyToolResultsAndAlignEphemeralPayloadMap()
             return
         }
+        session.rawInputSanitizeEvidence = nil
         session.transcript = presentation.transcript
         session.baseTranscriptProjection = presentation.baseProjection
         session.fullTranscriptProjection = presentation.fullProjection
@@ -12352,6 +12390,7 @@ final class AgentModeViewModel: ObservableObject {
             for: session,
             projectionProtection: presentation.projectionProtection
         )
+        session.rawInputSanitizeEvidence = presentation.rawInputSanitizeEvidence
         Self.logCodexDebug(
             "[AgentModeVM][TranscriptOrder] applyStructured tab=\(session.tabID) turns=\(presentation.transcript.turns.count) workingRowTail=\(Self.transcriptRowDebugWindow(presentation.workingProjection.workingRows)) workingBlockTail=\(Self.transcriptBlockDebugWindow(presentation.workingProjection.workingBlocks))"
         )
@@ -12382,6 +12421,7 @@ final class AgentModeViewModel: ObservableObject {
             selectedAgent: session.selectedAgent,
             previousPerformanceSnapshot: session.transcriptPerformanceSnapshot,
             previousSanitizedTranscript: session.transcript,
+            previousRawInputEvidence: session.rawInputSanitizeEvidence,
             previousBaseProjection: session.baseTranscriptProjection,
             previousTurnProjectionCaches: session.turnProjectionCaches,
             previousProjectionProtection: session.transcriptProjectionProtection,

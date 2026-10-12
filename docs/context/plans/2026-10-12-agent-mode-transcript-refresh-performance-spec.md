@@ -169,7 +169,7 @@ Step D3 — done | rounds 0/2 | open: none | downgraded: none | assumed: build-l
 
 ### D4 — Sanitize reuse after a full import
 
-Step D4 — todo | rounds 0/2 | open: none | downgraded: none | assumed: bounded raw-input equality reuse design/scout ready (D4-design.md) | deferred: none
+Step D4 — done | rounds 1/2 | open: none | downgraded: none | assumed: raw-input/output/processing-flag evidence replaces unsafe trusted-prefix proposal; D4-design.md | deferred: matched live latency/RSS and helper duplication per D4-final.md
 
 - Store the pre-sanitize import from the last refresh (`lastImportedTranscript`) next to `session.transcript`, and drop it on dehydrate.
 - Diff the new import against it, not against the sanitized transcript. Derive the reusable turn prefix and the first changed activity sequence index from that diff, and pass them through the existing `trustedReusablePrefixTurnCount` and `trustedIncrementalFinalTurnStartSequenceIndex` parameters.

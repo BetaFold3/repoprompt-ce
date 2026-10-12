@@ -41,6 +41,9 @@ enum AgentSanitizeIncrementalPathReason: String, Equatable {
     /// The activity immediately before the changed suffix differs from the previous span.
     case prefixBoundaryMismatch
     case changedSuffixNotFound
+    /// The raw-input activity comparison path produced the result: every activity was either
+    /// processed normally or reused from the previous output after full raw-input equality.
+    case rawInputActivityComparison
 }
 
 struct AgentSanitizedTranscriptMetrics: Equatable {
@@ -48,6 +51,24 @@ struct AgentSanitizedTranscriptMetrics: Equatable {
     let sanitizedActivityCount: Int
     let reusedTurnCount: Int
     let incrementalPathReason: AgentSanitizeIncrementalPathReason
+    /// Activities installed from the previous output instead of being processed (raw-input
+    /// comparison path only), whatever their replayed flag. Work-count evidence; never drives
+    /// retention.
+    var reusedActivityCount: Int = 0
+    /// For each turn → span → activity of the input, the Boolean that runtime processing
+    /// returned (or replayed) for it. Nil when any activity was installed without being processed
+    /// or replayed from evidence (prefix or suffix reuse), processing was skipped for tool-kind
+    /// activities, rows were explicitly preserved, or the purpose was persistent storage.
+    var activityProcessingFlags: [[[Bool]]]?
+}
+
+/// Session-local D4 evidence for one applied runtime build: its exact pre-sanitize input and,
+/// aligned with that input's turn → span → activity traversal, the Boolean that runtime
+/// processing (tool-identity normalization || runtime sanitization, no preserved rows) returned.
+/// Paired with the build's sanitized output, which the session holds as its transcript.
+struct AgentSanitizeRawInputEvidence: Equatable {
+    let importedTranscript: AgentTranscript
+    let activityProcessingFlags: [[[Bool]]]
 }
 
 struct AgentPersistedToolResultSummary: Equatable {
@@ -93,6 +114,13 @@ enum AgentToolResultPersistencePolicy {
         return updated
     }
 
+    /// Pure in `item` and `toolExecution`. `context` only memoizes content-keyed work (JSON
+    /// objects, bash metadata) and records metrics, except that a nil `toolExecution` is resolved
+    /// through `AgentTranscriptToolNormalizer.toolExecution(for:context:)`, which reads and
+    /// writes the context's per-ID execution state for `item.id` alone. No other item, payload
+    /// map, revision, setting, or session state is read. Runtime raw-input reuse
+    /// (`RawInputReuseCandidates`) relies on this: with an embedded execution, equal inputs
+    /// produce equal results.
     static func sanitizedToolResult(
         for item: AgentChatItem,
         toolExecution: AgentTranscriptToolExecution? = nil,
@@ -723,9 +751,14 @@ enum AgentToolResultPersistencePolicy {
         )
     }
 
+    /// `previousRawInputEvidence` describes the build whose sanitized output is
+    /// `previousSanitizedTranscript`. When both are supplied for runtime presentation with no
+    /// preserved visible rows, the raw-input activity comparison path runs and the prefix and
+    /// trusted-suffix hints are ignored.
     static func sanitizeTranscriptWithMetrics(
         _ transcript: AgentTranscript,
         previousSanitizedTranscript: AgentTranscript? = nil,
+        previousRawInputEvidence: AgentSanitizeRawInputEvidence? = nil,
         reusablePrefixTurnCount: Int? = nil,
         trustedReusablePrefixTurnCount: Int? = nil,
         trustedIncrementalFinalTurnStartSequenceIndex: Int? = nil,
@@ -733,6 +766,21 @@ enum AgentToolResultPersistencePolicy {
         context: AgentToolResultProcessingContext? = nil,
         purpose: AgentToolResultSanitizationPurpose = .runtimePresentation
     ) -> AgentSanitizedTranscriptMetrics {
+        if purpose == .runtimePresentation,
+           (preservedVisibleToolResultRowIDs ?? []).isEmpty,
+           let previousRawInputEvidence,
+           let previousSanitizedTranscript
+        {
+            return sanitizeRecordingProcessingFlags(
+                transcript,
+                reuseSource: RawInputReuseSource(
+                    evidence: previousRawInputEvidence,
+                    sanitizedTranscript: previousSanitizedTranscript
+                ),
+                context: context,
+                incrementalPathReason: .rawInputActivityComparison
+            )
+        }
         let reusedTurnCount: Int = switch purpose {
         case .runtimePresentation:
             validatedReusablePrefixTurnCount(
@@ -786,6 +834,16 @@ enum AgentToolResultPersistencePolicy {
         } else {
             incrementalPathReason = .trustedSuffixUnavailable
         }
+        if reusedTurnCount == 0, (preservedVisibleToolResultRowIDs ?? []).isEmpty, purpose == .runtimePresentation {
+            // Every activity is processed (or processing is skipped wholesale) exactly as by the
+            // loop below, additionally recording each processing result.
+            return sanitizeRecordingProcessingFlags(
+                transcript,
+                reuseSource: nil,
+                context: context,
+                incrementalPathReason: incrementalPathReason
+            )
+        }
         let containsSanitizableActivities: Bool = switch purpose {
         case .runtimePresentation:
             containsToolResultActivities(in: transcript)
@@ -831,6 +889,231 @@ enum AgentToolResultPersistencePolicy {
             reusedTurnCount: reusedTurnCount,
             incrementalPathReason: incrementalPathReason
         )
+    }
+
+    private struct RawInputReuseSource {
+        let evidence: AgentSanitizeRawInputEvidence
+        let sanitizedTranscript: AgentTranscript
+
+        func sanitizedTurn(at turnIndex: Int, id turnID: UUID) -> AgentTranscriptTurn? {
+            guard sanitizedTranscript.turns.indices.contains(turnIndex),
+                  sanitizedTranscript.turns[turnIndex].id == turnID
+            else {
+                return nil
+            }
+            return sanitizedTranscript.turns[turnIndex]
+        }
+
+        /// Previous raw activities, outputs, and processing flags for the span at the same
+        /// turn/span position, when every identity and length aligns.
+        func candidates(turnIndex: Int, turnID: UUID, spanIndex: Int, spanID: UUID) -> RawInputReuseCandidates? {
+            let rawTurns = evidence.importedTranscript.turns
+            let flagTurns = evidence.activityProcessingFlags
+            let sanitizedTurns = sanitizedTranscript.turns
+            guard rawTurns.indices.contains(turnIndex),
+                  sanitizedTurns.indices.contains(turnIndex),
+                  flagTurns.indices.contains(turnIndex)
+            else {
+                return nil
+            }
+            let rawTurn = rawTurns[turnIndex]
+            let sanitizedTurn = sanitizedTurns[turnIndex]
+            let flagSpans = flagTurns[turnIndex]
+            guard rawTurn.id == turnID,
+                  sanitizedTurn.id == turnID,
+                  rawTurn.responseSpans.count == flagSpans.count,
+                  rawTurn.responseSpans.indices.contains(spanIndex),
+                  sanitizedTurn.responseSpans.indices.contains(spanIndex)
+            else {
+                return nil
+            }
+            let rawSpan = rawTurn.responseSpans[spanIndex]
+            let sanitizedSpan = sanitizedTurn.responseSpans[spanIndex]
+            let flags = flagSpans[spanIndex]
+            guard rawSpan.id == spanID,
+                  sanitizedSpan.id == spanID,
+                  rawSpan.activities.count == sanitizedSpan.activities.count,
+                  rawSpan.activities.count == flags.count
+            else {
+                return nil
+            }
+            return RawInputReuseCandidates(
+                previousRawActivities: rawSpan.activities,
+                previousSanitizedActivities: sanitizedSpan.activities,
+                previousProcessingFlags: flags
+            )
+        }
+    }
+
+    /// Runtime sanitize (no preserved rows) that records, for every activity, the Boolean that
+    /// processing returned. With a reuse source, an activity whose raw input fully equals the
+    /// previous raw input at the same turn/span/activity position (identities aligned across
+    /// previous input, output, and flags) installs the previous output and replays its recorded
+    /// flag and context registration instead of being processed, so mutation counts,
+    /// grouped-history cache invalidation, and context state match processing it. Turn and span
+    /// metadata always come from the current input.
+    private static func sanitizeRecordingProcessingFlags(
+        _ transcript: AgentTranscript,
+        reuseSource: RawInputReuseSource?,
+        context: AgentToolResultProcessingContext?,
+        incrementalPathReason: AgentSanitizeIncrementalPathReason
+    ) -> AgentSanitizedTranscriptMetrics {
+        guard containsToolResultActivities(in: transcript) else {
+            // Processing is skipped wholesale. With no tool-kind activity at all, processing each
+            // activity would also report false, so all-false flags are exact. Tool calls without
+            // results are left unprocessed here but would be normalized later; record nothing.
+            return AgentSanitizedTranscriptMetrics(
+                transcript: transcript,
+                sanitizedActivityCount: 0,
+                reusedTurnCount: 0,
+                incrementalPathReason: incrementalPathReason,
+                activityProcessingFlags: containsToolKindActivities(in: transcript)
+                    ? nil
+                    : transcript.turns.map { $0.responseSpans.map { Array(repeating: false, count: $0.activities.count) } }
+            )
+        }
+        var sanitizedTranscript = transcript
+        var sanitizedActivityCount = 0
+        var reusedActivityCount = 0
+        var reusedTurnCount = 0
+        var flagsByTurn: [[[Bool]]] = []
+        flagsByTurn.reserveCapacity(sanitizedTranscript.turns.count)
+        for turnIndex in sanitizedTranscript.turns.indices {
+            let turnID = sanitizedTranscript.turns[turnIndex].id
+            var turnReusedActivityCount = 0
+            var flagsBySpan: [[Bool]] = []
+            flagsBySpan.reserveCapacity(sanitizedTranscript.turns[turnIndex].responseSpans.count)
+            for spanIndex in sanitizedTranscript.turns[turnIndex].responseSpans.indices {
+                let candidates = reuseSource?.candidates(
+                    turnIndex: turnIndex,
+                    turnID: turnID,
+                    spanIndex: spanIndex,
+                    spanID: sanitizedTranscript.turns[turnIndex].responseSpans[spanIndex].id
+                )
+                let result = sanitizeActivitiesRecordingProcessingFlags(
+                    in: &sanitizedTranscript.turns[turnIndex].responseSpans[spanIndex],
+                    candidates: candidates,
+                    context: context
+                )
+                sanitizedActivityCount += result.sanitized
+                reusedActivityCount += result.reused
+                turnReusedActivityCount += result.reused
+                flagsBySpan.append(result.flags)
+            }
+            flagsByTurn.append(flagsBySpan)
+            // A leading turn whose every tool activity was reused (non-tool activities are never
+            // candidates; processing them is a no-op) and whose sanitized result equals the
+            // previous output turn apart from grouped-history refresh state (span caches and the
+            // turn's frozen tail limit) takes the previous spans, keeping their grouped caches,
+            // with its own frozen limit. The reported reusable prefix lets the cache refresh
+            // validate those caches and keep them instead of rebuilding, as for legacy prefixes.
+            if reusedTurnCount == turnIndex,
+               let previousTurn = reuseSource?.sanitizedTurn(at: turnIndex, id: turnID),
+               turnReusedActivityCount == toolKindActivityCount(in: sanitizedTranscript.turns[turnIndex])
+            {
+                var installedTurn = previousTurn
+                installedTurn.frozenDetailedToolTailLimit = sanitizedTranscript.turns[turnIndex].frozenDetailedToolTailLimit
+                // Span equality excludes grouped caches.
+                if installedTurn == sanitizedTranscript.turns[turnIndex] {
+                    sanitizedTranscript.turns[turnIndex] = installedTurn
+                    reusedTurnCount += 1
+                }
+            }
+        }
+        return AgentSanitizedTranscriptMetrics(
+            transcript: sanitizedTranscript,
+            sanitizedActivityCount: sanitizedActivityCount,
+            reusedTurnCount: reusedTurnCount,
+            incrementalPathReason: incrementalPathReason,
+            reusedActivityCount: reusedActivityCount,
+            activityProcessingFlags: flagsByTurn
+        )
+    }
+
+    private static func toolKindActivityCount(in turn: AgentTranscriptTurn) -> Int {
+        turn.responseSpans.reduce(0) { count, span in
+            count + span.activities.count { $0.itemKind == .toolCall || $0.itemKind == .toolResult }
+        }
+    }
+
+    private static func containsToolKindActivities(in transcript: AgentTranscript) -> Bool {
+        transcript.turns.contains { turn in
+            turn.responseSpans.contains { span in
+                span.activities.contains { $0.itemKind == .toolCall || $0.itemKind == .toolResult }
+            }
+        }
+    }
+
+    private struct RawInputReuseCandidates {
+        let previousRawActivities: [AgentTranscriptActivity]
+        let previousSanitizedActivities: [AgentTranscriptActivity]
+        let previousProcessingFlags: [Bool]
+
+        /// The previous output and recorded processing flag for `activity` when processing it
+        /// provably reproduces them: a tool activity carrying its own execution (so processing
+        /// never consults the context's per-ID execution state) whose raw input fully equals the
+        /// previous raw input at this position.
+        func reusableResult(
+            at index: Int,
+            for activity: AgentTranscriptActivity
+        ) -> (activity: AgentTranscriptActivity, execution: AgentTranscriptToolExecution, flag: Bool)? {
+            guard activity.itemKind == .toolCall || activity.itemKind == .toolResult,
+                  activity.toolExecution != nil,
+                  previousRawActivities.indices.contains(index)
+            else {
+                return nil
+            }
+            let previousSanitized = previousSanitizedActivities[index]
+            let flag = previousProcessingFlags[index]
+            guard previousSanitized.id == activity.id,
+                  let execution = previousSanitized.toolExecution,
+                  previousRawActivities[index] == activity,
+                  // An unprocessed (false) result leaves the activity untouched.
+                  flag || previousSanitized == activity
+            else {
+                return nil
+            }
+            return (previousSanitized, execution, flag)
+        }
+    }
+
+    private static func sanitizeActivitiesRecordingProcessingFlags(
+        in span: inout AgentTranscriptProviderResponseSpan,
+        candidates: RawInputReuseCandidates?,
+        context: AgentToolResultProcessingContext?
+    ) -> (sanitized: Int, reused: Int, flags: [Bool]) {
+        var sanitizedActivityCount = 0
+        var reusedActivityCount = 0
+        var spanDidMutate = false
+        var flags: [Bool] = []
+        flags.reserveCapacity(span.activities.count)
+        for activityIndex in span.activities.indices {
+            let didMutate: Bool
+            if let reused = candidates?.reusableResult(at: activityIndex, for: span.activities[activityIndex]) {
+                // Processing an execution-carrying tool activity last registers exactly the
+                // output's execution for its ID; replay that at the same traversal position.
+                context?.storeToolExecution(reused.execution, for: reused.activity.id)
+                span.activities[activityIndex] = reused.activity
+                reusedActivityCount += 1
+                didMutate = reused.flag
+            } else {
+                didMutate = sanitizeActivity(
+                    &span.activities[activityIndex],
+                    preservedVisibleToolResultRowIDs: [],
+                    context: context,
+                    purpose: .runtimePresentation
+                )
+            }
+            flags.append(didMutate)
+            if didMutate {
+                spanDidMutate = true
+                sanitizedActivityCount += 1
+            }
+        }
+        if spanDidMutate {
+            span.fullRenderGroupedHistoryCache = nil
+        }
+        return (sanitizedActivityCount, reusedActivityCount, flags)
     }
 
     private enum IncrementalFinalTurnSanitizeOutcome {
@@ -1011,20 +1294,14 @@ enum AgentToolResultPersistencePolicy {
         var sanitizedActivityCount = 0
         var spanDidMutate = false
         for activityIndex in startIndex ..< span.activities.count {
-            var activity = span.activities[activityIndex]
-            let didNormalizeToolIdentity = normalizeToolIdentity(&activity, context: context)
-            let didSanitize: Bool = switch purpose {
-            case .runtimePresentation:
-                sanitizeRuntimeActivity(
-                    &activity,
-                    preservedVisibleToolResultRowIDs: preservedVisibleToolResultRowIDs,
-                    context: context
-                )
-            case .persistentStorage:
-                sanitizePersistentStorageActivity(&activity, context: context)
+            guard sanitizeActivity(
+                &span.activities[activityIndex],
+                preservedVisibleToolResultRowIDs: preservedVisibleToolResultRowIDs,
+                context: context,
+                purpose: purpose
+            ) else {
+                continue
             }
-            guard didNormalizeToolIdentity || didSanitize else { continue }
-            span.activities[activityIndex] = activity
             spanDidMutate = true
             sanitizedActivityCount += 1
         }
@@ -1032,6 +1309,31 @@ enum AgentToolResultPersistencePolicy {
             span.fullRenderGroupedHistoryCache = nil
         }
         return sanitizedActivityCount
+    }
+
+    /// Normalizes and sanitizes one activity; writes it back and returns true only when
+    /// processing reported a mutation.
+    private static func sanitizeActivity(
+        _ target: inout AgentTranscriptActivity,
+        preservedVisibleToolResultRowIDs: Set<UUID>,
+        context: AgentToolResultProcessingContext?,
+        purpose: AgentToolResultSanitizationPurpose
+    ) -> Bool {
+        var activity = target
+        let didNormalizeToolIdentity = normalizeToolIdentity(&activity, context: context)
+        let didSanitize: Bool = switch purpose {
+        case .runtimePresentation:
+            sanitizeRuntimeActivity(
+                &activity,
+                preservedVisibleToolResultRowIDs: preservedVisibleToolResultRowIDs,
+                context: context
+            )
+        case .persistentStorage:
+            sanitizePersistentStorageActivity(&activity, context: context)
+        }
+        guard didNormalizeToolIdentity || didSanitize else { return false }
+        target = activity
+        return true
     }
 
     private static func normalizeToolIdentity(

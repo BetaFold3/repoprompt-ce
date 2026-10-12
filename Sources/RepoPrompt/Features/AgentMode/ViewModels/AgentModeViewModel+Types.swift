@@ -1213,6 +1213,9 @@ extension AgentModeViewModel {
         let sanitizedActivityCount: Int
         let performanceSnapshot: AgentTranscriptPerformanceSnapshot
         let rawToolResultPayloadRenderRevisionByItemID: [UUID: Int]
+        /// The exact pre-sanitize input of `transcript`, installed as the session's raw-input
+        /// reuse pair on successful application; nil when the build cannot vouch for it.
+        var rawInputSanitizeEvidence: AgentSanitizeRawInputEvidence?
     }
 
     enum DerivedTranscriptRefreshReason: String {
