@@ -230,14 +230,19 @@ final class AgentTranscriptRefreshDiagnosticsTests: XCTestCase {
             XCTAssertGreaterThanOrEqual(afterParsedMiss.parsed.missCount - afterMetadataHit.parsed.missCount, 1)
             XCTAssertGreaterThanOrEqual(afterParsedHit.parsed.hitCount - afterParsedMiss.parsed.hitCount, 1)
 
-            let beforeEviction = BashToolResultParser.cacheCountersSnapshot()
+            // Eviction is two-generation (D3); exercise it on a small isolated cache so the
+            // process-wide table's larger working set does not hide the counters.
+            let smallCache = BashToolResultParser.Cache(
+                limits: .init(maxEntriesPerGeneration: 128, maxBytesPerTable: 16 * 1024 * 1024)
+            )
             for index in 0 ..< 300 {
-                _ = BashToolResultParser.parseMetadata(raw: #"{"status":"completed","output":"\#(token)-\#(index)"}"#)
+                let indexedRaw = #"{"status":"completed","output":"\#(token)-\#(index)"}"#
+                _ = smallCache.metadata(raw: indexedRaw) { BashToolResultParser.parseLivenessMetadata(raw: indexedRaw) }
             }
-            let afterEviction = BashToolResultParser.cacheCountersSnapshot()
-            XCTAssertGreaterThanOrEqual(afterEviction.metadata.evictedEntryCount - beforeEviction.metadata.evictedEntryCount, 256)
-            XCTAssertGreaterThanOrEqual(afterEviction.metadata.currentEntryCount, 1)
-            XCTAssertLessThanOrEqual(afterEviction.metadata.currentEntryCount, 256)
+            let afterEviction = smallCache.countersSnapshot().metadata
+            XCTAssertEqual(afterEviction.missCount, 300)
+            XCTAssertEqual(afterEviction.evictedEntryCount, 128)
+            XCTAssertEqual(afterEviction.currentEntryCount, 172)
         }
     #endif
 

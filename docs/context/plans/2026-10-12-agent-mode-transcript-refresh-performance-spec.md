@@ -157,7 +157,7 @@ Step D2 — blocked | rounds 0/2 | open: historical rejection causes unproven; D
 
 ### D3 — Remove the bash-metadata cache cliff
 
-Step D3 — todo | rounds 0/2 | open: none | downgraded: none | assumed: none | deferred: none
+Step D3 — done | rounds 0/2 | open: none | downgraded: none | assumed: build-local contexts verified; 2048 entries/generation and 16 MiB accounted/table initial limits | deferred: parsed byte tuning, memory-pressure purge and live validation per D3-final.md
 
 - **Per-build `AgentToolResultProcessingContext`:** remove the cap, since it lives for one build. Trim only when the first or last character is whitespace.
 - **Process-wide `BashToolResultParser.Cache`:** replace clear-on-overflow with bounded eviction, sized above the cross-session working set. Keep separate budgets for metadata and parsed results, use byte accounting, and compute outside the lock with a recheck before insert.
@@ -169,7 +169,7 @@ Step D3 — todo | rounds 0/2 | open: none | downgraded: none | assumed: none | 
 
 ### D4 — Sanitize reuse after a full import
 
-Step D4 — todo | rounds 0/2 | open: none | downgraded: none | assumed: none | deferred: none
+Step D4 — todo | rounds 0/2 | open: none | downgraded: none | assumed: bounded raw-input equality reuse design/scout ready (D4-design.md) | deferred: none
 
 - Store the pre-sanitize import from the last refresh (`lastImportedTranscript`) next to `session.transcript`, and drop it on dehydrate.
 - Diff the new import against it, not against the sanitized transcript. Derive the reusable turn prefix and the first changed activity sequence index from that diff, and pass them through the existing `trustedReusablePrefixTurnCount` and `trustedIncrementalFinalTurnStartSequenceIndex` parameters.
@@ -280,6 +280,8 @@ Pursue this only if, after D0–D7, the active-tab incremental refresh p95 is ab
 - `logCodexDebug(... transcriptRowDebugWindow(...))` on every refresh. Verify whether its argument is an `@autoclosure`.
 
 ## Decisions and provenance
+
+- Owner Decision (2026-10-12): Retry D3 commit; unsigned local commits are permitted for subsequent plan steps without changing global Git settings.
 
 - Owner Decision (2026-10-12): D0 records publication and SwiftUI observation; actual on-screen rendered-frame timing remains an Instruments measurement, not an in-app completion claim.
 

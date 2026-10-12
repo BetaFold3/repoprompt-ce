@@ -681,23 +681,20 @@ enum BashToolResultParser {
         let rawFallbackOutput: String?
     }
 
-    private struct ParsedCacheKey: Hashable {
+    struct ParsedCacheKey: Hashable {
         let raw: String
         let argsJSON: String
     }
 
-    private enum CacheEntry<Value> {
-        case value(Value)
-        case missing
-    }
-
     #if DEBUG || EDIT_FLOW_PERF
         /// Process-wide counters for one `BashToolResultParser` cache table. Counts only; no payloads.
+        /// `currentByteCount` is the cache's own UTF-8 + fixed-overhead accounting, not measured heap use.
         struct CacheTableCounters: Equatable {
             var hitCount: Int = 0
             var missCount: Int = 0
             var evictedEntryCount: Int = 0
             var currentEntryCount: Int = 0
+            var currentByteCount: Int = 0
         }
 
         struct CacheCountersSnapshot: Equatable {
@@ -706,101 +703,174 @@ enum BashToolResultParser {
         }
     #endif
 
-    private final class Cache {
+    /// Process-wide bounded cache for bash metadata and parsed results.
+    ///
+    /// Each table (metadata, parsed) uses two-generation eviction with its own entry and byte
+    /// limits: lookups hit the young generation, or promote an old-generation entry to young;
+    /// when young would exceed its entry or byte limit, the old generation is dropped and young
+    /// becomes old. Any working set no larger than one generation therefore stays resident across
+    /// repeated scans (plain LRU gets 0% on a cyclic scan larger than its capacity). Keys are the
+    /// full strings, never hashes. Values are computed outside the lock; insertion rechecks for a
+    /// concurrent insert of the same key and returns the resident value. Byte accounting is UTF-8
+    /// key/value length plus a fixed per-entry overhead, not measured heap use.
+    final class Cache {
+        struct Limits: Equatable {
+            let maxEntriesPerGeneration: Int
+            /// Upper bound on accounted bytes across both generations of one table.
+            let maxBytesPerTable: Int
+
+            /// The entry limit covers the observed ~900-result working set by count only.
+            /// Byte capacity, especially parsed output, needs live counter-based tuning.
+            static let processDefault = Limits(maxEntriesPerGeneration: 2048, maxBytesPerTable: 16 * 1024 * 1024)
+        }
+
+        private struct Table<Key: Hashable, Value> {
+            private struct Entry {
+                let value: Value
+                let byteCount: Int
+            }
+
+            let maxEntriesPerGeneration: Int
+            let maxBytesPerGeneration: Int
+            private var young: [Key: Entry] = [:]
+            private var old: [Key: Entry] = [:]
+            private var youngByteCount = 0
+            private var oldByteCount = 0
+            private(set) var hitCount = 0
+            private(set) var missCount = 0
+            private(set) var evictedEntryCount = 0
+
+            init(limits: Limits) {
+                maxEntriesPerGeneration = max(1, limits.maxEntriesPerGeneration)
+                maxBytesPerGeneration = max(1, limits.maxBytesPerTable / 2)
+            }
+
+            #if DEBUG || EDIT_FLOW_PERF
+                var counters: CacheTableCounters {
+                    CacheTableCounters(
+                        hitCount: hitCount,
+                        missCount: missCount,
+                        evictedEntryCount: evictedEntryCount,
+                        currentEntryCount: young.count + old.count,
+                        currentByteCount: youngByteCount + oldByteCount
+                    )
+                }
+            #endif
+
+            mutating func lookup(_ key: Key) -> Value? {
+                if let value = residentValue(for: key) {
+                    hitCount += 1
+                    return value
+                }
+                missCount += 1
+                return nil
+            }
+
+            /// Rechecks residency before inserting so concurrent computes of one key keep a
+            /// single accounted entry; returns the resident value when one exists.
+            mutating func insert(_ value: Value, for key: Key, byteCount: Int) -> Value {
+                if let resident = residentValue(for: key) {
+                    return resident
+                }
+                guard byteCount <= maxBytesPerGeneration else { return value }
+                insertYoung(Entry(value: value, byteCount: byteCount), for: key)
+                return value
+            }
+
+            private mutating func residentValue(for key: Key) -> Value? {
+                if let entry = young[key] {
+                    return entry.value
+                }
+                if let entry = old.removeValue(forKey: key) {
+                    oldByteCount -= entry.byteCount
+                    insertYoung(entry, for: key)
+                    return entry.value
+                }
+                return nil
+            }
+
+            private mutating func insertYoung(_ entry: Entry, for key: Key) {
+                if young.count >= maxEntriesPerGeneration
+                    || youngByteCount + entry.byteCount > maxBytesPerGeneration
+                {
+                    evictedEntryCount += old.count
+                    old = young
+                    oldByteCount = youngByteCount
+                    young = [:]
+                    youngByteCount = 0
+                }
+                young[key] = entry
+                youngByteCount += entry.byteCount
+            }
+        }
+
         private let lock = NSLock()
-        private var metadataByRaw: [String: CacheEntry<Metadata>] = [:]
-        private var parsedByKey: [ParsedCacheKey: CacheEntry<ParsedResult>] = [:]
-        #if DEBUG || EDIT_FLOW_PERF
-            private var metadataCounters = CacheTableCounters()
-            private var parsedCounters = CacheTableCounters()
-        #endif
+        private var metadataTable: Table<String, Metadata>
+        private var parsedTable: Table<ParsedCacheKey, ParsedResult>
+
+        init(limits: Limits = .processDefault) {
+            metadataTable = Table(limits: limits)
+            parsedTable = Table(limits: limits)
+        }
 
         func metadata(raw: String, compute: () -> Metadata) -> Metadata {
             lock.lock()
-            if let cached = metadataByRaw[raw] {
-                #if DEBUG || EDIT_FLOW_PERF
-                    if case .value = cached {
-                        metadataCounters.hitCount += 1
-                    } else {
-                        metadataCounters.missCount += 1
-                    }
-                #endif
+            if let cached = metadataTable.lookup(raw) {
                 lock.unlock()
-                switch cached {
-                case let .value(value):
-                    return value
-                case .missing:
-                    return compute()
-                }
+                return cached
             }
-            #if DEBUG || EDIT_FLOW_PERF
-                metadataCounters.missCount += 1
-            #endif
             lock.unlock()
 
             let value = compute()
+            let byteCount = Self.accountedByteCount(raw: raw, metadata: value)
 
             lock.lock()
-            if metadataByRaw.count > 255 {
-                #if DEBUG || EDIT_FLOW_PERF
-                    metadataCounters.evictedEntryCount += metadataByRaw.count
-                #endif
-                metadataByRaw.removeAll(keepingCapacity: true)
-            }
-            metadataByRaw[raw] = .value(value)
-            #if DEBUG || EDIT_FLOW_PERF
-                metadataCounters.currentEntryCount = metadataByRaw.count
-            #endif
-            lock.unlock()
-            return value
+            defer { lock.unlock() }
+            return metadataTable.insert(value, for: raw, byteCount: byteCount)
         }
 
         func parsed(raw: String, argsJSON: String, compute: () -> ParsedResult) -> ParsedResult {
             let key = ParsedCacheKey(raw: raw, argsJSON: argsJSON)
             lock.lock()
-            if let cached = parsedByKey[key] {
-                #if DEBUG || EDIT_FLOW_PERF
-                    if case .value = cached {
-                        parsedCounters.hitCount += 1
-                    } else {
-                        parsedCounters.missCount += 1
-                    }
-                #endif
+            if let cached = parsedTable.lookup(key) {
                 lock.unlock()
-                switch cached {
-                case let .value(value):
-                    return value
-                case .missing:
-                    return compute()
-                }
+                return cached
             }
-            #if DEBUG || EDIT_FLOW_PERF
-                parsedCounters.missCount += 1
-            #endif
             lock.unlock()
 
             let value = compute()
+            let byteCount = Self.accountedByteCount(key: key, parsed: value)
 
             lock.lock()
-            if parsedByKey.count > 255 {
-                #if DEBUG || EDIT_FLOW_PERF
-                    parsedCounters.evictedEntryCount += parsedByKey.count
-                #endif
-                parsedByKey.removeAll(keepingCapacity: true)
-            }
-            parsedByKey[key] = .value(value)
-            #if DEBUG || EDIT_FLOW_PERF
-                parsedCounters.currentEntryCount = parsedByKey.count
-            #endif
-            lock.unlock()
-            return value
+            defer { lock.unlock() }
+            return parsedTable.insert(value, for: key, byteCount: byteCount)
+        }
+
+        private static let metadataEntryOverheadBytes = MemoryLayout<String>.stride + MemoryLayout<Metadata>.stride
+        private static let parsedEntryOverheadBytes = MemoryLayout<ParsedCacheKey>.stride + MemoryLayout<ParsedResult>.stride
+
+        static func accountedByteCount(raw: String, metadata: Metadata) -> Int {
+            metadataEntryOverheadBytes
+                + raw.utf8.count
+                + (metadata.statusWord?.utf8.count ?? 0)
+                + (metadata.processID?.utf8.count ?? 0)
+        }
+
+        static func accountedByteCount(key: ParsedCacheKey, parsed: ParsedResult) -> Int {
+            parsedEntryOverheadBytes
+                + key.raw.utf8.count
+                + key.argsJSON.utf8.count
+                + (parsed.command?.utf8.count ?? 0)
+                + (parsed.statusWord?.utf8.count ?? 0)
+                + (parsed.output?.utf8.count ?? 0)
+                + (parsed.processID?.utf8.count ?? 0)
         }
 
         #if DEBUG || EDIT_FLOW_PERF
             func countersSnapshot() -> CacheCountersSnapshot {
                 lock.lock()
                 defer { lock.unlock() }
-                return CacheCountersSnapshot(metadata: metadataCounters, parsed: parsedCounters)
+                return CacheCountersSnapshot(metadata: metadataTable.counters, parsed: parsedTable.counters)
             }
         #endif
     }
@@ -863,8 +933,22 @@ enum BashToolResultParser {
         parseMetadata(raw: raw, context: nil)
     }
 
+    private static let whitespaceAndNewlineCharacters = CharacterSet.whitespacesAndNewlines
+
+    /// Returns exactly `raw.trimmingCharacters(in: .whitespacesAndNewlines)`, but returns `raw`
+    /// unchanged without scanning or copying when neither its first nor last Unicode scalar is
+    /// whitespace or a newline (trimming is then a no-op).
+    static func trimmingWhitespaceAndNewlinesIfNeeded(_ raw: String) -> String {
+        let scalars = raw.unicodeScalars
+        guard let first = scalars.first, let last = scalars.last else { return raw }
+        guard whitespaceAndNewlineCharacters.contains(first) || whitespaceAndNewlineCharacters.contains(last) else {
+            return raw
+        }
+        return raw.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
     static func parseMetadata(raw: String?, context: AgentToolResultProcessingContext?) -> Metadata {
-        let trimmed = raw?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let trimmed = raw.map(trimmingWhitespaceAndNewlinesIfNeeded) ?? ""
         guard !trimmed.isEmpty else {
             return Metadata(isRunning: false, statusWord: nil, exitCode: nil, processID: nil, isSummaryOnly: false)
         }
@@ -1464,8 +1548,9 @@ final class AgentToolResultProcessingContext: @unchecked Sendable {
         lock.unlock()
     }
 
+    /// Per-build memo; the context lives for one build, so it is unbounded.
     func bashMetadata(raw: String?, compute: () -> BashToolResultParser.Metadata) -> BashToolResultParser.Metadata {
-        let trimmed = raw?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let trimmed = raw.map(BashToolResultParser.trimmingWhitespaceAndNewlinesIfNeeded) ?? ""
         guard !trimmed.isEmpty else { return compute() }
         lock.lock()
         if let cached = bashMetadataByRaw[trimmed] {
@@ -1482,9 +1567,6 @@ final class AgentToolResultProcessingContext: @unchecked Sendable {
 
         let value = compute()
         lock.lock()
-        if bashMetadataByRaw.count > 255 {
-            bashMetadataByRaw.removeAll(keepingCapacity: true)
-        }
         bashMetadataByRaw[trimmed] = value
         lock.unlock()
         return value
