@@ -132,7 +132,7 @@ Step D0 — done | rounds 2/2 | open: none (D0-OracleA-round2.md, D0-OracleB-rou
 
 ### D1 — Ranged, non-structural segment end
 
-Step D1 — todo | rounds 0/2 | open: none | downgraded: none | assumed: none | deferred: none
+Step D1 — done | rounds 0/2 | open: none | downgraded: none | assumed: include reasoning segment end to avoid same-batch structural poisoning; classification-only | deferred: D5 commit optimization and optional direct Codex seal test; live/large-fixture validation per D1-final.md
 
 Use a non-structural mutation with an exact range for segment end. Either add a case such as `assistantStreamingStateChanged(changedIndexRange:)` or reuse an existing in-place-update case that has a range, `isStructural == false`, and `touchesUserItem == false`.
 

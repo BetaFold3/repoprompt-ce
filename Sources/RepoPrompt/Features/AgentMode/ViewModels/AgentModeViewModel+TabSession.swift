@@ -2255,6 +2255,77 @@ extension AgentModeViewModel {
             return true
         }
 
+        /// Ends streaming of the assistant rows `shouldEnd` selects, as one ranged, non-structural
+        /// mutation. The flipped indices are computed from the current items in this same
+        /// main-actor turn, before the batch. The range is the lowest through highest flipped index;
+        /// interior rows may be unchanged. No selected row means no
+        /// mutation and no notification. Only `isStreaming` changes: IDs, kinds, order, and tool
+        /// fields are untouched. Does not touch `lastActivityAt`.
+        @discardableResult
+        func endStreamingAssistantRows(
+            where shouldEnd: (AgentChatItem) -> Bool = { _ in true },
+            callerFileID: StaticString = #fileID,
+            callerFunction: StaticString = #function,
+            callerLine: UInt = #line
+        ) -> Bool {
+            endStreamingRows(
+                ofKind: .assistant,
+                mutation: { .assistantStreamingStateChanged(changedIndexRange: $0) },
+                where: shouldEnd,
+                callerFileID: callerFileID,
+                callerFunction: callerFunction,
+                callerLine: callerLine
+            )
+        }
+
+        /// Reasoning counterpart of `endStreamingAssistantRows`: ends streaming of the thinking rows
+        /// `shouldEnd` selects, as one ranged, non-structural mutation with the same contract.
+        @discardableResult
+        func endStreamingReasoningRows(
+            where shouldEnd: (AgentChatItem) -> Bool,
+            callerFileID: StaticString = #fileID,
+            callerFunction: StaticString = #function,
+            callerLine: UInt = #line
+        ) -> Bool {
+            endStreamingRows(
+                ofKind: .thinking,
+                mutation: { .reasoningStreamingStateChanged(changedIndexRange: $0) },
+                where: shouldEnd,
+                callerFileID: callerFileID,
+                callerFunction: callerFunction,
+                callerLine: callerLine
+            )
+        }
+
+        private func endStreamingRows(
+            ofKind kind: AgentChatItemKind,
+            mutation: (ClosedRange<Int>) -> AgentModeViewModel.SourceItemsMutation,
+            where shouldEnd: (AgentChatItem) -> Bool,
+            callerFileID: StaticString,
+            callerFunction: StaticString,
+            callerLine: UInt
+        ) -> Bool {
+            let flippedIndices = items.indices.filter { index in
+                let item = items[index]
+                return item.kind == kind && item.isStreaming && shouldEnd(item)
+            }
+            guard let firstIndex = flippedIndices.first, let lastIndex = flippedIndices.last else {
+                return false
+            }
+            return mutateItemsBatch(
+                mutation: mutation(firstIndex ... lastIndex),
+                touchActivity: false,
+                { items in
+                    for index in flippedIndices {
+                        items[index].isStreaming = false
+                    }
+                },
+                callerFileID: callerFileID,
+                callerFunction: callerFunction,
+                callerLine: callerLine
+            )
+        }
+
         enum SilentItemReplacementReason: String {
             case persistedSessionHydration
             case pendingToolFinalizationRepair

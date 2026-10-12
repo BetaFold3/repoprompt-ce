@@ -808,6 +808,13 @@ extension AgentModeViewModel {
         case replace(index: Int, previousKind: AgentChatItemKind, currentKind: AgentChatItemKind)
         case mutate(index: Int, itemKind: AgentChatItemKind)
         case remove(index: Int, itemKind: AgentChatItemKind)
+        /// Segment end: only `isStreaming` of existing assistant rows flipped, in place. The range
+        /// spans the lowest through highest flipped index; interior rows may be unchanged. Computed in the same
+        /// main-actor turn as the flip. No row is added, removed, reordered, or re-kinded.
+        case assistantStreamingStateChanged(changedIndexRange: ClosedRange<Int>)
+        /// Reasoning segment end: only `isStreaming` of existing thinking rows flipped, in place,
+        /// with the same exact-range and same-turn contract as `assistantStreamingStateChanged`.
+        case reasoningStreamingStateChanged(changedIndexRange: ClosedRange<Int>)
         case replaceAll
         case structural
 
@@ -818,6 +825,9 @@ extension AgentModeViewModel {
                  let .mutate(index, _),
                  let .remove(index, _):
                 index ... index
+            case let .assistantStreamingStateChanged(changedIndexRange),
+                 let .reasoningStreamingStateChanged(changedIndexRange):
+                changedIndexRange
             case .replaceAll, .structural:
                 nil
             }
@@ -831,6 +841,8 @@ extension AgentModeViewModel {
                 itemKind == .user
             case let .replace(_, previousKind, currentKind):
                 previousKind == .user || currentKind == .user
+            case .assistantStreamingStateChanged, .reasoningStreamingStateChanged:
+                false
             case .replaceAll, .structural:
                 true
             }
@@ -840,7 +852,7 @@ extension AgentModeViewModel {
             switch self {
             case .remove, .replaceAll, .structural:
                 true
-            case .append, .replace, .mutate:
+            case .append, .replace, .mutate, .assistantStreamingStateChanged, .reasoningStreamingStateChanged:
                 false
             }
         }

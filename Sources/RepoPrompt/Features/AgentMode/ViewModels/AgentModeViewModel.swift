@@ -948,6 +948,10 @@ final class AgentModeViewModel: ObservableObject {
             sessions[session.tabID] = session
         }
 
+        func test_endAssistantSegment(_ session: TabSession, background: Bool, sourceID: UUID? = nil) {
+            endAssistantSegment(session, background: background, sourceID: sourceID)
+        }
+
         func test_removeLiveSession(tabID: UUID) {
             sessions.removeValue(forKey: tabID)
         }
@@ -18967,23 +18971,15 @@ final class AgentModeViewModel: ObservableObject {
         // No shortcut for an empty set: a background segment end then ends nothing.
         let backgroundRowIDs = session.backgroundRowIDs
         let backgroundRowSourceIDs = session.backgroundRowSourceIDs
-        session.mutateItemsBatch(touchActivity: false) { items in
-            for index in items.indices where items[index].kind == .assistant && items[index].isStreaming {
-                let id = items[index].id
-                let isBackgroundRow = backgroundRowIDs.contains(id)
-                if isBackgroundRow == background, !isBackgroundRow || backgroundRowSourceIDs[id] == sourceID {
-                    items[index].isStreaming = false
-                }
-            }
+        // Ranged, non-structural: only `isStreaming` of the selected rows flips.
+        session.endStreamingAssistantRows { item in
+            let isBackgroundRow = backgroundRowIDs.contains(item.id)
+            return isBackgroundRow == background && (!isBackgroundRow || backgroundRowSourceIDs[item.id] == sourceID)
         }
     }
 
     func endActiveAssistantSegment(_ session: TabSession) {
-        session.mutateItemsBatch(touchActivity: false) { items in
-            for index in items.indices where items[index].kind == .assistant && items[index].isStreaming {
-                items[index].isStreaming = false
-            }
-        }
+        session.endStreamingAssistantRows()
     }
 
     func applyReasoningDelta(_ delta: String, groupID: String?, session: TabSession) {
@@ -19015,16 +19011,9 @@ final class AgentModeViewModel: ObservableObject {
     func endActiveReasoningSegment(_ session: TabSession) {
         let activeIDs = Set(session.reasoningItemIDsByGroupID.values)
         let allIDs = session.activeReasoningItemID.map { activeIDs.union([$0]) } ?? activeIDs
-        session.mutateItemsBatch(touchActivity: false) { items in
-            for itemID in allIDs {
-                if let index = items.firstIndex(where: { $0.id == itemID }),
-                   items[index].kind == .thinking,
-                   items[index].isStreaming
-                {
-                    items[index].isStreaming = false
-                }
-            }
-        }
+        // Ranged, non-structural: only `isStreaming` of the active reasoning rows flips. Live item
+        // IDs are unique, so membership matches the former first-index-by-ID lookup.
+        session.endStreamingReasoningRows { allIDs.contains($0.id) }
         session.activeReasoningItemID = nil
         session.reasoningItemIDsByGroupID.removeAll()
     }
