@@ -103,6 +103,10 @@ extension AgentModeViewModel {
         var onRunStateChanged: ((TabSession) -> Void)?
         #if DEBUG
             private(set) var test_incrementalRetentionCompactionCount = 0
+            /// Duplicate-ID repair scans run at this session's source-write boundaries.
+            private(set) var test_sourceItemDuplicateRepairScanCount = 0
+            /// Full derived-state rebuilds (`rebuildSourceItemDerivedState`).
+            private(set) var test_sourceItemDerivedRebuildCount = 0
         #endif
 
         /// Run state
@@ -1952,6 +1956,9 @@ extension AgentModeViewModel {
             _ candidateItems: [AgentChatItem],
             diagnosticContext: String
         ) -> [AgentChatItem] {
+            #if DEBUG
+                test_sourceItemDuplicateRepairScanCount += 1
+            #endif
             let repair = AgentSourceItemIDRepair.repairDuplicateIDs(in: candidateItems)
             if repair.didRepair {
                 AgentSourceItemIDRepair.logDiagnostics(
@@ -1978,6 +1985,9 @@ extension AgentModeViewModel {
             diagnosticContext: String,
             caller: AgentModeViewModel.SourceItemsMutationCaller
         ) -> Bool {
+            #if DEBUG
+                test_sourceItemDuplicateRepairScanCount += 1
+            #endif
             let repair = AgentSourceItemIDRepair.repairDuplicateIDs(in: candidateItems)
             guard repair.didRepair else { return false }
             AgentSourceItemIDRepair.logDiagnostics(
@@ -1992,10 +2002,17 @@ extension AgentModeViewModel {
             return true
         }
 
+        /// Rebuilds derived state from `items`. Precondition: `items` already has unique IDs. Every
+        /// caller establishes that at its source-write boundary (`items.didSet` and
+        /// `commitSourceItems` repair first; `compactSummaryOnlyToolResultsAndAlignEphemeralPayloadMap`
+        /// rebuilds only after a repair). This method does not repair source data.
         private func rebuildSourceItemDerivedState() {
-            repairStoredSourceItemsIfNeeded(diagnosticContext: "rebuildSourceItemDerivedState")
+            #if DEBUG
+                test_sourceItemDerivedRebuildCount += 1
+            #endif
             syncNextSequenceIndexFromItems()
             liveItemIDs = Set(items.map(\.id))
+            assert(liveItemIDs.count == items.count, "rebuildSourceItemDerivedState requires unique source item IDs")
             replaceEphemeralToolResultPayloadMap(
                 AgentModeViewModel.rebuildEphemeralToolResultPayloadMap(
                     from: items,
@@ -2004,7 +2021,27 @@ extension AgentModeViewModel {
                 liveItemIDs: liveItemIDs
             )
             rebuildToolCorrelationIndexes()
-            assertSourceItemDerivedStateIsConsistent()
+            assertSourceItemDerivedStateIsConsistentIfEnabled()
+        }
+
+        /// Whether a single-row write of `updatedID` (replacing `previousID`, if any) keeps source
+        /// item IDs unique. Relies on the `liveItemIDs == Set(items.map(\.id))` invariant; a
+        /// collision takes the existing repaired structural commit instead.
+        private func admitsIncrementalSourceItemID(_ updatedID: UUID, replacing previousID: UUID?) -> Bool {
+            if let previousID, previousID == updatedID { return true }
+            return !liveItemIDs.contains(updatedID)
+        }
+
+        /// Narrow hot-path DEBUG check after an admitted single-row write: only the touched
+        /// identities are inspected, plus the O(1) count invariant.
+        private func assertIncrementalSourceItemIdentity(previousID: UUID?, updatedID: UUID) {
+            #if DEBUG
+                assert(liveItemIDs.contains(updatedID), "incremental source write lost its live item ID")
+                if let previousID, previousID != updatedID {
+                    assert(!liveItemIDs.contains(previousID), "incremental source write kept a replaced live item ID")
+                }
+                assert(liveItemIDs.count == items.count, "incremental source write desynchronized live item IDs")
+            #endif
         }
 
         private func rebuildToolCorrelationIndexes() {
@@ -2223,7 +2260,28 @@ extension AgentModeViewModel {
             func testAssertSourceItemDerivedStateIsConsistent() {
                 assertSourceItemDerivedStateIsConsistent()
             }
+
+            /// Follows the `GlobalSettingsStore` XCTest-detection precedent: direct xctest and SwiftPM
+            /// runners need not set `XCTestConfigurationFilePath`.
+            private static let isXCTestProcess =
+                NSClassFromString("XCTestCase") != nil || NSClassFromString("XCTest.XCTestCase") != nil
         #endif
+
+        /// Full O(n) consistency sweep after a full derived rebuild or a flags-only streaming
+        /// commit, run automatically only in XCTest processes or when transcript debug
+        /// instrumentation is explicitly enabled. Ordinary DEBUG app runs and performance capture
+        /// use the narrow touched-row checks instead. Single-row incremental writes are not swept
+        /// automatically: an active-turn boundary frozen during a run outlives it until a full
+        /// rebuild, which this sweep reports as desynchronized (pre-existing behavior).
+        private func assertSourceItemDerivedStateIsConsistentIfEnabled(
+            file: StaticString = #fileID,
+            line: UInt = #line
+        ) {
+            #if DEBUG
+                guard Self.isXCTestProcess || AgentTranscriptDebugInstrumentation.isEnabled else { return }
+                assertSourceItemDerivedStateIsConsistent(file: file, line: line)
+            #endif
+        }
 
         private func assertSourceItemDerivedStateIsConsistent(
             file: StaticString = #fileID,
@@ -2280,7 +2338,7 @@ extension AgentModeViewModel {
 
         /// Ends streaming of the assistant rows `shouldEnd` selects, as one ranged, non-structural
         /// mutation. The flipped indices are computed from the current items in this same
-        /// main-actor turn, before the batch. The range is the lowest through highest flipped index;
+        /// main-actor turn, before the commit. The range is the lowest through highest flipped index;
         /// interior rows may be unchanged. No selected row means no
         /// mutation and no notification. Only `isStreaming` changes: IDs, kinds, order, and tool
         /// fields are untouched. Does not touch `lastActivityAt`.
@@ -2335,18 +2393,66 @@ extension AgentModeViewModel {
             guard let firstIndex = flippedIndices.first, let lastIndex = flippedIndices.last else {
                 return false
             }
-            return mutateItemsBatch(
-                mutation: mutation(firstIndex ... lastIndex),
-                touchActivity: false,
-                { items in
-                    for index in flippedIndices {
-                        items[index].isStreaming = false
-                    }
-                },
-                callerFileID: callerFileID,
-                callerFunction: callerFunction,
-                callerLine: callerLine
+            // Flags-only commit: IDs, sequence indexes, retained payloads (only `.toolResult` rows
+            // retain one) and tool-correlation inputs are unchanged, so no duplicate repair or
+            // derived rebuild runs. One array copy is still made.
+            #if DEBUG
+                let selectedRowsBefore = flippedIndices.map { items[$0] }
+            #endif
+            var updatedItems = items
+            for index in flippedIndices {
+                updatedItems[index].isStreaming = false
+            }
+            suppressSourceItemsChanged = true
+            items = updatedItems
+            suppressSourceItemsChanged = false
+            #if DEBUG
+                for (offset, index) in flippedIndices.enumerated() {
+                    var expected = selectedRowsBefore[offset]
+                    assert(expected.kind == kind && expected.isStreaming, "streaming end selected a non-streaming row")
+                    expected.isStreaming = false
+                    assert(items[index] == expected, "streaming end changed a field other than isStreaming")
+                }
+            #endif
+            reconcileIdleToolCorrelationBoundaryIfStale()
+            reconcileActiveToolCorrelationStartIfStale()
+            assertSourceItemDerivedStateIsConsistentIfEnabled()
+            finishIncrementalSourceItemsMutation(
+                mutation(firstIndex ... lastIndex),
+                caller: .init(fileID: callerFileID, function: callerFunction, line: callerLine)
             )
+            isDirty = true
+            return true
+        }
+
+        /// Keeps the one tool-correlation effect the former full rebuild had on a flags-only
+        /// commit: outside an active run, a full rebuild re-derives the active-turn boundary from
+        /// the last user row (a boundary frozen during a run can outlive it). The backward scan
+        /// stops at the last user row; indexes are rebuilt only when that boundary is stale.
+        private func reconcileIdleToolCorrelationBoundaryIfStale() {
+            guard !runState.isActive else { return }
+            let freshBoundary: ToolCorrelationBoundary = if let lastUserIndex = items.lastIndex(where: { $0.kind == .user }) {
+                .after(itemID: items[lastUserIndex].id, sequenceIndex: items[lastUserIndex].sequenceIndex)
+            } else {
+                .start
+            }
+            guard toolCorrelationIndexes.activeTurnBoundary != freshBoundary else { return }
+            rebuildToolCorrelationIndexes()
+        }
+
+        /// Keeps the former full rebuild's recovery during an active run: the frozen boundary is
+        /// kept, but single-row writes do not re-resolve its start, so it can go stale (a removed
+        /// anchor reappended, or a missing anchor's sequence-index fallback shifted by a sequence
+        /// change). Rebuilds only the correlation indexes, and only when the resolved start moved;
+        /// incremental maintenance keeps the maps consistent with the stored start otherwise.
+        private func reconcileActiveToolCorrelationStartIfStale() {
+            guard runState.isActive else { return }
+            let resolvedStartIndex = Self.resolvedToolCorrelationStartIndex(
+                for: items,
+                boundary: toolCorrelationIndexes.activeTurnBoundary
+            )
+            guard toolCorrelationIndexes.activeTurnStartIndex != resolvedStartIndex else { return }
+            rebuildToolCorrelationIndexes()
         }
 
         enum SilentItemReplacementReason: String {
@@ -2574,8 +2680,9 @@ extension AgentModeViewModel {
             var newItem = item
             newItem.sequenceIndex = nextSequenceIndex
             nextSequenceIndex += 1
-            let candidateItems = items + [newItem]
-            if commitRepairedSourceItemsIfNeeded(candidateItems, diagnosticContext: "appendItem", caller: caller) {
+            if !admitsIncrementalSourceItemID(newItem.id, replacing: nil),
+               commitRepairedSourceItemsIfNeeded(items + [newItem], diagnosticContext: "appendItem", caller: caller)
+            {
                 if newItem.kind == .user {
                     hasSentFirstMessage = true
                     lastUserMessageAt = newItem.timestamp
@@ -2589,6 +2696,7 @@ extension AgentModeViewModel {
             items.append(newItem)
             suppressSourceItemsChanged = false
             reconcileIncrementalEphemeralPayload(previousItem: nil, updatedItem: newItem)
+            assertIncrementalSourceItemIdentity(previousID: nil, updatedID: newItem.id)
             appendToolCorrelationIndexes(for: newItem, at: appendedIndex)
             finishIncrementalSourceItemsMutation(.append(index: appendedIndex, itemKind: newItem.kind), caller: caller)
             if newItem.kind == .user {
@@ -2614,18 +2722,21 @@ extension AgentModeViewModel {
             guard items.indices.contains(index) else { return }
             let previousItem = items[index]
             guard updatedItem != previousItem else { return }
-            var candidateItems = items
-            candidateItems[index] = updatedItem
-            if commitRepairedSourceItemsIfNeeded(candidateItems, diagnosticContext: "replaceItem", caller: caller) {
-                lastActivityAt = Date()
-                isDirty = true
-                return
+            if !admitsIncrementalSourceItemID(updatedItem.id, replacing: previousItem.id) {
+                var candidateItems = items
+                candidateItems[index] = updatedItem
+                if commitRepairedSourceItemsIfNeeded(candidateItems, diagnosticContext: "replaceItem", caller: caller) {
+                    lastActivityAt = Date()
+                    isDirty = true
+                    return
+                }
             }
             suppressSourceItemsChanged = true
             items[index] = updatedItem
             suppressSourceItemsChanged = false
             nextSequenceIndex = max(nextSequenceIndex, updatedItem.sequenceIndex + 1)
             reconcileIncrementalEphemeralPayload(previousItem: previousItem, updatedItem: updatedItem)
+            assertIncrementalSourceItemIdentity(previousID: previousItem.id, updatedID: updatedItem.id)
             updateToolCorrelationIndexes(previousItem: previousItem, updatedItem: updatedItem, at: index)
             finishIncrementalSourceItemsMutation(
                 .replace(index: index, previousKind: previousItem.kind, currentKind: updatedItem.kind),
@@ -2652,18 +2763,21 @@ extension AgentModeViewModel {
             var updatedItem = previousItem
             mutate(&updatedItem)
             guard updatedItem != previousItem else { return }
-            var candidateItems = items
-            candidateItems[index] = updatedItem
-            if commitRepairedSourceItemsIfNeeded(candidateItems, diagnosticContext: "mutateItem", caller: caller) {
-                lastActivityAt = Date()
-                isDirty = true
-                return
+            if !admitsIncrementalSourceItemID(updatedItem.id, replacing: previousItem.id) {
+                var candidateItems = items
+                candidateItems[index] = updatedItem
+                if commitRepairedSourceItemsIfNeeded(candidateItems, diagnosticContext: "mutateItem", caller: caller) {
+                    lastActivityAt = Date()
+                    isDirty = true
+                    return
+                }
             }
             suppressSourceItemsChanged = true
             items[index] = updatedItem
             suppressSourceItemsChanged = false
             nextSequenceIndex = max(nextSequenceIndex, updatedItem.sequenceIndex + 1)
             reconcileIncrementalEphemeralPayload(previousItem: previousItem, updatedItem: updatedItem)
+            assertIncrementalSourceItemIdentity(previousID: previousItem.id, updatedID: updatedItem.id)
             updateToolCorrelationIndexes(previousItem: previousItem, updatedItem: updatedItem, at: index)
             finishIncrementalSourceItemsMutation(.mutate(index: index, itemKind: updatedItem.kind), caller: caller)
             lastActivityAt = Date()
@@ -2710,18 +2824,21 @@ extension AgentModeViewModel {
             var updatedItem = previousItem
             mutate(&updatedItem)
             guard updatedItem != previousItem else { return }
-            var candidateItems = items
-            candidateItems[index] = updatedItem
-            if commitRepairedSourceItemsIfNeeded(candidateItems, diagnosticContext: "updateLastItem", caller: caller) {
-                lastActivityAt = Date()
-                isDirty = true
-                return
+            if !admitsIncrementalSourceItemID(updatedItem.id, replacing: previousItem.id) {
+                var candidateItems = items
+                candidateItems[index] = updatedItem
+                if commitRepairedSourceItemsIfNeeded(candidateItems, diagnosticContext: "updateLastItem", caller: caller) {
+                    lastActivityAt = Date()
+                    isDirty = true
+                    return
+                }
             }
             suppressSourceItemsChanged = true
             items[index] = updatedItem
             suppressSourceItemsChanged = false
             nextSequenceIndex = max(nextSequenceIndex, updatedItem.sequenceIndex + 1)
             reconcileIncrementalEphemeralPayload(previousItem: previousItem, updatedItem: updatedItem)
+            assertIncrementalSourceItemIdentity(previousID: previousItem.id, updatedID: updatedItem.id)
             updateToolCorrelationIndexes(previousItem: previousItem, updatedItem: updatedItem, at: index)
             finishIncrementalSourceItemsMutation(
                 .replace(index: index, previousKind: previousItem.kind, currentKind: updatedItem.kind),

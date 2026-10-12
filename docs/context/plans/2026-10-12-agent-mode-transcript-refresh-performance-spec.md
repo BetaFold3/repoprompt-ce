@@ -179,7 +179,7 @@ Step D4 — done | rounds 1/2 | open: none | downgraded: none | assumed: raw-inp
 
 ### D5 — O(change) source-item commit
 
-Step D5 — todo | rounds 0/2 | open: none | downgraded: none | assumed: none | deferred: none
+Step D5 — done | rounds 1/2 | open: none | downgraded: none | assumed: focused boundary validation is commit gate; preserve existing single-row assertion contract per D5-final.md | deferred: full-root failure/provenance retry, live timing, rare collision double repair and existing sidecar/index drift per D5-final.md
 
 - Remove the second duplicate-ID repair: `commitSourceItems` repairs, then `rebuildSourceItemDerivedState` repairs again.
 - For ranged appends and in-place updates, update `liveItemIDs` and the ephemeral payload map only for the changed indices. Keep the full rebuild for structural, remove, replace-all, and silent paths.
