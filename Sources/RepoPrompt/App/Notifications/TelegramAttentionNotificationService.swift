@@ -86,6 +86,8 @@ final class TelegramAttentionNotificationService {
         case tokenRemovedOffNotSaved
         case tokenRemoveFailed
         case tokenRemoveFailedOffNotSaved
+        case idleThresholdSaved
+        case invalidIdleThreshold
         case settingsSaveFailed
         case notConfigured
         /// A failed configuration write suspended delivery until a later save succeeds.
@@ -109,6 +111,8 @@ final class TelegramAttentionNotificationService {
             case .tokenRemovedOffNotSaved: "Bot token removed. Automatic notifications are off for this launch only: the off setting could not be saved."
             case .tokenRemoveFailed: "Could not remove the bot token. Automatic notifications are off, and delivery is suspended until a token is saved."
             case .tokenRemoveFailedOffNotSaved: "Could not remove the bot token or save the off setting. Automatic notifications are off for this launch only and may resume next launch."
+            case .idleThresholdSaved: "Idle setting saved."
+            case .invalidIdleThreshold: "Enter whole minutes, 0 or more. Nothing was changed."
             case .settingsSaveFailed: "Could not save settings. The change was not applied."
             case .notConfigured: "Save a bot token and chat ID first."
             case .deliverySuspended: "Telegram delivery is suspended until a configuration save succeeds."
@@ -143,6 +147,8 @@ final class TelegramAttentionNotificationService {
     /// The automatic-notification preference; admission is enabled only when also configured.
     private(set) var isEnabled = false
     private(set) var chatID: String?
+    /// The adopted saved idle threshold for automatic notifications; 0 means always notify.
+    private(set) var idleThresholdMinutes = GlobalScalarPreferences.TelegramSettings.defaultIdleThresholdMinutes
     private(set) var tokenStatus: TokenStatus = .notLoaded
     private(set) var storagePersistsAcrossLaunches = true
     /// A bot token and chat ID are configured and delivery is installed.
@@ -164,6 +170,8 @@ final class TelegramAttentionNotificationService {
     /// `observedEnabled` stays observable: it drives `offIsUnsaved`.
     private var observedEnabled = false
     @ObservationIgnored private var observedChatID: String?
+    /// The settings idle-policy revision adopted with `idleThresholdMinutes`.
+    @ObservationIgnored private var observedIdlePolicyRevision: UInt64 = 0
     @ObservationIgnored private var settingsObservation: AnyCancellable?
 
     init(
@@ -228,6 +236,7 @@ final class TelegramAttentionNotificationService {
         observedChatID = settings.telegramChatID()
         isEnabled = observedEnabled
         chatID = observedChatID
+        adoptSavedIdlePolicy()
         switch dependencies.tokenStore.read() {
         case let .token(stored):
             token = stored
@@ -285,6 +294,21 @@ final class TelegramAttentionNotificationService {
         deliverySuspended = false
         installDelivery()
         return finish(.chatIDSaved, true)
+    }
+
+    /// Saves the automatic-notification idle threshold in whole minutes (0 = always notify).
+    /// Changes only the automatic idle policy: the sender, pacer, token, and pending manual
+    /// tests are untouched; pending automatic events are not sent under the old policy.
+    @discardableResult
+    func saveIdleThresholdMinutes(_ draft: String) -> Bool {
+        guard let settings else { return finish(.unavailableInThisLaunch, false) }
+        let trimmed = draft.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, trimmed.unicodeScalars.allSatisfy({ Self.asciiDigits.contains($0) }),
+              let minutes = Int(trimmed)
+        else { return finish(.invalidIdleThreshold, false) }
+        guard settings.setTelegramIdleThresholdMinutes(minutes) else { return finish(.settingsSaveFailed, false) }
+        adoptSavedIdlePolicy()
+        return finish(.idleThresholdSaved, true)
     }
 
     /// Saves a new bot token. A blank or invalid draft changes nothing.
@@ -373,7 +397,7 @@ final class TelegramAttentionNotificationService {
     static func message(for suppression: AttentionNotificationSuppression) -> String {
         switch suppression {
         case .disabled: "Not sent: automatic notifications were off."
-        case .enableChanged: "Not sent: notifications were turned off or on before sending."
+        case .enableChanged: "Not sent: automatic notification settings (on/off or idle) changed before sending."
         case .configurationChanged: "Not sent: notification settings changed before sending."
         case .ineligibleSession: "Not sent: the session was not a root session you drive."
         case .successorTookOver: "Not sent: a follow-up continued the session."
@@ -383,6 +407,8 @@ final class TelegramAttentionNotificationService {
     }
 
     // MARK: - Private
+
+    private static let asciiDigits: ClosedRange<Unicode.Scalar> = "0" ... "9"
 
     private var notConfiguredResult: ActionResult {
         deliverySuspended ? .deliverySuspended : .notConfigured
@@ -402,8 +428,8 @@ final class TelegramAttentionNotificationService {
     /// Installs one immutable sender for the current token and chat ID (or none). Every call
     /// starts a new configuration generation, so events captured earlier never use it. Final
     /// admission also re-reads the saved chat ID (and, for automatic events, the saved enable
-    /// flag), so a reload not yet reconciled by the asynchronous observer cannot send through
-    /// this sender.
+    /// flag and idle policy), so a reload not yet reconciled by the asynchronous observer
+    /// cannot send through this sender or under an idle policy it has not adopted.
     private func installDelivery() {
         var delivery: TelegramPacedAttentionDelivery?
         if !deliverySuspended, let dependencies, let token, let chat = chatID.flatMap(TelegramChatID.init) {
@@ -412,7 +438,7 @@ final class TelegramAttentionNotificationService {
         let installedChatID = chatID
         admission.setDeliveryConfiguration(delivery) { [weak self] policy in
             guard let self, let settings, settings.telegramChatID() == installedChatID else { return false }
-            return policy == .manualTest || settings.telegramNotificationsEnabled()
+            return policy == .manualTest || (settings.telegramNotificationsEnabled() && savedIdlePolicyIsAdopted(settings))
         }
         isDeliveryConfigured = delivery != nil
         applyEnablement()
@@ -420,6 +446,22 @@ final class TelegramAttentionNotificationService {
 
     private func applyEnablement() {
         admission.setEnabled(automaticNotificationsActive)
+    }
+
+    /// The saved idle threshold and its revision equal the adopted pair (a change and revert not
+    /// yet observed differs by revision).
+    private func savedIdlePolicyIsAdopted(_ settings: GlobalSettingsStore) -> Bool {
+        settings.telegramIdleThresholdMinutes() == idleThresholdMinutes
+            && settings.telegramIdlePolicyRevision == observedIdlePolicyRevision
+    }
+
+    /// Adopts the saved idle threshold and revision into this service and the admission. No-op
+    /// when unchanged.
+    private func adoptSavedIdlePolicy() {
+        guard let settings, !savedIdlePolicyIsAdopted(settings) else { return }
+        idleThresholdMinutes = settings.telegramIdleThresholdMinutes()
+        observedIdlePolicyRevision = settings.telegramIdlePolicyRevision
+        admission.setIdlePolicy(minutes: idleThresholdMinutes, sourceRevision: observedIdlePolicyRevision)
     }
 
     /// Adopts settings values replaced outside this service (reload, recovery, import). Values
@@ -439,5 +481,6 @@ final class TelegramAttentionNotificationService {
             isEnabled = savedEnabled
             applyEnablement()
         }
+        adoptSavedIdlePolicy()
     }
 }

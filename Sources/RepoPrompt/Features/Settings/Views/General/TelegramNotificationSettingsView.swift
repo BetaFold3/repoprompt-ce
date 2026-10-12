@@ -6,6 +6,7 @@ import SwiftUI
 struct TelegramNotificationSettingsView: View {
     let service: TelegramAttentionNotificationService
     @State private var chatIDDraft = ""
+    @State private var idleMinutesDraft = ""
     @State private var tokenDraft = ""
     @Environment(\.repoPromptFontScalePreset) private var fontPreset
 
@@ -32,7 +33,7 @@ struct TelegramNotificationSettingsView: View {
 
                         SettingToggle(
                             title: "Send Telegram notifications",
-                            description: "Off by default. When this Mac's idle time is readable, notifications are sent only after 5 minutes without input.",
+                            description: "Off by default. Automatic notifications use the idle setting below. Zero means always notify; otherwise enter whole minutes. If idle time is unavailable, notifications are sent. Events skipped while you are active are not sent later.",
                             isOn: enabledBinding
                         )
                         .disabled(!service.isStarted)
@@ -44,6 +45,7 @@ struct TelegramNotificationSettingsView: View {
                             Button("Retry Saving Off") { _ = service.setEnabled(false) }
                         }
 
+                        idleRow
                         chatIDRow
                         tokenRow
 
@@ -54,6 +56,7 @@ struct TelegramNotificationSettingsView: View {
                                 label("Test: \(TelegramAttentionNotificationService.message(for: record))")
                             }
                         }
+                        label("Send Test ignores the idle setting and queues a test message, even while automatic notifications are off.")
 
                         if let action = service.lastAction {
                             label(action.message)
@@ -73,8 +76,44 @@ struct TelegramNotificationSettingsView: View {
             }
             .padding(fontPreset.scaledClamped(20, max: 28))
         }
-        .onAppear { chatIDDraft = service.chatID ?? "" }
+        .onAppear {
+            chatIDDraft = service.chatID ?? ""
+            idleMinutesDraft = String(service.idleThresholdMinutes)
+        }
         .onDisappear { tokenDraft = "" }
+    }
+
+    private var idleRow: some View {
+        VStack(alignment: .leading, spacing: fontPreset.scaledClamped(4, max: 6)) {
+            HStack(spacing: fontPreset.scaledClamped(8, max: 12)) {
+                TextField("Idle minutes", text: $idleMinutesDraft)
+                    .onSubmit { saveIdleMinutes(idleMinutesDraft) }
+                    .textFieldStyle(.roundedBorder)
+                    .frame(maxWidth: 120)
+                Button("Save Idle Setting") { saveIdleMinutes(idleMinutesDraft) }
+                    .disabled(!service.isStarted)
+                Button("Always Notify (0 minutes)") { saveIdleMinutes("0") }
+                    .disabled(!service.isStarted)
+            }
+            if service.isStarted {
+                label(savedIdleDescription)
+            }
+        }
+    }
+
+    private var savedIdleDescription: String {
+        let minutes = service.idleThresholdMinutes
+        if minutes == 0 {
+            return "Saved idle setting: always notify."
+        }
+        return "Saved idle setting: at least \(minutes) minute\(minutes == 1 ? "" : "s") idle."
+    }
+
+    /// Keeps an invalid or unsaved draft for correction; normalizes it after a successful save.
+    private func saveIdleMinutes(_ draft: String) {
+        if service.saveIdleThresholdMinutes(draft) {
+            idleMinutesDraft = String(service.idleThresholdMinutes)
+        }
     }
 
     private var chatIDRow: some View {

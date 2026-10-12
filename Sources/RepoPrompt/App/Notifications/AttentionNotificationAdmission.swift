@@ -65,7 +65,8 @@ extension AttentionNotificationDelivering {
 enum AttentionNotificationSuppression: String, Equatable {
     /// Disabled at the event, or no delivery is configured.
     case disabled
-    /// Disabled, or disabled and re-enabled, between capture and admission.
+    /// Automatic notification preferences (on/off or the idle threshold) changed, possibly and
+    /// back, between capture and admission.
     case enableChanged
     /// The delivery configuration was replaced or removed, or its saved notification settings
     /// changed, between capture and admission.
@@ -77,7 +78,7 @@ enum AttentionNotificationSuppression: String, Equatable {
     case successorTookOver
     /// The session, its binding, or the event itself is no longer current at admission.
     case eventNoLongerCurrent
-    /// Mac input idle time was readable and below the threshold at the event.
+    /// Mac input idle time was readable and below the idle threshold at the event.
     case userActive
 }
 
@@ -144,10 +145,13 @@ final class AttentionNotificationAdmission {
         idleSeconds: { TelegramAttentionIdleReader.secondsSinceLastInput() }
     ))
 
-    static let minimumIdleSeconds: TimeInterval = 5 * 60
-
     private(set) var isEnabled = false
-    /// Bumped on every enable change; a capture from another generation is never admitted.
+    /// Minimum idle minutes for automatic events at admission; 0 means always (no idle check).
+    private(set) var idleThresholdMinutes = GlobalScalarPreferences.TelegramSettings.defaultIdleThresholdMinutes
+    /// The settings idle-policy revision adopted with `idleThresholdMinutes`.
+    private(set) var idlePolicySourceRevision: UInt64 = 0
+    /// Bumped on every automatic-policy change (enable or idle policy); an automatic capture from
+    /// another generation is never admitted. Manual tests ignore it.
     private(set) var enableGeneration: UInt64 = 0
     /// Tombstones for every decided event, kept for the app lifetime.
     private(set) var records: [AttentionNotificationEventKey: Record] = [:]
@@ -182,6 +186,19 @@ final class AttentionNotificationAdmission {
     func setEnabled(_ enabled: Bool) {
         guard enabled != isEnabled else { return }
         isEnabled = enabled
+        enableGeneration &+= 1
+    }
+
+    /// Adopts the idle policy (minutes, 0 = always) and its settings revision. Any change to
+    /// either fences pending automatic captures; the delivery snapshot and manual tests are kept.
+    func setIdlePolicy(minutes: Int, sourceRevision: UInt64) {
+        guard minutes >= 0 else {
+            assertionFailure("Idle threshold minutes must be nonnegative")
+            return
+        }
+        guard minutes != idleThresholdMinutes || sourceRevision != idlePolicySourceRevision else { return }
+        idleThresholdMinutes = minutes
+        idlePolicySourceRevision = sourceRevision
         enableGeneration &+= 1
     }
 
@@ -310,7 +327,9 @@ final class AttentionNotificationAdmission {
             suppress(key, reason: .eventNoLongerCurrent)
             return false
         }
-        if let idle = capture.idleSecondsAtEvent, idle < Self.minimumIdleSeconds {
+        if capture.policy == .automatic, idleThresholdMinutes > 0, let idle = capture.idleSecondsAtEvent,
+           idle < TimeInterval(idleThresholdMinutes) * 60
+        {
             suppress(key, reason: .userActive)
             return false
         }

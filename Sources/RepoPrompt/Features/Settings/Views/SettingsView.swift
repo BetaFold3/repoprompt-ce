@@ -742,7 +742,7 @@ enum SettingsTab: String, CaseIterable {
         case .telemetry:
             ["telemetry", "privacy", "crash", "diagnostics", "sentry"]
         case .notifications:
-            ["notifications", "telegram", "alerts", "phone", "bot token", "chat id", "send test"]
+            ["notifications", "telegram", "alerts", "phone", "bot token", "chat id", "send test", "idle", "always notify"]
         case .chatSettings:
             [
                 "chat",

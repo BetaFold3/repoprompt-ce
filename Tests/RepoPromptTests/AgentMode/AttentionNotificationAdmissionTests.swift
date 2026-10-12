@@ -1039,6 +1039,104 @@ final class AttentionNotificationAdmissionTests: XCTestCase {
         }
     }
 
+    /// Configurable idle policy (Slice 12): default 5 minutes, custom minutes, 0 = always, and
+    /// `Int.max` without overflow. Idle is sampled once at capture; a dropped event is never
+    /// replayed after the policy changes; identical policies keep the automatic generation, and a
+    /// same-minutes revision change (change and revert) still fences. Manual tests ignore idle.
+    func testConfigurableIdlePolicyIsSampledAtEventTimeAndFencesOnlyAutomaticCaptures() async throws {
+        let delivery = StubDelivery(mode: .succeed)
+        var idle: TimeInterval? = 0
+        var idleReads = 0
+        let admission = AttentionNotificationAdmission(environment: .init(
+            delivery: delivery,
+            idleSeconds: {
+                idleReads += 1
+                return idle
+            }
+        ))
+        admission.setEnabled(true)
+        XCTAssertEqual(admission.idleThresholdMinutes, 5)
+        XCTAssertEqual(admission.idlePolicySourceRevision, 0)
+
+        func decide(_ seconds: TimeInterval?) async throws -> AttentionNotificationAdmission.Record {
+            idle = seconds
+            let event = AttentionNotificationEvent(
+                key: .turnCompleted(sessionID: UUID(), attemptID: UUID()),
+                workspaceName: nil,
+                sessionName: "Root",
+                content: .turnCompleted(finalAssistantText: "done")
+            )
+            admission.submit(admission.makeCapture(event: event, isStillCurrent: { true }))
+            return try await waitForRecord(admission, event.key) { $0 != .admitted }
+        }
+
+        let policies: [(minutes: Int, idle: [(TimeInterval?, AttentionNotificationAdmission.Record)])] = [
+            (5, [(299, .suppressed(.userActive)), (300, .delivered(.sent)), (nil, .delivered(.sent))]),
+            (2, [(119, .suppressed(.userActive)), (120, .delivered(.sent))]),
+            (0, [(0, .delivered(.sent)), (1, .delivered(.sent))]),
+            (Int.max, [(1e12, .suppressed(.userActive)), (nil, .delivered(.sent))])
+        ]
+        for (index, policy) in policies.enumerated() {
+            admission.setIdlePolicy(minutes: policy.minutes, sourceRevision: UInt64(index))
+            for (seconds, expected) in policy.idle {
+                let reads = idleReads
+                let record = try await decide(seconds)
+                XCTAssertEqual(record, expected, "\(policy.minutes) min, idle \(String(describing: seconds))")
+                XCTAssertEqual(idleReads, reads + 1, "Sampled once per automatic capture")
+            }
+        }
+
+        admission.setIdlePolicy(minutes: 5, sourceRevision: 10)
+        idle = 10
+        let active = AttentionNotificationEvent(
+            key: .turnCompleted(sessionID: UUID(), attemptID: UUID()),
+            workspaceName: nil,
+            sessionName: "Root",
+            content: .turnCompleted(finalAssistantText: "active")
+        )
+        let capture = admission.makeCapture(event: active, isStillCurrent: { true })
+        idle = 10000
+        admission.submit(capture)
+        let dropped = try await waitForRecord(admission, active.key)
+        XCTAssertEqual(dropped, .suppressed(.userActive), "Decided by the event-time sample")
+        admission.setIdlePolicy(minutes: 0, sourceRevision: 11)
+        admission.submit(capture)
+        admission.submit(admission.makeCapture(event: active, isStillCurrent: { true }))
+        try await waitUntil("the queue to drain") { admission.pendingEventKeys.isEmpty }
+        XCTAssertEqual(admission.records[active.key], .suppressed(.userActive), "Never replayed")
+
+        let generation = admission.enableGeneration
+        admission.setIdlePolicy(minutes: 0, sourceRevision: 11)
+        XCTAssertEqual(admission.enableGeneration, generation, "An identical policy keeps the generation")
+        admission.setIdlePolicy(minutes: 0, sourceRevision: 13)
+        XCTAssertEqual(admission.enableGeneration, generation + 1, "Same minutes, newer revision still fences")
+
+        let fence = AdmissionFence()
+        let fenced = AttentionNotificationAdmission(environment: .init(
+            delivery: delivery,
+            idleSeconds: { 10 },
+            beforeAdmission: { await fence.pause($0) }
+        ))
+        fenced.setEnabled(true)
+        let automatic = AttentionNotificationEvent(
+            key: .turnCompleted(sessionID: UUID(), attemptID: UUID()),
+            workspaceName: nil,
+            sessionName: "Root",
+            content: .turnCompleted(finalAssistantText: "pending")
+        )
+        fenced.setIdlePolicy(minutes: 0, sourceRevision: 1)
+        fenced.submit(fenced.makeCapture(event: automatic, isStillCurrent: { true }))
+        let test = fenced.submitManualTest { true }
+        try await waitForPauses(fence, 1)
+        fenced.setIdlePolicy(minutes: 5, sourceRevision: 2)
+        fenced.setIdlePolicy(minutes: 0, sourceRevision: 3)
+        fence.release()
+        let automaticRecord = try await waitForRecord(fenced, automatic.key)
+        XCTAssertEqual(automaticRecord, .suppressed(.enableChanged))
+        let testRecord = try await waitForRecord(fenced, test) { $0 != .admitted }
+        XCTAssertEqual(testRecord, .delivered(.sent), "Manual tests ignore idle policy changes and idle")
+    }
+
     // MARK: - Hanging and failing delivery
 
     /// Over the paced Telegram path with a stub HTTP client: a hanging request holds later

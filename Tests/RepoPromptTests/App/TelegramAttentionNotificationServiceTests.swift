@@ -518,6 +518,193 @@ final class TelegramAttentionNotificationServiceTests: XCTestCase {
         XCTAssertEqual(fixture.http.requestCount, 3)
     }
 
+    // MARK: - Idle policy (Slice 12)
+
+    /// An automatic event held before admission is never sent under an idle policy other than
+    /// the one it was captured under: explicit saves (including change-and-revert) fence it by
+    /// the automatic generation, and saved changes not yet adopted by the asynchronous observer
+    /// (including change-and-revert) fence it at the final saved-source check.
+    func testIdlePolicyChangesBeforeAdmissionNeverPostPendingAutomaticEvents() async throws {
+        enum Change: String, CaseIterable {
+            case explicitAlwaysFromDefault, explicitIncrease, explicitChangeAndRevert
+            case externalReload, externalChangeAndRevert
+        }
+        for change in Change.allCases {
+            let startMinutes = change == .explicitAlwaysFromDefault ? 5 : 0
+            let fixture = try makeFixture(enabled: true, idle: 10, idleMinutes: startMinutes)
+            fixture.service.start(launch: Self.allowedLaunch)
+            XCTAssertEqual(fixture.service.idleThresholdMinutes, startMinutes, change.rawValue)
+            XCTAssertEqual(fixture.admission.idleThresholdMinutes, startMinutes, change.rawValue)
+            let deliveryGeneration = fixture.admission.deliveryGeneration
+            fixture.fence.holds = true
+            var minutesAtAdmission: Int?
+            fixture.fence.onPass = { minutesAtAdmission = fixture.service.idleThresholdMinutes }
+            let event = completionEvent(text: "automatic")
+            fixture.admission.submit(fixture.admission.makeCapture(event: event, isStillCurrent: { true }))
+            try await waitUntil("\(change): the event to reach the fence") { fixture.fence.pauseCount == 1 }
+
+            let expected: AttentionNotificationSuppression
+            let finalMinutes: Int
+            switch change {
+            case .explicitAlwaysFromDefault:
+                XCTAssertTrue(fixture.service.saveIdleThresholdMinutes("0"))
+                (expected, finalMinutes) = (.enableChanged, 0)
+            case .explicitIncrease:
+                XCTAssertTrue(fixture.service.saveIdleThresholdMinutes("15"))
+                (expected, finalMinutes) = (.enableChanged, 15)
+            case .explicitChangeAndRevert:
+                XCTAssertTrue(fixture.service.saveIdleThresholdMinutes("5"))
+                XCTAssertTrue(fixture.service.saveIdleThresholdMinutes("0"))
+                (expected, finalMinutes) = (.enableChanged, 0)
+            case .externalReload, .externalChangeAndRevert:
+                fixture.fence.release()
+                let writer = try externalWriter(fixture)
+                XCTAssertTrue(writer.setTelegramIdleThresholdMinutes(5))
+                XCTAssertTrue(fixture.settings.reloadFromDisk())
+                if change == .externalChangeAndRevert {
+                    XCTAssertTrue(writer.setTelegramIdleThresholdMinutes(0))
+                    XCTAssertTrue(fixture.settings.reloadFromDisk())
+                }
+                XCTAssertEqual(fixture.service.idleThresholdMinutes, 0, "\(change): the observer has not run yet")
+                (expected, finalMinutes) = (.configurationChanged, change == .externalReload ? 5 : 0)
+            }
+            fixture.fence.release()
+
+            let record = try await waitForRecord(fixture.admission, event.key)
+            XCTAssertEqual(record, .suppressed(expected), change.rawValue)
+            if change == .externalReload || change == .externalChangeAndRevert {
+                XCTAssertEqual(minutesAtAdmission, 0, "\(change): admitted before the observer adopted the reload")
+            }
+            XCTAssertEqual(fixture.http.requestCount, 0, change.rawValue)
+
+            try await waitUntil("\(change): reconciliation") {
+                fixture.admission.idlePolicySourceRevision == fixture.settings.telegramIdlePolicyRevision
+            }
+            XCTAssertEqual(fixture.service.idleThresholdMinutes, finalMinutes, change.rawValue)
+            XCTAssertEqual(fixture.admission.idleThresholdMinutes, finalMinutes, change.rawValue)
+            XCTAssertEqual(fixture.admission.deliveryGeneration, deliveryGeneration, "\(change): sender kept")
+            XCTAssertEqual(fixture.factory.calls, 1, change.rawValue)
+            XCTAssertEqual(fixture.backend.calls.map(\.operation), [.get], "\(change): no token reread")
+        }
+    }
+
+    /// Invalid drafts, saves of the current effective value, unchanged reloads, and failed saves
+    /// change neither the policy nor its revision, and a held automatic event stays valid and is
+    /// sent (released before the settings observer runs).
+    func testInvalidUnchangedAndFailedIdleSavesKeepPolicyAndPendingEvents() async throws {
+        let fixture = try makeFixture(enabled: true, idle: 10, idleMinutes: 0)
+        fixture.service.start(launch: Self.allowedLaunch)
+        let revision = fixture.settings.telegramIdlePolicyRevision
+        let enableGeneration = fixture.admission.enableGeneration
+        let deliveryGeneration = fixture.admission.deliveryGeneration
+        fixture.fence.holds = true
+        let event = completionEvent(text: "automatic")
+        fixture.admission.submit(fixture.admission.makeCapture(event: event, isStillCurrent: { true }))
+        try await waitUntil("the event to reach the fence") { fixture.fence.pauseCount == 1 }
+
+        for draft in ["", "  ", "-1", "+5", "1.5", "1e3", "5 min", "\u{0663}", "99999999999999999999999"] {
+            XCTAssertFalse(fixture.service.saveIdleThresholdMinutes(draft), draft)
+            XCTAssertEqual(fixture.service.lastAction, .invalidIdleThreshold, draft)
+        }
+        XCTAssertFalse(fixture.settings.setTelegramIdleThresholdMinutes(-1), "The store rejects negatives")
+        XCTAssertTrue(fixture.service.saveIdleThresholdMinutes("0"))
+        XCTAssertTrue(fixture.service.saveIdleThresholdMinutes(" 00 "))
+        XCTAssertEqual(fixture.service.lastAction, .idleThresholdSaved)
+        XCTAssertTrue(fixture.settings.reloadFromDisk())
+        fixture.fileStore.failSaves = true
+        XCTAssertFalse(fixture.service.saveIdleThresholdMinutes("5"))
+        XCTAssertEqual(fixture.service.lastAction, .settingsSaveFailed)
+        fixture.fence.release()
+
+        XCTAssertEqual(fixture.settings.telegramIdleThresholdMinutes(), 0, "The failed value was rolled back")
+        XCTAssertEqual(fixture.settings.telegramIdlePolicyRevision, revision)
+        XCTAssertEqual(fixture.service.idleThresholdMinutes, 0)
+        XCTAssertEqual(fixture.admission.idleThresholdMinutes, 0)
+        XCTAssertEqual(fixture.admission.enableGeneration, enableGeneration)
+        XCTAssertEqual(fixture.admission.deliveryGeneration, deliveryGeneration)
+        XCTAssertTrue(fixture.service.isDeliveryConfigured)
+        XCTAssertTrue(fixture.service.automaticNotificationsActive)
+        try await waitForRecord(fixture.admission, event.key) { $0 == .delivered(.sent) }
+        XCTAssertEqual(fixture.http.requestCount, 1)
+
+        fixture.fileStore.failSaves = false
+        XCTAssertTrue(fixture.service.saveIdleThresholdMinutes("007"))
+        XCTAssertEqual(fixture.service.idleThresholdMinutes, 7, "Leading zeroes normalize")
+        XCTAssertEqual(fixture.settings.telegramIdlePolicyRevision, revision + 1)
+    }
+
+    /// Idle-only changes (explicit saves and an unobserved reload) never touch the sender, the
+    /// pacer, or the token, and never drop a held Send test; Send test ignores idle.
+    func testManualTestSurvivesIdleOnlyChangesWithSameSenderAndPacer() async throws {
+        let fixture = try makeFixture(idle: 10)
+        fixture.service.start(launch: Self.allowedLaunch)
+        let deliveryGeneration = fixture.admission.deliveryGeneration
+        fixture.fence.holds = true
+        XCTAssertTrue(fixture.service.sendTest())
+        let key = try XCTUnwrap(fixture.service.lastTestKey)
+        try await waitUntil("the test to reach the fence") { fixture.fence.pauseCount == 1 }
+
+        XCTAssertTrue(fixture.service.saveIdleThresholdMinutes("0"))
+        XCTAssertTrue(fixture.service.saveIdleThresholdMinutes("30"))
+        XCTAssertTrue(fixture.service.isTestPending)
+        let writer = try externalWriter(fixture)
+        XCTAssertTrue(writer.setTelegramIdleThresholdMinutes(3))
+        fixture.fence.release()
+        XCTAssertTrue(fixture.settings.reloadFromDisk())
+
+        try await waitForRecord(fixture.admission, key) { $0 == .delivered(.sent) }
+        XCTAssertEqual(fixture.http.texts, [TelegramAttentionMessageRenderer.testMessage])
+        try await waitUntil("reconciliation") { fixture.service.idleThresholdMinutes == 3 }
+        XCTAssertTrue(fixture.service.sendTest())
+        try await waitForRecord(fixture.admission, XCTUnwrap(fixture.service.lastTestKey)) { $0 == .delivered(.sent) }
+        XCTAssertEqual(fixture.http.requestTimes, [.zero, .seconds(1)], "The same pacer")
+        XCTAssertEqual(fixture.admission.deliveryGeneration, deliveryGeneration, "The same sender")
+        XCTAssertEqual(fixture.factory.calls, 1)
+        XCTAssertEqual(fixture.backend.calls.map(\.operation), [.get], "No token reread")
+        XCTAssertEqual(fixture.idle.reads, 0, "Send test never reads idle")
+    }
+
+    func testIdleThresholdPersistsWithDefaultAndTracksAcceptedTransitionsOnly() throws {
+        let fixture = try makeFixture()
+        let settings = fixture.settings
+        let initial = try savedTelegram(fixture)
+        XCTAssertNil(initial?.idleThresholdMinutes)
+        XCTAssertEqual(settings.telegramIdleThresholdMinutes(), 5, "Missing means the default")
+        XCTAssertEqual(GlobalScalarPreferences.TelegramSettings.effectiveIdleThresholdMinutes(nil), 5)
+        let negative = try JSONDecoder().decode(
+            GlobalScalarPreferences.self,
+            from: Data(#"{"telegram":{"enabled":true,"chatID":"7","idleThresholdMinutes":-3}}"#.utf8)
+        )
+        XCTAssertEqual(negative.telegram?.idleThresholdMinutes, -3, "Decoded as stored; the document still loads")
+        XCTAssertEqual(GlobalScalarPreferences.TelegramSettings.effectiveIdleThresholdMinutes(negative.telegram), 5)
+
+        let start = settings.telegramIdlePolicyRevision
+        XCTAssertTrue(settings.setTelegramIdleThresholdMinutes(5))
+        let afterDefaultSave = try savedTelegram(fixture)
+        XCTAssertNil(afterDefaultSave?.idleThresholdMinutes, "Saving the effective default writes nothing")
+        XCTAssertTrue(settings.setTelegramChatID("8"))
+        XCTAssertTrue(settings.setTelegramNotificationsEnabled(true))
+        XCTAssertEqual(settings.telegramIdlePolicyRevision, start, "Other Telegram settings never advance it")
+
+        for (minutes, revision) in [(0, start + 1), (5, start + 2), (0, start + 3), (Int.max, start + 4), (42, start + 5)] {
+            XCTAssertTrue(settings.setTelegramIdleThresholdMinutes(minutes))
+            XCTAssertEqual(settings.telegramIdlePolicyRevision, revision, "\(minutes)")
+            let reloaded = GlobalSettingsStore(defaults: fixture.defaults, fileStore: GlobalSettingsFileStore(fileURL: fixture.fileURL))
+            XCTAssertEqual(reloaded.telegramIdleThresholdMinutes(), minutes, "\(minutes) round-trips")
+        }
+
+        fixture.fileStore.failSaves = true
+        XCTAssertFalse(settings.setTelegramIdleThresholdMinutes(9))
+        XCTAssertEqual(settings.telegramIdleThresholdMinutes(), 42)
+        XCTAssertEqual(settings.telegramIdlePolicyRevision, start + 5, "A failed save never advances it")
+        fixture.fileStore.failSaves = false
+        XCTAssertTrue(settings.reloadFromDisk())
+        XCTAssertEqual(settings.telegramIdlePolicyRevision, start + 5, "An unchanged reload never advances it")
+
+        let saved = try savedTelegram(fixture)
+        XCTAssertEqual(saved, GlobalScalarPreferences.TelegramSettings(enabled: true, chatID: "8", idleThresholdMinutes: 42))
+    }
+
     // MARK: - Idle
 
     func testIdleReadingIsSanitizedAndThresholdedAtEventTime() async throws {
@@ -571,6 +758,7 @@ final class TelegramAttentionNotificationServiceTests: XCTestCase {
         chatID: String? = "7",
         enabled: Bool = false,
         idle: TimeInterval? = nil,
+        idleMinutes: Int? = nil,
         ephemeral: Bool = false,
         replies: [PacedStubHTTPClient.Reply] = []
     ) throws -> Fixture {
@@ -585,6 +773,9 @@ final class TelegramAttentionNotificationServiceTests: XCTestCase {
             XCTAssertTrue(settings.setTelegramChatID(chatID))
         }
         XCTAssertTrue(settings.setTelegramNotificationsEnabled(enabled))
+        if let idleMinutes {
+            XCTAssertTrue(settings.setTelegramIdleThresholdMinutes(idleMinutes))
+        }
 
         let backend = TestSecureStorageBackend(values: token.map { [.telegramAttentionBotToken: $0] } ?? [:])
         let storage: any SecureKeyValueStorageBackend = ephemeral ? EphemeralSecureKeyValueStore() : backend
@@ -647,6 +838,19 @@ final class TelegramAttentionNotificationServiceTests: XCTestCase {
         )
         service.start(launch: Self.allowedLaunch)
         return service
+    }
+
+    /// The Telegram group as saved on disk.
+    private func savedTelegram(_ fixture: Fixture) throws -> GlobalScalarPreferences.TelegramSettings? {
+        try GlobalSettingsFileStore(fileURL: fixture.fileURL).load().scalarPreferences?.telegram
+    }
+
+    /// Another settings writer over the same saved file (its own defaults suite).
+    private func externalWriter(_ fixture: Fixture) throws -> GlobalSettingsStore {
+        let suite = "TelegramServiceWriter.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        addTeardownBlock { defaults.removePersistentDomain(forName: suite) }
+        return GlobalSettingsStore(defaults: defaults, fileStore: GlobalSettingsFileStore(fileURL: fixture.fileURL))
     }
 
     private func launch(
@@ -756,7 +960,7 @@ private final class FactoryCounter {
 
 @MainActor
 private final class IdleCounter {
-    let value: TimeInterval?
+    var value: TimeInterval?
     private(set) var reads = 0
 
     init(value: TimeInterval?) {

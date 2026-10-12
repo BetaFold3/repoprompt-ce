@@ -651,12 +651,24 @@ struct GlobalScalarPreferences: Codable, Equatable {
     }
 
     struct TelegramSettings: Codable, Equatable {
+        static let defaultIdleThresholdMinutes = 5
+
         var enabled: Bool?
         var chatID: String?
+        /// Minimum Mac idle minutes before an automatic notification is sent. Missing (or an
+        /// invalid negative stored value) means the default 5; 0 means always notify.
+        var idleThresholdMinutes: Int?
 
-        init(enabled: Bool? = nil, chatID: String? = nil) {
+        init(enabled: Bool? = nil, chatID: String? = nil, idleThresholdMinutes: Int? = nil) {
             self.enabled = enabled
             self.chatID = chatID
+            self.idleThresholdMinutes = idleThresholdMinutes
+        }
+
+        /// The idle threshold in effect for a stored settings group (nil group or field: default).
+        static func effectiveIdleThresholdMinutes(_ settings: TelegramSettings?) -> Int {
+            guard let stored = settings?.idleThresholdMinutes, stored >= 0 else { return defaultIdleThresholdMinutes }
+            return stored
         }
     }
 
