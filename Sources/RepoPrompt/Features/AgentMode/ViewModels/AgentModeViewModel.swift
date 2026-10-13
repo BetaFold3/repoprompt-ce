@@ -811,6 +811,10 @@ final class AgentModeViewModel: ObservableObject {
         private var test_currentTabIDOverride: UUID?
         private var test_activeWorkspaceIDForSessionIndexOverride: UUID?
         private var test_allowsScheduledDerivedTranscriptRefreshWithoutPromptManager = false
+        /// Replaces the background first-event delay sleep; nil keeps the real cancel-aware sleep.
+        private var test_derivedTranscriptDeferralSleep: (@Sendable (Duration) async -> Void)?
+        /// Overrides the hidden kill-switch read; nil reads the defaults key.
+        private var test_backgroundDerivedTranscriptDeferralEnabledOverride: Bool?
         private var test_afterMCPStoreEpochBegan: (@MainActor () async -> Void)?
         private var test_terminalPublicationOverride: ((
             AgentRunTerminalCommitRevision,
@@ -902,6 +906,14 @@ final class AgentModeViewModel: ObservableObject {
 
         func test_setAllowsScheduledDerivedTranscriptRefreshWithoutPromptManager(_ value: Bool) {
             test_allowsScheduledDerivedTranscriptRefreshWithoutPromptManager = value
+        }
+
+        func test_setDerivedTranscriptDeferralSleep(_ sleep: (@Sendable (Duration) async -> Void)?) {
+            test_derivedTranscriptDeferralSleep = sleep
+        }
+
+        func test_setBackgroundDerivedTranscriptDeferralEnabledOverride(_ value: Bool?) {
+            test_backgroundDerivedTranscriptDeferralEnabledOverride = value
         }
 
         func test_setAfterMCPStoreEpochBegan(_ hook: (@MainActor () async -> Void)?) {
@@ -3971,9 +3983,15 @@ final class AgentModeViewModel: ObservableObject {
             refreshStaleResetRecoveryPresentationIfNeeded(for: session)
             if !session.runState.isActive {
                 completeNextAgentTurnRuntimeFooterIfNeeded(for: session, endedAt: Date())
+                // Terminal barrier: settle background-deferred work (including the footer
+                // mutation) before persistence and republish read derived state.
+                flushDeferredDerivedTranscriptRefresh(for: session)
             }
             persistRunStateTransitionIfNeeded(for: session)
             republishTranscriptPresentationForRunStateChangeIfNeeded(session)
+        }
+        newSession.onPendingQuestionUIChanged = { [weak self] session in
+            self?.catchUpDerivedTranscriptForPendingQuestionUIChange(session)
         }
         newSession.onUsageAccountingChanged = { [weak self] session, didChangeAcceptedAccounting in
             guard let self else { return }
@@ -10043,6 +10061,7 @@ final class AgentModeViewModel: ObservableObject {
         guard let session = session(for: tabID, createIfNeeded: false) else { return }
         guard session.isCompressedHistoryRevealed != isRevealed else { return }
         session.isCompressedHistoryRevealed = isRevealed
+        flushDeferredDerivedTranscriptRefresh(for: session)
         session.transcriptProjection = materializedTranscriptProjection(for: session)
         guard canBuildOrPublishActiveTranscriptBindings(for: session) else { return }
         _ = publishTranscriptPresentation(from: session)
@@ -10052,6 +10071,7 @@ final class AgentModeViewModel: ObservableObject {
         guard let session = session(for: tabID, createIfNeeded: false) else { return }
         guard session.isTranscriptWindowExpanded != isExpanded else { return }
         session.isTranscriptWindowExpanded = isExpanded
+        flushDeferredDerivedTranscriptRefresh(for: session)
         session.transcriptProjection = materializedTranscriptProjection(for: session)
         guard canBuildOrPublishActiveTranscriptBindings(for: session) else { return }
         _ = publishTranscriptPresentation(from: session)
@@ -11020,6 +11040,7 @@ final class AgentModeViewModel: ObservableObject {
             session.derivedTranscriptRefreshGeneration &+= 1
             session.derivedTranscriptRefreshTask?.cancel()
             session.derivedTranscriptRefreshTask = nil
+            session.derivedTranscriptRefreshDeferredGeneration = nil
             #if DEBUG || EDIT_FLOW_PERF
                 session.transcriptPerformanceSnapshot.refreshImmediateCount += 1
             #endif
@@ -11031,7 +11052,12 @@ final class AgentModeViewModel: ObservableObject {
             return
         }
 
-        if session.derivedTranscriptRefreshTask != nil {
+        // A delayed task coalesces later events without moving its deadline, unless the session
+        // became publishable meanwhile: then it falls through to an undelayed next-turn task
+        // (the merged summary is kept; the generation bump makes the delayed task a no-op).
+        if session.derivedTranscriptRefreshTask != nil,
+           !session.hasDeferredDerivedTranscriptRefresh || !canBuildOrPublishActiveTranscriptBindings(for: session)
+        {
             EditFlowPerf.end(
                 EditFlowPerf.Stage.Transcript.scheduleRefresh,
                 scheduleSignpost,
@@ -11043,16 +11069,33 @@ final class AgentModeViewModel: ObservableObject {
             session.pendingDerivedTranscriptRefreshReason = .liveMutation
             return
         }
+        session.derivedTranscriptRefreshTask?.cancel()
+        session.derivedTranscriptRefreshTask = nil
 
+        // D7: a background session (one that cannot build or publish active bindings) waits a
+        // fixed window from its FIRST pending event; active sessions keep next-turn coalescing.
+        let deferralSleep: (@Sendable (Duration) async -> Void)? =
+            !canBuildOrPublishActiveTranscriptBindings(for: session)
+                && isBackgroundDerivedTranscriptDeferralEnabled
+                ? derivedTranscriptDeferralSleep
+                : nil
         EditFlowPerf.end(
             EditFlowPerf.Stage.Transcript.scheduleRefresh,
             scheduleSignpost,
-            EditFlowPerf.Dimensions(status: reason.rawValue, outcome: "scheduled")
+            EditFlowPerf.Dimensions(
+                status: reason.rawValue,
+                outcome: deferralSleep == nil ? "scheduled" : "scheduledDeferred"
+            )
         )
         session.pendingDerivedTranscriptRefreshReason = .liveMutation
         session.derivedTranscriptRefreshGeneration &+= 1
         let scheduledGeneration = session.derivedTranscriptRefreshGeneration
+        session.derivedTranscriptRefreshDeferredGeneration = deferralSleep == nil ? nil : scheduledGeneration
         session.derivedTranscriptRefreshTask = Task { @MainActor [weak self, weak session] in
+            // Weak captures stay unbound across the wait so it retains neither owner.
+            if let deferralSleep {
+                await deferralSleep(Self.backgroundDerivedTranscriptRefreshDelay)
+            }
             guard let self, let session else { return }
             guard !Task.isCancelled else { return }
             guard sessions[session.tabID] === session else { return }
@@ -11060,8 +11103,67 @@ final class AgentModeViewModel: ObservableObject {
             let scheduledReason = session.pendingDerivedTranscriptRefreshReason ?? .liveMutation
             session.pendingDerivedTranscriptRefreshReason = nil
             session.derivedTranscriptRefreshTask = nil
+            session.derivedTranscriptRefreshDeferredGeneration = nil
             refreshDerivedTranscriptState(for: session, reason: scheduledReason)
         }
+    }
+
+    /// Fixed first-event window for background `.liveMutation` refreshes (D7).
+    static let backgroundDerivedTranscriptRefreshDelay: Duration = .milliseconds(1500)
+    /// Hidden reversible kill switch: `defaults write <bundle-id> <key> -bool YES` restores
+    /// pre-D7 scheduling (no background delay, no question-aggregate catch-up).
+    static let backgroundDerivedTranscriptDeferralDisabledDefaultsKey =
+        "AgentModeDisableBackgroundTranscriptRefreshDeferral"
+
+    private var isBackgroundDerivedTranscriptDeferralEnabled: Bool {
+        #if DEBUG
+            if let override = test_backgroundDerivedTranscriptDeferralEnabledOverride {
+                return override
+            }
+        #endif
+        return !UserDefaults.standard.bool(forKey: Self.backgroundDerivedTranscriptDeferralDisabledDefaultsKey)
+    }
+
+    private var derivedTranscriptDeferralSleep: @Sendable (Duration) async -> Void {
+        #if DEBUG
+            if let test_derivedTranscriptDeferralSleep {
+                return test_derivedTranscriptDeferralSleep
+            }
+        #endif
+        // Cancel-aware: cancellation ends the wait early; the task body then re-checks it.
+        return { delay in try? await Task.sleep(for: delay) }
+    }
+
+    /// Freshness barrier: runs a background-delayed refresh now, with its pending live reason
+    /// and merged summary. A no-op unless the pending task is one D7 delayed.
+    @discardableResult
+    func flushDeferredDerivedTranscriptRefresh(tabID: UUID) -> Bool {
+        guard let session = sessions[tabID] else { return false }
+        return flushDeferredDerivedTranscriptRefresh(for: session)
+    }
+
+    @discardableResult
+    func flushDeferredDerivedTranscriptRefresh(for session: TabSession) -> Bool {
+        guard sessions[session.tabID] === session,
+              session.hasDeferredDerivedTranscriptRefresh
+        else { return false }
+        let scheduledReason = session.pendingDerivedTranscriptRefreshReason ?? .liveMutation
+        refreshDerivedTranscriptState(for: session, reason: scheduledReason)
+        return true
+    }
+
+    /// Question-aggregate barrier: question visibility changes import policy
+    /// (`hidePendingQuestionToolCall`), so a background session catches up now even without a
+    /// delayed task. Active sessions keep their existing binding-update path.
+    private func catchUpDerivedTranscriptForPendingQuestionUIChange(_ session: TabSession) {
+        guard isBackgroundDerivedTranscriptDeferralEnabled,
+              !canBuildOrPublishActiveTranscriptBindings(for: session)
+        else { return }
+        catchUpDerivedTranscriptIfNeeded(
+            for: session,
+            reason: .liveMutation,
+            publishActivePresentation: false
+        )
     }
 
     /// `discardedPendingSummaryForDiagnostics` is the summary a caller already cleared for a
@@ -11078,6 +11180,7 @@ final class AgentModeViewModel: ObservableObject {
         session.derivedTranscriptRefreshGeneration &+= 1
         session.derivedTranscriptRefreshTask?.cancel()
         session.derivedTranscriptRefreshTask = nil
+        session.derivedTranscriptRefreshDeferredGeneration = nil
         let pendingMutationSummary = reason == .liveMutation ? session.pendingSourceItemsMutationSummary : nil
         #if DEBUG || EDIT_FLOW_PERF
             // Diagnostics only: a non-live refresh still reports the summary it discards.
@@ -11713,6 +11816,7 @@ final class AgentModeViewModel: ObservableObject {
         session.derivedTranscriptRefreshGeneration &+= 1
         session.derivedTranscriptRefreshTask?.cancel()
         session.derivedTranscriptRefreshTask = nil
+        session.derivedTranscriptRefreshDeferredGeneration = nil
         let scheduledReason = session.pendingDerivedTranscriptRefreshReason ?? reason
         session.pendingDerivedTranscriptRefreshReason = nil
         refreshDerivedTranscriptState(
@@ -18068,6 +18172,15 @@ final class AgentModeViewModel: ObservableObject {
                 hasPendingHandoff: hasPendingHandoff
             )
         }
+
+        func test_buildHeadlessAgentMessage(session: TabSession, initialMessage: String) -> AgentMessage {
+            buildHeadlessAgentMessage(
+                session: session,
+                initialMessageForRun: initialMessage,
+                runID: UUID(),
+                attachments: []
+            )
+        }
     #endif
 
     private func buildHeadlessAgentMessage(
@@ -18091,7 +18204,9 @@ final class AgentModeViewModel: ObservableObject {
             fullMessage = initialMessageForRun
             resumeSessionID = continuity.resumeSessionID
         } else {
-            // Non-resumable agents: include conversation history in prompt.
+            // Non-resumable agents: include conversation history in prompt. Runs after the run
+            // lease is acquired; settle background-deferred derived state before reading it.
+            flushDeferredDerivedTranscriptRefresh(for: session)
             let conversationHistory = buildConversationHistory(for: session)
             fullMessage = conversationHistory.isEmpty
                 ? initialMessageForRun
@@ -21139,6 +21254,8 @@ final class AgentModeViewModel: ObservableObject {
         for session: TabSession,
         upToItemID: UUID?
     ) -> AgentTranscript? {
+        // Settle a background-delayed refresh before reading the derived transcript.
+        flushDeferredDerivedTranscriptRefresh(for: session)
         let hasStructuredTranscript = !session.transcript.turns.isEmpty
 
         if let upToItemID {

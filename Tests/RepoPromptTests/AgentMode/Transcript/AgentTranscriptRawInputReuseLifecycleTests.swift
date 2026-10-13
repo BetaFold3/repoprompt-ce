@@ -333,6 +333,145 @@ final class AgentTranscriptRawInputReuseLifecycleTests: XCTestCase {
         assertWorkAvoided("warm full import after retention", processed: 0)
     }
 
+    // MARK: - D7 background deferral
+
+    /// W3 under D7: both sessions are background in one view model, so live mutations wait in
+    /// the delayed window and many merge into one refresh. After every released batch, the
+    /// question barrier, and the terminal barrier, the candidate's merged-summary refresh must
+    /// equal the forced-cold reference, including numeric payload revisions and question state.
+    func testW3BackgroundDeferredBatchesEqualColdDerivation() async throws {
+        let viewModel = makeViewModel()
+        viewModel.test_setCurrentTabIDOverride(UUID())
+        defer { viewModel.test_setCurrentTabIDOverride(nil) }
+        let gate = DerivedTranscriptDeferralSleepGate()
+        defer { gate.open() }
+        viewModel.test_setDerivedTranscriptDeferralSleep(gate.makeSleep())
+        viewModel.test_setBackgroundDerivedTranscriptDeferralEnabledOverride(true)
+        let candidate = try await viewModel.ensureSessionReady(tabID: UUID())
+        let reference = try await viewModel.ensureSessionReady(tabID: UUID())
+        reference.test_forcesColdDerivedTranscriptBuild = true
+        let sessions = [candidate, reference]
+        let seed = Self.w3Seed()
+        XCTAssertEqual(seed.count, 1500)
+        XCTAssertEqual(Set(seed.filter { $0.kind == .toolResult }.compactMap(\.toolResultJSON)).count, 900)
+        for session in sessions {
+            XCTAssertFalse(viewModel.canBuildOrPublishActiveTranscriptBindings(for: session))
+        }
+
+        /// `incremental`: the merged summary admits the importer (batches carrying a user item
+        /// never do: `containsUserMutation`).
+        func releaseBatch(
+            _ step: String,
+            incremental: Bool,
+            file: StaticString = #filePath,
+            line: UInt = #line
+        ) async {
+            for session in sessions {
+                XCTAssertTrue(session.hasDeferredDerivedTranscriptRefresh, "[\(step)] deferred", file: file, line: line)
+            }
+            let attempts = candidate.transcriptPerformanceSnapshot.incrementalImportAttemptCount
+            await gate.release(sessions.map(\.derivedTranscriptRefreshTask))
+            XCTAssertEqual(
+                candidate.transcriptPerformanceSnapshot.incrementalImportAttemptCount,
+                attempts + (incremental ? 1 : 0),
+                "[\(step)] merged-summary attempts",
+                file: file,
+                line: line
+            )
+            compare(step, file: file, line: line)
+        }
+        func compare(_ step: String, file: StaticString = #filePath, line: UInt = #line) {
+            for session in sessions {
+                XCTAssertFalse(session.hasDeferredDerivedTranscriptRefresh, "[\(step)] settled", file: file, line: line)
+                XCTAssertEqual(
+                    session.derivedTranscriptSyncState?.sourceItemsRevision,
+                    session.sourceItemsRevision,
+                    "[\(step)] synchronized",
+                    file: file,
+                    line: line
+                )
+            }
+            assertEquivalent(candidate, reference, step: step, file: file, line: line)
+        }
+
+        for session in sessions {
+            session.runState = .running
+            for item in seed {
+                session.appendItem(item)
+            }
+        }
+        await releaseBatch("seed batch", incremental: false)
+
+        let invocation = UUID()
+        let call = AgentChatItem.toolCall(name: "bash", invocationID: invocation, argsJSON: #"{"command":"echo batch"}"#)
+        let result = AgentChatItem.toolResult(
+            name: "bash",
+            invocationID: invocation,
+            resultJSON: Self.bashResultJSON(index: 20000, output: "batch output"),
+            isError: false
+        )
+        let updatedResultJSON = Self.bashResultJSON(index: 20001, output: "batch output updated")
+        var thinking = AgentChatItem.thinking("Considering")
+        thinking.isStreaming = true
+        let assistant = AgentChatItem.assistant("Checking the batch.", isStreaming: true)
+        apply(sessions) { session in
+            session.appendItem(call)
+            session.appendItem(result)
+            if let index = session.items.lastIndex(where: { $0.id == result.id }) {
+                session.mutateItem(at: index) { item in
+                    item.toolResultJSON = updatedResultJSON
+                    item.text = updatedResultJSON
+                }
+            }
+            session.appendItem(thinking)
+            session.activeReasoningItemID = thinking.id
+            session.appendItem(assistant)
+            viewModel.test_endAssistantSegment(session, background: false)
+            viewModel.endActiveReasoningSegment(session)
+        }
+        await releaseBatch("append, payload revision, and segment-end batch", incremental: true)
+
+        let askInvocation = UUID()
+        let askCall = AgentChatItem.toolCall(name: "ask_user", invocationID: askInvocation, argsJSON: #"{"question":"Continue?"}"#)
+        let pending = try Self.pendingAskUser()
+        apply(sessions) { session in
+            session.appendItem(askCall)
+            session.pendingAskUser = pending
+        }
+        compare("question barrier with pending batch")
+        XCTAssertTrue(candidate.hasPendingQuestionUI)
+
+        let askResult = AgentChatItem.toolResult(
+            name: "ask_user",
+            invocationID: askInvocation,
+            resultJSON: #"{"answers":{"continue":"yes"}}"#,
+            isError: false
+        )
+        apply(sessions) { $0.pendingAskUser = nil }
+        compare("question cleared without pending batch")
+        let nextRequest = AgentChatItem.user("Next request")
+        let followUpInvocation = UUID()
+        let followUpCall = AgentChatItem.toolCall(name: "bash", invocationID: followUpInvocation, argsJSON: #"{"command":"echo next"}"#)
+        let followUpResult = AgentChatItem.toolResult(
+            name: "bash",
+            invocationID: followUpInvocation,
+            resultJSON: Self.bashResultJSON(index: 20002, output: "next output"),
+            isError: false
+        )
+        apply(sessions) { session in
+            session.appendItem(askResult)
+            session.appendItem(nextRequest)
+            session.appendItem(followUpCall)
+            session.appendItem(followUpResult)
+        }
+        await releaseBatch("answer and second-turn batch", incremental: false)
+
+        let done = AgentChatItem.assistant("Done.")
+        apply(sessions) { $0.appendItem(done) }
+        apply(sessions) { $0.runState = .completed }
+        compare("terminal barrier")
+    }
+
     // MARK: - D2 run-state-only admission
 
     /// W3 kill gate and transitions through the production entry point. History sits behind a

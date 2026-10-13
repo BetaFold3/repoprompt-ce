@@ -201,7 +201,7 @@ Measured weight: about half the main-thread time of a 1 s new-session action, an
 
 ### D7 — Throttle background-tab derivation, with flush points (owner-approved 2026-10-12, gated on D1, D2, and the consumer audit)
 
-Step D7 — blocked | rounds 0/2 | open: D2 evidence gate and activation measurement unavailable; D7-consumer-audit.md | downgraded: none | assumed: keep existing scheduler until rebuilt-app evidence; remaining-gates.md | deferred: conditional throttle implementation and live no-regression validation
+Step D7 — blocked | rounds 0/2 | open: owner W2 activation/first-publication before-after qualification | downgraded: none | assumed: implementation validated and reviewed; fixed first-event window; nominal preview lag; D7-final.md | deferred: memory-pressure flush, queued-question duplicate refresh and non-reproduced OMP validation failure
 
 Design:
 - Add a trailing delay of about 1.5 s for sessions that cannot publish active bindings. Use the existing generation and cancel logic.
@@ -280,6 +280,8 @@ Pursue this only if, after D0–D7, the active-tab incremental refresh p95 is ab
 - `logCodexDebug(... transcriptRowDebugWindow(...))` on every refresh. Verify whether its argument is an `@autoclosure`.
 
 ## Decisions and provenance
+
+- Owner Decision (2026-10-13): Continue the remaining performance steps until complete.
 
 - Owner Decision (2026-10-13): Rebuild and relaunch the latest debug app now; the owner is ready.
 

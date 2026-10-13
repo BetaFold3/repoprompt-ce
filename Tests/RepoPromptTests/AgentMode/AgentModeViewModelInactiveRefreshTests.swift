@@ -269,6 +269,10 @@ final class AgentModeViewModelInactiveRefreshTests: XCTestCase {
 
     func testRefreshingInactiveSessionDoesNotClobberActivePresentation() async throws {
         let viewModel = makeViewModel()
+        // The background mutation takes D7's delayed path; an immediate test sleep keeps the
+        // drained refresh off wall-clock time.
+        viewModel.test_setDerivedTranscriptDeferralSleep { _ in }
+        viewModel.test_setBackgroundDerivedTranscriptDeferralEnabledOverride(true)
         let activeTabID = UUID()
         let inactiveTabID = UUID()
         viewModel.test_setCurrentTabIDOverride(activeTabID)

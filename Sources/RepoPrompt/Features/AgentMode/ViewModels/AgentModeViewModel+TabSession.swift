@@ -171,12 +171,37 @@ extension AgentModeViewModel {
         var worktreeBindingTransitionInProgress: Bool = false
 
         // Wait/question state
+
         @Published var waitingPrompt: String? = nil
-        @Published var pendingAskUser: AgentAskUserPendingState? = nil
-        @Published var pendingUserInputRequest: AgentRequestUserInputRequest? = nil
+
+        /// The three question props notify on aggregate (`hasPendingQuestionUI`) changes only:
+        /// draft edits and non-nil replacement keep the aggregate and stay silent.
+        @Published var pendingAskUser: AgentAskUserPendingState? = nil {
+            didSet {
+                notePendingQuestionUIAggregateChange(
+                    from: oldValue != nil || pendingUserInputRequest != nil || pendingMCPElicitationRequest != nil
+                )
+            }
+        }
+
+        @Published var pendingUserInputRequest: AgentRequestUserInputRequest? = nil {
+            didSet {
+                notePendingQuestionUIAggregateChange(
+                    from: pendingAskUser != nil || oldValue != nil || pendingMCPElicitationRequest != nil
+                )
+            }
+        }
+
         @Published var pendingApproval: AgentApprovalRequest? = nil
         @Published var pendingPermissionsRequest: AgentPermissionsRequest? = nil
-        @Published var pendingMCPElicitationRequest: AgentMCPElicitationRequest? = nil
+        @Published var pendingMCPElicitationRequest: AgentMCPElicitationRequest? = nil {
+            didSet {
+                notePendingQuestionUIAggregateChange(
+                    from: pendingAskUser != nil || pendingUserInputRequest != nil || oldValue != nil
+                )
+            }
+        }
+
         @Published var pendingApplyEditsReview: PendingApplyEditsReview? = nil
         @Published var pendingWorktreeMergeReview: PendingWorktreeMergeReview? = nil
         var queuedUserInputRequests: [AgentRequestUserInputRequest] = []
@@ -188,6 +213,14 @@ extension AgentModeViewModel {
         var pendingAskUserTimeoutGeneration: UInt64 = 0
         var hasPendingQuestionUI: Bool {
             pendingAskUser != nil || pendingUserInputRequest != nil || pendingMCPElicitationRequest != nil
+        }
+
+        /// Fired synchronously when `hasPendingQuestionUI` flips; wired by the owning view model.
+        var onPendingQuestionUIChanged: ((TabSession) -> Void)?
+
+        private func notePendingQuestionUIAggregateChange(from previousAggregate: Bool) {
+            guard previousAggregate != hasPendingQuestionUI else { return }
+            onPendingQuestionUIChanged?(self)
         }
 
         var applyEditsApprovalSubscriptionID: UUID?
@@ -1454,6 +1487,14 @@ extension AgentModeViewModel {
         var pendingDerivedTranscriptRefreshReason: DerivedTranscriptRefreshReason?
         var derivedTranscriptRefreshTask: Task<Void, Never>?
         var derivedTranscriptRefreshGeneration: UInt64 = 0
+        /// Generation of the pending refresh task when it was scheduled with the background
+        /// first-event delay. Freshness barriers flush only work that delay deferred.
+        var derivedTranscriptRefreshDeferredGeneration: UInt64?
+        var hasDeferredDerivedTranscriptRefresh: Bool {
+            derivedTranscriptRefreshTask != nil
+                && derivedTranscriptRefreshDeferredGeneration == derivedTranscriptRefreshGeneration
+        }
+
         var derivedTranscriptSyncState: DerivedTranscriptSyncState?
         var pendingCommandRunningByKey: [String: CodexNativeSessionController.CommandExecutionRunningUpdate] = [:]
         var pendingCommandRunningFlushTask: Task<Void, Never>?
@@ -1495,6 +1536,7 @@ extension AgentModeViewModel {
         func cancelEphemeralRuntimeState() {
             derivedTranscriptRefreshTask?.cancel()
             derivedTranscriptRefreshTask = nil
+            derivedTranscriptRefreshDeferredGeneration = nil
             pendingDerivedTranscriptRefreshReason = nil
             pendingCommandRunningFlushTask?.cancel()
             pendingCommandRunningFlushTask = nil
@@ -2509,6 +2551,7 @@ extension AgentModeViewModel {
             derivedTranscriptRefreshGeneration &+= 1
             derivedTranscriptRefreshTask?.cancel()
             derivedTranscriptRefreshTask = nil
+            derivedTranscriptRefreshDeferredGeneration = nil
         }
 
         @discardableResult
