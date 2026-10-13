@@ -189,7 +189,7 @@ Step D5 — done | rounds 1/2 | open: none | downgraded: none | assumed: focused
 
 ### D6 — Sidebar: one build per render pass
 
-Step D6 — done | rounds 0/2 | open: none; D6-normalization-final.md | downgraded: none | assumed: field-local empty/ASCII shortcut passed legacy equivalence and78 focused tests; OracleA/OracleB clear; no live speedup claim | deferred: post-patch creation timing and300ms goal, optional ASCII pair matrix, lazy corpus, model-catalog/recount/focus changes and wider SwiftUI cause-and-effect qualification
+Step D6 — done | rounds 0/2 | open: none; D6-normalization-final.md | downgraded: none | assumed: 254b83a8 packaged by ad6e461b;78 focused tests and OracleA/OracleB clear; relaunch question timed out unanswered; no live speedup claim | deferred: owner-approved relaunch, post-patch creation timing and300ms goal, optional ASCII pair matrix, lazy corpus, model-catalog/recount/focus changes and wider SwiftUI cause-and-effect qualification
 
 Measured weight: about half the main-thread time of a 1 s new-session action, and part of the 1.4 s of non-refresh work after a session click.
 
