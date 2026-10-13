@@ -189,7 +189,7 @@ Step D5 — done | rounds 1/2 | open: none | downgraded: none | assumed: focused
 
 ### D6 — Sidebar: one build per render pass
 
-Step D6-context-config — doing | rounds 0/2 | open: implementation and review | downgraded: none | assumed: skip only complete equal non-dirty before-save config projection; preserve actual changes and all save listeners | deferred: live savings and final full-sync runtime selection ownership
+Step D6-context-config — done | rounds 1/2 | open: none; D6-context-config-final.md | downgraded: none | assumed: skip only exact equal non-dirty config with matching active identities and live/stored prompt; 47 focused tests and both re-reviews clear; stored-only MCP prompt preservation retained | deferred: live frequency/savings, matched latency/RSS and final full-sync runtime selection ownership
 
 Step D6-creation-live — done | rounds 0/2 | open: none; D6-creation-fixes-live.md | downgraded: none | assumed: approved signed relaunch37ac09fa PID21158; direct freshCodex853.7ms andClaude579.3ms; warm firstPublish6.0/11.8ms; nativeUI-dominated workload; lost first-batch timings disclosed | deferred: 300ms creation goal, matched p95/causal gain, rendered-frame and original-load/RSS qualification
 
