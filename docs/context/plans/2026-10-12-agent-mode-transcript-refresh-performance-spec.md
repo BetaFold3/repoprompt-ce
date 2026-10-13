@@ -145,7 +145,7 @@ Use a non-structural mutation with an exact range for segment end. Either add a 
 
 ### D2 — Remove the causes of the 26 rejections (scope set by D0 data)
 
-Step D2 — blocked | rounds 0/2 | open: historical rejection causes unproven; D2-scout.md | downgraded: none | assumed: preserve all importer guards; independent D3–D6 may proceed | deferred: installed D0/live capture or deterministic reproduction to set fix scope
+Step D2 — blocked | rounds 0/2 | open: historical largest-session rejection causes not reproduced; 2026-10-13-live-check.md | downgraded: none | assumed: preserve importer guards; rebuilt DEBUG app verified | deferred: representative large-session capture, missingSummary triggers and interaction-latency qualification
 
 - Give unranged mutations real ranges.
 - If background rows in earlier turns cause the rejections, check whether they affect the final turn's projection before excluding them.
@@ -280,6 +280,8 @@ Pursue this only if, after D0–D7, the active-tab incremental refresh p95 is ab
 - `logCodexDebug(... transcriptRowDebugWindow(...))` on every refresh. Verify whether its argument is an `@autoclosure`.
 
 ## Decisions and provenance
+
+- Owner Decision (2026-10-13): Rebuild and relaunch the latest debug app now; the owner is ready.
 
 - Owner Decision (2026-10-12): Retry D3 commit; unsigned local commits are permitted for subsequent plan steps without changing global Git settings.
 
