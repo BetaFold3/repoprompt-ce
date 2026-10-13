@@ -189,7 +189,7 @@ Step D5 — done | rounds 1/2 | open: none | downgraded: none | assumed: focused
 
 ### D6 — Sidebar: one build per render pass
 
-Step D6 — done | rounds 0/2 | open: none; D6-normalization-live.md; D6-creation-remaining-investigation.md | downgraded: none | assumed: verified PID16280/build610c2205 containing254b83a8; three new creations950.7/627.1/338.2ms; autonomous read-only investigation and independent OracleA/OracleB planning complete; no matched-condition speedup claim | deferred: 300ms creation goal, optional ASCII pair matrix; recommended mapper-only per-sort semantic-key reuse remains unimplemented; collapse, published-state guards, lazy corpus, model-catalog/recount/focus changes and wider SwiftUI cause-and-effect qualification
+Step D6 — done | rounds 0/2 | open: none; D6-mapper-sort-final.md | downgraded: none | assumed: dedicated mapper-only worker completed; main final43 focused tests and OracleA/OracleB reviews clear; prior normalization/live evidence retained; no live speedup claim | deferred: 300ms creation goal, optional ASCII pair matrix, OracleB R-2 comparator delegation, collapse, published-state guards, lazy corpus, model-catalog/recount/focus changes and wider SwiftUI cause-and-effect qualification
 
 Measured weight: about half the main-thread time of a 1 s new-session action, and part of the 1.4 s of non-refresh work after a session click.
 
@@ -280,6 +280,8 @@ Pursue this only if, after D0–D7, the active-tab incremental refresh p95 is ab
 - `logCodexDebug(... transcriptRowDebugWindow(...))` on every refresh. Verify whether its argument is an `@autoclosure`.
 
 ## Decisions and provenance
+
+- Owner Decision (2026-10-13): Have a dedicated worker implement mapper-only per-sort ordering reuse; leave the additional collapse sort for later.
 
 - Owner Decision (2026-10-13): Relaunch the packaged normalization fix now.
 
