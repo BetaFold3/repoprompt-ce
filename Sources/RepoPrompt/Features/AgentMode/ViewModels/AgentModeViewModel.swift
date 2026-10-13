@@ -11066,11 +11066,14 @@ final class AgentModeViewModel: ObservableObject {
 
     /// `discardedPendingSummaryForDiagnostics` is the summary a caller already cleared for a
     /// non-live refresh; it feeds only the no-attempt diagnosis, never admission.
+    /// `permitsRunStateOnlyAdmission` is false for projection-integrity repair, which keeps
+    /// the full import.
     func refreshDerivedTranscriptState(
         for session: TabSession,
         reason: DerivedTranscriptRefreshReason = .manualRefresh,
         publishActivePresentation: Bool = true,
-        discardedPendingSummaryForDiagnostics: PendingSourceItemsMutationSummary? = nil
+        discardedPendingSummaryForDiagnostics: PendingSourceItemsMutationSummary? = nil,
+        permitsRunStateOnlyAdmission: Bool = true
     ) {
         session.derivedTranscriptRefreshGeneration &+= 1
         session.derivedTranscriptRefreshTask?.cancel()
@@ -11101,6 +11104,38 @@ final class AgentModeViewModel: ObservableObject {
             transcript: existingTranscript
         )
         #if DEBUG
+            let forcesColdDerivation = session.test_forcesColdDerivedTranscriptBuild
+        #else
+            let forcesColdDerivation = false
+        #endif
+        let currentSyncState = makeDerivedTranscriptSyncState(
+            for: session,
+            projectionProtection: projectionProtection
+        )
+        // Incremental admission. A usable source summary keeps the existing path. With no summary,
+        // a sync state that differs from the last synchronized one only in `runState` re-imports
+        // the final turn from its real start through the same guarded importer.
+        let incrementalAdmission: (earliestChangedIndex: Int, summary: PendingSourceItemsMutationSummary?)? = {
+            guard reason == .liveMutation,
+                  !forcesColdDerivation,
+                  session.pendingAskUser == nil
+            else {
+                return nil
+            }
+            if let pendingMutationSummary {
+                guard pendingMutationSummary.allowsIncrementalFinalTurnRebuild else { return nil }
+                return (pendingMutationSummary.earliestChangedIndex, pendingMutationSummary)
+            }
+            guard permitsRunStateOnlyAdmission,
+                  let previousSyncState = session.derivedTranscriptSyncState,
+                  previousSyncState.differsOnlyInRunState(from: currentSyncState),
+                  let finalTurnStartIndex = AgentTranscriptIO.finalTurnStartIndex(in: workingItemsSnapshot)
+            else {
+                return nil
+            }
+            return (finalTurnStartIndex, nil)
+        }()
+        #if DEBUG
             let debugMetricsEnabled = AgentTranscriptDebugInstrumentation.isEnabled
             let debugPendingMutationSummary: String?
             var debugIncrementalPath: String?
@@ -11120,7 +11155,11 @@ final class AgentModeViewModel: ObservableObject {
                 debugIncrementalPath = {
                     guard reason == .liveMutation else { return "full-rebuild:reason-\(reason.rawValue)" }
                     guard session.pendingAskUser == nil else { return "full-rebuild:pending-question" }
-                    guard let pendingMutationSummary else { return "full-rebuild:missing-mutation-summary" }
+                    guard let pendingMutationSummary else {
+                        return incrementalAdmission != nil
+                            ? "incremental-attempt:run-state-only"
+                            : "full-rebuild:missing-mutation-summary"
+                    }
                     guard pendingMutationSummary.allowsIncrementalFinalTurnRebuild else {
                         return "full-rebuild:mutation-disallows-incremental"
                     }
@@ -11168,19 +11207,10 @@ final class AgentModeViewModel: ObservableObject {
             EditFlowPerf.Stage.Transcript.importTranscript,
             EditFlowPerf.Dimensions(status: reason.rawValue, sourceItemCount: workingItemsSnapshot.count)
         )
-        #if DEBUG
-            let forcesColdDerivation = session.test_forcesColdDerivedTranscriptBuild
-        #else
-            let forcesColdDerivation = false
-        #endif
         let importedTranscript: AgentTranscript
         var trustedIncrementalFinalTurnStartSequenceIndex: Int?
-        if reason == .liveMutation,
-           !forcesColdDerivation,
-           session.pendingAskUser == nil,
-           let mutationSummary = pendingMutationSummary,
-           mutationSummary.allowsIncrementalFinalTurnRebuild
-        {
+        if let incrementalAdmission {
+            let earliestChangedIndex = incrementalAdmission.earliestChangedIndex
             #if DEBUG || EDIT_FLOW_PERF
                 let incrementalImportStartedAt = CFAbsoluteTimeGetCurrent()
                 var incrementalImportOutcome = "fallback"
@@ -11199,7 +11229,7 @@ final class AgentModeViewModel: ObservableObject {
             let incrementalImportResult = AgentTranscriptIO.incrementallyUpdatedTranscriptForFinalTurnWithDiagnostics(
                 existingTranscript: existingTranscript,
                 items: workingItemsSnapshot,
-                earliestChangedIndex: mutationSummary.earliestChangedIndex,
+                earliestChangedIndex: earliestChangedIndex,
                 terminalState: session.runState,
                 nextSequenceIndex: session.nextSequenceIndex,
                 policy: importPolicy,
@@ -11207,9 +11237,9 @@ final class AgentModeViewModel: ObservableObject {
             )
             if let incrementallyUpdatedTranscript = incrementalImportResult.transcript {
                 importedTranscript = incrementallyUpdatedTranscript
-                if workingItemsSnapshot.indices.contains(mutationSummary.earliestChangedIndex) {
+                if workingItemsSnapshot.indices.contains(earliestChangedIndex) {
                     trustedIncrementalFinalTurnStartSequenceIndex =
-                        workingItemsSnapshot[mutationSummary.earliestChangedIndex].sequenceIndex
+                        workingItemsSnapshot[earliestChangedIndex].sequenceIndex
                 }
                 #if DEBUG
                     debugIncrementalPath = usesDurableFrontier ? "incremental-success:frontier" : "incremental-success:no-frontier"
@@ -11243,12 +11273,14 @@ final class AgentModeViewModel: ObservableObject {
             #if DEBUG || EDIT_FLOW_PERF
                 let incrementalImportShape = Self.incrementalImportDiagnosticShape(incrementalImportResult)
                 let incrementalImportCaller = Self.transcriptRefreshDiagnosticCaller(
-                    mutationSummary,
+                    incrementalAdmission.summary,
                     preferEarliestChange: true
                 )
                 importDiagnosticOutcome = "incremental_\(incrementalImportOutcome)"
                 importDiagnosticReason = incrementalImportResult.rejection?.label
-                importDiagnosticFlags = DerivedTranscriptIncrementalNoAttemptDiagnosis.SummaryFlags(mutationSummary).label
+                importDiagnosticFlags = incrementalAdmission.summary.map {
+                    DerivedTranscriptIncrementalNoAttemptDiagnosis.SummaryFlags($0).label
+                } ?? "runStateOnly"
                 importDiagnosticCaller = incrementalImportCaller.label
                 importDiagnosticMergedCount = incrementalImportCaller.mergedCount
                 importDiagnosticFinalTurnItemCount = incrementalImportResult.finalTurnItemCount
@@ -11261,7 +11293,7 @@ final class AgentModeViewModel: ObservableObject {
                         tabTag: diagnosticTabTag,
                         finalTurnItemCount: incrementalImportResult.finalTurnItemCount,
                         finalTurnStartIndex: incrementalImportShape.finalTurnStartIndex,
-                        earliestChangedIndex: mutationSummary.earliestChangedIndex,
+                        earliestChangedIndex: earliestChangedIndex,
                         suffixTurnCount: incrementalImportShape.suffixTurnCount,
                         fallbackReason: incrementalImportResult.rejection?.label,
                         mutationFlags: importDiagnosticFlags,
@@ -11281,7 +11313,9 @@ final class AgentModeViewModel: ObservableObject {
         } else {
             #if DEBUG || EDIT_FLOW_PERF
                 performanceSnapshot.lastIncrementalImportDurationMS = nil
-                // Diagnostics only: mirrors the admission guard above; never drives it.
+                // Diagnostics only; never drives admission. Mirrors the source-summary admission;
+                // a missing summary also reports the sync delta, which shows refused run-state-only
+                // admissions as `syncDelta.run`.
                 let noAttemptDiagnosis = DerivedTranscriptIncrementalNoAttemptDiagnosis.diagnose(
                     reason: reason,
                     hasPendingQuestion: session.pendingAskUser != nil,
@@ -11292,7 +11326,13 @@ final class AgentModeViewModel: ObservableObject {
                     preferEarliestChange: false
                 )
                 importDiagnosticReason = noAttemptDiagnosis?.primary.rawValue ?? "unclassified"
-                importDiagnosticFlags = noAttemptDiagnosis?.summaryFlags.label
+                // A missing summary has no flags; report which sync inputs changed instead.
+                importDiagnosticFlags = noAttemptDiagnosis?.primary == .missingSummary
+                    ? DerivedTranscriptSyncState.diagnosticDeltaLabel(
+                        from: session.derivedTranscriptSyncState,
+                        to: currentSyncState
+                    )
+                    : noAttemptDiagnosis?.summaryFlags.label
                 importDiagnosticCaller = noAttemptCaller.label
                 importDiagnosticMergedCount = noAttemptCaller.mergedCount
             #endif
@@ -11678,7 +11718,10 @@ final class AgentModeViewModel: ObservableObject {
         refreshDerivedTranscriptState(
             for: session,
             reason: scheduledReason,
-            publishActivePresentation: publishActivePresentation
+            publishActivePresentation: publishActivePresentation,
+            // Defensive: `projectionLooksStale` implies an equal sync state, which already rules
+            // out run-state-only admission; integrity repair must still never take it.
+            permitsRunStateOnlyAdmission: !projectionLooksStale
         )
         return true
     }

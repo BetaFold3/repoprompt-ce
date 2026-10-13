@@ -997,7 +997,9 @@ extension AgentModeViewModel {
     }
 
     /// Why a refresh made no incremental final-turn import attempt. Diagnostics only: mirrors,
-    /// but never drives, the admission guard in `refreshDerivedTranscriptState`.
+    /// but never drives, the source-summary admission in `refreshDerivedTranscriptState`. The
+    /// run-state-only alternative and forced-cold derivation are decided in the view model only;
+    /// a refused run-state-only refresh reports `missingSummary`.
     struct DerivedTranscriptIncrementalNoAttemptDiagnosis: Equatable {
         /// First failing admission guard, in the guard's evaluation order.
         enum Primary: String {
@@ -1048,7 +1050,7 @@ extension AgentModeViewModel {
         let primary: Primary
         let summaryFlags: SummaryFlags
 
-        /// Returns nil when the admission guard would attempt an incremental import.
+        /// Returns nil when the source-summary admission would attempt an incremental import.
         static func diagnose(
             reason: DerivedTranscriptRefreshReason,
             hasPendingQuestion: Bool,
@@ -1077,6 +1079,36 @@ extension AgentModeViewModel {
         let selectedAgent: AgentProviderKind
         let hidePendingQuestionToolCall: Bool
         let projectionProtection: AgentTranscriptProjectionProtection
+
+        /// True only when `current` changes `runState` and matches every other input. Drives the
+        /// run-state-only incremental admission in `refreshDerivedTranscriptState`.
+        func differsOnlyInRunState(from current: DerivedTranscriptSyncState) -> Bool {
+            runState != current.runState
+                && sourceItemsRevision == current.sourceItemsRevision
+                && nextSequenceIndex == current.nextSequenceIndex
+                && selectedAgent == current.selectedAgent
+                && hidePendingQuestionToolCall == current.hidePendingQuestionToolCall
+                && projectionProtection == current.projectionProtection
+        }
+
+        /// Diagnostics only: static, content-free labels of the inputs that differ from
+        /// `current` (or `syncDelta.nil` when there is no previous state). Never drives admission.
+        static func diagnosticDeltaLabel(
+            from previous: DerivedTranscriptSyncState?,
+            to current: DerivedTranscriptSyncState
+        ) -> String {
+            guard let previous else { return "syncDelta.nil" }
+            let changed: [(Bool, String)] = [
+                (previous.sourceItemsRevision != current.sourceItemsRevision, "rev"),
+                (previous.nextSequenceIndex != current.nextSequenceIndex, "seq"),
+                (previous.runState != current.runState, "run"),
+                (previous.selectedAgent != current.selectedAgent, "agent"),
+                (previous.hidePendingQuestionToolCall != current.hidePendingQuestionToolCall, "ask"),
+                (previous.projectionProtection != current.projectionProtection, "protect")
+            ]
+            let labels = changed.compactMap { $0.0 ? $0.1 : nil }
+            return "syncDelta." + (labels.isEmpty ? "none" : labels.joined(separator: "-"))
+        }
     }
 
     struct PersistableTranscriptSnapshot {

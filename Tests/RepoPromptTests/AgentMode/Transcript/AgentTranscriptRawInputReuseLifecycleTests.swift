@@ -333,7 +333,406 @@ final class AgentTranscriptRawInputReuseLifecycleTests: XCTestCase {
         assertWorkAvoided("warm full import after retention", processed: 0)
     }
 
+    // MARK: - D2 run-state-only admission
+
+    /// W3 kill gate and transitions through the production entry point. History sits behind a
+    /// durable frontier; an earlier full, non-frozen turn keeps an unfinished tool call, an
+    /// in-progress background bash result, and a streaming background assistant row. Each session
+    /// is the only session of its own view model, so it owns headless active-binding publication
+    /// and a bare `runState` assignment reaches the refresh only through `onRunStateChanged` ->
+    /// `catchUpDerivedTranscriptForActiveBindingIfNeeded(.liveMutation)`; the test never refreshes
+    /// manually around a transition. Where only `runState` changed, the candidate must take the
+    /// incremental path and equal a cold derivation.
+    func testW3RunStateOnlyRefreshEqualsColdDerivationAcrossTransitions() async throws {
+        let pair = try await makeSyncedRunStatePair()
+        let candidate = pair.candidate
+        let reference = pair.reference
+        let sessions = [candidate, reference]
+        func refresh(_ reason: AgentModeViewModel.DerivedTranscriptRefreshReason) {
+            for (viewModel, session) in pair.owned {
+                viewModel.refreshDerivedTranscriptState(for: session, reason: reason, publishActivePresentation: false)
+            }
+        }
+        func transition(to runState: AgentSessionRunState, _ step: String, file: StaticString = #filePath, line: UInt = #line) {
+            let before = Self.importCounts(candidate)
+            let previousSync = candidate.derivedTranscriptSyncState
+            XCTAssertNil(candidate.pendingSourceItemsMutationSummary, "[\(step)] no source mutation", file: file, line: line)
+            XCTAssertEqual(previousSync?.runState == runState, false, "[\(step)] run state changed", file: file, line: line)
+            apply(sessions) { $0.runState = runState }
+            XCTAssertEqual(reference.transcript.turns.last?.terminalState, runState, "[\(step)] reference current", file: file, line: line)
+            let after = Self.importCounts(candidate)
+            XCTAssertEqual(after.attempts, before.attempts + 1, "[\(step)] run-state-only attempt", file: file, line: line)
+            XCTAssertEqual(after.successes, before.successes + 1, "[\(step)] incremental success", file: file, line: line)
+            XCTAssertEqual(after.frontierSuccesses, before.frontierSuccesses + 1, "[\(step)] durable frontier reused", file: file, line: line)
+            assertEquivalent(candidate, reference, step: step, file: file, line: line)
+            for (viewModel, session) in pair.owned {
+                assertSynchronized(viewModel, session, step: step, file: file, line: line)
+            }
+        }
+
+        transition(to: .idle, "running to idle")
+
+        let thirdRequest = AgentChatItem.user("Third request")
+        apply(sessions) { $0.appendItem(thirdRequest) }
+        refresh(.liveMutation)
+        assertEquivalent(candidate, reference, step: "user send while idle")
+        transition(to: .running, "idle to running after synced user send")
+
+        let inFlight = AgentChatItem.toolCall(name: "bash", invocationID: UUID(), argsJSON: #"{"command":"sleep 1"}"#)
+        apply(sessions) { $0.appendItem(inFlight) }
+        refresh(.liveMutation)
+        assertEquivalent(candidate, reference, step: "in-flight call")
+        transition(to: .failed, "running to failed with in-flight call")
+        transition(to: .running, "failed to running")
+        transition(to: .cancelled, "running to cancelled")
+        transition(to: .running, "cancelled to running")
+        transition(to: .completed, "running to completed")
+
+        // Once synchronized, the delta is empty: no new admission, the existing full path runs.
+        let before = Self.importCounts(candidate)
+        refresh(.liveMutation)
+        XCTAssertEqual(Self.importCounts(candidate).attempts, before.attempts, "empty delta stays full")
+        assertEquivalent(candidate, reference, step: "repeat after sync")
+    }
+
+    /// Every other synchronization input, a missing or invalidated sync state, a pending question,
+    /// and an explicit integrity repair keep the existing full import and still equal cold.
+    func testRunStateOnlyAdmissionRejectsEveryOtherChangedInput() async throws {
+        typealias Change = (AgentModeViewModel, AgentModeViewModel.TabSession) throws -> Void
+        let cases: [(String, Change)] = [
+            ("source revision", { $1.sourceItemsRevision &+= 1 }),
+            ("next sequence index", { $1.nextSequenceIndex += 1 }),
+            ("selected agent", { $1.selectedAgent = .codexExec }),
+            ("question hiding", { $1.pendingUserInputRequest = Self.pendingUserInputRequest() }),
+            ("projection protection", { _, session in
+                let earlierSequence = try XCTUnwrap(session.items.first { $0.kind == .user }?.sequenceIndex)
+                session.transcriptViewportState = AgentTranscriptViewportState(
+                    isDetachedFromLiveBottom: true,
+                    detachedAuthority: DetachedViewportAuthority(
+                        targetID: nil,
+                        anchor: nil,
+                        sequenceIndex: earlierSequence,
+                        blockID: nil,
+                        viewportMinY: nil
+                    )
+                )
+            }),
+            ("nil sync", { $1.derivedTranscriptSyncState = nil }),
+            ("silent replacement", { $1.setItemsSilently($1.items, reason: .testOverride) }),
+            // Setting `pendingAskUser` also flips question hiding, so both the guard and the sync
+            // delta reject this case.
+            ("pending question with hiding change", { $1.pendingAskUser = try Self.pendingAskUser() }),
+            // Isolates the `pendingAskUser` guard: hiding is already synchronized as true, so the
+            // sync delta is exactly `runState` and only the guard rejects.
+            ("pending question guard only", { viewModel, session in
+                session.pendingUserInputRequest = Self.pendingUserInputRequest()
+                viewModel.refreshDerivedTranscriptState(for: session, reason: .manualRefresh, publishActivePresentation: false)
+                XCTAssertTrue(session.hasPendingQuestionUI)
+                session.pendingAskUser = try Self.pendingAskUser()
+                let current = AgentModeViewModel.DerivedTranscriptSyncState(
+                    sourceItemsRevision: session.sourceItemsRevision,
+                    nextSequenceIndex: session.nextSequenceIndex,
+                    runState: .idle,
+                    selectedAgent: session.selectedAgent,
+                    hidePendingQuestionToolCall: session.hasPendingQuestionUI,
+                    projectionProtection: viewModel.transcriptProjectionProtection(for: session)
+                )
+                XCTAssertEqual(session.derivedTranscriptSyncState?.differsOnlyInRunState(from: current), true)
+            })
+        ]
+        for (step, change) in cases {
+            let pair = try await makeSyncedRunStatePair()
+            let before = Self.importCounts(pair.candidate)
+            for (viewModel, session) in pair.owned {
+                try change(viewModel, session)
+                session.runState = .idle
+                viewModel.refreshDerivedTranscriptState(for: session, reason: .liveMutation, publishActivePresentation: false)
+            }
+            XCTAssertEqual(Self.importCounts(pair.candidate).attempts, before.attempts, "[\(step)] no incremental attempt")
+            assertEquivalent(pair.candidate, pair.reference, step: step)
+        }
+
+        let pair = try await makeSyncedRunStatePair()
+        let before = Self.importCounts(pair.candidate)
+        for (viewModel, session) in pair.owned {
+            session.onRunStateChanged = nil
+            session.runState = .idle
+            viewModel.refreshDerivedTranscriptState(
+                for: session,
+                reason: .liveMutation,
+                publishActivePresentation: false,
+                permitsRunStateOnlyAdmission: false
+            )
+        }
+        XCTAssertEqual(Self.importCounts(pair.candidate).attempts, before.attempts, "integrity repair keeps the full import")
+        assertEquivalent(pair.candidate, pair.reference, step: "integrity repair")
+    }
+
+    /// An importer rejection on the run-state-only path falls back to the same full rebuild the
+    /// existing no-attempt path performs on identical input.
+    func testRunStateOnlyImporterRejectionFallsBackToFullRebuild() async throws {
+        let pair = try await makeSyncedRunStatePair()
+        let candidate = pair.candidate
+        let control = pair.reference
+        control.test_forcesColdDerivedTranscriptBuild = false
+        let invalidFrontier = AgentTranscriptCompactionFrontier(version: 1, frozenPrefixTurnCount: 999, lastFrozenTurnID: UUID())
+        for session in [candidate, control] {
+            session.onRunStateChanged = nil
+            session.transcript.compactionFrontier = invalidFrontier
+            XCTAssertNotNil(session.derivedTranscriptSyncState)
+            session.runState = .idle
+        }
+        let before = Self.importCounts(candidate)
+        pair.candidateViewModel.refreshDerivedTranscriptState(for: candidate, reason: .liveMutation, publishActivePresentation: false)
+        pair.referenceViewModel.refreshDerivedTranscriptState(
+            for: control,
+            reason: .liveMutation,
+            publishActivePresentation: false,
+            permitsRunStateOnlyAdmission: false
+        )
+        let after = Self.importCounts(candidate)
+        XCTAssertEqual(after.attempts, before.attempts + 1)
+        XCTAssertEqual(after.fallbacks, before.fallbacks + 1)
+        assertEquivalent(candidate, control, step: "importer rejection fallback")
+        assertSynchronized(pair.candidateViewModel, candidate, step: "importer rejection fallback")
+    }
+
+    func testRunStateOnlyDiagnosticsLabelAdmissionAndMissingSummarySyncDelta() async throws {
+        // Each session is refreshed by the view model that owns it.
+        let admitted = try await makeSyncedRunStatePair()
+        let unsynced = try await makeSyncedRunStatePair()
+        let agentChanged = try await makeSyncedRunStatePair()
+        try EditFlowPerf.$debugCaptureIsolationTokenForTesting.withValue(UUID()) {
+            switch EditFlowPerf.beginDebugCapture(label: "d2-run-state-only", maxSamples: 100) {
+            case .started:
+                break
+            case .busy:
+                return XCTFail("Capture should start.")
+            }
+            for pair in [admitted, unsynced, agentChanged] {
+                pair.candidate.onRunStateChanged = nil
+            }
+            unsynced.candidate.derivedTranscriptSyncState = nil
+            agentChanged.candidate.selectedAgent = .codexExec
+            for pair in [admitted, unsynced, agentChanged] {
+                pair.candidate.runState = .idle
+                pair.candidateViewModel.refreshDerivedTranscriptState(
+                    for: pair.candidate,
+                    reason: .liveMutation,
+                    publishActivePresentation: false
+                )
+            }
+
+            let imports = EditFlowPerf.debugCaptureSnapshot(finish: true).stages
+                .filter { $0.stageName == "EditFlow.Transcript.ImportTranscript" }
+                .map(\.sanitizedDimensions)
+            let admittedImport = try XCTUnwrap(imports.first { $0.contains("mutationFlags=runStateOnly") }, "\(imports)")
+            XCTAssertTrue(admittedImport.contains("outcome=incremental_success"), admittedImport)
+            XCTAssertTrue(
+                imports.contains { $0.contains("reason=missingSummary") && $0.contains("mutationFlags=syncDelta.nil") },
+                "\(imports)"
+            )
+            XCTAssertTrue(
+                imports.contains { $0.contains("reason=missingSummary") && $0.contains("mutationFlags=syncDelta.run-agent") },
+                "\(imports)"
+            )
+        }
+    }
+
+    func testSyncStateRunStateOnlyComparisonAndDeltaLabel() {
+        let base = AgentModeViewModel.DerivedTranscriptSyncState(
+            sourceItemsRevision: 1,
+            nextSequenceIndex: 2,
+            runState: .running,
+            selectedAgent: .claudeCode,
+            hidePendingQuestionToolCall: false,
+            projectionProtection: .none
+        )
+        func changed(
+            revision: Int = 1,
+            sequence: Int = 2,
+            runState: AgentSessionRunState = .idle,
+            agent: AgentProviderKind = .claudeCode,
+            hideQuestion: Bool = false,
+            protection: AgentTranscriptProjectionProtection = .none
+        ) -> AgentModeViewModel.DerivedTranscriptSyncState {
+            .init(
+                sourceItemsRevision: revision,
+                nextSequenceIndex: sequence,
+                runState: runState,
+                selectedAgent: agent,
+                hidePendingQuestionToolCall: hideQuestion,
+                projectionProtection: protection
+            )
+        }
+        XCTAssertTrue(base.differsOnlyInRunState(from: changed()))
+        XCTAssertFalse(base.differsOnlyInRunState(from: base), "an empty delta is not run-state-only")
+        for other in [
+            changed(revision: 2),
+            changed(sequence: 3),
+            changed(agent: .codexExec),
+            changed(hideQuestion: true),
+            changed(protection: .protectedTurn(UUID()))
+        ] {
+            XCTAssertFalse(base.differsOnlyInRunState(from: other), "\(other)")
+        }
+        typealias Sync = AgentModeViewModel.DerivedTranscriptSyncState
+        XCTAssertEqual(Sync.diagnosticDeltaLabel(from: nil, to: base), "syncDelta.nil")
+        XCTAssertEqual(Sync.diagnosticDeltaLabel(from: base, to: base), "syncDelta.none")
+        XCTAssertEqual(
+            Sync.diagnosticDeltaLabel(
+                from: base,
+                to: changed(revision: 2, sequence: 3, agent: .codexExec, hideQuestion: true, protection: .protectedTurn(UUID()))
+            ),
+            "syncDelta.rev-seq-run-agent-ask-protect"
+        )
+    }
+
     // MARK: - Helpers
+
+    /// Candidate and cold reference, each the only session of its own view model, so each owns
+    /// headless active-binding publication and is refreshed only by its owner.
+    private struct RunStatePair {
+        let candidateViewModel: AgentModeViewModel
+        let referenceViewModel: AgentModeViewModel
+        let candidate: AgentModeViewModel.TabSession
+        let reference: AgentModeViewModel.TabSession
+
+        var owned: [(AgentModeViewModel, AgentModeViewModel.TabSession)] {
+            [(candidateViewModel, candidate), (referenceViewModel, reference)]
+        }
+    }
+
+    /// Running sessions over `runStateFixture()`, synchronized through a summarized live refresh.
+    private func makeSyncedRunStatePair() async throws -> RunStatePair {
+        let candidateViewModel = makeViewModel()
+        let referenceViewModel = makeViewModel()
+        let candidate = try await candidateViewModel.ensureSessionReady(tabID: UUID())
+        let reference = try await referenceViewModel.ensureSessionReady(tabID: UUID())
+        reference.test_forcesColdDerivedTranscriptBuild = true
+        let pair = RunStatePair(
+            candidateViewModel: candidateViewModel,
+            referenceViewModel: referenceViewModel,
+            candidate: candidate,
+            reference: reference
+        )
+        let fixture = Self.runStateFixture()
+        let stillWorking = AgentChatItem.assistant("Still working.")
+        for (viewModel, session) in pair.owned {
+            session.runState = .running
+            for item in fixture.items {
+                session.appendItem(item)
+            }
+            session.backgroundRowIDs = [fixture.backgroundAssistantID]
+            viewModel.refreshDerivedTranscriptState(for: session, reason: .coldLoad, publishActivePresentation: false)
+            viewModel.refreshDerivedTranscriptState(for: session, reason: .manualRefresh, publishActivePresentation: false)
+            session.appendItem(stillWorking)
+            viewModel.refreshDerivedTranscriptState(for: session, reason: .liveMutation, publishActivePresentation: false)
+        }
+        let frozenPrefixTurnCount = candidate.transcript.compactionFrontier?.frozenPrefixTurnCount ?? 0
+        XCTAssertGreaterThan(frozenPrefixTurnCount, 0, "durable frontier")
+        XCTAssertTrue(
+            candidate.items.contains { $0.id == fixture.backgroundAssistantID && $0.isStreaming },
+            "earlier-turn background row survives retention"
+        )
+        // The unfinished/background turn is non-final, outside the frozen prefix, and full, so the
+        // cold reference re-imports it on every step instead of carrying it over.
+        let backgroundTurnIndex = try XCTUnwrap(candidate.transcript.turns.firstIndex { turn in
+            turn.allActivities.contains { $0.id == fixture.backgroundAssistantID }
+        })
+        XCTAssertGreaterThanOrEqual(backgroundTurnIndex, frozenPrefixTurnCount, "background turn outside frozen prefix")
+        XCTAssertLessThan(backgroundTurnIndex, candidate.transcript.turns.count - 1, "background turn is not final")
+        XCTAssertEqual(candidate.transcript.turns[backgroundTurnIndex].retentionTier, .full)
+        XCTAssertEqual(reference.transcript.turns[backgroundTurnIndex].retentionTier, .full)
+        assertEquivalent(candidate, reference, step: "synced pair")
+        for (viewModel, session) in pair.owned {
+            assertSynchronized(viewModel, session, step: "synced pair")
+        }
+        return pair
+    }
+
+    private func assertSynchronized(
+        _ viewModel: AgentModeViewModel,
+        _ session: AgentModeViewModel.TabSession,
+        step: String,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) {
+        XCTAssertTrue(
+            viewModel.canReuseDerivedTranscriptForSave(
+                for: session,
+                projectionProtection: viewModel.transcriptProjectionProtection(for: session)
+            ),
+            "[\(step)] synchronized",
+            file: file,
+            line: line
+        )
+    }
+
+    private static func importCounts(
+        _ session: AgentModeViewModel.TabSession
+    ) -> (attempts: Int, successes: Int, fallbacks: Int, frontierSuccesses: Int) {
+        let snapshot = session.transcriptPerformanceSnapshot
+        return (
+            snapshot.incrementalImportAttemptCount,
+            snapshot.incrementalImportSuccessCount,
+            snapshot.incrementalImportFallbackCount,
+            snapshot.frontierReuseSuccessCount
+        )
+    }
+
+    /// 40 history turns, an earlier full turn with an unfinished call, an in-progress background
+    /// bash result and a streaming background assistant row, then a final turn of bash work.
+    private static func runStateFixture() -> (items: [AgentChatItem], backgroundAssistantID: UUID) {
+        var items: [AgentChatItem] = []
+        func bash(_ index: Int, status: String = "completed") {
+            let invocationID = UUID()
+            items.append(.toolCall(name: "bash", invocationID: invocationID, argsJSON: #"{"command":"run \#(index)"}"#, sequenceIndex: items.count))
+            items.append(.toolResult(
+                name: "bash",
+                invocationID: invocationID,
+                resultJSON: bashResultJSON(index: index, output: String(repeating: "out \(index)\n", count: 10), status: status),
+                isError: false,
+                sequenceIndex: items.count
+            ))
+        }
+        for turn in 0 ..< 40 {
+            items.append(.user("History \(turn)", sequenceIndex: items.count))
+            bash(turn)
+            items.append(.assistant("History answer \(turn)", sequenceIndex: items.count))
+        }
+        items.append(.user("Background work", sequenceIndex: items.count))
+        items.append(.toolCall(name: "bash", invocationID: UUID(), argsJSON: #"{"command":"never finishes"}"#, sequenceIndex: items.count))
+        bash(500, status: "inProgress")
+        let backgroundAssistant = AgentChatItem.assistant("Background note", sequenceIndex: items.count, isStreaming: true)
+        items.append(backgroundAssistant)
+        items.append(.user("Final request", sequenceIndex: items.count))
+        for index in 600 ..< 603 {
+            bash(index)
+        }
+        items.append(.assistant("Progress so far.", sequenceIndex: items.count))
+        return (items, backgroundAssistant.id)
+    }
+
+    private static func pendingUserInputRequest() -> AgentRequestUserInputRequest {
+        AgentRequestUserInputRequest(
+            requestID: .string("d2-request"),
+            method: "request_user_input",
+            threadID: "thread",
+            turnID: "turn",
+            itemID: "item",
+            questions: [
+                AgentRequestUserInputQuestion(
+                    id: "q1",
+                    header: "Question",
+                    question: "Continue?",
+                    isOther: false,
+                    isSecret: false,
+                    options: []
+                )
+            ]
+        )
+    }
 
     private func apply(_ sessions: [AgentModeViewModel.TabSession], _ body: (AgentModeViewModel.TabSession) -> Void) {
         for session in sessions {
@@ -418,10 +817,10 @@ final class AgentTranscriptRawInputReuseLifecycleTests: XCTestCase {
         return items
     }
 
-    private static func bashResultJSON(index: Int, output: String) -> String {
+    private static func bashResultJSON(index: Int, output: String, status: String = "completed") -> String {
         let object: [String: Any] = [
             "type": "commandExecution",
-            "status": "completed",
+            "status": status,
             "processId": "process-\(index)",
             "exitCode": 0,
             "aggregatedOutput": output
