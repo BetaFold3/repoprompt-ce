@@ -189,6 +189,8 @@ Step D5 — done | rounds 1/2 | open: none | downgraded: none | assumed: focused
 
 ### D6 — Sidebar: one build per render pass
 
+Step D6-capacity — done | rounds 0/2 | open: none; D6-capacity-final.md | downgraded: none | assumed: interactive fresh creation defers committed inactive owned cleanup only; original UI soft-limit concurrency preserved; 68 tests and both initial reviews clear | deferred: live latency qualification; rare silent capacity refusal, reserved-action UX and pre-existing precommit shutdown overlap; fresh-session UI preparation
+
 Step D6 — done | rounds 0/2 | open: none; D6-mapper-sort-final.md; D6-mapper-sort-live.md | downgraded: none | assumed: cf4bb841 rebuild/relaunch verified PID7636; current creations833.4/1141.0/234.8ms use Codex/Claude/Claude, not matched prior cohort; no causal speedup claim; 43 tests and both reviews retained | deferred: 300ms creation goal, optional ASCII pair matrix, OracleB R-2 comparator delegation, collapse, published-state guards, lazy corpus, model-catalog/recount/focus changes and wider SwiftUI/wait cause-and-effect qualification
 
 Measured weight: about half the main-thread time of a 1 s new-session action, and part of the 1.4 s of non-refresh work after a session click.

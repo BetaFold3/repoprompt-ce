@@ -3297,7 +3297,7 @@ final class AgentModeViewModel: ObservableObject {
         // Pre-destructive veto: a tab whose retained conversation cannot be saved (stale-reset
         // recovery) is removed only after explicit confirmation; normal tabs pass through.
         promptManager.composeTabRemovalPreflight = { [weak self] request in
-            guard let self else { return nil }
+            guard let self, !hasPreparedForWindowClose else { return nil }
             return await admitComposeTabRemoval(
                 tabIDs: request.composeTabIDs,
                 stashedTabIDs: request.stashedTabIDs,
@@ -3758,6 +3758,13 @@ final class AgentModeViewModel: ObservableObject {
                     await prepareSessionForWindowClose(session)
                 }
             }
+        }
+        // Committed removals no longer appear in `sessions`; their owned cleanup (possibly
+        // deferred by interactive creation) must finish before providers and approval scopes
+        // are torn down. Await strong task handles: operations remove themselves on finish.
+        let committedCleanupTasks = composeTabRemovalOperations.values.compactMap(\.cleanupTask)
+        for cleanupTask in committedCleanupTasks {
+            await cleanupTask.value
         }
         codexCoordinator.stop()
         claudeCoordinator.stop()
@@ -13807,7 +13814,10 @@ final class AgentModeViewModel: ObservableObject {
         promptMutation: @MainActor () -> Bool,
         promptCleanup: @MainActor @escaping (@escaping @MainActor () -> Bool) async -> Void
     ) -> Bool {
-        guard let operation = composeTabRemovalOperations[operationID],
+        // Once window close begins, nothing new commits: the close drains only cleanup tasks
+        // that already exist, so a later commit could outlive it.
+        guard !hasPreparedForWindowClose,
+              let operation = composeTabRemovalOperations[operationID],
               operation.phase == .prepared,
               removalOperationContextIsCurrent(operation),
               removalTargetSetIsCurrent(operation),
@@ -20988,10 +20998,20 @@ final class AgentModeViewModel: ObservableObject {
             return priorTabID
         }
         let shouldClosePriorPlaceholder = isUntouchedSessionPlaceholder(for: priorTabID)
+        let originatingWorkspaceID = persistenceWorkspace?.id
+        let originatingOwner = sessionIndexOwner
 
-        await promptManager.createBlankComposeTab(createAgentSession: true)
-        guard let tabID = currentTabID,
-              let session = session(for: tabID, createIfNeeded: true)
+        // Only interactive creation may continue once an eligible inactive auto-stash has
+        // committed; its owned cleanup finishes independently.
+        guard let tabID = await promptManager.createFreshAgentComposeTab(
+            capacityCleanupWait: focusComposer
+                ? .deferEligibleInactiveAutoStashCleanup
+                : .awaitCompletion
+        ),
+            persistenceWorkspace?.id == originatingWorkspaceID,
+            sessionIndexOwner == originatingOwner,
+            currentTabID == tabID,
+            let session = session(for: tabID, createIfNeeded: true)
         else { return nil }
         guard session.adoptSessionProfile(requestedProfile) else {
             await deleteSession(tabID: tabID)
