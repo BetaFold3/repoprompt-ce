@@ -2512,9 +2512,21 @@ class PromptViewModel: ObservableObject {
         currentComposeTabs = updatedTabs
     }
 
+    /// Publishes compose-tab membership alone, without changing the active tab or editor state.
     @MainActor
-    func loadComposeTabsFromWorkspace(_ workspace: WorkspaceModel, syncPromptText: Bool = false) {
+    private func publishComposeTabMembership(from workspace: WorkspaceModel) {
         currentComposeTabs = workspace.composeTabs
+    }
+
+    @MainActor
+    func loadComposeTabsFromWorkspace(
+        _ workspace: WorkspaceModel,
+        syncPromptText: Bool = false,
+        publishMembership: Bool = true
+    ) {
+        if publishMembership {
+            publishComposeTabMembership(from: workspace)
+        }
         activeComposeTabID = workspace.activeComposeTabID ?? workspace.composeTabs.first?.id
         let validIDs = Set(workspace.composeTabs.map(\.id))
         dirtyTabIDs = dirtyTabIDs.intersection(validIDs)
@@ -2742,7 +2754,8 @@ class PromptViewModel: ObservableObject {
         strategy: ComposeTabCreationStrategy = .duplicateCurrent,
         name: String? = nil,
         blankAgentSessionID: UUID? = nil,
-        capacityCleanupWait: ComposeTabRemovalCleanupWait = .awaitCompletion
+        capacityCleanupWait: ComposeTabRemovalCleanupWait = .awaitCompletion,
+        prepareBeforeActivation: (@MainActor (UUID) -> Bool)? = nil
     ) async -> UUID? {
         guard
             let manager = workspaceManager,
@@ -2778,15 +2791,38 @@ class PromptViewModel: ObservableObject {
         }
 
         manager.workspaces[index].composeTabs.append(newTab)
-        await withComposeTabActivationSnapshotSuspended(targetTabID: newTab.id, manager: manager) {
+        let didActivate = await withComposeTabActivationSnapshotSuspended(
+            targetTabID: newTab.id,
+            manager: manager
+        ) { () async -> Bool in
+            if let prepareBeforeActivation {
+                // Publish membership only, then prepare the destination before its activation is
+                // observed. No suspension point separates membership, preparation and activation.
+                publishComposeTabMembership(from: manager.workspaces[index])
+                guard prepareBeforeActivation(newTab.id) else {
+                    // Withdraw only the just-appended, never-activated tab.
+                    manager.workspaces[index].composeTabs.removeAll { $0.id == newTab.id }
+                    publishComposeTabMembership(from: manager.workspaces[index])
+                    return false
+                }
+            }
             manager.workspaces[index].activeComposeTabID = newTab.id
-            activeComposeTabID = newTab.id
-            dirtyTabIDs.remove(newTab.id)
-            loadComposeTabsFromWorkspace(manager.workspaces[index])
+            if prepareBeforeActivation == nil {
+                activeComposeTabID = newTab.id
+                dirtyTabIDs.remove(newTab.id)
+                loadComposeTabsFromWorkspace(manager.workspaces[index])
+            } else {
+                // A prepared destination already published this exact membership; the loader alone
+                // publishes the new active ID, once.
+                dirtyTabIDs.remove(newTab.id)
+                loadComposeTabsFromWorkspace(manager.workspaces[index], publishMembership: false)
+            }
             await withComposeTabSwitching(targetTabID: newTab.id) {
                 await manager.applyComposeTabState(newTab)
             }
+            return true
         }
+        guard didActivate else { return nil }
 
         manager.markWorkspaceDirty()
         manager.pollAndSaveState()
@@ -2805,15 +2841,25 @@ class PromptViewModel: ObservableObject {
     }
 
     /// Creates and activates a blank tab bound to a new Agent session ID and returns the
-    /// created tab's ID, or `nil` when no tab was created (capacity refused, workspace changed).
+    /// created tab's ID, or `nil` when no tab was created (capacity refused, workspace changed,
+    /// preparation refused).
+    ///
+    /// `prepareBeforeActivation` receives the new tab and its newly minted Agent session ID once
+    /// the tab is a member of both the workspace and `currentComposeTabs`, synchronously before
+    /// the tab is activated. Returning `false` withdraws the never-activated tab.
     @MainActor
     func createFreshAgentComposeTab(
-        capacityCleanupWait: ComposeTabRemovalCleanupWait = .awaitCompletion
+        capacityCleanupWait: ComposeTabRemovalCleanupWait = .awaitCompletion,
+        prepareBeforeActivation: (@MainActor (_ tabID: UUID, _ agentSessionID: UUID) -> Bool)? = nil
     ) async -> UUID? {
-        await createComposeTab(
+        let agentSessionID = UUID()
+        return await createComposeTab(
             strategy: .blank,
-            blankAgentSessionID: UUID(),
-            capacityCleanupWait: capacityCleanupWait
+            blankAgentSessionID: agentSessionID,
+            capacityCleanupWait: capacityCleanupWait,
+            prepareBeforeActivation: prepareBeforeActivation.map { prepare in
+                { tabID in prepare(tabID, agentSessionID) }
+            }
         )
     }
 

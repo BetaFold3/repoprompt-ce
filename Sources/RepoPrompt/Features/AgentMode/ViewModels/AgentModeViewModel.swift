@@ -690,6 +690,8 @@ final class AgentModeViewModel: ObservableObject {
         /// operation (after the verdict), so an owner replacement or rebinding attempt can be
         /// interleaved before destruction.
         var test_composeTabRemovalPhaseTwoHook: (@MainActor (TabSession) async -> Void)?
+        /// Test seam: makes fresh-session preparation refuse before any side effect.
+        var test_refusesFreshSessionPreparation = false
         /// Test seam: awaited inside a removal operation's phase 1 after the MCP-control teardown
         /// and before ingestion retirement, so an owner replacement can be interleaved while the
         /// operation is suspended in early teardown.
@@ -4165,6 +4167,20 @@ final class AgentModeViewModel: ObservableObject {
         }
         guard canMaterializeSession(for: tabID) else { return nil }
         let newSession = makeSession(for: tabID)
+        installMaterializedSession(newSession, explicitSessionID: explicitSessionID)
+        return newSession
+    }
+
+    /// Shared tail of session materialization: binds the explicit session, settles readiness,
+    /// registers the session and subscribes approvals. A fresh session (one whose explicit ID
+    /// was just minted for a new tab) is marked freshly created before registration instead of
+    /// being seeded as an unhydrated persisted session.
+    private func installMaterializedSession(
+        _ newSession: TabSession,
+        explicitSessionID: UUID?,
+        isFresh: Bool = false
+    ) {
+        let tabID = newSession.tabID
         if let explicitSessionID {
             _ = installPersistentSessionBinding(
                 sessionID: explicitSessionID,
@@ -4173,11 +4189,70 @@ final class AgentModeViewModel: ObservableObject {
                 invalidateAsyncWork: false
             )
         }
-        newSession.hasLoadedPersistedState = newSession.activeAgentSessionID == nil
-        seedSortMetadataForUnhydratedSession(newSession, tabID: tabID)
+        if isFresh {
+            markSessionAsFreshlyCreated(newSession)
+        } else {
+            newSession.hasLoadedPersistedState = newSession.activeAgentSessionID == nil
+            seedSortMetadataForUnhydratedSession(newSession, tabID: tabID)
+        }
         sessions[tabID] = newSession
         ensureApplyEditsApprovalSessionSync(for: newSession)
-        return newSession
+    }
+
+    private struct FreshSessionSelection {
+        let agent: AgentProviderKind
+        let modelRaw: String
+        let reasoningEffortRaw: String?
+    }
+
+    /// Prepares and registers the session of a just-created, not-yet-activated fresh tab, so its
+    /// first activation finds a presentable, profile-configured session instead of clearing the
+    /// destination. Uses only the initiating action's captured selection and never writes the
+    /// active (source) tab's bindings. Refuses before any binding, registration or save.
+    private func prepareFreshSessionForActivation(
+        tabID: UUID,
+        agentSessionID: UUID,
+        profile: AgentSessionProfile,
+        selection: FreshSessionSelection,
+        knowledgeAgents: [AgentProviderKind]
+    ) -> TabSession? {
+        #if DEBUG
+            if test_refusesFreshSessionPreparation { return nil }
+        #endif
+        // Strict: no synchronous membership observer may materialize this explicit fresh tab before
+        // the callback; if one ever does, creation refuses rather than adopting that session.
+        guard currentTabID != tabID,
+              sessions[tabID] == nil,
+              explicitActiveSessionID(for: tabID) == agentSessionID,
+              canMaterializeSession(for: tabID)
+        else { return nil }
+        let session = makeSession(for: tabID)
+        session.selectedAgent = selection.agent
+        session.selectedModelRaw = selection.modelRaw
+        session.selectedReasoningEffortRaw = selection.reasoningEffortRaw
+        guard session.adoptSessionProfile(profile) else { return nil }
+        if profile == .knowledge {
+            let knowledgeAgent = knowledgeAgents.contains(selection.agent)
+                ? selection.agent
+                : knowledgeAgents[0]
+            session.selectedAgent = knowledgeAgent
+            session.selectedModelRaw = knowledgeAgent == selection.agent
+                && isModelRawValid(selection.modelRaw, for: knowledgeAgent)
+                ? selection.modelRaw
+                : defaultModelRaw(for: knowledgeAgent)
+            session.selectedReasoningEffortRaw = knowledgeAgent == selection.agent
+                ? selection.reasoningEffortRaw
+                : nil
+            codexCoordinator.normalizeCodexSelectionForSession(session, preservingExplicitEffort: true)
+        }
+
+        installMaterializedSession(session, explicitSessionID: agentSessionID, isFresh: true)
+        if applyWorkspaceDefaultRunLocationIfNeeded(to: session) {
+            session.isDirty = true
+            scheduleSave(for: tabID)
+        }
+        invalidateSidebarRestoreOrdering()
+        return session
     }
 
     private func seedSortMetadataForUnhydratedSession(_ session: TabSession, tabID: UUID) {
@@ -21000,52 +21075,44 @@ final class AgentModeViewModel: ObservableObject {
         let shouldClosePriorPlaceholder = isUntouchedSessionPlaceholder(for: priorTabID)
         let originatingWorkspaceID = persistenceWorkspace?.id
         let originatingOwner = sessionIndexOwner
+        let selection = FreshSessionSelection(
+            agent: selectedAgent,
+            modelRaw: selectedModelRaw,
+            reasoningEffortRaw: selectedReasoningEffortRaw
+        )
+        var preparedSession: TabSession?
 
         // Only interactive creation may continue once an eligible inactive auto-stash has
-        // committed; its owned cleanup finishes independently.
+        // committed; its owned cleanup finishes independently. The fresh session is prepared
+        // before the new tab activates, so activation presents it directly.
         guard let tabID = await promptManager.createFreshAgentComposeTab(
             capacityCleanupWait: focusComposer
                 ? .deferEligibleInactiveAutoStashCleanup
-                : .awaitCompletion
+                : .awaitCompletion,
+            prepareBeforeActivation: { [weak self] tabID, agentSessionID in
+                guard let self,
+                      persistenceWorkspace?.id == originatingWorkspaceID,
+                      sessionIndexOwner == originatingOwner,
+                      let session = prepareFreshSessionForActivation(
+                          tabID: tabID,
+                          agentSessionID: agentSessionID,
+                          profile: requestedProfile,
+                          selection: selection,
+                          knowledgeAgents: knowledgeAgents
+                      )
+                else { return false }
+                preparedSession = session
+                return true
+            }
         ),
+            let session = preparedSession,
+            session.tabID == tabID,
             persistenceWorkspace?.id == originatingWorkspaceID,
             sessionIndexOwner == originatingOwner,
             currentTabID == tabID,
-            let session = session(for: tabID, createIfNeeded: true)
+            sessions[tabID] === session
         else { return nil }
-        guard session.adoptSessionProfile(requestedProfile) else {
-            await deleteSession(tabID: tabID)
-            return nil
-        }
 
-        if requestedProfile == .knowledge {
-            let knowledgeAgent = knowledgeAgents.contains(selectedAgent)
-                ? selectedAgent
-                : knowledgeAgents[0]
-            let knowledgeModel = knowledgeAgent == selectedAgent
-                && isModelRawValid(selectedModelRaw, for: knowledgeAgent)
-                ? selectedModelRaw
-                : defaultModelRaw(for: knowledgeAgent)
-            session.selectedAgent = knowledgeAgent
-            session.selectedModelRaw = knowledgeModel
-            session.selectedReasoningEffortRaw = knowledgeAgent == selectedAgent
-                ? selectedReasoningEffortRaw
-                : nil
-            codexCoordinator.normalizeCodexSelectionForSession(session, preservingExplicitEffort: true)
-
-            isRestoringState = true
-            selectedAgent = session.selectedAgent
-            selectedModelRaw = session.selectedModelRaw
-            selectedReasoningEffortRaw = session.selectedReasoningEffortRaw
-            isRestoringState = false
-        }
-
-        markSessionAsFreshlyCreated(session)
-        if applyWorkspaceDefaultRunLocationIfNeeded(to: session) {
-            session.isDirty = true
-            scheduleSave(for: tabID)
-        }
-        invalidateSidebarRestoreOrdering()
         updateBindingsFromSession(session)
         syncAllActiveUIState()
         if focusComposer {

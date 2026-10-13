@@ -88,6 +88,206 @@ final class AgentModeChatSwitchActivationTests: XCTestCase {
         }
     }
 
+    func testFreshSessionCreationRetainsInitiatingSelectionAndSourceDraft() async throws {
+        for profile in [AgentSessionProfile.standard, .knowledge] {
+            try await withFixture { fixture in
+                let viewModel = fixture.viewModel
+                viewModel.test_setAvailableAgents([.codexExec])
+                fixture.window.apiSettingsViewModel.isCodexConnected = true
+                viewModel.selectedAgent = .codexExec
+                let options = viewModel.modelOptions(for: .codexExec)
+                let option = try XCTUnwrap(options.first(where: { !$0.isPlaceholderDefault }) ?? options.first)
+                viewModel.selectedModelRaw = option.rawValue
+                viewModel.selectedReasoningEffortRaw = option.supportedReasoningEfforts.first?.rawValue
+                let agent = viewModel.selectedAgent
+                let modelRaw = viewModel.selectedModelRaw
+                let effortRaw = viewModel.selectedReasoningEffortRaw
+                let sourceAgent = fixture.sessionA.selectedAgent
+                let sourceModelRaw = fixture.sessionA.selectedModelRaw
+                let sourceEffortRaw = fixture.sessionA.selectedReasoningEffortRaw
+                fixture.window.promptManager.promptText = "Draft A"
+
+                let returnedTabID = await viewModel.createAndActivateSessionTab(
+                    profile: profile,
+                    focusComposer: true
+                )
+                let tabID = try XCTUnwrap(returnedTabID)
+                let session = try XCTUnwrap(viewModel.sessions[tabID])
+
+                XCTAssertEqual(session.profile, profile)
+                XCTAssertEqual(session.selectedAgent, agent)
+                XCTAssertEqual(session.selectedModelRaw, modelRaw)
+                XCTAssertEqual(session.selectedReasoningEffortRaw, effortRaw)
+                XCTAssertEqual(viewModel.selectedAgent, agent)
+                XCTAssertEqual(viewModel.selectedModelRaw, modelRaw)
+                XCTAssertEqual(viewModel.selectedReasoningEffortRaw, effortRaw)
+                XCTAssertEqual(fixture.sessionA.selectedAgent, sourceAgent)
+                XCTAssertEqual(fixture.sessionA.selectedModelRaw, sourceModelRaw)
+                XCTAssertEqual(fixture.sessionA.selectedReasoningEffortRaw, sourceEffortRaw)
+                XCTAssertEqual(
+                    fixture.window.workspaceManager.activeWorkspace?.composeTabs
+                        .first(where: { $0.id == fixture.tabAID })?.promptText,
+                    "Draft A"
+                )
+            }
+        }
+    }
+
+    func testFreshSessionCreationFirstDestinationPresentationIsBoundAndHydrated() async throws {
+        let cases: [(profile: AgentSessionProfile, agent: AgentProviderKind)] = [
+            (.standard, .claudeCode),
+            (.standard, .codexExec),
+            (.knowledge, .codexExec)
+        ]
+        for (profile, agent) in cases {
+            try await withFixture { fixture in
+                let viewModel = fixture.viewModel
+                viewModel.test_setAvailableAgents([.claudeCode, .codexExec])
+                viewModel.selectedAgent = agent
+                let modelRaw = viewModel.selectedModelRaw
+                let effortRaw = viewModel.selectedReasoningEffortRaw
+                let sourceTabIDs: Set<UUID> = [fixture.tabAID, fixture.tabBID]
+                var presentations: [(tabID: UUID?, hydrated: Bool, profile: AgentSessionProfile?)] = []
+                var loadingTabIDs: [UUID?] = []
+                let presentationSink = viewModel.$activeTranscriptPresentation.dropFirst().sink { snapshot in
+                    let session = snapshot.tabID.flatMap { viewModel.sessions[$0] }
+                    presentations.append((snapshot.tabID, snapshot.bindingsHydrated, session?.profile))
+                }
+                let loadingSink = viewModel.$activeSessionLoadInProgressTabID.dropFirst().sink { tabID in
+                    loadingTabIDs.append(tabID)
+                }
+                // Ordered Prompt cues up to the start of context application (`isSwitchingComposeTab`).
+                var promptCues: [String] = []
+                let promptManager = fixture.window.promptManager
+                let membershipSink = promptManager.$currentComposeTabs.dropFirst().sink { tabs in
+                    promptCues.append("membership:\(tabs.count)")
+                }
+                let activeSink = promptManager.$activeComposeTabID.dropFirst().sink { tabID in
+                    promptCues.append(tabID.map(sourceTabIDs.contains) == false ? "active:new" : "active:other")
+                }
+                let switchingSink = promptManager.$isSwitchingComposeTab.dropFirst().sink { isSwitching in
+                    if isSwitching { promptCues.append("switching") }
+                }
+                defer {
+                    presentationSink.cancel()
+                    loadingSink.cancel()
+                    membershipSink.cancel()
+                    activeSink.cancel()
+                    switchingSink.cancel()
+                }
+
+                let returnedTabID = await viewModel.createAndActivateSessionTab(
+                    profile: profile,
+                    focusComposer: true
+                )
+                let tabID = try XCTUnwrap(returnedTabID)
+                let session = try XCTUnwrap(viewModel.sessions[tabID])
+                XCTAssertEqual(session.selectedAgent, agent)
+                XCTAssertEqual(session.selectedModelRaw, modelRaw)
+                XCTAssertEqual(session.selectedReasoningEffortRaw, effortRaw)
+                XCTAssertEqual(viewModel.selectedAgent, agent)
+                XCTAssertEqual(viewModel.selectedModelRaw, modelRaw)
+                XCTAssertEqual(viewModel.selectedReasoningEffortRaw, effortRaw)
+
+                XCTAssertFalse(
+                    presentations.contains { $0.tabID == nil },
+                    "No cleared, unbound destination is published"
+                )
+                XCTAssertFalse(presentations.contains { $0.tabID.map(sourceTabIDs.contains) == true })
+                let first = try XCTUnwrap(presentations.first { $0.tabID == tabID })
+                XCTAssertTrue(first.hydrated, "The first destination presentation is already hydrated")
+                XCTAssertEqual(first.profile, profile)
+                XCTAssertFalse(loadingTabIDs.contains(tabID), "No disk load starts for a fresh session")
+                XCTAssertEqual(
+                    Array(promptCues.prefix(3)),
+                    ["membership:3", "active:new", "switching"],
+                    "Membership, then the active ID, are each published once before context application"
+                )
+                XCTAssertEqual(promptManager.currentComposeTabs.map(\.id), [fixture.tabAID, fixture.tabBID, tabID])
+                XCTAssertNil(viewModel.activeSessionLoadInProgressTabID)
+                XCTAssertEqual(viewModel.currentTabID, tabID)
+                XCTAssertEqual(viewModel.ui.composer.focusRequest?.tabID, tabID)
+                XCTAssertTrue(viewModel.activeTranscriptPresentation.bindingsHydrated)
+            }
+        }
+    }
+
+    func testRefusedFreshSessionPreparationWithdrawsNeverActivatedTab() async throws {
+        try await withFixture { fixture in
+            let viewModel = fixture.viewModel
+            let promptManager = fixture.window.promptManager
+            let tabIDsBefore = promptManager.currentComposeTabs.map(\.id)
+            let sessionTabIDsBefore = Set(viewModel.sessions.keys)
+            var activeTabIDs: [UUID?] = []
+            let activeSink = promptManager.$activeComposeTabID.dropFirst().sink { activeTabIDs.append($0) }
+            viewModel.test_refusesFreshSessionPreparation = true
+            defer {
+                activeSink.cancel()
+                viewModel.test_refusesFreshSessionPreparation = false
+            }
+
+            let returnedTabID = await viewModel.createAndActivateSessionTab(focusComposer: true)
+
+            XCTAssertNil(returnedTabID)
+            XCTAssertTrue(activeTabIDs.isEmpty, "The refused tab is never activated")
+            XCTAssertEqual(promptManager.currentComposeTabs.map(\.id), tabIDsBefore)
+            XCTAssertEqual(
+                fixture.window.workspaceManager.activeWorkspace?.composeTabs.map(\.id),
+                tabIDsBefore
+            )
+            XCTAssertEqual(Set(viewModel.sessions.keys), sessionTabIDsBefore)
+            XCTAssertEqual(viewModel.currentTabID, fixture.tabAID)
+            XCTAssertNil(viewModel.ui.composer.focusRequest)
+            assertPresentation(
+                viewModel.activeTranscriptPresentation,
+                tabID: fixture.tabAID,
+                sessionID: fixture.sessionAID,
+                session: fixture.sessionA,
+                expectedTexts: fixture.tabATexts
+            )
+        }
+    }
+
+    func testFreshSessionCreationSupersededDuringContextApplyKeepsPreparedBackgroundSession() async throws {
+        try await withFixture { fixture in
+            let promptManager = fixture.window.promptManager
+            let workspaceManager = fixture.window.workspaceManager
+            let sourceTabIDs: Set<UUID> = [fixture.tabAID, fixture.tabBID]
+            var didSwitchDuringCreatedApply = false
+            // Creation pauses at context application of the created tab while the user switches to
+            // B; B's own apply passes straight through.
+            workspaceManager.composeTabApplyAfterContextHookForTesting = { tabID in
+                guard !sourceTabIDs.contains(tabID), !didSwitchDuringCreatedApply else { return }
+                didSwitchDuringCreatedApply = true
+                await promptManager.switchComposeTab(fixture.tabBID)
+            }
+            defer { workspaceManager.composeTabApplyAfterContextHookForTesting = nil }
+
+            let returnedTabID = await fixture.viewModel.createAndActivateSessionTab(focusComposer: true)
+
+            XCTAssertTrue(didSwitchDuringCreatedApply)
+            XCTAssertNil(returnedTabID)
+            XCTAssertEqual(fixture.viewModel.currentTabID, fixture.tabBID)
+            XCTAssertNil(fixture.viewModel.ui.composer.focusRequest)
+            let createdTabID = try XCTUnwrap(
+                promptManager.currentComposeTabs.map(\.id).first { !sourceTabIDs.contains($0) }
+            )
+            let created = try XCTUnwrap(
+                fixture.viewModel.sessions[createdTabID],
+                "The prepared session stays as an ordinary background tab"
+            )
+            XCTAssertTrue(created.hasLoadedPersistedState)
+            XCTAssertNotNil(fixture.viewModel.sessions[fixture.tabAID])
+            assertPresentation(
+                fixture.viewModel.activeTranscriptPresentation,
+                tabID: fixture.tabBID,
+                sessionID: fixture.sessionBID,
+                session: fixture.sessionB,
+                expectedTexts: fixture.tabBTexts
+            )
+        }
+    }
+
     func testSharedModelSelectionCommitPreservesInputBarOrderingAndRejectsDrift() async throws {
         try await withFixture { fixture in
             fixture.window.apiSettingsViewModel.isCodexConnected = true
