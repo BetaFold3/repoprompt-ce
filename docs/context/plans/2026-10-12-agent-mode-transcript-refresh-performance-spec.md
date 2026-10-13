@@ -189,7 +189,7 @@ Step D5 — done | rounds 1/2 | open: none | downgraded: none | assumed: focused
 
 ### D6 — Sidebar: one build per render pass
 
-Step D6 — done | rounds 0/2 | open: none | downgraded: none | assumed: share render-local rows only; observation parity verified per D6-final.md | deferred: live build counts/latency, parent-state invalidation measurements and optional API/test polish per D6-final.md
+Step D6 — doing | rounds 0/2 | open: creation remains 350.9–999.2 ms before composer readiness; pre-focus attribution needed; D7-post-activation-fix-live.md | downgraded: none | assumed: shared sidebar implementation remains reviewed; investigate measured creation path before further edits | deferred: parent-state invalidation measurements and optional API/test polish per D6-final.md
 
 Measured weight: about half the main-thread time of a 1 s new-session action, and part of the 1.4 s of non-refresh work after a session click.
 
@@ -201,7 +201,7 @@ Measured weight: about half the main-thread time of a 1 s new-session action, an
 
 ### D7 — Throttle background-tab derivation, with flush points (owner-approved 2026-10-12, gated on D1, D2, and the consumer audit)
 
-Step D7 — blocked | rounds 0/2 | open: owner relaunch approval and matched W2 no-regression qualification; D7-live-click-comparison.md | downgraded: none | assumed: activation fix 04a89044 packaged by efff2b0f; approval question timed out without answer; original preference restored; earlier OFF/ON2 p95 546.4/559.6 ms are unequal cohorts, not causal | deferred: memory-pressure flush, queued-question duplicate refresh, non-reproduced OMP validation failure and original W1/RSS qualification
+Step D7 — blocked | rounds 0/2 | open: representative original-load no-regression qualification; D7-post-activation-fix-live.md | downgraded: none | assumed: owner-approved relaunch verified PID74962; 12 warm revisits 6.1–27.3 ms without derivation; four shared warm IDs show no sample regression; original preference restored | deferred: memory-pressure flush, queued-question duplicate refresh, non-reproduced OMP validation failure and original W1/RSS qualification
 
 Design:
 - Add a trailing delay of about 1.5 s for sessions that cannot publish active bindings. Use the existing generation and cancel logic.
@@ -280,6 +280,8 @@ Pursue this only if, after D0–D7, the active-tab incremental refresh p95 is ab
 - `logCodexDebug(... transcriptRowDebugWindow(...))` on every refresh. Verify whether its argument is an `@autoclosure`.
 
 ## Decisions and provenance
+
+- Owner Decision (2026-10-13): Relaunch the packaged activation fix now.
 
 - Owner Decision (2026-10-13): Continue the remaining performance steps until complete.
 
