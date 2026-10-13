@@ -189,6 +189,8 @@ Step D5 — done | rounds 1/2 | open: none | downgraded: none | assumed: focused
 
 ### D6 — Sidebar: one build per render pass
 
+Step D6-creation-live — blocked | rounds 0/2 | open: fresh relaunch approval and installed-build measurement; D6-creation-package.md | downgraded: none | assumed: validation package at 7dc6007c passes; approval question timed out, so running app left unchanged | deferred: matched creation latency, broader SwiftUI attribution and original-load/RSS qualification
+
 Step D6-fresh-ui — done | rounds 0/2 | open: none; D6-fresh-ui-final.md | downgraded: none | assumed: fresh bound hydrated session precedes activation; one initial membership and active-ID publication; 85 tests including Claude and both initial reviews clear | deferred: live latency and wider UI qualification; committed stash retained on preparation refusal and refusal membership churn; final post-context sync redundancy
 
 Step D6-capacity — done | rounds 0/2 | open: none; D6-capacity-final.md | downgraded: none | assumed: interactive fresh creation defers committed inactive owned cleanup only; original UI soft-limit concurrency preserved; 68 tests and both initial reviews clear | deferred: live latency qualification; rare silent capacity refusal, reserved-action UX and pre-existing precommit shutdown overlap
