@@ -189,7 +189,9 @@ Step D5 — done | rounds 1/2 | open: none | downgraded: none | assumed: focused
 
 ### D6 — Sidebar: one build per render pass
 
-Step D6-creation-live — blocked | rounds 0/2 | open: fresh relaunch approval and installed-build measurement; D6-creation-package.md | downgraded: none | assumed: validation package at 7dc6007c passes; approval question timed out, so running app left unchanged | deferred: matched creation latency, broader SwiftUI attribution and original-load/RSS qualification
+Step D6-context-config — doing | rounds 0/2 | open: implementation and review | downgraded: none | assumed: skip only complete equal non-dirty before-save config projection; preserve actual changes and all save listeners | deferred: live savings and final full-sync runtime selection ownership
+
+Step D6-creation-live — done | rounds 0/2 | open: none; D6-creation-fixes-live.md | downgraded: none | assumed: approved signed relaunch37ac09fa PID21158; direct freshCodex853.7ms andClaude579.3ms; warm firstPublish6.0/11.8ms; nativeUI-dominated workload; lost first-batch timings disclosed | deferred: 300ms creation goal, matched p95/causal gain, rendered-frame and original-load/RSS qualification
 
 Step D6-fresh-ui — done | rounds 0/2 | open: none; D6-fresh-ui-final.md | downgraded: none | assumed: fresh bound hydrated session precedes activation; one initial membership and active-ID publication; 85 tests including Claude and both initial reviews clear | deferred: live latency and wider UI qualification; committed stash retained on preparation refusal and refusal membership churn; final post-context sync redundancy
 
@@ -286,6 +288,8 @@ Pursue this only if, after D0–D7, the active-tab incremental refresh p95 is ab
 - `logCodexDebug(... transcriptRowDebugWindow(...))` on every refresh. Verify whether its argument is an `@autoclosure`.
 
 ## Decisions and provenance
+
+- Owner Decision (2026-10-13): Relaunch the two committed creation fixes now, then continue measurement.
 
 - Owner Decision (2026-10-13): Rebuild and relaunch the mapper-only change now, then continue measurement.
 
