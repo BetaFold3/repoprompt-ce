@@ -678,6 +678,75 @@ final class AgentTranscriptRawInputReuseLifecycleTests: XCTestCase {
         }
     }
 
+    /// Equal-sync activation validates the unwindowed backing projections: valid grouped history
+    /// (one presented card, no backing rows) under any history visibility or window skips repair,
+    /// while genuine corruption repairs through the existing full import and equals cold.
+    func testEqualSyncActivationRepairsOnlyCorruptBackingProjections() async throws {
+        typealias Session = AgentModeViewModel.TabSession
+        func removeFirstGroupedBlock(_ projection: inout AgentTranscriptProjection) throws {
+            let index = try XCTUnwrap(projection.workingBlocks.firstIndex { $0.kind == .groupedHistory && $0.rows.isEmpty })
+            projection.workingBlocks.remove(at: index)
+        }
+        func substituteRow(_ rows: inout [AgentChatItem]) {
+            let index = rows.count / 2
+            rows[index] = .assistant("substitute", sequenceIndex: rows[index].sequenceIndex)
+        }
+        let cases: [(String, Bool, (Session) throws -> Void)] = [
+            ("valid hidden collapsed window", false, { _ in }),
+            ("valid revealed expanded window", false, { session in
+                session.isCompressedHistoryRevealed = true
+                session.isTranscriptWindowExpanded = true
+            }),
+            ("stored counts", true, { session in
+                let counts = session.transcriptProjectionCounts
+                session.transcriptProjectionCounts = .init(
+                    canonicalVisibleRowCount: counts.canonicalVisibleRowCount + 1,
+                    defaultPresentedRowCount: counts.defaultPresentedRowCount + 1
+                )
+            }),
+            ("grouped block missing", true, { session in
+                try removeFirstGroupedBlock(&session.fullTranscriptProjection)
+                try removeFirstGroupedBlock(&session.workingTranscriptProjection)
+            }),
+            ("working required row missing", true, { $0.workingTranscriptProjection.workingRows.removeLast() }),
+            ("full row substituted", true, { substituteRow(&$0.fullTranscriptProjection.workingRows) }),
+            ("full archived row substituted", true, { substituteRow(&$0.fullTranscriptProjection.archivedRows) })
+        ]
+        for (step, expectsRepair, change) in cases {
+            let pair = try await makeSyncedRunStatePair(groupedHistoryToolCount: 14)
+            let viewModel = pair.candidateViewModel
+            let candidate = pair.candidate
+            XCTAssertFalse(candidate.fullTranscriptProjection.archivedRows.isEmpty, "[\(step)] archived lane")
+            XCTAssertLessThan(
+                candidate.workingTranscriptProjection.workingRows.count,
+                candidate.transcriptProjectionCounts.defaultPresentedRowCount,
+                "[\(step)] grouped cards make raw rows and presented counts unlike units"
+            )
+            for (owner, session) in pair.owned {
+                if session === candidate {
+                    try change(session)
+                } else if !expectsRepair {
+                    try change(session)
+                }
+                session.transcriptProjection = owner.materializedTranscriptProjection(for: session)
+            }
+            XCTAssertTrue(viewModel.canBuildOrPublishActiveTranscriptBindings(for: candidate), "[\(step)] active owner")
+            let generation = candidate.derivedTranscriptRefreshGeneration
+            let before = Self.importCounts(candidate)
+
+            viewModel.applySessionToBindings(candidate)
+
+            XCTAssertEqual(
+                candidate.derivedTranscriptRefreshGeneration != generation,
+                expectsRepair,
+                "[\(step)] integrity repair"
+            )
+            XCTAssertEqual(Self.importCounts(candidate).attempts, before.attempts, "[\(step)] no run-state-only admission")
+            assertEquivalent(candidate, pair.reference, step: step)
+            assertSynchronized(viewModel, candidate, step: step)
+        }
+    }
+
     func testSyncStateRunStateOnlyComparisonAndDeltaLabel() {
         let base = AgentModeViewModel.DerivedTranscriptSyncState(
             sourceItemsRevision: 1,
@@ -743,7 +812,7 @@ final class AgentTranscriptRawInputReuseLifecycleTests: XCTestCase {
     }
 
     /// Running sessions over `runStateFixture()`, synchronized through a summarized live refresh.
-    private func makeSyncedRunStatePair() async throws -> RunStatePair {
+    private func makeSyncedRunStatePair(groupedHistoryToolCount: Int = 0) async throws -> RunStatePair {
         let candidateViewModel = makeViewModel()
         let referenceViewModel = makeViewModel()
         let candidate = try await candidateViewModel.ensureSessionReady(tabID: UUID())
@@ -755,7 +824,7 @@ final class AgentTranscriptRawInputReuseLifecycleTests: XCTestCase {
             candidate: candidate,
             reference: reference
         )
-        let fixture = Self.runStateFixture()
+        let fixture = Self.runStateFixture(groupedHistoryToolCount: groupedHistoryToolCount)
         let stillWorking = AgentChatItem.assistant("Still working.")
         for (viewModel, session) in pair.owned {
             session.runState = .running
@@ -820,9 +889,12 @@ final class AgentTranscriptRawInputReuseLifecycleTests: XCTestCase {
         )
     }
 
-    /// 40 history turns, an earlier full turn with an unfinished call, an in-progress background
-    /// bash result and a streaming background assistant row, then a final turn of bash work.
-    private static func runStateFixture() -> (items: [AgentChatItem], backgroundAssistantID: UUID) {
+    /// 40 history turns, an optional completed turn of `groupedHistoryToolCount` bash calls, an
+    /// earlier full turn with an unfinished call, an in-progress background bash result and a
+    /// streaming background assistant row, then a final turn of bash work.
+    private static func runStateFixture(
+        groupedHistoryToolCount: Int = 0
+    ) -> (items: [AgentChatItem], backgroundAssistantID: UUID) {
         var items: [AgentChatItem] = []
         func bash(_ index: Int, status: String = "completed") {
             let invocationID = UUID()
@@ -839,6 +911,13 @@ final class AgentTranscriptRawInputReuseLifecycleTests: XCTestCase {
             items.append(.user("History \(turn)", sequenceIndex: items.count))
             bash(turn)
             items.append(.assistant("History answer \(turn)", sequenceIndex: items.count))
+        }
+        if groupedHistoryToolCount > 0 {
+            items.append(.user("Grouped history", sequenceIndex: items.count))
+            for index in 0 ..< groupedHistoryToolCount {
+                bash(700 + index)
+            }
+            items.append(.assistant("Grouped answer", sequenceIndex: items.count))
         }
         items.append(.user("Background work", sequenceIndex: items.count))
         items.append(.toolCall(name: "bash", invocationID: UUID(), argsJSON: #"{"command":"never finishes"}"#, sequenceIndex: items.count))

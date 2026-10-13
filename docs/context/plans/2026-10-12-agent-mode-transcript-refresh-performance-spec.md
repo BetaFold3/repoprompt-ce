@@ -145,7 +145,7 @@ Use a non-structural mutation with an exact range for segment end. Either add a 
 
 ### D2 — Remove the causes of the 26 rejections (scope set by D0 data)
 
-Step D2 — done | rounds 0/2 | open: none | downgraded: none | assumed: run-state-only admission proven by cold differential tests; importer guards unchanged; D2-implementation.md | deferred: historical 26 rejections unreproduced, representative live qualification and optional diagnostics suffix
+Step D2 — done | rounds 0/2 | open: none; D2-activation-integrity-final.md | downgraded: none | assumed: activation backing-card integrity corrected; negative control and 53 focused tests pass; OracleA/OracleB initial reviews clear; importer guards unchanged | deferred: dedicated cold-load activation case, historical largest-session rejections, representative live qualification and optional diagnostics suffix
 
 - Give unranged mutations real ranges.
 - If background rows in earlier turns cause the rejections, check whether they affect the final turn's projection before excluding them.
@@ -201,7 +201,7 @@ Measured weight: about half the main-thread time of a 1 s new-session action, an
 
 ### D7 — Throttle background-tab derivation, with flush points (owner-approved 2026-10-12, gated on D1, D2, and the consumer audit)
 
-Step D7 — blocked | rounds 0/2 | open: owner W2 activation/first-publication before-after qualification | downgraded: none | assumed: implementation validated and reviewed; fixed first-event window; nominal preview lag; D7-final.md | deferred: memory-pressure flush, queued-question duplicate refresh and non-reproduced OMP validation failure
+Step D7 — blocked | rounds 0/2 | open: new activation-fix build and matched W2 no-regression qualification; D7-live-click-comparison.md | downgraded: none | assumed: reviewed implementation; original preference restored; earlier OFF/ON2 p95 546.4/559.6 ms are unequal cohorts, not causal; D2 integrity correction locally validated | deferred: memory-pressure flush, queued-question duplicate refresh, non-reproduced OMP validation failure and original W1/RSS qualification
 
 Design:
 - Add a trailing delay of about 1.5 s for sessions that cannot publish active bindings. Use the existing generation and cancel logic.

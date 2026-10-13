@@ -11865,11 +11865,20 @@ final class AgentModeViewModel: ObservableObject {
         if session.transcriptProjectionCounts != expectedCounts {
             return true
         }
-        let visibleRowCount = session.transcriptProjection.archivedRows.count
-            + session.transcriptProjection.workingRows.count
-        let workingRowCount = session.workingTranscriptProjection.workingRows.count
-        let presentedRowCount = max(visibleRowCount, workingRowCount)
-        return presentedRowCount < expectedCounts.defaultPresentedRowCount
+        // Validate the unwindowed backing projections in presented-item units, never the
+        // tail-windowed or history-visibility materialization. Grouped-history and
+        // collapsed-history-range cards require no rows; activity clusters require their rows.
+        let workingOnlyCounts = AgentTranscriptProjectionCounts(
+            canonicalVisibleRowCount: expectedCounts.defaultPresentedRowCount,
+            defaultPresentedRowCount: expectedCounts.defaultPresentedRowCount
+        )
+        guard AgentTranscriptProjectionBuilder.projectionCounts(for: session.fullTranscriptProjection) == expectedCounts,
+              AgentTranscriptProjectionBuilder.projectionCounts(for: session.workingTranscriptProjection) == workingOnlyCounts
+        else {
+            return true
+        }
+        return !AgentTranscriptProjectionBuilder.hasConsistentBackingRows(for: session.fullTranscriptProjection)
+            || !AgentTranscriptProjectionBuilder.hasConsistentBackingRows(for: session.workingTranscriptProjection)
     }
 
     private nonisolated static func persistableSnapshot(

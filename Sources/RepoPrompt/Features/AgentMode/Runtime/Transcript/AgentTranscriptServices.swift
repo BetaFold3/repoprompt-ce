@@ -6790,6 +6790,31 @@ enum AgentTranscriptProjectionBuilder {
         blocks.flatMap(projectionRows(for:))
     }
 
+    /// Whether each lane's backing rows contain every row its blocks require (per
+    /// `projectionRows(for:)`), in block order. Grouped-history and collapsed-history-range blocks
+    /// require none; activity clusters require their listed rows. Backing
+    /// rows may also retain rows a presentation intentionally omits from its blocks (cold-load
+    /// degraded collapsed blocks), so this checks required coverage and order, not equality.
+    static func hasConsistentBackingRows(for projection: AgentTranscriptProjection) -> Bool {
+        backingRows(projection.workingRows, containInOrder: projectionRows(for: projection.workingBlocks))
+            && backingRows(projection.archivedRows, containInOrder: projectionRows(for: projection.archivedBlocks))
+    }
+
+    private static func backingRows(
+        _ backingRows: [AgentChatItem],
+        containInOrder requiredRows: [AgentChatItem]
+    ) -> Bool {
+        guard requiredRows.count <= backingRows.count else { return false }
+        var searchStart = backingRows.startIndex
+        for requiredRow in requiredRows {
+            guard let matchIndex = backingRows[searchStart...].firstIndex(where: { $0.id == requiredRow.id }) else {
+                return false
+            }
+            searchStart = backingRows.index(after: matchIndex)
+        }
+        return true
+    }
+
     private static func reusableProjectionPrefix(
         from projection: AgentTranscriptProjection,
         turnIDs: Set<UUID>,
