@@ -189,7 +189,7 @@ Step D5 — done | rounds 1/2 | open: none | downgraded: none | assumed: focused
 
 ### D6 — Sidebar: one build per render pass
 
-Step D6 — done | rounds 0/2 | open: none; D6-mapper-sort-final.md | downgraded: none | assumed: dedicated mapper-only worker completed; main final43 focused tests and OracleA/OracleB reviews clear; prior normalization/live evidence retained; no live speedup claim | deferred: 300ms creation goal, optional ASCII pair matrix, OracleB R-2 comparator delegation, collapse, published-state guards, lazy corpus, model-catalog/recount/focus changes and wider SwiftUI cause-and-effect qualification
+Step D6 — done | rounds 0/2 | open: none; D6-mapper-sort-final.md; D6-mapper-sort-live.md | downgraded: none | assumed: cf4bb841 rebuild/relaunch verified PID7636; current creations833.4/1141.0/234.8ms use Codex/Claude/Claude, not matched prior cohort; no causal speedup claim; 43 tests and both reviews retained | deferred: 300ms creation goal, optional ASCII pair matrix, OracleB R-2 comparator delegation, collapse, published-state guards, lazy corpus, model-catalog/recount/focus changes and wider SwiftUI/wait cause-and-effect qualification
 
 Measured weight: about half the main-thread time of a 1 s new-session action, and part of the 1.4 s of non-refresh work after a session click.
 
@@ -280,6 +280,8 @@ Pursue this only if, after D0–D7, the active-tab incremental refresh p95 is ab
 - `logCodexDebug(... transcriptRowDebugWindow(...))` on every refresh. Verify whether its argument is an `@autoclosure`.
 
 ## Decisions and provenance
+
+- Owner Decision (2026-10-13): Rebuild and relaunch the mapper-only change now, then continue measurement.
 
 - Owner Decision (2026-10-13): Have a dedicated worker implement mapper-only per-sort ordering reuse; leave the additional collapse sort for later.
 
