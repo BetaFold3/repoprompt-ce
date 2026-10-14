@@ -1745,6 +1745,124 @@ final class AgentStaleResetOwnershipTests: XCTestCase {
         XCTAssertTrue(viewModel.reservedComposeTabIDs.isEmpty)
     }
 
+    // MARK: - Cold-hydration save attribution (D2 characterization)
+
+    /// Documents the CURRENT contract, not a desired one: a completed persisted session whose
+    /// provider differs from the placeholder is cold-hydrated into a background tab. Its derived
+    /// stamp keeps the placeholder run state/provider (hydration stamps before those restores), so
+    /// the next background save rejects reuse and takes the persistence-only fallback, even though
+    /// that fallback's production transforms reproduce the installed presentation exactly here.
+    func testColdHydratedBackgroundSessionSaveReuseCharacterization() async throws {
+        let owner = try await makeHarness(windowID: 4390)
+        owner.session.selectedAgent = .openCode
+        owner.session.appendItem(.user("Run the check"))
+        let invocation = UUID()
+        owner.session.appendItem(.toolCall(name: "bash", invocationID: invocation, argsJSON: #"{"command":"echo ok"}"#))
+        owner.session.appendItem(.toolResult(name: "bash", invocationID: invocation, resultJSON: #"{"output":"ok"}"#))
+        owner.session.appendItem(.assistant("Done"))
+        owner.session.runState = .completed
+        let ownerSaved = await owner.viewModel.flushSave(for: owner.tabID)
+        XCTAssertTrue(ownerSaved)
+        let sessionID = try XCTUnwrap(owner.session.activeAgentSessionID)
+        let persisted = try await owner.persistedSession()
+        XCTAssertEqual(persisted.lastRunState, AgentSessionRunState.completed.rawValue)
+        XCTAssertEqual(persisted.agentKind, AgentProviderKind.openCode.rawValue)
+        let persistedSequence = try XCTUnwrap(persisted.transcript?.nextSequenceIndex)
+
+        // Another owner stays active in the peer window; the bound tab hydrates in the background.
+        let peer = try await makeHarness(windowID: 4391, workspace: owner.workspace, storageURL: owner.storageURL)
+        let backgroundTabID = UUID()
+        let background = try XCTUnwrap(peer.viewModel.session(for: backgroundTabID, createIfNeeded: true))
+        let placeholder = (agent: background.selectedAgent, run: background.runState)
+        XCTAssertNotEqual(placeholder.agent, .openCode)
+        XCTAssertEqual(placeholder.run, .idle)
+        let peerBoundAgent = peer.viewModel.selectedAgent
+        XCTAssertNotNil(peer.viewModel.test_installPersistentSessionBinding(sessionID: sessionID, on: background))
+        let hydrated = await peer.viewModel.test_hydrateBoundSession(tabID: backgroundTabID)
+        XCTAssertTrue(hydrated === background)
+        XCTAssertEqual(background.persistedLoadDisposition, .applied)
+        XCTAssertTrue(background.hasLoadedPersistedState)
+        XCTAssertEqual(background.activeAgentSessionID, sessionID)
+        // Non-active-owner branch fixture, not a UI-activation regression: `currentTabID` is pinned
+        // by the harness override. The peer's owner object and its published agent binding stay put.
+        XCTAssertEqual(peer.viewModel.currentTabID, peer.tabID)
+        XCTAssertTrue(peer.viewModel.session(for: peer.tabID, createIfNeeded: false) === peer.session)
+        XCTAssertEqual(peer.viewModel.selectedAgent, peerBoundAgent)
+        XCTAssertEqual(background.selectedAgent, .openCode)
+        XCTAssertEqual(background.runState, .completed)
+        XCTAssertEqual(background.nextSequenceIndex, persistedSequence)
+
+        let protection = peer.viewModel.transcriptProjectionProtection(for: background, transcript: background.transcript)
+        let current = AgentModeViewModel.DerivedTranscriptSyncState(
+            sourceItemsRevision: background.sourceItemsRevision,
+            nextSequenceIndex: background.nextSequenceIndex,
+            runState: background.runState,
+            selectedAgent: background.selectedAgent,
+            hidePendingQuestionToolCall: background.hasPendingQuestionUI,
+            projectionProtection: protection
+        )
+        let delta = AgentModeViewModel.DerivedTranscriptSyncState.diagnosticDeltaLabel(
+            from: background.derivedTranscriptSyncState,
+            to: current
+        )
+        let stamp = try XCTUnwrap(background.derivedTranscriptSyncState)
+        XCTAssertEqual(stamp.runState, placeholder.run)
+        XCTAssertEqual(stamp.selectedAgent, placeholder.agent)
+        XCTAssertEqual(delta, "syncDelta.run-agent", "sequence, revision, ask and protection already match")
+        XCTAssertFalse(peer.viewModel.canReuseDerivedTranscriptForSave(for: background, projectionProtection: protection))
+        XCTAssertNil(background.pendingDerivedTranscriptRefreshReason)
+        XCTAssertNil(background.derivedTranscriptRefreshTask)
+
+        // Independent reference: transforms equivalent to the save fallback, on the final inputs
+        // (no reuse-prefix hint; the real written record below covers the production path).
+        let rebuilt = AgentTranscriptIO.rebuiltTranscriptPreservingCompactedPrefix(
+            existingTranscript: background.transcript,
+            workingItems: background.items,
+            terminalState: background.runState,
+            nextSequenceIndex: background.nextSequenceIndex,
+            policy: .liveSession(hidePendingQuestionToolCall: background.hasPendingQuestionUI),
+            protection: protection
+        )
+        let sanitized = AgentToolResultPersistencePolicy.sanitizeTranscriptWithMetrics(
+            rebuilt,
+            previousSanitizedTranscript: background.transcript,
+            context: AgentToolResultProcessingContext(),
+            purpose: .runtimePresentation
+        ).transcript
+        let reference = AgentTranscriptProjectionBuilder.refreshCompletedFullTurnGroupedHistoryCaches(in: sanitized)
+        let referenceCounts = AgentTranscriptProjectionBuilder.projectionCounts(for: reference)
+
+        // The fallback makes no semantic correction for this case.
+        XCTAssertEqual(reference, background.transcript)
+        XCTAssertEqual(referenceCounts, background.transcriptProjectionCounts)
+        XCTAssertEqual(referenceCounts.canonicalVisibleRowCount, background.transcriptCanonicalVisibleRowCount)
+        XCTAssertEqual(
+            AgentTranscriptIO.lastUserInteractionDate(in: reference),
+            AgentTranscriptIO.lastUserInteractionDate(in: background.transcript)
+        )
+
+        let previousOverride = AgentModePerfDiagnostics.debugProcessOverrideEnabled
+        AgentModePerfDiagnostics.setDebugProcessOverrideEnabled(true)
+        defer { AgentModePerfDiagnostics.setDebugProcessOverrideEnabled(previousOverride) }
+        background.isDirty = true
+        let backgroundSaved = await peer.viewModel.flushSave(for: backgroundTabID)
+        XCTAssertTrue(backgroundSaved)
+        let backgroundTag = "tabID=\(AgentModePerfDiagnostics.shortID(backgroundTabID))"
+        let fallbackLines = AgentModePerfDiagnostics.recentMetricLinesSnapshot(limit: 1000)
+            .filter { $0.contains(" save.session.persistenceOnlySnapshot ") && $0.contains(backgroundTag) }
+        XCTAssertEqual(fallbackLines.count, 1)
+        XCTAssertTrue(fallbackLines.first?.contains("syncDelta=syncDelta.run-agent") == true, "\(fallbackLines)")
+
+        // The record committed by the fallback save (production prefix hint and storage policy),
+        // read through the writer's data service, is semantically equal to the pre-hydration record;
+        // only save metadata may differ. This checks the logical save, not physical rewritten bytes.
+        let writerLoaded = try await peer.viewModel.test_dataService.loadAgentSession(id: sessionID, for: peer.workspace)
+        let resaved = try XCTUnwrap(writerLoaded)
+        XCTAssertEqual(resaved.transcript, persisted.transcript)
+        XCTAssertEqual(resaved.itemCount, persisted.itemCount)
+        XCTAssertEqual(resaved.lastUserMessageAt, persisted.lastUserMessageAt)
+    }
+
     // MARK: - Harness
 
     /// Mirrors `PromptViewModel.defaultComposeTabSoftLimit`, the interactive auto-stash threshold.

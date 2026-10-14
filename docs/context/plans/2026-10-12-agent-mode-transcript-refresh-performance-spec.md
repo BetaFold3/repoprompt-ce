@@ -155,7 +155,7 @@ Step D2 — done | rounds 0/2 | open: none; D2-activation-integrity-final.md | d
 - Never weaken a guard without an oracle case.
 - Expected: together with D1, the big session drops from about 90 s to about 12 s per 626 s.
 
-Step D2-save-attribution — doing | rounds 0/2 | open: bounded cold-hydration characterization and save-fallback diagnostic review | downgraded: none | assumed: do not adopt new hydration stamps or weaken reuse without semantic proof; D2-save-reuse-OracleA-plan.md; D2-save-reuse-OracleB-plan.md | deferred: exact live B442462C rejection input, production repair and runtime-selection wiring
+Step D2-save-attribution — done | rounds 0/2 | open: none; D2-save-attribution-final.md | downgraded: none | assumed: one real-store fixture proves redundant syncDelta.run-agent fallback; sequence matched; 46 tests and both initial reviews clear; DEBUG labels only, admission unchanged | deferred: exact live rejection input, terminal-coherence-safe production repair and runtime-selection wiring
 
 ### D3 — Remove the bash-metadata cache cliff
 

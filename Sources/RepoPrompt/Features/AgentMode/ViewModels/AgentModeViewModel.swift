@@ -14520,6 +14520,13 @@ final class AgentModeViewModel: ObservableObject {
                     ?? AgentTranscriptIO.lastUserInteractionDate(in: workingItemsSnapshot)
             )
         } else {
+            #if DEBUG
+                // Captured before the fallback: labels the sync-state inputs that differ from the stamp.
+                let syncDeltaLabel = DerivedTranscriptSyncState.diagnosticDeltaLabel(
+                    from: session.derivedTranscriptSyncState,
+                    to: makeDerivedTranscriptSyncState(for: session, projectionProtection: projectionProtection)
+                )
+            #endif
             builtPresentation = nil
             persistableSnapshot = persistableTranscriptSnapshot(
                 for: session,
@@ -14535,7 +14542,8 @@ final class AgentModeViewModel: ObservableObject {
                     tabID: tabID,
                     fields: [
                         "currentTabID": AgentModePerfDiagnostics.shortID(currentTabID),
-                        "sourceItemsRevision": String(session.sourceItemsRevision)
+                        "sourceItemsRevision": String(session.sourceItemsRevision),
+                        "syncDelta": syncDeltaLabel
                     ]
                 )
             #endif
