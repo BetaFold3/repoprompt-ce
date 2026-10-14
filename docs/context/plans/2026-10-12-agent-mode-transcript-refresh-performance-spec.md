@@ -195,6 +195,8 @@ Step D6-cold-path-signal — done | rounds 0/2 | open: none; D6-cold-path-signal
 
 Step D6-cold-admission-investigation — done | rounds 0/2 | open: none; D6-cold-pre-admission-investigation.md; D6-cold-post-admission-investigation.md | downgraded: none | assumed: ordered/additive PRE logs verified; handler-to-load UI work dominates, exact publication/admission split unknown; live POST reason unattributed | deferred: task-creation stamps, scheduling changes, shared processing context and terminal-coherence-safe adoption repair
 
+Step D6-cold-boundary-live — done | rounds 0/2 | open: none; D6-cold-timing-live-direct.md; D6-cold-timing-live-native.md | downgraded: none | assumed: installed f45ac238 verified; six cold loads joined; 120.734s native trace; main31.588%; hangmax1.029s | deferred: direct click latency and follow-fix gain (original filter omitted interaction logger; corrected capture had no interactions), paired leaf reuse, representative-load/RSS qualification
+
 Step D6-cold-timing — done | rounds 0/2 | open: none; D6-cold-timing-final.md | downgraded: none | assumed: five existing DEBUG logger boundaries; 75 tests then 42 after review cleanup; A/B no P0/P1 | deferred: live queue attribution, B D6-1/D6-3; identical overlapping service requests remain ambiguous
 
 Step D6-cold-follow-binding — done | rounds 0/2 | open: none; D6-cold-follow-binding-final.md | downgraded: none | assumed: exact destination follow copy in existing cold batch; 138 tests then 41 after review cleanup; A/B no P0/P1 | deferred: causal live latency gain, B F3 existing view arming-owner check
