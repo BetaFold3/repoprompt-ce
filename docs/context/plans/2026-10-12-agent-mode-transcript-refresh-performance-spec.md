@@ -195,7 +195,9 @@ Step D6-cold-path-signal — done | rounds 0/2 | open: none; D6-cold-path-signal
 
 Step D6-cold-admission-investigation — done | rounds 0/2 | open: none; D6-cold-pre-admission-investigation.md; D6-cold-post-admission-investigation.md | downgraded: none | assumed: ordered/additive PRE logs verified; handler-to-load UI work dominates, exact publication/admission split unknown; live POST reason unattributed | deferred: task-creation stamps, scheduling changes, shared processing context and terminal-coherence-safe adoption repair
 
-Step D6-cold-preparation — done | rounds 0/2 | open: none; D6-cold-preparation-final.md | downgraded: none | assumed: paired full persistent projection parity verified before edits; exact branch calls retained; build tooling unchanged | deferred: live latency/RSS qualification, frozen-limit prepare fixture, B F2/F3, broader sanitation/projection reuse
+Step D6-cold-preparation — done | rounds 0/2 | open: none; D6-cold-preparation-final.md; D6-cold-preparation-live.md | downgraded: none | assumed: installed22b2f3b4 verified; seven owner clicks joined; largecold2092.6ms/warm28.5ms are unmatched observations; source validation retained | deferred: matched latency/RSS qualification, frozen-limit prepare fixture, B F2/F3, broader sanitation/projection reuse
+
+Step D6-cold-live-directions — done | rounds 0/2 | open: none; D6-cold-preparation-live.md; D6-cold-preparation-live-OracleD-plan.md; D6-cold-preparation-live-OracleE-plan.md | downgraded: none | assumed: requested exact D/E presets verified, E one retry successful; native60.961s valid; sampled follow-publication caller | deferred: follow-copy qualification, admission/resumption boundaries, same-purpose preparation duplication proof; no new production edit
 
 Step D6-cold-loading-ui — done | rounds 0/2 | open: none; D6-cold-loading-ui-final.md | downgraded: none | assumed: reversible publication reduction without latency claim; build tooling unchanged | deferred: live qualification, earlier workspace-defer coalescing, B D6-A5/A6
 
