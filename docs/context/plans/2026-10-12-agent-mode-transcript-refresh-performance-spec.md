@@ -195,6 +195,10 @@ Step D6-cold-path-signal — done | rounds 0/2 | open: none; D6-cold-path-signal
 
 Step D6-cold-admission-investigation — done | rounds 0/2 | open: none; D6-cold-pre-admission-investigation.md; D6-cold-post-admission-investigation.md | downgraded: none | assumed: ordered/additive PRE logs verified; handler-to-load UI work dominates, exact publication/admission split unknown; live POST reason unattributed | deferred: task-creation stamps, scheduling changes, shared processing context and terminal-coherence-safe adoption repair
 
+Step D6-cold-loading-ui — done | rounds 0/2 | open: none; D6-cold-loading-ui-final.md | downgraded: none | assumed: reversible publication reduction without latency claim; build tooling unchanged | deferred: live qualification, earlier workspace-defer coalescing, B D6-A5/A6
+
+Step D6-cold-cache-investigation — done | rounds 0/2 | open: none; D6-cold-cache-investigation.md | downgraded: none | assumed: none | deferred: preservation-only candidate cut; no demonstrated downstream summary avoidance
+
 Step D6-cold-provider — done | rounds 0/2 | open: none; D6-cold-provider-final.md; D6-cold-provider-live.md; D6-cold-provider-live-provenance.md | downgraded: none | assumed: approved signed relaunch d53fde3b verified PID75569; recorded live run-only incremental import of 9 final-turn items; cold1904.1ms/warm29.3ms are individual samples; 82 tests and both reviews retained | deferred: D6-A crash-state coincidence/coherence characterization, matched gain/RSS, unusable native trace, writer teardown, run-state restamping, model-field movement and indexed-placeholder matrix
 
 Step D6-sanitize-reuse-investigation — done | rounds 0/2 | open: none; D6-sanitize-reuse-characterization.md; D6-sanitize-reuse-cut.md | downgraded: none | assumed: first post-full incremental fixture proves raw/SAN prefix miss; proposed raw import base cut because compactor consumes content-sensitive visibility/grouping/summary before sanitation; preserve existing guards and retention policy | deferred: live reuse-count exposure, actual cache-miss timing, qualified post-compaction cache reuse, UI cause-and-effect, original W1/RSS and optimized diagnostics lane
@@ -302,6 +306,8 @@ Pursue this only if, after D0–D7, the active-tab incremental refresh p95 is ab
 - `logCodexDebug(... transcriptRowDebugWindow(...))` on every refresh. Verify whether its argument is an `@autoclosure`.
 
 ## Decisions and provenance
+
+- Owner Decision (2026-10-14): Leave build tooling unchanged and continue investigating cold preparation and UI updates.
 
 - Owner Decision (2026-10-13): Relaunch the two committed creation fixes now, then continue measurement.
 

@@ -746,6 +746,11 @@ final class AgentModeViewModel: ObservableObject {
         activeUISyncSuppressionDepth > 0
     }
 
+    /// Transcript-UI-store-only publication batch: while open, `syncTranscriptUIState()` records a
+    /// request instead of building a snapshot; the outermost batch exit flushes once.
+    private var transcriptUIPublicationBatchDepth = 0
+    private var isTranscriptUIPublicationSyncRequested = false
+
     private var lastProcessedTabID: UUID?
 
     /// Last `AgentSessionRunState` the sidebar attention system observed for
@@ -1306,6 +1311,28 @@ final class AgentModeViewModel: ObservableObject {
         activeUISyncSuppressionDepth += 1
         defer { activeUISyncSuppressionDepth -= 1 }
         return try body()
+    }
+
+    func syncTranscriptUIState() {
+        guard transcriptUIPublicationBatchDepth == 0 else {
+            isTranscriptUIPublicationSyncRequested = true
+            return
+        }
+        ui.transcript.update(makeTranscriptUISnapshot())
+    }
+
+    /// Runs `body` synchronously and publishes at most one transcript UI store snapshot, built
+    /// from the final state, when the outermost batch exits. Other UI stores are unaffected.
+    private func withTranscriptUIPublicationBatch<T>(_ body: () -> T) -> T {
+        transcriptUIPublicationBatchDepth += 1
+        defer {
+            transcriptUIPublicationBatchDepth -= 1
+            if transcriptUIPublicationBatchDepth == 0, isTranscriptUIPublicationSyncRequested {
+                isTranscriptUIPublicationSyncRequested = false
+                syncTranscriptUIState()
+            }
+        }
+        return body()
     }
 
     var activeTranscriptAnalyticsSnapshot: AgentTranscriptAnalyticsSnapshot {
@@ -3857,33 +3884,40 @@ final class AgentModeViewModel: ObservableObject {
         guard lastProcessedTabID != tabID else { return }
         lastProcessedTabID = tabID
 
-        guard let session = session(for: tabID, createIfNeeded: false) else {
-            if workspaceSwitchInFlight,
-               !allowDuringWorkspaceSwitch,
-               workspaceManager?.composeTab(with: tabID) == nil
-            {
-                activeSessionLoadInProgressTabID = tabID
-                publishLoadingTranscriptPresentation(tabID: tabID)
-                return
+        // Session lookup/materialization and every synchronous activation branch (clear, warm bind,
+        // missing-session loading, cold loading setup) publish at most one transcript UI snapshot,
+        // flushed before any load Task is created. Returns the session that needs a cold load.
+        let coldSession: TabSession? = withTranscriptUIPublicationBatch {
+            guard let session = session(for: tabID, createIfNeeded: false) else {
+                if workspaceSwitchInFlight,
+                   !allowDuringWorkspaceSwitch,
+                   workspaceManager?.composeTab(with: tabID) == nil
+                {
+                    activeSessionLoadInProgressTabID = tabID
+                    publishLoadingTranscriptPresentation(tabID: tabID)
+                    return nil
+                }
+                workspaceSwitchInFlight = false
+                // No bound agent session for this tab yet.
+                activeSessionLoadInProgressTabID = nil
+                clearBindings()
+                return nil
             }
-            workspaceSwitchInFlight = false
-            // No bound agent session for this tab yet.
-            activeSessionLoadInProgressTabID = nil
-            clearBindings()
-            return
-        }
 
-        guard !session.isPresentableForOwner else {
-            workspaceSwitchInFlight = false
-            activeSessionLoadInProgressTabID = nil
+            guard !session.isPresentableForOwner else {
+                workspaceSwitchInFlight = false
+                activeSessionLoadInProgressTabID = nil
+                applySessionToBindings(session)
+                scheduleProvisionalClaudeContextWindowResolutionForActiveSession(reason: "workspace_switch_completed")
+                return nil
+            }
+
+            activeSessionLoadInProgressTabID = tabID
+            publishLoadingTranscriptPresentation(tabID: tabID)
             applySessionToBindings(session)
-            scheduleProvisionalClaudeContextWindowResolutionForActiveSession(reason: "workspace_switch_completed")
-            return
+            return session
         }
-
-        activeSessionLoadInProgressTabID = tabID
-        publishLoadingTranscriptPresentation(tabID: tabID)
-        applySessionToBindings(session)
+        guard let session = coldSession else { return }
         Task { [weak self] in
             guard let self else { return }
             await loadSessionFromDisk(for: session)

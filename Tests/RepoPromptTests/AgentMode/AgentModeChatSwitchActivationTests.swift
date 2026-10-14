@@ -1,3 +1,4 @@
+import Combine
 import Foundation
 import XCTest
 @_spi(TestSupport) @testable import RepoPromptApp
@@ -1834,6 +1835,356 @@ final class AgentModeChatSwitchActivationTests: XCTestCase {
                 XCTAssertEqual(session.transcriptProjectionCounts, reference.projectionCounts)
                 XCTAssertEqual(session.transcriptCanonicalVisibleRowCount, reference.canonicalVisibleRowCount)
                 XCTAssertEqual(session.transcriptAnalyticsSnapshot, reference.analyticsSnapshot)
+            }
+        }
+
+        // MARK: - D6 cold-loading UI publication
+
+        /// A foreground switch from a hydrated tab to an already-materialized, unpresentable persisted
+        /// tab publishes exactly one target loading snapshot to the transcript UI store before the
+        /// persisted load completes, then the hydrated target.
+        func testColdActivationPublishesOneLoadingSnapshotBeforeHydration() async throws {
+            try await withFixture { fixture in
+                let viewModel = fixture.viewModel
+                let cold = try await persistColdTarget(in: fixture)
+                defer { viewModel.test_persistenceWorkspaceOverride = nil }
+                let session = try materializeUnpresentable(cold.tabID, in: fixture)
+                XCTAssertEqual(viewModel.currentTabID, fixture.tabAID)
+                XCTAssertTrue(viewModel.ui.transcript.snapshot.isHydrated)
+                let previousRevision = viewModel.activeTranscriptPresentation.revision
+
+                let gate = ColdLoadGate()
+                defer { gate.release() }
+                viewModel.test_persistedLoadBeforePrepareHook = { held in
+                    guard held.tabID == cold.tabID else { return }
+                    await gate.waitForRelease()
+                }
+                defer { viewModel.test_persistedLoadBeforePrepareHook = nil }
+                var emissions: [AgentTranscriptUISnapshot] = []
+                let subscription = viewModel.ui.transcript.$snapshot.dropFirst().sink { snapshot in
+                    MainActor.assumeIsolated { emissions.append(snapshot) }
+                }
+                defer { subscription.cancel() }
+
+                await fixture.window.promptManager.switchComposeTab(cold.tabID)
+                try await Self.waitUntil { gate.isWaiting }
+                await Self.drainMainQueue()
+                XCTAssertTrue(viewModel.sessions[cold.tabID] === session)
+                XCTAssertFalse(session.hasLoadedPersistedState)
+
+                let loading = emissions.filter { $0.currentTabID == cold.tabID }
+                XCTAssertEqual(loading.count, 1, "One target loading publication before the persisted load completes")
+                let snapshot = try XCTUnwrap(loading.first)
+                XCTAssertEqual(snapshot.presentation.tabID, cold.tabID)
+                XCTAssertFalse(snapshot.isHydrated)
+                XCTAssertFalse(snapshot.presentation.bindingsHydrated)
+                XCTAssertEqual(snapshot.presentationRevision, previousRevision &+ 1)
+                XCTAssertEqual(snapshot.activeSessionLoadInProgressTabID, cold.tabID)
+                XCTAssertTrue(snapshot.presentation.visibleRows.isEmpty)
+                XCTAssertTrue(snapshot.presentation.workingRows.isEmpty)
+                XCTAssertEqual(viewModel.ui.transcript.snapshot, snapshot)
+
+                gate.release()
+                try await Self.waitUntil {
+                    session.hasLoadedPersistedState && viewModel.activeSessionLoadInProgressTabID == nil
+                }
+                await Self.drainMainQueue()
+                XCTAssertEqual(session.persistedLoadDisposition, .applied)
+                let hydrated = viewModel.ui.transcript.snapshot
+                XCTAssertEqual(hydrated.currentTabID, cold.tabID)
+                XCTAssertTrue(hydrated.isHydrated)
+                XCTAssertNil(hydrated.activeSessionLoadInProgressTabID)
+                assertPresentation(
+                    hydrated.presentation,
+                    tabID: cold.tabID,
+                    sessionID: cold.sessionID,
+                    session: session,
+                    expectedTexts: cold.texts
+                )
+                XCTAssertFalse(emissions.contains { snapshot in
+                    snapshot.currentTabID == cold.tabID
+                        && snapshot.presentation.visibleRows.contains { fixture.tabATexts.contains($0.text) }
+                }, "The target never shows the previous tab's rows")
+            }
+        }
+
+        /// A foreground switch to an unseeded persisted tab materializes and binds its session during
+        /// activation; the binding notification and sidebar publication land before the transcript UI
+        /// store publishes exactly one target loading snapshot, followed by the hydrated target.
+        func testUnseededColdActivationPublishesOneLoadingSnapshotAfterMaterialization() async throws {
+            try await withFixture { fixture in
+                let viewModel = fixture.viewModel
+                let cold = try await persistColdTarget(in: fixture)
+                defer { viewModel.test_persistenceWorkspaceOverride = nil }
+                let previousRevision = viewModel.activeTranscriptPresentation.revision
+
+                let gate = ColdLoadGate()
+                defer { gate.release() }
+                viewModel.test_persistedLoadBeforePrepareHook = { held in
+                    guard held.tabID == cold.tabID else { return }
+                    await gate.waitForRelease()
+                }
+                defer { viewModel.test_persistedLoadBeforePrepareHook = nil }
+                var events: [String] = []
+                var emissions: [AgentTranscriptUISnapshot] = []
+                let transcriptSubscription = viewModel.ui.transcript.$snapshot.dropFirst().sink { snapshot in
+                    MainActor.assumeIsolated {
+                        emissions.append(snapshot)
+                        if snapshot.currentTabID == cold.tabID { events.append("transcript") }
+                    }
+                }
+                let sidebarSubscription = viewModel.ui.sessionSidebar.$snapshot.dropFirst().sink { _ in
+                    // The sidebar snapshot carries no binding fields; only publications observed
+                    // after the VM registered the cold tab bound to the cold session count.
+                    MainActor.assumeIsolated {
+                        if viewModel.sessions[cold.tabID]?.activeAgentSessionID == cold.sessionID {
+                            events.append("sidebar")
+                        }
+                    }
+                }
+                let bindingSubscription = NotificationCenter.default
+                    .publisher(for: .agentSessionBindingDidChange, object: viewModel)
+                    .sink { notification in
+                        let tabID = notification.userInfo?["tabID"] as? UUID
+                        let sessionID = notification.userInfo?["sessionID"] as? UUID
+                        MainActor.assumeIsolated {
+                            if tabID == cold.tabID, sessionID == cold.sessionID { events.append("binding") }
+                        }
+                    }
+                defer {
+                    transcriptSubscription.cancel()
+                    sidebarSubscription.cancel()
+                    bindingSubscription.cancel()
+                }
+
+                await fixture.window.promptManager.switchComposeTab(cold.tabID)
+                try await Self.waitUntil { gate.isWaiting }
+                await Self.drainMainQueue()
+                let session = try XCTUnwrap(viewModel.sessions[cold.tabID], "Activation materializes the target")
+                XCTAssertEqual(session.activeAgentSessionID, cold.sessionID)
+                XCTAssertFalse(session.hasLoadedPersistedState)
+
+                XCTAssertEqual(events.count { $0 == "transcript" }, 1, "One target loading publication before the persisted load completes")
+                let flushIndex = try XCTUnwrap(events.firstIndex(of: "transcript"))
+                XCTAssertTrue(events[..<flushIndex].contains("binding"), "Binding installed before the transcript publication")
+                XCTAssertTrue(events[..<flushIndex].contains("sidebar"), "Sidebar publication after bound-session registration, before the transcript publication")
+                let snapshot = try XCTUnwrap(emissions.first { $0.currentTabID == cold.tabID })
+                XCTAssertEqual(snapshot.presentation.tabID, cold.tabID)
+                XCTAssertFalse(snapshot.isHydrated)
+                XCTAssertFalse(snapshot.presentation.bindingsHydrated)
+                XCTAssertEqual(snapshot.presentationRevision, previousRevision &+ 1)
+                XCTAssertEqual(snapshot.activeSessionLoadInProgressTabID, cold.tabID)
+                XCTAssertTrue(snapshot.presentation.visibleRows.isEmpty)
+                XCTAssertTrue(snapshot.presentation.workingRows.isEmpty)
+                XCTAssertEqual(viewModel.ui.transcript.snapshot, snapshot)
+
+                gate.release()
+                try await Self.waitUntil {
+                    session.hasLoadedPersistedState && viewModel.activeSessionLoadInProgressTabID == nil
+                }
+                await Self.drainMainQueue()
+                XCTAssertEqual(session.persistedLoadDisposition, .applied)
+                let hydrated = viewModel.ui.transcript.snapshot
+                XCTAssertEqual(hydrated.currentTabID, cold.tabID)
+                XCTAssertTrue(hydrated.isHydrated)
+                XCTAssertNil(hydrated.activeSessionLoadInProgressTabID)
+                assertPresentation(
+                    hydrated.presentation,
+                    tabID: cold.tabID,
+                    sessionID: cold.sessionID,
+                    session: session,
+                    expectedTexts: cold.texts
+                )
+                XCTAssertFalse(emissions.contains { snapshot in
+                    snapshot.currentTabID == cold.tabID
+                        && snapshot.presentation.visibleRows.contains { fixture.tabATexts.contains($0.text) }
+                }, "The target never shows the previous tab's rows")
+            }
+        }
+
+        /// After a rapid switch away from a still-loading unseeded cold target, the target's delayed
+        /// load never republishes its loading or hydrated state over the newer destination.
+        func testColdActivationStaleLoadCannotRepublishAfterRapidSwitch() async throws {
+            try await withFixture { fixture in
+                let viewModel = fixture.viewModel
+                let cold = try await persistColdTarget(in: fixture)
+                defer { viewModel.test_persistenceWorkspaceOverride = nil }
+
+                let gate = ColdLoadGate()
+                defer { gate.release() }
+                viewModel.test_persistedLoadBeforePrepareHook = { held in
+                    guard held.tabID == cold.tabID else { return }
+                    await gate.waitForRelease()
+                }
+                defer { viewModel.test_persistedLoadBeforePrepareHook = nil }
+                var emissions: [AgentTranscriptUISnapshot] = []
+                let subscription = viewModel.ui.transcript.$snapshot.dropFirst().sink { snapshot in
+                    MainActor.assumeIsolated { emissions.append(snapshot) }
+                }
+                defer { subscription.cancel() }
+
+                await fixture.window.promptManager.switchComposeTab(cold.tabID)
+                try await Self.waitUntil { gate.isWaiting }
+                let session = try XCTUnwrap(viewModel.sessions[cold.tabID])
+                XCTAssertEqual(emissions.count { $0.currentTabID == cold.tabID }, 1)
+
+                await fixture.window.promptManager.switchComposeTab(fixture.tabBID)
+                let destinationStart = emissions.count
+                gate.release()
+                try await Self.waitUntil { session.hasLoadedPersistedState }
+                await Self.drainMainQueue()
+
+                XCTAssertEqual(session.persistedLoadDisposition, .applied)
+                XCTAssertFalse(emissions[destinationStart...].contains { snapshot in
+                    snapshot.currentTabID == cold.tabID
+                        || snapshot.presentation.tabID == cold.tabID
+                        || snapshot.activeSessionLoadInProgressTabID == cold.tabID
+                }, "The stale cold load never republishes after the newer switch")
+                let destination = viewModel.ui.transcript.snapshot
+                XCTAssertEqual(destination.currentTabID, fixture.tabBID)
+                XCTAssertTrue(destination.isHydrated)
+                XCTAssertNil(destination.activeSessionLoadInProgressTabID)
+                assertPresentation(
+                    destination.presentation,
+                    tabID: fixture.tabBID,
+                    sessionID: fixture.sessionBID,
+                    session: fixture.sessionB,
+                    expectedTexts: fixture.tabBTexts
+                )
+            }
+        }
+
+        /// Activations that end without a cold load (no bound session; warm session) leave transcript UI
+        /// publication immediate: a later loading-flag update reaches the store synchronously.
+        func testEarlyExitAndWarmActivationsLeaveTranscriptPublicationImmediate() async throws {
+            try await withFixture { fixture in
+                let viewModel = fixture.viewModel
+                let window = fixture.window
+                let unboundTabID = UUID()
+                let workspace = try XCTUnwrap(window.workspaceManager.activeWorkspace)
+                let workspaceIndex = try XCTUnwrap(window.workspaceManager.workspaces.firstIndex { $0.id == workspace.id })
+                window.workspaceManager.workspaces[workspaceIndex].composeTabs.append(
+                    ComposeTabState(id: unboundTabID, name: "Unbound", activeAgentSessionID: nil)
+                )
+                window.promptManager.loadComposeTabsFromWorkspace(window.workspaceManager.workspaces[workspaceIndex])
+
+                @MainActor func assertLaterUpdatePublishesImmediately(_ label: String) {
+                    let marker = UUID()
+                    viewModel.test_setActiveSessionLoadInProgressTabID(marker)
+                    XCTAssertEqual(viewModel.ui.transcript.snapshot.activeSessionLoadInProgressTabID, marker, label)
+                    viewModel.test_setActiveSessionLoadInProgressTabID(nil)
+                    XCTAssertNil(viewModel.ui.transcript.snapshot.activeSessionLoadInProgressTabID, label)
+                }
+
+                // Early exit: the tab has no session at activation, so activation clears the bindings
+                // (an unbound placeholder created afterwards is never bound by this activation).
+                XCTAssertNil(viewModel.sessions[unboundTabID])
+                await window.promptManager.switchComposeTab(unboundTabID)
+                XCTAssertNil(viewModel.sessions[unboundTabID]?.activeAgentSessionID)
+                let cleared = viewModel.ui.transcript.snapshot
+                XCTAssertEqual(cleared.currentTabID, unboundTabID)
+                XCTAssertFalse(cleared.isHydrated)
+                XCTAssertNil(cleared.activeSessionLoadInProgressTabID)
+                assertLaterUpdatePublishesImmediately("after unbound early exit")
+
+                // Warm: the destination is presentable and publishes before the switch returns.
+                await window.promptManager.switchComposeTab(fixture.tabBID)
+                let warm = viewModel.ui.transcript.snapshot
+                XCTAssertEqual(warm.currentTabID, fixture.tabBID)
+                XCTAssertTrue(warm.isHydrated)
+                XCTAssertNil(warm.activeSessionLoadInProgressTabID)
+                assertPresentation(
+                    warm.presentation,
+                    tabID: fixture.tabBID,
+                    sessionID: fixture.sessionBID,
+                    session: fixture.sessionB,
+                    expectedTexts: fixture.tabBTexts
+                )
+                assertLaterUpdatePublishesImmediately("after warm activation")
+            }
+        }
+
+        /// Persists a completed two-row session to a real temporary store and adds an unseeded
+        /// compose tab bound to it; the view model reads that store until the caller resets the override.
+        private func persistColdTarget(in fixture: Fixture) async throws -> (tabID: UUID, sessionID: UUID, texts: [String]) {
+            let window = fixture.window
+            let storageURL = fixture.rootURL.appendingPathComponent("SessionStore", isDirectory: true)
+            try FileManager.default.createDirectory(at: storageURL, withIntermediateDirectories: true)
+            var storeWorkspace = try XCTUnwrap(window.workspaceManager.activeWorkspace)
+            storeWorkspace.customStoragePath = storageURL
+            fixture.viewModel.test_persistenceWorkspaceOverride = storeWorkspace
+
+            let writer = AgentModeViewModel(
+                testWindowID: 4491,
+                testWorkspacePath: storageURL.path,
+                testWorkspaceDirectory: storageURL,
+                codexControllerFactory: { _, _, _, _, _, _ in LifecycleNoopCodexController(recorder: LifecycleRecorder()) }
+            )
+            writer.test_establishPersistenceWorkspace(storeWorkspace)
+            let writerTabID = UUID()
+            writer.test_setCurrentTabIDOverride(writerTabID)
+            let written = try await writer.ensureSessionReady(tabID: writerTabID)
+            let texts = ["Cold user", "Cold assistant"]
+            written.appendItem(.user(texts[0]))
+            written.appendItem(.assistant(texts[1]))
+            written.runState = .completed
+            let saved = await writer.flushSave(for: writerTabID)
+            XCTAssertTrue(saved)
+            let sessionID = try XCTUnwrap(written.activeAgentSessionID)
+            // Ordinary close of the headless writer; the persisted record stays in the store.
+            await writer.prepareForWindowClose()
+
+            let tabID = UUID()
+            let workspaceIndex = try XCTUnwrap(window.workspaceManager.workspaces.firstIndex { $0.id == storeWorkspace.id })
+            window.workspaceManager.workspaces[workspaceIndex].composeTabs.append(
+                ComposeTabState(id: tabID, name: "Cold", activeAgentSessionID: sessionID)
+            )
+            window.promptManager.loadComposeTabsFromWorkspace(window.workspaceManager.workspaces[workspaceIndex])
+            XCTAssertNil(fixture.viewModel.sessions[tabID])
+            return (tabID, sessionID, texts)
+        }
+
+        /// Materializes the cold tab's session in the background (while another tab is current), so
+        /// activation takes the ordinary unpresentable-session path rather than materializing it.
+        private func materializeUnpresentable(_ tabID: UUID, in fixture: Fixture) throws -> AgentModeViewModel.TabSession {
+            let viewModel = fixture.viewModel
+            let before = viewModel.ui.transcript.snapshot
+            let session = try XCTUnwrap(viewModel.session(for: tabID, createIfNeeded: false))
+            XCTAssertFalse(session.isPresentableForOwner)
+            XCTAssertFalse(session.hasLoadedPersistedState)
+            XCTAssertEqual(viewModel.ui.transcript.snapshot, before, "Background materialization does not publish")
+            return session
+        }
+
+        private static func waitUntil(_ condition: () -> Bool) async throws {
+            let deadline = Date().addingTimeInterval(20)
+            while !condition() {
+                guard Date() < deadline else {
+                    XCTFail("Timed out waiting for condition")
+                    return
+                }
+                try await Task.sleep(for: .milliseconds(5))
+            }
+        }
+
+        @MainActor
+        private final class ColdLoadGate {
+            private var continuation: CheckedContinuation<Void, Never>?
+            private var released = false
+            private(set) var isWaiting = false
+
+            func waitForRelease() async {
+                if released { return }
+                isWaiting = true
+                await withCheckedContinuation { continuation in
+                    self.continuation = continuation
+                }
+            }
+
+            func release() {
+                released = true
+                continuation?.resume()
+                continuation = nil
             }
         }
     #endif
