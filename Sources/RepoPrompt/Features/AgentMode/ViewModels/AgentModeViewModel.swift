@@ -5364,6 +5364,9 @@ final class AgentModeViewModel: ObservableObject {
             isStaleResetRecoveryReplacement = false
         }
 
+        // The prepared presentation was built for the normalized persisted provider; install it
+        // before hydration stamps the derived-transcript sync state.
+        session.selectedAgent = payload.normalizedSelection.agent
         hydrateSession(
             session,
             withCanonicalItems: payload.canonicalLiveItems,
@@ -5427,7 +5430,6 @@ final class AgentModeViewModel: ObservableObject {
         } else {
             sessionIndexStore.removeSortDate(forTabID: session.tabID)
         }
-        session.selectedAgent = payload.normalizedSelection.agent
         session.ohMyPiThinkingSelections = agentSession.ohMyPiThinkingSelections ?? .empty
         if session.transcriptAnalyticsSnapshot.selectedAgent != session.selectedAgent {
             session.transcriptAnalyticsSnapshot.selectedAgent = session.selectedAgent

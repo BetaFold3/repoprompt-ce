@@ -191,7 +191,11 @@ Step D5 — done | rounds 1/2 | open: none | downgraded: none | assumed: focused
 
 ### D6 — Sidebar: one build per render pass
 
-Step D6-cold-path-signal — done | rounds 0/2 | open: none; D6-cold-path-signal-final.md | downgraded: none | assumed: pure duplicate-work removal; 37 focused tests, unchanged-HEAD goldens, negative control and both initial reviews clear; no cold gain claimed | deferred: installation/matched latency, test discoverability, private-helper precondition hardening and hover-only last-resort prefetch
+Step D6-cold-path-signal — done | rounds 0/2 | open: none; D6-cold-path-signal-final.md; D6-cold-path-signal-live.md | downgraded: none | assumed: aaf581ad approved signed relaunch verified PID63316; aligned owner clicks/native capture; 37 tests and both reviews retained; individual cold2089.1ms and warm38.7ms are not matched gain | deferred: PRE UI admission and POST catch-up attribution, matched latency/RSS, test discoverability, private-helper precondition hardening and hover-only last-resort prefetch
+
+Step D6-cold-admission-investigation — done | rounds 0/2 | open: none; D6-cold-pre-admission-investigation.md; D6-cold-post-admission-investigation.md | downgraded: none | assumed: ordered/additive PRE logs verified; handler-to-load UI work dominates, exact publication/admission split unknown; live POST reason unattributed | deferred: task-creation stamps, scheduling changes, shared processing context and terminal-coherence-safe adoption repair
+
+Step D6-cold-provider — done | rounds 0/2 | open: none; D6-cold-provider-final.md | downgraded: none | assumed: passive provider restored before hydration stamp; real foreground full-reference regression, old-order negative control and 82 focused tests pass; both initial reviews no P0/P1; D2 old-stamp expectations deliberately updated | deferred: D6-A crash-state coincidence/coherence characterization, exact live admission/gain, installation, writer teardown, run-state restamping, model-field movement and indexed-placeholder matrix
 
 Step D6-cold-tool-normalization — done | rounds 0/2 | open: none; D6-cold-tool-normalization-final.md; D6-cold-tool-normalization-live.md | downgraded: none | assumed: 719d41d5 approved signed relaunch verified PID13332; 36 tests and both reviews retained; late clicks outside native profile, incomplete timings disclose no matched gain | deferred: matched cold latency, hover-only last-resort prefetch, storage-pass equivalence and test relocation
 

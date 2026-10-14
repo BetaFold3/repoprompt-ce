@@ -1807,8 +1807,9 @@ final class AgentStaleResetOwnershipTests: XCTestCase {
         )
         let stamp = try XCTUnwrap(background.derivedTranscriptSyncState)
         XCTAssertEqual(stamp.runState, placeholder.run)
-        XCTAssertEqual(stamp.selectedAgent, placeholder.agent)
-        XCTAssertEqual(delta, "syncDelta.run-agent", "sequence, revision, ask and protection already match")
+        // The normalized persisted provider is installed before hydration stamps; run state is not.
+        XCTAssertEqual(stamp.selectedAgent, .openCode)
+        XCTAssertEqual(delta, "syncDelta.run", "provider, sequence, revision, ask and protection already match")
         XCTAssertFalse(peer.viewModel.canReuseDerivedTranscriptForSave(for: background, projectionProtection: protection))
         XCTAssertNil(background.pendingDerivedTranscriptRefreshReason)
         XCTAssertNil(background.derivedTranscriptRefreshTask)
@@ -1851,7 +1852,10 @@ final class AgentStaleResetOwnershipTests: XCTestCase {
         let fallbackLines = AgentModePerfDiagnostics.recentMetricLinesSnapshot(limit: 1000)
             .filter { $0.contains(" save.session.persistenceOnlySnapshot ") && $0.contains(backgroundTag) }
         XCTAssertEqual(fallbackLines.count, 1)
-        XCTAssertTrue(fallbackLines.first?.contains("syncDelta=syncDelta.run-agent") == true, "\(fallbackLines)")
+        XCTAssertTrue(
+            fallbackLines.first?.split(separator: " ").contains("syncDelta=syncDelta.run") == true,
+            "\(fallbackLines)"
+        )
 
         // The record committed by the fallback save (production prefix hint and storage policy),
         // read through the writer's data service, is semantically equal to the pre-hydration record;

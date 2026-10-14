@@ -1697,6 +1697,147 @@ final class AgentModeChatSwitchActivationTests: XCTestCase {
         workspaceManager.workspaces[workspaceIndex].composeTabs[tabIndex].selection = selection
     }
 
+    // MARK: - D6 cold activation provider stamp (real store, foreground switch)
+
+    #if DEBUG
+        /// A foreground cold activation of a persisted completed OpenCode session, from an unseeded
+        /// placeholder holding the warm tab's different provider, stamps hydration with the normalized
+        /// persisted provider. The activation catch-up then sees only the run-state delta and takes the
+        /// guarded run-state-only final-turn import, installing output equal to a full cold reference.
+        func testColdActivationStampsPersistedProviderAndCatchesUpRunStateOnly() async throws {
+            try await withFixture { fixture in
+                let viewModel = fixture.viewModel
+                let window = fixture.window
+                let storageURL = fixture.rootURL.appendingPathComponent("SessionStore", isDirectory: true)
+                try FileManager.default.createDirectory(at: storageURL, withIntermediateDirectories: true)
+                var storeWorkspace = try XCTUnwrap(window.workspaceManager.activeWorkspace)
+                storeWorkspace.customStoragePath = storageURL
+                viewModel.test_persistenceWorkspaceOverride = storeWorkspace
+                defer { viewModel.test_persistenceWorkspaceOverride = nil }
+
+                // A separate writer persists a completed multi-turn OpenCode session to the real store.
+                let writer = AgentModeViewModel(
+                    testWindowID: 4490,
+                    testWorkspacePath: storageURL.path,
+                    testWorkspaceDirectory: storageURL,
+                    codexControllerFactory: { _, _, _, _, _, _ in LifecycleNoopCodexController(recorder: LifecycleRecorder()) }
+                )
+                writer.test_establishPersistenceWorkspace(storeWorkspace)
+                let writerTabID = UUID()
+                writer.test_setCurrentTabIDOverride(writerTabID)
+                let written = try await writer.ensureSessionReady(tabID: writerTabID)
+                written.selectedAgent = .openCode
+                for turn in 0 ..< 3 {
+                    let invocation = UUID()
+                    written.appendItem(.user("Turn \(turn) request"))
+                    written.appendItem(.toolCall(name: "bash", invocationID: invocation, argsJSON: "{\"command\":\"echo \(turn)\"}"))
+                    written.appendItem(.toolResult(name: "bash", invocationID: invocation, resultJSON: "{\"output\":\"\(turn)\"}"))
+                    written.appendItem(.assistant("Turn \(turn) reply"))
+                }
+                written.runState = .completed
+                let saved = await writer.flushSave(for: writerTabID)
+                XCTAssertTrue(saved)
+                let sessionID = try XCTUnwrap(written.activeAgentSessionID)
+                let loaded = try await writer.test_dataService.loadAgentSession(id: sessionID, for: storeWorkspace)
+                let persisted = try XCTUnwrap(loaded)
+                XCTAssertEqual(persisted.agentKind, AgentProviderKind.openCode.rawValue)
+                XCTAssertEqual(persisted.lastRunState, AgentSessionRunState.completed.rawValue)
+                let persistedItems = try AgentTranscriptIO.workingSourceItems(from: XCTUnwrap(persisted.transcript))
+                XCTAssertEqual(persistedItems.map(\.id), written.items.map(\.id))
+
+                // Unseeded cold target; its placeholder inherits the warm tab's different provider.
+                let tabID = UUID()
+                let workspaceIndex = try XCTUnwrap(window.workspaceManager.workspaces.firstIndex { $0.id == storeWorkspace.id })
+                window.workspaceManager.workspaces[workspaceIndex].composeTabs.append(
+                    ComposeTabState(id: tabID, name: "Cold", activeAgentSessionID: sessionID)
+                )
+                window.promptManager.loadComposeTabsFromWorkspace(window.workspaceManager.workspaces[workspaceIndex])
+                XCTAssertNotEqual(viewModel.selectedAgent, .openCode)
+                XCTAssertNil(viewModel.ownerValidatedSessionIndex[sessionID])
+                XCTAssertNil(viewModel.sessions[tabID])
+
+                @MainActor func syncState(of session: AgentModeViewModel.TabSession) -> AgentModeViewModel.DerivedTranscriptSyncState {
+                    AgentModeViewModel.DerivedTranscriptSyncState(
+                        sourceItemsRevision: session.sourceItemsRevision,
+                        nextSequenceIndex: session.nextSequenceIndex,
+                        runState: session.runState,
+                        selectedAgent: session.selectedAgent,
+                        hidePendingQuestionToolCall: session.hasPendingQuestionUI,
+                        projectionProtection: viewModel.transcriptProjectionProtection(for: session, transcript: session.transcript)
+                    )
+                }
+                // Read-only: the target's state while the catch-up import is computed but not installed.
+                var catchUps: [(reason: String, path: String, stamp: AgentModeViewModel.DerivedTranscriptSyncState?, delta: String, attempts: Int, successes: Int)] = []
+                AgentTranscriptDebugInstrumentation.reset()
+                AgentTranscriptDebugInstrumentation.isEnabled = true
+                AgentTranscriptDebugInstrumentation.refreshAttemptHandler = { metrics in
+                    MainActor.assumeIsolated {
+                        guard viewModel.currentTabID == tabID, let target = viewModel.sessions[tabID],
+                              target.sourceItemsRevision == metrics.sourceItemsRevision
+                        else { return }
+                        let stamp = target.derivedTranscriptSyncState
+                        let delta = AgentModeViewModel.DerivedTranscriptSyncState.diagnosticDeltaLabel(from: stamp, to: syncState(of: target))
+                        let performance = target.transcriptPerformanceSnapshot
+                        catchUps.append((metrics.reason, metrics.incrementalPath, stamp, delta, performance.incrementalImportAttemptCount, performance.incrementalImportSuccessCount))
+                    }
+                }
+                defer { AgentTranscriptDebugInstrumentation.reset() }
+
+                await window.promptManager.switchComposeTab(tabID)
+                let session = try XCTUnwrap(viewModel.sessions[tabID])
+                let deadline = Date().addingTimeInterval(20)
+                while viewModel.activeSessionLoadInProgressTabID != nil || !session.hasLoadedPersistedState, Date() < deadline {
+                    try await Task.sleep(for: .milliseconds(5))
+                }
+                await Self.drainMainQueue()
+                XCTAssertEqual(session.persistedLoadDisposition, .applied)
+
+                XCTAssertEqual(catchUps.count, 1)
+                let catchUp = try XCTUnwrap(catchUps.first)
+                XCTAssertEqual(catchUp.reason, AgentModeViewModel.DerivedTranscriptRefreshReason.liveMutation.rawValue)
+                XCTAssertEqual(catchUp.stamp?.selectedAgent, .openCode, "Hydration stamps the normalized persisted provider")
+                XCTAssertEqual(catchUp.stamp?.runState, .idle, "Run state is still installed after the stamp")
+                XCTAssertEqual(catchUp.delta, "syncDelta.run")
+                XCTAssertEqual(catchUp.path, "incremental-success:no-frontier")
+                XCTAssertEqual(session.transcriptPerformanceSnapshot.incrementalImportAttemptCount - catchUp.attempts, 1)
+                XCTAssertEqual(session.transcriptPerformanceSnapshot.incrementalImportSuccessCount - catchUp.successes, 1)
+
+                // Sync: the catch-up leaves a reusable stamp for the completed state.
+                XCTAssertEqual(session.selectedAgent, .openCode)
+                XCTAssertEqual(session.runState, .completed)
+                XCTAssertEqual(session.derivedTranscriptSyncState, syncState(of: session))
+                let protection = viewModel.transcriptProjectionProtection(for: session, transcript: session.transcript)
+                XCTAssertTrue(viewModel.canReuseDerivedTranscriptForSave(for: session, projectionProtection: protection))
+
+                // Integrity: the hydrated items are the stored record; output equals a cold full reference.
+                XCTAssertEqual(session.items, persistedItems)
+                let rebuilt = AgentTranscriptIO.rebuiltTranscriptPreservingCompactedPrefix(
+                    existingTranscript: AgentTranscript(),
+                    workingItems: session.items,
+                    terminalState: session.runState,
+                    nextSequenceIndex: session.nextSequenceIndex,
+                    policy: .liveSession(hidePendingQuestionToolCall: session.hasPendingQuestionUI),
+                    protection: protection
+                )
+                let reference = AgentModeViewModel.buildTranscriptPresentation(
+                    from: rebuilt,
+                    sourceItems: session.items,
+                    selectedAgent: .openCode,
+                    previousPerformanceSnapshot: .empty,
+                    projectionProtection: protection,
+                    isColdLoad: true
+                )
+                XCTAssertEqual(session.transcript, reference.transcript)
+                XCTAssertEqual(session.baseTranscriptProjection, reference.baseProjection)
+                XCTAssertEqual(session.fullTranscriptProjection, reference.fullProjection)
+                XCTAssertEqual(session.workingTranscriptProjection, reference.workingProjection)
+                XCTAssertEqual(session.transcriptProjectionCounts, reference.projectionCounts)
+                XCTAssertEqual(session.transcriptCanonicalVisibleRowCount, reference.canonicalVisibleRowCount)
+                XCTAssertEqual(session.transcriptAnalyticsSnapshot, reference.analyticsSnapshot)
+            }
+        }
+    #endif
+
     // MARK: - D0 interaction-latency attribution (real PromptViewModel → notification → VM path)
 
     #if DEBUG
