@@ -191,6 +191,8 @@ Step D5 — done | rounds 1/2 | open: none | downgraded: none | assumed: focused
 
 ### D6 — Sidebar: one build per render pass
 
+Step D6-runtime-selection — done | rounds 0/2 | open: none; D6-runtime-selection-final.md | downgraded: none | assumed: guarded canonical non-flushing full-sync runtime input; 76 tests and both initial reviews clear; old-nil negative control fails; all other facade delivery retained | deferred: live UI savings/per-call summary cost, implicit-first-tab benefit, other runtime callers and terminal-coherence-safe save repair
+
 Step D6-context-config — done | rounds 1/2 | open: none; D6-context-config-final.md; D6-context-config-live.md | downgraded: none | assumed: fbe4b1e1 approved signed relaunch verified PID96485; 47 tests and both re-reviews clear; retained creation270.7/811.7/551.1ms and separate cold-load timers are unmatched samples | deferred: live guard frequency/savings, matched latency/RSS and final full-sync runtime selection ownership
 
 Step D6-creation-live — done | rounds 0/2 | open: none; D6-creation-fixes-live.md | downgraded: none | assumed: approved signed relaunch37ac09fa PID21158; direct freshCodex853.7ms andClaude579.3ms; warm firstPublish6.0/11.8ms; nativeUI-dominated workload; lost first-batch timings disclosed | deferred: 300ms creation goal, matched p95/causal gain, rendered-frame and original-load/RSS qualification

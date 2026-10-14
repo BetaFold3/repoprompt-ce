@@ -1595,6 +1595,108 @@ final class AgentModeChatSwitchActivationTests: XCTestCase {
         }
     }
 
+    // MARK: - D6 runtime selection (full sync reads the current owner's canonical selection)
+
+    func testFullSyncProjectsCurrentOwnerCanonicalExplicitSlicedAndZeroSelection() async throws {
+        try await withFixture { fixture in
+            let explicit = StoredSelection(
+                selectedPaths: ["Sources/Full.swift", "Sources/Sliced.swift"],
+                slices: [
+                    "Sources/Sliced.swift": [LineRange(start: 4, end: 8)],
+                    "Sources/SliceOnly.swift": [LineRange(start: 1, end: 2), LineRange(start: 10, end: 12)]
+                ],
+                codemapAutoEnabled: false
+            )
+            let explicitSummary = AgentContextExportResolver.selectionSummary(for: explicit)
+            XCTAssertEqual(explicitSummary.totalExplicitFileCount, 3)
+            XCTAssertGreaterThan(explicitSummary.slicedFileCount, 0)
+
+            try setCanonicalSelection(explicit, forTabID: fixture.tabAID, in: fixture)
+            fixture.viewModel.syncAllActiveUIState()
+            var snapshot = fixture.viewModel.ui.runtimeMetrics.runtimeVM.snapshot
+            XCTAssertEqual(snapshot.selectionSummary, explicitSummary)
+            XCTAssertEqual(snapshot.selectionFileCount, 3)
+
+            // A canonical zero selection is a real value, not "unknown".
+            try setCanonicalSelection(StoredSelection(), forTabID: fixture.tabAID, in: fixture)
+            fixture.viewModel.syncAllActiveUIState()
+            snapshot = fixture.viewModel.ui.runtimeMetrics.runtimeVM.snapshot
+            XCTAssertEqual(
+                snapshot.selectionSummary,
+                AgentContextExportResolver.selectionSummary(for: StoredSelection())
+            )
+            XCTAssertEqual(snapshot.selectionFileCount, 0)
+        }
+    }
+
+    func testFullSyncOwnerDisagreementAndMidSwitchSyncDoNotLeakPreviousSelection() async throws {
+        try await withFixture { fixture in
+            let workspaceManager = fixture.window.workspaceManager
+            let selectionA = StoredSelection(
+                selectedPaths: ["Sources/A0.swift", "Sources/A1.swift", "Sources/A2.swift"],
+                codemapAutoEnabled: false
+            )
+            let summaryA = AgentContextExportResolver.selectionSummary(for: selectionA)
+            try setCanonicalSelection(selectionA, forTabID: fixture.tabAID, in: fixture)
+            fixture.viewModel.syncAllActiveUIState()
+            XCTAssertEqual(fixture.viewModel.ui.runtimeMetrics.runtimeVM.snapshot.selectionSummary, summaryA)
+
+            // Workspace explicit active tab disagrees with the Agent owner: no canonical A summary.
+            let workspaceIndex = try XCTUnwrap(
+                workspaceManager.workspaces.firstIndex(where: { $0.id == workspaceManager.activeWorkspace?.id })
+            )
+            workspaceManager.workspaces[workspaceIndex].activeComposeTabID = fixture.tabBID
+            XCTAssertEqual(fixture.viewModel.currentTabID, fixture.tabAID)
+            fixture.viewModel.syncAllActiveUIState()
+            var snapshot = fixture.viewModel.ui.runtimeMetrics.runtimeVM.snapshot
+            XCTAssertNil(snapshot.selectionSummary)
+            // This fixture has no tool-derived selection metrics; those may legitimately supply
+            // a count when the live canonical summary is unavailable.
+            XCTAssertNil(snapshot.selectionFileCount)
+            workspaceManager.workspaces[workspaceIndex].activeComposeTabID = fixture.tabAID
+
+            // Real A→B switch: a full sync mid-apply and the final sync never surface A's counts.
+            try setCanonicalSelection(
+                StoredSelection(selectedPaths: ["Sources/B0.swift"], codemapAutoEnabled: false),
+                forTabID: fixture.tabBID,
+                in: fixture
+            )
+            var midApplySummaries: [AgentContextSelectionSummary?] = []
+            workspaceManager.composeTabApplyAfterContextHookForTesting = { tabID in
+                guard tabID == fixture.tabBID else { return }
+                fixture.viewModel.syncAllActiveUIState()
+                midApplySummaries.append(fixture.viewModel.ui.runtimeMetrics.runtimeVM.snapshot.selectionSummary)
+            }
+            defer { workspaceManager.composeTabApplyAfterContextHookForTesting = nil }
+
+            await fixture.window.promptManager.switchComposeTab(fixture.tabBID)
+
+            XCTAssertEqual(midApplySummaries.count, 1)
+            XCTAssertNotEqual(midApplySummaries.first ?? nil, summaryA)
+            XCTAssertEqual(fixture.viewModel.currentTabID, fixture.tabBID)
+            let workspaceID = try XCTUnwrap(workspaceManager.activeWorkspace?.id)
+            let canonicalB = try XCTUnwrap(
+                workspaceManager.composeTab(
+                    for: WorkspaceSelectionIdentity(workspaceID: workspaceID, tabID: fixture.tabBID)
+                )
+            ).selection
+            snapshot = fixture.viewModel.ui.runtimeMetrics.runtimeVM.snapshot
+            XCTAssertNotEqual(snapshot.selectionSummary, summaryA)
+            XCTAssertEqual(snapshot.selectionSummary, AgentContextExportResolver.selectionSummary(for: canonicalB))
+        }
+    }
+
+    private func setCanonicalSelection(_ selection: StoredSelection, forTabID tabID: UUID, in fixture: Fixture) throws {
+        let workspaceManager = fixture.window.workspaceManager
+        let workspaceIndex = try XCTUnwrap(
+            workspaceManager.workspaces.firstIndex(where: { $0.id == workspaceManager.activeWorkspace?.id })
+        )
+        let tabIndex = try XCTUnwrap(
+            workspaceManager.workspaces[workspaceIndex].composeTabs.firstIndex(where: { $0.id == tabID })
+        )
+        workspaceManager.workspaces[workspaceIndex].composeTabs[tabIndex].selection = selection
+    }
+
     // MARK: - D0 interaction-latency attribution (real PromptViewModel → notification → VM path)
 
     #if DEBUG
