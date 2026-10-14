@@ -144,6 +144,157 @@ final class CodexServiceTierVariantCatalogTests: XCTestCase {
         XCTAssertTrue(options.contains { $0.rawValue == "hermetic-model-fast" })
     }
 
+    func testFirstResolvedOptionMatchesResolvedOptionsFirstAcrossSources() throws {
+        func makeDefaults(_ label: String) throws -> UserDefaults {
+            let suiteName = "CodexServiceTierVariantCatalogTests.FirstResolved.\(label).\(UUID().uuidString)"
+            let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+            defaults.removePersistentDomain(forName: suiteName)
+            addTeardownBlock { defaults.removePersistentDomain(forName: suiteName) }
+            return defaults
+        }
+        func remote(
+            _ id: String,
+            _ displayName: String,
+            efforts: [String] = [],
+            speedTiers: [String] = [],
+            isDefault: Bool = false
+        ) -> CodexAppServerClient.RemoteModel {
+            CodexAppServerClient.RemoteModel(
+                id: id,
+                model: id,
+                displayName: displayName,
+                description: "",
+                isDefault: isDefault,
+                supportedReasoningEfforts: efforts.map { .init(reasoningEffort: $0, description: "") },
+                additionalSpeedTiers: speedTiers
+            )
+        }
+        func slug(_ slug: String) -> (AgentModelOption) -> Bool {
+            {
+                CodexAgentToolPreferences.reasoningEffortPreferenceSlug(forModelRaw: $0.rawValue)
+                    .caseInsensitiveCompare(slug) == .orderedSame
+            }
+        }
+        func raw(_ raw: String) -> (AgentModelOption) -> Bool {
+            { $0.rawValue == raw }
+        }
+
+        let defaults = try makeDefaults("Sources")
+        let knownRegistry = CodexKnownModelBaseRegistry(defaults: defaults)
+        knownRegistry.unionObserved(records: CodexDynamicModelStore.canonicalRecords(from: [
+            remote("hermetic-static", "Hermetic Static", speedTiers: ["fast"])
+        ]))
+        let registry = AgentCodexModelRegistry(defaults: defaults, knownModelBaseRegistry: knownRegistry)
+        let staticOnlyDefaults = try makeDefaults("StaticOnly")
+        let staticOnlyRegistry = AgentCodexModelRegistry(
+            defaults: staticOnlyDefaults,
+            knownModelBaseRegistry: knownRegistry
+        )
+        let staticOptions = [
+            AgentModelOption(rawValue: "default", displayName: "Default", description: nil, isDefault: true),
+            AgentModelOption(rawValue: "hermetic-shared", displayName: "Static Shared", description: nil, isDefault: false),
+            AgentModelOption(rawValue: "hermetic-static", displayName: "Hermetic Static", description: nil, isDefault: false)
+        ]
+
+        // Live A also writes the cache; overwrite the cache with B so live and cache differ.
+        XCTAssertTrue(registry.updateLiveModels([
+            remote("hermetic-live", "Hermetic Live", efforts: ["low", "high"], isDefault: true),
+            remote("hermetic-shared", "Live Shared"),
+            remote("hermetic-fastbase", "Hermetic Fastbase", speedTiers: ["fast"])
+        ]))
+        CodexDynamicModelStore.save([remote("hermetic-cache", "Cache Only")], defaults: defaults)
+
+        // Fixed oracle for the full nil/live resolution, independent of `firstResolvedOption`:
+        // placeholder, then mapper order (provider-default effort first, same-base effort rank,
+        // otherwise base order), then dynamic fast synthesis, then the static backfill (the
+        // hermetic set lacks the recommended GPT keys) minus equivalent duplicates, plus its fast variant.
+        XCTAssertEqual(registry.resolvedOptions(staticOptions: staticOptions).map(\.rawValue), [
+            "default",
+            "hermetic-live-low",
+            "hermetic-fastbase",
+            "hermetic-live-high",
+            "hermetic-shared",
+            "hermetic-fastbase-fast",
+            "hermetic-static",
+            "hermetic-static-fast"
+        ])
+
+        let sources: [(name: String, registry: AgentCodexModelRegistry, preferred: [CodexAppServerClient.RemoteModel]?)] = [
+            ("nil preferred uses live", registry, nil),
+            ("explicit empty uses cache", registry, []),
+            ("non-empty preferred", registry, [remote("hermetic-preferred", "Preferred")]),
+            ("static only, nil preferred", staticOnlyRegistry, nil),
+            ("static only, explicit empty", staticOnlyRegistry, [])
+        ]
+        let predicates: [(name: String, matches: (AgentModelOption) -> Bool)] = [
+            ("default placeholder", slug("default")),
+            ("primary with multiple efforts", slug("hermetic-live")),
+            ("case-insensitive duplicate", slug("HERMETIC-SHARED")),
+            ("synthesized fast", raw("hermetic-fastbase-fast")),
+            ("backfilled static", slug("hermetic-static")),
+            ("backfilled static fast", raw("hermetic-static-fast")),
+            ("cache only", slug("hermetic-cache")),
+            ("preferred only", slug("hermetic-preferred")),
+            ("miss", slug("hermetic-missing"))
+        ]
+
+        for source in sources {
+            let full = source.registry.resolvedOptions(
+                staticOptions: staticOptions,
+                preferredLiveModels: source.preferred
+            )
+            for predicate in predicates {
+                XCTAssertEqual(
+                    source.registry.firstResolvedOption(
+                        staticOptions: staticOptions,
+                        preferredLiveModels: source.preferred,
+                        matching: predicate.matches
+                    ),
+                    full.first(where: predicate.matches),
+                    "\(source.name): \(predicate.name)"
+                )
+            }
+        }
+
+        func first(
+            _ registry: AgentCodexModelRegistry,
+            _ preferred: [CodexAppServerClient.RemoteModel]?,
+            _ predicate: (AgentModelOption) -> Bool
+        ) -> AgentModelOption? {
+            registry.firstResolvedOption(
+                staticOptions: staticOptions,
+                preferredLiveModels: preferred,
+                matching: predicate
+            )
+        }
+        // Pin that the sources and groups above actually exercise the intended paths.
+        XCTAssertEqual(first(registry, nil, slug("hermetic-shared"))?.displayName, "Live Shared")
+        XCTAssertNotNil(first(registry, nil, slug("hermetic-live")))
+        XCTAssertNil(first(registry, nil, slug("hermetic-cache")))
+        XCTAssertNotNil(first(registry, [], slug("hermetic-cache")))
+        XCTAssertNil(first(registry, [], slug("hermetic-live")))
+        XCTAssertNotNil(first(registry, nil, raw("hermetic-fastbase-fast")))
+        XCTAssertNotNil(first(registry, nil, raw("hermetic-static")))
+        XCTAssertNotNil(first(registry, nil, raw("hermetic-static-fast")))
+        XCTAssertEqual(first(registry, nil, slug("default"))?.isPlaceholderDefault, true)
+        XCTAssertEqual(first(staticOnlyRegistry, nil, slug("hermetic-shared"))?.displayName, "Static Shared")
+        XCTAssertNotNil(first(staticOnlyRegistry, [], raw("hermetic-static-fast")))
+    }
+
+    func testCodexBaseDisplayNameFallsBackWhenCodexIsUnavailable() {
+        let rawModel = "hermetic-unavailable-high"
+        let modelSlug = CodexAgentToolPreferences.reasoningEffortPreferenceSlug(forModelRaw: rawModel)
+        XCTAssertEqual(
+            AgentModelCatalog.displayName(
+                for: rawModel,
+                agentKind: .codexExec,
+                availability: .none,
+                includeEffortSuffix: false
+            ),
+            AIModel.codexBaseDisplayName(for: modelSlug, fallbackDisplayName: rawModel)
+        )
+    }
+
     func testCodexCatalogFastSynthesisUsesInjectedSnapshot() throws {
         let suiteName = "CodexServiceTierVariantCatalogTests.\(UUID().uuidString)"
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))

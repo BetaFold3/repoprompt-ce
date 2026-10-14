@@ -195,6 +195,8 @@ Step D6-cold-path-signal — done | rounds 0/2 | open: none; D6-cold-path-signal
 
 Step D6-cold-admission-investigation — done | rounds 0/2 | open: none; D6-cold-pre-admission-investigation.md; D6-cold-post-admission-investigation.md | downgraded: none | assumed: ordered/additive PRE logs verified; handler-to-load UI work dominates, exact publication/admission split unknown; live POST reason unattributed | deferred: task-creation stamps, scheduling changes, shared processing context and terminal-coherence-safe adoption repair
 
+Step D6-hydration-ui-work — done | rounds 0/2 | open: none; D6-hydration-ui-work-final.md | downgraded: none | assumed: Codex primary-hit shortcut preserves display and required callbacks; 6/30/42 tests plus final 6; exact A/B no P0/P1 | deferred: live click latency, remaining UI work, B UI D6-P3-1/D6-P3-2
+
 Step D6-paired-storage-leaves — done | rounds 0/2 | open: none; D6-paired-storage-leaves-final.md | downgraded: none | assumed: storage-only same-invocation leaves; 94 tests then 6 after review cleanup; exact A/B no P0/P1 | deferred: live matched latency/RSS, B D6-P3-1/D6-P3-3
 
 Step D6-cold-boundary-live — done | rounds 0/2 | open: none; D6-cold-timing-live-direct.md; D6-cold-timing-live-native.md | downgraded: none | assumed: installed f45ac238 verified; six cold loads joined; 120.734s native trace; main31.588%; hangmax1.029s | deferred: direct click latency and follow-fix gain (original filter omitted interaction logger; corrected capture had no interactions), paired leaf reuse, representative-load/RSS qualification
