@@ -624,10 +624,10 @@ extension AgentSessionDataService {
             let transcriptPolicy = AgentTranscriptImportPolicy.liveSession(
                 hidePendingQuestionToolCall: request.hasPendingQuestionUI
             )
-            let persistedWorkingItems = agentSession.workingSourceItems()
             let loadedTranscript: AgentTranscript = {
                 if let transcript = agentSession.transcript {
                     if AgentTranscriptIO.containsRowsExcludedByPolicy(in: transcript, policy: transcriptPolicy) {
+                        let persistedWorkingItems = agentSession.workingSourceItems()
                         return AgentTranscriptIO.rebuiltTranscriptPreservingCompactedPrefix(
                             existingTranscript: transcript,
                             workingItems: persistedWorkingItems,
@@ -638,6 +638,7 @@ extension AgentSessionDataService {
                     }
                     return transcript
                 }
+                let persistedWorkingItems = agentSession.workingSourceItems()
                 return AgentTranscriptIO.buildTranscript(
                     from: persistedWorkingItems,
                     terminalState: normalizedRunState,

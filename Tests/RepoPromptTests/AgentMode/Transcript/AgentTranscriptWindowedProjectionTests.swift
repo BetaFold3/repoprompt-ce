@@ -151,6 +151,53 @@ final class AgentTranscriptWindowedProjectionTests: XCTestCase {
         )
     }
 
+    /// The persistent storage pipeline's own full (unwindowed) projection yields the same projection
+    /// counts as the transcript count walk over its paired output transcript, across protection,
+    /// every retention tier, grouped history, and the archived lane. The save entry compacts first
+    /// (re-tiering condensed turns here), so the normalized entry carries condensed into the same
+    /// persistent materialization.
+    func testPersistentPipelineProjectionCountsMatchPairedTranscriptCountWalk() throws {
+        let compacted = AgentTranscriptIO.buildTranscript(from: groupedToolItems(turnCount: 48), terminalState: .completed)
+        var tiered = AgentTranscriptIO.buildTranscript(
+            from: groupedToolItems(turnCount: 46),
+            terminalState: .completed,
+            compact: false
+        )
+        let tiers: [AgentTranscriptRetentionTier] = [.archived, .archived, .summary, .summary, .condensed, .condensed]
+        for (index, tier) in tiers.enumerated() {
+            tiered.turns[index].retentionTier = tier
+        }
+
+        var results: [(String, AgentTranscriptPolicyPipeline.Result)] = []
+        for (name, transcript) in [("compacted", compacted), ("tiered", tiered)] {
+            let lastTurnID = try XCTUnwrap(transcript.turns.last?.id)
+            for protection in [AgentTranscriptProjectionProtection.none, .protectedTurn(lastTurnID)] {
+                results.append(("\(name) \(protection)", AgentTranscriptPolicyPipeline.persistedTranscript(from: transcript, protection: protection)))
+            }
+        }
+        let normalizedTiered = AgentTranscriptPolicyPipeline.persistedNormalizedTranscript(tiered)
+        results.append(("tiered normalized", normalizedTiered))
+
+        for (step, result) in results {
+            XCTAssertEqual(
+                AgentTranscriptProjectionBuilder.projectionCounts(for: result.projection),
+                AgentTranscriptProjectionBuilder.projectionCounts(for: result.transcript),
+                step
+            )
+            XCTAssertTrue(result.transcript.turns.contains { $0.retentionTier == .full }, step)
+            XCTAssertTrue(result.transcript.turns.contains { $0.retentionTier != .full }, "[\(step)] retained tiers survive")
+            XCTAssertTrue(result.projection.workingBlocks.contains { $0.kind == .groupedHistory }, "[\(step)] grouped history survives")
+        }
+        XCTAssertEqual(
+            Set(normalizedTiered.transcript.turns.map(\.retentionTier)),
+            Set(AgentTranscriptRetentionTier.allCases),
+            "every retention tier survives persistent materialization"
+        )
+        XCTAssertFalse(normalizedTiered.projection.archivedRows.isEmpty, "the archived lane survives persistent materialization")
+        let tieredSave = try XCTUnwrap(results.first { $0.0.hasPrefix("tiered") }?.1)
+        XCTAssertFalse(tieredSave.projection.archivedRows.isEmpty, "the archived lane survives the save entry")
+    }
+
     /// A multi-row cluster is one presented card that still requires all its rows; a cold-load
     /// degraded cluster keeps backing rows its block no longer lists. Missing, substituted, or
     /// reordered required rows fail in either lane.

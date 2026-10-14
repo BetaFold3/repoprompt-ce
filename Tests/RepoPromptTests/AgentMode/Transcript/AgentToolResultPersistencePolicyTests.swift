@@ -1116,11 +1116,99 @@ final class AgentToolResultPersistencePolicyTests: XCTestCase {
             XCTAssertEqual(checks.customResponse, "Smoke the canary \(answerToken)", label)
         }
 
+        // Stored metadata pairs with the stored transcript, which is the persisted-pipeline output of
+        // the saved transcript; a cold load leaves the canonical file unchanged; a trusted canonical
+        // item count overrides only the item count, never the stored projection counts.
+        let storedData = try Data(contentsOf: fileURL)
+        let stored = try JSONDecoder().decode(AgentSession.self, from: storedData)
+        let storedTranscript = try XCTUnwrap(stored.transcript)
+        let storedCounts = AgentTranscriptProjectionBuilder.projectionCounts(for: storedTranscript)
+        XCTAssertEqual(stored.transcriptProjectionCounts, storedCounts)
+        XCTAssertEqual(stored.itemCount, storedCounts.canonicalVisibleRowCount)
+        XCTAssertEqual(stored.lastUserMessageAt, AgentTranscriptIO.lastUserInteractionDate(in: storedTranscript))
+        _ = try await AgentSessionDataService().loadAgentSession(from: fileURL)
+        XCTAssertEqual(try Data(contentsOf: fileURL), storedData, "A cold load does not rewrite a canonical file")
+        let firstSaved = try JSONDecoder().decode(AgentSession.self, from: XCTUnwrap(onDisk.data(using: .utf8)))
+        XCTAssertEqual(firstSaved.transcript, session.transcript.map { AgentTranscriptIO.persistedTranscript($0) })
+
+        let trustedItemCount = storedCounts.canonicalVisibleRowCount + 7
+        _ = try await AgentSessionDataService().saveAgentSession(
+            resaved,
+            for: workspace,
+            trustedCanonicalItemCount: trustedItemCount
+        )
+        let overridden = try JSONDecoder().decode(AgentSession.self, from: Data(contentsOf: fileURL))
+        let overriddenTranscript = try XCTUnwrap(overridden.transcript)
+        XCTAssertEqual(overridden.itemCount, trustedItemCount)
+        XCTAssertEqual(overridden.transcriptProjectionCounts, AgentTranscriptProjectionBuilder.projectionCounts(for: overriddenTranscript))
+        XCTAssertNotEqual(overridden.transcriptProjectionCounts?.canonicalVisibleRowCount, trustedItemCount)
+
         // An already summarized legacy payload stays a summary; it is never re-labeled as complete.
         let legacyStub = #"{"status":"success","summary_only":true,"summary_text":"ask_user • success"}"#
         let legacy = try XCTUnwrap(persistedSummary(toolName: "ask_user", rawResultJSON: legacyStub, argsJSON: argsJSON))
         XCTAssertTrue(legacy.summaryOnly)
         XCTAssertEqual(try decodedObject(legacy.resultJSON)["summary_only"] as? Bool, true)
+    }
+
+    /// Cold hydration preparation over a real store: a stored pending `ask_user` call is accepted
+    /// as-is without pending-question UI, takes the excluded-policy rebuild (hiding the call) with
+    /// it, and an empty session with no transcript takes the missing-transcript build.
+    func testColdHydrationPreparationAcceptedRebuildAndMissingTranscriptBranches() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("AgentToolResultPersistencePolicyTests", isDirectory: true)
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let workspace = WorkspaceModel(name: "Cold Preparation", repoPaths: ["/tmp/repo"], customStoragePath: directory)
+        let service = AgentSessionDataService()
+        func prepare(_ session: AgentSession, pendingQuestionUI: Bool) async throws -> AgentSessionHydrationPayload {
+            let prepared = try await service.preparePersistedHydration(AgentSessionHydrationRequest(
+                workspace: workspace,
+                tabID: session.composeTabID ?? UUID(),
+                sessionID: session.id,
+                resolvedDisplayName: session.name,
+                hasPendingQuestionUI: pendingQuestionUI,
+                transcriptViewportState: .liveBottom,
+                isCompressedHistoryRevealed: false,
+                initialPerformanceSnapshot: .empty
+            ))
+            return try XCTUnwrap(prepared)
+        }
+
+        let invocationID = UUID()
+        var pending = AgentSession(id: UUID(), workspaceID: workspace.id, composeTabID: UUID(), name: "Pending question")
+            .withItems([
+                AgentChatItem(kind: .user, text: "Ask me.", sequenceIndex: 0),
+                .toolCall(name: "ask_user", invocationID: invocationID, argsJSON: #"{"questions":[{"id":"q","question":"Proceed?"}]}"#, sequenceIndex: 1)
+            ])
+        pending.lastRunState = AgentSessionRunState.waitingForQuestion.rawValue
+        let pendingFileURL = try await service.saveAgentSession(pending, for: workspace)
+        // The saved file of an open pending question pairs its metadata with the stored transcript.
+        let pendingStored = try JSONDecoder().decode(AgentSession.self, from: Data(contentsOf: pendingFileURL))
+        let pendingTranscript = try XCTUnwrap(pendingStored.transcript)
+        XCTAssertTrue(AgentTranscriptIO.workingSourceItems(from: pendingTranscript).contains {
+            $0.kind == .toolCall && $0.toolInvocationID == invocationID
+        }, "The open ask_user call is stored")
+        let pendingCounts = AgentTranscriptProjectionBuilder.projectionCounts(for: pendingTranscript)
+        XCTAssertGreaterThan(pendingCounts.canonicalVisibleRowCount, 0)
+        XCTAssertEqual(pendingStored.transcriptProjectionCounts, pendingCounts)
+        XCTAssertEqual(pendingStored.itemCount, pendingCounts.canonicalVisibleRowCount)
+
+        let accepted = try await prepare(pending, pendingQuestionUI: false)
+        XCTAssertTrue(accepted.canonicalLiveItems.contains { $0.kind == .toolCall && $0.toolInvocationID == invocationID })
+        XCTAssertEqual(accepted.canonicalLiveItems, AgentTranscriptIO.workingSourceItems(from: accepted.transcript))
+
+        let rebuilt = try await prepare(pending, pendingQuestionUI: true)
+        XCTAssertFalse(rebuilt.canonicalLiveItems.contains { $0.kind == .toolCall }, "The pending question call is hidden")
+        XCTAssertEqual(rebuilt.canonicalLiveItems.map(\.text), ["Ask me."])
+        XCTAssertEqual(rebuilt.canonicalLiveItems, AgentTranscriptIO.workingSourceItems(from: rebuilt.transcript))
+        XCTAssertTrue(rebuilt.needsReloadMigrationSave)
+
+        let empty = AgentSession(id: UUID(), workspaceID: workspace.id, composeTabID: UUID(), name: "Empty")
+        _ = try await service.saveAgentSession(empty, for: workspace)
+        let emptyPrepared = try await prepare(empty, pendingQuestionUI: false)
+        XCTAssertNil(emptyPrepared.persistedSession.transcript, "The stored session has no transcript")
+        XCTAssertTrue(emptyPrepared.transcript.turns.isEmpty)
+        XCTAssertTrue(emptyPrepared.canonicalLiveItems.isEmpty)
     }
 
     private func persistedSummary(toolName: String, rawResultJSON: String, argsJSON: String? = nil) -> AgentPersistedToolResultSummary? {
