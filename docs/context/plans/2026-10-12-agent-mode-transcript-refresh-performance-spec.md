@@ -155,6 +155,8 @@ Step D2 — done | rounds 0/2 | open: none; D2-activation-integrity-final.md | d
 - Never weaken a guard without an oracle case.
 - Expected: together with D1, the big session drops from about 90 s to about 12 s per 626 s.
 
+Step D2-save-attribution — doing | rounds 0/2 | open: bounded cold-hydration characterization and save-fallback diagnostic review | downgraded: none | assumed: do not adopt new hydration stamps or weaken reuse without semantic proof; D2-save-reuse-OracleA-plan.md; D2-save-reuse-OracleB-plan.md | deferred: exact live B442462C rejection input, production repair and runtime-selection wiring
+
 ### D3 — Remove the bash-metadata cache cliff
 
 Step D3 — done | rounds 0/2 | open: none | downgraded: none | assumed: build-local contexts verified; 2048 entries/generation and 16 MiB accounted/table initial limits | deferred: parsed byte tuning, memory-pressure purge and live validation per D3-final.md
@@ -189,7 +191,7 @@ Step D5 — done | rounds 1/2 | open: none | downgraded: none | assumed: focused
 
 ### D6 — Sidebar: one build per render pass
 
-Step D6-context-config — done | rounds 1/2 | open: none; D6-context-config-final.md | downgraded: none | assumed: skip only exact equal non-dirty config with matching active identities and live/stored prompt; 47 focused tests and both re-reviews clear; stored-only MCP prompt preservation retained | deferred: live frequency/savings, matched latency/RSS and final full-sync runtime selection ownership
+Step D6-context-config — done | rounds 1/2 | open: none; D6-context-config-final.md; D6-context-config-live.md | downgraded: none | assumed: fbe4b1e1 approved signed relaunch verified PID96485; 47 tests and both re-reviews clear; retained creation270.7/811.7/551.1ms and separate cold-load timers are unmatched samples | deferred: live guard frequency/savings, matched latency/RSS and final full-sync runtime selection ownership
 
 Step D6-creation-live — done | rounds 0/2 | open: none; D6-creation-fixes-live.md | downgraded: none | assumed: approved signed relaunch37ac09fa PID21158; direct freshCodex853.7ms andClaude579.3ms; warm firstPublish6.0/11.8ms; nativeUI-dominated workload; lost first-batch timings disclosed | deferred: 300ms creation goal, matched p95/causal gain, rendered-frame and original-load/RSS qualification
 
