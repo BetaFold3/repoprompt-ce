@@ -30,6 +30,12 @@ enum AgentTranscriptToolVisibilityPolicy {
         if MCPIntegrationHelper.canonicalRepoPromptToolName(trimmed) != nil { return nil }
         let normalized = normalizedToolNameForComparison(trimmed) ?? ""
         if canonicalAlias(forNormalizedName: normalized) != nil { return nil }
+        return pathShapeSignal(fromTrimmedUnrecognizedName: trimmed)
+    }
+
+    /// Path-shape leg of `pathSignal`. Callers pass an already-trimmed, non-empty name that is
+    /// neither a RepoPrompt tool nor a known/web alias.
+    private static func pathShapeSignal(fromTrimmedUnrecognizedName trimmed: String) -> String? {
         let candidate = trimmed.replacingOccurrences(of: "\\", with: "/")
         guard !candidate.hasPrefix("/"), !candidate.hasPrefix("~") else { return nil }
         guard !candidate.contains("://"), !candidate.contains(" ") else { return nil }
@@ -53,7 +59,8 @@ enum AgentTranscriptToolVisibilityPolicy {
         if let alias = canonicalAlias(forNormalizedName: normalized) {
             return alias
         }
-        if isPathLikeToolName(trimmed) {
+        // The RepoPrompt and alias checks above already returned nil for `trimmed`.
+        if pathShapeSignal(fromTrimmedUnrecognizedName: trimmed) != nil {
             return "read_file"
         }
         return normalized

@@ -83,6 +83,35 @@ final class WebSearchToolCardTests: XCTestCase {
         }
     }
 
+    func testPathLikeToolNamesKeepPathSignalAndVisibleNameOutcomes() {
+        let cases: [(raw: String?, pathSignal: String?, visible: String?)] = [
+            (nil, nil, nil), ("", nil, nil), ("  \n", nil, nil),
+            // Recognized RepoPrompt, native, and web/dotted aliases are never paths.
+            ("mcp__RepoPromptCE__read_file", nil, "read_file"), ("mcp__RepoPromptCE__git", nil, "git"),
+            ("Read-File", nil, "read_file"), ("Bash", nil, "bash"), ("grep", nil, "file_search"),
+            ("browser.open", nil, "web_read"), ("tools.WebFetch", nil, "web_read"),
+            ("foo.\tweb_fetch", nil, "web_read"), ("functions.web_search", nil, "search"),
+            // Relative paths (backslashes normalized) and known extensions read as files.
+            ("Sources\\App\\Main.swift", "Sources/App/Main.swift", "read_file"),
+            ("src/main.ts", "src/main.ts", "read_file"), ("a/b", "a/b", "read_file"),
+            ("  docs/Guide.md \n", "docs/Guide.md", "read_file"), ("README.md", "README.md", "read_file"),
+            ("Main.SWIFT", "Main.SWIFT", "read_file"), ("tools/web_fetch", "tools/web_fetch", "read_file"),
+            ("\u{00DC}n\u{00EF}code/F\u{00EF}le.swift", "\u{00DC}n\u{00EF}code/F\u{00EF}le.swift", "read_file"),
+            // Absolute, home, URL, spaced, unknown-extension, and extension-only names are not paths.
+            ("/abs/path.swift", nil, "/abs/path.swift"), ("\\abs\\path.swift", nil, "\\abs\\path.swift"),
+            ("~/notes.md", nil, "~/notes.md"), ("https://example.com/a.md", nil, "https://example.com/a.md"),
+            ("my file.swift", nil, "my_file.swift"), ("src\\file with space.swift", nil, "src\\file_with_space.swift"),
+            ("notes.exe", nil, "notes.exe"), (".swift", nil, ".swift"), ("x.bash", nil, "x.bash"),
+            ("F\u{00EF}le.SW\u{0130}FT", nil, "F\u{00EF}le.SW\u{0130}FT".lowercased()), ("tool", nil, "tool")
+        ]
+        for (raw, pathSignal, visible) in cases {
+            let label = String(reflecting: raw)
+            XCTAssertEqual(AgentTranscriptToolVisibilityPolicy.pathSignal(fromPathLikeToolName: raw), pathSignal, label)
+            XCTAssertEqual(AgentTranscriptToolVisibilityPolicy.isPathLikeToolName(raw), pathSignal != nil, label)
+            XCTAssertEqual(AgentTranscriptToolVisibilityPolicy.normalizedVisibleToolName(raw), visible, label)
+        }
+    }
+
     func testWebActionClassifierDistinguishesSearchReadFindAndCodeSearch() throws {
         XCTAssertEqual(webPresentation(toolName: "search", args: ["query": "native web search cards"])?.title, "Web Search")
 

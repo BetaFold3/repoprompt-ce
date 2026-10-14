@@ -191,7 +191,9 @@ Step D5 — done | rounds 1/2 | open: none | downgraded: none | assumed: focused
 
 ### D6 — Sidebar: one build per render pass
 
-Step D6-cold-tool-normalization — done | rounds 0/2 | open: none; D6-cold-tool-normalization-final.md; D6-cold-blank-prefetch-live-profile.md | downgraded: none | assumed: pure tool-name processing only; 36 tests, targeted negative control and both initial reviews clear; no cache/persistence-policy change; not claimed to fix >1s cold wait | deferred: candidate installation/matched live gain, prefetch lifecycle, storage-pass equivalence, pathSignal reuse and test relocation
+Step D6-cold-path-signal — done | rounds 0/2 | open: none; D6-cold-path-signal-final.md | downgraded: none | assumed: pure duplicate-work removal; 37 focused tests, unchanged-HEAD goldens, negative control and both initial reviews clear; no cold gain claimed | deferred: installation/matched latency, test discoverability, private-helper precondition hardening and hover-only last-resort prefetch
+
+Step D6-cold-tool-normalization — done | rounds 0/2 | open: none; D6-cold-tool-normalization-final.md; D6-cold-tool-normalization-live.md | downgraded: none | assumed: 719d41d5 approved signed relaunch verified PID13332; 36 tests and both reviews retained; late clicks outside native profile, incomplete timings disclose no matched gain | deferred: matched cold latency, hover-only last-resort prefetch, storage-pass equivalence and test relocation
 
 Step D6-runtime-selection — done | rounds 0/2 | open: none; D6-runtime-selection-final.md; D6-runtime-selection-live.md | downgraded: none | assumed: 39b0602d approved signed relaunch verified PID83981; 76 tests and both initial reviews retained; separate 60.856s background profile main busy17.47%, zero detector intervals, longest sampled busy span1279ms; not matched qualification | deferred: live UI savings/per-call summary cost, interactive latency, implicit-first-tab benefit, other runtime callers and terminal-coherence-safe save repair
 
@@ -318,4 +320,5 @@ Pursue this only if, after D0–D7, the active-tab incremental refresh p95 is ab
 - Divergence: OracleA preferred sub-turn reuse before background work, while OracleB preferred input-diff sanitize memoization (D4) over trusting mutation summaries. Decision: D4 uses the input diff; extending sub-turn import waits for the D0 final-turn size data.
 - 2026-10-12 owner decisions: D7 is approved after the consumer audit, with the pros and cons recorded under D7. The optimized-with-diagnostics lane is favored ("If no cons much, why not?"); see the trade-off and required shape under Build configuration.
 - 2026-10-12 interactive capture: the owner drove session switches, new sessions, `ask_user` typing, and scrolling during a 5-minute trace. That turned W2 from unmeasured into measured single samples. It also exposed root causes 8 (activation full rebuild) and 9 (idle per-frame render), which the Oracle consultation did not have.
+- 2026-10-14 owner decision: prefetch is a last resort after reducing cold-load work; any eventual prefetch must be hover-triggered only.
 - Owner decisions still pending: adopting the acceptance targets above, and the exact shape of the optimized lane.
