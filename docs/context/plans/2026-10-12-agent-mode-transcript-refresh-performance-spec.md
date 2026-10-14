@@ -191,6 +191,8 @@ Step D5 — done | rounds 1/2 | open: none | downgraded: none | assumed: focused
 
 ### D6 — Sidebar: one build per render pass
 
+Step D6-cold-tool-normalization — done | rounds 0/2 | open: none; D6-cold-tool-normalization-final.md; D6-cold-blank-prefetch-live-profile.md | downgraded: none | assumed: pure tool-name processing only; 36 tests, targeted negative control and both initial reviews clear; no cache/persistence-policy change; not claimed to fix >1s cold wait | deferred: candidate installation/matched live gain, prefetch lifecycle, storage-pass equivalence, pathSignal reuse and test relocation
+
 Step D6-runtime-selection — done | rounds 0/2 | open: none; D6-runtime-selection-final.md; D6-runtime-selection-live.md | downgraded: none | assumed: 39b0602d approved signed relaunch verified PID83981; 76 tests and both initial reviews retained; separate 60.856s background profile main busy17.47%, zero detector intervals, longest sampled busy span1279ms; not matched qualification | deferred: live UI savings/per-call summary cost, interactive latency, implicit-first-tab benefit, other runtime callers and terminal-coherence-safe save repair
 
 Step D6-context-config — done | rounds 1/2 | open: none; D6-context-config-final.md; D6-context-config-live.md | downgraded: none | assumed: fbe4b1e1 approved signed relaunch verified PID96485; 47 tests and both re-reviews clear; retained creation270.7/811.7/551.1ms and separate cold-load timers are unmatched samples | deferred: live guard frequency/savings, matched latency/RSS and final full-sync runtime selection ownership

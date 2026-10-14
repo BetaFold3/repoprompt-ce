@@ -108,11 +108,12 @@ enum AgentTranscriptToolVisibilityPolicy {
             .replacingOccurrences(of: " ", with: "_")
     }
 
+    /// Exact non-web aliases are matched before web classification. Every alias below is
+    /// dot-free, lacks the stripped RepoPrompt prefix, and is outside both web name sets, so
+    /// `canonicalToolCardName` returns nil for each and the order cannot change a result.
+    /// Keep the `knownAliases` test list in WebSearchToolCardTests in sync; new aliases must remain disjoint.
     private static func canonicalAlias(forNormalizedName normalized: String) -> String? {
-        if let webCanonical = AgentWebToolCanonicalNames.canonicalToolCardName(normalized) {
-            return webCanonical
-        }
-        return switch normalized {
+        switch normalized {
         case "readfile", "read_file":
             "read_file"
         case "read_file_tool", "read_file_contents":
@@ -124,7 +125,7 @@ enum AgentTranscriptToolVisibilityPolicy {
         case "filechange", "file_change":
             "apply_patch"
         default:
-            nil
+            AgentWebToolCanonicalNames.canonicalToolCardName(normalized)
         }
     }
 

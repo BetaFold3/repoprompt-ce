@@ -17,6 +17,72 @@ final class WebSearchToolCardTests: XCTestCase {
         XCTAssertTrue(ToolCardRouter.knownResultTools.contains("search"))
     }
 
+    func testCanonicalToolCardNameMatchesLegacyClassificationAcrossCandidateEdgeCases() {
+        let corpus: [String?] = [
+            nil, "", "   ", "\n\t", ".", "..",
+            "search", "web_search", "WEB-SEARCH", " Web Search ", "google_web_search", "Search_Web", "WebSearch",
+            "WebFetch", "web-fetch", "web read", "browser.open", "Browser.Open", "browser_open", "read web page",
+            "functions.web_search", "tools.browser.open", "ns.WebFetch", "a.b.search", "web_search.", "search.web_fetch",
+            "web_fetch.search", "foo.\tweb_search", "foo.\nwebfetch", "foo.\u{00A0}web_fetch", "foo. web_search",
+            "foo.\tweb_search\t", "mcp__RepoPrompt__web_search", "mcp__repoprompt__web_search", "mcp__RepoPromptCE__web_search",
+            "xmcp__RepoPrompt__webfetchmcp__RepoPrompt__", "mcp__RepoPrompt__mcp__RepoPrompt__search",
+            "mcp__RepoPrompt__ns.open_url", "file_search", "read_file", "grep", "bash", "exec_command",
+            "\u{FF37}\u{FF25}\u{FF22}_search", "\u{0130}search", "web_search\u{0130}", "web_searc\u{0048}\u{0301}",
+            "S\u{0045}ARCH", "\u{212A}", "web\u{2010}search"
+        ]
+        for raw in corpus {
+            let label = String(reflecting: raw)
+            XCTAssertEqual(
+                AgentWebToolCanonicalNames.canonicalToolCardName(raw),
+                legacyCanonicalToolCardName(raw),
+                label
+            )
+            guard let raw else { continue }
+            XCTAssertEqual(AgentWebToolCanonicalNames.isWebSearchName(raw), legacyIsWebSearchName(raw), label)
+            XCTAssertEqual(AgentWebToolCanonicalNames.isWebReadName(raw), legacyIsWebReadName(raw), label)
+        }
+        // Pinned outcomes so a defect shared with the legacy copy cannot pass silently.
+        XCTAssertEqual(AgentWebToolCanonicalNames.canonicalToolCardName("foo.\tweb_search"), "search")
+        XCTAssertEqual(AgentWebToolCanonicalNames.canonicalToolCardName("foo.\u{00A0}web_fetch"), "web_read")
+        XCTAssertEqual(AgentWebToolCanonicalNames.canonicalToolCardName("web_fetch.search"), "search")
+        XCTAssertEqual(AgentWebToolCanonicalNames.canonicalToolCardName("mcp__RepoPrompt__WebFetch"), "web_read")
+        // Pre-existing behavior: RepoPrompt prefix stripping is case-sensitive.
+        XCTAssertNil(AgentWebToolCanonicalNames.canonicalToolCardName("mcp__repoprompt__webfetch"))
+        XCTAssertNil(AgentWebToolCanonicalNames.canonicalToolCardName("  "))
+        XCTAssertTrue(AgentWebToolCanonicalNames.isWebSearchName(" Web-Search "))
+        XCTAssertTrue(AgentWebToolCanonicalNames.isWebReadName("\tBrowser.Open\n"))
+        XCTAssertFalse(AgentWebToolCanonicalNames.isWebSearchName("file_search"))
+    }
+
+    func testVisibleToolNameKnownNonWebAliasesAreDisjointFromWebClassification() {
+        let knownAliases: [(alias: String, expected: String)] = [
+            ("readfile", "read_file"), ("read_file", "read_file"), ("read_file_tool", "read_file"),
+            ("read_file_contents", "read_file"), ("file_search", "file_search"), ("filesearch", "file_search"),
+            ("grep", "file_search"), ("bash", "bash"), ("shell", "bash"), ("local_shell", "bash"),
+            ("unified_exec", "bash"), ("exec", "bash"), ("exec_command", "bash"), ("run_shell_command", "bash"),
+            ("command", "bash"), ("filechange", "apply_patch"), ("file_change", "apply_patch")
+        ]
+        for (alias, expected) in knownAliases {
+            // Disjointness: matching these aliases before web classification cannot change a result.
+            XCTAssertNil(AgentWebToolCanonicalNames.canonicalToolCardName(alias), alias)
+            XCTAssertNil(legacyCanonicalToolCardName(alias), alias)
+            XCTAssertEqual(AgentTranscriptToolVisibilityPolicy.normalizedVisibleToolName(alias), expected, alias)
+        }
+        let variants: [(raw: String?, expected: String?)] = [
+            (nil, nil), ("  ", nil), ("  Exec-Command \n", "bash"), ("Run Shell Command", "bash"),
+            ("File-Change", "apply_patch"), ("READFILE", "read_file"), ("Web-Search", "search"),
+            ("functions.web_search", "search"), ("browser.open", "web_read"), ("tools.WebFetch", "web_read"),
+            ("foo.\tweb_fetch", "web_read"), ("x.bash", "x.bash"), ("custom_tool", "custom_tool")
+        ]
+        for (raw, expected) in variants {
+            XCTAssertEqual(
+                AgentTranscriptToolVisibilityPolicy.normalizedVisibleToolName(raw),
+                expected,
+                String(reflecting: raw)
+            )
+        }
+    }
+
     func testWebActionClassifierDistinguishesSearchReadFindAndCodeSearch() throws {
         XCTAssertEqual(webPresentation(toolName: "search", args: ["query": "native web search cards"])?.title, "Web Search")
 
@@ -377,6 +443,49 @@ final class WebSearchToolCardTests: XCTestCase {
             argsObject: args,
             resultObject: result
         ))
+    }
+
+    /// Verbatim copy of the pre-change classification (normalization repeated per predicate).
+    private func legacyNormalizedName(_ raw: String) -> String {
+        raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+            .replacingOccurrences(of: "-", with: "_")
+            .replacingOccurrences(of: " ", with: "_")
+    }
+
+    private func legacyIsWebSearchName(_ name: String) -> Bool {
+        switch legacyNormalizedName(name) {
+        case "search", "web_search", "web_search_request", "google_web_search", "search_web", "websearch":
+            true
+        default:
+            false
+        }
+    }
+
+    private func legacyIsWebReadName(_ name: String) -> Bool {
+        switch legacyNormalizedName(name) {
+        case "webfetch", "web_fetch", "web_read", "read_web", "browser.open", "browser_open", "open_url",
+             "read_url", "fetch_url", "web_page", "webpage", "read_web_page":
+            true
+        default:
+            false
+        }
+    }
+
+    private func legacyCanonicalToolCardName(_ raw: String?) -> String? {
+        guard let raw else { return nil }
+        var names: [String] = []
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmed.isEmpty {
+            let normalized = legacyNormalizedName(trimmed.replacingOccurrences(of: "mcp__RepoPrompt__", with: ""))
+            names = [normalized]
+            if let suffix = normalized.split(separator: ".").last.map(String.init), suffix != normalized {
+                names.append(suffix)
+            }
+        }
+        if names.contains(where: legacyIsWebSearchName) { return "search" }
+        if names.contains(where: legacyIsWebReadName) { return "web_read" }
+        return nil
     }
 
     private func jsonString(_ object: [String: Any], file: StaticString = #filePath, line: UInt = #line) -> String {
