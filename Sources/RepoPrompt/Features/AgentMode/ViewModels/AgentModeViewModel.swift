@@ -3924,8 +3924,21 @@ final class AgentModeViewModel: ObservableObject {
             return session
         }
         guard let session = coldSession else { return }
+        #if DEBUG
+            // Captured activation identity; never the mutable current generation.
+            let coldTaskFields: [String: String] = [
+                "windowID": "\(windowID)",
+                "tabID": WorkspaceRestorePerfLog.shortID(tabID),
+                "sessionID": WorkspaceRestorePerfLog.shortID(session.activeAgentSessionID),
+                "activationGeneration": "\(activationGeneration)"
+            ]
+            WorkspaceRestorePerfLog.event("agentMode.activation.coldTaskWillCreate", fields: coldTaskFields)
+        #endif
         Task { [weak self] in
             guard let self else { return }
+            #if DEBUG
+                WorkspaceRestorePerfLog.event("agentMode.activation.coldTaskEntered", fields: coldTaskFields)
+            #endif
             await loadSessionFromDisk(for: session)
             guard sessionActivationGeneration == activationGeneration else { return }
             guard currentTabID == tabID else { return }
@@ -5170,9 +5183,20 @@ final class AgentModeViewModel: ObservableObject {
                 if let hook = test_persistedLoadBeforePrepareHook {
                     await hook(session)
                 }
+                let prepareBoundaryFields: [String: String] = [
+                    "windowID": "\(windowID)",
+                    "tabID": WorkspaceRestorePerfLog.shortID(session.tabID),
+                    "sessionID": WorkspaceRestorePerfLog.shortID(sessionID),
+                    "loadAttemptID": WorkspaceRestorePerfLog.shortID(loadAttemptID),
+                    "transitionGeneration": "\(hydrationToken.transition.transitionGeneration)"
+                ]
+                WorkspaceRestorePerfLog.event("agentSessionHydration.prepareWillAwait", fields: prepareBoundaryFields)
             #endif
             let preparedPayload = try await dataService.preparePersistedHydration(request)
             #if DEBUG
+                var prepareResumeFields = prepareBoundaryFields
+                prepareResumeFields["payload"] = preparedPayload == nil ? "nil" : "present"
+                WorkspaceRestorePerfLog.event("agentSessionHydration.prepareDidResume", fields: prepareResumeFields)
                 if let hook = test_persistedLoadPrepareHook {
                     await hook(session)
                 }

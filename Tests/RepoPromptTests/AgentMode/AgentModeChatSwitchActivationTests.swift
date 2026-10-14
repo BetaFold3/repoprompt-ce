@@ -1992,6 +1992,120 @@ final class AgentModeChatSwitchActivationTests: XCTestCase {
             }
         }
 
+        /// The DEBUG cold-timing markers follow the activation/prepare boundaries: outer task markers
+        /// appear while the before-prepare gate is held, and after release the will-await, service
+        /// entry, successful payload, and did-resume markers appear in order before the after-prepare hook.
+        func testColdActivationTimingMarkersFollowGateOrder() async throws {
+            try await withFixture { fixture in
+                let viewModel = fixture.viewModel
+                let cold = try await persistColdTarget(in: fixture)
+                defer { viewModel.test_persistenceWorkspaceOverride = nil }
+                let session = try materializeUnpresentable(cold.tabID, in: fixture)
+                let previousOverride = WorkspaceRestorePerfLog.debugProcessOverrideEnabled
+                WorkspaceRestorePerfLog.setDebugProcessOverrideEnabled(true)
+                defer { WorkspaceRestorePerfLog.setDebugProcessOverrideEnabled(previousOverride) }
+                // The metrics buffer is process-global with no restore API: clear it for this test and
+                // filter by this test's cold tab ID.
+                WorkspaceRestorePerfLog.clearRecentMetricLines()
+
+                let markerNames = [
+                    "agentMode.activation.coldTaskWillCreate",
+                    "agentMode.activation.coldTaskEntered",
+                    "agentSessionHydration.prepareWillAwait",
+                    "agentSessionHydration.prepareEntered",
+                    "agentSessionHydration.prepare",
+                    "agentSessionHydration.prepareDidResume"
+                ]
+                let tabField = "tabID=\(WorkspaceRestorePerfLog.shortID(cold.tabID))"
+                func coldEvents() -> [(name: String, fields: [String: String])] {
+                    WorkspaceRestorePerfLog.recentMetricLinesSnapshot(limit: 2000).compactMap { line in
+                        let tokens = line.split(separator: " ").map(String.init)
+                        guard tokens.count > 1, markerNames.contains(tokens[1]), tokens.contains(tabField) else {
+                            return nil
+                        }
+                        var fields: [String: String] = [:]
+                        for token in tokens.dropFirst(2) {
+                            let pair = token.split(separator: "=", maxSplits: 1).map(String.init)
+                            if pair.count == 2 { fields[pair[0]] = pair[1] }
+                        }
+                        return (tokens[1], fields)
+                    }
+                }
+                func coldMarkers() -> [String] {
+                    coldEvents().map { event in
+                        event.name == "agentSessionHydration.prepare"
+                            ? "\(event.name):outcome=\(event.fields["outcome"] ?? "")"
+                            : event.name
+                    }
+                }
+
+                let gate = ColdLoadGate()
+                defer { gate.release() }
+                viewModel.test_persistedLoadBeforePrepareHook = { held in
+                    guard held.tabID == cold.tabID else { return }
+                    await gate.waitForRelease()
+                }
+                defer { viewModel.test_persistedLoadBeforePrepareHook = nil }
+                var markersAtAfterHook: [String]?
+                viewModel.test_persistedLoadPrepareHook = { held in
+                    guard held.tabID == cold.tabID else { return }
+                    markersAtAfterHook = coldMarkers()
+                }
+                defer { viewModel.test_persistedLoadPrepareHook = nil }
+
+                await fixture.window.promptManager.switchComposeTab(cold.tabID)
+                try await Self.waitUntil { gate.isWaiting }
+                await Self.drainMainQueue()
+                XCTAssertEqual(
+                    coldMarkers(),
+                    ["agentMode.activation.coldTaskWillCreate", "agentMode.activation.coldTaskEntered"],
+                    "Outer markers only while the before-prepare gate is held"
+                )
+
+                gate.release()
+                try await Self.waitUntil {
+                    session.hasLoadedPersistedState && viewModel.activeSessionLoadInProgressTabID == nil
+                }
+                await Self.drainMainQueue()
+                let expected = [
+                    "agentMode.activation.coldTaskWillCreate",
+                    "agentMode.activation.coldTaskEntered",
+                    "agentSessionHydration.prepareWillAwait",
+                    "agentSessionHydration.prepareEntered",
+                    "agentSessionHydration.prepare:outcome=payload",
+                    "agentSessionHydration.prepareDidResume"
+                ]
+                XCTAssertEqual(markersAtAfterHook, expected, "did-resume precedes the after-prepare hook")
+                XCTAssertEqual(coldMarkers(), expected)
+                XCTAssertTrue(viewModel.ui.transcript.snapshot.isHydrated)
+
+                let events = coldEvents()
+                XCTAssertEqual(events.count, expected.count)
+                func fields(_ name: String) -> [String: String] {
+                    events.first { $0.name == name }?.fields ?? [:]
+                }
+                let willCreate = fields("agentMode.activation.coldTaskWillCreate")
+                let entered = fields("agentMode.activation.coldTaskEntered")
+                let willAwait = fields("agentSessionHydration.prepareWillAwait")
+                let didResume = fields("agentSessionHydration.prepareDidResume")
+                let activationGeneration = try XCTUnwrap(willCreate["activationGeneration"])
+                XCTAssertFalse(activationGeneration.isEmpty)
+                XCTAssertEqual(entered["activationGeneration"], activationGeneration, "Outer events share the captured generation")
+                let loadAttemptID = try XCTUnwrap(willAwait["loadAttemptID"])
+                XCTAssertFalse(loadAttemptID.isEmpty)
+                XCTAssertNotEqual(loadAttemptID, "nil")
+                XCTAssertEqual(didResume["loadAttemptID"], loadAttemptID, "Await/resume share the load attempt")
+                let transitionGeneration = try XCTUnwrap(willAwait["transitionGeneration"])
+                XCTAssertFalse(transitionGeneration.isEmpty)
+                XCTAssertEqual(didResume["transitionGeneration"], transitionGeneration)
+                XCTAssertEqual(didResume["payload"], "present")
+                let targetSessionID = WorkspaceRestorePerfLog.shortID(cold.sessionID)
+                for event in events {
+                    XCTAssertEqual(event.fields["sessionID"], targetSessionID, "\(event.name) carries the target session")
+                }
+            }
+        }
+
         /// A foreground switch to an unseeded persisted tab materializes and binds its session during
         /// activation; the binding notification and sidebar publication land before the transcript UI
         /// store publishes exactly one target loading snapshot, followed by the hydrated target.

@@ -195,6 +195,8 @@ Step D6-cold-path-signal — done | rounds 0/2 | open: none; D6-cold-path-signal
 
 Step D6-cold-admission-investigation — done | rounds 0/2 | open: none; D6-cold-pre-admission-investigation.md; D6-cold-post-admission-investigation.md | downgraded: none | assumed: ordered/additive PRE logs verified; handler-to-load UI work dominates, exact publication/admission split unknown; live POST reason unattributed | deferred: task-creation stamps, scheduling changes, shared processing context and terminal-coherence-safe adoption repair
 
+Step D6-cold-timing — done | rounds 0/2 | open: none; D6-cold-timing-final.md | downgraded: none | assumed: five existing DEBUG logger boundaries; 75 tests then 42 after review cleanup; A/B no P0/P1 | deferred: live queue attribution, B D6-1/D6-3; identical overlapping service requests remain ambiguous
+
 Step D6-cold-follow-binding — done | rounds 0/2 | open: none; D6-cold-follow-binding-final.md | downgraded: none | assumed: exact destination follow copy in existing cold batch; 138 tests then 41 after review cleanup; A/B no P0/P1 | deferred: causal live latency gain, B F3 existing view arming-owner check
 
 Step D6-same-purpose-leaf-investigation — done | rounds 0/2 | open: none; D6-same-purpose-leaf-investigation.md | downgraded: none | assumed: source-proven repeated full-span leaf construction inside persistent materialization | deferred: paired leaf reuse implementation and avoided-work qualification; no backend edit
