@@ -1883,6 +1883,12 @@ final class AgentModeChatSwitchActivationTests: XCTestCase {
                 XCTAssertTrue(snapshot.presentation.visibleRows.isEmpty)
                 XCTAssertTrue(snapshot.presentation.workingRows.isEmpty)
                 XCTAssertEqual(viewModel.ui.transcript.snapshot, snapshot)
+                assertDefaultFollowAndQuietViewNormalization(
+                    snapshot,
+                    tabID: cold.tabID,
+                    viewModel: viewModel,
+                    emissionCount: { emissions.count }
+                )
 
                 gate.release()
                 try await Self.waitUntil {
@@ -1905,6 +1911,84 @@ final class AgentModeChatSwitchActivationTests: XCTestCase {
                     snapshot.currentTabID == cold.tabID
                         && snapshot.presentation.visibleRows.contains { fixture.tabATexts.contains($0.text) }
                 }, "The target never shows the previous tab's rows")
+            }
+        }
+
+        /// A pre-materialized cold destination with a non-default (detached, disarmed) follow state
+        /// carries that exact state in its single loading snapshot; the view's legitimate activation
+        /// reset to live-bottom/armed still mutates the session and publishes, without hydrating.
+        func testColdActivationLoadingSnapshotCarriesDetachedFollowAndViewResetPublishes() async throws {
+            try await withFixture { fixture in
+                let viewModel = fixture.viewModel
+                let cold = try await persistColdTarget(in: fixture)
+                defer { viewModel.test_persistenceWorkspaceOverride = nil }
+                let session = try materializeUnpresentable(cold.tabID, in: fixture)
+                viewModel.setTranscriptDetachedFromLiveBottom(
+                    tabID: cold.tabID,
+                    isDetached: true,
+                    armingState: .disarmedAfterManualDetach
+                )
+                let detached = AgentModeViewModel.ActiveTranscriptFollowBindingState(
+                    tabID: cold.tabID,
+                    viewportState: session.transcriptViewportState,
+                    armingState: session.transcriptAutoFollowArmingState
+                )
+                XCTAssertTrue(detached.viewportState.isDetachedFromLiveBottom)
+                XCTAssertEqual(detached.armingState, .disarmedAfterManualDetach)
+                XCTAssertEqual(viewModel.ui.transcript.snapshot.currentTabID, fixture.tabAID)
+
+                let gate = ColdLoadGate()
+                defer { gate.release() }
+                viewModel.test_persistedLoadBeforePrepareHook = { held in
+                    guard held.tabID == cold.tabID else { return }
+                    await gate.waitForRelease()
+                }
+                defer { viewModel.test_persistedLoadBeforePrepareHook = nil }
+                var emissions: [AgentTranscriptUISnapshot] = []
+                let subscription = viewModel.ui.transcript.$snapshot.dropFirst().sink { snapshot in
+                    MainActor.assumeIsolated { emissions.append(snapshot) }
+                }
+                defer { subscription.cancel() }
+
+                await fixture.window.promptManager.switchComposeTab(cold.tabID)
+                try await Self.waitUntil { gate.isWaiting }
+                await Self.drainMainQueue()
+                let loading = emissions.filter { $0.currentTabID == cold.tabID }
+                XCTAssertEqual(loading.count, 1)
+                let snapshot = try XCTUnwrap(loading.first)
+                XCTAssertFalse(snapshot.isHydrated)
+                XCTAssertEqual(snapshot.followBindingState, detached, "The loading snapshot preserves the destination's follow state")
+
+                let beforeReset = emissions.count
+                viewModel.normalizeTranscriptFollowStateForViewActivation(tabID: cold.tabID)
+                XCTAssertEqual(session.transcriptViewportState, .liveBottom)
+                XCTAssertEqual(session.transcriptAutoFollowArmingState, .armed)
+                XCTAssertEqual(emissions.count, beforeReset + 1, "The legitimate view reset publishes once")
+                let reset = viewModel.ui.transcript.snapshot
+                XCTAssertEqual(
+                    reset.followBindingState,
+                    AgentModeViewModel.ActiveTranscriptFollowBindingState(tabID: cold.tabID, viewportState: .liveBottom, armingState: .armed)
+                )
+                XCTAssertFalse(reset.isHydrated, "Follow alignment is not hydration")
+
+                gate.release()
+                try await Self.waitUntil {
+                    session.hasLoadedPersistedState && viewModel.activeSessionLoadInProgressTabID == nil
+                }
+                await Self.drainMainQueue()
+                let hydrated = viewModel.ui.transcript.snapshot
+                XCTAssertTrue(hydrated.isHydrated)
+                XCTAssertEqual(
+                    hydrated.followBindingState,
+                    AgentModeViewModel.ActiveTranscriptFollowBindingState(tabID: cold.tabID, viewportState: .liveBottom, armingState: .armed)
+                )
+                assertPresentation(
+                    hydrated.presentation,
+                    tabID: cold.tabID,
+                    sessionID: cold.sessionID,
+                    session: session,
+                    expectedTexts: cold.texts
+                )
             }
         }
 
@@ -1977,6 +2061,12 @@ final class AgentModeChatSwitchActivationTests: XCTestCase {
                 XCTAssertTrue(snapshot.presentation.visibleRows.isEmpty)
                 XCTAssertTrue(snapshot.presentation.workingRows.isEmpty)
                 XCTAssertEqual(viewModel.ui.transcript.snapshot, snapshot)
+                assertDefaultFollowAndQuietViewNormalization(
+                    snapshot,
+                    tabID: cold.tabID,
+                    viewModel: viewModel,
+                    emissionCount: { emissions.count }
+                )
 
                 gate.release()
                 try await Self.waitUntil {
@@ -2030,6 +2120,9 @@ final class AgentModeChatSwitchActivationTests: XCTestCase {
 
                 await fixture.window.promptManager.switchComposeTab(fixture.tabBID)
                 let destinationStart = emissions.count
+                // The inactive cold tab's normalization neither mutates nor publishes.
+                viewModel.normalizeTranscriptFollowStateForViewActivation(tabID: cold.tabID)
+                XCTAssertEqual(emissions.count, destinationStart)
                 gate.release()
                 try await Self.waitUntil { session.hasLoadedPersistedState }
                 await Self.drainMainQueue()
@@ -2039,9 +2132,19 @@ final class AgentModeChatSwitchActivationTests: XCTestCase {
                     snapshot.currentTabID == cold.tabID
                         || snapshot.presentation.tabID == cold.tabID
                         || snapshot.activeSessionLoadInProgressTabID == cold.tabID
+                        || snapshot.followBindingState.tabID == cold.tabID
                 }, "The stale cold load never republishes after the newer switch")
                 let destination = viewModel.ui.transcript.snapshot
                 XCTAssertEqual(destination.currentTabID, fixture.tabBID)
+                XCTAssertEqual(
+                    destination.followBindingState,
+                    AgentModeViewModel.ActiveTranscriptFollowBindingState(
+                        tabID: fixture.tabBID,
+                        viewportState: fixture.sessionB.transcriptViewportState,
+                        armingState: fixture.sessionB.transcriptAutoFollowArmingState
+                    ),
+                    "The warm destination's follow state survives the late cold completion"
+                )
                 XCTAssertTrue(destination.isHydrated)
                 XCTAssertNil(destination.activeSessionLoadInProgressTabID)
                 assertPresentation(
@@ -2154,6 +2257,29 @@ final class AgentModeChatSwitchActivationTests: XCTestCase {
             XCTAssertFalse(session.hasLoadedPersistedState)
             XCTAssertEqual(viewModel.ui.transcript.snapshot, before, "Background materialization does not publish")
             return session
+        }
+
+        /// The first loading snapshot carries the destination's default follow state, and the view's
+        /// real activation normalization while the load is held publishes nothing further.
+        private func assertDefaultFollowAndQuietViewNormalization(
+            _ snapshot: AgentTranscriptUISnapshot,
+            tabID: UUID,
+            viewModel: AgentModeViewModel,
+            emissionCount: () -> Int,
+            file: StaticString = #filePath,
+            line: UInt = #line
+        ) {
+            XCTAssertEqual(
+                snapshot.followBindingState,
+                AgentModeViewModel.ActiveTranscriptFollowBindingState(tabID: tabID, viewportState: .liveBottom, armingState: .armed),
+                "The loading snapshot carries the destination's follow state",
+                file: file,
+                line: line
+            )
+            let before = emissionCount()
+            viewModel.normalizeTranscriptFollowStateForViewActivation(tabID: tabID)
+            XCTAssertEqual(emissionCount(), before, "Default follow normalization adds no store publication", file: file, line: line)
+            XCTAssertFalse(viewModel.ui.transcript.snapshot.isHydrated, file: file, line: line)
         }
 
         private static func waitUntil(_ condition: () -> Bool) async throws {

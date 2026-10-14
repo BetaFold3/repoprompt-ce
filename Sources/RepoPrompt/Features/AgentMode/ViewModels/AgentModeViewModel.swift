@@ -3912,6 +3912,12 @@ final class AgentModeViewModel: ObservableObject {
                 return nil
             }
 
+            // Copy the destination's existing follow composite into the loading snapshot. For the
+            // default live-bottom/armed state this keeps the view's activation normalization from
+            // publishing a follow-only update; a non-default state's legitimate reset still publishes.
+            if currentTabID == tabID {
+                syncActiveTranscriptFollowBindings(from: session)
+            }
             activeSessionLoadInProgressTabID = tabID
             publishLoadingTranscriptPresentation(tabID: tabID)
             applySessionToBindings(session)
