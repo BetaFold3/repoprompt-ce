@@ -6277,6 +6277,80 @@ enum AgentTranscriptProjectionBuilder {
         let anchorBlockIndex: [AgentTranscriptAnchor: String]
     }
 
+    /// Invocation-local leaf blocks captured by one paired refresh for the same invocation's build,
+    /// keyed by turn position. Leaf blocks depend only on the turn's identity, tier, conclusion,
+    /// and span activities, none of which the refresh mutates. Leaf construction must never read
+    /// `frozenDetailedToolTailLimit` or `fullRenderGroupedHistoryCache` (the refresh's only
+    /// mutations), and activity suppression must stay a pure function of the activity, stable
+    /// within one call.
+    private final class GroupedHistoryLeafScratch {
+        struct TurnLeaves {
+            let turnID: UUID
+            let spanLeaves: [(spanID: UUID, blocks: [AgentTranscriptRenderBlock])]
+            let emittedConclusionActivityIDs: Set<UUID>
+        }
+
+        private var turnLeavesByPosition: [Int: TurnLeaves] = [:]
+        private(set) var consumedTurnCount = 0
+
+        func store(_ leaves: TurnLeaves, at position: Int) {
+            turnLeavesByPosition[position] = leaves
+        }
+
+        /// Removes the position's leaves; returns them only when turn and span identities match.
+        func take(at position: Int, for turn: AgentTranscriptTurn) -> PreparedTurnLeaves? {
+            guard let leaves = turnLeavesByPosition.removeValue(forKey: position),
+                  leaves.turnID == turn.id,
+                  leaves.spanLeaves.map(\.spanID) == turn.responseSpans.map(\.id)
+            else {
+                return nil
+            }
+            return PreparedTurnLeaves(leaves: leaves, scratch: self)
+        }
+
+        func recordConsumedTurn() {
+            consumedTurnCount += 1
+        }
+    }
+
+    private struct PreparedTurnLeaves {
+        let leaves: GroupedHistoryLeafScratch.TurnLeaves
+        let scratch: GroupedHistoryLeafScratch
+    }
+
+    struct StorageProjectionResult {
+        let transcript: AgentTranscript
+        let projection: AgentTranscriptProjection
+        /// Turns whose full blocks used leaves prepared by this invocation's refresh.
+        let preparedLeafTurnCount: Int
+    }
+
+    /// Persistent-storage pairing of `refreshCompletedFullTurnGroupedHistoryCaches(in:)` and
+    /// `build(from:)` on the returned transcript (no protection, no prefix, no turn caches): the
+    /// build reuses the refresh's span leaf blocks for ordinary full-tier turns.
+    static func refreshGroupedHistoryAndBuildStorageProjection(
+        in transcript: AgentTranscript
+    ) -> StorageProjectionResult {
+        let scratch = GroupedHistoryLeafScratch()
+        let refreshed = refreshCompletedFullTurnGroupedHistoryCaches(
+            in: transcript,
+            reusablePrefixTurnCount: nil,
+            leafScratch: scratch
+        )
+        let projection = buildProjection(
+            from: refreshed,
+            protection: .none,
+            reusablePrefix: nil,
+            turnCaches: [:],
+            preparedLeafScratch: scratch
+        ).projection
+        return StorageProjectionResult(
+            transcript: refreshed,
+            projection: projection,
+            preparedLeafTurnCount: scratch.consumedTurnCount
+        )
+    }
+
     /// Refreshes completed full-turn grouped-history summary caches.
     /// Also intentionally tightens `frozenDetailedToolTailLimit` when an eligible completed
     /// full turn emits grouped history under the current newest-first allocation. Callers
@@ -6284,6 +6358,18 @@ enum AgentTranscriptProjectionBuilder {
     static func refreshCompletedFullTurnGroupedHistoryCaches(
         in transcript: AgentTranscript,
         reusablePrefixTurnCount: Int? = nil
+    ) -> AgentTranscript {
+        refreshCompletedFullTurnGroupedHistoryCaches(
+            in: transcript,
+            reusablePrefixTurnCount: reusablePrefixTurnCount,
+            leafScratch: nil
+        )
+    }
+
+    private static func refreshCompletedFullTurnGroupedHistoryCaches(
+        in transcript: AgentTranscript,
+        reusablePrefixTurnCount: Int?,
+        leafScratch: GroupedHistoryLeafScratch?
     ) -> AgentTranscript {
         var updatedTranscript = transcript
         let context = AgentTranscriptProjectionBuildContext()
@@ -6311,6 +6397,7 @@ enum AgentTranscriptProjectionBuilder {
             }
             var didCollapseTurn = false
             var emittedConclusionActivityIDs = Set<UUID>()
+            var capturedSpanLeaves: [(spanID: UUID, blocks: [AgentTranscriptRenderBlock])]? = leafScratch == nil ? nil : []
             for spanIndex in updatedTranscript.turns[turnIndex].responseSpans.indices {
                 let span = updatedTranscript.turns[turnIndex].responseSpans[spanIndex]
                 let leafBlocks = fullSpanLeafBlocks(
@@ -6319,6 +6406,7 @@ enum AgentTranscriptProjectionBuilder {
                     archived: false,
                     emittedConclusionActivityIDs: &emittedConclusionActivityIDs
                 )
+                capturedSpanLeaves?.append((spanID: span.id, blocks: leafBlocks))
                 guard let plan = groupedHistoryCollapsePlan(
                     in: leafBlocks,
                     spanID: span.id,
@@ -6343,6 +6431,16 @@ enum AgentTranscriptProjectionBuilder {
                     detailedToolTailLimit: detailedToolTailLimit,
                     collapseDigest: plan.collapseDigest,
                     summary: summary
+                )
+            }
+            if let leafScratch, let capturedSpanLeaves {
+                leafScratch.store(
+                    .init(
+                        turnID: turn.id,
+                        spanLeaves: capturedSpanLeaves,
+                        emittedConclusionActivityIDs: emittedConclusionActivityIDs
+                    ),
+                    at: turnIndex
                 )
             }
             if didCollapseTurn {
@@ -6444,7 +6542,8 @@ enum AgentTranscriptProjectionBuilder {
         protection: AgentTranscriptProjectionProtection,
         reusablePrefix: ReusableProjectionPrefix?,
         turnCaches: [UUID: AgentTranscriptTurnProjectionCache],
-        processingContext: AgentToolResultProcessingContext? = nil
+        processingContext: AgentToolResultProcessingContext? = nil,
+        preparedLeafScratch: GroupedHistoryLeafScratch? = nil
     ) -> AgentTranscriptProjectionBuildResult {
         #if DEBUG
             let startedAt = Date.timeIntervalSinceReferenceDate
@@ -6462,7 +6561,8 @@ enum AgentTranscriptProjectionBuilder {
         var updatedTurnCaches = turnCaches.filter { transcriptTurnIDs.contains($0.key) }
         var cacheHitCount = 0
 
-        for turn in transcript.turns.dropFirst(reusablePrefix?.turnCount ?? 0) {
+        for (turnPosition, turn) in transcript.turns.enumerated().dropFirst(reusablePrefix?.turnCount ?? 0) {
+            let preparedLeaves = preparedLeafScratch?.take(at: turnPosition, for: turn)
             if let cachedProjection = cachedProjection(
                 for: turn,
                 protectedTurnID: protectedTurnID,
@@ -6485,6 +6585,7 @@ enum AgentTranscriptProjectionBuilder {
                 for: turn,
                 detailedToolTailLimit: detailedToolTailLimits[turn.id] ?? 0,
                 context: context,
+                preparedLeaves: preparedLeaves,
                 workingBlocks: &workingBlocks,
                 archivedBlocks: &archivedBlocks,
                 workingRows: &workingRows,
@@ -6840,6 +6941,7 @@ enum AgentTranscriptProjectionBuilder {
         for turn: AgentTranscriptTurn,
         detailedToolTailLimit: Int,
         context: AgentTranscriptProjectionBuildContext,
+        preparedLeaves: PreparedTurnLeaves?,
         workingBlocks: inout [AgentTranscriptRenderBlock],
         archivedBlocks: inout [AgentTranscriptRenderBlock],
         workingRows: inout [AgentChatItem],
@@ -6853,7 +6955,8 @@ enum AgentTranscriptProjectionBuilder {
             archived: archived,
             detailedToolTailLimit: detailedToolTailLimit,
             context: context,
-            protectDetachedFocus: false
+            protectDetachedFocus: false,
+            preparedLeaves: preparedLeaves
         )
         var appendedWorkingBlocks: [AgentTranscriptRenderBlock] = []
         var appendedArchivedBlocks: [AgentTranscriptRenderBlock] = []
@@ -7231,7 +7334,8 @@ enum AgentTranscriptProjectionBuilder {
         archived: Bool,
         detailedToolTailLimit: Int,
         context: AgentTranscriptProjectionBuildContext,
-        protectDetachedFocus: Bool
+        protectDetachedFocus: Bool,
+        preparedLeaves: PreparedTurnLeaves? = nil
     ) -> [AgentTranscriptRenderBlock] {
         let unsortedBlocks: [AgentTranscriptRenderBlock] = if protectDetachedFocus, turn.retentionTier != .archived {
             fullBlocks(
@@ -7247,7 +7351,8 @@ enum AgentTranscriptProjectionBuilder {
                     for: turn,
                     archived: archived,
                     detailedToolTailLimit: detailedToolTailLimit,
-                    context: context
+                    context: context,
+                    preparedLeaves: preparedLeaves
                 )
             case .condensed, .summary:
                 compactTierBlocks(
@@ -7786,8 +7891,11 @@ enum AgentTranscriptProjectionBuilder {
         for turn: AgentTranscriptTurn,
         archived: Bool,
         detailedToolTailLimit: Int,
-        context: AgentTranscriptProjectionBuildContext
+        context: AgentTranscriptProjectionBuildContext,
+        preparedLeaves: PreparedTurnLeaves? = nil
     ) -> [AgentTranscriptRenderBlock] {
+        // Prepared leaves were captured unarchived; anything else takes the ordinary path.
+        let preparedLeaves = archived ? nil : preparedLeaves
         var blocks: [AgentTranscriptRenderBlock] = []
         if let request = turn.request {
             blocks.append(.init(
@@ -7801,13 +7909,17 @@ enum AgentTranscriptProjectionBuilder {
             ))
         }
         var emittedConclusionActivityIDs = Set<UUID>()
-        for span in turn.responseSpans {
-            let leafBlocks = fullSpanLeafBlocks(
-                for: span,
-                in: turn,
-                archived: archived,
-                emittedConclusionActivityIDs: &emittedConclusionActivityIDs
-            )
+        for (spanIndex, span) in turn.responseSpans.enumerated() {
+            let leafBlocks: [AgentTranscriptRenderBlock] = if let preparedLeaves {
+                preparedLeaves.leaves.spanLeaves[spanIndex].blocks
+            } else {
+                fullSpanLeafBlocks(
+                    for: span,
+                    in: turn,
+                    archived: archived,
+                    emittedConclusionActivityIDs: &emittedConclusionActivityIDs
+                )
+            }
             blocks.append(contentsOf: collapseOlderHistory(
                 in: leafBlocks,
                 span: span,
@@ -7817,6 +7929,10 @@ enum AgentTranscriptProjectionBuilder {
                 detailedToolTailLimit: detailedToolTailLimit,
                 context: context
             ))
+        }
+        if let preparedLeaves {
+            emittedConclusionActivityIDs = preparedLeaves.leaves.emittedConclusionActivityIDs
+            preparedLeaves.scratch.recordConsumedTurn()
         }
         if emittedConclusionActivityIDs.isEmpty,
            let conclusionRow = conclusionRow(for: turn)

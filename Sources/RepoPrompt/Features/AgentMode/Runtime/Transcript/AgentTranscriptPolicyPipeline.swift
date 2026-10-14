@@ -114,13 +114,16 @@ enum AgentTranscriptPolicyPipeline {
 
     private static func materializePersistentStorageTranscript(_ transcript: AgentTranscript) -> Result {
         var finalMetrics = AgentToolResultPersistencePolicy.sanitizeTranscriptForPersistenceWithMetrics(transcript)
+        let refreshedStorage = AgentTranscriptProjectionBuilder.refreshGroupedHistoryAndBuildStorageProjection(
+            in: finalMetrics.transcript
+        )
         finalMetrics = .init(
-            transcript: AgentTranscriptProjectionBuilder.refreshCompletedFullTurnGroupedHistoryCaches(in: finalMetrics.transcript),
+            transcript: refreshedStorage.transcript,
             sanitizedActivityCount: finalMetrics.sanitizedActivityCount,
             reusedTurnCount: finalMetrics.reusedTurnCount,
             incrementalPathReason: finalMetrics.incrementalPathReason
         )
-        let finalProjection = AgentTranscriptProjectionBuilder.build(from: finalMetrics.transcript)
+        let finalProjection = refreshedStorage.projection
         let visibleToolResultRowIDs = AgentTranscriptProjectionBuilder.visibleToolResultRowIDs(in: finalProjection)
 
         return Result(
