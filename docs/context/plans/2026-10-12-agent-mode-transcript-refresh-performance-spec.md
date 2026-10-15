@@ -191,9 +191,11 @@ Step D5 — done | rounds 1/2 | open: none | downgraded: none | assumed: focused
 
 ### D6 — Sidebar: one build per render pass
 
-Step D6-early-load-start — done | rounds 0/2 | open: none; D6-early-start-final.md | downgraded: none | assumed: cold-only begin-or-join/early prepare; 44 activation plus110neighbor tests; both initial reviews no P0/P1 | deferred: combined live gain/discard ratio, A R1/B R-5 negative-path seam coverage, MCP Git diagnostic TaskLocal and B R-9 cosmetic cleanup
+Step D6-early-start-live — done | rounds 0/2 | open: none; D6-early-start-live.md | downgraded: none | assumed: installed317d8df4 verified; 15 activations/one new session joined; cold1658.2ms/warm28.0ms/new908.1ms; native120.810s, main31.18%, severe2372.7ms | deferred: responsiveness targets, matched W1/W2/RSS, cold normalization/presentation overlap and UI source ownership; no persistent sidebar memo or prefetch
 
-Step D6-ui-attribution — blocked | rounds 0/2 | open: dynamic invalidation cause requires combined manual capture; D6-ui-attribution-final.md | downgraded: none | assumed: five-line gated SwiftUI cause probe; app compile, lint and initial A/B reviews passed; no production UI ownership change | deferred: actual system-log output and causal publication/layout attribution
+Step D6-early-load-start — done | rounds 0/2 | open: none; D6-early-start-final.md; D6-early-start-live.md | downgraded: none | assumed: cold-only begin-or-join; 44 activation plus110neighbor tests; both initial reviews no P0/P1; live eight adopted/zero discarded | deferred: causal matched gain/discarded-path qualification, A R1/B R-5 negative-path seam coverage, MCP Git diagnostic TaskLocal and B R-9 cosmetic cleanup
+
+Step D6-ui-attribution — done | rounds 0/2 | open: none; D6-ui-attribution-final.md; D6-early-start-live.md | downgraded: none | assumed: live142 SwiftUI property-cause records; seven pre-focus sidebar filters119.2ms; initial A/B reviews retained; attribution investigation only | deferred: exact publisher ownership, narrower UI optimization, unexplained display-reconfiguration trigger and unattributable framework layout
 
 Step D6-cold-pass-proof — blocked | rounds 0/2 | open: purpose/cold-mutation/payload authority prevents whole-runtime-pass substitution; D6-cold-pass-feasibility.md | downgraded: none | assumed: no persistence/retention semantic changes | deferred: explicit single-pass redesign or separately scoped persistence/presentation overlap; rare merge-only storage duplicate not pursued
 
