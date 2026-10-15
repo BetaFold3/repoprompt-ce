@@ -8627,6 +8627,17 @@ enum AgentTranscriptProjectionBuilder {
         }
     }
 
+    private struct ClusterSummaryOrderKey {
+        let sequenceIndex: Int
+        let timestamp: Date
+        let rowID: UUID
+    }
+
+    private struct ClusterSummaryExecutionEntry {
+        let orderKey: ClusterSummaryOrderKey
+        let execution: AgentTranscriptToolExecution
+    }
+
     private static func clusterSummary(
         for rows: [AgentChatItem],
         context: AgentTranscriptProjectionBuildContext
@@ -8636,50 +8647,71 @@ enum AgentTranscriptProjectionBuilder {
         if let cached = context.clusterSummaryByRowIDs[cacheKey] {
             return cached
         }
-        let groupedExecutions = Dictionary(grouping: rows.compactMap { row -> (AgentChatItem, AgentTranscriptToolExecution)? in
+        // Group by stable execution ID in first-seen order, keeping only lightweight
+        // ordering records so sorts never copy whole rows.
+        var groupIndexByExecutionID: [String: Int] = [:]
+        var executionGroups: [[ClusterSummaryExecutionEntry]] = []
+        for row in rows {
             guard let execution = AgentTranscriptToolNormalizer.toolExecution(
                 for: row,
                 context: context.processingContext
-            ) else { return nil }
-            return (row, execution)
-        }, by: { $0.1.stableExecutionID })
-        let orderedExecutionGroups = groupedExecutions.values
-            .map { grouped in
-                grouped.sorted { lhs, rhs in
-                    if lhs.0.sequenceIndex == rhs.0.sequenceIndex {
-                        return lhs.0.timestamp < rhs.0.timestamp
-                    }
-                    return lhs.0.sequenceIndex < rhs.0.sequenceIndex
-                }
-            }
-            .sorted { lhs, rhs in
-                guard let lhsLast = lhs.last?.0 else { return false }
-                guard let rhsLast = rhs.last?.0 else { return true }
-                if lhsLast.sequenceIndex == rhsLast.sequenceIndex {
-                    if lhsLast.timestamp == rhsLast.timestamp {
-                        return lhsLast.id.uuidString < rhsLast.id.uuidString
-                    }
-                    return lhsLast.timestamp < rhsLast.timestamp
-                }
-                return lhsLast.sequenceIndex < rhsLast.sequenceIndex
-            }
-        let toolExecutions: [AgentTranscriptToolExecution] = orderedExecutionGroups.compactMap { orderedGroup in
-            guard let latestExecution = orderedGroup.last?.1 else { return nil }
-            return orderedGroup.dropLast().reduce(latestExecution) { partial, entry in
-                mergedToolExecutionMetadata(partial, with: entry.1)
+            ) else { continue }
+            let entry = ClusterSummaryExecutionEntry(
+                orderKey: ClusterSummaryOrderKey(
+                    sequenceIndex: row.sequenceIndex,
+                    timestamp: row.timestamp,
+                    rowID: row.id
+                ),
+                execution: execution
+            )
+            if let groupIndex = groupIndexByExecutionID[execution.stableExecutionID] {
+                executionGroups[groupIndex].append(entry)
+            } else {
+                groupIndexByExecutionID[execution.stableExecutionID] = executionGroups.count
+                executionGroups.append([entry])
             }
         }
-        let toolNames = Array(NSOrderedSet(array: toolExecutions.compactMap {
-            let normalized = AgentTranscriptToolNormalizer.normalizedToolName($0.toolName) ?? ""
-            return normalized.isEmpty ? nil : normalized
-        })) as? [String] ?? []
+        for groupIndex in executionGroups.indices where executionGroups[groupIndex].count > 1 {
+            executionGroups[groupIndex].sort { lhs, rhs in
+                if lhs.orderKey.sequenceIndex == rhs.orderKey.sequenceIndex {
+                    return lhs.orderKey.timestamp < rhs.orderKey.timestamp
+                }
+                return lhs.orderKey.sequenceIndex < rhs.orderKey.sequenceIndex
+            }
+        }
+        // Groups are never empty (each is created with its first entry); take each group's
+        // latest-row key once so the outer sort compares only plain keys.
+        let latestOrderKeys = executionGroups.map { $0[$0.count - 1].orderKey }
+        let orderedGroupIndices = latestOrderKeys.indices.sorted { lhsIndex, rhsIndex in
+            let lhsLast = latestOrderKeys[lhsIndex]
+            let rhsLast = latestOrderKeys[rhsIndex]
+            if lhsLast.sequenceIndex == rhsLast.sequenceIndex {
+                if lhsLast.timestamp == rhsLast.timestamp {
+                    return lhsLast.rowID.uuidString < rhsLast.rowID.uuidString
+                }
+                return lhsLast.timestamp < rhsLast.timestamp
+            }
+            return lhsLast.sequenceIndex < rhsLast.sequenceIndex
+        }
+        let toolExecutions: [AgentTranscriptToolExecution] = orderedGroupIndices.map { groupIndex in
+            let orderedGroup = executionGroups[groupIndex]
+            let latestExecution = orderedGroup[orderedGroup.count - 1].execution
+            return orderedGroup.dropLast().reduce(latestExecution) { partial, entry in
+                mergedToolExecutionMetadata(partial, with: entry.execution)
+            }
+        }
+        // Normalize each merged execution's tool name once; names and counts share it.
+        var normalizedToolNames: [String] = []
+        normalizedToolNames.reserveCapacity(toolExecutions.count)
         var toolNameCounts: [String: Int] = [:]
         for exec in toolExecutions {
             let normalized = AgentTranscriptToolNormalizer.normalizedToolName(exec.toolName) ?? ""
             if !normalized.isEmpty {
+                normalizedToolNames.append(normalized)
                 toolNameCounts[normalized, default: 0] += 1
             }
         }
+        let toolNames = Array(NSOrderedSet(array: normalizedToolNames)) as? [String] ?? []
         let keyPaths = Array(NSOrderedSet(array: toolExecutions.flatMap(\.keyPaths))) as? [String] ?? []
         let containsRunningWork = toolExecutions.contains { $0.status == .running || $0.status == .pending }
         let containsFailure = toolExecutions.contains { $0.status == .failed || $0.status == .cancelled }

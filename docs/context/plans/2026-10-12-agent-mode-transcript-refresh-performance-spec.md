@@ -191,6 +191,12 @@ Step D5 — done | rounds 1/2 | open: none | downgraded: none | assumed: focused
 
 ### D6 — Sidebar: one build per render pass
 
+Step D6-cluster-summary — done | rounds 0/2 | open: none; D6-cluster-summary-final.md | downgraded: none | assumed: lightweight group-order keys and shared post-merge name normalization; 19 tests pass on old and new implementation; both initial reviews no blockers | deferred: live latency qualification; unchanged summary formatter coverage per OracleB P3-2
+
+Step D6-collapse-predicate — todo | rounds 0/2 | open: lightweight structural predicate equivalence and review | downgraded: none | assumed: user-authorized item 2; no retention or persistent-cache semantic changes | deferred: live latency qualification
+
+Step D6-catchup-admission — doing | rounds 0/2 | open: identify post-hydration freshness/integrity trigger before any fix | downgraded: none | assumed: user-authorized item 3; preserve correctness guards | deferred: no speculative stamp repair
+
 Step D6-early-start-live — done | rounds 0/2 | open: none; D6-early-start-live.md | downgraded: none | assumed: installed317d8df4 verified; 15 activations/one new session joined; cold1658.2ms/warm28.0ms/new908.1ms; native120.810s, main31.18%, severe2372.7ms | deferred: responsiveness targets, matched W1/W2/RSS, cold normalization/presentation overlap and UI source ownership; no persistent sidebar memo or prefetch
 
 Step D6-early-load-start — done | rounds 0/2 | open: none; D6-early-start-final.md; D6-early-start-live.md | downgraded: none | assumed: cold-only begin-or-join; 44 activation plus110neighbor tests; both initial reviews no P0/P1; live eight adopted/zero discarded | deferred: causal matched gain/discarded-path qualification, A R1/B R-5 negative-path seam coverage, MCP Git diagnostic TaskLocal and B R-9 cosmetic cleanup
