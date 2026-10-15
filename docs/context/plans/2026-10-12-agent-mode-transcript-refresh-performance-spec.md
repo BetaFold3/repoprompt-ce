@@ -195,7 +195,7 @@ Step D6-cluster-summary — done | rounds 0/2 | open: none; D6-cluster-summary-f
 
 Step D6-collapse-predicate — done | rounds 0/2 | open: none; D6-collapse-predicate-final.md | downgraded: none | assumed: per-span descriptor predicate matches unchanged rendering; 34 focused tests plus final 7 after coverage addition; both initial reviews no blockers | deferred: live latency qualification; existing leaf-walk consolidation and missing-metadata count per OracleB F1/F2
 
-Step D6-catchup-admission — doing | rounds 0/2 | open: identify post-hydration freshness/integrity trigger before any fix | downgraded: none | assumed: user-authorized item 3; preserve correctness guards | deferred: no speculative stamp repair
+Step D6-catchup-admission — done | rounds 0/2 | open: none; D6-catchup-admission-final.md | downgraded: none | assumed: test-only investigation; four run-state fixtures reproduce run-stamp admission and cancelled/failed source reconciliation; 2 changed tests pass; both initial reviews no blockers | deferred: exact live admission reason, broader equivalence and any production catch-up elimination; correctness guards retained
 
 Step D6-early-start-live — done | rounds 0/2 | open: none; D6-early-start-live.md | downgraded: none | assumed: installed317d8df4 verified; 15 activations/one new session joined; cold1658.2ms/warm28.0ms/new908.1ms; native120.810s, main31.18%, severe2372.7ms | deferred: responsiveness targets, matched W1/W2/RSS, cold normalization/presentation overlap and UI source ownership; no persistent sidebar memo or prefetch
 

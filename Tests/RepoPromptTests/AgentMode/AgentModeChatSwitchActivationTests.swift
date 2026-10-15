@@ -1708,15 +1708,152 @@ final class AgentModeChatSwitchActivationTests: XCTestCase {
         func testColdActivationStampsPersistedProviderAndCatchesUpRunStateOnly() async throws {
             try await withFixture { fixture in
                 let viewModel = fixture.viewModel
-                let window = fixture.window
-                let storageURL = fixture.rootURL.appendingPathComponent("SessionStore", isDirectory: true)
-                try FileManager.default.createDirectory(at: storageURL, withIntermediateDirectories: true)
-                var storeWorkspace = try XCTUnwrap(window.workspaceManager.activeWorkspace)
-                storeWorkspace.customStoragePath = storageURL
-                viewModel.test_persistenceWorkspaceOverride = storeWorkspace
                 defer { viewModel.test_persistenceWorkspaceOverride = nil }
+                let observed = try await observeColdActivationCatchUp(persistedRunState: .completed, in: fixture)
+                let session = observed.session
+                XCTAssertEqual(observed.persisted.agentKind, AgentProviderKind.openCode.rawValue)
+                XCTAssertEqual(observed.persisted.lastRunState, AgentSessionRunState.completed.rawValue)
+                XCTAssertEqual(session.persistedLoadDisposition, .applied)
 
-                // A separate writer persists a completed multi-turn OpenCode session to the real store.
+                XCTAssertEqual(observed.catchUps.count, 1)
+                let catchUp = try XCTUnwrap(observed.catchUps.first)
+                XCTAssertEqual(catchUp.reason, AgentModeViewModel.DerivedTranscriptRefreshReason.liveMutation.rawValue)
+                XCTAssertEqual(catchUp.stamp?.selectedAgent, .openCode, "Hydration stamps the normalized persisted provider")
+                XCTAssertEqual(catchUp.stamp?.runState, .idle, "Run state is still installed after the stamp")
+                XCTAssertEqual(catchUp.delta, "syncDelta.run")
+                XCTAssertEqual(catchUp.path, "incremental-success:no-frontier")
+                XCTAssertEqual(session.transcriptPerformanceSnapshot.incrementalImportAttemptCount - catchUp.attempts, 1)
+                XCTAssertEqual(session.transcriptPerformanceSnapshot.incrementalImportSuccessCount - catchUp.successes, 1)
+
+                // Sync: the catch-up leaves a reusable stamp for the completed state.
+                XCTAssertEqual(session.selectedAgent, .openCode)
+                XCTAssertEqual(session.runState, .completed)
+                XCTAssertEqual(session.derivedTranscriptSyncState, coldCatchUpSyncState(of: session, in: viewModel))
+                let protection = viewModel.transcriptProjectionProtection(for: session, transcript: session.transcript)
+                XCTAssertTrue(viewModel.canReuseDerivedTranscriptForSave(for: session, projectionProtection: protection))
+
+                // Integrity: the hydrated items are the stored record; output equals a cold full reference.
+                XCTAssertEqual(session.items, observed.persistedItems)
+                let reference = observed.reference
+                XCTAssertEqual(session.transcript, reference.transcript)
+                XCTAssertEqual(session.baseTranscriptProjection, reference.baseProjection)
+                XCTAssertEqual(session.fullTranscriptProjection, reference.fullProjection)
+                XCTAssertEqual(session.workingTranscriptProjection, reference.workingProjection)
+                XCTAssertEqual(session.transcriptProjectionCounts, reference.projectionCounts)
+                XCTAssertEqual(session.transcriptCanonicalVisibleRowCount, reference.canonicalVisibleRowCount)
+                XCTAssertEqual(session.transcriptAnalyticsSnapshot, reference.analyticsSnapshot)
+
+                // The hydrated state the catch-up replaced already equaled that reference.
+                XCTAssertEqual(observed.transcriptBeforeCatchUp, reference.transcript)
+                XCTAssertEqual(observed.baseProjectionBeforeCatchUp, reference.baseProjection)
+            }
+        }
+
+        /// These cancelled/failed fixtures take one run-state-only catch-up. It leaves the hydrated
+        /// transcript and base projection unchanged but is not a no-op: it reconciles the hydrated source
+        /// items to the sanitized transcript's working items. The active-state fixture has complete message
+        /// rows but is saved with run state running. Cold activation preserves its cancelled turn/span,
+        /// unlike a fresh import at the restored idle state.
+        func testColdActivationCatchUpAcrossPersistedRunStates() async throws {
+            for persistedRunState in [AgentSessionRunState.cancelled, .failed, .running] {
+                try await withFixture { fixture in
+                    let viewModel = fixture.viewModel
+                    defer { viewModel.test_persistenceWorkspaceOverride = nil }
+                    let observed = try await observeColdActivationCatchUp(persistedRunState: persistedRunState, in: fixture)
+                    let session = observed.session
+                    let label = persistedRunState.rawValue
+                    XCTAssertEqual(session.persistedLoadDisposition, .applied, label)
+                    XCTAssertEqual(session.derivedTranscriptSyncState, coldCatchUpSyncState(of: session, in: viewModel), label)
+                    if persistedRunState.isActive {
+                        XCTAssertEqual(observed.persisted.lastRunState, AgentSessionRunState.idle.rawValue, "\(label): loads as idle")
+                        XCTAssertEqual(session.runState, .idle, label)
+                        XCTAssertTrue(observed.catchUps.isEmpty, "\(label): no observed run-state catch-up")
+                        XCTAssertNil(session.derivedTranscriptRefreshTask, label)
+                        XCTAssertNil(session.pendingDerivedTranscriptRefreshReason, label)
+                        XCTAssertNotEqual(session.transcript, observed.reference.transcript, "\(label): an idle rebuild is not an integrity reference for cold cancellation")
+                        let lastTurn = try XCTUnwrap(session.transcript.turns.last)
+                        XCTAssertEqual(lastTurn.terminalState, .cancelled, "\(label): the interrupted turn stays cancelled")
+                        XCTAssertEqual(lastTurn.responseSpans.map(\.lifecycle), [.cancelled], label)
+                    } else {
+                        XCTAssertEqual(observed.persisted.lastRunState, persistedRunState.rawValue, label)
+                        XCTAssertEqual(session.runState, persistedRunState, label)
+                        // Hydration installs the load-normalized record's items; the catch-up then reconciles them to
+                        // the working items of the sanitized transcript (`.retentionCompaction`), changing only
+                        // tool-result rows. Completed sessions are excluded from that reconciliation.
+                        XCTAssertEqual(observed.itemsBeforeCatchUp, observed.persistedItems, "\(label): hydrated items are the load-normalized record")
+                        XCTAssertEqual(session.items.map(\.id), observed.persistedItems.map(\.id), label)
+                        XCTAssertEqual(session.items, AgentTranscriptIO.workingSourceItems(from: session.transcript), label)
+                        let reconciled = zip(observed.persistedItems, session.items).filter { $0 != $1 }
+                        XCTAssertFalse(reconciled.isEmpty, "\(label): catch-up reconciles hydrated source items")
+                        XCTAssertTrue(reconciled.allSatisfy { $0.0.kind == .toolResult }, label)
+                        XCTAssertEqual(observed.catchUps.map(\.reason), [AgentModeViewModel.DerivedTranscriptRefreshReason.liveMutation.rawValue], label)
+                        XCTAssertEqual(observed.catchUps.first?.stamp?.selectedAgent, .openCode, label)
+                        XCTAssertEqual(observed.catchUps.first?.stamp?.runState, .idle, label)
+                        XCTAssertEqual(session.baseTranscriptProjection, observed.reference.baseProjection, label)
+                        XCTAssertEqual(session.fullTranscriptProjection, observed.reference.fullProjection, label)
+                        XCTAssertEqual(observed.catchUps.map(\.delta), ["syncDelta.run"], label)
+                        XCTAssertEqual(observed.catchUps.map(\.path), ["incremental-success:no-frontier"], label)
+                        XCTAssertEqual(observed.transcriptBeforeCatchUp, observed.reference.transcript, "\(label): hydrated transcript already final")
+                        XCTAssertEqual(observed.baseProjectionBeforeCatchUp, observed.reference.baseProjection, label)
+                        XCTAssertEqual(session.transcript, observed.reference.transcript, label)
+                    }
+                }
+            }
+        }
+
+        private struct ColdActivationCatchUpAttempt {
+            let reason: String
+            let path: String
+            let stamp: AgentModeViewModel.DerivedTranscriptSyncState?
+            let delta: String
+            let attempts: Int
+            let successes: Int
+        }
+
+        private struct ColdActivationCatchUpObservation {
+            let session: AgentModeViewModel.TabSession
+            let persisted: AgentSession
+            let persistedItems: [AgentChatItem]
+            let catchUps: [ColdActivationCatchUpAttempt]
+            /// The target's hydrated state while the (last) catch-up import is computed but not installed.
+            let transcriptBeforeCatchUp: AgentTranscript?
+            let baseProjectionBeforeCatchUp: AgentTranscriptProjection?
+            let itemsBeforeCatchUp: [AgentChatItem]?
+            /// Reimports final items at the restored run state. This is not an integrity reference
+            /// for cold-cancelled turns whose session-level run state has normalized to idle.
+            let reference: AgentModeViewModel.BuiltTranscriptPresentation
+        }
+
+        private func coldCatchUpSyncState(
+            of session: AgentModeViewModel.TabSession,
+            in viewModel: AgentModeViewModel
+        ) -> AgentModeViewModel.DerivedTranscriptSyncState {
+            AgentModeViewModel.DerivedTranscriptSyncState(
+                sourceItemsRevision: session.sourceItemsRevision,
+                nextSequenceIndex: session.nextSequenceIndex,
+                runState: session.runState,
+                selectedAgent: session.selectedAgent,
+                hidePendingQuestionToolCall: session.hasPendingQuestionUI,
+                projectionProtection: viewModel.transcriptProjectionProtection(for: session, transcript: session.transcript)
+            )
+        }
+
+        /// Persists a multi-turn OpenCode session at `persistedRunState` through a separate writer to
+        /// the real store, then cold-activates it in a new unseeded tab whose placeholder holds the warm
+        /// tab's different provider. Sets `test_persistenceWorkspaceOverride`; callers reset it.
+        private func observeColdActivationCatchUp(
+            persistedRunState: AgentSessionRunState,
+            in fixture: Fixture
+        ) async throws -> ColdActivationCatchUpObservation {
+            let viewModel = fixture.viewModel
+            let window = fixture.window
+            let storageURL = fixture.rootURL.appendingPathComponent("SessionStore", isDirectory: true)
+            try FileManager.default.createDirectory(at: storageURL, withIntermediateDirectories: true)
+            var storeWorkspace = try XCTUnwrap(window.workspaceManager.activeWorkspace)
+            storeWorkspace.customStoragePath = storageURL
+            viewModel.test_persistenceWorkspaceOverride = storeWorkspace
+            do {
+                // A separate writer persists the multi-turn OpenCode session to the real store.
                 let writer = AgentModeViewModel(
                     testWindowID: 4490,
                     testWorkspacePath: storageURL.path,
@@ -1735,14 +1872,12 @@ final class AgentModeChatSwitchActivationTests: XCTestCase {
                     written.appendItem(.toolResult(name: "bash", invocationID: invocation, resultJSON: "{\"output\":\"\(turn)\"}"))
                     written.appendItem(.assistant("Turn \(turn) reply"))
                 }
-                written.runState = .completed
+                written.runState = persistedRunState
                 let saved = await writer.flushSave(for: writerTabID)
                 XCTAssertTrue(saved)
                 let sessionID = try XCTUnwrap(written.activeAgentSessionID)
                 let loaded = try await writer.test_dataService.loadAgentSession(id: sessionID, for: storeWorkspace)
                 let persisted = try XCTUnwrap(loaded)
-                XCTAssertEqual(persisted.agentKind, AgentProviderKind.openCode.rawValue)
-                XCTAssertEqual(persisted.lastRunState, AgentSessionRunState.completed.rawValue)
                 let persistedItems = try AgentTranscriptIO.workingSourceItems(from: XCTUnwrap(persisted.transcript))
                 XCTAssertEqual(persistedItems.map(\.id), written.items.map(\.id))
 
@@ -1757,18 +1892,11 @@ final class AgentModeChatSwitchActivationTests: XCTestCase {
                 XCTAssertNil(viewModel.ownerValidatedSessionIndex[sessionID])
                 XCTAssertNil(viewModel.sessions[tabID])
 
-                @MainActor func syncState(of session: AgentModeViewModel.TabSession) -> AgentModeViewModel.DerivedTranscriptSyncState {
-                    AgentModeViewModel.DerivedTranscriptSyncState(
-                        sourceItemsRevision: session.sourceItemsRevision,
-                        nextSequenceIndex: session.nextSequenceIndex,
-                        runState: session.runState,
-                        selectedAgent: session.selectedAgent,
-                        hidePendingQuestionToolCall: session.hasPendingQuestionUI,
-                        projectionProtection: viewModel.transcriptProjectionProtection(for: session, transcript: session.transcript)
-                    )
-                }
                 // Read-only: the target's state while the catch-up import is computed but not installed.
-                var catchUps: [(reason: String, path: String, stamp: AgentModeViewModel.DerivedTranscriptSyncState?, delta: String, attempts: Int, successes: Int)] = []
+                var catchUps: [ColdActivationCatchUpAttempt] = []
+                var hydratedTranscriptBeforeCatchUp: AgentTranscript?
+                var hydratedBaseProjectionBeforeCatchUp: AgentTranscriptProjection?
+                var hydratedItemsBeforeCatchUp: [AgentChatItem]?
                 AgentTranscriptDebugInstrumentation.reset()
                 AgentTranscriptDebugInstrumentation.isEnabled = true
                 AgentTranscriptDebugInstrumentation.refreshAttemptHandler = { metrics in
@@ -1776,10 +1904,23 @@ final class AgentModeChatSwitchActivationTests: XCTestCase {
                         guard viewModel.currentTabID == tabID, let target = viewModel.sessions[tabID],
                               target.sourceItemsRevision == metrics.sourceItemsRevision
                         else { return }
+                        hydratedTranscriptBeforeCatchUp = target.transcript
+                        hydratedBaseProjectionBeforeCatchUp = target.baseTranscriptProjection
+                        hydratedItemsBeforeCatchUp = target.items
                         let stamp = target.derivedTranscriptSyncState
-                        let delta = AgentModeViewModel.DerivedTranscriptSyncState.diagnosticDeltaLabel(from: stamp, to: syncState(of: target))
+                        let delta = AgentModeViewModel.DerivedTranscriptSyncState.diagnosticDeltaLabel(
+                            from: stamp,
+                            to: self.coldCatchUpSyncState(of: target, in: viewModel)
+                        )
                         let performance = target.transcriptPerformanceSnapshot
-                        catchUps.append((metrics.reason, metrics.incrementalPath, stamp, delta, performance.incrementalImportAttemptCount, performance.incrementalImportSuccessCount))
+                        catchUps.append(.init(
+                            reason: metrics.reason,
+                            path: metrics.incrementalPath,
+                            stamp: stamp,
+                            delta: delta,
+                            attempts: performance.incrementalImportAttemptCount,
+                            successes: performance.incrementalImportSuccessCount
+                        ))
                     }
                 }
                 defer { AgentTranscriptDebugInstrumentation.reset() }
@@ -1791,27 +1932,8 @@ final class AgentModeChatSwitchActivationTests: XCTestCase {
                     try await Task.sleep(for: .milliseconds(5))
                 }
                 await Self.drainMainQueue()
-                XCTAssertEqual(session.persistedLoadDisposition, .applied)
 
-                XCTAssertEqual(catchUps.count, 1)
-                let catchUp = try XCTUnwrap(catchUps.first)
-                XCTAssertEqual(catchUp.reason, AgentModeViewModel.DerivedTranscriptRefreshReason.liveMutation.rawValue)
-                XCTAssertEqual(catchUp.stamp?.selectedAgent, .openCode, "Hydration stamps the normalized persisted provider")
-                XCTAssertEqual(catchUp.stamp?.runState, .idle, "Run state is still installed after the stamp")
-                XCTAssertEqual(catchUp.delta, "syncDelta.run")
-                XCTAssertEqual(catchUp.path, "incremental-success:no-frontier")
-                XCTAssertEqual(session.transcriptPerformanceSnapshot.incrementalImportAttemptCount - catchUp.attempts, 1)
-                XCTAssertEqual(session.transcriptPerformanceSnapshot.incrementalImportSuccessCount - catchUp.successes, 1)
-
-                // Sync: the catch-up leaves a reusable stamp for the completed state.
-                XCTAssertEqual(session.selectedAgent, .openCode)
-                XCTAssertEqual(session.runState, .completed)
-                XCTAssertEqual(session.derivedTranscriptSyncState, syncState(of: session))
                 let protection = viewModel.transcriptProjectionProtection(for: session, transcript: session.transcript)
-                XCTAssertTrue(viewModel.canReuseDerivedTranscriptForSave(for: session, projectionProtection: protection))
-
-                // Integrity: the hydrated items are the stored record; output equals a cold full reference.
-                XCTAssertEqual(session.items, persistedItems)
                 let rebuilt = AgentTranscriptIO.rebuiltTranscriptPreservingCompactedPrefix(
                     existingTranscript: AgentTranscript(),
                     workingItems: session.items,
@@ -1828,13 +1950,16 @@ final class AgentModeChatSwitchActivationTests: XCTestCase {
                     projectionProtection: protection,
                     isColdLoad: true
                 )
-                XCTAssertEqual(session.transcript, reference.transcript)
-                XCTAssertEqual(session.baseTranscriptProjection, reference.baseProjection)
-                XCTAssertEqual(session.fullTranscriptProjection, reference.fullProjection)
-                XCTAssertEqual(session.workingTranscriptProjection, reference.workingProjection)
-                XCTAssertEqual(session.transcriptProjectionCounts, reference.projectionCounts)
-                XCTAssertEqual(session.transcriptCanonicalVisibleRowCount, reference.canonicalVisibleRowCount)
-                XCTAssertEqual(session.transcriptAnalyticsSnapshot, reference.analyticsSnapshot)
+                return ColdActivationCatchUpObservation(
+                    session: session,
+                    persisted: persisted,
+                    persistedItems: persistedItems,
+                    catchUps: catchUps,
+                    transcriptBeforeCatchUp: hydratedTranscriptBeforeCatchUp,
+                    baseProjectionBeforeCatchUp: hydratedBaseProjectionBeforeCatchUp,
+                    itemsBeforeCatchUp: hydratedItemsBeforeCatchUp,
+                    reference: reference
+                )
             }
         }
 
