@@ -7146,24 +7146,25 @@ enum AgentTranscriptProjectionBuilder {
         return updatedTranscript
     }
 
-    fileprivate static func groupedHistoryWouldCollapse(
+    /// Whether full rendering at `detailedToolTailLimit` would emit grouped history for any span.
+    /// Equivalent to `groupedHistoryCollapsePlan(...) != nil` over `fullSpanLeafBlocks`: leaf
+    /// descriptors share their sorting, suppression, tool grouping, and conclusion dedup, and a
+    /// plan exists exactly when a span has more standalone-tool blocks than `max(0, limit)` (an
+    /// earlier tool always keeps the collapsed and grouped prefixes nonempty).
+    static func groupedHistoryWouldCollapse(
         in turn: AgentTranscriptTurn,
         detailedToolTailLimit: Int
     ) -> Bool {
         guard turn.retentionTier == .full else { return false }
+        let retainedToolBlockLimit = max(0, detailedToolTailLimit)
         var emittedConclusionActivityIDs = Set<UUID>()
         for span in turn.responseSpans {
-            let leafBlocks = fullSpanLeafBlocks(
+            let leafDescriptors = fullSpanLeafDescriptors(
                 for: span,
                 in: turn,
-                archived: false,
                 emittedConclusionActivityIDs: &emittedConclusionActivityIDs
             )
-            if groupedHistoryCollapsePlan(
-                in: leafBlocks,
-                spanID: span.id,
-                detailedToolTailLimit: detailedToolTailLimit
-            ) != nil {
+            if leafDescriptors.count(where: { $0.kind == .standaloneTool }) > retainedToolBlockLimit {
                 return true
             }
         }

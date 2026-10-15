@@ -193,7 +193,7 @@ Step D5 — done | rounds 1/2 | open: none | downgraded: none | assumed: focused
 
 Step D6-cluster-summary — done | rounds 0/2 | open: none; D6-cluster-summary-final.md | downgraded: none | assumed: lightweight group-order keys and shared post-merge name normalization; 19 tests pass on old and new implementation; both initial reviews no blockers | deferred: live latency qualification; unchanged summary formatter coverage per OracleB P3-2
 
-Step D6-collapse-predicate — todo | rounds 0/2 | open: lightweight structural predicate equivalence and review | downgraded: none | assumed: user-authorized item 2; no retention or persistent-cache semantic changes | deferred: live latency qualification
+Step D6-collapse-predicate — done | rounds 0/2 | open: none; D6-collapse-predicate-final.md | downgraded: none | assumed: per-span descriptor predicate matches unchanged rendering; 34 focused tests plus final 7 after coverage addition; both initial reviews no blockers | deferred: live latency qualification; existing leaf-walk consolidation and missing-metadata count per OracleB F1/F2
 
 Step D6-catchup-admission — doing | rounds 0/2 | open: identify post-hydration freshness/integrity trigger before any fix | downgraded: none | assumed: user-authorized item 3; preserve correctness guards | deferred: no speculative stamp repair
 

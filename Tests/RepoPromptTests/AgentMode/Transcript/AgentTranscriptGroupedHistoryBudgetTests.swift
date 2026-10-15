@@ -257,6 +257,180 @@ final class AgentTranscriptGroupedHistoryBudgetTests: XCTestCase {
         XCTAssertTrue(paired.projection.workingBlocks.contains { $0.kind == .groupedHistory })
     }
 
+    /// The lightweight collapse predicate must agree with whether the unchanged full render emits
+    /// grouped history, across limits and leaf-structure edges; non-full tiers never collapse.
+    func testGroupedHistoryCollapsePredicateMatchesFullRenderGroupedHistory() {
+        let limits = [Int.min, -1, 0, 1, 2, 3, Int.max]
+        let fixtures = collapsePredicateFixtures()
+        XCTAssertEqual(fixtures.count, 10)
+        for fixture in fixtures {
+            let rendered = limits.map { limit in
+                AgentTranscriptProjectionBuilder.blocks(
+                    for: fixture.turn,
+                    archived: false,
+                    detailedToolTailLimit: limit
+                ).contains { $0.kind == .groupedHistory }
+            }
+            let predicted = limits.map { limit in
+                AgentTranscriptProjectionBuilder.groupedHistoryWouldCollapse(in: fixture.turn, detailedToolTailLimit: limit)
+            }
+            XCTAssertEqual(predicted, rendered, "\(fixture.label): predicate matches full render")
+            XCTAssertEqual(rendered, fixture.expected, "\(fixture.label): full-render outcome per limit")
+            for tier in [AgentTranscriptRetentionTier.condensed, .summary, .archived] {
+                var nonFullTurn = fixture.turn
+                nonFullTurn.retentionTier = tier
+                XCTAssertFalse(
+                    limits.contains { AgentTranscriptProjectionBuilder.groupedHistoryWouldCollapse(in: nonFullTurn, detailedToolTailLimit: $0) },
+                    "\(fixture.label): \(tier) never collapses"
+                )
+            }
+        }
+    }
+
+    private struct CollapsePredicateFixture {
+        let label: String
+        let turn: AgentTranscriptTurn
+        /// Expected grouped-history emission for limits `[Int.min, -1, 0, 1, 2, 3, Int.max]`.
+        let expected: [Bool]
+    }
+
+    private func collapsePredicateFixtures() -> [CollapsePredicateFixture] {
+        let base = Date(timeIntervalSinceReferenceDate: 800_000_000)
+        func tool(
+            _ kind: AgentChatItemKind,
+            _ invocationID: UUID?,
+            sequence: Int,
+            at offset: TimeInterval? = nil,
+            hasExecution: Bool = true
+        ) -> AgentTranscriptActivity {
+            let item = AgentChatItem(
+                timestamp: base.addingTimeInterval(offset ?? TimeInterval(sequence)),
+                kind: kind,
+                text: "",
+                toolName: "read_file",
+                toolInvocationID: invocationID,
+                toolArgsJSON: #"{"path":"/tmp/file.swift"}"#,
+                toolResultJSON: kind == .toolResult ? #"{"content":"ok"}"# : nil,
+                sequenceIndex: sequence
+            )
+            let execution = hasExecution ? AgentTranscriptToolNormalizer.toolExecution(for: item) : nil
+            return AgentTranscriptActivity(from: item, toolExecution: execution)
+        }
+        func note(_ kind: AgentChatItemKind, _ text: String, sequence: Int, at offset: TimeInterval? = nil, id: UUID = UUID()) -> AgentTranscriptActivity {
+            AgentTranscriptActivity(from: AgentChatItem(
+                id: id,
+                timestamp: base.addingTimeInterval(offset ?? TimeInterval(sequence)),
+                kind: kind,
+                text: text,
+                sequenceIndex: sequence
+            ))
+        }
+        func turn(_ spans: [[AgentTranscriptActivity]], conclusionID: UUID? = nil) -> AgentTranscriptTurn {
+            AgentTranscriptTurn(
+                responseSpans: spans.map { AgentTranscriptProviderResponseSpan(lifecycle: .completed, startedAt: base, activities: $0) },
+                conclusionActivityID: conclusionID,
+                retentionTier: .full,
+                startedAt: base
+            )
+        }
+        let (a, b, c, d, e) = (UUID(), UUID(), UUID(), UUID(), UUID())
+        let conclusionID = UUID()
+        let conclusion = note(.assistant, "Final answer", sequence: 30, id: conclusionID)
+        let blankConclusion = note(.assistant, "   ", sequence: 3)
+        let suppressedToolRow = AgentChatItem(
+            timestamp: base.addingTimeInterval(2),
+            kind: .toolCall,
+            text: "",
+            toolName: "tool",
+            sequenceIndex: 2
+        )
+        let suppressedTool = AgentTranscriptActivity(
+            from: suppressedToolRow,
+            toolExecution: AgentTranscriptToolNormalizer.toolExecution(for: suppressedToolRow)
+        )
+        XCTAssertTrue(AgentTranscriptToolVisibilityPolicy.shouldSuppressActivity(suppressedTool))
+        let never = [false, false, false, false, false, false, false]
+        return [
+            .init(label: "no spans", turn: turn([]), expected: never),
+            .init(
+                label: "no tools",
+                turn: turn([[], [note(.assistant, "Looking", sequence: 1), note(.thinking, "Hmm", sequence: 2)]]),
+                expected: never
+            ),
+            .init(
+                label: "adjacent call/result pairs",
+                turn: turn([[
+                    tool(.toolCall, a, sequence: 1), tool(.toolResult, a, sequence: 2),
+                    tool(.toolCall, b, sequence: 3), tool(.toolResult, b, sequence: 4),
+                    tool(.toolCall, c, sequence: 5), tool(.toolResult, c, sequence: 6)
+                ]]),
+                expected: [true, true, true, true, true, false, false]
+            ),
+            .init(
+                // A visible assistant splits one execution; a suppressed (displayless) one does not.
+                label: "same execution separated by visible and suppressed rows",
+                turn: turn([[
+                    tool(.toolCall, a, sequence: 1), note(.assistant, "Between", sequence: 2), tool(.toolResult, a, sequence: 3),
+                    tool(.toolCall, b, sequence: 4), note(.assistant, "   ", sequence: 5), tool(.toolResult, b, sequence: 6)
+                ]]),
+                expected: [true, true, true, true, true, false, false]
+            ),
+            .init(
+                label: "suppressed tool and blank conclusion do not split an execution",
+                turn: turn([[
+                    tool(.toolCall, a, sequence: 1), suppressedTool, blankConclusion, tool(.toolResult, a, sequence: 4)
+                ]], conclusionID: blankConclusion.id),
+                expected: [true, true, true, false, false, false, false]
+            ),
+            .init(
+                // Adjacent tools without execution metadata share one block.
+                label: "missing execution metadata",
+                turn: turn([[
+                    tool(.toolCall, nil, sequence: 1, hasExecution: false),
+                    tool(.toolResult, nil, sequence: 2, hasExecution: false),
+                    note(.assistant, "Between", sequence: 3),
+                    tool(.toolCall, nil, sequence: 4, hasExecution: false)
+                ]]),
+                expected: [true, true, true, true, false, false, false]
+            ),
+            .init(
+                // Stored out of order; the sequence-3 tie resolves by timestamp (assistant first).
+                label: "unsorted and tied activities",
+                turn: turn([[
+                    tool(.toolResult, b, sequence: 4),
+                    tool(.toolResult, a, sequence: 2),
+                    tool(.toolCall, b, sequence: 3, at: 3.5),
+                    tool(.toolCall, a, sequence: 1),
+                    note(.assistant, "Between", sequence: 3, at: 3)
+                ]]),
+                expected: [true, true, true, true, false, false, false]
+            ),
+            .init(
+                label: "leading assistant buffered",
+                turn: turn([[note(.assistant, "Plan", sequence: 1), tool(.toolCall, a, sequence: 2), tool(.toolCall, b, sequence: 3)]]),
+                expected: [true, true, true, true, false, false, false]
+            ),
+            .init(
+                label: "leading assistant with progress",
+                turn: turn([[
+                    note(.assistant, "Plan", sequence: 1), tool(.toolCall, a, sequence: 2),
+                    note(.thinking, "Hmm", sequence: 3), tool(.toolCall, b, sequence: 4)
+                ]]),
+                expected: [true, true, true, true, false, false, false]
+            ),
+            .init(
+                // Per-span budgets: 2 + 3 tool blocks never collapse at limit 3. The conclusion and its
+                // duplicate in the second span both split the surrounding execution.
+                label: "multi-span with duplicate conclusion",
+                turn: turn([
+                    [tool(.toolCall, d, sequence: 10), conclusion, tool(.toolResult, d, sequence: 31)],
+                    [tool(.toolCall, e, sequence: 29), conclusion, tool(.toolResult, e, sequence: 32), tool(.toolCall, a, sequence: 33)]
+                ], conclusionID: conclusionID),
+                expected: [true, true, true, true, true, false, false]
+            )
+        ]
+    }
+
     /// Compares the old sequential refresh + build with the paired storage entry on the same
     /// persistence-sanitized input; returns the paired entry's prepared-leaf turn count, which
     /// must equal the input's eligible (full, completed, no open span) turn count.
