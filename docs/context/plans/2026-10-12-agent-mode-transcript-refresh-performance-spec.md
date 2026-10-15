@@ -191,11 +191,13 @@ Step D5 — done | rounds 1/2 | open: none | downgraded: none | assumed: focused
 
 ### D6 — Sidebar: one build per render pass
 
-Step D6-cluster-summary — done | rounds 0/2 | open: none; D6-cluster-summary-final.md | downgraded: none | assumed: lightweight group-order keys and shared post-merge name normalization; 19 tests pass on old and new implementation; both initial reviews no blockers | deferred: live latency qualification; unchanged summary formatter coverage per OracleB P3-2
+Step D6-cluster-summary — done | rounds 0/2 | open: none; D6-cluster-summary-final.md; D6-helper-optimizations-live.md | downgraded: none | assumed: lightweight group-order keys and shared post-merge name normalization; 19 tests pass on old and new implementation; both initial reviews no blockers; installed a014dc59 sampled helper CPU lower | deferred: matched latency/RSS qualification; unchanged summary formatter coverage per OracleB P3-2
 
-Step D6-collapse-predicate — done | rounds 0/2 | open: none; D6-collapse-predicate-final.md | downgraded: none | assumed: per-span descriptor predicate matches unchanged rendering; 34 focused tests plus final 7 after coverage addition; both initial reviews no blockers | deferred: live latency qualification; existing leaf-walk consolidation and missing-metadata count per OracleB F1/F2
+Step D6-collapse-predicate — done | rounds 0/2 | open: none; D6-collapse-predicate-final.md; D6-helper-optimizations-live.md | downgraded: none | assumed: descriptor equivalence; 34 focused tests plus final 7; both initial reviews no blockers; installed stacks show no render/digest ancestry beneath eligibility | deferred: matched latency/RSS qualification; existing leaf-walk consolidation and missing-metadata count per OracleB F1/F2
 
 Step D6-catchup-admission — done | rounds 0/2 | open: none; D6-catchup-admission-final.md | downgraded: none | assumed: test-only investigation; four run-state fixtures reproduce run-stamp admission and cancelled/failed source reconciliation; 2 changed tests pass; both initial reviews no blockers | deferred: exact live admission reason, broader equivalence and any production catch-up elimination; correctness guards retained
+
+Step D6-helper-optimizations-live — done | rounds 0/2 | open: none; D6-helper-optimizations-live.md | downgraded: none | assumed: installed a014dc59 verified; six switches/one creation; cold1267.4ms, prep1078.9ms, helper CPU401ms, new647.9ms; native120.712s/main27.33%; four hang events/160hitches | deferred: targets, matched causal/p95/RSS qualification, remaining normalization and UI ownership; no guard bypass
 
 Step D6-early-start-live — done | rounds 0/2 | open: none; D6-early-start-live.md | downgraded: none | assumed: installed317d8df4 verified; 15 activations/one new session joined; cold1658.2ms/warm28.0ms/new908.1ms; native120.810s, main31.18%, severe2372.7ms | deferred: responsiveness targets, matched W1/W2/RSS, cold normalization/presentation overlap and UI source ownership; no persistent sidebar memo or prefetch
 
