@@ -191,6 +191,8 @@ Step D5 — done | rounds 1/2 | open: none | downgraded: none | assumed: focused
 
 ### D6 — Sidebar: one build per render pass
 
+Step D6-structural-visibility — done | rounds 0/2 | open: none; D6-structural-visibility-final.md | downgraded: none | assumed: exact-ID query supports all tiers via existing authorities; initial A/B approve; combined187 plus final30 tests; synthetic DEBUG1500-item prep660.3→619.5ms | deferred: live latency/RSS, shared split consolidation and global counter isolation per final evidence
+
 Step D6-unused-language-inventory — done | rounds 0/2 | open: none; D6-recount-inventory-final.md | downgraded: none | assumed: unused inventory removed; selected/empty real-store red-green proof; final140 tests and independent reviews passed; prior176.4ms envelope includes34ms inventory CPU, not promised gain | deferred: live latency/RSS, exact sidebar publisher attribution and larger cold-pass redesign
 
 Step D6-activation-publication-coherence — done | rounds 1/2 | open: none; D6-recount-inventory-final.md | downgraded: none | assumed: captured approval refresh fenced until binding commit; duplicate same-tab activation preserves owner; nonnil approval and duplicate-notification red-green tests; final140 tests and exact A/B delta reviews no blockers | deferred: live frequency/gain, R2 entry-counter coverage and unproven nil/replacement orphan paths per final evidence

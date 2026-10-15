@@ -63,10 +63,27 @@ enum AgentTranscriptPolicyPipeline {
         }
     }
 
+    #if DEBUG
+        /// Test-only reference mode: derive the initial visible tool-result IDs from a full
+        /// projection build, as before the structural query, for differential comparison.
+        @TaskLocal static var derivesInitialVisibilityFromProjection = false
+    #endif
+
+    /// The tool-result rows visible in `build(from: transcript)`; the structural query avoids
+    /// constructing that projection, which only this ID set would read.
+    private static func initialVisibleToolResultRowIDs(for transcript: AgentTranscript) -> Set<UUID> {
+        #if DEBUG
+            if derivesInitialVisibilityFromProjection {
+                return AgentTranscriptProjectionBuilder.visibleToolResultRowIDs(
+                    in: AgentTranscriptProjectionBuilder.build(from: transcript)
+                )
+            }
+        #endif
+        return AgentTranscriptProjectionBuilder.visibleToolResultRowIDs(for: transcript)
+    }
+
     private static func materializeRuntimeTranscript(_ transcript: AgentTranscript) -> Result {
-        var visibleToolResultRowIDs = AgentTranscriptProjectionBuilder.visibleToolResultRowIDs(
-            in: AgentTranscriptProjectionBuilder.build(from: transcript)
-        )
+        var visibleToolResultRowIDs = initialVisibleToolResultRowIDs(for: transcript)
         var finalMetrics = AgentToolResultPersistencePolicy.sanitizeTranscriptWithMetrics(
             transcript,
             preservedVisibleToolResultRowIDs: visibleToolResultRowIDs,

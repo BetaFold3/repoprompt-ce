@@ -287,6 +287,229 @@ final class AgentTranscriptGroupedHistoryBudgetTests: XCTestCase {
         }
     }
 
+    /// The structural visible tool-result query equals the IDs read from a full projection build
+    /// across tiers, frozen ceilings, newest-first allocation, and leaf-structure edges.
+    func testStructuralVisibleToolResultRowIDsMatchProjectionBuild() throws {
+        var collapsedFixtureCount = 0
+        @discardableResult
+        func assertMatches(_ transcript: AgentTranscript, _ label: String, file: StaticString = #filePath, line: UInt = #line) -> Set<UUID> {
+            let expected = AgentTranscriptProjectionBuilder.visibleToolResultRowIDs(
+                in: AgentTranscriptProjectionBuilder.build(from: transcript)
+            )
+            XCTAssertEqual(AgentTranscriptProjectionBuilder.visibleToolResultRowIDs(for: transcript), expected, label, file: file, line: line)
+            let allToolResultIDs = Set(transcript.turns.flatMap(\.allActivities).filter { $0.itemKind == .toolResult }.map(\.id))
+            if expected.count < allToolResultIDs.count { collapsedFixtureCount += 1 }
+            return expected
+        }
+
+        var newerSequenceIndex = 100
+        let newerTurn = try XCTUnwrap(AgentTranscriptIO.buildTranscript(
+            from: makeTurnItems(label: "newer", toolCount: 6, sequenceIndex: &newerSequenceIndex),
+            terminalState: .completed,
+            nextSequenceIndex: newerSequenceIndex,
+            compact: false
+        ).turns.first)
+        for fixture in collapsePredicateFixtures() + conclusionToolResultFixtures() {
+            for tier in [AgentTranscriptRetentionTier.full, .condensed, .summary, .archived] {
+                for frozen in [nil, -1, 0, 1, 2, Int.max] as [Int?] {
+                    var turn = fixture.turn
+                    turn.retentionTier = tier
+                    turn.frozenDetailedToolTailLimit = frozen
+                    let label = "\(fixture.label) \(tier) frozen=\(String(describing: frozen))"
+                    assertMatches(AgentTranscript(turns: [turn], nextSequenceIndex: 200), label)
+                    assertMatches(AgentTranscript(turns: [turn, newerTurn], nextSequenceIndex: 200), "\(label) behind newer turn")
+                }
+            }
+        }
+
+        // Non-vacuous fallback: in summary and archived tiers the suppressed tool-result conclusion is
+        // visible only through the `conclusionRow` fallback, which keeps its activity ID and kind.
+        let suppressedFixture = try XCTUnwrap(conclusionToolResultFixtures().first { $0.label == "suppressed tool-result conclusion" })
+        let suppressedConclusionID = try XCTUnwrap(suppressedFixture.turn.conclusionActivityID)
+        for tier in [AgentTranscriptRetentionTier.summary, .archived] {
+            var turn = suppressedFixture.turn
+            turn.retentionTier = tier
+            XCTAssertTrue(
+                assertMatches(AgentTranscript(turns: [turn], nextSequenceIndex: 200), "suppressed fallback \(tier)")
+                    .contains(suppressedConclusionID),
+                "\(tier): the fallback conclusion row is a visible tool result"
+            )
+        }
+
+        let mixed = makeMixedTierTranscript()
+        assertMatches(mixed, "mixed tiers")
+        assertMatches(
+            AgentTranscriptProjectionBuilder.refreshCompletedFullTurnGroupedHistoryCaches(in: mixed),
+            "mixed tiers with frozen limits"
+        )
+        var sequenceIndex = 0
+        let olderItems = makeTurnItems(label: "older", toolCount: 20, sequenceIndex: &sequenceIndex)
+        let newerItems = makeTurnItems(label: "newer", toolCount: 2, sequenceIndex: &sequenceIndex)
+        let twoTurns = AgentTranscriptIO.buildTranscript(
+            from: olderItems + newerItems,
+            terminalState: .completed,
+            nextSequenceIndex: sequenceIndex,
+            compact: false
+        )
+        let visible = assertMatches(twoTurns, "two turns sharing the global tail")
+        XCTAssertEqual(visible.count, 8, "The newest-first allocation keeps 8 detailed tool executions")
+        let compacted = AgentTranscriptCompactor.compact(
+            AgentTranscriptIO.buildTranscript(
+                from: (0 ..< 30).flatMap { makeTurnItems(label: "turn \($0)", toolCount: 6, sequenceIndex: &sequenceIndex) },
+                terminalState: .completed,
+                nextSequenceIndex: sequenceIndex,
+                compact: false
+            ),
+            protection: .none
+        )
+        XCTAssertGreaterThan(Set(compacted.turns.map(\.retentionTier)).count, 1, "Compaction produces mixed tiers")
+        assertMatches(compacted, "compacted multi-turn")
+        assertMatches(AgentTranscriptPolicyPipeline.runtimeTranscript(compacted).transcript, "runtime-materialized multi-turn")
+        XCTAssertGreaterThan(collapsedFixtureCount, 0, "Fixtures hide some tool results")
+    }
+
+    /// The runtime and handoff pipelines produce identical outputs with structural initial visibility
+    /// and the projection reference, and the structural mode skips exactly the initial build.
+    func testRuntimePipelineStructuralInitialVisibilityMatchesProjectionReference() {
+        let buildCounter = ProjectionBuildCounter()
+        AgentTranscriptDebugInstrumentation.reset()
+        AgentTranscriptDebugInstrumentation.isEnabled = true
+        AgentTranscriptDebugInstrumentation.projectionBuildHandler = { _ in buildCounter.increment() }
+        defer { AgentTranscriptDebugInstrumentation.reset() }
+
+        var sequenceIndex = 0
+        let multiTurn = AgentTranscriptCompactor.compact(
+            AgentTranscriptIO.buildTranscript(
+                from: (0 ..< 30).flatMap { makeTurnItems(label: "turn \($0)", toolCount: 6, sequenceIndex: &sequenceIndex) },
+                terminalState: .completed,
+                nextSequenceIndex: sequenceIndex,
+                compact: false
+            ),
+            protection: .none
+        )
+        let fixtures: [(String, AgentTranscript)] = [
+            ("mixed tiers", makeMixedTierTranscript()),
+            ("compacted multi-turn", multiTurn),
+            ("empty", AgentTranscript())
+        ]
+        for (label, transcript) in fixtures {
+            func materialize(reference: Bool, _ body: () -> AgentTranscriptPolicyPipeline.Result) -> (AgentTranscriptPolicyPipeline.Result, Int) {
+                let before = buildCounter.value
+                let result = AgentTranscriptPolicyPipeline.$derivesInitialVisibilityFromProjection.withValue(reference, operation: body)
+                return (result, buildCounter.value - before)
+            }
+            let lastRowID = transcript.turns.last?.allActivities.last?.id
+            for (purpose, body) in [
+                ("runtime", { AgentTranscriptPolicyPipeline.runtimeTranscript(transcript) }),
+                ("handoff", { AgentTranscriptPolicyPipeline.handoffTranscript(from: transcript, upToRowID: nil) }),
+                ("handoff cutoff", { AgentTranscriptPolicyPipeline.handoffTranscript(from: transcript, upToRowID: lastRowID) })
+            ] as [(String, () -> AgentTranscriptPolicyPipeline.Result)] {
+                let (reference, referenceBuilds) = materialize(reference: true, body)
+                let (candidate, candidateBuilds) = materialize(reference: false, body)
+                let context = "\(label) \(purpose)"
+                XCTAssertEqual(candidate.transcript, reference.transcript, context)
+                XCTAssertEqual(
+                    candidate.transcript.turns.map(\.frozenDetailedToolTailLimit),
+                    reference.transcript.turns.map(\.frozenDetailedToolTailLimit),
+                    context
+                )
+                XCTAssertEqual(
+                    candidate.transcript.turns.flatMap { $0.responseSpans.map(\.fullRenderGroupedHistoryCache) },
+                    reference.transcript.turns.flatMap { $0.responseSpans.map(\.fullRenderGroupedHistoryCache) },
+                    context
+                )
+                XCTAssertEqual(candidate.projection, reference.projection, context)
+                XCTAssertEqual(candidate.visibleToolResultRowIDs, reference.visibleToolResultRowIDs, context)
+                XCTAssertEqual(candidate.sanitizedActivityCount, reference.sanitizedActivityCount, context)
+                XCTAssertEqual(candidate.retainedFullDetailBytes, reference.retainedFullDetailBytes, context)
+                XCTAssertEqual(candidateBuilds, referenceBuilds - 1, "\(context): only the initial build is removed")
+            }
+        }
+        XCTAssertFalse(
+            AgentTranscriptPolicyPipeline.runtimeTranscript(multiTurn).visibleToolResultRowIDs.isEmpty,
+            "Runtime materialization preserves visible tool results"
+        )
+    }
+
+    private final class ProjectionBuildCounter: @unchecked Sendable {
+        private let lock = NSLock()
+        private var count = 0
+        var value: Int {
+            lock.withLock { count }
+        }
+
+        func increment() {
+            lock.withLock { count += 1 }
+        }
+    }
+
+    /// Turns whose conclusion is a tool result: emitted leaf, suppressed (so only the turn's
+    /// `conclusionRow` fallback can show it), and absent. These fixtures feed only the ID-equality
+    /// test; their `expected` field is unused and left empty.
+    private func conclusionToolResultFixtures() -> [CollapsePredicateFixture] {
+        let base = Date(timeIntervalSinceReferenceDate: 800_000_000)
+        func activity(
+            _ kind: AgentChatItemKind,
+            toolName: String,
+            text: String,
+            invocationID: UUID = UUID(),
+            hasPayload: Bool = true,
+            sequence: Int
+        ) -> AgentTranscriptActivity {
+            let item = AgentChatItem(
+                timestamp: base.addingTimeInterval(TimeInterval(sequence)),
+                kind: kind,
+                text: text,
+                toolName: toolName,
+                toolInvocationID: invocationID,
+                toolArgsJSON: hasPayload ? #"{"path":"/tmp/file.swift"}"# : nil,
+                toolResultJSON: hasPayload && kind == .toolResult ? #"{"content":"ok"}"# : nil,
+                sequenceIndex: sequence
+            )
+            return AgentTranscriptActivity(from: item, toolExecution: AgentTranscriptToolNormalizer.toolExecution(for: item))
+        }
+        func turn(conclusion: AgentTranscriptActivity, summary: AgentTranscriptTurnSummary? = nil) -> AgentTranscriptTurn {
+            var activities: [AgentTranscriptActivity] = []
+            for index in 0 ..< 4 {
+                let invocationID = UUID()
+                activities.append(activity(.toolCall, toolName: "read_file", text: "", invocationID: invocationID, sequence: index * 2))
+                activities.append(activity(.toolResult, toolName: "read_file", text: "", invocationID: invocationID, sequence: index * 2 + 1))
+            }
+            activities.append(conclusion)
+            return AgentTranscriptTurn(
+                responseSpans: [AgentTranscriptProviderResponseSpan(lifecycle: .completed, startedAt: base, activities: activities)],
+                conclusionActivityID: conclusion.id,
+                summary: summary,
+                startedAt: base
+            )
+        }
+        let emittedConclusion = activity(.toolResult, toolName: "read_file", text: "Visible conclusion", sequence: 20)
+        // A placeholder-named result with no args, result, or text is suppressed by the existing policy;
+        // the summary's conclusion text lets `conclusionRow` still produce a row for it.
+        let suppressedConclusion = activity(.toolResult, toolName: "tool", text: "", hasPayload: false, sequence: 20)
+        XCTAssertFalse(AgentTranscriptToolVisibilityPolicy.shouldSuppressActivity(emittedConclusion))
+        XCTAssertTrue(AgentTranscriptToolVisibilityPolicy.shouldSuppressActivity(suppressedConclusion))
+        let summary = AgentTranscriptTurnSummary(
+            requestText: nil,
+            conclusionText: "Summarized conclusion",
+            compactConclusionText: nil,
+            middleSummaryText: nil,
+            toolCount: 5,
+            notableToolNames: [],
+            keyPaths: [],
+            compactedActivityCount: 0,
+            hadWarning: false,
+            hadError: false
+        )
+        var missing = turn(conclusion: activity(.toolResult, toolName: "read_file", text: "Visible conclusion", sequence: 20))
+        missing.conclusionActivityID = UUID()
+        return [
+            .init(label: "tool-result conclusion", turn: turn(conclusion: emittedConclusion), expected: []),
+            .init(label: "suppressed tool-result conclusion", turn: turn(conclusion: suppressedConclusion, summary: summary), expected: []),
+            .init(label: "missing conclusion activity", turn: missing, expected: [])
+        ]
+    }
+
     private struct CollapsePredicateFixture {
         let label: String
         let turn: AgentTranscriptTurn

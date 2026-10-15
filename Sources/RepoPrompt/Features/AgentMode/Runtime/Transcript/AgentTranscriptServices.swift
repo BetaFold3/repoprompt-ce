@@ -1609,15 +1609,19 @@ private struct CollapsibleLeafDescriptor {
     let kind: AgentTranscriptRenderBlockKind
     let rowCount: Int
     let containsProgressNote: Bool
+    /// IDs of this leaf's `.toolResult` rows; recorded only when requested, otherwise empty.
+    let toolResultActivityIDs: [UUID]
 
     init(
         kind: AgentTranscriptRenderBlockKind,
         rowCount: Int,
-        containsProgressNote: Bool = false
+        containsProgressNote: Bool = false,
+        toolResultActivityIDs: [UUID] = []
     ) {
         self.kind = kind
         self.rowCount = rowCount
         self.containsProgressNote = containsProgressNote
+        self.toolResultActivityIDs = toolResultActivityIDs
     }
 }
 
@@ -6861,6 +6865,58 @@ enum AgentTranscriptProjectionBuilder {
         return ids
     }
 
+    /// Equals `visibleToolResultRowIDs(in: build(from: transcript))` without the full render graph:
+    /// no render blocks, grouped-history summaries or sections, or full-tier activity rows. (Archived
+    /// `compactedRows` and the conclusion fallback still construct their few small rows.) Shares the build's newest-first
+    /// detailed-tool allocation (including frozen ceilings), leaf descriptors (sorting, suppression,
+    /// tool grouping, conclusion dedup), and the counts' collapse split:
+    /// - full turns show their emitted conclusions and the content leaves from the detailed split;
+    /// - condensed and summary turns group all span content and show only emitted conclusions;
+    /// - either falls back to the turn's conclusion row when no span emitted a conclusion;
+    /// - archived turns show `compactedRows`.
+    static func visibleToolResultRowIDs(for transcript: AgentTranscript) -> Set<UUID> {
+        let detailedToolTailLimits = detailedToolTailLimits(for: transcript)
+        var ids = Set<UUID>()
+        for turn in transcript.turns {
+            guard turn.retentionTier != .archived else {
+                for row in compactedRows(for: turn) where row.kind == .toolResult {
+                    ids.insert(row.id)
+                }
+                continue
+            }
+            let showsDetailedContent = turn.retentionTier == .full
+            let detailedToolTailLimit = detailedToolTailLimits[turn.id] ?? 0
+            var emittedConclusionActivityIDs = Set<UUID>()
+            for span in turn.responseSpans {
+                let leafDescriptors = fullSpanLeafDescriptors(
+                    for: span,
+                    in: turn,
+                    emittedConclusionActivityIDs: &emittedConclusionActivityIDs,
+                    recordsToolResultActivityIDs: true
+                )
+                for descriptor in leafDescriptors where descriptor.kind == .conclusion {
+                    ids.formUnion(descriptor.toolResultActivityIDs)
+                }
+                guard showsDetailedContent else { continue }
+                let contentDescriptors = leafDescriptors.filter { $0.kind != .conclusion }
+                let detailedStartIndex = collapsedDetailedStartIndex(
+                    in: contentDescriptors,
+                    detailedToolTailLimit: detailedToolTailLimit
+                ) ?? 0
+                for descriptor in contentDescriptors[detailedStartIndex...] {
+                    ids.formUnion(descriptor.toolResultActivityIDs)
+                }
+            }
+            if emittedConclusionActivityIDs.isEmpty,
+               let conclusionRow = conclusionRow(for: turn),
+               conclusionRow.kind == .toolResult
+            {
+                ids.insert(conclusionRow.id)
+            }
+        }
+        return ids
+    }
+
     static func blocks(for transcript: AgentTranscript) -> [AgentTranscriptRenderBlock] {
         let context = AgentTranscriptProjectionBuildContext()
         let detailedToolTailLimits = detailedToolTailLimits(for: transcript)
@@ -7564,10 +7620,14 @@ enum AgentTranscriptProjectionBuilder {
         return kinds
     }
 
+    /// Mirrors `fullSpanLeafBlocks` (sorting, suppression, tool grouping, conclusion dedup) without
+    /// constructing activity rows or render blocks. With `recordsToolResultActivityIDs`, each descriptor also lists
+    /// the IDs of the `.toolResult` rows its block would contain.
     private static func fullSpanLeafDescriptors(
         for span: AgentTranscriptProviderResponseSpan,
         in turn: AgentTranscriptTurn,
-        emittedConclusionActivityIDs: inout Set<UUID>
+        emittedConclusionActivityIDs: inout Set<UUID>,
+        recordsToolResultActivityIDs: Bool = false
     ) -> [CollapsibleLeafDescriptor] {
         let orderedActivities = span.activities.sorted { lhs, rhs in
             if lhs.sequenceIndex == rhs.sequenceIndex {
@@ -7578,12 +7638,22 @@ enum AgentTranscriptProjectionBuilder {
         var descriptors: [CollapsibleLeafDescriptor] = []
         var currentToolExecutionID: String?
         var currentToolRowCount = 0
+        var currentToolResultActivityIDs: [UUID] = []
+
+        func toolResultActivityIDs(of activity: AgentTranscriptActivity) -> [UUID] {
+            recordsToolResultActivityIDs && activity.itemKind == .toolResult ? [activity.id] : []
+        }
 
         func flushStandaloneToolDescriptor() {
             guard currentToolRowCount > 0 else { return }
-            descriptors.append(.init(kind: .standaloneTool, rowCount: currentToolRowCount))
+            descriptors.append(.init(
+                kind: .standaloneTool,
+                rowCount: currentToolRowCount,
+                toolResultActivityIDs: currentToolResultActivityIDs
+            ))
             currentToolExecutionID = nil
             currentToolRowCount = 0
+            currentToolResultActivityIDs = []
         }
 
         for activity in orderedActivities {
@@ -7592,7 +7662,11 @@ enum AgentTranscriptProjectionBuilder {
             case .conclusion:
                 flushStandaloneToolDescriptor()
                 if emittedConclusionActivityIDs.insert(activity.id).inserted {
-                    descriptors.append(.init(kind: .conclusion, rowCount: 1))
+                    descriptors.append(.init(
+                        kind: .conclusion,
+                        rowCount: 1,
+                        toolResultActivityIDs: toolResultActivityIDs(of: activity)
+                    ))
                 }
             case .standaloneTool:
                 let stableExecutionID = activity.toolExecution?.stableExecutionID
@@ -7600,10 +7674,12 @@ enum AgentTranscriptProjectionBuilder {
                    currentToolExecutionID == stableExecutionID
                 {
                     currentToolRowCount += 1
+                    currentToolResultActivityIDs.append(contentsOf: toolResultActivityIDs(of: activity))
                 } else {
                     flushStandaloneToolDescriptor()
                     currentToolExecutionID = stableExecutionID
                     currentToolRowCount = 1
+                    currentToolResultActivityIDs = toolResultActivityIDs(of: activity)
                 }
             case .standaloneAssistant:
                 flushStandaloneToolDescriptor()
@@ -7658,44 +7734,18 @@ enum AgentTranscriptProjectionBuilder {
         let conclusionBlockCount = conclusionDescriptors.count
         let conclusionRowCount = conclusionDescriptors.reduce(0) { $0 + $1.rowCount }
         let contentDescriptors = leafDescriptors.filter { $0.kind != .conclusion }
-        let toolIndices = contentDescriptors.indices.filter { contentDescriptors[$0].kind == .standaloneTool }
-        guard !toolIndices.isEmpty else {
+        guard let detailedStartIndex = collapsedDetailedStartIndex(
+            in: contentDescriptors,
+            detailedToolTailLimit: detailedToolTailLimit
+        ) else {
             return .init(
                 visibleBlockCount: contentDescriptors.count + conclusionBlockCount,
                 visibleRowCount: contentDescriptors.reduce(0) { $0 + $1.rowCount } + conclusionRowCount
             )
-        }
-
-        let detailedStartIndex: Int
-        if detailedToolTailLimit <= 0 {
-            detailedStartIndex = contentDescriptors.count
-        } else {
-            guard toolIndices.count > detailedToolTailLimit else {
-                return .init(
-                    visibleBlockCount: contentDescriptors.count + conclusionBlockCount,
-                    visibleRowCount: contentDescriptors.reduce(0) { $0 + $1.rowCount } + conclusionRowCount
-                )
-            }
-            let firstKeptToolIndex = toolIndices[toolIndices.count - detailedToolTailLimit]
-            var computedDetailedStartIndex = firstKeptToolIndex
-            while computedDetailedStartIndex > 0 {
-                let previousDescriptor = contentDescriptors[computedDetailedStartIndex - 1]
-                if previousDescriptor.kind == .standaloneTool {
-                    break
-                }
-                computedDetailedStartIndex -= 1
-            }
-            detailedStartIndex = computedDetailedStartIndex
         }
 
         let collapsedPrefix = contentDescriptors.prefix(detailedStartIndex)
         let detailedSuffix = contentDescriptors.dropFirst(detailedStartIndex)
-        guard !collapsedPrefix.isEmpty else {
-            return .init(
-                visibleBlockCount: contentDescriptors.count + conclusionBlockCount,
-                visibleRowCount: contentDescriptors.reduce(0) { $0 + $1.rowCount } + conclusionRowCount
-            )
-        }
 
         let bufferedLeadingDescriptor = shouldBufferLeadingAssistant(in: collapsedPrefix)
             ? collapsedPrefix.first
@@ -7707,6 +7757,40 @@ enum AgentTranscriptProjectionBuilder {
                 + detailedSuffix.reduce(0) { $0 + $1.rowCount }
                 + conclusionRowCount
         )
+    }
+
+    /// Descriptor form of `groupedHistoryCollapsePlan`'s split: the index of the first content
+    /// leaf kept in detail, or nil when the span keeps every content leaf visible (no tool leaf,
+    /// tool count within a positive limit, or an empty collapsed prefix).
+    /// Keep in sync with `groupedHistoryCollapsePlan`: the block and descriptor splits are separate
+    /// implementations, and runtime raw-payload retention relies on their agreement. The guard is
+    /// `AgentTranscriptGroupedHistoryBudgetTests.testStructuralVisibleToolResultRowIDsMatchProjectionBuild`
+    /// (and the counts-versus-projection coverage).
+    private static func collapsedDetailedStartIndex(
+        in contentDescriptors: [CollapsibleLeafDescriptor],
+        detailedToolTailLimit: Int
+    ) -> Int? {
+        let toolIndices = contentDescriptors.indices.filter { contentDescriptors[$0].kind == .standaloneTool }
+        guard !toolIndices.isEmpty else { return nil }
+
+        let detailedStartIndex: Int
+        if detailedToolTailLimit <= 0 {
+            detailedStartIndex = contentDescriptors.count
+        } else {
+            guard toolIndices.count > detailedToolTailLimit else { return nil }
+            let firstKeptToolIndex = toolIndices[toolIndices.count - detailedToolTailLimit]
+            var computedDetailedStartIndex = firstKeptToolIndex
+            while computedDetailedStartIndex > 0 {
+                let previousDescriptor = contentDescriptors[computedDetailedStartIndex - 1]
+                if previousDescriptor.kind == .standaloneTool {
+                    break
+                }
+                computedDetailedStartIndex -= 1
+            }
+            detailedStartIndex = computedDetailedStartIndex
+        }
+        guard detailedStartIndex > 0 else { return nil }
+        return detailedStartIndex
     }
 
     private static func filteredRowAnchorIndex(
