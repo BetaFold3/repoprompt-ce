@@ -191,6 +191,10 @@ Step D5 — done | rounds 1/2 | open: none | downgraded: none | assumed: focused
 
 ### D6 — Sidebar: one build per render pass
 
+Step D6-unused-language-inventory — done | rounds 0/2 | open: none; D6-recount-inventory-final.md | downgraded: none | assumed: unused inventory removed; selected/empty real-store red-green proof; final140 tests and independent reviews passed; prior176.4ms envelope includes34ms inventory CPU, not promised gain | deferred: live latency/RSS, exact sidebar publisher attribution and larger cold-pass redesign
+
+Step D6-activation-publication-coherence — done | rounds 1/2 | open: none; D6-recount-inventory-final.md | downgraded: none | assumed: captured approval refresh fenced until binding commit; duplicate same-tab activation preserves owner; nonnil approval and duplicate-notification red-green tests; final140 tests and exact A/B delta reviews no blockers | deferred: live frequency/gain, R2 entry-counter coverage and unproven nil/replacement orphan paths per final evidence
+
 Step D6-cluster-summary — done | rounds 0/2 | open: none; D6-cluster-summary-final.md; D6-helper-optimizations-live.md | downgraded: none | assumed: lightweight group-order keys and shared post-merge name normalization; 19 tests pass on old and new implementation; both initial reviews no blockers; installed a014dc59 sampled helper CPU lower | deferred: matched latency/RSS qualification; unchanged summary formatter coverage per OracleB P3-2
 
 Step D6-collapse-predicate — done | rounds 0/2 | open: none; D6-collapse-predicate-final.md; D6-helper-optimizations-live.md | downgraded: none | assumed: descriptor equivalence; 34 focused tests plus final 7; both initial reviews no blockers; installed stacks show no render/digest ancestry beneath eligibility | deferred: matched latency/RSS qualification; existing leaf-walk consolidation and missing-metadata count per OracleB F1/F2

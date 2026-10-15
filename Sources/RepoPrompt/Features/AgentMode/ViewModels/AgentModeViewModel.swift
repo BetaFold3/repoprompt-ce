@@ -3844,14 +3844,23 @@ final class AgentModeViewModel: ObservableObject {
     // MARK: - Tab Management
 
     private func onTabChanged(_ tabID: UUID?, allowDuringWorkspaceSwitch: Bool = false) {
-        sessionActivationGeneration &+= 1
+        let shouldDeferForWorkspaceSwitch = !allowDuringWorkspaceSwitch && workspaceManager?.isSwitchingWorkspace == true
+        // A repeated activation of the already-processed tab returns at the same-tab guard below.
+        // It keeps the in-flight activation as owner, so it must not advance the generation that
+        // owner's cold task checks before committing its binding and clearing the load marker.
+        let isRepeatedActivation = tabID != nil
+            && tabID == lastProcessedTabID
+            && !shouldDeferForWorkspaceSwitch
+            && isAgentModeActive
+        if !isRepeatedActivation {
+            sessionActivationGeneration &+= 1
+        }
         let activationGeneration = sessionActivationGeneration
         #if DEBUG || EDIT_FLOW_PERF
             if let tabID {
                 AgentInteractionLatencyProbe.tabActivationHandlerEntered(tabID: tabID, windowID: windowID)
             }
         #endif
-        let shouldDeferForWorkspaceSwitch = !allowDuringWorkspaceSwitch && workspaceManager?.isSwitchingWorkspace == true
         // Opening a session is the canonical "I've seen it" interaction —
         // clear any unseen-run-state badge the sidebar had queued for it.
         // Runs for every tab activation path (click, keyboard shortcut,
@@ -3883,7 +3892,10 @@ final class AgentModeViewModel: ObservableObject {
             return
         }
 
-        guard lastProcessedTabID != tabID else { return }
+        guard lastProcessedTabID != tabID else {
+            assert(isRepeatedActivation, "A same-tab return must preserve the activation generation")
+            return
+        }
         lastProcessedTabID = tabID
 
         // Session lookup/materialization and every synchronous activation branch (clear, warm bind,
@@ -11002,6 +11014,22 @@ final class AgentModeViewModel: ObservableObject {
         #endif
     }
 
+    /// True while the current destination's activation load is in progress and its active
+    /// presentation is not yet hydrated for the session's current binding. Persisted adoption can
+    /// make the session presentable before the activation commits the binding; the activation's
+    /// `applySessionToBindings` publishes that commit from the session's latest state, so session
+    /// refreshes landing in between must not publish the adopted rows unhydrated. Once the active
+    /// presentation is hydrated for this binding, refreshes apply even if the marker is still set.
+    private func isAwaitingActivationBindingCommit(_ session: TabSession) -> Bool {
+        guard activeSessionLoadInProgressTabID == session.tabID else { return false }
+        let presentation = activeTranscriptPresentation
+        let isHydratedForCurrentBinding = presentation.tabID == session.tabID
+            && presentation.bindingsHydrated
+            && presentation.hydratedPersistentBinding == session.persistentSessionBindingIdentity
+            && presentation.hydratedBindingTransitionGeneration == session.bindingTransitionGeneration
+        return !isHydratedForCurrentBinding
+    }
+
     func updateBindingsFromSession(_ session: TabSession) {
         #if DEBUG
             test_updateBindingsCallCount += 1
@@ -11030,6 +11058,12 @@ final class AgentModeViewModel: ObservableObject {
         }
         guard canBuildOrPublishActiveTranscriptBindings(for: session) else {
             publishLoadingTranscriptPresentation(tabID: session.tabID)
+            return
+        }
+        guard !isAwaitingActivationBindingCommit(session) else {
+            #if DEBUG
+                AgentModePerfDiagnostics.increment("ui.updateBindings.heldForActivationCommit", tabID: session.tabID)
+            #endif
             return
         }
 

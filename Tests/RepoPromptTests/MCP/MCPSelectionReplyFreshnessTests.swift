@@ -845,6 +845,48 @@ final class MCPSelectionReplyFreshnessTests: XCTestCase {
     }
 
     #if DEBUG
+        /// The store counter covers files(inRoot:), the per-root listing API used by the removed
+        /// scanned-language scan. It does not count every possible workspace-inventory query.
+        func testForcedRecountAccountsSelectionWithoutEnumeratingWorkspaceInventory() async throws {
+            let root = try makeTemporaryRoot(name: "RecountNoInventory")
+            defer { try? FileManager.default.removeItem(at: root.deletingLastPathComponent()) }
+            let selectedURL = root.appendingPathComponent("Selected.swift")
+            let unselectedURL = root.appendingPathComponent("Nested/Unselected.py")
+            try write(SwiftFixtureSource.emptyStruct("RecountSelectedType"), to: selectedURL)
+            try write("def recount_unselected():\n    return 1\n", to: unselectedURL)
+
+            let tabID = UUID()
+            let selection = StoredSelection(selectedPaths: [selectedURL.path])
+            let (window, _) = await makeWindow(root: root, tabID: tabID, selection: selection)
+            defer { WindowStatesManager.shared.unregisterWindowState(window) }
+            _ = try await WorkspaceRootLoadTestSupport.loadRootMatchingCurrentFileSystemSettings(
+                in: window,
+                path: root.path
+            )
+            let store = window.promptManager.workspaceFileContextStore
+            let tokenCounter = window.promptManager.tokenCountingViewModel
+
+            await store.resetFilesInRootRequestCountForTesting()
+            await tokenCounter.forceImmediateRecount()
+
+            let selectedEnumerationCount = await store.fileEnumerationRequestCountForTesting()
+            XCTAssertEqual(selectedEnumerationCount, 0)
+            let selectedInfo = try XCTUnwrap(tokenCounter.latestPublishedTokenInfo(forFullPath: selectedURL.path))
+            XCTAssertGreaterThan(selectedInfo.count, 0)
+            XCTAssertNil(tokenCounter.latestPublishedTokenInfo(forFullPath: unselectedURL.path))
+            XCTAssertEqual(tokenCounter.fileTokenInfo.count, 1)
+            XCTAssertGreaterThanOrEqual(tokenCounter.totalTokenCountFilesOnly, selectedInfo.count)
+
+            await window.selectionCoordinator.persistActiveSelection(StoredSelection())
+            await store.resetFilesInRootRequestCountForTesting()
+            await tokenCounter.forceImmediateRecount()
+
+            let emptyEnumerationCount = await store.fileEnumerationRequestCountForTesting()
+            XCTAssertEqual(emptyEnumerationCount, 0)
+            XCTAssertTrue(tokenCounter.fileTokenInfo.isEmpty)
+            XCTAssertEqual(tokenCounter.totalTokenCountFilesOnly, 0)
+        }
+
         func testActiveMCPTokenRepliesCompleteWhileBackgroundRecountIsBlockedAndCoalesce() async throws {
             let root = try makeTemporaryRoot(name: "ActiveTokenCache")
             defer { try? FileManager.default.removeItem(at: root.deletingLastPathComponent()) }

@@ -1396,10 +1396,6 @@ class PromptViewModel: ObservableObject {
         tokenCountingViewModel.codeMapContent
     }
 
-    var scannedLanguages: Set<LanguageType> {
-        tokenCountingViewModel.scannedLanguages
-    }
-
     var combinedTreeAndCodeMapContent: String {
         tokenCountingViewModel.combinedTreeAndCodeMapContent
     }

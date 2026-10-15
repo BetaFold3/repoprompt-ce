@@ -2491,6 +2491,180 @@ final class AgentModeChatSwitchActivationTests: XCTestCase {
             }
         }
 
+        /// Persisted adoption makes the destination presentable before its activation commits the
+        /// binding. An urgent session refresh landing in that window (the apply-edits approval
+        /// stream's path) keeps the destination's loading presentation; the authoritative commit
+        /// then publishes hydrated rows with the latest approval state, and refreshes after that
+        /// commit apply even while the load marker is still set.
+        func testColdLoadUrgentRefreshBeforeBindingCommitKeepsLoadingPresentation() async throws {
+            try await withFixture { fixture in
+                let viewModel = fixture.viewModel
+                let session = fixture.sessionA
+                let tabID = fixture.tabAID
+                await Self.drainMainQueue()
+                XCTAssertEqual(viewModel.currentTabID, tabID)
+                viewModel.applySessionToBindings(session)
+                viewModel.test_setActiveSessionLoadInProgressTabID(nil)
+                assertPresentation(
+                    viewModel.ui.transcript.snapshot.presentation,
+                    tabID: tabID,
+                    sessionID: fixture.sessionAID,
+                    session: session,
+                    expectedTexts: fixture.tabATexts
+                )
+
+                // The post-adoption, pre-commit state of a cold activation: the session is loaded
+                // and presentable, its binding is not marked hydrated, and the destination shows
+                // its loading presentation under the load marker.
+                session.clearCurrentBindingHydration()
+                viewModel.test_setActiveSessionLoadInProgressTabID(tabID)
+                viewModel.test_publishLoadingTranscriptPresentation(tabID: tabID)
+                XCTAssertTrue(session.hasLoadedPersistedState)
+                XCTAssertTrue(session.isPresentableForOwner)
+                XCTAssertNil(session.authoritativeHydratedBindingTransitionGeneration)
+                XCTAssertTrue(viewModel.canBuildOrPublishActiveTranscriptBindings(for: session))
+                let loading = viewModel.ui.transcript.snapshot
+                XCTAssertEqual(loading.currentTabID, tabID)
+                XCTAssertEqual(loading.activeSessionLoadInProgressTabID, tabID)
+                XCTAssertFalse(loading.isHydrated)
+                XCTAssertTrue(loading.presentation.visibleRows.isEmpty)
+
+                var emissions: [AgentTranscriptUISnapshot] = []
+                let subscription = viewModel.ui.transcript.$snapshot.dropFirst().sink { snapshot in
+                    MainActor.assumeIsolated { emissions.append(snapshot) }
+                }
+                defer { subscription.cancel() }
+
+                // An approval model update (auto-edit plus a pending review and its reconciled wait
+                // state, as the approval stream applies them) followed by its urgent refresh.
+                let heldAutoEdit = !session.autoEditEnabled
+                session.autoEditEnabled = heldAutoEdit
+                let heldReview = PendingApplyEditsReview(
+                    scope: viewModel.applyEditsScope(for: tabID),
+                    path: "held.swift",
+                    unifiedDiff: "@@ -1 +1 @@\n-old\n+new"
+                )
+                session.pendingApplyEditsReview = heldReview
+                defer {
+                    session.pendingApplyEditsReview = nil
+                    session.runState = .idle
+                }
+                viewModel.reconcileInteractiveRunState(session)
+                XCTAssertEqual(session.runState, .waitingForApproval)
+                let updateCountBeforeHeldRefresh = viewModel.test_updateBindingsCallCount
+                viewModel.requestUIRefresh(tabID: tabID, urgent: true)
+                XCTAssertEqual(
+                    viewModel.test_updateBindingsCallCount,
+                    updateCountBeforeHeldRefresh + 1,
+                    "The urgent refresh reaches the session binding update"
+                )
+                XCTAssertFalse(
+                    emissions.contains { !$0.presentation.visibleRows.isEmpty || !$0.presentation.workingRows.isEmpty },
+                    "No destination rows are published before the binding commit"
+                )
+                let held = viewModel.ui.transcript.snapshot
+                XCTAssertEqual(held.currentTabID, tabID)
+                XCTAssertFalse(held.isHydrated)
+                XCTAssertFalse(held.presentation.bindingsHydrated)
+                XCTAssertTrue(held.presentation.visibleRows.isEmpty)
+                XCTAssertTrue(held.presentation.workingRows.isEmpty)
+                XCTAssertEqual(session.autoEditEnabled, heldAutoEdit, "The session keeps the approval update")
+                XCTAssertEqual(session.pendingApplyEditsReview, heldReview)
+                XCTAssertNil(viewModel.ui.runInteraction.snapshot.pendingApplyEditsReview, "The held refresh publishes no review")
+                XCTAssertNotEqual(viewModel.ui.runInteraction.snapshot.runState, .waitingForApproval)
+
+                // The authoritative commit, in the cold activation's order: bindings, then marker.
+                viewModel.applySessionToBindings(session)
+                let committed = viewModel.ui.transcript.snapshot
+                XCTAssertTrue(committed.isHydrated)
+                assertPresentation(
+                    committed.presentation,
+                    tabID: tabID,
+                    sessionID: fixture.sessionAID,
+                    session: session,
+                    expectedTexts: fixture.tabATexts
+                )
+                XCTAssertEqual(viewModel.autoEditEnabled, heldAutoEdit, "The commit consumes the held approval state")
+                XCTAssertEqual(viewModel.pendingApplyEditsReview, heldReview)
+                XCTAssertEqual(viewModel.runState, .waitingForApproval)
+                XCTAssertEqual(viewModel.ui.runInteraction.snapshot.pendingApplyEditsReview, heldReview)
+                XCTAssertEqual(viewModel.ui.runInteraction.snapshot.runState, .waitingForApproval)
+                let firstRowsIndex = try XCTUnwrap(emissions.firstIndex { !$0.presentation.visibleRows.isEmpty })
+                XCTAssertTrue(emissions[firstRowsIndex].isHydrated, "The first row-bearing destination snapshot is hydrated")
+
+                // A refresh after the commit applies even while the marker is still set.
+                let postCommitAutoEdit = !heldAutoEdit
+                session.autoEditEnabled = postCommitAutoEdit
+                let updateCountBeforePostCommitRefresh = viewModel.test_updateBindingsCallCount
+                viewModel.requestUIRefresh(tabID: tabID, urgent: true)
+                XCTAssertEqual(viewModel.test_updateBindingsCallCount, updateCountBeforePostCommitRefresh + 1)
+                XCTAssertEqual(viewModel.autoEditEnabled, postCommitAutoEdit, "Post-commit refreshes are not held")
+                XCTAssertTrue(viewModel.ui.transcript.snapshot.isHydrated)
+                viewModel.test_setActiveSessionLoadInProgressTabID(nil)
+                assertPresentation(
+                    viewModel.ui.transcript.snapshot.presentation,
+                    tabID: tabID,
+                    sessionID: fixture.sessionAID,
+                    session: session,
+                    expectedTexts: fixture.tabATexts
+                )
+            }
+        }
+
+        /// A duplicate `.activeComposeTabChanged` for the tab whose cold activation is already in
+        /// flight is a no-op: the in-flight activation stays the owner, commits the hydrated
+        /// binding, clears the load marker, and later session refreshes reach the bindings.
+        func testDuplicateSameTabActivationNotificationKeepsColdActivationOwner() async throws {
+            try await withFixture { fixture in
+                let viewModel = fixture.viewModel
+                let cold = try await persistColdTarget(in: fixture)
+                defer { viewModel.test_persistenceWorkspaceOverride = nil }
+                let session = try materializeUnpresentable(cold.tabID, in: fixture)
+
+                let gate = ColdLoadGate()
+                defer { gate.release() }
+                var heldLoadResumed = false
+                viewModel.test_persistedLoadPrepareHook = { held in
+                    guard held.tabID == cold.tabID, !heldLoadResumed else { return }
+                    await gate.waitForRelease()
+                    heldLoadResumed = true
+                }
+                defer { viewModel.test_persistedLoadPrepareHook = nil }
+
+                await fixture.window.promptManager.switchComposeTab(cold.tabID)
+                try await Self.waitUntil { gate.isWaiting }
+                XCTAssertEqual(viewModel.activeSessionLoadInProgressTabID, cold.tabID)
+
+                // Post the same active tab again through the production notification sink.
+                NotificationCenter.default.post(
+                    name: .activeComposeTabChanged,
+                    object: nil,
+                    userInfo: ["tabID": cold.tabID, "windowID": fixture.window.windowID]
+                )
+                gate.release()
+                try await Self.waitUntil { heldLoadResumed && session.hasLoadedPersistedState }
+                try await Self.waitUntil { viewModel.activeSessionLoadInProgressTabID == nil }
+                await Self.drainMainQueue()
+
+                XCTAssertEqual(session.persistedLoadDisposition, .applied)
+                let hydrated = viewModel.ui.transcript.snapshot
+                XCTAssertEqual(hydrated.currentTabID, cold.tabID)
+                XCTAssertTrue(hydrated.isHydrated)
+                assertPresentation(
+                    hydrated.presentation,
+                    tabID: cold.tabID,
+                    sessionID: cold.sessionID,
+                    session: session,
+                    expectedTexts: cold.texts
+                )
+
+                let nextAutoEdit = !session.autoEditEnabled
+                session.autoEditEnabled = nextAutoEdit
+                viewModel.requestUIRefresh(tabID: cold.tabID, urgent: true)
+                XCTAssertEqual(viewModel.autoEditEnabled, nextAutoEdit, "Session refreshes reach the bindings")
+            }
+        }
+
         /// An early-prepared cold load held after its prepare keeps every existing fence: a switch
         /// away plus cancellation of the attempt means its late payload is neither applied nor
         /// published over the newer destination, and an ordinary reload still recovers the session.
