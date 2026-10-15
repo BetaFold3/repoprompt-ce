@@ -352,6 +352,89 @@ enum MarkdownStreamingFreezeBoundaryResolver {
 private struct MarkdownRenderRequestContext: Equatable {
     let signature: MarkdownRenderSignature
     let cadence: MarkdownRenderCadence
+    let prefersSynchronousFirstLayout: Bool
+}
+
+/// Compiles a render signature into attributed text. The scheduled compile and the opt-in
+/// first-layout memo both use this, so they produce identical output for one signature.
+enum MarkdownRenderCompiler {
+    @MainActor
+    static func compile(_ signature: MarkdownRenderSignature) -> NSAttributedString {
+        let document = Document(parsing: signature.text)
+        var compiler = EnhancedMarkdownCompiler()
+        compiler.fontSize = signature.fontSize
+        compiler.forceTextColor = signature.forceTextColor
+        compiler.useMonospaced = signature.useMonospaced
+        compiler.detectsMarkdownFilePaths = signature.detectsMarkdownFilePaths
+        compiler.codeFont = TranscriptCodeFontResolver.resolve(
+            preferredPostScriptName: signature.codeFontFaceIdentity,
+            pointSize: signature.fontSize
+        ).font
+        var compiled = compiler.attributedString(from: document)
+        if let forceTextColor = signature.forceTextColor {
+            compiled = applyTextColor(compiled, color: forceTextColor)
+        }
+        return compiled
+    }
+
+    private static func applyTextColor(_ attributedString: NSAttributedString, color: Color) -> NSAttributedString {
+        let mutable = attributedString.mutableCopy() as! NSMutableAttributedString
+        let fullRange = NSRange(location: 0, length: mutable.length)
+        mutable.addAttribute(.foregroundColor, value: NSColor(color), range: fullRange)
+        return mutable
+    }
+}
+
+/// Decides whether an opted-in view compiles its first single-renderer layout synchronously
+/// instead of measuring an unstyled placeholder and re-measuring after a scheduled compile.
+/// Only the first compiled text is affected; later updates keep the scheduled path.
+enum MarkdownFirstLayoutCompilePolicy {
+    static func compilesSynchronously(
+        prefersSynchronousFirstLayout: Bool,
+        cadence: MarkdownRenderCadence,
+        hasCompiledText: Bool
+    ) -> Bool {
+        prefersSynchronousFirstLayout && cadence == .immediate && !hasCompiledText
+    }
+}
+
+/// Single-entry memo owned by one `MarkdownTextView` identity. It lets `body` produce the
+/// styled first layout and lets the lifecycle publish that same result without compiling twice.
+/// It is a plain reference type: mutating it never publishes a SwiftUI change.
+@MainActor
+final class MarkdownFirstLayoutCompileMemo {
+    private var entry: (signature: MarkdownRenderSignature, compiled: NSAttributedString)?
+
+    var isEmpty: Bool {
+        entry == nil
+    }
+
+    /// Returns the retained result for exactly `signature`, compiling and replacing it on a miss.
+    func resolve(
+        _ signature: MarkdownRenderSignature,
+        compile: (MarkdownRenderSignature) -> NSAttributedString
+    ) -> NSAttributedString {
+        if let entry, entry.signature == signature {
+            return entry.compiled
+        }
+        let compiled = compile(signature)
+        entry = (signature, compiled)
+        return compiled
+    }
+
+    /// Resolves `signature` and releases the entry, for handing the result to published state.
+    func consume(
+        _ signature: MarkdownRenderSignature,
+        compile: (MarkdownRenderSignature) -> NSAttributedString
+    ) -> NSAttributedString {
+        let compiled = resolve(signature, compile: compile)
+        entry = nil
+        return compiled
+    }
+
+    func clear() {
+        entry = nil
+    }
 }
 
 private struct SegmentedStreamingMarkdownTextView: View, Equatable {
@@ -435,6 +518,8 @@ private struct SegmentedStreamingMarkdownTextView: View, Equatable {
 /// Renders text content - either as Markdown or plain Text.
 /// Uses EnhancedMarkdownCompiler to create NSAttributedString once, then displays via AttributedTextView.
 /// Tables are compiled into NSTextTable-backed attributed text and render through the same non-scrolling text view path.
+/// The default-off synchronous first-layout opt-in mutates only a nonpublishing memo during body evaluation;
+/// it applies before the first `.immediate` compile, while later updates retain scheduled rendering.
 struct MarkdownTextView: View, Equatable {
     let text: String
     let isMarkdown: Bool
@@ -444,6 +529,7 @@ struct MarkdownTextView: View, Equatable {
     let detectsMarkdownFilePaths: Bool
     let renderCadence: MarkdownRenderCadence
     private let allowsStreamingSegmentation: Bool
+    private let prefersSynchronousFirstLayout: Bool
     @Environment(\.markdownFileLinkOpener) private var markdownFileLinkOpener
     @ObservedObject private var fontScale = FontScaleManager.shared
     @ObservedObject private var globalSettings = GlobalSettingsStore.shared
@@ -464,6 +550,7 @@ struct MarkdownTextView: View, Equatable {
     @State private var lastPublishedSignature: MarkdownRenderSignature?
     @State private var lastPublishedAt: Date?
     @State private var latestRequestID: Int = 0
+    @State private var firstLayoutMemo = MarkdownFirstLayoutCompileMemo()
 
     init(
         text: String,
@@ -473,7 +560,8 @@ struct MarkdownTextView: View, Equatable {
         useMonospaced: Bool = false,
         detectsMarkdownFilePaths: Bool = false,
         renderCadence: MarkdownRenderCadence = .immediate,
-        allowsStreamingSegmentation: Bool = true
+        allowsStreamingSegmentation: Bool = true,
+        prefersSynchronousFirstLayout: Bool = false
     ) {
         self.text = text
         self.isMarkdown = isMarkdown
@@ -483,6 +571,7 @@ struct MarkdownTextView: View, Equatable {
         self.detectsMarkdownFilePaths = detectsMarkdownFilePaths
         self.renderCadence = renderCadence
         self.allowsStreamingSegmentation = allowsStreamingSegmentation
+        self.prefersSynchronousFirstLayout = prefersSynchronousFirstLayout
     }
 
     static func == (lhs: MarkdownTextView, rhs: MarkdownTextView) -> Bool {
@@ -494,6 +583,7 @@ struct MarkdownTextView: View, Equatable {
             lhs.detectsMarkdownFilePaths == rhs.detectsMarkdownFilePaths &&
             lhs.renderCadence == rhs.renderCadence &&
             lhs.allowsStreamingSegmentation == rhs.allowsStreamingSegmentation &&
+            lhs.prefersSynchronousFirstLayout == rhs.prefersSynchronousFirstLayout &&
             lhs.fontScale.preset.scaleFactor == rhs.fontScale.preset.scaleFactor &&
             lhs.globalSettings.transcriptCodeFontPostScriptName()
             == rhs.globalSettings.transcriptCodeFontPostScriptName()
@@ -555,7 +645,8 @@ struct MarkdownTextView: View, Equatable {
                 detectsMarkdownFilePaths: detectsMarkdownFilePaths,
                 codeFontFaceIdentity: resolvedCodeFont.fingerprint.faceIdentity
             ),
-            cadence: renderCadence
+            cadence: renderCadence,
+            prefersSynchronousFirstLayout: prefersSynchronousFirstLayout
         )
     }
 
@@ -576,6 +667,14 @@ struct MarkdownTextView: View, Equatable {
     private var displayAttributedString: NSAttributedString {
         if let compiled = attributedText {
             return compiled
+        }
+        if MarkdownFirstLayoutCompilePolicy.compilesSynchronously(
+            prefersSynchronousFirstLayout: prefersSynchronousFirstLayout,
+            cadence: renderCadence,
+            hasCompiledText: false
+        ) {
+            // Mutates only the non-publishing memo; the lifecycle adopts this same result.
+            return firstLayoutMemo.resolve(renderRequestContext.signature, compile: MarkdownRenderCompiler.compile)
         }
         let font: NSFont = if useMonospaced {
             resolvedCodeFont.font
@@ -622,7 +721,19 @@ struct MarkdownTextView: View, Equatable {
         case .skip:
             return
         case .compileNow:
-            enqueueCompile(for: context.signature, after: nil)
+            if MarkdownFirstLayoutCompilePolicy.compilesSynchronously(
+                prefersSynchronousFirstLayout: context.prefersSynchronousFirstLayout,
+                cadence: context.cadence,
+                hasCompiledText: attributedText != nil
+            ) {
+                // Supersede any queued compile, then publish the result `body` already laid out.
+                cancelPendingCompile()
+                latestRequestID += 1
+                let compiled = firstLayoutMemo.consume(context.signature, compile: MarkdownRenderCompiler.compile)
+                publishCompiled(compiled, for: context.signature)
+            } else {
+                enqueueCompile(for: context.signature, after: nil)
+            }
         case let .compileAfter(delay):
             enqueueCompile(for: context.signature, after: delay)
         }
@@ -658,10 +769,12 @@ struct MarkdownTextView: View, Equatable {
             || latestRequestedSignature != nil
             || lastPublishedSignature != nil
             || lastPublishedAt != nil
+            || !firstLayoutMemo.isEmpty
         else {
             return
         }
         cancelPendingCompile()
+        firstLayoutMemo.clear()
         attributedText = nil
         latestRequestedSignature = nil
         lastPublishedSignature = nil
@@ -669,37 +782,22 @@ struct MarkdownTextView: View, Equatable {
     }
 
     private func compileMarkdown(for signature: MarkdownRenderSignature, requestID: Int) {
-        let document = Document(parsing: signature.text)
-        var compiler = EnhancedMarkdownCompiler()
-        compiler.fontSize = signature.fontSize
-        compiler.forceTextColor = signature.forceTextColor
-        compiler.useMonospaced = signature.useMonospaced
-        compiler.detectsMarkdownFilePaths = signature.detectsMarkdownFilePaths
-        compiler.codeFont = TranscriptCodeFontResolver.resolve(
-            preferredPostScriptName: signature.codeFontFaceIdentity,
-            pointSize: signature.fontSize
-        ).font
-        var compiled = compiler.attributedString(from: document)
-        if let forceTextColor = signature.forceTextColor {
-            compiled = applyTextColor(compiled, color: forceTextColor)
-        }
+        let compiled = MarkdownRenderCompiler.compile(signature)
 
         guard !Task.isCancelled else { return }
         guard latestRequestID == requestID else { return }
         guard latestRequestedSignature == signature else { return }
         guard renderRequestContext.signature == signature else { return }
 
+        publishCompiled(compiled, for: signature)
+    }
+
+    private func publishCompiled(_ compiled: NSAttributedString, for signature: MarkdownRenderSignature) {
+        firstLayoutMemo.clear()
         attributedText = compiled
         lastPublishedSignature = signature
         lastPublishedAt = Date()
         compileTask = nil
-    }
-
-    private func applyTextColor(_ attributedString: NSAttributedString, color: Color) -> NSAttributedString {
-        let mutable = attributedString.mutableCopy() as! NSMutableAttributedString
-        let fullRange = NSRange(location: 0, length: mutable.length)
-        mutable.addAttribute(.foregroundColor, value: NSColor(color), range: fullRange)
-        return mutable
     }
 }
 
