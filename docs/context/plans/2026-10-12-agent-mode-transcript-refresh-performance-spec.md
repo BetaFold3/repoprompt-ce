@@ -193,7 +193,7 @@ Step D5 — done | rounds 1/2 | open: none | downgraded: none | assumed: focused
 
 Step D6-early-load-start — done | rounds 0/2 | open: none; D6-early-start-final.md | downgraded: none | assumed: cold-only begin-or-join/early prepare; 44 activation plus110neighbor tests; both initial reviews no P0/P1 | deferred: combined live gain/discard ratio, A R1/B R-5 negative-path seam coverage, MCP Git diagnostic TaskLocal and B R-9 cosmetic cleanup
 
-Step D6-ui-attribution — doing | rounds 0/2 | open: source attribution and one bounded UI boundary; D6-elephants-guidance.md | downgraded: none | assumed: existing diagnostics first; no tooling changes | deferred: combined manual qualification
+Step D6-ui-attribution — blocked | rounds 0/2 | open: dynamic invalidation cause requires combined manual capture; D6-ui-attribution-final.md | downgraded: none | assumed: five-line gated SwiftUI cause probe; app compile, lint and initial A/B reviews passed; no production UI ownership change | deferred: actual system-log output and causal publication/layout attribution
 
 Step D6-cold-pass-proof — blocked | rounds 0/2 | open: purpose/cold-mutation/payload authority prevents whole-runtime-pass substitution; D6-cold-pass-feasibility.md | downgraded: none | assumed: no persistence/retention semantic changes | deferred: explicit single-pass redesign or separately scoped persistence/presentation overlap; rare merge-only storage duplicate not pursued
 

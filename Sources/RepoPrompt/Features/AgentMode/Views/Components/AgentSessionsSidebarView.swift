@@ -223,6 +223,11 @@ struct AgentModeSessionsSidebarView: View {
     #if DEBUG
         private static func recordBodyMetric() {
             AgentModePerfDiagnostics.increment("ui.body.agentSessionsSidebar")
+            // SwiftUI system change-cause logging, collected separately from app diagnostics.
+            guard AgentModePerfDiagnostics.isEnabled, AgentModePerfDiagnostics.osLogEnabled else { return }
+            if #available(macOS 14.1, *) {
+                _logChanges()
+            }
         }
     #endif
 
