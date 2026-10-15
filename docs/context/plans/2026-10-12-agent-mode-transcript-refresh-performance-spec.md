@@ -191,6 +191,12 @@ Step D5 — done | rounds 1/2 | open: none | downgraded: none | assumed: focused
 
 ### D6 — Sidebar: one build per render pass
 
+Step D6-early-load-start — done | rounds 0/2 | open: none; D6-early-start-final.md | downgraded: none | assumed: cold-only begin-or-join/early prepare; 44 activation plus110neighbor tests; both initial reviews no P0/P1 | deferred: combined live gain/discard ratio, A R1/B R-5 negative-path seam coverage, MCP Git diagnostic TaskLocal and B R-9 cosmetic cleanup
+
+Step D6-ui-attribution — doing | rounds 0/2 | open: source attribution and one bounded UI boundary; D6-elephants-guidance.md | downgraded: none | assumed: existing diagnostics first; no tooling changes | deferred: combined manual qualification
+
+Step D6-cold-pass-proof — blocked | rounds 0/2 | open: purpose/cold-mutation/payload authority prevents whole-runtime-pass substitution; D6-cold-pass-feasibility.md | downgraded: none | assumed: no persistence/retention semantic changes | deferred: explicit single-pass redesign or separately scoped persistence/presentation overlap; rare merge-only storage duplicate not pursued
+
 Step D6-cold-path-signal — done | rounds 0/2 | open: none; D6-cold-path-signal-final.md; D6-cold-path-signal-live.md | downgraded: none | assumed: aaf581ad approved signed relaunch verified PID63316; aligned owner clicks/native capture; 37 tests and both reviews retained; individual cold2089.1ms and warm38.7ms are not matched gain | deferred: PRE UI admission and POST catch-up attribution, matched latency/RSS, test discoverability, private-helper precondition hardening and hover-only last-resort prefetch
 
 Step D6-cold-admission-investigation — done | rounds 0/2 | open: none; D6-cold-pre-admission-investigation.md; D6-cold-post-admission-investigation.md | downgraded: none | assumed: ordered/additive PRE logs verified; handler-to-load UI work dominates, exact publication/admission split unknown; live POST reason unattributed | deferred: task-creation stamps, scheduling changes, shared processing context and terminal-coherence-safe adoption repair

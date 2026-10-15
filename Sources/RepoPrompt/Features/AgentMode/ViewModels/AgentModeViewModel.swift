@@ -710,7 +710,9 @@ final class AgentModeViewModel: ObservableObject {
         var test_persistedLoadPrepareHook: (@MainActor (TabSession) async -> Void)?
         /// Test seam: awaited inside `performPersistedSessionLoad` immediately before the payload
         /// is prepared, so an obsolete load can be held while a rebinding and a replacement load
-        /// run to (or near) completion.
+        /// run to (or near) completion. Install it before the load starts: a cold activation's
+        /// synchronous start otherwise requests an early off-main prepare that a later-installed
+        /// hook cannot hold (it only discards that result and gates the in-operation fallback).
         var test_persistedLoadBeforePrepareHook: (@MainActor (TabSession) async -> Void)?
         /// Test seam: a non-nil error fails the authoritative schedule resync read for that
         /// durable session as if the storage read had thrown.
@@ -3934,12 +3936,17 @@ final class AgentModeViewModel: ObservableObject {
             ]
             WorkspaceRestorePerfLog.event("agentMode.activation.coldTaskWillCreate", fields: coldTaskFields)
         #endif
+        // Begin (or join) the operation-owned persisted load synchronously, after the loading
+        // publication flushed, so its preparation is requested before this activation's main-actor
+        // task hop. All load guards, attempt/transition fences and apply authority are unchanged;
+        // this task awaits the same operation and owns its handle cleanup when it created it.
+        let persistedLoadStart = startOrJoinPersistedLoad(for: session, startsPreparationEarly: true)
         Task { [weak self] in
             guard let self else { return }
             #if DEBUG
                 WorkspaceRestorePerfLog.event("agentMode.activation.coldTaskEntered", fields: coldTaskFields)
             #endif
-            await loadSessionFromDisk(for: session)
+            await awaitPersistedLoad(persistedLoadStart, for: session)
             guard sessionActivationGeneration == activationGeneration else { return }
             guard currentTabID == tabID else { return }
             guard sessions[tabID] === session else { return }
@@ -4962,24 +4969,77 @@ final class AgentModeViewModel: ObservableObject {
         for session: TabSession,
         staleResetRecoveryAttemptID: UUID? = nil
     ) async -> PersistedLoadOutcome {
+        await awaitPersistedLoad(
+            startOrJoinPersistedLoad(for: session, staleResetRecoveryAttemptID: staleResetRecoveryAttemptID),
+            for: session
+        )
+    }
+
+    /// Synchronous begin-or-join half of `loadSessionFromDisk`: on the main actor, without a
+    /// suspension, it settles, joins the in-flight operation, or creates (and records) the single
+    /// operation-owned load task. Only the caller that receives `.created` performs the
+    /// identity-aware handle cleanup, by passing the start to `awaitPersistedLoad`.
+    private struct PersistedLoadStart {
+        enum Kind {
+            case settled(PersistedLoadOutcome)
+            case joined(Task<PersistedLoadOutcome, Never>)
+            case created(Task<PersistedLoadOutcome, Never>)
+        }
+
+        let kind: Kind
+        #if DEBUG
+            let logLoadTask: (String) -> Void
+        #endif
+    }
+
+    /// Cold-activation early preparation owned by exactly one load attempt: the request captured
+    /// when the attempt began and its off-main prepare. The attempt adopts the result only if the
+    /// request it captures at its own (unchanged) capture point is equivalent; otherwise it
+    /// cancels this prepare and prepares in-operation exactly as before. Every exit of the owning
+    /// operation cancels it (a no-op once adopted and complete).
+    private struct EarlyPersistedHydrationPrepare {
+        let request: AgentSessionHydrationRequest
+        let task: Task<PreparedHydrationTransfer, Error>
+    }
+
+    /// Single-owner handoff of a prepared payload from the early prepare to its owning main-actor
+    /// load operation (the same actor-to-main transfer as the in-operation prepare); the payload
+    /// is never shared or mutated across isolation.
+    private struct PreparedHydrationTransfer: @unchecked Sendable {
+        let payload: AgentSessionHydrationPayload?
+    }
+
+    private func startOrJoinPersistedLoad(
+        for session: TabSession,
+        staleResetRecoveryAttemptID: UUID? = nil,
+        startsPreparationEarly: Bool = false
+    ) -> PersistedLoadStart {
         if let recovery = session.staleResetRecovery {
             guard case let .reloading(attemptID, _) = recovery.phase,
                   attemptID == staleResetRecoveryAttemptID
             else {
                 Self.logCodexDebug("[AgentModeVM][PersistedLoad] blocked by stale-reset recovery tab=\(session.tabID)")
-                return PersistedLoadOutcome(attemptID: nil, disposition: .unresolved)
+                #if DEBUG
+                    return PersistedLoadStart(
+                        kind: .settled(PersistedLoadOutcome(attemptID: nil, disposition: .unresolved)),
+                        logLoadTask: { _ in }
+                    )
+                #else
+                    return PersistedLoadStart(kind: .settled(PersistedLoadOutcome(attemptID: nil, disposition: .unresolved)))
+                #endif
             }
         }
         #if DEBUG
             let loadStartMS = WorkspaceRestorePerfLog.timestampMSIfEnabled()
+            let debugWindowID = windowID
             let debugTabID = session.tabID
             let debugStartRevision = session.sourceItemsRevision
             let debugExpectedSessionID = explicitActiveSessionID(for: session.tabID)
-            func logLoadTask(outcome: String) {
+            let logLoadTask: (String) -> Void = { outcome in
                 WorkspaceRestorePerfLog.event(
                     "agentSessionHydration.loadTask",
                     fields: [
-                        "windowID": "\(windowID)",
+                        "windowID": "\(debugWindowID)",
                         "tabID": WorkspaceRestorePerfLog.shortID(debugTabID),
                         "sessionID": WorkspaceRestorePerfLog.shortID(debugExpectedSessionID),
                         "outcome": outcome,
@@ -4988,23 +5048,26 @@ final class AgentModeViewModel: ObservableObject {
                     ]
                 )
             }
+            func start(_ kind: PersistedLoadStart.Kind) -> PersistedLoadStart {
+                PersistedLoadStart(kind: kind, logLoadTask: logLoadTask)
+            }
+        #else
+            func start(_ kind: PersistedLoadStart.Kind) -> PersistedLoadStart {
+                PersistedLoadStart(kind: kind)
+            }
         #endif
         if session.hasLoadedPersistedState {
             #if DEBUG
-                logLoadTask(outcome: "alreadyLoaded")
+                logLoadTask("alreadyLoaded")
             #endif
-            return PersistedLoadOutcome(
+            return start(.settled(PersistedLoadOutcome(
                 attemptID: session.currentPersistedLoadAttemptID,
                 disposition: session.persistedLoadDisposition ?? .applied
-            )
+            )))
         }
         if let persistedLoadTask = session.persistedLoadTask {
             Self.logCodexDebug("[AgentModeVM][PersistedLoad] join inflight tab=\(session.tabID)")
-            let joined = await persistedLoadTask.value
-            #if DEBUG
-                logLoadTask(outcome: "joinedExistingTask")
-            #endif
-            return joined
+            return start(.joined(persistedLoadTask))
         }
         let startRevision = session.sourceItemsRevision
         let expectedBinding = session.persistentSessionBindingIdentity
@@ -5017,8 +5080,12 @@ final class AgentModeViewModel: ObservableObject {
         }
         let loadAttemptID = UUID()
         session.currentPersistedLoadAttemptID = loadAttemptID
+        let earlyPrepare = startsPreparationEarly
+            ? makeEarlyPersistedHydrationPrepare(for: session, hydrationToken: hydrationToken)
+            : nil
         let persistedLoadTask = Task<PersistedLoadOutcome, Never> { [weak self] in
             guard let self else {
+                earlyPrepare?.task.cancel()
                 return PersistedLoadOutcome(attemptID: loadAttemptID, disposition: .unresolved)
             }
             let disposition = await performPersistedSessionLoad(
@@ -5026,26 +5093,116 @@ final class AgentModeViewModel: ObservableObject {
                 hydrationToken: hydrationToken,
                 startRevision: startRevision,
                 staleResetRecoveryAttemptID: staleResetRecoveryAttemptID,
-                loadAttemptID: loadAttemptID
+                loadAttemptID: loadAttemptID,
+                earlyPrepare: earlyPrepare
             )
             return PersistedLoadOutcome(attemptID: loadAttemptID, disposition: disposition)
         }
         session.persistedLoadTask = persistedLoadTask
-        defer {
-            // Identity-aware cleanup: a cancelled/obsolete invocation never erases the handle of a
-            // newer load that replaced it.
-            if session.persistedLoadTask == persistedLoadTask {
-                session.persistedLoadTask = nil
-            }
-        }
         Self.logCodexDebug(
-            "[AgentModeVM][PersistedLoad] start tab=\(session.tabID) revision=\(startRevision) sessionID=\(expectedSessionID?.uuidString ?? "nil")"
+            "[AgentModeVM][PersistedLoad] start tab=\(session.tabID) revision=\(startRevision) sessionID=\(expectedSessionID?.uuidString ?? "nil") early=\(earlyPrepare != nil)"
         )
-        let outcome = await persistedLoadTask.value
+        return start(.created(persistedLoadTask))
+    }
+
+    /// Awaiting half of `loadSessionFromDisk`. The creator of a load operation owns the
+    /// identity-aware cleanup of its handle; joiners and settled starts never touch it.
+    private func awaitPersistedLoad(_ start: PersistedLoadStart, for session: TabSession) async -> PersistedLoadOutcome {
+        switch start.kind {
+        case let .settled(outcome):
+            return outcome
+        case let .joined(persistedLoadTask):
+            let joined = await persistedLoadTask.value
+            #if DEBUG
+                start.logLoadTask("joinedExistingTask")
+            #endif
+            return joined
+        case let .created(persistedLoadTask):
+            defer {
+                // Identity-aware cleanup: a cancelled/obsolete invocation never erases the handle of a
+                // newer load that replaced it.
+                if session.persistedLoadTask == persistedLoadTask {
+                    session.persistedLoadTask = nil
+                }
+            }
+            let outcome = await persistedLoadTask.value
+            #if DEBUG
+                start.logLoadTask("createdTaskComplete")
+            #endif
+            return outcome
+        }
+    }
+
+    /// Starts the cold-activation prepare off the main actor from the synchronous load start, so
+    /// service entry does not wait behind main-actor work queued ahead of the operation task. It
+    /// still serializes on the data-service actor and its per-session persistence gate. Not used
+    /// when the in-operation prepare would not run, or while the DEBUG before-prepare seam is set
+    /// at start (a seam installed before the start gates all service entry; one installed later
+    /// only discards this prepare and gates the fallback).
+    private func makeEarlyPersistedHydrationPrepare(
+        for session: TabSession,
+        hydrationToken: PersistedHydrationCommitToken?
+    ) -> EarlyPersistedHydrationPrepare? {
         #if DEBUG
-            logLoadTask(outcome: "createdTaskComplete")
+            guard test_persistedLoadBeforePrepareHook == nil else { return nil }
         #endif
-        return outcome
+        guard !AppLaunchConfiguration.current.suppressesAgentSessionPersistence,
+              let hydrationToken,
+              let workspace = persistenceWorkspace ?? lastKnownWorkspaceSnapshot
+        else {
+            return nil
+        }
+        let request = persistedHydrationRequest(
+            for: session,
+            sessionID: hydrationToken.requestedSessionID,
+            workspace: workspace
+        )
+        let dataService = dataService
+        let task = Task.detached(priority: .userInitiated) { () async throws -> PreparedHydrationTransfer in
+            let payload = try await dataService.preparePersistedHydration(request)
+            return PreparedHydrationTransfer(payload: payload)
+        }
+        return EarlyPersistedHydrationPrepare(request: request, task: task)
+    }
+
+    /// The request the load operation captures for its prepare. Shared by the in-operation
+    /// capture and the early cold-activation capture so both read identical sources.
+    private func persistedHydrationRequest(
+        for session: TabSession,
+        sessionID: UUID,
+        workspace: WorkspaceModel
+    ) -> AgentSessionHydrationRequest {
+        AgentSessionHydrationRequest(
+            workspace: workspace,
+            tabID: session.tabID,
+            sessionID: sessionID,
+            resolvedDisplayName: resolvedSessionDisplayName(for: session.tabID),
+            hasPendingQuestionUI: session.hasPendingQuestionUI,
+            transcriptViewportState: persistedHydrationTranscriptViewportState(for: session),
+            isCompressedHistoryRevealed: session.isCompressedHistoryRevealed,
+            initialPerformanceSnapshot: session.transcriptPerformanceSnapshot
+        )
+    }
+
+    /// An early prepare is adopted only when its request is equivalent to the one the operation
+    /// captured at its own capture point. Every presentation input is compared exactly. The
+    /// workspace is compared by the fields the prepare consumes (the storage folder resolved from
+    /// id/name/customStoragePath, and the stamp's workspace id); unrelated workspace fields such as
+    /// the active compose tab legitimately change during activation.
+    private static func earlyHydrationRequest(
+        _ early: AgentSessionHydrationRequest,
+        isEquivalentTo current: AgentSessionHydrationRequest
+    ) -> Bool {
+        early.workspace.id == current.workspace.id
+            && early.workspace.name == current.workspace.name
+            && early.workspace.customStoragePath == current.workspace.customStoragePath
+            && early.tabID == current.tabID
+            && early.sessionID == current.sessionID
+            && early.resolvedDisplayName == current.resolvedDisplayName
+            && early.hasPendingQuestionUI == current.hasPendingQuestionUI
+            && early.transcriptViewportState == current.transcriptViewportState
+            && early.isCompressedHistoryRevealed == current.isCompressedHistoryRevealed
+            && early.initialPerformanceSnapshot == current.initialPerformanceSnapshot
     }
 
     /// The load attempt that produced an outcome is still the session's current attempt. An
@@ -5112,8 +5269,12 @@ final class AgentModeViewModel: ObservableObject {
         hydrationToken: PersistedHydrationCommitToken?,
         startRevision: Int,
         staleResetRecoveryAttemptID: UUID? = nil,
-        loadAttemptID: UUID
+        loadAttemptID: UUID,
+        earlyPrepare: EarlyPersistedHydrationPrepare? = nil
     ) async -> TabSession.PersistedLoadDisposition {
+        // The early prepare belongs to this operation: every exit that did not adopt it (or that
+        // adopted and already consumed it, where this is a no-op) stops it.
+        defer { earlyPrepare?.task.cancel() }
         let expectedSessionID = hydrationToken?.requestedSessionID
         #if DEBUG
             let performStartMS = WorkspaceRestorePerfLog.timestampMSIfEnabled()
@@ -5163,16 +5324,22 @@ final class AgentModeViewModel: ObservableObject {
             return .unbound
         }
 
-        let request = AgentSessionHydrationRequest(
-            workspace: workspace,
-            tabID: session.tabID,
-            sessionID: sessionID,
-            resolvedDisplayName: resolvedSessionDisplayName(for: session.tabID),
-            hasPendingQuestionUI: session.hasPendingQuestionUI,
-            transcriptViewportState: persistedHydrationTranscriptViewportState(for: session),
-            isCompressedHistoryRevealed: session.isCompressedHistoryRevealed,
-            initialPerformanceSnapshot: session.transcriptPerformanceSnapshot
-        )
+        let request = persistedHydrationRequest(for: session, sessionID: sessionID, workspace: workspace)
+        #if DEBUG
+            // A before-prepare seam installed after the synchronous early start cannot undo service
+            // I/O the early prepare may already have begun; it only discards that speculation and
+            // gates the in-operation fallback prepare. For a deterministic gate before any service
+            // entry, install the seam before the load starts (the early start is then never made).
+            let beforePrepareSeamInstalled = test_persistedLoadBeforePrepareHook != nil
+        #else
+            let beforePrepareSeamInstalled = false
+        #endif
+        let adoptedEarlyPrepare = beforePrepareSeamInstalled ? nil : earlyPrepare.flatMap { early in
+            Self.earlyHydrationRequest(early.request, isEquivalentTo: request) ? early : nil
+        }
+        if adoptedEarlyPrepare == nil {
+            earlyPrepare?.task.cancel()
+        }
 
         #if DEBUG
             var prepareStartMS: Double?
@@ -5188,11 +5355,22 @@ final class AgentModeViewModel: ObservableObject {
                     "tabID": WorkspaceRestorePerfLog.shortID(session.tabID),
                     "sessionID": WorkspaceRestorePerfLog.shortID(sessionID),
                     "loadAttemptID": WorkspaceRestorePerfLog.shortID(loadAttemptID),
-                    "transitionGeneration": "\(hydrationToken.transition.transitionGeneration)"
+                    "transitionGeneration": "\(hydrationToken.transition.transitionGeneration)",
+                    "earlyPrepare": earlyPrepare == nil ? "none" : (adoptedEarlyPrepare == nil ? "discarded" : "adopted")
                 ]
                 WorkspaceRestorePerfLog.event("agentSessionHydration.prepareWillAwait", fields: prepareBoundaryFields)
             #endif
-            let preparedPayload = try await dataService.preparePersistedHydration(request)
+            let preparedPayload = if let earlyTask = adoptedEarlyPrepare?.task {
+                // Cancellation of this operation reaches the early prepare exactly as it reaches an
+                // in-operation prepare (including cancellation that landed before this await).
+                try await withTaskCancellationHandler {
+                    try await earlyTask.value.payload
+                } onCancel: {
+                    earlyTask.cancel()
+                }
+            } else {
+                try await dataService.preparePersistedHydration(request)
+            }
             #if DEBUG
                 var prepareResumeFields = prepareBoundaryFields
                 prepareResumeFields["payload"] = preparedPayload == nil ? "nil" : "present"

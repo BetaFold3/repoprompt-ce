@@ -2271,6 +2271,189 @@ final class AgentModeChatSwitchActivationTests: XCTestCase {
             }
         }
 
+        /// Without the before-prepare seam, cold activation requests its preparation from the
+        /// synchronous load start (before the activation task hop). The owning operation adopts that
+        /// one prepare: exactly one service entry and payload for the attempt, the outer activation
+        /// task awaits the same operation, and the hydrated target is identical to the ordinary path.
+        func testColdActivationEarlyPrepareIsAdoptedOnceByOwningOperation() async throws {
+            try await withFixture { fixture in
+                let viewModel = fixture.viewModel
+                let cold = try await persistColdTarget(in: fixture)
+                defer { viewModel.test_persistenceWorkspaceOverride = nil }
+                let session = try materializeUnpresentable(cold.tabID, in: fixture)
+                let previousOverride = WorkspaceRestorePerfLog.debugProcessOverrideEnabled
+                WorkspaceRestorePerfLog.setDebugProcessOverrideEnabled(true)
+                defer { WorkspaceRestorePerfLog.setDebugProcessOverrideEnabled(previousOverride) }
+                WorkspaceRestorePerfLog.clearRecentMetricLines()
+                XCTAssertNil(viewModel.test_persistedLoadBeforePrepareHook)
+
+                var afterHookCount = 0
+                viewModel.test_persistedLoadPrepareHook = { held in
+                    guard held.tabID == cold.tabID else { return }
+                    afterHookCount += 1
+                }
+                defer { viewModel.test_persistedLoadPrepareHook = nil }
+                var emissions: [AgentTranscriptUISnapshot] = []
+                let subscription = viewModel.ui.transcript.$snapshot.dropFirst().sink { snapshot in
+                    MainActor.assumeIsolated { emissions.append(snapshot) }
+                }
+                defer { subscription.cancel() }
+
+                await fixture.window.promptManager.switchComposeTab(cold.tabID)
+                try await Self.waitUntil {
+                    session.hasLoadedPersistedState && viewModel.activeSessionLoadInProgressTabID == nil
+                }
+                await Self.drainMainQueue()
+
+                // The early start leaves activation publication unchanged: exactly one destination
+                // loading snapshot precedes the hydrated destination.
+                let destinationEmissions = emissions.filter { $0.currentTabID == cold.tabID }
+                let firstHydratedIndex = try XCTUnwrap(
+                    destinationEmissions.firstIndex { $0.isHydrated },
+                    "The destination publishes its hydrated snapshot"
+                )
+                let loadingEmissions = destinationEmissions[..<firstHydratedIndex]
+                XCTAssertEqual(loadingEmissions.count, 1, "One destination loading publication before hydration")
+                let loading = try XCTUnwrap(loadingEmissions.first)
+                XCTAssertFalse(loading.isHydrated)
+                XCTAssertFalse(loading.presentation.bindingsHydrated)
+                XCTAssertEqual(loading.presentation.tabID, cold.tabID)
+                XCTAssertEqual(loading.activeSessionLoadInProgressTabID, cold.tabID)
+                XCTAssertTrue(loading.presentation.visibleRows.isEmpty)
+                XCTAssertTrue(loading.presentation.workingRows.isEmpty)
+
+                let events = Self.coldHydrationEvents(tabID: cold.tabID)
+                let names = events.map(\.name)
+                for name in [
+                    "agentMode.activation.coldTaskWillCreate",
+                    "agentMode.activation.coldTaskEntered",
+                    "agentSessionHydration.prepareWillAwait",
+                    "agentSessionHydration.prepareEntered",
+                    "agentSessionHydration.prepare",
+                    "agentSessionHydration.prepareDidResume"
+                ] {
+                    XCTAssertEqual(names.count { $0 == name }, 1, "\(name) occurs once for the single load operation")
+                }
+                func index(_ name: String) throws -> Int {
+                    try XCTUnwrap(names.firstIndex(of: name), name)
+                }
+                XCTAssertLessThan(try index("agentMode.activation.coldTaskWillCreate"), try index("agentSessionHydration.prepareEntered"))
+                XCTAssertLessThan(try index("agentMode.activation.coldTaskWillCreate"), try index("agentMode.activation.coldTaskEntered"))
+                XCTAssertLessThan(try index("agentSessionHydration.prepareEntered"), try index("agentSessionHydration.prepare"))
+                XCTAssertLessThan(try index("agentSessionHydration.prepare"), try index("agentSessionHydration.prepareDidResume"))
+                XCTAssertLessThan(try index("agentSessionHydration.prepareWillAwait"), try index("agentSessionHydration.prepareDidResume"))
+                let prepare = try XCTUnwrap(events.first { $0.name == "agentSessionHydration.prepare" })
+                XCTAssertEqual(prepare.fields["outcome"], "payload")
+                let willAwait = try XCTUnwrap(events.first { $0.name == "agentSessionHydration.prepareWillAwait" })
+                XCTAssertEqual(willAwait.fields["earlyPrepare"], "adopted", "The operation adopts the early prepare")
+                let didResume = try XCTUnwrap(events.first { $0.name == "agentSessionHydration.prepareDidResume" })
+                XCTAssertEqual(didResume.fields["loadAttemptID"], willAwait.fields["loadAttemptID"])
+                XCTAssertEqual(didResume.fields["payload"], "present")
+
+                XCTAssertEqual(afterHookCount, 1, "One prepared payload reaches the operation's post-prepare fences")
+                XCTAssertEqual(session.persistedLoadDisposition, .applied)
+                XCTAssertNil(session.persistedLoadTask, "The creating activation task cleared its own handle")
+                let hydrated = viewModel.ui.transcript.snapshot
+                XCTAssertEqual(hydrated.currentTabID, cold.tabID)
+                XCTAssertTrue(hydrated.isHydrated)
+                assertPresentation(
+                    hydrated.presentation,
+                    tabID: cold.tabID,
+                    sessionID: cold.sessionID,
+                    session: session,
+                    expectedTexts: cold.texts
+                )
+            }
+        }
+
+        /// An early-prepared cold load held after its prepare keeps every existing fence: a switch
+        /// away plus cancellation of the attempt means its late payload is neither applied nor
+        /// published over the newer destination, and an ordinary reload still recovers the session.
+        func testColdActivationEarlyPrepareKeepsAttemptAndDestinationFences() async throws {
+            try await withFixture { fixture in
+                let viewModel = fixture.viewModel
+                let cold = try await persistColdTarget(in: fixture)
+                defer { viewModel.test_persistenceWorkspaceOverride = nil }
+                let session = try materializeUnpresentable(cold.tabID, in: fixture)
+                let previousOverride = WorkspaceRestorePerfLog.debugProcessOverrideEnabled
+                WorkspaceRestorePerfLog.setDebugProcessOverrideEnabled(true)
+                defer { WorkspaceRestorePerfLog.setDebugProcessOverrideEnabled(previousOverride) }
+                WorkspaceRestorePerfLog.clearRecentMetricLines()
+
+                let gate = ColdLoadGate()
+                defer { gate.release() }
+                var heldLoadResumed = false
+                viewModel.test_persistedLoadPrepareHook = { held in
+                    guard held.tabID == cold.tabID, !heldLoadResumed else { return }
+                    await gate.waitForRelease()
+                    heldLoadResumed = true
+                }
+                defer { viewModel.test_persistedLoadPrepareHook = nil }
+                var emissions: [AgentTranscriptUISnapshot] = []
+                let subscription = viewModel.ui.transcript.$snapshot.dropFirst().sink { snapshot in
+                    MainActor.assumeIsolated { emissions.append(snapshot) }
+                }
+                defer { subscription.cancel() }
+
+                await fixture.window.promptManager.switchComposeTab(cold.tabID)
+                try await Self.waitUntil { gate.isWaiting }
+                let willAwait = try XCTUnwrap(Self.coldHydrationEvents(tabID: cold.tabID).first {
+                    $0.name == "agentSessionHydration.prepareWillAwait"
+                })
+                XCTAssertEqual(willAwait.fields["earlyPrepare"], "adopted")
+
+                await fixture.window.promptManager.switchComposeTab(fixture.tabBID)
+                viewModel.cancelPersistedLoad(for: session)
+                let destinationStart = emissions.count
+                gate.release()
+                try await Self.waitUntil { heldLoadResumed }
+                await Self.drainMainQueue()
+
+                XCTAssertFalse(session.hasLoadedPersistedState, "A cancelled attempt's payload is never applied")
+                XCTAssertNotEqual(session.persistedLoadDisposition, .applied)
+                XCTAssertNil(session.persistedLoadTask)
+                XCTAssertFalse(emissions[destinationStart...].contains { snapshot in
+                    snapshot.currentTabID == cold.tabID
+                        || snapshot.presentation.tabID == cold.tabID
+                        || snapshot.activeSessionLoadInProgressTabID == cold.tabID
+                }, "The stale early-prepared load never republishes after the newer switch")
+                let destination = viewModel.ui.transcript.snapshot
+                XCTAssertEqual(destination.currentTabID, fixture.tabBID)
+                XCTAssertTrue(destination.isHydrated)
+
+                let outcome = await viewModel.loadSessionFromDisk(for: session)
+                XCTAssertEqual(outcome.disposition, .applied, "An ordinary reload recovers the cancelled cold session")
+                XCTAssertTrue(session.hasLoadedPersistedState)
+                XCTAssertEqual(session.items.map(\.text), cold.texts)
+                XCTAssertEqual(viewModel.ui.transcript.snapshot.currentTabID, fixture.tabBID)
+            }
+        }
+
+        /// Parsed DEBUG cold-hydration events for one tab, in emission order.
+        private static func coldHydrationEvents(tabID: UUID) -> [(name: String, fields: [String: String])] {
+            let markerNames = Set([
+                "agentMode.activation.coldTaskWillCreate",
+                "agentMode.activation.coldTaskEntered",
+                "agentSessionHydration.prepareWillAwait",
+                "agentSessionHydration.prepareEntered",
+                "agentSessionHydration.prepare",
+                "agentSessionHydration.prepareDidResume"
+            ])
+            let tabField = "tabID=\(WorkspaceRestorePerfLog.shortID(tabID))"
+            return WorkspaceRestorePerfLog.recentMetricLinesSnapshot(limit: 2000).compactMap { line in
+                let tokens = line.split(separator: " ").map(String.init)
+                guard tokens.count > 1, markerNames.contains(tokens[1]), tokens.contains(tabField) else {
+                    return nil
+                }
+                var fields: [String: String] = [:]
+                for token in tokens.dropFirst(2) {
+                    let pair = token.split(separator: "=", maxSplits: 1).map(String.init)
+                    if pair.count == 2 { fields[pair[0]] = pair[1] }
+                }
+                return (tokens[1], fields)
+            }
+        }
+
         /// Activations that end without a cold load (no bound session; warm session) leave transcript UI
         /// publication immediate: a later loading-flag update reaches the store synchronously.
         func testEarlyExitAndWarmActivationsLeaveTranscriptPublicationImmediate() async throws {
