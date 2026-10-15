@@ -191,6 +191,8 @@ Step D5 — done | rounds 1/2 | open: none | downgraded: none | assumed: focused
 
 ### D6 — Sidebar: one build per render pass
 
+Step D6-initial-viewport — done | rounds 1/2 | open: none; D6-initial-viewport-final.md | downgraded: none | assumed: initialOffset-only native bottom; exact1pt/current-layout skip; old-code hosted failure and final61 tests pass; A/B re-reviews approve and V-1 closed | deferred: live first-frame/late-height qualification, existing16pt correction and minor settle-grace difference per final evidence
+
 Step D6-structural-visibility — done | rounds 0/2 | open: none; D6-structural-visibility-final.md | downgraded: none | assumed: exact-ID query supports all tiers via existing authorities; initial A/B approve; combined187 plus final30 tests; synthetic DEBUG1500-item prep660.3→619.5ms | deferred: live latency/RSS, shared split consolidation and global counter isolation per final evidence
 
 Step D6-unused-language-inventory — done | rounds 0/2 | open: none; D6-recount-inventory-final.md | downgraded: none | assumed: unused inventory removed; selected/empty real-store red-green proof; final140 tests and independent reviews passed; prior176.4ms envelope includes34ms inventory CPU, not promised gain | deferred: live latency/RSS, exact sidebar publisher attribution and larger cold-pass redesign

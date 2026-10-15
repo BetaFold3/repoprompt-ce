@@ -2514,6 +2514,7 @@ struct AgentModeChatDetailView: View {
             messageListContent(viewportHeight: viewportHeight, proxy: proxy)
         }
         .id(transcriptScrollResetRevision)
+        .modifier(AgentTranscriptInitialBottomAnchor())
         .accessibilityIdentifier("agentTranscript.scrollView")
         .coordinateSpace(name: "AgentTranscriptScrollSpace")
         .transaction { txn in
@@ -4340,6 +4341,27 @@ struct AgentModeChatDetailView: View {
         recordCurrentRehydrateLayoutSample()
     }
 
+    /// macOS 15 instances start at their native bottom (`AgentTranscriptInitialBottomAnchor`).
+    /// When a current-generation layout sample shows the instance still at that native bottom,
+    /// the restore's `bottomTarget` scroll would only move the view up by the content's bottom
+    /// padding (16 points measured offscreen), so it is skipped. Otherwise the existing restore
+    /// scroll still runs.
+    private func isLiveBottomRestoreSatisfiedByNativeInitialLayout(
+        tabID: UUID,
+        presentationRevision: Int
+    ) -> Bool {
+        guard #available(macOS 15.0, *) else { return false }
+        return AgentTranscriptRehydrateRestoreLayoutPolicy.canSkipLiveBottomRestoreScroll(
+            hasNativeInitialBottomAnchor: true,
+            isProgrammaticScrollInFlight: programmaticScrollGate.isInFlight,
+            currentLayoutSampleKey: currentRehydrateLayoutSampleKey,
+            tabID: tabID,
+            presentationRevision: presentationRevision,
+            layoutPassToken: rehydrateLayoutPassToken,
+            metrics: scrollMetrics
+        )
+    }
+
     private func canCompleteLiveBottomRehydrateRestore(
         tabID: UUID,
         presentationRevision: Int
@@ -5067,6 +5089,11 @@ struct AgentModeChatDetailView: View {
             }
             rehydrateRestorePhase = .driving(tabID: tabID, presentationRevision: presentationRevision, target: target)
             if case .liveBottom = target {
+                if isLiveBottomRestoreSatisfiedByNativeInitialLayout(tabID: tabID, presentationRevision: presentationRevision) {
+                    debugLog("scheduleAwaitingLayoutRestore skipped redundant bottom scroll", details: "presentationRevision=\(presentationRevision)")
+                    finishRehydrateRestoreIfSettled()
+                    return
+                }
                 markColdRestoreBottomRequest(corrective: false)
             }
             if let restoreIntent = rehydrateRestoreIntent(for: target, tabID: tabID) {
