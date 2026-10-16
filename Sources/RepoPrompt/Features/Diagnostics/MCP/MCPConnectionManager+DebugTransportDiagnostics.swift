@@ -3,6 +3,7 @@
 import Foundation
 import MCP
 import RepoPromptAgentCore
+import RepoPromptShared
 import RepoPromptWorkspace
 
 #if DEBUG
@@ -72,7 +73,8 @@ import RepoPromptWorkspace
                 "client_name": clientName ?? NSNull(),
                 "normalized_client_id": debugNormalizedClientID(for: clientName) ?? NSNull(),
                 "window_id": windowID ?? NSNull(),
-                "binding_kind": bindingKind
+                "binding_kind": bindingKind,
+                "buildLane": RepoPromptBuildLane.current.rawValue
             ]
             if let tag = debugString(arguments, "tag") {
                 payload["tag"] = tag
