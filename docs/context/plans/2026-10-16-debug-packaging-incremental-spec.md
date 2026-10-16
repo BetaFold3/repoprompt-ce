@@ -417,7 +417,7 @@ Step 1 — done | rounds 0/2 | open: none | downgraded: none | assumed: accept f
 
 ### Step 2 — Drop the debug main-executable sign
 
-Step 2 — todo | rounds 0/2 | open: | downgraded: | assumed: | deferred:
+Step 2 — blocked | rounds 0/2 | open: full packaging/launch acceptance pending permission; owner question timed out | downgraded: none | assumed: reversible local checkpoint accepted by both reviewers; identical-input real signing passes Apple Development and ad-hoc | deferred: live A/B and conductor run not performed; known baseline lint assertion; evidence: step-2/findings.md, step-2/reviews/disposition.md
 
 - **Change:** gate `:519` on `IS_RELEASE`, and add a static test for the gate.
 - **Validation:** run the live comparison against the baseline worktree on identical inputs; deep verify passes; the app launches through `./conductor run`.

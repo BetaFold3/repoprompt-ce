@@ -250,6 +250,53 @@ APP_SIGN_ARGS=(){app_signing_body}
             ],
         )
 
+    def test_main_executable_separate_sign_is_release_only(self) -> None:
+        package_script = (SCRIPT_DIR / "package_app.sh").read_text(encoding="utf-8")
+        main_sign = 'sign_path "$APP_BUNDLE/Contents/MacOS/$APP_NAME"'
+        # Static: the release line is verbatim and is the whole body of an IS_RELEASE gate.
+        self.assertEqual(package_script.count(main_sign), 1)
+        self.assertIn(f"if (( IS_RELEASE )); then\n{main_sign}\nfi\nAPP_SIGN_ARGS=()\n", package_script)
+        self.assertLess(
+            package_script.index('sign_path "$APP_BUNDLE/Contents/MacOS/repoprompt-gateway"'), package_script.index(main_sign)
+        )
+        # Stub probe: run the real signing-call block with sign_path recording its target paths.
+        signing_calls = package_script.split("\nverify_signed_app_identity(){", 1)[1].split("\n}\n", 1)[1].split(
+            "if (( FAST_PACKAGE_CAN_SKIP_VERIFICATION )); then", 1
+        )[0]
+        self.assertTrue(signing_calls.startswith('if [[ -d "$APP_BUNDLE/Contents/Frameworks/Sparkle.framework" ]]'))
+        temp_dir = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, temp_dir, True)
+        app_bundle = temp_dir / "RepoPrompt.app"
+        (app_bundle / "Contents" / "Frameworks" / "Sparkle.framework").mkdir(parents=True)
+        probe = temp_dir / "signing-calls-probe.sh"
+        probe.write_text(
+            "#!/usr/bin/env bash\nset -euo pipefail\n"
+            'sign_path(){ printf \'%s\\n\' "$*"; }\n'
+            'sign_sparkle_framework(){ printf \'sparkle %s\\n\' "$1"; }\n'
+            f"APP_NAME=RepoPrompt\nAPP_BUNDLE='{app_bundle}'\nAPP_ENTITLEMENTS=/tmp/e.plist\n"
+            "USE_ADHOC_SIGNING=0\nUSE_LOCAL_SELF_SIGNED_RELEASE=0\nIS_RELEASE=\"$1\"\n" + signing_calls,
+            encoding="utf-8",
+        )
+        probe.chmod(0o755)
+        macos = f"{app_bundle}/Contents/MacOS"
+        expected = {
+            "0": [f"{macos}/repoprompt-mcp", f"{macos}/repoprompt-gateway", str(app_bundle)],
+            "1": [
+                f"{macos}/repoprompt-mcp",
+                f"{macos}/repoprompt-gateway",
+                f"{macos}/RepoPrompt",
+                f"{app_bundle} --entitlements /tmp/e.plist",
+            ],
+        }
+        for is_release, calls in expected.items():
+            with self.subTest(is_release=is_release):
+                result = subprocess.run([str(probe), is_release], text=True, capture_output=True)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(
+                    result.stdout.splitlines(),
+                    [f"sparkle {app_bundle}/Contents/Frameworks/Sparkle.framework", *calls],
+                )
+
     def test_custom_packaging_resigns_sparkle_helpers_without_recursive_entitlement_propagation(self) -> None:
         package_script = (SCRIPT_DIR / "package_app.sh").read_text(encoding="utf-8")
         staged_signing_script = (SCRIPT_DIR / "sign_staged_release.sh").read_text(encoding="utf-8")

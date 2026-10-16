@@ -558,7 +558,10 @@ verify_signed_app_identity(){
 if [[ -d "$APP_BUNDLE/Contents/Frameworks/Sparkle.framework" ]]; then sign_sparkle_framework "$APP_BUNDLE/Contents/Frameworks/Sparkle.framework"; fi
 sign_path "$APP_BUNDLE/Contents/MacOS/repoprompt-mcp"
 sign_path "$APP_BUNDLE/Contents/MacOS/repoprompt-gateway"
+# Debug: the outer bundle sign below signs the main executable, so the separate pass is release-only.
+if (( IS_RELEASE )); then
 sign_path "$APP_BUNDLE/Contents/MacOS/$APP_NAME"
+fi
 APP_SIGN_ARGS=()
 if (( IS_RELEASE )) && (( ! USE_ADHOC_SIGNING )); then
     APP_SIGN_ARGS+=(--entitlements "$APP_ENTITLEMENTS")
