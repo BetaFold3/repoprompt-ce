@@ -191,7 +191,7 @@ Step D5 — done | rounds 1/2 | open: none | downgraded: none | assumed: focused
 
 ### D6 — Sidebar: one build per render pass
 
-Step D6-render-server-spinner — done | rounds 0/2 | open: none; D6-render-server-spinner-review-r0.md | downgraded: none | assumed: preserve current Reduce Motion behavior; both initial reviews no P0/P1; wall-clock phase and 60 fps cap from B P3; 8 tests f1b4864b | deferred: live stall/VoiceOver/idle-profile check, B P2-2 production-hosting test, B P3-3 teardown simplification
+Step D6-render-server-spinner — done | rounds 0/2 | open: none; D6-render-server-spinner-review-r0.md | downgraded: none | assumed: preserve current Reduce Motion behavior; both initial reviews no P0/P1; wall-clock phase and 60 fps cap from B P3; 8 tests f1b4864b | deferred: VoiceOver/idle-profile check (owner reports a running row's spinner kept turning while a large session opened, 2026-10-16), B P2-2 production-hosting test, B P3-3 teardown simplification
 
 Step D6-highlight-first — done | rounds 0/2 | open: none; D6-highlight-first-review-r0.md | downgraded: none | assumed: sidebar-local best-effort run-loop deferral; OracleA dissent recorded in D6-next-directions-consultation.md; A D6-01 and B R1 fixed; 7 tests 5360fb6b | deferred: keyboard/MCP entry points unchanged, instrumented highlight timing (owner reports immediate highlight 2026-10-16, D6-2026-10-16-live-check.md), B R2 probe metric label, R4 body-pass count, R5/R6
 
@@ -209,7 +209,7 @@ Step D6-sidebar-search-corpus — done | rounds 0/2 | open: none; D6-sidebar-sea
 
 Step D6-collapsed-link-scan — done | rounds 0/2 | open: none; D6-collapsed-link-scan-implementation.md; D6-collapsed-link-scan-review-r0.md | downgraded: none | assumed: OracleB CLS-1 scan only the preview-bounded prefix (owner kept it 2026-10-16); O(preview) collapse check; owner live paste check fine (D6-2026-10-16-live-check.md); DEBUG fresh-string 1 MB paste 317–359→0.02–0.23 ms advisory; c6d45477 | deferred: CLS-2 test (no view seam)
 
-Step D6-cold-scanner — done | rounds 0/2 | open: none; D6-cold-critical-path-rebaseline.md; D6-cold-next-step-consultation.md; D6-cold-storage-skip-proof-scout.md; D6-cold-scanner-implementation.md; D6-cold-scanner-review-r0.md | downgraded: none | assumed: both plan lanes agreed on the scanner first; pointer re-host with the same state machine plus measured top/depth and if-case; frozen reference differential over corpus, hand cases, truncations and 20k mutations; A D6-01 and all B P2/P3 applied; DEBUG 1.65 MB decode 66.8→31.3 ms advisory; bcf4544d | deferred: Tier B memchr (≈6–7 ms ceiling), storage-skip on load (lanes split; proof scout found a privacy lag; owner question timed out, proceeded on recommendation: stop, keep load-time canonicalization), payload-map restriction (proof gate failed), frozen-limit precheck, working-items reuse, re-baseline and live check
+Step D6-cold-scanner — done | rounds 0/2 | open: none; D6-cold-critical-path-rebaseline.md; D6-cold-next-step-consultation.md; D6-cold-storage-skip-proof-scout.md; D6-cold-scanner-implementation.md; D6-cold-scanner-review-r0.md | downgraded: none | assumed: both plan lanes agreed on the scanner first; pointer re-host with the same state machine plus measured top/depth and if-case; frozen reference differential over corpus, hand cases, truncations and 20k mutations; A D6-01 and all B P2/P3 applied; DEBUG 1.65 MB decode 66.8→31.3 ms advisory; bcf4544d | deferred: Tier B memchr (≈6–7 ms ceiling), storage-skip on load (lanes split; proof scout found a privacy lag; owner chose to stop 2026-10-16), payload-map restriction (proof gate failed), frozen-limit precheck, working-items reuse, re-baseline and live check
 
 Step D6-initial-viewport — done | rounds 2/2 | open: none; D6-first-layout-markdown-final.md; D6-first-layout-markdown-live.md | downgraded: none | assumed: installed33e06b1b verified;49 tests and A/B approval retained; owner reports latest text stays in place on warm return;27 activations captured, not pixel proof or matched speedup | deferred: broad first-frame/long-completion cost, recurring shift attribution if observed, large-cold/RSS, existing16pt correction/settle-grace and minor memo allocation
 
@@ -368,6 +368,8 @@ Pursue this only if, after D0–D7, the active-tab incremental refresh p95 is ab
 - `logCodexDebug(... transcriptRowDebugWindow(...))` on every refresh. Verify whether its argument is an `@autoclosure`.
 
 ## Decisions and provenance
+
+- Owner Decision (2026-10-16): Stop the cold-open work after the scanner step; keep load-time storage canonicalization (no storage skip on open).
 
 - Owner Decision (2026-10-16): Keep the preview-bounded collapsed link scan; a displayed `x.md` + combining mark no longer depends on a supported path later in the message.
 
