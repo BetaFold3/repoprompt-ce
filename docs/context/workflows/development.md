@@ -124,6 +124,12 @@ Concurrent direct `package_app.sh` runs are unsupported; the conductor heavy slo
 - After a relinking one-file app edit, non-compile time was 7.20 s versus 7.32 s (paired median −0.53 s; 1 versus 8 signs).
 - A staged package into empty staging took 5.05 s versus 9.32 s. This used conductor's real staging and activation functions, not `./conductor run`.
 
+**Live acceptance** passed on 2026-10-16 with the owner's approval. It ran into `/Applications/RepoPrompt CE Dev.app` with the Apple Development identity, and was two successful `./conductor run`s:
+- The first was a `fresh` package that stopped the running app and launched the new one.
+- The second was a `noop-clone` that stopped and relaunched again. The staged root inode became the installed inode.
+
+A no-change `./conductor build` after launch was then `noop-dest`, with no signing. Every run passed the full checks, and the relaunched app answered `rpce-cli-debug` `windows`. Repeated clone-after-clone reuse was covered only by isolated non-launching runs, not by a third restart. An earlier attempt failed because a `./conductor build` had replaced the bundle under a running app (see the caution under Publish). After a normal quit and reopen, the retries above succeeded.
+
 The raw evidence is local working evidence. It lives only in the main checkout's git-excluded `.agent-artifacts/debug-packaging-incremental/`, is not tracked, and is absent from other clones.
 
 If the daemon is unavailable and direct packaging fails or hangs, capture traced output with `VERBOSE=1 ./Scripts/package_app.sh debug 2>&1 | tee /tmp/repoprompt-build.log`.
