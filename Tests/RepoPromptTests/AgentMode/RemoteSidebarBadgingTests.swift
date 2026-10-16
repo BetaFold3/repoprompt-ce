@@ -95,6 +95,83 @@ final class RemoteSidebarBadgingTests: XCTestCase {
         XCTAssertEqual(parent.hiddenThreadDescendantCount, 1)
     }
 
+    func testRowBasedCollapseAPIsMatchTabBasedAPIs() {
+        let viewModel = makeViewModel()
+        let parentTabID = id(15)
+        let childTabID = id(16)
+        let parentSessionID = id(115)
+        let childSessionID = id(116)
+        let tabs = [
+            tab(parentTabID, sessionID: parentSessionID),
+            tab(childTabID, sessionID: childSessionID)
+        ]
+        let workspace = WorkspaceModel(
+            name: "Row Collapse Parity",
+            repoPaths: [],
+            ephemeralFlag: true,
+            composeTabs: tabs,
+            activeComposeTabID: nil
+        )
+        let owner = viewModel.test_receiveWorkspaceSwitchNotification(workspace)
+        viewModel.test_installSessionIndexSnapshot(
+            sessionIndex([
+                entry(parentSessionID, tabID: parentTabID, lastUserMessageAt: date(100)),
+                entry(
+                    childSessionID,
+                    tabID: childTabID,
+                    parentSessionID: parentSessionID,
+                    lastUserMessageAt: date(50)
+                )
+            ]),
+            owner: owner,
+            latestOwner: owner,
+            activeWorkspace: workspace
+        )
+
+        func assertParity(
+            searchText: String,
+            expected: AgentModeViewModel.SidebarCollapseAllState,
+            line: UInt = #line
+        ) {
+            let rows = viewModel.filteredSidebarSessions(
+                for: tabs,
+                currentTabID: nil,
+                searchText: searchText
+            )
+            XCTAssertEqual(
+                viewModel.collapsibleSidebarThreadKeys(filteredRows: rows),
+                viewModel.collapsibleSidebarThreadKeys(for: tabs, currentTabID: nil, searchText: searchText),
+                line: line
+            )
+            let tabState = viewModel.sidebarCollapseAllState(for: tabs, currentTabID: nil, searchText: searchText)
+            let rowState = viewModel.sidebarCollapseAllState(
+                filteredRows: rows,
+                currentTabID: nil,
+                searchText: searchText
+            )
+            XCTAssertEqual(rowState, tabState, line: line)
+            XCTAssertEqual(rowState, expected, line: line)
+        }
+
+        assertParity(searchText: "", expected: .canCollapse)
+        XCTAssertEqual(
+            viewModel.collapsibleSidebarThreadKeys(
+                filteredRows: viewModel.filteredSidebarSessions(for: tabs, currentTabID: nil, searchText: "")
+            ),
+            [.session(parentSessionID)]
+        )
+        assertParity(searchText: "zz-no-session-matches-this", expected: .hidden)
+        // A matching child keeps its ancestor thread in the rows, but search still hides
+        // collapse-all. Empty search results alone would not exercise that short-circuit.
+        let matchingSearch = "Tab 0016"
+        let matchingRows = viewModel.filteredSidebarSessions(for: tabs, currentTabID: nil, searchText: matchingSearch)
+        XCTAssertEqual(viewModel.collapsibleSidebarThreadKeys(filteredRows: matchingRows), [.session(parentSessionID)])
+        assertParity(searchText: matchingSearch, expected: .hidden)
+
+        viewModel.setSidebarThreadCollapsed(true, for: .session(parentSessionID))
+        assertParity(searchText: "", expected: .canExpand)
+    }
+
     func testScheduledStatusSurvivesThreadCollapseCopy() {
         let viewModel = makeViewModel()
         let parentTabID = id(13)

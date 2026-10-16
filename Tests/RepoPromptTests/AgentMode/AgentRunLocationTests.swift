@@ -235,6 +235,8 @@ final class AgentRunLocationTests: XCTestCase {
         XCTAssertTrue(didBridgeActiveComposeTabChange)
         XCTAssertEqual(fixture.viewModel.currentTabID, tabID)
         XCTAssertEqual(session.remoteHost?.hostID, fixture.host.id)
+        XCTAssertEqual(session.selectedModelRaw, RemoteHostAgentCatalog.hostDefaultModelID)
+        XCTAssertEqual(fixture.viewModel.selectedModelRaw, RemoteHostAgentCatalog.hostDefaultModelID)
         XCTAssertEqual(
             fixture.viewModel.ui.statusPills.snapshot.runLocation?.selection,
             .host(hostID: fixture.host.id)

@@ -1475,7 +1475,467 @@ final class AgentStaleResetOwnershipTests: XCTestCase {
         XCTAssertNil(owner.session.persistenceState)
     }
 
+    // MARK: - Interactive creation at tab capacity
+
+    func testInteractiveCreationReturnsAfterCommittedAutoStashWhileOwnedCleanupIsHeld() async throws {
+        let capacity = try await makeCapacityFixture(windowID: 4430)
+        let fixture = capacity.base
+        let viewModel = fixture.viewModel
+        let targetTabID = capacity.targetTabID
+        let gate = StaleResetGate()
+        viewModel.test_composeTabRemovalPhaseTwoHook = { [gate] held in
+            guard held.tabID == targetTabID else { return }
+            await gate.waitForRelease()
+        }
+        defer {
+            viewModel.test_composeTabRemovalPhaseTwoHook = nil
+            gate.release()
+        }
+
+        let creation = CreationResultBox()
+        let creationTask = Task { @MainActor in
+            creation.tabID = await viewModel.createAndActivateSessionTab(focusComposer: true)
+            creation.finished = true
+        }
+        try await waitUntil("owned cleanup held") { gate.isWaiting }
+        try await waitUntil("interactive creation returned while cleanup is held") { creation.finished }
+        await creationTask.value
+
+        let createdTabID = try XCTUnwrap(creation.tabID)
+        XCTAssertEqual(fixture.promptManager.activeComposeTabID, createdTabID)
+        XCTAssertEqual(viewModel.ui.composer.focusRequest?.tabID, createdTabID)
+        XCTAssertEqual(fixture.composeTabIDs().count, capacity.softLimit, "Admission never overflows")
+        XCTAssertFalse(fixture.composeTabIDs().contains(targetTabID))
+        let stashed = try XCTUnwrap(fixture.stashedTabs().first { $0.tab.id == targetTabID })
+        XCTAssertEqual(stashed.tab.activeAgentSessionID, capacity.targetSessionID)
+        XCTAssertEqual(viewModel.tabDraftText[targetTabID], "Archived draft")
+        XCTAssertNotNil(viewModel.reservedComposeTabIDs[targetTabID], "The committed operation keeps its reservation")
+        XCTAssertEqual(viewModel.composeTabRemovalOperations.count, 1)
+        let archived = try await viewModel.test_dataService.loadAgentSession(
+            id: capacity.targetSessionID,
+            for: fixture.workspace
+        )
+        XCTAssertNotNil(archived, "Stash never deletes the persisted session")
+
+        // Other tabs stay removable while the archived target's cleanup is held.
+        let fillerTabID = capacity.fillerTabIDs[0]
+        await viewModel.deleteSession(tabID: fillerTabID)
+        XCTAssertFalse(fixture.composeTabIDs().contains(fillerTabID))
+
+        let blockedRestore = await fixture.promptManager.restoreStashedComposeTab(containingTabID: targetTabID)
+        XCTAssertNil(blockedRestore, "Restore is refused while the reservation is held")
+        XCTAssertFalse(fixture.composeTabIDs().contains(targetTabID))
+
+        gate.release()
+        try await waitUntil("owned cleanup finished") { viewModel.composeTabRemovalOperations.isEmpty }
+        XCTAssertTrue(viewModel.reservedComposeTabIDs.isEmpty)
+
+        let restored = await fixture.promptManager.restoreStashedComposeTab(containingTabID: targetTabID)
+        XCTAssertEqual(restored?.id, targetTabID)
+        XCTAssertTrue(fixture.composeTabIDs().contains(targetTabID))
+        XCTAssertNotNil(viewModel.session(for: targetTabID, createIfNeeded: true))
+    }
+
+    func testDefaultCreationAndOptedInActiveTargetStashStillAwaitHeldCleanup() async throws {
+        let capacity = try await makeCapacityFixture(windowID: 4431)
+        let fixture = capacity.base
+        let viewModel = fixture.viewModel
+        let targetTabID = capacity.targetTabID
+        let activeTarget = CreationResultBox()
+        let firstGate = StaleResetGate()
+        let secondGate = StaleResetGate()
+        viewModel.test_composeTabRemovalPhaseTwoHook = { [firstGate, secondGate, activeTarget] held in
+            if held.tabID == targetTabID {
+                await firstGate.waitForRelease()
+            } else if held.tabID == activeTarget.tabID {
+                await secondGate.waitForRelease()
+            }
+        }
+        defer {
+            viewModel.test_composeTabRemovalPhaseTwoHook = nil
+            firstGate.release()
+            secondGate.release()
+        }
+
+        // Non-interactive creation keeps the existing wait on the owned cleanup.
+        let creation = CreationResultBox()
+        let creationTask = Task { @MainActor in
+            creation.tabID = await viewModel.createAndActivateSessionTab()
+            creation.finished = true
+        }
+        try await waitUntil("owned cleanup held") { firstGate.isWaiting }
+        try await Task.sleep(nanoseconds: 50_000_000)
+        XCTAssertFalse(creation.finished, "Default creation waits for post-commit cleanup")
+        firstGate.release()
+        await creationTask.value
+        let createdTabID = try XCTUnwrap(creation.tabID)
+        XCTAssertTrue(viewModel.composeTabRemovalOperations.isEmpty)
+
+        // Opting in does not defer a stash that activates a replacement tab.
+        activeTarget.tabID = createdTabID
+        let stash = CreationResultBox()
+        let stashTask = Task { @MainActor in
+            await fixture.promptManager.stashTab(
+                createdTabID,
+                cleanupWait: .deferEligibleInactiveAutoStashCleanup
+            )
+            stash.finished = true
+        }
+        try await waitUntil("active-target cleanup held") { secondGate.isWaiting }
+        try await Task.sleep(nanoseconds: 50_000_000)
+        XCTAssertFalse(stash.finished, "An active-target stash waits even when deferral is requested")
+        XCTAssertNotEqual(fixture.promptManager.activeComposeTabID, createdTabID)
+        secondGate.release()
+        await stashTask.value
+        XCTAssertTrue(viewModel.composeTabRemovalOperations.isEmpty)
+        XCTAssertTrue(viewModel.reservedComposeTabIDs.isEmpty)
+    }
+
+    func testVetoedCapacityStashRefusesCreationAndLeavesPriorSessionUntouched() async throws {
+        let capacity = try await makeCapacityFixture(windowID: 4432)
+        let fixture = capacity.base
+        let viewModel = fixture.viewModel
+        let targetTabID = capacity.targetTabID
+        let priorParentSessionID = UUID()
+        capacity.primary.parentSessionID = priorParentSessionID
+        let tabIDsBefore = fixture.composeTabIDs()
+
+        let replacement = AgentTabSession(tabID: targetTabID)
+        viewModel.test_composeTabsWillCloseBeforeFinalSaveHook = { [viewModel, replacement] held in
+            guard held.tabID == targetTabID else { return }
+            viewModel.test_installLiveSession(replacement)
+        }
+        defer { viewModel.test_composeTabsWillCloseBeforeFinalSaveHook = nil }
+
+        let created = await viewModel.createAndActivateSessionTab(focusComposer: true)
+
+        XCTAssertNil(created, "A vetoed stash frees no capacity, so creation is refused")
+        XCTAssertEqual(fixture.composeTabIDs(), tabIDsBefore)
+        XCTAssertEqual(fixture.promptManager.activeComposeTabID, fixture.primaryTabID)
+        XCTAssertNil(viewModel.ui.composer.focusRequest)
+        XCTAssertEqual(capacity.primary.parentSessionID, priorParentSessionID, "The prior session is never treated as fresh")
+        XCTAssertEqual(capacity.primary.items.map(\.text), ["Primary history"])
+        XCTAssertTrue(viewModel.sessions[targetTabID] === replacement)
+        XCTAssertTrue(viewModel.reservedComposeTabIDs.isEmpty)
+        XCTAssertTrue(viewModel.composeTabRemovalOperations.isEmpty)
+    }
+
+    func testWindowCloseDrainsDeferredCreationCleanupAndRefusesNewRemovalCommits() async throws {
+        let capacity = try await makeCapacityFixture(windowID: 4433)
+        let fixture = capacity.base
+        let viewModel = fixture.viewModel
+        let targetTabID = capacity.targetTabID
+        let gate = StaleResetGate()
+        viewModel.test_composeTabRemovalPhaseTwoHook = { [gate] held in
+            guard held.tabID == targetTabID else { return }
+            await gate.waitForRelease()
+        }
+        defer {
+            viewModel.test_composeTabRemovalPhaseTwoHook = nil
+            gate.release()
+        }
+
+        let creation = CreationResultBox()
+        let creationTask = Task { @MainActor in
+            creation.tabID = await viewModel.createAndActivateSessionTab(focusComposer: true)
+            creation.finished = true
+        }
+        try await waitUntil("owned cleanup held") { gate.isWaiting }
+        try await waitUntil("interactive creation returned") { creation.finished }
+        await creationTask.value
+        XCTAssertNotNil(creation.tabID)
+
+        // A removal admitted and prepared before close begins must still be refused at the
+        // synchronous commit once close is in progress.
+        let lateTabID = capacity.fillerTabIDs[1]
+        let lateAdmission = await viewModel.admitComposeTabRemoval(tabIDs: [lateTabID], reason: .close)
+        let lateOperationID = try XCTUnwrap(lateAdmission)
+        let latePrepared = await viewModel.prepareComposeTabRemoval(operationID: lateOperationID)
+        XCTAssertTrue(latePrepared)
+
+        let close = CreationResultBox()
+        let closeTask = Task { @MainActor in
+            await viewModel.prepareForWindowClose()
+            close.finished = true
+        }
+        try await Task.sleep(nanoseconds: 50_000_000)
+        XCTAssertFalse(close.finished, "Window close waits for committed cleanup")
+
+        let fillerTabID = capacity.fillerTabIDs[0]
+        await fixture.promptManager.closeComposeTab(fillerTabID)
+        XCTAssertTrue(fixture.composeTabIDs().contains(fillerTabID), "No removal commits after close begins")
+        XCTAssertEqual(Set(viewModel.reservedComposeTabIDs.keys), [targetTabID, lateTabID])
+
+        let lateMutation = CreationResultBox()
+        let lateCommitted = viewModel.commitComposeTabRemoval(
+            operationID: lateOperationID,
+            promptMutation: {
+                lateMutation.finished = true
+                return true
+            },
+            promptCleanup: { _ in }
+        )
+        XCTAssertFalse(lateCommitted, "A prepared removal cannot commit after close begins")
+        XCTAssertFalse(lateMutation.finished, "The refused commit never mutates Prompt")
+        XCTAssertTrue(fixture.composeTabIDs().contains(lateTabID))
+        viewModel.finalizeComposeTabRemoval(operationID: lateOperationID)
+        XCTAssertNil(viewModel.reservedComposeTabIDs[lateTabID])
+        XCTAssertEqual(Set(viewModel.reservedComposeTabIDs.keys), [targetTabID])
+
+        gate.release()
+        await closeTask.value
+        XCTAssertTrue(close.finished)
+        XCTAssertTrue(viewModel.composeTabRemovalOperations.isEmpty)
+        XCTAssertTrue(viewModel.reservedComposeTabIDs.isEmpty)
+    }
+
+    func testAwaitedInteractiveCreationAdmitsAfterProvenStashDespiteConcurrentBackgroundCreation() async throws {
+        let capacity = try await makeCapacityFixture(windowID: 4436)
+        let fixture = capacity.base
+        let viewModel = fixture.viewModel
+        let targetTabID = capacity.targetTabID
+        let gate = StaleResetGate()
+        viewModel.test_composeTabRemovalPhaseTwoHook = { [gate] held in
+            guard held.tabID == targetTabID else { return }
+            await gate.waitForRelease()
+        }
+        defer {
+            viewModel.test_composeTabRemovalPhaseTwoHook = nil
+            gate.release()
+        }
+
+        let creation = CreationResultBox()
+        let creationTask = Task { @MainActor in
+            creation.tabID = await viewModel.createAndActivateSessionTab(focusComposer: false)
+            creation.finished = true
+        }
+        try await waitUntil("owned cleanup held") { gate.isWaiting }
+        XCTAssertFalse(creation.finished)
+        XCTAssertEqual(fixture.composeTabIDs().count, capacity.softLimit - 1)
+
+        // A background creation lands in the freed slot while the UI creation awaits cleanup.
+        let backgroundTab = await fixture.promptManager.createBackgroundComposeTab(
+            strategy: .blank,
+            name: "Concurrent background",
+            capacityPolicy: .mcpBackgroundAgent
+        )
+        let backgroundTabID = try XCTUnwrap(backgroundTab?.id)
+        XCTAssertEqual(fixture.composeTabIDs().count, capacity.softLimit)
+
+        gate.release()
+        await creationTask.value
+        let createdTabID = try XCTUnwrap(creation.tabID, "Proven removal admits the UI creation")
+        let tabIDs = fixture.composeTabIDs()
+        XCTAssertTrue(tabIDs.contains(createdTabID))
+        XCTAssertTrue(tabIDs.contains(backgroundTabID))
+        XCTAssertFalse(tabIDs.contains(targetTabID))
+        XCTAssertEqual(tabIDs.count, capacity.softLimit + 1)
+    }
+
+    func testInteractiveCreationInOverLimitWorkspaceKeepsNetTabCount() async throws {
+        let tabCount = Self.composeTabSoftLimit + 5
+        let capacity = try await makeCapacityFixture(windowID: 4434, tabCount: tabCount)
+        let fixture = capacity.base
+        let viewModel = fixture.viewModel
+
+        let created = await viewModel.createAndActivateSessionTab(focusComposer: true)
+
+        let createdTabID = try XCTUnwrap(created, "An already over-limit workspace still admits one-out-one-in")
+        XCTAssertEqual(fixture.promptManager.activeComposeTabID, createdTabID)
+        XCTAssertEqual(fixture.composeTabIDs().count, tabCount)
+        XCTAssertFalse(fixture.composeTabIDs().contains(capacity.targetTabID))
+        XCTAssertTrue(fixture.stashedTabs().contains { $0.tab.id == capacity.targetTabID })
+        try await waitUntil("owned cleanup finished") { viewModel.composeTabRemovalOperations.isEmpty }
+        XCTAssertTrue(viewModel.reservedComposeTabIDs.isEmpty)
+    }
+
+    // MARK: - Cold-hydration save attribution (D2 characterization)
+
+    /// Documents the CURRENT contract, not a desired one: a completed persisted session whose
+    /// provider differs from the placeholder is cold-hydrated into a background tab. Its derived
+    /// stamp keeps the placeholder run state/provider (hydration stamps before those restores), so
+    /// the next background save rejects reuse and takes the persistence-only fallback, even though
+    /// that fallback's production transforms reproduce the installed presentation exactly here.
+    func testColdHydratedBackgroundSessionSaveReuseCharacterization() async throws {
+        let owner = try await makeHarness(windowID: 4390)
+        owner.session.selectedAgent = .openCode
+        owner.session.appendItem(.user("Run the check"))
+        let invocation = UUID()
+        owner.session.appendItem(.toolCall(name: "bash", invocationID: invocation, argsJSON: #"{"command":"echo ok"}"#))
+        owner.session.appendItem(.toolResult(name: "bash", invocationID: invocation, resultJSON: #"{"output":"ok"}"#))
+        owner.session.appendItem(.assistant("Done"))
+        owner.session.runState = .completed
+        let ownerSaved = await owner.viewModel.flushSave(for: owner.tabID)
+        XCTAssertTrue(ownerSaved)
+        let sessionID = try XCTUnwrap(owner.session.activeAgentSessionID)
+        let persisted = try await owner.persistedSession()
+        XCTAssertEqual(persisted.lastRunState, AgentSessionRunState.completed.rawValue)
+        XCTAssertEqual(persisted.agentKind, AgentProviderKind.openCode.rawValue)
+        let persistedSequence = try XCTUnwrap(persisted.transcript?.nextSequenceIndex)
+
+        // Another owner stays active in the peer window; the bound tab hydrates in the background.
+        let peer = try await makeHarness(windowID: 4391, workspace: owner.workspace, storageURL: owner.storageURL)
+        let backgroundTabID = UUID()
+        let background = try XCTUnwrap(peer.viewModel.session(for: backgroundTabID, createIfNeeded: true))
+        let placeholder = (agent: background.selectedAgent, run: background.runState)
+        XCTAssertNotEqual(placeholder.agent, .openCode)
+        XCTAssertEqual(placeholder.run, .idle)
+        let peerBoundAgent = peer.viewModel.selectedAgent
+        XCTAssertNotNil(peer.viewModel.test_installPersistentSessionBinding(sessionID: sessionID, on: background))
+        let hydrated = await peer.viewModel.test_hydrateBoundSession(tabID: backgroundTabID)
+        XCTAssertTrue(hydrated === background)
+        XCTAssertEqual(background.persistedLoadDisposition, .applied)
+        XCTAssertTrue(background.hasLoadedPersistedState)
+        XCTAssertEqual(background.activeAgentSessionID, sessionID)
+        // Non-active-owner branch fixture, not a UI-activation regression: `currentTabID` is pinned
+        // by the harness override. The peer's owner object and its published agent binding stay put.
+        XCTAssertEqual(peer.viewModel.currentTabID, peer.tabID)
+        XCTAssertTrue(peer.viewModel.session(for: peer.tabID, createIfNeeded: false) === peer.session)
+        XCTAssertEqual(peer.viewModel.selectedAgent, peerBoundAgent)
+        XCTAssertEqual(background.selectedAgent, .openCode)
+        XCTAssertEqual(background.runState, .completed)
+        XCTAssertEqual(background.nextSequenceIndex, persistedSequence)
+
+        let protection = peer.viewModel.transcriptProjectionProtection(for: background, transcript: background.transcript)
+        let current = AgentDerivedTranscriptSyncState(
+            sourceItemsRevision: background.sourceItemsRevision,
+            nextSequenceIndex: background.nextSequenceIndex,
+            runState: background.runState,
+            selectedAgent: background.selectedAgent,
+            hidePendingQuestionToolCall: background.hasPendingQuestionUI,
+            projectionProtection: protection
+        )
+        let delta = AgentDerivedTranscriptSyncState.diagnosticDeltaLabel(
+            from: background.derivedTranscriptSyncState,
+            to: current
+        )
+        let stamp = try XCTUnwrap(background.derivedTranscriptSyncState)
+        XCTAssertEqual(stamp.runState, placeholder.run)
+        // The normalized persisted provider is installed before hydration stamps; run state is not.
+        XCTAssertEqual(stamp.selectedAgent, .openCode)
+        XCTAssertEqual(delta, "syncDelta.run", "provider, sequence, revision, ask and protection already match")
+        XCTAssertFalse(peer.viewModel.canReuseDerivedTranscriptForSave(for: background, projectionProtection: protection))
+        XCTAssertNil(background.pendingDerivedTranscriptRefreshReason)
+        XCTAssertNil(background.derivedTranscriptRefreshTask)
+
+        // Independent reference: transforms equivalent to the save fallback, on the final inputs
+        // (no reuse-prefix hint; the real written record below covers the production path).
+        let rebuilt = AgentTranscriptIO.rebuiltTranscriptPreservingCompactedPrefix(
+            existingTranscript: background.transcript,
+            workingItems: background.items,
+            terminalState: background.runState,
+            nextSequenceIndex: background.nextSequenceIndex,
+            policy: .liveSession(hidePendingQuestionToolCall: background.hasPendingQuestionUI),
+            protection: protection
+        )
+        let sanitized = AgentToolResultPersistencePolicy.sanitizeTranscriptWithMetrics(
+            rebuilt,
+            previousSanitizedTranscript: background.transcript,
+            context: AgentToolResultProcessingContext(),
+            purpose: .runtimePresentation
+        ).transcript
+        let reference = AgentTranscriptProjectionBuilder.refreshCompletedFullTurnGroupedHistoryCaches(in: sanitized)
+        let referenceCounts = AgentTranscriptProjectionBuilder.projectionCounts(for: reference)
+
+        // The fallback makes no semantic correction for this case.
+        XCTAssertEqual(reference, background.transcript)
+        XCTAssertEqual(referenceCounts, background.transcriptProjectionCounts)
+        XCTAssertEqual(referenceCounts.canonicalVisibleRowCount, background.transcriptCanonicalVisibleRowCount)
+        XCTAssertEqual(
+            AgentTranscriptIO.lastUserInteractionDate(in: reference),
+            AgentTranscriptIO.lastUserInteractionDate(in: background.transcript)
+        )
+
+        let previousOverride = AgentModePerfDiagnostics.debugProcessOverrideEnabled
+        AgentModePerfDiagnostics.setDebugProcessOverrideEnabled(true)
+        defer { AgentModePerfDiagnostics.setDebugProcessOverrideEnabled(previousOverride) }
+        background.isDirty = true
+        let backgroundSaved = await peer.viewModel.flushSave(for: backgroundTabID)
+        XCTAssertTrue(backgroundSaved)
+        let backgroundTag = "tabID=\(AgentModePerfDiagnostics.shortID(backgroundTabID))"
+        let fallbackLines = AgentModePerfDiagnostics.recentMetricLinesSnapshot(limit: 1000)
+            .filter { $0.contains(" save.session.persistenceOnlySnapshot ") && $0.contains(backgroundTag) }
+        XCTAssertEqual(fallbackLines.count, 1)
+        XCTAssertTrue(
+            fallbackLines.first?.split(separator: " ").contains("syncDelta=syncDelta.run") == true,
+            "\(fallbackLines)"
+        )
+
+        // The record committed by the fallback save (production prefix hint and storage policy),
+        // read through the writer's data service, is semantically equal to the pre-hydration record;
+        // only save metadata may differ. This checks the logical save, not physical rewritten bytes.
+        let writerLoaded = try await peer.viewModel.test_dataService.loadAgentSession(id: sessionID, for: peer.workspace)
+        let resaved = try XCTUnwrap(writerLoaded)
+        XCTAssertEqual(resaved.transcript, persisted.transcript)
+        XCTAssertEqual(resaved.itemCount, persisted.itemCount)
+        XCTAssertEqual(resaved.lastUserMessageAt, persisted.lastUserMessageAt)
+    }
+
     // MARK: - Harness
+
+    /// Mirrors `PromptViewModel.defaultComposeTabSoftLimit`, the interactive auto-stash threshold.
+    private static let composeTabSoftLimit = 50
+
+    private struct CapacityFixture {
+        let base: PromptManagedFixture
+        let softLimit: Int
+        let primary: AgentTabSession
+        /// Least recently used inactive tab with persisted history: the auto-stash target.
+        let targetTabID: UUID
+        let targetSessionID: UUID
+        let fillerTabIDs: [UUID]
+    }
+
+    /// The Prompt-managed fixture filled to the interactive soft limit, with the active primary
+    /// tab holding history (not a placeholder) and `extraTabIDs[0]` as the deterministic target.
+    private func makeCapacityFixture(
+        windowID: Int,
+        tabCount: Int = AgentStaleResetOwnershipTests.composeTabSoftLimit
+    ) async throws -> CapacityFixture {
+        let fixture = try await makePromptManagedFixture(windowID: windowID)
+        let viewModel = fixture.viewModel
+        let softLimit = Self.composeTabSoftLimit
+        let targetTabID = fixture.extraTabIDs[0]
+        let index = try XCTUnwrap(fixture.workspaceManager.workspaces.firstIndex { $0.id == fixture.workspace.id })
+        let targetIndex = try XCTUnwrap(
+            fixture.workspaceManager.workspaces[index].composeTabs.firstIndex { $0.id == targetTabID }
+        )
+        fixture.workspaceManager.workspaces[index].composeTabs[targetIndex].lastModified = .distantPast
+        // Pin every other inactive tab so auto-stash priority selects the target first even
+        // after binding its session marks it dirty.
+        for tabIndex in fixture.workspaceManager.workspaces[index].composeTabs.indices
+            where ![targetTabID, fixture.primaryTabID].contains(fixture.workspaceManager.workspaces[index].composeTabs[tabIndex].id)
+        {
+            fixture.workspaceManager.workspaces[index].composeTabs[tabIndex].isPinned = true
+        }
+        let fillerCount = tabCount - fixture.workspaceManager.workspaces[index].composeTabs.count
+        let fillers = (0 ..< fillerCount).map { ComposeTabState(id: UUID(), name: "Filler \($0)", isPinned: true) }
+        fixture.workspaceManager.workspaces[index].composeTabs.append(contentsOf: fillers)
+        fixture.promptManager.loadComposeTabsFromWorkspace(fixture.workspaceManager.workspaces[index])
+
+        let primary = try await viewModel.ensureSessionReady(tabID: fixture.primaryTabID)
+        primary.appendItem(.user("Primary history"))
+        let primarySaved = await viewModel.flushSave(for: fixture.primaryTabID)
+        XCTAssertTrue(primarySaved)
+        let target = try await viewModel.ensureSessionReady(tabID: targetTabID)
+        target.appendItem(.user("Archived history"))
+        let targetSaved = await viewModel.flushSave(for: targetTabID)
+        XCTAssertTrue(targetSaved)
+        let targetSessionID = try XCTUnwrap(target.activeAgentSessionID)
+        viewModel.tabDraftText[targetTabID] = "Archived draft"
+
+        viewModel.test_setCurrentTabIDOverride(nil)
+        XCTAssertEqual(viewModel.currentTabID, fixture.primaryTabID)
+        XCTAssertEqual(fixture.composeTabIDs().count, tabCount)
+        return CapacityFixture(
+            base: fixture,
+            softLimit: softLimit,
+            primary: primary,
+            targetTabID: targetTabID,
+            targetSessionID: targetSessionID,
+            fillerTabIDs: fillers.map(\.id)
+        )
+    }
 
     private struct PromptManagedFixture {
         let viewModel: AgentModeViewModel
@@ -1491,6 +1951,11 @@ final class AgentStaleResetOwnershipTests: XCTestCase {
         @MainActor
         func composeTabIDs() -> [UUID] {
             workspaceManager.workspaces.first { $0.id == workspace.id }?.composeTabs.map(\.id) ?? []
+        }
+
+        @MainActor
+        func stashedTabs() -> [StashedTab] {
+            workspaceManager.workspaces.first { $0.id == workspace.id }?.stashedTabs ?? []
         }
     }
 
@@ -1708,6 +2173,12 @@ private final class StaleResetGate {
         continuation?.resume()
         continuation = nil
     }
+}
+
+@MainActor
+private final class CreationResultBox {
+    var finished = false
+    var tabID: UUID?
 }
 
 @MainActor

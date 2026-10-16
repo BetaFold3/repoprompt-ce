@@ -100,6 +100,37 @@ package enum AgentTranscriptPresentationBuilder {
         )
     }
 
+    #if DEBUG || EDIT_FLOW_PERF
+        /// Records cumulative process-wide `BashToolResultParser` cache counters, one zero-work
+        /// span per table, so they reach both signposts and the DEBUG EditFlowPerf capture.
+        /// These are counter snapshots, not parser duration measurements; the snapshot is read
+        /// only when a span is live (signposts enabled or capture active).
+        nonisolated static func recordBashParserCacheCounterSnapshots() {
+            for table in ["metadata", "parsed"] {
+                let span = EditFlowPerf.begin(EditFlowPerf.Stage.Transcript.bashParserCache)
+                EditFlowPerf.end(
+                    EditFlowPerf.Stage.Transcript.bashParserCache,
+                    span,
+                    {
+                        let snapshot = BashToolResultParser.cacheCountersSnapshot()
+                        let counters = table == "metadata" ? snapshot.metadata : snapshot.parsed
+                        return EditFlowPerf.Dimensions(
+                            scanKind: table,
+                            hitCount: counters.hitCount,
+                            missCount: counters.missCount,
+                            evictedCount: counters.evictedEntryCount,
+                            entryCount: counters.currentEntryCount
+                        )
+                    }()
+                )
+            }
+        }
+    #endif
+
+    package nonisolated static func transcriptDiagnosticFinalTurnItemCount(_ sourceItems: [AgentChatItem]) -> Int? {
+        AgentTranscriptIO.finalTurnStartIndex(in: sourceItems).map { sourceItems.count - $0 }
+    }
+
     package nonisolated static func buildTranscriptPresentation(
         from transcript: AgentTranscript,
         sourceItems: [AgentChatItem],
@@ -108,13 +139,15 @@ package enum AgentTranscriptPresentationBuilder {
         selectedAgent: AgentProviderKind,
         previousPerformanceSnapshot: AgentTranscriptPerformanceSnapshot,
         previousSanitizedTranscript: AgentTranscript? = nil,
+        previousRawInputEvidence: AgentSanitizeRawInputEvidence? = nil,
         previousBaseProjection: AgentTranscriptProjection? = nil,
         previousTurnProjectionCaches: [UUID: AgentTranscriptTurnProjectionCache] = [:],
         previousProjectionProtection: AgentTranscriptProjectionProtection = .none,
         projectionProtection: AgentTranscriptProjectionProtection = .none,
         isCompressedHistoryRevealed: Bool = false,
         isColdLoad: Bool = false,
-        trustedIncrementalFinalTurnStartSequenceIndex: Int? = nil
+        trustedIncrementalFinalTurnStartSequenceIndex: Int? = nil,
+        diagnosticTabTag: String? = nil
     ) -> AgentBuiltTranscriptPresentation {
         let processingContext = AgentToolResultProcessingContext()
         #if DEBUG || EDIT_FLOW_PERF
@@ -122,7 +155,11 @@ package enum AgentTranscriptPresentationBuilder {
         #endif
         let projectionSignpost = EditFlowPerf.begin(
             EditFlowPerf.Stage.Transcript.projectionBuild,
-            EditFlowPerf.Dimensions(sourceItemCount: sourceItems.count)
+            EditFlowPerf.Dimensions(
+                sourceItemCount: sourceItems.count,
+                tabTag: diagnosticTabTag,
+                finalTurnItemCount: transcriptDiagnosticFinalTurnItemCount(sourceItems)
+            )
         )
         #if DEBUG || EDIT_FLOW_PERF
             let payloadCaptureStartedAt = CFAbsoluteTimeGetCurrent()
@@ -174,22 +211,37 @@ package enum AgentTranscriptPresentationBuilder {
         #endif
         let sanitizeSignpost = EditFlowPerf.begin(
             EditFlowPerf.Stage.Transcript.sanitize,
-            EditFlowPerf.Dimensions(sourceItemCount: sourceItems.count)
+            EditFlowPerf.Dimensions(
+                sourceItemCount: sourceItems.count,
+                tabTag: diagnosticTabTag,
+                finalTurnItemCount: transcriptDiagnosticFinalTurnItemCount(sourceItems)
+            )
         )
-        let sanitizeReusableTurnCount = commonEqualTurnPrefixCount(
-            in: transcript,
-            previousTranscript: previousSanitizedTranscript
-        )
+        // Raw-input activity comparison needs the previous build's exact raw input, processing
+        // flags, and output; with that evidence it replaces the turn-prefix and trusted-suffix
+        // hints. Without it, a live mutation keeps the legacy prefix and trusted-suffix hints,
+        // while a full import takes one recording pass (no prefix hint) so evidence is re-seeded.
+        let usesRawInputActivityReuse = previousRawInputEvidence != nil && previousSanitizedTranscript != nil
+        let seedsRawInputEvidence = !usesRawInputActivityReuse && trustedIncrementalFinalTurnStartSequenceIndex == nil
+        let sanitizeReusableTurnCount = usesRawInputActivityReuse || seedsRawInputEvidence
+            ? 0
+            : commonEqualTurnPrefixCount(
+                in: transcript,
+                previousTranscript: previousSanitizedTranscript
+            )
         #if DEBUG || EDIT_FLOW_PERF
-            if sanitizeReusableTurnCount > 0 {
+            if sanitizeReusableTurnCount > 0 || usesRawInputActivityReuse {
                 performanceSnapshot.sanitizeReuseAttemptCount += 1
             }
         #endif
         let sanitizeMetrics = AgentToolResultPersistencePolicy.sanitizeTranscriptWithMetrics(
             transcript,
             previousSanitizedTranscript: previousSanitizedTranscript,
-            reusablePrefixTurnCount: sanitizeReusableTurnCount > 0 ? sanitizeReusableTurnCount : nil,
-            trustedIncrementalFinalTurnStartSequenceIndex: trustedIncrementalFinalTurnStartSequenceIndex,
+            previousRawInputEvidence: usesRawInputActivityReuse ? previousRawInputEvidence : nil,
+            reusablePrefixTurnCount: seedsRawInputEvidence ? 0 : (sanitizeReusableTurnCount > 0 ? sanitizeReusableTurnCount : nil),
+            trustedIncrementalFinalTurnStartSequenceIndex: usesRawInputActivityReuse
+                ? nil
+                : trustedIncrementalFinalTurnStartSequenceIndex,
             context: processingContext,
             purpose: .runtimePresentation
         )
@@ -198,7 +250,17 @@ package enum AgentTranscriptPresentationBuilder {
             reusablePrefixTurnCount: sanitizeMetrics.reusedTurnCount
         )
         #if DEBUG || EDIT_FLOW_PERF
-            if sanitizeReusableTurnCount > 0 {
+            performanceSnapshot.lastSanitizeReusedActivityCount = usesRawInputActivityReuse
+                ? sanitizeMetrics.reusedActivityCount
+                : nil
+            if usesRawInputActivityReuse {
+                if sanitizeMetrics.reusedActivityCount > 0 {
+                    performanceSnapshot.sanitizeReuseSuccessCount += 1
+                } else {
+                    performanceSnapshot.sanitizeReuseFallbackCount += 1
+                }
+                performanceSnapshot.lastSanitizeReusedTurnCount = sanitizeMetrics.reusedTurnCount
+            } else if sanitizeReusableTurnCount > 0 {
                 if sanitizeMetrics.reusedTurnCount > 0 {
                     performanceSnapshot.sanitizeReuseSuccessCount += 1
                 } else {
@@ -214,8 +276,22 @@ package enum AgentTranscriptPresentationBuilder {
             EditFlowPerf.Stage.Transcript.sanitize,
             sanitizeSignpost,
             EditFlowPerf.Dimensions(
-                outcome: sanitizeMetrics.reusedTurnCount > 0 ? "reused_prefix" : "rebuilt",
-                sanitizedActivityCount: sanitizeMetrics.sanitizedActivityCount
+                outcome: sanitizeMetrics.reusedActivityCount > 0
+                    ? "reused_activities"
+                    : (sanitizeMetrics.reusedTurnCount > 0 ? "reused_prefix" : "rebuilt"),
+                sourceItemCount: sourceItems.count,
+                sanitizedActivityCount: sanitizeMetrics.sanitizedActivityCount,
+                tabTag: diagnosticTabTag,
+                finalTurnItemCount: transcriptDiagnosticFinalTurnItemCount(sourceItems),
+                fallbackReason: sanitizeMetrics.incrementalPathReason.rawValue
+            )
+        )
+        let projectionOnlySignpost = EditFlowPerf.begin(
+            EditFlowPerf.Stage.Transcript.projectionOnly,
+            EditFlowPerf.Dimensions(
+                sourceItemCount: sourceItems.count,
+                tabTag: diagnosticTabTag,
+                finalTurnItemCount: transcriptDiagnosticFinalTurnItemCount(sourceItems)
             )
         )
         let projectionReusableTurnCount = AgentTranscriptIO.validatedReusableFrozenPrefixTurnCount(in: sanitizedTranscript) ?? 0
@@ -291,6 +367,16 @@ package enum AgentTranscriptPresentationBuilder {
         let projection = isCompressedHistoryRevealed ? fullProjection : workingProjection
         let projectionCounts = AgentTranscriptProjectionBuilder.projectionCounts(for: baseProjection)
         let canonicalVisibleRowCount = projectionCounts.canonicalVisibleRowCount
+        EditFlowPerf.end(
+            EditFlowPerf.Stage.Transcript.projectionOnly,
+            projectionOnlySignpost,
+            EditFlowPerf.Dimensions(
+                lineCount: canonicalVisibleRowCount,
+                sourceItemCount: sourceItems.count,
+                tabTag: diagnosticTabTag,
+                finalTurnItemCount: transcriptDiagnosticFinalTurnItemCount(sourceItems)
+            )
+        )
         #if DEBUG
             if AgentTranscriptDebugInstrumentation.isEnabled, let previousBaseProjection {
                 let previousRows = previousBaseProjection.archivedRows + previousBaseProjection.workingRows
@@ -367,6 +453,7 @@ package enum AgentTranscriptPresentationBuilder {
                     regexCaptureCallCount: toolProcessingMetrics.regexCaptureCallCount
                 )
             )
+            recordBashParserCacheCounterSnapshots()
             EditFlowPerf.end(
                 EditFlowPerf.Stage.Transcript.projectionBuild,
                 projectionSignpost,
@@ -375,7 +462,9 @@ package enum AgentTranscriptPresentationBuilder {
                     lineCount: canonicalVisibleRowCount,
                     sourceItemCount: sourceItems.count,
                     retainedPayloadCount: capturedPayloadByItemID.count,
-                    retainedPayloadBytes: capturedPayloadBytes
+                    retainedPayloadBytes: capturedPayloadBytes,
+                    tabTag: diagnosticTabTag,
+                    finalTurnItemCount: transcriptDiagnosticFinalTurnItemCount(sourceItems)
                 )
             )
             if isColdLoad {
@@ -399,7 +488,12 @@ package enum AgentTranscriptPresentationBuilder {
             ),
             sanitizedActivityCount: sanitizeMetrics.sanitizedActivityCount,
             performanceSnapshot: performanceSnapshot,
-            rawToolResultPayloadRenderRevisionByItemID: rawToolResultPayloadRenderRevisionByItemID
+            rawToolResultPayloadRenderRevisionByItemID: rawToolResultPayloadRenderRevisionByItemID,
+            // Only builds that processed (or replayed from evidence) every activity record flags;
+            // prefix or trusted-suffix reuse installs activities unchecked and never seeds evidence.
+            rawInputSanitizeEvidence: sanitizeMetrics.activityProcessingFlags.map {
+                AgentSanitizeRawInputEvidence(importedTranscript: transcript, activityProcessingFlags: $0)
+            }
         )
     }
 

@@ -1221,11 +1221,20 @@ package enum AgentModelCatalog {
         availability: AvailabilityContext,
         codexDynamicModels: [CodexAppServerClient.RemoteModel]?
     ) -> String {
-        let options = options(for: .codexExec, availability: availability, codexDynamicModels: codexDynamicModels)
-        if let option = options.first(where: {
-            CodexAgentToolPreferences.reasoningEffortPreferenceSlug(forModelRaw: $0.rawValue)
-                .caseInsensitiveCompare(modelSlug) == .orderedSame
-        }) {
+        // Equivalent to `options(for: .codexExec, ...).first(where:)`: Codex has no ACP
+        // discovered-model source (`AgentProviderKind.codexExec.acpProviderID == nil`), so the
+        // Codex branch is the availability guard plus the registry resolution, which here stops
+        // at the first matching resolved option instead of building the full list.
+        if isAgentAvailable(.codexExec, availability: availability),
+           let option = AgentCodexModelRegistry.shared.firstResolvedOption(
+               staticOptions: AgentModel.modelsForAgent(.codexExec).map { staticOption($0, for: .codexExec) },
+               preferredLiveModels: codexDynamicModels,
+               matching: {
+                   CodexAgentToolPreferences.reasoningEffortPreferenceSlug(forModelRaw: $0.rawValue)
+                       .caseInsensitiveCompare(modelSlug) == .orderedSame
+               }
+           )
+        {
             return AIModel.stripCodexReasoningSuffix(from: option.displayName)
         }
         return AIModel.codexBaseDisplayName(for: modelSlug, fallbackDisplayName: rawModel)

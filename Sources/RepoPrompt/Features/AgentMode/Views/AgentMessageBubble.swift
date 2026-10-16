@@ -529,7 +529,8 @@ struct AgentMessageBubble: View {
                 isMarkdown: true,
                 allowInteraction: true,
                 detectsMarkdownFilePaths: true,
-                renderCadence: item.isStreaming ? .streamingCoalesced : .immediate
+                renderCadence: item.isStreaming ? .streamingCoalesced : .immediate,
+                prefersSynchronousFirstLayout: true
             )
         }
     }

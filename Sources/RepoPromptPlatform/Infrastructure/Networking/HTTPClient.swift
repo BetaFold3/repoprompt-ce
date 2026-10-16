@@ -3,6 +3,11 @@ import Foundation
 package struct HTTPResponse {
     package let data: Data
     package let http: HTTPURLResponse
+
+    package init(data: Data, http: HTTPURLResponse) {
+        self.data = data
+        self.http = http
+    }
 }
 
 package protocol HTTPClient: Sendable {

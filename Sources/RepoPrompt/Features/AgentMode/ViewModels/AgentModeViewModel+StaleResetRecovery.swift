@@ -429,6 +429,9 @@ extension AgentModeViewModel {
         session.replaceEphemeralToolResultPayloadMap([:], liveItemIDs: [])
         session.activeReasoningItemID = nil
         session.reasoningItemIDsByGroupID.removeAll()
+        session.backgroundRowIDs.removeAll()
+        session.backgroundRowSourceIDs.removeAll()
+        session.backgroundCurrentAssistantRowIDs.removeAll()
         session.codexReasoningSegmentsByKey.removeAll()
         session.clearClaudeReasoningStatus(clearDisplayedStatus: true)
         session.setRunningStatus(nil, source: nil)

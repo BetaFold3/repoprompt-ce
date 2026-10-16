@@ -1917,12 +1917,22 @@ final class ContextBuilderAgentViewModel: ObservableObject {
 
         // Persist tab-specific settings only. Agent/model are global, while token settings
         // are workspace-scoped; neither belongs in the tab configuration.
-        tab.contextBuilder = ContextBuilderTabConfig(
+        let config = ContextBuilderTabConfig(
             instructions: session.contextBuilderInstructions,
             autoGeneratePlan: session.autoGeneratePlan,
             followUpTypeRaw: session.selectedFollowUpType.rawValue,
             selectedContextBuilderPromptIDs: Array(session.selectedContextBuilderPromptIDs)
         )
+        // Only the before-save flush (`persistCurrentSession`) passes `markWorkspaceDirty: false`.
+        // Skip its write only when the config is exactly unchanged AND the live prompt text and
+        // active-tab identities already match the stored tab. Otherwise, keep the old
+        // reload: it pushes stored-only commits (e.g. MCP tab-context prompts) into the live
+        // Prompt before save capture. Changed configs and dirtying callers always write.
+        let reloadWouldChangeLivePrompt = promptManager.activeComposeTabID != tab.id
+            || manager.activeWorkspace?.activeComposeTabID != tab.id
+            || promptManager.promptText != tab.promptText
+        guard markWorkspaceDirty || tab.contextBuilder != config || reloadWouldChangeLivePrompt else { return }
+        tab.contextBuilder = config
         manager.updateComposeTab(tab, markDirty: markWorkspaceDirty)
     }
 

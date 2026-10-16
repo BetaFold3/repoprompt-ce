@@ -45,18 +45,43 @@ final class AgentModeNavigationController: ObservableObject {
 
         windowState.setAgentTitlebarAccessoryVisible(
             true,
-            onNewSession: { [weak agentModeVM] in
-                Task {
-                    await agentModeVM?.createAndActivateSessionTab(focusComposer: true)
-                }
+            onNewSession: { [weak agentModeVM, weak windowState] in
+                #if DEBUG || EDIT_FLOW_PERF
+                    let latencyAction = windowState.flatMap {
+                        AgentInteractionLatencyProbe.beginNewSession(windowID: $0.windowID, source: "titlebarNewSession")
+                    }
+                    Task {
+                        await AgentInteractionLatencyProbe.run(as: latencyAction) {
+                            await agentModeVM?.createAndActivateSessionTab(focusComposer: true)
+                        }
+                    }
+                #else
+                    Task {
+                        await agentModeVM?.createAndActivateSessionTab(focusComposer: true)
+                    }
+                #endif
             },
-            onNewKnowledgeSession: { [weak agentModeVM] in
-                Task {
-                    await agentModeVM?.createAndActivateSessionTab(
-                        profile: .knowledge,
-                        focusComposer: true
-                    )
-                }
+            onNewKnowledgeSession: { [weak agentModeVM, weak windowState] in
+                #if DEBUG || EDIT_FLOW_PERF
+                    let latencyAction = windowState.flatMap {
+                        AgentInteractionLatencyProbe.beginNewSession(
+                            windowID: $0.windowID,
+                            source: "titlebarNewKnowledgeSession"
+                        )
+                    }
+                    Task {
+                        await AgentInteractionLatencyProbe.run(as: latencyAction) {
+                            await agentModeVM?.createAndActivateSessionTab(profile: .knowledge, focusComposer: true)
+                        }
+                    }
+                #else
+                    Task {
+                        await agentModeVM?.createAndActivateSessionTab(
+                            profile: .knowledge,
+                            focusComposer: true
+                        )
+                    }
+                #endif
             },
             isKnowledgeSessionAvailable: agentModeVM.canCreateKnowledgeSession
         )

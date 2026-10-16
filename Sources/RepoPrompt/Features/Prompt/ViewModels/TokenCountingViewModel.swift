@@ -22,7 +22,6 @@ class TokenCountingViewModel: ObservableObject {
     @Published private(set) var fileTreeContent: String = ""
     @Published private(set) var codeMapContent: String = ""
     @Published private(set) var codemapPresentation: WorkspaceCodemapUIPresentationSnapshot = .empty
-    @Published private(set) var scannedLanguages: Set<LanguageType> = []
     @Published private(set) var copyContextTotalTokens: Int = 0
     @Published private(set) var copyContextTokenCountString: String = "0.00k"
 
@@ -504,15 +503,6 @@ class TokenCountingViewModel: ObservableObject {
         return fileManager?.snapshotSelection() ?? StoredSelection()
     }
 
-    private func allStoreFileRecords(from store: WorkspaceFileContextStore) async -> [WorkspaceFileRecord] {
-        let roots = await store.roots()
-        var records: [WorkspaceFileRecord] = []
-        for root in roots {
-            await records.append(contentsOf: store.files(inRoot: root.id))
-        }
-        return records
-    }
-
     private func predominantLanguage(
         from entries: [ResolvedPromptFileEntry],
         includeFiles: Bool,
@@ -591,30 +581,12 @@ class TokenCountingViewModel: ObservableObject {
         let duplicatePromptAtTop = includeUserPrompt ? copySnapshot.duplicateUserInstructionsAtTop : false
 
         let store = fileManager.workspaceFileContextStore
-        #if DEBUG
-            let allFilesStartMS = PromptTokenRecountDiagnostics.start()
-            PromptTokenRecountDiagnostics.event("tokenRecount.calculate.allFiles.begin")
-        #endif
-        let allFileRecords = await allStoreFileRecords(from: store)
-        #if DEBUG
-            PromptTokenRecountDiagnostics.event(
-                "tokenRecount.calculate.allFiles.end",
-                fields: [
-                    "files": "\(allFileRecords.count)",
-                    "duration": allFilesStartMS.map { PromptTokenRecountDiagnostics.formatElapsedMS(since: $0) } ?? "notMeasured"
-                ]
-            )
-        #endif
         guard !Task.isCancelled else {
             #if DEBUG
-                PromptTokenRecountDiagnostics.event("tokenRecount.calculate.cancelled", fields: ["phase": "allFiles", "duration": calculateStartMS.map { PromptTokenRecountDiagnostics.formatElapsedMS(since: $0) } ?? "notMeasured"])
+                PromptTokenRecountDiagnostics.event("tokenRecount.calculate.cancelled", fields: ["phase": "contextSnapshot", "duration": calculateStartMS.map { PromptTokenRecountDiagnostics.formatElapsedMS(since: $0) } ?? "notMeasured"])
             #endif
             return
         }
-        // Derive and publish the set of detected languages from store-owned file records.
-        let detectedExts = allFileRecords.map { (($0.name as NSString).pathExtension).lowercased() }
-        let detectedLangs = detectedExts.compactMap { SyntaxManager.shared.extensionToLanguage[$0] }
-        scannedLanguages = Set(detectedLangs)
 
         let effectiveCodeMapUsage = copySnapshot.codeMapUsage
         let accountingCodeMapUsage: CodeMapUsage = includeFiles ? effectiveCodeMapUsage : .none
@@ -1061,7 +1033,6 @@ class TokenCountingViewModel: ObservableObject {
 
     private func handleFileSystemTopologyChanged() {
         // Immediately clear caches used by UI previews so we don't show stale data
-        scannedLanguages = []
         codeMapContent = ""
         codemapPresentation = .empty
         fileTreeContent = ""

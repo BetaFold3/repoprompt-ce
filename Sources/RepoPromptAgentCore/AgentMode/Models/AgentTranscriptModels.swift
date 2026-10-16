@@ -1281,6 +1281,12 @@ package struct AgentTranscriptPerformanceSnapshot: Equatable {
     package var lastPayloadCaptureScannedItemCount: Int?
     package var lastSanitizedActivityCount: Int?
     package var lastSanitizeReusedTurnCount: Int?
+    /// Activities reused by raw-input comparison in the last build, including reused activities
+    /// whose replayed processing flag is false; nil when that path did not run. That path also
+    /// reports `rawInputActivityComparison` as its sanitize reason whether or not anything was
+    /// reused, and a build with zero reuse (such as the first build after compaction) counts as
+    /// a sanitize-reuse fallback.
+    var lastSanitizeReusedActivityCount: Int?
     package var lastProjectionReusedTurnCount: Int?
     package var retainedRawPayloadEntryCount: Int
     package var retainedRawPayloadTotalBytes: Int
@@ -1322,6 +1328,7 @@ package struct AgentTranscriptPerformanceSnapshot: Equatable {
         lastPayloadCaptureScannedItemCount: Int? = nil,
         lastSanitizedActivityCount: Int? = nil,
         lastSanitizeReusedTurnCount: Int? = nil,
+        lastSanitizeReusedActivityCount: Int? = nil,
         lastProjectionReusedTurnCount: Int? = nil,
         retainedRawPayloadEntryCount: Int = 0,
         retainedRawPayloadTotalBytes: Int = 0,
@@ -1362,6 +1369,7 @@ package struct AgentTranscriptPerformanceSnapshot: Equatable {
         self.lastPayloadCaptureScannedItemCount = lastPayloadCaptureScannedItemCount
         self.lastSanitizedActivityCount = lastSanitizedActivityCount
         self.lastSanitizeReusedTurnCount = lastSanitizeReusedTurnCount
+        self.lastSanitizeReusedActivityCount = lastSanitizeReusedActivityCount
         self.lastProjectionReusedTurnCount = lastProjectionReusedTurnCount
         self.retainedRawPayloadEntryCount = retainedRawPayloadEntryCount
         self.retainedRawPayloadTotalBytes = retainedRawPayloadTotalBytes

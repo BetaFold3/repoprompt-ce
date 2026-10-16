@@ -204,7 +204,11 @@ extension AgentModeViewModel {
         #endif
         syncComposerUIState(tabID: tabID)
         syncStatusPillsUIState()
-        syncRuntimeMetricsUIState()
+        let selectionSummary = currentOwnerCanonicalSelectionSummary()
+        syncRuntimeMetricsUIState(
+            liveSelectedFileCount: selectionSummary?.totalExplicitFileCount,
+            liveSelectionSummary: selectionSummary
+        )
         // Sidebar revision should publish only on sidebar-relevant changes (session
         // list, sort, search, visible count). `syncSidebarUIState()` still republishes
         // the snapshot when those inputs differ; callers that truly need to force a
@@ -213,6 +217,22 @@ extension AgentModeViewModel {
         syncSidebarUIState()
         syncTranscriptUIState()
         syncRunInteractionUIState()
+    }
+
+    /// Non-flushing read of the current owner's canonical stored selection. Nil (the previous
+    /// full-sync value) unless the active workspace's explicit active tab, `currentTabID`, and
+    /// the active session all agree and that tab exists in that workspace. No fallbacks.
+    private func currentOwnerCanonicalSelectionSummary() -> AgentContextSelectionSummary? {
+        guard let workspaceManager,
+              let workspace = workspaceManager.activeWorkspace,
+              let tabID = currentTabID,
+              activeSession?.tabID == tabID,
+              workspace.activeComposeTabID == tabID,
+              let tab = workspaceManager.composeTab(
+                  for: WorkspaceSelectionIdentity(workspaceID: workspace.id, tabID: tabID)
+              )
+        else { return nil }
+        return AgentContextExportResolver.selectionSummary(for: tab.selection)
     }
 
     func syncActiveUIState(tabID: UUID? = nil, invalidation: ActiveUIInvalidation) {

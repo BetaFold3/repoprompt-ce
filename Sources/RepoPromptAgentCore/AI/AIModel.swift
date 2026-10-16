@@ -1626,6 +1626,27 @@ public enum AIModel: Equatable, Hashable {
         return semanticMetadataPrecedes(leftMetadata, rightMetadata)
     }
 
+    /// Operation-local precomputed form of `codexBaseModelPrecedes`' per-string
+    /// metadata, for sorts that would otherwise rebuild it on every comparison.
+    /// `a.precedes(b)` equals `codexBaseModelPrecedes(a, b)` for the same
+    /// identifiers and the same capability snapshot. Not a cache: build keys
+    /// inside one sort and discard them with it.
+    struct CodexBaseModelSortKey {
+        private let metadata: SemanticSortMetadata
+
+        init(identifier: String) {
+            metadata = AIModel.semanticSortMetadata(
+                identifier: identifier,
+                fallbackDisplayName: identifier,
+                reasoningEffort: nil
+            )
+        }
+
+        func precedes(_ other: Self) -> Bool {
+            AIModel.semanticMetadataPrecedes(metadata, other.metadata)
+        }
+    }
+
     static func codexBaseDisplayName(for baseModelID: String, fallbackDisplayName: String) -> String {
         if let storeLabel = CodexDynamicModelStore.displayName(forModelID: baseModelID) {
             let normalizedStoreLabel = normalizedCodexBaseLabel(storeLabel)

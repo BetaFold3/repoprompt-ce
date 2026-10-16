@@ -5545,11 +5545,7 @@ package final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObser
 
     @discardableResult
     private static func endActiveAssistantSegmentState(_ session: AgentTabSession) -> Bool {
-        session.mutateItemsBatch(touchActivity: false) { items in
-            for index in items.indices where items[index].kind == .assistant && items[index].isStreaming {
-                items[index].isStreaming = false
-            }
-        }
+        session.endStreamingAssistantRows()
     }
 
     private func sealAssistantBoundary(_ session: AgentTabSession) {

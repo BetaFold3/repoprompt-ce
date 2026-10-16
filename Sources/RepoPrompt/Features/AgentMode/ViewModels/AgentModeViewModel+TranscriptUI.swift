@@ -18,8 +18,4 @@ extension AgentModeViewModel {
             archivedBlocks: session?.archivedTranscriptSnapshot.blocks ?? []
         )
     }
-
-    func syncTranscriptUIState() {
-        ui.transcript.update(makeTranscriptUISnapshot())
-    }
 }

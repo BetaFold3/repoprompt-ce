@@ -48,11 +48,34 @@ package final class AgentTabSession: ObservableObject {
             guard !suppressSourceItemsChanged else { return }
             repairStoredSourceItemsIfNeeded(diagnosticContext: "items.didSet")
             rebuildSourceItemDerivedState()
-            onSourceItemsChanged?(self, .structural)
+            onSourceItemsChanged?(self, .structural, .itemsDidSet)
         }
     }
 
-    package var transcript: AgentTranscript = .empty
+    package var transcript: AgentTranscript = .empty {
+        didSet {
+            guard rawInputSanitizeEvidence != nil,
+                  !Self.transcriptActivitiesMatch(oldValue, transcript)
+            else {
+                return
+            }
+            rawInputSanitizeEvidence = nil
+        }
+    }
+
+    /// When non-nil, the exact pre-sanitize input and per-activity processing flags of the
+    /// build whose sanitized activities are installed in `transcript`. It makes no claim about
+    /// current source items or maps. Any write that changes `transcript`'s activities or
+    /// structure drops it. Retention that changes source items keeps it while a run is active
+    /// (the next build reuses its unchanged activities) and drops it otherwise, so an idle
+    /// session does not pin pre-retention raw payloads; the next full import re-seeds it.
+    /// Session-local, never persisted.
+    package var rawInputSanitizeEvidence: AgentSanitizeRawInputEvidence?
+    #if DEBUG
+        /// Test seam: derive this session's transcript without incremental import or any
+        /// sanitize/projection reuse, keeping its durable compacted history.
+        package var test_forcesColdDerivedTranscriptBuild = false
+    #endif
     package var baseTranscriptProjection: AgentTranscriptProjection = .empty
     package var fullTranscriptProjection: AgentTranscriptProjection = .empty
     package var workingTranscriptProjection: AgentTranscriptProjection = .empty
@@ -73,10 +96,15 @@ package final class AgentTabSession: ObservableObject {
     private var toolCorrelationIndexes = ToolCorrelationIndexes()
     private var nextEphemeralToolResultPayloadRevision: Int = 1
     package var rawToolResultPayloadRenderRevisionByItemID: [UUID: Int] = [:]
-    package var onSourceItemsChanged: ((AgentTabSession, AgentSourceItemsMutation) -> Void)?
+    /// The caller is the static source location of the mutation entry call (diagnostics only).
+    package var onSourceItemsChanged: ((AgentTabSession, AgentSourceItemsMutation, AgentSourceItemsMutationCaller) -> Void)?
     package var onRunStateChanged: ((AgentTabSession) -> Void)?
     #if DEBUG
         private(set) var test_incrementalRetentionCompactionCount = 0
+        /// Duplicate-ID repair scans run at this session's source-write boundaries.
+        private(set) var test_sourceItemDuplicateRepairScanCount = 0
+        /// Full derived-state rebuilds (`rebuildSourceItemDerivedState`).
+        private(set) var test_sourceItemDerivedRebuildCount = 0
     #endif
 
     /// Run state
@@ -151,12 +179,37 @@ package final class AgentTabSession: ObservableObject {
     package var worktreeBindingTransitionInProgress: Bool = false
 
     // Wait/question state
+
     @Published package var waitingPrompt: String? = nil
-    @Published package var pendingAskUser: AgentAskUserPendingState? = nil
-    @Published package var pendingUserInputRequest: AgentRequestUserInputRequest? = nil
+
+    /// The three question props notify on aggregate (`hasPendingQuestionUI`) changes only:
+    /// draft edits and non-nil replacement keep the aggregate and stay silent.
+    @Published package var pendingAskUser: AgentAskUserPendingState? = nil {
+        didSet {
+            notePendingQuestionUIAggregateChange(
+                from: oldValue != nil || pendingUserInputRequest != nil || pendingMCPElicitationRequest != nil
+            )
+        }
+    }
+
+    @Published package var pendingUserInputRequest: AgentRequestUserInputRequest? = nil {
+        didSet {
+            notePendingQuestionUIAggregateChange(
+                from: pendingAskUser != nil || oldValue != nil || pendingMCPElicitationRequest != nil
+            )
+        }
+    }
+
     @Published package var pendingApproval: AgentApprovalRequest? = nil
     @Published package var pendingPermissionsRequest: AgentPermissionsRequest? = nil
-    @Published package var pendingMCPElicitationRequest: AgentMCPElicitationRequest? = nil
+    @Published package var pendingMCPElicitationRequest: AgentMCPElicitationRequest? = nil {
+        didSet {
+            notePendingQuestionUIAggregateChange(
+                from: pendingAskUser != nil || pendingUserInputRequest != nil || oldValue != nil
+            )
+        }
+    }
+
     @Published package var pendingApplyEditsReview: PendingApplyEditsReview? = nil
     @Published package var pendingWorktreeMergeReview: PendingWorktreeMergeReview? = nil
     package var queuedUserInputRequests: [AgentRequestUserInputRequest] = []
@@ -168,6 +221,14 @@ package final class AgentTabSession: ObservableObject {
     package var pendingAskUserTimeoutGeneration: UInt64 = 0
     package var hasPendingQuestionUI: Bool {
         pendingAskUser != nil || pendingUserInputRequest != nil || pendingMCPElicitationRequest != nil
+    }
+
+    /// Fired synchronously when `hasPendingQuestionUI` flips; wired by the owning view model.
+    package var onPendingQuestionUIChanged: ((AgentTabSession) -> Void)?
+
+    private func notePendingQuestionUIAggregateChange(from previousAggregate: Bool) {
+        guard previousAggregate != hasPendingQuestionUI else { return }
+        onPendingQuestionUIChanged?(self)
     }
 
     package var applyEditsApprovalSubscriptionID: UUID?
@@ -379,6 +440,38 @@ package final class AgentTabSession: ObservableObject {
     package var pendingACPSteeringInstructions: [ACPSteeringInstruction] = []
     /// Task that drains `pendingACPSteeringInstructions` one-by-one, waiting for MCP tool idle between each.
     package var acpSteeringFlushTask: Task<Void, Never>?
+
+    /// Attention notifications only: which source rows are a run attempt's own output. Rows at or
+    /// after `minimumSourceSequenceIndex` (the next index when the attempt began), plus the one
+    /// earlier assistant row this attempt's authoritative final content actually replaced.
+    /// Runtime-only; never persisted, published, or used by transcript or MCP authorities.
+    package struct AttentionTextProvenance: Equatable {
+        package let attemptID: UUID
+        package let minimumSourceSequenceIndex: Int
+        package var rewrittenPreBoundaryAssistantRowID: UUID?
+    }
+
+    package var attentionTextProvenance: AttentionTextProvenance?
+    /// Attention notifications only: one settled completion capture held while ACP steering
+    /// handoff work could still start a later attempt for it.
+    package var attentionDeferredCompletion: AttentionNotificationCapture?
+    /// Attention notifications only: ACP follow-up starts registered for observation whose start
+    /// has not returned yet.
+    package var attentionOutstandingFollowUpStartIDs: Set<UUID> = []
+
+    /// Records that `attemptID`'s authoritative final content replaced an assistant row that
+    /// predates the attempt. Call only after the replacement; it verifies the row now holds `text`.
+    package func recordAttentionFinalContentRewrite(attemptID: UUID, rowID: UUID, text: String) {
+        guard var provenance = attentionTextProvenance,
+              provenance.attemptID == attemptID,
+              let row = items.first(where: { $0.id == rowID }),
+              row.kind == .assistant,
+              row.text == text,
+              row.sequenceIndex < provenance.minimumSourceSequenceIndex
+        else { return }
+        provenance.rewrittenPreBoundaryAssistantRowID = rowID
+        attentionTextProvenance = provenance
+    }
 
     /// Number of upcoming turnCompleted events that should be treated as intermediate
     /// because we successfully queued a follow-up prompt during the same run.
@@ -1258,6 +1351,34 @@ package final class AgentTabSession: ObservableObject {
     package var activeReasoningItemID: UUID?
     package var reasoningItemIDsByGroupID: [String: UUID] = [:]
     package var pendingAssistantDelta: String = ""
+    /// Rows of any kind appended by background (between-run) delivery. A run never resumes or
+    /// replaces them, even when they landed below its user row, and each delivery's lookups
+    /// skip the other's rows. Not persisted.
+    package var backgroundRowIDs: Set<UUID> = []
+    /// The event stream (provider launch) each background row came from, for rows delivered
+    /// with a source. Background lookups of one stream skip another stream's rows.
+    package var backgroundRowSourceIDs: [UUID: UUID] = [:]
+    /// Each stream's current background message row, keyed by source. Further text and
+    /// authoritative `final_content` from that stream go to it even after an interleaved system
+    /// row or a run's terminal finalization ended its streaming; that message's other segment
+    /// ends, a run taking over the stream, and a newer user row retire it.
+    package var backgroundCurrentAssistantRowIDs: [UUID?: UUID] = [:]
+    /// The Claude event stream (the tab's current router) whose between-run output may update
+    /// session metadata. A replaced stream's output is still shown, but never overwrites the
+    /// newer launch's provider session ID.
+    package var claudeAuthoritativeEventSourceID: UUID?
+
+    /// Whether `rowID` is a background row delivered from `sourceID`'s stream.
+    package func isBackgroundRow(_ rowID: UUID, from sourceID: UUID?) -> Bool {
+        backgroundRowIDs.contains(rowID) && backgroundRowSourceIDs[rowID] == sourceID
+    }
+
+    /// Whether `rowID` belongs to a delivery: a run's rows are the non-background ones, and a
+    /// background delivery's are `sourceID`'s stream's background rows.
+    package func isDeliveryRow(_ rowID: UUID, background: Bool, sourceID: UUID?) -> Bool {
+        background ? isBackgroundRow(rowID, from: sourceID) : !backgroundRowIDs.contains(rowID)
+    }
+
     var pendingCodexAssistantScope: CodexNativeSessionController.ItemScope?
     var codexAssistantRowIDByScope: [CodexNativeSessionController.ItemScope: UUID] = [:]
     package var assistantDeltaFlushTask: Task<Void, Never>?
@@ -1265,8 +1386,10 @@ package final class AgentTabSession: ObservableObject {
     package var assistantDeltaFlushGeneration: UInt64 = 0
     var providerTerminalDrainGeneration: UInt64 = 0
     package var terminalCommitInProgress: Bool = false
-    var lastTerminalCommitRevision: AgentRunTerminalCommitRevision?
+    package var lastTerminalCommitRevision: AgentRunTerminalCommitRevision?
     var lastTerminalPublicationResult: AgentRunTerminalPublicationResult?
+    /// Commit whose queued follow-up instruction was already consumed (at most one per commit).
+    var terminalFollowUpTakenCommitID: UUID?
     var runAttemptTerminalResources: AgentRunAttemptTerminalResources?
     /// Handoff payload (injected into provider-facing text on first user send).
     /// Cleared only after the provider accepts the turn.
@@ -1440,6 +1563,14 @@ package final class AgentTabSession: ObservableObject {
     package var pendingDerivedTranscriptRefreshReason: AgentDerivedTranscriptRefreshReason?
     package var derivedTranscriptRefreshTask: Task<Void, Never>?
     package var derivedTranscriptRefreshGeneration: UInt64 = 0
+    /// Generation of the pending refresh task when it was scheduled with the background
+    /// first-event delay. Freshness barriers flush only work that delay deferred.
+    package var derivedTranscriptRefreshDeferredGeneration: UInt64?
+    package var hasDeferredDerivedTranscriptRefresh: Bool {
+        derivedTranscriptRefreshTask != nil
+            && derivedTranscriptRefreshDeferredGeneration == derivedTranscriptRefreshGeneration
+    }
+
     package var derivedTranscriptSyncState: AgentDerivedTranscriptSyncState?
     package var pendingCommandRunningByKey: [String: CodexNativeSessionController.CommandExecutionRunningUpdate] = [:]
     package var pendingCommandRunningFlushTask: Task<Void, Never>?
@@ -1481,6 +1612,7 @@ package final class AgentTabSession: ObservableObject {
     package func cancelEphemeralRuntimeState() {
         derivedTranscriptRefreshTask?.cancel()
         derivedTranscriptRefreshTask = nil
+        derivedTranscriptRefreshDeferredGeneration = nil
         pendingDerivedTranscriptRefreshReason = nil
         pendingCommandRunningFlushTask?.cancel()
         pendingCommandRunningFlushTask = nil
@@ -1625,6 +1757,10 @@ package final class AgentTabSession: ObservableObject {
             bindingTransitionGeneration: bindingTransitionGeneration,
             attemptID: attemptID,
             turnEpoch: turnEpoch
+        )
+        attentionTextProvenance = AttentionTextProvenance(
+            attemptID: ownership.attemptID,
+            minimumSourceSequenceIndex: nextSequenceIndex
         )
         #if DEBUG
             AgentModePerfDiagnostics.increment("run.lifecycle.attempt.started")
@@ -1914,7 +2050,7 @@ package final class AgentTabSession: ObservableObject {
 
     private enum SourceItemsDispatch {
         case silent
-        case notify(AgentSourceItemsMutation)
+        case notify(AgentSourceItemsMutation, AgentSourceItemsMutationCaller)
     }
 
     private func commitSourceItems(
@@ -1929,8 +2065,8 @@ package final class AgentTabSession: ObservableObject {
         rebuildSourceItemDerivedState()
         sourceItemsRevision &+= 1
         derivedTranscriptSyncState = nil
-        if case let .notify(mutation) = dispatch {
-            onSourceItemsChanged?(self, mutation)
+        if case let .notify(mutation, caller) = dispatch {
+            onSourceItemsChanged?(self, mutation, caller)
         }
     }
 
@@ -1938,6 +2074,9 @@ package final class AgentTabSession: ObservableObject {
         _ candidateItems: [AgentChatItem],
         diagnosticContext: String
     ) -> [AgentChatItem] {
+        #if DEBUG
+            test_sourceItemDuplicateRepairScanCount += 1
+        #endif
         let repair = AgentSourceItemIDRepair.repairDuplicateIDs(in: candidateItems)
         if repair.didRepair {
             AgentSourceItemIDRepair.logDiagnostics(
@@ -1961,8 +2100,12 @@ package final class AgentTabSession: ObservableObject {
     @discardableResult
     private func commitRepairedSourceItemsIfNeeded(
         _ candidateItems: [AgentChatItem],
-        diagnosticContext: String
+        diagnosticContext: String,
+        caller: AgentSourceItemsMutationCaller
     ) -> Bool {
+        #if DEBUG
+            test_sourceItemDuplicateRepairScanCount += 1
+        #endif
         let repair = AgentSourceItemIDRepair.repairDuplicateIDs(in: candidateItems)
         guard repair.didRepair else { return false }
         AgentSourceItemIDRepair.logDiagnostics(
@@ -1971,16 +2114,23 @@ package final class AgentTabSession: ObservableObject {
         )
         commitSourceItems(
             repair.items,
-            dispatch: .notify(.structural),
+            dispatch: .notify(.structural, caller),
             diagnosticContext: "\(diagnosticContext).commit"
         )
         return true
     }
 
+    /// Rebuilds derived state from `items`. Precondition: `items` already has unique IDs. Every
+    /// caller establishes that at its source-write boundary (`items.didSet` and
+    /// `commitSourceItems` repair first; `compactSummaryOnlyToolResultsAndAlignEphemeralPayloadMap`
+    /// rebuilds only after a repair). This method does not repair source data.
     private func rebuildSourceItemDerivedState() {
-        repairStoredSourceItemsIfNeeded(diagnosticContext: "rebuildSourceItemDerivedState")
+        #if DEBUG
+            test_sourceItemDerivedRebuildCount += 1
+        #endif
         syncNextSequenceIndexFromItems()
         liveItemIDs = Set(items.map(\.id))
+        assert(liveItemIDs.count == items.count, "rebuildSourceItemDerivedState requires unique source item IDs")
         replaceEphemeralToolResultPayloadMap(
             AgentTranscriptPresentationBuilder.rebuildEphemeralToolResultPayloadMap(
                 from: items,
@@ -1989,7 +2139,27 @@ package final class AgentTabSession: ObservableObject {
             liveItemIDs: liveItemIDs
         )
         rebuildToolCorrelationIndexes()
-        assertSourceItemDerivedStateIsConsistent()
+        assertSourceItemDerivedStateIsConsistentIfEnabled()
+    }
+
+    /// Whether a single-row write of `updatedID` (replacing `previousID`, if any) keeps source
+    /// item IDs unique. Relies on the `liveItemIDs == Set(items.map(\.id))` invariant; a
+    /// collision takes the existing repaired structural commit instead.
+    private func admitsIncrementalSourceItemID(_ updatedID: UUID, replacing previousID: UUID?) -> Bool {
+        if let previousID, previousID == updatedID { return true }
+        return !liveItemIDs.contains(updatedID)
+    }
+
+    /// Narrow hot-path DEBUG check after an admitted single-row write: only the touched
+    /// identities are inspected, plus the O(1) count invariant.
+    private func assertIncrementalSourceItemIdentity(previousID: UUID?, updatedID: UUID) {
+        #if DEBUG
+            assert(liveItemIDs.contains(updatedID), "incremental source write lost its live item ID")
+            if let previousID, previousID != updatedID {
+                assert(!liveItemIDs.contains(previousID), "incremental source write kept a replaced live item ID")
+            }
+            assert(liveItemIDs.count == items.count, "incremental source write desynchronized live item IDs")
+        #endif
     }
 
     private func rebuildToolCorrelationIndexes() {
@@ -2196,18 +2366,40 @@ package final class AgentTabSession: ObservableObject {
     }
 
     private func finishIncrementalSourceItemsMutation(
-        _ mutation: AgentSourceItemsMutation
+        _ mutation: AgentSourceItemsMutation,
+        caller: AgentSourceItemsMutationCaller
     ) {
         sourceItemsRevision &+= 1
         derivedTranscriptSyncState = nil
-        onSourceItemsChanged?(self, mutation)
+        onSourceItemsChanged?(self, mutation, caller)
     }
 
     #if DEBUG
         func testAssertSourceItemDerivedStateIsConsistent() {
             assertSourceItemDerivedStateIsConsistent()
         }
+
+        /// Follows the `GlobalSettingsStore` XCTest-detection precedent: direct xctest and SwiftPM
+        /// runners need not set `XCTestConfigurationFilePath`.
+        private static let isXCTestProcess =
+            NSClassFromString("XCTestCase") != nil || NSClassFromString("XCTest.XCTestCase") != nil
     #endif
+
+    /// Full O(n) consistency sweep after a full derived rebuild or a flags-only streaming
+    /// commit, run automatically only in XCTest processes or when transcript debug
+    /// instrumentation is explicitly enabled. Ordinary DEBUG app runs and performance capture
+    /// use the narrow touched-row checks instead. Single-row incremental writes are not swept
+    /// automatically: an active-turn boundary frozen during a run outlives it until a full
+    /// rebuild, which this sweep reports as desynchronized (pre-existing behavior).
+    private func assertSourceItemDerivedStateIsConsistentIfEnabled(
+        file: StaticString = #fileID,
+        line: UInt = #line
+    ) {
+        #if DEBUG
+            guard Self.isXCTestProcess || AgentTranscriptDebugInstrumentation.isEnabled else { return }
+            assertSourceItemDerivedStateIsConsistent(file: file, line: line)
+        #endif
+    }
 
     private func assertSourceItemDerivedStateIsConsistent(
         file: StaticString = #fileID,
@@ -2238,7 +2430,10 @@ package final class AgentTabSession: ObservableObject {
     package func mutateItemsBatch(
         mutation: AgentSourceItemsMutation = .structural,
         touchActivity: Bool = true,
-        _ body: (inout [AgentChatItem]) -> Void
+        _ body: (inout [AgentChatItem]) -> Void,
+        callerFileID: StaticString = #fileID,
+        callerFunction: StaticString = #function,
+        callerLine: UInt = #line
     ) -> Bool {
         let previousItems = items
         var updatedItems = previousItems
@@ -2246,7 +2441,10 @@ package final class AgentTabSession: ObservableObject {
         guard updatedItems != previousItems else { return false }
         commitSourceItems(
             updatedItems,
-            dispatch: .notify(mutation),
+            dispatch: .notify(
+                mutation,
+                .init(fileID: callerFileID, function: callerFunction, line: callerLine)
+            ),
             diagnosticContext: "mutateItemsBatch"
         )
         if touchActivity {
@@ -2254,6 +2452,125 @@ package final class AgentTabSession: ObservableObject {
         }
         isDirty = true
         return true
+    }
+
+    /// Ends streaming of the assistant rows `shouldEnd` selects, as one ranged, non-structural
+    /// mutation. The flipped indices are computed from the current items in this same
+    /// main-actor turn, before the commit. The range is the lowest through highest flipped index;
+    /// interior rows may be unchanged. No selected row means no
+    /// mutation and no notification. Only `isStreaming` changes: IDs, kinds, order, and tool
+    /// fields are untouched. Does not touch `lastActivityAt`.
+    @discardableResult
+    package func endStreamingAssistantRows(
+        where shouldEnd: (AgentChatItem) -> Bool = { _ in true },
+        callerFileID: StaticString = #fileID,
+        callerFunction: StaticString = #function,
+        callerLine: UInt = #line
+    ) -> Bool {
+        endStreamingRows(
+            ofKind: .assistant,
+            mutation: { .assistantStreamingStateChanged(changedIndexRange: $0) },
+            where: shouldEnd,
+            callerFileID: callerFileID,
+            callerFunction: callerFunction,
+            callerLine: callerLine
+        )
+    }
+
+    /// Reasoning counterpart of `endStreamingAssistantRows`: ends streaming of the thinking rows
+    /// `shouldEnd` selects, as one ranged, non-structural mutation with the same contract.
+    @discardableResult
+    package func endStreamingReasoningRows(
+        where shouldEnd: (AgentChatItem) -> Bool,
+        callerFileID: StaticString = #fileID,
+        callerFunction: StaticString = #function,
+        callerLine: UInt = #line
+    ) -> Bool {
+        endStreamingRows(
+            ofKind: .thinking,
+            mutation: { .reasoningStreamingStateChanged(changedIndexRange: $0) },
+            where: shouldEnd,
+            callerFileID: callerFileID,
+            callerFunction: callerFunction,
+            callerLine: callerLine
+        )
+    }
+
+    private func endStreamingRows(
+        ofKind kind: AgentChatItemKind,
+        mutation: (ClosedRange<Int>) -> AgentSourceItemsMutation,
+        where shouldEnd: (AgentChatItem) -> Bool,
+        callerFileID: StaticString,
+        callerFunction: StaticString,
+        callerLine: UInt
+    ) -> Bool {
+        let flippedIndices = items.indices.filter { index in
+            let item = items[index]
+            return item.kind == kind && item.isStreaming && shouldEnd(item)
+        }
+        guard let firstIndex = flippedIndices.first, let lastIndex = flippedIndices.last else {
+            return false
+        }
+        // Flags-only commit: IDs, sequence indexes, retained payloads (only `.toolResult` rows
+        // retain one) and tool-correlation inputs are unchanged, so no duplicate repair or
+        // derived rebuild runs. One array copy is still made.
+        #if DEBUG
+            let selectedRowsBefore = flippedIndices.map { items[$0] }
+        #endif
+        var updatedItems = items
+        for index in flippedIndices {
+            updatedItems[index].isStreaming = false
+        }
+        suppressSourceItemsChanged = true
+        items = updatedItems
+        suppressSourceItemsChanged = false
+        #if DEBUG
+            for (offset, index) in flippedIndices.enumerated() {
+                var expected = selectedRowsBefore[offset]
+                assert(expected.kind == kind && expected.isStreaming, "streaming end selected a non-streaming row")
+                expected.isStreaming = false
+                assert(items[index] == expected, "streaming end changed a field other than isStreaming")
+            }
+        #endif
+        reconcileIdleToolCorrelationBoundaryIfStale()
+        reconcileActiveToolCorrelationStartIfStale()
+        assertSourceItemDerivedStateIsConsistentIfEnabled()
+        finishIncrementalSourceItemsMutation(
+            mutation(firstIndex ... lastIndex),
+            caller: .init(fileID: callerFileID, function: callerFunction, line: callerLine)
+        )
+        isDirty = true
+        return true
+    }
+
+    /// Keeps the one tool-correlation effect the former full rebuild had on a flags-only
+    /// commit: outside an active run, a full rebuild re-derives the active-turn boundary from
+    /// the last user row (a boundary frozen during a run can outlive it). The backward scan
+    /// stops at the last user row; indexes are rebuilt only when that boundary is stale.
+    private func reconcileIdleToolCorrelationBoundaryIfStale() {
+        guard !runState.isActive else { return }
+        let freshBoundary: ToolCorrelationBoundary = if let lastUserIndex = items.lastIndex(where: { $0.kind == .user }) {
+            .after(itemID: items[lastUserIndex].id, sequenceIndex: items[lastUserIndex].sequenceIndex)
+        } else {
+            .start
+        }
+        guard toolCorrelationIndexes.activeTurnBoundary != freshBoundary else { return }
+        rebuildToolCorrelationIndexes()
+    }
+
+    /// Keeps the former full rebuild's recovery during an active run: the frozen boundary is
+    /// kept, but single-row writes do not re-resolve its start, so it can go stale (a removed
+    /// anchor reappended, or a missing anchor's sequence-index fallback shifted by a sequence
+    /// change). Rebuilds only the correlation indexes, and only when the resolved start moved;
+    /// incremental maintenance keeps the maps consistent with the stored start otherwise.
+    private func reconcileActiveToolCorrelationStartIfStale() {
+        guard runState.isActive else { return }
+        let resolvedStartIndex = Self.resolvedToolCorrelationStartIndex(
+            for: items,
+            boundary: toolCorrelationIndexes.activeTurnBoundary
+        )
+        guard toolCorrelationIndexes.activeTurnStartIndex != resolvedStartIndex else { return }
+        rebuildToolCorrelationIndexes()
     }
 
     package enum SilentItemReplacementReason: String {
@@ -2267,7 +2584,27 @@ package final class AgentTabSession: ObservableObject {
         case testOverride
     }
 
+    /// Same turn/span structure and identical activities. Span metadata (for example a
+    /// retained process `runID`) may differ: raw-input evidence only covers activities.
+    private static func transcriptActivitiesMatch(_ lhs: AgentTranscript, _ rhs: AgentTranscript) -> Bool {
+        guard lhs.turns.count == rhs.turns.count else { return false }
+        for (lhsTurn, rhsTurn) in zip(lhs.turns, rhs.turns) {
+            guard lhsTurn.id == rhsTurn.id,
+                  lhsTurn.responseSpans.count == rhsTurn.responseSpans.count
+            else {
+                return false
+            }
+            for (lhsSpan, rhsSpan) in zip(lhsTurn.responseSpans, rhsTurn.responseSpans) {
+                guard lhsSpan.id == rhsSpan.id, lhsSpan.activities == rhsSpan.activities else { return false }
+            }
+        }
+        return true
+    }
+
     package func setItemsSilently(_ items: [AgentChatItem], reason: SilentItemReplacementReason) {
+        if !runState.isActive, reason == .retentionCompaction, rawInputSanitizeEvidence != nil, self.items != items {
+            dropRawInputSanitizeEvidenceAfterIdleRetention()
+        }
         #if DEBUG
             if AgentTranscriptDebugInstrumentation.isEnabled {
                 AgentTranscriptDebugInstrumentation.sessionItemsReplacementHandler?(.init(
@@ -2290,6 +2627,7 @@ package final class AgentTabSession: ObservableObject {
         derivedTranscriptRefreshGeneration &+= 1
         derivedTranscriptRefreshTask?.cancel()
         derivedTranscriptRefreshTask = nil
+        derivedTranscriptRefreshDeferredGeneration = nil
     }
 
     @discardableResult
@@ -2318,11 +2656,19 @@ package final class AgentTabSession: ObservableObject {
         )
         sourceItemsRevision &+= 1
         derivedTranscriptSyncState = nil
+        dropRawInputSanitizeEvidenceAfterIdleRetention()
         #if DEBUG
             test_incrementalRetentionCompactionCount += 1
         #endif
         assertSourceItemDerivedStateIsConsistent()
         return true
+    }
+
+    /// Retention changed source items: outside an active run, nothing refreshes soon enough
+    /// for the evidence's pre-retention raw payloads to pay for their memory.
+    private func dropRawInputSanitizeEvidenceAfterIdleRetention() {
+        guard !runState.isActive else { return }
+        rawInputSanitizeEvidence = nil
     }
 
     /// Compact any summary-only tool-result items in place and align
@@ -2387,6 +2733,7 @@ package final class AgentTabSession: ObservableObject {
             }
         }
         if itemsDidMutate {
+            dropRawInputSanitizeEvidenceAfterIdleRetention()
             sourceItemsRevision &+= 1
             derivedTranscriptSyncState = nil
             suppressSourceItemsChanged = true
@@ -2401,6 +2748,7 @@ package final class AgentTabSession: ObservableObject {
     }
 
     package func clearDerivedTranscriptCaches() {
+        rawInputSanitizeEvidence = nil
         transcript = .empty
         baseTranscriptProjection = .empty
         fullTranscriptProjection = .empty
@@ -2418,22 +2766,42 @@ package final class AgentTabSession: ObservableObject {
         derivedTranscriptSyncState = nil
     }
 
-    package func replaceItems(_ items: [AgentChatItem]) {
+    package func replaceItems(
+        _ items: [AgentChatItem],
+        callerFileID: StaticString = #fileID,
+        callerFunction: StaticString = #function,
+        callerLine: UInt = #line
+    ) {
         setItemsSilently(items, reason: .testOverride)
         pendingTurnRuntimeAnchors.removeAll()
         agentMessageRuntimeFootersByItemID.removeAll()
         pendingSourceItemsMutationSummary = nil
-        onSourceItemsChanged?(self, .replaceAll)
+        onSourceItemsChanged?(
+            self,
+            .replaceAll,
+            .init(fileID: callerFileID, function: callerFunction, line: callerLine)
+        )
         lastActivityAt = Date()
         isDirty = true
     }
 
-    package func appendItem(_ item: AgentChatItem) {
+    package func appendItem(
+        _ item: AgentChatItem,
+        callerFileID: StaticString = #fileID,
+        callerFunction: StaticString = #function,
+        callerLine: UInt = #line
+    ) {
+        let caller = AgentSourceItemsMutationCaller(
+            fileID: callerFileID,
+            function: callerFunction,
+            line: callerLine
+        )
         var newItem = item
         newItem.sequenceIndex = nextSequenceIndex
         nextSequenceIndex += 1
-        let candidateItems = items + [newItem]
-        if commitRepairedSourceItemsIfNeeded(candidateItems, diagnosticContext: "appendItem") {
+        if !admitsIncrementalSourceItemID(newItem.id, replacing: nil),
+           commitRepairedSourceItemsIfNeeded(items + [newItem], diagnosticContext: "appendItem", caller: caller)
+        {
             if newItem.kind == .user {
                 hasSentFirstMessage = true
                 lastUserMessageAt = newItem.timestamp
@@ -2447,8 +2815,9 @@ package final class AgentTabSession: ObservableObject {
         items.append(newItem)
         suppressSourceItemsChanged = false
         reconcileIncrementalEphemeralPayload(previousItem: nil, updatedItem: newItem)
+        assertIncrementalSourceItemIdentity(previousID: nil, updatedID: newItem.id)
         appendToolCorrelationIndexes(for: newItem, at: appendedIndex)
-        finishIncrementalSourceItemsMutation(.append(index: appendedIndex, itemKind: newItem.kind))
+        finishIncrementalSourceItemsMutation(.append(index: appendedIndex, itemKind: newItem.kind), caller: caller)
         if newItem.kind == .user {
             hasSentFirstMessage = true
             lastUserMessageAt = newItem.timestamp
@@ -2457,56 +2826,90 @@ package final class AgentTabSession: ObservableObject {
         isDirty = true
     }
 
-    package func replaceItem(at index: Int, with updatedItem: AgentChatItem) {
+    package func replaceItem(
+        at index: Int,
+        with updatedItem: AgentChatItem,
+        callerFileID: StaticString = #fileID,
+        callerFunction: StaticString = #function,
+        callerLine: UInt = #line
+    ) {
+        let caller = AgentSourceItemsMutationCaller(
+            fileID: callerFileID,
+            function: callerFunction,
+            line: callerLine
+        )
         guard items.indices.contains(index) else { return }
         let previousItem = items[index]
         guard updatedItem != previousItem else { return }
-        var candidateItems = items
-        candidateItems[index] = updatedItem
-        if commitRepairedSourceItemsIfNeeded(candidateItems, diagnosticContext: "replaceItem") {
-            lastActivityAt = Date()
-            isDirty = true
-            return
+        if !admitsIncrementalSourceItemID(updatedItem.id, replacing: previousItem.id) {
+            var candidateItems = items
+            candidateItems[index] = updatedItem
+            if commitRepairedSourceItemsIfNeeded(candidateItems, diagnosticContext: "replaceItem", caller: caller) {
+                lastActivityAt = Date()
+                isDirty = true
+                return
+            }
         }
         suppressSourceItemsChanged = true
         items[index] = updatedItem
         suppressSourceItemsChanged = false
         nextSequenceIndex = max(nextSequenceIndex, updatedItem.sequenceIndex + 1)
         reconcileIncrementalEphemeralPayload(previousItem: previousItem, updatedItem: updatedItem)
+        assertIncrementalSourceItemIdentity(previousID: previousItem.id, updatedID: updatedItem.id)
         updateToolCorrelationIndexes(previousItem: previousItem, updatedItem: updatedItem, at: index)
         finishIncrementalSourceItemsMutation(
-            .replace(index: index, previousKind: previousItem.kind, currentKind: updatedItem.kind)
+            .replace(index: index, previousKind: previousItem.kind, currentKind: updatedItem.kind),
+            caller: caller
         )
         lastActivityAt = Date()
         isDirty = true
     }
 
-    package func mutateItem(at index: Int, _ mutate: (inout AgentChatItem) -> Void) {
+    package func mutateItem(
+        at index: Int,
+        _ mutate: (inout AgentChatItem) -> Void,
+        callerFileID: StaticString = #fileID,
+        callerFunction: StaticString = #function,
+        callerLine: UInt = #line
+    ) {
+        let caller = AgentSourceItemsMutationCaller(
+            fileID: callerFileID,
+            function: callerFunction,
+            line: callerLine
+        )
         guard items.indices.contains(index) else { return }
         let previousItem = items[index]
         var updatedItem = previousItem
         mutate(&updatedItem)
         guard updatedItem != previousItem else { return }
-        var candidateItems = items
-        candidateItems[index] = updatedItem
-        if commitRepairedSourceItemsIfNeeded(candidateItems, diagnosticContext: "mutateItem") {
-            lastActivityAt = Date()
-            isDirty = true
-            return
+        if !admitsIncrementalSourceItemID(updatedItem.id, replacing: previousItem.id) {
+            var candidateItems = items
+            candidateItems[index] = updatedItem
+            if commitRepairedSourceItemsIfNeeded(candidateItems, diagnosticContext: "mutateItem", caller: caller) {
+                lastActivityAt = Date()
+                isDirty = true
+                return
+            }
         }
         suppressSourceItemsChanged = true
         items[index] = updatedItem
         suppressSourceItemsChanged = false
         nextSequenceIndex = max(nextSequenceIndex, updatedItem.sequenceIndex + 1)
         reconcileIncrementalEphemeralPayload(previousItem: previousItem, updatedItem: updatedItem)
+        assertIncrementalSourceItemIdentity(previousID: previousItem.id, updatedID: updatedItem.id)
         updateToolCorrelationIndexes(previousItem: previousItem, updatedItem: updatedItem, at: index)
-        finishIncrementalSourceItemsMutation(.mutate(index: index, itemKind: updatedItem.kind))
+        finishIncrementalSourceItemsMutation(.mutate(index: index, itemKind: updatedItem.kind), caller: caller)
         lastActivityAt = Date()
         isDirty = true
     }
 
     @discardableResult
-    package func removeItem(at index: Int) -> AgentChatItem? {
+    package func removeItem(
+        at index: Int,
+        callerFileID: StaticString = #fileID,
+        callerFunction: StaticString = #function,
+        callerLine: UInt = #line
+    ) -> AgentChatItem? {
         guard items.indices.contains(index) else { return nil }
         let removed = items[index]
         suppressSourceItemsChanged = true
@@ -2514,34 +2917,51 @@ package final class AgentTabSession: ObservableObject {
         suppressSourceItemsChanged = false
         reconcileIncrementalEphemeralPayload(previousItem: removed, updatedItem: nil)
         rebuildToolCorrelationIndexes()
-        finishIncrementalSourceItemsMutation(.remove(index: index, itemKind: removed.kind))
+        finishIncrementalSourceItemsMutation(
+            .remove(index: index, itemKind: removed.kind),
+            caller: .init(fileID: callerFileID, function: callerFunction, line: callerLine)
+        )
         lastActivityAt = Date()
         isDirty = true
         return removed
     }
 
-    func updateLastItem(_ mutate: (inout AgentChatItem) -> Void) {
+    func updateLastItem(
+        _ mutate: (inout AgentChatItem) -> Void,
+        callerFileID: StaticString = #fileID,
+        callerFunction: StaticString = #function,
+        callerLine: UInt = #line
+    ) {
+        let caller = AgentSourceItemsMutationCaller(
+            fileID: callerFileID,
+            function: callerFunction,
+            line: callerLine
+        )
         guard !items.isEmpty else { return }
         let index = items.count - 1
         let previousItem = items[index]
         var updatedItem = previousItem
         mutate(&updatedItem)
         guard updatedItem != previousItem else { return }
-        var candidateItems = items
-        candidateItems[index] = updatedItem
-        if commitRepairedSourceItemsIfNeeded(candidateItems, diagnosticContext: "updateLastItem") {
-            lastActivityAt = Date()
-            isDirty = true
-            return
+        if !admitsIncrementalSourceItemID(updatedItem.id, replacing: previousItem.id) {
+            var candidateItems = items
+            candidateItems[index] = updatedItem
+            if commitRepairedSourceItemsIfNeeded(candidateItems, diagnosticContext: "updateLastItem", caller: caller) {
+                lastActivityAt = Date()
+                isDirty = true
+                return
+            }
         }
         suppressSourceItemsChanged = true
         items[index] = updatedItem
         suppressSourceItemsChanged = false
         nextSequenceIndex = max(nextSequenceIndex, updatedItem.sequenceIndex + 1)
         reconcileIncrementalEphemeralPayload(previousItem: previousItem, updatedItem: updatedItem)
+        assertIncrementalSourceItemIdentity(previousID: previousItem.id, updatedID: updatedItem.id)
         updateToolCorrelationIndexes(previousItem: previousItem, updatedItem: updatedItem, at: index)
         finishIncrementalSourceItemsMutation(
-            .replace(index: index, previousKind: previousItem.kind, currentKind: updatedItem.kind)
+            .replace(index: index, previousKind: previousItem.kind, currentKind: updatedItem.kind),
+            caller: caller
         )
         lastActivityAt = Date()
         isDirty = true

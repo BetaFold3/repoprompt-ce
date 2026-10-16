@@ -273,6 +273,10 @@ final class AgentModeViewModelInactiveRefreshTests: XCTestCase {
 
     func testRefreshingInactiveSessionDoesNotClobberActivePresentation() async throws {
         let viewModel = makeViewModel()
+        // The background mutation takes D7's delayed path; an immediate test sleep keeps the
+        // drained refresh off wall-clock time.
+        viewModel.test_setDerivedTranscriptDeferralSleep { _ in }
+        viewModel.test_setBackgroundDerivedTranscriptDeferralEnabledOverride(true)
         let activeTabID = UUID()
         let inactiveTabID = UUID()
         viewModel.test_setCurrentTabIDOverride(activeTabID)
@@ -1571,6 +1575,45 @@ final class AgentModeViewModelInactiveRefreshTests: XCTestCase {
         }
         XCTFail("Timed out waiting for condition")
     }
+
+    #if DEBUG
+        /// D0: a non-live refresh discards the pending live-mutation summary; its no-attempt
+        /// diagnosis must still report that summary's flags and caller, while admission and
+        /// clearing are unchanged.
+        func testNonLiveRefreshDiagnosisReportsDiscardedPendingMutationSummary() async throws {
+            let viewModel = makeViewModel()
+            let tabID = UUID()
+            viewModel.test_setCurrentTabIDOverride(tabID)
+            defer { viewModel.test_setCurrentTabIDOverride(nil) }
+            let session = try await viewModel.ensureSessionReady(tabID: tabID)
+            viewModel.refreshDerivedTranscriptState(for: session)
+
+            try EditFlowPerf.$debugCaptureIsolationTokenForTesting.withValue(UUID()) {
+                switch EditFlowPerf.beginDebugCapture(label: "d0-nonlive-discarded-summary", maxSamples: 100) {
+                case .started:
+                    break
+                case .busy:
+                    return XCTFail("Capture should start.")
+                }
+                // A live user mutation leaves a pending summary behind a scheduled refresh.
+                session.appendItem(.user("Pending question", sequenceIndex: 0))
+                XCTAssertNotNil(session.pendingSourceItemsMutationSummary)
+
+                viewModel.refreshDerivedTranscriptState(for: session, reason: .manualRefresh)
+
+                XCTAssertNil(session.pendingSourceItemsMutationSummary)
+                let snapshot = EditFlowPerf.debugCaptureSnapshot(finish: true)
+                let importStage = try XCTUnwrap(snapshot.stages.first {
+                    $0.stageName == "EditFlow.Transcript.ImportTranscript"
+                        && $0.sanitizedDimensions.contains("reason=reasonNotLive")
+                })
+                let dimensions = importStage.sanitizedDimensions
+                XCTAssertTrue(dimensions.contains("mutationFlags=user"), dimensions)
+                XCTAssertTrue(dimensions.contains("caller=AgentModeViewModelInactiveRefreshTests.swift_L"), dimensions)
+                XCTAssertTrue(dimensions.contains("mergedMutationCount=1"), dimensions)
+            }
+        }
+    #endif
 
     private func makeViewModel() -> AgentModeViewModel {
         let viewModel = AgentModeViewModel(

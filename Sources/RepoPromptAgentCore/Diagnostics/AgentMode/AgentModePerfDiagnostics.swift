@@ -88,7 +88,7 @@ import Foundation
             Recorder.debugProcessOverrideEnabled
         }
 
-        static var osLogEnabled: Bool {
+        package static var osLogEnabled: Bool {
             Recorder.osLogEnabled
         }
 

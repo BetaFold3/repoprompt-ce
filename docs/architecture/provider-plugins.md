@@ -87,6 +87,122 @@ make dev-provider-test
 
 If the developer daemon is unavailable, use the direct SwiftPM commands documented in the [development workflow](../context/workflows/development.md).
 
+### Claude output between runs
+
+A Claude process outlives the run that started it and can resume on its own after a
+successful result, for example when a background task finishes. Before 2026-10-11 the
+integrated runner's per-run consumer stopped reading the controller's event stream at
+completion, so that output stayed buffered until the next user send and then appeared under
+the newer user message.
+
+`ClaudeNativeEventRouter` (`Sources/RepoPromptAgentCore/AgentMode/Runtime/Runners/`) is now
+the single long-lived reader of each controller stream for a tab. It dispatches strictly in
+stream order, and each event belongs to the run that was current when the controller emitted
+it. A run becomes current at its in-band start marker: just before sending the run's message,
+the runner asks the controller to yield `.marker(attemptID)` on its events stream
+(`emitEventMarker`), so output emitted earlier is never the run's, even if the app reads it
+after the run started. A live run's marker starts it on whichever router reads it, including
+one created after the run registered. Runtimes without markers (no stream generations) fall back
+to the moment the runner resolves the run's start, still before its message is sent. Routing:
+
+- an event owned by the consuming run goes to that run's handler;
+- an event owned by a run whose task is still alive and not released (starting, sending, or
+  finalizing) waits for that run, as the stream buffered it before;
+- an event owned by no live run is between-run output. It goes straight to the transcript
+  through the view model's background path (`handleBackgroundNativeStreamResult`), which
+  appends and saves rows but changes no run state, running or reasoning status, or per-turn
+  usage finalization. This holds even when a newer run is already consuming: old output is
+  never handled as the newer run's response. Background text is applied at once to that
+  message's own rows (its streaming row, or the row an interleaved system row ended), never
+  through the shared assistant-delta buffer, and its `final_content` replaces only that row,
+  never an earlier turn's answer. Every row a background delivery appends (assistant, system,
+  tool, error) is recorded as background-owned, and each delivery's lookups skip the other's
+  rows of any kind: a run's stream events never continue, replace, or end a background row,
+  even one that landed below its user row, and background events never end or split a run's row
+  (also before any background row exists). Runtime errors read between runs take the same path.
+  A name-only tool-result match stays within its delivery. A background message's current row
+  is tracked by identity, not streaming state, so its further text and `final_content` still
+  reach it after an interleaved system row or a run's terminal finalization ended its streaming.
+  Current rows are kept per source event stream: each router carries its own source ID (one
+  stream, one provider launch), every background row records its source, and only output from
+  that stream continues, replaces, or retires its row. Lookups skip another stream's rows, and
+  one stream's segment end never ends another's row, so a draining router and the current one
+  can deliver interleaved without splitting or duplicating each other's message. A run taking
+  over a stream (the first event it owns dispatched from that router, in stream order; an
+  approval request handed over from before its marker, or a cancellation following it, is not
+  one) ends that stream's current message: the rest of it is the run's output. A newer user row
+  also retires it. So background output after a newer prompt always starts a new row below that
+  prompt and the run's answer, even when the old message's end never reached the background
+  path (the process exited, or its end belonged to the next run), and output from a relaunched
+  process never joins a row of the process before it. Between runs only the tab's current
+  stream (`claudeAuthoritativeEventSourceID`, set when the runner installs a router) updates the
+  provider session ID, from `runtimeInit` or `message_stop`: a replaced stream still draining is
+  shown but never overwrites the newer launch's ID. The terminal finalization does finalize
+  background tool calls still pending with the run's terminal state. Background rows are
+  excluded from a run's completion-notification text;
+- approval requests are never handled between runs. The router holds them, and everything
+  after them, for the next consuming run, which owns approval state. A request cancelled
+  before any run saw it is dropped with its cancellation, a cancellation follows the run that
+  received its request, and a request still held when the stream ends is discarded with the
+  dead process. Showing a between-run approval immediately is not implemented.
+
+Right after the attention capture, the terminal commit barrier calls `releaseProviderOutput`:
+the finishing run will not consume again, so output it still owns is shown at once instead of
+waiting for its task to return (capturing first keeps background text out of the finished turn's
+notification). Before a queued follow-up starts, the barrier also calls
+`deliverProviderOutputBeforeFollowUp`: the runner drains routers whose stream was replaced,
+emits a drain marker on the current stream and waits until everything before it was delivered,
+so that output is shown above the follow-up's user row. A commit retried after a rejected
+publication applies the same delivery before it starts the follow-up. Overlapping retries are
+serialized by the barrier flag; a publication result is recorded only for the still-current
+commit and never over a resolved one, so a losing retry's rejection cannot undo the owner's
+acceptance. One commit consumes at most one queued instruction, because the follow-up's attempt
+begins asynchronously and the commit stays current meanwhile; a retry of a commit whose
+instruction was consumed delivers nothing more. A commit superseded by a newer run attempt
+during publication or delivery records no result, skips delivery, starts no follow-up, and
+leaves the flag to its new owner. The drain
+returns early only when the current head cannot be delivered (an approval held for the next
+run, or output of another live run); that is evaluated against current state, not the
+processor's last pass.
+
+Cancelling a run detaches it from the router without cancelling the stream's iterator. The
+controller replaces its stream only after the old one finished (stdout EOF or shutdown), and
+each stream has a generation. A run that is cancelled or superseded before it selects a router
+finishes as cancelled without touching the tab's routers. When the tab router reads an older
+generation than the subscribed one, the runner first waits for that router to read its finished
+stream to the end (a router of a newer stream is never waited on), then reuses it if it
+holds events of the subscribing run: when the process exits after the run's message was sent,
+the controller emits the run's failure on the old stream before finishing it, and the next
+subscription returns a new, empty stream. Such a reused router is only a prefix: if it ends
+without the run's terminal event, the run continues on the subscribed stream. Other routers
+keep delivering what their streams carry and are revived, never given a second reader, if
+their stream becomes current again; output from a controller the tab no longer owns is
+dropped.
+
+Known residuals: the transcript is append-only. Output emitted after a run's start marker
+belongs to that run, even if the provider produced it for an earlier background task, because
+stream order is the only signal available. Output emitted after the user's new row was appended
+but before the run's start marker (while the run acquires its lease) is between-run output shown
+below the new row, and so is output of a cancelled run that the app reads only after the user's
+next message.
+
+The subprocess-free regression test is in
+`Tests/RepoPromptTests/AgentMode/ClaudeCompatible/ClaudeNativeBackgroundTranscriptTests.swift`:
+`make dev-test FILTER=AgentModeRunServiceLifecycleTests/testClaudeBackgroundOutputAppearsWithoutNewSendAndKeepsOriginalTurn`.
+It drives the real controller, translator, runner, terminal barrier, and view-model stream
+handler; only launch/control and user-message writes are faked. It does not reproduce the
+incident's prolonged catch-up latency, and live-app behavior has not been verified. The same
+file covers a process exit before the run subscribes, continuation on the subscribed stream,
+background output during an active run's status, background `final_content` across a system
+row or a run's terminal finalization, segment and row isolation between a run and interleaved
+background output, between-run runtime errors, and runs never merging into background rows
+below their user row. Ownership, marker, approval, and drain rules
+are covered by `ClaudeNativeEventRouterTests` in the same directory. The barrier's capture,
+release, delivery, and follow-up order, including retried, overlapping, and superseded commits
+and one follow-up per commit, is covered in `AgentModeRunServiceLifecycleTests`; exclusion of
+background rows from completion notifications is covered in
+`AttentionNotificationAdmissionTests`.
+
 ### Future external repository
 
 When the provider package is later moved to its own repository, the plan is:

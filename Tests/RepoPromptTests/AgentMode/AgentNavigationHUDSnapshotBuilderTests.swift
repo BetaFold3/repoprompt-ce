@@ -153,6 +153,93 @@ final class AgentNavigationHUDSnapshotBuilderTests: XCTestCase {
         XCTAssertGreaterThan(titleScore, pathScore)
     }
 
+    func testSearchFieldNormalizationMatchesLegacyNormalizerForEveryASCIIScalar() {
+        for value in UInt8(0) ... 0x7F {
+            let scalar = String(UnicodeScalar(value))
+            for input in [scalar, "a\(scalar)Z"] {
+                let trimmed = input.trimmingCharacters(in: .whitespacesAndNewlines)
+                XCTAssertEqual(
+                    Array(AgentSessionSearchNormalizer.normalize(trimmed).unicodeScalars),
+                    Array(trimmed.lowercased().unicodeScalars),
+                    "ASCII lowercasing diverges from legacy folding for \(String(reflecting: input))"
+                )
+                assertSearchFieldMatchesLegacyNormalizer(input)
+            }
+        }
+    }
+
+    func testSearchFieldNormalizationMatchesLegacyNormalizerForRealisticAndNonASCIIText() {
+        let inputs: [String?] = [
+            nil, "", " ", "\t\n", "\r\n", "  Padded Title \n", "\u{00A0}Title\u{00A0}",
+            "0F8C2E1A-5B3D-4C7E-9A6F-1D2E3F4A5B6C",
+            "/Users/Me/Workspace/RepoPrompt-CE/Sources/App.swift",
+            "feature/D6-Search_Field", "Claude Opus (High)", "Needs input",
+            "Café", "ＡＢＣ", "\u{0301}", "e\u{0301}", "Straße", "İstanbul",
+            "Fix 🚀 Sidebar", "Résumé/feature-ÄB", "日本語 Title"
+        ]
+        for input in inputs {
+            assertSearchFieldMatchesLegacyNormalizer(input)
+        }
+    }
+
+    func testSearchFieldsCorpusPreservesFilteringOrderAndScores() throws {
+        let uuid = "0F8C2E1A-5B3D-4C7E-9A6F-1D2E3F4A5B6C"
+        let fields = AgentSessionSearchFields(
+            title: "  Café Title ",
+            status: [nil, "Running", " ", "Running"],
+            path: ["\u{0301}", "/Tmp/X"],
+            identifier: [uuid]
+        )
+
+        // Legacy folding keeps a lone combining mark, so that field survives the empty filter.
+        XCTAssertEqual(fields.fields.map(\.text), ["Café Title", "Running", "Running", "\u{0301}", "/Tmp/X", uuid])
+        XCTAssertEqual(
+            fields.fields.map(\.normalizedText),
+            ["cafe title", "running", "running", "\u{0301}", "/tmp/x", uuid.lowercased()]
+        )
+        XCTAssertEqual(fields.fields.map(\.kind), [.title, .status, .status, .path, .path, .identifier])
+        XCTAssertEqual(
+            try XCTUnwrap(AgentSessionSearchMatcher.score(query: .parse("CAFÉ"), fields: fields)).value,
+            1060
+        )
+        XCTAssertEqual(
+            try XCTUnwrap(AgentSessionSearchMatcher.score(query: .parse("running"), fields: fields)).value,
+            700
+        )
+        XCTAssertEqual(
+            try XCTUnwrap(AgentSessionSearchMatcher.score(
+                query: .parse("CAFÉ"),
+                fields: AgentSessionSearchFields(title: "Cafe")
+            )).value,
+            1080
+        )
+        XCTAssertEqual(
+            try XCTUnwrap(AgentSessionSearchMatcher.score(query: .parse("\u{0301}"), fields: fields)).value,
+            460
+        )
+    }
+
+    private func assertSearchFieldMatchesLegacyNormalizer(
+        _ input: String?,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) {
+        let trimmed = input?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let legacy = AgentSessionSearchNormalizer.normalize(trimmed)
+        let field = AgentSessionSearchField(input, kind: .path)
+        let label = String(reflecting: input)
+        XCTAssertEqual(Array(field.text.unicodeScalars), Array(trimmed.unicodeScalars), label, file: file, line: line)
+        XCTAssertEqual(
+            Array(field.normalizedText.unicodeScalars),
+            Array(legacy.unicodeScalars),
+            label,
+            file: file,
+            line: line
+        )
+        XCTAssertEqual(field.isEmpty, legacy.isEmpty, label, file: file, line: line)
+        XCTAssertEqual(field.kind, .path, label, file: file, line: line)
+    }
+
     private func row(tabID: UUID, depth: Int, title: String) -> AgentModeViewModel.SidebarSession {
         AgentModeViewModel.SidebarSession(
             id: tabID,

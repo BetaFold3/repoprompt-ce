@@ -52,44 +52,73 @@ package final class AgentCodexModelRegistry {
         preferredLiveModels: [CodexAppServerClient.RemoteModel]? = nil
     ) -> [AgentModelOption] {
         let capabilities = knownModelBaseRegistry.capabilitySnapshot()
+        guard let dynamicOptions = dynamicSourceOptions(preferredLiveModels: preferredLiveModels) else {
+            return codexOptionsByAddingFastVariants(staticOptions, capabilities: capabilities)
+        }
+        return resolvedOptions(
+            dynamicOptions: dynamicOptions,
+            staticOptions: staticOptions,
+            capabilities: capabilities
+        )
+    }
+
+    /// Returns the same option as `resolvedOptions(...).first(where: predicate)`.
+    /// The selected source's leading options (dynamic placeholder + mapped options, or the
+    /// static options) always prefix the full resolution, so a match there is returned without
+    /// synthesizing fast variants or backfilling. A miss resolves the full list from the same
+    /// captured capabilities and source options.
+    /// `predicate` must be pure: on a miss it is re-evaluated over the leading options as part of the full list.
+    func firstResolvedOption(
+        staticOptions: [AgentModelOption],
+        preferredLiveModels: [CodexAppServerClient.RemoteModel]? = nil,
+        matching predicate: (AgentModelOption) -> Bool
+    ) -> AgentModelOption? {
+        let capabilities = knownModelBaseRegistry.capabilitySnapshot()
+        guard let dynamicOptions = dynamicSourceOptions(preferredLiveModels: preferredLiveModels) else {
+            if let match = staticOptions.first(where: predicate) {
+                return match
+            }
+            return codexOptionsByAddingFastVariants(staticOptions, capabilities: capabilities)
+                .first(where: predicate)
+        }
+        if let match = dynamicOptions.first(where: predicate) {
+            return match
+        }
+        return resolvedOptions(
+            dynamicOptions: dynamicOptions,
+            staticOptions: staticOptions,
+            capabilities: capabilities
+        ).first(where: predicate)
+    }
+
+    /// Source precedence shared by `resolvedOptions` and `firstResolvedOption`:
+    /// non-empty preferred models, then (explicit empty preferred) cache only; with nil preferred,
+    /// live models then cache. Returns nil when the static options are the only source.
+    private func dynamicSourceOptions(
+        preferredLiveModels: [CodexAppServerClient.RemoteModel]?
+    ) -> [AgentModelOption]? {
         if let preferredLiveModels {
             if !preferredLiveModels.isEmpty {
-                return resolvedOptions(
-                    dynamicOptions: codexDynamicOptions(from: preferredLiveModels),
-                    staticOptions: staticOptions,
-                    capabilities: capabilities
-                )
+                return codexDynamicOptions(from: preferredLiveModels)
             }
             let cachedOptions = CodexDynamicModelStore.modelOptions(defaults: defaults)
             if !cachedOptions.isEmpty {
-                return resolvedOptions(
-                    dynamicOptions: codexDynamicOptions(from: cachedOptions),
-                    staticOptions: staticOptions,
-                    capabilities: capabilities
-                )
+                return codexDynamicOptions(from: cachedOptions)
             }
-            return codexOptionsByAddingFastVariants(staticOptions, capabilities: capabilities)
+            return nil
         }
 
         let knownLiveModels = currentLiveModels()
         if !knownLiveModels.isEmpty {
-            return resolvedOptions(
-                dynamicOptions: codexDynamicOptions(from: knownLiveModels),
-                staticOptions: staticOptions,
-                capabilities: capabilities
-            )
+            return codexDynamicOptions(from: knownLiveModels)
         }
 
         let cachedOptions = CodexDynamicModelStore.modelOptions(defaults: defaults)
         if !cachedOptions.isEmpty {
-            return resolvedOptions(
-                dynamicOptions: codexDynamicOptions(from: cachedOptions),
-                staticOptions: staticOptions,
-                capabilities: capabilities
-            )
+            return codexDynamicOptions(from: cachedOptions)
         }
 
-        return codexOptionsByAddingFastVariants(staticOptions, capabilities: capabilities)
+        return nil
     }
 
     private func resolvedOptions(

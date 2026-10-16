@@ -52,6 +52,20 @@ final class ImageAwareTextView: NSTextView {
         onDidMoveToWindow?()
     }
 
+    #if DEBUG || EDIT_FLOW_PERF
+        /// Diagnostics-only notification of an accepted responder change from any route
+        /// (token attempt, SwiftUI focus binding, click). It never requests focus.
+        var onDidBecomeFirstResponderForInteractionProbe: (() -> Void)?
+
+        override func becomeFirstResponder() -> Bool {
+            let accepted = super.becomeFirstResponder()
+            if accepted {
+                onDidBecomeFirstResponderForInteractionProbe?()
+            }
+            return accepted
+        }
+    #endif
+
     override var readablePasteboardTypes: [NSPasteboard.PasteboardType] {
         var types = super.readablePasteboardTypes
         guard enablesImagePasteHandling else {
@@ -426,6 +440,9 @@ struct CustomTextField: NSViewRepresentable {
         let composerFocusState = ComposerFocusTokenPolicy.seededState(for: features.composerFocusToken)
         context.coordinator.lastAppliedComposerFocusToken = composerFocusState.lastAppliedToken
         context.coordinator.pendingComposerFocusToken = composerFocusState.pendingToken
+        #if DEBUG || EDIT_FLOW_PERF
+            context.coordinator.installInteractionProbeResponderObservation(on: textView)
+        #endif
         textView.enablesImagePasteHandling = onImagePaste != nil
         context.coordinator.configureFileTagSupport(
             textView: textView,
@@ -492,6 +509,9 @@ struct CustomTextField: NSViewRepresentable {
             scope: features.snippetPaletteScope
         )
         context.coordinator.scheduleComposerFocusToken(features.composerFocusToken, for: textView)
+        #if DEBUG || EDIT_FLOW_PERF
+            context.coordinator.observeComposerResponderForInteractionProbe(textView, via: "viewUpdate")
+        #endif
 
         var appliedProgrammaticTextChange = false
         // IME FIX: Avoid stomping marked text (composition) with programmatic writes.
@@ -535,6 +555,9 @@ struct CustomTextField: NSViewRepresentable {
         textView.delegate = nil
         textView.imagePasteHandler = nil
         textView.onDidMoveToWindow = nil
+        #if DEBUG || EDIT_FLOW_PERF
+            textView.onDidBecomeFirstResponderForInteractionProbe = nil
+        #endif
         textView.isAutomaticSpellingCorrectionEnabled = false
         coordinator.clearUndoHistory()
         coordinator.dismissFileTagOverlay()
@@ -584,6 +607,9 @@ struct CustomTextField: NSViewRepresentable {
         }
 
         func composerTextViewDidMoveToWindow(_ textView: ImageAwareTextView) {
+            #if DEBUG || EDIT_FLOW_PERF
+                observeComposerResponderForInteractionProbe(textView, via: "moveToWindow")
+            #endif
             guard let pendingComposerFocusToken else { return }
             scheduleComposerFocusToken(pendingComposerFocusToken, for: textView)
         }
@@ -601,7 +627,32 @@ struct CustomTextField: NSViewRepresentable {
             lastAppliedComposerFocusToken = nil
         }
 
+        #if DEBUG || EDIT_FLOW_PERF
+            func installInteractionProbeResponderObservation(on textView: ImageAwareTextView) {
+                textView.onDidBecomeFirstResponderForInteractionProbe = { [weak self, weak textView] in
+                    guard let self, let textView else { return }
+                    observeComposerResponderForInteractionProbe(textView, via: "responderBecame")
+                }
+            }
+
+            /// Diagnostics only: reads actual AppKit state for the current token. It never
+            /// requests focus and does not touch the seeded/applied token policy state.
+            func observeComposerResponderForInteractionProbe(_ textView: ImageAwareTextView, via: StaticString) {
+                guard AgentInteractionLatencyProbe.isAwaitingComposerFocus,
+                      isActive,
+                      let token = parent.features.composerFocusToken,
+                      let window = textView.window,
+                      window.isKeyWindow,
+                      window.firstResponder === textView
+                else { return }
+                AgentInteractionLatencyProbe.composerFocusAcknowledged(token: token, via: via)
+            }
+        #endif
+
         private func applyComposerFocusToken(_ token: UUID?, to textView: ImageAwareTextView) {
+            #if DEBUG || EDIT_FLOW_PERF
+                defer { observeComposerResponderForInteractionProbe(textView, via: "tokenAttempt") }
+            #endif
             let action = ComposerFocusTokenPolicy.action(
                 token: token,
                 lastAppliedToken: lastAppliedComposerFocusToken,

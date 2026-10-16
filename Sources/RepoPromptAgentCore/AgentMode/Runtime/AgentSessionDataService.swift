@@ -511,10 +511,12 @@ package actor AgentSessionDataService {
         existingProjectionCounts: AgentTranscriptProjectionCounts?,
         existingLastUserMessageAt: Date?,
         trustedCanonicalItemCount: Int? = nil,
+        precomputedProjectionCounts: AgentTranscriptProjectionCounts? = nil,
         preserveProvidedValues: Bool
     ) -> PreparedSessionMetadata {
         if let transcript {
-            let computedProjectionCounts = computeProjectionCounts(in: transcript)
+            // `precomputedProjectionCounts` must come from the full projection paired with `transcript`.
+            let computedProjectionCounts = precomputedProjectionCounts ?? computeProjectionCounts(in: transcript)
             return PreparedSessionMetadata(
                 itemCount: trustedCanonicalItemCount ?? computedProjectionCounts.canonicalVisibleRowCount,
                 transcriptProjectionCounts: computedProjectionCounts,
@@ -554,6 +556,8 @@ package actor AgentSessionDataService {
     ) -> AgentSession {
         var stored = session
         let lastRunState = stored.lastRunState.flatMap(AgentSessionRunState.init(rawValue:))
+        // Counts from the persistent pipeline's full projection paired with the stored transcript.
+        var persistedProjectionCounts: AgentTranscriptProjectionCounts?
         var workingItemsCache: [AgentChatItem]?
         func workingItems() -> [AgentChatItem] {
             if let workingItemsCache {
@@ -579,7 +583,9 @@ package actor AgentSessionDataService {
                 }
             }
             if let transcript = stored.transcript {
-                stored.transcript = AgentTranscriptIO.persistedTranscript(transcript)
+                let persisted = AgentTranscriptPolicyPipeline.persistedTranscript(from: transcript)
+                stored.transcript = persisted.transcript
+                persistedProjectionCounts = AgentTranscriptProjectionBuilder.projectionCounts(for: persisted.projection)
             }
         case .canonicalize:
             if stored.transcript == nil {
@@ -595,7 +601,9 @@ package actor AgentSessionDataService {
                 }
             }
             if let transcript = stored.transcript {
-                stored.transcript = AgentTranscriptIO.persistedTranscript(transcript)
+                let persisted = AgentTranscriptPolicyPipeline.persistedTranscript(from: transcript)
+                stored.transcript = persisted.transcript
+                persistedProjectionCounts = AgentTranscriptProjectionBuilder.projectionCounts(for: persisted.projection)
             }
         }
         stored.items = []
@@ -613,6 +621,7 @@ package actor AgentSessionDataService {
             existingProjectionCounts: stored.transcriptProjectionCounts,
             existingLastUserMessageAt: stored.lastUserMessageAt,
             trustedCanonicalItemCount: trustedCanonicalItemCount,
+            precomputedProjectionCounts: persistedProjectionCounts,
             preserveProvidedValues: preparation == .alreadyCanonicalTranscript
         )
         stored.itemCount = metadata.itemCount

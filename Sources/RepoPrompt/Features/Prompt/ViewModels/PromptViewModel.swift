@@ -1388,10 +1388,6 @@ class PromptViewModel: ObservableObject {
         tokenCountingViewModel.codeMapContent
     }
 
-    var scannedLanguages: Set<LanguageType> {
-        tokenCountingViewModel.scannedLanguages
-    }
-
     var combinedTreeAndCodeMapContent: String {
         tokenCountingViewModel.combinedTreeAndCodeMapContent
     }
@@ -2436,6 +2432,15 @@ class PromptViewModel: ObservableObject {
         case forkDuplicate(sourceTabID: UUID)
     }
 
+    /// Whether a removal caller waits for the Agent-owned post-commit cleanup task. Only
+    /// interactive fresh-Agent creation opts into deferral, and only an owned stash commit of
+    /// tabs that were eligible and inactive at the synchronous mutation skips the wait; the
+    /// operation keeps its reservations and cleanup ownership either way.
+    enum ComposeTabRemovalCleanupWait {
+        case awaitCompletion
+        case deferEligibleInactiveAutoStashCleanup
+    }
+
     func attachWorkspaceManager(_ manager: WorkspaceManagerViewModel) {
         workspaceManager = manager
     }
@@ -2495,9 +2500,21 @@ class PromptViewModel: ObservableObject {
         currentComposeTabs = updatedTabs
     }
 
+    /// Publishes compose-tab membership alone, without changing the active tab or editor state.
     @MainActor
-    func loadComposeTabsFromWorkspace(_ workspace: WorkspaceModel, syncPromptText: Bool = false) {
+    private func publishComposeTabMembership(from workspace: WorkspaceModel) {
         currentComposeTabs = workspace.composeTabs
+    }
+
+    @MainActor
+    func loadComposeTabsFromWorkspace(
+        _ workspace: WorkspaceModel,
+        syncPromptText: Bool = false,
+        publishMembership: Bool = true
+    ) {
+        if publishMembership {
+            publishComposeTabMembership(from: workspace)
+        }
         activeComposeTabID = workspace.activeComposeTabID ?? workspace.composeTabs.first?.id
         let validIDs = Set(workspace.composeTabs.map(\.id))
         dirtyTabIDs = dirtyTabIDs.intersection(validIDs)
@@ -2553,13 +2570,21 @@ class PromptViewModel: ObservableObject {
     /// Returns true if a tab was successfully stashed.
     @MainActor
     private func autoStashLeastRecentlyUsedTab(
-        excluding excludedID: UUID? = nil
+        excluding excludedID: UUID? = nil,
+        cleanupWait: ComposeTabRemovalCleanupWait = .awaitCompletion
     ) async -> Bool {
         guard
             let manager = workspaceManager,
             let workspace = manager.activeWorkspace,
             let index = manager.workspaces.firstIndex(where: { $0.id == workspace.id })
         else { return false }
+
+        func currentOpenTabs() -> [ComposeTabState]? {
+            guard manager.activeWorkspace?.id == workspace.id,
+                  let currentIndex = manager.workspaces.firstIndex(where: { $0.id == workspace.id })
+            else { return nil }
+            return manager.workspaces[currentIndex].composeTabs
+        }
 
         let tabs = manager.workspaces[index].composeTabs
         guard tabs.count > 1 else { return false } // never stash the last tab
@@ -2587,11 +2612,20 @@ class PromptViewModel: ObservableObject {
 
         for target in sortedCandidates {
             let affectedTabIDs = await autoStashAffectedComposeTabIDs(for: target.id)
-            guard canAutoStashAffectedComposeTabs(affectedTabIDs, among: tabs, excluding: excludedID) else {
+            // The cascade await can interleave tab or workspace changes; judge eligibility
+            // against the canonical tabs of the same workspace.
+            guard let tabsAfterCascade = currentOpenTabs() else { return false }
+            guard tabsAfterCascade.contains(where: { $0.id == target.id }),
+                  canAutoStashAffectedComposeTabs(affectedTabIDs, among: tabsAfterCascade, excluding: excludedID)
+            else {
                 continue
             }
-            await stashTab(target.id)
-            return true
+            await stashTab(target.id, cleanupWait: cleanupWait)
+            // `stashTab` reports nothing; admission requires the canonical removal to have
+            // happened. A vetoed or superseded stash refuses rather than overflowing.
+            guard let tabsAfterStash = currentOpenTabs() else { return false }
+            let remainingTabIDs = Set(tabsAfterStash.map(\.id))
+            return remainingTabIDs.isDisjoint(with: affectedTabIDs.union([target.id]))
         }
         return false
     }
@@ -2675,40 +2709,60 @@ class PromptViewModel: ObservableObject {
         in manager: WorkspaceManagerViewModel,
         workspaceIndex index: Int,
         policy: ComposeTabCapacityPolicy,
-        excluding excludedID: UUID? = nil
+        excluding excludedID: UUID? = nil,
+        cleanupWait: ComposeTabRemovalCleanupWait = .awaitCompletion
     ) async -> Bool {
+        let isBackgroundPolicy = policy == .mcpBackgroundAgent
+        let limit = isBackgroundPolicy ? backgroundAgentComposeTabHardLimit : maxComposeTabs
         let currentCount = manager.workspaces[index].composeTabs.count
-        switch policy {
-        case .uiInteractive:
-            guard currentCount >= maxComposeTabs else { return true }
-        case .mcpBackgroundAgent:
-            let hardLimit = backgroundAgentComposeTabHardLimit
-            guard currentCount >= hardLimit else { return true }
-            guard currentCount == hardLimit else { return false }
+        guard currentCount >= limit else { return true }
+        if isBackgroundPolicy {
+            guard currentCount == limit else { return false }
         }
 
+        let workspaceID = manager.workspaces[index].id
         let excluded = excludedID ?? manager.workspaces[index].activeComposeTabID
-        return await autoStashLeastRecentlyUsedTab(excluding: excluded)
+        guard await autoStashLeastRecentlyUsedTab(excluding: excluded, cleanupWait: cleanupWait) else {
+            return false
+        }
+        guard manager.activeWorkspace?.id == workspaceID,
+              let currentIndex = manager.workspaces.firstIndex(where: { $0.id == workspaceID })
+        else { return false }
+        // Interactive admission rests on the auto-stash's proven canonical removal of its target
+        // (and cascade) in this still-active workspace: one out per one in, even when the workspace
+        // is already above the soft limit or a concurrent background creation landed meanwhile.
+        // The background hard cap stays strict against the current canonical count.
+        guard isBackgroundPolicy else { return true }
+        return manager.workspaces[currentIndex].composeTabs.count < limit
     }
 
+    @discardableResult
     @MainActor
     private func createComposeTab(
         strategy: ComposeTabCreationStrategy = .duplicateCurrent,
         name: String? = nil,
-        blankAgentSessionID: UUID? = nil
-    ) async {
+        blankAgentSessionID: UUID? = nil,
+        capacityCleanupWait: ComposeTabRemovalCleanupWait = .awaitCompletion,
+        prepareBeforeActivation: (@MainActor (UUID) -> Bool)? = nil
+    ) async -> UUID? {
         guard
             let manager = workspaceManager,
             let workspace = manager.activeWorkspace,
             let index = manager.workspaces.firstIndex(where: { $0.id == workspace.id })
-        else { return }
+        else { return nil }
 
         guard await ensureCapacityForNewComposeTab(
             in: manager,
             workspaceIndex: index,
             policy: .uiInteractive,
-            excluding: manager.workspaces[index].activeComposeTabID
-        ) else { return }
+            excluding: manager.workspaces[index].activeComposeTabID,
+            cleanupWait: capacityCleanupWait
+        ) else { return nil }
+        // Capacity may have suspended for an auto-stash; never apply to a stale index.
+        guard manager.workspaces.indices.contains(index),
+              manager.workspaces[index].id == workspace.id,
+              manager.activeWorkspace?.id == workspace.id
+        else { return nil }
 
         let didSnapshotSource = flushAndSnapshotSourceTabIfNeeded(for: strategy, in: manager, workspaceIndex: index)
         guard let newTab = makeComposeTab(
@@ -2717,7 +2771,7 @@ class PromptViewModel: ObservableObject {
             workspaceIndex: index,
             manager: manager,
             blankAgentSessionID: blankAgentSessionID
-        ) else { return }
+        ) else { return nil }
 
         // Flush pending editor state and snapshot current tab before switching
         if !didSnapshotSource {
@@ -2725,18 +2779,42 @@ class PromptViewModel: ObservableObject {
         }
 
         manager.workspaces[index].composeTabs.append(newTab)
-        await withComposeTabActivationSnapshotSuspended(targetTabID: newTab.id, manager: manager) {
+        let didActivate = await withComposeTabActivationSnapshotSuspended(
+            targetTabID: newTab.id,
+            manager: manager
+        ) { () async -> Bool in
+            if let prepareBeforeActivation {
+                // Publish membership only, then prepare the destination before its activation is
+                // observed. No suspension point separates membership, preparation and activation.
+                publishComposeTabMembership(from: manager.workspaces[index])
+                guard prepareBeforeActivation(newTab.id) else {
+                    // Withdraw only the just-appended, never-activated tab.
+                    manager.workspaces[index].composeTabs.removeAll { $0.id == newTab.id }
+                    publishComposeTabMembership(from: manager.workspaces[index])
+                    return false
+                }
+            }
             manager.workspaces[index].activeComposeTabID = newTab.id
-            activeComposeTabID = newTab.id
-            dirtyTabIDs.remove(newTab.id)
-            loadComposeTabsFromWorkspace(manager.workspaces[index])
+            if prepareBeforeActivation == nil {
+                activeComposeTabID = newTab.id
+                dirtyTabIDs.remove(newTab.id)
+                loadComposeTabsFromWorkspace(manager.workspaces[index])
+            } else {
+                // A prepared destination already published this exact membership; the loader alone
+                // publishes the new active ID, once.
+                dirtyTabIDs.remove(newTab.id)
+                loadComposeTabsFromWorkspace(manager.workspaces[index], publishMembership: false)
+            }
             await withComposeTabSwitching(targetTabID: newTab.id) {
                 await manager.applyComposeTabState(newTab)
             }
+            return true
         }
+        guard didActivate else { return nil }
 
         manager.markWorkspaceDirty()
         manager.pollAndSaveState()
+        return newTab.id
     }
 
     @MainActor
@@ -2748,6 +2826,29 @@ class PromptViewModel: ObservableObject {
     func createBlankComposeTab(createAgentSession: Bool = false) async {
         let blankAgentSessionID = createAgentSession ? UUID() : nil
         await createComposeTab(strategy: .blank, blankAgentSessionID: blankAgentSessionID)
+    }
+
+    /// Creates and activates a blank tab bound to a new Agent session ID and returns the
+    /// created tab's ID, or `nil` when no tab was created (capacity refused, workspace changed,
+    /// preparation refused).
+    ///
+    /// `prepareBeforeActivation` receives the new tab and its newly minted Agent session ID once
+    /// the tab is a member of both the workspace and `currentComposeTabs`, synchronously before
+    /// the tab is activated. Returning `false` withdraws the never-activated tab.
+    @MainActor
+    func createFreshAgentComposeTab(
+        capacityCleanupWait: ComposeTabRemovalCleanupWait = .awaitCompletion,
+        prepareBeforeActivation: (@MainActor (_ tabID: UUID, _ agentSessionID: UUID) -> Bool)? = nil
+    ) async -> UUID? {
+        let agentSessionID = UUID()
+        return await createComposeTab(
+            strategy: .blank,
+            blankAgentSessionID: agentSessionID,
+            capacityCleanupWait: capacityCleanupWait,
+            prepareBeforeActivation: prepareBeforeActivation.map { prepare in
+                { tabID in prepare(tabID, agentSessionID) }
+            }
+        )
     }
 
     /// Create a fork-duplicate tab in the background (without switching to it).
@@ -2936,7 +3037,8 @@ class PromptViewModel: ObservableObject {
         expandCascade: Bool = true,
         isMutationContextCurrent: (@MainActor () -> Bool)? = nil,
         isMutationOwnerCurrent: (@MainActor () -> Bool)? = nil,
-        additionalStashedTabIDs: Set<UUID> = []
+        additionalStashedTabIDs: Set<UUID> = [],
+        cleanupWait: ComposeTabRemovalCleanupWait = .awaitCompletion
     ) async {
         guard !ids.isEmpty || !additionalStashedTabIDs.isEmpty,
               !isApplyingComposeTabRemoval,
@@ -3034,6 +3136,7 @@ class PromptViewModel: ObservableObject {
         var activationContextRevision: UInt64?
         var activationPromptText: String?
         var activationFilesTab: FilesTab?
+        var mayDeferOwnedCleanup = false
         let promptMutation: @MainActor () -> Bool = {
             guard !self.isApplyingComposeTabRemoval,
                   mutationOwnerIsCurrent(),
@@ -3114,6 +3217,19 @@ class PromptViewModel: ObservableObject {
             if let newActivationID {
                 manager.beginApplyingTabContext(forTabID: newActivationID)
                 activatedTabID = newActivationID
+            }
+            // Decided at the synchronous commit boundary, before any state below changes: the
+            // whole affected set is still inactive in both the workspace and Prompt active stores,
+            // no replacement tab is activated, and the eligibility provider's veto is re-checked.
+            if cleanupWait == .deferEligibleInactiveAutoStashCleanup,
+               reason == .stash,
+               newActivationID == nil,
+               request.stashedTabIDs.isEmpty,
+               previousActiveID.map({ !request.composeTabIDs.contains($0) }) ?? true,
+               self.activeComposeTabID.map({ !request.composeTabIDs.contains($0) }) ?? true,
+               request.composeTabIDs.allSatisfy({ self.composeTabAutoStashEligibilityProvider?($0) ?? true })
+            {
+                mayDeferOwnedCleanup = true
             }
 
             self.dirtyTabIDs.subtract(expectedPresentComposeTabIDs)
@@ -3219,7 +3335,11 @@ class PromptViewModel: ObservableObject {
                 promptMutation,
                 promptCleanup
             ) else { return }
-            await composeTabRemovalAwaitCleanup?(removalOperationID)
+            // Deferral leaves the committed operation's task, reservations, and finalization
+            // with the Agent owner; the `defer` above only marks this caller finalized.
+            if !mayDeferOwnedCleanup {
+                await composeTabRemovalAwaitCleanup?(removalOperationID)
+            }
         } else {
             guard promptMutation() else { return }
             await promptCleanup(mutationOwnerIsCurrent)
@@ -3352,7 +3472,8 @@ class PromptViewModel: ObservableObject {
     @MainActor
     func stashTab(
         _ id: UUID,
-        isMutationContextCurrent: (@MainActor () -> Bool)? = nil
+        isMutationContextCurrent: (@MainActor () -> Bool)? = nil,
+        cleanupWait: ComposeTabRemovalCleanupWait = .awaitCompletion
     ) async {
         guard
             let manager = workspaceManager,
@@ -3372,7 +3493,8 @@ class PromptViewModel: ObservableObject {
         await closeComposeTabs(
             withIDs: [id],
             reason: .stash,
-            isMutationContextCurrent: isMutationContextCurrent
+            isMutationContextCurrent: isMutationContextCurrent,
+            cleanupWait: cleanupWait
         )
     }
 

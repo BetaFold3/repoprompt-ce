@@ -44,8 +44,8 @@ package struct AgentDelegatedQuestionNoticePayload: Equatable {
         let question: String
         let context: String?
         let options: [Option]
-        let allowsMultiple: Bool
-        let allowsCustom: Bool
+        package let allowsMultiple: Bool
+        package let allowsCustom: Bool
 
         package init(
             id: String,
@@ -68,9 +68,9 @@ package struct AgentDelegatedQuestionNoticePayload: Equatable {
 
     package let key: AgentDelegatedQuestionNoticeKey
     let childSessionName: String
-    let title: String?
-    let context: String?
-    let questions: [Question]
+    package let title: String?
+    package let context: String?
+    package let questions: [Question]
 
     init(
         key: AgentDelegatedQuestionNoticeKey,

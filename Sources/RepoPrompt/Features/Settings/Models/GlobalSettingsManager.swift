@@ -371,10 +371,21 @@ class GlobalSettingsStore: ObservableObject {
 
     private var globalDefaults = GlobalDefaults(discoverAgentRaw: nil, discoverModelsByAgent: nil)
     private var scalarPreferences = GlobalScalarPreferences() {
-        didSet { pushDisplayPreferences() }
+        didSet {
+            pushDisplayPreferences()
+            guard !defersTelegramIdlePolicyRevision else { return }
+            noteTelegramIdlePolicyTransition(from: oldValue)
+        }
     }
 
     private weak var displayPreferencesTarget: UIDisplayPreferences?
+
+    /// In-memory count of accepted changes to the effective Telegram idle threshold (setter
+    /// saves, load, recovery, import, reload). Not persisted. A change and revert advances it
+    /// twice; a failed, rolled-back save never advances it.
+    private(set) var telegramIdlePolicyRevision: UInt64 = 0
+    /// Set while a Telegram write stages values before its save result is known.
+    private var defersTelegramIdlePolicyRevision = false
 
     private static let defaultBackgroundAgentComposeTabHardLimit = 500
     private static let defaultComposeTabSoftLimit = 50
@@ -1596,6 +1607,76 @@ class GlobalSettingsStore: ObservableObject {
             settings.performanceTracingEnabled = enabled
         }
         SentryTelemetryBootstrap.restartIfStarted()
+    }
+
+    // MARK: - Telegram attention notifications
+
+    func telegramNotificationsEnabled() -> Bool {
+        scalarPreferences.telegram?.enabled ?? false
+    }
+
+    /// The saved chat ID, trimmed; nil when none is saved.
+    func telegramChatID() -> String? {
+        let trimmed = scalarPreferences.telegram?.chatID?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return trimmed.isEmpty ? nil : trimmed
+    }
+
+    /// Returns true only when the value was written to disk; on failure the in-memory value is
+    /// restored, so nothing unsaved is reported or activated.
+    @discardableResult
+    func setTelegramNotificationsEnabled(_ enabled: Bool) -> Bool {
+        updateTelegramScalarAndSave { $0.enabled = enabled }
+    }
+
+    /// Stores a trimmed chat ID (nil or blank clears it). Same write result as above.
+    @discardableResult
+    func setTelegramChatID(_ chatID: String?) -> Bool {
+        let trimmed = chatID?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return updateTelegramScalarAndSave { $0.chatID = trimmed.isEmpty ? nil : trimmed }
+    }
+
+    /// Minimum Mac idle minutes for automatic notifications: 5 by default, 0 means always.
+    func telegramIdleThresholdMinutes() -> Int {
+        GlobalScalarPreferences.TelegramSettings.effectiveIdleThresholdMinutes(scalarPreferences.telegram)
+    }
+
+    /// Saves a nonnegative idle threshold. Negative values are rejected without a write; the
+    /// current effective value succeeds without a write. Same write result as above.
+    @discardableResult
+    func setTelegramIdleThresholdMinutes(_ minutes: Int) -> Bool {
+        guard minutes >= 0 else { return false }
+        guard minutes != telegramIdleThresholdMinutes() else { return true }
+        return updateTelegramScalarAndSave { $0.idleThresholdMinutes = minutes }
+    }
+
+    private func noteTelegramIdlePolicyTransition(from previous: GlobalScalarPreferences) {
+        let effective = GlobalScalarPreferences.TelegramSettings.effectiveIdleThresholdMinutes
+        if effective(previous.telegram) != effective(scalarPreferences.telegram) {
+            telegramIdlePolicyRevision &+= 1
+        }
+    }
+
+    private func updateTelegramScalarAndSave(
+        _ mutation: (inout GlobalScalarPreferences.TelegramSettings) -> Void
+    ) -> Bool {
+        let before = scalarPreferences
+        // Staged values count toward the idle revision only once the save succeeds.
+        defersTelegramIdlePolicyRevision = true
+        defer { defersTelegramIdlePolicyRevision = false }
+        updateScalarPreferences(commit: false) { preferences in
+            var settings = preferences.telegram ?? GlobalScalarPreferences.TelegramSettings()
+            mutation(&settings)
+            preferences.telegram = settings
+        }
+        if save() {
+            noteTelegramIdlePolicyTransition(from: before)
+            return true
+        }
+        if scalarPreferences != before {
+            objectWillChange.send()
+            scalarPreferences = before
+        }
+        return false
     }
 
     func modelResponsesOverrides() -> [String: Bool] {

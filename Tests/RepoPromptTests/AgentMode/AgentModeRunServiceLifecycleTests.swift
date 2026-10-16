@@ -5676,7 +5676,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
             makeTerminalPublicationEnvelope: { _, _, _, _ in
                 .init(epoch: epoch, snapshot: .expired(sessionID: sessionID))
             },
-            startFollowUpRun: { _, text in recorder.record("follow-up:\(text)") }
+            startFollowUpRun: { _, text, _ in recorder.record("follow-up:\(text)") }
         )
         let barrier = AgentRunTerminalCommitBarrier(hooks: hooks)
         let session = AgentTabSession(tabID: UUID())
@@ -5705,6 +5705,412 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         XCTAssertTrue(session.pendingInstructions.isEmpty)
         XCTAssertEqual(recorder.events.count(where: { $0 == "follow-up:continue" }), 1)
         XCTAssertEqual(session.lastTerminalPublicationResult, .accepted(successorEpoch: successor))
+    }
+
+    /// The finishing run is released right after the attention capture, and with a queued
+    /// follow-up its remaining output is delivered before the follow-up starts.
+    func testTerminalCommitReleasesProviderOutputAfterCaptureAndDeliversItBeforeFollowUp() async {
+        for queued in [true, false] {
+            let recorder = LifecycleRecorder()
+            var hooks = makeHooks(
+                recorder: recorder,
+                publishTerminalCommitResult: { _, _, _ in
+                    recorder.record("publish")
+                    return .accepted(successorEpoch: nil)
+                },
+                startFollowUpRun: { _, text, _ in recorder.record("follow-up:\(text)") }
+            )
+            hooks.captureAttentionTurnCompletion = { _, _ in
+                recorder.record("capture")
+                return nil
+            }
+            let barrier = AgentRunTerminalCommitBarrier(hooks: hooks)
+            let session = AgentTabSession(tabID: UUID())
+            session.runID = UUID()
+            session.runState = .running
+            session.pendingInstructions = queued ? ["continue"] : []
+            let ownership = session.beginRunAttempt(source: "test.providerOutputRelease")
+            let request = AgentRunTerminalCommitBarrier.Request(
+                session: session,
+                ownership: ownership,
+                expectedRunID: session.runID,
+                terminalState: .completed,
+                source: "test.providerOutputRelease",
+                attachmentDisposition: .deleteFiles,
+                finalizeNonCodexUsage: true,
+                supportsFollowUp: true,
+                notifyTurnComplete: true,
+                releaseProviderOutput: { recorder.record("release") },
+                deliverProviderOutputBeforeFollowUp: { recorder.record("deliver") }
+            )
+
+            _ = await barrier.commit(request)
+            let relevant: Set = ["capture", "release", "publish", "deliver", "follow-up:continue"]
+            let order = recorder.events.filter { relevant.contains($0) }
+            XCTAssertEqual(
+                order,
+                queued
+                    ? ["capture", "release", "publish", "deliver", "follow-up:continue"]
+                    : ["capture", "release", "publish"],
+                "queued follow-up: \(queued)"
+            )
+        }
+    }
+
+    /// A follow-up started by a retried commit (its first publication was rejected) also waits
+    /// for provider output received since the first commit.
+    func testRetriedTerminalCommitDeliversProviderOutputBeforeStartingFollowUp() async {
+        let recorder = LifecycleRecorder()
+        var publicationAttempts = 0
+        let hooks = makeHooks(
+            recorder: recorder,
+            publishTerminalCommitResult: { _, _, _ in
+                publicationAttempts += 1
+                recorder.record("publish")
+                return publicationAttempts == 1
+                    ? .rejected(reason: "test_transient_rejection")
+                    : .accepted(successorEpoch: nil)
+            },
+            startFollowUpRun: { _, text, _ in recorder.record("follow-up:\(text)") }
+        )
+        let barrier = AgentRunTerminalCommitBarrier(hooks: hooks)
+        let session = AgentTabSession(tabID: UUID())
+        session.runID = UUID()
+        session.runState = .running
+        session.pendingInstructions = ["continue"]
+        let ownership = session.beginRunAttempt(source: "test.providerOutputRetry")
+        let request = AgentRunTerminalCommitBarrier.Request(
+            session: session,
+            ownership: ownership,
+            expectedRunID: session.runID,
+            terminalState: .completed,
+            source: "test.providerOutputRetry",
+            attachmentDisposition: .deleteFiles,
+            finalizeNonCodexUsage: true,
+            supportsFollowUp: true,
+            notifyTurnComplete: false,
+            deliverProviderOutputBeforeFollowUp: {
+                recorder.record("deliver")
+                XCTAssertTrue(session.terminalCommitInProgress, "Concurrent commits are rejected while delivering.")
+            }
+        )
+
+        _ = await barrier.commit(request)
+        XCTAssertEqual(session.pendingInstructions, ["continue"])
+        _ = await barrier.commit(request)
+
+        let relevant: Set = ["publish", "deliver", "follow-up:continue"]
+        XCTAssertEqual(
+            recorder.events.filter { relevant.contains($0) },
+            ["publish", "deliver", "publish", "deliver", "follow-up:continue"]
+        )
+        XCTAssertFalse(session.terminalCommitInProgress)
+        XCTAssertTrue(session.pendingInstructions.isEmpty)
+    }
+
+    /// A retried commit whose publication resumes after a newer attempt began neither delivers,
+    /// starts the follow-up, nor leaves the barrier locked for the newer attempt's commit.
+    func testRetriedCommitSupersededDuringPublicationLeavesBarrierUnlocked() async throws {
+        let recorder = LifecycleRecorder()
+        var publicationAttempts = 0
+        var heldPublication: CheckedContinuation<Void, Never>?
+        let hooks = makeHooks(
+            recorder: recorder,
+            publishTerminalCommitResult: { _, _, _ in
+                publicationAttempts += 1
+                if publicationAttempts == 1 {
+                    return .rejected(reason: "test_transient_rejection")
+                }
+                if publicationAttempts == 2 {
+                    await withCheckedContinuation { heldPublication = $0 }
+                }
+                return .accepted(successorEpoch: nil)
+            },
+            startFollowUpRun: { _, text, _ in recorder.record("follow-up:\(text)") }
+        )
+        let barrier = AgentRunTerminalCommitBarrier(hooks: hooks)
+        let session = AgentTabSession(tabID: UUID())
+        session.runID = UUID()
+        session.runState = .running
+        session.pendingInstructions = ["continue"]
+        func makeRequest(_ ownership: AgentRunOwnership) -> AgentRunTerminalCommitBarrier.Request {
+            AgentRunTerminalCommitBarrier.Request(
+                session: session,
+                ownership: ownership,
+                expectedRunID: session.runID,
+                terminalState: .completed,
+                source: "test.supersededRetry",
+                attachmentDisposition: .deleteFiles,
+                finalizeNonCodexUsage: true,
+                supportsFollowUp: true,
+                notifyTurnComplete: false,
+                deliverProviderOutputBeforeFollowUp: { recorder.record("deliver") }
+            )
+        }
+        let request = makeRequest(session.beginRunAttempt(source: "test.supersededRetry"))
+
+        _ = await barrier.commit(request)
+        let retry = Task { @MainActor in await barrier.commit(request) }
+        try await waitUntil("The retried publication should be in flight") { heldPublication != nil }
+        let newer = session.beginRunAttempt(source: "test.supersededRetry.newer")
+        heldPublication?.resume()
+        _ = await retry.value
+
+        XCTAssertFalse(session.terminalCommitInProgress, "The superseded retry must not lock the barrier.")
+        XCTAssertEqual(recorder.events.count(where: { $0 == "deliver" }), 1)
+        XCTAssertFalse(recorder.contains("follow-up:continue"))
+        let newerRevision = await barrier.commit(makeRequest(newer))
+        XCTAssertNotNil(newerRevision, "The newer attempt's commit must not be rejected as in progress.")
+    }
+
+    /// Two retries whose publications overlap: the one that delivers provider output starts the
+    /// follow-up after its delivery; the other starts nothing.
+    func testOverlappingRetriedCommitsStartFollowUpOnlyAfterDelivery() async throws {
+        let recorder = LifecycleRecorder()
+        var publicationAttempts = 0
+        var heldPublications: [CheckedContinuation<Void, Never>] = []
+        var deliveries = 0
+        var heldDelivery: CheckedContinuation<Void, Never>?
+        let hooks = makeHooks(
+            recorder: recorder,
+            publishTerminalCommitResult: { _, _, _ in
+                publicationAttempts += 1
+                recorder.record("publish")
+                if publicationAttempts == 1 {
+                    return .rejected(reason: "test_transient_rejection")
+                }
+                await withCheckedContinuation { heldPublications.append($0) }
+                return .accepted(successorEpoch: nil)
+            },
+            startFollowUpRun: { _, text, _ in recorder.record("follow-up:\(text)") }
+        )
+        let barrier = AgentRunTerminalCommitBarrier(hooks: hooks)
+        let session = AgentTabSession(tabID: UUID())
+        session.runID = UUID()
+        session.runState = .running
+        session.pendingInstructions = ["continue"]
+        let ownership = session.beginRunAttempt(source: "test.overlappingRetries")
+        let request = AgentRunTerminalCommitBarrier.Request(
+            session: session,
+            ownership: ownership,
+            expectedRunID: session.runID,
+            terminalState: .completed,
+            source: "test.overlappingRetries",
+            attachmentDisposition: .deleteFiles,
+            finalizeNonCodexUsage: true,
+            supportsFollowUp: true,
+            notifyTurnComplete: false,
+            deliverProviderOutputBeforeFollowUp: {
+                deliveries += 1
+                recorder.record("deliver")
+                if deliveries == 2 {
+                    await withCheckedContinuation { heldDelivery = $0 }
+                }
+            }
+        )
+
+        _ = await barrier.commit(request)
+        let firstRetry = Task { @MainActor in await barrier.commit(request) }
+        let secondRetry = Task { @MainActor in await barrier.commit(request) }
+        try await waitUntil("Both retried publications should be in flight") { heldPublications.count == 2 }
+        heldPublications[0].resume()
+        try await waitUntil("One retry should be delivering provider output") { heldDelivery != nil }
+        heldPublications[1].resume()
+        for _ in 0 ..< 20 {
+            await Task.yield()
+        }
+        XCTAssertFalse(
+            recorder.contains("follow-up:continue"),
+            "The other retry must not start the follow-up while output is still being delivered."
+        )
+
+        heldDelivery?.resume()
+        _ = await firstRetry.value
+        _ = await secondRetry.value
+        XCTAssertEqual(recorder.events.count(where: { $0 == "follow-up:continue" }), 1)
+        XCTAssertEqual(recorder.events.filter { $0 == "deliver" || $0 == "follow-up:continue" }.last, "follow-up:continue")
+        XCTAssertFalse(session.terminalCommitInProgress)
+        XCTAssertTrue(session.pendingInstructions.isEmpty)
+    }
+
+    /// A losing retry whose publication is rejected after the barrier owner's was accepted must not
+    /// overwrite that acceptance: the owner still starts the follow-up after its delivery.
+    func testOverlappingRetryRejectionDoesNotOverwriteOwnersAcceptedPublication() async throws {
+        let recorder = LifecycleRecorder()
+        var publicationAttempts = 0
+        var heldPublications: [CheckedContinuation<Void, Never>] = []
+        var deliveries = 0
+        var heldDelivery: CheckedContinuation<Void, Never>?
+        let hooks = makeHooks(
+            recorder: recorder,
+            publishTerminalCommitResult: { _, _, _ in
+                publicationAttempts += 1
+                let attempt = publicationAttempts
+                if attempt == 1 {
+                    return .rejected(reason: "test_transient_rejection")
+                }
+                await withCheckedContinuation { heldPublications.append($0) }
+                return attempt == 2 ? .accepted(successorEpoch: nil) : .rejected(reason: "test_late_rejection")
+            },
+            startFollowUpRun: { _, text, _ in recorder.record("follow-up:\(text)") }
+        )
+        let barrier = AgentRunTerminalCommitBarrier(hooks: hooks)
+        let session = AgentTabSession(tabID: UUID())
+        session.runID = UUID()
+        session.runState = .running
+        session.pendingInstructions = ["continue"]
+        let ownership = session.beginRunAttempt(source: "test.overlappingRetryRejection")
+        let request = AgentRunTerminalCommitBarrier.Request(
+            session: session,
+            ownership: ownership,
+            expectedRunID: session.runID,
+            terminalState: .completed,
+            source: "test.overlappingRetryRejection",
+            attachmentDisposition: .deleteFiles,
+            finalizeNonCodexUsage: true,
+            supportsFollowUp: true,
+            notifyTurnComplete: false,
+            deliverProviderOutputBeforeFollowUp: {
+                deliveries += 1
+                if deliveries == 2 {
+                    await withCheckedContinuation { heldDelivery = $0 }
+                }
+            }
+        )
+
+        _ = await barrier.commit(request)
+        let firstRetry = Task { @MainActor in await barrier.commit(request) }
+        let secondRetry = Task { @MainActor in await barrier.commit(request) }
+        try await waitUntil("Both retried publications should be in flight") { heldPublications.count == 2 }
+        heldPublications[0].resume()
+        try await waitUntil("The accepted retry should be delivering provider output") { heldDelivery != nil }
+        heldPublications[1].resume()
+        _ = await secondRetry.value
+
+        heldDelivery?.resume()
+        _ = await firstRetry.value
+        XCTAssertEqual(recorder.events.count(where: { $0 == "follow-up:continue" }), 1)
+        XCTAssertEqual(session.lastTerminalPublicationResult, .accepted(successorEpoch: nil))
+        XCTAssertFalse(session.terminalCommitInProgress)
+        XCTAssertTrue(session.pendingInstructions.isEmpty)
+    }
+
+    /// One commit consumes at most one queued instruction: the follow-up's attempt begins
+    /// asynchronously, so a later retry of the still-current commit must not start another.
+    func testLaterRetryAfterFollowUpTakeDoesNotConsumeAnotherInstruction() async {
+        // A `.stale` publication drops the first instruction instead of starting it; that drop is
+        // the commit's one take as well.
+        for staleResult in [false, true] {
+            let recorder = LifecycleRecorder()
+            var publicationAttempts = 0
+            var deliveries = 0
+            let hooks = makeHooks(
+                recorder: recorder,
+                publishTerminalCommitResult: { _, _, _ in
+                    publicationAttempts += 1
+                    if publicationAttempts == 1 {
+                        return .rejected(reason: "test_transient_rejection")
+                    }
+                    return staleResult ? .stale : .accepted(successorEpoch: nil)
+                },
+                startFollowUpRun: { _, text, _ in recorder.record("follow-up:\(text)") }
+            )
+            let barrier = AgentRunTerminalCommitBarrier(hooks: hooks)
+            let session = AgentTabSession(tabID: UUID())
+            session.runID = UUID()
+            session.runState = .running
+            session.pendingInstructions = ["first", "second"]
+            let ownership = session.beginRunAttempt(source: "test.followUpOncePerCommit")
+            let request = AgentRunTerminalCommitBarrier.Request(
+                session: session,
+                ownership: ownership,
+                expectedRunID: session.runID,
+                terminalState: .completed,
+                source: "test.followUpOncePerCommit",
+                attachmentDisposition: .deleteFiles,
+                finalizeNonCodexUsage: true,
+                supportsFollowUp: true,
+                notifyTurnComplete: false,
+                deliverProviderOutputBeforeFollowUp: { deliveries += 1 }
+            )
+
+            _ = await barrier.commit(request)
+            _ = await barrier.commit(request)
+            let deliveriesAfterTake = deliveries
+            _ = await barrier.commit(request)
+
+            XCTAssertEqual(
+                recorder.events.filter { $0.hasPrefix("follow-up:") },
+                staleResult ? [] : ["follow-up:first"],
+                "stale: \(staleResult)"
+            )
+            XCTAssertEqual(session.pendingInstructions, ["second"], "stale: \(staleResult)")
+            XCTAssertEqual(deliveries, deliveriesAfterTake, "A consumed commit's retry delivers nothing more.")
+            XCTAssertFalse(session.terminalCommitInProgress)
+        }
+    }
+
+    /// A commit superseded by a newer run attempt while it delivers provider output starts no
+    /// follow-up and leaves the barrier to the newer attempt's commit, even when that commit is
+    /// still in progress when the superseded one resumes.
+    func testCommitSupersededDuringProviderOutputDeliveryLeavesBarrierToNewerCommit() async {
+        let recorder = LifecycleRecorder()
+        var publicationAttempts = 0
+        var heldPublication: CheckedContinuation<Void, Never>?
+        let hooks = makeHooks(
+            recorder: recorder,
+            publishTerminalCommitResult: { _, _, _ in
+                publicationAttempts += 1
+                if publicationAttempts == 2 {
+                    // The newer attempt's commit holds the barrier here.
+                    await withCheckedContinuation { heldPublication = $0 }
+                }
+                return .accepted(successorEpoch: nil)
+            },
+            startFollowUpRun: { _, text, _ in recorder.record("follow-up:\(text)") }
+        )
+        let barrier = AgentRunTerminalCommitBarrier(hooks: hooks)
+        let session = AgentTabSession(tabID: UUID())
+        session.runID = UUID()
+        session.runState = .running
+        session.pendingInstructions = ["continue"]
+        var newerCommit: Task<AgentRunTerminalCommitRevision?, Never>?
+        func makeRequest(
+            _ ownership: AgentRunOwnership,
+            onDeliver: @escaping @MainActor () async -> Void
+        ) -> AgentRunTerminalCommitBarrier.Request {
+            AgentRunTerminalCommitBarrier.Request(
+                session: session,
+                ownership: ownership,
+                expectedRunID: session.runID,
+                terminalState: .completed,
+                source: "test.supersededDelivery",
+                attachmentDisposition: .deleteFiles,
+                finalizeNonCodexUsage: true,
+                supportsFollowUp: true,
+                notifyTurnComplete: false,
+                deliverProviderOutputBeforeFollowUp: { await onDeliver() }
+            )
+        }
+        let first = session.beginRunAttempt(source: "test.supersededDelivery")
+
+        _ = await barrier.commit(makeRequest(first) {
+            // A newer attempt begins and its commit is still publishing when this one resumes.
+            session.runState = .running
+            let newer = session.beginRunAttempt(source: "test.supersededDelivery.newer")
+            newerCommit = Task { @MainActor in await barrier.commit(makeRequest(newer) {}) }
+            while heldPublication == nil {
+                await Task.yield()
+            }
+        })
+        XCTAssertFalse(recorder.contains("follow-up:continue"), "The superseded commit must not start the follow-up.")
+        XCTAssertTrue(session.terminalCommitInProgress, "The newer commit still owns the barrier.")
+
+        heldPublication?.resume()
+        let newerRevision = await newerCommit?.value
+        XCTAssertNotNil(newerRevision ?? nil)
+        XCTAssertFalse(session.terminalCommitInProgress)
+        XCTAssertEqual(recorder.events.count(where: { $0 == "follow-up:continue" }), 1)
     }
 
     func testProviderSuccessorConsumesOnceAfterAcceptedPublicationWithoutTouchingGenericQueue() async {
@@ -6371,6 +6777,8 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         flushPendingAssistantDelta: ((AgentTabSession) -> Void)? = nil,
         publishTerminalCommit: ((AgentTabSession, AgentRunTerminalCommitRevision) async -> Void)? = nil,
         handleHeadlessStreamResult: ((AIStreamResult) async -> Void)? = nil,
+        handleBackgroundNativeStreamResult: ((AIStreamResult, UUID) async -> Void)? = nil,
+        endBackgroundNativeMessage: ((UUID) -> Void)? = nil,
         toolTrackingHooks: AgentToolTrackingHooks = .noOp,
         autoSignalACPRouting: Bool = false,
         expectedPIDPolicyArmer: @escaping (MCPBootstrapLeaseSpec) async -> Bool = { _ in true },
@@ -6484,7 +6892,9 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
                     recorder: recorder,
                     flushPendingAssistantDelta: flushPendingAssistantDelta,
                     publishTerminalCommit: publishTerminalCommit,
-                    handleHeadlessStreamResult: handleHeadlessStreamResult
+                    handleHeadlessStreamResult: handleHeadlessStreamResult,
+                    handleBackgroundNativeStreamResult: handleBackgroundNativeStreamResult,
+                    endBackgroundNativeMessage: endBackgroundNativeMessage
                 ),
                 toolTrackingHooks: toolTrackingHooks,
                 runCoordinator: AgentRunCoordinator.shared
@@ -6508,8 +6918,10 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
             AgentSessionRunState,
             UUID?
         ) -> AgentRunTerminalPublicationEnvelope?)? = nil,
-        startFollowUpRun: ((UUID, String) -> Void)? = nil,
-        handleHeadlessStreamResult: ((AIStreamResult) async -> Void)? = nil
+        startFollowUpRun: ((UUID, String, AgentModeRunService.Hooks.FollowUpStartObservation?) -> Void)? = nil,
+        handleHeadlessStreamResult: ((AIStreamResult) async -> Void)? = nil,
+        handleBackgroundNativeStreamResult: ((AIStreamResult, UUID) async -> Void)? = nil,
+        endBackgroundNativeMessage: ((UUID) -> Void)? = nil
     ) -> AgentModeRunService.Hooks {
         let flushPendingAssistantDelta = flushPendingAssistantDelta ?? { _ in
             recorder.record("assistant-flush")
@@ -6555,7 +6967,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
                 await publishTerminalCommit(session, revision)
                 return .accepted(successorEpoch: nil)
             },
-            startFollowUpRun: startFollowUpRun ?? { _, _ in },
+            startFollowUpRun: startFollowUpRun ?? { _, _, _ in },
             restoreDraftText: { _, text, _, _ in recorder.record("draft:\(text)") },
             augmentUserMessageForProviderSend: { text, _, _, _ in text },
             stageResumeRecoveryHandoffIfNeeded: { _ in },
@@ -6566,6 +6978,12 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
                 // Only staged inputs are recorded, so runs without notices keep their event sequences.
                 guard let stageID else { return }
                 recorder.record("delegated-notice:\(stageID.uuidString):\(didSend)")
+            },
+            handleBackgroundNativeStreamResult: { result, sourceID, _ in
+                await handleBackgroundNativeStreamResult?(result, sourceID)
+            },
+            endBackgroundNativeMessage: { sourceID, _ in
+                endBackgroundNativeMessage?(sourceID)
             }
         )
     }

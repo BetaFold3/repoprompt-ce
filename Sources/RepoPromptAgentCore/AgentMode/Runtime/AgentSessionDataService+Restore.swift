@@ -558,6 +558,15 @@ extension AgentSessionDataService {
     ) async throws -> AgentSessionHydrationPayload? {
         #if DEBUG
             let prepareStartMS = WorkspaceRestorePerfLog.timestampMSIfEnabled()
+            // The request carries no window/attempt/generation; concurrent identical requests stay ambiguous.
+            WorkspaceRestorePerfLog.event(
+                "agentSessionHydration.prepareEntered",
+                fields: [
+                    "workspaceID": WorkspaceRestorePerfLog.shortID(request.workspace.id),
+                    "tabID": WorkspaceRestorePerfLog.shortID(request.tabID),
+                    "sessionID": WorkspaceRestorePerfLog.shortID(request.sessionID)
+                ]
+            )
             var loadDurationMS: Double?
             var transcriptDurationMS: Double?
             var presentationDurationMS: Double?
@@ -625,10 +634,10 @@ extension AgentSessionDataService {
             let transcriptPolicy = AgentTranscriptImportPolicy.liveSession(
                 hidePendingQuestionToolCall: request.hasPendingQuestionUI
             )
-            let persistedWorkingItems = agentSession.workingSourceItems()
             let loadedTranscript: AgentTranscript = {
                 if let transcript = agentSession.transcript {
                     if AgentTranscriptIO.containsRowsExcludedByPolicy(in: transcript, policy: transcriptPolicy) {
+                        let persistedWorkingItems = agentSession.workingSourceItems()
                         return AgentTranscriptIO.rebuiltTranscriptPreservingCompactedPrefix(
                             existingTranscript: transcript,
                             workingItems: persistedWorkingItems,
@@ -639,6 +648,7 @@ extension AgentSessionDataService {
                     }
                     return transcript
                 }
+                let persistedWorkingItems = agentSession.workingSourceItems()
                 return AgentTranscriptIO.buildTranscript(
                     from: persistedWorkingItems,
                     terminalState: normalizedRunState,
@@ -697,16 +707,7 @@ extension AgentSessionDataService {
                 || agentSession.lastUserMessageAt == nil
                 || frozenTailLimitNormalizationNeeded
 
-            #if DEBUG
-                logPrepare(
-                    outcome: "payload",
-                    canonicalLiveItems: canonicalLiveItems.count,
-                    turns: compactedTranscript.turns.count,
-                    needsReloadMigrationSave: needsReloadMigrationSave,
-                    frozenTailLimitNormalizationNeeded: frozenTailLimitNormalizationNeeded
-                )
-            #endif
-            return AgentSessionHydrationPayload(
+            let payload = AgentSessionHydrationPayload(
                 sessionID: request.sessionID,
                 persistedSession: agentSession,
                 persistenceState: editableLoad.persistenceState,
@@ -719,6 +720,16 @@ extension AgentSessionDataService {
                 restoredIndexEntry: restoredIndexEntry,
                 needsReloadMigrationSave: needsReloadMigrationSave
             )
+            #if DEBUG
+                logPrepare(
+                    outcome: "payload",
+                    canonicalLiveItems: canonicalLiveItems.count,
+                    turns: compactedTranscript.turns.count,
+                    needsReloadMigrationSave: needsReloadMigrationSave,
+                    frozenTailLimitNormalizationNeeded: frozenTailLimitNormalizationNeeded
+                )
+            #endif
+            return payload
         } catch {
             #if DEBUG
                 let outcome = (error is CancellationError || Task.isCancelled) ? "cancelled" : "error"

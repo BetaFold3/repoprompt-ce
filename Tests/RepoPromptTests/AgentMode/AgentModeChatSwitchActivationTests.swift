@@ -1,3 +1,4 @@
+import Combine
 import Foundation
 @_spi(TestSupport) @testable import RepoPromptAgentCore
 @testable import RepoPromptPlatform
@@ -89,6 +90,206 @@ final class AgentModeChatSwitchActivationTests: XCTestCase {
 
             XCTAssertNil(tabID)
             XCTAssertNil(fixture.viewModel.ui.composer.focusRequest)
+        }
+    }
+
+    func testFreshSessionCreationRetainsInitiatingSelectionAndSourceDraft() async throws {
+        for profile in [AgentSessionProfile.standard, .knowledge] {
+            try await withFixture { fixture in
+                let viewModel = fixture.viewModel
+                viewModel.test_setAvailableAgents([.codexExec])
+                fixture.window.apiSettingsViewModel.isCodexConnected = true
+                viewModel.selectedAgent = .codexExec
+                let options = viewModel.modelOptions(for: .codexExec)
+                let option = try XCTUnwrap(options.first(where: { !$0.isPlaceholderDefault }) ?? options.first)
+                viewModel.selectedModelRaw = option.rawValue
+                viewModel.selectedReasoningEffortRaw = option.supportedReasoningEfforts.first?.rawValue
+                let agent = viewModel.selectedAgent
+                let modelRaw = viewModel.selectedModelRaw
+                let effortRaw = viewModel.selectedReasoningEffortRaw
+                let sourceAgent = fixture.sessionA.selectedAgent
+                let sourceModelRaw = fixture.sessionA.selectedModelRaw
+                let sourceEffortRaw = fixture.sessionA.selectedReasoningEffortRaw
+                fixture.window.promptManager.promptText = "Draft A"
+
+                let returnedTabID = await viewModel.createAndActivateSessionTab(
+                    profile: profile,
+                    focusComposer: true
+                )
+                let tabID = try XCTUnwrap(returnedTabID)
+                let session = try XCTUnwrap(viewModel.sessions[tabID])
+
+                XCTAssertEqual(session.profile, profile)
+                XCTAssertEqual(session.selectedAgent, agent)
+                XCTAssertEqual(session.selectedModelRaw, modelRaw)
+                XCTAssertEqual(session.selectedReasoningEffortRaw, effortRaw)
+                XCTAssertEqual(viewModel.selectedAgent, agent)
+                XCTAssertEqual(viewModel.selectedModelRaw, modelRaw)
+                XCTAssertEqual(viewModel.selectedReasoningEffortRaw, effortRaw)
+                XCTAssertEqual(fixture.sessionA.selectedAgent, sourceAgent)
+                XCTAssertEqual(fixture.sessionA.selectedModelRaw, sourceModelRaw)
+                XCTAssertEqual(fixture.sessionA.selectedReasoningEffortRaw, sourceEffortRaw)
+                XCTAssertEqual(
+                    fixture.window.workspaceManager.activeWorkspace?.composeTabs
+                        .first(where: { $0.id == fixture.tabAID })?.promptText,
+                    "Draft A"
+                )
+            }
+        }
+    }
+
+    func testFreshSessionCreationFirstDestinationPresentationIsBoundAndHydrated() async throws {
+        let cases: [(profile: AgentSessionProfile, agent: AgentProviderKind)] = [
+            (.standard, .claudeCode),
+            (.standard, .codexExec),
+            (.knowledge, .codexExec)
+        ]
+        for (profile, agent) in cases {
+            try await withFixture { fixture in
+                let viewModel = fixture.viewModel
+                viewModel.test_setAvailableAgents([.claudeCode, .codexExec])
+                viewModel.selectedAgent = agent
+                let modelRaw = viewModel.selectedModelRaw
+                let effortRaw = viewModel.selectedReasoningEffortRaw
+                let sourceTabIDs: Set<UUID> = [fixture.tabAID, fixture.tabBID]
+                var presentations: [(tabID: UUID?, hydrated: Bool, profile: AgentSessionProfile?)] = []
+                var loadingTabIDs: [UUID?] = []
+                let presentationSink = viewModel.$activeTranscriptPresentation.dropFirst().sink { snapshot in
+                    let session = snapshot.tabID.flatMap { viewModel.sessions[$0] }
+                    presentations.append((snapshot.tabID, snapshot.bindingsHydrated, session?.profile))
+                }
+                let loadingSink = viewModel.$activeSessionLoadInProgressTabID.dropFirst().sink { tabID in
+                    loadingTabIDs.append(tabID)
+                }
+                // Ordered Prompt cues up to the start of context application (`isSwitchingComposeTab`).
+                var promptCues: [String] = []
+                let promptManager = fixture.window.promptManager
+                let membershipSink = promptManager.$currentComposeTabs.dropFirst().sink { tabs in
+                    promptCues.append("membership:\(tabs.count)")
+                }
+                let activeSink = promptManager.$activeComposeTabID.dropFirst().sink { tabID in
+                    promptCues.append(tabID.map(sourceTabIDs.contains) == false ? "active:new" : "active:other")
+                }
+                let switchingSink = promptManager.$isSwitchingComposeTab.dropFirst().sink { isSwitching in
+                    if isSwitching { promptCues.append("switching") }
+                }
+                defer {
+                    presentationSink.cancel()
+                    loadingSink.cancel()
+                    membershipSink.cancel()
+                    activeSink.cancel()
+                    switchingSink.cancel()
+                }
+
+                let returnedTabID = await viewModel.createAndActivateSessionTab(
+                    profile: profile,
+                    focusComposer: true
+                )
+                let tabID = try XCTUnwrap(returnedTabID)
+                let session = try XCTUnwrap(viewModel.sessions[tabID])
+                XCTAssertEqual(session.selectedAgent, agent)
+                XCTAssertEqual(session.selectedModelRaw, modelRaw)
+                XCTAssertEqual(session.selectedReasoningEffortRaw, effortRaw)
+                XCTAssertEqual(viewModel.selectedAgent, agent)
+                XCTAssertEqual(viewModel.selectedModelRaw, modelRaw)
+                XCTAssertEqual(viewModel.selectedReasoningEffortRaw, effortRaw)
+
+                XCTAssertFalse(
+                    presentations.contains { $0.tabID == nil },
+                    "No cleared, unbound destination is published"
+                )
+                XCTAssertFalse(presentations.contains { $0.tabID.map(sourceTabIDs.contains) == true })
+                let first = try XCTUnwrap(presentations.first { $0.tabID == tabID })
+                XCTAssertTrue(first.hydrated, "The first destination presentation is already hydrated")
+                XCTAssertEqual(first.profile, profile)
+                XCTAssertFalse(loadingTabIDs.contains(tabID), "No disk load starts for a fresh session")
+                XCTAssertEqual(
+                    Array(promptCues.prefix(3)),
+                    ["membership:3", "active:new", "switching"],
+                    "Membership, then the active ID, are each published once before context application"
+                )
+                XCTAssertEqual(promptManager.currentComposeTabs.map(\.id), [fixture.tabAID, fixture.tabBID, tabID])
+                XCTAssertNil(viewModel.activeSessionLoadInProgressTabID)
+                XCTAssertEqual(viewModel.currentTabID, tabID)
+                XCTAssertEqual(viewModel.ui.composer.focusRequest?.tabID, tabID)
+                XCTAssertTrue(viewModel.activeTranscriptPresentation.bindingsHydrated)
+            }
+        }
+    }
+
+    func testRefusedFreshSessionPreparationWithdrawsNeverActivatedTab() async throws {
+        try await withFixture { fixture in
+            let viewModel = fixture.viewModel
+            let promptManager = fixture.window.promptManager
+            let tabIDsBefore = promptManager.currentComposeTabs.map(\.id)
+            let sessionTabIDsBefore = Set(viewModel.sessions.keys)
+            var activeTabIDs: [UUID?] = []
+            let activeSink = promptManager.$activeComposeTabID.dropFirst().sink { activeTabIDs.append($0) }
+            viewModel.test_refusesFreshSessionPreparation = true
+            defer {
+                activeSink.cancel()
+                viewModel.test_refusesFreshSessionPreparation = false
+            }
+
+            let returnedTabID = await viewModel.createAndActivateSessionTab(focusComposer: true)
+
+            XCTAssertNil(returnedTabID)
+            XCTAssertTrue(activeTabIDs.isEmpty, "The refused tab is never activated")
+            XCTAssertEqual(promptManager.currentComposeTabs.map(\.id), tabIDsBefore)
+            XCTAssertEqual(
+                fixture.window.workspaceManager.activeWorkspace?.composeTabs.map(\.id),
+                tabIDsBefore
+            )
+            XCTAssertEqual(Set(viewModel.sessions.keys), sessionTabIDsBefore)
+            XCTAssertEqual(viewModel.currentTabID, fixture.tabAID)
+            XCTAssertNil(viewModel.ui.composer.focusRequest)
+            assertPresentation(
+                viewModel.activeTranscriptPresentation,
+                tabID: fixture.tabAID,
+                sessionID: fixture.sessionAID,
+                session: fixture.sessionA,
+                expectedTexts: fixture.tabATexts
+            )
+        }
+    }
+
+    func testFreshSessionCreationSupersededDuringContextApplyKeepsPreparedBackgroundSession() async throws {
+        try await withFixture { fixture in
+            let promptManager = fixture.window.promptManager
+            let workspaceManager = fixture.window.workspaceManager
+            let sourceTabIDs: Set<UUID> = [fixture.tabAID, fixture.tabBID]
+            var didSwitchDuringCreatedApply = false
+            // Creation pauses at context application of the created tab while the user switches to
+            // B; B's own apply passes straight through.
+            workspaceManager.composeTabApplyAfterContextHookForTesting = { tabID in
+                guard !sourceTabIDs.contains(tabID), !didSwitchDuringCreatedApply else { return }
+                didSwitchDuringCreatedApply = true
+                await promptManager.switchComposeTab(fixture.tabBID)
+            }
+            defer { workspaceManager.composeTabApplyAfterContextHookForTesting = nil }
+
+            let returnedTabID = await fixture.viewModel.createAndActivateSessionTab(focusComposer: true)
+
+            XCTAssertTrue(didSwitchDuringCreatedApply)
+            XCTAssertNil(returnedTabID)
+            XCTAssertEqual(fixture.viewModel.currentTabID, fixture.tabBID)
+            XCTAssertNil(fixture.viewModel.ui.composer.focusRequest)
+            let createdTabID = try XCTUnwrap(
+                promptManager.currentComposeTabs.map(\.id).first { !sourceTabIDs.contains($0) }
+            )
+            let created = try XCTUnwrap(
+                fixture.viewModel.sessions[createdTabID],
+                "The prepared session stays as an ordinary background tab"
+            )
+            XCTAssertTrue(created.hasLoadedPersistedState)
+            XCTAssertNotNil(fixture.viewModel.sessions[fixture.tabAID])
+            assertPresentation(
+                fixture.viewModel.activeTranscriptPresentation,
+                tabID: fixture.tabBID,
+                sessionID: fixture.sessionBID,
+                session: fixture.sessionB,
+                expectedTexts: fixture.tabBTexts
+            )
         }
     }
 
@@ -286,6 +487,16 @@ final class AgentModeChatSwitchActivationTests: XCTestCase {
             XCTAssertEqual(session.selectedAgent, .openCode)
             XCTAssertEqual(session.selectedModelRaw, AgentModel.defaultModel.rawValue)
 
+            // Fixture contract: the options override below is this case's only Codex catalog,
+            // with no live catalog and seed-only base names. A live snapshot from the process-global polling
+            // service (subscribed when the restored last-used agent is Codex) would classify the
+            // static encoded option as withdrawn; that contract is covered by
+            // testCodexNormalizationPreservesWithdrawnAndNormalizesPresentCapabilities.
+            fixture.viewModel.updateCodexDynamicModels([])
+            XCTAssertTrue(
+                fixture.viewModel.codexDynamicModels.isEmpty,
+                "Fixture expects seeded encoded-ID semantics, not live-catalog withdrawal."
+            )
             fixture.viewModel.test_setModelOptionsOverride(
                 [
                     AgentModelOption(
@@ -1388,6 +1599,1524 @@ final class AgentModeChatSwitchActivationTests: XCTestCase {
             }
         }
     }
+
+    // MARK: - D6 runtime selection (full sync reads the current owner's canonical selection)
+
+    func testFullSyncProjectsCurrentOwnerCanonicalExplicitSlicedAndZeroSelection() async throws {
+        try await withFixture { fixture in
+            let explicit = StoredSelection(
+                selectedPaths: ["Sources/Full.swift", "Sources/Sliced.swift"],
+                slices: [
+                    "Sources/Sliced.swift": [LineRange(start: 4, end: 8)],
+                    "Sources/SliceOnly.swift": [LineRange(start: 1, end: 2), LineRange(start: 10, end: 12)]
+                ],
+                codemapAutoEnabled: false
+            )
+            let explicitSummary = AgentContextExportResolver.selectionSummary(for: explicit)
+            XCTAssertEqual(explicitSummary.totalExplicitFileCount, 3)
+            XCTAssertGreaterThan(explicitSummary.slicedFileCount, 0)
+
+            try setCanonicalSelection(explicit, forTabID: fixture.tabAID, in: fixture)
+            fixture.viewModel.syncAllActiveUIState()
+            var snapshot = fixture.viewModel.ui.runtimeMetrics.runtimeVM.snapshot
+            XCTAssertEqual(snapshot.selectionSummary, explicitSummary)
+            XCTAssertEqual(snapshot.selectionFileCount, 3)
+
+            // A canonical zero selection is a real value, not "unknown".
+            try setCanonicalSelection(StoredSelection(), forTabID: fixture.tabAID, in: fixture)
+            fixture.viewModel.syncAllActiveUIState()
+            snapshot = fixture.viewModel.ui.runtimeMetrics.runtimeVM.snapshot
+            XCTAssertEqual(
+                snapshot.selectionSummary,
+                AgentContextExportResolver.selectionSummary(for: StoredSelection())
+            )
+            XCTAssertEqual(snapshot.selectionFileCount, 0)
+        }
+    }
+
+    func testFullSyncOwnerDisagreementAndMidSwitchSyncDoNotLeakPreviousSelection() async throws {
+        try await withFixture { fixture in
+            let workspaceManager = fixture.window.workspaceManager
+            let selectionA = StoredSelection(
+                selectedPaths: ["Sources/A0.swift", "Sources/A1.swift", "Sources/A2.swift"],
+                codemapAutoEnabled: false
+            )
+            let summaryA = AgentContextExportResolver.selectionSummary(for: selectionA)
+            try setCanonicalSelection(selectionA, forTabID: fixture.tabAID, in: fixture)
+            fixture.viewModel.syncAllActiveUIState()
+            XCTAssertEqual(fixture.viewModel.ui.runtimeMetrics.runtimeVM.snapshot.selectionSummary, summaryA)
+
+            // Workspace explicit active tab disagrees with the Agent owner: no canonical A summary.
+            let workspaceIndex = try XCTUnwrap(
+                workspaceManager.workspaces.firstIndex(where: { $0.id == workspaceManager.activeWorkspace?.id })
+            )
+            workspaceManager.workspaces[workspaceIndex].activeComposeTabID = fixture.tabBID
+            XCTAssertEqual(fixture.viewModel.currentTabID, fixture.tabAID)
+            fixture.viewModel.syncAllActiveUIState()
+            var snapshot = fixture.viewModel.ui.runtimeMetrics.runtimeVM.snapshot
+            XCTAssertNil(snapshot.selectionSummary)
+            // This fixture has no tool-derived selection metrics; those may legitimately supply
+            // a count when the live canonical summary is unavailable.
+            XCTAssertNil(snapshot.selectionFileCount)
+            workspaceManager.workspaces[workspaceIndex].activeComposeTabID = fixture.tabAID
+
+            // Real A→B switch: a full sync mid-apply and the final sync never surface A's counts.
+            try setCanonicalSelection(
+                StoredSelection(selectedPaths: ["Sources/B0.swift"], codemapAutoEnabled: false),
+                forTabID: fixture.tabBID,
+                in: fixture
+            )
+            var midApplySummaries: [AgentContextSelectionSummary?] = []
+            workspaceManager.composeTabApplyAfterContextHookForTesting = { tabID in
+                guard tabID == fixture.tabBID else { return }
+                fixture.viewModel.syncAllActiveUIState()
+                midApplySummaries.append(fixture.viewModel.ui.runtimeMetrics.runtimeVM.snapshot.selectionSummary)
+            }
+            defer { workspaceManager.composeTabApplyAfterContextHookForTesting = nil }
+
+            await fixture.window.promptManager.switchComposeTab(fixture.tabBID)
+
+            XCTAssertEqual(midApplySummaries.count, 1)
+            XCTAssertNotEqual(midApplySummaries.first ?? nil, summaryA)
+            XCTAssertEqual(fixture.viewModel.currentTabID, fixture.tabBID)
+            let workspaceID = try XCTUnwrap(workspaceManager.activeWorkspace?.id)
+            let canonicalB = try XCTUnwrap(
+                workspaceManager.composeTab(
+                    for: WorkspaceSelectionIdentity(workspaceID: workspaceID, tabID: fixture.tabBID)
+                )
+            ).selection
+            snapshot = fixture.viewModel.ui.runtimeMetrics.runtimeVM.snapshot
+            XCTAssertNotEqual(snapshot.selectionSummary, summaryA)
+            XCTAssertEqual(snapshot.selectionSummary, AgentContextExportResolver.selectionSummary(for: canonicalB))
+        }
+    }
+
+    private func setCanonicalSelection(_ selection: StoredSelection, forTabID tabID: UUID, in fixture: Fixture) throws {
+        let workspaceManager = fixture.window.workspaceManager
+        let workspaceIndex = try XCTUnwrap(
+            workspaceManager.workspaces.firstIndex(where: { $0.id == workspaceManager.activeWorkspace?.id })
+        )
+        let tabIndex = try XCTUnwrap(
+            workspaceManager.workspaces[workspaceIndex].composeTabs.firstIndex(where: { $0.id == tabID })
+        )
+        workspaceManager.workspaces[workspaceIndex].composeTabs[tabIndex].selection = selection
+    }
+
+    // MARK: - D6 cold activation provider stamp (real store, foreground switch)
+
+    #if DEBUG
+        /// A foreground cold activation of a persisted completed OpenCode session, from an unseeded
+        /// placeholder holding the warm tab's different provider, stamps hydration with the normalized
+        /// persisted provider. The activation catch-up then sees only the run-state delta and takes the
+        /// guarded run-state-only final-turn import, installing output equal to a full cold reference.
+        func testColdActivationStampsPersistedProviderAndCatchesUpRunStateOnly() async throws {
+            try await withFixture { fixture in
+                let viewModel = fixture.viewModel
+                defer { viewModel.test_persistenceWorkspaceOverride = nil }
+                let observed = try await observeColdActivationCatchUp(persistedRunState: .completed, in: fixture)
+                let session = observed.session
+                XCTAssertEqual(observed.persisted.agentKind, AgentProviderKind.openCode.rawValue)
+                XCTAssertEqual(observed.persisted.lastRunState, AgentSessionRunState.completed.rawValue)
+                XCTAssertEqual(session.persistedLoadDisposition, .applied)
+
+                XCTAssertEqual(observed.catchUps.count, 1)
+                let catchUp = try XCTUnwrap(observed.catchUps.first)
+                XCTAssertEqual(catchUp.reason, AgentDerivedTranscriptRefreshReason.liveMutation.rawValue)
+                XCTAssertEqual(catchUp.stamp?.selectedAgent, .openCode, "Hydration stamps the normalized persisted provider")
+                XCTAssertEqual(catchUp.stamp?.runState, .idle, "Run state is still installed after the stamp")
+                XCTAssertEqual(catchUp.delta, "syncDelta.run")
+                XCTAssertEqual(catchUp.path, "incremental-success:no-frontier")
+                XCTAssertEqual(session.transcriptPerformanceSnapshot.incrementalImportAttemptCount - catchUp.attempts, 1)
+                XCTAssertEqual(session.transcriptPerformanceSnapshot.incrementalImportSuccessCount - catchUp.successes, 1)
+
+                // Sync: the catch-up leaves a reusable stamp for the completed state.
+                XCTAssertEqual(session.selectedAgent, .openCode)
+                XCTAssertEqual(session.runState, .completed)
+                XCTAssertEqual(session.derivedTranscriptSyncState, coldCatchUpSyncState(of: session, in: viewModel))
+                let protection = viewModel.transcriptProjectionProtection(for: session, transcript: session.transcript)
+                XCTAssertTrue(viewModel.canReuseDerivedTranscriptForSave(for: session, projectionProtection: protection))
+
+                // Integrity: the hydrated items are the stored record; output equals a cold full reference.
+                XCTAssertEqual(session.items, observed.persistedItems)
+                let reference = observed.reference
+                XCTAssertEqual(session.transcript, reference.transcript)
+                XCTAssertEqual(session.baseTranscriptProjection, reference.baseProjection)
+                XCTAssertEqual(session.fullTranscriptProjection, reference.fullProjection)
+                XCTAssertEqual(session.workingTranscriptProjection, reference.workingProjection)
+                XCTAssertEqual(session.transcriptProjectionCounts, reference.projectionCounts)
+                XCTAssertEqual(session.transcriptCanonicalVisibleRowCount, reference.canonicalVisibleRowCount)
+                XCTAssertEqual(session.transcriptAnalyticsSnapshot, reference.analyticsSnapshot)
+
+                // The hydrated state the catch-up replaced already equaled that reference.
+                XCTAssertEqual(observed.transcriptBeforeCatchUp, reference.transcript)
+                XCTAssertEqual(observed.baseProjectionBeforeCatchUp, reference.baseProjection)
+            }
+        }
+
+        /// These cancelled/failed fixtures take one run-state-only catch-up. It leaves the hydrated
+        /// transcript and base projection unchanged but is not a no-op: it reconciles the hydrated source
+        /// items to the sanitized transcript's working items. The active-state fixture has complete message
+        /// rows but is saved with run state running. Cold activation preserves its cancelled turn/span,
+        /// unlike a fresh import at the restored idle state.
+        func testColdActivationCatchUpAcrossPersistedRunStates() async throws {
+            for persistedRunState in [AgentSessionRunState.cancelled, .failed, .running] {
+                try await withFixture { fixture in
+                    let viewModel = fixture.viewModel
+                    defer { viewModel.test_persistenceWorkspaceOverride = nil }
+                    let observed = try await observeColdActivationCatchUp(persistedRunState: persistedRunState, in: fixture)
+                    let session = observed.session
+                    let label = persistedRunState.rawValue
+                    XCTAssertEqual(session.persistedLoadDisposition, .applied, label)
+                    XCTAssertEqual(session.derivedTranscriptSyncState, coldCatchUpSyncState(of: session, in: viewModel), label)
+                    if persistedRunState.isActive {
+                        XCTAssertEqual(observed.persisted.lastRunState, AgentSessionRunState.idle.rawValue, "\(label): loads as idle")
+                        XCTAssertEqual(session.runState, .idle, label)
+                        XCTAssertTrue(observed.catchUps.isEmpty, "\(label): no observed run-state catch-up")
+                        XCTAssertNil(session.derivedTranscriptRefreshTask, label)
+                        XCTAssertNil(session.pendingDerivedTranscriptRefreshReason, label)
+                        XCTAssertNotEqual(session.transcript, observed.reference.transcript, "\(label): an idle rebuild is not an integrity reference for cold cancellation")
+                        let lastTurn = try XCTUnwrap(session.transcript.turns.last)
+                        XCTAssertEqual(lastTurn.terminalState, .cancelled, "\(label): the interrupted turn stays cancelled")
+                        XCTAssertEqual(lastTurn.responseSpans.map(\.lifecycle), [.cancelled], label)
+                    } else {
+                        XCTAssertEqual(observed.persisted.lastRunState, persistedRunState.rawValue, label)
+                        XCTAssertEqual(session.runState, persistedRunState, label)
+                        // Hydration installs the load-normalized record's items; the catch-up then reconciles them to
+                        // the working items of the sanitized transcript (`.retentionCompaction`), changing only
+                        // tool-result rows. Completed sessions are excluded from that reconciliation.
+                        XCTAssertEqual(observed.itemsBeforeCatchUp, observed.persistedItems, "\(label): hydrated items are the load-normalized record")
+                        XCTAssertEqual(session.items.map(\.id), observed.persistedItems.map(\.id), label)
+                        XCTAssertEqual(session.items, AgentTranscriptIO.workingSourceItems(from: session.transcript), label)
+                        let reconciled = zip(observed.persistedItems, session.items).filter { $0 != $1 }
+                        XCTAssertFalse(reconciled.isEmpty, "\(label): catch-up reconciles hydrated source items")
+                        XCTAssertTrue(reconciled.allSatisfy { $0.0.kind == .toolResult }, label)
+                        XCTAssertEqual(observed.catchUps.map(\.reason), [AgentDerivedTranscriptRefreshReason.liveMutation.rawValue], label)
+                        XCTAssertEqual(observed.catchUps.first?.stamp?.selectedAgent, .openCode, label)
+                        XCTAssertEqual(observed.catchUps.first?.stamp?.runState, .idle, label)
+                        XCTAssertEqual(session.baseTranscriptProjection, observed.reference.baseProjection, label)
+                        XCTAssertEqual(session.fullTranscriptProjection, observed.reference.fullProjection, label)
+                        XCTAssertEqual(observed.catchUps.map(\.delta), ["syncDelta.run"], label)
+                        XCTAssertEqual(observed.catchUps.map(\.path), ["incremental-success:no-frontier"], label)
+                        XCTAssertEqual(observed.transcriptBeforeCatchUp, observed.reference.transcript, "\(label): hydrated transcript already final")
+                        XCTAssertEqual(observed.baseProjectionBeforeCatchUp, observed.reference.baseProjection, label)
+                        XCTAssertEqual(session.transcript, observed.reference.transcript, label)
+                    }
+                }
+            }
+        }
+
+        private struct ColdActivationCatchUpAttempt {
+            let reason: String
+            let path: String
+            let stamp: AgentDerivedTranscriptSyncState?
+            let delta: String
+            let attempts: Int
+            let successes: Int
+        }
+
+        private struct ColdActivationCatchUpObservation {
+            let session: AgentTabSession
+            let persisted: AgentSession
+            let persistedItems: [AgentChatItem]
+            let catchUps: [ColdActivationCatchUpAttempt]
+            /// The target's hydrated state while the (last) catch-up import is computed but not installed.
+            let transcriptBeforeCatchUp: AgentTranscript?
+            let baseProjectionBeforeCatchUp: AgentTranscriptProjection?
+            let itemsBeforeCatchUp: [AgentChatItem]?
+            /// Reimports final items at the restored run state. This is not an integrity reference
+            /// for cold-cancelled turns whose session-level run state has normalized to idle.
+            let reference: AgentBuiltTranscriptPresentation
+        }
+
+        private func coldCatchUpSyncState(
+            of session: AgentTabSession,
+            in viewModel: AgentModeViewModel
+        ) -> AgentDerivedTranscriptSyncState {
+            AgentDerivedTranscriptSyncState(
+                sourceItemsRevision: session.sourceItemsRevision,
+                nextSequenceIndex: session.nextSequenceIndex,
+                runState: session.runState,
+                selectedAgent: session.selectedAgent,
+                hidePendingQuestionToolCall: session.hasPendingQuestionUI,
+                projectionProtection: viewModel.transcriptProjectionProtection(for: session, transcript: session.transcript)
+            )
+        }
+
+        /// Persists a multi-turn OpenCode session at `persistedRunState` through a separate writer to
+        /// the real store, then cold-activates it in a new unseeded tab whose placeholder holds the warm
+        /// tab's different provider. Sets `test_persistenceWorkspaceOverride`; callers reset it.
+        private func observeColdActivationCatchUp(
+            persistedRunState: AgentSessionRunState,
+            in fixture: Fixture
+        ) async throws -> ColdActivationCatchUpObservation {
+            let viewModel = fixture.viewModel
+            let window = fixture.window
+            let storageURL = fixture.rootURL.appendingPathComponent("SessionStore", isDirectory: true)
+            try FileManager.default.createDirectory(at: storageURL, withIntermediateDirectories: true)
+            var storeWorkspace = try XCTUnwrap(window.workspaceManager.activeWorkspace)
+            storeWorkspace.customStoragePath = storageURL
+            viewModel.test_persistenceWorkspaceOverride = storeWorkspace
+            do {
+                // A separate writer persists the multi-turn OpenCode session to the real store.
+                let writer = AgentModeViewModel(
+                    testWindowID: 4490,
+                    testWorkspacePath: storageURL.path,
+                    testWorkspaceDirectory: storageURL,
+                    codexControllerFactory: { _, _, _, _, _, _ in LifecycleNoopCodexController(recorder: LifecycleRecorder()) }
+                )
+                writer.test_establishPersistenceWorkspace(storeWorkspace)
+                let writerTabID = UUID()
+                writer.test_setCurrentTabIDOverride(writerTabID)
+                let written = try await writer.ensureSessionReady(tabID: writerTabID)
+                written.selectedAgent = .openCode
+                for turn in 0 ..< 3 {
+                    let invocation = UUID()
+                    written.appendItem(.user("Turn \(turn) request"))
+                    written.appendItem(.toolCall(name: "bash", invocationID: invocation, argsJSON: "{\"command\":\"echo \(turn)\"}"))
+                    written.appendItem(.toolResult(name: "bash", invocationID: invocation, resultJSON: "{\"output\":\"\(turn)\"}"))
+                    written.appendItem(.assistant("Turn \(turn) reply"))
+                }
+                written.runState = persistedRunState
+                let saved = await writer.flushSave(for: writerTabID)
+                XCTAssertTrue(saved)
+                let sessionID = try XCTUnwrap(written.activeAgentSessionID)
+                let loaded = try await writer.test_dataService.loadAgentSession(id: sessionID, for: storeWorkspace)
+                let persisted = try XCTUnwrap(loaded)
+                let persistedItems = try AgentTranscriptIO.workingSourceItems(from: XCTUnwrap(persisted.transcript))
+                XCTAssertEqual(persistedItems.map(\.id), written.items.map(\.id))
+
+                // Unseeded cold target; its placeholder inherits the warm tab's different provider.
+                let tabID = UUID()
+                let workspaceIndex = try XCTUnwrap(window.workspaceManager.workspaces.firstIndex { $0.id == storeWorkspace.id })
+                window.workspaceManager.workspaces[workspaceIndex].composeTabs.append(
+                    ComposeTabState(id: tabID, name: "Cold", activeAgentSessionID: sessionID)
+                )
+                window.promptManager.loadComposeTabsFromWorkspace(window.workspaceManager.workspaces[workspaceIndex])
+                XCTAssertNotEqual(viewModel.selectedAgent, .openCode)
+                XCTAssertNil(viewModel.ownerValidatedSessionIndex[sessionID])
+                XCTAssertNil(viewModel.sessions[tabID])
+
+                // Read-only: the target's state while the catch-up import is computed but not installed.
+                var catchUps: [ColdActivationCatchUpAttempt] = []
+                var hydratedTranscriptBeforeCatchUp: AgentTranscript?
+                var hydratedBaseProjectionBeforeCatchUp: AgentTranscriptProjection?
+                var hydratedItemsBeforeCatchUp: [AgentChatItem]?
+                AgentTranscriptDebugInstrumentation.reset()
+                AgentTranscriptDebugInstrumentation.isEnabled = true
+                AgentTranscriptDebugInstrumentation.refreshAttemptHandler = { metrics in
+                    MainActor.assumeIsolated {
+                        guard viewModel.currentTabID == tabID, let target = viewModel.sessions[tabID],
+                              target.sourceItemsRevision == metrics.sourceItemsRevision
+                        else { return }
+                        hydratedTranscriptBeforeCatchUp = target.transcript
+                        hydratedBaseProjectionBeforeCatchUp = target.baseTranscriptProjection
+                        hydratedItemsBeforeCatchUp = target.items
+                        let stamp = target.derivedTranscriptSyncState
+                        let delta = AgentDerivedTranscriptSyncState.diagnosticDeltaLabel(
+                            from: stamp,
+                            to: self.coldCatchUpSyncState(of: target, in: viewModel)
+                        )
+                        let performance = target.transcriptPerformanceSnapshot
+                        catchUps.append(.init(
+                            reason: metrics.reason,
+                            path: metrics.incrementalPath,
+                            stamp: stamp,
+                            delta: delta,
+                            attempts: performance.incrementalImportAttemptCount,
+                            successes: performance.incrementalImportSuccessCount
+                        ))
+                    }
+                }
+                defer { AgentTranscriptDebugInstrumentation.reset() }
+
+                await window.promptManager.switchComposeTab(tabID)
+                let session = try XCTUnwrap(viewModel.sessions[tabID])
+                let deadline = Date().addingTimeInterval(20)
+                while viewModel.activeSessionLoadInProgressTabID != nil || !session.hasLoadedPersistedState, Date() < deadline {
+                    try await Task.sleep(for: .milliseconds(5))
+                }
+                await Self.drainMainQueue()
+
+                let protection = viewModel.transcriptProjectionProtection(for: session, transcript: session.transcript)
+                let rebuilt = AgentTranscriptIO.rebuiltTranscriptPreservingCompactedPrefix(
+                    existingTranscript: AgentTranscript(),
+                    workingItems: session.items,
+                    terminalState: session.runState,
+                    nextSequenceIndex: session.nextSequenceIndex,
+                    policy: .liveSession(hidePendingQuestionToolCall: session.hasPendingQuestionUI),
+                    protection: protection
+                )
+                let reference = AgentModeViewModel.buildTranscriptPresentation(
+                    from: rebuilt,
+                    sourceItems: session.items,
+                    selectedAgent: .openCode,
+                    previousPerformanceSnapshot: .empty,
+                    projectionProtection: protection,
+                    isColdLoad: true
+                )
+                return ColdActivationCatchUpObservation(
+                    session: session,
+                    persisted: persisted,
+                    persistedItems: persistedItems,
+                    catchUps: catchUps,
+                    transcriptBeforeCatchUp: hydratedTranscriptBeforeCatchUp,
+                    baseProjectionBeforeCatchUp: hydratedBaseProjectionBeforeCatchUp,
+                    itemsBeforeCatchUp: hydratedItemsBeforeCatchUp,
+                    reference: reference
+                )
+            }
+        }
+
+        // MARK: - D6 cold-loading UI publication
+
+        /// A foreground switch from a hydrated tab to an already-materialized, unpresentable persisted
+        /// tab publishes exactly one target loading snapshot to the transcript UI store before the
+        /// persisted load completes, then the hydrated target.
+        func testColdActivationPublishesOneLoadingSnapshotBeforeHydration() async throws {
+            try await withFixture { fixture in
+                let viewModel = fixture.viewModel
+                let cold = try await persistColdTarget(in: fixture)
+                defer { viewModel.test_persistenceWorkspaceOverride = nil }
+                let session = try materializeUnpresentable(cold.tabID, in: fixture)
+                XCTAssertEqual(viewModel.currentTabID, fixture.tabAID)
+                XCTAssertTrue(viewModel.ui.transcript.snapshot.isHydrated)
+                let previousRevision = viewModel.activeTranscriptPresentation.revision
+
+                let gate = ColdLoadGate()
+                defer { gate.release() }
+                viewModel.test_persistedLoadBeforePrepareHook = { held in
+                    guard held.tabID == cold.tabID else { return }
+                    await gate.waitForRelease()
+                }
+                defer { viewModel.test_persistedLoadBeforePrepareHook = nil }
+                var emissions: [AgentTranscriptUISnapshot] = []
+                let subscription = viewModel.ui.transcript.$snapshot.dropFirst().sink { snapshot in
+                    MainActor.assumeIsolated { emissions.append(snapshot) }
+                }
+                defer { subscription.cancel() }
+
+                await fixture.window.promptManager.switchComposeTab(cold.tabID)
+                try await Self.waitUntil { gate.isWaiting }
+                await Self.drainMainQueue()
+                XCTAssertTrue(viewModel.sessions[cold.tabID] === session)
+                XCTAssertFalse(session.hasLoadedPersistedState)
+
+                let loading = emissions.filter { $0.currentTabID == cold.tabID }
+                XCTAssertEqual(loading.count, 1, "One target loading publication before the persisted load completes")
+                let snapshot = try XCTUnwrap(loading.first)
+                XCTAssertEqual(snapshot.presentation.tabID, cold.tabID)
+                XCTAssertFalse(snapshot.isHydrated)
+                XCTAssertFalse(snapshot.presentation.bindingsHydrated)
+                XCTAssertEqual(snapshot.presentationRevision, previousRevision &+ 1)
+                XCTAssertEqual(snapshot.activeSessionLoadInProgressTabID, cold.tabID)
+                XCTAssertTrue(snapshot.presentation.visibleRows.isEmpty)
+                XCTAssertTrue(snapshot.presentation.workingRows.isEmpty)
+                XCTAssertEqual(viewModel.ui.transcript.snapshot, snapshot)
+                assertDefaultFollowAndQuietViewNormalization(
+                    snapshot,
+                    tabID: cold.tabID,
+                    viewModel: viewModel,
+                    emissionCount: { emissions.count }
+                )
+
+                gate.release()
+                try await Self.waitUntil {
+                    session.hasLoadedPersistedState && viewModel.activeSessionLoadInProgressTabID == nil
+                }
+                await Self.drainMainQueue()
+                XCTAssertEqual(session.persistedLoadDisposition, .applied)
+                let hydrated = viewModel.ui.transcript.snapshot
+                XCTAssertEqual(hydrated.currentTabID, cold.tabID)
+                XCTAssertTrue(hydrated.isHydrated)
+                XCTAssertNil(hydrated.activeSessionLoadInProgressTabID)
+                assertPresentation(
+                    hydrated.presentation,
+                    tabID: cold.tabID,
+                    sessionID: cold.sessionID,
+                    session: session,
+                    expectedTexts: cold.texts
+                )
+                XCTAssertFalse(emissions.contains { snapshot in
+                    snapshot.currentTabID == cold.tabID
+                        && snapshot.presentation.visibleRows.contains { fixture.tabATexts.contains($0.text) }
+                }, "The target never shows the previous tab's rows")
+            }
+        }
+
+        /// A pre-materialized cold destination with a non-default (detached, disarmed) follow state
+        /// carries that exact state in its single loading snapshot; the view's legitimate activation
+        /// reset to live-bottom/armed still mutates the session and publishes, without hydrating.
+        func testColdActivationLoadingSnapshotCarriesDetachedFollowAndViewResetPublishes() async throws {
+            try await withFixture { fixture in
+                let viewModel = fixture.viewModel
+                let cold = try await persistColdTarget(in: fixture)
+                defer { viewModel.test_persistenceWorkspaceOverride = nil }
+                let session = try materializeUnpresentable(cold.tabID, in: fixture)
+                viewModel.setTranscriptDetachedFromLiveBottom(
+                    tabID: cold.tabID,
+                    isDetached: true,
+                    armingState: .disarmedAfterManualDetach
+                )
+                let detached = AgentModeViewModel.ActiveTranscriptFollowBindingState(
+                    tabID: cold.tabID,
+                    viewportState: session.transcriptViewportState,
+                    armingState: session.transcriptAutoFollowArmingState
+                )
+                XCTAssertTrue(detached.viewportState.isDetachedFromLiveBottom)
+                XCTAssertEqual(detached.armingState, .disarmedAfterManualDetach)
+                XCTAssertEqual(viewModel.ui.transcript.snapshot.currentTabID, fixture.tabAID)
+
+                let gate = ColdLoadGate()
+                defer { gate.release() }
+                viewModel.test_persistedLoadBeforePrepareHook = { held in
+                    guard held.tabID == cold.tabID else { return }
+                    await gate.waitForRelease()
+                }
+                defer { viewModel.test_persistedLoadBeforePrepareHook = nil }
+                var emissions: [AgentTranscriptUISnapshot] = []
+                let subscription = viewModel.ui.transcript.$snapshot.dropFirst().sink { snapshot in
+                    MainActor.assumeIsolated { emissions.append(snapshot) }
+                }
+                defer { subscription.cancel() }
+
+                await fixture.window.promptManager.switchComposeTab(cold.tabID)
+                try await Self.waitUntil { gate.isWaiting }
+                await Self.drainMainQueue()
+                let loading = emissions.filter { $0.currentTabID == cold.tabID }
+                XCTAssertEqual(loading.count, 1)
+                let snapshot = try XCTUnwrap(loading.first)
+                XCTAssertFalse(snapshot.isHydrated)
+                XCTAssertEqual(snapshot.followBindingState, detached, "The loading snapshot preserves the destination's follow state")
+
+                let beforeReset = emissions.count
+                viewModel.normalizeTranscriptFollowStateForViewActivation(tabID: cold.tabID)
+                XCTAssertEqual(session.transcriptViewportState, .liveBottom)
+                XCTAssertEqual(session.transcriptAutoFollowArmingState, .armed)
+                XCTAssertEqual(emissions.count, beforeReset + 1, "The legitimate view reset publishes once")
+                let reset = viewModel.ui.transcript.snapshot
+                XCTAssertEqual(
+                    reset.followBindingState,
+                    AgentModeViewModel.ActiveTranscriptFollowBindingState(tabID: cold.tabID, viewportState: .liveBottom, armingState: .armed)
+                )
+                XCTAssertFalse(reset.isHydrated, "Follow alignment is not hydration")
+
+                gate.release()
+                try await Self.waitUntil {
+                    session.hasLoadedPersistedState && viewModel.activeSessionLoadInProgressTabID == nil
+                }
+                await Self.drainMainQueue()
+                let hydrated = viewModel.ui.transcript.snapshot
+                XCTAssertTrue(hydrated.isHydrated)
+                XCTAssertEqual(
+                    hydrated.followBindingState,
+                    AgentModeViewModel.ActiveTranscriptFollowBindingState(tabID: cold.tabID, viewportState: .liveBottom, armingState: .armed)
+                )
+                assertPresentation(
+                    hydrated.presentation,
+                    tabID: cold.tabID,
+                    sessionID: cold.sessionID,
+                    session: session,
+                    expectedTexts: cold.texts
+                )
+            }
+        }
+
+        /// The DEBUG cold-timing markers follow the activation/prepare boundaries: outer task markers
+        /// appear while the before-prepare gate is held, and after release the will-await, service
+        /// entry, successful payload, and did-resume markers appear in order before the after-prepare hook.
+        func testColdActivationTimingMarkersFollowGateOrder() async throws {
+            try await withFixture { fixture in
+                let viewModel = fixture.viewModel
+                let cold = try await persistColdTarget(in: fixture)
+                defer { viewModel.test_persistenceWorkspaceOverride = nil }
+                let session = try materializeUnpresentable(cold.tabID, in: fixture)
+                let previousOverride = WorkspaceRestorePerfLog.debugProcessOverrideEnabled
+                WorkspaceRestorePerfLog.setDebugProcessOverrideEnabled(true)
+                defer { WorkspaceRestorePerfLog.setDebugProcessOverrideEnabled(previousOverride) }
+                // The metrics buffer is process-global with no restore API: clear it for this test and
+                // filter by this test's cold tab ID.
+                WorkspaceRestorePerfLog.clearRecentMetricLines()
+
+                let markerNames = [
+                    "agentMode.activation.coldTaskWillCreate",
+                    "agentMode.activation.coldTaskEntered",
+                    "agentSessionHydration.prepareWillAwait",
+                    "agentSessionHydration.prepareEntered",
+                    "agentSessionHydration.prepare",
+                    "agentSessionHydration.prepareDidResume"
+                ]
+                let tabField = "tabID=\(WorkspaceRestorePerfLog.shortID(cold.tabID))"
+                func coldEvents() -> [(name: String, fields: [String: String])] {
+                    WorkspaceRestorePerfLog.recentMetricLinesSnapshot(limit: 2000).compactMap { line in
+                        let tokens = line.split(separator: " ").map(String.init)
+                        guard tokens.count > 1, markerNames.contains(tokens[1]), tokens.contains(tabField) else {
+                            return nil
+                        }
+                        var fields: [String: String] = [:]
+                        for token in tokens.dropFirst(2) {
+                            let pair = token.split(separator: "=", maxSplits: 1).map(String.init)
+                            if pair.count == 2 { fields[pair[0]] = pair[1] }
+                        }
+                        return (tokens[1], fields)
+                    }
+                }
+                func coldMarkers() -> [String] {
+                    coldEvents().map { event in
+                        event.name == "agentSessionHydration.prepare"
+                            ? "\(event.name):outcome=\(event.fields["outcome"] ?? "")"
+                            : event.name
+                    }
+                }
+
+                let gate = ColdLoadGate()
+                defer { gate.release() }
+                viewModel.test_persistedLoadBeforePrepareHook = { held in
+                    guard held.tabID == cold.tabID else { return }
+                    await gate.waitForRelease()
+                }
+                defer { viewModel.test_persistedLoadBeforePrepareHook = nil }
+                var markersAtAfterHook: [String]?
+                viewModel.test_persistedLoadPrepareHook = { held in
+                    guard held.tabID == cold.tabID else { return }
+                    markersAtAfterHook = coldMarkers()
+                }
+                defer { viewModel.test_persistedLoadPrepareHook = nil }
+
+                await fixture.window.promptManager.switchComposeTab(cold.tabID)
+                try await Self.waitUntil { gate.isWaiting }
+                await Self.drainMainQueue()
+                XCTAssertEqual(
+                    coldMarkers(),
+                    ["agentMode.activation.coldTaskWillCreate", "agentMode.activation.coldTaskEntered"],
+                    "Outer markers only while the before-prepare gate is held"
+                )
+
+                gate.release()
+                try await Self.waitUntil {
+                    session.hasLoadedPersistedState && viewModel.activeSessionLoadInProgressTabID == nil
+                }
+                await Self.drainMainQueue()
+                let expected = [
+                    "agentMode.activation.coldTaskWillCreate",
+                    "agentMode.activation.coldTaskEntered",
+                    "agentSessionHydration.prepareWillAwait",
+                    "agentSessionHydration.prepareEntered",
+                    "agentSessionHydration.prepare:outcome=payload",
+                    "agentSessionHydration.prepareDidResume"
+                ]
+                XCTAssertEqual(markersAtAfterHook, expected, "did-resume precedes the after-prepare hook")
+                XCTAssertEqual(coldMarkers(), expected)
+                XCTAssertTrue(viewModel.ui.transcript.snapshot.isHydrated)
+
+                let events = coldEvents()
+                XCTAssertEqual(events.count, expected.count)
+                func fields(_ name: String) -> [String: String] {
+                    events.first { $0.name == name }?.fields ?? [:]
+                }
+                let willCreate = fields("agentMode.activation.coldTaskWillCreate")
+                let entered = fields("agentMode.activation.coldTaskEntered")
+                let willAwait = fields("agentSessionHydration.prepareWillAwait")
+                let didResume = fields("agentSessionHydration.prepareDidResume")
+                let activationGeneration = try XCTUnwrap(willCreate["activationGeneration"])
+                XCTAssertFalse(activationGeneration.isEmpty)
+                XCTAssertEqual(entered["activationGeneration"], activationGeneration, "Outer events share the captured generation")
+                let loadAttemptID = try XCTUnwrap(willAwait["loadAttemptID"])
+                XCTAssertFalse(loadAttemptID.isEmpty)
+                XCTAssertNotEqual(loadAttemptID, "nil")
+                XCTAssertEqual(didResume["loadAttemptID"], loadAttemptID, "Await/resume share the load attempt")
+                let transitionGeneration = try XCTUnwrap(willAwait["transitionGeneration"])
+                XCTAssertFalse(transitionGeneration.isEmpty)
+                XCTAssertEqual(didResume["transitionGeneration"], transitionGeneration)
+                XCTAssertEqual(didResume["payload"], "present")
+                let targetSessionID = WorkspaceRestorePerfLog.shortID(cold.sessionID)
+                for event in events {
+                    XCTAssertEqual(event.fields["sessionID"], targetSessionID, "\(event.name) carries the target session")
+                }
+            }
+        }
+
+        /// A foreground switch to an unseeded persisted tab materializes and binds its session during
+        /// activation; the binding notification and sidebar publication land before the transcript UI
+        /// store publishes exactly one target loading snapshot, followed by the hydrated target.
+        func testUnseededColdActivationPublishesOneLoadingSnapshotAfterMaterialization() async throws {
+            try await withFixture { fixture in
+                let viewModel = fixture.viewModel
+                let cold = try await persistColdTarget(in: fixture)
+                defer { viewModel.test_persistenceWorkspaceOverride = nil }
+                let previousRevision = viewModel.activeTranscriptPresentation.revision
+
+                let gate = ColdLoadGate()
+                defer { gate.release() }
+                viewModel.test_persistedLoadBeforePrepareHook = { held in
+                    guard held.tabID == cold.tabID else { return }
+                    await gate.waitForRelease()
+                }
+                defer { viewModel.test_persistedLoadBeforePrepareHook = nil }
+                var events: [String] = []
+                var emissions: [AgentTranscriptUISnapshot] = []
+                let transcriptSubscription = viewModel.ui.transcript.$snapshot.dropFirst().sink { snapshot in
+                    MainActor.assumeIsolated {
+                        emissions.append(snapshot)
+                        if snapshot.currentTabID == cold.tabID { events.append("transcript") }
+                    }
+                }
+                let sidebarSubscription = viewModel.ui.sessionSidebar.$snapshot.dropFirst().sink { _ in
+                    // The sidebar snapshot carries no binding fields; only publications observed
+                    // after the VM registered the cold tab bound to the cold session count.
+                    MainActor.assumeIsolated {
+                        if viewModel.sessions[cold.tabID]?.activeAgentSessionID == cold.sessionID {
+                            events.append("sidebar")
+                        }
+                    }
+                }
+                let bindingSubscription = NotificationCenter.default
+                    .publisher(for: .agentSessionBindingDidChange, object: viewModel)
+                    .sink { notification in
+                        let tabID = notification.userInfo?["tabID"] as? UUID
+                        let sessionID = notification.userInfo?["sessionID"] as? UUID
+                        MainActor.assumeIsolated {
+                            if tabID == cold.tabID, sessionID == cold.sessionID { events.append("binding") }
+                        }
+                    }
+                defer {
+                    transcriptSubscription.cancel()
+                    sidebarSubscription.cancel()
+                    bindingSubscription.cancel()
+                }
+
+                await fixture.window.promptManager.switchComposeTab(cold.tabID)
+                try await Self.waitUntil { gate.isWaiting }
+                await Self.drainMainQueue()
+                let session = try XCTUnwrap(viewModel.sessions[cold.tabID], "Activation materializes the target")
+                XCTAssertEqual(session.activeAgentSessionID, cold.sessionID)
+                XCTAssertFalse(session.hasLoadedPersistedState)
+
+                XCTAssertEqual(events.count { $0 == "transcript" }, 1, "One target loading publication before the persisted load completes")
+                let flushIndex = try XCTUnwrap(events.firstIndex(of: "transcript"))
+                XCTAssertTrue(events[..<flushIndex].contains("binding"), "Binding installed before the transcript publication")
+                XCTAssertTrue(events[..<flushIndex].contains("sidebar"), "Sidebar publication after bound-session registration, before the transcript publication")
+                let snapshot = try XCTUnwrap(emissions.first { $0.currentTabID == cold.tabID })
+                XCTAssertEqual(snapshot.presentation.tabID, cold.tabID)
+                XCTAssertFalse(snapshot.isHydrated)
+                XCTAssertFalse(snapshot.presentation.bindingsHydrated)
+                XCTAssertEqual(snapshot.presentationRevision, previousRevision &+ 1)
+                XCTAssertEqual(snapshot.activeSessionLoadInProgressTabID, cold.tabID)
+                XCTAssertTrue(snapshot.presentation.visibleRows.isEmpty)
+                XCTAssertTrue(snapshot.presentation.workingRows.isEmpty)
+                XCTAssertEqual(viewModel.ui.transcript.snapshot, snapshot)
+                assertDefaultFollowAndQuietViewNormalization(
+                    snapshot,
+                    tabID: cold.tabID,
+                    viewModel: viewModel,
+                    emissionCount: { emissions.count }
+                )
+
+                gate.release()
+                try await Self.waitUntil {
+                    session.hasLoadedPersistedState && viewModel.activeSessionLoadInProgressTabID == nil
+                }
+                await Self.drainMainQueue()
+                XCTAssertEqual(session.persistedLoadDisposition, .applied)
+                let hydrated = viewModel.ui.transcript.snapshot
+                XCTAssertEqual(hydrated.currentTabID, cold.tabID)
+                XCTAssertTrue(hydrated.isHydrated)
+                XCTAssertNil(hydrated.activeSessionLoadInProgressTabID)
+                assertPresentation(
+                    hydrated.presentation,
+                    tabID: cold.tabID,
+                    sessionID: cold.sessionID,
+                    session: session,
+                    expectedTexts: cold.texts
+                )
+                XCTAssertFalse(emissions.contains { snapshot in
+                    snapshot.currentTabID == cold.tabID
+                        && snapshot.presentation.visibleRows.contains { fixture.tabATexts.contains($0.text) }
+                }, "The target never shows the previous tab's rows")
+            }
+        }
+
+        /// After a rapid switch away from a still-loading unseeded cold target, the target's delayed
+        /// load never republishes its loading or hydrated state over the newer destination.
+        func testColdActivationStaleLoadCannotRepublishAfterRapidSwitch() async throws {
+            try await withFixture { fixture in
+                let viewModel = fixture.viewModel
+                let cold = try await persistColdTarget(in: fixture)
+                defer { viewModel.test_persistenceWorkspaceOverride = nil }
+
+                let gate = ColdLoadGate()
+                defer { gate.release() }
+                viewModel.test_persistedLoadBeforePrepareHook = { held in
+                    guard held.tabID == cold.tabID else { return }
+                    await gate.waitForRelease()
+                }
+                defer { viewModel.test_persistedLoadBeforePrepareHook = nil }
+                var emissions: [AgentTranscriptUISnapshot] = []
+                let subscription = viewModel.ui.transcript.$snapshot.dropFirst().sink { snapshot in
+                    MainActor.assumeIsolated { emissions.append(snapshot) }
+                }
+                defer { subscription.cancel() }
+
+                await fixture.window.promptManager.switchComposeTab(cold.tabID)
+                try await Self.waitUntil { gate.isWaiting }
+                let session = try XCTUnwrap(viewModel.sessions[cold.tabID])
+                XCTAssertEqual(emissions.count { $0.currentTabID == cold.tabID }, 1)
+
+                await fixture.window.promptManager.switchComposeTab(fixture.tabBID)
+                let destinationStart = emissions.count
+                // The inactive cold tab's normalization neither mutates nor publishes.
+                viewModel.normalizeTranscriptFollowStateForViewActivation(tabID: cold.tabID)
+                XCTAssertEqual(emissions.count, destinationStart)
+                gate.release()
+                try await Self.waitUntil { session.hasLoadedPersistedState }
+                await Self.drainMainQueue()
+
+                XCTAssertEqual(session.persistedLoadDisposition, .applied)
+                XCTAssertFalse(emissions[destinationStart...].contains { snapshot in
+                    snapshot.currentTabID == cold.tabID
+                        || snapshot.presentation.tabID == cold.tabID
+                        || snapshot.activeSessionLoadInProgressTabID == cold.tabID
+                        || snapshot.followBindingState.tabID == cold.tabID
+                }, "The stale cold load never republishes after the newer switch")
+                let destination = viewModel.ui.transcript.snapshot
+                XCTAssertEqual(destination.currentTabID, fixture.tabBID)
+                XCTAssertEqual(
+                    destination.followBindingState,
+                    AgentModeViewModel.ActiveTranscriptFollowBindingState(
+                        tabID: fixture.tabBID,
+                        viewportState: fixture.sessionB.transcriptViewportState,
+                        armingState: fixture.sessionB.transcriptAutoFollowArmingState
+                    ),
+                    "The warm destination's follow state survives the late cold completion"
+                )
+                XCTAssertTrue(destination.isHydrated)
+                XCTAssertNil(destination.activeSessionLoadInProgressTabID)
+                assertPresentation(
+                    destination.presentation,
+                    tabID: fixture.tabBID,
+                    sessionID: fixture.sessionBID,
+                    session: fixture.sessionB,
+                    expectedTexts: fixture.tabBTexts
+                )
+            }
+        }
+
+        /// Without the before-prepare seam, cold activation requests its preparation from the
+        /// synchronous load start (before the activation task hop). The owning operation adopts that
+        /// one prepare: exactly one service entry and payload for the attempt, the outer activation
+        /// task awaits the same operation, and the hydrated target is identical to the ordinary path.
+        func testColdActivationEarlyPrepareIsAdoptedOnceByOwningOperation() async throws {
+            try await withFixture { fixture in
+                let viewModel = fixture.viewModel
+                let cold = try await persistColdTarget(in: fixture)
+                defer { viewModel.test_persistenceWorkspaceOverride = nil }
+                let session = try materializeUnpresentable(cold.tabID, in: fixture)
+                let previousOverride = WorkspaceRestorePerfLog.debugProcessOverrideEnabled
+                WorkspaceRestorePerfLog.setDebugProcessOverrideEnabled(true)
+                defer { WorkspaceRestorePerfLog.setDebugProcessOverrideEnabled(previousOverride) }
+                WorkspaceRestorePerfLog.clearRecentMetricLines()
+                XCTAssertNil(viewModel.test_persistedLoadBeforePrepareHook)
+
+                var afterHookCount = 0
+                viewModel.test_persistedLoadPrepareHook = { held in
+                    guard held.tabID == cold.tabID else { return }
+                    afterHookCount += 1
+                }
+                defer { viewModel.test_persistedLoadPrepareHook = nil }
+                var emissions: [AgentTranscriptUISnapshot] = []
+                let subscription = viewModel.ui.transcript.$snapshot.dropFirst().sink { snapshot in
+                    MainActor.assumeIsolated { emissions.append(snapshot) }
+                }
+                defer { subscription.cancel() }
+
+                await fixture.window.promptManager.switchComposeTab(cold.tabID)
+                try await Self.waitUntil {
+                    session.hasLoadedPersistedState && viewModel.activeSessionLoadInProgressTabID == nil
+                }
+                await Self.drainMainQueue()
+
+                // The early start leaves activation publication unchanged: exactly one destination
+                // loading snapshot precedes the hydrated destination.
+                let destinationEmissions = emissions.filter { $0.currentTabID == cold.tabID }
+                let firstHydratedIndex = try XCTUnwrap(
+                    destinationEmissions.firstIndex { $0.isHydrated },
+                    "The destination publishes its hydrated snapshot"
+                )
+                let loadingEmissions = destinationEmissions[..<firstHydratedIndex]
+                XCTAssertEqual(loadingEmissions.count, 1, "One destination loading publication before hydration")
+                let loading = try XCTUnwrap(loadingEmissions.first)
+                XCTAssertFalse(loading.isHydrated)
+                XCTAssertFalse(loading.presentation.bindingsHydrated)
+                XCTAssertEqual(loading.presentation.tabID, cold.tabID)
+                XCTAssertEqual(loading.activeSessionLoadInProgressTabID, cold.tabID)
+                XCTAssertTrue(loading.presentation.visibleRows.isEmpty)
+                XCTAssertTrue(loading.presentation.workingRows.isEmpty)
+
+                let events = Self.coldHydrationEvents(tabID: cold.tabID)
+                let names = events.map(\.name)
+                for name in [
+                    "agentMode.activation.coldTaskWillCreate",
+                    "agentMode.activation.coldTaskEntered",
+                    "agentSessionHydration.prepareWillAwait",
+                    "agentSessionHydration.prepareEntered",
+                    "agentSessionHydration.prepare",
+                    "agentSessionHydration.prepareDidResume"
+                ] {
+                    XCTAssertEqual(names.count { $0 == name }, 1, "\(name) occurs once for the single load operation")
+                }
+                func index(_ name: String) throws -> Int {
+                    try XCTUnwrap(names.firstIndex(of: name), name)
+                }
+                XCTAssertLessThan(try index("agentMode.activation.coldTaskWillCreate"), try index("agentSessionHydration.prepareEntered"))
+                XCTAssertLessThan(try index("agentMode.activation.coldTaskWillCreate"), try index("agentMode.activation.coldTaskEntered"))
+                XCTAssertLessThan(try index("agentSessionHydration.prepareEntered"), try index("agentSessionHydration.prepare"))
+                XCTAssertLessThan(try index("agentSessionHydration.prepare"), try index("agentSessionHydration.prepareDidResume"))
+                XCTAssertLessThan(try index("agentSessionHydration.prepareWillAwait"), try index("agentSessionHydration.prepareDidResume"))
+                let prepare = try XCTUnwrap(events.first { $0.name == "agentSessionHydration.prepare" })
+                XCTAssertEqual(prepare.fields["outcome"], "payload")
+                let willAwait = try XCTUnwrap(events.first { $0.name == "agentSessionHydration.prepareWillAwait" })
+                XCTAssertEqual(willAwait.fields["earlyPrepare"], "adopted", "The operation adopts the early prepare")
+                let didResume = try XCTUnwrap(events.first { $0.name == "agentSessionHydration.prepareDidResume" })
+                XCTAssertEqual(didResume.fields["loadAttemptID"], willAwait.fields["loadAttemptID"])
+                XCTAssertEqual(didResume.fields["payload"], "present")
+
+                XCTAssertEqual(afterHookCount, 1, "One prepared payload reaches the operation's post-prepare fences")
+                XCTAssertEqual(session.persistedLoadDisposition, .applied)
+                XCTAssertNil(session.persistedLoadTask, "The creating activation task cleared its own handle")
+                let hydrated = viewModel.ui.transcript.snapshot
+                XCTAssertEqual(hydrated.currentTabID, cold.tabID)
+                XCTAssertTrue(hydrated.isHydrated)
+                assertPresentation(
+                    hydrated.presentation,
+                    tabID: cold.tabID,
+                    sessionID: cold.sessionID,
+                    session: session,
+                    expectedTexts: cold.texts
+                )
+            }
+        }
+
+        /// Persisted adoption makes the destination presentable before its activation commits the
+        /// binding. An urgent session refresh landing in that window (the apply-edits approval
+        /// stream's path) keeps the destination's loading presentation; the authoritative commit
+        /// then publishes hydrated rows with the latest approval state, and refreshes after that
+        /// commit apply even while the load marker is still set.
+        func testColdLoadUrgentRefreshBeforeBindingCommitKeepsLoadingPresentation() async throws {
+            try await withFixture { fixture in
+                let viewModel = fixture.viewModel
+                let session = fixture.sessionA
+                let tabID = fixture.tabAID
+                await Self.drainMainQueue()
+                XCTAssertEqual(viewModel.currentTabID, tabID)
+                viewModel.applySessionToBindings(session)
+                viewModel.test_setActiveSessionLoadInProgressTabID(nil)
+                assertPresentation(
+                    viewModel.ui.transcript.snapshot.presentation,
+                    tabID: tabID,
+                    sessionID: fixture.sessionAID,
+                    session: session,
+                    expectedTexts: fixture.tabATexts
+                )
+
+                // The post-adoption, pre-commit state of a cold activation: the session is loaded
+                // and presentable, its binding is not marked hydrated, and the destination shows
+                // its loading presentation under the load marker.
+                session.clearCurrentBindingHydration()
+                viewModel.test_setActiveSessionLoadInProgressTabID(tabID)
+                viewModel.test_publishLoadingTranscriptPresentation(tabID: tabID)
+                XCTAssertTrue(session.hasLoadedPersistedState)
+                XCTAssertTrue(session.isPresentableForOwner)
+                XCTAssertNil(session.authoritativeHydratedBindingTransitionGeneration)
+                XCTAssertTrue(viewModel.canBuildOrPublishActiveTranscriptBindings(for: session))
+                let loading = viewModel.ui.transcript.snapshot
+                XCTAssertEqual(loading.currentTabID, tabID)
+                XCTAssertEqual(loading.activeSessionLoadInProgressTabID, tabID)
+                XCTAssertFalse(loading.isHydrated)
+                XCTAssertTrue(loading.presentation.visibleRows.isEmpty)
+
+                var emissions: [AgentTranscriptUISnapshot] = []
+                let subscription = viewModel.ui.transcript.$snapshot.dropFirst().sink { snapshot in
+                    MainActor.assumeIsolated { emissions.append(snapshot) }
+                }
+                defer { subscription.cancel() }
+
+                // An approval model update (auto-edit plus a pending review and its reconciled wait
+                // state, as the approval stream applies them) followed by its urgent refresh.
+                let heldAutoEdit = !session.autoEditEnabled
+                session.autoEditEnabled = heldAutoEdit
+                let heldReview = PendingApplyEditsReview(
+                    scope: viewModel.applyEditsScope(for: tabID),
+                    path: "held.swift",
+                    unifiedDiff: "@@ -1 +1 @@\n-old\n+new"
+                )
+                session.pendingApplyEditsReview = heldReview
+                defer {
+                    session.pendingApplyEditsReview = nil
+                    session.runState = .idle
+                }
+                viewModel.reconcileInteractiveRunState(session)
+                XCTAssertEqual(session.runState, .waitingForApproval)
+                let updateCountBeforeHeldRefresh = viewModel.test_updateBindingsCallCount
+                viewModel.requestUIRefresh(tabID: tabID, urgent: true)
+                XCTAssertEqual(
+                    viewModel.test_updateBindingsCallCount,
+                    updateCountBeforeHeldRefresh + 1,
+                    "The urgent refresh reaches the session binding update"
+                )
+                XCTAssertFalse(
+                    emissions.contains { !$0.presentation.visibleRows.isEmpty || !$0.presentation.workingRows.isEmpty },
+                    "No destination rows are published before the binding commit"
+                )
+                let held = viewModel.ui.transcript.snapshot
+                XCTAssertEqual(held.currentTabID, tabID)
+                XCTAssertFalse(held.isHydrated)
+                XCTAssertFalse(held.presentation.bindingsHydrated)
+                XCTAssertTrue(held.presentation.visibleRows.isEmpty)
+                XCTAssertTrue(held.presentation.workingRows.isEmpty)
+                XCTAssertEqual(session.autoEditEnabled, heldAutoEdit, "The session keeps the approval update")
+                XCTAssertEqual(session.pendingApplyEditsReview, heldReview)
+                XCTAssertNil(viewModel.ui.runInteraction.snapshot.pendingApplyEditsReview, "The held refresh publishes no review")
+                XCTAssertNotEqual(viewModel.ui.runInteraction.snapshot.runState, .waitingForApproval)
+
+                // The authoritative commit, in the cold activation's order: bindings, then marker.
+                viewModel.applySessionToBindings(session)
+                let committed = viewModel.ui.transcript.snapshot
+                XCTAssertTrue(committed.isHydrated)
+                assertPresentation(
+                    committed.presentation,
+                    tabID: tabID,
+                    sessionID: fixture.sessionAID,
+                    session: session,
+                    expectedTexts: fixture.tabATexts
+                )
+                XCTAssertEqual(viewModel.autoEditEnabled, heldAutoEdit, "The commit consumes the held approval state")
+                XCTAssertEqual(viewModel.pendingApplyEditsReview, heldReview)
+                XCTAssertEqual(viewModel.runState, .waitingForApproval)
+                XCTAssertEqual(viewModel.ui.runInteraction.snapshot.pendingApplyEditsReview, heldReview)
+                XCTAssertEqual(viewModel.ui.runInteraction.snapshot.runState, .waitingForApproval)
+                let firstRowsIndex = try XCTUnwrap(emissions.firstIndex { !$0.presentation.visibleRows.isEmpty })
+                XCTAssertTrue(emissions[firstRowsIndex].isHydrated, "The first row-bearing destination snapshot is hydrated")
+
+                // A refresh after the commit applies even while the marker is still set.
+                let postCommitAutoEdit = !heldAutoEdit
+                session.autoEditEnabled = postCommitAutoEdit
+                let updateCountBeforePostCommitRefresh = viewModel.test_updateBindingsCallCount
+                viewModel.requestUIRefresh(tabID: tabID, urgent: true)
+                XCTAssertEqual(viewModel.test_updateBindingsCallCount, updateCountBeforePostCommitRefresh + 1)
+                XCTAssertEqual(viewModel.autoEditEnabled, postCommitAutoEdit, "Post-commit refreshes are not held")
+                XCTAssertTrue(viewModel.ui.transcript.snapshot.isHydrated)
+                viewModel.test_setActiveSessionLoadInProgressTabID(nil)
+                assertPresentation(
+                    viewModel.ui.transcript.snapshot.presentation,
+                    tabID: tabID,
+                    sessionID: fixture.sessionAID,
+                    session: session,
+                    expectedTexts: fixture.tabATexts
+                )
+            }
+        }
+
+        /// A duplicate `.activeComposeTabChanged` for the tab whose cold activation is already in
+        /// flight is a no-op: the in-flight activation stays the owner, commits the hydrated
+        /// binding, clears the load marker, and later session refreshes reach the bindings.
+        func testDuplicateSameTabActivationNotificationKeepsColdActivationOwner() async throws {
+            try await withFixture { fixture in
+                let viewModel = fixture.viewModel
+                let cold = try await persistColdTarget(in: fixture)
+                defer { viewModel.test_persistenceWorkspaceOverride = nil }
+                let session = try materializeUnpresentable(cold.tabID, in: fixture)
+
+                let gate = ColdLoadGate()
+                defer { gate.release() }
+                var heldLoadResumed = false
+                viewModel.test_persistedLoadPrepareHook = { held in
+                    guard held.tabID == cold.tabID, !heldLoadResumed else { return }
+                    await gate.waitForRelease()
+                    heldLoadResumed = true
+                }
+                defer { viewModel.test_persistedLoadPrepareHook = nil }
+
+                await fixture.window.promptManager.switchComposeTab(cold.tabID)
+                try await Self.waitUntil { gate.isWaiting }
+                XCTAssertEqual(viewModel.activeSessionLoadInProgressTabID, cold.tabID)
+
+                // Post the same active tab again through the production notification sink.
+                NotificationCenter.default.post(
+                    name: .activeComposeTabChanged,
+                    object: nil,
+                    userInfo: ["tabID": cold.tabID, "windowID": fixture.window.windowID]
+                )
+                gate.release()
+                try await Self.waitUntil { heldLoadResumed && session.hasLoadedPersistedState }
+                try await Self.waitUntil { viewModel.activeSessionLoadInProgressTabID == nil }
+                await Self.drainMainQueue()
+
+                XCTAssertEqual(session.persistedLoadDisposition, .applied)
+                let hydrated = viewModel.ui.transcript.snapshot
+                XCTAssertEqual(hydrated.currentTabID, cold.tabID)
+                XCTAssertTrue(hydrated.isHydrated)
+                assertPresentation(
+                    hydrated.presentation,
+                    tabID: cold.tabID,
+                    sessionID: cold.sessionID,
+                    session: session,
+                    expectedTexts: cold.texts
+                )
+
+                let nextAutoEdit = !session.autoEditEnabled
+                session.autoEditEnabled = nextAutoEdit
+                viewModel.requestUIRefresh(tabID: cold.tabID, urgent: true)
+                XCTAssertEqual(viewModel.autoEditEnabled, nextAutoEdit, "Session refreshes reach the bindings")
+            }
+        }
+
+        /// An early-prepared cold load held after its prepare keeps every existing fence: a switch
+        /// away plus cancellation of the attempt means its late payload is neither applied nor
+        /// published over the newer destination, and an ordinary reload still recovers the session.
+        func testColdActivationEarlyPrepareKeepsAttemptAndDestinationFences() async throws {
+            try await withFixture { fixture in
+                let viewModel = fixture.viewModel
+                let cold = try await persistColdTarget(in: fixture)
+                defer { viewModel.test_persistenceWorkspaceOverride = nil }
+                let session = try materializeUnpresentable(cold.tabID, in: fixture)
+                let previousOverride = WorkspaceRestorePerfLog.debugProcessOverrideEnabled
+                WorkspaceRestorePerfLog.setDebugProcessOverrideEnabled(true)
+                defer { WorkspaceRestorePerfLog.setDebugProcessOverrideEnabled(previousOverride) }
+                WorkspaceRestorePerfLog.clearRecentMetricLines()
+
+                let gate = ColdLoadGate()
+                defer { gate.release() }
+                var heldLoadResumed = false
+                viewModel.test_persistedLoadPrepareHook = { held in
+                    guard held.tabID == cold.tabID, !heldLoadResumed else { return }
+                    await gate.waitForRelease()
+                    heldLoadResumed = true
+                }
+                defer { viewModel.test_persistedLoadPrepareHook = nil }
+                var emissions: [AgentTranscriptUISnapshot] = []
+                let subscription = viewModel.ui.transcript.$snapshot.dropFirst().sink { snapshot in
+                    MainActor.assumeIsolated { emissions.append(snapshot) }
+                }
+                defer { subscription.cancel() }
+
+                await fixture.window.promptManager.switchComposeTab(cold.tabID)
+                try await Self.waitUntil { gate.isWaiting }
+                let willAwait = try XCTUnwrap(Self.coldHydrationEvents(tabID: cold.tabID).first {
+                    $0.name == "agentSessionHydration.prepareWillAwait"
+                })
+                XCTAssertEqual(willAwait.fields["earlyPrepare"], "adopted")
+
+                await fixture.window.promptManager.switchComposeTab(fixture.tabBID)
+                viewModel.cancelPersistedLoad(for: session)
+                let destinationStart = emissions.count
+                gate.release()
+                try await Self.waitUntil { heldLoadResumed }
+                await Self.drainMainQueue()
+
+                XCTAssertFalse(session.hasLoadedPersistedState, "A cancelled attempt's payload is never applied")
+                XCTAssertNotEqual(session.persistedLoadDisposition, .applied)
+                XCTAssertNil(session.persistedLoadTask)
+                XCTAssertFalse(emissions[destinationStart...].contains { snapshot in
+                    snapshot.currentTabID == cold.tabID
+                        || snapshot.presentation.tabID == cold.tabID
+                        || snapshot.activeSessionLoadInProgressTabID == cold.tabID
+                }, "The stale early-prepared load never republishes after the newer switch")
+                let destination = viewModel.ui.transcript.snapshot
+                XCTAssertEqual(destination.currentTabID, fixture.tabBID)
+                XCTAssertTrue(destination.isHydrated)
+
+                let outcome = await viewModel.loadSessionFromDisk(for: session)
+                XCTAssertEqual(outcome.disposition, .applied, "An ordinary reload recovers the cancelled cold session")
+                XCTAssertTrue(session.hasLoadedPersistedState)
+                XCTAssertEqual(session.items.map(\.text), cold.texts)
+                XCTAssertEqual(viewModel.ui.transcript.snapshot.currentTabID, fixture.tabBID)
+            }
+        }
+
+        /// Parsed DEBUG cold-hydration events for one tab, in emission order.
+        private static func coldHydrationEvents(tabID: UUID) -> [(name: String, fields: [String: String])] {
+            let markerNames = Set([
+                "agentMode.activation.coldTaskWillCreate",
+                "agentMode.activation.coldTaskEntered",
+                "agentSessionHydration.prepareWillAwait",
+                "agentSessionHydration.prepareEntered",
+                "agentSessionHydration.prepare",
+                "agentSessionHydration.prepareDidResume"
+            ])
+            let tabField = "tabID=\(WorkspaceRestorePerfLog.shortID(tabID))"
+            return WorkspaceRestorePerfLog.recentMetricLinesSnapshot(limit: 2000).compactMap { line in
+                let tokens = line.split(separator: " ").map(String.init)
+                guard tokens.count > 1, markerNames.contains(tokens[1]), tokens.contains(tabField) else {
+                    return nil
+                }
+                var fields: [String: String] = [:]
+                for token in tokens.dropFirst(2) {
+                    let pair = token.split(separator: "=", maxSplits: 1).map(String.init)
+                    if pair.count == 2 { fields[pair[0]] = pair[1] }
+                }
+                return (tokens[1], fields)
+            }
+        }
+
+        /// Activations that end without a cold load (no bound session; warm session) leave transcript UI
+        /// publication immediate: a later loading-flag update reaches the store synchronously.
+        func testEarlyExitAndWarmActivationsLeaveTranscriptPublicationImmediate() async throws {
+            try await withFixture { fixture in
+                let viewModel = fixture.viewModel
+                let window = fixture.window
+                let unboundTabID = UUID()
+                let workspace = try XCTUnwrap(window.workspaceManager.activeWorkspace)
+                let workspaceIndex = try XCTUnwrap(window.workspaceManager.workspaces.firstIndex { $0.id == workspace.id })
+                window.workspaceManager.workspaces[workspaceIndex].composeTabs.append(
+                    ComposeTabState(id: unboundTabID, name: "Unbound", activeAgentSessionID: nil)
+                )
+                window.promptManager.loadComposeTabsFromWorkspace(window.workspaceManager.workspaces[workspaceIndex])
+
+                @MainActor func assertLaterUpdatePublishesImmediately(_ label: String) {
+                    let marker = UUID()
+                    viewModel.test_setActiveSessionLoadInProgressTabID(marker)
+                    XCTAssertEqual(viewModel.ui.transcript.snapshot.activeSessionLoadInProgressTabID, marker, label)
+                    viewModel.test_setActiveSessionLoadInProgressTabID(nil)
+                    XCTAssertNil(viewModel.ui.transcript.snapshot.activeSessionLoadInProgressTabID, label)
+                }
+
+                // Early exit: the tab has no session at activation, so activation clears the bindings
+                // (an unbound placeholder created afterwards is never bound by this activation).
+                XCTAssertNil(viewModel.sessions[unboundTabID])
+                await window.promptManager.switchComposeTab(unboundTabID)
+                XCTAssertNil(viewModel.sessions[unboundTabID]?.activeAgentSessionID)
+                let cleared = viewModel.ui.transcript.snapshot
+                XCTAssertEqual(cleared.currentTabID, unboundTabID)
+                XCTAssertFalse(cleared.isHydrated)
+                XCTAssertNil(cleared.activeSessionLoadInProgressTabID)
+                assertLaterUpdatePublishesImmediately("after unbound early exit")
+
+                // Warm: the destination is presentable and publishes before the switch returns.
+                await window.promptManager.switchComposeTab(fixture.tabBID)
+                let warm = viewModel.ui.transcript.snapshot
+                XCTAssertEqual(warm.currentTabID, fixture.tabBID)
+                XCTAssertTrue(warm.isHydrated)
+                XCTAssertNil(warm.activeSessionLoadInProgressTabID)
+                assertPresentation(
+                    warm.presentation,
+                    tabID: fixture.tabBID,
+                    sessionID: fixture.sessionBID,
+                    session: fixture.sessionB,
+                    expectedTexts: fixture.tabBTexts
+                )
+                assertLaterUpdatePublishesImmediately("after warm activation")
+            }
+        }
+
+        /// Persists a completed two-row session to a real temporary store and adds an unseeded
+        /// compose tab bound to it; the view model reads that store until the caller resets the override.
+        private func persistColdTarget(in fixture: Fixture) async throws -> (tabID: UUID, sessionID: UUID, texts: [String]) {
+            let window = fixture.window
+            let storageURL = fixture.rootURL.appendingPathComponent("SessionStore", isDirectory: true)
+            try FileManager.default.createDirectory(at: storageURL, withIntermediateDirectories: true)
+            var storeWorkspace = try XCTUnwrap(window.workspaceManager.activeWorkspace)
+            storeWorkspace.customStoragePath = storageURL
+            fixture.viewModel.test_persistenceWorkspaceOverride = storeWorkspace
+
+            let writer = AgentModeViewModel(
+                testWindowID: 4491,
+                testWorkspacePath: storageURL.path,
+                testWorkspaceDirectory: storageURL,
+                codexControllerFactory: { _, _, _, _, _, _ in LifecycleNoopCodexController(recorder: LifecycleRecorder()) }
+            )
+            writer.test_establishPersistenceWorkspace(storeWorkspace)
+            let writerTabID = UUID()
+            writer.test_setCurrentTabIDOverride(writerTabID)
+            let written = try await writer.ensureSessionReady(tabID: writerTabID)
+            let texts = ["Cold user", "Cold assistant"]
+            written.appendItem(.user(texts[0]))
+            written.appendItem(.assistant(texts[1]))
+            written.runState = .completed
+            let saved = await writer.flushSave(for: writerTabID)
+            XCTAssertTrue(saved)
+            let sessionID = try XCTUnwrap(written.activeAgentSessionID)
+            // Ordinary close of the headless writer; the persisted record stays in the store.
+            await writer.prepareForWindowClose()
+
+            let tabID = UUID()
+            let workspaceIndex = try XCTUnwrap(window.workspaceManager.workspaces.firstIndex { $0.id == storeWorkspace.id })
+            window.workspaceManager.workspaces[workspaceIndex].composeTabs.append(
+                ComposeTabState(id: tabID, name: "Cold", activeAgentSessionID: sessionID)
+            )
+            window.promptManager.loadComposeTabsFromWorkspace(window.workspaceManager.workspaces[workspaceIndex])
+            XCTAssertNil(fixture.viewModel.sessions[tabID])
+            return (tabID, sessionID, texts)
+        }
+
+        /// Materializes the cold tab's session in the background (while another tab is current), so
+        /// activation takes the ordinary unpresentable-session path rather than materializing it.
+        private func materializeUnpresentable(_ tabID: UUID, in fixture: Fixture) throws -> AgentTabSession {
+            let viewModel = fixture.viewModel
+            let before = viewModel.ui.transcript.snapshot
+            let session = try XCTUnwrap(viewModel.session(for: tabID, createIfNeeded: false))
+            XCTAssertFalse(session.isPresentableForOwner)
+            XCTAssertFalse(session.hasLoadedPersistedState)
+            XCTAssertEqual(viewModel.ui.transcript.snapshot, before, "Background materialization does not publish")
+            return session
+        }
+
+        /// The first loading snapshot carries the destination's default follow state, and the view's
+        /// real activation normalization while the load is held publishes nothing further.
+        private func assertDefaultFollowAndQuietViewNormalization(
+            _ snapshot: AgentTranscriptUISnapshot,
+            tabID: UUID,
+            viewModel: AgentModeViewModel,
+            emissionCount: () -> Int,
+            file: StaticString = #filePath,
+            line: UInt = #line
+        ) {
+            XCTAssertEqual(
+                snapshot.followBindingState,
+                AgentModeViewModel.ActiveTranscriptFollowBindingState(tabID: tabID, viewportState: .liveBottom, armingState: .armed),
+                "The loading snapshot carries the destination's follow state",
+                file: file,
+                line: line
+            )
+            let before = emissionCount()
+            viewModel.normalizeTranscriptFollowStateForViewActivation(tabID: tabID)
+            XCTAssertEqual(emissionCount(), before, "Default follow normalization adds no store publication", file: file, line: line)
+            XCTAssertFalse(viewModel.ui.transcript.snapshot.isHydrated, file: file, line: line)
+        }
+
+        private static func waitUntil(_ condition: () -> Bool) async throws {
+            let deadline = Date().addingTimeInterval(20)
+            while !condition() {
+                guard Date() < deadline else {
+                    XCTFail("Timed out waiting for condition")
+                    return
+                }
+                try await Task.sleep(for: .milliseconds(5))
+            }
+        }
+
+        @MainActor
+        private final class ColdLoadGate {
+            private var continuation: CheckedContinuation<Void, Never>?
+            private var released = false
+            private(set) var isWaiting = false
+
+            func waitForRelease() async {
+                if released { return }
+                isWaiting = true
+                await withCheckedContinuation { continuation in
+                    self.continuation = continuation
+                }
+            }
+
+            func release() {
+                released = true
+                continuation?.resume()
+                continuation = nil
+            }
+        }
+    #endif
+
+    // MARK: - D0 interaction-latency attribution (real PromptViewModel → notification → VM path)
+
+    #if DEBUG
+        func testInteractionLatencySupersededClickSwitchNeitherRetargetsNorAdvancesNewerClick() async throws {
+            try await withFixture { fixture in
+                let recorder = LatencyEventRecorder()
+                defer { recorder.tearDown() }
+                let windowID = fixture.window.windowID
+                let older = AgentInteractionLatencyProbe.beginTabActivation(
+                    tabID: fixture.tabBID,
+                    windowID: windowID,
+                    source: "sidebarRow"
+                )
+                let newer = AgentInteractionLatencyProbe.beginTabActivation(
+                    tabID: fixture.tabAID,
+                    windowID: windowID,
+                    source: "sidebarRow"
+                )
+
+                // The older click's switch runs late under its own task-local action.
+                await Self.switchTab(fixture, to: fixture.tabBID, as: older)
+                await Self.drainMainQueue()
+                XCTAssertEqual(fixture.window.promptManager.activeComposeTabID, fixture.tabBID)
+                XCTAssertEqual(recorder.names(for: newer), ["tabActivation.begin"])
+                XCTAssertEqual(AgentInteractionLatencyProbe.pendingInteractionCountForTesting, 1)
+
+                await Self.switchTab(fixture, to: fixture.tabAID, as: newer)
+                XCTAssertEqual(
+                    Array(recorder.names(for: newer).prefix(3)),
+                    ["tabActivation.begin", "tabActivation.handlerEntered", "tabActivation.firstPublish"]
+                )
+                // The real switch reports scheduling wait separately from work start.
+                let fields = try XCTUnwrap(recorder.fields(of: "tabActivation.firstPublish", for: newer))
+                let queueWait = try XCTUnwrap(fields["queueWaitMS"].flatMap(Double.init))
+                let clickToWorkStart = try XCTUnwrap(fields["clickToWorkStartMS"].flatMap(Double.init))
+                XCTAssertLessThanOrEqual(queueWait, clickToWorkStart)
+                XCTAssertNotNil(fields["handlerToWorkStartMS"])
+                XCTAssertTrue(["applyBindings", "none"].contains(fields["refreshPath"] ?? ""), "\(fields)")
+            }
+        }
+
+        func testInteractionLatencyRapidSameTargetClicksIgnoreSupersededSwitchWork() async throws {
+            try await withFixture { fixture in
+                let recorder = LatencyEventRecorder()
+                defer { recorder.tearDown() }
+                let windowID = fixture.window.windowID
+                let older = AgentInteractionLatencyProbe.beginTabActivation(
+                    tabID: fixture.tabBID,
+                    windowID: windowID,
+                    source: "sidebarRow"
+                )
+                let newer = AgentInteractionLatencyProbe.beginTabActivation(
+                    tabID: fixture.tabBID,
+                    windowID: windowID,
+                    source: "sidebarRow"
+                )
+
+                // The superseded click performs the real handler, refresh and publish for the
+                // shared target; none of it may stamp the newer click.
+                await Self.switchTab(fixture, to: fixture.tabBID, as: older)
+                await Self.drainMainQueue()
+                XCTAssertEqual(fixture.viewModel.activeTranscriptPresentation.tabID, fixture.tabBID)
+                XCTAssertEqual(recorder.names(for: newer), ["tabActivation.begin"])
+
+                // The newer click's own switch is a no-op: the tab is already active.
+                await Self.switchTab(fixture, to: fixture.tabBID, as: newer)
+                await Self.drainMainQueue()
+                XCTAssertEqual(recorder.names(for: newer), ["tabActivation.begin"])
+                XCTAssertEqual(AgentInteractionLatencyProbe.pendingInteractionCountForTesting, 1)
+
+                // An unrelated streaming mutation (no task-local action) refreshes and publishes the
+                // target tab; without its own handler the newer click must not be stamped or done.
+                let revisionBeforeStreaming = fixture.viewModel.activeTranscriptPresentation.revision
+                fixture.sessionB.appendItem(.assistant("Streaming update", sequenceIndex: 2))
+                await Self.drainMainQueue()
+                let streamedPresentation = fixture.viewModel.activeTranscriptPresentation
+                XCTAssertEqual(streamedPresentation.tabID, fixture.tabBID)
+                XCTAssertGreaterThan(streamedPresentation.revision, revisionBeforeStreaming)
+                AgentInteractionLatencyProbe.transcriptPresentationObservedBySwiftUI(
+                    tabID: streamedPresentation.tabID,
+                    windowID: windowID,
+                    revision: streamedPresentation.revision
+                )
+                XCTAssertEqual(recorder.names(for: newer), ["tabActivation.begin"])
+                XCTAssertEqual(AgentInteractionLatencyProbe.pendingInteractionCountForTesting, 1)
+            }
+        }
+
+        func testInteractionLatencyOtherWindowSwitchDoesNotCancelActivation() async throws {
+            try await withFixture { fixtureA in
+                try await withFixture { fixtureB in
+                    let recorder = LatencyEventRecorder()
+                    defer { recorder.tearDown() }
+                    XCTAssertNotEqual(fixtureA.window.windowID, fixtureB.window.windowID)
+                    let action = AgentInteractionLatencyProbe.beginTabActivation(
+                        tabID: fixtureA.tabBID,
+                        windowID: fixtureA.window.windowID,
+                        source: "sidebarRow"
+                    )
+
+                    // Window B's unrelated switch reaches every VM's notification sink.
+                    await fixtureB.window.promptManager.switchComposeTab(fixtureB.tabBID)
+                    await Self.drainMainQueue()
+                    XCTAssertEqual(fixtureB.window.promptManager.activeComposeTabID, fixtureB.tabBID)
+                    XCTAssertEqual(recorder.names(for: action), ["tabActivation.begin"])
+                    XCTAssertEqual(AgentInteractionLatencyProbe.pendingInteractionCountForTesting, 1)
+
+                    // The owning window's handler still advances it.
+                    AgentInteractionLatencyAction.$current.withValue(action) {
+                        AgentInteractionLatencyProbe.tabActivationHandlerEntered(
+                            tabID: fixtureA.tabBID,
+                            windowID: fixtureA.window.windowID
+                        )
+                    }
+                    XCTAssertEqual(recorder.names(for: action), ["tabActivation.begin", "tabActivation.handlerEntered"])
+                }
+            }
+        }
+
+        func testInteractionLatencyOlderNewSessionFocusRequestDoesNotCompleteNewerAction() async throws {
+            try await withFixture { fixture in
+                let recorder = LatencyEventRecorder()
+                defer { recorder.tearDown() }
+                let windowID = fixture.window.windowID
+                let older = AgentInteractionLatencyProbe.beginNewSession(windowID: windowID, source: "globalShortcut")
+                let newer = AgentInteractionLatencyProbe.beginNewSession(windowID: windowID, source: "globalShortcut")
+
+                await Task {
+                    await AgentInteractionLatencyProbe.run(as: older) {
+                        await fixture.viewModel.createAndActivateSessionTab(focusComposer: true)
+                    }
+                }.value
+                // Focus behavior is unchanged; only attribution is withheld.
+                let olderRequest = try XCTUnwrap(fixture.viewModel.ui.composer.focusRequest)
+                AgentInteractionLatencyProbe.composerFocusAcknowledged(token: olderRequest.id, via: "tokenAttempt")
+                XCTAssertEqual(recorder.names(for: newer), ["newSession.begin"])
+                XCTAssertFalse(AgentInteractionLatencyProbe.isAwaitingComposerFocus)
+
+                await Task {
+                    await AgentInteractionLatencyProbe.run(as: newer) {
+                        await fixture.viewModel.createAndActivateSessionTab(focusComposer: true)
+                    }
+                }.value
+                let newerRequest = try XCTUnwrap(fixture.viewModel.ui.composer.focusRequest)
+                XCTAssertNotEqual(newerRequest.id, olderRequest.id)
+                AgentInteractionLatencyProbe.composerFocusAcknowledged(token: newerRequest.id, via: "tokenAttempt")
+                XCTAssertEqual(
+                    recorder.names(for: newer),
+                    ["newSession.begin", "newSession.focusRequested", "newSession.composerReady"]
+                )
+            }
+        }
+
+        private static func switchTab(
+            _ fixture: Fixture,
+            to tabID: UUID,
+            as action: AgentInteractionLatencyAction?
+        ) async {
+            await Task {
+                await AgentInteractionLatencyProbe.run(as: action) {
+                    await fixture.window.promptManager.switchComposeTab(tabID)
+                }
+            }.value
+        }
+
+        /// Lets main-queue callbacks and spawned main-actor Tasks from a switch run.
+        private static func drainMainQueue() async {
+            for _ in 0 ..< 5 {
+                await Task.yield()
+                await withCheckedContinuation { continuation in
+                    DispatchQueue.main.async { continuation.resume() }
+                }
+            }
+        }
+
+        @MainActor
+        private final class LatencyEventRecorder {
+            private(set) var events: [AgentInteractionLatencyLedger.Event] = []
+
+            init() {
+                AgentInteractionLatencyProbe.resetForTesting()
+                AgentInteractionLatencyProbe.enabledOverrideForTesting = true
+                AgentInteractionLatencyProbe.eventSinkForTesting = { [weak self] event in
+                    self?.events.append(event)
+                }
+            }
+
+            func names(for action: AgentInteractionLatencyAction?) -> [String] {
+                guard let id = action?.id else { return [] }
+                return events.filter { $0.interactionID == id }.map(\.name)
+            }
+
+            func fields(of name: String, for action: AgentInteractionLatencyAction?) -> [String: String]? {
+                guard let id = action?.id else { return nil }
+                return events.first { $0.interactionID == id && $0.name == name }?.fields
+            }
+
+            func tearDown() {
+                AgentInteractionLatencyProbe.resetForTesting()
+            }
+        }
+    #endif
 
     private func configureHUDCodexProvider(_ fixture: Fixture) {
         fixture.window.apiSettingsViewModel.isCodexConnected = true

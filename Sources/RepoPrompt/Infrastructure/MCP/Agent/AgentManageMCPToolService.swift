@@ -1285,6 +1285,9 @@ struct AgentManageMCPToolService {
                 // Safe on every terminal get_log: canReuseDerivedTranscriptForSave makes this
                 // a no-op when already synchronized.
                 await agentModeVM.ensureDerivedTranscriptCurrentForExport(tabID: liveSession.tabID)
+            } else {
+                // Active get_log: settle a background-delayed refresh (no-op otherwise).
+                await agentModeVM.flushDeferredDerivedTranscriptRefresh(tabID: liveSession.tabID)
             }
             let liveName = agentModeVM.sessionIndex[sessionID]?.name
             return (sessionID, liveName, hydrated.transcript, hydrated.runState)
@@ -1315,6 +1318,8 @@ struct AgentManageMCPToolService {
            let sessionID = liveSession.activeAgentSessionID
         {
             let hydrated = try await agentModeVM.ensureSessionReady(tabID: liveSession.tabID)
+            // Settle a background-delayed refresh before handing off the derived transcript.
+            await agentModeVM.flushDeferredDerivedTranscriptRefresh(tabID: liveSession.tabID)
             let liveName = targetWindow.workspaceManager.composeTab(with: hydrated.tabID)?.name
                 ?? agentModeVM.sessionIndex[sessionID]?.name
                 ?? "Agent Session"

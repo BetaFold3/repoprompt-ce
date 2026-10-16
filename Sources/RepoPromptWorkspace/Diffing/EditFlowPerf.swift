@@ -139,6 +139,24 @@ package enum EditFlowPerf {
         var permitActive: Bool?
         var publicationPending: Bool?
         var terminalBarrier: Bool?
+        /// Coarse, content-free tab tag (UUID prefix) for per-tab stage bucketing.
+        var tabTag: String?
+        var finalTurnItemCount: Int?
+        var finalTurnStartIndex: Int?
+        var earliestChangedIndex: Int?
+        var suffixTurnCount: Int?
+        /// Static fallback/rejection/no-attempt reason or incremental-path outcome label.
+        /// Sanitize may report activitySuffixSuccess; presence alone does not mean failure.
+        var fallbackReason: String?
+        /// Overlapping pending-mutation summary flags (static labels joined by `-`).
+        var mutationFlags: String?
+        /// Static source-code caller label (file/line/function); never payload.
+        var callerLabel: String?
+        var mergedMutationCount: Int?
+        var hitCount: Int?
+        var missCount: Int?
+        var evictedCount: Int?
+        var entryCount: Int?
 
         package init(
             toolName: String? = nil,
@@ -234,7 +252,20 @@ package enum EditFlowPerf {
             networkScopeActive: Bool? = nil,
             permitActive: Bool? = nil,
             publicationPending: Bool? = nil,
-            terminalBarrier: Bool? = nil
+            terminalBarrier: Bool? = nil,
+            tabTag: String? = nil,
+            finalTurnItemCount: Int? = nil,
+            finalTurnStartIndex: Int? = nil,
+            earliestChangedIndex: Int? = nil,
+            suffixTurnCount: Int? = nil,
+            fallbackReason: String? = nil,
+            mutationFlags: String? = nil,
+            callerLabel: String? = nil,
+            mergedMutationCount: Int? = nil,
+            hitCount: Int? = nil,
+            missCount: Int? = nil,
+            evictedCount: Int? = nil,
+            entryCount: Int? = nil
         ) {
             self.toolName = Self.sanitizedLabel(toolName)
             self.runPurpose = Self.sanitizedLabel(runPurpose)
@@ -330,6 +361,19 @@ package enum EditFlowPerf {
             self.permitActive = permitActive
             self.publicationPending = publicationPending
             self.terminalBarrier = terminalBarrier
+            self.tabTag = Self.sanitizedLabel(tabTag)
+            self.finalTurnItemCount = Self.nonNegative(finalTurnItemCount)
+            self.finalTurnStartIndex = Self.nonNegative(finalTurnStartIndex)
+            self.earliestChangedIndex = Self.nonNegative(earliestChangedIndex)
+            self.suffixTurnCount = Self.nonNegative(suffixTurnCount)
+            self.fallbackReason = Self.sanitizedLabel(fallbackReason)
+            self.mutationFlags = Self.sanitizedLabel(mutationFlags)
+            self.callerLabel = Self.sanitizedLabel(callerLabel)
+            self.mergedMutationCount = Self.nonNegative(mergedMutationCount)
+            self.hitCount = Self.nonNegative(hitCount)
+            self.missCount = Self.nonNegative(missCount)
+            self.evictedCount = Self.nonNegative(evictedCount)
+            self.entryCount = Self.nonNegative(entryCount)
         }
 
         fileprivate var logDescription: String {
@@ -428,6 +472,19 @@ package enum EditFlowPerf {
             append("permitActive", permitActive, to: &parts)
             append("publicationPending", publicationPending, to: &parts)
             append("terminalBarrier", terminalBarrier, to: &parts)
+            append("tab", tabTag, to: &parts)
+            append("finalTurnItemCount", finalTurnItemCount, to: &parts)
+            append("finalTurnStartIndex", finalTurnStartIndex, to: &parts)
+            append("earliestChangedIndex", earliestChangedIndex, to: &parts)
+            append("suffixTurnCount", suffixTurnCount, to: &parts)
+            append("reason", fallbackReason, to: &parts)
+            append("mutationFlags", mutationFlags, to: &parts)
+            append("caller", callerLabel, to: &parts)
+            append("mergedMutationCount", mergedMutationCount, to: &parts)
+            append("hitCount", hitCount, to: &parts)
+            append("missCount", missCount, to: &parts)
+            append("evictedCount", evictedCount, to: &parts)
+            append("entryCount", entryCount, to: &parts)
             return parts.joined(separator: " ")
         }
 
@@ -683,6 +740,11 @@ package enum EditFlowPerf {
             package static let payloadMap: StaticString = "EditFlow.Transcript.PayloadMap"
             package static let sanitize: StaticString = "EditFlow.Transcript.Sanitize"
             package static let projectionBuild: StaticString = "EditFlow.Transcript.ProjectionBuild"
+            /// Projection work only; begins after Sanitize ends (ProjectionBuild brackets PayloadMap + Sanitize too).
+            package static let projectionOnly: StaticString = "EditFlow.Transcript.ProjectionOnly"
+            /// Process-wide `BashToolResultParser` cache counters (cumulative), one zero-work span per
+            /// table. Counter snapshots only; the span duration is not a parser timing.
+            package static let bashParserCache: StaticString = "EditFlow.Transcript.BashParserCache"
             package static let publish: StaticString = "EditFlow.Transcript.Publish"
             package static let toolProcessing: StaticString = "EditFlow.Transcript.ToolProcessing"
         }
@@ -1276,7 +1338,7 @@ package enum EditFlowPerf {
             return ["1", "true", "yes", "y", "on"].contains(value)
         }()
 
-        static var isEnabled: Bool {
+        package static var isEnabled: Bool {
             environmentEnabled || UserDefaults.standard.bool(forKey: "editFlowPerfEnabled")
         }
 

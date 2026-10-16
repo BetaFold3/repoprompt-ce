@@ -9,19 +9,19 @@ package extension AgentSessionRunState {
 
 package struct AgentRunTerminalCommitRevision: Equatable {
     package let commitID: UUID
-    let ownership: AgentRunOwnership
-    let terminalState: AgentSessionRunState
+    package let ownership: AgentRunOwnership
+    package let terminalState: AgentSessionRunState
     package let expectedRunID: UUID?
     let sourceItemsRevision: Int
     let assistantDeltaFlushGeneration: UInt64
     let providerDrainGeneration: UInt64
     package let mcpPublicationEnvelope: AgentRunTerminalPublicationEnvelope?
-    let successorKind: AgentRunEpochTransitionKind?
-    let providerSuccessorID: UUID?
+    package let successorKind: AgentRunEpochTransitionKind?
+    package let providerSuccessorID: UUID?
 }
 
 @MainActor
-final class AgentRunTerminalCommitBarrier {
+package final class AgentRunTerminalCommitBarrier {
     struct ProviderSuccessor {
         let id: UUID
         let transitionKind: AgentRunEpochTransitionKind
@@ -49,6 +49,13 @@ final class AgentRunTerminalCommitBarrier {
         let providerDrainGeneration: UInt64
         let providerBuffersAreDrained: () -> Bool
         let prepareProviderState: () -> (@MainActor () async -> Void)?
+        /// Tells the provider the run will not consume again, right after its completion was
+        /// captured for attention notifications, so output it still owns can be shown at once.
+        let releaseProviderOutput: (@MainActor () -> Void)?
+        /// Delivers provider output that arrived before a queued follow-up starts, so it is shown
+        /// before the follow-up's user row. Runs after the attention capture, while the commit is
+        /// still in progress, and only when a queued follow-up instruction exists.
+        let deliverProviderOutputBeforeFollowUp: (@MainActor () async -> Void)?
         let postCommit: () -> Void
 
         @MainActor
@@ -70,6 +77,8 @@ final class AgentRunTerminalCommitBarrier {
             providerDrainGeneration: UInt64 = 0,
             providerBuffersAreDrained: @escaping () -> Bool = { true },
             prepareProviderState: @escaping () -> (@MainActor () async -> Void)? = { nil },
+            releaseProviderOutput: (@MainActor () -> Void)? = nil,
+            deliverProviderOutputBeforeFollowUp: (@MainActor () async -> Void)? = nil,
             postCommit: @escaping () -> Void = {}
         ) {
             self.session = session
@@ -101,6 +110,8 @@ final class AgentRunTerminalCommitBarrier {
             self.providerDrainGeneration = providerDrainGeneration
             self.providerBuffersAreDrained = providerBuffersAreDrained
             self.prepareProviderState = prepareProviderState
+            self.releaseProviderOutput = releaseProviderOutput
+            self.deliverProviderOutputBeforeFollowUp = deliverProviderOutputBeforeFollowUp
             self.postCommit = postCommit
         }
     }
@@ -151,23 +162,59 @@ final class AgentRunTerminalCommitBarrier {
            existingRevision.ownership == request.ownership
         {
             recordRejection("duplicate_commit", request: request)
-            if session.lastTerminalPublicationResult?.isResolved != true {
-                session.lastTerminalPublicationResult = await hooks.publishTerminalCommit(
+            var retryPublicationResult = session.lastTerminalPublicationResult
+            if retryPublicationResult?.isResolved != true {
+                let publicationResult = await hooks.publishTerminalCommit(
                     session,
                     existingRevision,
                     existingRevision.successorKind
                 )
+                // Overlapping retries publish concurrently: a result is recorded only for the
+                // still-current commit, and never over a resolved one (a later rejection must not
+                // undo the acceptance the barrier owner's follow-up depends on).
+                let isCurrent = session.lastTerminalCommitRevision?.commitID == existingRevision.commitID
+                if isCurrent, session.lastTerminalPublicationResult?.isResolved != true {
+                    session.lastTerminalPublicationResult = publicationResult
+                }
+                retryPublicationResult = isCurrent ? session.lastTerminalPublicationResult : publicationResult
             }
-            if let followUpInstruction = takeQueuedFollowUpIfReady(
-                session: session,
-                revision: existingRevision,
-                publicationResult: session.lastTerminalPublicationResult
-            ) {
-                hooks.startFollowUpRun(session.tabID, followUpInstruction)
+            // Publication may have suspended. A retry acts only while this commit is still current
+            // and no other commit or retry holds the barrier (that one consumes the follow-up
+            // after its own delivery). Only `commit` (blocked while the flag is held) and
+            // `beginRunAttempt` (which resets the flag) replace the revision.
+            let ownsRetry = !session.terminalCommitInProgress
+                && session.lastTerminalCommitRevision?.commitID == existingRevision.commitID
+            if ownsRetry,
+               existingRevision.successorKind != nil,
+               existingRevision.providerSuccessorID == nil,
+               session.terminalFollowUpTakenCommitID != existingRevision.commitID,
+               !session.pendingInstructions.isEmpty,
+               let deliverProviderOutput = request.deliverProviderOutputBeforeFollowUp
+            {
+                // Same boundary as the first commit: provider output received since then is shown
+                // before the follow-up's user row. Concurrent commits are rejected meanwhile.
+                session.terminalCommitInProgress = true
+                recordTerminalBarrierState(true, request: request)
+                await deliverProviderOutput()
+                if session.lastTerminalCommitRevision?.commitID == existingRevision.commitID {
+                    session.terminalCommitInProgress = false
+                    recordTerminalBarrierState(false, request: request)
+                }
+            }
+            if ownsRetry,
+               !session.terminalCommitInProgress,
+               session.lastTerminalCommitRevision?.commitID == existingRevision.commitID,
+               let followUpInstruction = takeQueuedFollowUpIfReady(
+                   session: session,
+                   revision: existingRevision,
+                   publicationResult: session.lastTerminalPublicationResult
+               )
+            {
+                hooks.startFollowUpRun(session.tabID, followUpInstruction, nil)
             }
             if let providerSuccessor = request.providerSuccessor,
                providerSuccessor.id == existingRevision.providerSuccessorID,
-               let publicationResult = session.lastTerminalPublicationResult
+               let publicationResult = retryPublicationResult
             {
                 notifyProviderSuccessor(
                     providerSuccessor,
@@ -314,24 +361,41 @@ final class AgentRunTerminalCommitBarrier {
         session.lastTerminalPublicationResult = nil
 
         hooks.updateBindings(session)
+        var attentionCapture: AttentionNotificationCapture?
         if request.notifyTurnComplete {
             hooks.notifyAgentTurnComplete(session)
+            if request.terminalState == .completed {
+                attentionCapture = hooks.captureAttentionTurnCompletion(session, revision)
+            }
         }
+        request.releaseProviderOutput?()
         hooks.scheduleSave(session.tabID)
-        session.lastTerminalPublicationResult = await hooks.publishTerminalCommit(
+        let publicationResult = await hooks.publishTerminalCommit(
             session,
             revision,
             successorKind
         )
-        let followUpInstruction = takeQueuedFollowUpIfReady(
+        // A newer run attempt can begin while this commit publishes or delivers provider output
+        // (`beginRunAttempt` resets the revision and the flag); this commit then owns neither the
+        // result slot, the follow-up, nor the flag.
+        var superseded = session.lastTerminalCommitRevision?.commitID != revision.commitID
+        if !superseded {
+            session.lastTerminalPublicationResult = publicationResult
+        }
+        if !superseded, queuedInstruction != nil,
+           let deliverProviderOutput = request.deliverProviderOutputBeforeFollowUp
+        {
+            await deliverProviderOutput()
+            superseded = session.lastTerminalCommitRevision?.commitID != revision.commitID
+        }
+        let followUpInstruction = superseded ? nil : takeQueuedFollowUpIfReady(
             session: session,
             revision: revision,
             publicationResult: session.lastTerminalPublicationResult
         )
-        if let providerSuccessor,
-           let publicationResult = session.lastTerminalPublicationResult
-        {
-            notifyProviderSuccessor(
+        var providerSuccessorDeclined = false
+        if let providerSuccessor {
+            providerSuccessorDeclined = notifyProviderSuccessor(
                 providerSuccessor,
                 revision: revision,
                 publicationResult: publicationResult
@@ -342,12 +406,24 @@ final class AgentRunTerminalCommitBarrier {
             ownership: request.ownership,
             tabID: session.tabID
         )
-        session.terminalCommitInProgress = false
-        recordTerminalBarrierState(false, request: request)
+        if !superseded {
+            session.terminalCommitInProgress = false
+            recordTerminalBarrierState(false, request: request)
+        }
         request.postCommit()
+        var followUpStartObservation: AgentModeRunService.Hooks.FollowUpStartObservation?
+        if let attentionCapture {
+            followUpStartObservation = hooks.settleAttentionTurnCompletion(
+                session,
+                revision,
+                attentionCapture,
+                providerSuccessorDeclined,
+                followUpInstruction != nil
+            )
+        }
 
         if let followUpInstruction {
-            hooks.startFollowUpRun(session.tabID, followUpInstruction)
+            hooks.startFollowUpRun(session.tabID, followUpInstruction, followUpStartObservation)
         }
         if request.completion == .terminalTeardownCompleted {
             await teardownTask?.value
@@ -363,17 +439,20 @@ final class AgentRunTerminalCommitBarrier {
         return revision
     }
 
+    /// Returns true only when the provider explicitly declined its successor after an accepted
+    /// publication (an observation for attention notifications; consumption is unchanged).
+    @discardableResult
     private func notifyProviderSuccessor(
         _ providerSuccessor: ProviderSuccessor,
         revision: AgentRunTerminalCommitRevision,
         publicationResult: AgentRunTerminalPublicationResult
-    ) {
+    ) -> Bool {
         if case .accepted = publicationResult {
             guard !consumedProviderSuccessorIDs.contains(providerSuccessor.id) else {
-                return
+                return false
             }
             guard providerSuccessor.consumeAfterPublication(revision, publicationResult) else {
-                return
+                return true
             }
             consumedProviderSuccessorIDs.insert(providerSuccessor.id)
             consumedProviderSuccessorOrder.append(providerSuccessor.id)
@@ -381,9 +460,10 @@ final class AgentRunTerminalCommitBarrier {
                 let expiredID = consumedProviderSuccessorOrder.removeFirst()
                 consumedProviderSuccessorIDs.remove(expiredID)
             }
-            return
+            return false
         }
         _ = providerSuccessor.consumeAfterPublication(revision, publicationResult)
+        return false
     }
 
     private func takeQueuedFollowUpIfReady(
@@ -395,6 +475,10 @@ final class AgentRunTerminalCommitBarrier {
               revision.providerSuccessorID == nil,
               let publicationResult
         else { return nil }
+        // One commit consumes at most one queued instruction. The follow-up's attempt begins
+        // asynchronously, so the commit stays current after the take and a later retry must not
+        // consume another.
+        guard session.terminalFollowUpTakenCommitID != revision.commitID else { return nil }
         switch publicationResult {
         case let .accepted(successorEpoch):
             if revision.mcpPublicationEnvelope != nil, successorEpoch == nil {
@@ -403,6 +487,7 @@ final class AgentRunTerminalCommitBarrier {
         case .rejected:
             return nil
         case .stale:
+            session.terminalFollowUpTakenCommitID = revision.commitID
             if !session.pendingInstructions.isEmpty {
                 session.pendingInstructions.removeFirst()
             }
@@ -413,6 +498,7 @@ final class AgentRunTerminalCommitBarrier {
             session.mcpFollowUpRunPending = false
             return nil
         }
+        session.terminalFollowUpTakenCommitID = revision.commitID
         return session.pendingInstructions.removeFirst()
     }
 

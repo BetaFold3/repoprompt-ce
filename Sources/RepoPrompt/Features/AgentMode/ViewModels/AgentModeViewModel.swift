@@ -492,6 +492,9 @@ final class AgentModeViewModel: ObservableObject {
     /// Runtime-only delegated `ask_user` notice registry (see AgentModeViewModel+DelegatedQuestions.swift).
     var delegatedQuestionNotices = AgentDelegatedQuestionNoticeRegistry()
 
+    /// Outbound attention-notification admission (see AgentModeViewModel+AttentionNotifications.swift).
+    var attentionNotificationAdmission: AttentionNotificationAdmission = .shared
+
     private struct AgentRunOracleReviewKey: Hashable {
         let sessionID: UUID
         let runID: UUID
@@ -570,6 +573,13 @@ final class AgentModeViewModel: ObservableObject {
     // MARK: - Dependencies
 
     private let windowID: Int
+    #if DEBUG || EDIT_FLOW_PERF
+        /// Owning window for D0 interaction-latency attribution from views.
+        var interactionLatencyWindowID: Int {
+            windowID
+        }
+    #endif
+
     /// Narrow window identity seam for cross-window scheduled-send commit notifications.
     var scheduledSendWindowID: Int {
         windowID
@@ -646,6 +656,8 @@ final class AgentModeViewModel: ObservableObject {
         /// operation (after the verdict), so an owner replacement or rebinding attempt can be
         /// interleaved before destruction.
         var test_composeTabRemovalPhaseTwoHook: (@MainActor (AgentTabSession) async -> Void)?
+        /// Test seam: makes fresh-session preparation refuse before any side effect.
+        var test_refusesFreshSessionPreparation = false
         /// Test seam: awaited inside a removal operation's phase 1 after the MCP-control teardown
         /// and before ingestion retirement, so an owner replacement can be interleaved while the
         /// operation is suspended in early teardown.
@@ -664,7 +676,9 @@ final class AgentModeViewModel: ObservableObject {
         var test_persistedLoadPrepareHook: (@MainActor (AgentTabSession) async -> Void)?
         /// Test seam: awaited inside `performPersistedSessionLoad` immediately before the payload
         /// is prepared, so an obsolete load can be held while a rebinding and a replacement load
-        /// run to (or near) completion.
+        /// run to (or near) completion. Install it before the load starts: a cold activation's
+        /// synchronous start otherwise requests an early off-main prepare that a later-installed
+        /// hook cannot hold (it only discards that result and gates the in-operation fallback).
         var test_persistedLoadBeforePrepareHook: (@MainActor (AgentTabSession) async -> Void)?
         /// Test seam: a non-nil error fails the authoritative schedule resync read for that
         /// durable session as if the storage read had thrown.
@@ -699,6 +713,11 @@ final class AgentModeViewModel: ObservableObject {
     private var isActiveUISyncSuppressed: Bool {
         activeUISyncSuppressionDepth > 0
     }
+
+    /// Transcript-UI-store-only publication batch: while open, `syncTranscriptUIState()` records a
+    /// request instead of building a snapshot; the outermost batch exit flushes once.
+    private var transcriptUIPublicationBatchDepth = 0
+    private var isTranscriptUIPublicationSyncRequested = false
 
     private var lastProcessedTabID: UUID?
 
@@ -767,6 +786,10 @@ final class AgentModeViewModel: ObservableObject {
         private var test_currentTabIDOverride: UUID?
         private var test_activeWorkspaceIDForSessionIndexOverride: UUID?
         private var test_allowsScheduledDerivedTranscriptRefreshWithoutPromptManager = false
+        /// Replaces the background first-event delay sleep; nil keeps the real cancel-aware sleep.
+        private var test_derivedTranscriptDeferralSleep: (@Sendable (Duration) async -> Void)?
+        /// Overrides the hidden kill-switch read; nil reads the defaults key.
+        private var test_backgroundDerivedTranscriptDeferralEnabledOverride: Bool?
         private var test_afterMCPStoreEpochBegan: (@MainActor () async -> Void)?
         private var test_terminalPublicationOverride: ((
             AgentRunTerminalCommitRevision,
@@ -804,6 +827,11 @@ final class AgentModeViewModel: ObservableObject {
 
         func test_initializeRunService() {
             _ = runService
+        }
+
+        /// The production terminal commit barrier wired with this view model's run hooks.
+        func test_terminalCommitBarrier() -> AgentRunTerminalCommitBarrier {
+            runService.test_terminalCommitBarrier()
         }
 
         func test_attachmentFinalizationHook() -> (
@@ -855,6 +883,14 @@ final class AgentModeViewModel: ObservableObject {
             test_allowsScheduledDerivedTranscriptRefreshWithoutPromptManager = value
         }
 
+        func test_setDerivedTranscriptDeferralSleep(_ sleep: (@Sendable (Duration) async -> Void)?) {
+            test_derivedTranscriptDeferralSleep = sleep
+        }
+
+        func test_setBackgroundDerivedTranscriptDeferralEnabledOverride(_ value: Bool?) {
+            test_backgroundDerivedTranscriptDeferralEnabledOverride = value
+        }
+
         func test_setAfterMCPStoreEpochBegan(_ hook: (@MainActor () async -> Void)?) {
             test_afterMCPStoreEpochBegan = hook
         }
@@ -897,6 +933,10 @@ final class AgentModeViewModel: ObservableObject {
 
         func test_installLiveSession(_ session: AgentTabSession) {
             sessions[session.tabID] = session
+        }
+
+        func test_endAssistantSegment(_ session: AgentTabSession, background: Bool, sourceID: UUID? = nil) {
+            endAssistantSegment(session, background: background, sourceID: sourceID)
         }
 
         func test_removeLiveSession(tabID: UUID) {
@@ -1239,6 +1279,28 @@ final class AgentModeViewModel: ObservableObject {
         activeUISyncSuppressionDepth += 1
         defer { activeUISyncSuppressionDepth -= 1 }
         return try body()
+    }
+
+    func syncTranscriptUIState() {
+        guard transcriptUIPublicationBatchDepth == 0 else {
+            isTranscriptUIPublicationSyncRequested = true
+            return
+        }
+        ui.transcript.update(makeTranscriptUISnapshot())
+    }
+
+    /// Runs `body` synchronously and publishes at most one transcript UI store snapshot, built
+    /// from the final state, when the outermost batch exits. Other UI stores are unaffected.
+    private func withTranscriptUIPublicationBatch<T>(_ body: () -> T) -> T {
+        transcriptUIPublicationBatchDepth += 1
+        defer {
+            transcriptUIPublicationBatchDepth -= 1
+            if transcriptUIPublicationBatchDepth == 0, isTranscriptUIPublicationSyncRequested {
+                isTranscriptUIPublicationSyncRequested = false
+                syncTranscriptUIState()
+            }
+        }
+        return body()
     }
 
     var activeTranscriptAnalyticsSnapshot: AgentTranscriptAnalyticsSnapshot {
@@ -3058,9 +3120,10 @@ final class AgentModeViewModel: ObservableObject {
                 }
                 return result
             },
-            startFollowUpRun: { [weak self] tabID, initialMessage in
+            startFollowUpRun: { [weak self] tabID, initialMessage, afterStart in
                 Task { [weak self] in
                     await self?.startAgentRun(tabID: tabID, initialMessage: initialMessage)
+                    afterStart?()
                 }
             },
             restoreDraftText: { [weak self] tabID, text, message, strategy in
@@ -3090,6 +3153,30 @@ final class AgentModeViewModel: ObservableObject {
             },
             recordDelegatedQuestionNoticeSendOutcome: { [weak self] session, stageID, didSend in
                 self?.recordDelegatedQuestionNoticeSendOutcome(for: session, stageID: stageID, didSend: didSend)
+            },
+            captureAttentionTurnCompletion: { [weak self] session, revision in
+                self?.captureAttentionTurnCompletion(for: session, revision: revision)
+            },
+            settleAttentionTurnCompletion: { [weak self] session, revision, capture, providerSuccessorDeclined, genericFollowUpScheduled in
+                self?.settleAttentionTurnCompletion(
+                    for: session,
+                    revision: revision,
+                    capture: capture,
+                    providerSuccessorDeclined: providerSuccessorDeclined,
+                    genericFollowUpScheduled: genericFollowUpScheduled
+                )
+            },
+            beginAttentionFollowUpObservation: { [weak self] session in
+                self?.beginAttentionFollowUpObservation(for: session)
+            },
+            attentionCompletionProgress: { [weak self] session in
+                self?.attentionCompletionProgress(for: session)
+            },
+            handleBackgroundNativeStreamResult: { [weak self] result, sourceID, session in
+                await self?.handleBackgroundNativeStreamResult(result, sourceID: sourceID, session: session)
+            },
+            endBackgroundNativeMessage: { [weak self] sourceID, session in
+                self?.endBackgroundMessage(fromSource: sourceID, session: session)
             }
         )
         let toolTrackingHooks = makeToolTrackingHooks()
@@ -3230,7 +3317,7 @@ final class AgentModeViewModel: ObservableObject {
         // Pre-destructive veto: a tab whose retained conversation cannot be saved (stale-reset
         // recovery) is removed only after explicit confirmation; normal tabs pass through.
         promptManager.composeTabRemovalPreflight = { [weak self] request in
-            guard let self else { return nil }
+            guard let self, !hasPreparedForWindowClose else { return nil }
             return await admitComposeTabRemoval(
                 tabIDs: request.composeTabIDs,
                 stashedTabIDs: request.stashedTabIDs,
@@ -3692,6 +3779,13 @@ final class AgentModeViewModel: ObservableObject {
                 }
             }
         }
+        // Committed removals no longer appear in `sessions`; their owned cleanup (possibly
+        // deferred by interactive creation) must finish before providers and approval scopes
+        // are torn down. Await strong task handles: operations remove themselves on finish.
+        let committedCleanupTasks = composeTabRemovalOperations.values.compactMap(\.cleanupTask)
+        for cleanupTask in committedCleanupTasks {
+            await cleanupTask.value
+        }
         codexCoordinator.stop()
         claudeCoordinator.stop()
         await applyEditsApprovalStore.cleanupWindowScopes(
@@ -3739,9 +3833,23 @@ final class AgentModeViewModel: ObservableObject {
     // MARK: - Tab Management
 
     private func onTabChanged(_ tabID: UUID?, allowDuringWorkspaceSwitch: Bool = false) {
-        sessionActivationGeneration &+= 1
-        let activationGeneration = sessionActivationGeneration
         let shouldDeferForWorkspaceSwitch = !allowDuringWorkspaceSwitch && workspaceManager?.isSwitchingWorkspace == true
+        // A repeated activation of the already-processed tab returns at the same-tab guard below.
+        // It keeps the in-flight activation as owner, so it must not advance the generation that
+        // owner's cold task checks before committing its binding and clearing the load marker.
+        let isRepeatedActivation = tabID != nil
+            && tabID == lastProcessedTabID
+            && !shouldDeferForWorkspaceSwitch
+            && isAgentModeActive
+        if !isRepeatedActivation {
+            sessionActivationGeneration &+= 1
+        }
+        let activationGeneration = sessionActivationGeneration
+        #if DEBUG || EDIT_FLOW_PERF
+            if let tabID {
+                AgentInteractionLatencyProbe.tabActivationHandlerEntered(tabID: tabID, windowID: windowID)
+            }
+        #endif
         // Opening a session is the canonical "I've seen it" interaction —
         // clear any unseen-run-state badge the sidebar had queued for it.
         // Runs for every tab activation path (click, keyboard shortcut,
@@ -3773,39 +3881,73 @@ final class AgentModeViewModel: ObservableObject {
             return
         }
 
-        guard lastProcessedTabID != tabID else { return }
+        guard lastProcessedTabID != tabID else {
+            assert(isRepeatedActivation, "A same-tab return must preserve the activation generation")
+            return
+        }
         lastProcessedTabID = tabID
 
-        guard let session = session(for: tabID, createIfNeeded: false) else {
-            if workspaceSwitchInFlight,
-               !allowDuringWorkspaceSwitch,
-               workspaceManager?.composeTab(with: tabID) == nil
-            {
-                activeSessionLoadInProgressTabID = tabID
-                publishLoadingTranscriptPresentation(tabID: tabID)
-                return
+        // Session lookup/materialization and every synchronous activation branch (clear, warm bind,
+        // missing-session loading, cold loading setup) publish at most one transcript UI snapshot,
+        // flushed before any load Task is created. Returns the session that needs a cold load.
+        let coldSession: AgentTabSession? = withTranscriptUIPublicationBatch {
+            guard let session = session(for: tabID, createIfNeeded: false) else {
+                if workspaceSwitchInFlight,
+                   !allowDuringWorkspaceSwitch,
+                   workspaceManager?.composeTab(with: tabID) == nil
+                {
+                    activeSessionLoadInProgressTabID = tabID
+                    publishLoadingTranscriptPresentation(tabID: tabID)
+                    return nil
+                }
+                workspaceSwitchInFlight = false
+                // No bound agent session for this tab yet.
+                activeSessionLoadInProgressTabID = nil
+                clearBindings()
+                return nil
             }
-            workspaceSwitchInFlight = false
-            // No bound agent session for this tab yet.
-            activeSessionLoadInProgressTabID = nil
-            clearBindings()
-            return
-        }
 
-        guard !session.isPresentableForOwner else {
-            workspaceSwitchInFlight = false
-            activeSessionLoadInProgressTabID = nil
+            guard !session.isPresentableForOwner else {
+                workspaceSwitchInFlight = false
+                activeSessionLoadInProgressTabID = nil
+                applySessionToBindings(session)
+                scheduleProvisionalClaudeContextWindowResolutionForActiveSession(reason: "workspace_switch_completed")
+                return nil
+            }
+
+            // Copy the destination's existing follow composite into the loading snapshot. For the
+            // default live-bottom/armed state this keeps the view's activation normalization from
+            // publishing a follow-only update; a non-default state's legitimate reset still publishes.
+            if currentTabID == tabID {
+                syncActiveTranscriptFollowBindings(from: session)
+            }
+            activeSessionLoadInProgressTabID = tabID
+            publishLoadingTranscriptPresentation(tabID: tabID)
             applySessionToBindings(session)
-            scheduleProvisionalClaudeContextWindowResolutionForActiveSession(reason: "workspace_switch_completed")
-            return
+            return session
         }
-
-        activeSessionLoadInProgressTabID = tabID
-        publishLoadingTranscriptPresentation(tabID: tabID)
-        applySessionToBindings(session)
+        guard let session = coldSession else { return }
+        #if DEBUG
+            // Captured activation identity; never the mutable current generation.
+            let coldTaskFields: [String: String] = [
+                "windowID": "\(windowID)",
+                "tabID": WorkspaceRestorePerfLog.shortID(tabID),
+                "sessionID": WorkspaceRestorePerfLog.shortID(session.activeAgentSessionID),
+                "activationGeneration": "\(activationGeneration)"
+            ]
+            WorkspaceRestorePerfLog.event("agentMode.activation.coldTaskWillCreate", fields: coldTaskFields)
+        #endif
+        // Begin (or join) the operation-owned persisted load synchronously, after the loading
+        // publication flushed, so its preparation is requested before this activation's main-actor
+        // task hop. All load guards, attempt/transition fences and apply authority are unchanged;
+        // this task awaits the same operation and owns its handle cleanup when it created it.
+        let persistedLoadStart = startOrJoinPersistedLoad(for: session, startsPreparationEarly: true)
         Task { [weak self] in
             guard let self else { return }
-            await loadSessionFromDisk(for: session)
+            #if DEBUG
+                WorkspaceRestorePerfLog.event("agentMode.activation.coldTaskEntered", fields: coldTaskFields)
+            #endif
+            await awaitPersistedLoad(persistedLoadStart, for: session)
             guard sessionActivationGeneration == activationGeneration else { return }
             guard currentTabID == tabID else { return }
             guard sessions[tabID] === session else { return }
@@ -3894,7 +4036,7 @@ final class AgentModeViewModel: ObservableObject {
 
     private func makeSession(for tabID: UUID) -> AgentTabSession {
         let newSession = AgentTabSession(tabID: tabID)
-        newSession.onSourceItemsChanged = { [weak self] session, mutation in
+        newSession.onSourceItemsChanged = { [weak self] session, mutation, caller in
             guard let self else { return }
             if mutation.touchesUserItem {
                 invalidateSidebarRestoreOrdering()
@@ -3903,7 +4045,7 @@ final class AgentModeViewModel: ObservableObject {
             // persistence from the source mutation itself so inactive presentation
             // deferral cannot make durability depend on derived UI refresh work.
             scheduleSave(for: session.tabID)
-            scheduleDerivedTranscriptRefresh(for: session, reason: .liveMutation, mutation: mutation)
+            scheduleDerivedTranscriptRefresh(for: session, reason: .liveMutation, mutation: mutation, caller: caller)
         }
         newSession.onRunStateChanged = { [weak self] session in
             guard let self else { return }
@@ -3911,9 +4053,15 @@ final class AgentModeViewModel: ObservableObject {
             refreshStaleResetRecoveryPresentationIfNeeded(for: session)
             if !session.runState.isActive {
                 completeNextAgentTurnRuntimeFooterIfNeeded(for: session, endedAt: Date())
+                // Terminal barrier: settle background-deferred work (including the footer
+                // mutation) before persistence and republish read derived state.
+                flushDeferredDerivedTranscriptRefresh(for: session)
             }
             persistRunStateTransitionIfNeeded(for: session)
             republishTranscriptPresentationForRunStateChangeIfNeeded(session)
+        }
+        newSession.onPendingQuestionUIChanged = { [weak self] session in
+            self?.catchUpDerivedTranscriptForPendingQuestionUIChange(session)
         }
         newSession.onUsageAccountingChanged = { [weak self] session, didChangeAcceptedAccounting in
             guard let self else { return }
@@ -4080,6 +4228,20 @@ final class AgentModeViewModel: ObservableObject {
         }
         guard canMaterializeSession(for: tabID) else { return nil }
         let newSession = makeSession(for: tabID)
+        installMaterializedSession(newSession, explicitSessionID: explicitSessionID)
+        return newSession
+    }
+
+    /// Shared tail of session materialization: binds the explicit session, settles readiness,
+    /// registers the session and subscribes approvals. A fresh session (one whose explicit ID
+    /// was just minted for a new tab) is marked freshly created before registration instead of
+    /// being seeded as an unhydrated persisted session.
+    private func installMaterializedSession(
+        _ newSession: AgentTabSession,
+        explicitSessionID: UUID?,
+        isFresh: Bool = false
+    ) {
+        let tabID = newSession.tabID
         if let explicitSessionID {
             _ = installPersistentSessionBinding(
                 sessionID: explicitSessionID,
@@ -4088,11 +4250,70 @@ final class AgentModeViewModel: ObservableObject {
                 invalidateAsyncWork: false
             )
         }
-        newSession.hasLoadedPersistedState = newSession.activeAgentSessionID == nil
-        seedSortMetadataForUnhydratedSession(newSession, tabID: tabID)
+        if isFresh {
+            markSessionAsFreshlyCreated(newSession)
+        } else {
+            newSession.hasLoadedPersistedState = newSession.activeAgentSessionID == nil
+            seedSortMetadataForUnhydratedSession(newSession, tabID: tabID)
+        }
         sessions[tabID] = newSession
         ensureApplyEditsApprovalSessionSync(for: newSession)
-        return newSession
+    }
+
+    private struct FreshSessionSelection {
+        let agent: AgentProviderKind
+        let modelRaw: String
+        let reasoningEffortRaw: String?
+    }
+
+    /// Prepares and registers the session of a just-created, not-yet-activated fresh tab, so its
+    /// first activation finds a presentable, profile-configured session instead of clearing the
+    /// destination. Uses only the initiating action's captured selection and never writes the
+    /// active (source) tab's bindings. Refuses before any binding, registration or save.
+    private func prepareFreshSessionForActivation(
+        tabID: UUID,
+        agentSessionID: UUID,
+        profile: AgentSessionProfile,
+        selection: FreshSessionSelection,
+        knowledgeAgents: [AgentProviderKind]
+    ) -> AgentTabSession? {
+        #if DEBUG
+            if test_refusesFreshSessionPreparation { return nil }
+        #endif
+        // Strict: no synchronous membership observer may materialize this explicit fresh tab before
+        // the callback; if one ever does, creation refuses rather than adopting that session.
+        guard currentTabID != tabID,
+              sessions[tabID] == nil,
+              explicitActiveSessionID(for: tabID) == agentSessionID,
+              canMaterializeSession(for: tabID)
+        else { return nil }
+        let session = makeSession(for: tabID)
+        session.selectedAgent = selection.agent
+        session.selectedModelRaw = selection.modelRaw
+        session.selectedReasoningEffortRaw = selection.reasoningEffortRaw
+        guard session.adoptSessionProfile(profile) else { return nil }
+        if profile == .knowledge {
+            let knowledgeAgent = knowledgeAgents.contains(selection.agent)
+                ? selection.agent
+                : knowledgeAgents[0]
+            session.selectedAgent = knowledgeAgent
+            session.selectedModelRaw = knowledgeAgent == selection.agent
+                && isModelRawValid(selection.modelRaw, for: knowledgeAgent)
+                ? selection.modelRaw
+                : defaultModelRaw(for: knowledgeAgent)
+            session.selectedReasoningEffortRaw = knowledgeAgent == selection.agent
+                ? selection.reasoningEffortRaw
+                : nil
+            codexCoordinator.normalizeCodexSelectionForSession(session, preservingExplicitEffort: true)
+        }
+
+        installMaterializedSession(session, explicitSessionID: agentSessionID, isFresh: true)
+        if applyWorkspaceDefaultRunLocationIfNeeded(to: session) {
+            session.isDirty = true
+            scheduleSave(for: tabID)
+        }
+        invalidateSidebarRestoreOrdering()
+        return session
     }
 
     private func seedSortMetadataForUnhydratedSession(_ session: AgentTabSession, tabID: UUID) {
@@ -4749,24 +4970,77 @@ final class AgentModeViewModel: ObservableObject {
         for session: AgentTabSession,
         staleResetRecoveryAttemptID: UUID? = nil
     ) async -> AgentPersistedLoadOutcome {
+        await awaitPersistedLoad(
+            startOrJoinPersistedLoad(for: session, staleResetRecoveryAttemptID: staleResetRecoveryAttemptID),
+            for: session
+        )
+    }
+
+    /// Synchronous begin-or-join half of `loadSessionFromDisk`: on the main actor, without a
+    /// suspension, it settles, joins the in-flight operation, or creates (and records) the single
+    /// operation-owned load task. Only the caller that receives `.created` performs the
+    /// identity-aware handle cleanup, by passing the start to `awaitPersistedLoad`.
+    private struct PersistedLoadStart {
+        enum Kind {
+            case settled(AgentPersistedLoadOutcome)
+            case joined(Task<AgentPersistedLoadOutcome, Never>)
+            case created(Task<AgentPersistedLoadOutcome, Never>)
+        }
+
+        let kind: Kind
+        #if DEBUG
+            let logLoadTask: (String) -> Void
+        #endif
+    }
+
+    /// Cold-activation early preparation owned by exactly one load attempt: the request captured
+    /// when the attempt began and its off-main prepare. The attempt adopts the result only if the
+    /// request it captures at its own (unchanged) capture point is equivalent; otherwise it
+    /// cancels this prepare and prepares in-operation exactly as before. Every exit of the owning
+    /// operation cancels it (a no-op once adopted and complete).
+    private struct EarlyPersistedHydrationPrepare {
+        let request: AgentSessionHydrationRequest
+        let task: Task<PreparedHydrationTransfer, Error>
+    }
+
+    /// Single-owner handoff of a prepared payload from the early prepare to its owning main-actor
+    /// load operation (the same actor-to-main transfer as the in-operation prepare); the payload
+    /// is never shared or mutated across isolation.
+    private struct PreparedHydrationTransfer: @unchecked Sendable {
+        let payload: AgentSessionHydrationPayload?
+    }
+
+    private func startOrJoinPersistedLoad(
+        for session: AgentTabSession,
+        staleResetRecoveryAttemptID: UUID? = nil,
+        startsPreparationEarly: Bool = false
+    ) -> PersistedLoadStart {
         if let recovery = session.staleResetRecovery {
             guard case let .reloading(attemptID, _) = recovery.phase,
                   attemptID == staleResetRecoveryAttemptID
             else {
                 Self.logCodexDebug("[AgentModeVM][PersistedLoad] blocked by stale-reset recovery tab=\(session.tabID)")
-                return AgentPersistedLoadOutcome(attemptID: nil, disposition: .unresolved)
+                #if DEBUG
+                    return PersistedLoadStart(
+                        kind: .settled(AgentPersistedLoadOutcome(attemptID: nil, disposition: .unresolved)),
+                        logLoadTask: { _ in }
+                    )
+                #else
+                    return PersistedLoadStart(kind: .settled(AgentPersistedLoadOutcome(attemptID: nil, disposition: .unresolved)))
+                #endif
             }
         }
         #if DEBUG
             let loadStartMS = WorkspaceRestorePerfLog.timestampMSIfEnabled()
+            let debugWindowID = windowID
             let debugTabID = session.tabID
             let debugStartRevision = session.sourceItemsRevision
             let debugExpectedSessionID = explicitActiveSessionID(for: session.tabID)
-            func logLoadTask(outcome: String) {
+            let logLoadTask: (String) -> Void = { outcome in
                 WorkspaceRestorePerfLog.event(
                     "agentSessionHydration.loadTask",
                     fields: [
-                        "windowID": "\(windowID)",
+                        "windowID": "\(debugWindowID)",
                         "tabID": WorkspaceRestorePerfLog.shortID(debugTabID),
                         "sessionID": WorkspaceRestorePerfLog.shortID(debugExpectedSessionID),
                         "outcome": outcome,
@@ -4775,23 +5049,26 @@ final class AgentModeViewModel: ObservableObject {
                     ]
                 )
             }
+            func start(_ kind: PersistedLoadStart.Kind) -> PersistedLoadStart {
+                PersistedLoadStart(kind: kind, logLoadTask: logLoadTask)
+            }
+        #else
+            func start(_ kind: PersistedLoadStart.Kind) -> PersistedLoadStart {
+                PersistedLoadStart(kind: kind)
+            }
         #endif
         if session.hasLoadedPersistedState {
             #if DEBUG
-                logLoadTask(outcome: "alreadyLoaded")
+                logLoadTask("alreadyLoaded")
             #endif
-            return AgentPersistedLoadOutcome(
+            return start(.settled(AgentPersistedLoadOutcome(
                 attemptID: session.currentPersistedLoadAttemptID,
                 disposition: session.persistedLoadDisposition ?? .applied
-            )
+            )))
         }
         if let persistedLoadTask = session.persistedLoadTask {
             Self.logCodexDebug("[AgentModeVM][PersistedLoad] join inflight tab=\(session.tabID)")
-            let joined = await persistedLoadTask.value
-            #if DEBUG
-                logLoadTask(outcome: "joinedExistingTask")
-            #endif
-            return joined
+            return start(.joined(persistedLoadTask))
         }
         let startRevision = session.sourceItemsRevision
         let expectedBinding = session.persistentSessionBindingIdentity
@@ -4804,8 +5081,12 @@ final class AgentModeViewModel: ObservableObject {
         }
         let loadAttemptID = UUID()
         session.currentPersistedLoadAttemptID = loadAttemptID
+        let earlyPrepare = startsPreparationEarly
+            ? makeEarlyPersistedHydrationPrepare(for: session, hydrationToken: hydrationToken)
+            : nil
         let persistedLoadTask = Task<AgentPersistedLoadOutcome, Never> { [weak self] in
             guard let self else {
+                earlyPrepare?.task.cancel()
                 return AgentPersistedLoadOutcome(attemptID: loadAttemptID, disposition: .unresolved)
             }
             let disposition = await performPersistedSessionLoad(
@@ -4813,26 +5094,116 @@ final class AgentModeViewModel: ObservableObject {
                 hydrationToken: hydrationToken,
                 startRevision: startRevision,
                 staleResetRecoveryAttemptID: staleResetRecoveryAttemptID,
-                loadAttemptID: loadAttemptID
+                loadAttemptID: loadAttemptID,
+                earlyPrepare: earlyPrepare
             )
             return AgentPersistedLoadOutcome(attemptID: loadAttemptID, disposition: disposition)
         }
         session.persistedLoadTask = persistedLoadTask
-        defer {
-            // Identity-aware cleanup: a cancelled/obsolete invocation never erases the handle of a
-            // newer load that replaced it.
-            if session.persistedLoadTask == persistedLoadTask {
-                session.persistedLoadTask = nil
-            }
-        }
         Self.logCodexDebug(
-            "[AgentModeVM][PersistedLoad] start tab=\(session.tabID) revision=\(startRevision) sessionID=\(expectedSessionID?.uuidString ?? "nil")"
+            "[AgentModeVM][PersistedLoad] start tab=\(session.tabID) revision=\(startRevision) sessionID=\(expectedSessionID?.uuidString ?? "nil") early=\(earlyPrepare != nil)"
         )
-        let outcome = await persistedLoadTask.value
+        return start(.created(persistedLoadTask))
+    }
+
+    /// Awaiting half of `loadSessionFromDisk`. The creator of a load operation owns the
+    /// identity-aware cleanup of its handle; joiners and settled starts never touch it.
+    private func awaitPersistedLoad(_ start: PersistedLoadStart, for session: AgentTabSession) async -> AgentPersistedLoadOutcome {
+        switch start.kind {
+        case let .settled(outcome):
+            return outcome
+        case let .joined(persistedLoadTask):
+            let joined = await persistedLoadTask.value
+            #if DEBUG
+                start.logLoadTask("joinedExistingTask")
+            #endif
+            return joined
+        case let .created(persistedLoadTask):
+            defer {
+                // Identity-aware cleanup: a cancelled/obsolete invocation never erases the handle of a
+                // newer load that replaced it.
+                if session.persistedLoadTask == persistedLoadTask {
+                    session.persistedLoadTask = nil
+                }
+            }
+            let outcome = await persistedLoadTask.value
+            #if DEBUG
+                start.logLoadTask("createdTaskComplete")
+            #endif
+            return outcome
+        }
+    }
+
+    /// Starts the cold-activation prepare off the main actor from the synchronous load start, so
+    /// service entry does not wait behind main-actor work queued ahead of the operation task. It
+    /// still serializes on the data-service actor and its per-session persistence gate. Not used
+    /// when the in-operation prepare would not run, or while the DEBUG before-prepare seam is set
+    /// at start (a seam installed before the start gates all service entry; one installed later
+    /// only discards this prepare and gates the fallback).
+    private func makeEarlyPersistedHydrationPrepare(
+        for session: AgentTabSession,
+        hydrationToken: PersistedHydrationCommitToken?
+    ) -> EarlyPersistedHydrationPrepare? {
         #if DEBUG
-            logLoadTask(outcome: "createdTaskComplete")
+            guard test_persistedLoadBeforePrepareHook == nil else { return nil }
         #endif
-        return outcome
+        guard !AppLaunchConfiguration.current.suppressesAgentSessionPersistence,
+              let hydrationToken,
+              let workspace = persistenceWorkspace ?? lastKnownWorkspaceSnapshot
+        else {
+            return nil
+        }
+        let request = persistedHydrationRequest(
+            for: session,
+            sessionID: hydrationToken.requestedSessionID,
+            workspace: workspace
+        )
+        let dataService = dataService
+        let task = Task.detached(priority: .userInitiated) { () async throws -> PreparedHydrationTransfer in
+            let payload = try await dataService.preparePersistedHydration(request)
+            return PreparedHydrationTransfer(payload: payload)
+        }
+        return EarlyPersistedHydrationPrepare(request: request, task: task)
+    }
+
+    /// The request the load operation captures for its prepare. Shared by the in-operation
+    /// capture and the early cold-activation capture so both read identical sources.
+    private func persistedHydrationRequest(
+        for session: AgentTabSession,
+        sessionID: UUID,
+        workspace: WorkspaceModel
+    ) -> AgentSessionHydrationRequest {
+        AgentSessionHydrationRequest(
+            workspace: workspace,
+            tabID: session.tabID,
+            sessionID: sessionID,
+            resolvedDisplayName: resolvedSessionDisplayName(for: session.tabID),
+            hasPendingQuestionUI: session.hasPendingQuestionUI,
+            transcriptViewportState: persistedHydrationTranscriptViewportState(for: session),
+            isCompressedHistoryRevealed: session.isCompressedHistoryRevealed,
+            initialPerformanceSnapshot: session.transcriptPerformanceSnapshot
+        )
+    }
+
+    /// An early prepare is adopted only when its request is equivalent to the one the operation
+    /// captured at its own capture point. Every presentation input is compared exactly. The
+    /// workspace is compared by the fields the prepare consumes (the storage folder resolved from
+    /// id/name/customStoragePath, and the stamp's workspace id); unrelated workspace fields such as
+    /// the active compose tab legitimately change during activation.
+    private static func earlyHydrationRequest(
+        _ early: AgentSessionHydrationRequest,
+        isEquivalentTo current: AgentSessionHydrationRequest
+    ) -> Bool {
+        early.workspace.id == current.workspace.id
+            && early.workspace.name == current.workspace.name
+            && early.workspace.customStoragePath == current.workspace.customStoragePath
+            && early.tabID == current.tabID
+            && early.sessionID == current.sessionID
+            && early.resolvedDisplayName == current.resolvedDisplayName
+            && early.hasPendingQuestionUI == current.hasPendingQuestionUI
+            && early.transcriptViewportState == current.transcriptViewportState
+            && early.isCompressedHistoryRevealed == current.isCompressedHistoryRevealed
+            && early.initialPerformanceSnapshot == current.initialPerformanceSnapshot
     }
 
     /// The load attempt that produced an outcome is still the session's current attempt. An
@@ -4899,8 +5270,12 @@ final class AgentModeViewModel: ObservableObject {
         hydrationToken: PersistedHydrationCommitToken?,
         startRevision: Int,
         staleResetRecoveryAttemptID: UUID? = nil,
-        loadAttemptID: UUID
+        loadAttemptID: UUID,
+        earlyPrepare: EarlyPersistedHydrationPrepare? = nil
     ) async -> AgentTabSession.PersistedLoadDisposition {
+        // The early prepare belongs to this operation: every exit that did not adopt it (or that
+        // adopted and already consumed it, where this is a no-op) stops it.
+        defer { earlyPrepare?.task.cancel() }
         let expectedSessionID = hydrationToken?.requestedSessionID
         #if DEBUG
             let performStartMS = WorkspaceRestorePerfLog.timestampMSIfEnabled()
@@ -4950,16 +5325,22 @@ final class AgentModeViewModel: ObservableObject {
             return .unbound
         }
 
-        let request = AgentSessionHydrationRequest(
-            workspace: workspace,
-            tabID: session.tabID,
-            sessionID: sessionID,
-            resolvedDisplayName: resolvedSessionDisplayName(for: session.tabID),
-            hasPendingQuestionUI: session.hasPendingQuestionUI,
-            transcriptViewportState: persistedHydrationTranscriptViewportState(for: session),
-            isCompressedHistoryRevealed: session.isCompressedHistoryRevealed,
-            initialPerformanceSnapshot: session.transcriptPerformanceSnapshot
-        )
+        let request = persistedHydrationRequest(for: session, sessionID: sessionID, workspace: workspace)
+        #if DEBUG
+            // A before-prepare seam installed after the synchronous early start cannot undo service
+            // I/O the early prepare may already have begun; it only discards that speculation and
+            // gates the in-operation fallback prepare. For a deterministic gate before any service
+            // entry, install the seam before the load starts (the early start is then never made).
+            let beforePrepareSeamInstalled = test_persistedLoadBeforePrepareHook != nil
+        #else
+            let beforePrepareSeamInstalled = false
+        #endif
+        let adoptedEarlyPrepare = beforePrepareSeamInstalled ? nil : earlyPrepare.flatMap { early in
+            Self.earlyHydrationRequest(early.request, isEquivalentTo: request) ? early : nil
+        }
+        if adoptedEarlyPrepare == nil {
+            earlyPrepare?.task.cancel()
+        }
 
         #if DEBUG
             var prepareStartMS: Double?
@@ -4970,9 +5351,31 @@ final class AgentModeViewModel: ObservableObject {
                 if let hook = test_persistedLoadBeforePrepareHook {
                     await hook(session)
                 }
+                let prepareBoundaryFields: [String: String] = [
+                    "windowID": "\(windowID)",
+                    "tabID": WorkspaceRestorePerfLog.shortID(session.tabID),
+                    "sessionID": WorkspaceRestorePerfLog.shortID(sessionID),
+                    "loadAttemptID": WorkspaceRestorePerfLog.shortID(loadAttemptID),
+                    "transitionGeneration": "\(hydrationToken.transition.transitionGeneration)",
+                    "earlyPrepare": earlyPrepare == nil ? "none" : (adoptedEarlyPrepare == nil ? "discarded" : "adopted")
+                ]
+                WorkspaceRestorePerfLog.event("agentSessionHydration.prepareWillAwait", fields: prepareBoundaryFields)
             #endif
-            let preparedPayload = try await dataService.preparePersistedHydration(request)
+            let preparedPayload = if let earlyTask = adoptedEarlyPrepare?.task {
+                // Cancellation of this operation reaches the early prepare exactly as it reaches an
+                // in-operation prepare (including cancellation that landed before this await).
+                try await withTaskCancellationHandler {
+                    try await earlyTask.value.payload
+                } onCancel: {
+                    earlyTask.cancel()
+                }
+            } else {
+                try await dataService.preparePersistedHydration(request)
+            }
             #if DEBUG
+                var prepareResumeFields = prepareBoundaryFields
+                prepareResumeFields["payload"] = preparedPayload == nil ? "nil" : "present"
+                WorkspaceRestorePerfLog.event("agentSessionHydration.prepareDidResume", fields: prepareResumeFields)
                 if let hook = test_persistedLoadPrepareHook {
                     await hook(session)
                 }
@@ -5204,6 +5607,9 @@ final class AgentModeViewModel: ObservableObject {
             isStaleResetRecoveryReplacement = false
         }
 
+        // The prepared presentation was built for the normalized persisted provider; install it
+        // before hydration stamps the derived-transcript sync state.
+        session.selectedAgent = payload.normalizedSelection.agent
         hydrateSession(
             session,
             withCanonicalItems: payload.canonicalLiveItems,
@@ -5258,6 +5664,8 @@ final class AgentModeViewModel: ObservableObject {
         session.worktreeBindings = agentSession.worktreeBindings
         session.worktreeMergeOperations = agentSession.worktreeMergeOperations
         session.nextSequenceIndex = payload.transcript.nextSequenceIndex
+        session.attentionTextProvenance = nil
+        discardAttentionDeferredCompletion(for: session)
         session.lastActivityAt = agentSession.savedAt
         session.lastUserMessageAt = payload.lastUserMessageAt
         if let lastUserMessageAt = payload.lastUserMessageAt {
@@ -5265,7 +5673,6 @@ final class AgentModeViewModel: ObservableObject {
         } else {
             sessionIndexStore.removeSortDate(forTabID: session.tabID)
         }
-        session.selectedAgent = payload.normalizedSelection.agent
         session.ohMyPiThinkingSelections = agentSession.ohMyPiThinkingSelections ?? .empty
         if session.transcriptAnalyticsSnapshot.selectedAgent != session.selectedAgent {
             session.transcriptAnalyticsSnapshot.selectedAgent = session.selectedAgent
@@ -5631,6 +6038,8 @@ final class AgentModeViewModel: ObservableObject {
         session.clearDerivedTranscriptCaches()
         session.hasSentFirstMessage = false
         session.nextSequenceIndex = 0
+        session.attentionTextProvenance = nil
+        discardAttentionDeferredCompletion(for: session)
         session.runState = .idle
         session.clearClaudeReasoningStatus(clearDisplayedStatus: true)
         session.setRunningStatus(nil, source: nil)
@@ -9736,6 +10145,9 @@ final class AgentModeViewModel: ObservableObject {
             tabID: tabID,
             revision: currentSnapshot.revision &+ 1
         )
+        #if DEBUG || EDIT_FLOW_PERF
+            AgentInteractionLatencyProbe.loadingPresentationPublished(tabID: tabID, windowID: windowID)
+        #endif
     }
 
     private var allowsHeadlessActiveTranscriptBindingPublication: Bool {
@@ -9791,6 +10203,9 @@ final class AgentModeViewModel: ObservableObject {
 
     @discardableResult
     private func publishTranscriptPresentation(from session: AgentTabSession, forceRevision: Bool = false) -> Bool {
+        #if DEBUG || EDIT_FLOW_PERF
+            AgentInteractionLatencyProbe.transcriptPublishBegan(tabID: session.tabID, windowID: windowID)
+        #endif
         let currentSnapshot = activeTranscriptPresentation
         let candidateSnapshot = transcriptPresentationSnapshot(
             from: session,
@@ -9869,6 +10284,9 @@ final class AgentModeViewModel: ObservableObject {
             }
         #endif
         guard contentChanged || performanceChanged || forceRevision else {
+            #if DEBUG || EDIT_FLOW_PERF
+                AgentInteractionLatencyProbe.transcriptPublishSkipped(tabID: session.tabID, windowID: windowID)
+            #endif
             return false
         }
         #if DEBUG || EDIT_FLOW_PERF
@@ -9883,6 +10301,14 @@ final class AgentModeViewModel: ObservableObject {
             from: session,
             revision: nextRevision
         )
+        #if DEBUG || EDIT_FLOW_PERF
+            AgentInteractionLatencyProbe.transcriptPublished(
+                tabID: session.tabID,
+                windowID: windowID,
+                revision: nextRevision,
+                contentChanged: contentChanged
+            )
+        #endif
         if !isActiveUISyncSuppressed {
             syncRuntimeMetricsUIState()
             syncRunInteractionUIState()
@@ -9962,6 +10388,7 @@ final class AgentModeViewModel: ObservableObject {
         guard let session = session(for: tabID, createIfNeeded: false) else { return }
         guard session.isCompressedHistoryRevealed != isRevealed else { return }
         session.isCompressedHistoryRevealed = isRevealed
+        flushDeferredDerivedTranscriptRefresh(for: session)
         session.transcriptProjection = materializedTranscriptProjection(for: session)
         guard canBuildOrPublishActiveTranscriptBindings(for: session) else { return }
         _ = publishTranscriptPresentation(from: session)
@@ -9971,6 +10398,7 @@ final class AgentModeViewModel: ObservableObject {
         guard let session = session(for: tabID, createIfNeeded: false) else { return }
         guard session.isTranscriptWindowExpanded != isExpanded else { return }
         session.isTranscriptWindowExpanded = isExpanded
+        flushDeferredDerivedTranscriptRefresh(for: session)
         session.transcriptProjection = materializedTranscriptProjection(for: session)
         guard canBuildOrPublishActiveTranscriptBindings(for: session) else { return }
         _ = publishTranscriptPresentation(from: session)
@@ -10059,11 +10487,23 @@ final class AgentModeViewModel: ObservableObject {
             isRestoringState = true
             defer { isRestoringState = false }
 
-            catchUpDerivedTranscriptForActiveBindingIfNeeded(
+            #if DEBUG || EDIT_FLOW_PERF
+                AgentInteractionLatencyProbe.transcriptRefreshBegan(tabID: session.tabID, windowID: windowID)
+            #endif
+            let didCatchUpDerivedTranscript = catchUpDerivedTranscriptForActiveBindingIfNeeded(
                 for: session,
                 reason: .liveMutation,
                 validateProjectionIntegrity: true
             )
+            #if DEBUG || EDIT_FLOW_PERF
+                AgentInteractionLatencyProbe.transcriptRefreshEnded(
+                    tabID: session.tabID,
+                    windowID: windowID,
+                    didRefresh: didCatchUpDerivedTranscript
+                )
+            #else
+                _ = didCatchUpDerivedTranscript
+            #endif
             publishTranscriptPresentation(from: session, forceRevision: false)
 
             let nextLiveBashExecutionByItemID = session.bashLiveExecutionByTranscriptItemID
@@ -10563,6 +11003,22 @@ final class AgentModeViewModel: ObservableObject {
         #endif
     }
 
+    /// True while the current destination's activation load is in progress and its active
+    /// presentation is not yet hydrated for the session's current binding. Persisted adoption can
+    /// make the session presentable before the activation commits the binding; the activation's
+    /// `applySessionToBindings` publishes that commit from the session's latest state, so session
+    /// refreshes landing in between must not publish the adopted rows unhydrated. Once the active
+    /// presentation is hydrated for this binding, refreshes apply even if the marker is still set.
+    private func isAwaitingActivationBindingCommit(_ session: AgentTabSession) -> Bool {
+        guard activeSessionLoadInProgressTabID == session.tabID else { return false }
+        let presentation = activeTranscriptPresentation
+        let isHydratedForCurrentBinding = presentation.tabID == session.tabID
+            && presentation.bindingsHydrated
+            && presentation.hydratedPersistentBinding == session.persistentSessionBindingIdentity
+            && presentation.hydratedBindingTransitionGeneration == session.bindingTransitionGeneration
+        return !isHydratedForCurrentBinding
+    }
+
     func updateBindingsFromSession(_ session: AgentTabSession) {
         #if DEBUG
             test_updateBindingsCallCount += 1
@@ -10591,6 +11047,12 @@ final class AgentModeViewModel: ObservableObject {
         }
         guard canBuildOrPublishActiveTranscriptBindings(for: session) else {
             publishLoadingTranscriptPresentation(tabID: session.tabID)
+            return
+        }
+        guard !isAwaitingActivationBindingCommit(session) else {
+            #if DEBUG
+                AgentModePerfDiagnostics.increment("ui.updateBindings.heldForActivationCommit", tabID: session.tabID)
+            #endif
             return
         }
 
@@ -10883,7 +11345,8 @@ final class AgentModeViewModel: ObservableObject {
     private func scheduleDerivedTranscriptRefresh(
         for session: AgentTabSession,
         reason: AgentDerivedTranscriptRefreshReason,
-        mutation: AgentSourceItemsMutation? = nil
+        mutation: AgentSourceItemsMutation? = nil,
+        caller: AgentSourceItemsMutationCaller? = nil
     ) {
         #if DEBUG
             let canScheduleAsyncRefresh = promptManager != nil || test_allowsScheduledDerivedTranscriptRefreshWithoutPromptManager
@@ -10897,12 +11360,17 @@ final class AgentModeViewModel: ObservableObject {
                 sourceItemCount: session.items.count
             )
         )
+        // Diagnostics only: the summary a non-live refresh discards, so its no-attempt
+        // diagnosis still reports flags and caller. Never consulted for admission.
+        let discardedPendingSummaryForDiagnostics = reason != .liveMutation
+            ? session.pendingSourceItemsMutationSummary
+            : nil
         if reason == .liveMutation, let mutation {
             if var pendingSummary = session.pendingSourceItemsMutationSummary {
-                pendingSummary.merge(mutation)
+                pendingSummary.merge(mutation, caller: caller)
                 session.pendingSourceItemsMutationSummary = pendingSummary
             } else {
-                session.pendingSourceItemsMutationSummary = AgentPendingSourceItemsMutationSummary(mutation)
+                session.pendingSourceItemsMutationSummary = AgentPendingSourceItemsMutationSummary(mutation, caller: caller)
             }
         } else if reason != .liveMutation {
             session.pendingSourceItemsMutationSummary = nil
@@ -10921,14 +11389,24 @@ final class AgentModeViewModel: ObservableObject {
             session.derivedTranscriptRefreshGeneration &+= 1
             session.derivedTranscriptRefreshTask?.cancel()
             session.derivedTranscriptRefreshTask = nil
+            session.derivedTranscriptRefreshDeferredGeneration = nil
             #if DEBUG || EDIT_FLOW_PERF
                 session.transcriptPerformanceSnapshot.refreshImmediateCount += 1
             #endif
-            refreshDerivedTranscriptState(for: session, reason: reason)
+            refreshDerivedTranscriptState(
+                for: session,
+                reason: reason,
+                discardedPendingSummaryForDiagnostics: discardedPendingSummaryForDiagnostics
+            )
             return
         }
 
-        if session.derivedTranscriptRefreshTask != nil {
+        // A delayed task coalesces later events without moving its deadline, unless the session
+        // became publishable meanwhile: then it falls through to an undelayed next-turn task
+        // (the merged summary is kept; the generation bump makes the delayed task a no-op).
+        if session.derivedTranscriptRefreshTask != nil,
+           !session.hasDeferredDerivedTranscriptRefresh || !canBuildOrPublishActiveTranscriptBindings(for: session)
+        {
             EditFlowPerf.end(
                 EditFlowPerf.Stage.Transcript.scheduleRefresh,
                 scheduleSignpost,
@@ -10940,16 +11418,33 @@ final class AgentModeViewModel: ObservableObject {
             session.pendingDerivedTranscriptRefreshReason = .liveMutation
             return
         }
+        session.derivedTranscriptRefreshTask?.cancel()
+        session.derivedTranscriptRefreshTask = nil
 
+        // D7: a background session (one that cannot build or publish active bindings) waits a
+        // fixed window from its FIRST pending event; active sessions keep next-turn coalescing.
+        let deferralSleep: (@Sendable (Duration) async -> Void)? =
+            !canBuildOrPublishActiveTranscriptBindings(for: session)
+                && isBackgroundDerivedTranscriptDeferralEnabled
+                ? derivedTranscriptDeferralSleep
+                : nil
         EditFlowPerf.end(
             EditFlowPerf.Stage.Transcript.scheduleRefresh,
             scheduleSignpost,
-            EditFlowPerf.Dimensions(status: reason.rawValue, outcome: "scheduled")
+            EditFlowPerf.Dimensions(
+                status: reason.rawValue,
+                outcome: deferralSleep == nil ? "scheduled" : "scheduledDeferred"
+            )
         )
         session.pendingDerivedTranscriptRefreshReason = .liveMutation
         session.derivedTranscriptRefreshGeneration &+= 1
         let scheduledGeneration = session.derivedTranscriptRefreshGeneration
+        session.derivedTranscriptRefreshDeferredGeneration = deferralSleep == nil ? nil : scheduledGeneration
         session.derivedTranscriptRefreshTask = Task { @MainActor [weak self, weak session] in
+            // Weak captures stay unbound across the wait so it retains neither owner.
+            if let deferralSleep {
+                await deferralSleep(Self.backgroundDerivedTranscriptRefreshDelay)
+            }
             guard let self, let session else { return }
             guard !Task.isCancelled else { return }
             guard sessions[session.tabID] === session else { return }
@@ -10957,19 +11452,91 @@ final class AgentModeViewModel: ObservableObject {
             let scheduledReason = session.pendingDerivedTranscriptRefreshReason ?? .liveMutation
             session.pendingDerivedTranscriptRefreshReason = nil
             session.derivedTranscriptRefreshTask = nil
+            session.derivedTranscriptRefreshDeferredGeneration = nil
             refreshDerivedTranscriptState(for: session, reason: scheduledReason)
         }
     }
 
+    /// Fixed first-event window for background `.liveMutation` refreshes (D7).
+    static let backgroundDerivedTranscriptRefreshDelay: Duration = .milliseconds(1500)
+    /// Hidden reversible kill switch: `defaults write <bundle-id> <key> -bool YES` restores
+    /// pre-D7 scheduling (no background delay, no question-aggregate catch-up).
+    static let backgroundDerivedTranscriptDeferralDisabledDefaultsKey =
+        "AgentModeDisableBackgroundTranscriptRefreshDeferral"
+
+    private var isBackgroundDerivedTranscriptDeferralEnabled: Bool {
+        #if DEBUG
+            if let override = test_backgroundDerivedTranscriptDeferralEnabledOverride {
+                return override
+            }
+        #endif
+        return !UserDefaults.standard.bool(forKey: Self.backgroundDerivedTranscriptDeferralDisabledDefaultsKey)
+    }
+
+    private var derivedTranscriptDeferralSleep: @Sendable (Duration) async -> Void {
+        #if DEBUG
+            if let test_derivedTranscriptDeferralSleep {
+                return test_derivedTranscriptDeferralSleep
+            }
+        #endif
+        // Cancel-aware: cancellation ends the wait early; the task body then re-checks it.
+        return { delay in try? await Task.sleep(for: delay) }
+    }
+
+    /// Freshness barrier: runs a background-delayed refresh now, with its pending live reason
+    /// and merged summary. A no-op unless the pending task is one D7 delayed.
+    @discardableResult
+    func flushDeferredDerivedTranscriptRefresh(tabID: UUID) -> Bool {
+        guard let session = sessions[tabID] else { return false }
+        return flushDeferredDerivedTranscriptRefresh(for: session)
+    }
+
+    @discardableResult
+    func flushDeferredDerivedTranscriptRefresh(for session: AgentTabSession) -> Bool {
+        guard sessions[session.tabID] === session,
+              session.hasDeferredDerivedTranscriptRefresh
+        else { return false }
+        let scheduledReason = session.pendingDerivedTranscriptRefreshReason ?? .liveMutation
+        refreshDerivedTranscriptState(for: session, reason: scheduledReason)
+        return true
+    }
+
+    /// Question-aggregate barrier: question visibility changes import policy
+    /// (`hidePendingQuestionToolCall`), so a background session catches up now even without a
+    /// delayed task. Active sessions keep their existing binding-update path.
+    private func catchUpDerivedTranscriptForPendingQuestionUIChange(_ session: AgentTabSession) {
+        guard isBackgroundDerivedTranscriptDeferralEnabled,
+              !canBuildOrPublishActiveTranscriptBindings(for: session)
+        else { return }
+        catchUpDerivedTranscriptIfNeeded(
+            for: session,
+            reason: .liveMutation,
+            publishActivePresentation: false
+        )
+    }
+
+    /// `discardedPendingSummaryForDiagnostics` is the summary a caller already cleared for a
+    /// non-live refresh; it feeds only the no-attempt diagnosis, never admission.
+    /// `permitsRunStateOnlyAdmission` is false for projection-integrity repair, which keeps
+    /// the full import.
     func refreshDerivedTranscriptState(
         for session: AgentTabSession,
         reason: AgentDerivedTranscriptRefreshReason = .manualRefresh,
-        publishActivePresentation: Bool = true
+        publishActivePresentation: Bool = true,
+        discardedPendingSummaryForDiagnostics: AgentPendingSourceItemsMutationSummary? = nil,
+        permitsRunStateOnlyAdmission: Bool = true
     ) {
         session.derivedTranscriptRefreshGeneration &+= 1
         session.derivedTranscriptRefreshTask?.cancel()
         session.derivedTranscriptRefreshTask = nil
+        session.derivedTranscriptRefreshDeferredGeneration = nil
         let pendingMutationSummary = reason == .liveMutation ? session.pendingSourceItemsMutationSummary : nil
+        #if DEBUG || EDIT_FLOW_PERF
+            // Diagnostics only: a non-live refresh still reports the summary it discards.
+            let diagnosticMutationSummary = reason == .liveMutation
+                ? pendingMutationSummary
+                : session.pendingSourceItemsMutationSummary ?? discardedPendingSummaryForDiagnostics
+        #endif
         session.pendingSourceItemsMutationSummary = nil
         session.pendingDerivedTranscriptRefreshReason = nil
         #if DEBUG || EDIT_FLOW_PERF
@@ -10988,6 +11555,38 @@ final class AgentModeViewModel: ObservableObject {
             for: session,
             transcript: existingTranscript
         )
+        #if DEBUG
+            let forcesColdDerivation = session.test_forcesColdDerivedTranscriptBuild
+        #else
+            let forcesColdDerivation = false
+        #endif
+        let currentSyncState = makeDerivedTranscriptSyncState(
+            for: session,
+            projectionProtection: projectionProtection
+        )
+        // Incremental admission. A usable source summary keeps the existing path. With no summary,
+        // a sync state that differs from the last synchronized one only in `runState` re-imports
+        // the final turn from its real start through the same guarded importer.
+        let incrementalAdmission: (earliestChangedIndex: Int, summary: AgentPendingSourceItemsMutationSummary?)? = {
+            guard reason == .liveMutation,
+                  !forcesColdDerivation,
+                  session.pendingAskUser == nil
+            else {
+                return nil
+            }
+            if let pendingMutationSummary {
+                guard pendingMutationSummary.allowsIncrementalFinalTurnRebuild else { return nil }
+                return (pendingMutationSummary.earliestChangedIndex, pendingMutationSummary)
+            }
+            guard permitsRunStateOnlyAdmission,
+                  let previousSyncState = session.derivedTranscriptSyncState,
+                  previousSyncState.differsOnlyInRunState(from: currentSyncState),
+                  let finalTurnStartIndex = AgentTranscriptIO.finalTurnStartIndex(in: workingItemsSnapshot)
+            else {
+                return nil
+            }
+            return (finalTurnStartIndex, nil)
+        }()
         #if DEBUG
             let debugMetricsEnabled = AgentTranscriptDebugInstrumentation.isEnabled
             let debugPendingMutationSummary: String?
@@ -11008,7 +11607,11 @@ final class AgentModeViewModel: ObservableObject {
                 debugIncrementalPath = {
                     guard reason == .liveMutation else { return "full-rebuild:reason-\(reason.rawValue)" }
                     guard session.pendingAskUser == nil else { return "full-rebuild:pending-question" }
-                    guard let pendingMutationSummary else { return "full-rebuild:missing-mutation-summary" }
+                    guard let pendingMutationSummary else {
+                        return incrementalAdmission != nil
+                            ? "incremental-attempt:run-state-only"
+                            : "full-rebuild:missing-mutation-summary"
+                    }
                     guard pendingMutationSummary.allowsIncrementalFinalTurnRebuild else {
                         return "full-rebuild:mutation-disallows-incremental"
                     }
@@ -11033,6 +11636,15 @@ final class AgentModeViewModel: ObservableObject {
         #if DEBUG || EDIT_FLOW_PERF
             var performanceSnapshot = session.transcriptPerformanceSnapshot
             performanceSnapshot.lastSourceItemCount = workingItemsSnapshot.count
+            let diagnosticTabTag: String? = Self.transcriptDiagnosticTabTag(session.tabID)
+            var importDiagnosticOutcome = "not_attempted"
+            var importDiagnosticReason: String?
+            var importDiagnosticFlags: String?
+            var importDiagnosticCaller: String?
+            var importDiagnosticMergedCount: Int?
+            var importDiagnosticFinalTurnItemCount: Int?
+        #else
+            let diagnosticTabTag: String? = nil
         #endif
         let importPolicy = AgentTranscriptImportPolicy.liveSession(
             hidePendingQuestionToolCall: session.hasPendingQuestionUI
@@ -11049,11 +11661,8 @@ final class AgentModeViewModel: ObservableObject {
         )
         let importedTranscript: AgentTranscript
         var trustedIncrementalFinalTurnStartSequenceIndex: Int?
-        if reason == .liveMutation,
-           session.pendingAskUser == nil,
-           let mutationSummary = pendingMutationSummary,
-           mutationSummary.allowsIncrementalFinalTurnRebuild
-        {
+        if let incrementalAdmission {
+            let earliestChangedIndex = incrementalAdmission.earliestChangedIndex
             #if DEBUG || EDIT_FLOW_PERF
                 let incrementalImportStartedAt = CFAbsoluteTimeGetCurrent()
                 var incrementalImportOutcome = "fallback"
@@ -11069,19 +11678,20 @@ final class AgentModeViewModel: ObservableObject {
                     performanceSnapshot.frontierReuseAttemptCount += 1
                 }
             #endif
-            if let incrementallyUpdatedTranscript = AgentTranscriptIO.incrementallyUpdatedTranscriptForFinalTurn(
+            let incrementalImportResult = AgentTranscriptIO.incrementallyUpdatedTranscriptForFinalTurnWithDiagnostics(
                 existingTranscript: existingTranscript,
                 items: workingItemsSnapshot,
-                earliestChangedIndex: mutationSummary.earliestChangedIndex,
+                earliestChangedIndex: earliestChangedIndex,
                 terminalState: session.runState,
                 nextSequenceIndex: session.nextSequenceIndex,
                 policy: importPolicy,
                 protection: projectionProtection
-            ) {
+            )
+            if let incrementallyUpdatedTranscript = incrementalImportResult.transcript {
                 importedTranscript = incrementallyUpdatedTranscript
-                if workingItemsSnapshot.indices.contains(mutationSummary.earliestChangedIndex) {
+                if workingItemsSnapshot.indices.contains(earliestChangedIndex) {
                     trustedIncrementalFinalTurnStartSequenceIndex =
-                        workingItemsSnapshot[mutationSummary.earliestChangedIndex].sequenceIndex
+                        workingItemsSnapshot[earliestChangedIndex].sequenceIndex
                 }
                 #if DEBUG
                     debugIncrementalPath = usesDurableFrontier ? "incremental-success:frontier" : "incremental-success:no-frontier"
@@ -11113,12 +11723,34 @@ final class AgentModeViewModel: ObservableObject {
                 #endif
             }
             #if DEBUG || EDIT_FLOW_PERF
+                let incrementalImportShape = Self.incrementalImportDiagnosticShape(incrementalImportResult)
+                let incrementalImportCaller = Self.transcriptRefreshDiagnosticCaller(
+                    incrementalAdmission.summary,
+                    preferEarliestChange: true
+                )
+                importDiagnosticOutcome = "incremental_\(incrementalImportOutcome)"
+                importDiagnosticReason = incrementalImportResult.rejection?.label
+                importDiagnosticFlags = incrementalAdmission.summary.map {
+                    DerivedTranscriptIncrementalNoAttemptDiagnosis.SummaryFlags($0).label
+                } ?? "runStateOnly"
+                importDiagnosticCaller = incrementalImportCaller.label
+                importDiagnosticMergedCount = incrementalImportCaller.mergedCount
+                importDiagnosticFinalTurnItemCount = incrementalImportResult.finalTurnItemCount
                 EditFlowPerf.end(
                     EditFlowPerf.Stage.Transcript.incrementalImport,
                     incrementalImportSignpost,
                     EditFlowPerf.Dimensions(
                         outcome: incrementalImportOutcome,
-                        sourceItemCount: workingItemsSnapshot.count
+                        sourceItemCount: workingItemsSnapshot.count,
+                        tabTag: diagnosticTabTag,
+                        finalTurnItemCount: incrementalImportResult.finalTurnItemCount,
+                        finalTurnStartIndex: incrementalImportShape.finalTurnStartIndex,
+                        earliestChangedIndex: earliestChangedIndex,
+                        suffixTurnCount: incrementalImportShape.suffixTurnCount,
+                        fallbackReason: incrementalImportResult.rejection?.label,
+                        mutationFlags: importDiagnosticFlags,
+                        callerLabel: incrementalImportCaller.label,
+                        mergedMutationCount: incrementalImportCaller.mergedCount
                     )
                 )
                 let incrementalImportDurationMS = max(0, (CFAbsoluteTimeGetCurrent() - incrementalImportStartedAt) * 1000)
@@ -11133,6 +11765,28 @@ final class AgentModeViewModel: ObservableObject {
         } else {
             #if DEBUG || EDIT_FLOW_PERF
                 performanceSnapshot.lastIncrementalImportDurationMS = nil
+                // Diagnostics only; never drives admission. Mirrors the source-summary admission;
+                // a missing summary also reports the sync delta, which shows refused run-state-only
+                // admissions as `syncDelta.run`.
+                let noAttemptDiagnosis = DerivedTranscriptIncrementalNoAttemptDiagnosis.diagnose(
+                    reason: reason,
+                    hasPendingQuestion: session.pendingAskUser != nil,
+                    summary: diagnosticMutationSummary
+                )
+                let noAttemptCaller = Self.transcriptRefreshDiagnosticCaller(
+                    diagnosticMutationSummary,
+                    preferEarliestChange: false
+                )
+                importDiagnosticReason = noAttemptDiagnosis?.primary.rawValue ?? "unclassified"
+                // A missing summary has no flags; report which sync inputs changed instead.
+                importDiagnosticFlags = noAttemptDiagnosis?.primary == .missingSummary
+                    ? AgentDerivedTranscriptSyncState.diagnosticDeltaLabel(
+                        from: session.derivedTranscriptSyncState,
+                        to: currentSyncState
+                    )
+                    : noAttemptDiagnosis?.summaryFlags.label
+                importDiagnosticCaller = noAttemptCaller.label
+                importDiagnosticMergedCount = noAttemptCaller.mergedCount
             #endif
             importedTranscript = AgentTranscriptIO.rebuiltTranscriptPreservingCompactedPrefix(
                 existingTranscript: existingTranscript,
@@ -11163,11 +11817,29 @@ final class AgentModeViewModel: ObservableObject {
                 )
             }
         #endif
-        EditFlowPerf.end(
-            EditFlowPerf.Stage.Transcript.importTranscript,
-            importSignpost,
-            EditFlowPerf.Dimensions(status: reason.rawValue, sourceItemCount: workingItemsSnapshot.count)
-        )
+        #if DEBUG || EDIT_FLOW_PERF
+            EditFlowPerf.end(
+                EditFlowPerf.Stage.Transcript.importTranscript,
+                importSignpost,
+                EditFlowPerf.Dimensions(
+                    status: reason.rawValue,
+                    outcome: importDiagnosticOutcome,
+                    sourceItemCount: workingItemsSnapshot.count,
+                    tabTag: diagnosticTabTag,
+                    finalTurnItemCount: importDiagnosticFinalTurnItemCount,
+                    fallbackReason: importDiagnosticReason,
+                    mutationFlags: importDiagnosticFlags,
+                    callerLabel: importDiagnosticCaller,
+                    mergedMutationCount: importDiagnosticMergedCount
+                )
+            )
+        #else
+            EditFlowPerf.end(
+                EditFlowPerf.Stage.Transcript.importTranscript,
+                importSignpost,
+                EditFlowPerf.Dimensions(status: reason.rawValue, sourceItemCount: workingItemsSnapshot.count)
+            )
+        #endif
         #if DEBUG || EDIT_FLOW_PERF
             let importDurationMS = max(0, (CFAbsoluteTimeGetCurrent() - importStartedAt) * 1000)
             performanceSnapshot.lastImportDurationMS = importDurationMS
@@ -11188,14 +11860,16 @@ final class AgentModeViewModel: ObservableObject {
             precomputedEphemeralPayloadRevisionByItemID: session.ephemeralToolResultPayloadRevisionByItemID,
             selectedAgent: session.selectedAgent,
             previousPerformanceSnapshot: previousPerformanceSnapshotForBuild,
-            previousSanitizedTranscript: existingTranscript,
-            previousBaseProjection: session.baseTranscriptProjection,
-            previousTurnProjectionCaches: session.turnProjectionCaches,
+            previousSanitizedTranscript: forcesColdDerivation ? nil : existingTranscript,
+            previousRawInputEvidence: forcesColdDerivation ? nil : session.rawInputSanitizeEvidence,
+            previousBaseProjection: forcesColdDerivation ? nil : session.baseTranscriptProjection,
+            previousTurnProjectionCaches: forcesColdDerivation ? [:] : session.turnProjectionCaches,
             previousProjectionProtection: session.transcriptProjectionProtection,
             projectionProtection: projectionProtection,
             isCompressedHistoryRevealed: session.isCompressedHistoryRevealed,
             isColdLoad: reason == .coldLoad,
-            trustedIncrementalFinalTurnStartSequenceIndex: trustedIncrementalFinalTurnStartSequenceIndex
+            trustedIncrementalFinalTurnStartSequenceIndex: trustedIncrementalFinalTurnStartSequenceIndex,
+            diagnosticTabTag: diagnosticTabTag
         )
         applyBuiltTranscriptPresentation(
             builtPresentation,
@@ -11407,12 +12081,16 @@ final class AgentModeViewModel: ObservableObject {
         session.derivedTranscriptRefreshGeneration &+= 1
         session.derivedTranscriptRefreshTask?.cancel()
         session.derivedTranscriptRefreshTask = nil
+        session.derivedTranscriptRefreshDeferredGeneration = nil
         let scheduledReason = session.pendingDerivedTranscriptRefreshReason ?? reason
         session.pendingDerivedTranscriptRefreshReason = nil
         refreshDerivedTranscriptState(
             for: session,
             reason: scheduledReason,
-            publishActivePresentation: publishActivePresentation
+            publishActivePresentation: publishActivePresentation,
+            // Defensive: `projectionLooksStale` implies an equal sync state, which already rules
+            // out run-state-only admission; integrity repair must still never take it.
+            permitsRunStateOnlyAdmission: !projectionLooksStale
         )
         return true
     }
@@ -11452,11 +12130,20 @@ final class AgentModeViewModel: ObservableObject {
         if session.transcriptProjectionCounts != expectedCounts {
             return true
         }
-        let visibleRowCount = session.transcriptProjection.archivedRows.count
-            + session.transcriptProjection.workingRows.count
-        let workingRowCount = session.workingTranscriptProjection.workingRows.count
-        let presentedRowCount = max(visibleRowCount, workingRowCount)
-        return presentedRowCount < expectedCounts.defaultPresentedRowCount
+        // Validate the unwindowed backing projections in presented-item units, never the
+        // tail-windowed or history-visibility materialization. Grouped-history and
+        // collapsed-history-range cards require no rows; activity clusters require their rows.
+        let workingOnlyCounts = AgentTranscriptProjectionCounts(
+            canonicalVisibleRowCount: expectedCounts.defaultPresentedRowCount,
+            defaultPresentedRowCount: expectedCounts.defaultPresentedRowCount
+        )
+        guard AgentTranscriptProjectionBuilder.projectionCounts(for: session.fullTranscriptProjection) == expectedCounts,
+              AgentTranscriptProjectionBuilder.projectionCounts(for: session.workingTranscriptProjection) == workingOnlyCounts
+        else {
+            return true
+        }
+        return !AgentTranscriptProjectionBuilder.hasConsistentBackingRows(for: session.fullTranscriptProjection)
+            || !AgentTranscriptProjectionBuilder.hasConsistentBackingRows(for: session.workingTranscriptProjection)
     }
 
     private nonisolated static func persistableSnapshot(
@@ -11535,8 +12222,58 @@ final class AgentModeViewModel: ObservableObject {
             analyticsSnapshot: session.transcriptAnalyticsSnapshot,
             sanitizedActivityCount: 0,
             performanceSnapshot: session.transcriptPerformanceSnapshot,
-            rawToolResultPayloadRenderRevisionByItemID: session.rawToolResultPayloadRenderRevisionByItemID
+            rawToolResultPayloadRenderRevisionByItemID: session.rawToolResultPayloadRenderRevisionByItemID,
+            rawInputSanitizeEvidence: session.rawInputSanitizeEvidence
         )
+    }
+
+    #if DEBUG || EDIT_FLOW_PERF
+        /// Coarse, content-free tab tag for stage dimensions (UUID prefix).
+        nonisolated static func transcriptDiagnosticTabTag(_ tabID: UUID) -> String {
+            String(tabID.uuidString.prefix(8))
+        }
+
+        /// Final-turn start index and suffix turn count carried by the importer diagnostics.
+        nonisolated static func incrementalImportDiagnosticShape(
+            _ result: AgentTranscriptIncrementalImportResult
+        ) -> (finalTurnStartIndex: Int?, suffixTurnCount: Int?) {
+            switch result {
+            case let .updated(_, finalTurnStartIndex, _):
+                (finalTurnStartIndex, 1)
+            case let .rejected(.changeBeforeFinalTurn(_, finalTurnStartIndex, _)):
+                (finalTurnStartIndex, nil)
+            case let .rejected(.suffixTurnCountMismatch(suffixTurnCount, finalTurnStartIndex, _)):
+                (finalTurnStartIndex, suffixTurnCount)
+            case let .rejected(.requestIDMismatch(finalTurnStartIndex, _)):
+                (finalTurnStartIndex, 1)
+            case .rejected:
+                (nil, nil)
+            }
+        }
+
+        /// DEBUG static caller attribution from a pending summary; nil outside DEBUG.
+        /// `preferEarliestChange` selects the caller that set the earliest changed index
+        /// (attempt rejected before the final turn); otherwise the first rejecting caller.
+        nonisolated static func transcriptRefreshDiagnosticCaller(
+            _ summary: AgentPendingSourceItemsMutationSummary?,
+            preferEarliestChange: Bool
+        ) -> (label: String?, mergedCount: Int?) {
+            #if DEBUG
+                guard let attribution = summary?.debugAttribution else { return (nil, nil) }
+                let caller = preferEarliestChange
+                    ? attribution.earliestChangeCaller
+                    : attribution.firstRejectingCaller ?? attribution.firstCaller
+                return (caller.label, attribution.mergedMutationCount)
+            #else
+                return (nil, nil)
+            #endif
+        }
+    #endif
+
+    /// Diagnostics only: source items from the importer's final-turn start to the end;
+    /// nil when there is no final-turn start.
+    nonisolated static func transcriptDiagnosticFinalTurnItemCount(_ sourceItems: [AgentChatItem]) -> Int? {
+        AgentTranscriptPresentationBuilder.transcriptDiagnosticFinalTurnItemCount(sourceItems)
     }
 
     nonisolated static func buildTranscriptPresentation(
@@ -11547,13 +12284,15 @@ final class AgentModeViewModel: ObservableObject {
         selectedAgent: AgentProviderKind,
         previousPerformanceSnapshot: AgentTranscriptPerformanceSnapshot,
         previousSanitizedTranscript: AgentTranscript? = nil,
+        previousRawInputEvidence: AgentSanitizeRawInputEvidence? = nil,
         previousBaseProjection: AgentTranscriptProjection? = nil,
         previousTurnProjectionCaches: [UUID: AgentTranscriptTurnProjectionCache] = [:],
         previousProjectionProtection: AgentTranscriptProjectionProtection = .none,
         projectionProtection: AgentTranscriptProjectionProtection = .none,
         isCompressedHistoryRevealed: Bool = false,
         isColdLoad: Bool = false,
-        trustedIncrementalFinalTurnStartSequenceIndex: Int? = nil
+        trustedIncrementalFinalTurnStartSequenceIndex: Int? = nil,
+        diagnosticTabTag: String? = nil
     ) -> AgentBuiltTranscriptPresentation {
         AgentTranscriptPresentationBuilder.buildTranscriptPresentation(
             from: transcript,
@@ -11563,13 +12302,15 @@ final class AgentModeViewModel: ObservableObject {
             selectedAgent: selectedAgent,
             previousPerformanceSnapshot: previousPerformanceSnapshot,
             previousSanitizedTranscript: previousSanitizedTranscript,
+            previousRawInputEvidence: previousRawInputEvidence,
             previousBaseProjection: previousBaseProjection,
             previousTurnProjectionCaches: previousTurnProjectionCaches,
             previousProjectionProtection: previousProjectionProtection,
             projectionProtection: projectionProtection,
             isCompressedHistoryRevealed: isCompressedHistoryRevealed,
             isColdLoad: isColdLoad,
-            trustedIncrementalFinalTurnStartSequenceIndex: trustedIncrementalFinalTurnStartSequenceIndex
+            trustedIncrementalFinalTurnStartSequenceIndex: trustedIncrementalFinalTurnStartSequenceIndex,
+            diagnosticTabTag: diagnosticTabTag
         )
     }
 
@@ -11689,6 +12430,7 @@ final class AgentModeViewModel: ObservableObject {
             session.compactSummaryOnlyToolResultsAndAlignEphemeralPayloadMap()
             return
         }
+        session.rawInputSanitizeEvidence = nil
         session.transcript = presentation.transcript
         session.baseTranscriptProjection = presentation.baseProjection
         session.fullTranscriptProjection = presentation.fullProjection
@@ -11710,6 +12452,7 @@ final class AgentModeViewModel: ObservableObject {
             for: session,
             projectionProtection: presentation.projectionProtection
         )
+        session.rawInputSanitizeEvidence = presentation.rawInputSanitizeEvidence
         Self.logCodexDebug(
             "[AgentModeVM][TranscriptOrder] applyStructured tab=\(session.tabID) turns=\(presentation.transcript.turns.count) workingRowTail=\(Self.transcriptRowDebugWindow(presentation.workingProjection.workingRows)) workingBlockTail=\(Self.transcriptBlockDebugWindow(presentation.workingProjection.workingBlocks))"
         )
@@ -11727,6 +12470,11 @@ final class AgentModeViewModel: ObservableObject {
             for: session,
             transcript: transcript
         )
+        #if DEBUG || EDIT_FLOW_PERF
+            let diagnosticTabTag: String? = Self.transcriptDiagnosticTabTag(session.tabID)
+        #else
+            let diagnosticTabTag: String? = nil
+        #endif
         let builtPresentation = Self.buildTranscriptPresentation(
             from: transcript,
             sourceItems: canonicalSourceItems,
@@ -11735,12 +12483,14 @@ final class AgentModeViewModel: ObservableObject {
             selectedAgent: session.selectedAgent,
             previousPerformanceSnapshot: session.transcriptPerformanceSnapshot,
             previousSanitizedTranscript: session.transcript,
+            previousRawInputEvidence: session.rawInputSanitizeEvidence,
             previousBaseProjection: session.baseTranscriptProjection,
             previousTurnProjectionCaches: session.turnProjectionCaches,
             previousProjectionProtection: session.transcriptProjectionProtection,
             projectionProtection: projectionProtection,
             isCompressedHistoryRevealed: session.isCompressedHistoryRevealed,
-            isColdLoad: isColdLoad
+            isColdLoad: isColdLoad,
+            diagnosticTabTag: diagnosticTabTag
         )
         applyBuiltTranscriptPresentation(
             builtPresentation,
@@ -12966,7 +13716,10 @@ final class AgentModeViewModel: ObservableObject {
         promptMutation: @MainActor () -> Bool,
         promptCleanup: @MainActor @escaping (@escaping @MainActor () -> Bool) async -> Void
     ) -> Bool {
-        guard let operation = composeTabRemovalOperations[operationID],
+        // Once window close begins, nothing new commits: the close drains only cleanup tasks
+        // that already exist, so a later commit could outlive it.
+        guard !hasPreparedForWindowClose,
+              let operation = composeTabRemovalOperations[operationID],
               operation.phase == .prepared,
               removalOperationContextIsCurrent(operation),
               removalTargetSetIsCurrent(operation),
@@ -13594,6 +14347,13 @@ final class AgentModeViewModel: ObservableObject {
                     ?? AgentTranscriptIO.lastUserInteractionDate(in: workingItemsSnapshot)
             )
         } else {
+            #if DEBUG
+                // Captured before the fallback: labels the sync-state inputs that differ from the stamp.
+                let syncDeltaLabel = AgentDerivedTranscriptSyncState.diagnosticDeltaLabel(
+                    from: session.derivedTranscriptSyncState,
+                    to: makeDerivedTranscriptSyncState(for: session, projectionProtection: projectionProtection)
+                )
+            #endif
             builtPresentation = nil
             persistableSnapshot = persistableTranscriptSnapshot(
                 for: session,
@@ -13609,7 +14369,8 @@ final class AgentModeViewModel: ObservableObject {
                     tabID: tabID,
                     fields: [
                         "currentTabID": AgentModePerfDiagnostics.shortID(currentTabID),
-                        "sourceItemsRevision": String(session.sourceItemsRevision)
+                        "sourceItemsRevision": String(session.sourceItemsRevision),
+                        "syncDelta": syncDeltaLabel
                     ]
                 )
             #endif
@@ -16023,10 +16784,15 @@ final class AgentModeViewModel: ObservableObject {
                     return
                 }
                 let queued = session.pendingACPSteeringInstructions.remove(at: queuedIndex)
+                // Attention notifications only: a completion deferred behind this queued steering is
+                // re-evaluated once this handoff settled (after the direct start returned).
+                defer { attentionCompletionProgress(for: session) }
                 if session.runState.isActive {
                     session.pendingInstructions.insert(queued.providerText, at: 0)
                 } else if session.runState == .completed, session.acpController != nil {
+                    let afterStart = beginAttentionFollowUpObservation(for: session)
                     await startAgentRun(tabID: session.tabID, initialMessage: queued.providerText)
+                    afterStart()
                 } else {
                     // ACP steering should never bounce back into the composer. If the
                     // active-steering queue was rejected before the run service could take it,
@@ -17335,6 +18101,15 @@ final class AgentModeViewModel: ObservableObject {
                 hasPendingHandoff: hasPendingHandoff
             )
         }
+
+        func test_buildHeadlessAgentMessage(session: AgentTabSession, initialMessage: String) -> AgentMessage {
+            buildHeadlessAgentMessage(
+                session: session,
+                initialMessageForRun: initialMessage,
+                runID: UUID(),
+                attachments: []
+            )
+        }
     #endif
 
     private func buildHeadlessAgentMessage(
@@ -17358,7 +18133,9 @@ final class AgentModeViewModel: ObservableObject {
             fullMessage = initialMessageForRun
             resumeSessionID = continuity.resumeSessionID
         } else {
-            // Non-resumable agents: include conversation history in prompt.
+            // Non-resumable agents: include conversation history in prompt. Runs after the run
+            // lease is acquired; settle background-deferred derived state before reading it.
+            flushDeferredDerivedTranscriptRefresh(for: session)
             let conversationHistory = buildConversationHistory(for: session)
             fullMessage = conversationHistory.isEmpty
                 ? initialMessageForRun
@@ -17580,6 +18357,14 @@ final class AgentModeViewModel: ObservableObject {
             await handleStreamResult(result, session: session, runID: runID, runAttemptID: runAttemptID)
         }
 
+        func test_handleBackgroundNativeStreamResult(
+            _ result: AIStreamResult,
+            sourceID: UUID? = nil,
+            session: AgentTabSession
+        ) async {
+            await handleBackgroundNativeStreamResult(result, sourceID: sourceID, session: session)
+        }
+
         static func test_claudeReasoningStatusPreview(from rawBuffer: String) -> String? {
             claudeReasoningStatusPreview(from: rawBuffer)
         }
@@ -17605,21 +18390,87 @@ final class AgentModeViewModel: ObservableObject {
             )
             return
         }
+        await applyStreamResult(
+            result,
+            session: session,
+            delivery: .activeRun(runID: runID, runAttemptID: runAttemptID)
+        )
+    }
+
+    /// Applies native-runtime output that arrived while no run is consuming (for example a Claude
+    /// continuation after a background task finished). Transcript rows are appended and saved as
+    /// they arrive. Run state, running-status and reasoning-status text, and per-turn usage
+    /// finalization are untouched because no run owns them; a newer run may be active.
+    /// `sourceID` identifies the event stream (provider launch) that carried the result: a background
+    /// message is only ever continued by output from its own stream.
+    func handleBackgroundNativeStreamResult(_ result: AIStreamResult, sourceID: UUID?, session: AgentTabSession) async {
+        await applyStreamResult(result, session: session, delivery: .background(sourceID: sourceID))
+    }
+
+    private enum StreamResultDelivery: Equatable {
+        case activeRun(runID: UUID, runAttemptID: UUID)
+        case background(sourceID: UUID?)
+    }
+
+    private func applyStreamResult(
+        _ result: AIStreamResult,
+        session: AgentTabSession,
+        delivery: StreamResultDelivery
+    ) async {
         await MainActor.run {
-            guard session.runID == runID,
-                  session.activeRunAttemptID == runAttemptID else { return }
+            switch delivery {
+            case let .activeRun(runID, runAttemptID):
+                guard session.runID == runID,
+                      session.activeRunAttemptID == runAttemptID else { return }
+            case .background:
+                guard session.selectedAgent.usesClaudeNativeRuntime else { return }
+            }
+            let isBackground: Bool
+            let backgroundSourceID: UUID?
+            if case let .background(sourceID) = delivery {
+                isBackground = true
+                backgroundSourceID = sourceID
+            } else {
+                isBackground = false
+                backgroundSourceID = nil
+            }
+            if isBackground {
+                // Buffered text belongs to a run: materialize it first, so every row appended
+                // from here on is this background delivery's own.
+                flushPendingAssistantDelta(session)
+            }
+            let lastRowIDBeforeDelivery = session.items.last?.id
+            defer {
+                if isBackground {
+                    recordBackgroundRows(
+                        appendedAfter: lastRowIDBeforeDelivery, sourceID: backgroundSourceID, session: session
+                    )
+                }
+            }
             var shouldUpdateBindings = false
             switch result.type {
             case "content":
                 // Normal content text
                 guard let content = result.text, !content.isEmpty else { break }
-                shouldUpdateBindings = clearClaudeReasoningStatus(session) || shouldUpdateBindings
-                enqueueAssistantDelta(content, session: session)
+                if isBackground {
+                    // Applied at once to the background message's own row, never through the
+                    // shared buffer, so it cannot merge with a run's text.
+                    shouldUpdateBindings = applyBackgroundAssistantDelta(
+                        content,
+                        sourceID: backgroundSourceID,
+                        session: session
+                    ) || shouldUpdateBindings
+                } else {
+                    shouldUpdateBindings = clearClaudeReasoningStatus(session) || shouldUpdateBindings
+                    enqueueAssistantDelta(content, session: session)
+                }
 
             case "final_content":
                 // Final authoritative message content for the turn.
                 guard let content = result.text else { break }
-                shouldUpdateBindings = clearClaudeReasoningStatus(session) || shouldUpdateBindings
+                if !isBackground {
+                    shouldUpdateBindings = clearClaudeReasoningStatus(session) || shouldUpdateBindings
+                }
                 // Materialize any pending content delta first so we preserve ordering.
                 flushPendingAssistantDelta(session)
                 guard AgentDisplayableText.hasDisplayableBody(content) else { break }
@@ -17629,10 +18480,22 @@ final class AgentModeViewModel: ObservableObject {
                 // interleaved, which can prematurely finalize the streaming segment.
                 // Walk past system items but stop at tool calls, user messages, etc.
                 let tailAssistantIndex: Int? = {
-                    if let streamingAssistantIndex = self.resumableStreamingAssistantIndexAcrossTrailingUserInterjections(in: session) {
+                    if isBackground {
+                        // Between runs any other row is an earlier turn's answer: only this
+                        // background message's current row (streaming, or ended by an interleaved
+                        // system row or a run's terminal finalization) is replaced.
+                        return self.backgroundCurrentAssistantIndex(in: session, sourceID: backgroundSourceID)
+                    }
+                    if let streamingAssistantIndex = self.resumableStreamingAssistantIndexAcrossTrailingUserInterjections(
+                        in: session
+                    ) {
                         return streamingAssistantIndex
                     }
                     for i in session.items.indices.reversed() {
+                        // Between-run rows are never this run's answer nor its boundary.
+                        if session.backgroundRowIDs.contains(session.items[i].id) {
+                            continue
+                        }
                         switch session.items[i].kind {
                         case .assistant:
                             return i
@@ -17650,14 +18513,26 @@ final class AgentModeViewModel: ObservableObject {
                     updated.text = content
                     updated.isStreaming = false
                     session.replaceItem(at: index, with: updated)
+                    // Notification-only provenance for a replaced row that predates this attempt.
+                    // Background output belongs to no attempt, so it records none.
+                    if case let .activeRun(_, runAttemptID) = delivery {
+                        session.recordAttentionFinalContentRewrite(
+                            attemptID: runAttemptID,
+                            rowID: updated.id,
+                            text: content
+                        )
+                    }
                 } else {
                     let assistantItem = AgentChatItem.assistant(content, sequenceIndex: session.nextSequenceIndex)
                     session.appendItem(assistantItem)
                 }
+                if isBackground {
+                    retireBackgroundCurrentAssistantRow(session, sourceID: backgroundSourceID)
+                }
                 shouldUpdateBindings = true
 
             case "reasoning":
-                guard ClaudeReasoningExtractionFeature.isEnabled else { break }
+                guard ClaudeReasoningExtractionFeature.isEnabled, !isBackground else { break }
                 // Claude provider-internal reasoning/thinking traces update only the
                 // transient running-status row. They are intentionally never added to
                 // the persisted chat transcript.
@@ -17677,7 +18552,7 @@ final class AgentModeViewModel: ObservableObject {
                 guard let toolName = result.toolName else { break }
                 let argsJSON = result.toolArgsJSON ?? result.toolArgs
                 flushPendingAssistantDelta(session)
-                endActiveAssistantSegment(session)
+                endAssistantSegment(session, background: isBackground, sourceID: backgroundSourceID)
                 endActiveReasoningSegment(session)
                 // Route provider-specific tool events through dedicated handlers.
                 if runService.handleProviderToolStreamEvent(result, session: session) {
@@ -17722,7 +18597,7 @@ final class AgentModeViewModel: ObservableObject {
                 let outputJSON = result.toolResultJSON ?? result.toolOutput ?? ""
                 let argsJSON = result.toolArgsJSON ?? result.toolArgs
                 flushPendingAssistantDelta(session)
-                endActiveAssistantSegment(session)
+                endAssistantSegment(session, background: isBackground, sourceID: backgroundSourceID)
                 endActiveReasoningSegment(session)
                 // Route provider-specific tool events through dedicated handlers.
                 if runService.handleProviderToolStreamEvent(result, session: session) {
@@ -17748,7 +18623,12 @@ final class AgentModeViewModel: ObservableObject {
                     updated.toolIsError = result.toolIsError
                     updated.text = outputJSON
                     session.replaceItem(at: index, with: updated)
-                } else if let index = session.items.lastIndex(where: { $0.kind == .toolCall && $0.toolName == toolName }) {
+                } else if let index = session.items.lastIndex(where: {
+                    // A name-only match stays within the same delivery's tool calls (for background
+                    // output, the same stream's).
+                    $0.kind == .toolCall && $0.toolName == toolName
+                        && session.isDeliveryRow($0.id, background: isBackground, sourceID: backgroundSourceID)
+                }) {
                     var updated = session.items[index]
                     updated.kind = .toolResult
                     updated.toolInvocationID = invocationID ?? updated.toolInvocationID
@@ -17780,7 +18660,7 @@ final class AgentModeViewModel: ObservableObject {
                 // Legacy tool usage event (e.g., "Using tool: read_file") - fallback for compatibility
                 if let eventText = result.text, eventText.hasPrefix("Using tool: ") {
                     flushPendingAssistantDelta(session)
-                    endActiveAssistantSegment(session)
+                    endAssistantSegment(session, background: isBackground, sourceID: backgroundSourceID)
                     endActiveReasoningSegment(session)
                     let toolName = String(eventText.dropFirst("Using tool: ".count))
                     if AgentToolTrackingSupport.shouldSuppressProviderToolEvent(toolName: toolName, invocationID: nil) {
@@ -17793,12 +18673,14 @@ final class AgentModeViewModel: ObservableObject {
                 }
 
             case "tool_progress":
+                guard !isBackground else { break }
                 if let progress = result.text?.trimmingCharacters(in: .whitespacesAndNewlines), !progress.isEmpty {
                     shouldUpdateBindings = setTransportRunningStatus(progress, session: session) || shouldUpdateBindings
                 }
 
             case "status":
                 nonCodexContextUsageEstimator(for: session.selectedAgent)?.ingestStatusSignal(result.text, session: session)
+                guard !isBackground else { break }
                 let statusText = session.selectedAgent.usesClaudeNativeRuntime
                     ? Self.claudeDisplayableStatusText(result.text)
                     : result.text?.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -17828,7 +18710,9 @@ final class AgentModeViewModel: ObservableObject {
 
             case "auth_status":
                 if let status = result.text?.trimmingCharacters(in: .whitespacesAndNewlines), !status.isEmpty {
-                    shouldUpdateBindings = setTransportRunningStatus(status, session: session, allowOverrideReasoning: true) || shouldUpdateBindings
+                    if !isBackground {
+                        shouldUpdateBindings = setTransportRunningStatus(status, session: session, allowOverrideReasoning: true) || shouldUpdateBindings
+                    }
                     let systemItem = AgentChatItem.system(status, sequenceIndex: session.nextSequenceIndex)
                     session.appendItem(systemItem)
                     shouldUpdateBindings = true
@@ -17836,6 +18720,7 @@ final class AgentModeViewModel: ObservableObject {
 
             case "session_state_changed":
                 // Claude Code lifecycle event — update run-state UI only, no transcript rows.
+                guard !isBackground else { break }
                 let state = result.text?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
                 switch state {
                 case "idle":
@@ -17857,6 +18742,7 @@ final class AgentModeViewModel: ObservableObject {
             case "task_progress":
                 // Claude Code task progress — update running status text, no transcript rows.
                 // Do not displace a visible Claude reasoning preview.
+                guard !isBackground else { break }
                 if let progressText = result.text?.trimmingCharacters(in: .whitespacesAndNewlines),
                    !progressText.isEmpty
                 {
@@ -17869,7 +18755,13 @@ final class AgentModeViewModel: ObservableObject {
                 if let text = result.text, !text.isEmpty {
                     nonCodexContextUsageEstimator(for: session.selectedAgent)?.ingestSystemSignal(text, session: session)
                     flushPendingAssistantDelta(session)
-                    endActiveAssistantSegment(session)
+                    // A system row interrupts a background message without ending it: its further
+                    // text and final content still go to its current row.
+                    let backgroundCurrentRowID = session.backgroundCurrentAssistantRowIDs[backgroundSourceID]
+                    endAssistantSegment(session, background: isBackground, sourceID: backgroundSourceID)
+                    if isBackground, let backgroundCurrentRowID {
+                        session.backgroundCurrentAssistantRowIDs[backgroundSourceID] = backgroundCurrentRowID
+                    }
                     // Filter out agent lifecycle messages that shouldn't appear in chat
                     let skipMessages = ["Agent initialized", "Agent completed", "Agent cancelled"]
                     guard !skipMessages.contains(text) else { break }
@@ -17883,22 +18775,27 @@ final class AgentModeViewModel: ObservableObject {
                 // finalization clears run state.
                 if let text = result.text, !text.isEmpty {
                     flushPendingAssistantDelta(session)
-                    endActiveAssistantSegment(session)
+                    endAssistantSegment(session, background: isBackground, sourceID: backgroundSourceID)
                     let errorItem = AgentChatItem.error(text, sequenceIndex: session.nextSequenceIndex)
                     session.appendItem(errorItem)
                     shouldUpdateBindings = true
                 }
 
             case "message_stop":
-                shouldUpdateBindings = clearClaudeReasoningStatus(session) || shouldUpdateBindings
-                shouldUpdateBindings = session.setRunningStatus(nil, source: nil) || shouldUpdateBindings
+                // Background output may arrive while a newer run shows its own status.
+                if !isBackground {
+                    shouldUpdateBindings = clearClaudeReasoningStatus(session) || shouldUpdateBindings
+                    shouldUpdateBindings = session.setRunningStatus(nil, source: nil) || shouldUpdateBindings
+                }
                 flushPendingAssistantDelta(session)
-                endActiveAssistantSegment(session)
+                endAssistantSegment(session, background: isBackground, sourceID: backgroundSourceID)
                 // Stream completed - assistant streaming segments already finalized above.
 
-                // Store provider session ID for resumption (native Claude or ACP runtimes).
+                // Store provider session ID for resumption (native Claude or ACP runtimes). Between
+                // runs only the tab's current event stream does: a replaced one may still drain.
                 if let sessionID = result.providerSessionID,
-                   session.selectedAgent.usesClaudeNativeRuntime || session.selectedAgent.acpProviderID != nil
+                   session.selectedAgent.usesClaudeNativeRuntime || session.selectedAgent.acpProviderID != nil,
+                   !isBackground || session.claudeAuthoritativeEventSourceID == backgroundSourceID
                 {
                     session.providerSessionID = sessionID
                     session.isDirty = true
@@ -17912,12 +18809,16 @@ final class AgentModeViewModel: ObservableObject {
                         modelContextWindow: result.modelContextWindow,
                         session: session
                     )
-                    finalizeNonCodexTurnUsageIfNeeded(
-                        for: session,
-                        promptTokens: result.promptTokens,
-                        completionTokens: result.completionTokens,
-                        contextUsedTokens: result.contextUsedTokens
-                    )
+                    // Between runs there is no user turn to finalize; a later run's own
+                    // accounting must not be closed by background output.
+                    if !isBackground {
+                        finalizeNonCodexTurnUsageIfNeeded(
+                            for: session,
+                            promptTokens: result.promptTokens,
+                            completionTokens: result.completionTokens,
+                            contextUsedTokens: result.contextUsedTokens
+                        )
+                    }
                 }
                 shouldUpdateBindings = true
 
@@ -17932,6 +18833,10 @@ final class AgentModeViewModel: ObservableObject {
 
             if shouldUpdateBindings {
                 requestUIRefresh(tabID: session.tabID)
+                if isBackground {
+                    // No terminal commit follows background output, so persist it now.
+                    scheduleSave(for: session.tabID)
+                }
             }
         }
     }
@@ -18057,17 +18962,98 @@ final class AgentModeViewModel: ObservableObject {
         }
     }
 
+    /// The run's streaming assistant row that further run text continues. Background (between-run)
+    /// rows of any kind are skipped: a run neither continues nor stops at them.
     private func resumableStreamingAssistantIndexAcrossTrailingUserInterjections(in session: AgentTabSession) -> Int? {
         for index in session.items.indices.reversed() {
             let item = session.items[index]
-            if item.kind == .assistant, item.isStreaming {
-                return index
+            if session.backgroundRowIDs.contains(item.id) {
+                continue
+            }
+            if item.kind == .assistant {
+                return item.isStreaming ? index : nil
             }
             guard item.kind == .user else {
                 return nil
             }
         }
         return nil
+    }
+
+    /// `sourceID`'s stream's current background row, whether or not it is still streaming, when
+    /// only that stream's system rows, other streams' rows and a run's rows other than a user row
+    /// follow it. A newer prompt retires it: a message whose end never reached the background path
+    /// (the process exited, or its end belonged to the next run) is never continued by later output.
+    private func backgroundCurrentAssistantIndex(in session: AgentTabSession, sourceID: UUID?) -> Int? {
+        guard let rowID = session.backgroundCurrentAssistantRowIDs[sourceID] else {
+            return nil
+        }
+        for index in session.items.indices.reversed() {
+            let item = session.items[index]
+            if item.kind == .user {
+                // Retired for good: a later transcript change that removes this prompt must not
+                // revive it.
+                session.backgroundCurrentAssistantRowIDs.removeValue(forKey: sourceID)
+                return nil
+            }
+            // A run's and another stream's rows are skipped; this stream's rows other than a system
+            // row end the search.
+            guard session.isBackgroundRow(item.id, from: sourceID) else { continue }
+            if item.id == rowID {
+                return index
+            }
+            guard item.kind == .system else { return nil }
+        }
+        return nil
+    }
+
+    /// Records the rows a background delivery appended after `anchorID` (the transcript's last row
+    /// before it applied; nil when the transcript was empty).
+    private func recordBackgroundRows(appendedAfter anchorID: UUID?, sourceID: UUID?, session: AgentTabSession) {
+        var appendedIDs: [UUID] = []
+        var foundAnchor = anchorID == nil
+        for item in session.items.reversed() {
+            if item.id == anchorID {
+                foundAnchor = true
+                break
+            }
+            appendedIDs.append(item.id)
+        }
+        // Without the anchor (the transcript was replaced meanwhile) nothing is attributed.
+        guard foundAnchor else { return }
+        session.backgroundRowIDs.formUnion(appendedIDs)
+        if let sourceID {
+            for id in appendedIDs {
+                session.backgroundRowSourceIDs[id] = sourceID
+            }
+        }
+    }
+
+    /// Applies background (between-run) assistant text to that message's own row: its current row
+    /// from the same stream (also when an interleaved system row or a run's terminal finalization
+    /// ended its streaming), or a new background row.
+    private func applyBackgroundAssistantDelta(_ delta: String, sourceID: UUID?, session: AgentTabSession) -> Bool {
+        // Buffered text belongs to a run; materialize it first so order and rows stay separate.
+        flushPendingAssistantDelta(session)
+        if let index = backgroundCurrentAssistantIndex(in: session, sourceID: sourceID) {
+            session.mutateItem(at: index) { item in
+                item.text += delta
+                item.isStreaming = true
+            }
+        } else {
+            guard AgentDisplayableText.hasDisplayableBody(delta) else { return false }
+            var assistantItem = AgentChatItem.assistant(delta, sequenceIndex: session.nextSequenceIndex)
+            assistantItem.isStreaming = true
+            session.appendItem(assistantItem)
+            session.backgroundCurrentAssistantRowIDs[sourceID] = assistantItem.id
+        }
+        session.assistantDeltaFlushGeneration &+= 1
+        requestAssistantPresentationRefresh(
+            session: session,
+            sourceItemsRevision: session.sourceItemsRevision,
+            flushGeneration: session.assistantDeltaFlushGeneration
+        )
+        return true
     }
 
     @discardableResult
@@ -18088,12 +19074,39 @@ final class AgentModeViewModel: ObservableObject {
         return true
     }
 
-    func endActiveAssistantSegment(_ session: AgentTabSession) {
-        session.mutateItemsBatch(touchActivity: false) { items in
-            for index in items.indices where items[index].kind == .assistant && items[index].isStreaming {
-                items[index].isStreaming = false
-            }
+    /// Retires `sourceID`'s stream's current background row; other streams keep theirs.
+    private func retireBackgroundCurrentAssistantRow(_ session: AgentTabSession, sourceID: UUID?) {
+        session.backgroundCurrentAssistantRowIDs.removeValue(forKey: sourceID)
+    }
+
+    /// A run took over `sourceID`'s stream: the background message it interrupted continues as the
+    /// run's output, so later between-run output of that stream starts a new message. Called in
+    /// stream order, after that stream's earlier between-run output was applied.
+    func endBackgroundMessage(fromSource sourceID: UUID, session: AgentTabSession) {
+        guard session.backgroundCurrentAssistantRowIDs[sourceID] != nil else { return }
+        endAssistantSegment(session, background: true, sourceID: sourceID)
+    }
+
+    /// Ends the streaming segments of one delivery only: background output never ends a run's
+    /// segment, a run's output never ends a background message's, and one stream's background
+    /// output never ends another stream's. A background segment end also retires that stream's
+    /// current row.
+    private func endAssistantSegment(_ session: AgentTabSession, background: Bool, sourceID: UUID? = nil) {
+        if background {
+            retireBackgroundCurrentAssistantRow(session, sourceID: sourceID)
         }
+        // No shortcut for an empty set: a background segment end then ends nothing.
+        let backgroundRowIDs = session.backgroundRowIDs
+        let backgroundRowSourceIDs = session.backgroundRowSourceIDs
+        // Ranged, non-structural: only `isStreaming` of the selected rows flips.
+        session.endStreamingAssistantRows { item in
+            let isBackgroundRow = backgroundRowIDs.contains(item.id)
+            return isBackgroundRow == background && (!isBackgroundRow || backgroundRowSourceIDs[item.id] == sourceID)
+        }
+    }
+
+    func endActiveAssistantSegment(_ session: AgentTabSession) {
+        session.endStreamingAssistantRows()
     }
 
     func applyReasoningDelta(_ delta: String, groupID: String?, session: AgentTabSession) {
@@ -18125,16 +19138,9 @@ final class AgentModeViewModel: ObservableObject {
     func endActiveReasoningSegment(_ session: AgentTabSession) {
         let activeIDs = Set(session.reasoningItemIDsByGroupID.values)
         let allIDs = session.activeReasoningItemID.map { activeIDs.union([$0]) } ?? activeIDs
-        session.mutateItemsBatch(touchActivity: false) { items in
-            for itemID in allIDs {
-                if let index = items.firstIndex(where: { $0.id == itemID }),
-                   items[index].kind == .thinking,
-                   items[index].isStreaming
-                {
-                    items[index].isStreaming = false
-                }
-            }
-        }
+        // Ranged, non-structural: only `isStreaming` of the active reasoning rows flips. Live item
+        // IDs are unique, so membership matches the former first-index-by-ID lookup.
+        session.endStreamingReasoningRows { allIDs.contains($0.id) }
         session.activeReasoningItemID = nil
         session.reasoningItemIDsByGroupID.removeAll()
     }
@@ -18732,13 +19738,16 @@ final class AgentModeViewModel: ObservableObject {
                 interactionID: interaction.id,
                 provenance: controllerProvenance
             )
-            guard !audience.pausesTimeout else { return }
-            schedulePendingAskUserTimeout(
-                for: session,
-                interactionID: interaction.id,
-                timeoutSeconds: interaction.timeoutSeconds,
-                startedAt: interaction.askedAt
-            )
+            if !audience.pausesTimeout {
+                schedulePendingAskUserTimeout(
+                    for: session,
+                    interactionID: interaction.id,
+                    timeoutSeconds: interaction.timeoutSeconds,
+                    startedAt: interaction.askedAt
+                )
+            }
+            // Attention notifications: capture only after routing and timeout scheduling.
+            captureAttentionQuestion(for: session, interactionID: interaction.id, audience: audience)
         }
     }
 
@@ -19305,7 +20314,7 @@ final class AgentModeViewModel: ObservableObject {
 
     /// Status-aware assistant preview: active runs only show text from the current turn,
     /// terminal runs show the logical trailing response from the latest turn.
-    private func mcpResolvedAssistantPreview(session: AgentTabSession, status: AgentRunMCPSnapshot.Status) -> String? {
+    func mcpResolvedAssistantPreview(session: AgentTabSession, status: AgentRunMCPSnapshot.Status) -> String? {
         switch status {
         case .expired:
             return nil
@@ -19442,6 +20451,8 @@ final class AgentModeViewModel: ObservableObject {
         session.pendingTaggedFileAttachments.removeAll()
         session.attachmentsPendingProviderConsumptionCleanup.removeAll()
         session.nextSequenceIndex = 0
+        session.attentionTextProvenance = nil
+        discardAttentionDeferredCompletion(for: session)
         session.lastActivityAt = Date()
         session.lastUserMessageAt = nil
         session.isDirty = true
@@ -19461,6 +20472,9 @@ final class AgentModeViewModel: ObservableObject {
         session.contextCompactedAt = nil
         session.activeReasoningItemID = nil
         session.reasoningItemIDsByGroupID.removeAll()
+        session.backgroundRowIDs.removeAll()
+        session.backgroundRowSourceIDs.removeAll()
+        session.backgroundCurrentAssistantRowIDs.removeAll()
         session.clearClaudeReasoningStatus(clearDisplayedStatus: true)
         session.setRunningStatus(nil, source: nil)
         session.codexReasoningSegmentsByKey.removeAll()
@@ -19894,44 +20908,46 @@ final class AgentModeViewModel: ObservableObject {
             return priorTabID
         }
         let shouldClosePriorPlaceholder = isUntouchedSessionPlaceholder(for: priorTabID)
+        let originatingWorkspaceID = persistenceWorkspace?.id
+        let originatingOwner = sessionIndexOwner
+        let selection = FreshSessionSelection(
+            agent: selectedAgent,
+            modelRaw: selectedModelRaw,
+            reasoningEffortRaw: selectedReasoningEffortRaw
+        )
+        var preparedSession: AgentTabSession?
 
-        await promptManager.createBlankComposeTab(createAgentSession: true)
-        guard let tabID = currentTabID,
-              let session = session(for: tabID, createIfNeeded: true)
+        // Only interactive creation may continue once an eligible inactive auto-stash has
+        // committed; its owned cleanup finishes independently. The fresh session is prepared
+        // before the new tab activates, so activation presents it directly.
+        guard let tabID = await promptManager.createFreshAgentComposeTab(
+            capacityCleanupWait: focusComposer
+                ? .deferEligibleInactiveAutoStashCleanup
+                : .awaitCompletion,
+            prepareBeforeActivation: { [weak self] tabID, agentSessionID in
+                guard let self,
+                      persistenceWorkspace?.id == originatingWorkspaceID,
+                      sessionIndexOwner == originatingOwner,
+                      let session = prepareFreshSessionForActivation(
+                          tabID: tabID,
+                          agentSessionID: agentSessionID,
+                          profile: requestedProfile,
+                          selection: selection,
+                          knowledgeAgents: knowledgeAgents
+                      )
+                else { return false }
+                preparedSession = session
+                return true
+            }
+        ),
+            let session = preparedSession,
+            session.tabID == tabID,
+            persistenceWorkspace?.id == originatingWorkspaceID,
+            sessionIndexOwner == originatingOwner,
+            currentTabID == tabID,
+            sessions[tabID] === session
         else { return nil }
-        guard session.adoptSessionProfile(requestedProfile) else {
-            await deleteSession(tabID: tabID)
-            return nil
-        }
 
-        if requestedProfile == .knowledge {
-            let knowledgeAgent = knowledgeAgents.contains(selectedAgent)
-                ? selectedAgent
-                : knowledgeAgents[0]
-            let knowledgeModel = knowledgeAgent == selectedAgent
-                && isModelRawValid(selectedModelRaw, for: knowledgeAgent)
-                ? selectedModelRaw
-                : defaultModelRaw(for: knowledgeAgent)
-            session.selectedAgent = knowledgeAgent
-            session.selectedModelRaw = knowledgeModel
-            session.selectedReasoningEffortRaw = knowledgeAgent == selectedAgent
-                ? selectedReasoningEffortRaw
-                : nil
-            codexCoordinator.normalizeCodexSelectionForSession(session, preservingExplicitEffort: true)
-
-            isRestoringState = true
-            selectedAgent = session.selectedAgent
-            selectedModelRaw = session.selectedModelRaw
-            selectedReasoningEffortRaw = session.selectedReasoningEffortRaw
-            isRestoringState = false
-        }
-
-        markSessionAsFreshlyCreated(session)
-        if applyWorkspaceDefaultRunLocationIfNeeded(to: session) {
-            session.isDirty = true
-            scheduleSave(for: tabID)
-        }
-        invalidateSidebarRestoreOrdering()
         updateBindingsFromSession(session)
         syncAllActiveUIState()
         if focusComposer {
@@ -20169,6 +21185,8 @@ final class AgentModeViewModel: ObservableObject {
         for session: AgentTabSession,
         upToItemID: UUID?
     ) -> AgentTranscript? {
+        // Settle a background-delayed refresh before reading the derived transcript.
+        flushDeferredDerivedTranscriptRefresh(for: session)
         let hasStructuredTranscript = !session.transcript.turns.isEmpty
 
         if let upToItemID {

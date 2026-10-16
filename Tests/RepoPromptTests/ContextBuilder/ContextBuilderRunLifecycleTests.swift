@@ -1,3 +1,4 @@
+import Combine
 import Darwin
 import Foundation
 import MCP
@@ -133,6 +134,199 @@ final class ContextBuilderRunLifecycleTests: XCTestCase {
             ),
             committed.selectionRevision
         )
+    }
+
+    func testBeforeSaveSkipsExactlyUnchangedContextBuilderTabConfigOnly() async throws {
+        let fixture = try await makeContextBuilderBeforeSaveFixture("Unchanged")
+        defer { tearDownContextBuilderBeforeSaveFixture(fixture) }
+        let manager = fixture.window.workspaceManager
+        let viewModel = fixture.window.contextBuilderAgentViewModel
+
+        // Explicit dirtying callers keep writing and dirtying the workspace.
+        let versionBeforeDirtyCaller = manager.debugStateVersionForWorkspace(fixture.workspaceID)
+        let promptIDs: Set<UUID> = [UUID(), UUID(), UUID()]
+        viewModel.selectedContextBuilderPromptIDs = promptIDs
+        XCTAssertGreaterThan(manager.debugStateVersionForWorkspace(fixture.workspaceID), versionBeforeDirtyCaller)
+        XCTAssertEqual(
+            try Set(XCTUnwrap(manager.composeTab(with: fixture.tabID)).contextBuilder.selectedContextBuilderPromptIDs),
+            promptIDs
+        )
+
+        // Converge the stored config and Prompt tabs, then flush the same config again.
+        _ = pollBeforeSaveWithCaptureSuspended(fixture)
+        let baseline = try XCTUnwrap(manager.composeTab(with: fixture.tabID)).contextBuilder
+        XCTAssertNotNil(baseline.autoGeneratePlan)
+        XCTAssertNotNil(baseline.followUpTypeRaw)
+        let dateBefore = manager.activeWorkspace?.dateModified
+        let versionBefore = manager.debugStateVersionForWorkspace(fixture.workspaceID)
+
+        let observation = pollBeforeSaveWithCaptureSuspended(fixture)
+
+        // Zero publications assumes the other registered beforeSave listeners are quiescent here;
+        // the dateModified/stateVersion assertions isolate this guard.
+        XCTAssertEqual(observation.composeTabPublications, 0)
+        XCTAssertEqual(observation.activeComposeTabPublications, 0)
+        XCTAssertEqual(observation.dateModified, dateBefore)
+        XCTAssertEqual(observation.stateVersion, versionBefore)
+        XCTAssertEqual(try XCTUnwrap(manager.composeTab(with: fixture.tabID)).contextBuilder, baseline)
+    }
+
+    func testBeforeSaveRewritesEachChangedContextBuilderFieldWithoutDirtyingWorkspace() async throws {
+        let fixture = try await makeContextBuilderBeforeSaveFixture("Changed")
+        defer { tearDownContextBuilderBeforeSaveFixture(fixture) }
+        let manager = fixture.window.workspaceManager
+        fixture.window.contextBuilderAgentViewModel.selectedContextBuilderPromptIDs = [UUID(), UUID(), UUID()]
+        _ = pollBeforeSaveWithCaptureSuspended(fixture)
+        let baseline = try XCTUnwrap(manager.composeTab(with: fixture.tabID)).contextBuilder
+        let explicitAutoGeneratePlan = try XCTUnwrap(baseline.autoGeneratePlan)
+        XCTAssertNotNil(baseline.followUpTypeRaw)
+        XCTAssertEqual(baseline.selectedContextBuilderPromptIDs.count, 3)
+
+        let staleConfigs: [(String, (inout ContextBuilderTabConfig) -> Void)] = [
+            ("instructions", { $0.instructions += " stale" }),
+            ("autoGeneratePlan nil", { $0.autoGeneratePlan = nil }),
+            ("autoGeneratePlan flipped", { $0.autoGeneratePlan = !explicitAutoGeneratePlan }),
+            ("followUpTypeRaw nil", { $0.followUpTypeRaw = nil }),
+            ("followUpTypeRaw changed", { $0.followUpTypeRaw = "stale-follow-up" }),
+            ("prompt ID order", { $0.selectedContextBuilderPromptIDs.reverse() })
+        ]
+        for (label, makeStale) in staleConfigs {
+            var staleTab = try XCTUnwrap(manager.composeTab(with: fixture.tabID))
+            makeStale(&staleTab.contextBuilder)
+            XCTAssertNotEqual(staleTab.contextBuilder, baseline, label)
+            XCTAssertTrue(manager.updateComposeTabStoredOnly(staleTab, inWorkspaceID: fixture.workspaceID), label)
+            let dateBefore = manager.activeWorkspace?.dateModified
+            let versionBefore = manager.debugStateVersionForWorkspace(fixture.workspaceID)
+
+            let observation = pollBeforeSaveWithCaptureSuspended(fixture)
+
+            XCTAssertEqual(try XCTUnwrap(manager.composeTab(with: fixture.tabID)).contextBuilder, baseline, label)
+            XCTAssertEqual(observation.stateVersion, versionBefore, label)
+            XCTAssertNotEqual(observation.dateModified, dateBefore, label)
+            XCTAssertGreaterThan(observation.composeTabPublications, 0, label)
+        }
+    }
+
+    /// Faithful production writer: an active-tab MCP commit whose live UI apply is skipped because
+    /// the canonical selection advanced stores the prompt only; its end-of-run save and the next
+    /// ordinary save must keep the committed prompt.
+    func testOrdinarySaveKeepsActiveTabPromptCommittedWithoutLiveApply() async throws {
+        let fixture = try await makeContextBuilderBeforeSaveFixture("CommittedPrompt")
+        defer { tearDownContextBuilderBeforeSaveFixture(fixture) }
+        let manager = fixture.window.workspaceManager
+        let identity = WorkspaceSelectionIdentity(workspaceID: fixture.workspaceID, tabID: fixture.tabID)
+        manager.pollAndSaveState() // Converge the Context Builder tab config first.
+        XCTAssertEqual(fixture.window.promptManager.promptText, "")
+
+        let connectionID = UUID()
+        let runID = UUID()
+        try fixture.window.mcpServer.bindTabForConnection(
+            connectionID: connectionID,
+            clientName: "context-builder-before-save-test",
+            tabID: fixture.tabID,
+            workspaceID: fixture.workspaceID,
+            windowID: fixture.window.windowID,
+            runID: runID
+        )
+        var advancedTab = try XCTUnwrap(manager.composeTab(for: identity))
+        advancedTab.selection = StoredSelection(
+            selectedPaths: [fixture.root.appendingPathComponent("Advanced.swift").path],
+            codemapAutoEnabled: false
+        )
+        XCTAssertTrue(manager.updateComposeTabStoredOnly(advancedTab, inWorkspaceID: fixture.workspaceID))
+
+        let result = await fixture.window.mcpServer.commitContextBuilderTabContext(
+            connectionID: connectionID,
+            expectedRunID: runID,
+            isStillCurrent: { true },
+            promptFallback: "Discovery response"
+        )
+        XCTAssertEqual(result.outcome, .committed)
+        XCTAssertEqual(try XCTUnwrap(manager.composeTab(for: identity)).selection, advancedTab.selection)
+        XCTAssertEqual(try XCTUnwrap(manager.composeTab(for: identity)).promptText, "Discovery response")
+
+        manager.pollAndSaveState()
+
+        XCTAssertEqual(try XCTUnwrap(manager.composeTab(for: identity)).promptText, "Discovery response")
+    }
+
+    private struct ContextBuilderBeforeSaveFixture {
+        let window: WindowState
+        let workspaceID: UUID
+        let tabID: UUID
+        let root: URL
+    }
+
+    private struct ContextBuilderBeforeSaveObservation {
+        let composeTabPublications: Int
+        let activeComposeTabPublications: Int
+        let dateModified: Date?
+        let stateVersion: Int
+    }
+
+    private func makeContextBuilderBeforeSaveFixture(_ label: String) async throws -> ContextBuilderBeforeSaveFixture {
+        let previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
+        GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
+        let window = WindowState()
+        GlobalSettingsStore.shared.setMCPAutoStart(previousAutoStart, commit: false)
+        WindowStatesManager.shared.registerWindowState(window)
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ContextBuilderBeforeSave\(label)-\(UUID().uuidString)")
+        var didSetUp = false
+        defer {
+            if !didSetUp {
+                WindowStatesManager.shared.unregisterWindowState(window)
+                try? FileManager.default.removeItem(at: root)
+            }
+        }
+        try await window.workspaceManager.awaitInitialized(timeout: .seconds(60))
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let workspace = window.workspaceManager.createWorkspace(
+            name: "Context Builder before-save \(label)",
+            repoPaths: [root.path],
+            ephemeral: true
+        )
+        await window.workspaceManager.switchWorkspace(
+            to: workspace,
+            saveState: false,
+            reason: "ContextBuilderRunLifecycleTests.beforeSave\(label)"
+        )
+        let workspaceID = try XCTUnwrap(window.workspaceManager.activeWorkspace?.id)
+        let tabID = try XCTUnwrap(window.workspaceManager.activeWorkspace?.activeComposeTabID)
+        window.contextBuilderAgentViewModel.refreshActiveSessionBindings()
+        XCTAssertEqual(window.contextBuilderAgentViewModel.currentTabID, tabID)
+        didSetUp = true
+        return ContextBuilderBeforeSaveFixture(window: window, workspaceID: workspaceID, tabID: tabID, root: root)
+    }
+
+    private func tearDownContextBuilderBeforeSaveFixture(_ fixture: ContextBuilderBeforeSaveFixture) {
+        WindowStatesManager.shared.unregisterWindowState(fixture.window)
+        try? FileManager.default.removeItem(at: fixture.root)
+    }
+
+    /// Runs the real save path with capture suspended, isolating the before-save listener writes.
+    private func pollBeforeSaveWithCaptureSuspended(
+        _ fixture: ContextBuilderBeforeSaveFixture
+    ) -> ContextBuilderBeforeSaveObservation {
+        let manager = fixture.window.workspaceManager
+        let prompt = fixture.window.promptManager
+        var composeTabPublications = 0
+        var activeComposeTabPublications = 0
+        let observers: [AnyCancellable] = [
+            prompt.$currentComposeTabs.dropFirst().sink { _ in composeTabPublications += 1 },
+            prompt.$activeComposeTabID.dropFirst().sink { _ in activeComposeTabPublications += 1 }
+        ]
+        manager.beginApplyingTabContext(forTabID: fixture.tabID)
+        manager.pollAndSaveState()
+        let observation = ContextBuilderBeforeSaveObservation(
+            composeTabPublications: composeTabPublications,
+            activeComposeTabPublications: activeComposeTabPublications,
+            dateModified: manager.activeWorkspace?.dateModified,
+            stateVersion: manager.debugStateVersionForWorkspace(fixture.workspaceID)
+        )
+        manager.endApplyingTabContext(forTabID: fixture.tabID)
+        observers.forEach { $0.cancel() }
+        return observation
     }
 
     func testSuccessfulCommitPrecedesChildTerminationAndCleanupWaitsForJoin() async {

@@ -34,10 +34,11 @@ final class SecureStorageAccountCatalogTests: XCTestCase {
                 "rp.agent.permissions.codex.v1",
                 "rp.agent.permissions.claude.v1",
                 "rp.agent.permissions.openCode.v1",
-                "rp.agent.permissions.cursor.v1"
+                "rp.agent.permissions.cursor.v1",
+                "TelegramAttention.botToken.v1"
             ]
         )
-        XCTAssertEqual(Set(SecureStorageAccountCatalog.allAccounts.map(\.identifier)).count, 24)
+        XCTAssertEqual(Set(SecureStorageAccountCatalog.allAccounts.map(\.identifier)).count, 25)
     }
 
     func testProviderMappingsUseCatalogAccounts() {

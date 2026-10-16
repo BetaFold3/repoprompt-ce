@@ -91,8 +91,10 @@ struct AgentModeSidebarSessionBuilder {
         }
         let tabNameByID = sidebarTabNameLookup(for: linkedTabs)
         let tabOrder = sidebarTabOrder(for: linkedTabs)
+        // Membership only: ordering continues to come from `linkedTabs` above.
+        let linkedTabIDs = Set(linkedTabs.map(\.id))
         let explicitSessionIDByTabID = authoritativeSessionIDByTabID.filter { tabID, _ in
-            linkedTabs.contains(where: { $0.id == tabID })
+            linkedTabIDs.contains(tabID)
         }
         let explicitTabIDBySessionID = Dictionary(
             explicitSessionIDByTabID.map { ($0.value, $0.key) },

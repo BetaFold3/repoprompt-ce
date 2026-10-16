@@ -216,7 +216,11 @@ package final class AgentModeRunService {
             AgentRunTerminalCommitRevision,
             AgentRunEpochTransitionKind?
         ) async -> AgentRunTerminalPublicationResult
-        let startFollowUpRun: (UUID, String) -> Void
+        /// Attention notifications only: observes that a generic follow-up start returned (whether it
+        /// started, refused, or failed). Synchronous, never throws, and claims nothing about the outcome.
+        package typealias FollowUpStartObservation = @MainActor () -> Void
+        /// Starts a follow-up run. A non-nil `afterStart` is invoked once, after the start returns.
+        let startFollowUpRun: (_ tabID: UUID, _ text: String, _ afterStart: FollowUpStartObservation?) -> Void
         /// Restore queued steering draft text back to the composer.
         let restoreDraftText: (_ tabID: UUID, _ text: String, _ message: String, _ strategy: DraftRestorationStrategy) -> Void
         /// Augment queued steering text with skill context, tagged files, and attachment rendering before submit.
@@ -243,6 +247,48 @@ package final class AgentModeRunService {
             _ stageID: UUID?,
             _ didSend: Bool
         ) -> Void = { _, _, _ in }
+        /// Attention notifications only (App/Notifications): reads the completed attempt and its
+        /// final assistant text at terminal commit. Never mutates run state; nil skips the event.
+        var captureAttentionTurnCompletion: (
+            _ session: AgentTabSession,
+            _ revision: AgentRunTerminalCommitRevision
+        ) -> AttentionNotificationCapture? = { _, _ in nil }
+        /// Attention notifications only: called once per accepted commit that produced a capture,
+        /// after successor selection settled. `providerSuccessorDeclined` is true only when the
+        /// selected provider successor declined after an accepted publication;
+        /// `genericFollowUpScheduled` is true only when this commit actually hands a queued follow-up
+        /// to `startFollowUpRun`. A returned observation is passed to that start. Must not await or
+        /// mutate run state.
+        var settleAttentionTurnCompletion: (
+            _ session: AgentTabSession,
+            _ revision: AgentRunTerminalCommitRevision,
+            _ capture: AttentionNotificationCapture,
+            _ providerSuccessorDeclined: Bool,
+            _ genericFollowUpScheduled: Bool
+        ) -> FollowUpStartObservation? = { _, _, _, _, _ in nil }
+        /// Attention notifications only: registers one ACP-steering follow-up start and returns the
+        /// observation passed to it. Must not await or mutate run state.
+        var beginAttentionFollowUpObservation: (
+            _ session: AgentTabSession
+        ) -> FollowUpStartObservation? = { _ in nil }
+        /// Attention notifications only: ACP steering handoff work progressed (a flush finished).
+        /// Must not await or mutate run state.
+        var attentionCompletionProgress: (_ session: AgentTabSession) -> Void = { _ in }
+        /// Native-runtime output received while no run is consuming (for example a Claude
+        /// continuation after a background task finished). Appends transcript rows immediately,
+        /// without run-attempt ownership and without mutating run state. `sourceID` identifies the
+        /// event stream (one provider launch) that carried the result.
+        var handleBackgroundNativeStreamResult: (
+            _ result: AIStreamResult,
+            _ sourceID: UUID,
+            _ session: AgentTabSession
+        ) async -> Void = { _, _, _ in }
+        /// A run took over the event stream `sourceID`: that stream's current background message
+        /// ends, so later between-run output of the stream starts a new message.
+        var endBackgroundNativeMessage: (
+            _ sourceID: UUID,
+            _ session: AgentTabSession
+        ) -> Void = { _, _ in }
 
         package init(
             estimateRuntimeTokens: @escaping (String) -> Int,
@@ -288,7 +334,7 @@ package final class AgentModeRunService {
                 AgentRunTerminalCommitRevision,
                 AgentRunEpochTransitionKind?
             ) async -> AgentRunTerminalPublicationResult,
-            startFollowUpRun: @escaping (UUID, String) -> Void,
+            startFollowUpRun: @escaping (_ tabID: UUID, _ text: String, _ afterStart: FollowUpStartObservation?) -> Void,
             restoreDraftText: @escaping (_ tabID: UUID, _ text: String, _ message: String, _ strategy: DraftRestorationStrategy) -> Void,
             augmentUserMessageForProviderSend: @escaping (
                 _ text: String,
@@ -304,7 +350,31 @@ package final class AgentModeRunService {
                 _ session: AgentTabSession,
                 _ stageID: UUID?,
                 _ didSend: Bool
-            ) -> Void = { _, _, _ in }
+            ) -> Void = { _, _, _ in },
+            captureAttentionTurnCompletion: @escaping (
+                _ session: AgentTabSession,
+                _ revision: AgentRunTerminalCommitRevision
+            ) -> AttentionNotificationCapture? = { _, _ in nil },
+            settleAttentionTurnCompletion: @escaping (
+                _ session: AgentTabSession,
+                _ revision: AgentRunTerminalCommitRevision,
+                _ capture: AttentionNotificationCapture,
+                _ providerSuccessorDeclined: Bool,
+                _ genericFollowUpScheduled: Bool
+            ) -> FollowUpStartObservation? = { _, _, _, _, _ in nil },
+            beginAttentionFollowUpObservation: @escaping (
+                _ session: AgentTabSession
+            ) -> FollowUpStartObservation? = { _ in nil },
+            attentionCompletionProgress: @escaping (_ session: AgentTabSession) -> Void = { _ in },
+            handleBackgroundNativeStreamResult: @escaping (
+                _ result: AIStreamResult,
+                _ sourceID: UUID,
+                _ session: AgentTabSession
+            ) async -> Void = { _, _, _ in },
+            endBackgroundNativeMessage: @escaping (
+                _ sourceID: UUID,
+                _ session: AgentTabSession
+            ) -> Void = { _, _ in }
         ) {
             self.estimateRuntimeTokens = estimateRuntimeTokens
             self.addUserInputTokensToActiveNonCodexTurn = addUserInputTokensToActiveNonCodexTurn
@@ -343,6 +413,12 @@ package final class AgentModeRunService {
             self.recordPendingHandoffSendOutcome = recordPendingHandoffSendOutcome
             self.signalMCPInstructionDelivered = signalMCPInstructionDelivered
             self.recordDelegatedQuestionNoticeSendOutcome = recordDelegatedQuestionNoticeSendOutcome
+            self.captureAttentionTurnCompletion = captureAttentionTurnCompletion
+            self.settleAttentionTurnCompletion = settleAttentionTurnCompletion
+            self.beginAttentionFollowUpObservation = beginAttentionFollowUpObservation
+            self.attentionCompletionProgress = attentionCompletionProgress
+            self.handleBackgroundNativeStreamResult = handleBackgroundNativeStreamResult
+            self.endBackgroundNativeMessage = endBackgroundNativeMessage
         }
     }
 
@@ -353,6 +429,10 @@ package final class AgentModeRunService {
     #if DEBUG
         func test_acpRunner() -> ACPIntegratedAgentModeRunner {
             acpRunner
+        }
+
+        package func test_terminalCommitBarrier() -> AgentRunTerminalCommitBarrier {
+            terminalCommitBarrier
         }
 
         package func test_attachmentFinalizationHook() -> (
@@ -787,6 +867,7 @@ package final class AgentModeRunService {
                         _ = await self.submitQueuedACPSteeringIfSupported(session: session)
                     }
                 }
+                hooks.attentionCompletionProgress(session)
             }
 
             while true {
@@ -1069,7 +1150,7 @@ package final class AgentModeRunService {
                 session.pendingInstructions.insert(contentsOf: providerTexts, at: 0)
             }
             session.mcpFollowUpRunPending = true
-            hooks.startFollowUpRun(tabID, first)
+            hooks.startFollowUpRun(tabID, first, hooks.beginAttentionFollowUpObservation(session))
             return
         }
         session.pendingInstructions.insert(contentsOf: providerTexts, at: 0)

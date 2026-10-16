@@ -34,6 +34,9 @@ package enum SecureStorageAccount: CaseIterable, Hashable, Identifiable {
     case agentPermissionOpenCodeDocument
     case agentPermissionCursorDocument
 
+    /// Telegram attention-notification bot token.
+    case telegramAttentionBotToken
+
     package var identifier: String {
         switch self {
         case .anthropicAPI:
@@ -99,6 +102,8 @@ package enum SecureStorageAccount: CaseIterable, Hashable, Identifiable {
                 40, 42, 116, 59, 61, 63, 52, 46, 116, 42, 63, 40, 55, 51, 41, 41,
                 51, 53, 52, 41, 116, 57, 47, 40, 41, 53, 40, 116, 44, 107
             ])
+        case .telegramAttentionBotToken:
+            "TelegramAttention.botToken.v1"
         }
     }
 
@@ -132,6 +137,7 @@ package enum SecureStorageAccount: CaseIterable, Hashable, Identifiable {
         case .agentPermissionClaudeDocument: "Claude permissions"
         case .agentPermissionOpenCodeDocument: "OpenCode permissions"
         case .agentPermissionCursorDocument: "Cursor permissions"
+        case .telegramAttentionBotToken: "Telegram notification bot token"
         }
     }
 

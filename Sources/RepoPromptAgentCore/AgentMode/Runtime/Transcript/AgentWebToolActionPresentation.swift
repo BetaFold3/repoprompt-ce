@@ -92,14 +92,24 @@ package enum AgentWebToolCanonicalNames {
 
     package static func canonicalToolCardName(_ raw: String?) -> String? {
         guard let raw else { return nil }
-        let names = normalizedNameCandidates(raw)
-        if names.contains(where: isWebSearchName) { return "search" }
-        if names.contains(where: isWebReadName) { return "web_read" }
+        // Each candidate gets the public predicates' normalization exactly once (a dotted suffix may
+        // still start with whitespace), then search precedence is checked across all candidates.
+        let names = normalizedNameCandidates(raw).map(normalizedName)
+        if names.contains(where: isNormalizedWebSearchName) { return "search" }
+        if names.contains(where: isNormalizedWebReadName) { return "web_read" }
         return nil
     }
 
     static func isWebSearchName(_ name: String) -> Bool {
-        switch normalizedName(name) {
+        isNormalizedWebSearchName(normalizedName(name))
+    }
+
+    static func isWebReadName(_ name: String) -> Bool {
+        isNormalizedWebReadName(normalizedName(name))
+    }
+
+    private static func isNormalizedWebSearchName(_ normalized: String) -> Bool {
+        switch normalized {
         case "search", "web_search", "web_search_request", "google_web_search", "search_web", "websearch":
             true
         default:
@@ -107,8 +117,8 @@ package enum AgentWebToolCanonicalNames {
         }
     }
 
-    static func isWebReadName(_ name: String) -> Bool {
-        switch normalizedName(name) {
+    private static func isNormalizedWebReadName(_ normalized: String) -> Bool {
+        switch normalized {
         case "webfetch", "web_fetch", "web_read", "read_web", "browser.open", "browser_open", "open_url",
              "read_url", "fetch_url", "web_page", "webpage", "read_web_page":
             true

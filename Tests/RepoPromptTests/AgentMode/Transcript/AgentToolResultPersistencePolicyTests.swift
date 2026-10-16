@@ -1120,11 +1120,384 @@ final class AgentToolResultPersistencePolicyTests: XCTestCase {
             XCTAssertEqual(checks.customResponse, "Smoke the canary \(answerToken)", label)
         }
 
+        // Stored metadata pairs with the stored transcript, which is the persisted-pipeline output of
+        // the saved transcript; a cold load leaves the canonical file unchanged; a trusted canonical
+        // item count overrides only the item count, never the stored projection counts.
+        let storedData = try Data(contentsOf: fileURL)
+        let stored = try JSONDecoder().decode(AgentSession.self, from: storedData)
+        let storedTranscript = try XCTUnwrap(stored.transcript)
+        let storedCounts = AgentTranscriptProjectionBuilder.projectionCounts(for: storedTranscript)
+        XCTAssertEqual(stored.transcriptProjectionCounts, storedCounts)
+        XCTAssertEqual(stored.itemCount, storedCounts.canonicalVisibleRowCount)
+        XCTAssertEqual(stored.lastUserMessageAt, AgentTranscriptIO.lastUserInteractionDate(in: storedTranscript))
+        _ = try await AgentSessionDataService().loadAgentSession(from: fileURL)
+        XCTAssertEqual(try Data(contentsOf: fileURL), storedData, "A cold load does not rewrite a canonical file")
+        let firstSaved = try JSONDecoder().decode(AgentSession.self, from: XCTUnwrap(onDisk.data(using: .utf8)))
+        XCTAssertEqual(firstSaved.transcript, session.transcript.map { AgentTranscriptIO.persistedTranscript($0) })
+
+        let trustedItemCount = storedCounts.canonicalVisibleRowCount + 7
+        _ = try await AgentSessionDataService().saveAgentSession(
+            resaved,
+            for: workspace,
+            trustedCanonicalItemCount: trustedItemCount
+        )
+        let overridden = try JSONDecoder().decode(AgentSession.self, from: Data(contentsOf: fileURL))
+        let overriddenTranscript = try XCTUnwrap(overridden.transcript)
+        XCTAssertEqual(overridden.itemCount, trustedItemCount)
+        XCTAssertEqual(overridden.transcriptProjectionCounts, AgentTranscriptProjectionBuilder.projectionCounts(for: overriddenTranscript))
+        XCTAssertNotEqual(overridden.transcriptProjectionCounts?.canonicalVisibleRowCount, trustedItemCount)
+
         // An already summarized legacy payload stays a summary; it is never re-labeled as complete.
         let legacyStub = #"{"status":"success","summary_only":true,"summary_text":"ask_user • success"}"#
         let legacy = try XCTUnwrap(persistedSummary(toolName: "ask_user", rawResultJSON: legacyStub, argsJSON: argsJSON))
         XCTAssertTrue(legacy.summaryOnly)
         XCTAssertEqual(try decodedObject(legacy.resultJSON)["summary_only"] as? Bool, true)
+    }
+
+    /// Cold hydration preparation over a real store: a stored pending `ask_user` call is accepted
+    /// as-is without pending-question UI, takes the excluded-policy rebuild (hiding the call) with
+    /// it, and an empty session with no transcript takes the missing-transcript build.
+    func testColdHydrationPreparationAcceptedRebuildAndMissingTranscriptBranches() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("AgentToolResultPersistencePolicyTests", isDirectory: true)
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let workspace = WorkspaceModel(name: "Cold Preparation", repoPaths: ["/tmp/repo"], customStoragePath: directory)
+        let service = AgentSessionDataService()
+        func prepare(_ session: AgentSession, pendingQuestionUI: Bool) async throws -> AgentSessionHydrationPayload {
+            let prepared = try await service.preparePersistedHydration(AgentSessionHydrationRequest(
+                workspace: workspace,
+                tabID: session.composeTabID ?? UUID(),
+                sessionID: session.id,
+                resolvedDisplayName: session.name,
+                hasPendingQuestionUI: pendingQuestionUI,
+                transcriptViewportState: .liveBottom,
+                isCompressedHistoryRevealed: false,
+                initialPerformanceSnapshot: .empty
+            ))
+            return try XCTUnwrap(prepared)
+        }
+
+        let invocationID = UUID()
+        var pending = AgentSession(id: UUID(), workspaceID: workspace.id, composeTabID: UUID(), name: "Pending question")
+            .withItems([
+                AgentChatItem(kind: .user, text: "Ask me.", sequenceIndex: 0),
+                .toolCall(name: "ask_user", invocationID: invocationID, argsJSON: #"{"questions":[{"id":"q","question":"Proceed?"}]}"#, sequenceIndex: 1)
+            ])
+        pending.lastRunState = AgentSessionRunState.waitingForQuestion.rawValue
+        let pendingFileURL = try await service.saveAgentSession(pending, for: workspace)
+        // The saved file of an open pending question pairs its metadata with the stored transcript.
+        let pendingStored = try JSONDecoder().decode(AgentSession.self, from: Data(contentsOf: pendingFileURL))
+        let pendingTranscript = try XCTUnwrap(pendingStored.transcript)
+        XCTAssertTrue(AgentTranscriptIO.workingSourceItems(from: pendingTranscript).contains {
+            $0.kind == .toolCall && $0.toolInvocationID == invocationID
+        }, "The open ask_user call is stored")
+        let pendingCounts = AgentTranscriptProjectionBuilder.projectionCounts(for: pendingTranscript)
+        XCTAssertGreaterThan(pendingCounts.canonicalVisibleRowCount, 0)
+        XCTAssertEqual(pendingStored.transcriptProjectionCounts, pendingCounts)
+        XCTAssertEqual(pendingStored.itemCount, pendingCounts.canonicalVisibleRowCount)
+
+        let accepted = try await prepare(pending, pendingQuestionUI: false)
+        XCTAssertTrue(accepted.canonicalLiveItems.contains { $0.kind == .toolCall && $0.toolInvocationID == invocationID })
+        XCTAssertEqual(accepted.canonicalLiveItems, AgentTranscriptIO.workingSourceItems(from: accepted.transcript))
+
+        let rebuilt = try await prepare(pending, pendingQuestionUI: true)
+        XCTAssertFalse(rebuilt.canonicalLiveItems.contains { $0.kind == .toolCall }, "The pending question call is hidden")
+        XCTAssertEqual(rebuilt.canonicalLiveItems.map(\.text), ["Ask me."])
+        XCTAssertEqual(rebuilt.canonicalLiveItems, AgentTranscriptIO.workingSourceItems(from: rebuilt.transcript))
+        XCTAssertTrue(rebuilt.needsReloadMigrationSave)
+
+        let empty = AgentSession(id: UUID(), workspaceID: workspace.id, composeTabID: UUID(), name: "Empty")
+        _ = try await service.saveAgentSession(empty, for: workspace)
+        let emptyPrepared = try await prepare(empty, pendingQuestionUI: false)
+        XCTAssertNil(emptyPrepared.persistedSession.transcript, "The stored session has no transcript")
+        XCTAssertTrue(emptyPrepared.transcript.turns.isEmpty)
+        XCTAssertTrue(emptyPrepared.canonicalLiveItems.isEmpty)
+    }
+
+    /// Same saved bytes, copied into a fresh store with a fresh service for every run: cold load and
+    /// hydration preparation give identical outputs whether runtime materialization derives its
+    /// initial visible tool results structurally or from the projection reference, and the
+    /// structural mode skips exactly one projection build per runtime materialization.
+    func testColdLoadStructuralInitialVisibilityMatchesProjectionReferenceForSameSavedBytes() async throws {
+        let buildCounter = ColdLoadProjectionBuildCounter()
+        AgentTranscriptDebugInstrumentation.reset()
+        AgentTranscriptDebugInstrumentation.isEnabled = true
+        AgentTranscriptDebugInstrumentation.projectionBuildHandler = { _ in buildCounter.increment() }
+        defer { AgentTranscriptDebugInstrumentation.reset() }
+
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("AgentToolResultPersistencePolicyTests", isDirectory: true)
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let workspaceID = UUID()
+        func workspace(_ directory: URL) -> WorkspaceModel {
+            WorkspaceModel(id: workspaceID, name: "Structural Visibility", repoPaths: ["/tmp/repo"], customStoragePath: directory)
+        }
+        let seedDirectory = root.appendingPathComponent("seed", isDirectory: true)
+        let seedService = AgentSessionDataService()
+
+        var fixtures: [(label: String, session: AgentSession, relativePath: String, pendingQuestionUI: [Bool])] = []
+        func addFixture(_ label: String, items: [AgentChatItem], runState: AgentSessionRunState? = nil, pendingQuestionUI: [Bool] = [false]) async throws {
+            var session = AgentSession(id: UUID(), workspaceID: workspaceID, composeTabID: UUID(), name: label).withItems(items)
+            session.lastRunState = runState?.rawValue
+            let fileURL = try await seedService.saveAgentSession(session, for: workspace(seedDirectory))
+            let relativePath = String(fileURL.standardizedFileURL.path.dropFirst(seedDirectory.standardizedFileURL.path.count))
+            fixtures.append((label, session, relativePath, pendingQuestionUI))
+        }
+        try await addFixture("single large turn", items: Self.largeSingleTurnItems())
+        let multiTurnItems = Self.multiTurnItems(turnCount: 40, toolsPerTurn: 10)
+        try await addFixture("multi-turn", items: multiTurnItems)
+        try await addFixture(
+            "pending ask_user",
+            items: multiTurnItems + [
+                .user("Ask me.", sequenceIndex: multiTurnItems.count),
+                .toolCall(name: "ask_user", invocationID: UUID(), argsJSON: #"{"questions":[{"id":"q","question":"Proceed?"}]}"#, sequenceIndex: multiTurnItems.count + 1)
+            ],
+            runState: .waitingForQuestion,
+            pendingQuestionUI: [false, true]
+        )
+
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        func encoded(_ session: AgentSession) throws -> Data {
+            var session = session
+            session.fileURL = nil
+            return try encoder.encode(session)
+        }
+        struct ColdLoadOutputs: Equatable {
+            let runtimeSession: Data
+            /// The file after load, decoded and re-encoded with sorted keys: raw rewrite bytes are
+            /// not byte-stable across identical runs (dictionary key order), independent of mode.
+            let canonicalFileAfterLoad: Data
+            /// Whether the file's bytes differ from the saved bytes after load. A rewrite of
+            /// identical bytes is indistinguishable, so this is content-change evidence only, not
+            /// proof of the rewrite decision or of a write occurring.
+            let persistedBytesChanged: Bool
+        }
+        struct HydrationOutputs: Equatable {
+            let persistedSession: Data
+            let canonicalLiveItems: [AgentChatItem]
+            let transcript: AgentTranscript
+            let presentationTranscript: AgentTranscript
+            let fullProjection: AgentTranscriptProjection
+            let projection: AgentTranscriptProjection
+            let projectionCounts: AgentTranscriptProjectionCounts
+            let sanitizedActivityCount: Int
+            let payloadRevisions: [UUID: Int]
+            /// The retained raw tool-result payloads the owner installs, rebuilt from the canonical
+            /// live items by the existing view-model authority.
+            let rawPayloadByItemID: [UUID: String]
+            let rawInputSanitizeEvidence: AgentSanitizeRawInputEvidence?
+            let normalizedRunState: AgentSessionRunState
+            let lastUserMessageAt: Date?
+            let needsReloadMigrationSave: Bool
+            /// Persistence-state components that are comparable across fresh services; the stamp's
+            /// service ID and file URL are per-run by construction.
+            let persistenceSessionID: UUID
+            let persistenceWorkspaceID: UUID
+            let deletionGeneration: UInt64
+            let transcriptResetGeneration: UInt64
+        }
+        var runIndex = 0
+        func freshStore() throws -> URL {
+            runIndex += 1
+            let directory = root.appendingPathComponent("run-\(runIndex)", isDirectory: true)
+            try FileManager.default.copyItem(at: seedDirectory, to: directory)
+            return directory
+        }
+        func withMode<T>(reference: Bool, _ body: () async throws -> T) async rethrows -> (T, builds: Int) {
+            let before = buildCounter.value
+            let value = try await AgentTranscriptPolicyPipeline.$derivesInitialVisibilityFromProjection.withValue(reference) {
+                try await body()
+            }
+            return (value, buildCounter.value - before)
+        }
+
+        for fixture in fixtures {
+            var loads: [Bool: [ColdLoadOutputs]] = [:]
+            var hydrations: [String: [HydrationOutputs]] = [:]
+            // Interleaved reference/candidate runs, each on a fresh copy of the same saved bytes.
+            for reference in [true, false, true, false] {
+                let store = try freshStore()
+                let fileURL = URL(fileURLWithPath: store.standardizedFileURL.path + fixture.relativePath)
+                let savedBytes = try Data(contentsOf: fileURL)
+                let (loaded, loadBuilds) = try await withMode(reference: reference) {
+                    try await AgentSessionDataService().loadAgentSession(from: fileURL)
+                }
+                let bytesAfterLoad = try Data(contentsOf: fileURL)
+                let runtimeSessionData = try encoded(loaded)
+                let canonicalFileAfterLoad = try encoded(JSONDecoder().decode(AgentSession.self, from: bytesAfterLoad))
+                loads[reference, default: []].append(.init(
+                    runtimeSession: runtimeSessionData,
+                    canonicalFileAfterLoad: canonicalFileAfterLoad,
+                    persistedBytesChanged: bytesAfterLoad != savedBytes
+                ))
+                XCTAssertNotNil(loaded.transcript, fixture.label)
+
+                for pendingQuestionUI in fixture.pendingQuestionUI {
+                    let hydrationStore = try freshStore()
+                    let (prepared, prepareBuilds) = try await withMode(reference: reference) {
+                        try await AgentSessionDataService().preparePersistedHydration(AgentSessionHydrationRequest(
+                            workspace: workspace(hydrationStore),
+                            tabID: fixture.session.composeTabID ?? UUID(),
+                            sessionID: fixture.session.id,
+                            resolvedDisplayName: fixture.session.name,
+                            hasPendingQuestionUI: pendingQuestionUI,
+                            transcriptViewportState: .liveBottom,
+                            isCompressedHistoryRevealed: false,
+                            initialPerformanceSnapshot: .empty
+                        ))
+                    }
+                    let payload = try XCTUnwrap(prepared, fixture.label)
+                    let presentation = payload.builtPresentation
+                    let persistedSessionData = try encoded(payload.persistedSession)
+                    hydrations["\(reference) pending=\(pendingQuestionUI)", default: []].append(.init(
+                        persistedSession: persistedSessionData,
+                        canonicalLiveItems: payload.canonicalLiveItems,
+                        transcript: payload.transcript,
+                        presentationTranscript: presentation.transcript,
+                        fullProjection: presentation.fullProjection,
+                        projection: presentation.projection,
+                        projectionCounts: presentation.projectionCounts,
+                        sanitizedActivityCount: presentation.sanitizedActivityCount,
+                        payloadRevisions: presentation.rawToolResultPayloadRenderRevisionByItemID,
+                        rawPayloadByItemID: AgentModeViewModel.rebuildEphemeralToolResultPayloadMap(from: payload.canonicalLiveItems),
+                        rawInputSanitizeEvidence: presentation.rawInputSanitizeEvidence,
+                        normalizedRunState: payload.normalizedRunState,
+                        lastUserMessageAt: payload.lastUserMessageAt,
+                        needsReloadMigrationSave: payload.needsReloadMigrationSave,
+                        persistenceSessionID: payload.persistenceState.stamp.sessionID,
+                        persistenceWorkspaceID: payload.persistenceState.stamp.workspaceID,
+                        deletionGeneration: payload.persistenceState.stamp.deletionGeneration,
+                        transcriptResetGeneration: payload.persistenceState.transcriptResetGeneration
+                    ))
+                    if reference {
+                        buildCounter.recordReference(prepareBuilds, key: "\(fixture.label) prepare \(pendingQuestionUI)")
+                    } else {
+                        let referenceBuilds = try XCTUnwrap(buildCounter.reference(key: "\(fixture.label) prepare \(pendingQuestionUI)"))
+                        XCTAssertEqual(
+                            prepareBuilds,
+                            referenceBuilds - 1,
+                            "\(fixture.label) pending=\(pendingQuestionUI): preparation skips one initial build"
+                        )
+                    }
+                }
+                if reference {
+                    buildCounter.recordReference(loadBuilds, key: "\(fixture.label) load")
+                } else {
+                    let referenceBuilds = try XCTUnwrap(buildCounter.reference(key: "\(fixture.label) load"))
+                    XCTAssertEqual(
+                        loadBuilds,
+                        referenceBuilds - 1,
+                        "\(fixture.label): cold load skips one initial build"
+                    )
+                }
+            }
+            let referenceLoads = try XCTUnwrap(loads[true])
+            let candidateLoads = try XCTUnwrap(loads[false])
+            XCTAssertEqual(Set(referenceLoads.map(\.runtimeSession)).count, 1, "\(fixture.label): reference loads are deterministic")
+            XCTAssertEqual(Set(referenceLoads.map(\.canonicalFileAfterLoad)).count, 1, "\(fixture.label): reference files are deterministic")
+            XCTAssertEqual(candidateLoads, referenceLoads, "\(fixture.label): runtime session, persisted file content, and whether persisted bytes changed match")
+            for pendingQuestionUI in fixture.pendingQuestionUI {
+                let referenceHydrations = try XCTUnwrap(hydrations["true pending=\(pendingQuestionUI)"])
+                let candidateHydrations = try XCTUnwrap(hydrations["false pending=\(pendingQuestionUI)"])
+                XCTAssertEqual(referenceHydrations.count, 2)
+                XCTAssertFalse(
+                    referenceHydrations[0].rawPayloadByItemID.isEmpty,
+                    "\(fixture.label) pending=\(pendingQuestionUI): the fixture retains raw payloads"
+                )
+                XCTAssertEqual(
+                    candidateHydrations,
+                    referenceHydrations,
+                    "\(fixture.label) pending=\(pendingQuestionUI): hydration outputs match"
+                )
+            }
+        }
+    }
+
+    private final class ColdLoadProjectionBuildCounter: @unchecked Sendable {
+        private let lock = NSLock()
+        private var count = 0
+        private var references: [String: Int] = [:]
+        var value: Int {
+            lock.withLock { count }
+        }
+
+        func increment() {
+            lock.withLock { count += 1 }
+        }
+
+        func recordReference(_ builds: Int, key: String) {
+            lock.withLock { references[key] = builds }
+        }
+
+        func reference(key: String) -> Int? {
+            lock.withLock { references[key] }
+        }
+    }
+
+    /// One request, 300 bash calls, 900 bash results, and 299 assistant rows in one turn.
+    private static func largeSingleTurnItems() -> [AgentChatItem] {
+        var items: [AgentChatItem] = [.user("Run the large workload", sequenceIndex: 0)]
+        var assistantCount = 0
+        for index in 0 ..< 900 {
+            let invocationID = UUID()
+            let argsJSON = #"{"command":"run \#(index)"}"#
+            if index < 300 {
+                items.append(.toolCall(name: "bash", invocationID: invocationID, argsJSON: argsJSON, sequenceIndex: items.count))
+            }
+            items.append(.toolResult(
+                name: "bash",
+                invocationID: invocationID,
+                argsJSON: argsJSON,
+                resultJSON: bashResultJSON(index: index),
+                isError: false,
+                sequenceIndex: items.count
+            ))
+            if index % 3 == 2, assistantCount < 299 {
+                items.append(.assistant("Step \(index)", sequenceIndex: items.count))
+                assistantCount += 1
+            }
+        }
+        return items
+    }
+
+    private static func multiTurnItems(turnCount: Int, toolsPerTurn: Int) -> [AgentChatItem] {
+        var items: [AgentChatItem] = []
+        for turn in 0 ..< turnCount {
+            items.append(.user("Turn \(turn)", sequenceIndex: items.count))
+            for tool in 0 ..< toolsPerTurn {
+                let invocationID = UUID()
+                let argsJSON = #"{"command":"turn \#(turn) tool \#(tool)"}"#
+                items.append(.toolCall(name: "bash", invocationID: invocationID, argsJSON: argsJSON, sequenceIndex: items.count))
+                items.append(.toolResult(
+                    name: "bash",
+                    invocationID: invocationID,
+                    argsJSON: argsJSON,
+                    resultJSON: bashResultJSON(index: turn * toolsPerTurn + tool),
+                    isError: false,
+                    sequenceIndex: items.count
+                ))
+                if tool % 4 == 3 {
+                    items.append(.assistant("Turn \(turn) progress \(tool)", sequenceIndex: items.count))
+                }
+            }
+            items.append(.assistant("Turn \(turn) done", sequenceIndex: items.count))
+        }
+        return items
+    }
+
+    private static func bashResultJSON(index: Int) -> String {
+        let object: [String: Any] = [
+            "type": "commandExecution",
+            "status": "completed",
+            "processId": "process-\(index)",
+            "exitCode": 0,
+            "aggregatedOutput": String(repeating: "output \(index)\n", count: 20)
+        ]
+        let data = try! JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
+        return String(decoding: data, as: UTF8.self)
     }
 
     private func persistedSummary(toolName: String, rawResultJSON: String, argsJSON: String? = nil) -> AgentPersistedToolResultSummary? {

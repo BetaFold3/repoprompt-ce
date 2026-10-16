@@ -447,6 +447,82 @@ extension AgentModeViewModel {
         let shouldEnableCodexComputerUse: Bool
     }
 
+    /// Why a refresh made no incremental final-turn import attempt. Diagnostics only: mirrors,
+    /// but never drives, the source-summary admission in `refreshDerivedTranscriptState`. The
+    /// run-state-only alternative and forced-cold derivation are decided in the view model only;
+    /// a refused run-state-only refresh reports `missingSummary`.
+    struct DerivedTranscriptIncrementalNoAttemptDiagnosis: Equatable {
+        /// First failing admission guard, in the guard's evaluation order.
+        enum Primary: String {
+            case reasonNotLive
+            case pendingQuestion
+            case missingSummary
+            case summaryRejected
+        }
+
+        /// Every flag present on the pending summary, reported even when an earlier guard
+        /// already failed, so overlapping causes stay visible.
+        struct SummaryFlags: OptionSet, Equatable {
+            let rawValue: Int
+            static let removal = SummaryFlags(rawValue: 1 << 0)
+            static let replaceAll = SummaryFlags(rawValue: 1 << 1)
+            static let user = SummaryFlags(rawValue: 1 << 2)
+            static let structural = SummaryFlags(rawValue: 1 << 3)
+            static let unranged = SummaryFlags(rawValue: 1 << 4)
+
+            init(rawValue: Int) {
+                self.rawValue = rawValue
+            }
+
+            init(_ summary: AgentPendingSourceItemsMutationSummary) {
+                var flags: SummaryFlags = []
+                if summary.containsRemoval { flags.insert(.removal) }
+                if summary.containsReplaceAll { flags.insert(.replaceAll) }
+                if summary.containsUserMutation { flags.insert(.user) }
+                if summary.containsStructuralMutation { flags.insert(.structural) }
+                if summary.containsUnrangedMutation { flags.insert(.unranged) }
+                self = flags
+            }
+
+            /// Static labels joined by `-` in a fixed order; nil when empty.
+            var label: String? {
+                let ordered: [(SummaryFlags, String)] = [
+                    (.removal, "removal"),
+                    (.replaceAll, "replaceAll"),
+                    (.user, "user"),
+                    (.structural, "structural"),
+                    (.unranged, "unranged")
+                ]
+                let labels = ordered.compactMap { contains($0.0) ? $0.1 : nil }
+                return labels.isEmpty ? nil : labels.joined(separator: "-")
+            }
+        }
+
+        let primary: Primary
+        let summaryFlags: SummaryFlags
+
+        /// Returns nil when the source-summary admission would attempt an incremental import.
+        static func diagnose(
+            reason: AgentDerivedTranscriptRefreshReason,
+            hasPendingQuestion: Bool,
+            summary: AgentPendingSourceItemsMutationSummary?
+        ) -> DerivedTranscriptIncrementalNoAttemptDiagnosis? {
+            let flags = summary.map(SummaryFlags.init) ?? []
+            let primary: Primary
+            if reason != .liveMutation {
+                primary = .reasonNotLive
+            } else if hasPendingQuestion {
+                primary = .pendingQuestion
+            } else if let summary {
+                guard !summary.allowsIncrementalFinalTurnRebuild else { return nil }
+                primary = .summaryRejected
+            } else {
+                primary = .missingSummary
+            }
+            return DerivedTranscriptIncrementalNoAttemptDiagnosis(primary: primary, summaryFlags: flags)
+        }
+    }
+
     struct PersistableTranscriptSnapshot {
         let transcript: AgentTranscript
         let projectionCounts: AgentTranscriptProjectionCounts

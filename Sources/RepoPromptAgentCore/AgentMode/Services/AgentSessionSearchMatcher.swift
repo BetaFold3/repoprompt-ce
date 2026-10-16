@@ -85,8 +85,21 @@ package struct AgentSessionSearchField: Equatable {
     init(_ text: String?, kind: AgentSessionSearchFieldKind) {
         let trimmed = text?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         self.text = trimmed
-        normalizedText = AgentSessionSearchNormalizer.normalize(trimmed)
+        normalizedText = Self.normalizedFieldText(trimmed: trimmed)
         self.kind = kind
+    }
+
+    /// Output-identical to `AgentSessionSearchNormalizer.normalize` for already-trimmed text:
+    /// empty stays empty and pure ASCII only needs A–Z lowercasing (pinned by per-scalar ASCII
+    /// equivalence tests, standalone and embedded). Non-ASCII keeps the shared folding normalizer.
+    private static func normalizedFieldText(trimmed: String) -> String {
+        if trimmed.isEmpty {
+            return ""
+        }
+        if trimmed.utf8.allSatisfy({ $0 < 0x80 }) {
+            return trimmed.lowercased()
+        }
+        return AgentSessionSearchNormalizer.normalize(trimmed)
     }
 
     var isEmpty: Bool {

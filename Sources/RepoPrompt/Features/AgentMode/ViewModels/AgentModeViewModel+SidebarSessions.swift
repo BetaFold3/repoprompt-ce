@@ -659,13 +659,21 @@ extension AgentModeViewModel {
         searchText: String,
         diagnosticSource: String? = nil
     ) -> [AgentSidebarThreadKey] {
-        filteredSidebarSessions(
-            for: tabs,
-            currentTabID: currentTabID,
-            searchText: searchText,
-            diagnosticSource: diagnosticSource
+        collapsibleSidebarThreadKeys(
+            filteredRows: filteredSidebarSessions(
+                for: tabs,
+                currentTabID: currentTabID,
+                searchText: searchText,
+                diagnosticSource: diagnosticSource
+            )
         )
-        .compactMap { row in
+    }
+
+    /// Row-based overload: derives collapsible thread keys from rows already
+    /// produced by `filteredSidebarSessions(for:currentTabID:searchText:diagnosticSource:)`
+    /// so a single view body can share one filtered build across consumers.
+    func collapsibleSidebarThreadKeys(filteredRows: [SidebarSession]) -> [AgentSidebarThreadKey] {
+        filteredRows.compactMap { row in
             guard row.depth == 0, row.hasThreadChildren, let key = row.threadKey else { return nil }
             return key
         }

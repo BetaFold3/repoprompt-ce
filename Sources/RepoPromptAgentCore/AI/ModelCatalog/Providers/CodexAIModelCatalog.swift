@@ -178,10 +178,16 @@ enum CodexDynamicModelMapper {
             }
         }
 
-        return options.sorted { lhs, rhs in
-            let leftBase = lhs.baseID.lowercased()
-            let rightBase = rhs.baseID.lowercased()
-            if leftBase == rightBase {
+        // Build each option's lowercased base and semantic key once, rather than
+        // per comparison; the branch sequence below is otherwise unchanged.
+        let decorated = options.map { option in
+            let base = option.baseID.lowercased()
+            return (option: option, base: base, key: AIModel.CodexBaseModelSortKey(identifier: base))
+        }
+        return decorated.sorted { lhsEntry, rhsEntry in
+            let lhs = lhsEntry.option
+            let rhs = rhsEntry.option
+            if lhsEntry.base == rhsEntry.base {
                 let leftRank = effortRank(lhs.reasoningEffort)
                 let rightRank = effortRank(rhs.reasoningEffort)
                 if leftRank != rightRank {
@@ -192,10 +198,10 @@ enum CodexDynamicModelMapper {
             if lhs.isDefault != rhs.isDefault {
                 return lhs.isDefault && !rhs.isDefault
             }
-            if AIModel.codexBaseModelPrecedes(leftBase, rightBase) { return true }
-            if AIModel.codexBaseModelPrecedes(rightBase, leftBase) { return false }
+            if lhsEntry.key.precedes(rhsEntry.key) { return true }
+            if rhsEntry.key.precedes(lhsEntry.key) { return false }
             return lhs.displayName.localizedCaseInsensitiveCompare(rhs.displayName) == .orderedAscending
-        }
+        }.map(\.option)
     }
 
     static func displayName(forModelID id: String, records: [CodexDynamicModelRecord]) -> String? {

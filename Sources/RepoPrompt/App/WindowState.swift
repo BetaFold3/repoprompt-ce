@@ -725,9 +725,18 @@ class WindowState: ObservableObject {
     func startNewAgentSessionFromGlobalShortcut() {
         guard workspaceManager.activeWorkspace?.isSystemWorkspace == false else { return }
 
-        Task {
-            await agentModeViewModel.createAndActivateSessionTab(focusComposer: true)
-        }
+        #if DEBUG || EDIT_FLOW_PERF
+            let latencyAction = AgentInteractionLatencyProbe.beginNewSession(windowID: windowID, source: "globalShortcut")
+            Task {
+                await AgentInteractionLatencyProbe.run(as: latencyAction) {
+                    await agentModeViewModel.createAndActivateSessionTab(focusComposer: true)
+                }
+            }
+        #else
+            Task {
+                await agentModeViewModel.createAndActivateSessionTab(focusComposer: true)
+            }
+        #endif
     }
 
     func requestClose(authorization: WindowCloseAuthorization? = nil) {

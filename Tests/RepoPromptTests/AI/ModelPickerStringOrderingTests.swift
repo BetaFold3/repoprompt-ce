@@ -664,6 +664,149 @@ final class ModelPickerStringOrderingTests: XCTestCase {
         XCTAssertEqual(gpt56Sol.isProviderDefault, true)
     }
 
+    func testDynamicCodexMapperOrdersPerOptionDefaultBeforeSemanticBaseOrder() {
+        let options = CodexDynamicModelMapper.options(from: [
+            orderingRecord(id: "gpt-5.1-codex-max"),
+            orderingRecord(id: "gpt-5.6-sol", efforts: ["ultra", "low", "max"], defaultEffort: "low"),
+            orderingRecord(id: "gpt-5.4", isDefault: true, efforts: ["high", "low"], defaultEffort: "low")
+        ])
+
+        XCTAssertEqual(options.map(\.id), [
+            "gpt-5.4-low",
+            "gpt-5.6-sol-low",
+            "gpt-5.6-sol-max",
+            "gpt-5.6-sol-ultra",
+            "gpt-5.4-high",
+            "gpt-5.1-codex-max"
+        ])
+        XCTAssertEqual(options.filter(\.isDefault).map(\.id), ["gpt-5.4-low"])
+    }
+
+    func testDynamicCodexMapperFinalSortMatchesFrozenStringComparatorAcrossPermutations() {
+        let records: [CodexDynamicModelRecord] = [
+            orderingRecord(id: "gpt-5.6-sol", efforts: ["low", "medium", "high", "xhigh", "max", "ultra"], defaultEffort: "medium"),
+            orderingRecord(id: "gpt-5.6-terra", isDefault: true, efforts: ["low", "xhigh", "max", "ultra"], defaultEffort: "xhigh"),
+            orderingRecord(id: "gpt-5.6-luna", efforts: ["low", "max"], defaultEffort: nil),
+            orderingRecord(id: "GPT-5.6-Sol", displayName: "GPT-5.6 Sol Mixed", efforts: ["low", "minimal"], defaultEffort: "low"),
+            orderingRecord(id: "gpt-5.6", efforts: ["high"], defaultEffort: "high"),
+            orderingRecord(id: "gpt-5.5", isDefault: true),
+            orderingRecord(id: "gpt-5.4", efforts: ["low", "high"], defaultEffort: "high"),
+            orderingRecord(id: "gpt-5.4-fast", efforts: ["low", "high"], defaultEffort: "low"),
+            orderingRecord(id: "gpt-5.1-codex-max", efforts: ["low", "high", "xhigh"], defaultEffort: "xhigh"),
+            orderingRecord(id: "gpt-5.3-codex"),
+            orderingRecord(id: "o3", displayName: ""),
+            orderingRecord(id: "custom-model", displayName: "Same Label"),
+            orderingRecord(id: "custom-model-two", displayName: "same label"),
+            orderingRecord(id: "modèle-ünï", displayName: "Modèle"),
+            orderingRecord(id: "mode\u{0300}le-u\u{0308}ni\u{0308}", displayName: "Mode\u{0300}le"),
+            orderingRecord(id: "ı-model", displayName: "ı"),
+            orderingRecord(id: "I-model", displayName: "I"),
+            orderingRecord(id: "gpt-5.4", efforts: ["low", "high"], defaultEffort: "high"),
+            orderingRecord(id: "  "),
+            orderingRecord(id: "zz-default", isDefault: true, efforts: ["ultra", "none"], defaultEffort: "ultra")
+        ]
+
+        XCTAssertEqual(CodexDynamicModelMapper.options(from: [CodexDynamicModelRecord]()), [])
+        XCTAssertEqual(referenceDynamicCodexOptions(from: []), [])
+
+        let count = records.count
+        var permutations: [[CodexDynamicModelRecord]] = []
+        for base in [records, Array(records.reversed())] {
+            for offset in 0 ..< count {
+                permutations.append(Array(base[offset...] + base[..<offset]))
+            }
+            let evens = base.enumerated().filter { $0.offset.isMultiple(of: 2) }.map(\.element)
+            let odds = base.enumerated().filter { !$0.offset.isMultiple(of: 2) }.map(\.element)
+            permutations.append(evens + odds)
+        }
+
+        for (index, permutation) in permutations.enumerated() {
+            let actual = CodexDynamicModelMapper.options(from: permutation)
+            XCTAssertFalse(actual.isEmpty)
+            XCTAssertEqual(actual, referenceDynamicCodexOptions(from: permutation), "permutation \(index)")
+        }
+    }
+
+    func testCodexBaseModelSortKeyMatchesStringComparatorForAllPairs() {
+        let identifiers = [
+            "gpt-5.6-sol", "GPT-5.6-Sol", "gpt-5.6", "gpt-5.6-terra", "gpt-5.6-luna",
+            "gpt-5.6-sol-ultra", "gpt-5.6-terra-max", "gpt-5.6-sol-fast", "gpt-5.5",
+            "gpt-5.4", "gpt-5.4-fast", "gpt-5.3-codex", "gpt-5.1-codex-max", "o3",
+            "custom-model", "mod\u{00E8}le", "mode\u{0300}le", "\u{0131}", "I", "", "  "
+        ]
+        for lhs in identifiers {
+            let lhsKey = AIModel.CodexBaseModelSortKey(identifier: lhs)
+            for rhs in identifiers {
+                XCTAssertEqual(
+                    lhsKey.precedes(AIModel.CodexBaseModelSortKey(identifier: rhs)),
+                    AIModel.codexBaseModelPrecedes(lhs, rhs),
+                    "\(lhs.debugDescription) vs \(rhs.debugDescription)"
+                )
+            }
+        }
+    }
+
+    /// Collects single-record mapper output, already sorted within each record,
+    /// and applies the mapper's first-wins lowercased-ID dedup. A frozen copy
+    /// of the pre-key final sort then calls the unchanged string comparator.
+    private func referenceDynamicCodexOptions(
+        from records: [CodexDynamicModelRecord]
+    ) -> [CodexDynamicModelOption] {
+        var seen = Set<String>()
+        var generated: [CodexDynamicModelOption] = []
+        for record in records {
+            for option in CodexDynamicModelMapper.options(from: [record])
+                where seen.insert(option.id.lowercased()).inserted
+            {
+                generated.append(option)
+            }
+        }
+
+        func effortRank(_ effort: CodexReasoningEffort?) -> Int {
+            guard let effort else { return -1 }
+            return CodexReasoningEffort.displayOrder.firstIndex(of: effort) ?? Int.max
+        }
+
+        return generated.sorted { lhs, rhs in
+            let leftBase = lhs.baseID.lowercased()
+            let rightBase = rhs.baseID.lowercased()
+            if leftBase == rightBase {
+                let leftRank = effortRank(lhs.reasoningEffort)
+                let rightRank = effortRank(rhs.reasoningEffort)
+                if leftRank != rightRank {
+                    return leftRank < rightRank
+                }
+                return lhs.displayName.localizedCaseInsensitiveCompare(rhs.displayName) == .orderedAscending
+            }
+            if lhs.isDefault != rhs.isDefault {
+                return lhs.isDefault && !rhs.isDefault
+            }
+            if AIModel.codexBaseModelPrecedes(leftBase, rightBase) { return true }
+            if AIModel.codexBaseModelPrecedes(rightBase, leftBase) { return false }
+            return lhs.displayName.localizedCaseInsensitiveCompare(rhs.displayName) == .orderedAscending
+        }
+    }
+
+    private func orderingRecord(
+        id: String,
+        displayName: String? = nil,
+        isDefault: Bool = false,
+        efforts: [String] = [],
+        defaultEffort: String? = nil
+    ) -> CodexDynamicModelRecord {
+        CodexDynamicModelRecord(
+            id: id,
+            model: id,
+            displayName: displayName ?? id,
+            description: "\(id) description",
+            isDefault: isDefault,
+            supportedReasoningEfforts: efforts.map {
+                CodexDynamicReasoningRecord(reasoningEffort: $0, description: "\(id) \($0)")
+            },
+            defaultReasoningEffort: defaultEffort
+        )
+    }
+
     private func dynamicCodexRecord(
         id: String,
         defaultEffort: String,

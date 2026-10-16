@@ -157,14 +157,14 @@ package struct AgentSessionSidebarBuildResult {
 }
 
 package struct AgentSessionHydrationRequest {
-    let workspace: any AgentWorkspaceStorageReference
-    let tabID: UUID
-    let sessionID: UUID
-    let resolvedDisplayName: String
-    let hasPendingQuestionUI: Bool
-    let transcriptViewportState: AgentTranscriptViewportState
-    let isCompressedHistoryRevealed: Bool
-    let initialPerformanceSnapshot: AgentTranscriptPerformanceSnapshot
+    package let workspace: any AgentWorkspaceStorageReference
+    package let tabID: UUID
+    package let sessionID: UUID
+    package let resolvedDisplayName: String
+    package let hasPendingQuestionUI: Bool
+    package let transcriptViewportState: AgentTranscriptViewportState
+    package let isCompressedHistoryRevealed: Bool
+    package let initialPerformanceSnapshot: AgentTranscriptPerformanceSnapshot
 
     package init(
         workspace: any AgentWorkspaceStorageReference,

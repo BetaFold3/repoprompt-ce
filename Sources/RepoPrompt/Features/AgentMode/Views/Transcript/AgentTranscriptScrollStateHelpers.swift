@@ -118,6 +118,41 @@ enum AgentTranscriptRehydrateRestoreLayoutPolicy {
             layoutPassToken: layoutPassToken
         )
     }
+
+    /// Largest distance from the content end still treated as the native initial bottom.
+    static let nativeInitialBottomTolerance: CGFloat = 1
+
+    /// The initial live-bottom restore scroll is redundant only when the instance still sits at
+    /// its native bottom (within `nativeInitialBottomTolerance`, not the looser near-bottom
+    /// threshold) in a valid layout sample recorded for the current tab, presentation revision
+    /// and layout pass. Anything else — rows re-measured after the first layout, a stale or
+    /// missing sample, a scroll in flight — keeps the existing restore scroll. Hosts without the
+    /// native anchor never skip: their samples (the legacy bottom-sentinel path) do not prove the
+    /// instance started at the bottom.
+    static func canSkipLiveBottomRestoreScroll(
+        hasNativeInitialBottomAnchor: Bool,
+        isProgrammaticScrollInFlight: Bool,
+        currentLayoutSampleKey: AgentTranscriptRehydrateRetryKey?,
+        tabID: UUID,
+        presentationRevision: Int,
+        layoutPassToken: UInt64,
+        metrics: AgentTranscriptScrollMetrics
+    ) -> Bool {
+        guard hasNativeInitialBottomAnchor, !isProgrammaticScrollInFlight else { return false }
+        guard hasValidLayoutSample(metrics),
+              metrics.viewportHeight.isFinite,
+              metrics.distanceToBottom.isFinite,
+              metrics.distanceToBottom >= 0,
+              metrics.distanceToBottom <= nativeInitialBottomTolerance
+        else {
+            return false
+        }
+        return currentLayoutSampleKey == AgentTranscriptRehydrateRetryKey(
+            tabID: tabID,
+            presentationRevision: presentationRevision,
+            layoutPassToken: layoutPassToken
+        )
+    }
 }
 
 enum AgentTranscriptActivationRepaintRemountPolicy {

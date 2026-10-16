@@ -567,6 +567,206 @@ final class AgentTranscriptGroupInspectionTests: XCTestCase {
         XCTAssertEqual(roundTripped.failedToolCount, 2)
     }
 
+    // MARK: - Cluster summary ordering and merge
+
+    /// One condensed span whose grouped-history tool summary covers every row. Executions interleave so
+    /// the outer order (each execution's latest row by sequence, then timestamp, then row-ID string)
+    /// differs from first-seen order; two execution pairs tie on sequence; one execution has an exact
+    /// sequence-and-timestamp tie between its own rows; one latest row has no tool name and one uses a
+    /// prefixed alias. Span activities arrive unsorted in the scrambled variant.
+    func testClusterSummaryOrdersMergesAndNormalizesExecutionsAtTheProjectionBoundary() throws {
+        let rows = Self.clusterSummaryOrderingRows()
+        let expected = Self.expectedClusterSummary(
+            toolCount: 8,
+            toolNames: ["apply_edits", "file_search", "read_file", "get_code_structure", "get_file_tree"],
+            toolNameCounts: ["apply_edits": 1, "file_search": 2, "read_file": 3, "get_code_structure": 1, "get_file_tree": 1],
+            keyPaths: ["a1.swift", "a2.swift", "d.swift", "g2.swift", "g1.swift", "g3.swift"],
+            containsRunningWork: true,
+            containsFailure: true,
+            containsWarning: true,
+            shortNarration: String(repeating: "n", count: 120) + "…",
+            failedToolCount: 1
+        )
+        let canonical = ["a1", "b1", "b2", "e1", "h1", "a2", "c1", "c2", "d1", "n1", "f1", "e2", "g1", "g2", "g3", "t1"]
+        // Unsorted, with the cross-execution c2/d1 tie reversed; g2 stays before its exact tie g3.
+        let scrambled = ["t1", "g2", "d1", "e2", "a2", "g3", "b2", "c2", "n1", "h1", "f1", "e1", "b1", "g1", "c1", "a1"]
+        XCTAssertEqual(try Self.condensedToolSummary(canonical.map { rows[$0]! }), expected, "canonical order")
+        XCTAssertEqual(try Self.condensedToolSummary(scrambled.map { rows[$0]! }), expected, "scrambled order")
+
+        // An exact sequence-and-timestamp tie inside one execution keeps input order, so the later
+        // input row is the latest execution and earlier rows merge into it in ascending order.
+        let tieSwapped = canonical.map { $0 == "g2" ? "g3" : $0 == "g3" ? "g2" : $0 }
+        XCTAssertEqual(
+            try Self.condensedToolSummary(tieSwapped.map { rows[$0]! }),
+            Self.expectedClusterSummary(
+                toolCount: 8,
+                toolNames: ["apply_edits", "file_search", "read_file", "get_code_structure", "get_file_tree"],
+                toolNameCounts: ["apply_edits": 1, "file_search": 2, "read_file": 3, "get_code_structure": 1, "get_file_tree": 1],
+                keyPaths: ["a1.swift", "a2.swift", "d.swift", "g3.swift", "g1.swift", "g2.swift"],
+                containsRunningWork: true,
+                containsFailure: false,
+                containsWarning: true,
+                shortNarration: String(repeating: "n", count: 120) + "…",
+                failedToolCount: nil
+            ),
+            "exact tie resolved by input order"
+        )
+    }
+
+    func testClusterSummaryWithoutToolsKeepsZeroAndNilSemantics() throws {
+        let reply = AgentChatItem(
+            timestamp: Self.clusterBaseDate,
+            kind: .assistant,
+            text: "  Short reply  ",
+            sequenceIndex: 1
+        )
+        XCTAssertEqual(
+            try Self.condensedToolSummary([reply]),
+            Self.expectedClusterSummary(
+                toolCount: 0,
+                toolNames: [],
+                toolNameCounts: [:],
+                keyPaths: [],
+                containsRunningWork: false,
+                containsFailure: false,
+                containsWarning: false,
+                shortNarration: "Short reply",
+                failedToolCount: nil
+            )
+        )
+    }
+
+    private static let clusterBaseDate = Date(timeIntervalSinceReferenceDate: 800_000_000)
+
+    private static func clusterSummaryOrderingRows() -> [String: AgentChatItem] {
+        func invocation(_ suffix: String) -> UUID {
+            UUID(uuidString: "00000000-0000-0000-0000-0000000000\(suffix)")!
+        }
+        func tool(
+            _ kind: AgentChatItemKind,
+            _ name: String?,
+            _ invocationID: UUID?,
+            args: String? = nil,
+            result: String? = nil,
+            isError: Bool? = nil,
+            sequence: Int,
+            at offset: TimeInterval? = nil,
+            id: UUID = UUID()
+        ) -> AgentChatItem {
+            AgentChatItem(
+                id: id,
+                timestamp: clusterBaseDate.addingTimeInterval(offset ?? TimeInterval(sequence)),
+                kind: kind,
+                text: "",
+                toolName: name,
+                toolInvocationID: invocationID,
+                toolArgsJSON: args,
+                toolResultJSON: result,
+                toolIsError: isError,
+                sequenceIndex: sequence
+            )
+        }
+        let (a, b, c, d, e, f, g) = (invocation("A1"), invocation("B1"), invocation("C1"), invocation("D1"), invocation("E1"), invocation("F1"), invocation("A7"))
+        return [
+            "a1": tool(.toolCall, "read_file", a, args: #"{"path":"a1.swift"}"#, sequence: 1),
+            "b1": tool(.toolCall, "apply_edits", b, args: #"{"edits":[]}"#, sequence: 2),
+            // The latest B row has no tool name; the merge fills it from the call before normalization.
+            "b2": tool(.toolResult, nil, b, result: #"{"status":"success"}"#, sequence: 3),
+            "e1": tool(.toolCall, "get_file_tree", e, args: #"{"depth":1}"#, sequence: 4),
+            // No invocation ID: grouped by its own content-derived execution ID.
+            "h1": tool(.toolCall, "file_search", nil, args: #"{"pattern":"needle"}"#, sequence: 5),
+            "a2": tool(.toolResult, "read_file", a, args: #"{"path":"a2.swift"}"#, result: #"{"content":"ok"}"#, isError: false, sequence: 6),
+            "c1": tool(.toolCall, "get_code_structure", c, args: #"{"symbol":"Widget"}"#, sequence: 7),
+            // c2 and d1 tie on sequence and timestamp; the smaller row-ID string (d1) orders first.
+            "c2": tool(
+                .toolResult,
+                "get_code_structure",
+                c,
+                result: #"{"status":"success"}"#,
+                sequence: 8,
+                id: UUID(uuidString: "FFFFFFFF-FFFF-FFFF-FFFF-FFFFFFFFFFFF")!
+            ),
+            "d1": tool(
+                .toolCall,
+                "mcp__RepoPromptCE__read_file",
+                d,
+                args: #"{"path":"d.swift"}"#,
+                sequence: 8,
+                id: UUID(uuidString: "00000000-0000-0000-0000-000000000001")!
+            ),
+            "n1": AgentChatItem(timestamp: clusterBaseDate.addingTimeInterval(9), kind: .assistant, text: String(repeating: "n", count: 130), sequenceIndex: 9),
+            // f1 and e2 tie on sequence; the earlier timestamp (f1) orders first.
+            "f1": tool(.toolCall, "read_file", f, args: #"{"pattern":"f"}"#, sequence: 10, at: 10),
+            "e2": tool(.toolResult, "get_file_tree", e, result: #"{"status":"warning"}"#, sequence: 10, at: 10.5),
+            "g1": tool(.toolCall, "file_search", g, args: #"{"path":"g1.swift"}"#, sequence: 11),
+            "g2": tool(.toolResult, "file_search", g, args: #"{"path":"g2.swift"}"#, result: #"{"status":"running"}"#, sequence: 12),
+            "g3": tool(.toolResult, "file_search", g, args: #"{"path":"g3.swift"}"#, result: #"{"status":"failed"}"#, isError: true, sequence: 12),
+            "t1": AgentChatItem(timestamp: clusterBaseDate.addingTimeInterval(13), kind: .thinking, text: "Later thinking", sequenceIndex: 13)
+        ]
+    }
+
+    /// Projects `items` as one condensed span (activities kept in the given order, raw tool names
+    /// preserved) and returns the grouped-history tool summary.
+    private static func condensedToolSummary(_ items: [AgentChatItem]) throws -> AgentTranscriptClusterSummary {
+        let activities = items.map { item -> AgentTranscriptActivity in
+            guard var execution = AgentTranscriptToolNormalizer.toolExecution(for: item) else {
+                return AgentTranscriptActivity(from: item)
+            }
+            execution.toolName = item.toolName
+            return AgentTranscriptActivity(from: item, toolExecution: execution)
+        }
+        let turn = AgentTranscriptTurn(
+            responseSpans: [AgentTranscriptProviderResponseSpan(startedAt: clusterBaseDate, activities: activities)],
+            retentionTier: .condensed,
+            startedAt: clusterBaseDate
+        )
+        let blocks = AgentTranscriptProjectionBuilder.blocks(for: turn, archived: false)
+        let grouped = try XCTUnwrap(blocks.first { $0.kind == .groupedHistory })
+        return try XCTUnwrap(grouped.groupedHistory?.summary.toolSummary)
+    }
+
+    private static func expectedClusterSummary(
+        toolCount: Int,
+        toolNames: [String],
+        toolNameCounts: [String: Int],
+        keyPaths: [String],
+        containsRunningWork: Bool,
+        containsFailure: Bool,
+        containsWarning: Bool,
+        shortNarration: String?,
+        failedToolCount: Int?
+    ) -> AgentTranscriptClusterSummary {
+        let toolGroups = ClusterToolCategory.buildGroups(
+            toolNames: toolNameCounts.isEmpty ? toolNames : toolNameCounts.keys.sorted(),
+            counts: toolNameCounts
+        )
+        let base = AgentTranscriptClusterSummary(
+            toolCount: toolCount,
+            toolNames: toolNames,
+            toolNameCounts: toolNameCounts,
+            toolGroups: toolGroups,
+            keyPaths: keyPaths,
+            containsRunningWork: containsRunningWork,
+            containsFailure: containsFailure,
+            containsWarning: containsWarning,
+            shortNarration: shortNarration,
+            failedToolCount: failedToolCount
+        )
+        return AgentTranscriptClusterSummary(
+            toolCount: toolCount,
+            toolNames: toolNames,
+            toolNameCounts: toolNameCounts,
+            toolGroups: toolGroups,
+            keyPaths: keyPaths,
+            containsRunningWork: containsRunningWork,
+            containsFailure: containsFailure,
+            containsWarning: containsWarning,
+            shortNarration: shortNarration,
+            collapsedDisplay: AgentTranscriptSummaryTextFormatter.collapsedDisplay(for: base, fallbackCount: toolCount),
+            failedToolCount: failedToolCount
+        )
+    }
+
     // MARK: - Helpers
 
     /// Drives a plain `AgentTranscriptInnerFollowState` and an `AgentTranscriptInnerFollowTracker`

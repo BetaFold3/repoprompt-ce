@@ -444,6 +444,9 @@ struct GlobalScalarPreferences: Codable, Equatable {
     var agentMode: AgentModeSettings?
     var telemetry: TelemetrySettings?
     var modelOverrides: ModelOverrideSettingsData?
+    /// Telegram attention notifications (enable flag and chat ID only; the bot token lives in
+    /// secure storage, never here).
+    var telegram: TelegramSettings?
 
     init(
         ui: UISettings? = nil,
@@ -453,7 +456,8 @@ struct GlobalScalarPreferences: Codable, Equatable {
         fileSystem: FileSystemSettings? = nil,
         agentMode: AgentModeSettings? = nil,
         telemetry: TelemetrySettings? = nil,
-        modelOverrides: ModelOverrideSettingsData? = nil
+        modelOverrides: ModelOverrideSettingsData? = nil,
+        telegram: TelegramSettings? = nil
     ) {
         self.ui = ui
         self.promptPackaging = promptPackaging
@@ -463,6 +467,7 @@ struct GlobalScalarPreferences: Codable, Equatable {
         self.agentMode = agentMode
         self.telemetry = telemetry
         self.modelOverrides = modelOverrides
+        self.telegram = telegram
     }
 
     struct UISettings: Codable, Equatable {
@@ -643,6 +648,28 @@ struct GlobalScalarPreferences: Codable, Equatable {
             self.enabled = enabled
             self.appHangReportsEnabled = appHangReportsEnabled
             self.performanceTracingEnabled = performanceTracingEnabled
+        }
+    }
+
+    struct TelegramSettings: Codable, Equatable {
+        static let defaultIdleThresholdMinutes = 5
+
+        var enabled: Bool?
+        var chatID: String?
+        /// Minimum Mac idle minutes before an automatic notification is sent. Missing (or an
+        /// invalid negative stored value) means the default 5; 0 means always notify.
+        var idleThresholdMinutes: Int?
+
+        init(enabled: Bool? = nil, chatID: String? = nil, idleThresholdMinutes: Int? = nil) {
+            self.enabled = enabled
+            self.chatID = chatID
+            self.idleThresholdMinutes = idleThresholdMinutes
+        }
+
+        /// The idle threshold in effect for a stored settings group (nil group or field: default).
+        static func effectiveIdleThresholdMinutes(_ settings: TelegramSettings?) -> Int {
+            guard let stored = settings?.idleThresholdMinutes, stored >= 0 else { return defaultIdleThresholdMinutes }
+            return stored
         }
     }
 
