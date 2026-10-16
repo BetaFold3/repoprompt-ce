@@ -2005,12 +2005,17 @@ class PackageScriptReuseTests(unittest.TestCase):
                 bundle = Path(tmp) / BUNDLE
                 (bundle / "Contents" / "Resources").mkdir(parents=True)
                 env = dict(os.environ, ROOT_DIR_FOR_PROVENANCE=tmp, APP_BUNDLE_FOR_PROVENANCE=str(bundle),
-                           GIT_STATE_FOR_PROVENANCE=dpc.git_state_json(git))
+                           GIT_STATE_FOR_PROVENANCE=dpc.git_state_json(git), BUILD_LANE_FOR_PROVENANCE="debug",
+                           LANE_FLAGS_VERIFIED_FOR_PROVENANCE="0")
                 subprocess.run([sys.executable, "-"], input=writer, text=True, env=env, check=True, capture_output=True)
                 payload = json.loads((bundle / "Contents/Resources/RepoPromptDebugProvenance.json").read_text())
                 self.assertEqual((payload["branch"], payload["commit"], payload["dirty"]), git)
-                self.assertEqual(sorted(payload), ["branch", "buildTimeEpoch", "buildTimeISO", "commit", "dirty",
-                                                   "repoRoot", "version", "worktreeName", "worktreePath"])
+                # Build-lane keys are additive (optimized-diagnostics lane spec §4.9); lane values are
+                # pinned in test_release_tooling.py.
+                self.assertEqual(sorted(payload), ["assertConfiguration", "branch", "buildLane", "buildTimeEpoch",
+                                                   "buildTimeISO", "commit", "dirty", "laneFlagsVerified",
+                                                   "optimization", "repoRoot", "swiftConfiguration", "version",
+                                                   "worktreeName", "worktreePath"])
 
 
 if __name__ == "__main__":

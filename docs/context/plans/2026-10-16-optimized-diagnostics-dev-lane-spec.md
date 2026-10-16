@@ -477,7 +477,7 @@ Each step compiles and passes its tests on its own.
 Status:
 - Step 1 — done | rounds 0/2 | open: | downgraded: | assumed: assertions off and isolated scratch as approved | deferred: S1-P3-1 allowlist; S1-P3-4 gate-copy static test; optimized compile to Step 4; pre-existing release-selftest lint assertion (optimized-lane-step1-review.md)
 - Step 2 — done | rounds 0/2 | open: | downgraded: | assumed: literal no-DEBUG rule includes dormant tests | deferred: real optimized-plan validation to Step 4 (optimized-lane-step2-review.md)
-- Step 3 — todo | rounds 0/2 | open: | downgraded: | assumed: | deferred:
+- Step 3 — done | rounds 0/2 | open: | downgraded: | assumed: explicit Apple Development name as specified | deferred: real caller environment to Step 4; SHA1 identity selection only if needed; baseline release-selftest lint assertion (optimized-lane-step3-review.md)
 - Step 4 — todo | rounds 0/2 | open: | downgraded: | assumed: | deferred:
 - Step 5 — todo | rounds 0/2 | open: | downgraded: | assumed: | deferred:
 - Step 6 — todo | rounds 0/2 | open: | downgraded: | assumed: | deferred:

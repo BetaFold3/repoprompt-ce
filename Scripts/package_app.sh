@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
+# The optimized-diagnostics manifest gate reaches Swift only through canonical_swift.sh
+# --rpce-optimized-diagnostics (debug-optimized below); never inherit it, including on paths
+# that call Swift directly, such as the KeyboardShortcuts helper's `swift package resolve`.
+unset RPCE_OPTIMIZED_DIAGNOSTICS
 
 CONF="${1:-debug}"
 FAST_PACKAGE_MARKER="${2:-}"
@@ -166,8 +170,12 @@ case "$FAST_PACKAGE_MARKER" in
     *) fail "Unknown package mode '$FAST_PACKAGE_MARKER'. Expected 'fast' or no package mode." ;;
 esac
 if (( $# > 2 )); then
-    fail "Too many arguments. Usage: $0 [debug|release] [fast]"
+    fail "Too many arguments. Usage: $0 [debug|debug-optimized|release] [fast]"
 fi
+case "$CONF" in
+    debug|debug-optimized|release) ;;
+    *) fail "Unknown configuration '$CONF'. Usage: $0 [debug|debug-optimized|release] [fast]" ;;
+esac
 # Debug package cache escape, checked before any build or mutation. Unset means on; release ignores it.
 DEBUG_PACKAGE_CACHE_MODE="on"
 if [[ "$CONF" != "release" ]]; then
@@ -175,6 +183,21 @@ if [[ "$CONF" != "release" ]]; then
         on|off) DEBUG_PACKAGE_CACHE_MODE="${REPOPROMPT_DEBUG_PACKAGE_CACHE-on}" ;;
         *) fail "REPOPROMPT_DEBUG_PACKAGE_CACHE must be 'on' or 'off', got '${REPOPROMPT_DEBUG_PACKAGE_CACHE}'. Unset it for the default, or use off to disable debug package caches." ;;
     esac
+fi
+# Optimized-diagnostics lane preconditions from the caller's environment, checked before any
+# mutation or build: an explicit Apple Development identity (persistent debug Keychain storage),
+# no bundle-ID overrides and no Sentry. The resolved bundle ID is checked once it is known.
+if [[ "$CONF" == "debug-optimized" ]]; then
+    [[ -n "${SIGN_IDENTITY:-}" ]] ||
+        fail "debug-optimized requires an explicit SIGN_IDENTITY=\"Apple Development: ...\"; auto-detected and ad-hoc signing are not supported."
+    [[ "$SIGN_IDENTITY" != "-" ]] ||
+        fail "debug-optimized does not support ad-hoc signing (SIGN_IDENTITY=-); set SIGN_IDENTITY=\"Apple Development: ...\"."
+    [[ "$SIGN_IDENTITY" == "Apple Development:"* ]] ||
+        fail "debug-optimized requires SIGN_IDENTITY to begin with 'Apple Development:'; got '$SIGN_IDENTITY'."
+    [[ -z "${BUNDLE_ID:-}" && -z "${DEBUG_BUNDLE_ID:-}" ]] ||
+        fail "debug-optimized keeps the debug bundle ID; unset BUNDLE_ID and DEBUG_BUNDLE_ID."
+    [[ -z "${REPOPROMPT_ENABLE_SENTRY+set}" && -z "${REPOPROMPT_UPLOAD_SENTRY_SYMBOLS+set}" ]] ||
+        fail "debug-optimized does not support Sentry; unset REPOPROMPT_ENABLE_SENTRY and REPOPROMPT_UPLOAD_SENTRY_SYMBOLS."
 fi
 
 BUNDLE_ID_OVERRIDE="${BUNDLE_ID:-}"
@@ -196,6 +219,22 @@ SENTRY_SYMBOLS_DIR="$ROOT_DIR/.build/sentry-symbols/$CONF"
 
 IS_RELEASE=0
 [[ "$CONF" == "release" ]] && IS_RELEASE=1
+# Build lane. debug-optimized compiles `swift build -c release` with first-party DEBUG in its own
+# scratch folder; IS_RELEASE stays 0, so it takes every debug identity, signing, storage-marker,
+# provenance, single-build, staging, package-cache and verification branch below.
+BUILD_LANE="$CONF"
+SWIFT_CONF="$CONF"
+CANONICAL_PREFIX=()
+COMPAT_CONF="$CONF"
+IS_OPTIMIZED_LANE=0
+OPTIMIZED_SCRATCH_DIR="$ROOT_DIR/.build/optimized-diagnostics"
+LANE_FLAGS_VERIFIED=0
+if [[ "$CONF" == "debug-optimized" ]]; then
+    IS_OPTIMIZED_LANE=1
+    SWIFT_CONF="release"
+    CANONICAL_PREFIX=(--rpce-optimized-diagnostics)
+    COMPAT_CONF="debug"
+fi
 if (( FAST_PACKAGE_REQUESTED )); then
     if (( IS_RELEASE )); then
         echo "WARNING: Fast packaging is debug-only; ignoring the 'fast' marker for release packaging."
@@ -209,6 +248,11 @@ if (( IS_RELEASE )); then
 else
     BUNDLE_ID="${BUNDLE_ID_OVERRIDE:-${DEBUG_BUNDLE_ID:-$BASE_BUNDLE_ID.debug}}"
     URL_SCHEME="repoprompt-ce-debug"
+fi
+if (( IS_OPTIMIZED_LANE )); then
+    [[ "$BUNDLE_ID" == "com.pvncher.repoprompt.ce.debug" ]] ||
+        fail "debug-optimized requires the debug bundle ID com.pvncher.repoprompt.ce.debug; resolved '$BUNDLE_ID'."
+    echo "*** OPTIMIZED DIAGNOSTICS LANE: swift -c release, first-party DEBUG, debug identity ***"
 fi
 
 phase "Checking build environment"
@@ -332,7 +376,7 @@ fi
 printf 'Debug secure storage backend marker: %s\n' "$DEBUG_STORAGE_BACKEND_MARKER"
 printf 'Signing mode marker: %s\n' "$SIGNING_MODE_MARKER"
 
-SWIFT_BUILD_ARGS=(-c "$CONF")
+SWIFT_BUILD_ARGS=(-c "$SWIFT_CONF")
 if sentry_linking_enabled; then
     SWIFT_BUILD_ARGS+=(-debug-info-format dwarf)
 fi
@@ -355,7 +399,13 @@ if (( PUBLIC_UNIVERSAL_RELEASE )); then
         "$CONTROL_PLANE_SCRIPTS_DIR/build_swiftpm_release_products.sh" "$BUILD_DIR"
 else
     phase "Patching KeyboardShortcuts resource lookup"
+    if (( IS_OPTIMIZED_LANE )); then
+        # The lane's own dependency checkouts live in its scratch folder (canonical_swift.sh).
+        run env REPOPROMPT_SWIFTPM_SCRATCH_PATH="$OPTIMIZED_SCRATCH_DIR" \
+            "$CONTROL_PLANE_SCRIPTS_DIR/patch_keyboard_shortcuts_resource_lookup.sh" "$ROOT_DIR"
+    else
     run "$CONTROL_PLANE_SCRIPTS_DIR/patch_keyboard_shortcuts_resource_lookup.sh" "$ROOT_DIR"
+    fi
 
     if (( IS_RELEASE )); then
     phase "Building $APP_NAME ($CONF, host-native)"
@@ -370,13 +420,15 @@ else
         # Debug: one product-less build of the default graph. Every root non-test target
         # belongs to one of the three products above. SwiftPM also builds a few small
         # dependency-package executables; they no-op unless dependencies change.
+        # debug-optimized adds only the wrapper's leading lane flag (an empty prefix otherwise;
+        # ${arr[@]+...} keeps an empty array safe under set -u on bash 3.2).
         phase "Building debug products ($CONF, host-native)"
-        run "$CONTROL_PLANE_SCRIPTS_DIR/canonical_swift.sh" build "${SWIFT_BUILD_ARGS[@]}"
+        run "$CONTROL_PLANE_SCRIPTS_DIR/canonical_swift.sh" ${CANONICAL_PREFIX[@]+"${CANONICAL_PREFIX[@]}"} build "${SWIFT_BUILD_ARGS[@]}"
     fi
 
     phase "Resolving build artifact paths"
-    echo_cmd "$CONTROL_PLANE_SCRIPTS_DIR/canonical_swift.sh" build -c "$CONF" --show-bin-path
-    BUILD_DIR="$("$CONTROL_PLANE_SCRIPTS_DIR/canonical_swift.sh" build -c "$CONF" --show-bin-path)"
+    echo_cmd "$CONTROL_PLANE_SCRIPTS_DIR/canonical_swift.sh" ${CANONICAL_PREFIX[@]+"${CANONICAL_PREFIX[@]}"} build -c "$SWIFT_CONF" --show-bin-path
+    BUILD_DIR="$("$CONTROL_PLANE_SCRIPTS_DIR/canonical_swift.sh" ${CANONICAL_PREFIX[@]+"${CANONICAL_PREFIX[@]}"} build -c "$SWIFT_CONF" --show-bin-path)"
 fi
 if (( PUBLIC_UNIVERSAL_RELEASE )); then
     APP_BUNDLE="$ROOT_DIR/.build/release/$APP_NAME.app"
@@ -385,10 +437,33 @@ elif (( IS_RELEASE )); then
 else
     APP_BUNDLE="${REPOPROMPT_DEBUG_APP_BUNDLE:-$HOME/Library/Application Support/RepoPrompt CE/DebugApps/$APP_NAME.app}"
 fi
-COMPAT_APP_BUNDLE="$ROOT_DIR/.build/$CONF/$APP_NAME.app"
+COMPAT_APP_BUNDLE="$ROOT_DIR/.build/$COMPAT_CONF/$APP_NAME.app"
 CLI_PATH="$BUILD_DIR/repoprompt-mcp"
 GATEWAY_PATH="$BUILD_DIR/repoprompt-gateway"
 printf 'BUILD_DIR=%s\nAPP_BUNDLE=%s\nCOMPAT_APP_BUNDLE=%s\nCLI_PATH=%s\nGATEWAY_PATH=%s\nAD_HOC_SIGNING=%s\nARCHITECTURE_POLICY=%s\n' "$BUILD_DIR" "$APP_BUNDLE" "$COMPAT_APP_BUNDLE" "$CLI_PATH" "$GATEWAY_PATH" "$USE_ADHOC_SIGNING" "$ARCHITECTURE_POLICY"
+
+# Optimized-diagnostics lane-flag verifier: on every lane package (fresh, noop-dest and noop-clone)
+# before the cache plan and any reuse. Any non-zero status, usage errors (2) included, fails packaging.
+if (( IS_OPTIMIZED_LANE )); then
+    phase "Verifying optimized-diagnostics lane flags"
+    LANE_SCRATCH_CANONICAL="$(CDPATH='' cd -- "$OPTIMIZED_SCRATCH_DIR" 2>/dev/null && pwd -P)" ||
+        fail "debug-optimized scratch folder is missing: $OPTIMIZED_SCRATCH_DIR"
+    LANE_BUILD_DIR_CANONICAL="$(CDPATH='' cd -- "$BUILD_DIR" 2>/dev/null && pwd -P)" ||
+        fail "debug-optimized BUILD_DIR is missing: $BUILD_DIR"
+    [[ "$LANE_BUILD_DIR_CANONICAL" == "$LANE_SCRATCH_CANONICAL/"* ]] ||
+        fail "debug-optimized BUILD_DIR must lie under $OPTIMIZED_SCRATCH_DIR; got $BUILD_DIR ($LANE_BUILD_DIR_CANONICAL)."
+    LANE_BUILD_PLAN_DIR="$(CDPATH='' cd -- "$LANE_BUILD_DIR_CANONICAL/../.." 2>/dev/null && pwd -P)" ||
+        fail "debug-optimized could not resolve the build-plan folder of $BUILD_DIR"
+    [[ "$LANE_BUILD_PLAN_DIR" == "$LANE_SCRATCH_CANONICAL" ]] ||
+        fail "debug-optimized BUILD_DIR must be <scratch>/<triple>/release under $OPTIMIZED_SCRATCH_DIR; got $BUILD_DIR ($LANE_BUILD_DIR_CANONICAL)."
+    LANE_BUILD_YAML="$LANE_BUILD_PLAN_DIR/release.yaml"
+    echo_cmd python3 -I -S "$CONTROL_PLANE_SCRIPTS_DIR/verify_build_lane_flags.py" --build-yaml "$LANE_BUILD_YAML"
+    LANE_VERIFY_STATUS=0
+    python3 -I -S "$CONTROL_PLANE_SCRIPTS_DIR/verify_build_lane_flags.py" --build-yaml "$LANE_BUILD_YAML" || LANE_VERIFY_STATUS=$?
+    (( LANE_VERIFY_STATUS == 0 )) ||
+        fail "verify_build_lane_flags.py exited with status $LANE_VERIFY_STATUS; the build plan does not prove the optimized-diagnostics lane flags."
+    LANE_FLAGS_VERIFIED=1
+fi
 
 # Strict reader for debug_package_cache.py stdout: schema=1 first, then each expected key once.
 # Unknown, duplicate, missing or malformed lines fail loudly. No eval.
@@ -709,6 +784,7 @@ if (( ! IS_RELEASE )); then
     # A reused bundle keeps its provenance bytes; its input key already pins the same Git state.
     if (( ! DEBUG_PACKAGE_REUSED )); then
     phase "Writing debug bundle provenance"
+    BUILD_LANE_FOR_PROVENANCE="$BUILD_LANE" LANE_FLAGS_VERIFIED_FOR_PROVENANCE="$LANE_FLAGS_VERIFIED" \
     ROOT_DIR_FOR_PROVENANCE="$ROOT_DIR" APP_BUNDLE_FOR_PROVENANCE="$APP_BUNDLE" GIT_STATE_FOR_PROVENANCE="$DEBUG_PACKAGE_GIT_STATE" python3 - <<'PY'
 from __future__ import annotations
 
@@ -722,6 +798,16 @@ root = Path(os.environ["ROOT_DIR_FOR_PROVENANCE"]).resolve()
 bundle = Path(os.environ["APP_BUNDLE_FOR_PROVENANCE"])
 # The plan's Git snapshot (also hashed into the input key); no second Git query.
 git_state = json.loads(os.environ["GIT_STATE_FOR_PROVENANCE"])
+# Build-lane labels (additive keys; readers check only the fields they need).
+lane = os.environ["BUILD_LANE_FOR_PROVENANCE"]
+lane_labels = {
+    "debug": {"swiftConfiguration": "debug", "optimization": "Onone", "assertConfiguration": "Debug", "laneFlagsVerified": None},
+    "debug-optimized": {"swiftConfiguration": "release", "optimization": "O", "assertConfiguration": "Release", "laneFlagsVerified": True},
+}
+if lane not in lane_labels:
+    raise SystemExit(f"ERROR: unknown debug build lane {lane!r} for provenance")
+if lane == "debug-optimized" and os.environ["LANE_FLAGS_VERIFIED_FOR_PROVENANCE"] != "1":
+    raise SystemExit("ERROR: debug-optimized provenance requires verified lane flags")
 now = time.time()
 payload = {
     "version": 1,
@@ -733,6 +819,8 @@ payload = {
     "dirty": bool(git_state["dirty"]),
     "buildTimeEpoch": now,
     "buildTimeISO": datetime.fromtimestamp(now, timezone.utc).astimezone().isoformat(timespec="seconds"),
+    "buildLane": lane,
+    **lane_labels[lane],
 }
 path = bundle / "Contents" / "Resources" / "RepoPromptDebugProvenance.json"
 path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")

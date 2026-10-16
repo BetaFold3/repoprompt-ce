@@ -171,6 +171,7 @@ CLOSURE_EXCLUSIONS = {
     "build_swiftpm_release_products.sh": "release-only",
     "write_app_artifact_manifest.py": "release-only",
     "upload_sentry_debug_symbols.sh": "Sentry side effect; REPOPROMPT_UPLOAD_SENTRY_SYMBOLS is an ENV_INPUTS value",
+    "verify_build_lane_flags.py": "lane-only build-plan check; runs on every lane package before the plan; no output effect",
     # ROOT_DIR paths
     ".build": "build outputs, destinations and generated state",
     "Scripts": "default control-plane scripts dir; its files are INPUT_SCRIPTS",
@@ -194,6 +195,9 @@ CLOSURE_EXCLUSIONS = {
     "REPOPROMPT_PROVISIONING_PROFILE": "release-only",
     "REPOPROMPT_RUN_WITHOUT_GITHUB_TOKENS": "release-only (universal builder)",
     "REPOPROMPT_SENTRY_AUTH_TOKEN_FILE": "Sentry upload credentials; no bundle effect",
+    "REPOPROMPT_SWIFTPM_SCRATCH_PATH": (
+        "lane scratch path for the KeyboardShortcuts patch helper; its effect reaches the key through the product stat records"
+    ),
     "SENTRY_AUTH_TOKEN": "Sentry upload credentials; no bundle effect",
     "SENTRY_AUTH_TOKEN_FILE": "Sentry upload credentials; no bundle effect",
     "SIGNING_TEAM_ID": "release-only checks; debug value comes from version.env",
