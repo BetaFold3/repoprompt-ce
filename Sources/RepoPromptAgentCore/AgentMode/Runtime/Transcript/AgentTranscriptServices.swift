@@ -2702,6 +2702,61 @@ package enum AgentTranscriptIO {
         )
     }
 
+    /// Keeps each existing interrupted (cancelled/failed) turn's terminal envelope through a rebuild
+    /// that brings no new information for that turn. Working rows cannot carry the envelope: import
+    /// closes spans as `.completed` and applies the supplied run state only to the trailing turn, so a
+    /// cold-cancelled turn (`AgentSessionRestoreSupport.sanitizeColdRestoredTranscript`) rebuilt at the
+    /// restored idle state would otherwise become idle with completed spans, and an earlier interrupted
+    /// turn would lose its state whenever a rebuild re-imports it.
+    /// A rebuilt turn keeps the envelope only when the existing turn with the same ID has the same
+    /// request, spans and activity rows (content repairs allowed) and no open span. The supplied state
+    /// applies only to the rebuilt final turn, so that turn additionally requires a non-active run and
+    /// no different explicit terminal state; otherwise the rebuild wins. Full-turn summaries are derived
+    /// caches that compaction clears, so they are not part of the envelope.
+    private static func preservingInterruptedTurnEnvelopes(
+        in rebuiltWorkingTranscript: AgentTranscript,
+        existingWorkingTranscript: AgentTranscript,
+        terminalState: AgentSessionRunState?
+    ) -> AgentTranscript {
+        var interruptedTurnsByID: [UUID: AgentTranscriptTurn] = [:]
+        for turn in existingWorkingTranscript.turns {
+            guard turn.terminalState == .cancelled || turn.terminalState == .failed,
+                  !turn.responseSpans.contains(where: { $0.lifecycle == .open })
+            else { continue }
+            interruptedTurnsByID[turn.id] = turn
+        }
+        guard !interruptedTurnsByID.isEmpty else {
+            return rebuiltWorkingTranscript
+        }
+        var preserved = rebuiltWorkingTranscript
+        let finalIndex = preserved.turns.indices.last
+        for index in preserved.turns.indices {
+            let rebuiltTurn = preserved.turns[index]
+            guard let existingTurn = interruptedTurnsByID[rebuiltTurn.id],
+                  let interruptedState = existingTurn.terminalState,
+                  rebuiltTurn.request?.id == existingTurn.request?.id,
+                  rebuiltTurn.responseSpans.map(\.id) == existingTurn.responseSpans.map(\.id),
+                  rebuiltTurn.responseSpans.map({ $0.activities.map(\.id) })
+                  == existingTurn.responseSpans.map({ $0.activities.map(\.id) })
+            else { continue }
+            if index == finalIndex,
+               !(terminalState == nil || terminalState == .idle || terminalState == interruptedState)
+            {
+                continue
+            }
+            var turn = rebuiltTurn
+            turn.terminalState = interruptedState
+            turn.completedAt = existingTurn.completedAt ?? turn.completedAt
+            for spanIndex in turn.responseSpans.indices {
+                let existingSpan = existingTurn.responseSpans[spanIndex]
+                turn.responseSpans[spanIndex].lifecycle = existingSpan.lifecycle
+                turn.responseSpans[spanIndex].completedAt = existingSpan.completedAt ?? turn.responseSpans[spanIndex].completedAt
+            }
+            preserved.turns[index] = turn
+        }
+        return preserved
+    }
+
     package static func rebuiltTranscriptPreservingCompactedPrefix(
         existingTranscript: AgentTranscript,
         workingItems: [AgentChatItem],
@@ -2746,7 +2801,11 @@ package enum AgentTranscriptIO {
         }
         var mergedTranscript = transcriptByReplacingWorkingTurns(
             in: existingTranscript,
-            with: rebuiltWorkingTranscript,
+            with: preservingInterruptedTurnEnvelopes(
+                in: rebuiltWorkingTranscript,
+                existingWorkingTranscript: existingWorkingTranscript,
+                terminalState: terminalState
+            ),
             nextSequenceIndex: nextSequenceIndex ?? rebuiltWorkingTranscript.nextSequenceIndex
         )
         let reusableFrozenPrefixTurnCount = AgentTranscriptDurableFrontierSupport.validatedFrozenPrefixTurnCountForIncrementalReuse(

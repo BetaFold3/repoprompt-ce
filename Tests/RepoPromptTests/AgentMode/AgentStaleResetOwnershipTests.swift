@@ -1871,6 +1871,130 @@ final class AgentStaleResetOwnershipTests: XCTestCase {
         XCTAssertEqual(resaved.lastUserMessageAt, persisted.lastUserMessageAt)
     }
 
+    /// A session persisted while running is cold-hydrated into a background tab of a peer window whose
+    /// own owner stays active, so its save is not active-owned. The tab is reused: its placeholder still
+    /// holds a previous `.completed` run state, which hydration stamps before installing the restored
+    /// idle state (see `testColdHydratedBackgroundSessionSaveReuseCharacterization`). The stale stamp
+    /// rejects presentation reuse with no refresh pending, so the save rebuilds through the non-active
+    /// persistence-only snapshot (`persistableTranscriptSnapshot`) at idle. The cancelled turn and span
+    /// survive in memory, in the saved file's bytes, and through a reload.
+    func testColdCancelledBackgroundSessionSaveKeepsCancelledTurnThroughPersistenceOnlySnapshot() async throws {
+        let metricLines = try await assertColdCancelledBackgroundSessionSave(
+            ownerWindowID: 4392,
+            peerWindowID: 4393,
+            placeholderRunState: .completed,
+            endsWithUnmatchedToolCall: false
+        )
+        let fallbackLines = metricLines.filter { $0.contains(" save.session.persistenceOnlySnapshot ") }
+        XCTAssertEqual(fallbackLines.count, 1, "The save took the non-active persistence-only snapshot: \(metricLines)")
+        XCTAssertTrue(
+            fallbackLines.first?.split(separator: " ").contains("syncDelta=syncDelta.run") == true,
+            "\(fallbackLines)"
+        )
+        XCTAssertFalse(metricLines.contains { $0.contains(" save.session.localPendingToolRepair ") }, "\(metricLines)")
+    }
+
+    /// The same background save when the interrupted turn ends in a tool call without a result (bash
+    /// was running at quit): the save's pending-tool repair converts that row in place as a non-active
+    /// owner and refreshes the derived transcript (`.saveSession`), whose rebuild keeps the cancelled
+    /// turn; the save then reuses that presentation.
+    func testColdCancelledMidToolBackgroundSessionSaveKeepsCancelledTurnThroughPendingToolRepair() async throws {
+        let metricLines = try await assertColdCancelledBackgroundSessionSave(
+            ownerWindowID: 4394,
+            peerWindowID: 4399,
+            placeholderRunState: nil,
+            endsWithUnmatchedToolCall: true
+        )
+        XCTAssertTrue(
+            metricLines.contains {
+                $0.contains(" save.session.localPendingToolRepair ") && $0.contains("activeOwned=false") && $0.contains("repairedCount=1")
+            },
+            "The save repaired the unmatched call as a non-active owner: \(metricLines)"
+        )
+        XCTAssertFalse(metricLines.contains { $0.contains(" save.session.persistenceOnlySnapshot ") }, "\(metricLines)")
+    }
+
+    /// Persists a two-turn OpenCode session at run state running, cold-hydrates it into a background tab
+    /// of a peer window, saves that tab, and asserts the cancelled final turn and span in memory, in the
+    /// saved bytes, and after a reload. Returns the save's DEBUG metric lines for the background tab.
+    private func assertColdCancelledBackgroundSessionSave(
+        ownerWindowID: Int,
+        peerWindowID: Int,
+        placeholderRunState: AgentSessionRunState?,
+        endsWithUnmatchedToolCall: Bool
+    ) async throws -> [String] {
+        let owner = try await makeHarness(windowID: ownerWindowID)
+        owner.session.selectedAgent = .openCode
+        for turn in 0 ..< 2 {
+            owner.session.appendItem(.user("Turn \(turn) request"))
+            owner.session.appendItem(.assistant("Turn \(turn) reply"))
+        }
+        if endsWithUnmatchedToolCall {
+            owner.session.appendItem(.toolCall(name: "bash", invocationID: UUID(), argsJSON: #"{"command":"sleep 60"}"#))
+        }
+        let lastRowID = try XCTUnwrap(owner.session.items.last?.id)
+        owner.session.runState = .running
+        let ownerSaved = await owner.viewModel.flushSave(for: owner.tabID)
+        XCTAssertTrue(ownerSaved)
+        let sessionID = try XCTUnwrap(owner.session.activeAgentSessionID)
+        let persisted = try await owner.persistedSession()
+        XCTAssertEqual(persisted.lastRunState, AgentSessionRunState.idle.rawValue, "A persisted active run loads as idle")
+        let fileURL = try XCTUnwrap(persisted.fileURL)
+
+        // Another owner stays active in the peer window; the bound tab hydrates in the background.
+        let peer = try await makeHarness(windowID: peerWindowID, workspace: owner.workspace, storageURL: owner.storageURL)
+        let backgroundTabID = UUID()
+        let background = try XCTUnwrap(peer.viewModel.session(for: backgroundTabID, createIfNeeded: true))
+        if let placeholderRunState {
+            background.runState = placeholderRunState
+        }
+        XCTAssertNotNil(peer.viewModel.test_installPersistentSessionBinding(sessionID: sessionID, on: background))
+        let hydrated = await peer.viewModel.test_hydrateBoundSession(tabID: backgroundTabID)
+        XCTAssertTrue(hydrated === background)
+        XCTAssertEqual(background.persistedLoadDisposition, .applied)
+        XCTAssertEqual(peer.viewModel.currentTabID, peer.tabID, "The background tab is not the active owner")
+        XCTAssertFalse(peer.viewModel.canBuildOrPublishActiveTranscriptBindings(for: background))
+        XCTAssertEqual(background.runState, .idle)
+        let restoredTurn = try XCTUnwrap(background.transcript.turns.last)
+        XCTAssertEqual(restoredTurn.terminalState, .cancelled)
+        XCTAssertEqual(restoredTurn.responseSpans.map(\.lifecycle), [.cancelled])
+        XCTAssertEqual(background.items.last?.id, lastRowID)
+        XCTAssertEqual(background.items.last?.kind, endsWithUnmatchedToolCall ? .toolCall : .assistant)
+        XCTAssertNil(background.pendingDerivedTranscriptRefreshReason)
+        XCTAssertNil(background.derivedTranscriptRefreshTask)
+
+        let previousOverride = AgentModePerfDiagnostics.debugProcessOverrideEnabled
+        AgentModePerfDiagnostics.setDebugProcessOverrideEnabled(true)
+        defer { AgentModePerfDiagnostics.setDebugProcessOverrideEnabled(previousOverride) }
+        background.isDirty = true
+        let backgroundSaved = await peer.viewModel.flushSave(for: backgroundTabID)
+        await peer.viewModel.awaitInFlightSave(sessionID: sessionID)
+        XCTAssertTrue(backgroundSaved)
+        let backgroundTag = "tabID=\(AgentModePerfDiagnostics.shortID(backgroundTabID))"
+        let metricLines = AgentModePerfDiagnostics.recentMetricLinesSnapshot(limit: 1000).filter { $0.contains(backgroundTag) }
+        XCTAssertEqual(background.items.last?.id, lastRowID)
+        if endsWithUnmatchedToolCall {
+            XCTAssertEqual(background.items.last?.kind, .toolResult, "The repair converted the call in place")
+        }
+
+        func assertCancelled(_ transcript: AgentTranscript?, _ stage: String) throws {
+            let turn = try XCTUnwrap(transcript?.turns.last, stage)
+            XCTAssertEqual(turn.id, restoredTurn.id, stage)
+            XCTAssertEqual(turn.terminalState, .cancelled, "\(stage): the interrupted turn stays cancelled")
+            XCTAssertEqual(turn.responseSpans.map(\.lifecycle), [.cancelled], stage)
+            XCTAssertTrue(turn.allActivities.contains { $0.id == lastRowID }, stage)
+        }
+        try assertCancelled(background.transcript, "in memory after save")
+        let savedSession = try JSONDecoder().decode(AgentSession.self, from: Data(contentsOf: fileURL))
+        XCTAssertEqual(savedSession.id, sessionID)
+        XCTAssertEqual(savedSession.lastRunState, AgentSessionRunState.idle.rawValue)
+        try assertCancelled(savedSession.transcript, "saved bytes")
+        let reloaded = try await peer.viewModel.test_dataService.loadAgentSession(id: sessionID, for: peer.workspace)
+        XCTAssertEqual(reloaded?.lastRunState, AgentSessionRunState.idle.rawValue)
+        try assertCancelled(reloaded?.transcript, "reloaded")
+        return metricLines
+    }
+
     // MARK: - Harness
 
     /// Mirrors `PromptViewModel.defaultComposeTabSoftLimit`, the interactive auto-stash threshold.
