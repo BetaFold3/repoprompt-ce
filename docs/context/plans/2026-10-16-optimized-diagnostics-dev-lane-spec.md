@@ -475,14 +475,14 @@ Each step compiles and passes its tests on its own.
 8. **Launch smoke and A-B-A measurement** (validation steps 8–9), as owner-approved actions.
 
 Status:
-- Step 1 — done | rounds 0/2 | open: | downgraded: | assumed: assertions off and isolated scratch as approved | deferred: S1-P3-1 allowlist; S1-P3-4 gate-copy static test; optimized compile to Step 4; pre-existing release-selftest lint assertion (optimized-lane-step1-review.md)
-- Step 2 — done | rounds 0/2 | open: | downgraded: | assumed: literal no-DEBUG rule includes dormant tests | deferred: real optimized-plan validation to Step 4 (optimized-lane-step2-review.md)
-- Step 3 — done | rounds 0/2 | open: | downgraded: | assumed: explicit Apple Development name as specified | deferred: real caller environment to Step 4; SHA1 identity selection only if needed; baseline release-selftest lint assertion (optimized-lane-step3-review.md)
+- Step 1 — done | rounds 0/2 | open: | downgraded: | assumed: assertions off and isolated scratch as approved | deferred: S1-P3-1 allowlist; S1-P3-4 gate-copy static test; pre-existing release-selftest lint assertion (optimized-lane-step1-review.md)
+- Step 2 — done | rounds 0/2 | open: | downgraded: | assumed: literal no-DEBUG rule includes dormant tests | deferred: none; real plan passed Step 4 (optimized-lane-step2-review.md)
+- Step 3 — done | rounds 0/2 | open: | downgraded: | assumed: explicit Apple Development name as specified | deferred: SHA1 identity selection only if needed; baseline release-selftest lint assertion (optimized-lane-step3-review.md)
 - Step 4 — done | rounds 0/2 | open: | downgraded: | assumed: build/packaging go only; default timeout remains 3600s | deferred: runtime acceptance Step 8; disk 7.0 GiB (8.9 GB free); optional SIGKILL-hint test/display label; baseline lint assertion (optimized-lane-step4-review.md, optimized-lane-step4-warnings.md)
-- Step 5 — done | rounds 0/2 | open: | downgraded: | assumed: protocol 19 workstream; restart idle daemon before acceptance | deferred: live lifecycle Step 8; liveApp queue/app-argv docs Step 7; cosmetic P3-4/5 (optimized-lane-step5-review.md)
+- Step 5 — done | rounds 0/2 | open: | downgraded: | assumed: protocol 19 workstream; restart idle daemon before acceptance | deferred: live lifecycle Step 8; cosmetic P3-4/5 (optimized-lane-step5-review.md)
 - Step 6 — done | rounds 0/2 | open: | downgraded: | assumed: observed stale source-list recovery only | deferred: live ping Step 8; plain-release equivalence and invalid-flag arm untested (optimized-lane-step6-review.md)
-- Step 7 — todo | rounds 0/2 | open: | downgraded: | assumed: | deferred:
-- Step 8 — todo | rounds 0/2 | open: | downgraded: | assumed: | deferred:
+- Step 7 — done | rounds 0/2 | open: | downgraded: | assumed: make environment behavior retained; costs advisory | deferred: refresh Pending documentation after Step 8 (optimized-lane-step7-review.md)
+- Step 8 — blocked | rounds 0/2 | open: fresh owner approval for visible relaunch | downgraded: | assumed: no runtime speedup claim before measurement | deferred: launch smoke and A-B-A comparison
 - Spec — done (owner approved implementation) | rounds 2/2 | open: | downgraded: | assumed: assertions off; per-invocation selection; separate build folder | deferred:
 
 ## Decisions

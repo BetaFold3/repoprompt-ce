@@ -108,7 +108,7 @@ Quit a running debug app normally before an ordinary `make dev-build` / `./condu
   - Stamps are also off under `REPOPROMPT_ENABLE_SENTRY=1` or a truthy `REPOPROMPT_UPLOAD_SENTRY_SYMBOLS`.
 - With the cache `off` or an unresolved identity, every nested component is signed, and the cache is never read, written, evicted or pruned.
 
-**Provenance.** The plan reads Git once (branch, commit, dirty); that snapshot feeds both the input key and `RepoPromptDebugProvenance.json`. Its build time is the assembly time. A reused bundle keeps its provenance bytes, so the build time is unchanged on `noop-dest` and `noop-clone`. A commit or dirty-flag flip changes the key, so the next package is `fresh`.
+**Provenance.** The plan reads Git once (branch, commit, dirty); that snapshot feeds both the input key and `RepoPromptDebugProvenance.json`. Its build time is the assembly time. A reused bundle keeps its provenance bytes, so the build time is unchanged on `noop-dest` and `noop-clone`. A commit or dirty-flag flip changes the key, so the next package is `fresh`. The file also names its lane (`"version"` stays 1; readers check only the fields they need): `buildLane` (`debug` or `debug-optimized`), `swiftConfiguration` (`debug` / `release`), `optimization` (`Onone` / `O`), `assertConfiguration` (`Debug` / `Release`) and `laneFlagsVerified` (`null` / `true`). The launch report and `app status` print `build lane: <buildLane>`, or `unknown (pre-lane provenance)` for an older bundle.
 
 **Failure and recovery.**
 - There is no in-run retry. A failed check exits non-zero and evicts every component entry it used and every destination or source stamp it consulted, matching or not, so the next package assembles and signs again.
@@ -133,6 +133,80 @@ A no-change `./conductor build` after launch was then `noop-dest`, with no signi
 The raw evidence is local working evidence. It lives only in the main checkout's git-excluded `.agent-artifacts/debug-packaging-incremental/`, is not tracked, and is absent from other clones.
 
 If the daemon is unavailable and direct packaging fails or hangs, capture traced output with `VERBOSE=1 ./Scripts/package_app.sh debug 2>&1 | tee /tmp/repoprompt-build.log`.
+
+### Optimized diagnostics lane (opt-in)
+
+The lane packages the same Dev app from an optimized build. SwiftPM builds `-c release` (`-O`, whole-module optimization, no `-enable-testing`) in its own scratch folder, `.build/optimized-diagnostics/`. `DEBUG` and the lane marker `RPCE_OPTIMIZED_DIAGNOSTICS` are defined only on the first-party Swift modules listed in `FIRST_PARTY_MODULES` in `Scripts/verify_build_lane_flags.py`; third-party and C modules build as plain release. A new first-party Swift target needs the manifest's first-party debug settings and an entry in that list. The verifier rejects an unlisted module only if its name starts with `RepoPrompt`; any other new name is checked as third-party, so it would build without `DEBUG` unnoticed. Packaging takes the debug path, so the bundle ID `com.pvncher.repoprompt.ce.debug`, the `repoprompt-ce-debug` URL scheme, Apple Development signing, the secure-storage marker, the destination, staging and user data are unchanged. The debug lane stays the default, with unchanged compiler arguments and environment. Release, local-production and public-release packaging never use the lane.
+
+**Select it per invocation.** Conductor keeps no lane state: each command chooses, and the same command without the flag returns to the debug lane. `make` is the exception noted below.
+
+```bash
+SIGN_IDENTITY='Apple Development: …' make dev-build OPTIMIZED=1           # ./conductor build --optimized
+SIGN_IDENTITY='Apple Development: …' make dev-run OPTIMIZED=1             # ./conductor run --optimized
+SIGN_IDENTITY='Apple Development: …' ./conductor app relaunch --optimized
+```
+
+`make dev-run OPTIMIZED=1` / `./conductor run --optimized` and `./conductor app relaunch --optimized` stop and relaunch the visible Dev app. Like their plain forms, each needs the user's just-in-time approval immediately before it runs. `make dev-build OPTIMIZED=1` / `./conductor build --optimized` into a scratch `REPOPROMPT_DEBUG_APP_BUNDLE` launches nothing.
+
+- The lane requires an explicit `SIGN_IDENTITY` beginning with `Apple Development:` (no auto-detected or ad-hoc signing), no `BUNDLE_ID` / `DEBUG_BUNDLE_ID` override, and `REPOPROMPT_ENABLE_SENTRY` and `REPOPROMPT_UPLOAD_SENTRY_SYMBOLS` unset. Packaging fails before building otherwise.
+- `make` treats only the value `1` as the lane. It also takes `OPTIMIZED` from the environment, so an exported `OPTIMIZED=1` makes every `make dev-build` and `make dev-run` use the lane; pass it on the command line instead. `make dev-launch-existing` ignores `OPTIMIZED`.
+- Only a leading `--optimized` selects the lane. To pass `--optimized` to the app itself, put it after `--` (`./conductor run -- --optimized`).
+- `app launch-existing` never builds and rejects `--optimized`; it launches whatever lane the bundle was packaged with. Direct `make build` stays debug-only, and `./conductor package` has no lane.
+- `--optimized` needs conductor protocol 19. An idle older daemon is replaced on the next command; a busy one refuses until idle instead of silently dropping the flag.
+- Plain and lane requests never share a request key, so they never merge.
+
+**What changes relative to the debug Dev app.**
+- Kept: all first-party `#if DEBUG` code, including `AgentModePerfDiagnostics`, the main-thread stall watchdog, `__repoprompt_debug_diagnostics` (used by `rpce-cli-debug`), the EditFlowPerf capture recorder, debug-only `app_settings` keys, and the debug app-support, socket and CLI paths.
+- Changed: `assert` and `assertionFailure` are not evaluated (release semantics); `precondition`, `fatalError`, overflow and exclusivity traps still trap. Third-party `#if DEBUG` paths behave as in the shipped app. Every link produces full dSYMs regardless of `RPCE_DEBUG_DSYM`, and no index store is written. Timing diagnostics should fire less often if the app is faster.
+- Lost: assertion checks, and lldb stepping and variable-inspection quality. Crash backtraces still symbolicate through the dSYMs, but inlined frames collapse.
+- This is release code generation plus first-party debug extras, not a shipping-performance claim; first-party `DEBUG` work still runs.
+
+**Proof on every lane package.** After the build and before the package keys are computed, including on `noop-dest` and `noop-clone`, `Scripts/verify_build_lane_flags.py` reads `.build/optimized-diagnostics/release.yaml`. Every first-party compile command must carry `-DDEBUG`, `-DRPCE_OPTIMIZED_DIAGNOSTICS`, `-O` and `-whole-module-optimization`, without `-Onone` or `-enable-testing`. No other module may carry either define. A missing first-party module or an unclassified `RepoPrompt*` module fails closed, and any failure fails packaging. Its selftest runs in `make conductor-selftest`. The package log prints `*** OPTIMIZED DIAGNOSTICS LANE … ***`.
+
+**Costs.** Measured on 2026-10-16 with probe bundles (advisory: one noisy host at 1-minute load about 3–4.6, single samples):
+- cold build: about 13 m 17 s (797 s, including about 100 s of first dependency resolution, checkout and patching);
+- one-line `RepoPromptApp` edit: 5 m 13 s (one whole-module `RepoPromptApp` compile plus relink, symbols and packaging);
+- no-change rebuild: 2.6 s (`noop-dest`);
+- disk: `.build/optimized-diagnostics/` grew to 7.0 GiB, mostly from a second copy of dependency repositories and binary artifacts. Check free space before a cold build.
+
+Edits to `RepoPromptShared` or `RepoPromptAgentCore` cascade and were not measured. The lane's runtime speed relative to the debug lane has not been measured.
+
+**Heavy slot.** Lane packaging runs in the machine-wide heavy slot and holds it for minutes. Meanwhile every other job on the machine that needs that slot waits: builds, packaging and source-validating tests (`make dev-test`, `dev-core-test`, `dev-provider-test`, `dev-test-parallel`), including other agents' loops. Daemon-admitted jobs report `waiting-heavy-slot`. Artifact-only `make dev-test-artifact` uses the separate XCTest slot and is not blocked. Keep debug for edit-build loops; build the lane at natural break points, when no agents are mid-test.
+
+**Live-app lane and supersession.** `run --optimized` and `app relaunch --optimized` package into staging inside the same job that later stops and launches the app, so that job holds the `liveApp` lane for the whole build. The running app stays usable meanwhile. A queued `app launch-existing` or a later FIFO `run` waits for the whole build. A newer `app relaunch` or `app stop` supersedes it (the newest relaunch intent wins); each is a visible lifecycle action that needs the user's just-in-time approval at that moment.
+
+**Timeout and interruption.** A lane `build`, `run` or `app relaunch` without `--timeout` gets the ordinary 3600 s limit. The lane floor, twice the measured cold build (1594 s), is lower, so it doesn't raise it. Pass a longer limit with `./conductor <command> --optimized --timeout <seconds>`; the `make` targets can't pass `--timeout`. What the clock counts differs by command:
+- `build`: the daemon takes the heavy slot before it starts the packaging process, and the clock starts with that process, so waiting for the slot doesn't count.
+- `run` and `app relaunch`: the clock starts when the job's process starts, and that process waits for the heavy slot itself, so time spent waiting behind other heavy jobs counts against the limit.
+
+Waiting in the queue for a local lane such as `liveApp` doesn't count for any of them. A timed-out lane job's message names the `--timeout` rerun. Whole-module compiles keep no partial results: a timeout, or a stop or relaunch that supersedes the job mid-compile, discards the interrupted module's progress, and the retry compiles it from zero. A failure before activation leaves the live bundle untouched.
+
+**Running app.** The caution under Publish applies unchanged: don't `build --optimized` into a running app's destination; use `run` or `app relaunch` for the live app.
+
+**Package cache and the compatibility link.** The lane shares `.build/debug/package-cache/v1/` and the `fresh` / `noop-dest` / `noop-clone` outcomes. The input key includes the lane, so reuse never crosses lanes: switching lanes at a destination always packages `fresh`, and a staged lane `run` clones the live bundle only when it is a lane bundle with the same inputs. Alternating lanes can evict the other lane's signed helper entries, which costs only a re-sign. Both lanes use the `.build/debug/RepoPrompt.app` compatibility link. A probe `build --optimized` with `REPOPROMPT_DEBUG_APP_BUNDLE` set to a scratch path points that link at the probe until the next `app relaunch` or `launch-existing` repairs it; launch through conductor rather than opening the link.
+
+**Labels and the evidence rule.** The bundle's provenance records the lane (see Provenance above). The running process reports its compiled-in lane as `buildLane` (`debug` or `debug-optimized`) in the diagnostics `ping`: `rpce-cli-debug -w <window-id> -c __repoprompt_debug_diagnostics -j '{"op":"ping"}'`.
+- Record `buildLane` from the running process with every timing sample.
+- Take `commit` and `dirty` from the bundle's provenance only once the process is bound to that bundle, by the rule `Scripts/live_codemap_authority_e2e.py` applies at capture start and again at capture end:
+  - `ps -o pid=,lstart=,comm=` must name the bundle's own `Contents/MacOS/RepoPrompt` for that PID.
+  - The process start time must be strictly later than the provenance `buildTimeEpoch` and the executable's mtime and ctime. `lstart` has whole-second precision and is treated as a lower bound, so a same-second or newer bundle is unproven. This catches a bundle replaced after launch but before the capture started.
+  - Then compare the process identity (PID and start time), the executable's stat record (device, inode, mode, size, mtime, ctime), its SHA-256 and the provenance bytes between start and end.
+  - Any failure or difference invalidates the capture, including a bundle replaced during it. The binding is a conservative timestamp rule, not a hash of the mapped executable.
+- Never pool samples from different lanes or commits.
+- `./conductor metrics` rows carry no lane. Identify lane jobs by joining a row's `ticket` to its job record (`./conductor job status <ticket> --json` shows `args.optimized: true`; the key is absent for the debug lane) while that record is retained, and never pool minutes-long lane builds with debug builds.
+
+**Stale local-package source list (observed once).** One lane build compiled against a cached plan that lacked a source file newly added to the local `Packages/RepoPromptCore` package, so app code using the new declaration failed with `cannot find '<name>' in scope`. Touching the root manifest (`touch Package.swift`, which changes only its mtime) and retrying the coordinated build recovered. Use this only for that symptom. Don't touch the manifest on every edit; equivalent staleness in the debug lane has not been reproduced.
+
+**Fresh worktrees (anticipated, not reproduced).** In a checkout that has never had a default debug build, lane packaging may create `.build/debug` as a real directory (package-cache root and compatibility link) where SwiftPM normally keeps a symlink, and a later default debug build might then fail or replace it. Run one default debug build first. If a default debug build later fails in such a checkout, check `ls -ld .build/debug` first. Only if it is a real directory, not a symlink, remove it while no conductor job runs (`rm -rf .build/debug`; this costs only package-cache speed).
+
+**Rollback.**
+1. Relaunch without `--optimized`, with the user's approval at that moment. This restores the plain Dev app with the same data and Keychain service.
+2. Revert the lane's commits, newest first. Steps 1–6 are `1d19255c` (manifest gate) through `7e349c6a` (running build lane), followed by the commit that added this subsection and the Makefile `OPTIMIZED` switch. Check `git log` for later commits that touch the same files before reverting.
+3. Optionally reclaim disk with `rm -rf .build/optimized-diagnostics`, only when `./conductor job list` shows no queued or running job and no direct packaging runs; the next lane build is cold again.
+
+No data migration is involved.
+
+**Pending** (refresh or remove when live acceptance completes). Build, packaging, identity and lane-flag proof were validated on probe bundles. Live acceptance (an approved `app relaunch --optimized` into `/Applications/RepoPrompt CE Dev.app`, the runtime `ping` label, Keychain continuity and existing data) and the debug-versus-optimized runtime comparison have not run.
 
 ## Use the CE debug CLI
 

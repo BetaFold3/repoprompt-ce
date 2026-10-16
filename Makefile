@@ -14,10 +14,10 @@ help:
 	@printf '  %-30s %s\n' 'clean' 'Remove .build'
 	@printf '\n%s\n' 'Coordinated developer daemon targets:'
 	@printf '  %-30s %s\n' 'dev-status' 'Show conductor daemon status'
-	@printf '  %-30s %s\n' 'dev-build' 'Coordinated debug app package build; FAST=1 is a compatibility alias'
+	@printf '  %-30s %s\n' 'dev-build' 'Coordinated debug app package build; FAST=1 is a compatibility alias; OPTIMIZED=1 selects the optimized-diagnostics lane (minutes per changed build)'
 	@printf '  %-30s %s\n' 'dev-swift-build' 'Coordinated Swift build; override with PRODUCT=name'
 	@printf '  %-30s %s\n' 'dev-dsym' 'Regenerate debug dSYMs for built products (never builds); PRODUCT=all|RepoPrompt|repoprompt-mcp|repoprompt-gateway|root-tests'
-	@printf '  %-30s %s\n' 'dev-run' 'Coordinated debug app build and launch'
+	@printf '  %-30s %s\n' 'dev-run' 'Coordinated debug app build and launch; OPTIMIZED=1 selects the optimized-diagnostics lane for this run only'
 	@printf '  %-30s %s\n' 'dev-launch-existing' 'Launch existing coordinated debug app without building'
 	@printf '  %-30s %s\n' 'dev-test' 'Coordinated test run; override with FILTER=name'
 	@printf '  %-30s %s\n' 'dev-test-artifact' 'Fast re-run of built tests; artifact-scoped, not source validation'
@@ -135,6 +135,7 @@ conductor-selftest:
 	python3 Scripts/test_conductor_benchmark.py
 	python3 Scripts/test_swift_pipeline_metrics.py
 	python3 Scripts/test_debug_dsym.py
+	python3 Scripts/test_verify_build_lane_flags.py
 	python3 Scripts/test_swift_build_benchmark.py
 	python3 Scripts/test_conductor_lifecycle.py
 	python3 Scripts/test_local_production_installer.py
@@ -184,7 +185,7 @@ dev-status:
 	./conductor status
 
 dev-build:
-	./conductor build$(if $(filter 1,$(FAST)), --fast)
+	./conductor build$(if $(filter 1,$(FAST)), --fast)$(if $(filter 1,$(OPTIMIZED)), --optimized)
 
 dev-swift-build:
 	./conductor swift-build --product $(PRODUCT)
@@ -193,7 +194,7 @@ dev-dsym:
 	./conductor dsym --product $(PRODUCT)
 
 dev-run:
-	./conductor run
+	./conductor run$(if $(filter 1,$(OPTIMIZED)), --optimized)
 
 dev-launch-existing:
 	./conductor app launch-existing
