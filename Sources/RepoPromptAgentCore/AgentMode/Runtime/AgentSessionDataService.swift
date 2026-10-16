@@ -229,8 +229,8 @@ package actor AgentSessionDataService {
     #endif
 
     private let persistenceServiceID = UUID()
-    private let encoder = JSONEncoder()
-    private let decoder = JSONDecoder()
+    private let encoder = AgentSessionDataService.makeSessionEncoder()
+    private let decoder = AgentSessionDataService.makeSessionDecoder()
     private let diskWriter = AgentSessionDiskWriter()
     private static let sidebarStreamMetadataIndexReconciliationDelaySeconds: TimeInterval = 2.0
 
@@ -293,6 +293,11 @@ package actor AgentSessionDataService {
             _ injector: (@Sendable (URL) -> Error?)?
         ) {
             test_agentSessionDeletionFailureInjector = injector
+        }
+
+        /// Test seam: how many operations are queued behind the session's persistence gate.
+        func test_sessionPersistenceWaiterCount(for sessionID: UUID) -> Int {
+            sessionPersistenceWaiters[sessionID]?.count ?? 0
         }
     #endif
 
@@ -476,15 +481,18 @@ package actor AgentSessionDataService {
         }
     }
 
-    private func computeLastUserMessageAt(in items: [AgentChatItemPersist]) -> Date? {
+    // The normalization and storage-preparation helpers below are static and read only their
+    // arguments, so cold hydration can run them off the actor (`loadAgentSessionForHydration`).
+
+    private static func computeLastUserMessageAt(in items: [AgentChatItemPersist]) -> Date? {
         AgentTranscriptIO.lastUserInteractionDate(in: items.map { $0.toItem() })
     }
 
-    private func computeLastUserMessageAt(in transcript: AgentTranscript) -> Date? {
+    private static func computeLastUserMessageAt(in transcript: AgentTranscript) -> Date? {
         AgentTranscriptIO.lastUserInteractionDate(in: transcript)
     }
 
-    private func computeProjectionCounts(in transcript: AgentTranscript) -> AgentTranscriptProjectionCounts {
+    private static func computeProjectionCounts(in transcript: AgentTranscript) -> AgentTranscriptProjectionCounts {
         AgentTranscriptProjectionBuilder.projectionCounts(for: transcript)
     }
 
@@ -504,7 +512,7 @@ package actor AgentSessionDataService {
         let lastUserMessageAt: Date?
     }
 
-    private func preparedSessionMetadata(
+    private static func preparedSessionMetadata(
         transcript: AgentTranscript?,
         workingItems: [AgentChatItem],
         existingItemCount: Int?,
@@ -547,7 +555,7 @@ package actor AgentSessionDataService {
         )
     }
 
-    private func sessionPreparedForStorage(
+    private static func sessionPreparedForStorage(
         _ session: AgentSession,
         fileURL: URL? = nil,
         savedAt: Date? = nil,
@@ -568,43 +576,24 @@ package actor AgentSessionDataService {
             return items
         }
 
-        switch preparation {
-        case .alreadyCanonicalTranscript:
-            if stored.transcript == nil {
-                let canonicalWorkingItems = workingItems()
-                if !canonicalWorkingItems.isEmpty {
-                    let nextSequenceIndex = max((canonicalWorkingItems.map(\.sequenceIndex).max() ?? -1) + 1, 0)
-                    stored.transcript = AgentTranscriptIO.buildTranscript(
-                        from: canonicalWorkingItems,
-                        terminalState: lastRunState,
-                        nextSequenceIndex: nextSequenceIndex,
-                        policy: .canonical
-                    )
-                }
+        // Both preparations build and persist the transcript the same way; `preparation` only decides
+        // whether provided metadata is preserved below.
+        if stored.transcript == nil {
+            let canonicalWorkingItems = workingItems()
+            if !canonicalWorkingItems.isEmpty {
+                let nextSequenceIndex = max((canonicalWorkingItems.map(\.sequenceIndex).max() ?? -1) + 1, 0)
+                stored.transcript = AgentTranscriptIO.buildTranscript(
+                    from: canonicalWorkingItems,
+                    terminalState: lastRunState,
+                    nextSequenceIndex: nextSequenceIndex,
+                    policy: .canonical
+                )
             }
-            if let transcript = stored.transcript {
-                let persisted = AgentTranscriptPolicyPipeline.persistedTranscript(from: transcript)
-                stored.transcript = persisted.transcript
-                persistedProjectionCounts = AgentTranscriptProjectionBuilder.projectionCounts(for: persisted.projection)
-            }
-        case .canonicalize:
-            if stored.transcript == nil {
-                let canonicalWorkingItems = workingItems()
-                if !canonicalWorkingItems.isEmpty {
-                    let nextSequenceIndex = max((canonicalWorkingItems.map(\.sequenceIndex).max() ?? -1) + 1, 0)
-                    stored.transcript = AgentTranscriptIO.buildTranscript(
-                        from: canonicalWorkingItems,
-                        terminalState: lastRunState,
-                        nextSequenceIndex: nextSequenceIndex,
-                        policy: .canonical
-                    )
-                }
-            }
-            if let transcript = stored.transcript {
-                let persisted = AgentTranscriptPolicyPipeline.persistedTranscript(from: transcript)
-                stored.transcript = persisted.transcript
-                persistedProjectionCounts = AgentTranscriptProjectionBuilder.projectionCounts(for: persisted.projection)
-            }
+        }
+        if let transcript = stored.transcript {
+            let persisted = AgentTranscriptPolicyPipeline.persistedTranscript(from: transcript)
+            stored.transcript = persisted.transcript
+            persistedProjectionCounts = AgentTranscriptProjectionBuilder.projectionCounts(for: persisted.projection)
         }
         stored.items = []
         stored.serializationVersion = AgentSession.currentSerializationVersion
@@ -630,10 +619,23 @@ package actor AgentSessionDataService {
         return stored
     }
 
-    private func normalizeLoadedSession(
+    private static func normalizeLoadedSession(
         _ session: AgentSession,
         fileURL: URL
     ) -> NormalizedLoadedSession {
+        let runtimeSession = runtimeNormalizedLoadedSession(session, fileURL: fileURL)
+        let storage = storageNormalizedLoadedSession(session, runtimeSession: runtimeSession, fileURL: fileURL)
+        return NormalizedLoadedSession(
+            runtimeSession: runtimeSession,
+            persistedSessionToRewrite: storage.needsRewrite ? storage.persistedSession : nil
+        )
+    }
+
+    /// The runtime half of `normalizeLoadedSession`: the in-memory session a load returns.
+    private static func runtimeNormalizedLoadedSession(
+        _ session: AgentSession,
+        fileURL: URL
+    ) -> AgentSession {
         let policy = AgentTranscriptImportPolicy.canonical
         let persistedLastRunState = session.lastRunState.flatMap(AgentSessionRunState.init(rawValue:))
         let restoredLastRunStateRaw = AgentSessionRestoreSupport.coldRestoredLastRunStateRaw(session.lastRunState)
@@ -713,6 +715,22 @@ package actor AgentSessionDataService {
             )
             runtimeSession.lastUserMessageAt = computeLastUserMessageAt(in: runtimeSession.items)
         }
+        return runtimeSession
+    }
+
+    private struct StorageNormalizedLoadedSession {
+        let persistedSession: AgentSession
+        let needsRewrite: Bool
+    }
+
+    /// The storage half of `normalizeLoadedSession`: the canonical stored form of `runtimeSession`
+    /// and whether the decoded `session` differs from it. The rewrite decision never compares
+    /// worktree merge operations; the stored form carries `runtimeSession`'s operations as given.
+    private static func storageNormalizedLoadedSession(
+        _ session: AgentSession,
+        runtimeSession: AgentSession,
+        fileURL: URL
+    ) -> StorageNormalizedLoadedSession {
         let persistedSession = sessionPreparedForStorage(
             runtimeSession,
             fileURL: fileURL,
@@ -727,10 +745,7 @@ package actor AgentSessionDataService {
             || session.itemCount != persistedSession.itemCount
             || session.transcriptProjectionCounts != persistedSession.transcriptProjectionCounts
             || session.lastUserMessageAt != persistedSession.lastUserMessageAt
-        return NormalizedLoadedSession(
-            runtimeSession: runtimeSession,
-            persistedSessionToRewrite: needsRewrite ? persistedSession : nil
-        )
+        return StorageNormalizedLoadedSession(persistedSession: persistedSession, needsRewrite: needsRewrite)
     }
 
     private func writeDataAtomically(_ data: Data, to fileURL: URL) async throws {
@@ -1607,6 +1622,8 @@ package actor AgentSessionDataService {
 
     /// Loads an editable session and its process-local persistence state under one gate. The
     /// caller must adopt both values together; the state cannot safely authorize an older snapshot.
+    /// Cold hydration uses `loadAgentSessionForHydration`, except in the DEBUG sequential
+    /// reference mode (`forcesSequentialHydrationPreparation`), which keeps this path.
     func loadAgentSessionForEditing(
         id sessionID: UUID,
         for workspace: some AgentWorkspaceStorageReference
@@ -1624,6 +1641,168 @@ package actor AgentSessionDataService {
                 workspaceID: workspace.id,
                 fileURL: fileURL
             )
+        )
+    }
+
+    /// Cold hydration's counterpart of `loadAgentSessionForEditing`: one gate-held operation that
+    /// loads the session exactly as `loadAgentSessionLocked` does while overlapping the load's
+    /// storage canonicalization with the hydration branch.
+    ///
+    /// Order: read, decode, and runtime normalization (off the actor); worktree merge
+    /// reconciliation; then two branches on the reconciled runtime session. The storage branch
+    /// prepares the stored form and the rewrite decision and encodes off the actor, then writes,
+    /// updates the metadata index, and records schedule authority on the actor. The hydration
+    /// branch is a structured child task (`async let`), so task-locals and cancellation propagate.
+    /// The storage branch does not observe cancellation and always completes before the hydration
+    /// branch is joined; the persistence state is captured after it and the gate is released, as in the
+    /// sequential path; then the hydration branch is awaited and cancellation is checked once more.
+    /// A storage failure releases the gate, then throws `loadFailed`; leaving the scope cancels and
+    /// implicitly awaits the hydration branch, whose result is discarded. A hydration failure,
+    /// including cancellation, is rethrown after the storage branch completed and the gate was released.
+    /// The gate is never held while only the hydration branch runs: that branch reads only its value
+    /// inputs.
+    func loadAgentSessionForHydration(
+        id sessionID: UUID,
+        for workspace: some AgentWorkspaceStorageReference,
+        inputs: AgentSessionHydrationBranchInputs
+    ) async throws -> AgentSessionHydrationLoad? {
+        await acquireSessionPersistence(for: sessionID)
+        var holdsSessionPersistence = true
+        defer {
+            if holdsSessionPersistence {
+                releaseSessionPersistence(for: sessionID)
+            }
+        }
+        let folder = try ensureAgentSessionsFolder(for: workspace)
+        let fileURL = agentSessionFileURL(id: sessionID, in: folder)
+        guard FileManager.default.fileExists(atPath: fileURL.path) else { return nil }
+
+        let prefix: HydrationLoadPrefix
+        do {
+            prefix = try await Self.hydrationLoadPrefix(fileURL: fileURL)
+        } catch {
+            throw AgentSessionDataError.loadFailed(error)
+        }
+        var reconciledSession = prefix.runtimeSession
+        let reconciledMergeOperations = await AgentSessionWorktreeMergeReconciler.reconcile(reconciledSession.worktreeMergeOperations)
+        let mergeOperationsChanged = reconciledMergeOperations != reconciledSession.worktreeMergeOperations
+        if mergeOperationsChanged {
+            reconciledSession.worktreeMergeOperations = reconciledMergeOperations
+        }
+        let runtimeSession = reconciledSession
+
+        async let hydration = Self.hydrationBranchResultOffActor(for: runtimeSession, inputs: inputs)
+        do {
+            let rewrite = try await Self.hydrationStorageRewrite(
+                loadedSession: prefix.loadedSession,
+                runtimeSession: runtimeSession,
+                fileURL: fileURL,
+                mergeOperationsChanged: mergeOperationsChanged
+            )
+            #if DEBUG
+                await Self.hydrationOverlapProbe?.storageCommitPoint()
+            #endif
+            try await commitLoadedSessionStorage(rewrite: rewrite, runtimeSession: runtimeSession, fileURL: fileURL)
+            #if DEBUG
+                Self.hydrationOverlapProbe?.branchFinished(.storage)
+            #endif
+        } catch {
+            // Release the gate first: leaving scope then cancels and implicitly awaits the hydration
+            // child (which reads only its value inputs), and its presentation is discarded.
+            holdsSessionPersistence = false
+            releaseSessionPersistence(for: sessionID)
+            throw AgentSessionDataError.loadFailed(error)
+        }
+        let persistenceState = persistenceState(
+            sessionID: sessionID,
+            workspaceID: workspace.id,
+            fileURL: fileURL
+        )
+        // The hydration branch reads only its value inputs, so the gate scope ends here as in the
+        // sequential path (which derives hydration after `loadAgentSessionForEditing` returns).
+        holdsSessionPersistence = false
+        releaseSessionPersistence(for: sessionID)
+        let hydrationResult = try await hydration
+        // An already-finished child does not observe a cancellation that arrived during storage.
+        try Task.checkCancellation()
+        return AgentSessionHydrationLoad(
+            editableLoad: AgentSessionEditableLoad(session: runtimeSession, persistenceState: persistenceState),
+            hydration: hydrationResult
+        )
+    }
+
+    /// The storage commit both load paths share: write a rewritten session and then index it, or
+    /// refresh an existing index record; then record schedule authority.
+    private func commitLoadedSessionStorage(
+        rewrite: LoadedSessionStorageRewrite?,
+        runtimeSession: AgentSession,
+        fileURL: URL
+    ) async throws {
+        if let rewrite {
+            try await writeDataAtomically(rewrite.encoded, to: fileURL)
+            await upsertMetadataRecord(
+                metadataRecord(from: rewrite.persistedSession, fileURL: fileURL),
+                folder: fileURL.deletingLastPathComponent()
+            )
+        } else {
+            await upsertMetadataRecordIfIndexPresent(runtimeSession, fileURL: fileURL)
+        }
+        rememberScheduleAuthority(from: runtimeSession, fileURL: fileURL)
+    }
+
+    /// Session file coders. The actor's coders and the fresh ones cold hydration uses off the actor
+    /// come from these factories, so both paths encode and decode identically.
+    private static func makeSessionEncoder() -> JSONEncoder {
+        JSONEncoder()
+    }
+
+    private static func makeSessionDecoder() -> JSONDecoder {
+        JSONDecoder()
+    }
+
+    private struct HydrationLoadPrefix {
+        /// The session as decoded from disk, compared against its stored form for the rewrite decision.
+        let loadedSession: AgentSession
+        /// The runtime normalization of `loadedSession`, before merge reconciliation.
+        let runtimeSession: AgentSession
+    }
+
+    private struct LoadedSessionStorageRewrite {
+        let persistedSession: AgentSession
+        let encoded: Data
+    }
+
+    /// Off-actor prefix of the hydration load: read, decode, and runtime normalization, as in
+    /// `loadAgentSessionLocked`. Decoding uses a fresh decoder from `makeSessionDecoder`.
+    @concurrent
+    private static func hydrationLoadPrefix(fileURL: URL) async throws -> HydrationLoadPrefix {
+        let data = try Data(contentsOf: fileURL, options: .mappedIfSafe)
+        let loadedSession = try AgentSessionDataCodec.decodeSession(from: data, using: makeSessionDecoder())
+        return HydrationLoadPrefix(
+            loadedSession: loadedSession,
+            runtimeSession: runtimeNormalizedLoadedSession(loadedSession, fileURL: fileURL)
+        )
+    }
+
+    /// Off-actor pure part of the hydration storage branch: the stored form of the reconciled runtime
+    /// session and `loadAgentSessionLocked`'s rewrite decision (normalization differences, or changed
+    /// merge operations, keeping the decoded `savedAt`), encoded with a fresh encoder from
+    /// `makeSessionEncoder`. Returns nil when no rewrite is needed.
+    @concurrent
+    private static func hydrationStorageRewrite(
+        loadedSession: AgentSession,
+        runtimeSession: AgentSession,
+        fileURL: URL,
+        mergeOperationsChanged: Bool
+    ) async throws -> LoadedSessionStorageRewrite? {
+        #if DEBUG
+            await hydrationOverlapProbe?.branchStarted(.storage)
+        #endif
+        let storage = storageNormalizedLoadedSession(loadedSession, runtimeSession: runtimeSession, fileURL: fileURL)
+        guard storage.needsRewrite || mergeOperationsChanged else { return nil }
+        return try LoadedSessionStorageRewrite(
+            persistedSession: storage.persistedSession,
+            encoded: AgentSessionDataCodec.encodeSession(storage.persistedSession, using: makeSessionEncoder())
         )
     }
 
@@ -1793,7 +1972,7 @@ package actor AgentSessionDataService {
                 || !$0.intentionallyRemovedAcceptedUserItemReceiptsByID.isEmpty
         } ?? false
 
-        let sessionToSave = sessionPreparedForStorage(
+        let sessionToSave = Self.sessionPreparedForStorage(
             sessionWithAuthoritativeSchedule,
             fileURL: fileURL,
             savedAt: Date(),
@@ -1946,7 +2125,7 @@ package actor AgentSessionDataService {
             session.scheduledSend = nil
         }
 
-        let sessionToSave = sessionPreparedForStorage(
+        let sessionToSave = Self.sessionPreparedForStorage(
             session,
             fileURL: fileURL,
             savedAt: Date(),
@@ -2311,7 +2490,7 @@ package actor AgentSessionDataService {
             session.scheduledSend = nil
         }
         session.lastScheduledDispatch = receipt
-        let sessionToSave = sessionPreparedForStorage(
+        let sessionToSave = Self.sessionPreparedForStorage(
             session,
             fileURL: fileURL,
             savedAt: Date(),
@@ -2418,13 +2597,13 @@ package actor AgentSessionDataService {
         do {
             let data = try Data(contentsOf: fileURL, options: .mappedIfSafe)
             let session = try AgentSessionDataCodec.decodeSession(from: data, using: decoder)
-            let normalized = normalizeLoadedSession(session, fileURL: fileURL)
+            let normalized = Self.normalizeLoadedSession(session, fileURL: fileURL)
             var runtimeSession = normalized.runtimeSession
             var persistedSessionToRewrite = normalized.persistedSessionToRewrite
             let reconciledMergeOperations = await AgentSessionWorktreeMergeReconciler.reconcile(runtimeSession.worktreeMergeOperations)
             if reconciledMergeOperations != runtimeSession.worktreeMergeOperations {
                 runtimeSession.worktreeMergeOperations = reconciledMergeOperations
-                persistedSessionToRewrite = sessionPreparedForStorage(
+                persistedSessionToRewrite = Self.sessionPreparedForStorage(
                     runtimeSession,
                     fileURL: fileURL,
                     savedAt: session.savedAt,
@@ -2432,17 +2611,13 @@ package actor AgentSessionDataService {
                     trustedCanonicalItemCount: runtimeSession.itemCount
                 )
             }
-            if let persistedSession = persistedSessionToRewrite {
-                let encoded = try AgentSessionDataCodec.encodeSession(persistedSession, using: encoder)
-                try await writeDataAtomically(encoded, to: fileURL)
-                await upsertMetadataRecord(
-                    metadataRecord(from: persistedSession, fileURL: fileURL),
-                    folder: fileURL.deletingLastPathComponent()
+            let rewrite = try persistedSessionToRewrite.map { persistedSession in
+                try LoadedSessionStorageRewrite(
+                    persistedSession: persistedSession,
+                    encoded: AgentSessionDataCodec.encodeSession(persistedSession, using: encoder)
                 )
-            } else {
-                await upsertMetadataRecordIfIndexPresent(runtimeSession, fileURL: fileURL)
             }
-            rememberScheduleAuthority(from: runtimeSession, fileURL: fileURL)
+            try await commitLoadedSessionStorage(rewrite: rewrite, runtimeSession: runtimeSession, fileURL: fileURL)
             return runtimeSession
         } catch {
             throw AgentSessionDataError.loadFailed(error)
@@ -2497,16 +2672,16 @@ package actor AgentSessionDataService {
                header.lastUserMessageAt == nil || header.itemCount == nil || header.transcriptProjectionCounts == nil,
                let fullSession = try? AgentSessionDataCodec.decodeSession(from: data, using: decoder)
             {
-                let normalized = normalizeLoadedSession(fullSession, fileURL: fileURL)
+                let normalized = Self.normalizeLoadedSession(fullSession, fileURL: fileURL)
                 if let transcript = normalized.runtimeSession.transcript {
-                    recoveredLastUserMessageAt = recoveredLastUserMessageAt ?? computeLastUserMessageAt(in: transcript)
-                    let projectionCounts = computeProjectionCounts(in: transcript)
+                    recoveredLastUserMessageAt = recoveredLastUserMessageAt ?? Self.computeLastUserMessageAt(in: transcript)
+                    let projectionCounts = Self.computeProjectionCounts(in: transcript)
                     recoveredProjectionCounts = recoveredProjectionCounts ?? projectionCounts
                     if header.itemCount == nil {
                         count = projectionCounts.canonicalVisibleRowCount
                     }
                 } else {
-                    recoveredLastUserMessageAt = recoveredLastUserMessageAt ?? computeLastUserMessageAt(in: normalized.runtimeSession.items)
+                    recoveredLastUserMessageAt = recoveredLastUserMessageAt ?? Self.computeLastUserMessageAt(in: normalized.runtimeSession.items)
                     recoveredProjectionCounts = recoveredProjectionCounts ?? .init(
                         canonicalVisibleRowCount: normalized.runtimeSession.items.count,
                         defaultPresentedRowCount: normalized.runtimeSession.items.count

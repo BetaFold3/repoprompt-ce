@@ -301,18 +301,104 @@ package enum AgentTranscriptIncrementalImportResult: Equatable {
     }
 
     package enum AgentTranscriptDebugInstrumentation {
-        package nonisolated(unsafe) static var isEnabled = false
-        nonisolated(unsafe) static var protectedTailScanHandler: ((AgentTranscriptProtectedTailScanMetrics) -> Void)?
-        nonisolated(unsafe) static var compactionHandler: ((AgentTranscriptCompactionMetrics) -> Void)?
-        nonisolated(unsafe) static var workingSourceItemsHandler: ((AgentTranscriptWorkingSourceItemsMetrics) -> Void)?
-        nonisolated(unsafe) static var rebuildHandler: ((AgentTranscriptRebuildMetrics) -> Void)?
-        nonisolated(unsafe) static var projectionBuildHandler: ((AgentTranscriptProjectionBuildMetrics) -> Void)?
-        nonisolated(unsafe) static var refreshAttemptHandler: ((AgentTranscriptRefreshAttemptMetrics) -> Void)?
-        package nonisolated(unsafe) static var presentationPublishHandler: ((AgentTranscriptPresentationPublishMetrics) -> Void)?
-        nonisolated(unsafe) static var sessionItemsReplacementHandler: ((AgentTranscriptSessionItemsReplacementMetrics) -> Void)?
-        nonisolated(unsafe) static var projectionIdentityHandler: ((AgentTranscriptProjectionIdentityMetrics) -> Void)?
+        /// Cold hydration runs storage canonicalization and presentation building concurrently, so
+        /// the enable flag and the stored handlers are guarded by `slotLock`, and `emit` serializes
+        /// handler invocations under the separate recursive `callLock` (handlers may emit nested
+        /// metrics), never under `slotLock`. The whole instrumentation is DEBUG-only (enclosing
+        /// `#if DEBUG`).
+        private static let slotLock = NSLock()
+        private static let callLock = NSRecursiveLock()
+        private nonisolated(unsafe) static var slots = Slots()
+
+        private struct Slots {
+            var isEnabled = false
+            var protectedTailScanHandler: ((AgentTranscriptProtectedTailScanMetrics) -> Void)?
+            var compactionHandler: ((AgentTranscriptCompactionMetrics) -> Void)?
+            var workingSourceItemsHandler: ((AgentTranscriptWorkingSourceItemsMetrics) -> Void)?
+            var rebuildHandler: ((AgentTranscriptRebuildMetrics) -> Void)?
+            var projectionBuildHandler: ((AgentTranscriptProjectionBuildMetrics) -> Void)?
+            var refreshAttemptHandler: ((AgentTranscriptRefreshAttemptMetrics) -> Void)?
+            var presentationPublishHandler: ((AgentTranscriptPresentationPublishMetrics) -> Void)?
+            var sessionItemsReplacementHandler: ((AgentTranscriptSessionItemsReplacementMetrics) -> Void)?
+            var projectionIdentityHandler: ((AgentTranscriptProjectionIdentityMetrics) -> Void)?
+        }
+
+        private static func readSlots<Value>(_ read: (Slots) -> Value) -> Value {
+            slotLock.lock()
+            defer { slotLock.unlock() }
+            return read(slots)
+        }
+
+        private static func writeSlots(_ write: (inout Slots) -> Void) {
+            slotLock.lock()
+            defer { slotLock.unlock() }
+            write(&slots)
+        }
+
+        package static var isEnabled: Bool {
+            get { readSlots(\.isEnabled) }
+            set { writeSlots { $0.isEnabled = newValue } }
+        }
+
+        static var protectedTailScanHandler: ((AgentTranscriptProtectedTailScanMetrics) -> Void)? {
+            get { readSlots(\.protectedTailScanHandler) }
+            set { writeSlots { $0.protectedTailScanHandler = newValue } }
+        }
+
+        static var compactionHandler: ((AgentTranscriptCompactionMetrics) -> Void)? {
+            get { readSlots(\.compactionHandler) }
+            set { writeSlots { $0.compactionHandler = newValue } }
+        }
+
+        static var workingSourceItemsHandler: ((AgentTranscriptWorkingSourceItemsMetrics) -> Void)? {
+            get { readSlots(\.workingSourceItemsHandler) }
+            set { writeSlots { $0.workingSourceItemsHandler = newValue } }
+        }
+
+        static var rebuildHandler: ((AgentTranscriptRebuildMetrics) -> Void)? {
+            get { readSlots(\.rebuildHandler) }
+            set { writeSlots { $0.rebuildHandler = newValue } }
+        }
+
+        static var projectionBuildHandler: ((AgentTranscriptProjectionBuildMetrics) -> Void)? {
+            get { readSlots(\.projectionBuildHandler) }
+            set { writeSlots { $0.projectionBuildHandler = newValue } }
+        }
+
+        static var refreshAttemptHandler: ((AgentTranscriptRefreshAttemptMetrics) -> Void)? {
+            get { readSlots(\.refreshAttemptHandler) }
+            set { writeSlots { $0.refreshAttemptHandler = newValue } }
+        }
+
+        package static var presentationPublishHandler: ((AgentTranscriptPresentationPublishMetrics) -> Void)? {
+            get { readSlots(\.presentationPublishHandler) }
+            set { writeSlots { $0.presentationPublishHandler = newValue } }
+        }
+
+        static var sessionItemsReplacementHandler: ((AgentTranscriptSessionItemsReplacementMetrics) -> Void)? {
+            get { readSlots(\.sessionItemsReplacementHandler) }
+            set { writeSlots { $0.sessionItemsReplacementHandler = newValue } }
+        }
+
+        static var projectionIdentityHandler: ((AgentTranscriptProjectionIdentityMetrics) -> Void)? {
+            get { readSlots(\.projectionIdentityHandler) }
+            set { writeSlots { $0.projectionIdentityHandler = newValue } }
+        }
+
         private static let refreshSignatureLock = NSLock()
         private nonisolated(unsafe) static var lastRefreshInputSignatureByTabID: [UUID: String] = [:]
+
+        /// Invokes a handler read from one of the slots above with lazily built metrics, outside
+        /// `slotLock`, serializing concurrent invocations under the recursive `callLock`. Handlers
+        /// must not block on another thread that may emit (for example a synchronous hop to the main
+        /// actor while it emits): that thread would wait on `callLock` and deadlock.
+        package static func emit<Metrics>(_ handler: ((Metrics) -> Void)?, _ metrics: @autoclosure () -> Metrics) {
+            guard let handler else { return }
+            let value = metrics()
+            callLock.lock()
+            defer { callLock.unlock() }
+            handler(value)
+        }
 
         static func reset() {
             isEnabled = false
@@ -352,7 +438,7 @@ package enum AgentTranscriptIncrementalImportResult: Equatable {
             let previous = lastRefreshInputSignatureByTabID[tabID]
             lastRefreshInputSignatureByTabID[tabID] = inputSignature
             refreshSignatureLock.unlock()
-            refreshAttemptHandler?(.init(
+            emit(refreshAttemptHandler, .init(
                 reason: reason,
                 sourceItemsRevision: sourceItemsRevision,
                 itemCount: itemCount,
@@ -2587,7 +2673,7 @@ package enum AgentTranscriptIO {
         let repairedRows = repairedSourceItems(rows, diagnosticContext: "working_source_items")
         #if DEBUG
             if AgentTranscriptDebugInstrumentation.isEnabled {
-                AgentTranscriptDebugInstrumentation.workingSourceItemsHandler?(.init(
+                AgentTranscriptDebugInstrumentation.emit(AgentTranscriptDebugInstrumentation.workingSourceItemsHandler, .init(
                     transcriptTurnCount: transcript.turns.count,
                     fullTurnCount: transcript.turns.count(where: { $0.retentionTier == .full }),
                     itemCount: repairedRows.count,
@@ -2823,7 +2909,7 @@ package enum AgentTranscriptIO {
         #if DEBUG
             if AgentTranscriptDebugInstrumentation.isEnabled {
                 let worsening = retentionTierWorseningCounts(from: existingTranscript, to: compacted)
-                AgentTranscriptDebugInstrumentation.rebuildHandler?(.init(
+                AgentTranscriptDebugInstrumentation.emit(AgentTranscriptDebugInstrumentation.rebuildHandler, .init(
                     existingTurnCount: existingTranscript.turns.count,
                     workingItemsCount: workingItems.count,
                     existingWorkingItemCount: existingWorkingItemCount,
@@ -5832,7 +5918,7 @@ enum AgentTranscriptCompactor {
             let trimmed = structurallyTrimmedTranscript(copy)
             #if DEBUG
                 if AgentTranscriptDebugInstrumentation.isEnabled {
-                    AgentTranscriptDebugInstrumentation.compactionHandler?(.init(
+                    AgentTranscriptDebugInstrumentation.emit(AgentTranscriptDebugInstrumentation.compactionHandler, .init(
                         mode: mode,
                         initialWorkingUnitCount: initialWorkingUnitCount,
                         finalWorkingUnitCount: CompactionPressure(transcript: trimmed).workingUnitCount,
@@ -5880,7 +5966,7 @@ enum AgentTranscriptCompactor {
         let trimmed = structurallyTrimmedTranscript(copy)
         #if DEBUG
             if AgentTranscriptDebugInstrumentation.isEnabled {
-                AgentTranscriptDebugInstrumentation.compactionHandler?(.init(
+                AgentTranscriptDebugInstrumentation.emit(AgentTranscriptDebugInstrumentation.compactionHandler, .init(
                     mode: mode,
                     initialWorkingUnitCount: initialWorkingUnitCount,
                     finalWorkingUnitCount: CompactionPressure(transcript: trimmed).workingUnitCount,
@@ -6075,7 +6161,7 @@ enum AgentTranscriptCompactor {
 
             func emit(countedToolExecutionCount: Int, protectedTurnCount: Int) {
                 guard AgentTranscriptDebugInstrumentation.isEnabled else { return }
-                AgentTranscriptDebugInstrumentation.protectedTailScanHandler?(.init(
+                AgentTranscriptDebugInstrumentation.emit(AgentTranscriptDebugInstrumentation.protectedTailScanHandler, .init(
                     transcriptTurnCount: transcript.turns.count,
                     limit: limit,
                     turnsVisited: turnsVisited,
@@ -6744,7 +6830,7 @@ package enum AgentTranscriptProjectionBuilder {
                 "[AgentTranscriptProjection] build turns=\(transcript.turns.count) workingRows=\(workingRows.count) workingBlocks=\(workingBlocks.count) reusedPrefixTurns=\(reusablePrefix?.turnCount ?? 0) cacheHits=\(cacheHitCount) workingRowTail=[\(workingRowTail)] workingBlockTail=[\(workingBlockTail)]"
             )
             if AgentTranscriptDebugInstrumentation.isEnabled {
-                AgentTranscriptDebugInstrumentation.projectionBuildHandler?(.init(
+                AgentTranscriptDebugInstrumentation.emit(AgentTranscriptDebugInstrumentation.projectionBuildHandler, .init(
                     turnCount: transcript.turns.count,
                     reusedPrefixTurnCount: reusablePrefix?.turnCount ?? 0,
                     cacheHitCount: cacheHitCount,

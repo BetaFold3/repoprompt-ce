@@ -1428,6 +1428,618 @@ final class AgentToolResultPersistencePolicyTests: XCTestCase {
         }
     }
 
+    // MARK: - Overlapped cold hydration
+
+    private enum ColdHydrationPreparationMode: String, CaseIterable {
+        case sequential
+        case overlapped
+
+        func run<T>(_ body: () async throws -> T) async rethrows -> T {
+            try await AgentSessionDataService.$forcesSequentialHydrationPreparation.withValue(self == .sequential) {
+                try await body()
+            }
+        }
+    }
+
+    private struct ColdHydrationFixture {
+        let label: String
+        let session: AgentSession
+        /// The session file's path relative to the seed store directory.
+        let relativePath: String
+        let pendingQuestionUI: [Bool]
+    }
+
+    /// Saved sessions in one seed store (with its metadata index). Every run copies the seed into a
+    /// fresh store and uses a fresh service.
+    private final class ColdHydrationStore {
+        let root: URL
+        let seedDirectory: URL
+        let workspaceID = UUID()
+        private(set) var fixtures: [ColdHydrationFixture] = []
+        private var runIndex = 0
+
+        init(label: String) {
+            root = FileManager.default.temporaryDirectory
+                .appendingPathComponent("AgentToolResultPersistencePolicyTests", isDirectory: true)
+                .appendingPathComponent("\(label)-\(UUID().uuidString)", isDirectory: true)
+            seedDirectory = root.appendingPathComponent("seed", isDirectory: true)
+        }
+
+        func workspace(_ directory: URL) -> WorkspaceModel {
+            WorkspaceModel(id: workspaceID, name: "Cold Hydration Overlap", repoPaths: ["/tmp/repo"], customStoragePath: directory)
+        }
+
+        func addFixture(
+            _ label: String,
+            items: [AgentChatItem],
+            runState: AgentSessionRunState? = nil,
+            mergeOperations: [AgentSessionWorktreeMergeOperation] = [],
+            pendingQuestionUI: [Bool] = [false],
+            loadedOnce: Bool = false
+        ) async throws {
+            var session = AgentSession(id: UUID(), workspaceID: workspaceID, composeTabID: UUID(), name: label).withItems(items)
+            session.lastRunState = runState?.rawValue
+            session.worktreeMergeOperations = mergeOperations
+            let fileURL = try await AgentSessionDataService().saveAgentSession(session, for: workspace(seedDirectory))
+            if loadedOnce {
+                // One cold load leaves the file in its steady-state canonical form.
+                _ = try await AgentSessionDataService().loadAgentSession(from: fileURL)
+            }
+            let relativePath = String(fileURL.standardizedFileURL.path.dropFirst(seedDirectory.standardizedFileURL.path.count))
+            fixtures.append(.init(label: label, session: session, relativePath: relativePath, pendingQuestionUI: pendingQuestionUI))
+        }
+
+        func freshStore() throws -> URL {
+            runIndex += 1
+            let directory = root.appendingPathComponent("run-\(runIndex)", isDirectory: true)
+            try FileManager.default.copyItem(at: seedDirectory, to: directory)
+            return directory
+        }
+
+        func fileURL(of fixture: ColdHydrationFixture, in store: URL) -> URL {
+            URL(fileURLWithPath: store.standardizedFileURL.path + fixture.relativePath)
+        }
+
+        func request(_ fixture: ColdHydrationFixture, store: URL, pendingQuestionUI: Bool) -> AgentSessionHydrationRequest {
+            AgentSessionHydrationRequest(
+                workspace: workspace(store),
+                tabID: fixture.session.composeTabID ?? UUID(),
+                sessionID: fixture.session.id,
+                resolvedDisplayName: fixture.session.name,
+                hasPendingQuestionUI: pendingQuestionUI,
+                transcriptViewportState: .liveBottom,
+                isCompressedHistoryRevealed: false,
+                initialPerformanceSnapshot: .empty
+            )
+        }
+
+        func remove() {
+            try? FileManager.default.removeItem(at: root)
+        }
+    }
+
+    /// Everything a cold hydration produces that is comparable across fresh stores and services.
+    private struct ColdHydrationRunOutputs: Equatable {
+        let runtimeSession: Data
+        let canonicalLiveItems: [AgentChatItem]
+        let transcript: AgentTranscript
+        let presentationTranscript: AgentTranscript
+        let fullProjection: AgentTranscriptProjection
+        let projection: AgentTranscriptProjection
+        let projectionCounts: AgentTranscriptProjectionCounts
+        let sanitizedActivityCount: Int
+        let payloadRevisions: [UUID: Int]
+        let rawInputSanitizeEvidence: AgentSanitizeRawInputEvidence?
+        let normalizedRunState: AgentSessionRunState
+        let normalizedSelection: AgentModelCatalog.NormalizedAgentSelection
+        let lastUserMessageAt: Date?
+        let restoredIndexEntry: AgentSessionIndexEntry
+        let needsReloadMigrationSave: Bool
+        /// Persistence-state components comparable across fresh services; the stamp's service ID
+        /// and file URL are per-run by construction, so `persistenceStateAuthorizesSave` covers them.
+        let persistenceSessionID: UUID
+        let persistenceWorkspaceID: UUID
+        let deletionGeneration: UInt64
+        let transcriptResetGeneration: UInt64
+        let persistenceStateAuthorizesSave: Bool
+        /// The file after hydration, decoded and re-encoded with sorted keys (raw rewrite bytes are
+        /// not byte-stable across identical runs because of dictionary key order).
+        let canonicalFileAfterHydration: Data
+        let fileBytesChanged: Bool
+        /// The session's metadata-index record after hydration, without per-run file observations.
+        let metadataRecord: Data?
+    }
+
+    /// Sorted-key encoding without per-run values: the store-specific file URL and the merge
+    /// reconciliation timestamps, which use the reconciliation's wall-clock `now`.
+    private static func comparableEncoding(_ session: AgentSession) throws -> Data {
+        var session = session
+        session.fileURL = nil
+        session.worktreeMergeOperations = session.worktreeMergeOperations.map { operation in
+            var operation = operation
+            operation.updatedAt = .distantPast
+            operation.completedAt = operation.completedAt.map { _ in .distantPast }
+            return operation
+        }
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        return try encoder.encode(session)
+    }
+
+    private static func comparableMetadataRecord(sessionID: UUID, folder: URL) throws -> Data? {
+        let indexURL = folder.appendingPathComponent("AgentSessionIndex.json")
+        guard FileManager.default.fileExists(atPath: indexURL.path) else { return nil }
+        let index = try JSONDecoder().decode(AgentSessionMetadataIndex.self, from: Data(contentsOf: indexURL))
+        guard var record = index.entries.first(where: { $0.id == sessionID }) else { return nil }
+        // The observed size must describe the current file; its value varies across runs when a
+        // reconciled merge operation encodes the reconciliation's wall-clock timestamp.
+        let sessionFileURL = folder.appendingPathComponent(record.filename)
+        let fileSize = try FileManager.default.attributesOfItem(atPath: sessionFileURL.path)[.size] as? NSNumber
+        XCTAssertEqual(record.observedFileSize, fileSize?.int64Value, "The index record observes the current file")
+        record.observedFileSize = nil
+        record.observedFileModificationDate = nil
+        record.lastIndexedAt = .distantPast
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        return try encoder.encode(record)
+    }
+
+    private static func coldHydrationRun(
+        _ fixture: ColdHydrationFixture,
+        in store: ColdHydrationStore,
+        mode: ColdHydrationPreparationMode,
+        pendingQuestionUI: Bool
+    ) async throws -> ColdHydrationRunOutputs {
+        let directory = try store.freshStore()
+        let fileURL = store.fileURL(of: fixture, in: directory)
+        let savedBytes = try Data(contentsOf: fileURL)
+        let service = AgentSessionDataService()
+        let prepared = try await mode.run {
+            try await service.preparePersistedHydration(store.request(fixture, store: directory, pendingQuestionUI: pendingQuestionUI))
+        }
+        let payload = try XCTUnwrap(prepared, "\(fixture.label) \(mode)")
+        let bytesAfterHydration = try Data(contentsOf: fileURL)
+        let canonicalFile = try comparableEncoding(JSONDecoder().decode(AgentSession.self, from: bytesAfterHydration))
+        let metadataRecord = try comparableMetadataRecord(sessionID: fixture.session.id, folder: fileURL.deletingLastPathComponent())
+        // The paired state must authorize an owner save of the hydrated session on this service.
+        let authorizesSave: Bool
+        do {
+            _ = try await service.saveAgentSession(
+                payload.persistedSession,
+                for: store.workspace(directory),
+                fileCreationPolicy: .requireExisting,
+                persistenceState: payload.persistenceState
+            )
+            authorizesSave = true
+        } catch {
+            authorizesSave = false
+        }
+        let presentation = payload.builtPresentation
+        return try ColdHydrationRunOutputs(
+            runtimeSession: comparableEncoding(payload.persistedSession),
+            canonicalLiveItems: payload.canonicalLiveItems,
+            transcript: payload.transcript,
+            presentationTranscript: presentation.transcript,
+            fullProjection: presentation.fullProjection,
+            projection: presentation.projection,
+            projectionCounts: presentation.projectionCounts,
+            sanitizedActivityCount: presentation.sanitizedActivityCount,
+            payloadRevisions: presentation.rawToolResultPayloadRenderRevisionByItemID,
+            rawInputSanitizeEvidence: presentation.rawInputSanitizeEvidence,
+            normalizedRunState: payload.normalizedRunState,
+            normalizedSelection: payload.normalizedSelection,
+            lastUserMessageAt: payload.lastUserMessageAt,
+            restoredIndexEntry: payload.restoredIndexEntry,
+            needsReloadMigrationSave: payload.needsReloadMigrationSave,
+            persistenceSessionID: payload.persistenceState.stamp.sessionID,
+            persistenceWorkspaceID: payload.persistenceState.stamp.workspaceID,
+            deletionGeneration: payload.persistenceState.stamp.deletionGeneration,
+            transcriptResetGeneration: payload.persistenceState.transcriptResetGeneration,
+            persistenceStateAuthorizesSave: authorizesSave,
+            canonicalFileAfterHydration: canonicalFile,
+            fileBytesChanged: bytesAfterHydration != savedBytes,
+            metadataRecord: metadataRecord
+        )
+    }
+
+    private static func differingFields(_ lhs: ColdHydrationRunOutputs, _ rhs: ColdHydrationRunOutputs) -> [String] {
+        var fields: [String] = []
+        func check(_ name: String, _ isEqual: Bool) {
+            if !isEqual { fields.append(name) }
+        }
+        check("runtimeSession", lhs.runtimeSession == rhs.runtimeSession)
+        check("canonicalLiveItems", lhs.canonicalLiveItems == rhs.canonicalLiveItems)
+        check("transcript", lhs.transcript == rhs.transcript)
+        check("presentationTranscript", lhs.presentationTranscript == rhs.presentationTranscript)
+        check("fullProjection", lhs.fullProjection == rhs.fullProjection)
+        check("projection", lhs.projection == rhs.projection)
+        check("projectionCounts", lhs.projectionCounts == rhs.projectionCounts)
+        check("sanitizedActivityCount", lhs.sanitizedActivityCount == rhs.sanitizedActivityCount)
+        check("payloadRevisions", lhs.payloadRevisions == rhs.payloadRevisions)
+        check("rawInputSanitizeEvidence", lhs.rawInputSanitizeEvidence == rhs.rawInputSanitizeEvidence)
+        check("normalizedRunState", lhs.normalizedRunState == rhs.normalizedRunState)
+        check("normalizedSelection", lhs.normalizedSelection == rhs.normalizedSelection)
+        check("lastUserMessageAt", lhs.lastUserMessageAt == rhs.lastUserMessageAt)
+        check("restoredIndexEntry", lhs.restoredIndexEntry == rhs.restoredIndexEntry)
+        check("needsReloadMigrationSave", lhs.needsReloadMigrationSave == rhs.needsReloadMigrationSave)
+        check("persistenceSessionID", lhs.persistenceSessionID == rhs.persistenceSessionID)
+        check("persistenceWorkspaceID", lhs.persistenceWorkspaceID == rhs.persistenceWorkspaceID)
+        check("deletionGeneration", lhs.deletionGeneration == rhs.deletionGeneration)
+        check("transcriptResetGeneration", lhs.transcriptResetGeneration == rhs.transcriptResetGeneration)
+        check("persistenceStateAuthorizesSave", lhs.persistenceStateAuthorizesSave == rhs.persistenceStateAuthorizesSave)
+        check("canonicalFileAfterHydration", lhs.canonicalFileAfterHydration == rhs.canonicalFileAfterHydration)
+        check("fileBytesChanged", lhs.fileBytesChanged == rhs.fileBytesChanged)
+        if lhs.metadataRecord != rhs.metadataRecord {
+            func object(_ data: Data?) -> [String: Any] {
+                data.flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] } ?? [:]
+            }
+            let lhsObject = object(lhs.metadataRecord)
+            let rhsObject = object(rhs.metadataRecord)
+            let keys = Set(lhsObject.keys).union(rhsObject.keys).filter { key in
+                !NSDictionary(dictionary: [key: lhsObject[key] ?? NSNull()]).isEqual(to: [key: rhsObject[key] ?? NSNull()])
+            }
+            fields.append("metadataRecord\(keys.sorted())")
+        }
+        return fields
+    }
+
+    private static func awaitingApprovalMergeOperation() -> AgentSessionWorktreeMergeOperation {
+        let source = GitWorktreeMergeEndpoint(
+            worktreeID: "wt_source",
+            repositoryID: "gitrepo_overlap",
+            repoKey: "repo",
+            path: "/tmp/repo-source",
+            name: "feature-worktree",
+            branch: "feature/merge",
+            head: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            isMain: false
+        )
+        let target = GitWorktreeMergeEndpoint(
+            worktreeID: "wt_target",
+            repositoryID: "gitrepo_overlap",
+            repoKey: "repo",
+            path: "/tmp/repo-target",
+            name: "main",
+            branch: "main",
+            head: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            isMain: true
+        )
+        return AgentSessionWorktreeMergeOperation(
+            id: "merge_overlap",
+            source: source,
+            target: target,
+            mergeBase: "cccccccccccccccccccccccccccccccccccccccc",
+            sourceHead: source.head,
+            targetHeadBefore: target.head,
+            status: .awaitingApproval,
+            createdAt: Date(timeIntervalSinceReferenceDate: 100),
+            updatedAt: Date(timeIntervalSinceReferenceDate: 200)
+        )
+    }
+
+    /// Overlapped cold hydration (storage canonicalization and rewrite in parallel with the
+    /// hydration branch, inside one gate-held operation) and the sequential reference (editable
+    /// load, then the hydration branch on the actor) give equal payloads, persisted file content,
+    /// rewrite outcome, metadata-index record, and runtime session, and both issue a persistence
+    /// state that authorizes the owner's next save. Fixtures cover a steady-state canonical file (no
+    /// rewrite), a freshly saved file, an active run state (rewrite), a merge operation
+    /// reconciliation changes (forced rewrite preserving `savedAt`), pending-question UI on and
+    /// off, and a missing session.
+    func testColdHydrationOverlappedPreparationMatchesSequentialReference() async throws {
+        let store = ColdHydrationStore(label: "overlap-differential")
+        defer { store.remove() }
+        let multiTurnItems = Self.multiTurnItems(turnCount: 12, toolsPerTurn: 6)
+        try await store.addFixture("canonical", items: multiTurnItems, loadedOnce: true)
+        try await store.addFixture("freshly saved", items: multiTurnItems)
+        try await store.addFixture("active run state", items: multiTurnItems, runState: .running)
+        try await store.addFixture("merge awaiting approval", items: multiTurnItems, mergeOperations: [Self.awaitingApprovalMergeOperation()])
+        try await store.addFixture(
+            "pending ask_user",
+            items: multiTurnItems + [
+                .user("Ask me.", sequenceIndex: multiTurnItems.count),
+                .toolCall(name: "ask_user", invocationID: UUID(), argsJSON: #"{"questions":[{"id":"q","question":"Proceed?"}]}"#, sequenceIndex: multiTurnItems.count + 1)
+            ],
+            runState: .waitingForQuestion,
+            pendingQuestionUI: [false, true]
+        )
+
+        var outputsByKey: [String: [ColdHydrationRunOutputs]] = [:]
+        for fixture in store.fixtures {
+            for pendingQuestionUI in fixture.pendingQuestionUI {
+                // Interleaved sequential/overlapped runs, each on a fresh copy of the same saved bytes.
+                for mode in ColdHydrationPreparationMode.allCases + ColdHydrationPreparationMode.allCases {
+                    let outputs = try await Self.coldHydrationRun(fixture, in: store, mode: mode, pendingQuestionUI: pendingQuestionUI)
+                    outputsByKey["\(fixture.label) pending=\(pendingQuestionUI) \(mode)", default: []].append(outputs)
+                }
+                let label = "\(fixture.label) pending=\(pendingQuestionUI)"
+                let sequential = try XCTUnwrap(outputsByKey["\(label) sequential"])
+                let overlapped = try XCTUnwrap(outputsByKey["\(label) overlapped"])
+                XCTAssertEqual(sequential.count, 2)
+                XCTAssertEqual(Set(sequential.map(\.canonicalFileAfterHydration)).count, 1, "\(label): sequential runs are deterministic")
+                XCTAssertTrue(sequential.allSatisfy(\.persistenceStateAuthorizesSave), label)
+                XCTAssertNotNil(sequential[0].metadataRecord, "\(label): the store has an index record")
+                for (overlappedRun, sequentialRun) in zip(overlapped, sequential) {
+                    XCTAssertEqual(
+                        Self.differingFields(overlappedRun, sequentialRun),
+                        [],
+                        "\(label): overlapped preparation matches the sequential reference"
+                    )
+                }
+                XCTAssertEqual(overlapped, sequential, "\(label): overlapped preparation matches the sequential reference")
+            }
+        }
+
+        /// The fixtures exercise both rewrite outcomes and the merge-forced rewrite.
+        func outputs(_ label: String) throws -> ColdHydrationRunOutputs {
+            try XCTUnwrap(outputsByKey["\(label) pending=false overlapped"]?.first, label)
+        }
+        XCTAssertFalse(try outputs("canonical").fileBytesChanged, "A canonical file is not rewritten")
+        XCTAssertTrue(try outputs("active run state").fileBytesChanged, "A restored active run state is rewritten")
+        let mergeFixture = try XCTUnwrap(store.fixtures.first { $0.label == "merge awaiting approval" })
+        let merged = try JSONDecoder().decode(AgentSession.self, from: outputs("merge awaiting approval").canonicalFileAfterHydration)
+        XCTAssertEqual(merged.worktreeMergeOperations.map(\.status), [.cancelled], "Reconciliation forces the rewrite")
+        let seedSavedAt = try JSONDecoder().decode(
+            AgentSession.self,
+            from: Data(contentsOf: store.fileURL(of: mergeFixture, in: store.seedDirectory))
+        ).savedAt
+        XCTAssertEqual(merged.savedAt, seedSavedAt, "The forced rewrite keeps the decoded savedAt")
+
+        // A missing session yields no payload and creates no file in either mode.
+        let missingID = UUID()
+        for mode in ColdHydrationPreparationMode.allCases {
+            let directory = try store.freshStore()
+            let prepared = try await mode.run {
+                try await AgentSessionDataService().preparePersistedHydration(AgentSessionHydrationRequest(
+                    workspace: store.workspace(directory),
+                    tabID: UUID(),
+                    sessionID: missingID,
+                    resolvedDisplayName: "Missing",
+                    hasPendingQuestionUI: false,
+                    transcriptViewportState: .liveBottom,
+                    isCompressedHistoryRevealed: false,
+                    initialPerformanceSnapshot: .empty
+                ))
+            }
+            XCTAssertNil(prepared, "\(mode): a missing session has no payload")
+            let missingFile = directory
+                .appendingPathComponent("AgentSessions", isDirectory: true)
+                .appendingPathComponent("AgentSession-\(missingID.uuidString).json")
+            XCTAssertFalse(FileManager.default.fileExists(atPath: missingFile.path), "\(mode)")
+        }
+    }
+
+    /// The overlapped operation's storage and hydration branches both start before either finishes
+    /// (each branch waits at its start until the other has started, bounded by a timeout), and the
+    /// sequential reference never consults the probe.
+    func testColdHydrationOverlapRunsStorageAndHydrationBranchesConcurrently() async throws {
+        let store = ColdHydrationStore(label: "overlap-probe")
+        defer { store.remove() }
+        try await store.addFixture("active run state", items: Self.multiTurnItems(turnCount: 6, toolsPerTurn: 4), runState: .running)
+        let fixture = try XCTUnwrap(store.fixtures.first)
+
+        let probe = AgentSessionHydrationOverlapProbe()
+        let directory = try store.freshStore()
+        let prepared = try await AgentSessionDataService.$hydrationOverlapProbe.withValue(probe) {
+            try await AgentSessionDataService().preparePersistedHydration(store.request(fixture, store: directory, pendingQuestionUI: false))
+        }
+        XCTAssertNotNil(prepared)
+        XCTAssertTrue(probe.overlapObserved, "Both branches ran at once: \(probe.events)")
+        XCTAssertEqual(Set(probe.events.suffix(2)), [.finished(.storage), .finished(.hydration)])
+
+        let sequentialProbe = AgentSessionHydrationOverlapProbe()
+        let sequentialDirectory = try store.freshStore()
+        _ = try await AgentSessionDataService.$hydrationOverlapProbe.withValue(sequentialProbe) {
+            try await ColdHydrationPreparationMode.sequential.run {
+                try await AgentSessionDataService().preparePersistedHydration(
+                    store.request(fixture, store: sequentialDirectory, pendingQuestionUI: false)
+                )
+            }
+        }
+        XCTAssertEqual(sequentialProbe.events, [], "The sequential reference has no overlapped branches")
+    }
+
+    /// A failed rewrite surfaces as `loadFailed` in both modes and leaves the file untouched, and a
+    /// hydration cancelled while queued on the session gate completes its load (the file is fully
+    /// rewritten and indexed, exactly as an uncancelled run leaves it) and then throws
+    /// `CancellationError` in both modes, matching the sequential (pre-overlap) behavior.
+    func testColdHydrationRewriteFailureAndCancellationMatchSequentialReference() async throws {
+        let store = ColdHydrationStore(label: "overlap-failure")
+        defer { store.remove() }
+        try await store.addFixture("active run state", items: Self.multiTurnItems(turnCount: 6, toolsPerTurn: 4), runState: .running)
+        let fixture = try XCTUnwrap(store.fixtures.first)
+
+        for mode in ColdHydrationPreparationMode.allCases {
+            // Rewrite failure: the session folder refuses the atomic replacement.
+            let directory = try store.freshStore()
+            let fileURL = store.fileURL(of: fixture, in: directory)
+            let folder = fileURL.deletingLastPathComponent()
+            let savedBytes = try Data(contentsOf: fileURL)
+            try FileManager.default.setAttributes([.posixPermissions: 0o555], ofItemAtPath: folder.path)
+            let service = AgentSessionDataService()
+            let request = store.request(fixture, store: directory, pendingQuestionUI: false)
+            let probe = AgentSessionHydrationOverlapProbe()
+            let failure: Error?
+            do {
+                _ = try await mode.run {
+                    try await AgentSessionDataService.$hydrationOverlapProbe.withValue(probe) {
+                        try await service.preparePersistedHydration(request)
+                    }
+                }
+                failure = nil
+            } catch {
+                failure = error
+            }
+            try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: folder.path)
+            var surfacedAsLoadFailed = false
+            if let dataError = failure as? AgentSessionDataError, case .loadFailed = dataError {
+                surfacedAsLoadFailed = true
+            }
+            XCTAssertTrue(surfacedAsLoadFailed, "\(mode): the rewrite failure surfaces as loadFailed, got \(String(describing: failure))")
+            XCTAssertEqual(try Data(contentsOf: fileURL), savedBytes, "\(mode): a failed rewrite leaves the file untouched")
+            if mode == .overlapped {
+                // The hydration child was joined (cancelled and implicitly awaited) before the throw.
+                XCTAssertTrue(probe.events.contains(.finished(.hydration)), "\(mode): \(probe.events)")
+                XCTAssertFalse(probe.events.contains(.finished(.storage)), "\(mode): \(probe.events)")
+            }
+            // The gate is free after the storage failure: nothing waits, and the next load succeeds.
+            let waiters = await service.test_sessionPersistenceWaiterCount(for: fixture.session.id)
+            XCTAssertEqual(waiters, 0, "\(mode)")
+            let next = try await service.preparePersistedHydration(request)
+            XCTAssertNotNil(next, "\(mode): a later load succeeds after a storage failure")
+        }
+
+        let reference = try await Self.coldHydrationRun(fixture, in: store, mode: .sequential, pendingQuestionUI: false)
+        XCTAssertTrue(reference.fileBytesChanged)
+        for mode in ColdHydrationPreparationMode.allCases {
+            let directory = try store.freshStore()
+            let fileURL = store.fileURL(of: fixture, in: directory)
+            let workspace = store.workspace(directory)
+            let service = AgentSessionDataService()
+            // Hold the session gate with a conditional deletion that aborts once released.
+            let holder = ColdHydrationGateHolder()
+            await service.test_setConditionalDeletionHook { _ in
+                await holder.holdUntilReleased()
+                throw CancellationError()
+            }
+            let composeTabID = try XCTUnwrap(fixture.session.composeTabID)
+            let candidates = try await service.deletionCandidates(forComposeTabID: composeTabID, for: workspace)
+            let candidate = try XCTUnwrap(candidates.first { $0.sessionID == fixture.session.id })
+            let deletion = Task { try await service.deleteAgentSession(ifCurrent: candidate, for: workspace) }
+            try await Self.waitUntilColdHydration { holder.isHolding }
+            let request = store.request(fixture, store: directory, pendingQuestionUI: false)
+            let hydration = Task {
+                try await mode.run { try await service.preparePersistedHydration(request) }
+            }
+            var queued = 0
+            for _ in 0 ..< 500 {
+                queued = await service.test_sessionPersistenceWaiterCount(for: fixture.session.id)
+                if queued > 0 { break }
+                try await Task.sleep(for: .milliseconds(10))
+            }
+            XCTAssertEqual(queued, 1, "\(mode): the hydration waits on the session gate")
+            hydration.cancel()
+            holder.release()
+            _ = await deletion.result
+            await service.test_setConditionalDeletionHook(nil)
+
+            let result = await hydration.result
+            switch result {
+            case .success:
+                XCTFail("\(mode): a cancelled hydration throws")
+            case let .failure(error):
+                XCTAssertTrue(error is CancellationError, "\(mode): \(error)")
+            }
+            let bytesAfter = try Data(contentsOf: fileURL)
+            XCTAssertEqual(
+                try Self.comparableEncoding(JSONDecoder().decode(AgentSession.self, from: bytesAfter)),
+                reference.canonicalFileAfterHydration,
+                "\(mode): the cancelled hydration's load still completed the full rewrite"
+            )
+            XCTAssertEqual(
+                try Self.comparableMetadataRecord(sessionID: fixture.session.id, folder: fileURL.deletingLastPathComponent()),
+                reference.metadataRecord,
+                "\(mode): the index matches the rewritten file"
+            )
+        }
+    }
+
+    /// A cancellation that arrives while the storage branch is still committing, after the hydration
+    /// child has already finished, is not lost: the commit completes (the file is fully rewritten and
+    /// indexed, exactly as an uncancelled run leaves it), the operation throws `CancellationError`,
+    /// and the session gate is free for the next load.
+    func testColdHydrationCancelledWhileStorageCommitsAfterHydrationFinishedThrows() async throws {
+        let store = ColdHydrationStore(label: "overlap-late-cancel")
+        defer { store.remove() }
+        try await store.addFixture("active run state", items: Self.multiTurnItems(turnCount: 6, toolsPerTurn: 4), runState: .running)
+        let fixture = try XCTUnwrap(store.fixtures.first)
+        let reference = try await Self.coldHydrationRun(fixture, in: store, mode: .sequential, pendingQuestionUI: false)
+        XCTAssertTrue(reference.fileBytesChanged)
+
+        let directory = try store.freshStore()
+        let fileURL = store.fileURL(of: fixture, in: directory)
+        let savedBytes = try Data(contentsOf: fileURL)
+        let service = AgentSessionDataService()
+        let request = store.request(fixture, store: directory, pendingQuestionUI: false)
+        let probe = AgentSessionHydrationOverlapProbe(holdsStorageCommit: true)
+        let hydration = Task {
+            try await AgentSessionDataService.$hydrationOverlapProbe.withValue(probe) {
+                try await service.preparePersistedHydration(request)
+            }
+        }
+        // Failure-path cleanup: never leave the operation suspended at the cancellation-insensitive
+        // commit hold (and its session gate held). Cancelling and releasing again are no-ops.
+        defer {
+            hydration.cancel()
+            probe.releaseStorageCommit()
+        }
+        try await Self.waitUntilColdHydration { probe.isHoldingStorageCommit && probe.events.contains(.finished(.hydration)) }
+        XCTAssertFalse(probe.events.contains(.finished(.storage)), "Storage is held before its commit")
+        XCTAssertEqual(try Data(contentsOf: fileURL), savedBytes, "Nothing is written before the commit")
+        hydration.cancel()
+        probe.releaseStorageCommit()
+
+        switch await hydration.result {
+        case .success:
+            XCTFail("A hydration cancelled during the storage commit throws")
+        case let .failure(error):
+            XCTAssertTrue(error is CancellationError, "\(error)")
+        }
+        XCTAssertTrue(probe.events.contains(.finished(.storage)), "The storage commit completed")
+        XCTAssertEqual(
+            try Self.comparableEncoding(JSONDecoder().decode(AgentSession.self, from: Data(contentsOf: fileURL))),
+            reference.canonicalFileAfterHydration,
+            "The cancelled hydration's load still completed the full rewrite"
+        )
+        XCTAssertEqual(
+            try Self.comparableMetadataRecord(sessionID: fixture.session.id, folder: fileURL.deletingLastPathComponent()),
+            reference.metadataRecord,
+            "The index matches the rewritten file"
+        )
+        let waiters = await service.test_sessionPersistenceWaiterCount(for: fixture.session.id)
+        XCTAssertEqual(waiters, 0)
+        let next = try await service.preparePersistedHydration(request)
+        XCTAssertNotNil(next, "The session gate is free: a subsequent load succeeds")
+    }
+
+    private final class ColdHydrationGateHolder: @unchecked Sendable {
+        private let lock = NSLock()
+        private var holding = false
+        private var released = false
+        private var continuation: CheckedContinuation<Void, Never>?
+
+        var isHolding: Bool {
+            lock.withLock { holding }
+        }
+
+        func holdUntilReleased() async {
+            await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+                let resumeNow: Bool = lock.withLock {
+                    holding = true
+                    if released { return true }
+                    self.continuation = continuation
+                    return false
+                }
+                if resumeNow { continuation.resume() }
+            }
+        }
+
+        func release() {
+            let pending: CheckedContinuation<Void, Never>? = lock.withLock {
+                released = true
+                defer { continuation = nil }
+                return continuation
+            }
+            pending?.resume()
+        }
+    }
+
+    private static func waitUntilColdHydration(_ condition: () -> Bool) async throws {
+        for _ in 0 ..< 500 where !condition() {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        XCTAssertTrue(condition(), "Timed out waiting for the condition")
+    }
+
     private final class ColdLoadProjectionBuildCounter: @unchecked Sendable {
         private let lock = NSLock()
         private var count = 0
