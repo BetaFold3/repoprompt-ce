@@ -417,7 +417,7 @@ Step 1 — done | rounds 0/2 | open: none | downgraded: none | assumed: accept f
 
 ### Step 2 — Drop the debug main-executable sign
 
-Step 2 — blocked | rounds 0/2 | open: full packaging/launch acceptance pending permission; owner question timed out | downgraded: none | assumed: reversible local checkpoint accepted by both reviewers; identical-input real signing passes Apple Development and ad-hoc | deferred: live A/B and conductor run not performed; known baseline lint assertion; evidence: step-2/findings.md, step-2/reviews/disposition.md
+Step 2 — blocked | rounds 0/2 | open: successful launch acceptance; approved conductor run failed process detection after verified package | downgraded: none | assumed: reversible checkpoint; identical-input real signing passes Apple Development and ad-hoc | deferred: historical packaging A/B not performed; known baseline lint assertion; evidence: step-2/findings.md, step-2/reviews/disposition.md, step-7/diagnosis.md
 
 - **Change:** gate `:519` on `IS_RELEASE`, and add a static test for the gate.
 - **Validation:** run the live comparison against the baseline worktree on identical inputs; deep verify passes; the app launches through `./conductor run`.
@@ -425,7 +425,7 @@ Step 2 — blocked | rounds 0/2 | open: full packaging/launch acceptance pending
 
 ### Step 3 — Fresh sibling assembly and publish
 
-Step 3 — blocked | rounds 0/2 | open: visible conductor run acceptance pending owner approval | downgraded: none | assumed: reversible local checkpoint; isolated real packaging/swap/kill/fallback validation passed | deferred: S3-3/S3-4 retention behavior per spec, known baseline lint assertion; evidence: step-3/findings.md, step-3/reviews/disposition.md
+Step 3 — blocked | rounds 0/2 | open: successful launch acceptance; actual staged activation passed but process detection failed | downgraded: none | assumed: reversible checkpoint; isolated packaging/swap/kill/fallback passed | deferred: S3-3/S3-4 retention behavior per spec, known baseline lint assertion; evidence: step-3/findings.md, step-3/reviews/disposition.md, step-7/diagnosis.md
 
 - **Change:** add `debug_package_cache.py` with only `publish` and `cleanup-stale`; add the `PACKAGE_DEST`/`TEMP_PARENT` handling; make `rm -rf "$APP_BUNDLE"` release-only; change `finish()` to the new rule; move compatibility-link updates to after publish; add the publish tests.
 - **Validation:** repeat the `rm -rf` pin search; the fault-injection tests pass, including a failed restore followed by cleanup; live: killing packaging during signing leaves the existing app launchable; identity, smoke and verify pass inside the hidden parent; `conductor run` still activates its staged bundle.
@@ -450,7 +450,7 @@ Step 5 — done | rounds 0/2 | open: none | downgraded: none | assumed: full ver
 
 ### Step 6 — No-op skip and staging reuse
 
-Step 6 — blocked | rounds 0/2 | open: /Applications after-launch and actual conductor run acceptance need owner approval | downgraded: none | assumed: full verification on reuse per step-0/adjustment.md; release-inert reuse gates preserve release behavior; reversible checkpoint reviewed | deferred: bounded orphan stamps and conservative failure eviction; known baseline lint/benchmark failures; evidence: step-6/findings.md, step-6/reviews/dispositions.md
+Step 6 — blocked | rounds 0/2 | open: successful relaunch and after-launch reuse; /Applications no-op and actual run clone/activation passed but old-process detection failed | downgraded: none | assumed: full verification per step-0/adjustment.md; release-inert gates; reversible checkpoint | deferred: orphan stamps/conservative eviction; baseline lint/benchmark failures; evidence: step-6/findings.md, step-6/reviews/dispositions.md, step-7/diagnosis.md
 
 - **Change:** add `inventory`, the stamps and the three outcomes; add the `conductor.py` env line; add the plan, stamp and lifecycle tests.
 - **Validation:** S1 into `/Applications` hits `noop-dest`, prints `Created:` and refreshes the compatibility link; after launching the app, a no-change build is still `noop-dest`; S3 hits `noop-clone`, publishes, activates and launches, and a second `run` clones again (record the root inode before and after activation); `touch` on a bundle file, deleting the destination, or enabling Sentry gives `fresh`; ticket invalidation is unchanged.
@@ -458,7 +458,7 @@ Step 6 — blocked | rounds 0/2 | open: /Applications after-launch and actual co
 
 ### Step 7 — Docs and the default flip
 
-Step 7 — todo | rounds 0/2 | open: | downgraded: | assumed: Q1 unanswered; no default flip, document full verification and fast alias; step-0/adjustment.md | deferred:
+Step 7 — done | rounds 0/2 | open: none | downgraded: none | assumed: no proportional default flip; full verification and fast alias per step-0/adjustment.md | deferred: Steps 2/3/6 live relaunch acceptance and pre-existing process-detector gap; evidence: step-7/findings.md, step-7/reviews/dispositions.md
 
 - **Change:** fix `docs/context/workflows/development.md:85`, which names `.build/debug/RepoPrompt.app` (only the compatibility link) as the destination; document the real destination, the outcomes, cache location and pruning, the escape variable and recovery commands including `.retain` recovery, assembly-time provenance, and that direct concurrent runs are unsupported; if Q1 is yes, make proportional mode the default and keep `fast` as an accepted alias.
 - **Validation:** the affected suites pass, and the `--fast` pins still hold; `off` runs every check; default `conductor run` skips D when `nested_key` is unchanged; the final S1–S3 measurements are taken.
@@ -485,6 +485,8 @@ Step 7 — todo | rounds 0/2 | open: | downgraded: | assumed: Q1 unanswered; no 
 - Rolling back to the old scripts ignores the new receipts, and the next package rebuilds normally.
 
 ## Decisions
+
+- 2026-10-16: The owner approved the next needed rebuild and relaunch for live acceptance; the main agent will run the coordinated operation after the measurement worker finishes.
 
 - 2026-10-16: The owner authorized unsigned local commits for the remaining packaging plan steps after repeated 1Password signing failures; Git signing configuration and push permissions stay unchanged.
 

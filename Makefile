@@ -14,7 +14,7 @@ help:
 	@printf '  %-30s %s\n' 'clean' 'Remove .build'
 	@printf '\n%s\n' 'Coordinated developer daemon targets:'
 	@printf '  %-30s %s\n' 'dev-status' 'Show conductor daemon status'
-	@printf '  %-30s %s\n' 'dev-build' 'Coordinated debug app package build; FAST=1 opts into fast verification'
+	@printf '  %-30s %s\n' 'dev-build' 'Coordinated debug app package build; FAST=1 is a compatibility alias'
 	@printf '  %-30s %s\n' 'dev-swift-build' 'Coordinated Swift build; override with PRODUCT=name'
 	@printf '  %-30s %s\n' 'dev-dsym' 'Regenerate debug dSYMs for built products (never builds); PRODUCT=all|RepoPrompt|repoprompt-mcp|repoprompt-gateway|root-tests'
 	@printf '  %-30s %s\n' 'dev-run' 'Coordinated debug app build and launch'
