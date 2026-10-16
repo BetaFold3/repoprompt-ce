@@ -164,6 +164,33 @@ class FixtureReplayTests(SpanInvariantMixin, unittest.TestCase):
                 with_timing["output"] = dict(with_timing["output"], records=plain["output"]["records"])
                 self.assertEqual(with_timing, plain)
 
+    def test_product_less_debug_package_build_is_one_command_segment(self) -> None:
+        # Debug-packaging Step 1: debug packaging runs one product-less build, so SwiftPM
+        # prints "Build complete!" without a product name. The v1 package-debug fixture
+        # keeps the old three-product trace; this in-memory trace covers the new shape.
+        case = {"originNs": 0, "steps": [
+            {"boundary": "command_start", "atMs": 0, "metadata": {"command": "/repo/Scripts/package_app.sh debug"}},
+            {"atMs": 10, "chunk": "==> [2026-10-16 12:00:01] Building debug products (debug, host-native) (previous: 0s, total: 1s)\n"
+                                  "+ /repo/Scripts/canonical_swift.sh build -c debug \n"},
+            {"atMs": 1000, "chunk": "rpce-debug-dsym: requested=off effective=off reason=debug_skip configuration=debug\n"
+                                    "Building for debugging...\n[3/6] Compiling RepoPromptApp A.swift\n"},
+            {"atMs": 2400, "chunk": "Build complete! (1.40s)\n"
+                                    "==> [2026-10-16 12:00:03] Resolving build artifact paths (previous: 2s, total: 3s)\n"
+                                    "+ /repo/Scripts/canonical_swift.sh build -c debug --show-bin-path \n"
+                                    "BUILD_DIR=/repo/.build/arm64-apple-macosx/debug\n"},
+            {"eof": True, "atMs": 3000},
+        ]}
+        _, payload = replay(case)
+        self.assertEqual(payload["status"], "complete")
+        self.assertEqual(len(payload["segments"]), 1)
+        segment = payload["segments"][0]
+        self.assertEqual(segment["openedBy"], "command")
+        self.assertEqual(segment["command"], "/repo/Scripts/canonical_swift.sh build -c debug")
+        self.assertIn("Building debug products (debug, host-native)", segment["context"])
+        self.assertIsNone(segment["buildProduct"])
+        self.assertEqual(segment["reportedBuild"], {"ns": 1400 * MS, "quality": "reported_duration"})
+        self.assertEqual(segment["modules"]["RepoPromptApp"]["compiledFiles"], 1)
+
     def test_finalize_is_idempotent_and_late_observations_are_ignored(self) -> None:
         recorder, payload = replay(load_case("null-test"))
         recorder.observe_records([metrics.OutputRecord(999, 10**12, "Build complete! (9.00s)", "lf")])

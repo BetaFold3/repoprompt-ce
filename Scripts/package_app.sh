@@ -289,6 +289,7 @@ else
     phase "Patching KeyboardShortcuts resource lookup"
     run "$CONTROL_PLANE_SCRIPTS_DIR/patch_keyboard_shortcuts_resource_lookup.sh" "$ROOT_DIR"
 
+    if (( IS_RELEASE )); then
     phase "Building $APP_NAME ($CONF, host-native)"
     run "$CONTROL_PLANE_SCRIPTS_DIR/canonical_swift.sh" build "${SWIFT_BUILD_ARGS[@]}" --product "$APP_NAME"
 
@@ -297,6 +298,13 @@ else
 
     phase "Building repoprompt-gateway ($CONF, host-native)"
     run "$CONTROL_PLANE_SCRIPTS_DIR/canonical_swift.sh" build "${SWIFT_BUILD_ARGS[@]}" --product repoprompt-gateway
+    else
+        # Debug: one product-less build of the default graph. Every root non-test target
+        # belongs to one of the three products above. SwiftPM also builds a few small
+        # dependency-package executables; they no-op unless dependencies change.
+        phase "Building debug products ($CONF, host-native)"
+        run "$CONTROL_PLANE_SCRIPTS_DIR/canonical_swift.sh" build "${SWIFT_BUILD_ARGS[@]}"
+    fi
 
     phase "Resolving build artifact paths"
     echo_cmd "$CONTROL_PLANE_SCRIPTS_DIR/canonical_swift.sh" build -c "$CONF" --show-bin-path

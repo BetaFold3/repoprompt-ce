@@ -409,7 +409,7 @@ Step 0 — done | rounds 0/2 | open: none | downgraded: none | assumed: single-a
 
 ### Step 1 — Single debug SwiftPM build
 
-Step 1 — todo | rounds 0/2 | open: | downgraded: | assumed: | deferred:
+Step 1 — done | rounds 0/2 | open: none | downgraded: none | assumed: accept four dependency example executables in default graph; relinking S2 per step-0/adjustment.md | deferred: pre-existing lint assertion; optional dependency test-build comparison and future graph recheck (step-1/reviews/disposition.md); evidence: step-1/findings.md
 
 - **Change:** add the debug-only `Building debug products` phase with no `--product`; release keeps its three phases; add the heading and ordering tests; add the bin-path cache only if Step 0 qualified it.
 - **Validation:** `swift package describe --type json` shows no extra root targets get built; five alternations of `./conductor swift-build --product RepoPrompt` with `./conductor build` show no replan above 3 s; the release-branch diff is empty; S1 and S2 are measured.
@@ -433,7 +433,7 @@ Step 3 — todo | rounds 0/2 | open: | downgraded: | assumed: | deferred:
 
 ### Step 4 — Keys, plan and proportional verification behind `fast`
 
-Step 4 — todo | rounds 0/2 | open: | downgraded: | assumed: | deferred:
+Step 4 — todo | rounds 0/2 | open: | downgraded: | assumed: full verification always; no proportional mode or nested verification receipt; fast alias becomes inert; step-0/adjustment.md | deferred:
 
 - **Change:** add `resolve-identity`, `plan`, `record` and `forget`, and the closure lists; merge the `find-identity` calls; add the non-deep strict verify to M; put D behind the deep-set rule, with proportional mode from `fast`; parse `REPOPROMPT_DEBUG_PACKAGE_CACHE`; add `forget` to `finish()`; retire the old fingerprint (§F) and retarget the pins; add the key, closure, identity and mode tests; add the vendor receipt only if Step 0 qualified it.
 - **Validation:** all tests pass; the live tamper experiment is recorded, and the per-component remedy is specified if the outer verify misses the flip; live: `off` runs D and writes nothing; an ambiguous identity substring warns, runs D and writes no receipt; a corrupted verified record runs D.
@@ -442,7 +442,7 @@ Step 4 — todo | rounds 0/2 | open: | downgraded: | assumed: | deferred:
 
 ### Step 5 — Signed Sparkle and helper caches
 
-Step 5 — todo | rounds 0/2 | open: | downgraded: | assumed: | deferred:
+Step 5 — todo | rounds 0/2 | open: | downgraded: | assumed: full verification on component hits; retain pre-commit component verification; step-0/adjustment.md | deferred:
 
 - **Change:** add `component-lookup`/`component-commit`, `clone_tree` and pruning; route Sparkle and the helpers through the cache, with the Sparkle basis from Step 0; add per-component verification if Step 4 requires it; add the cache tests, including the darwin Identifier test.
 - **Validation:** Identifier and CDHash match the Step 4 output for both helpers and Sparkle; the first run runs D; a second edit-build shows `CACHE HIT` for all three components and skips D under `fast`; a helper rebuild forces D; a cross-volume `REPOPROMPT_DEBUG_APP_BUNDLE` (a mounted disk image) uses the copy fallback; S2 is measured.
@@ -450,7 +450,7 @@ Step 5 — todo | rounds 0/2 | open: | downgraded: | assumed: | deferred:
 
 ### Step 6 — No-op skip and staging reuse
 
-Step 6 — todo | rounds 0/2 | open: | downgraded: | assumed: | deferred:
+Step 6 — todo | rounds 0/2 | open: | downgraded: | assumed: full verification on destination/clone reuse; step-0/adjustment.md | deferred:
 
 - **Change:** add `inventory`, the stamps and the three outcomes; add the `conductor.py` env line; add the plan, stamp and lifecycle tests.
 - **Validation:** S1 into `/Applications` hits `noop-dest`, prints `Created:` and refreshes the compatibility link; after launching the app, a no-change build is still `noop-dest`; S3 hits `noop-clone`, publishes, activates and launches, and a second `run` clones again (record the root inode before and after activation); `touch` on a bundle file, deleting the destination, or enabling Sentry gives `fresh`; ticket invalidation is unchanged.
@@ -458,7 +458,7 @@ Step 6 — todo | rounds 0/2 | open: | downgraded: | assumed: | deferred:
 
 ### Step 7 — Docs and the default flip
 
-Step 7 — todo | rounds 0/2 | open: | downgraded: | assumed: | deferred:
+Step 7 — todo | rounds 0/2 | open: | downgraded: | assumed: Q1 unanswered; no default flip, document full verification and fast alias; step-0/adjustment.md | deferred:
 
 - **Change:** fix `docs/context/workflows/development.md:85`, which names `.build/debug/RepoPrompt.app` (only the compatibility link) as the destination; document the real destination, the outcomes, cache location and pruning, the escape variable and recovery commands including `.retain` recovery, assembly-time provenance, and that direct concurrent runs are unsupported; if Q1 is yes, make proportional mode the default and keep `fast` as an accepted alias.
 - **Validation:** the affected suites pass, and the `--fast` pins still hold; `off` runs every check; default `conductor run` skips D when `nested_key` is unchanged; the final S1–S3 measurements are taken.
@@ -485,6 +485,8 @@ Step 7 — todo | rounds 0/2 | open: | downgraded: | assumed: | deferred:
 - Rolling back to the old scripts ignores the new receipts, and the next package rebuilds normally.
 
 ## Decisions
+
+- 2026-10-16: The owner authorized unsigned local commits for the remaining packaging plan steps after repeated 1Password signing failures; Git signing configuration and push permissions stay unchanged.
 
 - 2026-10-16: For Step 0, the owner approved fresh non-live staging package measurements instead of repeated `conductor run`; actual run/activation checks remain for the later behavior-changing steps.
 

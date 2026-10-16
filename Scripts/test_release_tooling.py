@@ -1701,6 +1701,128 @@ fi
         self.assertLess(broad_resources_copy, resources_validation)
         self.assertLess(resources_validation, outer_app_sign)
 
+    def test_host_native_debug_runs_one_product_less_build_and_release_keeps_three_product_builds(self) -> None:
+        package_script = (SCRIPT_DIR / "package_app.sh").read_text(encoding="utf-8")
+        host_native = package_script.split('phase "Patching KeyboardShortcuts resource lookup"', 1)[1].split(
+            'phase "Resolving build artifact paths"', 1
+        )[0]
+        release_branch, debug_branch = host_native.split("    if (( IS_RELEASE )); then\n", 1)[1].split("    else\n", 1)
+        debug_branch = debug_branch.split("    fi\n", 1)[0]
+        release_lines = [
+            'phase "Building $APP_NAME ($CONF, host-native)"',
+            'run "$CONTROL_PLANE_SCRIPTS_DIR/canonical_swift.sh" build "${SWIFT_BUILD_ARGS[@]}" --product "$APP_NAME"',
+            'phase "Building repoprompt-mcp ($CONF, host-native)"',
+            'run "$CONTROL_PLANE_SCRIPTS_DIR/canonical_swift.sh" build "${SWIFT_BUILD_ARGS[@]}" --product repoprompt-mcp',
+            'phase "Building repoprompt-gateway ($CONF, host-native)"',
+            'run "$CONTROL_PLANE_SCRIPTS_DIR/canonical_swift.sh" build "${SWIFT_BUILD_ARGS[@]}" --product repoprompt-gateway',
+        ]
+        debug_phase = 'phase "Building debug products ($CONF, host-native)"'
+        debug_build = 'run "$CONTROL_PLANE_SCRIPTS_DIR/canonical_swift.sh" build "${SWIFT_BUILD_ARGS[@]}"\n'
+
+        # Release keeps its three product builds verbatim (original indentation) and in order.
+        positions = [("\n" + release_branch).index("\n    " + line + "\n") for line in release_lines]
+        self.assertEqual(positions, sorted(positions))
+        self.assertNotIn(debug_phase, release_branch)
+        # Debug runs exactly one product-less build after the KeyboardShortcuts patch.
+        self.assertIn(debug_phase, debug_branch)
+        self.assertEqual(debug_branch.count("canonical_swift.sh"), 1)
+        self.assertIn(debug_build, debug_branch)
+        self.assertNotIn("--product", debug_branch)
+        self.assertLess(debug_branch.index(debug_phase), debug_branch.index(debug_build))
+        self.assertLess(package_script.index("patch_keyboard_shortcuts_resource_lookup.sh"), package_script.index(debug_phase))
+        self.assertLess(package_script.index(debug_phase), package_script.index('phase "Resolving build artifact paths"'))
+        self.assertEqual(package_script.count("--show-bin-path)"), 1)
+
+    def test_host_native_build_commands_differ_only_between_debug_and_release(self) -> None:
+        # Stub evidence: fake doctor, KeyboardShortcuts patch and canonical_swift.sh record argv;
+        # the bin-path query fails on purpose so packaging stops before any bundle work.
+        temp_dir = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, temp_dir, True)
+        root = temp_dir / "repo"
+        scripts = root / "Scripts"
+        scripts.mkdir(parents=True)
+        shutil.copy2(SCRIPT_DIR / "load_release_metadata.sh", scripts / "load_release_metadata.sh")
+        shutil.copy2(SCRIPT_DIR / "parse_release_metadata.py", scripts / "parse_release_metadata.py")
+        (root / "version.env").write_text(
+            "APP_NAME=RepoPrompt\nDISPLAY_NAME=\"RepoPrompt CE\"\nMARKETING_VERSION=1.0.0\nBUILD_NUMBER=1\n"
+            "BUNDLE_ID=com.pvncher.repoprompt.ce\nSIGNING_TEAM_ID=648A27MST5\n",
+            encoding="utf-8",
+        )
+        calls = temp_dir / "calls.log"
+        stubs = {
+            "doctor.sh": "exit 0\n",
+            "patch_keyboard_shortcuts_resource_lookup.sh": 'printf "patch\\n" >> "$STUB_CALLS"\n',
+            "canonical_swift.sh": (
+                'printf "swift %s\\n" "$*" >> "$STUB_CALLS"\n'
+                'for arg in "$@"; do [[ "$arg" != --show-bin-path ]] || exit 7; done\n'
+            ),
+        }
+        for name, body in stubs.items():
+            stub = scripts / name
+            stub.write_text("#!/usr/bin/env bash\n" + body, encoding="utf-8")
+            stub.chmod(0o755)
+        base_env = {
+            key: value
+            for key, value in os.environ.items()
+            if key not in {
+                "SIGN_IDENTITY", "REPOPROMPT_ENABLE_SENTRY", "VERBOSE", "BUNDLE_ID", "APP_NAME", "DEBUG_SECURE_STORAGE_BACKEND"
+            }
+            and not key.startswith(("LOCAL_SELF_SIGNED", "LOCAL_SIGNING", "ALLOW_ADHOC", "RELEASE_ALLOW"))
+        }
+        base_env.update(
+            {
+                "REPOPROMPT_CONTROL_PLANE_SCRIPTS_DIR": str(scripts),
+                "REPOPROMPT_RELEASE_SOURCE_ROOT": str(root),
+                "STUB_CALLS": str(calls),
+            }
+        )
+        cases = {
+            "debug": (
+                {"ALLOW_ADHOC_SIGNING": "1", "PREFER_STABLE_DEBUG_SIGNING": "0"},
+                ["patch", "swift build -c debug", "swift build -c debug --show-bin-path"],
+                ["Building debug products (debug, host-native)"],
+            ),
+            "release": (
+                {
+                    "LOCAL_SELF_SIGNED_RELEASE": "1",
+                    "SIGN_IDENTITY": "RepoPrompt CE Stub Identity",
+                    "LOCAL_SIGNING_CERTIFICATE_SHA1": "a" * 40,
+                    "LOCAL_SIGNING_CERTIFICATE_SHA256": "b" * 64,
+                    "LOCAL_SIGNING_SERVICE_GENERATION": "1",
+                },
+                [
+                    "patch",
+                    "swift build -c release --product RepoPrompt",
+                    "swift build -c release --product repoprompt-mcp",
+                    "swift build -c release --product repoprompt-gateway",
+                    "swift build -c release --show-bin-path",
+                ],
+                [
+                    "Building RepoPrompt (release, host-native)",
+                    "Building repoprompt-mcp (release, host-native)",
+                    "Building repoprompt-gateway (release, host-native)",
+                ],
+            ),
+        }
+        for conf, (extra_env, expected_calls, expected_build_phases) in cases.items():
+            with self.subTest(conf=conf):
+                calls.unlink(missing_ok=True)
+                result = subprocess.run(
+                    [str(SCRIPT_DIR / "package_app.sh"), conf],
+                    env={**base_env, **extra_env},
+                    text=True,
+                    capture_output=True,
+                )
+                self.assertEqual(result.returncode, 7, result.stdout + result.stderr)
+                self.assertEqual(calls.read_text(encoding="utf-8").splitlines(), expected_calls)
+                timing_prefix = '[package-timing] phase="Building '
+                build_phases = [
+                    line[len('[package-timing] phase="'):].split('" elapsed_ms=', 1)[0]
+                    for line in result.stdout.splitlines()
+                    if line.startswith(timing_prefix)
+                ]
+                self.assertEqual(build_phases, expected_build_phases)
+
     def test_runtime_bundle_verifier_is_removed_without_changing_sparkle_or_anti_debug_startup(self) -> None:
         app_delegate = (SCRIPT_DIR.parent / "Sources" / "RepoPrompt" / "App" / "AppDelegate.swift").read_text(
             encoding="utf-8"
@@ -2373,9 +2495,10 @@ label_generated_tip_appcast""",
         package_script = (SCRIPT_DIR / "package_app.sh").read_text(encoding="utf-8")
         release_script = (SCRIPT_DIR / "release.sh").read_text(encoding="utf-8")
         self.assertIn('"$RUN_WITHOUT_GITHUB_TOKENS" swift package resolve', release_script)
+        # Three release product builds, one debug product-less build, and the bin-path echo plus query.
         self.assertEqual(
             package_script.count('"$CONTROL_PLANE_SCRIPTS_DIR/canonical_swift.sh" build'),
-            5,
+            6,
         )
         self.assertNotIn('"$RUN_WITHOUT_GITHUB_TOKENS" swift build', package_script)
         self.assertIn(
