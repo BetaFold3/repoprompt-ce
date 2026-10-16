@@ -27,6 +27,9 @@ package_timing_now
 PACKAGE_TIMING_START_US="$PACKAGE_TIMING_NOW_US"
 PACKAGE_TIMING_PHASE_START_US="$PACKAGE_TIMING_NOW_US"
 PACKAGE_TIMING_TOTAL_MS="?"
+# Debug publish state read by finish(); set only once hidden-sibling assembly starts.
+PACKAGE_DEST=""
+TEMP_PARENT=""
 package_timing_record(){
     local elapsed_ms="?" name="$PACKAGE_TIMING_PHASE"
     package_timing_now
@@ -103,6 +106,17 @@ PY
 finish(){
     local status="$1" now total
     [[ -z "${APP_ENTITLEMENTS:-}" ]] || rm -f "$APP_ENTITLEMENTS"
+    # Debug hidden-sibling assembly: delete the temp parent only while the destination exists
+    # and no publish step asked to retain it (.retain holds the recovery line).
+    if [[ -n "${TEMP_PARENT:-}" && -d "$TEMP_PARENT" ]]; then
+        if [[ -e "$PACKAGE_DEST" && ! -e "$TEMP_PARENT/.retain" ]]; then
+            rm -rf "$TEMP_PARENT" || echo "WARNING: could not remove $TEMP_PARENT; stale cleanup will retry." >&2
+        elif [[ -e "$TEMP_PARENT/.retain" ]]; then
+            echo "ERROR: kept $TEMP_PARENT: $(cat "$TEMP_PARENT/.retain" 2>/dev/null || true)" >&2
+        else
+            echo "WARNING: kept $TEMP_PARENT because $PACKAGE_DEST is missing; it holds the unpublished package. Remove it with: rm -rf \"$TEMP_PARENT\"" >&2
+        fi
+    fi
     package_timing_record
     printf '[package-timing] summary outcome=%s deep=%s total_ms=%s status=%s\n' "$PACKAGE_TIMING_OUTCOME" "$PACKAGE_TIMING_DEEP" "$PACKAGE_TIMING_TOTAL_MS" "$status"
     now="$(date +%s)"
@@ -337,10 +351,25 @@ generate_sentry_debug_symbols(){
 generate_sentry_debug_symbols
 
 phase "Creating app bundle layout"
+if (( IS_RELEASE )); then
 run rm -rf "$APP_BUNDLE"
 APP_BUNDLE_MATCHES_COMPAT="$(paths_same "$APP_BUNDLE" "$COMPAT_APP_BUNDLE")"
 if [[ "$APP_BUNDLE_MATCHES_COMPAT" != "1" ]]; then
     run rm -rf "$COMPAT_APP_BUNDLE"
+fi
+else
+    # Debug: assemble in a fresh hidden sibling of the destination and publish it only after
+    # every check passed, so a failed package never touches the installed bundle.
+    PACKAGE_DEST="$APP_BUNDLE"
+    if [[ -L "$PACKAGE_DEST" ]] || { [[ -e "$PACKAGE_DEST" ]] && [[ ! -d "$PACKAGE_DEST" ]]; }; then
+        fail "Debug package destination must be a directory or absent, not a symlink or file: $PACKAGE_DEST. Remove it or set REPOPROMPT_DEBUG_APP_BUNDLE to another path."
+    fi
+    run mkdir -p "$(dirname "$PACKAGE_DEST")"
+    run python3 -I -S "$CONTROL_PLANE_SCRIPTS_DIR/debug_package_cache.py" cleanup-stale --parent "$(dirname "$PACKAGE_DEST")" --max-age 3600
+    APP_BUNDLE_MATCHES_COMPAT="$(paths_same "$PACKAGE_DEST" "$COMPAT_APP_BUNDLE")"
+    TEMP_PARENT="$(mktemp -d "$(dirname "$PACKAGE_DEST")/.rpce-package-$$-XXXXXXXX")"
+    APP_BUNDLE="$TEMP_PARENT/$(basename "$PACKAGE_DEST")"
+    printf 'Assembling debug app bundle in hidden sibling: %s\n' "$APP_BUNDLE"
 fi
 run mkdir -p "$APP_BUNDLE/Contents/MacOS" "$APP_BUNDLE/Contents/Resources/bin" "$APP_BUNDLE/Contents/Frameworks"
 for exe in "$APP_NAME" repoprompt-mcp repoprompt-gateway; do
@@ -609,6 +638,14 @@ if truthy "${REPOPROMPT_UPLOAD_SENTRY_SYMBOLS:-}"; then
     sentry_linking_enabled || fail "REPOPROMPT_UPLOAD_SENTRY_SYMBOLS requires REPOPROMPT_ENABLE_SENTRY=1."
     require_sentry_upload_credentials
     run "$CONTROL_PLANE_SCRIPTS_DIR/upload_sentry_debug_symbols.sh" "$SENTRY_SYMBOLS_DIR"
+fi
+if (( ! IS_RELEASE )); then
+    phase "Publishing debug app bundle"
+    run python3 -I -S "$CONTROL_PLANE_SCRIPTS_DIR/debug_package_cache.py" publish --new "$APP_BUNDLE" --dest "$PACKAGE_DEST" --temp-parent "$TEMP_PARENT"
+    APP_BUNDLE="$PACKAGE_DEST"
+    if [[ "$APP_BUNDLE_MATCHES_COMPAT" != "1" ]]; then
+        run rm -rf "$COMPAT_APP_BUNDLE"
+    fi
 fi
 if [[ "$APP_BUNDLE_MATCHES_COMPAT" != "1" ]]; then
     phase "Updating compatibility app bundle link"

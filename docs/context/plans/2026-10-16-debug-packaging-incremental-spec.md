@@ -425,7 +425,7 @@ Step 2 — blocked | rounds 0/2 | open: full packaging/launch acceptance pending
 
 ### Step 3 — Fresh sibling assembly and publish
 
-Step 3 — todo | rounds 0/2 | open: | downgraded: | assumed: | deferred:
+Step 3 — blocked | rounds 0/2 | open: visible conductor run acceptance pending owner approval | downgraded: none | assumed: reversible local checkpoint; isolated real packaging/swap/kill/fallback validation passed | deferred: S3-3/S3-4 retention behavior per spec, known baseline lint assertion; evidence: step-3/findings.md, step-3/reviews/disposition.md
 
 - **Change:** add `debug_package_cache.py` with only `publish` and `cleanup-stale`; add the `PACKAGE_DEST`/`TEMP_PARENT` handling; make `rm -rf "$APP_BUNDLE"` release-only; change `finish()` to the new rule; move compatibility-link updates to after publish; add the publish tests.
 - **Validation:** repeat the `rm -rf` pin search; the fault-injection tests pass, including a failed restore followed by cleanup; live: killing packaging during signing leaves the existing app launchable; identity, smoke and verify pass inside the hidden parent; `conductor run` still activates its staged bundle.
