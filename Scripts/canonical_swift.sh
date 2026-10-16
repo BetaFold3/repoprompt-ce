@@ -7,6 +7,46 @@
 # SOURCE_GH_TOKEN.
 set -eo pipefail
 
+# Optimized-diagnostics Dev lane (internal; intended for `package_app.sh debug-optimized`). A leading --rpce-optimized-diagnostics is consumed here, so the
+# command switch below sees today's argv shape. The lane accepts only
+# `build ... -c release`; test products, scratch/build/package paths, any other
+# configuration spelling and -Xswiftc (which reaches third-party modules) exit 2
+# before Swift. The manifest gate reaches Swift only through this flag: env -i
+# drops an inherited RPCE_OPTIMIZED_DIAGNOSTICS.
+optimized_lane=""
+if [[ "${1:-}" == "--rpce-optimized-diagnostics" ]]; then
+    shift
+    optimized_lane=1
+    lane_reject() {
+        echo "canonical_swift.sh: --rpce-optimized-diagnostics $1" >&2
+        exit 2
+    }
+    [[ "${1:-}" == build ]] || lane_reject "supports only the build command; got '${1:-}'"
+    lane_release=0
+    lane_args=("${@:2}")
+    for ((lane_index = 0; lane_index < ${#lane_args[@]}; lane_index++)); do
+        lane_token="${lane_args[$lane_index]}"
+        case "$lane_token" in
+            -c)
+                lane_value="${lane_args[$((lane_index + 1))]:-}"
+                [[ "$lane_release" == 0 ]] || lane_reject "requires exactly one '-c release'; got a second '-c'"
+                if [[ "$lane_value" != release ]]; then
+                    lane_reject "requires exactly one '-c release'; got '-c $lane_value'"
+                fi
+                lane_release=1
+                lane_index=$((lane_index + 1))
+                ;;
+            --build-tests | -Xswiftc | -Xswiftc=* | --scratch-path | --scratch-path=* | --build-path | --build-path=* | \
+                --package-path | --package-path=* | --configuration | --configuration=* | -c=* | \
+                --rpce-optimized-diagnostics)
+                lane_reject "does not accept '$lane_token'"
+                ;;
+        esac
+    done
+    [[ "$lane_release" == 1 ]] || lane_reject "requires '-c release'"
+    [[ -f "$PWD/Package.swift" ]] || lane_reject "must run from the package root; no Package.swift in '$PWD'"
+fi
+
 # Pinned constant PATH: env -i clears PATH, but SwiftPM build steps spawn
 # tools (codesign for debug entitlements, git) via PATH lookup. A constant
 # system PATH keeps the environment deterministic across all lanes.
@@ -34,6 +74,9 @@ if [[ -n "${SDKROOT:-}" ]]; then
 fi
 if [[ -n "${TOOLCHAINS:-}" ]]; then
     swift_env+=("TOOLCHAINS=$TOOLCHAINS")
+fi
+if [[ -n "$optimized_lane" ]]; then
+    swift_env+=("RPCE_OPTIMIZED_DIAGNOSTICS=1")
 fi
 
 # Index store policy (RPCE_INDEX_STORE=on|off; unset means off). No known
@@ -65,6 +108,12 @@ case "${1:-}" in
         index_candidate=1
         ;;
 esac
+# The lane's own build folder: never thrashes .build/<arch>/debug or the shared
+# host-native release tree. It precedes classification, so the dSYM and index
+# policies see it (release configuration: full symbols, no index flag).
+if [[ -n "$optimized_lane" ]]; then
+    set -- "${@:1:4}" --scratch-path "$PWD/.build/optimized-diagnostics" "${@:5}"
+fi
 
 # Debug dSYM policy (RPCE_DEBUG_DSYM=on|off; unset means off). The classifier
 # inspects only the build configuration of this exact argument vector, prints

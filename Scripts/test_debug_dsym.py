@@ -8,6 +8,7 @@ import io
 import os
 import signal
 import struct
+import subprocess
 import sys
 import tempfile
 import textwrap
@@ -146,6 +147,142 @@ class PolicyTests(unittest.TestCase):
         with mock.patch.object(dd, "classify_environment", side_effect=RuntimeError("boom")):
             code, out, _ = self.run_cli(["wrapper-policy", "--", "build"], {})
         self.assertEqual((code, out), (70, ""))
+
+    def test_optimized_lane_argv_keeps_full_symbols_and_debug_policy_is_unchanged(self) -> None:
+        # The exact vectors canonical_swift.sh classifies for the optimized-diagnostics lane.
+        prefix = ["build", "--build-system", "native", "--no-color-diagnostics",
+                  "--scratch-path", "/repo/.build/optimized-diagnostics"]
+        for tail in (["-c", "release"], ["-c", "release", "--show-bin-path"]):
+            for requested in (None, "off", "on"):
+                with self.subTest(tail=tail, requested=requested):
+                    decision = self.decide(prefix + tail, requested)
+                    self.assertEqual((decision.configuration, decision.effective), ("release", "on"))
+                    self.assertFalse(decision.skip)
+        # The scratch-path operand never changes the debug classification.
+        for argv in (prefix, prefix + ["-c", "debug"], prefix + ["--show-bin-path"]):
+            with self.subTest(argv=argv):
+                decision = self.decide(argv)
+                self.assertEqual((decision.configuration, decision.effective, decision.reason),
+                                 ("debug", "off", "debug_skip"))
+
+
+class OptimizedLaneWrapperTests(unittest.TestCase):
+    """canonical_swift.sh --rpce-optimized-diagnostics: rules, gate injection and scratch path (Step 1)."""
+
+    WRAPPER = SCRIPT_DIR / "canonical_swift.sh"
+    POLICY_KEYS = {"RPCE_DEBUG_DSYM", "RPCE_INDEX_STORE", "REPOPROMPT_ENABLE_SENTRY", "SWIFT_DRIVER_DSYMUTIL_EXEC",
+                   "RPCE_OPTIMIZED_DIAGNOSTICS", "RPCE_ENABLE_BENCHMARK_TESTS", "RPCE_RUN_CODEMAP_E2E",
+                   "RPCE_RUN_SCALE_TESTS", "DEVELOPER_DIR", "SDKROOT", "TOOLCHAINS", "PWD", "OLDPWD"}
+
+    def setUp(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.package = Path(os.path.realpath(tmp.name))
+        (self.package / "Package.swift").write_text("// swift-tools-version: 6.2\n")
+        self.scratch = str(self.package / ".build" / "optimized-diagnostics")
+
+    def run_wrapper(self, arguments, extra_env=None, cwd=None):
+        """``(exit, child env, swift argv, stderr)``; ``exec`` is stubbed so Swift never runs."""
+        env = {key: value for key, value in os.environ.items() if key not in self.POLICY_KEYS}
+        env.update(extra_env or {})
+        result = subprocess.run(
+            ["/bin/bash", "-c", 'exec() { printf "%s\\0" "$@"; }; wrapper="$1"; shift; source "$wrapper" "$@"',
+             "canonical-swift-test", str(self.WRAPPER), *arguments],
+            check=False, capture_output=True, env=env, cwd=str(cwd or self.package))
+        argv = result.stdout.decode().split("\0")[:-1]
+        if not argv:
+            return result.returncode, None, None, result.stderr.decode()
+        swift_index = argv.index("/usr/bin/swift")
+        self.assertEqual(argv[:2], ["/usr/bin/env", "-i"])
+        return result.returncode, argv[2:swift_index], argv[swift_index + 1:], result.stderr.decode()
+
+    def lane(self, *arguments):
+        return ["--rpce-optimized-diagnostics", *arguments]
+
+    def test_lane_adds_the_gate_and_scratch_path_and_keeps_full_symbols(self) -> None:
+        _, plain_env, plain_args, _ = self.run_wrapper(["build", "-c", "release"])
+        for tail in (["-c", "release"], ["-c", "release", "--show-bin-path"], ["--show-bin-path", "-c", "release"]):
+            with self.subTest(tail=tail):
+                code, child_env, swift_args, stderr = self.run_wrapper(self.lane("build", *tail))
+                self.assertEqual(code, 0)
+                # Today's release environment plus exactly the gate, appended last.
+                self.assertEqual(child_env, plain_env + ["RPCE_OPTIMIZED_DIAGNOSTICS=1"])
+                self.assertEqual(swift_args, ["build", "--build-system", "native", "--no-color-diagnostics",
+                                              "--scratch-path", self.scratch, *tail])
+                self.assertNotIn("--disable-index-store", swift_args)
+                self.assertNotIn("--rpce-optimized-diagnostics", swift_args)
+                self.assertEqual(stderr.count("rpce-debug-dsym:"), 1)
+                self.assertIn("effective=on reason=configuration_release configuration=release", stderr)
+        self.assertEqual(plain_args, ["build", "--build-system", "native", "--no-color-diagnostics", "-c", "release"])
+
+    def test_build_and_bin_path_query_share_one_lane_environment_under_any_policy(self) -> None:
+        environments = set()
+        for tail in (["-c", "release"], ["-c", "release", "--show-bin-path"]):
+            for extra in ({}, {"RPCE_DEBUG_DSYM": "off"}, {"RPCE_DEBUG_DSYM": "on"}, {"RPCE_INDEX_STORE": "on"},
+                          {"RPCE_OPTIMIZED_DIAGNOSTICS": "0"}, {"RPCE_OPTIMIZED_DIAGNOSTICS": "1"}):
+                with self.subTest(tail=tail, extra=extra):
+                    code, child_env, swift_args, _ = self.run_wrapper(self.lane("build", *tail), extra)
+                    self.assertEqual(code, 0)
+                    self.assertEqual(child_env.count("RPCE_OPTIMIZED_DIAGNOSTICS=1"), 1)
+                    self.assertFalse(any(item.startswith("SWIFT_DRIVER_DSYMUTIL_EXEC=") for item in child_env))
+                    self.assertNotIn("--disable-index-store", swift_args)
+                    environments.add(tuple(child_env))
+        self.assertEqual(len(environments), 1)
+
+    def test_inherited_gate_never_reaches_swift_without_the_flag(self) -> None:
+        for arguments in (["build"], ["build", "-c", "release"], ["build", "-c", "debug", "--show-bin-path"],
+                          ["test", "list"], ["package", "resolve"]):
+            with self.subTest(arguments=arguments):
+                plain = self.run_wrapper(arguments)
+                inherited = self.run_wrapper(arguments, {"RPCE_OPTIMIZED_DIAGNOSTICS": "1"})
+                self.assertEqual(inherited, plain)
+                self.assertFalse(any(item.startswith("RPCE_OPTIMIZED_DIAGNOSTICS") for item in plain[1]))
+                self.assertNotIn("--scratch-path", plain[2])
+
+    def test_unsafe_or_conflicting_lane_argv_exits_2_before_swift(self) -> None:
+        cases = (
+            ([], "supports only the build command"),
+            (["test", "-c", "release"], "supports only the build command"),
+            (["package", "resolve"], "supports only the build command"),
+            (["run", "-c", "release"], "supports only the build command"),
+            (["build"], "requires '-c release'"),
+            (["build", "--show-bin-path"], "requires '-c release'"),
+            (["build", "-c", "debug"], "requires exactly one '-c release'"),
+            (["build", "-c", "release", "-c", "debug"], "requires exactly one '-c release'"),
+            (["build", "-c", "release", "-c", "release"], "requires exactly one '-c release'"),
+            (["build", "-c"], "requires exactly one '-c release'"),
+            (["build", "-c=release"], "does not accept '-c=release'"),
+            (["build", "--configuration", "release"], "does not accept '--configuration'"),
+            (["build", "--configuration=release"], "does not accept '--configuration=release'"),
+            (["build", "-c", "release", "--build-tests"], "does not accept '--build-tests'"),
+            (["build", "-c", "release", "-Xswiftc", "-DDEBUG"], "does not accept '-Xswiftc'"),
+            (["build", "-c", "release", "--scratch-path", "/tmp/x"], "does not accept '--scratch-path'"),
+            (["build", "-c", "release", "--scratch-path=/tmp/x"], "does not accept '--scratch-path=/tmp/x'"),
+            (["build", "-c", "release", "--build-path", "/tmp/x"], "does not accept '--build-path'"),
+            (["build", "-c", "release", "--package-path", "/tmp/x"], "does not accept '--package-path'"),
+            (["build", "-c", "release", "--rpce-optimized-diagnostics"],
+             "does not accept '--rpce-optimized-diagnostics'"),
+        )
+        for arguments, message in cases:
+            with self.subTest(arguments=arguments):
+                code, child_env, _, stderr = self.run_wrapper(self.lane(*arguments))
+                self.assertEqual(code, 2)
+                self.assertIsNone(child_env)
+                self.assertIn(f"canonical_swift.sh: --rpce-optimized-diagnostics {message}", stderr)
+                self.assertNotIn("rpce-debug-dsym:", stderr)  # rejected before classification
+        # The flag is recognized only in the leading position; elsewhere the default path forwards it untouched.
+        code, child_env, swift_args, _ = self.run_wrapper(["build", "--rpce-optimized-diagnostics"])
+        self.assertEqual(code, 0)
+        self.assertFalse(any(item.startswith("RPCE_OPTIMIZED_DIAGNOSTICS") for item in child_env))
+        self.assertNotIn("--scratch-path", swift_args)
+
+    def test_lane_requires_the_package_root_as_working_directory(self) -> None:
+        elsewhere = self.package / "Sources"
+        elsewhere.mkdir()
+        code, child_env, _, stderr = self.run_wrapper(self.lane("build", "-c", "release"), cwd=elsewhere)
+        self.assertEqual(code, 2)
+        self.assertIsNone(child_env)
+        self.assertIn("must run from the package root", stderr)
 
 
 class UUIDReaderTests(unittest.TestCase):

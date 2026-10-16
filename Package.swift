@@ -10,6 +10,17 @@ let environment = ProcessInfo.processInfo.environment
 let sentryEnabled = environment["REPOPROMPT_ENABLE_SENTRY"] == "1"
 let benchmarkTestsEnabled = environment["RPCE_ENABLE_BENCHMARK_TESTS"] == "1"
 
+// Optimized-diagnostics Dev lane: coordinated builds reach it only through
+// `Scripts/canonical_swift.sh --rpce-optimized-diagnostics build -c release`.
+// Gate off, every first-party site carries exactly the debug-only DEBUG define.
+// Gate on, first-party Swift targets define DEBUG in the release build, plus a
+// lane marker. Packages/RepoPromptCore and Packages/RepoPromptAgentProviders
+// keep identical copies of this gate (manifests cannot share code).
+let optimizedDiagnosticsLane = environment["RPCE_OPTIMIZED_DIAGNOSTICS"] == "1"
+let firstPartyDebugSettings: [SwiftSetting] = optimizedDiagnosticsLane
+    ? [.define("DEBUG"), .define("RPCE_OPTIMIZED_DIAGNOSTICS", .when(configuration: .release))]
+    : [.define("DEBUG", .when(configuration: .debug))]
+
 var packageDependencies: [Package.Dependency] = [
     .package(url: "https://github.com/apple/swift-log.git", exact: "1.6.3"),
     .package(url: "https://github.com/sindresorhus/KeyboardShortcuts.git", exact: "2.3.0"),
@@ -84,8 +95,7 @@ var repoPromptAppDependencies: [Target.Dependency] = [
 ]
 
 /// Shared by RepoPromptApp and the lower app-split library targets so compile conditions stay aligned.
-let repoPromptLayerSwiftSettings: [SwiftSetting] = [
-    .define("DEBUG", .when(configuration: .debug)),
+let repoPromptLayerSwiftSettings: [SwiftSetting] = firstPartyDebugSettings + [
     .enableUpcomingFeature("BareSlashRegexLiterals")
 ]
 
@@ -133,7 +143,9 @@ let package = Package(
         .executableTarget(
             name: "RepoPrompt",
             dependencies: ["RepoPromptApp"],
-            path: "Sources/RepoPromptExecutable"
+            path: "Sources/RepoPromptExecutable",
+            // Debug builds already define DEBUG here; only the lane adds settings.
+            swiftSettings: optimizedDiagnosticsLane ? firstPartyDebugSettings : nil
         ),
         .target(
             name: "RepoPromptApp",
@@ -207,7 +219,7 @@ let package = Package(
         .target(
             name: "RepoPromptRemoteWire",
             path: "Sources/RepoPromptRemoteWire",
-            swiftSettings: [.define("DEBUG", .when(configuration: .debug))]
+            swiftSettings: firstPartyDebugSettings
         ),
         .executableTarget(
             name: "RepoPromptMCP",
@@ -215,7 +227,7 @@ let package = Package(
                 .product(name: "RepoPromptMCPCore", package: "RepoPromptCore")
             ],
             path: "Sources/RepoPromptMCP",
-            swiftSettings: [.define("DEBUG", .when(configuration: .debug))]
+            swiftSettings: firstPartyDebugSettings
         ),
         .executableTarget(
             name: "RepoPromptGateway",
@@ -235,7 +247,7 @@ let package = Package(
             resources: [
                 .copy("Resources/pwa")
             ],
-            swiftSettings: [.define("DEBUG", .when(configuration: .debug))]
+            swiftSettings: firstPartyDebugSettings
         ),
         .target(name: "CSwiftPCRE2", path: "Sources/CSwiftPCRE2", exclude: ["deps/sljit/sljit_src/sljitNativeARM_64.c", "deps/sljit/sljit_src/sljitSerialize.c", "deps/sljit/sljit_src/sljitUtils.c", "deps/sljit/sljit_src/sljitNativeX86_common.c", "deps/sljit/sljit_src/sljitNativeX86_64.c", "deps/sljit/sljit_src/sljitNativeX86_32.c", "deps/sljit/sljit_src/allocator_src/sljitWXExecAllocatorPosix.c", "deps/sljit/sljit_src/allocator_src/sljitProtExecAllocatorPosix.c", "deps/sljit/sljit_src/allocator_src/sljitExecAllocatorPosix.c", "deps/sljit/sljit_src/allocator_src/sljitExecAllocatorCore.c", "deps/sljit/sljit_src/allocator_src/sljitExecAllocatorApple.c"], publicHeadersPath: "include", cSettings: [.headerSearchPath("include"), .headerSearchPath("src"), .define("PCRE2_CODE_UNIT_WIDTH", to: "8"), .define("HAVE_CONFIG_H")]),
         .target(name: "RepoPromptC", path: "Sources/RepoPromptC", publicHeadersPath: "include", cSettings: [.headerSearchPath("include")]),

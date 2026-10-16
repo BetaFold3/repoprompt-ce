@@ -475,7 +475,7 @@ Each step compiles and passes its tests on its own.
 8. **Launch smoke and A-B-A measurement** (validation steps 8–9), as owner-approved actions.
 
 Status:
-- Step 1 — todo | rounds 0/2 | open: | downgraded: | assumed: | deferred:
+- Step 1 — done | rounds 0/2 | open: | downgraded: | assumed: assertions off and isolated scratch as approved | deferred: S1-P3-1 allowlist; S1-P3-4 gate-copy static test; optimized compile to Step 4; pre-existing release-selftest lint assertion (optimized-lane-step1-review.md)
 - Step 2 — todo | rounds 0/2 | open: | downgraded: | assumed: | deferred:
 - Step 3 — todo | rounds 0/2 | open: | downgraded: | assumed: | deferred:
 - Step 4 — todo | rounds 0/2 | open: | downgraded: | assumed: | deferred:
@@ -483,9 +483,11 @@ Status:
 - Step 6 — todo | rounds 0/2 | open: | downgraded: | assumed: | deferred:
 - Step 7 — todo | rounds 0/2 | open: | downgraded: | assumed: | deferred:
 - Step 8 — todo | rounds 0/2 | open: | downgraded: | assumed: | deferred:
-- Spec — done (awaiting owner approval) | rounds 2/2 | open: | downgraded: | assumed: assertions off; per-invocation selection; separate build folder | deferred:
+- Spec — done (owner approved implementation) | rounds 2/2 | open: | downgraded: | assumed: assertions off; per-invocation selection; separate build folder | deferred:
 
 ## Decisions
+
+- Owner Decision (2026-10-16): Implement Steps 1–4 one at a time with validation, OracleA/OracleB review and local commits; continue toward the remaining steps if build-time results show nothing unexpected. This authorizes the optimized-diagnostics lane in place of the earlier leave-tooling-unchanged decision; visible app lifecycle actions still require fresh approval.
 
 - Owner Decision (2026-10-16): Merge the OracleA and OracleB recommendations into one spec, have both Oracles review it once, and show the final spec before implementation.
 - Owner Decision (2026-10-16): Include the build-plan flag verifier and the running-app build-lane label.

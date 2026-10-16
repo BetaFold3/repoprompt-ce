@@ -1,5 +1,12 @@
 // swift-tools-version: 6.2
+import Foundation
 import PackageDescription
+
+// Optimized-diagnostics Dev lane gate; keep identical to the root Package.swift copy.
+let optimizedDiagnosticsLane = ProcessInfo.processInfo.environment["RPCE_OPTIMIZED_DIAGNOSTICS"] == "1"
+let firstPartyDebugSettings: [SwiftSetting] = optimizedDiagnosticsLane
+    ? [.define("DEBUG"), .define("RPCE_OPTIMIZED_DIAGNOSTICS", .when(configuration: .release))]
+    : [.define("DEBUG", .when(configuration: .debug))]
 
 let package = Package(
     name: "RepoPromptCore",
@@ -22,7 +29,7 @@ let package = Package(
         .target(
             name: "RepoPromptShared",
             path: "Sources/RepoPromptShared",
-            swiftSettings: [.define("DEBUG", .when(configuration: .debug))]
+            swiftSettings: firstPartyDebugSettings
         ),
         .target(
             name: "RepoPromptMCPClientKit",
@@ -33,7 +40,7 @@ let package = Package(
                 .product(name: "SystemPackage", package: "swift-system")
             ],
             path: "Sources/RepoPromptMCPClientKit",
-            swiftSettings: [.define("DEBUG", .when(configuration: .debug))]
+            swiftSettings: firstPartyDebugSettings
         ),
         .target(
             name: "RepoPromptMCPCore",
@@ -46,7 +53,7 @@ let package = Package(
                 .product(name: "SystemPackage", package: "swift-system")
             ],
             path: "Sources/RepoPromptMCPCore",
-            swiftSettings: [.define("DEBUG", .when(configuration: .debug))]
+            swiftSettings: firstPartyDebugSettings
         ),
         .testTarget(
             name: "RepoPromptCoreTests",
