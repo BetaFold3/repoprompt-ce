@@ -12,8 +12,40 @@ cd "$ROOT_DIR"
 
 START_TIME="$(date +%s)"
 PHASE_START="$START_TIME"
+# Machine-readable timing records for Scripts/summarize_package_phases.py. They use
+# $EPOCHREALTIME (bash >= 5; wall clock, not monotonic) and never spawn a process.
+# Values are "?" when $EPOCHREALTIME is unavailable. Totals for comparisons come
+# from an outer harness with a monotonic clock.
+PACKAGE_TIMING_PHASE="startup"
+PACKAGE_TIMING_OUTCOME="fresh"
+PACKAGE_TIMING_DEEP="skipped:not-reached"
+package_timing_now(){
+    PACKAGE_TIMING_NOW_US="${EPOCHREALTIME:-}"
+    PACKAGE_TIMING_NOW_US="${PACKAGE_TIMING_NOW_US//[!0-9]/}"
+}
+package_timing_now
+PACKAGE_TIMING_START_US="$PACKAGE_TIMING_NOW_US"
+PACKAGE_TIMING_PHASE_START_US="$PACKAGE_TIMING_NOW_US"
+PACKAGE_TIMING_TOTAL_MS="?"
+package_timing_record(){
+    local elapsed_ms="?" name="$PACKAGE_TIMING_PHASE"
+    package_timing_now
+    PACKAGE_TIMING_TOTAL_MS="?"
+    if [[ -n "$PACKAGE_TIMING_NOW_US" && -n "$PACKAGE_TIMING_START_US" ]]; then
+        PACKAGE_TIMING_TOTAL_MS=$(( (PACKAGE_TIMING_NOW_US - PACKAGE_TIMING_START_US) / 1000 ))
+    fi
+    if [[ -n "$PACKAGE_TIMING_NOW_US" && -n "$PACKAGE_TIMING_PHASE_START_US" ]]; then
+        elapsed_ms=$(( (PACKAGE_TIMING_NOW_US - PACKAGE_TIMING_PHASE_START_US) / 1000 ))
+    fi
+    name="${name//\\/\\\\}"
+    name="${name//\"/\\\"}"
+    printf '[package-timing] phase="%s" elapsed_ms=%s total_ms=%s\n' "$name" "$elapsed_ms" "$PACKAGE_TIMING_TOTAL_MS"
+    PACKAGE_TIMING_PHASE_START_US="$PACKAGE_TIMING_NOW_US"
+}
 phase(){
     local now elapsed total
+    package_timing_record
+    PACKAGE_TIMING_PHASE="$*"
     now="$(date +%s)"
     elapsed=$((now - PHASE_START))
     total=$((now - START_TIME))
@@ -71,6 +103,8 @@ PY
 finish(){
     local status="$1" now total
     [[ -z "${APP_ENTITLEMENTS:-}" ]] || rm -f "$APP_ENTITLEMENTS"
+    package_timing_record
+    printf '[package-timing] summary outcome=%s deep=%s total_ms=%s status=%s\n' "$PACKAGE_TIMING_OUTCOME" "$PACKAGE_TIMING_DEEP" "$PACKAGE_TIMING_TOTAL_MS" "$status"
     now="$(date +%s)"
     total=$((now - START_TIME))
     if (( status == 0 )); then
@@ -530,8 +564,10 @@ else
     sign_path "$APP_BUNDLE"
 fi
 if (( FAST_PACKAGE_CAN_SKIP_VERIFICATION )); then
+    PACKAGE_TIMING_DEEP="skipped:fast-fingerprint"
     echo "FAST PACKAGE SKIP: codesign --verify --deep --strict (matching fully verified package fingerprint)."
 else
+    PACKAGE_TIMING_DEEP="ran"
     run codesign --verify --deep --strict --verbose=2 "$APP_BUNDLE"
 fi
 verify_signed_app_identity

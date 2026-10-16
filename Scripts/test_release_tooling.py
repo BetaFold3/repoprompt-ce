@@ -3045,5 +3045,113 @@ esac
         return subprocess.run(args, cwd=cwd, text=True, capture_output=True, check=True)
 
 
+class PackageTimingTests(unittest.TestCase):
+    """Debug-packaging Step 0: [package-timing] records and their summarizer."""
+
+    def test_package_app_emits_parseable_timing_records_and_failed_runs_are_excluded(self) -> None:
+        import summarize_package_phases as summarizer
+
+        temp_dir = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, temp_dir, True)
+        root = temp_dir / "repo"
+        scripts = root / "Scripts"
+        scripts.mkdir(parents=True)
+        shutil.copy2(SCRIPT_DIR / "load_release_metadata.sh", scripts / "load_release_metadata.sh")
+        shutil.copy2(SCRIPT_DIR / "parse_release_metadata.py", scripts / "parse_release_metadata.py")
+        doctor = scripts / "doctor.sh"
+        doctor.write_text("#!/usr/bin/env bash\nexit 42\n", encoding="utf-8")
+        doctor.chmod(0o755)
+        (root / "version.env").write_text(
+            'APP_NAME=RepoPrompt\nDISPLAY_NAME="RepoPrompt CE"\nMARKETING_VERSION=1.0.0\nBUILD_NUMBER=1\n'
+            "BUNDLE_ID=com.pvncher.repoprompt.ce\nSIGNING_TEAM_ID=648A27MST5\n",
+            encoding="utf-8",
+        )
+        env = os.environ.copy()
+        env.update({"REPOPROMPT_CONTROL_PLANE_SCRIPTS_DIR": str(scripts), "REPOPROMPT_RELEASE_SOURCE_ROOT": str(root)})
+        result = subprocess.run(
+            [str(SCRIPT_DIR / "package_app.sh"), "debug"], env=env, text=True, capture_output=True
+        )
+        self.assertEqual(result.returncode, 42, result.stderr)
+        lines = result.stdout.splitlines()
+        # The human-readable heading format is unchanged.
+        self.assertRegex(result.stdout, r"(?m)^==> \[\d{4}-\d\d-\d\d \d\d:\d\d:\d\d\] Checking build environment "
+                                        r"\(previous: \d+s, total: \d+s\)$")
+        timing = [line for line in lines if line.startswith("[package-timing]")]
+        names = [summarizer._PHASE_RE.search(line).group(1) for line in timing[:-1]]
+        self.assertEqual(names, ["startup", "Loading release metadata", "Checking build environment"])
+        self.assertRegex(timing[-1], r"^\[package-timing\] summary outcome=fresh deep=skipped:not-reached "
+                                     r"total_ms=(\d+|\?) status=42$")
+        runs = summarizer.parse_runs(lines, "stub")
+        self.assertEqual(len(runs), 1)
+        payload = summarizer.summarize(runs)
+        self.assertEqual(payload["runs"], 0)
+        self.assertEqual(payload["excludedRuns"], [{"source": "stub", "index": 0, "reason": "status=42"}])
+
+    def test_summarizer_reports_phase_medians_iqr_and_non_compile_time(self) -> None:
+        import summarize_package_phases as summarizer
+
+        def run_log(build_ms: int, sign_ms: int, deep: str = "ran") -> list[str]:
+            total = 100 + build_ms + 50 + sign_ms
+            return [
+                "==> [2026-10-16 10:00:00] Loading release metadata (previous: 0s, total: 0s)",
+                '[package-timing] phase="startup" elapsed_ms=100 total_ms=100',
+                f'[package-timing] phase="Building RepoPrompt (debug, host-native)" elapsed_ms={build_ms} total_ms=1',
+                '[package-timing] phase="Resolving build artifact paths" elapsed_ms=50 total_ms=2',
+                f'[package-timing] phase="Signing app bundle" elapsed_ms={sign_ms} total_ms=3',
+                f"[package-timing] summary outcome=fresh deep={deep} total_ms={total} status=0",
+            ]
+
+        temp_dir = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, temp_dir, True)
+        log = temp_dir / "runs.log"
+        lines = run_log(3000, 4000) + run_log(3200, 4100) + run_log(2800, 4200) + run_log(3100, 3900)
+        # A backward wall-clock jump shows as a negative phase even when the final total is positive.
+        clock_jump = run_log(3000, 4000)
+        clock_jump[3] = '[package-timing] phase="Resolving build artifact paths" elapsed_ms=-1200 total_ms=1900'
+        lines += clock_jump
+        lines += ['[package-timing] phase="startup" elapsed_ms=10 total_ms=10',
+                  "[package-timing] summary outcome=fresh deep=ran total_ms=-5 status=0"]
+        lines += ['[package-timing] phase="startup" elapsed_ms=? total_ms=?',
+                  "[package-timing] summary outcome=fresh deep=ran total_ms=? status=0",
+                  '[package-timing] phase="startup" elapsed_ms=5 total_ms=5']
+        log.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        output = temp_dir / "summary.json"
+        self.assertEqual(summarizer.main([str(log), "--output", str(output)]), 0)
+        payload = json.loads(output.read_text(encoding="utf-8"))
+        self.assertEqual(payload["runs"], 4)
+        self.assertEqual(
+            [item["reason"] for item in payload["excludedRuns"]],
+            ["negative elapsed_ms for phase 'Resolving build artifact paths' (wall-clock jump; repeat the sample)",
+             "negative total_ms (wall-clock jump; repeat the sample)", "unknown total_ms", "no summary record"],
+        )
+        self.assertEqual(list(payload["phases"]), ["startup", "Building RepoPrompt (debug, host-native)",
+                                                   "Resolving build artifact paths", "Signing app bundle"])
+        self.assertEqual(payload["phases"]["Signing app bundle"]["median_ms"], 4050)
+        self.assertEqual(payload["build_ms"]["median_ms"], 3050)
+        self.assertEqual([run["non_compile_ms"] for run in payload["perRun"]], [4150, 4250, 4350, 4050])
+        self.assertEqual(payload["non_compile_ms"]["median_ms"], 4200)
+        self.assertEqual(payload["non_compile_ms"]["iqr_ms"], 150)
+        self.assertEqual(payload["deep"], {"ran": 4})
+        # A run killed before its summary never merges into the next run, and VERBOSE=1 shell
+        # tracing of the record printf is ignored instead of read as a malformed record.
+        xtrace = ("+ printf '[package-timing] phase=\"%s\" elapsed_ms=%s total_ms=%s\\n' startup 1 1",
+                  "++ printf '[package-timing] summary outcome=%s deep=%s total_ms=%s status=%s\\n' fresh ran 9 0",
+                  "+ package_timing_record")
+        interrupted = ['[package-timing] phase="startup" elapsed_ms=1 total_ms=1',
+                       '[package-timing] phase="Building RepoPrompt (debug, host-native)" elapsed_ms=9000 total_ms=9001']
+        combined = temp_dir / "combined.log"
+        combined.write_text("\n".join([*interrupted, *xtrace, *run_log(3000, 4000), *xtrace]) + "\n", encoding="utf-8")
+        runs = summarizer.parse_runs(combined.read_text(encoding="utf-8").splitlines(), "combined")
+        self.assertEqual([len(run["phases"]) for run in runs], [2, 4])
+        payload = summarizer.summarize(runs)
+        self.assertEqual(payload["runs"], 1)
+        self.assertEqual(payload["excludedRuns"], [{"source": "combined", "index": 0, "reason": "no summary record"}])
+        self.assertEqual(payload["perRun"][0]["build_ms"], 3000)
+        self.assertEqual(payload["perRun"][0]["non_compile_ms"], 4150)
+        empty = temp_dir / "empty.log"
+        empty.write_text("no timing here\n", encoding="utf-8")
+        self.assertEqual(summarizer.main([str(empty), "--output", str(temp_dir / "empty.json")]), 1)
+
+
 if __name__ == "__main__":
     unittest.main()

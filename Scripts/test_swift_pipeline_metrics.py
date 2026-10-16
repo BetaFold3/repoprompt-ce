@@ -131,6 +131,39 @@ class FixtureReplayTests(SpanInvariantMixin, unittest.TestCase):
         offsets = [event["t"] for event in recorder.events()]
         self.assertEqual(offsets[0], 0)
 
+    def test_package_timing_records_do_not_change_package_metrics(self) -> None:
+        # Debug-packaging Step 0: as in real output, phase() prints a [package-timing]
+        # record before every phase ==> heading, and finish() prints the closing phase
+        # record and the summary before its "Completed packaging" heading. They are not
+        # markers, so segments, contexts and counts derive exactly as without them.
+        case = load_case("package-debug")
+        timed = json.loads(json.dumps(case))
+        record = '[package-timing] phase="Building a\\"b" elapsed_ms=1234 total_ms=5678\n'
+        closing = ('[package-timing] phase="Updating compatibility app bundle link" elapsed_ms=? total_ms=?\n'
+                   "[package-timing] summary outcome=fresh deep=ran total_ms=30000 status=0\n")
+        inserted = 0
+        for step in timed["steps"]:
+            if "chunk" not in step or "==> " not in step["chunk"]:
+                continue
+            lines = step["chunk"].splitlines(keepends=True)
+            for index, line in enumerate(lines):
+                if line.startswith("==> "):
+                    prefix = closing if "Completed packaging" in line else record
+                    inserted += prefix.count("\n")
+                    lines[index] = prefix + line
+            step["chunk"] = "".join(lines)
+        self.assertGreaterEqual(inserted, 7)
+        self.assertTrue(any(closing + "==> [" in step.get("chunk", "") and "Completed packaging" in step["chunk"]
+                            for step in timed["steps"]))
+        _, plain = replay(case)
+        for size in (None, 3):
+            with self.subTest(piece_size=size):
+                _, with_timing = replay(timed, piece_size=size)
+                # Only the raw record count sees the extra lines.
+                self.assertEqual(with_timing["output"]["records"], plain["output"]["records"] + inserted)
+                with_timing["output"] = dict(with_timing["output"], records=plain["output"]["records"])
+                self.assertEqual(with_timing, plain)
+
     def test_finalize_is_idempotent_and_late_observations_are_ignored(self) -> None:
         recorder, payload = replay(load_case("null-test"))
         recorder.observe_records([metrics.OutputRecord(999, 10**12, "Build complete! (9.00s)", "lf")])
@@ -251,7 +284,9 @@ class ClassifierTests(unittest.TestCase):
 
     def test_non_markers(self) -> None:
         for text in ("", "\x1b[2K", "$", "+x", "==>", "[ACPAgentRunToolTracking] foo", "Build failed", "Test Suite 'x' oops",
-                     "acquired global heavy slot /tmp/x after 0ms", "PLAN workers=8", "warning: something.pcm is fine"):
+                     "acquired global heavy slot /tmp/x after 0ms", "PLAN workers=8", "warning: something.pcm is fine",
+                     '[package-timing] phase="Building RepoPrompt (debug, host-native)" elapsed_ms=22370 total_ms=23001',
+                     "[package-timing] summary outcome=fresh deep=ran total_ms=30000 status=0"):
             with self.subTest(text=text):
                 self.assertIsNone(metrics.classify_record(text))
 
