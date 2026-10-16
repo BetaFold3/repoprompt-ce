@@ -1027,25 +1027,209 @@ struct AgentStashedSessionRow: View {
 /// - Read as "actively processing" without competing with the green waiting
 ///   dot — running is informational, waiting is actionable, so running
 ///   should not out-shout it.
+///
+/// The rotation runs as a Core Animation animation on the render server, so it
+/// keeps turning while the main thread is busy and does not drive per-frame
+/// SwiftUI updates for every running row.
 private struct AgentRowActivityArc: View {
     var tint: Color = .accentColor
-    @State private var rotation: Double = 0
 
     var body: some View {
-        Circle()
-            .trim(from: 0.0, to: 0.7)
-            .stroke(
-                tint.opacity(0.75),
-                style: StrokeStyle(lineWidth: 1.5, lineCap: .round)
+        // The layer view is sized to the stroke's outer edge so the centered
+        // stroke of the 15pt circle is never clipped; the outer frame keeps the
+        // 15pt layout footprint the SwiftUI shape had.
+        AgentRowActivityArcLayerRepresentable(tint: tint)
+            .frame(
+                width: 15 + AgentRowActivityArcLayerView.lineWidth,
+                height: 15 + AgentRowActivityArcLayerView.lineWidth
             )
             .frame(width: 15, height: 15)
-            .rotationEffect(.degrees(rotation))
-            .onAppear {
-                withAnimation(.linear(duration: 1.0).repeatForever(autoreverses: false)) {
-                    rotation = 360
-                }
-            }
+            .accessibilityElement(children: .ignore)
             .accessibilityLabel("Running")
+    }
+}
+
+private struct AgentRowActivityArcLayerRepresentable: NSViewRepresentable {
+    let tint: Color
+
+    func makeNSView(context _: Context) -> AgentRowActivityArcLayerView {
+        let view = AgentRowActivityArcLayerView()
+        view.update(tint: NSColor(tint))
+        return view
+    }
+
+    func updateNSView(_ nsView: AgentRowActivityArcLayerView, context _: Context) {
+        nsView.update(tint: NSColor(tint))
+    }
+
+    static func dismantleNSView(_ nsView: AgentRowActivityArcLayerView, coordinator _: ()) {
+        nsView.tearDown()
+    }
+}
+
+/// Layer-hosted rotating arc behind `AgentRowActivityArc`. Owns one
+/// `CAShapeLayer` sublayer of AppKit's backing layer and one explicit
+/// rotation animation that is installed only when missing, so sidebar
+/// re-renders never reset its phase or stack extra animations.
+final class AgentRowActivityArcLayerView: NSView {
+    static let rotationAnimationKey = "agentRowActivityArc.rotation"
+    static let lineWidth: CGFloat = 1.5
+    static let strokeEnd: CGFloat = 0.7
+    static let strokeOpacity: CGFloat = 0.75
+
+    let arcLayer = CAShapeLayer()
+    private var tintColor: NSColor = .controlAccentColor
+    private var observesSystemColors = false
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        wantsLayer = true
+        setAccessibilityElement(false)
+        arcLayer.fillColor = nil
+        arcLayer.lineWidth = Self.lineWidth
+        arcLayer.lineCap = .round
+        arcLayer.strokeStart = 0
+        arcLayer.strokeEnd = Self.strokeEnd
+        arcLayer.anchorPoint = CGPoint(x: 0.5, y: 0.5)
+        layer?.addSublayer(arcLayer)
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(systemColorsDidChange(_:)),
+            name: NSColor.systemColorsDidChangeNotification,
+            object: nil
+        )
+        observesSystemColors = true
+        applyStrokeColor()
+    }
+
+    convenience init() {
+        self.init(frame: .zero)
+    }
+
+    @available(*, unavailable)
+    required init?(coder _: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    deinit {
+        NotificationCenter.default.removeObserver(self)
+    }
+
+    /// Matches SwiftUI's y-down space: angle 0 is 3 o'clock, increasing angles
+    /// and positive rotation read clockwise on screen.
+    override var isFlipped: Bool {
+        true
+    }
+
+    override func hitTest(_: NSPoint) -> NSView? {
+        nil
+    }
+
+    func update(tint: NSColor) {
+        tintColor = tint
+        applyStrokeColor()
+        installRotationIfNeeded()
+    }
+
+    func tearDown() {
+        arcLayer.removeAnimation(forKey: Self.rotationAnimationKey)
+        if observesSystemColors {
+            NotificationCenter.default.removeObserver(
+                self,
+                name: NSColor.systemColorsDidChangeNotification,
+                object: nil
+            )
+            observesSystemColors = false
+        }
+    }
+
+    override func setFrameSize(_ newSize: NSSize) {
+        super.setFrameSize(newSize)
+        needsLayout = true
+    }
+
+    override func layout() {
+        super.layout()
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        arcLayer.bounds = CGRect(origin: .zero, size: bounds.size)
+        arcLayer.position = CGPoint(x: bounds.midX, y: bounds.midY)
+        // Inset by half the stroke so the full stroke stays inside bounds.
+        let diameter = max(0, min(bounds.width, bounds.height) - Self.lineWidth)
+        let path = CGMutablePath()
+        if diameter > 0 {
+            path.addArc(
+                center: CGPoint(x: bounds.midX, y: bounds.midY),
+                radius: diameter / 2,
+                startAngle: 0,
+                endAngle: 2 * .pi,
+                clockwise: false
+            )
+        }
+        arcLayer.path = path
+        CATransaction.commit()
+        installRotationIfNeeded()
+    }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        if window == nil {
+            arcLayer.removeAnimation(forKey: Self.rotationAnimationKey)
+        } else {
+            applyContentsScale()
+            applyStrokeColor()
+            installRotationIfNeeded()
+        }
+    }
+
+    override func viewDidChangeBackingProperties() {
+        super.viewDidChangeBackingProperties()
+        applyContentsScale()
+    }
+
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        applyStrokeColor()
+    }
+
+    @objc private func systemColorsDidChange(_: Notification) {
+        applyStrokeColor()
+    }
+
+    private func applyContentsScale() {
+        guard let scale = window?.backingScaleFactor else { return }
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        arcLayer.contentsScale = scale
+        CATransaction.commit()
+    }
+
+    private func applyStrokeColor() {
+        var resolved: CGColor?
+        effectiveAppearance.performAsCurrentDrawingAppearance {
+            resolved = tintColor.cgColor
+        }
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        arcLayer.strokeColor = resolved.map { $0.copy(alpha: $0.alpha * Self.strokeOpacity) ?? $0 }
+        CATransaction.commit()
+    }
+
+    private func installRotationIfNeeded() {
+        guard window != nil, arcLayer.animation(forKey: Self.rotationAnimationKey) == nil else { return }
+        let rotation = CABasicAnimation(keyPath: "transform.rotation.z")
+        rotation.fromValue = 0
+        rotation.toValue = 2 * Double.pi
+        rotation.duration = 1.0
+        rotation.timingFunction = CAMediaTimingFunction(name: .linear)
+        rotation.repeatCount = .infinity
+        rotation.isRemovedOnCompletion = false
+        // Phase follows whole wall-clock seconds, so running rows turn in sync and
+        // re-entering a window continues the turn instead of restarting at 0.
+        rotation.beginTime = arcLayer.convertTime(floor(CACurrentMediaTime()), from: nil)
+        // A 15pt indicator needs no ProMotion rate; cap render-server work at 60 fps.
+        rotation.preferredFrameRateRange = CAFrameRateRange(minimum: 30, maximum: 60, preferred: 60)
+        arcLayer.add(rotation, forKey: Self.rotationAnimationKey)
     }
 }
 

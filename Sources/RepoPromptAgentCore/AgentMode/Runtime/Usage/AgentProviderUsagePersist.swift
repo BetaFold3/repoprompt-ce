@@ -45,11 +45,21 @@ package struct AgentProviderUsageRawValue: Equatable {
     /// equality is never used as proof; a significand beyond `Decimal` precision or an exponent
     /// outside its range simply fails the comparison and the value stays opaque.
     func losslessRecord() -> AgentProviderUsageRecord? {
-        guard let rawShape = AgentProviderUsageJSONScanner.shape(of: data) else { return nil }
+        Self.losslessRecord(of: data) { AgentProviderUsageJSONScanner.shape(of: $0) }
+    }
+
+    /// The projection proof with the comparison-shape function supplied. Production always passes
+    /// `AgentProviderUsageJSONScanner.shape(of:)`; the parameter lets the scanner differential suite
+    /// run this exact proof with its frozen reference scanner.
+    static func losslessRecord(
+        of data: Data,
+        shape: (Data) -> AgentProviderUsageJSONScanner.Shape?
+    ) -> AgentProviderUsageRecord? {
+        guard let rawShape = shape(data) else { return nil }
         guard let record = try? JSONDecoder().decode(AgentProviderUsageRecord.self, from: data),
               record.semanticViolation == nil,
               let reencoded = try? JSONEncoder().encode(record),
-              AgentProviderUsageJSONScanner.shape(of: reencoded) == rawShape
+              shape(reencoded) == rawShape
         else {
             return nil
         }

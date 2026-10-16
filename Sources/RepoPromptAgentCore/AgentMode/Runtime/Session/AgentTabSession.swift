@@ -2607,7 +2607,7 @@ package final class AgentTabSession: ObservableObject {
         }
         #if DEBUG
             if AgentTranscriptDebugInstrumentation.isEnabled {
-                AgentTranscriptDebugInstrumentation.sessionItemsReplacementHandler?(.init(
+                AgentTranscriptDebugInstrumentation.emit(AgentTranscriptDebugInstrumentation.sessionItemsReplacementHandler, .init(
                     reason: reason.rawValue,
                     previousItemCount: self.items.count,
                     newItemCount: items.count,

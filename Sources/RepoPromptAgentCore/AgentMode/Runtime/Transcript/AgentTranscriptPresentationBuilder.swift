@@ -391,7 +391,7 @@ package enum AgentTranscriptPresentationBuilder {
                 let newBlockSemanticDigest = AgentTranscriptDebugInstrumentation.blockSemanticSignature(newBlocks)
                 let previousBlockIdentityDigest = AgentTranscriptDebugInstrumentation.blockIdentitySignature(previousBlocks)
                 let newBlockIdentityDigest = AgentTranscriptDebugInstrumentation.blockIdentitySignature(newBlocks)
-                AgentTranscriptDebugInstrumentation.projectionIdentityHandler?(.init(
+                AgentTranscriptDebugInstrumentation.emit(AgentTranscriptDebugInstrumentation.projectionIdentityHandler, .init(
                     previousRowCount: previousRows.count,
                     newRowCount: newRows.count,
                     previousBlockCount: previousBlocks.count,

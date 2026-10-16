@@ -224,7 +224,13 @@ final class RemoteSidebarBadgingTests: XCTestCase {
 
         XCTAssertEqual(rows.map(\.tabID), [parentTabID])
         XCTAssertEqual(rows.first?.scheduledSendStatus, .pending(scheduledFor))
-        XCTAssertTrue(rows.first?.searchFields.fields.map(\.text).contains("scheduled") == true)
+        // Blank search deliberately skips the per-row search corpus; the corpus must
+        // still survive the thread-collapse copy whenever a search reads it.
+        XCTAssertEqual(rows.first?.searchFields, .empty)
+        let searchedRows = viewModel.filteredSidebarSessions(for: tabs, currentTabID: nil, searchText: "scheduled")
+        XCTAssertEqual(searchedRows.map(\.tabID), [parentTabID])
+        XCTAssertEqual(searchedRows.first?.scheduledSendStatus, .pending(scheduledFor))
+        XCTAssertTrue(searchedRows.first?.searchFields.fields.map(\.text).contains("scheduled") == true)
     }
 
     func testRemoteControlDeviceIDUsesRemoteOriginFromIndexEntry() throws {

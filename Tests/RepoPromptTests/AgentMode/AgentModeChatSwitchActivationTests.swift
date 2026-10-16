@@ -1755,15 +1755,24 @@ final class AgentModeChatSwitchActivationTests: XCTestCase {
 
         /// These cancelled/failed fixtures take one run-state-only catch-up. It leaves the hydrated
         /// transcript and base projection unchanged but is not a no-op: it reconciles the hydrated source
-        /// items to the sanitized transcript's working items. The active-state fixture has complete message
-        /// rows but is saved with run state running. Cold activation preserves its cancelled turn/span,
-        /// unlike a fresh import at the restored idle state.
+        /// items to the sanitized transcript's working items. The active-state fixture is saved with run
+        /// state running while its final turn's last tool call has no result (interrupted mid-tool). Cold
+        /// activation preserves its cancelled turn/span, unlike a fresh import at the restored idle state,
+        /// and so does the reload-migration save that follows it, whose pending-tool repair turns that call
+        /// row into a result in place: in memory, in the saved bytes, and after a reload. The target's hydration is held
+        /// until the switch's own save flush has run, so that save always follows the observation, and
+        /// the test then flushes it explicitly.
         func testColdActivationCatchUpAcrossPersistedRunStates() async throws {
             for persistedRunState in [AgentSessionRunState.cancelled, .failed, .running] {
                 try await withFixture { fixture in
                     let viewModel = fixture.viewModel
                     defer { viewModel.test_persistenceWorkspaceOverride = nil }
-                    let observed = try await observeColdActivationCatchUp(persistedRunState: persistedRunState, in: fixture)
+                    let observed = try await observeColdActivationCatchUp(
+                        persistedRunState: persistedRunState,
+                        in: fixture,
+                        holdsHydrationUntilSwitchSettles: true,
+                        endsWithUnmatchedToolCall: persistedRunState.isActive
+                    )
                     let session = observed.session
                     let label = persistedRunState.rawValue
                     XCTAssertEqual(session.persistedLoadDisposition, .applied, label)
@@ -1778,6 +1787,12 @@ final class AgentModeChatSwitchActivationTests: XCTestCase {
                         let lastTurn = try XCTUnwrap(session.transcript.turns.last)
                         XCTAssertEqual(lastTurn.terminalState, .cancelled, "\(label): the interrupted turn stays cancelled")
                         XCTAssertEqual(lastTurn.responseSpans.map(\.lifecycle), [.cancelled], label)
+                        try await assertColdCancelledTurnSurvivesReloadMigrationSave(
+                            observed,
+                            cancelledTurnID: lastTurn.id,
+                            viewModel: viewModel,
+                            label: label
+                        )
                     } else {
                         XCTAssertEqual(observed.persisted.lastRunState, persistedRunState.rawValue, label)
                         XCTAssertEqual(session.runState, persistedRunState, label)
@@ -1800,9 +1815,53 @@ final class AgentModeChatSwitchActivationTests: XCTestCase {
                         XCTAssertEqual(observed.transcriptBeforeCatchUp, observed.reference.transcript, "\(label): hydrated transcript already final")
                         XCTAssertEqual(observed.baseProjectionBeforeCatchUp, observed.reference.baseProjection, label)
                         XCTAssertEqual(session.transcript, observed.reference.transcript, label)
+                        await viewModel.flushSave(for: session.tabID)
+                        XCTAssertEqual(session.transcript, observed.reference.transcript, "\(label): unchanged by a save")
                     }
                 }
             }
+        }
+
+        /// Flushes the cold target's pending reload-migration save, then asserts that the cancelled turn
+        /// and span survive in memory, in the saved file's bytes, and through a reload.
+        private func assertColdCancelledTurnSurvivesReloadMigrationSave(
+            _ observed: ColdActivationCatchUpObservation,
+            cancelledTurnID: UUID,
+            viewModel: AgentModeViewModel,
+            label: String
+        ) async throws {
+            let session = observed.session
+            let sessionID = try XCTUnwrap(session.activeAgentSessionID)
+            XCTAssertTrue(session.isDirty, "\(label): the reload-migration save is pending, not yet run")
+            let unmatchedCall = try XCTUnwrap(session.items.last, label)
+            XCTAssertEqual(unmatchedCall.kind, .toolCall, "\(label): the turn still ends in the unmatched call before the save")
+            let saved = await viewModel.flushSave(for: session.tabID)
+            await viewModel.awaitInFlightSave(sessionID: sessionID)
+            XCTAssertTrue(saved, "\(label): the reload-migration save wrote")
+            XCTAssertFalse(session.isDirty, label)
+            XCTAssertEqual(session.runState, .idle, label)
+            let repairedCall = try XCTUnwrap(session.items.last, label)
+            XCTAssertEqual(repairedCall.id, unmatchedCall.id, label)
+            XCTAssertEqual(repairedCall.kind, .toolResult, "\(label): the save's pending-tool repair converted the call in place")
+
+            func assertCancelled(_ transcript: AgentTranscript?, _ stage: String) throws {
+                let turn = try XCTUnwrap(transcript?.turns.last, "\(label) \(stage)")
+                XCTAssertEqual(turn.id, cancelledTurnID, "\(label) \(stage)")
+                XCTAssertEqual(turn.terminalState, .cancelled, "\(label) \(stage): the interrupted turn stays cancelled")
+                XCTAssertEqual(turn.responseSpans.map(\.lifecycle), [.cancelled], "\(label) \(stage)")
+            }
+            try assertCancelled(session.transcript, "in memory after save")
+
+            let fileURL = try XCTUnwrap(observed.persisted.fileURL)
+            let savedSession = try JSONDecoder().decode(AgentSession.self, from: Data(contentsOf: fileURL))
+            XCTAssertEqual(savedSession.id, sessionID, label)
+            XCTAssertEqual(savedSession.lastRunState, AgentSessionRunState.idle.rawValue, label)
+            try assertCancelled(savedSession.transcript, "saved bytes")
+
+            let workspace = try XCTUnwrap(viewModel.test_persistenceWorkspaceOverride)
+            let reloaded = try await viewModel.test_dataService.loadAgentSession(id: sessionID, for: workspace)
+            XCTAssertEqual(reloaded?.lastRunState, AgentSessionRunState.idle.rawValue, label)
+            try assertCancelled(reloaded?.transcript, "reloaded")
         }
 
         private struct ColdActivationCatchUpAttempt {
@@ -1847,7 +1906,9 @@ final class AgentModeChatSwitchActivationTests: XCTestCase {
         /// tab's different provider. Sets `test_persistenceWorkspaceOverride`; callers reset it.
         private func observeColdActivationCatchUp(
             persistedRunState: AgentSessionRunState,
-            in fixture: Fixture
+            in fixture: Fixture,
+            holdsHydrationUntilSwitchSettles: Bool = false,
+            endsWithUnmatchedToolCall: Bool = false
         ) async throws -> ColdActivationCatchUpObservation {
             let viewModel = fixture.viewModel
             let window = fixture.window
@@ -1875,6 +1936,10 @@ final class AgentModeChatSwitchActivationTests: XCTestCase {
                     written.appendItem(.toolCall(name: "bash", invocationID: invocation, argsJSON: "{\"command\":\"echo \(turn)\"}"))
                     written.appendItem(.toolResult(name: "bash", invocationID: invocation, resultJSON: "{\"output\":\"\(turn)\"}"))
                     written.appendItem(.assistant("Turn \(turn) reply"))
+                }
+                if endsWithUnmatchedToolCall {
+                    // Interrupted mid-tool: the final turn's last call has no result.
+                    written.appendItem(.toolCall(name: "bash", invocationID: UUID(), argsJSON: "{\"command\":\"sleep 60\"}"))
                 }
                 written.runState = persistedRunState
                 let saved = await writer.flushSave(for: writerTabID)
@@ -1929,7 +1994,25 @@ final class AgentModeChatSwitchActivationTests: XCTestCase {
                 }
                 defer { AgentTranscriptDebugInstrumentation.reset() }
 
+                // Optionally holds the prepared payload before install until the switch's workspace
+                // save has flushed the (still unloaded) target, so that flush cannot save the target.
+                let hydrationGate = ColdLoadGate()
+                defer { hydrationGate.release() }
+                if holdsHydrationUntilSwitchSettles {
+                    viewModel.test_persistedLoadPrepareHook = { held in
+                        guard held.tabID == tabID else { return }
+                        await hydrationGate.waitForRelease()
+                    }
+                }
+                defer { viewModel.test_persistedLoadPrepareHook = nil }
+
                 await window.promptManager.switchComposeTab(tabID)
+                if holdsHydrationUntilSwitchSettles {
+                    try await Self.waitUntil { hydrationGate.isWaiting }
+                    await Self.drainMainQueue()
+                    XCTAssertFalse(try XCTUnwrap(viewModel.sessions[tabID]).hasLoadedPersistedState)
+                    hydrationGate.release()
+                }
                 let session = try XCTUnwrap(viewModel.sessions[tabID])
                 let deadline = Date().addingTimeInterval(20)
                 while viewModel.activeSessionLoadInProgressTabID != nil || !session.hasLoadedPersistedState, Date() < deadline {

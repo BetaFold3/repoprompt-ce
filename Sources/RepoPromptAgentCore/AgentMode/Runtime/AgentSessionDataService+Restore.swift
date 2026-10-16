@@ -583,6 +583,9 @@ extension AgentSessionDataService {
                     "tabID": WorkspaceRestorePerfLog.shortID(request.tabID),
                     "sessionID": WorkspaceRestorePerfLog.shortID(request.sessionID),
                     "outcome": outcome,
+                    // Overlapped preparation runs the hydration branch inside the load operation, so
+                    // loadDuration covers it too; transcript/presentation durations are the branch's.
+                    "preparation": Self.preparesHydrationSequentially ? "sequential" : "overlapped",
                     "loadDuration": loadDurationMS.map(WorkspaceRestorePerfLog.formatMS) ?? "notRun",
                     "transcriptDuration": transcriptDurationMS.map(WorkspaceRestorePerfLog.formatMS) ?? "notRun",
                     "presentationDuration": presentationDurationMS.map(WorkspaceRestorePerfLog.formatMS) ?? "notRun",
@@ -603,130 +606,64 @@ extension AgentSessionDataService {
             #if DEBUG
                 let loadStartMS = WorkspaceRestorePerfLog.timestampMSIfEnabled()
             #endif
+            let inputs = AgentSessionHydrationBranchInputs(request)
             // Paired editable load: the transcript and the persistence state the owner will save
-            // under come from one gate-held read.
-            guard let editableLoad = try await loadAgentSessionForEditing(
-                id: request.sessionID,
-                for: request.workspace
-            ) else {
-                #if DEBUG
-                    if let loadStartMS {
-                        loadDurationMS = WorkspaceRestorePerfLog.elapsedMS(since: loadStartMS)
-                    }
-                    logPrepare(outcome: "missingSession")
-                #endif
-                return nil
+            // under come from one gate-held operation. By default that operation overlaps storage
+            // canonicalization with the hydration branch; DEBUG can force the sequential reference.
+            let loaded: AgentSessionHydrationLoad? = if Self.preparesHydrationSequentially {
+                // Sequential reference: the hydration branch runs on the actor after the load.
+                if let editableLoad = try await loadAgentSessionForEditing(id: request.sessionID, for: request.workspace) {
+                    try AgentSessionHydrationLoad(
+                        editableLoad: editableLoad,
+                        hydration: Self.hydrationBranchResult(for: editableLoad.session, inputs: inputs)
+                    )
+                } else {
+                    nil
+                }
+            } else {
+                try await loadAgentSessionForHydration(
+                    id: request.sessionID,
+                    for: request.workspace,
+                    inputs: inputs
+                )
             }
-            let agentSession = editableLoad.session
             #if DEBUG
                 if let loadStartMS {
                     loadDurationMS = WorkspaceRestorePerfLog.elapsedMS(since: loadStartMS)
                 }
-                let transcriptStartMS = WorkspaceRestorePerfLog.timestampMSIfEnabled()
             #endif
-
-            let persistedRunState = agentSession.lastRunState.flatMap(AgentSessionRunState.init(rawValue:))
-            let normalizedRunState = AgentSessionRestoreSupport.normalizeColdRestoredRunState(persistedRunState)
-            let normalizedSelection = AgentModelCatalog.normalizePersistedSelection(
-                agentRaw: agentSession.agentKind,
-                modelRaw: agentSession.agentModel
-            )
-            let transcriptPolicy = AgentTranscriptImportPolicy.liveSession(
-                hidePendingQuestionToolCall: request.hasPendingQuestionUI
-            )
-            let loadedTranscript: AgentTranscript = {
-                if let transcript = agentSession.transcript {
-                    if AgentTranscriptIO.containsRowsExcludedByPolicy(in: transcript, policy: transcriptPolicy) {
-                        let persistedWorkingItems = agentSession.workingSourceItems()
-                        return AgentTranscriptIO.rebuiltTranscriptPreservingCompactedPrefix(
-                            existingTranscript: transcript,
-                            workingItems: persistedWorkingItems,
-                            terminalState: normalizedRunState,
-                            nextSequenceIndex: transcript.nextSequenceIndex,
-                            policy: transcriptPolicy
-                        )
-                    }
-                    return transcript
-                }
-                let persistedWorkingItems = agentSession.workingSourceItems()
-                return AgentTranscriptIO.buildTranscript(
-                    from: persistedWorkingItems,
-                    terminalState: normalizedRunState,
-                    nextSequenceIndex: (persistedWorkingItems.map(\.sequenceIndex).max() ?? -1) + 1,
-                    policy: transcriptPolicy
-                )
-            }()
-            let compactedTranscript = AgentTranscriptProjectionBuilder
-                .normalizedFrozenDetailedToolTailLimits(in: loadedTranscript)
-            let frozenTailLimitNormalizationNeeded = compactedTranscript != loadedTranscript
-            let canonicalLiveItems = AgentTranscriptIO.workingSourceItems(from: compactedTranscript)
-            let projectionProtection = AgentSessionRestoreSupport.transcriptProjectionProtection(
-                for: compactedTranscript,
-                viewportState: request.transcriptViewportState
-            )
+            guard let loaded else {
+                #if DEBUG
+                    logPrepare(outcome: "missingSession")
+                #endif
+                return nil
+            }
+            let hydration = loaded.hydration
             #if DEBUG
-                if let transcriptStartMS {
-                    transcriptDurationMS = WorkspaceRestorePerfLog.elapsedMS(since: transcriptStartMS)
-                }
+                transcriptDurationMS = hydration.transcriptDurationMS
+                presentationDurationMS = hydration.presentationDurationMS
             #endif
-
-            try Task.checkCancellation()
-            #if DEBUG
-                let presentationStartMS = WorkspaceRestorePerfLog.timestampMSIfEnabled()
-            #endif
-            let builtPresentation = AgentSessionRestoreSupport.buildTranscriptPresentation(
-                from: compactedTranscript,
-                sourceItems: canonicalLiveItems,
-                selectedAgent: normalizedSelection.agent,
-                previousPerformanceSnapshot: request.initialPerformanceSnapshot,
-                projectionProtection: projectionProtection,
-                isCompressedHistoryRevealed: request.isCompressedHistoryRevealed,
-                isColdLoad: true
-            )
-            #if DEBUG
-                if let presentationStartMS {
-                    presentationDurationMS = WorkspaceRestorePerfLog.elapsedMS(since: presentationStartMS)
-                }
-            #endif
-            try Task.checkCancellation()
-
-            let lastUserMessageAt = agentSession.lastUserMessageAt
-                ?? AgentTranscriptIO.lastUserInteractionDate(in: compactedTranscript)
-                ?? AgentSessionRestoreSupport.computeLastUserMessageDate(in: canonicalLiveItems)
-            let restoredIndexEntry = AgentSessionRestoreSupport.buildSidebarIndexEntry(
-                from: agentSession,
-                tabID: request.tabID,
-                name: request.resolvedDisplayName,
-                lastUserMessageAt: lastUserMessageAt,
-                itemCount: compactedTranscript.turns.isEmpty
-                    ? canonicalLiveItems.count
-                    : builtPresentation.projectionCounts.canonicalVisibleRowCount
-            )
-            let needsReloadMigrationSave = agentSession.transcript != compactedTranscript
-                || agentSession.itemCount == nil
-                || agentSession.lastUserMessageAt == nil
-                || frozenTailLimitNormalizationNeeded
 
             let payload = AgentSessionHydrationPayload(
                 sessionID: request.sessionID,
-                persistedSession: agentSession,
-                persistenceState: editableLoad.persistenceState,
-                canonicalLiveItems: canonicalLiveItems,
-                transcript: compactedTranscript,
-                builtPresentation: builtPresentation,
-                normalizedRunState: normalizedRunState,
-                normalizedSelection: normalizedSelection,
-                lastUserMessageAt: lastUserMessageAt,
-                restoredIndexEntry: restoredIndexEntry,
-                needsReloadMigrationSave: needsReloadMigrationSave
+                persistedSession: loaded.editableLoad.session,
+                persistenceState: loaded.editableLoad.persistenceState,
+                canonicalLiveItems: hydration.canonicalLiveItems,
+                transcript: hydration.transcript,
+                builtPresentation: hydration.builtPresentation,
+                normalizedRunState: hydration.normalizedRunState,
+                normalizedSelection: hydration.normalizedSelection,
+                lastUserMessageAt: hydration.lastUserMessageAt,
+                restoredIndexEntry: hydration.restoredIndexEntry,
+                needsReloadMigrationSave: hydration.needsReloadMigrationSave
             )
             #if DEBUG
                 logPrepare(
                     outcome: "payload",
-                    canonicalLiveItems: canonicalLiveItems.count,
-                    turns: compactedTranscript.turns.count,
-                    needsReloadMigrationSave: needsReloadMigrationSave,
-                    frozenTailLimitNormalizationNeeded: frozenTailLimitNormalizationNeeded
+                    canonicalLiveItems: hydration.canonicalLiveItems.count,
+                    turns: hydration.transcript.turns.count,
+                    needsReloadMigrationSave: hydration.needsReloadMigrationSave,
+                    frozenTailLimitNormalizationNeeded: hydration.frozenTailLimitNormalizationNeeded
                 )
             #endif
             return payload
@@ -738,4 +675,331 @@ extension AgentSessionDataService {
             throw error
         }
     }
+
+    #if DEBUG
+        /// Test/measurement-only reference mode: prepare hydration as before the overlap, with the
+        /// editable load (storage canonicalization and any rewrite included) followed by the
+        /// hydration branch on the actor.
+        @TaskLocal static var forcesSequentialHydrationPreparation = false
+        /// Test-only overlap evidence: when set, the overlapped hydration operation reports when its
+        /// storage and hydration branches start and finish.
+        @TaskLocal static var hydrationOverlapProbe: AgentSessionHydrationOverlapProbe?
+    #endif
+
+    static var preparesHydrationSequentially: Bool {
+        #if DEBUG
+            forcesSequentialHydrationPreparation
+        #else
+            false
+        #endif
+    }
+
+    /// The post-load hydration derivation: live-policy rebuild, frozen-tail normalization, source
+    /// items, protection, the cold presentation build, the sidebar entry, and the migration-save
+    /// decision, all from the runtime session the gate-held load returned. Static and state-free,
+    /// so the overlapped operation can run it off the actor; it observes cancellation before and
+    /// after the presentation build.
+    static func hydrationBranchResult(
+        for agentSession: AgentSession,
+        inputs: AgentSessionHydrationBranchInputs
+    ) throws -> AgentSessionHydrationBranchResult {
+        #if DEBUG
+            let transcriptStartMS = WorkspaceRestorePerfLog.timestampMSIfEnabled()
+            var transcriptDurationMS: Double?
+            var presentationDurationMS: Double?
+        #endif
+        let persistedRunState = agentSession.lastRunState.flatMap(AgentSessionRunState.init(rawValue:))
+        let normalizedRunState = AgentSessionRestoreSupport.normalizeColdRestoredRunState(persistedRunState)
+        let normalizedSelection = AgentModelCatalog.normalizePersistedSelection(
+            agentRaw: agentSession.agentKind,
+            modelRaw: agentSession.agentModel
+        )
+        let transcriptPolicy = AgentTranscriptImportPolicy.liveSession(
+            hidePendingQuestionToolCall: inputs.hasPendingQuestionUI
+        )
+        let loadedTranscript: AgentTranscript = {
+            if let transcript = agentSession.transcript {
+                if AgentTranscriptIO.containsRowsExcludedByPolicy(in: transcript, policy: transcriptPolicy) {
+                    let persistedWorkingItems = agentSession.workingSourceItems()
+                    return AgentTranscriptIO.rebuiltTranscriptPreservingCompactedPrefix(
+                        existingTranscript: transcript,
+                        workingItems: persistedWorkingItems,
+                        terminalState: normalizedRunState,
+                        nextSequenceIndex: transcript.nextSequenceIndex,
+                        policy: transcriptPolicy
+                    )
+                }
+                return transcript
+            }
+            let persistedWorkingItems = agentSession.workingSourceItems()
+            return AgentTranscriptIO.buildTranscript(
+                from: persistedWorkingItems,
+                terminalState: normalizedRunState,
+                nextSequenceIndex: (persistedWorkingItems.map(\.sequenceIndex).max() ?? -1) + 1,
+                policy: transcriptPolicy
+            )
+        }()
+        let compactedTranscript = AgentTranscriptProjectionBuilder
+            .normalizedFrozenDetailedToolTailLimits(in: loadedTranscript)
+        let frozenTailLimitNormalizationNeeded = compactedTranscript != loadedTranscript
+        let canonicalLiveItems = AgentTranscriptIO.workingSourceItems(from: compactedTranscript)
+        let projectionProtection = AgentSessionRestoreSupport.transcriptProjectionProtection(
+            for: compactedTranscript,
+            viewportState: inputs.transcriptViewportState
+        )
+        #if DEBUG
+            if let transcriptStartMS {
+                transcriptDurationMS = WorkspaceRestorePerfLog.elapsedMS(since: transcriptStartMS)
+            }
+        #endif
+
+        try Task.checkCancellation()
+        #if DEBUG
+            let presentationStartMS = WorkspaceRestorePerfLog.timestampMSIfEnabled()
+        #endif
+        let builtPresentation = AgentSessionRestoreSupport.buildTranscriptPresentation(
+            from: compactedTranscript,
+            sourceItems: canonicalLiveItems,
+            selectedAgent: normalizedSelection.agent,
+            previousPerformanceSnapshot: inputs.initialPerformanceSnapshot,
+            projectionProtection: projectionProtection,
+            isCompressedHistoryRevealed: inputs.isCompressedHistoryRevealed,
+            isColdLoad: true
+        )
+        #if DEBUG
+            if let presentationStartMS {
+                presentationDurationMS = WorkspaceRestorePerfLog.elapsedMS(since: presentationStartMS)
+            }
+        #endif
+        try Task.checkCancellation()
+
+        let lastUserMessageAt = agentSession.lastUserMessageAt
+            ?? AgentTranscriptIO.lastUserInteractionDate(in: compactedTranscript)
+            ?? AgentSessionRestoreSupport.computeLastUserMessageDate(in: canonicalLiveItems)
+        let restoredIndexEntry = AgentSessionRestoreSupport.buildSidebarIndexEntry(
+            from: agentSession,
+            tabID: inputs.tabID,
+            name: inputs.resolvedDisplayName,
+            lastUserMessageAt: lastUserMessageAt,
+            itemCount: compactedTranscript.turns.isEmpty
+                ? canonicalLiveItems.count
+                : builtPresentation.projectionCounts.canonicalVisibleRowCount
+        )
+        let needsReloadMigrationSave = agentSession.transcript != compactedTranscript
+            || agentSession.itemCount == nil
+            || agentSession.lastUserMessageAt == nil
+            || frozenTailLimitNormalizationNeeded
+
+        #if DEBUG
+            return AgentSessionHydrationBranchResult(
+                canonicalLiveItems: canonicalLiveItems,
+                transcript: compactedTranscript,
+                builtPresentation: builtPresentation,
+                normalizedRunState: normalizedRunState,
+                normalizedSelection: normalizedSelection,
+                lastUserMessageAt: lastUserMessageAt,
+                restoredIndexEntry: restoredIndexEntry,
+                needsReloadMigrationSave: needsReloadMigrationSave,
+                frozenTailLimitNormalizationNeeded: frozenTailLimitNormalizationNeeded,
+                transcriptDurationMS: transcriptDurationMS,
+                presentationDurationMS: presentationDurationMS
+            )
+        #else
+            return AgentSessionHydrationBranchResult(
+                canonicalLiveItems: canonicalLiveItems,
+                transcript: compactedTranscript,
+                builtPresentation: builtPresentation,
+                normalizedRunState: normalizedRunState,
+                normalizedSelection: normalizedSelection,
+                lastUserMessageAt: lastUserMessageAt,
+                restoredIndexEntry: restoredIndexEntry,
+                needsReloadMigrationSave: needsReloadMigrationSave,
+                frozenTailLimitNormalizationNeeded: frozenTailLimitNormalizationNeeded
+            )
+        #endif
+    }
+
+    /// The off-actor boundary for the hydration branch: an explicitly `@concurrent` async function,
+    /// so it runs on the generic executor when the overlapped operation starts it as a structured
+    /// child task (`async let`), inheriting task-locals and cancellation.
+    @concurrent
+    static func hydrationBranchResultOffActor(
+        for agentSession: AgentSession,
+        inputs: AgentSessionHydrationBranchInputs
+    ) async throws -> AgentSessionHydrationBranchResult {
+        #if DEBUG
+            let probe = hydrationOverlapProbe
+            await probe?.branchStarted(.hydration)
+            defer { probe?.branchFinished(.hydration) }
+        #endif
+        return try hydrationBranchResult(for: agentSession, inputs: inputs)
+    }
 }
+
+/// The Sendable value fields of `AgentSessionHydrationRequest` the hydration branch reads. The
+/// request itself holds a non-Sendable workspace reference and never crosses off the actor.
+struct AgentSessionHydrationBranchInputs {
+    let tabID: UUID
+    let resolvedDisplayName: String
+    let hasPendingQuestionUI: Bool
+    let transcriptViewportState: AgentTranscriptViewportState
+    let isCompressedHistoryRevealed: Bool
+    let initialPerformanceSnapshot: AgentTranscriptPerformanceSnapshot
+
+    init(_ request: AgentSessionHydrationRequest) {
+        tabID = request.tabID
+        resolvedDisplayName = request.resolvedDisplayName
+        hasPendingQuestionUI = request.hasPendingQuestionUI
+        transcriptViewportState = request.transcriptViewportState
+        isCompressedHistoryRevealed = request.isCompressedHistoryRevealed
+        initialPerformanceSnapshot = request.initialPerformanceSnapshot
+    }
+}
+
+/// The payload fields the hydration branch derives from the loaded runtime session.
+struct AgentSessionHydrationBranchResult {
+    let canonicalLiveItems: [AgentChatItem]
+    let transcript: AgentTranscript
+    let builtPresentation: AgentBuiltTranscriptPresentation
+    let normalizedRunState: AgentSessionRunState
+    let normalizedSelection: AgentModelCatalog.NormalizedAgentSelection
+    let lastUserMessageAt: Date?
+    let restoredIndexEntry: AgentSessionIndexEntry
+    let needsReloadMigrationSave: Bool
+    let frozenTailLimitNormalizationNeeded: Bool
+    #if DEBUG
+        let transcriptDurationMS: Double?
+        let presentationDurationMS: Double?
+    #endif
+}
+
+/// A gate-held hydration load: the runtime session paired with its persistence state, and the
+/// hydration branch derived from that same runtime session.
+struct AgentSessionHydrationLoad {
+    let editableLoad: AgentSessionEditableLoad
+    let hydration: AgentSessionHydrationBranchResult
+}
+
+#if DEBUG
+    /// Records the overlapped hydration operation's branch starts and finishes. Each branch waits at
+    /// its start (bounded by `rendezvousTimeout`) until the other branch has also started, so a
+    /// recorded overlap proves both branches were running at once rather than relying on timing.
+    final class AgentSessionHydrationOverlapProbe: @unchecked Sendable {
+        enum Branch: String, Hashable {
+            case storage
+            case hydration
+        }
+
+        enum Event: Hashable {
+            case started(Branch)
+            case finished(Branch)
+            case rendezvousTimedOut(Branch)
+        }
+
+        private let lock = NSLock()
+        private let rendezvousTimeout: Duration
+        private let holdsStorageCommit: Bool
+        private var recordedEvents: [Event] = []
+        private var startedBranches: Set<Branch> = []
+        private var waiters: [Branch: CheckedContinuation<Void, Never>] = [:]
+        private var storageCommitHeld = false
+        private var storageCommitReleased = false
+        private var storageCommitWaiter: CheckedContinuation<Void, Never>?
+
+        /// With `holdsStorageCommit`, the storage branch waits before its commit (write, index,
+        /// schedule authority) until `releaseStorageCommit()`; the wait ignores cancellation.
+        init(rendezvousTimeout: Duration = .seconds(5), holdsStorageCommit: Bool = false) {
+            self.rendezvousTimeout = rendezvousTimeout
+            self.holdsStorageCommit = holdsStorageCommit
+        }
+
+        var isHoldingStorageCommit: Bool {
+            lock.withLock { storageCommitHeld && !storageCommitReleased }
+        }
+
+        func storageCommitPoint() async {
+            guard holdsStorageCommit else { return }
+            await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+                let resumeNow: Bool = lock.withLock {
+                    storageCommitHeld = true
+                    if storageCommitReleased { return true }
+                    storageCommitWaiter = continuation
+                    return false
+                }
+                if resumeNow { continuation.resume() }
+            }
+        }
+
+        /// Releases the held (or a future) storage commit. Idempotent.
+        func releaseStorageCommit() {
+            let waiter: CheckedContinuation<Void, Never>? = lock.withLock {
+                storageCommitReleased = true
+                defer { storageCommitWaiter = nil }
+                return storageCommitWaiter
+            }
+            waiter?.resume()
+        }
+
+        var events: [Event] {
+            lock.withLock { recordedEvents }
+        }
+
+        /// True when both branches started before either finished and neither timed out waiting.
+        var overlapObserved: Bool {
+            let events = events
+            guard let firstFinish = events.firstIndex(where: {
+                if case .finished = $0 { return true }
+                return false
+            }) else { return false }
+            let startsBeforeFinish = Set(events[..<firstFinish].compactMap { event -> Branch? in
+                if case let .started(branch) = event { return branch }
+                return nil
+            })
+            let timedOut = events.contains {
+                if case .rendezvousTimedOut = $0 { return true }
+                return false
+            }
+            return startsBeforeFinish == [.storage, .hydration] && !timedOut
+        }
+
+        func branchStarted(_ branch: Branch) async {
+            await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+                let resumeNow: [CheckedContinuation<Void, Never>] = lock.withLock {
+                    recordedEvents.append(.started(branch))
+                    startedBranches.insert(branch)
+                    if startedBranches.count == 2 {
+                        let pending = Array(waiters.values)
+                        waiters.removeAll()
+                        return pending + [continuation]
+                    }
+                    waiters[branch] = continuation
+                    return []
+                }
+                guard !resumeNow.isEmpty else {
+                    let timeout = rendezvousTimeout
+                    Task { [weak self] in
+                        try? await Task.sleep(for: timeout)
+                        self?.timeOut(branch)
+                    }
+                    return
+                }
+                for waiter in resumeNow {
+                    waiter.resume()
+                }
+            }
+        }
+
+        func branchFinished(_ branch: Branch) {
+            lock.withLock { recordedEvents.append(.finished(branch)) }
+        }
+
+        private func timeOut(_ branch: Branch) {
+            let waiter: CheckedContinuation<Void, Never>? = lock.withLock {
+                guard let waiter = waiters.removeValue(forKey: branch) else { return nil }
+                recordedEvents.append(.rendezvousTimedOut(branch))
+                return waiter
+            }
+            waiter?.resume()
+        }
+    }
+#endif
