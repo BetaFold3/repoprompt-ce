@@ -292,6 +292,8 @@ struct AgentModeSessionsListView: View {
     let currentTabID: UUID?
     /// Active filtered rows built once by the parent sidebar body.
     let filteredSessions: [AgentModeViewModel.SidebarSession]
+    /// Clicked row awaiting its deferred switch; drives the row highlight only.
+    @State private var pendingSelection = AgentSidebarPendingSelection()
     @State private var archivedSessionsExpanded = false
     @State private var showingClearArchivedConfirmation = false
     @ObservedObject private var fontScale = FontScaleManager.shared
@@ -409,6 +411,7 @@ struct AgentModeSessionsListView: View {
         let activeSections = AgentSidebarDateSectionBuilder.activeSections(for: snapshot.pagedSessions)
         let firstActiveSectionID = activeSections.first?.id
         let remoteWorkspaceSection = agentModeVM.remoteWorkspaceSidebarSection()
+        let highlightedTabID = pendingSelection.resolvedActiveTabID(current: currentTabID)
         ScrollView {
             VStack(spacing: listRowSpacing) {
                 ForEach(activeSections) { section in
@@ -421,7 +424,7 @@ struct AgentModeSessionsListView: View {
                         ForEach(group.rows, id: \.id) { session in
                             AgentSessionRow(
                                 title: session.title,
-                                isActive: session.tabID == currentTabID,
+                                isActive: session.tabID == highlightedTabID,
                                 isPinned: session.isPinned,
                                 isMCPControlled: session.isMCPControlled,
                                 runState: agentModeVM.runState(for: session.tabID),
@@ -447,22 +450,7 @@ struct AgentModeSessionsListView: View {
                                     }
                                     : nil,
                                 onSelect: {
-                                    #if DEBUG || EDIT_FLOW_PERF
-                                        let latencyAction = session.tabID != currentTabID
-                                            ? AgentInteractionLatencyProbe.beginTabActivation(
-                                                tabID: session.tabID,
-                                                windowID: agentModeVM.interactionLatencyWindowID,
-                                                source: "sidebarRow"
-                                            )
-                                            : nil
-                                        Task {
-                                            await AgentInteractionLatencyProbe.run(as: latencyAction) {
-                                                await promptManager.switchComposeTab(session.tabID)
-                                            }
-                                        }
-                                    #else
-                                        Task { await promptManager.switchComposeTab(session.tabID) }
-                                    #endif
+                                    selectSession(session.tabID)
                                 },
                                 onTogglePin: {
                                     promptManager.toggleComposeTabPinned(session.tabID)
@@ -592,6 +580,60 @@ struct AgentModeSessionsListView: View {
             }
             .padding(.horizontal, listHorizontalPadding)
         }
+        .onChange(of: currentTabID) { _, newValue in
+            pendingSelection.clear(ifTabID: newValue)
+        }
+        .onDisappear {
+            pendingSelection.clearHighlight()
+        }
+    }
+
+    /// Row click. A click on the active row keeps the immediate switch call. A click on
+    /// another row highlights it first and defers the switch to a zero-interval run-loop
+    /// timer, which normally fires after the loop's BeforeWaiting commit, so the highlight
+    /// can render before the heavy activation (best-effort, not guaranteed). The last
+    /// click wins: a superseded deferred switch does not run, and neither does one
+    /// overtaken by a switch from another entry point (keyboard, MCP) during the deferral.
+    private func selectSession(_ tabID: UUID) {
+        guard tabID != currentTabID else {
+            pendingSelection.cancel()
+            Task { await promptManager.switchComposeTab(tabID) }
+            return
+        }
+        #if DEBUG || EDIT_FLOW_PERF
+            // Begin at click time so latency includes the deferral.
+            let latencyAction = AgentInteractionLatencyProbe.beginTabActivation(
+                tabID: tabID,
+                windowID: agentModeVM.interactionLatencyWindowID,
+                source: "sidebarRow"
+            )
+        #endif
+        let baseTabID = promptManager.activeComposeTabID
+        let token = pendingSelection.begin(tabID: tabID)
+        let timer = Timer(timeInterval: 0, repeats: false) { _ in
+            MainActor.assumeIsolated {
+                guard pendingSelection.isCurrent(token) else { return }
+                Task {
+                    // Recheck after the hop. A switch made elsewhere since the click was
+                    // issued later, so it wins, as it did before the deferral.
+                    let liveTabID = promptManager.activeComposeTabID
+                    guard pendingSelection.isCurrent(token), liveTabID == baseTabID || liveTabID == tabID else {
+                        pendingSelection.clear(ifToken: token)
+                        return
+                    }
+                    #if DEBUG || EDIT_FLOW_PERF
+                        await AgentInteractionLatencyProbe.run(as: latencyAction) {
+                            await promptManager.switchComposeTab(tabID)
+                        }
+                    #else
+                        await promptManager.switchComposeTab(tabID)
+                    #endif
+                    // Reverts the highlight when the switch was refused or guarded.
+                    pendingSelection.clear(ifToken: token)
+                }
+            }
+        }
+        RunLoop.main.add(timer, forMode: .common)
     }
 
     #if DEBUG
