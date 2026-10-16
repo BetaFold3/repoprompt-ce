@@ -688,7 +688,7 @@ package actor AgentSessionDataService {
             normalizedTranscript = nil
         }
         let runtimeTranscript = normalizedTranscript.map {
-            let runtimeNormalized = AgentTranscriptPolicyPipeline.runtimeTranscript($0).transcript
+            let runtimeNormalized = AgentTranscriptPolicyPipeline.runtimeTranscriptOnly($0)
             return AgentSessionRestoreSupport.sanitizeColdRestoredTranscript(runtimeNormalized)
         }
         let runtimeWorkingItems = runtimeTranscript.map(AgentTranscriptIO.workingSourceItems(from:)) ?? workingItems

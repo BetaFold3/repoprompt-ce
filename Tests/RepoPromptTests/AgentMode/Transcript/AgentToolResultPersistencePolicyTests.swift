@@ -1216,9 +1216,11 @@ final class AgentToolResultPersistencePolicyTests: XCTestCase {
     }
 
     /// Same saved bytes, copied into a fresh store with a fresh service for every run: cold load and
-    /// hydration preparation give identical outputs whether runtime materialization derives its
-    /// initial visible tool results structurally or from the projection reference, and the
-    /// structural mode skips exactly one projection build per runtime materialization.
+    /// hydration preparation give identical outputs whether runtime normalization derives its
+    /// initial and post-refresh visible tool results from projection builds (reference), its
+    /// initial IDs structurally (structural initial), or both structurally (candidate). Each step
+    /// skips exactly one projection build per runtime normalization: the initial build, then the
+    /// final build `runtimeTranscriptOnly` never makes.
     func testColdLoadStructuralInitialVisibilityMatchesProjectionReferenceForSameSavedBytes() async throws {
         let buildCounter = ColdLoadProjectionBuildCounter()
         AgentTranscriptDebugInstrumentation.reset()
@@ -1306,29 +1308,46 @@ final class AgentToolResultPersistencePolicyTests: XCTestCase {
             try FileManager.default.copyItem(at: seedDirectory, to: directory)
             return directory
         }
-        func withMode<T>(reference: Bool, _ body: () async throws -> T) async rethrows -> (T, builds: Int) {
+        enum Mode: Int, CaseIterable {
+            case reference
+            case structuralInitial
+            case candidate
+        }
+        func withMode<T>(_ mode: Mode, _ body: () async throws -> T) async rethrows -> (T, builds: Int) {
             let before = buildCounter.value
-            let value = try await AgentTranscriptPolicyPipeline.$derivesInitialVisibilityFromProjection.withValue(reference) {
-                try await body()
+            let value = try await AgentTranscriptPolicyPipeline.$derivesInitialVisibilityFromProjection.withValue(mode == .reference) {
+                try await AgentTranscriptPolicyPipeline.$derivesPostRefreshVisibilityFromProjection.withValue(mode != .candidate) {
+                    try await body()
+                }
             }
             return (value, buildCounter.value - before)
         }
+        func assertBuilds(_ builds: Int, mode: Mode, key: String, _ message: String) throws {
+            guard mode != .reference else {
+                buildCounter.recordReference(builds, key: "\(mode) \(key)")
+                return
+            }
+            let previousMode = try XCTUnwrap(Mode(rawValue: mode.rawValue - 1))
+            let previousBuilds = try XCTUnwrap(buildCounter.reference(key: "\(previousMode) \(key)"))
+            XCTAssertEqual(builds, previousBuilds - 1, "\(key) \(mode): \(message)")
+            buildCounter.recordReference(builds, key: "\(mode) \(key)")
+        }
 
         for fixture in fixtures {
-            var loads: [Bool: [ColdLoadOutputs]] = [:]
+            var loads: [Mode: [ColdLoadOutputs]] = [:]
             var hydrations: [String: [HydrationOutputs]] = [:]
-            // Interleaved reference/candidate runs, each on a fresh copy of the same saved bytes.
-            for reference in [true, false, true, false] {
+            // Interleaved reference/structural-initial/candidate runs, each on a fresh copy of the same saved bytes.
+            for mode in Mode.allCases + Mode.allCases {
                 let store = try freshStore()
                 let fileURL = URL(fileURLWithPath: store.standardizedFileURL.path + fixture.relativePath)
                 let savedBytes = try Data(contentsOf: fileURL)
-                let (loaded, loadBuilds) = try await withMode(reference: reference) {
+                let (loaded, loadBuilds) = try await withMode(mode) {
                     try await AgentSessionDataService().loadAgentSession(from: fileURL)
                 }
                 let bytesAfterLoad = try Data(contentsOf: fileURL)
                 let runtimeSessionData = try encoded(loaded)
                 let canonicalFileAfterLoad = try encoded(JSONDecoder().decode(AgentSession.self, from: bytesAfterLoad))
-                loads[reference, default: []].append(.init(
+                loads[mode, default: []].append(.init(
                     runtimeSession: runtimeSessionData,
                     canonicalFileAfterLoad: canonicalFileAfterLoad,
                     persistedBytesChanged: bytesAfterLoad != savedBytes
@@ -1337,7 +1356,7 @@ final class AgentToolResultPersistencePolicyTests: XCTestCase {
 
                 for pendingQuestionUI in fixture.pendingQuestionUI {
                     let hydrationStore = try freshStore()
-                    let (prepared, prepareBuilds) = try await withMode(reference: reference) {
+                    let (prepared, prepareBuilds) = try await withMode(mode) {
                         try await AgentSessionDataService().preparePersistedHydration(AgentSessionHydrationRequest(
                             workspace: workspace(hydrationStore),
                             tabID: fixture.session.composeTabID ?? UUID(),
@@ -1352,7 +1371,7 @@ final class AgentToolResultPersistencePolicyTests: XCTestCase {
                     let payload = try XCTUnwrap(prepared, fixture.label)
                     let presentation = payload.builtPresentation
                     let persistedSessionData = try encoded(payload.persistedSession)
-                    hydrations["\(reference) pending=\(pendingQuestionUI)", default: []].append(.init(
+                    hydrations["\(mode) pending=\(pendingQuestionUI)", default: []].append(.init(
                         persistedSession: persistedSessionData,
                         canonicalLiveItems: payload.canonicalLiveItems,
                         transcript: payload.transcript,
@@ -1372,46 +1391,39 @@ final class AgentToolResultPersistencePolicyTests: XCTestCase {
                         deletionGeneration: payload.persistenceState.stamp.deletionGeneration,
                         transcriptResetGeneration: payload.persistenceState.transcriptResetGeneration
                     ))
-                    if reference {
-                        buildCounter.recordReference(prepareBuilds, key: "\(fixture.label) prepare \(pendingQuestionUI)")
-                    } else {
-                        let referenceBuilds = try XCTUnwrap(buildCounter.reference(key: "\(fixture.label) prepare \(pendingQuestionUI)"))
-                        XCTAssertEqual(
-                            prepareBuilds,
-                            referenceBuilds - 1,
-                            "\(fixture.label) pending=\(pendingQuestionUI): preparation skips one initial build"
-                        )
-                    }
-                }
-                if reference {
-                    buildCounter.recordReference(loadBuilds, key: "\(fixture.label) load")
-                } else {
-                    let referenceBuilds = try XCTUnwrap(buildCounter.reference(key: "\(fixture.label) load"))
-                    XCTAssertEqual(
-                        loadBuilds,
-                        referenceBuilds - 1,
-                        "\(fixture.label): cold load skips one initial build"
+                    try assertBuilds(
+                        prepareBuilds,
+                        mode: mode,
+                        key: "\(fixture.label) prepare pending=\(pendingQuestionUI)",
+                        "preparation skips one more projection build"
                     )
                 }
+                try assertBuilds(loadBuilds, mode: mode, key: "\(fixture.label) load", "cold load skips one more projection build")
             }
-            let referenceLoads = try XCTUnwrap(loads[true])
-            let candidateLoads = try XCTUnwrap(loads[false])
+            let referenceLoads = try XCTUnwrap(loads[.reference])
             XCTAssertEqual(Set(referenceLoads.map(\.runtimeSession)).count, 1, "\(fixture.label): reference loads are deterministic")
             XCTAssertEqual(Set(referenceLoads.map(\.canonicalFileAfterLoad)).count, 1, "\(fixture.label): reference files are deterministic")
-            XCTAssertEqual(candidateLoads, referenceLoads, "\(fixture.label): runtime session, persisted file content, and whether persisted bytes changed match")
+            for mode in [Mode.structuralInitial, .candidate] {
+                XCTAssertEqual(
+                    try XCTUnwrap(loads[mode]),
+                    referenceLoads,
+                    "\(fixture.label) \(mode): runtime session, persisted file content, and whether persisted bytes changed match"
+                )
+            }
             for pendingQuestionUI in fixture.pendingQuestionUI {
-                let referenceHydrations = try XCTUnwrap(hydrations["true pending=\(pendingQuestionUI)"])
-                let candidateHydrations = try XCTUnwrap(hydrations["false pending=\(pendingQuestionUI)"])
+                let referenceHydrations = try XCTUnwrap(hydrations["\(Mode.reference) pending=\(pendingQuestionUI)"])
                 XCTAssertEqual(referenceHydrations.count, 2)
                 XCTAssertFalse(
                     referenceHydrations[0].rawPayloadByItemID.isEmpty,
                     "\(fixture.label) pending=\(pendingQuestionUI): the fixture retains raw payloads"
                 )
-                XCTAssertEqual(
-                    candidateHydrations,
-                    referenceHydrations,
-                    "\(fixture.label) pending=\(pendingQuestionUI): hydration outputs match"
-                )
+                for mode in [Mode.structuralInitial, .candidate] {
+                    XCTAssertEqual(
+                        try XCTUnwrap(hydrations["\(mode) pending=\(pendingQuestionUI)"]),
+                        referenceHydrations,
+                        "\(fixture.label) pending=\(pendingQuestionUI) \(mode): hydration outputs match"
+                    )
+                }
             }
         }
     }

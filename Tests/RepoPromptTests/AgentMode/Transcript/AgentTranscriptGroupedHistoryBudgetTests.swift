@@ -435,6 +435,241 @@ final class AgentTranscriptGroupedHistoryBudgetTests: XCTestCase {
         )
     }
 
+    /// Every input the runtime stabilization loop queries (sanitized from the original input,
+    /// grouped-history caches refreshed) gives equal structural and projection-derived visible
+    /// tool-result IDs, across the visibility fixtures and fixtures that need stabilization retries.
+    func testStructuralVisibleToolResultRowIDsMatchProjectionBuildOnRuntimeStabilizationInputs() throws {
+        var queriedInputCount = 0
+        var retryingFixtures: [String] = []
+        var exhaustedFixtures: [String] = []
+        for (label, transcript) in try runtimeStabilizationFixtures() {
+            let trace = traceRuntimeStabilization(transcript)
+            if trace.retries > 0 { retryingFixtures.append(label) }
+            if trace.exhausted { exhaustedFixtures.append(label) }
+            // The exhausted final transcript is never queried; it is checked too for coverage.
+            for (index, input) in (trace.queriedInputs + (trace.exhausted ? [trace.final] : [])).enumerated() {
+                queriedInputCount += 1
+                XCTAssertEqual(
+                    AgentTranscriptProjectionBuilder.visibleToolResultRowIDs(for: input),
+                    projectionVisibleToolResultRowIDs(input),
+                    "\(label) stabilization input \(index)"
+                )
+            }
+            // The replica is faithful: it reproduces the pipeline's transcript and caches.
+            assertSameRuntimeTranscript(trace.final, AgentTranscriptPolicyPipeline.runtimeTranscript(transcript).transcript, "\(label) replica")
+        }
+        XCTAssertGreaterThan(queriedInputCount, 100)
+        XCTAssertTrue(retryingFixtures.contains("execution metadata added by sanitize"), "Retrying fixtures: \(retryingFixtures)")
+        XCTAssertFalse(exhaustedFixtures.contains("execution metadata added by sanitize"), "That fixture converges after one retry")
+        // The full-tier suppressed tool-result conclusion's visible set does not settle within the
+        // retry bound, so it covers the exhausted exit. It is the only fixture that does; if a
+        // later fix makes it converge, add a dedicated exhausting fixture rather than drop this.
+        XCTAssertTrue(
+            exhaustedFixtures.contains("suppressed tool-result conclusion full frozen=nil"),
+            "Exhausted fixtures: \(exhaustedFixtures)"
+        )
+    }
+
+    /// `runtimeTranscriptOnly` equals `runtimeTranscript(_:).transcript` (including the in-memory
+    /// frozen limits and per-span caches), in candidate and projection-reference modes, and the
+    /// candidate skips every post-refresh projection build: exactly one fewer when no retry runs.
+    func testRuntimeTranscriptOnlyMatchesRuntimeTranscriptWithoutFinalProjectionBuild() throws {
+        let buildCounter = ProjectionBuildCounter()
+        AgentTranscriptDebugInstrumentation.reset()
+        AgentTranscriptDebugInstrumentation.isEnabled = true
+        AgentTranscriptDebugInstrumentation.projectionBuildHandler = { _ in buildCounter.increment() }
+        defer { AgentTranscriptDebugInstrumentation.reset() }
+        func counted<T>(_ body: () -> T) -> (T, Int) {
+            let before = buildCounter.value
+            let value = body()
+            return (value, buildCounter.value - before)
+        }
+
+        var sawConvergedRetry = false
+        var sawExhausted = false
+        var sawNoRetry = false
+        for (label, transcript) in try runtimeStabilizationFixtures() {
+            let trace = traceRuntimeStabilization(transcript)
+            let (reference, referenceBuilds) = counted { AgentTranscriptPolicyPipeline.runtimeTranscript(transcript) }
+            let (projectionMode, projectionModeBuilds) = counted {
+                AgentTranscriptPolicyPipeline.$derivesPostRefreshVisibilityFromProjection.withValue(true) {
+                    AgentTranscriptPolicyPipeline.runtimeTranscriptOnly(transcript)
+                }
+            }
+            let (candidate, candidateBuilds) = counted { AgentTranscriptPolicyPipeline.runtimeTranscriptOnly(transcript) }
+            assertSameRuntimeTranscript(candidate, reference.transcript, "\(label) candidate")
+            assertSameRuntimeTranscript(projectionMode, reference.transcript, "\(label) projection reference mode")
+            XCTAssertEqual(referenceBuilds, trace.queriedInputs.count + (trace.exhausted ? 1 : 0), "\(label): runtimeTranscript builds")
+            XCTAssertEqual(projectionModeBuilds, trace.queriedInputs.count, "\(label): reference mode builds each queried input")
+            XCTAssertEqual(candidateBuilds, 0, "\(label): the transcript-only path builds no projection")
+            // Converged after r retries: r + 1 builds; exhausted: 3 queried + 1 final = retries + 1.
+            XCTAssertEqual(referenceBuilds - candidateBuilds, trace.retries + 1, "\(label): skipped builds")
+            if trace.retries == 0 {
+                sawNoRetry = true
+                XCTAssertEqual(candidateBuilds, referenceBuilds - 1, "\(label): one fewer build without retries")
+            } else if trace.exhausted {
+                sawExhausted = true
+            } else {
+                sawConvergedRetry = true
+            }
+        }
+        XCTAssertTrue(sawConvergedRetry, "A fixture converges after a stabilization retry")
+        XCTAssertTrue(sawExhausted, "A fixture exhausts the stabilization retries")
+        XCTAssertTrue(sawNoRetry)
+    }
+
+    private struct RuntimeStabilizationTrace {
+        /// The sanitized, cache-refreshed transcripts whose visible IDs the loop compares, in order.
+        var queriedInputs: [AgentTranscript] = []
+        var retries = 0
+        var exhausted = false
+        var final = AgentTranscript()
+    }
+
+    /// Replicates the runtime stabilization loop with projection-derived IDs: sanitize from the
+    /// original input, refresh grouped-history caches, compare, at most 3 retries.
+    private func traceRuntimeStabilization(_ transcript: AgentTranscript) -> RuntimeStabilizationTrace {
+        func sanitizedAndRefreshed(_ preserved: Set<UUID>) -> AgentTranscript {
+            AgentTranscriptProjectionBuilder.refreshCompletedFullTurnGroupedHistoryCaches(
+                in: AgentToolResultPersistencePolicy.sanitizeTranscriptWithMetrics(
+                    transcript,
+                    preservedVisibleToolResultRowIDs: preserved,
+                    purpose: .runtimePresentation
+                ).transcript
+            )
+        }
+        var trace = RuntimeStabilizationTrace()
+        var visible = projectionVisibleToolResultRowIDs(transcript)
+        trace.final = sanitizedAndRefreshed(visible)
+        for _ in 0 ..< 3 {
+            trace.queriedInputs.append(trace.final)
+            let stabilized = projectionVisibleToolResultRowIDs(trace.final)
+            guard stabilized != visible else { return trace }
+            visible = stabilized
+            trace.retries += 1
+            trace.final = sanitizedAndRefreshed(visible)
+        }
+        trace.exhausted = true
+        return trace
+    }
+
+    private func projectionVisibleToolResultRowIDs(_ transcript: AgentTranscript) -> Set<UUID> {
+        AgentTranscriptProjectionBuilder.visibleToolResultRowIDs(in: AgentTranscriptProjectionBuilder.build(from: transcript))
+    }
+
+    private func assertSameRuntimeTranscript(
+        _ candidate: AgentTranscript,
+        _ reference: AgentTranscript,
+        _ context: String,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) {
+        XCTAssertEqual(candidate, reference, context, file: file, line: line)
+        XCTAssertEqual(
+            candidate.turns.map(\.frozenDetailedToolTailLimit),
+            reference.turns.map(\.frozenDetailedToolTailLimit),
+            "\(context): frozen limits",
+            file: file,
+            line: line
+        )
+        // Transcript equality omits the in-memory grouped-history caches; compare them explicitly.
+        XCTAssertEqual(
+            candidate.turns.flatMap { $0.responseSpans.map(\.fullRenderGroupedHistoryCache) },
+            reference.turns.flatMap { $0.responseSpans.map(\.fullRenderGroupedHistoryCache) },
+            "\(context): per-span grouped-history caches",
+            file: file,
+            line: line
+        )
+    }
+
+    /// The visibility fixtures plus pending/terminal-tool transcripts and a fixture whose runtime
+    /// sanitization changes the visible set, so stabilization needs a retry.
+    private func runtimeStabilizationFixtures() throws -> [(String, AgentTranscript)] {
+        var fixtures: [(String, AgentTranscript)] = []
+        var newerSequenceIndex = 100
+        let newerTurn = try XCTUnwrap(AgentTranscriptIO.buildTranscript(
+            from: makeTurnItems(label: "newer", toolCount: 6, sequenceIndex: &newerSequenceIndex),
+            terminalState: .completed,
+            nextSequenceIndex: newerSequenceIndex,
+            compact: false
+        ).turns.first)
+        for fixture in collapsePredicateFixtures() + conclusionToolResultFixtures() {
+            for tier in [AgentTranscriptRetentionTier.full, .condensed, .summary, .archived] {
+                for frozen in [nil, 0, 2, Int.max] as [Int?] {
+                    var turn = fixture.turn
+                    turn.retentionTier = tier
+                    turn.frozenDetailedToolTailLimit = frozen
+                    let label = "\(fixture.label) \(tier) frozen=\(String(describing: frozen))"
+                    fixtures.append((label, AgentTranscript(turns: [turn], nextSequenceIndex: 200)))
+                    fixtures.append(("\(label) behind newer turn", AgentTranscript(turns: [turn, newerTurn], nextSequenceIndex: 200)))
+                }
+            }
+        }
+        let mixed = makeMixedTierTranscript()
+        fixtures.append(("mixed tiers", mixed))
+        fixtures.append(("mixed tiers with frozen limits", AgentTranscriptProjectionBuilder.refreshCompletedFullTurnGroupedHistoryCaches(in: mixed)))
+        var sequenceIndex = 0
+        let compactedItems = (0 ..< 30).flatMap { makeTurnItems(label: "turn \($0)", toolCount: 6, sequenceIndex: &sequenceIndex) }
+        let compacted = AgentTranscriptCompactor.compact(
+            AgentTranscriptIO.buildTranscript(from: compactedItems, terminalState: .completed, nextSequenceIndex: sequenceIndex, compact: false),
+            protection: .none
+        )
+        fixtures.append(("compacted multi-turn", compacted))
+
+        sequenceIndex = 0
+        let history = makeTurnItems(label: "older", toolCount: 12, sequenceIndex: &sequenceIndex)
+            + makeTurnItems(label: "middle", toolCount: 3, sequenceIndex: &sequenceIndex)
+        var pendingItems = history
+        pendingItems.append(.user("Ask me.", sequenceIndex: sequenceIndex))
+        pendingItems.append(.toolCall(name: "read_file", invocationID: UUID(), argsJSON: #"{"path":"/tmp/a.swift"}"#, sequenceIndex: sequenceIndex + 1))
+        pendingItems.append(.toolCall(
+            name: "ask_user",
+            invocationID: UUID(),
+            argsJSON: #"{"questions":[{"id":"q","question":"Proceed?"}]}"#,
+            sequenceIndex: sequenceIndex + 2
+        ))
+        fixtures.append(("pending tool calls", AgentTranscriptIO.buildTranscript(
+            from: pendingItems,
+            terminalState: .running,
+            nextSequenceIndex: sequenceIndex + 3,
+            compact: false
+        )))
+        var terminalItems = history
+        var terminalSequenceIndex = sequenceIndex
+        terminalItems += makeTurnItems(label: "terminal", toolCount: 9, sequenceIndex: &terminalSequenceIndex).dropLast()
+        fixtures.append(("terminal tool result", AgentTranscriptIO.buildTranscript(
+            from: terminalItems,
+            terminalState: .completed,
+            nextSequenceIndex: terminalSequenceIndex,
+            compact: false
+        )))
+        fixtures.append(("empty", AgentTranscript()))
+        let missingExecutionMetadata = try makeMissingExecutionMetadataTranscript()
+        fixtures.append(("execution metadata added by sanitize", missingExecutionMetadata))
+        return fixtures
+    }
+
+    /// A completed full turn whose tool activities carry no execution metadata, so the original
+    /// render keeps them in one block (no collapse, every result visible). Runtime sanitization
+    /// attaches executions, splitting the block per execution and collapsing older tools, so the
+    /// visible set changes and stabilization retries once.
+    private func makeMissingExecutionMetadataTranscript() throws -> AgentTranscript {
+        var sequenceIndex = 0
+        var transcript = AgentTranscriptIO.buildTranscript(
+            from: makeTurnItems(label: "stripped", toolCount: 12, sequenceIndex: &sequenceIndex),
+            terminalState: .completed,
+            nextSequenceIndex: sequenceIndex,
+            compact: false
+        )
+        let turnIndex = try XCTUnwrap(transcript.turns.indices.last)
+        for spanIndex in transcript.turns[turnIndex].responseSpans.indices {
+            for activityIndex in transcript.turns[turnIndex].responseSpans[spanIndex].activities.indices {
+                transcript.turns[turnIndex].responseSpans[spanIndex].activities[activityIndex].toolExecution = nil
+            }
+        }
+        return transcript
+    }
+
     private final class ProjectionBuildCounter: @unchecked Sendable {
         private let lock = NSLock()
         private var count = 0
