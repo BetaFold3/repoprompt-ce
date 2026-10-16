@@ -20,6 +20,10 @@ struct AgentModeSidebarSessionBuilder {
     var pairedDeviceDisplayNameByBareID: [String: String] = [:]
     /// Delegated ask_user badges resolved by durable session ID, so index-only rows work too.
     var delegatedQuestionAttentionBySessionID: [UUID: AgentDelegatedQuestionSidebarAttention] = [:]
+    /// When false, rows carry `AgentSessionSearchFields.empty` instead of the per-row
+    /// search corpus. Only for callers that never read `searchFields`, such as the
+    /// blank-search sidebar path; every other caller keeps the complete corpus.
+    var includesSearchFields = true
 
     private struct BuildContext {
         let tabByID: [UUID: ComposeTabState]
@@ -335,18 +339,22 @@ struct AgentModeSidebarSessionBuilder {
         let delegatedQuestionAttention = resolvedSessionID
             .flatMap { delegatedQuestionAttentionBySessionID[$0] }
             .flatMap { $0.isEmpty ? nil : $0 }
-        let searchFields = Self.searchFields(
-            title: title,
-            entry: entry,
-            runState: metadataLiveSession?.runState ?? entry.flatMap { AgentSessionRunState(rawValue: $0.lastRunStateRaw ?? "") },
-            isMCPControlled: isMCPControlled,
-            worktree: worktree,
-            mergeAttention: mergeAttention,
-            scheduledSendStatus: scheduledSendStatus,
-            delegatedQuestionAttention: delegatedQuestionAttention,
-            sessionID: resolvedSessionID,
-            tabID: tab.id
-        )
+        let searchFields: AgentSessionSearchFields = if includesSearchFields {
+            Self.searchFields(
+                title: title,
+                entry: entry,
+                runState: metadataLiveSession?.runState ?? entry.flatMap { AgentSessionRunState(rawValue: $0.lastRunStateRaw ?? "") },
+                isMCPControlled: isMCPControlled,
+                worktree: worktree,
+                mergeAttention: mergeAttention,
+                scheduledSendStatus: scheduledSendStatus,
+                delegatedQuestionAttention: delegatedQuestionAttention,
+                sessionID: resolvedSessionID,
+                tabID: tab.id
+            )
+        } else {
+            .empty
+        }
 
         return SidebarSession(
             id: tab.id,

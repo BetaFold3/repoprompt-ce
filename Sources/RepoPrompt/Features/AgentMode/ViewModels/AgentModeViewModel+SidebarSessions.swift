@@ -396,7 +396,12 @@ extension AgentModeViewModel {
 
     /// Session-linked sidebar data source.
     /// Blank compose tabs stay hidden until they are explicitly linked to an agent session.
-    func sidebarSessions(for tabs: [ComposeTabState]) -> [SidebarSession] {
+    /// `includesSearchFields: false` returns rows with an empty search corpus; use it only
+    /// when no consumer reads `searchFields` (the blank-search sidebar path).
+    func sidebarSessions(
+        for tabs: [ComposeTabState],
+        includesSearchFields: Bool = true
+    ) -> [SidebarSession] {
         let currentIndex = ownerValidatedSessionIndex
         let indexEntriesByTabID = Dictionary(grouping: currentIndex.values, by: \.tabID)
         let authoritativeSessionIDByTabID = Dictionary(
@@ -435,7 +440,8 @@ extension AgentModeViewModel {
             mcpControlledTabIDs: mcpControlledTabIDs,
             registeredRemoteHosts: registeredRemoteHostsForSidebar(currentIndex: currentIndex),
             pairedDeviceDisplayNameByBareID: pairedDeviceDisplayNameByBareID,
-            delegatedQuestionAttentionBySessionID: delegatedQuestionSidebarAttentionBySessionID()
+            delegatedQuestionAttentionBySessionID: delegatedQuestionSidebarAttentionBySessionID(),
+            includesSearchFields: includesSearchFields
         ).build()
     }
 
@@ -679,6 +685,8 @@ extension AgentModeViewModel {
         }
     }
 
+    /// When the effective search is blank, rows carry `AgentSessionSearchFields.empty`;
+    /// callers that read `searchFields` must use `sidebarSessions(for:)` instead.
     func filteredSidebarSessions(
         for tabs: [ComposeTabState],
         currentTabID: UUID?,
@@ -689,9 +697,10 @@ extension AgentModeViewModel {
             let startMS = AgentModePerfDiagnostics.timestampMSIfEnabled()
         #endif
         let source = diagnosticSource ?? "unknown"
-        let sortedSessions = sidebarSessions(for: tabs)
         let effectiveSearchText = searchText ?? sessionSidebarSearchText
         let searchTrimmed = effectiveSearchText.trimmingCharacters(in: .whitespacesAndNewlines)
+        // Blank search never reads `searchFields`, so skip building the per-row corpus.
+        let sortedSessions = sidebarSessions(for: tabs, includesSearchFields: !searchTrimmed.isEmpty)
         let result: [SidebarSession]
         if searchTrimmed.isEmpty {
             result = sidebarRowsApplyingThreadCollapse(

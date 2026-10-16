@@ -662,11 +662,235 @@ final class AgentModeSidebarSessionBuilderTests: XCTestCase {
         XCTAssertFalse(quiet.searchFields.fields.map(\.text).contains("question"))
     }
 
+    func testSearchFieldsOptOutMatchesFullBuildExceptSearchFields() throws {
+        let rootTabID = id(80)
+        let childTabID = id(81)
+        let grandchildTabID = id(82)
+        let pinnedTabID = id(83)
+        let remoteTabID = id(84)
+        let liveTabID = id(85)
+        let rootSessionID = id(180)
+        let childSessionID = id(181)
+        let grandchildSessionID = id(182)
+        let pinnedSessionID = id(183)
+        let remoteSessionID = id(184)
+        let liveSessionID = id(185)
+        let tabs = [
+            tab(rootTabID, sessionID: rootSessionID),
+            tab(childTabID, sessionID: childSessionID),
+            tab(grandchildTabID, sessionID: grandchildSessionID),
+            tab(pinnedTabID, sessionID: pinnedSessionID, isPinned: true),
+            tab(remoteTabID, sessionID: remoteSessionID),
+            tab(liveTabID, sessionID: liveSessionID)
+        ]
+        let index = sessionIndex([
+            entry(rootSessionID, tabID: rootTabID, lastUserMessageAt: date(300)),
+            entry(childSessionID, tabID: childTabID, parentSessionID: rootSessionID, lastUserMessageAt: date(250)),
+            entry(
+                grandchildSessionID,
+                tabID: grandchildTabID,
+                parentSessionID: childSessionID,
+                lastUserMessageAt: nil,
+                scheduledSendSummary: scheduledSummary(state: .needsConfirmation)
+            ),
+            entry(pinnedSessionID, tabID: pinnedTabID, lastUserMessageAt: date(10)),
+            entry(remoteSessionID, tabID: remoteTabID, lastUserMessageAt: date(200), remoteHostName: "Mac Studio"),
+            entry(liveSessionID, tabID: liveTabID, lastUserMessageAt: date(100))
+        ])
+        let sessions = [
+            liveTabID: liveSession(tabID: liveTabID, sessionID: liveSessionID, lastUserMessageAt: date(400))
+        ]
+        let attention = [
+            rootSessionID: AgentDelegatedQuestionSidebarAttention(
+                pendingChildQuestionCount: 1,
+                undeliveredChildQuestionCount: 0,
+                ownQuestion: nil
+            ),
+            childSessionID: AgentDelegatedQuestionSidebarAttention(ownQuestion: .waitingOnParentAgent)
+        ]
+
+        func rows(includesSearchFields: Bool) -> [AgentModeViewModel.SidebarSession] {
+            build(
+                tabs: tabs,
+                sessions: sessions,
+                sessionIndex: index,
+                delegatedQuestionAttention: attention,
+                mcpControlledTabIDs: [childTabID],
+                registeredRemoteHosts: [(id: "host-1", displayName: "Mac Studio")],
+                includesSearchFields: includesSearchFields
+            )
+        }
+        let full = rows(includesSearchFields: true)
+        let lean = rows(includesSearchFields: false)
+
+        XCTAssertEqual(
+            full.map(\.tabID),
+            [pinnedTabID, liveTabID, rootTabID, childTabID, grandchildTabID, remoteTabID]
+        )
+        XCTAssertEqual(full.map(\.depth), [0, 0, 0, 1, 2, 0])
+        XCTAssertTrue(full.allSatisfy { !$0.searchFields.fields.isEmpty })
+        XCTAssertTrue(lean.allSatisfy { $0.searchFields == .empty })
+        XCTAssertEqual(lean, full.map { withSearchFields(.empty, $0) })
+        XCTAssertNotNil(try row(for: rootTabID, in: lean).delegatedQuestionAttention)
+        XCTAssertNotNil(try row(for: grandchildTabID, in: lean).scheduledSendStatus)
+        XCTAssertTrue(try row(for: childTabID, in: lean).isMCPControlled)
+        XCTAssertNotNil(try row(for: remoteTabID, in: lean).remoteHostAbbreviation)
+    }
+
+    func testDefaultBuilderKeepsCompleteSearchCorpus() throws {
+        let tabID = id(86)
+        let sessionID = id(186)
+        let indexed = entry(
+            sessionID,
+            tabID: tabID,
+            lastUserMessageAt: date(100),
+            scheduledSendSummary: scheduledSummary(state: .scheduled)
+        )
+        let builder = AgentModeSidebarSessionBuilder(
+            allTabs: [tab(tabID, sessionID: sessionID)],
+            linkedTabs: [tab(tabID, sessionID: sessionID)],
+            sessions: [:],
+            authoritativeSessionIDByTabID: [tabID: sessionID],
+            sessionIndex: sessionIndex([indexed]),
+            sessionListSortDates: [:],
+            sessionListCacheReady: true,
+            sidebarRestoreFrozenOrderByTabID: [:],
+            mcpControlledTabIDs: [],
+            registeredRemoteHosts: []
+        )
+        XCTAssertTrue(builder.includesSearchFields)
+
+        let projected = try row(for: tabID, in: builder.build())
+        XCTAssertEqual(
+            projected.searchFields,
+            AgentModeSidebarSessionBuilder.searchFields(
+                title: projected.title,
+                entry: indexed,
+                runState: nil,
+                isMCPControlled: false,
+                worktree: nil,
+                mergeAttention: nil,
+                scheduledSendStatus: projected.scheduledSendStatus,
+                sessionID: sessionID,
+                tabID: tabID
+            )
+        )
+        let texts = projected.searchFields.fields.map(\.text)
+        XCTAssertTrue(texts.contains(projected.title))
+        XCTAssertTrue(texts.contains("scheduled"))
+        XCTAssertTrue(texts.contains(tabID.uuidString))
+        XCTAssertTrue(texts.contains(sessionID.uuidString))
+    }
+
+    func testBlankSearchFilteredRowsSkipCorpusButKeepOrderThreadCollapseAndAttention() throws {
+        let viewModel = makeViewModel()
+        let rootATabID = id(90)
+        let childBTabID = id(91)
+        let grandchildCTabID = id(92)
+        let rootDTabID = id(93)
+        let childETabID = id(94)
+        let rootFTabID = id(95)
+        let rootASessionID = id(190)
+        let childBSessionID = id(191)
+        let grandchildCSessionID = id(192)
+        let rootDSessionID = id(193)
+        let childESessionID = id(194)
+        let rootFSessionID = id(195)
+        let tabs = [
+            tab(rootATabID, sessionID: rootASessionID),
+            tab(childBTabID, sessionID: childBSessionID),
+            tab(grandchildCTabID, sessionID: grandchildCSessionID),
+            tab(rootDTabID, sessionID: rootDSessionID),
+            tab(childETabID, sessionID: childESessionID),
+            tab(rootFTabID, sessionID: rootFSessionID)
+        ]
+        let workspace = WorkspaceModel(
+            name: "Sidebar Blank Search Corpus",
+            repoPaths: [],
+            ephemeralFlag: true,
+            composeTabs: tabs,
+            activeComposeTabID: nil
+        )
+        let owner = viewModel.test_receiveWorkspaceSwitchNotification(workspace)
+        viewModel.test_installSessionIndexSnapshot(
+            sessionIndex([
+                entry(rootASessionID, tabID: rootATabID, lastUserMessageAt: date(300)),
+                entry(childBSessionID, tabID: childBTabID, parentSessionID: rootASessionID, lastUserMessageAt: date(250)),
+                entry(
+                    grandchildCSessionID,
+                    tabID: grandchildCTabID,
+                    parentSessionID: childBSessionID,
+                    lastUserMessageAt: date(240)
+                ),
+                entry(rootDSessionID, tabID: rootDTabID, lastUserMessageAt: date(200)),
+                entry(childESessionID, tabID: childETabID, parentSessionID: rootDSessionID, lastUserMessageAt: date(190)),
+                entry(rootFSessionID, tabID: rootFTabID, lastUserMessageAt: date(100))
+            ]),
+            owner: owner,
+            latestOwner: owner,
+            activeWorkspace: workspace
+        )
+        viewModel.setSidebarThreadCollapsed(true, for: .session(rootASessionID))
+        viewModel.setSidebarThreadCollapsed(true, for: .session(rootDSessionID))
+        viewModel.ui.sessionSidebar.markRunStateAttention(tabID: grandchildCTabID, state: .completed)
+        viewModel.ui.sessionSidebar.markRunStateAttention(tabID: rootFTabID, state: .failed)
+
+        let fullRows = viewModel.sidebarSessions(for: tabs)
+        XCTAssertTrue(fullRows.allSatisfy { !$0.searchFields.fields.isEmpty })
+        let fullRowByTabID = Dictionary(uniqueKeysWithValues: fullRows.map { ($0.tabID, $0) })
+
+        let blank = viewModel.filteredSidebarSessions(for: tabs, currentTabID: childETabID, searchText: "")
+        let whitespace = viewModel.filteredSidebarSessions(for: tabs, currentTabID: childETabID, searchText: " \n\t ")
+        XCTAssertEqual(whitespace, blank)
+        XCTAssertTrue(blank.allSatisfy { $0.searchFields == .empty })
+        XCTAssertEqual(blank.map(\.tabID), [rootATabID, rootDTabID, childETabID, rootFTabID])
+        for row in blank {
+            let full = try XCTUnwrap(fullRowByTabID[row.tabID])
+            XCTAssertEqual(builderProjection(row), withSearchFields(.empty, full))
+        }
+
+        let rootA = try row(for: rootATabID, in: blank)
+        XCTAssertEqual(rootA.threadKey, .session(rootASessionID))
+        XCTAssertTrue(rootA.hasThreadChildren)
+        XCTAssertTrue(rootA.isThreadCollapsed)
+        XCTAssertEqual(rootA.hiddenThreadDescendantCount, 2)
+        XCTAssertEqual(rootA.hiddenThreadDescendantAttentionCount, 1)
+        XCTAssertEqual(rootA.threadActivityDate, date(300))
+        let rootD = try row(for: rootDTabID, in: blank)
+        XCTAssertTrue(rootD.hasThreadChildren)
+        XCTAssertFalse(rootD.isThreadCollapsed, "A collapsed thread containing the active tab stays expanded")
+        XCTAssertEqual(rootD.hiddenThreadDescendantCount, 0)
+        let rootF = try row(for: rootFTabID, in: blank)
+        XCTAssertFalse(rootF.hasThreadChildren)
+        XCTAssertEqual(rootF.hiddenThreadDescendantAttentionCount, 0)
+        XCTAssertEqual(
+            viewModel.collapsibleSidebarThreadKeys(filteredRows: blank),
+            [.session(rootASessionID), .session(rootDSessionID)]
+        )
+
+        let searched = viewModel.filteredSidebarSessions(
+            for: tabs,
+            currentTabID: childETabID,
+            searchText: "Tab 0092"
+        )
+        XCTAssertEqual(searched.map(\.tabID), [rootATabID, childBTabID, grandchildCTabID])
+        XCTAssertEqual(searched.map(\.depth), [0, 1, 2])
+        XCTAssertFalse(searched.contains(where: \.isThreadCollapsed), "Search never collapses threads")
+        for row in searched {
+            let full = try XCTUnwrap(fullRowByTabID[row.tabID])
+            XCTAssertEqual(row.searchFields, full.searchFields)
+            XCTAssertEqual(builderProjection(row), full)
+        }
+    }
+
     private func build(
         tabs: [ComposeTabState],
         sessions: [UUID: AgentTabSession] = [:],
         sessionIndex: [UUID: AgentSessionIndexEntry],
-        delegatedQuestionAttention: [UUID: AgentDelegatedQuestionSidebarAttention] = [:]
+        delegatedQuestionAttention: [UUID: AgentDelegatedQuestionSidebarAttention] = [:],
+        mcpControlledTabIDs: Set<UUID> = [],
+        registeredRemoteHosts: [(id: String, displayName: String)] = [],
+        includesSearchFields: Bool = true
     ) -> [AgentModeViewModel.SidebarSession] {
         var builder = AgentModeSidebarSessionBuilder(
             allTabs: tabs,
@@ -681,11 +905,80 @@ final class AgentModeSidebarSessionBuilderTests: XCTestCase {
             sessionListSortDates: [:],
             sessionListCacheReady: true,
             sidebarRestoreFrozenOrderByTabID: [:],
-            mcpControlledTabIDs: [],
-            registeredRemoteHosts: []
+            mcpControlledTabIDs: mcpControlledTabIDs,
+            registeredRemoteHosts: registeredRemoteHosts
         )
         builder.delegatedQuestionAttentionBySessionID = delegatedQuestionAttention
+        builder.includesSearchFields = includesSearchFields
         return builder.build()
+    }
+
+    private func makeViewModel() -> AgentModeViewModel {
+        AgentModeViewModel(
+            testWindowID: 1,
+            testWorkspacePath: FileManager.default.currentDirectoryPath,
+            codexControllerFactory: { _, _, _, _, _, _ in LifecycleNoopCodexController(recorder: LifecycleRecorder()) }
+        )
+    }
+
+    /// Copy of `row` with every field preserved except `searchFields`.
+    private func withSearchFields(
+        _ searchFields: AgentSessionSearchFields,
+        _ row: AgentModeViewModel.SidebarSession
+    ) -> AgentModeViewModel.SidebarSession {
+        AgentModeViewModel.SidebarSession(
+            id: row.id,
+            tabID: row.tabID,
+            title: row.title,
+            lastUserMessageAt: row.lastUserMessageAt,
+            activityDate: row.activityDate,
+            isPinned: row.isPinned,
+            sessionID: row.sessionID,
+            parentSessionID: row.parentSessionID,
+            depth: row.depth,
+            isMCPControlled: row.isMCPControlled,
+            remoteHostName: row.remoteHostName,
+            remoteHostAbbreviation: row.remoteHostAbbreviation,
+            remoteControlDeviceID: row.remoteControlDeviceID,
+            remoteControlDeviceDisplayName: row.remoteControlDeviceDisplayName,
+            worktree: row.worktree,
+            worktreeMergeAttention: row.worktreeMergeAttention,
+            scheduledSendStatus: row.scheduledSendStatus,
+            delegatedQuestionAttention: row.delegatedQuestionAttention,
+            threadKey: row.threadKey,
+            hasThreadChildren: row.hasThreadChildren,
+            isThreadCollapsed: row.isThreadCollapsed,
+            hiddenThreadDescendantCount: row.hiddenThreadDescendantCount,
+            hiddenThreadDescendantAttentionCount: row.hiddenThreadDescendantAttentionCount,
+            threadActivityDate: row.threadActivityDate,
+            searchFields: searchFields
+        )
+    }
+
+    /// Builder-owned fields of a displayed row: the thread-collapse pass's fields reset to
+    /// the builder defaults so the row compares against `sidebarSessions(for:)` output.
+    private func builderProjection(_ row: AgentModeViewModel.SidebarSession) -> AgentModeViewModel.SidebarSession {
+        AgentModeViewModel.SidebarSession(
+            id: row.id,
+            tabID: row.tabID,
+            title: row.title,
+            lastUserMessageAt: row.lastUserMessageAt,
+            activityDate: row.activityDate,
+            isPinned: row.isPinned,
+            sessionID: row.sessionID,
+            parentSessionID: row.parentSessionID,
+            depth: row.depth,
+            isMCPControlled: row.isMCPControlled,
+            remoteHostName: row.remoteHostName,
+            remoteHostAbbreviation: row.remoteHostAbbreviation,
+            remoteControlDeviceID: row.remoteControlDeviceID,
+            remoteControlDeviceDisplayName: row.remoteControlDeviceDisplayName,
+            worktree: row.worktree,
+            worktreeMergeAttention: row.worktreeMergeAttention,
+            scheduledSendStatus: row.scheduledSendStatus,
+            delegatedQuestionAttention: row.delegatedQuestionAttention,
+            searchFields: row.searchFields
+        )
     }
 
     private func liveSession(
