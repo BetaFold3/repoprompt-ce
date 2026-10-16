@@ -1,6 +1,8 @@
 # Completed outcome — 2026-10-08
 
-Steps 1–10 are accepted for delivery, with the historical owner-approved measurement limitations retained below. Steps 3–9 are signed local commits; Step 10's final signed commit is pending at the time of this annotation. The final commit also closes Steps 11–12 without speculative code changes under the owner's approximately half-day investigation caps.
+Steps 1–10 are accepted for delivery, with the historical owner-approved measurement limitations retained below. Steps 3–9 are signed local commits; Step 10 is signed commit `811a96d0`, which also closes Steps 11–12 without speculative code changes under the owner's approximately half-day investigation caps.
+
+Follow-up triage (owner, 2026-10-08): the two follow-ups worth keeping (the unexplained edit-associated pre-test interval, and `make dev-bench` refusing post-Step-10 revisions) are recorded in `docs/context/workflows/development.md`. Every other nonblocking finding, deferred P2/P3 and missed absolute target recorded below is deliberately dropped; none is backlog. Evidence directories cited below (`.agent-artifacts/…`) were deleted after closure; review exports under `prompt-exports/` remain.
 
 OD27 replaced Step 10's larger cleanup, atomic-regeneration and statistical qualification requirements with the lean contract. Debug defaults to off; full-symbol exceptions and the on escape hatch remain. Coordinated `make dev-dsym` regenerates existing products in place. No automatic stale-symbol cleanup was needed on this toolchain. Ten alternating same-tree edits per mode gave medians 18.655 s on / 11.654 s off, saving 7.001 s (37.5%); null medians differed by +0.004 s off. Default-off CE packaging and focused `AgentContextRatioDisplayTests` passed, along with 954 conductor selftests.
 
