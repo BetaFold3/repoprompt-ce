@@ -1,261 +1,320 @@
 # Code-mode readiness, RepoPrompt-owned code-mode executor, and Git surface narrowing plan
 
-Scope: read when the task touches MCP `outputSchema`/`structuredContent` delivery, structured result projection for `read_file`/`file_search`/`get_code_structure`/`get_file_tree`, a RepoPrompt-owned code-mode script executor (`code_mode`), nested tool dispatch from a script, the `git_review_snapshot` tool, or shell-aware narrowing of the `git` tool in Agent Mode runs.
+Scope: read when the task touches MCP `outputSchema`/`structuredContent` delivery, structured results for `read_file`/`file_search`/`get_code_structure`/`get_file_tree`, a RepoPrompt-owned code-mode script executor (`code_mode`), nested tool dispatch from a script, the `git_review_snapshot` tool, or shell-aware narrowing of the `git` tool in Agent Mode runs.
 Authority: Reference
-Last-verified: 2026-10-04
+Last-verified: 2026-10-12
 
-Status: Planned, not implemented. No app source has changed for this plan. The Phase 0 offline analyzer exists locally (`Scripts/analyze_tool_usage.py` and its test file, uncommitted); live structured-content probes have not run. One material disagreement (§8.4, the executor's promotion gate) remains open; its recommendation is recorded but not silently adopted. 2026-10-04 additions: a corrected baseline that includes every Claude Code log root (§2.2), prior art from OpenCode v2 Code Mode (§2.3), and OpenCode capability facts (§4.1, §10).
+Status: Planned, not implemented. No app source has changed for this plan. The 2026-10-10 revision replaces the earlier gate dispute and the multi-level enablement machinery with measured evidence (§3: a 360-run lab experiment across Claude Code, Codex, Pi 1.1 and OpenCode 1.18 and 2.0, plus usage logs) and a single simple gate (§7). A same-day follow-up (§3.6, about 300 more runs) tested the owner's proposal of RepoPrompt `code_mode` with the provider's own code mode off, and widened D3 from "Claude Code only" to every run where RepoPrompt's tools are called directly. A second follow-up (§3.7, about 900 runs) measured the reviewers' blind spots and tightened the executor's failure, concurrency and result-shape rules (§6). The Phase 3 gate run (§3.8, 2026-10-11) passed on Claude Code and Codex; next is Phase 4 (app code). Long-session runs on 2026-10-12 (§3.9) added Claude resume through the owner's shim and 11-turn mixed sessions, and corrected the Codex session figures. The usage analyzer (`Scripts/analyze_tool_usage.py` and its tests) is committed; the lab harness and raw results are local only (`docs/investigations/2026-10-10-codemode-lab/`).
 
-Decision process: two independent Oracle lanes (OracleE `95F2BD07-4A94-417C-AAAF-17CAB847EC35` and OracleD `7F177418-1980-4BF5-9768-B278FBC7C2BB`; `model_selection: explicit` on the first round, `inherited` on continuations) received an identical brief carrying file:line evidence verified against the live checkout and six months of local usage measurements. Six material disagreements went to anonymous reciprocal challenge (each lane received the other's arguments, never its identity). Round 1: both lanes moved, and on P1–P3 they effectively swapped positions. Round 2: OracleD converged on all three; OracleE's round-2 send failed three times on an `oracle_browser_warning` (ChatGPT browser session), so the round-2 convergence is OracleD's acceptance of OracleE's round-1 positions, with compatible refinements adopted by the plan author. Minor points were settled by the plan author after checking the code (§8.6).
-
-User decisions (2026-10-03):
-1. Scope is code-mode readiness plus Git narrowing only. Pi provider work is out of scope (see `docs/context/plans/pi-provider-integration.md`).
-2. Context Builder is being deprecated: it is not a target, receives no investment, and keeps its current behavior; it does not constrain the Git design.
-3. Git: hide plain inspection only in runs that have a native shell; keep a narrow review-snapshot capability everywhere; keep the full Git surface for runs and clients without a shell.
-4. The owner expects a RepoPrompt-owned code-mode executor in our own harness, phased and gated by measurement.
-5. Knowledge sessions stay unchanged: no `git`, no `git_review_snapshot`, no executor.
+Owner decisions (2026-10-03, unchanged):
+1. Scope is code mode plus Git narrowing. Pi provider work is out of scope (`docs/context/plans/pi-provider-integration.md`).
+2. Context Builder is deprecated: no investment, current behavior kept, no constraint on Git design.
+3. Git: hide plain inspection only in runs that have a native shell; keep a review snapshot everywhere.
+4. The executor is RepoPrompt-owned, phased, and gated by measurement.
+5. Knowledge sessions are unchanged: no `git`, no snapshot, no executor.
 6. The executor engine is vendored QuickJS-ng.
-7. The executor is Agent Mode–only until its promotion gate passes; no external-client enrollment.
+7. The executor is Agent Mode–only until its gate passes.
 
-## 1. Goal
+## 1. Summary
 
-Make RepoPrompt's highest-volume tools composable by scripts and cheaper for models, and remove redundant tool surface where the agent already has a shell:
+| Deliverable | What | Measured basis (§3) | Plan |
+|---|---|---|---|
+| D1 Structured results | Keep today's text; add `structuredContent` and `outputSchema` for the four exploration tools | Clients disagree on what they show the model. Codex about 9% cheaper (not yet significant); Claude cost-neutral and more correct; Pi dearer | Ship the capability default-off; turn it on per host after a confirming gate run (Codex first) |
+| D2 Git narrowing | `git_review_snapshot` everywhere; hide `git` in runs with a shell | Shell already carries more Git inspection than the tool | Ship |
+| D3 `code_mode` executor | Bounded script over the four read-only tools, for runs where RepoPrompt's tools are called directly (never inside a client's code mode) | Optional `code_mode` is about 11% cheaper on Claude, about 20% cheaper on Codex with RepoPrompt tools taken out of Codex's code mode, and about 44% cheaper than Pi's own code mode, all at equal correctness; nested inside Codex's code mode it is about 12% dearer; heavy fan-out turns produce 61% of real exploration output | Experimental and optional, per provider; confirm with the prototype at 5 repetitions and a fixed result shape, then build the QuickJS engine |
+| D4 Measurement | Usage analyzer plus a controlled lab harness | Both exist locally | The harness and one gate decide every default |
 
-- **D1 Structured results.** Ship spec-standard `outputSchema` + `structuredContent` for the exploration tools, default off, enabled only where evidence shows it helps.
-- **D2 Git narrowing.** Add `git_review_snapshot`; restrict the full `git` tool only in runs proven to have a native shell.
-- **D3 Owned executor.** Add an experimental `code_mode` MCP tool that runs a bounded QuickJS script calling the read-only exploration tools through the existing dispatch authority.
-- **D4 Measurement.** Baseline from local logs, then a controlled A/B/C experiment that decides whether the executor leaves experimental status.
+Non-goals: Pi provider integration; Context Builder changes; Knowledge policy; a `code_mode` tool nested inside a client's code mode; rewriting a provider's model catalog; persistent script state; edits, selection, Git, Oracle or delegation inside scripts.
 
-Non-goals: Pi provider integration; Context Builder changes; Knowledge policy changes; external-client executor enrollment; persistent script state; edits, selection management, Git, Oracle, or delegation inside scripts.
-
-## 2. Evidence
-
-### 2.1 Verified repository facts
+## 2. Verified repository facts
 
 | Fact | Evidence |
 |---|---|
-| Successful window-tool calls return Markdown content only: `CallTool.Result(content: contentBlocks, isError: false)`. | `Sources/RepoPrompt/Infrastructure/MCP/MCPConnectionManager.swift:13102-13103` |
-| No server code produces `structuredContent` or `outputSchema`; they appear only in result readers. | `AgentTranscriptServices.swift:365`, `ToolJSON.swift:9`, `RepoPromptGateway/Wire/RemoteWireMCPBridge.swift:33` |
-| The pinned SDK already supports both fields. | `.build/checkouts/swift-sdk/Sources/MCP/Server/Tools.swift:23` (`Tool.outputSchema`), `:407` (`CallTool.Result.structuredContent`) |
-| Typed DTOs exist and are encoded to `Value` before formatting. | `Sources/RepoPrompt/Infrastructure/MCP/ToolResultDTOs.swift:107-159` (`SearchResultDTO`), `:246` (`FileTreeDTO`), `:282` (`CodeStructureReplyDTO`), `:731` (`ReadFileReply`), `:2115` (`GitToolReplyDTO`); `Tool.swift:31-46` |
-| Hidden `_rawJSON` returns compact JSON text. | `MCPToolArgsNormalizer.swift:161-163,203-205`; `ToolOutputFormatter.swift:977-1021` |
-| Custom client capabilities must be strings; non-string experimental entries are stripped at the socket boundary. | `MCPInitializeCompatibility.swift:22-24`; `docs/context/workflows/development.md:87-96` |
-| Connection lanes are independent `AsyncLimiter`s; there is no cross-lane drain. | `MCPConnectionManager.swift:1535-1545`, `:1821-1836` |
-| `.exclusive` additionally takes a per-window/app-wide mutation lease (limit 1); `.smallRead` takes a per-window small-read lease (limit 2). | `MCPConnectionManager.swift:1852-1857`, `:12270-12320` |
-| Admission caps: small reads 2 per connection and 2 per window; searches 4 per connection; Git 2 per connection + 1 per repository; exclusive 1; control 8. | `Policies/MCPToolAdmissionPolicy.swift:32-38,52` |
-| Every advertised tool needs an execution contract and an admission class; both tables are closed. | `Policies/MCPToolExecutionContract.swift:59-105`; `MCPToolAdmissionPolicy.swift:40-71` |
-| Only `.bounded` contracts get the server-side deadline/watchdog; `.longSynchronousCancellable` and the other cancellable kinds run unbounded. | `MCPConnectionManager.swift:12743-12747` |
-| Agent Mode `read_file` and eligible content searches enqueue automatic selection mutations. | `ViewModels/MCPReadFileAutoSelectionCoordinator.swift:3-8` |
-| `git` is one tool with `op` + `artifacts`; artifact publication auto-selects review artifacts and Oracle review mode requires them. | `WindowTools/MCPGitToolProvider.swift:331-372,436-447,537,695-747` |
-| Shell availability is a per-run fact. Claude Agent Mode keeps Bash unless the preference is off or the profile is `.mcpSafeDefaults`; Knowledge and discovery runs disallow Bash. | `ClaudeControllerLaunchPolicy.swift:5-25`; `ClaudeCodeIntegrationConfiguration.swift:47-67,75-76,108-109,155-176` |
-| Knowledge's positive tool ceiling excludes `git`. | `Features/AgentMode/Runtime/AgentSessionProfile.swift:16-27` |
-| Run restrictions are unioned into `restrictedTools` and enforced at both `tools/list` and `tools/call`. | `Features/AgentMode/Runtime/AgentModeRunLease.swift:14-24`; `MCPConnectionManager.swift:11395-11420` |
-| Default-off per-feature Agent Mode settings have a precedent. | `AppSettingsMCPService.swift:926` (`agent_mode.codex_computer_use_enabled`) |
+| Successful window-tool calls return Markdown text only. | `Sources/RepoPrompt/Infrastructure/MCP/MCPConnectionManager.swift:13102-13103` |
+| No server code produces `structuredContent` or `outputSchema`; the pinned SDK supports both. | `.build/checkouts/swift-sdk/Sources/MCP/Server/Tools.swift:23,100-108` |
+| Typed DTOs already exist and are encoded to `Value` before formatting; hidden `_rawJSON` returns them as compact JSON text. | `ToolResultDTOs.swift` (`SearchResultDTO`, `FileTreeDTO`, `CodeStructureReplyDTO`, `ReadFileReply`); `MCPToolArgsNormalizer.swift:161-163,203-205`; `ToolOutputFormatter.swift:977-1021` |
+| The handshake client name is stored per connection (`ctx.clientName = clientInfo.name`). Client names are client-asserted and must never authorize anything. | `MCPConnectionManager.swift:5583`, `:186-192` |
+| Admission: small reads 2 per connection and 2 per window; searches 4; Git 2 per connection + 1 per repository; exclusive 1; control 8. Lanes are independent limiters. | `Policies/MCPToolAdmissionPolicy.swift:32-38`; `MCPConnectionManager.swift:1535-1545,1821-1836` |
+| Every advertised tool needs an execution contract and an admission class; only `.bounded` contracts get the server watchdog. | `Policies/MCPToolExecutionContract.swift:59-105`; `MCPConnectionManager.swift:12743-12747` |
+| Agent Mode `read_file` and eligible searches enqueue automatic selection. | `ViewModels/MCPReadFileAutoSelectionCoordinator.swift:3-8` |
+| `git` is one tool with `op` + `artifacts`; artifacts auto-select review files and Oracle review needs them. | `WindowTools/MCPGitToolProvider.swift:331-372,436-447,695-747` |
+| Shell availability is a per-run fact (Claude keeps Bash unless the preference is off or the profile is `.mcpSafeDefaults`; Knowledge and discovery runs disallow it). Run restrictions are enforced at both `tools/list` and `tools/call`. | `ClaudeControllerLaunchPolicy.swift:5-25`; `ClaudeCodeIntegrationConfiguration.swift:47-67`; `AgentModeRunLease.swift:14-24`; `MCPConnectionManager.swift:11395-11420` |
+| RepoPrompt's OpenCode overlay registers the RepoPrompt server without a `codemode` key and allows `bash` in managed interactive mode. | `Sources/RepoPrompt/Infrastructure/AI/Providers/OpenCode/OpenCodeIntegrationConfiguration.swift:32-41,117-128,293-295` |
 
-### 2.2 Measured usage (this machine, 2026-04-03 to 2026-10-04)
+## 3. Evidence
 
-Source: `Scripts/analyze_tool_usage.py` (Phase 0 analyzer) over native Codex logs (`~/.codex/sessions`, `~/.codex/archived_sessions`) and **every** Claude Code log root (`~/.claude/projects` plus each `~/.claude-rotator/profiles/*/projects`; the analyzer's default reads only the first, which missed 393 of 978 Claude files, so pass every root explicitly with repeated `--claude-root`). Aggregates only; calls are deduplicated by provider and call ID; tokens ≈ characters ÷ 4 is an estimate, not billed tokens. 978 Claude and 3,488 Codex files; 0 malformed, oversized or unmatched outputs. The first draft of this section came from an unreviewed prototype that missed the profile roots and counted replayed outputs; the analyzer reproduces that prototype exactly on the same inputs, and the differences are fully explained in the local report (deduplicating 1,215 replayed outputs and serializing Unicode without escapes, −1.87% characters).
+All numbers are local aggregates; no private session content is quoted. Token figures from client logs are provider-reported, not billing. The full per-arm, per-task and per-turn figures, the method details, and the non-token measurements are recorded in [code-mode lab measurements](../code-mode-measurements.md); this section keeps the decision-relevant summaries.
 
-| Tool | Calls (Codex + Claude) | Share of all tool output | Median / p90 / p99 chars |
-|---|---:|---:|---|
-| `read_file` | 21,379 (13,598 + 7,781) | 27.3% | 3.9k / 15.1k / 53.7k |
-| Native shell (Codex `exec_command` / Claude `Bash`) | 18,661 / 12,407 | 19.5% / 4.6% | 2.4k / 12.7k / 61k; 1.1k / 4.8k / 14.8k |
-| `file_search` | 7,970 (5,559 + 2,411) | 10.7% | 2.7k / 22.2k / 47.4k |
-| Codex `exec` (client-native code mode) | 1,958 | 3.3% | 2.1k / 40.0k / 40.2k |
-| `git` | 1,959 (1,673 + 286) | 0.9% | 0.6k / 6.1k / 27.8k |
-| `get_code_structure` | 651 | 0.9% | 2.2k / 21.3k / 23.6k |
+### 3.1 Usage baseline (2026-04-03 to 2026-10-04)
 
-Total measured tool output is 548M characters; native image and PDF reads inflate the denominator (Claude `Read` 17.1%, Codex `view_image` 9.8%).
+From `Scripts/analyze_tool_usage.py` over 3,488 Codex and 978 Claude Code session files (pass every Claude log root with repeated `--claude-root`).
 
-| Per provider | Codex | Claude Code |
-|---|---:|---:|
-| User turns that used RepoPrompt (of all observed turns) | 1,264 of 5,946 | 988 of 2,235 |
-| RepoPrompt calls per such turn, median / p90 | 17 / 49 | 11 / 48 |
-| Turns with ≥3 direct exploration calls (composition opportunities) | 1,073 | 612 |
-| Exploration chain length, median / p90 | 3 / 19 | 2 / 6 |
-| `read_file` calls with a line range | 71.0% | 73.6% |
-| `read_file` calls that re-read a path already read in the session | 42.5% (34.0M chars) | 50.1% (23.7M chars) |
-| Reads whose path appeared in an earlier same-turn search/structure/tree output (lower bound) | 9.3% | 4.8% |
-| `file_search` outputs flagged truncated (heuristic) | 20.5% | 10.3% |
-| Multi-call assistant batches (native parallelism) | 9,558 | 5,655 |
-| RepoPrompt `git` calls / with `artifacts=true` | 1,673 / 67 | 286 / 65 |
-| Shell Git inspection commands (status/diff/show/log/blame) | 2,269 | 2,202 |
+- `read_file` (21,379 calls, 27.3% of all tool output) and `file_search` (7,970, 10.7%) dominate; the four exploration tools are 88.7% of RepoPrompt's output. RepoPrompt's burden is tool **results**, not tool definitions.
+- Claude Code is a heavy RepoPrompt user (988 RepoPrompt turns, median 11 / p90 48 calls per turn) and already batches calls natively (5,655 multi-call batches).
+- Codex already uses its native code mode on RepoPrompt: 1,452 of 1,958 `exec` scripts call RepoPrompt tools; 513 use `Promise.all`.
+- 42–50% of reads re-read a path already read in the session (58M characters); search→read joins are low (5–9%).
+- Git: RepoPrompt `git` 1,673 (Codex) / 286 (Claude) calls versus 2,269 / 2,202 shell Git inspection commands. Artifact publication is 4% of Codex `git` calls but 23% of Claude's.
 
-- RepoPrompt tools produced 44.1% of all tool output; the four exploration tools produced 88.7% of RepoPrompt's output.
-- Codex `exec` scripts: 1,452 of 1,958 lexically call RepoPrompt tools (2,271 nested call sites, a static estimate; nested results are not logged separately); 513 use `Promise.all`; 361 contain more than one tool call site.
-- RepoPrompt `git` is overwhelmingly plain inspection, while the shell already carries more Git inspection than the tool does in both clients. Artifact publication is 4% of Codex `git` calls but 23% of Claude's, so `git_review_snapshot` matters most for Claude runs.
-- **Correction to the first draft:** Claude Code, which has no native code mode and is the executor's intended cohort, is a heavy RepoPrompt user here (18,367 RepoPrompt calls). The earlier claim that it "barely used RepoPrompt" came from the missing log roots.
-- Re-reads are common (42–50% of reads repeat a path), but the measurement cannot tell whether the content changed or the re-read was avoidable. Search→read joins are low, so the composition win is more likely to come from filtering and summarising inside one script than from search-then-read chaining.
-- Provider-reported tokens exist for 59% of Codex turns and 91% of Claude turns; they are not billing evidence and are not used as a baseline here.
+### 3.2 Prior art
 
-### 2.3 Prior art: OpenCode v2 Code Mode (verified 2026-10-04)
-
-Sources: `anomalyco/opencode` `packages/codemode/{README.md,codemode.md}`, `packages/opencode/src/tool/code-mode.ts` and `src/mcp/catalog.ts` on `dev` (release v1.18.34, 2026-09-30), and the v2 MCP docs page. The v2-branch core adapter (`packages/core/src/tool/{registry,execute}.ts`) is described in `codemode.md` but was not read directly.
-
-| Aspect | OpenCode v2 | This plan | Consequence |
-|---|---|---|---|
-| Exposure | Default for every MCP server: tools are deferred behind one `execute` tool and grouped as `tools.<server>.<tool>`; `mcp.servers.<name>.codemode: false` exposes them directly. v1 ships it behind `OPENCODE_EXPERIMENTAL_CODE_MODE`. | Opt-in `code_mode` over four read-only tools, Agent Mode only. | OpenCode v2 is a *client-side* code-mode host for RepoPrompt, like Codex `exec` (§4.1, §10). |
-| Engine | Owned tree-walking interpreter: TypeScript stripped, Acorn parse, no `eval`; a restricted subset (no classes, generators, timers, `.then` chaining, modules). | Vendored QuickJS-ng with no libc (owner decision 6). | Both give capability confinement, not process isolation. OpenCode trades full JavaScript for full control of the surface; QuickJS-ng gives full ES with engine-enforced heap, stack and interrupt limits, which this plan relies on. No change. |
-| Results inside scripts | Uses `structuredContent` when present; otherwise text blocks joined as a string; never parses text as JSON (an explicit non-goal). `outputSchema` becomes the generated TypeScript signature; without one a tool is `Promise<unknown>`. | D1 adds `outputSchema` + `structuredContent`. | Today OpenCode scripts receive RepoPrompt results as Markdown strings typed `unknown`. D1 directly improves a shipping client, which strengthens D1 independently of D3. |
-| Nested authority | `dev`: each child runs plugin `tool.execute.before/after` hooks and a per-tool permission `ask`. v2 core: leaf tools own authorization; nested calls reuse the outer invocation context and skip registry hooks; "catalog visibility is not execution authorization". | Every child runs the full policy, restriction, admission, contract and observer path (§5.1). | This plan is deliberately stricter, because RepoPrompt is the server and enforces run leases itself. No change. |
-| Output bounding | Only the outer `execute` result is bounded; child results stay complete inside the program. | 2 MiB per imported child, 16 MiB cumulative, 32 KiB final output. | Same principle (bound the model-facing result, not intermediates), with memory caps added for an in-process engine. No change. |
-| Limits | The library sets no defaults (`timeoutMs`, `maxToolCalls`, `maxOutputBytes` are host policy); fixed 8 concurrent calls and 32 nesting levels; OpenCode core sets no timeout or call limit and relies on user cancellation. | Fixed limits (§5.1), 4 concurrent children. | A server-hosted engine cannot rely on a client's cancel button, so fixed limits stay. |
-| Discovery | Token-budgeted catalog (default 2,000 estimated tokens), round-robin across namespaces, plus `tools.$codemode.search`. | Four allowlisted tools, always listed. | Not needed at four tools; revisit only if the allowlist grows. |
-| Claimed benefit | Release notes: fewer tokens and round trips. The widely cited 177,444 → 13,274-token result measured the *first request* of a session with a 97-tool MCP server, i.e. tool-definition overhead. | RepoPrompt's burden is tool *results* (§2.2), not definitions. | OpenCode's headline saving does not transfer; it is not evidence for D3. §6 still has to measure result-volume and round-trip effects directly. |
-| Maturity signals | Open issue #51849: v2.0.18 code mode reports `Unknown tool` for connected stdio servers, while `codemode: false` works. Issue #45349 (`search` missing at runtime) was closed as not planned. | — | If RepoPrompt runs OpenCode v2 in code mode, RepoPrompt tools inherit these failure modes. |
-
-## 3. D1 — Structured results
-
-### 3.1 Settled design
-
-- **Tools first:** `read_file`, `file_search`, `get_code_structure`, `get_file_tree`; `git_review_snapshot` and `code_mode` get schemas when they land. Legacy `git` gets no schema in this plan.
-- **Modes:** `MCPResultDeliveryMode` = `legacy` (no `outputSchema`, no `structuredContent`; today's bytes) or `structuredCompact` (`outputSchema` + `structuredContent` + a summary text of ≤512 UTF-8 bytes with counts, ranges, truncation and warnings). Add `structuredFull` (today's text plus `structuredContent`, no token change) only if a probe shows a client forwards `structuredContent` to scripts but not to the model.
-- **Enablement authority (precedence, resolved once per connection, never persisted):**
-  1. Lease override: `MCPBootstrapLeaseSpec.agentMode(..., resultDelivery:)` set from a default-off per-provider `app_settings` key (e.g. `agent_mode.structured_results.<provider>`), flipped by a person after reading Phase 0 probe evidence. Not version-gated, so experiment arms stay reproducible across CLI releases.
-  2. Probe-backed profile table keyed by handshake client identity and tested version (`auto`). It ships empty and gains rows only from Phase 0 probe artifacts; untested versions fall back to legacy. Identity selects presentation, never permissions.
-  3. Legacy.
-- **No per-call `_structured` argument** (model-controlled, with effects the model cannot observe). No custom initialize capability (no real client sends one, and object values are stripped).
-- **`_rawJSON`:** on legacy connections unchanged; on schema-advertised connections it keeps its exact compact-JSON text and also carries `structuredContent`, because an advertised `outputSchema` is a conformance promise.
-- **Schema source of truth:** hand-written schemas in a new `Sources/RepoPrompt/Infrastructure/MCP/MCPToolOutputSchemas.swift`, matching existing `CodingKeys` and optional/omitted fields, permitting additive properties, and covering truncation, omission counts, retry metadata and `worktree_scope`. A parity test encodes fixture DTOs and checks key sets and primitive types against the schema. No reflection or generator.
-- **Errors:** thrown/contract errors keep `isError: true` and their existing text. DTO-embedded soft errors keep today's `isError` semantics and stay inside `structuredContent`.
-- **Notices:** `structuredContent` carries the unannotated result; delegated-question notices still append once as text (`AgentDelegatedQuestionNoticeWire.splitting`).
-- **Projection site:** one synchronous `makeToolResult(toolName:args:value:mode:)` used by the success exit (`MCPConnectionManager.swift:13102`) and by the error helpers (`:1257-1285`), after `delivery.settle`. Observers still receive the unannotated value.
-
-### 3.2 Changes
-
-- `Tool.swift`: optional `outputSchema: Value?` on both initializers; `MCPWindowToolRuntime.tool(...)`: pass-through.
-- New `MCPToolOutputSchemas.swift`, new `MCPStructuredToolResults.swift` (mode resolution, summary lines, projection).
-- `MCPConnectionManager.swift`: per-connection mode resolution at policy install; `tools/list` sets `MCP.Tool.outputSchema` only for structured connections (separate output-schema cache; not passed through input-schema projection); all result exits go through `makeToolResult`.
-- `AgentModeRunLease.swift`: defaulted `resultDelivery` parameter; provider coordinators read the per-provider setting; `AppSettingsMCPService` registers the keys.
-- Providers for the four tools pass their schema.
-
-## 4. D2 — Git narrowing
-
-### 4.1 Settled design
-
-- **Separate tool, name-based restriction.** Add `git_review_snapshot` (`MCPWindowToolName.gitReviewSnapshot`) in `MCPGitToolProvider`. Op-level gating inside one `git` tool was rejected because it would add a second policy axis (op allowlists, op-dependent schemas and descriptions, execution-time op checks). Name restriction already fails closed in both `tools/list` and `tools/call`.
-- **Snapshot behavior:** fixed `op = diff`, `artifacts = true`, `detail = summary`. Inputs: `compare`, `scope`, `mode`, `repo_root`, `repo_roots`, `repo_key`, `path`, `paths`, `context_lines`, `detect_renames`, with today's defaults and validation. `op`, `artifacts`, `detail`, `inline`, `ref`, `count` and `lines` are rejected by schema and at runtime. It returns `GitToolReplyDTO` through the existing publication, auto-selection, advertisement and cleanup path. It never dispatches a nested call to `git`.
-- **Shared implementation:** refactor the git entry path to take an invocation kind (`full` / `reviewSnapshot`) that supplies the real canonical tool name to the hard-coded authorization identities (`replaceAdvertisedGitArtifactsForCurrentTab`, `invalidateAdvertisedGitArtifactsForCurrentTab`, tab-context resolution, and readiness helpers).
-- **Classification:** admission `.gitRead` (shares connection and per-repository limits with `git`); contract `.workspaceLifecycleCancellable`; annotations local, non-destructive, `readOnlyHint: false` (it writes snapshot files and selection).
-- **Shell signal:** new `AgentRunToolCapabilities` (`nativeShell`, `nativeCodeMode`, each `available | unavailable | unknown`), computed from the final launch configuration after profile, permission and native-tool decisions. `MCPBootstrapLeaseSpec.agentMode` takes a defaulted capabilities value and unions `git` into `restrictedTools` only when `nativeShell == .available`. The MCP layer never learns about shells; the `ConnectionPolicyInstaller` signature does not change.
-
-| Launch | `nativeShell` | Result |
+| Source | What it says or does | Takeaway for this plan |
 |---|---|---|
-| Claude with Bash enabled | available | `git` hidden; snapshot available |
-| Claude with Bash off or `.mcpSafeDefaults` | unavailable | full `git` |
-| Codex Agent Mode | available (unknown if a configuration disables its shell) | `git` hidden |
-| OMP (`--no-tools`) | unavailable | full `git` |
-| OpenCode managed interactive mode (`bash: allow`, `OpenCodeIntegrationConfiguration.swift:293-295`) | available | `git` hidden; snapshot available |
-| OpenCode headless / no-tools modes (`bash` denied, `:321-328`) | unavailable | full `git` |
-| Cursor | unknown until proven | full `git` |
-| Context Builder discovery | unavailable | unchanged full `git` |
-| Knowledge | n/a | unchanged: neither tool (owner decision) |
-| External clients without a lease | unknown | full `git` + snapshot |
+| Armin Ronacher, "Codemode" (2026-10-06), and Pi 1.1 docs (`codemode.md`, `mcp.md`) | Pi runs scripts on the harness in QuickJS/WASM with no network, filesystem or timers; MCP tools default to code-mode exposure (`codemode`, `deferred`, `direct`, `hidden`); scripts get the full `CallToolResult`; tool calls are capped at 4 concurrent; `store`/`load` keep values across scripts; probe 5–10 items, then process the rest. The post asks MCP servers for `structuredContent` + `outputSchema`, results that are consistent regardless of size, and composable tool search. It warns that server-side code mode inside a client's code mode is "pretty bad", that durability is hard, and that smaller models do worse. It publishes no measurements. | Supports D1's "same result, plus structure" shape. Supports restricting D3 to runs where RepoPrompt's tools are called directly, never nested in a client's code mode. Gives no evidence of size of wins, so §3.4 measures it. |
+| OpenCode v2 Code Mode (source on `dev`, release 1.18.34; v2 docs) | Default for every MCP server: tools sit behind one `execute` tool. Scripts receive `structuredContent` when present, otherwise text, and never parse text. Its headline saving (177k → 13k tokens) measured tool-definition overhead with a 97-tool server. Open issue #51849: stdio servers fail with `Unknown tool` in v2 code mode. | OpenCode v2 puts RepoPrompt behind its code mode by default. The headline saving (tool definitions) does not transfer, but the lab found v2's default cheaper for RepoPrompt for other reasons (§3.4, §8). |
+| Codex 0.159 | Its model catalog marks every current model `tool_mode: "code_mode_only"` (only the older gpt-5.5 is not), so all MCP calls run inside `exec`; scripts get typed declarations and the full result. Rewriting the catalog breaks tool discovery (§3.6). The documented key `features.code_mode.direct_only_tool_namespaces` exposes named MCP namespaces as direct tools and removes them from the `exec` surface, while code mode stays on for everything else. | Codex can join D3 through the namespace key; never through the catalog. |
 
-- **Prompts and docs:** Oracle review guidance names `git_review_snapshot` first; shell-enabled prompts direct inspection to the shell; other prompts keep Git guidance. Legacy `git(artifacts: true)` stays for clients that still have `git`.
-- **Rollback:** dropping the capability union restores today's surface; the additive snapshot tool stays.
+### 3.3 Live client probe (2026-10-10)
 
-## 5. D3 — RepoPrompt-owned executor (`code_mode`)
+A stdio fixture returned different sentinels in text (`TXT-…`, a one-line summary) and in `structuredContent` (`STRUCT-…` plus an items array) for the same call.
 
-### 5.1 Settled design
+| Client (handshake `clientInfo.name`, version) | Direct call: model sees | Native script sees |
+|---|---|---|
+| Claude Code (`claude-code` 2.1.281) | **Only `structuredContent` as JSON; the text is dropped** | No native code mode |
+| Codex (`codex-mcp-client` 0.159.0) | Both | Full result (`content`, `structuredContent`, `isError`) |
+| OpenCode (`opencode` 1.18.34) | Text only | `execute` (experimental flag): `structuredContent` only; text dropped |
+| OpenCode v2 (`opencode` 2.0.26, package `@opencode/cli`) | Text only (`codemode: false`) | `execute` (the default): `structuredContent` only; text dropped. Issue #51849 (`Unknown tool` on stdio servers) did not reproduce |
+| Pi (`pi` 1.1.0) | Text only | Full result; scripts often pass it through with `text(JSON.stringify(r))`, so the model then sees both |
 
-- **Tool:** `code_mode` (window tool, `isEnabledByDefault: false`, policy-gated via `MCPPolicyGatedTools`, granted through `AgentModeMCPPolicyInstaller.additionalTools` only under an experiment setting, and only for Agent Mode runs whose `nativeCodeMode` is not `available`). Input: `script` (required string, async function body, ≤32 KiB). Annotation `.repoPromptLocalReadOnly` (allowlist is read-only and selection is suppressed).
-- **Engine:** vendored QuickJS-ng as a C target (`Sources/CQuickJS`, license under the repository's third-party license location), excluding `quickjs-libc` (no `std`/`os`, so no filesystem, network or timers). One fresh runtime per invocation, owned by one dedicated thread; no QuickJS pointer crosses threads; Promise jobs are pumped on that thread; an interrupt handler checks an atomic deadline/cancel flag.
-- **Guest API:** frozen `tools.<name>(args)` for the allowlist ∩ tools visible to this connection; each call resolves to the full normalized envelope (`content`, `structuredContent`, `isError`); dispatch/protocol failures reject. No console accumulation, module loading or persistent store.
-- **Allowlist:** `read_file`, `file_search`, `get_code_structure`, `get_file_tree`. The bridge positively admits only tools classified `.smallRead` or `.fileSearch`; unknown or reclassified tools fail closed, protected by a focused test. Git, snapshot, edits, selection, Oracle, delegation and recursion are excluded.
-- **Limits:** heap 64 MiB; stack 512 KiB; guest CPU 2 s (excluding tool waits); wall 60 s; ≤32 child-call attempts; ≤4 children dispatching concurrently; ≤2 MiB per imported child result (oversize returns an explicit bridge failure, never byte truncation); ≤16 MiB cumulative; final output ≤32 KiB serialized JSON; cancellation cleanup grace 2 s. Reject cycles, unsupported types, non-finite numbers and nesting beyond 64.
-- **Dispatch authority (P2 converged):** retain the per-connection callable already registered with the SDK `CallTool` handler in a registry entry removed on disconnect, and invoke that same callable for children. No extraction of the handler body, no copied handler, no socket loopback.
-  - `@TaskLocal currentToolCallOrigin`: default `.transport` (set at SDK entry); `.codeMode(parentInvocationID, ordinal)` set only by the bridge; not wire-constructible.
-  - Trusted context carries the parent's validated run/tab/worktree identity and binding generation. Children reject `context_id`, `_tabID`, `_windowID`/`window_id` and aliases (`code_mode_routing_override_rejected`), revalidate the pinned binding before each child, and fail with `code_mode_binding_changed` rather than falling back to the active tab.
-  - A typed result sink receives the unannotated settled `Value` exactly once at the success settle site; denials and errors are read from the real `CallTool.Result` envelope.
-  - Every child gets its own invocation ID and delivery transaction and runs the full policy, restriction, ceiling, admission, freshness, contract, observer and cancellation path. Children are child tasks, never detached tasks.
-  - Before any nesting, land the task-locals and nil parent metadata and prove unchanged transport behavior.
-- **Admission (P3 converged):** `code_mode` is classified `.control`; no new lane (lanes are independent, so a parent in `.control` cannot block children in `.smallRead`/`.fileSearch`). Script capacity (1 per connection, 2 process-wide, non-queuing `retryable` rejection) is declared in `MCPToolAdmissionPolicy` beside the classification and acquired in the manager's admission step, shaped like the exclusive mutation lease, never in the provider or bridge. Parent and children count in `admittedCallCount`. Measure control-slot contention before considering a dedicated lane.
-- **Execution contract:** `.bounded(deadline: 62 s, cancellationGrace: 2 s)`, which puts the existing server-side watchdog behind the runner's own 60 s deadline. Children keep their own contracts and inherit the parent's cancellation.
-- **Selection:** trusted origin `.codeMode` suppresses automatic selection at the shared enqueue boundary used by reads and eligible searches. Direct calls are unchanged. The tool description tells callers to select shortlisted material explicitly afterwards.
-- **Delegated-question notices (P6 converged):** children settle with `handOff: false` (strip and release). The parent runs the existing notice attachment/reservation step after its children finish and commits eligible notices once, outside the script output. No reservation-transfer API. Inspect the attachment timing first; add a hook only if it is too early.
-- **Partial failure:** handled child errors are visible to the script; an uncaught error, timeout, memory limit, cancellation, or return while children are outstanding stops new children, cancels queued/running ones through the shared path, and returns `isError: true` with bounded diagnostics and counts (`calls_started`, `calls_completed`, `calls_failed`). Completed reads are not undone. Success returns `CodeModeReplyDTO { output, calls_started, calls_completed, calls_failed }`.
-- **Visibility:** completion observers gain optional `parentInvocationID` and `childOrdinal` (persisted tracking fields optional and absent-decodes-to-nil). The first experiment renders children as flat cards badged "via code_mode"; a grouped parent card follows only if the experiment continues.
+Consequences: a compact summary text (the earlier `structuredCompact` idea) would starve OpenCode and Pi direct callers, and Claude would see JSON regardless. The only safe shape is **text unchanged + `structuredContent`**. For Claude Code that shape still replaces Markdown with JSON on the wire.
 
-## 6. D4 — Measurement
+JSON versus today's Markdown on a 24-call corpus from this repository: `read_file` +3%, `get_file_tree` +2%, `get_code_structure` +6%, `file_search` +72% (JSON keeps full match lines where Markdown truncates to about 160 characters), `git` +82%. Any client that shows the model the JSON pays these deltas.
 
-- **Offline analyzer (exists locally, uncommitted):** `Scripts/analyze_tool_usage.py` (standard library only, streaming, SQLite-on-disk percentiles and deduplication; precedent `Scripts/analyze_claude_raw_events.py`) and `Scripts/test_analyze_tool_usage.py` (17 synthetic-fixture tests). It reports metrics a–k: per-tool, per-provider and per-month sizes in characters and UTF-8 bytes; RepoPrompt and exploration share; per-turn calls and composition opportunities; search→read joins; read ranges and re-reads; search truncation; parallelism; Codex `exec` script statistics; RepoPrompt Git ops versus shell Git; provider-reported tokens; and coverage. Characters ÷ 4 is labelled an estimate. Only aggregate output is kept, locally, never committed. Run it with every Claude log root (§2.2).
-- **Baseline gate (amended 2026-10-04):** the analyzer must reproduce the reference prototype's aggregates exactly on the same inputs and fully decompose every canonical difference. This replaces "reproduce §2.2 within ±2%": the canonical analyzer deliberately corrects replayed-output and Unicode accounting, so some per-metric deltas exceed 2% for explained reasons. Status: met. Invocation counts for `read_file`, `file_search`, `git` and `exec` agree within 0.3%, total characters are −1.87% with an exact decomposition, and two independent runs produced identical JSON.
-- **Structured-content probe:** a debug-only server switch puts distinct sentinels in `structuredContent` and in text for `read_file`; live runs per client/version record which sentinel reaches the model and which reaches native scripts. Results fill the profile table and decide whether `structuredFull` is needed. Clients: Codex (`exec`), Claude Code, and OpenCode v2 when available. From source, OpenCode's code mode hands `structuredContent` to scripts in preference to text (§2.3); the probe confirms this live and records what its direct (`codemode: false`) path shows the model.
-- **D1 gate per client:** model-visible payload plus schema overhead ≤ legacy +5% on the probe corpus, and no garbled or duplicated results; otherwise that client stays legacy.
-- **Executor experiment (agreed design):** 12 fixed, diverse exploration tasks × ≥5 paired, randomized and interleaved repetitions × three arms on Claude Code Agent Mode: A (legacy, no executor), B (structured, no executor), C (structured + `code_mode`). C vs B isolates the executor; B vs A measures D1. Reset source, selection and routing per run; hold Git policy and model settings fixed. Count wrapper output, shell substitutions, retries and natural failures; exclude deliberate fault-injection runs from performance samples. Adoption is measured against predefined multi-tool opportunities, not treatment-observed counts.
-- **Agreed gate components:** zero policy, routing, selection, delivery or sandbox violations; success ≥95% and ≤5 points below B, with a calibration precondition that A and B themselves reach ≥95% on the chosen tasks, and no task where C fails every repetition while B passes every repetition; median and p90 wall time ≤ B +15%; adoption ≥30% of predefined opportunities; natural executor failure ≤10% per invocation; ≤600 tokens of added surface; missing token observations block any cost claim.
-- **Disputed component:** the token criterion (§8.4).
+### 3.4 Controlled lab experiment (2026-10-10)
 
-## 7. Phases
+Harness: `docs/investigations/2026-10-10-codemode-lab/` (local). An MCP proxy in front of `repoprompt_ce_cli_debug` exposes only the four exploration tools and can add `structuredContent` (from `_rawJSON`) and a prototype `code_mode` tool (Node `vm` sandbox; nested results `{text, data, isError}`; 60 s, 32 calls, 32 KiB output). Eight tasks with machine-checked ground truth: three single-lookup, three multi-step, two heavy fan-out (rank or count across 20–30 files). Three repetitions per arm and task. Native file and shell tools are disabled where the host allows it, and violations are counted.
 
-| Phase | Goal | Key changes | Validation | Exit gate |
-|---|---|---|---|---|
-| 0 Baseline and probes | Reproducible numbers; know what clients forward | Analyzer + fixtures + test target (done locally, uncommitted); probe switch; this plan's evidence notes | Analyzer fixture tests (17 pass); `Scripts/check-agent-context`; `Scripts/test-check-agent-context`; `make guardrails` (passed); live probes (Codex, Claude Code, OpenCode v2) | Amended baseline gate met (§6); probe results recorded per client/version (pending) |
-| 1 Structured results (D1) | Opt-in structured delivery | `Tool.outputSchema`, schemas, delivery mode, `makeToolResult`, lease field, settings | `make dev-lint`; focused `MCPStructuredOutputTests` (modes, `_rawJSON`, errors, truncation, `worktree_scope`, notices, every result exit); `make dev-swift-build PRODUCT=RepoPrompt` and `PRODUCT=repoprompt-mcp`; live check with the setting on | Legacy output byte-identical; per-client D1 gate |
-| 2 Git narrowing (D2) | Snapshot tool, then shell-aware restriction | Snapshot tool + shared invocation kind first; then capabilities, lease union, prompts | `MCPGitSurfaceTests` (denial direct and aliased, invalid snapshot args, multi-root/worktree, shared admission, publication failure, cancellation); `AgentRunToolCapabilitiesTests`; existing artifact/Oracle suites; live Oracle review from shell and no-shell runs | Capability matrix passes; Oracle review works in both |
-| 3 Dispatch seam | Nested re-entry with no transport change | Callable registry, origin task-local, typed sink, nil parent metadata | All MCP suites; unfiltered `make dev-test-parallel` | Unchanged transport payloads, routing, errors, cancellation |
-| 4 Executor (experimental) | `code_mode` behind experiment grant | QuickJS-ng target, runtime, bridge, capacity admission, selection suppression, notice timing, flat child cards | `MCPCodeModeRuntimeTests` (globals absent, infinite and microtask loops interrupted, memory and recursion limits, output caps, cancellation); `MCPCodeModeTests` (restricted/ceiling denials, routing overrides rejected, binding change fails, 20 nested reads leave selection unchanged while direct controls enqueue, notice exactly-once, positive class check); both builds; `make guardrails` | Zero bypasses, deadlocks, leaked permits, premature notice commits, unsafe teardown; engine interruption must work or the phase stops |
-| 5 Experiment and decision | Numbers | Run §6 protocol; record results here | Analyzer + in-app counters | §6 gate plus the §8.4 resolution |
-| 6 Promotion (conditional) | Default-on where proven | Grant default, grouped cards, docs | Focused suites per change; `make dev-test-parallel` | Owner sign-off |
+| Host and model | Arms |
+|---|---|
+| Claude Code, Sonnet | `cc_text` (today), `cc_struct` (+`structuredContent`), `cc_cm` (+optional `code_mode`), `cc_cm_only` (only `code_mode`) |
+| Pi 1.1, `gpt-6-sol` (low) | `pi_direct`, `pi_cm` (Pi code mode), `pi_cm_struct` |
+| Codex 0.159, `gpt-6-sol` (low) | `cx_text`, `cx_struct` (code mode is always on) |
+| OpenCode 1.18.34, `big-pickle` | `oc_direct`, `oc_cm` (experimental `execute`), `oc_cm_struct` |
+| OpenCode 2.0.26, `big-pickle` (isolated install) | `oc2_direct` (`codemode: false`), `oc2_cm` (default code mode), `oc2_cm_struct` |
 
-Throughout: never weaken assertions or regenerate the curated XCTest ledger; add surgical ledger rows for new suites; contribution evidence is an unfiltered `make dev-test-parallel`.
+**Metric.** Raw token totals are dominated by cheap cache reads (47–90% of all tokens depending on host), so the comparison uses **price-weighted tokens**: uncached input ×1, cache write ×1.25, cache read ×0.1, output ×5 (Sonnet's relative prices). On Claude this tracks the billed cost closely ($2.36–3.02 per million weighted tokens across all 96 runs). Ratios are the geometric mean over tasks of per-task medians against the host's baseline arm; brackets are 95% bootstrap intervals (resampling repetitions within tasks); below 1 is cheaper.
 
-## 8. Material disagreements and resolutions
+| Host | Change vs host baseline | Single lookup | Multi-step | Heavy fan-out | All tasks | Correct (change / baseline) |
+|---|---|---:|---:|---:|---:|---:|
+| Claude Code | optional `code_mode` (`cc_cm`) | ×1.00 [0.93–1.08] | ×0.95 [0.91–1.11] | ×0.67 [0.27–0.90] | ×0.89 [0.72–1.00] | 96% / 96% |
+| Claude Code | only `code_mode` (`cc_cm_only`) | ×1.29 [1.03–1.32] | ×1.05 [0.87–1.39] | ×0.46 [0.24–0.57] | ×0.93 [0.74–1.01] | 92% / 96% |
+| Claude Code | +`structuredContent` (`cc_struct`) | ×1.02 [0.95–1.09] | ×1.03 [1.02–1.05] | ×1.10 [0.50–1.62] | ×1.04 [0.85–1.15] | 100% / 96% |
+| Codex | +`structuredContent` (`cx_struct`) | ×0.87 [0.64–1.34] | ×0.97 [0.74–1.54] | ×0.89 [0.76–1.39] | ×0.91 [0.81–1.22] | 100% / 100% |
+| Pi 1.1 | Pi code mode (`pi_cm`) | ×2.46 [1.67–3.12] | ×1.50 [1.36–1.84] | ×1.30 [0.77–1.44] | ×1.74 [1.41–1.98] | 100% / 100% |
+| Pi 1.1 | Pi code mode +`structuredContent` | ×3.26 [2.04–3.94] | ×1.73 [1.58–2.23] | ×1.03 [0.61–1.36] | ×1.93 [1.54–2.15] | 100% / 100% |
+| OpenCode 1.18 | experimental code mode (`oc_cm`) | ×1.31 [0.92–1.54] | ×1.24 [0.88–1.49] | ×0.75 [0.57–0.88] | ×1.12 [0.90–1.21] | 92% / 100% |
+| OpenCode 1.18 | code mode +`structuredContent` | ×1.21 [1.03–1.35] | ×1.03 [0.77–1.34] | ×0.71 [0.54–0.84] | ×1.00 [0.86–1.11] | 100% / 100% |
+| OpenCode 2.0.26 | default code mode (`oc2_cm`) | ×0.37 [0.32–0.59] | ×0.39 [0.31–0.55] | ×0.74 [0.46–1.08] | ×0.45 [0.39–0.58] | 100% / 100% |
+| OpenCode 2.0.26 | code mode +`structuredContent` | ×0.58 [0.49–0.98] | ×0.49 [0.42–0.67] | ×0.58 [0.41–0.86] | ×0.54 [0.49–0.72] | 100% / 100% |
 
-### 8.1 P1 — Structured-output enablement authority (converged)
+Correctness: every arm answered at least 92% of runs correctly. Native-tool or shell violations: one run in 360 (OpenCode v2 with structured content). The only task that broke was T7 (rank the five longest of about 28 files). Claude scripts counted lines in the Markdown `text` (header lines included) instead of using the structured value; `cc_cm_only` was wrong in 2 of 3 runs and `cc_cm` in 1 of 3, while `cc_struct` was right in 3 of 3 and `cc_text` in 2 of 3. Two OpenCode v1 code-mode runs timed out.
 
-One lane first proposed an initialize-time capability (`capabilities.experimental[...]`); the other proposed a probe-filled client-identity table plus a per-call `_structured` argument. Round 1: the capability was dropped (no real client sends it, and the pinned SDK path strips non-string values, `MCPInitializeCompatibility.swift:22-24`), and `_structured` was dropped as model-controlled. Round 2 converged on: lease override from a default-off per-provider setting (not version-gated, for reproducible experiment arms) > version-pinned probe table (`auto`) > legacy. `_rawJSON` on schema-advertised connections carries both representations. Resolution: §3.1.
+Findings:
+- **The executor's win is real on Claude, and it comes from heavy fan-out.** Optional `code_mode` costs the same on single lookups, slightly less on multi-step tasks, and about a third less on heavy tasks, where a script replaces about 30 direct reads (T7: 3 turns instead of 31). Forcing scripts for every call (`cc_cm_only`) saves more on heavy tasks but costs 29% more on single lookups and loses correctness. Claude chose the optional tool in 42% of runs, always on heavy tasks and never on single lookups.
+- **Client-side code mode depends on the harness.** Pi 1.1 costs 1.5–2.5× more on single and multi-step tasks, and OpenCode v1's experimental mode costs more on small tasks and saves 25–30% only on heavy ones; their overheads come from tool discovery calls, script writing, and scripts that pass raw results through. OpenCode v2 is the opposite: its default code mode is about 55% cheaper than the same harness with `codemode: false` on every task kind, at 100% correctness. Two effects explain it: with code mode off, the v2 model still searches `execute` for the tools first and wastes turns, and scripts return only what is needed. The v2 harness is also lighter overall (first-step context about 10k tokens versus about 17k for v1).
+- **Structured results are client-specific.** Codex is cheaper with them (×0.91 overall, interval includes 1). Claude is cost-neutral and gets T7 right every time. Pi gets dearer (×1.11 over Pi code mode), because scripts dump the whole result, which then carries both text and structure. OpenCode v2 code mode gets 20% dearer (×1.20 [1.09–1.45] over its own code mode), because scripts then receive the larger JSON instead of Markdown.
+- **Raw-token view, for contrast:** optional `code_mode` looks ×1.09 more expensive on raw totals while it is ×0.89 on price-weighted tokens. Gating on raw totals would have rejected the one real win.
 
-### 8.2 P2 — Nested dispatch authority (converged)
+Limits: eight tasks are a small, exploration-only sample; one model per host; cross-host numbers are not comparable (different models and harness prompts), only ratios within a host; wall time is inflated by shared-window admission because runs share one RepoPrompt window (tokens and turns are unaffected); OpenCode ran unrestricted on a free model; Pi used an OpenAI model because its Anthropic login had expired; the executor was a Node prototype in a proxy, not the in-app QuickJS design.
 
-The choice was a mechanical extraction of the ~1,700-line `tools/call` closure into a transport-neutral dispatcher versus re-entering the registered handler. Both lanes switched sides in round 1. In round 2, retaining and re-entering the same registered callable won: transport behavior is unchanged by construction instead of by review of a very large move, and a non-wire-constructible task-local is as tamper-proof as a parameter (the existing `$currentToolResultDelivery` and `currentConnectionID` precedent). The extraction side's safeguards were kept: explicit trusted context with pinned routing and binding generation, rejected routing overrides, per-child invocation IDs, and real error envelopes. Resolution: §5.1.
+### 3.5 Real-usage checks
 
-### 8.3 P3 — Executor admission (converged after source verification)
+Codex, July 2026 (natural comparison): of turns with at least three exploration calls, 161 turns that used `exec` with RepoPrompt calls versus 128 that used direct calls only. Median input tokens were similar (224k versus 231k), model calls 8 versus 9, and duration 40 s versus 58 s, while tool output was larger (56k versus 21k characters, because scripts often return raw results). This is observational and confounded by task choice: script turns looked faster, not cheaper.
 
-One lane proposed a new `.codeMode` orchestration lane on the premise that exclusive calls wait for other lanes to drain. The plan author verified that lanes are independent limiters and found no such drain (§2.1). Both lanes then accepted `.control` plus a positive child-class check. The round-2 refinement was adopted: script capacity is declared in `MCPToolAdmissionPolicy` and acquired in the manager's admission step, so the admission table stays the single concurrency authority. A dedicated lane is deferred until control-slot contention is measured. The plan author added the `.bounded` contract, because only bounded contracts get the server watchdog (`MCPConnectionManager.swift:12743-12747`). Resolution: §5.1.
+How often real work looks like the heavy lab tasks (Claude Code, 2026-04-03 to 2026-10-10, 1,152 user turns with at least one direct exploration call):
 
-### 8.4 P5 — Executor promotion gate: token criterion (OPEN)
+| Exploration calls in the turn | Share of turns | Share of exploration output |
+|---|---:|---:|
+| 1 | 14.1% | 1.1% |
+| 2–4 | 26.0% | 5.1% |
+| 5–9 | 20.8% | 11.0% |
+| 10–19 | 18.1% | 21.6% |
+| 20+ | 20.9% | 61.2% |
 
-The experiment design and most gate components converged (§6). The token criterion did not:
+Fan-out-sized turns are common: a fifth of exploring turns make 20 or more calls and produce 61% of the exploration output. (Counting only adjacent call chains, as the earlier draft did, understated this, because any other tool call breaks a chain.) Most real 20+ turns read code for understanding rather than counting, so the model must still see much of the content; the lab's heavy-task saving is an upper bound for them.
 
-- **Position A (latest from the lane that kept the larger reductions as gates):** gate on ≥25% less model-visible tool-result volume and ≥20% fewer round trips, with median reported total tokens required **not to increase**. Rationale: the executor's value includes fewer model turns and less context pressure, and a no-increase guard prevents shipping a cost regression without requiring a large billed saving from a 12-task sample.
-- **Position B (latest from the other lane, round 2):** median provider-reported total tokens must be **≥15% lower**, C vs B, paired by task, and lower in ≥10 of 12 tasks (a sign-test floor replacing a bootstrap CI at this sample size); volume and round trips are reported, not gated. Rationale: cost/latency is the executor's sole justification, and the owner's "gated by measurement" requires proof of benefit, not just absence of harm; bytes and round trips can fall while billed tokens or quality regress.
-- The lane holding Position A could not answer round 2 (three `oracle_browser_warning` failures), so Position A is its round-1 statement.
+### 3.6 Provider code mode off, RepoPrompt `code_mode` on (2026-10-10 follow-up)
 
-**Recommendation (plan author):** a two-tier gate. *Promote beyond experimental* only if tokens are ≥15% lower (≥10 of 12 tasks lower), **or** if tokens do not increase and median wall time is ≥20% lower (the round-trip benefit Position A values, measured where the user feels it). *Remain experimental* if tokens do not increase but neither benefit threshold is met. *Withdraw* if tokens increase. Volume and round trips stay reported diagnostics. This keeps Position B's proof-of-benefit requirement while accepting latency as a benefit. Not adopted until the owner decides.
+The owner's proposal: use RepoPrompt's `code_mode` and turn off a provider's own code mode where it has one. Same harness and metric as §3.4; the proxy now answers `initialize` and `tools/list` at once (a slow start had hidden the tools from some Codex runs), and the re-run baselines matched the earlier ones within 3%. Codex arms use RepoPrompt's real Codex launch settings (`features.tool_search=false`, apps, plugins and tool suggestions off) on `gpt-6-sol` at low effort.
 
-### 8.5 P6 — Notices produced during nested calls (converged)
+| Host | Change vs baseline (same model) | Reps | Single | Multi | Heavy | All | Correct | `code_mode` used |
+|---|---|---:|---:|---:|---:|---:|---:|---:|
+| Codex | RepoPrompt tools direct (namespace key) + optional `code_mode`, vs native code mode | 5 | ×0.76 | ×0.77 | ×0.93 | ×0.80 [0.62–1.03] | 40/40 | 19/40 (multi and heavy only) |
+| Codex | RepoPrompt tools direct, no `code_mode`, vs native code mode | 5 | ×0.74 | ×1.40 | ×1.81 | ×1.18 [0.83–1.35] | 40/40 | — |
+| Codex | Native code mode + nested `code_mode`, vs native code mode | 3 | ×1.20 | ×1.06 | ×1.08 | ×1.12 [0.92–1.38] | 24/24 | 12/24 |
+| Codex | Catalog rewrite (`tool_mode` removed) | 2 | — | — | — | — | 4/16 | 12 of 16 runs never reached the tools |
+| Codex gpt-5.5 (no `code_mode_only`) | direct + optional `code_mode`, vs direct | 3 | ×1.00 | ×0.78 | ×0.46 | ×0.75 [0.61–1.13] | 24/24 | 8/24 |
+| Pi 1.1 | RepoPrompt server `exposure: direct` + optional `code_mode`, vs Pi direct | 3 | ×0.71 | ×1.19 | ×0.80 | ×0.89 [0.68–1.10] | 24/24 | 12/24 |
+| Pi 1.1 | the same, vs Pi's own code mode | 3 | ×0.40 | ×0.76 | ×0.61 | ×0.56 [0.45–0.67] | 24/24 | — |
 
-Transferring child notice reservations into the parent transaction was rejected as unnecessary machinery. Children settle with `handOff: false`, and the parent's existing reservation step runs after its children finish. The contract test: a notice becomes pending during a child, the script returns an unrelated constant, no further tool call occurs, and the parent result carries the notice exactly once (plus cancellation and competing-transport cases). Resolution: §5.1.
+Findings:
+- **Codex can turn its code mode off for RepoPrompt alone,** through `features.code_mode.direct_only_tool_namespaces` (documented in the 0.159 config schema). Verified with the lab server (`mcp__rp`) and with the real `RepoPromptCE` server (`mcp__RepoPromptCE`): calls arrive as direct function calls while `exec` stays available for other tools. The catalog rewrite is not usable: the model often emits a `tool_search_tool` call that Codex rejects, then gives up.
+- **On Codex, direct RepoPrompt tools need `code_mode`.** Without it, multi-step and heavy tasks cost 40–81% more than Codex's own code mode; with it, every kind is cheaper and the run passes the §7 gate. The saving is not yet proven (the interval reaches 1.03).
+- **Nesting stays bad,** as Ronacher warned: `code_mode` inside Codex's code mode is dearer in every kind.
+- **On Pi, RepoPrompt's `code_mode` beats Pi's own code mode clearly** and is close to Pi direct (multi-step ×1.19 breaches the +10% bound at 3 repetitions). Pi ran an OpenAI model only.
+- Models used `code_mode` only on multi-step and heavy tasks (Codex 19 of 40 runs, Pi 12 of 24), never on single lookups, as on Claude.
 
-### 8.6 Minor points settled by the plan author
+Oracle consultation (OracleD and OracleE, independent): both reject the catalog rewrite and nesting, keep OpenCode v2 native, and ask for per-run eligibility rather than per-provider; OracleE pointed to the namespace key, which the lab then verified. Blind spots both raised: understanding-heavy and edit-interleaved turns, Opus and higher reasoning effort, long sessions and caching, failure and timeout cost, admission contention, the Node→QuickJS-ng behavior gap, and engine containment.
 
-- P4 (Knowledge grants) was closed by the owner: unchanged.
-- Executor allowlist excludes `git` (it is `.gitRead` and `artifacts` mutates the tab); this also removes a legacy-`git` schema from D1's scope.
-- Tool names `code_mode` (matches the owner's and Pi's terminology) and `git_review_snapshot`; both renameable before Phase 2/4 lands.
-- Limits use the tighter set from §5.1 (32 child calls, 512 KiB stack, 32 KiB output, 2 s guest CPU).
-- `.bounded` execution contract for `code_mode` instead of `.longSynchronousCancellable`.
-- Flat child cards first; grouped parent cards only on promotion.
-- Measurement evidence stays local and aggregate-only; it is never committed (consistent with the `docs/investigations` rule in `AGENTS.md`).
+### 3.7 Blind-spot follow-up (2026-10-10)
 
-## 9. Risks
+The reviewers' blind spots, measured the same day by three lab workers and the session runner (about 900 more runs; same metric; Codex arms use RepoPrompt's real launch config). Repo HEAD `d4cbd9d1`.
 
-- **Beneficiary population (revised 2026-10-04):** Claude Code, the executor's cohort, is a substantial RepoPrompt user on this machine (988 RepoPrompt turns, median 11 and p90 48 RepoPrompt calls per turn, 612 composition opportunities). It already batches calls natively (5,655 multi-call batches), so the executor's gain must come from filtering and chaining rather than parallelism. Codex and OpenCode v2 have client-side code mode and stay outside the cohort. The experiment may still legitimately end in "remain experimental".
-- **OpenCode v2 default code mode:** RepoPrompt's ephemeral OpenCode overlay registers the RepoPrompt server without a `codemode` key (`OpenCodeIntegrationConfiguration.swift:32-41,117-128`). Under OpenCode v2 that silently moves every RepoPrompt tool behind OpenCode's `execute`, inheriting its known defects (§2.3) and changing what the model sees. The locally installed OpenCode is 1.18.34 (v1), so this has not been observed yet.
-- **Client handling of structured results:** clients may duplicate or ignore `structuredContent`; contained by default-off delivery and per-client probes.
-- **Selection semantics:** suppressed nested selection means Oracle context must be selected explicitly after a script; the description must say so.
-- **In-process engine:** QuickJS gives capability and resource isolation, not process isolation; the Phase 4 adversarial suite blocks integration on any interruption or cleanup failure.
-- **Surface change for shell runs:** prompts must move to the shell and `git_review_snapshot` before narrowing is enabled; stale tool lists cannot bypass call-time denial.
-- **Hydrated pre-change run policies** lack the new restriction until the next launch (harmless).
+| Blind spot | Setup | Result (cost ratio, code-mode arm vs its baseline) | Correctness (code mode / baseline) |
+|---|---|---|---|
+| Understanding and edit tasks (3 trace-the-behaviour tasks, 3 return-a-diff tasks; 5 reps) | Claude Sonnet | understand ×1.04 [0.90–1.20], edit ×0.94 [0.88–1.09] | 28/30 / 28/30 |
+| | Codex low | understand ×0.81 [0.71–0.87], edit ×0.75 [0.62–0.81] | 22/30 / 24/30; majority lost on E3 |
+| Opus and high effort (3 reps) | Claude Opus, T1–T8 | ×0.96 [0.72–0.99]; heavy ×0.71 | 24/24 / 24/24 |
+| | Claude Opus, understand/edit | ×1.00 [0.93–1.10] | 18/18 / 18/18 |
+| | Codex high, T1–T8 | ×0.75 [0.62–1.11] | 24/24 / 24/24 |
+| | Codex high, understand/edit | ×0.73 [0.66–0.85] | 16/18 / 17/18 |
+| Long sessions (6 turns, resumed CLI session, 3 orders × 2 reps) | Claude Sonnet | session total ×0.70 [0.62–0.79] | 32/36 / 36/36 |
+| | Codex low | session total ×0.84 [0.70–1.00] (corrected 2026-10-12, §3.9) | 36/36 / 36/36 |
+| Failures: 15% transient errors (F1) / 20% calls slowed 10 s (F2), same faults on direct and nested calls (3 reps) | Claude | F1 ×0.80, F2 ×0.69 | loses T8 (F1) and T7 (F2) |
+| | Codex | F1 ×0.73, F2 ×0.68 | no task lost |
 
-## 10. Open questions
+Findings:
+- **The savings hold or grow.** Codex is cheaper with `direct + code_mode` on every new dimension. Claude saves most in long sessions (fewer raw results stay in context, so later turns are cheaper); on understanding and edit tasks it is cost-neutral, which is acceptable because the tool is optional.
+- **Every correctness loss traces to two fixable executor behaviours.** (1) Scripts count lines in the Markdown `text` instead of `data.total_lines`; in sessions the model then reuses the wrong method on later turns (all 4 Claude session failures). (2) Failed nested calls are silently treated as empty: 11 of 13 Claude and 7 of 10 Codex scripts that hit a failed call still reported success, and timeouts threw away all finished work. Codex re-issued every failed script and stayed correct.
+- **Codex E3 loss is a search-output problem, not a script problem.** The model built its diff from `file_search` context snippets, whose tree prefix and `▶` match marker shift indentation, so the diff did not apply; the baseline failed the same way in 2 of 5 runs. Code-mode runs lean on search snippets more.
+- **Read-slot contention:** the 2-per-window small-read cap is the ceiling. 32 reads took 1.80 s serial, 1.40 s with 2 in flight, 1.33 s with 4, 1.56 s with 8. Admission is FIFO with no starvation, but a foreground `read_file` p50 rose from 52 ms to 177/310/664 ms with 1/2/4 background scripts on the same connection (113/169/399 ms on separate connections).
+- **QuickJS-ng 0.17 (built without libc, C host on the planned protocol):** 167 harvested real scripts gave identical results to Node (no engine-caused difference; nested call counts equal for all 167). Differences in a 74-expression probe: no `Intl` (locale formatting, `localeCompare`) and different error wording. 286 adversarial runs: CPU spins, async spins and catastrophic regex stop at 2 s guest CPU (the interrupt fires inside the regex engine and cannot be caught), never-settling promises are detected in about 5 ms, heap stays at the 64 MiB limit, recursion stops at 1,022 frames, at most 4 calls reach the bridge, no calls after the deadline, and patching `tools`, `JSON` or `Promise` cannot affect the bridge. The Node prototype failed most of these (no CPU or memory limit, host `process` reachable, forged protocol frames); it also lost results over about 64 KiB (a handful of lab scripts), so earlier lab numbers are slightly pessimistic for code mode.
 
-1. **§8.4 token criterion for promoting `code_mode`** — choose Position A, Position B, or the recommended two-tier gate.
-2. Approve the tool names `code_mode` and `git_review_snapshot`.
-3. Cursor shell availability: keep `unknown` (full `git`) until verified? (OpenCode resolved from source: the managed interactive mode allows `bash`; headless and no-tools modes deny it.)
-4. Accept the spec-SHOULD deviation of a ≤512-byte summary text instead of serialized JSON in `structuredCompact` mode?
-5. Should a later phase enroll OMP (fixed `--no-tools` profile, no native code mode) in the executor experiment?
-6. Phase 0 must confirm that Codex `exec` scripts and Claude Code actually receive `structuredContent`. From source, Pi and OpenCode code mode both pass it to scripts. Without that confirmation for Codex and Claude, D1 benefits only the owned executor and OpenCode.
-7. **OpenCode v2 overlay policy:** when RepoPrompt launches OpenCode v2, should the overlay pin `codemode: false` for the RepoPrompt server (keep today's direct surface and avoid issue #51849), or accept OpenCode's default and set `nativeCodeMode = available`? Recommendation: pin `false` until an OpenCode v2 probe passes, then decide per version. Also confirm whether OpenCode v1 tolerates the `codemode` key before writing it unconditionally. This is a provider-integration change outside D1–D4 and needs the owner's call.
-8. **Re-read volume:** 42–50% of `read_file` calls re-read a path already read in the session (58M characters combined). Is a separate investigation into read deduplication (for example unchanged-content markers) worth opening? It is out of scope here and may be a larger lever than D3.
+Reports and data: `docs/investigations/2026-10-10-codemode-lab/` (local): `reports/new_tasks.md`, `reports/contention_faults.md`, `reports/qjs.md`.
+
+### 3.8 Phase 3 gate run (2026-10-11)
+
+The lab executor was swapped for the QuickJS-ng host (built without libc) with the §6 rules: data-first child results from one tool call, failed calls reject (opt-out `{allowError: true}`) with a failure footer, one executor retry, partial output on timeout, 2 calls in flight, 32 calls, 32 KiB output, and the §6 description. Baselines re-ran in the same window. Claude long sessions ran as one stream-json process per session, as Agent Mode drives Claude. About 570 runs.
+
+| Host | Set | Reps | Single | Multi | Heavy | All | Correct (code mode / baseline) |
+|---|---|---:|---:|---:|---:|---:|---:|
+| Claude Sonnet | T1–T8 | 5 | ×1.01 [1.00–1.09] | ×0.74 [0.72–0.90] | ×0.58 [0.25–0.74] | ×0.78 [0.64–0.87] | 68/70 / 66/70 over all 14 tasks |
+| | understand / edit | 5 | | | | ×0.94 / ×1.05; ×1.00 [0.89–1.13] | |
+| | 6-turn sessions | 2 × 3 orders | | | | ×0.66 [0.56–0.79] | 36/36 / 34/36 |
+| | 15% injected errors | 3 | ×1.22 | ×0.78 | ×0.73 | ×0.82 [0.71–0.87] | 18/18 / 18/18 |
+| Codex gpt-6-sol | T1–T8 | 5 | ×0.45 [0.41–0.78] | ×0.66 [0.54–0.98] | ×0.55 [0.39–0.86] | ×0.55 [0.49–0.71] | 67/70 / 68/70 over all 14 tasks |
+| | understand / edit | 5 | | | | ×0.79 / ×0.73; ×0.76 [0.66–0.87] | |
+| | 6-turn sessions | 2 × 3 orders | | | | ×0.79 [0.62–0.93] (corrected 2026-10-12, §3.9) | 36/36 / 36/36 |
+| | 15% injected errors | 3 | ×0.47 | ×0.62 | ×0.51 | ×0.55 [0.48–0.68] | 18/18 / 17/18 |
+
+Gate (§7) over all 14 tasks: Claude single ×1.01, multi ×0.90, heavy ×0.68; Codex ×0.45, ×0.70, ×0.65; no task lost its majority on either host, with or without injected errors. **Both hosts pass**, and the savings are now shown (intervals below 1) for Claude on T1–T8 and sessions and for Codex everywhere. The fixes removed every earlier correctness loss: under injected errors the executor retried 36 failed calls and surfaced the 6 that still failed; no script timed out. Models used `code_mode` in 20% (Claude) and 69% (Codex) of single-task runs.
+
+Codex on the app-server path (owner's shim, RepoPrompt's real override set, computer use on and off): the namespace key in the thread-level config makes the RepoPrompt tools direct calls in every run; without it they run inside `exec`; no tool-search failures. Lab details: `reports/qjs.md` (v2 executor) and `reports/appserver.md`.
+
+### 3.9 Long sessions and Claude resume (2026-10-12)
+
+QuickJS-ng executor as in §3.8; Codex 0.162.0-alpha through the owner's shim; 204 more turns. Full per-turn tables, cumulative cost and context per turn: [code-mode lab measurements](../code-mode-measurements.md) §4–§5.
+
+| Host | Session | Paired sessions | Session total | Context at end (code mode / baseline) | Correct turns (code mode / baseline) |
+|---|---|---:|---|---|---:|
+| Claude Sonnet, `--resume` per turn | 6-turn T-only (S1–S3) | 6 | ×0.71 [0.54–0.93] | 67k / 78k | 36/36 / 35/36 |
+| Claude Sonnet, stream-json | 11-turn mixed (T1–T8 + U1–U3) | 3 | ×1.01 [0.97–1.08] | 144k / 143k | 33/33 / 33/33 |
+| Codex | 11-turn mixed | 3 | ×0.85 [0.77–0.90] | 54k / 65k | 31/33 / 32/33 |
+
+Findings:
+- **Codex session figures were overstated by the harness, not by Codex.** `codex exec resume` reports each turn's usage as the cumulative thread total (checked against the per-request usage in Codex's rollout files on 0.159 and 0.162); earlier session totals summed those running totals. Per-turn usage gives §3.7 ×0.84 [0.70–1.00] and §3.8 ×0.79 [0.62–0.93]; the conclusions stand.
+- **Codex keeps its saving at 11 turns** and carries 17% less context forward. Single-turn ratios scatter but do not drift upward with session length.
+- **Claude resume through the owner's shim works** (stream-json output; 72/72 turns) and agrees with the stream-json process: ×0.71 versus ×0.66 on the same sequences.
+- **Claude's long-session saving depends on the mix.** On the 11-turn mixed session it is cost-neutral (within the +10% bound): understanding turns are half of the session's cost and run ×1.07; fan-out turns save less in a session (×0.83) because earlier turns already loaded the files for the baseline too; and Claude chose `code_mode` in only 4 of 33 turns. The 6-turn T-only saving (×0.66–0.71) is the fan-out-heavy end, not the typical session.
+- Codex missed U3 (the 27-check trace task) twice with code mode and once without, each time on a single check; no other turn failed.
+
+## 4. D1 — Structured results
+
+- **Shape (one, no modes):** today's text content unchanged, plus `structuredContent` (the existing DTO encoded as JSON) and an `outputSchema` in `tools/list`. Errors keep `isError: true` and their text. Delegated-question notices stay text-only. `_rawJSON` keeps its exact text and also carries `structuredContent` when schemas are advertised.
+- **Tools:** `read_file`, `file_search`, `get_code_structure`, `get_file_tree`; later `git_review_snapshot` and `code_mode`. Legacy `git` gets no schema.
+- **Enablement:** one app setting `mcp.structured_results` = `off` (default) | `on`, read when a connection is set up. A change applies to the next connection, because once `outputSchema` is advertised the connection must keep returning `structuredContent`. No client table ships. If a host later passes the §7 gate, a small table keyed by handshake client name may be added; the name would select presentation only, never permissions.
+- **Why ship it while it is off by default:** the executor (D3) needs the structured value for nested results regardless of this setting (the setting governs wire output only); Codex was about 9% cheaper with it, and Claude answered the heavy ranking task correctly every time with it (§3.4). Pi and OpenCode v2 scripts got dearer with it (they consume `structuredContent`, which is larger than the Markdown), so it is not a universal default.
+- **First candidates:** Codex (`codex-mcp-client`), then Claude Code, each after a confirming §7 run at 5 repetitions. Enabling for one host but not another needs the client-name table above; until then the setting is global.
+- **Schemas:** hand-written in a new `MCPToolOutputSchemas.swift`, permissive about additional properties, with a parity test that encodes fixture DTOs and checks keys and primitive types. No generator.
+- **Projection:** one `makeToolResult(toolName:args:value:structured:)` used by the success exit (`MCPConnectionManager.swift:13102`) and the error helpers.
+- **Dropped from earlier drafts:** `structuredCompact` summary text, the per-provider lease override, version-pinned probe tables, an `auto` client table, a per-call `_structured` argument, and a custom initialize capability.
+
+## 5. D2 — Git narrowing
+
+- **New tool `git_review_snapshot`:** fixed `op = diff`, `artifacts = true`, `detail = summary`; accepts `compare`, `scope`, `mode`, `repo_root(s)`, `repo_key`, `path(s)`, `context_lines`, `detect_renames`; rejects everything else. It reuses the existing publication, auto-selection and cleanup path through a shared invocation kind (`full` / `reviewSnapshot`) that passes the real tool name to artifact authorization. Admission `.gitRead`, contract `.workspaceLifecycleCancellable`, not read-only (it writes snapshot files and selection).
+- **Shell signal:** one boolean `runHasNativeShell`, computed from the final launch configuration. When true, the Agent Mode lease adds `git` to `restrictedTools`. The MCP layer never learns about shells. RepoPrompt cannot see a user's own Claude Code permission rules, so a user who denies Bash there must turn off RepoPrompt's Bash preference to get `git` back; the Agent Mode docs must say so.
+
+| Launch | Shell | Result |
+|---|---|---|
+| Claude with Bash | yes | `git` hidden; snapshot available |
+| Claude with Bash off or `.mcpSafeDefaults` | no | full `git` |
+| Codex Agent Mode | yes | `git` hidden |
+| OpenCode managed interactive (`bash: allow`) | yes | `git` hidden |
+| OpenCode headless / no-tools, OMP (`--no-tools`), Cursor (until verified), external clients | no or unknown | full `git` + snapshot |
+| Context Builder discovery | no | unchanged: must not gain the snapshot; Phase 2 confirms how its tool set is bounded |
+| Knowledge | n/a | unchanged: its closed allowlist (`AgentSessionProfile.swift:16-27`) already excludes both new tools |
+
+- **Prompts:** Oracle review guidance names `git_review_snapshot` first; shell-enabled prompts send inspection to the shell.
+- **Rollback:** drop the restriction; the snapshot tool stays.
+
+## 6. D3 — `code_mode` executor (experimental)
+
+- **Who gets it:** Agent Mode runs in which RepoPrompt's tools are called **directly**, never from inside a client's code mode. Eligibility is a per-run fact computed from provider, resolved model and final launch configuration (next to `runHasNativeShell`); the handshake client name plays no part, and an unknown capability means no `code_mode`. Knowledge and Context Builder discovery never get it. It is always **offered alongside** the direct tools: `cc_cm_only` shows that forcing scripts for every call costs 29% more on single lookups and loses correctness, while optional exposure let models use scripts where they pay (multi-step and heavy runs only, on every host).
+- **Per-provider setting** ("RepoPrompt tools": `native` | `direct + code_mode`), default `native` until that provider passes §7 at 5 repetitions; it applies from the next run:
+
+  | Provider | `native` (default) | `direct + code_mode` |
+  |---|---|---|
+  | Claude Code | Direct tools (no native code mode) | Adds optional `code_mode` |
+  | Codex | RepoPrompt tools inside Codex's `exec` | Registers a second, read-only RepoPrompt server entry (the four exploration tools plus `code_mode`), lists its namespace in `features.code_mode.direct_only_tool_namespaces` in the thread-level config, and leaves the main RepoPrompt server inside `exec`. Exposing the whole RepoPrompt catalog directly adds about 15k prompt tokens per model request (31.7k vs 16.8k on the first request; the 5-tool lab server adds about 1.5k), which would erase the saving. The namespace is `mcp__` plus the server name with `-` turned into `_`, case-sensitive; a wrong name silently falls back to `exec`, so verify the direct tools on the first turn. Verified on the app-server path through the owner's shim, with computer use on and off (2026-10-10). Never rewrite the model catalog or `tool_mode`. Without `code_mode`, direct RepoPrompt tools are dearer than native (§3.6), so the two always switch together |
+  | Pi (future provider) | Pi's code mode | Writes `exposure: direct` for the RepoPrompt server and adds `code_mode`; confirm the model cannot also reach RepoPrompt tools from Pi's own scripts |
+  | OpenCode v2 | OpenCode's code mode | Not offered (native is about 55% cheaper than direct; replacement is research only) |
+
+- **Codex structured results interplay:** in direct mode Codex showed the model only `structuredContent` (§3.3, probed through the catalog rewrite; re-probe with the namespace key), so D1 on Codex changes what direct calls look like; gate D1 and `direct + code_mode` on Codex together.
+- **Tool:** `code_mode(script)`; the script is an async function body of at most 32 KiB.
+- **Nested result shape (decide in Phase 3):** the lab's heavy-task correctness loss came from scripts counting lines in the Markdown `text` (seven header lines too many) while `data.total_lines` was available; the prototype description offered `data` but did not tell models to prefer it. Candidates: (a) `{text, data, isError}` with a description that says to read fields from `data`; (b) data-first, OpenCode's choice: `{data, isError}` when a structured value exists and `text` only as a fallback. Pick the candidate that passes §7 on the prototype; §3.7 makes (b) the leading candidate (the same text-counting error recurred in sessions and propagated to later turns). Either way, each child result comes from one tool call (the prototype's second `_rawJSON` call halved read capacity), and the description tells models to probe a few items before looping over many, to use `Promise.all` for independent calls, to count lines with `data.total_lines`, to check failures and retry only failed items, that there is no `Intl` (sort with explicit comparators), and to return only the aggregate.
+- **Engine:** vendored QuickJS-ng without `quickjs-libc` (no filesystem, network or timers); one runtime per call on a dedicated thread; interrupt handler for deadline, cancel and guest CPU (thread CPU time, counted only inside JS); `JS_NewContextRaw` with only the needed intrinsics; frozen, non-configurable `tools`; host-side argument serialization through C APIs (never through guest `JSON`); a never-settling script (no jobs, nothing in flight) ends at once. Validated in the lab (§3.7): parity with Node on 167 real scripts and containment on 286 adversarial runs.
+- **Allowlist:** `read_file`, `file_search`, `get_code_structure`, `get_file_tree`, admitted only if classified `.smallRead` or `.fileSearch` (fails closed otherwise).
+- **Limits:** 60 s wall, 2 s guest CPU, 64 MiB heap, 1 MiB stack, 32 nested calls, **2 in flight** (the small-read window cap; 4 or 8 bought at most 5% and multiplied foreground queueing, §3.7), 2 MiB per child result, 32 KiB final output, argument object at most 64 KiB. Exceeding the output cap, the heap or any other limit returns `isError: true` with call counts; nothing is truncated silently. About 5% of real scripts produced more than 32 KiB and about a fifth made 28–29 nested calls, so keep the limits visible in the description.
+- **Dispatch:** children re-enter the connection's registered `tools/call` handler with a non-wire task-local origin, so each child runs the full policy, restriction, admission, contract, observer and cancellation path. Children may not override routing (`context_id`, `_tabID`, `_windowID`). Automatic selection is suppressed for children; the description tells callers to select shortlisted files afterwards.
+- **Admission:** parent classified `.control` with a script cap of 1 per connection and 1 per window; the parent never holds a read slot while awaiting children; contract `.bounded(62 s)`. Optional: admit direct calls ahead of queued script children.
+- **Failure:** a nested call that fails rejects by default (scripts may opt into `{allowError: true}`), and the result always ends with a failure footer listing failed calls (also in `structuredContent`). Retry transient read errors once inside the executor. On timeout or cancel, stop new children and return the partial output plus completed, in-flight and failed call counts, marked as a timeout; never discard finished work. In the lab, silent success with failed children caused every code-mode correctness loss under injected faults.
+- **Visibility:** child calls appear as flat transcript cards marked "via code_mode".
+- **Notices:** children release delegated-question notices; the parent attaches them once after its children finish.
+
+## 7. D4 — Measurement and the gate
+
+- **Usage analyzer:** `Scripts/analyze_tool_usage.py` with 17 fixture tests. Re-run it after each phase to watch real usage.
+- **Lab harness:** §3.4. Re-run it for every default change and for new client versions. It reports tokens, turns, tool calls, correctness, violations and wall time per arm, paired per-task ratios, and a per-kind gate view.
+- **Reproducibility:** the lab harness is local and uncommitted today. Before a gate decision depends on it, commit it under `Scripts/` (without logs or credentials) with a short README, so someone else can re-run a gate.
+- **One gate for every default change** (D1 per host, D3 promotion), always against that host's baseline arm (today's tools, no executor, no structured content):
+  1. **Correctness:** for each task, the change is correct in a majority of repetitions wherever the baseline is. Zero violations: no native shell or file use where disabled, no honored routing override, no selection change caused by a nested call.
+  2. **Cost, per task kind:** in each kind (single lookup, multi-step, heavy fan-out), the geometric mean of per-task median **price-weighted tokens** (§3.4) is at most 10% above the baseline. Raw token totals, turns and wall time are reported, not gated: raw totals are dominated by cheap cache reads and would have rejected the one real saving, and wall time is noisy while runs share a window.
+  3. **Claimed savings must show:** a change justified by savings must lower price-weighted tokens on the kind it targets, with the 95% bootstrap interval below 1.
+  4. **Repetitions:** at least 5 per arm and task for a gate decision (the 2026-10-10 run used 3 and is exploratory).
+- **Missing data blocks the claim, not the work:** if a host cannot be measured, its default stays off.
+
+## 8. Phases
+
+| Phase | Changes | Validation | Exit |
+|---|---|---|---|
+| 0 Evidence | Analyzer, lab harness, this plan | Analyzer tests (17 pass); `Scripts/check-agent-context` | Done; commit the lab harness before a gate decision relies on it |
+| 1 D1 | `Tool.outputSchema`, schemas, `makeToolResult`, `mcp.structured_results` (default off) | `make dev-lint`; focused `MCPStructuredOutputTests` (text byte-identical, errors, truncation, `_rawJSON`, notices); `make dev-swift-build`; lab re-run against the real app | Output byte-identical with the setting off |
+| 2 D2 | Snapshot tool, then shell restriction and prompts | `MCPGitSurfaceTests` (including `tools/list` for Knowledge and discovery runs); existing artifact and Oracle suites; live Oracle review from a shell run and a no-shell run | Oracle review works in both; Knowledge and discovery unchanged |
+| 3 D3 prototype decision | **Done 2026-10-11: passed on Claude Code and Codex (§3.8); continue to Phase 4.** No app code. Done 2026-10-10 (§3.6–3.7): understanding and edit tasks, Opus and high effort, long sessions, injected faults, contention, QuickJS-ng parity and containment. Remaining: swap the lab bridge to the QuickJS-ng host with the §6 fixes (data-first results, failure rejection and footer, partial output on timeout, 2 in flight, one call per child), then re-run T1–T8 + U/E at 5 repetitions, the long sessions, and fault profile F1 for Claude Sonnet and Codex; run Codex once through RepoPrompt's app-server launch and the owner's shim | §7 gate per host, plus zero correctness loss under F1 | Continue for the hosts that pass; stop D3 if none passes and record the result here |
+| 4 D3 seam | Re-entry callable, origin task-local, typed result sink; lease carries the per-run eligibility; Codex overrides add the namespace key only in `direct + code_mode` (tests for CLI and app-server override parity) | All MCP suites; `make dev-test-parallel` | Transport behavior unchanged |
+| 5 D3 executor | QuickJS-ng target, bridge, limits, selection suppression, cards | Runtime tests (no globals, loops interrupted, memory, output caps, cancel); bridge tests (denials, routing overrides rejected, selection unchanged, notice once, absent from Knowledge and discovery); `make guardrails` | No bypass, leak or deadlock |
+| 6 Decide | Lab re-run with the in-app executor | §7 gate | Owner sign-off on the default |
+
+Throughout: never weaken assertions; leave the frozen XCTest ledger alone.
+
+**OpenCode v2 note (provider work, outside D1–D4):** when RepoPrompt launches OpenCode v2, keep OpenCode's default code mode for the RepoPrompt server (do not write `codemode: false`): the lab shows the default about 55% cheaper at equal correctness, and the stdio `Unknown tool` defect did not reproduce on 2.0.26. Keep D1 off for OpenCode v2 (structured content made its scripts dearer). v2 is a separate package (`@opencode/cli`) with its own config shape (`mcp.servers.<name>`); the overlay must target it explicitly. Two harness facts from the lab: v2 waits on stdin unless it is closed, and it resolves its workspace from `PWD`, not the process working directory.
+
+## 9. Decisions log
+
+- 2026-10-03: The owner decisions above. The Git design uses a separate snapshot tool rather than op-level gating. Nested dispatch re-enters the registered handler rather than extracting it. Executor admission uses `.control` plus a script cap. Child notices release, and the parent attaches them once.
+- 2026-10-10: The promotion-gate dispute (≥15% token saving versus no-increase) is replaced by the single §7 gate, measured per task kind in price-weighted tokens. D1 drops the compact mode and the lease and probe precedence for one default-off setting. D2's tri-state capability becomes a boolean. D3 is limited to clients without native code mode, is always optional, and gets a prototype decision step before the engine is built. Independent review (OracleD) shaped the per-kind gate, the default-off D1, the lease-based D3 exposure and the phase order. The OpenCode v2 recommendation flipped from "pin `codemode: false`" to "keep the default" after the 2.0.26 lab run.
+- 2026-10-10 (follow-up, owner question "why Claude only, what about Codex?"): D3 eligibility changes from "provider without native code mode" to "RepoPrompt tools called directly", with a per-provider `native` | `direct + code_mode` setting. Codex qualifies through `features.code_mode.direct_only_tool_namespaces` (§3.6: ×0.80 at 5 repetitions, 40/40 correct); Pi through `exposure: direct`; OpenCode v2 stays native. Rejected: rewriting Codex's model catalog (4/16 correct) and nesting `code_mode` inside a client's code mode (×1.12). OracleD and OracleE consulted independently; OracleE found the namespace key.
+- 2026-10-10 (blind-spot follow-up, §3.7): the Oracles' blind spots were measured. Savings hold for Codex on every dimension and grow for Claude in long sessions; all correctness losses come from text-based counting and silently swallowed nested failures. Executor changes: data-first results become the leading shape, nested failures reject by default with a failure footer, timeouts return partial output, children run 2 in flight with 1 script per window, and each child is one tool call. QuickJS-ng is confirmed as the engine (parity and containment in the lab).
+- 2026-10-12 (long sessions, §3.9): the full numbers move to `docs/context/code-mode-measurements.md`, regenerated from the surviving raw rows (the original §3.4 rows were lost with `/tmp`). Codex session figures are corrected for cumulative usage reporting. No decision changes: Codex saves in long sessions; Claude is cost-neutral on mixed long sessions and saves on fan-out-heavy ones, which keeps `code_mode` optional rather than a default push for Claude.
+- 2026-10-11 (Phase 3 gate, §3.8): with the QuickJS-ng host and the §6 rules, `direct + code_mode` passes §7 on Claude Code and Codex at 5 repetitions, in sessions and under injected errors, with no correctness loss. D3 proceeds to Phases 4–5. For Codex the direct set is a second, read-only RepoPrompt server entry (the full catalog direct costs about 15k prompt tokens per request); verified on the app-server path through the owner's shim.
+
+## 10. Risks and open questions
+
+- **Client behavior drifts.** The probe matrix is per version; re-run the probe and lab when Claude Code, Codex, OpenCode or Pi change major behavior.
+- **Claude JSON substitution.** Claude Code shows `structuredContent` instead of the text. If it later forwards both, re-measure `cc_struct`.
+- **Lab tasks are mechanical.** Heavy lab tasks count and rank; real 20+ call turns mostly read code for understanding, so expect smaller real savings than the lab's heavy-task figure.
+- **Read re-use** (42–50% re-reads) may be a larger lever than D3. A separate investigation is optional.
+- **Codex launch drift.** `direct_only_tool_namespaces`, the `code_mode_only` catalog and tool-search behavior are version-specific; re-probe on each Codex upgrade and fall back to `native` when the key is unknown. The namespace is derived from the configured server name; RepoPrompt's own launch and the owner's shim must use the same name.
+- **Remaining unmeasured shapes.** §3.7 covered understanding and edit tasks, Opus, high effort, 6-turn sessions, faults and contention. §3.9 added 11-turn mixed sessions and Claude resume. Still unmeasured: real edits applied between reads (the lab's edit tasks return a diff) and sessions long enough to compact (the longest reached about 144k context on Claude). The lab tasks remain small (14 tasks, one repository).
+- **Search snippets are not edit-safe.** `file_search` context lines carry a tree prefix and a `▶` marker that shift indentation; diffs built from them fail to apply (Codex E3 in §3.7, with and without code mode). Independent of D3; the description should tell models to read the target lines with `read_file` before editing, and a search format fix is a separate question.
+- **Engine containment.** QuickJS-ng runs model-written code in-process; a dedicated thread is not isolation. The lab host passed 286 adversarial runs (§3.7); the in-app executor needs the same cases as tests. `Object.prototype.toJSON` can rewrite arguments inside the guest, so the app's path policy stays the boundary.
+- **Open:** the tool names `code_mode` and `git_review_snapshot`; whether Cursor has a shell; whether OMP should join a later D3 experiment.
