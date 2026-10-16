@@ -6073,6 +6073,41 @@ class AppStatusIdentityTests(unittest.TestCase):
             self.assertFalse(staged.parent.exists())
             self.assertFalse(any(live.parent.glob(".RepoPrompt.app.previous.*")))
 
+    def test_staged_package_names_live_bundle_as_reuse_source_and_build_still_invalidates_ticket(self) -> None:
+        # Debug packaging Step 6: the staged package may clone the live bundle (noop-clone); nothing
+        # else in conductor changes, and `build` keeps invalidating the root ticket unconditionally.
+        captured: dict = {}
+
+        def fake_package(name, argv, cwd, env=None, **_kwargs):
+            captured.update(argv=list(argv), env=dict(env or {}))
+            self.make_bundle(Path(env["REPOPROMPT_DEBUG_APP_BUNDLE"]), "staged")
+            return 0, "", ""
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            live = root / "DebugApps" / "RepoPrompt.app"
+            self.make_bundle(live, "live")
+            with mock.patch.dict(os.environ, {"REPOPROMPT_DEBUG_APP_BUNDLE": str(live)}), mock.patch.object(
+                conductor, "machine_heavy_slot", return_value=contextlib.nullcontext()
+            ), mock.patch.object(conductor, "run_operation_command", side_effect=fake_package), contextlib.redirect_stdout(
+                io.StringIO()
+            ):
+                code, staged = conductor.package_debug_app_under_heavy(root, "run")
+
+            self.assertEqual(code, 0)
+            self.assertEqual(captured["argv"][-1], "debug")
+            self.assertEqual(captured["env"]["REPOPROMPT_DEBUG_APP_REUSE_SOURCE"], str(live))
+            self.assertEqual(Path(captured["env"]["REPOPROMPT_DEBUG_APP_BUNDLE"]), staged)
+            self.assertIn("/.staging/", captured["env"]["REPOPROMPT_DEBUG_APP_BUNDLE"])
+            self.assertEqual(staged.parent.parent, live.parent / ".staging")
+            self.assertEqual((live / "Contents" / "MacOS" / "RepoPrompt").read_text(encoding="utf-8"), "live")
+        for args in ({}, {"fast": True}, {"appArgs": []}):
+            self.assertTrue(conductor.operation_invalidates_root_build_ticket("build", args), args)
+        import inspect
+
+        package_source = inspect.getsource(conductor.package_debug_app_under_heavy)
+        self.assertEqual(package_source.count('env["REPOPROMPT_DEBUG_APP_REUSE_SOURCE"] = str(live_bundle)'), 1)
+
     def test_repair_compatibility_link_replaces_removed_staging_target(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

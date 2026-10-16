@@ -450,7 +450,7 @@ Step 5 — done | rounds 0/2 | open: none | downgraded: none | assumed: full ver
 
 ### Step 6 — No-op skip and staging reuse
 
-Step 6 — todo | rounds 0/2 | open: | downgraded: | assumed: full verification on destination/clone reuse; step-0/adjustment.md | deferred:
+Step 6 — blocked | rounds 0/2 | open: /Applications after-launch and actual conductor run acceptance need owner approval | downgraded: none | assumed: full verification on reuse per step-0/adjustment.md; release-inert reuse gates preserve release behavior; reversible checkpoint reviewed | deferred: bounded orphan stamps and conservative failure eviction; known baseline lint/benchmark failures; evidence: step-6/findings.md, step-6/reviews/dispositions.md
 
 - **Change:** add `inventory`, the stamps and the three outcomes; add the `conductor.py` env line; add the plan, stamp and lifecycle tests.
 - **Validation:** S1 into `/Applications` hits `noop-dest`, prints `Created:` and refreshes the compatibility link; after launching the app, a no-change build is still `noop-dest`; S3 hits `noop-clone`, publishes, activates and launches, and a second `run` clones again (record the root inode before and after activation); `touch` on a bundle file, deleting the destination, or enabling Sentry gives `fresh`; ticket invalidation is unchanged.

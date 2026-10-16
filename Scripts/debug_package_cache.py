@@ -15,10 +15,19 @@ Subcommands:
       Remove ``.rpce-package-*`` siblings older than SECONDS, except any holding ``.retain``.
   resolve-identity --sign-identity S   (stdin: ``security find-identity -v -p codesigning`` output)
       Print ``cert=<SHA-1>|adhoc|unresolved``, mirroring how ``codesign -s`` picks one identity.
-  plan --cache on|off --cert C --root R --scripts-dir S --build-dir B --field NAME=VALUE...
-      Print the package keys, ``outcome`` and ``receipts_allowed``. Reads stat metadata, small
-      repository inputs and Git state only; it never reads or writes a cache. When receipts are
-      not allowed (cache ``off`` or an unresolved identity) the keys are ``none``.
+  plan --cache on|off --cert C --root R --scripts-dir S --build-dir B --cache-root C --dest D
+       [--reuse-source S] --field NAME=VALUE...
+      Print the package keys, ``outcome`` (``fresh``, ``noop-dest`` or ``noop-clone``),
+      ``receipts_allowed``, ``bundle_reuse``, the one Git snapshot (``git_state`` JSON, which
+      the provenance writer reuses) and the bundle stamps this run relies on. Keys read stat
+      metadata, small repository inputs and Git state; the destination is never a key input.
+      When receipts are not allowed (cache ``off`` or an unresolved identity) the keys are
+      ``none`` and no cache or stamp is read or written. Sentry runs never reuse a bundle.
+  record --cache-root C --bundle B --input-key K --component ID=KEY... [--keep-stamp P...]
+      After publish: write the bundle stamp (root inode, input key, inventory) and keep the 8
+      newest stamps plus the protected ones.
+  inventory --bundle B
+      Print the bundle inventory used by stamps (diagnostics).
   component-lookup --cache-root C --component ID=KEY...
       For each signed component (``sparkle``, ``helper_mcp``, ``helper_gateway``) print
       ``<ID>_status=hit`` with the entry, or ``miss`` with a fresh private temp entry to sign into.
@@ -26,17 +35,18 @@ Subcommands:
   component-commit --cache-root C --component ID=TEMP...
       Record the signed payload's inventory in ``receipt.json``, write ``.complete`` last and
       rename the temp entry into place. If the entry already exists the temp copy is discarded.
-  forget --cache-root C --entry PATH...
-      Evict the named component entries (a failed run's used entries).
+  forget --cache-root C [--entry PATH...] [--stamp PATH...]
+      Evict the named component entries and bundle stamps (a failed run's used entries).
   prune --cache-root C [--keep 2] [--used PATH...]
       Keep the newest entries per component plus every used one; drop stale temp entries.
 
 The package_app.sh caller invokes the component subcommands only when ``plan`` allowed receipts
 (cache ``on`` and a resolved identity), so cache ``off`` never reads, writes or evicts entries.
-Component cache layout (immutable entries)::
+Component cache layout (immutable entries) and bundle stamps::
 
     <cache-root>/components/sparkle/<key>/Sparkle.framework, receipt.json, .complete
     <cache-root>/components/helpers/<name>/<key>/<name>,       receipt.json, .complete
+    <cache-root>/stamps/<dev>-<ino>.json    # named for the published bundle root inode
 
 stdout carries ``key=value`` lines, the first being ``schema=1``. Diagnostics go to stderr.
 Exit codes: 0 success, 1 failure with the destination intact (or still absent), 2 usage,
@@ -46,7 +56,9 @@ Exit codes: 0 success, 1 failure with the destination intact (or still absent), 
 from __future__ import annotations
 
 import argparse
+import contextlib
 import ctypes
+from datetime import datetime, timezone
 import errno
 import hashlib
 import json
@@ -177,6 +189,7 @@ CLOSURE_EXCLUSIONS = {
     "PROFILE_APP_IDENTIFIER": "release-only internal",
     "RELEASE_ALLOW_ADHOC_SIGNING": "release-only",
     "REPOPROMPT_DEBUG_APP_BUNDLE": "destination path; excluded from every key by design",
+    "REPOPROMPT_DEBUG_APP_REUSE_SOURCE": "noop-clone source path; reused only when its stamp matches input_key",
     "REPOPROMPT_DEBUG_PACKAGE_CACHE": "escape: off disables keys and receipts",
     "REPOPROMPT_PROVISIONING_PROFILE": "release-only",
     "REPOPROMPT_RUN_WITHOUT_GITHUB_TOKENS": "release-only (universal builder)",
@@ -662,6 +675,120 @@ def compute_keys(
 
 
 PLAN_KEYS = ("signing_policy_key", "input_key", "sparkle_key", *HELPERS.values())
+# Plan output after the keys: the Git snapshot, then the bundle-reuse decision.
+PLAN_REUSE_KEYS = ("dest_stamp", "source_stamp", "built_at")
+
+# --- Bundle stamps and reuse outcomes (plan Step 6) ------------------------------------------
+# A stamp is named for the published bundle root's (dev, ino), which rename and swap preserve,
+# and records the input key plus the bundle inventory. An inode alone never proves reuse.
+STAMP_VERSION = 1
+STAMP_NAME_RE = re.compile(r"[0-9]+-[0-9]+\.json")
+DEFAULT_KEEP_STAMPS = 8
+# package_app.sh truthy(); REPOPROMPT_UPLOAD_SENTRY_SYMBOLS uses it.
+TRUTHY = frozenset({"1", "true", "TRUE", "yes", "YES"})
+
+
+def bundle_reuse_blocker(cache: str, cert: str, environ: Mapping[str, str]) -> Optional[str]:
+    """Why bundle-level reuse is off for this run, or None. Sentry side effects stay on the fresh path."""
+    if cache != "on":
+        return "cache off"
+    if cert == "unresolved":
+        return "signing identity unresolved"
+    if environ.get("REPOPROMPT_ENABLE_SENTRY") == "1":
+        return "REPOPROMPT_ENABLE_SENTRY=1"
+    if environ.get("REPOPROMPT_UPLOAD_SENTRY_SYMBOLS", "") in TRUTHY:
+        return "REPOPROMPT_UPLOAD_SENTRY_SYMBOLS is set"
+    return None
+
+
+def stamps_dir(cache_root: Path) -> Path:
+    return Path(cache_root, "stamps")
+
+
+def bundle_inventory(bundle: Path) -> List[List[object]]:
+    """(rel, type, mode, size, mtime_ns, ino, symlink target) for every entry below the root.
+
+    ctime and xattrs are ignored (launches and Gatekeeper add metadata), and so is the root's own
+    entry, whose timestamps a rename across parents can touch.
+    """
+    return [entry for entry in component_inventory(Path(bundle)) if entry[0] != "."]
+
+
+def _directory_stat(path: Path) -> Optional[os.stat_result]:
+    """lstat of a real directory (never through a symlink), else None."""
+    try:
+        st = os.lstat(path)
+    except FileNotFoundError:
+        return None
+    return st if stat.S_ISDIR(st.st_mode) else None
+
+
+def stamp_path(cache_root: Path, st: os.stat_result) -> Path:
+    return stamps_dir(cache_root) / f"{st.st_dev}-{st.st_ino}.json"
+
+
+def check_stamp(cache_root: Path, bundle: Path, input_key: str, err: TextIO) -> Tuple[Optional[Path], Optional[str], str]:
+    """(stamp path, builtAt, problem): ``problem`` is empty when the bundle is reusable as is."""
+    st = _directory_stat(bundle)
+    if st is None:
+        return None, None, "is missing or not a directory"
+    path = stamp_path(cache_root, st)
+    try:
+        data = path.read_bytes()
+    except FileNotFoundError:
+        return path, None, "has no stamp"
+    try:
+        stamp = json.loads(data.decode("utf-8"))
+    except ValueError:  # includes UnicodeDecodeError
+        stamp = None
+    if not (isinstance(stamp, dict) and stamp.get("version") == STAMP_VERSION and isinstance(stamp.get("inputKey"), str)
+            and isinstance(stamp.get("builtAt"), str) and isinstance(stamp.get("inventory"), list)):
+        err.write(f"WARNING: corrupt or unknown-schema package stamp {path}; forgetting it.\n")
+        with contextlib.suppress(FileNotFoundError):
+            path.unlink()
+        return path, None, "had a corrupt stamp"
+    if stamp["inputKey"] != input_key:
+        return path, None, "was built from other inputs"
+    try:
+        inventory = bundle_inventory(bundle)
+    except OSError as exc:
+        return path, None, f"could not be inventoried ({exc})"
+    if inventory != stamp["inventory"]:
+        return path, None, "changed since it was stamped"
+    os.utime(path)  # recency for stamp pruning
+    return path, stamp["builtAt"], ""
+
+
+def decide_outcome(cache_root: Path, dest: Path, reuse_source: Optional[Path], input_key: str,
+                   err: TextIO) -> Dict[str, str]:
+    """``noop-dest`` for an intact stamped destination, ``noop-clone`` for an absent destination
+    with a distinct stamped reuse source, otherwise ``fresh``."""
+    result = {"outcome": "fresh", "dest_stamp": "none", "source_stamp": "none", "built_at": "none"}
+    if os.path.lexists(dest):
+        path, built_at, problem = check_stamp(cache_root, dest, input_key, err)
+        reason = f"destination {problem}"
+        result["dest_stamp"] = str(path) if path else "none"
+        if not problem:
+            result.update(outcome="noop-dest", built_at=str(built_at))
+    elif reuse_source is None:
+        reason = "destination absent and no reuse source"
+    elif os.path.abspath(reuse_source) == os.path.abspath(dest):
+        reason = "reuse source is the destination"
+    else:
+        path, built_at, problem = check_stamp(cache_root, reuse_source, input_key, err)
+        reason = f"reuse source {problem}"
+        result["source_stamp"] = str(path) if path else "none"
+        if not problem:
+            result.update(outcome="noop-clone", built_at=str(built_at))
+    if result["outcome"] != "fresh":
+        reason = "stamp and inventory match the current inputs"
+    err.write(f"Debug package reuse: {result['outcome']} ({reason})\n")
+    return result
+
+
+def git_state_json(git: Tuple[Optional[str], Optional[str], Optional[bool]]) -> str:
+    branch, commit, dirty = git
+    return json.dumps({"branch": branch, "commit": commit, "dirty": dirty}, sort_keys=True, separators=(",", ":"))
 
 
 def plan(
@@ -672,26 +799,90 @@ def plan(
     scripts_dir: Path,
     build_dir: Path,
     fields: Mapping[str, str],
+    cache_root: Optional[Path] = None,
+    package_dest: Optional[Path] = None,
+    reuse_source: Optional[Path] = None,
     environ: Optional[Mapping[str, str]] = None,
     out: Optional[TextIO] = None,
     err: Optional[TextIO] = None,
     compute: Callable[..., Dict[str, str]] = compute_keys,
+    git_reader: Callable[[Path], Tuple[Optional[str], Optional[str], Optional[bool]]] = git_state,
 ) -> int:
     out = out or sys.stdout
     err = err or sys.stderr
+    environ = os.environ if environ is None else environ
+    # One Git snapshot serves the keys and the generated provenance, in every cache mode.
+    git = git_reader(root)
     receipts_allowed = cache == "on" and cert != "unresolved"
     if receipts_allowed:
         keys = compute(cert=cert, root=root, scripts_dir=scripts_dir, build_dir=build_dir, fields=fields,
-                       environ=os.environ if environ is None else environ, git=git_state(root), os_build=macos_build())
+                       environ=environ, git=git, os_build=macos_build())
     else:
         keys = {name: "none" for name in PLAN_KEYS}
         if cache == "off":
             err.write("Debug package caches disabled (REPOPROMPT_DEBUG_PACKAGE_CACHE=off): "
                       "no cache reads or writes; full signing and verification.\n")
-    lines = [f"schema={SCHEMA}", "outcome=fresh", f"cache={cache}", f"cert={cert}",
-             f"receipts_allowed={int(receipts_allowed)}", *(f"{name}={keys[name]}" for name in PLAN_KEYS)]
+    blocker = bundle_reuse_blocker(cache, cert, environ)
+    reuse = {"outcome": "fresh", "dest_stamp": "none", "source_stamp": "none", "built_at": "none"}
+    if blocker is None and cache_root is not None and package_dest is not None:
+        reuse = decide_outcome(cache_root, package_dest, reuse_source, keys["input_key"], err)
+    elif blocker is not None:
+        err.write(f"Debug package reuse: fresh (bundle reuse disabled: {blocker})\n")
+    lines = [f"schema={SCHEMA}", f"outcome={reuse['outcome']}", f"cache={cache}", f"cert={cert}",
+             f"receipts_allowed={int(receipts_allowed)}", f"bundle_reuse={int(blocker is None)}",
+             *(f"{name}={keys[name]}" for name in PLAN_KEYS), f"git_state={git_state_json(git)}",
+             *(f"{name}={reuse[name]}" for name in PLAN_REUSE_KEYS)]
     out.write("\n".join(lines) + "\n")
     return EXIT_OK
+
+
+def record(cache_root: Path, bundle: Path, input_key: str, components: Sequence[Tuple[str, str]], *,
+           keep: int = DEFAULT_KEEP_STAMPS, protected: Sequence[Path] = (), now: Callable[[], float] = time.time,
+           out: TextIO, err: TextIO) -> int:
+    """Write the stamp of a just-published bundle from its post-publish inventory, then prune stamps."""
+    st = _directory_stat(bundle)
+    if st is None:
+        raise ComponentCacheError(f"cannot stamp {bundle}: not a directory")
+    directory = stamps_dir(cache_root)
+    directory.mkdir(parents=True, exist_ok=True)
+    path = stamp_path(cache_root, st)
+    built = now()
+    stamp = {"version": STAMP_VERSION, "inputKey": input_key, "componentKeys": dict(components),
+             "builtAt": datetime.fromtimestamp(built, timezone.utc).astimezone().isoformat(timespec="seconds"),
+             "bundlePath": str(bundle), "inventory": bundle_inventory(bundle)}
+    temp = directory / f".{path.name}{TEMP_MARKER}{os.getpid()}.{os.urandom(4).hex()}"
+    try:
+        temp.write_text(json.dumps(stamp, sort_keys=True) + "\n", encoding="utf-8")
+        os.replace(temp, path)
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            temp.unlink()
+    pruned = prune_stamps(directory, keep=keep, protected=(path, *protected), now=built)
+    err.write(f"Recorded debug package stamp {path}\n")
+    out.write(f"schema={SCHEMA}\nstamp={path}\npruned_stamps={pruned}\n")
+    return EXIT_OK
+
+
+def prune_stamps(directory: Path, *, keep: int, protected: Iterable[Path], now: float,
+                 max_temp_age: float = 3600) -> int:
+    """Keep the ``keep`` newest stamps (by mtime) plus every protected one; drop stale temp files."""
+    keep_paths = {os.path.realpath(path) for path in protected}
+    stamps: List[Tuple[int, str, Path]] = []
+    pruned = 0
+    for item in os.scandir(directory):
+        st = item.stat(follow_symlinks=False)
+        if STAMP_NAME_RE.fullmatch(item.name) and stat.S_ISREG(st.st_mode):
+            stamps.append((st.st_mtime_ns, item.name, Path(item.path)))
+        elif TEMP_MARKER in item.name and stat.S_ISREG(st.st_mode) and now - st.st_mtime >= max_temp_age:
+            os.unlink(item.path)
+            pruned += 1
+    for index, (_, _, path) in enumerate(sorted(stamps, reverse=True)):
+        if index < keep or os.path.realpath(path) in keep_paths:
+            continue
+        with contextlib.suppress(FileNotFoundError):
+            path.unlink()
+        pruned += 1
+    return pruned
 
 
 # --- Signed component cache (plan Step 5) ----------------------------------------------------
@@ -836,7 +1027,7 @@ def _component_of_entry(cache_root: Path, entry: Path) -> Optional[str]:
     return None
 
 
-def forget(cache_root: Path, entries: Sequence[Path], *, out: TextIO, err: TextIO) -> int:
+def forget(cache_root: Path, entries: Sequence[Path], *, stamps: Sequence[Path] = (), out: TextIO, err: TextIO) -> int:
     forgotten = 0
     for entry in map(Path, entries):
         if not os.path.lexists(entry):
@@ -845,6 +1036,14 @@ def forget(cache_root: Path, entries: Sequence[Path], *, out: TextIO, err: TextI
             raise ComponentCacheError(f"refusing to forget {entry}: not a component entry under {cache_root}")
         _evict(entry, err)
         err.write(f"Forgot cache entry {entry}\n")
+        forgotten += 1
+    for stamp_file in map(Path, stamps):
+        if not os.path.lexists(stamp_file):
+            continue
+        if not STAMP_NAME_RE.fullmatch(stamp_file.name) or not _same_directory(stamp_file.parent, stamps_dir(cache_root)):
+            raise ComponentCacheError(f"refusing to forget {stamp_file}: not a bundle stamp under {cache_root}")
+        stamp_file.unlink()
+        err.write(f"Forgot bundle stamp {stamp_file}\n")
         forgotten += 1
     out.write(f"schema={SCHEMA}\nforgotten={forgotten}\n")
     return EXIT_OK
@@ -950,15 +1149,28 @@ def build_parser() -> argparse.ArgumentParser:
     plan_parser.add_argument("--root", type=Path, required=True)
     plan_parser.add_argument("--scripts-dir", type=Path, required=True)
     plan_parser.add_argument("--build-dir", type=Path, required=True)
+    plan_parser.add_argument("--cache-root", type=Path, required=True)
+    plan_parser.add_argument("--dest", type=Path, required=True)
+    plan_parser.add_argument("--reuse-source", default="", help="existing stamped bundle to clone (empty: none)")
     plan_parser.add_argument("--field", action="append", default=[], metavar="NAME=VALUE")
     for name, metavar, help_text in (("component-lookup", "ID=KEY", "find or start signed component entries"),
                                      ("component-commit", "ID=TEMP", "commit signed component temp entries")):
         component_parser = commands.add_parser(name, help=help_text)
         component_parser.add_argument("--cache-root", type=Path, required=True)
         component_parser.add_argument("--component", action="append", default=[], metavar=metavar)
-    forget_parser = commands.add_parser("forget", help="evict component entries a failed run used")
+    forget_parser = commands.add_parser("forget", help="evict component entries and stamps a failed run used")
     forget_parser.add_argument("--cache-root", type=Path, required=True)
-    forget_parser.add_argument("--entry", type=Path, action="append", required=True)
+    forget_parser.add_argument("--entry", type=Path, action="append", default=[])
+    forget_parser.add_argument("--stamp", type=Path, action="append", default=[])
+    record_parser = commands.add_parser("record", help="stamp a just-published bundle and prune stamps")
+    record_parser.add_argument("--cache-root", type=Path, required=True)
+    record_parser.add_argument("--bundle", type=Path, required=True)
+    record_parser.add_argument("--input-key", required=True)
+    record_parser.add_argument("--component", action="append", default=[], metavar="ID=KEY")
+    record_parser.add_argument("--keep", type=_non_negative_int, default=DEFAULT_KEEP_STAMPS)
+    record_parser.add_argument("--keep-stamp", type=Path, action="append", default=[])
+    inventory_parser = commands.add_parser("inventory", help="print the stamp inventory of a bundle")
+    inventory_parser.add_argument("--bundle", type=Path, required=True)
     prune_parser = commands.add_parser("prune", help="keep the newest and the used component entries")
     prune_parser.add_argument("--cache-root", type=Path, required=True)
     prune_parser.add_argument("--keep", type=_non_negative_int, default=DEFAULT_KEEP)
@@ -977,12 +1189,26 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             print(UNRESOLVED_WARNING, file=sys.stderr)
         sys.stdout.write(f"schema={SCHEMA}\ncert={cert}\n")
         return EXIT_OK
+    if args.command == "inventory":
+        sys.stdout.write(f"schema={SCHEMA}\n" + "".join(json.dumps(entry) + "\n" for entry in bundle_inventory(args.bundle)))
+        return EXIT_OK
     if args.command == "plan":
         fields = _parse_fields(parser, args.field)
-        return plan(cache=args.cache, cert=args.cert, root=args.root, scripts_dir=args.scripts_dir,
-                    build_dir=args.build_dir, fields=fields)
-    if args.command in ("component-lookup", "component-commit", "forget", "prune"):
+    if args.command == "forget" and not (args.entry or args.stamp):
+        parser.error("forget needs at least one --entry or --stamp")
+    if args.command == "record":
+        if not COMPONENT_KEY_RE.fullmatch(args.input_key):
+            parser.error("--input-key must be a lowercase 64-hex key")
+        components = _component_pairs(parser, args.component, keys=True)
+    if args.command in ("plan", "record", "component-lookup", "component-commit", "forget", "prune"):
         try:
+            if args.command == "plan":
+                return plan(cache=args.cache, cert=args.cert, root=args.root, scripts_dir=args.scripts_dir,
+                            build_dir=args.build_dir, fields=fields, cache_root=args.cache_root,
+                            package_dest=args.dest, reuse_source=Path(args.reuse_source) if args.reuse_source else None)
+            if args.command == "record":
+                return record(args.cache_root, args.bundle, args.input_key, components, keep=args.keep,
+                              protected=args.keep_stamp, out=sys.stdout, err=sys.stderr)
             if args.command == "component-lookup":
                 requests = _component_pairs(parser, args.component, keys=True)
                 return component_lookup(args.cache_root, requests, out=sys.stdout, err=sys.stderr)
@@ -990,7 +1216,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 requests = _component_pairs(parser, args.component, keys=False)
                 return component_commit(args.cache_root, requests, out=sys.stdout, err=sys.stderr)
             if args.command == "forget":
-                return forget(args.cache_root, args.entry, out=sys.stdout, err=sys.stderr)
+                return forget(args.cache_root, args.entry, stamps=args.stamp, out=sys.stdout, err=sys.stderr)
             return prune(args.cache_root, keep=args.keep, used=args.used, out=sys.stdout, err=sys.stderr)
         except (OSError, ComponentCacheError) as exc:
             print(f"ERROR: debug package {args.command} failed: {exc}. To recover, {CACHE_RECOVERY}.", file=sys.stderr)

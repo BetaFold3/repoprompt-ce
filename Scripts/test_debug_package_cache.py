@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import errno
 import io
+import json
 import os
 import re
 import shlex
@@ -20,7 +21,7 @@ import time
 import unittest
 from pathlib import Path
 from unittest import mock
-from typing import Callable, List, Optional, Tuple
+from typing import Callable, List, Optional, Sequence, Tuple
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPT_DIR))
@@ -728,13 +729,33 @@ class KeyTests(unittest.TestCase):
     def test_destination_and_provenance_are_not_inputs(self) -> None:
         import inspect
 
-        for function in (dpc.compute_keys, dpc.plan):
-            parameters = inspect.signature(function).parameters
-            self.assertFalse({"dest", "destination", "bundle", "app_bundle"} & set(parameters), function)
+        parameters = inspect.signature(dpc.compute_keys).parameters
+        self.assertFalse({"dest", "destination", "bundle", "app_bundle", "package_dest", "reuse_source", "cache_root"}
+                         & set(parameters))
+        # Step 6: plan receives the destination and reuse source only to pick the outcome; the
+        # keys it prints are identical for any destination.
+        seen: List[set] = []
+
+        def compute(**kwargs):
+            seen.append(set(kwargs))
+            return self.fx.keys()
+
+        printed = []
+        for dest, source in ((self.fx.base / "a" / "RepoPrompt.app", None),
+                             (self.fx.base / "b" / "RepoPrompt.app", self.fx.base / "live" / "RepoPrompt.app")):
+            out = io.StringIO()
+            dpc.plan(cache="on", cert=SHA_A, root=self.fx.root, scripts_dir=self.fx.scripts, build_dir=self.fx.build,
+                     fields=self.fx.fields, cache_root=self.fx.base / "cache", package_dest=dest, reuse_source=source,
+                     environ={}, out=out, err=io.StringIO(), compute=compute, git_reader=lambda _root: ("main", "a" * 40, False))
+            values = dict(line.split("=", 1) for line in out.getvalue().splitlines()[1:])
+            printed.append({name: values[name] for name in dpc.PLAN_KEYS})
+        self.assertEqual(printed[0], printed[1])
+        self.assertTrue(all(not ({"dest", "package_dest", "reuse_source", "cache_root"} & kwargs) for kwargs in seen))
         package = (SCRIPT_DIR / "package_app.sh").read_text(encoding="utf-8")
         plan_call = package.split('debug_package_cache.py" plan', 1)[1].split(')"', 1)[0]
-        self.assertNotIn("APP_BUNDLE", plan_call)
-        self.assertNotIn("PACKAGE_DEST", plan_call)
+        self.assertEqual(re.findall(r"\S*(?:APP_BUNDLE|PACKAGE_DEST)\S*", plan_call), ['"$APP_BUNDLE"'])
+        self.assertIn('--reuse-source "${REPOPROMPT_DEBUG_APP_REUSE_SOURCE:-}"', plan_call)
+        self.assertIn('--dest "$APP_BUNDLE"', plan_call)
         self.assertNotIn("Provenance", plan_call)
 
     def test_executables_are_only_stat_read(self) -> None:
@@ -871,11 +892,15 @@ class ClosureTests(unittest.TestCase):
 
 
 class PlanModeTests(unittest.TestCase):
+    GIT = ("main", "c" * 40, True)
+
     def run_plan(self, cache: str, cert: str) -> Tuple[dict, str, List[int]]:
         calls: List[int] = []
+        git_reads: List[Path] = []
 
         def compute(**kwargs):
             calls.append(1)
+            self.assertEqual(kwargs["git"], self.GIT)  # the same snapshot that the provenance reuses
             return {name: "k" * 64 for name in dpc.PLAN_KEYS}
 
         out, err = io.StringIO(), io.StringIO()
@@ -883,12 +908,16 @@ class PlanModeTests(unittest.TestCase):
         self.addCleanup(shutil.rmtree, root, True)
         before = sorted(p.relative_to(root) for p in root.rglob("*"))
         code = dpc.plan(cache=cache, cert=cert, root=root, scripts_dir=root, build_dir=root, fields={}, environ={},
-                        out=out, err=err, compute=compute)
+                        cache_root=root / "cache", package_dest=root / "dest" / "RepoPrompt.app", out=out, err=err,
+                        compute=compute, git_reader=lambda path: (git_reads.append(path), self.GIT)[1])
         self.assertEqual(code, 0)
         self.assertEqual(sorted(p.relative_to(root) for p in root.rglob("*")), before)  # plan writes nothing
+        self.assertEqual(git_reads, [root])  # exactly one Git snapshot, in every mode
         lines = out.getvalue().splitlines()
         self.assertEqual(lines[0], "schema=1")
-        return dict(line.split("=", 1) for line in lines[1:]), err.getvalue(), calls
+        values = dict(line.split("=", 1) for line in lines[1:])
+        self.assertEqual(json.loads(values["git_state"]), {"branch": "main", "commit": "c" * 40, "dirty": True})
+        return values, err.getvalue(), calls
 
     def test_off_and_unresolved_compute_nothing_and_allow_no_receipts(self) -> None:
         for cache, cert in (("off", SHA_A), ("off", "unresolved"), ("on", "unresolved")):
@@ -896,8 +925,9 @@ class PlanModeTests(unittest.TestCase):
                 values, err, calls = self.run_plan(cache, cert)
                 self.assertEqual(calls, [])
                 self.assertEqual(values["receipts_allowed"], "0")
+                self.assertEqual(values["bundle_reuse"], "0")
                 self.assertEqual(values["outcome"], "fresh")
-                self.assertTrue(all(values[name] == "none" for name in dpc.PLAN_KEYS))
+                self.assertTrue(all(values[name] == "none" for name in (*dpc.PLAN_KEYS, *dpc.PLAN_REUSE_KEYS)))
                 self.assertEqual("REPOPROMPT_DEBUG_PACKAGE_CACHE=off" in err, cache == "off")
 
     def test_on_with_resolved_cert_computes_keys(self) -> None:
@@ -905,11 +935,15 @@ class PlanModeTests(unittest.TestCase):
             values, err, calls = self.run_plan("on", cert)
             self.assertEqual(calls, [1])
             self.assertEqual(values["receipts_allowed"], "1")
-            self.assertEqual(list(values), ["outcome", "cache", "cert", "receipts_allowed", *dpc.PLAN_KEYS])
+            self.assertEqual(values["bundle_reuse"], "1")
+            self.assertEqual(list(values), ["outcome", "cache", "cert", "receipts_allowed", "bundle_reuse", *dpc.PLAN_KEYS,
+                                            "git_state", *dpc.PLAN_REUSE_KEYS])
+            self.assertIn("Debug package reuse: fresh (destination absent and no reuse source)", err)
 
     def test_cli_rejects_bad_cache_cert_and_fields(self) -> None:
         base = [sys.executable, "-I", "-S", str(SCRIPT_DIR / "debug_package_cache.py"), "plan", "--root", "/r",
-                "--scripts-dir", "/s", "--build-dir", "/b"]
+                "--scripts-dir", "/s", "--build-dir", "/b", "--cache-root", "/nonexistent-rpce-cache",
+                "--dest", "/nonexistent-rpce-dest/RepoPrompt.app"]
         fields = [arg for name in dpc.PLAN_FIELDS for arg in ("--field", f"{name}=v")]
         for extra in (["--cache", "maybe", "--cert", "adhoc", *fields],
                       ["--cache", "on", "--cert", SHA_A.lower(), *fields],
@@ -1308,7 +1342,8 @@ class PackageScriptComponentCacheTests(unittest.TestCase):
     def test_cache_calls_are_reachable_only_when_the_plan_allows_receipts(self) -> None:
         script = self.script
         self.assertEqual(re.findall(r"^\s*DEBUG_PACKAGE_COMPONENTS=1$", script, re.M), ["        DEBUG_PACKAGE_COMPONENTS=1"])
-        gate = 'if [[ "$DEBUG_PACKAGE_RECEIPTS_ALLOWED" == "1" ]]; then\n        DEBUG_PACKAGE_COMPONENTS=1\n'
+        gate = ('if [[ "$DEBUG_PACKAGE_RECEIPTS_ALLOWED" == "1" ]] && (( ! DEBUG_PACKAGE_REUSED )); then\n'
+                '        DEBUG_PACKAGE_COMPONENTS=1\n')
         self.assertIn(gate, script)
         debug_block = script.rindex("if (( ! IS_RELEASE )); then", 0, script.index(gate))
         self.assertLess(script.index('debug_package_cache.py" plan', debug_block), script.index(gate))
@@ -1326,7 +1361,8 @@ class PackageScriptComponentCacheTests(unittest.TestCase):
         self.assertIn("if (( DEBUG_PACKAGE_COMPONENT_COMMITTED )); then\n        DEBUG_PACKAGE_PRUNE_ARGS=()",
                       script)
         self.assertEqual(script.count("forget --cache-root"), 1)
-        self.assertIn("if (( status != 0 && ${#DEBUG_PACKAGE_COMPONENT_USED[@]} )); then", script)
+        self.assertIn("if (( status != 0 && ${#DEBUG_PACKAGE_COMPONENT_USED[@]} + ${#DEBUG_PACKAGE_STAMPS_USED[@]} )); then",
+                      script)
         appends = re.findall(r"DEBUG_PACKAGE_COMPONENT_USED\+=", script)
         self.assertEqual(len(appends), 2)
         for name in ("use_cached_debug_component", "sign_debug_component_misses"):
@@ -1389,7 +1425,7 @@ class PackageScriptComponentCacheTests(unittest.TestCase):
         self.assertEqual((dst1 / "Versions" / "B" / "Sparkle").read_text(encoding="utf-8"), "payload")
 
     def finish_probe(self, status: int, used: List[str], temps: List[Path],
-                     forget_status: int = 0) -> subprocess.CompletedProcess:
+                     forget_status: int = 0, stamps: Sequence[str] = (), shell: str = "bash") -> subprocess.CompletedProcess:
         body = self.script.split("\nfinish(){\n", 1)[1].split("\n}\ntrap 'finish $?' EXIT", 1)[0]
         probe = (
             "set -euo pipefail\npackage_timing_record(){ :; }\n"
@@ -1399,8 +1435,9 @@ class PackageScriptComponentCacheTests(unittest.TestCase):
             "DEBUG_PACKAGE_CACHE_ROOT=/repo/.build/debug/package-cache/v1\n"
             f"DEBUG_PACKAGE_COMPONENT_TEMPS=({' '.join(shlex.quote(str(p)) for p in temps)})\n"
             f"DEBUG_PACKAGE_COMPONENT_USED=({' '.join(shlex.quote(p) for p in used)})\n"
+            f"DEBUG_PACKAGE_STAMPS_USED=({' '.join(shlex.quote(p) for p in stamps)})\n"
             f"finish(){{\n{body}\n}}\nfinish {status}\n")
-        return subprocess.run(["bash", "-c", probe], text=True, capture_output=True)
+        return subprocess.run([shell, "-c", probe], text=True, capture_output=True)
 
     def test_finish_drops_temps_and_forgets_used_entries_only_after_failure(self) -> None:
         temp = Path(tempfile.mkdtemp(prefix="rpce-dpc-finish-temps-"))
@@ -1426,6 +1463,19 @@ class PackageScriptComponentCacheTests(unittest.TestCase):
                 else:
                     self.assertEqual(forget_lines, [])
                     self.assertNotIn("evict", result.stderr)
+        stamps = ["/repo/.build/debug/package-cache/v1/stamps/16777232-42.json",
+                  "/repo/.build/debug/package-cache/v1/stamps/16777232-43.json"]
+        for status, entries, forgets in ((1, stamps, True), (0, stamps, False)):
+            with self.subTest(status=status, stamps=True):
+                result = self.finish_probe(status, [], [], stamps=entries)
+                forget_lines = [line for line in result.stderr.splitlines() if " forget " in line]
+                self.assertEqual(forget_lines, [
+                    "python3 -I -S /scripts/debug_package_cache.py forget --cache-root "
+                    "/repo/.build/debug/package-cache/v1 --stamp " + stamps[0] + " --stamp " + stamps[1]] if forgets else [])
+        with self.subTest("components and stamps"):
+            result = self.finish_probe(1, used[:1], [], stamps=stamps[:1])
+            self.assertIn("forget --cache-root /repo/.build/debug/package-cache/v1 --entry " + used[0]
+                          + " --stamp " + stamps[0] + "\n", result.stderr)
         with self.subTest("forget fails"):
             result = self.finish_probe(1, used, [], forget_status=1)
             self.assertEqual(result.returncode, 1, result.stderr)
@@ -1433,6 +1483,36 @@ class PackageScriptComponentCacheTests(unittest.TestCase):
             self.assertNotIn("ERROR: evicted", result.stderr)
             self.assertIn("REPOPROMPT_DEBUG_PACKAGE_CACHE=off", result.stderr)
             self.assertIn('rm -rf "/repo/.build/debug/package-cache"', result.stderr)
+
+    @unittest.skipUnless(Path("/bin/bash").exists(), "system bash")
+    def test_empty_used_and_record_arrays_survive_set_u_on_system_bash(self) -> None:
+        # macOS /bin/bash 3.2 treats an empty "${arr[@]}" as unbound under set -u.
+        component = "/repo/.build/debug/package-cache/v1/components/sparkle/" + KEY_1
+        stamp = "/repo/.build/debug/package-cache/v1/stamps/16777232-42.json"
+        for used, stamps, expected in (([component], [], "--entry " + component),
+                                       ([], [stamp], "--stamp " + stamp)):
+            with self.subTest(expected=expected):
+                result = self.finish_probe(1, used, [], stamps=stamps, shell="/bin/bash")
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertNotIn("unbound variable", result.stderr)
+                self.assertIn("forget --cache-root /repo/.build/debug/package-cache/v1 " + expected + "\n", result.stderr)
+        block = "if (( ! IS_RELEASE )) && " + self.script.split("\nif (( ! IS_RELEASE )) && ", 1)[1].split("\nprintf 'Created:", 1)[0]
+        self.assertIn(" record --cache-root ", block)
+        for source_stamp, keep in (("none", ""), (stamp, " --keep-stamp " + stamp)):
+            with self.subTest(source_stamp=source_stamp):
+                probe = (
+                    "set -euo pipefail\nrun(){ \"$@\"; }\npython3(){ printf 'python3 %s\\n' \"$*\"; }\n"
+                    "IS_RELEASE=0 DEBUG_PACKAGE_BUNDLE_REUSE=1 DEBUG_PACKAGE_OUTCOME=fresh CONTROL_PLANE_SCRIPTS_DIR=/scripts\n"
+                    "DEBUG_PACKAGE_CACHE_ROOT=/c APP_BUNDLE=/d/RepoPrompt.app DEBUG_PACKAGE_INPUT_KEY=k "
+                    "DEBUG_PACKAGE_SPARKLE_KEY=s DEBUG_PACKAGE_HELPER_MCP_KEY=m DEBUG_PACKAGE_HELPER_GATEWAY_KEY=g\n"
+                    f"DEBUG_PACKAGE_SOURCE_STAMP={shlex.quote(source_stamp)}\n{block}\necho done\n")
+                result = subprocess.run(["/bin/bash", "-c", probe], text=True, capture_output=True)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertNotIn("WARNING", result.stderr)
+                self.assertEqual(result.stdout, (
+                    "python3 -I -S /scripts/debug_package_cache.py record --cache-root /c --bundle /d/RepoPrompt.app "
+                    "--input-key k --component sparkle=s --component helper_mcp=m --component helper_gateway=g"
+                    f"{keep}\ndone\n"))
 
     @unittest.skipUnless(sys.platform == "darwin" and Path("/usr/bin/codesign").exists(), "real codesign")
     def test_real_ad_hoc_signing_miss_hit_and_helper_rebuild_through_the_script_functions(self) -> None:
@@ -1457,7 +1537,8 @@ class PackageScriptComponentCacheTests(unittest.TestCase):
         functions = "".join(self.function(name) for name in (
             "echo_cmd", "run", "read_debug_package_output", "clone_tree", "debug_component", "debug_component_hit",
             "use_cached_debug_component", "sign_debug_component_misses", "sign_path", "sign_sparkle_framework"))
-        lookup = self.between('    if [[ "$DEBUG_PACKAGE_RECEIPTS_ALLOWED" == "1" ]]; then\n', "\n    fi\n")
+        lookup = self.between('    if [[ "$DEBUG_PACKAGE_RECEIPTS_ALLOWED" == "1" ]] && (( ! DEBUG_PACKAGE_REUSED )); then\n',
+                              "\n    fi\n")
         layout = self.between('for exe in "$APP_NAME" repoprompt-mcp repoprompt-gateway; do\n', "\ndone\n")
         sparkle = self.between("if debug_component_hit sparkle; then\n", "\nfi\n")
         signing = self.between("if (( DEBUG_PACKAGE_COMPONENTS )); then\n    sign_debug_component_misses\n", "\nfi\n")
@@ -1475,6 +1556,7 @@ class PackageScriptComponentCacheTests(unittest.TestCase):
                 + f"APP_BUNDLE={shlex.quote(str(bundle))}\nAPP_NAME=RepoPrompt\n"
                 + "SIGN_IDENTITY=- USE_ADHOC_SIGNING=1 USE_LOCAL_SELF_SIGNED_RELEASE=0 IS_RELEASE=0\n"
                 + "DEBUG_PACKAGE_COMPONENTS=0 DEBUG_PACKAGE_RECEIPTS_ALLOWED=1 DEBUG_PACKAGE_COMPONENT_COMMITTED=0\n"
+                + "DEBUG_PACKAGE_REUSED=0\n"
                 + "DEBUG_PACKAGE_CLONE_FALLBACK_REPORTED=0 DEBUG_PACKAGE_COMPONENT_TEMPS=() DEBUG_PACKAGE_COMPONENT_USED=()\n"
                 + f"DEBUG_PACKAGE_SPARKLE_KEY={'5' * 64} DEBUG_PACKAGE_HELPER_MCP_KEY={mcp_key} "
                 + f"DEBUG_PACKAGE_HELPER_GATEWAY_KEY={'7' * 64}\n"
@@ -1524,6 +1606,411 @@ class PackageScriptComponentCacheTests(unittest.TestCase):
         self.assertEqual(len(calls), 2)
         self.assertTrue(calls[0].endswith("/repoprompt-mcp") and ".tmp." in calls[0], calls)
         self.assertEqual((out.count("CACHE HIT: "), out.count("CACHE MISS: ")), (2, 1))
+
+
+# --- Step 6: bundle stamps, reuse outcomes and the shared Git snapshot -----------------------
+
+KEY_IN = "1" * 64
+KEY_OTHER = "2" * 64
+
+
+def make_bundle(path: Path) -> Path:
+    (path / "Contents" / "MacOS").mkdir(parents=True)
+    (path / "Contents" / "MacOS" / "RepoPrompt").write_text("exe", encoding="utf-8")
+    (path / "Contents" / "Resources").mkdir()
+    (path / "Contents" / "Resources" / "data.json").write_text("{}", encoding="utf-8")
+    os.symlink("../MacOS/RepoPrompt", path / "Contents" / "Resources" / "link")
+    return path
+
+
+class BundleStampTests(unittest.TestCase):
+    """Stamps and outcomes over real temporary bundles (unit; darwin adds real xattrs)."""
+
+    def setUp(self) -> None:
+        self.base = Path(tempfile.mkdtemp(prefix="rpce-dpc-stamps-"))
+        self.addCleanup(shutil.rmtree, self.base, True)
+        self.cache = self.base / "cache" / "v1"
+        self.dest = make_bundle(self.base / "dest" / BUNDLE)
+
+    def record(self, bundle: Path, key: str = KEY_IN, **kwargs) -> Path:
+        out = io.StringIO()
+        self.assertEqual(dpc.record(self.cache, bundle, key, [("sparkle", KEY_OTHER)], out=out, err=io.StringIO(),
+                                    **kwargs), 0)
+        return Path(dict(line.split("=", 1) for line in out.getvalue().splitlines()[1:])["stamp"])
+
+    def decide(self, dest: Path, source: Optional[Path] = None, key: str = KEY_IN) -> Tuple[dict, str]:
+        err = io.StringIO()
+        return dpc.decide_outcome(self.cache, dest, source, key, err), err.getvalue()
+
+    def test_stamp_round_trip_is_named_for_the_root_inode(self) -> None:
+        stamp = self.record(self.dest)
+        st = os.lstat(self.dest)
+        self.assertEqual(stamp, self.cache / "stamps" / f"{st.st_dev}-{st.st_ino}.json")
+        data = json.loads(stamp.read_text(encoding="utf-8"))
+        self.assertEqual({k: data[k] for k in ("version", "inputKey", "componentKeys", "bundlePath")},
+                         {"version": 1, "inputKey": KEY_IN, "componentKeys": {"sparkle": KEY_OTHER},
+                          "bundlePath": str(self.dest)})
+        self.assertEqual(data["inventory"], dpc.bundle_inventory(self.dest))
+        self.assertNotIn(".", [entry[0] for entry in data["inventory"]])  # the root itself is not inventoried
+        link = os.lstat(self.dest / "Contents/Resources/link")
+        self.assertIn(["Contents/Resources/link", "link", link.st_mode, link.st_size, link.st_mtime_ns, link.st_ino,
+                       "../MacOS/RepoPrompt"], data["inventory"])
+        result, err = self.decide(self.dest)
+        self.assertEqual(result, {"outcome": "noop-dest", "dest_stamp": str(stamp), "source_stamp": "none",
+                                  "built_at": data["builtAt"]})
+        self.assertIn("Debug package reuse: noop-dest", err)
+
+    def test_inventory_ignores_root_timestamps_ctime_and_xattrs_across_a_cross_parent_rename(self) -> None:
+        stamp = self.record(self.dest)
+        moved = self.base / "elsewhere" / BUNDLE
+        moved.parent.mkdir()
+        os.rename(self.dest, moved)  # publish and activation keep the root inode under a new parent
+        os.utime(moved, ns=(1, 1))
+        exe = moved / "Contents" / "MacOS" / "RepoPrompt"
+        mode = os.lstat(exe).st_mode
+        os.chmod(exe, 0o600)
+        os.chmod(exe, mode & 0o7777)  # ctime moved, nothing else
+        self.assertEqual(os.lstat(exe).st_mode, mode)
+        if sys.platform == "darwin" and Path("/usr/bin/xattr").exists():
+            for target in (moved, exe, moved / "Contents"):
+                subprocess.run(["/usr/bin/xattr", "-w", "com.repoprompt.test", "1", str(target)], check=True)
+            self.assertIn("com.repoprompt.test", subprocess.run(["/usr/bin/xattr", str(exe)], text=True,
+                                                                 capture_output=True, check=True).stdout)
+        result, _ = self.decide(moved)
+        self.assertEqual((result["outcome"], result["dest_stamp"]), ("noop-dest", str(stamp)))
+
+    def test_content_changes_and_a_recreated_bundle_give_fresh(self) -> None:
+        mutations = {
+            "touch": lambda b: os.utime(b / "Contents/Resources/data.json", ns=(1, 1)),
+            "rename": lambda b: os.rename(b / "Contents/Resources/data.json", b / "Contents/Resources/renamed.json"),
+            "added .DS_Store": lambda b: (b / ".DS_Store").write_text("x", encoding="utf-8"),
+            "mode": lambda b: os.chmod(b / "Contents/MacOS/RepoPrompt", 0o700),
+            "symlink retarget": lambda b: (os.unlink(b / "Contents/Resources/link"),
+                                           os.symlink("elsewhere", b / "Contents/Resources/link")),
+            "replaced file": lambda b: (os.unlink(b / "Contents/Resources/data.json"),
+                                        (b / "Contents/Resources/data.json").write_text("{}", encoding="utf-8")),
+        }
+        for label, mutate in mutations.items():
+            with self.subTest(label):
+                bundle = make_bundle(self.base / label / BUNDLE)
+                stamp = self.record(bundle)
+                mutate(bundle)
+                result, err = self.decide(bundle)
+                self.assertEqual((result["outcome"], result["dest_stamp"]), ("fresh", str(stamp)))
+                self.assertIn("destination changed since it was stamped", err)
+        self.record(self.dest)
+        shutil.rmtree(self.dest)
+        make_bundle(self.dest)  # new root inode: no stamp applies
+        result, err = self.decide(self.dest)
+        self.assertEqual(result["outcome"], "fresh")
+
+    def test_other_inputs_keep_the_stamp_and_corrupt_or_unknown_stamps_are_forgotten(self) -> None:
+        stamp = self.record(self.dest, key=KEY_OTHER)
+        result, err = self.decide(self.dest)
+        self.assertEqual(result["outcome"], "fresh")
+        self.assertIn("built from other inputs", err)
+        self.assertTrue(stamp.exists())
+        valid = json.loads(stamp.read_text(encoding="utf-8"))
+        for text in (b"{", b"[]", json.dumps(dict(valid, version=2)).encode(), json.dumps({"version": 1}).encode(),
+                     json.dumps(dict(valid, inventory="x")).encode(), b"\xff", b'{"version": 1, "inputKey": "\xff"}'):
+            with self.subTest(text=text[:20]):
+                stamp.write_bytes(text)
+                result, err = self.decide(self.dest, key=KEY_OTHER)
+                self.assertEqual((result["outcome"], result["dest_stamp"]), ("fresh", str(stamp)))
+                self.assertIn("WARNING: corrupt or unknown-schema package stamp", err)
+                self.assertFalse(stamp.exists())
+
+    def test_noop_clone_needs_an_absent_destination_and_a_distinct_stamped_source(self) -> None:
+        source = self.dest
+        stamp = self.record(source)
+        staged = self.base / "DebugApps" / ".staging" / "token" / BUNDLE
+        result, err = self.decide(staged, source)
+        self.assertEqual(result, {"outcome": "noop-clone", "dest_stamp": "none", "source_stamp": str(stamp),
+                                  "built_at": json.loads(stamp.read_text(encoding="utf-8"))["builtAt"]})
+        make_bundle(staged)  # a present destination is never cloned over
+        result, err = self.decide(staged, source)
+        self.assertEqual((result["outcome"], result["source_stamp"]), ("fresh", "none"))
+        self.assertIn("destination has no stamp", err)
+        shutil.rmtree(staged)
+        link = self.base / "link.app"
+        os.symlink(source, link)
+        for label, candidate, key, reason in (
+            ("source is the destination", staged, KEY_IN, "reuse source is the destination"),
+            ("missing source", self.base / "missing.app", KEY_IN, "reuse source is missing or not a directory"),
+            ("symlink source", link, KEY_IN, "reuse source is missing or not a directory"),
+            ("other inputs", source, KEY_OTHER, "reuse source was built from other inputs"),
+            ("no source", None, KEY_IN, "destination absent and no reuse source"),
+        ):
+            with self.subTest(label):
+                result, err = self.decide(staged, candidate, key=key)
+                self.assertEqual(result["outcome"], "fresh")
+                self.assertIn(reason, err)
+        (source / "Contents" / "new").write_text("x", encoding="utf-8")
+        result, err = self.decide(staged, source)
+        self.assertEqual((result["outcome"], result["source_stamp"]), ("fresh", str(stamp)))
+        self.assertIn("reuse source changed since it was stamped", err)
+
+    def test_record_keeps_eight_newest_plus_protected_stamps_and_drops_stale_temps(self) -> None:
+        directory = self.cache / "stamps"
+        directory.mkdir(parents=True)
+        for index in range(12):
+            path = directory / f"1-{index}.json"
+            path.write_text("{}", encoding="utf-8")
+            os.utime(path, ns=(index * 10**9 + 10**9, index * 10**9 + 10**9))
+        stale = directory / ".1-99.json.tmp.1.dead"
+        stale.write_text("x", encoding="utf-8")
+        os.utime(stale, (1, 1))
+        recent = directory / ".1-98.json.tmp.2.beef"
+        recent.write_text("x", encoding="utf-8")
+        stamp = self.record(self.dest, protected=[directory / "1-0.json"])
+        kept = sorted(p.name for p in directory.iterdir())
+        expected = sorted([stamp.name, recent.name, "1-0.json", *(f"1-{index}.json" for index in range(5, 12))])
+        self.assertEqual(kept, expected)
+
+    def test_forget_removes_only_named_stamps(self) -> None:
+        stamp = self.record(self.dest)
+        out = io.StringIO()
+        dpc.forget(self.cache, [], stamps=[stamp, self.cache / "stamps" / "9-9.json"], out=out, err=io.StringIO())
+        self.assertIn("forgotten=1", out.getvalue())
+        self.assertFalse(stamp.exists())
+        outside = self.base / "1-1.json"
+        outside.write_text("{}", encoding="utf-8")
+        notes = self.cache / "stamps" / "notes.txt"
+        notes.write_text("x", encoding="utf-8")
+        for path in (outside, notes):
+            with self.subTest(path=path.name), self.assertRaises(dpc.ComponentCacheError):
+                dpc.forget(self.cache, [], stamps=[path], out=io.StringIO(), err=io.StringIO())
+            self.assertTrue(path.exists())
+
+    def test_record_and_forget_cli_validation(self) -> None:
+        helper = [sys.executable, "-I", "-S", str(SCRIPT_DIR / "debug_package_cache.py")]
+        base = helper + ["record", "--cache-root", str(self.cache), "--bundle", str(self.dest)]
+        for extra in (["--input-key", "x" * 64, "--component", f"sparkle={KEY_OTHER}"],
+                      ["--input-key", KEY_IN, "--component", "sparkle=short"],
+                      ["--input-key", KEY_IN]):
+            with self.subTest(extra=extra[:2]):
+                result = subprocess.run(base + extra, text=True, capture_output=True)
+                self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertFalse(self.cache.exists())
+        missing = subprocess.run(helper + ["record", "--cache-root", str(self.cache), "--bundle", str(self.base / "gone"),
+                                           "--input-key", KEY_IN, "--component", f"sparkle={KEY_OTHER}"],
+                                 text=True, capture_output=True)
+        self.assertEqual(missing.returncode, 1)
+        self.assertIn("REPOPROMPT_DEBUG_PACKAGE_CACHE=off", missing.stderr)
+        good = subprocess.run(base + ["--input-key", KEY_IN, "--component", f"sparkle={KEY_OTHER}"], text=True,
+                              capture_output=True)
+        self.assertEqual(good.returncode, 0, good.stderr)
+        self.assertEqual([line.split("=", 1)[0] for line in good.stdout.splitlines()], ["schema", "stamp", "pruned_stamps"])
+        nothing = subprocess.run(helper + ["forget", "--cache-root", str(self.cache)], text=True, capture_output=True)
+        self.assertEqual(nothing.returncode, 2)
+
+
+class PlanReuseTests(unittest.TestCase):
+    """plan's outcome decision and its bundle-reuse switches (unit)."""
+
+    def setUp(self) -> None:
+        self.base = Path(tempfile.mkdtemp(prefix="rpce-dpc-plan-reuse-"))
+        self.addCleanup(shutil.rmtree, self.base, True)
+        self.cache = self.base / "cache" / "v1"
+        self.dest = make_bundle(self.base / "dest" / BUNDLE)
+        out = io.StringIO()
+        dpc.record(self.cache, self.dest, KEY_IN, [], out=out, err=io.StringIO())
+        self.stamp = Path(out.getvalue().split("stamp=", 1)[1].splitlines()[0])
+        os.utime(self.stamp, ns=(10**9, 10**9))
+
+    def plan(self, *, cache: str = "on", cert: str = SHA_A, environ: Optional[dict] = None,
+             dest: Optional[Path] = None, source: Optional[Path] = None) -> Tuple[dict, str]:
+        out, err = io.StringIO(), io.StringIO()
+        dpc.plan(cache=cache, cert=cert, root=self.base, scripts_dir=self.base, build_dir=self.base, fields={},
+                 cache_root=self.cache, package_dest=dest or self.dest, reuse_source=source, environ=environ or {},
+                 out=out, err=err, compute=lambda **_: {name: KEY_IN for name in dpc.PLAN_KEYS},
+                 git_reader=lambda _root: (None, None, False))
+        return dict(line.split("=", 1) for line in out.getvalue().splitlines()[1:]), err.getvalue()
+
+    def test_matching_stamp_gives_noop_dest_and_refreshes_its_recency(self) -> None:
+        values, _ = self.plan()
+        self.assertEqual((values["outcome"], values["bundle_reuse"], values["dest_stamp"]), ("noop-dest", "1", str(self.stamp)))
+        self.assertGreater(os.stat(self.stamp).st_mtime_ns, 10**9)
+        staged = self.base / "staging" / BUNDLE
+        values, _ = self.plan(dest=staged, source=self.dest)
+        self.assertEqual((values["outcome"], values["source_stamp"], values["dest_stamp"]),
+                         ("noop-clone", str(self.stamp), "none"))
+
+    def test_sentry_off_and_unresolved_never_reuse_or_read_stamps(self) -> None:
+        cases = {f"upload {value}": {"REPOPROMPT_UPLOAD_SENTRY_SYMBOLS": value} for value in sorted(dpc.TRUTHY)}
+        cases["sentry"] = {"REPOPROMPT_ENABLE_SENTRY": "1"}
+        for label, environ in cases.items():
+            with self.subTest(label):
+                values, err = self.plan(environ=environ)
+                self.assertEqual((values["outcome"], values["bundle_reuse"], values["receipts_allowed"]), ("fresh", "0", "1"))
+                self.assertEqual((values["dest_stamp"], values["source_stamp"]), ("none", "none"))
+                self.assertIn("bundle reuse disabled", err)
+                self.assertEqual(os.stat(self.stamp).st_mtime_ns, 10**9)  # not even read for recency
+        for cache, cert in (("off", SHA_A), ("on", "unresolved")):
+            with self.subTest(cache=cache, cert=cert):
+                values, _ = self.plan(cache=cache, cert=cert, dest=self.base / "staging" / BUNDLE, source=self.dest)
+                self.assertEqual((values["outcome"], values["bundle_reuse"], values["source_stamp"]), ("fresh", "0", "none"))
+                self.assertEqual(os.stat(self.stamp).st_mtime_ns, 10**9)
+        for value in ("0", "", "false"):
+            with self.subTest(upload=value):
+                self.assertEqual(self.plan(environ={"REPOPROMPT_UPLOAD_SENTRY_SYMBOLS": value})[0]["outcome"], "noop-dest")
+
+    def test_truthy_and_sentry_rules_mirror_package_app(self) -> None:
+        script = (SCRIPT_DIR / "package_app.sh").read_text(encoding="utf-8")
+        truthy = script.split("\ntruthy(){\n", 1)[1].split("\n}\n", 1)[0]
+        cases = re.search(r"^\s*([^)\n]+)\) return 0 ;;$", truthy, re.M).group(1)
+        self.assertEqual(set(cases.split("|")), dpc.TRUTHY)
+        self.assertIn('    [[ "${REPOPROMPT_ENABLE_SENTRY:-}" == "1" ]]\n', script.split("\nsentry_linking_enabled(){\n", 1)[1])
+        self.assertIn('if truthy "${REPOPROMPT_UPLOAD_SENTRY_SYMBOLS:-}"; then', script)
+
+
+class PackageScriptReuseTests(unittest.TestCase):
+    """package_app.sh wiring for noop-dest / noop-clone (static plus stubbed shell probes)."""
+
+    GATE = "if (( ! DEBUG_PACKAGE_REUSED )); then"
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.script = (SCRIPT_DIR / "package_app.sh").read_text(encoding="utf-8")
+
+    def gated_text(self, gate: str) -> str:
+        """Text inside every block opened by ``gate`` (nesting-aware over shell if/fi lines)."""
+        lines = self.script.splitlines()
+        regions: List[str] = []
+        for index, line in enumerate(lines):
+            if line.strip() != gate:
+                continue
+            depth = 0
+            for inner in lines[index:]:
+                stripped = inner.strip()
+                if stripped.startswith("if ") and stripped.endswith("; then"):
+                    depth += 1
+                elif stripped == "fi":
+                    depth -= 1
+                regions.append(inner)
+                if depth == 0:
+                    break
+            self.assertEqual(depth, 0, f"unterminated {gate} at line {index + 1}")
+        return "\n".join(regions) + "\n"
+
+    def test_every_verification_runs_on_every_outcome_and_only_assembly_and_signing_are_skipped(self) -> None:
+        gated = self.gated_text(self.GATE)
+        checks = (
+            'verify_sparkle_vendor.sh" "$SPARKLE_FRAMEWORK"',
+            'run "$CONTROL_PLANE_SCRIPTS_DIR/validate_required_swiftpm_resource_bundles.sh" "$APP_BUNDLE"',
+            'run plutil -lint "$APP_BUNDLE/Contents/Info.plist"',
+            'validate_json.py" \\\n        "$APP_BUNDLE/Contents/Resources/RepoPromptDebugProvenance.json"',
+            'run codesign --verify --deep --strict --verbose=2 "$APP_BUNDLE"',
+            "\nverify_signed_app_identity\n",
+            '"$ARCHITECTURE_POLICY" "Post-sign packaged app"',
+            'validate_embedded_mcp_helper_layout.sh" "$APP_BUNDLE"',
+            'smoke_embedded_mcp_helper.sh" "$APP_BUNDLE"',
+        )
+        for check in checks:
+            with self.subTest(check=check):
+                self.assertEqual(self.script.count(check), 1)
+                self.assertNotIn(check.strip("\n"), gated)
+        skipped = (
+            'run cp "$BUILD_DIR/$exe" "$APP_BUNDLE/Contents/MacOS/$exe"',
+            'run cp -R "$bundle" "$APP_BUNDLE/Contents/Resources/"',
+            'normalize_swiftpm_resource_bundles.sh" "$APP_BUNDLE"',
+            "Path('$APP_BUNDLE/Contents/Info.plist').write_text(s)",
+            'run cp -R "$SPARKLE_FRAMEWORK" "$APP_BUNDLE/Contents/Frameworks/"',
+            "run install_name_tool -add_rpath",
+            '"Pre-sign packaged app"',
+            "path.write_text(json.dumps(payload",
+            "    sign_debug_component_misses\n",
+            'sign_path "$APP_BUNDLE/Contents/MacOS/repoprompt-mcp"',
+            '    sign_path "$APP_BUNDLE"\n',
+        )
+        for mutation in skipped:
+            with self.subTest(mutation=mutation):
+                self.assertIn(mutation, gated)
+        assignments = [line for line in self.script.splitlines()
+                       if "DEBUG_PACKAGE_REUSED=1" in line and not line.lstrip().startswith("#")]
+        self.assertEqual(assignments, ["        noop-dest|noop-clone) DEBUG_PACKAGE_REUSED=1 ;;"])
+        # noop-dest skips only publish; noop-clone publishes its verified clone.
+        publish_gate = self.gated_text('if [[ "$DEBUG_PACKAGE_OUTCOME" != "noop-dest" ]]; then')
+        self.assertIn("debug_package_cache.py\" publish --new", publish_gate)
+        self.assertNotIn("verify", publish_gate)
+
+    def layout_probe(self, outcome: str) -> Tuple[subprocess.CompletedProcess, Path]:
+        temp = Path(tempfile.mkdtemp(prefix="rpce-dpc-layout-"))
+        self.addCleanup(shutil.rmtree, temp, True)
+        layout = self.script.split('phase "Creating app bundle layout"\n', 1)[1].split(f"{self.GATE}\nrun mkdir -p", 1)[0]
+        dest = temp / "DebugApps" / BUNDLE
+        if outcome == "noop-dest":
+            make_bundle(dest)
+        source = make_bundle(temp / "live" / BUNDLE)
+        probe = ("set -euo pipefail\nphase(){ :; }\nrun(){ \"$@\"; }\npython3(){ echo \"python3 $*\"; }\n"
+                 "paths_same(){ echo 0; }\nfail(){ echo \"ERROR: $*\" >&2; exit 1; }\n"
+                 "clone_tree(){ echo \"clone $1 -> $2\"; cp -R \"$1\" \"$2\"; }\n"
+                 f"IS_RELEASE=0 APP_BUNDLE={shlex.quote(str(dest))} COMPAT_APP_BUNDLE=/nonexistent TEMP_PARENT=''\n"
+                 "CONTROL_PLANE_SCRIPTS_DIR=/scripts\n"
+                 f"DEBUG_PACKAGE_OUTCOME={outcome} DEBUG_PACKAGE_BUILT_AT=2026-10-16T00:00:00+00:00\n"
+                 f"REPOPROMPT_DEBUG_APP_REUSE_SOURCE={shlex.quote(str(source))}\n"
+                 + layout + 'echo "APP_BUNDLE=$APP_BUNDLE"\necho "TEMP_PARENT=$TEMP_PARENT"\n')
+        return subprocess.run(["bash", "-c", probe], text=True, capture_output=True), dest
+
+    def test_noop_dest_verifies_in_place_and_noop_clone_clones_into_a_hidden_sibling(self) -> None:
+        result, dest = self.layout_probe("noop-dest")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(f"PACKAGE NO-OP: {dest} unchanged since 2026-10-16T00:00:00+00:00", result.stdout)
+        self.assertIn(f"APP_BUNDLE={dest}\nTEMP_PARENT=\n", result.stdout)
+        self.assertNotIn("clone ", result.stdout)
+        self.assertEqual([p.name for p in dest.parent.iterdir()], [BUNDLE])
+        result, dest = self.layout_probe("noop-clone")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        temp_parent = Path(result.stdout.split("TEMP_PARENT=", 1)[1].strip())
+        self.assertTrue(temp_parent.name.startswith(".rpce-package-"))
+        self.assertEqual(temp_parent.parent, dest.parent)
+        self.assertIn(f"APP_BUNDLE={temp_parent / BUNDLE}\n", result.stdout)
+        self.assertIn("PACKAGE REUSE: cloning ", result.stdout)
+        self.assertTrue((temp_parent / BUNDLE / "Contents" / "MacOS" / "RepoPrompt").is_file())
+        self.assertFalse(dest.exists())  # published only after verification
+        result, dest = self.layout_probe("fresh")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("clone ", result.stdout)
+        self.assertFalse(Path(result.stdout.split("TEMP_PARENT=", 1)[1].strip(), BUNDLE).exists())
+
+    def test_stamps_are_recorded_after_publish_and_forgotten_on_failure(self) -> None:
+        script = self.script
+        record_gate = ('if (( ! IS_RELEASE )) && [[ "$DEBUG_PACKAGE_BUNDLE_REUSE" == "1" && '
+                       '"$DEBUG_PACKAGE_OUTCOME" != "noop-dest" ]]; then\n')
+        self.assertEqual(script.count("debug_package_cache.py\" record --cache-root"), 1)
+        record = script.index("debug_package_cache.py\" record --cache-root")
+        self.assertLess(script.index(record_gate), record)
+        self.assertLess(script.index('publish --new "$APP_BUNDLE"'), record)
+        self.assertLess(script.index('run ln -sfn "$APP_BUNDLE" "$COMPAT_APP_BUNDLE"'), record)
+        self.assertLess(record, script.index("printf 'Created: %s\\n' \"$APP_BUNDLE\""))
+        self.assertIn('--bundle "$APP_BUNDLE" --input-key "$DEBUG_PACKAGE_INPUT_KEY"', script)
+        self.assertIn('echo "WARNING: could not record the debug package stamp;', script)
+        self.assertIn('DEBUG_PACKAGE_RECORD_ARGS+=(--keep-stamp "$DEBUG_PACKAGE_SOURCE_STAMP")', script)
+        for name in ("DEST", "SOURCE"):
+            self.assertIn(f'[[ "$DEBUG_PACKAGE_{name}_STAMP" == "none" ]] || '
+                          f'DEBUG_PACKAGE_STAMPS_USED+=("$DEBUG_PACKAGE_{name}_STAMP")', script)
+        self.assertIn('for entry in ${DEBUG_PACKAGE_STAMPS_USED[@]+"${DEBUG_PACKAGE_STAMPS_USED[@]}"}; '
+                      'do forget_args+=(--stamp "$entry"); done',
+                      script.split("\nfinish(){\n", 1)[1].split("\n}\ntrap", 1)[0])
+        self.assertIn('DEBUG_PACKAGE_STAMPS_USED=()\n', script.split("\ntrap 'finish $?' EXIT", 1)[0])
+
+    def test_provenance_uses_the_plan_git_snapshot_without_a_second_git_query(self) -> None:
+        writer = self.script.split('GIT_STATE_FOR_PROVENANCE="$DEBUG_PACKAGE_GIT_STATE" python3 - <<\'PY\'\n', 1)[1]
+        writer = writer.split("\nPY\n", 1)[0]
+        self.assertNotIn("subprocess", writer)
+        self.assertNotIn("rev-parse", writer)
+        self.assertEqual(self.script.count("rev-parse"), 0)
+        for git in (("trunk", "a" * 40, True), (None, None, False)):
+            with self.subTest(git=git), tempfile.TemporaryDirectory() as tmp:
+                bundle = Path(tmp) / BUNDLE
+                (bundle / "Contents" / "Resources").mkdir(parents=True)
+                env = dict(os.environ, ROOT_DIR_FOR_PROVENANCE=tmp, APP_BUNDLE_FOR_PROVENANCE=str(bundle),
+                           GIT_STATE_FOR_PROVENANCE=dpc.git_state_json(git))
+                subprocess.run([sys.executable, "-"], input=writer, text=True, env=env, check=True, capture_output=True)
+                payload = json.loads((bundle / "Contents/Resources/RepoPromptDebugProvenance.json").read_text())
+                self.assertEqual((payload["branch"], payload["commit"], payload["dirty"]), git)
+                self.assertEqual(sorted(payload), ["branch", "buildTimeEpoch", "buildTimeISO", "commit", "dirty",
+                                                   "repoRoot", "version", "worktreeName", "worktreePath"])
 
 
 if __name__ == "__main__":

@@ -191,8 +191,9 @@ class ReleaseToolingTests(unittest.TestCase):
     def test_local_self_signed_outer_codesign_uses_equals_requirement_argv(self) -> None:
         package_script = (SCRIPT_DIR / "package_app.sh").read_text(encoding="utf-8")
         sign_path_body = package_script.split("sign_path(){", 1)[1].split("\n}\nsign_sparkle_framework(){", 1)[0]
+        # Step 6: the signing block ends with the debug bundle-reuse gate's `fi`; the captured body is unchanged.
         app_signing_body = package_script.split("APP_SIGN_ARGS=()", 1)[1].split(
-            'PACKAGE_TIMING_DEEP="ran"\nrun codesign --verify --deep --strict',
+            'fi\nPACKAGE_TIMING_DEEP="ran"\nrun codesign --verify --deep --strict',
             1,
         )[0]
         temp_dir = Path(tempfile.mkdtemp())
@@ -266,7 +267,9 @@ APP_SIGN_ARGS=(){app_signing_body}
         )[0]
         # Debug with the signed component cache: misses are signed in cache entries, so the bundle
         # signs only its outer seal. Release and uncached debug keep the nested signing lines verbatim.
+        # Step 6: a reused debug bundle (noop-dest/noop-clone; always 0 in release) signs nothing.
         self.assertTrue(signing_calls.startswith(
+            "if (( ! DEBUG_PACKAGE_REUSED )); then\n"
             "if (( DEBUG_PACKAGE_COMPONENTS )); then\n    sign_debug_component_misses\nelse\n"
             'if [[ -d "$APP_BUNDLE/Contents/Frameworks/Sparkle.framework" ]]; then sign_sparkle_framework '
             '"$APP_BUNDLE/Contents/Frameworks/Sparkle.framework"; fi\n'
@@ -285,6 +288,7 @@ APP_SIGN_ARGS=(){app_signing_body}
             "sign_debug_component_misses(){ echo components; }\n"
             f"APP_NAME=RepoPrompt\nAPP_BUNDLE='{app_bundle}'\nAPP_ENTITLEMENTS=/tmp/e.plist\n"
             "USE_ADHOC_SIGNING=0\nUSE_LOCAL_SELF_SIGNED_RELEASE=0\nIS_RELEASE=\"$1\"\nDEBUG_PACKAGE_COMPONENTS=\"$2\"\n"
+            "DEBUG_PACKAGE_REUSED=\"${3:-0}\"\n"
             + signing_calls,
             encoding="utf-8",
         )
@@ -311,6 +315,11 @@ APP_SIGN_ARGS=(){app_signing_body}
             result = subprocess.run([str(probe), "0", "1"], text=True, capture_output=True)
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(result.stdout.splitlines(), ["components", str(app_bundle)])
+        for components in ("0", "1"):
+            with self.subTest(debug_bundle_reused=True, components=components):
+                result = subprocess.run([str(probe), "0", components, "1"], text=True, capture_output=True)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout.splitlines(), [])
 
     def test_custom_packaging_resigns_sparkle_helpers_without_recursive_entitlement_propagation(self) -> None:
         package_script = (SCRIPT_DIR / "package_app.sh").read_text(encoding="utf-8")

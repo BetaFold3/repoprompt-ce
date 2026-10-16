@@ -7898,6 +7898,7 @@ def package_debug_app_under_heavy(repo_root: Path, operation_label: str) -> Tupl
     )
     env = os.environ.copy()
     env["REPOPROMPT_DEBUG_APP_BUNDLE"] = str(staged_bundle)
+    env["REPOPROMPT_DEBUG_APP_REUSE_SOURCE"] = str(live_bundle)
     try:
         with machine_heavy_slot(metadata, env, "global heavy slot for debug package"):
             code, _stdout, _stderr = run_operation_command(

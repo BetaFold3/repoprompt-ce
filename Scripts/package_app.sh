@@ -38,6 +38,11 @@ DEBUG_PACKAGE_COMPONENT_TEMPS=()
 DEBUG_PACKAGE_COMPONENT_USED=()
 DEBUG_PACKAGE_COMPONENT_COMMITTED=0
 DEBUG_PACKAGE_CLONE_FALLBACK_REPORTED=0
+# Debug bundle reuse: DEBUG_PACKAGE_REUSED=1 for the noop-dest and noop-clone outcomes (no assembly or
+# signing; full verification). After a failure, finish() forgets every destination and source stamp the plan
+# consulted, matching or not (conservative: at most one extra fresh package).
+DEBUG_PACKAGE_REUSED=0
+DEBUG_PACKAGE_STAMPS_USED=()
 package_timing_record(){
     local elapsed_ms="?" name="$PACKAGE_TIMING_PHASE"
     package_timing_now
@@ -130,13 +135,15 @@ finish(){
     if (( ${#DEBUG_PACKAGE_COMPONENT_TEMPS[@]} )); then
         rm -rf "${DEBUG_PACKAGE_COMPONENT_TEMPS[@]}" || true
     fi
-    if (( status != 0 && ${#DEBUG_PACKAGE_COMPONENT_USED[@]} )); then
+    if (( status != 0 && ${#DEBUG_PACKAGE_COMPONENT_USED[@]} + ${#DEBUG_PACKAGE_STAMPS_USED[@]} )); then
         local forget_args=() entry
-        for entry in "${DEBUG_PACKAGE_COMPONENT_USED[@]}"; do forget_args+=(--entry "$entry"); done
+        # ${arr[@]+...}: an empty array is unbound under set -u on bash < 4.4.
+        for entry in ${DEBUG_PACKAGE_COMPONENT_USED[@]+"${DEBUG_PACKAGE_COMPONENT_USED[@]}"}; do forget_args+=(--entry "$entry"); done
+        for entry in ${DEBUG_PACKAGE_STAMPS_USED[@]+"${DEBUG_PACKAGE_STAMPS_USED[@]}"}; do forget_args+=(--stamp "$entry"); done
         if python3 -I -S "$CONTROL_PLANE_SCRIPTS_DIR/debug_package_cache.py" forget --cache-root "$DEBUG_PACKAGE_CACHE_ROOT" "${forget_args[@]}" >/dev/null; then
-            echo "ERROR: evicted the cached signed components this failed run used; the next package signs them again." >&2
+            echo "ERROR: evicted the cached signed components and bundle stamps this failed run used; the next package signs and assembles again." >&2
         else
-            echo "WARNING: could not evict the cached signed components this failed run used; they may be reused by the next package." >&2
+            echo "WARNING: could not evict the cached signed components and bundle stamps this failed run used; they may be reused by the next package." >&2
         fi
         echo "ERROR: if packaging keeps failing, retry with REPOPROMPT_DEBUG_PACKAGE_CACHE=off or clear the cache while no package job runs: rm -rf \"$ROOT_DIR/.build/debug/package-cache\"" >&2
     fi
@@ -401,6 +408,11 @@ read_debug_package_output(){
         case "$key" in
             cert) DEBUG_PACKAGE_CERT="$value" ;;
             outcome) DEBUG_PACKAGE_OUTCOME="$value" ;;
+            bundle_reuse) DEBUG_PACKAGE_BUNDLE_REUSE="$value" ;;
+            git_state) DEBUG_PACKAGE_GIT_STATE="$value" ;;
+            dest_stamp) DEBUG_PACKAGE_DEST_STAMP="$value" ;;
+            source_stamp) DEBUG_PACKAGE_SOURCE_STAMP="$value" ;;
+            built_at) DEBUG_PACKAGE_BUILT_AT="$value" ;;
             cache) DEBUG_PACKAGE_CACHE_REPORTED="$value" ;;
             receipts_allowed) DEBUG_PACKAGE_RECEIPTS_ALLOWED="$value" ;;
             signing_policy_key) DEBUG_PACKAGE_SIGNING_POLICY_KEY="$value" ;;
@@ -499,7 +511,9 @@ sign_debug_component_misses(){
 }
 if (( ! IS_RELEASE )); then
     # Debug package keys. With receipts allowed they select the signed component cache entries
-    # below; every package still signs the outer bundle and runs full verification.
+    # below and, through bundle stamps, the outcome: fresh (assemble and sign), noop-dest (the
+    # destination is unchanged) or noop-clone (clone a stamped reuse source). Every outcome runs
+    # full verification. The plan's single Git snapshot also feeds the generated provenance.
     phase "Computing debug package keys"
     [[ "$SIGN_IDENTITY" == "-" ]] || load_codesigning_identities
     DEBUG_PACKAGE_HELPER_OUTPUT="$(
@@ -510,6 +524,8 @@ if (( ! IS_RELEASE )); then
         python3 -I -S "$CONTROL_PLANE_SCRIPTS_DIR/debug_package_cache.py" plan \
             --cache "$DEBUG_PACKAGE_CACHE_MODE" --cert "$DEBUG_PACKAGE_CERT" \
             --root "$ROOT_DIR" --scripts-dir "$CONTROL_PLANE_SCRIPTS_DIR" --build-dir "$BUILD_DIR" \
+            --cache-root "$DEBUG_PACKAGE_CACHE_ROOT" --dest "$APP_BUNDLE" \
+            --reuse-source "${REPOPROMPT_DEBUG_APP_REUSE_SOURCE:-}" \
             --field CONF="$CONF" --field APP_NAME="$APP_NAME" --field DISPLAY_NAME="$DISPLAY_NAME" \
             --field BUNDLE_ID="$BUNDLE_ID" --field URL_SCHEME="$URL_SCHEME" \
             --field MARKETING_VERSION="$MARKETING_VERSION" --field BUILD_NUMBER="$BUILD_NUMBER" \
@@ -519,14 +535,24 @@ if (( ! IS_RELEASE )); then
             --field LOCAL_SIGNING_CERTIFICATE_SHA256="$LOCAL_SIGNING_CERTIFICATE_SHA256" \
             --field LOCAL_SIGNING_SERVICE_GENERATION="$LOCAL_SIGNING_SERVICE_GENERATION"
     )" || fail "debug_package_cache.py plan exited with status $?."
-    read_debug_package_output plan "$DEBUG_PACKAGE_HELPER_OUTPUT" outcome cache cert receipts_allowed signing_policy_key input_key sparkle_key helper_mcp_key helper_gateway_key
+    read_debug_package_output plan "$DEBUG_PACKAGE_HELPER_OUTPUT" outcome cache cert receipts_allowed bundle_reuse \
+        signing_policy_key input_key sparkle_key helper_mcp_key helper_gateway_key git_state dest_stamp source_stamp built_at
     PACKAGE_TIMING_OUTCOME="$DEBUG_PACKAGE_OUTCOME"
-    printf 'Debug package plan: outcome=%s cache=%s cert=%s receipts_allowed=%s input_key=%s\n' \
-        "$DEBUG_PACKAGE_OUTCOME" "$DEBUG_PACKAGE_CACHE_REPORTED" "$DEBUG_PACKAGE_CERT" "$DEBUG_PACKAGE_RECEIPTS_ALLOWED" "$DEBUG_PACKAGE_INPUT_KEY"
+    case "$DEBUG_PACKAGE_OUTCOME" in
+        fresh) ;;
+        noop-dest|noop-clone) DEBUG_PACKAGE_REUSED=1 ;;
+        *) fail "debug_package_cache.py plan printed an unknown outcome '$DEBUG_PACKAGE_OUTCOME'." ;;
+    esac
+    [[ "$DEBUG_PACKAGE_DEST_STAMP" == "none" ]] || DEBUG_PACKAGE_STAMPS_USED+=("$DEBUG_PACKAGE_DEST_STAMP")
+    [[ "$DEBUG_PACKAGE_SOURCE_STAMP" == "none" ]] || DEBUG_PACKAGE_STAMPS_USED+=("$DEBUG_PACKAGE_SOURCE_STAMP")
+    printf 'Debug package plan: outcome=%s cache=%s cert=%s receipts_allowed=%s bundle_reuse=%s input_key=%s\n' \
+        "$DEBUG_PACKAGE_OUTCOME" "$DEBUG_PACKAGE_CACHE_REPORTED" "$DEBUG_PACKAGE_CERT" "$DEBUG_PACKAGE_RECEIPTS_ALLOWED" \
+        "$DEBUG_PACKAGE_BUNDLE_REUSE" "$DEBUG_PACKAGE_INPUT_KEY"
     printf 'Debug package component keys: signing_policy=%s sparkle=%s repoprompt-mcp=%s repoprompt-gateway=%s\n' \
         "$DEBUG_PACKAGE_SIGNING_POLICY_KEY" "$DEBUG_PACKAGE_SPARKLE_KEY" "$DEBUG_PACKAGE_HELPER_MCP_KEY" "$DEBUG_PACKAGE_HELPER_GATEWAY_KEY"
     # Cache off or an unresolved identity: no component cache reads or writes; today's signing path.
-    if [[ "$DEBUG_PACKAGE_RECEIPTS_ALLOWED" == "1" ]]; then
+    # A reused bundle signs nothing, so it looks up no components.
+    if [[ "$DEBUG_PACKAGE_RECEIPTS_ALLOWED" == "1" ]] && (( ! DEBUG_PACKAGE_REUSED )); then
         DEBUG_PACKAGE_COMPONENTS=1
         phase "Looking up signed debug components"
         DEBUG_PACKAGE_HELPER_OUTPUT="$(
@@ -577,10 +603,21 @@ else
     run mkdir -p "$(dirname "$PACKAGE_DEST")"
     run python3 -I -S "$CONTROL_PLANE_SCRIPTS_DIR/debug_package_cache.py" cleanup-stale --parent "$(dirname "$PACKAGE_DEST")" --max-age 3600
     APP_BUNDLE_MATCHES_COMPAT="$(paths_same "$PACKAGE_DEST" "$COMPAT_APP_BUNDLE")"
+    if [[ "$DEBUG_PACKAGE_OUTCOME" == "noop-dest" ]]; then
+        # The destination is verified in place below; nothing is assembled, signed or published.
+        printf 'PACKAGE NO-OP: %s unchanged since %s\n' "$PACKAGE_DEST" "$DEBUG_PACKAGE_BUILT_AT"
+    else
     TEMP_PARENT="$(mktemp -d "$(dirname "$PACKAGE_DEST")/.rpce-package-$$-XXXXXXXX")"
     APP_BUNDLE="$TEMP_PARENT/$(basename "$PACKAGE_DEST")"
     printf 'Assembling debug app bundle in hidden sibling: %s\n' "$APP_BUNDLE"
+    fi
+    if [[ "$DEBUG_PACKAGE_OUTCOME" == "noop-clone" ]]; then
+        # The reuse source is only read; its clone is fully verified before publish.
+        printf 'PACKAGE REUSE: cloning %s\n' "$REPOPROMPT_DEBUG_APP_REUSE_SOURCE"
+        clone_tree "$REPOPROMPT_DEBUG_APP_REUSE_SOURCE" "$APP_BUNDLE"
+    fi
 fi
+if (( ! DEBUG_PACKAGE_REUSED )); then
 run mkdir -p "$APP_BUNDLE/Contents/MacOS" "$APP_BUNDLE/Contents/Resources/bin" "$APP_BUNDLE/Contents/Frameworks"
 for exe in "$APP_NAME" repoprompt-mcp repoprompt-gateway; do
     [[ -x "$BUILD_DIR/$exe" ]] || fail "Missing built executable: $BUILD_DIR/$exe"
@@ -603,8 +640,10 @@ shopt -s nullglob
 for bundle in "$BUILD_DIR"/*.bundle; do run cp -R "$bundle" "$APP_BUNDLE/Contents/Resources/"; done
 shopt -u nullglob
 run "$CONTROL_PLANE_SCRIPTS_DIR/normalize_swiftpm_resource_bundles.sh" "$APP_BUNDLE"
+fi
 run "$CONTROL_PLANE_SCRIPTS_DIR/validate_required_swiftpm_resource_bundles.sh" "$APP_BUNDLE" "Packaged app SwiftPM resource bundle layout"
 
+if (( ! DEBUG_PACKAGE_REUSED )); then
 phase "Writing Info.plist"
 run python3 - <<PY
 import plistlib
@@ -617,6 +656,7 @@ if schemes != ['$URL_SCHEME']:
     raise SystemExit('ERROR: packaged Info.plist URL scheme mismatch')
 Path('$APP_BUNDLE/Contents/Info.plist').write_text(s)
 PY
+fi
 run plutil -lint "$APP_BUNDLE/Contents/Info.plist"
 
 if (( USE_LOCAL_SELF_SIGNED_RELEASE )); then
@@ -655,6 +695,7 @@ printf 'Framework destination: %s\n' "$APP_BUNDLE/Contents/Frameworks"
 SPARKLE_FRAMEWORK="$BUILD_DIR/Sparkle.framework"
 REPOPROMPT_RELEASE_SOURCE_ROOT="$ROOT_DIR" \
     "$CONTROL_PLANE_SCRIPTS_DIR/verify_sparkle_vendor.sh" "$SPARKLE_FRAMEWORK"
+if (( ! DEBUG_PACKAGE_REUSED )); then
 if debug_component_hit sparkle; then
     use_cached_debug_component sparkle
 else
@@ -662,42 +703,34 @@ run cp -R "$SPARKLE_FRAMEWORK" "$APP_BUNDLE/Contents/Frameworks/"
 fi
 run install_name_tool -add_rpath @executable_path/../Frameworks "$APP_BUNDLE/Contents/MacOS/$APP_NAME" 2>/dev/null || true
 run "$CONTROL_PLANE_SCRIPTS_DIR/validate_app_architectures.sh" "$APP_BUNDLE" "$ARCHITECTURE_POLICY" "Pre-sign packaged app"
+fi
 
 if (( ! IS_RELEASE )); then
+    # A reused bundle keeps its provenance bytes; its input key already pins the same Git state.
+    if (( ! DEBUG_PACKAGE_REUSED )); then
     phase "Writing debug bundle provenance"
-    ROOT_DIR_FOR_PROVENANCE="$ROOT_DIR" APP_BUNDLE_FOR_PROVENANCE="$APP_BUNDLE" python3 - <<'PY'
+    ROOT_DIR_FOR_PROVENANCE="$ROOT_DIR" APP_BUNDLE_FOR_PROVENANCE="$APP_BUNDLE" GIT_STATE_FOR_PROVENANCE="$DEBUG_PACKAGE_GIT_STATE" python3 - <<'PY'
 from __future__ import annotations
 
 from datetime import datetime, timezone
 from pathlib import Path
 import json
 import os
-import subprocess
 import time
 
 root = Path(os.environ["ROOT_DIR_FOR_PROVENANCE"]).resolve()
 bundle = Path(os.environ["APP_BUNDLE_FOR_PROVENANCE"])
-
-def git(args: list[str]) -> str | None:
-    try:
-        completed = subprocess.run(["git", "-C", str(root), *args], text=True, capture_output=True, timeout=5)
-    except Exception:
-        return None
-    if completed.returncode != 0:
-        return None
-    value = completed.stdout.strip()
-    return value or None
-
-status = git(["status", "--porcelain"])
+# The plan's Git snapshot (also hashed into the input key); no second Git query.
+git_state = json.loads(os.environ["GIT_STATE_FOR_PROVENANCE"])
 now = time.time()
 payload = {
     "version": 1,
     "repoRoot": str(root),
     "worktreePath": str(root),
     "worktreeName": root.name,
-    "branch": git(["rev-parse", "--abbrev-ref", "HEAD"]),
-    "commit": git(["rev-parse", "HEAD"]),
-    "dirty": bool(status),
+    "branch": git_state["branch"],
+    "commit": git_state["commit"],
+    "dirty": bool(git_state["dirty"]),
     "buildTimeEpoch": now,
     "buildTimeISO": datetime.fromtimestamp(now, timezone.utc).astimezone().isoformat(timespec="seconds"),
 }
@@ -705,11 +738,16 @@ path = bundle / "Contents" / "Resources" / "RepoPromptDebugProvenance.json"
 path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 print(f"Debug bundle provenance: {path}")
 PY
+    fi
     run python3 "$CONTROL_PLANE_SCRIPTS_DIR/validate_json.py" \
         "$APP_BUNDLE/Contents/Resources/RepoPromptDebugProvenance.json"
 fi
 
+if (( DEBUG_PACKAGE_REUSED )); then
+    phase "Verifying reused debug app bundle"
+else
 phase "Signing app bundle"
+fi
 sign_path(){
     local path="$1"
     shift || true
@@ -777,6 +815,7 @@ verify_signed_app_identity(){
         [[ -n "$team" && "$team" != "not set" ]] || fail "Debug app was expected to be signed with a stable identity, but no team identifier was found."
     fi
 }
+if (( ! DEBUG_PACKAGE_REUSED )); then
 if (( DEBUG_PACKAGE_COMPONENTS )); then
     sign_debug_component_misses
 else
@@ -800,6 +839,7 @@ if (( ${#APP_SIGN_ARGS[@]} )); then
 else
     sign_path "$APP_BUNDLE"
 fi
+fi
 PACKAGE_TIMING_DEEP="ran"
 run codesign --verify --deep --strict --verbose=2 "$APP_BUNDLE"
 verify_signed_app_identity
@@ -818,8 +858,10 @@ if truthy "${REPOPROMPT_UPLOAD_SENTRY_SYMBOLS:-}"; then
     run "$CONTROL_PLANE_SCRIPTS_DIR/upload_sentry_debug_symbols.sh" "$SENTRY_SYMBOLS_DIR"
 fi
 if (( ! IS_RELEASE )); then
+    if [[ "$DEBUG_PACKAGE_OUTCOME" != "noop-dest" ]]; then
     phase "Publishing debug app bundle"
     run python3 -I -S "$CONTROL_PLANE_SCRIPTS_DIR/debug_package_cache.py" publish --new "$APP_BUNDLE" --dest "$PACKAGE_DEST" --temp-parent "$TEMP_PARENT"
+    fi
     APP_BUNDLE="$PACKAGE_DEST"
     if [[ "$APP_BUNDLE_MATCHES_COMPAT" != "1" ]]; then
         run rm -rf "$COMPAT_APP_BUNDLE"
@@ -844,5 +886,16 @@ if [[ "$APP_BUNDLE_MATCHES_COMPAT" != "1" ]]; then
     fi
     run ln -sfn "$APP_BUNDLE" "$COMPAT_APP_BUNDLE"
     printf 'Compatibility link: %s -> %s\n' "$COMPAT_APP_BUNDLE" "$APP_BUNDLE"
+fi
+# Stamp the published bundle (fresh or cloned) by its root inode so the next package can reuse it.
+# A failed stamp write only costs a fresh package next time.
+if (( ! IS_RELEASE )) && [[ "$DEBUG_PACKAGE_BUNDLE_REUSE" == "1" && "$DEBUG_PACKAGE_OUTCOME" != "noop-dest" ]]; then
+    DEBUG_PACKAGE_RECORD_ARGS=()
+    [[ "$DEBUG_PACKAGE_SOURCE_STAMP" == "none" ]] || DEBUG_PACKAGE_RECORD_ARGS+=(--keep-stamp "$DEBUG_PACKAGE_SOURCE_STAMP")
+    run python3 -I -S "$CONTROL_PLANE_SCRIPTS_DIR/debug_package_cache.py" record --cache-root "$DEBUG_PACKAGE_CACHE_ROOT" \
+        --bundle "$APP_BUNDLE" --input-key "$DEBUG_PACKAGE_INPUT_KEY" --component sparkle="$DEBUG_PACKAGE_SPARKLE_KEY" \
+        --component helper_mcp="$DEBUG_PACKAGE_HELPER_MCP_KEY" --component helper_gateway="$DEBUG_PACKAGE_HELPER_GATEWAY_KEY" \
+        ${DEBUG_PACKAGE_RECORD_ARGS[@]+"${DEBUG_PACKAGE_RECORD_ARGS[@]}"} ||
+        echo "WARNING: could not record the debug package stamp; packaging succeeded, and the next package of these inputs is fresh." >&2
 fi
 printf 'Created: %s\n' "$APP_BUNDLE"
