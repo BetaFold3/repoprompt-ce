@@ -348,11 +348,13 @@ Operation commands:
   ./conductor core-test [--list | --filter <filter>] [--test-product <product>] [--no-xctest-deadlines] [--xctest-stall-seconds <seconds>] [--xctest-stall-wake-probe]
   ./conductor install-debug-cli
   ./conductor debug-cli-status
-  ./conductor run [-- <app args...>]                  # build/package, then FIFO coordinated launch
+  ./conductor run [--optimized] [-- <app args...>]    # build/package, then FIFO coordinated launch
   ./conductor app status
   ./conductor app stop                                 # latest interactive stop intent
   ./conductor app launch-existing [-- <app args...>]   # launch existing DebugApps bundle without building
-  ./conductor app relaunch [-- <app args...>]          # latest interactive relaunch intent
+  ./conductor app relaunch [--optimized] [-- <app args...>]   # latest interactive relaunch intent
+    run/app relaunch --optimized package and launch the same lane as build --optimized (minutes per build;
+    selection is per invocation, never sticky); launch-existing never builds and rejects --optimized
   ./conductor smoke [--launch | --packaged-app <path>] [--artifact-manifest <path>] [--workspace <name>] [--window-id <id>] [--agent-run] [--execution-location-ui]
     --execution-location-ui uses REPOPROMPT_EXECUTION_LOCATION_UI_SMOKE_WAIT (default 3s) and _CYCLES (default 3); Accessibility permission is required.
     (without --launch/--packaged-app, requires the CE debug app to already be running and CLI installed)
@@ -2723,6 +2725,13 @@ class OutputSummarizer:
 
 
 OPTIMIZED_LANE_ARG = "optimized"
+OPTIMIZED_LANE_FLAG = "--optimized"
+# `package_app.sh` configs the staged build-then-launch helper may forward (the debug lane is the default).
+DEBUG_APP_PACKAGE_CONFIGS = ("debug", "debug-optimized")
+LAUNCH_EXISTING_OPTIMIZED_REJECTION = (
+    "launch-existing does not build; its lane is whatever the bundle was packaged with "
+    "(see RepoPromptDebugProvenance.json)."
+)
 
 
 def is_optimized_lane_request(args: Dict[str, Any]) -> bool:
@@ -2735,13 +2744,24 @@ def is_optimized_lane_request(args: Dict[str, Any]) -> bool:
     return True
 
 
+def optimized_lane_packaging_command(operation: Any, args: Dict[str, Any]) -> Optional[str]:
+    """The user-facing command for an operation that packages a debug app and accepts --optimized
+    (`build`, `run`, `app relaunch`); None for every other operation."""
+    if operation in {"build", "run"}:
+        return str(operation)
+    if operation == "app" and args.get("subcommand") == "relaunch":
+        return "app relaunch"
+    return None
+
+
 def optimized_lane_timeout_hint(operation: Any, args: Dict[str, Any], effective_timeout: float) -> Optional[str]:
     """Actionable suffix for a timed-out lane job; None for every other job (messages unchanged)."""
-    if operation != "build" or args.get(OPTIMIZED_LANE_ARG) is not True:
+    command = optimized_lane_packaging_command(operation, args)
+    if command is None or args.get(OPTIMIZED_LANE_ARG) is not True:
         return None
     return (
         f"; optimized-lane builds compile whole modules with no partial results; "
-        f"rerun with a longer limit: ./conductor build --optimized --timeout <seconds> "
+        f"rerun with a longer limit: ./conductor {command} --optimized --timeout <seconds> "
         f"(this run allowed {effective_timeout:.0f}s)"
     )
 
@@ -3253,6 +3273,8 @@ class OperationRegistry:
         if operation == "debug-cli-status":
             return [script("install_debug_cli.sh"), "status"], lanes, cwd, env, effective_timeout
         if operation == "run":
+            # Validate at dispatch too, independently of default-timeout calculation.
+            is_optimized_lane_request(args)
             return self._internal_argv("debug_app_build_then_launch", dict(args)), ["liveApp"], cwd, env, effective_timeout
         if operation == "app":
             subcommand = args.get("subcommand")
@@ -3262,8 +3284,11 @@ class OperationRegistry:
             if subcommand == "status":
                 return self._internal_argv("app_status", {}), lanes, cwd, env, effective_timeout
             if subcommand == "launch-existing":
+                if OPTIMIZED_LANE_ARG in args:
+                    raise ConductorError(LAUNCH_EXISTING_OPTIMIZED_REJECTION)
                 return self._internal_argv("app_launch_existing", dict(args)), ["liveApp"], cwd, env, effective_timeout
             if subcommand == "relaunch":
+                is_optimized_lane_request(args)  # independent of the timeout path, as for run
                 return self._internal_argv("debug_app_build_then_launch", dict(args)), ["liveApp"], cwd, env, effective_timeout
         if operation == "smoke":
             lanes = ["debugArtifact", "liveApp"]
@@ -3393,7 +3418,7 @@ class OperationRegistry:
             return MEDIUM_TIMEOUT_SECONDS
         if operation in {"test", "provider-test", "core-test"} and args.get("filter"):
             return FILTERED_TEST_TIMEOUT_SECONDS
-        if operation == "build" and is_optimized_lane_request(args):
+        if optimized_lane_packaging_command(operation, args) is not None and is_optimized_lane_request(args):
             return max(MEDIUM_TIMEOUT_SECONDS, OPTIMIZED_LANE_TIMEOUT_FLOOR_SECONDS)
         return MEDIUM_TIMEOUT_SECONDS
 
@@ -7778,6 +7803,16 @@ def current_repo_commit(repo_root: Path) -> Optional[str]:
     return git_metadata_value(repo_root, ["rev-parse", "HEAD"])
 
 
+def provenance_build_lane_label(provenance: Dict[str, Any]) -> str:
+    """`buildLane` as packaged (§4.9); bundles packaged before the lane key existed have none."""
+    if "buildLane" not in provenance:
+        return "unknown (pre-lane provenance)"
+    lane = provenance.get("buildLane")
+    if isinstance(lane, str) and lane:
+        return lane
+    return f"<invalid: {lane!r}>"
+
+
 def provenance_report_lines(repo_root: Path, bundle: Path) -> List[str]:
     provenance = read_debug_app_provenance(bundle)
     if not provenance:
@@ -7795,6 +7830,7 @@ def provenance_report_lines(repo_root: Path, bundle: Path) -> List[str]:
     lines.append(f"    commit: {commit[:12] if commit != '<unknown>' else commit}")
     lines.append(f"    dirty at build: {dirty if isinstance(dirty, bool) else '<unknown>'}")
     lines.append(f"    built: {built_at}")
+    lines.append(f"    build lane: {provenance_build_lane_label(provenance)}")
     flags: List[str] = []
     try:
         current_root = str(repo_root.resolve())
@@ -7922,7 +7958,15 @@ def cleanup_staged_debug_bundle(staged_bundle: Optional[Path]) -> None:
         shutil.rmtree(parent)
 
 
-def package_debug_app_under_heavy(repo_root: Path, operation_label: str) -> Tuple[int, Optional[Path]]:
+def package_debug_app_under_heavy(
+    repo_root: Path, operation_label: str, package_config: str = "debug"
+) -> Tuple[int, Optional[Path]]:
+    # Validated before any staging path, lock or child process exists.
+    if package_config not in DEBUG_APP_PACKAGE_CONFIGS:
+        raise ConductorError(
+            f"unsupported staged debug package config {package_config!r}; expected one of: "
+            + ", ".join(DEBUG_APP_PACKAGE_CONFIGS)
+        )
     live_bundle = debug_app_bundle_path()
     staging_parent = staged_debug_app_parent(live_bundle)
     staged_bundle = staging_parent / live_bundle.name
@@ -7941,7 +7985,7 @@ def package_debug_app_under_heavy(repo_root: Path, operation_label: str) -> Tupl
         with machine_heavy_slot(metadata, env, "global heavy slot for debug package"):
             code, _stdout, _stderr = run_operation_command(
                 "package staged debug app",
-                [str(repo_root / "Scripts" / "package_app.sh"), "debug"],
+                [str(repo_root / "Scripts" / "package_app.sh"), package_config],
                 repo_root,
                 env=env,
             )
@@ -8137,7 +8181,10 @@ def operation_app_launch_existing(repo_root: Path, args: Dict[str, Any]) -> int:
 
 
 def operation_debug_app_build_then_launch(repo_root: Path, args: Dict[str, Any]) -> int:
-    package_code, staged_bundle = package_debug_app_under_heavy(repo_root, "debug app build/package")
+    package_config = "debug-optimized" if is_optimized_lane_request(args) else "debug"
+    package_code, staged_bundle = package_debug_app_under_heavy(
+        repo_root, "debug app build/package", package_config=package_config
+    )
     if package_code != 0 or staged_bundle is None:
         print("Package failed; no live bundle or stop/launch lifecycle action was performed.", flush=True)
         return package_code or 1
@@ -8922,16 +8969,30 @@ def handle_real_operation(paths: Paths, operation: str, argv: List[str]) -> int:
         if ns.filter:
             preflight_test_filter(paths.repo_root, operation, ns.filter)
     elif operation == "run":
+        # Only a leading --optimized selects the lane; everything after it keeps today's pass-through
+        # rule, so `run -- --optimized` and a second `--optimized` are application arguments.
+        if rest and rest[0] == OPTIMIZED_LANE_FLAG:
+            args[OPTIMIZED_LANE_ARG] = True
+            rest = rest[1:]
         app_args = rest[1:] if rest and rest[0] == "--" else rest
         args["appArgs"] = app_args
     elif operation == "app":
         if not rest or rest[0] not in {"status", "stop", "launch-existing", "relaunch"}:
-            raise ConductorError("usage: ./conductor app status|stop|launch-existing|relaunch [-- <app args...>]")
+            raise ConductorError(
+                "usage: ./conductor app status|stop | launch-existing [-- <app args...>] "
+                "| relaunch [--optimized] [-- <app args...>]"
+            )
         args["subcommand"] = rest[0]
         trailing = rest[1:]
         if args["subcommand"] in {"status", "stop"} and trailing:
             raise ConductorError(f"app {args['subcommand']} does not accept application arguments")
         if args["subcommand"] in {"launch-existing", "relaunch"}:
+            if trailing and trailing[0] == OPTIMIZED_LANE_FLAG:
+                if args["subcommand"] == "launch-existing":
+                    raise ConductorError(LAUNCH_EXISTING_OPTIMIZED_REJECTION)
+                # Only a leading --optimized before '--'; `relaunch -- --optimized` is an app argument.
+                args[OPTIMIZED_LANE_ARG] = True
+                trailing = trailing[1:]
             if trailing and trailing[0] != "--":
                 raise ConductorError(f"app {args['subcommand']} application arguments must follow '--'")
             args["appArgs"] = trailing[1:] if trailing else []

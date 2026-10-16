@@ -479,7 +479,7 @@ Status:
 - Step 2 — done | rounds 0/2 | open: | downgraded: | assumed: literal no-DEBUG rule includes dormant tests | deferred: real optimized-plan validation to Step 4 (optimized-lane-step2-review.md)
 - Step 3 — done | rounds 0/2 | open: | downgraded: | assumed: explicit Apple Development name as specified | deferred: real caller environment to Step 4; SHA1 identity selection only if needed; baseline release-selftest lint assertion (optimized-lane-step3-review.md)
 - Step 4 — done | rounds 0/2 | open: | downgraded: | assumed: build/packaging go only; default timeout remains 3600s | deferred: runtime acceptance Step 8; disk 7.0 GiB (8.9 GB free); optional SIGKILL-hint test/display label; baseline lint assertion (optimized-lane-step4-review.md, optimized-lane-step4-warnings.md)
-- Step 5 — todo | rounds 0/2 | open: | downgraded: | assumed: | deferred:
+- Step 5 — done | rounds 0/2 | open: | downgraded: | assumed: protocol 19 workstream; restart idle daemon before acceptance | deferred: live lifecycle Step 8; liveApp queue/app-argv docs Step 7; cosmetic P3-4/5 (optimized-lane-step5-review.md)
 - Step 6 — todo | rounds 0/2 | open: | downgraded: | assumed: | deferred:
 - Step 7 — todo | rounds 0/2 | open: | downgraded: | assumed: | deferred:
 - Step 8 — todo | rounds 0/2 | open: | downgraded: | assumed: | deferred:

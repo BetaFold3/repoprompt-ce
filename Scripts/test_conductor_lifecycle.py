@@ -412,7 +412,7 @@ class LifecycleQueueTests(LifecycleTestCase):
                 self.assertNotIn("RPCE_OPTIMIZED_DIAGNOSTICS", env)
 
     def run_build_until_timeout(
-        self, args: dict, *, request_timeout: float | None = None
+        self, args: dict, *, request_timeout: float | None = None, operation: str = "build"
     ) -> tuple[conductor.DaemonState, dict, list[float]]:
         tmp, state = self.make_state()
         self.addCleanup(tmp.cleanup)
@@ -430,7 +430,7 @@ class LifecycleQueueTests(LifecycleTestCase):
         with mock.patch.object(state.registry, "prepare", side_effect=fake_prepare), mock.patch.object(
             conductor, "operation_requires_global_heavy_slot", return_value=False
         ):
-            request = {"operation": "build", "args": args, "env": {}}
+            request = {"operation": operation, "args": args, "env": {}}
             if request_timeout is not None:
                 request["timeout"] = request_timeout
             ticket = state.enqueue(request)["ticket"]
@@ -458,7 +458,16 @@ class LifecycleQueueTests(LifecycleTestCase):
         self.assertTrue(waited.get("logTail"))
         self.assertNotIn("--timeout", "".join(waited.get("logTail") or []))
         self.assertIsNone(conductor.optimized_lane_timeout_hint("build", {}, 10.0))
-        self.assertIsNone(conductor.optimized_lane_timeout_hint("run", {"optimized": True}, 10.0))
+        # Step 5 extends the hint to run/app relaunch; non-packaging operations never get it.
+        for operation, args in (
+            ("run", {"appArgs": []}),
+            ("app", {"subcommand": "relaunch", "appArgs": []}),
+            ("app", {"subcommand": "launch-existing", "optimized": True}),
+            ("app", {"subcommand": "stop", "optimized": True}),
+            ("package", {"config": "debug", "optimized": True}),
+        ):
+            with self.subTest(operation=operation, args=args):
+                self.assertIsNone(conductor.optimized_lane_timeout_hint(operation, args, 10.0))
 
     def test_optimized_and_default_build_requests_never_share_a_request_key(self) -> None:
         tmp, state = self.make_state()
@@ -478,6 +487,228 @@ class LifecycleQueueTests(LifecycleTestCase):
             self.assertEqual(again["ticket"], first["ticket"])
             waited = state.job_wait(first["ticket"], None, 30.0)
         self.assertEqual(waited["state"], "failed")
+
+    # Step 5: `run --optimized` / `app relaunch --optimized`. Every lifecycle case below is a stubbed
+    # enqueue or a prepared request; nothing builds, stops or launches an app.
+
+    def test_run_optimized_cli_consumes_only_a_leading_flag_and_keeps_pass_through(self) -> None:
+        tmp, state = self.make_state()
+        self.addCleanup(tmp.cleanup)
+        cases = {
+            # Today's rule, unchanged: an optional leading '--', everything else is an app argument.
+            (): ({"appArgs": []}, None),
+            ("--", "--demo"): ({"appArgs": ["--demo"]}, None),
+            ("--demo",): ({"appArgs": ["--demo"]}, None),
+            ("--", "--optimized"): ({"appArgs": ["--optimized"]}, None),
+            ("--demo", "--optimized"): ({"appArgs": ["--demo", "--optimized"]}, None),
+            # A leading --optimized is consumed once; the rest follows today's rule.
+            ("--optimized",): ({"optimized": True, "appArgs": []}, None),
+            ("--optimized", "--", "--demo"): ({"optimized": True, "appArgs": ["--demo"]}, None),
+            ("--optimized", "--demo"): ({"optimized": True, "appArgs": ["--demo"]}, None),
+            ("--optimized", "--optimized"): ({"optimized": True, "appArgs": ["--optimized"]}, None),
+            ("--optimized", "--", "--optimized"): ({"optimized": True, "appArgs": ["--optimized"]}, None),
+            ("--optimized", "--timeout", "900", "--", "--x"): ({"optimized": True, "appArgs": ["--x"]}, 900.0),
+            ("--timeout", "900", "--optimized"): ({"optimized": True, "appArgs": []}, 900.0),
+        }
+        for argv, (expected_args, expected_timeout) in cases.items():
+            with self.subTest(argv=argv), mock.patch.object(conductor, "enqueue_and_maybe_wait", return_value=0) as enqueue:
+                code = conductor.handle_real_operation(state.paths, "run", list(argv))
+                self.assertEqual(code, 0)
+                self.assertEqual(enqueue.call_args.args[1], "run")
+                self.assertEqual(enqueue.call_args.args[2], expected_args)
+                self.assertEqual(enqueue.call_args.args[3].timeout, expected_timeout)
+                if "optimized" not in expected_args:
+                    self.assertNotIn("optimized", enqueue.call_args.args[2])
+
+    def test_app_relaunch_optimized_cli_is_leading_only_and_launch_existing_rejects_it(self) -> None:
+        tmp, state = self.make_state()
+        self.addCleanup(tmp.cleanup)
+        accepted = {
+            ("relaunch",): {"subcommand": "relaunch", "appArgs": []},
+            ("relaunch", "--optimized"): {"subcommand": "relaunch", "optimized": True, "appArgs": []},
+            ("relaunch", "--optimized", "--", "--demo"): {
+                "subcommand": "relaunch", "optimized": True, "appArgs": ["--demo"]
+            },
+            ("relaunch", "--optimized", "--", "--optimized"): {
+                "subcommand": "relaunch", "optimized": True, "appArgs": ["--optimized"]
+            },
+            # After '--' it is an application argument, never the lane.
+            ("relaunch", "--", "--optimized"): {"subcommand": "relaunch", "appArgs": ["--optimized"]},
+            ("launch-existing", "--", "--optimized"): {"subcommand": "launch-existing", "appArgs": ["--optimized"]},
+        }
+        for argv, expected in accepted.items():
+            with self.subTest(argv=argv), mock.patch.object(conductor, "enqueue_and_maybe_wait", return_value=0) as enqueue:
+                self.assertEqual(conductor.handle_real_operation(state.paths, "app", list(argv)), 0)
+                self.assertEqual(enqueue.call_args.args[1], "app")
+                self.assertEqual(enqueue.call_args.args[2], expected)
+        rejected = {
+            # Leading-only: a non-leading flag or app arguments without '--' keep today's error.
+            ("relaunch", "--optimized", "--demo"): "must follow '--'",
+            ("relaunch", "--optimized", "--optimized"): "must follow '--'",
+            ("relaunch", "--demo", "--optimized"): "must follow '--'",
+            ("launch-existing", "--optimized"): "launch-existing does not build",
+            ("launch-existing", "--optimized", "--", "--demo"): "launch-existing does not build",
+            ("status", "--optimized"): "does not accept application arguments",
+            ("stop", "--optimized"): "does not accept application arguments",
+        }
+        for argv, message in rejected.items():
+            with self.subTest(argv=argv), mock.patch.object(conductor, "enqueue_and_maybe_wait", return_value=0) as enqueue:
+                with self.assertRaisesRegex(conductor.ConductorError, message):
+                    conductor.handle_real_operation(state.paths, "app", list(argv))
+                enqueue.assert_not_called()
+        with mock.patch.object(conductor, "enqueue_and_maybe_wait", return_value=0), self.assertRaises(
+            conductor.ConductorError
+        ) as usage:
+            conductor.handle_real_operation(state.paths, "app", ["--optimized", "relaunch"])
+        # The usage error offers --optimized for relaunch only.
+        self.assertIn("relaunch [--optimized] [-- <app args...>]", str(usage.exception))
+        self.assertIn("launch-existing [-- <app args...>]", str(usage.exception))
+        self.assertEqual(str(usage.exception).count("--optimized"), 1)
+        with mock.patch.object(conductor, "enqueue_and_maybe_wait", return_value=0), self.assertRaises(
+            conductor.ConductorError
+        ) as raised:
+            conductor.handle_real_operation(state.paths, "app", ["launch-existing", "--optimized"])
+        self.assertEqual(
+            str(raised.exception),
+            "launch-existing does not build; its lane is whatever the bundle was packaged with "
+            "(see RepoPromptDebugProvenance.json).",
+        )
+
+    def test_run_and_relaunch_optimized_prepare_forwards_lane_with_timeout_floor(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            registry = conductor.OperationRegistry(Path(tmp))
+            floor = max(conductor.MEDIUM_TIMEOUT_SECONDS, conductor.OPTIMIZED_LANE_TIMEOUT_FLOOR_SECONDS)
+            plain_requests = {
+                "run": {"operation": "run", "args": {"appArgs": ["--demo"]}, "env": {}},
+                "app relaunch": {"operation": "app", "args": {"subcommand": "relaunch", "appArgs": ["--demo"]}, "env": {}},
+            }
+            for label, plain in plain_requests.items():
+                lane = dict(plain, args=dict(plain["args"], optimized=True))
+                with self.subTest(label=label):
+                    plain_argv, plain_lanes, _cwd, _env, plain_timeout = registry.prepare(plain)
+                    lane_argv, lane_lanes, _cwd, _env, lane_timeout = registry.prepare(lane)
+                    plain_payload = json.loads(plain_argv[-1])
+                    lane_payload = json.loads(lane_argv[-1])
+                    # Same internal build-then-launch job and lane; only the forwarded key differs.
+                    self.assertEqual(plain_payload["kind"], "debug_app_build_then_launch")
+                    self.assertEqual(lane_payload["kind"], "debug_app_build_then_launch")
+                    self.assertEqual(plain_payload["args"], plain["args"])
+                    self.assertNotIn("optimized", plain_payload["args"])
+                    self.assertIs(lane_payload["args"]["optimized"], True)
+                    self.assertEqual(plain_lanes, ["liveApp"])
+                    self.assertEqual(lane_lanes, ["liveApp"])
+                    self.assertEqual(plain_timeout, conductor.MEDIUM_TIMEOUT_SECONDS)
+                    self.assertEqual(lane_timeout, floor)
+                    with mock.patch.object(
+                        conductor, "OPTIMIZED_LANE_TIMEOUT_FLOOR_SECONDS", conductor.MEDIUM_TIMEOUT_SECONDS * 3
+                    ):
+                        self.assertEqual(registry.prepare(lane)[4], conductor.MEDIUM_TIMEOUT_SECONDS * 3)
+                        self.assertEqual(registry.prepare(plain)[4], conductor.MEDIUM_TIMEOUT_SECONDS)
+                    for explicit in (5.0, floor + 1.0):
+                        self.assertEqual(registry.prepare(dict(lane, timeout=explicit))[4], explicit)
+                    for bad in (False, "true", 1, None):
+                        forged = dict(plain, args=dict(plain["args"], optimized=bad))
+                        with self.assertRaisesRegex(conductor.ConductorError, "must be true"):
+                            registry.prepare(forged)
+                        with self.assertRaisesRegex(conductor.ConductorError, "must be true"):
+                            registry.prepare(dict(forged, timeout=600.0))
+                        # Validation does not depend on the default-timeout path.
+                        with mock.patch.object(
+                            registry, "_default_timeout", return_value=conductor.MEDIUM_TIMEOUT_SECONDS
+                        ), self.assertRaisesRegex(conductor.ConductorError, "must be true"):
+                            registry.prepare(dict(forged, timeout=600.0))
+            # A forged launch-existing lane request is refused by the daemon too, with the same explanation.
+            with self.assertRaisesRegex(conductor.ConductorError, "launch-existing does not build"):
+                registry.prepare(
+                    {"operation": "app", "args": {"subcommand": "launch-existing", "optimized": True, "appArgs": []}}
+                )
+            launch_existing = registry.prepare({"operation": "app", "args": {"subcommand": "launch-existing", "appArgs": []}})
+            self.assertIn("app_launch_existing", launch_existing[0][-1])
+            self.assertEqual(launch_existing[4], conductor.MEDIUM_TIMEOUT_SECONDS)
+            # Gate never forwarded for the launch commands either.
+            with mock.patch.dict(os.environ, {"RPCE_OPTIMIZED_DIAGNOSTICS": "1"}):
+                snapshot = conductor.OperationRegistry.client_env_snapshot()
+                for plain in plain_requests.values():
+                    lane = dict(plain, args=dict(plain["args"], optimized=True), env=snapshot)
+                    self.assertNotIn("RPCE_OPTIMIZED_DIAGNOSTICS", registry.prepare(lane)[3])
+
+    def test_optimized_run_and_relaunch_timeout_failures_name_their_own_command(self) -> None:
+        cases = {
+            "run": ({"optimized": True, "appArgs": []}, "./conductor run --optimized --timeout <seconds>"),
+            "app": (
+                {"subcommand": "relaunch", "optimized": True, "appArgs": []},
+                "./conductor app relaunch --optimized --timeout <seconds>",
+            ),
+        }
+        for operation, (args, command) in cases.items():
+            with self.subTest(operation=operation):
+                _state, waited, prepared = self.run_build_until_timeout(args, operation=operation)
+                self.assertEqual(waited["state"], "failed")
+                self.assertEqual(waited["exitCode"], 124)
+                error = waited.get("error") or ""
+                self.assertTrue(error.startswith("timed out after 0.5s; "), error)
+                self.assertIn(command, error)
+                self.assertIn("hint: optimized-lane builds", "".join(waited.get("logTail") or []))
+                floor = max(conductor.MEDIUM_TIMEOUT_SECONDS, conductor.OPTIMIZED_LANE_TIMEOUT_FLOOR_SECONDS)
+                self.assertEqual(float(prepared[0]), float(floor))
+        _state, waited, _prepared = self.run_build_until_timeout({"appArgs": []}, operation="run")
+        self.assertEqual(waited.get("error"), "timed out after 0.5s")
+
+    def test_optimized_and_plain_launch_requests_never_share_a_request_key(self) -> None:
+        for operation, plain_args in (
+            ("run", {"appArgs": []}),
+            ("app", {"subcommand": "relaunch", "appArgs": []}),
+        ):
+            with self.subTest(operation=operation):
+                tmp, state = self.make_state()
+                self.addCleanup(tmp.cleanup)
+                lane_args = dict(plain_args, optimized=True)
+                self.assertNotEqual(
+                    state.registry.fingerprint({"operation": operation, "args": lane_args}),
+                    state.registry.fingerprint({"operation": operation, "args": plain_args}),
+                )
+                with mock.patch.object(state, "_schedule_locked"):
+                    first = state.enqueue({"operation": operation, "args": lane_args, "env": {}, "requestKey": "k"})
+                    with self.assertRaisesRegex(conductor.ConductorError, "request-key mismatch"):
+                        state.enqueue({"operation": operation, "args": plain_args, "env": {}, "requestKey": "k"})
+                    again = state.enqueue({"operation": operation, "args": lane_args, "env": {}, "requestKey": "k"})
+                self.assertTrue(again.get("reused"))
+                self.assertEqual(again["ticket"], first["ticket"])
+                self.assertIs(state.jobs[first["ticket"]].args["optimized"], True)
+
+    def test_newest_relaunch_intent_supersedes_across_lanes(self) -> None:
+        # The newest relaunch wins whatever either lane is; a superseded queued lane job never builds.
+        cases = (
+            ("run", {"optimized": True, "appArgs": []}, {"subcommand": "relaunch", "appArgs": []}),
+            ("app", {"subcommand": "relaunch", "optimized": True, "appArgs": []}, {"subcommand": "relaunch", "appArgs": []}),
+            ("app", {"subcommand": "relaunch", "appArgs": []}, {"subcommand": "relaunch", "optimized": True, "appArgs": []}),
+            ("run", {"appArgs": []}, {"subcommand": "relaunch", "optimized": True, "appArgs": []}),
+            ("app", {"subcommand": "relaunch", "optimized": True, "appArgs": []}, {"subcommand": "stop"}),
+        )
+        for old_operation, old_args, new_args in cases:
+            with self.subTest(old=(old_operation, old_args), new=new_args):
+                tmp, state = self.make_state()
+                self.addCleanup(tmp.cleanup)
+                old = self.make_job(state, "old", old_operation, dict(old_args), ["liveApp"])
+                state.jobs[old.ticket] = old
+                state.queue.append(old.ticket)
+                with mock.patch.object(state, "_schedule_locked"):
+                    payload = state.enqueue({"operation": "app", "args": dict(new_args)})
+                self.assertEqual(old.state, "canceled")
+                self.assertEqual(old.superseded_by_operation, f"app {new_args['subcommand']}")
+                self.assertEqual(payload["supersededJobs"][0]["ticket"], old.ticket)
+                newest = state.jobs[payload["ticket"]]
+                self.assertEqual(newest.args.get("optimized"), new_args.get("optimized"))
+        # `run --optimized` stays an ordinary FIFO run: it supersedes nothing.
+        tmp, state = self.make_state()
+        self.addCleanup(tmp.cleanup)
+        prior = self.make_job(state, "prior", "app", {"subcommand": "relaunch", "appArgs": []}, ["liveApp"])
+        state.jobs[prior.ticket] = prior
+        state.queue.append(prior.ticket)
+        with mock.patch.object(state, "_schedule_locked"):
+            payload = state.enqueue({"operation": "run", "args": {"optimized": True, "appArgs": []}})
+        self.assertEqual(prior.state, "queued")
+        self.assertEqual(payload.get("supersededJobs"), [])
 
     def test_guardrails_delegates_aggregator_without_lanes(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -6315,6 +6546,154 @@ class AppStatusIdentityTests(unittest.TestCase):
 
         package_source = inspect.getsource(conductor.package_debug_app_under_heavy)
         self.assertEqual(package_source.count('env["REPOPROMPT_DEBUG_APP_REUSE_SOURCE"] = str(live_bundle)'), 1)
+
+    def test_staged_package_forwards_lane_config_and_keeps_reuse_source(self) -> None:
+        # Step 5: only the package_app.sh config changes; staging and the reuse source are as for debug.
+        for config in ("debug", "debug-optimized"):
+            captured: dict = {}
+
+            def fake_package(name, argv, cwd, env=None, **_kwargs):
+                captured.update(argv=list(argv), env=dict(env or {}))
+                self.make_bundle(Path(env["REPOPROMPT_DEBUG_APP_BUNDLE"]), "staged")
+                return 0, "", ""
+
+            with self.subTest(config=config), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                live = root / "DebugApps" / "RepoPrompt.app"
+                self.make_bundle(live, "live")
+                with mock.patch.dict(os.environ, {"REPOPROMPT_DEBUG_APP_BUNDLE": str(live)}), mock.patch.object(
+                    conductor, "machine_heavy_slot", return_value=contextlib.nullcontext()
+                ), mock.patch.object(conductor, "run_operation_command", side_effect=fake_package), contextlib.redirect_stdout(
+                    io.StringIO()
+                ):
+                    code, staged = conductor.package_debug_app_under_heavy(root, "run", package_config=config)
+                self.assertEqual(code, 0)
+                self.assertEqual(captured["argv"], [str(root / "Scripts" / "package_app.sh"), config])
+                self.assertEqual(captured["env"]["REPOPROMPT_DEBUG_APP_REUSE_SOURCE"], str(live))
+                self.assertEqual(Path(captured["env"]["REPOPROMPT_DEBUG_APP_BUNDLE"]), staged)
+                self.assertEqual(staged.parent.parent, live.parent / ".staging")
+                self.assertEqual((live / "Contents" / "MacOS" / "RepoPrompt").read_text(encoding="utf-8"), "live")
+        import inspect
+
+        self.assertEqual(
+            inspect.signature(conductor.package_debug_app_under_heavy).parameters["package_config"].default, "debug"
+        )
+
+    def test_staged_package_rejects_unknown_config_before_staging_or_slot(self) -> None:
+        for config in ("release", "fast", "", "debug ", "Debug", "debug-optimized fast"):
+            with self.subTest(config=config), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                live = root / "DebugApps" / "RepoPrompt.app"
+                self.make_bundle(live, "live")
+                with mock.patch.dict(os.environ, {"REPOPROMPT_DEBUG_APP_BUNDLE": str(live)}), mock.patch.object(
+                    conductor, "machine_heavy_slot"
+                ) as slot, mock.patch.object(conductor, "run_operation_command") as run, mock.patch.object(
+                    conductor, "staged_debug_app_parent"
+                ) as staging:
+                    with self.assertRaisesRegex(conductor.ConductorError, "unsupported staged debug package config"):
+                        conductor.package_debug_app_under_heavy(root, "run", package_config=config)
+                slot.assert_not_called()
+                run.assert_not_called()
+                staging.assert_not_called()
+                self.assertFalse((live.parent / ".staging").exists())
+                self.assertEqual((live / "Contents" / "MacOS" / "RepoPrompt").read_text(encoding="utf-8"), "live")
+
+    def test_optimized_lane_package_failure_keeps_live_intact_and_skips_lifecycle(self) -> None:
+        captured: dict = {}
+
+        def failing_package(name, argv, cwd, env=None, **_kwargs):
+            captured.update(argv=list(argv), env=dict(env or {}))
+            # A partial staged bundle exists when the lane build fails or is superseded mid-package.
+            self.make_bundle(Path(env["REPOPROMPT_DEBUG_APP_BUNDLE"]), "partial")
+            return 65, "", ""
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            live = root / "DebugApps" / "RepoPrompt.app"
+            self.make_bundle(live, "live")
+            output = io.StringIO()
+            with mock.patch.dict(os.environ, {"REPOPROMPT_DEBUG_APP_BUNDLE": str(live)}), mock.patch.object(
+                conductor, "machine_heavy_slot", return_value=contextlib.nullcontext()
+            ), mock.patch.object(conductor, "run_operation_command", side_effect=failing_package), mock.patch.object(
+                conductor, "operation_app_launch_existing"
+            ) as launch, mock.patch.object(conductor, "_operation_app_stop_unlocked") as stop, contextlib.redirect_stdout(output):
+                code = conductor.operation_debug_app_build_then_launch(root, {"optimized": True, "appArgs": ["--demo"]})
+
+            self.assertEqual(code, 65)
+            self.assertEqual(captured["argv"][-1], "debug-optimized")
+            launch.assert_not_called()
+            stop.assert_not_called()
+            self.assertEqual((live / "Contents" / "MacOS" / "RepoPrompt").read_text(encoding="utf-8"), "live")
+            self.assertFalse(Path(captured["env"]["REPOPROMPT_DEBUG_APP_BUNDLE"]).parent.exists())
+            self.assertIn("no live bundle or stop/launch lifecycle action", output.getvalue())
+
+    def test_build_then_launch_maps_lane_request_to_package_config(self) -> None:
+        cases = (
+            ({"appArgs": []}, "debug"),
+            ({"appArgs": ["--demo"], "subcommand": "relaunch"}, "debug"),
+            ({"optimized": True, "appArgs": []}, "debug-optimized"),
+            ({"optimized": True, "appArgs": ["--demo"], "subcommand": "relaunch"}, "debug-optimized"),
+        )
+        for args, config in cases:
+            with self.subTest(args=args), mock.patch.object(
+                conductor, "package_debug_app_under_heavy", return_value=(0, Path("/tmp/staged/RepoPrompt.app"))
+            ) as package, mock.patch.object(conductor, "operation_app_launch_existing", return_value=0) as launch:
+                code = conductor.operation_debug_app_build_then_launch(Path("/tmp/repo"), dict(args))
+            self.assertEqual(code, 0)
+            package.assert_called_once_with(Path("/tmp/repo"), "debug app build/package", package_config=config)
+            launch_args = launch.call_args.args[1]
+            self.assertEqual(launch_args["stagedBundle"], "/tmp/staged/RepoPrompt.app")
+            self.assertEqual(launch_args["appArgs"], args["appArgs"])
+        for bad in (False, "true", 1):
+            with self.subTest(bad=bad), mock.patch.object(conductor, "package_debug_app_under_heavy") as package:
+                with self.assertRaisesRegex(conductor.ConductorError, "must be true"):
+                    conductor.operation_debug_app_build_then_launch(Path("/tmp/repo"), {"optimized": bad, "appArgs": []})
+            package.assert_not_called()
+
+    def test_provenance_report_names_build_lane_or_pre_lane_unknown(self) -> None:
+        cases = (
+            ({"buildLane": "debug-optimized"}, "    build lane: debug-optimized"),
+            ({"buildLane": "debug"}, "    build lane: debug"),
+            ({}, "    build lane: unknown (pre-lane provenance)"),
+            ({"buildLane": ""}, "    build lane: <invalid: ''>"),
+            ({"buildLane": 5}, "    build lane: <invalid: 5>"),
+        )
+        for extra, expected in cases:
+            with self.subTest(extra=extra), tempfile.TemporaryDirectory() as tmp:
+                bundle = Path(tmp) / "RepoPrompt.app"
+                provenance_path = conductor.debug_app_provenance_path(bundle)
+                provenance_path.parent.mkdir(parents=True)
+                payload = {"repoRoot": tmp, "branch": "main", "commit": "a" * 40, "dirty": False, "buildTimeISO": "t", **extra}
+                provenance_path.write_text(json.dumps(payload), encoding="utf-8")
+                with mock.patch.object(conductor, "current_repo_commit", return_value="a" * 40):
+                    lines = conductor.provenance_report_lines(Path(tmp), bundle)
+                self.assertIn(expected, lines)
+                self.assertEqual(sum(line.startswith("    build lane: ") for line in lines), 1)
+                self.assertFalse(any("WARNING" in line for line in lines), lines)
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(
+                conductor.provenance_report_lines(Path(tmp), Path(tmp) / "RepoPrompt.app"), ["  Bundle provenance: <missing>"]
+            )
+
+    def test_launch_report_and_app_status_both_print_the_build_lane(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            bundle = Path(tmp) / "DebugApps" / "RepoPrompt.app"
+            self.make_bundle(bundle)
+            provenance_path = conductor.debug_app_provenance_path(bundle)
+            provenance_path.parent.mkdir(parents=True, exist_ok=True)
+            provenance_path.write_text(
+                json.dumps({"repoRoot": tmp, "commit": "b" * 40, "buildLane": "debug-optimized"}), encoding="utf-8"
+            )
+            probe = subprocess.CompletedProcess([], 1, stdout="", stderr="")
+            output = io.StringIO()
+            with mock.patch.dict(os.environ, {"REPOPROMPT_DEBUG_APP_BUNDLE": str(bundle)}), mock.patch.object(
+                conductor.subprocess, "run", return_value=probe
+            ), mock.patch.object(conductor, "current_repo_commit", return_value="b" * 40), mock.patch.object(
+                conductor, "find_debug_app_pids", return_value=[]
+            ), mock.patch.object(conductor, "run_operation_command", return_value=(0, "", "")), contextlib.redirect_stdout(output):
+                self.assertEqual(conductor.report_launch_bundle_details(Path(tmp), bundle), 0)
+                self.assertEqual(conductor.operation_app_status(Path(tmp)), 0)
+            self.assertEqual(output.getvalue().count("    build lane: debug-optimized"), 2)
 
     def test_repair_compatibility_link_replaces_removed_staging_target(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
