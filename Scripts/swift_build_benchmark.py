@@ -101,7 +101,7 @@ RUNTIME_FILES = (
     "Scripts/debug_app_process.py",
     "Scripts/canonical_swift.sh",
     "Scripts/package_app.sh",
-    "Scripts/fast_package_fingerprint.py",
+    "Scripts/debug_package_cache.py",
     "Package.swift",
     "Package.resolved",
 )

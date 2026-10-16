@@ -13,6 +13,12 @@ Subcommands:
       ``.retain`` and the exact ``mv`` recovery is printed (exit 3).
   cleanup-stale --parent DIR --max-age SECONDS
       Remove ``.rpce-package-*`` siblings older than SECONDS, except any holding ``.retain``.
+  resolve-identity --sign-identity S   (stdin: ``security find-identity -v -p codesigning`` output)
+      Print ``cert=<SHA-1>|adhoc|unresolved``, mirroring how ``codesign -s`` picks one identity.
+  plan --cache on|off --cert C --root R --scripts-dir S --build-dir B --field NAME=VALUE...
+      Print the package keys, ``outcome`` and ``receipts_allowed``. Reads stat metadata, small
+      repository inputs and Git state only; it never reads or writes a cache. When receipts are
+      not allowed (cache ``off`` or an unresolved identity) the keys are ``none``.
 
 stdout carries ``key=value`` lines, the first being ``schema=1``. Diagnostics go to stderr.
 Exit codes: 0 success, 1 failure with the destination intact (or still absent), 2 usage,
@@ -24,12 +30,17 @@ from __future__ import annotations
 import argparse
 import ctypes
 import errno
+import hashlib
 import os
+import plistlib
+import re
 import shutil
+import stat
+import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Callable, Optional, Sequence, TextIO
+from typing import Callable, Dict, Iterable, List, Mapping, Optional, Sequence, TextIO, Tuple
 
 SCHEMA = 1
 TEMP_PARENT_PREFIX = ".rpce-package-"
@@ -46,6 +57,120 @@ EXIT_DESTINATION_MISSING = 3
 
 RenameFn = Callable[[Path, Path], None]
 RemoveTreeFn = Callable[[Path], None]
+
+# --- Package keys (plan Step 4) -------------------------------------------------------------
+# Each key is the SHA-256 of a labelled, NUL-separated stream. Built outputs are keyed by
+# stat metadata (no per-byte hashing of executables); small repository inputs by content.
+KEY_SCHEMA = 1
+PRODUCTS = ("RepoPrompt", "repoprompt-mcp", "repoprompt-gateway")
+HELPERS = {"repoprompt-mcp": "helper_mcp_key", "repoprompt-gateway": "helper_gateway_key"}
+# Control scripts (basenames under the control-plane scripts dir) whose bytes shape the debug
+# package, including the data/helper files they read. Verification scripts are listed too.
+INPUT_SCRIPTS = (
+    "package_app.sh",
+    "debug_package_cache.py",
+    "load_release_metadata.sh",
+    "parse_release_metadata.py",
+    "normalize_swiftpm_resource_bundles.sh",
+    "validate_required_swiftpm_resource_bundles.sh",
+    "verify_sparkle_vendor.sh",
+    "validate_app_architectures.sh",
+    "validate_embedded_mcp_helper_layout.sh",
+    "smoke_embedded_mcp_helper.sh",
+    "run_without_github_tokens.sh",
+    "validate_json.py",
+)
+# Scripts referenced through a variable file name (none since the fast fingerprint retired).
+DECLARED_DYNAMIC: Dict[str, str] = {}
+# Repository inputs (relative to ROOT_DIR) copied into or rendered for the bundle.
+REPO_INPUTS = (
+    "AppBundle/Info.plist.template",
+    "LICENSE",
+    "THIRD_PARTY_NOTICES.md",
+    "ThirdPartyLicenses",
+    "AppResources",
+    "version.env",
+)
+# Raw environment values hashed into input_key (their effect is not visible in any field).
+ENV_INPUTS = ("REPOPROMPT_ENABLE_SENTRY", "REPOPROMPT_UPLOAD_SENTRY_SYMBOLS")
+# Resolved package_app.sh values passed as --field; each must be passed exactly once.
+PLAN_FIELDS = (
+    "CONF",
+    "APP_NAME",
+    "DISPLAY_NAME",
+    "BUNDLE_ID",
+    "URL_SCHEME",
+    "MARKETING_VERSION",
+    "BUILD_NUMBER",
+    "DEBUG_STORAGE_BACKEND_MARKER",
+    "SIGNING_MODE_MARKER",
+    "USE_ADHOC_SIGNING",
+    "ARCHITECTURE_POLICY",
+    "LOCAL_SIGNING_CERTIFICATE_SHA256",
+    "LOCAL_SIGNING_SERVICE_GENERATION",
+)
+SIGNING_FIELDS = ("SIGNING_MODE_MARKER", "DEBUG_STORAGE_BACKEND_MARKER", "USE_ADHOC_SIGNING")
+# Environment variables the closure scripts read whose effect reaches the keys through a plan
+# input instead of the raw value: a field, the resolved cert, --root, or --scripts-dir.
+ENV_RESOLVED = {
+    "ALLOW_ADHOC_SIGNING": "field USE_ADHOC_SIGNING",
+    "APP_NAME": "field APP_NAME",
+    "BUILD_NUMBER": "field BUILD_NUMBER",
+    "BUNDLE_ID": "field BUNDLE_ID",
+    "BUNDLE_ID_OVERRIDE": "field BUNDLE_ID",
+    "DEBUG_BUNDLE_ID": "field BUNDLE_ID",
+    "DEBUG_SECURE_STORAGE_BACKEND": "field DEBUG_STORAGE_BACKEND_MARKER",
+    "DISPLAY_NAME": "field DISPLAY_NAME",
+    "LOCAL_SIGNING_CERTIFICATE_SHA256": "field LOCAL_SIGNING_CERTIFICATE_SHA256",
+    "LOCAL_SIGNING_SERVICE_GENERATION": "field LOCAL_SIGNING_SERVICE_GENERATION",
+    "MARKETING_VERSION": "field MARKETING_VERSION",
+    "PREFER_STABLE_DEBUG_SIGNING": "cert",
+    "REPOPROMPT_CONTROL_PLANE_SCRIPTS_DIR": "scripts-dir",
+    "REPOPROMPT_RELEASE_BUILD_NUMBER_OVERRIDE": "field BUILD_NUMBER",
+    "REPOPROMPT_RELEASE_SOURCE_ROOT": "root",
+    "SIGN_IDENTITY": "cert",
+}
+# Everything else the closure references, with the reason it is not a key input.
+CLOSURE_EXCLUSIONS = {
+    # Scripts
+    "doctor.sh": "environment check only; no output effect",
+    "canonical_swift.sh": "build effect reaches the key through the product stat records",
+    "patch_keyboard_shortcuts_resource_lookup.sh": "patch effect reaches the key through the product stat records",
+    "build_swiftpm_release_products.sh": "release-only",
+    "write_app_artifact_manifest.py": "release-only",
+    "upload_sentry_debug_symbols.sh": "Sentry side effect; REPOPROMPT_UPLOAD_SENTRY_SYMBOLS is an ENV_INPUTS value",
+    # ROOT_DIR paths
+    ".build": "build outputs, destinations and generated state",
+    "Scripts": "default control-plane scripts dir; its files are INPUT_SCRIPTS",
+    "AppBundle/RepoPrompt.entitlements.template": "release-only",
+    "AppBundle/RepoPrompt.local-self-signed.entitlements.template": "release-only",
+    # Environment
+    "APP_ENTITLEMENTS": "script-internal temporary file",
+    "APP_ENTITLEMENTS_TEMPLATE": "release-only",
+    "EPOCHREALTIME": "timing records only",
+    "GATEWAY_ARCHES": "validate_app_architectures.sh internal",
+    "HELPER_ARCHES": "validate_app_architectures.sh internal",
+    "MAIN_ARCHES": "validate_app_architectures.sh internal",
+    "LIPO": "verification tool only; verification always runs",
+    "LOCAL_SELF_SIGNED_RELEASE": "release-only (debug fails when set)",
+    "LOCAL_SIGNING_CERTIFICATE_SHA1": "release-only (local self-signed requirement)",
+    "PROFILE_APP_IDENTIFIER": "release-only internal",
+    "RELEASE_ALLOW_ADHOC_SIGNING": "release-only",
+    "REPOPROMPT_DEBUG_APP_BUNDLE": "destination path; excluded from every key by design",
+    "REPOPROMPT_DEBUG_PACKAGE_CACHE": "escape: off disables keys and receipts",
+    "REPOPROMPT_PROVISIONING_PROFILE": "release-only",
+    "REPOPROMPT_RUN_WITHOUT_GITHUB_TOKENS": "release-only (universal builder)",
+    "REPOPROMPT_SENTRY_AUTH_TOKEN_FILE": "Sentry upload credentials; no bundle effect",
+    "SENTRY_AUTH_TOKEN": "Sentry upload credentials; no bundle effect",
+    "SENTRY_AUTH_TOKEN_FILE": "Sentry upload credentials; no bundle effect",
+    "SIGNING_TEAM_ID": "release-only checks; debug value comes from version.env",
+    "TEMP_PARENT": "script-internal publish state",
+    "VERBOSE": "shell tracing only",
+}
+CERT_RE = re.compile(r"[0-9A-F]{40}")
+IDENTITY_LINE_RE = re.compile(r'^\s*\d+\)\s+([0-9A-Fa-f]{40})\s+"(.*)"\s*$')
+UNRESOLVED_WARNING = "WARNING: signing identity not uniquely resolved; package caches disabled"
+SYSTEM_VERSION_PLIST = Path("/System/Library/CoreServices/SystemVersion.plist")
 
 
 def renamex_swap(source: Path, destination: Path) -> None:
@@ -296,6 +421,278 @@ def cleanup_stale(
     return EXIT_OK
 
 
+# --- resolve-identity ------------------------------------------------------------------------
+
+
+def parse_identities(listing: str) -> List[Tuple[str, str]]:
+    """(SHA-1 uppercase, name) pairs from ``security find-identity -v -p codesigning`` text."""
+    identities: List[Tuple[str, str]] = []
+    for line in listing.splitlines():
+        match = IDENTITY_LINE_RE.match(line)
+        if match and (match.group(1).upper(), match.group(2)) not in identities:
+            identities.append((match.group(1).upper(), match.group(2)))
+    return identities
+
+
+def resolve_identity(sign_identity: str, listing: str) -> str:
+    """``adhoc``, the single matching SHA-1, or ``unresolved`` (ambiguous, unmatched or empty)."""
+    if sign_identity == "-":
+        return "adhoc"
+    identities = parse_identities(listing)
+    if re.fullmatch(r"[0-9A-Fa-f]{40}", sign_identity):
+        wanted = sign_identity.upper()
+        return wanted if any(sha1 == wanted for sha1, _ in identities) else "unresolved"
+    matches = {sha1 for sha1, name in identities if sign_identity and sign_identity in name}
+    return matches.pop() if len(matches) == 1 else "unresolved"
+
+
+# --- plan ------------------------------------------------------------------------------------
+
+
+class Key:
+    """Labelled NUL-separated SHA-256 stream."""
+
+    def __init__(self, label: str) -> None:
+        self.digest = hashlib.sha256(f"rpce-debug-package-key\0{KEY_SCHEMA}\0{label}\0".encode())
+
+    def add(self, label: str, *values: object) -> "Key":
+        self.digest.update(f"\x1e{label}".encode())
+        for value in values:
+            self.digest.update(b"\0" + os.fsencode("<missing>" if value is None else str(value)))
+        return self
+
+    def hexdigest(self) -> str:
+        return self.digest.hexdigest()
+
+
+StatFn = Callable[[Path], os.stat_result]
+
+
+def _stat_tuple(path: Path, stat_fn: StatFn) -> Tuple[object, ...]:
+    try:
+        st = stat_fn(path)
+    except FileNotFoundError:
+        return ("missing",)
+    return (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns, oct(st.st_mode))
+
+
+def product_record(path: Path, stat_fn: StatFn = os.stat) -> Tuple[object, ...]:
+    """Stat record of a built executable; cp follows symlinks, so this does too."""
+    return _stat_tuple(path, stat_fn)
+
+
+def _walk(root: Path, lstat_fn: StatFn) -> Iterable[Tuple[str, Path, os.stat_result]]:
+    """Every entry below and including ``root`` (rel ``.``), sorted, never following symlinks."""
+    stack = [(".", root)]
+    while stack:
+        rel, path = stack.pop()
+        st = lstat_fn(path)
+        yield rel, path, st
+        if stat.S_ISDIR(st.st_mode):
+            children = sorted(os.listdir(path), reverse=True)
+            stack.extend(((name if rel == "." else f"{rel}/{name}"), path / name) for name in children)
+
+
+def _entry_type(mode: int) -> str:
+    if stat.S_ISLNK(mode):
+        return "link"
+    if stat.S_ISDIR(mode):
+        return "dir"
+    if stat.S_ISREG(mode):
+        return "file"
+    return "other"
+
+
+def add_tree_manifest(key: Key, label: str, root: Path, lstat_fn: StatFn = os.lstat) -> None:
+    """Stat manifest: (rel, type, mode, size, mtime_ns, ctime_ns, ino, symlink target)."""
+    if not os.path.lexists(root):
+        key.add(label, "missing")
+        return
+    for rel, path, st in _walk(root, lstat_fn):
+        target = os.readlink(path) if stat.S_ISLNK(st.st_mode) else ""
+        key.add(label, rel, _entry_type(st.st_mode), oct(st.st_mode), st.st_size, st.st_mtime_ns, st.st_ctime_ns,
+                st.st_ino, target)
+
+
+def add_content_inputs(key: Key, label: str, root: Path, names: Iterable[str]) -> None:
+    """Content records (rel, type, mode, symlink target, sha256) for small inputs."""
+    for name in names:
+        top = root / name
+        if not os.path.lexists(top):
+            key.add(label, name, "missing")
+            continue
+        for rel, path, st in _walk(top, os.lstat):
+            relative = name if rel == "." else f"{name}/{rel}"
+            kind = _entry_type(st.st_mode)
+            target = os.readlink(path) if kind == "link" else ""
+            content = hashlib.sha256(path.read_bytes()).hexdigest() if kind == "file" else ""
+            key.add(label, relative, kind, oct(stat.S_IMODE(st.st_mode)), target, content)
+
+
+def scripts_digest(scripts_dir: Path) -> str:
+    names = (*INPUT_SCRIPTS, *DECLARED_DYNAMIC)
+    if len(set(names)) != len(names):
+        raise ValueError("closure script basenames must be unique")
+    key = Key("scripts")
+    add_content_inputs(key, "script", scripts_dir, sorted(names))
+    return key.hexdigest()
+
+
+def git_state(root: Path) -> Tuple[Optional[str], Optional[str], Optional[bool]]:
+    """(branch, commit, dirty) exactly as the debug provenance records them; None when unavailable."""
+
+    def git(args: List[str]) -> Optional[str]:
+        try:
+            completed = subprocess.run(["git", "-C", str(root), *args], text=True, capture_output=True, timeout=5)
+        except Exception:
+            return None
+        if completed.returncode != 0:
+            return None
+        return completed.stdout.strip() or None
+
+    status = git(["status", "--porcelain"])
+    # dirty is bool(status) on purpose: the provenance writer records exactly this, so an
+    # unavailable `git status` reads as clean in both. compute_keys still accepts None (injected).
+    return git(["rev-parse", "--abbrev-ref", "HEAD"]), git(["rev-parse", "HEAD"]), bool(status)
+
+
+def macos_build() -> Optional[str]:
+    try:
+        return plistlib.loads(SYSTEM_VERSION_PLIST.read_bytes()).get("ProductBuildVersion")
+    except (OSError, ValueError):
+        return None
+
+
+def _tool_record(name_or_path: str, environ: Mapping[str, str], stat_fn: StatFn) -> Tuple[object, ...]:
+    resolved = name_or_path if "/" in name_or_path else shutil.which(name_or_path, path=environ.get("PATH"))
+    if not resolved:
+        return (name_or_path, "unresolved")
+    return (name_or_path, resolved, *_stat_tuple(Path(resolved), stat_fn))
+
+
+def signing_policy_key(
+    cert: str,
+    fields: Mapping[str, str],
+    scripts: str,
+    *,
+    environ: Mapping[str, str],
+    os_build: Optional[str],
+    stat_fn: StatFn = os.stat,
+) -> str:
+    key = Key("signing-policy").add("cert", cert)
+    for name in SIGNING_FIELDS:
+        key.add("field", name, fields[name])
+    key.add("macos-build", os_build)
+    key.add("codesign", *_tool_record("codesign", environ, stat_fn))
+    allocate = environ.get("CODESIGN_ALLOCATE")
+    key.add("codesign-allocate", *(_tool_record(allocate, environ, stat_fn) if allocate else ("unset",)))
+    return key.add("scripts", scripts).hexdigest()
+
+
+def bundle_names(build_dir: Path) -> List[str]:
+    """Names the package_app.sh glob ``$BUILD_DIR/*.bundle`` copies (no dot-files)."""
+    try:
+        return sorted(name for name in os.listdir(build_dir) if name.endswith(".bundle") and not name.startswith("."))
+    except FileNotFoundError:
+        return []
+
+
+def compute_keys(
+    *,
+    cert: str,
+    root: Path,
+    scripts_dir: Path,
+    build_dir: Path,
+    fields: Mapping[str, str],
+    environ: Mapping[str, str],
+    git: Tuple[Optional[str], Optional[str], Optional[bool]],
+    os_build: Optional[str],
+    stat_fn: StatFn = os.stat,
+    lstat_fn: StatFn = os.lstat,
+) -> Dict[str, str]:
+    """All plan keys. The destination and generated provenance bytes are never inputs."""
+    scripts = scripts_digest(scripts_dir)
+    policy = signing_policy_key(cert, fields, scripts, environ=environ, os_build=os_build, stat_fn=stat_fn)
+    products = {name: product_record(build_dir / name, stat_fn) for name in PRODUCTS}
+
+    sparkle = Key("sparkle").add("signing-policy", policy)
+    add_tree_manifest(sparkle, "sparkle", build_dir / "Sparkle.framework", lstat_fn)
+    keys = {"signing_policy_key": policy, "sparkle_key": sparkle.hexdigest()}
+    for name, output in HELPERS.items():
+        keys[output] = Key("helper").add("name", name).add("product", *products[name]).add("signing-policy", policy).hexdigest()
+
+    resolved_root = root.resolve()
+    key = Key("input").add("root", resolved_root, resolved_root.name)
+    for name in PLAN_FIELDS:
+        key.add("field", name, fields[name])
+    for name in ENV_INPUTS:
+        key.add("env", name, environ.get(name))
+    key.add("signing-policy", policy)
+    for name in PRODUCTS:
+        key.add("product", name, *products[name])
+    for name in bundle_names(build_dir):
+        add_tree_manifest(key, f"bundle:{name}", build_dir / name, lstat_fn)
+    key.add("sparkle", keys["sparkle_key"])
+    add_content_inputs(key, "repo", root, REPO_INPUTS)
+    key.add("scripts", scripts)
+    branch, commit, dirty = git
+    key.add("git", branch, commit, "null" if dirty is None else int(dirty))
+    keys["input_key"] = key.hexdigest()
+    return keys
+
+
+PLAN_KEYS = ("signing_policy_key", "input_key", "sparkle_key", *HELPERS.values())
+
+
+def plan(
+    *,
+    cache: str,
+    cert: str,
+    root: Path,
+    scripts_dir: Path,
+    build_dir: Path,
+    fields: Mapping[str, str],
+    environ: Optional[Mapping[str, str]] = None,
+    out: Optional[TextIO] = None,
+    err: Optional[TextIO] = None,
+    compute: Callable[..., Dict[str, str]] = compute_keys,
+) -> int:
+    out = out or sys.stdout
+    err = err or sys.stderr
+    receipts_allowed = cache == "on" and cert != "unresolved"
+    if receipts_allowed:
+        keys = compute(cert=cert, root=root, scripts_dir=scripts_dir, build_dir=build_dir, fields=fields,
+                       environ=os.environ if environ is None else environ, git=git_state(root), os_build=macos_build())
+    else:
+        keys = {name: "none" for name in PLAN_KEYS}
+        if cache == "off":
+            err.write("Debug package caches disabled (REPOPROMPT_DEBUG_PACKAGE_CACHE=off): "
+                      "no cache reads or writes; full signing and verification.\n")
+    lines = [f"schema={SCHEMA}", "outcome=fresh", f"cache={cache}", f"cert={cert}",
+             f"receipts_allowed={int(receipts_allowed)}", *(f"{name}={keys[name]}" for name in PLAN_KEYS)]
+    out.write("\n".join(lines) + "\n")
+    return EXIT_OK
+
+
+def _cert(value: str) -> str:
+    if value in ("adhoc", "unresolved") or CERT_RE.fullmatch(value):
+        return value
+    raise argparse.ArgumentTypeError(f"expected adhoc, unresolved or an uppercase SHA-1, got {value!r}")
+
+
+def _parse_fields(parser: argparse.ArgumentParser, pairs: Sequence[str]) -> Dict[str, str]:
+    fields: Dict[str, str] = {}
+    for pair in pairs:
+        name, sep, value = pair.partition("=")
+        if not sep or name not in PLAN_FIELDS or name in fields:
+            parser.error(f"--field {pair!r}: unknown, malformed or duplicate field")
+        fields[name] = value
+    missing = [name for name in PLAN_FIELDS if name not in fields]
+    if missing:
+        parser.error(f"missing --field values: {', '.join(missing)}")
+    return fields
+
+
 def _non_negative_int(value: str) -> int:
     try:
         parsed = int(value)
@@ -316,13 +713,33 @@ def build_parser() -> argparse.ArgumentParser:
     cleanup_parser = commands.add_parser("cleanup-stale", help="remove stale hidden package siblings")
     cleanup_parser.add_argument("--parent", type=Path, required=True)
     cleanup_parser.add_argument("--max-age", type=_non_negative_int, required=True)
+    identity_parser = commands.add_parser("resolve-identity", help="resolve SIGN_IDENTITY to one certificate")
+    identity_parser.add_argument("--sign-identity", required=True)
+    plan_parser = commands.add_parser("plan", help="print package keys and the outcome")
+    plan_parser.add_argument("--cache", choices=("on", "off"), required=True)
+    plan_parser.add_argument("--cert", type=_cert, required=True)
+    plan_parser.add_argument("--root", type=Path, required=True)
+    plan_parser.add_argument("--scripts-dir", type=Path, required=True)
+    plan_parser.add_argument("--build-dir", type=Path, required=True)
+    plan_parser.add_argument("--field", action="append", default=[], metavar="NAME=VALUE")
     return parser
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
-    args = build_parser().parse_args(argv)
+    parser = build_parser()
+    args = parser.parse_args(argv)
     if args.command == "publish":
         return publish(args.new, args.dest, args.temp_parent)
+    if args.command == "resolve-identity":
+        cert = resolve_identity(args.sign_identity, "" if args.sign_identity == "-" else sys.stdin.read())
+        if cert == "unresolved":
+            print(UNRESOLVED_WARNING, file=sys.stderr)
+        sys.stdout.write(f"schema={SCHEMA}\ncert={cert}\n")
+        return EXIT_OK
+    if args.command == "plan":
+        fields = _parse_fields(parser, args.field)
+        return plan(cache=args.cache, cert=args.cert, root=args.root, scripts_dir=args.scripts_dir,
+                    build_dir=args.build_dir, fields=fields)
     return cleanup_stale(args.parent, args.max_age)
 
 

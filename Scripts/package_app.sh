@@ -138,6 +138,14 @@ esac
 if (( $# > 2 )); then
     fail "Too many arguments. Usage: $0 [debug|release] [fast]"
 fi
+# Debug package cache escape, checked before any build or mutation. Unset means on; release ignores it.
+DEBUG_PACKAGE_CACHE_MODE="on"
+if [[ "$CONF" != "release" ]]; then
+    case "${REPOPROMPT_DEBUG_PACKAGE_CACHE-on}" in
+        on|off) DEBUG_PACKAGE_CACHE_MODE="${REPOPROMPT_DEBUG_PACKAGE_CACHE-on}" ;;
+        *) fail "REPOPROMPT_DEBUG_PACKAGE_CACHE must be 'on' or 'off', got '${REPOPROMPT_DEBUG_PACKAGE_CACHE}'. Unset it for the default, or use off to disable debug package caches." ;;
+    esac
+fi
 
 BUNDLE_ID_OVERRIDE="${BUNDLE_ID:-}"
 RELEASE_BUILD_NUMBER_OVERRIDE="${REPOPROMPT_RELEASE_BUILD_NUMBER_OVERRIDE:-}"
@@ -158,13 +166,11 @@ SENTRY_SYMBOLS_DIR="$ROOT_DIR/.build/sentry-symbols/$CONF"
 
 IS_RELEASE=0
 [[ "$CONF" == "release" ]] && IS_RELEASE=1
-FAST_PACKAGE_ACTIVE=0
 if (( FAST_PACKAGE_REQUESTED )); then
     if (( IS_RELEASE )); then
         echo "WARNING: Fast packaging is debug-only; ignoring the 'fast' marker for release packaging."
     else
-        FAST_PACKAGE_ACTIVE=1
-        echo "*** FAST DEBUG PACKAGING REQUESTED: all signing remains enabled; verification skips require an exact match to the last fully verified package. ***"
+        echo "The 'fast' package mode is an accepted compatibility alias; debug packaging always runs full verification."
     fi
 fi
 if (( IS_RELEASE )); then
@@ -200,6 +206,16 @@ USE_ADHOC_SIGNING=0
 USE_LOCAL_SELF_SIGNED_RELEASE=0
 DEBUG_STORAGE_BACKEND_MARKER="alternate-in-memory"
 SIGNING_MODE_MARKER="debug-apple-development"
+# Debug: one `security find-identity` listing serves auto-detection, the not-found warning and
+# package-cache identity resolution. Release keeps its own query below.
+CODESIGNING_IDENTITIES=""
+CODESIGNING_IDENTITIES_LOADED=0
+load_codesigning_identities(){
+    if (( ! CODESIGNING_IDENTITIES_LOADED )); then
+        CODESIGNING_IDENTITIES="$(security find-identity -v -p codesigning 2>/dev/null || true)"
+        CODESIGNING_IDENTITIES_LOADED=1
+    fi
+}
 warn_adhoc_signing(){
     echo "WARNING: Using explicit ad-hoc signing for a debug package."
     echo "WARNING: RepoPrompt debug runtime will use ephemeral in-memory secure storage instead of macOS Keychain for API keys and secure permission documents."
@@ -224,7 +240,8 @@ if [[ "$LOCAL_SELF_SIGNED_RELEASE" == "1" || "$LOCAL_SELF_SIGNED_RELEASE" == "tr
     echo "WARNING: This app is for installation on this Mac only. It is not notarized and must not be uploaded to GitHub Releases."
 fi
 if [[ -z "$SIGN_IDENTITY" ]] && (( ! IS_RELEASE )) && [[ "$PREFER_STABLE_DEBUG_SIGNING" == "1" || "$PREFER_STABLE_DEBUG_SIGNING" == "true" ]]; then
-    AUTO_SIGN_IDENTITY="$(security find-identity -v -p codesigning 2>/dev/null | awk -F'"' '/"Apple Development: / { print $2; exit }')"
+    load_codesigning_identities
+    AUTO_SIGN_IDENTITY="$(awk -F'"' '/"Apple Development: / { print $2; exit }' <<< "$CODESIGNING_IDENTITIES")"
     if [[ -n "$AUTO_SIGN_IDENTITY" ]]; then
         SIGN_IDENTITY="$AUTO_SIGN_IDENTITY"
         echo "Using auto-detected debug signing identity: $SIGN_IDENTITY"
@@ -252,8 +269,15 @@ else
         echo "WARNING: Use explicit SIGN_IDENTITY=\"Apple Development: ...\" to opt in to persistent debug Keychain storage."
     fi
     echo "Using signing identity: $SIGN_IDENTITY"
+    if (( IS_RELEASE )); then
     if ! security find-identity -v -p codesigning | grep -F -- "$SIGN_IDENTITY" >/dev/null 2>&1; then
         echo "WARNING: SIGN_IDENTITY was not found by exact text in 'security find-identity'; codesign will still attempt to use it."
+    fi
+    else
+        load_codesigning_identities
+        if ! grep -F -- "$SIGN_IDENTITY" <<< "$CODESIGNING_IDENTITIES" >/dev/null 2>&1; then
+            echo "WARNING: SIGN_IDENTITY was not found by exact text in 'security find-identity'; codesign will still attempt to use it."
+        fi
     fi
 fi
 
@@ -335,6 +359,69 @@ COMPAT_APP_BUNDLE="$ROOT_DIR/.build/$CONF/$APP_NAME.app"
 CLI_PATH="$BUILD_DIR/repoprompt-mcp"
 GATEWAY_PATH="$BUILD_DIR/repoprompt-gateway"
 printf 'BUILD_DIR=%s\nAPP_BUNDLE=%s\nCOMPAT_APP_BUNDLE=%s\nCLI_PATH=%s\nGATEWAY_PATH=%s\nAD_HOC_SIGNING=%s\nARCHITECTURE_POLICY=%s\n' "$BUILD_DIR" "$APP_BUNDLE" "$COMPAT_APP_BUNDLE" "$CLI_PATH" "$GATEWAY_PATH" "$USE_ADHOC_SIGNING" "$ARCHITECTURE_POLICY"
+
+# Strict reader for debug_package_cache.py stdout: schema=1 first, then each expected key once.
+# Unknown, duplicate, missing or malformed lines fail loudly. No eval.
+read_debug_package_output(){
+    local label="$1" output="$2" key value seen=" " first=1
+    shift 2
+    while IFS='=' read -r key value; do
+        if (( first )); then
+            [[ "$key" == "schema" && "$value" == "1" ]] || fail "debug_package_cache.py $label: expected schema=1 first, got '$key=$value'."
+            first=0
+            continue
+        fi
+        [[ " $* " == *" $key "* ]] || fail "debug_package_cache.py $label printed an unknown key '$key'."
+        [[ "$seen" != *" $key "* ]] || fail "debug_package_cache.py $label printed '$key' twice."
+        [[ -n "$value" ]] || fail "debug_package_cache.py $label printed an empty '$key'."
+        seen+="$key "
+        case "$key" in
+            cert) DEBUG_PACKAGE_CERT="$value" ;;
+            outcome) DEBUG_PACKAGE_OUTCOME="$value" ;;
+            cache) DEBUG_PACKAGE_CACHE_REPORTED="$value" ;;
+            receipts_allowed) DEBUG_PACKAGE_RECEIPTS_ALLOWED="$value" ;;
+            signing_policy_key) DEBUG_PACKAGE_SIGNING_POLICY_KEY="$value" ;;
+            input_key) DEBUG_PACKAGE_INPUT_KEY="$value" ;;
+            sparkle_key) DEBUG_PACKAGE_SPARKLE_KEY="$value" ;;
+            helper_mcp_key) DEBUG_PACKAGE_HELPER_MCP_KEY="$value" ;;
+            helper_gateway_key) DEBUG_PACKAGE_HELPER_GATEWAY_KEY="$value" ;;
+            *) fail "debug_package_cache.py $label printed an unsupported key '$key'." ;;
+        esac
+    done <<< "$output"
+    (( ! first )) || fail "debug_package_cache.py $label printed nothing."
+    for key in "$@"; do
+        [[ "$seen" == *" $key "* ]] || fail "debug_package_cache.py $label did not print '$key'."
+    done
+}
+if (( ! IS_RELEASE )); then
+    # Debug package keys. This step only computes and reports them: nothing reads or writes a
+    # package cache yet, and every outcome below runs full signing and verification.
+    phase "Computing debug package keys"
+    [[ "$SIGN_IDENTITY" == "-" ]] || load_codesigning_identities
+    DEBUG_PACKAGE_HELPER_OUTPUT="$(
+        python3 -I -S "$CONTROL_PLANE_SCRIPTS_DIR/debug_package_cache.py" resolve-identity --sign-identity "$SIGN_IDENTITY" <<< "$CODESIGNING_IDENTITIES"
+    )" || fail "debug_package_cache.py resolve-identity exited with status $?."
+    read_debug_package_output resolve-identity "$DEBUG_PACKAGE_HELPER_OUTPUT" cert
+    DEBUG_PACKAGE_HELPER_OUTPUT="$(
+        python3 -I -S "$CONTROL_PLANE_SCRIPTS_DIR/debug_package_cache.py" plan \
+            --cache "$DEBUG_PACKAGE_CACHE_MODE" --cert "$DEBUG_PACKAGE_CERT" \
+            --root "$ROOT_DIR" --scripts-dir "$CONTROL_PLANE_SCRIPTS_DIR" --build-dir "$BUILD_DIR" \
+            --field CONF="$CONF" --field APP_NAME="$APP_NAME" --field DISPLAY_NAME="$DISPLAY_NAME" \
+            --field BUNDLE_ID="$BUNDLE_ID" --field URL_SCHEME="$URL_SCHEME" \
+            --field MARKETING_VERSION="$MARKETING_VERSION" --field BUILD_NUMBER="$BUILD_NUMBER" \
+            --field DEBUG_STORAGE_BACKEND_MARKER="$DEBUG_STORAGE_BACKEND_MARKER" \
+            --field SIGNING_MODE_MARKER="$SIGNING_MODE_MARKER" --field USE_ADHOC_SIGNING="$USE_ADHOC_SIGNING" \
+            --field ARCHITECTURE_POLICY="$ARCHITECTURE_POLICY" \
+            --field LOCAL_SIGNING_CERTIFICATE_SHA256="$LOCAL_SIGNING_CERTIFICATE_SHA256" \
+            --field LOCAL_SIGNING_SERVICE_GENERATION="$LOCAL_SIGNING_SERVICE_GENERATION"
+    )" || fail "debug_package_cache.py plan exited with status $?."
+    read_debug_package_output plan "$DEBUG_PACKAGE_HELPER_OUTPUT" outcome cache cert receipts_allowed signing_policy_key input_key sparkle_key helper_mcp_key helper_gateway_key
+    PACKAGE_TIMING_OUTCOME="$DEBUG_PACKAGE_OUTCOME"
+    printf 'Debug package plan: outcome=%s cache=%s cert=%s receipts_allowed=%s input_key=%s\n' \
+        "$DEBUG_PACKAGE_OUTCOME" "$DEBUG_PACKAGE_CACHE_REPORTED" "$DEBUG_PACKAGE_CERT" "$DEBUG_PACKAGE_RECEIPTS_ALLOWED" "$DEBUG_PACKAGE_INPUT_KEY"
+    printf 'Debug package component keys: signing_policy=%s sparkle=%s repoprompt-mcp=%s repoprompt-gateway=%s\n' \
+        "$DEBUG_PACKAGE_SIGNING_POLICY_KEY" "$DEBUG_PACKAGE_SPARKLE_KEY" "$DEBUG_PACKAGE_HELPER_MCP_KEY" "$DEBUG_PACKAGE_HELPER_GATEWAY_KEY"
+fi
 
 generate_sentry_debug_symbols(){
     sentry_linking_enabled || return 0
@@ -491,31 +578,6 @@ PY
         "$APP_BUNDLE/Contents/Resources/RepoPromptDebugProvenance.json"
 fi
 
-FAST_PACKAGE_CACHE="$ROOT_DIR/.build/debug/fast-package-verified.sha256"
-FAST_PACKAGE_LAYOUT_VALIDATOR_NAME="validate_embedded_mcp_helper_layout.sh"
-FAST_PACKAGE_FINGERPRINT=""
-FAST_PACKAGE_CAN_SKIP_VERIFICATION=0
-if (( ! IS_RELEASE )); then
-    FAST_PACKAGE_FINGERPRINT="$(
-        python3 "$CONTROL_PLANE_SCRIPTS_DIR/fast_package_fingerprint.py" \
-            --bundle "$APP_BUNDLE" \
-            --sign-identity "$SIGN_IDENTITY" \
-            --signing-mode "$SIGNING_MODE_MARKER" \
-            --script "$CONTROL_PLANE_SCRIPTS_DIR/fast_package_fingerprint.py" \
-            --script "$CONTROL_PLANE_SCRIPTS_DIR/package_app.sh" \
-            --script "$CONTROL_PLANE_SCRIPTS_DIR/run_without_github_tokens.sh" \
-            --script "$CONTROL_PLANE_SCRIPTS_DIR/smoke_embedded_mcp_helper.sh" \
-            --script "$CONTROL_PLANE_SCRIPTS_DIR/validate_app_architectures.sh" \
-            --script "$CONTROL_PLANE_SCRIPTS_DIR/$FAST_PACKAGE_LAYOUT_VALIDATOR_NAME"
-    )"
-    if (( FAST_PACKAGE_ACTIVE )) && [[ -f "$FAST_PACKAGE_CACHE" ]] && [[ "$(cat "$FAST_PACKAGE_CACHE")" == "$FAST_PACKAGE_FINGERPRINT" ]]; then
-        FAST_PACKAGE_CAN_SKIP_VERIFICATION=1
-        echo "*** FAST DEBUG PACKAGING ACTIVE: skipping deep codesign verification, redundant post-sign architecture validation, and the embedded MCP-helper smoke; all signing and identity/layout checks remain enabled. ***"
-    elif (( FAST_PACKAGE_ACTIVE )); then
-        echo "WARNING: Fast-package inputs do not match the last fully verified package; running all verification and refreshing the baseline."
-    fi
-fi
-
 phase "Signing app bundle"
 sign_path(){
     local path="$1"
@@ -603,19 +665,10 @@ if (( ${#APP_SIGN_ARGS[@]} )); then
 else
     sign_path "$APP_BUNDLE"
 fi
-if (( FAST_PACKAGE_CAN_SKIP_VERIFICATION )); then
-    PACKAGE_TIMING_DEEP="skipped:fast-fingerprint"
-    echo "FAST PACKAGE SKIP: codesign --verify --deep --strict (matching fully verified package fingerprint)."
-else
-    PACKAGE_TIMING_DEEP="ran"
-    run codesign --verify --deep --strict --verbose=2 "$APP_BUNDLE"
-fi
+PACKAGE_TIMING_DEEP="ran"
+run codesign --verify --deep --strict --verbose=2 "$APP_BUNDLE"
 verify_signed_app_identity
-if (( FAST_PACKAGE_CAN_SKIP_VERIFICATION )); then
-    echo "FAST PACKAGE SKIP: post-sign architecture validation (the same bundle passed pre-sign validation; signing does not change Mach-O slices)."
-else
-    run "$CONTROL_PLANE_SCRIPTS_DIR/validate_app_architectures.sh" "$APP_BUNDLE" "$ARCHITECTURE_POLICY" "Post-sign packaged app"
-fi
+run "$CONTROL_PLANE_SCRIPTS_DIR/validate_app_architectures.sh" "$APP_BUNDLE" "$ARCHITECTURE_POLICY" "Post-sign packaged app"
 if (( PUBLIC_UNIVERSAL_RELEASE )); then
     run "$CONTROL_PLANE_SCRIPTS_DIR/write_app_artifact_manifest.py" write \
         --app "$APP_BUNDLE" \
@@ -623,17 +676,7 @@ if (( PUBLIC_UNIVERSAL_RELEASE )); then
         --expected-architectures "$ARCHITECTURE_POLICY"
 fi
 run "$CONTROL_PLANE_SCRIPTS_DIR/validate_embedded_mcp_helper_layout.sh" "$APP_BUNDLE" "Packaged app MCP helper layout"
-if (( FAST_PACKAGE_CAN_SKIP_VERIFICATION )); then
-    echo "FAST PACKAGE SKIP: embedded MCP-helper smoke (helper bytes match the fully verified package fingerprint)."
-else
-    run "$RUN_WITHOUT_GITHUB_TOKENS" "$CONTROL_PLANE_SCRIPTS_DIR/smoke_embedded_mcp_helper.sh" "$APP_BUNDLE" "Packaged app MCP helper"
-    if (( ! IS_RELEASE )); then
-        mkdir -p "$(dirname "$FAST_PACKAGE_CACHE")"
-        FAST_PACKAGE_CACHE_TEMP="$FAST_PACKAGE_CACHE.tmp.$$"
-        printf '%s\n' "$FAST_PACKAGE_FINGERPRINT" > "$FAST_PACKAGE_CACHE_TEMP"
-        mv -f "$FAST_PACKAGE_CACHE_TEMP" "$FAST_PACKAGE_CACHE"
-    fi
-fi
+run "$RUN_WITHOUT_GITHUB_TOKENS" "$CONTROL_PLANE_SCRIPTS_DIR/smoke_embedded_mcp_helper.sh" "$APP_BUNDLE" "Packaged app MCP helper"
 if truthy "${REPOPROMPT_UPLOAD_SENTRY_SYMBOLS:-}"; then
     sentry_linking_enabled || fail "REPOPROMPT_UPLOAD_SENTRY_SYMBOLS requires REPOPROMPT_ENABLE_SENTRY=1."
     require_sentry_upload_credentials

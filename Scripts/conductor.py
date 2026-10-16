@@ -178,7 +178,7 @@ def generated_job_file_ticket(name: str) -> Optional[str]:
     return None
 
 
-PROTOCOL_VERSION = 17
+PROTOCOL_VERSION = 18
 TERMINAL_STATES = {"completed", "failed", "canceled"}
 LANE_NAMES = {"build", "debugArtifact", "liveApp", "release", "style"}
 LOG_TAIL_LINES = 30
@@ -3006,6 +3006,8 @@ class OperationRegistry:
         "REPOPROMPT_DEBUG_APP_ROOT",
         "REPOPROMPT_DEBUG_APP_BUNDLE",
         "REPOPROMPT_DEBUG_CLI_INSTALL_PATH",
+        # Debug package cache escape (on|off); package_app.sh validates it before any build or mutation.
+        "REPOPROMPT_DEBUG_PACKAGE_CACHE",
     ]
     BUILD_ENV_KEYS = [
         "PATH",

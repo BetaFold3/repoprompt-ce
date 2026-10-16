@@ -93,7 +93,8 @@ class LifecycleQueueTests(LifecycleTestCase):
         # 16: Step 10 adds the `dsym` operation and forwards RPCE_DEBUG_DSYM; an
         # idle protocol-15 daemon would reject one and silently drop the other.
         # 17: forwards RPCE_INDEX_STORE, which an idle protocol-16 daemon would drop.
-        self.assertEqual(conductor.PROTOCOL_VERSION, 17)
+        # 18: forwards REPOPROMPT_DEBUG_PACKAGE_CACHE, which an idle protocol-17 daemon would drop.
+        self.assertEqual(conductor.PROTOCOL_VERSION, 18)
 
     def test_ensure_daemon_stops_and_replaces_idle_protocol_15_daemon(self) -> None:
         tmp, state = self.make_state()
@@ -241,6 +242,34 @@ class LifecycleQueueTests(LifecycleTestCase):
         self.assertEqual(fast_argv[-2:], ["debug", "fast"])
         self.assertEqual(default_argv[-1:], ["debug"])
         self.assertEqual(fast_lanes, ["build", "debugArtifact"])
+
+    def test_build_forwards_debug_package_cache_escape_verbatim_to_package_child_env(self) -> None:
+        # Client snapshot -> daemon request filter -> package_app.sh child env, verbatim; package_app.sh
+        # (not conductor) rejects values other than on/off before any build or mutation.
+        key = "REPOPROMPT_DEBUG_PACKAGE_CACHE"
+        self.assertIn(key, conductor.OperationRegistry.PASSTHROUGH_ENV_KEYS)
+        self.assertNotIn("CODESIGN_ALLOCATE", conductor.OperationRegistry.PASSTHROUGH_ENV_KEYS)
+        with tempfile.TemporaryDirectory() as tmp:
+            registry = conductor.OperationRegistry(Path(tmp))
+            for value in ("off", "on", "bogus", ""):
+                with self.subTest(value=value), mock.patch.dict(os.environ, {key: value}):
+                    snapshot = conductor.OperationRegistry.client_env_snapshot()
+                    self.assertEqual(snapshot[key], value)
+                    for args in ({}, {"fastPackage": True}):
+                        argv, _lanes, _cwd, env, _timeout = registry.prepare(
+                            {"operation": "build", "args": args, "env": snapshot}
+                        )
+                        self.assertTrue(argv[0].endswith("package_app.sh"), argv)
+                        self.assertEqual(env[key], value)
+                    # `run` packages through the internal build-then-launch job; its env carries the
+                    # escape to the staged package child the same way (prepared only, never launched).
+                    argv, _lanes, _cwd, env, _timeout = registry.prepare(
+                        {"operation": "run", "args": {"appArgs": []}, "env": snapshot}
+                    )
+                    self.assertEqual(json.loads(argv[-1])["kind"], "debug_app_build_then_launch")
+                    self.assertEqual(env[key], value)
+            argv, _lanes, _cwd, env, _timeout = registry.prepare({"operation": "build", "args": {}, "env": {}})
+            self.assertNotIn(key, env)
 
     def test_guardrails_delegates_aggregator_without_lanes(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

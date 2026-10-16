@@ -433,7 +433,7 @@ Step 3 — blocked | rounds 0/2 | open: visible conductor run acceptance pending
 
 ### Step 4 — Keys, plan and proportional verification behind `fast`
 
-Step 4 — todo | rounds 0/2 | open: | downgraded: | assumed: full verification always; no proportional mode or nested verification receipt; fast alias becomes inert; step-0/adjustment.md | deferred:
+Step 4 — done | rounds 0/2 | open: none | downgraded: none | assumed: full verification always; no proportional mode or nested verification receipt; fast alias inert; required conductor forwarding/protocol 18; step-0/adjustment.md | deferred: record/forget/finish-forget to Steps 5–6; shared Git/provenance snapshot to Step 6; known baseline lint/benchmark failures; evidence: step-4/findings.md, step-4/reviews/disposition.md
 
 - **Change:** add `resolve-identity`, `plan`, `record` and `forget`, and the closure lists; merge the `find-identity` calls; add the non-deep strict verify to M; put D behind the deep-set rule, with proportional mode from `fast`; parse `REPOPROMPT_DEBUG_PACKAGE_CACHE`; add `forget` to `finish()`; retire the old fingerprint (§F) and retarget the pins; add the key, closure, identity and mode tests; add the vendor receipt only if Step 0 qualified it.
 - **Validation:** all tests pass; the live tamper experiment is recorded, and the per-component remedy is specified if the outer verify misses the flip; live: `off` runs D and writes nothing; an ambiguous identity substring warns, runs D and writes no receipt; a corrupted verified record runs D.

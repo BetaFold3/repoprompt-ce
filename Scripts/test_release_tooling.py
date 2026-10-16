@@ -24,53 +24,54 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
-import fast_package_fingerprint  # noqa: E402
+import debug_package_cache  # noqa: E402
 
 
 class ReleaseToolingTests(unittest.TestCase):
-    def test_fast_package_fingerprint_covers_bundle_resources_and_control_helpers(self) -> None:
+    def test_debug_package_input_key_covers_resources_scripts_and_git_but_not_provenance(self) -> None:
+        # Retargeted from the retired fast-package fingerprint: same resource- and script-sensitivity.
         with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            bundle = root / "RepoPrompt.app"
-            resource = bundle / "Contents" / "Resources" / "Configuration.json"
-            executable = bundle / "Contents" / "MacOS" / "RepoPrompt"
-            provenance = (
-                bundle
-                / "Contents"
-                / "Resources"
-                / "RepoPromptDebugProvenance.json"
-            )
-            resource.parent.mkdir(parents=True)
-            executable.parent.mkdir(parents=True)
+            root = Path(tmp) / "repo"
+            scripts = root / "Scripts"
+            build = root / ".build" / "debug"
+            resources = root / "AppResources"
+            for directory in (scripts, build, resources):
+                directory.mkdir(parents=True)
+            for name in debug_package_cache.INPUT_SCRIPTS:
+                (scripts / name).write_text(f"{name}-v1\n", encoding="utf-8")
+            resource = resources / "Configuration.json"
             resource.write_text('{"version":1}\n', encoding="utf-8")
+            provenance = Path(tmp) / "dest" / "RepoPrompt.app" / "Contents" / "Resources" / "RepoPromptDebugProvenance.json"
+            provenance.parent.mkdir(parents=True)
             provenance.write_text('{"generated":1}\n', encoding="utf-8")
-            executable.write_bytes(b"executable-v1")
-            executable.chmod(0o755)
-            package_helper = root / "package_app.sh"
-            verification_helper = root / "smoke_embedded_mcp_helper.sh"
-            package_helper.write_text("package-v1\n", encoding="utf-8")
-            verification_helper.write_text("verify-v1\n", encoding="utf-8")
-            scripts = [package_helper, verification_helper]
+            fields = {name: "x" for name in debug_package_cache.PLAN_FIELDS}
+            git = ["main", "a" * 40, False]
 
-            def fingerprint() -> str:
-                return fast_package_fingerprint.fast_package_fingerprint(
-                    bundle,
-                    sign_identity="-",
-                    signing_mode="adhoc",
-                    scripts=scripts,
-                )
+            def key() -> str:
+                return debug_package_cache.compute_keys(
+                    cert="adhoc", root=root, scripts_dir=scripts, build_dir=build, fields=fields,
+                    environ={"PATH": "/usr/bin"}, git=tuple(git), os_build="25A1",
+                )["input_key"]
 
-            baseline = fingerprint()
+            baseline = key()
             provenance.write_text('{"generated":2}\n', encoding="utf-8")
-            self.assertEqual(fingerprint(), baseline)
+            self.assertEqual(key(), baseline)
 
             resource.write_text('{"version":2}\n', encoding="utf-8")
-            resource_changed = fingerprint()
-            self.assertNotEqual(resource_changed, baseline)
-
+            self.assertNotEqual(key(), baseline)
             resource.write_text('{"version":1}\n', encoding="utf-8")
-            verification_helper.write_text("verify-v2\n", encoding="utf-8")
-            self.assertNotEqual(fingerprint(), baseline)
+            self.assertEqual(key(), baseline)
+
+            (scripts / "smoke_embedded_mcp_helper.sh").write_text("verify-v2\n", encoding="utf-8")
+            self.assertNotEqual(key(), baseline)
+            (scripts / "smoke_embedded_mcp_helper.sh").write_text("smoke_embedded_mcp_helper.sh-v1\n", encoding="utf-8")
+            self.assertEqual(key(), baseline)
+
+            git[1] = "b" * 40
+            self.assertNotEqual(key(), baseline)
+            git[1] = "a" * 40
+            git[2] = True
+            self.assertNotEqual(key(), baseline)
 
     def test_debug_provenance_uses_json_validation_and_rejects_truncated_output(self) -> None:
         package_script = (SCRIPT_DIR / "package_app.sh").read_text(encoding="utf-8")
@@ -191,7 +192,7 @@ class ReleaseToolingTests(unittest.TestCase):
         package_script = (SCRIPT_DIR / "package_app.sh").read_text(encoding="utf-8")
         sign_path_body = package_script.split("sign_path(){", 1)[1].split("\n}\nsign_sparkle_framework(){", 1)[0]
         app_signing_body = package_script.split("APP_SIGN_ARGS=()", 1)[1].split(
-            "if (( FAST_PACKAGE_CAN_SKIP_VERIFICATION )); then",
+            'PACKAGE_TIMING_DEEP="ran"\nrun codesign --verify --deep --strict',
             1,
         )[0]
         temp_dir = Path(tempfile.mkdtemp())
@@ -261,7 +262,7 @@ APP_SIGN_ARGS=(){app_signing_body}
         )
         # Stub probe: run the real signing-call block with sign_path recording its target paths.
         signing_calls = package_script.split("\nverify_signed_app_identity(){", 1)[1].split("\n}\n", 1)[1].split(
-            "if (( FAST_PACKAGE_CAN_SKIP_VERIFICATION )); then", 1
+            'PACKAGE_TIMING_DEEP="ran"\nrun codesign --verify --deep --strict', 1
         )[0]
         self.assertTrue(signing_calls.startswith('if [[ -d "$APP_BUNDLE/Contents/Frameworks/Sparkle.framework" ]]'))
         temp_dir = Path(tempfile.mkdtemp())
