@@ -264,7 +264,15 @@ APP_SIGN_ARGS=(){app_signing_body}
         signing_calls = package_script.split("\nverify_signed_app_identity(){", 1)[1].split("\n}\n", 1)[1].split(
             'PACKAGE_TIMING_DEEP="ran"\nrun codesign --verify --deep --strict', 1
         )[0]
-        self.assertTrue(signing_calls.startswith('if [[ -d "$APP_BUNDLE/Contents/Frameworks/Sparkle.framework" ]]'))
+        # Debug with the signed component cache: misses are signed in cache entries, so the bundle
+        # signs only its outer seal. Release and uncached debug keep the nested signing lines verbatim.
+        self.assertTrue(signing_calls.startswith(
+            "if (( DEBUG_PACKAGE_COMPONENTS )); then\n    sign_debug_component_misses\nelse\n"
+            'if [[ -d "$APP_BUNDLE/Contents/Frameworks/Sparkle.framework" ]]; then sign_sparkle_framework '
+            '"$APP_BUNDLE/Contents/Frameworks/Sparkle.framework"; fi\n'
+            'sign_path "$APP_BUNDLE/Contents/MacOS/repoprompt-mcp"\n'
+            'sign_path "$APP_BUNDLE/Contents/MacOS/repoprompt-gateway"\nfi\n'
+        ))
         temp_dir = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, temp_dir, True)
         app_bundle = temp_dir / "RepoPrompt.app"
@@ -274,8 +282,10 @@ APP_SIGN_ARGS=(){app_signing_body}
             "#!/usr/bin/env bash\nset -euo pipefail\n"
             'sign_path(){ printf \'%s\\n\' "$*"; }\n'
             'sign_sparkle_framework(){ printf \'sparkle %s\\n\' "$1"; }\n'
+            "sign_debug_component_misses(){ echo components; }\n"
             f"APP_NAME=RepoPrompt\nAPP_BUNDLE='{app_bundle}'\nAPP_ENTITLEMENTS=/tmp/e.plist\n"
-            "USE_ADHOC_SIGNING=0\nUSE_LOCAL_SELF_SIGNED_RELEASE=0\nIS_RELEASE=\"$1\"\n" + signing_calls,
+            "USE_ADHOC_SIGNING=0\nUSE_LOCAL_SELF_SIGNED_RELEASE=0\nIS_RELEASE=\"$1\"\nDEBUG_PACKAGE_COMPONENTS=\"$2\"\n"
+            + signing_calls,
             encoding="utf-8",
         )
         probe.chmod(0o755)
@@ -291,12 +301,16 @@ APP_SIGN_ARGS=(){app_signing_body}
         }
         for is_release, calls in expected.items():
             with self.subTest(is_release=is_release):
-                result = subprocess.run([str(probe), is_release], text=True, capture_output=True)
+                result = subprocess.run([str(probe), is_release, "0"], text=True, capture_output=True)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(
                     result.stdout.splitlines(),
                     [f"sparkle {app_bundle}/Contents/Frameworks/Sparkle.framework", *calls],
                 )
+        with self.subTest(debug_component_cache=True):
+            result = subprocess.run([str(probe), "0", "1"], text=True, capture_output=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout.splitlines(), ["components", str(app_bundle)])
 
     def test_custom_packaging_resigns_sparkle_helpers_without_recursive_entitlement_propagation(self) -> None:
         package_script = (SCRIPT_DIR / "package_app.sh").read_text(encoding="utf-8")

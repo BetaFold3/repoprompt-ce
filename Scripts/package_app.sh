@@ -30,6 +30,14 @@ PACKAGE_TIMING_TOTAL_MS="?"
 # Debug publish state read by finish(); set only once hidden-sibling assembly starts.
 PACKAGE_DEST=""
 TEMP_PARENT=""
+# Debug signed component cache state, also read by finish(). DEBUG_PACKAGE_COMPONENTS becomes 1
+# only when the debug plan allows receipts (cache on and a resolved signing identity).
+DEBUG_PACKAGE_COMPONENTS=0
+DEBUG_PACKAGE_CACHE_ROOT="$ROOT_DIR/.build/debug/package-cache/v1"
+DEBUG_PACKAGE_COMPONENT_TEMPS=()
+DEBUG_PACKAGE_COMPONENT_USED=()
+DEBUG_PACKAGE_COMPONENT_COMMITTED=0
+DEBUG_PACKAGE_CLONE_FALLBACK_REPORTED=0
 package_timing_record(){
     local elapsed_ms="?" name="$PACKAGE_TIMING_PHASE"
     package_timing_now
@@ -116,6 +124,21 @@ finish(){
         else
             echo "WARNING: kept $TEMP_PARENT because $PACKAGE_DEST is missing; it holds the unpublished package. Remove it with: rm -rf \"$TEMP_PARENT\"" >&2
         fi
+    fi
+    # Debug component cache: drop this run's uncommitted temp entries; after a failure, evict
+    # every cached component the run used so the next run signs it again.
+    if (( ${#DEBUG_PACKAGE_COMPONENT_TEMPS[@]} )); then
+        rm -rf "${DEBUG_PACKAGE_COMPONENT_TEMPS[@]}" || true
+    fi
+    if (( status != 0 && ${#DEBUG_PACKAGE_COMPONENT_USED[@]} )); then
+        local forget_args=() entry
+        for entry in "${DEBUG_PACKAGE_COMPONENT_USED[@]}"; do forget_args+=(--entry "$entry"); done
+        if python3 -I -S "$CONTROL_PLANE_SCRIPTS_DIR/debug_package_cache.py" forget --cache-root "$DEBUG_PACKAGE_CACHE_ROOT" "${forget_args[@]}" >/dev/null; then
+            echo "ERROR: evicted the cached signed components this failed run used; the next package signs them again." >&2
+        else
+            echo "WARNING: could not evict the cached signed components this failed run used; they may be reused by the next package." >&2
+        fi
+        echo "ERROR: if packaging keeps failing, retry with REPOPROMPT_DEBUG_PACKAGE_CACHE=off or clear the cache while no package job runs: rm -rf \"$ROOT_DIR/.build/debug/package-cache\"" >&2
     fi
     package_timing_record
     printf '[package-timing] summary outcome=%s deep=%s total_ms=%s status=%s\n' "$PACKAGE_TIMING_OUTCOME" "$PACKAGE_TIMING_DEEP" "$PACKAGE_TIMING_TOTAL_MS" "$status"
@@ -385,6 +408,8 @@ read_debug_package_output(){
             sparkle_key) DEBUG_PACKAGE_SPARKLE_KEY="$value" ;;
             helper_mcp_key) DEBUG_PACKAGE_HELPER_MCP_KEY="$value" ;;
             helper_gateway_key) DEBUG_PACKAGE_HELPER_GATEWAY_KEY="$value" ;;
+            sparkle_status|helper_mcp_status|helper_gateway_status) printf -v "DEBUG_PACKAGE_COMPONENT_STATUS_${key%_status}" '%s' "$value" ;;
+            sparkle_path|helper_mcp_path|helper_gateway_path) printf -v "DEBUG_PACKAGE_COMPONENT_PATH_${key%_path}" '%s' "$value" ;;
             *) fail "debug_package_cache.py $label printed an unsupported key '$key'." ;;
         esac
     done <<< "$output"
@@ -393,9 +418,88 @@ read_debug_package_output(){
         [[ "$seen" == *" $key "* ]] || fail "debug_package_cache.py $label did not print '$key'."
     done
 }
+# Debug signed component cache (Sparkle and both helpers), used only when DEBUG_PACKAGE_COMPONENTS=1.
+# A miss signs the unsigned build output in a private temp entry with the normal signing functions,
+# verifies it and commits it; hits and misses alike are cloned into the bundle, never hard-linked.
+clone_tree(){
+    local src="$1" dst="$2"
+    [[ ! -e "$dst" && ! -L "$dst" ]] || fail "clone_tree destination already exists: $dst"
+    echo_cmd cp -c -R -p "$src" "$dst"
+    if cp -c -R -p "$src" "$dst" 2>/dev/null; then
+        return 0
+    fi
+    # Never copy over a partial clone.
+    rm -rf "$dst"
+    if (( ! DEBUG_PACKAGE_CLONE_FALLBACK_REPORTED )); then
+        echo "clone unavailable; copied"
+        DEBUG_PACKAGE_CLONE_FALLBACK_REPORTED=1
+    fi
+    run cp -R -p "$src" "$dst"
+}
+debug_component(){
+    case "$1" in
+        sparkle) DEBUG_COMPONENT_PAYLOAD="Sparkle.framework"; DEBUG_COMPONENT_TARGET="$APP_BUNDLE/Contents/Frameworks/Sparkle.framework"; DEBUG_COMPONENT_KEY="$DEBUG_PACKAGE_SPARKLE_KEY" ;;
+        helper_mcp) DEBUG_COMPONENT_PAYLOAD="repoprompt-mcp"; DEBUG_COMPONENT_TARGET="$APP_BUNDLE/Contents/MacOS/repoprompt-mcp"; DEBUG_COMPONENT_KEY="$DEBUG_PACKAGE_HELPER_MCP_KEY" ;;
+        helper_gateway) DEBUG_COMPONENT_PAYLOAD="repoprompt-gateway"; DEBUG_COMPONENT_TARGET="$APP_BUNDLE/Contents/MacOS/repoprompt-gateway"; DEBUG_COMPONENT_KEY="$DEBUG_PACKAGE_HELPER_GATEWAY_KEY" ;;
+        *) fail "Unknown debug package component '$1'." ;;
+    esac
+    DEBUG_COMPONENT_SOURCE="$BUILD_DIR/$DEBUG_COMPONENT_PAYLOAD"
+    local status_var="DEBUG_PACKAGE_COMPONENT_STATUS_$1" path_var="DEBUG_PACKAGE_COMPONENT_PATH_$1"
+    DEBUG_COMPONENT_STATUS="${!status_var}"
+    DEBUG_COMPONENT_PATH="${!path_var}"
+}
+debug_component_hit(){
+    local status_var="DEBUG_PACKAGE_COMPONENT_STATUS_$1"
+    (( DEBUG_PACKAGE_COMPONENTS )) && [[ "${!status_var}" == "hit" ]]
+}
+use_cached_debug_component(){
+    debug_component "$1"
+    [[ "$DEBUG_COMPONENT_STATUS" == "hit" ]] || fail "Debug package component '$1' is not a cache hit."
+    printf 'CACHE HIT: %s %s\n' "$DEBUG_COMPONENT_PAYLOAD" "$DEBUG_COMPONENT_KEY"
+    DEBUG_PACKAGE_COMPONENT_USED+=("$DEBUG_COMPONENT_PATH")
+    clone_tree "$DEBUG_COMPONENT_PATH/$DEBUG_COMPONENT_PAYLOAD" "$DEBUG_COMPONENT_TARGET"
+}
+sign_debug_component_misses(){
+    local id commit_args=() expected=() committed=()
+    for id in sparkle helper_mcp helper_gateway; do
+        debug_component "$id"
+        [[ "$DEBUG_COMPONENT_STATUS" == "hit" ]] && continue
+        [[ "$DEBUG_COMPONENT_STATUS" == "miss" ]] || fail "Unexpected debug component status '$DEBUG_COMPONENT_STATUS' for $id."
+        (( ${#commit_args[@]} )) || phase "Signing debug component cache misses"
+        if [[ "$id" == "sparkle" ]]; then
+            run cp -R "$DEBUG_COMPONENT_SOURCE" "$DEBUG_COMPONENT_PATH/"
+            sign_sparkle_framework "$DEBUG_COMPONENT_PATH/$DEBUG_COMPONENT_PAYLOAD"
+        else
+            run cp "$DEBUG_COMPONENT_SOURCE" "$DEBUG_COMPONENT_PATH/$DEBUG_COMPONENT_PAYLOAD"
+            run chmod +x "$DEBUG_COMPONENT_PATH/$DEBUG_COMPONENT_PAYLOAD"
+            sign_path "$DEBUG_COMPONENT_PATH/$DEBUG_COMPONENT_PAYLOAD"
+        fi
+        # A freshly signed component is verified before it can enter the cache.
+        run codesign --verify --deep --strict --verbose=2 "$DEBUG_COMPONENT_PATH/$DEBUG_COMPONENT_PAYLOAD"
+        commit_args+=(--component "$id=$DEBUG_COMPONENT_PATH")
+        expected+=("${id}_status" "${id}_path")
+        committed+=("$id")
+    done
+    (( ${#commit_args[@]} )) || return 0
+    DEBUG_PACKAGE_COMMIT_OUTPUT="$(
+        python3 -I -S "$CONTROL_PLANE_SCRIPTS_DIR/debug_package_cache.py" component-commit --cache-root "$DEBUG_PACKAGE_CACHE_ROOT" "${commit_args[@]}"
+    )" || fail "debug_package_cache.py component-commit exited with status $?."
+    read_debug_package_output component-commit "$DEBUG_PACKAGE_COMMIT_OUTPUT" "${expected[@]}"
+    for id in "${committed[@]}"; do
+        debug_component "$id"
+        [[ "$DEBUG_COMPONENT_STATUS" == "committed" || "$DEBUG_COMPONENT_STATUS" == "collision" ]] ||
+            fail "Unexpected debug component commit status '$DEBUG_COMPONENT_STATUS' for $id."
+        printf 'CACHE MISS: %s %s signed and cached (%s)\n' "$DEBUG_COMPONENT_PAYLOAD" "$DEBUG_COMPONENT_KEY" "$DEBUG_COMPONENT_STATUS"
+        DEBUG_PACKAGE_COMPONENT_USED+=("$DEBUG_COMPONENT_PATH")
+        DEBUG_PACKAGE_COMPONENT_COMMITTED=1
+        run rm -rf "$DEBUG_COMPONENT_TARGET"
+        clone_tree "$DEBUG_COMPONENT_PATH/$DEBUG_COMPONENT_PAYLOAD" "$DEBUG_COMPONENT_TARGET"
+    done
+    phase "Signing app bundle"
+}
 if (( ! IS_RELEASE )); then
-    # Debug package keys. This step only computes and reports them: nothing reads or writes a
-    # package cache yet, and every outcome below runs full signing and verification.
+    # Debug package keys. With receipts allowed they select the signed component cache entries
+    # below; every package still signs the outer bundle and runs full verification.
     phase "Computing debug package keys"
     [[ "$SIGN_IDENTITY" == "-" ]] || load_codesigning_identities
     DEBUG_PACKAGE_HELPER_OUTPUT="$(
@@ -421,6 +525,25 @@ if (( ! IS_RELEASE )); then
         "$DEBUG_PACKAGE_OUTCOME" "$DEBUG_PACKAGE_CACHE_REPORTED" "$DEBUG_PACKAGE_CERT" "$DEBUG_PACKAGE_RECEIPTS_ALLOWED" "$DEBUG_PACKAGE_INPUT_KEY"
     printf 'Debug package component keys: signing_policy=%s sparkle=%s repoprompt-mcp=%s repoprompt-gateway=%s\n' \
         "$DEBUG_PACKAGE_SIGNING_POLICY_KEY" "$DEBUG_PACKAGE_SPARKLE_KEY" "$DEBUG_PACKAGE_HELPER_MCP_KEY" "$DEBUG_PACKAGE_HELPER_GATEWAY_KEY"
+    # Cache off or an unresolved identity: no component cache reads or writes; today's signing path.
+    if [[ "$DEBUG_PACKAGE_RECEIPTS_ALLOWED" == "1" ]]; then
+        DEBUG_PACKAGE_COMPONENTS=1
+        phase "Looking up signed debug components"
+        DEBUG_PACKAGE_HELPER_OUTPUT="$(
+            python3 -I -S "$CONTROL_PLANE_SCRIPTS_DIR/debug_package_cache.py" component-lookup --cache-root "$DEBUG_PACKAGE_CACHE_ROOT" \
+                --component sparkle="$DEBUG_PACKAGE_SPARKLE_KEY" \
+                --component helper_mcp="$DEBUG_PACKAGE_HELPER_MCP_KEY" \
+                --component helper_gateway="$DEBUG_PACKAGE_HELPER_GATEWAY_KEY"
+        )" || fail "debug_package_cache.py component-lookup exited with status $?."
+        read_debug_package_output component-lookup "$DEBUG_PACKAGE_HELPER_OUTPUT" \
+            sparkle_status sparkle_path helper_mcp_status helper_mcp_path helper_gateway_status helper_gateway_path
+        for id in sparkle helper_mcp helper_gateway; do
+            debug_component "$id"
+            [[ "$DEBUG_COMPONENT_STATUS" != "miss" ]] || DEBUG_PACKAGE_COMPONENT_TEMPS+=("$DEBUG_COMPONENT_PATH")
+        done
+        printf 'Debug component cache (%s): Sparkle=%s repoprompt-mcp=%s repoprompt-gateway=%s\n' "$DEBUG_PACKAGE_CACHE_ROOT" \
+            "$DEBUG_PACKAGE_COMPONENT_STATUS_sparkle" "$DEBUG_PACKAGE_COMPONENT_STATUS_helper_mcp" "$DEBUG_PACKAGE_COMPONENT_STATUS_helper_gateway"
+    fi
 fi
 
 generate_sentry_debug_symbols(){
@@ -461,6 +584,10 @@ fi
 run mkdir -p "$APP_BUNDLE/Contents/MacOS" "$APP_BUNDLE/Contents/Resources/bin" "$APP_BUNDLE/Contents/Frameworks"
 for exe in "$APP_NAME" repoprompt-mcp repoprompt-gateway; do
     [[ -x "$BUILD_DIR/$exe" ]] || fail "Missing built executable: $BUILD_DIR/$exe"
+    if [[ "$exe" != "$APP_NAME" ]] && debug_component_hit "helper_${exe#repoprompt-}"; then
+        use_cached_debug_component "helper_${exe#repoprompt-}"
+        continue
+    fi
     run cp "$BUILD_DIR/$exe" "$APP_BUNDLE/Contents/MacOS/$exe"
     run chmod +x "$APP_BUNDLE/Contents/MacOS/$exe"
 done
@@ -528,7 +655,11 @@ printf 'Framework destination: %s\n' "$APP_BUNDLE/Contents/Frameworks"
 SPARKLE_FRAMEWORK="$BUILD_DIR/Sparkle.framework"
 REPOPROMPT_RELEASE_SOURCE_ROOT="$ROOT_DIR" \
     "$CONTROL_PLANE_SCRIPTS_DIR/verify_sparkle_vendor.sh" "$SPARKLE_FRAMEWORK"
+if debug_component_hit sparkle; then
+    use_cached_debug_component sparkle
+else
 run cp -R "$SPARKLE_FRAMEWORK" "$APP_BUNDLE/Contents/Frameworks/"
+fi
 run install_name_tool -add_rpath @executable_path/../Frameworks "$APP_BUNDLE/Contents/MacOS/$APP_NAME" 2>/dev/null || true
 run "$CONTROL_PLANE_SCRIPTS_DIR/validate_app_architectures.sh" "$APP_BUNDLE" "$ARCHITECTURE_POLICY" "Pre-sign packaged app"
 
@@ -646,9 +777,13 @@ verify_signed_app_identity(){
         [[ -n "$team" && "$team" != "not set" ]] || fail "Debug app was expected to be signed with a stable identity, but no team identifier was found."
     fi
 }
+if (( DEBUG_PACKAGE_COMPONENTS )); then
+    sign_debug_component_misses
+else
 if [[ -d "$APP_BUNDLE/Contents/Frameworks/Sparkle.framework" ]]; then sign_sparkle_framework "$APP_BUNDLE/Contents/Frameworks/Sparkle.framework"; fi
 sign_path "$APP_BUNDLE/Contents/MacOS/repoprompt-mcp"
 sign_path "$APP_BUNDLE/Contents/MacOS/repoprompt-gateway"
+fi
 # Debug: the outer bundle sign below signs the main executable, so the separate pass is release-only.
 if (( IS_RELEASE )); then
 sign_path "$APP_BUNDLE/Contents/MacOS/$APP_NAME"
@@ -688,6 +823,13 @@ if (( ! IS_RELEASE )); then
     APP_BUNDLE="$PACKAGE_DEST"
     if [[ "$APP_BUNDLE_MATCHES_COMPAT" != "1" ]]; then
         run rm -rf "$COMPAT_APP_BUNDLE"
+    fi
+    # Prune only after a run that added entries; the used ones always stay.
+    if (( DEBUG_PACKAGE_COMPONENT_COMMITTED )); then
+        DEBUG_PACKAGE_PRUNE_ARGS=()
+        for entry in "${DEBUG_PACKAGE_COMPONENT_USED[@]}"; do DEBUG_PACKAGE_PRUNE_ARGS+=(--used "$entry"); done
+        run python3 -I -S "$CONTROL_PLANE_SCRIPTS_DIR/debug_package_cache.py" prune --cache-root "$DEBUG_PACKAGE_CACHE_ROOT" --keep 2 "${DEBUG_PACKAGE_PRUNE_ARGS[@]}" ||
+            echo "WARNING: debug component cache pruning failed; packaging succeeded." >&2
     fi
 fi
 if [[ "$APP_BUNDLE_MATCHES_COMPAT" != "1" ]]; then

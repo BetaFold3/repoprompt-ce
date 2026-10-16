@@ -442,7 +442,7 @@ Step 4 — done | rounds 0/2 | open: none | downgraded: none | assumed: full ver
 
 ### Step 5 — Signed Sparkle and helper caches
 
-Step 5 — todo | rounds 0/2 | open: | downgraded: | assumed: full verification on component hits; retain pre-commit component verification; step-0/adjustment.md | deferred:
+Step 5 — done | rounds 0/2 | open: none | downgraded: none | assumed: full verification on hits per step-0/adjustment.md; real cross-volume success plus injected retry branch accepted | deferred: no demonstrated end-to-end timing gain at n=3; known baseline lint assertion; evidence: step-5/findings.md, step-5/reviews/disposition.md
 
 - **Change:** add `component-lookup`/`component-commit`, `clone_tree` and pruning; route Sparkle and the helpers through the cache, with the Sparkle basis from Step 0; add per-component verification if Step 4 requires it; add the cache tests, including the darwin Identifier test.
 - **Validation:** Identifier and CDHash match the Step 4 output for both helpers and Sparkle; the first run runs D; a second edit-build shows `CACHE HIT` for all three components and skips D under `fast`; a helper rebuild forces D; a cross-volume `REPOPROMPT_DEBUG_APP_BUNDLE` (a mounted disk image) uses the copy fallback; S2 is measured.

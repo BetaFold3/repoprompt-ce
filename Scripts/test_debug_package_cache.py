@@ -438,6 +438,7 @@ package_timing_record(){{ :; }}
 PACKAGE_TIMING_OUTCOME=fresh PACKAGE_TIMING_DEEP=ran PACKAGE_TIMING_TOTAL_MS=0 START_TIME="$(date +%s)" CONF=debug
 PACKAGE_DEST={shlex.quote(str(dest))}
 TEMP_PARENT={shlex.quote(str(temp_parent))}
+DEBUG_PACKAGE_COMPONENT_TEMPS=() DEBUG_PACKAGE_COMPONENT_USED=()
 finish(){{
 {self.finish_body()}
 }}
@@ -1002,8 +1003,13 @@ class PackageScriptStep4Tests(unittest.TestCase):
                  '"$APP_BUNDLE" "Packaged app MCP helper"\n')
         self.assertEqual(self.script.count(smoke), 1)
         verifies = re.findall(r"codesign --verify[^\n]*", self.script)
-        self.assertEqual(len(verifies), 2)
+        # Two bundle verifies plus (Step 5) the pre-commit verify of freshly signed cache components.
+        self.assertEqual(len(verifies), 3)
         self.assertTrue(all("--deep --strict" in line for line in verifies), verifies)
+        misses = self.script.split("\nsign_debug_component_misses(){\n", 1)[1].split("\n}\n", 1)[0]
+        self.assertIn('run codesign --verify --deep --strict --verbose=2 "$DEBUG_COMPONENT_PATH/$DEBUG_COMPONENT_PAYLOAD"',
+                      misses)
+        self.assertLess(misses.index("codesign --verify"), misses.index("component-commit"))
         self.assertEqual(re.findall(r'PACKAGE_TIMING_DEEP="([^"]*)"', self.script), ["skipped:not-reached", "ran"])
 
     def test_find_identity_is_one_debug_listing_and_release_keeps_its_query(self) -> None:
@@ -1068,6 +1074,456 @@ class PackageScriptStep4Tests(unittest.TestCase):
                 result = self.reader_probe(output, "outcome")
                 self.assertEqual(result.returncode, 1, result.stdout)
                 self.assertIn(message, result.stderr)
+
+
+# --- Step 5: signed component cache ----------------------------------------------------------
+
+KEY_1 = "1" * 64
+KEY_2 = "2" * 64
+
+
+class ComponentCacheTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp = Path(tempfile.mkdtemp(prefix="rpce-dpc-components-"))
+        self.addCleanup(shutil.rmtree, self.temp, True)
+        self.cache = self.temp / "package-cache" / "v1"
+
+    def call(self, function, *args, **kwargs) -> Tuple[dict, str]:
+        out, err = io.StringIO(), io.StringIO()
+        self.assertEqual(function(self.cache, *args, out=out, err=err, **kwargs), 0)
+        lines = out.getvalue().splitlines()
+        self.assertEqual(lines[0], "schema=1")
+        return dict(line.split("=", 1) for line in lines[1:]), err.getvalue()
+
+    def lookup(self, component: str, key: str = KEY_1) -> Tuple[str, Path, str]:
+        values, err = self.call(dpc.component_lookup, [(component, key)])
+        return values[f"{component}_status"], Path(values[f"{component}_path"]), err
+
+    @staticmethod
+    def fill(temp: Path, component: str, marker: str = "signed") -> Path:
+        payload = temp / dpc.COMPONENTS[component][1]
+        if component == "sparkle":
+            (payload / "Versions" / "B").mkdir(parents=True)
+            (payload / "Versions" / "B" / "Sparkle").write_text(marker, encoding="utf-8")
+            (payload / "Versions" / "Current").symlink_to("B")
+        else:
+            payload.write_text(marker, encoding="utf-8")
+            payload.chmod(0o755)
+        return payload
+
+    def committed(self, component: str, key: str = KEY_1, marker: str = "signed") -> Path:
+        status, temp, _ = self.lookup(component, key)
+        self.assertEqual(status, "miss")
+        self.fill(temp, component, marker)
+        values, _ = self.call(dpc.component_commit, [(component, str(temp))])
+        self.assertEqual(values[f"{component}_status"], "committed")
+        return Path(values[f"{component}_path"])
+
+    def test_components_match_the_plan_helper_keys(self) -> None:
+        self.assertEqual({f"{cid}_key" for cid in dpc.COMPONENTS if cid != "sparkle"}, set(dpc.HELPERS.values()))
+        for name, output in dpc.HELPERS.items():
+            self.assertEqual(dpc.COMPONENTS[output[:-len("_key")]], (("helpers", name), name))
+
+    def test_miss_commit_then_hit_with_immutable_entry_and_receipt(self) -> None:
+        for component in dpc.COMPONENTS:
+            with self.subTest(component=component):
+                status, temp, _ = self.lookup(component)
+                directory = dpc.component_dir(self.cache, component)
+                self.assertEqual((status, temp.parent), ("miss", directory))
+                self.assertTrue(temp.name.startswith(f"{KEY_1}.tmp."), temp)
+                payload = self.fill(temp, component)
+                values, _ = self.call(dpc.component_commit, [(component, str(temp))])
+                final = directory / KEY_1
+                self.assertEqual(values, {f"{component}_status": "committed", f"{component}_path": str(final)})
+                self.assertFalse(temp.exists())
+                self.assertEqual(sorted(os.listdir(final)), sorted([payload.name, "receipt.json", ".complete"]))
+                receipt = dpc.json.loads((final / "receipt.json").read_text(encoding="utf-8"))
+                self.assertEqual(receipt["inventory"], dpc.component_inventory(final / payload.name))
+                os.utime(final, (1, 1))
+                status, path, _ = self.lookup(component)
+                self.assertEqual((status, path), ("hit", final))
+                self.assertGreater(final.stat().st_mtime, 1)  # a hit refreshes recency for pruning
+
+    def test_helper_temp_and_final_paths_keep_the_product_basename(self) -> None:
+        for component, name in (("helper_mcp", "repoprompt-mcp"), ("helper_gateway", "repoprompt-gateway")):
+            status, temp, _ = self.lookup(component)
+            payload = self.fill(temp, component)
+            self.assertTrue(str(payload).endswith(f".tmp.{temp.name.split('.tmp.', 1)[1]}/{name}"), payload)
+            values, _ = self.call(dpc.component_commit, [(component, str(temp))])
+            self.assertEqual(values[f"{component}_path"], str(self.cache / "components" / "helpers" / name / KEY_1))
+            self.assertTrue((Path(values[f"{component}_path"]) / name).is_file())
+
+    def test_incomplete_or_corrupt_entries_are_evicted_and_miss(self) -> None:
+        def no_complete(final: Path) -> None:
+            (final / ".complete").unlink()
+
+        def payload_rewritten(final: Path) -> None:
+            (final / "repoprompt-mcp").write_text("tampered!", encoding="utf-8")
+
+        def payload_replaced_with_restored_mtime(final: Path) -> None:
+            payload = final / "repoprompt-mcp"
+            st = payload.stat()
+            replacement = final / "replacement"
+            replacement.write_text("signed", encoding="utf-8")  # same size, new inode
+            os.chmod(replacement, st.st_mode)
+            os.utime(replacement, ns=(st.st_atime_ns, st.st_mtime_ns))
+            os.replace(replacement, payload)
+
+        def extra_member(final: Path) -> None:
+            (final / "stray").write_text("x", encoding="utf-8")
+
+        def receipt_garbled(final: Path) -> None:
+            (final / "receipt.json").write_text("{not json", encoding="utf-8")
+
+        def receipt_for_other_key(final: Path) -> None:
+            receipt = dpc.json.loads((final / "receipt.json").read_text(encoding="utf-8"))
+            receipt["key"] = KEY_2
+            (final / "receipt.json").write_text(dpc.json.dumps(receipt), encoding="utf-8")
+
+        for corrupt in (no_complete, payload_rewritten, payload_replaced_with_restored_mtime, extra_member,
+                        receipt_garbled, receipt_for_other_key):
+            with self.subTest(corrupt=corrupt.__name__):
+                final = self.committed("helper_mcp")
+                corrupt(final)
+                status, temp, err = self.lookup("helper_mcp")
+                self.assertEqual(status, "miss")
+                self.assertIn("Evicting helper_mcp cache entry", err)
+                self.assertFalse(final.exists())
+                self.assertEqual([p.name for p in final.parent.iterdir()], [temp.name])  # nothing evicted left behind
+                shutil.rmtree(temp)
+
+    def test_collision_discards_the_private_temp_and_never_merges(self) -> None:
+        _, first, _ = self.lookup("sparkle")
+        _, second, _ = self.lookup("sparkle")
+        self.assertNotEqual(first, second)
+        self.fill(first, "sparkle", marker="first")
+        self.fill(second, "sparkle", marker="second")
+        (second / "Sparkle.framework" / "only-in-second").write_text("x", encoding="utf-8")
+        self.call(dpc.component_commit, [("sparkle", str(first))])
+        values, err = self.call(dpc.component_commit, [("sparkle", str(second))])
+        final = dpc.component_dir(self.cache, "sparkle") / KEY_1
+        self.assertEqual(values, {"sparkle_status": "collision", "sparkle_path": str(final)})
+        self.assertIn("discarded this run's signed copy", err)
+        self.assertFalse(second.exists())
+        self.assertEqual((final / "Sparkle.framework" / "Versions" / "B" / "Sparkle").read_text(encoding="utf-8"), "first")
+        self.assertFalse((final / "Sparkle.framework" / "only-in-second").exists())
+        self.assertIsNone(dpc.entry_problem(final, "sparkle", KEY_1))
+
+    def test_collision_with_an_unusable_entry_fails_loudly(self) -> None:
+        _, second, _ = self.lookup("helper_gateway")
+        final = self.committed("helper_gateway")
+        (final / ".complete").unlink()
+        self.fill(second, "helper_gateway")
+        result = subprocess.run(
+            [sys.executable, "-I", "-S", str(SCRIPT_DIR / "debug_package_cache.py"), "component-commit",
+             "--cache-root", str(self.cache), "--component", f"helper_gateway={second}"],
+            text=True, capture_output=True)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("committed concurrently but is unusable", result.stderr)
+        self.assertIn("REPOPROMPT_DEBUG_PACKAGE_CACHE=off", result.stderr)
+        self.assertIn("rm -rf .build/debug/package-cache", result.stderr)
+        self.assertFalse(second.exists())
+
+    def test_commit_rejects_foreign_or_malformed_temp_entries(self) -> None:
+        _, temp, _ = self.lookup("helper_mcp")
+        self.fill(temp, "helper_mcp")
+        foreign = self.temp / f"{KEY_1}.tmp.1.x"
+        foreign.mkdir()
+        self.fill(foreign, "helper_mcp")
+        for component, path in (("helper_gateway", temp), ("helper_mcp", foreign)):
+            with self.subTest(component=component, path=path.name):
+                with self.assertRaises(dpc.ComponentCacheError):
+                    self.call(dpc.component_commit, [(component, str(path))])
+        (temp / "extra").write_text("x", encoding="utf-8")
+        with self.assertRaises(dpc.ComponentCacheError):
+            self.call(dpc.component_commit, [("helper_mcp", str(temp))])
+        self.assertFalse((temp.parent / KEY_1).exists())
+
+    def test_forget_evicts_named_entries_only_inside_the_cache(self) -> None:
+        sparkle = self.committed("sparkle")
+        helper = self.committed("helper_mcp")
+        keep = self.committed("helper_gateway")
+        values, _ = self.call(dpc.forget, [sparkle, helper, sparkle.with_name(KEY_2)])
+        self.assertEqual(values, {"forgotten": "2"})
+        self.assertFalse(sparkle.exists() or helper.exists())
+        self.assertTrue(keep.exists())
+        outside = self.temp / KEY_1
+        outside.mkdir()
+        with self.assertRaises(dpc.ComponentCacheError):
+            self.call(dpc.forget, [outside])
+        self.assertTrue(outside.exists())
+
+    def test_prune_keeps_two_newest_per_component_plus_used_and_drops_stale_temps(self) -> None:
+        helpers = dpc.component_dir(self.cache, "helper_mcp")
+        entries = []
+        for index, key in enumerate(("a" * 64, "b" * 64, "c" * 64, "d" * 64)):
+            entry = self.committed("helper_mcp", key)
+            os.utime(entry, (1000 + index, 1000 + index))
+            entries.append(entry)
+        sparkle = self.committed("sparkle")
+        os.utime(sparkle, (1, 1))
+        stale_temp = helpers / f"{KEY_2}.tmp.9.stale"
+        fresh_temp = helpers / f"{KEY_2}.tmp.9.fresh"
+        stale_evict = helpers / f"{KEY_2}.evict.9.old"
+        for path in (stale_temp, fresh_temp, stale_evict):
+            path.mkdir()
+        os.utime(stale_temp, (1, 1))
+        os.utime(stale_evict, (1, 1))
+        values, _ = self.call(dpc.prune, keep=2, used=[entries[0]], now=lambda: time.time())
+        self.assertEqual(values, {"pruned": "3"})
+        self.assertEqual(sorted(p.name for p in helpers.iterdir()),
+                         sorted([entries[0].name, entries[2].name, entries[3].name, fresh_temp.name]))
+        self.assertTrue(sparkle.exists())
+
+    def test_cli_validates_components_and_keys(self) -> None:
+        base = [sys.executable, "-I", "-S", str(SCRIPT_DIR / "debug_package_cache.py"), "component-lookup",
+                "--cache-root", str(self.cache)]
+        for components in ([], ["sparkle=none"], [f"sparkle={'A' * 64}"], [f"other={KEY_1}"],
+                           [f"sparkle={KEY_1}", f"sparkle={KEY_2}"], ["sparkle"]):
+            with self.subTest(components=components):
+                args = [arg for value in components for arg in ("--component", value)]
+                result = subprocess.run(base + args, text=True, capture_output=True)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertFalse(self.cache.exists())
+        good = subprocess.run(base + ["--component", f"helper_gateway={KEY_1}", "--component", f"sparkle={KEY_2}"],
+                              text=True, capture_output=True)
+        self.assertEqual(good.returncode, 0, good.stderr)
+        self.assertEqual([line.split("=", 1)[0] for line in good.stdout.splitlines()],
+                         ["schema", "helper_gateway_status", "helper_gateway_path", "sparkle_status", "sparkle_path"])
+
+
+class PackageScriptComponentCacheTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.script = (SCRIPT_DIR / "package_app.sh").read_text(encoding="utf-8")
+
+    def function(self, name: str) -> str:
+        body = self.script.split(f"\n{name}(){{\n", 1)[1].split("\n}\n", 1)[0]
+        return f"{name}(){{\n{body}\n}}\n"
+
+    def between(self, start: str, end: str) -> str:
+        head = self.script.index(start)
+        return self.script[head:self.script.index(end, head) + len(end)]
+
+    def test_cache_calls_are_reachable_only_when_the_plan_allows_receipts(self) -> None:
+        script = self.script
+        self.assertEqual(re.findall(r"^\s*DEBUG_PACKAGE_COMPONENTS=1$", script, re.M), ["        DEBUG_PACKAGE_COMPONENTS=1"])
+        gate = 'if [[ "$DEBUG_PACKAGE_RECEIPTS_ALLOWED" == "1" ]]; then\n        DEBUG_PACKAGE_COMPONENTS=1\n'
+        self.assertIn(gate, script)
+        debug_block = script.rindex("if (( ! IS_RELEASE )); then", 0, script.index(gate))
+        self.assertLess(script.index('debug_package_cache.py" plan', debug_block), script.index(gate))
+        lookup = self.between(gate, "\n    fi\n")
+        self.assertIn('debug_package_cache.py" component-lookup', lookup)
+        self.assertEqual(script.count("component-lookup --cache-root"), 1)
+        self.assertEqual(script.count("component-commit --cache-root"), 1)
+        self.assertIn("component-commit --cache-root", self.function("sign_debug_component_misses"))
+        self.assertEqual(script.count("sign_debug_component_misses\n"), 1)
+        self.assertIn("if (( DEBUG_PACKAGE_COMPONENTS )); then\n    sign_debug_component_misses\nelse\n", script)
+        self.assertIn('(( DEBUG_PACKAGE_COMPONENTS )) && [[ "${!status_var}" == "hit" ]]', self.function("debug_component_hit"))
+        self.assertEqual(re.findall(r"(debug_component_hit [^;\n]+); then", script),
+                         ['debug_component_hit "helper_${exe#repoprompt-}"', "debug_component_hit sparkle"])
+        self.assertEqual(script.count("prune --cache-root"), 1)
+        self.assertIn("if (( DEBUG_PACKAGE_COMPONENT_COMMITTED )); then\n        DEBUG_PACKAGE_PRUNE_ARGS=()",
+                      script)
+        self.assertEqual(script.count("forget --cache-root"), 1)
+        self.assertIn("if (( status != 0 && ${#DEBUG_PACKAGE_COMPONENT_USED[@]} )); then", script)
+        appends = re.findall(r"DEBUG_PACKAGE_COMPONENT_USED\+=", script)
+        self.assertEqual(len(appends), 2)
+        for name in ("use_cached_debug_component", "sign_debug_component_misses"):
+            self.assertIn("DEBUG_PACKAGE_COMPONENT_USED+=", self.function(name))
+        self.assertEqual(script.count("DEBUG_PACKAGE_COMPONENT_COMMITTED=1"), 1)
+        self.assertIn("DEBUG_PACKAGE_COMPONENT_COMMITTED=1", self.function("sign_debug_component_misses"))
+
+    def test_release_keeps_copy_and_nested_signing_text(self) -> None:
+        self.assertIn('    run cp "$BUILD_DIR/$exe" "$APP_BUNDLE/Contents/MacOS/$exe"\n'
+                      '    run chmod +x "$APP_BUNDLE/Contents/MacOS/$exe"\n', self.script)
+        self.assertIn('if debug_component_hit sparkle; then\n    use_cached_debug_component sparkle\nelse\n'
+                      'run cp -R "$SPARKLE_FRAMEWORK" "$APP_BUNDLE/Contents/Frameworks/"\nfi\n', self.script)
+        self.assertNotIn("ln ", self.function("clone_tree") + self.function("use_cached_debug_component"))
+
+    def clone_probe(self, fail_clone: bool) -> Tuple[subprocess.CompletedProcess, Path, Path]:
+        temp = Path(tempfile.mkdtemp(prefix="rpce-dpc-clone-"))
+        self.addCleanup(shutil.rmtree, temp, True)
+        src = temp / "src" / "Sparkle.framework"
+        (src / "Versions" / "B").mkdir(parents=True)
+        (src / "Versions" / "B" / "Sparkle").write_text("payload", encoding="utf-8")
+        (src / "Versions" / "Current").symlink_to("B")
+        shim = temp / "bin"
+        shim.mkdir()
+        log = temp / "cp.log"
+        (shim / "cp").write_text(
+            "#!/bin/bash\n"
+            f"printf '%s\\n' \"$*\" >> {shlex.quote(str(log))}\n"
+            + ('if [[ \"$1\" == \"-c\" ]]; then dst=\"${@: -1}\"; mkdir -p \"$dst/partial\"; '
+               'echo \"clonefile failed: Cross-device link\" >&2; exit 1; fi\n' if fail_clone else "")
+            + 'exec /bin/cp "$@"\n', encoding="utf-8")
+        (shim / "cp").chmod(0o755)
+        dst1, dst2 = temp / "a" / "Sparkle.framework", temp / "b" / "Sparkle.framework"
+        dst1.parent.mkdir()
+        dst2.parent.mkdir()
+        probe = ("set -euo pipefail\n" + self.function("echo_cmd") + self.function("run")
+                 + 'fail(){ echo "ERROR: $*" >&2; exit 1; }\nDEBUG_PACKAGE_CLONE_FALLBACK_REPORTED=0\n'
+                 + self.function("clone_tree")
+                 + f"clone_tree {shlex.quote(str(src))} {shlex.quote(str(dst1))}\n"
+                 + f"clone_tree {shlex.quote(str(src))} {shlex.quote(str(dst2))}\n"
+                 + f"clone_tree {shlex.quote(str(src))} {shlex.quote(str(dst2))}\n")
+        env = dict(os.environ, PATH=f"{shim}:{os.environ.get('PATH', '')}")
+        result = subprocess.run(["bash", "-c", probe], text=True, capture_output=True, env=env)
+        return result, dst1, dst2
+
+    def test_clone_tree_removes_a_partial_clone_before_the_plain_copy(self) -> None:
+        result, dst1, dst2 = self.clone_probe(fail_clone=True)
+        self.assertEqual(result.returncode, 1)  # the third call targets an existing destination
+        self.assertIn("clone_tree destination already exists", result.stderr)
+        self.assertEqual(result.stdout.count("clone unavailable; copied"), 1)
+        for dst in (dst1, dst2):
+            self.assertFalse((dst / "partial").exists(), dst)
+            self.assertEqual((dst / "Versions" / "B" / "Sparkle").read_text(encoding="utf-8"), "payload")
+            self.assertTrue((dst / "Versions" / "Current").is_symlink())
+        self.assertIn("+ cp -R -p ", result.stdout)
+
+    @unittest.skipUnless(sys.platform == "darwin", "APFS clonefile")
+    def test_clone_tree_clones_without_fallback_on_apfs(self) -> None:
+        result, dst1, _ = self.clone_probe(fail_clone=False)
+        self.assertNotIn("clone unavailable", result.stdout)
+        self.assertEqual((dst1 / "Versions" / "B" / "Sparkle").read_text(encoding="utf-8"), "payload")
+
+    def finish_probe(self, status: int, used: List[str], temps: List[Path],
+                     forget_status: int = 0) -> subprocess.CompletedProcess:
+        body = self.script.split("\nfinish(){\n", 1)[1].split("\n}\ntrap 'finish $?' EXIT", 1)[0]
+        probe = (
+            "set -euo pipefail\npackage_timing_record(){ :; }\n"
+            f'python3(){{ printf "python3 %s\\n" "$*" >&2; return {forget_status}; }}\n'
+            'PACKAGE_TIMING_OUTCOME=fresh PACKAGE_TIMING_DEEP=ran PACKAGE_TIMING_TOTAL_MS=0 START_TIME="$(date +%s)" CONF=debug\n'
+            'PACKAGE_DEST="" TEMP_PARENT="" ROOT_DIR=/repo CONTROL_PLANE_SCRIPTS_DIR=/scripts\n'
+            "DEBUG_PACKAGE_CACHE_ROOT=/repo/.build/debug/package-cache/v1\n"
+            f"DEBUG_PACKAGE_COMPONENT_TEMPS=({' '.join(shlex.quote(str(p)) for p in temps)})\n"
+            f"DEBUG_PACKAGE_COMPONENT_USED=({' '.join(shlex.quote(p) for p in used)})\n"
+            f"finish(){{\n{body}\n}}\nfinish {status}\n")
+        return subprocess.run(["bash", "-c", probe], text=True, capture_output=True)
+
+    def test_finish_drops_temps_and_forgets_used_entries_only_after_failure(self) -> None:
+        temp = Path(tempfile.mkdtemp(prefix="rpce-dpc-finish-temps-"))
+        self.addCleanup(shutil.rmtree, temp, True)
+        used = ["/repo/.build/debug/package-cache/v1/components/sparkle/" + KEY_1,
+                "/repo/.build/debug/package-cache/v1/components/helpers/repoprompt-mcp/" + KEY_2]
+        for status, entries, forgets in ((1, used, True), (0, used, False), (1, [], False)):
+            with self.subTest(status=status, used=bool(entries)):
+                leftover = temp / f"{KEY_1}.tmp.1.{status}{len(entries)}"
+                (leftover / "Sparkle.framework").mkdir(parents=True)
+                result = self.finish_probe(status, entries, [leftover])
+                self.assertEqual(result.returncode, status, result.stderr)
+                self.assertFalse(leftover.exists())
+                forget_lines = [line for line in result.stderr.splitlines() if " forget " in line]
+                if forgets:
+                    self.assertEqual(forget_lines, [
+                        "python3 -I -S /scripts/debug_package_cache.py forget --cache-root "
+                        "/repo/.build/debug/package-cache/v1 --entry " + used[0] + " --entry " + used[1]])
+                    self.assertIn("REPOPROMPT_DEBUG_PACKAGE_CACHE=off", result.stderr)
+                    self.assertIn('rm -rf "/repo/.build/debug/package-cache"', result.stderr)
+                    self.assertIn("ERROR: evicted the cached signed components", result.stderr)
+                    self.assertNotIn("could not evict", result.stderr)
+                else:
+                    self.assertEqual(forget_lines, [])
+                    self.assertNotIn("evict", result.stderr)
+        with self.subTest("forget fails"):
+            result = self.finish_probe(1, used, [], forget_status=1)
+            self.assertEqual(result.returncode, 1, result.stderr)
+            self.assertIn("WARNING: could not evict the cached signed components", result.stderr)
+            self.assertNotIn("ERROR: evicted", result.stderr)
+            self.assertIn("REPOPROMPT_DEBUG_PACKAGE_CACHE=off", result.stderr)
+            self.assertIn('rm -rf "/repo/.build/debug/package-cache"', result.stderr)
+
+    @unittest.skipUnless(sys.platform == "darwin" and Path("/usr/bin/codesign").exists(), "real codesign")
+    def test_real_ad_hoc_signing_miss_hit_and_helper_rebuild_through_the_script_functions(self) -> None:
+        """Live darwin evidence through the real functions: ad-hoc codesign, real helper CLI, real clones."""
+        sparkle_vendor = SCRIPT_DIR.parent / "Vendor/Sparkle/Sparkle.xcframework/macos-arm64_x86_64/Sparkle.framework"
+        if not sparkle_vendor.is_dir():
+            self.skipTest("vendored Sparkle.framework is unavailable")
+        temp = Path(tempfile.mkdtemp(prefix="rpce-dpc-real-"))
+        self.addCleanup(shutil.rmtree, temp, True)
+        build = temp / "build"
+        build.mkdir()
+        for name in ("RepoPrompt", "repoprompt-mcp", "repoprompt-gateway"):
+            shutil.copy("/usr/bin/true", build / name)
+        subprocess.run(["cp", "-R", str(sparkle_vendor), str(build)], check=True)
+        shim = temp / "bin"
+        shim.mkdir()
+        log = temp / "codesign.log"
+        (shim / "codesign").write_text(
+            f"#!/bin/bash\nprintf '%s\\n' \"$*\" >> {shlex.quote(str(log))}\nexec /usr/bin/codesign \"$@\"\n",
+            encoding="utf-8")
+        (shim / "codesign").chmod(0o755)
+        functions = "".join(self.function(name) for name in (
+            "echo_cmd", "run", "read_debug_package_output", "clone_tree", "debug_component", "debug_component_hit",
+            "use_cached_debug_component", "sign_debug_component_misses", "sign_path", "sign_sparkle_framework"))
+        lookup = self.between('    if [[ "$DEBUG_PACKAGE_RECEIPTS_ALLOWED" == "1" ]]; then\n', "\n    fi\n")
+        layout = self.between('for exe in "$APP_NAME" repoprompt-mcp repoprompt-gateway; do\n', "\ndone\n")
+        sparkle = self.between("if debug_component_hit sparkle; then\n", "\nfi\n")
+        signing = self.between("if (( DEBUG_PACKAGE_COMPONENTS )); then\n    sign_debug_component_misses\n", "\nfi\n")
+
+        def package(run: str, mcp_key: str) -> Tuple[Path, List[str], str]:
+            bundle = temp / run / "RepoPrompt.app"
+            (bundle / "Contents" / "MacOS").mkdir(parents=True)
+            (bundle / "Contents" / "Frameworks").mkdir()
+            log.write_text("", encoding="utf-8")
+            probe = (
+                "set -euo pipefail\nphase(){ :; }\nfail(){ echo \"ERROR: $*\" >&2; exit 1; }\n" + functions
+                + f"CONTROL_PLANE_SCRIPTS_DIR={shlex.quote(str(SCRIPT_DIR))}\n"
+                + f"DEBUG_PACKAGE_CACHE_ROOT={shlex.quote(str(temp / 'cache' / 'v1'))}\n"
+                + f"BUILD_DIR={shlex.quote(str(build))}\nSPARKLE_FRAMEWORK=\"$BUILD_DIR/Sparkle.framework\"\n"
+                + f"APP_BUNDLE={shlex.quote(str(bundle))}\nAPP_NAME=RepoPrompt\n"
+                + "SIGN_IDENTITY=- USE_ADHOC_SIGNING=1 USE_LOCAL_SELF_SIGNED_RELEASE=0 IS_RELEASE=0\n"
+                + "DEBUG_PACKAGE_COMPONENTS=0 DEBUG_PACKAGE_RECEIPTS_ALLOWED=1 DEBUG_PACKAGE_COMPONENT_COMMITTED=0\n"
+                + "DEBUG_PACKAGE_CLONE_FALLBACK_REPORTED=0 DEBUG_PACKAGE_COMPONENT_TEMPS=() DEBUG_PACKAGE_COMPONENT_USED=()\n"
+                + f"DEBUG_PACKAGE_SPARKLE_KEY={'5' * 64} DEBUG_PACKAGE_HELPER_MCP_KEY={mcp_key} "
+                + f"DEBUG_PACKAGE_HELPER_GATEWAY_KEY={'7' * 64}\n"
+                + lookup + layout + sparkle + signing)
+            env = dict(os.environ, PATH=f"{shim}:{os.environ.get('PATH', '')}")
+            result = subprocess.run(["bash", "-c", probe], text=True, capture_output=True, env=env)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            return bundle, log.read_text(encoding="utf-8").splitlines(), result.stdout
+
+        def details(path: Path) -> dict:
+            text = subprocess.run(["/usr/bin/codesign", "-dv", "--verbose=4", str(path)], text=True,
+                                  capture_output=True, check=True).stderr
+            return {k: v for k, _, v in (line.partition("=") for line in text.splitlines()) if k in ("Identifier", "CDHash")}
+
+        cache = temp / "cache" / "v1" / "components"
+        mcp_entry = cache / "helpers" / "repoprompt-mcp" / ("6" * 64) / "repoprompt-mcp"
+        first, calls, out = package("run1", "6" * 64)
+        self.assertEqual(sum(call.startswith("--force --sign -") for call in calls), 7)  # 5 Sparkle + 2 helpers
+        self.assertEqual(sum(call.startswith("--verify --deep --strict") for call in calls), 3)
+        self.assertEqual(out.count("CACHE MISS: "), 3)
+        # The Identifier comes from the payload basename (ad-hoc appends a hash; identity signing gives exactly
+        # repoprompt-mcp), so the cached copy equals a fresh sign of the same input under the same basename.
+        fresh = temp / "fresh" / "repoprompt-mcp"
+        renamed = temp / "fresh" / "other-name"
+        fresh.parent.mkdir()
+        for path in (fresh, renamed):
+            shutil.copy(build / "repoprompt-mcp", path)
+            subprocess.run(["/usr/bin/codesign", "--force", "--sign", "-", "--timestamp=none", str(path)], check=True,
+                           capture_output=True)
+        self.assertTrue(details(mcp_entry)["Identifier"].startswith("repoprompt-mcp"), details(mcp_entry))
+        self.assertEqual(details(fresh), details(mcp_entry))  # cached == freshly signed same input
+        self.assertFalse(details(renamed)["Identifier"].startswith("repoprompt-mcp"), details(renamed))
+        for rel, entry in (("Contents/MacOS/repoprompt-mcp", mcp_entry),
+                           ("Contents/Frameworks/Sparkle.framework", cache / "sparkle" / ("5" * 64) / "Sparkle.framework")):
+            self.assertEqual(details(first / rel), details(entry))
+        subprocess.run(["/usr/bin/codesign", "--verify", "--deep", "--strict", str(first / "Contents/Frameworks/Sparkle.framework")],
+                       check=True, capture_output=True)
+
+        second, calls, out = package("run2", "6" * 64)
+        self.assertEqual(calls, [])  # all three reused: no signing, no component verify
+        self.assertEqual(out.count("CACHE HIT: "), 3)
+        self.assertEqual(details(second / "Contents/MacOS/repoprompt-mcp"), details(mcp_entry))
+        self.assertNotEqual(os.stat(second / "Contents/MacOS/repoprompt-mcp").st_ino, os.stat(mcp_entry).st_ino)
+
+        _, calls, out = package("run3", "8" * 64)  # helper relink -> new helper key only
+        self.assertEqual(calls[0].split()[:3], ["--force", "--sign", "-"])
+        self.assertEqual(len(calls), 2)
+        self.assertTrue(calls[0].endswith("/repoprompt-mcp") and ".tmp." in calls[0], calls)
+        self.assertEqual((out.count("CACHE HIT: "), out.count("CACHE MISS: ")), (2, 1))
 
 
 if __name__ == "__main__":

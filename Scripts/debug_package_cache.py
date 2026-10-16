@@ -19,6 +19,24 @@ Subcommands:
       Print the package keys, ``outcome`` and ``receipts_allowed``. Reads stat metadata, small
       repository inputs and Git state only; it never reads or writes a cache. When receipts are
       not allowed (cache ``off`` or an unresolved identity) the keys are ``none``.
+  component-lookup --cache-root C --component ID=KEY...
+      For each signed component (``sparkle``, ``helper_mcp``, ``helper_gateway``) print
+      ``<ID>_status=hit`` with the entry, or ``miss`` with a fresh private temp entry to sign into.
+      An entry whose receipt inventory no longer matches, or that lacks ``.complete``, is evicted.
+  component-commit --cache-root C --component ID=TEMP...
+      Record the signed payload's inventory in ``receipt.json``, write ``.complete`` last and
+      rename the temp entry into place. If the entry already exists the temp copy is discarded.
+  forget --cache-root C --entry PATH...
+      Evict the named component entries (a failed run's used entries).
+  prune --cache-root C [--keep 2] [--used PATH...]
+      Keep the newest entries per component plus every used one; drop stale temp entries.
+
+The package_app.sh caller invokes the component subcommands only when ``plan`` allowed receipts
+(cache ``on`` and a resolved identity), so cache ``off`` never reads, writes or evicts entries.
+Component cache layout (immutable entries)::
+
+    <cache-root>/components/sparkle/<key>/Sparkle.framework, receipt.json, .complete
+    <cache-root>/components/helpers/<name>/<key>/<name>,       receipt.json, .complete
 
 stdout carries ``key=value`` lines, the first being ``schema=1``. Diagnostics go to stderr.
 Exit codes: 0 success, 1 failure with the destination intact (or still absent), 2 usage,
@@ -31,6 +49,7 @@ import argparse
 import ctypes
 import errno
 import hashlib
+import json
 import os
 import plistlib
 import re
@@ -38,6 +57,7 @@ import shutil
 import stat
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 from typing import Callable, Dict, Iterable, List, Mapping, Optional, Sequence, TextIO, Tuple
@@ -674,6 +694,215 @@ def plan(
     return EXIT_OK
 
 
+# --- Signed component cache (plan Step 5) ----------------------------------------------------
+# Each entry is signed and verified once by package_app.sh, committed here, and then cloned
+# (never hard-linked) into every bundle. Entries are immutable; there is no lock: writers use
+# unique temp entries and an atomic rename, and a colliding commit discards its temp copy.
+
+# Component id -> (directory below <cache-root>/components, payload name). Helper payloads keep
+# their product basename: a loose Mach-O signed without --identifier takes it as Identifier.
+COMPONENTS: Dict[str, Tuple[Tuple[str, ...], str]] = {
+    "sparkle": (("sparkle",), "Sparkle.framework"),
+    "helper_mcp": (("helpers", "repoprompt-mcp"), "repoprompt-mcp"),
+    "helper_gateway": (("helpers", "repoprompt-gateway"), "repoprompt-gateway"),
+}
+COMPONENT_KEY_RE = re.compile(r"[0-9a-f]{64}")
+RECEIPT_NAME = "receipt.json"
+COMPLETE_NAME = ".complete"
+TEMP_MARKER = ".tmp."
+EVICT_MARKER = ".evict."
+RECEIPT_VERSION = 1
+DEFAULT_KEEP = 2
+STALE_TEMP_SECONDS = 3600
+CACHE_RECOVERY = ("retry with REPOPROMPT_DEBUG_PACKAGE_CACHE=off, or clear the cache while no package job runs: "
+                  "rm -rf .build/debug/package-cache")
+
+
+class ComponentCacheError(Exception):
+    """An operational component-cache failure (not a normal miss)."""
+
+
+def component_dir(cache_root: Path, component: str) -> Path:
+    return Path(cache_root, "components", *COMPONENTS[component][0])
+
+
+def component_inventory(payload: Path) -> List[List[object]]:
+    """(rel, type, mode, size, mtime_ns, ino, symlink target) per payload entry, never following links."""
+    inventory: List[List[object]] = []
+    for rel, path, st in _walk(payload, os.lstat):
+        target = os.readlink(path) if stat.S_ISLNK(st.st_mode) else ""
+        inventory.append([rel, _entry_type(st.st_mode), st.st_mode, st.st_size, st.st_mtime_ns, st.st_ino, target])
+    return inventory
+
+
+def _receipt(component: str, key: str, inventory: List[List[object]]) -> Dict[str, object]:
+    return {"version": RECEIPT_VERSION, "component": component, "key": key, "payload": COMPONENTS[component][1],
+            "inventory": inventory}
+
+
+def entry_problem(entry: Path, component: str, key: str) -> Optional[str]:
+    """Why ``entry`` cannot be reused, or None when its receipt inventory still matches."""
+    payload = COMPONENTS[component][1]
+    if entry.is_symlink() or not entry.is_dir():
+        return "not a directory"
+    if not (entry / COMPLETE_NAME).is_file():
+        return f"incomplete (no {COMPLETE_NAME})"
+    members = sorted(os.listdir(entry))
+    if members != sorted((payload, RECEIPT_NAME, COMPLETE_NAME)):
+        return f"unexpected members {members}"
+    try:
+        receipt = json.loads((entry / RECEIPT_NAME).read_text(encoding="utf-8"))
+        inventory = component_inventory(entry / payload)
+    except (OSError, ValueError) as exc:
+        return f"unreadable entry ({exc})"
+    if receipt != _receipt(component, key, inventory):
+        return "receipt inventory mismatch"
+    return None
+
+
+def _evict(path: Path, err: TextIO) -> None:
+    """Move an entry aside atomically, then delete it; a failed delete is left for prune."""
+    aside = path.with_name(f"{path.name}{EVICT_MARKER}{os.getpid()}.{os.urandom(4).hex()}")
+    os.rename(path, aside)
+    try:
+        shutil.rmtree(aside)
+    except OSError as exc:
+        err.write(f"WARNING: could not delete evicted cache entry {aside}: {exc}; prune removes it later.\n")
+
+
+def component_lookup(cache_root: Path, requests: Sequence[Tuple[str, str]], *, out: TextIO, err: TextIO) -> int:
+    lines = [f"schema={SCHEMA}"]
+    for component, key in requests:
+        directory = component_dir(cache_root, component)
+        entry = directory / key
+        if os.path.lexists(entry):
+            problem = entry_problem(entry, component, key)
+            if problem is None:
+                os.utime(entry)  # recency for prune; receipts cover only the payload
+                lines += [f"{component}_status=hit", f"{component}_path={entry}"]
+                continue
+            err.write(f"Evicting {component} cache entry {entry}: {problem}\n")
+            _evict(entry, err)
+        directory.mkdir(parents=True, exist_ok=True)
+        temp = tempfile.mkdtemp(prefix=f"{key}{TEMP_MARKER}{os.getppid()}.", dir=directory)
+        lines += [f"{component}_status=miss", f"{component}_path={temp}"]
+    out.write("\n".join(lines) + "\n")
+    return EXIT_OK
+
+
+def component_commit(cache_root: Path, requests: Sequence[Tuple[str, str]], *, out: TextIO, err: TextIO) -> int:
+    lines = [f"schema={SCHEMA}"]
+    for component, temp_text in requests:
+        directory = component_dir(cache_root, component)
+        payload = COMPONENTS[component][1]
+        temp = Path(temp_text)
+        key, marker, _ = temp.name.partition(TEMP_MARKER)
+        if (not marker or not COMPONENT_KEY_RE.fullmatch(key) or temp.is_symlink() or not temp.is_dir()
+                or not _same_directory(temp.parent, directory)):
+            raise ComponentCacheError(f"{temp} is not a {component} temp entry under {directory}")
+        if sorted(os.listdir(temp)) != [payload]:
+            raise ComponentCacheError(f"{temp} must hold exactly the signed {payload}")
+        receipt = _receipt(component, key, component_inventory(temp / payload))
+        (temp / RECEIPT_NAME).write_text(json.dumps(receipt, sort_keys=True) + "\n", encoding="utf-8")
+        (temp / COMPLETE_NAME).write_text("1\n", encoding="utf-8")  # written last
+        final = directory / key
+        status = "committed"
+        if os.path.lexists(final):
+            status = "collision"
+        else:
+            try:
+                os.rename(temp, final)
+            except OSError as exc:
+                if exc.errno not in (errno.EEXIST, errno.ENOTEMPTY):
+                    raise
+                status = "collision"
+        if status == "collision":
+            shutil.rmtree(temp)  # never merge trees; reuse the entry another writer committed
+            problem = entry_problem(final, component, key)
+            if problem is not None:
+                raise ComponentCacheError(f"{final} was committed concurrently but is unusable ({problem})")
+            err.write(f"{component} cache entry {final} already exists; discarded this run's signed copy.\n")
+        lines += [f"{component}_status={status}", f"{component}_path={final}"]
+    out.write("\n".join(lines) + "\n")
+    return EXIT_OK
+
+
+def _component_of_entry(cache_root: Path, entry: Path) -> Optional[str]:
+    if not COMPONENT_KEY_RE.fullmatch(entry.name):
+        return None
+    for component in COMPONENTS:
+        if _same_directory(entry.parent, component_dir(cache_root, component)):
+            return component
+    return None
+
+
+def forget(cache_root: Path, entries: Sequence[Path], *, out: TextIO, err: TextIO) -> int:
+    forgotten = 0
+    for entry in map(Path, entries):
+        if not os.path.lexists(entry):
+            continue
+        if _component_of_entry(cache_root, entry) is None:
+            raise ComponentCacheError(f"refusing to forget {entry}: not a component entry under {cache_root}")
+        _evict(entry, err)
+        err.write(f"Forgot cache entry {entry}\n")
+        forgotten += 1
+    out.write(f"schema={SCHEMA}\nforgotten={forgotten}\n")
+    return EXIT_OK
+
+
+def prune(
+    cache_root: Path,
+    *,
+    keep: int,
+    used: Sequence[Path],
+    max_temp_age: float = STALE_TEMP_SECONDS,
+    now: Callable[[], float] = time.time,
+    out: TextIO,
+    err: TextIO,
+) -> int:
+    """Keep the ``keep`` newest entries (by mtime) per component plus every used entry."""
+    used_paths = {os.path.realpath(path) for path in used}
+    current = now()
+    pruned = 0
+    for component in COMPONENTS:
+        directory = component_dir(cache_root, component)
+        if directory.is_symlink() or not directory.is_dir():
+            continue
+        entries: List[Tuple[int, str, Path]] = []
+        for item in os.scandir(directory):
+            path = Path(item.path)
+            st = item.stat(follow_symlinks=False)
+            if COMPONENT_KEY_RE.fullmatch(item.name):
+                entries.append((st.st_mtime_ns, item.name, path))
+            elif (TEMP_MARKER in item.name or EVICT_MARKER in item.name) and current - st.st_mtime >= max_temp_age:
+                if item.is_dir(follow_symlinks=False):
+                    shutil.rmtree(path)
+                else:
+                    path.unlink()
+                pruned += 1
+        for index, (_, _, path) in enumerate(sorted(entries, reverse=True)):
+            if index < keep or os.path.realpath(path) in used_paths:
+                continue
+            _evict(path, err)
+            pruned += 1
+    out.write(f"schema={SCHEMA}\npruned={pruned}\n")
+    return EXIT_OK
+
+
+def _component_pairs(parser: argparse.ArgumentParser, pairs: Sequence[str], *, keys: bool) -> List[Tuple[str, str]]:
+    parsed: List[Tuple[str, str]] = []
+    for pair in pairs:
+        component, sep, value = pair.partition("=")
+        if not sep or component not in COMPONENTS or any(component == seen for seen, _ in parsed) or not value:
+            parser.error(f"--component {pair!r}: unknown, malformed or duplicate component")
+        if keys and not COMPONENT_KEY_RE.fullmatch(value):
+            parser.error(f"--component {pair!r}: expected a lowercase 64-hex key")
+        parsed.append((component, value))
+    if not parsed:
+        parser.error("at least one --component is required")
+    return parsed
+
+
 def _cert(value: str) -> str:
     if value in ("adhoc", "unresolved") or CERT_RE.fullmatch(value):
         return value
@@ -722,6 +951,18 @@ def build_parser() -> argparse.ArgumentParser:
     plan_parser.add_argument("--scripts-dir", type=Path, required=True)
     plan_parser.add_argument("--build-dir", type=Path, required=True)
     plan_parser.add_argument("--field", action="append", default=[], metavar="NAME=VALUE")
+    for name, metavar, help_text in (("component-lookup", "ID=KEY", "find or start signed component entries"),
+                                     ("component-commit", "ID=TEMP", "commit signed component temp entries")):
+        component_parser = commands.add_parser(name, help=help_text)
+        component_parser.add_argument("--cache-root", type=Path, required=True)
+        component_parser.add_argument("--component", action="append", default=[], metavar=metavar)
+    forget_parser = commands.add_parser("forget", help="evict component entries a failed run used")
+    forget_parser.add_argument("--cache-root", type=Path, required=True)
+    forget_parser.add_argument("--entry", type=Path, action="append", required=True)
+    prune_parser = commands.add_parser("prune", help="keep the newest and the used component entries")
+    prune_parser.add_argument("--cache-root", type=Path, required=True)
+    prune_parser.add_argument("--keep", type=_non_negative_int, default=DEFAULT_KEEP)
+    prune_parser.add_argument("--used", type=Path, action="append", default=[])
     return parser
 
 
@@ -740,6 +981,20 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         fields = _parse_fields(parser, args.field)
         return plan(cache=args.cache, cert=args.cert, root=args.root, scripts_dir=args.scripts_dir,
                     build_dir=args.build_dir, fields=fields)
+    if args.command in ("component-lookup", "component-commit", "forget", "prune"):
+        try:
+            if args.command == "component-lookup":
+                requests = _component_pairs(parser, args.component, keys=True)
+                return component_lookup(args.cache_root, requests, out=sys.stdout, err=sys.stderr)
+            if args.command == "component-commit":
+                requests = _component_pairs(parser, args.component, keys=False)
+                return component_commit(args.cache_root, requests, out=sys.stdout, err=sys.stderr)
+            if args.command == "forget":
+                return forget(args.cache_root, args.entry, out=sys.stdout, err=sys.stderr)
+            return prune(args.cache_root, keep=args.keep, used=args.used, out=sys.stdout, err=sys.stderr)
+        except (OSError, ComponentCacheError) as exc:
+            print(f"ERROR: debug package {args.command} failed: {exc}. To recover, {CACHE_RECOVERY}.", file=sys.stderr)
+            return EXIT_FAILED
     return cleanup_stale(args.parent, args.max_age)
 
 
