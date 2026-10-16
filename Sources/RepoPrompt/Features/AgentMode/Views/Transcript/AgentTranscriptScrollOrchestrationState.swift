@@ -18,6 +18,9 @@ struct TranscriptPresentationViewState {
     var transcriptScrollResetRevision = 0
     var activationRepaintRemountKey: AgentTranscriptRehydrateRetryKey?
     var activationRepaintRemountCount = 0
+    /// Tab whose hydrated presentation the transcript `ScrollView` is already mounted for in the
+    /// current activation. See `AgentTranscriptScrollMountKey`.
+    var hydratedTranscriptMountTabID: UUID?
     var showCompressedHistory = false
     var transcriptBlockExpansion: [String: Bool] = [:]
     var transcriptBlockDefaultExpansion: [String: Bool] = [:]
@@ -47,6 +50,8 @@ struct AgentTranscriptBottomAffordanceState: Equatable {
 @MainActor
 final class AgentTranscriptScrollEngine: ObservableObject {
     var scrollMetrics = AgentTranscriptScrollMetrics()
+    /// See `AgentTranscriptMountedScrollGeometry`.
+    var lastMountedScrollGeometry: AgentTranscriptMountedScrollGeometry?
     var pendingCompressionRestoreStrategy: AgentTranscriptCompressionRestoreStrategy?
     var hasUserInteractedWithScroll = false
     var isUserInteractingWithScroll = false

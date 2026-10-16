@@ -342,6 +342,14 @@ struct AgentModeChatDetailView: View {
         nonmutating set { presentation.activationRepaintRemountCount = newValue }
     }
 
+    private var hydratedTranscriptMountTabID: UUID? {
+        get { presentation.hydratedTranscriptMountTabID }
+        nonmutating set {
+            guard presentation.hydratedTranscriptMountTabID != newValue else { return }
+            presentation.hydratedTranscriptMountTabID = newValue
+        }
+    }
+
     private var composerBottomInset: CGFloat {
         get { presentation.composerBottomInset }
         nonmutating set { presentation.composerBottomInset = newValue }
@@ -1660,6 +1668,16 @@ struct AgentModeChatDetailView: View {
         )
     }
 
+    /// Identity of the transcript `ScrollView`; changes in the same update as the content it
+    /// freshens (tab entry, first hydration of an activation, explicit reset revision bumps).
+    private var transcriptScrollMountKey: AgentTranscriptScrollMountKey {
+        AgentTranscriptScrollMountKey(
+            restoreSignal: restoreSignal,
+            hydratedMountTabID: hydratedTranscriptMountTabID,
+            resetRevision: transcriptScrollResetRevision
+        )
+    }
+
     private var shouldShowStreamingHistoryIndicator: Bool {
         canRevealCompressedHistory && !usesCompressedHistory
     }
@@ -2190,11 +2208,13 @@ struct AgentModeChatDetailView: View {
                     applyStoredTranscriptViewportState(for: currentTabID)
                     armRehydrateRestore(for: currentTabID)
                     _ = advanceRehydrateRestoreIfNeeded(proxy: proxy)
+                    replayMountedScrollGeometryForRestore()
                     #if DEBUG
                         assertScrollStateInvariants()
                     #endif
                 }
                 .onDisappear {
+                    scrollEngine.lastMountedScrollGeometry = nil
                     clearPinnedTranscriptChangeSuppression()
                     clearPinnedIdleTransitionManualDetach()
                     clearManualDetachOverride()
@@ -2356,12 +2376,15 @@ struct AgentModeChatDetailView: View {
                         legacyIsNearBottom = false
                         lastSeenUserMessageID = nil
                         interruptSmoothPinnedSend(reason: "tabChange")
-                        transcriptScrollResetRevision &+= 1
+                        // No reset-revision bump: `transcriptScrollMountKey` follows the
+                        // presentation tab, so the destination rows already mounted in a fresh
+                        // ScrollView in the update that delivered them.
                         scrollEngine.rehydrate.coldRestoreStartedAt = nil
                         clearLiveTranscriptViewportCaptureState(shouldResetDetachedRebaseTracking: true)
                         applyStoredTranscriptViewportState(for: newTabID)
                         armRehydrateRestore(for: newTabID)
                         _ = advanceRehydrateRestoreIfNeeded(proxy: proxy)
+                        replayMountedScrollGeometryForRestore()
                         #if DEBUG
                             assertScrollStateInvariants()
                         #endif
@@ -2378,18 +2401,29 @@ struct AgentModeChatDetailView: View {
                         {
                             markSmoothPinnedSendLayoutMutation("presentationRevisionChangedWhileStreaming")
                         }
-                        if let remountKey = AgentTranscriptActivationRepaintRemountPolicy.remountKey(
+                        var isMountKeyRemount = false
+                        if let remount = AgentTranscriptActivationRepaintRemountPolicy.decision(
                             oldSignal: oldSignal,
                             newSignal: newSignal,
                             currentTabID: currentTabID,
                             rehydratePhase: rehydrateRestorePhase,
                             lastRemountKey: activationRepaintRemountKey,
                             remountCount: activationRepaintRemountCount,
-                            layoutPassToken: rehydrateLayoutPassToken
+                            layoutPassToken: rehydrateLayoutPassToken,
+                            hydratedMountTabID: hydratedTranscriptMountTabID
                         ) {
-                            remountTranscriptForActivationRepaint(key: remountKey)
+                            remountTranscriptForActivationRepaint(remount)
+                            isMountKeyRemount = !remount.requiresIdentityBump
                         }
+                        hydratedTranscriptMountTabID = AgentTranscriptScrollMountKey.hydratedMountTabID(
+                            afterObserving: newSignal,
+                            currentTabID: currentTabID,
+                            previous: hydratedTranscriptMountTabID
+                        )
                         _ = advanceRehydrateRestoreIfNeeded(proxy: proxy)
+                        if isMountKeyRemount {
+                            replayMountedScrollGeometryForRestore()
+                        }
                     }
                     .onChange(of: rehydrateRestorePhase) { oldPhase, newPhase in
                         debugLog("onChange rehydrateRestorePhase", details: "old=\(debugDescription(for: oldPhase)) new=\(debugDescription(for: newPhase))")
@@ -2513,10 +2547,13 @@ struct AgentModeChatDetailView: View {
 
     @available(macOS 15.0, *)
     private func modernScrollableContentBase(proxy: ScrollViewProxy, viewportHeight: CGFloat) -> some View {
-        ScrollView {
+        // One key per body evaluation: identity, transaction and the geometry sample stamp agree.
+        let mountKey = transcriptScrollMountKey
+        return ScrollView {
             messageListContent(viewportHeight: viewportHeight, proxy: proxy)
         }
-        .id(transcriptScrollResetRevision)
+        .id(mountKey)
+        .transaction(value: mountKey, Self.disableAnimationsForTranscriptRemount)
         .modifier(AgentTranscriptInitialBottomAnchor())
         .accessibilityIdentifier("agentTranscript.scrollView")
         .coordinateSpace(name: "AgentTranscriptScrollSpace")
@@ -2529,6 +2566,10 @@ struct AgentModeChatDetailView: View {
             #if DEBUG
                 AgentTranscriptUpdateBurstProbe.note(.outerScrollGeometryAction)
             #endif
+            scrollEngine.lastMountedScrollGeometry = AgentTranscriptMountedScrollGeometry(
+                mountKey: mountKey,
+                metrics: newMetrics
+            )
             let oldMetrics = applyScrollMetrics(newMetrics)
             recordRehydrateLayoutSampleIfNeeded(metrics: newMetrics)
             recordPendingBottomScrollOutcomeLayoutMutationIfNeeded(oldMetrics: oldMetrics, newMetrics: newMetrics)
@@ -2587,10 +2628,12 @@ struct AgentModeChatDetailView: View {
     }
 
     private func legacyScrollableContent(proxy: ScrollViewProxy, viewportHeight: CGFloat) -> some View {
-        ScrollView {
+        let mountKey = transcriptScrollMountKey
+        return ScrollView {
             messageListContent(viewportHeight: viewportHeight, proxy: proxy)
         }
-        .id(transcriptScrollResetRevision)
+        .id(mountKey)
+        .transaction(value: mountKey, Self.disableAnimationsForTranscriptRemount)
         .accessibilityIdentifier("agentTranscript.scrollView")
         .coordinateSpace(name: "AgentTranscriptScrollSpace")
         .transaction { txn in
@@ -4022,6 +4065,7 @@ struct AgentModeChatDetailView: View {
         _ = applyScrollMetrics(AgentTranscriptScrollMetrics())
         legacyIsNearBottom = false
         interruptSmoothPinnedSend(reason: "manualScrollViewReset")
+        recordTranscriptMountDiagnostic("resetBump.manual", tabID: currentTabID)
         transcriptScrollResetRevision &+= 1
         scrollEngine.rehydrate.coldRestoreStartedAt = nil
         clearLiveTranscriptViewportCaptureState(shouldResetDetachedRebaseTracking: true)
@@ -4337,6 +4381,27 @@ struct AgentModeChatDetailView: View {
             return
         }
         recordCurrentRehydrateLayoutSample()
+    }
+
+    /// A fresh instance from a `transcriptScrollMountKey` change reports its first geometry before
+    /// the same update's handlers reset the scroll metrics and arm the restore (see
+    /// `AgentTranscriptMountedScrollGeometry`). Feeds that already-reported sample to the
+    /// restore's geometry consumers once the handlers ran, as the former post-handler remount's
+    /// first geometry action did. Never scrolls; a no-op unless the sample belongs to the
+    /// currently keyed instance. The replayed subset (`applyScrollMetrics`, the layout sample,
+    /// `finishRehydrateRestoreIfSettled`) is intentional: the transition, user-progress and
+    /// bottom-outcome recorders are not replayed.
+    private func replayMountedScrollGeometryForRestore() {
+        guard let metrics = AgentTranscriptMountedScrollGeometry.replayableMetrics(
+            scrollEngine.lastMountedScrollGeometry,
+            currentMountKey: transcriptScrollMountKey
+        ) else { return }
+        debugLog("replayMountedScrollGeometryForRestore", details: "distance=\(metrics.distanceToBottom) viewport=\(metrics.viewportHeight)")
+        _ = applyScrollMetrics(metrics)
+        recordRehydrateLayoutSampleIfNeeded(metrics: metrics)
+        if isRehydrateRestoreActive {
+            finishRehydrateRestoreIfSettled()
+        }
     }
 
     private func recordRehydrateLayoutSampleAfterProgrammaticSettle() {
@@ -4958,15 +5023,34 @@ struct AgentModeChatDetailView: View {
         }
     }
 
+    /// DEBUG-only live-capture counters (`agentTranscript.mount.*`): reset-revision bumps by cause
+    /// and key-driven activation mounts, so a capture can show transcript builds per switch.
+    private func recordTranscriptMountDiagnostic(_ cause: String, tabID: UUID?) {
+        #if DEBUG
+            AgentModePerfDiagnostics.increment("agentTranscript.mount.\(cause)", tabID: tabID)
+        #endif
+    }
+
     private func resetActivationRepaintRemountTracking() {
         activationRepaintRemountKey = nil
         activationRepaintRemountCount = 0
     }
 
-    private func remountTranscriptForActivationRepaint(key: AgentTranscriptRehydrateRetryKey) {
+    /// A transcript remount swaps the whole `ScrollView` instance; like the former explicit
+    /// reset-revision remount, it must not run an insertion/removal transition.
+    private static func disableAnimationsForTranscriptRemount(_ transaction: inout Transaction) {
+        transaction.animation = nil
+        transaction.disablesAnimations = true
+    }
+
+    /// Restore bookkeeping for an activation repaint remount. Tab entry and the first hydration
+    /// already mounted a fresh instance through `transcriptScrollMountKey` in the update that
+    /// changed the restore signal, so only `requiresIdentityBump` decisions bump the revision.
+    private func remountTranscriptForActivationRepaint(_ decision: AgentTranscriptActivationRepaintRemountPolicy.Decision) {
+        let key = decision.key
         debugLog(
             "activationRepaintRemount",
-            details: "tab=\(debugShortID(key.tabID)) revision=\(key.presentationRevision) count=\(activationRepaintRemountCount + 1)"
+            details: "tab=\(debugShortID(key.tabID)) revision=\(key.presentationRevision) count=\(activationRepaintRemountCount + 1) trigger=\(decision.trigger) bump=\(decision.requiresIdentityBump)"
         )
         cancelAllScheduledScrollWork()
         rehydrateLayoutPassToken &+= 1
@@ -4987,6 +5071,15 @@ struct AgentModeChatDetailView: View {
             break
         }
         clearLiveTranscriptViewportCaptureState(shouldResetDetachedRebaseTracking: false)
+        #if DEBUG
+            let cause = switch decision.trigger {
+            case .enteredTab: "enteredTab"
+            case .becameHydrated: decision.requiresIdentityBump ? "reHydration" : "firstHydration"
+            case .revisionChangedWhileAwaitingLayout: "revisionWhileAwaiting"
+            }
+            recordTranscriptMountDiagnostic((decision.requiresIdentityBump ? "resetBump." : "keyDriven.") + cause, tabID: key.tabID)
+        #endif
+        guard decision.requiresIdentityBump else { return }
         var transaction = Transaction(animation: nil)
         transaction.disablesAnimations = true
         withTransaction(transaction) {
@@ -4994,29 +5087,30 @@ struct AgentModeChatDetailView: View {
         }
     }
 
+    /// Activation-start bookkeeping for an already hydrated presentation; never bumps (see
+    /// `AgentTranscriptActivationRepaintRemountPolicy.activationStartDecision` for why each of
+    /// `armRehydrateRestore`'s three callers — `onAppear`, `onChange(currentTabID)`, the manual
+    /// reset — already shows a fresh instance).
     private func remountTranscriptForAlreadyHydratedActivationIfNeeded() {
-        let newSignal = restoreSignal
-        let oldSignal = AgentTranscriptRestoreSignal(
-            tabID: nil,
-            bindingsHydrated: false,
-            presentationRevision: newSignal.presentationRevision
-        )
-        if let remountKey = AgentTranscriptActivationRepaintRemountPolicy.remountKey(
-            oldSignal: oldSignal,
-            newSignal: newSignal,
+        if let remount = AgentTranscriptActivationRepaintRemountPolicy.activationStartDecision(
+            signal: restoreSignal,
             currentTabID: currentTabID,
             rehydratePhase: rehydrateRestorePhase,
             lastRemountKey: activationRepaintRemountKey,
             remountCount: activationRepaintRemountCount,
             layoutPassToken: rehydrateLayoutPassToken
         ) {
-            remountTranscriptForActivationRepaint(key: remountKey)
+            remountTranscriptForActivationRepaint(remount)
         }
     }
 
     private func armRehydrateRestore(for tabID: UUID?) {
         debugLog("armRehydrateRestore", details: "target=\(debugShortID(tabID))")
         resetActivationRepaintRemountTracking()
+        hydratedTranscriptMountTabID = AgentTranscriptScrollMountKey.hydratedMountTabID(
+            atActivationOf: tabID,
+            restoreSignal: restoreSignal
+        )
         rehydrateLayoutPassToken &+= 1
         lastSettledRehydrateRetryKey = nil
         currentRehydrateLayoutSampleKey = nil
