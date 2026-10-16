@@ -94,7 +94,8 @@ class LifecycleQueueTests(LifecycleTestCase):
         # idle protocol-15 daemon would reject one and silently drop the other.
         # 17: forwards RPCE_INDEX_STORE, which an idle protocol-16 daemon would drop.
         # 18: forwards REPOPROMPT_DEBUG_PACKAGE_CACHE, which an idle protocol-17 daemon would drop.
-        self.assertEqual(conductor.PROTOCOL_VERSION, 18)
+        # 19: `build --optimized` (args.optimized); an idle protocol-18 daemon would drop it and build debug.
+        self.assertEqual(conductor.PROTOCOL_VERSION, 19)
 
     def test_ensure_daemon_stops_and_replaces_idle_protocol_15_daemon(self) -> None:
         tmp, state = self.make_state()
@@ -270,6 +271,213 @@ class LifecycleQueueTests(LifecycleTestCase):
                     self.assertEqual(env[key], value)
             argv, _lanes, _cwd, env, _timeout = registry.prepare({"operation": "build", "args": {}, "env": {}})
             self.assertNotIn(key, env)
+
+    def test_build_optimized_cli_sets_the_lane_key_only_when_true(self) -> None:
+        tmp, state = self.make_state()
+        self.addCleanup(tmp.cleanup)
+        cases = {
+            (): ({}, None),
+            ("--fast",): ({"fastPackage": True}, None),
+            ("--optimized",): ({"optimized": True}, None),
+            ("--optimized", "--fast"): ({"fastPackage": True, "optimized": True}, None),
+            ("--optimized", "--timeout", "600"): ({"optimized": True}, 600.0),
+            ("--timeout", "9000", "--optimized"): ({"optimized": True}, 9000.0),
+        }
+        for argv, (expected_args, expected_timeout) in cases.items():
+            with self.subTest(argv=argv), mock.patch.object(conductor, "enqueue_and_maybe_wait", return_value=0) as enqueue:
+                code = conductor.handle_real_operation(state.paths, "build", list(argv))
+                self.assertEqual(code, 0)
+                self.assertEqual(enqueue.call_args.args[1], "build")
+                self.assertEqual(enqueue.call_args.args[2], expected_args)
+                self.assertEqual(enqueue.call_args.args[3].timeout, expected_timeout)
+                if "--optimized" not in argv:
+                    self.assertNotIn("optimized", enqueue.call_args.args[2])
+        with mock.patch.object(conductor, "enqueue_and_maybe_wait", return_value=0), \
+                contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            conductor.handle_real_operation(state.paths, "build", ["--optimized=yes"])
+
+    def test_build_optimized_maps_to_the_lane_package_config_and_timeout_floor(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            registry = conductor.OperationRegistry(Path(tmp))
+            default = registry.prepare({"operation": "build", "args": {}, "env": {}})
+            fast = registry.prepare({"operation": "build", "args": {"fastPackage": True}, "env": {}})
+            lane = registry.prepare({"operation": "build", "args": {"optimized": True}, "env": {}})
+            lane_fast = registry.prepare(
+                {"operation": "build", "args": {"optimized": True, "fastPackage": True}, "env": {}}
+            )
+            # Default lane: today's argv, lanes and timeout, byte for byte.
+            self.assertEqual(default[0], [str(Path(tmp) / "Scripts" / "package_app.sh"), "debug"])
+            self.assertEqual(fast[0], [str(Path(tmp) / "Scripts" / "package_app.sh"), "debug", "fast"])
+            self.assertEqual(default[4], conductor.MEDIUM_TIMEOUT_SECONDS)
+            self.assertEqual(fast[4], conductor.MEDIUM_TIMEOUT_SECONDS)
+            # Lane: same script, the debug-optimized config, the same lanes, and the timeout floor.
+            self.assertEqual(lane[0], [str(Path(tmp) / "Scripts" / "package_app.sh"), "debug-optimized"])
+            self.assertEqual(lane_fast[0][-2:], ["debug-optimized", "fast"])
+            for prepared in (default, fast, lane, lane_fast):
+                self.assertEqual(prepared[1], ["build", "debugArtifact"])
+                self.assertEqual(prepared[2], Path(tmp))
+            floor = max(conductor.MEDIUM_TIMEOUT_SECONDS, conductor.OPTIMIZED_LANE_TIMEOUT_FLOOR_SECONDS)
+            self.assertEqual(lane[4], floor)
+            self.assertEqual(lane_fast[4], floor)
+            # Never below the ordinary build default, whatever the measured floor.
+            self.assertGreaterEqual(lane[4], conductor.MEDIUM_TIMEOUT_SECONDS)
+            # The floor applies to the lane only, whatever its measured value; the default keeps its timeout.
+            with mock.patch.object(conductor, "OPTIMIZED_LANE_TIMEOUT_FLOOR_SECONDS", conductor.MEDIUM_TIMEOUT_SECONDS * 3):
+                self.assertEqual(
+                    registry.prepare({"operation": "build", "args": {"optimized": True}, "env": {}})[4],
+                    conductor.MEDIUM_TIMEOUT_SECONDS * 3,
+                )
+                self.assertEqual(
+                    registry.prepare({"operation": "build", "args": {}, "env": {}})[4],
+                    conductor.MEDIUM_TIMEOUT_SECONDS,
+                )
+            with mock.patch.object(conductor, "OPTIMIZED_LANE_TIMEOUT_FLOOR_SECONDS", 60):
+                self.assertEqual(
+                    registry.prepare({"operation": "build", "args": {"optimized": True}, "env": {}})[4],
+                    conductor.MEDIUM_TIMEOUT_SECONDS,
+                )
+            # An explicit --timeout always wins, below or above the floor.
+            for explicit in (5.0, 600.0, floor + 1.0):
+                with self.subTest(explicit=explicit):
+                    _argv, _lanes, _cwd, _env, timeout = registry.prepare(
+                        {"operation": "build", "args": {"optimized": True}, "env": {}, "timeout": explicit}
+                    )
+                    self.assertEqual(timeout, explicit)
+            # Only `true` is a lane request; every other present value is malformed, never debug.
+            for bad in (False, "true", 1, None, "1"):
+                with self.subTest(bad=bad), self.assertRaisesRegex(conductor.ConductorError, "must be true"):
+                    registry.prepare({"operation": "build", "args": {"optimized": bad}, "env": {}})
+            # Other operations are untouched by the key (run/app relaunch support is Step 5).
+            package = registry.prepare({"operation": "package", "args": {"config": "debug"}, "env": {}})
+            self.assertEqual(package[0][-1], "debug")
+
+    def test_build_optimized_request_identity_is_distinct_and_default_identity_unchanged(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            registry = conductor.OperationRegistry(Path(tmp))
+            default = {"operation": "build", "args": {}, "env": {}}
+            lane = {"operation": "build", "args": {"optimized": True}, "env": {}}
+            # The default fingerprint is exactly the pre-lane material: no `optimized` key appears.
+            material = {
+                "operation": "build",
+                "args": {},
+                "timeout": None,
+                "verbose": False,
+                "env": {
+                    key: ("off" if key == conductor.DEBUG_DSYM_POLICY_ENV_KEY else None)
+                    for key in conductor.OperationRegistry.PASSTHROUGH_ENV_KEYS
+                },
+            }
+            expected = hashlib.sha256(conductor.json_dumps(material).encode("utf-8")).hexdigest()
+            self.assertEqual(registry.fingerprint(default), expected)
+            self.assertNotEqual(registry.fingerprint(lane), registry.fingerprint(default))
+            self.assertNotEqual(
+                registry.fingerprint({"operation": "build", "args": {"optimized": True, "fastPackage": True}}),
+                registry.fingerprint({"operation": "build", "args": {"fastPackage": True}}),
+            )
+
+    def test_build_optimized_forwards_caller_signing_without_injecting_absent_identity_or_sentry(self) -> None:
+        # The lane preconditions in package_app.sh require an explicit Apple Development SIGN_IDENTITY and
+        # *unset* Sentry variables and BUNDLE_ID; conductor must forward the first verbatim and never inject
+        # the others, even when the daemon's own environment has them.
+        self.assertNotIn("RPCE_OPTIMIZED_DIAGNOSTICS", conductor.OperationRegistry.PASSTHROUGH_ENV_KEYS)
+        identity = "Apple Development: Stub Person (TEAMID1234)"
+        absent = ("REPOPROMPT_ENABLE_SENTRY", "REPOPROMPT_UPLOAD_SENTRY_SYMBOLS", "BUNDLE_ID", "DEBUG_BUNDLE_ID")
+        bundle = "/tmp/rpce-opt-probe-test/RepoPrompt.app"
+        caller = {key: value for key, value in os.environ.items() if key not in absent}
+        caller.update({
+            "SIGN_IDENTITY": identity,
+            "REPOPROMPT_DEBUG_APP_BUNDLE": bundle,
+            "RPCE_OPTIMIZED_DIAGNOSTICS": "1",
+        })
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ, caller, clear=True):
+            snapshot = conductor.OperationRegistry.client_env_snapshot()
+            registry = conductor.OperationRegistry(Path(tmp))
+            daemon_env = {"REPOPROMPT_ENABLE_SENTRY": "1", "REPOPROMPT_UPLOAD_SENTRY_SYMBOLS": "1", "BUNDLE_ID": "x.y"}
+            with mock.patch.dict(os.environ, daemon_env):
+                for args in ({"optimized": True}, {"optimized": True, "fastPackage": True}):
+                    with self.subTest(args=args):
+                        argv, _lanes, _cwd, env, _timeout = registry.prepare(
+                            {"operation": "build", "args": args, "env": snapshot}
+                        )
+                        self.assertEqual(argv[1], "debug-optimized")
+                        self.assertEqual(env["SIGN_IDENTITY"], identity)
+                        self.assertEqual(env["REPOPROMPT_DEBUG_APP_BUNDLE"], bundle)
+                        for key in absent + ("RPCE_OPTIMIZED_DIAGNOSTICS", "ALLOW_ADHOC_SIGNING"):
+                            self.assertNotIn(key, env)
+                # A forged request env carrying the gate is filtered by the daemon too.
+                forged = dict(snapshot, RPCE_OPTIMIZED_DIAGNOSTICS="1")
+                _argv, _lanes, _cwd, env, _timeout = registry.prepare(
+                    {"operation": "build", "args": {"optimized": True}, "env": forged}
+                )
+                self.assertNotIn("RPCE_OPTIMIZED_DIAGNOSTICS", env)
+
+    def run_build_until_timeout(
+        self, args: dict, *, request_timeout: float | None = None
+    ) -> tuple[conductor.DaemonState, dict, list[float]]:
+        tmp, state = self.make_state()
+        self.addCleanup(tmp.cleanup)
+        # Persistence and maintenance finish after ``job_wait``; drain before the tempdir goes (LIFO).
+        self.addCleanup(state._await_maintenance, 10.0)
+        self.addCleanup(state._await_job_telemetry, 10.0)
+        sleeper = [sys.executable, "-u", "-c", "import time; time.sleep(30)"]
+        prepared_timeouts: list[float] = []
+
+        def fake_prepare(request: dict) -> tuple:
+            real = conductor.OperationRegistry.prepare(state.registry, request)
+            prepared_timeouts.append(real[4])
+            return (sleeper, ["style"], state.paths.repo_root, {"PATH": os.environ.get("PATH", "")}, 0.5)
+
+        with mock.patch.object(state.registry, "prepare", side_effect=fake_prepare), mock.patch.object(
+            conductor, "operation_requires_global_heavy_slot", return_value=False
+        ):
+            request = {"operation": "build", "args": args, "env": {}}
+            if request_timeout is not None:
+                request["timeout"] = request_timeout
+            ticket = state.enqueue(request)["ticket"]
+            waited = state.job_wait(ticket, None, 30.0)
+        return state, waited, prepared_timeouts
+
+    def test_optimized_build_timeout_failure_names_the_timeout_flag(self) -> None:
+        _state, waited, prepared = self.run_build_until_timeout({"optimized": True})
+        self.assertEqual(waited["state"], "failed")
+        self.assertEqual(waited["exitCode"], 124)
+        error = waited.get("error") or ""
+        self.assertTrue(error.startswith("timed out after 0.5s; "), error)
+        self.assertIn("./conductor build --optimized --timeout <seconds>", error)
+        self.assertIn("(this run allowed 0s)", error)  # 0.5 rounds to 0 in the whole-second hint
+        self.assertIn("hint: optimized-lane builds", "".join(waited.get("logTail") or []))
+        self.assertEqual(waited["resultSummary"], error)
+        # The enqueue-time preparation applies the floor; the run-time one sees the job's stored timeout.
+        floor = max(conductor.MEDIUM_TIMEOUT_SECONDS, conductor.OPTIMIZED_LANE_TIMEOUT_FLOOR_SECONDS)
+        self.assertEqual(float(prepared[0]), float(floor))
+
+    def test_default_build_timeout_failure_message_is_unchanged(self) -> None:
+        _state, waited, _prepared = self.run_build_until_timeout({})
+        self.assertEqual(waited["state"], "failed")
+        self.assertEqual(waited.get("error"), "timed out after 0.5s")
+        self.assertTrue(waited.get("logTail"))
+        self.assertNotIn("--timeout", "".join(waited.get("logTail") or []))
+        self.assertIsNone(conductor.optimized_lane_timeout_hint("build", {}, 10.0))
+        self.assertIsNone(conductor.optimized_lane_timeout_hint("run", {"optimized": True}, 10.0))
+
+    def test_optimized_and_default_build_requests_never_share_a_request_key(self) -> None:
+        tmp, state = self.make_state()
+        self.addCleanup(tmp.cleanup)
+        self.addCleanup(state._await_maintenance, 10.0)
+        self.addCleanup(state._await_job_telemetry, 10.0)
+        sleeper = [sys.executable, "-u", "-c", "import time; time.sleep(30)"]
+        with mock.patch.object(
+            state.registry, "prepare",
+            side_effect=lambda _request: (sleeper, ["style"], state.paths.repo_root, {"PATH": os.environ.get("PATH", "")}, 1.0),
+        ), mock.patch.object(conductor, "operation_requires_global_heavy_slot", return_value=False):
+            first = state.enqueue({"operation": "build", "args": {"optimized": True}, "env": {}, "requestKey": "k"})
+            with self.assertRaisesRegex(conductor.ConductorError, "request-key mismatch"):
+                state.enqueue({"operation": "build", "args": {}, "env": {}, "requestKey": "k"})
+            again = state.enqueue({"operation": "build", "args": {"optimized": True}, "env": {}, "requestKey": "k"})
+            self.assertTrue(again.get("reused"))
+            self.assertEqual(again["ticket"], first["ticket"])
+            waited = state.job_wait(first["ticket"], None, 30.0)
+        self.assertEqual(waited["state"], "failed")
 
     def test_guardrails_delegates_aggregator_without_lanes(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

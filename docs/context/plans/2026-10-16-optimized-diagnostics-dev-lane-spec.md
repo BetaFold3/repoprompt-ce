@@ -478,7 +478,7 @@ Status:
 - Step 1 — done | rounds 0/2 | open: | downgraded: | assumed: assertions off and isolated scratch as approved | deferred: S1-P3-1 allowlist; S1-P3-4 gate-copy static test; optimized compile to Step 4; pre-existing release-selftest lint assertion (optimized-lane-step1-review.md)
 - Step 2 — done | rounds 0/2 | open: | downgraded: | assumed: literal no-DEBUG rule includes dormant tests | deferred: real optimized-plan validation to Step 4 (optimized-lane-step2-review.md)
 - Step 3 — done | rounds 0/2 | open: | downgraded: | assumed: explicit Apple Development name as specified | deferred: real caller environment to Step 4; SHA1 identity selection only if needed; baseline release-selftest lint assertion (optimized-lane-step3-review.md)
-- Step 4 — todo | rounds 0/2 | open: | downgraded: | assumed: | deferred:
+- Step 4 — done | rounds 0/2 | open: | downgraded: | assumed: build/packaging go only; default timeout remains 3600s | deferred: runtime acceptance Step 8; disk 7.0 GiB (8.9 GB free); optional SIGKILL-hint test/display label; baseline lint assertion (optimized-lane-step4-review.md, optimized-lane-step4-warnings.md)
 - Step 5 — todo | rounds 0/2 | open: | downgraded: | assumed: | deferred:
 - Step 6 — todo | rounds 0/2 | open: | downgraded: | assumed: | deferred:
 - Step 7 — todo | rounds 0/2 | open: | downgraded: | assumed: | deferred:

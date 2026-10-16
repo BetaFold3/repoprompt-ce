@@ -178,7 +178,7 @@ def generated_job_file_ticket(name: str) -> Optional[str]:
     return None
 
 
-PROTOCOL_VERSION = 18
+PROTOCOL_VERSION = 19
 TERMINAL_STATES = {"completed", "failed", "canceled"}
 LANE_NAMES = {"build", "debugArtifact", "liveApp", "release", "style"}
 LOG_TAIL_LINES = 30
@@ -266,6 +266,11 @@ FILTERED_TEST_TIMEOUT_SECONDS = 20 * 60
 ARTIFACT_TEST_TIMEOUT_SECONDS = 10 * 60
 MEDIUM_TIMEOUT_SECONDS = 60 * 60
 RELEASE_TIMEOUT_SECONDS = 2 * 60 * 60
+# Optimized-diagnostics lane (`build --optimized`): whole-module `-c release` compiles take
+# minutes and have no partial results. Floor = twice the measured cold build (797 s, including
+# dependency resolution, 2026-10-16); a request without --timeout gets max(default, floor).
+# The measured floor is currently below the 3600 s default, so it does not raise that default.
+OPTIMIZED_LANE_TIMEOUT_FLOOR_SECONDS = 2 * 797
 SMOKE_AGENT_WAIT_SECONDS = 120.0
 
 IMPLEMENTED_OPERATIONS = {
@@ -332,7 +337,9 @@ Operation commands:
   ./conductor install-format-tools   # explicit Homebrew install of missing style tools
   ./conductor swift-build --product RepoPrompt|repoprompt-mcp|repoprompt-gateway|all
   ./conductor dsym [--product all|RepoPrompt|repoprompt-mcp|repoprompt-gateway|root-tests]   # regenerate debug dSYMs; never builds
-  ./conductor build [--fast]
+  ./conductor build [--fast] [--optimized]
+    --optimized packages the opt-in optimized-diagnostics lane (swift -c release, first-party DEBUG,
+    Dev identity; needs SIGN_IDENTITY='Apple Development: ...'); each build takes minutes
   ./conductor package debug|release
   ./conductor test [--list | --filter <filter>] [--test-product <product>] [--no-xctest-deadlines] [--xctest-stall-seconds <seconds>] [--xctest-stall-wake-probe]
   ./conductor test-artifact --filter <filter> [--no-xctest-deadlines] [--xctest-stall-seconds <seconds>] [--xctest-stall-wake-probe]
@@ -2715,6 +2722,30 @@ class OutputSummarizer:
         }
 
 
+OPTIMIZED_LANE_ARG = "optimized"
+
+
+def is_optimized_lane_request(args: Dict[str, Any]) -> bool:
+    """True for an optimized-diagnostics lane request. The client sets the key only when true,
+    so any other present value is a malformed request rather than a second spelling of debug."""
+    if OPTIMIZED_LANE_ARG not in args:
+        return False
+    if args[OPTIMIZED_LANE_ARG] is not True:
+        raise ConductorError(f"request arg '{OPTIMIZED_LANE_ARG}' must be true when present")
+    return True
+
+
+def optimized_lane_timeout_hint(operation: Any, args: Dict[str, Any], effective_timeout: float) -> Optional[str]:
+    """Actionable suffix for a timed-out lane job; None for every other job (messages unchanged)."""
+    if operation != "build" or args.get(OPTIMIZED_LANE_ARG) is not True:
+        return None
+    return (
+        f"; optimized-lane builds compile whole modules with no partial results; "
+        f"rerun with a longer limit: ./conductor build --optimized --timeout <seconds> "
+        f"(this run allowed {effective_timeout:.0f}s)"
+    )
+
+
 def operation_display_name(operation: str, args: Dict[str, Any]) -> str:
     if operation == "app" and args.get("subcommand") in {"status", "stop", "launch-existing", "relaunch"}:
         return f"app {args['subcommand']}"
@@ -3162,7 +3193,7 @@ class OperationRegistry:
                     "--package-root", str(self.repo_root)]
             return argv, ["build"], cwd, env, effective_timeout
         if operation == "build":
-            argv = [script("package_app.sh"), "debug"]
+            argv = [script("package_app.sh"), "debug-optimized" if is_optimized_lane_request(args) else "debug"]
             if args.get("fastPackage"):
                 argv.append("fast")
             return argv, ["build", "debugArtifact"], cwd, env, effective_timeout
@@ -3362,6 +3393,8 @@ class OperationRegistry:
             return MEDIUM_TIMEOUT_SECONDS
         if operation in {"test", "provider-test", "core-test"} and args.get("filter"):
             return FILTERED_TEST_TIMEOUT_SECONDS
+        if operation == "build" and is_optimized_lane_request(args):
+            return max(MEDIUM_TIMEOUT_SECONDS, OPTIMIZED_LANE_TIMEOUT_FLOOR_SECONDS)
         return MEDIUM_TIMEOUT_SECONDS
 
     def fingerprint(self, request: Dict[str, Any]) -> str:
@@ -4582,6 +4615,11 @@ class DaemonState:
                             self._append_system_line_locked(job, job.error + "\n")
                     if exit_code == 0:
                         exit_code = 124
+                    timeout_hint = optimized_lane_timeout_hint(job.operation, job.args, effective_timeout)
+                    if timeout_hint is not None:
+                        with self.condition:
+                            job.error = (job.error or f"timed out after {effective_timeout:.1f}s") + timeout_hint
+                            self._append_system_line_locked(job, "hint: " + timeout_hint.lstrip("; ") + "\n")
                 if telemetry is not None:
                     self._telemetry_boundary(
                         telemetry, "exit_observed", metadata={"exitCode": exit_code, "timedOut": job.timed_out}
@@ -8774,9 +8812,13 @@ def handle_real_operation(paths: Paths, operation: str, argv: List[str]) -> int:
     elif operation == "build":
         parser = argparse.ArgumentParser(prog="conductor build")
         parser.add_argument("--fast", action="store_true")
+        parser.add_argument("--optimized", action="store_true")
         ns = parser.parse_args(rest)
         if ns.fast:
             args["fastPackage"] = True
+        if ns.optimized:
+            # Only when true: the default request's args and identity stay unchanged.
+            args[OPTIMIZED_LANE_ARG] = True
     elif operation == "swift-build":
         parser = argparse.ArgumentParser(prog="conductor swift-build")
         parser.add_argument("--product", required=True, choices=["RepoPrompt", "repoprompt-mcp", "repoprompt-gateway", "all"])
