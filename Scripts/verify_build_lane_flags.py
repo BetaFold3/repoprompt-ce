@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Verify the optimized-diagnostics lane's Swift compile flags from SwiftPM's build plan.
 
-Spec: docs/context/plans/2026-10-16-optimized-diagnostics-dev-lane-spec.md §5.
+Contract: docs/context/workflows/development.md#optimized-diagnostics-lane-opt-in.
 Read-only, Python 3 standard library only.
 
 Usage: verify_build_lane_flags.py --build-yaml <scratch>/release.yaml

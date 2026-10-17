@@ -1,10 +1,18 @@
+# Completion summary — 2026-10-17
+
+Closed by the owner after implementation, independent OracleA/OracleB step reviews, probe validation and approved live acceptance. The optimized Dev app keeps first-party diagnostics and the existing Dev identity; plain debug remains the default. Runtime observations were exploratory, not a controlled speedup or completed-frame claim. The owner accepted closure with repeated A-B-A/native-frame qualification and the recorded minor validation/review follow-ups deferred. No further manual tests are required for this workstream.
+
+Current operating guidance: [Optimized diagnostics lane](../../workflows/development.md#optimized-diagnostics-lane-opt-in). The technical design below is preserved as historical context; its original estimates are not current measurements.
+
+---
+
 # Optimized-diagnostics Dev lane — technical spec
 
 Scope: read when the task touches an optimized (`-c release`) build of the CE Dev app that keeps first-party `DEBUG` diagnostics, the `RPCE_OPTIMIZED_DIAGNOSTICS` manifest gate, `canonical_swift.sh --rpce-optimized-diagnostics`, `package_app.sh debug-optimized`, `./conductor build|run|app relaunch --optimized`, `Scripts/verify_build_lane_flags.py`, or `RepoPromptBuildLane`.
 Authority: Reference
 Last-verified: 2026-10-16
 
-Status: proposed. Merged from independent OracleA and OracleB recommendations, then reviewed once by both (round-1 findings applied 2026-10-16). Refreshed 2026-10-16 against the merged incremental debug packaging (merge `0d4ed733`; owner documentation in `docs/context/workflows/development.md` → "Debug packaging"), then re-reviewed by both (round 2: both approved; P3 clarifications applied). Implementation waits for the owner. Building it reverses the 2026-10-14 owner decision "Leave build tooling unchanged" for this lane only.
+Status: closed by owner on 2026-10-17. Steps 1–8 are complete by owner acceptance, with deferred qualification and minor follow-ups retained below. The specification used both review rounds; implementation, probe validation and live smoke are recorded in the evidence directory. The owner authorized changing build tooling for this lane only.
 
 ## Goal
 
@@ -478,14 +486,16 @@ Status:
 - Step 1 — done | rounds 0/2 | open: | downgraded: | assumed: assertions off and isolated scratch as approved | deferred: S1-P3-1 allowlist; S1-P3-4 gate-copy static test; pre-existing release-selftest lint assertion (optimized-lane-step1-review.md)
 - Step 2 — done | rounds 0/2 | open: | downgraded: | assumed: literal no-DEBUG rule includes dormant tests | deferred: none; real plan passed Step 4 (optimized-lane-step2-review.md)
 - Step 3 — done | rounds 0/2 | open: | downgraded: | assumed: explicit Apple Development name as specified | deferred: SHA1 identity selection only if needed; baseline release-selftest lint assertion (optimized-lane-step3-review.md)
-- Step 4 — done | rounds 0/2 | open: | downgraded: | assumed: build/packaging go only; default timeout remains 3600s | deferred: runtime acceptance Step 8; disk 7.0 GiB (8.9 GB free); optional SIGKILL-hint test/display label; baseline lint assertion (optimized-lane-step4-review.md, optimized-lane-step4-warnings.md)
-- Step 5 — done | rounds 0/2 | open: | downgraded: | assumed: protocol 19 workstream; restart idle daemon before acceptance | deferred: live lifecycle Step 8; cosmetic P3-4/5 (optimized-lane-step5-review.md)
-- Step 6 — done | rounds 0/2 | open: | downgraded: | assumed: observed stale source-list recovery only | deferred: live ping Step 8; plain-release equivalence and invalid-flag arm untested (optimized-lane-step6-review.md)
-- Step 7 — done | rounds 0/2 | open: | downgraded: | assumed: make environment behavior retained; costs advisory | deferred: refresh Pending documentation after Step 8 (optimized-lane-step7-review.md)
-- Step 8 — doing | rounds 0/2 | open: owner acceptance of exploratory runtime comparison | downgraded: | assumed: single first-open observations only, no causal speedup estimate | deferred: full repeated A-B-A/native-frame qualification; smoke passed; captures stopped; owner approved restoring optimized after comparison (optimized-lane-step8-live.md, optimized-lane-step8-comparison.md)
+- Step 4 — done | rounds 0/2 | open: | downgraded: | assumed: build/packaging go only; default timeout remains 3600s | deferred: disk 7.0 GiB (free-space measurement was historical); optional SIGKILL-hint test/display label; baseline lint assertion (optimized-lane-step4-review.md, optimized-lane-step4-warnings.md)
+- Step 5 — done | rounds 0/2 | open: | downgraded: | assumed: protocol 19 workstream; restart idle daemon before acceptance | deferred: cosmetic P3-4/5 (optimized-lane-step5-review.md)
+- Step 6 — done | rounds 0/2 | open: | downgraded: | assumed: observed stale source-list recovery only | deferred: plain-release equivalence and invalid-flag arm untested (optimized-lane-step6-review.md)
+- Step 7 — done | rounds 0/2 | open: | downgraded: | assumed: make environment behavior retained; costs advisory | deferred: none; owning documentation refreshed after live acceptance and owner closure (optimized-lane-step7-review.md)
+- Step 8 — done (owner accepted closure) | rounds 0/2 | open: | downgraded: | assumed: single first-open observations only, no causal speedup estimate | deferred: full repeated A-B-A/native-frame qualification; smoke passed and optimized app restored; captures stopped (optimized-lane-step8-live.md, optimized-lane-step8-comparison.md)
 - Spec — done (owner approved implementation) | rounds 2/2 | open: | downgraded: | assumed: assertions off; per-invocation selection; separate build folder | deferred:
 
 ## Decisions
+
+- Owner Decision (2026-10-17): Close the optimized-diagnostics lane work after live acceptance and the exploratory comparison, with the reported qualification limits and deferred checks preserved.
 
 - Owner Decision (2026-10-17): Perform the lane comparison; approved debug, optimized and debug relaunches at their action boundaries, then requested fewer manual repetitions and no excessive manual steps unless necessary. After comparison, approved restoring the optimized app.
 
