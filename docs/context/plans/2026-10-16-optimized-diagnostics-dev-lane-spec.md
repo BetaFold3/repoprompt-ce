@@ -482,10 +482,12 @@ Status:
 - Step 5 — done | rounds 0/2 | open: | downgraded: | assumed: protocol 19 workstream; restart idle daemon before acceptance | deferred: live lifecycle Step 8; cosmetic P3-4/5 (optimized-lane-step5-review.md)
 - Step 6 — done | rounds 0/2 | open: | downgraded: | assumed: observed stale source-list recovery only | deferred: live ping Step 8; plain-release equivalence and invalid-flag arm untested (optimized-lane-step6-review.md)
 - Step 7 — done | rounds 0/2 | open: | downgraded: | assumed: make environment behavior retained; costs advisory | deferred: refresh Pending documentation after Step 8 (optimized-lane-step7-review.md)
-- Step 8 — doing | rounds 0/2 | open: advisory A-B-A runtime comparison | downgraded: | assumed: no runtime speedup claim before measurement | deferred: additional relaunches require fresh approval; live launch, ping, signature and owner-confirmed data/provider continuity passed (optimized-lane-step8-live.md)
+- Step 8 — doing | rounds 0/2 | open: owner acceptance of exploratory runtime comparison | downgraded: | assumed: single first-open observations only, no causal speedup estimate | deferred: full repeated A-B-A/native-frame qualification; smoke passed; captures stopped; owner approved restoring optimized after comparison (optimized-lane-step8-live.md, optimized-lane-step8-comparison.md)
 - Spec — done (owner approved implementation) | rounds 2/2 | open: | downgraded: | assumed: assertions off; per-invocation selection; separate build folder | deferred:
 
 ## Decisions
+
+- Owner Decision (2026-10-17): Perform the lane comparison; approved debug, optimized and debug relaunches at their action boundaries, then requested fewer manual repetitions and no excessive manual steps unless necessary. After comparison, approved restoring the optimized app.
 
 - Owner Decision (2026-10-17): Rebuild and relaunch now; after launch, confirmed expected workspaces and sessions are present and configured providers work without re-entering API keys.
 

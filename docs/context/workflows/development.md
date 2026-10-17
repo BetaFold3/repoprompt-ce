@@ -169,7 +169,7 @@ SIGN_IDENTITY='Apple Development: …' ./conductor app relaunch --optimized
 - no-change rebuild: 2.6 s (`noop-dest`);
 - disk: `.build/optimized-diagnostics/` grew to 7.0 GiB, mostly from a second copy of dependency repositories and binary artifacts. Check free space before a cold build.
 
-Edits to `RepoPromptShared` or `RepoPromptAgentCore` cascade and were not measured. The lane's runtime speed relative to the debug lane has not been measured.
+Edits to `RepoPromptShared` or `RepoPromptAgentCore` cascade and were not measured. An exploratory same-revision comparison on 2026-10-17 observed the 2,161-item session's first publication at 589 ms optimized versus 936 ms debug, and SwiftUI observation at 756 ms versus 1,103 ms. These are single first-open observations, not completed drawing or a causal speedup estimate: host load and sidebar search state differed. Repeated, controlled runtime qualification remains incomplete.
 
 **Heavy slot.** Lane packaging runs in the machine-wide heavy slot and holds it for minutes. Meanwhile every other job on the machine that needs that slot waits: builds, packaging and source-validating tests (`make dev-test`, `dev-core-test`, `dev-provider-test`, `dev-test-parallel`), including other agents' loops. Daemon-admitted jobs report `waiting-heavy-slot`. Artifact-only `make dev-test-artifact` uses the separate XCTest slot and is not blocked. Keep debug for edit-build loops; build the lane at natural break points, when no agents are mid-test.
 
@@ -206,7 +206,7 @@ Waiting in the queue for a local lane such as `liveApp` doesn't count for any of
 
 No data migration is involved.
 
-**Live acceptance** passed on 2026-10-17. An owner-approved `app relaunch --optimized` installed clean commit `6c1129d0` into `/Applications/RepoPrompt CE Dev.app`; the staged job completed in 8.95 s with warm build outputs and fresh packaging. Lane-flag verification, deep-strict signature verification, the Dev identity and the compatibility link passed. The running process reported `buildLane: debug-optimized`, and the performance diagnostics settings remained enabled. The owner confirmed existing workspaces and sessions and configured-provider use without re-entering API keys. This is a launch smoke, not runtime performance evidence. The controlled debug-versus-optimized comparison remains pending.
+**Live acceptance** passed on 2026-10-17. An owner-approved `app relaunch --optimized` installed clean commit `6c1129d0` into `/Applications/RepoPrompt CE Dev.app`; the staged job completed in 8.95 s with warm build outputs and fresh packaging. Lane-flag verification, deep-strict signature verification, the Dev identity and the compatibility link passed. The running process reported `buildLane: debug-optimized`, and the performance diagnostics settings remained enabled. The owner confirmed existing workspaces and sessions and configured-provider use without re-entering API keys. The subsequent exploratory comparison is described under Costs; it does not satisfy the repeated, controlled comparison. Native trace finalization failed, so no native hang/hitch or completed-frame result is claimed.
 
 ## Use the CE debug CLI
 
