@@ -482,10 +482,12 @@ Status:
 - Step 5 — done | rounds 0/2 | open: | downgraded: | assumed: protocol 19 workstream; restart idle daemon before acceptance | deferred: live lifecycle Step 8; cosmetic P3-4/5 (optimized-lane-step5-review.md)
 - Step 6 — done | rounds 0/2 | open: | downgraded: | assumed: observed stale source-list recovery only | deferred: live ping Step 8; plain-release equivalence and invalid-flag arm untested (optimized-lane-step6-review.md)
 - Step 7 — done | rounds 0/2 | open: | downgraded: | assumed: make environment behavior retained; costs advisory | deferred: refresh Pending documentation after Step 8 (optimized-lane-step7-review.md)
-- Step 8 — blocked | rounds 0/2 | open: fresh owner approval for visible relaunch | downgraded: | assumed: no runtime speedup claim before measurement | deferred: launch smoke and A-B-A comparison
+- Step 8 — doing | rounds 0/2 | open: advisory A-B-A runtime comparison | downgraded: | assumed: no runtime speedup claim before measurement | deferred: additional relaunches require fresh approval; live launch, ping, signature and owner-confirmed data/provider continuity passed (optimized-lane-step8-live.md)
 - Spec — done (owner approved implementation) | rounds 2/2 | open: | downgraded: | assumed: assertions off; per-invocation selection; separate build folder | deferred:
 
 ## Decisions
+
+- Owner Decision (2026-10-17): Rebuild and relaunch now; after launch, confirmed expected workspaces and sessions are present and configured providers work without re-entering API keys.
 
 - Owner Decision (2026-10-16): Implement Steps 1–4 one at a time with validation, OracleA/OracleB review and local commits; continue toward the remaining steps if build-time results show nothing unexpected. This authorizes the optimized-diagnostics lane in place of the earlier leave-tooling-unchanged decision; visible app lifecycle actions still require fresh approval.
 

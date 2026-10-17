@@ -206,7 +206,7 @@ Waiting in the queue for a local lane such as `liveApp` doesn't count for any of
 
 No data migration is involved.
 
-**Pending** (refresh or remove when live acceptance completes). Build, packaging, identity and lane-flag proof were validated on probe bundles. Live acceptance (an approved `app relaunch --optimized` into `/Applications/RepoPrompt CE Dev.app`, the runtime `ping` label, Keychain continuity and existing data) and the debug-versus-optimized runtime comparison have not run.
+**Live acceptance** passed on 2026-10-17. An owner-approved `app relaunch --optimized` installed clean commit `6c1129d0` into `/Applications/RepoPrompt CE Dev.app`; the staged job completed in 8.95 s with warm build outputs and fresh packaging. Lane-flag verification, deep-strict signature verification, the Dev identity and the compatibility link passed. The running process reported `buildLane: debug-optimized`, and the performance diagnostics settings remained enabled. The owner confirmed existing workspaces and sessions and configured-provider use without re-entering API keys. This is a launch smoke, not runtime performance evidence. The controlled debug-versus-optimized comparison remains pending.
 
 ## Use the CE debug CLI
 
