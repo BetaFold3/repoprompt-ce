@@ -22,6 +22,43 @@ final class AgentProviderContextBuilderTests: XCTestCase {
         XCTAssertFalse(fileTree.contains(fixture.worktreeRoot.path), fileTree)
     }
 
+    func testInitialFileTreeOmitsPendingAutomaticCodemapsAfterShortBoundedWait() async throws {
+        let repositoryFixture = try ReviewGitRepositoryFixture(name: #function)
+        let root = try repositoryFixture.makeRepository(
+            named: "repository",
+            files: [
+                "Sources/Source.swift": "struct Source { let target: Target }\n",
+                "Sources/Target.swift": "struct Target { func initialTreePendingTargetSymbol() {} }\n"
+            ]
+        )
+        let codemapFixture = try CodemapStoreFixture(name: #function)
+        addTeardownBlock {
+            await codemapFixture.shutdown()
+            repositoryFixture.cleanup()
+        }
+        // Every artifact demand stays busy, so automatic readiness can never settle.
+        let store = codemapFixture.makeStore(demandResultHook: { _, _ in
+            .busy(retryAfterMilliseconds: 1000)
+        })
+        _ = try await store.loadRoot(path: root.path)
+        let clock = ContinuousClock()
+        let started = clock.now
+
+        let fileTree = await AgentProviderContextBuilder.initialFileTree(
+            selection: StoredSelection(
+                selectedPaths: [root.appendingPathComponent("Sources/Source.swift").path],
+                codemapAutoEnabled: true
+            ),
+            store: store,
+            lookupContext: WorkspaceLookupContext(rootScope: .allLoaded, bindingProjection: nil)
+        )
+
+        let elapsed = started.duration(to: clock.now)
+        XCTAssertLessThan(elapsed, .seconds(5), "Initial file tree must not wait the full readiness deadline for pending automatic codemaps")
+        XCTAssertTrue(fileTree.contains("Source.swift *"), fileTree)
+        XCTAssertFalse(fileTree.contains("Target.swift +"), fileTree)
+    }
+
     func testForkFileContentsBlockReadsWorktreeContentAndDisplaysLogicalPath() async throws {
         let fixture = try await makeBoundFixture()
         let lookupContext = await makeLookupContext(fixture: fixture)
