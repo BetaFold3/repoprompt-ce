@@ -1,9 +1,27 @@
 import Foundation
 
 package let workspaceCodemapProductionDemandWaitMilliseconds = 10000
+package let workspaceCodemapOptionalEnrichmentWaitMilliseconds = 1500
 
 package struct WorkspaceCodemapPresentationRequestPolicy: Equatable {
     static let `default` = Self()
+    /// One readiness round and no wait: only codemaps another requester already holds ready are
+    /// presented; demands this call creates are released before they can settle.
+    package static let noReadinessWait = Self(maximumReadinessRounds: 1, maximumTotalWait: .zero)
+    /// Optional automatic enrichment: default readiness rounds/backoff with a short bounded wait so
+    /// cached or quick builds render; still-pending codemaps are omitted with their typed issues.
+    package static let optionalAutomaticEnrichment = Self(
+        maximumTotalWait: .milliseconds(workspaceCodemapOptionalEnrichmentWaitMilliseconds)
+    )
+
+    /// Optional-enrichment callers: automatic intents use the short bounded wait; exact (explicitly
+    /// selected or complete) and empty intents keep the default bounded wait.
+    package static func optionalEnrichment(
+        for intent: WorkspaceCodemapOperationPresentationIntent
+    ) -> Self {
+        if case .automatic = intent { return .optionalAutomaticEnrichment }
+        return .default
+    }
 
     let maximumReadinessRounds: Int
     let initialBackoffMilliseconds: Int

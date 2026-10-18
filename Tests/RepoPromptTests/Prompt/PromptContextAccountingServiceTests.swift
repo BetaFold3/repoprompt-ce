@@ -478,6 +478,250 @@ final class PromptContextAccountingServiceTests: XCTestCase {
         XCTAssertTrue(resolution.entries.allSatisfy { $0.mode == .codemap })
     }
 
+    func testResolveEntriesOmitsPendingAutomaticCodemapsAfterShortBoundedWait() async throws {
+        let fixture = try await makePendingCodemapFixture(name: #function)
+        let clock = ContinuousClock()
+        let started = clock.now
+
+        let resolution = await PromptContextAccountingService().resolveEntries(
+            selection: StoredSelection(selectedPaths: [fixture.sourcePath], codemapAutoEnabled: true),
+            store: fixture.store,
+            codeMapUsage: .auto
+        )
+
+        let elapsed = started.duration(to: clock.now)
+        XCTAssertLessThan(elapsed, Self.pendingReadinessElapsedBound, "Accounting must not wait the full readiness deadline for pending codemaps")
+        XCTAssertEqual(resolution.entries.map(\.file.standardizedRelativePath), ["Sources/Source.swift"])
+        XCTAssertFalse(resolution.entries.contains { $0.isCodemap })
+        assertPendingCodemapsOmitted(resolution.codemapPresentation)
+    }
+
+    func testWithPromptStatsOmitsPendingAutomaticCodemapsAfterShortBoundedWait() async throws {
+        let fixture = try await makePendingCodemapFixture(name: #function)
+        let clock = ContinuousClock()
+        let started = clock.now
+
+        let result = try await PromptContextAccountingService().withPromptStats(
+            request: PromptContextAccountingRequest(
+                selection: StoredSelection(selectedPaths: [fixture.sourcePath], codemapAutoEnabled: true),
+                codeMapUsage: .auto
+            ),
+            store: fixture.store,
+            lookupContext: WorkspaceLookupContext(rootScope: .allLoaded, bindingProjection: nil)
+        ) { $0 }
+
+        let elapsed = started.duration(to: clock.now)
+        XCTAssertLessThan(elapsed, Self.pendingReadinessElapsedBound, "Prompt stats must not wait the full readiness deadline for pending codemaps")
+        XCTAssertEqual(result.resolvedEntries.map(\.file.standardizedRelativePath), ["Sources/Source.swift"])
+        XCTAssertTrue(result.codemapFileIDsUsed.isEmpty)
+        assertPendingCodemapsOmitted(result.codemapPresentation)
+    }
+
+    func testResolveEntriesIncludesAlreadyReadySelectedCodemap() async throws {
+        let repositories = try ReviewGitRepositoryFixture(name: #function)
+        let root = try repositories.makeRepository(
+            named: "repository",
+            files: ["Sources/Ready.swift": "struct ReadyAccounting { func readyAccountingSymbol() {} }\n"]
+        )
+        let codemapFixture = try CodemapStoreFixture(name: #function)
+        addTeardownBlock {
+            await codemapFixture.shutdown()
+            repositories.cleanup()
+        }
+        let store = codemapFixture.makeStore(codemapProjectionPreloadLaunchPolicy: .disabled)
+        let loaded = try await store.loadRoot(path: root.path)
+        let files = await store.files(inRoot: loaded.id)
+        let file = try XCTUnwrap(files.first)
+        let ready = try await readyCodemapDemand(store: store, fileID: file.id)
+        addTeardownBlock {
+            _ = await store.cancelCodemapArtifactDemand(ready.ticket)
+        }
+
+        let resolution = await PromptContextAccountingService().resolveEntries(
+            selection: StoredSelection(selectedPaths: [file.standardizedFullPath], codemapAutoEnabled: false),
+            store: store,
+            codeMapUsage: .selected
+        )
+
+        XCTAssertEqual(resolution.codemapPresentation.orderedEntries.map(\.fileID), [file.id])
+        XCTAssertTrue(
+            resolution.codemapPresentation.renderedEntriesByFileID[file.id]?.text.contains("readyAccountingSymbol") == true
+        )
+        let entry = try XCTUnwrap(resolution.entries.first)
+        XCTAssertTrue(entry.isCodemap)
+    }
+
+    func testWithPromptStatsIncludesAutomaticCodemapOnRecountAfterPendingCall() async throws {
+        let repositories = try ReviewGitRepositoryFixture(name: #function)
+        let root = try repositories.makeRepository(
+            named: "repository",
+            files: [
+                "Sources/Source.swift": "struct Source { let target: Target }\n",
+                "Sources/Target.swift": "struct Target { func convergedTargetCodemapSymbol() {} }\n"
+            ]
+        )
+        let codemapFixture = try CodemapStoreFixture(name: #function)
+        addTeardownBlock {
+            await codemapFixture.shutdown()
+            repositories.cleanup()
+        }
+        let demandsReleased = CodemapLockedCounter()
+        let store = codemapFixture.makeStore(demandResultHook: { _, result in
+            demandsReleased.value == 0 ? .busy(retryAfterMilliseconds: 1000) : result
+        })
+        _ = try await store.loadRoot(path: root.path)
+        let targetLookup = await store.lookupPath(
+            root.appendingPathComponent("Sources/Target.swift").path,
+            rootScope: .allLoaded
+        )
+        let target = try XCTUnwrap(targetLookup?.file)
+        let request = PromptContextAccountingRequest(
+            selection: StoredSelection(
+                selectedPaths: [root.appendingPathComponent("Sources/Source.swift").path],
+                codemapAutoEnabled: true
+            ),
+            codeMapUsage: .auto
+        )
+        let lookupContext = WorkspaceLookupContext(rootScope: .allLoaded, bindingProjection: nil)
+        let service = PromptContextAccountingService()
+
+        let pending = try await service.withPromptStats(
+            request: request,
+            store: store,
+            lookupContext: lookupContext
+        ) { $0 }
+        assertPendingCodemapsOmitted(pending.codemapPresentation)
+
+        demandsReleased.increment()
+        // Later recounts (as UI/MCP refreshes would issue) must eventually include the target.
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: .seconds(30))
+        var included = false
+        var laterCalls = 0
+        while !included, clock.now < deadline {
+            laterCalls += 1
+            let later = try await service.withPromptStats(
+                request: request,
+                store: store,
+                lookupContext: lookupContext
+            ) { $0 }
+            included = later.codemapPresentation.renderedEntriesByFileID[target.id]?.text
+                .contains("convergedTargetCodemapSymbol") == true
+            if !included {
+                try await Task.sleep(for: .milliseconds(100))
+            }
+        }
+        XCTAssertTrue(included, "Automatic codemap never became ready after \(laterCalls) bounded-wait recounts")
+    }
+
+    func testResolveEntriesOmitsAutomaticCodemapsWhileSelectionGraphIsUnpublishedAfterShortBoundedWait() async throws {
+        let repositories = try ReviewGitRepositoryFixture(name: #function)
+        let root = try repositories.makeRepository(
+            named: "repository",
+            files: [
+                "Sources/Source.swift": "struct Source { let unpublishedGraphSentinel: Target }\n",
+                "Sources/Target.swift": "struct Target { func unpublishedGraphTargetSymbol() {} }\n"
+            ]
+        )
+        // Artifact demands succeed, but selection-graph publication stays parked, so the
+        // automatic plan keeps reporting transient graph readiness.
+        let codemapFixture = try CodemapStoreFixture(name: #function)
+        let graphGate = CodemapGraphPublicationGate()
+        addTeardownBlock {
+            graphGate.release()
+            await codemapFixture.shutdown()
+            repositories.cleanup()
+        }
+        let store = codemapFixture.makeStore(graphPublicationWaiter: { rootEpoch in
+            await graphGate.enterAndWait(rootEpoch)
+        })
+        _ = try await store.loadRoot(path: root.path)
+        let clock = ContinuousClock()
+        let started = clock.now
+
+        let resolution = await PromptContextAccountingService().resolveEntries(
+            selection: StoredSelection(
+                selectedPaths: [root.appendingPathComponent("Sources/Source.swift").path],
+                codemapAutoEnabled: true
+            ),
+            store: store,
+            codeMapUsage: .auto
+        )
+
+        let elapsed = started.duration(to: clock.now)
+        XCTAssertLessThan(elapsed, Self.pendingReadinessElapsedBound, "Accounting must not wait the full readiness deadline for graph readiness")
+        let entry = try XCTUnwrap(resolution.entries.first)
+        XCTAssertEqual(resolution.entries.count, 1)
+        XCTAssertTrue(entry.loadedContent?.contains("unpublishedGraphSentinel") == true)
+        XCTAssertFalse(resolution.entries.contains { $0.isCodemap })
+        assertPendingCodemapsOmitted(resolution.codemapPresentation)
+    }
+
+    private static let pendingReadinessElapsedBound: Duration = .seconds(5)
+
+    private func makePendingCodemapFixture(
+        name: String
+    ) async throws -> (store: WorkspaceFileContextStore, sourcePath: String) {
+        let repositories = try ReviewGitRepositoryFixture(name: name)
+        let root = try repositories.makeRepository(
+            named: "repository",
+            files: [
+                "Sources/Source.swift": "struct Source { let target: Target }\n",
+                "Sources/Target.swift": "struct Target { func pendingTargetCodemapSymbol() {} }\n"
+            ]
+        )
+        let codemapFixture = try CodemapStoreFixture(name: name)
+        addTeardownBlock {
+            await codemapFixture.shutdown()
+            repositories.cleanup()
+        }
+        // Every artifact demand stays busy, so automatic readiness can never settle.
+        let store = codemapFixture.makeStore(demandResultHook: { _, _ in
+            .busy(retryAfterMilliseconds: 1000)
+        })
+        _ = try await store.loadRoot(path: root.path)
+        return (store, root.appendingPathComponent("Sources/Source.swift").standardizedFileURL.path)
+    }
+
+    private func assertPendingCodemapsOmitted(
+        _ presentation: WorkspaceCodemapOperationPresentation,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) {
+        XCTAssertTrue(presentation.orderedEntries.isEmpty, file: file, line: line)
+        switch presentation.coverage {
+        case .pending, .unavailable:
+            break
+        case .complete, .partial:
+            XCTFail("Pending automatic codemaps must report typed retry coverage", file: file, line: line)
+        }
+        XCTAssertFalse(presentation.issues.isEmpty, file: file, line: line)
+    }
+
+    private func readyCodemapDemand(
+        store: WorkspaceFileContextStore,
+        fileID: UUID,
+        timeout: Duration = .seconds(60)
+    ) async throws -> WorkspaceCodemapArtifactDemandReady {
+        var result = await store.requestCodemapArtifact(forFileID: fileID)
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: timeout)
+        while clock.now < deadline {
+            switch result {
+            case let .ready(ready):
+                return ready
+            case let .pending(ticket):
+                try await Task.sleep(for: .milliseconds(25))
+                result = await store.codemapArtifactDemandStatus(ticket)
+            case let .unavailable(reason):
+                XCTFail("Expected ready codemap demand, got \(reason)")
+                throw NSError(domain: "PromptContextAccountingServiceTests", code: 1)
+            }
+        }
+        XCTFail("Timed out waiting for ready codemap demand")
+        throw NSError(domain: "PromptContextAccountingServiceTests", code: 1)
+    }
+
     private func makeTemporaryRoot(name: String) throws -> URL {
         try makeTestDirectory(name: name)
     }
