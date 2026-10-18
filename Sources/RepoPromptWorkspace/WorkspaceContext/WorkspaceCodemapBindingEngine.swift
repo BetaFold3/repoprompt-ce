@@ -378,6 +378,8 @@ actor WorkspaceCodemapBindingEngine {
     private let sourceReader: WorkspaceCodemapValidatedSourceReaderClient
     private let catalogClient: WorkspaceCodemapBindingCatalogClient
     private let overlay: WorkspaceCodemapLiveOverlay
+    /// The artifact-store lease admission this engine's completions draw on.
+    nonisolated let artifactLeaseAdmissionIdentity: ObjectIdentifier
     private let policy: WorkspaceCodemapBindingEnginePolicy
     private let hooks: WorkspaceCodemapBindingEngineHooks
     private let uptimeNanoseconds: @Sendable () -> UInt64
@@ -386,6 +388,9 @@ actor WorkspaceCodemapBindingEngine {
     private var activeRequests: [UUID: ActiveRequest] = [:]
     private var drainingRequestTasks: [UUID: Task<Void, Never>] = [:]
     private var queuedRequests: [UUID: QueuedRequest] = [:]
+    /// Lease or byte capacity refusal of a ready completion (artifact-store lease admission or
+    /// overlay acceptance), by public owner, until the owner's caller takes it. `demand(_:)` cannot carry it without widening its result type.
+    private var completionCapacityBusyByOwner: [WorkspaceCodemapLiveDemandOwner: WorkspaceCodemapCompletionCapacityBusy] = [:]
     private var queueOrder: [UUID] = []
     private var nextQueueOrdinal: UInt64 = 1
     private var nextAdmissionOrdinal: UInt64 = 1
@@ -477,6 +482,7 @@ actor WorkspaceCodemapBindingEngine {
         self.sourceReader = sourceReader
         self.catalogClient = catalogClient
         self.overlay = overlay
+        artifactLeaseAdmissionIdentity = runtime.artifactStore.leaseAdmissionIdentity
         self.policy = policy
         self.hooks = hooks
         nextQueueOrdinal = max(1, initialQueueOrdinal)
@@ -845,6 +851,7 @@ actor WorkspaceCodemapBindingEngine {
     }
 
     func demand(_ demand: WorkspaceCodemapBindingDemand) async -> WorkspaceCodemapBindingDemandResult {
+        completionCapacityBusyByOwner.removeValue(forKey: demand.owner)
         let requestID = UUID()
         let cancellation = DemandCancellationState()
         return await withTaskCancellationHandler {
@@ -967,8 +974,17 @@ actor WorkspaceCodemapBindingEngine {
         ))
     }
 
+    /// Takes the lease or byte capacity refusal behind the owner's last non-ready demand result:
+    /// `.busy` from overlay acceptance, or `.unavailable(.transient)` from store lease admission.
+    func takeCompletionCapacityBusy(
+        owner: WorkspaceCodemapLiveDemandOwner
+    ) -> WorkspaceCodemapCompletionCapacityBusy? {
+        completionCapacityBusyByOwner.removeValue(forKey: owner)
+    }
+
     @discardableResult
     func cancel(owner: WorkspaceCodemapLiveDemandOwner) async -> Int {
+        completionCapacityBusyByOwner.removeValue(forKey: owner)
         let requestIDs = queuedRequests.values
             .filter { $0.demand.owner == owner }
             .map(\.id) + activeRequests.values.filter { $0.publicOwner == owner }.map(\.id)
@@ -1192,6 +1208,25 @@ actor WorkspaceCodemapBindingEngine {
             requestGeneration: requestGeneration
         )
     }
+
+    #if DEBUG
+        @discardableResult
+        func evictOverlayEntryForCapacityForTesting(rootEpoch: WorkspaceCodemapRootEpoch) async -> Bool {
+            await overlay.evictEntryForCapacityForTesting(rootEpoch: rootEpoch)
+        }
+
+        func setOverlayPolicyForTesting(_ policy: WorkspaceCodemapLiveOverlayPolicy) async {
+            await overlay.setPolicyForTesting(policy)
+        }
+
+        func overlayAccountingForTesting() async -> WorkspaceCodemapLiveOverlayAccounting {
+            await overlay.accounting()
+        }
+
+        func setArtifactStoreActiveLeaseCountLimitForTesting(_ maximumCount: Int?) async {
+            await runtime.artifactStore.setActiveLeaseCountLimitForTesting(maximumCount)
+        }
+    #endif
 
     @discardableResult
     func revokeReadyArtifact(
@@ -6229,7 +6264,22 @@ actor WorkspaceCodemapBindingEngine {
             )
         }
         guard let completion else { return .rejected(.staleCompletion) }
-        let lease = try await runtime.coordinator.acquireLease(for: resolved.resolution)
+        let lease: CodeMapArtifactLease
+        do {
+            lease = try await runtime.coordinator.acquireLease(for: resolved.resolution)
+        } catch let CodeMapArtifactLeaseError.busy(limit)
+            where limit == .activeLeaseCountLimit || limit == .activeLeaseByteLimit
+        {
+            // The artifact store's process-wide active-lease budget is full. Every ready overlay
+            // entry holds one of these leases, so the caller may release an idle one and retry.
+            // The failure itself still surfaces as before.
+            completionCapacityBusyByOwner[request.publicOwner] = WorkspaceCodemapCompletionCapacityBusy(
+                reason: limit == .activeLeaseCountLimit ? .leaseLimit : .artifactByteLimit,
+                rootEpoch: request.rootEpoch,
+                scope: .artifactLeaseAdmission(artifactLeaseAdmissionIdentity)
+            )
+            throw CodeMapArtifactLeaseError.busy(limit)
+        }
         try Task.checkCancellation()
         guard currentRequest(requestID) != nil else {
             await lease.close()
@@ -6291,7 +6341,18 @@ actor WorkspaceCodemapBindingEngine {
             }
             guard currentRequest(requestID) != nil else { throw CancellationError() }
             return .unavailable(.terminalArtifact(outcome))
-        case .busy:
+        case let .busy(reason):
+            if reason == .leaseLimit || reason == .artifactByteLimit {
+                let isRootLimited = await overlay.completionCapacityIsRootLimited(
+                    rootEpoch: request.rootEpoch,
+                    candidateBytes: lease.handle.estimatedResidentByteCount
+                )
+                completionCapacityBusyByOwner[request.publicOwner] = WorkspaceCodemapCompletionCapacityBusy(
+                    reason: reason,
+                    rootEpoch: request.rootEpoch,
+                    scope: isRootLimited ? .overlayRoot : .overlayProcess
+                )
+            }
             await lease.close()
             recordBusy(request.rootEpoch)
             return .busy(retryAfterMilliseconds: nil)
@@ -6336,6 +6397,9 @@ actor WorkspaceCodemapBindingEngine {
         }
         if cancelOverlay, let owner = request.overlayOwner, let ticket = request.ticket {
             _ = await overlay.cancelDemand(owner: owner, ticket: ticket)
+        }
+        if request.cancelled || request.continuation == nil {
+            completionCapacityBusyByOwner.removeValue(forKey: request.publicOwner)
         }
         request.continuation?.resume(returning: request.cancelled ? .cancelled : result)
         scheduleQueuedRequests()

@@ -116,7 +116,7 @@ actor WorkspaceCodemapLiveOverlay {
         let catalogGeneration: UInt64
     }
 
-    private let policy: WorkspaceCodemapLiveOverlayPolicy
+    private var policy: WorkspaceCodemapLiveOverlayPolicy
     private let manifestRecordEqualityTraversal: @Sendable () -> Void
     private let manifestAdoptionCommitHook: @Sendable () async -> Void
     private let initialManifestInvalidationGeneration: UInt64
@@ -1577,6 +1577,31 @@ actor WorkspaceCodemapLiveOverlay {
             root.liveFileIDByRelativePath.removeValue(forKey: removed.identity.standardizedRelativePath)
         }
     }
+
+    /// Whether the root's own lease or byte budget, not only the process budget, rejects one
+    /// more ready completion of `candidateBytes`. Used to pick which idle record to release
+    /// after a capacity busy.
+    func completionCapacityIsRootLimited(
+        rootEpoch: WorkspaceCodemapRootEpoch,
+        candidateBytes: UInt64
+    ) -> Bool {
+        guard let root = roots[rootEpoch] else { return false }
+        return addingSaturating(rootLeaseCount(root), 1) > policy.maximumLeaseCountPerRoot ||
+            addingSaturating(rootArtifactBytes(root), candidateBytes) > policy.maximumArtifactByteCountPerRoot
+    }
+
+    #if DEBUG
+        /// Runs one production capacity eviction for the root, as entry-count overflow would.
+        @discardableResult
+        func evictEntryForCapacityForTesting(rootEpoch: WorkspaceCodemapRootEpoch) -> Bool {
+            evictEntryForCapacity(requiredRootEpoch: rootEpoch, excludingFileIDs: [])
+        }
+
+        /// Replaces the capacity policy so tests can reach lease or byte limits cheaply.
+        func setPolicyForTesting(_ policy: WorkspaceCodemapLiveOverlayPolicy) {
+            self.policy = policy
+        }
+    #endif
 
     private func evictEntryForCapacity(
         requiredRootEpoch: WorkspaceCodemapRootEpoch?,

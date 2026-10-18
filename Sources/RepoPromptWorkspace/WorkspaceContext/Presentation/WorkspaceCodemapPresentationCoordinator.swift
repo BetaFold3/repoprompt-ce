@@ -1626,16 +1626,21 @@ package struct WorkspaceCodemapPresentationCoordinator {
         return clock.now < deadline
     }
 
+    /// Bounds how long one release waits for shared store cleanup. Every drained resource is
+    /// still released; a timed-out wait leaves the shared cleanup running to completion.
+    static let releaseCleanupWait: Duration = .milliseconds(250)
+
     private func release(_ ownership: WorkspaceCodemapOperationPresentationOwnership) async {
         let resources = await ownership.drain()
+        let deadline = ContinuousClock.now.advanced(by: Self.releaseCleanupWait)
         for ticket in resources.projectionTickets {
-            _ = await store.releaseCodemapProjectionDemand(ticket)
+            _ = await store.releaseCodemapProjectionDemand(ticket, deadline: deadline)
         }
         for bundle in resources.bundles {
             _ = await store.releaseCodemapPresentation(bundle)
         }
         for ticket in resources.tickets {
-            _ = await store.cancelCodemapArtifactDemand(ticket)
+            _ = await store.cancelCodemapArtifactDemand(ticket, deadline: deadline)
         }
     }
 

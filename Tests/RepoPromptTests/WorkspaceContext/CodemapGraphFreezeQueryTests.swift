@@ -207,18 +207,20 @@ final class CodemapGraphFreezeQueryTests: WorkspaceFileContextStoreCodemapSeamTe
             ])
         )
 
-        let cancellationTask = Task {
-            await store.cancelCodemapArtifactDemand(firstCancellationTicket)
-        }
-        let cancellationEntered = await cancellationGate.waitUntilEntered()
-        XCTAssertTrue(cancellationEntered)
+        // Releasing the last holder of a ready demand keeps the artifact warm without running the
+        // gated cleanup, but every frozen bundle that referenced the request still fails closed.
+        let cancellationResult = await store.cancelCodemapArtifactDemand(firstCancellationTicket)
+        XCTAssertTrue(cancellationResult)
         await assertPresentationRenderUnavailable(
             store.renderCodemapPresentation(cancellationBundle),
             equals: .bundleNotRetained
         )
+        let cancellationCleanupEntered = await cancellationGate.waitUntilEntered(
+            timeout: .milliseconds(200),
+            failOnTimeout: false
+        )
+        XCTAssertFalse(cancellationCleanupEntered, "A warm release must not run demand cleanup.")
         await cancellationGate.release()
-        let cancellationResult = await cancellationTask.value
-        XCTAssertTrue(cancellationResult)
 
         let catalogLoaded = try await store.loadRoot(path: catalogRoot.path)
         let catalogFiles = await store.files(inRoot: catalogLoaded.id)
@@ -652,10 +654,12 @@ final class CodemapGraphFreezeQueryTests: WorkspaceFileContextStoreCodemapSeamTe
         )
         let firstMarkerSnapshot = try XCTUnwrap(firstMarkerSnapshotValue)
 
-        let repeatedTicket = try await pendingTicket(
-            store.requestCodemapArtifact(forFileID: file.id)
-        )
-        let repeatedReady = try await readyResult(settledResult(store: store, ticket: repeatedTicket))
+        // The released ready record stays warm, so the repeat joins it immediately.
+        let repeatedResult = await store.requestCodemapArtifact(forFileID: file.id)
+        let repeatedReady = try readyResult(repeatedResult)
+        let repeatedTicket = repeatedReady.ticket
+        XCTAssertEqual(repeatedTicket.requestID, ticket.requestID)
+        XCTAssertNotEqual(repeatedTicket.retainID, ticket.retainID)
         XCTAssertEqual(repeatedReady.snapshot.outcome, .readyNoSymbols)
         _ = await store.cancelCodemapArtifactDemand(repeatedTicket)
         let repeatedMarkerSnapshotValue = await store.codemapMarkerReadinessSnapshotForTesting(
@@ -1956,5 +1960,594 @@ final class CodemapGraphFreezeQueryTests: WorkspaceFileContextStoreCodemapSeamTe
         XCTAssertEqual(fixture.engineFactoryCount.value, 0)
         XCTAssertEqual(fixture.manifestReadCount.value, 0)
         XCTAssertEqual(fixture.buildCount.value, 0)
+    }
+
+    /// A last-holder release of a current ready seed keeps it warm: the re-request joins the idle
+    /// record with a fresh retain, without an overlay contribution advance, graph worker start,
+    /// recovery observer, or projection schedule, and the graph still answers for the joined ticket.
+    func testLastReadyReleaseStaysWarmAndRejoinsWithoutOverlayGraphOrProjectionChurn() async throws {
+        let repositoryFixture = try ReviewGitRepositoryFixture(name: #function)
+        let root = try repositoryFixture.makeRepository(
+            named: "repository",
+            files: [
+                "Sources/Source.swift": "struct Source { let target: Target }\n",
+                "Sources/Target.swift": SwiftFixtureSource.emptyStruct("Target")
+            ]
+        )
+        let fixture = try CodemapStoreFixture(name: #function)
+        let graphProbe = CodemapSelectionGraphProbe()
+        addTeardownBlock {
+            await fixture.shutdown()
+            repositoryFixture.cleanup()
+        }
+        let store = fixture.makeStore(selectionGraphFactory: graphProbe.factory)
+        let loaded = try await store.loadRoot(path: root.path)
+        let files = await store.files(inRoot: loaded.id)
+        let source = try XCTUnwrap(files.first { $0.standardizedRelativePath == "Sources/Source.swift" })
+        let target = try XCTUnwrap(files.first { $0.standardizedRelativePath == "Sources/Target.swift" })
+        let targetDemand = try await readyArtifactDemand(store: store, forFileID: target.id)
+        let seed = try await readyArtifactDemand(store: store, forFileID: source.id)
+        let rootEpoch = seed.ticket.rootEpoch
+        let published = await graphProbe.waitUntilPublished(rootEpoch: rootEpoch, minimumNodeCount: 2)
+        XCTAssertTrue(published)
+        _ = try await readyGraphQuery(
+            store: store,
+            query: WorkspaceCodemapStoreSelectionGraphQuery(selectedSources: [
+                WorkspaceCodemapStoreSelectionGraphSourceIdentity(ticket: seed.ticket)
+            ])
+        )
+        let drained = await waitForCodemapGraphPublicationDrain(store: store, rootEpoch: rootEpoch)
+        XCTAssertTrue(drained)
+        let generationBefore = await store.codemapOverlayContributionGenerationForTesting(rootEpoch: rootEpoch)
+        XCTAssertNotNil(generationBefore)
+        let accountingBefore = await store.codemapBindingEngineAccountingForTesting(rootID: loaded.id)
+        let scheduledBefore = try XCTUnwrap(accountingBefore?.counters.projectionPreloadsScheduled)
+        let countsBefore = await store.codemapPresentationOperationCountsForTesting()
+        let evictionsBefore = await store.codemapIdleReadyDemandEvictionCountForTesting()
+
+        let clock = ContinuousClock()
+        let releaseStarted = clock.now
+        let released = await store.cancelCodemapArtifactDemand(seed.ticket)
+        XCTAssertTrue(released)
+        XCTAssertLessThan(releaseStarted.duration(to: clock.now), .milliseconds(500))
+        let idleAfterRelease = await store.codemapIdleReadyDemandFileIDsForTesting(rootEpoch: rootEpoch)
+        XCTAssertEqual(idleAfterRelease, [source.id])
+        XCTAssertEqual(try seed.ready.handle.artifactKey(), seed.ready.snapshot.artifactKey)
+
+        let rejoined = try await readyResult(store.requestCodemapArtifact(forFileID: source.id))
+        XCTAssertEqual(rejoined.ticket.requestID, seed.ticket.requestID)
+        XCTAssertEqual(rejoined.ticket.requestGeneration, seed.ticket.requestGeneration)
+        XCTAssertNotEqual(rejoined.ticket.retainID, seed.ticket.retainID)
+        XCTAssertEqual(rejoined.snapshot.artifactKey, seed.ready.snapshot.artifactKey)
+        let idleAfterJoin = await store.codemapIdleReadyDemandFileIDsForTesting(rootEpoch: rootEpoch)
+        XCTAssertTrue(idleAfterJoin.isEmpty)
+
+        // The released retain cannot cancel, reset, or observe the joined demand.
+        let staleRelease = await store.cancelCodemapArtifactDemand(seed.ticket)
+        XCTAssertFalse(staleRelease)
+        await assertStale(store.codemapArtifactDemandStatus(seed.ticket))
+        let joinedRetainCount = await store.codemapArtifactDemandRetainCountForTesting(rejoined.ticket)
+        XCTAssertEqual(joinedRetainCount, 1)
+        _ = try await readyResult(store.codemapArtifactDemandStatus(rejoined.ticket))
+
+        let generationAfter = await store.codemapOverlayContributionGenerationForTesting(rootEpoch: rootEpoch)
+        XCTAssertEqual(generationAfter, generationBefore)
+        let accountingAfter = await store.codemapBindingEngineAccountingForTesting(rootID: loaded.id)
+        XCTAssertEqual(accountingAfter?.counters.projectionPreloadsScheduled, scheduledBefore)
+        let countsAfter = await store.codemapPresentationOperationCountsForTesting()
+        XCTAssertEqual(countsAfter.graphWorkerStarts, countsBefore.graphWorkerStarts)
+        XCTAssertEqual(
+            countsAfter.projectionRecoveryObserversStarted,
+            countsBefore.projectionRecoveryObserversStarted
+        )
+        let evictionsAfter = await store.codemapIdleReadyDemandEvictionCountForTesting()
+        XCTAssertEqual(evictionsAfter, evictionsBefore)
+        let query = await store.queryCodemapSelectionGraph(
+            WorkspaceCodemapStoreSelectionGraphQuery(selectedSources: [
+                WorkspaceCodemapStoreSelectionGraphSourceIdentity(ticket: rejoined.ticket)
+            ])
+        )
+        guard case .readyPartial = query else {
+            return XCTFail("The joined seed must query the retained published graph, got \(query)")
+        }
+
+        _ = await store.cancelCodemapArtifactDemand(rejoined.ticket)
+        _ = await store.cancelCodemapArtifactDemand(targetDemand.ticket)
+        await store.unloadRoot(id: loaded.id)
+    }
+
+    /// A withdrawn published summary with no publication flight, worker, pending snapshot, or
+    /// recovery observer must not leave a structure query pending until its deadline: the query
+    /// signals publication once for the desired key, and a repeat withdrawal for the same key
+    /// falls back to capture and revalidation instead of waiting again.
+    func testStructureQuerySignalsPublicationOnceForWithdrawnSummaryWithNoActiveFlight() async throws {
+        let repositoryFixture = try ReviewGitRepositoryFixture(name: #function)
+        let root = try repositoryFixture.makeRepository(
+            named: "repository",
+            files: [
+                "Sources/Source.swift": "struct Source { let target: Target }\n",
+                "Sources/Target.swift": SwiftFixtureSource.emptyStruct("Target")
+            ]
+        )
+        let fixture = try CodemapStoreFixture(name: #function)
+        let graphProbe = CodemapSelectionGraphProbe()
+        addTeardownBlock {
+            await fixture.shutdown()
+            repositoryFixture.cleanup()
+        }
+        let store = fixture.makeStore(selectionGraphFactory: graphProbe.factory)
+        let loaded = try await store.loadRoot(path: root.path)
+        let files = await store.files(inRoot: loaded.id)
+        let source = try XCTUnwrap(files.first { $0.standardizedRelativePath == "Sources/Source.swift" })
+        let target = try XCTUnwrap(files.first { $0.standardizedRelativePath == "Sources/Target.swift" })
+        let targetDemand = try await readyArtifactDemand(store: store, forFileID: target.id)
+        let seed = try await readyArtifactDemand(store: store, forFileID: source.id)
+        let rootEpoch = seed.ticket.rootEpoch
+        let published = await graphProbe.waitUntilPublished(rootEpoch: rootEpoch, minimumNodeCount: 2)
+        XCTAssertTrue(published)
+        let structureQuery = WorkspaceCodemapStructureTraversalQuery(
+            seeds: [WorkspaceCodemapStoreSelectionGraphSourceIdentity(ticket: seed.ticket)],
+            direction: .both,
+            limits: .init(maximumDepth: 2, maximumNodeCount: 10, maximumEdgeCount: 10, maximumByteCount: 4096)
+        )
+        let clock = ContinuousClock()
+        let settleDeadline = clock.now.advanced(by: .seconds(10))
+        var settled = await store.queryCodemapStructureGraph(structureQuery)
+        while case .pending = settled, clock.now < settleDeadline {
+            try await Task.sleep(for: .milliseconds(10))
+            settled = await store.queryCodemapStructureGraph(structureQuery)
+        }
+        guard case .readyPartial = settled else {
+            return XCTFail("The structure query never settled before the withdrawal, got \(settled)")
+        }
+        let drained = await waitForCodemapGraphPublicationDrain(store: store, rootEpoch: rootEpoch)
+        XCTAssertTrue(drained)
+
+        let withdrawn = await store.withdrawCodemapPublishedGraphSummaryForTesting(rootEpoch: rootEpoch)
+        XCTAssertTrue(withdrawn)
+        let signalsBefore = await store.codemapPresentationOperationCountsForTesting().graphBatchSignals
+        let first = await store.queryCodemapStructureGraph(structureQuery)
+        XCTAssertEqual(first, .pending(.graphRebuilding(rootEpoch)))
+        let signalsAfterFirst = await store.codemapPresentationOperationCountsForTesting().graphBatchSignals
+        XCTAssertEqual(signalsAfterFirst, signalsBefore + 1, "The idle withdrawn summary must restart publication")
+        let drainedAfterSignal = await waitForCodemapGraphPublicationDrain(store: store, rootEpoch: rootEpoch)
+        XCTAssertTrue(drainedAfterSignal)
+        let republished = await store.queryCodemapStructureGraph(structureQuery)
+        if case .pending = republished {
+            XCTFail("The signalled publication must end the wait, got \(republished)")
+        }
+
+        // The same desired key withdrawn again (a publication that retired without publishing)
+        // is not signalled a second time; the query captures and revalidates instead.
+        let withdrawnAgain = await store.withdrawCodemapPublishedGraphSummaryForTesting(rootEpoch: rootEpoch)
+        XCTAssertTrue(withdrawnAgain)
+        let signalsBeforeRepeat = await store.codemapPresentationOperationCountsForTesting().graphBatchSignals
+        let repeated = await store.queryCodemapStructureGraph(structureQuery)
+        if case .pending = repeated {
+            XCTFail("A repeated withdrawal for a signalled key must fall back to capture, got \(repeated)")
+        }
+        let signalsAfterRepeat = await store.codemapPresentationOperationCountsForTesting().graphBatchSignals
+        XCTAssertEqual(signalsAfterRepeat, signalsBeforeRepeat)
+
+        _ = await store.cancelCodemapArtifactDemand(seed.ticket)
+        _ = await store.cancelCodemapArtifactDemand(targetDemand.ticket)
+        await store.unloadRoot(id: loaded.id)
+    }
+
+    /// Two holders share a warm record re-keyed to the first rejoiner. When that holder releases
+    /// first, the record and its ready result are re-keyed to the remaining holder, so
+    /// retain-scoped checks never read a released retain.
+    func testCreatorFirstReleaseRekeysWarmRecordToRemainingHolder() async throws {
+        let repositoryFixture = try ReviewGitRepositoryFixture(name: #function)
+        let root = try repositoryFixture.makeRepository(
+            named: "repository",
+            files: ["Sources/Feature.swift": SwiftFixtureSource.emptyStruct("Feature")]
+        )
+        let fixture = try CodemapStoreFixture(name: #function, projectionAuthority: .none)
+        addTeardownBlock {
+            await fixture.shutdown()
+            repositoryFixture.cleanup()
+        }
+        let store = fixture.makeStore(codemapProjectionPreloadLaunchPolicy: .disabled)
+        let loaded = try await store.loadRoot(path: root.path)
+        let loadedFiles = await store.files(inRoot: loaded.id)
+        let file = try XCTUnwrap(loadedFiles.first)
+        let original = try await readyArtifactDemand(store: store, forFileID: file.id)
+        let rootEpoch = original.ticket.rootEpoch
+        let released = await store.cancelCodemapArtifactDemand(original.ticket)
+        XCTAssertTrue(released)
+
+        let first = try await readyResult(store.requestCodemapArtifact(forFileID: file.id))
+        let second = try await readyResult(store.requestCodemapArtifact(forFileID: file.id))
+        XCTAssertEqual(first.ticket.requestID, original.ticket.requestID)
+        XCTAssertEqual(second.ticket.requestID, original.ticket.requestID)
+        XCTAssertNotEqual(first.ticket.retainID, second.ticket.retainID)
+        let rekeyedToFirst = await store.codemapDemandRecordTicketsForTesting(rootEpoch: rootEpoch, fileID: file.id)
+        XCTAssertEqual(rekeyedToFirst?.record.retainID, first.ticket.retainID)
+
+        let firstReleased = await store.cancelCodemapArtifactDemand(first.ticket)
+        XCTAssertTrue(firstReleased)
+        let recordTickets = await store.codemapDemandRecordTicketsForTesting(rootEpoch: rootEpoch, fileID: file.id)
+        let tickets = try XCTUnwrap(recordTickets)
+        XCTAssertEqual(tickets.record, second.ticket, "The record must name the remaining holder's retain")
+        XCTAssertEqual(tickets.ready, second.ticket, "The ready result must name the remaining holder's retain")
+        let retainCount = await store.codemapArtifactDemandRetainCountForTesting(second.ticket)
+        XCTAssertEqual(retainCount, 1)
+        _ = try await readyResult(store.codemapArtifactDemandStatus(second.ticket))
+        await assertStale(store.codemapArtifactDemandStatus(first.ticket))
+        let idle = await store.codemapIdleReadyDemandFileIDsForTesting(rootEpoch: rootEpoch)
+        XCTAssertTrue(idle.isEmpty)
+
+        let secondReleased = await store.cancelCodemapArtifactDemand(second.ticket)
+        XCTAssertTrue(secondReleased)
+        let idleAfter = await store.codemapIdleReadyDemandFileIDsForTesting(rootEpoch: rootEpoch)
+        XCTAssertEqual(idleAfter, [file.id])
+        await store.unloadRoot(id: loaded.id)
+    }
+
+    /// Idle ready records are capped per root. Releasing one more than the cap evicts the least
+    /// recently released record (revoking it), and that file's next request is a fresh demand.
+    /// The production cap is derived from the overlay policy; the test lowers it through the
+    /// DEBUG seam so one more than the cap stays a handful of files.
+    func testIdleReadyDemandCapEvictsOldestReleasedRecord() async throws {
+        let productionCapacity = WorkspaceFileContextStore.maximumIdleReadyCodemapDemandsPerRoot
+        let policy = WorkspaceCodemapLiveOverlayPolicy.default
+        XCTAssertLessThanOrEqual(
+            productionCapacity * 2,
+            policy.maximumEntryCountPerRoot,
+            "Idle records may use at most half of the live overlay's per-root entries."
+        )
+        XCTAssertLessThanOrEqual(
+            productionCapacity * 2,
+            policy.maximumLeaseCountPerRoot,
+            "Idle records may hold at most half of the live overlay's per-root leases."
+        )
+        XCTAssertEqual(
+            productionCapacity,
+            min(policy.maximumEntryCountPerRoot, policy.maximumLeaseCountPerRoot) / 2
+        )
+        let capacity = 4
+        var repositoryFiles: [String: String] = [:]
+        for index in 0 ... capacity {
+            repositoryFiles[String(format: "Sources/File%03d.swift", index)] =
+                SwiftFixtureSource.emptyStruct(String(format: "File%03d", index))
+        }
+        let repositoryFixture = try ReviewGitRepositoryFixture(name: #function)
+        let root = try repositoryFixture.makeRepository(named: "repository", files: repositoryFiles)
+        let fixture = try CodemapStoreFixture(name: #function, projectionAuthority: .none)
+        addTeardownBlock {
+            await fixture.shutdown()
+            repositoryFixture.cleanup()
+        }
+        let store = fixture.makeStore(codemapProjectionPreloadLaunchPolicy: .disabled)
+        await store.setIdleReadyCodemapDemandCapacityForTesting(capacity)
+        let loaded = try await store.loadRoot(path: root.path)
+        let files = await store.files(inRoot: loaded.id)
+            .sorted { $0.standardizedRelativePath < $1.standardizedRelativePath }
+        XCTAssertEqual(files.count, capacity + 1)
+        let evictionsBefore = await store.codemapIdleReadyDemandEvictionCountForTesting()
+
+        typealias Demand = (ticket: WorkspaceCodemapArtifactDemandTicket, ready: WorkspaceCodemapArtifactDemandReady)
+        var demands: [Demand] = []
+        for file in files {
+            let demand = try await readyArtifactDemand(store: store, forFileID: file.id)
+            demands.append(demand)
+            let released = await store.cancelCodemapArtifactDemand(demand.ticket)
+            XCTAssertTrue(released)
+            let idle = await store.codemapIdleReadyDemandFileIDsForTesting(rootEpoch: demand.ticket.rootEpoch)
+            XCTAssertLessThanOrEqual(idle.count, capacity)
+        }
+        let oldest = try XCTUnwrap(demands.first)
+        let rootEpoch = oldest.ticket.rootEpoch
+        let idle = await store.codemapIdleReadyDemandFileIDsForTesting(rootEpoch: rootEpoch)
+        XCTAssertEqual(idle, files.dropFirst().map(\.id), "Idle records stay in least-recently-released order.")
+        let evictionsAfter = await store.codemapIdleReadyDemandEvictionCountForTesting()
+        XCTAssertEqual(evictionsAfter - evictionsBefore, 1)
+        try await AsyncTestWait.waitUntil("evicted record cleanup", timeout: 5) {
+            await !store.codemapArtifactDemandCleanupSnapshotForTesting(oldest.ticket).demandRecordPresent
+        }
+        XCTAssertThrowsError(try oldest.ready.handle.artifactKey()) {
+            XCTAssertEqual($0 as? WorkspaceCodemapLiveOverlayBundleAccessError, .closed)
+        }
+        let newest = try XCTUnwrap(demands.last)
+        XCTAssertEqual(try newest.ready.handle.artifactKey(), newest.ready.snapshot.artifactKey)
+
+        let fresh = try await pendingTicket(store.requestCodemapArtifact(forFileID: oldest.ticket.fileID))
+        XCTAssertNotEqual(fresh.requestID, oldest.ticket.requestID)
+        _ = try await readyResult(settledResult(store: store, ticket: fresh))
+        let rejoinedNewest = try await readyResult(store.requestCodemapArtifact(forFileID: newest.ticket.fileID))
+        XCTAssertEqual(rejoinedNewest.ticket.requestID, newest.ticket.requestID)
+        _ = await store.cancelCodemapArtifactDemand(fresh)
+        _ = await store.cancelCodemapArtifactDemand(rejoinedNewest.ticket)
+        await store.unloadRoot(id: loaded.id)
+    }
+
+    /// S1 fix 2b: idle ready records hold overlay leases. When they fill the root's overlay lease
+    /// budget, a new file's completion evicts the least recently released idle record and
+    /// completes instead of settling busy.
+    func testOverlayLeaseLimitBusyEvictsOldestIdleRecordAndCompletesNewFile() async throws {
+        let repositoryFixture = try ReviewGitRepositoryFixture(name: #function)
+        let root = try repositoryFixture.makeRepository(named: "repository", files: [
+            "Sources/A.swift": SwiftFixtureSource.emptyStruct("A"),
+            "Sources/B.swift": SwiftFixtureSource.emptyStruct("B"),
+            "Sources/C.swift": SwiftFixtureSource.emptyStruct("C")
+        ])
+        let fixture = try CodemapStoreFixture(name: #function, projectionAuthority: .none)
+        addTeardownBlock {
+            await fixture.shutdown()
+            repositoryFixture.cleanup()
+        }
+        let store = fixture.makeStore(codemapProjectionPreloadLaunchPolicy: .disabled)
+        let loaded = try await store.loadRoot(path: root.path)
+        let files = await store.files(inRoot: loaded.id)
+            .sorted { $0.standardizedRelativePath < $1.standardizedRelativePath }
+        XCTAssertEqual(files.map(\.standardizedRelativePath), ["Sources/A.swift", "Sources/B.swift", "Sources/C.swift"])
+        let (fileA, fileB, fileC) = (files[0], files[1], files[2])
+
+        let demandA = try await readyArtifactDemand(store: store, forFileID: fileA.id)
+        let rootEpoch = demandA.ticket.rootEpoch
+        let policySet = await store.setCodemapOverlayPolicyForTesting(
+            rootEpoch: rootEpoch,
+            policy: WorkspaceCodemapLiveOverlayPolicy(maximumLeaseCountPerRoot: 2)
+        )
+        XCTAssertTrue(policySet)
+        addTeardownBlock {
+            await store.setCodemapOverlayPolicyForTesting(rootEpoch: rootEpoch, policy: .default)
+        }
+        let demandB = try await readyArtifactDemand(store: store, forFileID: fileB.id)
+        _ = await store.cancelCodemapArtifactDemand(demandA.ticket)
+        _ = await store.cancelCodemapArtifactDemand(demandB.ticket)
+        let idleBefore = await store.codemapIdleReadyDemandFileIDsForTesting(rootEpoch: rootEpoch)
+        XCTAssertEqual(idleBefore, [fileA.id, fileB.id])
+        let leasesBefore = await store.codemapOverlayRootAccountingForTesting(rootEpoch: rootEpoch)?.leaseCount
+        XCTAssertEqual(leasesBefore, 2, "Both idle records keep their overlay leases, filling the budget.")
+        let evictionsBefore = await store.codemapIdleReadyDemandEvictionCountForTesting()
+
+        // Not `readyArtifactDemand`: it retries busy results, which would hide the refusal.
+        let ticketC = try await pendingTicket(store.requestCodemapArtifact(forFileID: fileC.id))
+        let resultC = try await settledResult(store: store, ticket: ticketC)
+        guard case .ready = resultC else {
+            return XCTFail("A full lease budget of idle records must not block a new completion; got \(resultC)")
+        }
+
+        let evictionsAfter = await store.codemapIdleReadyDemandEvictionCountForTesting()
+        XCTAssertEqual(evictionsAfter - evictionsBefore, 1, "Exactly one idle record is released.")
+        let idleAfter = await store.codemapIdleReadyDemandFileIDsForTesting(rootEpoch: rootEpoch)
+        XCTAssertEqual(idleAfter, [fileB.id], "The least recently released idle record is the one evicted.")
+        XCTAssertThrowsError(try demandA.ready.handle.artifactKey()) {
+            XCTAssertEqual($0 as? WorkspaceCodemapLiveOverlayBundleAccessError, .closed)
+        }
+        let leasesAfter = await store.codemapOverlayRootAccountingForTesting(rootEpoch: rootEpoch)?.leaseCount
+        XCTAssertEqual(leasesAfter, 2)
+        let rejoinedB = try await readyResult(store.requestCodemapArtifact(forFileID: fileB.id))
+        XCTAssertEqual(rejoinedB.ticket.requestID, demandB.ticket.requestID, "The newer idle record stays warm.")
+        _ = await store.cancelCodemapArtifactDemand(rejoinedB.ticket)
+        _ = await store.cancelCodemapArtifactDemand(ticketC)
+        await store.unloadRoot(id: loaded.id)
+    }
+
+    /// S1 fix 2b/3: the artifact store's process-wide active-lease admission (128 by default) is
+    /// the budget idle records reach first. A refused lease evicts an idle record and the
+    /// completion retries once. Victims come from the requester's root first, even when another
+    /// root holds an older record, because only the requester's root advances anyway; with none
+    /// there, the oldest across the requester store's other roots.
+    func testArtifactStoreLeaseLimitEvictsRequesterRootThenStoreIdleRecords() async throws {
+        let repositoryFixture = try ReviewGitRepositoryFixture(name: #function)
+        let firstRoot = try repositoryFixture.makeRepository(named: "first", files: [
+            "Sources/A.swift": SwiftFixtureSource.emptyStruct("A")
+        ])
+        let secondRoot = try repositoryFixture.makeRepository(named: "second", files: [
+            "Sources/B.swift": SwiftFixtureSource.emptyStruct("B"),
+            "Sources/C.swift": SwiftFixtureSource.emptyStruct("C"),
+            "Sources/D.swift": SwiftFixtureSource.emptyStruct("D")
+        ])
+        let fixture = try CodemapStoreFixture(name: #function, projectionAuthority: .none)
+        addTeardownBlock {
+            await fixture.shutdown()
+            repositoryFixture.cleanup()
+        }
+        let store = fixture.makeStore(codemapProjectionPreloadLaunchPolicy: .disabled)
+        let firstLoaded = try await store.loadRoot(path: firstRoot.path)
+        let secondLoaded = try await store.loadRoot(path: secondRoot.path)
+        let firstFiles = await store.files(inRoot: firstLoaded.id)
+        let fileA = try XCTUnwrap(firstFiles.first)
+        let secondFiles = await store.files(inRoot: secondLoaded.id)
+            .sorted { $0.standardizedRelativePath < $1.standardizedRelativePath }
+        XCTAssertEqual(
+            secondFiles.map(\.standardizedRelativePath),
+            ["Sources/B.swift", "Sources/C.swift", "Sources/D.swift"]
+        )
+        let (fileB, fileC, fileD) = (secondFiles[0], secondFiles[1], secondFiles[2])
+
+        let demandA = try await readyArtifactDemand(store: store, forFileID: fileA.id)
+        let demandB = try await readyArtifactDemand(store: store, forFileID: fileB.id)
+        let firstEpoch = demandA.ticket.rootEpoch
+        let secondEpoch = demandB.ticket.rootEpoch
+        XCTAssertNotEqual(firstEpoch, secondEpoch)
+        let limitSet = await store.setCodemapArtifactStoreActiveLeaseCountLimitForTesting(
+            rootEpoch: secondEpoch,
+            maximumCount: 2
+        )
+        XCTAssertTrue(limitSet)
+        addTeardownBlock {
+            await store.setCodemapArtifactStoreActiveLeaseCountLimitForTesting(rootEpoch: secondEpoch, maximumCount: nil)
+        }
+        _ = await store.cancelCodemapArtifactDemand(demandA.ticket)
+        _ = await store.cancelCodemapArtifactDemand(demandB.ticket)
+        let firstIdleBefore = await store.codemapIdleReadyDemandFileIDsForTesting(rootEpoch: firstEpoch)
+        let secondIdleBefore = await store.codemapIdleReadyDemandFileIDsForTesting(rootEpoch: secondEpoch)
+        XCTAssertEqual(firstIdleBefore, [fileA.id], "A, in the other root, is the oldest idle record.")
+        XCTAssertEqual(secondIdleBefore, [fileB.id])
+        let evictionsBefore = await store.codemapIdleReadyDemandEvictionCountForTesting()
+
+        // Not `readyArtifactDemand`: it retries non-ready results, which would hide the refusal.
+        let ticketC = try await pendingTicket(store.requestCodemapArtifact(forFileID: fileC.id))
+        let resultC = try await settledResult(store: store, ticket: ticketC)
+        guard case .ready = resultC else {
+            return XCTFail("A full artifact-store lease budget of idle records must not block a new completion; got \(resultC)")
+        }
+        let evictionsAfterC = await store.codemapIdleReadyDemandEvictionCountForTesting()
+        XCTAssertEqual(evictionsAfterC - evictionsBefore, 1, "Exactly one idle record is released.")
+        let firstIdleAfterC = await store.codemapIdleReadyDemandFileIDsForTesting(rootEpoch: firstEpoch)
+        let secondIdleAfterC = await store.codemapIdleReadyDemandFileIDsForTesting(rootEpoch: secondEpoch)
+        XCTAssertEqual(secondIdleAfterC, [], "The requester root's idle record is evicted first.")
+        XCTAssertEqual(firstIdleAfterC, [fileA.id], "The other root's older idle record stays warm.")
+        XCTAssertThrowsError(try demandB.ready.handle.artifactKey()) {
+            XCTAssertEqual($0 as? WorkspaceCodemapLiveOverlayBundleAccessError, .closed)
+        }
+        XCTAssertEqual(try demandA.ready.handle.artifactKey(), demandA.ready.snapshot.artifactKey)
+
+        // C is held, so the requester root has no idle record left: D falls back to the oldest
+        // idle record across the store's other roots.
+        let ticketD = try await pendingTicket(store.requestCodemapArtifact(forFileID: fileD.id))
+        let resultD = try await settledResult(store: store, ticket: ticketD)
+        guard case .ready = resultD else {
+            return XCTFail("With no idle record in the requester root, another root's must be released; got \(resultD)")
+        }
+        let evictionsAfterD = await store.codemapIdleReadyDemandEvictionCountForTesting()
+        XCTAssertEqual(evictionsAfterD - evictionsAfterC, 1)
+        let firstIdleAfterD = await store.codemapIdleReadyDemandFileIDsForTesting(rootEpoch: firstEpoch)
+        XCTAssertEqual(firstIdleAfterD, [])
+        XCTAssertThrowsError(try demandA.ready.handle.artifactKey()) {
+            XCTAssertEqual($0 as? WorkspaceCodemapLiveOverlayBundleAccessError, .closed)
+        }
+        _ = await store.cancelCodemapArtifactDemand(ticketC)
+        _ = await store.cancelCodemapArtifactDemand(ticketD)
+        await store.unloadRoot(id: firstLoaded.id)
+        await store.unloadRoot(id: secondLoaded.id)
+    }
+
+    /// S1 fix 2c/3: the artifact-store lease admission is process-wide, shared by every window's
+    /// store. When the requester store has no idle record and another store's idle records fill
+    /// the admission, a new demand evicts the least recently released one in that other store.
+    func testArtifactStoreLeaseLimitEvictsOldestIdleRecordInAnotherStore() async throws {
+        let repositoryFixture = try ReviewGitRepositoryFixture(name: #function)
+        let firstRoot = try repositoryFixture.makeRepository(named: "first", files: [
+            "Sources/A1.swift": SwiftFixtureSource.emptyStruct("A1"),
+            "Sources/A2.swift": SwiftFixtureSource.emptyStruct("A2")
+        ])
+        let secondRoot = try repositoryFixture.makeRepository(named: "second", files: [
+            "Sources/B1.swift": SwiftFixtureSource.emptyStruct("B1")
+        ])
+        let fixture = try CodemapStoreFixture(name: #function, projectionAuthority: .none)
+        addTeardownBlock {
+            await fixture.shutdown()
+            repositoryFixture.cleanup()
+        }
+        // Both stores come from one fixture, so they share its runtime and lease admission, as
+        // every window's store shares the process-wide admission in production.
+        let storeA = fixture.makeStore(codemapProjectionPreloadLaunchPolicy: .disabled)
+        let storeB = fixture.makeStore(codemapProjectionPreloadLaunchPolicy: .disabled)
+        let loadedA = try await storeA.loadRoot(path: firstRoot.path)
+        let loadedB = try await storeB.loadRoot(path: secondRoot.path)
+        let filesA = await storeA.files(inRoot: loadedA.id)
+            .sorted { $0.standardizedRelativePath < $1.standardizedRelativePath }
+        XCTAssertEqual(filesA.map(\.standardizedRelativePath), ["Sources/A1.swift", "Sources/A2.swift"])
+        let filesB = await storeB.files(inRoot: loadedB.id)
+        let fileB1 = try XCTUnwrap(filesB.first)
+
+        let demandA1 = try await readyArtifactDemand(store: storeA, forFileID: filesA[0].id)
+        let demandA2 = try await readyArtifactDemand(store: storeA, forFileID: filesA[1].id)
+        let epochA = demandA1.ticket.rootEpoch
+        let limitSet = await storeA.setCodemapArtifactStoreActiveLeaseCountLimitForTesting(
+            rootEpoch: epochA,
+            maximumCount: 2
+        )
+        XCTAssertTrue(limitSet)
+        addTeardownBlock {
+            await storeA.setCodemapArtifactStoreActiveLeaseCountLimitForTesting(rootEpoch: epochA, maximumCount: nil)
+        }
+        _ = await storeA.cancelCodemapArtifactDemand(demandA1.ticket)
+        _ = await storeA.cancelCodemapArtifactDemand(demandA2.ticket)
+        let idleABefore = await storeA.codemapIdleReadyDemandFileIDsForTesting(rootEpoch: epochA)
+        XCTAssertEqual(idleABefore, [filesA[0].id, filesA[1].id])
+        let evictionsABefore = await storeA.codemapIdleReadyDemandEvictionCountForTesting()
+        let evictionsBBefore = await storeB.codemapIdleReadyDemandEvictionCountForTesting()
+
+        // Not `readyArtifactDemand`: it retries non-ready results, which would hide the refusal.
+        let ticketB1 = try await pendingTicket(storeB.requestCodemapArtifact(forFileID: fileB1.id))
+        let idleB = await storeB.codemapIdleReadyDemandFileIDsForTesting(rootEpoch: ticketB1.rootEpoch)
+        XCTAssertEqual(idleB, [], "The requester store has no idle record of its own.")
+        let resultB1 = try await settledResult(store: storeB, ticket: ticketB1)
+        guard case .ready = resultB1 else {
+            return XCTFail("Another store's idle records filling the lease admission must not block a completion; got \(resultB1)")
+        }
+
+        let evictionsAAfter = await storeA.codemapIdleReadyDemandEvictionCountForTesting()
+        let evictionsBAfter = await storeB.codemapIdleReadyDemandEvictionCountForTesting()
+        XCTAssertEqual(evictionsAAfter - evictionsABefore, 1, "The owning store evicts exactly one idle record.")
+        XCTAssertEqual(evictionsBAfter - evictionsBBefore, 0)
+        let idleAAfter = await storeA.codemapIdleReadyDemandFileIDsForTesting(rootEpoch: epochA)
+        XCTAssertEqual(idleAAfter, [filesA[1].id], "The least recently released idle record, in the other store, is evicted.")
+        XCTAssertThrowsError(try demandA1.ready.handle.artifactKey()) {
+            XCTAssertEqual($0 as? WorkspaceCodemapLiveOverlayBundleAccessError, .closed)
+        }
+        let rejoinedA2 = try await readyResult(storeA.requestCodemapArtifact(forFileID: filesA[1].id))
+        XCTAssertEqual(rejoinedA2.ticket.requestID, demandA2.ticket.requestID, "The newer idle record stays warm.")
+        _ = await storeA.cancelCodemapArtifactDemand(rejoinedA2.ticket)
+        _ = await storeB.cancelCodemapArtifactDemand(ticketB1)
+        await storeA.unloadRoot(id: loadedA.id)
+        await storeB.unloadRoot(id: loadedB.id)
+    }
+
+    /// S1 fix 3 (S1-R2-01): an object's `deinit` unregisters from the idle eviction registry, so
+    /// the registry must never drop a last strong reference while its lock is held. Drop the
+    /// only external reference while `liveObjects()` is mid-enumeration: the enumeration must
+    /// finish, see no object, and the object must be unregistered.
+    func testIdleEvictionRegistryLastReferenceDroppedDuringEnumerationDoesNotDeadlock() {
+        let registry = WorkspaceCodemapWeakObjectRegistry<CodemapRegistryProbe>()
+        let holder = CodemapRegistryProbeHolder()
+        do {
+            let probe = CodemapRegistryProbe(registry: registry)
+            registry.register(probe)
+            holder.hold(probe)
+        }
+        XCTAssertEqual(registry.registeredCountForTesting, 1)
+        registry.setAfterSnapshotHookForTesting { holder.release() }
+
+        let finished = DispatchSemaphore(value: 0)
+        let liveCount = CodemapLockedValues<Int>()
+        let thread = Thread {
+            liveCount.append(registry.liveObjects().count)
+            finished.signal()
+        }
+        thread.start()
+        guard finished.wait(timeout: .now() + 5) == .success else {
+            // Return without touching the registry again: its lock is held by the stuck thread.
+            return XCTFail("Enumeration deadlocked: the last reference was released while the registry lock was held.")
+        }
+        XCTAssertEqual(liveCount.values, [0])
+        XCTAssertEqual(registry.registeredCountForTesting, 0, "The destroyed object unregistered itself.")
+    }
+}
+
+private final class CodemapRegistryProbe {
+    private let registry: WorkspaceCodemapWeakObjectRegistry<CodemapRegistryProbe>
+
+    init(registry: WorkspaceCodemapWeakObjectRegistry<CodemapRegistryProbe>) {
+        self.registry = registry
+    }
+
+    deinit {
+        registry.unregister(ObjectIdentifier(self))
+    }
+}
+
+private final class CodemapRegistryProbeHolder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var probe: CodemapRegistryProbe?
+
+    func hold(_ probe: CodemapRegistryProbe) {
+        lock.withLock { self.probe = probe }
+    }
+
+    /// Releases the probe outside `lock`, so its `deinit` runs on the caller.
+    func release() {
+        let released = lock.withLock {
+            let probe = self.probe
+            self.probe = nil
+            return probe
+        }
+        _ = released
     }
 }
