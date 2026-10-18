@@ -6,6 +6,8 @@ Last-verified: 2026-10-04
 
 Status: **Focused original-fix E2E passed structure-only: 34/34 queries on PID 64805, including index/commit changes and churn.** The user stopped further catalog-bug diagnostic expansion; unfinished predicate diagnostics were reverted. Earlier 19/19 fixture-root counter checks remain recorded separately. Catalog-addition/referrers publication still fails with `publication.traversal.graph`; its exact cause and behavioral fix remain unresolved. OracleA/B R1 closed the prior diagnostic P1/P2 findings with no new P0/P1. Release-mode emission is out of scope and unverified.
 
+Active follow-up: [codemap automatic convergence plan](plans/2026-10-18-codemap-automatic-convergence-plan.md) (warm release, batched projection authority, automatic foreground repair).
+
 ## Ownership and boundaries
 
 - `WorkspaceCodemapGitCapabilityService.swift` owns repository evidence and authority resolution.

@@ -1,0 +1,28 @@
+# Codemap automatic convergence plan
+
+Scope: read when the task touches automatic codemap convergence on large roots: demand release and the idle ready cache, projection source-authority batching, or automatic prompt-builder root repair.
+Authority: Authoritative
+Evidence: `docs/plans/evidence/2026-10-18-codemap-preload-churn/` (local).
+Review policy: `docs/context/review-policy.md`.
+
+## Problem (summary)
+- Cause 1: external Git index rewrites leave the codemap authority baseline stale; prompt builders never repair it (only `get_code_structure` does).
+- Cause 2: on a large root every automatic call restarts the whole projection (demand start/accept/release advance the overlay contribution generation; last-holder release also clears the root-wide published graph), and a full rerun costs ~400 s (16 git spawns per candidate). Release waits on the rerun, so calls can block for minutes.
+
+## Steps
+1. Release keeps ready codemaps warm and root graph state intact; bounded release wait (Oracle seams S1 + S2).
+2. Projection issues source authority once per batch window (up to 128 candidates) instead of twice per candidate (seam S5b; no config memo).
+3. Automatic prompt-builder operations use the existing bounded foreground root-session repair, without in-call restart (seam S6).
+4. Contract doc update and owner live acceptance (dev-app rebuild/relaunch is owner-run).
+
+Deferred by plan: semantic coverage advances (S3), incremental rerun (S4), git config memo (S5a), semantic index generation.
+
+## Status
+Step 1 — done | rounds 2/2 | open: | downgraded: | assumed: lease-pressure eviction reaches idle records in every window (fix 2c); warm rejoins skip Git authority revalidation (R1-02, Step 4 text); S1-R2-01 fixed per reviewer's smallest fix after round 2, not re-reviewed | deferred: cold large-selection convergence (owner question); process-wide idle bound at release (R2-02/03); fence wait deadline (R1-04); coordinator deadline test (S1-02); fail-closed finalization variant (S1-A-05); publication-enabled lease check (Step 4)
+Step 2 — todo | rounds 0/2 | open: | downgraded: | assumed: | deferred:
+Step 3 — todo | rounds 0/2 | open: | downgraded: | assumed: | deferred:
+Step 4 — todo | rounds 0/2 | open: | downgraded: | assumed: | deferred:
+
+## Decisions
+- D1: implement the three-step fix (release/warm cache + bounded wait, batched authority windows, automatic foreground repair).
+- D2: approve changing the contract so foreground automatic prompt builds may run a bounded repair; background work still never repairs.
