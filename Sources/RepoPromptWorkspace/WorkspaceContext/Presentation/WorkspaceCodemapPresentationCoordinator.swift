@@ -69,16 +69,26 @@ private actor WorkspaceCodemapDemandRecoveryState {
     private var refreshedFileIDs: Set<UUID> = []
     private var resetRootEpochs: Set<WorkspaceCodemapRootEpoch> = []
     private var retriedFileIDs: Set<UUID> = []
+    /// Automatic operations recur with every recount, so they may reset a root session only for
+    /// the one failure a replacement session clears by adopting the new authority. Binding, layout,
+    /// capability, and registration failures can survive a reset and would reset on every recount.
+    /// They also never refresh currentness: a stale-currentness demand would restart the whole
+    /// presentation in-call, whereas automatic coverage reports it and a later recount refreshes.
+    private let isAutomaticScope: Bool
+
+    init(isAutomaticScope: Bool = false) {
+        self.isAutomaticScope = isAutomaticScope
+    }
 
     func claim(
-        _ recovery: WorkspaceCodemapArtifactDemandRecovery,
+        _ rejection: WorkspaceCodemapBindingDemandRejection,
         ticket: WorkspaceCodemapArtifactDemandTicket
     ) -> Bool {
-        switch recovery {
+        switch WorkspaceCodemapArtifactDemandRecovery(rejection) {
         case .refreshCurrentness:
-            refreshedFileIDs.insert(ticket.fileID).inserted
+            !isAutomaticScope && refreshedFileIDs.insert(ticket.fileID).inserted
         case .resetRootSession:
-            claimRootSessionReset(rootEpoch: ticket.rootEpoch)
+            claimRootSessionReset(rootEpoch: ticket.rootEpoch, rejection: rejection)
         case .retryFreshDemand:
             retriedFileIDs.insert(ticket.fileID).inserted
         case .terminal:
@@ -89,6 +99,17 @@ private actor WorkspaceCodemapDemandRecoveryState {
     /// One root-session reset per operation and root, shared by seed and projection recovery.
     func claimRootSessionReset(rootEpoch: WorkspaceCodemapRootEpoch) -> Bool {
         resetRootEpochs.insert(rootEpoch).inserted
+    }
+
+    /// The operation's reset claim for a reset-capable rejection, subject to the automatic scope.
+    func claimRootSessionReset(
+        rootEpoch: WorkspaceCodemapRootEpoch,
+        rejection: WorkspaceCodemapBindingDemandRejection
+    ) -> Bool {
+        guard !isAutomaticScope || rejection == .repositoryAuthorityChanged else {
+            return false
+        }
+        return claimRootSessionReset(rootEpoch: rootEpoch)
     }
 }
 
@@ -190,6 +211,12 @@ package struct WorkspaceCodemapPresentationCoordinator {
         let receipt: WorkspaceCodemapAutomaticSelectionPublicationReceipt?
     }
 
+    /// The latest observed status of a projection ticket this operation acquired.
+    private struct ProjectionDemandStatusObservation {
+        let ticket: WorkspaceCodemapProjectionDemandTicket
+        let status: WorkspaceCodemapProjectionDemandStatus
+    }
+
     private struct DemandBatch {
         let resultsByFileID: [UUID: WorkspaceCodemapArtifactDemandResult]
         let resetRootEpochs: Set<WorkspaceCodemapRootEpoch>
@@ -201,6 +228,9 @@ package struct WorkspaceCodemapPresentationCoordinator {
         let readyCandidates: [WorkspaceCodemapBindingAutomaticSelectionCatalogCandidate]
         let pendingReasons: [WorkspaceCodemapAutomaticSelectionPendingReason]
         let partialReasons: [WorkspaceCodemapAutomaticSelectionPartialReason]
+        /// Roots whose session this operation reset after a provisional candidate rejection; when
+        /// non-empty the other fields are not populated and the plan must not be resolved.
+        let resetRootEpochs: [WorkspaceCodemapRootEpoch]
     }
 
     private enum ProjectionDemandWaitOutcome {
@@ -298,6 +328,17 @@ package struct WorkspaceCodemapPresentationCoordinator {
         let clock = ContinuousClock()
         let deadline = clock.now.advanced(by: policy.maximumTotalWait)
         var lastStaleReason: WorkspaceCodemapOperationPublicationStaleReason?
+        // Foreground automatic presentation (prompt/export builds under the optional-enrichment
+        // policy, gated like `keepsAdmittedWorkOnCompletion`) may spend one bounded root-session
+        // reset per root for the whole operation, shared by seed, candidate, and projection recovery
+        // and by the stale retry, and only for repository-authority drift. Exact intents and other
+        // policies keep today's non-recovering demand.
+        let automaticRecoveryState: WorkspaceCodemapDemandRecoveryState? =
+            if policy == .optionalAutomaticEnrichment, case .automatic = intent {
+                WorkspaceCodemapDemandRecoveryState(isAutomaticScope: true)
+            } else {
+                nil
+            }
 
         for attempt in 0 ... 1 {
             try Task.checkCancellation()
@@ -309,7 +350,8 @@ package struct WorkspaceCodemapPresentationCoordinator {
                     logicalRootDisplayNamesByRootID: logicalRootDisplayNamesByRootID,
                     ownership: ownership,
                     clock: clock,
-                    deadline: deadline
+                    deadline: deadline,
+                    automaticRecoveryState: automaticRecoveryState
                 )
                 if let reason = retryableStaleReason(in: result.issues) {
                     lastStaleReason = reason
@@ -377,7 +419,8 @@ package struct WorkspaceCodemapPresentationCoordinator {
         logicalRootDisplayNamesByRootID: [UUID: String],
         ownership: WorkspaceCodemapOperationPresentationOwnership,
         clock: ContinuousClock,
-        deadline: ContinuousClock.Instant
+        deadline: ContinuousClock.Instant,
+        automaticRecoveryState: WorkspaceCodemapDemandRecoveryState?
     ) async throws -> WorkspaceCodemapOperationPresentation {
         let candidates: [WorkspaceCodemapOperationPresentationCandidate]
         var issues: [WorkspaceCodemapOperationIssue]
@@ -407,7 +450,8 @@ package struct WorkspaceCodemapPresentationCoordinator {
                 logicalRootDisplayNamesByRootID: logicalRootDisplayNamesByRootID,
                 ownership: ownership,
                 clock: clock,
-                deadline: deadline
+                deadline: deadline,
+                recoveryState: automaticRecoveryState
             )
             if let coverage = preparation.coverage {
                 return WorkspaceCodemapOperationPresentation(
@@ -456,8 +500,25 @@ package struct WorkspaceCodemapPresentationCoordinator {
             priority: .demand,
             ownership: ownership,
             clock: clock,
-            deadline: deadline
+            deadline: deadline,
+            recoveryState: automaticRecoveryState
         )
+        if !demandBatch.resetRootEpochs.isEmpty {
+            // An automatic candidate's demand reset its root session: the automatic receipt and the
+            // other candidates belong to the detached session. Report pending without restarting.
+            // Race-only in practice (candidate-phase ready targets join warm records); this drops
+            // other roots' ready entries for this call, and a later recount restores them.
+            let pendingReasons = demandBatch.resetRootEpochs
+                .sorted(by: workspaceCodemapRootEpochPrecedes)
+                .map { WorkspaceCodemapAutomaticSelectionPendingReason.graphRebuild(rootEpoch: $0) }
+            issues.append(.automatic(.pending(pendingReasons)))
+            return WorkspaceCodemapOperationPresentation(
+                orderedEntries: [],
+                coverage: .pending(issues),
+                issues: issues,
+                publicationReceipt: nil
+            )
+        }
         var requestsByRoot: [WorkspaceCodemapRootEpoch: [WorkspaceCodemapPresentationRequest]] = [:]
         for candidate in candidates {
             guard let result = demandBatch.resultsByFileID[candidate.fileID] else {
@@ -561,7 +622,8 @@ package struct WorkspaceCodemapPresentationCoordinator {
         logicalRootDisplayNamesByRootID: [UUID: String],
         ownership: WorkspaceCodemapOperationPresentationOwnership,
         clock: ContinuousClock,
-        deadline: ContinuousClock.Instant
+        deadline: ContinuousClock.Instant,
+        recoveryState: WorkspaceCodemapDemandRecoveryState?
     ) async throws -> AutomaticPreparation {
         let sourceCollection = await store.codemapOperationPresentationCandidates(
             forFileIDs: sourceFileIDs,
@@ -603,7 +665,8 @@ package struct WorkspaceCodemapPresentationCoordinator {
             priority: .demand,
             ownership: ownership,
             clock: clock,
-            deadline: deadline
+            deadline: deadline,
+            recoveryState: recoveryState
         )
         var readySources: [WorkspaceCodemapAutomaticSelectionSourceIdentity] = []
         var pendingReasons: [WorkspaceCodemapAutomaticSelectionPendingReason] = []
@@ -655,25 +718,52 @@ package struct WorkspaceCodemapPresentationCoordinator {
             by: \.rootEpoch
         )
         let projectionDeadline = projectionDeadlineUptimeNanoseconds(clock: clock, deadline: deadline)
+        var projectionStatuses: [ProjectionDemandStatusObservation] = []
         for rootEpoch in sourceTicketsByRoot.keys.sorted(by: workspaceCodemapRootEpochPrecedes) {
             let acquisition = await store.acquireCodemapProjectionDemand(
                 sourceTickets: sourceTicketsByRoot[rootEpoch] ?? [],
                 deadlineUptimeNanoseconds: projectionDeadline
             )
-            if case let .acquired(ticket, _) = acquisition {
+            if case let .acquired(ticket, status) = acquisition {
                 await ownership.record(ticket)
+                projectionStatuses.append(.init(ticket: ticket, status: status))
             }
         }
         var planDisposition: WorkspaceCodemapAutomaticSelectionCandidatePlanDisposition = .pending([])
         var provisionallyDemandedFileIDs = Set<UUID>()
         for round in 0 ..< policy.maximumReadinessRounds {
             try Task.checkCancellation()
+            // A projection run joined by this operation can latch a root-wide authority failure at
+            // acquisition or while planning waits. Round 0 uses the acquisition statuses; later
+            // rounds re-poll the acquired tickets after the backoff.
+            if let recoveryState {
+                if round > 0 {
+                    var refreshed: [ProjectionDemandStatusObservation] = []
+                    for observation in projectionStatuses {
+                        let status = await store.codemapProjectionDemandStatus(observation.ticket)
+                        refreshed.append(.init(ticket: observation.ticket, status: status))
+                    }
+                    projectionStatuses = refreshed
+                }
+                if let preparation = try await resetLatchedAutomaticProjectionSessions(
+                    projectionStatuses,
+                    ownership: ownership,
+                    recoveryState: recoveryState,
+                    deadline: deadline,
+                    pendingReasons: pendingReasons,
+                    issues: issues
+                ) {
+                    return preparation
+                }
+            }
             planDisposition = await store.planAutomaticCodemapSelectionCandidates(
                 sources: readySources,
                 rootScope: rootScope,
                 maximumCandidateDemandCount: policy.maximumCandidateDemandCount
             )
             if case let .provisional(provisional) = planDisposition {
+                var provisionalResults: [UUID: WorkspaceCodemapArtifactDemandResult] = [:]
+                var provisionalTickets: [UUID: WorkspaceCodemapArtifactDemandTicket] = [:]
                 for candidate in provisional.candidates
                     where !provisionallyDemandedFileIDs.contains(candidate.identity.fileID)
                 {
@@ -683,6 +773,8 @@ package struct WorkspaceCodemapPresentationCoordinator {
                         rootScopeEpochs: provisional.rootScopeEpochs
                     ) else { continue }
                     await ownership.record(owned)
+                    provisionalResults[candidate.identity.fileID] = owned.result
+                    provisionalTickets[candidate.identity.fileID] = ticket(from: owned)
                     switch owned.result {
                     case .ready, .pending:
                         provisionallyDemandedFileIDs.insert(candidate.identity.fileID)
@@ -690,6 +782,24 @@ package struct WorkspaceCodemapPresentationCoordinator {
                         break
                     case .unavailable:
                         provisionallyDemandedFileIDs.insert(candidate.identity.fileID)
+                    }
+                }
+                // A cold provisional candidate can be the first demand to observe the drift.
+                if let recoveryState {
+                    let resetRootEpochs = try await resetRejectedAutomaticCandidateSessions(
+                        candidates: provisional.candidates,
+                        results: provisionalResults,
+                        ticketsByFileID: provisionalTickets,
+                        ownership: ownership,
+                        recoveryState: recoveryState,
+                        deadline: deadline
+                    )
+                    if !resetRootEpochs.isEmpty {
+                        return rootResetAutomaticPreparation(
+                            resetRootEpochs: resetRootEpochs,
+                            pendingReasons: pendingReasons,
+                            issues: issues
+                        )
                     }
                 }
             }
@@ -723,8 +833,16 @@ package struct WorkspaceCodemapPresentationCoordinator {
                 rootScope: rootScope,
                 ownership: ownership,
                 clock: clock,
-                deadline: deadline
+                deadline: deadline,
+                recoveryState: recoveryState
             )
+            guard provisionalDemand.resetRootEpochs.isEmpty else {
+                return rootResetAutomaticPreparation(
+                    resetRootEpochs: provisionalDemand.resetRootEpochs,
+                    pendingReasons: pendingReasons,
+                    issues: issues
+                )
+            }
             let selection = await store.provisionalAutomaticCodemapSelectionResult(
                 sources: readySources,
                 plan: value,
@@ -809,12 +927,20 @@ package struct WorkspaceCodemapPresentationCoordinator {
             rootScope: rootScope,
             ownership: ownership,
             clock: clock,
-            deadline: deadline
+            deadline: deadline,
+            recoveryState: recoveryState
         ) else {
             let automaticCoverage = WorkspaceCodemapAutomaticSelectionAggregateCoverage
                 .stale(.publicationReceipt)
             issues.append(.automatic(automaticCoverage))
             return AutomaticPreparation(candidates: [], issues: issues, coverage: .unavailable(issues), receipt: nil)
+        }
+        guard candidateDemand.resetRootEpochs.isEmpty else {
+            return rootResetAutomaticPreparation(
+                resetRootEpochs: candidateDemand.resetRootEpochs.sorted(by: workspaceCodemapRootEpochPrecedes),
+                pendingReasons: pendingReasons,
+                issues: issues
+            )
         }
         var candidatePending: [WorkspaceCodemapAutomaticSelectionPendingReason] = []
         for candidate in plan.candidates {
@@ -959,6 +1085,104 @@ package struct WorkspaceCodemapPresentationCoordinator {
         return preparation
     }
 
+    /// Spends the operation's shared once-per-root reset for each acquired projection ticket whose
+    /// current session latched a reset-capable failure the recovery scope admits, in root order.
+    /// After any claimed reset (prepared, out of deadline, or superseded by a newer session) returns
+    /// a pending preparation without restarting: the replacement session's preload needs its own
+    /// run, and a later recount picks it up. Returns nil when no reset was claimed.
+    private func resetLatchedAutomaticProjectionSessions(
+        _ observations: [ProjectionDemandStatusObservation],
+        ownership: WorkspaceCodemapOperationPresentationOwnership,
+        recoveryState: WorkspaceCodemapDemandRecoveryState,
+        deadline: ContinuousClock.Instant,
+        pendingReasons: [WorkspaceCodemapAutomaticSelectionPendingReason],
+        issues: [WorkspaceCodemapOperationIssue]
+    ) async throws -> AutomaticPreparation? {
+        var resetRootEpochs: [WorkspaceCodemapRootEpoch] = []
+        resets: for observation in observations {
+            guard case let .unavailable(reason, _) = observation.status,
+                  let rejection = reason.rootSessionResetRejection
+            else { continue }
+            try Task.checkCancellation()
+            let ticket = observation.ticket
+            guard await ownership.owns(ticket),
+                  await recoveryState.claimRootSessionReset(rootEpoch: ticket.rootEpoch, rejection: rejection)
+            else { continue }
+            let preparation = await store.prepareCodemapProjectionRootSessionRetry(
+                ticket,
+                reason: reason,
+                deadline: deadline
+            )
+            switch preparation {
+            case .prepared, .stale, .deadlineReached:
+                resetRootEpochs.append(ticket.rootEpoch)
+            case .cancelled:
+                throw CancellationError()
+            }
+            if preparation == .deadlineReached { break resets }
+        }
+        guard !resetRootEpochs.isEmpty else { return nil }
+        return rootResetAutomaticPreparation(
+            resetRootEpochs: resetRootEpochs,
+            pendingReasons: pendingReasons,
+            issues: issues
+        )
+    }
+
+    /// Resets the root session for candidate demands whose fresh issuance observed a reset-capable
+    /// rejection the recovery scope admits, at most once per root, using the existing ticket-fenced
+    /// store preparation. The replacement demand stays owned so release keeps it warm. Returns the
+    /// roots whose reset this operation claimed; empty when none.
+    private func resetRejectedAutomaticCandidateSessions(
+        candidates: [WorkspaceCodemapBindingAutomaticSelectionCatalogCandidate],
+        results: [UUID: WorkspaceCodemapArtifactDemandResult],
+        ticketsByFileID: [UUID: WorkspaceCodemapArtifactDemandTicket],
+        ownership: WorkspaceCodemapOperationPresentationOwnership,
+        recoveryState: WorkspaceCodemapDemandRecoveryState,
+        deadline: ContinuousClock.Instant
+    ) async throws -> [WorkspaceCodemapRootEpoch] {
+        var resetRootEpochs: [WorkspaceCodemapRootEpoch] = []
+        for candidate in candidates {
+            let fileID = candidate.identity.fileID
+            guard case let .unavailable(.rejected(rejection)) = results[fileID],
+                  WorkspaceCodemapArtifactDemandRecovery(rejection) == .resetRootSession,
+                  let ticket = ticketsByFileID[fileID],
+                  !resetRootEpochs.contains(ticket.rootEpoch)
+            else { continue }
+            try Task.checkCancellation()
+            guard await ownership.owns(ticket),
+                  await recoveryState.claimRootSessionReset(rootEpoch: ticket.rootEpoch, rejection: rejection)
+            else { continue }
+            // `.background` matches every other automatic candidate (re)issuance (initial and busy
+            // retries); only seeds and exact paths use `.demand`.
+            if let repaired = await store.prepareCodemapRootSessionRetry(
+                ticket,
+                rejection: rejection,
+                priority: .background,
+                deadline: deadline
+            ) {
+                await ownership.replaceConsumed(ticket, with: repaired)
+            }
+            resetRootEpochs.append(ticket.rootEpoch)
+        }
+        return resetRootEpochs
+    }
+
+    /// Pending outcome after an automatic operation spent a root-session reset. Preparation is not
+    /// restarted within the call; a later recount works against the replacement session.
+    private func rootResetAutomaticPreparation(
+        resetRootEpochs: [WorkspaceCodemapRootEpoch],
+        pendingReasons existingPendingReasons: [WorkspaceCodemapAutomaticSelectionPendingReason],
+        issues existingIssues: [WorkspaceCodemapOperationIssue]
+    ) -> AutomaticPreparation {
+        var pendingReasons = existingPendingReasons
+        pendingReasons.append(contentsOf: resetRootEpochs.map { .graphRebuild(rootEpoch: $0) })
+        pendingReasons.sort(by: automaticSelectionPendingReasonPrecedes)
+        var issues = existingIssues
+        issues.append(.automatic(.pending(pendingReasons)))
+        return AutomaticPreparation(candidates: [], issues: issues, coverage: .pending(issues), receipt: nil)
+    }
+
     private func staleAutomaticPreparation(
         reason: WorkspaceCodemapAutomaticSelectionStaleReason = .publicationReceipt,
         issues existingIssues: [WorkspaceCodemapOperationIssue]
@@ -978,7 +1202,8 @@ package struct WorkspaceCodemapPresentationCoordinator {
         rootScope: WorkspaceLookupRootScope,
         ownership: WorkspaceCodemapOperationPresentationOwnership,
         clock: ContinuousClock,
-        deadline: ContinuousClock.Instant
+        deadline: ContinuousClock.Instant,
+        recoveryState: WorkspaceCodemapDemandRecoveryState?
     ) async throws -> ProvisionalDemandBatch {
         var candidates: [WorkspaceCodemapBindingAutomaticSelectionCatalogCandidate] = []
         var seen = Set<UUID>()
@@ -1036,6 +1261,24 @@ package struct WorkspaceCodemapPresentationCoordinator {
                     break
                 }
             }
+            if let recoveryState {
+                let resetRootEpochs = try await resetRejectedAutomaticCandidateSessions(
+                    candidates: candidates,
+                    results: results,
+                    ticketsByFileID: ticketsByFileID,
+                    ownership: ownership,
+                    recoveryState: recoveryState,
+                    deadline: deadline
+                )
+                if !resetRootEpochs.isEmpty {
+                    return ProvisionalDemandBatch(
+                        readyCandidates: [],
+                        pendingReasons: [],
+                        partialReasons: [],
+                        resetRootEpochs: resetRootEpochs
+                    )
+                }
+            }
             guard hasPending,
                   round + 1 < policy.maximumReadinessRounds,
                   clock.now < deadline
@@ -1050,12 +1293,14 @@ package struct WorkspaceCodemapPresentationCoordinator {
                 let fileID = candidate.identity.fileID
                 attemptsByFileID[fileID, default: 0] += 1
                 let result: WorkspaceCodemapArtifactDemandResult
+                let resultTicket: WorkspaceCodemapArtifactDemandTicket?
                 if let existingTicket, await ownership.owns(existingTicket) {
                     result = await store.retryBusyCodemapArtifactDemand(
                         existingTicket,
                         priority: .background
                     )
                     await ownership.replaceConsumed(existingTicket, with: result)
+                    resultTicket = ticket(from: result)
                 } else if let owned = await store.requestProvisionalAutomaticCodemapArtifactWithOwnership(
                     candidate: candidate,
                     rootScope: rootScope,
@@ -1063,12 +1308,15 @@ package struct WorkspaceCodemapPresentationCoordinator {
                 ) {
                     await ownership.record(owned)
                     result = owned.result
+                    // The owned ticket, as in the initial requests, so a later rejection can reset.
+                    resultTicket = ticket(from: owned)
                 } else {
                     // Ownership reacquisition only reports nil here; staleCurrentness is the conservative catch-all.
                     result = .unavailable(.staleCurrentness)
+                    resultTicket = nil
                 }
                 results[fileID] = result
-                ticketsByFileID[fileID] = ticket(from: result)
+                ticketsByFileID[fileID] = resultTicket
             }
         }
 
@@ -1106,7 +1354,8 @@ package struct WorkspaceCodemapPresentationCoordinator {
         return ProvisionalDemandBatch(
             readyCandidates: readyCandidates,
             pendingReasons: pendingReasons,
-            partialReasons: partialReasons
+            partialReasons: partialReasons,
+            resetRootEpochs: []
         )
     }
 
@@ -1115,7 +1364,8 @@ package struct WorkspaceCodemapPresentationCoordinator {
         rootScope: WorkspaceLookupRootScope,
         ownership: WorkspaceCodemapOperationPresentationOwnership,
         clock: ContinuousClock,
-        deadline: ContinuousClock.Instant
+        deadline: ContinuousClock.Instant,
+        recoveryState: WorkspaceCodemapDemandRecoveryState?
     ) async throws -> DemandBatch? {
         var candidates: [WorkspaceCodemapBindingAutomaticSelectionCatalogCandidate] = []
         var seen = Set<UUID>()
@@ -1159,6 +1409,27 @@ package struct WorkspaceCodemapPresentationCoordinator {
                     if let milliseconds { retryAfter.append(milliseconds) }
                 case .ready, .unavailable:
                     break
+                }
+            }
+            // A cold candidate can be the first demand to observe repository-authority drift (warm
+            // seeds and a completed projection issue no authority). Spend the operation's reset and
+            // stop: the plan and its coverage proofs belong to the detached session.
+            if let recoveryState {
+                let resetRootEpochs = try await resetRejectedAutomaticCandidateSessions(
+                    candidates: candidates,
+                    results: results,
+                    ticketsByFileID: ticketsByFileID,
+                    ownership: ownership,
+                    recoveryState: recoveryState,
+                    deadline: deadline
+                )
+                if !resetRootEpochs.isEmpty {
+                    return DemandBatch(
+                        resultsByFileID: results,
+                        resetRootEpochs: Set(resetRootEpochs),
+                        deadlineReached: clock.now >= deadline,
+                        defensiveRoundLimitReached: false
+                    )
                 }
             }
             guard hasPending,
@@ -1373,7 +1644,7 @@ package struct WorkspaceCodemapPresentationCoordinator {
                       await ownership.owns(existingTicket)
                 else { continue }
                 let recovery = WorkspaceCodemapArtifactDemandRecovery(rejection)
-                guard await recoveryState.claim(recovery, ticket: existingTicket) else {
+                guard await recoveryState.claim(rejection, ticket: existingTicket) else {
                     exhaustedRecoveryFileIDs.insert(fileID)
                     continue
                 }
