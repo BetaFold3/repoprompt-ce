@@ -387,10 +387,27 @@ actor WorkspaceCodemapBindingEngine {
     private var roots: [WorkspaceCodemapRootEpoch: RootRecord] = [:]
     private var activeRequests: [UUID: ActiveRequest] = [:]
     private var drainingRequestTasks: [UUID: Task<Void, Never>] = [:]
+    #if DEBUG
+        /// Runs inside an admitted request, after its artifact resolves and before the overlay
+        /// accepts it, so tests can hold admitted work deterministically.
+        private var beforeResolutionPublicationHookForTesting: (@Sendable (
+            WorkspaceCodemapRootEpoch,
+            String
+        ) async -> Void)?
+    #endif
     private var queuedRequests: [UUID: QueuedRequest] = [:]
     /// Lease or byte capacity refusal of a ready completion (artifact-store lease admission or
     /// overlay acceptance), by public owner, until the owner's caller takes it. `demand(_:)` cannot carry it without widening its result type.
     private var completionCapacityBusyByOwner: [WorkspaceCodemapLiveDemandOwner: WorkspaceCodemapCompletionCapacityBusy] = [:]
+    /// Owners whose admitted-aware release found nothing outstanding, by root. The owner's next
+    /// `demand(_:)` is rejected as cancelled instead of registering: it is a submission that lost
+    /// the race with the release and would otherwise run with no holder. Consumed by that
+    /// rejection; cleared by `cancel(owner:)`, `clearReleasedOwnerFence(_:)`, root unload, and
+    /// shutdown.
+    private var releasedOwnerFences: [WorkspaceCodemapLiveDemandOwner: WorkspaceCodemapRootEpoch] = [:]
+    #if DEBUG
+        private var releasedOwnerFenceRejectionCount = 0
+    #endif
     private var queueOrder: [UUID] = []
     private var nextQueueOrdinal: UInt64 = 1
     private var nextAdmissionOrdinal: UInt64 = 1
@@ -852,6 +869,12 @@ actor WorkspaceCodemapBindingEngine {
 
     func demand(_ demand: WorkspaceCodemapBindingDemand) async -> WorkspaceCodemapBindingDemandResult {
         completionCapacityBusyByOwner.removeValue(forKey: demand.owner)
+        if releasedOwnerFences.removeValue(forKey: demand.owner) != nil {
+            #if DEBUG
+                releasedOwnerFenceRejectionCount += 1
+            #endif
+            return .cancelled
+        }
         let requestID = UUID()
         let cancellation = DemandCancellationState()
         return await withTaskCancellationHandler {
@@ -985,6 +1008,7 @@ actor WorkspaceCodemapBindingEngine {
     @discardableResult
     func cancel(owner: WorkspaceCodemapLiveDemandOwner) async -> Int {
         completionCapacityBusyByOwner.removeValue(forKey: owner)
+        releasedOwnerFences.removeValue(forKey: owner)
         let requestIDs = queuedRequests.values
             .filter { $0.demand.owner == owner }
             .map(\.id) + activeRequests.values.filter { $0.publicOwner == owner }.map(\.id)
@@ -992,6 +1016,48 @@ actor WorkspaceCodemapBindingEngine {
         await cancelOverlayAssociations(cancellationBatch.overlayCancellations)
         recordCancellationTelemetry(cancellationBatch.cancelledRequestCount)
         return cancellationBatch.cancelledRequestCount
+    }
+
+    /// Releases an owner's demand without discarding admitted work. In one actor turn: queued
+    /// requests are cancelled (they hold no overlay demand, so nothing advances the contribution
+    /// generation) and an admitted request is left running to completion. Explicit cancellation
+    /// keeps using `cancel(owner:)`.
+    ///
+    /// With nothing outstanding the owner is fenced: its demand either already finished or has
+    /// not registered yet, and a later registration must not run unheld. The fence rejects the
+    /// owner's next `demand(_:)`; a finished result is unaffected.
+    func releaseOwnerKeepingAdmitted(
+        _ owner: WorkspaceCodemapLiveDemandOwner,
+        rootEpoch: WorkspaceCodemapRootEpoch
+    ) async -> WorkspaceCodemapOwnerReleaseDisposition {
+        let queuedRequestIDs = queuedRequests.values
+            .filter { $0.demand.owner == owner }
+            .map(\.id)
+        let hasAdmittedRequest = activeRequests.values.contains {
+            $0.publicOwner == owner && !$0.cancelled
+        }
+        guard !queuedRequestIDs.isEmpty || hasAdmittedRequest else {
+            releasedOwnerFences[owner] = rootEpoch
+            return .nothingOutstanding
+        }
+        let cancellationBatch = synchronouslyCancelRequests(queuedRequestIDs)
+        recordCancellationTelemetry(cancellationBatch.cancelledRequestCount)
+        let disposition: WorkspaceCodemapOwnerReleaseDisposition
+        if hasAdmittedRequest {
+            disposition = .admittedContinues
+        } else {
+            completionCapacityBusyByOwner.removeValue(forKey: owner)
+            disposition = .cancelledQueued
+        }
+        // Queued requests never reached overlay admission; this is empty in practice and runs
+        // after the decision above, so it cannot change it.
+        await cancelOverlayAssociations(cancellationBatch.overlayCancellations)
+        return disposition
+    }
+
+    /// Drops the owner's release fence once its holder knows no further submission will come.
+    func clearReleasedOwnerFence(_ owner: WorkspaceCodemapLiveDemandOwner) {
+        releasedOwnerFences.removeValue(forKey: owner)
     }
 
     @discardableResult
@@ -1049,6 +1115,7 @@ actor WorkspaceCodemapBindingEngine {
 
     func unloadRoot(rootEpoch: WorkspaceCodemapRootEpoch) async {
         revokeProjectionDemands(rootEpoch: rootEpoch, status: .cancelled)
+        releasedOwnerFences = releasedOwnerFences.filter { $0.value != rootEpoch }
         #if DEBUG
             debugCapabilityResolutionsByRootEpoch.removeValue(forKey: rootEpoch)
             debugRepositoryAuthorityChangesByRootEpoch.removeValue(forKey: rootEpoch)
@@ -1103,6 +1170,7 @@ actor WorkspaceCodemapBindingEngine {
         }
 
         isShuttingDown = true
+        releasedOwnerFences.removeAll()
         #if DEBUG
             for hold in debugProjectionAdmissionHolds.values {
                 hold.expiryTask.cancel()
@@ -1221,6 +1289,21 @@ actor WorkspaceCodemapBindingEngine {
 
         func overlayAccountingForTesting() async -> WorkspaceCodemapLiveOverlayAccounting {
             await overlay.accounting()
+        }
+
+        func overlayDemandEventCountsForTesting() async -> WorkspaceCodemapLiveOverlayDemandEventCounts {
+            await overlay.demandEventCountsForTesting()
+        }
+
+        /// Demands rejected by a release fence, and fences still standing.
+        func releasedOwnerFenceCountsForTesting() -> (rejections: Int, standing: Int) {
+            (releasedOwnerFenceRejectionCount, releasedOwnerFences.count)
+        }
+
+        func setBeforeResolutionPublicationHookForTesting(
+            _ hook: (@Sendable (WorkspaceCodemapRootEpoch, String) async -> Void)?
+        ) {
+            beforeResolutionPublicationHookForTesting = hook
         }
 
         func setArtifactStoreActiveLeaseCountLimitForTesting(_ maximumCount: Int?) async {
@@ -6232,6 +6315,14 @@ actor WorkspaceCodemapBindingEngine {
         isClean: Bool
     ) async throws -> WorkspaceCodemapBindingDemandResult {
         try Task.checkCancellation()
+        #if DEBUG
+            if let hook = beforeResolutionPublicationHookForTesting,
+               let gatedRequest = currentRequest(requestID)
+            {
+                await hook(gatedRequest.rootEpoch, gatedRequest.relativePath)
+                try Task.checkCancellation()
+            }
+        #endif
         guard let request = currentRequest(requestID) else { throw CancellationError() }
         if resolved.performedBuild {
             incrementCounter(\.builds)

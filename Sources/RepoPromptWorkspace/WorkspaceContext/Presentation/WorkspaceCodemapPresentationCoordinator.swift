@@ -313,7 +313,7 @@ package struct WorkspaceCodemapPresentationCoordinator {
                 )
                 if let reason = retryableStaleReason(in: result.issues) {
                     lastStaleReason = reason
-                    await release(ownership)
+                    await release(ownership, site: .staleRetry)
                     if attempt == 0, clock.now < deadline { continue }
                     let value = try await operation(incompletePublication(reason: reason))
                     try Task.checkCancellation()
@@ -323,7 +323,7 @@ package struct WorkspaceCodemapPresentationCoordinator {
                    result.publicationReceipt == nil,
                    result.orderedEntries.isEmpty
                 {
-                    await release(ownership)
+                    await release(ownership, site: .staleFallback)
                     let value = try await operation(incompletePublication(reason: reason))
                     try Task.checkCancellation()
                     return value
@@ -339,21 +339,29 @@ package struct WorkspaceCodemapPresentationCoordinator {
                     )
                     switch disposition {
                     case .current:
-                        await release(ownership)
+                        await release(
+                            ownership,
+                            keepingAdmittedWork: keepsAdmittedWorkOnCompletion(intent),
+                            site: .normalReturn
+                        )
                         return value
                     case let .stale(reason):
                         lastStaleReason = reason
-                        await release(ownership)
+                        await release(ownership, site: .revalidationStale)
                         if attempt == 0, clock.now < deadline { continue }
                         let fallbackValue = try await operation(incompletePublication(reason: reason))
                         try Task.checkCancellation()
                         return fallbackValue
                     }
                 }
-                await release(ownership)
+                await release(
+                    ownership,
+                    keepingAdmittedWork: keepsAdmittedWorkOnCompletion(intent),
+                    site: .normalReturn
+                )
                 return value
             } catch {
-                await release(ownership)
+                await release(ownership, site: .thrown)
                 if Task.isCancelled || error is CancellationError { throw CancellationError() }
                 throw error
             }
@@ -1630,8 +1638,32 @@ package struct WorkspaceCodemapPresentationCoordinator {
     /// still released; a timed-out wait leaves the shared cleanup running to completion.
     static let releaseCleanupWait: Duration = .milliseconds(250)
 
-    private func release(_ ownership: WorkspaceCodemapOperationPresentationOwnership) async {
+    /// Ordinary completion of optional automatic enrichment (including an expired readiness
+    /// wait) keeps engine-admitted demands running so their results park idle for the next
+    /// call; queued ones are still cancelled. Every other release cancels as before.
+    private func keepsAdmittedWorkOnCompletion(
+        _ intent: WorkspaceCodemapOperationPresentationIntent
+    ) -> Bool {
+        guard policy == .optionalAutomaticEnrichment,
+              case .automatic = intent,
+              !Task.isCancelled
+        else { return false }
+        return true
+    }
+
+    private func release(
+        _ ownership: WorkspaceCodemapOperationPresentationOwnership,
+        keepingAdmittedWork: Bool = false,
+        site: WorkspaceCodemapPresentationReleaseSite
+    ) async {
         let resources = await ownership.drain()
+        #if DEBUG
+            WorkspaceCodemapPresentationReleaseSiteCountsForTesting.record(
+                site,
+                keepingAdmittedWork: keepingAdmittedWork,
+                ticketCount: resources.tickets.count
+            )
+        #endif
         let deadline = ContinuousClock.now.advanced(by: Self.releaseCleanupWait)
         for ticket in resources.projectionTickets {
             _ = await store.releaseCodemapProjectionDemand(ticket, deadline: deadline)
@@ -1640,7 +1672,11 @@ package struct WorkspaceCodemapPresentationCoordinator {
             _ = await store.releaseCodemapPresentation(bundle)
         }
         for ticket in resources.tickets {
-            _ = await store.cancelCodemapArtifactDemand(ticket, deadline: deadline)
+            _ = await store.cancelCodemapArtifactDemand(
+                ticket,
+                deadline: deadline,
+                keepingAdmittedWork: keepingAdmittedWork
+            )
         }
     }
 
@@ -1915,7 +1951,7 @@ extension WorkspaceCodemapPresentationCoordinator {
         recordingInto trace: inout WorkspaceCodemapStructureDiagnosticTrace
     ) async {
         let started = trace.mark()
-        await release(ownership)
+        await release(ownership, site: .structure)
         trace.recordDuration(.cleanup, since: started)
     }
 
@@ -3052,3 +3088,75 @@ extension WorkspaceCodemapPresentationCoordinator {
         )
     }
 }
+
+/// The coordinator exits that release a presentation's ownership.
+enum WorkspaceCodemapPresentationReleaseSite {
+    /// `withPresentation` revalidated current, or had no publication receipt: the only sites
+    /// that opt in to keeping admitted work.
+    case normalReturn
+    /// A retryable stale issue in the presentation (retried once, then the fallback).
+    case staleRetry
+    /// A retry that produced nothing after an earlier stale attempt.
+    case staleFallback
+    /// Publication revalidation reported stale.
+    case revalidationStale
+    /// The operation or presentation threw.
+    case thrown
+    /// Any structure-query release.
+    case structure
+}
+
+#if DEBUG
+    /// Process-wide release counts by coordinator site; integers only.
+    package enum WorkspaceCodemapPresentationReleaseSiteCountsForTesting {
+        package struct Counts: Equatable {
+            package var optedInNormalReturns = 0
+            package var cancellingNormalReturns = 0
+            package var staleRetries = 0
+            package var staleFallbacks = 0
+            package var revalidationStales = 0
+            package var thrown = 0
+            package var structure = 0
+            /// Artifact-demand tickets released keeping admitted work, and released cancelling.
+            package var optedInTickets = 0
+            package var cancellingTickets = 0
+        }
+
+        private static let lock = NSLock()
+        private nonisolated(unsafe) static var counts = Counts()
+
+        package static func snapshot() -> Counts {
+            lock.withLock { counts }
+        }
+
+        static func record(
+            _ site: WorkspaceCodemapPresentationReleaseSite,
+            keepingAdmittedWork: Bool,
+            ticketCount: Int
+        ) {
+            lock.withLock {
+                switch site {
+                case .normalReturn where keepingAdmittedWork:
+                    counts.optedInNormalReturns += 1
+                case .normalReturn:
+                    counts.cancellingNormalReturns += 1
+                case .staleRetry:
+                    counts.staleRetries += 1
+                case .staleFallback:
+                    counts.staleFallbacks += 1
+                case .revalidationStale:
+                    counts.revalidationStales += 1
+                case .thrown:
+                    counts.thrown += 1
+                case .structure:
+                    counts.structure += 1
+                }
+                if keepingAdmittedWork {
+                    counts.optedInTickets += ticketCount
+                } else {
+                    counts.cancellingTickets += ticketCount
+                }
+            }
+        }
+    }
+#endif

@@ -634,6 +634,16 @@ struct WorkspaceCodemapBindingEngineHooks {
     static let none = WorkspaceCodemapBindingEngineHooks()
 }
 
+/// What `releaseOwnerKeepingAdmitted` did with an owner's outstanding demand.
+enum WorkspaceCodemapOwnerReleaseDisposition: Equatable {
+    /// Queued request(s) were cancelled; nothing was admitted.
+    case cancelledQueued
+    /// An admitted request keeps running to completion; nothing admitted was cancelled.
+    case admittedContinues
+    /// The owner had no queued or admitted request.
+    case nothingOutstanding
+}
+
 struct WorkspaceCodemapBindingEngineCounters: Equatable {
     var capabilityResolutions: UInt64 = 0
     var capabilityRetries: UInt64 = 0

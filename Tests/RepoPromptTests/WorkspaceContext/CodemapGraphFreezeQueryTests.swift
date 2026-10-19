@@ -2093,7 +2093,16 @@ final class CodemapGraphFreezeQueryTests: WorkspaceFileContextStoreCodemapSeamTe
         let clock = ContinuousClock()
         let settleDeadline = clock.now.advanced(by: .seconds(10))
         var settled = await store.queryCodemapStructureGraph(structureQuery)
-        while case .pending = settled, clock.now < settleDeadline {
+        /// The readiness states the structure coordinator waits through: the root's projection
+        /// preload may not have finished, which the store reports as a typed `definitionUniverse`
+        /// unavailability rather than partial structure.
+        func awaitsReadiness(_ disposition: WorkspaceCodemapStructureTraversalDisposition) -> Bool {
+            switch disposition {
+            case .pending, .unavailable(.graphNotBuilt), .unavailable(.definitionUniverse): true
+            default: false
+            }
+        }
+        while awaitsReadiness(settled), clock.now < settleDeadline {
             try await Task.sleep(for: .milliseconds(10))
             settled = await store.queryCodemapStructureGraph(structureQuery)
         }
@@ -2488,6 +2497,763 @@ final class CodemapGraphFreezeQueryTests: WorkspaceFileContextStoreCodemapSeamTe
         _ = await storeB.cancelCodemapArtifactDemand(ticketB1)
         await storeA.unloadRoot(id: loadedA.id)
         await storeB.unloadRoot(id: loadedB.id)
+    }
+
+    // MARK: Step 1b: optional automatic releases keep admitted work
+
+    /// Step 1b V1: the engine's admitted-aware release cancels a queued request, leaves an
+    /// admitted request running (repeatably), and reports an owner with nothing outstanding.
+    func testReleaseOwnerKeepingAdmittedReportsQueuedAdmittedAndNothingOutstanding() async throws {
+        let harness = try await makeKeptWorkHarness(name: #function, files: ["A", "B"], materializationLimit: 1)
+        let store = harness.store
+        let ticketA = try await pendingTicket(store.requestCodemapArtifact(forFileID: harness.id("A")))
+        try await harness.gate.waitUntilEntered(harness.path("A"))
+        let ticketB = try await pendingTicket(store.requestCodemapArtifact(forFileID: harness.id("B")))
+        try await harness.waitForEngine(active: 1, queued: 1)
+        let generationBefore = await harness.generation()
+
+        let queued = await store.codemapReleaseOwnerKeepingAdmittedForTesting(ticketB)
+        XCTAssertEqual(queued, .cancelledQueued)
+        try await harness.waitForEngine(active: 1, queued: 0)
+        let admitted = await store.codemapReleaseOwnerKeepingAdmittedForTesting(ticketA)
+        XCTAssertEqual(admitted, .admittedContinues)
+        let admittedAgain = await store.codemapReleaseOwnerKeepingAdmittedForTesting(ticketA)
+        XCTAssertEqual(admittedAgain, .admittedContinues, "The admitted request keeps running")
+        try await harness.waitForEngine(active: 1, queued: 0)
+        let generationAfterReleases = await harness.generation()
+        XCTAssertEqual(generationAfterReleases, generationBefore, "Neither disposition changes the overlay")
+
+        let resultB = try await settledResult(store: store, ticket: ticketB)
+        guard case .unavailable = resultB else {
+            return XCTFail("The cancelled queued request must not become ready; got \(resultB)")
+        }
+        let nothing = await store.codemapReleaseOwnerKeepingAdmittedForTesting(ticketB)
+        XCTAssertEqual(nothing, .nothingOutstanding)
+
+        harness.gate.open()
+        _ = try await readyResult(settledResult(store: store, ticket: ticketA))
+        _ = await store.cancelCodemapArtifactDemand(ticketA)
+        _ = await store.cancelCodemapArtifactDemand(ticketB)
+        await store.unloadRoot(id: harness.rootID)
+    }
+
+    /// Step 1b V2: the last holder's opted-in release of an admitted demand leaves it running as an
+    /// orphan. It completes, parks idle as one begin plus one accept (generation +2, no `.modified`
+    /// shadow from a last-owner cancel), and a re-request rejoins it with no new demand.
+    func testOrphanedAdmittedDemandParksIdleAndRejoinsWithoutNewDemand() async throws {
+        let harness = try await makeKeptWorkHarness(name: #function, files: ["X"])
+        let store = harness.store
+        let initialGeneration = await harness.generation()
+        let generationBefore = try XCTUnwrap(initialGeneration)
+        let ticket = try await pendingTicket(store.requestCodemapArtifact(forFileID: harness.id("X")))
+        try await harness.gate.waitUntilEntered(harness.path("X"))
+        let flowBefore = await store.codemapDemandFlowCountsForTesting()
+
+        let released = await store.cancelCodemapArtifactDemand(ticket, keepingAdmittedWork: true)
+        XCTAssertTrue(released)
+        let flowReleased = await store.codemapDemandFlowCountsForTesting()
+        XCTAssertEqual(flowReleased.releasedOrphaned - flowBefore.releasedOrphaned, 1)
+        XCTAssertEqual(flowReleased.pendingLastHolderCancels, flowBefore.pendingLastHolderCancels)
+        let retainCount = await store.codemapArtifactDemandRetainCountForTesting(ticket)
+        XCTAssertEqual(retainCount, 0)
+        let present = await store.codemapArtifactDemandCleanupSnapshotForTesting(ticket).demandRecordPresent
+        XCTAssertTrue(present, "The orphan's record stays while its admitted work runs")
+        try await harness.waitForEngine(active: 1, queued: 0)
+
+        harness.gate.open()
+        try await AsyncTestWait.waitUntil("orphan parked idle", timeout: 30) {
+            await store.codemapIdleReadyDemandFileIDsForTesting(rootEpoch: harness.rootEpoch)
+                .contains(harness.id("X"))
+        }
+        let flowParked = await store.codemapDemandFlowCountsForTesting()
+        XCTAssertEqual(flowParked.releasedParked - flowBefore.releasedParked, 1)
+        let parkedGeneration = await harness.generation()
+        let generationParked = try XCTUnwrap(parkedGeneration)
+        XCTAssertEqual(generationParked.rawValue - generationBefore.rawValue, 2, "One begin and one accept")
+        let shadows = await store.codemapOverlayRootAccountingForTesting(rootEpoch: harness.rootEpoch)?
+            .shadowEntryCount
+        XCTAssertEqual(shadows, 0, "No last-owner cancel left a .modified shadow")
+
+        let rejoined = try await readyResult(store.requestCodemapArtifact(forFileID: harness.id("X")))
+        XCTAssertEqual(rejoined.ticket.requestID, ticket.requestID)
+        let flowRejoined = await store.codemapDemandFlowCountsForTesting()
+        XCTAssertEqual(flowRejoined.freshDemands, flowParked.freshDemands, "Rejoining starts no demand")
+        XCTAssertEqual(flowRejoined.idleReadyRejoins - flowParked.idleReadyRejoins, 1)
+        let generationRejoined = await harness.generation()
+        XCTAssertEqual(generationRejoined, generationParked)
+        _ = await store.cancelCodemapArtifactDemand(rejoined.ticket)
+        await store.unloadRoot(id: harness.rootID)
+    }
+
+    /// Step 1b V3: an opted-in release of a demand the engine has only queued cancels it with no
+    /// overlay begin, last-owner cancel, or contribution advance; the next request starts fresh.
+    func testQueuedDemandReleasedKeepingAdmittedWorkCancelsWithoutOverlayChange() async throws {
+        let harness = try await makeKeptWorkHarness(name: #function, files: ["A", "B"], materializationLimit: 1)
+        let store = harness.store
+        let ticketA = try await pendingTicket(store.requestCodemapArtifact(forFileID: harness.id("A")))
+        try await harness.gate.waitUntilEntered(harness.path("A"))
+        let ticketB = try await pendingTicket(store.requestCodemapArtifact(forFileID: harness.id("B")))
+        try await harness.waitForEngine(active: 1, queued: 1)
+        let generationBefore = await harness.generation()
+        let initialEvents = await store.codemapOverlayDemandEventCountsForTesting(rootEpoch: harness.rootEpoch)
+        let eventsBefore = try XCTUnwrap(initialEvents)
+        let flowBefore = await store.codemapDemandFlowCountsForTesting()
+
+        let released = await store.cancelCodemapArtifactDemand(ticketB, keepingAdmittedWork: true)
+        XCTAssertTrue(released)
+        let flowAfter = await store.codemapDemandFlowCountsForTesting()
+        XCTAssertEqual(flowAfter.releasedDroppedCancelledQueued - flowBefore.releasedDroppedCancelledQueued, 1)
+        XCTAssertEqual(flowAfter.releasedOrphaned, flowBefore.releasedOrphaned)
+        try await AsyncTestWait.waitUntil("cancelled queued record removed", timeout: 10) {
+            await !store.codemapArtifactDemandCleanupSnapshotForTesting(ticketB).demandRecordPresent
+        }
+        try await harness.waitForEngine(active: 1, queued: 0)
+        let generationAfter = await harness.generation()
+        XCTAssertEqual(generationAfter, generationBefore, "A queued cancel does not advance the overlay")
+        let finalEvents = await store.codemapOverlayDemandEventCountsForTesting(rootEpoch: harness.rootEpoch)
+        let eventsAfter = try XCTUnwrap(finalEvents)
+        XCTAssertEqual(eventsAfter.begins, eventsBefore.begins)
+        XCTAssertEqual(eventsAfter.lastOwnerCancels, eventsBefore.lastOwnerCancels)
+        XCTAssertEqual(eventsAfter.contributionAdvances, eventsBefore.contributionAdvances)
+
+        harness.gate.open()
+        _ = try await readyResult(settledResult(store: store, ticket: ticketA))
+        let fresh = try await readyArtifactDemand(store: store, forFileID: harness.id("B"))
+        XCTAssertNotEqual(fresh.ticket.requestID, ticketB.requestID)
+        _ = await store.cancelCodemapArtifactDemand(ticketA)
+        _ = await store.cancelCodemapArtifactDemand(fresh.ticket)
+        await store.unloadRoot(id: harness.rootID)
+    }
+
+    /// Step 1b V5: an orphan whose file changes before it completes is dropped with the path
+    /// invalidation; it never parks, and the next request is a fresh demand rather than a join.
+    func testOrphanDroppedWhenItsFileChangesBeforeCompletionAndNextRequestStartsFresh() async throws {
+        let harness = try await makeKeptWorkHarness(name: #function, files: ["X"])
+        let store = harness.store
+        let ticket = try await pendingTicket(store.requestCodemapArtifact(forFileID: harness.id("X")))
+        try await harness.gate.waitUntilEntered(harness.path("X"))
+        _ = await store.cancelCodemapArtifactDemand(ticket, keepingAdmittedWork: true)
+        let flowBefore = await store.codemapDemandFlowCountsForTesting()
+        XCTAssertEqual(flowBefore.releasedOrphaned, 1)
+
+        try Self.write("struct X { let changed = true }\n", to: harness.root.appendingPathComponent(harness.path("X")))
+        await store.replayObservedFileSystemDeltas(
+            rootID: harness.rootID,
+            deltas: [.fileModified(harness.path("X"), nil)]
+        )
+        try await AsyncTestWait.waitUntil("changed orphan dropped", timeout: 10) {
+            await !store.codemapArtifactDemandCleanupSnapshotForTesting(ticket).demandRecordPresent
+        }
+        harness.gate.open()
+        let fresh = try await readyArtifactDemand(store: store, forFileID: harness.id("X"))
+        XCTAssertNotEqual(fresh.ticket.requestID, ticket.requestID)
+        let flowAfter = await store.codemapDemandFlowCountsForTesting()
+        XCTAssertEqual(flowAfter.pendingJoins, flowBefore.pendingJoins, "Nothing joined the dead orphan")
+        XCTAssertEqual(flowAfter.releasedParked, flowBefore.releasedParked, "The dead orphan never parked")
+        let idle = await store.codemapIdleReadyDemandFileIDsForTesting(rootEpoch: harness.rootEpoch)
+        XCTAssertFalse(idle.contains(harness.id("X")))
+        _ = await store.cancelCodemapArtifactDemand(fresh.ticket)
+        await store.unloadRoot(id: harness.rootID)
+    }
+
+    /// Step 1b V5 (authority): an orphan whose root authority changes before it completes is
+    /// detached with the session; nothing joins it, and the file's next demand is fresh.
+    func testOrphanDroppedWhenRootAuthorityChangesBeforeCompletion() async throws {
+        let harness = try await makeKeptWorkHarness(name: #function, files: ["X"])
+        let store = harness.store
+        let ticket = try await pendingTicket(store.requestCodemapArtifact(forFileID: harness.id("X")))
+        try await harness.gate.waitUntilEntered(harness.path("X"))
+        _ = await store.cancelCodemapArtifactDemand(ticket, keepingAdmittedWork: true)
+        let flowBefore = await store.codemapDemandFlowCountsForTesting()
+
+        // A repository-authority mutation detaches the root's codemap session, and its cleanup
+        // waits for the cancelled work to drain, so it runs while the gate is still closed.
+        let fence = Task { await store.fenceCodemapAuthorityForRepositoryAuthorityMutation(rootIDs: [harness.rootID]) }
+        try await AsyncTestWait.waitUntil("dead orphan dropped", timeout: 10) {
+            await !store.codemapArtifactDemandCleanupSnapshotForTesting(ticket).demandRecordPresent
+        }
+        let next = await store.requestCodemapArtifact(forFileID: harness.id("X"))
+        if case let .pending(nextTicket) = next {
+            XCTAssertNotEqual(nextTicket.requestID, ticket.requestID, "Nothing may join the dead orphan")
+            _ = await store.cancelCodemapArtifactDemand(nextTicket)
+        } else if case let .ready(ready) = next {
+            XCTFail("The dead orphan must not be reused; got ready \(ready.ticket)")
+        } else {
+            XCTFail("Expected a fresh pending demand while the authority fence drains; got \(next)")
+        }
+        harness.gate.open()
+        await fence.value
+        let fresh = try await readyArtifactDemand(store: store, forFileID: harness.id("X"))
+        XCTAssertNotEqual(fresh.ticket.requestID, ticket.requestID)
+        let flowAfter = await store.codemapDemandFlowCountsForTesting()
+        XCTAssertEqual(flowAfter.pendingJoins, flowBefore.pendingJoins, "Nothing joined the dead orphan")
+        XCTAssertEqual(flowAfter.releasedParked, flowBefore.releasedParked, "The dead orphan never parked")
+        _ = await store.cancelCodemapArtifactDemand(fresh.ticket)
+        await store.unloadRoot(id: harness.rootID)
+    }
+
+    /// Step 1b V6: an orphan that completes into a full overlay lease budget does not evict idle
+    /// records for capacity (only a held requester may); it settles busy and is dropped.
+    func testOrphanAtLeaseLimitDropsWithoutEvictingIdleRecords() async throws {
+        let harness = try await makeKeptWorkHarness(name: #function, files: ["A", "C"])
+        let store = harness.store
+        let policySet = await store.setCodemapOverlayPolicyForTesting(
+            rootEpoch: harness.rootEpoch,
+            policy: WorkspaceCodemapLiveOverlayPolicy(maximumLeaseCountPerRoot: 2)
+        )
+        XCTAssertTrue(policySet)
+        addTeardownBlock {
+            await store.setCodemapOverlayPolicyForTesting(rootEpoch: harness.rootEpoch, policy: .default)
+        }
+        harness.gate.open()
+        let demandA = try await readyArtifactDemand(store: store, forFileID: harness.id("A"))
+        _ = await store.cancelCodemapArtifactDemand(demandA.ticket)
+        harness.gate.close()
+        let idleBefore = await store.codemapIdleReadyDemandFileIDsForTesting(rootEpoch: harness.rootEpoch)
+        XCTAssertEqual(idleBefore, [harness.id("Prime"), harness.id("A")])
+        let leasesBefore = await store.codemapOverlayRootAccountingForTesting(rootEpoch: harness.rootEpoch)?.leaseCount
+        XCTAssertEqual(leasesBefore, 2, "The idle records fill the lease budget")
+        let evictionsBefore = await store.codemapIdleReadyDemandEvictionCountForTesting()
+
+        let ticketC = try await pendingTicket(store.requestCodemapArtifact(forFileID: harness.id("C")))
+        try await harness.gate.waitUntilEntered(harness.path("C"))
+        let flowBefore = await store.codemapDemandFlowCountsForTesting()
+        _ = await store.cancelCodemapArtifactDemand(ticketC, keepingAdmittedWork: true)
+        harness.gate.open()
+        try await AsyncTestWait.waitUntil("orphan dropped busy", timeout: 30) {
+            await store.codemapDemandFlowCountsForTesting().releasedDroppedBusy > flowBefore.releasedDroppedBusy
+        }
+        let present = await store.codemapArtifactDemandCleanupSnapshotForTesting(ticketC).demandRecordPresent
+        XCTAssertFalse(present)
+        let evictionsAfter = await store.codemapIdleReadyDemandEvictionCountForTesting()
+        XCTAssertEqual(evictionsAfter, evictionsBefore, "An unretained requester never evicts for capacity")
+        let idleAfter = await store.codemapIdleReadyDemandFileIDsForTesting(rootEpoch: harness.rootEpoch)
+        XCTAssertEqual(idleAfter, idleBefore)
+        let flowAfter = await store.codemapDemandFlowCountsForTesting()
+        XCTAssertEqual(flowAfter.releasedParked, flowBefore.releasedParked)
+        await store.unloadRoot(id: harness.rootID)
+    }
+
+    /// Step 1b V7 (queued): a request arriving while an opted-in release is still resolving waits
+    /// for it. The resolution cancels the queued demand, and the joiner gets a fresh demand,
+    /// never the cancelled one.
+    func testJoinerDuringQueuedReleaseResolutionStartsFreshInsteadOfCancelled() async throws {
+        let harness = try await makeKeptWorkHarness(name: #function, files: ["A", "B"], materializationLimit: 1)
+        let store = harness.store
+        let ticketA = try await pendingTicket(store.requestCodemapArtifact(forFileID: harness.id("A")))
+        try await harness.gate.waitUntilEntered(harness.path("A"))
+        let ticketB = try await pendingTicket(store.requestCodemapArtifact(forFileID: harness.id("B")))
+        try await harness.waitForEngine(active: 1, queued: 1)
+        let resolutionGate = CodemapSuspensionGate()
+        await store.setCodemapReleaseResolutionHookForTesting { _ in await resolutionGate.enterAndWait() }
+        addTeardownBlock { resolutionGate.release() }
+        let flowBefore = await store.codemapDemandFlowCountsForTesting()
+
+        let release = Task { await store.cancelCodemapArtifactDemand(ticketB, keepingAdmittedWork: true) }
+        await resolutionGate.waitUntilEntered()
+        let joiner = Task { await store.requestCodemapArtifact(forFileID: harness.id("B")) }
+        try await AsyncTestWait.waitUntil("joiner waits on the resolution", timeout: 10) {
+            await store.codemapDemandFlowCountsForTesting().releaseResolutionFenceWaits >
+                flowBefore.releaseResolutionFenceWaits
+        }
+        resolutionGate.release()
+        let released = await release.value
+        XCTAssertTrue(released)
+        let joined = await joiner.value
+        let joinedTicket = try pendingTicket(joined)
+        XCTAssertNotEqual(joinedTicket.requestID, ticketB.requestID, "The joiner gets a fresh demand")
+        let flowAfter = await store.codemapDemandFlowCountsForTesting()
+        XCTAssertEqual(flowAfter.releasedDroppedCancelledQueued - flowBefore.releasedDroppedCancelledQueued, 1)
+        XCTAssertEqual(flowAfter.pendingJoins, flowBefore.pendingJoins)
+
+        harness.gate.open()
+        _ = try await readyResult(settledResult(store: store, ticket: ticketA))
+        _ = try await readyResult(settledResult(store: store, ticket: joinedTicket))
+        _ = await store.cancelCodemapArtifactDemand(ticketA)
+        _ = await store.cancelCodemapArtifactDemand(joinedTicket)
+        await store.unloadRoot(id: harness.rootID)
+    }
+
+    /// Step 1b V7 (admitted): a request arriving while an opted-in release of an admitted demand is
+    /// resolving waits for it, then joins the still-running work and receives its ready result.
+    func testJoinerDuringAdmittedReleaseResolutionJoinsRunningWork() async throws {
+        let harness = try await makeKeptWorkHarness(name: #function, files: ["X"])
+        let store = harness.store
+        let ticket = try await pendingTicket(store.requestCodemapArtifact(forFileID: harness.id("X")))
+        try await harness.gate.waitUntilEntered(harness.path("X"))
+        let resolutionGate = CodemapSuspensionGate()
+        await store.setCodemapReleaseResolutionHookForTesting { _ in await resolutionGate.enterAndWait() }
+        addTeardownBlock { resolutionGate.release() }
+        let flowBefore = await store.codemapDemandFlowCountsForTesting()
+
+        let release = Task { await store.cancelCodemapArtifactDemand(ticket, keepingAdmittedWork: true) }
+        await resolutionGate.waitUntilEntered()
+        let joiner = Task { await store.requestCodemapArtifact(forFileID: harness.id("X")) }
+        try await AsyncTestWait.waitUntil("joiner waits on the resolution", timeout: 10) {
+            await store.codemapDemandFlowCountsForTesting().releaseResolutionFenceWaits >
+                flowBefore.releaseResolutionFenceWaits
+        }
+        resolutionGate.release()
+        _ = await release.value
+        let joinedTicket = try await pendingTicket(joiner.value)
+        XCTAssertEqual(joinedTicket.requestID, ticket.requestID, "The joiner joins the running work")
+        XCTAssertNotEqual(joinedTicket.retainID, ticket.retainID)
+        let flowJoined = await store.codemapDemandFlowCountsForTesting()
+        XCTAssertEqual(flowJoined.releasedOrphaned - flowBefore.releasedOrphaned, 1)
+        XCTAssertEqual(flowJoined.pendingJoins - flowBefore.pendingJoins, 1)
+
+        harness.gate.open()
+        let ready = try await readyResult(settledResult(store: store, ticket: joinedTicket))
+        XCTAssertEqual(ready.ticket.retainID, joinedTicket.retainID)
+        let flowReady = await store.codemapDemandFlowCountsForTesting()
+        XCTAssertEqual(flowReady.releasedParked, flowBefore.releasedParked, "A rejoined orphan is held, not parked")
+        let idle = await store.codemapIdleReadyDemandFileIDsForTesting(rootEpoch: harness.rootEpoch)
+        XCTAssertFalse(idle.contains(harness.id("X")))
+        _ = await store.cancelCodemapArtifactDemand(joinedTicket)
+        await store.unloadRoot(id: harness.rootID)
+    }
+
+    /// Step 1b V8 (root release): unloading the root while an orphan's admitted work is in
+    /// flight leaves no demand record behind once the work finishes.
+    func testRootUnloadWithOrphanInFlightLeavesNoRecords() async throws {
+        let harness = try await makeKeptWorkHarness(name: #function, files: ["X"])
+        let store = harness.store
+        let ticket = try await pendingTicket(store.requestCodemapArtifact(forFileID: harness.id("X")))
+        try await harness.gate.waitUntilEntered(harness.path("X"))
+        _ = await store.cancelCodemapArtifactDemand(ticket, keepingAdmittedWork: true)
+        let inFlight = await store.codemapBindingEngineAccountingForTesting(rootID: harness.rootID)
+        let accounting = try XCTUnwrap(inFlight, "The root's engine exists before the unload")
+        XCTAssertEqual(accounting.activeRequestCount, 1, "The orphan's admitted work is in flight")
+        let finishedBefore = await store.codemapDemandFlowCountsForTesting().demandTasksFinished
+
+        await store.unloadRoot(id: harness.rootID)
+        harness.gate.open()
+        // The orphan's engine request went through the gate, and its store demand task ended.
+        try await harness.gate.waitUntilPassed(harness.path("X"))
+        try await AsyncTestWait.waitUntil("orphan's demand task ended", timeout: 10) {
+            await store.codemapDemandFlowCountsForTesting().demandTasksFinished > finishedBefore
+        }
+        let present = await store.codemapArtifactDemandCleanupSnapshotForTesting(ticket).demandRecordPresent
+        XCTAssertFalse(present)
+        let idle = await store.codemapIdleReadyDemandFileIDsForTesting(rootEpoch: harness.rootEpoch)
+        XCTAssertTrue(idle.isEmpty)
+    }
+
+    /// Step 1b V8 (shutdown): shutting the engine down while an orphan's admitted work is parked
+    /// resolves it cancelled, and the orphan's record is dropped rather than parked.
+    func testEngineShutdownWithOrphanInFlightLeavesNoRecords() async throws {
+        let harness = try await makeKeptWorkHarness(name: #function, files: ["X"])
+        let store = harness.store
+        let ticket = try await pendingTicket(store.requestCodemapArtifact(forFileID: harness.id("X")))
+        try await harness.gate.waitUntilEntered(harness.path("X"))
+        _ = await store.cancelCodemapArtifactDemand(ticket, keepingAdmittedWork: true)
+        let flowBefore = await store.codemapDemandFlowCountsForTesting()
+
+        let shutdown = Task { await harness.fixture.shutdown() }
+        try await AsyncTestWait.waitUntil("orphan dropped on shutdown", timeout: 10) {
+            await !store.codemapArtifactDemandCleanupSnapshotForTesting(ticket).demandRecordPresent
+        }
+        harness.gate.open()
+        await shutdown.value
+        let flowAfter = await store.codemapDemandFlowCountsForTesting()
+        XCTAssertEqual(flowAfter.releasedParked, flowBefore.releasedParked)
+        let idle = await store.codemapIdleReadyDemandFileIDsForTesting(rootEpoch: harness.rootEpoch)
+        XCTAssertFalse(idle.contains(harness.id("X")))
+        await store.unloadRoot(id: harness.rootID)
+    }
+
+    /// Step 1b V9: releasing many demands at once keeps at most the engine's admitted count (C)
+    /// running as orphans; every queued one is cancelled, and only the orphans park.
+    func testLargeKeptWorkReleaseLeavesAtMostAdmittedCountOrphans() async throws {
+        let names = ["A", "B", "C", "D", "E", "F"]
+        let admissionLimit = 2
+        let harness = try await makeKeptWorkHarness(
+            name: #function,
+            files: names,
+            materializationLimit: admissionLimit
+        )
+        let store = harness.store
+        var tickets: [WorkspaceCodemapArtifactDemandTicket] = []
+        for name in names {
+            try await tickets.append(pendingTicket(store.requestCodemapArtifact(forFileID: harness.id(name))))
+        }
+        try await harness.waitForEngine(active: admissionLimit, queued: names.count - admissionLimit)
+        let flowBefore = await store.codemapDemandFlowCountsForTesting()
+
+        for ticket in tickets {
+            _ = await store.cancelCodemapArtifactDemand(ticket, keepingAdmittedWork: true)
+        }
+        let flowReleased = await store.codemapDemandFlowCountsForTesting()
+        XCTAssertEqual(flowReleased.releasedOrphaned - flowBefore.releasedOrphaned, admissionLimit)
+        XCTAssertEqual(
+            flowReleased.releasedDroppedCancelledQueued - flowBefore.releasedDroppedCancelledQueued,
+            names.count - admissionLimit
+        )
+        try await harness.waitForEngine(active: admissionLimit, queued: 0)
+
+        harness.gate.open()
+        try await AsyncTestWait.waitUntil("orphans parked", timeout: 30) {
+            await store.codemapIdleReadyDemandFileIDsForTesting(rootEpoch: harness.rootEpoch).count ==
+                1 + admissionLimit
+        }
+        try await harness.waitForEngine(active: 0, queued: 0)
+        let flowParked = await store.codemapDemandFlowCountsForTesting()
+        XCTAssertEqual(flowParked.releasedParked - flowBefore.releasedParked, admissionLimit)
+        var recordCount = 0
+        for ticket in tickets where await store.codemapArtifactDemandCleanupSnapshotForTesting(ticket).demandRecordPresent {
+            recordCount += 1
+        }
+        XCTAssertEqual(recordCount, admissionLimit, "Only the admitted orphans keep records")
+        XCTAssertEqual(harness.gate.entered.count, admissionLimit, "No cancelled queued request ran")
+        await store.unloadRoot(id: harness.rootID)
+    }
+
+    /// Step 1b fix 1 (S1B-01): a demand released after its pre-submit check but before the engine
+    /// registers it finds nothing outstanding. The engine fences the owner, so the late
+    /// submission is rejected as cancelled instead of running with no holder, and the orphan is
+    /// dropped. The pre-submit guard is not involved: it ran before the release.
+    func testReleaseBeforeEngineRegistrationFencesTheLateSubmission() async throws {
+        let harness = try await makeKeptWorkHarness(name: #function, files: ["X"])
+        let store = harness.store
+        let fileID = harness.id("X")
+        let submission = CodemapSuspensionGate()
+        let submissions = CodemapLockedCounter()
+        await store.setCodemapBeforeEngineSubmissionHookForTesting { ticket in
+            guard ticket.fileID == fileID, submissions.incrementAndGet() == 1 else { return }
+            await submission.enterAndWait()
+        }
+        addTeardownBlock { submission.release() }
+        let ticket = try await pendingTicket(store.requestCodemapArtifact(forFileID: fileID))
+        await submission.waitUntilEntered()
+        let flowBefore = await store.codemapDemandFlowCountsForTesting()
+        let initialFences = await store.codemapBindingEngineReleasedOwnerFenceCountsForTesting(
+            rootEpoch: harness.rootEpoch
+        )
+        let fencesBefore = try XCTUnwrap(initialFences)
+
+        let released = await store.cancelCodemapArtifactDemand(ticket, keepingAdmittedWork: true)
+        XCTAssertTrue(released)
+        try await harness.waitForEngine(active: 0, queued: 0)
+        let presentWhileHeld = await store.codemapArtifactDemandCleanupSnapshotForTesting(ticket).demandRecordPresent
+        XCTAssertTrue(presentWhileHeld, "The orphan's record waits for its demand task")
+
+        submission.release()
+        try await AsyncTestWait.waitUntil("late submission settled", timeout: 10) {
+            await !store.codemapArtifactDemandCleanupSnapshotForTesting(ticket).demandRecordPresent
+        }
+        try await harness.waitForEngine(active: 0, queued: 0)
+        let finalFences = await store.codemapBindingEngineReleasedOwnerFenceCountsForTesting(
+            rootEpoch: harness.rootEpoch
+        )
+        let fencesAfter = try XCTUnwrap(finalFences)
+        XCTAssertEqual(fencesAfter.rejections - fencesBefore.rejections, 1, "The late submission was fenced")
+        XCTAssertEqual(fencesAfter.standing, 0)
+        let flowAfter = await store.codemapDemandFlowCountsForTesting()
+        XCTAssertEqual(flowAfter.releasedOrphaned - flowBefore.releasedOrphaned, 1)
+        XCTAssertEqual(flowAfter.releasedDroppedCancelled - flowBefore.releasedDroppedCancelled, 1)
+        XCTAssertEqual(flowAfter.releasedParked, flowBefore.releasedParked)
+        XCTAssertFalse(harness.gate.entered.contains(harness.path("X")), "No unheld request ran")
+
+        harness.gate.open()
+        let fresh = try await readyArtifactDemand(store: store, forFileID: fileID)
+        XCTAssertNotEqual(fresh.ticket.requestID, ticket.requestID)
+        _ = await store.cancelCodemapArtifactDemand(fresh.ticket)
+        await store.unloadRoot(id: harness.rootID)
+    }
+
+    /// Step 1b fix 1 (S1B-01): a request for a file whose release found nothing outstanding
+    /// never joins it (its fenced submission would cancel the joiner); it starts fresh, and the
+    /// held submission never registers.
+    func testRequestAfterNothingOutstandingReleaseStartsFresh() async throws {
+        let harness = try await makeKeptWorkHarness(name: #function, files: ["X"])
+        let store = harness.store
+        let fileID = harness.id("X")
+        let submission = CodemapSuspensionGate()
+        let submissions = CodemapLockedCounter()
+        await store.setCodemapBeforeEngineSubmissionHookForTesting { ticket in
+            guard ticket.fileID == fileID, submissions.incrementAndGet() == 1 else { return }
+            await submission.enterAndWait()
+        }
+        addTeardownBlock { submission.release() }
+        let ticket = try await pendingTicket(store.requestCodemapArtifact(forFileID: fileID))
+        await submission.waitUntilEntered()
+        _ = await store.cancelCodemapArtifactDemand(ticket, keepingAdmittedWork: true)
+        let flowBefore = await store.codemapDemandFlowCountsForTesting()
+
+        let joined = try await pendingTicket(store.requestCodemapArtifact(forFileID: fileID))
+        XCTAssertNotEqual(joined.requestID, ticket.requestID, "The request starts fresh")
+        let flowJoined = await store.codemapDemandFlowCountsForTesting()
+        XCTAssertEqual(flowJoined.pendingJoins, flowBefore.pendingJoins)
+        XCTAssertEqual(flowJoined.releasedDroppedCancelled - flowBefore.releasedDroppedCancelled, 1)
+        XCTAssertEqual(flowJoined.freshDemands - flowBefore.freshDemands, 1)
+
+        submission.release()
+        harness.gate.open()
+        let ready = try await readyResult(settledResult(store: store, ticket: joined))
+        XCTAssertEqual(ready.ticket.requestID, joined.requestID)
+        try await harness.waitForEngine(active: 0, queued: 0)
+        XCTAssertEqual(
+            harness.gate.entered.count { $0 == harness.path("X") },
+            1,
+            "Only the fresh demand ran"
+        )
+        try await AsyncTestWait.waitUntil("release fence cleared", timeout: 10) {
+            await store.codemapBindingEngineReleasedOwnerFenceCountsForTesting(rootEpoch: harness.rootEpoch)?
+                .standing == 0
+        }
+        _ = await store.cancelCodemapArtifactDemand(joined)
+        await store.unloadRoot(id: harness.rootID)
+    }
+
+    /// Fills the overlay lease budget (limit 2) with the idle `Prime` and `A`, so a held request
+    /// for `C` completes into a capacity refusal, evicts `Prime`, and retries once.
+    private func fillLeaseBudgetForCapacityRetry(_ harness: KeptWorkHarness) async throws {
+        let store = harness.store
+        let policySet = await store.setCodemapOverlayPolicyForTesting(
+            rootEpoch: harness.rootEpoch,
+            policy: WorkspaceCodemapLiveOverlayPolicy(maximumLeaseCountPerRoot: 2)
+        )
+        XCTAssertTrue(policySet)
+        addTeardownBlock {
+            await store.setCodemapOverlayPolicyForTesting(rootEpoch: harness.rootEpoch, policy: .default)
+        }
+        harness.gate.open()
+        let demandA = try await readyArtifactDemand(store: store, forFileID: harness.id("A"))
+        _ = await store.cancelCodemapArtifactDemand(demandA.ticket)
+        let idle = await store.codemapIdleReadyDemandFileIDsForTesting(rootEpoch: harness.rootEpoch)
+        XCTAssertEqual(idle, [harness.id("Prime"), harness.id("A")])
+        let leases = await store.codemapOverlayRootAccountingForTesting(rootEpoch: harness.rootEpoch)?.leaseCount
+        XCTAssertEqual(leases, 2, "The idle records fill the lease budget")
+    }
+
+    /// Step 1b fix 1 (S1B-A-06): the last holder releasing while its capacity eviction runs keeps
+    /// the refusal: the requester submits no retry, settles busy, and is dropped.
+    func testReleaseDuringCapacityEvictionSubmitsNoRetry() async throws {
+        let cleanupHold = CodemapArmableSuspensionGate()
+        let harness = try await makeKeptWorkHarness(
+            name: #function,
+            files: ["A", "C"],
+            cancellationCleanupHook: { _ in await cleanupHold.enterIfArmedAndWait() }
+        )
+        addTeardownBlock { cleanupHold.release() }
+        let store = harness.store
+        try await fillLeaseBudgetForCapacityRetry(harness)
+        let evictionsBefore = await store.codemapIdleReadyDemandEvictionCountForTesting()
+        cleanupHold.arm()
+
+        let ticketC = try await pendingTicket(store.requestCodemapArtifact(forFileID: harness.id("C")))
+        await cleanupHold.waitUntilEntered()
+        let flowBefore = await store.codemapDemandFlowCountsForTesting()
+        let initialFences = await store.codemapBindingEngineReleasedOwnerFenceCountsForTesting(
+            rootEpoch: harness.rootEpoch
+        )
+        let fencesBefore = try XCTUnwrap(initialFences)
+        let released = await store.cancelCodemapArtifactDemand(ticketC, keepingAdmittedWork: true)
+        XCTAssertTrue(released)
+        cleanupHold.release()
+
+        try await AsyncTestWait.waitUntil("released requester dropped", timeout: 30) {
+            await !store.codemapArtifactDemandCleanupSnapshotForTesting(ticketC).demandRecordPresent
+        }
+        try await harness.waitForEngine(active: 0, queued: 0)
+        let flowAfter = await store.codemapDemandFlowCountsForTesting()
+        XCTAssertEqual(flowAfter.releasedOrphaned - flowBefore.releasedOrphaned, 1)
+        XCTAssertEqual(flowAfter.releasedDroppedBusy - flowBefore.releasedDroppedBusy, 1)
+        XCTAssertEqual(
+            harness.gate.entered.count { $0 == harness.path("C") },
+            1,
+            "The released requester submitted no retry"
+        )
+        let evictionsAfter = await store.codemapIdleReadyDemandEvictionCountForTesting()
+        XCTAssertEqual(evictionsAfter - evictionsBefore, 1, "The held requester evicted Prime")
+        try await AsyncTestWait.waitUntil("release fence cleared", timeout: 10) {
+            await store.codemapBindingEngineReleasedOwnerFenceCountsForTesting(rootEpoch: harness.rootEpoch)?
+                .standing == 0
+        }
+        let finalFences = await store.codemapBindingEngineReleasedOwnerFenceCountsForTesting(
+            rootEpoch: harness.rootEpoch
+        )
+        XCTAssertEqual(finalFences?.rejections, fencesBefore.rejections)
+        await store.unloadRoot(id: harness.rootID)
+    }
+
+    /// Step 1b fix 1 (S1B-A-06): a release landing after the capacity retry's holder check but
+    /// before the engine registers the retry fences it: the retry is rejected as cancelled and
+    /// never runs unheld.
+    func testReleaseBeforeCapacityRetryRegistrationFencesTheRetry() async throws {
+        let harness = try await makeKeptWorkHarness(name: #function, files: ["A", "C"])
+        let store = harness.store
+        try await fillLeaseBudgetForCapacityRetry(harness)
+        let fileID = harness.id("C")
+        let retry = CodemapSuspensionGate()
+        let submissions = CodemapLockedCounter()
+        await store.setCodemapBeforeEngineSubmissionHookForTesting { ticket in
+            guard ticket.fileID == fileID, submissions.incrementAndGet() == 2 else { return }
+            await retry.enterAndWait()
+        }
+        addTeardownBlock { retry.release() }
+
+        let ticketC = try await pendingTicket(store.requestCodemapArtifact(forFileID: fileID))
+        await retry.waitUntilEntered()
+        let flowBefore = await store.codemapDemandFlowCountsForTesting()
+        let initialFences = await store.codemapBindingEngineReleasedOwnerFenceCountsForTesting(
+            rootEpoch: harness.rootEpoch
+        )
+        let fencesBefore = try XCTUnwrap(initialFences)
+        let released = await store.cancelCodemapArtifactDemand(ticketC, keepingAdmittedWork: true)
+        XCTAssertTrue(released)
+        retry.release()
+
+        try await AsyncTestWait.waitUntil("fenced retry settled", timeout: 30) {
+            await !store.codemapArtifactDemandCleanupSnapshotForTesting(ticketC).demandRecordPresent
+        }
+        try await harness.waitForEngine(active: 0, queued: 0)
+        let finalFences = await store.codemapBindingEngineReleasedOwnerFenceCountsForTesting(
+            rootEpoch: harness.rootEpoch
+        )
+        let fencesAfter = try XCTUnwrap(finalFences)
+        XCTAssertEqual(fencesAfter.rejections - fencesBefore.rejections, 1, "The retry was fenced")
+        XCTAssertEqual(fencesAfter.standing, 0)
+        let flowAfter = await store.codemapDemandFlowCountsForTesting()
+        XCTAssertEqual(flowAfter.releasedOrphaned - flowBefore.releasedOrphaned, 1)
+        XCTAssertEqual(flowAfter.releasedDroppedCancelled - flowBefore.releasedDroppedCancelled, 1)
+        XCTAssertEqual(flowAfter.releasedParked, flowBefore.releasedParked)
+        XCTAssertEqual(
+            harness.gate.entered.count { $0 == harness.path("C") },
+            1,
+            "The fenced retry never ran"
+        )
+        await store.unloadRoot(id: harness.rootID)
+    }
+
+    /// Step 1b fix 1 (S1B-A-01): an orphan that settles ready but not reusable (without a path
+    /// invalidation) was never parked, so it is not in the idle LRU; the settle still evicts it
+    /// by file. Its record is gone and the next request starts fresh.
+    func testOrphanSettlingReadyButNotReusableIsEvictedOutsideTheIdleList() async throws {
+        let harness = try await makeKeptWorkHarness(name: #function, files: ["X"])
+        let store = harness.store
+        let fileID = harness.id("X")
+        let ticket = try await pendingTicket(store.requestCodemapArtifact(forFileID: fileID))
+        try await harness.gate.waitUntilEntered(harness.path("X"))
+        _ = await store.cancelCodemapArtifactDemand(ticket, keepingAdmittedWork: true)
+        await store.setCodemapIdleReadyNonReusableForTesting(fileID: fileID, true)
+        let flowBefore = await store.codemapDemandFlowCountsForTesting()
+        let evictionsBefore = await store.codemapIdleReadyDemandEvictionCountForTesting()
+        let idleBefore = await store.codemapIdleReadyDemandFileIDsForTesting(rootEpoch: harness.rootEpoch)
+        XCTAssertFalse(idleBefore.contains(fileID), "The orphan was never parked")
+
+        harness.gate.open()
+        try await AsyncTestWait.waitUntil("non-reusable orphan evicted", timeout: 30) {
+            await !store.codemapArtifactDemandCleanupSnapshotForTesting(ticket).demandRecordPresent
+        }
+        let flowAfter = await store.codemapDemandFlowCountsForTesting()
+        XCTAssertEqual(flowAfter.releasedDroppedNotCurrent - flowBefore.releasedDroppedNotCurrent, 1)
+        XCTAssertEqual(flowAfter.releasedParked, flowBefore.releasedParked)
+        let evictionsAfter = await store.codemapIdleReadyDemandEvictionCountForTesting()
+        XCTAssertEqual(evictionsAfter - evictionsBefore, 1, "The settle evicted (revoked) the ready record")
+        let idleAfter = await store.codemapIdleReadyDemandFileIDsForTesting(rootEpoch: harness.rootEpoch)
+        XCTAssertFalse(idleAfter.contains(fileID))
+
+        await store.setCodemapIdleReadyNonReusableForTesting(fileID: fileID, false)
+        let fresh = try await readyArtifactDemand(store: store, forFileID: fileID)
+        XCTAssertNotEqual(fresh.ticket.requestID, ticket.requestID)
+        let flowFresh = await store.codemapDemandFlowCountsForTesting()
+        XCTAssertEqual(flowFresh.freshDemands - flowAfter.freshDemands, 1)
+        XCTAssertEqual(flowFresh.idleReadyRejoins, flowAfter.idleReadyRejoins)
+        _ = await store.cancelCodemapArtifactDemand(fresh.ticket)
+        await store.unloadRoot(id: harness.rootID)
+    }
+
+    private struct KeptWorkHarness {
+        let store: WorkspaceFileContextStore
+        let fixture: CodemapStoreFixture
+        let root: URL
+        let rootID: UUID
+        let rootEpoch: WorkspaceCodemapRootEpoch
+        let fileIDs: [String: UUID]
+        let gate: CodemapReopenablePublicationGate
+
+        func id(_ name: String) -> UUID {
+            fileIDs[name] ?? UUID()
+        }
+
+        func path(_ name: String) -> String {
+            "Sources/\(name).swift"
+        }
+
+        func generation() async -> WorkspaceCodemapSelectionGraphContributionGeneration? {
+            await store.codemapOverlayContributionGenerationForTesting(rootEpoch: rootEpoch)
+        }
+
+        func waitForEngine(active: Int, queued: Int) async throws {
+            try await AsyncTestWait.waitUntil("engine active=\(active) queued=\(queued)", timeout: 30) {
+                let accounting = await store.codemapBindingEngineAccountingForTesting(rootID: rootID)
+                return accounting?.activeRequestCount == active && accounting?.queuedRequestCount == queued
+            }
+        }
+    }
+
+    /// One Git root holding `Sources/Prime.swift` plus `Sources/<name>.swift` for each name, with
+    /// engine admission limited to `materializationLimit` per root and projection off. `Prime` is
+    /// demanded and released (parked idle) so the engine exists; then the publication gate is
+    /// installed, closed: each admitted request parks after its artifact resolves and before the
+    /// overlay accepts it.
+    private func makeKeptWorkHarness(
+        name: String,
+        files names: [String],
+        materializationLimit: Int = 4,
+        cancellationCleanupHook: @escaping @Sendable (WorkspaceCodemapArtifactDemandTicket) async -> Void = { _ in }
+    ) async throws -> KeptWorkHarness {
+        var repositoryFiles = ["Sources/Prime.swift": SwiftFixtureSource.emptyStruct("Prime")]
+        for fileName in names {
+            repositoryFiles["Sources/\(fileName).swift"] = SwiftFixtureSource.emptyStruct(fileName)
+        }
+        let repositoryFixture = try ReviewGitRepositoryFixture(name: name)
+        let root = try repositoryFixture.makeRepository(named: "repository", files: repositoryFiles)
+        let fixture = try CodemapStoreFixture(
+            name: name,
+            projectionAuthority: .none,
+            bindingEnginePolicy: WorkspaceCodemapBindingEnginePolicy(
+                maximumConcurrentMaterializationCountPerRoot: materializationLimit
+            )
+        )
+        let gate = CodemapReopenablePublicationGate()
+        addTeardownBlock {
+            await fixture.shutdown()
+            repositoryFixture.cleanup()
+        }
+        // Teardown blocks run last-in first-out: open the gate before shutting the engine down.
+        addTeardownBlock { gate.open() }
+        let store = fixture.makeStore(
+            codemapProjectionPreloadLaunchPolicy: .disabled,
+            cancellationCleanupHook: cancellationCleanupHook
+        )
+        let loaded = try await store.loadRoot(path: root.path)
+        var fileIDs: [String: UUID] = [:]
+        for file in await store.files(inRoot: loaded.id) {
+            let baseName = URL(fileURLWithPath: file.standardizedRelativePath)
+                .deletingPathExtension().lastPathComponent
+            fileIDs[baseName] = file.id
+        }
+        XCTAssertEqual(fileIDs.count, names.count + 1)
+        let prime = try await readyArtifactDemand(store: store, forFileID: XCTUnwrap(fileIDs["Prime"]))
+        _ = await store.cancelCodemapArtifactDemand(prime.ticket)
+        let rootEpoch = prime.ticket.rootEpoch
+        let hookInstalled = await store.setCodemapBindingEngineBeforeResolutionPublicationHookForTesting(
+            rootEpoch: rootEpoch
+        ) { _, path in
+            await gate.pass(path)
+        }
+        XCTAssertTrue(hookInstalled)
+        return KeptWorkHarness(
+            store: store,
+            fixture: fixture,
+            root: root,
+            rootID: loaded.id,
+            rootEpoch: rootEpoch,
+            fileIDs: fileIDs,
+            gate: gate
+        )
     }
 
     /// S1 fix 3 (S1-R2-01): an object's `deinit` unregisters from the idle eviction registry, so
