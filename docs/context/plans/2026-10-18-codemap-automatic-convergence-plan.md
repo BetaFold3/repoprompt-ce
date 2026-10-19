@@ -19,6 +19,7 @@ Deferred by plan: semantic coverage advances (S3), incremental rerun (S4), git c
 
 ## Status
 Step 1 — done | rounds 2/2 | open: | downgraded: | assumed: lease-pressure eviction reaches idle records in every window (fix 2c); warm rejoins skip Git authority revalidation (R1-02, Step 4 text); S1-R2-01 fixed per reviewer's smallest fix after round 2, not re-reviewed | deferred: cold large-selection convergence (owner question); process-wide idle bound at release (R2-02/03); fence wait deadline (R1-04); coordinator deadline test (S1-02); fail-closed finalization variant (S1-A-05); publication-enabled lease check (Step 4)
+Step 1b — done | rounds 1/2 | open: | downgraded: S1B-A-01 and S1B-A-08 rejected with evidence (step1b-fix1-report.md) | assumed: scope and bound per OracleA/B option-(a) assessments (evidence optA-*.md); R1-A-01 guard added after round 1, not re-reviewed | deferred: structure latency right after an automatic build and projection preload staying scheduled (Step 4 acceptance); resolution-fence wait deadline (S1B-A-11); stale owner fences after detach (R1-A-02); release-site counters need a consumer or removal (R1-A-03)
 Step 2 — todo | rounds 0/2 | open: | downgraded: | assumed: | deferred:
 Step 3 — todo | rounds 0/2 | open: | downgraded: | assumed: | deferred:
 Step 4 — todo | rounds 0/2 | open: | downgraded: | assumed: | deferred:
@@ -26,3 +27,4 @@ Step 4 — todo | rounds 0/2 | open: | downgraded: | assumed: | deferred:
 ## Decisions
 - D1: implement the three-step fix (release/warm cache + bounded wait, batched authority windows, automatic foreground repair).
 - D2: approve changing the contract so foreground automatic prompt builds may run a bounded repair; background work still never repairs.
+- D3: add Step 1b (released, already-admitted pending automatic demands finish into the warm cache) if OracleA and OracleB approve; both approved with changes.
