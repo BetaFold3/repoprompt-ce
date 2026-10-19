@@ -1878,6 +1878,113 @@ final class CodemapGraphFreezeQueryTests: WorkspaceFileContextStoreCodemapSeamTe
         await store.unloadRoot(id: blocker.id)
     }
 
+    /// A foreground selection snapshot that reaches the selection graph while an older projection-seal
+    /// rebuild holds the graph actor's only active rebuild slot gets `busy(actorActiveRebuildLimit)`,
+    /// and its worker exits idle with no pending snapshot. With no further projection or selection
+    /// signal, the foreground generation must still publish once the seal rebuild finishes. The newer
+    /// observed key supersedes the seal, the store answers the seal `.stale`, and the binding engine's
+    /// publication-staleness check restarts projection at the overlay's newer contribution generation;
+    /// that reseal publishes the foreground generation with complete coverage.
+    func testForegroundSnapshotBehindOlderProjectionSealRebuildPublishesWithoutFurtherSignal() async throws {
+        let repositoryFixture = try ReviewGitRepositoryFixture(name: #function)
+        let root = try repositoryFixture.makeRepository(
+            named: "selection",
+            files: [
+                "Sources/First.swift": SwiftFixtureSource.emptyStruct("First"),
+                "Sources/Second.swift": "struct Second { let first: First }\n"
+            ]
+        )
+        let fixture = try CodemapStoreFixture(name: #function, syntheticGraphArtifacts: true)
+        let buildGate = CodemapSelectionGraphBuildGate()
+        let graphProbe = CodemapSelectionGraphProbe(buildGate: buildGate)
+        addTeardownBlock {
+            buildGate.releaseAll()
+            await fixture.shutdown()
+            repositoryFixture.cleanup()
+        }
+        let store = fixture.makeStore(selectionGraphFactory: graphProbe.factory)
+        let loaded = try await store.loadRoot(path: root.path)
+
+        // With no demand yet, the root's only graph build is its projection preload seal.
+        let sealGeneration = try XCTUnwrap(buildGate.waitUntilFirstBlocked())
+
+        let files = await store.files(inRoot: loaded.id)
+        let first = try XCTUnwrap(files.first { $0.standardizedRelativePath == "Sources/First.swift" })
+        let firstTicket = try await pendingTicket(store.requestCodemapArtifact(forFileID: first.id))
+        _ = try await readyResult(settledResult(store: store, ticket: firstTicket))
+        let rootEpoch = firstTicket.rootEpoch
+        let graph = try XCTUnwrap(graphProbe.graph(rootEpoch: rootEpoch))
+
+        // The foreground snapshot advances the graph's observed key past the seal's generation and its
+        // worker meets the seal rebuild's active slot.
+        var foregroundKey: WorkspaceCodemapSelectionGraphRuntimeKey?
+        try await AsyncTestWait.waitUntil(
+            "foreground selection snapshot meets the in-flight seal rebuild",
+            timeout: 10
+        ) {
+            let accounting = await graph.accounting()
+            guard accounting.activeRebuildCount == 1,
+                  accounting.actorBusyCount >= 1,
+                  accounting.acceptedProjectionSegmentCount >= 1,
+                  accounting.completedProjectionCoverageCount == 0,
+                  let observed = accounting.currentObservedKey,
+                  observed.contributionGeneration.rawValue > sealGeneration
+            else { return false }
+            foregroundKey = observed
+            return true
+        }
+        let latestKey = try XCTUnwrap(foregroundKey)
+        let drained = await waitForCodemapGraphPublicationDrain(store: store, rootEpoch: rootEpoch)
+        XCTAssertTrue(drained)
+        let blockedAccounting = await graph.accounting()
+        XCTAssertNil(blockedAccounting.publishedSummary)
+        XCTAssertEqual(blockedAccounting.currentObservedKey, latestKey)
+
+        // Release the seal rebuild and every later build; send no further signal.
+        buildGate.releaseAll()
+
+        var publishedKey: WorkspaceCodemapSelectionGraphRuntimeKey?
+        do {
+            try await AsyncTestWait.waitUntil("foreground generation publishes", timeout: 10) {
+                let accounting = await graph.accounting()
+                publishedKey = accounting.publishedSummary?.key
+                return publishedKey == latestKey
+            }
+        } catch {
+            let accounting = await graph.accounting()
+            let engine = await store.codemapBindingEngineAccountingForTesting(rootID: rootEpoch.rootID)
+            XCTFail(
+                "Foreground generation \(latestKey.contributionGeneration) never published; "
+                    + "published \(String(describing: publishedKey?.contributionGeneration)), "
+                    + "graph \(accounting), engine \(String(describing: engine))"
+            )
+            return
+        }
+        let finalAccounting = await graph.accounting()
+        XCTAssertEqual(finalAccounting.currentObservedKey, latestKey)
+        XCTAssertEqual(finalAccounting.publishedSummary?.key, latestKey)
+        guard case .complete? = finalAccounting.publishedSummary?.definitionUniverseCoverage else {
+            return XCTFail("The foreground generation must publish through the projection reseal")
+        }
+        XCTAssertEqual(finalAccounting.supersededPublicationCount, 1)
+        let workerStarts = await store.codemapPresentationOperationCountsForTesting().graphWorkerStarts
+        XCTAssertEqual(workerStarts, 1, "Only the busy-exited foreground worker may start")
+
+        let structure = await store.queryCodemapStructureGraph(
+            WorkspaceCodemapStructureTraversalQuery(
+                seeds: [WorkspaceCodemapStoreSelectionGraphSourceIdentity(ticket: firstTicket)],
+                direction: .both,
+                limits: .init(maximumDepth: 2, maximumNodeCount: 10, maximumEdgeCount: 10, maximumByteCount: 4096)
+            )
+        )
+        guard case .readyPartial = structure else {
+            return XCTFail("The published foreground generation must answer structure queries, got \(structure)")
+        }
+
+        _ = await store.cancelCodemapArtifactDemand(firstTicket)
+        await store.unloadRoot(id: loaded.id)
+    }
+
     func testNonGitDemandBecomesTerminalWithoutSourceReadManifestBuildOrGraphWork() async throws {
         let fixture = try CodemapStoreFixture(
             name: #function,
