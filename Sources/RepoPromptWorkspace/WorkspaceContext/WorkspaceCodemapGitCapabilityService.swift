@@ -253,10 +253,20 @@ enum WorkspaceCodemapSourceAuthorityRevalidation: Hashable {
     }
 }
 
+/// One candidate of a batched source-authority issuance window.
+struct WorkspaceCodemapSourceAuthorityRequest: Equatable {
+    let candidateRepositoryRelativePath: String
+    let observedPathGeneration: UInt64
+    let currentPathGeneration: UInt64
+}
+
 struct WorkspaceCodemapGitCapabilityServiceHooks {
     var beforeResolution: @Sendable () async -> Void
     var afterFirstAuthorityCapture: @Sendable () async -> Void
     var afterSourcePathFingerprintCapture: @Sendable () async -> Void
+    /// Runs in each source-authority window after the per-candidate attribute captures, right
+    /// before the window's closing repository capture.
+    var beforeSourceAuthorityPostRepositoryCapture: @Sendable () async -> Void
     var afterAuthorityEvidenceComponentStat: @Sendable (String, Bool) -> Void
     var afterAuthorityEvidenceOpen: @Sendable (URL) -> Void
 
@@ -264,12 +274,14 @@ struct WorkspaceCodemapGitCapabilityServiceHooks {
         beforeResolution: @escaping @Sendable () async -> Void = {},
         afterFirstAuthorityCapture: @escaping @Sendable () async -> Void = {},
         afterSourcePathFingerprintCapture: @escaping @Sendable () async -> Void = {},
+        beforeSourceAuthorityPostRepositoryCapture: @escaping @Sendable () async -> Void = {},
         afterAuthorityEvidenceComponentStat: @escaping @Sendable (String, Bool) -> Void = { _, _ in },
         afterAuthorityEvidenceOpen: @escaping @Sendable (URL) -> Void = { _ in }
     ) {
         self.beforeResolution = beforeResolution
         self.afterFirstAuthorityCapture = afterFirstAuthorityCapture
         self.afterSourcePathFingerprintCapture = afterSourcePathFingerprintCapture
+        self.beforeSourceAuthorityPostRepositoryCapture = beforeSourceAuthorityPostRepositoryCapture
         self.afterAuthorityEvidenceComponentStat = afterAuthorityEvidenceComponentStat
         self.afterAuthorityEvidenceOpen = afterAuthorityEvidenceOpen
     }
@@ -364,6 +376,9 @@ actor WorkspaceCodemapGitCapabilityService {
     private let pathFingerprintClient: WorkspaceCodemapPathFingerprintClient
     private let historicalRecordLimit: Int
     private var records: [WorkspaceCodemapRootEpoch: RootRecord] = [:]
+    #if DEBUG
+        private var authorityCaptureCount = 0
+    #endif
     private var flights: [WorkspaceCodemapRootEpoch: RootFlight] = [:]
     private var resolutionObservers: [UUID: Task<Void, Never>] = [:]
     private var rootEpochByWaiterID: [UUID: WorkspaceCodemapRootEpoch] = [:]
@@ -528,6 +543,12 @@ actor WorkspaceCodemapGitCapabilityService {
             rootEpoch: WorkspaceCodemapRootEpoch
         ) -> WorkspaceCodemapSourceAuthorityFailure? {
             records[rootEpoch]?.lastSourceAuthorityFailure
+        }
+
+        /// Repository authority captures started by this service (resolution, issuance, and
+        /// revalidation), each about eight Git spawns.
+        func authorityCaptureCountForTesting() -> Int {
+            authorityCaptureCount
         }
     #endif
 
@@ -753,6 +774,7 @@ actor WorkspaceCodemapGitCapabilityService {
         return state
     }
 
+    /// Single-candidate issuance: a one-request window of `makeSourceAuthorities`.
     func makeSourceAuthority(
         capability: GitCodemapRootCapability,
         observedRootEpoch: WorkspaceCodemapRootEpoch,
@@ -763,22 +785,119 @@ actor WorkspaceCodemapGitCapabilityService {
         observedIngressGeneration: UInt64,
         currentIngressGeneration: UInt64
     ) async -> WorkspaceCodemapSourceAuthorityIssuance {
+        let issuances = await makeSourceAuthorities(
+            capability: capability,
+            observedRootEpoch: observedRootEpoch,
+            observedRepositoryAuthority: observedRepositoryAuthority,
+            observedIngressGeneration: observedIngressGeneration,
+            currentIngressGeneration: currentIngressGeneration,
+            requests: [WorkspaceCodemapSourceAuthorityRequest(
+                candidateRepositoryRelativePath: candidateRepositoryRelativePath,
+                observedPathGeneration: observedPathGeneration,
+                currentPathGeneration: currentPathGeneration
+            )]
+        )
+        return issuances.first ?? .unavailable(sourceAuthorityFailed(.tokenInvalid, rootEpoch: capability.rootEpoch))
+    }
+
+    static let maximumSourceAuthorityWindowCandidateCount = 128
+
+    /// Issues source authority for many candidates, sharing one bracketed repository capture
+    /// window per chunk of at most `maximumSourceAuthorityWindowCandidateCount` requests.
+    /// Effective configuration is captured fresh at both ends of every window. Returns one
+    /// issuance per request, in request order; never throws.
+    func makeSourceAuthorities(
+        capability: GitCodemapRootCapability,
+        observedRootEpoch: WorkspaceCodemapRootEpoch,
+        observedRepositoryAuthority: WorkspaceCodemapRepositoryAuthorityToken,
+        observedIngressGeneration: UInt64,
+        currentIngressGeneration: UInt64,
+        requests: [WorkspaceCodemapSourceAuthorityRequest]
+    ) async -> [WorkspaceCodemapSourceAuthorityIssuance] {
+        var issuances: [WorkspaceCodemapSourceAuthorityIssuance] = []
+        issuances.reserveCapacity(requests.count)
+        var windowStart = requests.startIndex
+        while windowStart < requests.endIndex {
+            let windowEnd = min(windowStart + Self.maximumSourceAuthorityWindowCandidateCount, requests.endIndex)
+            await issuances.append(contentsOf: makeSourceAuthorityWindow(
+                capability: capability,
+                observedRootEpoch: observedRootEpoch,
+                observedRepositoryAuthority: observedRepositoryAuthority,
+                observedIngressGeneration: observedIngressGeneration,
+                currentIngressGeneration: currentIngressGeneration,
+                requests: Array(requests[windowStart ..< windowEnd])
+            ))
+            windowStart = windowEnd
+        }
+        return issuances
+    }
+
+    /// One candidate still in a source-authority window.
+    private struct SourceAuthorityWindowCandidate {
+        let index: Int
+        let request: WorkspaceCodemapSourceAuthorityRequest
+        let path: String
+        let prePathFingerprint: GitBlobLStatFingerprint
+        var preAttributes = ""
+        var postAttributes = ""
+        var postPathFingerprint: GitBlobLStatFingerprint?
+    }
+
+    /// One window, in the single issuance's step order. A per-candidate failure drops only that
+    /// candidate (logged once each); a root-wide or window-wide failure applies to every
+    /// remaining candidate and is logged once for the window.
+    private func makeSourceAuthorityWindow(
+        capability: GitCodemapRootCapability,
+        observedRootEpoch: WorkspaceCodemapRootEpoch,
+        observedRepositoryAuthority: WorkspaceCodemapRepositoryAuthorityToken,
+        observedIngressGeneration: UInt64,
+        currentIngressGeneration: UInt64,
+        requests: [WorkspaceCodemapSourceAuthorityRequest]
+    ) async -> [WorkspaceCodemapSourceAuthorityIssuance] {
         let rootEpoch = capability.rootEpoch
+        var results = [WorkspaceCodemapSourceAuthorityIssuance?](repeating: nil, count: requests.count)
+        func finished() -> [WorkspaceCodemapSourceAuthorityIssuance] {
+            results.map { $0 ?? .unavailable(.tokenInvalid) }
+        }
+        func fail(_ candidateIndex: Int, _ failure: WorkspaceCodemapSourceAuthorityFailure) {
+            results[candidateIndex] = .unavailable(sourceAuthorityFailed(failure, rootEpoch: rootEpoch))
+        }
+        func failAll(
+            _ candidates: [SourceAuthorityWindowCandidate],
+            _ failure: WorkspaceCodemapSourceAuthorityFailure
+        ) {
+            guard !candidates.isEmpty else { return }
+            let recorded = sourceAuthorityFailed(failure, rootEpoch: rootEpoch)
+            for candidate in candidates {
+                results[candidate.index] = .unavailable(recorded)
+            }
+        }
+
+        // 1. The capability must still be the record's eligible, stable capability.
         guard let record = records[rootEpoch],
               case let .eligible(activeCapability) = record.state,
               activeCapability == capability,
               let stableAuthority = record.stableAuthority
-        else { return .unavailable(sourceAuthorityFailed(.capabilityInactive, rootEpoch: rootEpoch)) }
-        guard let candidatePath = Self.safeRepositoryRelativePath(candidateRepositoryRelativePath),
-              Self.isCandidate(
-                  candidatePath,
-                  insideLoadedRootPrefix: capability.repositoryRelativeLoadedRootPrefix
-              )
-        else { return .unavailable(sourceAuthorityFailed(.candidatePathRejected, rootEpoch: rootEpoch)) }
+        else {
+            let failure = sourceAuthorityFailed(.capabilityInactive, rootEpoch: rootEpoch)
+            return Array(repeating: .unavailable(failure), count: requests.count)
+        }
         let loadedRoot = URL(fileURLWithPath: record.binding.standardizedLoadedRootPath)
 
-        let failure: WorkspaceCodemapSourceAuthorityFailure
-        do {
+        // 2. Per candidate: a safe path inside the loaded-root prefix, a no-follow pre path
+        // fingerprint, and a regular file.
+        var survivors: [SourceAuthorityWindowCandidate] = []
+        survivors.reserveCapacity(requests.count)
+        for (index, request) in requests.enumerated() {
+            guard let candidatePath = Self.safeRepositoryRelativePath(request.candidateRepositoryRelativePath),
+                  Self.isCandidate(
+                      candidatePath,
+                      insideLoadedRootPrefix: capability.repositoryRelativeLoadedRootPrefix
+                  )
+            else {
+                fail(index, .candidatePathRejected)
+                continue
+            }
             let prePathFingerprint: GitBlobLStatFingerprint
             do {
                 prePathFingerprint = try pathFingerprintClient.fingerprint(
@@ -786,81 +905,171 @@ actor WorkspaceCodemapGitCapabilityService {
                     candidatePath
                 )
             } catch {
-                throw SourceAuthorityStepError(Self.candidatePathFailure(for: error))
+                fail(index, Self.candidatePathFailure(for: error))
+                continue
             }
             guard prePathFingerprint.isRegularFile else {
-                throw SourceAuthorityStepError(.candidateNotRegularFile)
+                fail(index, .candidateNotRegularFile)
+                continue
             }
-            await hooks.afterSourcePathFingerprintCapture()
-            try Task.checkCancellation()
-            let preRepository = try await captureAuthorityStep(
-                loadedRoot: loadedRoot,
-                capability: capability
-            )
-            // Return on the first baseline mismatch: no token can be accepted, and a second capture
-            // would only spend Git calls on a rejection whose root-wide cause is already known.
-            if let mismatch = Self.authorityMismatch(
-                baseline: stableAuthority,
-                observed: preRepository.stableAuthority
-            ) {
-                throw SourceAuthorityStepError(mismatch)
-            }
-            let preAttributes = try candidateAttributeStep(
-                layout: capability.repositoryLayout,
-                candidatePath: candidatePath
-            )
-            try Task.checkCancellation()
-            let postAttributes = try candidateAttributeStep(
-                layout: capability.repositoryLayout,
-                candidatePath: candidatePath
-            )
-            let postRepository = try await captureAuthorityStep(
-                loadedRoot: loadedRoot,
-                capability: capability
-            )
-            let postPathFingerprint: GitBlobLStatFingerprint
-            do {
-                postPathFingerprint = try pathFingerprintClient.fingerprint(
-                    capability.repositoryLayout.workTreeRoot,
-                    candidatePath
-                )
-            } catch {
-                throw SourceAuthorityStepError(Self.captureFailure(for: error, window: .pathFingerprint))
-            }
-            // The pre-capture matched the baseline, so any later disagreement is window instability.
-            guard preAttributes == postAttributes else {
-                throw SourceAuthorityStepError(.unstableWindow(.attributes))
-            }
-            guard preRepository == postRepository,
-                  postRepository.stableAuthority == stableAuthority
-            else { throw SourceAuthorityStepError(.unstableWindow(.repository)) }
-            guard prePathFingerprint == postPathFingerprint,
-                  postPathFingerprint.isRegularFile
-            else { throw SourceAuthorityStepError(.unstableWindow(.pathFingerprint)) }
-            guard case let .eligible(currentCapability) = records[rootEpoch]?.state,
-                  currentCapability == capability
-            else { throw SourceAuthorityStepError(.unstableWindow(.capability)) }
-
-            guard let token = WorkspaceCodemapSourceAuthorityToken.issue(
-                capability: capability,
-                observedRootEpoch: observedRootEpoch,
-                observedRepositoryAuthority: observedRepositoryAuthority,
-                candidateRepositoryRelativePath: candidatePath,
-                acceptedPrePathFingerprint: prePathFingerprint,
-                acceptedPostPathFingerprint: postPathFingerprint,
-                candidateAttributeGeneration: postAttributes,
-                observedPathGeneration: observedPathGeneration,
-                currentPathGeneration: currentPathGeneration,
-                observedIngressGeneration: observedIngressGeneration,
-                currentIngressGeneration: currentIngressGeneration
-            ) else { throw SourceAuthorityStepError(.tokenInvalid) }
-            return .issued(token)
-        } catch let error as SourceAuthorityStepError {
-            failure = error.failure
-        } catch {
-            failure = Self.captureFailure(for: error, window: .repository)
+            survivors.append(SourceAuthorityWindowCandidate(
+                index: index,
+                request: request,
+                path: candidatePath,
+                prePathFingerprint: prePathFingerprint
+            ))
         }
-        return .unavailable(sourceAuthorityFailed(failure, rootEpoch: rootEpoch))
+        guard !survivors.isEmpty else { return finished() }
+
+        // 3.
+        await hooks.afterSourcePathFingerprintCapture()
+        guard !Task.isCancelled else {
+            failAll(survivors, .cancelled)
+            return finished()
+        }
+
+        // 4. One opening repository capture. Return on the first baseline mismatch: no token can
+        // be accepted, and a second capture would only spend Git calls on a rejection whose
+        // root-wide cause is already known.
+        let preRepository: AuthorityCapture
+        do {
+            preRepository = try await captureAuthorityStep(loadedRoot: loadedRoot, capability: capability)
+        } catch {
+            failAll(survivors, Self.captureFailure(for: error, window: .repository))
+            return finished()
+        }
+        if let mismatch = Self.authorityMismatch(
+            baseline: stableAuthority,
+            observed: preRepository.stableAuthority
+        ) {
+            failAll(survivors, mismatch)
+            return finished()
+        }
+
+        // 5.
+        survivors = survivors.compactMap { candidate in
+            var candidate = candidate
+            do {
+                candidate.preAttributes = try candidateAttributeStep(
+                    layout: capability.repositoryLayout,
+                    candidatePath: candidate.path
+                )
+                return candidate
+            } catch {
+                fail(candidate.index, Self.captureFailure(for: error, window: .attributes))
+                return nil
+            }
+        }
+        guard !survivors.isEmpty else { return finished() }
+
+        // 6.
+        guard !Task.isCancelled else {
+            failAll(survivors, .cancelled)
+            return finished()
+        }
+
+        // 7.
+        survivors = survivors.compactMap { candidate in
+            var candidate = candidate
+            do {
+                candidate.postAttributes = try candidateAttributeStep(
+                    layout: capability.repositoryLayout,
+                    candidatePath: candidate.path
+                )
+                return candidate
+            } catch {
+                fail(candidate.index, Self.captureFailure(for: error, window: .attributes))
+                return nil
+            }
+        }
+        guard !survivors.isEmpty else { return finished() }
+
+        // 8. One closing repository capture.
+        await hooks.beforeSourceAuthorityPostRepositoryCapture()
+        let postRepository: AuthorityCapture
+        do {
+            postRepository = try await captureAuthorityStep(loadedRoot: loadedRoot, capability: capability)
+        } catch {
+            failAll(survivors, Self.captureFailure(for: error, window: .repository))
+            return finished()
+        }
+
+        // 9.
+        survivors = survivors.compactMap { candidate in
+            var candidate = candidate
+            do {
+                candidate.postPathFingerprint = try pathFingerprintClient.fingerprint(
+                    capability.repositoryLayout.workTreeRoot,
+                    candidate.path
+                )
+                return candidate
+            } catch {
+                fail(candidate.index, Self.captureFailure(for: error, window: .pathFingerprint))
+                return nil
+            }
+        }
+        guard !survivors.isEmpty else { return finished() }
+
+        // 10. Window checks, per candidate in the single issuance's order. The opening capture
+        // matched the baseline, so any later disagreement is window instability.
+        let repositoryStable = preRepository == postRepository &&
+            postRepository.stableAuthority == stableAuthority
+        let capabilityCurrent = if case let .eligible(currentCapability) = records[rootEpoch]?.state {
+            currentCapability == capability
+        } else {
+            false
+        }
+        var repositoryUnstable: [SourceAuthorityWindowCandidate] = []
+        var capabilityChanged: [SourceAuthorityWindowCandidate] = []
+        var accepted: [SourceAuthorityWindowCandidate] = []
+        for candidate in survivors {
+            guard candidate.preAttributes == candidate.postAttributes else {
+                fail(candidate.index, .unstableWindow(.attributes))
+                continue
+            }
+            guard repositoryStable else {
+                repositoryUnstable.append(candidate)
+                continue
+            }
+            guard let postPathFingerprint = candidate.postPathFingerprint,
+                  candidate.prePathFingerprint == postPathFingerprint,
+                  postPathFingerprint.isRegularFile
+            else {
+                fail(candidate.index, .unstableWindow(.pathFingerprint))
+                continue
+            }
+            guard capabilityCurrent else {
+                capabilityChanged.append(candidate)
+                continue
+            }
+            accepted.append(candidate)
+        }
+        failAll(repositoryUnstable, .unstableWindow(.repository))
+        failAll(capabilityChanged, .unstableWindow(.capability))
+
+        // 11.
+        for candidate in accepted {
+            guard let postPathFingerprint = candidate.postPathFingerprint,
+                  let token = WorkspaceCodemapSourceAuthorityToken.issue(
+                      capability: capability,
+                      observedRootEpoch: observedRootEpoch,
+                      observedRepositoryAuthority: observedRepositoryAuthority,
+                      candidateRepositoryRelativePath: candidate.path,
+                      acceptedPrePathFingerprint: candidate.prePathFingerprint,
+                      acceptedPostPathFingerprint: postPathFingerprint,
+                      candidateAttributeGeneration: candidate.postAttributes,
+                      observedPathGeneration: candidate.request.observedPathGeneration,
+                      currentPathGeneration: candidate.request.currentPathGeneration,
+                      observedIngressGeneration: observedIngressGeneration,
+                      currentIngressGeneration: currentIngressGeneration
+                  )
+            else {
+                fail(candidate.index, .tokenInvalid)
+                continue
+            }
+            results[candidate.index] = .issued(token)
+        }
+        return finished()
     }
 
     /// Revalidates previously issued source-authority tokens against one stable repository/path window.
@@ -1211,6 +1420,9 @@ actor WorkspaceCodemapGitCapabilityService {
         expectedLayout: GitRepositoryLayout,
         prefix: String
     ) async throws -> AuthorityCapture {
+        #if DEBUG
+            authorityCaptureCount += 1
+        #endif
         guard let currentLayout = try await gitService.resolveGitBlobRepository(containing: loadedRoot),
               Self.repositoryRelativePrefix(
                   loadedRoot: loadedRoot,

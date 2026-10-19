@@ -1800,7 +1800,14 @@ final class CodemapGraphFreezeQueryTests: WorkspaceFileContextStoreCodemapSeamTe
             await fixture.shutdown()
             repositoryFixture.cleanup()
         }
-        let store = fixture.makeStore(selectionGraphFactory: graphProbe.factory)
+        // Projection preload is background graph work outside this seam: a preload seal can apply to
+        // the selection graph first, take the single active reservation, and block at the build
+        // gate in place of the blocker worker. The selection snapshots then meet a busy graph actor
+        // instead of a worker parked in process admission, so the coalescing scenario never forms.
+        let store = fixture.makeStore(
+            codemapProjectionPreloadLaunchPolicy: .disabled,
+            selectionGraphFactory: graphProbe.factory
+        )
         let blocker = try await store.loadRoot(path: blockerRoot.path)
         let selection = try await store.loadRoot(path: selectionRoot.path)
 

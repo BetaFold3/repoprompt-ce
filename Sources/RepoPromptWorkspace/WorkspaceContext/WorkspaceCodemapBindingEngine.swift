@@ -276,6 +276,23 @@ actor WorkspaceCodemapBindingEngine {
         case budget(WorkspaceCodemapProjectionBudget)
     }
 
+    /// The exact single-issuance inputs a batch-prefetched source authority was issued for. A
+    /// candidate uses the prefetched issuance only while these still equal its current inputs.
+    private struct ProjectionSourceAuthorityInputs: Equatable {
+        let sessionID: UUID
+        let capability: GitCodemapRootCapability
+        let repositoryAuthority: WorkspaceCodemapRepositoryAuthorityToken
+        let repositoryRelativePath: String
+        let pathGeneration: UInt64
+        let observedIngressGeneration: UInt64
+        let currentIngressGeneration: UInt64
+    }
+
+    private struct ProjectionPrefetchedSourceAuthority {
+        let inputs: ProjectionSourceAuthorityInputs
+        let issuance: WorkspaceCodemapSourceAuthorityIssuance
+    }
+
     private enum ProjectionBatchResult {
         case checkpointed
         case complete
@@ -2806,6 +2823,13 @@ actor WorkspaceCodemapBindingEngine {
             guard updateProjectionPhase(jobID: jobID, rootEpoch: rootEpoch, phase: .resolvingArtifacts) else {
                 return .cancelled
             }
+            let prefetchedSourceAuthorities = await prefetchProjectionSourceAuthorities(
+                jobID: jobID,
+                rootEpoch: rootEpoch,
+                misses: misses,
+                pipelineByFileID: pipelineByFileID,
+                classificationsByPath: classificationsByPath
+            )
             for candidate in misses {
                 guard let pipelineIdentity = pipelineByFileID[candidate.identity.fileID],
                       let classification = classificationsByPath[
@@ -2817,7 +2841,8 @@ actor WorkspaceCodemapBindingEngine {
                     rootEpoch: rootEpoch,
                     candidate: candidate,
                     pipelineIdentity: pipelineIdentity,
-                    classification: classification
+                    classification: classification,
+                    prefetchedSourceAuthority: prefetchedSourceAuthorities[candidate.identity.fileID]
                 )
                 guard currentProjectionJob(jobID: jobID, rootEpoch: rootEpoch) != nil else {
                     return .cancelled
@@ -3357,12 +3382,119 @@ actor WorkspaceCodemapBindingEngine {
         roots[rootEpoch] = .eligible(session)
     }
 
+    /// Issues source authority for every authority-requiring miss of one batch in shared
+    /// repository capture windows. Candidates the resolve guard would reject are skipped; each
+    /// result records the inputs it was issued for so resolution can detect a stale prefetch.
+    private func prefetchProjectionSourceAuthorities(
+        jobID: UUID,
+        rootEpoch: WorkspaceCodemapRootEpoch,
+        misses: [WorkspaceCodemapProjectionCatalogCandidate],
+        pipelineByFileID: [UUID: CodeMapPipelineIdentity],
+        classificationsByPath: [String: GitBlobIdentityClassification]
+    ) async -> [UUID: ProjectionPrefetchedSourceAuthority] {
+        guard let job = currentProjectionJob(jobID: jobID, rootEpoch: rootEpoch),
+              case let .eligible(session)? = roots[rootEpoch],
+              session.id == job.sessionID
+        else { return [:] }
+        var fileIDs: [UUID] = []
+        var inputs: [ProjectionSourceAuthorityInputs] = []
+        for candidate in misses {
+            guard let pipelineIdentity = pipelineByFileID[candidate.identity.fileID],
+                  session.pipelines[pipelineIdentity] != nil,
+                  let classification = classificationsByPath[candidate.identity.standardizedRelativePath],
+                  let candidateInputs = projectionSourceAuthorityInputs(
+                      job: job,
+                      session: session,
+                      candidate: candidate,
+                      classification: classification
+                  )
+            else { continue }
+            switch classification.outcome {
+            case .oidEligible, .requiresValidatedWorktreeBytes:
+                fileIDs.append(candidate.identity.fileID)
+                inputs.append(candidateInputs)
+            case .securityExcluded, .unsupported, .unavailable:
+                continue
+            }
+        }
+        guard !inputs.isEmpty else { return [:] }
+        let issuances = await capabilityService.makeSourceAuthorities(
+            capability: session.capability,
+            observedRootEpoch: rootEpoch,
+            observedRepositoryAuthority: job.repositoryAuthority,
+            observedIngressGeneration: job.ingressGeneration,
+            currentIngressGeneration: session.registration.ingressGeneration,
+            requests: inputs.map {
+                WorkspaceCodemapSourceAuthorityRequest(
+                    candidateRepositoryRelativePath: $0.repositoryRelativePath,
+                    observedPathGeneration: $0.pathGeneration,
+                    currentPathGeneration: $0.pathGeneration
+                )
+            }
+        )
+        guard issuances.count == inputs.count else { return [:] }
+        var prefetched: [UUID: ProjectionPrefetchedSourceAuthority] = [:]
+        for index in inputs.indices {
+            prefetched[fileIDs[index]] = ProjectionPrefetchedSourceAuthority(
+                inputs: inputs[index],
+                issuance: issuances[index]
+            )
+        }
+        return prefetched
+    }
+
+    /// Whether a prefetched issuance is the outcome a fresh single issuance would also produce.
+    /// Issued tokens, root-wide authority changes, and candidate-local path rejections are final.
+    /// Every window-instability outcome is retried with a fresh single issuance, as before
+    /// batching: one shared `.gitattributes` edit marks every candidate in the window
+    /// attribute-unstable, and a fresh window either succeeds or latches the root-wide change.
+    /// Capture failures, an inactive capability, and cancellation are retried the same way.
+    private static func prefetchedSourceAuthorityIsFinal(
+        _ issuance: WorkspaceCodemapSourceAuthorityIssuance
+    ) -> Bool {
+        guard let failure = issuance.failure else { return true }
+        switch failure {
+        case .repositoryAuthorityChanged, .repositoryBindingChanged, .repositoryLayoutChanged,
+             .candidatePathRejected, .candidateNotRegularFile, .tokenInvalid:
+            return true
+        case .capabilityInactive, .unstableWindow(.repository), .unstableWindow(.capability),
+             .unstableWindow(.attributes), .unstableWindow(.pathFingerprint),
+             .captureFailed, .cancelled:
+            return false
+        }
+    }
+
+    private func projectionSourceAuthorityInputs(
+        job: ProjectionPreloadJob,
+        session: Session,
+        candidate: WorkspaceCodemapProjectionCatalogCandidate,
+        classification: GitBlobIdentityClassification
+    ) -> ProjectionSourceAuthorityInputs? {
+        guard classification.relativePath == candidate.identity.standardizedRelativePath,
+              let repositoryRelativePath = classification.repositoryRelativePath,
+              repositoryRelativePath == repositoryPath(
+                  loadedRootRelativePath: candidate.identity.standardizedRelativePath,
+                  prefix: session.capability.repositoryRelativeLoadedRootPrefix
+              )
+        else { return nil }
+        return ProjectionSourceAuthorityInputs(
+            sessionID: session.id,
+            capability: session.capability,
+            repositoryAuthority: job.repositoryAuthority,
+            repositoryRelativePath: repositoryRelativePath,
+            pathGeneration: candidate.pathGeneration,
+            observedIngressGeneration: job.ingressGeneration,
+            currentIngressGeneration: session.registration.ingressGeneration
+        )
+    }
+
     private func resolveProjectionCandidate(
         jobID: UUID,
         rootEpoch: WorkspaceCodemapRootEpoch,
         candidate: WorkspaceCodemapProjectionCatalogCandidate,
         pipelineIdentity: CodeMapPipelineIdentity,
-        classification: GitBlobIdentityClassification
+        classification: GitBlobIdentityClassification,
+        prefetchedSourceAuthority: ProjectionPrefetchedSourceAuthority? = nil
     ) async -> ProjectionCandidateResolution {
         guard let job = currentProjectionJob(jobID: jobID, rootEpoch: rootEpoch),
               case let .eligible(session)? = roots[rootEpoch],
@@ -3406,16 +3538,38 @@ actor WorkspaceCodemapBindingEngine {
             break
         }
 
-        let issuance = await capabilityService.makeSourceAuthority(
-            capability: session.capability,
-            observedRootEpoch: rootEpoch,
-            observedRepositoryAuthority: job.repositoryAuthority,
-            candidateRepositoryRelativePath: repositoryRelativePath,
-            observedPathGeneration: candidate.pathGeneration,
-            currentPathGeneration: candidate.pathGeneration,
-            observedIngressGeneration: job.ingressGeneration,
-            currentIngressGeneration: session.registration.ingressGeneration
-        )
+        guard let currentInputs = projectionSourceAuthorityInputs(
+            job: job,
+            session: session,
+            candidate: candidate,
+            classification: classification
+        ) else { return .transient }
+        // Defense in depth. The job is current here (checked above, no suspension since), which
+        // pins the session, ingress generation, and repository authority; a session's capability
+        // is immutable; and `pathGeneration` comes from the same candidate value. So prefetched
+        // inputs of a current job always equal the current inputs.
+        #if DEBUG
+            if let prefetchedSourceAuthority, prefetchedSourceAuthority.inputs != currentInputs {
+                assertionFailure("Prefetched source-authority inputs diverged while the projection job is current.")
+            }
+        #endif
+        let issuance = if let prefetchedSourceAuthority,
+                          prefetchedSourceAuthority.inputs == currentInputs,
+                          Self.prefetchedSourceAuthorityIsFinal(prefetchedSourceAuthority.issuance)
+        {
+            prefetchedSourceAuthority.issuance
+        } else {
+            await capabilityService.makeSourceAuthority(
+                capability: session.capability,
+                observedRootEpoch: rootEpoch,
+                observedRepositoryAuthority: job.repositoryAuthority,
+                candidateRepositoryRelativePath: repositoryRelativePath,
+                observedPathGeneration: candidate.pathGeneration,
+                currentPathGeneration: candidate.pathGeneration,
+                observedIngressGeneration: job.ingressGeneration,
+                currentIngressGeneration: session.registration.ingressGeneration
+            )
+        }
         guard !Task.isCancelled else { return .transient }
         if let failure = issuance.failure {
             // Fence before recording: a worker whose job or session was replaced during the
