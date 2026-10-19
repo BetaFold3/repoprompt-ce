@@ -123,6 +123,47 @@ extension PromptContextAccountingServiceTests {
         try await fixture.assertRecoversWithOneRepair(seedPath: "Sources/Other.swift")
     }
 
+    /// Stat-only index rewrites (a tracked file touched, then the index refreshed, as `git status`
+    /// does) are not repository-authority drift: automatic codemaps stay, and nothing is repaired.
+    /// Each round also edits a Swift file so projection reruns and captures repository authority
+    /// against the rewritten index; warm recounts alone never capture.
+    func testStatOnlyIndexRewritesKeepAutomaticCodemapsWithoutRepair() async throws {
+        let fixture = try await makeAutomaticRepairFixture(name: #function)
+        try await fixture.convergeBaseline()
+        let authorityChangesBefore = await fixture.repositoryAuthorityChanges()
+
+        for (index, path) in ["Sources/Target.swift", "Sources/Source.swift", "Sources/Target.swift"].enumerated() {
+            let round = index + 1
+            try fixture.repositories.rewriteIndexWithoutContentChange(path: path, at: fixture.root)
+            let coveragesBefore = await fixture.projectionCoveragesCompleted()
+            _ = try await fixture.store.editFile(
+                rootID: fixture.rootID,
+                relativePath: "Sources/Extra.swift",
+                newContent: "struct Extra { let round = \(round) }\n"
+            )
+            var calls: [String] = []
+            var included = false
+            while !included, calls.count < 4 {
+                if !calls.isEmpty { try await Task.sleep(for: .milliseconds(100)) }
+                let call = try await fixture.automaticCall(seedPath: "Sources/Source.swift")
+                included = call.included
+                calls.append(call.diagnostics)
+                XCTAssertFalse(call.reportsGraphRebuild, "Round \(round) reset the root: \(call.diagnostics)")
+                XCTAssertFalse(
+                    call.diagnostics.contains("repositoryAuthorityChanged"),
+                    "Round \(round) reported authority drift: \(call.diagnostics)"
+                )
+            }
+            XCTAssertTrue(included, "Round \(round) dropped Target:\n\(calls.joined(separator: "\n"))")
+            let completed = try await fixture.awaitProjectionCoverage(beyond: coveragesBefore)
+            XCTAssertTrue(completed, "Round \(round): the projection rerun never completed coverage.")
+        }
+        let repairs = await fixture.store.codemapRootSessionRepairCountForTesting()
+        XCTAssertEqual(repairs - fixture.baselineRepairs, 0, "Stat-only index rewrites must not reset the root.")
+        let authorityChangesAfter = await fixture.repositoryAuthorityChanges()
+        XCTAssertEqual(authorityChangesAfter, authorityChangesBefore, "No capture may observe an authority change.")
+    }
+
     /// Covers store-internal projection preload only: with drift and no accounting call, the store
     /// and engine never reset the root session. App recount triggers are not modeled here.
     func testIdleStoreInternalProjectionPreloadDoesNotRepairAuthorityDrift() async throws {
@@ -405,5 +446,20 @@ private final class AutomaticRepairFixture: @unchecked Sendable {
 
     func repositoryAuthorityChanges() async -> UInt64 {
         await store.codemapBindingEngineAccountingForTesting(rootID: rootID)?.counters.repositoryAuthorityChanges ?? 0
+    }
+
+    func projectionCoveragesCompleted() async -> UInt64 {
+        await store.codemapBindingEngineAccountingForTesting(rootID: rootID)?.counters.projectionCoveragesCompleted ?? 0
+    }
+
+    /// Waits up to 30 s for a projection coverage completed after `baseline`.
+    func awaitProjectionCoverage(beyond baseline: UInt64) async throws -> Bool {
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: .seconds(30))
+        while clock.now < deadline {
+            if await projectionCoveragesCompleted() > baseline { return true }
+            try await Task.sleep(for: .milliseconds(25))
+        }
+        return false
     }
 }

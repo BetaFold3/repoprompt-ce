@@ -269,6 +269,9 @@ struct WorkspaceCodemapGitCapabilityServiceHooks {
     var beforeSourceAuthorityPostRepositoryCapture: @Sendable () async -> Void
     var afterAuthorityEvidenceComponentStat: @Sendable (String, Bool) -> Void
     var afterAuthorityEvidenceOpen: @Sendable (URL) -> Void
+    /// Runs after a capture reads the index entries with `ls-files`, right before the closing index
+    /// stat that must match the opening one.
+    var afterIndexEntriesRead: @Sendable () async -> Void
 
     init(
         beforeResolution: @escaping @Sendable () async -> Void = {},
@@ -276,7 +279,8 @@ struct WorkspaceCodemapGitCapabilityServiceHooks {
         afterSourcePathFingerprintCapture: @escaping @Sendable () async -> Void = {},
         beforeSourceAuthorityPostRepositoryCapture: @escaping @Sendable () async -> Void = {},
         afterAuthorityEvidenceComponentStat: @escaping @Sendable (String, Bool) -> Void = { _, _ in },
-        afterAuthorityEvidenceOpen: @escaping @Sendable (URL) -> Void = { _ in }
+        afterAuthorityEvidenceOpen: @escaping @Sendable (URL) -> Void = { _ in },
+        afterIndexEntriesRead: @escaping @Sendable () async -> Void = {}
     ) {
         self.beforeResolution = beforeResolution
         self.afterFirstAuthorityCapture = afterFirstAuthorityCapture
@@ -284,6 +288,7 @@ struct WorkspaceCodemapGitCapabilityServiceHooks {
         self.beforeSourceAuthorityPostRepositoryCapture = beforeSourceAuthorityPostRepositoryCapture
         self.afterAuthorityEvidenceComponentStat = afterAuthorityEvidenceComponentStat
         self.afterAuthorityEvidenceOpen = afterAuthorityEvidenceOpen
+        self.afterIndexEntriesRead = afterIndexEntriesRead
     }
 
     static let none = WorkspaceCodemapGitCapabilityServiceHooks()
@@ -311,6 +316,9 @@ actor WorkspaceCodemapGitCapabilityService {
         let repositoryBindingEpoch: String
         let worktreeBindingEpoch: String
         let layoutGeneration: String
+        /// Digest of the index entries the codemap pipeline reads (`ls-files --stage -v`), not of
+        /// the index file's stat (oversized indexes fall back to the stat digest). See
+        /// `indexEntriesGeneration(layout:objectFormat:)`.
         let indexGeneration: String
         let checkoutConfigurationGeneration: String
         let attributeGeneration: String
@@ -375,9 +383,15 @@ actor WorkspaceCodemapGitCapabilityService {
     private let hooks: WorkspaceCodemapGitCapabilityServiceHooks
     private let pathFingerprintClient: WorkspaceCodemapPathFingerprintClient
     private let historicalRecordLimit: Int
+    private let indexEntriesOutputByteLimit: Int
     private var records: [WorkspaceCodemapRootEpoch: RootRecord] = [:]
+    /// Index entry generations keyed by standardized index path. Each value pairs the index stat
+    /// digest with the entry digest read while that stat was the same before and after the read.
+    /// In memory only; cleared when it reaches `indexGenerationMemoLimit` entries.
+    private var indexGenerationMemo: [String: (statDigest: String, generation: String)] = [:]
     #if DEBUG
         private var authorityCaptureCount = 0
+        private var indexEntriesReadCount = 0
     #endif
     private var flights: [WorkspaceCodemapRootEpoch: RootFlight] = [:]
     private var resolutionObservers: [UUID: Task<Void, Never>] = [:]
@@ -390,15 +404,22 @@ actor WorkspaceCodemapGitCapabilityService {
         namespaceSalt: Data,
         hooks: WorkspaceCodemapGitCapabilityServiceHooks = .none,
         pathFingerprintClient: WorkspaceCodemapPathFingerprintClient = .noFollow,
-        historicalRecordLimit: Int = 64
+        historicalRecordLimit: Int = 64,
+        indexEntriesOutputByteLimit: Int = WorkspaceCodemapGitCapabilityService.defaultIndexEntriesOutputByteLimit
     ) {
         precondition(historicalRecordLimit > 0)
+        precondition(indexEntriesOutputByteLimit > 0)
         self.gitService = gitService
         self.namespaceSalt = namespaceSalt
         self.hooks = hooks
         self.pathFingerprintClient = pathFingerprintClient
         self.historicalRecordLimit = historicalRecordLimit
+        self.indexEntriesOutputByteLimit = indexEntriesOutputByteLimit
     }
+
+    /// Above this much `ls-files` output, `indexGeneration` falls back to the index stat digest.
+    static let defaultIndexEntriesOutputByteLimit = 64 * 1024 * 1024
+    private static let indexGenerationMemoLimit = 32
 
     nonisolated static func eligibilityPreflight(
         gitService: GitService,
@@ -549,6 +570,11 @@ actor WorkspaceCodemapGitCapabilityService {
         /// revalidation), each about eight Git spawns.
         func authorityCaptureCountForTesting() -> Int {
             authorityCaptureCount
+        }
+
+        /// Full-index `ls-files` reads started by `indexEntriesGeneration(layout:objectFormat:)` (memo misses).
+        func indexEntriesReadCountForTesting() -> Int {
+            indexEntriesReadCount
         }
     #endif
 
@@ -1273,7 +1299,8 @@ actor WorkspaceCodemapGitCapabilityService {
         if let captureError = error as? CapabilityCaptureError {
             switch captureError {
             case .layoutChanged(.repositoryLayout): return .repositoryLayoutChanged
-            case .layoutChanged(.descriptorWindow): return .unstableWindow(window)
+            case .layoutChanged(.descriptorWindow), .layoutChanged(.indexEntriesWindow):
+                return .unstableWindow(window)
             case .permissionDenied: return .captureFailed(.permissionDenied)
             case .authorityFileTooLarge: return .captureFailed(.transient)
             }
@@ -1358,18 +1385,26 @@ actor WorkspaceCodemapGitCapabilityService {
 
         do {
             for attempt in 0 ..< 2 {
-                let pre = try await captureAuthority(
-                    loadedRoot: loadedRoot,
-                    expectedLayout: layout,
-                    prefix: prefix
-                )
-                await hooks.afterFirstAuthorityCapture()
-                try Task.checkCancellation()
-                let post = try await captureAuthority(
-                    loadedRoot: loadedRoot,
-                    expectedLayout: layout,
-                    prefix: prefix
-                )
+                let pre: AuthorityCapture
+                let post: AuthorityCapture
+                do {
+                    pre = try await captureAuthority(
+                        loadedRoot: loadedRoot,
+                        expectedLayout: layout,
+                        prefix: prefix
+                    )
+                    await hooks.afterFirstAuthorityCapture()
+                    try Task.checkCancellation()
+                    post = try await captureAuthority(
+                        loadedRoot: loadedRoot,
+                        expectedLayout: layout,
+                        prefix: prefix
+                    )
+                } catch CapabilityCaptureError.layoutChanged(.indexEntriesWindow) {
+                    // An index rewrite during an entries read is the same race as a pre/post mismatch.
+                    if attempt == 0 { continue }
+                    return .transient(.repositoryChanging)
+                }
                 guard pre == post else {
                     if attempt == 0 { continue }
                     return .transient(.repositoryChanging)
@@ -1462,9 +1497,9 @@ actor WorkspaceCodemapGitCapabilityService {
             ],
             includeBoundedContents: true
         )
-        let indexGeneration = try digestEvidence(
-            urls: [currentLayout.gitDir.appendingPathComponent("index")],
-            includeBoundedContents: false
+        let indexGeneration = try await indexEntriesGeneration(
+            layout: currentLayout,
+            objectFormat: objectFormat
         )
         let metadataGeneration = try digestEvidence(
             urls: Self.metadataURLs(layout: currentLayout),
@@ -1535,12 +1570,55 @@ actor WorkspaceCodemapGitCapabilityService {
         )
     }
 
+    /// The `indexGeneration` authority component: a digest of the index entries the codemap pipeline
+    /// reads (mode, object ID, stage, path, assume-unchanged and skip-worktree per entry), so an index
+    /// rewrite that changes only stat data (for example `git status` refreshing entries) is not an
+    /// authority change. The index stat digest keys an in-memory memo, so `ls-files` runs once per index
+    /// rewrite. The entries are read between two stat digests; if they differ, the capture fails as an
+    /// unstable repository window (resolution retries it once, like a pre/post capture mismatch, then
+    /// reports `.repositoryChanging`) and nothing is memoized. Above `indexEntriesOutputByteLimit` of
+    /// output, the stat digest itself is the generation.
+    private func indexEntriesGeneration(
+        layout: GitRepositoryLayout,
+        objectFormat: GitObjectFormat
+    ) async throws -> String {
+        let indexURL = layout.gitDir.appendingPathComponent("index")
+        let memoKey = indexURL.standardizedFileURL.path
+        let openingStat = try digestEvidence(urls: [indexURL], includeBoundedContents: false)
+        if let memo = indexGenerationMemo[memoKey], memo.statDigest == openingStat {
+            return memo.generation
+        }
+        #if DEBUG
+            indexEntriesReadCount += 1
+        #endif
+        let entriesDigest = try await gitService.gitIndexEntriesDigest(
+            at: layout.workTreeRoot,
+            objectFormat: objectFormat,
+            maximumOutputByteCount: indexEntriesOutputByteLimit
+        )
+        await hooks.afterIndexEntriesRead()
+        try Task.checkCancellation()
+        let closingStat = try digestEvidence(urls: [indexURL], includeBoundedContents: false)
+        guard openingStat == closingStat else {
+            throw CapabilityCaptureError.layoutChanged(.indexEntriesWindow)
+        }
+        let generation = entriesDigest ?? openingStat
+        if indexGenerationMemo[memoKey] == nil, indexGenerationMemo.count >= Self.indexGenerationMemoLimit {
+            indexGenerationMemo.removeAll()
+        }
+        indexGenerationMemo[memoKey] = (statDigest: openingStat, generation: generation)
+        return generation
+    }
+
     private enum CapabilityCaptureError: Error {
         /// Where a layout change was observed. Only the capture's repository layout/prefix guard is a
-        /// layout change; descriptor-window races and traversal rejection are window instability.
+        /// layout change; descriptor-window races, traversal rejection, and an index rewrite while
+        /// its entries are read are window instability.
         enum Origin {
             case repositoryLayout
             case descriptorWindow
+            /// The index stat changed while `ls-files` read its entries.
+            case indexEntriesWindow
         }
 
         case layoutChanged(Origin)
