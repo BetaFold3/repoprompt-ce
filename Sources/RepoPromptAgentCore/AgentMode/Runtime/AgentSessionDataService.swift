@@ -1972,6 +1972,11 @@ package actor AgentSessionDataService {
                 || !$0.intentionallyRemovedAcceptedUserItemReceiptsByID.isEmpty
         } ?? false
 
+        #if DEBUG
+            // Phase-boundary clocks are read only while diagnostics are enabled; later marks follow
+            // the first so one save never reports a partial split.
+            let diagnosticsPrepareStartMS = AgentModePerfDiagnostics.timestampMSIfEnabled()
+        #endif
         let sessionToSave = Self.sessionPreparedForStorage(
             sessionWithAuthoritativeSchedule,
             fileURL: fileURL,
@@ -1981,11 +1986,29 @@ package actor AgentSessionDataService {
                 ? nil
                 : trustedCanonicalItemCount
         )
+        #if DEBUG
+            let diagnosticsEncodeStartMS = diagnosticsPrepareStartMS.map { _ in AgentModePerfDiagnostics.timestampMS() }
+        #endif
         let freshEncoder = JSONEncoder()
         // Field-local codec: `providerUsage` bytes are re-inserted verbatim; any preservation
         // failure throws here, before the atomic writer replaces the file.
         let data = try AgentSessionDataCodec.encodeSession(sessionToSave, using: freshEncoder)
+        #if DEBUG
+            let diagnosticsWriteStartMS = diagnosticsEncodeStartMS.map { _ in AgentModePerfDiagnostics.timestampMS() }
+        #endif
         try await diskWriter.enqueueAndWait(data: data, url: fileURL)
+        #if DEBUG
+            // The atomic replacement has returned successfully: this is the full-save commit point,
+            // recorded before schedule/reset authority and metadata-index work.
+            Self.recordFullSessionWrittenDiagnostics(
+                sessionToSave,
+                encodedByteCount: data.count,
+                committingTranscriptReset: resetReceipt != nil,
+                prepareStartMS: diagnosticsPrepareStartMS,
+                encodeStartMS: diagnosticsEncodeStartMS,
+                writeStartMS: diagnosticsWriteStartMS
+            )
+        #endif
         rememberScheduleAuthority(
             from: sessionToSave,
             fileURL: fileURL,
@@ -2011,6 +2034,40 @@ package actor AgentSessionDataService {
             disposition: .written
         )
     }
+
+    #if DEBUG
+        /// `save.session.written`: one successful full-session replacement by `saveAgentSessionLocked`.
+        /// Schedule mutations, accepted-send finalization, and load/migration rewrites also replace
+        /// session files but are deliberately not counted. `writerAwait` is awaited writer latency
+        /// (queueing and coalescing included), not disk-only time. Fields carry no content or paths.
+        private static func recordFullSessionWrittenDiagnostics(
+            _ session: AgentSession,
+            encodedByteCount: Int,
+            committingTranscriptReset: Bool,
+            prepareStartMS: Double?,
+            encodeStartMS: Double?,
+            writeStartMS: Double?
+        ) {
+            guard let prepareStartMS, let encodeStartMS, let writeStartMS else { return }
+            let writtenMS = AgentModePerfDiagnostics.timestampMS()
+            AgentModePerfDiagnostics.increment("save.session.written", tabID: session.composeTabID)
+            AgentModePerfDiagnostics.event(
+                "save.session.written",
+                tabID: session.composeTabID,
+                fields: [
+                    "sessionID": AgentModePerfDiagnostics.shortID(session.id),
+                    "duration": AgentModePerfDiagnostics.formatMS(writtenMS - prepareStartMS),
+                    "prepare": AgentModePerfDiagnostics.formatMS(encodeStartMS - prepareStartMS),
+                    "encode": AgentModePerfDiagnostics.formatMS(writeStartMS - encodeStartMS),
+                    "writerAwait": AgentModePerfDiagnostics.formatMS(writtenMS - writeStartMS),
+                    "bytes": String(encodedByteCount),
+                    "itemCount": session.itemCount.map(String.init) ?? "nil",
+                    "turnCount": String(session.transcript?.turns.count ?? 0),
+                    "transcriptReset": String(committingTranscriptReset)
+                ]
+            )
+        }
+    #endif
 
     /// Atomically compare-and-mutates the persisted scheduled-send member.
     ///
