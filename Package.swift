@@ -16,9 +16,14 @@ let benchmarkTestsEnabled = environment["RPCE_ENABLE_BENCHMARK_TESTS"] == "1"
 // Gate on, first-party Swift targets define DEBUG in the release build, plus a
 // lane marker. Packages/RepoPromptCore and Packages/RepoPromptAgentProviders
 // keep identical copies of this gate (manifests cannot share code).
+// Optimized-incremental App lane (`canonical_swift.sh --rpce-optimized-incremental`): the same gate
+// plus RPCE_OPTIMIZED_INCREMENTAL=1 adds the RPCE_OPTIMIZED_INCREMENTAL lane label to every
+// first-party module; only the root manifest also compiles RepoPromptApp non-WMO (below).
 let optimizedDiagnosticsLane = environment["RPCE_OPTIMIZED_DIAGNOSTICS"] == "1"
+let optimizedIncrementalLane = optimizedDiagnosticsLane && environment["RPCE_OPTIMIZED_INCREMENTAL"] == "1"
 let firstPartyDebugSettings: [SwiftSetting] = optimizedDiagnosticsLane
     ? [.define("DEBUG"), .define("RPCE_OPTIMIZED_DIAGNOSTICS", .when(configuration: .release))]
+    + (optimizedIncrementalLane ? [.define("RPCE_OPTIMIZED_INCREMENTAL", .when(configuration: .release))] : [])
     : [.define("DEBUG", .when(configuration: .debug))]
 
 var packageDependencies: [Package.Dependency] = [
@@ -100,6 +105,15 @@ let repoPromptLayerSwiftSettings: [SwiftSetting] = firstPartyDebugSettings + [
 ]
 
 var repoPromptAppSwiftSettings: [SwiftSetting] = repoPromptLayerSwiftSettings
+// Optimized-incremental App lane only: RepoPromptApp alone overrides SwiftPM's release
+// -whole-module-optimization (the driver honors the last of the pair) with incremental batch mode.
+// SwiftPM's own -j<host CPUs> sets frontend parallelism. Every other module keeps -O WMO;
+// Scripts/verify_build_lane_flags.py --lane optimized-incremental proves both on every lane package.
+if optimizedIncrementalLane {
+    repoPromptAppSwiftSettings.append(
+        .unsafeFlags(["-no-whole-module-optimization", "-incremental", "-enable-batch-mode"], .when(configuration: .release))
+    )
+}
 
 var repoPromptTestDependencies: [Target.Dependency] = [
     "RepoPromptApp",
