@@ -1664,6 +1664,52 @@ package actor WorkspaceFileContextStore {
             return await owner.engine.accounting()
         }
 
+        /// Mirrors a real dead fence: the engine's first catalog read publishes the authoritative
+        /// projection shard, a later stale read supersedes the job, and its worker exits.
+        func installRetainedSupersededCodemapProjectionForTesting(rootID: UUID) async -> UUID? {
+            guard let owner = debugCodemapBindingEngine(rootID: rootID),
+                  let authority = codemapSessionsByRootEpoch[owner.rootEpoch]?.authority,
+                  await ensureCodemapProjectionCatalogShard(authority: authority)
+            else { return nil }
+            return await owner.engine.debugInstallRetainedSupersededProjectionJobForTesting(
+                rootEpoch: owner.rootEpoch
+            )
+        }
+
+        func retainedSupersededCodemapProjectionIDForTesting(rootID: UUID) async -> UUID? {
+            guard let owner = debugCodemapBindingEngine(rootID: rootID) else { return nil }
+            return await owner.engine.retainedSupersededProjectionJobID(rootEpoch: owner.rootEpoch)
+        }
+
+        /// Read-only: the projection catalog token the root's newest engine-backed session would
+        /// observe now, or nil without a current session, authority, or published catalog shard.
+        func codemapProjectionCatalogTokenForTesting(rootID: UUID) -> WorkspaceCodemapProjectionCatalogToken? {
+            guard let owner = debugCodemapBindingEngine(rootID: rootID),
+                  let authority = codemapSessionsByRootEpoch[owner.rootEpoch]?.authority
+            else { return nil }
+            return codemapProjectionCatalogShardAndToken(authority: authority)?.token
+        }
+
+        /// Applied-index batches classified projection-neutral for the root in this root lifetime.
+        func codemapProjectionNeutralBatchCountForTesting(rootID: UUID) -> UInt64 {
+            codemapProjectionNeutralBatchCountsByRootID[rootID] ?? 0
+        }
+
+        /// The root's raw applied-index generation, which every published batch advances.
+        func appliedIndexGenerationForTesting(rootID: UUID) -> UInt64? {
+            appliedIndexGenerationsByRootID[rootID]
+        }
+
+        /// The raw topology generation of the root's published catalog shard, if one is published.
+        func publishedRootCatalogShardTopologyGenerationForTesting(rootID: UUID) -> UInt64? {
+            publishedRootCatalogShardsByRootID[rootID]?.key.topologyGeneration
+        }
+
+        /// The ordered projection file IDs of the root's published catalog shard, if one is published.
+        func publishedRootCatalogShardProjectionFileIDsForTesting(rootID: UUID) -> [UUID]? {
+            publishedRootCatalogShardsByRootID[rootID]?.projectionFiles.map(\.file.id)
+        }
+
         private func debugCodemapBindingEngine(
             rootID: UUID
         ) -> (rootEpoch: WorkspaceCodemapRootEpoch, engine: WorkspaceCodemapBindingEngine)? {
@@ -2694,6 +2740,18 @@ package actor WorkspaceFileContextStore {
     private var fileSystemDeltaContinuations: [UUID: AsyncStream<WorkspaceFileSystemDeltaEvent>.Continuation] = [:]
     private var appliedIndexContinuations: [UUID: AsyncStream<WorkspaceAppliedIndexBatchEvent>.Continuation] = [:]
     private var appliedIndexGenerationsByRootID: [UUID: UInt64] = [:]
+    /// Projection-relevant applied-index stamp per root. It follows `appliedIndexGenerationsByRootID`
+    /// except across batches that change no projection candidate (`isCodemapProjectionNeutral`), so
+    /// the projection catalog token stays current through folder-only batches instead of
+    /// terminalizing a running or completed projection that nothing reschedules.
+    private var codemapProjectionAppliedIndexGenerationsByRootID: [UUID: UInt64] = [:]
+    /// Projection-relevant topology stamp per root. It follows `catalogGenerationsByRootID` only
+    /// across non-neutral batches (`isCodemapProjectionNeutral`), for the same reason as above.
+    private var codemapProjectionTopologyGenerationsByRootID: [UUID: UInt64] = [:]
+    #if DEBUG
+        /// Applied-index batches classified projection-neutral per root (test observability only).
+        private var codemapProjectionNeutralBatchCountsByRootID: [UUID: UInt64] = [:]
+    #endif
     private var sliceRebaseSourceEntries: [SliceRebaseSourceCacheKey: SliceRebaseSourceCacheEntry] = [:]
     private var sliceRebaseSourceEstimatedBytes = 0
     private var sliceRebaseSourceAccessOrdinal: UInt64 = 0
@@ -5166,6 +5224,8 @@ package actor WorkspaceFileContextStore {
                 rootLoadConfigurationsByPath[pending.standardizedPath] = pending.loadConfiguration
                 rootLoadOrder.append(root.id)
                 appliedIndexGenerationsByRootID[root.id] = 0
+                codemapProjectionAppliedIndexGenerationsByRootID[root.id] = 0
+                codemapProjectionTopologyGenerationsByRootID[root.id] = 0
                 catalogGenerationsByRootID[root.id] = 0
                 publishedRootCatalogShardsByRootID[root.id] = pending.preparedShard
                 rootCatalogShardDeltaStatesByRootID[root.id] = RootCatalogShardDeltaState(
@@ -7474,6 +7534,11 @@ package actor WorkspaceFileContextStore {
         if event.isRootUnload {
             publishedRootCatalogShardsByRootID.removeValue(forKey: event.rootID)
             rootCatalogShardDeltaStatesByRootID.removeValue(forKey: event.rootID)
+            codemapProjectionAppliedIndexGenerationsByRootID.removeValue(forKey: event.rootID)
+            codemapProjectionTopologyGenerationsByRootID.removeValue(forKey: event.rootID)
+            #if DEBUG
+                codemapProjectionNeutralBatchCountsByRootID.removeValue(forKey: event.rootID)
+            #endif
             return
         }
 
@@ -7484,6 +7549,17 @@ package actor WorkspaceFileContextStore {
             publishedRootCatalogShardsByRootID.removeValue(forKey: event.rootID)
             rootCatalogShardDeltaStatesByRootID.removeValue(forKey: event.rootID)
             return
+        }
+        // Folder-only batches (adds, removes, modifications) patch only folder records and change no
+        // projection candidate; the projection stamps follow only batches with a file-level change.
+        // The catalog (topology) generation was already bumped before this event was published.
+        if !event.isCodemapProjectionNeutral {
+            codemapProjectionAppliedIndexGenerationsByRootID[event.rootID] = event.generation
+            codemapProjectionTopologyGenerationsByRootID[event.rootID] = currentKey.topologyGeneration
+        } else {
+            #if DEBUG
+                codemapProjectionNeutralBatchCountsByRootID[event.rootID, default: 0] &+= 1
+            #endif
         }
 
         guard let previousShard = publishedRootCatalogShardsByRootID[event.rootID] else {
@@ -7894,6 +7970,15 @@ package actor WorkspaceFileContextStore {
                 pathIndexChangedFileIDs.insert(oldFileID)
             }
         }
+        // A projection-neutral batch must leave `files` untouched, so the shard's projection files
+        // and projection index (pure functions of `files`) cannot change under an unmoved token.
+        #if DEBUG
+            if event.isCodemapProjectionNeutral, !touchedFileIDs.isEmpty || !pathIndexChangedFileIDs.isEmpty {
+                assertionFailure(
+                    "Projection-neutral applied-index batch touched catalog files (root \(event.rootID), generation \(event.generation))."
+                )
+            }
+        #endif
         guard removedFileIDs.isDisjoint(with: upsertedFilesByID.keys),
               removedFolderIDs.isDisjoint(with: upsertedFoldersByID.keys),
               removedFilePaths.isDisjoint(with: upsertedFilePaths),
@@ -10116,6 +10201,8 @@ package actor WorkspaceFileContextStore {
         completion.record(rootID: root.id, lifetimeID: state.lifetimeID)
         rootLoadOrder.append(root.id)
         appliedIndexGenerationsByRootID[root.id] = 0
+        codemapProjectionAppliedIndexGenerationsByRootID[root.id] = 0
+        codemapProjectionTopologyGenerationsByRootID[root.id] = 0
         catalogGenerationsByRootID[root.id] = 0
         #if DEBUG
             rootCrawlCountsByRootID[root.id, default: 0] += 1
@@ -10528,6 +10615,11 @@ package actor WorkspaceFileContextStore {
                 isRootUnload: true
             ))
             appliedIndexGenerationsByRootID.removeValue(forKey: rootID)
+            codemapProjectionAppliedIndexGenerationsByRootID.removeValue(forKey: rootID)
+            codemapProjectionTopologyGenerationsByRootID.removeValue(forKey: rootID)
+            #if DEBUG
+                codemapProjectionNeutralBatchCountsByRootID.removeValue(forKey: rootID)
+            #endif
             catalogGenerationsByRootID.removeValue(forKey: rootID)
             #if DEBUG
                 publicationInvalidationHistoryByRootID.removeValue(forKey: rootID)
@@ -11352,6 +11444,9 @@ package actor WorkspaceFileContextStore {
 
         var provisionalCandidates: [WorkspaceCodemapBindingAutomaticSelectionCatalogCandidate] = []
         var provisionalIncompleteReasons: [WorkspaceCodemapAutomaticSelectionIncompleteReason] = []
+        var retainedSupersededProjections: [
+            WorkspaceCodemapRootEpoch: (engine: WorkspaceCodemapBindingEngine, jobID: UUID)
+        ] = [:]
         for rootEpoch in orderedRootEpochs {
             guard let session = codemapSessionsByRootEpoch[rootEpoch],
                   let engine = session.engine,
@@ -11375,6 +11470,11 @@ package actor WorkspaceFileContextStore {
                     maximumMatchedCandidateCount: maximumCandidateDemandCount
                 )
             )
+            // Captured regardless of disposition: over a dead fence the engine can still return an
+            // empty provisional plan, which yields no usable fallback candidates.
+            if let jobID = await engine.retainedSupersededProjectionJobID(rootEpoch: rootEpoch) {
+                retainedSupersededProjections[rootEpoch] = (engine, jobID)
+            }
             if case let .provisional(candidates, _, progress, remainingCount, retry) = engineDisposition {
                 let remainingCapacity = maximumCandidateDemandCount - provisionalCandidates.count
                 guard candidates.count <= remainingCapacity else {
@@ -11418,6 +11518,19 @@ package actor WorkspaceFileContextStore {
             budgetPolicy: queryPolicy
         )
         await codemapAutomaticSelectionQueryHook(orderedRootEpochs[0])
+        // Reconfirm retained dead fences before the synchronous validation below, so no await
+        // separates that validation from a terminal or fallback return.
+        var reconfirmedSupersededRootEpochs = Set<WorkspaceCodemapRootEpoch>()
+        if provisionalFallbackDisposition == nil {
+            for rootEpoch in orderedRootEpochs {
+                guard let captured = retainedSupersededProjections[rootEpoch] else { continue }
+                if await captured.engine.retainedSupersededProjectionJobID(rootEpoch: rootEpoch) ==
+                    captured.jobID
+                {
+                    reconfirmedSupersededRootEpochs.insert(rootEpoch)
+                }
+            }
+        }
         guard codemapAutomaticSelectionRootScopeEpochs(rootScope) == rootScopeEpochs else {
             return .stale(.rootEpochNotCurrent(orderedRootEpochs[0]))
         }
@@ -11436,6 +11549,24 @@ package actor WorkspaceFileContextStore {
                   ready.ticket.requestGeneration == capturedTicket.requestGeneration,
                   codemapDemandIsCurrent(capturedTicket)
             else { return .stale(.sourceStateChanged(source)) }
+        }
+
+        let supersededRootEpochs = reconfirmedSupersededRootEpochs
+        /// Graph coverage that cannot advance because this root's projection is a retained dead
+        /// fence is terminal, not pending. Provisional results stay usable, and other roots'
+        /// reasons are untouched. The job was reconfirmed before validation; the same engine
+        /// must still own the root session.
+        func retainedSupersededDisposition(
+            rootEpoch: WorkspaceCodemapRootEpoch
+        ) -> WorkspaceCodemapAutomaticSelectionCandidatePlanDisposition? {
+            guard supersededRootEpochs.contains(rootEpoch),
+                  let captured = retainedSupersededProjections[rootEpoch],
+                  codemapSessionsByRootEpoch[rootEpoch]?.engine === captured.engine
+            else { return nil }
+            return .unavailable(.graph(.definitionUniverse(
+                rootEpoch: rootEpoch,
+                reason: .projectionSuperseded
+            )))
         }
 
         switch disposition {
@@ -11476,10 +11607,25 @@ package actor WorkspaceFileContextStore {
                 coverageProofs: coverageProofs
             ))
         case let .incomplete(reason):
+            if case let .definitionUniverse(rootEpoch, _, _, _) = reason,
+               let terminal = retainedSupersededDisposition(rootEpoch: rootEpoch)
+            {
+                return terminal
+            }
             return provisionalFallbackDisposition ?? .incomplete([.graph(reason)])
         case let .busy(reason):
+            if case let .definitionUniverse(rootEpoch, _, _) = reason,
+               let terminal = retainedSupersededDisposition(rootEpoch: rootEpoch)
+            {
+                return terminal
+            }
             return provisionalFallbackDisposition ?? .busy(reason)
         case let .unavailable(reason):
+            if case let .notActivated(rootEpoch) = reason,
+               let terminal = retainedSupersededDisposition(rootEpoch: rootEpoch)
+            {
+                return terminal
+            }
             return .unavailable(.graph(reason))
         case let .stale(reason):
             return .stale(.graph(reason))
@@ -18775,8 +18921,10 @@ package actor WorkspaceFileContextStore {
             shard,
             WorkspaceCodemapProjectionCatalogToken(
                 rootEpoch: authority.rootEpoch,
-                topologyGeneration: shard.key.topologyGeneration,
-                appliedIndexGeneration: shard.appliedIndexGeneration,
+                // No projection-relevant batch has occurred in this root lifetime; zero is the initial
+                // projection revision, independent of the shard's current raw generations.
+                topologyGeneration: codemapProjectionTopologyGenerationsByRootID[authority.rootEpoch.rootID] ?? 0,
+                appliedIndexGeneration: codemapProjectionAppliedIndexGenerationsByRootID[authority.rootEpoch.rootID] ?? 0,
                 catalogGeneration: authority.catalogGeneration,
                 ingressGeneration: authority.ingressGeneration,
                 projectionInvalidationGeneration:

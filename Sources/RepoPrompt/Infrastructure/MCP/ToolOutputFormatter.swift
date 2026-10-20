@@ -3565,6 +3565,7 @@ extension ToolOutputFormatter {
             || (codeStructure.omittedTotal ?? 0) > 0
             || (codeStructure.tokenBudgetOmittedCount ?? 0) > 0
             || codeStructure.tokenBudgetHit == true
+            || codeStructure.automaticCodemapIssues?.isEmpty == false
     }
 
     private static func selectedCodeStructureDiagnosticLines(
@@ -3595,6 +3596,14 @@ extension ToolOutputFormatter {
         }
         if codeStructure.tokenBudgetHit == true {
             lines.append("\(summaryPrefix)Token budget hit\(summarySuffix)")
+        }
+        if let automaticIssues = codeStructure.automaticCodemapIssues, !automaticIssues.isEmpty {
+            lines.append(
+                "\(summaryPrefix)Automatic codemaps unavailable\(summarySuffix): \(automaticIssues.count) root(s)"
+            )
+            for issue in automaticIssues {
+                lines.append("\(bulletIndent)- \(issue.message)")
+            }
         }
         return lines
     }

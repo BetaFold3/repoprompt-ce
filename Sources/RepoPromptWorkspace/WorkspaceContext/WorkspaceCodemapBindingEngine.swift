@@ -1453,6 +1453,27 @@ actor WorkspaceCodemapBindingEngine {
         return true
     }
 
+    /// Identity of the current session's retained superseded projection job, if one fences the root.
+    func retainedSupersededProjectionJobID(rootEpoch: WorkspaceCodemapRootEpoch) -> UUID? {
+        retainedSupersededProjectionJob(rootEpoch: rootEpoch)?.id
+    }
+
+    /// A superseded job retained with no worker for the current, non-latched session.
+    /// `scheduleProjectionPreload` refuses it and no restart path revives it; only root
+    /// invalidation or unload removes it. Authority-latched sessions keep their own repair path.
+    private func retainedSupersededProjectionJob(
+        rootEpoch: WorkspaceCodemapRootEpoch
+    ) -> ProjectionPreloadJob? {
+        guard case let .eligible(session)? = roots[rootEpoch],
+              session.projectionAuthorityFailure == nil,
+              let job = projectionJobs[rootEpoch],
+              job.phase == .superseded,
+              job.task == nil,
+              job.sessionID == session.id
+        else { return nil }
+        return job
+    }
+
     func waitForCurrentProjectionCoverage(
         rootEpoch: WorkspaceCodemapRootEpoch
     ) async -> Bool {
@@ -1513,6 +1534,10 @@ actor WorkspaceCodemapBindingEngine {
                 retry: preload.retry
             ) {
                 return provisional
+            }
+            // A retained dead fence is terminal for this session, not pending work.
+            if retainedSupersededProjectionJob(rootEpoch: request.rootEpoch)?.id == preload.id {
+                return .unavailable(.projectionSuperseded)
             }
             if preload.phase == .suspendedBusy {
                 return .busy(
@@ -2017,6 +2042,48 @@ actor WorkspaceCodemapBindingEngine {
                 debugCapabilityResolutionsByRootEpoch[rootEpoch] ?? 0,
                 debugRepositoryAuthorityChangesByRootEpoch[rootEpoch] ?? 0
             )
+        }
+
+        /// Installs the retained-superseded fence (no worker, no proof) for the current session when
+        /// the root has no projection job. Store-level tests use it where the real catalog cannot
+        /// deterministically supersede; the engine-level regression drives the real stale path.
+        func debugInstallRetainedSupersededProjectionJobForTesting(
+            rootEpoch: WorkspaceCodemapRootEpoch
+        ) -> UUID? {
+            guard case let .eligible(session)? = roots[rootEpoch],
+                  session.projectionAuthorityFailure == nil,
+                  projectionJobs[rootEpoch] == nil
+            else { return nil }
+            let jobID = UUID()
+            projectionJobs[rootEpoch] = ProjectionPreloadJob(
+                id: jobID,
+                rootEpoch: rootEpoch,
+                sessionID: session.id,
+                sessionGeneration: session.generation,
+                invalidationGeneration: session.invalidationGeneration,
+                repositoryAuthority: session.capability.repositoryAuthority,
+                catalogGeneration: session.registration.catalogGeneration,
+                ingressGeneration: session.registration.ingressGeneration,
+                phase: .superseded,
+                generation: nil,
+                cursor: nil,
+                lastProcessedCursor: nil,
+                progress: projectionProgress(.notStarted, phase: .superseded),
+                nextSegmentSequence: 0,
+                pipelineScopes: [:],
+                resources: .zero,
+                pendingManifestMutationCount: 0,
+                retryAttempt: 0,
+                retry: nil,
+                budget: nil,
+                checkpoint: nil,
+                coverageProof: nil,
+                coverageCompletedUptimeNanoseconds: nil,
+                task: nil,
+                isQueuedForAdmission: false,
+                isActiveBatch: false
+            )
+            return jobID
         }
 
         func debugProjectionContributionObservation(
