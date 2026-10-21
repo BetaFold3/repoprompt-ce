@@ -1351,6 +1351,17 @@ package final class AgentTabSession: ObservableObject {
     package var activeReasoningItemID: UUID?
     package var reasoningItemIDsByGroupID: [String: UUID] = [:]
     package var pendingAssistantDelta: String = ""
+    /// The flush of whichever producer (VM or Codex coordinator) armed the current buffer timer;
+    /// `drainPendingAssistantDelta()` applies the buffer through it, exactly as that timer would.
+    package var assistantDeltaDrain: ((AgentTabSession) -> Void)?
+
+    /// Applies buffered assistant text now through its producer's own flush, which clears the
+    /// buffer and invalidates the pending timer first, so the text lands exactly once.
+    package func drainPendingAssistantDelta() {
+        guard !pendingAssistantDelta.isEmpty, let assistantDeltaDrain else { return }
+        assistantDeltaDrain(self)
+    }
+
     /// Rows of any kind appended by background (between-run) delivery. A run never resumes or
     /// replaces them, even when they landed below its user row, and each delivery's lookups
     /// skip the other's rows. Not persisted.
@@ -1554,8 +1565,32 @@ package final class AgentTabSession: ObservableObject {
         didSet {
             if isDirty {
                 persistenceMutationGeneration &+= 1
+                onPersistenceMutation?(self)
             }
         }
+    }
+
+    /// Called on every `isDirty = true`, including dirty-only edits that change no source item.
+    /// Source-item mutations notify through `onSourceItemsChanged` first, before their dirty mark.
+    package var onPersistenceMutation: ((AgentTabSession) -> Void)?
+    /// Transcript save maximum wait (R3), transient and never persisted: when the first change
+    /// not yet covered by a successful save happened. Later changes never move it; only a clean
+    /// save receipt of the current projection (or finding nothing left to save) clears it.
+    package var transcriptSaveFirstUnsavedAt: ContinuousClock.Instant?
+    /// The single maximum-wait (or failed-save retry) timer for this owner.
+    package var transcriptSaveMaxWaitTask: Task<Void, Never>?
+    /// Identifies the armed timer; a wakeup whose generation no longer matches is obsolete.
+    package var transcriptSaveMaxWaitGeneration: UInt64 = 0
+    /// Consecutive maximum-wait saves that wrote nothing; spaces retries (at least 1 s apart).
+    package var transcriptSaveMaxWaitRetryCount: Int = 0
+
+    /// Withdraws the maximum-wait obligation and makes any armed timer's wakeup obsolete.
+    package func invalidateTranscriptSaveMaxWait() {
+        transcriptSaveMaxWaitTask?.cancel()
+        transcriptSaveMaxWaitTask = nil
+        transcriptSaveMaxWaitGeneration &+= 1
+        transcriptSaveFirstUnsavedAt = nil
+        transcriptSaveMaxWaitRetryCount = 0
     }
 
     package var sourceItemsRevision: Int = 0
@@ -1644,6 +1679,11 @@ package final class AgentTabSession: ObservableObject {
 
     @discardableResult
     package func beginPersistentBindingTransition() -> UInt64 {
+        // Replacing an existing binding retires the previous owner's maximum wait. A genuine
+        // creator's first binding (inside its first save) keeps its own obligation.
+        if persistentSessionBindingIdentity != nil {
+            invalidateTranscriptSaveMaxWait()
+        }
         bindingTransitionGeneration &+= 1
         bindingTransitionInProgress = true
         authoritativeHydratedBinding = nil

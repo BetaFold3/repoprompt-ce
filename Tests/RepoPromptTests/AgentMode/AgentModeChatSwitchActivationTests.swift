@@ -1709,11 +1709,18 @@ final class AgentModeChatSwitchActivationTests: XCTestCase {
         /// placeholder holding the warm tab's different provider, stamps hydration with the normalized
         /// persisted provider. The activation catch-up then sees only the run-state delta and takes the
         /// guarded run-state-only final-turn import, installing output equal to a full cold reference.
+        /// Hydration is held until the switch's own save flush has run, as in the persisted-run-state
+        /// variants, so that save always follows the observation; a save that lands first is covered by
+        /// `testSaveBeforeActivationCatchUpReconcilesOnlyGeneratedToolSummaries`.
         func testColdActivationStampsPersistedProviderAndCatchesUpRunStateOnly() async throws {
             try await withFixture { fixture in
                 let viewModel = fixture.viewModel
                 defer { viewModel.test_persistenceWorkspaceOverride = nil }
-                let observed = try await observeColdActivationCatchUp(persistedRunState: .completed, in: fixture)
+                let observed = try await observeColdActivationCatchUp(
+                    persistedRunState: .completed,
+                    in: fixture,
+                    holdsHydrationUntilSwitchSettles: true
+                )
                 let session = observed.session
                 XCTAssertEqual(observed.persisted.agentKind, AgentProviderKind.openCode.rawValue)
                 XCTAssertEqual(observed.persisted.lastRunState, AgentSessionRunState.completed.rawValue)
@@ -1751,6 +1758,227 @@ final class AgentModeChatSwitchActivationTests: XCTestCase {
                 XCTAssertEqual(observed.transcriptBeforeCatchUp, reference.transcript)
                 XCTAssertEqual(observed.baseProjectionBeforeCatchUp, reference.baseProjection)
             }
+        }
+
+        /// A foreground save that runs after real persisted hydration but before the activation
+        /// catch-up (the race the observation tests hold off) reconciles working items from the
+        /// sanitized presentation. Judged against the original stored record: IDs, order, kinds,
+        /// user/assistant text, and tool associations are unchanged, the only in-memory difference is
+        /// dropping storage-generated `"<tool> • <status>"` summary text from summary-only bash
+        /// payloads, and the written file restores it, so the durable items equal the input. A later
+        /// activation then installs output equal to a cold reference built from the original input.
+        func testSaveBeforeActivationCatchUpReconcilesOnlyGeneratedToolSummaries() async throws {
+            try await withFixture { fixture in
+                let viewModel = fixture.viewModel
+                let window = fixture.window
+                let storageURL = fixture.rootURL.appendingPathComponent("SessionStore", isDirectory: true)
+                try FileManager.default.createDirectory(at: storageURL, withIntermediateDirectories: true)
+                var storeWorkspace = try XCTUnwrap(window.workspaceManager.activeWorkspace)
+                storeWorkspace.customStoragePath = storageURL
+                viewModel.test_persistenceWorkspaceOverride = storeWorkspace
+                // Automatic debounce and maximum-wait saves stay held; only the explicit save runs.
+                // Every held sleep is ended explicitly when the test finishes, after its timer task is
+                // cancelled, so no held debounce save runs late.
+                let heldSaveTimers = HeldSaveTimers()
+                viewModel.test_saveTimerSleepOverride = { _, _ in try await heldSaveTimers.sleep() }
+                defer {
+                    for owner in viewModel.sessions.values {
+                        viewModel.cancelTranscriptSaveTimers(owner)
+                    }
+                    heldSaveTimers.cancelAll()
+                    viewModel.test_persistenceWorkspaceOverride = nil
+                    viewModel.test_saveTimerSleepOverride = nil
+                    viewModel.test_saveSessionBeforeWriteHook = nil
+                    viewModel.test_setCurrentTabIDOverride(nil)
+                }
+
+                // The same multi-turn completed OpenCode record the observation tests use.
+                let writer = AgentModeViewModel(
+                    testWindowID: 4492,
+                    testWorkspacePath: storageURL.path,
+                    testWorkspaceDirectory: storageURL,
+                    codexControllerFactory: { _, _, _, _, _, _ in LifecycleNoopCodexController(recorder: LifecycleRecorder()) }
+                )
+                writer.test_establishPersistenceWorkspace(storeWorkspace)
+                // The writer's automatic saves are held too; only its explicit flush writes the record.
+                writer.test_saveTimerSleepOverride = { _, _ in try await heldSaveTimers.sleep() }
+                let writerTabID = UUID()
+                writer.test_setCurrentTabIDOverride(writerTabID)
+                let written = try await writer.ensureSessionReady(tabID: writerTabID)
+                written.selectedAgent = .openCode
+                for turn in 0 ..< 3 {
+                    let invocation = UUID()
+                    written.appendItem(.user("Turn \(turn) request"))
+                    written.appendItem(.toolCall(name: "bash", invocationID: invocation, argsJSON: "{\"command\":\"echo \(turn)\"}"))
+                    written.appendItem(.toolResult(name: "bash", invocationID: invocation, resultJSON: "{\"output\":\"\(turn)\"}"))
+                    written.appendItem(.assistant("Turn \(turn) reply"))
+                }
+                written.runState = .completed
+                let saved = await writer.flushSave(for: writerTabID)
+                XCTAssertTrue(saved)
+                let sessionID = try XCTUnwrap(written.activeAgentSessionID)
+                await writer.prepareForWindowClose()
+                // Window close keeps a pending debounce; retire the writer's timers so none can write
+                // the file under test later (its held sleeps end with the others at cleanup).
+                for owner in writer.sessions.values {
+                    writer.cancelTranscriptSaveTimers(owner)
+                }
+                XCTAssertTrue(writer.sessions.values.allSatisfy { $0.saveDebounceTask == nil && $0.transcriptSaveMaxWaitTask == nil })
+                writer.test_saveTimerSleepOverride = nil
+                let loadedInput = try await viewModel.test_dataService.loadAgentSession(id: sessionID, for: storeWorkspace)
+                let input = try XCTUnwrap(loadedInput)
+                let inputItems = try AgentTranscriptIO.workingSourceItems(from: XCTUnwrap(input.transcript))
+                let fileURL = try XCTUnwrap(input.fileURL)
+
+                // Real persisted hydration of a background-materialized tab, without activation.
+                let tabID = UUID()
+                let workspaceIndex = try XCTUnwrap(window.workspaceManager.workspaces.firstIndex { $0.id == storeWorkspace.id })
+                window.workspaceManager.workspaces[workspaceIndex].composeTabs.append(
+                    ComposeTabState(id: tabID, name: "Cold", activeAgentSessionID: sessionID)
+                )
+                window.promptManager.loadComposeTabsFromWorkspace(window.workspaceManager.workspaces[workspaceIndex])
+                let session = try materializeUnpresentable(tabID, in: fixture)
+                let request = AgentSessionHydrationRequest(
+                    workspace: storeWorkspace,
+                    tabID: tabID,
+                    sessionID: sessionID,
+                    resolvedDisplayName: "Cold",
+                    hasPendingQuestionUI: false,
+                    transcriptViewportState: .liveBottom,
+                    isCompressedHistoryRevealed: false,
+                    initialPerformanceSnapshot: .empty
+                )
+                let preparedPayload = try await viewModel.test_dataService.preparePersistedHydration(request)
+                let payload = try XCTUnwrap(preparedPayload)
+                let didHydrate = await viewModel.test_applyPersistedHydration(payload, to: session)
+                XCTAssertTrue(didHydrate)
+                // Foreground ownership only: no switch, presentation, or catch-up.
+                viewModel.test_setCurrentTabIDOverride(tabID)
+
+                // Precondition: hydrated items are the stored record, and the catch-up is still owed.
+                XCTAssertEqual(session.items, inputItems)
+                XCTAssertNotEqual(session.derivedTranscriptSyncState, coldCatchUpSyncState(of: session, in: viewModel))
+
+                let revisionBeforeSave = session.sourceItemsRevision
+                var itemsAtWrite: [AgentChatItem]?
+                var revisionAtWrite: Int?
+                viewModel.test_saveSessionBeforeWriteHook = { saving in
+                    guard saving === session else { return }
+                    itemsAtWrite = saving.items
+                    revisionAtWrite = saving.sourceItemsRevision
+                }
+                session.isDirty = true
+                let outcome = await viewModel.flushSaveDetailed(for: tabID)
+                guard case .written = outcome else {
+                    return XCTFail("The foreground save must write, got \(outcome)")
+                }
+                let memoryItems = try XCTUnwrap(itemsAtWrite)
+                XCTAssertGreaterThan(try XCTUnwrap(revisionAtWrite), revisionBeforeSave, "The save reconciled working items before writing")
+
+                // Memory: only generated summaries of summary-only tool payloads may differ.
+                let memoryDifferences = Self.itemDifferencesBeyondGeneratedToolSummaries(from: inputItems, to: memoryItems)
+                XCTAssertEqual(memoryDifferences, [], memoryDifferences.joined(separator: "\n"))
+                XCTAssertEqual(session.items, memoryItems)
+
+                // Durable: the written record, decoded read-only, restores the original items exactly.
+                let durable = try AgentSessionDataCodec.decodeSession(from: Data(contentsOf: fileURL))
+                XCTAssertEqual(durable.id, sessionID)
+                XCTAssertEqual(durable.lastRunState, AgentSessionRunState.completed.rawValue)
+                let durableItems = try AgentTranscriptIO.workingSourceItems(from: XCTUnwrap(durable.transcript))
+                let durableDifferences = Self.itemDifferencesBeyondGeneratedToolSummaries(from: inputItems, to: durableItems, allowGeneratedSummaryRemoval: false)
+                XCTAssertEqual(durableDifferences, [], durableDifferences.joined(separator: "\n"))
+
+                // Activation after the save: the real foreground switch catches the tab up, and its
+                // output equals a cold reference built from the ORIGINAL stored items.
+                viewModel.test_setCurrentTabIDOverride(nil)
+                XCTAssertNotEqual(viewModel.currentTabID, tabID)
+                await window.promptManager.switchComposeTab(tabID)
+                try await Self.waitUntil {
+                    viewModel.currentTabID == tabID && viewModel.activeSessionLoadInProgressTabID == nil
+                }
+                await Self.drainMainQueue()
+                XCTAssertTrue(viewModel.sessions[tabID] === session, "Activation reuses the hydrated owner")
+                XCTAssertEqual(session.selectedAgent, .openCode)
+                XCTAssertEqual(session.runState, .completed)
+                XCTAssertEqual(session.derivedTranscriptSyncState, coldCatchUpSyncState(of: session, in: viewModel))
+                XCTAssertEqual(session.items, memoryItems, "Activation does not change the reconciled items")
+                let protection = viewModel.transcriptProjectionProtection(for: session, transcript: session.transcript)
+                let rebuiltFromInput = AgentTranscriptIO.rebuiltTranscriptPreservingCompactedPrefix(
+                    existingTranscript: AgentTranscript(),
+                    workingItems: inputItems,
+                    terminalState: .completed,
+                    nextSequenceIndex: session.nextSequenceIndex,
+                    policy: .liveSession(hidePendingQuestionToolCall: session.hasPendingQuestionUI),
+                    protection: protection
+                )
+                let reference = AgentModeViewModel.buildTranscriptPresentation(
+                    from: rebuiltFromInput,
+                    sourceItems: inputItems,
+                    selectedAgent: .openCode,
+                    previousPerformanceSnapshot: .empty,
+                    projectionProtection: protection,
+                    isColdLoad: true
+                )
+                XCTAssertEqual(session.transcript, reference.transcript)
+                XCTAssertEqual(session.baseTranscriptProjection, reference.baseProjection)
+                XCTAssertEqual(session.fullTranscriptProjection, reference.fullProjection)
+                XCTAssertEqual(session.workingTranscriptProjection, reference.workingProjection)
+                XCTAssertEqual(session.transcriptProjectionCounts, reference.projectionCounts)
+                XCTAssertEqual(session.transcriptCanonicalVisibleRowCount, reference.canonicalVisibleRowCount)
+                XCTAssertEqual(session.transcriptAnalyticsSnapshot, reference.analyticsSnapshot)
+            }
+        }
+
+        /// Exact per-field differences between two item lists over their Codable encoding. When
+        /// `allowGeneratedSummaryRemoval` is set, a JSON-object field may differ only by dropping a
+        /// `summary_text` equal to the storage-generated `"<toolName> • <status>"` string.
+        private static func itemDifferencesBeyondGeneratedToolSummaries(
+            from input: [AgentChatItem],
+            to output: [AgentChatItem],
+            allowGeneratedSummaryRemoval: Bool = true
+        ) -> [String] {
+            var differences: [String] = []
+            if input.map(\.id) != output.map(\.id) {
+                differences.append("ids/order: \(input.map(\.id)) => \(output.map(\.id))")
+                return differences
+            }
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = [.sortedKeys]
+            for (before, after) in zip(input, output) {
+                guard let beforeData = try? encoder.encode(before), let afterData = try? encoder.encode(after),
+                      let beforeObject = (try? JSONSerialization.jsonObject(with: beforeData)) as? [String: Any],
+                      let afterObject = (try? JSONSerialization.jsonObject(with: afterData)) as? [String: Any]
+                else {
+                    differences.append("\(before.id): not encodable")
+                    continue
+                }
+                for key in Set(beforeObject.keys).union(afterObject.keys).sorted() {
+                    let beforeValue = beforeObject[key]
+                    let afterValue = afterObject[key]
+                    if let beforeValue, let afterValue, (beforeValue as AnyObject).isEqual(afterValue) { continue }
+                    if allowGeneratedSummaryRemoval,
+                       isGeneratedSummaryRemoval(beforeValue, afterValue, toolName: before.toolName)
+                    {
+                        continue
+                    }
+                    differences.append("\(before.id) \(before.kind) .\(key): \(String(describing: beforeValue)) => \(String(describing: afterValue))")
+                }
+            }
+            return differences
+        }
+
+        private static func isGeneratedSummaryRemoval(_ before: Any?, _ after: Any?, toolName: String?) -> Bool {
+            guard let toolName,
+                  let beforeText = before as? String, let afterText = after as? String,
+                  var beforeObject = (try? JSONSerialization.jsonObject(with: Data(beforeText.utf8))) as? [String: Any],
+                  let afterObject = (try? JSONSerialization.jsonObject(with: Data(afterText.utf8))) as? [String: Any],
+                  beforeObject["summary_only"] as? Bool == true,
+                  let status = beforeObject["status"] as? String,
+                  beforeObject["summary_text"] as? String == "\(toolName) • \(status)",
+                  afterObject["summary_text"] == nil
+            else { return false }
+            beforeObject.removeValue(forKey: "summary_text")
+            return NSDictionary(dictionary: beforeObject).isEqual(to: afterObject)
         }
 
         /// These cancelled/failed fixtures take one run-state-only catch-up. It leaves the hydrated
@@ -2973,6 +3201,32 @@ final class AgentModeChatSwitchActivationTests: XCTestCase {
                     return
                 }
                 try await Task.sleep(for: .milliseconds(5))
+            }
+        }
+
+        /// Save-timer sleeps that never complete on their own; `cancelAll()` ends every one (and any
+        /// started later) with `CancellationError`.
+        @MainActor
+        private final class HeldSaveTimers {
+            private var continuations: [CheckedContinuation<Void, Error>] = []
+            private var isClosed = false
+
+            func sleep() async throws {
+                if isClosed {
+                    throw CancellationError()
+                }
+                try await withCheckedThrowingContinuation { continuation in
+                    continuations.append(continuation)
+                }
+            }
+
+            func cancelAll() {
+                isClosed = true
+                let pending = continuations
+                continuations.removeAll()
+                for continuation in pending {
+                    continuation.resume(throwing: CancellationError())
+                }
             }
         }
 

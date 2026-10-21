@@ -4,7 +4,8 @@ Scope: read when the task touches persistence of composer drafts or queued input
 Authority: Reference
 Last-verified: 2026-10-18
 
-Status: Phase 0 complete (diagnostics and fixture evidence); restart behavior is not implemented.
+Status: Phase 0 committed; Phase 1a validated and reviewed, awaiting local commit signing; Phase 1b foundation in progress.
+Step 1a — blocked | rounds 2/2 | open: local commit signing ([evidence](evidence/2026-10-18-lossless-app-restart/phase1a.md)) | downgraded: | assumed: transcript-only scheduling/draining; embedded lifecycle identity for 1b ([scope evidence](evidence/2026-10-18-lossless-app-restart/phase1-scope.md)) | deferred: lifecycle integration to 1b; live acceptance (O3)
 Step 0 — done | rounds 0/2 | open: none | downgraded: none | assumed: none | deferred: live sampling, isolated main-actor timing, quit-time loss observation, real-app crash testing (O3), and minor items in [evidence and reviews](evidence/2026-10-18-lossless-app-restart/phase0.md)
 - **How it was drafted:** OracleD and OracleE each wrote an independent plan, and this spec merges them. It includes one review round from each Oracle; every P0, P1, and P2 finding is resolved below. Identity was verified for each send.
 - **Evidence:** code reading, plus crash experiments that ran the real provider CLIs under a throwaway parent process. RepoPrompt itself was not killed.

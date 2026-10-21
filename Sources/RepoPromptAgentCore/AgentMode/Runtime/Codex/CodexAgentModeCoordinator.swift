@@ -5478,6 +5478,9 @@ package final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObser
         guard session.assistantDeltaFlushTask == nil else { return }
         session.assistantDeltaTaskGeneration &+= 1
         let taskGeneration = session.assistantDeltaTaskGeneration
+        session.assistantDeltaDrain = { [weak self] session in
+            self?.flushPendingAssistantDelta(session)
+        }
         let assistantDeltaFlushDelayNanos = assistantDeltaFlushDelayNanos
         session.assistantDeltaFlushTask = Task { @MainActor [weak self, session] in
             do {

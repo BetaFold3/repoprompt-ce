@@ -666,6 +666,8 @@ final class AgentModeViewModel: ObservableObject {
         /// captured and immediately before the durable write, so a mutation can land during the
         /// awaited write.
         var test_saveSessionBeforeWriteHook: (@MainActor (AgentTabSession) async -> Void)?
+        /// Replaces the debounce, maximum-wait, and retry sleeps of session saves.
+        var test_saveTimerSleepOverride: (@MainActor (SaveTimerKind, ContinuousClock.Instant) async throws -> Void)?
         /// Test seam: awaited inside `ensurePersistenceState` immediately before create-only
         /// authority is prepared for a never-persisted session, so another save request can be
         /// coalesced behind the in-flight initial save.
@@ -797,7 +799,7 @@ final class AgentModeViewModel: ObservableObject {
             AgentTabSession
         ) async -> AgentRunTerminalPublicationResult)?
     #endif
-    private var hasPreparedForWindowClose = false
+    private(set) var hasPreparedForWindowClose = false
     private static let uiRefreshCoalesceDelayNanos: UInt64 = 75_000_000
     private static let sessionSidebarRestoreBatchSize = 32
     private nonisolated static let sessionSidebarRestoreRetryLimit = 1
@@ -3807,6 +3809,8 @@ final class AgentModeViewModel: ObservableObject {
         // does not depend on agentTask being non-nil. Cancelling the task
         // handle early just sends the stop signal sooner; the graceful path
         // still finalizes run state and disposes the provider.
+        // The conversation is retained, so buffered assistant text is applied, not discarded.
+        session.drainPendingAssistantDelta()
         session.cancelEphemeralRuntimeState()
         cancelPendingQuestion(for: session)
         cancelPendingApproval(for: session)
@@ -3828,6 +3832,10 @@ final class AgentModeViewModel: ObservableObject {
             reason: "window_close"
         )
         await releaseSessionWorktreeOwnership(sessionID: sessionID)
+        // Only the maximum wait ends here (and cannot re-arm after close begins). A pending debounce is
+        // kept as before: until the Phase 1b lifecycle flush exists, it is what writes an edit made
+        // just before close, or state the cleanup above re-dirtied.
+        clearTranscriptSaveMaxWait(session)
     }
 
     // MARK: - Tab Management
@@ -4044,8 +4052,13 @@ final class AgentModeViewModel: ObservableObject {
             // Source items are the canonical mutable session data. Schedule
             // persistence from the source mutation itself so inactive presentation
             // deferral cannot make durability depend on derived UI refresh work.
+            // The maximum wait is armed here too: this callback precedes the dirty mark.
+            noteTranscriptPersistenceMutation(session)
             scheduleSave(for: session.tabID)
             scheduleDerivedTranscriptRefresh(for: session, reason: .liveMutation, mutation: mutation, caller: caller)
+        }
+        newSession.onPersistenceMutation = { [weak self] session in
+            self?.noteTranscriptPersistenceMutation(session)
         }
         newSession.onRunStateChanged = { [weak self] session in
             guard let self else { return }
@@ -8291,6 +8304,9 @@ final class AgentModeViewModel: ObservableObject {
         }
         if session.codexController != nil || session.codexConversationID != nil || session.codexRolloutPath != nil || session.selectedAgent == .codexExec {
             await codexCoordinator.shutdownCodexSession(session)
+            // The conversation is retained across a location change: buffered text is applied
+            // before the Codex state clear would discard it.
+            session.drainPendingAssistantDelta()
             codexCoordinator.clearCodexSessionState(session)
         }
         await claudeCoordinator.shutdownClaudeSessionIfNeeded(session)
@@ -12770,6 +12786,8 @@ final class AgentModeViewModel: ObservableObject {
         // cancelEphemeralRuntimeState() cancels and nils agentTask before the
         // graceful cancelAgentRun() call in handleWorkspaceSwitch. See
         // prepareSessionForWindowClose for why this ordering is safe.
+        // The conversation is retained, so buffered assistant text is applied, not discarded.
+        session.drainPendingAssistantDelta()
         session.cancelEphemeralRuntimeState()
         clearPendingAssistantDelta(session)
         cancelPendingQuestion(for: session)
@@ -12780,6 +12798,9 @@ final class AgentModeViewModel: ObservableObject {
             _ = mcpRunToolCanceller(runID, "workspace_switch")
         }
         remoteCoordinator.stop(tabID: session.tabID)
+        // The new workspace's owner is already installed and this session is discarded next, so
+        // the drain above is memory-only; no timer may save it later under another context.
+        cancelTranscriptSaveTimers(session)
         return target
     }
 
@@ -13543,7 +13564,7 @@ final class AgentModeViewModel: ObservableObject {
 
             removePendingUIRefresh(for: tabID)
             cancelPersistedLoad(for: session)
-            flushPendingAssistantDelta(session)
+            session.drainPendingAssistantDelta()
             cancelPendingQuestion(for: session)
             cancelPendingApproval(for: session)
             cancelPendingApplyEditsReview(for: session, reason: "Cancelled because tab is closing")
@@ -13612,7 +13633,9 @@ final class AgentModeViewModel: ObservableObject {
             }
 
             // Subscription identifiers were captured above; only now may session-owned ephemeral
-            // state be cleared without dropping terminal output.
+            // state be cleared without dropping terminal output. Text buffered during the
+            // shutdown awaits is applied first so the final save below includes it.
+            session.drainPendingAssistantDelta()
             session.cancelEphemeralRuntimeState()
             if let stopTask = session.staleResetRecoveryTask {
                 await stopTask.value
@@ -14090,8 +14113,10 @@ final class AgentModeViewModel: ObservableObject {
             AgentModePerfDiagnostics.event("save.schedule", tabID: tabID, fields: ["replaced": String(replacedPendingSave), "dirty": String(session.isDirty)])
         #endif
         session.saveDebounceTask?.cancel()
+        let sleep = saveTimerSleep
+        let debounceDeadline = ContinuousClock.now + Self.saveDebounceInterval
         session.saveDebounceTask = Task { [weak self] in
-            try? await Task.sleep(nanoseconds: 1_000_000_000) // 1 second debounce
+            try? await sleep(.debounce, debounceDeadline)
             guard !Task.isCancelled else { return }
             await self?.saveSession(for: tabID)
         }
@@ -14202,7 +14227,7 @@ final class AgentModeViewModel: ObservableObject {
         guard let session = sessions[tabID],
               let context = explicitContext ?? currentSessionPersistenceContext(),
               sessionPersistenceContextIsCurrent(context),
-              session.isDirty || session.activeAgentSessionID == nil
+              session.isDirty || session.activeAgentSessionID == nil || !session.pendingAssistantDelta.isEmpty
         else {
             #if DEBUG
                 AgentModePerfDiagnostics.event("save.session.skipped", tabID: tabID, fields: ["reason": "missingContextOwnerOrClean"])
@@ -14228,9 +14253,14 @@ final class AgentModeViewModel: ObservableObject {
             #endif
             return .notWritten
         }
+        // Buffered assistant text belongs in this snapshot (R3): it is applied through its
+        // producer's flush before any revision, item snapshot, or commit token is captured.
+        session.drainPendingAssistantDelta()
+        guard session.isDirty || session.activeAgentSessionID == nil else {
+            return .notWritten
+        }
 
-        let hasConversationContent = !session.items.isEmpty || !session.transcript.turns.isEmpty || session.runState.isActive || session.hasPendingQuestionUI || session.pendingApproval != nil || session.pendingPermissionsRequest != nil || session.pendingApplyEditsReview != nil || session.pendingWorktreeMergeReview != nil || session.worktreeMergeOperations.contains { $0.status.isActive } || session.scheduledSend != nil
-        if session.activeAgentSessionID == nil, !hasConversationContent {
+        if session.activeAgentSessionID == nil, !hasPersistableConversationContent(session) {
             return .notWritten
         }
         guard let sessionID = ensureSessionBoundToTab(session) else {
@@ -14635,6 +14665,8 @@ final class AgentModeViewModel: ObservableObject {
                 return .resetAcknowledged
             }
             session.isDirty = false
+            // A clean receipt of the current owner and projection satisfies the maximum wait.
+            clearTranscriptSaveMaxWait(session)
             session.lastUserMessageAt = lastUserMessageAt
             if let lastUserMessageAt {
                 sessionIndexStore.setSortDate(lastUserMessageAt, forTabID: tabID)
@@ -14723,6 +14755,12 @@ final class AgentModeViewModel: ObservableObject {
             print("[AgentModeVM] Failed to save session: \(error)")
             return .notWritten
         }
+    }
+
+    /// Whether an unbound session has anything a save would persist (unbound sessions without
+    /// conversation content are never written).
+    func hasPersistableConversationContent(_ session: AgentTabSession) -> Bool {
+        !session.items.isEmpty || !session.transcript.turns.isEmpty || session.runState.isActive || session.hasPendingQuestionUI || session.pendingApproval != nil || session.pendingPermissionsRequest != nil || session.pendingApplyEditsReview != nil || session.pendingWorktreeMergeReview != nil || session.worktreeMergeOperations.contains { $0.status.isActive } || session.scheduledSend != nil
     }
 
     func isSaveInFlight(sessionID: UUID) -> Bool {
@@ -18925,6 +18963,9 @@ final class AgentModeViewModel: ObservableObject {
         if session.assistantDeltaFlushTask == nil {
             session.assistantDeltaTaskGeneration &+= 1
             let taskGeneration = session.assistantDeltaTaskGeneration
+            session.assistantDeltaDrain = { [weak self] session in
+                self?.flushPendingAssistantDelta(session)
+            }
             session.assistantDeltaFlushTask = Task { [weak self, weak session] in
                 do {
                     try await Task.sleep(nanoseconds: 250_000_000)

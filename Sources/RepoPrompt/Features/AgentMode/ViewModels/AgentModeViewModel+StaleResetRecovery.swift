@@ -263,7 +263,7 @@ extension AgentModeViewModel {
         else { return }
         // Buffered output that no terminal commit consumed (remote projections, already-inactive
         // runs) is committed to the retained view rather than discarded.
-        flushPendingAssistantDelta(session)
+        session.drainPendingAssistantDelta()
         var registrationActive = false
         if let sessionID = session.activeAgentSessionID {
             registrationActive = await AgentRunSessionStore.hasActiveRegistration(sessionID: sessionID)
