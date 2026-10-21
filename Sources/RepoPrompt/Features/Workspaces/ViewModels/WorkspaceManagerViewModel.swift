@@ -548,8 +548,11 @@ class WorkspaceManagerViewModel: ObservableObject {
         var task: Task<Void, Never>?
     }
 
-    // Tracks whether initialization is complete
+    /// Tracks whether initialization is complete
     private(set) var isInitialized = false
+    /// The initial workspace activation waits for `performDeferredInitialWorkspaceActivation()`
+    /// (a window scene's app-wide admission at registration).
+    private var hasDeferredInitialWorkspaceActivation = false
     private var initializationCallbackWaiters = WaiterRegistry<Void>()
     private var switchingCompletionWaiters = WaiterRegistry<Void>()
     private var initializationReadinessWaiters = WaiterRegistry<Result<Void, Error>>()
@@ -1637,7 +1640,8 @@ class WorkspaceManagerViewModel: ObservableObject {
         promptViewModel: PromptViewModel,
         workspaceSearchService: WorkspaceSearchService = WorkspaceSearchService(),
         switchTimingPolicy: WorkspaceSwitchTimingPolicy = .production,
-        performInitialWorkspaceActivation: Bool = true
+        performInitialWorkspaceActivation: Bool = true,
+        defersInitialWorkspaceActivation: Bool = false
     ) {
         #if DEBUG
             let initStartMS = WorkspaceRestorePerfLog.timestampMSIfEnabled()
@@ -1820,7 +1824,22 @@ class WorkspaceManagerViewModel: ObservableObject {
 
         if !performInitialWorkspaceActivation {
             completeInitialization()
-        } else if activeWorkspace == nil {
+        } else if defersInitialWorkspaceActivation {
+            hasDeferredInitialWorkspaceActivation = true
+        } else {
+            activateInitialWorkspace()
+        }
+    }
+
+    /// Starts the initial workspace activation deferred at init; a no-op otherwise.
+    func performDeferredInitialWorkspaceActivation() {
+        guard hasDeferredInitialWorkspaceActivation else { return }
+        hasDeferredInitialWorkspaceActivation = false
+        activateInitialWorkspace()
+    }
+
+    private func activateInitialWorkspace() {
+        if activeWorkspace == nil {
             if let defaultWS = findOrCreateDefaultWorkspace() {
                 Task {
                     await switchWorkspace(to: defaultWS, saveState: false)

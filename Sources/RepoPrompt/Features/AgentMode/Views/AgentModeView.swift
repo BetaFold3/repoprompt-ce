@@ -2745,12 +2745,15 @@ struct AgentModeChatDetailView: View {
                     agentModeVM.submitMCPElicitationResponse(tabID: tabID, requestID: request.id, response: response)
                 }
             )
+            .disabled(runInteractionSnapshot.isShutdownFrozen)
             .id("pendingMCPElicitation")
             .transition(.opacity)
         } else if let request = runInteractionSnapshot.pendingUserInputRequest {
             let cancelTarget = runInteractionSnapshot.pendingUserInputCancelTarget
             AgentRequestUserInputCard(
                 request: request,
+                initialDrafts: currentTabID.map { agentModeVM.userInputDrafts(tabID: $0, requestID: request.id) } ?? [:],
+                isFrozen: runInteractionSnapshot.isShutdownFrozen,
                 onSubmit: { response in
                     guard let tabID = currentTabID else { return }
                     agentModeVM.submitUserInputResponse(tabID: tabID, requestID: request.requestID, response: response)
@@ -2760,9 +2763,20 @@ struct AgentModeChatDetailView: View {
                     Task {
                         _ = await agentModeVM.cancelAgentRun(target: cancelTarget, completion: .terminalPublished)
                     }
+                },
+                onDraftChange: { questionID, draft in
+                    guard let tabID = currentTabID else { return }
+                    agentModeVM.updateUserInputDraft(
+                        tabID: tabID,
+                        requestID: request.id,
+                        questionID: questionID,
+                        draft: draft
+                    )
                 }
             )
-            .id("pendingUserInputRequest")
+            // Keyed by the request: switching requests (tabs) builds a card seeded from that
+            // request's session-owned drafts instead of reusing another request's state.
+            .id("pendingUserInputRequest-\(request.id.uuidString)")
             .transition(.opacity)
         } else if let pendingAskUser = runInteractionSnapshot.pendingAskUser {
             AgentAskUserWizardCard(
@@ -2797,6 +2811,7 @@ struct AgentModeChatDetailView: View {
                     agentModeVM.noteAskUserCardActivity(tabID: tabID, interactionID: pendingAskUser.interaction.id)
                 }
             )
+            .disabled(runInteractionSnapshot.isShutdownFrozen)
             .id("pendingAskUser")
             .transition(.opacity)
         } else if let conflict = runInteractionSnapshot.activeWorktreeMergeConflict {

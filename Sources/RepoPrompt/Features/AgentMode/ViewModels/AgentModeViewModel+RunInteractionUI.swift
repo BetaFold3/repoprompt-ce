@@ -26,7 +26,8 @@ extension AgentModeViewModel {
             canForkCurrentSession: canForkCurrentSession,
             selectedAgent: selectedAgent,
             selectedModelRaw: selectedModelRaw,
-            selectedReasoningEffortRaw: selectedReasoningEffortRaw
+            selectedReasoningEffortRaw: selectedReasoningEffortRaw,
+            isShutdownFrozen: isShutdownFrozen
         )
     }
 

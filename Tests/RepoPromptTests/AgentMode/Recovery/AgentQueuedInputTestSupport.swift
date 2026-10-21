@@ -73,11 +73,14 @@ final class RecoveryLaneFixture {
         self.owner = owner
     }
 
-    static func make(_ name: String) async throws -> RecoveryLaneFixture {
+    static func make(
+        _ name: String,
+        fileOperations: AgentRecoveryStore.FileOperations = .live
+    ) async throws -> RecoveryLaneFixture {
         let root = try RecoveryTestSupport.makeTemporaryRoot(name)
         let recoveryRoot = root.appendingPathComponent("AgentRecovery/v1", isDirectory: true)
         let workspace = Workspace(customStoragePath: root.appendingPathComponent("workspace", isDirectory: true))
-        let store = AgentRecoveryStore(rootURL: recoveryRoot)
+        let store = AgentRecoveryStore(rootURL: recoveryRoot, fileOperations: fileOperations)
         let service = AgentSessionDataService(
             tombstoneRoot: recoveryRoot.appendingPathComponent("tombstones", isDirectory: true),
             recoveryStore: store

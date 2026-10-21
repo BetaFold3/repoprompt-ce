@@ -489,6 +489,8 @@ struct AgentComposerProps: Equatable {
     var delegatedQuestions: [AgentDelegatedQuestionBannerRow] = []
     /// Lossless-restart recovery list for this workspace (open and closed sessions).
     var recoveryList: AgentRecoveryListProps?
+    /// R4 edit freeze of this window (quit or window close preserving it): the composer is disabled.
+    var isShutdownFrozen = false
 
     static let empty = AgentComposerProps(
         currentTabID: nil,

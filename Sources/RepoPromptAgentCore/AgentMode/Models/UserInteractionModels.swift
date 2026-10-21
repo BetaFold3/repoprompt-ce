@@ -647,6 +647,26 @@ package struct AgentRequestUserInputQuestionDraft: Hashable {
     }
 }
 
+/// Session-owned partial answers of one native user-input request (see
+/// `AgentTabSession.pendingUserInputDrafts`).
+package struct AgentRequestUserInputDraftState: Hashable {
+    package let requestID: UUID
+    package var draftsByQuestionID: [String: AgentRequestUserInputQuestionDraft]
+
+    package init(requestID: UUID, draftsByQuestionID: [String: AgentRequestUserInputQuestionDraft] = [:]) {
+        self.requestID = requestID
+        self.draftsByQuestionID = draftsByQuestionID
+    }
+}
+
+package extension AgentRequestUserInputQuestionDraft {
+    /// Any answer at all (a selection or typed text): for a secret question, content that would be
+    /// lost by shutdown and is never persisted.
+    var hasContent: Bool {
+        selectedOptionIndex != nil || !note.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+}
+
 package struct AgentRequestUserInputResponse: Hashable {
     let answersByQuestionID: [String: [String]]
 

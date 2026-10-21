@@ -249,6 +249,41 @@ final class AgentRecoveryQueuedInputTests: XCTestCase {
         XCTAssertNotNil(fixture.lane.terminalEvidenceFailures[ownership.attemptID])
     }
 
+    /// R4-04: a terminal-evidence storage failure keeps its operation, and the finalization retry
+    /// re-records it (storage only) once storage recovers; a later success clears the failure.
+    func testFailedTerminalEvidenceIsRetainedAndRetriedStorageOnly() async throws {
+        fixture.tearDown()
+        let failures = RecoveryStoreWriteFailureSwitch()
+        fixture = try await RecoveryLaneFixture.make(
+            "AgentRecoveryQueuedInputTests-retry",
+            fileOperations: failures.fileOperations()
+        )
+        let ownership = Support.ownership(sessionID: fixture.sessionID)
+        let commit = Support.terminalCommit(ownership: ownership, state: .cancelled)
+
+        failures.shouldFailWrites = true
+        await fixture.lane.recordTerminalEvidence(commit, transcriptTurnID: nil).value
+        XCTAssertNotNil(fixture.lane.terminalEvidenceFailures[ownership.attemptID])
+
+        // Still failing: the retry keeps the failure visible.
+        await fixture.lane.retryFailedTerminalEvidence()
+        XCTAssertNotNil(fixture.lane.terminalEvidenceFailures[ownership.attemptID])
+        let missing = await fixture.store.read(sessionID: fixture.sessionID).record
+        XCTAssertNil(missing?.runAttempt(id: ownership.attemptID)?.terminal)
+
+        failures.shouldFailWrites = false
+        await fixture.lane.retryFailedTerminalEvidence()
+        XCTAssertTrue(fixture.lane.terminalEvidenceFailures.isEmpty)
+        let record = await fixture.store.read(sessionID: fixture.sessionID).record
+        let run = try XCTUnwrap(record?.runAttempt(id: ownership.attemptID))
+        XCTAssertEqual(run.terminal?.commitID, commit.commitID)
+        XCTAssertEqual(run.terminal?.terminalState, .cancelled)
+
+        // Nothing is left to retry.
+        await fixture.lane.retryFailedTerminalEvidence()
+        XCTAssertTrue(fixture.lane.terminalEvidenceFailures.isEmpty)
+    }
+
     /// R08: a run's first recorded turn is kept (later steering never replaces it), and terminal
     /// evidence completes only missing join keys, never failing on a recorded one.
     func testTerminalEvidenceCompletesMissingRunJoinKeysAndKeepsRecordedOnes() async throws {

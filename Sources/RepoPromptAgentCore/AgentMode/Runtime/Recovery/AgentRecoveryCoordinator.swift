@@ -103,6 +103,32 @@ package enum AgentRecoveryAdmissionRefusal: Error, Equatable {
     /// A transcript reset is preparing this lane (preserving its composer before the generation
     /// advances); admission reopens if the reset is vetoed, or under the successor lane.
     case resetPreparationInProgress
+    /// App quit or this window's close is preserving state (two-stage shutdown). Reopens if the
+    /// user cancels Stage A; never reopens once teardown began.
+    case shutdownInProgress
+}
+
+/// Owners frozen by one shutdown request: every lane (app quit) or the lanes of specific owners
+/// (window close). See `AgentRecoveryCoordinator.beginShutdownFreeze`.
+package enum AgentRecoveryShutdownScope: Equatable {
+    case application
+    case owners(Set<ObjectIdentifier>)
+
+    package func contains(_ ownerID: ObjectIdentifier) -> Bool {
+        switch self {
+        case .application: true
+        case let .owners(owners): owners.contains(ownerID)
+        }
+    }
+}
+
+/// Why a lane's shutdown preparation (Stage A) could not prove its state durable. The lane, its
+/// live input, and admission are left untouched apart from the caller-owned freeze.
+package enum AgentRecoveryShutdownPreparationFailure: Error, Equatable {
+    /// Composer preservation failed (same cases as reset preparation).
+    case composer(AgentRecoveryResetPreparationFailure)
+    /// Pending-question snapshots or run shutdown evidence could not be written.
+    case evidenceNotPersisted(AgentRecoveryControllerFailure)
 }
 
 /// Why a transcript reset was vetoed before the generation advanced. The old lane and its live
@@ -379,6 +405,10 @@ package final class AgentRecoveryCoordinator {
     private var heldIntentNotes: [UUID: HeldIntentNotes] = [:]
     /// See `ownerlessUnsavedInputs`.
     private var releasedUnsavedInputs: [UUID: AgentRecoveryOwnerlessUnsavedInput] = [:]
+    /// Active shutdown freezes by token (see `beginShutdownFreeze`).
+    private var shutdownFreezes: [UUID: AgentRecoveryShutdownScope] = [:]
+    /// Serial tail of launch-mark writes (`shutdownInProgress`, `cleanExit`, corrections).
+    private var launchMarkTail: Task<Void, Never>?
 
     package init(
         store: AgentRecoveryStore,
@@ -566,6 +596,105 @@ package final class AgentRecoveryCoordinator {
             )
         }
         return holds
+    }
+
+    // MARK: Shutdown freeze (two-stage quit / window close)
+
+    /// Synchronously closes admission, dispatch commits, handoff, and composer submission for
+    /// `scope` (call before the first await of a shutdown request). Returns the token that ends it.
+    /// Freezes are independent: an owner stays frozen while any covering token is active.
+    @discardableResult
+    package func beginShutdownFreeze(scope: AgentRecoveryShutdownScope) -> UUID {
+        let token = UUID()
+        shutdownFreezes[token] = scope
+        NotificationCenter.default.post(name: .agentRecoveryCoordinatorDidChange, object: self)
+        return token
+    }
+
+    /// Adds an owner to a window-scoped freeze (a lane claimed by a frozen window's new session).
+    package func extendShutdownFreeze(_ token: UUID, owner: AnyObject) {
+        guard case var .owners(owners) = shutdownFreezes[token] else { return }
+        owners.insert(ObjectIdentifier(owner))
+        shutdownFreezes[token] = .owners(owners)
+    }
+
+    /// Ends one freeze (Stage A cancelled or failed). Idempotent.
+    package func endShutdownFreeze(_ token: UUID) {
+        guard shutdownFreezes.removeValue(forKey: token) != nil else { return }
+        NotificationCenter.default.post(name: .agentRecoveryCoordinatorDidChange, object: self)
+    }
+
+    /// Whether a shutdown freeze covers `owner`'s lanes and producers.
+    package func isShutdownFrozen(owner: AnyObject) -> Bool {
+        isShutdownFrozen(ownerID: ObjectIdentifier(owner))
+    }
+
+    package func isShutdownFrozen(ownerID: ObjectIdentifier) -> Bool {
+        shutdownFreezes.values.contains { $0.contains(ownerID) }
+    }
+
+    package var hasShutdownFreeze: Bool {
+        !shutdownFreezes.isEmpty
+    }
+
+    /// Joins released lanes' retirements and returns the sessions whose ownerless input is still
+    /// unsaved afterwards. Released lanes are app-owned (their window may already be gone), so only
+    /// app quit loses that memory and vetoes on it; a window close never attributes them to itself.
+    package func settleReleasedRetirements() async -> Set<UUID> {
+        var unsaved: Set<UUID> = []
+        for (sessionID, retirement) in releasedRetirements {
+            let remaining = await retirement.value
+            if !remaining.isEmpty, releasedRetirements[sessionID] == retirement {
+                unsaved.insert(sessionID)
+            }
+        }
+        unsaved.formUnion(releasedUnsavedInputs.keys)
+        return unsaved
+    }
+
+    /// Enqueues an ordered unclean launch-mark write for this instance and returns its outcome.
+    /// Writes (clean ones included) run strictly in call order.
+    package func recordLaunchState(_ state: AgentRecoveryLaunchMark.State) -> Task<Bool, Never> {
+        enqueueLaunchMarkWrite { store in
+            _ = try await store.recordCurrentLaunch(state)
+            return true
+        }
+    }
+
+    /// A fresh clean-exit authorization (see `AgentRecoveryCleanExitGate`).
+    package func authorizeCleanExit() -> UUID {
+        store.cleanExitGate.authorize()
+    }
+
+    /// Revokes any unstarted clean write and reports whether a clean mark can still land (a write
+    /// that already began cannot be revoked).
+    package func revokeCleanExit() -> AgentRecoveryCleanExitGate.Revocation {
+        store.cleanExitGate.revoke()
+    }
+
+    /// Enqueues the ordered clean write under `authorization`; `false` when it failed or its
+    /// authorization was no longer current when it began (nothing written).
+    package func recordCleanExit(authorization: UUID) -> Task<Bool, Never> {
+        enqueueLaunchMarkWrite { store in
+            try await store.recordCleanExit(authorization: authorization)
+        }
+    }
+
+    private func enqueueLaunchMarkWrite(
+        _ write: @escaping @Sendable (AgentRecoveryStore) async throws -> Bool
+    ) -> Task<Bool, Never> {
+        let previous = launchMarkTail
+        let store = store
+        let task = Task { @MainActor () -> Bool in
+            await previous?.value
+            do {
+                return try await write(store)
+            } catch {
+                return false
+            }
+        }
+        launchMarkTail = Task { _ = await task.value }
+        return task
     }
 
     // MARK: Admission and crash holds
@@ -837,8 +966,8 @@ package final class AgentRecoveryCoordinator {
 
     /// The hold reason for uncertain input whose live projection is over, or `nil` while one still
     /// owns it:
-    /// - `dispatching`/`deliveryUnknown` whose latest attempt belongs to a run with terminal or
-    ///   shutdown evidence (the run ended);
+    /// - `dispatching`/`deliveryUnknown` whose latest attempt belongs to a run with terminal
+    ///   evidence (the run ended; a recorded shutdown reason is intent, not a stop);
     /// - `deliveryUnknown` whose latest attempt has no run attempt: its handoff already settled as
     ///   unknown and no run will end for it.
     /// A `dispatching` attempt without a run attempt is still owned by its in-flight handoff.
@@ -849,7 +978,7 @@ package final class AgentRecoveryCoordinator {
         guard let runAttemptID = attempt.runAttemptID else {
             return intent.deliveryState == .deliveryUnknown ? unlinkedUnconfirmedHoldReason : nil
         }
-        guard let run = record.runAttempt(id: runAttemptID), run.terminal != nil || run.shutdown != nil else {
+        guard let run = record.runAttempt(id: runAttemptID), run.terminal != nil else {
             return nil
         }
         return runEndedUnconfirmedHoldReason
@@ -1018,6 +1147,10 @@ package final class AgentRecoverySessionLane {
     package private(set) var hasUnrepresentableComposerEdit = false
     /// Terminal-evidence write failures by run attempt (see `recordTerminalEvidence`).
     package private(set) var terminalEvidenceFailures: [UUID: AgentRecoveryControllerFailure] = [:]
+    /// The failed terminal-evidence operation of each attempt in `terminalEvidenceFailures`, kept so
+    /// shutdown finalization can retry the storage write after the provider already stopped (no new
+    /// terminal event will arrive to repair it).
+    private var failedTerminalEvidence: [UUID: (commit: AgentRunTerminalCommitRevision, transcriptTurnID: UUID?)] = [:]
     private var terminalEvidenceTail: Task<Void, Never>?
     /// Composer input inherited from retired predecessors, oldest first (plus restored held content
     /// that newer typing kept out of the composer, see `resolveHeldComposer`). While non-empty, new
@@ -1440,6 +1573,7 @@ package final class AgentRecoverySessionLane {
     ) async -> Result<AgentRecoveryAdmitted<Receipt>, AgentRecoveryAdmissionFailure> {
         guard !isRetired else { return .failure(.refused(.laneRetired)) }
         guard !isResetPreparationActive else { return .failure(.refused(.resetPreparationInProgress)) }
+        guard !isShutdownFrozen else { return .failure(.refused(.shutdownInProgress)) }
         guard admission.binding == binding else { return .failure(.refused(.bindingMismatch)) }
         // Joined by reset preparation before it flushes the old generation's composer.
         activeAdmissionCount += 1
@@ -1468,6 +1602,7 @@ package final class AgentRecoverySessionLane {
         guard !isRetired else { return .failure(.refused(.laneRetired)) }
         guard unsavedPredecessorInputs.isEmpty else { return .failure(.refused(.unsavedPredecessorInput)) }
         guard !isResetPreparationActive else { return .failure(.refused(.resetPreparationInProgress)) }
+        guard !isShutdownFrozen else { return .failure(.refused(.shutdownInProgress)) }
         let receipt: Receipt
         switch await commit(self, admission.submission, revision) {
         case let .failure(failure):
@@ -1483,6 +1618,11 @@ package final class AgentRecoverySessionLane {
             return .failure(.staleAfterCommit(intentID: admission.intentID, staleMarkPersisted: persisted))
         }
         return .success(AgentRecoveryAdmitted(admission: admission, receipt: receipt, submittedComposerRevision: revision))
+    }
+
+    /// A shutdown request (app quit or this owner's window close) froze this lane's owner.
+    package var isShutdownFrozen: Bool {
+        coordinator?.isShutdownFrozen(ownerID: ownerID) ?? false
     }
 
     private func admissionRefusal() async -> AgentRecoveryAdmissionRefusal? {
@@ -1531,7 +1671,108 @@ package final class AgentRecoverySessionLane {
         isResetPreparationActive = false
     }
 
+    // MARK: Shutdown preparation (Stage A)
+
+    /// Run evidence written by shutdown preparation for the owner's active run.
+    package struct ShutdownRunEvidence {
+        package let ownership: AgentRunOwnership
+        package let processRunID: UUID?
+        package let reason: AgentRecoveryShutdownReason
+        package let lastConfirmedActivityAt: Date?
+
+        package init(
+            ownership: AgentRunOwnership,
+            processRunID: UUID?,
+            reason: AgentRecoveryShutdownReason,
+            lastConfirmedActivityAt: Date?
+        ) {
+            self.ownership = ownership
+            self.processRunID = processRunID
+            self.reason = reason
+            self.lastConfirmedActivityAt = lastConfirmedActivityAt
+        }
+    }
+
+    /// Stage A for one lane while the caller holds a shutdown freeze covering its owner: joins
+    /// predecessor settlement, in-flight admissions and dispatch commits, restore, and tracked
+    /// evidence writes; writes the latest composer under the current generation (failing on
+    /// unrepresentable, unsaved-predecessor, or unwritten input exactly like reset preparation);
+    /// then applies the exact pending-question update (`nil` leaves them unchanged) and records the
+    /// active run's shutdown reason. Never retires the lane or changes reset state, so a cancelled
+    /// shutdown leaves it fully usable. A reason already recorded by an earlier, cancelled attempt
+    /// is kept (the store keeps the first reason; it is intent, never proof of a stop). Succeeds
+    /// with the upserted interaction IDs that were already stored (another owner's, or an earlier
+    /// attempt's, preserved questions).
+    package func prepareForShutdown(
+        questions: AgentRecoveryStore.QuestionSnapshotUpdate?,
+        run: ShutdownRunEvidence?
+    ) async -> Result<Set<UUID>, AgentRecoveryShutdownPreparationFailure> {
+        guard !isRetired else { return .failure(.composer(.laneRetired)) }
+        if case let .failure(failure) = await performComposerPreservation() {
+            return .failure(.composer(failure))
+        }
+        await settleEvidenceWrites()
+        guard !isRetired else { return .failure(.composer(.laneRetired)) }
+        var alreadyStored = Set<UUID>()
+        if let questions {
+            // Exact IDs only: a question another owner preserved (a closed window of this or an
+            // earlier launch) is kept until it is resolved by its own ID.
+            switch await updateQuestionSnapshots(questions) {
+            case let .success(written):
+                alreadyStored = written.alreadyStored
+            case let .failure(failure):
+                return .failure(.evidenceNotPersisted(failure))
+            }
+        }
+        if let run {
+            if case let .failure(failure) = await ensureRunAttempt(
+                ownership: run.ownership,
+                processRunID: run.processRunID,
+                transcriptTurnID: nil,
+                processRunAssociation: .keepExisting
+            ) {
+                return .failure(.evidenceNotPersisted(failure))
+            }
+            let recorded = await transaction { store, binding in
+                try await store.recordRunShutdown(
+                    binding: binding,
+                    expectedRevision: store.currentRevision(sessionID: binding.sessionID),
+                    runAttemptID: run.ownership.attemptID,
+                    reason: run.reason,
+                    lastConfirmedActivityAt: run.lastConfirmedActivityAt
+                )
+            }
+            switch recorded {
+            case .success, .failure(.store(.runAttemptConflict)):
+                break
+            case let .failure(failure):
+                return .failure(.evidenceNotPersisted(failure))
+            }
+        }
+        return .success(alreadyStored)
+    }
+
+    /// Applies an exact, interaction-keyed change to the durable pending-question snapshots (see
+    /// `AgentRecoveryStore.QuestionSnapshotUpdate`), atomically with whatever else is stored.
+    package func updateQuestionSnapshots(
+        _ update: AgentRecoveryStore.QuestionSnapshotUpdate
+    ) async -> Result<AgentRecoveryStore.QuestionSnapshotUpdateReceipt, AgentRecoveryControllerFailure> {
+        await transaction { store, binding in
+            try await store.updateQuestionSnapshots(
+                binding: binding,
+                expectedRevision: store.currentRevision(sessionID: binding.sessionID),
+                update: update
+            )
+        }
+    }
+
     private func performResetPreparation() async -> Result<Void, AgentRecoveryResetPreparationFailure> {
+        await performComposerPreservation()
+    }
+
+    /// Shared by reset and shutdown preparation: proves the latest composer durable under the
+    /// current generation without retiring the lane.
+    private func performComposerPreservation() async -> Result<Void, AgentRecoveryResetPreparationFailure> {
         await predecessorSettlement?.value
         await waitForAdmissionsToDrain()
         guard !isRetired else { return .failure(.laneRetired) }
@@ -1598,6 +1839,7 @@ package final class AgentRecoverySessionLane {
         guard !dispatches.isEmpty else { return .failure(.refused(.untrackedInput)) }
         guard !isRetired else { return .failure(.refused(.laneRetired)) }
         guard !isResetPreparationActive else { return .failure(.refused(.resetPreparationInProgress)) }
+        guard !isShutdownFrozen else { return .failure(.refused(.shutdownInProgress)) }
         activeAdmissionCount += 1
         defer { admissionDidFinish() }
         if let refusal = await admissionRefusal() {
@@ -1605,6 +1847,7 @@ package final class AgentRecoverySessionLane {
         }
         guard !isRetired else { return .failure(.refused(.laneRetired)) }
         guard !isResetPreparationActive else { return .failure(.refused(.resetPreparationInProgress)) }
+        guard !isShutdownFrozen else { return .failure(.refused(.shutdownInProgress)) }
         let committed: Result<[AgentRecoveryDispatchReceipt], AgentRecoveryControllerFailure> = await transaction { store, binding in
             if single {
                 let receipt = try await store.beginDispatch(
@@ -1641,7 +1884,7 @@ package final class AgentRecoverySessionLane {
     /// frozen by reset preparation. Re-checked by every route immediately before the provider
     /// boundary (`AgentRecoveryDispatchEvidence.isValidForHandoff(in:)`).
     package var isValidForHandoff: Bool {
-        !isRetired && !isResetPreparationActive
+        !isRetired && !isResetPreparationActive && !isShutdownFrozen
     }
 
     /// Settles committed attempts that will not be handed off back to `queued` (pre-handoff).
@@ -1829,9 +2072,21 @@ package final class AgentRecoverySessionLane {
                 failure = terminalFailure
             }
             terminalEvidenceFailures[runAttemptID] = failure
+            failedTerminalEvidence[runAttemptID] = failure == nil ? nil : (commit, transcriptTurnID)
         }
         terminalEvidenceTail = task
         return task
+    }
+
+    /// Reissues every retained failed terminal-evidence write (storage only; nothing is torn down
+    /// or re-run) after the writes enqueued so far, and waits for them. A failure stays visible.
+    package func retryFailedTerminalEvidence() async {
+        await terminalEvidenceTail?.value
+        let failed = failedTerminalEvidence.sorted { $0.key.uuidString < $1.key.uuidString }
+        for (_, operation) in failed {
+            recordTerminalEvidence(operation.commit, transcriptTurnID: operation.transcriptTurnID)
+        }
+        await terminalEvidenceTail?.value
     }
 
     // MARK: Delivery evidence
@@ -1869,6 +2124,13 @@ package final class AgentRecoverySessionLane {
         for write in Array(pendingDeliveryEvidenceWrites.values) {
             await write.value
         }
+    }
+
+    /// Awaits tracked delivery-evidence writes and the terminal-evidence tail enqueued so far
+    /// (Stage A before snapshots, Stage B after the actual stop and terminal commit).
+    package func settleEvidenceWrites() async {
+        await deliveryEvidenceWritesSettled()
+        await terminalEvidenceTail?.value
     }
 
     /// Current durable record for this session (read inside the gate).

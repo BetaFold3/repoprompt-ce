@@ -158,11 +158,13 @@ actor WindowSessionDiskWriter {
         }
     }
 
-    func writeImmediately(_ snapshot: WindowSessionSnapshot) {
+    /// Writes now; `false` when the atomic write failed (the previous file is left intact).
+    @discardableResult
+    func writeImmediately(_ snapshot: WindowSessionSnapshot) -> Bool {
         pendingTask?.cancel()
         pendingTask = nil
         writeGeneration += 1
-        writeToDisk(snapshot)
+        return writeToDisk(snapshot)
     }
 
     private func performScheduledWrite(_ snapshot: WindowSessionSnapshot, generation: UInt64) {
@@ -171,15 +173,18 @@ actor WindowSessionDiskWriter {
         writeToDisk(snapshot)
     }
 
-    private func writeToDisk(_ snapshot: WindowSessionSnapshot) {
+    @discardableResult
+    private func writeToDisk(_ snapshot: WindowSessionSnapshot) -> Bool {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
 
         do {
             let data = try encoder.encode(snapshot)
             try data.write(to: fileURL, options: .atomic)
+            return true
         } catch {
             print("Failed to write window session snapshot: \(error)")
+            return false
         }
     }
 
@@ -223,6 +228,11 @@ class WindowStatesManager: ObservableObject {
     /// operations should be skipped to prevent EXC_BAD_ACCESS crashes during shutdown.
     /// This is checked by views and view models before triggering updates.
     private(set) var isTerminating = false
+
+    /// The single app-scoped two-stage quit / window-close coordinator (spec R4).
+    lazy var lifecycleShutdown = AgentLifecycleShutdownCoordinator(environment: makeLifecycleShutdownEnvironment())
+    /// Failure prompts currently shown by `lifecycleShutdown`, by scope.
+    var presentedLifecycleShutdownAlerts: [AgentLifecycleShutdownScope: NSAlert] = [:]
 
     private lazy var globalShortcutActivationController = GlobalShortcutActivationController(
         trackedWindows: { [weak self] in self?.allWindows ?? [] },
@@ -654,14 +664,27 @@ class WindowStatesManager: ObservableObject {
         }
     }
 
-    func registerWindowState(_ state: WindowState) {
+    /// Registers a window as application state. Returns `false` when an app quit passed its point
+    /// of no return: the window is refused before it joins `allWindows` or activates.
+    @discardableResult
+    func registerWindowState(_ state: WindowState) -> Bool {
         // Prevent duplicate registration
-        guard !allWindows.contains(where: { $0 === state }) else { return }
+        guard !allWindows.contains(where: { $0 === state }) else { return true }
+
+        // App-wide admission, decided before the window becomes application state (the only path
+        // into `allWindows`, the app quit's participants). During an app quit's Stage A it joins
+        // the quit frozen; after its point of no return it is refused and never activates.
+        guard lifecycleShutdown.admitApplicationWindow(state.agentModeViewModel) else {
+            state.refuseApplicationAdmission()
+            return false
+        }
 
         #if DEBUG
             let registerStartMS = WorkspaceRestorePerfLog.timestampMSIfEnabled()
         #endif
         allWindows.append(state)
+        // A window scene's deferred activation starts only now (no-op for an already active state).
+        state.activateAfterApplicationAdmission()
         #if DEBUG
             WorkspaceRestorePerfLog.log(
                 "restore.window registered windowID=\(state.windowID) registeredWindows=\(allWindows.count) pendingRestoreEntries=\(restoreQueue.count)"
@@ -722,6 +745,7 @@ class WindowStatesManager: ObservableObject {
                 )
             }
         #endif
+        return true
     }
 
     func unregisterWindowState(_ state: WindowState) {
@@ -775,18 +799,32 @@ class WindowStatesManager: ObservableObject {
         Task { await windowSessionWriter.scheduleWrite(snapshot) }
     }
 
-    func persistWindowSessionImmediately(reason: String = "unspecified") async {
-        guard !AppLaunchConfiguration.current.suppressesWindowPersistence else { return }
+    /// Explicit result of an immediate layout write (two-stage quit Stage A needs proof).
+    enum WindowSessionPersistOutcome: Equatable {
+        case written
+        /// Restore is still applying the on-disk snapshot, which stays authoritative and intact.
+        case preservedExisting
+        case suppressed
+        case failed
+
+        var isPreserved: Bool {
+            self != .failed
+        }
+    }
+
+    @discardableResult
+    func persistWindowSessionImmediately(reason: String = "unspecified") async -> WindowSessionPersistOutcome {
+        guard !AppLaunchConfiguration.current.suppressesWindowPersistence else { return .suppressed }
         guard restorePersistenceGate.shouldPersistNow(reason: reason) else {
             // Preserve the on-disk snapshot: it is still the authoritative record of
             // the previous session while restore has not finished applying it.
             #if DEBUG
                 WorkspaceRestorePerfLog.log("restore.persist deferredImmediate reason=\(reason)")
             #endif
-            return
+            return .preservedExisting
         }
         let snapshot = captureCurrentSession()
-        await windowSessionWriter.writeImmediately(snapshot)
+        return await windowSessionWriter.writeImmediately(snapshot) ? .written : .failed
     }
 
     private func flushDeferredWindowSessionPersistIfRestoreIdle() {

@@ -37,7 +37,8 @@ enum WindowStateCompositionFactory {
         workspaceFileContextStore injectedWorkspaceFileContextStore: WorkspaceFileContextStore? = nil,
         workspaceSwitchTimingPolicy: WorkspaceSwitchTimingPolicy = .production,
         loadStoredAPISettingsDataOnInit: Bool = true,
-        codexModelPollingService: CodexModelPollingService = .shared
+        codexModelPollingService: CodexModelPollingService = .shared,
+        defersInitialWorkspaceActivation: Bool = false
     ) -> WindowStateComposition {
         // 1) Workspace file context store + visible file-tree UI adapter
         #if DEBUG
@@ -88,7 +89,8 @@ enum WindowStateCompositionFactory {
             fileManager: workspaceFilesViewModel,
             promptViewModel: promptManager,
             workspaceSearchService: workspaceSearchService,
-            switchTimingPolicy: workspaceSwitchTimingPolicy
+            switchTimingPolicy: workspaceSwitchTimingPolicy,
+            defersInitialWorkspaceActivation: defersInitialWorkspaceActivation
         )
         let selectionCoordinator = WorkspaceSelectionCoordinator(
             workspaceManager: workspaceManager,

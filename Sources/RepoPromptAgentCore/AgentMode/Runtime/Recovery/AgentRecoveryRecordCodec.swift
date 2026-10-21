@@ -56,6 +56,7 @@ enum AgentRecoveryRecordCodec {
                 crashHoldAcknowledgement: reader.optional("crashHoldAcknowledgement").map {
                     try crashHoldAcknowledgement($0, path: "record.crashHoldAcknowledgement")
                 },
+                questions: questions(reader.optional("questions"), path: "record.questions"),
                 extras: reader.extras
             )
             try validateInvariants(record)
@@ -93,6 +94,90 @@ enum AgentRecoveryRecordCodec {
         object["runAttempts"] = .array(record.runAttempts.map(runAttemptJSON))
         if let acknowledgement = record.crashHoldAcknowledgement {
             object["crashHoldAcknowledgement"] = crashHoldAcknowledgementJSON(acknowledgement)
+        }
+        // Absent when empty, so records without questions keep their existing bytes.
+        if !record.questions.isEmpty {
+            object["questions"] = .array(record.questions.map(questionJSON))
+        }
+        return .object(object)
+    }
+
+    // MARK: Pending-question snapshots
+
+    private static func questions(
+        _ json: AgentRecoveryJSONValue?,
+        path: String
+    ) throws -> [AgentRecoveryQuestionSnapshot] {
+        guard let json else { return [] }
+        guard case let .array(values) = json else {
+            throw AgentRecoveryDecodingError(reason: .malformed("\(path) is not an array"))
+        }
+        return try values.enumerated().map { try question($1, path: "\(path)[\($0)]") }
+    }
+
+    private static func question(_ json: AgentRecoveryJSONValue, path: String) throws -> AgentRecoveryQuestionSnapshot {
+        var reader = try Reader(json, path: path)
+        let kindRaw = try reader.string("kind")
+        guard let kind = AgentRecoveryQuestionKind(rawValue: kindRaw) else {
+            throw AgentRecoveryDecodingError(reason: .unknownVariant("\(path).kind \(kindRaw)"))
+        }
+        return try AgentRecoveryQuestionSnapshot(
+            interactionID: reader.uuid("interactionID"),
+            kind: kind,
+            runAttemptID: reader.optionalUUID("runAttemptID"),
+            transcriptResetGeneration: reader.uint64("transcriptResetGeneration"),
+            appInstanceID: reader.uuid("appInstanceID"),
+            askedAt: reader.timestamp("askedAt"),
+            title: reader.optionalString("title"),
+            message: reader.optionalString("message"),
+            items: reader.array("items").enumerated().map { try questionItem($1, path: "\(path).items[\($0)]") },
+            extras: reader.extras
+        )
+    }
+
+    private static func questionItem(_ json: AgentRecoveryJSONValue, path: String) throws -> AgentRecoveryQuestionItem {
+        var reader = try Reader(json, path: path)
+        let isSecret = try reader.bool("isSecret")
+        let answer = try reader.optionalString("answer")
+        // A secret answer on disk is never adopted (and would not round-trip): unreadable.
+        if isSecret, answer != nil {
+            throw AgentRecoveryDecodingError(reason: .malformed("\(path) stores a secret answer"))
+        }
+        return try AgentRecoveryQuestionItem(
+            questionID: reader.string("questionID"),
+            header: reader.optionalString("header"),
+            text: reader.string("text"),
+            options: reader.array("options").enumerated().map { try Reader.string($1, path: "\(path).options[\($0)]") },
+            isSecret: isSecret,
+            answer: answer,
+            extras: reader.extras
+        )
+    }
+
+    private static func questionJSON(_ snapshot: AgentRecoveryQuestionSnapshot) -> AgentRecoveryJSONValue {
+        var object = snapshot.extras
+        object["interactionID"] = .string(snapshot.interactionID.uuidString)
+        object["kind"] = .string(snapshot.kind.rawValue)
+        setOptional(&object, "runAttemptID", snapshot.runAttemptID?.uuidString)
+        object["transcriptResetGeneration"] = .number(Decimal(snapshot.transcriptResetGeneration))
+        object["appInstanceID"] = .string(snapshot.appInstanceID.uuidString)
+        object["askedAt"] = timestampJSON(snapshot.askedAt)
+        setOptional(&object, "title", snapshot.title)
+        setOptional(&object, "message", snapshot.message)
+        object["items"] = .array(snapshot.items.map(questionItemJSON))
+        return .object(object)
+    }
+
+    private static func questionItemJSON(_ item: AgentRecoveryQuestionItem) -> AgentRecoveryJSONValue {
+        var object = item.extras
+        object["questionID"] = .string(item.questionID)
+        setOptional(&object, "header", item.header)
+        object["text"] = .string(item.text)
+        object["options"] = .array(item.options.map { .string($0) })
+        object["isSecret"] = .bool(item.isSecret)
+        // Defense in depth: the model already drops it, the encoder never writes one either.
+        if !item.isSecret {
+            setOptional(&object, "answer", item.answer)
         }
         return .object(object)
     }

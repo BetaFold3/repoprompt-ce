@@ -27,6 +27,9 @@ struct AgentRunInteractionUISnapshot: Equatable {
     var selectedAgent: AgentProviderKind
     var selectedModelRaw: String
     var selectedReasoningEffortRaw: String?
+    /// R4 edit freeze of this window: answer cards are disabled (answers are also refused by the
+    /// view model before any mutation).
+    var isShutdownFrozen = false
 
     var isAgentBusy: Bool {
         runState == .running

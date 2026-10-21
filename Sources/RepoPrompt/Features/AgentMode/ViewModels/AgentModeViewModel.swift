@@ -846,6 +846,24 @@ final class AgentModeViewModel: ObservableObject {
         ) async -> AgentRunTerminalPublicationResult)?
     #endif
     private(set) var hasPreparedForWindowClose = false
+    /// The single irreversible teardown (Stage B); a repeated request joins it instead of returning
+    /// before the teardown finished.
+    private var windowCloseTeardownTask: Task<Void, Never>?
+    /// Stage A freeze of this window's sessions (see `AgentModeViewModel+Shutdown.swift`).
+    @Published var shutdownFreezeState: AgentModeShutdownFreezeState?
+    /// Per tab, the exact question snapshots this window's Stage A wrote and the lane they were
+    /// written to (live resolution and Cancel remove only those interaction IDs).
+    var shutdownQuestionSnapshots: [UUID: AgentModeShutdownQuestionSnapshots] = [:]
+    /// Serializes this window's live-resolution and Cancel snapshot removals; a later Stage A joins
+    /// it before writing.
+    var shutdownQuestionSnapshotWriteTask: Task<Void, Never>?
+    /// This window's latest Stage A preparation, whichever request started it. A later one (Retry,
+    /// or a successor request after Cancel or window-close supersession) joins it and the removals
+    /// it enqueued before capturing questions.
+    var shutdownPreparationTask: Task<AgentModeShutdownReport, Never>?
+    /// Question-snapshot removals whose write failed, keyed by the lane they target. Kept (never
+    /// dropped before a receipt) and retried before the next Stage A writes.
+    var shutdownFailedQuestionSnapshotRemovals: [ObjectIdentifier: AgentModeShutdownFailedQuestionRemoval] = [:]
     private static let uiRefreshCoalesceDelayNanos: UInt64 = 75_000_000
     private static let sessionSidebarRestoreBatchSize = 32
     private nonisolated static let sessionSidebarRestoreRetryLimit = 1
@@ -3822,7 +3840,19 @@ final class AgentModeViewModel: ObservableObject {
     }
 
     func prepareForWindowClose() async {
-        guard !hasPreparedForWindowClose else { return }
+        await prepareForWindowClose(reason: .windowClose)
+    }
+
+    /// Irreversible teardown of this window's agent state (two-stage shutdown Stage B, or the
+    /// legacy close path). Idempotent and joinable: every caller awaits the same teardown, which
+    /// runs exactly once. Nothing durable is withdrawn here: queued intents stay queued (teardown
+    /// only resumes an instruction wait), preserved questions are not refreshed, and the run
+    /// shutdown `reason` was recorded by Stage A (the legacy path records none).
+    func prepareForWindowClose(reason _: AgentRecoveryShutdownReason) async {
+        if let windowCloseTeardownTask {
+            await windowCloseTeardownTask.value
+            return
+        }
         hasPreparedForWindowClose = true
         unregisterObserverRegistrations()
         detachScheduledSendCoordinator()
@@ -3838,6 +3868,15 @@ final class AgentModeViewModel: ObservableObject {
         pendingRemoteStartWindowPicker = nil
         workspaceSwitchProvider.cancelAllBackgroundCleanup()
         cancelSessionIndexRefresh(releaseFrozenOrder: true)
+        let task = Task { @MainActor [weak self] in
+            guard let self else { return }
+            await performWindowCloseTeardown()
+        }
+        windowCloseTeardownTask = task
+        await task.value
+    }
+
+    private func performWindowCloseTeardown() async {
         let tabIDs = Array(sessions.keys)
         await withTaskGroup(of: Void.self) { group in
             for tabID in tabIDs {
@@ -3899,8 +3938,8 @@ final class AgentModeViewModel: ObservableObject {
         )
         await releaseSessionWorktreeOwnership(sessionID: sessionID)
         // Only the maximum wait ends here (and cannot re-arm after close begins). A pending debounce is
-        // kept as before: until the Phase 1b lifecycle flush exists, it is what writes an edit made
-        // just before close, or state the cleanup above re-dirtied.
+        // kept: the two-stage shutdown's final flush (`finalizeTranscriptsAfterShutdown`) supersedes
+        // it, and the legacy close path still relies on it for state the cleanup above re-dirtied.
         clearTranscriptSaveMaxWait(session)
     }
 
@@ -6541,6 +6580,7 @@ final class AgentModeViewModel: ObservableObject {
             resolvedBy: resolvedBy,
             resolvedAt: Date()
         )
+        refreshRecoveryQuestionSnapshotsAfterLiveResolution(for: session, interactionID: interactionID)
         guard session.mcpControlContext != nil else { return }
         wakeCurrentMCPWaitersForInteractionResolutionFireAndForget(for: session)
     }
@@ -9970,6 +10010,15 @@ final class AgentModeViewModel: ObservableObject {
             throw MCPError.invalidParams("The pending interaction no longer matches interaction_id.")
         }
         let kind = currentInteraction.kind
+        switch kind {
+        case .question, .mcpElicitation, .userInput:
+            // Answers are frozen while a shutdown preserves this window: refused before any change.
+            guard !isShutdownFrozen else {
+                throw MCPError.invalidParams(AgentModeShutdownAnswerRefused().errorDescription ?? "")
+            }
+        default:
+            break
+        }
         // Stage `resolved_by` attribution for the resolution funnels; they consume it
         // synchronously via `recordMCPInteractionResolution`. The defer clears any
         // leftover staging when a branch throws before resolving, so a later
@@ -20713,6 +20762,8 @@ final class AgentModeViewModel: ObservableObject {
     }
 
     func updateAskUserDraft(tabID: UUID, interactionID: UUID, questionID: String, draft: AgentAskUserDraft) {
+        // Frozen by shutdown preparation: the snapshot being written must stay the latest answer.
+        guard !isShutdownFrozen else { return }
         guard let session = sessions[tabID],
               var pending = session.pendingAskUser,
               pending.interaction.id == interactionID,
@@ -20818,6 +20869,7 @@ final class AgentModeViewModel: ObservableObject {
     }
 
     func submitAskUserResponse(tabID: UUID, interactionID: UUID) {
+        guard !isShutdownFrozen else { return }
         guard let session = sessions[tabID], session.pendingAskUser?.interaction.id == interactionID else { return }
         do {
             if session.remoteHost != nil {
@@ -20831,6 +20883,8 @@ final class AgentModeViewModel: ObservableObject {
     }
 
     func submitAskUserResponse(tabID: UUID, interactionID: UUID, draftsByQuestionID: [String: AgentAskUserDraft]) throws {
+        // Refused before the drafts are replaced: the preserved snapshot stays the latest answer.
+        guard !isShutdownFrozen else { throw AgentModeShutdownAnswerRefused() }
         guard let session = sessions[tabID],
               var pending = session.pendingAskUser,
               pending.interaction.id == interactionID
@@ -20845,6 +20899,7 @@ final class AgentModeViewModel: ObservableObject {
     }
 
     func skipAskUser(tabID: UUID, interactionID: UUID) {
+        guard !isShutdownFrozen else { return }
         guard let session = sessions[tabID], session.pendingAskUser?.interaction.id == interactionID else { return }
         if session.remoteHost != nil {
             try? resolveRemoteAskUserResponse(for: session, interactionID: interactionID, skipAll: true)
@@ -20854,6 +20909,7 @@ final class AgentModeViewModel: ObservableObject {
     }
 
     private func resolveAskUserResponse(for session: AgentTabSession, interactionID: UUID, skipAll: Bool) throws {
+        guard !isShutdownFrozen else { throw AgentModeShutdownAnswerRefused() }
         guard let pending = session.pendingAskUser,
               pending.interaction.id == interactionID,
               let continuation = session.askUserContinuation
@@ -20875,6 +20931,7 @@ final class AgentModeViewModel: ObservableObject {
     }
 
     private func resolveRemoteAskUserResponse(for session: AgentTabSession, interactionID: UUID, skipAll: Bool) throws {
+        guard !isShutdownFrozen else { throw AgentModeShutdownAnswerRefused() }
         guard let pending = session.pendingAskUser,
               pending.interaction.id == interactionID
         else { return }
@@ -20926,6 +20983,7 @@ final class AgentModeViewModel: ObservableObject {
     }
 
     func submitUserInputResponse(tabID: UUID, requestID: CodexAppServerRequestID, response: AgentRequestUserInputResponse) {
+        guard !isShutdownFrozen else { return }
         guard let session = sessions[tabID],
               let request = session.pendingUserInputRequest,
               request.requestID == requestID

@@ -26,6 +26,71 @@ package protocol AgentRecoveryLifecycleGate: Sendable {
     func performRecoveryTransaction<T: Sendable>(_ body: @Sendable () async throws -> T) async throws -> T
 }
 
+// MARK: - Clean-exit gate
+
+/// Persistence-boundary fence for this launch's clean mark (spec R4). The shutdown coordinator
+/// authorizes one clean write after a successful final flush; the store writes `cleanExit` only
+/// when that authorization is still current as the write begins (a newer authorization or a
+/// revocation stops an unstarted write). A write that already began is atomic and cannot be
+/// revoked: `revoke()` only reports that it may still land (`inProgress`).
+package final class AgentRecoveryCleanExitGate: @unchecked Sendable {
+    package enum Revocation: Equatable {
+        /// No clean write is in progress and none is on disk: none can land from now on.
+        case prevented
+        /// A clean write began and is being written; it may still land.
+        case inProgress
+        /// The clean mark is on disk (no later unclean mark replaced it).
+        case committed
+    }
+
+    private let lock = NSLock()
+    private var authorized: UUID?
+    private var writing: UUID?
+    private var cleanOnDisk = false
+
+    package init() {}
+
+    /// A fresh single-use authorization; it supersedes any earlier, unstarted one.
+    package func authorize() -> UUID {
+        let token = UUID()
+        lock.withLock { authorized = token }
+        return token
+    }
+
+    /// Revokes any unstarted authorization and reports what can still land.
+    package func revoke() -> Revocation {
+        lock.withLock {
+            authorized = nil
+            if writing != nil { return .inProgress }
+            return cleanOnDisk ? .committed : .prevented
+        }
+    }
+
+    /// Store only: starts the clean write of `token` when it is still the authorization.
+    func begin(_ token: UUID) -> Bool {
+        lock.withLock {
+            guard authorized == token, writing == nil else { return false }
+            authorized = nil
+            writing = token
+            return true
+        }
+    }
+
+    /// Store only: the clean write of `token` finished.
+    func finish(_ token: UUID, committed: Bool) {
+        lock.withLock {
+            guard writing == token else { return }
+            writing = nil
+            if committed { cleanOnDisk = true }
+        }
+    }
+
+    /// Store only: an unclean mark replaced the launch file.
+    func noteUncleanCommitted() {
+        lock.withLock { cleanOnDisk = false }
+    }
+}
+
 /// Identity of the current app launch. `previousInstance` holds are derived by comparing an
 /// intent's owning instance with this value; nothing is rewritten at relaunch.
 package enum AgentRecoveryLaunchInstance {
@@ -262,6 +327,8 @@ package actor AgentRecoveryStore {
     package nonisolated let appInstanceID: UUID
     /// Publishes every committed record write or deleted-session removal, in commit order.
     package nonisolated let commitPublisher = AgentRecoveryCommitPublisher()
+    /// Persistence-boundary fence of this launch's clean mark (spec R4).
+    package nonisolated let cleanExitGate = AgentRecoveryCleanExitGate()
     private let fileOperations: FileOperations
     private let now: @Sendable () -> Date
 
@@ -1371,12 +1438,41 @@ package actor AgentRecoveryStore {
         ))
     }
 
-    /// Persists this instance's unclean `running` mark (atomic replace). Nothing in this package
-    /// writes `cleanExit`; that belongs to two-stage shutdown.
+    /// Persists this instance's unclean `running` mark (atomic replace).
     package func recordCurrentLaunchRunning() throws -> AgentRecoveryLaunchMark {
+        try recordCurrentLaunch(.running)
+    }
+
+    /// Persists this instance's unclean launch mark (atomic replace). `cleanExit` is written only
+    /// through `recordCleanExit(authorization:)`; a committed unclean mark replaces any clean one.
+    package func recordCurrentLaunch(_ state: AgentRecoveryLaunchMark.State) throws -> AgentRecoveryLaunchMark {
+        guard state != .cleanExit else {
+            throw AgentRecoveryStoreError.storageFailure("cleanExit requires a clean-exit authorization")
+        }
+        let mark = try writeLaunchMark(state)
+        cleanExitGate.noteUncleanCommitted()
+        return mark
+    }
+
+    /// Writes the clean mark only under the gate's current authorization (the app-scoped shutdown
+    /// coordinator authorizes it after a successful final flush). `false` when the authorization
+    /// was revoked or superseded before this write began: nothing is written.
+    package func recordCleanExit(authorization: UUID) throws -> Bool {
+        guard cleanExitGate.begin(authorization) else { return false }
+        do {
+            _ = try writeLaunchMark(.cleanExit)
+        } catch {
+            cleanExitGate.finish(authorization, committed: false)
+            throw error
+        }
+        cleanExitGate.finish(authorization, committed: true)
+        return true
+    }
+
+    private func writeLaunchMark(_ state: AgentRecoveryLaunchMark.State) throws -> AgentRecoveryLaunchMark {
         let mark = AgentRecoveryLaunchMark(
             appInstanceID: appInstanceID,
-            state: .running,
+            state: state,
             recordedAt: AgentRecoveryTimestamp(now())
         )
         let object: [String: Any] = [
@@ -1486,6 +1582,83 @@ package actor AgentRecoveryStore {
             recordRevision: record.revision,
             disposition: .committed,
             composerRevision: record.composer?.revision
+        )
+    }
+
+    /// An exact, interaction-keyed change to the durable question snapshots. Every snapshot not
+    /// named here is kept as stored, whichever launch or owner wrote it: a question a closed
+    /// window (this launch or an earlier one) preserved stays until it is resolved by ID.
+    package struct QuestionSnapshotUpdate: Equatable {
+        /// Written in place of a stored snapshot with the same interaction ID, else appended.
+        package var upserting: [AgentRecoveryQuestionSnapshot]
+        /// Removed exactly (an ID also upserted is written, not removed).
+        package var removing: Set<UUID>
+
+        package init(upserting: [AgentRecoveryQuestionSnapshot] = [], removing: Set<UUID> = []) {
+            self.upserting = upserting
+            self.removing = removing
+        }
+    }
+
+    package struct QuestionSnapshotUpdateReceipt: Equatable {
+        package let receipt: AgentRecoveryLocalReceipt
+        /// Upserted interaction IDs that were already stored before this write.
+        package let alreadyStored: Set<UUID>
+    }
+
+    /// Applies `update` to the session's pending-question snapshots (shutdown preparation, live
+    /// resolution, Cancel, or a recovery-list dismissal). Unchanged when identical; nothing is
+    /// created for an empty set on a session without a record. Secret answers are structurally absent.
+    package func updateQuestionSnapshots(
+        binding: AgentRecoveryLifecycleBinding,
+        expectedRevision: AgentRecoveryRecordRevision?,
+        update: QuestionSnapshotUpdate
+    ) throws -> QuestionSnapshotUpdateReceipt {
+        let current = try writableRecord(binding: binding)
+        let stored = current?.questions ?? []
+        let storedIDs = Set(stored.map(\.interactionID))
+        let alreadyStored = Set(update.upserting.map(\.interactionID)).intersection(storedIDs)
+        var latest: [UUID: AgentRecoveryQuestionSnapshot] = [:]
+        for snapshot in update.upserting {
+            latest[snapshot.interactionID] = snapshot
+        }
+        var snapshots = stored.compactMap { snapshot in
+            latest[snapshot.interactionID] ?? (update.removing.contains(snapshot.interactionID) ? nil : snapshot)
+        }
+        var appended = Set<UUID>()
+        for snapshot in update.upserting where !storedIDs.contains(snapshot.interactionID) {
+            guard appended.insert(snapshot.interactionID).inserted, let written = latest[snapshot.interactionID] else { continue }
+            snapshots.append(written)
+        }
+        if stored == snapshots {
+            return QuestionSnapshotUpdateReceipt(
+                receipt: AgentRecoveryLocalReceipt(
+                    binding: binding,
+                    recordRevision: current?.revision,
+                    disposition: .unchanged,
+                    composerRevision: current?.composer?.revision
+                ),
+                alreadyStored: alreadyStored
+            )
+        }
+        try requireRevision(expectedRevision, current: current)
+        let record = try replace(
+            current,
+            binding: binding,
+            composer: current?.composer,
+            intents: current?.intents ?? [],
+            attempts: current?.attempts ?? [],
+            runAttempts: current?.runAttempts ?? [],
+            questions: snapshots
+        )
+        return QuestionSnapshotUpdateReceipt(
+            receipt: AgentRecoveryLocalReceipt(
+                binding: binding,
+                recordRevision: record.revision,
+                disposition: .committed,
+                composerRevision: record.composer?.revision
+            ),
+            alreadyStored: alreadyStored
         )
     }
 
@@ -1848,7 +2021,8 @@ package actor AgentRecoveryStore {
         intents: [AgentRecoveryIntent],
         attempts: [AgentRecoveryAttempt],
         runAttempts: [AgentRecoveryRunAttempt],
-        crashHoldAcknowledgement: AgentRecoveryCrashHoldAcknowledgement?? = nil
+        crashHoldAcknowledgement: AgentRecoveryCrashHoldAcknowledgement?? = nil,
+        questions: [AgentRecoveryQuestionSnapshot]? = nil
     ) throws -> AgentRecoveryRecord {
         let record = AgentRecoveryRecord(
             sessionID: binding.sessionID,
@@ -1861,6 +2035,7 @@ package actor AgentRecoveryStore {
             attempts: attempts,
             runAttempts: runAttempts,
             crashHoldAcknowledgement: crashHoldAcknowledgement ?? current?.crashHoldAcknowledgement,
+            questions: questions ?? current?.questions ?? [],
             extras: current?.extras ?? [:]
         )
         do {

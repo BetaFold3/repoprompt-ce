@@ -243,6 +243,8 @@ extension AgentModeViewModel {
             "Earlier unsaved input in this session needs to be restored or discarded first (recovery banner). Your draft is kept."
         case .resetPreparationInProgress:
             "The conversation is being cleared, so this message was not sent. Your draft is kept."
+        case .shutdownInProgress:
+            "RepoPrompt is saving this session before closing, so this message was not sent. Your draft is kept."
         case .laneRetired, .bindingMismatch:
             "The session changed before this message could be saved, so it was not sent. Your draft is kept."
         case .composerUnavailable, .untrackedInput:
@@ -310,6 +312,11 @@ extension AgentModeViewModel {
         interviewFirst: Bool,
         consumesComposer: Bool
     ) async -> RecoveryInputAdmission {
+        // Scoped shutdown freeze (app quit, or this window's close): refused before any authority,
+        // promotion, or write, even for a session that would otherwise need no durable admission.
+        if isRecoveryShutdownFrozen(session) {
+            return .blocked(Self.recoveryAdmissionRefusalMessage(.shutdownInProgress))
+        }
         guard requiresDurableRecoveryAdmission(for: session) else { return .notRequired }
         let tabID = session.tabID
         // A live lane is the session's durable authority; without one, normal authority is
@@ -684,6 +691,10 @@ extension AgentModeViewModel {
             coordinator.releaseLane(previous)
         }
         session.recoveryLane = lane
+        // A session of a window frozen by its close joins that freeze (app quit freezes every owner).
+        if let token = shutdownFreezeState?.recoveryToken {
+            coordinator.extendShutdownFreeze(token, owner: session)
+        }
         // Eager restore: edits typed meanwhile are buffered by the lane under their original
         // first-unsaved instant.
         Task { [weak self, weak session] in
@@ -912,6 +923,8 @@ extension AgentModeViewModel {
     /// `endRecoveryTranscriptResetPreparation` releases it. Inactive (`nil`) when recovery is not
     /// composed.
     func prepareRecoveryTranscriptReset(for session: AgentTabSession) async -> AgentRecoveryResetPreparationFailure? {
+        // No binding change while shutdown preparation owns this session (vetoed, nothing cleared).
+        if isRecoveryShutdownFrozen(session) { return .alreadyPreparing }
         guard let coordinator = recoveryCoordinator else { return nil }
         if let preparation = coordinator.composerPreparation(for: session) {
             await preparation.preparationTask?.value

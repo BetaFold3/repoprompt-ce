@@ -249,6 +249,9 @@ struct ResizableTextFieldFeatures {
     var snippetPaletteItemsProvider: (() -> [SnippetPaletteItem])?
     var snippetPaletteScope: SnippetPaletteScope?
     var composerFocusToken: UUID?
+    /// Queried live at the text view's edit entry (typing, paste, drop, snippet insertion): `false`
+    /// refuses the change before the text view accepts it (e.g. the shutdown edit freeze).
+    var acceptsEdits: (() -> Bool)?
 
     static let plain = ResizableTextFieldFeatures()
 
@@ -263,7 +266,8 @@ struct ResizableTextFieldFeatures {
         slashSkillSuggestionsProvider: ((String) async -> [MentionSuggestion])?,
         snippetPaletteItemsProvider: (() -> [SnippetPaletteItem])? = nil,
         snippetPaletteScope: SnippetPaletteScope? = nil,
-        composerFocusToken: UUID? = nil
+        composerFocusToken: UUID? = nil,
+        acceptsEdits: (() -> Bool)? = nil
     ) -> ResizableTextFieldFeatures {
         ResizableTextFieldFeatures(
             enableFileTagOverlay: true,
@@ -279,7 +283,8 @@ struct ResizableTextFieldFeatures {
             enableSnippetPalette: snippetPaletteItemsProvider != nil,
             snippetPaletteItemsProvider: snippetPaletteItemsProvider,
             snippetPaletteScope: snippetPaletteScope,
-            composerFocusToken: composerFocusToken
+            composerFocusToken: composerFocusToken,
+            acceptsEdits: acceptsEdits
         )
     }
 }
@@ -479,6 +484,11 @@ struct CustomTextField: NSViewRepresentable {
     func updateNSView(_ nsView: NSScrollView, context: Context) {
         context.coordinator.parent = self
         guard let textView = nsView.documentView as? ImageAwareTextView else { return }
+        // `.disabled` (e.g. the shutdown edit freeze) makes the text read-only; it stays selectable.
+        let isEditable = context.environment.isEnabled
+        if textView.isEditable != isEditable {
+            textView.isEditable = isEditable
+        }
         textView.imagePasteHandler = onImagePaste
         textView.enablesImagePasteHandling = onImagePaste != nil
         if textView.font != fontPreset.nsFont {
@@ -587,6 +597,16 @@ struct CustomTextField: NSViewRepresentable {
 
         init(_ parent: CustomTextField) {
             self.parent = parent
+        }
+
+        /// The edit entry: a refused change never reaches the text (or its binding), so nothing is
+        /// accepted on screen and then lost.
+        func textView(
+            _: NSTextView,
+            shouldChangeTextIn _: NSRange,
+            replacementString _: String?
+        ) -> Bool {
+            parent.features.acceptsEdits?() ?? true
         }
 
         func scheduleComposerFocusToken(_ token: UUID?, for textView: ImageAwareTextView) {

@@ -201,7 +201,715 @@ final class AgentRecoveryResetBoundaryTests: XCTestCase {
         XCTAssertEqual(stored?.transcriptResetGeneration, 1)
     }
 
+    // MARK: - Shutdown Stage A (R4)
+
+    /// Stage A joins an in-flight save and flushes again, so the latest projection (changed while
+    /// that save was suspended) is durable; a partially hydrated session is skipped, never written.
+    func testShutdownPreparationFlushesAgainAfterAnInFlightSaveAndSkipsPartialHydration() async throws {
+        let harness = try await makeHarness(windowID: 4604)
+        let lane = try await persistAndClaimLane(harness)
+        let viewModel = harness.viewModel
+        let gate = ResetBoundaryWriteGate()
+        viewModel.test_saveSessionBeforeWriteHook = { _ in await gate.waitOnce() }
+        harness.session.appendItem(.user("Saved by the held write"))
+        let heldSave = Task { await viewModel.flushSaveDetailed(for: harness.tabID) }
+        let saveHeld = await RecoveryTestSupport.eventually { gate.isWaiting }
+        XCTAssertTrue(saveHeld)
+        harness.session.appendItem(.user("Appended while the save was held"))
+
+        let requestID = UUID()
+        viewModel.beginShutdownFreeze(requestID: requestID, ownsRecoveryFreeze: true)
+        XCTAssertTrue(lane.isShutdownFrozen, "a window close freezes its own lanes synchronously")
+        guard case .failure(.refused(.shutdownInProgress)) = await Self.admitQueued("typed while closing", on: lane) else {
+            return XCTFail("admission is refused while frozen")
+        }
+        let preparation = Task { await viewModel.prepareSessionsForShutdown(reason: .windowClose) }
+        for _ in 0 ..< 50 {
+            await Task.yield()
+        }
+        gate.release()
+        _ = await heldSave.value
+        let report = await preparation.value
+        viewModel.test_saveSessionBeforeWriteHook = nil
+        XCTAssertEqual(report.blockers, [])
+        XCTAssertFalse(harness.session.isDirty, "the second flush made the latest projection durable")
+        let fileText = try await harness.persistedFileText()
+        XCTAssertTrue(fileText.contains("Saved by the held write"), fileText)
+        XCTAssertTrue(fileText.contains("Appended while the save was held"), fileText)
+
+        // Partial hydration: skipped, never written, never reported as saved.
+        harness.session.hasLoadedPersistedState = false
+        harness.session.appendItem(.user("Not hydrated yet"))
+        let skipped = await viewModel.flushTranscriptForShutdown(harness.session, final: false)
+        XCTAssertEqual(skipped, .skipped)
+        let unchanged = try await harness.persistedFileText()
+        XCTAssertFalse(unchanged.contains("Not hydrated yet"), unchanged)
+        harness.session.hasLoadedPersistedState = true
+
+        // Cancel reopens the window's lanes.
+        viewModel.endShutdownFreeze(requestID: requestID)
+        XCTAssertFalse(lane.isShutdownFrozen)
+        XCTAssertFalse(viewModel.isShutdownFrozen)
+        guard case .success = await Self.admitQueued("typed after cancel", on: lane) else {
+            return XCTFail("Cancel reopens admission")
+        }
+    }
+
+    /// A non-empty secret answer vetoes Stage A before anything is written; otherwise the pending
+    /// question is preserved with its partial non-secret answer and never the secret one.
+    func testShutdownPreparationVetoesASecretAnswerAndNeverPersistsIt() async throws {
+        let harness = try await makeHarness(windowID: 4605)
+        let lane = try await persistAndClaimLane(harness)
+        let viewModel = harness.viewModel
+        let request = AgentRequestUserInputRequest(
+            requestID: .string("shutdown-request"),
+            method: "request_user_input",
+            threadID: "thread",
+            turnID: "turn",
+            itemID: "item",
+            questions: [
+                AgentRequestUserInputQuestion(
+                    id: "target",
+                    header: "Target",
+                    question: "Which environment?",
+                    isOther: false,
+                    isSecret: false,
+                    options: []
+                ),
+                AgentRequestUserInputQuestion(
+                    id: "token",
+                    header: "Token",
+                    question: "Paste the deploy token",
+                    isOther: false,
+                    isSecret: true,
+                    options: []
+                )
+            ]
+        )
+        harness.session.pendingUserInputRequest = request
+        viewModel.updateUserInputDraft(
+            tabID: harness.tabID,
+            requestID: request.id,
+            questionID: "target",
+            draft: AgentRequestUserInputQuestionDraft(note: "staging")
+        )
+        viewModel.updateUserInputDraft(
+            tabID: harness.tabID,
+            requestID: request.id,
+            questionID: "token",
+            draft: AgentRequestUserInputQuestionDraft(note: "hunter2")
+        )
+
+        let first = UUID()
+        viewModel.beginShutdownFreeze(requestID: first, ownsRecoveryFreeze: true)
+        viewModel.updateUserInputDraft(
+            tabID: harness.tabID,
+            requestID: request.id,
+            questionID: "token",
+            draft: AgentRequestUserInputQuestionDraft(note: "changed while frozen")
+        )
+        XCTAssertEqual(
+            viewModel.userInputDrafts(tabID: harness.tabID, requestID: request.id)["token"]?.note,
+            "hunter2",
+            "answers are frozen during Stage A"
+        )
+        let vetoed = await viewModel.prepareSessionsForShutdown(reason: .windowClose)
+        XCTAssertEqual(vetoed.blockers.count, 1)
+        XCTAssertTrue(vetoed.blockers.first?.contains("secret answer") == true, "\(vetoed.blockers)")
+        let afterVeto = await lane.store.read(sessionID: lane.sessionID).record?.questions ?? []
+        XCTAssertTrue(afterVeto.isEmpty, "nothing is written before the veto")
+        viewModel.endShutdownFreeze(requestID: first)
+
+        viewModel.updateUserInputDraft(
+            tabID: harness.tabID,
+            requestID: request.id,
+            questionID: "token",
+            draft: AgentRequestUserInputQuestionDraft()
+        )
+        let second = UUID()
+        viewModel.beginShutdownFreeze(requestID: second, ownsRecoveryFreeze: true)
+        let report = await viewModel.prepareSessionsForShutdown(reason: .windowClose)
+        XCTAssertEqual(report.blockers, [])
+        let questions = await lane.store.read(sessionID: lane.sessionID).record?.questions ?? []
+        XCTAssertEqual(questions.count, 1)
+        XCTAssertEqual(questions.first?.interactionID, request.id)
+        XCTAssertEqual(questions.first?.kind, .userInput)
+        XCTAssertEqual(questions.first?.items.map(\.isSecret), [false, true])
+        XCTAssertEqual(questions.first?.items.first?.answer, "staging")
+        XCTAssertNil(questions.first?.items.last?.answer)
+        let recordData = try Data(contentsOf: lane.store.recordFileURL(sessionID: lane.sessionID))
+        XCTAssertFalse(String(decoding: recordData, as: UTF8.self).contains("hunter2"))
+        viewModel.endShutdownFreeze(requestID: second)
+    }
+
+    // MARK: - Shutdown Stage B and the answer freeze (R4 review fixes)
+
+    /// R4-04 (VM): a terminal-evidence write that failed is retried (storage only) by the final
+    /// flush after the real teardown; while storage still fails, the report blocks the clean mark.
+    func testFinalFlushRetriesFailedTerminalEvidenceStorageOnly() async throws {
+        let failures = RecoveryStoreWriteFailureSwitch()
+        let harness = try await makeHarness(windowID: 4606, fileOperations: failures.fileOperations())
+        let lane = try await persistAndClaimLane(harness)
+        let viewModel = harness.viewModel
+        let ownership = RecoveryTestSupport.ownership(sessionID: lane.sessionID)
+        let commit = RecoveryTestSupport.terminalCommit(ownership: ownership, state: .cancelled)
+        failures.shouldFailWrites = true
+        await lane.recordTerminalEvidence(commit, transcriptTurnID: nil).value
+        XCTAssertNotNil(lane.terminalEvidenceFailures[ownership.attemptID])
+
+        viewModel.beginShutdownFreeze(requestID: UUID(), ownsRecoveryFreeze: true)
+        await viewModel.prepareForWindowClose(reason: .appQuit)
+        let blocked = await viewModel.finalizeTranscriptsAfterShutdown()
+        XCTAssertTrue(
+            blocked.blockers.contains { $0.contains("how its last run ended could not be saved") },
+            "\(blocked.blockers)"
+        )
+
+        failures.shouldFailWrites = false
+        let report = await viewModel.finalizeTranscriptsAfterShutdown()
+        XCTAssertEqual(report.blockers, [])
+        XCTAssertTrue(lane.terminalEvidenceFailures.isEmpty)
+        let run = await lane.store.read(sessionID: lane.sessionID).record?.runAttempt(id: ownership.attemptID)
+        XCTAssertEqual(run?.terminal?.commitID, commit.commitID)
+        XCTAssertEqual(run?.terminal?.terminalState, .cancelled)
+    }
+
+    /// R4-B07: after the real teardown, the final flush writes content that arrived during it (the
+    /// terminal commit's transcript) with an empty report; a queued intent stays queued; and a
+    /// later preparation of the torn-down window is a no-op that keeps its preserved question.
+    func testTeardownKeepsQueuedIntentAndQuestionAndTheFinalFlushWritesLateContent() async throws {
+        let harness = try await makeHarness(windowID: 4607)
+        let lane = try await persistAndClaimLane(harness)
+        let viewModel = harness.viewModel
+        guard case let .success(admitted) = await Self.admitQueued("queued before quit", on: lane) else {
+            return XCTFail("admitted before the freeze")
+        }
+        let intentID = admitted.receipt.intent.intentID
+        let (interaction, asked) = await pendingAskUser(harness)
+        viewModel.updateAskUserDraft(
+            tabID: harness.tabID,
+            interactionID: interaction.id,
+            questionID: "target",
+            draft: AgentAskUserDraft(customResponse: "staging")
+        )
+
+        viewModel.beginShutdownFreeze(requestID: UUID(), ownsRecoveryFreeze: true)
+        let prepared = await viewModel.prepareSessionsForShutdown(reason: .appQuit)
+        XCTAssertEqual(prepared.blockers, [])
+        let preserved = await lane.store.read(sessionID: lane.sessionID).record?.questions ?? []
+        XCTAssertEqual(preserved.map(\.interactionID), [interaction.id])
+        XCTAssertEqual(preserved.first?.kind, .askUser)
+        XCTAssertEqual(preserved.first?.items.first?.answer, "staging", "the ask_user partial answer is preserved")
+
+        await viewModel.prepareForWindowClose(reason: .appQuit)
+        do {
+            _ = try await asked.value
+            XCTFail("teardown cancels the live question")
+        } catch is CancellationError {
+        } catch {
+            XCTFail("unexpected \(error)")
+        }
+        // The terminal commit's transcript content lands after the teardown.
+        harness.session.appendItem(.user("Arrived during teardown"))
+        let report = await viewModel.finalizeTranscriptsAfterShutdown()
+        XCTAssertEqual(report.blockers, [])
+        XCTAssertFalse(harness.session.isDirty)
+        let fileText = try await harness.persistedFileText()
+        XCTAssertTrue(fileText.contains("Arrived during teardown"), fileText)
+
+        let record = await lane.store.read(sessionID: lane.sessionID).record
+        XCTAssertEqual(record?.intent(id: intentID)?.deliveryState, .queued, "teardown never withdraws a queued intent")
+        XCTAssertEqual(record?.questions.map(\.interactionID), [interaction.id], "teardown never erases the snapshot")
+        let again = await viewModel.prepareSessionsForShutdown(reason: .appQuit)
+        XCTAssertEqual(again.blockers, [])
+        let kept = await lane.store.read(sessionID: lane.sessionID).record?.questions ?? []
+        XCTAssertEqual(kept.map(\.interactionID), [interaction.id], "a torn-down window is never prepared again")
+    }
+
+    /// R4-03: an answer submitted while frozen is refused at the shared boundary before any
+    /// mutation (drafts, pending question, continuation kept), MCP elicitation included; after
+    /// Cancel the same answer is accepted.
+    func testFrozenAnswersAreRefusedBeforeAnyMutationAndAcceptedAfterCancel() async throws {
+        let harness = try await makeHarness(windowID: 4608)
+        _ = try await persistAndClaimLane(harness)
+        let viewModel = harness.viewModel
+        let (interaction, asked) = await pendingAskUser(harness)
+        viewModel.updateAskUserDraft(
+            tabID: harness.tabID,
+            interactionID: interaction.id,
+            questionID: "target",
+            draft: AgentAskUserDraft(customResponse: "staging")
+        )
+
+        let requestID = UUID()
+        viewModel.beginShutdownFreeze(requestID: requestID, ownsRecoveryFreeze: true)
+        XCTAssertThrowsError(try viewModel.submitAskUserResponse(
+            tabID: harness.tabID,
+            interactionID: interaction.id,
+            draftsByQuestionID: ["target": AgentAskUserDraft(customResponse: "production")]
+        )) { error in
+            XCTAssertTrue(error is AgentModeShutdownAnswerRefused, "\(error)")
+        }
+        viewModel.submitAskUserResponse(tabID: harness.tabID, interactionID: interaction.id)
+        viewModel.skipAskUser(tabID: harness.tabID, interactionID: interaction.id)
+        XCTAssertEqual(
+            harness.session.pendingAskUser?.draftsByQuestionID["target"],
+            AgentAskUserDraft(customResponse: "staging"),
+            "the preserved draft was not replaced"
+        )
+        XCTAssertNotNil(harness.session.askUserContinuation, "the question is still pending")
+
+        viewModel.endShutdownFreeze(requestID: requestID)
+        try viewModel.submitAskUserResponse(
+            tabID: harness.tabID,
+            interactionID: interaction.id,
+            draftsByQuestionID: ["target": AgentAskUserDraft(customResponse: "production")]
+        )
+        let response = try await asked.value
+        XCTAssertEqual(response.answersByQuestionID["target"]?.customResponse, "production")
+        XCTAssertNil(harness.session.pendingAskUser)
+
+        // MCP elicitation: the same boundary.
+        let elicitation = AgentMCPElicitationRequest(
+            requestID: .string("shutdown-elicitation"),
+            method: "mcpServer/elicitation/request",
+            threadID: "thread",
+            turnID: "turn",
+            itemID: "item",
+            prompt: "Provide a value",
+            rawParamsJSON: "{}"
+        )
+        harness.session.pendingMCPElicitationRequest = elicitation
+        let second = UUID()
+        viewModel.beginShutdownFreeze(requestID: second, ownsRecoveryFreeze: true)
+        viewModel.submitMCPElicitationResponse(
+            tabID: harness.tabID,
+            requestID: elicitation.id,
+            response: AgentMCPElicitationResponse(action: .accept)
+        )
+        XCTAssertEqual(harness.session.pendingMCPElicitationRequest?.id, elicitation.id, "the elicitation stays pending")
+        viewModel.endShutdownFreeze(requestID: second)
+        harness.session.pendingMCPElicitationRequest = nil
+    }
+
+    /// R4-01: Cancel removes the snapshots this window introduced; a later Stage A joins that
+    /// removal before writing its own, so the removal never erases them.
+    func testCancelClearsThisLaunchQuestionSnapshotsBeforeALaterStageAWritesAgain() async throws {
+        let harness = try await makeHarness(windowID: 4609)
+        let lane = try await persistAndClaimLane(harness)
+        let viewModel = harness.viewModel
+        let (interaction, asked) = await pendingAskUser(harness)
+
+        let first = UUID()
+        viewModel.beginShutdownFreeze(requestID: first, ownsRecoveryFreeze: true)
+        _ = await viewModel.prepareSessionsForShutdown(reason: .windowClose)
+        let written = await lane.store.read(sessionID: lane.sessionID).record?.questions ?? []
+        XCTAssertEqual(written.map(\.interactionID), [interaction.id])
+        XCTAssertEqual(
+            viewModel.shutdownQuestionSnapshots[harness.tabID],
+            AgentModeShutdownQuestionSnapshots(lane: ObjectIdentifier(lane), live: [interaction.id], introduced: [interaction.id])
+        )
+
+        viewModel.endShutdownFreeze(requestID: first)
+        XCTAssertTrue(viewModel.shutdownQuestionSnapshots.isEmpty)
+        let second = UUID()
+        viewModel.beginShutdownFreeze(requestID: second, ownsRecoveryFreeze: true)
+        _ = await viewModel.prepareSessionsForShutdown(reason: .windowClose)
+        let rewritten = await lane.store.read(sessionID: lane.sessionID).record?.questions ?? []
+        XCTAssertEqual(rewritten.map(\.interactionID), [interaction.id], "the earlier clear landed first")
+
+        viewModel.endShutdownFreeze(requestID: second)
+        await viewModel.shutdownQuestionSnapshotWriteTask?.value
+        let cleared = await lane.store.read(sessionID: lane.sessionID).record?.questions ?? []
+        XCTAssertTrue(cleared.isEmpty, "a reopened question is no longer preserved")
+
+        try viewModel.submitAskUserResponse(
+            tabID: harness.tabID,
+            interactionID: interaction.id,
+            draftsByQuestionID: ["target": AgentAskUserDraft(customResponse: "done")]
+        )
+        _ = try await asked.value
+    }
+
+    /// R4-01 (same-launch close/reopen): a window closed earlier in this launch preserved a question
+    /// (its snapshot carries this launch's instance ID; this window never tracked it). This window's
+    /// Stage A without that question live, Cancel, and an untracked live resolution all keep it. A
+    /// question this window introduces is removed by Cancel; one already preserved by the closed
+    /// owner that is live here again (adopted, rewritten in place) is kept.
+    func testReopenedWindowKeepsASameLaunchClosedOwnersQuestionsThroughStageAAndCancel() async throws {
+        let harness = try await makeHarness(windowID: 4611)
+        let lane = try await persistAndClaimLane(harness)
+        let viewModel = harness.viewModel
+        let store = lane.store
+        func storedIDs() async -> [UUID] {
+            await (store.read(sessionID: lane.sessionID).record?.questions ?? []).map(\.interactionID)
+        }
+        let adoptedRequest = Self.userInputRequest("adopted", questionIDs: ["target"])
+        let closed = Self.questionSnapshot(interactionID: UUID(), appInstanceID: store.appInstanceID)
+        let closedAdopted = Self.questionSnapshot(interactionID: adoptedRequest.id, appInstanceID: store.appInstanceID)
+        guard case .success = await lane.updateQuestionSnapshots(.init(upserting: [closed, closedAdopted])) else {
+            return XCTFail("the closed window's preserved questions are stored")
+        }
+
+        // Quit with no live question, then Cancel: nothing preserved is erased.
+        let first = UUID()
+        viewModel.beginShutdownFreeze(requestID: first, ownsRecoveryFreeze: true)
+        let emptyPreparation = await viewModel.prepareSessionsForShutdown(reason: .appQuit)
+        XCTAssertEqual(emptyPreparation.blockers, [])
+        XCTAssertNil(viewModel.shutdownQuestionSnapshots[harness.tabID])
+        var ids = await storedIDs()
+        XCTAssertEqual(ids, [closed.interactionID, adoptedRequest.id], "an empty capture erases nothing")
+        viewModel.endShutdownFreeze(requestID: first)
+        await viewModel.shutdownQuestionSnapshotWriteTask?.value
+        ids = await storedIDs()
+        XCTAssertEqual(ids, [closed.interactionID, adoptedRequest.id], "Cancel erases nothing this window did not add")
+
+        // A live question of this window (introduced) and the adopted one live again.
+        let (interaction, asked) = await pendingAskUser(harness)
+        harness.session.pendingUserInputRequest = adoptedRequest
+        let second = UUID()
+        viewModel.beginShutdownFreeze(requestID: second, ownsRecoveryFreeze: true)
+        let livePreparation = await viewModel.prepareSessionsForShutdown(reason: .appQuit)
+        XCTAssertEqual(livePreparation.blockers, [])
+        let written = await store.read(sessionID: lane.sessionID).record?.questions ?? []
+        XCTAssertEqual(written.map(\.interactionID), [closed.interactionID, adoptedRequest.id, interaction.id])
+        XCTAssertEqual(written[1].kind, .userInput, "the adopted question is rewritten in place from the live request")
+        XCTAssertEqual(
+            viewModel.shutdownQuestionSnapshots[harness.tabID],
+            AgentModeShutdownQuestionSnapshots(
+                lane: ObjectIdentifier(lane),
+                live: [adoptedRequest.id, interaction.id],
+                introduced: [interaction.id]
+            )
+        )
+        viewModel.endShutdownFreeze(requestID: second)
+        await viewModel.shutdownQuestionSnapshotWriteTask?.value
+        ids = await storedIDs()
+        XCTAssertEqual(ids, [closed.interactionID, adoptedRequest.id], "Cancel removes only what this window introduced")
+
+        // An untracked live resolution (after Cancel) writes nothing.
+        harness.session.pendingUserInputRequest = nil
+        try viewModel.submitAskUserResponse(
+            tabID: harness.tabID,
+            interactionID: interaction.id,
+            draftsByQuestionID: ["target": AgentAskUserDraft(customResponse: "done")]
+        )
+        _ = try await asked.value
+        await viewModel.shutdownQuestionSnapshotWriteTask?.value
+        ids = await storedIDs()
+        XCTAssertEqual(ids, [closed.interactionID, adoptedRequest.id])
+    }
+
+    /// R4-01: a live resolution during a frozen Stage A's lifetime removes exactly that
+    /// interaction's snapshot; the other live question and the closed owner's question stay.
+    func testLiveResolutionRemovesExactlyItsSnapshot() async throws {
+        let harness = try await makeHarness(windowID: 4612)
+        let lane = try await persistAndClaimLane(harness)
+        let viewModel = harness.viewModel
+        let store = lane.store
+        let closed = Self.questionSnapshot(interactionID: UUID(), appInstanceID: store.appInstanceID)
+        guard case .success = await lane.updateQuestionSnapshots(.init(upserting: [closed])) else {
+            return XCTFail("the closed window's preserved question is stored")
+        }
+        let (interaction, asked) = await pendingAskUser(harness)
+        let request = Self.userInputRequest("still-live", questionIDs: ["region"])
+        harness.session.pendingUserInputRequest = request
+
+        let requestID = UUID()
+        viewModel.beginShutdownFreeze(requestID: requestID, ownsRecoveryFreeze: true)
+        _ = await viewModel.prepareSessionsForShutdown(reason: .windowClose)
+        // The resolution funnel (a timeout reaches it while answers are frozen).
+        viewModel.recordMCPInteractionResolution(for: harness.session, interactionID: interaction.id)
+        await viewModel.shutdownQuestionSnapshotWriteTask?.value
+        let ids = await (store.read(sessionID: lane.sessionID).record?.questions ?? []).map(\.interactionID)
+        XCTAssertEqual(ids, [closed.interactionID, request.id])
+        XCTAssertEqual(viewModel.shutdownQuestionSnapshots[harness.tabID]?.live, [request.id])
+
+        viewModel.endShutdownFreeze(requestID: requestID)
+        await viewModel.shutdownQuestionSnapshotWriteTask?.value
+        let afterCancel = await (store.read(sessionID: lane.sessionID).record?.questions ?? []).map(\.interactionID)
+        XCTAssertEqual(afterCancel, [closed.interactionID])
+        harness.session.pendingUserInputRequest = nil
+        try viewModel.submitAskUserResponse(
+            tabID: harness.tabID,
+            interactionID: interaction.id,
+            draftsByQuestionID: ["target": AgentAskUserDraft(customResponse: "done")]
+        )
+        _ = try await asked.value
+    }
+
+    /// R4-01-R1 (Cancel → new quit): a cancelled request's preparation, held after its question
+    /// upsert (during run evidence), finishes after a new request started. Its late cleanup lands
+    /// before the successor captures, so the successor's snapshot survives and is owned by it.
+    func testCancelledPreparationsLateCleanupNeverErasesTheSuccessorsSnapshot() async throws {
+        try await assertSupersededPreparationNeverErasesTheSuccessorsSnapshot(.cancelThenNewQuit, windowID: 4613)
+    }
+
+    /// R4-01-R1 (window close → app quit): the same, when an app quit supersedes this window's close.
+    func testSupersededWindowClosePreparationsLateCleanupNeverErasesTheSuccessorsSnapshot() async throws {
+        try await assertSupersededPreparationNeverErasesTheSuccessorsSnapshot(.windowCloseThenAppQuit, windowID: 4614)
+    }
+
+    /// R4-01-R2: a question-snapshot removal whose write failed keeps its IDs and lane, is retried
+    /// before the next Stage A writes (a failure there is a blocker, with nothing upserted over it),
+    /// and is dropped only after a successful retry.
+    func testFailedQuestionSnapshotRemovalIsKeptAndRetriedBeforeTheNextStageA() async throws {
+        let failures = RecoveryStoreWriteFailureSwitch()
+        let harness = try await makeHarness(windowID: 4615, fileOperations: failures.fileOperations())
+        let lane = try await persistAndClaimLane(harness)
+        let viewModel = harness.viewModel
+        let laneKey = ObjectIdentifier(lane)
+        let (interaction, asked) = await pendingAskUser(harness)
+        func storedIDs() async -> [UUID] {
+            await (lane.store.read(sessionID: lane.sessionID).record?.questions ?? []).map(\.interactionID)
+        }
+
+        let first = UUID()
+        viewModel.beginShutdownFreeze(requestID: first, ownsRecoveryFreeze: true)
+        let prepared = await viewModel.prepareSessionsForShutdown(reason: .windowClose)
+        XCTAssertEqual(prepared.blockers, [])
+        failures.shouldFailWrites = true
+        viewModel.endShutdownFreeze(requestID: first)
+        await viewModel.shutdownQuestionSnapshotWriteTask?.value
+        XCTAssertEqual(viewModel.shutdownFailedQuestionSnapshotRemovals[laneKey]?.interactionIDs, [interaction.id])
+        XCTAssertEqual(viewModel.shutdownFailedQuestionSnapshotRemovals[laneKey]?.tabID, harness.tabID)
+        var ids = await storedIDs()
+        XCTAssertEqual(ids, [interaction.id], "the failed removal left the snapshot stored")
+
+        let second = UUID()
+        viewModel.beginShutdownFreeze(requestID: second, ownsRecoveryFreeze: true)
+        let blocked = await viewModel.prepareSessionsForShutdown(reason: .windowClose)
+        XCTAssertTrue(
+            blocked.blockers.contains { $0.contains("could not be removed from its saved recovery state") },
+            "\(blocked.blockers)"
+        )
+        XCTAssertNil(viewModel.shutdownQuestionSnapshots[harness.tabID], "nothing was upserted over the failed removal")
+        XCTAssertEqual(viewModel.shutdownFailedQuestionSnapshotRemovals[laneKey]?.interactionIDs, [interaction.id], "kept until a receipt")
+        viewModel.endShutdownFreeze(requestID: second)
+
+        failures.shouldFailWrites = false
+        let third = UUID()
+        viewModel.beginShutdownFreeze(requestID: third, ownsRecoveryFreeze: true)
+        let ready = await viewModel.prepareSessionsForShutdown(reason: .windowClose)
+        XCTAssertEqual(ready.blockers, [])
+        XCTAssertNil(viewModel.shutdownFailedQuestionSnapshotRemovals[laneKey], "dropped after the successful retry")
+        XCTAssertEqual(
+            viewModel.shutdownQuestionSnapshots[harness.tabID],
+            AgentModeShutdownQuestionSnapshots(lane: laneKey, live: [interaction.id], introduced: [interaction.id]),
+            "removed by the retry, then preserved (and owned) again by this Stage A"
+        )
+        ids = await storedIDs()
+        XCTAssertEqual(ids, [interaction.id])
+
+        viewModel.endShutdownFreeze(requestID: third)
+        await viewModel.shutdownQuestionSnapshotWriteTask?.value
+        ids = await storedIDs()
+        XCTAssertTrue(ids.isEmpty)
+        try viewModel.submitAskUserResponse(
+            tabID: harness.tabID,
+            interactionID: interaction.id,
+            draftsByQuestionID: ["target": AgentAskUserDraft(customResponse: "done")]
+        )
+        _ = try await asked.value
+    }
+
+    /// R4 B-N4: the composer and answer cards observe narrow stores, not the view model; the freeze
+    /// reaches them through those stores' snapshots on begin and on end.
+    func testShutdownFreezeIsPublishedThroughTheObservedComposerAndAnswerStores() async throws {
+        let harness = try await makeHarness(windowID: 4616)
+        let viewModel = harness.viewModel
+        viewModel.syncComposerUIState()
+        viewModel.syncRunInteractionUIState()
+        XCTAssertFalse(viewModel.ui.composer.props.isShutdownFrozen)
+        XCTAssertFalse(viewModel.ui.runInteraction.snapshot.isShutdownFrozen)
+
+        let requestID = UUID()
+        viewModel.beginShutdownFreeze(requestID: requestID, ownsRecoveryFreeze: true)
+        XCTAssertTrue(viewModel.ui.composer.props.isShutdownFrozen)
+        XCTAssertTrue(viewModel.ui.runInteraction.snapshot.isShutdownFrozen)
+
+        viewModel.endShutdownFreeze(requestID: requestID)
+        XCTAssertFalse(viewModel.ui.composer.props.isShutdownFrozen)
+        XCTAssertFalse(viewModel.ui.runInteraction.snapshot.isShutdownFrozen)
+    }
+
+    private enum ShutdownSupersession {
+        case cancelThenNewQuit
+        case windowCloseThenAppQuit
+    }
+
+    private func assertSupersededPreparationNeverErasesTheSuccessorsSnapshot(
+        _ pattern: ShutdownSupersession,
+        windowID: Int
+    ) async throws {
+        let hold = RecoveryStoreRunShutdownWriteHold()
+        defer { hold.release() }
+        let harness = try await makeHarness(windowID: windowID, fileOperations: hold.fileOperations())
+        let lane = try await persistAndClaimLane(harness)
+        let viewModel = harness.viewModel
+        let (interaction, asked) = await pendingAskUser(harness)
+        viewModel.updateAskUserDraft(
+            tabID: harness.tabID,
+            interactionID: interaction.id,
+            questionID: "target",
+            draft: AgentAskUserDraft(customResponse: "staging")
+        )
+        // An active run: its shutdown reason is the lane write after the question upsert.
+        _ = harness.session.beginRunAttempt(source: "shutdownSupersessionTest")
+
+        let first = UUID()
+        viewModel.beginShutdownFreeze(requestID: first, ownsRecoveryFreeze: true)
+        let predecessor = Task { @MainActor in
+            await viewModel.prepareSessionsForShutdown(reason: pattern == .cancelThenNewQuit ? .appQuit : .windowClose)
+        }
+        let held = await RecoveryTestSupport.eventually { hold.isHolding }
+        XCTAssertTrue(held, "the predecessor is held after its question upsert, in its run evidence write")
+
+        let second = UUID()
+        switch pattern {
+        case .cancelThenNewQuit:
+            viewModel.endShutdownFreeze(requestID: first)
+            viewModel.beginShutdownFreeze(requestID: second, ownsRecoveryFreeze: false)
+        case .windowCloseThenAppQuit:
+            viewModel.beginShutdownFreeze(requestID: second, ownsRecoveryFreeze: false)
+            viewModel.endShutdownFreeze(requestID: first) // superseded: ignored
+        }
+        let successor = Task { @MainActor in
+            await viewModel.prepareSessionsForShutdown(reason: .appQuit)
+        }
+        for _ in 0 ..< 50 {
+            await Task.yield()
+        }
+        hold.release()
+        _ = await predecessor.value
+        let report = await successor.value
+        XCTAssertEqual(report.blockers, [])
+        await viewModel.shutdownQuestionSnapshotWriteTask?.value
+
+        let stored = await lane.store.read(sessionID: lane.sessionID).record?.questions ?? []
+        XCTAssertEqual(stored.map(\.interactionID), [interaction.id], "the predecessor's late cleanup never erases the successor's snapshot")
+        XCTAssertEqual(stored.first?.items.first?.answer, "staging")
+        XCTAssertEqual(
+            viewModel.shutdownQuestionSnapshots[harness.tabID],
+            AgentModeShutdownQuestionSnapshots(lane: ObjectIdentifier(lane), live: [interaction.id], introduced: [interaction.id]),
+            "the successor owns the snapshot it wrote"
+        )
+        let raw = try String(decoding: Data(contentsOf: lane.store.recordFileURL(sessionID: lane.sessionID)), as: UTF8.self)
+        XCTAssertTrue(raw.lowercased().contains(interaction.id.uuidString.lowercased()), "the raw record keeps the question")
+        XCTAssertTrue(raw.contains("staging"))
+
+        viewModel.endShutdownFreeze(requestID: second)
+        await viewModel.shutdownQuestionSnapshotWriteTask?.value
+        try viewModel.submitAskUserResponse(
+            tabID: harness.tabID,
+            interactionID: interaction.id,
+            draftsByQuestionID: ["target": AgentAskUserDraft(customResponse: "done")]
+        )
+        _ = try await asked.value
+    }
+
+    /// R4-06: the native user-input card seeds each request from its session-owned partial answers,
+    /// so switching requests (a reused card) never reports empty defaults over a retained answer.
+    func testNativeUserInputCardReseedsRetainedPartialAnswersPerRequest() async throws {
+        let harness = try await makeHarness(windowID: 4610)
+        let viewModel = harness.viewModel
+        let first = Self.userInputRequest("first", questionIDs: ["target", "region"])
+        let second = Self.userInputRequest("second", questionIDs: ["reason"])
+        harness.session.pendingUserInputRequest = first
+        viewModel.updateUserInputDraft(
+            tabID: harness.tabID,
+            requestID: first.id,
+            questionID: "target",
+            draft: AgentRequestUserInputQuestionDraft(note: "staging")
+        )
+        viewModel.updateUserInputDraft(
+            tabID: harness.tabID,
+            requestID: first.id,
+            questionID: "region",
+            draft: AgentRequestUserInputQuestionDraft(note: "eu")
+        )
+        let retained = viewModel.userInputDrafts(tabID: harness.tabID, requestID: first.id)
+        XCTAssertEqual(retained["target"]?.note, "staging", "a later draft keeps the other answers")
+        XCTAssertEqual(retained["region"]?.note, "eu")
+
+        let seededFirst = AgentRequestUserInputCard.seededDrafts(for: first, initialDrafts: retained)
+        XCTAssertEqual(seededFirst["target"]?.note, "staging")
+        XCTAssertEqual(seededFirst["region"]?.note, "eu")
+        let seededSecond = AgentRequestUserInputCard.seededDrafts(
+            for: second,
+            initialDrafts: viewModel.userInputDrafts(tabID: harness.tabID, requestID: second.id)
+        )
+        XCTAssertEqual(Set(seededSecond.keys), ["reason"], "another request never shows the first one's answers")
+        XCTAssertEqual(seededSecond["reason"], AgentRequestUserInputQuestionDraft())
+        let seededBack = AgentRequestUserInputCard.seededDrafts(
+            for: first,
+            initialDrafts: viewModel.userInputDrafts(tabID: harness.tabID, requestID: first.id)
+        )
+        XCTAssertEqual(seededBack, seededFirst, "switching back reseeds the retained answers")
+    }
+
     // MARK: - Harness
+
+    /// Starts a real pending ask_user question (its continuation is the run's wait).
+    private func pendingAskUser(_ harness: Harness) async -> (AgentAskUserInteraction, Task<AgentAskUserResponse, Error>) {
+        let interaction = AgentAskUserInteraction(
+            id: UUID(),
+            questions: [AgentAskUserQuestion(id: "target", question: "Which environment?")]
+        )
+        let viewModel = harness.viewModel
+        let tabID = harness.tabID
+        let asked = Task { @MainActor in
+            try await viewModel.askUser(tabID: tabID, interaction: interaction)
+        }
+        let session = harness.session
+        let pending = await RecoveryTestSupport.eventually { session.askUserContinuation != nil }
+        XCTAssertTrue(pending, "the ask_user question is pending")
+        return (interaction, asked)
+    }
+
+    /// A question another owner preserved (as a closed window's Stage A would have written it).
+    private static func questionSnapshot(interactionID: UUID, appInstanceID: UUID) -> AgentRecoveryQuestionSnapshot {
+        AgentRecoveryQuestionSnapshot(
+            interactionID: interactionID,
+            kind: .askUser,
+            runAttemptID: nil,
+            transcriptResetGeneration: 0,
+            appInstanceID: appInstanceID,
+            askedAt: AgentRecoveryTimestamp(millisecondsSince1970: 1000),
+            title: "Preserved by a closed window",
+            message: nil,
+            items: [
+                AgentRecoveryQuestionItem(
+                    questionID: "target",
+                    header: "Target",
+                    text: "Which environment?",
+                    options: [],
+                    isSecret: false,
+                    answer: nil
+                )
+            ]
+        )
+    }
+
+    private static func userInputRequest(_ name: String, questionIDs: [String]) -> AgentRequestUserInputRequest {
+        AgentRequestUserInputRequest(
+            requestID: .string("request-\(name)"),
+            method: "request_user_input",
+            threadID: "thread",
+            turnID: "turn-\(name)",
+            itemID: "item-\(name)",
+            questions: questionIDs.map {
+                AgentRequestUserInputQuestion(
+                    id: $0,
+                    header: $0,
+                    question: "Value for \($0)?",
+                    isOther: false,
+                    isSecret: false,
+                    options: []
+                )
+            }
+        )
+    }
 
     private struct Harness {
         let viewModel: AgentModeViewModel
@@ -254,7 +962,10 @@ final class AgentRecoveryResetBoundaryTests: XCTestCase {
         return lane
     }
 
-    private func makeHarness(windowID: Int) async throws -> Harness {
+    private func makeHarness(
+        windowID: Int,
+        fileOperations: AgentRecoveryStore.FileOperations = .live
+    ) async throws -> Harness {
         let storageURL = try RecoveryTestSupport.makeTemporaryRoot("AgentRecoveryResetBoundaryWorkspace")
         let recoveryRoot = try RecoveryTestSupport.makeTemporaryRoot("AgentRecoveryResetBoundaryStore")
             .appendingPathComponent("AgentRecovery/v1", isDirectory: true)
@@ -262,7 +973,7 @@ final class AgentRecoveryResetBoundaryTests: XCTestCase {
             try? FileManager.default.removeItem(at: storageURL)
             try? FileManager.default.removeItem(at: recoveryRoot.deletingLastPathComponent().deletingLastPathComponent())
         }
-        let store = AgentRecoveryStore(rootURL: recoveryRoot)
+        let store = AgentRecoveryStore(rootURL: recoveryRoot, fileOperations: fileOperations)
         let service = AgentSessionDataService(
             tombstoneRoot: recoveryRoot.appendingPathComponent("tombstones", isDirectory: true),
             recoveryStore: store
@@ -303,6 +1014,51 @@ final class AgentRecoveryResetBoundaryTests: XCTestCase {
         let session = try await viewModel.ensureSessionReady(tabID: tabID)
         XCTAssertNotNil(session.recoveryComposerObserver, "First-draft observation is installed at session creation")
         return Harness(viewModel: viewModel, workspace: workspace, tabID: tabID, session: session)
+    }
+}
+
+/// Store file operations that hold the first record write carrying a run's shutdown reason (the
+/// lane's Stage A write after its question upsert) until released.
+private final class RecoveryStoreRunShutdownWriteHold: @unchecked Sendable {
+    private let lock = NSLock()
+    private let gate = DispatchSemaphore(value: 0)
+    private var armed = true
+    private var holding = false
+    private var released = false
+
+    var isHolding: Bool {
+        lock.withLock { holding }
+    }
+
+    func fileOperations() -> AgentRecoveryStore.FileOperations {
+        AgentRecoveryStore.FileOperations(
+            writeAtomically: { [self] data, url in
+                let marker = Data("\"shutdown\"".utf8)
+                let shouldHold = lock.withLock { () -> Bool in
+                    guard armed, !released, data.range(of: marker) != nil else { return false }
+                    armed = false
+                    holding = true
+                    return true
+                }
+                if shouldHold {
+                    gate.wait()
+                }
+                try data.write(to: url, options: .atomic)
+            },
+            removeItem: { url in try FileManager.default.removeItem(at: url) }
+        )
+    }
+
+    /// Idempotent.
+    func release() {
+        let wasHolding = lock.withLock { () -> Bool in
+            released = true
+            defer { holding = false }
+            return holding
+        }
+        if wasHolding {
+            gate.signal()
+        }
     }
 }
 

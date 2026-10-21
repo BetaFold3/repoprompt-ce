@@ -2408,6 +2408,9 @@ extension AgentModeViewModel: AgentScheduledSendCoordinatorHost {
             || session.pendingMCPElicitationRequest != nil
             || session.mcpControlContext != nil
             || isMCPControlled(tabID: tabID)
+            // Two-stage shutdown froze this session: a due schedule waits (never fails) and is
+            // re-evaluated when a cancelled Stage A reopens admission.
+            || isRecoveryShutdownFrozen(session)
         return AgentScheduledSendBusyState(
             runID: session.runID,
             runState: session.runState,

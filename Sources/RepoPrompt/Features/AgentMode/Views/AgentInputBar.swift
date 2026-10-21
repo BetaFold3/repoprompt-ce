@@ -46,6 +46,9 @@ struct AgentComposerActions {
     var delegatedQuestions: AgentDelegatedQuestionBannerActions?
     /// Lossless-restart recovery list actions; nil hides the list.
     var recoveryList: AgentRecoveryListActions?
+    /// Live R4 edit freeze (quit or window close preserving this window): the composer refuses
+    /// edits and image attachments at their entry instead of accepting input it could lose.
+    var isShutdownFrozen: () -> Bool = { false }
 }
 
 enum CursorModelProviderChipDisplay {
@@ -171,6 +174,10 @@ struct AgentInputBar: View {
             statusPills
                 .padding(.bottom, Self.footerHeight + ComposerChrome<EmptyView, EmptyView>.baseBarHeight + composerBottomInset - 8)
         }
+        // R4 edit freeze, published through the observed composer store (the detail view holds the
+        // view model unobserved); after the overlay so the status pills are covered too. The text
+        // field also refuses edits at its entry while frozen.
+        .disabled(composerUI.props.isShutdownFrozen)
         .onChange(of: composerFocusObservationCue) { oldCue, newCue in
             let tabChanged = AgentComposerFocusObservationCue.tabChanged(
                 from: oldCue,
@@ -339,7 +346,8 @@ struct AgentInputBar: View {
                     await agentModeVM.performRecoveryListAction(rowID: rowID, action: action)
                 },
                 retryStartup: { agentModeVM.retryRecoveryStartup() }
-            )
+            ),
+            isShutdownFrozen: { agentModeVM.isShutdownFrozen }
         )
     }
 
@@ -942,7 +950,8 @@ struct AgentComposerView: View, Equatable {
                     snippetPaletteScope: currentTabID.map {
                         SnippetPaletteScope(windowID: windowID, tabID: $0)
                     },
-                    composerFocusToken: composerFocusToken
+                    composerFocusToken: composerFocusToken,
+                    acceptsEdits: { [actions] in !actions.isShutdownFrozen() }
                 ),
                 onHeightChange: { newHeight in
                     editorTextFieldHeight = newHeight
@@ -2539,9 +2548,18 @@ struct AgentComposerView: View, Equatable {
         guard let tabID = currentTabID else {
             return false
         }
+        // Frozen: the drop is refused (never accepted), so the source keeps it.
+        guard !actions.isShutdownFrozen() else {
+            return false
+        }
         return imageInputAdapter.loadPreparedImages(from: providers) { prepared in
             guard !prepared.isEmpty else { return }
             Task { @MainActor in
+                // A freeze that began while the images loaded: the composer is not changed.
+                guard !actions.isShutdownFrozen() else {
+                    imageInputAdapter.cleanupTemporaryFiles(prepared)
+                    return
+                }
                 attachPreparedImages(prepared, tabID: tabID)
             }
         }
@@ -2553,6 +2571,10 @@ struct AgentComposerView: View, Equatable {
         }
         guard imageInputAdapter.shouldConsumePasteAsImageAttachment(from: pasteboard) else {
             return false
+        }
+        // Frozen: the image is consumed unattached (never inserted as text, never accepted).
+        guard !actions.isShutdownFrozen() else {
+            return true
         }
         let prepared = imageInputAdapter.preparedImages(from: pasteboard)
         guard !prepared.isEmpty else {

@@ -95,7 +95,8 @@ extension AgentModeViewModel {
             draftRestorationEvent: draftRestorationEvent.map(AgentDraftRestorationProps.init),
             fileTagLookupContextIdentity: agentWorkspaceLookupContextIdentity(tabID: tabID, session: session),
             delegatedQuestions: delegatedQuestionBannerRows(forParentTabID: tabID),
-            recoveryList: recoveryListProps(forActiveSession: session)
+            recoveryList: recoveryListProps(forActiveSession: session),
+            isShutdownFrozen: isShutdownFrozen
         )
     }
 

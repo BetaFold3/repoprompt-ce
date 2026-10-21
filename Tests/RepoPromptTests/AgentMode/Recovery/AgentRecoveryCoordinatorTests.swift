@@ -1531,6 +1531,293 @@ final class AgentRecoveryCoordinatorTests: XCTestCase {
 
     // MARK: Deleted sessions
 
+    // MARK: Shutdown (R4 two-stage quit / window close)
+
+    private func questionSnapshot(
+        _ store: AgentRecoveryStore,
+        secretAnswer: String? = nil
+    ) -> AgentRecoveryQuestionSnapshot {
+        AgentRecoveryQuestionSnapshot(
+            interactionID: UUID(),
+            kind: .userInput,
+            runAttemptID: nil,
+            transcriptResetGeneration: 0,
+            appInstanceID: store.appInstanceID,
+            askedAt: AgentRecoveryTimestamp(millisecondsSince1970: 1000),
+            title: "Deploy?",
+            message: nil,
+            items: [
+                AgentRecoveryQuestionItem(
+                    questionID: "target",
+                    header: "Target",
+                    text: "Which environment?",
+                    options: ["staging", "production"],
+                    isSecret: false,
+                    answer: "staging"
+                ),
+                AgentRecoveryQuestionItem(
+                    questionID: "token",
+                    header: nil,
+                    text: "Paste the token",
+                    options: [],
+                    isSecret: true,
+                    answer: secretAnswer
+                )
+            ]
+        )
+    }
+
+    /// Scoped admission refusal on every route (queued, direct, dispatch commit, handoff): only the
+    /// covered owner is frozen, an app-wide freeze covers lanes claimed later, and ending the freeze
+    /// (Stage A Cancel) reopens everything.
+    func testShutdownFreezeRefusesEveryRouteForCoveredOwnersOnlyAndCancelReopens() async throws {
+        let store = makeStore()
+        let service = makeService(store: store)
+        let loadA = try await makeSession(service)
+        let loadB = try await makeSession(service)
+        let coordinator = try await startedCoordinator(store: store, service: service)
+        let ownerA = Owner()
+        let ownerB = Owner()
+        let laneA = try coordinator.claimLane(owner: ownerA, persistenceState: loadA.persistenceState)
+        let laneB = try coordinator.claimLane(owner: ownerB, persistenceState: loadB.persistenceState)
+        _ = await laneA.restoreComposer()
+        _ = await laneB.restoreComposer()
+        guard case let .success(queued) = await laneA.admitQueued(admission(laneA, "queued before the freeze")) else {
+            return XCTFail("admission is open before the freeze")
+        }
+        let dispatch = [AgentRecoveryDispatchRequest(
+            intentID: queued.receipt.intent.intentID,
+            attempt: AgentRecoveryAttemptStart(attemptID: UUID())
+        )]
+
+        let token = coordinator.beginShutdownFreeze(scope: .owners([ObjectIdentifier(ownerA)]))
+        XCTAssertTrue(laneA.isShutdownFrozen)
+        XCTAssertFalse(laneB.isShutdownFrozen, "a window close freezes only its own owners")
+        let frozenQueued = await laneA.admitQueued(admission(laneA, "queued"))
+        assertRefused(frozenQueued, .shutdownInProgress)
+        let direct = await laneA.admitDirect(admission(laneA, "direct"), attempt: AgentRecoveryAttemptStart(attemptID: UUID()))
+        guard case .failure(.refused(.shutdownInProgress)) = direct else {
+            return XCTFail("direct admission is refused while frozen, got \(direct)")
+        }
+        let frozenDispatch = await laneA.beginDispatches(dispatch, authorization: .liveQueue)
+        guard case .failure(.refused(.shutdownInProgress)) = frozenDispatch else {
+            return XCTFail("a dispatch commit is refused while frozen, got \(frozenDispatch)")
+        }
+        XCTAssertFalse(laneA.isValidForHandoff, "no provider handoff while frozen")
+        XCTAssertTrue(laneB.isValidForHandoff)
+        guard case .success = await laneB.admitQueued(admission(laneB, "other window")) else {
+            return XCTFail("an unaffected owner keeps admitting")
+        }
+
+        coordinator.endShutdownFreeze(token)
+        XCTAssertFalse(laneA.isShutdownFrozen)
+        XCTAssertTrue(laneA.isValidForHandoff)
+        guard case .success = await laneA.admitQueued(admission(laneA, "after cancel")) else {
+            return XCTFail("Cancel reopens admission")
+        }
+        guard case .success = await laneA.beginDispatches(dispatch, authorization: .liveQueue) else {
+            return XCTFail("Cancel reopens dispatch commits")
+        }
+
+        let appToken = coordinator.beginShutdownFreeze(scope: .application)
+        let loadC = try await makeSession(service)
+        let laneC = try coordinator.claimLane(owner: Owner(), persistenceState: loadC.persistenceState)
+        XCTAssertTrue(laneB.isShutdownFrozen)
+        XCTAssertTrue(laneC.isShutdownFrozen, "an app quit also covers lanes claimed after it began")
+        coordinator.endShutdownFreeze(appToken)
+        XCTAssertFalse(coordinator.hasShutdownFreeze)
+    }
+
+    /// Stage A vetoes on input an unsaved predecessor holds only in memory, leaves the lane usable,
+    /// and on success writes the composer, the pending-question snapshots (never a secret answer),
+    /// and the run's shutdown reason (the first reason is kept across attempts).
+    func testShutdownPreparationVetoesUnsavedPredecessorThenPersistsQuestionsAndRunReason() async throws {
+        let store = makeStore()
+        let service = makeService(store: store)
+        let load = try await makeSession(service)
+        let coordinator = try await startedCoordinator(store: store, service: service)
+        let first = try coordinator.claimLane(owner: Owner(), persistenceState: load.persistenceState)
+        _ = await first.restoreComposer()
+        failures.shouldFailWrites = true
+        XCTAssertNotNil(first.composerDidChange(Support.content("unsaved before replacement")))
+        let second = try coordinator.claimLane(owner: Owner(), persistenceState: load.persistenceState)
+        // Joins the predecessor's (failing) hand-over flush.
+        let blocked = await second.admitQueued(admission(second, "blocked"))
+        assertRefused(blocked, .unsavedPredecessorInput)
+        let inherited = try XCTUnwrap(second.unsavedPredecessorInputs.first)
+        failures.shouldFailWrites = false
+        _ = await second.restoreComposer()
+
+        let vetoed = await second.prepareForShutdown(questions: .init(upserting: [questionSnapshot(store)]), run: nil)
+        guard case .failure(.composer(.unsavedPredecessorInput)) = vetoed else {
+            return XCTFail("input held only in memory vetoes Stage A, got \(vetoed)")
+        }
+        XCTAssertFalse(second.isRetired, "a veto leaves the lane usable")
+        XCTAssertEqual(second.unsavedPredecessorInputs, [inherited])
+        let afterVeto = await store.read(sessionID: load.session.id).record?.questions ?? []
+        XCTAssertTrue(afterVeto.isEmpty, "nothing after the veto was written")
+
+        _ = await second.resolveUnsavedPredecessorInput(.discard, expected: inherited, liveComposerIsEmpty: true)
+        second.composerDidChange(Support.content("typed before quitting"))
+        let snapshot = questionSnapshot(store, secretAnswer: "s3cr3t")
+        XCTAssertNil(snapshot.items[1].answer, "a secret answer is structurally absent")
+        let ownership = Support.ownership(sessionID: load.session.id)
+        let run = AgentRecoverySessionLane.ShutdownRunEvidence(
+            ownership: ownership,
+            processRunID: nil,
+            reason: .windowClose,
+            lastConfirmedActivityAt: nil
+        )
+        guard case .success = await second.prepareForShutdown(questions: .init(upserting: [snapshot]), run: run) else {
+            return XCTFail("Stage A succeeds once nothing is held only in memory")
+        }
+        let prepared = await store.read(sessionID: load.session.id).record
+        let record = try XCTUnwrap(prepared)
+        XCTAssertEqual(record.composer?.content.text, "typed before quitting")
+        XCTAssertEqual(record.questions, [snapshot])
+        XCTAssertEqual(record.runAttempt(id: ownership.attemptID)?.shutdown?.reason, .windowClose)
+        XCTAssertNil(record.runAttempt(id: ownership.attemptID)?.terminal, "a shutdown reason is not a stop")
+
+        // A later attempt (window close cancelled, then app quit) keeps the first reason.
+        let laterRun = AgentRecoverySessionLane.ShutdownRunEvidence(
+            ownership: ownership,
+            processRunID: nil,
+            reason: .appQuit,
+            lastConfirmedActivityAt: nil
+        )
+        let resolved = AgentRecoveryStore.QuestionSnapshotUpdate(removing: [snapshot.interactionID])
+        guard case .success = await second.prepareForShutdown(questions: resolved, run: laterRun) else {
+            return XCTFail("a repeated preparation succeeds")
+        }
+        let repeatedRecord = await store.read(sessionID: load.session.id).record
+        let repeated = try XCTUnwrap(repeatedRecord)
+        XCTAssertEqual(repeated.runAttempt(id: ownership.attemptID)?.shutdown?.reason, .windowClose)
+        XCTAssertTrue(repeated.questions.isEmpty, "a resolved question is removed by its interaction ID")
+        guard case .success = await second.admitQueued(admission(second, "still usable")) else {
+            return XCTFail("preparation never retires the lane or keeps admission closed")
+        }
+    }
+
+    /// R4-01: question writes name exact interactions. A question another owner preserved, from an
+    /// earlier launch or from a window closed earlier in this same launch (its snapshot carries
+    /// this launch's instance ID), survives a reopened owner's preparation without live questions.
+    /// Only an exact removal (live resolution, the recovery list) erases a snapshot; re-upserting a
+    /// stored question replaces it in place and reports it as already stored.
+    func testQuestionWritesNameExactInteractionsAndKeepOtherOwnersSnapshots() async throws {
+        let previousStore = makeStore(instance: UUID())
+        let previousService = makeService(store: previousStore)
+        let load = try await makeSession(previousService)
+        let previousGate = try previousService.recoveryLifecycleGate(for: load.persistenceState)
+        let earlier = questionSnapshot(previousStore)
+        try await previousGate.performRecoveryTransaction {
+            _ = try await previousStore.updateQuestionSnapshots(
+                binding: previousGate.binding,
+                expectedRevision: previousStore.currentRevision(sessionID: load.session.id),
+                update: .init(upserting: [earlier])
+            )
+        }
+
+        let store = makeStore(instance: UUID())
+        let service = makeService(store: store)
+        let coordinator = try await startedCoordinator(store: store, service: service)
+        let reloaded = try await service.loadAgentSessionForEditing(id: load.session.id, for: workspace)
+        let persistenceState = try XCTUnwrap(reloaded?.persistenceState)
+        let closedOwner = try coordinator.claimLane(owner: Owner(), persistenceState: persistenceState)
+        _ = await closedOwner.restoreComposer()
+
+        // A window of this launch preserves its live question, then closes.
+        let closed = questionSnapshot(store)
+        guard case let .success(alreadyStored) = await closedOwner.prepareForShutdown(
+            questions: .init(upserting: [closed]),
+            run: nil
+        ) else {
+            return XCTFail("the closing window's preparation succeeds")
+        }
+        XCTAssertEqual(alreadyStored, [])
+        XCTAssertEqual(closed.appInstanceID, store.appInstanceID, "the closed window's snapshot is this launch's")
+
+        // The session reopens in another window of the same launch, with no live question.
+        let reopened = try coordinator.claimLane(owner: Owner(), persistenceState: persistenceState)
+        _ = await reopened.restoreComposer()
+        guard case .success = await reopened.prepareForShutdown(questions: .init(), run: nil) else {
+            return XCTFail("preparation without live questions succeeds")
+        }
+        var stored = await store.read(sessionID: load.session.id).record?.questions
+        XCTAssertEqual(stored, [earlier, closed], "no live question erases neither launch's preserved question")
+
+        let live = questionSnapshot(store)
+        guard case let .success(newlyStored) = await reopened.prepareForShutdown(
+            questions: .init(upserting: [live]),
+            run: nil
+        ) else {
+            return XCTFail("preparation with a live question succeeds")
+        }
+        XCTAssertEqual(newlyStored, [], "a new live question is not already stored")
+        stored = await store.read(sessionID: load.session.id).record?.questions
+        XCTAssertEqual(stored, [earlier, closed, live])
+
+        var revised = closed
+        revised.extras["revision"] = .string("2")
+        guard case let .success(restored) = await reopened.prepareForShutdown(
+            questions: .init(upserting: [revised]),
+            run: nil
+        ) else {
+            return XCTFail("re-upserting a stored question succeeds")
+        }
+        XCTAssertEqual(restored, [closed.interactionID], "a re-upserted question is reported as already stored")
+        stored = await store.read(sessionID: load.session.id).record?.questions
+        XCTAssertEqual(stored, [earlier, revised, live], "replaced in place")
+
+        // Live resolution removes exactly its interaction.
+        guard case .success = await reopened.updateQuestionSnapshots(.init(removing: [live.interactionID])) else {
+            return XCTFail("live refresh succeeds")
+        }
+        stored = await store.read(sessionID: load.session.id).record?.questions
+        XCTAssertEqual(stored, [earlier, revised])
+
+        // The recovery list removes exactly the question it resolved.
+        guard case .success = await reopened.updateQuestionSnapshots(.init(removing: [earlier.interactionID])) else {
+            return XCTFail("the recovery list removes its question")
+        }
+        stored = await store.read(sessionID: load.session.id).record?.questions
+        XCTAssertEqual(stored, [revised])
+    }
+
+    /// Question snapshots round-trip through a fresh store; a secret answer stored on disk makes the
+    /// record unreadable instead of being adopted.
+    func testQuestionSnapshotsRoundTripAndAStoredSecretAnswerIsUnreadable() async throws {
+        let store = makeStore()
+        let service = makeService(store: store)
+        let load = try await makeSession(service)
+        let coordinator = try await startedCoordinator(store: store, service: service)
+        let lane = try coordinator.claimLane(owner: Owner(), persistenceState: load.persistenceState)
+        _ = await lane.restoreComposer()
+        var snapshot = questionSnapshot(store)
+        snapshot.extras["futureField"] = .string("kept")
+        guard case .success = await lane.updateQuestionSnapshots(.init(upserting: [snapshot])) else {
+            return XCTFail("question snapshots are written")
+        }
+        let reread = await makeStore().read(sessionID: load.session.id).record
+        XCTAssertEqual(reread?.questions, [snapshot], "unknown fields and every item survive a round trip")
+
+        let fileURL = store.recordFileURL(sessionID: load.session.id)
+        let data = try Data(contentsOf: fileURL)
+        guard case .success = AgentRecoveryRecordCodec.decode(data, expectedSessionID: load.session.id) else {
+            return XCTFail("the written record decodes")
+        }
+        var object = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        var questions = try XCTUnwrap(object["questions"] as? [[String: Any]])
+        var items = try XCTUnwrap(questions[0]["items"] as? [[String: Any]])
+        XCTAssertNil(items[1]["answer"], "no secret answer was written")
+        items[1]["answer"] = "leaked"
+        questions[0]["items"] = items
+        object["questions"] = questions
+        let tampered = try JSONSerialization.data(withJSONObject: object)
+        guard case .failure = AgentRecoveryRecordCodec.decode(tampered, expectedSessionID: load.session.id) else {
+            return XCTFail("a stored secret answer is never adopted")
+        }
+    }
+
     func testDeletedSessionNeverRestoresOrAdmits() async throws {
         let store = makeStore()
         let service = makeService(store: store)

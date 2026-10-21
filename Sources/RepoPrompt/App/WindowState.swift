@@ -148,6 +148,18 @@ class WindowState: ObservableObject {
     /// Called whenever `isCurrentlyFocused` changes.
     var onFocusChanged: ((Bool) -> Void)?
 
+    /// App-wide admission of a window scene (decided once, at registration).
+    enum ApplicationAdmission: Equatable {
+        /// Created by a window scene; inert until registration admits it.
+        case pending
+        case admitted
+        /// Opened after an app quit's point of no return: an inert "RepoPrompt is quitting" shell
+        /// that never becomes application state (no workspace, sessions, scheduler, or input).
+        case refusedDuringQuit
+    }
+
+    @Published private(set) var applicationAdmission: ApplicationAdmission
+
     // MARK: - Per-Window View Models
 
     let workspaceFileContextStore: WorkspaceFileContextStore
@@ -342,6 +354,18 @@ class WindowState: ObservableObject {
         )
     }
 
+    /// A window scene's state: its existing activation (initial workspace activation, scheduled-send
+    /// host) waits for app-wide admission at registration, so a window refused during an app quit
+    /// never activates.
+    static func forWindowScene() -> WindowState {
+        WindowState(
+            contextBuilderProviderFactory: nil,
+            loadStoredAPISettingsDataOnInit: true,
+            codexModelPollingService: .shared,
+            defersActivationUntilAdmission: true
+        )
+    }
+
     #if DEBUG
         convenience init(contextBuilderProviderFactory: @escaping ContextBuilderAgentViewModel.ProviderFactory) {
             self.init(
@@ -377,8 +401,10 @@ class WindowState: ObservableObject {
         contextBuilderProviderFactory: ContextBuilderAgentViewModel.ProviderFactory?,
         loadStoredAPISettingsDataOnInit: Bool,
         codexModelPollingService: CodexModelPollingService,
-        workspaceFileContextStore injectedWorkspaceFileContextStore: WorkspaceFileContextStore? = nil
+        workspaceFileContextStore injectedWorkspaceFileContextStore: WorkspaceFileContextStore? = nil,
+        defersActivationUntilAdmission: Bool = false
     ) {
+        applicationAdmission = defersActivationUntilAdmission ? .pending : .admitted
         // Assign a unique window ID
         WindowState.windowCounter += 1
         windowID = WindowState.windowCounter
@@ -399,7 +425,8 @@ class WindowState: ObservableObject {
             contextBuilderProviderFactory: contextBuilderProviderFactory,
             workspaceFileContextStore: injectedWorkspaceFileContextStore,
             loadStoredAPISettingsDataOnInit: loadStoredAPISettingsDataOnInit,
-            codexModelPollingService: codexModelPollingService
+            codexModelPollingService: codexModelPollingService,
+            defersInitialWorkspaceActivation: defersActivationUntilAdmission
         )
 
         workspaceFileContextStore = composition.workspaceFileContextStore
@@ -422,8 +449,11 @@ class WindowState: ObservableObject {
         chatDataService = composition.chatDataService
         workspaceManager = composition.workspaceManager
 
-        // Register this window's Agent Mode view model as a scheduled-send dispatch host.
-        agentModeViewModel.attachScheduledSendCoordinator(Self.sharedScheduledSendCoordinator)
+        // Register this window's Agent Mode view model as a scheduled-send dispatch host (a window
+        // scene does so only once admitted).
+        if !defersActivationUntilAdmission {
+            agentModeViewModel.attachScheduledSendCoordinator(Self.sharedScheduledSendCoordinator)
+        }
 
         // Set up additional actions
         setupSendPromptAction()
@@ -492,6 +522,21 @@ class WindowState: ObservableObject {
                 refreshAgentChatTitleCluster()
             }
             .store(in: &cancellables)
+    }
+
+    /// Registration admitted this window scene: runs the activation deferred at init, in its
+    /// original order (scheduled-send host, then the initial workspace activation).
+    func activateAfterApplicationAdmission() {
+        guard applicationAdmission == .pending else { return }
+        applicationAdmission = .admitted
+        agentModeViewModel.attachScheduledSendCoordinator(Self.sharedScheduledSendCoordinator)
+        workspaceManager.performDeferredInitialWorkspaceActivation()
+    }
+
+    /// Registration refused this window scene (an app quit passed its point of no return).
+    func refuseApplicationAdmission() {
+        guard applicationAdmission == .pending else { return }
+        applicationAdmission = .refusedDuringQuit
     }
 
     private func setupMCPAutoStart() {

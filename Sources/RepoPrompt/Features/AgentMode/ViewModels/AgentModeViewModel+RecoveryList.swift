@@ -116,6 +116,38 @@ extension AgentModeViewModel {
                 )
             }
         }
+        /// R4: questions that were pending when an earlier launch shut down. Historical text only:
+        /// the old request is never resumed; its text can be copied into an empty message box.
+        func appendQuestionRows(
+            sessionID: UUID,
+            name: String,
+            record: AgentRecoveryRecord,
+            isActive: Bool,
+            openAction: [AgentRecoveryListRowProps.Action]
+        ) {
+            let earlier = record.questions.filter { $0.appInstanceID != currentInstanceID }
+            guard !earlier.isEmpty else { return }
+            let liveIsEmpty: Bool = {
+                guard isActive, let session = activeSession, let lane = session.recoveryLane else { return false }
+                return recoveryInputContent(for: session, store: lane.store, sessionID: lane.sessionID)?.isEmpty ?? false
+            }()
+            for snapshot in earlier {
+                let actions: [AgentRecoveryListRowProps.Action] = isActive
+                    ? (liveIsEmpty ? [.restoreDraft, .discardDraft] : [.discardDraft])
+                    : openAction
+                append(
+                    Self.recoveryListQuestionRowID(sessionID: sessionID, interactionID: snapshot.interactionID),
+                    sessionID: sessionID,
+                    name: name,
+                    title: "Unanswered question",
+                    detail: liveIsEmpty || !isActive
+                        ? "The agent was waiting for an answer when RepoPrompt closed. That request has ended; you can copy the question and any partial answer into the message box."
+                        : "The agent was waiting for an answer when RepoPrompt closed. That request has ended. Clear the message box to copy it there, or dismiss it.",
+                    text: snapshot.composerText,
+                    actions: actions
+                )
+            }
+        }
         var listedSessionIDs: Set<UUID> = []
 
         for failure in coordinator.reconciliation.workspaceFailures where failure.workspaceID == workspaceID {
@@ -251,6 +283,13 @@ extension AgentModeViewModel {
                     ?? max(binding.transcriptResetGeneration, record.transcriptResetGeneration),
                 isActive: isActive,
                 isRemote: resolution.remoteHostID != nil,
+                openAction: openAction
+            )
+            appendQuestionRows(
+                sessionID: sessionID,
+                name: name,
+                record: record,
+                isActive: isActive,
                 openAction: openAction
             )
         }
@@ -451,6 +490,10 @@ extension AgentModeViewModel {
             return name
         }
         return "Session \(sessionID.uuidString.prefix(8))"
+    }
+
+    static func recoveryListQuestionRowID(sessionID: UUID, interactionID: UUID) -> String {
+        "question-\(sessionID.uuidString)-\(interactionID.uuidString)"
     }
 
     static func recoveryListHeldDraftRowID(sessionID: UUID, revision: AgentRecoveryComposerRevision) -> String {
@@ -673,6 +716,9 @@ extension AgentModeViewModel {
     /// draft. The row ID carries the displayed revision or entry identity; a changed draft is never
     /// resolved in its place.
     private func resolveRecoveryListDraft(rowID: String, choice: AgentRecoveryHeldComposerChoice) async -> String? {
+        if rowID.hasPrefix("question-") {
+            return await resolveRecoveryListQuestion(rowID: rowID, choice: choice)
+        }
         let changed = "This draft changed. Review it again."
         if let sessionID = recoveryListDraftRowID(rowID, kind: "ownerless") {
             guard choice == .discard,
@@ -718,6 +764,50 @@ extension AgentModeViewModel {
             }
         }
         return changed
+    }
+
+    /// R4: copies an earlier launch's unanswered question into the empty message box (saved first),
+    /// or dismisses it. Never resumes the old request; the snapshot is removed only afterwards.
+    private func resolveRecoveryListQuestion(rowID: String, choice: AgentRecoveryHeldComposerChoice) async -> String? {
+        let ids = rowID.dropFirst("question-".count)
+        guard ids.count == 73,
+              let sessionID = UUID(uuidString: String(ids.prefix(36))),
+              let interactionID = UUID(uuidString: String(ids.suffix(36)))
+        else { return "This question is no longer available." }
+        guard let (session, lane) = recoveryListLane(sessionID: sessionID) else {
+            return "Open this session to use this question."
+        }
+        let questions: [AgentRecoveryQuestionSnapshot]
+        switch await lane.readRecord() {
+        case let .failure(failure):
+            return "The saved question couldn't be read (\(failure)). Nothing was changed."
+        case let .success(state):
+            switch state {
+            case .preserved:
+                return "The saved question data is unreadable and is kept unchanged."
+            case .absent:
+                return nil
+            case let .supported(record):
+                questions = record.questions
+            }
+        }
+        guard let snapshot = questions.first(where: { $0.interactionID == interactionID }) else { return nil }
+        if choice == .restoreToComposer {
+            guard session.recoveryLane === lane, !lane.isRetired,
+                  recoveryInputContent(for: session, store: lane.store, sessionID: lane.sessionID)?.isEmpty == true
+            else {
+                return "Clear the message box first. Your current text and this question are both kept."
+            }
+            applyRecoveredComposer(AgentRecoveryInputContent(text: snapshot.composerText), lane: lane, to: session)
+            recoveryComposerDidMutate(session: session)
+            if case let .failed(failure) = await lane.flushComposer() {
+                return "The question was copied into the message box but couldn't be saved (\(Self.recoveryListDescription(of: failure))). It is still listed here."
+            }
+        }
+        if case let .failure(failure) = await lane.updateQuestionSnapshots(.init(removing: [interactionID])) {
+            return "The question couldn't be removed from this list (\(Self.recoveryListDescription(of: failure)))."
+        }
+        return nil
     }
 
     private static func recoveryListDraftFailureText(_ failure: AgentRecoveryControllerFailure) -> String {

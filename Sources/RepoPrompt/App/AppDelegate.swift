@@ -258,23 +258,19 @@ class AppDelegate: NSObject, ObservableObject, NSApplicationDelegate {
         guard quitRequestPhase != .terminating else { return }
         quitRequestPhase = .terminating
 
-        // Signal termination only after the user has confirmed (or the warning is bypassed).
-        WindowStatesManager.shared.signalTermination()
-        ProcessTermination.beginAppTerminationFastPath()
-        MCPBackgroundModeCoordinator.shared.resetForTermination()
-
-        // Persist the final restorable window session before async shutdown begins.
-        // Using .terminateLater lets us do async work without deadlocking.
-        Task { @MainActor in
-            if !AppLaunchConfiguration.current.suppressesWindowPersistence {
-                await WindowStatesManager.shared.persistWindowSessionImmediately(reason: "appShouldTerminate")
+        // Two-stage quit (spec R4): the coordinator freezes admission synchronously, preserves
+        // layout and agent state (Stage A, cancellable), and only then sets the termination flags
+        // and tears down (Stage B). It owns the single reply: `false` after a cancelled Stage A
+        // (the app stays usable), `true` once Stage B finished or the user chose Quit Anyway.
+        let started = WindowStatesManager.shared.lifecycleShutdown.requestApplicationQuit { [weak self] shouldTerminate in
+            if !shouldTerminate {
+                self?.quitRequestPhase = .idle
             }
-
-            // Shut down agent processes and MCP tools on the main actor WITHOUT blocking.
-            await OhMyPiThinkingCapabilityResolver.shared.cancel(reason: .appTermination)
-            await WindowStatesManager.shared.shutdownAllAgentSessions()
-            await WindowStatesManager.shared.stopAllServers()
-            sender.reply(toApplicationShouldTerminate: true)
+            sender.reply(toApplicationShouldTerminate: shouldTerminate)
+        }
+        if !started {
+            // An earlier quit still owns its reply; this request adds nothing.
+            appDelegateDebugLog("quit request joined an in-progress shutdown")
         }
     }
 

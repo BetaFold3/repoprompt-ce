@@ -360,6 +360,74 @@ final class AgentRecoveryStartupReconciliationTests: XCTestCase {
         ), "This launch's own mark proves nothing about the previous one")
     }
 
+    /// R4: a recorded shutdown reason is intent, never proof of a stop. Neither this launch's
+    /// uncertain-input hold nor the next launch's crash hold treats it as terminal evidence, and a
+    /// `shutdownInProgress` launch mark proves no clean exit.
+    func testShutdownReasonWithoutAStopKeepsTheRunAndItsUncertainInputHeld() async throws {
+        let earlier = launch()
+        let home = try makeWorkspace("home")
+        let load = try await makeSession(earlier, in: home)
+        let ownership = Support.ownership(sessionID: load.session.id)
+        let submission = Support.submission("sent while quitting")
+        try await transact(earlier, load) { store, binding in
+            _ = try await store.ensureRunAttempt(
+                binding: binding,
+                expectedRevision: store.currentRevision(sessionID: binding.sessionID),
+                ownership: ownership,
+                processRunID: nil,
+                transcriptTurnID: nil
+            )
+            _ = try await store.commitQueuedIntent(
+                binding: binding,
+                expectedRevision: store.currentRevision(sessionID: binding.sessionID),
+                submission: submission,
+                consumption: nil
+            )
+            _ = try await store.beginDispatch(
+                binding: binding,
+                expectedRevision: store.currentRevision(sessionID: binding.sessionID),
+                intentID: submission.intentID,
+                attempt: AgentRecoveryAttemptStart(attemptID: UUID(), runAttemptID: ownership.attemptID),
+                authorization: .liveQueue
+            )
+            _ = try await store.recordRunShutdown(
+                binding: binding,
+                expectedRevision: store.currentRevision(sessionID: binding.sessionID),
+                runAttemptID: ownership.attemptID,
+                reason: .appQuit,
+                lastConfirmedActivityAt: nil
+            )
+        }
+        let stored = await earlier.store.read(sessionID: load.session.id)
+        let record = try XCTUnwrap(stored.record)
+        let intent = try XCTUnwrap(record.intent(id: submission.intentID))
+        XCTAssertEqual(record.runAttempt(id: ownership.attemptID)?.shutdown?.reason, .appQuit)
+        XCTAssertNil(
+            AgentRecoveryCoordinator.uncertainInputHoldReason(intent, in: record),
+            "A shutdown reason without terminal evidence leaves the input owned by its run"
+        )
+
+        let previous = AgentRecoveryPreviousLaunch.mark(AgentRecoveryLaunchMark(
+            appInstanceID: earlier.store.appInstanceID,
+            state: .shutdownInProgress,
+            recordedAt: AgentRecoveryTimestamp(millisecondsSince1970: 1000)
+        ))
+        let now = launch()
+        XCTAssertFalse(previous.provesCleanExit(currentInstanceID: now.store.appInstanceID))
+        XCTAssertNil(
+            AgentColdRestoreInterruptionContext.launchReason(previousLaunch: previous, currentInstanceID: now.store.appInstanceID),
+            "An unfinished shutdown proves no cause for legacy turns"
+        )
+        let results = try await sweep(now, [home])
+        let hold = try XCTUnwrap(AgentRecoveryCoordinator.deriveCrashHolds(
+            from: results,
+            currentInstanceID: now.store.appInstanceID,
+            previousExitProvenClean: false
+        )[load.session.id], "A shutdown reason is never a stop")
+        XCTAssertEqual(hold.uncertainRunAttemptIDs, [ownership.attemptID])
+        XCTAssertEqual(hold.uncertainIntentIDs, [submission.intentID])
+    }
+
     func testOrdinaryLoadBeforeStartupStampsProvisionallyAndReconcileRefinesWithoutErasing() async throws {
         let earlier = launch()
         let home = try makeWorkspace("home")

@@ -256,6 +256,9 @@ package struct AgentColdRestoreInterruptionContext: Equatable {
             return .appQuit
         case .running:
             return .appCrash
+        case .shutdownInProgress:
+            // A quit that never reached its clean mark proves neither a quit nor a crash.
+            return nil
         }
     }
 

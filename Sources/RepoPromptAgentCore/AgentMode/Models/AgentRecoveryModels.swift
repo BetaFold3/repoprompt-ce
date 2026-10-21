@@ -792,6 +792,9 @@ package struct AgentRecoveryRecord: Equatable {
     package let runAttempts: [AgentRecoveryRunAttempt]
     /// Latest explicit crash-hold acknowledgement; absent means unacknowledged.
     package let crashHoldAcknowledgement: AgentRecoveryCrashHoldAcknowledgement?
+    /// Pending questions preserved by the latest shutdown preparation (empty = none). Display and
+    /// explicit composer restore only: never a continuation, routing, or provider request.
+    package let questions: [AgentRecoveryQuestionSnapshot]
     package let extras: AgentRecoveryExtras
 
     package init(
@@ -805,9 +808,11 @@ package struct AgentRecoveryRecord: Equatable {
         attempts: [AgentRecoveryAttempt],
         runAttempts: [AgentRecoveryRunAttempt],
         crashHoldAcknowledgement: AgentRecoveryCrashHoldAcknowledgement? = nil,
+        questions: [AgentRecoveryQuestionSnapshot] = [],
         extras: AgentRecoveryExtras = [:]
     ) {
         self.crashHoldAcknowledgement = crashHoldAcknowledgement
+        self.questions = questions
         self.sessionID = sessionID
         self.revision = revision
         self.incarnationID = incarnationID
@@ -845,6 +850,103 @@ package struct AgentRecoveryRecord: Equatable {
             names.formUnion(intent.payload.managedImageFileNames)
         }
         return names
+    }
+}
+
+// MARK: - Pending-question snapshots
+
+/// Which live question surface a snapshot was taken from.
+package enum AgentRecoveryQuestionKind: String, CaseIterable {
+    /// RepoPrompt `ask_user` wizard.
+    case askUser
+    /// Provider-native `request_user_input`.
+    case userInput
+    /// MCP elicitation (title and message only; it has no partial-answer surface).
+    case elicitation
+}
+
+/// One question of a snapshot with its partial answer. A secret item never carries an answer, a
+/// selection, or any plaintext derived from one: the initializer drops it.
+package struct AgentRecoveryQuestionItem: Equatable {
+    package let questionID: String
+    package let header: String?
+    package let text: String
+    package let options: [String]
+    package let isSecret: Bool
+    /// Rendered partial answer (selected options and typed text); always `nil` for a secret item.
+    package let answer: String?
+    package var extras: AgentRecoveryExtras
+
+    package init(
+        questionID: String,
+        header: String?,
+        text: String,
+        options: [String],
+        isSecret: Bool,
+        answer: String?,
+        extras: AgentRecoveryExtras = [:]
+    ) {
+        self.questionID = questionID
+        self.header = header
+        self.text = text
+        self.options = options
+        self.isSecret = isSecret
+        let trimmed = answer?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        self.answer = isSecret || trimmed.isEmpty ? nil : answer
+        self.extras = extras
+    }
+}
+
+/// A pending question preserved before shutdown (spec R4). Restored only as historical text: a
+/// later launch offers an explicit copy into the composer and never resumes the old request.
+package struct AgentRecoveryQuestionSnapshot: Equatable {
+    /// Live interaction identity (stable per request).
+    package let interactionID: UUID
+    package let kind: AgentRecoveryQuestionKind
+    package let runAttemptID: UUID?
+    package let transcriptResetGeneration: UInt64
+    package let appInstanceID: UUID
+    package let askedAt: AgentRecoveryTimestamp
+    package let title: String?
+    package let message: String?
+    package let items: [AgentRecoveryQuestionItem]
+    package var extras: AgentRecoveryExtras
+
+    package init(
+        interactionID: UUID,
+        kind: AgentRecoveryQuestionKind,
+        runAttemptID: UUID?,
+        transcriptResetGeneration: UInt64,
+        appInstanceID: UUID,
+        askedAt: AgentRecoveryTimestamp,
+        title: String?,
+        message: String?,
+        items: [AgentRecoveryQuestionItem],
+        extras: AgentRecoveryExtras = [:]
+    ) {
+        self.interactionID = interactionID
+        self.kind = kind
+        self.runAttemptID = runAttemptID
+        self.transcriptResetGeneration = transcriptResetGeneration
+        self.appInstanceID = appInstanceID
+        self.askedAt = askedAt
+        self.title = title
+        self.message = message
+        self.items = items
+        self.extras = extras
+    }
+
+    /// Plain text for an explicit composer restore (question text plus any non-secret partial
+    /// answer). Contains nothing from a secret item except its question text.
+    package var composerText: String {
+        var lines: [String] = []
+        if let title, !title.isEmpty { lines.append(title) }
+        if let message, !message.isEmpty { lines.append(message) }
+        for item in items {
+            lines.append("Q: \(item.text)")
+            if let answer = item.answer { lines.append("A: \(answer)") }
+        }
+        return lines.joined(separator: "\n")
     }
 }
 
@@ -1025,11 +1127,14 @@ package enum AgentRecoveryHeldComposerResolution: Equatable {
 
 // MARK: - Launch state
 
-/// Run mark persisted for each app launch at `AgentRecovery/v1/launch-state.json`. Until two-stage
-/// shutdown lands, no build writes `cleanExit`, so every previous launch reads as unclean.
+/// Run mark persisted for each app launch at `AgentRecovery/v1/launch-state.json`. Two-stage app
+/// quit writes `shutdownInProgress` when Stage A begins and `cleanExit` only as its last step;
+/// window close never writes a launch mark.
 package struct AgentRecoveryLaunchMark: Equatable {
     package enum State: String, CaseIterable {
         case running
+        /// App quit began but did not finish. Never proves a clean exit and implies no R5 reason.
+        case shutdownInProgress
         case cleanExit
     }
 

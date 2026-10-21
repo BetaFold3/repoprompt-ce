@@ -194,11 +194,19 @@ package final class AgentTabSession: ObservableObject {
 
     @Published package var pendingUserInputRequest: AgentRequestUserInputRequest? = nil {
         didSet {
+            if pendingUserInputDrafts?.requestID != pendingUserInputRequest?.id {
+                pendingUserInputDrafts = nil
+            }
             notePendingQuestionUIAggregateChange(
                 from: pendingAskUser != nil || oldValue != nil || pendingMCPElicitationRequest != nil
             )
         }
     }
+
+    /// Partial answers of `pendingUserInputRequest`. Owned by the session (not the card) so
+    /// shutdown preparation snapshots non-secret answers and vetoes on a non-empty secret one.
+    /// Memory-only; dropped whenever the pending request changes.
+    package var pendingUserInputDrafts: AgentRequestUserInputDraftState?
 
     @Published package var pendingApproval: AgentApprovalRequest? = nil
     @Published package var pendingPermissionsRequest: AgentPermissionsRequest? = nil
