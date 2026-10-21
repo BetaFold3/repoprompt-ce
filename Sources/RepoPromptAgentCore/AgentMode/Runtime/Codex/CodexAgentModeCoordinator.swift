@@ -193,18 +193,38 @@ package final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObser
 
     package enum NativeSendOutcome: Equatable {
         case sent
-        case queuedFallback(queueID: UUID, reason: CodexTurnFallbackDecision)
+        /// Held in the Codex fallback queue under its store-issued queue receipt (the queue ID is the
+        /// receipt's recovery intent ID). Restart-held, not provider acceptance. Never produced
+        /// without a receipt: input without durable admission fails closed instead of queuing.
+        case queuedFallback(receipt: AgentRecoveryQueueReceipt, reason: CodexTurnFallbackDecision)
         case stale(reason: String)
         case cancelled
         case failed(message: String)
+        /// Durable input only: the provider handoff began but its result is not proven, or its
+        /// delivery evidence could not be written. The intent stays `dispatching`/`deliveryUnknown`
+        /// in the recovery store; callers must not restore a retryable draft, report it as sent, or
+        /// retry it automatically.
+        case deliveryUnknown(message: String)
 
         package var didSend: Bool {
             switch self {
             case .sent, .queuedFallback:
                 true
-            case .stale, .cancelled, .failed:
+            case .stale, .cancelled, .failed, .deliveryUnknown:
                 false
             }
+        }
+
+        /// The store-issued queue receipt of a `queuedFallback`; `nil` for every other outcome.
+        package var durableQueueReceipt: AgentRecoveryQueueReceipt? {
+            if case let .queuedFallback(receipt, _) = self {
+                return receipt
+            }
+            return nil
+        }
+
+        package var fallbackQueueID: UUID? {
+            durableQueueReceipt?.intent.intentID
         }
     }
 
@@ -223,6 +243,36 @@ package final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObser
             return .provenNotSubmitted
         }
         return .deliveryUnknown
+    }
+
+    /// A refused `beginDispatch` whose intent is already past `queued` toward delivery (dispatching
+    /// through another send, provider-accepted, or uncertain): this send must not hand it off, and
+    /// the caller must treat it as possibly delivered (never retryable).
+    private nonisolated static func codexDispatchBeginFailureMayAlreadyBeDelivered(
+        _ failure: AgentRecoveryAdmissionFailure
+    ) -> Bool {
+        guard case let .commitFailed(controllerFailure) = failure else { return false }
+        return codexRecoveryFailureMayAlreadyBeDelivered(controllerFailure)
+    }
+
+    /// The intent is past `queued` toward delivery (see `codexDispatchBeginFailureMayAlreadyBeDelivered`).
+    private nonisolated static func codexRecoveryFailureMayAlreadyBeDelivered(
+        _ failure: AgentRecoveryControllerFailure
+    ) -> Bool {
+        guard case let .store(storeError) = failure else { return false }
+        switch storeError {
+        case let .invalidTransition(_, from, _):
+            switch from {
+            case .dispatching, .providerAccepted, .deliveryUnknown:
+                return true
+            case .queued, .failed, .withdrawn:
+                return false
+            }
+        case .attemptConflict:
+            return true
+        default:
+            return false
+        }
     }
 
     private func settleCodexUsageDispatchAfterStartFailure(
@@ -292,6 +342,11 @@ package final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObser
     private let codexRecoveryProbeTimeout: TimeInterval
     private var codexRecoveryAttemptedRunIDs: Set<UUID> = []
     private var codexAuthRecoveryAttemptedRunIDs: Set<UUID> = []
+    /// Durable fallback enqueues awaiting their store receipt, keyed by queue (intent) ID. A
+    /// concurrent request for the same ID joins the reserved operation instead of starting another.
+    private var pendingDurableCodexFallbackEnqueues: [UUID: Task<NativeSendOutcome, Never>] = [:]
+    /// Last durable fallback enqueue per tab, so projections keep request (FIFO) order.
+    private var durableCodexFallbackEnqueueTailByTabID: [UUID: Task<NativeSendOutcome, Never>] = [:]
     private var pendingCodexThreadNameSyncByTabID: [UUID: PendingCodexThreadNameSync] = [:]
     private var codexThreadNameSyncTaskByTabID: [UUID: (generation: UUID, task: Task<Void, Never>)] = [:]
     private var observedCodexAssistantCompletionScopesByTabID: [UUID: Set<CodexNativeSessionController.ItemScope>] = [:]
@@ -2140,21 +2195,37 @@ package final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObser
         }
     }
 
-    private func fallbackSubmissionContext(
-        _ context: AgentTabSession.CodexFallbackSubmissionContext?,
-        text: String,
-        images: [AgentImageAttachment]
-    ) -> AgentTabSession.CodexFallbackSubmissionContext {
-        context ?? .init(
-            queueID: UUID(),
-            providerText: text,
-            images: images,
-            taggedFileAttachments: [],
-            draftText: text,
-            optimisticUserItemID: nil,
-            origin: .manual,
-            dispatchTicket: nil
+    /// Input without a store-issued queue receipt (no context, or untracked legacy input while
+    /// admission is `.inactive`) is never queued or acknowledged as queued: nothing was handed off,
+    /// so it fails closed as a plain pre-handoff failure and keeps the legacy retryable restore.
+    private func refuseCodexFallbackWithoutQueueReceipt(
+        session: AgentTabSession,
+        attachmentReservationID: UUID?,
+        terminalize: Bool
+    ) async -> NativeSendOutcome {
+        let message = "Codex could not queue this message because it has no durable recovery receipt; it was not sent."
+        logCodex("[AgentModeVM][Recovery] Codex fallback refused without a store-issued queue receipt")
+        if terminalize {
+            // The send created this run: end it like any other failure before handoff.
+            await finalizeCodexRun(
+                session,
+                turnStatus: .failed,
+                reason: "fallback-refused-without-receipt",
+                errorMessage: message,
+                notifyOnCompleted: false
+            )
+            return .failed(message: message)
+        }
+        viewModel?.finalizeAttachmentsForTurn(
+            for: session,
+            reservationID: attachmentReservationID,
+            disposition: .restoreToPending
         )
+        session.appendItem(AgentChatItem.error(message, sequenceIndex: session.nextSequenceIndex))
+        session.isDirty = true
+        viewModel?.requestUIRefresh(tabID: session.tabID, urgent: true)
+        viewModel?.scheduleSave(for: session.tabID)
+        return .failed(message: message)
     }
 
     private func detachCodexFallbackAttachmentReservation(
@@ -2188,6 +2259,7 @@ package final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObser
     @discardableResult
     private func removeQueuedCodexFallbackForDeliveredAttempt(
         _ attemptID: UUID,
+        deliveredIntentID: UUID? = nil,
         session: AgentTabSession
     ) -> Bool {
         recordDeliveredMCPFallbackAttempt(attemptID, session: session)
@@ -2198,6 +2270,11 @@ package final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObser
             return false
         }) else { return false }
         let removed = session.codexFallbackQueue.remove(at: index)
+        // A durable sibling queued under a different intent loses its projection without delivery;
+        // keep it held for explicit recovery instead of leaving an unprojected `queued` intent.
+        if removed.identity.isDurable, removed.identity.intentID != deliveredIntentID {
+            holdDurableCodexFallbackInput(removed.identity, session: session)
+        }
         if session.codexFallbackQueue.isEmpty, session.codexFallbackDispatchInFlight == nil {
             session.codexFallbackPumpTask?.cancel()
             session.codexFallbackPumpTask = nil
@@ -2237,28 +2314,252 @@ package final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObser
         return true
     }
 
+    /// Run/controller lineage a fallback entry is queued under.
+    private struct CodexFallbackLineage: Equatable {
+        let threadID: String
+        let controllerInstanceID: ObjectIdentifier
+        let controllerGeneration: UUID
+        let runID: UUID
+        let runAttemptID: UUID
+    }
+
+    private func currentCodexFallbackLineage(
+        session: AgentTabSession,
+        controller: any CodexSessionControlling
+    ) -> CodexFallbackLineage? {
+        guard let threadID = session.codexConversationID,
+              let runID = session.runID,
+              let runAttemptID = session.activeRunAttemptID,
+              let activeController = session.codexController,
+              Self.sameCodexControllerInstance(activeController, controller)
+        else { return nil }
+        return CodexFallbackLineage(
+            threadID: threadID,
+            controllerInstanceID: ObjectIdentifier(controller),
+            controllerGeneration: session.codexControllerGeneration,
+            runID: runID,
+            runAttemptID: runAttemptID
+        )
+    }
+
+    /// The acknowledgement for a submission that is already projected (queued or in flight): its
+    /// own store-issued queue receipt, never one derived from a bare queue ID.
+    private func projectedCodexFallbackOutcome(
+        queueID: UUID,
+        reason: CodexTurnFallbackDecision,
+        session: AgentTabSession
+    ) -> NativeSendOutcome? {
+        let projected = session.codexFallbackQueue.first(where: { $0.id == queueID })
+            ?? (session.codexFallbackDispatchInFlight?.id == queueID ? session.codexFallbackDispatchInFlight : nil)
+        guard let projected else { return nil }
+        guard let receipt = projected.identity.queueReceipt, receipt.intent.intentID == queueID else {
+            return .stale(reason: "Codex could not acknowledge the queued fallback without its durable queue receipt.")
+        }
+        return .queuedFallback(receipt: receipt, reason: reason)
+    }
+
+    /// Queues a fallback, acknowledged only with a store-issued queue receipt: any verified
+    /// no-handoff/rejection evidence settles first (same intent back to `queued`), the receipt is
+    /// reissued, and the run/controller/lane target is revalidated before the entry is projected
+    /// and acknowledged. A lost target persists a stale-target hold and projects nothing. Input
+    /// without durable admission fails closed (`refuseCodexFallbackWithoutQueueReceipt`).
+    /// Concurrent requests for the same queue ID join the reserved operation; projections keep
+    /// request order per tab.
     private func enqueueCodexFallback(
         session: AgentTabSession,
         context: AgentTabSession.CodexFallbackSubmissionContext?,
-        text: String,
-        images: [AgentImageAttachment],
         selection: (model: String?, reasoningEffort: String?, serviceTier: String?),
         attachmentReservationID: UUID?,
         reason: CodexTurnFallbackDecision,
-        controller: any CodexSessionControlling
-    ) -> NativeSendOutcome {
-        guard let threadID = session.codexConversationID,
-              let runID = session.runID,
-              let runAttemptID = session.activeRunAttemptID
+        controller: any CodexSessionControlling,
+        dispatchEvidence: AgentRecoveryDispatchEvidence? = nil,
+        terminalizeRefusal: Bool
+    ) async -> NativeSendOutcome {
+        guard let submission = context,
+              let admittedReceipt = submission.identity.queueReceipt,
+              admittedReceipt.intent.intentID == submission.queueID
         else {
-            return .stale(reason: "Codex could not queue fallback delivery because its run lineage changed.")
+            // Only untracked (legacy `.inactive`) input reaches here: its evidence writes nothing.
+            return await refuseCodexFallbackWithoutQueueReceipt(
+                session: session,
+                attachmentReservationID: attachmentReservationID,
+                terminalize: terminalizeRefusal
+            )
         }
-        let submission = fallbackSubmissionContext(context, text: text, images: images)
-        if session.codexFallbackQueue.contains(where: { $0.id == submission.queueID })
-            || session.codexFallbackDispatchInFlight?.id == submission.queueID
-        {
-            return .queuedFallback(queueID: submission.queueID, reason: reason)
+        if let projected = projectedCodexFallbackOutcome(
+            queueID: submission.queueID,
+            reason: reason,
+            session: session
+        ) {
+            return projected
         }
+        if let pending = pendingDurableCodexFallbackEnqueues[submission.queueID] {
+            return await pending.value
+        }
+        guard let lineage = currentCodexFallbackLineage(session: session, controller: controller) else {
+            releaseDurableCodexFallbackAttachments(attachmentReservationID, session: session)
+            holdDurableCodexFallbackInput(submission.identity, session: session, after: dispatchEvidence)
+            return .stale(reason: "Codex could not queue this message because its run changed; it is held for recovery.")
+        }
+        let blockingTurn = recoverableCodexFallbackBlockingTurn(session: session)
+        let previousTail = durableCodexFallbackEnqueueTailByTabID[session.tabID]
+        let tabID = session.tabID
+        let task = Task { @MainActor [self, session] () -> NativeSendOutcome in
+            _ = await previousTail?.value
+            return await completeDurableCodexFallbackEnqueue(
+                session: session,
+                submission: submission,
+                selection: selection,
+                attachmentReservationID: attachmentReservationID,
+                reason: reason,
+                lineage: lineage,
+                blockingTurn: blockingTurn,
+                dispatchEvidence: dispatchEvidence
+            )
+        }
+        pendingDurableCodexFallbackEnqueues[submission.queueID] = task
+        durableCodexFallbackEnqueueTailByTabID[tabID] = task
+        let outcome = await task.value
+        if pendingDurableCodexFallbackEnqueues[submission.queueID] == task {
+            pendingDurableCodexFallbackEnqueues[submission.queueID] = nil
+        }
+        if durableCodexFallbackEnqueueTailByTabID[tabID] == task {
+            durableCodexFallbackEnqueueTailByTabID[tabID] = nil
+        }
+        return outcome
+    }
+
+    private func completeDurableCodexFallbackEnqueue(
+        session: AgentTabSession,
+        submission: AgentTabSession.CodexFallbackSubmissionContext,
+        selection: (model: String?, reasoningEffort: String?, serviceTier: String?),
+        attachmentReservationID: UUID?,
+        reason: CodexTurnFallbackDecision,
+        lineage: CodexFallbackLineage,
+        blockingTurn: AgentTabSession.CodexFallbackBlockingTurn?,
+        dispatchEvidence: AgentRecoveryDispatchEvidence?
+    ) async -> NativeSendOutcome {
+        let intentID = submission.queueID
+        // Only verified no-handoff or rejection evidence may return the same intent to `queued`.
+        if let dispatchEvidence {
+            let failures = await dispatchEvidence.settled()
+            switch dispatchEvidence.observation {
+            case .notHandedOff, .rejected:
+                guard failures.isEmpty else {
+                    return durableCodexFallbackDeliveryUnknown(
+                        session: session,
+                        submission: submission,
+                        attachmentReservationID: attachmentReservationID,
+                        message: "Codex rejected this message, but its queue record could not be saved; recovery keeps it as uncertain. \(Self.recoveryFailureSummary(failures))"
+                    )
+                }
+            case .open, .accepted, .deliveryUnknown:
+                return durableCodexFallbackDeliveryUnknown(
+                    session: session,
+                    submission: submission,
+                    attachmentReservationID: attachmentReservationID,
+                    message: "Codex may have received this message; it was not queued for automatic resend."
+                )
+            }
+        }
+        guard let lane = session.recoveryLane,
+              let binding = submission.identity.queueReceipt?.intent.binding,
+              lane.binding == binding
+        else {
+            releaseDurableCodexFallbackAttachments(attachmentReservationID, session: session)
+            return .stale(reason: "Codex could not queue this message because its recovery lane changed; it stays saved for recovery.")
+        }
+        let issued = await lane.issueQueueReceipt(intentID: intentID)
+        let targetIsCurrent = !lane.isRetired
+            && session.recoveryLane === lane
+            && currentCodexFallbackLineageMatches(lineage, session: session)
+            && recoverableCodexFallbackBlockingTurn(session: session) == blockingTurn
+        if let projected = projectedCodexFallbackOutcome(queueID: intentID, reason: reason, session: session) {
+            return projected
+        }
+        if case let .failure(failure) = issued, Self.codexRecoveryFailureMayAlreadyBeDelivered(failure) {
+            // The same intent is dispatching through another send (or already accepted/uncertain):
+            // never projected, held, resent, or released here; that delivery owns its outcome.
+            logCodex("[AgentModeVM][Recovery] Codex fallback refused for an intent already in delivery intent=\(intentID): \(failure)")
+            return .deliveryUnknown(message: "Codex did not queue this message again because it is already being delivered or may have been delivered; it was not resent.")
+        }
+        guard case let .success(queueReceipt) = issued, targetIsCurrent else {
+            var staleMarked = false
+            if !targetIsCurrent, case .success = await lane.markTargetStale(intentID: intentID) {
+                staleMarked = true
+            }
+            releaseDurableCodexFallbackAttachments(attachmentReservationID, session: session)
+            if case let .failure(failure) = issued {
+                logCodex("[AgentModeVM][Recovery] Codex fallback queue receipt unavailable intent=\(intentID): \(failure)")
+                return .stale(reason: "Codex could not confirm this message's queue record; it was not queued.")
+            }
+            logCodex("[AgentModeVM][Recovery] Codex fallback target changed before projection intent=\(intentID) staleMarked=\(staleMarked)")
+            return .stale(reason: "Codex did not queue this message because the active run changed; it is held for recovery.")
+        }
+        projectCodexFallbackEntry(
+            session: session,
+            submission: submission,
+            receipt: queueReceipt,
+            selection: selection,
+            attachmentReservationID: attachmentReservationID,
+            reason: reason,
+            lineage: lineage,
+            blockingTurn: blockingTurn
+        )
+        return .queuedFallback(receipt: queueReceipt, reason: reason)
+    }
+
+    private func currentCodexFallbackLineageMatches(
+        _ lineage: CodexFallbackLineage,
+        session: AgentTabSession
+    ) -> Bool {
+        guard let controller = session.codexController else { return false }
+        return currentCodexFallbackLineage(session: session, controller: controller) == lineage
+    }
+
+    /// Uncertain durable fallback: never projected, acknowledged, or restored as a draft.
+    private func durableCodexFallbackDeliveryUnknown(
+        session: AgentTabSession,
+        submission: AgentTabSession.CodexFallbackSubmissionContext,
+        attachmentReservationID: UUID?,
+        message: String
+    ) -> NativeSendOutcome {
+        releaseDurableCodexFallbackAttachments(attachmentReservationID, session: session)
+        if case let .mcp(attemptID) = submission.origin {
+            session.codexSteerAckTracker.resolve(attemptID: attemptID, state: .deliveryUnknown(message: message))
+        }
+        logCodex("[AgentModeVM][Recovery] Codex fallback delivery unknown intent=\(submission.queueID): \(message)")
+        return .deliveryUnknown(message: message)
+    }
+
+    /// Durable input keeps its attachment files (the intent references them); they are never
+    /// returned to the composer as a retryable draft.
+    private func releaseDurableCodexFallbackAttachments(
+        _ reservationID: UUID?,
+        session: AgentTabSession
+    ) {
+        guard reservationID != nil else { return }
+        viewModel?.finalizeAttachmentsForTurn(
+            for: session,
+            reservationID: reservationID,
+            disposition: .keepFiles
+        )
+    }
+
+    private static func recoveryFailureSummary(_ failures: [AgentRecoveryControllerFailure]) -> String {
+        failures.map { String(describing: $0) }.joined(separator: "; ")
+    }
+
+    private func projectCodexFallbackEntry(
+        session: AgentTabSession,
+        submission: AgentTabSession.CodexFallbackSubmissionContext,
+        receipt: AgentRecoveryQueueReceipt,
+        selection: (model: String?, reasoningEffort: String?, serviceTier: String?),
+        attachmentReservationID: UUID?,
+        reason: CodexTurnFallbackDecision,
+        lineage: CodexFallbackLineage,
+        blockingTurn: AgentTabSession.CodexFallbackBlockingTurn?
+    ) {
         let entry = AgentTabSession.CodexFallbackQueueEntry(
             id: submission.queueID,
             providerText: submission.providerText,
@@ -2268,16 +2569,16 @@ package final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObser
             reasoningEffort: selection.reasoningEffort,
             serviceTier: selection.serviceTier,
             attachmentReservationID: attachmentReservationID,
-            optimisticUserItemID: submission.optimisticUserItemID,
+            identity: AgentQueuedInputIdentity(receipt: receipt),
             draftText: submission.draftText,
             origin: submission.origin,
             fallbackReason: reason,
-            originThreadID: threadID,
-            originControllerInstanceID: ObjectIdentifier(controller),
-            originControllerGeneration: session.codexControllerGeneration,
-            originRunID: runID,
-            originRunAttemptID: runAttemptID,
-            blockingTurn: recoverableCodexFallbackBlockingTurn(session: session),
+            originThreadID: lineage.threadID,
+            originControllerInstanceID: lineage.controllerInstanceID,
+            originControllerGeneration: lineage.controllerGeneration,
+            originRunID: lineage.runID,
+            originRunAttemptID: lineage.runAttemptID,
+            blockingTurn: blockingTurn,
             state: .queued
         )
         detachCodexFallbackAttachmentReservation(attachmentReservationID, session: session)
@@ -2285,7 +2586,7 @@ package final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObser
         if case let .mcp(attemptID) = submission.origin {
             session.codexSteerAckTracker.resolve(
                 attemptID: attemptID,
-                state: .durablyQueued(queueID: submission.queueID)
+                state: .durablyQueued(receipt: receipt)
             )
         } else if session.mcpControlContext != nil {
             Task { @MainActor [weak viewModel, weak session] in
@@ -2299,7 +2600,31 @@ package final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObser
         if Self.codexFallbackReasonAllowsIdlePump(reason) {
             scheduleCodexFallbackIdlePump(session: session, queueID: submission.queueID)
         }
-        return .queuedFallback(queueID: submission.queueID, reason: reason)
+    }
+
+    /// Persists the stale-target hold for durable input whose live projection was dropped by
+    /// lifecycle teardown (best effort, after ordered evidence). Never withdraws or restores it.
+    private func holdDurableCodexFallbackInput(
+        _ identity: AgentQueuedInputIdentity,
+        session: AgentTabSession,
+        after evidence: AgentRecoveryDispatchEvidence? = nil
+    ) {
+        guard let intentID = identity.intentID,
+              let binding = identity.queueReceipt?.intent.binding,
+              let lane = session.recoveryLane,
+              lane.binding == binding
+        else {
+            if identity.isDurable {
+                logCodex("[AgentModeVM][Recovery] Codex durable fallback input left without a matching recovery lane; recovery discovery keeps it")
+            }
+            return
+        }
+        Task { @MainActor in
+            _ = await evidence?.settled()
+            if case let .failure(failure) = await lane.markTargetStale(intentID: intentID) {
+                logCodex("[AgentModeVM][Recovery] Codex stale-target hold failed intent=\(intentID): \(failure)")
+            }
+        }
     }
 
     /// Heads the idle pump may release once a thread read reports `.idle`.
@@ -2482,6 +2807,16 @@ package final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObser
         return true
     }
 
+    /// Codex before-handoff step (R07): under an active run attempt, durable input first records that
+    /// run attempt (with the session's process run), so a crash after Codex accepted the turn still
+    /// leaves discoverable open-run evidence; then the dispatch commits against it.
+    private func beginCodexDispatch(
+        session: AgentTabSession,
+        constituents: [AgentQueuedInputIdentity]
+    ) async -> Result<AgentRecoveryDispatchEvidence, AgentRecoveryAdmissionFailure> {
+        await AgentRecoveryDispatchEvidence.beginUnderActiveRun(session: session, constituents: constituents)
+    }
+
     private func dispatchClaimedCodexFallback(
         _ head: AgentTabSession.CodexFallbackQueueEntry,
         session: AgentTabSession
@@ -2499,6 +2834,60 @@ package final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObser
             )
             return
         }
+        // Durable heads commit `dispatching` before the handoff; untracked heads (admission
+        // inactive) write nothing. Revalidate the exact claim and controller after the await.
+        let evidence: AgentRecoveryDispatchEvidence
+        switch await beginCodexDispatch(session: session, constituents: [head.identity]) {
+        case let .success(begun):
+            evidence = begun
+        case let .failure(failure):
+            logCodex("[AgentModeVM][Recovery] dispatchClaimedCodexFallback: dispatch evidence refused for \(head.id): \(failure)")
+            if dropDeliveredClaimedCodexFallbackIfNeeded(head, session: session) {
+                return
+            }
+            guard session.codexFallbackDispatchInFlight?.id == head.id else {
+                holdDurableCodexFallbackInput(head.identity, session: session)
+                return
+            }
+            let message = if case .dispatchStaleAfterCommit = failure {
+                "Codex queued follow-up was not sent because the session changed before dispatch."
+            } else if failure == .refused(.bindingMismatch) {
+                Self.codexOwnershipRefusedMessage
+            } else {
+                "Codex queued follow-up was not sent because its delivery record could not be saved."
+            }
+            await failCodexFallbackDispatch(
+                session: session,
+                entry: head,
+                message: message
+            )
+            return
+        }
+        if dropDeliveredClaimedCodexFallbackIfNeeded(head, session: session) {
+            evidence.noteNoHandoff(message: "Codex already accepted this MCP attempt through another dispatch.")
+            return
+        }
+        // Final synchronous ownership check (R06): no suspension between it and `startUserTurn`.
+        guard session.codexFallbackDispatchInFlight?.id == head.id,
+              let currentController = session.codexController,
+              Self.sameCodexControllerInstance(currentController, controller),
+              session.codexControllerGeneration == head.originControllerGeneration,
+              session.runID == head.originRunID,
+              evidence.isValidForHandoff(in: session)
+        else {
+            evidence.noteNoHandoff(message: "Codex queued follow-up target changed before dispatch.")
+            if session.codexFallbackDispatchInFlight?.id == head.id {
+                await failCodexFallbackDispatch(
+                    session: session,
+                    entry: head,
+                    message: "Codex queued follow-up lost its controller before dispatch.",
+                    evidence: evidence
+                )
+            } else {
+                holdDurableCodexFallbackInput(head.identity, session: session, after: evidence)
+            }
+            return
+        }
         let usageDispatchTicket = session.registerCodexUsageDispatch(requestedModel: head.model)
         do {
             _ = try await controller.startUserTurn(
@@ -2508,7 +2897,10 @@ package final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObser
                 reasoningEffort: head.reasoningEffort,
                 serviceTier: head.serviceTier
             )
+            // Affirmative provider acceptance, captured before any reconciliation below.
+            evidence.noteAccepted()
             session.acceptCodexUsageDispatch(usageDispatchTicket)
+            surfaceCodexAcceptedEvidenceFailuresIfNeeded(evidence, session: session)
             guard var inFlight = session.codexFallbackDispatchInFlight,
                   inFlight.id == head.id,
                   session.codexController.map(ObjectIdentifier.init) == head.originControllerInstanceID
@@ -2538,18 +2930,96 @@ package final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObser
                 error: error,
                 session: session
             )
+            let message: String
+            switch Self.codexTurnStartFailureDisposition(error) {
+            case .provenNotSubmitted:
+                evidence.noteNoHandoff(message: error.localizedDescription)
+                message = "Codex queued follow-up failed to start: \(error.localizedDescription)"
+            case .deliveryUnknown:
+                evidence.noteDeliveryUnknown()
+                message = evidence.isDurable
+                    ? "Codex queued follow-up may have reached Codex, but delivery could not be confirmed; it was not resent. \(error.localizedDescription)"
+                    : "Codex queued follow-up failed to start: \(error.localizedDescription)"
+            }
             await failCodexFallbackDispatch(
                 session: session,
                 entry: head,
-                message: "Codex queued follow-up failed to start: \(error.localizedDescription)"
+                message: message,
+                evidence: evidence
             )
         }
+    }
+
+    /// Logs and surfaces an acceptance whose durable evidence could not be written: the record
+    /// stays `dispatching`, which recovery treats as uncertain. Never reported as a failure.
+    private func surfaceCodexAcceptedEvidenceFailuresIfNeeded(
+        _ evidence: AgentRecoveryDispatchEvidence,
+        session: AgentTabSession
+    ) {
+        guard evidence.isDurable else { return }
+        Task { @MainActor [weak self, weak session] in
+            let failures = await evidence.settled()
+            guard !failures.isEmpty, let self, let session else { return }
+            logCodex("[AgentModeVM][Recovery] Codex accepted a message but its delivery record failed: \(Self.recoveryFailureSummary(failures))")
+            session.appendItem(.error(
+                "Codex accepted this message, but its delivery record could not be saved. After a restart it is shown as uncertain and is not resent automatically.",
+                sequenceIndex: session.nextSequenceIndex
+            ))
+            viewModel?.requestUIRefresh(tabID: session.tabID, urgent: true)
+            viewModel?.scheduleSave(for: session.tabID)
+        }
+    }
+
+    /// A durable Codex send refused because the session's active run is missing or was not created
+    /// under this session's recovery binding (R07). Nothing was handed off; the input stays saved.
+    static let codexOwnershipRefusedMessage = "Codex did not send this message because its run does not belong to this session's saved conversation. The message stays saved."
+
+    /// Ends a durable send that did not reach (or did not provably reach) Codex. Attachments keep
+    /// their files and are never returned to the composer; the intent is held for explicit
+    /// recovery (after any ordered outcome evidence), never withdrawn or retried automatically.
+    private func rejectDurableCodexSendBeforeHandoff(
+        session: AgentTabSession,
+        identity: AgentQueuedInputIdentity?,
+        evidence: AgentRecoveryDispatchEvidence?,
+        message: String,
+        attachmentReservationID: UUID?,
+        terminalize: Bool,
+        turnStatus: CodexNativeSessionController.TurnStatus = .failed
+    ) async {
+        releaseDurableCodexFallbackAttachments(attachmentReservationID, session: session)
+        if let identity {
+            holdDurableCodexFallbackInput(identity, session: session, after: evidence)
+        }
+        if terminalize {
+            await finalizeCodexRun(
+                session,
+                turnStatus: turnStatus,
+                reason: "durable-send-not-delivered",
+                errorMessage: message,
+                notifyOnCompleted: false
+            )
+        } else {
+            session.appendItem(AgentChatItem.error(message, sequenceIndex: session.nextSequenceIndex))
+            setRunningStatus(nil, source: nil, session: session)
+            viewModel?.requestUIRefresh(tabID: session.tabID, urgent: true)
+            viewModel?.scheduleSave(for: session.tabID)
+        }
+    }
+
+    private func resolveCodexMCPAttemptDeliveryUnknown(
+        _ context: AgentTabSession.CodexFallbackSubmissionContext?,
+        message: String,
+        session: AgentTabSession
+    ) {
+        guard case let .mcp(attemptID) = context?.origin else { return }
+        session.codexSteerAckTracker.resolve(attemptID: attemptID, state: .deliveryUnknown(message: message))
     }
 
     private func failCodexFallbackDispatch(
         session: AgentTabSession,
         entry: AgentTabSession.CodexFallbackQueueEntry,
-        message: String
+        message: String,
+        evidence: AgentRecoveryDispatchEvidence? = nil
     ) async {
         if session.codexFallbackQueue.first?.id == entry.id {
             session.codexFallbackQueue.removeFirst()
@@ -2559,11 +3029,17 @@ package final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObser
         }
         session.mcpFollowUpRunPending = false
         session.codexPendingTurnKind = nil
-        viewModel?.finalizeAttachmentsForTurn(
-            for: session,
-            reservationID: entry.attachmentReservationID,
-            disposition: .restoreToPending
-        )
+        if entry.identity.isDurable {
+            // Durable input is never restored as a retryable draft; it stays held for recovery.
+            releaseDurableCodexFallbackAttachments(entry.attachmentReservationID, session: session)
+            holdDurableCodexFallbackInput(entry.identity, session: session, after: evidence)
+        } else {
+            viewModel?.finalizeAttachmentsForTurn(
+                for: session,
+                reservationID: entry.attachmentReservationID,
+                disposition: .restoreToPending
+            )
+        }
         session.appendItem(.error(message, sequenceIndex: session.nextSequenceIndex))
         if session.activeRunOwnership != nil {
             await finalizeCodexRun(
@@ -2607,6 +3083,13 @@ package final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObser
         for entry in queued {
             if case let .mcp(attemptID) = entry.origin {
                 session.codexSteerAckTracker.markStale(attemptID: attemptID, reason: reason)
+            }
+            if entry.identity.isDurable {
+                // Lifecycle teardown preserves durable input: its deterministic bubble and payload
+                // stay, nothing returns to the composer as a draft, and the intent is held as a
+                // stale target for explicit recovery (never withdrawn here).
+                holdDurableCodexFallbackInput(entry.identity, session: session)
+                continue
             }
             if let optimisticUserItemID = entry.optimisticUserItemID,
                let index = session.items.firstIndex(where: { $0.id == optimisticUserItemID })
@@ -4783,6 +5266,20 @@ package final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObser
         terminalizeRejectedSend: Bool = true
     ) async -> NativeSendOutcome {
         logCodex("[AgentModeVM] sendCodexNativeMessage called for tab \(session.tabID)")
+        // Mandatory recovery admission: every Codex send carries a durable identity (store-issued
+        // queue receipt). Fail closed before any run, controller, or composer state changes.
+        let sendIsDurable = fallbackContext?.identity.isDurable == true
+        guard let sendIdentity = fallbackContext?.identity
+            ?? AgentQueuedInputIdentity.untracked(userItemID: nil, in: session),
+            sendIsDurable || session.recoveryAdmissionMode == .inactive
+        else {
+            viewModel?.finalizeAttachmentsForTurn(
+                for: session,
+                reservationID: attachmentReservationID,
+                disposition: .restoreToPending
+            )
+            return .stale(reason: "Codex did not send because this message has no durable recovery admission.")
+        }
         // Startup can outlive Stop; these identify the send's own run attempt afterwards, including
         // after a later attempt has begun and already ended.
         let sendRunOwnership = session.activeRunOwnership
@@ -4837,7 +5334,9 @@ package final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObser
         cancelCodexIdleShutdown(for: session.tabID)
 
         let selection = effectiveCodexSelection(for: session)
-        session.codexPendingAuthRetryTurn = .init(
+        // Managed-auth replay is an automatic resend after an unproven `turn/start` outcome, so it
+        // stays legacy-only: durable input is never retried automatically (explicit recovery only).
+        session.codexPendingAuthRetryTurn = sendIsDurable ? nil : .init(
             text: text,
             images: attachments,
             model: selection.model,
@@ -4951,23 +5450,105 @@ package final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObser
             return .failed(message: message)
         }
 
-        let dispatchPlan = codexTurnDispatchPlan(
+        var dispatchPlan = codexTurnDispatchPlan(
             wasRunAlreadyActive: wasRunAlreadyActive,
             session: session
         )
         let sendThreadID = session.codexConversationID
         if case let .fallback(decision) = dispatchPlan {
             clearCodexPendingAuthRetryTurn(session)
-            return enqueueCodexFallback(
+            return await enqueueCodexFallback(
                 session: session,
                 context: fallbackContext,
-                text: text,
-                images: attachments,
                 selection: selection,
                 attachmentReservationID: attachmentReservationID,
                 reason: decision,
-                controller: controller
+                controller: controller,
+                terminalizeRefusal: terminalizeRejectedSend && !wasRunAlreadyActive
             )
+        }
+
+        // Before handoff: durable input commits `dispatching` (untracked input writes nothing).
+        let dispatchEvidence: AgentRecoveryDispatchEvidence
+        switch await beginCodexDispatch(session: session, constituents: [sendIdentity]) {
+        case let .success(evidence):
+            dispatchEvidence = evidence
+        case let .failure(failure):
+            logCodex("[AgentModeVM][Recovery] sendCodexNativeMessage: dispatch evidence refused: \(failure)")
+            clearCodexPendingAuthRetryTurn(session)
+            // Nothing was written: the intent keeps whatever state its owner gave it, so no hold is
+            // added here. Zero handoffs, no acknowledgement, and never a retryable `.failed`: the
+            // durable intent is the only copy, so nothing is restored as a draft or retried.
+            if Self.codexDispatchBeginFailureMayAlreadyBeDelivered(failure) {
+                // The same intent is already dispatching (another send in flight), accepted, or
+                // uncertain: it may reach Codex through that delivery, so this one is not resent.
+                let message = "Codex did not send this message again because it is already being delivered or may have been delivered; it was not resent."
+                if terminalizeRejectedSend, session.runID == sendRunID {
+                    await rejectDurableCodexSendBeforeHandoff(
+                        session: session,
+                        identity: nil,
+                        evidence: nil,
+                        message: message,
+                        attachmentReservationID: attachmentReservationID,
+                        terminalize: true
+                    )
+                }
+                // The MCP attempt is left to the delivery that owns the intent (or its timeout); a
+                // duplicate never preempts that delivery's acceptance.
+                return .deliveryUnknown(message: message)
+            }
+            guard session.runID == sendRunID else {
+                return .stale(reason: "Codex did not send because the active run changed before its delivery record was saved.")
+            }
+            // Missing or incompatible run ownership (R07): refused before any write. The saved input
+            // is held visibly (stale target) rather than sent unlinked under a token it does not own.
+            let ownershipRefused = failure == .refused(.bindingMismatch)
+            let message = ownershipRefused
+                ? Self.codexOwnershipRefusedMessage
+                : "Codex did not send because its delivery record could not be saved. The message stays saved for recovery."
+            await rejectDurableCodexSendBeforeHandoff(
+                session: session,
+                identity: ownershipRefused ? sendIdentity : nil,
+                evidence: nil,
+                message: message,
+                attachmentReservationID: attachmentReservationID,
+                terminalize: terminalizeRejectedSend
+            )
+            return .stale(reason: message)
+        }
+        if dispatchEvidence.isDurable {
+            // Revalidate the exact run and controller after the await, then re-plan: the turn may
+            // have started, completed, or become non-steerable meanwhile.
+            guard session.runID == sendRunID,
+                  session.runState.isActive,
+                  let currentController = session.codexController,
+                  Self.sameCodexControllerInstance(currentController, controller),
+                  currentController.hasActiveThread,
+                  session.codexConversationID == sendThreadID,
+                  // Final synchronous ownership check (R06): no suspension before the handoff.
+                  dispatchEvidence.isValidForHandoff(in: session)
+            else {
+                dispatchEvidence.noteNoHandoff(message: "Codex run or controller changed before dispatch.")
+                holdDurableCodexFallbackInput(sendIdentity, session: session, after: dispatchEvidence)
+                return .stale(reason: "Codex did not send because the active run changed before dispatch; the message is held for recovery.")
+            }
+            dispatchPlan = codexTurnDispatchPlan(
+                wasRunAlreadyActive: wasRunAlreadyActive,
+                session: session
+            )
+            if case let .fallback(decision) = dispatchPlan {
+                dispatchEvidence.noteNoHandoff(message: "Codex queued this message before dispatch.")
+                return await enqueueCodexFallback(
+                    session: session,
+                    context: fallbackContext,
+                    selection: selection,
+                    attachmentReservationID: attachmentReservationID,
+                    reason: decision,
+                    controller: controller,
+                    dispatchEvidence: dispatchEvidence,
+                    terminalizeRefusal: terminalizeRejectedSend && !wasRunAlreadyActive
+                )
+            }
         }
 
         // Only `turn/start` dispatches register accounting work; `turn/steer` joins the already
@@ -4987,6 +5568,8 @@ package final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObser
                     reasoningEffort: selection.reasoningEffort,
                     serviceTier: selection.serviceTier
                 )
+                // Affirmative provider acceptance, captured before any reconciliation.
+                dispatchEvidence.noteAccepted()
                 session.acceptCodexUsageDispatch(usageDispatchTicket)
             case let .steer(identity):
                 logCodex("[AgentModeVM] sendCodexNativeMessage: calling controller.steerUserTurn expectedTurnID=\(identity.turnID)")
@@ -4996,6 +5579,8 @@ package final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObser
                         images: attachments,
                         expectedTurnID: identity.turnID
                     )
+                    // Affirmative provider acceptance, captured before reconciliation.
+                    dispatchEvidence.noteAccepted()
                     if receipt.acceptedTurnID != identity.turnID {
                         await reconcileAcceptedCodexSteerMismatch(
                             from: identity,
@@ -5022,37 +5607,21 @@ package final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObser
                         acceptedDispatchTurnID: actualTurnID
                     )
                     session.codexPendingSteerLifecycleReconciliation = reconciliation
+                    let retryReceipt: CodexTurnSteerReceipt
                     do {
-                        let receipt = try await controller.steerUserTurn(
+                        retryReceipt = try await controller.steerUserTurn(
                             text: text,
                             images: attachments,
                             expectedTurnID: actualTurnID
                         )
-                        guard receipt.acceptedTurnID == actualTurnID else {
-                            throw CodexTurnSteerError.expectedTurnMismatch(
-                                expectedTurnID: expectedTurnID,
-                                actualTurnID: actualTurnID,
-                                failure: failure
-                            )
-                        }
-                        guard await controller.prepareLifecycleAuthorityReconciliationAfterAcceptedMismatch(
-                            expectedCurrentTurnID: identity.turnID,
-                            acceptedDispatchTurnID: actualTurnID
-                        ) else {
-                            throw CodexTurnSteerError.expectedTurnMismatch(
-                                expectedTurnID: expectedTurnID,
-                                actualTurnID: actualTurnID,
-                                failure: failure
-                            )
-                        }
-                        if session.codexPendingSteerLifecycleReconciliation == reconciliation,
-                           session.codexAuthoritativeActiveTurn != identity
-                        {
-                            session.codexPendingSteerLifecycleReconciliation = nil
-                        }
                     } catch {
                         if session.codexPendingSteerLifecycleReconciliation == reconciliation {
                             session.codexPendingSteerLifecycleReconciliation = nil
+                        }
+                        // A typed steer rejection is verified non-acceptance; any other retry
+                        // failure leaves durable delivery unproven and must not become a fallback.
+                        if sendIsDurable, !(error is CodexTurnSteerError) {
+                            throw error
                         }
                         throw CodexTurnSteerError.expectedTurnMismatch(
                             expectedTurnID: expectedTurnID,
@@ -5060,10 +5629,40 @@ package final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObser
                             failure: failure
                         )
                     }
+                    // The retry was accepted: capture it before any reconciliation. From here on
+                    // nothing may queue a fallback (that would deliver the input twice).
+                    dispatchEvidence.noteAccepted()
+                    if retryReceipt.acceptedTurnID == actualTurnID {
+                        let prepared = await controller.prepareLifecycleAuthorityReconciliationAfterAcceptedMismatch(
+                            expectedCurrentTurnID: identity.turnID,
+                            acceptedDispatchTurnID: actualTurnID
+                        )
+                        if !prepared {
+                            logCodex(
+                                "[AgentModeVM] sendCodexNativeMessage: retried steer accepted turn=\(actualTurnID) but controller lifecycle authority is unavailable; relying on session-level reconciliation without resend"
+                            )
+                        }
+                        if session.codexPendingSteerLifecycleReconciliation == reconciliation,
+                           session.codexAuthoritativeActiveTurn != identity
+                        {
+                            session.codexPendingSteerLifecycleReconciliation = nil
+                        }
+                    } else {
+                        if session.codexPendingSteerLifecycleReconciliation == reconciliation {
+                            session.codexPendingSteerLifecycleReconciliation = nil
+                        }
+                        await reconcileAcceptedCodexSteerMismatch(
+                            from: identity,
+                            acceptedTurnID: retryReceipt.acceptedTurnID,
+                            controller: controller,
+                            session: session
+                        )
+                    }
                 }
             case .fallback:
                 preconditionFailure("Fallback dispatch plans return before provider dispatch")
             }
+            surfaceCodexAcceptedEvidenceFailuresIfNeeded(dispatchEvidence, session: session)
             guard session.runID == sendRunID,
                   session.runState.isActive,
                   let activeController = session.codexController,
@@ -5071,7 +5670,11 @@ package final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObser
             else {
                 if case let .mcp(attemptID) = fallbackContext?.origin {
                     if sendThreadID == session.codexConversationID {
-                        removeQueuedCodexFallbackForDeliveredAttempt(attemptID, session: session)
+                        removeQueuedCodexFallbackForDeliveredAttempt(
+                            attemptID,
+                            deliveredIntentID: sendIdentity.intentID,
+                            session: session
+                        )
                     } else {
                         logCodex("[AgentModeVM] sendCodexNativeMessage: keeping queued fallback after stale-controller acceptance because the accepted Codex thread is no longer the persisted session thread")
                     }
@@ -5100,7 +5703,11 @@ package final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObser
                 attachmentReservationID: attachmentReservationID
             )
             if case let .mcp(attemptID) = fallbackContext?.origin {
-                removeQueuedCodexFallbackForDeliveredAttempt(attemptID, session: session)
+                removeQueuedCodexFallbackForDeliveredAttempt(
+                    attemptID,
+                    deliveredIntentID: sendIdentity.intentID,
+                    session: session
+                )
                 let state: CodexSteerAckTracker.TerminalState = switch dispatchPlan {
                 case .start:
                     .startAccepted
@@ -5117,12 +5724,20 @@ package final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObser
             }
             return .sent
         } catch let steerError as CodexTurnSteerError {
+            // Accepted input never becomes a fallback, whatever reconciliation reports afterwards.
+            if dispatchEvidence.observation == .accepted {
+                logCodex("[AgentModeVM] sendCodexNativeMessage: ignoring post-acceptance steer error without fallback - \(steerError)")
+                return .sent
+            }
             session.withdrawCodexUsageDispatch(usageDispatchTicket)
             session.codexPendingTurnKind = nil
+            // A typed steer rejection is the provider's verified non-acceptance.
+            dispatchEvidence.noteRejected(message: String(describing: steerError))
             guard session.runID == sendRunID,
                   let activeController = session.codexController,
                   Self.sameCodexControllerInstance(activeController, controller)
             else {
+                holdDurableCodexFallbackInput(sendIdentity, session: session, after: dispatchEvidence)
                 return .stale(reason: "Codex ignored a late steer rejection because the active run/controller changed.")
             }
             let decision: CodexTurnFallbackDecision = switch steerError {
@@ -5138,15 +5753,15 @@ package final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObser
                 .activeTurnNotSteerable(turnKind: turnKind, failure: failure)
             }
             clearCodexPendingAuthRetryTurn(session)
-            return enqueueCodexFallback(
+            return await enqueueCodexFallback(
                 session: session,
                 context: fallbackContext,
-                text: text,
-                images: attachments,
                 selection: selection,
                 attachmentReservationID: attachmentReservationID,
                 reason: decision,
-                controller: controller
+                controller: controller,
+                dispatchEvidence: dispatchEvidence,
+                terminalizeRefusal: terminalizeRejectedSend && !wasRunAlreadyActive
             )
         } catch {
             // Only a proven local preflight failure can clear an unaccepted exact ticket.
@@ -5158,12 +5773,59 @@ package final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObser
                 session: session
             )
             session.codexPendingTurnKind = nil
+            // Record exactly what the failure proves before any cleanup. Acceptance is never
+            // downgraded; only a local preflight failure proves the handoff never began.
+            let handoffProvenNotBegun = Self.codexTurnStartFailureDisposition(error) == .provenNotSubmitted
+            if dispatchEvidence.observation == .accepted {
+                // Accepted, then a later step threw: never a fallback or a retryable failure.
+                logCodex("[AgentModeVM] sendCodexNativeMessage: post-acceptance error without resend - \(error.localizedDescription)")
+                return .sent
+            }
+            if handoffProvenNotBegun {
+                dispatchEvidence.noteNoHandoff(message: error.localizedDescription)
+            } else {
+                dispatchEvidence.noteDeliveryUnknown()
+            }
+            let durableOutcomeUnknown = dispatchEvidence.isDurable
+                && dispatchEvidence.observation != .notHandedOff
             guard session.runID == sendRunID,
                   let activeController = session.codexController,
                   Self.sameCodexControllerInstance(activeController, controller)
             else {
                 logCodex("[AgentModeVM] sendCodexNativeMessage: ignoring late send error for stale controller - \(error.localizedDescription)")
+                if dispatchEvidence.isDurable {
+                    holdDurableCodexFallbackInput(sendIdentity, session: session, after: dispatchEvidence)
+                }
+                if durableOutcomeUnknown {
+                    let message = "Codex may have received this message before the active run changed; it was not resent."
+                    resolveCodexMCPAttemptDeliveryUnknown(fallbackContext, message: message, session: session)
+                    return .deliveryUnknown(message: message)
+                }
                 return .stale(reason: "Codex ignored a late send failure because the active run/controller changed.")
+            }
+            if dispatchEvidence.isDurable {
+                clearCodexPendingAuthRetryTurn(session)
+                let message = durableOutcomeUnknown
+                    ? "Codex may have received this message, but delivery could not be confirmed; it was not resent. \(error.localizedDescription)"
+                    : "Codex native send failed before reaching Codex: \(error.localizedDescription)"
+                if !(error is CancellationError) {
+                    markCodexReconnectNeeded(for: session, source: "send-error")
+                }
+                clearCodexAuthRecoveryAttempt(for: session.runID)
+                await rejectDurableCodexSendBeforeHandoff(
+                    session: session,
+                    identity: sendIdentity,
+                    evidence: dispatchEvidence,
+                    message: message,
+                    attachmentReservationID: attachmentReservationID,
+                    terminalize: terminalizeRejectedSend,
+                    turnStatus: error is CancellationError ? .interrupted : .failed
+                )
+                guard durableOutcomeUnknown else {
+                    return error is CancellationError ? .cancelled : .failed(message: message)
+                }
+                resolveCodexMCPAttemptDeliveryUnknown(fallbackContext, message: message, session: session)
+                return .deliveryUnknown(message: message)
             }
             if error is CancellationError {
                 clearCodexPendingAuthRetryTurn(session)

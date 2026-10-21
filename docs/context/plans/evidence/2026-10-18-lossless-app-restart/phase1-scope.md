@@ -35,6 +35,21 @@ Proposed Phase 1b packages, each requiring its own validation and review:
 
 These are implementation packages, not claims that durable sends are complete before the coupled routes are integrated.
 
+## Foundation refinements (implementation assumptions)
+
+OracleA's continued planning consultation (`restart-phase-1-scope-an-DABF9B`, verified inherited preset) was exported to `prompt-exports/oracle-plan-2026-10-20-230525-restart-phase-1-scop-cc4a.md`. Main adopts the following reversible implementation assumptions, not owner Decisions:
+
+- Session UUIDs are globally unique. A permanent tombstone retires that UUID across workspaces; recreating a conversation uses a new UUID. No tombstone garbage collector is added.
+- Lifecycle contains incarnation, reset generation and latest reset receipt. Reset transcript and identity commit together. Absent legacy identity migrates under the existing gate before editable authority escapes; null, unknown or malformed identity remains unreadable and non-writable.
+- Initial preparation commits the normal initial session under the same gate; exactly one creator wins. No extra reservation table or creation-operation protocol is added.
+- Generic existing-session saves require loaded lifecycle authority. Stale or missing authority cannot silently acquire the current generation. Ordinary saves cannot reconstruct a missing old session.
+- Missing-file scheduled reconstruction is allowed only with current-process authoritative identity/reset evidence; after restart, absent authority fails closed rather than resurrecting an old snapshot.
+- Tombstone commit is logical deletion. Subsequent unlink failure is cleanup residue, not a return to an active session. Unknown tombstone data is preserved and blocks access.
+
+The foundation package is necessary storage ownership only; it does not yet provide durable input acknowledgements, composer recovery, or safe shutdown.
+
+The next package is [inactive recovery transactions and a composer controller](phase1b-recovery.md), including integration with the existing lifecycle gate. Production composer persistence is not activated separately: input capture, durable acknowledgements, all queues/drains, schedule receipt transfer/startup barrier and held-input UI must cut over together. This avoids a temporary draft-only implementation that could erase the sole durable input copy on an unprotected send clear.
+
 ## Shared-writer gate audit
 
 The Phase 0 concern about a load/migration write bypassing the same-session gate was resolved by source inspection:

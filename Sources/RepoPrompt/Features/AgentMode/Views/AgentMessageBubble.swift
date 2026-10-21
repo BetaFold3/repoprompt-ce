@@ -364,6 +364,12 @@ struct AgentMessageBubble: View {
                                     .buttonStyle(.plain)
                             }
                         }
+                    } else if let recoveryDelivery = item.recoveryDelivery {
+                        // Recovery evidence only: no resend action (that is the remote flag's).
+                        Text(Self.recoveryDeliveryLabel(recoveryDelivery))
+                            .font(fontPreset.swiftUIFont(sizeAtNormal: 11, weight: .semibold))
+                            .foregroundStyle(recoveryDelivery == .notSent ? Color.red : Color.orange)
+                            .hoverTooltip(Self.recoveryDeliveryHelp(recoveryDelivery))
                     }
                     if item.codexGoalMode != nil || item.workflow != nil {
                         HStack(spacing: 6) {
@@ -386,7 +392,7 @@ struct AgentMessageBubble: View {
                 .padding(12)
                 .background(BubbleColors.lightBlue)
                 .cornerRadius(20)
-                .opacity(item.isUndeliveredRemoteSend ? 0.65 : 1)
+                .opacity(item.isUndeliveredRemoteSend || item.recoveryDelivery != nil ? 0.65 : 1)
 
                 if let scheduledSend = item.scheduledSend {
                     scheduledSendMarker(scheduledSend)
@@ -397,12 +403,38 @@ struct AgentMessageBubble: View {
         }
     }
 
+    /// R1a label of a user bubble whose earlier-launch intent has no acceptance evidence.
+    static func recoveryDeliveryLabel(_ delivery: AgentUserItemRecoveryDelivery) -> String {
+        switch delivery {
+        case .notSent: "Not sent"
+        case .unconfirmed: "Delivery unconfirmed"
+        }
+    }
+
+    static func recoveryDeliveryHelp(_ delivery: AgentUserItemRecoveryDelivery) -> String {
+        switch delivery {
+        case .notSent:
+            "RepoPrompt stopped before this message reached the agent."
+        case .unconfirmed:
+            "RepoPrompt stopped before the agent confirmed this message. Sending it again might duplicate it."
+        }
+    }
+
+    /// Receipt-kind-aware schedule marker: only provider acceptance says "Sent". A saved-in-queue
+    /// receipt saved the input for sending; a legacy receipt proves neither.
+    static func scheduledSendMarkerText(_ provenance: AgentScheduledSendProvenance) -> String {
+        let sentAt = AgentScheduledSendDateFormatting.dateAndTime(provenance.sentAt)
+        let outcome = switch provenance.kind {
+        case .providerAccepted: "Sent \(sentAt)"
+        case .savedInQueue: "Saved for sending \(sentAt)"
+        case .legacyUnknown: "Dispatched \(sentAt)"
+        }
+        return "Scheduled for \(AgentScheduledSendDateFormatting.dateAndTime(provenance.scheduledFor)) · \(outcome)"
+    }
+
     private func scheduledSendMarker(_ provenance: AgentScheduledSendProvenance) -> some View {
         Label {
-            Text(
-                "Scheduled for \(AgentScheduledSendDateFormatting.dateAndTime(provenance.scheduledFor)) · "
-                    + "Sent \(AgentScheduledSendDateFormatting.dateAndTime(provenance.sentAt))"
-            )
+            Text(Self.scheduledSendMarkerText(provenance))
         } icon: {
             Image(systemName: "clock")
         }

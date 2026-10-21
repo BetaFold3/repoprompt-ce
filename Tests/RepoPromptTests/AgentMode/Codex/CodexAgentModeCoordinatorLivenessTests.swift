@@ -1672,20 +1672,18 @@ final class CodexAgentModeCoordinatorLivenessTests: XCTestCase {
         XCTAssertEqual(session.codexPendingTurnKind, .user)
     }
 
-    func testActiveCodexNativeSendWithoutExactIdentityQueuesWithoutStarting() async {
+    func testActiveCodexNativeSendWithoutExactIdentityQueuesWithoutStarting() async throws {
+        let fixture = try await RecoveryLaneFixture.make("codex-liveness-missing-identity")
+        defer { fixture.tearDown() }
         let controller = LivenessFakeCodexController(snapshot: .active(activeFlags: []))
         let viewModel = makeViewModel(controller: controller)
-        guard let session = preparedCodexSession(in: viewModel, controller: controller) else {
+        guard let session = preparedCodexSession(in: viewModel, controller: controller, recoveryLane: fixture.lane) else {
             return XCTFail("Expected the Codex test session to materialize")
         }
         session.codexAuthoritativeActiveTurn = nil
         session.codexRoutingObservedTurnID = "routing-only-turn"
 
-        let outcome = await viewModel.test_codexCoordinator.sendCodexNativeMessage(
-            session: session,
-            text: "hello",
-            attachments: []
-        )
+        let outcome = try await sendDurably("hello", viewModel: viewModel, session: session, fixture: fixture)
 
         guard case .queuedFallback(_, .activeWithoutAuthoritativeIdentity) = outcome else {
             return XCTFail("Expected missing-identity fallback queue, got \(outcome)")
@@ -1695,7 +1693,9 @@ final class CodexAgentModeCoordinatorLivenessTests: XCTestCase {
         XCTAssertEqual(session.codexFallbackQueue.count, 1)
     }
 
-    func testTypedSteerRejectionReturnsFallbackWithoutReplacingAuthoritativeIdentity() async {
+    func testTypedSteerRejectionReturnsFallbackWithoutReplacingAuthoritativeIdentity() async throws {
+        let fixture = try await RecoveryLaneFixture.make("codex-liveness-typed-rejection")
+        defer { fixture.tearDown() }
         let failure = CodexAppServerClient.RequestFailure(
             method: "turn/steer",
             code: -32602,
@@ -1707,16 +1707,12 @@ final class CodexAgentModeCoordinatorLivenessTests: XCTestCase {
             steerError: CodexTurnSteerError.noActiveTurn(failure)
         )
         let viewModel = makeViewModel(controller: controller)
-        guard let session = preparedCodexSession(in: viewModel, controller: controller) else {
+        guard let session = preparedCodexSession(in: viewModel, controller: controller, recoveryLane: fixture.lane) else {
             return XCTFail("Expected the Codex test session to materialize")
         }
         let identity = session.codexAuthoritativeActiveTurn
 
-        let outcome = await viewModel.test_codexCoordinator.sendCodexNativeMessage(
-            session: session,
-            text: "hello",
-            attachments: []
-        )
+        let outcome = try await sendDurably("hello", viewModel: viewModel, session: session, fixture: fixture)
 
         guard case .queuedFallback(_, .noActiveTurn(failure: failure)) = outcome else {
             return XCTFail("Expected no-active fallback queue, got \(outcome)")
@@ -1737,22 +1733,43 @@ final class CodexAgentModeCoordinatorLivenessTests: XCTestCase {
             snapshot: .active(activeFlags: []),
             steerError: CodexTurnSteerError.noActiveTurn(failure)
         )
+        // Mandatory durable admission through a real temporary lane: the VM commits the composer
+        // input before the optimistic bubble, so the typed fallback queues under its receipt.
+        let recovery = try await RecoveryLaneFixture.make("ManualTypedFallbackKeepsBubble")
+        defer { recovery.tearDown() }
         let viewModel = makeViewModel(controller: controller)
-        guard let session = preparedCodexSession(in: viewModel, controller: controller) else {
+        guard let session = preparedCodexSession(in: viewModel, controller: controller, recoveryLane: recovery.lane) else {
             return XCTFail("Expected the Codex test session to materialize")
         }
+        session.recoveryLane = recovery.lane
+        session.recoveryAdmissionMode = .mandatory
         viewModel.storeDraftText(for: session.tabID, "restore me")
 
-        let result = viewModel.submitUserTurn(text: "restore me", tabID: session.tabID)
+        let result = await viewModel.submitUserTurnAdmittingRecoveryInput(
+            text: "restore me",
+            tabID: session.tabID,
+            origin: .composer
+        )
 
         XCTAssertEqual(result, .submitted)
-        try await waitUntil {
+        // The durable path performs real store writes (admission, dispatch, queue receipt), so the
+        // budget allows parallel-runner load; the awaited condition is unchanged.
+        try await waitUntil(timeout: 10) {
             controller.steerUserTurnIDsSync() == ["turn"]
                 && session.codexFallbackQueue.count == 1
         }
         XCTAssertEqual(session.items.filter { $0.kind == .user }.map(\.text), ["restore me"])
         XCTAssertEqual(viewModel.retrieveDraftText(for: session.tabID), "restore me")
         XCTAssertEqual(session.codexAuthoritativeActiveTurn?.turnID, "turn")
+        // One identity end to end: committed intent == bubble item == queue entry.
+        let bubble = try XCTUnwrap(session.items.last { $0.kind == .user })
+        let entry = try XCTUnwrap(session.codexFallbackQueue.first)
+        let record = await recovery.store.read(sessionID: recovery.sessionID).record
+        let intent = try XCTUnwrap(record?.intent(id: entry.id))
+        XCTAssertEqual(intent.userItemID, bubble.id)
+        XCTAssertEqual(intent.origin, .composer)
+        XCTAssertEqual(intent.payload.text, "restore me")
+        XCTAssertEqual(intent.deliveryState, .queued)
     }
 
     func testAcceptedSteerRemainsSentWhenMatchingTurnCompletesBeforeReceiptResumes() async throws {
@@ -1887,6 +1904,39 @@ final class CodexAgentModeCoordinatorLivenessTests: XCTestCase {
         .usageObservation(.init(threadID: "fake", turnID: turn, turnAttribution: .notified, ordinal: ordinal, last: counters, total: counters, modelContextWindow: 258_400))
     }
 
+    /// Sends `text` as real durable input: a `queued` intent admitted through `fixture`'s lane
+    /// (installed on `session`), its intent ID reused as the fallback queue ID.
+    private func sendDurably(
+        _ text: String,
+        viewModel: AgentModeViewModel,
+        session: AgentTabSession,
+        fixture: RecoveryLaneFixture
+    ) async throws -> CodexAgentModeCoordinator.NativeSendOutcome {
+        session.recoveryLane = fixture.lane
+        let identity = try await fixture.queuedIdentity(text)
+        let intentID = try XCTUnwrap(identity.intentID)
+        let context = AgentTabSession.CodexFallbackSubmissionContext(
+            queueID: intentID,
+            providerText: text,
+            images: [],
+            taggedFileAttachments: [],
+            draftText: text,
+            identity: identity,
+            origin: .manual,
+            dispatchTicket: nil
+        )
+        let outcome = await viewModel.test_codexCoordinator.sendCodexNativeMessage(
+            session: session,
+            text: text,
+            attachments: [],
+            fallbackContext: context
+        )
+        if let receipt = outcome.durableQueueReceipt {
+            XCTAssertEqual(receipt.intent.intentID, identity.intentID, "The queue ack is this intent's store receipt")
+        }
+        return outcome
+    }
+
     private func makeViewModel(
         controller: LivenessFakeCodexController,
         drain: AgentCodexAgentRunWaitDrain? = nil
@@ -1902,14 +1952,23 @@ final class CodexAgentModeCoordinatorLivenessTests: XCTestCase {
         return viewModel
     }
 
+    /// A running Codex session with an active run attempt. Durable-input tests pass `recoveryLane`:
+    /// the tab is then bound to that lane's persistent session before the run attempt begins, as
+    /// production does (`startAgentRun` binds before the runner creates ownership), so the attempt's
+    /// ownership is compatible with the lane (R07).
     private func preparedCodexSession(
         in viewModel: AgentModeViewModel,
         controller: LivenessFakeCodexController,
-        runID: UUID = UUID()
+        runID: UUID = UUID(),
+        recoveryLane: AgentRecoverySessionLane? = nil
     ) -> AgentTabSession? {
         guard let session = viewModel.session(for: UUID(), createIfNeeded: true) else {
             XCTFail("Expected the Codex test session to materialize")
             return nil
+        }
+        if let recoveryLane {
+            _ = viewModel.test_installPersistentSessionBinding(sessionID: recoveryLane.sessionID, on: session)
+            session.recoveryLane = recoveryLane
         }
         session.selectedAgent = .codexExec
         session.runID = runID

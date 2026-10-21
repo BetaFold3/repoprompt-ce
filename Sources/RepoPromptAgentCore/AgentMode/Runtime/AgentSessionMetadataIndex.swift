@@ -157,6 +157,10 @@ package struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
     var toolCallCount: Int
     package var scheduledSendSummary: AgentSessionScheduledSendSummary?
     package var lastScheduledDispatch: AgentScheduledSendProvenance?
+    /// Whether the saved transcript holds an unresolved interruption (recovery discovery hint).
+    /// `nil` when unknown (a stub-built or older record). Deliberately not part of
+    /// `lacksTranscriptDerivedFields`, which classifies history enrichment.
+    package var hasUnresolvedInterruption: Bool?
 
     var hasUnreadableScheduledSend: Bool {
         scheduledSendSummary?.isUnreadable == true
@@ -244,7 +248,8 @@ package struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
         interActiveIntervalGapSeconds: [Int] = [],
         toolCallCount: Int = 0,
         scheduledSendSummary: AgentSessionScheduledSendSummary? = nil,
-        lastScheduledDispatch: AgentScheduledSendProvenance? = nil
+        lastScheduledDispatch: AgentScheduledSendProvenance? = nil,
+        hasUnresolvedInterruption: Bool? = nil
     ) {
         self.id = id
         self.filename = filename
@@ -282,6 +287,7 @@ package struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
         self.toolCallCount = toolCallCount
         self.scheduledSendSummary = scheduledSendSummary
         self.lastScheduledDispatch = lastScheduledDispatch
+        self.hasUnresolvedInterruption = hasUnresolvedInterruption
     }
 
     enum CodingKeys: String, CodingKey {
@@ -321,6 +327,7 @@ package struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
         case toolCallCount
         case scheduledSendSummary
         case lastScheduledDispatch
+        case hasUnresolvedInterruption
     }
 
     package init(from decoder: Decoder) throws {
@@ -381,6 +388,7 @@ package struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
         toolCallCount = try container.decodeIfPresent(Int.self, forKey: .toolCallCount) ?? 0
         scheduledSendSummary = try container.decodeIfPresent(AgentSessionScheduledSendSummary.self, forKey: .scheduledSendSummary)
         lastScheduledDispatch = try container.decodeIfPresent(AgentScheduledSendProvenance.self, forKey: .lastScheduledDispatch)
+        hasUnresolvedInterruption = try container.decodeIfPresent(Bool.self, forKey: .hasUnresolvedInterruption)
     }
 
     func sidebarEntry(tabID overrideTabID: UUID? = nil, displayName: String? = nil) -> AgentSessionIndexEntry? {
@@ -469,6 +477,7 @@ package struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
             && toolCallCount == other.toolCallCount
             && scheduledSendSummary == other.scheduledSendSummary
             && lastScheduledDispatch == other.lastScheduledDispatch
+            && hasUnresolvedInterruption == other.hasUnresolvedInterruption
     }
 
     static func record(
@@ -520,7 +529,10 @@ package struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
             interActiveIntervalGapSeconds: durationPrimitives.gapSeconds,
             toolCallCount: computedToolCallCount,
             scheduledSendSummary: AgentSessionScheduledSendSummary.make(from: session.scheduledSend),
-            lastScheduledDispatch: session.lastScheduledDispatch
+            lastScheduledDispatch: session.lastScheduledDispatch,
+            hasUnresolvedInterruption: session.transcript.map { transcript in
+                transcript.turns.contains { $0.interruption.map { $0.resolution == nil } ?? false }
+            }
         )
     }
 

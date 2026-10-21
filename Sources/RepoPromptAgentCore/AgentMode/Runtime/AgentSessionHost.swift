@@ -102,10 +102,18 @@ package protocol ClaudeAgentModeCoordinatorHost: AgentSessionHost {
         ifStillOwned: @escaping @MainActor () -> Bool,
         beforeCommit: (@MainActor () async -> Void)?
     ) async -> Bool
-    func prependPendingHandoffIfNeeded(
+    /// Prepends the pending-handoff payload when it is neither staged nor held, reporting the
+    /// exact stage this call created.
+    func stagePendingHandoffIfNeeded(
         _ text: String,
         session: AgentTabSession
-    ) -> String
+    ) -> AgentStagedProviderText
+    /// Durable form: stages the payload and returns its exact snapshot (payload ID saved first),
+    /// for `AgentProviderHandoff.notePendingHandoff` before the dispatch commit.
+    func stagePendingHandoffForDurableDispatch(
+        _ text: String,
+        session: AgentTabSession
+    ) async -> AgentPendingHandoffDispatchStaging
     @discardableResult
     func updatePermissionBindingState(from session: AgentTabSession, syncUI: Bool) -> Bool
 }

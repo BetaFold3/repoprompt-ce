@@ -372,6 +372,80 @@ struct AgentStaleResetRecoveryActions {
     let retryStopping: (_ tabID: UUID, _ recoveryID: UUID) async -> String?
 }
 
+/// Lossless-restart recovery list (Phase 1b), backed by the recovery coordinator's authoritative
+/// startup results overlaid with records committed since, plus this launch's held input (held or
+/// unsaved drafts, input no longer queued, composer save failures). Opening a row never starts a
+/// provider.
+struct AgentRecoveryListProps: Equatable {
+    enum Status: Equatable {
+        case loading
+        case ready
+        /// Startup (or composition) failed: every send route stays closed until Retry succeeds.
+        case failed(String)
+    }
+
+    let status: Status
+    let rows: [AgentRecoveryListRowProps]
+    let canRetry: Bool
+
+    var isEmpty: Bool {
+        status == .ready && rows.isEmpty
+    }
+}
+
+struct AgentRecoveryListRowProps: Equatable, Identifiable {
+    enum Action: Equatable {
+        /// Move the held input into this session's (empty) composer, then withdraw it.
+        case edit
+        /// Withdraw the held input (the row stays until the withdrawal commits).
+        case remove
+        /// Open the session's tab; actions apply only to the open session.
+        case open
+        /// Confirm that the previous run is no longer running (the exact published crash hold).
+        case confirmStopped
+        /// Hide an informational row for this launch (nothing is written or erased).
+        case hide
+        /// Place the displayed held or unsaved draft into this session's empty message box.
+        case restoreDraft
+        /// Discard exactly the displayed held or unsaved draft (after `confirmation`); current
+        /// typing is kept and saved.
+        case discardDraft
+        /// Write the message box again after a failed save.
+        case retrySave
+        /// R10: stop owning a held scheduled transfer (after `confirmation`). The message stays
+        /// visible with its uncertain delivery; it is never marked "not delivered" or resent.
+        case cancelSchedule
+    }
+
+    let id: String
+    let sessionID: UUID?
+    let sessionName: String
+    let title: String
+    let detail: String
+    /// The original input (View), when the row is held input.
+    let text: String?
+    let attachmentNames: [String]
+    let actions: [Action]
+    let isWorking: Bool
+    /// Persistent inline error of the last failed action (Retry by repeating it).
+    let error: String?
+    /// Explicit confirmation shown before a destructive `discardDraft`.
+    var confirmation: String?
+}
+
+/// Per-row action state kept by the view model (not persisted).
+enum AgentRecoveryListRowActionState: Equatable {
+    case working
+    case failed(String)
+    /// Committed (or hidden for this launch): the row is no longer listed.
+    case resolved
+}
+
+struct AgentRecoveryListActions {
+    let perform: (_ rowID: String, _ action: AgentRecoveryListRowProps.Action) async -> Void
+    let retryStartup: () -> Void
+}
+
 struct AgentComposerProps: Equatable {
     let currentTabID: UUID?
     let submitTarget: AgentComposerSubmitTarget?
@@ -413,6 +487,8 @@ struct AgentComposerProps: Equatable {
     let fileTagLookupContextIdentity: AgentWorkspaceLookupContextIdentity
     /// Pending child questions addressed to this tab's agent (delegated ask_user plan §6.5).
     var delegatedQuestions: [AgentDelegatedQuestionBannerRow] = []
+    /// Lossless-restart recovery list for this workspace (open and closed sessions).
+    var recoveryList: AgentRecoveryListProps?
 
     static let empty = AgentComposerProps(
         currentTabID: nil,

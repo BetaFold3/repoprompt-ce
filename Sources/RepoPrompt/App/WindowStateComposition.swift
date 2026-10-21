@@ -165,6 +165,10 @@ enum WindowStateCompositionFactory {
             oracleViewModel: oracleViewModel,
             applyEditsApprovalStore: applyEditsApprovalStore
         )
+        // Lossless-restart recovery is installed (mandatory) before this view model hydrates any
+        // session or observes a first draft; every window shares one store, DataService, and
+        // coordinator.
+        AgentRecoveryAppComposition.shared.install(into: agentModeViewModel)
         workspaceFilesViewModel.setSessionWorktreeBindingsProvider { [weak agentModeViewModel] sessionID in
             agentModeViewModel?.worktreeBindings(forAgentSessionID: sessionID) ?? []
         }

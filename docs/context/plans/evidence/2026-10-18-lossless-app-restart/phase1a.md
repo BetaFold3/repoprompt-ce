@@ -2,7 +2,11 @@
 
 Scope: read when the task touches lossless-restart Phase 1a: the transcript save maximum wait, its mutation observation, ownership and hydration fences, failed-save retries, buffered assistant-text draining before saves and destructive cleanup, or their tests.
 Authority: Reference
-Last-verified: 2026-10-20
+Last-verified: 2026-10-21
+
+## Signed checkpoint
+
+On 2026-10-21 the owner selected the configured 1Password signer. A normal signed commit retry succeeded as `ebd686f7d4bf198c512e61d0e665deaef0ed2c0f` (`Preserve streaming transcripts with bounded save deadlines`). Main verified the index exactly matched the previously reviewed tree `207a0bdd3eb75b5b194c86f01c8a678e6654b374`, checked the staged diff for whitespace errors, and confirmed the resulting commit contains a signature. No signing configuration was changed, no unsigned bypass used, and nothing pushed. The earlier failed attempts below are historical. Complete quit/window-close preservation remains the next package, not a completed Phase 1a guarantee.
 
 Evidence for step 1a of [the lossless app restart spec](../../2026-10-18-lossless-app-restart-spec.md) under the transcript-only scope assumed in [the Phase 1 scope note](phase1-scope.md). This is fixture and code evidence only; no visible app launch or live acceptance was performed. Sections below retain the investigation chronology; later dispositions supersede earlier open findings. Plan status is maintained by the main agent; Decisions contain owner answers only.
 
@@ -542,3 +546,7 @@ The final reviews are [Oracle A r2](phase1a-oraclea-r2.md) and [Oracle B r2](pha
 Both final preset identities were verified and both lanes closed without P0/P1 findings. The main agent checked conductor job `0afef997-af50-4d33-9ec3-fee9f6e17d9e`: source-validating test, completed, exit 0. After staging only this step's files, `make guardrails`, `Scripts/check-agent-context`, and `Scripts/test-check-agent-context` passed (23 checker tests; existing route-count warning). `git diff --cached --check` passed after removing whitespace-only defects in two review exports. The staged source, tests, plan-status change and evidence were inspected. Unrelated checkout changes remain unstaged. No push, live lifecycle operation, full-suite run or release validation was performed.
 
 The first local commit attempt failed at configured 1Password SSH signing (`failed to fill whole buffer`, `failed to write commit object`); no commit was created. Main asked the owner to approve signing, authorize unsigned local commits, or leave commits pending. The staged Phase 1a snapshot is preserved; later Phase 1b edits remain unstaged.
+
+A second signed commit attempt on 2026-10-21 used the same 17-file staged snapshot (2379 insertions, 10 deletions; cached whitespace check passed). The configured `op-ssh-sign` helper ran, then again failed with `failed to fill whole buffer` and `failed to write commit object` (Git exit 128). No commit was created; HEAD remained `be41cf0b`. Main asked again for signing readiness or explicit command-local unsigned authorization. Signing was not disabled and the later integration work was not staged. The follow-up question timed out after 300 seconds without an owner answer; unsigned commits remain unauthorized.
+
+A later third retry during cutover remediation first verified that the staged tree was still exactly `207a0bdd3eb75b5b194c86f01c8a678e6654b374` and that cached whitespace checks passed. The normal signed commit again exited 128 with the same 1Password error. HEAD remains `be41cf0b`, the staged tree is unchanged, and no signing configuration was bypassed. This remains a commit-only blocker; independent implementation continues.

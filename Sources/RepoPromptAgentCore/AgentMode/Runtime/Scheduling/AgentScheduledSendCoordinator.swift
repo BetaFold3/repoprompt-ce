@@ -154,6 +154,9 @@ package struct AgentScheduledSendBusyState: Equatable {
     var hasPendingInstructions: Bool
     var cancellationIsSettling: Bool
     var hasStartOrDispatchReservation: Bool
+    /// Lossless-restart recovery for this session is unresolved (an unconfirmed crash hold, an
+    /// unresolved schedule receipt transfer, or missing mandatory recovery dependencies).
+    var hasUnresolvedRecovery: Bool
 
     package init(
         runID: UUID? = nil,
@@ -164,7 +167,8 @@ package struct AgentScheduledSendBusyState: Equatable {
         hasPendingPermissionsRequest: Bool = false,
         hasPendingInstructions: Bool = false,
         cancellationIsSettling: Bool = false,
-        hasStartOrDispatchReservation: Bool = false
+        hasStartOrDispatchReservation: Bool = false,
+        hasUnresolvedRecovery: Bool = false
     ) {
         self.runID = runID
         self.runState = runState
@@ -175,6 +179,7 @@ package struct AgentScheduledSendBusyState: Equatable {
         self.hasPendingInstructions = hasPendingInstructions
         self.cancellationIsSettling = cancellationIsSettling
         self.hasStartOrDispatchReservation = hasStartOrDispatchReservation
+        self.hasUnresolvedRecovery = hasUnresolvedRecovery
     }
 
     package var isBusy: Bool {
@@ -186,6 +191,50 @@ package struct AgentScheduledSendBusyState: Equatable {
             || hasPendingInstructions
             || cancellationIsSettling
             || hasStartOrDispatchReservation
+            || hasUnresolvedRecovery
+    }
+}
+
+/// Startup admission of the scheduler (lossless-restart barrier). Production composition closes
+/// it at construction, before any host registers, and opens it only after recovery startup
+/// reconciliation is ready. While closed, nothing evaluates candidates, starts hydration, writes
+/// confirmations, arms timers, or dispatches.
+package enum AgentScheduledSendStartupAdmission: Equatable {
+    case open
+    case awaitingRecovery
+    case recoveryFailed(String)
+}
+
+/// Why a `.dispatching` schedule attempt is held instead of becoming a delivery-unknown
+/// confirmation: its R9 receipt transfer to a durable recovery intent is not yet resolved.
+package enum AgentScheduledSendTransferHoldReason: Equatable {
+    /// Repair has not run yet (startup barrier, recovery lane, or hydration pending).
+    case awaitingRecovery
+    /// This process handed the linked intent to a provider route whose affirmative evidence
+    /// arrives after dispatch returns (non-Codex acceptance, or a direct send whose evidence is
+    /// still being written). The intent is `dispatching`; repair re-runs when the run settles and
+    /// transfers only on `providerAccepted` or a settled `queued` state.
+    case awaitingProviderEvidence
+    /// Conflicting or unknown evidence, or a failed transfer write; never confirmed automatically.
+    case unresolved(String)
+}
+
+package struct AgentScheduledSendTransferHold: Equatable {
+    package let sessionID: UUID
+    package let scheduleID: UUID
+    package let scheduleAttemptID: UUID
+    package let reason: AgentScheduledSendTransferHoldReason
+
+    package init(
+        sessionID: UUID,
+        scheduleID: UUID,
+        scheduleAttemptID: UUID,
+        reason: AgentScheduledSendTransferHoldReason
+    ) {
+        self.sessionID = sessionID
+        self.scheduleID = scheduleID
+        self.scheduleAttemptID = scheduleAttemptID
+        self.reason = reason
     }
 }
 
@@ -203,6 +252,9 @@ package struct AgentScheduledSendAdmissionLease: Equatable {
     /// (`isNewSessionStart && !runAlongsideOtherSessions`) requires other sessions in the
     /// workspace to be idle. Follow-ups wait only on their own destination session.
     let requiresWorkspaceGate: Bool
+    /// New-session starts wait for unresolved recovery anywhere in the workspace, even when they
+    /// run alongside other sessions.
+    let blocksOnUnresolvedRecovery: Bool
 
     fileprivate init(
         id: UUID,
@@ -214,7 +266,8 @@ package struct AgentScheduledSendAdmissionLease: Equatable {
         effectiveDueAt: Date,
         allowsNeedsConfirmation: Bool,
         runAlongsideOtherSessions: Bool,
-        requiresWorkspaceGate: Bool
+        requiresWorkspaceGate: Bool,
+        blocksOnUnresolvedRecovery: Bool
     ) {
         self.id = id
         self.sessionID = sessionID
@@ -226,6 +279,7 @@ package struct AgentScheduledSendAdmissionLease: Equatable {
         self.allowsNeedsConfirmation = allowsNeedsConfirmation
         self.runAlongsideOtherSessions = runAlongsideOtherSessions
         self.requiresWorkspaceGate = requiresWorkspaceGate
+        self.blocksOnUnresolvedRecovery = blocksOnUnresolvedRecovery
     }
 }
 
@@ -245,6 +299,10 @@ package enum ScheduledDispatchOutcome: Equatable {
     case deferredBusy
     case failedBeforeHandoff
     case unknownAfterHandoff
+    /// Mandatory recovery: the host placed a transfer hold on this exact attempt (uncertain or
+    /// unprovable delivery evidence). The pending schedule, its payload, and any user bubble stay as
+    /// they are until explicit resolution; never a pre-handoff failure, confirmation, or re-drive.
+    case heldForRecovery
 }
 
 @MainActor
@@ -263,6 +321,7 @@ package protocol AgentScheduledSendCoordinatorHost: AnyObject {
     func scheduledSendProjectionNeedsRefresh(tabID: UUID, sessionID: UUID)
     func scheduledSendSessionName(tabID: UUID) -> String?
     func scheduledSendBusySessionName(inWorkspace workspaceID: UUID, excluding sessionID: UUID) -> String?
+    func hasUnresolvedRecoverySession(inWorkspace workspaceID: UUID, excluding sessionID: UUID) -> Bool
     func ownsScheduledSendDestination(tabID: UUID, sessionID: UUID) -> Bool
     /// Whether any tab on this host bound to the durable `sessionID` is busy. The owning host's
     /// dispatching tab is evaluated without its own dispatch reservation; foreign hosts pass `nil`.
@@ -297,6 +356,14 @@ extension AgentScheduledSendCoordinatorHost {
 
     func scheduledSendBusySessionName(inWorkspace workspaceID: UUID, excluding sessionID: UUID) -> String? {
         nil
+    }
+
+    /// Whether any session in the workspace (other than `sessionID`) has unresolved lossless-restart
+    /// recovery. Blocks new-session starts even when they run alongside other sessions.
+    /// Hosts answer for their open sessions and, through the shared recovery coordinator's startup
+    /// results, for restricted or crash-held sessions no window has opened.
+    package func hasUnresolvedRecoverySession(inWorkspace _: UUID, excluding _: UUID) -> Bool {
+        false
     }
 }
 
@@ -363,6 +430,10 @@ package extension Notification.Name {
     /// Coalesced when the coordinator's dashboard-visible projection actually changes.
     static let agentScheduledSendDashboardDidChange =
         Notification.Name("AgentScheduledSendCoordinator.dashboardDidChange")
+    /// The scheduler's startup admission changed (`object` is the coordinator). Hosts resume
+    /// deferred hydration normalization and receipt-transfer repair once it reports `open`.
+    static let agentScheduledSendStartupAdmissionDidChange =
+        Notification.Name("AgentScheduledSendCoordinator.startupAdmissionDidChange")
 }
 
 @MainActor
@@ -539,11 +610,25 @@ package final class AgentScheduledSendCoordinator {
     private var dashboardNotificationScheduled = false
     private var lastPublishedDashboardSignature: [String] = []
 
+    /// Lossless-restart startup barrier. `.open` by default (inactive cutover); production
+    /// composition passes `.awaitingRecovery` so it is closed before any host registers.
+    package private(set) var startupAdmission: AgentScheduledSendStartupAdmission
+    private var startupAdmissionWaiters: [CheckedContinuation<Bool, Never>] = []
+    /// Unresolved R9 receipt transfers keyed by schedule id. A held schedule is never turned into
+    /// a delivery-unknown confirmation, admitted, or dispatched.
+    private var transferHoldsByScheduleID: [UUID: AgentScheduledSendTransferHold] = [:]
+    /// When true (mandatory recovery), a `.dispatching` record nobody owns is resolved by its
+    /// hydrated host (receipt-transfer repair) instead of becoming a confirmation obligation from
+    /// an unhydrated projection.
+    package var dispatchingRecordsRequireTransferResolution = false
+
     package init(
         clock: SchedulerClock? = nil,
         discontinuityThreshold: TimeInterval = 30,
-        recoveryRetryDelays: [TimeInterval] = AgentScheduledSendRecoveryPolicy.defaultRetryDelays
+        recoveryRetryDelays: [TimeInterval] = AgentScheduledSendRecoveryPolicy.defaultRetryDelays,
+        startupAdmission: AgentScheduledSendStartupAdmission = .open
     ) {
+        self.startupAdmission = startupAdmission
         let resolvedClock = clock ?? .system()
         self.clock = resolvedClock
         launchAt = resolvedClock.now()
@@ -568,6 +653,107 @@ package final class AgentScheduledSendCoordinator {
         if let deletionObserver {
             NotificationCenter.default.removeObserver(deletionObserver)
         }
+    }
+
+    // MARK: Startup admission (lossless-restart barrier)
+
+    package var isStartupAdmissionOpen: Bool {
+        startupAdmission == .open
+    }
+
+    /// Closes startup admission synchronously. Composition must call this (or construct with
+    /// `.awaitingRecovery`) before the first `register`; returns `false` when a host is already
+    /// registered so the caller can treat the ordering violation as a wiring failure. Closing never
+    /// revokes an admission or retained attempt that already exists.
+    @discardableResult
+    package func closeStartupAdmission() -> Bool {
+        pruneRegistrations()
+        let wasUnregistered = registrations.isEmpty
+        guard startupAdmission != .awaitingRecovery else { return wasUnregistered }
+        startupAdmission = .awaitingRecovery
+        armTimer(for: nil)
+        postStartupAdmissionChange()
+        return wasUnregistered
+    }
+
+    /// Recovery startup reconciliation is ready: release evaluation, hydration normalization, and
+    /// receipt-transfer repair.
+    package func openStartupAdmission() {
+        guard startupAdmission != .open else { return }
+        startupAdmission = .open
+        resumeStartupAdmissionWaiters(open: true)
+        postStartupAdmissionChange()
+        evaluate()
+    }
+
+    /// Recovery startup failed: admission stays closed with a persistent reason. Retry closes
+    /// (`closeStartupAdmission`) and opens again after a successful reconciliation.
+    package func failStartupAdmission(_ message: String) {
+        startupAdmission = .recoveryFailed(message)
+        armTimer(for: nil)
+        resumeStartupAdmissionWaiters(open: false)
+        postStartupAdmissionChange()
+    }
+
+    /// Suspends until admission is open (`true`) or startup failed (`false`).
+    package func awaitStartupAdmission() async -> Bool {
+        switch startupAdmission {
+        case .open:
+            true
+        case .recoveryFailed:
+            false
+        case .awaitingRecovery:
+            await withCheckedContinuation { continuation in
+                startupAdmissionWaiters.append(continuation)
+            }
+        }
+    }
+
+    private func resumeStartupAdmissionWaiters(open: Bool) {
+        let waiters = startupAdmissionWaiters
+        startupAdmissionWaiters = []
+        for waiter in waiters {
+            waiter.resume(returning: open)
+        }
+    }
+
+    private func postStartupAdmissionChange() {
+        NotificationCenter.default.post(name: .agentScheduledSendStartupAdmissionDidChange, object: self)
+    }
+
+    // MARK: Receipt-transfer holds (R9)
+
+    /// Installs or updates the hold for one schedule attempt. A pending delivery-unknown
+    /// confirmation for the same schedule is withdrawn: the transfer repair owns the decision, so
+    /// no duplicate confirmation is offered for input a recovery intent may already own.
+    package func holdTransfer(_ hold: AgentScheduledSendTransferHold) {
+        let previous = transferHoldsByScheduleID[hold.scheduleID]
+        transferHoldsByScheduleID[hold.scheduleID] = hold
+        if let pending = pendingConfirmationsByScheduleID[hold.scheduleID],
+           pending.reason == .deliveryUnknown,
+           pending.inFlightRequestID == nil
+        {
+            pendingConfirmationsByScheduleID.removeValue(forKey: hold.scheduleID)
+            postPendingConfirmationChange(pending)
+        }
+        if previous != hold {
+            evaluate()
+        }
+    }
+
+    /// Releases exactly this attempt's hold (repair completed, or no linked intent exists).
+    package func releaseTransferHold(scheduleID: UUID, scheduleAttemptID: UUID) {
+        guard transferHoldsByScheduleID[scheduleID]?.scheduleAttemptID == scheduleAttemptID else { return }
+        transferHoldsByScheduleID.removeValue(forKey: scheduleID)
+        evaluate()
+    }
+
+    package func transferHold(scheduleID: UUID) -> AgentScheduledSendTransferHold? {
+        transferHoldsByScheduleID[scheduleID]
+    }
+
+    package func transferHold(sessionID: UUID) -> AgentScheduledSendTransferHold? {
+        transferHoldsByScheduleID.values.first { $0.sessionID == sessionID }
     }
 
     @discardableResult
@@ -737,6 +923,8 @@ package final class AgentScheduledSendCoordinator {
         runAlongsideOtherSessions: Bool? = nil,
         committedRevision: Date? = nil
     ) {
+        // No pre-barrier consent, and never for an attempt whose receipt transfer is unresolved.
+        guard isStartupAdmissionOpen, transferHoldsByScheduleID[scheduleID] == nil else { return }
         guard pendingConfirmationsByScheduleID[scheduleID] == nil else { return }
         let currentRecords = collectCandidates()
             .map(\.candidate.scheduledSend)
@@ -1045,7 +1233,9 @@ package final class AgentScheduledSendCoordinator {
 
     func isValid(_ validator: AgentScheduledSendFinalHandoffValidator) -> Bool {
         let lease = validator.lease
-        guard isValid(lease),
+        guard isStartupAdmissionOpen,
+              transferHoldsByScheduleID[lease.scheduleID] == nil,
+              isValid(lease),
               let admission = admissionsBySessionID[lease.sessionID],
               admission.registrationID == validator.registrationID,
               admission.tabID == validator.tabID,
@@ -1077,6 +1267,19 @@ package final class AgentScheduledSendCoordinator {
             )
         }
         guard !destinationBusyElsewhere else { return false }
+
+        // Unresolved recovery anywhere in the workspace blocks every new-session start, including
+        // one that runs alongside other sessions.
+        if lease.blocksOnUnresolvedRecovery,
+           registrations.contains(where: { registration in
+               registration.host?.hasUnresolvedRecoverySession(
+                   inWorkspace: lease.workspaceID,
+                   excluding: lease.sessionID
+               ) == true
+           })
+        {
+            return false
+        }
 
         // Other sessions in the workspace block only a workspace-gated new-session start.
         guard lease.requiresWorkspaceGate else { return true }
@@ -1144,6 +1347,13 @@ package final class AgentScheduledSendCoordinator {
     }
 
     func evaluate() {
+        // Startup barrier: no candidate evaluation, hydration, confirmation write, timer, or
+        // dispatch until recovery reconciliation released admission.
+        guard isStartupAdmissionOpen else {
+            armTimer(for: nil)
+            requestDashboardNotification()
+            return
+        }
         guard !isEvaluating else {
             needsRerun = true
             return
@@ -1253,6 +1463,12 @@ package final class AgentScheduledSendCoordinator {
             let dispatchOwner = matchingEntries.first(where: { $0.candidate.isHydrated })
                 ?? owned
 
+            // An unresolved R9 receipt transfer: the recovery intent may already own this input.
+            // Neither a confirmation obligation nor a dispatch may be created for it.
+            if transferHoldsByScheduleID[record.id] != nil {
+                continue
+            }
+
             // A pending confirmation obligation blocks admission regardless of the projected
             // state, hydration, timers, or epoch refreshes, until its exact durable
             // acknowledgement (or user supersession). It is driven ahead of any logic that could
@@ -1280,6 +1496,16 @@ package final class AgentScheduledSendCoordinator {
 
             if record.state == .dispatching {
                 guard !retiredRevisions.contains(revision) else { continue }
+                if dispatchingRecordsRequireTransferResolution {
+                    // Mandatory recovery: only the hydrated host may decide (repair the linked
+                    // transfer, hold conflicting evidence, or normalize when nothing is linked).
+                    if !dispatchOwner.candidate.isHydrated,
+                       !hydrationFailures.contains(candidate.sessionID)
+                    {
+                        startHydrationIfNeeded(for: dispatchOwner)
+                    }
+                    continue
+                }
                 // A `.dispatching` record nobody in this process owns: delivery is unknown. The
                 // revision is retired once the confirmation is durable.
                 requireConfirmation(matchingEntries, reason: .deliveryUnknown)
@@ -1422,6 +1648,18 @@ package final class AgentScheduledSendCoordinator {
             let runAlongside = confirmedOverride?.runAlongsideOtherSessions
                 ?? record.runAlongsideOtherSessions
             let requiresWorkspaceGate = record.isNewSessionStart && !runAlongside
+            if record.isNewSessionStart,
+               registrations.contains(where: { registration in
+                   registration.host?.hasUnresolvedRecoverySession(
+                       inWorkspace: candidate.workspaceID,
+                       excluding: candidate.sessionID
+                   ) == true
+               })
+            {
+                setFirstEligibleAtIfNeeded(dispatchOwner: dispatchOwner, at: now, earliestFutureDeadline: &earliestFutureDeadline)
+                armedRecords[record.id] = armed
+                continue
+            }
             if requiresWorkspaceGate {
                 let workspaceID = candidate.workspaceID
                 let hasCoordinatorReservation = admissionsBySessionID.values.contains {
@@ -1456,7 +1694,8 @@ package final class AgentScheduledSendCoordinator {
                 effectiveDueAt: effectiveNotBefore,
                 allowsNeedsConfirmation: isUserConfirmed,
                 runAlongsideOtherSessions: runAlongside,
-                requiresWorkspaceGate: requiresWorkspaceGate
+                requiresWorkspaceGate: requiresWorkspaceGate,
+                blocksOnUnresolvedRecovery: record.isNewSessionStart
             )
             admissionsBySessionID[candidate.sessionID] = Admission(
                 lease: lease,
@@ -1765,7 +2004,9 @@ package final class AgentScheduledSendCoordinator {
                 // The host completed durable finalization itself (legacy direct path).
                 settleRetainedAttempt(sessionID: lease.sessionID, key: retained.key, workerID: nil, disposition: .committed)
             }
-        case .failedBeforeHandoff:
+        case .failedBeforeHandoff, .heldForRecovery:
+            // `.heldForRecovery`: the admitted revision never re-drives; the transfer hold (not a
+            // retained attempt) owns presentation, so no `needsAttention` record is created.
             retiredRevisions.insert(revision)
             removeConfirmedOverride(matching: lease)
             if let retained = retainedAttemptsBySessionID[lease.sessionID],
@@ -1930,6 +2171,8 @@ package final class AgentScheduledSendCoordinator {
                 return .destinationUnavailable
             case .snapshotUndecodable:
                 return .invalidAcceptanceEvidence("reconstruction snapshot undecodable")
+            case .lifecycleAuthorityUnavailable:
+                return .destinationUnavailable
             }
         }
         if let mutationError = error as? AgentScheduledSendMutationError {
@@ -1953,8 +2196,9 @@ package final class AgentScheduledSendCoordinator {
     private func handleExplicitDeletionCommit(fileKey: URL, generation: UInt64) {
         let matches = retainedAttemptsBySessionID.filter { _, retained in
             guard let context = retained.context else { return false }
-            return context.fileURL.standardizedFileURL == fileKey.standardizedFileURL
-                && context.deletionGeneration < generation
+            // Both sides are the DataService's canonical key; a raw spelling (`/var` vs
+            // `/private/var`) would silently miss the deletion and strand the retained attempt.
+            return context.fileKey == fileKey && context.deletionGeneration < generation
         }
         for (sessionID, retained) in matches {
             // A worker mid-attempt learns the same fact from the gated finalizer; a dormant or

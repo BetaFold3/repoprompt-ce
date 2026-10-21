@@ -2805,16 +2805,24 @@ package enum AgentTranscriptIO {
         terminalState: AgentSessionRunState?
     ) -> AgentTranscript {
         var interruptedTurnsByID: [UUID: AgentTranscriptTurn] = [:]
+        // R5 interruption evidence is turn-level and never rebuilt from items: carried by turn ID.
+        var interruptionsByTurnID: [UUID: AgentTranscriptTurnInterruption] = [:]
         for turn in existingWorkingTranscript.turns {
+            if let interruption = turn.interruption {
+                interruptionsByTurnID[turn.id] = interruption
+            }
             guard turn.terminalState == .cancelled || turn.terminalState == .failed,
                   !turn.responseSpans.contains(where: { $0.lifecycle == .open })
             else { continue }
             interruptedTurnsByID[turn.id] = turn
         }
-        guard !interruptedTurnsByID.isEmpty else {
+        guard !interruptedTurnsByID.isEmpty || !interruptionsByTurnID.isEmpty else {
             return rebuiltWorkingTranscript
         }
         var preserved = rebuiltWorkingTranscript
+        for index in preserved.turns.indices where preserved.turns[index].interruption == nil {
+            preserved.turns[index].interruption = interruptionsByTurnID[preserved.turns[index].id]
+        }
         let finalIndex = preserved.turns.indices.last
         for index in preserved.turns.indices {
             let rebuiltTurn = preserved.turns[index]

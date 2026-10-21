@@ -161,6 +161,10 @@ public struct AgentChatItem: Codable, Identifiable, Sendable, Equatable {
     /// True when an optimistic remote user turn failed before delivery was acknowledged.
     public var isUndeliveredRemoteSend: Bool
 
+    /// R1a delivery presentation from an earlier launch's recovery evidence (never the remote-resend
+    /// flag above, and never an action). `nil` when nothing contradicts the bubble's normal look.
+    public var recoveryDelivery: AgentUserItemRecoveryDelivery?
+
     public init(
         id: UUID = UUID(),
         timestamp: Date = Date(),
@@ -180,7 +184,8 @@ public struct AgentChatItem: Codable, Identifiable, Sendable, Equatable {
         codexGoalMode: AgentCodexGoalModeMetadata? = nil,
         scheduledSend: AgentScheduledSendProvenance? = nil,
         isLocalControlPlaneEcho: Bool = false,
-        isUndeliveredRemoteSend: Bool = false
+        isUndeliveredRemoteSend: Bool = false,
+        recoveryDelivery: AgentUserItemRecoveryDelivery? = nil
     ) {
         self.id = id
         self.timestamp = timestamp
@@ -201,6 +206,7 @@ public struct AgentChatItem: Codable, Identifiable, Sendable, Equatable {
         self.scheduledSend = scheduledSend
         self.isLocalControlPlaneEcho = isLocalControlPlaneEcho
         self.isUndeliveredRemoteSend = isUndeliveredRemoteSend
+        self.recoveryDelivery = recoveryDelivery
     }
 
     /// Returns a copy of this item with a replaced timestamp and all other fields
@@ -227,7 +233,8 @@ public struct AgentChatItem: Codable, Identifiable, Sendable, Equatable {
             codexGoalMode: codexGoalMode,
             scheduledSend: scheduledSend,
             isLocalControlPlaneEcho: isLocalControlPlaneEcho,
-            isUndeliveredRemoteSend: isUndeliveredRemoteSend
+            isUndeliveredRemoteSend: isUndeliveredRemoteSend,
+            recoveryDelivery: recoveryDelivery
         )
     }
 
@@ -242,7 +249,7 @@ public struct AgentChatItem: Codable, Identifiable, Sendable, Equatable {
         case id, timestamp, kind, text, attachments, taggedFileAttachments
         case toolName, toolInvocationID, toolArgsJSON, toolResultJSON, toolIsError
         case reasoning, sequenceIndex, isStreaming, workflow, codexGoalMode, scheduledSend
-        case isLocalControlPlaneEcho, isUndeliveredRemoteSend
+        case isLocalControlPlaneEcho, isUndeliveredRemoteSend, recoveryDelivery
     }
 
     public init(from decoder: Decoder) throws {
@@ -266,6 +273,7 @@ public struct AgentChatItem: Codable, Identifiable, Sendable, Equatable {
         scheduledSend = try c.decodeIfPresent(AgentScheduledSendProvenance.self, forKey: .scheduledSend)
         isLocalControlPlaneEcho = try c.decodeIfPresent(Bool.self, forKey: .isLocalControlPlaneEcho) ?? false
         isUndeliveredRemoteSend = try c.decodeIfPresent(Bool.self, forKey: .isUndeliveredRemoteSend) ?? false
+        recoveryDelivery = try? c.decodeIfPresent(AgentUserItemRecoveryDelivery.self, forKey: .recoveryDelivery)
     }
 
     // MARK: - Factory Methods
@@ -345,9 +353,20 @@ extension AgentChatItem {
             codexGoalMode: codexGoalMode,
             scheduledSend: scheduledSend,
             isLocalControlPlaneEcho: isLocalControlPlaneEcho,
-            isUndeliveredRemoteSend: isUndeliveredRemoteSend
+            isUndeliveredRemoteSend: isUndeliveredRemoteSend,
+            recoveryDelivery: recoveryDelivery
         )
     }
+}
+
+/// R1a presentation of a user bubble whose earlier-launch recovery intent has no affirmative
+/// provider acceptance. Presentation only: delivery evidence stays in the recovery record.
+public enum AgentUserItemRecoveryDelivery: String, Codable, Sendable, Equatable {
+    /// Verified not delivered: no handoff began, or every attempt conclusively failed before or at
+    /// the provider boundary.
+    case notSent
+    /// A handoff began and its outcome is unknown; sending again might duplicate it.
+    case unconfirmed
 }
 
 // MARK: - Persistence Model
@@ -373,6 +392,7 @@ public struct AgentChatItemPersist: Codable, Identifiable, Sendable, Equatable {
     public var scheduledSend: AgentScheduledSendProvenance?
     public var isLocalControlPlaneEcho: Bool
     public var isUndeliveredRemoteSend: Bool
+    public var recoveryDelivery: AgentUserItemRecoveryDelivery?
 
     public init(from item: AgentChatItem, sanitizeToolResults: Bool = true) {
         id = item.id
@@ -390,6 +410,7 @@ public struct AgentChatItemPersist: Codable, Identifiable, Sendable, Equatable {
         scheduledSend = item.scheduledSend
         isLocalControlPlaneEcho = item.isLocalControlPlaneEcho
         isUndeliveredRemoteSend = item.isUndeliveredRemoteSend
+        recoveryDelivery = item.recoveryDelivery
         toolResultStatus = nil
 
         if sanitizeToolResults, item.kind == .toolResult {
@@ -464,7 +485,8 @@ public struct AgentChatItemPersist: Codable, Identifiable, Sendable, Equatable {
             codexGoalMode: codexGoalMode,
             scheduledSend: scheduledSend,
             isLocalControlPlaneEcho: isLocalControlPlaneEcho,
-            isUndeliveredRemoteSend: isUndeliveredRemoteSend
+            isUndeliveredRemoteSend: isUndeliveredRemoteSend,
+            recoveryDelivery: recoveryDelivery
         )
     }
 
@@ -513,6 +535,7 @@ public struct AgentChatItemPersist: Codable, Identifiable, Sendable, Equatable {
         case scheduledSend
         case isLocalControlPlaneEcho
         case isUndeliveredRemoteSend
+        case recoveryDelivery
     }
 
     public init(from decoder: Decoder) throws {
@@ -536,6 +559,7 @@ public struct AgentChatItemPersist: Codable, Identifiable, Sendable, Equatable {
         scheduledSend = try container.decodeIfPresent(AgentScheduledSendProvenance.self, forKey: .scheduledSend)
         isLocalControlPlaneEcho = try container.decodeIfPresent(Bool.self, forKey: .isLocalControlPlaneEcho) ?? false
         isUndeliveredRemoteSend = try container.decodeIfPresent(Bool.self, forKey: .isUndeliveredRemoteSend) ?? false
+        recoveryDelivery = try? container.decodeIfPresent(AgentUserItemRecoveryDelivery.self, forKey: .recoveryDelivery)
     }
 }
 

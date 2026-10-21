@@ -1,0 +1,205 @@
+import Foundation
+import SwiftUI
+
+/// Lossless-restart recovery list above the composer (Phase 1b): held input with View / Edit /
+/// Remove, held or unsaved drafts with Restore / Discard (confirmed), composer save failures,
+/// crash holds, interrupted turns, held schedule transfers, and unknown recovery status. Failures stay inline on their row until the action succeeds; nothing shows a
+/// permanent "Saving"/"Saved" state.
+struct AgentRecoveryListBanner: View {
+    let props: AgentRecoveryListProps
+    let actions: AgentRecoveryListActions
+
+    static let headerHeight: CGFloat = 22
+    static let rowHeight: CGFloat = 52
+    static let maxVisibleRows = 3
+
+    static func reservedHeight(for props: AgentRecoveryListProps) -> CGFloat {
+        let visibleRows = min(max(props.rows.count, 0), maxVisibleRows)
+        return headerHeight + CGFloat(visibleRows) * rowHeight + 12
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            header
+            if !props.rows.isEmpty {
+                ScrollView(.vertical) {
+                    VStack(alignment: .leading, spacing: 0) {
+                        ForEach(props.rows) { row in
+                            AgentRecoveryListRow(row: row, actions: actions)
+                                .frame(height: Self.rowHeight)
+                        }
+                    }
+                }
+                .frame(height: CGFloat(min(props.rows.count, Self.maxVisibleRows)) * Self.rowHeight)
+            }
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 6)
+        .background(
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .fill(Color.orange.opacity(0.10))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .stroke(Color.orange.opacity(0.35), lineWidth: 0.5)
+        )
+        .accessibilityIdentifier("agent.recoveryList.banner")
+    }
+
+    private var header: some View {
+        HStack(spacing: 8) {
+            Image(systemName: headerIcon)
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundStyle(.orange)
+            Text(headerText)
+                .font(.system(size: 11, weight: .medium))
+                .lineLimit(2)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .accessibilityIdentifier("agent.recoveryList.status")
+            if props.canRetry {
+                Button("Retry") { actions.retryStartup() }
+                    .accessibilityIdentifier("agent.recoveryList.retry")
+            }
+        }
+        .frame(minHeight: Self.headerHeight)
+    }
+
+    private var headerIcon: String {
+        switch props.status {
+        case .loading:
+            "clock.arrow.circlepath"
+        case .ready:
+            "exclamationmark.arrow.triangle.2.circlepath"
+        case .failed:
+            "exclamationmark.triangle"
+        }
+    }
+
+    private var headerText: String {
+        switch props.status {
+        case .loading:
+            "Checking for work interrupted when RepoPrompt last closed…"
+        case .ready:
+            props.rows.count == 1
+                ? "1 saved or interrupted item needs your attention."
+                : "\(props.rows.count) saved or interrupted items need your attention."
+        case let .failed(message):
+            message
+        }
+    }
+}
+
+private struct AgentRecoveryListRow: View {
+    let row: AgentRecoveryListRowProps
+    let actions: AgentRecoveryListActions
+
+    @State private var isViewing = false
+    @State private var pendingConfirmation: AgentRecoveryListRowProps.Action?
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 8) {
+            VStack(alignment: .leading, spacing: 1) {
+                HStack(spacing: 4) {
+                    Text(row.title)
+                        .font(.system(size: 11, weight: .semibold))
+                    Text("· \(row.sessionName)")
+                        .font(.system(size: 10))
+                        .foregroundStyle(.secondary)
+                }
+                .lineLimit(1)
+                Text(row.error ?? row.detail)
+                    .font(.system(size: 10, weight: row.error == nil ? .regular : .semibold))
+                    .foregroundStyle(row.error == nil ? Color.secondary : Color.orange)
+                    .lineLimit(2)
+                    .accessibilityIdentifier(row.error == nil ? "agent.recoveryList.detail" : "agent.recoveryList.error")
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+
+            if row.isWorking {
+                ProgressView().controlSize(.small)
+            }
+            if row.text != nil || !row.attachmentNames.isEmpty {
+                Button("View") { isViewing = true }
+                    .popover(isPresented: $isViewing, arrowEdge: .top) { viewer }
+                    .accessibilityIdentifier("agent.recoveryList.view")
+            }
+            ForEach(row.actions, id: \.self) { action in
+                Button(title(for: action), role: isDestructive(action) ? .destructive : nil) {
+                    if action == .discardDraft || action == .cancelSchedule, row.confirmation != nil {
+                        pendingConfirmation = action
+                    } else {
+                        Task { await actions.perform(row.id, action) }
+                    }
+                }
+                .accessibilityIdentifier("agent.recoveryList.\(action)")
+            }
+        }
+        .controlSize(.small)
+        .disabled(row.isWorking)
+        .padding(.vertical, 3)
+        .confirmationDialog(
+            row.confirmation ?? "",
+            isPresented: Binding(
+                get: { pendingConfirmation != nil },
+                set: { if !$0 { pendingConfirmation = nil } }
+            ),
+            titleVisibility: .visible
+        ) {
+            Button(pendingConfirmation == .cancelSchedule ? "Cancel Schedule" : "Discard", role: .destructive) {
+                guard let action = pendingConfirmation else { return }
+                pendingConfirmation = nil
+                Task { await actions.perform(row.id, action) }
+            }
+            .accessibilityIdentifier("agent.recoveryList.confirmDiscard")
+            Button(pendingConfirmation == .cancelSchedule ? "Keep" : "Cancel", role: .cancel) { pendingConfirmation = nil }
+        }
+    }
+
+    private func isDestructive(_ action: AgentRecoveryListRowProps.Action) -> Bool {
+        action == .remove || action == .discardDraft || action == .cancelSchedule
+    }
+
+    private var viewer: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text(row.title).font(.headline)
+            Text(row.detail).font(.caption).foregroundStyle(.secondary)
+            if let text = row.text, !text.isEmpty {
+                ScrollView {
+                    Text(text)
+                        .textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .frame(maxHeight: 240)
+            }
+            if !row.attachmentNames.isEmpty {
+                Text("Attachments: \(row.attachmentNames.joined(separator: ", "))")
+                    .font(.caption)
+            }
+        }
+        .padding(12)
+        .frame(width: 360)
+    }
+
+    private func title(for action: AgentRecoveryListRowProps.Action) -> String {
+        switch action {
+        case .edit:
+            "Edit"
+        case .remove:
+            "Remove"
+        case .open:
+            "Open"
+        case .confirmStopped:
+            "It stopped"
+        case .hide:
+            "Hide"
+        case .restoreDraft:
+            "Restore"
+        case .discardDraft:
+            "Discard…"
+        case .retrySave:
+            "Retry save"
+        case .cancelSchedule:
+            "Cancel pending schedule…"
+        }
+    }
+}

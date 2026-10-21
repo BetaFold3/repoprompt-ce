@@ -44,6 +44,8 @@ struct AgentComposerActions {
     let openCLIProvidersSettings: () -> Void
     /// Delegated ask_user parent banner actions (plan §6.5); nil hides the Open action.
     var delegatedQuestions: AgentDelegatedQuestionBannerActions?
+    /// Lossless-restart recovery list actions; nil hides the list.
+    var recoveryList: AgentRecoveryListActions?
 }
 
 enum CursorModelProviderChipDisplay {
@@ -331,6 +333,12 @@ struct AgentInputBar: View {
             },
             delegatedQuestions: AgentDelegatedQuestionBannerActions(
                 openChild: { row in await agentModeVM.openDelegatedQuestionChild(row) }
+            ),
+            recoveryList: AgentRecoveryListActions(
+                perform: { rowID, action in
+                    await agentModeVM.performRecoveryListAction(rowID: rowID, action: action)
+                },
+                retryStartup: { agentModeVM.retryRecoveryStartup() }
             )
         )
     }
@@ -541,6 +549,16 @@ struct AgentComposerView: View, Equatable {
         return props.delegatedQuestions
     }
 
+    private var renderedRecoveryList: AgentRecoveryListProps? {
+        guard actions.recoveryList != nil, props.currentTabID == currentTabID else { return nil }
+        return props.recoveryList
+    }
+
+    private var recoveryListBannerReservedHeight: CGFloat {
+        guard let list = renderedRecoveryList else { return 0 }
+        return AgentRecoveryListBanner.reservedHeight(for: list) + AgentAttachmentStripLayout.composerVerticalSpacingWhenPresent
+    }
+
     private var renderedStaleResetRecovery: AgentStaleResetRecoveryProps? {
         guard let recovery = props.staleResetRecovery,
               recovery.tabID == props.currentTabID,
@@ -631,6 +649,7 @@ struct AgentComposerView: View, Equatable {
             hasTaggedFiles: hasPendingTaggedFileAttachments
         ) + steeringUnsupportedInfoBoxReservedHeight + scheduledSendBannerReservedHeight
             + staleResetRecoveryBannerReservedHeight + delegatedQuestionsBannerReservedHeight
+            + recoveryListBannerReservedHeight
     }
 
     private var composerChromeVerticalPadding: CGFloat {
@@ -853,6 +872,10 @@ struct AgentComposerView: View, Equatable {
 
     private var mainContent: some View {
         VStack(alignment: .leading, spacing: AgentAttachmentStripLayout.composerVerticalSpacingWhenPresent) {
+            if let recoveryList = renderedRecoveryList, let recoveryListActions = actions.recoveryList {
+                AgentRecoveryListBanner(props: recoveryList, actions: recoveryListActions)
+            }
+
             if let staleResetRecovery = renderedStaleResetRecovery {
                 AgentStaleResetRecoveryBanner(
                     props: staleResetRecovery,

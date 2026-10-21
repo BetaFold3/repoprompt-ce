@@ -3007,6 +3007,15 @@ actor LifecycleFakeNativeController: NativeAgentRuntimeControlling {
         sentMessages
     }
 
+    /// A (possibly late) successful completion for a specific earlier turn.
+    func emitCompletedTurnCompletion(turnID: UUID) {
+        turnInFlight = false
+        if pendingTurnCompletionID == turnID {
+            pendingTurnCompletionID = nil
+        }
+        streamContinuation.yield(.turnCompleted(turnID: turnID, status: .completed))
+    }
+
     func emitCancelledTurnCompletion(turnID: UUID) {
         turnInFlight = false
         if pendingTurnCompletionID == turnID {

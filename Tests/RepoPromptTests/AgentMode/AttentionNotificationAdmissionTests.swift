@@ -25,12 +25,12 @@ final class AttentionNotificationAdmissionTests: XCTestCase {
             let fixture = makeFixture()
             var followUps: [String] = []
             var afterStart: AgentModeRunService.Hooks.FollowUpStartObservation?
-            let barrier = makeBarrier(fixture.vm, startFollowUpRun: { _, text, observe in
-                followUps.append(text)
+            let barrier = makeBarrier(fixture.vm, startFollowUpRun: { _, instruction, observe in
+                followUps.append(instruction.text)
                 afterStart = observe
             })
             let root = makeSession(fixture.vm)
-            root.session.pendingInstructions = ["second"]
+            root.session.setUntrackedPendingInstructionsForTesting(["second"])
 
             let first = beginTurn(root.session, user: "first", assistant: "Intermediate answer A")
             let firstCommit = await barrier.commit(completedRequest(root.session, first, supportsFollowUp: true))
@@ -176,7 +176,7 @@ final class AttentionNotificationAdmissionTests: XCTestCase {
             let root = makeSession(fixture.vm)
             // Codex uses the fixture's no-op stub, so even a regressed refusal launches no provider.
             root.session.selectedAgent = .codexExec
-            root.session.pendingInstructions = ["queued follow-up"]
+            root.session.setUntrackedPendingInstructionsForTesting(["queued follow-up"])
             let ownership = beginTurn(root.session, user: "first", assistant: "Answer before the refused follow-up")
             let commit = await fixture.vm.test_terminalCommitBarrier()
                 .commit(completedRequest(root.session, ownership, supportsFollowUp: true))
@@ -259,7 +259,7 @@ final class AttentionNotificationAdmissionTests: XCTestCase {
             let session = fixture.live.session
             let tabID = fixture.live.tabID
 
-            _ = fixture.vm.submitUserTurn(text: "Root turn", tabID: tabID)
+            _ = fixture.vm.submitUserTurn(text: "Root turn", tabID: tabID, codexAttemptID: nil, admitted: nil)
             try await waitUntil("\(name): root prompt held", timeout: .seconds(30)) {
                 fixture.fakeCount("prompt") >= 1 && session.runState == .running
                     && session.acpController != nil && session.activeRunAttemptID != nil
@@ -271,7 +271,7 @@ final class AttentionNotificationAdmissionTests: XCTestCase {
             _ = await ACPActiveSteeringPromptTestHook.$afterPromptReturned.withValue({ @MainActor in
                 await fixture.gate.pass()
             }) {
-                fixture.vm.submitUserTurn(text: "Steering A", tabID: tabID)
+                fixture.vm.submitUserTurn(text: "Steering A", tabID: tabID, codexAttemptID: nil, admitted: nil)
             }
             try await waitUntil("\(name): steering A held", timeout: .seconds(30)) {
                 fixture.fakeCount("cancel") >= 1 && fixture.fakeCount("prompt") >= 2
@@ -281,7 +281,7 @@ final class AttentionNotificationAdmissionTests: XCTestCase {
 
             // B is accepted behind the active flush.
             if schedule != .flushFinishedWithoutSuccessor {
-                _ = fixture.vm.submitUserTurn(text: "Steering B", tabID: tabID)
+                _ = fixture.vm.submitUserTurn(text: "Steering B", tabID: tabID, codexAttemptID: nil, admitted: nil)
                 await Task { @MainActor in }.value
                 XCTAssertEqual(session.pendingACPSteeringInstructions.count, 1, name)
                 XCTAssertNotNil(session.acpSteeringFlushTask, name)
@@ -379,7 +379,7 @@ final class AttentionNotificationAdmissionTests: XCTestCase {
         session.acpController = controller
 
         // B is accepted for live ACP steering while the run is active; A's answer lands after it.
-        _ = fixture.vm.submitUserTurn(text: "steer B", tabID: root.tabID)
+        _ = fixture.vm.submitUserTurn(text: "steer B", tabID: root.tabID, codexAttemptID: nil, admitted: nil)
         XCTAssertEqual(session.pendingACPSteeringInstructions.count, 1)
         session.appendItem(.assistant("ACP answer A", sequenceIndex: session.nextSequenceIndex))
         let reservation = UUID()
@@ -417,7 +417,7 @@ final class AttentionNotificationAdmissionTests: XCTestCase {
         let session = root.session
         // Codex uses the fixture's no-op stub, so even a regressed refusal launches no provider.
         session.selectedAgent = .codexExec
-        session.pendingInstructions = ["queued follow-up"]
+        session.setUntrackedPendingInstructionsForTesting(["queued follow-up"])
         let ownership = beginTurn(session, user: "first", assistant: "Answer during the ACP handoff")
         let observeACPStart = fixture.vm.beginAttentionFollowUpObservation(for: session)
         let commit = await fixture.vm.test_terminalCommitBarrier()
@@ -479,7 +479,7 @@ final class AttentionNotificationAdmissionTests: XCTestCase {
                 attachments: [],
                 taggedFileAttachments: [],
                 draftText: "steer",
-                optimisticUserItemID: nil,
+                identity: .inactiveForTesting(in: session),
                 createdAt: Date()
             )]
             _ = await barrier.commit(completedRequest(session, ownership))
@@ -684,7 +684,7 @@ final class AttentionNotificationAdmissionTests: XCTestCase {
     /// session did not settle idle on that completion.
     func testCompletionChangedWhilePausedBeforeAdmissionIsNeverDelivered() async throws {
         let scenarios: [(name: String, mutate: (AgentTabSession) -> Void)] = [
-            ("follow-up queued", { $0.pendingInstructions.append("late follow-up") }),
+            ("follow-up queued", { $0.appendUntrackedPendingInstructionForTesting("late follow-up") }),
             ("new run attempt", { session in
                 session.runState = .running
                 session.beginRunAttempt(source: "test.attention.newAttempt")
@@ -1172,7 +1172,7 @@ final class AttentionNotificationAdmissionTests: XCTestCase {
         XCTAssertEqual(fixture.admission.activeEventKey, firstKey)
 
         // Turn 2 commits and its queued successor actually starts while turn 1's request still hangs.
-        root.session.pendingInstructions = ["three"]
+        root.session.setUntrackedPendingInstructionsForTesting(["three"])
         let second = beginTurn(root.session, user: "two", assistant: "second")
         let revision = await barrier.commit(completedRequest(root.session, second, supportsFollowUp: true))
         XCTAssertEqual(revision?.successorKind, .relatedFollowUp)
@@ -1870,7 +1870,7 @@ final class AttentionNotificationAdmissionTests: XCTestCase {
     /// invokes its observation).
     private func makeBarrier(
         _ vm: AgentModeViewModel,
-        startFollowUpRun: @escaping (UUID, String, AgentModeRunService.Hooks.FollowUpStartObservation?) -> Void = { _, _, _ in }
+        startFollowUpRun: @escaping (UUID, AgentPendingInstruction, AgentModeRunService.Hooks.FollowUpStartObservation?) -> Void = { _, _, _ in }
     ) -> AgentRunTerminalCommitBarrier {
         AgentRunTerminalCommitBarrier(hooks: AgentModeRunService.Hooks(
             estimateRuntimeTokens: { $0.count },
@@ -1904,10 +1904,11 @@ final class AttentionNotificationAdmissionTests: XCTestCase {
             publishTerminalCommit: { _, _, _ in .accepted(successorEpoch: nil) },
             startFollowUpRun: startFollowUpRun,
             restoreDraftText: { _, _, _, _ in },
-            augmentUserMessageForProviderSend: { text, _, _, _ in text },
+            augmentUserMessageForProviderSend: { text, _, _, _, _ in AgentStagedProviderText(text: text) },
             stageResumeRecoveryHandoffIfNeeded: { _ in },
-            prependPendingHandoffIfNeeded: { text, _ in text },
-            recordPendingHandoffSendOutcome: { _, _ in },
+            prependPendingHandoffIfNeeded: { text, _ in AgentStagedProviderText(text: text) },
+            stagePendingHandoffForDurableDispatch: { _, _ in .none },
+            recordPendingHandoffSendOutcome: { _, _, _ in },
             signalMCPInstructionDelivered: { _ in },
             captureAttentionTurnCompletion: { [weak vm] session, revision in
                 vm?.captureAttentionTurnCompletion(for: session, revision: revision)

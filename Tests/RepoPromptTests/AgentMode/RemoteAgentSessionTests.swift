@@ -2490,7 +2490,11 @@ final class RemoteAgentSessionTests: XCTestCase {
         )
 
         // The first steer must self-heal observation: subscribe + catch-up, then send.
-        try await fixture.coordinator.steer(session: session, text: "Continue")
+        try await fixture.coordinator.steer(
+            session: session,
+            text: "Continue",
+            dispatch: RemoteInputDispatch(input: .inactiveForTesting(in: session))
+        )
 
         let subscribeCount = await connection.subscribeCallCount()
         let steerCount = await connection.commandCount(type: "steer")
@@ -2524,7 +2528,11 @@ final class RemoteAgentSessionTests: XCTestCase {
         )
 
         do {
-            try await fixture.coordinator.steer(session: session, text: "Continue")
+            try await fixture.coordinator.steer(
+                session: session,
+                text: "Continue",
+                dispatch: RemoteInputDispatch(input: .inactiveForTesting(in: session))
+            )
             XCTFail("Expected steer to be withheld when observation attach fails hard")
         } catch {
             // Hard (non-transient) attach failure must surface as a send failure.

@@ -832,10 +832,15 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
             initialMessageForRun: "pre-denied",
             attachments: []
         )
+        // The run task joins the claimed startup teardown, whose terminal commit awaits the attempt's
+        // terminal resources (tracker stop, then the lease disposition). The run state turns inactive
+        // inside that commit before those resources run, so it alone does not order the lease reads.
+        let runTask = try XCTUnwrap(session.agentTask, "the run task owns the startup teardown")
 
         try await waitUntil("Pre-denied authorization should terminalize without bootstrap") {
             !session.runState.isActive
         }
+        await runTask.value
         XCTAssertEqual(bootstrapEntries, 0)
         let authorizationOutcome = await context.authorizationReceipt.wait()
         XCTAssertEqual(authorizationOutcome, .denied)
@@ -3650,17 +3655,21 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         )
         controller.snapshotRuntimeStatus = .active(activeFlags: [])
         let harness = makeHarness(recorder: recorder, codexController: controller)
-        let session = AgentTabSession(tabID: UUID())
+        // A Codex fallback queues only under a store-issued receipt: real temporary lane.
+        let recovery = try await RecoveryLaneFixture.make("ColdResumeQueuesFirstSend")
+        defer { recovery.tearDown() }
+        let session = recovery.boundTabSession()
         session.selectedAgent = .codexExec
         session.codexConversationID = "saved-thread"
         session.codexRolloutPath = "/tmp/saved-thread.jsonl"
 
-        let outcome = await harness.service.startRun(
+        let outcome = try await harness.service.startRun(
             tabID: session.tabID,
             session: session,
             initialUserMessage: "resume",
             initialMessageForRun: "resume",
-            attachments: []
+            attachments: [],
+            codexFallbackContext: recovery.codexFallbackContext("resume")
         )
 
         guard case let .queuedFallback(_, reason)? = outcome else {
@@ -3699,16 +3708,19 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         // The thread keeps reporting active, so only the replayed turn's completion can release.
         controller.snapshotRuntimeStatus = .active(activeFlags: [])
         let harness = makeHarness(recorder: recorder, codexController: controller)
-        let session = AgentTabSession(tabID: UUID())
+        let recovery = try await RecoveryLaneFixture.make("ColdResumeWaitsForReplayedTurn")
+        defer { recovery.tearDown() }
+        let session = recovery.boundTabSession()
         session.selectedAgent = .codexExec
         session.codexConversationID = "saved-thread"
 
-        let outcome = await harness.service.startRun(
+        let outcome = try await harness.service.startRun(
             tabID: session.tabID,
             session: session,
             initialUserMessage: "resume",
             initialMessageForRun: "resume",
-            attachments: []
+            attachments: [],
+            codexFallbackContext: recovery.codexFallbackContext("resume")
         )
         guard case .queuedFallback(_, .resumedThreadActive)? = outcome else {
             return XCTFail("Expected the cold-resume send to queue behind the active thread, got \(String(describing: outcome))")
@@ -3746,16 +3758,19 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         let snapshotGate = LifecyclePublicationGate()
         controller.snapshotGate = snapshotGate
         let harness = makeHarness(recorder: recorder, codexController: controller)
-        let session = AgentTabSession(tabID: UUID())
+        let recovery = try await RecoveryLaneFixture.make("ColdResumeIdleReadAfterReplayedStart")
+        defer { recovery.tearDown() }
+        let session = recovery.boundTabSession()
         session.selectedAgent = .codexExec
         session.codexConversationID = "saved-thread"
 
-        let outcome = await harness.service.startRun(
+        let outcome = try await harness.service.startRun(
             tabID: session.tabID,
             session: session,
             initialUserMessage: "resume",
             initialMessageForRun: "resume",
-            attachments: []
+            attachments: [],
+            codexFallbackContext: recovery.codexFallbackContext("resume")
         )
         guard case .queuedFallback(_, .resumedThreadActive)? = outcome else {
             return XCTFail("Expected the cold-resume send to queue behind the active thread, got \(String(describing: outcome))")
@@ -3809,26 +3824,30 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         // The thread keeps reporting active, so only lifecycle completions can release the queue.
         controller.snapshotRuntimeStatus = .active(activeFlags: [])
         let harness = makeHarness(recorder: recorder, codexController: controller)
-        let session = AgentTabSession(tabID: UUID())
+        let recovery = try await RecoveryLaneFixture.make("ColdResumeDrainsInOrder")
+        defer { recovery.tearDown() }
+        let session = recovery.boundTabSession()
         session.selectedAgent = .codexExec
         session.codexConversationID = "saved-thread"
 
-        let first = await harness.service.startRun(
+        let first = try await harness.service.startRun(
             tabID: session.tabID,
             session: session,
             initialUserMessage: "first",
             initialMessageForRun: "first",
-            attachments: []
+            attachments: [],
+            codexFallbackContext: recovery.codexFallbackContext("first")
         )
         guard case .queuedFallback(_, .resumedThreadActive)? = first else {
             return XCTFail("Expected the cold-resume send to queue behind the active thread, got \(String(describing: first))")
         }
 
         // A second message submitted during the now-active run joins the same resumed-thread wait.
-        let second = await harness.host.test_codexCoordinator.sendCodexNativeMessage(
+        let second = try await harness.host.test_codexCoordinator.sendCodexNativeMessage(
             session: session,
             text: "second",
-            attachments: []
+            attachments: [],
+            fallbackContext: recovery.codexFallbackContext("second")
         )
         guard case .queuedFallback(_, .resumedThreadActive) = second else {
             return XCTFail("Expected the follow-up to join the resumed-thread wait, got \(second)")
@@ -3884,7 +3903,9 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         )
         controller.snapshotRuntimeStatus = .active(activeFlags: [])
         let harness = makeHarness(recorder: recorder, codexController: controller)
-        let session = AgentTabSession(tabID: UUID())
+        let recovery = try await RecoveryLaneFixture.make("PrewarmedActiveThreadQueuesFirstSend")
+        defer { recovery.tearDown() }
+        let session = recovery.boundTabSession()
         session.selectedAgent = .codexExec
         session.codexConversationID = "saved-thread"
 
@@ -3896,12 +3917,13 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         XCTAssertFalse(session.runState.isActive)
         XCTAssertNil(session.codexAnonymousActiveTurn)
 
-        let outcome = await harness.service.startRun(
+        let outcome = try await harness.service.startRun(
             tabID: session.tabID,
             session: session,
             initialUserMessage: "resume",
             initialMessageForRun: "resume",
-            attachments: []
+            attachments: [],
+            codexFallbackContext: recovery.codexFallbackContext("resume")
         )
 
         guard case .queuedFallback(_, .resumedThreadActive)? = outcome else {
@@ -3933,7 +3955,9 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         )
         controller.snapshotRuntimeStatus = .active(activeFlags: [])
         let harness = makeHarness(recorder: recorder, codexController: controller)
-        let session = AgentTabSession(tabID: UUID())
+        let recovery = try await RecoveryLaneFixture.make("ColdResumeReplacesStaleIdentity")
+        defer { recovery.tearDown() }
+        let session = recovery.boundTabSession()
         session.selectedAgent = .codexExec
         session.codexConversationID = "saved-thread"
         let staleIdentity = AgentTabSession.CodexAuthoritativeTurnIdentity(
@@ -3950,12 +3974,13 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
             session?.codexAuthoritativeActiveTurn = staleIdentity
         }
 
-        let outcome = await harness.service.startRun(
+        let outcome = try await harness.service.startRun(
             tabID: session.tabID,
             session: session,
             initialUserMessage: "resume",
             initialMessageForRun: "resume",
-            attachments: []
+            attachments: [],
+            codexFallbackContext: recovery.codexFallbackContext("resume")
         )
 
         guard case .queuedFallback(_, .resumedThreadActive)? = outcome else {
@@ -4121,7 +4146,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         XCTAssertNil(session.codexConversationID)
     }
 
-    func testCodexFallbackAndRejectedSendVariantsPreserveReusedOwnership() async {
+    func testCodexFallbackAndRejectedSendVariantsPreserveReusedOwnership() async throws {
         let rows: [(LifecycleNoopCodexController.SendBehavior, Bool)] = [
             (.failure, true),
             (.cancellation, true),
@@ -4136,18 +4161,22 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
                 activatesThread: activatesThread
             )
             let harness = makeHarness(recorder: recorder, codexController: codexController)
-            let session = AgentTabSession(tabID: UUID())
+            // A fallback queues only under a store-issued receipt: real temporary lane per row.
+            let recovery = try await RecoveryLaneFixture.make("ReusedCodexVariant")
+            defer { recovery.tearDown() }
+            let session = recovery.boundTabSession()
             session.selectedAgent = .codexExec
             session.runState = .running
             session.runID = UUID()
             let ownership = session.beginRunAttempt(source: "test.reusedCodexVariant")
 
-            let outcome = await harness.service.startRun(
+            let outcome = try await harness.service.startRun(
                 tabID: session.tabID,
                 session: session,
                 initialUserMessage: "reused rejected send",
                 initialMessageForRun: "reused rejected send",
-                attachments: []
+                attachments: [],
+                codexFallbackContext: recovery.codexFallbackContext("reused rejected send")
             )
 
             if activatesThread {
@@ -4708,7 +4737,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
                 }
 
                 XCTAssertTrue(session.pendingACPSteeringInstructions.isEmpty)
-                XCTAssertEqual(session.pendingInstructions, ["preserve ACP follow-up"])
+                XCTAssertEqual(session.pendingInstructionTexts, ["preserve ACP follow-up"])
                 XCTAssertFalse(recorder.contains("delivered"))
             }
         }
@@ -4777,6 +4806,14 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         session.selectedAgent = .cursor
         let stageID = UUID()
         let acknowledged = "delegated-notice:\(stageID.uuidString):true"
+        // Ordering gate, not a speed oracle: the first ACP launch in a test process captures the
+        // login-shell environment (XCTest is never terminal-inherited) through the process-wide cache,
+        // a one-time cost with its own 5 s capture timeout that a loaded parallel run can spend
+        // entirely. Complete it with the exact request `ACPAgentSessionController` issues, so the
+        // bound below covers only this run's launch, handshake, and prompt write.
+        _ = await ProcessEnvironmentBuilder.build(
+            ProcessEnvironmentRequest(purpose: .acpAgent(providerID: ACPProviderID.cursor.rawValue))
+        )
 
         _ = await harness.service.startRun(
             tabID: session.tabID,
@@ -4862,10 +4899,105 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         XCTAssertFalse(session.runState.isActive)
     }
 
+    /// Phase 1b ACP initial route: a durable start commits dispatch before the runner, attaches the
+    /// existing run attempt before `session/prompt`, and only the provider's `session/prompt`
+    /// response (not the write) records acceptance.
+    func testACPDurablePromptIsAcceptedByThePromptResponseUnderItsRunAttempt() async throws {
+        let fixture = try await RecoveryLaneFixture.make("route-acp-accept")
+        defer { fixture.tearDown() }
+        let recorder = LifecycleRecorder()
+        let workspace = try makeTemporaryDirectory()
+        let recordURL = workspace.appendingPathComponent("acp-durable-prompt.jsonl")
+        let scriptURL = try makeOpenCodeModeFlowServerScript()
+        let provider = LifecycleFakeACPProvider(
+            providerID: .cursor,
+            commandPath: scriptURL.path,
+            environment: ["ACP_RECORD_PATH": recordURL.path],
+            recorder: recorder
+        )
+        let harness = makeHarness(
+            recorder: recorder,
+            workspacePathProvider: { _ in workspace.path },
+            acpProviderFactory: { _, _ in provider }
+        )
+        let session = fixture.boundTabSession()
+        session.selectedAgent = .cursor
+        let identity = try await fixture.queuedIdentity("durable ACP prompt")
+        session.recoveryAdmissionMode = .mandatory
+
+        let outcome = await harness.service.startRun(
+            tabID: session.tabID,
+            session: session,
+            initialUserMessage: "durable ACP prompt",
+            initialMessageForRun: "durable ACP prompt",
+            attachments: [],
+            inputConstituents: [identity]
+        )
+        XCTAssertNil(outcome)
+        try await withLifecycleTimeout("durable ACP prompt run") {
+            await session.agentTask?.value
+        }
+
+        XCTAssertTrue(recordedOpenCodeFlowRequests(at: recordURL).contains { $0.method == "session/prompt" })
+        let accepted = await fixture.waitForIntent(identity, state: .providerAccepted)
+        XCTAssertEqual(accepted?.deliveryState, .providerAccepted)
+        XCTAssertEqual(accepted?.intentID, identity.intentID)
+        let attempts = await fixture.attempts(for: identity)
+        XCTAssertEqual(attempts.count, 1, "One delivery attempt")
+        let runAttemptID = try XCTUnwrap(attempts.first?.runAttemptID, "Attached to the existing run attempt before the prompt")
+        let hasRunAttempt = await fixture.hasRunAttempt(runAttemptID)
+        XCTAssertTrue(hasRunAttempt)
+    }
+
+    /// Phase 1b ACP initial route: a `session/prompt` that fails before its write (no
+    /// `onSubmitted`) is proven not handed off, so the same intent returns to `queued`.
+    func testACPDurablePromptNeverWrittenReturnsSameIntentToQueue() async throws {
+        let fixture = try await RecoveryLaneFixture.make("route-acp-not-written")
+        defer { fixture.tearDown() }
+        let recorder = LifecycleRecorder()
+        let workspace = try makeTemporaryDirectory()
+        let provider = try LifecycleFakeACPProvider(
+            providerID: .cursor,
+            commandPath: makeFakeACPServerScript().path,
+            recorder: recorder,
+            failPromptBuild: true
+        )
+        let harness = makeHarness(
+            recorder: recorder,
+            workspacePathProvider: { _ in workspace.path },
+            acpProviderFactory: { _, _ in provider }
+        )
+        let session = fixture.boundTabSession()
+        session.selectedAgent = .cursor
+        let identity = try await fixture.queuedIdentity("never written")
+        session.recoveryAdmissionMode = .mandatory
+
+        let outcome = await harness.service.startRun(
+            tabID: session.tabID,
+            session: session,
+            initialUserMessage: "never written",
+            initialMessageForRun: "never written",
+            attachments: [],
+            inputConstituents: [identity]
+        )
+        XCTAssertNil(outcome)
+        try await withLifecycleTimeout("durable ACP prompt that fails before its write") {
+            await session.agentTask?.value
+        }
+
+        XCTAssertTrue(recorder.events.contains("provider:prompt-build-failed"), "Precondition: the prompt was never written")
+        let attempts = await fixture.attempts(for: identity)
+        XCTAssertEqual(attempts.count, 1, "The dispatch was committed first")
+        XCTAssertNotNil(attempts.first?.runAttemptID, "and attached to the run attempt before the prompt")
+        let queued = await fixture.waitForIntent(identity, state: .queued)
+        XCTAssertEqual(queued?.deliveryState, .queued)
+        XCTAssertEqual(queued?.intentID, identity.intentID)
+    }
+
     /// Plan §6.2 / evidence scout: Codex `NativeSendOutcome.didSend` is also true for a queued fallback,
     /// which has not reached the model. Staged delegated-question notices acknowledge only after an
     /// actual send, never before it, and a queued fallback reports its stage as not sent.
-    func testCodexDelegatedQuestionStageAcknowledgesOnlyAfterAnActualSendNotAQueuedFallback() async {
+    func testCodexDelegatedQuestionStageAcknowledgesOnlyAfterAnActualSendNotAQueuedFallback() async throws {
         // Actual send: acknowledged exactly once, after the provider accepted the turn.
         do {
             let recorder = LifecycleRecorder()
@@ -4909,19 +5041,23 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
                 activatesThread: true
             )
             let harness = makeHarness(recorder: recorder, codexController: controller)
-            let session = AgentTabSession(tabID: UUID())
+            // A fallback queues only under a store-issued receipt: real temporary lane.
+            let recovery = try await RecoveryLaneFixture.make("QueuedFallbackNotice")
+            defer { recovery.tearDown() }
+            let session = recovery.boundTabSession()
             session.selectedAgent = .codexExec
             session.runState = .running
             session.runID = UUID()
             let ownership = session.beginRunAttempt(source: "test.queuedFallbackNotice")
             let stageID = UUID()
 
-            let outcome = await harness.service.startRun(
+            let outcome = try await harness.service.startRun(
                 tabID: session.tabID,
                 session: session,
                 initialUserMessage: "queued send carrying staged notices",
                 initialMessageForRun: "queued send carrying staged notices",
                 attachments: [],
+                codexFallbackContext: recovery.codexFallbackContext("queued send carrying staged notices"),
                 delegatedQuestionStageID: stageID
             )
 
@@ -5676,13 +5812,13 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
             makeTerminalPublicationEnvelope: { _, _, _, _ in
                 .init(epoch: epoch, snapshot: .expired(sessionID: sessionID))
             },
-            startFollowUpRun: { _, text, _ in recorder.record("follow-up:\(text)") }
+            startFollowUpRun: { _, instruction, _ in recorder.record("follow-up:\(instruction.text)") }
         )
         let barrier = AgentRunTerminalCommitBarrier(hooks: hooks)
         let session = AgentTabSession(tabID: UUID())
         session.runID = UUID()
         session.runState = .running
-        session.pendingInstructions = ["continue"]
+        session.setUntrackedPendingInstructionsForTesting(["continue"])
         let ownership = session.beginRunAttempt(source: "test.followUpPublication")
         let request = AgentRunTerminalCommitBarrier.Request(
             session: session,
@@ -5697,7 +5833,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         )
 
         _ = await barrier.commit(request)
-        XCTAssertEqual(session.pendingInstructions, ["continue"])
+        XCTAssertEqual(session.pendingInstructionTexts, ["continue"])
         XCTAssertTrue(session.mcpFollowUpRunPending)
         XCTAssertFalse(recorder.contains("follow-up:continue"))
 
@@ -5718,7 +5854,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
                     recorder.record("publish")
                     return .accepted(successorEpoch: nil)
                 },
-                startFollowUpRun: { _, text, _ in recorder.record("follow-up:\(text)") }
+                startFollowUpRun: { _, instruction, _ in recorder.record("follow-up:\(instruction.text)") }
             )
             hooks.captureAttentionTurnCompletion = { _, _ in
                 recorder.record("capture")
@@ -5728,7 +5864,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
             let session = AgentTabSession(tabID: UUID())
             session.runID = UUID()
             session.runState = .running
-            session.pendingInstructions = queued ? ["continue"] : []
+            session.setUntrackedPendingInstructionsForTesting(queued ? ["continue"] : [])
             let ownership = session.beginRunAttempt(source: "test.providerOutputRelease")
             let request = AgentRunTerminalCommitBarrier.Request(
                 session: session,
@@ -5771,13 +5907,13 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
                     ? .rejected(reason: "test_transient_rejection")
                     : .accepted(successorEpoch: nil)
             },
-            startFollowUpRun: { _, text, _ in recorder.record("follow-up:\(text)") }
+            startFollowUpRun: { _, instruction, _ in recorder.record("follow-up:\(instruction.text)") }
         )
         let barrier = AgentRunTerminalCommitBarrier(hooks: hooks)
         let session = AgentTabSession(tabID: UUID())
         session.runID = UUID()
         session.runState = .running
-        session.pendingInstructions = ["continue"]
+        session.setUntrackedPendingInstructionsForTesting(["continue"])
         let ownership = session.beginRunAttempt(source: "test.providerOutputRetry")
         let request = AgentRunTerminalCommitBarrier.Request(
             session: session,
@@ -5796,7 +5932,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         )
 
         _ = await barrier.commit(request)
-        XCTAssertEqual(session.pendingInstructions, ["continue"])
+        XCTAssertEqual(session.pendingInstructionTexts, ["continue"])
         _ = await barrier.commit(request)
 
         let relevant: Set = ["publish", "deliver", "follow-up:continue"]
@@ -5826,13 +5962,13 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
                 }
                 return .accepted(successorEpoch: nil)
             },
-            startFollowUpRun: { _, text, _ in recorder.record("follow-up:\(text)") }
+            startFollowUpRun: { _, instruction, _ in recorder.record("follow-up:\(instruction.text)") }
         )
         let barrier = AgentRunTerminalCommitBarrier(hooks: hooks)
         let session = AgentTabSession(tabID: UUID())
         session.runID = UUID()
         session.runState = .running
-        session.pendingInstructions = ["continue"]
+        session.setUntrackedPendingInstructionsForTesting(["continue"])
         func makeRequest(_ ownership: AgentRunOwnership) -> AgentRunTerminalCommitBarrier.Request {
             AgentRunTerminalCommitBarrier.Request(
                 session: session,
@@ -5882,13 +6018,13 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
                 await withCheckedContinuation { heldPublications.append($0) }
                 return .accepted(successorEpoch: nil)
             },
-            startFollowUpRun: { _, text, _ in recorder.record("follow-up:\(text)") }
+            startFollowUpRun: { _, instruction, _ in recorder.record("follow-up:\(instruction.text)") }
         )
         let barrier = AgentRunTerminalCommitBarrier(hooks: hooks)
         let session = AgentTabSession(tabID: UUID())
         session.runID = UUID()
         session.runState = .running
-        session.pendingInstructions = ["continue"]
+        session.setUntrackedPendingInstructionsForTesting(["continue"])
         let ownership = session.beginRunAttempt(source: "test.overlappingRetries")
         let request = AgentRunTerminalCommitBarrier.Request(
             session: session,
@@ -5952,13 +6088,13 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
                 await withCheckedContinuation { heldPublications.append($0) }
                 return attempt == 2 ? .accepted(successorEpoch: nil) : .rejected(reason: "test_late_rejection")
             },
-            startFollowUpRun: { _, text, _ in recorder.record("follow-up:\(text)") }
+            startFollowUpRun: { _, instruction, _ in recorder.record("follow-up:\(instruction.text)") }
         )
         let barrier = AgentRunTerminalCommitBarrier(hooks: hooks)
         let session = AgentTabSession(tabID: UUID())
         session.runID = UUID()
         session.runState = .running
-        session.pendingInstructions = ["continue"]
+        session.setUntrackedPendingInstructionsForTesting(["continue"])
         let ownership = session.beginRunAttempt(source: "test.overlappingRetryRejection")
         let request = AgentRunTerminalCommitBarrier.Request(
             session: session,
@@ -6013,13 +6149,13 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
                     }
                     return staleResult ? .stale : .accepted(successorEpoch: nil)
                 },
-                startFollowUpRun: { _, text, _ in recorder.record("follow-up:\(text)") }
+                startFollowUpRun: { _, instruction, _ in recorder.record("follow-up:\(instruction.text)") }
             )
             let barrier = AgentRunTerminalCommitBarrier(hooks: hooks)
             let session = AgentTabSession(tabID: UUID())
             session.runID = UUID()
             session.runState = .running
-            session.pendingInstructions = ["first", "second"]
+            session.setUntrackedPendingInstructionsForTesting(["first", "second"])
             let ownership = session.beginRunAttempt(source: "test.followUpOncePerCommit")
             let request = AgentRunTerminalCommitBarrier.Request(
                 session: session,
@@ -6044,10 +6180,60 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
                 staleResult ? [] : ["follow-up:first"],
                 "stale: \(staleResult)"
             )
-            XCTAssertEqual(session.pendingInstructions, ["second"], "stale: \(staleResult)")
+            XCTAssertEqual(session.pendingInstructionTexts, ["second"], "stale: \(staleResult)")
             XCTAssertEqual(deliveries, deliveriesAfterTake, "A consumed commit's retry delivers nothing more.")
             XCTAssertFalse(session.terminalCommitInProgress)
         }
+    }
+
+    /// A `.stale` publication never silently drops a durable queued input (untracked input keeps
+    /// the legacy drop above): it stays queued with its intent. The bound lane's run terminal
+    /// evidence is recorded although this local run has no MCP publication envelope.
+    func testStalePublicationPreservesDurableFollowUpAndRecordsTerminalEvidenceWithoutMCP() async throws {
+        let fixture = try await RecoveryLaneFixture.make("StaleDurableFollowUp")
+        defer { fixture.tearDown() }
+        let recorder = LifecycleRecorder()
+        let hooks = makeHooks(
+            recorder: recorder,
+            publishTerminalCommitResult: { _, _, _ in .stale },
+            startFollowUpRun: { _, instruction, _ in recorder.record("follow-up:\(instruction.text)") }
+        )
+        let barrier = AgentRunTerminalCommitBarrier(hooks: hooks)
+        let session = fixture.boundTabSession()
+        session.runID = UUID()
+        session.runState = .running
+        let identity = try await fixture.queuedIdentity("durable follow-up")
+        let durable = AgentPendingInstruction(text: "durable follow-up", identity: identity)
+        session.pendingInstructions = [durable]
+        let ownership = session.beginRunAttempt(source: "test.staleDurableFollowUp")
+        let request = AgentRunTerminalCommitBarrier.Request(
+            session: session,
+            ownership: ownership,
+            expectedRunID: session.runID,
+            terminalState: .completed,
+            source: "test.staleDurableFollowUp",
+            attachmentDisposition: .deleteFiles,
+            finalizeNonCodexUsage: true,
+            supportsFollowUp: true,
+            notifyTurnComplete: false
+        )
+
+        let committed = await barrier.commit(request)
+        let revision = try XCTUnwrap(committed)
+        _ = await barrier.commit(request)
+
+        XCTAssertNil(revision.mcpPublicationEnvelope)
+        XCTAssertTrue(recorder.events.filter { $0.hasPrefix("follow-up:") }.isEmpty)
+        XCTAssertEqual(session.pendingInstructions, [durable], "A durable follow-up is never silently discarded")
+        XCTAssertFalse(session.mcpFollowUpRunPending)
+        let state = await fixture.intent(identity)?.deliveryState
+        XCTAssertEqual(state, .queued)
+        let recorded = await RecoveryTestSupport.eventually {
+            let record = await fixture.store.read(sessionID: fixture.sessionID).record
+            return record?.runAttempts.first { $0.runAttemptID == ownership.attemptID }?.terminal?.commitID == revision.commitID
+        }
+        XCTAssertTrue(recorded, "Terminal evidence is independent of MCP publication")
+        XCTAssertTrue(fixture.lane.terminalEvidenceFailures.isEmpty)
     }
 
     /// A commit superseded by a newer run attempt while it delivers provider output starts no
@@ -6067,13 +6253,13 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
                 }
                 return .accepted(successorEpoch: nil)
             },
-            startFollowUpRun: { _, text, _ in recorder.record("follow-up:\(text)") }
+            startFollowUpRun: { _, instruction, _ in recorder.record("follow-up:\(instruction.text)") }
         )
         let barrier = AgentRunTerminalCommitBarrier(hooks: hooks)
         let session = AgentTabSession(tabID: UUID())
         session.runID = UUID()
         session.runState = .running
-        session.pendingInstructions = ["continue"]
+        session.setUntrackedPendingInstructionsForTesting(["continue"])
         var newerCommit: Task<AgentRunTerminalCommitRevision?, Never>?
         func makeRequest(
             _ ownership: AgentRunOwnership,
@@ -6130,7 +6316,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         let session = AgentTabSession(tabID: UUID())
         session.runID = UUID()
         session.runState = .running
-        session.pendingInstructions = ["unrelated generic instruction"]
+        session.setUntrackedPendingInstructionsForTesting(["unrelated generic instruction"])
         let ownership = session.beginRunAttempt(source: "test.providerSuccessor")
         let successorID = UUID()
         let request = AgentRunTerminalCommitBarrier.Request(
@@ -6158,12 +6344,12 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
 
         _ = await barrier.commit(request)
         XCTAssertTrue(consumedRevisions.isEmpty)
-        XCTAssertEqual(session.pendingInstructions, ["unrelated generic instruction"])
+        XCTAssertEqual(session.pendingInstructionTexts, ["unrelated generic instruction"])
 
         _ = await barrier.commit(request)
         _ = await barrier.commit(request)
         XCTAssertEqual(consumedRevisions.count, 1)
-        XCTAssertEqual(session.pendingInstructions, ["unrelated generic instruction"])
+        XCTAssertEqual(session.pendingInstructionTexts, ["unrelated generic instruction"])
         XCTAssertEqual(session.lastTerminalCommitRevision?.providerSuccessorID, successorID)
     }
 
@@ -6781,6 +6967,8 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         endBackgroundNativeMessage: ((UUID) -> Void)? = nil,
         toolTrackingHooks: AgentToolTrackingHooks = .noOp,
         autoSignalACPRouting: Bool = false,
+        stageResumeRecoveryHandoffIfNeeded: ((AgentTabSession) async -> Void)? = nil,
+        stagesDurablePendingHandoffThroughHost: Bool = false,
         expectedPIDPolicyArmer: @escaping (MCPBootstrapLeaseSpec) async -> Bool = { _ in true },
         ompQualificationAuthorizer: @escaping (OhMyPiAgentModeSmokeGate.StartTransaction, UUID) -> Bool = { _, _ in false },
         ompQualificationActiveWorkspaceID: @escaping () -> UUID? = { nil },
@@ -6894,7 +7082,13 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
                     publishTerminalCommit: publishTerminalCommit,
                     handleHeadlessStreamResult: handleHeadlessStreamResult,
                     handleBackgroundNativeStreamResult: handleBackgroundNativeStreamResult,
-                    endBackgroundNativeMessage: endBackgroundNativeMessage
+                    endBackgroundNativeMessage: endBackgroundNativeMessage,
+                    stageResumeRecoveryHandoffIfNeeded: stageResumeRecoveryHandoffIfNeeded,
+                    stagePendingHandoffForDurableDispatch: stagesDurablePendingHandoffThroughHost
+                        ? { [weak host] text, session in
+                            await host?.stagePendingHandoffForDurableDispatch(text, session: session) ?? .failed
+                        }
+                        : nil
                 ),
                 toolTrackingHooks: toolTrackingHooks,
                 runCoordinator: AgentRunCoordinator.shared
@@ -6918,10 +7112,12 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
             AgentSessionRunState,
             UUID?
         ) -> AgentRunTerminalPublicationEnvelope?)? = nil,
-        startFollowUpRun: ((UUID, String, AgentModeRunService.Hooks.FollowUpStartObservation?) -> Void)? = nil,
+        startFollowUpRun: ((UUID, AgentPendingInstruction, AgentModeRunService.Hooks.FollowUpStartObservation?) -> Void)? = nil,
         handleHeadlessStreamResult: ((AIStreamResult) async -> Void)? = nil,
         handleBackgroundNativeStreamResult: ((AIStreamResult, UUID) async -> Void)? = nil,
-        endBackgroundNativeMessage: ((UUID) -> Void)? = nil
+        endBackgroundNativeMessage: ((UUID) -> Void)? = nil,
+        stageResumeRecoveryHandoffIfNeeded: ((AgentTabSession) async -> Void)? = nil,
+        stagePendingHandoffForDurableDispatch: ((String, AgentTabSession) async -> AgentPendingHandoffDispatchStaging)? = nil
     ) -> AgentModeRunService.Hooks {
         let flushPendingAssistantDelta = flushPendingAssistantDelta ?? { _ in
             recorder.record("assistant-flush")
@@ -6969,15 +7165,18 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
             },
             startFollowUpRun: startFollowUpRun ?? { _, _, _ in },
             restoreDraftText: { _, text, _, _ in recorder.record("draft:\(text)") },
-            augmentUserMessageForProviderSend: { text, _, _, _ in text },
-            stageResumeRecoveryHandoffIfNeeded: { _ in },
-            prependPendingHandoffIfNeeded: { text, _ in text },
-            recordPendingHandoffSendOutcome: { _, didSend in recorder.record("handoff:\(didSend)") },
+            augmentUserMessageForProviderSend: { text, _, _, _, _ in AgentStagedProviderText(text: text) },
+            stageResumeRecoveryHandoffIfNeeded: stageResumeRecoveryHandoffIfNeeded ?? { _ in },
+            prependPendingHandoffIfNeeded: { text, _ in AgentStagedProviderText(text: text) },
+            stagePendingHandoffForDurableDispatch: stagePendingHandoffForDurableDispatch ?? { _, _ in .none },
+            recordPendingHandoffSendOutcome: { _, _, disposition in
+                recorder.record("handoff:\(Self.stagedInputLabel(disposition))")
+            },
             signalMCPInstructionDelivered: { _ in recorder.record("delivered") },
-            recordDelegatedQuestionNoticeSendOutcome: { _, stageID, didSend in
+            recordDelegatedQuestionNoticeSendOutcome: { _, stageID, disposition in
                 // Only staged inputs are recorded, so runs without notices keep their event sequences.
                 guard let stageID else { return }
-                recorder.record("delegated-notice:\(stageID.uuidString):\(didSend)")
+                recorder.record("delegated-notice:\(stageID.uuidString):\(Self.stagedInputLabel(disposition))")
             },
             handleBackgroundNativeStreamResult: { result, sourceID, _ in
                 await handleBackgroundNativeStreamResult?(result, sourceID)
@@ -6993,6 +7192,15 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         let session: AgentTabSession
         let controller: ACPAgentSessionController
         let processID: pid_t
+    }
+
+    /// Recorded staged-input disposition: `true` (sent), `false` (not sent), `unknown`.
+    nonisolated static func stagedInputLabel(_ disposition: AgentStagedInputDisposition) -> String {
+        switch disposition {
+        case .sent: "true"
+        case .notSent: "false"
+        case .deliveryUnknown: "unknown"
+        }
     }
 
     private func makeRetainedACPFixture(processIDFileName: String) async throws -> RetainedACPFixture {
@@ -7060,7 +7268,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
             attachments: [],
             taggedFileAttachments: [],
             draftText: text,
-            optimisticUserItemID: nil,
+            identity: .inactiveForTesting(in: session),
             createdAt: Date()
         )
     }
@@ -7088,7 +7296,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
             attachments: [],
             taggedFileAttachments: [],
             draftText: text,
-            optimisticUserItemID: nil,
+            identity: .inactiveForTesting(in: session),
             createdAt: Date()
         )
     }

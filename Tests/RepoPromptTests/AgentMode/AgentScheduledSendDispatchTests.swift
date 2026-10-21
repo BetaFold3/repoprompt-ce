@@ -988,7 +988,7 @@ final class AgentScheduledSendDispatchTests: XCTestCase {
         harness.session.isScheduledDispatchInFlight = false
 
         XCTAssertFalse(harness.viewModel.scheduledSendBusyState(tabID: harness.tabID).isBusy)
-        harness.session.pendingInstructions = ["queued follow-up"]
+        harness.session.setUntrackedPendingInstructionsForTesting(["queued follow-up"])
         XCTAssertTrue(harness.viewModel.scheduledSendBusyState(tabID: harness.tabID).hasPendingInstructions)
         harness.session.pendingInstructions = []
         harness.session.runState = .waitingForUser
@@ -1247,12 +1247,17 @@ final class AgentScheduledSendDispatchTests: XCTestCase {
         XCTAssertEqual(probe.startCount, 1)
     }
 
-    func testProviderAcceptanceIsDerivedFromRunStateForNonCodexRunners() {
+    func testProviderAcceptanceIsDerivedFromRunStateForNonCodexRunners() async throws {
         typealias Accept = AgentModeViewModel
+        // A Codex fallback outcome carries a store-issued queue receipt from a real temporary lane.
+        let recovery = try await RecoveryLaneFixture.make("ScheduledAcceptanceCodexFallback")
+        defer { recovery.tearDown() }
+        let admitted = try await recovery.queuedIdentity("scheduled fallback")
+        let queueReceipt = try XCTUnwrap(admitted.queueReceipt)
         XCTAssertTrue(Accept.scheduledProviderAccepted(outcome: .sent, agent: .codexExec, runState: .idle))
         XCTAssertTrue(
             Accept.scheduledProviderAccepted(
-                outcome: .queuedFallback(queueID: UUID(), reason: .activeWithoutAuthoritativeIdentity),
+                outcome: .queuedFallback(receipt: queueReceipt, reason: .activeWithoutAuthoritativeIdentity),
                 agent: .codexExec,
                 runState: .idle
             ),
@@ -2615,6 +2620,151 @@ final class AgentScheduledSendDispatchTests: XCTestCase {
         XCTAssertEqual(harness.session.scheduledSendPersistedUpdatedAt, persistedRecord.updatedAt, "Local revision matches the exact installed record")
     }
 
+    func testInitialCreationKeepsItsAuthorityWhenTheContextChangesAfterTheDurableCommit() async throws {
+        let harness = try await makeHarness(windowID: 4380)
+        let sessionID = try XCTUnwrap(harness.viewModel.ensureSessionBoundToTab(harness.session))
+        harness.session.appendItem(.user("first save creates the file"))
+        harness.session.isDirty = true
+
+        // The exclusive creation commits; before its authority is adopted, the persistence
+        // context stops being current (for example, a workspace switch flush).
+        let elsewhere = WorkspaceModel(name: "Elsewhere", repoPaths: [harness.storageURL.path], customStoragePath: harness.storageURL)
+        let flips = DispatchProbe()
+        harness.viewModel.test_initialPersistenceCommittedHook = { [harness, flips, elsewhere] _ in
+            flips.startCount += 1
+            harness.viewModel.test_persistenceWorkspaceOverride = elsewhere
+        }
+        let first = await harness.viewModel.saveSessionDetailed(for: harness.tabID)
+        harness.viewModel.test_initialPersistenceCommittedHook = nil
+        XCTAssertEqual(flips.startCount, 1, "The context flipped after the durable commit")
+        XCTAssertTrue(first.didWriteDurably, "The creation commit is reported honestly as a durable write")
+        XCTAssertFalse(first.isCleanSuccess, "Its authority was not used for the current save: not a clean projection")
+        XCTAssertTrue(harness.session.isDirty, "The projection stays dirty for a fresh owner-current save")
+        XCTAssertEqual(harness.session.persistedIncarnationSessionID, sessionID, "The committed creation is this owner's incarnation")
+        let created = try XCTUnwrap(harness.session.persistenceState(for: sessionID), "Creation authority is retained for the originating owner")
+
+        // The same in-memory owner becomes current again: newer edits save under the original
+        // creation authority instead of re-attempting creation (`sessionAlreadyExists`).
+        harness.viewModel.test_persistenceWorkspaceOverride = harness.workspace
+        harness.session.appendItem(.user("edit after the context returned"))
+        harness.session.isDirty = true
+        let saved = await harness.viewModel.flushSave(for: harness.tabID)
+        XCTAssertTrue(saved, "The creator keeps saving its own file")
+        let persisted = try await harness.persistedSession()
+        XCTAssertTrue(persisted.toLiveItems().contains { $0.text == "edit after the context returned" })
+        XCTAssertEqual(persisted.lifecycle?.lifecycle?.incarnationID, created.stamp.incarnationID, "Same incarnation; nothing was recreated")
+    }
+
+    func testInitialCreationStaysDurableWhenTheRestOfThatSaveWritesNothing() async throws {
+        // The owner changes after the creation committed, before the full write.
+        let flipped = try await makeHarness(windowID: 4383)
+        let flippedID = try XCTUnwrap(flipped.viewModel.ensureSessionBoundToTab(flipped.session))
+        flipped.session.appendItem(.user("created before the owner changed"))
+        flipped.session.isDirty = true
+        let flips = DispatchProbe()
+        flipped.viewModel.test_saveSessionBeforeWriteHook = { [flipped, flips] held in
+            flips.startCount += 1
+            _ = flipped.viewModel.test_installPersistentSessionBinding(sessionID: UUID(), on: held)
+        }
+        let flippedOutcome = await flipped.viewModel.saveSessionDetailed(for: flipped.tabID)
+        flipped.viewModel.test_saveSessionBeforeWriteHook = nil
+        XCTAssertEqual(flips.startCount, 1, "The owner changed after the durable creation")
+        XCTAssertTrue(flippedOutcome.didWriteDurably, "The committed creation is never reported as not written")
+        XCTAssertFalse(flippedOutcome.isCleanSuccess)
+        let created = try await flipped.viewModel.test_dataService.loadAgentSession(id: flippedID, for: flipped.workspace)
+        XCTAssertTrue(try XCTUnwrap(created).toLiveItems().contains { $0.text == "created before the owner changed" })
+
+        // The full write after the creation fails.
+        let failing = try await makeHarness(windowID: 4384)
+        let failingID = try XCTUnwrap(failing.viewModel.ensureSessionBoundToTab(failing.session))
+        failing.session.appendItem(.user("created before the full write failed"))
+        failing.session.isDirty = true
+        addTeardownBlock {
+            await AgentSessionDataService.shared.test_setSessionWriteFailureInjector(nil)
+        }
+        failing.viewModel.test_saveSessionBeforeWriteHook = { [failing, failingID] _ in
+            await failing.viewModel.test_dataService.test_setSessionWriteFailureInjector { url -> Error? in
+                guard url.lastPathComponent.contains(failingID.uuidString) else { return nil }
+                return InjectedSecondWriteFailure()
+            }
+        }
+        let failedOutcome = await failing.viewModel.saveSessionDetailed(for: failing.tabID)
+        failing.viewModel.test_saveSessionBeforeWriteHook = nil
+        await failing.viewModel.test_dataService.test_setSessionWriteFailureInjector(nil)
+        XCTAssertTrue(failedOutcome.didWriteDurably, "The committed creation is never reported as not written")
+        XCTAssertFalse(failedOutcome.isCleanSuccess, "The failed write is not a clean projection")
+        XCTAssertTrue(failing.session.isDirty, "The projection stays dirty")
+        XCTAssertNotNil(failing.session.persistenceState(for: failingID), "The creator keeps its authority")
+        let createdBeforeFailure = try await failing.viewModel.test_dataService.loadAgentSession(id: failingID, for: failing.workspace)
+        XCTAssertTrue(
+            try XCTUnwrap(createdBeforeFailure).toLiveItems().contains { $0.text == "created before the full write failed" },
+            "The durable outcome names content the creation actually committed"
+        )
+        let retried = await failing.viewModel.flushSave(for: failing.tabID)
+        XCTAssertTrue(retried, "A later save writes normally under the created incarnation")
+    }
+
+    func testFreshScheduleInstallRollsBackWhenTheTabIsReboundDuringCreation() async throws {
+        let harness = try await makeHarness(windowID: 4386)
+        let replacementID = UUID()
+        let rebinds = DispatchProbe()
+        // The creation commits and is adopted; the tab is rebound before the full write.
+        harness.viewModel.test_saveSessionBeforeWriteHook = { [harness, rebinds] held in
+            guard rebinds.startCount == 0 else { return }
+            rebinds.startCount += 1
+            _ = harness.viewModel.test_installPersistentSessionBinding(sessionID: replacementID, on: held)
+        }
+        let install = await harness.viewModel.installScheduledSend(
+            text: "Rebound during creation",
+            on: harness.session,
+            notBefore: Date().addingTimeInterval(600),
+            runAlongsideOtherSessions: false,
+            isNewSessionStart: false
+        )
+        harness.viewModel.test_saveSessionBeforeWriteHook = nil
+        XCTAssertEqual(rebinds.startCount, 1, "The tab was rebound after the durable creation")
+        if case .success = install {
+            XCTFail("A schedule is never kept on a tab rebound away from its created session")
+        }
+        XCTAssertEqual(harness.session.activeAgentSessionID, replacementID)
+        XCTAssertNil(harness.session.scheduledSend, "Rolled back: the replacement session never carries the schedule")
+        XCTAssertNil(harness.session.scheduledSendWorkspaceID)
+    }
+
+    func testRestoredBindingToADeletedSessionIsReleasedInsteadOfBecomingAnUnsaveableCreator() async throws {
+        let owner = try await makeHarness(windowID: 4381)
+        let sessionID = try XCTUnwrap(owner.viewModel.ensureSessionBoundToTab(owner.session))
+        owner.session.appendItem(.user("history that was deleted"))
+        owner.session.isDirty = true
+        let ownerSaved = await owner.viewModel.flushSave(for: owner.tabID)
+        XCTAssertTrue(ownerSaved)
+        try await owner.viewModel.test_dataService.deleteAgentSession(id: sessionID, for: owner.workspace)
+
+        // Restart inside the crash window: the tombstone committed, the workspace unbind did not.
+        let restored = try await makeHarness(windowID: 4382, workspace: owner.workspace, storageURL: owner.storageURL)
+        XCTAssertNotNil(restored.viewModel.test_installPersistentSessionBinding(sessionID: sessionID, on: restored.session))
+        let outcome = await restored.viewModel.hydrateMaterializedRemoteSession(restored.session)
+        XCTAssertEqual(outcome, .rejected, "A deleted UUID is never adopted as a genuine creator")
+        XCTAssertFalse(restored.session.hasLoadedPersistedState)
+        XCTAssertNotEqual(restored.session.persistedLoadDisposition, .noPayload)
+        XCTAssertNil(restored.session.persistenceState(for: sessionID))
+        try await waitUntil("the existing deletion cleanup released the deleted binding") {
+            restored.viewModel.sessions[restored.tabID] == nil
+        }
+
+        // The tab is usable again under a fresh identity; the deleted UUID is never recreated.
+        let fresh = try await restored.viewModel.ensureSessionReady(tabID: restored.tabID)
+        XCTAssertFalse(fresh === restored.session)
+        let freshID = try XCTUnwrap(restored.viewModel.ensureSessionBoundToTab(fresh))
+        XCTAssertNotEqual(freshID, sessionID)
+        fresh.appendItem(.user("typed after the restart"))
+        fresh.isDirty = true
+        let freshSaved = await restored.viewModel.flushSave(for: restored.tabID)
+        XCTAssertTrue(freshSaved, "The released tab saves durably again")
+        let deleted = try await restored.viewModel.test_dataService.loadAgentSession(id: sessionID, for: restored.workspace)
+        XCTAssertNil(deleted, "The deleted session stays deleted")
+    }
+
     func testMaterializedRemoteHydrationRejectsRebindDuringHeldLoadWithoutDeclaringLoaded() async throws {
         let harness = try await makeHarness(windowID: 4373)
         let existingID = UUID()
@@ -2908,6 +3058,8 @@ final class AgentScheduledSendDispatchTests: XCTestCase {
 private struct DispatchWaitTimeout: Error {}
 
 private struct InjectedDispatchRecoveryFailure: Error {}
+
+private struct InjectedSecondWriteFailure: Error {}
 
 private struct InjectedResyncReadFailure: Error {}
 

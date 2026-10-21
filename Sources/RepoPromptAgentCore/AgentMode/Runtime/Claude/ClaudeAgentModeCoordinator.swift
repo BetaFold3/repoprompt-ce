@@ -145,6 +145,23 @@ package final class ClaudeAgentModeCoordinator {
     private var controllerEffortEvidenceByTabID: [UUID: ControllerEffortEvidence] = [:]
     private var preparationByTabID: [UUID: JoinablePreparation] = [:]
     private var dispatchReservationByTabID: [UUID: DispatchReservation] = [:]
+    /// Written user messages awaiting the provider's affirmative evidence (their own turn's
+    /// `turnCompleted(.completed)` from the controller that wrote them), keyed by the controller
+    /// turn ID returned by the write. An entry outlives its run attempt (a late completion still
+    /// refines that same delivery attempt) but never the writing controller's event delivery: it
+    /// ends at the turn's own completion, when no router can deliver that controller's events
+    /// any more, when the controller is gone, or at `stop()`.
+    private var dispatchHandoffsByTurnID: [UUID: WrittenDispatchHandoff] = [:]
+
+    private struct WrittenDispatchHandoff {
+        let tabID: UUID
+        let runAttemptID: UUID?
+        let handoff: AgentProviderHandoff
+        /// The controller that performed the write. Weak: evidence never keeps a process alive,
+        /// and a deallocated controller can emit nothing more for this turn.
+        weak var controller: AnyObject?
+    }
+
     private var controllerRetirementGenerationByTabID: [UUID: UUID] = [:]
     private var fallbackReplacementClaimByTabID: [UUID: FallbackReplacementClaim] = [:]
     private var privateFallbackControllerByTabID: [UUID: TrackedPrivateFallbackController] = [:]
@@ -256,6 +273,10 @@ package final class ClaudeAgentModeCoordinator {
         preparationByTabID.values.forEach { $0.task.cancel() }
         preparationByTabID.removeAll()
         dispatchReservationByTabID.removeAll()
+        // No controller event is processed after stop: written messages stay delivery-unknown.
+        let writtenHandoffs = dispatchHandoffsByTurnID.values.map(\.handoff)
+        dispatchHandoffsByTurnID.removeAll()
+        writtenHandoffs.forEach { $0.settleIfUnresolved() }
         controllerEffortEvidenceByTabID.removeAll()
         if let viewModel {
             for session in viewModel.sessions.values {
@@ -1596,13 +1617,108 @@ package final class ClaudeAgentModeCoordinator {
         )
     }
 
+    /// Records the provider's terminal evidence for a written user message. Only the turn's own
+    /// `.completed` result is affirmative acceptance; cancelled/failed results (including ones the
+    /// controller synthesizes on process exit) leave delivery unknown. Called before any other
+    /// handling of the completion.
+    ///
+    /// The completion must come from the controller that wrote the turn (`isEmittedBy` is asked
+    /// about that controller), so it applies only to that same captured turn and delivery
+    /// attempt, never to a successor. It is honored even after the turn's run attempt finalized
+    /// and recorded uncertainty: a late `.completed` refines `deliveryUnknown` to accepted.
+    func noteClaudeTurnCompleted(
+        turnID: UUID,
+        status: NativeAgentRuntimeTurnStatus,
+        isEmittedBy: (AnyObject) -> Bool
+    ) {
+        guard let written = dispatchHandoffsByTurnID[turnID] else { return }
+        guard let writer = written.controller else {
+            // The writing controller is gone; nothing more can arrive for this turn.
+            dispatchHandoffsByTurnID.removeValue(forKey: turnID)
+            written.handoff.settleIfUnresolved()
+            return
+        }
+        guard isEmittedBy(writer) else { return }
+        dispatchHandoffsByTurnID.removeValue(forKey: turnID)
+        switch status {
+        case .completed:
+            written.handoff.noteAccepted()
+        case .cancelled, .failed:
+            written.handoff.noteDeliveryUnknown()
+        }
+    }
+
+    /// A run attempt ended: written messages of that attempt without their turn's completion
+    /// become delivery-unknown (never retryable drafts). They stay associated with their turn so
+    /// a late completion from the same controller can still prove acceptance.
+    func settleWrittenDispatchHandoffs(tabID: UUID, runAttemptID: UUID) {
+        for written in dispatchHandoffsByTurnID.values
+            where written.tabID == tabID && written.runAttemptID == runAttemptID
+        {
+            written.handoff.settleIfUnresolved()
+        }
+    }
+
+    /// An event router of `tabID` finished: no further events can be delivered from controllers
+    /// for which `isStillDeliverable` is false. Their written messages end tracking as
+    /// delivery-unknown; entries of deallocated controllers end too.
+    func releaseWrittenDispatchHandoffs(
+        tabID: UUID,
+        isStillDeliverable: (AnyObject) -> Bool
+    ) {
+        let released = dispatchHandoffsByTurnID.filter { _, written in
+            guard written.tabID == tabID else { return false }
+            guard let writer = written.controller else { return true }
+            return !isStillDeliverable(writer)
+        }
+        for (turnID, written) in released {
+            dispatchHandoffsByTurnID.removeValue(forKey: turnID)
+            written.handoff.settleIfUnresolved()
+        }
+    }
+
+    #if DEBUG
+        var test_writtenDispatchHandoffCount: Int {
+            dispatchHandoffsByTurnID.count
+        }
+    #endif
+
+    /// Errors the Claude controller throws before writing the user message (see
+    /// `ClaudeNativeProcessSessionController.sendUserMessage`). Any other error is ambiguous.
+    private static func sendErrorProvesNoWrite(_ error: Error) -> Bool {
+        guard let controllerError = error as? NativeAgentRuntimeControllerError else { return false }
+        switch controllerError {
+        case .processNotRunning, .initializationFailed:
+            return true
+        default:
+            return false
+        }
+    }
+
+    /// The central Claude native send seam. `handoff` carries the input's committed dispatch
+    /// evidence: every return before the controller write reports no handoff; a write that the
+    /// controller proves never happened reports no handoff; any other write outcome stays
+    /// uncertain until the turn's own completion (`noteClaudeTurnCompleted`). A successful write
+    /// is not acceptance.
     @discardableResult
     func sendClaudeNativeMessage(
         session: AgentTabSession,
         text: String,
-        attachments _: [AgentImageAttachment]
+        attachments _: [AgentImageAttachment],
+        handoff: AgentProviderHandoff
     ) async -> Bool {
+        defer {
+            if !handoff.handoffStarted {
+                handoff.noteNoHandoff()
+            }
+        }
         guard dispatchReservationByTabID[session.tabID] == nil else {
+            return false
+        }
+        // The handoff was recorded against an exact run attempt; never send it under another.
+        if let expectedRunAttemptID = handoff.runAttemptID,
+           session.activeRunAttemptID != expectedRunAttemptID
+        {
             return false
         }
         let dispatchRunID = session.runID ?? UUID()
@@ -1627,6 +1743,16 @@ package final class ClaudeAgentModeCoordinator {
         handler.resetTurnState(for: session)
         viewModel?.setAgentRunActive(session.tabID, isActive: true)
         viewModel?.requestUIRefresh(tabID: session.tabID, urgent: true)
+
+        // Durable run-start input (adopted plan §5): provider text whose pending-handoff prefix
+        // (e.g. a resume-recovery handoff staged by the session preparation below) was attached to
+        // the still-queued carrier before its dispatch commit. Set once, at that commit.
+        var committedDurableText: String?
+        func blockDurableSend(_ failure: AgentProviderHandoff.CommitFailure) -> Bool {
+            handoff.blockBeforeHandoff(failure)
+            session.appendItem(.error(failure.userText, sequenceIndex: session.nextSequenceIndex))
+            return false
+        }
 
         for _ in 0 ..< 3 {
             let preparationReady = await ensureClaudeNativeSessionReadiness(session: session)
@@ -1796,6 +1922,40 @@ package final class ClaudeAgentModeCoordinator {
                 }
             }
 
+            // Deferred durable dispatch commit, after every preparation above that can create the
+            // pending-handoff prefix: stage it, attach its exact snapshot to the queued carrier,
+            // then commit. If that cannot be completed the send is blocked with its input saved —
+            // never sent without its handoff.
+            // Untracked input commits too (nothing is written for it) and keeps legacy staging at the
+            // write below.
+            if !handoff.isCommitted {
+                var durableText = text
+                if handoff.isDurable {
+                    // Without a host nothing can stage a prefix (`.none`); the late-payload check
+                    // below still guards the write.
+                    switch await viewModel?.stagePendingHandoffForDurableDispatch(text, session: session) ?? .none {
+                    case .none:
+                        break
+                    case let .staged(staged, snapshot):
+                        durableText = staged.text
+                        handoff.carryStagedInput(AgentCarriedStagedInput(pendingHandoffStage: staged.pendingHandoffStage))
+                        handoff.notePendingHandoff(snapshot)
+                    case .failed:
+                        return blockDurableSend(.pendingHandoffNotSaved)
+                    }
+                }
+                if case let .failure(failure) = await handoff.commitDispatch(session: session) {
+                    return blockDurableSend(failure)
+                }
+                committedDurableText = durableText
+                guard dispatchReservationIsCurrent(dispatchReservation, for: session) else {
+                    return false
+                }
+                guard sessionOwnsClaudeController(controller, for: session) else {
+                    continue
+                }
+            }
+
             // This is the final launch-settings validation before dispatch. There is
             // intentionally no suspension between this check and sendUserMessage, so a
             // Safe Managed tightening cannot enqueue a turn on the stale controller.
@@ -1824,18 +1984,42 @@ package final class ClaudeAgentModeCoordinator {
                 return false
             }
             do {
-                let outboundText: String = if let viewModel {
-                    viewModel.prependPendingHandoffIfNeeded(text, session: session)
+                let outboundText: String
+                if handoff.isDurable {
+                    // Durable input carries exactly the prefix its intent records. A handoff payload
+                    // that preparation created after this input's commit (late bootstrap, e.g. a
+                    // controller recycled after the commit) would send it without the history it
+                    // needs: blocked, with its input saved.
+                    guard !handoff.pendingHandoffCreatedAfterCommit(in: session) else {
+                        return blockDurableSend(.pendingHandoffAfterCommit)
+                    }
+                    outboundText = committedDurableText ?? text
+                } else if let viewModel {
+                    // Untracked input: a recovery handoff staged during session preparation rides
+                    // on this write; this handoff then settles exactly that stage.
+                    let staged = viewModel.stagePendingHandoffIfNeeded(text, session: session)
+                    outboundText = staged.text
+                    handoff.carryStagedInput(AgentCarriedStagedInput(pendingHandoffStage: staged.pendingHandoffStage))
                 } else {
-                    text
+                    outboundText = text
                 }
                 let instructions = agentModeInstructionInjection(for: session)
                 let providerBoundText = providerBoundUserMessage(outboundText, instructions: instructions)
+                guard handoff.enterProviderBoundary(in: session) else { return false }
                 let turnID = try await controller.sendUserMessage(providerBoundText)
+                // Written: track until the turn's own completion proves acceptance.
+                dispatchHandoffsByTurnID[turnID] = WrittenDispatchHandoff(
+                    tabID: session.tabID,
+                    runAttemptID: dispatchReservation.runAttemptID,
+                    handoff: handoff,
+                    controller: controller as AnyObject
+                )
                 guard dispatchReservationIsCurrent(dispatchReservation, for: session) else {
+                    handoff.noteDeliveryUnknown()
                     return false
                 }
                 guard sessionOwnsClaudeController(controller, for: session) else {
+                    handoff.noteDeliveryUnknown()
                     await shutdownClaudeControllerIfUnowned(controller, by: session)
                     return false
                 }
@@ -1845,6 +2029,13 @@ package final class ClaudeAgentModeCoordinator {
                 // through the session-owned seam; nothing is registered from here.
                 return true
             } catch {
+                if !handoff.handoffStarted {
+                    handoff.noteNoHandoff(message: error.localizedDescription)
+                } else if Self.sendErrorProvesNoWrite(error) {
+                    handoff.noteProvenNotWritten(message: error.localizedDescription)
+                } else {
+                    handoff.noteDeliveryUnknown()
+                }
                 guard dispatchReservationIsCurrent(dispatchReservation, for: session) else {
                     return false
                 }

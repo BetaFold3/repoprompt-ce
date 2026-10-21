@@ -1,6 +1,7 @@
 import Combine
 import Foundation
 import os
+import RepoPromptAgentCore
 import RepoPromptUI
 import RepoPromptWorkspace
 import SwiftUI
@@ -1929,6 +1930,54 @@ class WorkspaceManagerViewModel: ObservableObject {
             print("Failed to load workspaceIndex.json: \(error)")
             return []
         }
+    }
+
+    // MARK: - Recovery inventory (lossless restart Phase 1b)
+
+    /// The workspace storage root startup recovery inventories: the configured global custom
+    /// location, else the default root (the same resolution as `currentBaseRoot`).
+    nonisolated static func recoveryInventoryBaseRoot() -> URL {
+        UserDefaults.standard.string(forKey: "GlobalCustomStorageURL").map { URL(fileURLWithPath: $0) }
+            ?? defaultWorkspaceRoot()
+    }
+
+    /// Failure-reporting workspace inventory for startup recovery, beside the convenience loaders
+    /// (which silently drop unreadable data). Read only: nothing is created, normalized, or saved.
+    /// A missing index is an empty inventory (no workspace was ever saved); an unreadable index
+    /// throws `AgentRecoveryInventoryIndexFailure` because the global scope cannot be established.
+    /// An entry whose ID repeats is a scoped failure for that workspace.
+    nonisolated static func loadRecoveryWorkspaceInventory(
+        baseRoot: URL = recoveryInventoryBaseRoot()
+    ) throws -> AgentRecoveryWorkspaceInventory {
+        let indexURL = baseRoot.appendingPathComponent("workspacesIndex.json")
+        guard FileManager.default.fileExists(atPath: indexURL.path) else { return .empty }
+        let entries: [WorkspaceIndexEntry]
+        do {
+            entries = try JSONDecoder().decode([WorkspaceIndexEntry].self, from: Data(contentsOf: indexURL))
+        } catch {
+            throw AgentRecoveryInventoryIndexFailure(reason: String(describing: error))
+        }
+        var workspaces: [AgentRecoveryWorkspaceDestination] = []
+        var failures: [AgentRecoveryWorkspaceInventory.Failure] = []
+        let counts = Dictionary(entries.map { ($0.id, 1) }, uniquingKeysWith: +)
+        for entry in entries {
+            guard counts[entry.id] == 1 else {
+                if !failures.contains(where: { $0.workspaceID == entry.id }) {
+                    failures.append(AgentRecoveryWorkspaceInventory.Failure(
+                        workspaceID: entry.id,
+                        location: indexURL.path,
+                        reason: "The workspace index lists this workspace more than once."
+                    ))
+                }
+                continue
+            }
+            workspaces.append(AgentRecoveryWorkspaceDestination(
+                id: entry.id,
+                name: entry.name,
+                customStoragePath: entry.customStoragePath
+            ))
+        }
+        return AgentRecoveryWorkspaceInventory(workspaces: workspaces, failures: failures)
     }
 
     private func saveWorkspaceIndex(_ entries: [WorkspaceIndexEntry]) throws {

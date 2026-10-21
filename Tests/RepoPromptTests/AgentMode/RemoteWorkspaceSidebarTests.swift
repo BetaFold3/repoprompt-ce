@@ -741,7 +741,8 @@ final class RemoteWorkspaceSidebarTests: XCTestCase {
 
         let outcome = await fixture.viewModel.startAgentRun(
             tabID: session.tabID,
-            initialMessage: "Run this locally"
+            initialMessage: "Run this locally",
+            inputConstituents: nil
         )
         XCTAssertTrue(outcome?.didSend == true, String(describing: outcome))
         XCTAssertTrue(fixture.lifecycleRecorder.events.contains("codex:send"))
@@ -1003,7 +1004,7 @@ final class RemoteWorkspaceSidebarTests: XCTestCase {
         fixture.coordinator.test_installController(controller, for: session, hostID: fixture.host.id)
         fixture.viewModel.interviewFirst = true
 
-        _ = fixture.viewModel.submitUserTurn(text: "Actually dispatched text", tabID: session.tabID)
+        _ = fixture.viewModel.submitUserTurn(text: "Actually dispatched text", tabID: session.tabID, codexAttemptID: nil, admitted: nil)
         await waitUntil {
             session.items.contains { $0.kind == .user && $0.isUndeliveredRemoteSend }
         }
@@ -1757,7 +1758,7 @@ final class RemoteWorkspaceSidebarTests: XCTestCase {
             hostID: fixture.host.id
         )
 
-        _ = fixture.viewModel.submitUserTurn(text: "Quit while picker open", tabID: session.tabID)
+        _ = fixture.viewModel.submitUserTurn(text: "Quit while picker open", tabID: session.tabID, codexAttemptID: nil, admitted: nil)
         await waitUntil {
             guard fixture.viewModel.pendingRemoteStartWindowPicker != nil,
                   let userItem = session.items.first(where: {
@@ -1850,7 +1851,9 @@ final class RemoteWorkspaceSidebarTests: XCTestCase {
         XCTAssertEqual(selectedPersistedPayload.windowID, 61)
         XCTAssertEqual(selectedPersistedPayload.workspaceID, "workspace-selected")
         XCTAssertEqual(selectedLoaded.locallyAttributedStartItemID, attributedItemID)
-        XCTAssertEqual(selectedLoaded.lastRunState, AgentSessionRunState.idle.rawValue)
+        // F-7: a same-launch read keeps the live owner's saved active run; the cold hydration below
+        // restores it.
+        XCTAssertEqual(selectedLoaded.lastRunState, AgentSessionRunState.running.rawValue)
 
         let selectedHydrationRequest = AgentSessionHydrationRequest(
             workspace: workspace,

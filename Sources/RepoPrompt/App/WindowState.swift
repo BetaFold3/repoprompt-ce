@@ -109,9 +109,10 @@ class WindowState: ObservableObject {
     private static let sharedMCPService = MCPService()
 
     /// App-level scheduled-send admission coordinator shared by every window (plan §3.2).
-    /// Wiring only: hosts register here; the coordinator arms timers and issues leases.
+    /// Wiring only: hosts register here; the coordinator arms timers and issues leases. Owned by
+    /// the recovery composition, which creates it closed until recovery startup is ready.
     private static let sharedScheduledSendCoordinator: AgentScheduledSendCoordinator = {
-        let coordinator = AgentScheduledSendCoordinator()
+        let coordinator = AgentRecoveryAppComposition.shared.scheduler
         _ = NSWorkspace.shared.notificationCenter.addObserver(
             forName: NSWorkspace.didWakeNotification,
             object: nil,

@@ -1,5 +1,26 @@
 import Foundation
 
+/// The run's input could not be associated with its run attempt before the provider handoff; the
+/// provider was not invoked and the input's intent is back in `queued`.
+private enum HeadlessHandoffError: LocalizedError {
+    case deliveryNotRecorded
+    /// The dispatching lane retired or froze for reset after the dispatch commit (R06).
+    case sessionChangedBeforeHandoff
+    /// The deferred dispatch commit (adopted plan §5) could not be completed; nothing was sent.
+    case dispatchNotCommitted(AgentProviderHandoff.CommitFailure)
+
+    var errorDescription: String? {
+        switch self {
+        case .deliveryNotRecorded:
+            "This message was not sent because its delivery could not be recorded. It stays saved."
+        case .sessionChangedBeforeHandoff:
+            AgentProviderHandoff.sessionChangedBeforeHandoffMessage
+        case let .dispatchNotCommitted(failure):
+            failure.userText
+        }
+    }
+}
+
 @MainActor
 final class HeadlessAgentModeRunner {
     private let headlessProviderFactory: AgentHeadlessProviderFactory
@@ -22,9 +43,16 @@ final class HeadlessAgentModeRunner {
         initialUserMessage: String,
         initialMessageForRun: String,
         attachments: [AgentImageAttachment],
-        makeLease: (_ runID: UUID) -> MCPBootstrapLease,
-        delegatedQuestionStageID: UUID? = nil
+        handoff: AgentProviderHandoff,
+        makeLease: (_ runID: UUID) -> MCPBootstrapLease
     ) async {
+        // The run task owns the handoff once created; every earlier exit never reached the provider.
+        var runTaskOwnsHandoff = false
+        defer {
+            if !runTaskOwnsHandoff {
+                handoff.settleRunInputScope()
+            }
+        }
         let attachmentReservationID = hooks.reserveAttachmentsForTurn(attachments, session)
 
         if initialMessageForRun != initialUserMessage,
@@ -120,7 +148,9 @@ final class HeadlessAgentModeRunner {
             }
         }
 
+        runTaskOwnsHandoff = true
         session.agentTask = Task { [weak self, weak session] in
+            defer { handoff.settleRunInputScope() }
             guard let self, let session else { return }
             await withTaskCancellationHandler {
                 let acquired = await lease.acquire()
@@ -129,8 +159,8 @@ final class HeadlessAgentModeRunner {
                         session: session,
                         runID: runID,
                         ownership: ownership,
-                        attachmentReservationID: attachmentReservationID,
-                        delegatedQuestionStageID: delegatedQuestionStageID
+                        handoff: handoff,
+                        attachmentReservationID: attachmentReservationID
                     )
                     return
                 }
@@ -148,10 +178,10 @@ final class HeadlessAgentModeRunner {
                     runID: runID,
                     runAttemptID: runAttemptID,
                     ownership: ownership,
+                    handoff: handoff,
                     attachments: attachments,
                     attachmentReservationID: attachmentReservationID,
-                    lease: lease,
-                    delegatedQuestionStageID: delegatedQuestionStageID
+                    lease: lease
                 )
             } onCancel: {}
         }
@@ -161,11 +191,12 @@ final class HeadlessAgentModeRunner {
         session: AgentTabSession,
         runID: UUID,
         ownership: AgentRunOwnership,
-        attachmentReservationID: UUID?,
-        delegatedQuestionStageID: UUID?
+        handoff: AgentProviderHandoff,
+        attachmentReservationID: UUID?
     ) async {
-        hooks.recordPendingHandoffSendOutcome(session, false)
-        hooks.recordDelegatedQuestionNoticeSendOutcome(session, delegatedQuestionStageID, false)
+        // Never reached the provider: release the staged input before the terminal commit.
+        handoff.noteNoHandoff()
+        hooks.recordStagedInputSendOutcome(handoff: handoff, sent: false)
         await terminalCommitBarrier.commit(.init(
             session: session,
             ownership: ownership,
@@ -192,19 +223,50 @@ final class HeadlessAgentModeRunner {
         runID: UUID,
         runAttemptID: UUID,
         ownership: AgentRunOwnership,
+        handoff: AgentProviderHandoff,
         attachments: [AgentImageAttachment],
         attachmentReservationID: UUID?,
-        lease: MCPBootstrapLease,
-        delegatedQuestionStageID: UUID?
+        lease: MCPBootstrapLease
     ) async {
         var providerInitializationCompleted = false
         do {
             await lease.providerInitializationStarted(provider: session.selectedAgent.rawValue)
+            // The input's delivery attempts are attached to this run attempt before the provider
+            // is invoked; then the exact attempt must still own the session.
+            if case let .failure(failure) = await handoff.attachRunAttempt(
+                ownership: ownership,
+                processRunID: runID,
+                session: session
+            ) {
+                handoff.noteNoHandoff(message: "run attempt not recorded: \(failure)")
+                throw HeadlessHandoffError.deliveryNotRecorded
+            }
+            // Deferred dispatch commit (no bootstrap on this route creates a pending-handoff prefix;
+            // a payload created after the commit still blocks the send).
+            var commitFailure: AgentProviderHandoff.CommitFailure?
+            if case let .failure(failure) = await handoff.commitDispatch(session: session) {
+                commitFailure = failure
+            } else if handoff.pendingHandoffCreatedAfterCommit(in: session) {
+                commitFailure = .pendingHandoffAfterCommit
+            }
+            if let commitFailure {
+                handoff.blockBeforeHandoff(commitFailure)
+                throw HeadlessHandoffError.dispatchNotCommitted(commitFailure)
+            }
+            guard !Task.isCancelled, session.isCurrentRunAttempt(ownership, expectedRunID: runID) else {
+                handoff.noteNoHandoff()
+                throw CancellationError()
+            }
+            // Stream creation is the handoff boundary, not acceptance. Final ownership check with no
+            // suspension before the provider call.
+            guard handoff.enterProviderBoundary(in: session) else {
+                throw HeadlessHandoffError.sessionChangedBeforeHandoff
+            }
             let stream = try await provider.streamAgentMessage(initialMessage, runID: runID)
             providerInitializationCompleted = true
             await lease.providerInitializationCompleted(provider: session.selectedAgent.rawValue, outcome: "ready")
-            hooks.recordPendingHandoffSendOutcome(session, true)
-            hooks.recordDelegatedQuestionNoticeSendOutcome(session, delegatedQuestionStageID, true)
+            // Stream creation is the headless stage-delivery boundary (not acceptance).
+            hooks.recordStagedInputSendOutcome(handoff: handoff, sent: true)
             hooks.stageConsumedAttachmentFilesForDeferredCleanup(attachments, session)
             hooks.markAttachmentsConsumed(session, attachmentReservationID)
             _ = await lease.releaseWhenRouted()
@@ -213,6 +275,13 @@ final class HeadlessAgentModeRunner {
             }
 
             for try await result in stream {
+                // Model output is the provider's affirmative evidence; record it before anything
+                // that could end this loop.
+                if handoff.observation != .accepted,
+                   AgentProviderHandoff.streamResultProvesProviderAcceptance(result)
+                {
+                    handoff.noteAccepted()
+                }
                 guard !Task.isCancelled else { break }
                 guard session.isCurrentRunAttempt(ownership, expectedRunID: runID) else { return }
                 session.recordRunProgress(ownership: ownership, kind: .providerEvent, stage: .running)
@@ -246,9 +315,9 @@ final class HeadlessAgentModeRunner {
             if !providerInitializationCompleted {
                 await lease.providerInitializationCompleted(provider: session.selectedAgent.rawValue, outcome: "cancelled")
             }
-            hooks.recordPendingHandoffSendOutcome(session, false)
-            // No-op once the stream started (that stage already committed).
-            hooks.recordDelegatedQuestionNoticeSendOutcome(session, delegatedQuestionStageID, false)
+            // No-op once the stream started (that stage already committed). Stream creation that
+            // failed after the boundary was entered leaves durable input uncertain: held.
+            hooks.recordStagedInputSendOutcome(handoff: handoff, sent: false)
             await terminalCommitBarrier.commit(.init(
                 session: session,
                 ownership: ownership,
@@ -270,8 +339,7 @@ final class HeadlessAgentModeRunner {
             if !providerInitializationCompleted {
                 await lease.providerInitializationCompleted(provider: session.selectedAgent.rawValue, outcome: "failed")
             }
-            hooks.recordPendingHandoffSendOutcome(session, false)
-            hooks.recordDelegatedQuestionNoticeSendOutcome(session, delegatedQuestionStageID, false)
+            hooks.recordStagedInputSendOutcome(handoff: handoff, sent: false)
             await terminalCommitBarrier.commit(.init(
                 session: session,
                 ownership: ownership,

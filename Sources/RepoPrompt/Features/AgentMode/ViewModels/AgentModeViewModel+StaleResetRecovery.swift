@@ -148,6 +148,7 @@ extension AgentModeViewModel {
         cancelPersistedLoad(for: session)
         // Authority is dropped; the incarnation ID is kept so no creation path can ever target it.
         session.persistenceState = nil
+        recoveryPersistenceStateDidChange(for: session)
         session.clearCurrentBindingHydration()
         session.hasLoadedPersistedState = false
         session.isDirty = true

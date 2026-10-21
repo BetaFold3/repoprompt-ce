@@ -1,0 +1,2026 @@
+import Foundation
+
+// Lossless-restart Phase 1b production composition (spec R1, R2, R8). Constructed once by the App's
+// `AgentRecoveryAppComposition` (mandatory admission, startup before scheduler admission opens);
+// XCTest processes compose it explicitly with temporary stores.
+//
+// Ownership: one app-scoped coordinator owns one store, the DataService that gates it, the launch
+// mark and startup barrier, crash holds, and exactly one live `AgentRecoverySessionLane` (one
+// composer controller) per durable session. Lock order stays DataService gate -> recovery store.
+
+package extension Notification.Name {
+    /// A tracked delivery-evidence write of a session lane finished. `object`: the
+    /// `AgentRecoverySessionLane`; `userInfo`: `sessionID`. A wake-up only: observers re-read the
+    /// durable record, which stays the authority.
+    static let agentRecoveryDeliveryEvidenceDidSettle = Notification.Name("AgentRecoverySessionLane.deliveryEvidenceDidSettle")
+}
+
+// MARK: - Composition errors
+
+package enum AgentRecoveryCompositionError: Error, Equatable {
+    /// The DataService validates gates and discovery against a different recovery store.
+    case dataServiceStoreMismatch
+}
+
+// MARK: - Admission carrier
+
+/// Immutable runtime admission carrier (not persisted). Identities are allocated once at input
+/// admission and carried unchanged through preparation, queues, runners, and callbacks. `original`
+/// is the user's input before optimistic clearing or provider-text augmentation.
+package struct AgentRecoveryAdmission: Equatable {
+    package let binding: AgentRecoveryLifecycleBinding
+    package let intentID: UUID
+    package let userItemID: UUID
+    package let origin: AgentRecoveryIntentOrigin
+    package let target: AgentRecoveryIntentTarget
+    package let original: AgentRecoveryInputContent
+    package let scheduleReference: AgentRecoveryScheduleReference?
+    /// The pending handoff this input's send prepends, captured (with its fenced payload ID) before
+    /// admission and committed with the intent, so the exact prefix is durable before any handoff.
+    package let pendingHandoff: AgentRecoveryPendingHandoffSnapshot?
+
+    package init(
+        binding: AgentRecoveryLifecycleBinding,
+        intentID: UUID = UUID(),
+        userItemID: UUID,
+        origin: AgentRecoveryIntentOrigin,
+        target: AgentRecoveryIntentTarget,
+        original: AgentRecoveryInputContent,
+        scheduleReference: AgentRecoveryScheduleReference? = nil,
+        pendingHandoff: AgentRecoveryPendingHandoffSnapshot? = nil
+    ) {
+        self.binding = binding
+        self.intentID = intentID
+        self.userItemID = userItemID
+        self.origin = origin
+        self.target = target
+        self.original = original
+        self.scheduleReference = scheduleReference
+        self.pendingHandoff = pendingHandoff
+    }
+
+    package var submission: AgentRecoveryIntentSubmission {
+        AgentRecoveryIntentSubmission(
+            intentID: intentID,
+            userItemID: userItemID,
+            origin: origin,
+            target: target,
+            payload: original,
+            scheduleReference: scheduleReference,
+            pendingHandoff: pendingHandoff
+        )
+    }
+}
+
+/// A committed admission: the carrier, its store-issued receipt (never provider acceptance), and
+/// the composer revision it consumed, if it came from the composer.
+package struct AgentRecoveryAdmitted<Receipt: Equatable & Sendable>: Equatable {
+    package let admission: AgentRecoveryAdmission
+    package let receipt: Receipt
+    package let submittedComposerRevision: AgentRecoveryComposerRevision?
+}
+
+/// Why admission was refused before any durable write. Every refusal is fail-closed.
+package enum AgentRecoveryAdmissionRefusal: Error, Equatable {
+    /// Startup has not completed (or was never started): admission stays closed.
+    case startupNotReady
+    case startupFailed(String)
+    /// The session or its workspace is restricted by startup results (unknown recovery status,
+    /// duplicate destinations, an unreadable workspace, or a held schedule transfer).
+    case restricted(String)
+    /// An uncertain previous-launch attempt for this session awaits explicit confirmation.
+    case crashHeld(AgentRecoveryCrashHold)
+    case laneRetired
+    case bindingMismatch
+    /// The composer could not be restored, so its submission has no safe revision.
+    case composerUnavailable(AgentRecoveryControllerFailure)
+    /// Input without durable admission reached a dispatch while admission is mandatory (or mixed
+    /// with durable constituents). Never dispatched as legacy input.
+    case untrackedInput
+    /// A retired predecessor lane left composer input it could not persist; new admissions wait
+    /// for its explicit resolution (`resolveUnsavedPredecessorInput`).
+    case unsavedPredecessorInput
+    /// A transcript reset is preparing this lane (preserving its composer before the generation
+    /// advances); admission reopens if the reset is vetoed, or under the successor lane.
+    case resetPreparationInProgress
+}
+
+/// Why a transcript reset was vetoed before the generation advanced. The old lane and its live
+/// input are left untouched; nothing was carried into, or written under, a new generation.
+package enum AgentRecoveryResetPreparationFailure: Error, Equatable {
+    case laneRetired
+    case alreadyPreparing
+    /// The latest composer could not be written under the current generation (or its baseline
+    /// could not be learned); the controller's failure when known.
+    case composerNotPersisted(AgentRecoveryControllerFailure?)
+    /// The live composer holds content not yet representable durably (for example an image
+    /// awaiting promotion into managed storage).
+    case unrepresentableComposerInput
+    /// A retired predecessor's input is retained only in memory and awaits explicit resolution.
+    case unsavedPredecessorInput
+    /// The composer kept changing while it was being preserved; retry the reset.
+    case composerChangedDuringPreparation
+}
+
+/// Why composer input that had no lane yet (first draft of a new tab, or content awaiting image
+/// promotion) could not be handed to a lane. The obligation and its payload stay visible.
+package enum AgentRecoveryComposerPreparationFailure: Error, Equatable {
+    /// Durable session authority could not be established (creation refused, conflict, no context).
+    case authorityUnavailable(String)
+    /// The owner was replaced or rebound while preparing; nothing is written into the replacement.
+    case ownerReplaced
+    /// An attached image could not be imported into managed recovery storage. The live attachment
+    /// is kept.
+    case imagePromotionFailed(String)
+}
+
+/// Composer input owed to disk that cannot be forwarded to a lane yet. Holds the earliest first
+/// unsaved instant on the coordinator's absolute clock; forwarding passes it on so preparation
+/// (authority creation, image promotion, restore) never restarts the 2-second bound. One
+/// preparation task per owner; later mutations coalesce into the same obligation.
+@MainActor
+package final class AgentRecoveryComposerPreparation {
+    package let firstUnsavedAt: ContinuousClock.Instant
+    /// Latest representable content (`nil` while it still references unpromoted images).
+    package fileprivate(set) var latestContent: AgentRecoveryInputContent?
+    package fileprivate(set) var failure: AgentRecoveryComposerPreparationFailure?
+    fileprivate var task: Task<Void, Never>?
+    fileprivate weak var owner: AnyObject?
+
+    fileprivate init(owner: AnyObject, firstUnsavedAt: ContinuousClock.Instant) {
+        self.owner = owner
+        self.firstUnsavedAt = firstUnsavedAt
+    }
+
+    package var isPreparing: Bool {
+        task != nil
+    }
+
+    /// The task running the single preparation (test observability and joins).
+    package var preparationTask: Task<Void, Never>? {
+        task
+    }
+}
+
+/// Unsaved composer input of a released lane whose owner went away (see
+/// `AgentRecoveryCoordinator.ownerlessUnsavedInputs`), oldest first.
+package struct AgentRecoveryOwnerlessUnsavedInput: Equatable {
+    package let workspaceID: UUID
+    package fileprivate(set) var inputs: [AgentRecoveryUnsavedComposerInput]
+}
+
+/// Live composer input a retired lane genuinely could not persist under its own authority: its
+/// final preservation write failed or was rejected (storage, held composer, lifecycle), its
+/// durable baseline could not be learned, or it was still pending when its lifecycle binding
+/// changed without reset preparation. A healthy same-binding hand-over writes the input and yields
+/// none. Never written with the retired authority afterward, never carried into a new generation
+/// implicitly, and never silently dropped: the successor lane keeps it visible until the user
+/// resolves it.
+package struct AgentRecoveryUnsavedComposerInput: Equatable {
+    /// Binding the input was typed under (the retired lane's).
+    package let binding: AgentRecoveryLifecycleBinding
+    package let content: AgentRecoveryInputContent
+    /// The retired controller's final write failure, if its flush failed.
+    package let failure: AgentRecoveryControllerFailure?
+    /// R02: this is the visible copy of a restored draft whose rollback is still owed. The durable
+    /// copy stays protected by every owner (a same-binding successor adopts the obligation) until the
+    /// rollback or an explicit, durably written resolution commits.
+    package var restoreRollback: AgentRecoveryRestoreRollbackObligation?
+}
+
+package enum AgentRecoveryAdmissionFailure: Error, Equatable {
+    case refused(AgentRecoveryAdmissionRefusal)
+    /// The durable commit failed; nothing was admitted and no handoff may happen.
+    case commitFailed(AgentRecoveryControllerFailure)
+    /// Committed durably, but the lane was retired during the await. The intent is preserved as
+    /// held input (stale target) and must not be projected or dispatched by this caller.
+    case staleAfterCommit(intentID: UUID, staleMarkPersisted: Bool)
+    /// A delivery attempt committed, but the lane was retired or frozen by reset preparation during
+    /// the await: nothing may be handed off. `settledToQueue` says whether the attempts were settled
+    /// back to `queued` as pre-handoff (otherwise they stay `dispatching`, never retried silently).
+    case dispatchStaleAfterCommit(settledToQueue: Bool)
+
+    /// User-facing text for a dispatch that could not be committed (or went stale) before handoff.
+    package var dispatchFailureText: String {
+        switch self {
+        case .refused(.untrackedInput):
+            "This message was not sent because it was not saved for recovery first."
+        case .refused:
+            "This message was not sent because its recovery state is not ready. It stays saved."
+        case .commitFailed:
+            "This message was not sent because its delivery could not be recorded. It stays saved."
+        case .staleAfterCommit, .dispatchStaleAfterCommit:
+            "This message was not sent because the session changed. It stays saved."
+        }
+    }
+}
+
+/// Submission captured synchronously at the moment the user sends from the composer. Its revision
+/// is issued immediately when the composer is restored, or right after restore completes (before
+/// any typing that followed), so later typing never becomes consumable by this submission.
+@MainActor
+package final class AgentRecoveryComposerSubmissionToken {
+    package let content: AgentRecoveryInputContent
+    package fileprivate(set) var revision: AgentRecoveryComposerRevision?
+
+    fileprivate init(content: AgentRecoveryInputContent) {
+        self.content = content
+    }
+}
+
+// MARK: - Startup
+
+/// Per-session crash hold: previous-launch run attempts or deliveries left open, bound to the
+/// validated lifecycle (incarnation and reset generation) and those exact identities. A shutdown
+/// reason does not close an open run. Legacy open turns without a run attempt contribute their own
+/// transcript turn identity (no run identity is invented). Confirmation is a durable, exact
+/// acknowledgement (`AgentRecoveryCrashHoldAcknowledgement`, F-2): it lifts only this hold, a later
+/// launch with the identical uncertainty does not ask again, and it is never a retry of
+/// `deliveryUnknown` input or a run outcome.
+package struct AgentRecoveryCrashHold: Equatable {
+    package let sessionID: UUID
+    package let incarnationID: UUID
+    package let transcriptResetGeneration: UInt64
+    package let uncertainRunAttemptIDs: Set<UUID>
+    package let uncertainIntentIDs: Set<UUID>
+    package let uncertainTranscriptTurnIDs: Set<UUID>
+    /// Whether the previous launch wrote a clean-exit mark. Per-attempt open evidence still holds.
+    package let previousExitProvenClean: Bool
+
+    package init(
+        sessionID: UUID,
+        incarnationID: UUID,
+        transcriptResetGeneration: UInt64,
+        uncertainRunAttemptIDs: Set<UUID>,
+        uncertainIntentIDs: Set<UUID>,
+        uncertainTranscriptTurnIDs: Set<UUID> = [],
+        previousExitProvenClean: Bool
+    ) {
+        self.sessionID = sessionID
+        self.incarnationID = incarnationID
+        self.transcriptResetGeneration = transcriptResetGeneration
+        self.uncertainRunAttemptIDs = uncertainRunAttemptIDs
+        self.uncertainIntentIDs = uncertainIntentIDs
+        self.uncertainTranscriptTurnIDs = uncertainTranscriptTurnIDs
+        self.previousExitProvenClean = previousExitProvenClean
+    }
+
+    /// Whether `acknowledgement` acknowledged exactly this hold.
+    package func isCovered(by acknowledgement: AgentRecoveryCrashHoldAcknowledgement?) -> Bool {
+        acknowledgement?.covers(
+            incarnationID: incarnationID,
+            transcriptResetGeneration: transcriptResetGeneration,
+            runAttemptIDs: uncertainRunAttemptIDs,
+            intentIDs: uncertainIntentIDs,
+            transcriptTurnIDs: uncertainTranscriptTurnIDs
+        ) == true
+    }
+}
+
+package struct AgentRecoveryStartupReport: Equatable {
+    package let previousLaunch: AgentRecoveryPreviousLaunch
+    package let currentLaunch: AgentRecoveryLaunchMark
+    /// Raw inventory. Not lifecycle authorization: lanes validate through the DataService gate, and
+    /// a tombstoned session never acquires a lane, so its record never restores.
+    package let discovered: [AgentRecoveryDiscoveryEntry]
+    /// Authoritative reconciliation results (empty in the report handed to `Reconcile`).
+    package let reconciliation: AgentRecoveryStartupReconciliation
+    /// Derived from `reconciliation`, never from raw discovery (empty in the report handed to
+    /// `Reconcile`).
+    package let crashHolds: [UUID: AgentRecoveryCrashHold]
+
+    package init(
+        previousLaunch: AgentRecoveryPreviousLaunch,
+        currentLaunch: AgentRecoveryLaunchMark,
+        discovered: [AgentRecoveryDiscoveryEntry],
+        reconciliation: AgentRecoveryStartupReconciliation = .empty,
+        crashHolds: [UUID: AgentRecoveryCrashHold] = [:]
+    ) {
+        self.previousLaunch = previousLaunch
+        self.currentLaunch = currentLaunch
+        self.discovered = discovered
+        self.reconciliation = reconciliation
+        self.crashHolds = crashHolds
+    }
+}
+
+package extension Notification.Name {
+    /// The recovery coordinator's startup state, results, restrictions, or crash holds changed.
+    /// `object`: the `AgentRecoveryCoordinator`. A wake-up only; observers re-read the coordinator.
+    static let agentRecoveryCoordinatorDidChange = Notification.Name("AgentRecoveryCoordinator.didChange")
+    /// Records were committed (written or removed) after composition. `object`: the coordinator;
+    /// `userInfo["sessionIDs"]`: `Set<UUID>`. Coalesced; observers re-read `liveRecordState(for:)`.
+    /// Distinct from `agentRecoveryCoordinatorDidChange`: startup results, holds, and restrictions
+    /// are unchanged by an ordinary write.
+    static let agentRecoveryRecordsDidChange = Notification.Name("AgentRecoveryCoordinator.recordsDidChange")
+    /// Composer recovery state that needs a visible user decision or error changed (held composer,
+    /// unsaved predecessor input, held intents, composer write or preparation failure). `object`: the
+    /// coordinator; `userInfo["sessionID"]` when a lane is known. A wake-up only.
+    static let agentRecoveryComposerStateDidChange = Notification.Name("AgentRecoveryCoordinator.composerStateDidChange")
+}
+
+package enum AgentRecoveryStartupState: Equatable {
+    case notStarted
+    case loading
+    case ready
+    case failed(String)
+}
+
+// MARK: - Coordinator
+
+@MainActor
+package final class AgentRecoveryCoordinator {
+    /// Startup reconciliation (inventory, intent/transcript joins, schedule receipt transfer) run
+    /// after discovery and before admission opens; returns the authoritative per-session results
+    /// that holds and restrictions are built from. Throws when the global scope cannot be
+    /// established (startup stays closed). Must never await this coordinator's startup or a
+    /// scheduler barrier. Required: there is no permissive default.
+    package typealias Reconcile = @MainActor (AgentRecoveryStartupReport) async throws -> AgentRecoveryStartupReconciliation
+    package typealias ComposerControllerFactory = @MainActor (
+        AgentRecoveryStore,
+        any AgentRecoveryLifecycleGate
+    ) -> AgentRecoveryComposerPersistenceController
+
+    package let store: AgentRecoveryStore
+    package let dataService: AgentSessionDataService
+    private let reconcile: Reconcile
+    private let makeComposerController: ComposerControllerFactory
+    /// Absolute monotonic clock seam shared with composer controllers (first-unsaved instants).
+    private let clockNow: () -> ContinuousClock.Instant
+    /// Owner-scoped composer obligations awaiting a lane (see `AgentRecoveryComposerPreparation`).
+    private var composerPreparations: [ObjectIdentifier: AgentRecoveryComposerPreparation] = [:]
+
+    package private(set) var startupState: AgentRecoveryStartupState = .notStarted
+    package private(set) var startupReport: AgentRecoveryStartupReport?
+    /// Read once, before this launch's mark replaces it; retained across startup retries.
+    private var capturedPreviousLaunch: AgentRecoveryPreviousLaunch?
+    private var startupTask: Task<Void, Never>?
+    private var crashHolds: [UUID: AgentRecoveryCrashHold] = [:]
+    private var confirmedCrashHolds: [UUID: AgentRecoveryCrashHold] = [:]
+    /// Authoritative startup results (closed sessions included); `.empty` until ready.
+    package private(set) var reconciliation: AgentRecoveryStartupReconciliation = .empty
+    /// App-scoped restrictions shared by recovery admission and scheduling.
+    package private(set) var restrictions: AgentRecoveryRestrictions = .none
+    private var lanes: [UUID: AgentRecoverySessionLane] = [:]
+    /// Retirements of released lanes not yet inherited by a new lane for the same session.
+    private var releasedRetirements: [UUID: AgentRecoverySessionLane.Retirement] = [:]
+    /// Latest committed record state per session published by the store since composition (live
+    /// overlay of the startup snapshot; `reconciliation` itself is never re-run per write).
+    private var liveRecordCommits: [UUID: AgentRecoveryRecordCommit] = [:]
+    private var pendingRecordChangeSessionIDs: Set<UUID> = []
+    private var recordChangePostScheduled = false
+    private struct HeldIntentNotes {
+        let incarnationID: UUID
+        let workspaceID: UUID
+        var reasons: [UUID: String]
+    }
+
+    /// App-scoped held-intent presentation (this launch), per session and incarnation.
+    private var heldIntentNotes: [UUID: HeldIntentNotes] = [:]
+    /// See `ownerlessUnsavedInputs`.
+    private var releasedUnsavedInputs: [UUID: AgentRecoveryOwnerlessUnsavedInput] = [:]
+
+    package init(
+        store: AgentRecoveryStore,
+        dataService: AgentSessionDataService,
+        reconcile: @escaping Reconcile,
+        makeComposerController: @escaping ComposerControllerFactory = { store, gate in
+            AgentRecoveryComposerPersistenceController(store: store, gate: gate)
+        },
+        clockNow: @escaping () -> ContinuousClock.Instant = { ContinuousClock.now }
+    ) throws {
+        guard dataService.usesRecoveryStore(store) else {
+            throw AgentRecoveryCompositionError.dataServiceStoreMismatch
+        }
+        self.store = store
+        self.dataService = dataService
+        self.reconcile = reconcile
+        self.makeComposerController = makeComposerController
+        self.clockNow = clockNow
+        store.commitPublisher.setHandler { [weak self] commit in
+            Task { @MainActor [weak self] in
+                self?.adoptRecordCommit(commit)
+            }
+        }
+    }
+
+    // MARK: Live records
+
+    /// The latest record state committed for `sessionID` since composition, or `nil` when the store
+    /// has not written or removed it since (the startup snapshot is then current).
+    package func liveRecordState(for sessionID: UUID) -> AgentRecoveryRecordCommit.State? {
+        liveRecordCommits[sessionID]?.state
+    }
+
+    /// Sessions with a record committed since composition.
+    package var liveRecordSessionIDs: Set<UUID> {
+        Set(liveRecordCommits.keys)
+    }
+
+    private func adoptRecordCommit(_ commit: AgentRecoveryRecordCommit) {
+        if let existing = liveRecordCommits[commit.sessionID], existing.sequence >= commit.sequence {
+            return
+        }
+        liveRecordCommits[commit.sessionID] = commit
+        pruneHeldPresentation(for: commit)
+        if case let .supported(record) = commit.state {
+            presentUncertainInputOfEndedRuns(in: record)
+        }
+        pendingRecordChangeSessionIDs.insert(commit.sessionID)
+        guard !recordChangePostScheduled else { return }
+        recordChangePostScheduled = true
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            recordChangePostScheduled = false
+            let sessionIDs = pendingRecordChangeSessionIDs
+            pendingRecordChangeSessionIDs = []
+            NotificationCenter.default.post(
+                name: .agentRecoveryRecordsDidChange,
+                object: self,
+                userInfo: ["sessionIDs": sessionIDs]
+            )
+        }
+    }
+
+    /// Posts `agentRecoveryComposerStateDidChange` (lanes and composer preparations).
+    fileprivate func composerStateDidChange(sessionID: UUID?) {
+        NotificationCenter.default.post(
+            name: .agentRecoveryComposerStateDidChange,
+            object: self,
+            userInfo: sessionID.map { ["sessionID": $0] }
+        )
+    }
+
+    // MARK: Startup barrier
+
+    /// Starts the startup sequence once: previous mark -> current unclean mark -> discovery ->
+    /// reconciliation -> crash holds -> ready. Admission is closed until it reports `ready`.
+    package func startIfNeeded() {
+        guard startupState == .notStarted else { return }
+        runStartup()
+    }
+
+    /// Re-runs startup after a failure. Files are never modified by a failed startup.
+    package func retryStartup() {
+        guard case .failed = startupState else { return }
+        runStartup()
+    }
+
+    /// Waits for an in-flight startup and returns the settled state (`notStarted` stays closed).
+    package func awaitStartup() async -> AgentRecoveryStartupState {
+        while startupState == .loading, let task = startupTask {
+            await task.value
+        }
+        return startupState
+    }
+
+    private func runStartup() {
+        startupState = .loading
+        startupTask = Task { [weak self] in
+            await self?.performStartup()
+        }
+    }
+
+    private func performStartup() async {
+        do {
+            let previous: AgentRecoveryPreviousLaunch
+            if let capturedPreviousLaunch {
+                previous = capturedPreviousLaunch
+            } else {
+                previous = await store.readLaunchMark()
+                capturedPreviousLaunch = previous
+            }
+            // R5: cold loads stamp from the captured previous launch, not this launch's mark.
+            await dataService.adoptColdRestoreLaunchEvidence(previous)
+            let current = try await store.recordCurrentLaunchRunning()
+            let entries = try await store.discoverRecords()
+            let results = try await reconcile(AgentRecoveryStartupReport(
+                previousLaunch: previous,
+                currentLaunch: current,
+                discovered: entries
+            ))
+            let holds = Self.deriveCrashHolds(
+                from: results,
+                currentInstanceID: store.appInstanceID,
+                previousExitProvenClean: previous.provesCleanExit(currentInstanceID: store.appInstanceID)
+            )
+            // Results, holds, and restrictions are published before readiness. A hold the user
+            // already acknowledged exactly (durably, F-2) does not ask again.
+            reconciliation = results
+            crashHolds = holds
+            confirmedCrashHolds = holds.filter { sessionID, hold in
+                confirmedCrashHolds[sessionID] == hold
+                    || hold.isCovered(by: results.resolution(for: sessionID)?.record?.record.crashHoldAcknowledgement)
+            }
+            restrictions = AgentRecoveryRestrictions.from(results)
+            startupReport = AgentRecoveryStartupReport(
+                previousLaunch: previous,
+                currentLaunch: current,
+                discovered: entries,
+                reconciliation: results,
+                crashHolds: holds
+            )
+            startupState = .ready
+        } catch {
+            startupState = .failed(String(describing: error))
+        }
+        NotificationCenter.default.post(name: .agentRecoveryCoordinatorDidChange, object: self)
+    }
+
+    /// Crash holds from authoritative results only (actionable sessions whose record matched the
+    /// validated lifecycle; tombstoned or mismatched records hold nothing for another incarnation).
+    /// Open evidence at startup belongs to an earlier launch (no admission has opened yet):
+    /// - run attempts without terminal evidence (a shutdown reason does not close a run);
+    /// - earlier-instance `dispatching` or `deliveryUnknown` intents, with or without a run attempt
+    ///   (terminal run evidence settles completion, not independently unknown delivery);
+    /// - interrupted last turns without a run attempt (legacy), by their own turn identity.
+    /// A session executing on an authoritative remote host (persisted execution binding, F-3) holds
+    /// nothing locally: no local process ran it. Its uncertain input stays visible as remote
+    /// uncertainty and is never auto-retried.
+    package static func deriveCrashHolds(
+        from reconciliation: AgentRecoveryStartupReconciliation,
+        currentInstanceID: UUID,
+        previousExitProvenClean: Bool
+    ) -> [UUID: AgentRecoveryCrashHold] {
+        var holds: [UUID: AgentRecoveryCrashHold] = [:]
+        for resolution in reconciliation.sessions {
+            guard resolution.classification == .actionable, let binding = resolution.binding,
+                  resolution.remoteHostID == nil
+            else { continue }
+            let record = resolution.record?.record
+            let openRuns = Set((record?.runAttempts ?? []).filter { $0.terminal == nil }.map(\.runAttemptID))
+            let uncertainIntents = Set((record?.intents ?? []).filter {
+                ($0.deliveryState == .dispatching || $0.deliveryState == .deliveryUnknown)
+                    && $0.appInstanceID != currentInstanceID
+            }.map(\.intentID))
+            let legacyTurns = resolution.unresolvedLegacyInterruptedTurnIDs
+            guard !openRuns.isEmpty || !uncertainIntents.isEmpty || !legacyTurns.isEmpty else { continue }
+            holds[resolution.sessionID] = AgentRecoveryCrashHold(
+                sessionID: resolution.sessionID,
+                incarnationID: binding.incarnationID,
+                transcriptResetGeneration: binding.transcriptResetGeneration,
+                uncertainRunAttemptIDs: openRuns,
+                uncertainIntentIDs: uncertainIntents,
+                uncertainTranscriptTurnIDs: legacyTurns,
+                previousExitProvenClean: previousExitProvenClean
+            )
+        }
+        return holds
+    }
+
+    // MARK: Admission and crash holds
+
+    /// `nil` when admission is open for `binding`; otherwise the fail-closed refusal.
+    package func admissionRefusal(
+        for binding: AgentRecoveryLifecycleBinding,
+        workspaceID: UUID? = nil
+    ) async -> AgentRecoveryAdmissionRefusal? {
+        switch await awaitStartup() {
+        case .notStarted, .loading:
+            return .startupNotReady
+        case let .failed(message):
+            return .startupFailed(message)
+        case .ready:
+            break
+        }
+        if let hold = blockingCrashHold(for: binding) {
+            return .crashHeld(hold)
+        }
+        if let reason = restrictions.sessionRestriction(binding.sessionID)
+            ?? workspaceID.flatMap({ restrictions.workspaceRestriction($0) })
+        {
+            return .restricted(reason)
+        }
+        return nil
+    }
+
+    /// Whether a restricted or crash-held session other than `sessionID` (open or closed), or the
+    /// workspace itself, is unresolved in `workspaceID`: the scheduler's workspace-busy extension.
+    package func hasUnresolvedSession(inWorkspace workspaceID: UUID, excluding sessionID: UUID) -> Bool {
+        if restrictions.hasUnresolvedSession(inWorkspace: workspaceID, excluding: sessionID) {
+            return true
+        }
+        return crashHolds.values.contains { hold in
+            hold.sessionID != sessionID
+                && confirmedCrashHolds[hold.sessionID] != hold
+                && reconciliation.resolution(for: hold.sessionID)?.workspaceID == workspaceID
+        }
+    }
+
+    /// Lifts a session's held-transfer restriction after its owner resolved the schedule transfer.
+    /// Nonactionable, duplicate, and workspace restrictions stay until a fresh startup inspection.
+    package func noteScheduleTransferResolved(sessionID: UUID) {
+        guard let resolution = reconciliation.resolution(for: sessionID),
+              resolution.classification == .actionable,
+              case .held = resolution.scheduleTransfer,
+              restrictions.sessionRestriction(sessionID) != nil
+        else { return }
+        restrictions.lift(sessionID: sessionID)
+        NotificationCenter.default.post(name: .agentRecoveryCoordinatorDidChange, object: self)
+    }
+
+    /// The published crash hold for the session (confirmed or not).
+    package func crashHold(for sessionID: UUID) -> AgentRecoveryCrashHold? {
+        crashHolds[sessionID]
+    }
+
+    /// An unconfirmed crash hold bound to this incarnation and reset generation.
+    package func blockingCrashHold(for binding: AgentRecoveryLifecycleBinding) -> AgentRecoveryCrashHold? {
+        guard let hold = crashHolds[binding.sessionID],
+              hold.incarnationID == binding.incarnationID,
+              hold.transcriptResetGeneration == binding.transcriptResetGeneration
+        else {
+            return nil
+        }
+        return confirmedCrashHolds[binding.sessionID] == hold ? nil : hold
+    }
+
+    /// Explicit user confirmation of exactly the published hold (F-2), through `lane` (the session's
+    /// live lane, same lifecycle as the hold): the displayed hold is revalidated, the exact
+    /// acknowledgement is committed under the lifecycle gate, and only after that commit succeeds
+    /// is the hold published as confirmed. `false` for a stale hold or a failed commit (nothing is
+    /// lifted). The acknowledgement closes no run and changes no delivery certainty.
+    package func confirmCrashHold(_ hold: AgentRecoveryCrashHold, lane: AgentRecoverySessionLane) async -> Bool {
+        func isCurrent() -> Bool {
+            crashHolds[hold.sessionID] == hold
+                && !lane.isRetired
+                && lane.sessionID == hold.sessionID
+                && lane.binding.incarnationID == hold.incarnationID
+                && lane.binding.transcriptResetGeneration == hold.transcriptResetGeneration
+        }
+        guard isCurrent() else { return false }
+        if confirmedCrashHolds[hold.sessionID] == hold { return true }
+        guard case .success = await lane.recordCrashHoldAcknowledgement(hold), isCurrent() else { return false }
+        confirmedCrashHolds[hold.sessionID] = hold
+        NotificationCenter.default.post(name: .agentRecoveryCoordinatorDidChange, object: self)
+        return true
+    }
+
+    // MARK: Lanes
+
+    /// Installs the single live lane for `persistenceState`'s durable session. An existing lane for
+    /// the same owner and persistence state is returned unchanged. Any other existing lane is
+    /// retired first (synchronously closed to new admissions and edits; when the lifecycle binding
+    /// is unchanged its latest input, including typing buffered before its restore, is written
+    /// before its controller retires), and the new lane's restore waits for that retirement. Only
+    /// input that genuinely failed to persist is inherited as `unsavedPredecessorInputs`.
+    package func claimLane(
+        owner: AnyObject,
+        persistenceState: AgentSessionPersistenceState
+    ) throws -> AgentRecoverySessionLane {
+        let gate = try dataService.recoveryLifecycleGate(for: persistenceState)
+        let sessionID = gate.binding.sessionID
+        let predecessor = lanes[sessionID]
+        if let predecessor, !predecessor.isRetired, predecessor.isOwned(by: owner),
+           predecessor.persistenceState == persistenceState
+        {
+            return predecessor
+        }
+        // A released lane's retirement is inherited too, so its unsaved input reaches the next owner
+        // (which then presents it; the ownerless publication below is withdrawn).
+        let released = releasedRetirements.removeValue(forKey: sessionID)
+        if released != nil, releasedUnsavedInputs.removeValue(forKey: sessionID) != nil {
+            composerStateDidChange(sessionID: sessionID)
+        }
+        let retirement = predecessor?.beginRetirement(preserving: predecessor?.binding == gate.binding) ?? released
+        let lane = AgentRecoverySessionLane(
+            coordinator: self,
+            store: store,
+            owner: owner,
+            persistenceState: persistenceState,
+            gate: gate,
+            composer: makeComposerController(store, gate),
+            predecessorRetirement: retirement
+        )
+        lanes[sessionID] = lane
+        return lane
+    }
+
+    /// The live (unretired) lane for a durable session.
+    package func lane(for sessionID: UUID) -> AgentRecoverySessionLane? {
+        guard let lane = lanes[sessionID], !lane.isRetired else { return nil }
+        return lane
+    }
+
+    /// Retires `lane` (preserving its latest composer input first) and unregisters it if still
+    /// current. The release task stays owned by the coordinator until a later lane inherits it.
+    @discardableResult
+    package func releaseLane(_ lane: AgentRecoverySessionLane) -> Task<Void, Never> {
+        let retirement = lane.beginRetirement(preserving: true)
+        let sessionID = lane.sessionID
+        if lanes[sessionID] === lane {
+            lanes[sessionID] = nil
+            releasedRetirements[sessionID] = retirement
+        }
+        return Task { @MainActor [weak self] in
+            let unsaved = await retirement.value
+            // The owner went away: input its lane could not persist is published here until a
+            // later lane for the session inherits it, never kept only inside a parked task.
+            guard let self, !unsaved.isEmpty, releasedRetirements[sessionID] == retirement else { return }
+            releasedUnsavedInputs[sessionID] = AgentRecoveryOwnerlessUnsavedInput(
+                workspaceID: lane.persistenceState.stamp.workspaceID,
+                inputs: unsaved
+            )
+            composerStateDidChange(sessionID: sessionID)
+        }
+    }
+
+    /// Composer input a released lane could not persist while no later lane has inherited it (its
+    /// owner tab or window went away), by session. Shown by the recovery list of its workspace.
+    package var ownerlessUnsavedInputs: [UUID: AgentRecoveryOwnerlessUnsavedInput] {
+        releasedUnsavedInputs
+    }
+
+    /// Explicit user discard of exactly the displayed ownerless input (oldest first). The parked
+    /// retirement is replaced by one carrying only the remaining inputs, so a later lane never
+    /// inherits the discarded payload. Returns `false` when it is no longer the oldest entry.
+    @discardableResult
+    package func discardOwnerlessUnsavedInput(sessionID: UUID, expected: AgentRecoveryUnsavedComposerInput) -> Bool {
+        // R02: a restored copy whose rollback is still owed is resolved only through a lane (a
+        // durable write); dropping it here would leave its stored copy unprotected for the next owner.
+        guard expected.restoreRollback == nil,
+              var ownerless = releasedUnsavedInputs[sessionID], ownerless.inputs.first == expected,
+              releasedRetirements[sessionID] != nil
+        else { return false }
+        ownerless.inputs.removeFirst()
+        let remaining = ownerless.inputs
+        releasedUnsavedInputs[sessionID] = remaining.isEmpty ? nil : ownerless
+        releasedRetirements[sessionID] = remaining.isEmpty ? nil : Task { remaining }
+        composerStateDidChange(sessionID: sessionID)
+        return true
+    }
+
+    // MARK: Held intents (this launch)
+
+    /// Held intents recorded for this incarnation of the session (see
+    /// `AgentRecoverySessionLane.noteProjectionRemoved`).
+    package func heldIntents(for binding: AgentRecoveryLifecycleBinding) -> [UUID: String] {
+        heldIntents(sessionID: binding.sessionID, incarnationID: binding.incarnationID)
+    }
+
+    package func heldIntents(sessionID: UUID, incarnationID: UUID) -> [UUID: String] {
+        guard let notes = heldIntentNotes[sessionID], notes.incarnationID == incarnationID else { return [:] }
+        return notes.reasons
+    }
+
+    /// Sessions with held intents recorded this launch (any owner, any window).
+    package var heldIntentSessions: [UUID: (incarnationID: UUID, workspaceID: UUID, reasons: [UUID: String])] {
+        heldIntentNotes.mapValues { ($0.incarnationID, $0.workspaceID, $0.reasons) }
+    }
+
+    fileprivate func noteHeldIntents(
+        _ intentIDs: [UUID],
+        reason: String,
+        binding: AgentRecoveryLifecycleBinding,
+        workspaceID: UUID
+    ) {
+        var notes = heldIntentNotes[binding.sessionID].flatMap { $0.incarnationID == binding.incarnationID ? $0 : nil }
+            ?? HeldIntentNotes(incarnationID: binding.incarnationID, workspaceID: workspaceID, reasons: [:])
+        var changed = false
+        for intentID in intentIDs where notes.reasons[intentID] == nil {
+            notes.reasons[intentID] = reason
+            changed = true
+        }
+        guard changed else { return }
+        heldIntentNotes[binding.sessionID] = notes
+        composerStateDidChange(sessionID: binding.sessionID)
+    }
+
+    fileprivate func clearHeldIntent(_ intentID: UUID, binding: AgentRecoveryLifecycleBinding) {
+        guard var notes = heldIntentNotes[binding.sessionID], notes.incarnationID == binding.incarnationID,
+              notes.reasons.removeValue(forKey: intentID) != nil
+        else { return }
+        heldIntentNotes[binding.sessionID] = notes.reasons.isEmpty ? nil : notes
+        composerStateDidChange(sessionID: binding.sessionID)
+    }
+
+    /// Keeps held-intent and ownerless presentation consistent with a committed record: a deleted
+    /// session or another incarnation drops it; accepted or withdrawn intents need no decision.
+    private func pruneHeldPresentation(for commit: AgentRecoveryRecordCommit) {
+        let sessionID = commit.sessionID
+        switch commit.state {
+        case .absent:
+            let hadNotes = heldIntentNotes.removeValue(forKey: sessionID) != nil
+            let hadUnsaved = releasedUnsavedInputs.removeValue(forKey: sessionID) != nil
+            if hadNotes || hadUnsaved { composerStateDidChange(sessionID: sessionID) }
+        case let .supported(record):
+            guard var notes = heldIntentNotes[sessionID] else { return }
+            guard notes.incarnationID == record.incarnationID else {
+                heldIntentNotes[sessionID] = nil
+                composerStateDidChange(sessionID: sessionID)
+                return
+            }
+            let before = notes.reasons.count
+            notes.reasons = notes.reasons.filter { intentID, reason in
+                guard let intent = record.intent(id: intentID) else { return true }
+                switch intent.deliveryState {
+                case .providerAccepted, .withdrawn:
+                    return false
+                default:
+                    // A derived ended-run note lasts only while its condition holds (input settled
+                    // back to the live queue is owned by it again).
+                    guard Self.derivedHoldReasons.contains(reason) else { return true }
+                    return Self.uncertainInputHoldReason(intent, in: record) != nil
+                }
+            }
+            guard notes.reasons.count != before else { return }
+            heldIntentNotes[sessionID] = notes.reasons.isEmpty ? nil : notes
+            composerStateDidChange(sessionID: sessionID)
+        }
+    }
+
+    // MARK: Uncertain input after its run ended (this launch)
+
+    package static let runEndedUnconfirmedHoldReason = "Its run ended before delivery was confirmed."
+    package static let unlinkedUnconfirmedHoldReason = "Its handoff ended before delivery was confirmed."
+    private static let derivedHoldReasons: Set<String> = [runEndedUnconfirmedHoldReason, unlinkedUnconfirmedHoldReason]
+
+    /// The hold reason for uncertain input whose live projection is over, or `nil` while one still
+    /// owns it:
+    /// - `dispatching`/`deliveryUnknown` whose latest attempt belongs to a run with terminal or
+    ///   shutdown evidence (the run ended);
+    /// - `deliveryUnknown` whose latest attempt has no run attempt: its handoff already settled as
+    ///   unknown and no run will end for it.
+    /// A `dispatching` attempt without a run attempt is still owned by its in-flight handoff.
+    package static func uncertainInputHoldReason(_ intent: AgentRecoveryIntent, in record: AgentRecoveryRecord) -> String? {
+        guard intent.deliveryState == .dispatching || intent.deliveryState == .deliveryUnknown,
+              let attempt = record.attempts(forIntent: intent.intentID).last
+        else { return nil }
+        guard let runAttemptID = attempt.runAttemptID else {
+            return intent.deliveryState == .deliveryUnknown ? unlinkedUnconfirmedHoldReason : nil
+        }
+        guard let run = record.runAttempt(id: runAttemptID), run.terminal != nil || run.shutdown != nil else {
+            return nil
+        }
+        return runEndedUnconfirmedHoldReason
+    }
+
+    /// Registers this launch's uncertain input of ended runs as held presentation, derived from the
+    /// committed record (order-independent: whichever of the outcome or the terminal evidence lands
+    /// last). The workspace comes from the session's current lane or its existing notes; a session
+    /// with neither is listed from the record by the startup overlay instead.
+    private func presentUncertainInputOfEndedRuns(in record: AgentRecoveryRecord) {
+        let currentInstanceID = store.appInstanceID
+        var byReason: [String: [UUID]] = [:]
+        for intent in record.intents where intent.appInstanceID == currentInstanceID {
+            if let reason = Self.uncertainInputHoldReason(intent, in: record) {
+                byReason[reason, default: []].append(intent.intentID)
+            }
+        }
+        guard !byReason.isEmpty else { return }
+        let existing = heldIntentNotes[record.sessionID].flatMap { $0.incarnationID == record.incarnationID ? $0 : nil }
+        guard let workspaceID = lanes[record.sessionID]?.persistenceState.stamp.workspaceID ?? existing?.workspaceID else {
+            return
+        }
+        let binding = AgentRecoveryLifecycleBinding(
+            sessionID: record.sessionID,
+            incarnationID: record.incarnationID,
+            transcriptResetGeneration: record.transcriptResetGeneration
+        )
+        for (reason, intentIDs) in byReason.sorted(by: { $0.key < $1.key }) {
+            noteHeldIntents(intentIDs, reason: reason, binding: binding, workspaceID: workspaceID)
+        }
+    }
+
+    // MARK: Composer preparation (no lane yet)
+
+    /// The owner's outstanding obligation, if any.
+    package func composerPreparation(for owner: AnyObject) -> AgentRecoveryComposerPreparation? {
+        guard let preparation = composerPreparations[ObjectIdentifier(owner)] else { return nil }
+        guard preparation.owner === owner else {
+            // A deallocated owner's identifier was reused; its obligation died with it.
+            composerPreparations[ObjectIdentifier(owner)] = nil
+            return nil
+        }
+        return preparation
+    }
+
+    /// Records a composer mutation of `owner` that cannot reach a lane yet. The first such mutation
+    /// fixes the obligation's first-unsaved instant (now, on the shared clock); later ones only
+    /// replace the latest content (`nil` = not yet representable).
+    @discardableResult
+    package func recordComposerMutationAwaitingPreparation(
+        owner: AnyObject,
+        content: AgentRecoveryInputContent?
+    ) -> AgentRecoveryComposerPreparation {
+        let preparation = composerPreparation(for: owner) ?? {
+            let created = AgentRecoveryComposerPreparation(owner: owner, firstUnsavedAt: clockNow())
+            composerPreparations[ObjectIdentifier(owner)] = created
+            return created
+        }()
+        preparation.latestContent = content
+        return preparation
+    }
+
+    /// Starts the owner's single preparation task unless one is running. `body` establishes
+    /// authority, promotes images, and hands the latest content over with
+    /// `completeComposerPreparation`; a returned failure keeps the obligation and its payload
+    /// visible. Returns `false` when a preparation was already running (the mutation coalesced).
+    @discardableResult
+    package func startComposerPreparation(
+        owner: AnyObject,
+        _ body: @escaping @MainActor (AgentRecoveryComposerPreparation) async -> AgentRecoveryComposerPreparationFailure?
+    ) -> Bool {
+        guard let preparation = composerPreparation(for: owner), preparation.task == nil else { return false }
+        if preparation.failure != nil {
+            preparation.failure = nil
+            composerStateDidChange(sessionID: nil)
+        }
+        preparation.task = Task { @MainActor [weak self, preparation] in
+            let failure = await body(preparation)
+            preparation.task = nil
+            if let failure {
+                preparation.failure = failure
+                self?.composerStateDidChange(sessionID: nil)
+            }
+        }
+        return true
+    }
+
+    /// Hands the owner's obligation to `lane` with its original first-unsaved instant, so the write
+    /// is due at that instant plus 2 seconds (immediately when overdue). Refused when `lane` is not
+    /// owned by `owner` (a replacement or late completion never adopts the obligation); the
+    /// obligation is then kept with `ownerReplaced`.
+    @discardableResult
+    package func completeComposerPreparation(
+        owner: AnyObject,
+        forwardingTo lane: AgentRecoverySessionLane,
+        content: AgentRecoveryInputContent
+    ) -> Result<AgentRecoveryComposerRevision?, AgentRecoveryComposerPreparationFailure> {
+        guard let preparation = composerPreparation(for: owner) else {
+            return .success(lane.composerDidChange(content))
+        }
+        guard lane.isOwned(by: owner), !lane.isRetired, lanes[lane.sessionID] === lane else {
+            preparation.failure = .ownerReplaced
+            composerStateDidChange(sessionID: nil)
+            return .failure(.ownerReplaced)
+        }
+        composerPreparations[ObjectIdentifier(owner)] = nil
+        if preparation.failure != nil {
+            composerStateDidChange(sessionID: lane.sessionID)
+        }
+        return .success(lane.composerDidChange(content, firstUnsavedAt: preparation.firstUnsavedAt))
+    }
+
+    /// Drops the owner's obligation after an explicit user discard (or once its content is empty).
+    package func discardComposerPreparation(owner: AnyObject) {
+        guard composerPreparations.removeValue(forKey: ObjectIdentifier(owner)) != nil else { return }
+        composerStateDidChange(sessionID: nil)
+    }
+}
+
+// MARK: - Session lane
+
+/// One durable session's recovery ownership: its lifecycle gate, its single composer controller,
+/// restore-before-edits sequencing, explicit held-composer resolution, and gated admission and
+/// evidence transactions used by every producer.
+@MainActor
+package final class AgentRecoverySessionLane {
+    package enum ComposerState: Equatable {
+        case unrestored
+        case restoring
+        /// Restored (or superseded by newer live typing); edits write through.
+        case ready
+        /// A composer from another reset generation is stored; it awaits explicit resolution.
+        /// Live edits are kept pending (writes refuse with `heldComposerUnresolved`).
+        case held(AgentRecoveryComposerSnapshot)
+        case restoreFailed(AgentRecoveryControllerFailure)
+    }
+
+    private static let maximumConflictRetries = 3
+    /// Held-input reason for input committed while its session changed (lane retired meanwhile).
+    package static let sessionChangedHoldReason = "The session changed before it was sent, so it was never queued."
+
+    package let persistenceState: AgentSessionPersistenceState
+    package let binding: AgentRecoveryLifecycleBinding
+    package let composer: AgentRecoveryComposerPersistenceController
+    private let gate: any AgentRecoveryLifecycleGate
+    package let store: AgentRecoveryStore
+    private weak var coordinator: AgentRecoveryCoordinator?
+    private weak var owner: AnyObject?
+    private let ownerID: ObjectIdentifier
+    /// A retired lane's handoff: the composer input it could not persist, oldest first.
+    package typealias Retirement = Task<[AgentRecoveryUnsavedComposerInput], Never>
+
+    private let predecessorRetirement: Retirement?
+    /// Adopts the predecessor's unsaved input once its retirement finishes.
+    private var predecessorSettlement: Task<Void, Never>?
+
+    package private(set) var composerState: ComposerState = .unrestored {
+        didSet {
+            if oldValue != composerState { notifyStateChange() }
+        }
+    }
+
+    package private(set) var isRetired = false
+    /// The latest live composer could not be represented durably (for example an image not yet in
+    /// managed storage), so it was not persisted. Cleared by the next representable edit.
+    package private(set) var hasUnrepresentableComposerEdit = false
+    /// Terminal-evidence write failures by run attempt (see `recordTerminalEvidence`).
+    package private(set) var terminalEvidenceFailures: [UUID: AgentRecoveryControllerFailure] = [:]
+    private var terminalEvidenceTail: Task<Void, Never>?
+    /// Composer input inherited from retired predecessors, oldest first (plus restored held content
+    /// that newer typing kept out of the composer, see `resolveHeldComposer`). While non-empty, new
+    /// admissions are refused (`unsavedPredecessorInput`) and a restore never replaces live UI.
+    package private(set) var unsavedPredecessorInputs: [AgentRecoveryUnsavedComposerInput] = [] {
+        didSet {
+            if oldValue != unsavedPredecessorInputs { notifyStateChange() }
+        }
+    }
+
+    /// Durable intents of this session (this incarnation) whose live projection was removed without
+    /// a replacement, with the reason shown to the user. Owned by the app-scoped coordinator, so a
+    /// lane retirement, reclaim, or another window's ownership never hides them.
+    package var heldIntents: [UUID: String] {
+        coordinator?.heldIntents(for: binding) ?? [:]
+    }
+
+    private var retirementTask: Retirement?
+    private var restoreTask: Task<AgentRecoveryComposerRestoreOutcome, Never>?
+    /// Latest live content typed before restore completed (forwarded after the restore).
+    private var bufferedEdit: AgentRecoveryInputContent?
+    /// Earliest first-unsaved instant of the buffered (or unrepresentable) input. Forwarded with it
+    /// so the controller's 2-second bound is never restarted by waiting for restore or promotion.
+    package private(set) var bufferedFirstUnsavedAt: ContinuousClock.Instant?
+    private var awaitingRevision: [AgentRecoveryComposerSubmissionToken] = []
+    /// Set while a transcript reset preserves this lane's composer; new admissions and dispatch
+    /// commits are refused.
+    package private(set) var isResetPreparationActive = false
+    /// In-flight admission and dispatch commits, joined by reset preparation before it flushes.
+    private var activeAdmissionCount = 0
+    /// An admission or dispatch commit is in flight (test observability of the reset drain).
+    package var hasInFlightAdmissions: Bool {
+        activeAdmissionCount > 0
+    }
+
+    private var admissionDrainWaiters: [CheckedContinuation<Void, Never>] = []
+
+    fileprivate init(
+        coordinator: AgentRecoveryCoordinator,
+        store: AgentRecoveryStore,
+        owner: AnyObject,
+        persistenceState: AgentSessionPersistenceState,
+        gate: any AgentRecoveryLifecycleGate,
+        composer: AgentRecoveryComposerPersistenceController,
+        predecessorRetirement: Retirement?
+    ) {
+        self.coordinator = coordinator
+        self.store = store
+        self.owner = owner
+        ownerID = ObjectIdentifier(owner)
+        self.persistenceState = persistenceState
+        binding = gate.binding
+        self.gate = gate
+        self.composer = composer
+        self.predecessorRetirement = predecessorRetirement
+        if let predecessorRetirement {
+            // Strong capture: inherited input must not be lost with a short-lived lane.
+            predecessorSettlement = Task { @MainActor in
+                let inherited = await predecessorRetirement.value
+                unsavedPredecessorInputs.append(contentsOf: inherited.map(adoptingRestoreRollback))
+            }
+        }
+        composer.stateDidChange = { [weak self] in
+            self?.notifyStateChange()
+        }
+        composer.restoreRollbackDidSucceed = { [weak self] held in
+            self?.restoreRollbackDidSucceed(held)
+        }
+    }
+
+    /// R02 hand-over: runs in the predecessor settlement, before this lane's first restore, write,
+    /// or admission (each waits for it). A same-binding predecessor's outstanding rollback becomes
+    /// this controller's, so the stored restored draft stays protected under the new owner. A lane
+    /// already retired before its settlement (a transit-only owner in a rapid chain) still adopts:
+    /// its controller retires only after this settlement, and its own retirement then forwards the
+    /// still-owed obligation to the next owner. Under another binding the obligation does not apply
+    /// (the store refuses ordinary composer writes over another reset generation's composer and any
+    /// write under another incarnation), so the entry is kept as ordinary unsaved input.
+    private func adoptingRestoreRollback(_ input: AgentRecoveryUnsavedComposerInput) -> AgentRecoveryUnsavedComposerInput {
+        guard let obligation = input.restoreRollback else { return input }
+        guard input.binding == binding else {
+            var ordinary = input
+            ordinary.restoreRollback = nil
+            return ordinary
+        }
+        composer.adoptRestoreRollback(obligation)
+        return input
+    }
+
+    /// A retried rollback put the held draft back: it is presented as held again, replacing the
+    /// visible restored copy.
+    private func restoreRollbackDidSucceed(_ held: AgentRecoveryComposerSnapshot) {
+        guard !isRetired else { return }
+        unsavedPredecessorInputs.removeAll { $0.restoreRollback?.held == held }
+        composerState = .held(held)
+    }
+
+    private func notifyStateChange() {
+        coordinator?.composerStateDidChange(sessionID: binding.sessionID)
+    }
+
+    // MARK: Held intents (this launch)
+
+    /// Records that the live projections of these durable intents were removed without a
+    /// replacement, so they are presented as held input (`reason` is shown with them). Recorded on
+    /// the coordinator even after this lane retired (a late runner path), so the next owner, in any
+    /// window, still presents them. Untracked input has no intent and is never recorded.
+    package func noteProjectionRemoved(intentIDs: some Sequence<UUID>, reason: String) {
+        coordinator?.noteHeldIntents(
+            Array(intentIDs),
+            reason: reason,
+            binding: binding,
+            workspaceID: persistenceState.stamp.workspaceID
+        )
+    }
+
+    /// Drops held-intent presentation once the intent no longer needs a decision (withdrawn,
+    /// accepted, or moved back into the composer).
+    package func clearHeldIntent(_ intentID: UUID) {
+        coordinator?.clearHeldIntent(intentID, binding: binding)
+    }
+
+    package var sessionID: UUID {
+        binding.sessionID
+    }
+
+    package func isOwned(by candidate: AnyObject) -> Bool {
+        owner != nil && ObjectIdentifier(candidate) == ownerID
+    }
+
+    // MARK: Composer
+
+    /// Forwards a full live composer snapshot. Before restore completes the latest content is
+    /// buffered (restore before edits) and `nil` is returned. `firstUnsavedAt` is the instant of the
+    /// earliest mutation this content represents when it was held elsewhere first (no lane yet);
+    /// the earliest outstanding instant always wins.
+    @discardableResult
+    package func composerDidChange(
+        _ content: AgentRecoveryInputContent,
+        firstUnsavedAt: ContinuousClock.Instant? = nil
+    ) -> AgentRecoveryComposerRevision? {
+        guard !isRetired else { return nil }
+        hasUnrepresentableComposerEdit = false
+        let instant = earliest(firstUnsavedAt ?? composer.currentInstant, bufferedFirstUnsavedAt)
+        switch composerState {
+        case .ready, .held:
+            bufferedFirstUnsavedAt = nil
+            return composer.composerDidChange(content, firstUnsavedAt: instant)
+        case .unrestored, .restoring, .restoreFailed:
+            bufferedEdit = content
+            bufferedFirstUnsavedAt = instant
+            return nil
+        }
+    }
+
+    /// Records that the live composer changed to content that cannot be persisted yet. The
+    /// obligation's first-unsaved instant is kept for the content that later represents it.
+    package func composerContentUnrepresentable(firstUnsavedAt: ContinuousClock.Instant? = nil) {
+        guard !isRetired else { return }
+        composer.noteUnrepresentableComposerChange()
+        hasUnrepresentableComposerEdit = true
+        bufferedFirstUnsavedAt = earliest(firstUnsavedAt ?? composer.currentInstant, bufferedFirstUnsavedAt)
+    }
+
+    private func earliest(
+        _ instant: ContinuousClock.Instant,
+        _ other: ContinuousClock.Instant?
+    ) -> ContinuousClock.Instant {
+        other.map { min($0, instant) } ?? instant
+    }
+
+    /// Captures a composer submission synchronously (before optimistic clearing).
+    package func beginComposerSubmission(_ content: AgentRecoveryInputContent) -> AgentRecoveryComposerSubmissionToken {
+        let token = AgentRecoveryComposerSubmissionToken(content: content)
+        guard !isRetired else { return token }
+        switch composerState {
+        case .ready, .held:
+            token.revision = composer.composerDidChange(content)
+        case .unrestored, .restoring, .restoreFailed:
+            // The submitted content supersedes earlier buffered typing.
+            bufferedEdit = nil
+            bufferedFirstUnsavedAt = nil
+            awaitingRevision.append(token)
+        }
+        return token
+    }
+
+    /// Restores the durable composer once (after any predecessor's retirement). The returned
+    /// outcome is what the live UI may adopt: `.restored(snapshot)` only when nothing was typed or
+    /// submitted meanwhile, otherwise `.superseded`. A failed restore may be retried.
+    package func restoreComposer() async -> AgentRecoveryComposerRestoreOutcome {
+        if let restoreTask {
+            return await restoreTask.value
+        }
+        guard !isRetired else { return .failed(.retired) }
+        composerState = .restoring
+        let settlement = predecessorSettlement
+        let task = Task { [weak self] () -> AgentRecoveryComposerRestoreOutcome in
+            await settlement?.value
+            guard let self else { return .failed(.retired) }
+            return await performRestore()
+        }
+        restoreTask = task
+        return await task.value
+    }
+
+    private func performRestore() async -> AgentRecoveryComposerRestoreOutcome {
+        let outcome = await composer.loadRestorableComposer()
+        // The learned state is recorded even when retirement began meanwhile: a same-binding
+        // retirement preserves its captured input against exactly this baseline.
+        switch outcome {
+        case .restored, .superseded:
+            composerState = .ready
+        case let .heldForOtherGeneration(snapshot):
+            composerState = .held(snapshot)
+        case let .failed(failure):
+            composerState = .restoreFailed(failure)
+            restoreTask = nil
+            return outcome
+        }
+        // Retirement captured the buffered input and forwards it itself before retiring.
+        guard !isRetired else { return .failed(.retired) }
+        // Submissions captured during the restore issue revisions first, then later typing.
+        let hadLiveInput = !awaitingRevision.isEmpty || bufferedEdit != nil
+        for token in awaitingRevision {
+            token.revision = composer.composerDidChange(token.content)
+        }
+        awaitingRevision = []
+        if let edit = bufferedEdit {
+            bufferedEdit = nil
+            // The original first-unsaved instant: waiting for restore never restarts the bound.
+            composer.composerDidChange(edit, firstUnsavedAt: bufferedFirstUnsavedAt)
+            bufferedFirstUnsavedAt = nil
+        }
+        // Unresolved predecessor input is live input too: a restore never replaces it in the UI.
+        if hadLiveInput || !unsavedPredecessorInputs.isEmpty, case .restored = outcome {
+            return .superseded
+        }
+        return outcome
+    }
+
+    /// Explicit user resolution of exactly the displayed (oldest) unsaved predecessor input
+    /// (`expected`; otherwise `heldInputChanged`). `discard` drops that payload;
+    /// `restoreToComposer` requires an empty live composer, forwards the content as this lane's
+    /// live composer (written under this lane's authority, by explicit choice), and returns it for
+    /// the UI to show. Admission reopens once none remain.
+    package func resolveUnsavedPredecessorInput(
+        _ choice: AgentRecoveryHeldComposerChoice,
+        expected: AgentRecoveryUnsavedComposerInput,
+        liveComposerIsEmpty: Bool
+    ) async -> Result<AgentRecoveryInputContent?, AgentRecoveryControllerFailure> {
+        // `liveComposerIsEmpty` describes the composer at this instant; a change while waiting for
+        // the predecessor settlement must not be replaced by the restored content.
+        let liveRevisionAtRequest = composer.liveRevision
+        await predecessorSettlement?.value
+        guard !isRetired else { return .failure(.retired) }
+        guard let oldest = unsavedPredecessorInputs.first else { return .failure(.noHeldComposer) }
+        guard oldest == expected else { return .failure(.heldInputChanged) }
+        if let obligation = oldest.restoreRollback, composer.outstandingRestoreRollback == obligation {
+            return await resolveProtectedRestore(
+                choice,
+                entry: oldest,
+                obligation: obligation,
+                liveComposerIsEmpty: liveComposerIsEmpty,
+                liveRevisionAtRequest: liveRevisionAtRequest
+            )
+        }
+        switch choice {
+        case .discard:
+            unsavedPredecessorInputs.removeFirst()
+            return .success(nil)
+        case .restoreToComposer:
+            guard liveComposerIsEmpty else { return .failure(.liveComposerHasUnsavedContent) }
+            guard composer.liveRevision == liveRevisionAtRequest else { return .failure(.composerChangedDuringRestore) }
+            unsavedPredecessorInputs.removeFirst()
+            composerDidChange(oldest.content)
+            return .success(oldest.content)
+        }
+    }
+
+    /// R02: the protected restored copy is resolved only by a durable write (the controller stores
+    /// the live typing or removes the copy for discard, or stores the placed content for restore);
+    /// the entry is removed, and admission reopens, only after that write commits. A failure keeps
+    /// the entry, the protection, and the stored copy, and is returned for a Retry.
+    private func resolveProtectedRestore(
+        _ choice: AgentRecoveryHeldComposerChoice,
+        entry: AgentRecoveryUnsavedComposerInput,
+        obligation: AgentRecoveryRestoreRollbackObligation,
+        liveComposerIsEmpty: Bool,
+        liveRevisionAtRequest: AgentRecoveryComposerRevision?
+    ) async -> Result<AgentRecoveryInputContent?, AgentRecoveryControllerFailure> {
+        // The write needs this lane's learned baseline (the stored restored revision).
+        if let restoreTask {
+            _ = await restoreTask.value
+        }
+        guard !isRetired else { return .failure(.retired) }
+        guard case .ready = composerState else {
+            if case let .restoreFailed(failure) = composerState { return .failure(failure) }
+            return .failure(.heldInputChanged)
+        }
+        let placing: AgentRecoveryInputContent?
+        switch choice {
+        case .discard:
+            placing = nil
+        case .restoreToComposer:
+            guard liveComposerIsEmpty else { return .failure(.liveComposerHasUnsavedContent) }
+            guard composer.liveRevision == liveRevisionAtRequest else { return .failure(.composerChangedDuringRestore) }
+            placing = entry.content
+        }
+        if case let .failure(failure) = await composer.resolveProtectedRestore(obligation, placing: placing) {
+            // R02-R2: typing raced the placement write and its put-back failed, so the committed
+            // placement is now the protected revision; the visible copy carries that obligation.
+            if !isRetired, let current = composer.outstandingRestoreRollback, current != obligation,
+               let index = unsavedPredecessorInputs.firstIndex(of: entry)
+            {
+                unsavedPredecessorInputs[index].restoreRollback = current
+            }
+            return .failure(failure)
+        }
+        if let index = unsavedPredecessorInputs.firstIndex(of: entry) {
+            unsavedPredecessorInputs.remove(at: index)
+        }
+        return .success(placing)
+    }
+
+    package func flushComposer() async -> AgentRecoveryComposerFlushOutcome {
+        await composer.flush()
+    }
+
+    /// Explicit user resolution of exactly the displayed held composer (`expectedHeldRevision`;
+    /// otherwise `heldInputChanged`). `restoreToComposer` requires an empty live composer and
+    /// returns the content to place into it; `discard` stores current live typing in the same
+    /// replacement. A composer change during a restore yields `composerChangedDuringRestore`
+    /// with the held draft still stored and still presented (see the controller's restore
+    /// freeze). Only when the controller could not revert a raced restore is the restored content
+    /// kept visible as unsaved predecessor-style input with that failure (never dropped, never
+    /// merged); `.success(nil)` is then returned.
+    package func resolveHeldComposer(
+        _ choice: AgentRecoveryHeldComposerChoice,
+        expectedHeldRevision: AgentRecoveryComposerRevision,
+        liveComposerIsEmpty: Bool
+    ) async -> Result<AgentRecoveryComposerSnapshot?, AgentRecoveryControllerFailure> {
+        guard !isRetired else { return .failure(.retired) }
+        guard case let .held(displayed) = composerState else { return .failure(.noHeldComposer) }
+        guard displayed.revision == expectedHeldRevision else { return .failure(.heldInputChanged) }
+        if choice == .restoreToComposer, !liveComposerIsEmpty {
+            return .failure(.liveComposerHasUnsavedContent)
+        }
+        let result = await composer.resolveHeldComposer(choice, expectedHeldRevision: expectedHeldRevision)
+        guard case let .success(restored) = result else { return result }
+        if !isRetired {
+            composerState = .ready
+        }
+        if let restored, composer.liveRevision != restored.revision {
+            if !isRetired {
+                unsavedPredecessorInputs.append(AgentRecoveryUnsavedComposerInput(
+                    binding: binding,
+                    content: restored.content,
+                    failure: composer.restoreRevertFailure,
+                    restoreRollback: composer.outstandingRestoreRollback
+                ))
+            }
+            return .success(nil)
+        }
+        return result
+    }
+
+    // MARK: Admission
+
+    /// Commits a `queued` intent (no handoff begun) after the startup barrier and crash-hold check.
+    /// Composer submissions consume only the submitted (or earlier) composer revision.
+    package func admitQueued(
+        _ admission: AgentRecoveryAdmission,
+        composerToken: AgentRecoveryComposerSubmissionToken? = nil
+    ) async -> Result<AgentRecoveryAdmitted<AgentRecoveryQueueReceipt>, AgentRecoveryAdmissionFailure> {
+        await admit(admission, composerToken: composerToken, intentReceipt: \.intent) { lane, submission, revision in
+            if let revision {
+                return await lane.composer.submitQueued(submission, submittedRevision: revision).map(\.receipt)
+            }
+            return await lane.transaction { store, binding in
+                try await store.commitQueuedIntent(
+                    binding: binding,
+                    expectedRevision: store.currentRevision(sessionID: binding.sessionID),
+                    submission: submission,
+                    consumption: nil
+                )
+            }
+        }
+    }
+
+    /// Commits a `dispatching` intent and its delivery attempt before any provider handoff.
+    package func admitDirect(
+        _ admission: AgentRecoveryAdmission,
+        attempt: AgentRecoveryAttemptStart,
+        composerToken: AgentRecoveryComposerSubmissionToken? = nil
+    ) async -> Result<AgentRecoveryAdmitted<AgentRecoveryDispatchReceipt>, AgentRecoveryAdmissionFailure> {
+        await admit(admission, composerToken: composerToken, intentReceipt: \.intent) { lane, submission, revision in
+            if let revision {
+                return await lane.composer.submitDirect(submission, attempt: attempt, submittedRevision: revision)
+                    .map(\.receipt)
+            }
+            return await lane.transaction { store, binding in
+                try await store.commitDispatchingIntent(
+                    binding: binding,
+                    expectedRevision: store.currentRevision(sessionID: binding.sessionID),
+                    submission: submission,
+                    attempt: attempt,
+                    consumption: nil
+                )
+            }
+        }
+    }
+
+    private func admit<Receipt: Equatable & Sendable>(
+        _ admission: AgentRecoveryAdmission,
+        composerToken: AgentRecoveryComposerSubmissionToken?,
+        intentReceipt: (Receipt) -> AgentRecoveryIntentReceipt,
+        commit: (AgentRecoverySessionLane, AgentRecoveryIntentSubmission, AgentRecoveryComposerRevision?) async
+            -> Result<Receipt, AgentRecoveryControllerFailure>
+    ) async -> Result<AgentRecoveryAdmitted<Receipt>, AgentRecoveryAdmissionFailure> {
+        guard !isRetired else { return .failure(.refused(.laneRetired)) }
+        guard !isResetPreparationActive else { return .failure(.refused(.resetPreparationInProgress)) }
+        guard admission.binding == binding else { return .failure(.refused(.bindingMismatch)) }
+        // Joined by reset preparation before it flushes the old generation's composer.
+        activeAdmissionCount += 1
+        defer { admissionDidFinish() }
+        if let refusal = await admissionRefusal() {
+            return .failure(.refused(refusal))
+        }
+        await predecessorSettlement?.value
+        guard unsavedPredecessorInputs.isEmpty else { return .failure(.refused(.unsavedPredecessorInput)) }
+        var revision: AgentRecoveryComposerRevision?
+        if let composerToken {
+            let outcome = await restoreComposer()
+            guard let tokenRevision = composerToken.revision else {
+                if case let .failed(failure) = outcome {
+                    return .failure(.refused(.composerUnavailable(failure)))
+                }
+                return .failure(.refused(.composerUnavailable(.retired)))
+            }
+            revision = tokenRevision
+        }
+        // Revalidate after every await before the durable write.
+        guard !isRetired else { return .failure(.refused(.laneRetired)) }
+        if let refusal = await admissionRefusal() {
+            return .failure(.refused(refusal))
+        }
+        guard !isRetired else { return .failure(.refused(.laneRetired)) }
+        guard unsavedPredecessorInputs.isEmpty else { return .failure(.refused(.unsavedPredecessorInput)) }
+        guard !isResetPreparationActive else { return .failure(.refused(.resetPreparationInProgress)) }
+        let receipt: Receipt
+        switch await commit(self, admission.submission, revision) {
+        case let .failure(failure):
+            return .failure(.commitFailed(failure))
+        case let .success(value):
+            receipt = value
+        }
+        if isRetired {
+            let marked = await markTargetStale(intentID: intentReceipt(receipt).intentID)
+            let persisted = if case .success = marked { true } else { false }
+            // Presented now by the session's next owner (any window), marked or not.
+            noteProjectionRemoved(intentIDs: [intentReceipt(receipt).intentID], reason: Self.sessionChangedHoldReason)
+            return .failure(.staleAfterCommit(intentID: admission.intentID, staleMarkPersisted: persisted))
+        }
+        return .success(AgentRecoveryAdmitted(admission: admission, receipt: receipt, submittedComposerRevision: revision))
+    }
+
+    private func admissionRefusal() async -> AgentRecoveryAdmissionRefusal? {
+        guard let coordinator else { return .startupNotReady }
+        return await coordinator.admissionRefusal(for: binding, workspaceID: persistenceState.stamp.workspaceID)
+    }
+
+    private func admissionDidFinish() {
+        activeAdmissionCount -= 1
+        guard activeAdmissionCount == 0 else { return }
+        let waiters = admissionDrainWaiters
+        admissionDrainWaiters = []
+        for waiter in waiters {
+            waiter.resume()
+        }
+    }
+
+    private func waitForAdmissionsToDrain() async {
+        guard activeAdmissionCount > 0 else { return }
+        await withCheckedContinuation { admissionDrainWaiters.append($0) }
+    }
+
+    // MARK: Transcript reset preparation
+
+    /// Preserves this lane's composer before a transcript reset advances the generation (spec R2
+    /// reset ordering). Synchronously closes admission, then joins predecessor settlement, admitted
+    /// submissions, and restore, and writes the latest composer under the current generation.
+    /// Fails (vetoing the reset, admission reopened, nothing cleared) when input remains
+    /// unrepresentable, unwritten, or retained only in memory. On success admission stays closed
+    /// until the caller commits the reset (the lane is then retired by the successor claim) or calls
+    /// `endTranscriptResetPreparation()`. The written composer is left held by the new generation;
+    /// it is never adopted there implicitly.
+    package func prepareForTranscriptReset() async -> Result<Void, AgentRecoveryResetPreparationFailure> {
+        guard !isRetired else { return .failure(.laneRetired) }
+        guard !isResetPreparationActive else { return .failure(.alreadyPreparing) }
+        isResetPreparationActive = true
+        let result = await performResetPreparation()
+        if case .failure = result {
+            isResetPreparationActive = false
+        }
+        return result
+    }
+
+    /// Releases a successful preparation whose reset was not committed (reopens admission).
+    package func endTranscriptResetPreparation() {
+        isResetPreparationActive = false
+    }
+
+    private func performResetPreparation() async -> Result<Void, AgentRecoveryResetPreparationFailure> {
+        await predecessorSettlement?.value
+        await waitForAdmissionsToDrain()
+        guard !isRetired else { return .failure(.laneRetired) }
+        // Learns the baseline and forwards buffered typing with its original instant.
+        let restore = await restoreComposer()
+        guard !isRetired else { return .failure(.laneRetired) }
+        switch composerState {
+        case .ready, .held:
+            break
+        case let .restoreFailed(failure):
+            return .failure(.composerNotPersisted(failure))
+        case .unrestored, .restoring:
+            if case let .failed(failure) = restore {
+                return .failure(.composerNotPersisted(failure))
+            }
+            return .failure(.composerNotPersisted(nil))
+        }
+        guard unsavedPredecessorInputs.isEmpty else { return .failure(.unsavedPredecessorInput) }
+        for _ in 0 ..< Self.maximumConflictRetries {
+            guard !isRetired else { return .failure(.laneRetired) }
+            guard !hasUnrepresentableComposerEdit else { return .failure(.unrepresentableComposerInput) }
+            guard composer.hasPendingChanges else { return .success(()) }
+            if case let .failed(failure) = await composer.flush() {
+                return .failure(.composerNotPersisted(failure))
+            }
+        }
+        guard !isRetired else { return .failure(.laneRetired) }
+        return composer.hasPendingChanges ? .failure(.composerChangedDuringPreparation) : .success(())
+    }
+
+    // MARK: Dispatch and evidence
+
+    /// Starts a delivery attempt for an existing intent. Closed by retirement, reset preparation,
+    /// the startup barrier, and an unconfirmed crash hold.
+    package func beginDispatch(
+        intentID: UUID,
+        attempt: AgentRecoveryAttemptStart,
+        authorization: AgentRecoveryDispatchAuthorization
+    ) async -> Result<AgentRecoveryDispatchReceipt, AgentRecoveryAdmissionFailure> {
+        await beginDispatches(
+            [AgentRecoveryDispatchRequest(intentID: intentID, attempt: attempt)],
+            authorization: authorization,
+            single: true
+        ).map { $0[0] }
+    }
+
+    /// Starts one delivery attempt per constituent of a single combined handoff, atomically and in
+    /// order (`AgentRecoveryStore.beginDispatches`). Same closures as `beginDispatch`.
+    package func beginDispatches(
+        _ dispatches: [AgentRecoveryDispatchRequest],
+        authorization: AgentRecoveryDispatchAuthorization
+    ) async -> Result<[AgentRecoveryDispatchReceipt], AgentRecoveryAdmissionFailure> {
+        await beginDispatches(dispatches, authorization: authorization, single: false)
+    }
+
+    /// The commit participates in the reset drain. A commit that lands after this lane retired (a
+    /// new owner claimed the session) or after reset preparation froze it is settled back to
+    /// `queued` as pre-handoff and refused, so its stale owner never hands it off.
+    private func beginDispatches(
+        _ dispatches: [AgentRecoveryDispatchRequest],
+        authorization: AgentRecoveryDispatchAuthorization,
+        single: Bool
+    ) async -> Result<[AgentRecoveryDispatchReceipt], AgentRecoveryAdmissionFailure> {
+        guard !dispatches.isEmpty else { return .failure(.refused(.untrackedInput)) }
+        guard !isRetired else { return .failure(.refused(.laneRetired)) }
+        guard !isResetPreparationActive else { return .failure(.refused(.resetPreparationInProgress)) }
+        activeAdmissionCount += 1
+        defer { admissionDidFinish() }
+        if let refusal = await admissionRefusal() {
+            return .failure(.refused(refusal))
+        }
+        guard !isRetired else { return .failure(.refused(.laneRetired)) }
+        guard !isResetPreparationActive else { return .failure(.refused(.resetPreparationInProgress)) }
+        let committed: Result<[AgentRecoveryDispatchReceipt], AgentRecoveryControllerFailure> = await transaction { store, binding in
+            if single {
+                let receipt = try await store.beginDispatch(
+                    binding: binding,
+                    expectedRevision: store.currentRevision(sessionID: binding.sessionID),
+                    intentID: dispatches[0].intentID,
+                    attempt: dispatches[0].attempt,
+                    authorization: authorization
+                )
+                return [receipt]
+            }
+            return try await store.beginDispatches(
+                binding: binding,
+                expectedRevision: store.currentRevision(sessionID: binding.sessionID),
+                dispatches: dispatches,
+                authorization: authorization
+            )
+        }
+        let receipts: [AgentRecoveryDispatchReceipt]
+        switch committed {
+        case let .failure(failure):
+            return .failure(.commitFailed(failure))
+        case let .success(value):
+            receipts = value
+        }
+        guard isValidForHandoff else {
+            let settled = await settleStaleDispatch(receipts)
+            return .failure(.dispatchStaleAfterCommit(settledToQueue: settled))
+        }
+        return .success(receipts)
+    }
+
+    /// Whether input dispatched through this lane may still be handed off: not retired and not
+    /// frozen by reset preparation. Re-checked by every route immediately before the provider
+    /// boundary (`AgentRecoveryDispatchEvidence.isValidForHandoff(in:)`).
+    package var isValidForHandoff: Bool {
+        !isRetired && !isResetPreparationActive
+    }
+
+    /// Settles committed attempts that will not be handed off back to `queued` (pre-handoff).
+    /// Returns whether every settlement was written.
+    private func settleStaleDispatch(_ receipts: [AgentRecoveryDispatchReceipt]) async -> Bool {
+        var settled = true
+        for receipt in receipts {
+            if case .failure = await settleToQueue(
+                intentID: receipt.intent.intentID,
+                attemptID: receipt.attemptID,
+                evidence: .preHandoff,
+                message: "The session changed before this message was handed off."
+            ) {
+                settled = false
+            }
+        }
+        return settled
+    }
+
+    /// Evidence writes below are not closed by retirement: evidence for work already handed off
+    /// must still be recorded while the lifecycle binding is valid.
+    package func recordDeliveryOutcome(
+        intentID: UUID,
+        attemptID: UUID,
+        outcome: AgentRecoveryDeliveryOutcome
+    ) async -> Result<AgentRecoveryOutcomeReceipt, AgentRecoveryControllerFailure> {
+        await transaction { store, binding in
+            try await store.recordDeliveryOutcome(
+                binding: binding,
+                expectedRevision: store.currentRevision(sessionID: binding.sessionID),
+                intentID: intentID,
+                attemptID: attemptID,
+                outcome: outcome
+            )
+        }
+    }
+
+    package func settleToQueue(
+        intentID: UUID,
+        attemptID: UUID,
+        evidence: AgentRecoveryFailureKind,
+        message: String?
+    ) async -> Result<AgentRecoveryIntentReceipt, AgentRecoveryControllerFailure> {
+        await transaction { store, binding in
+            try await store.settleToQueue(
+                binding: binding,
+                expectedRevision: store.currentRevision(sessionID: binding.sessionID),
+                intentID: intentID,
+                attemptID: attemptID,
+                evidence: evidence,
+                message: message
+            )
+        }
+    }
+
+    /// Attaches the exact pending-handoff snapshot a send is about to prepend to its carrier intent,
+    /// before that intent's dispatch commit (adopted plan §5). A first attachment is refused unless
+    /// the intent is `queued` and every earlier attempt is conclusively not delivered.
+    package func attachPendingHandoff(
+        intentID: UUID,
+        snapshot: AgentRecoveryPendingHandoffSnapshot
+    ) async -> Result<AgentRecoveryIntentReceipt, AgentRecoveryControllerFailure> {
+        await transaction { store, binding in
+            try await store.attachPendingHandoff(
+                binding: binding,
+                expectedRevision: store.currentRevision(sessionID: binding.sessionID),
+                intentID: intentID,
+                snapshot: snapshot
+            )
+        }
+    }
+
+    package func issueQueueReceipt(intentID: UUID) async -> Result<AgentRecoveryQueueReceipt, AgentRecoveryControllerFailure> {
+        await transaction { store, binding in
+            try await store.issueQueueReceipt(binding: binding, intentID: intentID)
+        }
+    }
+
+    package func markTargetStale(intentID: UUID) async -> Result<AgentRecoveryIntentReceipt, AgentRecoveryControllerFailure> {
+        await transaction { store, binding in
+            try await store.markTargetStale(
+                binding: binding,
+                expectedRevision: store.currentRevision(sessionID: binding.sessionID),
+                intentID: intentID
+            )
+        }
+    }
+
+    /// Explicit user removal only; lifecycle teardown preserves intents.
+    package func withdraw(intentID: UUID) async -> Result<AgentRecoveryIntentReceipt, AgentRecoveryControllerFailure> {
+        await transaction { store, binding in
+            try await store.withdraw(
+                binding: binding,
+                expectedRevision: store.currentRevision(sessionID: binding.sessionID),
+                intentID: intentID
+            )
+        }
+    }
+
+    package func ensureRunAttempt(
+        ownership: AgentRunOwnership,
+        processRunID: UUID?,
+        transcriptTurnID: UUID?,
+        processRunAssociation: AgentRecoveryRunAssociationPolicy = .strict
+    ) async -> Result<AgentRecoveryRunReceipt, AgentRecoveryControllerFailure> {
+        await transaction { store, binding in
+            try await store.ensureRunAttempt(
+                binding: binding,
+                expectedRevision: store.currentRevision(sessionID: binding.sessionID),
+                ownership: ownership,
+                processRunID: processRunID,
+                transcriptTurnID: transcriptTurnID,
+                processRunAssociation: processRunAssociation
+            )
+        }
+    }
+
+    package func attachDeliveryAttempt(
+        attemptID: UUID,
+        ownership: AgentRunOwnership
+    ) async -> Result<AgentRecoveryRunReceipt, AgentRecoveryControllerFailure> {
+        await transaction { store, binding in
+            try await store.attachDeliveryAttempt(
+                binding: binding,
+                expectedRevision: store.currentRevision(sessionID: binding.sessionID),
+                attemptID: attemptID,
+                ownership: ownership
+            )
+        }
+    }
+
+    /// Commits the exact acknowledgement of `hold` (see `AgentRecoveryCoordinator.confirmCrashHold`).
+    package func recordCrashHoldAcknowledgement(
+        _ hold: AgentRecoveryCrashHold
+    ) async -> Result<AgentRecoveryLocalReceipt, AgentRecoveryControllerFailure> {
+        await transaction { store, binding in
+            try await store.recordCrashHoldAcknowledgement(
+                binding: binding,
+                expectedRevision: store.currentRevision(sessionID: binding.sessionID),
+                incarnationID: hold.incarnationID,
+                transcriptResetGeneration: hold.transcriptResetGeneration,
+                runAttemptIDs: hold.uncertainRunAttemptIDs,
+                intentIDs: hold.uncertainIntentIDs,
+                transcriptTurnIDs: hold.uncertainTranscriptTurnIDs
+            )
+        }
+    }
+
+    package func recordRunTerminal(
+        _ commit: AgentRunTerminalCommitRevision
+    ) async -> Result<AgentRecoveryRunReceipt, AgentRecoveryControllerFailure> {
+        await transaction { store, binding in
+            try await store.recordRunTerminal(
+                binding: binding,
+                expectedRevision: store.currentRevision(sessionID: binding.sessionID),
+                commit: commit
+            )
+        }
+    }
+
+    /// Terminal evidence from the terminal commit barrier, independent of any MCP publication
+    /// envelope: ensures the run attempt exists, completing its missing join keys (the commit's
+    /// expected process run and `transcriptTurnID`, the turn the barrier retained that run in)
+    /// without replacing recorded ones (R08), then records its terminal commit. Writes run in
+    /// call order. A failure stays visible in `terminalEvidenceFailures` (keyed by run attempt)
+    /// until a later write for that attempt succeeds.
+    @discardableResult
+    package func recordTerminalEvidence(
+        _ commit: AgentRunTerminalCommitRevision,
+        transcriptTurnID: UUID?
+    ) -> Task<Void, Never> {
+        let previous = terminalEvidenceTail
+        let task = Task { @MainActor in
+            await previous?.value
+            let runAttemptID = commit.ownership.attemptID
+            var failure: AgentRecoveryControllerFailure?
+            if case let .failure(ensureFailure) = await ensureRunAttempt(
+                ownership: commit.ownership,
+                processRunID: commit.expectedRunID,
+                transcriptTurnID: transcriptTurnID,
+                processRunAssociation: .keepExisting
+            ) {
+                failure = ensureFailure
+            } else if case let .failure(terminalFailure) = await recordRunTerminal(commit) {
+                failure = terminalFailure
+            }
+            terminalEvidenceFailures[runAttemptID] = failure
+        }
+        terminalEvidenceTail = task
+        return task
+    }
+
+    // MARK: Delivery evidence
+
+    /// Delivery-evidence writes (`AgentRecoveryDispatchEvidence`) enqueued through this lane and not
+    /// yet finished, by tracking token.
+    private var pendingDeliveryEvidenceWrites: [UUID: Task<Void, Never>] = [:]
+
+    /// Tracks one enqueued delivery-evidence write. Once it finished (written or failed) the lane
+    /// posts `agentRecoveryDeliveryEvidenceDidSettle` (object: this lane) so a waiter on a still-
+    /// `dispatching` intent re-reads the record on that signal instead of polling. Evidence may
+    /// land after the run went inactive; the signal, not run state, marks its arrival.
+    package func trackDeliveryEvidenceWrite(_ write: Task<Void, Never>) {
+        let token = UUID()
+        pendingDeliveryEvidenceWrites[token] = write
+        Task { @MainActor [weak self] in
+            await write.value
+            guard let self else { return }
+            pendingDeliveryEvidenceWrites[token] = nil
+            NotificationCenter.default.post(
+                name: .agentRecoveryDeliveryEvidenceDidSettle,
+                object: self,
+                userInfo: ["sessionID": sessionID]
+            )
+        }
+    }
+
+    package var hasPendingDeliveryEvidenceWrites: Bool {
+        !pendingDeliveryEvidenceWrites.isEmpty
+    }
+
+    /// Awaits every delivery-evidence write tracked so far. Writes enqueued afterwards post their
+    /// own settle signal.
+    package func deliveryEvidenceWritesSettled() async {
+        for write in Array(pendingDeliveryEvidenceWrites.values) {
+            await write.value
+        }
+    }
+
+    /// Current durable record for this session (read inside the gate).
+    package func readRecord() async -> Result<AgentRecoveryRecordState, AgentRecoveryControllerFailure> {
+        await transaction { store, binding in
+            await store.read(sessionID: binding.sessionID)
+        }
+    }
+
+    // MARK: Retirement
+
+    /// Closes the lane to new admissions and edits immediately, then preserves before relinquishing
+    /// the single writer: with `preserving` (unchanged binding) it joins predecessor settlement and
+    /// the in-flight restore, learns the durable baseline, forwards input buffered before restore
+    /// with its original first-unsaved instant, flushes, and only then retires the controller.
+    /// Without `preserving` (the binding changed, e.g. a committed reset) nothing is written under
+    /// either authority. Idempotent. The returned task yields only input that genuinely could not be
+    /// persisted, oldest first (inherited unresolved input, then this lane's latest composite input
+    /// with its write/restore/authority failure); a healthy hand-over yields nothing.
+    fileprivate func beginRetirement(preserving: Bool) -> Retirement {
+        if let retirementTask {
+            return retirementTask
+        }
+        isRetired = true
+        let buffered = bufferedEdit
+        let bufferedAt = bufferedFirstUnsavedAt
+        bufferedEdit = nil
+        bufferedFirstUnsavedAt = nil
+        // Submissions awaiting a revision are refused (`composerUnavailable`) by their own admit;
+        // their content returns to the composer through the caller's failed-submission path.
+        awaitingRevision = []
+        let settlement = predecessorSettlement
+        let restore = restoreTask
+        let task = Task { @MainActor [self] () -> [AgentRecoveryUnsavedComposerInput] in
+            await settlement?.value
+            var unsaved = unsavedPredecessorInputs
+            let residue = await preserveForRetirement(
+                buffered: buffered,
+                bufferedAt: bufferedAt,
+                restore: restore,
+                preserving: preserving
+            )
+            // R02: the retiring flush retried any owed rollback. A visible restored copy whose
+            // rollback succeeded is dropped (the held slot owns the draft; the successor restores
+            // it as held); one still owed carries its obligation to the successor.
+            let outstanding = composer.outstandingRestoreRollback
+            unsaved.removeAll { $0.restoreRollback != nil && $0.restoreRollback != outstanding }
+            // R02-R1: `preserveForRetirement` retired the controller after its serialized chain
+            // drained, so an obligation created by a resolution still in flight when retirement
+            // began (whose visible copy this retired lane never appended) is known only now. It is
+            // carried exactly once, ahead of the newer typing it raced.
+            if let outstanding, !unsaved.contains(where: { $0.restoreRollback == outstanding }) {
+                unsaved.append(AgentRecoveryUnsavedComposerInput(
+                    binding: binding,
+                    content: outstanding.held.content,
+                    failure: composer.restoreRevertFailure ?? .retired,
+                    restoreRollback: outstanding
+                ))
+            }
+            if let residue {
+                unsaved.append(residue)
+            }
+            return unsaved
+        }
+        retirementTask = task
+        return task
+    }
+
+    /// Runs inside the retirement task (the lane is already closed). Returns the latest input left
+    /// unpersisted, if any. A cancelled or failed write never counts as success.
+    private func preserveForRetirement(
+        buffered: AgentRecoveryInputContent?,
+        bufferedAt: ContinuousClock.Instant?,
+        restore: Task<AgentRecoveryComposerRestoreOutcome, Never>?,
+        preserving: Bool
+    ) async -> AgentRecoveryUnsavedComposerInput? {
+        guard preserving else {
+            // Binding changed: the old generation's input is never written under the new one.
+            let content = buffered ?? composer.pendingContent
+            let failure = buffered == nil ? composer.lastWriteFailure : nil
+            await composer.retire(flushingPending: false)
+            return content.map { AgentRecoveryUnsavedComposerInput(binding: binding, content: $0, failure: failure) }
+        }
+        _ = await restore?.value
+        guard buffered != nil || composer.hasPendingChanges else {
+            // Nothing owed: retire without learning a baseline (the serialized chain is drained).
+            await composer.retire(flushingPending: false)
+            return composer.pendingContent.map {
+                AgentRecoveryUnsavedComposerInput(binding: binding, content: $0, failure: composer.lastWriteFailure ?? .retired)
+            }
+        }
+        if let failure = await learnRetirementBaseline() {
+            // Without a validated baseline the write could overwrite an unreadable or held composer.
+            let content = buffered ?? composer.pendingContent
+            await composer.retire(flushingPending: false)
+            return content.map { AgentRecoveryUnsavedComposerInput(binding: binding, content: $0, failure: failure) }
+        }
+        if let buffered {
+            composer.composerDidChange(buffered, firstUnsavedAt: bufferedAt)
+        }
+        let outcome = await composer.retire(flushingPending: true)
+        guard let content = composer.pendingContent else { return nil }
+        let failure: AgentRecoveryControllerFailure? = if case let .failed(failure) = outcome {
+            failure
+        } else {
+            composer.lastWriteFailure ?? .retired
+        }
+        return AgentRecoveryUnsavedComposerInput(binding: binding, content: content, failure: failure)
+    }
+
+    /// Ensures the controller knows the durable composer before the retiring flush. `nil` when the
+    /// flush may proceed (a held composer makes it fail explicitly with `heldComposerUnresolved`).
+    private func learnRetirementBaseline() async -> AgentRecoveryControllerFailure? {
+        switch composerState {
+        case .ready, .held:
+            return nil
+        case .unrestored, .restoring, .restoreFailed:
+            switch await composer.loadRestorableComposer() {
+            case .restored, .superseded:
+                composerState = .ready
+                return nil
+            case let .heldForOtherGeneration(snapshot):
+                composerState = .held(snapshot)
+                return nil
+            case let .failed(failure):
+                composerState = .restoreFailed(failure)
+                return failure
+            }
+        }
+    }
+
+    // MARK: Gate
+
+    /// Runs `body` inside the foundation lifecycle gate, retrying record-revision conflicts.
+    /// Never call provider or network work from `body`.
+    package func transaction<T: Sendable>(
+        _ body: @escaping @Sendable (AgentRecoveryStore, AgentRecoveryLifecycleBinding) async throws -> T
+    ) async -> Result<T, AgentRecoveryControllerFailure> {
+        let store = store
+        let binding = binding
+        var lastFailure: AgentRecoveryControllerFailure = .store(.storageFailure("no attempt"))
+        for _ in 0 ..< Self.maximumConflictRetries {
+            do {
+                return try await .success(gate.performRecoveryTransaction { try await body(store, binding) })
+            } catch let error as AgentRecoveryStoreError {
+                lastFailure = .store(error)
+                if case .revisionConflict = error { continue }
+                return .failure(lastFailure)
+            } catch {
+                return .failure(.lifecycleRejected(String(describing: error)))
+            }
+        }
+        return .failure(lastFailure)
+    }
+}

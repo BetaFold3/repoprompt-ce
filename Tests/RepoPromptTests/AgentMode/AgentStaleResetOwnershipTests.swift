@@ -73,9 +73,9 @@ final class AgentStaleResetOwnershipTests: XCTestCase {
         XCTAssertTrue(owner.session.isDirty)
 
         // Backend admission is closed and the view is retained; nothing is written.
-        let submit = owner.viewModel.submitUserTurn(text: "blocked", tabID: owner.tabID)
+        let submit = owner.viewModel.submitUserTurn(text: "blocked", tabID: owner.tabID, codexAttemptID: nil, admitted: nil)
         XCTAssertEqual(submit, .blocked(message: AgentModeViewModel.staleResetRecoveryBlockedMessage))
-        let start = await owner.viewModel.startAgentRun(tabID: owner.tabID, initialMessage: "blocked")
+        let start = await owner.viewModel.startAgentRun(tabID: owner.tabID, initialMessage: "blocked", inputConstituents: nil)
         guard case let .failed(startMessage)? = start else {
             return XCTFail("Run start must be refused, got \(String(describing: start))")
         }
@@ -1237,12 +1237,13 @@ final class AgentStaleResetOwnershipTests: XCTestCase {
         try FileManager.default.createDirectory(at: otherStorage, withIntermediateDirectories: true)
         let otherWorkspace = WorkspaceModel(name: "Other", repoPaths: [otherStorage.path], customStoragePath: otherStorage)
         let foreignSessionID = sessionID
-        _ = try await owner.viewModel.test_dataService.saveAgentSession(
+        let foreignFileURL = try await owner.viewModel.test_dataService.saveAgentSession(
             AgentSession(id: foreignSessionID, workspaceID: otherWorkspace.id, composeTabID: owner.tabID, name: "Foreign"),
             for: otherWorkspace,
             preparation: .alreadyCanonicalTranscript,
             trustedCanonicalItemCount: 0
         )
+        let foreignBytes = try Data(contentsOf: foreignFileURL)
 
         // The active workspace changes after the verdict, while the destructive phase is held.
         let foreignSortDate = Date(timeIntervalSinceReferenceDate: 4416)
@@ -1285,8 +1286,14 @@ final class AgentStaleResetOwnershipTests: XCTestCase {
         owner.viewModel.test_composeTabRemovalPhaseTwoHook = nil
 
         XCTAssertNil(owner.viewModel.sessions[owner.tabID], "Logical Agent removal committed before cleanup suspended")
+        XCTAssertEqual(
+            try? Data(contentsOf: foreignFileURL),
+            foreignBytes,
+            "Captured cleanup never targets the newly active workspace"
+        )
+        // The committed deletion's UUID-wide tombstone logically retires the same ID everywhere.
         let foreign = try await owner.viewModel.test_dataService.loadAgentSession(id: foreignSessionID, for: otherWorkspace)
-        XCTAssertNotNil(foreign, "Captured cleanup never targets the newly active workspace")
+        XCTAssertNil(foreign)
         XCTAssertEqual(owner.viewModel.ownerValidatedSessionIndex[foreignSessionID], foreignIndexEntry)
         XCTAssertEqual(owner.viewModel.ownerValidatedSessionListSortDates[owner.tabID], foreignSortDate)
         owner.viewModel.test_establishPersistenceWorkspace(owner.workspace)
@@ -1938,7 +1945,9 @@ final class AgentStaleResetOwnershipTests: XCTestCase {
         XCTAssertTrue(ownerSaved)
         let sessionID = try XCTUnwrap(owner.session.activeAgentSessionID)
         let persisted = try await owner.persistedSession()
-        XCTAssertEqual(persisted.lastRunState, AgentSessionRunState.idle.rawValue, "A persisted active run loads as idle")
+        // F-7: this same-launch read is a storage mutation, so the live owner's active run is kept as
+        // saved; only the cold hydration below maps it to idle.
+        XCTAssertEqual(persisted.lastRunState, AgentSessionRunState.running.rawValue, "A same-launch read keeps the saved active run")
         let fileURL = try XCTUnwrap(persisted.fileURL)
 
         // Another owner stays active in the peer window; the bound tab hydrates in the background.
@@ -2341,6 +2350,70 @@ final class AgentStaleResetOwnershipTests: XCTestCase {
         )
     }
 
+    func testDeletedSessionCleanupNeverRemovesAReplacementInstalledDuringItsTeardown() async throws {
+        let fixture = try await makePromptManagedFixture(windowID: 4391)
+        let viewModel = fixture.viewModel
+        let workspaceManager = fixture.workspaceManager
+        let workspaceID = fixture.workspace.id
+        let tabID = fixture.primaryTabID
+
+        // Crash-window state: the session is durably deleted, the tab is still bound to it.
+        let deletedID = UUID()
+        _ = try await viewModel.test_dataService.saveAgentSession(
+            AgentSession(id: deletedID, workspaceID: workspaceID, name: "Deleted elsewhere"),
+            for: fixture.workspace,
+            preparation: .alreadyCanonicalTranscript,
+            trustedCanonicalItemCount: 0
+        )
+        try await viewModel.test_dataService.deleteAgentSession(id: deletedID, for: fixture.workspace)
+        let old = try await viewModel.ensureSessionReady(tabID: tabID)
+        XCTAssertNotNil(viewModel.test_installPersistentSessionBinding(sessionID: deletedID, on: old, updateWorkspaceMetadata: true))
+        XCTAssertEqual(workspaceManager.activeAgentSessionID(forTabID: tabID, inWorkspaceID: workspaceID), deletedID)
+
+        // Held at the awaited-teardown boundary: a replacement owner with a fresh UUID and dirty
+        // content is installed on the same tab, then the old cleanup resumes.
+        let box = ReplacementOwnerBox()
+        viewModel.test_deletedSessionTeardownHook = { [box] held in
+            guard box.replacement == nil else { return }
+            box.heldOwnerWasOld = held === old
+            box.ownerDetachedBeforeTeardown = viewModel.sessions[tabID] == nil
+            box.durableBindingCleared = workspaceManager.activeAgentSessionID(forTabID: tabID, inWorkspaceID: workspaceID) == nil
+            guard let fresh = try? await viewModel.ensureSessionReady(tabID: tabID) else { return }
+            box.replacement = fresh
+            box.replacementID = viewModel.ensureSessionBoundToTab(fresh)
+            fresh.appendItem(.user("replacement content"))
+            fresh.isDirty = true
+        }
+        await viewModel.finalizeDeletedAgentSessionReferences(
+            sessionID: deletedID,
+            workspaceID: workspaceID,
+            reason: "restored_deleted_binding"
+        )
+        viewModel.test_deletedSessionTeardownHook = nil
+
+        XCTAssertTrue(box.heldOwnerWasOld, "Only the captured owner is torn down")
+        XCTAssertTrue(box.ownerDetachedBeforeTeardown, "The old owner leaves the tab before any awaited teardown")
+        XCTAssertTrue(box.durableBindingCleared, "The durable workspace binding to the deleted UUID is cleared")
+        let replacement = try XCTUnwrap(box.replacement)
+        let replacementID = try XCTUnwrap(box.replacementID)
+        XCTAssertFalse(replacement === old)
+        XCTAssertNotEqual(replacementID, deletedID)
+        XCTAssertTrue(viewModel.sessions[tabID] === replacement, "The replacement owner remains installed")
+        XCTAssertEqual(replacement.activeAgentSessionID, replacementID)
+        XCTAssertEqual(
+            workspaceManager.activeAgentSessionID(forTabID: tabID, inWorkspaceID: workspaceID),
+            replacementID,
+            "The old cleanup never clears the replacement's durable binding"
+        )
+        XCTAssertTrue(replacement.items.contains { $0.text == "replacement content" })
+        let saved = await viewModel.flushSave(for: tabID)
+        XCTAssertTrue(saved, "The replacement saves cleanly")
+        let persisted = try await viewModel.test_dataService.loadAgentSession(id: replacementID, for: fixture.workspace)
+        XCTAssertTrue(try XCTUnwrap(persisted).toLiveItems().contains { $0.text == "replacement content" })
+        let deleted = try await viewModel.test_dataService.loadAgentSession(id: deletedID, for: fixture.workspace)
+        XCTAssertNil(deleted, "The deleted session stays deleted")
+    }
+
     private struct PromptManagedFixture {
         let viewModel: AgentModeViewModel
         let promptManager: PromptViewModel
@@ -2583,6 +2656,15 @@ private final class StaleResetGate {
 private final class CreationResultBox {
     var finished = false
     var tabID: UUID?
+}
+
+@MainActor
+private final class ReplacementOwnerBox {
+    var replacement: AgentTabSession?
+    var replacementID: UUID?
+    var heldOwnerWasOld = false
+    var ownerDetachedBeforeTeardown = false
+    var durableBindingCleared = false
 }
 
 @MainActor

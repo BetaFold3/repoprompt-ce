@@ -207,6 +207,7 @@ package final class ACPIntegratedAgentModeRunner {
         initialUserMessage: String,
         initialMessageForRun: String,
         attachments: [AgentImageAttachment],
+        handoff: AgentProviderHandoff,
         runRequest: ACPRunRequest,
         makeLease: @escaping (_ runID: UUID) -> MCPBootstrapLease,
         providerStartAuthorizer: @escaping (_ runID: UUID) -> Bool,
@@ -217,8 +218,7 @@ package final class ACPIntegratedAgentModeRunner {
             _ authorized: Bool,
             _ startupFailureReason: String?
         ) -> Bool,
-        providerStartBootstrapObserver: @escaping () -> Void,
-        delegatedQuestionStageID: UUID? = nil
+        providerStartBootstrapObserver: @escaping () -> Void
     ) async {
         #if DEBUG
             var providerBoundaryResponsibilityTransferred = false
@@ -229,6 +229,14 @@ package final class ACPIntegratedAgentModeRunner {
                 }
             }
         #endif
+        // A run task owns the handoff once created; every earlier exit never reached the provider.
+        // Settling the handoff also settles the staged input it carries (`carriedStagedInput`).
+        var runTaskOwnsHandoff = false
+        defer {
+            if !runTaskOwnsHandoff {
+                handoff.settleRunInputScope()
+            }
+        }
         let attachmentReservationID = hooks.reserveAttachmentsForTurn(attachments, session)
 
         if initialMessageForRun != initialUserMessage,
@@ -305,7 +313,9 @@ package final class ACPIntegratedAgentModeRunner {
                         ).apply(to: deferredLease)
                     }
                 }
+                runTaskOwnsHandoff = true
                 session.agentTask = Task { [weak self, weak session] in
+                    defer { handoff.settleRunInputScope() }
                     guard let self, let session else { return }
                     if let clientNameHint = runRequest.agentKind.mcpClientNameHint {
                         await startToolTracking(for: session, runID: runID, clientNameHint: clientNameHint)
@@ -318,11 +328,11 @@ package final class ACPIntegratedAgentModeRunner {
                             runAttemptID: runAttemptID,
                             initialMessageForRun: initialMessageForRun,
                             attachments: attachments,
+                            handoff: handoff,
                             controller: existingController,
                             runRequest: runRequest,
                             deferredLease: deferredLease,
-                            attachmentReservationID: attachmentReservationID,
-                            delegatedQuestionStageID: delegatedQuestionStageID
+                            attachmentReservationID: attachmentReservationID
                         )
                     } onCancel: {}
                 }
@@ -475,7 +485,9 @@ package final class ACPIntegratedAgentModeRunner {
         let terminalCommitBarrier = terminalCommitBarrier
         let hooks = hooks
         let startupTeardownClaim = StartupTeardownClaim()
+        runTaskOwnsHandoff = true
         session.agentTask = Task { [weak self] in
+            defer { handoff.settleRunInputScope() }
             #if DEBUG
                 if runRequest.agentKind == .ohMyPi {
                     await beforeAgentTaskEntry()
@@ -497,7 +509,7 @@ package final class ACPIntegratedAgentModeRunner {
                    session.runID == runID,
                    session.acpController == nil || session.acpController === controller
                 {
-                    hooks.recordPendingHandoffSendOutcome(session, false)
+                    handoff.settleRunInputScope()
                     await terminalCommitBarrier.commit(.init(
                         session: session,
                         ownership: currentOwnership,
@@ -539,6 +551,7 @@ package final class ACPIntegratedAgentModeRunner {
                     runAttemptID: runAttemptID,
                     initialMessageForRun: initialMessageForRun,
                     attachments: attachments,
+                    handoff: handoff,
                     controller: controller,
                     runRequest: freshRunRequest,
                     lease: lease,
@@ -546,8 +559,7 @@ package final class ACPIntegratedAgentModeRunner {
                     providerStartBoundaryReporter: providerStartBoundaryReporter,
                     providerStartBootstrapObserver: providerStartBootstrapObserver,
                     attachmentReservationID: attachmentReservationID,
-                    startupTeardownClaim: startupTeardownClaim,
-                    delegatedQuestionStageID: delegatedQuestionStageID
+                    startupTeardownClaim: startupTeardownClaim
                 )
             } onCancel: { [weak self] in
                 guard freshRunRequest.agentKind == .ohMyPi else { return }
@@ -574,6 +586,11 @@ package final class ACPIntegratedAgentModeRunner {
         }
     }
 
+    /// Submits steering into the active ACP prompt. `handoff` carries the committed dispatch of
+    /// every steering constituent (in order): every return before the `session/prompt` call
+    /// reports no handoff; a throw without the documented write callback reports no handoff; a
+    /// throw after it stays delivery-unknown; the provider's `session/prompt` response is
+    /// acceptance.
     func submitActivePrompt(
         session: AgentTabSession,
         messageForRun: String,
@@ -581,8 +598,14 @@ package final class ACPIntegratedAgentModeRunner {
         runRequest: ACPRunRequest,
         targetRunID: UUID?,
         targetRunAttemptID: UUID?,
-        targetController: ACPAgentSessionController
+        targetController: ACPAgentSessionController,
+        handoff: AgentProviderHandoff
     ) async -> Bool {
+        defer {
+            if !handoff.handoffStarted {
+                handoff.noteNoHandoff()
+            }
+        }
         guard runRequest.agentKind == session.selectedAgent,
               runRequest.agentKind.acpProviderID != nil,
               session.runState == .running,
@@ -643,9 +666,13 @@ package final class ACPIntegratedAgentModeRunner {
             attachments
         )
 
+        let promptWrite = ACPPromptWriteObservation()
         do {
             log("active steering session/prompt begin attempt=\(runAttemptID)", runID: runID)
-            try await controller.prompt(agentMessage, request: runRequest)
+            guard handoff.enterProviderBoundary(in: session) else { return false }
+            try await controller.prompt(agentMessage, request: runRequest, onSubmitted: promptWrite.onSubmitted)
+            // The provider answered `session/prompt`: affirmative acceptance, recorded first.
+            handoff.noteAccepted()
             log("active steering session/prompt completed attempt=\(runAttemptID)", runID: runID)
             #if DEBUG
                 if let hold = ACPActiveSteeringPromptTestHook.afterPromptReturned {
@@ -660,6 +687,12 @@ package final class ACPIntegratedAgentModeRunner {
             // activeRunAttemptID to still be present here.
             return true
         } catch {
+            if promptWrite.wasWritten {
+                handoff.noteDeliveryUnknown()
+            } else {
+                // Documented boundary: building or writing the request failed; never written.
+                handoff.noteProvenNotWritten(message: String(describing: error))
+            }
             let identity = await controller.refreshProviderSessionIdentityAfterPromptInterruption()
             applyProviderSessionIdentity(identity, session: session)
             let normalized = await controller.normalizeError(error)
@@ -742,7 +775,7 @@ package final class ACPIntegratedAgentModeRunner {
               let ownership = session.activeRunOwnership,
               ownership.attemptID == runAttemptID
         else { return }
-        hooks.recordPendingHandoffSendOutcome(session, false)
+        // The staged input is released by the owning scope's handoff settlement (never handed off).
         await terminalCommitBarrier.commit(.init(
             session: session,
             ownership: ownership,
@@ -773,7 +806,7 @@ package final class ACPIntegratedAgentModeRunner {
               let ownership = session.activeRunOwnership,
               ownership.attemptID == runAttemptID
         else { return }
-        hooks.recordPendingHandoffSendOutcome(session, false)
+        // The staged input is released by the owning scope's handoff settlement (never handed off).
         await terminalCommitBarrier.commit(.init(
             session: session,
             ownership: ownership,
@@ -1065,6 +1098,7 @@ package final class ACPIntegratedAgentModeRunner {
         runAttemptID: UUID,
         initialMessageForRun: String,
         attachments: [AgentImageAttachment],
+        handoff: AgentProviderHandoff,
         controller: ACPAgentSessionController,
         runRequest: ACPRunRequest,
         lease: MCPBootstrapLease,
@@ -1078,8 +1112,7 @@ package final class ACPIntegratedAgentModeRunner {
         ) -> Bool,
         providerStartBootstrapObserver: () -> Void,
         attachmentReservationID: UUID?,
-        startupTeardownClaim: StartupTeardownClaim,
-        delegatedQuestionStageID: UUID?
+        startupTeardownClaim: StartupTeardownClaim
     ) async {
         #if DEBUG
             var providerBoundaryReported = false
@@ -1364,7 +1397,40 @@ package final class ACPIntegratedAgentModeRunner {
             var initialMessageForPromptTurn = initialMessageForRun
             if bootstrap.didFallbackToNewSessionAfterLoadFailure {
                 await hooks.stageResumeRecoveryHandoffIfNeeded(session)
-                initialMessageForPromptTurn = hooks.prependPendingHandoffIfNeeded(initialMessageForRun, session)
+                if handoff.isDurable {
+                    // Adopted plan §5: this input's dispatch commit is deferred to `runPromptTurn`,
+                    // so the recovery handoff this fallback created is staged now and its exact
+                    // snapshot is attached to the still-queued carrier at that commit. If it cannot
+                    // be staged durably the send is blocked with its input saved — never sent to
+                    // the fresh session without its history.
+                    switch await hooks.stagePendingHandoffForDurableDispatch(initialMessageForRun, session) {
+                    case .none:
+                        break
+                    case let .staged(staged, snapshot):
+                        initialMessageForPromptTurn = staged.text
+                        handoff.carryStagedInput(AgentCarriedStagedInput(pendingHandoffStage: staged.pendingHandoffStage))
+                        handoff.notePendingHandoff(snapshot)
+                    case .failed:
+                        handoff.blockBeforeHandoff(.pendingHandoffNotSaved)
+                        await finalize(
+                            session: session,
+                            runID: runID,
+                            runAttemptID: runAttemptID,
+                            controller: controller,
+                            attachmentReservationID: attachmentReservationID,
+                            terminalState: .failed,
+                            errorText: AgentProviderHandoff.CommitFailure.pendingHandoffNotSaved.userText,
+                            notifyTurnComplete: false,
+                            shouldShutdownController: false
+                        )
+                        return
+                    }
+                } else {
+                    let staged = hooks.prependPendingHandoffIfNeeded(initialMessageForRun, session)
+                    initialMessageForPromptTurn = staged.text
+                    // The recovery handoff now rides on this prompt: its handoff settles that stage.
+                    handoff.carryStagedInput(AgentCarriedStagedInput(pendingHandoffStage: staged.pendingHandoffStage))
+                }
             }
             applyProviderSessionIdentity(
                 bootstrap.providerSessionIdentity,
@@ -1418,10 +1484,10 @@ package final class ACPIntegratedAgentModeRunner {
                 runAttemptID: runAttemptID,
                 initialMessageForRun: initialMessageForPromptTurn,
                 attachments: attachments,
+                handoff: handoff,
                 controller: controller,
                 runRequest: runRequest,
-                attachmentReservationID: attachmentReservationID,
-                delegatedQuestionStageID: delegatedQuestionStageID
+                attachmentReservationID: attachmentReservationID
             )
         } catch is CancellationError {
             if !providerInitializationCompleted {
@@ -1479,11 +1545,11 @@ package final class ACPIntegratedAgentModeRunner {
         runAttemptID: UUID,
         initialMessageForRun: String,
         attachments: [AgentImageAttachment],
+        handoff: AgentProviderHandoff,
         controller: ACPAgentSessionController,
         runRequest: ACPRunRequest,
         deferredLease: MCPBootstrapLease?,
-        attachmentReservationID: UUID?,
-        delegatedQuestionStageID: UUID?
+        attachmentReservationID: UUID?
     ) async {
         do {
             guard await controller.hasReusableSession else {
@@ -1547,10 +1613,10 @@ package final class ACPIntegratedAgentModeRunner {
                 runAttemptID: runAttemptID,
                 initialMessageForRun: initialMessageForRun,
                 attachments: attachments,
+                handoff: handoff,
                 controller: controller,
                 runRequest: runRequest,
-                attachmentReservationID: attachmentReservationID,
-                delegatedQuestionStageID: delegatedQuestionStageID
+                attachmentReservationID: attachmentReservationID
             )
         } catch is CancellationError {
             await finalize(
@@ -1588,11 +1654,95 @@ package final class ACPIntegratedAgentModeRunner {
         runAttemptID: UUID,
         initialMessageForRun: String,
         attachments: [AgentImageAttachment],
+        handoff: AgentProviderHandoff,
         controller: ACPAgentSessionController,
         runRequest: ACPRunRequest,
-        attachmentReservationID: UUID?,
-        delegatedQuestionStageID: UUID?
+        attachmentReservationID: UUID?
     ) async {
+        // Attach the input's delivery attempts to this run attempt before the provider is
+        // invoked, then require the exact attempt and controller to still own the session.
+        guard let ownership = session.activeRunOwnership,
+              ownership.attemptID == runAttemptID,
+              session.runID == runID,
+              session.acpController === controller,
+              !Task.isCancelled
+        else {
+            handoff.noteNoHandoff()
+            await finalize(
+                session: session,
+                runID: runID,
+                runAttemptID: runAttemptID,
+                controller: controller,
+                attachmentReservationID: attachmentReservationID,
+                terminalState: .cancelled,
+                errorText: nil,
+                notifyTurnComplete: false,
+                shouldShutdownController: true
+            )
+            return
+        }
+        if case let .failure(failure) = await handoff.attachRunAttempt(
+            ownership: ownership,
+            processRunID: runID,
+            session: session
+        ) {
+            handoff.noteNoHandoff(message: "run attempt not recorded: \(failure)")
+            await finalize(
+                session: session,
+                runID: runID,
+                runAttemptID: runAttemptID,
+                controller: controller,
+                attachmentReservationID: attachmentReservationID,
+                terminalState: .failed,
+                errorText: "This message was not sent because its delivery could not be recorded. It stays saved.",
+                notifyTurnComplete: false,
+                shouldShutdownController: false
+            )
+            return
+        }
+        // Deferred dispatch commit (adopted plan §5), after the bootstrap and any fallback staging:
+        // the noted pending-handoff snapshot is attached to the still-queued carrier first. If that
+        // cannot be completed the send is blocked with its input saved; late payloads also block.
+        var commitFailure: AgentProviderHandoff.CommitFailure?
+        if case let .failure(failure) = await handoff.commitDispatch(session: session) {
+            commitFailure = failure
+        } else if handoff.pendingHandoffCreatedAfterCommit(in: session) {
+            commitFailure = .pendingHandoffAfterCommit
+        }
+        if let commitFailure {
+            handoff.blockBeforeHandoff(commitFailure)
+            await finalize(
+                session: session,
+                runID: runID,
+                runAttemptID: runAttemptID,
+                controller: controller,
+                attachmentReservationID: attachmentReservationID,
+                terminalState: .failed,
+                errorText: commitFailure.userText,
+                notifyTurnComplete: false,
+                shouldShutdownController: false
+            )
+            return
+        }
+        guard session.activeRunAttemptID == runAttemptID,
+              session.runID == runID,
+              session.acpController === controller,
+              !Task.isCancelled
+        else {
+            handoff.noteNoHandoff()
+            await finalize(
+                session: session,
+                runID: runID,
+                runAttemptID: runAttemptID,
+                controller: controller,
+                attachmentReservationID: attachmentReservationID,
+                terminalState: .cancelled,
+                errorText: nil,
+                notifyTurnComplete: false,
+                shouldShutdownController: true
+            )
+            return
+        }
         log("prompt turn begin", runID: runID)
         setRunningStatus("Thinking…", source: .transport, session: session, urgent: true)
         let agentMessage = hooks.buildHeadlessAgentMessage(
@@ -1601,17 +1751,34 @@ package final class ACPIntegratedAgentModeRunner {
             runID,
             attachments
         )
-        hooks.recordPendingHandoffSendOutcome(session, true)
-        // Delegated child-question notices in this input acknowledge only at the actual
-        // `session/prompt` write — not optimistically here, and not at turn end (plan §6.2).
-        let delegatedQuestionAcknowledgement = makeDelegatedQuestionPromptAcknowledgement(
-            session: session,
-            stageID: delegatedQuestionStageID
-        )
+        // Staged input in this prompt (pending handoff and delegated child-question notices) settles
+        // only at the actual `session/prompt` write — not optimistically here, and not at turn end
+        // (plan §6.2; ACP `onSubmitted` is the stage-delivery boundary, not acceptance).
+        let stagedInputAcknowledgement = makeStagedInputPromptAcknowledgement(handoff: handoff)
+        // `onSubmitted` proves only the `session/prompt` write; the provider's response proves
+        // acceptance.
+        let promptWrite = ACPPromptWriteObservation(forwarding: stagedInputAcknowledgement.onSubmitted)
         hooks.stageConsumedAttachmentFilesForDeferredCleanup(attachments, session)
         hooks.markAttachmentsConsumed(session, attachmentReservationID)
 
         let events = await controller.events
+        // Final synchronous ownership check (no await before the prompt write): a lane retired
+        // or frozen for reset after the dispatch commit settles this attempt as never handed off.
+        guard handoff.enterProviderBoundary(in: session) else {
+            await stagedInputAcknowledgement.settle()
+            await finalize(
+                session: session,
+                runID: runID,
+                runAttemptID: runAttemptID,
+                controller: controller,
+                attachmentReservationID: attachmentReservationID,
+                terminalState: .failed,
+                errorText: AgentProviderHandoff.sessionChangedBeforeHandoffMessage,
+                notifyTurnComplete: false,
+                shouldShutdownController: true
+            )
+            return
+        }
         let consumeTask = Task { @MainActor [weak self, weak session] in
             guard let self, let session else {
                 return ConsumeEventsOutcome(terminalState: .failed, errorText: "ACP event consumer deallocated.")
@@ -1629,15 +1796,24 @@ package final class ACPIntegratedAgentModeRunner {
             try await controller.prompt(
                 agentMessage,
                 request: runRequest,
-                onSubmitted: delegatedQuestionAcknowledgement.onSubmitted
+                onSubmitted: promptWrite.onSubmitted
             )
-            await delegatedQuestionAcknowledgement.settle()
+            // The provider answered `session/prompt`: affirmative acceptance, recorded before any
+            // reconciliation below.
+            handoff.noteAccepted()
+            await stagedInputAcknowledgement.settle()
             let identity = await controller.currentProviderSessionIdentity()
             applyProviderSessionIdentity(identity, session: session)
             log("controller.prompt returned; awaiting event consumer", runID: runID)
         } catch {
-            // Releases the staged notices unless the prompt was actually written.
-            await delegatedQuestionAcknowledgement.settle()
+            if promptWrite.wasWritten {
+                handoff.noteDeliveryUnknown()
+            } else {
+                // Documented boundary: building or writing the request failed; never written.
+                handoff.noteProvenNotWritten(message: String(describing: error))
+            }
+            // Releases the staged input unless the prompt was actually written.
+            await stagedInputAcknowledgement.settle()
             let identity = await controller.refreshProviderSessionIdentityAfterPromptInterruption()
             applyProviderSessionIdentity(identity, session: session)
             let normalizedError = await controller.normalizeError(error)
@@ -1675,26 +1851,23 @@ package final class ACPIntegratedAgentModeRunner {
         )
     }
 
-    /// Settles delegated child-question notices staged into one ACP prompt (plan §6.2):
-    /// `onSubmitted` (passed to `ACPAgentSessionController.prompt`) fires at the actual
-    /// `session/prompt` write and acknowledges that exact stage; `settle()` — awaited once the
-    /// prompt returned or threw, before finalization — releases the stage when no write happened
-    /// and otherwise just joins the acknowledgement. A nil stage is a no-op.
-    private func makeDelegatedQuestionPromptAcknowledgement(
-        session: AgentTabSession,
-        stageID: UUID?
+    /// Settles the staged input `handoff` carries into one ACP prompt (plan §6.2): `onSubmitted`
+    /// (passed to `ACPAgentSessionController.prompt`) fires at the actual `session/prompt` write
+    /// and settles those exact stages as sent; `settle()` — awaited once the prompt returned or
+    /// threw, before finalization — otherwise classifies them from the handoff's evidence (a
+    /// prompt never written releases them) and joins the acknowledgement.
+    private func makeStagedInputPromptAcknowledgement(
+        handoff: AgentProviderHandoff
     ) -> (onSubmitted: (@Sendable () -> Void)?, settle: () async -> Void) {
-        guard let stageID else { return (nil, {}) }
         let (submissions, continuation) = AsyncStream<Void>.makeStream(bufferingPolicy: .bufferingNewest(1))
         let hooks = hooks
-        let acknowledgement = Task { @MainActor [weak session] in
+        let acknowledgement = Task { @MainActor in
             var submitted = false
             for await _ in submissions {
                 submitted = true
                 break
             }
-            guard let session else { return }
-            hooks.recordDelegatedQuestionNoticeSendOutcome(session, stageID, submitted)
+            hooks.recordStagedInputSendOutcome(handoff: handoff, sent: submitted)
         }
         return (
             onSubmitted: {
@@ -1862,7 +2035,7 @@ package final class ACPIntegratedAgentModeRunner {
         guard let ownership = session.activeRunOwnership,
               ownership.attemptID == runAttemptID
         else { return }
-        hooks.recordPendingHandoffSendOutcome(session, false)
+        // The staged input is released by the owning task's handoff settlement (never handed off).
         await terminalCommitBarrier.commit(.init(
             session: session,
             ownership: ownership,

@@ -1987,11 +1987,11 @@ final class AgentRunWorktreeStartTests: AgentRunWorktreeStartGitSeedTestCase {
                 attachments: [],
                 taggedFileAttachments: [],
                 draftText: "queued ACP draft",
-                optimisticUserItemID: nil,
+                identity: .inactiveForTesting(in: session),
                 createdAt: Date()
             )
         ]
-        session.pendingInstructions = ["queued shared draft"]
+        session.setUntrackedPendingInstructionsForTesting(["queued shared draft"])
         viewModel.test_setCurrentTabIDOverride(tabID)
         defer { viewModel.test_setCurrentTabIDOverride(nil) }
 

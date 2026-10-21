@@ -359,6 +359,14 @@ package final class AgentRunTerminalCommitBarrier {
         )
         session.lastTerminalCommitRevision = revision
         session.lastTerminalPublicationResult = nil
+        // Recovery terminal evidence does not depend on MCP publication (local runs have no
+        // envelope). Recorded only for the lane bound to this run's persistent session. The turn
+        // the process run was retained in completes a missing turn join (R08).
+        if let lane = session.recoveryLane,
+           request.ownership.binding.persistentSessionID == lane.sessionID
+        {
+            lane.recordTerminalEvidence(revision, transcriptTurnID: terminalTurnID)
+        }
 
         hooks.updateBindings(session)
         var attentionCapture: AttentionNotificationCapture?
@@ -470,7 +478,7 @@ package final class AgentRunTerminalCommitBarrier {
         session: AgentTabSession,
         revision: AgentRunTerminalCommitRevision,
         publicationResult: AgentRunTerminalPublicationResult?
-    ) -> String? {
+    ) -> AgentPendingInstruction? {
         guard revision.successorKind != nil,
               revision.providerSuccessorID == nil,
               let publicationResult
@@ -488,7 +496,9 @@ package final class AgentRunTerminalCommitBarrier {
             return nil
         case .stale:
             session.terminalFollowUpTakenCommitID = revision.commitID
-            if !session.pendingInstructions.isEmpty {
+            // Untracked input keeps the legacy drop. A durable input is never silently discarded:
+            // it stays queued for a later boundary or explicit user action.
+            if let head = session.pendingInstructions.first, !head.isDurable {
                 session.pendingInstructions.removeFirst()
             }
             session.mcpFollowUpRunPending = false

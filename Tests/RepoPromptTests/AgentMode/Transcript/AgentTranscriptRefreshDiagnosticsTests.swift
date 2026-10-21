@@ -310,8 +310,11 @@ final class AgentTranscriptRefreshDiagnosticsTests: XCTestCase {
             persisted.lastRunState = AgentSessionRunState.running.rawValue
             let fileURL = try await AgentSessionDataService().saveAgentSession(persisted, for: workspace)
 
-            // Load normalization, including the cold-restore sanitize.
-            let loaded = try await AgentSessionDataService().loadAgentSession(from: fileURL)
+            // Load normalization, including the cold-restore sanitize (F-7: a cold-restore load; the
+            // generic loader is a storage mutation and never sanitizes).
+            XCTAssertEqual(fileURL.lastPathComponent, "AgentSession-\(persisted.id.uuidString).json", label)
+            let coldLoad = try await AgentSessionDataService().loadAgentSessionForEditing(id: persisted.id, for: workspace)
+            let loaded = try XCTUnwrap(coldLoad, label).session
             XCTAssertEqual(loaded.lastRunState, AgentSessionRunState.idle.rawValue, label)
             let restored = try XCTUnwrap(loaded.transcript, label)
             let restoredFinal = try XCTUnwrap(restored.turns.last, label)

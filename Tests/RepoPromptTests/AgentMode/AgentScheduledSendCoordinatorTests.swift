@@ -1080,6 +1080,214 @@ final class AgentScheduledSendCoordinatorTests: XCTestCase {
         }
     }
 
+    // MARK: - Lossless-restart startup barrier and R9 transfer holds
+
+    func testClosedStartupAdmissionBlocksEvaluationHydrationAndConsentUntilOpened() async {
+        let start = Date(timeIntervalSince1970: 60000)
+        let clock = FakeScheduledSendClock(now: start)
+        let coordinator = AgentScheduledSendCoordinator(clock: clock.clock, startupAdmission: .awaitingRecovery)
+        XCTAssertTrue(coordinator.closeStartupAdmission(), "Closed before any host registered")
+        let host = FakeScheduledSendHost()
+        let record = makeRecord(createdAt: start, notBefore: start.addingTimeInterval(20))
+        host.addScheduledSession(record: record)
+        let stub = makeRecord(createdAt: start, notBefore: start.addingTimeInterval(1))
+        host.addScheduledSession(record: stub, isHydrated: false)
+
+        coordinator.register(host)
+        clock.advance(to: start.addingTimeInterval(2))
+        coordinator.evaluate()
+        coordinator.confirmAndSendNow(scheduleID: record.id)
+        await drainTasks()
+        XCTAssertFalse(coordinator.isStartupAdmissionOpen)
+        XCTAssertFalse(coordinator.closeStartupAdmission(), "A late close reports the ordering violation")
+        XCTAssertTrue(host.dispatches.isEmpty)
+        XCTAssertEqual(host.hydrationCount, 0, "No hydration (and so no hydration normalization) before the barrier")
+        XCTAssertTrue(host.mutationRequests.isEmpty)
+
+        coordinator.openStartupAdmission()
+        await drainTasks()
+        XCTAssertFalse(
+            host.dispatches.contains { $0.scheduleID == record.id },
+            "Send-now consent offered before the barrier was refused, so the future deadline still applies"
+        )
+    }
+
+    func testOpeningStartupAdmissionReleasesFutureDeadlinesUnchanged() async {
+        let start = Date(timeIntervalSince1970: 61000)
+        let clock = FakeScheduledSendClock(now: start)
+        let coordinator = AgentScheduledSendCoordinator(clock: clock.clock, startupAdmission: .awaitingRecovery)
+        let host = FakeScheduledSendHost()
+        let record = makeRecord(createdAt: start, notBefore: start.addingTimeInterval(30))
+        host.addScheduledSession(record: record)
+        coordinator.register(host)
+        await drainTasks()
+
+        let opened = Task { await coordinator.awaitStartupAdmission() }
+        coordinator.openStartupAdmission()
+        let didOpen = await opened.value
+        XCTAssertTrue(didOpen)
+        await drainTasks()
+        XCTAssertTrue(host.dispatches.isEmpty, "A future deadline still waits for its deadline")
+
+        clock.advance(to: record.notBefore)
+        await drainTasks()
+        XCTAssertEqual(host.dispatches.map(\.scheduleID), [record.id])
+    }
+
+    func testFailedStartupAdmissionStaysClosedAndResumesWaitersWithFailure() async {
+        let start = Date(timeIntervalSince1970: 61500)
+        let clock = FakeScheduledSendClock(now: start)
+        let coordinator = AgentScheduledSendCoordinator(clock: clock.clock, startupAdmission: .awaitingRecovery)
+        let host = FakeScheduledSendHost()
+        let record = makeRecord(createdAt: start, notBefore: start.addingTimeInterval(5))
+        host.addScheduledSession(record: record)
+        coordinator.register(host)
+
+        let waiter = Task { await coordinator.awaitStartupAdmission() }
+        await drainTasks()
+        coordinator.failStartupAdmission("reconciliation failed")
+        let opened = await waiter.value
+        XCTAssertFalse(opened)
+        XCTAssertEqual(coordinator.startupAdmission, .recoveryFailed("reconciliation failed"))
+        clock.advance(to: record.notBefore)
+        coordinator.evaluate()
+        await drainTasks()
+        XCTAssertTrue(host.dispatches.isEmpty)
+    }
+
+    func testTransferHoldSuppressesDeliveryUnknownConfirmationConsentAndDispatch() async {
+        let start = Date(timeIntervalSince1970: 62000)
+        let clock = FakeScheduledSendClock(now: start)
+        let coordinator = AgentScheduledSendCoordinator(clock: clock.clock)
+        let host = FakeScheduledSendHost()
+        let workspaceID = UUID()
+        let sessionID = UUID()
+        var record = makeRecord(createdAt: start, notBefore: start)
+        let attempt = AgentScheduledSendPersist.Attempt(attemptID: UUID(), itemID: UUID(), startedAt: start)
+        record.state = .dispatching
+        record.attempt = attempt
+        host.addScheduledSession(sessionID: sessionID, workspaceID: workspaceID, record: record)
+        let hold = AgentScheduledSendTransferHold(
+            sessionID: sessionID,
+            scheduleID: record.id,
+            scheduleAttemptID: attempt.attemptID,
+            reason: .awaitingRecovery
+        )
+        coordinator.holdTransfer(hold)
+
+        coordinator.register(host)
+        coordinator.confirmAndSendNow(scheduleID: record.id)
+        await drainTasks()
+        XCTAssertEqual(coordinator.transferHold(sessionID: sessionID), hold)
+        XCTAssertTrue(host.mutationRequests.isEmpty, "No duplicate delivery-unknown confirmation for a held transfer")
+        XCTAssertTrue(coordinator.dashboardPendingConfirmations(in: workspaceID).isEmpty)
+        XCTAssertTrue(host.dispatches.isEmpty)
+
+        // A different attempt cannot release this hold.
+        coordinator.releaseTransferHold(scheduleID: record.id, scheduleAttemptID: UUID())
+        XCTAssertNotNil(coordinator.transferHold(scheduleID: record.id))
+
+        // No linked intent: the legacy delivery-unknown normalization applies once released.
+        coordinator.releaseTransferHold(scheduleID: record.id, scheduleAttemptID: attempt.attemptID)
+        await drainTasks()
+        XCTAssertNil(coordinator.transferHold(scheduleID: record.id))
+        XCTAssertEqual(host.record(scheduleID: record.id)?.state, .needsConfirmation)
+        XCTAssertEqual(host.record(scheduleID: record.id)?.confirmationReason, .deliveryUnknown)
+        XCTAssertTrue(host.dispatches.isEmpty)
+    }
+
+    func testMandatoryTransferResolutionHydratesDispatchingStubInsteadOfConfirmingIt() async {
+        let start = Date(timeIntervalSince1970: 63000)
+        let clock = FakeScheduledSendClock(now: start)
+        let coordinator = AgentScheduledSendCoordinator(clock: clock.clock)
+        coordinator.dispatchingRecordsRequireTransferResolution = true
+        let host = FakeScheduledSendHost()
+        host.holdHydration = true
+        let workspaceID = UUID()
+        var record = makeRecord(createdAt: start, notBefore: start)
+        record.state = .dispatching
+        record.attempt = AgentScheduledSendPersist.Attempt(attemptID: UUID(), itemID: UUID(), startedAt: start)
+        host.addScheduledSession(workspaceID: workspaceID, record: record, isHydrated: false)
+
+        coordinator.register(host)
+        await drainTasks()
+        XCTAssertEqual(host.heldHydrationCount, 1, "Only the hydrated host may decide the transfer")
+        XCTAssertTrue(host.mutationRequests.isEmpty)
+        XCTAssertTrue(coordinator.dashboardPendingConfirmations(in: workspaceID).isEmpty)
+        XCTAssertTrue(host.dispatches.isEmpty)
+        host.releaseHeldHydrations()
+        await drainTasks()
+    }
+
+    func testHeldForRecoveryOutcomeNeverConfirmsRedrivesOrCreatesAttentionRecord() async {
+        let start = Date(timeIntervalSince1970: 63500)
+        let clock = FakeScheduledSendClock(now: start)
+        let coordinator = AgentScheduledSendCoordinator(clock: clock.clock)
+        coordinator.dispatchingRecordsRequireTransferResolution = true
+        let host = FakeScheduledSendHost()
+        host.automaticOutcome = .heldForRecovery
+        let workspaceID = UUID()
+        let sessionID = UUID()
+        let record = makeRecord(createdAt: start, notBefore: start.addingTimeInterval(5))
+        host.addScheduledSession(sessionID: sessionID, workspaceID: workspaceID, record: record)
+        // The real host places the exact-attempt transfer hold before reporting the outcome.
+        host.onDispatchEntered = { [coordinator] _ in
+            coordinator.holdTransfer(AgentScheduledSendTransferHold(
+                sessionID: sessionID,
+                scheduleID: record.id,
+                scheduleAttemptID: UUID(),
+                reason: .unresolved("Delivery of this scheduled message could not be confirmed.")
+            ))
+        }
+
+        coordinator.register(host)
+        clock.advance(to: record.notBefore)
+        await drainTasks()
+        XCTAssertEqual(host.dispatches.map(\.scheduleID), [record.id])
+        XCTAssertEqual(host.record(scheduleID: record.id)?.state, .dispatching, "The pending schedule stays projected as-is")
+        XCTAssertNotNil(coordinator.transferHold(scheduleID: record.id))
+        XCTAssertNil(coordinator.recoveryStatus(sessionID: sessionID), "The hold, not a needs-attention record, owns presentation")
+        XCTAssertNil(coordinator.activeAdmission(sessionID: sessionID))
+
+        coordinator.confirmAndSendNow(scheduleID: record.id)
+        clock.advance(to: record.notBefore.addingTimeInterval(60))
+        coordinator.recordDidChange()
+        await drainTasks()
+        XCTAssertEqual(host.dispatches.count, 1, "A held attempt is never re-driven")
+        XCTAssertTrue(host.mutationRequests.isEmpty, "No delivery-unknown confirmation is written for a held attempt")
+        XCTAssertTrue(coordinator.dashboardPendingConfirmations(in: workspaceID).isEmpty)
+    }
+
+    func testUnresolvedRecoveryBlocksNewSessionStartEvenWhenRunningAlongside() async {
+        let start = Date(timeIntervalSince1970: 64000)
+        let clock = FakeScheduledSendClock(now: start)
+        let coordinator = AgentScheduledSendCoordinator(clock: clock.clock)
+        let workspaceID = UUID()
+        let scheduledHost = FakeScheduledSendHost()
+        let recoveryHost = FakeScheduledSendHost()
+        recoveryHost.unresolvedRecoveryWorkspaceIDs = [workspaceID]
+        let record = makeRecord(
+            createdAt: start,
+            notBefore: start.addingTimeInterval(10),
+            isNewSessionStart: true,
+            runAlongsideOtherSessions: true
+        )
+        scheduledHost.addScheduledSession(workspaceID: workspaceID, record: record)
+        XCTAssertTrue(AgentScheduledSendBusyState(hasUnresolvedRecovery: true).isBusy)
+
+        coordinator.register(scheduledHost)
+        coordinator.register(recoveryHost)
+        clock.advance(to: record.notBefore)
+        await drainTasks()
+        XCTAssertTrue(scheduledHost.dispatches.isEmpty)
+
+        recoveryHost.unresolvedRecoveryWorkspaceIDs = []
+        coordinator.recordDidChange()
+        await drainTasks()
+        XCTAssertEqual(scheduledHost.dispatches.map(\.scheduleID), [record.id])
+        XCTAssertEqual(scheduledHost.dispatches.first?.lease.runAlongsideOtherSessions, true)
+    }
+
     private func makeRecord(
         id: UUID = UUID(),
         createdAt: Date,
@@ -1903,7 +2111,13 @@ final class AgentScheduledSendCoordinatorTests: XCTestCase {
         let start = Date(timeIntervalSince1970: 36000)
         let clock = FakeScheduledSendClock(now: start)
         let coordinator = AgentScheduledSendCoordinator(clock: clock.clock, recoveryRetryDelays: [1, 1, 1])
-        let fixture = try await makeRecoveryFixture(name: "Deleted", createdAt: start, notBefore: start.addingTimeInterval(10))
+        // Stored through a symlinked directory: deletion is matched by the canonical file key.
+        let fixture = try await makeRecoveryFixture(
+            name: "Deleted",
+            createdAt: start,
+            notBefore: start.addingTimeInterval(10),
+            storageThroughSymlink: true
+        )
         let failures = RecoveryFailureSwitch()
         await fixture.service.test_setScheduledSendRecoveryFailureInjector { [failures] _ in failures.next() }
         let handoff = RecoveryHandoffRecorder()
@@ -1919,6 +2133,7 @@ final class AgentScheduledSendCoordinatorTests: XCTestCase {
             failures.callCount == 1 && Self.isWaitingToRetry(coordinator.recoveryStatus(sessionID: fixture.sessionID)?.phase)
         }
         let payload = try XCTUnwrap(handoff.payload)
+        XCTAssertNotEqual(payload.context.fileURL.path, payload.context.fileKey.path, "The fixture path is not canonical")
 
         // Explicit deletion through the gated data service advances the deletion generation.
         try await fixture.service.deleteAgentSession(id: fixture.sessionID, for: fixture.workspace)
@@ -2042,7 +2257,12 @@ final class AgentScheduledSendCoordinatorTests: XCTestCase {
         let record: AgentScheduledSendPersist
     }
 
-    private func makeRecoveryFixture(name: String, createdAt: Date, notBefore: Date) async throws -> RecoveryFixture {
+    private func makeRecoveryFixture(
+        name: String,
+        createdAt: Date,
+        notBefore: Date,
+        storageThroughSymlink: Bool = false
+    ) async throws -> RecoveryFixture {
         let service = AgentSessionDataService()
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("AgentScheduledSendCoordinatorTests", isDirectory: true)
@@ -2051,7 +2271,14 @@ final class AgentScheduledSendCoordinatorTests: XCTestCase {
         addTeardownBlock {
             try? FileManager.default.removeItem(at: directory)
         }
-        let workspace = WorkspaceModel(name: name, repoPaths: ["/tmp/repo"], customStoragePath: directory)
+        var storage = directory
+        if storageThroughSymlink {
+            let target = directory.appendingPathComponent("storage", isDirectory: true)
+            try FileManager.default.createDirectory(at: target, withIntermediateDirectories: true)
+            storage = directory.appendingPathComponent("storage-link", isDirectory: true)
+            try FileManager.default.createSymbolicLink(at: storage, withDestinationURL: target)
+        }
+        let workspace = WorkspaceModel(name: name, repoPaths: ["/tmp/repo"], customStoragePath: storage)
         let record = makeRecord(createdAt: createdAt, notBefore: notBefore, isNewSessionStart: false)
         let sessionID = UUID()
         _ = try await service.saveAgentSession(
@@ -2300,6 +2527,8 @@ private final class FakeScheduledSendHost: AgentScheduledSendCoordinatorHost {
 
     var holdDispatches = false
     var suppressCandidatesWhileDispatching = false
+    /// Workspaces in which this host reports unresolved lossless-restart recovery.
+    var unresolvedRecoveryWorkspaceIDs: Set<UUID> = []
     var automaticOutcome: ScheduledDispatchOutcome = .accepted
     var hydrationSucceeds = true
     /// When set, `ensureHydrated` suspends until `releaseHeldHydrations()`.
@@ -2409,6 +2638,10 @@ private final class FakeScheduledSendHost: AgentScheduledSendCoordinatorHost {
                 && $0.sessionID != sessionID
                 && $0.busyState.isBusy
         }
+    }
+
+    func hasUnresolvedRecoverySession(inWorkspace workspaceID: UUID, excluding _: UUID) -> Bool {
+        unresolvedRecoveryWorkspaceIDs.contains(workspaceID)
     }
 
     func scheduledSendBusyStateExcludingDispatchReservation(
@@ -2627,7 +2860,8 @@ private final class FakeScheduledSendHost: AgentScheduledSendCoordinatorHost {
         case .failedBeforeHandoff:
             record.state = .failed
             session.record = record
-        case .unknownAfterHandoff:
+        case .unknownAfterHandoff, .heldForRecovery:
+            // A held transfer keeps the attempt projected as-is (`.dispatching`), like the real host.
             record.state = .dispatching
             if projectedRecord == nil {
                 record.updatedAt = lease.admittedUpdatedAt.addingTimeInterval(0.001)

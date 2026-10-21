@@ -337,8 +337,11 @@ package final class AgentTabSession: ObservableObject {
     /// when MCP control is active, `.userConfigured` otherwise.
     package var permissionProfile: AgentProviderPermissionProfile = .userConfigured
 
-    // Instruction queue for when user sends while agent is not waiting (shared across all runners)
-    package var pendingInstructions: [String] = []
+    /// Instruction queue for when user sends while agent is not waiting (shared across all runners).
+    /// Each entry carries the identity of the user input(s) it delivers.
+    package var pendingInstructions: [AgentPendingInstruction] = []
+    /// `.inactive` until recovery activation; `.mandatory` refuses untracked queued input.
+    package var recoveryAdmissionMode: AgentRecoveryAdmissionMode = .inactive
     package let codexSteerAckTracker = CodexSteerAckTracker()
 
     /// Claude-only steering queue — carries draft text for restoration on cancel/failure
@@ -354,8 +357,8 @@ package final class AgentTabSession: ObservableObject {
         let taggedFileAttachments: [AgentTaggedFileAttachment]
         /// The original user-typed text to restore into the composer on failure/cancel.
         let draftText: String
-        /// The optimistic user bubble we appended (for potential removal on failure).
-        let optimisticUserItemID: UUID?
+        /// The queued user input this steering delivers (its user item is the optimistic bubble).
+        package let identity: AgentQueuedInputIdentity
         let createdAt: Date
         /// Claude turn completions protected by this accepted steering instruction.
         var supersedingProtectedTurnIDs: Set<UUID> = []
@@ -368,7 +371,7 @@ package final class AgentTabSession: ObservableObject {
             attachments: [AgentImageAttachment],
             taggedFileAttachments: [AgentTaggedFileAttachment],
             draftText: String,
-            optimisticUserItemID: UUID?,
+            identity: AgentQueuedInputIdentity,
             createdAt: Date,
             supersedingProtectedTurnIDs: Set<UUID> = []
         ) {
@@ -379,9 +382,14 @@ package final class AgentTabSession: ObservableObject {
             self.attachments = attachments
             self.taggedFileAttachments = taggedFileAttachments
             self.draftText = draftText
-            self.optimisticUserItemID = optimisticUserItemID
+            self.identity = identity
             self.createdAt = createdAt
             self.supersedingProtectedTurnIDs = supersedingProtectedTurnIDs
+        }
+
+        /// The optimistic user bubble we appended (for potential removal on failure).
+        var optimisticUserItemID: UUID? {
+            identity.userItemID
         }
     }
 
@@ -408,8 +416,8 @@ package final class AgentTabSession: ObservableObject {
         let taggedFileAttachments: [AgentTaggedFileAttachment]
         /// The original user-typed text to restore into the composer on failure/cancel.
         let draftText: String
-        /// The optimistic user bubble we appended (for potential removal on failure).
-        let optimisticUserItemID: UUID?
+        /// The queued user input this steering delivers (its user item is the optimistic bubble).
+        package let identity: AgentQueuedInputIdentity
         let createdAt: Date
 
         package init(
@@ -421,7 +429,7 @@ package final class AgentTabSession: ObservableObject {
             attachments: [AgentImageAttachment],
             taggedFileAttachments: [AgentTaggedFileAttachment],
             draftText: String,
-            optimisticUserItemID: UUID?,
+            identity: AgentQueuedInputIdentity,
             createdAt: Date
         ) {
             self.id = id
@@ -432,8 +440,13 @@ package final class AgentTabSession: ObservableObject {
             self.attachments = attachments
             self.taggedFileAttachments = taggedFileAttachments
             self.draftText = draftText
-            self.optimisticUserItemID = optimisticUserItemID
+            self.identity = identity
             self.createdAt = createdAt
+        }
+
+        /// The optimistic user bubble we appended (for potential removal on failure).
+        var optimisticUserItemID: UUID? {
+            identity.userItemID
         }
     }
 
@@ -609,7 +622,8 @@ package final class AgentTabSession: ObservableObject {
         package let images: [AgentImageAttachment]
         package let taggedFileAttachments: [AgentTaggedFileAttachment]
         package let draftText: String
-        package let optimisticUserItemID: UUID?
+        /// The user input this submission delivers. A durable identity's intent ID is the queue ID.
+        package let identity: AgentQueuedInputIdentity
         package let origin: CodexFallbackOrigin
         package let dispatchTicket: UInt64?
 
@@ -619,18 +633,26 @@ package final class AgentTabSession: ObservableObject {
             images: [AgentImageAttachment],
             taggedFileAttachments: [AgentTaggedFileAttachment],
             draftText: String,
-            optimisticUserItemID: UUID?,
+            identity: AgentQueuedInputIdentity,
             origin: CodexFallbackOrigin,
             dispatchTicket: UInt64?
         ) {
+            assert(
+                identity.intentID == nil || identity.intentID == queueID,
+                "A durable Codex fallback submission is queued under its recovery intent ID"
+            )
             self.queueID = queueID
             self.providerText = providerText
             self.images = images
             self.taggedFileAttachments = taggedFileAttachments
             self.draftText = draftText
-            self.optimisticUserItemID = optimisticUserItemID
+            self.identity = identity
             self.origin = origin
             self.dispatchTicket = dispatchTicket
+        }
+
+        package var optimisticUserItemID: UUID? {
+            identity.userItemID
         }
     }
 
@@ -667,7 +689,8 @@ package final class AgentTabSession: ObservableObject {
         let reasoningEffort: String?
         let serviceTier: String?
         let attachmentReservationID: UUID?
-        let optimisticUserItemID: UUID?
+        /// The user input this entry delivers (copied from its submission context).
+        package let identity: AgentQueuedInputIdentity
         package var draftText: String
         let origin: CodexFallbackOrigin
         let fallbackReason: CodexFallbackReason
@@ -678,6 +701,10 @@ package final class AgentTabSession: ObservableObject {
         let originRunAttemptID: UUID
         var blockingTurn: CodexFallbackBlockingTurn?
         var state: CodexFallbackQueueState
+
+        var optimisticUserItemID: UUID? {
+            identity.userItemID
+        }
     }
 
     package var codexPendingTurnKind: CodexTurnKind?
@@ -698,6 +725,10 @@ package final class AgentTabSession: ObservableObject {
     package var instructionContinuation: CheckedContinuation<UserInstructionResponse, Error>?
     package var instructionTimeoutTask: Task<Void, Never>?
     package var instructionWaitID: UUID?
+    /// The newest `wait_for_next_instruction` call (set at its entry, before any await). A queued-head
+    /// drain that suspends hands the head off only while it still owns the wait; a newer call
+    /// supersedes it.
+    package var instructionWaitOwnerID: UUID?
 
     /// Agent run
     package var runID: UUID? {
@@ -744,17 +775,65 @@ package final class AgentTabSession: ObservableObject {
         didSet {
             guard draftText != oldValue else { return }
             draftMutationGeneration &+= 1
+            notifyRecoveryComposerMutation()
         }
     }
 
     package private(set) var draftMutationGeneration: UInt64 = 0
 
     /// Selected workflow template for next message
-    package var selectedWorkflow: AgentWorkflowDefinition?
+    package var selectedWorkflow: AgentWorkflowDefinition? {
+        didSet {
+            guard selectedWorkflow != oldValue else { return }
+            notifyRecoveryComposerMutation()
+        }
+    }
 
-    // Pending image attachments for the next user turn
-    @Published package var pendingImageAttachments: [AgentImageAttachment] = []
-    @Published package var pendingTaggedFileAttachments: [AgentTaggedFileAttachment] = []
+    /// Composer interview-first choice for this session's next first message (per session, part of
+    /// the recoverable composer snapshot).
+    package var interviewFirst: Bool = false {
+        didSet {
+            guard interviewFirst != oldValue else { return }
+            notifyRecoveryComposerMutation()
+        }
+    }
+
+    /// Recovery lane owning this durable session's composer persistence and input admission, when
+    /// recovery is composed. Installed and replaced only through `AgentRecoveryCoordinator.claimLane`.
+    package var recoveryLane: AgentRecoverySessionLane?
+
+    /// Composite composer observation (text, images, tagged files, workflow, interview choice).
+    /// Called synchronously after each composer mutation while installed and not suppressed.
+    package var recoveryComposerObserver: (@MainActor (AgentTabSession) -> Void)?
+    private var recoveryComposerObservationSuppression = 0
+
+    /// Applies restored or programmatic composer state without reporting it as a new edit.
+    package func withRecoveryComposerObservationSuppressed(_ body: () -> Void) {
+        recoveryComposerObservationSuppression += 1
+        defer { recoveryComposerObservationSuppression -= 1 }
+        body()
+    }
+
+    private func notifyRecoveryComposerMutation() {
+        guard recoveryComposerObservationSuppression == 0, let recoveryComposerObserver else { return }
+        recoveryComposerObserver(self)
+    }
+
+    /// Pending image attachments for the next user turn
+    @Published package var pendingImageAttachments: [AgentImageAttachment] = [] {
+        didSet {
+            guard pendingImageAttachments != oldValue else { return }
+            notifyRecoveryComposerMutation()
+        }
+    }
+
+    @Published package var pendingTaggedFileAttachments: [AgentTaggedFileAttachment] = [] {
+        didSet {
+            guard pendingTaggedFileAttachments != oldValue else { return }
+            notifyRecoveryComposerMutation()
+        }
+    }
+
     package var attachmentsPendingProviderConsumptionCleanup: [AgentImageAttachment] = []
     package var attachmentTurnState: AgentAttachmentTurnState = .idle
 

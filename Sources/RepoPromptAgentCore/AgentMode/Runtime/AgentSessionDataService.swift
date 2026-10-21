@@ -12,7 +12,9 @@ enum AgentSessionDataError: Error {
 }
 
 package enum AgentSessionFileCreationPolicy {
-    /// Existing behavior for deliberate initial session creation.
+    /// The compatibility save may create a genuinely new, lifecycle-absent session when no file
+    /// and no tombstone exist (exclusive under the session gate). Never overrides lifecycle or tombstone fences, and
+    /// never applies to persistence-state saves (their file must already exist).
     case createIfMissing
     /// A writer targeting an existing incarnation must not recreate an explicitly deleted file.
     case requireExisting
@@ -24,6 +26,9 @@ package struct AgentSessionPersistenceStamp: Hashable {
     let sessionID: UUID
     package let workspaceID: UUID
     let deletionGeneration: UInt64
+    /// Durable lifecycle incarnation. Always present for editable authority; `nil` only for a
+    /// deletion candidate captured from a legacy or unreadable file.
+    package let incarnationID: UUID?
     fileprivate let serviceID: UUID
     fileprivate let fileURL: URL
 }
@@ -34,9 +39,9 @@ package struct AgentSessionPersistenceState: Hashable {
     package let transcriptResetGeneration: UInt64
 }
 
-struct AgentSessionEditableLoad {
-    let session: AgentSession
-    let persistenceState: AgentSessionPersistenceState
+package struct AgentSessionEditableLoad {
+    package let session: AgentSession
+    package let persistenceState: AgentSessionPersistenceState
 }
 
 package struct AgentSessionDeletionCandidate: Hashable {
@@ -67,6 +72,8 @@ package struct AgentSessionSaveCommit {
     package let fileURL: URL
     package let persistenceState: AgentSessionPersistenceState
     package let disposition: Disposition
+    /// The stored session this commit wrote; `nil` for `.resetAlreadyCommitted` (no write).
+    let committedSession: AgentSession?
 }
 
 package enum AgentScheduledSendMutationError: Error, Equatable {
@@ -94,6 +101,22 @@ package enum AgentScheduledSendMutationError: Error, Equatable {
     case staleDeletionGeneration(expected: UInt64, actual: UInt64)
     case staleTranscriptResetGeneration(expected: UInt64, actual: UInt64)
     case sessionAlreadyExists(UUID)
+    /// A durable tombstone retired this session UUID.
+    case sessionDeleted(UUID)
+    /// A tombstone exists for this UUID but cannot be verified; writes fail closed.
+    case unreadableTombstone(UUID)
+    /// The persisted envelope's serialization version is not supported by this build.
+    case unsupportedSessionEnvelope(UUID, serializationVersion: Int)
+    /// The persisted (or supplied) lifecycle member is unreadable and never writable.
+    case unreadableLifecycle(UUID)
+    /// A compatibility save of an existing file did not carry its loaded lifecycle authority.
+    case missingLifecycle(UUID)
+    case staleIncarnation(expected: UUID?, actual: UUID?)
+    /// Transcript resets commit only through the persistence-state save overload.
+    case transcriptResetRequiresPersistenceState
+    case transcriptResetGenerationOverflow
+    /// Initial creation requires a lifecycle-absent session for this workspace, not a list stub.
+    case invalidInitialSession(UUID)
 }
 
 package struct AgentScheduledSendFinalizedItemRemoval: Equatable {
@@ -216,7 +239,17 @@ private actor AgentSessionDiskWriter {
 /// per-session persistence gate below is process-wide for app writes. Direct instances remain
 /// available to isolated tests.
 package actor AgentSessionDataService {
-    package static let shared = AgentSessionDataService()
+    /// Composed with the app's single production recovery store (one store, one gate, shared by
+    /// every window, MCP tool, and the recovery coordinator). XCTest processes keep a storeless
+    /// shared instance; tests inject temporary stores explicitly.
+    package static let shared = if let store = AgentRecoveryStore.production {
+        AgentSessionDataService(
+            tombstoneRoot: AgentRecoveryStore.productionRootURL.appendingPathComponent("tombstones", isDirectory: true),
+            recoveryStore: store
+        )
+    } else {
+        AgentSessionDataService()
+    }
 
     #if DEBUG
         private var testConditionalDeletionHook: (@Sendable (AgentSessionDeletionCandidate) async throws -> Void)?
@@ -229,6 +262,48 @@ package actor AgentSessionDataService {
     #endif
 
     private let persistenceServiceID = UUID()
+    /// `<Application Support>/RepoPrompt CE/AgentRecovery/v1/tombstones`. Tombstones are
+    /// session-UUID-wide and permanent; isolated tests pass their own root.
+    private let tombstoneRoot: URL
+    /// Session UUIDs observed with a committed or unreadable tombstone (never removed).
+    private var knownTombstonedSessionIDs: Set<UUID> = []
+    /// Tombstoned UUIDs whose hidden on-disk residue this service already logged (log once).
+    private var loggedTombstonedResidueSessionIDs: Set<UUID> = []
+    /// Durable lifecycle last read or written by this service, keyed by canonical file identity.
+    /// Valid because this service is the sole writer; refreshed by every gate-held load.
+    private var lifecycleByFileKey: [URL: AgentSessionLifecycle] = [:]
+    /// Lossless-restart recovery store (Phase 1b). The production store for `shared` outside
+    /// XCTest; `nil` keeps recovery discovery, stamping, and deletion cleanup inactive.
+    private let recoveryStore: AgentRecoveryStore?
+    /// R5 launch evidence adopted from the recovery coordinator's captured previous launch.
+    private var coldRestoreLaunchEvidence: AgentRecoveryPreviousLaunch?
+    /// Turns this process stamped `unknown` before launch evidence was captured, by session.
+    private var provisionalUnknownStampTurnIDs: [UUID: Set<UUID>] = [:]
+
+    package init(tombstoneRoot: URL? = nil, recoveryStore: AgentRecoveryStore? = nil) {
+        self.tombstoneRoot = tombstoneRoot ?? Self.defaultTombstoneRoot()
+        self.recoveryStore = recoveryStore
+    }
+
+    private static func defaultTombstoneRoot() -> URL {
+        #if DEBUG
+            // Follows the `GlobalSettingsStore` XCTest precedent: test processes (including the
+            // shared instance and default-constructed services) never write live Application
+            // Support tombstones. Each such instance gets its own temporary root.
+            if NSClassFromString("XCTestCase") != nil || NSClassFromString("XCTest.XCTestCase") != nil {
+                return FileManager.default.temporaryDirectory
+                    .appendingPathComponent("RepoPromptCE-XCTest", isDirectory: true)
+                    .appendingPathComponent("AgentRecovery-\(UUID().uuidString)", isDirectory: true)
+                    .appendingPathComponent("v1", isDirectory: true)
+                    .appendingPathComponent("tombstones", isDirectory: true)
+            }
+        #endif
+        return MCPFilesystemConstants.identity.applicationSupportRootURL()
+            .appendingPathComponent("AgentRecovery", isDirectory: true)
+            .appendingPathComponent("v1", isDirectory: true)
+            .appendingPathComponent("tombstones", isDirectory: true)
+    }
+
     private let encoder = AgentSessionDataService.makeSessionEncoder()
     private let decoder = AgentSessionDataService.makeSessionDecoder()
     private let diskWriter = AgentSessionDiskWriter()
@@ -251,8 +326,10 @@ package actor AgentSessionDataService {
         var intentionallyRemovedAcceptedUserItemReceiptsByID: [UUID: AgentScheduledSendProvenance]
     }
 
+    /// Process-local cache of the canonical post-reset snapshot for accidental missing-file
+    /// reconstruction. Reset identity itself is durable in the session lifecycle.
     private struct AgentSessionTranscriptResetAuthority {
-        let deletionGeneration: UInt64
+        let incarnationID: UUID
         let generation: UInt64
         let receipt: AgentSessionTranscriptResetReceipt
         let canonicalSessionSnapshot: Data
@@ -287,12 +364,39 @@ package actor AgentSessionDataService {
         }
 
         /// Test seam: throws the returned error instead of unlinking an existing session file.
+        /// The unlink happens after the tombstone commit, so deletion remains logically effective.
         private var test_agentSessionDeletionFailureInjector: ((URL) -> Error?)?
 
         func test_setAgentSessionDeletionFailureInjector(
             _ injector: (@Sendable (URL) -> Error?)?
         ) {
             test_agentSessionDeletionFailureInjector = injector
+        }
+
+        /// Test seam: throws the returned error instead of writing a tombstone.
+        private var test_tombstoneWriteFailureInjector: ((UUID) -> Error?)?
+
+        func test_setTombstoneWriteFailureInjector(_ injector: (@Sendable (UUID) -> Error?)?) {
+            test_tombstoneWriteFailureInjector = injector
+        }
+
+        /// Test seam: throws the returned error instead of replacing or creating a session file.
+        private var test_sessionWriteFailureInjector: ((URL) -> Error?)?
+
+        func test_setSessionWriteFailureInjector(_ injector: (@Sendable (URL) -> Error?)?) {
+            test_sessionWriteFailureInjector = injector
+        }
+
+        /// Test seam: drops this service's process-local lifecycle authority for `fileURL`, as a
+        /// service that never observed the destination would have none.
+        func test_forgetLifecycleAuthority(for fileURL: URL) {
+            let key = canonicalSessionFileKey(fileURL)
+            lifecycleByFileKey.removeValue(forKey: key)
+            transcriptResetAuthorityByFileURL.removeValue(forKey: key)
+        }
+
+        var test_tombstoneRoot: URL {
+            tombstoneRoot
         }
 
         /// Test seam: how many operations are queued behind the session's persistence gate.
@@ -328,6 +432,27 @@ package actor AgentSessionDataService {
         let lastScheduledDispatch: AgentScheduledSendProvenance?
     }
 
+    /// Envelope version and lifecycle only: the write-side fence for a cache miss.
+    private struct AgentSessionLifecycleHeader: Decodable {
+        let id: UUID
+        let serializationVersion: Int
+        let lifecycle: AgentSessionLifecycleMember?
+
+        private enum CodingKeys: String, CodingKey {
+            case id
+            case serializationVersion
+            case lifecycle
+        }
+
+        init(from decoder: Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            id = try container.decode(UUID.self, forKey: .id)
+            serializationVersion = try container.decodeIfPresent(Int.self, forKey: .serializationVersion)
+                ?? AgentSession.legacyUnversionedSerializationVersion
+            lifecycle = try AgentSession.decodeLifecycleMember(from: container, forKey: .lifecycle)
+        }
+    }
+
     private struct AgentSessionHeader: Decodable {
         let id: UUID
         let serializationVersion: Int?
@@ -360,12 +485,14 @@ package actor AgentSessionDataService {
         let pendingHandoffPayload: String?
         let pendingHandoffCreatedAt: Date?
         let pendingHandoffSourceItemID: UUID?
+        let pendingHandoffPayloadID: UUID?
         let pendingHandoffDefersProviderLockUntilSend: Bool?
         let isMCPOriginated: Bool?
         let origin: AgentSessionOrigin?
         let profile: AgentSessionProfile?
         let scheduledSend: AgentScheduledSendMember?
         let lastScheduledDispatch: AgentScheduledSendProvenance?
+        let lifecycle: AgentSessionLifecycleMember?
 
         private enum CodingKeys: String, CodingKey {
             case id
@@ -399,12 +526,14 @@ package actor AgentSessionDataService {
             case pendingHandoffPayload
             case pendingHandoffCreatedAt
             case pendingHandoffSourceItemID
+            case pendingHandoffPayloadID
             case pendingHandoffDefersProviderLockUntilSend
             case isMCPOriginated
             case origin
             case profile
             case scheduledSend
             case lastScheduledDispatch
+            case lifecycle
         }
 
         init(from decoder: Decoder) throws {
@@ -453,6 +582,7 @@ package actor AgentSessionDataService {
             pendingHandoffPayload = try container.decodeIfPresent(String.self, forKey: .pendingHandoffPayload)
             pendingHandoffCreatedAt = try container.decodeIfPresent(Date.self, forKey: .pendingHandoffCreatedAt)
             pendingHandoffSourceItemID = try container.decodeIfPresent(UUID.self, forKey: .pendingHandoffSourceItemID)
+            pendingHandoffPayloadID = try container.decodeIfPresent(UUID.self, forKey: .pendingHandoffPayloadID)
             pendingHandoffDefersProviderLockUntilSend = try container.decodeIfPresent(
                 Bool.self,
                 forKey: .pendingHandoffDefersProviderLockUntilSend
@@ -478,6 +608,7 @@ package actor AgentSessionDataService {
                 AgentScheduledSendProvenance.self,
                 forKey: .lastScheduledDispatch
             )
+            lifecycle = try AgentSession.decodeLifecycleMember(from: container, forKey: .lifecycle)
         }
     }
 
@@ -619,11 +750,35 @@ package actor AgentSessionDataService {
         return stored
     }
 
+    /// Why a gate-held load runs (F-7). Only `coldRestore` treats the file as the previous
+    /// execution's evidence: it stamps open turns, restores accepted bubbles, and maps an active
+    /// saved run state to its cold-restored form. `storageMutation` (schedule mutation, repair,
+    /// cancellation and finalization, same-launch resync, rename, read-only tool loads, metadata
+    /// recovery) decodes and migrates only: an open turn a live owner of this launch may still be
+    /// running is never cancelled, stamped, or rewritten as interrupted.
+    enum LoadPurpose: Equatable {
+        case coldRestore
+        case storageMutation
+    }
+
+    /// `assigningLifecycle` adds migration identity to the runtime session; the storage form then
+    /// differs from the decoded legacy session, so identity joins (or forces) one replacement.
     private static func normalizeLoadedSession(
         _ session: AgentSession,
-        fileURL: URL
+        fileURL: URL,
+        purpose: LoadPurpose,
+        assigningLifecycle: AgentSessionLifecycle? = nil,
+        interruptionContext: AgentColdRestoreInterruptionContext? = nil
     ) -> NormalizedLoadedSession {
-        let runtimeSession = runtimeNormalizedLoadedSession(session, fileURL: fileURL)
+        var runtimeSession = runtimeNormalizedLoadedSession(
+            session,
+            fileURL: fileURL,
+            purpose: purpose,
+            interruptionContext: interruptionContext
+        )
+        if let assigningLifecycle {
+            runtimeSession.lifecycle = .v1(assigningLifecycle)
+        }
         let storage = storageNormalizedLoadedSession(session, runtimeSession: runtimeSession, fileURL: fileURL)
         return NormalizedLoadedSession(
             runtimeSession: runtimeSession,
@@ -634,11 +789,21 @@ package actor AgentSessionDataService {
     /// The runtime half of `normalizeLoadedSession`: the in-memory session a load returns.
     private static func runtimeNormalizedLoadedSession(
         _ session: AgentSession,
-        fileURL: URL
+        fileURL: URL,
+        purpose: LoadPurpose,
+        interruptionContext: AgentColdRestoreInterruptionContext? = nil
     ) -> AgentSession {
+        let isColdRestore = purpose == .coldRestore
+        // A storage mutation never applies prior-execution evidence.
+        let interruptionContext = isColdRestore ? interruptionContext : nil
         let policy = AgentTranscriptImportPolicy.canonical
         let persistedLastRunState = session.lastRunState.flatMap(AgentSessionRunState.init(rawValue:))
-        let restoredLastRunStateRaw = AgentSessionRestoreSupport.coldRestoredLastRunStateRaw(session.lastRunState)
+        // F-7: an active saved run state that a live run of the current launch still owns is not a
+        // previous execution's state, so a second owner's cold hydration keeps it as saved.
+        let keepsLiveRunState = interruptionContext?.hasCurrentLaunchLiveRun == true
+        let restoredLastRunStateRaw = isColdRestore && !keepsLiveRunState
+            ? AgentSessionRestoreSupport.coldRestoredLastRunStateRaw(session.lastRunState)
+            : session.lastRunState
         let repairTerminalState = (persistedLastRunState?.isActive == true) ? nil : persistedLastRunState
         let importTerminalState = persistedLastRunState
         let repairContext = AgentTranscriptQualityRepair.Context.coldRestore(agentKindRaw: session.agentKind)
@@ -659,13 +824,27 @@ package actor AgentSessionDataService {
         } else {
             0
         }
-        let nextSequenceIndex = max(
+        var nextSequenceIndex = max(
             storedTranscript?.nextSequenceIndex ?? 0,
             (workingItems.map(\.sequenceIndex).max() ?? -1) + 1
         )
+        // R1a: an accepted earlier-launch intent without its saved bubble gets it restored once,
+        // under its deterministic item ID, in the same normalization the load commits.
+        let presentItemIDs = Set(workingItems.map(\.id))
+            .union((storedTranscript?.turns ?? []).compactMap { $0.request?.id })
+        let restoredBubbles = interruptionContext?.missingAcceptedBubbles(
+            lifecycle: session.lifecycle?.lifecycle,
+            presentItemIDs: presentItemIDs
+        ) ?? []
+        for var bubble in restoredBubbles {
+            bubble.sequenceIndex = nextSequenceIndex
+            nextSequenceIndex += 1
+            workingItems.append(bubble)
+        }
         let normalizedTranscript: AgentTranscript?
         if let storedTranscript {
             let shouldRebuildFromWorkingItems = repairedWorkingCount > 0
+                || !restoredBubbles.isEmpty
                 || AgentTranscriptIO.containsRowsExcludedByPolicy(in: storedTranscript, policy: policy)
                 || (repairTerminalState != nil && AgentTranscriptQualityRepair.terminalMetadataRepairNeeded(in: storedTranscript))
             if shouldRebuildFromWorkingItems {
@@ -691,7 +870,12 @@ package actor AgentSessionDataService {
         }
         let runtimeTranscript = normalizedTranscript.map {
             let runtimeNormalized = AgentTranscriptPolicyPipeline.runtimeTranscriptOnly($0)
-            return AgentSessionRestoreSupport.sanitizeColdRestoredTranscript(runtimeNormalized)
+            guard isColdRestore else { return runtimeNormalized }
+            return AgentSessionRestoreSupport.sanitizeColdRestoredTranscript(
+                runtimeNormalized,
+                interruptionContext: interruptionContext,
+                unacceptedDeliveries: interruptionContext?.unacceptedDeliveries(lifecycle: session.lifecycle?.lifecycle) ?? [:]
+            )
         }
         let runtimeWorkingItems = runtimeTranscript.map(AgentTranscriptIO.workingSourceItems(from:)) ?? workingItems
         var runtimeSession = session
@@ -745,17 +929,38 @@ package actor AgentSessionDataService {
             || session.itemCount != persistedSession.itemCount
             || session.transcriptProjectionCounts != persistedSession.transcriptProjectionCounts
             || session.lastUserMessageAt != persistedSession.lastUserMessageAt
+            || session.lifecycle != persistedSession.lifecycle
         return StorageNormalizedLoadedSession(persistedSession: persistedSession, needsRewrite: needsRewrite)
     }
 
+    /// Every session-file replacement goes through here (callers hold the session gate).
     private func writeDataAtomically(_ data: Data, to fileURL: URL) async throws {
+        #if DEBUG
+            if let injected = test_sessionWriteFailureInjector?(fileURL) {
+                throw injected
+            }
+        #endif
         try await diskWriter.enqueueAndWait(data: data, url: fileURL)
     }
 
     // MARK: - Metadata Index Helpers
 
+    /// Metadata-index cache, reconciliation and once-per-process keys share the session-file
+    /// directory identity, so a save through a stamp's resolved folder and a listing through the
+    /// workspace's own spelling of that folder use one cache entry.
     private func canonicalMetadataFolderKey(_ folder: URL) -> URL {
-        folder.standardizedFileURL
+        resolvedExistingDirectoryKey(folder) ?? folder.standardizedFileURL
+    }
+
+    /// `realpath(3)` of an existing directory (symlinks, `/var` vs `/private/var`, on-disk case);
+    /// `nil` when it cannot be resolved (for example, an absent folder).
+    private func resolvedExistingDirectoryKey(_ directory: URL) -> URL? {
+        let resolvedPath: String? = directory.standardizedFileURL.withUnsafeFileSystemRepresentation { representation in
+            guard let representation, let resolved = realpath(representation, nil) else { return nil }
+            defer { free(resolved) }
+            return String(cString: resolved)
+        }
+        return resolvedPath.map { URL(fileURLWithPath: $0, isDirectory: true) }
     }
 
     private func metadataIndexFileURL(forAgentSessionsFolder folder: URL) -> URL {
@@ -980,9 +1185,14 @@ package actor AgentSessionDataService {
             includingPropertiesForKeys: [.contentModificationDateKey],
             options: [.skipsHiddenFiles]
         )
-        let jsonFiles = contents.filter {
-            $0.pathExtension.lowercased() == "json"
-                && $0.lastPathComponent.starts(with: "AgentSession-")
+        // Residue of a committed deletion (unlink failed after the tombstone) is not a session.
+        let tombstoned = try tombstonedSessionIDs()
+        let jsonFiles = contents.filter { fileURL in
+            fileURL.pathExtension.lowercased() == "json"
+                && fileURL.lastPathComponent.starts(with: "AgentSession-")
+                && agentSessionID(fromFilename: fileURL.lastPathComponent).map {
+                    !isTombstonedResidue(fileURL, sessionID: $0, tombstoned: tombstoned)
+                } ?? true
         }
         let sorted = jsonFiles.sorted { lhs, rhs in
             let lhsDate = (try? lhs.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate ?? .distantPast
@@ -1189,8 +1399,8 @@ package actor AgentSessionDataService {
                 metadataIndexCacheByFolder.removeValue(forKey: key)
                 return nil
             }
-            return FastMetadataRecordsResult(
-                records: cached.entries.sortedForAgentSessionMetadataIndex(),
+            return try FastMetadataRecordsResult(
+                records: excludingTombstoned(cached.entries.sortedForAgentSessionMetadataIndex()),
                 source: .memoryIndex
             )
         }
@@ -1209,8 +1419,8 @@ package actor AgentSessionDataService {
                 return nil
             }
             metadataIndexCacheByFolder[key] = index
-            return FastMetadataRecordsResult(
-                records: index.entries.sortedForAgentSessionMetadataIndex(),
+            return try FastMetadataRecordsResult(
+                records: excludingTombstoned(index.entries.sortedForAgentSessionMetadataIndex()),
                 source: .diskIndex
             )
         } catch {
@@ -1222,7 +1432,9 @@ package actor AgentSessionDataService {
     package func metadataRecordForSessionID(_ id: UUID, for workspace: some AgentWorkspaceStorageReference) async throws -> AgentSessionMetadataRecord? {
         let folder = try ensureAgentSessionsFolder(for: workspace)
         let fileURL = agentSessionFileURL(id: id, in: folder)
-        guard FileManager.default.fileExists(atPath: fileURL.path) else {
+        guard try tombstoneState(for: id) == .absent,
+              FileManager.default.fileExists(atPath: fileURL.path)
+        else {
             return nil
         }
         let stub = try await loadAgentSessionStub(
@@ -1238,7 +1450,7 @@ package actor AgentSessionDataService {
         limit: Int? = nil
     ) async throws -> [AgentSessionMetadataRecord] {
         let index = try await metadataIndex(for: workspace, mode: .backfillIfMissing)
-        let records = index?.entries.sortedForAgentSessionMetadataIndex() ?? []
+        let records = try excludingTombstoned(index?.entries.sortedForAgentSessionMetadataIndex() ?? [])
         guard let limit else { return records }
         return Array(records.prefix(max(limit, 0)))
     }
@@ -1256,24 +1468,241 @@ package actor AgentSessionDataService {
                 reason: "sidebarStreamHotIndex",
                 workspaceID: workspace.id
             )
-            return index.entries.sortedForAgentSessionMetadataIndex()
+            return try excludingTombstoned(index.entries.sortedForAgentSessionMetadataIndex())
         }
         let index = try await rebuildMetadataIndex(folder: folder)
-        return index.entries.sortedForAgentSessionMetadataIndex()
+        return try excludingTombstoned(index.entries.sortedForAgentSessionMetadataIndex())
     }
 
+    /// One stable identity for a session file across URL spellings. Every lifecycle, reset,
+    /// schedule-authority and deletion cache, and every pinned stamp, is keyed by it, so two
+    /// workspace storage references that alias one directory (`/var` vs `/private/var`, a
+    /// symlinked custom storage path) share one authoritative entry: a reset or deletion through
+    /// one spelling fences a stale save through the other instead of hitting a stale cache entry.
+    /// The existing parent directory is resolved with `realpath(3)`; when it cannot be resolved
+    /// (absent folder) the standardized URL is used unchanged.
     private func canonicalSessionFileKey(_ fileURL: URL) -> URL {
-        fileURL.standardizedFileURL
+        let standardized = fileURL.standardizedFileURL
+        guard let directory = resolvedExistingDirectoryKey(standardized.deletingLastPathComponent()) else {
+            return standardized
+        }
+        return directory.appendingPathComponent(standardized.lastPathComponent, isDirectory: false)
     }
 
-    private func currentTranscriptResetGeneration(for fileKey: URL) -> UInt64 {
-        transcriptResetAuthorityByFileURL[fileKey]?.generation ?? 0
+    // MARK: - Tombstones
+
+    private func tombstoneFileURL(for sessionID: UUID) -> URL {
+        tombstoneRoot.appendingPathComponent("\(sessionID.uuidString).json")
+    }
+
+    /// Authoritative durable deletion state for one UUID. A read error other than absence throws:
+    /// it is never treated as "not deleted".
+    private func tombstoneState(for sessionID: UUID) throws -> AgentSessionTombstoneState {
+        if knownTombstonedSessionIDs.contains(sessionID) {
+            return Self.isTombstoneReadable(at: tombstoneFileURL(for: sessionID), sessionID: sessionID)
+                ? .committed
+                : .unreadable
+        }
+        let url = tombstoneFileURL(for: sessionID)
+        let data: Data
+        do {
+            data = try Data(contentsOf: url)
+        } catch let error as CocoaError where error.code == .fileReadNoSuchFile {
+            return .absent
+        } catch let error as NSError where error.domain == NSPOSIXErrorDomain && error.code == Int(ENOENT) {
+            return .absent
+        }
+        knownTombstonedSessionIDs.insert(sessionID)
+        return Self.tombstone(data, matches: sessionID) ? .committed : .unreadable
+    }
+
+    private static func isTombstoneReadable(at url: URL, sessionID: UUID) -> Bool {
+        guard let data = try? Data(contentsOf: url) else { return false }
+        return tombstone(data, matches: sessionID)
+    }
+
+    private static func tombstone(_ data: Data, matches sessionID: UUID) -> Bool {
+        guard let jsonValue = try? JSONDecoder().decode(AgentScheduledSendJSONValue.self, from: data),
+              let tombstone = try? JSONDecoder().decode(AgentSessionDeletionTombstone.self, from: data),
+              tombstone.schemaVersion == AgentSessionDeletionTombstone.currentSchemaVersion,
+              tombstone.sessionID == sessionID,
+              let typedData = try? JSONEncoder().encode(tombstone),
+              let typedJSON = try? JSONDecoder().decode(AgentScheduledSendJSONValue.self, from: typedData),
+              typedJSON == jsonValue
+        else { return false }
+        return true
+    }
+
+    /// Fails unless no tombstone (committed or unreadable) exists for `sessionID`.
+    private func requireNoTombstone(for sessionID: UUID) throws {
+        switch try tombstoneState(for: sessionID) {
+        case .absent:
+            return
+        case .committed:
+            throw AgentScheduledSendMutationError.sessionDeleted(sessionID)
+        case .unreadable:
+            throw AgentScheduledSendMutationError.unreadableTombstone(sessionID)
+        }
+    }
+
+    /// Optional lookups (editable load, hydration): a committed tombstone reads like an absent
+    /// file (`true`, no authority is issued), an unreadable one fails closed. Creation and saves
+    /// remain fenced by `requireNoTombstone`.
+    private func isCommittedTombstone(for sessionID: UUID) throws -> Bool {
+        switch try tombstoneState(for: sessionID) {
+        case .absent:
+            return false
+        case .committed:
+            return true
+        case .unreadable:
+            throw AgentScheduledSendMutationError.unreadableTombstone(sessionID)
+        }
+    }
+
+    /// Whether `sessionID` is durably deleted. Lets a hydration that found no payload tell a
+    /// deleted binding (restored after a crash between the tombstone and the workspace unbind)
+    /// from a genuine creator. An unreadable tombstone throws (fail closed).
+    package func isAgentSessionDeleted(id sessionID: UUID) throws -> Bool {
+        try isCommittedTombstone(for: sessionID)
+    }
+
+    /// Every tombstoned UUID (committed or unreadable) for listing filters. A directory read
+    /// failure other than absence throws rather than resurrecting deleted sessions.
+    private func tombstonedSessionIDs() throws -> Set<UUID> {
+        let contents: [URL]
+        do {
+            contents = try FileManager.default.contentsOfDirectory(
+                at: tombstoneRoot,
+                includingPropertiesForKeys: nil,
+                options: []
+            )
+        } catch let error as CocoaError where error.code == .fileReadNoSuchFile {
+            return knownTombstonedSessionIDs
+        }
+        for url in contents where url.pathExtension == "json" {
+            if let id = UUID(uuidString: url.deletingPathExtension().lastPathComponent) {
+                knownTombstonedSessionIDs.insert(id)
+            }
+        }
+        return knownTombstonedSessionIDs
+    }
+
+    /// `true` when an on-disk session file belongs to a tombstoned UUID. The first time this
+    /// service hides residue for a UUID it logs the file and its tombstone. A tombstone is the
+    /// permanent, UUID-wide retirement record: removing it would re-enable stale owners of that
+    /// incarnation, so recovering residue content (for example, a restored backup) requires a
+    /// deliberate offline repair under a new session identity, never deleting the tombstone.
+    private func isTombstonedResidue(_ fileURL: URL, sessionID: UUID, tombstoned: Set<UUID>) -> Bool {
+        guard tombstoned.contains(sessionID) else { return false }
+        if loggedTombstonedResidueSessionIDs.insert(sessionID).inserted {
+            print("[AgentSessionDataService] hiding session file \(fileURL.path): session \(sessionID) is retired by tombstone \(tombstoneFileURL(for: sessionID).path); recovering it requires a deliberate repair under a new session identity")
+        }
+        return true
+    }
+
+    private func excludingTombstoned(_ records: [AgentSessionMetadataRecord]) throws -> [AgentSessionMetadataRecord] {
+        guard !records.isEmpty else { return records }
+        let tombstoned = try tombstonedSessionIDs()
+        guard !tombstoned.isEmpty else { return records }
+        return records.filter { !tombstoned.contains($0.id) }
+    }
+
+    /// Commit point of a deletion: atomically writes the tombstone if absent. Never replaces an
+    /// existing (including unreadable) tombstone. Returns `true` only when this call committed it.
+    private func commitTombstone(for sessionID: UUID) throws -> Bool {
+        switch try tombstoneState(for: sessionID) {
+        case .committed:
+            return false
+        case .unreadable:
+            throw AgentScheduledSendMutationError.unreadableTombstone(sessionID)
+        case .absent:
+            break
+        }
+        #if DEBUG
+            if let injected = test_tombstoneWriteFailureInjector?(sessionID) {
+                throw injected
+            }
+        #endif
+        try FileManager.default.createDirectory(at: tombstoneRoot, withIntermediateDirectories: true)
+        let data = try JSONEncoder().encode(AgentSessionDeletionTombstone(sessionID: sessionID))
+        try data.write(to: tombstoneFileURL(for: sessionID), options: .atomic)
+        knownTombstonedSessionIDs.insert(sessionID)
+        return true
+    }
+
+    // MARK: - Lifecycle authority
+
+    private enum DurableLifecycleState {
+        /// A supported legacy envelope without a lifecycle member (not yet migrated).
+        case legacy
+        case v1(AgentSessionLifecycle)
+    }
+
+    /// Envelope and lifecycle checks applied to a decoded session before normalization or any
+    /// rewrite. Unsupported envelopes and unreadable lifecycle never reach a writer.
+    private static func validateDecodedEnvelope(_ session: AgentSession) throws -> DurableLifecycleState {
+        try validateEnvelope(sessionID: session.id, serializationVersion: session.serializationVersion, lifecycle: session.lifecycle)
+    }
+
+    private static func validateEnvelope(
+        sessionID: UUID,
+        serializationVersion: Int,
+        lifecycle: AgentSessionLifecycleMember?
+    ) throws -> DurableLifecycleState {
+        guard AgentSession.supportedSerializationVersions.contains(serializationVersion) else {
+            throw AgentScheduledSendMutationError.unsupportedSessionEnvelope(
+                sessionID,
+                serializationVersion: serializationVersion
+            )
+        }
+        switch lifecycle {
+        case nil:
+            return .legacy
+        case let .v1(value):
+            return .v1(value)
+        case .unreadable:
+            throw AgentScheduledSendMutationError.unreadableLifecycle(sessionID)
+        }
+    }
+
+    /// Current durable state of an existing file, from this service's cache or an envelope read.
+    /// Callers hold the gate and have verified the file exists.
+    private func currentDurableLifecycle(fileURL: URL, sessionID: UUID) throws -> DurableLifecycleState {
+        let key = canonicalSessionFileKey(fileURL)
+        if let cached = lifecycleByFileKey[key] {
+            return .v1(cached)
+        }
+        let data = try Data(contentsOf: fileURL, options: .mappedIfSafe)
+        let header = try AgentSessionDataCodec.decodeEnvelope(
+            AgentSessionLifecycleHeader.self,
+            from: data,
+            using: decoder
+        ).value
+        let state = try Self.validateEnvelope(
+            sessionID: sessionID,
+            serializationVersion: header.serializationVersion,
+            lifecycle: header.lifecycle
+        )
+        if case let .v1(value) = state {
+            lifecycleByFileKey[key] = value
+        }
+        return state
+    }
+
+    private func rememberLifecycle(of session: AgentSession, fileURL: URL) {
+        let key = canonicalSessionFileKey(fileURL)
+        if let lifecycle = session.lifecycle?.lifecycle {
+            lifecycleByFileKey[key] = lifecycle
+        } else {
+            lifecycleByFileKey.removeValue(forKey: key)
+        }
     }
 
     private func persistenceState(
         sessionID: UUID,
         workspaceID: UUID,
-        fileURL: URL
+        fileURL: URL,
+        lifecycle: AgentSessionLifecycle
     ) -> AgentSessionPersistenceState {
         let fileKey = canonicalSessionFileKey(fileURL)
         return AgentSessionPersistenceState(
@@ -1281,10 +1710,28 @@ package actor AgentSessionDataService {
                 sessionID: sessionID,
                 workspaceID: workspaceID,
                 deletionGeneration: deletionGenerationsByFileKey[fileKey] ?? 0,
+                incarnationID: lifecycle.incarnationID,
                 serviceID: persistenceServiceID,
                 fileURL: fileKey
             ),
-            transcriptResetGeneration: currentTranscriptResetGeneration(for: fileKey)
+            transcriptResetGeneration: lifecycle.transcriptResetGeneration
+        )
+    }
+
+    /// Editable authority for a gate-held loaded (and therefore migrated) runtime session.
+    private func editablePersistenceState(
+        for session: AgentSession,
+        workspaceID: UUID,
+        fileURL: URL
+    ) throws -> AgentSessionPersistenceState {
+        guard let lifecycle = session.lifecycle?.lifecycle else {
+            throw AgentScheduledSendMutationError.unreadableLifecycle(session.id)
+        }
+        return persistenceState(
+            sessionID: session.id,
+            workspaceID: workspaceID,
+            fileURL: fileURL,
+            lifecycle: lifecycle
         )
     }
 
@@ -1305,6 +1752,17 @@ package actor AgentSessionDataService {
                 expected: stamp.deletionGeneration,
                 actual: currentGeneration
             )
+        }
+    }
+
+    /// The loaded (migrated) session must still be the stamp's durable incarnation.
+    private func validateStampIncarnation(
+        _ stamp: AgentSessionPersistenceStamp,
+        against session: AgentSession
+    ) throws {
+        let actual = session.lifecycle?.lifecycle?.incarnationID
+        guard let expected = stamp.incarnationID, expected == actual else {
+            throw AgentScheduledSendMutationError.staleIncarnation(expected: stamp.incarnationID, actual: actual)
         }
     }
 
@@ -1600,24 +2058,50 @@ package actor AgentSessionDataService {
 
     // MARK: - Public API
 
-    /// Issues the lifetime/reset state for a genuine initial creation. The caller retains this
-    /// value and must not replace it after a missing-file or deletion failure.
+    /// Durable exclusive initial creation. Under the session gate it rejects a tombstone or an
+    /// existing file, assigns fresh lifecycle (reset generation zero), and writes the normal
+    /// session file with the existing atomic writer; the caller adopts the committed session and
+    /// state together. Exclusivity is the gate's: DataService is the app's sole session writer, so
+    /// two creators of one UUID through it serialize, one commits, and the other receives
+    /// `sessionAlreadyExists` (never adopts the winner). Independent service instances or
+    /// processes on one storage directory are outside this contract. Later saves by the owner
+    /// require the existing file.
     package func prepareInitialAgentSessionPersistence(
-        sessionID: UUID,
-        for workspace: some AgentWorkspaceStorageReference
-    ) async throws -> AgentSessionPersistenceState {
+        initialSession: AgentSession,
+        for workspace: some AgentWorkspaceStorageReference,
+        preparation: SavePreparation = .canonicalize,
+        trustedCanonicalItemCount: Int? = nil
+    ) async throws -> AgentSessionEditableLoad {
+        let sessionID = initialSession.id
         await acquireSessionPersistence(for: sessionID)
         defer { releaseSessionPersistence(for: sessionID) }
+        guard initialSession.lifecycle == nil,
+              initialSession.workspaceID == nil || initialSession.workspaceID == workspace.id,
+              !(initialSession.isListStub && initialSession.effectiveItemCount > 0)
+        else {
+            throw AgentScheduledSendMutationError.invalidInitialSession(sessionID)
+        }
         let folder = try ensureAgentSessionsFolder(for: workspace)
         let fileURL = agentSessionFileURL(id: sessionID, in: folder)
+        try requireNoTombstone(for: sessionID)
         guard !FileManager.default.fileExists(atPath: fileURL.path) else {
             throw AgentScheduledSendMutationError.sessionAlreadyExists(sessionID)
         }
-        return persistenceState(
-            sessionID: sessionID,
-            workspaceID: workspace.id,
-            fileURL: fileURL
+        let commit = try await saveAgentSessionLocked(
+            initialSession,
+            for: workspace,
+            preparation: preparation,
+            trustedCanonicalItemCount: trustedCanonicalItemCount,
+            intentionallyRemovingFinalizedScheduledSendItems: [],
+            committingTranscriptReset: nil,
+            fileCreationPolicy: .createIfMissing,
+            authority: .compatibility,
+            countsAsFullSave: false
         )
+        guard let committedSession = commit.committedSession else {
+            throw AgentScheduledSendMutationError.sessionAlreadyExists(sessionID)
+        }
+        return AgentSessionEditableLoad(session: committedSession, persistenceState: commit.persistenceState)
     }
 
     /// Loads an editable session and its process-local persistence state under one gate. The
@@ -1632,12 +2116,15 @@ package actor AgentSessionDataService {
         defer { releaseSessionPersistence(for: sessionID) }
         let folder = try ensureAgentSessionsFolder(for: workspace)
         let fileURL = agentSessionFileURL(id: sessionID, in: folder)
-        guard FileManager.default.fileExists(atPath: fileURL.path) else { return nil }
-        let session = try await loadAgentSessionLocked(from: fileURL)
-        return AgentSessionEditableLoad(
+        guard try !isCommittedTombstone(for: sessionID),
+              FileManager.default.fileExists(atPath: fileURL.path)
+        else { return nil }
+        // The sequential hydration reference: a cold restoration.
+        let session = try await loadAgentSessionLocked(from: fileURL, purpose: .coldRestore)
+        return try AgentSessionEditableLoad(
             session: session,
-            persistenceState: persistenceState(
-                sessionID: sessionID,
+            persistenceState: editablePersistenceState(
+                for: session,
                 workspaceID: workspace.id,
                 fileURL: fileURL
             )
@@ -1675,15 +2162,23 @@ package actor AgentSessionDataService {
         }
         let folder = try ensureAgentSessionsFolder(for: workspace)
         let fileURL = agentSessionFileURL(id: sessionID, in: folder)
-        guard FileManager.default.fileExists(atPath: fileURL.path) else { return nil }
+        guard try !isCommittedTombstone(for: sessionID),
+              FileManager.default.fileExists(atPath: fileURL.path)
+        else { return nil }
 
         let prefix: HydrationLoadPrefix
+        let interruptionContext = await coldRestoreInterruptionContext(sessionID: sessionID)
         do {
-            prefix = try await Self.hydrationLoadPrefix(fileURL: fileURL)
+            prefix = try await Self.hydrationLoadPrefix(fileURL: fileURL, interruptionContext: interruptionContext)
         } catch {
             throw AgentSessionDataError.loadFailed(error)
         }
+        // Lifecycle is decided on the actor before branching; a migration identity is returned
+        // only after the storage branch durably committed it.
         var reconciledSession = prefix.runtimeSession
+        if case .legacy = try Self.validateDecodedEnvelope(prefix.loadedSession) {
+            reconciledSession.lifecycle = .v1(.fresh())
+        }
         let reconciledMergeOperations = await AgentSessionWorktreeMergeReconciler.reconcile(reconciledSession.worktreeMergeOperations)
         let mergeOperationsChanged = reconciledMergeOperations != reconciledSession.worktreeMergeOperations
         if mergeOperationsChanged {
@@ -1703,6 +2198,7 @@ package actor AgentSessionDataService {
                 await Self.hydrationOverlapProbe?.storageCommitPoint()
             #endif
             try await commitLoadedSessionStorage(rewrite: rewrite, runtimeSession: runtimeSession, fileURL: fileURL)
+            noteColdRestoreStamps(sessionID: sessionID, context: interruptionContext, transcript: runtimeSession.transcript)
             #if DEBUG
                 Self.hydrationOverlapProbe?.branchFinished(.storage)
             #endif
@@ -1713,11 +2209,18 @@ package actor AgentSessionDataService {
             releaseSessionPersistence(for: sessionID)
             throw AgentSessionDataError.loadFailed(error)
         }
-        let persistenceState = persistenceState(
-            sessionID: sessionID,
-            workspaceID: workspace.id,
-            fileURL: fileURL
-        )
+        let persistenceState: AgentSessionPersistenceState
+        do {
+            persistenceState = try editablePersistenceState(
+                for: runtimeSession,
+                workspaceID: workspace.id,
+                fileURL: fileURL
+            )
+        } catch {
+            holdsSessionPersistence = false
+            releaseSessionPersistence(for: sessionID)
+            throw error
+        }
         // The hydration branch reads only its value inputs, so the gate scope ends here as in the
         // sequential path (which derives hydration after `loadAgentSessionForEditing` returns).
         holdsSessionPersistence = false
@@ -1748,6 +2251,7 @@ package actor AgentSessionDataService {
             await upsertMetadataRecordIfIndexPresent(runtimeSession, fileURL: fileURL)
         }
         rememberScheduleAuthority(from: runtimeSession, fileURL: fileURL)
+        rememberLifecycle(of: runtimeSession, fileURL: fileURL)
     }
 
     /// Session file coders. The actor's coders and the fresh ones cold hydration uses off the actor
@@ -1775,12 +2279,20 @@ package actor AgentSessionDataService {
     /// Off-actor prefix of the hydration load: read, decode, and runtime normalization, as in
     /// `loadAgentSessionLocked`. Decoding uses a fresh decoder from `makeSessionDecoder`.
     @concurrent
-    private static func hydrationLoadPrefix(fileURL: URL) async throws -> HydrationLoadPrefix {
+    private static func hydrationLoadPrefix(
+        fileURL: URL,
+        interruptionContext: AgentColdRestoreInterruptionContext?
+    ) async throws -> HydrationLoadPrefix {
         let data = try Data(contentsOf: fileURL, options: .mappedIfSafe)
         let loadedSession = try AgentSessionDataCodec.decodeSession(from: data, using: makeSessionDecoder())
         return HydrationLoadPrefix(
             loadedSession: loadedSession,
-            runtimeSession: runtimeNormalizedLoadedSession(loadedSession, fileURL: fileURL)
+            runtimeSession: runtimeNormalizedLoadedSession(
+                loadedSession,
+                fileURL: fileURL,
+                purpose: .coldRestore,
+                interruptionContext: interruptionContext?.withProviderConversationID(loadedSession.providerSessionID)
+            )
         )
     }
 
@@ -1818,6 +2330,13 @@ package actor AgentSessionDataService {
     /// reset also records its canonical post-reset snapshot for accepted-send recovery after accidental
     /// file loss. This URL-returning overload remains for generic compatibility; editable Agent Mode
     /// owners must use the persistence-state overload below.
+    ///
+    /// Compatibility lifecycle rules (the creation policy never overrides them):
+    /// - existing file: `session` must carry the typed lifecycle it was loaded with, matching the
+    ///   current incarnation and reset generation (load-modify-save), otherwise the save fails;
+    /// - missing file: only a genuinely new, lifecycle-absent session with no tombstone is created,
+    ///   exclusively; a lifecycle-bearing snapshot is never reconstructed (`sessionNotFound`);
+    /// - transcript resets are rejected; they commit only through the persistence-state overload.
     package func saveAgentSession(
         _ session: AgentSession,
         for workspace: some AgentWorkspaceStorageReference,
@@ -1837,13 +2356,21 @@ package actor AgentSessionDataService {
             intentionallyRemovingFinalizedScheduledSendItems: removals,
             committingTranscriptReset: resetReceipt,
             fileCreationPolicy: fileCreationPolicy,
-            expectedPersistenceState: nil
+            authority: .compatibility
         )
         return commit.fileURL
     }
 
     /// Fenced full-save entry point for an editable owner. The returned state is the only state
-    /// that owner may use for later saves; failures never refresh or transfer ownership.
+    /// that owner may use for later saves; failures never refresh or transfer ownership. The file
+    /// must exist (initial creation is `prepareInitialAgentSessionPersistence`), regardless of
+    /// `fileCreationPolicy`. DataService merges the durable lifecycle into the payload; the
+    /// payload's own `lifecycle` member is never trusted.
+    ///
+    /// Reset commit: a receipt equal to the persisted latest receipt is acknowledged without a
+    /// write (`.resetAlreadyCommitted`) when the state's generation is current or its immediate
+    /// predecessor; otherwise the generation must be current, and the reset transcript, the
+    /// incremented generation, and the receipt are written in one replacement.
     package func saveAgentSession(
         _ session: AgentSession,
         for workspace: some AgentWorkspaceStorageReference,
@@ -1864,8 +2391,16 @@ package actor AgentSessionDataService {
             intentionallyRemovingFinalizedScheduledSendItems: removals,
             committingTranscriptReset: resetReceipt,
             fileCreationPolicy: fileCreationPolicy,
-            expectedPersistenceState: persistenceState
+            authority: .persistenceState(persistenceState)
         )
+    }
+
+    private enum SaveAuthority {
+        /// Generic load-modify-save or genuine exclusive creation; authority is the payload's own
+        /// loaded lifecycle.
+        case compatibility
+        /// Editable owner; authority is the captured service-issued state.
+        case persistenceState(AgentSessionPersistenceState)
     }
 
     private func saveAgentSessionLocked(
@@ -1876,11 +2411,12 @@ package actor AgentSessionDataService {
         intentionallyRemovingFinalizedScheduledSendItems removals: [AgentScheduledSendFinalizedItemRemoval],
         committingTranscriptReset resetReceipt: AgentSessionTranscriptResetReceipt?,
         fileCreationPolicy: AgentSessionFileCreationPolicy,
-        expectedPersistenceState: AgentSessionPersistenceState?
+        authority: SaveAuthority,
+        countsAsFullSave: Bool = true
     ) async throws -> AgentSessionSaveCommit {
         let agentSessionsFolder: URL
         let fileURL: URL
-        if let expectedPersistenceState {
+        if case let .persistenceState(expectedPersistenceState) = authority {
             try validatePersistenceStamp(
                 expectedPersistenceState.stamp,
                 sessionID: session.id,
@@ -1893,36 +2429,103 @@ package actor AgentSessionDataService {
             fileURL = agentSessionFileURL(id: session.id, in: agentSessionsFolder)
         }
         let fileKey = canonicalSessionFileKey(fileURL)
+        try requireNoTombstone(for: session.id)
 
         let fileExists = FileManager.default.fileExists(atPath: fileURL.path)
-        if !fileExists, case .requireExisting = fileCreationPolicy {
-            throw AgentScheduledSendMutationError.sessionNotFound(session.id)
+        // `nil` only for a genuine exclusive creation.
+        let currentLifecycle: AgentSessionLifecycle?
+        switch authority {
+        case let .persistenceState(expected):
+            guard fileExists else {
+                throw AgentScheduledSendMutationError.sessionNotFound(session.id)
+            }
+            guard case let .v1(current) = try currentDurableLifecycle(fileURL: fileURL, sessionID: session.id) else {
+                throw AgentScheduledSendMutationError.staleIncarnation(expected: expected.stamp.incarnationID, actual: nil)
+            }
+            guard expected.stamp.incarnationID == current.incarnationID else {
+                throw AgentScheduledSendMutationError.staleIncarnation(
+                    expected: expected.stamp.incarnationID,
+                    actual: current.incarnationID
+                )
+            }
+            let isCurrentOrImmediatePredecessor =
+                expected.transcriptResetGeneration <= current.transcriptResetGeneration
+                    && current.transcriptResetGeneration - expected.transcriptResetGeneration <= 1
+            if let resetReceipt,
+               current.lastTranscriptResetReceipt == resetReceipt,
+               isCurrentOrImmediatePredecessor
+            {
+                return AgentSessionSaveCommit(
+                    fileURL: fileURL,
+                    persistenceState: persistenceState(
+                        sessionID: session.id,
+                        workspaceID: workspace.id,
+                        fileURL: fileURL,
+                        lifecycle: current
+                    ),
+                    disposition: .resetAlreadyCommitted,
+                    committedSession: nil
+                )
+            }
+            guard expected.transcriptResetGeneration == current.transcriptResetGeneration else {
+                throw AgentScheduledSendMutationError.staleTranscriptResetGeneration(
+                    expected: expected.transcriptResetGeneration,
+                    actual: current.transcriptResetGeneration
+                )
+            }
+            currentLifecycle = current
+        case .compatibility:
+            guard resetReceipt == nil else {
+                throw AgentScheduledSendMutationError.transcriptResetRequiresPersistenceState
+            }
+            if fileExists {
+                let durable = try currentDurableLifecycle(fileURL: fileURL, sessionID: session.id)
+                let supplied: AgentSessionLifecycle
+                switch session.lifecycle {
+                case nil:
+                    throw AgentScheduledSendMutationError.missingLifecycle(session.id)
+                case .unreadable:
+                    throw AgentScheduledSendMutationError.unreadableLifecycle(session.id)
+                case let .v1(value):
+                    supplied = value
+                }
+                guard case let .v1(current) = durable else {
+                    // A legacy file is migrated by a gate-held load before any authority exists.
+                    throw AgentScheduledSendMutationError.staleIncarnation(expected: supplied.incarnationID, actual: nil)
+                }
+                guard supplied.incarnationID == current.incarnationID else {
+                    throw AgentScheduledSendMutationError.staleIncarnation(
+                        expected: supplied.incarnationID,
+                        actual: current.incarnationID
+                    )
+                }
+                guard supplied.transcriptResetGeneration == current.transcriptResetGeneration else {
+                    throw AgentScheduledSendMutationError.staleTranscriptResetGeneration(
+                        expected: supplied.transcriptResetGeneration,
+                        actual: current.transcriptResetGeneration
+                    )
+                }
+                currentLifecycle = current
+            } else {
+                guard case .createIfMissing = fileCreationPolicy, session.lifecycle == nil else {
+                    // Never reconstruct a lifecycle-bearing snapshot as an ordinary save.
+                    throw AgentScheduledSendMutationError.sessionNotFound(session.id)
+                }
+                currentLifecycle = nil
+            }
         }
-
-        let currentResetGeneration = currentTranscriptResetGeneration(for: fileKey)
-        if let resetReceipt,
-           fileExists,
-           let committedReset = transcriptResetAuthorityByFileURL[fileKey],
-           committedReset.deletionGeneration == (deletionGenerationsByFileKey[fileKey] ?? 0),
-           committedReset.receipt == resetReceipt
-        {
-            return AgentSessionSaveCommit(
-                fileURL: fileURL,
-                persistenceState: persistenceState(
-                    sessionID: session.id,
-                    workspaceID: workspace.id,
-                    fileURL: fileURL
-                ),
-                disposition: .resetAlreadyCommitted
-            )
-        }
-        if let expectedPersistenceState,
-           expectedPersistenceState.transcriptResetGeneration != currentResetGeneration
-        {
-            throw AgentScheduledSendMutationError.staleTranscriptResetGeneration(
-                expected: expectedPersistenceState.transcriptResetGeneration,
-                actual: currentResetGeneration
-            )
+        let lifecycleToWrite: AgentSessionLifecycle
+        if let currentLifecycle {
+            if let resetReceipt {
+                guard let advanced = currentLifecycle.advancingTranscriptReset(receipt: resetReceipt) else {
+                    throw AgentScheduledSendMutationError.transcriptResetGenerationOverflow
+                }
+                lifecycleToWrite = advanced
+            } else {
+                lifecycleToWrite = currentLifecycle
+            }
+        } else {
+            lifecycleToWrite = .fresh()
         }
 
         let staleRemovalPolicy: StaleFinalizedItemRemovalPolicy =
@@ -1971,6 +2574,8 @@ package actor AgentSessionDataService {
             !$0.protectedAcceptedUserItemsByID.isEmpty
                 || !$0.intentionallyRemovedAcceptedUserItemReceiptsByID.isEmpty
         } ?? false
+        // Durable authority always comes from DataService, never from the payload.
+        sessionWithAuthoritativeSchedule.lifecycle = .v1(lifecycleToWrite)
 
         #if DEBUG
             // Phase-boundary clocks are read only while diagnostics are enabled; later marks follow
@@ -1996,29 +2601,37 @@ package actor AgentSessionDataService {
         #if DEBUG
             let diagnosticsWriteStartMS = diagnosticsEncodeStartMS.map { _ in AgentModePerfDiagnostics.timestampMS() }
         #endif
-        try await diskWriter.enqueueAndWait(data: data, url: fileURL)
+        // Creation is exclusive by the app contract, not by a filesystem primitive: DataService
+        // (`.shared`) is the sole session writer and this gate is held from the absence check
+        // above through the atomic write, so of two creators of one UUID exactly one writes and
+        // the other observes the file (`sessionAlreadyExists`).
+        try await writeDataAtomically(data, to: fileURL)
         #if DEBUG
             // The atomic replacement has returned successfully: this is the full-save commit point,
-            // recorded before schedule/reset authority and metadata-index work.
-            Self.recordFullSessionWrittenDiagnostics(
-                sessionToSave,
-                encodedByteCount: data.count,
-                committingTranscriptReset: resetReceipt != nil,
-                prepareStartMS: diagnosticsPrepareStartMS,
-                encodeStartMS: diagnosticsEncodeStartMS,
-                writeStartMS: diagnosticsWriteStartMS
-            )
+            // recorded before schedule/reset authority and metadata-index work. Owner creation via
+            // `prepareInitialAgentSessionPersistence` is not a full save and is not counted.
+            if countsAsFullSave {
+                Self.recordFullSessionWrittenDiagnostics(
+                    sessionToSave,
+                    encodedByteCount: data.count,
+                    committingTranscriptReset: resetReceipt != nil,
+                    prepareStartMS: diagnosticsPrepareStartMS,
+                    encodeStartMS: diagnosticsEncodeStartMS,
+                    writeStartMS: diagnosticsWriteStartMS
+                )
+            }
         #endif
         rememberScheduleAuthority(
             from: sessionToSave,
             fileURL: fileURL,
             preservingItemAuthority: itemAuthorityForSave
         )
+        rememberLifecycle(of: sessionToSave, fileURL: fileURL)
         if let resetReceipt {
             transcriptResetAuthorityByFileURL[fileKey] =
                 AgentSessionTranscriptResetAuthority(
-                    deletionGeneration: deletionGenerationsByFileKey[fileKey] ?? 0,
-                    generation: currentResetGeneration &+ 1,
+                    incarnationID: lifecycleToWrite.incarnationID,
+                    generation: lifecycleToWrite.transcriptResetGeneration,
                     receipt: resetReceipt,
                     canonicalSessionSnapshot: data
                 )
@@ -2029,9 +2642,11 @@ package actor AgentSessionDataService {
             persistenceState: persistenceState(
                 sessionID: session.id,
                 workspaceID: workspace.id,
-                fileURL: fileURL
+                fileURL: fileURL,
+                lifecycle: lifecycleToWrite
             ),
-            disposition: .written
+            disposition: .written,
+            committedSession: sessionToSave
         )
     }
 
@@ -2127,11 +2742,15 @@ package actor AgentSessionDataService {
             agentSessionsFolder = try ensureAgentSessionsFolder(for: workspace)
             fileURL = agentSessionFileURL(id: sessionID, in: agentSessionsFolder)
         }
+        try requireNoTombstone(for: sessionID)
         guard FileManager.default.fileExists(atPath: fileURL.path) else {
             throw AgentScheduledSendMutationError.sessionNotFound(sessionID)
         }
 
-        var session = try await loadAgentSessionLocked(from: fileURL)
+        var session = try await loadAgentSessionLocked(from: fileURL, purpose: .storageMutation)
+        if let persistenceStamp {
+            try validateStampIncarnation(persistenceStamp, against: session)
+        }
 
         switch mutation {
         case let .upsert(expectedUpdatedAt, value):
@@ -2190,8 +2809,9 @@ package actor AgentSessionDataService {
             trustedCanonicalItemCount: session.itemCount
         )
         let data = try AgentSessionDataCodec.encodeSession(sessionToSave, using: JSONEncoder())
-        try await diskWriter.enqueueAndWait(data: data, url: fileURL)
+        try await writeDataAtomically(data, to: fileURL)
         rememberScheduleAuthority(from: sessionToSave, fileURL: fileURL)
+        rememberLifecycle(of: sessionToSave, fileURL: fileURL)
 
         let indexStatus: AgentScheduledSendMutationResult.MetadataIndexStatus =
             switch await upsertMetadataRecordReporting(
@@ -2305,10 +2925,17 @@ package actor AgentSessionDataService {
             fileURL = agentSessionFileURL(id: sessionID, in: agentSessionsFolder)
         }
         let fileKey = canonicalSessionFileKey(fileURL)
+        try requireNoTombstone(for: sessionID)
         guard FileManager.default.fileExists(atPath: fileURL.path) else {
             throw AgentScheduledSendMutationError.sessionNotFound(sessionID)
         }
-        let session = try await loadAgentSessionLocked(from: fileURL)
+        let session = try await loadAgentSessionLocked(from: fileURL, purpose: .storageMutation)
+        if let persistenceStamp {
+            try validateStampIncarnation(persistenceStamp, against: session)
+        }
+        guard let lifecycle = session.lifecycle?.lifecycle else {
+            throw AgentScheduledSendMutationError.unreadableLifecycle(sessionID)
+        }
         guard let record = session.scheduledSend?.persistedValue else {
             throw AgentScheduledSendMutationError.staleExpectedUpdatedAt(expected: expectedUpdatedAt, actual: nil)
         }
@@ -2327,22 +2954,26 @@ package actor AgentSessionDataService {
             workspaceID: workspace.id,
             workspace: workspace,
             fileURL: fileURL,
+            fileKey: fileKey,
             agentSessionsFolderURL: agentSessionsFolder,
             deletionGeneration: deletionGenerationsByFileKey[fileKey] ?? 0,
+            incarnationID: lifecycle.incarnationID,
             canonicalSessionSnapshot: snapshot,
-            transcriptResetReceiptAtPreparation:
-            transcriptResetAuthorityByFileURL[fileKey]?.receipt,
-            transcriptResetGenerationAtPreparation:
-            currentTranscriptResetGeneration(for: fileKey),
+            transcriptResetReceiptAtPreparation: lifecycle.lastTranscriptResetReceipt,
+            transcriptResetGenerationAtPreparation: lifecycle.transcriptResetGeneration,
             dataService: self
         )
     }
 
     /// Recovery finalization at the pinned destination, under the same gate and through the same
-    /// accepted-item/receipt/schedule-retirement pipeline as `finalizeScheduledSend`. When the
-    /// authoritative file is missing, explicit-deletion evidence is checked first; only an
-    /// accidental loss is reconstructed from the captured canonical snapshot. Never overwrites an
-    /// existing file wholesale.
+    /// accepted-item/receipt/schedule-retirement pipeline as `finalizeScheduledSend`. Deletion
+    /// evidence (durable tombstone, then process-local generation) is checked first. An existing
+    /// file must still be the captured incarnation; a later durable reset suppresses accepted items
+    /// absent from the post-reset transcript. A missing file is reconstructed only while this
+    /// service still holds authoritative lifecycle/reset state for the destination (selecting the
+    /// post-reset snapshot when a later reset committed); otherwise it fails closed with
+    /// `lifecycleAuthorityUnavailable`. Identity is never minted from a recovery snapshot, and an
+    /// existing file is never overwritten wholesale.
     func finalizeScheduledSend(
         recovery payload: AgentScheduledSendAcceptedPayload
     ) async throws -> AgentScheduledSendRecoveryOutcome {
@@ -2353,15 +2984,17 @@ package actor AgentSessionDataService {
         await acquireSessionPersistence(for: context.sessionID)
         defer { releaseSessionPersistence(for: context.sessionID) }
         let fileKey = canonicalSessionFileKey(context.fileURL)
+        switch try tombstoneState(for: context.sessionID) {
+        case .absent:
+            break
+        case .committed:
+            return .explicitlyDeleted
+        case .unreadable:
+            throw AgentScheduledSendMutationError.unreadableTombstone(context.sessionID)
+        }
         let currentDeletionGeneration = deletionGenerationsByFileKey[fileKey] ?? 0
         guard currentDeletionGeneration == context.deletionGeneration else {
             return .explicitlyDeleted
-        }
-        let laterResetAuthority = transcriptResetAuthorityByFileURL[fileKey].flatMap { authority in
-            authority.deletionGeneration == currentDeletionGeneration
-                && authority.generation > context.transcriptResetGenerationAtPreparation
-                ? authority
-                : nil
         }
         #if DEBUG
             if let injected = test_scheduledSendRecoveryFailureInjector?(payload) {
@@ -2374,7 +3007,17 @@ package actor AgentSessionDataService {
             receipt: payload.receipt
         )
         if FileManager.default.fileExists(atPath: context.fileURL.path) {
-            let session = try await loadAgentSessionLocked(from: context.fileURL)
+            let session = try await loadAgentSessionLocked(from: context.fileURL, purpose: .storageMutation)
+            guard let lifecycle = session.lifecycle?.lifecycle,
+                  lifecycle.incarnationID == context.incarnationID
+            else {
+                throw AgentScheduledSendMutationError.staleIncarnation(
+                    expected: context.incarnationID,
+                    actual: session.lifecycle?.lifecycle?.incarnationID
+                )
+            }
+            let laterResetCommitted =
+                lifecycle.transcriptResetGeneration > context.transcriptResetGenerationAtPreparation
             let result = try await commitScheduledSendFinalization(
                 session: session,
                 fileURL: context.fileURL,
@@ -2383,10 +3026,30 @@ package actor AgentSessionDataService {
                 expectedAttempt: payload.attempt,
                 acceptedUserItem: payload.acceptedItem,
                 receipt: payload.receipt,
-                suppressAcceptedItem: laterResetAuthority != nil
+                suppressAcceptedItem: laterResetCommitted
                     && !sessionContainsItem(session, itemID: payload.attempt.itemID)
             )
             return .committed(result)
+        }
+        // Missing file: only this service's authoritative lifecycle for the same incarnation can
+        // decide which snapshot is current.
+        guard let authoritativeLifecycle = lifecycleByFileKey[fileKey],
+              authoritativeLifecycle.incarnationID == context.incarnationID,
+              authoritativeLifecycle.transcriptResetGeneration >= context.transcriptResetGenerationAtPreparation
+        else {
+            throw AgentScheduledSendRecoveryError.lifecycleAuthorityUnavailable
+        }
+        let laterResetAuthority: AgentSessionTranscriptResetAuthority?
+        if authoritativeLifecycle.transcriptResetGeneration > context.transcriptResetGenerationAtPreparation {
+            guard let authority = transcriptResetAuthorityByFileURL[fileKey],
+                  authority.incarnationID == authoritativeLifecycle.incarnationID,
+                  authority.generation == authoritativeLifecycle.transcriptResetGeneration
+            else {
+                throw AgentScheduledSendRecoveryError.lifecycleAuthorityUnavailable
+            }
+            laterResetAuthority = authority
+        } else {
+            laterResetAuthority = nil
         }
         var isDirectory: ObjCBool = false
         guard FileManager.default.fileExists(atPath: context.agentSessionsFolderURL.path, isDirectory: &isDirectory),
@@ -2405,6 +3068,8 @@ package actor AgentSessionDataService {
         if let scheduleAuthority = scheduleAuthorityByFileURL[fileKey] {
             snapshot = sessionByApplyingScheduleAuthority(scheduleAuthority, to: snapshot)
         }
+        // Retain the authoritative lifecycle and reset receipt; never the snapshot's own member.
+        snapshot.lifecycle = .v1(authoritativeLifecycle)
         let result = try await commitScheduledSendFinalization(
             session: snapshot,
             fileURL: context.fileURL,
@@ -2456,10 +3121,11 @@ package actor AgentSessionDataService {
 
         let agentSessionsFolder = try ensureAgentSessionsFolder(for: workspace)
         let fileURL = agentSessionFileURL(id: sessionID, in: agentSessionsFolder)
+        try requireNoTombstone(for: sessionID)
         guard FileManager.default.fileExists(atPath: fileURL.path) else {
             throw AgentScheduledSendMutationError.sessionNotFound(sessionID)
         }
-        let session = try await loadAgentSessionLocked(from: fileURL)
+        let session = try await loadAgentSessionLocked(from: fileURL, purpose: .storageMutation)
         return try await commitScheduledSendFinalization(
             session: session,
             fileURL: fileURL,
@@ -2555,13 +3221,14 @@ package actor AgentSessionDataService {
             trustedCanonicalItemCount: nil
         )
         let data = try AgentSessionDataCodec.encodeSession(sessionToSave, using: JSONEncoder())
-        try await diskWriter.enqueueAndWait(data: data, url: fileURL)
+        try await writeDataAtomically(data, to: fileURL)
         rememberScheduleAuthority(
             from: sessionToSave,
             fileURL: fileURL,
             protecting: acceptedItemMustRemainAbsent ? nil : stampedItem,
             preservingItemAuthority: itemAuthorityForCommit
         )
+        rememberLifecycle(of: sessionToSave, fileURL: fileURL)
 
         let indexStatus: AgentScheduledSendMutationResult.MetadataIndexStatus =
             switch await upsertMetadataRecordReporting(
@@ -2578,6 +3245,609 @@ package actor AgentSessionDataService {
             session: sessionToSave,
             fileURL: fileURL,
             metadataIndexStatus: indexStatus
+        )
+    }
+
+    // MARK: - Recovery lifecycle gate (lossless restart Phase 1b, inactive)
+
+    /// Whether `store` is this service's configured recovery store (composition check: gates and
+    /// tombstone-aware discovery must validate against the same store the coordinator writes).
+    package nonisolated func usesRecoveryStore(_ store: AgentRecoveryStore) -> Bool {
+        recoveryStore === store
+    }
+
+    /// A recovery gate for one editable session's persistence state. Requires lifecycle authority.
+    package nonisolated func recoveryLifecycleGate(
+        for state: AgentSessionPersistenceState
+    ) throws -> AgentSessionRecoveryLifecycleGate {
+        guard let incarnationID = state.stamp.incarnationID else {
+            throw AgentScheduledSendMutationError.missingLifecycle(state.stamp.sessionID)
+        }
+        return AgentSessionRecoveryLifecycleGate(
+            service: self,
+            persistenceState: state,
+            binding: AgentRecoveryLifecycleBinding(
+                sessionID: state.stamp.sessionID,
+                incarnationID: incarnationID,
+                transcriptResetGeneration: state.transcriptResetGeneration
+            )
+        )
+    }
+
+    /// Runs `body` under the session persistence gate after validating `state` against current
+    /// durable authority; rejects (before `body`) after deletion, reset, or incarnation change.
+    func performRecoveryTransaction<T: Sendable>(
+        persistenceState state: AgentSessionPersistenceState,
+        _ body: @Sendable () async throws -> T
+    ) async throws -> T {
+        let sessionID = state.stamp.sessionID
+        await acquireSessionPersistence(for: sessionID)
+        defer { releaseSessionPersistence(for: sessionID) }
+        let stamp = state.stamp
+        try validatePersistenceStamp(stamp, sessionID: sessionID, workspaceID: stamp.workspaceID)
+        try requireNoTombstone(for: sessionID)
+        guard FileManager.default.fileExists(atPath: stamp.fileURL.path) else {
+            throw AgentScheduledSendMutationError.sessionNotFound(sessionID)
+        }
+        guard case let .v1(current) = try currentDurableLifecycle(fileURL: stamp.fileURL, sessionID: sessionID) else {
+            throw AgentScheduledSendMutationError.staleIncarnation(expected: stamp.incarnationID, actual: nil)
+        }
+        guard stamp.incarnationID == current.incarnationID else {
+            throw AgentScheduledSendMutationError.staleIncarnation(expected: stamp.incarnationID, actual: current.incarnationID)
+        }
+        guard state.transcriptResetGeneration == current.transcriptResetGeneration else {
+            throw AgentScheduledSendMutationError.staleTranscriptResetGeneration(
+                expected: state.transcriptResetGeneration,
+                actual: current.transcriptResetGeneration
+            )
+        }
+        return try await body()
+    }
+
+    /// R5 stamp evidence for a gate-held cold load: the session's recovery run attempts (an absent or
+    /// unreadable record contributes none, so the stamp says `unknown` without a run ID). `nil` when
+    /// no recovery store is composed (legacy behavior: no stamp). Callers hold the session gate.
+    private func coldRestoreInterruptionContext(sessionID: UUID) async -> AgentColdRestoreInterruptionContext? {
+        guard let recoveryStore else { return nil }
+        let currentInstanceID = recoveryStore.appInstanceID
+        let launchStateCaptured = coldRestoreLaunchEvidence != nil
+        let launchReason = coldRestoreLaunchEvidence.flatMap {
+            AgentColdRestoreInterruptionContext.launchReason(previousLaunch: $0, currentInstanceID: currentInstanceID)
+        }
+        let provisional = provisionalUnknownStampTurnIDs[sessionID] ?? []
+        guard let record = await recoveryStore.read(sessionID: sessionID).record else {
+            return AgentColdRestoreInterruptionContext(
+                observedAt: Date(),
+                providerConversationID: nil,
+                runAttempts: [],
+                launchReason: launchReason,
+                launchStateCaptured: launchStateCaptured,
+                provisionalUnknownTurnIDs: provisional,
+                currentInstanceID: currentInstanceID
+            )
+        }
+        // R1a: no affirmative acceptance (queued, failed, dispatching, unknown, or withdrawn) from an
+        // earlier launch: the saved deterministic bubble is never shown as sent. Verified
+        // non-delivery reads as not sent; a handoff that may have happened reads as unconfirmed.
+        let unaccepted = record.intents.compactMap { intent -> AgentColdRestoreInterruptionContext.UnacceptedBubble? in
+            guard intent.deliveryState != .providerAccepted, intent.appInstanceID != currentInstanceID else { return nil }
+            return AgentColdRestoreInterruptionContext.UnacceptedBubble(
+                userItemID: intent.userItemID,
+                incarnationID: record.incarnationID,
+                transcriptResetGeneration: intent.transcriptResetGeneration,
+                delivery: AgentColdRestoreInterruptionContext.unacceptedDelivery(
+                    state: intent.deliveryState,
+                    attempts: record.attempts(forIntent: intent.intentID)
+                )
+            )
+        }
+        let bubbles = record.intents.compactMap { intent -> AgentColdRestoreInterruptionContext.AcceptedBubble? in
+            // Only affirmative acceptance from an earlier launch; this launch's own optimistic
+            // bubbles are owned by their live view model.
+            guard intent.deliveryState == .providerAccepted, intent.appInstanceID != currentInstanceID else { return nil }
+            return AgentColdRestoreInterruptionContext.AcceptedBubble(
+                userItemID: intent.userItemID,
+                incarnationID: record.incarnationID,
+                transcriptResetGeneration: intent.transcriptResetGeneration,
+                text: intent.payload.text,
+                attachments: intent.payload.images.compactMap { recoveryStore.attachment(for: $0, sessionID: sessionID) },
+                taggedFiles: intent.payload.taggedFiles.map(\.attachment),
+                workflow: intent.payload.workflow?.definition
+            )
+        }
+        return AgentColdRestoreInterruptionContext(
+            observedAt: Date(),
+            providerConversationID: nil,
+            runAttempts: record.runAttempts,
+            acceptedBubbles: bubbles,
+            unacceptedBubbles: unaccepted,
+            launchReason: launchReason,
+            launchStateCaptured: launchStateCaptured,
+            provisionalUnknownTurnIDs: provisional,
+            // F-7: this launch's live runs (and their exact turns) are excluded from the cold
+            // restoration; the rest of the record is still applied.
+            currentInstanceID: currentInstanceID
+        )
+    }
+
+    /// Adopts the previous-launch state the recovery coordinator captured (before this launch's
+    /// mark replaced it) as R5 launch evidence. First capture wins; until then stamps say `unknown`
+    /// provisionally and are refined by a later gate-held load.
+    package func adoptColdRestoreLaunchEvidence(_ previousLaunch: AgentRecoveryPreviousLaunch) {
+        guard coldRestoreLaunchEvidence == nil else { return }
+        coldRestoreLaunchEvidence = previousLaunch
+    }
+
+    /// After a committed cold load: remembers turns stamped `unknown` only because launch evidence
+    /// was not captured yet, or forgets them once a load with evidence refined them.
+    private func noteColdRestoreStamps(
+        sessionID: UUID,
+        context: AgentColdRestoreInterruptionContext?,
+        transcript: AgentTranscript?
+    ) {
+        guard let context else { return }
+        if context.launchStateCaptured {
+            if context.launchReason != nil {
+                provisionalUnknownStampTurnIDs[sessionID] = nil
+            }
+            return
+        }
+        let stamped = (transcript?.turns ?? []).filter { turn in
+            guard let interruption = turn.interruption else { return false }
+            return interruption.observedAt == context.observedAt
+                && interruption.reason == .unknown
+                && interruption.resolution == nil
+        }.map(\.id)
+        guard !stamped.isEmpty else { return }
+        provisionalUnknownStampTurnIDs[sessionID, default: []].formUnion(stamped)
+    }
+
+    // MARK: - Startup reconciliation (lossless restart Phase 1b)
+
+    /// The workspace's session folder, resolved without creating anything.
+    private func existingAgentSessionsFolder(for workspace: some AgentWorkspaceStorageReference) -> URL {
+        let base: URL = if let customURL = workspace.customStoragePath {
+            customURL
+        } else {
+            MCPFilesystemConstants.identity.applicationSupportRootURL()
+                .appendingPathComponent("Workspaces", isDirectory: true)
+                .appendingPathComponent(WorkspaceDirectoryName.directoryName(name: workspace.name, id: workspace.id))
+        }
+        return base.appendingPathComponent("AgentSessions")
+    }
+
+    /// Every normal session file of `workspace` (full sessions and durable stubs share one file
+    /// format), each with a metadata-index hint only when the index entry still describes the file
+    /// on disk. Creates nothing. A default-location workspace without a folder has no sessions; an
+    /// unreachable custom location or an unreadable folder throws (a scoped workspace failure).
+    package func recoverySessionFiles(
+        for workspace: some AgentWorkspaceStorageReference
+    ) async throws -> [AgentRecoverySessionFile] {
+        let folder = existingAgentSessionsFolder(for: workspace)
+        if let customURL = workspace.customStoragePath {
+            var isDirectory: ObjCBool = false
+            guard FileManager.default.fileExists(atPath: customURL.path, isDirectory: &isDirectory), isDirectory.boolValue else {
+                throw CocoaError(.fileReadNoSuchFile, userInfo: [NSFilePathErrorKey: customURL.path])
+            }
+        }
+        guard FileManager.default.fileExists(atPath: folder.path) else { return [] }
+        let names = try FileManager.default.contentsOfDirectory(atPath: folder.path)
+        let index = await readMetadataIndexIfAvailable(folder: folder)
+        var entriesByID: [UUID: AgentSessionMetadataRecord] = [:]
+        for entry in index?.entries ?? [] where entriesByID[entry.id] == nil {
+            entriesByID[entry.id] = entry
+        }
+        return names.compactMap { agentSessionID(fromFilename: $0) }
+            .sorted { $0.uuidString < $1.uuidString }
+            .map { sessionID in
+                let fileURL = agentSessionFileURL(id: sessionID, in: folder)
+                guard let entry = entriesByID[sessionID] else {
+                    return AgentRecoverySessionFile(sessionID: sessionID, hint: nil)
+                }
+                let observed = metadataResourceValues(for: fileURL)
+                guard let size = observed.size, let modified = observed.modified,
+                      entry.observedFileSize == size, entry.observedFileModificationDate == modified
+                else {
+                    // A stale entry may describe an older file: inspect the session itself.
+                    return AgentRecoverySessionFile(sessionID: sessionID, hint: nil)
+                }
+                return AgentRecoverySessionFile(sessionID: sessionID, hint: AgentRecoverySessionFileHint(
+                    lastRunStateRaw: entry.lastRunStateRaw,
+                    scheduleStateRaw: entry.scheduledSendSummary?.stateRaw,
+                    scheduleUnreadable: entry.hasUnreadableScheduledSend,
+                    // A stub-built entry cannot say: inspect it (once; the load re-indexes it).
+                    mayHaveUnresolvedInterruption: entry.hasUnresolvedInterruption ?? entry.lacksTranscriptDerivedFields
+                ))
+            }
+    }
+
+    /// Reconciles one session at startup under its session gate (spec R1a, R5, R9): validates the
+    /// tombstone, session file, recovery record, and lifecycle authority before any load, so a
+    /// mismatched or unreadable authority never normalizes the saved turn; then loads (stamping
+    /// open turns and restoring accepted bubbles in the same rewrite) and repairs an unowned
+    /// `.dispatching` schedule. Constructs no provider, controller, or view model, and never waits
+    /// on a startup barrier. Every unresolved interruption is reported, whichever launch stamped it:
+    /// repeated restarts keep its row and crash hold until it is resolved.
+    package func reconcileRecoverySession(
+        sessionID: UUID,
+        workspace: AgentRecoveryWorkspaceDestination
+    ) async -> AgentSessionRecoveryResolution {
+        await acquireSessionPersistence(for: sessionID)
+        defer { releaseSessionPersistence(for: sessionID) }
+        return await reconcileRecoverySessionLocked(sessionID: sessionID, workspace: workspace)
+    }
+
+    private func reconcileRecoverySessionLocked(
+        sessionID: UUID,
+        workspace: AgentRecoveryWorkspaceDestination
+    ) async -> AgentSessionRecoveryResolution {
+        func resolution(_ classification: AgentSessionRecoveryClassification) -> AgentSessionRecoveryResolution {
+            AgentSessionRecoveryResolution(sessionID: sessionID, workspaceID: workspace.id, classification: classification)
+        }
+        switch try? tombstoneState(for: sessionID) {
+        case nil:
+            return resolution(.nonactionable(.authorityUnreadable))
+        case .committed, .unreadable:
+            return resolution(.tombstoned)
+        case .absent:
+            break
+        }
+        let fileURL = agentSessionFileURL(id: sessionID, in: existingAgentSessionsFolder(for: workspace))
+        guard FileManager.default.fileExists(atPath: fileURL.path) else {
+            return resolution(.nonactionable(.sessionFileUnavailable))
+        }
+        let recordState: AgentRecoveryRecordState = if let recoveryStore {
+            await recoveryStore.read(sessionID: sessionID)
+        } else {
+            .absent
+        }
+        if case let .preserved(reason) = recordState {
+            return resolution(.nonactionable(.unreadableRecord(reason)))
+        }
+        let durable: DurableLifecycleState
+        do {
+            durable = try currentDurableLifecycle(fileURL: fileURL, sessionID: sessionID)
+        } catch {
+            return resolution(.nonactionable(.authorityUnreadable))
+        }
+        if let record = recordState.record {
+            guard case let .v1(lifecycle) = durable,
+                  lifecycle.incarnationID == record.incarnationID,
+                  lifecycle.transcriptResetGeneration >= record.transcriptResetGeneration
+            else {
+                return resolution(.nonactionable(.authorityMismatch))
+            }
+        }
+        var session: AgentSession
+        do {
+            // Startup reconciliation is the cold restoration of a closed session.
+            session = try await loadAgentSessionLocked(from: fileURL, purpose: .coldRestore)
+        } catch {
+            return resolution(.nonactionable(.authorityUnreadable))
+        }
+        guard case let .v1(lifecycle)? = session.lifecycle else {
+            return resolution(.nonactionable(.authorityUnreadable))
+        }
+        let binding = AgentRecoveryLifecycleBinding(
+            sessionID: sessionID,
+            incarnationID: lifecycle.incarnationID,
+            transcriptResetGeneration: lifecycle.transcriptResetGeneration
+        )
+        var discovered: AgentRecoveryDiscoveredRecord?
+        if let record = recordState.record, let recoveryStore {
+            let holds = await recoveryStore.derivedHolds(for: record, currentGeneration: lifecycle.transcriptResetGeneration)
+            discovered = AgentRecoveryDiscoveredRecord(record: record, holdsByIntentID: holds)
+        }
+        let turns = session.transcript?.turns ?? []
+        let attemptsByID = Dictionary(
+            (recordState.record?.runAttempts ?? []).map { ($0.runAttemptID, $0) },
+            uniquingKeysWith: { first, _ in first }
+        )
+        let interruptedTurns = turns.compactMap { turn -> AgentRecoveryInterruptedTurn? in
+            guard let interruption = turn.interruption, interruption.resolution == nil else { return nil }
+            let completed = interruption.runAttemptID.flatMap { attemptsByID[$0]?.terminal } != nil
+            return AgentRecoveryInterruptedTurn(
+                turnID: turn.id,
+                interruption: interruption,
+                status: completed ? .completedTailMayBeMissing : .interrupted,
+                isLastTurn: turn.id == turns.last?.id
+            )
+        }
+        // Attempts the transcript never saved (R08 joins: own turn, or an unambiguous process run):
+        // open ones, and terminal ones of this generation whose turn is missing (R09).
+        let runAttempts = recordState.record?.runAttempts ?? []
+        let recoveryOnlyRunAttempts = AgentRecoveryRunTurnJoin(runAttempts: runAttempts).unrepresentedAttempts(
+            runAttempts,
+            in: turns,
+            currentGeneration: lifecycle.transcriptResetGeneration
+        )
+        var transfer = AgentRecoveryScheduleTransferOutcome.notApplicable
+        if case let .v1(schedule)? = session.scheduledSend, schedule.state == .dispatching {
+            transfer = await repairScheduledSendTransferLocked(
+                sessionID: sessionID,
+                workspace: workspace,
+                persistenceStamp: nil,
+                expectedRecord: schedule
+            )
+            if transfer != .notApplicable,
+               let reloaded = try? await loadAgentSessionLocked(from: fileURL, purpose: .storageMutation)
+            {
+                session = reloaded
+            }
+        }
+        let resolved = AgentSessionRecoveryResolution(
+            sessionID: sessionID,
+            workspaceID: workspace.id,
+            sessionName: session.name,
+            composeTabID: session.composeTabID,
+            classification: .actionable,
+            binding: binding,
+            record: discovered,
+            interruptedTurns: interruptedTurns,
+            recoveryOnlyRunAttempts: recoveryOnlyRunAttempts,
+            scheduleTransfer: transfer,
+            remoteHostID: session.remoteHost?.hostID
+        )
+        guard resolved.hasRecoveryItems || recordState.record != nil else {
+            return resolution(.idle)
+        }
+        return resolved
+    }
+
+    /// Classifies a session the startup sweep cannot place in exactly one destination (a recovery
+    /// record without a session file, or several session files), under its session gate: deletion
+    /// residue behind a committed or unreadable tombstone is retired, an unreadable tombstone
+    /// authority is unknown, and otherwise `unplaced` applies.
+    package func classifyUnplacedRecoverySession(
+        sessionID: UUID,
+        unplaced: AgentSessionRecoveryClassification
+    ) async -> AgentSessionRecoveryClassification {
+        await acquireSessionPersistence(for: sessionID)
+        defer { releaseSessionPersistence(for: sessionID) }
+        switch try? tombstoneState(for: sessionID) {
+        case nil:
+            return .nonactionable(.authorityUnreadable)
+        case .committed, .unreadable:
+            return .tombstoned
+        case .absent:
+            return unplaced
+        }
+    }
+
+    /// R9 receipt-transfer repair of an unowned `.dispatching` schedule attempt, decided and committed
+    /// under the session gate (the shared repair for closed sessions at startup and for hydrated
+    /// owners). Completes the transfer in one CAS, normalizes to the delivery-unknown confirmation
+    /// when nothing links to the attempt, and otherwise holds with the schedule unchanged. Never
+    /// dispatches, confirms, or releases attachments.
+    package func repairScheduledSendTransfer(
+        sessionID: UUID,
+        for workspace: some AgentWorkspaceStorageReference,
+        persistenceStamp: AgentSessionPersistenceStamp,
+        expectedRecord: AgentScheduledSendPersist
+    ) async -> AgentRecoveryScheduleTransferOutcome {
+        await acquireSessionPersistence(for: sessionID)
+        defer { releaseSessionPersistence(for: sessionID) }
+        return await repairScheduledSendTransferLocked(
+            sessionID: sessionID,
+            workspace: workspace,
+            persistenceStamp: persistenceStamp,
+            expectedRecord: expectedRecord
+        )
+    }
+
+    private func repairScheduledSendTransferLocked(
+        sessionID: UUID,
+        workspace: some AgentWorkspaceStorageReference,
+        persistenceStamp: AgentSessionPersistenceStamp?,
+        expectedRecord: AgentScheduledSendPersist
+    ) async -> AgentRecoveryScheduleTransferOutcome {
+        guard expectedRecord.state == .dispatching else { return .notApplicable }
+        let fileURL = persistenceStamp?.fileURL
+            ?? agentSessionFileURL(id: sessionID, in: existingAgentSessionsFolder(for: workspace))
+        let session: AgentSession
+        do {
+            if let persistenceStamp {
+                try validatePersistenceStamp(persistenceStamp, sessionID: sessionID, workspaceID: workspace.id)
+            }
+            try requireNoTombstone(for: sessionID)
+            guard FileManager.default.fileExists(atPath: fileURL.path) else { return .notApplicable }
+            session = try await loadAgentSessionLocked(from: fileURL, purpose: .storageMutation)
+            if let persistenceStamp {
+                try validateStampIncarnation(persistenceStamp, against: session)
+            }
+        } catch {
+            return .held("The scheduled message's session could not be read: \(error)")
+        }
+        guard case let .v1(current)? = session.scheduledSend, current == expectedRecord else { return .notApplicable }
+        let recoveryRecord: AgentRecoveryRecordState = if let recoveryStore {
+            await recoveryStore.read(sessionID: sessionID)
+        } else {
+            .absent
+        }
+        let mutation: AgentScheduledSendMutation
+        let outcome: AgentRecoveryScheduleTransferOutcome
+        switch AgentScheduledSendTransfer.resolve(record: current, recoveryRecord: recoveryRecord, sentAt: Date()) {
+        case .noLinkedIntent, .rolledBack:
+            let duplicateItemExists = current.attempt.map { sessionContainsItem(session, itemID: $0.itemID) } ?? false
+            mutation = .upsert(
+                expectedUpdatedAt: current.updatedAt,
+                value: AgentScheduledSendTransfer.deliveryUnknownNormalization(of: current, duplicateItemExists: duplicateItemExists)
+            )
+            outcome = .normalized
+        case let .hold(message):
+            return .held(message)
+        case let .completeTransfer(receipt):
+            mutation = .clear(expectedUpdatedAt: current.updatedAt, completedDispatch: receipt)
+            outcome = .completed(receipt)
+        case .cancelTransfer:
+            // R10: a committed cancellation decision is finished (also after a crash between its
+            // write and this clear), never resent and never re-confirmed.
+            mutation = .clear(expectedUpdatedAt: current.updatedAt, completedDispatch: nil)
+            outcome = .cancelled
+        }
+        do {
+            _ = try await performScheduledSendMutation(
+                sessionID: sessionID,
+                for: workspace,
+                persistenceStamp: persistenceStamp,
+                mutation: mutation
+            )
+            return outcome
+        } catch {
+            return .held("The scheduled message's transfer could not be saved: \(error)")
+        }
+    }
+
+    /// R10 "Cancel pending schedule" for a held transfer, under the session gate: validates the
+    /// exact pending `.dispatching` schedule attempt (`expectedRecord`) and the single linked intent
+    /// whose own evidence holds it, commits the cancellation decision on that intent, then clears
+    /// that exact schedule by CAS without any receipt. `.cancelled` only after the clear succeeds; a
+    /// failed clear leaves the decision for the startup or owner repair to finish. `.notApplicable`
+    /// when the schedule moved or the transfer is no longer held by that intent; `.held` on a read or
+    /// write failure. Delivery evidence, attempts and attachments are never changed.
+    package func cancelScheduledSendTransfer(
+        sessionID: UUID,
+        for workspace: some AgentWorkspaceStorageReference,
+        persistenceStamp: AgentSessionPersistenceStamp,
+        expectedRecord: AgentScheduledSendPersist
+    ) async -> AgentRecoveryScheduleTransferOutcome {
+        await acquireSessionPersistence(for: sessionID)
+        defer { releaseSessionPersistence(for: sessionID) }
+        guard expectedRecord.state == .dispatching, let attempt = expectedRecord.attempt, let recoveryStore else {
+            return .notApplicable
+        }
+        let fileURL = persistenceStamp.fileURL
+        let session: AgentSession
+        let binding: AgentRecoveryLifecycleBinding
+        do {
+            try validatePersistenceStamp(persistenceStamp, sessionID: sessionID, workspaceID: workspace.id)
+            try requireNoTombstone(for: sessionID)
+            guard FileManager.default.fileExists(atPath: fileURL.path) else { return .notApplicable }
+            session = try await loadAgentSessionLocked(from: fileURL, purpose: .storageMutation)
+            try validateStampIncarnation(persistenceStamp, against: session)
+            guard case let .v1(lifecycle) = try currentDurableLifecycle(fileURL: fileURL, sessionID: sessionID) else {
+                return .held("The scheduled message's session has no readable lifecycle.")
+            }
+            binding = AgentRecoveryLifecycleBinding(
+                sessionID: sessionID,
+                incarnationID: lifecycle.incarnationID,
+                transcriptResetGeneration: lifecycle.transcriptResetGeneration
+            )
+        } catch {
+            return .held("The scheduled message's session could not be read: \(error)")
+        }
+        guard case let .v1(current)? = session.scheduledSend, current == expectedRecord else { return .notApplicable }
+        let recoveryRecord = await recoveryStore.read(sessionID: sessionID)
+        let resolution = AgentScheduledSendTransfer.resolve(record: current, recoveryRecord: recoveryRecord, sentAt: Date())
+        if resolution != .cancelTransfer {
+            guard let intentID = AgentScheduledSendTransfer.cancellableHeldTransferIntentID(
+                record: current,
+                recoveryRecord: recoveryRecord
+            ) else { return .notApplicable }
+            do {
+                // Lock order: this session gate, then the recovery store.
+                _ = try await recoveryStore.recordScheduledTransferCancellation(
+                    binding: binding,
+                    expectedRevision: recoveryRecord.record?.revision,
+                    intentID: intentID,
+                    scheduleID: current.id,
+                    scheduleAttemptID: attempt.attemptID
+                )
+            } catch {
+                return .held("The cancellation could not be saved: \(error)")
+            }
+        }
+        do {
+            _ = try await performScheduledSendMutation(
+                sessionID: sessionID,
+                for: workspace,
+                persistenceStamp: persistenceStamp,
+                mutation: .clear(expectedUpdatedAt: current.updatedAt, completedDispatch: nil)
+            )
+            return .cancelled
+        } catch {
+            return .held("The pending schedule could not be cleared: \(error)")
+        }
+    }
+
+    /// Classifies every recovery record against this workspace's tombstones and session lifecycle,
+    /// each under its session gate. Empty when no recovery store is configured.
+    package func discoverRecoveryRecords(
+        for workspace: some AgentWorkspaceStorageReference
+    ) async throws -> [AgentSessionRecoveryDiscovery] {
+        guard let recoveryStore else { return [] }
+        let folder = try ensureAgentSessionsFolder(for: workspace)
+        var results: [AgentSessionRecoveryDiscovery] = []
+        for entry in try await recoveryStore.discoverRecords() {
+            let sessionID: UUID
+            switch entry {
+            case let .preserved(preserved):
+                guard let id = preserved.sessionID else {
+                    results.append(.nonactionable(sessionID: nil, reason: .unreadableRecord(preserved.reason)))
+                    continue
+                }
+                sessionID = id
+            case let .supported(discovered):
+                sessionID = discovered.record.sessionID
+            }
+            await acquireSessionPersistence(for: sessionID)
+            let classification = await classifyRecoveryRecord(
+                sessionID: sessionID,
+                fileURL: agentSessionFileURL(id: sessionID, in: folder),
+                store: recoveryStore
+            )
+            releaseSessionPersistence(for: sessionID)
+            results.append(classification)
+        }
+        return results
+    }
+
+    /// Callers hold the session gate. Rereads the record under the gate.
+    private func classifyRecoveryRecord(
+        sessionID: UUID,
+        fileURL: URL,
+        store: AgentRecoveryStore
+    ) async -> AgentSessionRecoveryDiscovery {
+        switch try? tombstoneState(for: sessionID) {
+        case nil:
+            return .nonactionable(sessionID: sessionID, reason: .authorityUnreadable)
+        case .committed, .unreadable:
+            return .tombstoned(sessionID: sessionID)
+        case .absent:
+            break
+        }
+        let record: AgentRecoveryRecord
+        switch await store.read(sessionID: sessionID) {
+        case .absent:
+            return .nonactionable(sessionID: sessionID, reason: .sessionFileUnavailable)
+        case let .preserved(reason):
+            return .nonactionable(sessionID: sessionID, reason: .unreadableRecord(reason))
+        case let .supported(value):
+            record = value
+        }
+        guard FileManager.default.fileExists(atPath: fileURL.path) else {
+            return .nonactionable(sessionID: sessionID, reason: .sessionFileUnavailable)
+        }
+        let durable: DurableLifecycleState
+        do {
+            durable = try currentDurableLifecycle(fileURL: fileURL, sessionID: sessionID)
+        } catch {
+            return .nonactionable(sessionID: sessionID, reason: .authorityUnreadable)
+        }
+        guard case let .v1(lifecycle) = durable,
+              lifecycle.incarnationID == record.incarnationID,
+              lifecycle.transcriptResetGeneration >= record.transcriptResetGeneration
+        else {
+            return .nonactionable(sessionID: sessionID, reason: .authorityMismatch)
+        }
+        let holds = await store.derivedHolds(for: record, currentGeneration: lifecycle.transcriptResetGeneration)
+        return .eligible(
+            AgentRecoveryDiscoveredRecord(record: record, holdsByIntentID: holds),
+            binding: AgentRecoveryLifecycleBinding(
+                sessionID: sessionID,
+                incarnationID: lifecycle.incarnationID,
+                transcriptResetGeneration: lifecycle.transcriptResetGeneration
+            )
         )
     }
 
@@ -2621,7 +3891,10 @@ package actor AgentSessionDataService {
     package func rawLastRunStateForAgentSession(id: UUID, for workspace: some AgentWorkspaceStorageReference) async throws -> String? {
         let agentSessionsFolder = try ensureAgentSessionsFolder(for: workspace)
         let fileURL = agentSessionsFolder.appendingPathComponent(agentSessionFilename(for: id))
-        guard FileManager.default.fileExists(atPath: fileURL.path) else { return nil }
+        // Tombstoned residue is never read as a session, like the other lookups by ID.
+        guard try tombstoneState(for: id) == .absent,
+              FileManager.default.fileExists(atPath: fileURL.path)
+        else { return nil }
         let data = try Data(contentsOf: fileURL, options: .mappedIfSafe)
         return try AgentSessionDataCodec.decodeEnvelope(AgentSessionLastRunStateHeader.self, from: data, using: decoder)
             .value.lastRunState
@@ -2636,7 +3909,8 @@ package actor AgentSessionDataService {
 
         await acquireSessionPersistence(for: sessionID)
         do {
-            let session = try await loadAgentSessionLocked(from: fileURL)
+            // Resync, rename, and read-only tool loads: never a cold restoration (F-7).
+            let session = try await loadAgentSessionLocked(from: fileURL, purpose: .storageMutation)
             releaseSessionPersistence(for: sessionID)
             return session
         } catch {
@@ -2645,16 +3919,47 @@ package actor AgentSessionDataService {
         }
     }
 
-    private func loadAgentSessionLocked(from fileURL: URL) async throws -> AgentSession {
+    /// Gate-held load. Fences (tombstone, unsupported envelope, unreadable lifecycle) throw their
+    /// typed errors before normalization or any rewrite. A legacy session receives fresh identity
+    /// in the same replacement as its normalization; on write failure the original bytes remain
+    /// and no identity escapes.
+    private func loadAgentSessionLocked(from fileURL: URL, purpose: LoadPurpose) async throws -> AgentSession {
         let filename = fileURL.lastPathComponent
-        guard filename.starts(with: "AgentSession-"), filename.hasSuffix(".json") else {
+        guard let sessionID = agentSessionID(fromFilename: filename) else {
             throw AgentSessionDataError.invalidFilename(filename)
+        }
+        try requireNoTombstone(for: sessionID)
+        let session: AgentSession
+        do {
+            let data = try Data(contentsOf: fileURL, options: .mappedIfSafe)
+            session = try AgentSessionDataCodec.decodeSession(from: data, using: decoder)
+        } catch {
+            throw AgentSessionDataError.loadFailed(error)
+        }
+        let migrationLifecycle: AgentSessionLifecycle? = switch try Self.validateDecodedEnvelope(session) {
+        case .legacy:
+            .fresh()
+        case .v1:
+            nil
         }
 
         do {
-            let data = try Data(contentsOf: fileURL, options: .mappedIfSafe)
-            let session = try AgentSessionDataCodec.decodeSession(from: data, using: decoder)
-            let normalized = Self.normalizeLoadedSession(session, fileURL: fileURL)
+            // Gate-held, before normalization: open-turn evidence is stamped in the same value the
+            // normalization rewrite commits, so no load sanitizes it away first. Only a cold
+            // restoration reads that evidence.
+            let interruptionContext: AgentColdRestoreInterruptionContext? = if purpose == .coldRestore {
+                await coldRestoreInterruptionContext(sessionID: sessionID)?
+                    .withProviderConversationID(session.providerSessionID)
+            } else {
+                nil
+            }
+            let normalized = Self.normalizeLoadedSession(
+                session,
+                fileURL: fileURL,
+                purpose: purpose,
+                assigningLifecycle: migrationLifecycle,
+                interruptionContext: interruptionContext
+            )
             var runtimeSession = normalized.runtimeSession
             var persistedSessionToRewrite = normalized.persistedSessionToRewrite
             let reconciledMergeOperations = await AgentSessionWorktreeMergeReconciler.reconcile(runtimeSession.worktreeMergeOperations)
@@ -2675,10 +3980,22 @@ package actor AgentSessionDataService {
                 )
             }
             try await commitLoadedSessionStorage(rewrite: rewrite, runtimeSession: runtimeSession, fileURL: fileURL)
+            noteColdRestoreStamps(sessionID: sessionID, context: interruptionContext, transcript: runtimeSession.transcript)
             return runtimeSession
         } catch {
             throw AgentSessionDataError.loadFailed(error)
         }
+    }
+
+    /// Whether a best-effort metadata-recovery rewrite may replace this envelope: never for an
+    /// unsupported version or unreadable lifecycle.
+    private static func permitsMetadataRecoveryRewrite(
+        serializationVersion: Int,
+        lifecycle: AgentSessionLifecycleMember?
+    ) -> Bool {
+        guard AgentSession.supportedSerializationVersions.contains(serializationVersion) else { return false }
+        if case .unreadable = lifecycle { return false }
+        return true
     }
 
     /// Loads a lightweight stub under the same gate because metadata recovery may rewrite the file.
@@ -2713,14 +4030,24 @@ package actor AgentSessionDataService {
         persistRecoveredMetadata: Bool
     ) async throws -> AgentSession {
         let filename = fileURL.lastPathComponent
-        guard filename.starts(with: "AgentSession-"), filename.hasSuffix(".json") else {
+        guard let sessionID = agentSessionID(fromFilename: filename) else {
             throw AgentSessionDataError.invalidFilename(filename)
         }
+        // Inaccessible residue of a committed deletion is never served, even for display.
+        try requireNoTombstone(for: sessionID)
 
         do {
             let data = try Data(contentsOf: fileURL, options: .mappedIfSafe)
             let decodedHeader = try AgentSessionDataCodec.decodeEnvelope(AgentSessionHeader.self, from: data, using: decoder)
             let header = decodedHeader.value
+            // Display-only metadata may be served for any decodable envelope, but a recovery rewrite
+            // happens only for a supported envelope; a legacy one gains identity in that rewrite.
+            var stubLifecycle = header.lifecycle
+            let permitsRewrite = Self.permitsMetadataRecoveryRewrite(
+                serializationVersion: header.serializationVersion ?? AgentSession.legacyUnversionedSerializationVersion,
+                lifecycle: header.lifecycle
+            )
+            let migrationLifecycle: AgentSessionLifecycle? = header.lifecycle == nil ? .fresh() : nil
             var recoveredLastUserMessageAt = header.lastUserMessageAt
             var recoveredProjectionCounts = header.transcriptProjectionCounts
             var count = recoveredProjectionCounts?.canonicalVisibleRowCount ?? header.itemCount ?? 0
@@ -2729,7 +4056,13 @@ package actor AgentSessionDataService {
                header.lastUserMessageAt == nil || header.itemCount == nil || header.transcriptProjectionCounts == nil,
                let fullSession = try? AgentSessionDataCodec.decodeSession(from: data, using: decoder)
             {
-                let normalized = Self.normalizeLoadedSession(fullSession, fileURL: fileURL)
+                // Metadata recovery is a storage mutation: it never stamps or sanitizes (F-7).
+                let normalized = Self.normalizeLoadedSession(
+                    fullSession,
+                    fileURL: fileURL,
+                    purpose: .storageMutation,
+                    assigningLifecycle: migrationLifecycle
+                )
                 if let transcript = normalized.runtimeSession.transcript {
                     recoveredLastUserMessageAt = recoveredLastUserMessageAt ?? Self.computeLastUserMessageAt(in: transcript)
                     let projectionCounts = Self.computeProjectionCounts(in: transcript)
@@ -2749,11 +4082,15 @@ package actor AgentSessionDataService {
                 }
                 count = recoveredProjectionCounts?.canonicalVisibleRowCount ?? count
                 if persistRecoveredMetadata,
+                   permitsRewrite,
                    let persistedSession = normalized.persistedSessionToRewrite
                 {
                     do {
                         let encoded = try AgentSessionDataCodec.encodeSession(persistedSession, using: encoder)
                         try await writeDataAtomically(encoded, to: fileURL)
+                        // Only a committed rewrite makes migration identity durable.
+                        stubLifecycle = persistedSession.lifecycle
+                        rememberLifecycle(of: persistedSession, fileURL: fileURL)
                         await upsertMetadataRecord(
                             metadataRecord(from: persistedSession, fileURL: fileURL),
                             folder: fileURL.deletingLastPathComponent()
@@ -2797,6 +4134,7 @@ package actor AgentSessionDataService {
                 pendingHandoffPayload: header.pendingHandoffPayload,
                 pendingHandoffCreatedAt: header.pendingHandoffCreatedAt,
                 pendingHandoffSourceItemID: header.pendingHandoffSourceItemID,
+                pendingHandoffPayloadID: header.pendingHandoffPayloadID,
                 pendingHandoffDefersProviderLockUntilSend: header.pendingHandoffDefersProviderLockUntilSend ?? false,
                 scheduledSend: header.scheduledSend,
                 lastScheduledDispatch: header.lastScheduledDispatch,
@@ -2804,7 +4142,8 @@ package actor AgentSessionDataService {
                 origin: header.origin,
                 profile: header.profile ?? .standard,
                 worktreeBindings: header.worktreeBindings ?? [],
-                worktreeMergeOperations: header.worktreeMergeOperations ?? []
+                worktreeMergeOperations: header.worktreeMergeOperations ?? [],
+                lifecycle: stubLifecycle
             )
             rememberScheduleAuthority(from: stub, fileURL: fileURL)
             return stub
@@ -2823,8 +4162,11 @@ package actor AgentSessionDataService {
             options: [.skipsHiddenFiles]
         )
 
-        let jsonFiles = contents.filter {
-            agentSessionID(fromFilename: $0.lastPathComponent) != nil
+        let tombstoned = try tombstonedSessionIDs()
+        let jsonFiles = contents.filter { fileURL in
+            agentSessionID(fromFilename: fileURL.lastPathComponent).map {
+                !isTombstonedResidue(fileURL, sessionID: $0, tombstoned: tombstoned)
+            } ?? false
         }
 
         let datedFiles = jsonFiles.map { url in
@@ -2978,7 +4320,10 @@ package actor AgentSessionDataService {
         let filename = "AgentSession-\(id.uuidString).json"
         let fileURL = agentSessionsFolder.appendingPathComponent(filename)
 
-        guard FileManager.default.fileExists(atPath: fileURL.path) else {
+        // A logically deleted session is absent even when unlink left residue behind.
+        guard try tombstoneState(for: id) == .absent,
+              FileManager.default.fileExists(atPath: fileURL.path)
+        else {
             return nil
         }
 
@@ -3017,47 +4362,68 @@ package actor AgentSessionDataService {
     }
 
     /// Delete a particular agent session file under the same per-session gate as saves and CAS.
+    /// A filename that is not a session UUID is rejected (no ungated fallback).
     func deleteAgentSessionFile(_ fileURL: URL) async throws {
         guard let sessionID = agentSessionID(fromFilename: fileURL.lastPathComponent) else {
-            try await deleteAgentSessionFileLocked(fileURL)
-            return
+            throw AgentSessionDataError.invalidFilename(fileURL.lastPathComponent)
         }
         await acquireSessionPersistence(for: sessionID)
         defer { releaseSessionPersistence(for: sessionID) }
-        try await deleteAgentSessionFileLocked(fileURL)
+        try await deleteAgentSessionFileLocked(fileURL, sessionID: sessionID)
     }
 
-    private func deleteAgentSessionFileLocked(_ fileURL: URL) async throws {
+    /// Tombstone-first deletion (callers hold the gate). The durable tombstone is the commit point:
+    /// its write failure throws with nothing published or unlinked. After it, deletion is logically
+    /// effective (caches, live authority, notification), and an unlink failure only leaves
+    /// inaccessible residue that is reported diagnostically; repeated deletion retries cleanup
+    /// without publishing the logical deletion again (one generation bump and notification per
+    /// tombstone commit).
+    private func deleteAgentSessionFileLocked(_ fileURL: URL, sessionID: UUID) async throws {
         let folder = fileURL.deletingLastPathComponent()
         let filename = fileURL.lastPathComponent
-        let parsedID = agentSessionID(fromFilename: filename)
         let fileKey = canonicalSessionFileKey(fileURL)
-        if FileManager.default.fileExists(atPath: fileURL.path) {
-            #if DEBUG
-                if let injected = test_agentSessionDeletionFailureInjector?(fileURL) {
-                    throw injected
-                }
-            #endif
-            try FileManager.default.removeItem(at: fileURL)
-        }
+        let newlyCommitted = try commitTombstone(for: sessionID)
 
-        // Publish committed deletion authority only after unlink succeeds (or the file was already
-        // absent). This remains synchronous under the per-session gate with no suspension window.
+        // Caches never describe a deleted file (idempotent on retry).
         scheduleAuthorityByFileURL.removeValue(forKey: fileKey)
         transcriptResetAuthorityByFileURL.removeValue(forKey: fileKey)
-        let generation = (deletionGenerationsByFileKey[fileKey] ?? 0) &+ 1
-        deletionGenerationsByFileKey[fileKey] = generation
+        lifecycleByFileKey.removeValue(forKey: fileKey)
+        if newlyCommitted {
+            // Publish logical deletion synchronously under the per-session gate, exactly once.
+            let generation = (deletionGenerationsByFileKey[fileKey] ?? 0) &+ 1
+            deletionGenerationsByFileKey[fileKey] = generation
+            let userInfo: [String: Any] = ["fileKey": fileKey, "generation": generation, "sessionID": sessionID]
+            NotificationCenter.default.post(name: .agentSessionDeletionDidCommit, object: nil, userInfo: userInfo)
+        }
+
+        if FileManager.default.fileExists(atPath: fileURL.path) {
+            do {
+                #if DEBUG
+                    if let injected = test_agentSessionDeletionFailureInjector?(fileURL) {
+                        throw injected
+                    }
+                #endif
+                try FileManager.default.removeItem(at: fileURL)
+            } catch {
+                print("[AgentSessionDataService] deletion committed for \(sessionID); session file cleanup failed and residue remains inaccessible: \(error)")
+            }
+        }
+        if let recoveryStore {
+            // Still under the session gate: no recovery transaction can interleave. Failure never
+            // reverses the deletion; tombstone filtering hides any residue and a repeated
+            // deletion retries the cleanup.
+            do {
+                _ = try await recoveryStore.removeDataForDeletedSession(sessionID: sessionID)
+            } catch {
+                print("[AgentSessionDataService] deletion committed for \(sessionID); recovery cleanup failed and residue remains nonactionable: \(error)")
+            }
+        }
         await removeMetadataRecords(
             matching: { record in
-                record.filename == filename || parsedID.map { record.id == $0 } == true
+                record.filename == filename || record.id == sessionID
             },
             folder: folder
         )
-        var userInfo: [String: Any] = ["fileKey": fileKey, "generation": generation]
-        if let parsedID {
-            userInfo["sessionID"] = parsedID
-        }
-        NotificationCenter.default.post(name: .agentSessionDeletionDidCommit, object: nil, userInfo: userInfo)
     }
 
     /// Current explicit-deletion generation for a session file (0 when never deleted).
@@ -3086,6 +4452,7 @@ package actor AgentSessionDataService {
         }
 
         let files = try await listAgentSessions(for: workspace)
+        var incarnationByPath: [String: UUID] = [:]
         for fileURL in files {
             guard
                 let stub = try? await loadAgentSessionStub(
@@ -3096,18 +4463,32 @@ package actor AgentSessionDataService {
                 stub.composeTabID == tabID
             else { continue }
             candidateFilesByPath[fileURL.path] = fileURL
+            incarnationByPath[fileURL.path] = stub.lifecycle?.lifecycle?.incarnationID
         }
 
-        return candidateFilesByPath.values.compactMap { fileURL in
-            guard let sessionID = agentSessionID(fromFilename: fileURL.lastPathComponent) else {
+        let tombstoned = try tombstonedSessionIDs()
+        return candidateFilesByPath.compactMap { path, fileURL in
+            guard let sessionID = agentSessionID(fromFilename: fileURL.lastPathComponent),
+                  !tombstoned.contains(sessionID)
+            else {
                 return nil
             }
+            let fileKey = canonicalSessionFileKey(fileURL)
+            let incarnationID = incarnationByPath[path]
             return AgentSessionDeletionCandidate(
                 composeTabID: tabID,
-                persistenceState: persistenceState(
-                    sessionID: sessionID,
-                    workspaceID: workspace.id,
-                    fileURL: fileURL
+                persistenceState: AgentSessionPersistenceState(
+                    stamp: AgentSessionPersistenceStamp(
+                        sessionID: sessionID,
+                        workspaceID: workspace.id,
+                        deletionGeneration: deletionGenerationsByFileKey[fileKey] ?? 0,
+                        incarnationID: incarnationID,
+                        serviceID: persistenceServiceID,
+                        fileURL: fileKey
+                    ),
+                    transcriptResetGeneration: lifecycleByFileKey[fileKey].flatMap {
+                        $0.incarnationID == incarnationID ? $0.transcriptResetGeneration : nil
+                    } ?? 0
                 )
             )
         }
@@ -3132,8 +4513,18 @@ package actor AgentSessionDataService {
             workspaceID: workspace.id
         )
         let fileURL = state.stamp.fileURL
+        switch try tombstoneState(for: sessionID) {
+        case .absent:
+            break
+        case .committed:
+            // Already logically deleted: retry cleanup of any residue.
+            try await deleteAgentSessionFileLocked(fileURL, sessionID: sessionID)
+            return .alreadyAbsent
+        case .unreadable:
+            throw AgentScheduledSendMutationError.unreadableTombstone(sessionID)
+        }
         guard FileManager.default.fileExists(atPath: fileURL.path) else {
-            try await deleteAgentSessionFileLocked(fileURL)
+            try await deleteAgentSessionFileLocked(fileURL, sessionID: sessionID)
             return .alreadyAbsent
         }
         guard
@@ -3143,11 +4534,13 @@ package actor AgentSessionDataService {
                 persistRecoveredMetadata: false
             ),
             stub.id == sessionID,
-            stub.composeTabID == candidate.composeTabID
+            stub.composeTabID == candidate.composeTabID,
+            state.stamp.incarnationID == nil
+            || state.stamp.incarnationID == stub.lifecycle?.lifecycle?.incarnationID
         else {
             return .ownershipChanged
         }
-        try await deleteAgentSessionFileLocked(fileURL)
+        try await deleteAgentSessionFileLocked(fileURL, sessionID: sessionID)
         return .deleted
     }
 

@@ -1,0 +1,1061 @@
+import Foundation
+
+// Lossless-restart Phase 1b recovery record model (spec R1, R1a, R2).
+//
+// One record per session lives at `AgentRecovery/v1/sessions/<sessionID>.json` and is written
+// only by `AgentRecoveryStore`. Every supported object keeps unknown additive members ("extras")
+// so a newer build's fields survive an older build's rewrite. A record with a future schema, a
+// malformed required field, or an unknown closed-set variant is preserved byte-for-byte and is
+// never writable (see `AgentRecoveryRecordDecoding`).
+//
+// Lifecycle identity (incarnation and transcript-reset generation) is issued only by
+// `AgentSessionDataService`; records reference it and never assign or advance it.
+
+package typealias AgentRecoveryJSONValue = AgentScheduledSendJSONValue
+package typealias AgentRecoveryExtras = [String: AgentRecoveryJSONValue]
+
+// MARK: - Opaque revisions
+
+/// Opaque whole-record revision. Equality/CAS only: no ordering, arithmetic, or increment.
+package struct AgentRecoveryRecordRevision: Hashable, CustomStringConvertible {
+    let token: String
+
+    static func make() -> AgentRecoveryRecordRevision {
+        AgentRecoveryRecordRevision(token: UUID().uuidString)
+    }
+
+    package var description: String {
+        "record-revision(\(token))"
+    }
+}
+
+/// Opaque composer revision covering text, images, tagged files, workflow, and interview choice.
+/// Equality only; the issuing controller alone knows the local order of its own revisions.
+package struct AgentRecoveryComposerRevision: Hashable, CustomStringConvertible {
+    let token: String
+
+    package static func make() -> AgentRecoveryComposerRevision {
+        AgentRecoveryComposerRevision(token: UUID().uuidString)
+    }
+
+    package var description: String {
+        "composer-revision(\(token))"
+    }
+}
+
+// MARK: - Timestamps
+
+/// Millisecond wall-clock timestamp. Integer milliseconds round-trip exactly through JSON.
+package struct AgentRecoveryTimestamp: Hashable {
+    package let millisecondsSince1970: Int64
+
+    package init(millisecondsSince1970: Int64) {
+        self.millisecondsSince1970 = millisecondsSince1970
+    }
+
+    package init(_ date: Date) {
+        millisecondsSince1970 = Int64((date.timeIntervalSince1970 * 1000).rounded(.down))
+    }
+
+    package var date: Date {
+        Date(timeIntervalSince1970: TimeInterval(millisecondsSince1970) / 1000)
+    }
+}
+
+// MARK: - Lifecycle reference
+
+/// Reference to foundation-issued lifecycle authority for one session. Callers obtain it from
+/// `AgentSessionDataService` authority; recovery code never creates or advances it.
+package struct AgentRecoveryLifecycleBinding: Hashable {
+    package let sessionID: UUID
+    package let incarnationID: UUID
+    package let transcriptResetGeneration: UInt64
+
+    package init(sessionID: UUID, incarnationID: UUID, transcriptResetGeneration: UInt64) {
+        self.sessionID = sessionID
+        self.incarnationID = incarnationID
+        self.transcriptResetGeneration = transcriptResetGeneration
+    }
+}
+
+// MARK: - Input content
+
+/// Durable image reference. Managed files live under the recovery store's per-session attachment
+/// directory and are named relative to it; remote images keep their URL.
+package struct AgentRecoveryImageReference: Equatable {
+    package enum Location: Equatable {
+        case managedFile(fileName: String)
+        case remoteURL(String)
+    }
+
+    package let id: UUID
+    package let location: Location
+    package let title: String?
+    package let createdAt: AgentRecoveryTimestamp
+    package var extras: AgentRecoveryExtras
+
+    package init(
+        id: UUID,
+        location: Location,
+        title: String?,
+        createdAt: AgentRecoveryTimestamp,
+        extras: AgentRecoveryExtras = [:]
+    ) {
+        self.id = id
+        self.location = location
+        self.title = title
+        self.createdAt = createdAt
+        self.extras = extras
+    }
+
+    package var managedFileName: String? {
+        guard case let .managedFile(fileName) = location else { return nil }
+        return fileName
+    }
+}
+
+package struct AgentRecoveryTaggedFileReference: Equatable {
+    package let id: UUID
+    package let relativePath: String
+    package let displayName: String
+    package let createdAt: AgentRecoveryTimestamp
+    package var extras: AgentRecoveryExtras
+
+    package init(
+        id: UUID,
+        relativePath: String,
+        displayName: String,
+        createdAt: AgentRecoveryTimestamp,
+        extras: AgentRecoveryExtras = [:]
+    ) {
+        self.id = id
+        self.relativePath = relativePath
+        self.displayName = displayName
+        self.createdAt = createdAt
+        self.extras = extras
+    }
+
+    package init(_ attachment: AgentTaggedFileAttachment) {
+        self.init(
+            id: attachment.id,
+            relativePath: attachment.relativePath,
+            displayName: attachment.displayName,
+            createdAt: AgentRecoveryTimestamp(attachment.createdAt)
+        )
+    }
+
+    package var attachment: AgentTaggedFileAttachment {
+        AgentTaggedFileAttachment(
+            id: id,
+            relativePath: relativePath,
+            displayName: displayName,
+            createdAt: createdAt.date
+        )
+    }
+}
+
+/// Full workflow snapshot, including the resolved template body. `AgentWorkflowDefinition`'s own
+/// Codable form deliberately omits custom templates, so recovery does not reuse it.
+package struct AgentRecoveryWorkflowSnapshot: Equatable {
+    package enum Source: Equatable {
+        case builtIn(AgentWorkflow)
+        case custom(id: UUID)
+    }
+
+    package let source: Source
+    package let displayName: String
+    package let iconName: String
+    package let accentColorHex: String?
+    package let tooltipText: String?
+    package let descriptionText: String?
+    package let template: String?
+    package var extras: AgentRecoveryExtras
+
+    package init(
+        source: Source,
+        displayName: String,
+        iconName: String,
+        accentColorHex: String?,
+        tooltipText: String?,
+        descriptionText: String?,
+        template: String?,
+        extras: AgentRecoveryExtras = [:]
+    ) {
+        self.source = source
+        self.displayName = displayName
+        self.iconName = iconName
+        self.accentColorHex = accentColorHex
+        self.tooltipText = tooltipText
+        self.descriptionText = descriptionText
+        self.template = template
+        self.extras = extras
+    }
+
+    package init(_ definition: AgentWorkflowDefinition) {
+        let source: Source = switch definition.source {
+        case let .builtIn(workflow): .builtIn(workflow)
+        case let .custom(id): .custom(id: id)
+        }
+        self.init(
+            source: source,
+            displayName: definition.displayName,
+            iconName: definition.iconName,
+            accentColorHex: definition.accentColorHex,
+            tooltipText: definition.tooltipText,
+            descriptionText: definition.descriptionText,
+            template: definition.template
+        )
+    }
+
+    /// The workflow as captured, including its snapshotted template body.
+    package var definition: AgentWorkflowDefinition {
+        var definition = switch source {
+        case let .builtIn(workflow):
+            AgentWorkflowDefinition(builtIn: workflow)
+        case let .custom(id):
+            AgentWorkflowDefinition(
+                customID: id,
+                displayName: displayName,
+                iconName: iconName,
+                accentColorHex: accentColorHex,
+                tooltipText: tooltipText,
+                descriptionText: descriptionText
+            )
+        }
+        definition.template = template
+        return definition
+    }
+}
+
+/// Immutable composer or intent payload: text, images, tagged files, workflow, interview choice.
+package struct AgentRecoveryInputContent: Equatable {
+    package let text: String
+    package let images: [AgentRecoveryImageReference]
+    package let taggedFiles: [AgentRecoveryTaggedFileReference]
+    package let workflow: AgentRecoveryWorkflowSnapshot?
+    package let interviewFirst: Bool
+    package var extras: AgentRecoveryExtras
+
+    package init(
+        text: String,
+        images: [AgentRecoveryImageReference] = [],
+        taggedFiles: [AgentRecoveryTaggedFileReference] = [],
+        workflow: AgentRecoveryWorkflowSnapshot? = nil,
+        interviewFirst: Bool = false,
+        extras: AgentRecoveryExtras = [:]
+    ) {
+        self.text = text
+        self.images = images
+        self.taggedFiles = taggedFiles
+        self.workflow = workflow
+        self.interviewFirst = interviewFirst
+        self.extras = extras
+    }
+
+    /// No user-visible content; an empty composer is stored as an absent composer.
+    package var isEmpty: Bool {
+        text.isEmpty && images.isEmpty && taggedFiles.isEmpty && workflow == nil && !interviewFirst
+    }
+
+    var managedImageFileNames: Set<String> {
+        Set(images.compactMap(\.managedFileName))
+    }
+}
+
+/// Immutable composer snapshot under one composer revision. It keeps the reset generation it was
+/// typed under, so carrying it through a later record rewrite never relabels it as current input.
+package struct AgentRecoveryComposerSnapshot: Equatable {
+    package let revision: AgentRecoveryComposerRevision
+    package let capturedAt: AgentRecoveryTimestamp
+    package let transcriptResetGeneration: UInt64
+    package let content: AgentRecoveryInputContent
+    package var extras: AgentRecoveryExtras
+
+    package init(
+        revision: AgentRecoveryComposerRevision,
+        capturedAt: AgentRecoveryTimestamp,
+        transcriptResetGeneration: UInt64,
+        content: AgentRecoveryInputContent,
+        extras: AgentRecoveryExtras = [:]
+    ) {
+        self.revision = revision
+        self.capturedAt = capturedAt
+        self.transcriptResetGeneration = transcriptResetGeneration
+        self.content = content
+        self.extras = extras
+    }
+}
+
+// MARK: - Pending handoff
+
+/// Exact pending-handoff content a send prepends to its provider-facing text, captured on the intent
+/// before any handoff. Only the appended handoff is kept (never automatically expanded workspace
+/// context). It lives on the intent, not in `AgentRecoveryInputContent`, so composer snapshots never
+/// inherit the provider prefix and the user bubble keeps showing the original user input
+/// (`AgentRecoveryIntent.payload`).
+///
+/// `payloadID` is the durable `AgentPendingHandoffState.payloadID`: the join key between a payload
+/// still pending in the session and this intent's delivery evidence. `createdAt` has millisecond
+/// precision and is never an identity.
+package struct AgentRecoveryPendingHandoffSnapshot: Equatable {
+    package let payloadID: UUID
+    /// Exact original pending payload.
+    package let payload: String
+    package let createdAt: AgentRecoveryTimestamp?
+    package let sourceItemID: UUID?
+    /// Exact text prepended to the provider-facing input, separator included.
+    package let prependedText: String
+    package var extras: AgentRecoveryExtras
+
+    package init(
+        payloadID: UUID,
+        payload: String,
+        createdAt: AgentRecoveryTimestamp?,
+        sourceItemID: UUID?,
+        prependedText: String,
+        extras: AgentRecoveryExtras = [:]
+    ) {
+        self.payloadID = payloadID
+        self.payload = payload
+        self.createdAt = createdAt
+        self.sourceItemID = sourceItemID
+        self.prependedText = prependedText
+        self.extras = extras
+    }
+
+    /// Captures the session's pending handoff as prepended by one send. `nil` unless the state has a
+    /// non-empty payload with a durable payload ID (call `ensurePayloadID()` and persist it first).
+    package init?(_ state: AgentPendingHandoffState, prependedText: String) {
+        guard state.hasPayload, let payload = state.payload, let payloadID = state.payloadID else {
+            return nil
+        }
+        self.init(
+            payloadID: payloadID,
+            payload: payload,
+            createdAt: state.createdAt.map { AgentRecoveryTimestamp($0) },
+            sourceItemID: state.sourceItemID,
+            prependedText: prependedText
+        )
+    }
+
+    /// Same captured content, ignoring unknown members a newer build stored.
+    package func hasSameContent(as other: AgentRecoveryPendingHandoffSnapshot) -> Bool {
+        payloadID == other.payloadID
+            && payload == other.payload
+            && createdAt == other.createdAt
+            && sourceItemID == other.sourceItemID
+            && prependedText == other.prependedText
+    }
+}
+
+// MARK: - Intents and attempts
+
+/// R2 intent delivery state. Exactly these six values; holds never add a state.
+package enum AgentRecoveryDeliveryState: String, CaseIterable {
+    /// Saved; no handoff has begun.
+    case queued
+    /// Handoff may have happened.
+    case dispatching
+    /// The provider acknowledged it (not "completed").
+    case providerAccepted
+    /// Sending again might duplicate it.
+    case deliveryUnknown
+    /// Verified rejection or pre-handoff failure; the payload is kept.
+    case failed
+    /// The user removed it explicitly.
+    case withdrawn
+
+    /// No further delivery action applies. This is not a retention predicate: accepted intents keep
+    /// evidence needed to reconcile the transcript, so nothing deletes records based on it.
+    package var requiresNoFurtherDelivery: Bool {
+        self == .providerAccepted || self == .withdrawn
+    }
+}
+
+/// Send route that produced an intent (spec "Done when" 1). Closed set: an unknown value makes the
+/// record unreadable rather than being coerced.
+package enum AgentRecoveryIntentOrigin: String, CaseIterable {
+    case composer
+    case followUp
+    case steering
+    case codexFallback
+    case scheduled
+    case mcp
+}
+
+/// R9 receipt-transfer join: the schedule and its dispatching attempt that produced this intent.
+package struct AgentRecoveryScheduleReference: Equatable {
+    package let scheduleID: UUID
+    package let scheduleAttemptID: UUID
+    package var extras: AgentRecoveryExtras
+
+    package init(scheduleID: UUID, scheduleAttemptID: UUID, extras: AgentRecoveryExtras = [:]) {
+        self.scheduleID = scheduleID
+        self.scheduleAttemptID = scheduleAttemptID
+        self.extras = extras
+    }
+}
+
+/// R10: the user's explicit "Cancel pending schedule" decision for one held schedule transfer,
+/// persisted on the linked intent. It names the exact schedule and schedule attempt (it never
+/// matches a replacement schedule), means only "stop owning this pending schedule" (not "the
+/// message was not delivered"), and changes no delivery state or attempt outcome. A startup or
+/// owner repair that finds a matching decision finishes the cancellation (clears that exact
+/// pending schedule without any receipt); it never resends or asks for another confirmation.
+package struct AgentRecoveryScheduledTransferCancellation: Equatable {
+    package let decisionID: UUID
+    package let scheduleID: UUID
+    package let scheduleAttemptID: UUID
+    package let recordedAt: AgentRecoveryTimestamp
+    package var extras: AgentRecoveryExtras
+
+    package init(
+        decisionID: UUID,
+        scheduleID: UUID,
+        scheduleAttemptID: UUID,
+        recordedAt: AgentRecoveryTimestamp,
+        extras: AgentRecoveryExtras = [:]
+    ) {
+        self.decisionID = decisionID
+        self.scheduleID = scheduleID
+        self.scheduleAttemptID = scheduleAttemptID
+        self.recordedAt = recordedAt
+        self.extras = extras
+    }
+
+    package func matches(scheduleID: UUID, scheduleAttemptID: UUID) -> Bool {
+        self.scheduleID == scheduleID && self.scheduleAttemptID == scheduleAttemptID
+    }
+}
+
+/// Live run an input was admitted against. `runAttemptID` is the existing
+/// `AgentRunOwnership.attemptID`; `processRunID` is the process run (`AgentTabSession.runID`),
+/// which can span several attempts; `providerConversationID` is the provider's own conversation
+/// identity (for example the Codex thread ID) when the route has one. Runtime-only guards
+/// (`AgentRunBindingIdentity`, controller identity and generation) are revalidated by the producer
+/// and never persisted.
+package struct AgentRecoveryRunTarget: Equatable {
+    package let runAttemptID: UUID
+    package let processRunID: UUID?
+    package let providerConversationID: String?
+    package var extras: AgentRecoveryExtras
+
+    package init(
+        runAttemptID: UUID,
+        processRunID: UUID?,
+        providerConversationID: String?,
+        extras: AgentRecoveryExtras = [:]
+    ) {
+        self.runAttemptID = runAttemptID
+        self.processRunID = processRunID
+        self.providerConversationID = providerConversationID
+        self.extras = extras
+    }
+}
+
+/// Immutable target captured at admission. The lifecycle part (incarnation, reset generation) is
+/// the record's and the intent's own. An explicit user action never silently retargets an intent.
+package struct AgentRecoveryIntentTarget: Equatable {
+    /// `nil` = session input (no existing live run is claimed).
+    package let liveRun: AgentRecoveryRunTarget?
+    package var extras: AgentRecoveryExtras
+
+    package init(liveRun: AgentRecoveryRunTarget?, extras: AgentRecoveryExtras = [:]) {
+        self.liveRun = liveRun
+        self.extras = extras
+    }
+
+    package static let session = AgentRecoveryIntentTarget(liveRun: nil)
+
+    package static func liveRun(_ run: AgentRecoveryRunTarget) -> AgentRecoveryIntentTarget {
+        AgentRecoveryIntentTarget(liveRun: run)
+    }
+}
+
+package struct AgentRecoveryIntent: Equatable {
+    package let intentID: UUID
+    /// The transcript user item this message is (or will be) shown as. Supplied by the producer from
+    /// its actual item identity and retained across every retry, so Send never appends a second bubble.
+    package let userItemID: UUID
+    package let origin: AgentRecoveryIntentOrigin
+    package let target: AgentRecoveryIntentTarget
+    package let createdAt: AgentRecoveryTimestamp
+    /// Launch instance that owns live draining of this intent. Changes only on an explicit user dispatch.
+    package internal(set) var appInstanceID: UUID
+    /// Foundation reset generation the intent was committed under (never retargeted on reset).
+    package let transcriptResetGeneration: UInt64
+    package internal(set) var deliveryState: AgentRecoveryDeliveryState
+    package let payload: AgentRecoveryInputContent
+    package let scheduleReference: AgentRecoveryScheduleReference?
+    /// Pending handoff prepended to this intent's provider-facing text. Set at submission or attached
+    /// once to a `queued` intent whose earlier attempts (if any) are all conclusively not delivered
+    /// (`AgentRecoveryStore.attachPendingHandoff`); never replaced and never cleared, so delivery
+    /// evidence stays joinable to the payload.
+    package internal(set) var pendingHandoff: AgentRecoveryPendingHandoffSnapshot?
+    /// Persisted stale-target hold: the captured target was lost after admission (for example the run
+    /// ended during the store await). Absent means not marked; it is never cleared by a rewrite.
+    package internal(set) var staleTargetMarkedAt: AgentRecoveryTimestamp?
+    /// Set by an explicit withdrawal. Kept as history if acceptance evidence for an earlier attempt
+    /// arrives later (acceptance wins).
+    package internal(set) var withdrawnAt: AgentRecoveryTimestamp?
+    /// R10 explicit cancellation of this intent's held schedule transfer (see the type).
+    package internal(set) var scheduledTransferCancellation: AgentRecoveryScheduledTransferCancellation?
+    package var extras: AgentRecoveryExtras
+
+    package init(
+        intentID: UUID,
+        userItemID: UUID,
+        origin: AgentRecoveryIntentOrigin,
+        target: AgentRecoveryIntentTarget,
+        createdAt: AgentRecoveryTimestamp,
+        appInstanceID: UUID,
+        transcriptResetGeneration: UInt64,
+        deliveryState: AgentRecoveryDeliveryState,
+        payload: AgentRecoveryInputContent,
+        scheduleReference: AgentRecoveryScheduleReference?,
+        pendingHandoff: AgentRecoveryPendingHandoffSnapshot? = nil,
+        staleTargetMarkedAt: AgentRecoveryTimestamp? = nil,
+        withdrawnAt: AgentRecoveryTimestamp? = nil,
+        scheduledTransferCancellation: AgentRecoveryScheduledTransferCancellation? = nil,
+        extras: AgentRecoveryExtras = [:]
+    ) {
+        self.scheduledTransferCancellation = scheduledTransferCancellation
+        self.intentID = intentID
+        self.userItemID = userItemID
+        self.origin = origin
+        self.target = target
+        self.createdAt = createdAt
+        self.appInstanceID = appInstanceID
+        self.transcriptResetGeneration = transcriptResetGeneration
+        self.deliveryState = deliveryState
+        self.payload = payload
+        self.scheduleReference = scheduleReference
+        self.pendingHandoff = pendingHandoff
+        self.staleTargetMarkedAt = staleTargetMarkedAt
+        self.withdrawnAt = withdrawnAt
+        self.extras = extras
+    }
+}
+
+package enum AgentRecoveryFailureKind: String, CaseIterable {
+    /// The provider verifiably rejected the message.
+    case verifiedRejection
+    /// The handoff provably never began.
+    case preHandoff
+}
+
+/// Delivery outcome evidence recorded on an attempt (R2 outcomes by boundary).
+package enum AgentRecoveryDeliveryOutcome: Equatable {
+    case providerAccepted
+    case deliveryUnknown
+    case failed(AgentRecoveryFailureKind, message: String?)
+
+    var resultingState: AgentRecoveryDeliveryState {
+        switch self {
+        case .providerAccepted: .providerAccepted
+        case .deliveryUnknown: .deliveryUnknown
+        case .failed: .failed
+        }
+    }
+}
+
+package struct AgentRecoveryAttemptOutcome: Equatable {
+    package let outcome: AgentRecoveryDeliveryOutcome
+    package let recordedAt: AgentRecoveryTimestamp
+    package var extras: AgentRecoveryExtras
+
+    package init(
+        outcome: AgentRecoveryDeliveryOutcome,
+        recordedAt: AgentRecoveryTimestamp,
+        extras: AgentRecoveryExtras = [:]
+    ) {
+        self.outcome = outcome
+        self.recordedAt = recordedAt
+        self.extras = extras
+    }
+}
+
+/// One delivery attempt (a handoff), written as `dispatching` evidence before any provider handoff.
+/// Distinct from a run attempt: several deliveries can share one run attempt.
+package struct AgentRecoveryAttempt: Equatable {
+    package let attemptID: UUID
+    package let intentID: UUID
+    package let userItemID: UUID
+    /// The existing run attempt (`AgentRunOwnership.attemptID`); attachable once when ownership
+    /// becomes available.
+    package internal(set) var runAttemptID: UUID?
+    /// R1a join key when the producer knows the transcript turn.
+    package let transcriptTurnID: UUID?
+    package let appInstanceID: UUID
+    package let dispatchedAt: AgentRecoveryTimestamp
+    package internal(set) var outcome: AgentRecoveryAttemptOutcome?
+    /// Earlier non-accepting evidence replaced by later affirmative acceptance for this exact
+    /// attempt. `.deliveryUnknown` is a refinement; `.failed` is preserved conflicting evidence.
+    package internal(set) var supersededOutcome: AgentRecoveryAttemptOutcome?
+    package var extras: AgentRecoveryExtras
+
+    package init(
+        attemptID: UUID,
+        intentID: UUID,
+        userItemID: UUID,
+        runAttemptID: UUID?,
+        transcriptTurnID: UUID?,
+        appInstanceID: UUID,
+        dispatchedAt: AgentRecoveryTimestamp,
+        outcome: AgentRecoveryAttemptOutcome? = nil,
+        supersededOutcome: AgentRecoveryAttemptOutcome? = nil,
+        extras: AgentRecoveryExtras = [:]
+    ) {
+        self.attemptID = attemptID
+        self.intentID = intentID
+        self.userItemID = userItemID
+        self.runAttemptID = runAttemptID
+        self.transcriptTurnID = transcriptTurnID
+        self.appInstanceID = appInstanceID
+        self.dispatchedAt = dispatchedAt
+        self.outcome = outcome
+        self.supersededOutcome = supersededOutcome
+        self.extras = extras
+    }
+}
+
+// MARK: - Run attempts
+
+/// Recordable per-attempt shutdown or close reasons (spec R5 values). `appCrash` and `unknown` are
+/// inferred at cold restore, never recorded by a live process.
+package enum AgentRecoveryShutdownReason: String, CaseIterable {
+    case appQuit
+    case windowClose
+    case safeRestart
+    case providerProcessLost
+}
+
+/// How `ensureRunAttempt` treats a process-run association that differs from the recorded one.
+package enum AgentRecoveryRunAssociationPolicy: Equatable {
+    /// Start-time evidence: a conflicting process run fails the write.
+    case strict
+    /// Terminal-time completion: fills only a missing association and keeps an existing one, so
+    /// terminal evidence is never lost to an association mismatch.
+    case keepExisting
+}
+
+/// Terminal evidence from `AgentRunTerminalCommitRevision`, independent of any MCP envelope.
+package struct AgentRecoveryRunTerminalEvidence: Equatable {
+    package let commitID: UUID
+    /// One of the commit terminal states (`completed`, `cancelled`, `failed`).
+    package let terminalState: AgentSessionRunState
+    package let expectedRunID: UUID?
+    package let recordedAt: AgentRecoveryTimestamp
+    package var extras: AgentRecoveryExtras
+
+    package init(
+        commitID: UUID,
+        terminalState: AgentSessionRunState,
+        expectedRunID: UUID?,
+        recordedAt: AgentRecoveryTimestamp,
+        extras: AgentRecoveryExtras = [:]
+    ) {
+        self.commitID = commitID
+        self.terminalState = terminalState
+        self.expectedRunID = expectedRunID
+        self.recordedAt = recordedAt
+        self.extras = extras
+    }
+}
+
+package struct AgentRecoveryRunShutdownEvidence: Equatable {
+    package let reason: AgentRecoveryShutdownReason
+    package let observedAt: AgentRecoveryTimestamp
+    package let lastConfirmedActivityAt: AgentRecoveryTimestamp?
+    package var extras: AgentRecoveryExtras
+
+    package init(
+        reason: AgentRecoveryShutdownReason,
+        observedAt: AgentRecoveryTimestamp,
+        lastConfirmedActivityAt: AgentRecoveryTimestamp?,
+        extras: AgentRecoveryExtras = [:]
+    ) {
+        self.reason = reason
+        self.observedAt = observedAt
+        self.lastConfirmedActivityAt = lastConfirmedActivityAt
+        self.extras = extras
+    }
+}
+
+/// Evidence for one existing logical run attempt, keyed by `AgentRunOwnership.attemptID`. Recovery
+/// never allocates run identity. Provider acceptance is not run completion.
+package struct AgentRecoveryRunAttempt: Equatable {
+    package let runAttemptID: UUID
+    /// Reset generation captured when the run evidence was first recorded.
+    package let transcriptResetGeneration: UInt64
+    package internal(set) var processRunID: UUID?
+    package internal(set) var transcriptTurnID: UUID?
+    package let startedAt: AgentRecoveryTimestamp
+    /// The app instance that first recorded this run's evidence (the launch that owns the run).
+    /// Optional run-start evidence: a legacy attempt without it has an unknown owner, never the
+    /// current launch. Captured once and never rewritten.
+    package let appInstanceID: UUID?
+    package internal(set) var terminal: AgentRecoveryRunTerminalEvidence?
+    package internal(set) var shutdown: AgentRecoveryRunShutdownEvidence?
+    package var extras: AgentRecoveryExtras
+
+    package init(
+        runAttemptID: UUID,
+        transcriptResetGeneration: UInt64,
+        processRunID: UUID?,
+        transcriptTurnID: UUID?,
+        startedAt: AgentRecoveryTimestamp,
+        appInstanceID: UUID? = nil,
+        terminal: AgentRecoveryRunTerminalEvidence? = nil,
+        shutdown: AgentRecoveryRunShutdownEvidence? = nil,
+        extras: AgentRecoveryExtras = [:]
+    ) {
+        self.runAttemptID = runAttemptID
+        self.transcriptResetGeneration = transcriptResetGeneration
+        self.processRunID = processRunID
+        self.transcriptTurnID = transcriptTurnID
+        self.startedAt = startedAt
+        self.appInstanceID = appInstanceID
+        self.terminal = terminal
+        self.shutdown = shutdown
+        self.extras = extras
+    }
+}
+
+/// The user's explicit acknowledgement of one exact prior-run crash hold ("I acknowledged this
+/// prior-run warning and chose to continue"). It never marks a run completed, cancelled or
+/// aborted, never changes delivery certainty, hides no recovery row, and authorizes no replay of
+/// uncertain input. A later startup treats a hold as acknowledged only when this matches it
+/// exactly (incarnation, reset generation, and every uncertain identity); additional or changed
+/// uncertainty asks again. ID sets are encoded sorted, so the value round-trips deterministically.
+package struct AgentRecoveryCrashHoldAcknowledgement: Equatable {
+    package let decisionID: UUID
+    package let incarnationID: UUID
+    package let transcriptResetGeneration: UInt64
+    package let runAttemptIDs: Set<UUID>
+    package let intentIDs: Set<UUID>
+    package let transcriptTurnIDs: Set<UUID>
+    package let recordedAt: AgentRecoveryTimestamp
+    package var extras: AgentRecoveryExtras
+
+    package init(
+        decisionID: UUID,
+        incarnationID: UUID,
+        transcriptResetGeneration: UInt64,
+        runAttemptIDs: Set<UUID>,
+        intentIDs: Set<UUID>,
+        transcriptTurnIDs: Set<UUID>,
+        recordedAt: AgentRecoveryTimestamp,
+        extras: AgentRecoveryExtras = [:]
+    ) {
+        self.decisionID = decisionID
+        self.incarnationID = incarnationID
+        self.transcriptResetGeneration = transcriptResetGeneration
+        self.runAttemptIDs = runAttemptIDs
+        self.intentIDs = intentIDs
+        self.transcriptTurnIDs = transcriptTurnIDs
+        self.recordedAt = recordedAt
+        self.extras = extras
+    }
+
+    /// Whether this decision acknowledged exactly the uncertainty described by these identities.
+    package func covers(
+        incarnationID: UUID,
+        transcriptResetGeneration: UInt64,
+        runAttemptIDs: Set<UUID>,
+        intentIDs: Set<UUID>,
+        transcriptTurnIDs: Set<UUID>
+    ) -> Bool {
+        self.incarnationID == incarnationID
+            && self.transcriptResetGeneration == transcriptResetGeneration
+            && self.runAttemptIDs == runAttemptIDs
+            && self.intentIDs == intentIDs
+            && self.transcriptTurnIDs == transcriptTurnIDs
+    }
+}
+
+// MARK: - Record
+
+package struct AgentRecoveryRecord: Equatable {
+    package static let currentSchemaVersion = 1
+
+    package let sessionID: UUID
+    package let revision: AgentRecoveryRecordRevision
+    package let incarnationID: UUID
+    /// Latest foundation reset generation that wrote this record.
+    package let transcriptResetGeneration: UInt64
+    package let updatedAt: AgentRecoveryTimestamp
+    package let composer: AgentRecoveryComposerSnapshot?
+    /// Intents in submission order.
+    package let intents: [AgentRecoveryIntent]
+    package let attempts: [AgentRecoveryAttempt]
+    package let runAttempts: [AgentRecoveryRunAttempt]
+    /// Latest explicit crash-hold acknowledgement; absent means unacknowledged.
+    package let crashHoldAcknowledgement: AgentRecoveryCrashHoldAcknowledgement?
+    package let extras: AgentRecoveryExtras
+
+    package init(
+        sessionID: UUID,
+        revision: AgentRecoveryRecordRevision,
+        incarnationID: UUID,
+        transcriptResetGeneration: UInt64,
+        updatedAt: AgentRecoveryTimestamp,
+        composer: AgentRecoveryComposerSnapshot?,
+        intents: [AgentRecoveryIntent],
+        attempts: [AgentRecoveryAttempt],
+        runAttempts: [AgentRecoveryRunAttempt],
+        crashHoldAcknowledgement: AgentRecoveryCrashHoldAcknowledgement? = nil,
+        extras: AgentRecoveryExtras = [:]
+    ) {
+        self.crashHoldAcknowledgement = crashHoldAcknowledgement
+        self.sessionID = sessionID
+        self.revision = revision
+        self.incarnationID = incarnationID
+        self.transcriptResetGeneration = transcriptResetGeneration
+        self.updatedAt = updatedAt
+        self.composer = composer
+        self.intents = intents
+        self.attempts = attempts
+        self.runAttempts = runAttempts
+        self.extras = extras
+    }
+
+    package func intent(id: UUID) -> AgentRecoveryIntent? {
+        intents.first { $0.intentID == id }
+    }
+
+    package func attempts(forIntent intentID: UUID) -> [AgentRecoveryAttempt] {
+        attempts.filter { $0.intentID == intentID }
+    }
+
+    package func runAttempt(id: UUID) -> AgentRecoveryRunAttempt? {
+        runAttempts.first { $0.runAttemptID == id }
+    }
+
+    /// Intents (in submission order) whose captured pending handoff has `payloadID`: the hydration
+    /// join for a payload still pending in the session.
+    package func intents(carryingPendingHandoff payloadID: UUID) -> [AgentRecoveryIntent] {
+        intents.filter { $0.pendingHandoff?.payloadID == payloadID }
+    }
+
+    /// Managed image file names referenced by the composer or any intent payload.
+    var referencedManagedImageFileNames: Set<String> {
+        var names = composer?.content.managedImageFileNames ?? []
+        for intent in intents {
+            names.formUnion(intent.payload.managedImageFileNames)
+        }
+        return names
+    }
+}
+
+// MARK: - Holds
+
+/// R2 hold reasons. Holds block automatic draining without changing delivery state. Effective holds
+/// are computed on every read from persisted markers and current authority.
+package enum AgentRecoveryHoldReason: String, CaseIterable {
+    /// Persisted stale-target marker, or the intent's reset generation differs from current authority.
+    case staleTarget
+    /// A referenced managed image file is missing.
+    case missingAttachment
+    /// The intent belongs to an earlier app launch instance.
+    case previousInstance
+}
+
+// MARK: - Receipts
+
+/// Receipts are issued only by `AgentRecoveryStore` (internal initializers) and prove a committed
+/// local state, never provider acceptance or permission to dispatch later.
+package enum AgentRecoveryCommitDisposition: Equatable {
+    case committed
+    /// The requested durable state already existed and was revalidated; nothing was written or consumed.
+    case unchanged
+}
+
+/// Composer-only commit receipt.
+package struct AgentRecoveryLocalReceipt: Equatable {
+    package let binding: AgentRecoveryLifecycleBinding
+    /// Record revision after this operation (`nil` only when no record exists).
+    package let recordRevision: AgentRecoveryRecordRevision?
+    package let disposition: AgentRecoveryCommitDisposition
+    /// Stored composer revision after this operation (`nil` = no stored composer).
+    package let composerRevision: AgentRecoveryComposerRevision?
+}
+
+package struct AgentRecoveryIntentReceipt: Equatable {
+    package let binding: AgentRecoveryLifecycleBinding
+    package let recordRevision: AgentRecoveryRecordRevision
+    package let disposition: AgentRecoveryCommitDisposition
+    package let intentID: UUID
+    package let userItemID: UUID
+    package let deliveryState: AgentRecoveryDeliveryState
+    /// The intent's captured pending handoff: on a dispatch receipt, the exact text to prepend.
+    package let pendingHandoff: AgentRecoveryPendingHandoffSnapshot?
+    /// Stored current-generation composer revision after this operation (`nil` = none stored).
+    package let composerRevision: AgentRecoveryComposerRevision?
+    /// Stored composer from another reset generation (held input; never consumed or replaced
+    /// implicitly). Kept separate so it never becomes a current composer baseline.
+    package let heldComposerRevision: AgentRecoveryComposerRevision?
+    /// Whether this operation removed the stored composer.
+    package let composerConsumed: Bool
+}
+
+/// Issued only for a durable `queued` intent with no hold, owned by `owningAppInstanceID`.
+package struct AgentRecoveryQueueReceipt: Equatable {
+    package let intent: AgentRecoveryIntentReceipt
+    package let owningAppInstanceID: UUID
+}
+
+/// Issued only while the intent is `dispatching` on this open delivery attempt.
+package struct AgentRecoveryDispatchReceipt: Equatable {
+    package let intent: AgentRecoveryIntentReceipt
+    package let attemptID: UUID
+}
+
+package struct AgentRecoveryOutcomeReceipt: Equatable {
+    package let intent: AgentRecoveryIntentReceipt
+    package let attemptID: UUID
+    package let outcome: AgentRecoveryDeliveryOutcome
+    /// Earlier evidence this acceptance superseded (`.failed` here is exposed conflicting evidence).
+    package let supersededOutcome: AgentRecoveryDeliveryOutcome?
+}
+
+package struct AgentRecoveryRunReceipt: Equatable {
+    package let binding: AgentRecoveryLifecycleBinding
+    package let recordRevision: AgentRecoveryRecordRevision
+    package let disposition: AgentRecoveryCommitDisposition
+    package let runAttemptID: UUID
+}
+
+// MARK: - Mutation inputs
+
+package struct AgentRecoveryIntentSubmission: Equatable {
+    package let intentID: UUID
+    package let userItemID: UUID
+    package let origin: AgentRecoveryIntentOrigin
+    package let target: AgentRecoveryIntentTarget
+    package let payload: AgentRecoveryInputContent
+    package let scheduleReference: AgentRecoveryScheduleReference?
+    /// Pending handoff this submission's send prepends (committed with the intent, before handoff).
+    package let pendingHandoff: AgentRecoveryPendingHandoffSnapshot?
+
+    package init(
+        intentID: UUID,
+        userItemID: UUID,
+        origin: AgentRecoveryIntentOrigin,
+        target: AgentRecoveryIntentTarget,
+        payload: AgentRecoveryInputContent,
+        scheduleReference: AgentRecoveryScheduleReference? = nil,
+        pendingHandoff: AgentRecoveryPendingHandoffSnapshot? = nil
+    ) {
+        self.intentID = intentID
+        self.userItemID = userItemID
+        self.origin = origin
+        self.target = target
+        self.payload = payload
+        self.scheduleReference = scheduleReference
+        self.pendingHandoff = pendingHandoff
+    }
+}
+
+package struct AgentRecoveryAttemptStart: Equatable {
+    package let attemptID: UUID
+    package let runAttemptID: UUID?
+    package let transcriptTurnID: UUID?
+
+    package init(attemptID: UUID, runAttemptID: UUID? = nil, transcriptTurnID: UUID? = nil) {
+        self.attemptID = attemptID
+        self.runAttemptID = runAttemptID
+        self.transcriptTurnID = transcriptTurnID
+    }
+}
+
+/// One constituent of an atomic multi-intent dispatch (`beginDispatches`), in handoff order.
+package struct AgentRecoveryDispatchRequest: Equatable {
+    package let intentID: UUID
+    package let attempt: AgentRecoveryAttemptStart
+
+    package init(intentID: UUID, attempt: AgentRecoveryAttemptStart) {
+        self.intentID = intentID
+        self.attempt = attempt
+    }
+}
+
+/// Conditional composer removal in the same replacement as an intent insertion. The stored
+/// composer is consumed only when it has the binding's reset generation and its revision is one of
+/// `consumableRevisions` (the submitted revision and revisions the issuing controller knows it
+/// superseded); otherwise it is preserved.
+package struct AgentRecoveryComposerConsumption: Equatable {
+    package let submittedRevision: AgentRecoveryComposerRevision
+    package let consumableRevisions: Set<AgentRecoveryComposerRevision>
+
+    package init(
+        submittedRevision: AgentRecoveryComposerRevision,
+        supersededRevisions: Set<AgentRecoveryComposerRevision> = []
+    ) {
+        self.submittedRevision = submittedRevision
+        consumableRevisions = supersededRevisions.union([submittedRevision])
+    }
+}
+
+/// Who is starting a dispatch. Recovered (previous-instance), failed, or delivery-unknown intents
+/// dispatch only on an explicit user action; live queues drain only their own instance's unheld
+/// intents. An explicit action may claim a previous-instance intent but never bypasses a stale
+/// target or missing attachment (retargeting is a separate, explicit transfer).
+package enum AgentRecoveryDispatchAuthorization: Equatable {
+    case liveQueue
+    case explicitUserAction
+}
+
+// MARK: - Held composer resolution
+
+/// Explicit user resolution of a stored composer typed under another reset generation (held
+/// input). Never chosen automatically: reset, restore, and submission all leave it held.
+package enum AgentRecoveryHeldComposerResolution: Equatable {
+    /// Removes the held composer. Live typing is untouched and is written afterwards.
+    case discard
+    /// Moves the held content into the current generation's composer under `revision` (issued by
+    /// the session's composer controller). Valid only while the live composer has no unsaved
+    /// content; the store never merges or retargets it implicitly.
+    case restoreToComposer(revision: AgentRecoveryComposerRevision)
+    /// Discards the held composer and stores `snapshot` (current-generation live typing captured by
+    /// the session's composer controller) in the same record replacement, so the new typing is
+    /// never left memory-only between the discard and a later write.
+    case discardReplacingWith(AgentRecoveryComposerSnapshot)
+}
+
+// MARK: - Launch state
+
+/// Run mark persisted for each app launch at `AgentRecovery/v1/launch-state.json`. Until two-stage
+/// shutdown lands, no build writes `cleanExit`, so every previous launch reads as unclean.
+package struct AgentRecoveryLaunchMark: Equatable {
+    package enum State: String, CaseIterable {
+        case running
+        case cleanExit
+    }
+
+    package let appInstanceID: UUID
+    package let state: State
+    package let recordedAt: AgentRecoveryTimestamp
+
+    package init(appInstanceID: UUID, state: State, recordedAt: AgentRecoveryTimestamp) {
+        self.appInstanceID = appInstanceID
+        self.state = state
+        self.recordedAt = recordedAt
+    }
+}
+
+/// Evidence about the launch before this one, read before the current mark replaces it.
+package enum AgentRecoveryPreviousLaunch: Equatable {
+    /// No mark: first launch with recovery, or a build that never wrote one.
+    case none
+    case mark(AgentRecoveryLaunchMark)
+    /// Unreadable or future mark bytes.
+    case unreadable(String)
+
+    /// Only an explicit clean-exit mark from another instance proves a clean previous exit; a
+    /// missing or unreadable mark is classified conservatively as unclean.
+    package func provesCleanExit(currentInstanceID: UUID) -> Bool {
+        guard case let .mark(mark) = self else { return false }
+        return mark.state == .cleanExit && mark.appInstanceID != currentInstanceID
+    }
+}

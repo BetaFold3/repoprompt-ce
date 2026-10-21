@@ -2006,7 +2006,9 @@ final class AgentModeChatSwitchActivationTests: XCTestCase {
                     XCTAssertEqual(session.persistedLoadDisposition, .applied, label)
                     XCTAssertEqual(session.derivedTranscriptSyncState, coldCatchUpSyncState(of: session, in: viewModel), label)
                     if persistedRunState.isActive {
-                        XCTAssertEqual(observed.persisted.lastRunState, AgentSessionRunState.idle.rawValue, "\(label): loads as idle")
+                        // F-7: the writer's same-launch read keeps the saved active run; the cold
+                        // activation below still loads it as idle.
+                        XCTAssertEqual(observed.persisted.lastRunState, persistedRunState.rawValue, "\(label): a same-launch read keeps the saved run")
                         XCTAssertEqual(session.runState, .idle, label)
                         XCTAssertTrue(observed.catchUps.isEmpty, "\(label): no observed run-state catch-up")
                         XCTAssertNil(session.derivedTranscriptRefreshTask, label)
@@ -2063,9 +2065,13 @@ final class AgentModeChatSwitchActivationTests: XCTestCase {
             XCTAssertTrue(session.isDirty, "\(label): the reload-migration save is pending, not yet run")
             let unmatchedCall = try XCTUnwrap(session.items.last, label)
             XCTAssertEqual(unmatchedCall.kind, .toolCall, "\(label): the turn still ends in the unmatched call before the save")
-            let saved = await viewModel.flushSave(for: session.tabID)
+            // The cold load's own normalizing write may still be in flight (F-7: the writer's
+            // same-launch read no longer pre-normalizes the file); settle it so this explicit flush is
+            // not deferred behind it.
             await viewModel.awaitInFlightSave(sessionID: sessionID)
-            XCTAssertTrue(saved, "\(label): the reload-migration save wrote")
+            let outcome = await viewModel.flushSaveDetailed(for: session.tabID)
+            await viewModel.awaitInFlightSave(sessionID: sessionID)
+            XCTAssertTrue(outcome.isCleanSuccess, "\(label): the reload-migration save wrote (\(outcome))")
             XCTAssertFalse(session.isDirty, label)
             XCTAssertEqual(session.runState, .idle, label)
             let repairedCall = try XCTUnwrap(session.items.last, label)
