@@ -319,6 +319,7 @@ package actor ACPAgentSessionController {
     private var sessionID: String?
     private var providerSessionIdentity: ACPProviderSessionIdentity
     private var didEmitTerminal = false
+    private var providerProcessExitedUnexpectedly = false
     private var eventStreamFinished = false
     private var loadSessionSupported = false
     private var discoveredSessionModels: ACPDiscoveredSessionModels?
@@ -413,6 +414,13 @@ package actor ACPAgentSessionController {
 
     func normalizeError(_ error: Error) -> Error {
         provider.normalizeError(error)
+    }
+
+    /// Whether the provider process exited (or timed out) while this controller was not closing it:
+    /// the exact provider-process-loss fact for a run's terminal cause (review A F06). Closing or
+    /// shutting the controller down ourselves never sets it.
+    package func providerProcessWasLost() -> Bool {
+        providerProcessExitedUnexpectedly
     }
 
     nonisolated func classifyConfigurationMutationFailureForSweep(
@@ -1938,6 +1946,7 @@ package actor ACPAgentSessionController {
             finishEventsIfNeeded()
             return
         }
+        providerProcessExitedUnexpectedly = true
 
         if state == .promptRunning || !didEmitTerminal {
             let message = timedOut

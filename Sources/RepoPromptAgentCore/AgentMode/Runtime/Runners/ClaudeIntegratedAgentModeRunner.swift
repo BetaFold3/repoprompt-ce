@@ -6,6 +6,11 @@ final class ClaudeIntegratedAgentModeRunner {
         let terminalState: AgentSessionRunState
         let errorText: String?
         let shouldShutdownSession: Bool
+        /// `.providerProcessLost` only when the provider's process or event transport ended under a
+        /// still-active run (review A F06); provider-reported failures stay ordinary.
+        var cause: AgentRunTerminalCause = .ordinary
+        /// The run's turn the provider reported failed; its runtime says whether process loss failed it.
+        var failedTurnID: UUID?
     }
 
     /// Carries a run handler's terminal outcome out of the router callback.
@@ -254,7 +259,8 @@ final class ClaudeIntegratedAgentModeRunner {
                     terminalState: outcome.terminalState,
                     errorText: outcome.errorText,
                     notifyTurnComplete: outcome.terminalState == .completed,
-                    shouldShutdownSession: outcome.shouldShutdownSession
+                    shouldShutdownSession: outcome.shouldShutdownSession,
+                    cause: outcome.cause
                 )
             } onCancel: {}
         }
@@ -289,7 +295,12 @@ final class ClaudeIntegratedAgentModeRunner {
             router = next
             resolution = await consumeRun(router: router, box: box, session: session, runID: runID, runAttemptID: runAttemptID)
         }
-        if let outcome = box.value {
+        if var outcome = box.value {
+            if outcome.terminalState == .failed, let turnID = outcome.failedTurnID,
+               await controller.turnEndedByProcessLoss(turnID)
+            {
+                outcome.cause = .providerProcessLost
+            }
             return outcome
         }
         switch resolution {
@@ -307,7 +318,8 @@ final class ClaudeIntegratedAgentModeRunner {
             return ConsumeEventsOutcome(
                 terminalState: .failed,
                 errorText: "Claude events stream ended unexpectedly. The run may need to be restarted.",
-                shouldShutdownSession: false
+                shouldShutdownSession: false,
+                cause: .providerProcessLost
             )
         }
     }
@@ -450,7 +462,7 @@ final class ClaudeIntegratedAgentModeRunner {
             case .cancelled:
                 return ConsumeEventsOutcome(terminalState: .cancelled, errorText: nil, shouldShutdownSession: false)
             case .failed:
-                return ConsumeEventsOutcome(terminalState: .failed, errorText: nil, shouldShutdownSession: false)
+                return ConsumeEventsOutcome(terminalState: .failed, errorText: nil, shouldShutdownSession: false, failedTurnID: turnID)
             }
         case let .error(message):
             session.clearClaudeReasoningStatus(clearDisplayedStatus: true)
@@ -793,6 +805,7 @@ final class ClaudeIntegratedAgentModeRunner {
             expectedRunID: runID,
             terminalState: .cancelled,
             source: "claudeNative.acquireFailure",
+            cause: .ordinary,
             attachmentReservationID: attachmentReservationID,
             attachmentDisposition: .deleteFiles,
             finalizeNonCodexUsage: true,
@@ -809,7 +822,8 @@ final class ClaudeIntegratedAgentModeRunner {
         terminalState: AgentSessionRunState,
         errorText: String?,
         notifyTurnComplete: Bool,
-        shouldShutdownSession: Bool = false
+        shouldShutdownSession: Bool = false,
+        cause: AgentRunTerminalCause = .ordinary
     ) async {
         // Messages this attempt wrote whose turn never completed stay delivery-unknown.
         claudeCoordinator.settleWrittenDispatchHandoffs(tabID: session.tabID, runAttemptID: ownership.attemptID)
@@ -819,6 +833,7 @@ final class ClaudeIntegratedAgentModeRunner {
             expectedRunID: runID,
             terminalState: terminalState,
             source: "claudeNative.finalize",
+            cause: cause,
             errorText: errorText,
             attachmentReservationID: attachmentReservationID,
             attachmentDisposition: .deleteFiles,

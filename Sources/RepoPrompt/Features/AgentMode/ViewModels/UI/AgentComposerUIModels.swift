@@ -372,10 +372,10 @@ struct AgentStaleResetRecoveryActions {
     let retryStopping: (_ tabID: UUID, _ recoveryID: UUID) async -> String?
 }
 
-/// Lossless-restart recovery list (Phase 1b), backed by the recovery coordinator's authoritative
-/// startup results overlaid with records committed since, plus this launch's held input (held or
-/// unsaved drafts, input no longer queued, composer save failures). Opening a row never starts a
-/// provider.
+/// Lossless-restart recovery banner: the exact session filter of the coordinator's app-wide
+/// recovery catalog (Phase 2) for the active session, plus its owner's composer-preparation
+/// failure. Items elsewhere are counted and reachable through the Needs Attention sheet. Opening a
+/// row never starts a provider.
 struct AgentRecoveryListProps: Equatable {
     enum Status: Equatable {
         case loading
@@ -387,10 +387,33 @@ struct AgentRecoveryListProps: Equatable {
     let status: Status
     let rows: [AgentRecoveryListRowProps]
     let canRetry: Bool
+    /// Undismissed catalog items outside this banner (shown in the Needs Attention sheet).
+    var otherItemCount: Int = 0
 
+    /// Nothing to show: no rows and nothing elsewhere (the "Needs Attention (n)…" affordance alone
+    /// keeps the banner visible).
     var isEmpty: Bool {
-        status == .ready && rows.isEmpty
+        status == .ready && rows.isEmpty && otherItemCount == 0
     }
+}
+
+/// One row of the app-wide Needs Attention sheet.
+struct AgentRecoveryNeedsAttentionRow: Equatable, Identifiable {
+    let row: AgentRecoveryListRowProps
+    let isDismissed: Bool
+    /// The item belongs to another workspace (actions may need that workspace open).
+    let isOtherWorkspace: Bool
+
+    var id: String {
+        row.id
+    }
+}
+
+extension Notification.Name {
+    /// A window's view model asks its root sheet host (`AgentRecoveryNeedsAttentionHost`) to present
+    /// the Needs Attention sheet; the host consumes the view model's pending request. `object`: the
+    /// `AgentModeViewModel`.
+    static let agentRecoveryNeedsAttentionRequested = Notification.Name("AgentRecovery.needsAttentionRequested")
 }
 
 struct AgentRecoveryListRowProps: Equatable, Identifiable {
@@ -403,8 +426,11 @@ struct AgentRecoveryListRowProps: Equatable, Identifiable {
         case open
         /// Confirm that the previous run is no longer running (the exact published crash hold).
         case confirmStopped
-        /// Hide an informational row for this launch (nothing is written or erased).
-        case hide
+        /// Durably dismiss the card in its displayed state (it returns if that state changes). It
+        /// never resolves, withdraws, removes, confirms, or releases anything.
+        case dismiss
+        /// Remove the saved historical question (its request already ended).
+        case removeSavedQuestion
         /// Place the displayed held or unsaved draft into this session's empty message box.
         case restoreDraft
         /// Discard exactly the displayed held or unsaved draft (after `confirmation`); current
@@ -433,17 +459,11 @@ struct AgentRecoveryListRowProps: Equatable, Identifiable {
     var confirmation: String?
 }
 
-/// Per-row action state kept by the view model (not persisted).
-enum AgentRecoveryListRowActionState: Equatable {
-    case working
-    case failed(String)
-    /// Committed (or hidden for this launch): the row is no longer listed.
-    case resolved
-}
-
 struct AgentRecoveryListActions {
     let perform: (_ rowID: String, _ action: AgentRecoveryListRowProps.Action) async -> Void
     let retryStartup: () -> Void
+    /// Presents the app-wide Needs Attention sheet.
+    var openNeedsAttention: () -> Void = {}
 }
 
 struct AgentComposerProps: Equatable {

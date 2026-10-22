@@ -29,6 +29,12 @@ final class AgentRecoveryAppComposition {
     /// Whether this composition selects mandatory recovery for the windows it installs into.
     let isActive: Bool
     private var startupTask: Task<Void, Never>?
+    /// Every window view model recovery was installed into (weak; a closed window drops out).
+    private var installedViewModels: [WeakInstalledViewModel] = []
+
+    private struct WeakInstalledViewModel {
+        weak var viewModel: AgentModeViewModel?
+    }
 
     /// - Parameters:
     ///   - store: the single recovery store; `nil` leaves recovery inactive (legacy behavior).
@@ -51,7 +57,7 @@ final class AgentRecoveryAppComposition {
         scheduler.closeStartupAdmission()
         scheduler.dispatchingRecordsRequireTransferResolution = true
         do {
-            coordinator = try AgentRecoveryCoordinator(
+            let composed = try AgentRecoveryCoordinator(
                 store: store,
                 dataService: dataService,
                 reconcile: { report in
@@ -65,7 +71,19 @@ final class AgentRecoveryAppComposition {
                     )
                 }
             )
+            coordinator = composed
             failure = nil
+            // Schedules awaiting explicit confirmation are catalog items too (Phase 2): the shared
+            // scheduler's summaries for hosted sessions, and every inventoried workspace's index for
+            // sessions no window hosts (closed workspaces included). Hydrated sessions of windows
+            // sharing this scheduler are authoritative through the scheduler, never the index.
+            composed.attachScheduler(
+                scheduler,
+                hydratedSessionIDs: { [weak self] in self?.hydratedScheduleSessionIDs() ?? [] },
+                indexWorkspaces: {
+                    try? await Task.detached(priority: .utility) { try loadInventory() }.value.workspaces
+                }
+            )
         } catch {
             coordinator = nil
             failure = String(describing: error)
@@ -87,6 +105,8 @@ final class AgentRecoveryAppComposition {
     /// observes its first draft, then starts startup once. Inactive compositions install nothing.
     func install(into viewModel: AgentModeViewModel) {
         guard isActive else { return }
+        installedViewModels.removeAll { $0.viewModel == nil || $0.viewModel === viewModel }
+        installedViewModels.append(WeakInstalledViewModel(viewModel: viewModel))
         if let coordinator {
             viewModel.installRecoveryCoordinator(coordinator, admissionMode: .mandatory)
             viewModel.recoveryStartupRetry = { [weak self] in self?.retryStartup() }
@@ -125,6 +145,20 @@ final class AgentRecoveryAppComposition {
         case .notStarted, .loading:
             break
         }
+    }
+
+    /// Sessions hydrated by a window that hosts this composition's scheduler.
+    private func hydratedScheduleSessionIDs() -> Set<UUID> {
+        var sessionIDs: Set<UUID> = []
+        for entry in installedViewModels {
+            guard let viewModel = entry.viewModel, viewModel.scheduledSendCoordinator === scheduler else { continue }
+            for session in viewModel.sessions.values where session.hasLoadedPersistedState {
+                if let sessionID = session.activeAgentSessionID {
+                    sessionIDs.insert(sessionID)
+                }
+            }
+        }
+        return sessionIDs
     }
 
     /// Test observability: the task releasing the scheduler after startup.

@@ -2500,6 +2500,11 @@ package final actor ClaudeNativeProcessSessionController {
             beginTurnTracking()
         }
 
+        /// The production stdout-EOF path (process loss) for the given launch's reader.
+        func test_handleStdoutEOF(launchToken: UUID) async {
+            await handleStdoutEOF(launchToken: launchToken)
+        }
+
         /// Installs a synthetic process launch (no subprocess) so attribution can be exercised
         /// through the production `handleStreamPayload` path.
         @discardableResult
@@ -2771,6 +2776,18 @@ package final actor ClaudeNativeProcessSessionController {
         }
     }
 
+    /// Turns failed by an unexpected stdout EOF (process loss), oldest first; bounded.
+    private var processLostTurnIDs: [UUID] = []
+    private static let processLostTurnIDLimit = 64
+
+    /// `async` to match `NativeAgentRuntimeControlling` exactly: a synchronous signature lets the
+    /// protocol extension's `false` default win both as the witness and in direct `await` calls.
+    package func turnEndedByProcessLoss(_ turnID: UUID) async -> Bool {
+        guard let index = processLostTurnIDs.firstIndex(of: turnID) else { return false }
+        processLostTurnIDs.remove(at: index)
+        return true
+    }
+
     private func handleStdoutEOF(launchToken: UUID) async {
         guard !isShuttingDown else { return }
         // An EOF from an already-replaced process must not tear down the current launch.
@@ -2796,6 +2813,12 @@ package final actor ClaudeNativeProcessSessionController {
         hasCompletedInitialFlagSettings = false
         let staleIDs = drainAllTurnIDs()
         if !staleIDs.isEmpty {
+            // Review A F06: these turns failed by provider-process loss (not a requested shutdown);
+            // recorded before their completions so the run's finalizer can type its cause. Bounded.
+            processLostTurnIDs.append(contentsOf: staleIDs)
+            if processLostTurnIDs.count > Self.processLostTurnIDLimit {
+                processLostTurnIDs.removeFirst(processLostTurnIDs.count - Self.processLostTurnIDLimit)
+            }
             emit(.error("Claude process exited unexpectedly."))
             for id in staleIDs {
                 emitTurnCompleted(turnID: id, status: .failed)

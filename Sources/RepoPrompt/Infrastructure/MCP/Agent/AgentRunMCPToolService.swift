@@ -659,6 +659,7 @@ struct AgentRunMCPToolService {
             )
             _ = await agentModeVM.cancelAgentRun(
                 target: exactTarget,
+                cause: .ordinary,
                 completion: .terminalPublished
             )
         }
@@ -1604,6 +1605,7 @@ struct AgentRunMCPToolService {
                         } else {
                             await agentModeVM.cancelAgentRun(
                                 tabID: target.tabID,
+                                cause: .ordinary,
                                 completion: .terminalPublished
                             )
                         }
@@ -2331,7 +2333,11 @@ struct AgentRunMCPToolService {
                 "The requested run_id is not the current run for this session; refusing to cancel a different run."
             )
         }
-        guard await agentModeVM.cancelAgentRun(target: cancelTarget, completion: .terminalPublished) else {
+        guard await agentModeVM.cancelAgentRun(
+            target: cancelTarget,
+            cause: .userCancel,
+            completion: .terminalPublished
+        ) else {
             throw MCPError.invalidParams(
                 "The requested run is no longer current; refusing to cancel a different run."
             )

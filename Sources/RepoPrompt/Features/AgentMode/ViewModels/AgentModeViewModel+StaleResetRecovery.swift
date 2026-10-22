@@ -255,7 +255,7 @@ extension AgentModeViewModel {
             // The terminal commit flushes buffered assistant output into the retained view,
             // finalizes streaming items and pending tool calls, drains provider buffers, and the
             // completion awaits the registered teardown of the run attempt's resources.
-            await cancelAgentRun(tabID: tabID, completion: .terminalTeardownCompleted)
+            await cancelAgentRun(tabID: tabID, cause: .ordinary, completion: .terminalTeardownCompleted)
         }
         guard let afterCancel = session.staleResetRecovery,
               afterCancel.id == recoveryID,

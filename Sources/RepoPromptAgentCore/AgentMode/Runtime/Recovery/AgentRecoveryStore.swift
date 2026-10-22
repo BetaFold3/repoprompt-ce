@@ -144,6 +144,8 @@ package enum AgentRecoveryStoreError: Error, Equatable {
     /// A composer change reached the owner while an explicit held-composer restore was in flight,
     /// before its write (`AgentRecoveryResolutionFence`). Nothing was written.
     case heldResolutionSuperseded
+    /// The acknowledged card's semantic state changed (or it no longer exists). Nothing was written.
+    case cardChanged
 
     package var category: Category {
         switch self {
@@ -160,7 +162,7 @@ package enum AgentRecoveryStoreError: Error, Equatable {
         case .heldComposerUnresolved, .heldResolutionSuperseded:
             .heldInput
         case .intentNotFound, .intentConflict, .attemptNotFound, .attemptConflict, .runAttemptNotFound,
-             .runAttemptConflict, .invalidTransition, .heldIntent:
+             .runAttemptConflict, .invalidTransition, .heldIntent, .cardChanged:
             .invalidOperation
         }
     }
@@ -1227,7 +1229,8 @@ package actor AgentRecoveryStore {
         if let terminal = run.terminal {
             guard terminal.commitID == commit.commitID,
                   terminal.terminalState == commit.terminalState,
-                  terminal.expectedRunID == commit.expectedRunID
+                  terminal.expectedRunID == commit.expectedRunID,
+                  terminal.cause == commit.cause
             else {
                 throw AgentRecoveryStoreError.runAttemptConflict(runAttemptID)
             }
@@ -1238,7 +1241,8 @@ package actor AgentRecoveryStore {
             commitID: commit.commitID,
             terminalState: commit.terminalState,
             expectedRunID: commit.expectedRunID,
-            recordedAt: AgentRecoveryTimestamp(now())
+            recordedAt: AgentRecoveryTimestamp(now()),
+            cause: commit.cause
         )
         var runAttempts = current.runAttempts
         runAttempts[index] = run
@@ -1606,8 +1610,9 @@ package actor AgentRecoveryStore {
         package let alreadyStored: Set<UUID>
     }
 
-    /// Applies `update` to the session's pending-question snapshots (shutdown preparation, live
-    /// resolution, Cancel, or a recovery-list dismissal). Unchanged when identical; nothing is
+    /// Applies `update` to the session's pending-question snapshots (live creation, draft, and
+    /// resolution writes, shutdown preparation, Cancel, or an explicit saved-question removal).
+    /// Unchanged when identical; nothing is
     /// created for an empty set on a session without a record. Secret answers are structurally absent.
     package func updateQuestionSnapshots(
         binding: AgentRecoveryLifecycleBinding,
@@ -1622,8 +1627,10 @@ package actor AgentRecoveryStore {
         for snapshot in update.upserting {
             latest[snapshot.interactionID] = snapshot
         }
+        // A snapshot written in place keeps its first stored ask time and unknown fields.
         var snapshots = stored.compactMap { snapshot in
-            latest[snapshot.interactionID] ?? (update.removing.contains(snapshot.interactionID) ? nil : snapshot)
+            latest[snapshot.interactionID].map { $0.mergingStored(snapshot) }
+                ?? (update.removing.contains(snapshot.interactionID) ? nil : snapshot)
         }
         var appended = Set<UUID>()
         for snapshot in update.upserting where !storedIDs.contains(snapshot.interactionID) {
@@ -1659,6 +1666,63 @@ package actor AgentRecoveryStore {
                 composerRevision: record.composer?.revision
             ),
             alreadyStored: alreadyStored
+        )
+    }
+
+    /// Durably dismisses one recovery card in its displayed semantic state (Phase 2 §D). `isCurrent`
+    /// revalidates the card against the record about to be replaced, atomically with the write;
+    /// `false` (its record-backed state changed or it no longer exists) refuses with `cardChanged`
+    /// and writes nothing. An identical acknowledgement is unchanged; a different one for the same
+    /// key replaces it. Acknowledgements of another incarnation are dropped; no other acknowledgement
+    /// is evicted, so an unchanged dismissed card never reappears because of an unrelated Dismiss
+    /// (review A F07; retention is deferred). Nothing else changes: no turn is resolved, no input,
+    /// draft, question, crash-hold acknowledgement, or run evidence is touched. Creates the record
+    /// when absent (a card backed only by the session file).
+    package func acknowledgeCard(
+        binding: AgentRecoveryLifecycleBinding,
+        expectedRevision: AgentRecoveryRecordRevision?,
+        key: AgentRecoveryCardKey,
+        freshness: AgentRecoveryCardFreshness,
+        isCurrent: @Sendable (AgentRecoveryRecord?) -> Bool
+    ) throws -> AgentRecoveryLocalReceipt {
+        guard key.incarnationID == binding.incarnationID else {
+            throw AgentRecoveryStoreError.staleIncarnation(expected: binding.incarnationID, actual: key.incarnationID)
+        }
+        let current = try writableRecord(binding: binding)
+        guard isCurrent(current) else {
+            throw AgentRecoveryStoreError.cardChanged
+        }
+        if let current, current.isCardAcknowledged(key, freshness: freshness) {
+            return AgentRecoveryLocalReceipt(
+                binding: binding,
+                recordRevision: current.revision,
+                disposition: .unchanged,
+                composerRevision: current.composer?.revision
+            )
+        }
+        try requireRevision(expectedRevision, current: current)
+        var acknowledgements = (current?.cardAcknowledgements ?? []).filter {
+            $0.key != key && $0.key.incarnationID == binding.incarnationID
+        }
+        acknowledgements.append(AgentRecoveryCardAcknowledgement(
+            key: key,
+            freshness: freshness,
+            acknowledgedAt: AgentRecoveryTimestamp(now())
+        ))
+        let record = try replace(
+            current,
+            binding: binding,
+            composer: current?.composer,
+            intents: current?.intents ?? [],
+            attempts: current?.attempts ?? [],
+            runAttempts: current?.runAttempts ?? [],
+            cardAcknowledgements: acknowledgements
+        )
+        return AgentRecoveryLocalReceipt(
+            binding: binding,
+            recordRevision: record.revision,
+            disposition: .committed,
+            composerRevision: record.composer?.revision
         )
     }
 
@@ -2011,9 +2075,9 @@ package actor AgentRecoveryStore {
         )
     }
 
-    /// Atomically replaces the record (new opaque revision, binding generation, preserved extras and
-    /// crash-hold acknowledgement unless one is supplied). Never deletes attachments: a record
-    /// reference is not proof that a file is unused.
+    /// Atomically replaces the record (new opaque revision, binding generation, preserved extras,
+    /// crash-hold acknowledgement, questions, and card acknowledgements unless supplied). Never
+    /// deletes attachments: a record reference is not proof that a file is unused.
     private func replace(
         _ current: AgentRecoveryRecord?,
         binding: AgentRecoveryLifecycleBinding,
@@ -2022,7 +2086,8 @@ package actor AgentRecoveryStore {
         attempts: [AgentRecoveryAttempt],
         runAttempts: [AgentRecoveryRunAttempt],
         crashHoldAcknowledgement: AgentRecoveryCrashHoldAcknowledgement?? = nil,
-        questions: [AgentRecoveryQuestionSnapshot]? = nil
+        questions: [AgentRecoveryQuestionSnapshot]? = nil,
+        cardAcknowledgements: [AgentRecoveryCardAcknowledgement]? = nil
     ) throws -> AgentRecoveryRecord {
         let record = AgentRecoveryRecord(
             sessionID: binding.sessionID,
@@ -2036,6 +2101,7 @@ package actor AgentRecoveryStore {
             runAttempts: runAttempts,
             crashHoldAcknowledgement: crashHoldAcknowledgement ?? current?.crashHoldAcknowledgement,
             questions: questions ?? current?.questions ?? [],
+            cardAcknowledgements: cardAcknowledgements ?? current?.cardAcknowledgements ?? [],
             extras: current?.extras ?? [:]
         )
         do {

@@ -184,13 +184,13 @@ final class AgentRecoveryResetBoundaryTests: XCTestCase {
         viewModel.storeDraftText(for: tabID, "typed after clearing")
         let typedRow = try XCTUnwrap(heldRow(), "The held draft is listed in this launch")
         XCTAssertEqual(typedRow.text, "draft before reset")
-        XCTAssertEqual(typedRow.actions, [.discardDraft], "Restore never replaces current typing")
+        XCTAssertEqual(typedRow.actions, [.discardDraft, .dismiss], "Restore never replaces current typing")
         XCTAssertNotNil(typedRow.confirmation, "Discard asks first")
 
         viewModel.storeDraftText(for: tabID, "")
         let emptyRow = try XCTUnwrap(heldRow())
         XCTAssertEqual(emptyRow.id, typedRow.id, "The row identifies the same displayed draft")
-        XCTAssertEqual(emptyRow.actions, [.restoreDraft, .discardDraft])
+        XCTAssertEqual(emptyRow.actions, [.restoreDraft, .discardDraft, .dismiss])
 
         await viewModel.performRecoveryListAction(rowID: emptyRow.id, action: .restoreDraft)
         XCTAssertNil(heldRow(), "The resolved draft leaves the list")
@@ -493,12 +493,14 @@ final class AgentRecoveryResetBoundaryTests: XCTestCase {
     }
 
     /// R4-01: Cancel removes the snapshots this window introduced; a later Stage A joins that
-    /// removal before writing its own, so the removal never erases them.
+    /// removal before writing its own, so the removal never erases them. (A question the live lane
+    /// never created; a lane-created one is durable already, see
+    /// `testLaneCreatedQuestionStaysStoredThroughCancelAndIsRemovedOnlyByItsResolution`.)
     func testCancelClearsThisLaunchQuestionSnapshotsBeforeALaterStageAWritesAgain() async throws {
         let harness = try await makeHarness(windowID: 4609)
         let lane = try await persistAndClaimLane(harness)
         let viewModel = harness.viewModel
-        let (interaction, asked) = await pendingAskUser(harness)
+        let interaction = installUntrackedUserInput(harness, "cancel")
 
         let first = UUID()
         viewModel.beginShutdownFreeze(requestID: first, ownsRecoveryFreeze: true)
@@ -522,13 +524,46 @@ final class AgentRecoveryResetBoundaryTests: XCTestCase {
         await viewModel.shutdownQuestionSnapshotWriteTask?.value
         let cleared = await lane.store.read(sessionID: lane.sessionID).record?.questions ?? []
         XCTAssertTrue(cleared.isEmpty, "a reopened question is no longer preserved")
+        harness.session.pendingUserInputRequest = nil
+    }
+
+    /// Plan §E: a question created through the live lane is durable before it is shown, so Stage A
+    /// finds it already stored (never "introduced") and Cancel keeps it; only its own resolution
+    /// removes it, after the reply.
+    func testLaneCreatedQuestionStaysStoredThroughCancelAndIsRemovedOnlyByItsResolution() async throws {
+        let harness = try await makeHarness(windowID: 4617)
+        let lane = try await persistAndClaimLane(harness)
+        let viewModel = harness.viewModel
+        func storedIDs() async -> [UUID] {
+            await (lane.store.read(sessionID: lane.sessionID).record?.questions ?? []).map(\.interactionID)
+        }
+        let (interaction, asked) = await pendingAskUser(harness)
+        var ids = await storedIDs()
+        XCTAssertEqual(ids, [interaction.id], "committed before the question was shown")
+
+        let requestID = UUID()
+        viewModel.beginShutdownFreeze(requestID: requestID, ownsRecoveryFreeze: true)
+        let prepared = await viewModel.prepareSessionsForShutdown(reason: .windowClose)
+        XCTAssertEqual(prepared.blockers, [])
+        XCTAssertEqual(
+            viewModel.shutdownQuestionSnapshots[harness.tabID],
+            AgentModeShutdownQuestionSnapshots(lane: ObjectIdentifier(lane), live: [interaction.id], introduced: []),
+            "already stored by the live lane, so Stage A introduces nothing"
+        )
+        viewModel.endShutdownFreeze(requestID: requestID)
+        await viewModel.shutdownQuestionSnapshotWriteTask?.value
+        ids = await storedIDs()
+        XCTAssertEqual(ids, [interaction.id], "Cancel keeps a live question durable")
 
         try viewModel.submitAskUserResponse(
             tabID: harness.tabID,
             interactionID: interaction.id,
             draftsByQuestionID: ["target": AgentAskUserDraft(customResponse: "done")]
         )
-        _ = try await asked.value
+        let response = try await asked.value
+        XCTAssertEqual(response.answersByQuestionID["target"]?.customResponse, "done")
+        let removed = await RecoveryTestSupport.eventually { await storedIDs().isEmpty }
+        XCTAssertTrue(removed, "the resolution removes exactly its snapshot")
     }
 
     /// R4-01 (same-launch close/reopen): a window closed earlier in this launch preserved a question
@@ -564,9 +599,10 @@ final class AgentRecoveryResetBoundaryTests: XCTestCase {
         ids = await storedIDs()
         XCTAssertEqual(ids, [closed.interactionID, adoptedRequest.id], "Cancel erases nothing this window did not add")
 
-        // A live question of this window (introduced) and the adopted one live again.
-        let (interaction, asked) = await pendingAskUser(harness)
+        // A live question of this window (introduced; one the live lane never created) and the
+        // adopted one live again.
         harness.session.pendingUserInputRequest = adoptedRequest
+        let interaction = installUntrackedUserInput(harness, "introduced", queued: true)
         let second = UUID()
         viewModel.beginShutdownFreeze(requestID: second, ownsRecoveryFreeze: true)
         let livePreparation = await viewModel.prepareSessionsForShutdown(reason: .appQuit)
@@ -589,12 +625,8 @@ final class AgentRecoveryResetBoundaryTests: XCTestCase {
 
         // An untracked live resolution (after Cancel) writes nothing.
         harness.session.pendingUserInputRequest = nil
-        try viewModel.submitAskUserResponse(
-            tabID: harness.tabID,
-            interactionID: interaction.id,
-            draftsByQuestionID: ["target": AgentAskUserDraft(customResponse: "done")]
-        )
-        _ = try await asked.value
+        harness.session.queuedUserInputRequests = []
+        viewModel.recordMCPInteractionResolution(for: harness.session, interactionID: interaction.id)
         await viewModel.shutdownQuestionSnapshotWriteTask?.value
         ids = await storedIDs()
         XCTAssertEqual(ids, [closed.interactionID, adoptedRequest.id])
@@ -659,7 +691,7 @@ final class AgentRecoveryResetBoundaryTests: XCTestCase {
         let lane = try await persistAndClaimLane(harness)
         let viewModel = harness.viewModel
         let laneKey = ObjectIdentifier(lane)
-        let (interaction, asked) = await pendingAskUser(harness)
+        let interaction = installUntrackedUserInput(harness, "failed-removal")
         func storedIDs() async -> [UUID] {
             await (lane.store.read(sessionID: lane.sessionID).record?.questions ?? []).map(\.interactionID)
         }
@@ -705,12 +737,7 @@ final class AgentRecoveryResetBoundaryTests: XCTestCase {
         await viewModel.shutdownQuestionSnapshotWriteTask?.value
         ids = await storedIDs()
         XCTAssertTrue(ids.isEmpty)
-        try viewModel.submitAskUserResponse(
-            tabID: harness.tabID,
-            interactionID: interaction.id,
-            draftsByQuestionID: ["target": AgentAskUserDraft(customResponse: "done")]
-        )
-        _ = try await asked.value
+        harness.session.pendingUserInputRequest = nil
     }
 
     /// R4 B-N4: the composer and answer cards observe narrow stores, not the view model; the freeze
@@ -747,12 +774,13 @@ final class AgentRecoveryResetBoundaryTests: XCTestCase {
         let harness = try await makeHarness(windowID: windowID, fileOperations: hold.fileOperations())
         let lane = try await persistAndClaimLane(harness)
         let viewModel = harness.viewModel
-        let (interaction, asked) = await pendingAskUser(harness)
-        viewModel.updateAskUserDraft(
+        // A question the live lane never created: only Stage A writes it.
+        let interaction = installUntrackedUserInput(harness, "supersession")
+        viewModel.updateUserInputDraft(
             tabID: harness.tabID,
-            interactionID: interaction.id,
+            requestID: interaction.id,
             questionID: "target",
-            draft: AgentAskUserDraft(customResponse: "staging")
+            draft: AgentRequestUserInputQuestionDraft(note: "staging")
         )
         // An active run: its shutdown reason is the lane write after the question upsert.
         _ = harness.session.beginRunAttempt(source: "shutdownSupersessionTest")
@@ -800,12 +828,7 @@ final class AgentRecoveryResetBoundaryTests: XCTestCase {
 
         viewModel.endShutdownFreeze(requestID: second)
         await viewModel.shutdownQuestionSnapshotWriteTask?.value
-        try viewModel.submitAskUserResponse(
-            tabID: harness.tabID,
-            interactionID: interaction.id,
-            draftsByQuestionID: ["target": AgentAskUserDraft(customResponse: "done")]
-        )
-        _ = try await asked.value
+        harness.session.pendingUserInputRequest = nil
     }
 
     /// R4-06: the native user-input card seeds each request from its session-owned partial answers,
@@ -848,6 +871,222 @@ final class AgentRecoveryResetBoundaryTests: XCTestCase {
         XCTAssertEqual(seededBack, seededFirst, "switching back reseeds the retained answers")
     }
 
+    // MARK: - Live question persistence (plan §E)
+
+    /// Answer ordering: the answer's snapshot is written before the reply, edits are refused
+    /// meanwhile, and the snapshot is removed by its ID after the reply.
+    func testAnswerIsSavedBeforeItsReplyAndRemovedAfterIt() async throws {
+        let hold = RecoveryStoreMarkerWriteHold(marker: "held-answer")
+        defer { hold.release() }
+        let harness = try await makeHarness(windowID: 4618, fileOperations: hold.fileOperations())
+        let lane = try await persistAndClaimLane(harness)
+        let viewModel = harness.viewModel
+        let (interaction, asked) = await pendingAskUser(harness)
+
+        try viewModel.submitAskUserResponse(
+            tabID: harness.tabID,
+            interactionID: interaction.id,
+            draftsByQuestionID: ["target": AgentAskUserDraft(customResponse: "held-answer")]
+        )
+        let held = await RecoveryTestSupport.eventually { hold.isHolding }
+        XCTAssertTrue(held, "the answer's snapshot write is in flight")
+        XCTAssertNotNil(harness.session.askUserContinuation, "no reply before the answer is saved")
+        XCTAssertTrue(harness.session.recoveryQuestionResolutionReservations.contains(interaction.id))
+        viewModel.updateAskUserDraft(
+            tabID: harness.tabID,
+            interactionID: interaction.id,
+            questionID: "target",
+            draft: AgentAskUserDraft(customResponse: "edited meanwhile")
+        )
+        XCTAssertEqual(
+            harness.session.pendingAskUser?.draftsByQuestionID["target"],
+            AgentAskUserDraft(customResponse: "held-answer"),
+            "the submitted answer stays the latest while it is saved"
+        )
+
+        hold.release()
+        let response = try await asked.value
+        XCTAssertEqual(response.answersByQuestionID["target"]?.customResponse, "held-answer")
+        XCTAssertTrue(harness.session.recoveryQuestionResolutionReservations.isEmpty)
+        let removed = await RecoveryTestSupport.eventually {
+            await (lane.store.read(sessionID: lane.sessionID).record?.questions ?? []).isEmpty
+        }
+        XCTAssertTrue(removed, "removed by its ID after the reply")
+    }
+
+    /// Review A F01. This replaces R4's `testStorageCannotHoldAnAnswersReplyPastTheBound`, which
+    /// asserted the wrong contract (the reply was sent while its snapshot write was still stuck).
+    /// An answer is replied only after its snapshot is preserved: storage that does not answer
+    /// within the bound sends nothing; the answer, its request and its live continuation stay, the
+    /// reservation is released, and a retryable save error is listed. Once storage recovers,
+    /// submitting again replies exactly once and the snapshot is removed after the reply.
+    func testDelayedPreservationSendsNoReplyAndKeepsTheAnswerForRetry() async throws {
+        let hold = RecoveryStoreMarkerWriteHold(marker: "stuck-answer")
+        defer { hold.release() }
+        let harness = try await makeHarness(windowID: 4619, fileOperations: hold.fileOperations())
+        let lane = try await persistAndClaimLane(harness)
+        let viewModel = harness.viewModel
+        let (interaction, asked) = await pendingAskUser(harness)
+        let answer = ["target": AgentAskUserDraft(customResponse: "stuck-answer")]
+
+        try viewModel.submitAskUserResponse(tabID: harness.tabID, interactionID: interaction.id, draftsByQuestionID: answer)
+        let held = await RecoveryTestSupport.eventually { hold.isHolding }
+        XCTAssertTrue(held, "the answer's snapshot write is in flight")
+        let session = harness.session
+        let gaveUp = await RecoveryTestSupport.eventually(timeoutSeconds: 10) {
+            lane.questionPersistence.unsentAnswerIDs.contains(interaction.id)
+                && !session.recoveryQuestionResolutionReservations.contains(interaction.id)
+        }
+        XCTAssertTrue(gaveUp, "the bounded wait ended without preserving the answer")
+        XCTAssertTrue(hold.isHolding, "storage still has not answered")
+        XCTAssertNotNil(harness.session.askUserContinuation, "no reply was sent after the bounded wait")
+        XCTAssertEqual(harness.session.pendingAskUser?.interaction.id, interaction.id, "the request stays pending")
+        XCTAssertEqual(harness.session.pendingAskUser?.draftsByQuestionID["target"], answer["target"], "the answer is kept")
+        XCTAssertFalse(harness.session.recoveryQuestionResolutionReservations.contains(interaction.id), "the reservation is released")
+        let saveFailureID = AgentRecoveryCatalogProjection.questionSaveFailureItemID(sessionID: lane.sessionID)
+        let listed = await RecoveryTestSupport.eventually {
+            guard case .questionSaveFailed(_, unsentAnswer: true)? = viewModel.recoveryCoordinator?.catalog.item(id: saveFailureID)?.payload else { return false }
+            return true
+        }
+        XCTAssertTrue(listed, "A retryable save error is listed for the unsent answer")
+
+        hold.release()
+        let preserved = await RecoveryTestSupport.eventually { !lane.questionPersistence.needsPreservation(interaction.id) }
+        XCTAssertTrue(preserved)
+        try viewModel.submitAskUserResponse(tabID: harness.tabID, interactionID: interaction.id, draftsByQuestionID: answer)
+        let response = try await asked.value
+        XCTAssertEqual(response.answersByQuestionID["target"]?.customResponse, "stuck-answer")
+        XCTAssertFalse(response.timedOut)
+        XCTAssertTrue(lane.questionPersistence.unsentAnswerIDs.isEmpty)
+        let removed = await RecoveryTestSupport.eventually {
+            await (lane.store.read(sessionID: lane.sessionID).record?.questions ?? []).isEmpty
+        }
+        XCTAssertTrue(removed, "removed by its ID after the reply")
+        let cleared = await RecoveryTestSupport.eventually { viewModel.recoveryCoordinator?.catalog.item(id: saveFailureID) == nil }
+        XCTAssertTrue(cleared, "the save error clears once the answer is sent")
+    }
+
+    /// Review A F01: a failed preservation sends no reply. The answer and its continuation stay, the
+    /// reservation is released, the save error is listed, and the timeout that yielded to the answer
+    /// is armed again; the question then ends by its actual timeout (separate cleanup), never by
+    /// the unsaved answer.
+    func testFailedPreservationSendsNoReplyKeepsTheAnswerAndRearmsTheTimeout() async throws {
+        let failures = RecoveryStoreWriteFailureSwitch()
+        let harness = try await makeHarness(windowID: 4631, fileOperations: failures.fileOperations())
+        let lane = try await persistAndClaimLane(harness)
+        let viewModel = harness.viewModel
+        let interaction = AgentAskUserInteraction(
+            timeoutSeconds: 2,
+            questions: [AgentAskUserQuestion(id: "target", question: "Which environment?")]
+        )
+        let tabID = harness.tabID
+        let asked = Task { @MainActor in
+            try await viewModel.askUser(tabID: tabID, interaction: interaction)
+        }
+        let session = harness.session
+        let pending = await RecoveryTestSupport.eventually { session.askUserContinuation != nil }
+        XCTAssertTrue(pending)
+
+        failures.shouldFailWrites = true
+        try viewModel.submitAskUserResponse(
+            tabID: tabID,
+            interactionID: interaction.id,
+            draftsByQuestionID: ["target": AgentAskUserDraft(customResponse: "unsaved-answer")]
+        )
+        let notSent = await RecoveryTestSupport.eventually {
+            lane.questionPersistence.unsentAnswerIDs.contains(interaction.id)
+                && !session.recoveryQuestionResolutionReservations.contains(interaction.id)
+        }
+        XCTAssertTrue(notSent)
+        XCTAssertNotNil(session.askUserContinuation, "no reply after a failed preservation")
+        XCTAssertEqual(session.pendingAskUser?.draftsByQuestionID["target"], AgentAskUserDraft(customResponse: "unsaved-answer"))
+        XCTAssertFalse(session.recoveryQuestionResolutionReservations.contains(interaction.id))
+        XCTAssertNotNil(lane.questionPersistence.lastWriteFailure)
+        let saveFailureID = AgentRecoveryCatalogProjection.questionSaveFailureItemID(sessionID: lane.sessionID)
+        let listed = await RecoveryTestSupport.eventually {
+            guard case .questionSaveFailed(_?, unsentAnswer: true)? = viewModel.recoveryCoordinator?.catalog.item(id: saveFailureID)?.payload else { return false }
+            return true
+        }
+        XCTAssertTrue(listed, "The save error is listed with the unsent answer")
+
+        let response = try await asked.value
+        XCTAssertTrue(response.timedOut, "the re-armed timeout ends the question; the unsaved answer is never sent")
+        XCTAssertTrue(lane.questionPersistence.unsentAnswerIDs.isEmpty, "the timeout ended the interaction")
+        failures.shouldFailWrites = false
+    }
+
+    /// A timeout replies without waiting for storage; a failed removal keeps the snapshot, is owed
+    /// (never re-replied), and is retried by the next Stage A before it writes.
+    func testTimeoutRemovesItsSnapshotAndAFailedRemovalIsRetriedWithoutAnotherReply() async throws {
+        let failures = RecoveryStoreWriteFailureSwitch()
+        let harness = try await makeHarness(windowID: 4620, fileOperations: failures.fileOperations())
+        let lane = try await persistAndClaimLane(harness)
+        let viewModel = harness.viewModel
+        func storedIDs() async -> [UUID] {
+            await (lane.store.read(sessionID: lane.sessionID).record?.questions ?? []).map(\.interactionID)
+        }
+        let interaction = AgentAskUserInteraction(
+            timeoutSeconds: 0.3,
+            questions: [AgentAskUserQuestion(id: "target", question: "Which environment?")]
+        )
+        let tabID = harness.tabID
+        let asked = Task { @MainActor in
+            try await viewModel.askUser(tabID: tabID, interaction: interaction)
+        }
+        let session = harness.session
+        let pending = await RecoveryTestSupport.eventually { session.askUserContinuation != nil }
+        XCTAssertTrue(pending)
+        var ids = await storedIDs()
+        XCTAssertEqual(ids, [interaction.id])
+
+        failures.shouldFailWrites = true
+        let response = try await asked.value
+        XCTAssertTrue(response.timedOut)
+        let owed = await RecoveryTestSupport.eventually {
+            lane.questionPersistence.owedRemovals == [interaction.id] && lane.questionPersistence.lastWriteFailure != nil
+        }
+        XCTAssertTrue(owed, "the failed removal is owed")
+        ids = await storedIDs()
+        XCTAssertEqual(ids, [interaction.id], "the failed removal kept the snapshot")
+
+        failures.shouldFailWrites = false
+        let requestID = UUID()
+        viewModel.beginShutdownFreeze(requestID: requestID, ownsRecoveryFreeze: true)
+        let report = await viewModel.prepareSessionsForShutdown(reason: .windowClose)
+        XCTAssertEqual(report.blockers, [])
+        ids = await storedIDs()
+        XCTAssertTrue(ids.isEmpty, "retried by Stage A's drain")
+        XCTAssertTrue(lane.questionPersistence.owedRemovals.isEmpty)
+        viewModel.endShutdownFreeze(requestID: requestID)
+    }
+
+    /// A failed creation write refuses the question (never shown as durably available); the next
+    /// one is accepted once storage works.
+    func testAskUserIsRefusedWhenItsCreationCannotBeSaved() async throws {
+        let failures = RecoveryStoreWriteFailureSwitch()
+        let harness = try await makeHarness(windowID: 4621, fileOperations: failures.fileOperations())
+        let lane = try await persistAndClaimLane(harness)
+        let viewModel = harness.viewModel
+        failures.shouldFailWrites = true
+        let refused = AgentAskUserInteraction(questions: [AgentAskUserQuestion(id: "target", question: "Which environment?")])
+        do {
+            _ = try await viewModel.askUser(tabID: harness.tabID, interaction: refused)
+            XCTFail("an unsaved question is refused")
+        } catch {
+            XCTAssertTrue(String(describing: error).contains("could not be saved"), "\(error)")
+        }
+        XCTAssertNil(harness.session.pendingAskUser)
+        XCTAssertNil(harness.session.recoveryQuestionCreationReservation)
+        XCTAssertFalse(lane.questionPersistence.hasPendingWork, "the refused question is not retried")
+
+        failures.shouldFailWrites = false
+        let (interaction, asked) = await pendingAskUser(harness)
+        let stored = await (lane.store.read(sessionID: lane.sessionID).record?.questions ?? []).map(\.interactionID)
+        XCTAssertEqual(stored, [interaction.id])
+        viewModel.skipAskUser(tabID: harness.tabID, interactionID: interaction.id)
+        _ = try await asked.value
+    }
+
     // MARK: - Harness
 
     /// Starts a real pending ask_user question (its continuation is the run's wait).
@@ -865,6 +1104,22 @@ final class AgentRecoveryResetBoundaryTests: XCTestCase {
         let pending = await RecoveryTestSupport.eventually { session.askUserContinuation != nil }
         XCTAssertTrue(pending, "the ask_user question is pending")
         return (interaction, asked)
+    }
+
+    /// Installs a native user-input request directly, as a producer without a live lane would: the
+    /// live question lane never created it, so only shutdown preparation writes it (R4 tracking).
+    private func installUntrackedUserInput(
+        _ harness: Harness,
+        _ name: String,
+        queued: Bool = false
+    ) -> AgentRequestUserInputRequest {
+        let request = Self.userInputRequest(name, questionIDs: ["target"])
+        if queued {
+            harness.session.queuedUserInputRequests.append(request)
+        } else {
+            harness.session.pendingUserInputRequest = request
+        }
+        return request
     }
 
     /// A question another owner preserved (as a closed window's Stage A would have written it).
@@ -1014,6 +1269,54 @@ final class AgentRecoveryResetBoundaryTests: XCTestCase {
         let session = try await viewModel.ensureSessionReady(tabID: tabID)
         XCTAssertNotNil(session.recoveryComposerObserver, "First-draft observation is installed at session creation")
         return Harness(viewModel: viewModel, workspace: workspace, tabID: tabID, session: session)
+    }
+}
+
+/// Store file operations that hold the first record write containing `marker` until released.
+private final class RecoveryStoreMarkerWriteHold: @unchecked Sendable {
+    private let lock = NSLock()
+    private let gate = DispatchSemaphore(value: 0)
+    private let marker: Data
+    private var armed = true
+    private var holding = false
+    private var released = false
+
+    init(marker: String) {
+        self.marker = Data(marker.utf8)
+    }
+
+    var isHolding: Bool {
+        lock.withLock { holding }
+    }
+
+    func fileOperations() -> AgentRecoveryStore.FileOperations {
+        AgentRecoveryStore.FileOperations(
+            writeAtomically: { [self] data, url in
+                let shouldHold = lock.withLock { () -> Bool in
+                    guard armed, !released, data.range(of: marker) != nil else { return false }
+                    armed = false
+                    holding = true
+                    return true
+                }
+                if shouldHold {
+                    gate.wait()
+                }
+                try data.write(to: url, options: .atomic)
+            },
+            removeItem: { url in try FileManager.default.removeItem(at: url) }
+        )
+    }
+
+    /// Idempotent.
+    func release() {
+        let wasHolding = lock.withLock { () -> Bool in
+            released = true
+            defer { holding = false }
+            return holding
+        }
+        if wasHolding {
+            gate.signal()
+        }
     }
 }
 

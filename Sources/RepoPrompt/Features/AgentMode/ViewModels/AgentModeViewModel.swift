@@ -664,8 +664,11 @@ final class AgentModeViewModel: ObservableObject {
     var recoveryCompositionFailure: String?
     /// Production composition's startup retry (nil when not composed by the app).
     var recoveryStartupRetry: (@MainActor () -> Void)?
-    /// Recovery-list row actions in flight or failed, keyed by row ID (see `+RecoveryList`).
-    var recoveryListRowStates: [String: AgentRecoveryListRowActionState] = [:]
+    /// A Needs Attention request this window's sheet host has not presented yet.
+    var recoveryNeedsAttentionRequestPending = false
+    /// Opens a recovery item's session in another workspace through the existing agent-session
+    /// navigation route (replaceable in tests; it never starts a provider).
+    var recoveryListRouteToSession: RecoveryListSessionRouter = AgentModeViewModel.routeRecoveryListSessionThroughDeepLinks
     /// Injection seam for scheduled dispatch: replaces `startAgentRun` so provider acceptance
     /// outcomes can be driven without a live provider. `nil` uses the real run path.
     var scheduledDispatchRunStarter: ScheduledDispatchRunStarter?
@@ -3848,7 +3851,7 @@ final class AgentModeViewModel: ObservableObject {
     /// runs exactly once. Nothing durable is withdrawn here: queued intents stay queued (teardown
     /// only resumes an instruction wait), preserved questions are not refreshed, and the run
     /// shutdown `reason` was recorded by Stage A (the legacy path records none).
-    func prepareForWindowClose(reason _: AgentRecoveryShutdownReason) async {
+    func prepareForWindowClose(reason: AgentRecoveryShutdownReason) async {
         if let windowCloseTeardownTask {
             await windowCloseTeardownTask.value
             return
@@ -3868,21 +3871,22 @@ final class AgentModeViewModel: ObservableObject {
         pendingRemoteStartWindowPicker = nil
         workspaceSwitchProvider.cancelAllBackgroundCleanup()
         cancelSessionIndexRefresh(releaseFrozenOrder: true)
+        let teardownCause = AgentRunTerminalCause(shutdownReason: reason)
         let task = Task { @MainActor [weak self] in
             guard let self else { return }
-            await performWindowCloseTeardown()
+            await performWindowCloseTeardown(cause: teardownCause)
         }
         windowCloseTeardownTask = task
         await task.value
     }
 
-    private func performWindowCloseTeardown() async {
+    private func performWindowCloseTeardown(cause: AgentRunTerminalCause) async {
         let tabIDs = Array(sessions.keys)
         await withTaskGroup(of: Void.self) { group in
             for tabID in tabIDs {
                 group.addTask { @MainActor [weak self] in
                     guard let self, let session = sessions[tabID] else { return }
-                    await prepareSessionForWindowClose(session)
+                    await prepareSessionForWindowClose(session, teardownCause: cause)
                 }
             }
         }
@@ -3901,7 +3905,15 @@ final class AgentModeViewModel: ObservableObject {
         )
     }
 
-    private func prepareSessionForWindowClose(_ session: AgentTabSession) async {
+    private func prepareSessionForWindowClose(
+        _ session: AgentTabSession,
+        teardownCause: AgentRunTerminalCause
+    ) async {
+        // Before any cancellation: a runner that commits first after its task is cancelled still
+        // records the lifecycle cause (Stage A only recorded the provisional shutdown reason).
+        if session.lifecycleTeardownCause == nil {
+            session.lifecycleTeardownCause = teardownCause
+        }
         removePendingUIRefresh(for: session.tabID)
         cancelPersistedLoad(for: session)
         // The window close was confirmed upstream (its impact sheet listed unsaved conversations).
@@ -3923,7 +3935,7 @@ final class AgentModeViewModel: ObservableObject {
         cancelPendingInstruction(for: session)
         await teardownMCPControl(for: session, cleanupSessionStore: true)
         if session.runState.isActive {
-            await cancelAgentRun(tabID: session.tabID)
+            await cancelAgentRun(tabID: session.tabID, cause: teardownCause)
         }
         await cleanupACPStateForDeletedSession(session)
         await session.disposeProviderIfPresent()
@@ -6581,6 +6593,9 @@ final class AgentModeViewModel: ObservableObject {
             resolvedAt: Date()
         )
         refreshRecoveryQuestionSnapshotsAfterLiveResolution(for: session, interactionID: interactionID)
+        // After the reply ran: exactly this interaction's live snapshot is removed (retried, never
+        // re-replied, if the removal fails).
+        endRecoveryQuestions(for: session, [interactionID])
         guard session.mcpControlContext != nil else { return }
         wakeCurrentMCPWaitersForInteractionResolutionFireAndForget(for: session)
     }
@@ -8278,9 +8293,11 @@ final class AgentModeViewModel: ObservableObject {
                         cancelPendingInstruction(for: session)
                         // Terminal publication synchronously detaches the old provider/controller,
                         // so rebinding does not wait on potentially non-cooperative teardown.
+                        // The user confirmed stopping the active run to change location.
                         await runService.cancelRun(
                             tabID: session.tabID,
                             session: session,
+                            cause: .userCancel,
                             intent: .executionLocationChange,
                             completion: .terminalPublished
                         )
@@ -13115,7 +13132,7 @@ final class AgentModeViewModel: ObservableObject {
             )
         }
         for session in sessions.values where session.runState.isActive {
-            await cancelAgentRun(tabID: session.tabID)
+            await cancelAgentRun(tabID: session.tabID, cause: .ordinary)
         }
         claudeCoordinator.detachAllClaudeToolTrackingHandlersForWorkspaceSwitch()
         codexCoordinator.stop()
@@ -13854,15 +13871,17 @@ final class AgentModeViewModel: ObservableObject {
             if session.remoteHost != nil {
                 await retireRemoteIngestion(for: session)
             } else if session.runState.isActive {
+                // Closing the tab is the user's confirmed stop of its run.
                 _ = await cancelAgentRun(
                     target: makeRunCancelTarget(tabID: tabID, session: session),
+                    cause: .userCancel,
                     completion: .terminalTeardownCompleted
                 )
             } else if isTabRunning(tabID)
                 || session.activeRunOwnership != nil
                 || session.terminalCommitInProgress
             {
-                await cancelAgentRun(tabID: tabID, completion: .terminalTeardownCompleted)
+                await cancelAgentRun(tabID: tabID, cause: .userCancel, completion: .terminalTeardownCompleted)
             }
             guard ownerStillCurrent(target) else {
                 abortComposeTabRemoval(operation, vetoedTabIDs: [tabID])
@@ -17033,7 +17052,7 @@ final class AgentModeViewModel: ObservableObject {
             if session.selectedAgent.usesClaudeNativeRuntime, !attachmentsToSend.isEmpty {
                 Task { [weak self] in
                     guard let self else { return }
-                    await cancelAgentRun(tabID: tabID)
+                    await cancelAgentRun(tabID: tabID, cause: .ordinary)
                     await startAgentRun(
                         tabID: tabID,
                         initialMessage: wrappedText,
@@ -19934,6 +19953,7 @@ final class AgentModeViewModel: ObservableObject {
     /// Callers that destroy provider-owned infrastructure can explicitly await terminal teardown.
     func cancelAgentRun(
         tabID: UUID,
+        cause: AgentRunTerminalCause,
         completion: AgentModeRunService.CancellationCompletion = .terminalPublished
     ) async {
         guard let session = sessions[tabID] else { return }
@@ -19948,7 +19968,7 @@ final class AgentModeViewModel: ObservableObject {
             }
             return
         }
-        await runService.cancelRun(tabID: tabID, session: session, completion: completion)
+        await runService.cancelRun(tabID: tabID, session: session, cause: cause, completion: completion)
     }
 
     /// Cancel a render-time run target, refusing if the live tab no longer matches that target.
@@ -19956,6 +19976,7 @@ final class AgentModeViewModel: ObservableObject {
     @discardableResult
     func cancelAgentRun(
         target: AgentRunCancelTarget,
+        cause: AgentRunTerminalCause,
         completion: AgentModeRunService.CancellationCompletion = .terminalPublished
     ) async -> Bool {
         guard let session = sessions[target.tabID] else {
@@ -19987,7 +20008,7 @@ final class AgentModeViewModel: ObservableObject {
             return false
         }
         cancelPendingInstruction(for: session)
-        await runService.cancelRun(tabID: target.tabID, session: session, completion: completion)
+        await runService.cancelRun(tabID: target.tabID, session: session, cause: cause, completion: completion)
         return true
     }
 
@@ -20432,6 +20453,7 @@ final class AgentModeViewModel: ObservableObject {
                     await runService.cancelRun(
                         tabID: session.tabID,
                         session: session,
+                        cause: .ordinary,
                         intent: .userStop,
                         completion: .terminalPublished
                     )
@@ -20720,6 +20742,8 @@ final class AgentModeViewModel: ObservableObject {
             interaction: interaction,
             timeoutStartedAt: interaction.askedAt
         )
+        // Durable before it is shown (plan §E); ownership and blocking rules are revalidated.
+        try await commitAskUserForRecovery(pending, session: session, tabID: tabID)
         session.pendingAskUser = pending
         reconcileInteractiveRunState(session)
         updateBindingsFromSession(session)
@@ -20746,8 +20770,8 @@ final class AgentModeViewModel: ObservableObject {
         }
     }
 
-    private func rejectAskUserIfBlockingInteractionExists(in session: AgentTabSession) throws {
-        if session.pendingAskUser != nil {
+    func rejectAskUserIfBlockingInteractionExists(in session: AgentTabSession) throws {
+        if session.pendingAskUser != nil || session.recoveryQuestionCreationReservation != nil {
             throw MCPError.invalidParams("ask_user is already waiting for a response in this session.")
         }
         if session.pendingApproval != nil || session.pendingPermissionsRequest != nil || session.pendingApplyEditsReview != nil || session.pendingWorktreeMergeReview != nil {
@@ -20767,12 +20791,15 @@ final class AgentModeViewModel: ObservableObject {
         guard let session = sessions[tabID],
               var pending = session.pendingAskUser,
               pending.interaction.id == interactionID,
-              pending.interaction.questions.contains(where: { $0.id == questionID })
+              pending.interaction.questions.contains(where: { $0.id == questionID }),
+              // An answer is flushing before its reply: the submitted answer stays the latest.
+              !isRecoveryQuestionResolutionReserved(session, interactionID: interactionID)
         else { return }
         guard pending.draftsByQuestionID[questionID] != draft else { return }
         pending.draftsByQuestionID[questionID] = draft
         session.pendingAskUser = pending
         updateBindingsFromSession(session)
+        noteRecoveryQuestionDraftChanged(for: session, interactionID: interactionID)
     }
 
     func updateAskUserQuestionIndex(tabID: UUID, interactionID: UUID, index: Int) {
@@ -20836,7 +20863,9 @@ final class AgentModeViewModel: ObservableObject {
                   session.pendingAskUserTimeoutGeneration == generation,
                   let pending = session.pendingAskUser,
                   pending.interaction.id == interactionID,
-                  let continuation = session.askUserContinuation
+                  let continuation = session.askUserContinuation,
+                  // A submitted answer is flushing before its reply: the answer wins.
+                  !isRecoveryQuestionResolutionReserved(session, interactionID: interactionID)
             else { return }
 
             session.pendingInteractionResolutionAttribution = "timeout"
@@ -20870,7 +20899,9 @@ final class AgentModeViewModel: ObservableObject {
 
     func submitAskUserResponse(tabID: UUID, interactionID: UUID) {
         guard !isShutdownFrozen else { return }
-        guard let session = sessions[tabID], session.pendingAskUser?.interaction.id == interactionID else { return }
+        guard let session = sessions[tabID], session.pendingAskUser?.interaction.id == interactionID,
+              !isRecoveryQuestionResolutionReserved(session, interactionID: interactionID)
+        else { return }
         do {
             if session.remoteHost != nil {
                 try resolveRemoteAskUserResponse(for: session, interactionID: interactionID, skipAll: false)
@@ -20887,7 +20918,8 @@ final class AgentModeViewModel: ObservableObject {
         guard !isShutdownFrozen else { throw AgentModeShutdownAnswerRefused() }
         guard let session = sessions[tabID],
               var pending = session.pendingAskUser,
-              pending.interaction.id == interactionID
+              pending.interaction.id == interactionID,
+              !isRecoveryQuestionResolutionReserved(session, interactionID: interactionID)
         else { return }
         pending.draftsByQuestionID = draftsByQuestionID
         session.pendingAskUser = pending
@@ -20900,7 +20932,9 @@ final class AgentModeViewModel: ObservableObject {
 
     func skipAskUser(tabID: UUID, interactionID: UUID) {
         guard !isShutdownFrozen else { return }
-        guard let session = sessions[tabID], session.pendingAskUser?.interaction.id == interactionID else { return }
+        guard let session = sessions[tabID], session.pendingAskUser?.interaction.id == interactionID,
+              !isRecoveryQuestionResolutionReserved(session, interactionID: interactionID)
+        else { return }
         if session.remoteHost != nil {
             try? resolveRemoteAskUserResponse(for: session, interactionID: interactionID, skipAll: true)
         } else {
@@ -20917,6 +20951,35 @@ final class AgentModeViewModel: ObservableObject {
 
         let response = try buildAskUserResponse(from: pending, skipAll: skipAll)
 
+        // A submitted answer is made durable before the reply (a skip has nothing to save).
+        if !skipAll, resolveAfterRecoveryQuestionFlush(
+            for: session,
+            interactionID: interactionID,
+            resolve: { [weak self] session in
+                guard let self,
+                      let pending = session.pendingAskUser,
+                      pending.interaction.id == interactionID,
+                      let continuation = session.askUserContinuation,
+                      let response = try? buildAskUserResponse(from: pending, skipAll: false)
+                else { return }
+                completeAskUserResolution(for: session, interactionID: interactionID, response: response, continuation: continuation)
+            },
+            notSent: { [weak self] session in
+                self?.rearmAskUserTimeoutAfterAbandonedAnswer(session, interactionID: interactionID)
+            }
+        ) {
+            return
+        }
+        completeAskUserResolution(for: session, interactionID: interactionID, response: response, continuation: continuation)
+    }
+
+    /// The existing `ask_user` reply, run exactly once per resolution.
+    private func completeAskUserResolution(
+        for session: AgentTabSession,
+        interactionID: UUID,
+        response: AgentAskUserResponse,
+        continuation: CheckedContinuation<AgentAskUserResponse, Error>
+    ) {
         invalidatePendingAskUserTimeout(for: session)
         session.pendingAskUser = nil
         session.askUserContinuation = nil
@@ -20986,7 +21049,8 @@ final class AgentModeViewModel: ObservableObject {
         guard !isShutdownFrozen else { return }
         guard let session = sessions[tabID],
               let request = session.pendingUserInputRequest,
-              request.requestID == requestID
+              request.requestID == requestID,
+              !isRecoveryQuestionResolutionReserved(session, interactionID: request.id)
         else {
             return
         }
@@ -20998,7 +21062,24 @@ final class AgentModeViewModel: ObservableObject {
             requestUIRefresh(tabID: tabID, urgent: true)
             return
         }
-        codexCoordinator.submitUserInputResponse(session: session, requestID: requestID, response: response)
+        // The latest non-secret answers are made durable before the reply.
+        if resolveAfterRecoveryQuestionFlush(for: session, interactionID: request.id, resolve: { [weak self] session in
+            guard let self, session.pendingUserInputRequest?.id == request.id else { return }
+            completeUserInputResponse(for: session, request: request, response: response)
+        }) {
+            return
+        }
+        completeUserInputResponse(for: session, request: request, response: response)
+    }
+
+    /// The existing native user-input reply, run exactly once per resolution.
+    private func completeUserInputResponse(
+        for session: AgentTabSession,
+        request: AgentRequestUserInputRequest,
+        response: AgentRequestUserInputResponse
+    ) {
+        let tabID = session.tabID
+        codexCoordinator.submitUserInputResponse(session: session, requestID: request.requestID, response: response)
         session.pendingUserInputRequest = nil
         if !session.queuedUserInputRequests.isEmpty {
             session.pendingUserInputRequest = session.queuedUserInputRequests.removeFirst()
@@ -21011,6 +21092,16 @@ final class AgentModeViewModel: ObservableObject {
     }
 
     private func cancelPendingQuestion(for session: AgentTabSession) {
+        // Ended questions: removed, unless lifecycle teardown preserves them. A pending native
+        // user-input request is not cleared here, so it is not ended either.
+        var endedQuestions = Set(session.queuedUserInputRequests.map(\.id) + session.queuedMCPElicitationRequests.map(\.id))
+        if let pending = session.pendingAskUser { endedQuestions.insert(pending.interaction.id) }
+        if let request = session.pendingMCPElicitationRequest { endedQuestions.insert(request.id) }
+        if let reserved = session.recoveryQuestionCreationReservation {
+            // An ask_user still being saved is cancelled too (its creation sees the cleared reservation).
+            endedQuestions.insert(reserved)
+            session.recoveryQuestionCreationReservation = nil
+        }
         invalidatePendingAskUserTimeout(for: session)
         let continuation = session.askUserContinuation
         session.askUserContinuation = nil
@@ -21021,11 +21112,15 @@ final class AgentModeViewModel: ObservableObject {
         session.queuedMCPElicitationRequests.removeAll()
         reconcileInteractiveRunState(session)
         reconcileDelegatedQuestionNotices(trigger: "askUserCancelled")
+        endRecoveryQuestions(for: session, endedQuestions)
         continuation?.resume(throwing: CancellationError())
         publishRunInteractionStateChange(for: session, reason: .pendingQuestionCancelled)
     }
 
     private func cancelPendingApproval(for session: AgentTabSession) {
+        var endedQuestions = Set(session.queuedMCPElicitationRequests.map(\.id))
+        if let request = session.pendingMCPElicitationRequest { endedQuestions.insert(request.id) }
+        endRecoveryQuestions(for: session, endedQuestions)
         session.pendingApproval = nil
         session.pendingPermissionsRequest = nil
         session.pendingMCPElicitationRequest = nil

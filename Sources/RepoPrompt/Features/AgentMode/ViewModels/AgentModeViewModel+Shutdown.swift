@@ -198,7 +198,8 @@ extension AgentModeViewModel {
               let session = sessions[tabID],
               let request = session.pendingUserInputRequest,
               request.id == requestID,
-              request.questions.contains(where: { $0.id == questionID })
+              request.questions.contains(where: { $0.id == questionID }),
+              !isRecoveryQuestionResolutionReserved(session, interactionID: requestID)
         else { return }
         var state = session.pendingUserInputDrafts?.requestID == requestID
             ? session.pendingUserInputDrafts ?? AgentRequestUserInputDraftState(requestID: requestID)
@@ -206,6 +207,8 @@ extension AgentModeViewModel {
         guard state.draftsByQuestionID[questionID] != draft else { return }
         state.draftsByQuestionID[questionID] = draft
         session.pendingUserInputDrafts = state
+        // A secret answer never reaches the snapshot, so it never schedules a changed write.
+        noteRecoveryQuestionDraftChanged(for: session, interactionID: requestID)
     }
 
     // MARK: Stage A

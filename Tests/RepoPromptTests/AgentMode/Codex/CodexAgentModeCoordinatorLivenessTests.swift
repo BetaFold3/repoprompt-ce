@@ -1095,6 +1095,370 @@ final class CodexAgentModeCoordinatorLivenessTests: XCTestCase {
         XCTAssertEqual(session.queuedUserInputRequests.map(\.requestID), [queued.requestID])
     }
 
+    // MARK: Native question creation (plan §E; review A F02 / B F3, F11, F17)
+
+    private enum NativeQuestionKind: String, CaseIterable {
+        case userInput
+        case elicitation
+    }
+
+    private struct NativeQuestion {
+        let event: CodexNativeSessionController.Event
+        let interactionID: UUID
+    }
+
+    private func nativeQuestion(_ kind: NativeQuestionKind, id: String, turnID: String = "turn") -> NativeQuestion {
+        switch kind {
+        case .userInput:
+            let request = makeUserInputRequest(id: id, threadID: "fake", turnID: turnID)
+            return NativeQuestion(event: .requestUserInput(request), interactionID: request.id)
+        case .elicitation:
+            let request = AgentMCPElicitationRequest(
+                requestID: .string(id),
+                method: "mcpServer/elicitation/request",
+                threadID: "fake",
+                turnID: turnID,
+                itemID: id,
+                serverName: "server",
+                message: "Continue?",
+                rawParamsJSON: "{}"
+            )
+            return NativeQuestion(event: .mcpElicitationRequest(request), interactionID: request.id)
+        }
+    }
+
+    /// Shown (active) first, then queued, per kind.
+    private func shownAndQueued(_ kind: NativeQuestionKind, _ session: AgentTabSession) -> (shown: UUID?, queued: [UUID]) {
+        switch kind {
+        case .userInput:
+            (session.pendingUserInputRequest?.id, session.queuedUserInputRequests.map(\.id))
+        case .elicitation:
+            (session.pendingMCPElicitationRequest?.id, session.queuedMCPElicitationRequests.map(\.id))
+        }
+    }
+
+    /// The actual Codex producers commit the snapshot before the request is shown or queued: while
+    /// the creation write is held nothing is published; after it commits the stored snapshot exists
+    /// and the request is queued behind the active one. No reply is sent.
+    func testNativeQuestionIsCommittedBeforeItIsShownOrQueued() async throws {
+        for kind in NativeQuestionKind.allCases {
+            let writes = CodexQuestionWriteControl()
+            let fixture = try await RecoveryLaneFixture.make("codex-question-order-\(kind.rawValue)", fileOperations: writes.fileOperations())
+            defer { fixture.tearDown() }
+            let controller = LivenessFakeCodexController(snapshot: .active(activeFlags: []))
+            let viewModel = makeViewModel(controller: controller)
+            guard let session = preparedCodexSession(in: viewModel, controller: controller, recoveryLane: fixture.lane) else {
+                return XCTFail("Expected the Codex test session to materialize")
+            }
+            let first = nativeQuestion(kind, id: "first-\(kind.rawValue)")
+            let second = nativeQuestion(kind, id: "second-\(kind.rawValue)")
+
+            await viewModel.test_codexCoordinator.test_handleCodexNativeEvent(first.event, session: session)
+            XCTAssertEqual(shownAndQueued(kind, session).shown, first.interactionID, "\(kind)")
+
+            writes.holdNextWrite()
+            let handling = Task { @MainActor in
+                await viewModel.test_codexCoordinator.test_handleCodexNativeEvent(second.event, session: session)
+            }
+            try await waitUntil { writes.isHolding }
+            XCTAssertEqual(shownAndQueued(kind, session).queued, [], "\(kind): not queued before its snapshot commits")
+            writes.release()
+            await handling.value
+
+            XCTAssertEqual(shownAndQueued(kind, session).shown, first.interactionID, "\(kind)")
+            XCTAssertEqual(shownAndQueued(kind, session).queued, [second.interactionID], "\(kind)")
+            let stored = await fixture.store.read(sessionID: fixture.sessionID).record?.questions.map(\.interactionID) ?? []
+            XCTAssertEqual(Set(stored), [first.interactionID, second.interactionID], "\(kind)")
+            XCTAssertEqual(fixture.lane.questionPersistence.liveInteractionIDs, [first.interactionID, second.interactionID], "\(kind)")
+            XCTAssertTrue(controller.serverResponseIDs.isEmpty, "\(kind)")
+            XCTAssertTrue(session.runState.isActive, "\(kind): the run waits for the question")
+        }
+    }
+
+    /// A failed creation write is never shown or queued and never answered: the snapshot is
+    /// withdrawn, the lane surfaces a question save-failure catalog item, and the run takes the
+    /// existing producer failure path with a generic error. An explicit Retry with nothing left
+    /// unsaved settles the item.
+    func testNativeQuestionCreationWriteFailureFailsRunWithoutShowingOrReplying() async throws {
+        for kind in NativeQuestionKind.allCases {
+            let writes = CodexQuestionWriteControl()
+            let fixture = try await RecoveryLaneFixture.make("codex-question-fail-\(kind.rawValue)", fileOperations: writes.fileOperations())
+            defer { fixture.tearDown() }
+            let controller = LivenessFakeCodexController(snapshot: .active(activeFlags: []))
+            let viewModel = makeViewModel(controller: controller)
+            guard let session = preparedCodexSession(in: viewModel, controller: controller, recoveryLane: fixture.lane) else {
+                return XCTFail("Expected the Codex test session to materialize")
+            }
+            let question = nativeQuestion(kind, id: "fail-\(kind.rawValue)")
+            let saveFailureItemID = AgentRecoveryCatalogProjection.questionSaveFailureItemID(sessionID: fixture.sessionID)
+            writes.failNextWrite()
+
+            await viewModel.test_codexCoordinator.test_handleCodexNativeEvent(question.event, session: session)
+
+            XCTAssertTrue(AgentRecoveryLiveQuestions.liveInteractionIDs(of: session).isEmpty, "\(kind): never shown or queued")
+            try await waitUntil { session.runState == .failed }
+            XCTAssertTrue(
+                session.items.contains { $0.kind == .error && $0.text == CodexAgentModeCoordinator.unsavedQuestionRunFailureMessage },
+                "\(kind): the run fails with the generic message"
+            )
+            XCTAssertTrue(controller.serverResponseIDs.isEmpty, "\(kind): no reply is synthesized")
+            try await waitUntil { !controller.interruptedTurnIDs.isEmpty }
+            XCTAssertEqual(controller.interruptedTurnIDs, ["turn"], "\(kind): exactly the asking turn is interrupted")
+            XCTAssertEqual(controller.cancelCurrentTurnCount, 0, "\(kind)")
+            let questions = fixture.lane.questionPersistence
+            XCTAssertNotNil(questions.lastWriteFailure, "\(kind)")
+            XCTAssertFalse(questions.liveInteractionIDs.contains(question.interactionID), "\(kind)")
+            XCTAssertFalse(questions.hasPendingWork, "\(kind): the withdrawn snapshot is not retried")
+            let stored = await fixture.store.read(sessionID: fixture.sessionID).record?.questions ?? []
+            XCTAssertTrue(stored.isEmpty, "\(kind)")
+            XCTAssertTrue(fixture.coordinator.catalog.items.contains { $0.id == saveFailureItemID }, "\(kind): the save error is visible")
+
+            let retried = await questions.flush()
+            XCTAssertEqual(retried, .nothingPending)
+            XCTAssertNil(questions.lastWriteFailure, "\(kind)")
+            XCTAssertFalse(fixture.coordinator.catalog.items.contains { $0.id == saveFailureItemID }, "\(kind)")
+        }
+    }
+
+    /// Review R2 (A F11-R2): a replacement run attempt starts during the failed run's finalization
+    /// (inside the terminal publication, after the failed attempt ended), with no authoritative turn
+    /// ID captured initially. Only the asking request's exact turn is interrupted, never the
+    /// replacement's turn and never through an unscoped current-turn interrupt; with no known
+    /// identity nothing is interrupted. The failure stays visible and the replacement keeps running.
+    func testUnsavedQuestionFailureInterruptsOnlyTheAskingTurnWhenAReplacementStartsDuringFinalization() async throws {
+        for kind in NativeQuestionKind.allCases {
+            for askingTurnKnown in [true, false] {
+                let label = "\(kind)/asking-turn-known:\(askingTurnKnown)"
+                let writes = CodexQuestionWriteControl()
+                let fixture = try await RecoveryLaneFixture.make("codex-question-finalize-\(kind.rawValue)-\(askingTurnKnown)", fileOperations: writes.fileOperations())
+                defer { fixture.tearDown() }
+                let controller = LivenessFakeCodexController(snapshot: .active(activeFlags: []))
+                let viewModel = makeViewModel(controller: controller)
+                guard let session = preparedCodexSession(in: viewModel, controller: controller, recoveryLane: fixture.lane) else {
+                    return XCTFail("Expected the Codex test session to materialize")
+                }
+                session.codexAuthoritativeActiveTurn = nil
+                let replacementRunID = UUID()
+                var replacementStarted = false
+                viewModel.test_setTerminalPublicationOverride { _, _, published in
+                    if !replacementStarted, published === session, !session.runState.isActive {
+                        replacementStarted = true
+                        session.runID = replacementRunID
+                        session.runState = .running
+                        let ownership = session.beginRunAttempt(source: "test.replacementDuringFinalization")
+                        session.codexAuthoritativeActiveTurn = .init(
+                            threadID: "fake",
+                            turnID: "replacement-turn",
+                            turnKind: .user,
+                            controllerInstanceID: ObjectIdentifier(controller),
+                            controllerGeneration: session.codexControllerGeneration,
+                            runID: replacementRunID,
+                            runAttemptID: ownership.attemptID
+                        )
+                    }
+                    return .accepted(successorEpoch: nil)
+                }
+                let question = nativeQuestion(kind, id: "finalize-\(kind.rawValue)", turnID: askingTurnKnown ? "asking-turn" : "")
+                writes.failNextWrite()
+
+                await viewModel.test_codexCoordinator.test_handleCodexNativeEvent(question.event, session: session)
+                viewModel.test_setTerminalPublicationOverride(nil)
+
+                XCTAssertTrue(replacementStarted, "\(label): the replacement started during finalization")
+                XCTAssertEqual(session.runID, replacementRunID, label)
+                XCTAssertTrue(session.runState.isActive, "\(label): the replacement keeps running")
+                XCTAssertTrue(
+                    session.items.contains { $0.kind == .error && $0.text == CodexAgentModeCoordinator.unsavedQuestionRunFailureMessage },
+                    "\(label): the failure stays visible"
+                )
+                XCTAssertTrue(controller.serverResponseIDs.isEmpty, label)
+                if askingTurnKnown {
+                    try await waitUntil { !controller.interruptedTurnIDs.isEmpty }
+                } else {
+                    try await Task.sleep(nanoseconds: 100_000_000)
+                }
+                XCTAssertEqual(controller.interruptedTurnIDs, askingTurnKnown ? ["asking-turn"] : [], "\(label): only the asking turn")
+                XCTAssertEqual(controller.cancelCurrentTurnCount, 0, "\(label): never an unscoped current-turn interrupt")
+            }
+        }
+    }
+
+    /// A replacement run attempt that takes the tab while the creation write is suspended (the run
+    /// stays active, so an active-run-only fence would pass) must not receive the old request: it is
+    /// neither shown nor queued nor answered, and its snapshot's exact removal is written.
+    func testNativeQuestionSuspendedAcrossRunReplacementIsNotShownAndItsSnapshotEnds() async throws {
+        for kind in NativeQuestionKind.allCases {
+            let writes = CodexQuestionWriteControl()
+            let fixture = try await RecoveryLaneFixture.make("codex-question-replaced-\(kind.rawValue)", fileOperations: writes.fileOperations())
+            defer { fixture.tearDown() }
+            let controller = LivenessFakeCodexController(snapshot: .active(activeFlags: []))
+            let viewModel = makeViewModel(controller: controller)
+            guard let session = preparedCodexSession(in: viewModel, controller: controller, recoveryLane: fixture.lane) else {
+                return XCTFail("Expected the Codex test session to materialize")
+            }
+            let question = nativeQuestion(kind, id: "replaced-\(kind.rawValue)")
+            writes.holdNextWrite()
+            let handling = Task { @MainActor in
+                await viewModel.test_codexCoordinator.test_handleCodexNativeEvent(question.event, session: session)
+            }
+            try await waitUntil { writes.isHolding }
+            XCTAssertTrue(session.endCurrentRunAttempt(source: "test.replacement"))
+            session.runID = UUID()
+            session.beginRunAttempt(source: "test.replacement")
+            XCTAssertTrue(session.runState.isActive)
+            writes.release()
+            await handling.value
+
+            XCTAssertTrue(AgentRecoveryLiveQuestions.liveInteractionIDs(of: session).isEmpty, "\(kind): not shown in the replacement run")
+            XCTAssertTrue(controller.serverResponseIDs.isEmpty, "\(kind)")
+            XCTAssertEqual(session.runState, .running, "\(kind): the replacement run is untouched")
+            XCTAssertTrue(controller.interruptedTurnIDs.isEmpty && controller.cancelCurrentTurnCount == 0, "\(kind): the replacement turn is not interrupted")
+            let questions = fixture.lane.questionPersistence
+            XCTAssertFalse(questions.liveInteractionIDs.contains(question.interactionID), "\(kind)")
+            try await waitUntil { !questions.committedInteractionIDs.contains(question.interactionID) && questions.owedRemovals.isEmpty }
+            let stored = await fixture.store.read(sessionID: fixture.sessionID).record?.questions ?? []
+            XCTAssertTrue(stored.isEmpty, "\(kind): its exact removal is written")
+            XCTAssertNil(questions.lastWriteFailure, "\(kind)")
+        }
+    }
+
+    private enum LaneHandOver: String, CaseIterable {
+        case release
+        case successorClaim
+    }
+
+    /// Review R1-F2 (P2): the recovery lane is handed over while the same run waits on the creation
+    /// write (no lifecycle teardown): released, or (review R2, B R2-F1) replaced by a real same-owner
+    /// successor claim. The retired controller cannot keep the question live, so the request is never
+    /// shown or answered, the successor never adopts the never-published creation, and the run is not
+    /// left active and unanswered: it fails loudly with the generic message and exactly the asking
+    /// provider turn is interrupted.
+    func testNativeQuestionLaneHandOverDuringCreationFailsTheRunLoudlyAndInterruptsTheProvider() async throws {
+        for kind in NativeQuestionKind.allCases {
+            for handOver in LaneHandOver.allCases {
+                try await assertNativeQuestionLaneHandOverDuringCreation(kind: kind, handOver: handOver)
+            }
+        }
+    }
+
+    private func assertNativeQuestionLaneHandOverDuringCreation(kind: NativeQuestionKind, handOver: LaneHandOver) async throws {
+        let label = "\(kind)/\(handOver)"
+        do {
+            let writes = CodexQuestionWriteControl()
+            let fixture = try await RecoveryLaneFixture.make("codex-question-handover-\(kind.rawValue)-\(handOver.rawValue)", fileOperations: writes.fileOperations())
+            defer { fixture.tearDown() }
+            let controller = LivenessFakeCodexController(snapshot: .active(activeFlags: []))
+            let viewModel = makeViewModel(controller: controller)
+            guard let session = preparedCodexSession(in: viewModel, controller: controller, recoveryLane: fixture.lane) else {
+                return XCTFail("Expected the Codex test session to materialize")
+            }
+            let question = nativeQuestion(kind, id: "handover-\(kind.rawValue)")
+            let relocatedState = handOver == .successorClaim ? try await fixture.relocatedPersistenceState() : nil
+            writes.holdNextWrite()
+            let handling = Task { @MainActor in
+                await viewModel.test_codexCoordinator.test_handleCodexNativeEvent(question.event, session: session)
+            }
+            try await waitUntil { writes.isHolding }
+            var successor: AgentRecoverySessionLane?
+            switch handOver {
+            case .release:
+                fixture.coordinator.releaseLane(fixture.lane)
+                XCTAssertNil(AgentRecoveryLiveQuestions.lane(for: session), "\(label): the session's lane was handed over")
+            case .successorClaim:
+                let claimed = try fixture.claimSuccessor(persistenceState: XCTUnwrap(relocatedState))
+                XCTAssertFalse(claimed === fixture.lane, "\(label): a real successor lane")
+                XCTAssertTrue(fixture.lane.isRetired, "\(label): the predecessor retires")
+                session.recoveryLane = claimed
+                successor = claimed
+                XCTAssertFalse(
+                    claimed.questionPersistence.liveInteractionIDs.contains(question.interactionID),
+                    "\(label): a creation still in flight is not handed over"
+                )
+            }
+            XCTAssertTrue(session.runState.isActive, "\(label): the same run still holds the session")
+            XCTAssertNil(session.lifecycleTeardownCause, "\(label)")
+            writes.release()
+            await handling.value
+
+            XCTAssertTrue(AgentRecoveryLiveQuestions.liveInteractionIDs(of: session).isEmpty, "\(label): never shown or queued")
+            try await waitUntil { session.runState == .failed }
+            XCTAssertTrue(
+                session.items.contains { $0.kind == .error && $0.text == CodexAgentModeCoordinator.unsavedQuestionRunFailureMessage },
+                "\(label): the run fails loudly with the generic message"
+            )
+            XCTAssertTrue(controller.serverResponseIDs.isEmpty, "\(label): no reply is synthesized")
+            if let successor {
+                XCTAssertFalse(
+                    successor.questionPersistence.liveInteractionIDs.contains(question.interactionID),
+                    "\(label): the successor never presents the request as live"
+                )
+            }
+            try await waitUntil { !controller.interruptedTurnIDs.isEmpty }
+            XCTAssertEqual(controller.interruptedTurnIDs, ["turn"], "\(label): exactly the asking turn is interrupted")
+            XCTAssertEqual(controller.cancelCurrentTurnCount, 0, "\(label): never an unscoped current-turn interrupt")
+        }
+    }
+
+    /// Review R2 (B R2-F1), through a real same-owner successor claim: a committed question's draft
+    /// still unsaved (here carried by a held write) is handed over and preserved by the successor
+    /// after the predecessor retires, while a creation still in flight is not adopted as live.
+    func testSuccessorClaimAdoptsCommittedQuestionDraftButNotAnInFlightCreation() async throws {
+        let writes = CodexQuestionWriteControl()
+        let fixture = try await RecoveryLaneFixture.make("codex-question-successor-claim", fileOperations: writes.fileOperations())
+        defer { fixture.tearDown() }
+        let questions = fixture.lane.questionPersistence
+        let committed = UUID()
+        let creating = UUID()
+        func snapshot(_ id: UUID, answer: String?) -> AgentRecoveryQuestionSnapshot {
+            AgentRecoveryQuestionSnapshot(
+                interactionID: id,
+                kind: .userInput,
+                runAttemptID: nil,
+                transcriptResetGeneration: fixture.lane.binding.transcriptResetGeneration,
+                appInstanceID: fixture.store.appInstanceID,
+                askedAt: AgentRecoveryTimestamp(millisecondsSince1970: 1000),
+                title: "Deploy?",
+                message: nil,
+                items: [AgentRecoveryQuestionItem(
+                    questionID: "target",
+                    header: nil,
+                    text: "Which environment?",
+                    options: [],
+                    isSecret: false,
+                    answer: answer
+                )]
+            )
+        }
+        guard case .success = await questions.commitCreation(snapshot(committed, answer: nil)) else {
+            return XCTFail("the first question's creation commits")
+        }
+        let relocatedState = try await fixture.relocatedPersistenceState()
+
+        writes.holdNextWrite()
+        questions.draftDidChange(snapshot(committed, answer: "unsaved draft"))
+        let creation = Task { @MainActor in await questions.commitCreation(snapshot(creating, answer: nil)) }
+        try await waitUntil { writes.isHolding }
+        XCTAssertTrue(questions.needsPreservation(committed), "the draft is not durable yet")
+
+        let successor = try fixture.claimSuccessor(persistenceState: relocatedState)
+        XCTAssertFalse(successor === fixture.lane)
+        XCTAssertTrue(fixture.lane.isRetired)
+        let adopted = successor.questionPersistence
+        XCTAssertEqual(adopted.liveInteractionIDs, [committed], "only the committed question is handed over")
+        XCTAssertTrue(adopted.needsPreservation(committed), "its handed-over draft is pending in the successor")
+
+        writes.release()
+        _ = await creation.value
+        try await waitUntil { !adopted.needsPreservation(committed) && !adopted.hasPendingWork }
+        let stored = await fixture.store.read(sessionID: fixture.sessionID).record?.questions ?? []
+        XCTAssertEqual(
+            stored.first { $0.interactionID == committed }?.items.first?.answer,
+            "unsaved draft",
+            "the successor preserved the committed question's draft"
+        )
+        XCTAssertFalse(adopted.liveInteractionIDs.contains(creating), "the in-flight creation never becomes live in the successor")
+    }
+
     func testInactiveCommandRunningOutputWithoutAnchorCreatesMinimalAnchorOnly() async throws {
         let controller = LivenessFakeCodexController(snapshot: .active(activeFlags: []))
         let viewModel = makeViewModel(controller: controller)
@@ -1994,12 +2358,12 @@ final class CodexAgentModeCoordinatorLivenessTests: XCTestCase {
         return session
     }
 
-    private func makeUserInputRequest(id: String) -> AgentRequestUserInputRequest {
+    private func makeUserInputRequest(id: String, threadID: String = "thread", turnID: String = "turn") -> AgentRequestUserInputRequest {
         AgentRequestUserInputRequest(
             requestID: .string(id),
             method: "request_user_input",
-            threadID: "thread",
-            turnID: "turn",
+            threadID: threadID,
+            turnID: turnID,
             itemID: id,
             questions: [
                 AgentRequestUserInputQuestion(
@@ -2208,8 +2572,13 @@ private final class LivenessFakeCodexController: CodexSessionControlling {
     }
 
     func interruptUserTurn(expectedTurnID: String) async throws -> CodexTurnInterruptReceipt {
-        CodexTurnInterruptReceipt(interruptedTurnID: expectedTurnID)
+        interruptedTurnIDs.append(expectedTurnID)
+        return CodexTurnInterruptReceipt(interruptedTurnID: expectedTurnID)
     }
+
+    /// Every provider interrupt requested (expected turn ID, or the current turn's cancellation).
+    private(set) var interruptedTurnIDs: [String] = []
+    private(set) var cancelCurrentTurnCount = 0
 
     private func recordSendUserTurn() {
         onSendUserTurn?()
@@ -2247,7 +2616,67 @@ private final class LivenessFakeCodexController: CodexSessionControlling {
         }
     }
 
-    func cancelCurrentTurn() async {}
+    func cancelCurrentTurn() async {
+        cancelCurrentTurnCount += 1
+    }
+
     func shutdown() async {}
-    func respondToServerRequest(id: CodexAppServerRequestID, result: [String: Any]) async {}
+    func respondToServerRequest(id: CodexAppServerRequestID, result: [String: Any]) async {
+        serverResponseIDs.append(id)
+    }
+
+    /// Every server-request reply sent (a native question's reply is never synthesized).
+    private(set) var serverResponseIDs: [CodexAppServerRequestID] = []
+}
+
+/// Store file operations that fail the next write, or hold the next write until released (the
+/// native question creation write, here). Later writes (terminal evidence) are unaffected.
+private final class CodexQuestionWriteControl: @unchecked Sendable {
+    private let lock = NSLock()
+    private let gate = DispatchSemaphore(value: 0)
+    private var failNext = false
+    private var holdArmed = false
+    private var holding = false
+
+    func failNextWrite() {
+        lock.withLock { failNext = true }
+    }
+
+    var isHolding: Bool {
+        lock.withLock { holding }
+    }
+
+    func holdNextWrite() {
+        lock.withLock { holdArmed = true }
+    }
+
+    func release() {
+        let wasHolding = lock.withLock { () -> Bool in
+            holdArmed = false
+            defer { holding = false }
+            return holding
+        }
+        if wasHolding { gate.signal() }
+    }
+
+    func fileOperations() -> AgentRecoveryStore.FileOperations {
+        AgentRecoveryStore.FileOperations(
+            writeAtomically: { [self] data, url in
+                let (fail, hold) = lock.withLock { () -> (Bool, Bool) in
+                    if failNext {
+                        failNext = false
+                        return (true, false)
+                    }
+                    guard holdArmed else { return (false, false) }
+                    holdArmed = false
+                    holding = true
+                    return (false, true)
+                }
+                if fail { throw CocoaError(.fileWriteUnknown) }
+                if hold { gate.wait() }
+                try data.write(to: url, options: .atomic)
+            },
+            removeItem: { url in try FileManager.default.removeItem(at: url) }
+        )
+    }
 }

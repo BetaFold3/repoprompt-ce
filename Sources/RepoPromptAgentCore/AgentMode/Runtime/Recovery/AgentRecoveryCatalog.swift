@@ -1,0 +1,847 @@
+import Foundation
+
+// Lossless-restart Phase 2 recovery catalog: one immutable, app-wide projection of everything that
+// needs the user's attention after a restart or an interrupted run, owned and published by the
+// recovery coordinator. Both surfaces render it: the per-session banner is an exact session filter
+// of the snapshot, and the app-wide Needs Attention sheet renders the snapshot itself. Presentation
+// adapters format rows and choose actions for their navigation context; they never rediscover or
+// remove items. Building a catalog constructs no provider, controller, or view model.
+
+/// Phase-2 item kinds.
+package enum AgentRecoveryCatalogItemKind: String, CaseIterable {
+    case interruptedTurn
+    case terminalOutcome
+    case savedInput
+    case savedDraft
+    case unansweredQuestion
+    case scheduleNeedsConfirmation
+    case crashHold
+    case heldScheduleTransfer
+    case statusUnknown
+    case saveFailure
+}
+
+/// Shared progress or failure of one item's action (the same on every surface).
+package enum AgentRecoveryCatalogActionState: Equatable {
+    case working
+    case failed(String)
+}
+
+/// Why sending to an item's session stays paused (non-dismissible: a dismissed card keeps it).
+/// A restricted session is refused by admission itself (`AgentRecoveryAdmissionRefusal.restricted`);
+/// the catalog kept no reader for a restriction blocker, so it carries none (review B F16).
+package enum AgentRecoveryCatalogBlocker: Equatable {
+    case crashHold
+}
+
+/// Durable Dismiss state of a dismissible item: its semantic key and current freshness, and whether
+/// the stored acknowledgement covers exactly this state.
+package struct AgentRecoveryCatalogAcknowledgement: Equatable {
+    package let key: AgentRecoveryCardKey
+    package let freshness: AgentRecoveryCardFreshness
+    package let isAcknowledged: Bool
+}
+
+/// Formatting context of held input (the adapter's wording and action choice).
+package struct AgentRecoveryCatalogIntentContext: Equatable {
+    package let isEarlierLaunch: Bool
+    /// Why it is held this launch (its projection was removed, or it is uncertain after its run).
+    package let heldReason: String?
+    /// Typed under the session's current reset generation.
+    package let sameGeneration: Bool
+    /// The session executes on an authoritative remote host (F-3).
+    package let isRemote: Bool
+}
+
+/// The typed display payload a presentation adapter formats.
+package enum AgentRecoveryCatalogPayload: Equatable {
+    case workspaceFailure(reason: String)
+    case nonactionable(AgentSessionRecoveryNonactionableReason)
+    case duplicateDestination
+    case noDestination
+    case crashHold(AgentRecoveryCrashHold)
+    case scheduleTransfer(message: String)
+    case turn(AgentRecoveryInterruptedTurn)
+    /// A turn saved open that cold restoration closed with its attempt's ordinary outcome.
+    case outcomeTurn(AgentRecoveryOutcomeTurn)
+    case recoveryOnlyRun(AgentRecoveryRunAttempt)
+    case intent(AgentRecoveryIntent, AgentRecoveryCatalogIntentContext)
+    /// A saved question whose request has ended (an earlier launch's, or this launch's once its
+    /// owning request expired). Historical text only; never resumed.
+    case question(AgentRecoveryQuestionSnapshot, isCurrentLaunch: Bool)
+    /// A composer typed before the conversation was cleared (a live lane's held draft).
+    case heldDraft(AgentRecoveryComposerSnapshot)
+    /// A session without a live lane whose recovery record holds a saved, non-empty composer
+    /// (review A F05). `fromClearedConversation` when it was typed before the conversation was cleared.
+    case closedSessionDraft(AgentRecoveryComposerSnapshot, fromClearedConversation: Bool)
+    case composerRestoreFailed(AgentRecoveryControllerFailure)
+    case unsavedPredecessor(AgentRecoveryUnsavedComposerInput, count: Int)
+    case composerWriteFailed(AgentRecoveryControllerFailure)
+    /// Input a released lane could not persist while no later lane inherited it.
+    case ownerlessDraft(AgentRecoveryUnsavedComposerInput)
+    /// A tab's composer input that could not be prepared for saving yet (no lane, no durable
+    /// authority). Runtime only: never persisted, never dismissible.
+    case composerPreparationFailed(AgentRecoveryComposerPreparationFailure)
+    /// A live question's snapshot or removal could not be saved (`failure`), or a submitted answer
+    /// was not sent because it could not be preserved first (`unsentAnswer`). Runtime only, never
+    /// dismissible: it clears once a write commits and no answer is held.
+    case questionSaveFailed(AgentRecoveryControllerFailure?, unsentAnswer: Bool)
+    case scheduleNeedsConfirmation(AgentScheduledSendConfirmationSummary)
+    /// A workspace holds session files but no current metadata index, so schedules awaiting
+    /// confirmation there could not be checked (index-only discovery never rebuilds it).
+    case scheduleIndexUnavailable(workspaceName: String)
+}
+
+/// The latest index-only read of schedules awaiting confirmation, across every known workspace.
+package struct AgentRecoveryIndexedSchedules: Equatable {
+    package let summaries: [AgentScheduledSendConfirmationSummary]
+    package let unavailableWorkspaces: [AgentRecoveryWorkspaceDestination]
+
+    package static let empty = AgentRecoveryIndexedSchedules(summaries: [], unavailableWorkspaces: [])
+}
+
+package struct AgentRecoveryCatalogItem: Equatable, Identifiable {
+    /// Stable row identity (the recovery list's existing row ID formats).
+    package let id: String
+    package let kind: AgentRecoveryCatalogItemKind
+    package let sessionID: UUID?
+    package let workspaceID: UUID?
+    /// Saved session name when known; adapters fall back to their own display names.
+    package let sessionName: String?
+    /// Tab to open the session from (never starts a provider).
+    package let composeTabID: UUID?
+    package let payload: AgentRecoveryCatalogPayload
+    /// `nil` when the item offers no durable Dismiss (save failures, unknown or unreadable authority,
+    /// held transfers).
+    package let acknowledgement: AgentRecoveryCatalogAcknowledgement?
+
+    package var isDismissed: Bool {
+        acknowledgement?.isAcknowledged == true
+    }
+}
+
+/// One immutable catalog snapshot. Items are in stable display order.
+package struct AgentRecoveryCatalog: Equatable {
+    package let generation: UInt64
+    package let items: [AgentRecoveryCatalogItem]
+    /// Sessions whose sending stays paused, with why (shown even when their cards are dismissed).
+    package let blockers: [UUID: AgentRecoveryCatalogBlocker]
+
+    package init(generation: UInt64, items: [AgentRecoveryCatalogItem], blockers: [UUID: AgentRecoveryCatalogBlocker]) {
+        self.generation = generation
+        self.items = items
+        self.blockers = blockers
+    }
+
+    package static let empty = AgentRecoveryCatalog(generation: 0, items: [], blockers: [:])
+
+    package func item(id: String) -> AgentRecoveryCatalogItem? {
+        items.first { $0.id == id }
+    }
+
+    /// The exact items of the Needs Attention sheet, in snapshot order.
+    package func needsAttentionItems(includeDismissed: Bool) -> [AgentRecoveryCatalogItem] {
+        includeDismissed ? items : items.filter { !$0.isDismissed }
+    }
+
+    /// The banner's exact session filter: the session's items, a tab-keyed item of its tab that has
+    /// no session yet, and scope-level items of its workspace (a workspace that could not be
+    /// checked). Dismissed items are excluded.
+    package func bannerItems(sessionID: UUID?, workspaceID: UUID?, tabID: UUID? = nil) -> [AgentRecoveryCatalogItem] {
+        items.filter { item in
+            guard !item.isDismissed else { return false }
+            if let sessionID, item.sessionID == sessionID { return true }
+            if item.sessionID == nil, let tabID, item.composeTabID == tabID { return true }
+            return item.sessionID == nil && item.composeTabID == nil && item.workspaceID != nil && item.workspaceID == workspaceID
+        }
+    }
+}
+
+// MARK: - Projection
+
+/// Builds the catalog from the coordinator's current authoritative state: tabs' failed composer
+/// preparations, startup results overlaid by committed records, crash holds and restrictions, this
+/// launch's held and ownerless input, live lanes' composer state, and schedules awaiting
+/// confirmation (scheduler and index summaries, merged by the coordinator). Linear in the
+/// inspected records and items (maps are built once), plus the stable display order.
+@MainActor
+package enum AgentRecoveryCatalogProjection {
+    static func build(
+        coordinator: AgentRecoveryCoordinator,
+        schedules: [AgentScheduledSendConfirmationSummary],
+        unavailableScheduleIndexes: [AgentRecoveryWorkspaceDestination] = [],
+        generation: UInt64
+    ) -> AgentRecoveryCatalog {
+        guard coordinator.startupState == .ready else {
+            return AgentRecoveryCatalog(generation: generation, items: [], blockers: [:])
+        }
+        var builder = Builder(coordinator: coordinator)
+        builder.addComposerPreparations()
+        builder.addStartupResults()
+        builder.addHeldInputOfUnlistedSessions()
+        builder.addLaneComposerState()
+        builder.addOwnerlessInput()
+        builder.addSchedules(schedules)
+        builder.addUnavailableScheduleIndexes(unavailableScheduleIndexes)
+        return AgentRecoveryCatalog(generation: generation, items: builder.items, blockers: builder.blockers)
+    }
+
+    /// Row identity of a tab's failed composer preparation.
+    package static func preparationItemID(tabID: UUID) -> String {
+        "draft-prep-\(tabID.uuidString)"
+    }
+
+    /// Row identity of a session's live-question save failure.
+    package static func questionSaveFailureItemID(sessionID: UUID) -> String {
+        "savefail-question-\(sessionID.uuidString)"
+    }
+
+    /// Freshness of a turn's or run's classified outcome (and interruption cause).
+    static func runFreshness(status: AgentRecoveryInterruptedTurn.Status, reason: AgentTranscriptTurnInterruption.Reason?) -> AgentRecoveryCardFreshness {
+        AgentRecoveryCardFreshness("\(status)|\(reason?.rawValue ?? "-")")
+    }
+
+    /// Freshness of held input: its delivery classification and typed hold/blocker state.
+    static func intentFreshness(_ intent: AgentRecoveryIntent, held: Bool) -> AgentRecoveryCardFreshness {
+        AgentRecoveryCardFreshness("\(intent.deliveryState.rawValue)|held:\(held)|stale:\(intent.staleTargetMarkedAt != nil)")
+    }
+
+    /// A question card is fresh per interaction: partial-answer edits never unhide it.
+    static let questionFreshness = AgentRecoveryCardFreshness("asked")
+    /// A draft card is fresh per composer revision.
+    static let draftFreshness = AgentRecoveryCardFreshness("held")
+
+    static func scheduleFreshness(_ summary: AgentScheduledSendConfirmationSummary) -> AgentRecoveryCardFreshness {
+        AgentRecoveryCardFreshness(
+            "\(summary.attemptID?.uuidString ?? "-")|\(summary.reason?.rawValue ?? "-")|\(Int64((summary.notBefore.timeIntervalSince1970 * 1000).rounded()))"
+        )
+    }
+
+    static func crashHoldFreshness(_ hold: AgentRecoveryCrashHold) -> AgentRecoveryCardFreshness {
+        func ids(_ set: Set<UUID>) -> String {
+            set.map(\.uuidString).sorted().joined(separator: ",")
+        }
+        return AgentRecoveryCardFreshness(
+            "r:\(ids(hold.uncertainRunAttemptIDs))|i:\(ids(hold.uncertainIntentIDs))|t:\(ids(hold.uncertainTranscriptTurnIDs))"
+        )
+    }
+
+    @MainActor
+    private struct Builder {
+        let coordinator: AgentRecoveryCoordinator
+        let currentInstanceID: UUID
+        var items: [AgentRecoveryCatalogItem] = []
+        var blockers: [UUID: AgentRecoveryCatalogBlocker] = [:]
+        var listedSessionIDs: Set<UUID> = []
+        /// Incarnation and current record per session (startup snapshot overlaid by later commits).
+        var bindings: [UUID: AgentRecoveryLifecycleBinding] = [:]
+        var records: [UUID: AgentRecoveryRecord] = [:]
+
+        init(coordinator: AgentRecoveryCoordinator) {
+            self.coordinator = coordinator
+            currentInstanceID = coordinator.store.appInstanceID
+        }
+
+        // swiftlint:disable:next function_parameter_count
+        mutating func append(
+            _ id: String,
+            kind: AgentRecoveryCatalogItemKind,
+            sessionID: UUID?,
+            workspaceID: UUID?,
+            sessionName: String?,
+            composeTabID: UUID?,
+            payload: AgentRecoveryCatalogPayload,
+            card: (key: AgentRecoveryCardKey, freshness: AgentRecoveryCardFreshness)? = nil
+        ) {
+            let acknowledgement = card.map { card in
+                AgentRecoveryCatalogAcknowledgement(
+                    key: card.key,
+                    freshness: card.freshness,
+                    isAcknowledged: sessionID.flatMap { records[$0] }?.isCardAcknowledged(card.key, freshness: card.freshness) ?? false
+                )
+            }
+            items.append(AgentRecoveryCatalogItem(
+                id: id,
+                kind: kind,
+                sessionID: sessionID,
+                workspaceID: workspaceID,
+                sessionName: sessionName,
+                composeTabID: composeTabID,
+                payload: payload,
+                acknowledgement: acknowledgement
+            ))
+        }
+
+        func currentRecord(sessionID: UUID, startup: AgentRecoveryRecord?, incarnationID: UUID) -> AgentRecoveryRecord? {
+            guard let live = coordinator.liveRecordState(for: sessionID) else { return startup }
+            switch live {
+            case let .supported(record):
+                return record.incarnationID == incarnationID ? record : nil
+            case .absent:
+                return nil
+            }
+        }
+
+        mutating func addStartupResults() {
+            for failure in coordinator.reconciliation.workspaceFailures {
+                append(
+                    "workspace-\(failure.workspaceID.uuidString)",
+                    kind: .statusUnknown,
+                    sessionID: nil,
+                    workspaceID: failure.workspaceID,
+                    sessionName: nil,
+                    composeTabID: nil,
+                    payload: .workspaceFailure(reason: failure.reason)
+                )
+            }
+            for resolution in coordinator.reconciliation.sessions {
+                addResolution(resolution)
+            }
+        }
+
+        mutating func addResolution(_ resolution: AgentSessionRecoveryResolution) {
+            let sessionID = resolution.sessionID
+            let key = sessionID.uuidString
+            let workspaceID = resolution.workspaceID
+            let name = resolution.sessionName
+            let tabID = resolution.composeTabID
+            let unknownPayload: AgentRecoveryCatalogPayload? = switch resolution.classification {
+            case .idle, .tombstoned, .actionable: nil
+            case let .nonactionable(reason): .nonactionable(reason)
+            case .duplicateDestination: .duplicateDestination
+            case .noDestination: .noDestination
+            }
+            if let unknownPayload {
+                append("status-\(key)", kind: .statusUnknown, sessionID: sessionID, workspaceID: workspaceID, sessionName: name, composeTabID: tabID, payload: unknownPayload)
+                return
+            }
+            guard case .actionable = resolution.classification, let binding = resolution.binding else { return }
+            bindings[sessionID] = binding
+            listedSessionIDs.insert(sessionID)
+            let record = currentRecord(sessionID: sessionID, startup: resolution.record?.record, incarnationID: binding.incarnationID)
+            if let record { records[sessionID] = record }
+
+            if let hold = coordinator.crashHold(for: sessionID), coordinator.blockingCrashHold(for: binding) != nil {
+                blockers[sessionID] = .crashHold
+                append(
+                    "crash-\(key)",
+                    kind: .crashHold,
+                    sessionID: sessionID,
+                    workspaceID: workspaceID,
+                    sessionName: name,
+                    composeTabID: tabID,
+                    payload: .crashHold(hold),
+                    card: (
+                        AgentRecoveryCardKey(kind: .crashHold, incarnationID: hold.incarnationID, transcriptResetGeneration: hold.transcriptResetGeneration, entityID: "crashHold"),
+                        AgentRecoveryCatalogProjection.crashHoldFreshness(hold)
+                    )
+                )
+            }
+
+            if case let .held(message) = resolution.scheduleTransfer,
+               coordinator.restrictions.sessionRestriction(sessionID) != nil
+            {
+                append("transfer-\(key)", kind: .heldScheduleTransfer, sessionID: sessionID, workspaceID: workspaceID, sessionName: name, composeTabID: tabID, payload: .scheduleTransfer(message: message))
+            }
+
+            /// Startup rows are re-classified from the current record's run evidence (a later terminal
+            /// commit or shutdown of the same attempt updates the row; freshness unhides it).
+            func currentAttempt(_ attemptID: UUID?) -> AgentRecoveryRunAttempt? {
+                guard let attemptID else { return nil }
+                return record?.runAttempts.first { $0.runAttemptID == attemptID }
+            }
+            var representedRuns = Set<UUID>()
+            for startupTurn in resolution.interruptedTurns {
+                let turn = currentAttempt(startupTurn.interruption.runAttemptID).map {
+                    AgentRecoveryInterruptedTurn(
+                        turnID: startupTurn.turnID,
+                        interruption: startupTurn.interruption,
+                        status: .classify(attempt: $0),
+                        isLastTurn: startupTurn.isLastTurn
+                    )
+                } ?? startupTurn
+                // A turn joined to a run attempt is identified by that attempt (deduplicated with a
+                // recovery-only representation of the same run); a legacy turn by its own ID.
+                let entityID = turn.interruption.runAttemptID?.uuidString ?? turn.turnID.uuidString
+                if let attemptID = turn.interruption.runAttemptID { representedRuns.insert(attemptID) }
+                append(
+                    "turn-\(key)-\(turn.turnID.uuidString)",
+                    kind: turn.status.isInterruption ? .interruptedTurn : .terminalOutcome,
+                    sessionID: sessionID,
+                    workspaceID: workspaceID,
+                    sessionName: name,
+                    composeTabID: tabID,
+                    payload: .turn(turn),
+                    card: (
+                        AgentRecoveryCardKey(kind: .run, incarnationID: binding.incarnationID, transcriptResetGeneration: nil, entityID: entityID),
+                        AgentRecoveryCatalogProjection.runFreshness(status: turn.status, reason: turn.status.isInterruption ? turn.interruption.reason : nil)
+                    )
+                )
+            }
+            for startupOutcome in resolution.outcomeTurns where !representedRuns.contains(startupOutcome.runAttempt.runAttemptID) {
+                let outcome = AgentRecoveryOutcomeTurn(
+                    turnID: startupOutcome.turnID,
+                    runAttempt: currentAttempt(startupOutcome.runAttempt.runAttemptID) ?? startupOutcome.runAttempt
+                )
+                representedRuns.insert(outcome.runAttempt.runAttemptID)
+                append(
+                    "turn-\(key)-\(outcome.turnID.uuidString)",
+                    kind: outcome.status.isInterruption ? .interruptedTurn : .terminalOutcome,
+                    sessionID: sessionID,
+                    workspaceID: workspaceID,
+                    sessionName: name,
+                    composeTabID: tabID,
+                    payload: .outcomeTurn(outcome),
+                    card: (
+                        AgentRecoveryCardKey(kind: .run, incarnationID: binding.incarnationID, transcriptResetGeneration: nil, entityID: outcome.runAttempt.runAttemptID.uuidString),
+                        AgentRecoveryCatalogProjection.runFreshness(status: outcome.status, reason: nil)
+                    )
+                )
+            }
+            for startupAttempt in resolution.recoveryOnlyRunAttempts where !representedRuns.contains(startupAttempt.runAttemptID) {
+                let attempt = currentAttempt(startupAttempt.runAttemptID) ?? startupAttempt
+                representedRuns.insert(attempt.runAttemptID)
+                let status = AgentRecoveryInterruptedTurn.Status.classify(terminal: attempt.terminal, shutdown: attempt.shutdown)
+                append(
+                    "run-\(key)-\(attempt.runAttemptID.uuidString)",
+                    kind: attempt.terminal == nil ? .interruptedTurn : .terminalOutcome,
+                    sessionID: sessionID,
+                    workspaceID: workspaceID,
+                    sessionName: name,
+                    composeTabID: tabID,
+                    payload: .recoveryOnlyRun(attempt),
+                    card: (
+                        AgentRecoveryCardKey(kind: .run, incarnationID: binding.incarnationID, transcriptResetGeneration: nil, entityID: attempt.runAttemptID.uuidString),
+                        AgentRecoveryCatalogProjection.runFreshness(status: status, reason: nil)
+                    )
+                )
+            }
+
+            guard let record else { return }
+            addLiveRunInterruptions(
+                sessionID: sessionID,
+                workspaceID: workspaceID,
+                name: name,
+                tabID: tabID,
+                record: record,
+                represented: representedRuns
+            )
+            addIntents(
+                sessionID: sessionID,
+                workspaceID: workspaceID,
+                name: name,
+                tabID: tabID,
+                record: record,
+                currentGeneration: coordinator.lane(for: sessionID)?.binding.transcriptResetGeneration
+                    ?? max(binding.transcriptResetGeneration, record.transcriptResetGeneration),
+                isRemote: resolution.remoteHostID != nil
+            )
+            addQuestions(sessionID: sessionID, workspaceID: workspaceID, name: name, tabID: tabID, record: record)
+            addDurableComposer(
+                sessionID: sessionID,
+                workspaceID: workspaceID,
+                name: name,
+                tabID: tabID,
+                record: record,
+                currentGeneration: max(binding.transcriptResetGeneration, record.transcriptResetGeneration)
+            )
+        }
+
+        /// Review A F05: a saved, non-empty composer of a session no live lane represents (closed,
+        /// or its lane released) is listed from the current record, by composer revision (the same
+        /// identity and card key a live lane's held draft uses), so preserved draft text stays
+        /// discoverable. A live lane's composer state represents it instead.
+        mutating func addDurableComposer(
+            sessionID: UUID,
+            workspaceID: UUID?,
+            name: String?,
+            tabID: UUID?,
+            record: AgentRecoveryRecord,
+            currentGeneration: UInt64
+        ) {
+            guard let snapshot = record.composer, !snapshot.content.isEmpty else { return }
+            if let lane = coordinator.lane(for: sessionID), !lane.isRetired { return }
+            append(
+                AgentRecoveryCatalogProjection.heldDraftItemID(sessionID: sessionID, revision: snapshot.revision),
+                kind: .savedDraft,
+                sessionID: sessionID,
+                workspaceID: workspaceID,
+                sessionName: name,
+                composeTabID: tabID,
+                payload: .closedSessionDraft(snapshot, fromClearedConversation: snapshot.transcriptResetGeneration != currentGeneration),
+                card: (
+                    AgentRecoveryCardKey(kind: .savedDraft, incarnationID: record.incarnationID, transcriptResetGeneration: snapshot.transcriptResetGeneration, entityID: String(describing: snapshot.revision)),
+                    AgentRecoveryCatalogProjection.draftFreshness
+                )
+            )
+        }
+
+        /// This launch's runs whose terminal commit recorded an interruption cause (provider process
+        /// loss, window close, app quit) after startup, from the current committed record: listed
+        /// by run attempt, joined to the latest transcript turn the attempt dispatched into (its own
+        /// turn, or a later steer: the turn its terminal closed; review B F1).
+        /// An active run has no terminal evidence and is never listed; an attempt a startup row
+        /// already represents is skipped. Earlier launches' runs are covered by startup reconciliation.
+        mutating func addLiveRunInterruptions(
+            sessionID: UUID,
+            workspaceID: UUID?,
+            name: String?,
+            tabID: UUID?,
+            record: AgentRecoveryRecord,
+            represented: Set<UUID>
+        ) {
+            let key = sessionID.uuidString
+            let join = AgentRecoveryRunTurnJoin(runAttempts: record.runAttempts, intentAttempts: record.attempts)
+            for attempt in record.runAttempts where attempt.appInstanceID == currentInstanceID && !represented.contains(attempt.runAttemptID) {
+                guard let terminal = attempt.terminal, let reason = terminal.cause?.interruptionReason else { continue }
+                let status = AgentRecoveryInterruptedTurn.Status.classify(attempt: attempt)
+                let card = (
+                    key: AgentRecoveryCardKey(kind: .run, incarnationID: record.incarnationID, transcriptResetGeneration: nil, entityID: attempt.runAttemptID.uuidString),
+                    freshness: AgentRecoveryCatalogProjection.runFreshness(status: status, reason: status.isInterruption ? reason : nil)
+                )
+                if let turnID = join.latestTurnID(of: attempt) {
+                    let turn = AgentRecoveryInterruptedTurn(
+                        turnID: turnID,
+                        interruption: AgentTranscriptTurnInterruption(
+                            reason: reason,
+                            observedAt: terminal.recordedAt.date,
+                            lastConfirmedActivityAt: attempt.shutdown?.lastConfirmedActivityAt?.date,
+                            runAttemptID: attempt.runAttemptID
+                        ),
+                        status: status,
+                        isLastTurn: false
+                    )
+                    append(
+                        "turn-\(key)-\(turnID.uuidString)",
+                        kind: status.isInterruption ? .interruptedTurn : .terminalOutcome,
+                        sessionID: sessionID,
+                        workspaceID: workspaceID,
+                        sessionName: name,
+                        composeTabID: tabID,
+                        payload: .turn(turn),
+                        card: card
+                    )
+                } else {
+                    append(
+                        "run-\(key)-\(attempt.runAttemptID.uuidString)",
+                        kind: status.isInterruption ? .interruptedTurn : .terminalOutcome,
+                        sessionID: sessionID,
+                        workspaceID: workspaceID,
+                        sessionName: name,
+                        composeTabID: tabID,
+                        payload: .recoveryOnlyRun(attempt),
+                        card: card
+                    )
+                }
+            }
+        }
+
+        /// Held input of one session from its current record. Earlier-launch intents that need a
+        /// decision are listed; this launch's intents when held (their projection was removed),
+        /// stale-marked, or uncertain after their run ended. Any other one is still projected by a
+        /// live queue or an active run.
+        mutating func addIntents(
+            sessionID: UUID,
+            workspaceID: UUID?,
+            name: String?,
+            tabID: UUID?,
+            record: AgentRecoveryRecord,
+            currentGeneration: UInt64,
+            isRemote: Bool
+        ) {
+            let key = sessionID.uuidString
+            let heldReasons = coordinator.heldIntents(sessionID: sessionID, incarnationID: record.incarnationID)
+            for intent in record.intents where AgentRecoveryCatalogProjection.needsDecision(intent) {
+                let isEarlierLaunch = intent.appInstanceID != currentInstanceID
+                let heldReason = heldReasons[intent.intentID]
+                    ?? (isEarlierLaunch ? nil : AgentRecoveryCoordinator.uncertainInputHoldReason(intent, in: record))
+                guard isEarlierLaunch || heldReason != nil || intent.staleTargetMarkedAt != nil else { continue }
+                append(
+                    "intent-\(key)-\(intent.intentID.uuidString)",
+                    kind: .savedInput,
+                    sessionID: sessionID,
+                    workspaceID: workspaceID,
+                    sessionName: name,
+                    composeTabID: tabID,
+                    payload: .intent(intent, AgentRecoveryCatalogIntentContext(
+                        isEarlierLaunch: isEarlierLaunch,
+                        heldReason: heldReason,
+                        sameGeneration: intent.transcriptResetGeneration == currentGeneration,
+                        isRemote: isRemote
+                    )),
+                    card: (
+                        AgentRecoveryCardKey(kind: .savedInput, incarnationID: record.incarnationID, transcriptResetGeneration: intent.transcriptResetGeneration, entityID: intent.intentID.uuidString),
+                        AgentRecoveryCatalogProjection.intentFreshness(intent, held: heldReason != nil)
+                    )
+                )
+            }
+        }
+
+        /// Saved questions whose request has ended: every earlier launch's, and this launch's whose
+        /// owning lane no longer holds its live request (closed window or tab, expired transport).
+        /// A live question stays in its live card only.
+        mutating func addQuestions(sessionID: UUID, workspaceID: UUID?, name: String?, tabID: UUID?, record: AgentRecoveryRecord) {
+            let live = coordinator.lane(for: sessionID)?.questionPersistence.liveInteractionIDs ?? []
+            for snapshot in record.questions where !live.contains(snapshot.interactionID) {
+                append(
+                    "question-\(sessionID.uuidString)-\(snapshot.interactionID.uuidString)",
+                    kind: .unansweredQuestion,
+                    sessionID: sessionID,
+                    workspaceID: workspaceID,
+                    sessionName: name,
+                    composeTabID: tabID,
+                    payload: .question(snapshot, isCurrentLaunch: snapshot.appInstanceID == currentInstanceID),
+                    card: (
+                        AgentRecoveryCardKey(kind: .question, incarnationID: record.incarnationID, transcriptResetGeneration: snapshot.transcriptResetGeneration, entityID: snapshot.interactionID.uuidString),
+                        AgentRecoveryCatalogProjection.questionFreshness
+                    )
+                )
+            }
+        }
+
+        /// This launch's held input and saved questions of sessions absent from the startup results
+        /// (created this launch, or first written since).
+        mutating func addHeldInputOfUnlistedSessions() {
+            var sessionIDs = Set(coordinator.heldIntentSessions.keys)
+            for lane in coordinator.liveLanes where !lane.isRetired {
+                sessionIDs.insert(lane.sessionID)
+            }
+            for sessionID in coordinator.liveRecordSessionIDs {
+                sessionIDs.insert(sessionID)
+            }
+            for sessionID in sessionIDs.sorted(by: { $0.uuidString < $1.uuidString }) where !listedSessionIDs.contains(sessionID) {
+                guard case let .supported(record)? = coordinator.liveRecordState(for: sessionID) else { continue }
+                let lane = coordinator.lane(for: sessionID)
+                let held = coordinator.heldIntentSessions[sessionID]
+                if let held, held.incarnationID != record.incarnationID { continue }
+                if let lane, lane.binding.incarnationID != record.incarnationID { continue }
+                records[sessionID] = record
+                bindings[sessionID] = lane?.binding
+                let workspaceID = held?.workspaceID ?? lane?.persistenceState.stamp.workspaceID
+                    ?? coordinator.knownWorkspaceID(for: sessionID)
+                // Review R1 (A P2): a closed session's items keep its compose tab for Open.
+                let tabID = coordinator.knownComposeTabID(for: sessionID)
+                addLiveRunInterruptions(
+                    sessionID: sessionID,
+                    workspaceID: workspaceID,
+                    name: nil,
+                    tabID: tabID,
+                    record: record,
+                    represented: []
+                )
+                addIntents(
+                    sessionID: sessionID,
+                    workspaceID: workspaceID,
+                    name: nil,
+                    tabID: tabID,
+                    record: record,
+                    currentGeneration: lane?.binding.transcriptResetGeneration ?? record.transcriptResetGeneration,
+                    isRemote: false
+                )
+                addQuestions(sessionID: sessionID, workspaceID: workspaceID, name: nil, tabID: tabID, record: record)
+                addDurableComposer(
+                    sessionID: sessionID,
+                    workspaceID: workspaceID,
+                    name: nil,
+                    tabID: tabID,
+                    record: record,
+                    currentGeneration: lane?.binding.transcriptResetGeneration ?? record.transcriptResetGeneration
+                )
+            }
+        }
+
+        /// Live lanes' composer recovery state (held or unsaved drafts, restore and write failures).
+        mutating func addLaneComposerState() {
+            for lane in coordinator.liveLanes.sorted(by: { $0.sessionID.uuidString < $1.sessionID.uuidString }) where !lane.isRetired {
+                let sessionID = lane.sessionID
+                let key = sessionID.uuidString
+                let workspaceID = lane.persistenceState.stamp.workspaceID
+                let name = coordinator.reconciliation.resolution(for: sessionID)?.sessionName
+                if records[sessionID] == nil, case let .supported(record)? = coordinator.liveRecordState(for: sessionID),
+                   record.incarnationID == lane.binding.incarnationID
+                {
+                    records[sessionID] = record
+                }
+                switch lane.composerState {
+                case let .held(snapshot):
+                    append(
+                        AgentRecoveryCatalogProjection.heldDraftItemID(sessionID: sessionID, revision: snapshot.revision),
+                        kind: .savedDraft,
+                        sessionID: sessionID,
+                        workspaceID: workspaceID,
+                        sessionName: name,
+                        composeTabID: nil,
+                        payload: .heldDraft(snapshot),
+                        card: (
+                            AgentRecoveryCardKey(kind: .savedDraft, incarnationID: lane.binding.incarnationID, transcriptResetGeneration: snapshot.transcriptResetGeneration, entityID: String(describing: snapshot.revision)),
+                            AgentRecoveryCatalogProjection.draftFreshness
+                        )
+                    )
+                case let .restoreFailed(failure):
+                    append("draft-restorefail-\(key)", kind: .saveFailure, sessionID: sessionID, workspaceID: workspaceID, sessionName: name, composeTabID: nil, payload: .composerRestoreFailed(failure))
+                case .unrestored, .restoring, .ready:
+                    break
+                }
+                if let entry = lane.unsavedPredecessorInputs.first {
+                    append(
+                        "draft-unsaved-\(key)-\(AgentRecoveryCatalogProjection.fingerprint(entry))",
+                        kind: .saveFailure,
+                        sessionID: sessionID,
+                        workspaceID: workspaceID,
+                        sessionName: name,
+                        composeTabID: nil,
+                        payload: .unsavedPredecessor(entry, count: lane.unsavedPredecessorInputs.count)
+                    )
+                }
+                if let failure = lane.composer.lastWriteFailure {
+                    // A held composer blocks writes until it is resolved; its own item presents it.
+                    if case .store(.heldComposerUnresolved) = failure {} else {
+                        append("draft-savefail-\(key)", kind: .saveFailure, sessionID: sessionID, workspaceID: workspaceID, sessionName: name, composeTabID: nil, payload: .composerWriteFailed(failure))
+                    }
+                }
+                let questions = lane.questionPersistence
+                if questions.lastWriteFailure != nil || !questions.unsentAnswerIDs.isEmpty {
+                    append(
+                        AgentRecoveryCatalogProjection.questionSaveFailureItemID(sessionID: sessionID),
+                        kind: .saveFailure,
+                        sessionID: sessionID,
+                        workspaceID: workspaceID,
+                        sessionName: name,
+                        composeTabID: nil,
+                        payload: .questionSaveFailed(questions.lastWriteFailure, unsentAnswer: !questions.unsentAnswerIDs.isEmpty)
+                    )
+                }
+            }
+        }
+
+        /// Unsaved input of a released lane whose owner went away (no lane inherited it yet).
+        mutating func addOwnerlessInput() {
+            for (sessionID, ownerless) in coordinator.ownerlessUnsavedInputs.sorted(by: { $0.key.uuidString < $1.key.uuidString })
+                where coordinator.lane(for: sessionID) == nil
+            {
+                guard let entry = ownerless.inputs.first else { continue }
+                append(
+                    "draft-ownerless-\(sessionID.uuidString)-\(AgentRecoveryCatalogProjection.fingerprint(entry))",
+                    kind: .saveFailure,
+                    sessionID: sessionID,
+                    workspaceID: ownerless.workspaceID,
+                    sessionName: coordinator.reconciliation.resolution(for: sessionID)?.sessionName,
+                    composeTabID: coordinator.reconciliation.resolution(for: sessionID)?.composeTabID,
+                    payload: .ownerlessDraft(entry)
+                )
+            }
+        }
+
+        /// A tab's composer input that could not be prepared for saving (runtime only; its item
+        /// clears when a retry, hand-off, or discard clears the obligation).
+        mutating func addComposerPreparations() {
+            let failed = coordinator.failedComposerPreparations.compactMap { entry -> (AgentTabSession, AgentRecoveryComposerPreparationFailure)? in
+                (entry.owner as? AgentTabSession).map { ($0, entry.failure) }
+            }
+            for (owner, failure) in failed.sorted(by: { $0.0.tabID.uuidString < $1.0.tabID.uuidString }) {
+                let sessionID = owner.activeAgentSessionID
+                append(
+                    AgentRecoveryCatalogProjection.preparationItemID(tabID: owner.tabID),
+                    kind: .saveFailure,
+                    sessionID: sessionID,
+                    workspaceID: nil,
+                    sessionName: sessionID.flatMap { coordinator.reconciliation.resolution(for: $0)?.sessionName },
+                    composeTabID: owner.tabID,
+                    payload: .composerPreparationFailed(failure)
+                )
+            }
+        }
+
+        /// Ordinary schedules awaiting explicit confirmation, one item per schedule identity (the
+        /// coordinator already merged its sources and left out a schedule whose exact attempt is held
+        /// for transfer).
+        mutating func addSchedules(_ schedules: [AgentScheduledSendConfirmationSummary]) {
+            for summary in schedules {
+                let resolution = coordinator.reconciliation.resolution(for: summary.sessionID)
+                let incarnationID = bindings[summary.sessionID]?.incarnationID
+                    ?? coordinator.lane(for: summary.sessionID)?.binding.incarnationID
+                    ?? resolution?.binding?.incarnationID
+                append(
+                    "schedule-\(summary.sessionID.uuidString)-\(summary.scheduleID.uuidString)",
+                    kind: .scheduleNeedsConfirmation,
+                    sessionID: summary.sessionID,
+                    workspaceID: summary.workspaceID,
+                    sessionName: summary.sessionName ?? resolution?.sessionName,
+                    composeTabID: summary.tabID ?? resolution?.composeTabID,
+                    payload: .scheduleNeedsConfirmation(summary),
+                    // Review R1 (A P2): a legacy index entry without its attempt must be opened first.
+                    card: summary.requiresOpenBeforeDismiss ? nil : incarnationID.map {
+                        (
+                            AgentRecoveryCardKey(kind: .schedule, incarnationID: $0, transcriptResetGeneration: nil, entityID: summary.scheduleID.uuidString),
+                            AgentRecoveryCatalogProjection.scheduleFreshness(summary)
+                        )
+                    }
+                )
+            }
+        }
+
+        /// Workspaces whose schedules could not be checked from their index (not already listed
+        /// as a workspace startup could not check).
+        mutating func addUnavailableScheduleIndexes(_ workspaces: [AgentRecoveryWorkspaceDestination]) {
+            let failed = Set(coordinator.reconciliation.workspaceFailures.map(\.workspaceID))
+            for workspace in workspaces where !failed.contains(workspace.id) {
+                append(
+                    "schedule-index-\(workspace.id.uuidString)",
+                    kind: .statusUnknown,
+                    sessionID: nil,
+                    workspaceID: workspace.id,
+                    sessionName: nil,
+                    composeTabID: nil,
+                    payload: .scheduleIndexUnavailable(workspaceName: workspace.name)
+                )
+            }
+        }
+    }
+
+    /// Store-side revalidation of a Dismiss, atomically with its write: record-backed items must
+    /// still exist in the displayed record state (input with the same delivery classification and
+    /// stale mark, a still-saved question). Other kinds were revalidated against the projection.
+    package nonisolated static func recordStillMatches(
+        key: AgentRecoveryCardKey,
+        freshness: AgentRecoveryCardFreshness,
+        record: AgentRecoveryRecord?
+    ) -> Bool {
+        switch key.kind {
+        case .savedInput?:
+            guard let intent = record?.intents.first(where: { $0.intentID.uuidString == key.entityID }) else { return false }
+            let token = freshness.token
+            return token.hasPrefix("\(intent.deliveryState.rawValue)|")
+                && token.hasSuffix("|stale:\(intent.staleTargetMarkedAt != nil)")
+        case .question?:
+            return record?.questions.contains { $0.interactionID.uuidString == key.entityID } ?? false
+        case .run?, .savedDraft?, .schedule?, .crashHold?, nil:
+            return true
+        }
+    }
+
+    /// Held input that may still need a user decision. Accepted and withdrawn intents need none.
+    package static func needsDecision(_ intent: AgentRecoveryIntent) -> Bool {
+        switch intent.deliveryState {
+        case .queued, .dispatching, .deliveryUnknown, .failed:
+            true
+        case .providerAccepted, .withdrawn:
+            false
+        }
+    }
+
+    package static func heldDraftItemID(sessionID: UUID, revision: AgentRecoveryComposerRevision) -> String {
+        "draft-held-\(sessionID.uuidString)-\(token(String(describing: revision)))"
+    }
+
+    /// Identity of one displayed unsaved entry within this process (item IDs carry it, so an action
+    /// applies only to exactly the entry that was shown).
+    package static func fingerprint(_ entry: AgentRecoveryUnsavedComposerInput) -> String {
+        token(String(describing: entry))
+    }
+
+    private static func token(_ value: String) -> String {
+        var hasher = Hasher()
+        hasher.combine(value)
+        return String(UInt(bitPattern: hasher.finalize()), radix: 16)
+    }
+}

@@ -1529,6 +1529,557 @@ final class AgentRecoveryCoordinatorTests: XCTestCase {
         XCTAssertEqual(persisted, held, "the reconstructed record still holds the original draft")
     }
 
+    // MARK: Recovery catalog (Phase 2)
+
+    /// Saved questions are catalog items once their request ended (an earlier launch's, or this
+    /// launch's after a preserving end); a live one stays in its live card only. Dismiss is durable
+    /// through the live lane and removes nothing.
+    func testCatalogListsEndedQuestionsExcludesLiveOnesAndDismissesDurably() async throws {
+        let earlierStore = makeStore()
+        let earlierService = makeService(store: earlierStore)
+        let load = try await makeSession(earlierService)
+        let earlier = try await startedCoordinator(store: earlierStore, service: earlierService)
+        let earlierLane = try earlier.claimLane(owner: Owner(), persistenceState: load.persistenceState)
+        let earlierQuestion = questionSnapshot(earlierStore)
+        _ = try await earlierLane.questionPersistence.commitCreation(earlierQuestion).get()
+
+        let store = makeStore()
+        let service = makeService(store: store)
+        let coordinator = try await startedCoordinator(store: store, service: service)
+        let sessionID = load.session.id
+        let earlierItemID = "question-\(sessionID.uuidString)-\(earlierQuestion.interactionID.uuidString)"
+        let listed = try XCTUnwrap(coordinator.catalog.item(id: earlierItemID))
+        XCTAssertEqual(listed.kind, .unansweredQuestion)
+        XCTAssertEqual(listed.payload, .question(earlierQuestion, isCurrentLaunch: false))
+        XCTAssertFalse(listed.isDismissed)
+        XCTAssertEqual(coordinator.catalog.bannerItems(sessionID: sessionID, workspaceID: workspace.id).map(\.id), [earlierItemID])
+
+        // This launch's live question is never a recovery item while its request is live.
+        let owner = Owner()
+        let reloaded = try await service.loadAgentSessionForEditing(id: sessionID, for: workspace)
+        let lane = try coordinator.claimLane(owner: owner, persistenceState: XCTUnwrap(reloaded?.persistenceState))
+        _ = await lane.restoreComposer()
+        let liveQuestion = questionSnapshot(store)
+        _ = try await lane.questionPersistence.commitCreation(liveQuestion).get()
+        let liveItemID = "question-\(sessionID.uuidString)-\(liveQuestion.interactionID.uuidString)"
+        let committed = await Support.eventually {
+            guard case let .supported(record)? = coordinator.liveRecordState(for: sessionID) else { return false }
+            return record.questions.count == 2
+        }
+        XCTAssertTrue(committed)
+        XCTAssertNil(coordinator.catalog.item(id: liveItemID), "A live question stays in its live card")
+
+        // Its request ends without an answer (window close): it becomes historical now.
+        lane.questionPersistence.end([liveQuestion.interactionID], preserving: true)
+        let ended = try XCTUnwrap(coordinator.catalog.item(id: liveItemID))
+        XCTAssertEqual(ended.payload, .question(liveQuestion, isCurrentLaunch: true))
+
+        // Dismiss writes only the acknowledgement; the question is kept and stays listable.
+        let failure = await coordinator.dismissCatalogItem(listed)
+        XCTAssertNil(failure)
+        let dismissed = await Support.eventually { coordinator.catalog.item(id: earlierItemID)?.isDismissed == true }
+        XCTAssertTrue(dismissed)
+        XCTAssertFalse(coordinator.catalog.bannerItems(sessionID: sessionID, workspaceID: workspace.id).contains { $0.id == earlierItemID })
+        XCTAssertEqual(coordinator.catalog.needsAttentionItems(includeDismissed: true).count { $0.id == earlierItemID }, 1)
+        let stored = await store.read(sessionID: sessionID).record
+        let record = try XCTUnwrap(stored)
+        XCTAssertEqual(Set(record.questions.map(\.interactionID)), [earlierQuestion.interactionID, liveQuestion.interactionID])
+        XCTAssertEqual(record.cardAcknowledgements.map(\.key.kind), [.question])
+
+        // A repeated Dismiss of the same state succeeds without another write.
+        let revision = record.revision
+        let repeated = await coordinator.dismissCatalogItem(listed)
+        XCTAssertNil(repeated)
+        let unchanged = await store.read(sessionID: sessionID).record?.revision
+        XCTAssertEqual(unchanged, revision)
+    }
+
+    /// Review A F05: a closed session whose record holds only a saved draft is discoverable from
+    /// that record, by composer revision. While a live lane owns the session its composer state
+    /// represents the draft instead; when the lane is released the record lists it again.
+    func testCatalogListsDurableDraftsOfSessionsWithoutALiveLane() async throws {
+        let earlierStore = makeStore()
+        let earlierService = makeService(store: earlierStore)
+        let load = try await makeSession(earlierService)
+        let earlier = try await startedCoordinator(store: earlierStore, service: earlierService)
+        let earlierLane = try earlier.claimLane(owner: Owner(), persistenceState: load.persistenceState)
+        _ = await earlierLane.restoreComposer()
+        earlierLane.composerDidChange(Support.content("draft left in a closed session"))
+        guard case .committed = await earlierLane.flushComposer() else {
+            return XCTFail("the draft is saved")
+        }
+        let saved = await earlierStore.read(sessionID: load.session.id).record?.composer
+        let snapshot = try XCTUnwrap(saved)
+
+        let store = makeStore()
+        let service = makeService(store: store)
+        let coordinator = try await startedCoordinator(store: store, service: service)
+        let sessionID = load.session.id
+        let itemID = AgentRecoveryCatalogProjection.heldDraftItemID(sessionID: sessionID, revision: snapshot.revision)
+        let listed = try XCTUnwrap(coordinator.catalog.item(id: itemID), "a draft-only closed session is listed")
+        XCTAssertEqual(listed.kind, .savedDraft)
+        XCTAssertEqual(listed.payload, .closedSessionDraft(snapshot, fromClearedConversation: false))
+        XCTAssertEqual(listed.workspaceID, workspace.id, "Open routes to its workspace")
+        XCTAssertEqual(listed.acknowledgement?.key.entityID, String(describing: snapshot.revision))
+
+        // A live lane's composer represents it while the session is open.
+        let reloaded = try await service.loadAgentSessionForEditing(id: sessionID, for: workspace)
+        let lane = try coordinator.claimLane(owner: Owner(), persistenceState: XCTUnwrap(reloaded?.persistenceState))
+        _ = await lane.restoreComposer()
+        let represented = await Support.eventually { coordinator.catalog.item(id: itemID) == nil }
+        XCTAssertTrue(represented, "no duplicate row while the lane owns the composer")
+
+        // Released (the tab closed): the durable record lists it again.
+        await coordinator.releaseLane(lane).value
+        let relisted = await Support.eventually { coordinator.catalog.item(id: itemID) != nil }
+        XCTAssertTrue(relisted)
+        guard case .closedSessionDraft(snapshot, fromClearedConversation: false)? = coordinator.catalog.item(id: itemID)?.payload else {
+            return XCTFail("the same saved draft, by its revision")
+        }
+    }
+
+    /// Review R1 (A P2): a session created this launch (absent from the startup results) and then
+    /// closed keeps its compose tab with its workspace, so its durable items offer Open.
+    func testClosedSessionOfThisLaunchKeepsItsComposeTabForOpen() async throws {
+        let store = makeStore()
+        let service = makeService(store: store)
+        let coordinator = try await startedCoordinator(store: store, service: service)
+        let load = try await makeSession(service)
+        let sessionID = load.session.id
+        XCTAssertNil(coordinator.reconciliation.resolution(for: sessionID), "not in the startup results")
+        let tab = AgentTabSession(tabID: UUID())
+        let lane = try coordinator.claimLane(owner: tab, persistenceState: load.persistenceState)
+        _ = await lane.restoreComposer()
+        lane.composerDidChange(Support.content("draft of a closed new session"))
+        guard case .committed = await lane.flushComposer() else {
+            return XCTFail("the draft is saved")
+        }
+        let saved = await store.read(sessionID: sessionID).record?.composer
+        let snapshot = try XCTUnwrap(saved)
+
+        await coordinator.releaseLane(lane).value
+        XCTAssertEqual(coordinator.knownComposeTabID(for: sessionID), tab.tabID)
+        let itemID = AgentRecoveryCatalogProjection.heldDraftItemID(sessionID: sessionID, revision: snapshot.revision)
+        let listed = await Support.eventually { coordinator.catalog.item(id: itemID) != nil }
+        XCTAssertTrue(listed, "the closed session's saved draft is listed")
+        let item = try XCTUnwrap(coordinator.catalog.item(id: itemID))
+        XCTAssertEqual(item.workspaceID, workspace.id)
+        XCTAssertEqual(item.composeTabID, tab.tabID, "Open targets the session's compose tab")
+    }
+
+    /// Review A F04 / B F1: a run of this launch that ends after startup with an interruption cause
+    /// (provider process loss) is listed from the current committed record, by run attempt, on
+    /// the latest turn it dispatched into: a steer's own turn, not the run's opening turn. An
+    /// ordinary terminal is never listed, and an active run has no terminal evidence to list.
+    func testCatalogListsLiveRunInterruptionsAfterStartupOnTheSteeredTurn() async throws {
+        let store = makeStore()
+        let service = makeService(store: store)
+        let load = try await makeSession(service)
+        let coordinator = try await startedCoordinator(store: store, service: service)
+        let lane = try coordinator.claimLane(owner: Owner(), persistenceState: load.persistenceState)
+        let sessionID = load.session.id
+
+        // An ordinary failure of another run is not an interruption.
+        let ordinary = Support.ownership(sessionID: sessionID)
+        let ordinaryTurnID = UUID()
+        _ = try await lane.ensureRunAttempt(ownership: ordinary, processRunID: nil, transcriptTurnID: ordinaryTurnID).get()
+        await lane.recordTerminalEvidence(
+            Support.terminalCommit(ownership: ordinary, state: .failed, cause: .ordinary),
+            transcriptTurnID: ordinaryTurnID
+        ).value
+
+        // The interrupted run: opened on one turn, then steered into a second one.
+        let ownership = Support.ownership(sessionID: sessionID)
+        let openingTurnID = UUID()
+        _ = try await lane.ensureRunAttempt(ownership: ownership, processRunID: nil, transcriptTurnID: openingTurnID).get()
+        XCTAssertNil(coordinator.catalog.item(id: "turn-\(sessionID.uuidString)-\(openingTurnID.uuidString)"), "An active run is never listed")
+        let steer = try await lane.admitQueued(admission(lane, "steer")).get()
+        _ = try await lane.beginDispatch(
+            intentID: steer.receipt.intent.intentID,
+            attempt: AgentRecoveryAttemptStart(attemptID: UUID(), runAttemptID: ownership.attemptID),
+            authorization: .liveQueue
+        ).get()
+        let steerTurnID = steer.admission.userItemID
+        await lane.recordTerminalEvidence(
+            Support.terminalCommit(ownership: ownership, state: .failed, cause: .providerProcessLost),
+            transcriptTurnID: steerTurnID
+        ).value
+
+        let itemID = "turn-\(sessionID.uuidString)-\(steerTurnID.uuidString)"
+        let listed = await Support.eventually { coordinator.catalog.item(id: itemID) != nil }
+        XCTAssertTrue(listed, "listed on the steered turn the terminal closed")
+        let item = try XCTUnwrap(coordinator.catalog.item(id: itemID))
+        XCTAssertEqual(item.kind, .interruptedTurn)
+        guard case let .turn(turn) = item.payload else { return XCTFail("a turn row, got \(item.payload)") }
+        XCTAssertEqual(turn.turnID, steerTurnID)
+        XCTAssertEqual(turn.interruption.reason, .providerProcessLost)
+        XCTAssertEqual(turn.interruption.runAttemptID, ownership.attemptID)
+        XCTAssertTrue(turn.status.isInterruption)
+        XCTAssertEqual(item.acknowledgement?.key.entityID, ownership.attemptID.uuidString, "Identified by its run attempt")
+
+        let runItems = coordinator.catalog.needsAttentionItems(includeDismissed: true).filter {
+            $0.sessionID == sessionID && ($0.id.hasPrefix("turn-") || $0.id.hasPrefix("run-"))
+        }
+        XCTAssertEqual(runItems.map(\.id), [itemID], "Neither the opening turn nor the ordinary failure is listed")
+    }
+
+    /// A Dismiss of an item whose displayed state no longer matches is refused (never applied to the
+    /// changed item), and a non-dismissible item offers no acknowledgement.
+    func testCatalogDismissRefusesChangedAndNonDismissibleItems() async throws {
+        let store = makeStore()
+        let service = makeService(store: store)
+        let load = try await makeSession(service)
+        let coordinator = try await startedCoordinator(store: store, service: service)
+        let lane = try coordinator.claimLane(owner: Owner(), persistenceState: load.persistenceState)
+        let question = questionSnapshot(store)
+        _ = try await lane.questionPersistence.commitCreation(question).get()
+        lane.questionPersistence.end([question.interactionID], preserving: true)
+        let itemID = "question-\(load.session.id.uuidString)-\(question.interactionID.uuidString)"
+        let present = await Support.eventually { coordinator.catalog.item(id: itemID) != nil }
+        XCTAssertTrue(present)
+        let item = try XCTUnwrap(coordinator.catalog.item(id: itemID))
+        let itemKey = try XCTUnwrap(item.acknowledgement).key
+        let changed = AgentRecoveryCatalogItem(
+            id: item.id,
+            kind: item.kind,
+            sessionID: item.sessionID,
+            workspaceID: item.workspaceID,
+            sessionName: item.sessionName,
+            composeTabID: item.composeTabID,
+            payload: item.payload,
+            acknowledgement: AgentRecoveryCatalogAcknowledgement(
+                key: itemKey,
+                freshness: AgentRecoveryCardFreshness("an older state"),
+                isAcknowledged: false
+            )
+        )
+        let refusal = await coordinator.dismissCatalogItem(changed)
+        XCTAssertEqual(refusal, "This item changed. Review it again.")
+        let nonDismissible = AgentRecoveryCatalogItem(
+            id: "workspace-x", kind: .statusUnknown, sessionID: nil, workspaceID: workspace.id, sessionName: nil,
+            composeTabID: nil, payload: .workspaceFailure(reason: "x"), acknowledgement: nil
+        )
+        let notOffered = await coordinator.dismissCatalogItem(nonDismissible)
+        XCTAssertNotNil(notOffered)
+        let record = await store.read(sessionID: load.session.id).record
+        XCTAssertEqual(record?.cardAcknowledgements.count ?? 0, 0, "Nothing was written")
+    }
+
+    // MARK: Indexed schedules (sessions no window hosts)
+
+    @MainActor
+    private final class HydratedSessions {
+        var ids: Set<UUID> = []
+    }
+
+    private struct IndexedSchedule {
+        let sessionID: UUID
+        let tabID: UUID
+        let scheduleID: UUID
+
+        var itemID: String {
+            "schedule-\(sessionID.uuidString)-\(scheduleID.uuidString)"
+        }
+    }
+
+    private func sessionIndexURL(_ storage: URL) -> URL {
+        storage.appendingPathComponent("AgentSessions", isDirectory: true)
+            .appendingPathComponent("AgentSessionIndex.json")
+    }
+
+    /// An earlier launch's session file whose saved schedule is in `state` (nothing hydrates it).
+    private func writeScheduledSession(
+        _ service: AgentSessionDataService,
+        in workspace: AgentRecoveryWorkspaceDestination,
+        storage: URL,
+        name: String,
+        state: AgentScheduledSendPersist.State,
+        notBefore: Date,
+        attempt: AgentScheduledSendPersist.Attempt? = nil
+    ) async throws -> IndexedSchedule {
+        let tabID = UUID()
+        let load = try await service.prepareInitialAgentSessionPersistence(
+            initialSession: AgentSession(id: UUID(), workspaceID: workspace.id, composeTabID: tabID, name: name)
+                .withItems([AgentChatItem.user("hello", sequenceIndex: 0)]),
+            for: workspace,
+            preparation: .alreadyCanonicalTranscript,
+            trustedCanonicalItemCount: 1
+        )
+        let schedule = AgentScheduledSendPersist(
+            id: UUID(),
+            createdAt: notBefore.addingTimeInterval(-60),
+            updatedAt: notBefore,
+            notBefore: notBefore,
+            state: state,
+            confirmationReason: state == .needsConfirmation ? .missedWhileClosed : nil,
+            rawText: "scheduled \(name)",
+            attachments: [],
+            taggedFileAttachments: [],
+            interviewFirst: false,
+            isNewSessionStart: false,
+            runAlongsideOtherSessions: false,
+            attempt: attempt
+        )
+        let sessionURL = storage
+            .appendingPathComponent("AgentSessions", isDirectory: true)
+            .appendingPathComponent("AgentSession-\(load.session.id.uuidString).json")
+        var saved = try AgentSessionDataCodec.decodeSession(from: Data(contentsOf: sessionURL))
+        saved.scheduledSend = .v1(schedule)
+        try AgentSessionDataCodec.encodeSession(saved).write(to: sessionURL, options: .atomic)
+        return IndexedSchedule(sessionID: load.session.id, tabID: tabID, scheduleID: schedule.id)
+    }
+
+    /// Review B F4: a previous build's schema-7 index (same schedule summary shape, no recovery hint)
+    /// still lists its schedules read-only instead of a permanent "couldn't be checked" item, and
+    /// is neither rewritten nor rebuilt; an older, incompatible schema stays not checked.
+    func testScheduleCompatibleOlderIndexIsReadForScheduleDiscoveryWithoutRewriting() async throws {
+        let storage = root.appendingPathComponent("schema7", isDirectory: true)
+        let legacyStorage = root.appendingPathComponent("schema6", isDirectory: true)
+        let workspace = AgentRecoveryWorkspaceDestination(id: UUID(), name: "Schema 7", customStoragePath: storage)
+        let legacy = AgentRecoveryWorkspaceDestination(id: UUID(), name: "Schema 6", customStoragePath: legacyStorage)
+        let earlier = makeService(store: makeStore())
+        let notBefore = Date(timeIntervalSince1970: 1000)
+        let schedule = try await writeScheduledSession(
+            earlier, in: workspace, storage: storage, name: "Old index", state: .needsConfirmation, notBefore: notBefore
+        )
+        _ = try await writeScheduledSession(
+            earlier, in: legacy, storage: legacyStorage, name: "Older index", state: .needsConfirmation, notBefore: notBefore
+        )
+        for (folder, version) in [(storage, 7), (legacyStorage, 6)] {
+            try? FileManager.default.removeItem(at: sessionIndexURL(folder))
+            let builder = makeService(store: makeStore())
+            let target = folder == storage ? workspace : legacy
+            _ = try await builder.indexedAgentSessionMetadataRecords(for: target)
+            var json = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: sessionIndexURL(folder))) as? [String: Any])
+            json["schemaVersion"] = version
+            json["entries"] = (json["entries"] as? [[String: Any]])?.map { entry in
+                var entry = entry
+                entry.removeValue(forKey: "recoveryHint")
+                return entry
+            }
+            try JSONSerialization.data(withJSONObject: json).write(to: sessionIndexURL(folder), options: .atomic)
+        }
+        let olderBytes = try Data(contentsOf: sessionIndexURL(storage))
+
+        let store = makeStore()
+        let service = makeService(store: store)
+        let compatible = await service.recoveryIndexedSessionRecords(for: workspace)
+        let records = try XCTUnwrap(compatible, "A schema-7 index is read for schedule discovery")
+        XCTAssertEqual(records.compactMap(\.scheduledSendSummary?.id), [schedule.scheduleID])
+        let incompatible = await service.recoveryIndexedSessionRecords(for: legacy)
+        XCTAssertNil(incompatible, "An older, incompatible schema is not read")
+
+        let coordinator = try await startedCoordinator(store: store, service: service)
+        coordinator.attachScheduler(
+            AgentScheduledSendCoordinator(startupAdmission: .open),
+            hydratedSessionIDs: { [] },
+            indexWorkspaces: { [workspace, legacy] }
+        )
+        await coordinator.indexedScheduleRefresh?.value
+        XCTAssertNotNil(coordinator.catalog.item(id: schedule.itemID), "The schema-7 index's schedule is listed")
+        XCTAssertNil(coordinator.catalog.item(id: "schedule-index-\(workspace.id.uuidString)"), "No permanent not-checked item")
+        XCTAssertNotNil(coordinator.catalog.item(id: "schedule-index-\(legacy.id.uuidString)"))
+        XCTAssertEqual(try Data(contentsOf: sessionIndexURL(storage)), olderBytes, "Discovery never rewrites or rebuilds an index")
+    }
+
+    /// Review A F08: an index-sourced confirmation names its schedule attempt, so its card freshness
+    /// equals the hydrated schedule's and a Dismiss survives the session hydrating.
+    func testIndexedScheduleCardKeepsItsOccurrenceFreshnessAcrossHydration() async throws {
+        let storage = root.appendingPathComponent("closed-attempt", isDirectory: true)
+        let closed = AgentRecoveryWorkspaceDestination(id: UUID(), name: "Closed", customStoragePath: storage)
+        let earlier = makeService(store: makeStore())
+        let notBefore = Date(timeIntervalSince1970: 1000)
+        let attempt = AgentScheduledSendPersist.Attempt(attemptID: UUID(), itemID: UUID(), startedAt: notBefore)
+        let attempted = try await writeScheduledSession(
+            earlier, in: closed, storage: storage, name: "Attempted", state: .needsConfirmation, notBefore: notBefore, attempt: attempt
+        )
+        try? FileManager.default.removeItem(at: sessionIndexURL(storage))
+
+        let store = makeStore()
+        let service = makeService(store: store)
+        _ = try await service.indexedAgentSessionMetadataRecords(for: closed)
+        let coordinator = try await startedCoordinator(store: store, service: service)
+        coordinator.attachScheduler(
+            AgentScheduledSendCoordinator(startupAdmission: .open),
+            hydratedSessionIDs: { [] },
+            indexWorkspaces: { [closed] }
+        )
+        await coordinator.indexedScheduleRefresh?.value
+
+        let item = try XCTUnwrap(coordinator.catalog.item(id: attempted.itemID))
+        guard case let .scheduleNeedsConfirmation(indexed) = item.payload else {
+            return XCTFail("Unexpected payload \(item.payload)")
+        }
+        XCTAssertEqual(indexed.attemptID, attempt.attemptID, "The index names the confirmation's attempt")
+        // The hydrated scheduler's summary of the same occurrence (its attempt, reason, and time).
+        let hydrated = AgentScheduledSendConfirmationSummary(
+            sessionID: attempted.sessionID,
+            tabID: attempted.tabID,
+            workspaceID: closed.id,
+            scheduleID: attempted.scheduleID,
+            attemptID: attempt.attemptID,
+            reason: .missedWhileClosed,
+            notBefore: notBefore,
+            previewText: "scheduled Attempted",
+            sessionName: "Attempted"
+        )
+        XCTAssertEqual(
+            AgentRecoveryCatalogProjection.scheduleFreshness(indexed),
+            AgentRecoveryCatalogProjection.scheduleFreshness(hydrated),
+            "Hydration never makes the same confirmation occurrence look fresh"
+        )
+        if let acknowledgement = item.acknowledgement {
+            XCTAssertEqual(acknowledgement.freshness, AgentRecoveryCatalogProjection.scheduleFreshness(hydrated))
+        }
+    }
+
+    /// Review R1 (A F08 residual): an index-read confirmation without its occurrence identity (no
+    /// attempt, as a legacy entry decodes) offers Open but no Dismiss, so hydration supplying the
+    /// attempt can never resurface a dismissed card; one naming its attempt stays dismissable.
+    func testIndexedScheduleWithoutAttemptRequiresOpenBeforeDismiss() async throws {
+        let storage = try XCTUnwrap(workspace.customStoragePath)
+        let destination = AgentRecoveryWorkspaceDestination(id: workspace.id, name: workspace.name, customStoragePath: storage)
+        let earlier = makeService(store: makeStore())
+        let notBefore = Date(timeIntervalSince1970: 1000)
+        let attempt = AgentScheduledSendPersist.Attempt(attemptID: UUID(), itemID: UUID(), startedAt: notBefore)
+        let attempted = try await writeScheduledSession(
+            earlier, in: destination, storage: storage, name: "Attempted", state: .needsConfirmation, notBefore: notBefore, attempt: attempt
+        )
+        let legacy = try await writeScheduledSession(
+            earlier, in: destination, storage: storage, name: "Legacy", state: .needsConfirmation, notBefore: notBefore.addingTimeInterval(60)
+        )
+        try? FileManager.default.removeItem(at: sessionIndexURL(storage))
+
+        let store = makeStore()
+        let service = makeService(store: store)
+        _ = try await service.indexedAgentSessionMetadataRecords(for: destination)
+        let coordinator = try await startedCoordinator(store: store, service: service)
+        coordinator.attachScheduler(
+            AgentScheduledSendCoordinator(startupAdmission: .open),
+            hydratedSessionIDs: { [] },
+            indexWorkspaces: { [destination] }
+        )
+        await coordinator.indexedScheduleRefresh?.value
+        // Lanes (not hydration) supply each session's incarnation, so cards can be keyed; the index
+        // stays their schedule source.
+        for sessionID in [attempted.sessionID, legacy.sessionID] {
+            let reloaded = try await service.loadAgentSessionForEditing(id: sessionID, for: workspace)
+            _ = try coordinator.claimLane(owner: Owner(), persistenceState: XCTUnwrap(reloaded?.persistenceState))
+        }
+
+        let attemptedItem = try XCTUnwrap(coordinator.catalog.item(id: attempted.itemID))
+        XCTAssertNotNil(attemptedItem.acknowledgement, "An index entry naming its attempt stays dismissable")
+        let legacyItem = try XCTUnwrap(coordinator.catalog.item(id: legacy.itemID))
+        guard case let .scheduleNeedsConfirmation(summary) = legacyItem.payload else {
+            return XCTFail("Unexpected payload \(legacyItem.payload)")
+        }
+        XCTAssertNil(summary.attemptID)
+        XCTAssertTrue(summary.requiresOpenBeforeDismiss)
+        XCTAssertNil(legacyItem.acknowledgement, "No Dismiss without the occurrence identity")
+        XCTAssertEqual(legacyItem.composeTabID, legacy.tabID, "Open stays available")
+        let refused = await coordinator.dismissCatalogItem(legacyItem)
+        XCTAssertNotNil(refused, "Dismiss is refused until the session is opened")
+        XCTAssertFalse(coordinator.catalog.item(id: legacy.itemID)?.isDismissed ?? true)
+    }
+
+    /// Schedules awaiting confirmation in sessions no window hosts (here a workspace no window has
+    /// open) are listed from that workspace's metadata index, one item per schedule identity. A
+    /// hydrated session, or a schedule whose exact attempt is held for transfer, withdraws exactly its
+    /// own item. A workspace with session files but no index is listed as not checked. Discovery
+    /// creates, rebuilds, registers, hydrates, and confirms nothing.
+    func testCatalogListsIndexedScheduleConfirmationsOfUnhostedSessionsByScheduleIdentity() async throws {
+        let closedStorage = root.appendingPathComponent("closed", isDirectory: true)
+        let unindexedStorage = root.appendingPathComponent("unindexed", isDirectory: true)
+        let emptyStorage = root.appendingPathComponent("empty", isDirectory: true)
+        let closed = AgentRecoveryWorkspaceDestination(id: UUID(), name: "Closed", customStoragePath: closedStorage)
+        let unindexed = AgentRecoveryWorkspaceDestination(id: UUID(), name: "Unindexed", customStoragePath: unindexedStorage)
+        let empty = AgentRecoveryWorkspaceDestination(id: UUID(), name: "Empty", customStoragePath: emptyStorage)
+
+        // Earlier launch: session files with saved schedules, written after their index entries.
+        let earlier = makeService(store: makeStore())
+        let base = Date(timeIntervalSince1970: 1000)
+        let first = try await writeScheduledSession(
+            earlier, in: closed, storage: closedStorage, name: "Closed 1", state: .needsConfirmation, notBefore: base
+        )
+        let second = try await writeScheduledSession(
+            earlier, in: closed, storage: closedStorage, name: "Closed 2", state: .needsConfirmation, notBefore: base.addingTimeInterval(60)
+        )
+        let third = try await writeScheduledSession(
+            earlier, in: closed, storage: closedStorage, name: "Closed 3", state: .needsConfirmation, notBefore: base.addingTimeInterval(120)
+        )
+        let pending = try await writeScheduledSession(
+            earlier, in: closed, storage: closedStorage, name: "Closed 4", state: .scheduled, notBefore: base.addingTimeInterval(180)
+        )
+        _ = try await writeScheduledSession(
+            earlier, in: unindexed, storage: unindexedStorage, name: "Unindexed", state: .needsConfirmation, notBefore: base
+        )
+        try? FileManager.default.removeItem(at: sessionIndexURL(closedStorage))
+        try? FileManager.default.removeItem(at: sessionIndexURL(unindexedStorage))
+
+        // This launch: the closed workspace's index is current (an ordinary sidebar read rebuilt it);
+        // the other workspace has none.
+        let store = makeStore()
+        let service = makeService(store: store)
+        _ = try await service.indexedAgentSessionMetadataRecords(for: closed)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: sessionIndexURL(closedStorage).path))
+        let coordinator = try await startedCoordinator(store: store, service: service)
+        let scheduler = AgentScheduledSendCoordinator(startupAdmission: .open)
+        let hydrated = HydratedSessions()
+        coordinator.attachScheduler(
+            scheduler,
+            hydratedSessionIDs: { hydrated.ids },
+            indexWorkspaces: { [closed, unindexed, empty] }
+        )
+        await coordinator.indexedScheduleRefresh?.value
+
+        let item = try XCTUnwrap(coordinator.catalog.item(id: first.itemID))
+        XCTAssertEqual(item.kind, .scheduleNeedsConfirmation)
+        XCTAssertEqual(item.sessionID, first.sessionID)
+        XCTAssertEqual(item.workspaceID, closed.id)
+        XCTAssertEqual(item.sessionName, "Closed 1")
+        XCTAssertEqual(item.composeTabID, first.tabID)
+        guard case let .scheduleNeedsConfirmation(summary) = item.payload else {
+            return XCTFail("Unexpected payload \(item.payload)")
+        }
+        XCTAssertEqual(summary.scheduleID, first.scheduleID)
+        XCTAssertEqual(summary.reason, .missedWhileClosed)
+        XCTAssertNil(summary.attemptID)
+        XCTAssertEqual(summary.notBefore, base)
+        XCTAssertNotNil(coordinator.catalog.item(id: second.itemID))
+        XCTAssertNotNil(coordinator.catalog.item(id: third.itemID))
+        XCTAssertNil(coordinator.catalog.item(id: pending.itemID), "A schedule not awaiting confirmation is not listed")
+        let unchecked = try XCTUnwrap(coordinator.catalog.item(id: "schedule-index-\(unindexed.id.uuidString)"))
+        XCTAssertEqual(unchecked.kind, .statusUnknown)
+        XCTAssertNil(unchecked.acknowledgement)
+        XCTAssertNil(coordinator.catalog.item(id: "schedule-index-\(empty.id.uuidString)"))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: sessionIndexURL(unindexedStorage).path), "Discovery never rebuilds an index")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: emptyStorage.path), "Discovery creates nothing")
+        XCTAssertTrue(scheduler.confirmationSummaries().isEmpty, "Nothing was registered or hydrated for the catalog")
+
+        // A hydrated session's owner is authoritative: only its own index item is withdrawn. (In
+        // production hydration registers with the scheduler, whose dashboard change re-projects.)
+        hydrated.ids = [first.sessionID]
+        coordinator.invalidateCatalog()
+        XCTAssertNil(coordinator.catalog.item(id: first.itemID))
+        XCTAssertNotNil(coordinator.catalog.item(id: second.itemID))
+
+        // A transfer hold on one schedule's exact attempt withdraws that schedule only, through the
+        // scheduler's own dashboard notification.
+        let hold = AgentScheduledSendTransferHold(
+            sessionID: second.sessionID,
+            scheduleID: second.scheduleID,
+            scheduleAttemptID: UUID(),
+            reason: .awaitingRecovery
+        )
+        scheduler.holdTransfer(hold)
+        let held = await Support.eventually { coordinator.catalog.item(id: second.itemID) == nil }
+        XCTAssertTrue(held, "A held attempt is presented by its transfer, not as a confirmation")
+        XCTAssertNotNil(coordinator.catalog.item(id: third.itemID), "A different schedule stays listed")
+        scheduler.releaseTransferHold(scheduleID: hold.scheduleID, scheduleAttemptID: hold.scheduleAttemptID)
+        let released = await Support.eventually { coordinator.catalog.item(id: second.itemID) != nil }
+        XCTAssertTrue(released)
+    }
+
     // MARK: Deleted sessions
 
     // MARK: Shutdown (R4 two-stage quit / window close)

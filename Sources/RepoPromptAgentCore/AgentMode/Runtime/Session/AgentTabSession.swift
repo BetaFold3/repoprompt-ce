@@ -225,6 +225,12 @@ package final class AgentTabSession: ObservableObject {
     package var transcriptViewportState: AgentTranscriptViewportState = .liveBottom
     package var transcriptAutoFollowArmingState: AgentTranscriptAutoFollowArmingState = .armed
     package var askUserContinuation: CheckedContinuation<AgentAskUserResponse, Error>?
+    /// An `ask_user` whose snapshot is being committed before it is published (plan §E): a
+    /// concurrent request is refused as if this one were already pending.
+    package var recoveryQuestionCreationReservation: UUID?
+    /// Interactions whose answer is flushing its latest snapshot before the reply is sent: further
+    /// edits, answers, and the timeout are refused for them meanwhile.
+    package var recoveryQuestionResolutionReservations: Set<UUID> = []
     package var askUserTimeoutTask: Task<Void, Never>?
     package var pendingAskUserTimeoutGeneration: UInt64 = 0
     package var hasPendingQuestionUI: Bool {
@@ -1484,6 +1490,10 @@ package final class AgentTabSession: ObservableObject {
     package var assistantDeltaFlushGeneration: UInt64 = 0
     var providerTerminalDrainGeneration: UInt64 = 0
     package var terminalCommitInProgress: Bool = false
+    /// Set once by the irreversible lifecycle teardown (two-stage shutdown Stage B or the legacy
+    /// close path) before it cancels the run, so a runner that commits first after its task is
+    /// cancelled still records the teardown cause. Stage A never sets it.
+    package var lifecycleTeardownCause: AgentRunTerminalCause?
     package var lastTerminalCommitRevision: AgentRunTerminalCommitRevision?
     var lastTerminalPublicationResult: AgentRunTerminalPublicationResult?
     /// Commit whose queued follow-up instruction was already consumed (at most one per commit).

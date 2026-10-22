@@ -2807,21 +2807,29 @@ package enum AgentTranscriptIO {
         var interruptedTurnsByID: [UUID: AgentTranscriptTurn] = [:]
         // R5 interruption evidence is turn-level and never rebuilt from items: carried by turn ID.
         var interruptionsByTurnID: [UUID: AgentTranscriptTurnInterruption] = [:]
+        // Phase 2 recovered-outcome markers are turn-level evidence too (review A F03-R1).
+        var recoveredOutcomesByTurnID: [UUID: AgentTranscriptTurnRecoveredOutcome] = [:]
         for turn in existingWorkingTranscript.turns {
             if let interruption = turn.interruption {
                 interruptionsByTurnID[turn.id] = interruption
+            }
+            if let recoveredOutcome = turn.recoveredOutcome {
+                recoveredOutcomesByTurnID[turn.id] = recoveredOutcome
             }
             guard turn.terminalState == .cancelled || turn.terminalState == .failed,
                   !turn.responseSpans.contains(where: { $0.lifecycle == .open })
             else { continue }
             interruptedTurnsByID[turn.id] = turn
         }
-        guard !interruptedTurnsByID.isEmpty || !interruptionsByTurnID.isEmpty else {
+        guard !interruptedTurnsByID.isEmpty || !interruptionsByTurnID.isEmpty || !recoveredOutcomesByTurnID.isEmpty else {
             return rebuiltWorkingTranscript
         }
         var preserved = rebuiltWorkingTranscript
         for index in preserved.turns.indices where preserved.turns[index].interruption == nil {
             preserved.turns[index].interruption = interruptionsByTurnID[preserved.turns[index].id]
+        }
+        for index in preserved.turns.indices where preserved.turns[index].recoveredOutcome == nil {
+            preserved.turns[index].recoveredOutcome = recoveredOutcomesByTurnID[preserved.turns[index].id]
         }
         let finalIndex = preserved.turns.indices.last
         for index in preserved.turns.indices {

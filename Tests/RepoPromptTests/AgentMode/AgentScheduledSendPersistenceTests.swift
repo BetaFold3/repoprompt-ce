@@ -226,7 +226,8 @@ final class AgentScheduledSendPersistenceTests: XCTestCase {
             AgentSessionMetadataIndex.self,
             from: Data(contentsOf: indexFile)
         )
-        XCTAssertEqual(rewritten.schemaVersion, 7)
+        // Phase 2 schema 8 (bounded recovery hint); a schema-6 index is still rebuilt.
+        XCTAssertEqual(rewritten.schemaVersion, 8)
         XCTAssertEqual(rewritten.entries.count, 3)
     }
 

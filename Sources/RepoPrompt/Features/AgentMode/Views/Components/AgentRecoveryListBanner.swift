@@ -1,9 +1,11 @@
 import Foundation
 import SwiftUI
 
-/// Lossless-restart recovery list above the composer (Phase 1b): held input with View / Edit /
-/// Remove, held or unsaved drafts with Restore / Discard (confirmed), composer save failures,
-/// crash holds, interrupted turns, held schedule transfers, and unknown recovery status. Failures stay inline on their row until the action succeeds; nothing shows a
+/// Lossless-restart recovery banner above the composer: the active session's items of the app-wide
+/// recovery catalog (held input with View / Edit / Remove, held or unsaved drafts with Restore /
+/// Discard (confirmed), unanswered questions, composer save failures, crash holds, interrupted
+/// turns, held schedule transfers, and unknown recovery status), with a Needs Attention entry for
+/// items elsewhere. Failures stay inline on their row until the action succeeds; nothing shows a
 /// permanent "Saving"/"Saved" state.
 struct AgentRecoveryListBanner: View {
     let props: AgentRecoveryListProps
@@ -60,6 +62,11 @@ struct AgentRecoveryListBanner: View {
                 Button("Retry") { actions.retryStartup() }
                     .accessibilityIdentifier("agent.recoveryList.retry")
             }
+            if props.status == .ready, props.otherItemCount > 0 {
+                Button("Needs Attention (\(props.otherItemCount))…") { actions.openNeedsAttention() }
+                    .controlSize(.small)
+                    .accessibilityIdentifier("agent.recoveryList.needsAttention")
+            }
         }
         .frame(minHeight: Self.headerHeight)
     }
@@ -89,7 +96,8 @@ struct AgentRecoveryListBanner: View {
     }
 }
 
-private struct AgentRecoveryListRow: View {
+/// One recovery row (banner and Needs Attention sheet).
+struct AgentRecoveryListRow: View {
     let row: AgentRecoveryListRowProps
     let actions: AgentRecoveryListActions
 
@@ -190,8 +198,10 @@ private struct AgentRecoveryListRow: View {
             "Open"
         case .confirmStopped:
             "It stopped"
-        case .hide:
-            "Hide"
+        case .dismiss:
+            "Dismiss"
+        case .removeSavedQuestion:
+            "Remove saved question"
         case .restoreDraft:
             "Restore"
         case .discardDraft:

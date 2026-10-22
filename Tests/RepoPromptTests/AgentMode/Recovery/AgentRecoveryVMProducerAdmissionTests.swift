@@ -338,7 +338,7 @@ final class AgentRecoveryVMProducerAdmissionTests: XCTestCase {
         let listed = await RecoveryTestSupport.eventually { row() != nil }
         XCTAssertTrue(listed, "A current-launch held intent is listed live")
         XCTAssertEqual(row()?.text, "submitted draft")
-        XCTAssertEqual(row()?.actions, [.edit, .remove])
+        XCTAssertEqual(row()?.actions, [.edit, .remove, .dismiss])
         XCTAssertTrue(
             row()?.detail.contains(AgentModeViewModel.refusedSubmissionHoldReason) == true,
             String(describing: row()?.detail)
@@ -408,8 +408,8 @@ final class AgentRecoveryVMProducerAdmissionTests: XCTestCase {
 
         let listed = await RecoveryTestSupport.eventually { row(unknownRowID) != nil && row(inFlightRowID) != nil }
         XCTAssertTrue(listed, "Stopped-run uncertain input is visible without a restart")
-        XCTAssertEqual(row(unknownRowID)?.actions, [.remove])
-        XCTAssertEqual(row(inFlightRowID)?.actions, [])
+        XCTAssertEqual(row(unknownRowID)?.actions, [.remove, .dismiss])
+        XCTAssertEqual(row(inFlightRowID)?.actions, [.dismiss])
         for id in [unknownRowID, inFlightRowID] {
             XCTAssertTrue(
                 row(id)?.detail.contains(AgentRecoveryCoordinator.runEndedUnconfirmedHoldReason) == true,

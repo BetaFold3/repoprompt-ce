@@ -639,6 +639,53 @@ package enum AgentRecoveryRunAssociationPolicy: Equatable {
     case keepExisting
 }
 
+/// Why a run reached its terminal commit (Phase 2). Recorded with terminal evidence and used by
+/// the shared interruption classifier; there is deliberately no live `appCrash` cause (a crash
+/// never commits). An explicit user cancel is not an interruption.
+package enum AgentRunTerminalCause: String, CaseIterable {
+    /// Provider completion or failure, or a cancellation that is neither a user stop nor a
+    /// lifecycle teardown (workspace switch, reset, delete).
+    case ordinary
+    case userCancel
+    case appQuit
+    case windowClose
+    case providerProcessLost
+
+    /// The live interruption reason this cause stamps on a non-completed turn; `nil` when the
+    /// terminal is not an interruption.
+    package var interruptionReason: AgentTranscriptTurnInterruption.Reason? {
+        switch self {
+        case .ordinary, .userCancel: nil
+        case .appQuit: .appQuit
+        case .windowClose: .windowClose
+        case .providerProcessLost: .providerProcessLost
+        }
+    }
+
+    package init(shutdownReason: AgentRecoveryShutdownReason) {
+        switch shutdownReason {
+        case .appQuit: self = .appQuit
+        case .windowClose: self = .windowClose
+        // Safe restart is a later phase; its teardown is an app quit until then.
+        case .safeRestart: self = .appQuit
+        case .providerProcessLost: self = .providerProcessLost
+        }
+    }
+
+    /// The cause a commit records: a completed run is always ordinary (completion wins against a
+    /// provisional shutdown reason), an explicit user cancel stays one, and otherwise a lifecycle
+    /// teardown cause set before the run was cancelled wins over the runner's own request.
+    package static func effective(
+        requested: AgentRunTerminalCause,
+        terminalState: AgentSessionRunState,
+        lifecycleTeardown: AgentRunTerminalCause?
+    ) -> AgentRunTerminalCause {
+        if terminalState == .completed { return .ordinary }
+        if requested == .userCancel { return .userCancel }
+        return lifecycleTeardown ?? requested
+    }
+}
+
 /// Terminal evidence from `AgentRunTerminalCommitRevision`, independent of any MCP envelope.
 package struct AgentRecoveryRunTerminalEvidence: Equatable {
     package let commitID: UUID
@@ -646,6 +693,8 @@ package struct AgentRecoveryRunTerminalEvidence: Equatable {
     package let terminalState: AgentSessionRunState
     package let expectedRunID: UUID?
     package let recordedAt: AgentRecoveryTimestamp
+    /// `nil` for evidence written before Phase 2 or with an unrecognized value (kept in extras).
+    package let cause: AgentRunTerminalCause?
     package var extras: AgentRecoveryExtras
 
     package init(
@@ -653,12 +702,14 @@ package struct AgentRecoveryRunTerminalEvidence: Equatable {
         terminalState: AgentSessionRunState,
         expectedRunID: UUID?,
         recordedAt: AgentRecoveryTimestamp,
+        cause: AgentRunTerminalCause?,
         extras: AgentRecoveryExtras = [:]
     ) {
         self.commitID = commitID
         self.terminalState = terminalState
         self.expectedRunID = expectedRunID
         self.recordedAt = recordedAt
+        self.cause = cause
         self.extras = extras
     }
 }
@@ -774,6 +825,81 @@ package struct AgentRecoveryCrashHoldAcknowledgement: Equatable {
     }
 }
 
+// MARK: - Recovery card acknowledgements (durable Dismiss)
+
+/// Typed semantic identity of one recovery card (lossless restart Phase 2 §D): session incarnation,
+/// the item's own reset generation where it has one, kind, and durable entity ID (run-attempt ID,
+/// legacy turn ID, intent ID, interaction ID, composer revision, schedule/attempt identity, or crash
+/// hold identity). Never row text, array position, record revision, or `updatedAt`. The kind is kept
+/// as its raw string so an acknowledgement a newer build wrote round-trips unchanged.
+package struct AgentRecoveryCardKey: Hashable {
+    package enum Kind: String, CaseIterable {
+        /// An interrupted turn or a run's recorded terminal outcome.
+        case run
+        case savedInput
+        case savedDraft
+        case question
+        case schedule
+        case crashHold
+    }
+
+    package let kindRaw: String
+    package let incarnationID: UUID
+    package let transcriptResetGeneration: UInt64?
+    package let entityID: String
+
+    package init(kind: Kind, incarnationID: UUID, transcriptResetGeneration: UInt64?, entityID: String) {
+        self.init(kindRaw: kind.rawValue, incarnationID: incarnationID, transcriptResetGeneration: transcriptResetGeneration, entityID: entityID)
+    }
+
+    package init(kindRaw: String, incarnationID: UUID, transcriptResetGeneration: UInt64?, entityID: String) {
+        self.kindRaw = kindRaw
+        self.incarnationID = incarnationID
+        self.transcriptResetGeneration = transcriptResetGeneration
+        self.entityID = entityID
+    }
+
+    /// `nil` for a kind this build does not know (kept, never matched).
+    package var kind: Kind? {
+        Kind(rawValue: kindRaw)
+    }
+}
+
+/// The semantic state of a card when it was acknowledged, derived only from typed facts that make
+/// it reappear when they change materially (outcome or interruption cause, delivery classification
+/// and holds, a new composer revision, a new confirmation occurrence or reason, a changed
+/// uncertainty set). Ordinary edits, receipts, and unrelated record writes do not change it.
+package struct AgentRecoveryCardFreshness: Hashable {
+    package let token: String
+
+    package init(_ token: String) {
+        self.token = token
+    }
+}
+
+/// The user's durable Dismiss of one card in one semantic state. It hides that card only while its
+/// freshness is unchanged. It never resolves a turn, withdraws or edits input, removes a question
+/// or draft, confirms or cancels a schedule, releases a crash hold or restriction, or changes run
+/// or process ownership.
+package struct AgentRecoveryCardAcknowledgement: Equatable {
+    package let key: AgentRecoveryCardKey
+    package let freshness: AgentRecoveryCardFreshness
+    package let acknowledgedAt: AgentRecoveryTimestamp
+    package var extras: AgentRecoveryExtras
+
+    package init(
+        key: AgentRecoveryCardKey,
+        freshness: AgentRecoveryCardFreshness,
+        acknowledgedAt: AgentRecoveryTimestamp,
+        extras: AgentRecoveryExtras = [:]
+    ) {
+        self.key = key
+        self.freshness = freshness
+        self.acknowledgedAt = acknowledgedAt
+        self.extras = extras
+    }
+}
+
 // MARK: - Record
 
 package struct AgentRecoveryRecord: Equatable {
@@ -795,6 +921,9 @@ package struct AgentRecoveryRecord: Equatable {
     /// Pending questions preserved by the latest shutdown preparation (empty = none). Display and
     /// explicit composer restore only: never a continuation, routing, or provider request.
     package let questions: [AgentRecoveryQuestionSnapshot]
+    /// Durable card acknowledgements (Dismiss), one per card key (empty = none). Additive: a record
+    /// without them decodes empty and keeps its existing bytes.
+    package let cardAcknowledgements: [AgentRecoveryCardAcknowledgement]
     package let extras: AgentRecoveryExtras
 
     package init(
@@ -809,10 +938,12 @@ package struct AgentRecoveryRecord: Equatable {
         runAttempts: [AgentRecoveryRunAttempt],
         crashHoldAcknowledgement: AgentRecoveryCrashHoldAcknowledgement? = nil,
         questions: [AgentRecoveryQuestionSnapshot] = [],
+        cardAcknowledgements: [AgentRecoveryCardAcknowledgement] = [],
         extras: AgentRecoveryExtras = [:]
     ) {
         self.crashHoldAcknowledgement = crashHoldAcknowledgement
         self.questions = questions
+        self.cardAcknowledgements = cardAcknowledgements
         self.sessionID = sessionID
         self.revision = revision
         self.incarnationID = incarnationID
@@ -835,6 +966,15 @@ package struct AgentRecoveryRecord: Equatable {
 
     package func runAttempt(id: UUID) -> AgentRecoveryRunAttempt? {
         runAttempts.first { $0.runAttemptID == id }
+    }
+
+    package func cardAcknowledgement(for key: AgentRecoveryCardKey) -> AgentRecoveryCardAcknowledgement? {
+        cardAcknowledgements.first { $0.key == key }
+    }
+
+    /// Whether the card is dismissed in exactly this semantic state.
+    package func isCardAcknowledged(_ key: AgentRecoveryCardKey, freshness: AgentRecoveryCardFreshness) -> Bool {
+        cardAcknowledgement(for: key)?.freshness == freshness
     }
 
     /// Intents (in submission order) whose captured pending handoff has `payloadID`: the hydration
@@ -934,6 +1074,32 @@ package struct AgentRecoveryQuestionSnapshot: Equatable {
         self.message = message
         self.items = items
         self.extras = extras
+    }
+
+    /// This snapshot written in place of `stored` (same interaction): the first stored ask time is
+    /// kept, so a recapture never manufactures freshness, and unknown fields of the stored snapshot
+    /// and of its items survive unless this snapshot carries the same key.
+    package func mergingStored(_ stored: AgentRecoveryQuestionSnapshot) -> AgentRecoveryQuestionSnapshot {
+        guard stored.interactionID == interactionID else { return self }
+        let storedItems = Dictionary(stored.items.map { ($0.questionID, $0.extras) }, uniquingKeysWith: { first, _ in first })
+        let mergedItems = items.map { item in
+            guard let storedExtras = storedItems[item.questionID], !storedExtras.isEmpty else { return item }
+            var merged = item
+            merged.extras = storedExtras.merging(item.extras) { _, new in new }
+            return merged
+        }
+        return AgentRecoveryQuestionSnapshot(
+            interactionID: interactionID,
+            kind: kind,
+            runAttemptID: runAttemptID,
+            transcriptResetGeneration: transcriptResetGeneration,
+            appInstanceID: appInstanceID,
+            askedAt: stored.askedAt,
+            title: title,
+            message: message,
+            items: mergedItems,
+            extras: stored.extras.merging(extras) { _, new in new }
+        )
     }
 
     /// Plain text for an explicit composer restore (question text plus any non-secret partial

@@ -39,7 +39,7 @@ extension AgentTabSession {
 @MainActor
 final class RecoveryLaneFixture {
     private struct Workspace: AgentWorkspaceStorageReference {
-        let id = UUID()
+        var id = UUID()
         let name = "Recovery Lane Fixture"
         let customStoragePath: URL?
     }
@@ -52,6 +52,7 @@ final class RecoveryLaneFixture {
     let coordinator: AgentRecoveryCoordinator
     let lane: AgentRecoverySessionLane
     private let owner: Owner
+    private let workspace: Workspace
 
     var sessionID: UUID {
         lane.sessionID
@@ -63,7 +64,8 @@ final class RecoveryLaneFixture {
         service: AgentSessionDataService,
         coordinator: AgentRecoveryCoordinator,
         lane: AgentRecoverySessionLane,
-        owner: Owner
+        owner: Owner,
+        workspace: Workspace
     ) {
         self.root = root
         self.store = store
@@ -71,6 +73,34 @@ final class RecoveryLaneFixture {
         self.coordinator = coordinator
         self.lane = lane
         self.owner = owner
+        self.workspace = workspace
+    }
+
+    /// A real same-owner successor claim that preserves ownership (same incarnation and lifecycle
+    /// binding, different persistence state), taking `claimLane`'s ownership-preserving hand-over
+    /// path (review R2, B R2-F1). The state comes from `relocatedPersistenceState()`, loaded before
+    /// any store write is held (loading takes the session persistence gate).
+    func claimSuccessor(persistenceState: AgentSessionPersistenceState) throws -> AgentRecoverySessionLane {
+        try coordinator.claimLane(owner: owner, persistenceState: persistenceState)
+    }
+
+    /// The same session incarnation's persistence state from a relocated file: the session's file is
+    /// copied to another storage folder of the same workspace and loaded by the same service.
+    func relocatedPersistenceState() async throws -> AgentSessionPersistenceState {
+        guard let storage = workspace.customStoragePath else { throw RecoveryLaneFixtureError.relocatedSessionUnavailable }
+        let fileName = "AgentSession-\(sessionID.uuidString).json"
+        let relocatedStorage = root.appendingPathComponent("relocated", isDirectory: true)
+        let relocatedFolder = relocatedStorage.appendingPathComponent("AgentSessions", isDirectory: true)
+        try FileManager.default.createDirectory(at: relocatedFolder, withIntermediateDirectories: true)
+        try FileManager.default.copyItem(
+            at: storage.appendingPathComponent("AgentSessions", isDirectory: true).appendingPathComponent(fileName),
+            to: relocatedFolder.appendingPathComponent(fileName)
+        )
+        let relocated = Workspace(id: workspace.id, customStoragePath: relocatedStorage)
+        guard let load = try await service.loadAgentSessionForEditing(id: sessionID, for: relocated) else {
+            throw RecoveryLaneFixtureError.relocatedSessionUnavailable
+        }
+        return load.persistenceState
     }
 
     static func make(
@@ -121,7 +151,8 @@ final class RecoveryLaneFixture {
             service: service,
             coordinator: coordinator,
             lane: lane,
-            owner: owner
+            owner: owner,
+            workspace: workspace
         )
     }
 
@@ -179,4 +210,5 @@ final class RecoveryLaneFixture {
 
 enum RecoveryLaneFixtureError: Error {
     case startupNotReady
+    case relocatedSessionUnavailable
 }

@@ -481,7 +481,7 @@ extension AgentModeRunServiceLifecycleTests {
             XCTFail("The initial turn must be registered before steering")
             observeTerminalPublication = false
             await harness.service.cancelRun(
-                tabID: session.tabID, session: session, completion: .terminalTeardownCompleted
+                tabID: session.tabID, session: session, cause: .userCancel, completion: .terminalTeardownCompleted
             )
             await agentTask?.value
             return
@@ -522,7 +522,7 @@ extension AgentModeRunServiceLifecycleTests {
 
         observeTerminalPublication = false
         await harness.service.cancelRun(
-            tabID: session.tabID, session: session, completion: .terminalTeardownCompleted
+            tabID: session.tabID, session: session, cause: .userCancel, completion: .terminalTeardownCompleted
         )
         await agentTask?.value
     }
@@ -640,7 +640,7 @@ extension AgentModeRunServiceLifecycleTests {
         let drainRun: () async -> Void = {
             await self.awaitWithinLifecycleBound("Runner task drains", operation: { _ = await agentTask?.value }) {
                 await harness.service.cancelRun(
-                    tabID: session.tabID, session: session, completion: .terminalTeardownCompleted
+                    tabID: session.tabID, session: session, cause: .userCancel, completion: .terminalTeardownCompleted
                 )
                 agentTask?.cancel()
             }
@@ -649,7 +649,7 @@ extension AgentModeRunServiceLifecycleTests {
             observeTerminalPublication = false
             if session.runState.isActive {
                 await harness.service.cancelRun(
-                    tabID: session.tabID, session: session, completion: .terminalTeardownCompleted
+                    tabID: session.tabID, session: session, cause: .userCancel, completion: .terminalTeardownCompleted
                 )
             }
             await drainRun()
@@ -799,7 +799,7 @@ extension AgentModeRunServiceLifecycleTests {
         case .runCancelled:
             observeTerminalPublication = false
             await harness.service.cancelRun(
-                tabID: session.tabID, session: session, completion: .terminalTeardownCompleted
+                tabID: session.tabID, session: session, cause: .userCancel, completion: .terminalTeardownCompleted
             )
             // The injected deadline is 60 s, so a flush that finishes within this bound
             // was interrupted by cancellation/ownership loss, not by the timeout.

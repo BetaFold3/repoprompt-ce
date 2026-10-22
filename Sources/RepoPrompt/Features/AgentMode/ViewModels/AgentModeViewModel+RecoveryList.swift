@@ -27,35 +27,131 @@ extension AgentModeViewModel {
         case let .failed(message):
             .failed("Interrupted work could not be checked: \(message). Sending stays paused until this succeeds.")
         }
-        let rows = status == .ready ? recoveryListRows(coordinator: coordinator, activeSession: activeSession) : []
+        var rows: [AgentRecoveryListRowProps] = []
+        var otherItemCount = 0
+        if status == .ready {
+            let catalog = coordinator.catalog
+            let sessionID = activeSession?.activeAgentSessionID
+            let workspaceID = persistenceWorkspace?.id
+            // Sending stays paused while a crash hold blocks: its card, even when dismissed, keeps a
+            // compact non-dismissible indicator with the confirmation.
+            if let sessionID, catalog.blockers[sessionID] == .crashHold,
+               let hold = catalog.items.first(where: { $0.sessionID == sessionID && $0.kind == .crashHold && $0.isDismissed })
+            {
+                rows.append(recoveryListRow(for: hold, coordinator: coordinator, activeSession: activeSession, pausedIndicator: true))
+            }
+            // The banner is an exact session (and tab) filter of the catalog. Schedule items stay
+            // with the scheduled-send surfaces: a schedule awaiting confirmation is already presented
+            // by the session's own scheduled-send banner, and an unchecked index is listed in Needs
+            // Attention.
+            let bannerItems = catalog.bannerItems(sessionID: sessionID, workspaceID: workspaceID, tabID: activeSession?.tabID)
+                .filter { !Self.isScheduleDomainItem($0) }
+            rows += bannerItems.map { recoveryListRow(for: $0, coordinator: coordinator, activeSession: activeSession) }
+            let shownIDs = Set(bannerItems.map(\.id))
+            otherItemCount = catalog.items.count { item in
+                !item.isDismissed && !shownIDs.contains(item.id)
+                    && !(item.kind == .scheduleNeedsConfirmation && item.sessionID == sessionID)
+            }
+        }
         let canRetry = if case .failed = status { recoveryStartupRetry != nil } else { false }
-        let props = AgentRecoveryListProps(status: status, rows: rows, canRetry: canRetry)
+        let props = AgentRecoveryListProps(status: status, rows: rows, canRetry: canRetry, otherItemCount: otherItemCount)
         return props.isEmpty ? nil : props
     }
 
-    private func recoveryListRows(
-        coordinator: AgentRecoveryCoordinator,
-        activeSession: AgentTabSession?
-    ) -> [AgentRecoveryListRowProps] {
+    /// Rows of the app-wide Needs Attention sheet: every catalog item in snapshot order (dismissed
+    /// ones only when asked), formatted for this window.
+    func recoveryNeedsAttentionRows(includeDismissed: Bool, activeSession: AgentTabSession?) -> [AgentRecoveryNeedsAttentionRow] {
+        guard let coordinator = recoveryCoordinator, coordinator.startupState == .ready else { return [] }
         let workspaceID = persistenceWorkspace?.id
-        let activeSessionID = activeSession?.activeAgentSessionID
-        var rows: [AgentRecoveryListRowProps] = []
-        func append(
-            _ id: String,
-            sessionID: UUID?,
-            name: String,
-            title: String,
-            detail: String,
+        return coordinator.catalog.needsAttentionItems(includeDismissed: includeDismissed).map { item in
+            AgentRecoveryNeedsAttentionRow(
+                row: recoveryListRow(for: item, coordinator: coordinator, activeSession: activeSession),
+                isDismissed: item.isDismissed,
+                isOtherWorkspace: item.workspaceID != nil && item.workspaceID != workspaceID
+            )
+        }
+    }
+
+    /// Undismissed catalog items (the sidebar's Needs Attention count).
+    var recoveryNeedsAttentionCount: Int {
+        guard let coordinator = recoveryCoordinator, coordinator.startupState == .ready else { return 0 }
+        return coordinator.catalog.items.count { !$0.isDismissed }
+    }
+
+    /// Asks this window's root to present the app-wide Needs Attention sheet (reachable with any
+    /// number of items, so dismissed ones stay reviewable) and re-reads index-only schedules. The
+    /// request stays pending until the window's sheet host consumes it, so a window that is still
+    /// appearing presents it once it is mounted. Starts and hydrates nothing.
+    func presentRecoveryNeedsAttention() {
+        recoveryNeedsAttentionRequestPending = true
+        recoveryCoordinator?.requestIndexedScheduleRefresh()
+        NotificationCenter.default.post(name: .agentRecoveryNeedsAttentionRequested, object: self)
+    }
+
+    /// Consumes a pending Needs Attention request (the window's sheet host presents it once).
+    func consumeRecoveryNeedsAttentionRequest() -> Bool {
+        guard recoveryNeedsAttentionRequestPending else { return false }
+        recoveryNeedsAttentionRequestPending = false
+        return true
+    }
+
+    /// Schedule-domain items are presented by the scheduled-send surfaces and Needs Attention, never
+    /// by the composer's recovery banner.
+    private static func isScheduleDomainItem(_ item: AgentRecoveryCatalogItem) -> Bool {
+        switch item.payload {
+        case .scheduleNeedsConfirmation, .scheduleIndexUnavailable: true
+        default: false
+        }
+    }
+
+    private static func recoveryListError(_ state: AgentRecoveryCatalogActionState?) -> String? {
+        if case let .failed(message)? = state { message } else { nil }
+    }
+
+    /// Formats one catalog item for this window: full actions for the active session (or the tab
+    /// owning a draft in this window), Open for another session with a tab, and Dismiss for an item
+    /// with a durable acknowledgement. Never rediscovers or removes anything.
+    // swiftlint:disable:next cyclomatic_complexity function_body_length
+    func recoveryListRow(
+        for item: AgentRecoveryCatalogItem,
+        coordinator: AgentRecoveryCoordinator,
+        activeSession: AgentTabSession?,
+        pausedIndicator: Bool = false
+    ) -> AgentRecoveryListRowProps {
+        let sessionID = item.sessionID
+        let isActive = sessionID != nil && sessionID == activeSession?.activeAgentSessionID
+        let tabSession = sessionID.flatMap { recoveryListTabSession(sessionID: $0) }
+        // A tab of this window that owns the item (a tab-keyed item may have no session yet).
+        let localTabID = item.composeTabID.flatMap { sessions[$0] != nil ? $0 : nil }
+        let name: String = if let tabSession {
+            resolvedSessionDisplayName(for: tabSession.tabID)
+        } else if let localTabID {
+            resolvedSessionDisplayName(for: localTabID)
+        } else if let sessionName = item.sessionName {
+            sessionName
+        } else if let sessionID {
+            "Session \(sessionID.uuidString.prefix(8))"
+        } else {
+            "This workspace"
+        }
+        let openAction: [AgentRecoveryListRowProps.Action] = isActive || item.composeTabID == nil ? [] : [.open]
+        let dismiss: [AgentRecoveryListRowProps.Action] = item.acknowledgement != nil && !item.isDismissed ? [.dismiss] : []
+        let liveIsEmpty: Bool = {
+            guard let tabSession, let lane = tabSession.recoveryLane else { return false }
+            return recoveryInputContent(for: tabSession, store: lane.store, sessionID: lane.sessionID)?.isEmpty ?? false
+        }()
+        let rowID = pausedIndicator ? "\(Self.recoveryListPausedRowPrefix)\(sessionID?.uuidString ?? "")" : item.id
+        let state = coordinator.catalogActionStates[rowID]
+        func row(
+            _ title: String,
+            _ detail: String,
             text: String? = nil,
             attachmentNames: [String] = [],
             actions: [AgentRecoveryListRowProps.Action] = [],
             confirmation: String? = nil
-        ) {
-            let state = recoveryListRowStates[id]
-            guard state != .resolved else { return }
-            let error: String? = if case let .failed(message)? = state { message } else { nil }
-            rows.append(AgentRecoveryListRowProps(
-                id: id,
+        ) -> AgentRecoveryListRowProps {
+            AgentRecoveryListRowProps(
+                id: rowID,
                 sessionID: sessionID,
                 sessionName: name,
                 title: title,
@@ -64,278 +160,160 @@ extension AgentModeViewModel {
                 attachmentNames: attachmentNames,
                 actions: actions,
                 isWorking: state == .working,
-                error: error,
+                error: Self.recoveryListError(state),
                 confirmation: confirmation
-            ))
-        }
-        let currentInstanceID = coordinator.store.appInstanceID
-        /// Held input of one session from its current record (the startup snapshot overlaid with
-        /// later commits). Earlier-launch intents that need a decision are listed; this launch's
-        /// intents when held (their projection was removed), stale-marked, or uncertain after their
-        /// run ended. Any other one is still projected by a live queue or an active run.
-        func appendIntentRows(
-            sessionID: UUID,
-            name: String,
-            record: AgentRecoveryRecord,
-            currentGeneration: UInt64,
-            isActive: Bool,
-            isRemote: Bool = false,
-            openAction: [AgentRecoveryListRowProps.Action]
-        ) {
-            let key = sessionID.uuidString
-            let heldReasons = coordinator.heldIntents(sessionID: sessionID, incarnationID: record.incarnationID)
-            for intent in record.intents where Self.recoveryListShowsIntent(intent) {
-                let isEarlierLaunch = intent.appInstanceID != currentInstanceID
-                let heldReason = heldReasons[intent.intentID]
-                    ?? (isEarlierLaunch ? nil : AgentRecoveryCoordinator.uncertainInputHoldReason(intent, in: record))
-                guard isEarlierLaunch || heldReason != nil || intent.staleTargetMarkedAt != nil else { continue }
-                let sameGeneration = intent.transcriptResetGeneration == currentGeneration
-                var detail = isRemote && intent.deliveryState == .deliveryUnknown
-                    ? Self.recoveryListRemoteUncertainty
-                    : Self.recoveryListCertainty(of: intent.deliveryState, earlierLaunch: isEarlierLaunch)
-                if let heldReason {
-                    detail += " \(heldReason)"
-                } else if !isEarlierLaunch {
-                    detail += " \(AgentRecoverySessionLane.sessionChangedHoldReason)"
-                }
-                if !sameGeneration {
-                    detail += " It was written before the conversation was cleared, so it can't be moved into it."
-                }
-                let actions: [AgentRecoveryListRowProps.Action] = isActive
-                    ? Self.recoveryListIntentActions(intent.deliveryState, sameGeneration: sameGeneration)
-                    : openAction
-                append(
-                    "intent-\(key)-\(intent.intentID.uuidString)",
-                    sessionID: sessionID,
-                    name: name,
-                    title: Self.recoveryListTitle(of: intent.deliveryState),
-                    detail: detail,
-                    text: intent.payload.text,
-                    attachmentNames: Self.recoveryListAttachmentNames(intent.payload),
-                    actions: actions
-                )
-            }
-        }
-        /// R4: questions that were pending when an earlier launch shut down. Historical text only:
-        /// the old request is never resumed; its text can be copied into an empty message box.
-        func appendQuestionRows(
-            sessionID: UUID,
-            name: String,
-            record: AgentRecoveryRecord,
-            isActive: Bool,
-            openAction: [AgentRecoveryListRowProps.Action]
-        ) {
-            let earlier = record.questions.filter { $0.appInstanceID != currentInstanceID }
-            guard !earlier.isEmpty else { return }
-            let liveIsEmpty: Bool = {
-                guard isActive, let session = activeSession, let lane = session.recoveryLane else { return false }
-                return recoveryInputContent(for: session, store: lane.store, sessionID: lane.sessionID)?.isEmpty ?? false
-            }()
-            for snapshot in earlier {
-                let actions: [AgentRecoveryListRowProps.Action] = isActive
-                    ? (liveIsEmpty ? [.restoreDraft, .discardDraft] : [.discardDraft])
-                    : openAction
-                append(
-                    Self.recoveryListQuestionRowID(sessionID: sessionID, interactionID: snapshot.interactionID),
-                    sessionID: sessionID,
-                    name: name,
-                    title: "Unanswered question",
-                    detail: liveIsEmpty || !isActive
-                        ? "The agent was waiting for an answer when RepoPrompt closed. That request has ended; you can copy the question and any partial answer into the message box."
-                        : "The agent was waiting for an answer when RepoPrompt closed. That request has ended. Clear the message box to copy it there, or dismiss it.",
-                    text: snapshot.composerText,
-                    actions: actions
-                )
-            }
-        }
-        var listedSessionIDs: Set<UUID> = []
-
-        for failure in coordinator.reconciliation.workspaceFailures where failure.workspaceID == workspaceID {
-            append(
-                "workspace-\(failure.workspaceID.uuidString)",
-                sessionID: nil,
-                name: "This workspace",
-                title: "Interrupted work could not be checked",
-                detail: "\(failure.reason) Sending and scheduling in this workspace stay paused."
             )
         }
-
-        for resolution in coordinator.reconciliation.sessions {
-            // This workspace's sessions; a session without an established destination is listed
-            // in every workspace (it may belong to any of them).
-            guard resolution.workspaceID == nil || resolution.workspaceID == workspaceID else { continue }
-            let sessionID = resolution.sessionID
-            let key = sessionID.uuidString
-            let name = resolution.sessionName ?? "Session \(key.prefix(8))"
-            let isActive = sessionID == activeSessionID
-            let openAction: [AgentRecoveryListRowProps.Action] = isActive || resolution.composeTabID == nil ? [] : [.open]
-            switch resolution.classification {
-            case .idle, .tombstoned:
-                continue
-            case let .nonactionable(reason):
-                append(
-                    "status-\(key)",
-                    sessionID: sessionID,
-                    name: name,
-                    title: "Recovery status unknown",
-                    detail: "\(Self.recoveryListDescription(of: reason)) Its saved data is kept unchanged; sending to it stays paused."
-                )
-                continue
-            case .duplicateDestination:
-                append(
-                    "status-\(key)",
-                    sessionID: sessionID,
-                    name: name,
-                    title: "Recovery status unknown",
-                    detail: "More than one workspace holds this session, so recovery can't choose one. Sending to it stays paused."
-                )
-                continue
-            case .noDestination:
-                append(
-                    "status-\(key)",
-                    sessionID: sessionID,
-                    name: name,
-                    title: "Recovery status unknown",
-                    detail: "Recovered messages exist for a session whose saved conversation wasn't found. They are kept unchanged."
-                )
-                continue
-            case .actionable:
-                break
+        switch item.payload {
+        case let .workspaceFailure(reason):
+            return row("Interrupted work could not be checked", "\(reason) Sending and scheduling in this workspace stay paused.")
+        case let .nonactionable(reason):
+            return row("Recovery status unknown", "\(Self.recoveryListDescription(of: reason)) Its saved data is kept unchanged; sending to it stays paused.")
+        case .duplicateDestination:
+            return row("Recovery status unknown", "More than one workspace holds this session, so recovery can't choose one. Sending to it stays paused.")
+        case .noDestination:
+            return row("Recovery status unknown", "Recovered messages exist for a session whose saved conversation wasn't found. They are kept unchanged.")
+        case let .crashHold(hold):
+            if pausedIndicator {
+                return row("Sending is paused", "The previous run may still be running. Confirm it stopped to send again.", actions: [.confirmStopped])
             }
-            guard let binding = resolution.binding else { continue }
-
-            if let hold = coordinator.crashHold(for: sessionID), coordinator.blockingCrashHold(for: binding) != nil {
-                append(
-                    "crash-\(key)",
-                    sessionID: sessionID,
-                    name: name,
-                    title: "The previous run may still be running",
-                    detail: hold.previousExitProvenClean
-                        ? "RepoPrompt closed while this session was working. Sending to it is paused until you confirm the previous run has stopped."
-                        : "RepoPrompt quit unexpectedly while this session was working. Sending to it is paused until you confirm the previous run has stopped.",
-                    actions: [.confirmStopped] + openAction
-                )
-            }
-
-            if case let .held(message) = resolution.scheduleTransfer,
-               coordinator.restrictions.sessionRestriction(sessionID) != nil
-            {
-                append(
-                    "transfer-\(key)",
-                    sessionID: sessionID,
-                    name: name,
-                    title: "Scheduled message held",
-                    detail: "\(message) It won't be sent until this is resolved.",
-                    actions: [.cancelSchedule] + openAction,
-                    confirmation: "Cancel this pending schedule? The message stays listed with its delivery unconfirmed; it won't be sent again automatically."
-                )
-            }
-
-            for turn in resolution.interruptedTurns {
-                let title = switch turn.status {
-                case .interrupted:
-                    "Turn interrupted"
-                case .completedTailMayBeMissing:
-                    "Completed while RepoPrompt was closed"
-                }
-                let detail = switch turn.status {
-                case .interrupted:
-                    "\(Self.recoveryListDescription(of: turn.interruption.reason)) The saved conversation stops where it was interrupted."
-                case .completedTailMayBeMissing:
-                    "The run finished, but the end of its transcript may be missing."
-                }
-                append(
-                    "turn-\(key)-\(turn.turnID.uuidString)",
-                    sessionID: sessionID,
-                    name: name,
-                    title: title,
-                    detail: detail,
-                    actions: [.hide] + openAction
-                )
-            }
-
+            return row(
+                "The previous run may still be running",
+                hold.previousExitProvenClean
+                    ? "RepoPrompt closed while this session was working. Sending to it is paused until you confirm the previous run has stopped."
+                    : "RepoPrompt quit unexpectedly while this session was working. Sending to it is paused until you confirm the previous run has stopped.",
+                actions: [.confirmStopped] + openAction + dismiss
+            )
+        case let .scheduleTransfer(message):
+            return row(
+                "Scheduled message held",
+                "\(message) It won't be sent until this is resolved.",
+                actions: [.cancelSchedule] + openAction,
+                confirmation: "Cancel this pending schedule? The message stays listed with its delivery unconfirmed; it won't be sent again automatically."
+            )
+        case let .turn(turn):
+            let (title, detail) = Self.recoveryListTurnText(turn)
+            return row(title, detail, actions: dismiss + openAction)
+        case let .outcomeTurn(outcome):
+            let (title, detail) = Self.recoveryListOutcomeTurnText(outcome)
+            return row(title, detail, actions: dismiss + openAction)
+        case let .recoveryOnlyRun(attempt):
             // R1a: a run whose turn was never saved is still listed from its recovery evidence. A
             // finished run (R09) shows its recorded outcome; it holds nothing.
-            for attempt in resolution.recoveryOnlyRunAttempts {
-                let (title, detail) = Self.recoveryOnlyRunRowText(attempt)
-                append(
-                    "run-\(key)-\(attempt.runAttemptID.uuidString)",
-                    sessionID: sessionID,
-                    name: name,
-                    title: title,
-                    detail: detail,
-                    actions: [.hide] + openAction
-                )
+            let (title, detail) = Self.recoveryOnlyRunRowText(attempt)
+            return row(title, detail, actions: dismiss + openAction)
+        case let .intent(intent, context):
+            var detail = context.isRemote && intent.deliveryState == .deliveryUnknown
+                ? Self.recoveryListRemoteUncertainty
+                : Self.recoveryListCertainty(of: intent.deliveryState, earlierLaunch: context.isEarlierLaunch)
+            if let heldReason = context.heldReason {
+                detail += " \(heldReason)"
+            } else if !context.isEarlierLaunch {
+                detail += " \(AgentRecoverySessionLane.sessionChangedHoldReason)"
             }
-
-            listedSessionIDs.insert(sessionID)
-            guard let record = recoveryListCurrentRecord(
-                coordinator: coordinator,
-                sessionID: sessionID,
-                startup: resolution.record?.record,
-                incarnationID: binding.incarnationID
-            ) else { continue }
-            appendIntentRows(
-                sessionID: sessionID,
-                name: name,
-                record: record,
-                currentGeneration: recoveryListLiveLane(sessionID: sessionID)?.binding.transcriptResetGeneration
-                    ?? max(binding.transcriptResetGeneration, record.transcriptResetGeneration),
-                isActive: isActive,
-                isRemote: resolution.remoteHostID != nil,
-                openAction: openAction
+            if !context.sameGeneration {
+                detail += " It was written before the conversation was cleared, so it can't be moved into it."
+            }
+            let actions = isActive
+                ? Self.recoveryListIntentActions(intent.deliveryState, sameGeneration: context.sameGeneration)
+                : openAction
+            return row(
+                Self.recoveryListTitle(of: intent.deliveryState),
+                detail,
+                text: intent.payload.text,
+                attachmentNames: Self.recoveryListAttachmentNames(intent.payload),
+                actions: actions + dismiss
             )
-            appendQuestionRows(
-                sessionID: sessionID,
-                name: name,
-                record: record,
-                isActive: isActive,
-                openAction: openAction
+        case let .question(snapshot, isCurrentLaunch):
+            // R4: historical text only; the old request is never resumed. Its text can be copied
+            // into an empty message box. A saved question does not prove it went unanswered (an
+            // answer may have been sent before its removal was saved), so its status is uncertain.
+            let ended = isCurrentLaunch
+                ? "The agent's question expired (its window or tab closed, or the request ended)."
+                : "The agent asked this question before RepoPrompt closed. That request has ended."
+            let uncertainty = "Whether an answer reached the agent is uncertain; check the conversation before answering again."
+            let actions: [AgentRecoveryListRowProps.Action] = isActive
+                ? (liveIsEmpty ? [.restoreDraft, .removeSavedQuestion] : [.removeSavedQuestion])
+                : openAction
+            return row(
+                "Expired question",
+                liveIsEmpty || !isActive
+                    ? "\(ended) \(uncertainty) You can copy the question and any partial answer into the message box."
+                    : "\(ended) \(uncertainty) Clear the message box to copy it there, or remove it.",
+                text: snapshot.composerText,
+                actions: actions + dismiss
             )
-        }
-
-        // This launch's held input of sessions absent from the startup results (created this
-        // launch, or first written since), from any owner or window of this workspace.
-        for (sessionID, held) in coordinator.heldIntentSessions.sorted(by: { $0.key.uuidString < $1.key.uuidString })
-            where !listedSessionIDs.contains(sessionID) && held.workspaceID == workspaceID
-        {
-            guard case let .supported(record)? = coordinator.liveRecordState(for: sessionID),
-                  record.incarnationID == held.incarnationID
-            else { continue }
-            appendIntentRows(
-                sessionID: sessionID,
-                name: recoveryListSessionName(sessionID),
-                record: record,
-                currentGeneration: recoveryListLiveLane(sessionID: sessionID)?.binding.transcriptResetGeneration
-                    ?? record.transcriptResetGeneration,
-                isActive: sessionID == activeSessionID,
-                openAction: []
+        case let .heldDraft(snapshot):
+            guard tabSession != nil else {
+                return row("Draft from before the conversation was cleared", "Open the session to restore or discard it.", text: snapshot.content.text, actions: dismiss)
+            }
+            return row(
+                "Draft from before the conversation was cleared",
+                liveIsEmpty
+                    ? "It was kept when the conversation was cleared. Restore it into the message box, or discard it."
+                    : "The message box has new text, so it can't be restored now; both are kept. Discarding it saves your current text.",
+                text: snapshot.content.text,
+                attachmentNames: Self.recoveryListAttachmentNames(snapshot.content),
+                actions: (liveIsEmpty ? [.restoreDraft, .discardDraft] : [.discardDraft]) + dismiss,
+                confirmation: liveIsEmpty
+                    ? "Discard the draft from before the conversation was cleared? This can't be undone."
+                    : "Discard the draft from before the conversation was cleared and save your current text?"
             )
-        }
-
-        // Composer recovery state of this window's sessions (held or unsaved drafts, failures).
-        let tabSessions = sessions.values.sorted { lhs, rhs in
-            if (lhs === activeSession) != (rhs === activeSession) { return lhs === activeSession }
-            return lhs.tabID.uuidString < rhs.tabID.uuidString
-        }
-        for session in tabSessions {
-            appendComposerRows(for: session, coordinator: coordinator, append: append)
-        }
-
-        // Unsaved input of a released lane whose owner went away (no lane inherited it yet).
-        for (sessionID, ownerless) in coordinator.ownerlessUnsavedInputs.sorted(by: { $0.key.uuidString < $1.key.uuidString })
-            where ownerless.workspaceID == workspaceID && coordinator.lane(for: sessionID) == nil
-        {
-            guard let entry = ownerless.inputs.first else { continue }
+        case let .closedSessionDraft(snapshot, fromClearedConversation):
+            // Review A F05: kept in the session's recovery record; opening the session restores it
+            // into the message box (or offers it, when it predates a cleared conversation).
+            return row(
+                fromClearedConversation ? "Draft from before the conversation was cleared" : "Saved draft",
+                fromClearedConversation
+                    ? "It was kept when the conversation was cleared. Open the session to restore or discard it."
+                    : "This session has unsent text in its message box. Open the session to continue it.",
+                text: snapshot.content.text,
+                attachmentNames: Self.recoveryListAttachmentNames(snapshot.content),
+                actions: openAction + dismiss
+            )
+        case let .composerRestoreFailed(failure):
+            return row(
+                "Saved draft couldn't be loaded",
+                "\(Self.recoveryListDescription(of: failure)) It is kept unchanged; sending from the message box stays paused until it loads.",
+                actions: tabSession == nil ? [] : [.retrySave]
+            )
+        case let .unsavedPredecessor(entry, count):
+            let suffix = Self.recoveryListFailureSuffix(entry.failure)
+            let choice = liveIsEmpty
+                ? "Restore it into the message box, or discard it."
+                : "Clear the message box to restore it, or discard it."
+            return row(
+                count == 1 ? "Unsaved draft" : "Unsaved draft (1 of \(count))",
+                "This draft couldn't be saved\(suffix). \(choice) Sending in this session is paused until it is resolved.",
+                text: entry.content.text,
+                attachmentNames: Self.recoveryListAttachmentNames(entry.content),
+                actions: tabSession == nil ? [] : (liveIsEmpty ? [.restoreDraft, .discardDraft] : [.discardDraft]),
+                confirmation: "Discard this unsaved draft? This can't be undone."
+            )
+        case let .composerWriteFailed(failure):
+            return row(
+                "Message box not saved",
+                "Your latest text couldn't be saved (\(Self.recoveryListDescription(of: failure))). It is still in the message box.",
+                actions: tabSession == nil ? [] : [.retrySave]
+            )
+        case let .questionSaveFailed(failure, unsentAnswer):
+            // Runtime only, never dismissible: it clears once a question write commits and no
+            // answer is held. A held answer is never sent before it is saved.
+            let reason = failure.map { " (\(Self.recoveryListDescription(of: $0)))" } ?? ""
+            return row(
+                unsentAnswer ? "Answer not sent" : "Question not saved",
+                unsentAnswer
+                    ? "Your answer couldn't be saved for crash recovery\(reason), so it wasn't sent. It is still in the question card; submit it again."
+                    : "The agent's question or your partial answer couldn't be saved for crash recovery\(reason). It is still shown in the session.",
+                actions: tabSession == nil ? [] : [.retrySave]
+            )
+        case let .ownerlessDraft(entry):
             // R02: a restored draft whose rollback is still owed is saved, but only an open session
             // can resolve it (durably); it offers no discard here.
             let awaitsRollback = entry.restoreRollback != nil
-            append(
-                "draft-ownerless-\(sessionID.uuidString)-\(Self.recoveryListFingerprint(entry))",
-                sessionID: sessionID,
-                name: recoveryListSessionName(sessionID),
-                title: awaitsRollback ? "Restored draft" : "Unsaved draft",
-                detail: awaitsRollback
+            return row(
+                awaitsRollback ? "Restored draft" : "Unsaved draft",
+                awaitsRollback
                     ? "Its tab closed before this restored draft could be put back\(Self.recoveryListFailureSuffix(entry.failure)). It is kept. Open the session to resolve it."
                     : "Its tab closed before this draft could be saved\(Self.recoveryListFailureSuffix(entry.failure)). Open the session to restore it, or discard it.",
                 text: entry.content.text,
@@ -343,130 +321,33 @@ extension AgentModeViewModel {
                 actions: awaitsRollback ? [] : [.discardDraft],
                 confirmation: awaitsRollback ? nil : "Discard this unsaved draft? This can't be undone."
             )
-        }
-        return rows
-    }
-
-    private typealias RecoveryListAppend = (
-        _ id: String,
-        _ sessionID: UUID?,
-        _ name: String,
-        _ title: String,
-        _ detail: String,
-        _ text: String?,
-        _ attachmentNames: [String],
-        _ actions: [AgentRecoveryListRowProps.Action],
-        _ confirmation: String?
-    ) -> Void
-
-    /// Held composer, unsaved predecessor input, composer save/restore failures, and owner
-    /// preparation failures of one tab. Restore is offered only into an empty message box; Discard
-    /// always asks first and keeps (and saves) current typing.
-    private func appendComposerRows(
-        for session: AgentTabSession,
-        coordinator: AgentRecoveryCoordinator,
-        append: RecoveryListAppend
-    ) {
-        let name = resolvedSessionDisplayName(for: session.tabID)
-        if let failure = coordinator.composerPreparation(for: session)?.failure {
-            append(
-                "draft-prep-\(session.tabID.uuidString)",
-                session.activeAgentSessionID,
-                name,
+        case let .composerPreparationFailed(failure):
+            // Runtime only (no durable authority yet): retried from the window owning the tab, never
+            // dismissed. It clears once a retry, hand-off, or discard clears the obligation.
+            return row(
                 "Message box not saved yet",
-                "Your current text couldn't be prepared for saving (\(Self.recoveryListDescription(of: failure))). It is still in the message box.",
-                nil,
-                [],
-                [.retrySave],
-                nil
+                localTabID == nil
+                    ? "A message box in another window couldn't be prepared for saving (\(Self.recoveryListDescription(of: failure))). Its text is still there; retry from that window."
+                    : "Your current text couldn't be prepared for saving (\(Self.recoveryListDescription(of: failure))). It is still in the message box.",
+                actions: localTabID == nil ? [] : [.retrySave]
             )
-        }
-        guard let lane = session.recoveryLane, !lane.isRetired else { return }
-        let sessionID = lane.sessionID
-        let liveIsEmpty = recoveryInputContent(for: session, store: lane.store, sessionID: sessionID)?.isEmpty ?? false
-        switch lane.composerState {
-        case let .held(snapshot):
-            append(
-                Self.recoveryListHeldDraftRowID(sessionID: sessionID, revision: snapshot.revision),
-                sessionID,
-                name,
-                "Draft from before the conversation was cleared",
-                liveIsEmpty
-                    ? "It was kept when the conversation was cleared. Restore it into the message box, or discard it."
-                    : "The message box has new text, so it can't be restored now; both are kept. Discarding it saves your current text.",
-                snapshot.content.text,
-                Self.recoveryListAttachmentNames(snapshot.content),
-                liveIsEmpty ? [.restoreDraft, .discardDraft] : [.discardDraft],
-                liveIsEmpty
-                    ? "Discard the draft from before the conversation was cleared? This can't be undone."
-                    : "Discard the draft from before the conversation was cleared and save your current text?"
+        case let .scheduleIndexUnavailable(workspaceName):
+            return row(
+                "Scheduled messages couldn't be checked",
+                "\(workspaceName) has saved sessions but no readable session list, so a scheduled message waiting for confirmation there may be missing here. Open that workspace to review its scheduled messages; nothing is sent automatically."
             )
-        case let .restoreFailed(failure):
-            append(
-                "draft-restorefail-\(sessionID.uuidString)",
-                sessionID,
-                name,
-                "Saved draft couldn't be loaded",
-                "\(Self.recoveryListDescription(of: failure)) It is kept unchanged; sending from the message box stays paused until it loads.",
-                nil,
-                [],
-                [.retrySave],
-                nil
-            )
-        case .unrestored, .restoring, .ready:
-            break
-        }
-        if let entry = lane.unsavedPredecessorInputs.first {
-            let count = lane.unsavedPredecessorInputs.count
-            let suffix = Self.recoveryListFailureSuffix(entry.failure)
-            let choice = liveIsEmpty
-                ? "Restore it into the message box, or discard it."
-                : "Clear the message box to restore it, or discard it."
-            append(
-                "draft-unsaved-\(sessionID.uuidString)-\(Self.recoveryListFingerprint(entry))",
-                sessionID,
-                name,
-                count == 1 ? "Unsaved draft" : "Unsaved draft (1 of \(count))",
-                "This draft couldn't be saved\(suffix). \(choice) Sending in this session is paused until it is resolved.",
-                entry.content.text,
-                Self.recoveryListAttachmentNames(entry.content),
-                liveIsEmpty ? [.restoreDraft, .discardDraft] : [.discardDraft],
-                "Discard this unsaved draft? This can't be undone."
-            )
-        }
-        if let failure = lane.composer.lastWriteFailure {
-            if case .store(.heldComposerUnresolved) = failure {
-                // Presented by the held-draft row: writes resume once it is resolved.
-            } else {
-                append(
-                    "draft-savefail-\(sessionID.uuidString)",
-                    sessionID,
-                    name,
-                    "Message box not saved",
-                    "Your latest text couldn't be saved (\(Self.recoveryListDescription(of: failure))). It is still in the message box.",
-                    nil,
-                    [],
-                    [.retrySave],
-                    nil
-                )
+        case let .scheduleNeedsConfirmation(summary):
+            let reason = switch summary.reason {
+            case .missedWhileClosed?: "Its time passed while RepoPrompt was closed."
+            case .missedDuringSleep?: "Its time passed while the Mac was asleep."
+            default: "It needs your confirmation before it is sent."
             }
-        }
-    }
-
-    /// The session's record as currently committed: the latest commit published since composition,
-    /// else the startup snapshot. `nil` for a removed record or another incarnation.
-    private func recoveryListCurrentRecord(
-        coordinator: AgentRecoveryCoordinator,
-        sessionID: UUID,
-        startup: AgentRecoveryRecord?,
-        incarnationID: UUID
-    ) -> AgentRecoveryRecord? {
-        guard let live = coordinator.liveRecordState(for: sessionID) else { return startup }
-        switch live {
-        case let .supported(record):
-            return record.incarnationID == incarnationID ? record : nil
-        case .absent:
-            return nil
+            return row(
+                "Scheduled message needs confirmation",
+                "\(reason) Open the session to send or cancel it; it won't be sent automatically.",
+                text: summary.previewText.isEmpty ? nil : summary.previewText,
+                actions: openAction + dismiss
+            )
         }
     }
 
@@ -478,38 +359,19 @@ extension AgentModeViewModel {
         }
     }
 
-    private func recoveryListLiveLane(sessionID: UUID) -> AgentRecoverySessionLane? {
-        recoveryCoordinator?.lane(for: sessionID)
-    }
-
-    private func recoveryListSessionName(_ sessionID: UUID) -> String {
-        if let session = recoveryListTabSession(sessionID: sessionID) {
-            return resolvedSessionDisplayName(for: session.tabID)
-        }
-        if let name = recoveryCoordinator?.reconciliation.resolution(for: sessionID)?.sessionName {
-            return name
-        }
-        return "Session \(sessionID.uuidString.prefix(8))"
-    }
-
     static func recoveryListQuestionRowID(sessionID: UUID, interactionID: UUID) -> String {
         "question-\(sessionID.uuidString)-\(interactionID.uuidString)"
     }
 
+    /// Catalog item identities (one formula shared with the catalog projection).
     static func recoveryListHeldDraftRowID(sessionID: UUID, revision: AgentRecoveryComposerRevision) -> String {
-        "draft-held-\(sessionID.uuidString)-\(recoveryListToken(String(describing: revision)))"
+        AgentRecoveryCatalogProjection.heldDraftItemID(sessionID: sessionID, revision: revision)
     }
 
     /// Identity of one displayed unsaved entry within this process (row IDs carry it, so an action
     /// applies only to exactly the entry that was shown).
     static func recoveryListFingerprint(_ entry: AgentRecoveryUnsavedComposerInput) -> String {
-        recoveryListToken(String(describing: entry))
-    }
-
-    private static func recoveryListToken(_ value: String) -> String {
-        var hasher = Hasher()
-        hasher.combine(value)
-        return String(UInt(bitPattern: hasher.finalize()), radix: 16)
+        AgentRecoveryCatalogProjection.fingerprint(entry)
     }
 
     private static func recoveryListAttachmentNames(_ content: AgentRecoveryInputContent) -> [String] {
@@ -520,12 +382,13 @@ extension AgentModeViewModel {
         failure.map { " (\(recoveryListDescription(of: $0)))" } ?? ""
     }
 
-    private static func recoveryListDescription(of failure: AgentRecoveryControllerFailure) -> String {
+    /// User-facing wording only: raw store errors and gate reasons can describe local paths.
+    static func recoveryListDescription(of failure: AgentRecoveryControllerFailure) -> String {
         switch failure {
-        case let .store(error):
-            "saving failed: \(error)"
-        case let .lifecycleRejected(reason):
-            "the session changed: \(reason)"
+        case .store:
+            "saving to disk failed"
+        case .lifecycleRejected:
+            "the session changed"
         case .retired:
             "the session moved to another tab or window"
         case .noHeldComposer, .heldInputChanged:
@@ -539,12 +402,12 @@ extension AgentModeViewModel {
 
     private static func recoveryListDescription(of failure: AgentRecoveryComposerPreparationFailure) -> String {
         switch failure {
-        case let .authorityUnavailable(reason):
-            "the session isn't ready: \(reason)"
+        case .authorityUnavailable:
+            "the session isn't ready"
         case .ownerReplaced:
             "the tab changed"
-        case let .imagePromotionFailed(reason):
-            "an image couldn't be saved: \(reason)"
+        case .imagePromotionFailed:
+            "an image couldn't be saved"
         }
     }
 
@@ -623,16 +486,53 @@ extension AgentModeViewModel {
                 "A run started but its turn was not saved before RepoPrompt stopped. Its output may be missing."
             )
         }
-        let outcome = switch terminal.terminalState {
-        case .completed: "The run completed"
-        case .cancelled: "The run was stopped"
+        // The shared classifier: a failed or cancelled run is never presented as completed.
+        let outcome = switch AgentRecoveryInterruptedTurn.Status.classify(terminal: terminal, shutdown: attempt.shutdown) {
+        case .completedTailMayBeMissing: "The run completed"
+        case .interrupted: "The run was interrupted"
         case .failed: "The run failed"
-        default: "The run ended"
+        case .stopped: "The run was stopped"
+        case .cancelledByUser: "The run was cancelled"
+        case .unknown: "The run ended"
         }
         return (
             "Run finished, but its turn wasn't saved",
             "\(outcome), but its turn was not saved before RepoPrompt stopped. Its output is missing from the conversation."
         )
+    }
+
+    /// Row text for a stamped turn, from the shared classifier.
+    static func recoveryListTurnText(_ turn: AgentRecoveryInterruptedTurn) -> (title: String, detail: String) {
+        recoveryListTurnText(status: turn.status, reason: turn.interruption.reason)
+    }
+
+    /// Row text for a turn saved open whose run's recorded outcome closed it (never an interruption).
+    static func recoveryListOutcomeTurnText(_ outcome: AgentRecoveryOutcomeTurn) -> (title: String, detail: String) {
+        recoveryListTurnText(status: outcome.status, reason: .unknown)
+    }
+
+    private static func recoveryListTurnText(
+        status: AgentRecoveryInterruptedTurn.Status,
+        reason: AgentTranscriptTurnInterruption.Reason
+    ) -> (title: String, detail: String) {
+        switch status {
+        case .interrupted:
+            (
+                "Turn interrupted",
+                "\(recoveryListDescription(of: reason)) The saved conversation stops where it was interrupted."
+            )
+        case .completedTailMayBeMissing:
+            ("Completed; transcript tail may be missing", "The run completed, but the end of its transcript may be missing.")
+        case .failed:
+            ("Run failed", "The run failed, and the end of its transcript may be missing.")
+        case .stopped:
+            ("Run stopped", "The run was stopped, and the end of its transcript may be missing.")
+        case .cancelledByUser:
+            // Explicit cancels include agent- and tool-requested ones, so the wording stays neutral.
+            ("Run cancelled", "This run was cancelled; the end of its transcript may be missing.")
+        case .unknown:
+            ("Run status unknown", "RepoPrompt can't tell how this run ended. The saved conversation is kept unchanged.")
+        }
     }
 
     private static func recoveryListDescription(of reason: AgentTranscriptTurnInterruption.Reason) -> String {
@@ -668,9 +568,12 @@ extension AgentModeViewModel {
     // MARK: Actions
 
     /// Performs one row action; failures stay visible inline on the row (repeat the action to retry).
+    /// Progress and failures are the coordinator's shared action state, so every surface (banner and
+    /// Needs Attention sheet, any window) shows the same. A row leaves only once its backing state
+    /// changed (committed), never by a local mark.
     func performRecoveryListAction(rowID: String, action: AgentRecoveryListRowProps.Action) async {
-        guard recoveryListRowStates[rowID] != .working else { return }
-        recoveryListRowStates[rowID] = .working
+        guard let coordinator = recoveryCoordinator, coordinator.catalogActionStates[rowID] != .working else { return }
+        coordinator.setCatalogActionState(.working, for: rowID)
         refreshRecoveryListUI()
         let failure: String? = switch action {
         case .edit:
@@ -681,26 +584,27 @@ extension AgentModeViewModel {
             await openRecoveryListSession(rowID: rowID)
         case .confirmStopped:
             await confirmRecoveryCrashHold(rowID: rowID)
-        case .hide:
-            nil
+        case .dismiss:
+            await dismissRecoveryListItem(rowID: rowID)
         case .restoreDraft:
             await resolveRecoveryListDraft(rowID: rowID, choice: .restoreToComposer)
-        case .discardDraft:
+        case .discardDraft, .removeSavedQuestion:
             await resolveRecoveryListDraft(rowID: rowID, choice: .discard)
         case .retrySave:
             await retryRecoveryListSave(rowID: rowID)
         case .cancelSchedule:
             await cancelRecoveryScheduleTransfer(rowID: rowID)
         }
-        if let failure {
-            recoveryListRowStates[rowID] = .failed(failure)
-        } else {
-            // Draft rows are backed by live state and leave once it is resolved; their IDs may
-            // recur (a later failure), so they are never marked resolved.
-            let conditionBacked = action == .open || rowID.hasPrefix(Self.recoveryListDraftRowPrefix)
-            recoveryListRowStates[rowID] = conditionBacked ? nil : .resolved
-        }
+        coordinator.setCatalogActionState(failure.map { .failed($0) }, for: rowID)
         refreshRecoveryListUI()
+    }
+
+    /// Dismiss: durably acknowledges exactly the displayed item in its displayed state. Nothing else
+    /// changes (the turn, input, question, draft, schedule, or crash hold stays as it is).
+    private func dismissRecoveryListItem(rowID: String) async -> String? {
+        guard let coordinator = recoveryCoordinator else { return nil }
+        guard let item = coordinator.catalog.item(id: rowID) else { return "This item changed. Review it again." }
+        return await coordinator.dismissCatalogItem(item)
     }
 
     static let recoveryListDraftRowPrefix = "draft-"
@@ -823,8 +727,34 @@ extension AgentModeViewModel {
         }
     }
 
+    private static func recoveryListRouteFailure(_ result: AgentSessionRouteResult) -> String? {
+        switch result {
+        case .routed:
+            nil
+        case .workspaceUnavailable:
+            "That workspace isn't available. Open it from the Workspaces menu."
+        case let .workspaceSwitchBlocked(message):
+            message ?? "RepoPrompt couldn't switch to that workspace."
+        case .blockedByActiveDifferentSession:
+            "Another session is active in that tab. Open this session from the sidebar."
+        case .tabUnavailable, .sessionUnavailable, .sessionMismatch:
+            "This session can't be opened from here. Open it from the sidebar."
+        }
+    }
+
     /// Retry save (write failure), retry load (restore failure), or restart preparation.
     private func retryRecoveryListSave(rowID: String) async -> String? {
+        if rowID.hasPrefix("savefail-question-") {
+            guard let sessionID = recoveryListSessionID(rowID),
+                  let session = recoveryListTabSession(sessionID: sessionID),
+                  let lane = AgentRecoveryLiveQuestions.lane(for: session)
+            else { return "This session is no longer open here." }
+            if case let .failed(failure) = await lane.questionPersistence.flush() {
+                return "The question still couldn't be saved (\(Self.recoveryListDescription(of: failure)))."
+            }
+            // A held answer is sent only by submitting it again (its card still holds it).
+            return lane.questionPersistence.unsentAnswerIDs.isEmpty ? nil : "Saved. Submit your answer again to send it."
+        }
         if let tabIDString = rowID.hasPrefix("draft-prep-") ? String(rowID.dropFirst("draft-prep-".count)) : nil {
             guard let tabID = UUID(uuidString: tabIDString), let session = sessions[tabID] else {
                 return "This tab is no longer open."
@@ -878,7 +808,25 @@ extension AgentModeViewModel {
         return (sessionID, intentID)
     }
 
+    /// Row ID of a session's compact paused indicator (its crash-hold card is dismissed).
+    static let recoveryListPausedRowPrefix = "paused-"
+
+    /// The catalog item a row acts on: the item itself, or for the paused indicator its session's
+    /// crash-hold item. Actions resolve sessions from the current catalog, never by re-parsing.
+    func recoveryListCatalogItem(_ rowID: String) -> AgentRecoveryCatalogItem? {
+        guard let coordinator = recoveryCoordinator else { return nil }
+        if rowID.hasPrefix(Self.recoveryListPausedRowPrefix) {
+            return coordinator.catalog.item(id: "crash-\(rowID.dropFirst(Self.recoveryListPausedRowPrefix.count))")
+        }
+        return coordinator.catalog.item(id: rowID)
+    }
+
     private func recoveryListSessionID(_ rowID: String) -> UUID? {
+        if let sessionID = recoveryListCatalogItem(rowID)?.sessionID { return sessionID }
+        if rowID.hasPrefix(Self.recoveryListPausedRowPrefix) {
+            return UUID(uuidString: String(rowID.dropFirst(Self.recoveryListPausedRowPrefix.count)))
+        }
+        // A row whose item just left the catalog (`<kind>-<session UUID>[-…]`).
         guard let dash = rowID.firstIndex(of: "-") else { return nil }
         return UUID(uuidString: String(rowID[rowID.index(after: dash)...].prefix(36)))
     }
@@ -1103,13 +1051,28 @@ extension AgentModeViewModel {
             : "The confirmation couldn't be saved, or the session's status changed. Review it again."
     }
 
-    /// Opens the row's session tab (switch or unstash) without starting anything.
+    typealias RecoveryListSessionRouter = @MainActor (AgentSessionDeepLinkRoute) async -> AgentSessionRouteResult
+
+    /// Production `recoveryListRouteToSession`: the existing agent-session navigation route.
+    static func routeRecoveryListSessionThroughDeepLinks(_ route: AgentSessionDeepLinkRoute) async -> AgentSessionRouteResult {
+        await AppDeepLinkRouter.shared.route(agentSession: route)
+    }
+
+    /// Opens the row's session tab (switch or unstash) without starting anything. A session in
+    /// another workspace is opened through the existing agent-session navigation route (it switches
+    /// to, or finds a window showing, that workspace).
     private func openRecoveryListSession(rowID: String) async -> String? {
-        guard let coordinator = recoveryCoordinator,
-              let sessionID = recoveryListSessionID(rowID),
-              let tabID = coordinator.reconciliation.resolution(for: sessionID)?.composeTabID,
-              let promptManager
-        else { return "This session can't be opened from here. Open it from the sidebar." }
+        let unavailable = "This session can't be opened from here. Open it from the sidebar."
+        guard let coordinator = recoveryCoordinator, let sessionID = recoveryListSessionID(rowID) else { return unavailable }
+        let item = recoveryListCatalogItem(rowID)
+        let resolution = coordinator.reconciliation.resolution(for: sessionID)
+        guard let tabID = item?.composeTabID ?? resolution?.composeTabID else { return unavailable }
+        if let workspaceID = item?.workspaceID ?? resolution?.workspaceID, workspaceID != persistenceWorkspace?.id {
+            let route = AgentSessionDeepLinkRoute(workspaceID: workspaceID, tabID: tabID, sessionID: sessionID)
+            let result = await recoveryListRouteToSession(route)
+            return Self.recoveryListRouteFailure(result)
+        }
+        guard let promptManager else { return unavailable }
         if promptManager.currentComposeTabs.contains(where: { $0.id == tabID }) {
             await promptManager.switchComposeTab(tabID)
         } else if promptManager.currentStashedTabs.contains(where: { $0.id == tabID }) {

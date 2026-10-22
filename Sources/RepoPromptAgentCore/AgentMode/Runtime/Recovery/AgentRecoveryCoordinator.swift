@@ -339,6 +339,10 @@ package extension Notification.Name {
     /// Distinct from `agentRecoveryCoordinatorDidChange`: startup results, holds, and restrictions
     /// are unchanged by an ordinary write.
     static let agentRecoveryRecordsDidChange = Notification.Name("AgentRecoveryCoordinator.recordsDidChange")
+    /// The recovery catalog may have changed (any recovery, lane, composer, question, or schedule
+    /// confirmation state, or a catalog action state). `object`: the coordinator. Coalesced; a
+    /// wake-up only: observers re-read `catalog` and `catalogActionStates`.
+    static let agentRecoveryCatalogDidChange = Notification.Name("AgentRecoveryCoordinator.catalogDidChange")
     /// Composer recovery state that needs a visible user decision or error changed (held composer,
     /// unsaved predecessor input, held intents, composer write or preparation failure). `object`: the
     /// coordinator; `userInfo["sessionID"]` when a lane is known. A wake-up only.
@@ -388,6 +392,12 @@ package final class AgentRecoveryCoordinator {
     /// App-scoped restrictions shared by recovery admission and scheduling.
     package private(set) var restrictions: AgentRecoveryRestrictions = .none
     private var lanes: [UUID: AgentRecoverySessionLane] = [:]
+    /// Workspace of each session's latest lane claim this launch (kept after release, so items of a
+    /// closed session can still be opened in their workspace).
+    private var laneWorkspaceIDs: [UUID: UUID] = [:]
+    /// Compose tab of each session's latest lane claim this launch, kept alongside its workspace so
+    /// Open on a closed session's item targets its tab identity (review R1, A P2).
+    private var laneComposeTabIDs: [UUID: UUID] = [:]
     /// Retirements of released lanes not yet inherited by a new lane for the same session.
     private var releasedRetirements: [UUID: AgentRecoverySessionLane.Retirement] = [:]
     /// Latest committed record state per session published by the store since composition (live
@@ -407,6 +417,26 @@ package final class AgentRecoveryCoordinator {
     private var releasedUnsavedInputs: [UUID: AgentRecoveryOwnerlessUnsavedInput] = [:]
     /// Active shutdown freezes by token (see `beginShutdownFreeze`).
     private var shutdownFreezes: [UUID: AgentRecoveryShutdownScope] = [:]
+    /// Cached catalog snapshot; `nil` once anything it projects changed.
+    private var cachedCatalog: AgentRecoveryCatalog?
+    private var catalogGeneration: UInt64 = 0
+    private var catalogChangePostScheduled = false
+    /// The shared scheduler: its summaries cover schedules of sessions some window hosts.
+    private weak var attachedScheduler: AgentScheduledSendCoordinator?
+    private var scheduleConfirmationObserver: (any NSObjectProtocol)?
+    /// Sessions a window hydrated: their owner (through the scheduler), never the index, is
+    /// authoritative for their schedule.
+    private var hydratedScheduleSessionIDs: @MainActor () -> Set<UUID> = { [] }
+    /// Every workspace whose metadata index the catalog reads for schedules no window hosts (`nil`
+    /// result: the inventory could not be read; the last read is kept).
+    private var scheduleIndexWorkspaces: (@MainActor () async -> [AgentRecoveryWorkspaceDestination]?)?
+    /// The latest index read (see `requestIndexedScheduleRefresh`).
+    private var indexedSchedules = AgentRecoveryIndexedSchedules.empty
+    private var indexedScheduleRefreshTask: Task<Void, Never>?
+    private var indexedScheduleRefreshPending = false
+    /// Shared, app-wide action state per catalog item (every surface shows the same progress or
+    /// error). An item disappears only when its backing state changes, never by a local mark.
+    package private(set) var catalogActionStates: [String: AgentRecoveryCatalogActionState] = [:]
     /// Serial tail of launch-mark writes (`shutdownInProgress`, `cleanExit`, corrections).
     private var launchMarkTail: Task<Void, Never>?
 
@@ -447,11 +477,26 @@ package final class AgentRecoveryCoordinator {
         Set(liveRecordCommits.keys)
     }
 
+    /// Every live (unretired) lane.
+    package var liveLanes: [AgentRecoverySessionLane] {
+        lanes.values.filter { !$0.isRetired }
+    }
+
     private func adoptRecordCommit(_ commit: AgentRecoveryRecordCommit) {
         if let existing = liveRecordCommits[commit.sessionID], existing.sequence >= commit.sequence {
             return
         }
         liveRecordCommits[commit.sessionID] = commit
+        invalidateCatalog()
+        // Schema-8 index hint: recomposed from the committed record facts (rewritten only on change).
+        let facts: AgentSessionRecoveryHint.RecordFacts = switch commit.state {
+        case let .supported(record): .make(from: record)
+        case .absent: .absent
+        }
+        let dataService = dataService
+        Task {
+            await dataService.noteRecoveryRecordCommitted(sessionID: commit.sessionID, sequence: commit.sequence, facts: facts)
+        }
         pruneHeldPresentation(for: commit)
         if case let .supported(record) = commit.state {
             presentUncertainInputOfEndedRuns(in: record)
@@ -472,8 +517,239 @@ package final class AgentRecoveryCoordinator {
         }
     }
 
+    // MARK: Catalog
+
+    /// The current app-wide recovery catalog (cached until anything it projects changes).
+    package var catalog: AgentRecoveryCatalog {
+        if let cachedCatalog { return cachedCatalog }
+        catalogGeneration &+= 1
+        let built = AgentRecoveryCatalogProjection.build(
+            coordinator: self,
+            schedules: mergedScheduleConfirmations(),
+            unavailableScheduleIndexes: indexedSchedules.unavailableWorkspaces,
+            generation: catalogGeneration
+        )
+        cachedCatalog = built
+        return built
+    }
+
+    /// Feeds the catalog schedules awaiting explicit confirmation from two read-only sources and
+    /// re-projects it whenever the scheduler's dashboard changes (replacing an earlier source):
+    /// - the shared scheduler's summaries, for sessions a window hosts (hydrated or open tab);
+    /// - every workspace's metadata index (`indexWorkspaces`), for sessions no window hosts, closed
+    ///   workspaces included. A hosted or hydrated session's index entry never adds a second item.
+    /// Neither source confirms, sends, or changes scheduler policy.
+    package func attachScheduler(
+        _ scheduler: AgentScheduledSendCoordinator,
+        hydratedSessionIDs: @escaping @MainActor () -> Set<UUID> = { [] },
+        indexWorkspaces: (@MainActor () async -> [AgentRecoveryWorkspaceDestination]?)? = nil
+    ) {
+        if let scheduleConfirmationObserver {
+            NotificationCenter.default.removeObserver(scheduleConfirmationObserver)
+        }
+        attachedScheduler = scheduler
+        hydratedScheduleSessionIDs = hydratedSessionIDs
+        scheduleIndexWorkspaces = indexWorkspaces
+        scheduleConfirmationObserver = NotificationCenter.default.addObserver(
+            forName: .agentScheduledSendDashboardDidChange,
+            object: scheduler,
+            queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated {
+                self?.invalidateCatalog()
+                self?.requestIndexedScheduleRefresh()
+            }
+        }
+        invalidateCatalog()
+        requestIndexedScheduleRefresh()
+    }
+
+    /// One item per schedule identity: the scheduler's summaries first, then index summaries of
+    /// sessions neither the scheduler nor a hydrated window covers. A schedule whose exact attempt is
+    /// held for transfer is presented by the transfer item instead.
+    private func mergedScheduleConfirmations() -> [AgentScheduledSendConfirmationSummary] {
+        let live = attachedScheduler?.confirmationSummaries() ?? []
+        let liveScheduleIDs = Set(live.map(\.scheduleID))
+        let liveSessionIDs = Set(live.map(\.sessionID))
+        let hydrated = hydratedScheduleSessionIDs()
+        let indexed = indexedSchedules.summaries.filter { summary in
+            !liveScheduleIDs.contains(summary.scheduleID)
+                && !liveSessionIDs.contains(summary.sessionID)
+                && !hydrated.contains(summary.sessionID)
+        }
+        return (live + indexed)
+            .filter { attachedScheduler?.transferHold(scheduleID: $0.scheduleID) == nil }
+            .sorted { ($0.notBefore, $0.scheduleID.uuidString) < ($1.notBefore, $1.scheduleID.uuidString) }
+    }
+
+    /// Re-reads every workspace's index for schedules awaiting confirmation (coalesced: at most one
+    /// read runs, and a request during it runs one more). Never hydrates, rebuilds, or writes.
+    package func requestIndexedScheduleRefresh() {
+        guard scheduleIndexWorkspaces != nil else { return }
+        guard indexedScheduleRefreshTask == nil else {
+            indexedScheduleRefreshPending = true
+            return
+        }
+        indexedScheduleRefreshTask = Task { @MainActor [weak self] in
+            await self?.runIndexedScheduleRefresh()
+        }
+    }
+
+    /// Test observability: the running index read, if any.
+    package var indexedScheduleRefresh: Task<Void, Never>? {
+        indexedScheduleRefreshTask
+    }
+
+    private func runIndexedScheduleRefresh() async {
+        defer { indexedScheduleRefreshTask = nil }
+        repeat {
+            indexedScheduleRefreshPending = false
+            guard startupState == .ready, let source = scheduleIndexWorkspaces else { return }
+            guard let workspaces = await source() else { continue }
+            let read = await Self.readIndexedSchedules(workspaces: workspaces, dataService: dataService)
+            if read != indexedSchedules {
+                indexedSchedules = read
+                invalidateCatalog()
+            }
+        } while indexedScheduleRefreshPending
+    }
+
+    private static func readIndexedSchedules(
+        workspaces: [AgentRecoveryWorkspaceDestination],
+        dataService: AgentSessionDataService
+    ) async -> AgentRecoveryIndexedSchedules {
+        var summaries: [AgentScheduledSendConfirmationSummary] = []
+        var unavailable: [AgentRecoveryWorkspaceDestination] = []
+        for workspace in workspaces {
+            guard let records = await dataService.recoveryIndexedSessionRecords(for: workspace) else {
+                unavailable.append(workspace)
+                continue
+            }
+            for record in records {
+                guard let summary = record.scheduledSendSummary, !summary.isUnreadable,
+                      summary.stateRaw == AgentScheduledSendPersist.State.needsConfirmation.rawValue,
+                      let scheduleID = summary.id, let notBefore = summary.notBefore
+                else { continue }
+                summaries.append(AgentScheduledSendConfirmationSummary(
+                    sessionID: record.id,
+                    tabID: record.composeTabID,
+                    workspaceID: workspace.id,
+                    scheduleID: scheduleID,
+                    attemptID: summary.attemptID,
+                    reason: summary.confirmationReasonRaw.flatMap(AgentScheduledSendPersist.ConfirmationReason.init(rawValue:)),
+                    notBefore: notBefore,
+                    previewText: summary.previewText,
+                    sessionName: record.name,
+                    requiresOpenBeforeDismiss: summary.attemptID == nil
+                ))
+            }
+        }
+        return AgentRecoveryIndexedSchedules(summaries: summaries, unavailableWorkspaces: unavailable)
+    }
+
+    /// Marks the catalog stale and posts one coalesced `agentRecoveryCatalogDidChange`.
+    package func invalidateCatalog() {
+        cachedCatalog = nil
+        postCatalogChange()
+    }
+
+    /// Startup results, holds, restrictions, or freezes changed.
+    private func postCoordinatorDidChange() {
+        invalidateCatalog()
+        NotificationCenter.default.post(name: .agentRecoveryCoordinatorDidChange, object: self)
+    }
+
+    /// Sets (or clears, with `nil`) the shared action state of one catalog item.
+    package func setCatalogActionState(_ state: AgentRecoveryCatalogActionState?, for itemID: String) {
+        guard catalogActionStates[itemID] != state else { return }
+        catalogActionStates[itemID] = state
+        // Action states are not projected into the catalog; only observers are woken.
+        postCatalogChange()
+    }
+
+    private func postCatalogChange() {
+        guard !catalogChangePostScheduled else { return }
+        catalogChangePostScheduled = true
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            catalogChangePostScheduled = false
+            NotificationCenter.default.post(name: .agentRecoveryCatalogDidChange, object: self)
+        }
+    }
+
+    /// Durable Dismiss of exactly the displayed item in its displayed state (Phase 2 §D). Written
+    /// through the session's live lane when its incarnation is live, otherwise under the closed
+    /// session's persistence gate after revalidating its durable lifecycle. It changes nothing but
+    /// the card acknowledgement: the turn, input, question, draft, schedule, crash hold, and any
+    /// restriction stay as they are. A repeated Dismiss of an already-dismissed state succeeds.
+    /// Returns a user-facing failure, or `nil` once committed.
+    package func dismissCatalogItem(_ item: AgentRecoveryCatalogItem) async -> String? {
+        guard let acknowledgement = item.acknowledgement, let sessionID = item.sessionID else {
+            return "This item can't be dismissed."
+        }
+        let changed = "This item changed. Review it again."
+        // Revalidated against the current projection: a changed item is never dismissed in its place.
+        guard let current = catalog.item(id: item.id), current.acknowledgement?.key == acknowledgement.key,
+              current.acknowledgement?.freshness == acknowledgement.freshness
+        else { return changed }
+        if current.isDismissed { return nil }
+        let key = acknowledgement.key
+        let freshness = acknowledgement.freshness
+        let result: Result<AgentRecoveryLocalReceipt, AgentRecoveryControllerFailure>
+        if let lane = lane(for: sessionID), lane.binding.incarnationID == key.incarnationID {
+            result = await lane.acknowledgeCard(key: key, freshness: freshness)
+        } else if let resolution = reconciliation.resolution(for: sessionID),
+                  let binding = resolution.binding, binding.incarnationID == key.incarnationID,
+                  let workspace = resolution.workspace
+        {
+            result = await acknowledgeClosedCard(binding: binding, workspace: workspace, key: key, freshness: freshness)
+        } else {
+            return "Open this session to dismiss this item."
+        }
+        switch result {
+        case .success:
+            return nil
+        case .failure(.store(.cardChanged)):
+            return changed
+        case .failure:
+            // Generic wording: store failures can describe local paths.
+            return "This item couldn't be dismissed. It is still listed; try again."
+        }
+    }
+
+    private func acknowledgeClosedCard(
+        binding: AgentRecoveryLifecycleBinding,
+        workspace: AgentRecoveryWorkspaceDestination,
+        key: AgentRecoveryCardKey,
+        freshness: AgentRecoveryCardFreshness
+    ) async -> Result<AgentRecoveryLocalReceipt, AgentRecoveryControllerFailure> {
+        let store = store
+        var lastFailure: AgentRecoveryControllerFailure = .store(.storageFailure("no attempt"))
+        for _ in 0 ..< 3 {
+            do {
+                return try await .success(dataService.performClosedRecoveryTransaction(binding: binding, workspace: workspace) {
+                    try await store.acknowledgeCard(
+                        binding: binding,
+                        expectedRevision: store.currentRevision(sessionID: binding.sessionID),
+                        key: key,
+                        freshness: freshness,
+                        isCurrent: { AgentRecoveryCatalogProjection.recordStillMatches(key: key, freshness: freshness, record: $0) }
+                    )
+                })
+            } catch let error as AgentRecoveryStoreError {
+                lastFailure = .store(error)
+                if case .revisionConflict = error { continue }
+                return .failure(lastFailure)
+            } catch {
+                return .failure(.lifecycleRejected(String(describing: error)))
+            }
+        }
+        return .failure(lastFailure)
+    }
+
     /// Posts `agentRecoveryComposerStateDidChange` (lanes and composer preparations).
     fileprivate func composerStateDidChange(sessionID: UUID?) {
+        invalidateCatalog()
         NotificationCenter.default.post(
             name: .agentRecoveryComposerStateDidChange,
             object: self,
@@ -524,6 +800,8 @@ package final class AgentRecoveryCoordinator {
             await dataService.adoptColdRestoreLaunchEvidence(previous)
             let current = try await store.recordCurrentLaunchRunning()
             let entries = try await store.discoverRecords()
+            // Schema-8 hints: from now on a session without a discovered record is known clear.
+            await dataService.adoptRecoveryHintInventory(entries)
             let results = try await reconcile(AgentRecoveryStartupReport(
                 previousLaunch: previous,
                 currentLaunch: current,
@@ -554,7 +832,8 @@ package final class AgentRecoveryCoordinator {
         } catch {
             startupState = .failed(String(describing: error))
         }
-        NotificationCenter.default.post(name: .agentRecoveryCoordinatorDidChange, object: self)
+        postCoordinatorDidChange()
+        requestIndexedScheduleRefresh()
     }
 
     /// Crash holds from authoritative results only (actionable sessions whose record matched the
@@ -607,7 +886,7 @@ package final class AgentRecoveryCoordinator {
     package func beginShutdownFreeze(scope: AgentRecoveryShutdownScope) -> UUID {
         let token = UUID()
         shutdownFreezes[token] = scope
-        NotificationCenter.default.post(name: .agentRecoveryCoordinatorDidChange, object: self)
+        postCoordinatorDidChange()
         return token
     }
 
@@ -621,7 +900,7 @@ package final class AgentRecoveryCoordinator {
     /// Ends one freeze (Stage A cancelled or failed). Idempotent.
     package func endShutdownFreeze(_ token: UUID) {
         guard shutdownFreezes.removeValue(forKey: token) != nil else { return }
-        NotificationCenter.default.post(name: .agentRecoveryCoordinatorDidChange, object: self)
+        postCoordinatorDidChange()
     }
 
     /// Whether a shutdown freeze covers `owner`'s lanes and producers.
@@ -745,7 +1024,7 @@ package final class AgentRecoveryCoordinator {
               restrictions.sessionRestriction(sessionID) != nil
         else { return }
         restrictions.lift(sessionID: sessionID)
-        NotificationCenter.default.post(name: .agentRecoveryCoordinatorDidChange, object: self)
+        postCoordinatorDidChange()
     }
 
     /// The published crash hold for the session (confirmed or not).
@@ -781,7 +1060,7 @@ package final class AgentRecoveryCoordinator {
         if confirmedCrashHolds[hold.sessionID] == hold { return true }
         guard case .success = await lane.recordCrashHoldAcknowledgement(hold), isCurrent() else { return false }
         confirmedCrashHolds[hold.sessionID] = hold
-        NotificationCenter.default.post(name: .agentRecoveryCoordinatorDidChange, object: self)
+        postCoordinatorDidChange()
         return true
     }
 
@@ -811,6 +1090,17 @@ package final class AgentRecoveryCoordinator {
         if released != nil, releasedUnsavedInputs.removeValue(forKey: sessionID) != nil {
             composerStateDidChange(sessionID: sessionID)
         }
+        // Review B F9: a hand-over that preserves ownership (same owner, same lifecycle binding) keeps
+        // the predecessor's still-live questions live in the successor, captured before retirement.
+        // Any other claim inherits none: historical or expired requests never become live.
+        let preservesOwnership = predecessor.map {
+            !$0.isRetired && $0.isOwned(by: owner) && $0.binding == gate.binding
+        } ?? false
+        let inheritedLiveQuestions: [AgentRecoveryQuestionSnapshot] = if preservesOwnership, let predecessor {
+            predecessor.questionPersistence.liveSnapshots
+        } else {
+            []
+        }
         let retirement = predecessor?.beginRetirement(preserving: predecessor?.binding == gate.binding) ?? released
         let lane = AgentRecoverySessionLane(
             coordinator: self,
@@ -822,7 +1112,32 @@ package final class AgentRecoveryCoordinator {
             predecessorRetirement: retirement
         )
         lanes[sessionID] = lane
+        laneWorkspaceIDs[sessionID] = persistenceState.stamp.workspaceID
+        if let tabID = (owner as? AgentTabSession)?.tabID {
+            laneComposeTabIDs[sessionID] = tabID
+        }
+        if !inheritedLiveQuestions.isEmpty {
+            // Pending until this lane writes them, after the predecessor's retirement (review R1).
+            var afterRetirement: (@MainActor () async -> Void)?
+            if let retirement {
+                afterRetirement = { _ = await retirement.value }
+            }
+            lane.questionPersistence.adoptLiveInteractions(inheritedLiveQuestions, after: afterRetirement)
+        }
+        invalidateCatalog()
         return lane
+    }
+
+    /// The workspace a session was last owned in this launch (a lane claim), else its startup
+    /// destination; `nil` when neither is known.
+    package func knownWorkspaceID(for sessionID: UUID) -> UUID? {
+        laneWorkspaceIDs[sessionID] ?? reconciliation.resolution(for: sessionID)?.workspaceID
+    }
+
+    /// The compose tab a session was last owned in this launch (a lane claim), else its startup
+    /// compose tab; `nil` when neither is known.
+    package func knownComposeTabID(for sessionID: UUID) -> UUID? {
+        laneComposeTabIDs[sessionID] ?? reconciliation.resolution(for: sessionID)?.composeTabID
     }
 
     /// The live (unretired) lane for a durable session.
@@ -841,6 +1156,7 @@ package final class AgentRecoveryCoordinator {
             lanes[sessionID] = nil
             releasedRetirements[sessionID] = retirement
         }
+        invalidateCatalog()
         return Task { @MainActor [weak self] in
             let unsaved = await retirement.value
             // The owner went away: input its lane could not persist is published here until a
@@ -1013,6 +1329,15 @@ package final class AgentRecoveryCoordinator {
 
     // MARK: Composer preparation (no lane yet)
 
+    /// Live owners' failed preparations, for the catalog's runtime projection (never persisted and
+    /// never dismissible: the obligation clears only by a successful retry, hand-off, or discard).
+    package var failedComposerPreparations: [(owner: AnyObject, failure: AgentRecoveryComposerPreparationFailure)] {
+        composerPreparations.values.compactMap { preparation in
+            guard let failure = preparation.failure, let owner = preparation.owner else { return nil }
+            return (owner, failure)
+        }
+    }
+
     /// The owner's outstanding obligation, if any.
     package func composerPreparation(for owner: AnyObject) -> AgentRecoveryComposerPreparation? {
         guard let preparation = composerPreparations[ObjectIdentifier(owner)] else { return nil }
@@ -1123,6 +1448,19 @@ package final class AgentRecoverySessionLane {
     package let persistenceState: AgentSessionPersistenceState
     package let binding: AgentRecoveryLifecycleBinding
     package let composer: AgentRecoveryComposerPersistenceController
+    /// Live pending-question persistence (plan §E): creation, drafts, and resolution of this
+    /// session's questions, written through this lane's gated question update.
+    package private(set) lazy var questionPersistence: AgentRecoveryQuestionPersistenceController = {
+        let controller = AgentRecoveryQuestionPersistenceController { [weak self] update in
+            guard let self else { return .failure(.retired) }
+            return await updateQuestionSnapshots(update)
+        }
+        controller.stateDidChange = { [weak self] in
+            self?.notifyStateChange()
+        }
+        return controller
+    }()
+
     private let gate: any AgentRecoveryLifecycleGate
     package let store: AgentRecoveryStore
     private weak var coordinator: AgentRecoveryCoordinator?
@@ -1713,6 +2051,12 @@ package final class AgentRecoverySessionLane {
         }
         await settleEvidenceWrites()
         guard !isRetired else { return .failure(.composer(.laneRetired)) }
+        // The live question lane drains first (answers are frozen): unsaved drafts and owed
+        // removals land before the aggregate capture closes any remaining gap.
+        if case let .failed(failure) = await questionPersistence.drain() {
+            return .failure(.evidenceNotPersisted(failure))
+        }
+        guard !isRetired else { return .failure(.composer(.laneRetired)) }
         var alreadyStored = Set<UUID>()
         if let questions {
             // Exact IDs only: a question another owner preserved (a closed window of this or an
@@ -2016,6 +2360,23 @@ package final class AgentRecoverySessionLane {
         }
     }
 
+    /// Durably dismisses one recovery card in its displayed state (see
+    /// `AgentRecoveryCoordinator.dismissCatalogItem`).
+    package func acknowledgeCard(
+        key: AgentRecoveryCardKey,
+        freshness: AgentRecoveryCardFreshness
+    ) async -> Result<AgentRecoveryLocalReceipt, AgentRecoveryControllerFailure> {
+        await transaction { store, binding in
+            try await store.acknowledgeCard(
+                binding: binding,
+                expectedRevision: store.currentRevision(sessionID: binding.sessionID),
+                key: key,
+                freshness: freshness,
+                isCurrent: { AgentRecoveryCatalogProjection.recordStillMatches(key: key, freshness: freshness, record: $0) }
+            )
+        }
+    }
+
     /// Commits the exact acknowledgement of `hold` (see `AgentRecoveryCoordinator.confirmCrashHold`).
     package func recordCrashHoldAcknowledgement(
         _ hold: AgentRecoveryCrashHold
@@ -2193,6 +2554,9 @@ package final class AgentRecoverySessionLane {
             if let residue {
                 unsaved.append(residue)
             }
+            // Questions: a same-binding hand-over writes what is still owed; a changed binding
+            // writes nothing under either authority.
+            await questionPersistence.retire(flushingPending: preserving)
             return unsaved
         }
         retirementTask = task

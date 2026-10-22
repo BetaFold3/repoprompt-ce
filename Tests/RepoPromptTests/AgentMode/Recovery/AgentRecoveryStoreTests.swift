@@ -1198,6 +1198,167 @@ final class AgentRecoveryStoreTests: XCTestCase {
         XCTAssertEqual(try managedFiles(directory), [])
     }
 
+    // MARK: - Card acknowledgements (Phase 2 §D)
+
+    func testCardAcknowledgementRoundTripsAndSurvivesUnrelatedWrites() async throws {
+        let store = makeStore()
+        let session = binding(UUID(), UUID())
+        let queued = Support.submission("queued")
+        let other = Support.submission("other")
+        var revision = try await store.commitQueuedIntent(
+            binding: session, expectedRevision: nil, submission: queued, consumption: nil
+        ).intent.recordRevision
+        let key = AgentRecoveryCardKey(
+            kind: .savedInput,
+            incarnationID: session.incarnationID,
+            transcriptResetGeneration: 0,
+            entityID: queued.intentID.uuidString
+        )
+        let freshness = AgentRecoveryCardFreshness("queued|held:false|stale:false")
+        let committed = try await store.acknowledgeCard(
+            binding: session, expectedRevision: revision, key: key, freshness: freshness, isCurrent: { _ in true }
+        )
+        XCTAssertEqual(committed.disposition, .committed)
+        let repeated = try await store.acknowledgeCard(
+            binding: session, expectedRevision: nil, key: key, freshness: freshness, isCurrent: { _ in true }
+        )
+        XCTAssertEqual(repeated.disposition, .unchanged, "An identical Dismiss is idempotent")
+
+        // Unrelated writes keep the acknowledgement; they never unhide the card.
+        revision = try await store.commitQueuedIntent(
+            binding: session, expectedRevision: committed.recordRevision, submission: other, consumption: nil
+        ).intent.recordRevision
+        let composerReceipt = try await store.commitComposer(
+            binding: session,
+            expectedRevision: revision,
+            expectedComposerRevision: nil,
+            snapshot: Support.snapshot("typing")
+        )
+        revision = try XCTUnwrap(composerReceipt.recordRevision)
+        _ = try await store.withdraw(binding: session, expectedRevision: revision, intentID: other.intentID)
+
+        // A relaunch reads it back; only the exact acknowledged state is dismissed.
+        let relaunched = makeStore(instance: instanceB)
+        let record = try await loadRecord(relaunched, session.sessionID)
+        XCTAssertTrue(record.isCardAcknowledged(key, freshness: freshness))
+        XCTAssertFalse(record.isCardAcknowledged(key, freshness: AgentRecoveryCardFreshness("failed|held:false|stale:false")))
+        XCTAssertEqual(record.cardAcknowledgements.count, 1)
+        XCTAssertEqual(record.intent(id: queued.intentID)?.deliveryState, .queued, "Dismiss withdraws nothing")
+    }
+
+    func testCardAcknowledgementKeepsUnknownKindsAndMembersAcrossRewrites() async throws {
+        let store = makeStore()
+        let session = binding(UUID(), UUID())
+        let key = AgentRecoveryCardKey(kind: .run, incarnationID: session.incarnationID, transcriptResetGeneration: nil, entityID: "run-1")
+        _ = try await store.acknowledgeCard(
+            binding: session, expectedRevision: nil, key: key, freshness: AgentRecoveryCardFreshness("interrupted|appCrash"),
+            isCurrent: { _ in true }
+        )
+        let fileURL = store.recordFileURL(sessionID: session.sessionID)
+        var json = try Support.readJSON(fileURL)
+        XCTAssertNil(Support.member(json, at: [.key("cardAcknowledgements"), .index(0)], key: "transcriptResetGeneration"))
+        Support.setMember(&json, at: [.key("cardAcknowledgements"), .index(0)], key: "kind", value: .string("futureKind"))
+        Support.setMember(&json, at: [.key("cardAcknowledgements"), .index(0)], key: "futureMember", value: .string("kept"))
+        try Support.writeJSON(json, to: fileURL)
+
+        let relaunched = makeStore(instance: instanceB)
+        let record = try await loadRecord(relaunched, session.sessionID)
+        let future = try XCTUnwrap(record.cardAcknowledgements.first)
+        XCTAssertEqual(future.key.kindRaw, "futureKind")
+        XCTAssertNil(future.key.kind)
+        XCTAssertFalse(record.isCardAcknowledged(key, freshness: AgentRecoveryCardFreshness("interrupted|appCrash")))
+
+        // An unrelated rewrite keeps the newer build's acknowledgement byte-for-byte in meaning.
+        _ = try await relaunched.commitQueuedIntent(
+            binding: session, expectedRevision: record.revision, submission: Support.submission("later"), consumption: nil
+        )
+        let rewritten = try Support.readJSON(fileURL)
+        XCTAssertEqual(Support.member(rewritten, at: [.key("cardAcknowledgements"), .index(0)], key: "kind"), .string("futureKind"))
+        XCTAssertEqual(Support.member(rewritten, at: [.key("cardAcknowledgements"), .index(0)], key: "futureMember"), .string("kept"))
+    }
+
+    func testCardAcknowledgementRefusesChangedCardsOtherIncarnationsAndNeverEvictsAnother() async throws {
+        let store = makeStore()
+        let session = binding(UUID(), UUID())
+        func key(_ entity: String, incarnation: UUID? = nil) -> AgentRecoveryCardKey {
+            AgentRecoveryCardKey(kind: .run, incarnationID: incarnation ?? session.incarnationID, transcriptResetGeneration: nil, entityID: entity)
+        }
+        let freshness = AgentRecoveryCardFreshness("interrupted|-")
+        await assertStoreError(.cardChanged) {
+            try await store.acknowledgeCard(binding: session, expectedRevision: nil, key: key("a"), freshness: freshness, isCurrent: { _ in false })
+        }
+        let afterRefusal = await store.read(sessionID: session.sessionID)
+        XCTAssertNil(afterRefusal.record, "A refused Dismiss writes nothing")
+        let foreign = UUID()
+        await assertStoreError(.staleIncarnation(expected: session.incarnationID, actual: foreign)) {
+            try await store.acknowledgeCard(
+                binding: session, expectedRevision: nil, key: key("a", incarnation: foreign), freshness: freshness, isCurrent: { _ in true }
+            )
+        }
+
+        // Review A F07 (deliberate contract change): more than the former 128 bound are all kept.
+        let limit = 129
+        for index in 0 ... limit {
+            _ = try await store.acknowledgeCard(
+                binding: session,
+                expectedRevision: store.currentRevision(sessionID: session.sessionID),
+                key: key("entity-\(index)"),
+                freshness: freshness,
+                isCurrent: { _ in true }
+            )
+        }
+        // A changed state of the same key replaces it in place of adding another.
+        _ = try await store.acknowledgeCard(
+            binding: session,
+            expectedRevision: store.currentRevision(sessionID: session.sessionID),
+            key: key("entity-\(limit)"),
+            freshness: AgentRecoveryCardFreshness("failed|-"),
+            isCurrent: { _ in true }
+        )
+        let record = try await loadRecord(store, session.sessionID)
+        XCTAssertEqual(record.cardAcknowledgements.count, limit + 1, "No acknowledgement is evicted")
+        XCTAssertTrue(
+            record.isCardAcknowledged(key("entity-0"), freshness: freshness),
+            "An unrelated Dismiss never makes an unchanged dismissed card reappear"
+        )
+        XCTAssertTrue(record.isCardAcknowledged(key("entity-\(limit)"), freshness: AgentRecoveryCardFreshness("failed|-")))
+        XCTAssertFalse(record.isCardAcknowledged(key("entity-\(limit)"), freshness: freshness))
+    }
+
+    /// Review B F8: emptying a record's other content (withdrawing its last held intent) never
+    /// removes the record or its acknowledgements; a later unrelated write keeps the Dismiss.
+    func testWithdrawingTheLastIntentKeepsCardAcknowledgements() async throws {
+        let store = makeStore()
+        let session = binding(UUID(), UUID())
+        let submission = Support.submission("only input")
+        _ = try await store.commitQueuedIntent(binding: session, expectedRevision: nil, submission: submission, consumption: nil)
+        let key = AgentRecoveryCardKey(kind: .run, incarnationID: session.incarnationID, transcriptResetGeneration: nil, entityID: "turn")
+        let freshness = AgentRecoveryCardFreshness("interrupted|appCrash")
+        _ = try await store.acknowledgeCard(
+            binding: session,
+            expectedRevision: store.currentRevision(sessionID: session.sessionID),
+            key: key,
+            freshness: freshness,
+            isCurrent: { _ in true }
+        )
+        _ = try await store.withdraw(
+            binding: session, expectedRevision: store.currentRevision(sessionID: session.sessionID), intentID: submission.intentID
+        )
+        let afterWithdraw = try await loadRecord(store, session.sessionID)
+        XCTAssertTrue(afterWithdraw.isCardAcknowledged(key, freshness: freshness), "The last intent's withdrawal keeps the Dismiss")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: store.recordFileURL(sessionID: session.sessionID).path))
+
+        // An unrelated later write (a new input) never unhides it.
+        _ = try await store.commitQueuedIntent(
+            binding: session,
+            expectedRevision: store.currentRevision(sessionID: session.sessionID),
+            submission: Support.submission("later"),
+            consumption: nil
+        )
+        let afterUnrelated = try await loadRecord(store, session.sessionID)
+        XCTAssertTrue(afterUnrelated.isCardAcknowledged(key, freshness: freshness))
+    }
+
     // MARK: - Helpers
 
     private func managedFiles(_ directory: URL) throws -> [String] {

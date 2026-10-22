@@ -98,18 +98,37 @@ final class AgentRecoveryStartupCompositionTests: XCTestCase {
             viewModel.recoveryListProps(forActiveSession: session)?.rows.first { $0.id == rowID }
         }
         XCTAssertEqual(row()?.text, "held input")
-        XCTAssertEqual(row()?.actions, [.edit, .remove])
+        XCTAssertEqual(row()?.actions, [.edit, .remove, .dismiss])
 
-        // Unreadable recovered data is listed view-only and left unchanged.
-        let statusRow = viewModel.recoveryListProps(forActiveSession: session)?.rows
-            .first { $0.id == "status-\(unreadable.session.id.uuidString)" }
+        // Phase 2: the banner is the active session's exact catalog filter; other sessions' items
+        // are counted there and listed in the app-wide Needs Attention sheet.
+        let statusRowID = "status-\(unreadable.session.id.uuidString)"
+        let runRowID = "run-\(unsaved.session.id.uuidString)-\(unsavedOwnership.attemptID.uuidString)"
+        let banner = try XCTUnwrap(viewModel.recoveryListProps(forActiveSession: session))
+        XCTAssertFalse(banner.rows.contains { $0.id == statusRowID || $0.id == runRowID })
+        XCTAssertGreaterThanOrEqual(banner.otherItemCount, 2)
+        func sheetRow(_ id: String, includeDismissed: Bool = false) -> AgentRecoveryNeedsAttentionRow? {
+            viewModel.recoveryNeedsAttentionRows(includeDismissed: includeDismissed, activeSession: session).first { $0.id == id }
+        }
+
+        // Unreadable recovered data is listed view-only (not dismissible) and left unchanged.
+        let statusRow = sheetRow(statusRowID)?.row
         XCTAssertEqual(statusRow?.title, "Recovery status unknown")
         XCTAssertEqual(statusRow?.actions, [])
         XCTAssertEqual(try Data(contentsOf: unreadableURL), unreadableBytes)
-        let runRow = viewModel.recoveryListProps(forActiveSession: session)?.rows
-            .first { $0.id == "run-\(unsaved.session.id.uuidString)-\(unsavedOwnership.attemptID.uuidString)" }
+        let runRow = sheetRow(runRowID)?.row
         XCTAssertEqual(runRow?.title, "Run interrupted before it was saved")
-        XCTAssertEqual(runRow?.actions.first, .hide)
+        XCTAssertEqual(runRow?.actions.first, .dismiss)
+
+        // Dismiss of a closed session's card is durable (under its persistence gate) and changes
+        // nothing else: the run evidence stays open and the item is still listed as dismissed.
+        await viewModel.performRecoveryListAction(rowID: runRowID, action: .dismiss)
+        let dismissed = await Support.eventually { sheetRow(runRowID) == nil }
+        XCTAssertTrue(dismissed, String(describing: viewModel.recoveryCoordinator?.catalogActionStates[runRowID]))
+        XCTAssertEqual(sheetRow(runRowID, includeDismissed: true)?.isDismissed, true)
+        let unsavedRecord = await now.store.read(sessionID: unsaved.session.id).record
+        XCTAssertEqual(unsavedRecord?.cardAcknowledgements.map(\.key.entityID), [unsavedOwnership.attemptID.uuidString])
+        XCTAssertNil(unsavedRecord?.runAttempts.first?.terminal, "Dismiss resolves nothing")
 
         // Edit never replaces newer typing; the source stays saved.
         viewModel.storeDraftText(for: tabID, "newer typing")
@@ -135,6 +154,233 @@ final class AgentRecoveryStartupCompositionTests: XCTestCase {
         let afterRemoval = await deliveryState(now.store, load, submission.intentID)
         XCTAssertEqual(afterRemoval, .withdrawn)
         XCTAssertEqual(try Data(contentsOf: unreadableURL), unreadableBytes)
+    }
+
+    /// Review B F5, F10 and cross-workspace Open: rows resolve their session from the catalog (the
+    /// paused indicator's "It stopped" confirms the dismissed crash hold; a schedule row opens its
+    /// session); an item in another workspace opens through the agent-session route with its exact
+    /// workspace, tab, and session; and items only elsewhere keep the banner reachable.
+    func testRecoveryListRowsResolveSessionsFromTheCatalogAndOpenAcrossWorkspaces() async throws {
+        let fixture = try makeFixture()
+        let otherStorage = fixture.root.appendingPathComponent("other-workspace", isDirectory: true)
+        try FileManager.default.createDirectory(at: otherStorage, withIntermediateDirectories: true)
+        let other = WorkspaceModel(name: "Other Workspace", repoPaths: [otherStorage.path], customStoragePath: otherStorage)
+        let otherDestination = AgentRecoveryWorkspaceDestination(id: other.id, name: other.name, customStoragePath: otherStorage)
+        let tabID = UUID()
+
+        // Earlier launch (no clean exit): a run in flight in this workspace's session (a crash
+        // hold), and in another workspace an interrupted run and a schedule awaiting confirmation.
+        let earlier = makeLaunch(fixture)
+        let earlierStore = earlier.store
+        let held = try await makeSession(earlier, fixture: fixture, composeTabID: tabID)
+        let heldOwnership = Support.ownership(sessionID: held.session.id)
+        let heldGate = try earlier.service.recoveryLifecycleGate(for: held.persistenceState)
+        let heldBinding = heldGate.binding
+        try await heldGate.performRecoveryTransaction {
+            _ = try await earlierStore.ensureRunAttempt(
+                binding: heldBinding,
+                expectedRevision: earlierStore.currentRevision(sessionID: heldBinding.sessionID),
+                ownership: heldOwnership,
+                processRunID: nil,
+                transcriptTurnID: nil
+            )
+            _ = try await earlierStore.commitDispatchingIntent(
+                binding: heldBinding,
+                expectedRevision: earlierStore.currentRevision(sessionID: heldBinding.sessionID),
+                submission: Support.submission("in flight at crash"),
+                attempt: AgentRecoveryAttemptStart(attemptID: UUID(), runAttemptID: heldOwnership.attemptID),
+                consumption: nil
+            )
+        }
+        let elsewhereTabID = UUID()
+        let elsewhere = try await makeSession(earlier, fixture: fixture, workspace: other, composeTabID: elsewhereTabID)
+        let elsewhereOwnership = Support.ownership(sessionID: elsewhere.session.id)
+        let elsewhereGate = try earlier.service.recoveryLifecycleGate(for: elsewhere.persistenceState)
+        let elsewhereBinding = elsewhereGate.binding
+        let question = AgentRecoveryQuestionSnapshot(
+            interactionID: UUID(),
+            kind: .askUser,
+            runAttemptID: elsewhereOwnership.attemptID,
+            transcriptResetGeneration: elsewhereBinding.transcriptResetGeneration,
+            appInstanceID: UUID(),
+            askedAt: AgentRecoveryTimestamp(millisecondsSince1970: 1000),
+            title: "Question",
+            message: nil,
+            items: [AgentRecoveryQuestionItem(
+                questionID: "target", header: nil, text: "Which environment?", options: [], isSecret: false, answer: "staging"
+            )],
+            extras: [:]
+        )
+        try await elsewhereGate.performRecoveryTransaction {
+            _ = try await earlierStore.ensureRunAttempt(
+                binding: elsewhereBinding,
+                expectedRevision: earlierStore.currentRevision(sessionID: elsewhereBinding.sessionID),
+                ownership: elsewhereOwnership,
+                processRunID: nil,
+                transcriptTurnID: nil
+            )
+            _ = try await earlierStore.updateQuestionSnapshots(
+                binding: elsewhereBinding,
+                expectedRevision: earlierStore.currentRevision(sessionID: elsewhereBinding.sessionID),
+                update: AgentRecoveryStore.QuestionSnapshotUpdate(upserting: [question], removing: [])
+            )
+        }
+        let scheduledTabID = UUID()
+        let scheduled = try await makeSession(earlier, fixture: fixture, workspace: other, composeTabID: scheduledTabID)
+        let notBefore = Date(timeIntervalSince1970: 1000)
+        let schedule = AgentScheduledSendPersist(
+            id: UUID(),
+            createdAt: notBefore.addingTimeInterval(-60),
+            updatedAt: notBefore,
+            notBefore: notBefore,
+            state: .needsConfirmation,
+            confirmationReason: .missedWhileClosed,
+            rawText: "scheduled elsewhere",
+            attachments: [],
+            taggedFileAttachments: [],
+            interviewFirst: false,
+            isNewSessionStart: false,
+            runAlongsideOtherSessions: false
+        )
+        let sessionsFolder = otherStorage.appendingPathComponent("AgentSessions", isDirectory: true)
+        let scheduledURL = sessionsFolder.appendingPathComponent("AgentSession-\(scheduled.session.id.uuidString).json")
+        var saved = try AgentSessionDataCodec.decodeSession(from: Data(contentsOf: scheduledURL))
+        saved.scheduledSend = .v1(schedule)
+        try AgentSessionDataCodec.encodeSession(saved).write(to: scheduledURL, options: .atomic)
+        try? FileManager.default.removeItem(at: sessionsFolder.appendingPathComponent("AgentSessionIndex.json"))
+        _ = try await makeLaunch(fixture).service.indexedAgentSessionMetadataRecords(for: otherDestination)
+
+        // This launch: both workspaces are inventoried; this window shows the first one.
+        let now = makeLaunch(fixture)
+        let scheduler = AgentScheduledSendCoordinator(startupAdmission: .awaitingRecovery)
+        let destinations = [fixture.destination, otherDestination]
+        let composition = AgentRecoveryAppComposition(
+            store: now.store,
+            dataService: now.service,
+            scheduler: scheduler,
+            loadInventory: { AgentRecoveryWorkspaceInventory(workspaces: destinations) }
+        )
+        let viewModel = makeViewModel(windowID: 4811, fixture: fixture)
+        composition.install(into: viewModel)
+        await composition.startupCompletion?.value
+        let coordinator = try XCTUnwrap(composition.coordinator)
+        viewModel.test_establishPersistenceWorkspace(fixture.workspace)
+
+        let runRowID = "run-\(elsewhere.session.id.uuidString)-\(elsewhereOwnership.attemptID.uuidString)"
+        let scheduleRowID = "schedule-\(scheduled.session.id.uuidString)-\(schedule.id.uuidString)"
+        let listed = await Support.eventually {
+            coordinator.catalog.item(id: runRowID) != nil && coordinator.catalog.item(id: scheduleRowID) != nil
+        }
+        XCTAssertTrue(listed, "\(coordinator.catalog.items.map(\.id))")
+
+        // B F2: a saved question never claims it went unanswered (its answer may have been sent).
+        let questionRowID = AgentModeViewModel.recoveryListQuestionRowID(
+            sessionID: elsewhere.session.id, interactionID: question.interactionID
+        )
+        let questionRow = try XCTUnwrap(
+            viewModel.recoveryNeedsAttentionRows(includeDismissed: false, activeSession: nil).first { $0.id == questionRowID },
+            "\(coordinator.catalog.items.map(\.id))"
+        )
+        XCTAssertTrue(questionRow.isOtherWorkspace)
+        XCTAssertEqual(questionRow.row.title, "Expired question")
+        XCTAssertTrue(questionRow.row.detail.contains("Whether an answer reached the agent is uncertain"), questionRow.row.detail)
+        XCTAssertFalse(questionRow.row.title.localizedCaseInsensitiveContains("unanswered"))
+        XCTAssertFalse(questionRow.row.detail.localizedCaseInsensitiveContains("before it was answered"))
+        XCTAssertEqual(questionRow.row.actions, [.open, .dismiss])
+
+        // F10: with nothing for the active (here no) session, items elsewhere keep the banner.
+        let elsewhereOnly = try XCTUnwrap(viewModel.recoveryListProps(forActiveSession: nil), "Items elsewhere keep the banner reachable")
+        XCTAssertTrue(elsewhereOnly.rows.isEmpty)
+        XCTAssertGreaterThanOrEqual(elsewhereOnly.otherItemCount, 3)
+
+        // Cross-workspace Open (run and schedule rows) uses the exact agent-session route.
+        final class Routes {
+            var routes: [AgentSessionDeepLinkRoute] = []
+            var result: AgentSessionRouteResult = .routed
+        }
+        let routes = Routes()
+        viewModel.recoveryListRouteToSession = { route in
+            routes.routes.append(route)
+            return routes.result
+        }
+        await viewModel.performRecoveryListAction(rowID: runRowID, action: .open)
+        XCTAssertNil(coordinator.catalogActionStates[runRowID])
+        await viewModel.performRecoveryListAction(rowID: scheduleRowID, action: .open)
+        XCTAssertNil(coordinator.catalogActionStates[scheduleRowID], "A schedule row resolves its session from the catalog")
+        XCTAssertEqual(routes.routes, [
+            AgentSessionDeepLinkRoute(workspaceID: other.id, tabID: elsewhereTabID, sessionID: elsewhere.session.id),
+            AgentSessionDeepLinkRoute(workspaceID: other.id, tabID: scheduledTabID, sessionID: scheduled.session.id)
+        ])
+        routes.result = .workspaceUnavailable
+        await viewModel.performRecoveryListAction(rowID: runRowID, action: .open)
+        guard case .failed = coordinator.catalogActionStates[runRowID] else {
+            return XCTFail("A failed route is reported on the row: \(String(describing: coordinator.catalogActionStates[runRowID]))")
+        }
+        XCTAssertTrue(viewModel.sessions.isEmpty, "Opening elsewhere hydrates nothing in this window")
+
+        // F5: the paused indicator of a dismissed crash hold confirms exactly that hold.
+        viewModel.test_setCurrentTabIDOverride(tabID)
+        let session = try await viewModel.ensureSessionReady(tabID: tabID)
+        if session.activeAgentSessionID != held.session.id {
+            XCTAssertNotNil(viewModel.test_installPersistentSessionBinding(sessionID: held.session.id, on: session))
+            _ = await viewModel.test_hydrateBoundSession(tabID: tabID)
+        }
+        let laneClaimed = await Support.eventually { session.recoveryLane != nil }
+        XCTAssertTrue(laneClaimed)
+        XCTAssertNotNil(coordinator.crashHold(for: held.session.id))
+        let crash = try XCTUnwrap(coordinator.catalog.items.first { $0.sessionID == held.session.id && $0.kind == .crashHold })
+        await viewModel.performRecoveryListAction(rowID: crash.id, action: .dismiss)
+        let dismissed = await Support.eventually { coordinator.catalog.item(id: crash.id)?.isDismissed == true }
+        XCTAssertTrue(dismissed, String(describing: coordinator.catalogActionStates[crash.id]))
+        XCTAssertEqual(coordinator.catalog.blockers[held.session.id], .crashHold, "Dismiss lifts nothing")
+        let pausedRowID = "\(AgentModeViewModel.recoveryListPausedRowPrefix)\(held.session.id.uuidString)"
+        let paused = try XCTUnwrap(viewModel.recoveryListProps(forActiveSession: session)?.rows.first { $0.id == pausedRowID })
+        XCTAssertTrue(paused.actions.contains(.confirmStopped))
+        XCTAssertFalse(paused.actions.contains(.dismiss), "The paused indicator is not dismissible")
+        await viewModel.performRecoveryListAction(rowID: pausedRowID, action: .confirmStopped)
+        XCTAssertNil(coordinator.catalogActionStates[pausedRowID], "It stopped resolves the hold's session from the catalog")
+        let lifted = await Support.eventually { coordinator.catalog.blockers[held.session.id] == nil }
+        XCTAssertTrue(lifted)
+        let acknowledgement = await now.store.read(sessionID: held.session.id).record?.crashHoldAcknowledgement
+        XCTAssertNotNil(acknowledgement)
+    }
+
+    /// Review A F09: recorded outcomes are worded without unsupported timing claims, and a failed or
+    /// cancelled run is never presented as completed.
+    func testRecoveredRunWordingStatesOnlyWhatTheEvidenceEstablishes() {
+        func attempt(_ state: AgentSessionRunState, _ cause: AgentRunTerminalCause?) -> AgentRecoveryRunAttempt {
+            AgentRecoveryRunAttempt(
+                runAttemptID: UUID(),
+                transcriptResetGeneration: 0,
+                processRunID: nil,
+                transcriptTurnID: UUID(),
+                startedAt: AgentRecoveryTimestamp(millisecondsSince1970: 1000),
+                terminal: AgentRecoveryRunTerminalEvidence(
+                    commitID: UUID(), terminalState: state, expectedRunID: nil,
+                    recordedAt: AgentRecoveryTimestamp(millisecondsSince1970: 2000), cause: cause
+                )
+            )
+        }
+        let completed = AgentModeViewModel.recoveryListOutcomeTurnText(
+            AgentRecoveryOutcomeTurn(turnID: UUID(), runAttempt: attempt(.completed, .ordinary))
+        )
+        XCTAssertEqual(completed.title, "Completed; transcript tail may be missing")
+        XCTAssertFalse(completed.title.contains("while RepoPrompt was closed"))
+        XCTAssertFalse(completed.detail.contains("while RepoPrompt was closed"))
+        let failed = AgentModeViewModel.recoveryListOutcomeTurnText(
+            AgentRecoveryOutcomeTurn(turnID: UUID(), runAttempt: attempt(.failed, .ordinary))
+        )
+        XCTAssertEqual(failed.title, "Run failed")
+        XCTAssertFalse(failed.title.localizedCaseInsensitiveContains("completed"))
+        let cancelled = AgentModeViewModel.recoveryListOutcomeTurnText(
+            AgentRecoveryOutcomeTurn(turnID: UUID(), runAttempt: attempt(.cancelled, .userCancel))
+        )
+        XCTAssertEqual(cancelled.title, "Run cancelled")
+        let unsavedCompleted = AgentModeViewModel.recoveryOnlyRunRowText(attempt(.completed, .ordinary))
+        XCTAssertEqual(unsavedCompleted.title, "Run finished, but its turn wasn't saved")
+        XCTAssertTrue(unsavedCompleted.detail.hasPrefix("The run completed"))
+        let unsavedFailed = AgentModeViewModel.recoveryOnlyRunRowText(attempt(.failed, .ordinary))
+        XCTAssertTrue(unsavedFailed.detail.hasPrefix("The run failed"), unsavedFailed.detail)
     }
 
     /// R04: Edit keeps a carrier's exact pending-handoff association. An absent session payload is
@@ -605,6 +851,201 @@ final class AgentRecoveryStartupCompositionTests: XCTestCase {
         XCTAssertEqual(try Data(contentsOf: indexURL), indexData, "The index is read only")
     }
 
+    // MARK: - App-wide Needs Attention (non-visible routing and publication)
+
+    /// Records the objects of one notification name (posted synchronously on the main thread).
+    @MainActor
+    private final class PostedObjects {
+        var ids: [ObjectIdentifier] = []
+        private var token: (any NSObjectProtocol)?
+
+        init(_ name: Notification.Name) {
+            token = NotificationCenter.default.addObserver(forName: name, object: nil, queue: nil) { [weak self] note in
+                let id = (note.object as AnyObject?).map(ObjectIdentifier.init)
+                MainActor.assumeIsolated {
+                    if let id { self?.ids.append(id) }
+                }
+            }
+        }
+
+        func stop() {
+            if let token { NotificationCenter.default.removeObserver(token) }
+            token = nil
+        }
+
+        func count(of object: AnyObject) -> Int {
+            ids.count { $0 == ObjectIdentifier(object) }
+        }
+    }
+
+    private struct RouteOpenFailure: Error {}
+
+    /// The app-level route reaches the focused window's view model, or a window it opens when none
+    /// exists, and presents the shared catalog only: nothing hydrates, and the route stays
+    /// reachable when every item is dismissed. A Dismiss in one window is published to every window.
+    func testNeedsAttentionRouteReachesAnyWindowWithoutHydratingAndStaysReachableWhenAllDismissed() async throws {
+        let fixture = try makeFixture()
+
+        // Earlier launch: a closed session's run whose transcript turn was never saved.
+        let earlier = makeLaunch(fixture)
+        let unsaved = try await makeSession(earlier, fixture: fixture)
+        let ownership = Support.ownership(sessionID: unsaved.session.id)
+        let gate = try earlier.service.recoveryLifecycleGate(for: unsaved.persistenceState)
+        let earlierStore = earlier.store
+        let binding = gate.binding
+        try await gate.performRecoveryTransaction {
+            _ = try await earlierStore.ensureRunAttempt(
+                binding: binding,
+                expectedRevision: earlierStore.currentRevision(sessionID: binding.sessionID),
+                ownership: ownership,
+                processRunID: nil,
+                transcriptTurnID: nil
+            )
+        }
+
+        // This launch: two windows share one composition; neither opens a tab.
+        let now = makeLaunch(fixture)
+        let scheduler = AgentScheduledSendCoordinator(startupAdmission: .awaitingRecovery)
+        let destination = fixture.destination
+        let composition = AgentRecoveryAppComposition(
+            store: now.store,
+            dataService: now.service,
+            scheduler: scheduler,
+            loadInventory: { AgentRecoveryWorkspaceInventory(workspaces: [destination]) }
+        )
+        let windowA = makeViewModel(windowID: 4851, fixture: fixture)
+        let windowB = makeViewModel(windowID: 4852, fixture: fixture)
+        composition.install(into: windowA)
+        composition.install(into: windowB)
+        await composition.startupCompletion?.value
+        let coordinator = try XCTUnwrap(composition.coordinator)
+        XCTAssertTrue(windowA.recoveryCoordinator === coordinator)
+        XCTAssertTrue(windowB.recoveryCoordinator === coordinator)
+
+        let runRowID = "run-\(unsaved.session.id.uuidString)-\(ownership.attemptID.uuidString)"
+        let initialRows = windowA.recoveryNeedsAttentionRows(includeDismissed: false, activeSession: nil)
+        let initialSummary = initialRows.map { "\($0.id): \($0.row.title) \($0.row.actions)" }
+        XCTAssertTrue(initialRows.contains { $0.id == runRowID }, "\(initialSummary)")
+        XCTAssertEqual(windowA.recoveryNeedsAttentionCount, initialRows.count)
+        XCTAssertEqual(windowB.recoveryNeedsAttentionCount, initialRows.count)
+        XCTAssertEqual(
+            initialRows.map(\.id),
+            windowB.recoveryNeedsAttentionRows(includeDismissed: false, activeSession: nil).map(\.id),
+            "Every window renders the same catalog"
+        )
+
+        // Every item dismissed in window B; window A observes the same published catalog.
+        let catalogPosts = PostedObjects(.agentRecoveryCatalogDidChange)
+        defer { catalogPosts.stop() }
+        for row in initialRows {
+            XCTAssertTrue(row.row.actions.contains(.dismiss), "\(initialSummary)")
+            await windowB.performRecoveryListAction(rowID: row.id, action: .dismiss)
+        }
+        let dismissedEverywhere = await Support.eventually {
+            windowA.recoveryNeedsAttentionCount == 0 && windowB.recoveryNeedsAttentionCount == 0
+        }
+        XCTAssertTrue(dismissedEverywhere, "\(initialSummary) \(coordinator.catalogActionStates)")
+        let publishedPost = await Support.eventually { catalogPosts.count(of: coordinator) > 0 }
+        XCTAssertTrue(publishedPost)
+        let dismissedRowInA = windowA.recoveryNeedsAttentionRows(includeDismissed: true, activeSession: nil).first { $0.id == runRowID }
+        XCTAssertEqual(dismissedRowInA?.isDismissed, true, "Show dismissed still lists it with nothing undismissed")
+        XCTAssertNil(dismissedRowInA?.row.error)
+
+        // Route to an existing window: it never opens another.
+        let requests = PostedObjects(.agentRecoveryNeedsAttentionRequested)
+        defer { requests.stop() }
+        let existingTarget = await AgentRecoveryNeedsAttentionRouter.present(existing: windowA) {
+            XCTFail("An existing window is used")
+            throw RouteOpenFailure()
+        }
+        XCTAssertTrue(existingTarget === windowA)
+        XCTAssertEqual(requests.ids, [ObjectIdentifier(windowA)])
+        XCTAssertTrue(windowA.consumeRecoveryNeedsAttentionRequest())
+        XCTAssertFalse(windowA.consumeRecoveryNeedsAttentionRequest(), "A request presents once")
+        XCTAssertFalse(windowB.consumeRecoveryNeedsAttentionRequest())
+
+        // No window: one is opened through the existing route and presents once registered.
+        var opened = 0
+        let openedTarget = await AgentRecoveryNeedsAttentionRouter.present(existing: nil) {
+            opened += 1
+            return windowB
+        }
+        XCTAssertTrue(openedTarget === windowB)
+        XCTAssertEqual(opened, 1)
+        XCTAssertEqual(requests.ids, [ObjectIdentifier(windowA), ObjectIdentifier(windowB)])
+        XCTAssertTrue(windowB.consumeRecoveryNeedsAttentionRequest())
+
+        let failedTarget = await AgentRecoveryNeedsAttentionRouter.present(existing: nil) {
+            throw RouteOpenFailure()
+        }
+        XCTAssertNil(failedTarget)
+        XCTAssertEqual(requests.count(of: windowA) + requests.count(of: windowB), 2)
+
+        XCTAssertTrue(windowA.sessions.isEmpty, "Presenting hydrates nothing")
+        XCTAssertTrue(windowB.sessions.isEmpty, "Presenting hydrates nothing")
+        XCTAssertTrue(scheduler.confirmationSummaries().isEmpty)
+    }
+
+    /// A tab's failed composer preparation is a coordinator catalog item (runtime only): every
+    /// window lists it, only the window owning the tab offers Retry, it has no durable Dismiss, and
+    /// an action's failure is the same shared state in every window.
+    func testFailedComposerPreparationAndActionResultArePublishedToEveryWindow() async throws {
+        let fixture = try makeFixture()
+        let now = makeLaunch(fixture)
+        let scheduler = AgentScheduledSendCoordinator(startupAdmission: .awaitingRecovery)
+        let destination = fixture.destination
+        let composition = AgentRecoveryAppComposition(
+            store: now.store,
+            dataService: now.service,
+            scheduler: scheduler,
+            loadInventory: { AgentRecoveryWorkspaceInventory(workspaces: [destination]) }
+        )
+        let windowA = makeViewModel(windowID: 4861, fixture: fixture)
+        let windowB = makeViewModel(windowID: 4862, fixture: fixture)
+        composition.install(into: windowA)
+        composition.install(into: windowB)
+        await composition.startupCompletion?.value
+        let coordinator = try XCTUnwrap(composition.coordinator)
+        windowA.test_establishPersistenceWorkspace(fixture.workspace)
+        windowB.test_establishPersistenceWorkspace(fixture.workspace)
+
+        let tabID = UUID()
+        let owner = try XCTUnwrap(windowA.session(for: tabID, createIfNeeded: true))
+        let catalogPosts = PostedObjects(.agentRecoveryCatalogDidChange)
+        defer { catalogPosts.stop() }
+        coordinator.recordComposerMutationAwaitingPreparation(owner: owner, content: AgentRecoveryInputContent(text: "typed"))
+        XCTAssertTrue(coordinator.startComposerPreparation(owner: owner) { _ in .authorityUnavailable("no workspace authority") })
+
+        let itemID = AgentRecoveryCatalogProjection.preparationItemID(tabID: tabID)
+        let published = await Support.eventually {
+            coordinator.catalog.item(id: itemID) != nil && catalogPosts.count(of: coordinator) > 0
+        }
+        XCTAssertTrue(published, "The failure is published as a catalog change")
+        let item = try XCTUnwrap(coordinator.catalog.item(id: itemID))
+        XCTAssertEqual(item.kind, .saveFailure)
+        XCTAssertEqual(item.composeTabID, tabID)
+        XCTAssertNil(item.acknowledgement, "No durable Dismiss for an unpersistable failure")
+        XCTAssertEqual(item.payload, .composerPreparationFailed(.authorityUnavailable("no workspace authority")))
+
+        func sheetRow(_ window: AgentModeViewModel) -> AgentRecoveryListRowProps? {
+            window.recoveryNeedsAttentionRows(includeDismissed: true, activeSession: nil).first { $0.id == itemID }?.row
+        }
+        XCTAssertEqual(sheetRow(windowA)?.title, "Message box not saved yet")
+        XCTAssertEqual(sheetRow(windowA)?.actions, [.retrySave], "The window owning the tab retries")
+        XCTAssertEqual(sheetRow(windowB)?.title, "Message box not saved yet")
+        XCTAssertEqual(sheetRow(windowB)?.actions, [], "Another window lists it without acting on a tab it does not own")
+        let banner = try XCTUnwrap(windowA.recoveryListProps(forActiveSession: owner))
+        XCTAssertTrue(banner.rows.contains { $0.id == itemID }, "The owning tab's banner shows the same item")
+
+        // An action failure is shared state: both windows show it, and the item stays listed.
+        await windowA.performRecoveryListAction(rowID: itemID, action: .dismiss)
+        XCTAssertEqual(coordinator.catalogActionStates[itemID], .failed("This item can't be dismissed."))
+        XCTAssertEqual(sheetRow(windowA)?.error, "This item can't be dismissed.")
+        XCTAssertEqual(sheetRow(windowB)?.error, "This item can't be dismissed.")
+        XCTAssertNotNil(coordinator.catalog.item(id: itemID))
+        XCTAssertTrue(windowB.sessions.isEmpty, "Listing it in another window hydrates nothing there")
+    }
+
     // MARK: - Fixtures
 
     private func makeFixture() throws -> Fixture {
@@ -649,17 +1090,19 @@ final class AgentRecoveryStartupCompositionTests: XCTestCase {
     private func makeSession(
         _ launch: Launch,
         fixture: Fixture,
+        workspace: WorkspaceModel? = nil,
         composeTabID: UUID = UUID()
     ) async throws -> AgentSessionEditableLoad {
+        let workspace = workspace ?? fixture.workspace
         let session = AgentSession(
             id: UUID(),
-            workspaceID: fixture.workspace.id,
+            workspaceID: workspace.id,
             composeTabID: composeTabID,
             name: "Recovered Session"
         ).withItems([AgentChatItem.user("hello", sequenceIndex: 0)])
         return try await launch.service.prepareInitialAgentSessionPersistence(
             initialSession: session,
-            for: fixture.workspace,
+            for: workspace,
             preparation: .alreadyCanonicalTranscript,
             trustedCanonicalItemCount: 1
         )

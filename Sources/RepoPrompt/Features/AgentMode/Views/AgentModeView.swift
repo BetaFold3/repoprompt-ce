@@ -2761,7 +2761,11 @@ struct AgentModeChatDetailView: View {
                 onStop: {
                     guard let cancelTarget else { return }
                     Task {
-                        _ = await agentModeVM.cancelAgentRun(target: cancelTarget, completion: .terminalPublished)
+                        _ = await agentModeVM.cancelAgentRun(
+                            target: cancelTarget,
+                            cause: .userCancel,
+                            completion: .terminalPublished
+                        )
                     }
                 },
                 onDraftChange: { questionID, draft in

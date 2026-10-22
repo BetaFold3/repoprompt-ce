@@ -511,6 +511,22 @@ public struct AgentTranscriptTurnInterruption: Codable, Sendable, Equatable {
     }
 }
 
+/// Lossless-restart Phase 2 (review A F03-R1): cold restore closed this turn while it was still
+/// open, as its run attempt's recorded ordinary outcome (completed, or an ordinary failure or
+/// cancel). The outcome is known, but the saved transcript tail may be missing. Not an
+/// interruption: the turn keeps its outcome. Optional and additive; an unreadable value decodes as
+/// absent. Durable until the recovery item is dismissed (its card acknowledgement).
+public struct AgentTranscriptTurnRecoveredOutcome: Codable, Sendable, Equatable {
+    /// The run attempt whose terminal evidence decided the outcome.
+    public var runAttemptID: UUID
+    public var observedAt: Date
+
+    public init(runAttemptID: UUID, observedAt: Date) {
+        self.runAttemptID = runAttemptID
+        self.observedAt = observedAt
+    }
+}
+
 public struct AgentTranscriptTurn: Codable, Identifiable, Sendable, Equatable {
     public let id: UUID
     public var request: AgentTranscriptRequestAnchor?
@@ -528,6 +544,9 @@ public struct AgentTranscriptTurn: Codable, Identifiable, Sendable, Equatable {
     public var frozenDetailedToolTailLimit: Int?
     /// R5: set when cold restore closed this turn while it was still open.
     public var interruption: AgentTranscriptTurnInterruption?
+    /// Set when cold restore closed this open turn as its recorded ordinary outcome (never together
+    /// with an interruption).
+    public var recoveredOutcome: AgentTranscriptTurnRecoveredOutcome?
 
     public init(
         id: UUID = UUID(),
@@ -541,7 +560,8 @@ public struct AgentTranscriptTurn: Codable, Identifiable, Sendable, Equatable {
         lastActivityAt: Date? = nil,
         completedAt: Date? = nil,
         frozenDetailedToolTailLimit: Int? = nil,
-        interruption: AgentTranscriptTurnInterruption? = nil
+        interruption: AgentTranscriptTurnInterruption? = nil,
+        recoveredOutcome: AgentTranscriptTurnRecoveredOutcome? = nil
     ) {
         self.id = id
         self.request = request
@@ -555,6 +575,7 @@ public struct AgentTranscriptTurn: Codable, Identifiable, Sendable, Equatable {
         self.completedAt = completedAt
         self.frozenDetailedToolTailLimit = frozenDetailedToolTailLimit
         self.interruption = interruption
+        self.recoveredOutcome = recoveredOutcome
     }
 
     enum CodingKeys: String, CodingKey {
@@ -570,6 +591,7 @@ public struct AgentTranscriptTurn: Codable, Identifiable, Sendable, Equatable {
         case completedAt
         case frozenDetailedToolTailLimit
         case interruption
+        case recoveredOutcome
     }
 
     public init(from decoder: Decoder) throws {
@@ -587,6 +609,7 @@ public struct AgentTranscriptTurn: Codable, Identifiable, Sendable, Equatable {
         frozenDetailedToolTailLimit = try container.decodeIfPresent(Int.self, forKey: .frozenDetailedToolTailLimit)
         // Additive member: an unreadable record never fails the session.
         interruption = try? container.decodeIfPresent(AgentTranscriptTurnInterruption.self, forKey: .interruption)
+        recoveredOutcome = try? container.decodeIfPresent(AgentTranscriptTurnRecoveredOutcome.self, forKey: .recoveredOutcome)
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -603,6 +626,7 @@ public struct AgentTranscriptTurn: Codable, Identifiable, Sendable, Equatable {
         try container.encodeIfPresent(completedAt, forKey: .completedAt)
         try container.encodeIfPresent(frozenDetailedToolTailLimit, forKey: .frozenDetailedToolTailLimit)
         try container.encodeIfPresent(interruption, forKey: .interruption)
+        try container.encodeIfPresent(recoveredOutcome, forKey: .recoveredOutcome)
     }
 
     public var isCompleted: Bool {

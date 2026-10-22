@@ -41,6 +41,10 @@ package protocol NativeAgentRuntimeControlling: Actor {
     func interruptTurn(reason: String) async -> NativeAgentRuntimeInterruptOutcome
     func shutdown() async
     func respondToPermissionRequest(id: String, decision: AgentApprovalDecision) async
+    /// Whether the runtime failed `turnID` because its provider process ended unexpectedly (not a
+    /// shutdown it was asked for): the run's terminal cause is provider-process loss (review A F06).
+    /// Answers once per turn. Runtimes without that evidence answer `false`.
+    func turnEndedByProcessLoss(_ turnID: UUID) async -> Bool
 }
 
 extension NativeAgentRuntimeControlling {
@@ -59,6 +63,10 @@ extension NativeAgentRuntimeControlling {
 
     func emitEventMarker(_: UUID) async -> UInt64? {
         nil
+    }
+
+    func turnEndedByProcessLoss(_: UUID) async -> Bool {
+        false
     }
 }
 

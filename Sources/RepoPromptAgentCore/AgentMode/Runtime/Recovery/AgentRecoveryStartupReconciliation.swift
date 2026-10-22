@@ -102,10 +102,64 @@ package struct AgentRecoverySessionFileHint: Equatable {
 
 /// A saved turn cold restore found open, with its R5 record and R1a status.
 package struct AgentRecoveryInterruptedTurn: Equatable {
+    /// The one classification of a turn's run outcome, shared by cold restore reconciliation, live
+    /// state and the recovery catalog. It reads recorded run evidence only; a turn's `completedAt`
+    /// (set by sanitizing) never implies completion. Every status other than `interrupted` and
+    /// `unknown` comes from terminal evidence of a turn saved open, so its transcript tail may be
+    /// missing.
     package enum Status: Equatable {
         case interrupted
-        /// Terminal evidence exists for its run attempt: "completed; transcript tail may be missing".
+        /// The run completed: "completed; transcript tail may be missing".
         case completedTailMayBeMissing
+        /// The provider run failed on its own (not an interruption).
+        case failed
+        /// Stopped by the app for an ordinary reason (workspace switch, reset, delete).
+        case stopped
+        /// The user explicitly cancelled the run; not an interruption.
+        case cancelledByUser
+        /// The evidence does not say how the run ended.
+        case unknown
+
+        /// Whether the run's end is an interruption the user may want to resume.
+        package var isInterruption: Bool {
+            self == .interrupted
+        }
+
+        /// Classifies a run attempt from its recorded evidence. No terminal evidence is an
+        /// interruption (the run never committed). A completed terminal is completion only with an
+        /// ordinary (or legacy unspecified) cause; a failed or cancelled terminal is never
+        /// completion. A legacy cancelled terminal without a cause is an interruption only when
+        /// shutdown evidence was recorded, otherwise unknown.
+        package static func classify(
+            terminal: AgentRecoveryRunTerminalEvidence?,
+            shutdown: AgentRecoveryRunShutdownEvidence?
+        ) -> Status {
+            guard let terminal else { return .interrupted }
+            let cause = terminal.cause
+            switch terminal.terminalState {
+            case .completed:
+                return cause == nil || cause == .ordinary ? .completedTailMayBeMissing : .unknown
+            case .failed:
+                if cause?.interruptionReason != nil { return .interrupted }
+                return cause == .userCancel ? .cancelledByUser : .failed
+            case .cancelled:
+                switch cause {
+                case .userCancel?: return .cancelledByUser
+                case .ordinary?: return .stopped
+                case .appQuit?, .windowClose?, .providerProcessLost?: return .interrupted
+                case nil: return shutdown == nil ? .unknown : .interrupted
+                }
+            default:
+                return .unknown
+            }
+        }
+
+        /// Classification of a stamped turn: by its joined run attempt when there is one;
+        /// otherwise (a legacy turn with no attempt) the stamp is the only evidence.
+        package static func classify(attempt: AgentRecoveryRunAttempt?) -> Status {
+            guard let attempt else { return .interrupted }
+            return classify(terminal: attempt.terminal, shutdown: attempt.shutdown)
+        }
     }
 
     package let turnID: UUID
@@ -119,6 +173,25 @@ package struct AgentRecoveryInterruptedTurn: Equatable {
         self.interruption = interruption
         self.status = status
         self.isLastTurn = isLastTurn
+    }
+}
+
+/// A turn saved open that cold restoration closed with its run attempt's authoritative ordinary
+/// outcome (completed, an ordinary failure or cancel, or a user cancel) instead of an interruption
+/// (review A F03). Listed by the launch that closed it: its transcript tail may be missing. Carries
+/// no interruption stamp and never contributes to a crash hold.
+package struct AgentRecoveryOutcomeTurn: Equatable {
+    package let turnID: UUID
+    package let runAttempt: AgentRecoveryRunAttempt
+
+    package init(turnID: UUID, runAttempt: AgentRecoveryRunAttempt) {
+        self.turnID = turnID
+        self.runAttempt = runAttempt
+    }
+
+    /// The shared classifier over the attempt's recorded evidence (never `interrupted`).
+    package var status: AgentRecoveryInterruptedTurn.Status {
+        .classify(attempt: runAttempt)
     }
 }
 
@@ -163,6 +236,8 @@ package struct AgentSessionRecoveryResolution: Equatable {
     /// The recovery record with holds against the authoritative generation (actionable only).
     package let record: AgentRecoveryDiscoveredRecord?
     package let interruptedTurns: [AgentRecoveryInterruptedTurn]
+    /// Turns saved open that this launch's cold restoration closed with an ordinary outcome.
+    package let outcomeTurns: [AgentRecoveryOutcomeTurn]
     /// Run attempts with no saved transcript turn (`AgentRecoveryRunTurnJoin.unrepresentedAttempts`):
     /// open ones (the run started but the transcript never saved it) and terminal ones of the
     /// current generation (the run finished but its turn is missing, R09). Listed as their own rows
@@ -174,6 +249,9 @@ package struct AgentSessionRecoveryResolution: Equatable {
     /// host's, not a local process's: it is excluded from local crash holds and local-owner
     /// confirmation, and its uncertain input stays visible as remote uncertainty.
     package let remoteHostID: String?
+    /// The validated session storage destination (actionable sessions only): the closed-session
+    /// gate a recovery-card acknowledgement uses when no live lane exists.
+    package let workspace: AgentRecoveryWorkspaceDestination?
 
     package init(
         sessionID: UUID,
@@ -184,11 +262,15 @@ package struct AgentSessionRecoveryResolution: Equatable {
         binding: AgentRecoveryLifecycleBinding? = nil,
         record: AgentRecoveryDiscoveredRecord? = nil,
         interruptedTurns: [AgentRecoveryInterruptedTurn] = [],
+        outcomeTurns: [AgentRecoveryOutcomeTurn] = [],
         recoveryOnlyRunAttempts: [AgentRecoveryRunAttempt] = [],
         scheduleTransfer: AgentRecoveryScheduleTransferOutcome = .notApplicable,
-        remoteHostID: String? = nil
+        remoteHostID: String? = nil,
+        workspace: AgentRecoveryWorkspaceDestination? = nil
     ) {
+        self.outcomeTurns = outcomeTurns
         self.remoteHostID = remoteHostID
+        self.workspace = workspace
         self.sessionID = sessionID
         self.workspaceID = workspaceID
         self.sessionName = sessionName
@@ -239,6 +321,7 @@ package struct AgentSessionRecoveryResolution: Equatable {
         }
         if case .held = scheduleTransfer { return true }
         if interruptedTurns.contains(where: { $0.interruption.resolution == nil }) { return true }
+        if !outcomeTurns.isEmpty { return true }
         if !recoveryOnlyRunAttempts.isEmpty { return true }
         guard let record = record?.record else { return false }
         // Unresolved run evidence counts even without a transcript turn.

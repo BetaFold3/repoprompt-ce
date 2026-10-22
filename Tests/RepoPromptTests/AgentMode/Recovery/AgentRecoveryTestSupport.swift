@@ -288,13 +288,15 @@ enum RecoveryTestSupport {
         ownership: AgentRunOwnership,
         commitID: UUID = UUID(),
         state: AgentSessionRunState = .completed,
-        expectedRunID: UUID? = nil
+        expectedRunID: UUID? = nil,
+        cause: AgentRunTerminalCause = .ordinary
     ) -> AgentRunTerminalCommitRevision {
         AgentRunTerminalCommitRevision(
             commitID: commitID,
             ownership: ownership,
             terminalState: state,
             expectedRunID: expectedRunID,
+            cause: cause,
             sourceItemsRevision: 0,
             assistantDeltaFlushGeneration: 0,
             providerDrainGeneration: 0,

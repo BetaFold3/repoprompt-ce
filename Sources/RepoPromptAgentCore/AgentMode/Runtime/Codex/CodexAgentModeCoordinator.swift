@@ -619,6 +619,11 @@ package final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObser
 
     @discardableResult
     private func clearCodexPendingInteractions(in session: AgentTabSession) -> Bool {
+        // Native questions end with the run (removed), unless lifecycle teardown preserves them.
+        var endedQuestions = Set(session.queuedMCPElicitationRequests.map(\.id) + session.queuedUserInputRequests.map(\.id))
+        if let request = session.pendingMCPElicitationRequest { endedQuestions.insert(request.id) }
+        if let request = session.pendingUserInputRequest { endedQuestions.insert(request.id) }
+        AgentRecoveryLiveQuestions.end(session: session, interactionIDs: endedQuestions, preserving: false)
         let didClear = session.pendingApproval != nil
             || session.pendingPermissionsRequest != nil
             || session.pendingMCPElicitationRequest != nil
@@ -6887,6 +6892,17 @@ package final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObser
         return true
     }
 
+    /// Finalize reasons where the app-server transport or process ended under the run and
+    /// recovery could not reattach; every other finalize is an ordinary provider terminal.
+    static func terminalCause(forFinalizeReason reason: String) -> AgentRunTerminalCause {
+        switch reason {
+        case "transport-closed-fallback", "unexpected-stream-end":
+            .providerProcessLost
+        default:
+            .ordinary
+        }
+    }
+
     private func finalizeCodexRun(
         _ session: AgentTabSession,
         turnStatus: CodexNativeSessionController.TurnStatus,
@@ -6945,6 +6961,7 @@ package final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObser
             expectedRunID: expectedRunID,
             terminalState: terminalState,
             source: "codex.finalize.\(reason)",
+            cause: Self.terminalCause(forFinalizeReason: reason),
             errorText: errorMessage,
             attachmentDisposition: attachmentDisposition,
             finalizeNonCodexUsage: false,
@@ -7053,6 +7070,140 @@ package final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObser
             return false
         }
         return true
+    }
+
+    /// Admission of a native question after its creation write (plan §E).
+    enum CodexNativeQuestionAdmission: Equatable {
+        /// Saved (or the session has no recovery lane) and the same owner still holds the session.
+        case publish
+        /// The owner changed or a duplicate was published while the snapshot was written.
+        case drop
+        /// The snapshot could not be saved, or the recovery lane was handed over during the write,
+        /// while the same run still holds the session: the run fails loudly (never a silent drop).
+        case persistenceFailed
+    }
+
+    static let unsavedQuestionRunFailureMessage =
+        "Codex asked a question that couldn't be saved for crash recovery, so it wasn't shown and the run was stopped. Try again."
+
+    /// Commits a native question's snapshot before it is shown or queued. Publication requires a
+    /// successful write and the exact owner captured before the write: the same recovery lane and
+    /// question controller, run attempt (ownership, attempt generation, run ID), and Codex controller,
+    /// with the run still active. A failed write withdraws the snapshot (the lane keeps its visible
+    /// save error); no provider reply is ever synthesized. A session without a lane keeps the
+    /// existing behavior (covered by shutdown preparation only).
+    ///
+    /// Review R1-F2: the run fence and the lane fence are separate. A changed run (replacement,
+    /// generation, run ID, controller, or no longer active) drops the request silently, as its run
+    /// is gone. A lane handed over while the same run waits cannot publish through the retired
+    /// controller, so that run fails loudly (`persistenceFailed`) instead of waiting forever.
+    private func admitCodexNativeQuestion(
+        interactionID: UUID,
+        session: AgentTabSession,
+        isDuplicate: () -> Bool,
+        snapshot: (AgentRecoveryQuestionSnapshotBuilder.Context) -> AgentRecoveryQuestionSnapshot
+    ) async -> CodexNativeQuestionAdmission {
+        guard let lane = AgentRecoveryLiveQuestions.lane(for: session) else { return .publish }
+        let questions = lane.questionPersistence
+        let ownership = session.activeRunOwnership
+        let attemptGeneration = session.runAttemptGeneration
+        let runID = session.runID
+        let controller = session.codexController
+        let built = snapshot(AgentRecoveryLiveQuestions.context(for: session, lane: lane))
+        let result = await questions.commitCreation(built)
+        let laneHeld = AgentRecoveryLiveQuestions.lane(for: session) === lane && lane.questionPersistence === questions
+        let runHeld: Bool = {
+            guard session.runState.isActive,
+                  session.activeRunOwnership == ownership,
+                  session.runAttemptGeneration == attemptGeneration,
+                  session.runID == runID
+            else { return false }
+            switch (session.codexController, controller) {
+            case (nil, nil):
+                return true
+            case let (current?, captured?):
+                return Self.sameCodexControllerInstance(current, captured)
+            default:
+                return false
+            }
+        }()
+        guard runHeld else {
+            // The run is gone: its request ends with it, preserved only under lifecycle teardown.
+            switch result {
+            case .failure:
+                questions.forget(interactionID)
+            case .success:
+                if !AgentRecoveryLiveQuestions.liveInteractionIDs(of: session).contains(interactionID) {
+                    questions.end([interactionID], preserving: session.lifecycleTeardownCause != nil)
+                }
+            }
+            return .drop
+        }
+        if !laneHeld, session.lifecycleTeardownCause != nil {
+            // Window close or quit released the lane: that teardown ends the run (with its own
+            // interruption cause); a stored snapshot stays as its preserved question.
+            if case .failure = result { questions.forget(interactionID) }
+            return .drop
+        }
+        switch result {
+        case .failure:
+            questions.forget(interactionID)
+            return .persistenceFailed
+        case .success where !laneHeld:
+            // Lane-only hand-over: the retired controller cannot keep this question live.
+            return .persistenceFailed
+        case .success:
+            guard !isDuplicate() else {
+                // The request ended with its owner (or another copy was shown): its snapshot ends
+                // too, preserved only under lifecycle teardown.
+                if !AgentRecoveryLiveQuestions.liveInteractionIDs(of: session).contains(interactionID) {
+                    questions.end([interactionID], preserving: session.lifecycleTeardownCause != nil)
+                }
+                return .drop
+            }
+            return .publish
+        }
+    }
+
+    /// The existing producer failure path for a request that cannot be presented: the run fails
+    /// with a generic message and the request is never answered.
+    /// Review R1-F2: the provider turn is interrupted too, since it is blocked on the unanswered
+    /// server request (still never answered).
+    /// Review R2 (A F11-R2): the failed turn's exact identity is pinned before finalization
+    /// releases the run (called synchronously after admission, while the same run still holds the
+    /// session): the asking request's own turn, else this run's authoritative turn. Only that turn
+    /// is interrupted, on the run's own controller (`interruptUserTurn` is turn-scoped and refuses
+    /// any other current turn), so a replacement started during finalization is never interrupted.
+    /// With no known identity nothing is interrupted (the failure stays visible); there is never an
+    /// unscoped current-turn interrupt.
+    private func failCodexRunForUnsavedQuestion(_ session: AgentTabSession, askingTurnID: String) async {
+        let controller = session.codexController
+        let failedTurnID = Self.failedQuestionTurnID(askingTurnID: askingTurnID, session: session)
+        await finalizeCodexRun(
+            session,
+            turnStatus: .failed,
+            reason: "question-persistence-failed",
+            errorMessage: Self.unsavedQuestionRunFailureMessage,
+            notifyOnCompleted: false
+        )
+        viewModel?.requestUIRefresh(tabID: session.tabID, urgent: true)
+        guard let controller, let failedTurnID else { return }
+        Task { [controller] in
+            _ = try? await controller.interruptUserTurn(expectedTurnID: failedTurnID)
+        }
+    }
+
+    /// The provider turn a failed native question belongs to, read while its run still holds the
+    /// session: the request's own turn ID, else the authoritative turn of this exact run attempt.
+    static func failedQuestionTurnID(askingTurnID: String, session: AgentTabSession) -> String? {
+        let asking = askingTurnID.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !asking.isEmpty { return asking }
+        guard let active = session.codexAuthoritativeActiveTurn,
+              active.runID == session.runID,
+              active.runAttemptID == session.activeRunAttemptID
+        else { return nil }
+        let authoritative = active.turnID.trimmingCharacters(in: .whitespacesAndNewlines)
+        return authoritative.isEmpty ? nil : authoritative
     }
 
     private func handleCodexNativeEvent(
@@ -7212,9 +7363,26 @@ package final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObser
             guard session.runState.isActive else { return }
             clearCodexPendingAuthRetryTurn(session)
             sealAssistantBoundary(session)
-            let alreadyPending = session.pendingMCPElicitationRequest?.requestID == request.requestID
-            let alreadyQueued = session.queuedMCPElicitationRequests.contains { $0.requestID == request.requestID }
-            guard !alreadyPending, !alreadyQueued else { return }
+            func isDuplicate() -> Bool {
+                session.pendingMCPElicitationRequest?.requestID == request.requestID
+                    || session.queuedMCPElicitationRequests.contains { $0.requestID == request.requestID }
+            }
+            guard !isDuplicate() else { return }
+            // Committed before it is shown or queued (plan §E), under the exact owner captured first.
+            switch await admitCodexNativeQuestion(
+                interactionID: request.id,
+                session: session,
+                isDuplicate: isDuplicate,
+                snapshot: { AgentRecoveryQuestionSnapshotBuilder.snapshot(elicitation: request, context: $0) }
+            ) {
+            case .publish:
+                break
+            case .drop:
+                return
+            case .persistenceFailed:
+                await failCodexRunForUnsavedQuestion(session, askingTurnID: request.turnID)
+                return
+            }
             if session.pendingMCPElicitationRequest == nil {
                 session.pendingMCPElicitationRequest = request
             } else {
@@ -7234,9 +7402,26 @@ package final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObser
                 submitUserInputResponse(session: session, requestID: request.requestID, response: response)
                 return
             }
-            let alreadyPending = session.pendingUserInputRequest?.requestID == request.requestID
-            let alreadyQueued = session.queuedUserInputRequests.contains { $0.requestID == request.requestID }
-            guard !alreadyPending, !alreadyQueued else {
+            func isDuplicate() -> Bool {
+                session.pendingUserInputRequest?.requestID == request.requestID
+                    || session.queuedUserInputRequests.contains { $0.requestID == request.requestID }
+            }
+            guard !isDuplicate() else {
+                return
+            }
+            // Committed before it is shown or queued (plan §E), without answers (none exist yet).
+            switch await admitCodexNativeQuestion(
+                interactionID: request.id,
+                session: session,
+                isDuplicate: isDuplicate,
+                snapshot: { AgentRecoveryQuestionSnapshotBuilder.snapshot(userInput: request, drafts: [:], context: $0) }
+            ) {
+            case .publish:
+                break
+            case .drop:
+                return
+            case .persistenceFailed:
+                await failCodexRunForUnsavedQuestion(session, askingTurnID: request.turnID)
                 return
             }
             if session.pendingUserInputRequest == nil {

@@ -776,6 +776,9 @@ package struct AgentMCPElicitationRequest: Identifiable, Hashable {
     let defaultContentJSON: String?
     let rawParamsJSON: String
     package let details: [AgentApprovalDetail]
+    /// When the request was received (stamped once at creation, like the other question requests),
+    /// so a durable snapshot's ask time never changes between captures.
+    package let askedAt: Date
 
     init(
         id: UUID? = nil,
@@ -793,7 +796,8 @@ package struct AgentMCPElicitationRequest: Identifiable, Hashable {
         schemaJSON: String? = nil,
         defaultContentJSON: String? = nil,
         rawParamsJSON: String,
-        details: [AgentApprovalDetail] = []
+        details: [AgentApprovalDetail] = [],
+        askedAt: Date = Date()
     ) {
         self.id = id ?? Self.stableID(
             requestID: requestID,
@@ -817,6 +821,7 @@ package struct AgentMCPElicitationRequest: Identifiable, Hashable {
         self.defaultContentJSON = defaultContentJSON
         self.rawParamsJSON = rawParamsJSON
         self.details = details
+        self.askedAt = askedAt
     }
 
     static func stableID(

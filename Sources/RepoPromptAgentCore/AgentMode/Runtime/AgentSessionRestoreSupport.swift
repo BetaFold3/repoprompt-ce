@@ -1,5 +1,18 @@
 import Foundation
 
+package extension AgentTranscriptTurn {
+    /// Whether the user item `itemID` belongs to this turn: the turn it opened, its request
+    /// anchor, or a mid-turn user activity (review B R1-F1).
+    func containsUserItem(_ itemID: UUID) -> Bool {
+        id == itemID || request?.id == itemID || userActivityIDs.contains(itemID)
+    }
+
+    /// IDs of the user activities inside this turn's response spans.
+    var userActivityIDs: [UUID] {
+        responseSpans.flatMap { span in span.activities.filter { $0.itemKind == .user }.map(\.id) }
+    }
+}
+
 /// Ambiguity-aware joins between recovery run attempts and saved transcript turns (R08/F-14).
 ///
 /// A run attempt's own transcript turn (`transcriptTurnID`) is authoritative. A process run ID is
@@ -11,8 +24,15 @@ package struct AgentRecoveryRunTurnJoin: Equatable {
     private let attemptsByTurnID: [UUID: [AgentRecoveryRunAttempt]]
     /// Attempts without their own turn, by process run.
     private let unkeyedAttemptsByProcessRunID: [UUID: [AgentRecoveryRunAttempt]]
+    /// Review B F1: input dispatched under an already-running attempt (steering) opens its own
+    /// transcript turn (the user item's ID) while the run attempt keeps its start turn. Those turns
+    /// join the run attempt their dispatch recorded; a turn claimed by several run attempts is
+    /// ambiguous and joins none. A run attempt's own turn always wins.
+    private let steeredAttemptsByTurnID: [UUID: AgentRecoveryRunAttempt]
+    /// Each run attempt's latest dispatched transcript turn (its own turn, or a later steer).
+    private let latestTurnIDByRunAttemptID: [UUID: UUID]
 
-    package init(runAttempts: [AgentRecoveryRunAttempt]) {
+    package init(runAttempts: [AgentRecoveryRunAttempt], intentAttempts: [AgentRecoveryAttempt] = []) {
         var byTurn: [UUID: [AgentRecoveryRunAttempt]] = [:]
         var unkeyedByRun: [UUID: [AgentRecoveryRunAttempt]] = [:]
         for attempt in runAttempts {
@@ -22,8 +42,33 @@ package struct AgentRecoveryRunTurnJoin: Equatable {
                 unkeyedByRun[runID, default: []].append(attempt)
             }
         }
+        let runAttemptsByID = Dictionary(runAttempts.map { ($0.runAttemptID, $0) }, uniquingKeysWith: { first, _ in first })
+        var steeredRunIDs: [UUID: Set<UUID>] = [:]
+        var latest: [UUID: (turnID: UUID, at: AgentRecoveryTimestamp?)] = [:]
+        for attempt in runAttempts {
+            if let turnID = attempt.transcriptTurnID { latest[attempt.runAttemptID] = (turnID, nil) }
+        }
+        for dispatch in intentAttempts {
+            guard let runAttemptID = dispatch.runAttemptID, runAttemptsByID[runAttemptID] != nil else { continue }
+            if byTurn[dispatch.userItemID] == nil {
+                steeredRunIDs[dispatch.userItemID, default: []].insert(runAttemptID)
+            }
+            // The own turn (no dispatch time) precedes every dispatch into its run; ties keep the first.
+            if let at = latest[runAttemptID]?.at, at.date >= dispatch.dispatchedAt.date { continue }
+            latest[runAttemptID] = (dispatch.userItemID, dispatch.dispatchedAt)
+        }
         attemptsByTurnID = byTurn
         unkeyedAttemptsByProcessRunID = unkeyedByRun
+        steeredAttemptsByTurnID = steeredRunIDs.compactMapValues { ids in
+            ids.count == 1 ? ids.first.flatMap { runAttemptsByID[$0] } : nil
+        }
+        latestTurnIDByRunAttemptID = latest.mapValues(\.turnID)
+    }
+
+    /// The latest transcript turn `runAttempt` dispatched into (its own turn, or a later steer):
+    /// the turn its terminal closed. `nil` when the attempt has no turn join key.
+    package func latestTurnID(of runAttempt: AgentRecoveryRunAttempt) -> UUID? {
+        latestTurnIDByRunAttemptID[runAttempt.runAttemptID] ?? runAttempt.transcriptTurnID
     }
 
     /// The single run attempt a saved turn belongs to; `nil` when none or ambiguous. Several
@@ -35,6 +80,14 @@ package struct AgentRecoveryRunTurnJoin: Equatable {
             let open = owners.filter { $0.terminal == nil }
             return open.count == 1 ? open[0] : nil
         }
+        if let steered = steeredAttemptsByTurnID[turn.id] { return steered }
+        // Review B R1-F1: steering recorded as a mid-turn user activity joins the run attempt its
+        // dispatch recorded (one attempt only; several are ambiguous).
+        let activitySteered = Set(turn.userActivityIDs.compactMap { steeredAttemptsByTurnID[$0]?.runAttemptID })
+        if activitySteered.count == 1, let steered = turn.userActivityIDs.lazy.compactMap({ self.steeredAttemptsByTurnID[$0] }).first {
+            return steered
+        }
+        if activitySteered.count > 1 { return nil }
         var candidates: [UUID: AgentRecoveryRunAttempt] = [:]
         for runID in Set(turn.responseSpans.compactMap(\.runID)) {
             guard let unkeyed = unkeyedAttemptsByProcessRunID[runID] else { continue }
@@ -87,6 +140,8 @@ package struct AgentColdRestoreInterruptionContext: Equatable {
     package struct AttemptEvidence: Equatable {
         package let runAttemptID: UUID
         package let shutdownReason: AgentRecoveryShutdownReason?
+        /// Phase 2 terminal cause recorded with the attempt's terminal evidence, if any.
+        package let terminalCause: AgentRunTerminalCause?
     }
 
     /// R1a: an earlier launch's intent with affirmative provider acceptance whose deterministic
@@ -163,6 +218,7 @@ package struct AgentColdRestoreInterruptionContext: Equatable {
         observedAt: Date,
         providerConversationID: String?,
         runAttempts: [AgentRecoveryRunAttempt],
+        intentAttempts: [AgentRecoveryAttempt] = [],
         acceptedBubbles: [AcceptedBubble] = [],
         unacceptedBubbles: [UnacceptedBubble] = [],
         launchReason: AgentTranscriptTurnInterruption.Reason? = nil,
@@ -177,7 +233,7 @@ package struct AgentColdRestoreInterruptionContext: Equatable {
         self.launchReason = launchReason
         self.launchStateCaptured = launchStateCaptured
         self.provisionalUnknownTurnIDs = launchReason == nil ? [] : provisionalUnknownTurnIDs
-        runJoin = AgentRecoveryRunTurnJoin(runAttempts: runAttempts)
+        runJoin = AgentRecoveryRunTurnJoin(runAttempts: runAttempts, intentAttempts: intentAttempts)
         currentLaunchLiveRuns = currentInstanceID.map { current in
             runAttempts.filter {
                 $0.appInstanceID == current && $0.terminal == nil && $0.shutdown == nil
@@ -291,19 +347,58 @@ package struct AgentColdRestoreInterruptionContext: Equatable {
 
     private func evidence(for turn: AgentTranscriptTurn) -> AttemptEvidence? {
         runJoin.attempt(for: turn).map {
-            AttemptEvidence(runAttemptID: $0.runAttemptID, shutdownReason: $0.shutdown?.reason)
+            AttemptEvidence(
+                runAttemptID: $0.runAttemptID,
+                shutdownReason: $0.shutdown?.reason,
+                terminalCause: $0.terminal?.cause
+            )
         }
     }
 
-    /// Per-attempt evidence first, then the launch state; `unknown` only when neither applies.
+    /// Per-attempt evidence first (a recorded interruption terminal cause, then the shutdown
+    /// reason), then the launch state; `unknown` only when none applies.
     private func reason(for evidence: AttemptEvidence?) -> AgentTranscriptTurnInterruption.Reason {
-        switch evidence?.shutdownReason {
+        if let causeReason = evidence?.terminalCause?.interruptionReason {
+            return causeReason
+        }
+        return switch evidence?.shutdownReason {
         case .appQuit?: .appQuit
         case .windowClose?: .windowClose
         case .safeRestart?: .safeRestart
         case .providerProcessLost?: .providerProcessLost
         case nil: launchReason ?? .unknown
         }
+    }
+
+    /// The authoritative ordinary outcome of the turn's joined run attempt: its terminal commit
+    /// recorded a non-interruption. A completed commit is always ordinary (completion wins against a
+    /// provisional Stage A shutdown reason); a failed or cancelled commit is ordinary only with an
+    /// explicit `ordinary` or `userCancel` cause (pre-Phase 2 evidence without a cause proves
+    /// nothing). `nil` when no such evidence exists.
+    func ordinaryTerminalOutcome(for turn: AgentTranscriptTurn) -> AgentSessionRunState? {
+        guard let terminal = runJoin.attempt(for: turn)?.terminal else { return nil }
+        switch terminal.terminalState {
+        case .completed:
+            return .completed
+        case .failed, .cancelled:
+            guard let cause = terminal.cause, cause.interruptionReason == nil else { return nil }
+            return terminal.terminalState
+        default:
+            return nil
+        }
+    }
+
+    /// The durable marker for a turn cold restore closes as its joined attempt's ordinary outcome
+    /// (review A F03-R1); `nil` when there is no such outcome.
+    func recoveredOutcome(for turn: AgentTranscriptTurn) -> AgentTranscriptTurnRecoveredOutcome? {
+        guard ordinaryTerminalOutcome(for: turn) != nil, let attempt = runJoin.attempt(for: turn) else { return nil }
+        return AgentTranscriptTurnRecoveredOutcome(runAttemptID: attempt.runAttemptID, observedAt: observedAt)
+    }
+
+    /// Whether the turn carries a provisional, unresolved `unknown` stamp this process wrote.
+    func hasProvisionalUnknownStamp(_ turn: AgentTranscriptTurn) -> Bool {
+        guard let existing = turn.interruption else { return false }
+        return existing.reason == .unknown && existing.resolution == nil && provisionalUnknownTurnIDs.contains(turn.id)
     }
 
     /// A provisional `unknown` stamp this process wrote before launch evidence existed, refined
@@ -320,8 +415,13 @@ package struct AgentColdRestoreInterruptionContext: Equatable {
         return existing
     }
 
-    func interruption(for turn: AgentTranscriptTurn) -> AgentTranscriptTurnInterruption {
+    /// The stamp for an open turn cold restore closes, or `nil` when its run attempt's terminal
+    /// evidence records an ordinary outcome (completed, an ordinary failure or cancel, or an explicit
+    /// user cancel): such a turn closes as that outcome, never as an interruption.
+    func interruption(for turn: AgentTranscriptTurn) -> AgentTranscriptTurnInterruption? {
+        if ordinaryTerminalOutcome(for: turn) != nil { return nil }
         let evidence = evidence(for: turn)
+        if evidence?.terminalCause == .userCancel { return nil }
         return AgentTranscriptTurnInterruption(
             reason: reason(for: evidence),
             observedAt: observedAt,
@@ -480,7 +580,26 @@ package enum AgentSessionRestoreSupport {
                 }
             }
         }
-        if let interruptionContext, let refined = interruptionContext.refinedInterruption(of: turn) {
+        // Authoritative ordinary terminal evidence (completed, or an ordinary failure or cancel)
+        // decides the turn's outcome: a provisional `unknown` stamp this process wrote is withdrawn
+        // and the turn's envelope takes that outcome instead of an interruption.
+        let ordinaryOutcome = interruptionContext?.ordinaryTerminalOutcome(for: turn)
+        if let ordinaryOutcome, interruptionContext?.hasProvisionalUnknownStamp(turn) == true {
+            turn.interruption = nil
+            if turn.terminalState?.isActive != true {
+                // Review B R1-F7: spans the provisional close cancelled take the outcome's lifecycle.
+                let provisionalLifecycle = closedSpanLifecycle(for: .cancelled)
+                let outcomeLifecycle = closedSpanLifecycle(for: ordinaryOutcome)
+                if turn.terminalState == .cancelled, outcomeLifecycle != provisionalLifecycle {
+                    for spanIndex in turn.responseSpans.indices where turn.responseSpans[spanIndex].lifecycle == provisionalLifecycle {
+                        turn.responseSpans[spanIndex].lifecycle = outcomeLifecycle
+                    }
+                }
+                turn.terminalState = ordinaryOutcome
+            }
+            // The provisional stamp closed a saved-open turn: its tail may be missing too.
+            turn.recoveredOutcome = turn.recoveredOutcome ?? interruptionContext?.recoveredOutcome(for: turn)
+        } else if let interruptionContext, let refined = interruptionContext.refinedInterruption(of: turn) {
             turn.interruption = refined
         }
         let activeToolExecutionIDs = activeToolExecutionIDsNeedingColdRestoreCancellation(in: turn)
@@ -490,11 +609,16 @@ package enum AgentSessionRestoreSupport {
             || (turn.terminalState == nil && (hasOpenSpan || !activeToolExecutionIDs.isEmpty))
 
         // R5: the open-turn evidence is recorded before sanitizing closes it, in the same value.
-        if shouldCancelTurn, turn.interruption == nil, let interruptionContext {
+        if shouldCancelTurn, turn.interruption == nil, ordinaryOutcome == nil, let interruptionContext {
             turn.interruption = interruptionContext.interruption(for: turn)
         }
         if shouldCancelTurn {
-            turn.terminalState = .cancelled
+            turn.terminalState = ordinaryOutcome ?? .cancelled
+            // Review A F03-R1: a saved-open turn closed as its ordinary outcome keeps a durable
+            // tail-may-be-missing marker; turns that were already closed are never marked.
+            if ordinaryOutcome != nil, turn.recoveredOutcome == nil {
+                turn.recoveredOutcome = interruptionContext?.recoveredOutcome(for: turn)
+            }
         }
         if shouldCancelTurn || (turn.completedAt == nil && !(turn.terminalState?.isActive ?? false)) {
             turn.completedAt = turn.completedAt
@@ -503,7 +627,7 @@ package enum AgentSessionRestoreSupport {
                 ?? turn.request?.timestamp
                 ?? turn.startedAt
         }
-        if shouldCancelTurn, var summary = turn.summary {
+        if shouldCancelTurn, turn.terminalState != .completed, var summary = turn.summary {
             summary.hadError = true
             turn.summary = summary
         }

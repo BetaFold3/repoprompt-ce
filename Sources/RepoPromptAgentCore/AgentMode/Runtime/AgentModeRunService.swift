@@ -1214,6 +1214,7 @@ package final class AgentModeRunService {
             expectedRunID: session.runID,
             terminalState: .failed,
             source: "runService.startupFailure",
+            cause: .ordinary,
             errorText: message,
             attachmentDisposition: .deleteFiles,
             finalizeNonCodexUsage: session.selectedAgent != .codexExec,
@@ -1714,7 +1715,7 @@ package final class AgentModeRunService {
         case .running:
             steeringDebugLog("[AgentRunSteeringWake] Claude flush cancelling stranded run tab=\(tabID) runID=\(runID) attempt=\(runAttemptID)")
             session.claudeSteeringFlushTask = nil
-            await cancelRun(tabID: tabID, session: session)
+            await cancelRun(tabID: tabID, session: session, cause: .ordinary)
         case .failed:
             steeringDebugLog("[AgentRunSteeringWake] Claude flush committing stranded send failure tab=\(tabID) runID=\(runID) attempt=\(runAttemptID)")
             session.claudeSteeringFlushTask = nil
@@ -1727,6 +1728,7 @@ package final class AgentModeRunService {
                 expectedRunID: runID,
                 terminalState: .failed,
                 source: "runService.claudeSteeringSendFailure",
+                cause: .ordinary,
                 attachmentDisposition: .deleteFiles,
                 finalizeNonCodexUsage: true,
                 supportsFollowUp: false,
@@ -1861,6 +1863,7 @@ package final class AgentModeRunService {
     package func cancelRun(
         tabID: UUID,
         session: AgentTabSession,
+        cause: AgentRunTerminalCause,
         intent: CancellationIntent = .userStop,
         completion: CancellationCompletion = .terminalPublished
     ) async {
@@ -1969,6 +1972,7 @@ package final class AgentModeRunService {
             expectedRunID: expectedRunID,
             terminalState: .cancelled,
             source: "runService.cancel",
+            cause: cause,
             completion: effectiveCompletion,
             attachmentDisposition: session.selectedAgent == .codexExec ? .restoreToPending : .deleteFiles,
             finalizeNonCodexUsage: session.selectedAgent != .codexExec,

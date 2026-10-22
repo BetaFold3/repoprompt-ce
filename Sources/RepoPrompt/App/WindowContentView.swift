@@ -96,6 +96,8 @@ struct WindowContentView: View {
         case .admitted:
             ContentView(windowState: windowState)
                 .safeAreaInset(edge: .top) { GlobalSettingsPersistenceBlockBanner(allowsSessionDismissal: true) }
+                // App-wide Needs Attention sheet, independent of the sidebar and any tab.
+                .modifier(AgentRecoveryNeedsAttentionHost(agentModeVM: windowState.agentModeViewModel))
                 .environmentObject(windowState) // If your subviews need it
                 .environmentObject(sparkleManager)
                 .environmentObject(versionManager) // Pass versionManager to ContentView

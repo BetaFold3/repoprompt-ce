@@ -57,6 +57,10 @@ enum AgentRecoveryRecordCodec {
                     try crashHoldAcknowledgement($0, path: "record.crashHoldAcknowledgement")
                 },
                 questions: questions(reader.optional("questions"), path: "record.questions"),
+                cardAcknowledgements: cardAcknowledgements(
+                    reader.optional("cardAcknowledgements"),
+                    path: "record.cardAcknowledgements"
+                ),
                 extras: reader.extras
             )
             try validateInvariants(record)
@@ -99,6 +103,59 @@ enum AgentRecoveryRecordCodec {
         if !record.questions.isEmpty {
             object["questions"] = .array(record.questions.map(questionJSON))
         }
+        // Absent when empty, so records without acknowledgements keep their existing bytes.
+        if !record.cardAcknowledgements.isEmpty {
+            object["cardAcknowledgements"] = .array(record.cardAcknowledgements.map(cardAcknowledgementJSON))
+        }
+        return .object(object)
+    }
+
+    // MARK: Card acknowledgements
+
+    private static func cardAcknowledgements(
+        _ json: AgentRecoveryJSONValue?,
+        path: String
+    ) throws -> [AgentRecoveryCardAcknowledgement] {
+        guard let json else { return [] }
+        guard case let .array(values) = json else {
+            throw AgentRecoveryDecodingError(reason: .malformed("\(path) is not an array"))
+        }
+        return try values.enumerated().map { try cardAcknowledgement($1, path: "\(path)[\($0)]") }
+    }
+
+    private static func cardAcknowledgement(
+        _ json: AgentRecoveryJSONValue,
+        path: String
+    ) throws -> AgentRecoveryCardAcknowledgement {
+        var reader = try Reader(json, path: path)
+        // An unknown kind (a newer build's card) is kept as its raw string and round-trips.
+        let kindRaw = try reader.string("kind")
+        let generation: UInt64? = try reader.peek("transcriptResetGeneration") == nil
+            ? nil
+            : reader.uint64("transcriptResetGeneration")
+        return try AgentRecoveryCardAcknowledgement(
+            key: AgentRecoveryCardKey(
+                kindRaw: kindRaw,
+                incarnationID: reader.uuid("incarnationID"),
+                transcriptResetGeneration: generation,
+                entityID: reader.string("entityID")
+            ),
+            freshness: AgentRecoveryCardFreshness(reader.string("freshness")),
+            acknowledgedAt: reader.timestamp("acknowledgedAt"),
+            extras: reader.extras
+        )
+    }
+
+    private static func cardAcknowledgementJSON(_ acknowledgement: AgentRecoveryCardAcknowledgement) -> AgentRecoveryJSONValue {
+        var object = acknowledgement.extras
+        object["kind"] = .string(acknowledgement.key.kindRaw)
+        object["incarnationID"] = .string(acknowledgement.key.incarnationID.uuidString)
+        if let generation = acknowledgement.key.transcriptResetGeneration {
+            object["transcriptResetGeneration"] = .number(Decimal(generation))
+        }
+        object["entityID"] = .string(acknowledgement.key.entityID)
+        object["freshness"] = .string(acknowledgement.freshness.token)
+        object["acknowledgedAt"] = timestampJSON(acknowledgement.acknowledgedAt)
         return .object(object)
     }
 
@@ -229,6 +286,12 @@ enum AgentRecoveryRecordCodec {
 
     /// Structural invariants that typed fields alone cannot express.
     private static func validateInvariants(_ record: AgentRecoveryRecord) throws {
+        var cardKeys: Set<AgentRecoveryCardKey> = []
+        for acknowledgement in record.cardAcknowledgements {
+            guard cardKeys.insert(acknowledgement.key).inserted else {
+                throw AgentRecoveryDecodingError(reason: .malformed("duplicate card acknowledgement \(acknowledgement.key.kindRaw)"))
+            }
+        }
         var intentIDs: Set<UUID> = []
         for intent in record.intents {
             guard intentIDs.insert(intent.intentID).inserted else {
@@ -682,6 +745,7 @@ enum AgentRecoveryRecordCodec {
             terminalObject["terminalState"] = .string(terminal.terminalState.rawValue)
             setOptional(&terminalObject, "expectedRunID", terminal.expectedRunID?.uuidString)
             terminalObject["recordedAt"] = timestampJSON(terminal.recordedAt)
+            setOptional(&terminalObject, "cause", terminal.cause?.rawValue)
             object["terminal"] = .object(terminalObject)
         }
         if let shutdown = run.shutdown {
@@ -702,11 +766,24 @@ enum AgentRecoveryRecordCodec {
         guard let state = AgentSessionRunState(rawValue: stateRaw), state.isTerminalForCommit else {
             throw AgentRecoveryDecodingError(reason: .unknownVariant("\(path).terminalState=\(stateRaw)"))
         }
+        // Additive Phase 2 member: an unrecognized or non-string cause stays an extra (preserved
+        // verbatim) and reads as unspecified, so a newer writer's value never makes the record
+        // unreadable.
+        let cause: AgentRunTerminalCause?
+        if case let .string(causeRaw)? = reader.peek("cause"),
+           let knownCause = AgentRunTerminalCause(rawValue: causeRaw)
+        {
+            _ = try reader.optional("cause")
+            cause = knownCause
+        } else {
+            cause = nil
+        }
         return try AgentRecoveryRunTerminalEvidence(
             commitID: reader.uuid("commitID"),
             terminalState: state,
             expectedRunID: reader.optionalUUID("expectedRunID"),
             recordedAt: reader.timestamp("recordedAt"),
+            cause: cause,
             extras: reader.extras
         )
     }
@@ -800,6 +877,11 @@ enum AgentRecoveryRecordCodec {
 
         var extras: AgentRecoveryExtras {
             object.filter { !consumed.contains($0.key) }
+        }
+
+        /// Reads a member without consuming it; it stays an extra unless a later read consumes it.
+        func peek(_ key: String) -> AgentRecoveryJSONValue? {
+            object[key]
         }
 
         mutating func required(_ key: String) throws -> AgentRecoveryJSONValue {

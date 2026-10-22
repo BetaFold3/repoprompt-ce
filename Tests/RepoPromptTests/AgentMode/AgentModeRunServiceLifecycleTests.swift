@@ -286,6 +286,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
             expectedRunID: session.runID,
             terminalState: .completed,
             source: "test.correlationIndex",
+            cause: .ordinary,
             attachmentDisposition: .deleteFiles,
             finalizeNonCodexUsage: false,
             supportsFollowUp: false,
@@ -2593,7 +2594,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         XCTAssertNil(controller.startReferences[0])
         XCTAssertEqual(session.codexConversationID, "lifecycle")
         XCTAssertFalse(session.codexNeedsReconnect)
-        await harness.service.cancelRun(tabID: session.tabID, session: session)
+        await harness.service.cancelRun(tabID: session.tabID, session: session, cause: .userCancel)
     }
 
     func testCodexHandoffRetriesThreadStartAfterFirstStartFailure() async {
@@ -2644,7 +2645,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         XCTAssertTrue(controller.startReferences.compactMap(\.self).isEmpty)
         XCTAssertEqual(session.codexConversationID, "lifecycle")
         XCTAssertFalse(session.codexNeedsReconnect)
-        await harness.service.cancelRun(tabID: session.tabID, session: session)
+        await harness.service.cancelRun(tabID: session.tabID, session: session, cause: .userCancel)
     }
 
     func testCodexDisconnectedThreadResumesFromSavedIDRegardlessOfTranscriptShape() async {
@@ -2673,7 +2674,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         XCTAssertEqual(controller.startReferences[0]?.rolloutPath, "/tmp/saved-thread.jsonl")
         XCTAssertEqual(session.codexConversationID, "saved-thread")
         XCTAssertEqual(session.codexRolloutPath, "/tmp/saved-thread.jsonl")
-        await harness.service.cancelRun(tabID: session.tabID, session: session)
+        await harness.service.cancelRun(tabID: session.tabID, session: session, cause: .userCancel)
     }
 
     func testCodexRepeatedResumeTimeoutKeepsSavedThreadAndResumesSameThreadOnRetry() async {
@@ -2736,7 +2737,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         XCTAssertEqual(session.codexRolloutPath, "/tmp/saved-thread.jsonl")
         XCTAssertEqual(session.codexResumeTimeoutState.consecutiveTimeouts, 0)
         XCTAssertFalse(session.items.contains { $0.text.contains("Started a fresh thread") })
-        await harness.service.cancelRun(tabID: session.tabID, session: session)
+        await harness.service.cancelRun(tabID: session.tabID, session: session, cause: .userCancel)
     }
 
     func testCodexResumeCancelledByStopShowsNoFailureItem() async throws {
@@ -2766,7 +2767,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
             )
         }
         await resumeGate.waitUntilEntered()
-        await harness.service.cancelRun(tabID: session.tabID, session: session)
+        await harness.service.cancelRun(tabID: session.tabID, session: session, cause: .userCancel)
         let outcome = await runTask.value
 
         XCTAssertEqual(outcome, .cancelled)
@@ -2796,7 +2797,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         XCTAssertEqual(controller.startReferences.count, 2)
         XCTAssertEqual(controller.startReferences[1]?.conversationID, "saved-thread")
         XCTAssertEqual(session.codexResumeTimeoutState.consecutiveTimeouts, 0)
-        await harness.service.cancelRun(tabID: session.tabID, session: session)
+        await harness.service.cancelRun(tabID: session.tabID, session: session, cause: .userCancel)
     }
 
     func testCodexResumeFailureBeforeStopStaysVisible() async {
@@ -2858,7 +2859,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
             await resumeGate.waitUntilEntered()
             // The genuine failure settles first; the later cancellation cannot replace it.
             await resumeGate.settle(.failure(row.error))
-            await harness.service.cancelRun(tabID: session.tabID, session: session)
+            await harness.service.cancelRun(tabID: session.tabID, session: session, cause: .userCancel)
             // Deliver only after Stop, so the coordinator classifies with its task already cancelled.
             await deliveryGate.release()
             let outcome = await runTask.value
@@ -2904,7 +2905,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
             )
         }
         await resumeGate.waitUntilEntered()
-        await harness.service.cancelRun(tabID: session.tabID, session: session)
+        await harness.service.cancelRun(tabID: session.tabID, session: session, cause: .userCancel)
         await resumeGate.settle(.success(()))
         let outcome = await runTask.value
 
@@ -2941,7 +2942,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         XCTAssertEqual(controller.sentTexts, ["retry"])
         XCTAssertGreaterThan(coordinator.test_readySessionToolTrackingRequestCount(tabID: session.tabID), 0)
         XCTAssertFalse(session.codexNeedsReconnect)
-        await harness.service.cancelRun(tabID: session.tabID, session: session)
+        await harness.service.cancelRun(tabID: session.tabID, session: session, cause: .userCancel)
     }
 
     func testCodexResumeTaskCancelledWithoutStopInvalidatesItsOwnController() async throws {
@@ -3011,7 +3012,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
                 XCTAssertEqual(session.pendingImageAttachments.map(\.id), [reservedAttachment.id], "Attachments return to the composer.")
                 XCTAssertEqual(session.attachmentTurnState, .idle)
                 XCTAssertFalse(recorder.contains(prefix: "commit:"), "A joined send publishes no terminal commit: \(recorder.events)")
-                await harness.service.cancelRun(tabID: session.tabID, session: session)
+                await harness.service.cancelRun(tabID: session.tabID, session: session, cause: .userCancel)
             }
         }
     }
@@ -3051,7 +3052,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
             await resumeGate.waitUntilEntered()
             await resumeGate.settle(.failure(LifecycleCodexMissingRolloutError()))
             if row.stopsBeforeDelivery {
-                await harness.service.cancelRun(tabID: session.tabID, session: session)
+                await harness.service.cancelRun(tabID: session.tabID, session: session, cause: .userCancel)
             }
             await deliveryGate.release()
             let outcome = await runTask.value
@@ -3063,7 +3064,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
                 XCTAssertEqual(session.codexConversationID, "lifecycle", row.name)
                 XCTAssertTrue(session.items.contains { $0.text.contains("Started a fresh thread.") }, row.name)
                 XCTAssertEqual(controller.sentTexts, ["resume"], row.name)
-                await harness.service.cancelRun(tabID: session.tabID, session: session)
+                await harness.service.cancelRun(tabID: session.tabID, session: session, cause: .userCancel)
                 continue
             }
             XCTAssertEqual(outcome, .cancelled, row.name)
@@ -3253,7 +3254,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
             if let settledBeforeStop = row.settledBeforeStop {
                 await stoppedGate.settle(settledBeforeStop)
             }
-            await harness.service.cancelRun(tabID: session.tabID, session: session)
+            await harness.service.cancelRun(tabID: session.tabID, session: session, cause: .userCancel)
             XCTAssertNil(session.codexController, "\(row.name): Stop detaches the stopped attempt's controller")
 
             let successorRun = Task { @MainActor in
@@ -3280,7 +3281,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
             }
             if row.successorStage.isStopped {
                 // The successor is stopped before the stopped attempt's outcome is delivered.
-                await harness.service.cancelRun(tabID: session.tabID, session: session)
+                await harness.service.cancelRun(tabID: session.tabID, session: session, cause: .userCancel)
                 if row.successorStage == .stoppedWhileStarting {
                     let successorOutcome = await successorRun.value
                     XCTAssertEqual(successorOutcome, .cancelled, row.name)
@@ -3380,7 +3381,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
             )
             XCTAssertTrue(stoppedController.sentTexts.isEmpty, row.name)
             XCTAssertEqual(session.codexConversationID, "saved-thread", row.name)
-            await harness.service.cancelRun(tabID: session.tabID, session: session)
+            await harness.service.cancelRun(tabID: session.tabID, session: session, cause: .userCancel)
         }
     }
 
@@ -3480,11 +3481,11 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
             switch row.stopPoint {
             case .duringRefresh:
                 await authRecovery.waitUntilEntered()
-                await harness.service.cancelRun(tabID: session.tabID, session: session)
+                await harness.service.cancelRun(tabID: session.tabID, session: session, cause: .userCancel)
                 await refreshGate.release()
             case .duringRecoveredResume:
                 await recoveredGate.waitUntilEntered()
-                await harness.service.cancelRun(tabID: session.tabID, session: session)
+                await harness.service.cancelRun(tabID: session.tabID, session: session, cause: .userCancel)
                 if !row.recoveredResumeHonorsCancellation {
                     await recoveredGate.settle(.success(()))
                 }
@@ -3517,7 +3518,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
                 XCTAssertEqual(recoveredController.startReferences.count, 1, row.name)
                 XCTAssertGreaterThan(coordinator.test_readySessionToolTrackingRequestCount(tabID: session.tabID), 0, row.name)
                 XCTAssertEqual(session.codexResumeTimeoutState.consecutiveTimeouts, 0, row.name)
-                await harness.service.cancelRun(tabID: session.tabID, session: session)
+                await harness.service.cancelRun(tabID: session.tabID, session: session, cause: .userCancel)
                 continue
             }
             XCTAssertTrue(recoveredController.sentTexts.isEmpty, row.name)
@@ -3643,7 +3644,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
             XCTAssertEqual(controller.startReferences.count, 2, row.name)
             XCTAssertEqual(controller.startReferences[1]?.conversationID, "saved-thread", row.name)
             XCTAssertEqual(session.codexConversationID, "saved-thread", row.name)
-            await harness.service.cancelRun(tabID: session.tabID, session: session)
+            await harness.service.cancelRun(tabID: session.tabID, session: session, cause: .userCancel)
         }
     }
 
@@ -3696,7 +3697,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         }
         XCTAssertNil(session.codexAnonymousActiveTurn)
         XCTAssertTrue(session.codexFallbackQueue.isEmpty)
-        await harness.service.cancelRun(tabID: session.tabID, session: session)
+        await harness.service.cancelRun(tabID: session.tabID, session: session, cause: .userCancel)
     }
 
     func testCodexColdResumeQueuedSendWaitsForReplayedTurnCompletion() async throws {
@@ -3745,7 +3746,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         }
         XCTAssertTrue(session.codexFallbackQueue.isEmpty)
         XCTAssertNil(session.codexAnonymousActiveTurn)
-        await harness.service.cancelRun(tabID: session.tabID, session: session)
+        await harness.service.cancelRun(tabID: session.tabID, session: session, cause: .userCancel)
     }
 
     func testCodexColdResumeIdleReadAfterReplayedStartWaitsForCorrelatedCompletion() async throws {
@@ -3812,7 +3813,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
             resumedAttemptID,
             "The queued send starts as the published successor attempt, after the resumed turn's terminal commit."
         )
-        await harness.service.cancelRun(tabID: session.tabID, session: session)
+        await harness.service.cancelRun(tabID: session.tabID, session: session, cause: .userCancel)
     }
 
     func testCodexColdResumeQueuedSendsDrainInOrderThroughReplayedTurnAndSuccessor() async throws {
@@ -3892,7 +3893,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
             controller.sentTexts == ["first", "second"]
         }
         XCTAssertTrue(session.codexFallbackQueue.isEmpty)
-        await harness.service.cancelRun(tabID: session.tabID, session: session)
+        await harness.service.cancelRun(tabID: session.tabID, session: session, cause: .userCancel)
     }
 
     func testCodexPrewarmedActiveThreadQueuesFirstColdSendUntilIdle() async throws {
@@ -3944,7 +3945,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
             controller.sentTexts == ["resume"]
         }
         XCTAssertTrue(session.codexFallbackQueue.isEmpty)
-        await harness.service.cancelRun(tabID: session.tabID, session: session)
+        await harness.service.cancelRun(tabID: session.tabID, session: session, cause: .userCancel)
     }
 
     func testCodexColdResumeReplacesStaleAuthoritativeIdentityWithResumedThreadMarker() async throws {
@@ -4006,7 +4007,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
             controller.sentTexts == ["resume"]
         }
         XCTAssertTrue(session.codexFallbackQueue.isEmpty)
-        await harness.service.cancelRun(tabID: session.tabID, session: session)
+        await harness.service.cancelRun(tabID: session.tabID, session: session, cause: .userCancel)
     }
 
     func testCodexResumeSystemErrorKeepsSavedThreadAndRetriesSameThread() async {
@@ -4056,7 +4057,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         XCTAssertEqual(retryOutcome, .sent)
         XCTAssertEqual(controller.startReferences.count, 2)
         XCTAssertEqual(controller.startReferences[1]?.conversationID, "saved-thread")
-        await harness.service.cancelRun(tabID: session.tabID, session: session)
+        await harness.service.cancelRun(tabID: session.tabID, session: session, cause: .userCancel)
     }
 
     func testCodexStartResultWithoutThreadIDDoesNotPersistResumeMetadata() async {
@@ -4085,7 +4086,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         // rollout-only shape that later sends would reject as corrupt.
         XCTAssertNil(session.codexConversationID)
         XCTAssertNil(session.codexRolloutPath)
-        await harness.service.cancelRun(tabID: session.tabID, session: session)
+        await harness.service.cancelRun(tabID: session.tabID, session: session, cause: .userCancel)
     }
 
     func testCodexRolloutWithoutThreadIDSurfacesResumeIntegrityError() async {
@@ -4463,7 +4464,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
             XCTAssertFalse(recorder.contains("factory:claude"))
             XCTAssertFalse(recorder.contains("factory:acp-provider"))
             XCTAssertFalse(recorder.contains("factory:headless"))
-            await harness.service.cancelRun(tabID: session.tabID, session: session)
+            await harness.service.cancelRun(tabID: session.tabID, session: session, cause: .userCancel)
             XCTAssertNil(session.activeRunOwnership)
         }
 
@@ -4841,6 +4842,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
             await harness.service.cancelRun(
                 tabID: session.tabID,
                 session: session,
+                cause: .userCancel,
                 completion: .terminalPublished
             )
             throw error
@@ -4850,6 +4852,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         await harness.service.cancelRun(
             tabID: session.tabID,
             session: session,
+            cause: .userCancel,
             completion: .terminalPublished
         )
         let stageEvents = recorder.events.filter { $0.hasPrefix("delegated-notice:\(stageID.uuidString)") }
@@ -5029,7 +5032,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
             if let sendIndex, let acknowledgementIndex {
                 XCTAssertLessThan(sendIndex, acknowledgementIndex, "Never acknowledged before the provider accepted the turn")
             }
-            await harness.service.cancelRun(tabID: session.tabID, session: session)
+            await harness.service.cancelRun(tabID: session.tabID, session: session, cause: .userCancel)
         }
 
         // Queued fallback: `didSend` is true, but the input has not reached the model.
@@ -5106,6 +5109,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         await harness.service.cancelRun(
             tabID: session.tabID,
             session: session,
+            cause: .userCancel,
             completion: .terminalPublished
         )
 
@@ -5125,6 +5129,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         await harness.service.cancelRun(
             tabID: session.tabID,
             session: session,
+            cause: .userCancel,
             completion: .terminalTeardownCompleted
         )
     }
@@ -5474,6 +5479,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
             expectedRunID: session.runID,
             terminalState: .cancelled,
             source: "test.nilReservationAttachmentCapture",
+            cause: .ordinary,
             attachmentReservationID: nil,
             attachmentDisposition: .deleteFiles,
             finalizeNonCodexUsage: false,
@@ -5569,6 +5575,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
             expectedRunID: session.runID,
             terminalState: .completed,
             source: "test.stale",
+            cause: .ordinary,
             attachmentDisposition: .deleteFiles,
             finalizeNonCodexUsage: true,
             supportsFollowUp: false,
@@ -5598,6 +5605,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
             expectedRunID: session.runID,
             terminalState: .completed,
             source: "test.claude",
+            cause: .ordinary,
             attachmentDisposition: .deleteFiles,
             finalizeNonCodexUsage: true,
             supportsFollowUp: false,
@@ -5637,6 +5645,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         await harness.service.cancelRun(
             tabID: session.tabID,
             session: session,
+            cause: .userCancel,
             completion: .terminalPublished
         )
 
@@ -5650,6 +5659,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         await harness.service.cancelRun(
             tabID: session.tabID,
             session: session,
+            cause: .userCancel,
             completion: .terminalPublished
         )
         XCTAssertEqual(recorder.events.count(where: { $0.hasPrefix("commit:") }), 1)
@@ -5714,6 +5724,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         await harness.service.cancelRun(
             tabID: session.tabID,
             session: session,
+            cause: .userCancel,
             completion: .terminalPublished
         )
 
@@ -5759,6 +5770,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
             expectedRunID: session.runID,
             terminalState: .completed,
             source: "test.retryPublication",
+            cause: .ordinary,
             attachmentDisposition: .deleteFiles,
             finalizeNonCodexUsage: true,
             supportsFollowUp: false,
@@ -5826,6 +5838,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
             expectedRunID: session.runID,
             terminalState: .completed,
             source: "test.followUpPublication",
+            cause: .ordinary,
             attachmentDisposition: .deleteFiles,
             finalizeNonCodexUsage: true,
             supportsFollowUp: true,
@@ -5872,6 +5885,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
                 expectedRunID: session.runID,
                 terminalState: .completed,
                 source: "test.providerOutputRelease",
+                cause: .ordinary,
                 attachmentDisposition: .deleteFiles,
                 finalizeNonCodexUsage: true,
                 supportsFollowUp: true,
@@ -5921,6 +5935,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
             expectedRunID: session.runID,
             terminalState: .completed,
             source: "test.providerOutputRetry",
+            cause: .ordinary,
             attachmentDisposition: .deleteFiles,
             finalizeNonCodexUsage: true,
             supportsFollowUp: true,
@@ -5976,6 +5991,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
                 expectedRunID: session.runID,
                 terminalState: .completed,
                 source: "test.supersededRetry",
+                cause: .ordinary,
                 attachmentDisposition: .deleteFiles,
                 finalizeNonCodexUsage: true,
                 supportsFollowUp: true,
@@ -6032,6 +6048,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
             expectedRunID: session.runID,
             terminalState: .completed,
             source: "test.overlappingRetries",
+            cause: .ordinary,
             attachmentDisposition: .deleteFiles,
             finalizeNonCodexUsage: true,
             supportsFollowUp: true,
@@ -6102,6 +6119,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
             expectedRunID: session.runID,
             terminalState: .completed,
             source: "test.overlappingRetryRejection",
+            cause: .ordinary,
             attachmentDisposition: .deleteFiles,
             finalizeNonCodexUsage: true,
             supportsFollowUp: true,
@@ -6163,6 +6181,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
                 expectedRunID: session.runID,
                 terminalState: .completed,
                 source: "test.followUpOncePerCommit",
+                cause: .ordinary,
                 attachmentDisposition: .deleteFiles,
                 finalizeNonCodexUsage: true,
                 supportsFollowUp: true,
@@ -6212,6 +6231,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
             expectedRunID: session.runID,
             terminalState: .completed,
             source: "test.staleDurableFollowUp",
+            cause: .ordinary,
             attachmentDisposition: .deleteFiles,
             finalizeNonCodexUsage: true,
             supportsFollowUp: true,
@@ -6271,6 +6291,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
                 expectedRunID: session.runID,
                 terminalState: .completed,
                 source: "test.supersededDelivery",
+                cause: .ordinary,
                 attachmentDisposition: .deleteFiles,
                 finalizeNonCodexUsage: true,
                 supportsFollowUp: true,
@@ -6325,6 +6346,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
             expectedRunID: session.runID,
             terminalState: .completed,
             source: "test.providerSuccessor",
+            cause: .ordinary,
             attachmentDisposition: .deleteFiles,
             finalizeNonCodexUsage: false,
             supportsFollowUp: false,
@@ -6374,6 +6396,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
             await harness.service.cancelRun(
                 tabID: session.tabID,
                 session: session,
+                cause: .userCancel,
                 completion: .terminalPublished
             )
             recorder.record("cancel:first-return")
@@ -6386,6 +6409,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
             await harness.service.cancelRun(
                 tabID: session.tabID,
                 session: session,
+                cause: .userCancel,
                 completion: .terminalPublished
             )
             recorder.record("cancel:second-return")
@@ -6430,6 +6454,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
             await harness.service.cancelRun(
                 tabID: session.tabID,
                 session: session,
+                cause: .userCancel,
                 completion: .terminalPublished
             )
         }
@@ -6476,6 +6501,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
             await harness.service.cancelRun(
                 tabID: session.tabID,
                 session: session,
+                cause: .userCancel,
                 completion: .terminalPublished
             )
         }
@@ -6538,6 +6564,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
             await harness.service.cancelRun(
                 tabID: session.tabID,
                 session: session,
+                cause: .userCancel,
                 completion: .terminalPublished
             )
             recorder.record("omp-qualification-cancel:return")
@@ -6579,6 +6606,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
             await harness.service.cancelRun(
                 tabID: session.tabID,
                 session: session,
+                cause: .userCancel,
                 completion: .terminalTeardownCompleted
             )
             recorder.record("cancel:return")
@@ -6621,6 +6649,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         await harness.service.cancelRun(
             tabID: session.tabID,
             session: session,
+            cause: .userCancel,
             completion: .terminalPublished
         )
         try await waitUntil("Publication-only cancellation should start teardown") {
@@ -6631,6 +6660,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
             await harness.service.cancelRun(
                 tabID: session.tabID,
                 session: session,
+                cause: .userCancel,
                 completion: .terminalTeardownCompleted
             )
             recorder.record("late-cleanup:return")
@@ -6666,6 +6696,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
             await harness.service.cancelRun(
                 tabID: session.tabID,
                 session: session,
+                cause: .userCancel,
                 intent: .executionLocationChange,
                 completion: .terminalPublished
             )
@@ -6711,6 +6742,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
                 await harness.service.cancelRun(
                     tabID: session.tabID,
                     session: session,
+                    cause: .userCancel,
                     completion: .terminalPublished
                 )
 
@@ -6731,6 +6763,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
                 await harness.service.cancelRun(
                     tabID: session.tabID,
                     session: session,
+                    cause: .userCancel,
                     completion: .terminalPublished
                 )
 
@@ -6746,6 +6779,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
                 await harness.service.cancelRun(
                     tabID: session.tabID,
                     session: session,
+                    cause: .userCancel,
                     completion: .terminalPublished
                 )
 
@@ -6770,6 +6804,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
                         await harness.service.cancelRun(
                             tabID: session.tabID,
                             session: session,
+                            cause: .userCancel,
                             completion: .terminalPublished
                         )
                     }
@@ -6823,6 +6858,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         await harness.service.cancelRun(
             tabID: session.tabID,
             session: session,
+            cause: .userCancel,
             completion: .terminalTeardownCompleted
         )
 
@@ -6893,7 +6929,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
             XCTAssertEqual(relevant[2].params["value"] as? String, expectedMode, level.rawValue)
             XCTAssertFalse(session.items.contains { $0.kind == .error }, level.rawValue)
 
-            await harness.service.cancelRun(tabID: session.tabID, session: session)
+            await harness.service.cancelRun(tabID: session.tabID, session: session, cause: .userCancel)
         }
     }
 
@@ -6945,6 +6981,27 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         )
         session.ompQualificationStartContext = context
         return context
+    }
+
+    /// Phase 2: the barrier records the effective cause. A lifecycle teardown marker set before
+    /// the cancel wins over the runner's ordinary request; an explicit user cancel stays one.
+    func testCancelRecordsEffectiveTerminalCause() async {
+        let recorder = LifecycleRecorder()
+        let harness = makeHarness(recorder: recorder)
+        for (requested, teardown, expected) in [
+            (AgentRunTerminalCause.ordinary, AgentRunTerminalCause?.some(.appQuit), AgentRunTerminalCause.appQuit),
+            (.userCancel, .some(.windowClose), .userCancel),
+            (.ordinary, nil, .ordinary)
+        ] {
+            let session = AgentTabSession(tabID: UUID())
+            session.runID = UUID()
+            session.runState = .running
+            _ = session.beginRunAttempt(source: "test.effectiveCause")
+            session.lifecycleTeardownCause = teardown
+            await harness.service.cancelRun(tabID: session.tabID, session: session, cause: requested)
+            XCTAssertEqual(session.runState, .cancelled)
+            XCTAssertEqual(session.lastTerminalCommitRevision?.cause, expected)
+        }
     }
 
     func makeHarness(

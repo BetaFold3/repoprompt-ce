@@ -207,10 +207,17 @@ final class AgentRecoveryStartupReconciliationTests: XCTestCase {
         XCTAssertEqual(persistedLegacy.terminalState, .cancelled)
 
         let completedResolution = try XCTUnwrap(results.resolution(for: completed.session.id))
-        let completedTurn = try XCTUnwrap(completedResolution.interruptedTurns.first)
+        // Review A F03 (deliberate contract change from R4): authoritative completion closes the open
+        // turn as completed with no interruption stamp and lists it as an outcome turn (its transcript
+        // tail may be missing; durable across launches until dismissed, review A F03-R1).
+        XCTAssertTrue(completedResolution.interruptedTurns.isEmpty, "An ordinary outcome is never an interruption")
+        let completedTurn = try XCTUnwrap(completedResolution.outcomeTurns.first)
         XCTAssertEqual(completedTurn.turnID, completedTurnID)
-        XCTAssertEqual(completedTurn.interruption.runAttemptID, ownership.attemptID, "Joined to its existing run attempt")
+        XCTAssertEqual(completedTurn.runAttempt.runAttemptID, ownership.attemptID, "Joined to its existing run attempt")
         XCTAssertEqual(completedTurn.status, .completedTailMayBeMissing)
+        let persistedCompleted = try XCTUnwrap(readSessionFile(completed).transcript?.turns.first { $0.id == completedTurnID })
+        XCTAssertNil(persistedCompleted.interruption)
+        XCTAssertEqual(persistedCompleted.terminalState, .completed)
 
         let currentInstanceID = await now.store.appInstanceID
         let holds = AgentRecoveryCoordinator.deriveCrashHolds(
@@ -358,6 +365,104 @@ final class AgentRecoveryStartupReconciliationTests: XCTestCase {
             )),
             currentInstanceID: currentInstance
         ), "This launch's own mark proves nothing about the previous one")
+    }
+
+    /// Review A F04 / B F1: teardown → save → reload → reconcile. A window close stamps the turn the
+    /// terminal closed (live barrier stamp), the session is saved, and the next launch reconciles
+    /// that stamp by its run attempt exactly once: never as a recovery-only run, never as an outcome.
+    /// The steering variant closes a later steer turn while the run keeps its opening turn. Review
+    /// B R1-F1: the live transcript always opens a turn per user item (`importLegacyItems`), but a
+    /// saved transcript may carry the steer as a mid-turn user activity; the terminal user item is
+    /// then that activity, and the turn containing it is stamped and reconciled.
+    func testLiveTeardownStampSurvivesSaveAndReloadAndReconcilesByRunAttempt() async throws {
+        enum Steering: CaseIterable { case none, ownTurn, midTurnActivity }
+        let earlier = launch()
+        let home = try makeWorkspace("teardown")
+        for steering in Steering.allCases {
+            let steered = steering != .none
+            let startID = UUID()
+            let steerID = UUID()
+            var items = [AgentChatItem.user("start", id: startID, sequenceIndex: 0)]
+            if steering == .ownTurn { items.append(AgentChatItem.user("steer", id: steerID, sequenceIndex: 1)) }
+            if steering == .midTurnActivity { items.append(AgentChatItem.assistant("working", sequenceIndex: 1)) }
+            let load = try await makeSession(earlier, in: home, items: items)
+            if steering == .midTurnActivity {
+                try rewriteSessionFile(load) { session in
+                    var transcript = try XCTUnwrap(session.transcript)
+                    let spanIndex = try XCTUnwrap(transcript.turns.last?.responseSpans.indices.last)
+                    let steer = AgentChatItem.user("steer", id: steerID, sequenceIndex: 2)
+                    transcript.turns[transcript.turns.count - 1].responseSpans[spanIndex].activities.append(AgentTranscriptActivity(from: steer))
+                    session.transcript = transcript
+                }
+            }
+            // The run's terminal closes the turn of its last user item.
+            let terminalUserItemID = steered ? steerID : startID
+            let terminalTurnID = steering == .ownTurn ? steerID : startID
+            let ownership = Support.ownership(sessionID: load.session.id)
+            let commit = Support.terminalCommit(ownership: ownership, state: .cancelled, cause: .windowClose)
+            try await transact(earlier, load) { store, binding in
+                _ = try await store.ensureRunAttempt(
+                    binding: binding,
+                    expectedRevision: store.currentRevision(sessionID: binding.sessionID),
+                    ownership: ownership,
+                    processRunID: nil,
+                    transcriptTurnID: startID
+                )
+                if steered {
+                    _ = try await store.commitDispatchingIntent(
+                        binding: binding,
+                        expectedRevision: store.currentRevision(sessionID: binding.sessionID),
+                        submission: Support.submission("steer", userItemID: steerID),
+                        attempt: AgentRecoveryAttemptStart(attemptID: UUID(), runAttemptID: ownership.attemptID),
+                        consumption: nil
+                    )
+                }
+                _ = try await store.recordRunTerminal(
+                    binding: binding,
+                    expectedRevision: store.currentRevision(sessionID: binding.sessionID),
+                    commit: commit
+                )
+            }
+
+            // Teardown: the barrier's live stamp on the turn the terminal closed; then the save.
+            let tab = AgentTabSession(tabID: UUID())
+            tab.transcript = try XCTUnwrap(readSessionFile(load).transcript)
+            XCTAssertEqual(tab.transcript.turns.last?.id, terminalTurnID)
+            XCTAssertEqual(tab.transcript.turns.count, steering == .ownTurn ? 2 : 1, "\(steering)")
+            AgentRunTerminalCommitBarrier.stampLiveInterruption(
+                cause: commit.cause,
+                terminalState: .cancelled,
+                turnID: terminalUserItemID,
+                runAttemptID: ownership.attemptID,
+                session: tab,
+                now: Date(timeIntervalSince1970: 2000)
+            )
+            let stamped = try XCTUnwrap(tab.transcript.turns.first { $0.id == terminalTurnID }?.interruption)
+            try rewriteSessionFile(load) { $0.transcript = tab.transcript }
+
+            // Reload and reconcile in the next launch.
+            let now = launch()
+            await now.service.adoptColdRestoreLaunchEvidence(.mark(AgentRecoveryLaunchMark(
+                appInstanceID: earlier.store.appInstanceID,
+                state: .cleanExit,
+                recordedAt: AgentRecoveryTimestamp(millisecondsSince1970: 3000)
+            )))
+            let results = try await sweep(now, [home])
+            let resolution = try XCTUnwrap(results.resolution(for: load.session.id), "\(steering)")
+            XCTAssertEqual(resolution.interruptedTurns.map(\.turnID), [terminalTurnID], "\(steering)")
+            let turn = try XCTUnwrap(resolution.interruptedTurns.first)
+            XCTAssertEqual(turn.interruption, stamped, "the saved stamp, unchanged")
+            XCTAssertEqual(turn.interruption.reason, .windowClose)
+            XCTAssertEqual(turn.interruption.runAttemptID, ownership.attemptID)
+            XCTAssertTrue(turn.status.isInterruption)
+            XCTAssertTrue(resolution.recoveryOnlyRunAttempts.isEmpty, "the saved turn represents the run")
+            XCTAssertTrue(resolution.outcomeTurns.isEmpty)
+            XCTAssertEqual(
+                try readSessionFile(load).transcript?.turns.compactMap(\.interruption),
+                [stamped],
+                "\(steering): no other turn is stamped"
+            )
+        }
     }
 
     /// R4: a recorded shutdown reason is intent, never proof of a stop. Neither this launch's
@@ -1234,6 +1339,224 @@ final class AgentRecoveryStartupReconciliationTests: XCTestCase {
         XCTAssertNotEqual(rehydrated.session.lastRunState, running)
         let finalRun = await now.store.read(sessionID: load.session.id).record?.runAttempts.first { $0.runAttemptID == live.attemptID }
         XCTAssertNil(finalRun?.terminal, "Cold restoration never fabricates terminal evidence")
+    }
+
+    /// Review A F03 / B F7: an earlier launch's open turn whose run attempt committed authoritative
+    /// ordinary terminal evidence (completed, even after a provisional Stage A `appQuit` shutdown
+    /// reason; an ordinary failure; an ordinary cancel) is closed on cold hydration with that outcome
+    /// and no interruption. The closed envelope is saved, and a later reload keeps it unchanged. A
+    /// recorded interruption cause on a sibling turn is still stamped.
+    func testColdHydrationClosesOrdinaryTerminalOutcomesWithoutInterruptionThroughSaveAndReload() async throws {
+        let earlier = launch()
+        let home = try makeWorkspace("ordinary-terminal")
+        let completedTurnID = UUID()
+        let failedTurnID = UUID()
+        let cancelledTurnID = UUID()
+        let interruptedTurnID = UUID()
+        let load = try await makeSession(earlier, in: home, items: [
+            AgentChatItem.user("completed", id: completedTurnID, sequenceIndex: 0),
+            AgentChatItem.assistant("done", sequenceIndex: 1),
+            AgentChatItem.user("failed", id: failedTurnID, sequenceIndex: 2),
+            AgentChatItem.assistant("partial", sequenceIndex: 3),
+            AgentChatItem.user("cancelled", id: cancelledTurnID, sequenceIndex: 4),
+            AgentChatItem.assistant("partial", sequenceIndex: 5),
+            AgentChatItem.user("interrupted", id: interruptedTurnID, sequenceIndex: 6),
+            AgentChatItem.assistant("partial", sequenceIndex: 7)
+        ])
+        let completed = Support.ownership(sessionID: load.session.id)
+        let failed = Support.ownership(sessionID: load.session.id)
+        let cancelled = Support.ownership(sessionID: load.session.id)
+        let interrupted = Support.ownership(sessionID: load.session.id)
+        let runs = [
+            (completed, completedTurnID, AgentSessionRunState.completed, AgentRunTerminalCause.ordinary),
+            (failed, failedTurnID, .failed, .ordinary),
+            (cancelled, cancelledTurnID, .cancelled, .ordinary),
+            (interrupted, interruptedTurnID, .cancelled, .windowClose)
+        ]
+        try await transact(earlier, load) { store, binding in
+            for (ownership, turnID, state, cause) in runs {
+                _ = try await store.ensureRunAttempt(
+                    binding: binding,
+                    expectedRevision: store.currentRevision(sessionID: binding.sessionID),
+                    ownership: ownership,
+                    processRunID: nil,
+                    transcriptTurnID: turnID
+                )
+                if ownership == completed {
+                    // Stage A recorded a provisional quit reason before the run completed.
+                    _ = try await store.recordRunShutdown(
+                        binding: binding,
+                        expectedRevision: store.currentRevision(sessionID: binding.sessionID),
+                        runAttemptID: ownership.attemptID,
+                        reason: .appQuit,
+                        lastConfirmedActivityAt: nil
+                    )
+                }
+                _ = try await store.recordRunTerminal(
+                    binding: binding,
+                    expectedRevision: store.currentRevision(sessionID: binding.sessionID),
+                    commit: Support.terminalCommit(ownership: ownership, state: state, cause: cause)
+                )
+            }
+        }
+        // The app crashed after the terminal commits but before the transcript save: every turn is
+        // saved open.
+        try rewriteSessionFile(load) { session in
+            var transcript = try XCTUnwrap(session.transcript)
+            XCTAssertEqual(transcript.turns.map(\.id), [completedTurnID, failedTurnID, cancelledTurnID, interruptedTurnID])
+            for index in transcript.turns.indices {
+                transcript.turns[index].terminalState = .running
+                transcript.turns[index].completedAt = nil
+                transcript.turns[index].interruption = nil
+                XCTAssertFalse(transcript.turns[index].responseSpans.isEmpty)
+                for spanIndex in transcript.turns[index].responseSpans.indices {
+                    transcript.turns[index].responseSpans[spanIndex].lifecycle = .open
+                    transcript.turns[index].responseSpans[spanIndex].completedAt = nil
+                }
+            }
+            session.transcript = transcript
+            session.lastRunState = AgentSessionRunState.running.rawValue
+        }
+
+        let now = launch()
+        let hydratedLoad = try await now.service.loadAgentSessionForEditing(id: load.session.id, for: home)
+        let hydrated = try XCTUnwrap(hydratedLoad)
+        let expected: [UUID: AgentSessionRunState] = [
+            completedTurnID: .completed,
+            failedTurnID: .failed,
+            cancelledTurnID: .cancelled
+        ]
+        func assertClosed(_ turns: [AgentTranscriptTurn], _ label: String) throws {
+            for (turnID, outcome) in expected {
+                let turn = try XCTUnwrap(turns.first { $0.id == turnID }, label)
+                XCTAssertEqual(turn.terminalState, outcome, "\(label): closed with its authoritative outcome")
+                XCTAssertNil(turn.interruption, "\(label): an ordinary outcome is never an interruption")
+                XCTAssertNotNil(turn.completedAt, label)
+                XCTAssertFalse(turn.responseSpans.contains { $0.lifecycle == .open }, label)
+            }
+            let control = try XCTUnwrap(turns.first { $0.id == interruptedTurnID }, label)
+            XCTAssertEqual(control.terminalState, .cancelled, label)
+            XCTAssertEqual(control.interruption?.reason, .windowClose, "\(label): a recorded interruption cause is still stamped")
+            XCTAssertEqual(control.interruption?.runAttemptID, interrupted.attemptID, label)
+        }
+        try assertClosed(XCTUnwrap(hydrated.session.transcript?.turns), "hydrated")
+        let saved = try readSessionFile(load)
+        try assertClosed(XCTUnwrap(saved.transcript?.turns), "saved")
+        XCTAssertEqual(
+            Set(saved.transcript?.turns.first { $0.id == completedTurnID }?.responseSpans.map(\.lifecycle) ?? []),
+            [.completed],
+            "The completed turn's spans close completed, not cancelled"
+        )
+        XCTAssertEqual(
+            Set(saved.transcript?.turns.first { $0.id == failedTurnID }?.responseSpans.map(\.lifecycle) ?? []),
+            [.failed]
+        )
+
+        // A later launch reloads the saved envelope unchanged.
+        let later = launch()
+        let reloadedLoad = try await later.service.loadAgentSessionForEditing(id: load.session.id, for: home)
+        let reloaded = try XCTUnwrap(reloadedLoad)
+        try assertClosed(XCTUnwrap(reloaded.session.transcript?.turns), "reloaded")
+        XCTAssertEqual(reloaded.session.transcript?.turns, hydrated.session.transcript?.turns, "Reload changes nothing")
+    }
+
+    /// Review A F03-R1: the "transcript tail may be missing" item of a turn saved open and closed as
+    /// its ordinary outcome is durable on the turn itself, so a second fresh launch (which finds the
+    /// turn already closed) still lists it. A turn that was saved closed is never marked. Dismiss is
+    /// a durable card acknowledgement that an unrelated record write and a further launch keep.
+    func testOrdinaryOutcomeTailWarningSurvivesFreshLaunchesUntilDismissed() async throws {
+        let earlier = launch()
+        let home = try makeWorkspace("tail-warning")
+        let closedTurnID = UUID()
+        let openTurnID = UUID()
+        let load = try await makeSession(earlier, in: home, items: [
+            AgentChatItem.user("saved closed", id: closedTurnID, sequenceIndex: 0),
+            AgentChatItem.assistant("done", sequenceIndex: 1),
+            AgentChatItem.user("saved open", id: openTurnID, sequenceIndex: 2),
+            AgentChatItem.assistant("partial", sequenceIndex: 3)
+        ])
+        let closedRun = Support.ownership(sessionID: load.session.id)
+        let openRun = Support.ownership(sessionID: load.session.id)
+        try await transact(earlier, load) { store, binding in
+            for (ownership, turnID) in [(closedRun, closedTurnID), (openRun, openTurnID)] {
+                _ = try await store.ensureRunAttempt(
+                    binding: binding,
+                    expectedRevision: store.currentRevision(sessionID: binding.sessionID),
+                    ownership: ownership,
+                    processRunID: nil,
+                    transcriptTurnID: turnID
+                )
+                _ = try await store.recordRunTerminal(
+                    binding: binding,
+                    expectedRevision: store.currentRevision(sessionID: binding.sessionID),
+                    commit: Support.terminalCommit(ownership: ownership, state: .completed, cause: .ordinary)
+                )
+            }
+        }
+        // Crash after the last terminal commit, before the transcript save: only the last turn is open.
+        try rewriteSessionFile(load) { _ = try self.openLastTurn(&$0) }
+
+        // First fresh launch closes the open turn as completed and marks it durably.
+        let first = launch()
+        let firstResults = try await sweep(first, [home])
+        let firstResolution = try XCTUnwrap(firstResults.resolution(for: load.session.id))
+        XCTAssertEqual(firstResolution.outcomeTurns.map(\.turnID), [openTurnID], "Only the turn saved open is listed")
+        XCTAssertTrue(firstResolution.interruptedTurns.isEmpty)
+        let saved = try XCTUnwrap(readSessionFile(load).transcript?.turns)
+        let savedOpen = try XCTUnwrap(saved.first { $0.id == openTurnID })
+        XCTAssertEqual(savedOpen.terminalState, .completed)
+        XCTAssertNil(savedOpen.interruption, "Never a fake interruption")
+        XCTAssertEqual(savedOpen.recoveredOutcome?.runAttemptID, openRun.attemptID, "The obligation is durable on the turn")
+        XCTAssertNil(saved.first { $0.id == closedTurnID }?.recoveredOutcome, "A turn saved closed is never marked uncertain")
+
+        // Second fresh launch: the turn is already closed, and the item is still listed.
+        let second = launch()
+        let secondCoordinator = try await startedCoordinator(second, workspaces: [home])
+        let secondResolution = try XCTUnwrap(secondCoordinator.reconciliation.resolution(for: load.session.id))
+        XCTAssertEqual(secondResolution.outcomeTurns.map(\.turnID), [openTurnID], "Listed after another restart")
+        XCTAssertEqual(secondResolution.outcomeTurns.first?.status, .completedTailMayBeMissing)
+        func outcomeItem(_ coordinator: AgentRecoveryCoordinator) -> AgentRecoveryCatalogItem? {
+            coordinator.catalog.items.first { item in
+                if case let .outcomeTurn(outcome) = item.payload { return outcome.turnID == openTurnID }
+                return false
+            }
+        }
+        let item = try XCTUnwrap(outcomeItem(secondCoordinator))
+        XCTAssertFalse(item.isDismissed)
+        XCTAssertFalse(secondCoordinator.catalog.items.contains { item in
+            if case let .outcomeTurn(outcome) = item.payload { return outcome.turnID == closedTurnID }
+            return false
+        })
+        let dismissFailure = await secondCoordinator.dismissCatalogItem(item)
+        XCTAssertNil(dismissFailure)
+        XCTAssertEqual(outcomeItem(secondCoordinator)?.isDismissed, true)
+
+        // An unrelated record write (a saved question) after the Dismiss.
+        let binding = try XCTUnwrap(secondResolution.binding)
+        _ = try await second.store.updateQuestionSnapshots(
+            binding: binding,
+            expectedRevision: second.store.currentRevision(sessionID: load.session.id),
+            update: .init(upserting: [AgentRecoveryQuestionSnapshot(
+                interactionID: UUID(),
+                kind: .askUser,
+                runAttemptID: nil,
+                transcriptResetGeneration: binding.transcriptResetGeneration,
+                appInstanceID: second.store.appInstanceID,
+                askedAt: AgentRecoveryTimestamp(millisecondsSince1970: 5000),
+                title: "Unrelated",
+                message: nil,
+                items: [],
+                extras: [:]
+            )])
+        )
+
+        // Third fresh launch: still the same obligation on disk, still dismissed.
+        let third = launch()
+        let thirdCoordinator = try await startedCoordinator(third, workspaces: [home])
+        XCTAssertEqual(thirdCoordinator.reconciliation.resolution(for: load.session.id)?.outcomeTurns.map(\.turnID), [openTurnID])
+        let kept = try XCTUnwrap(outcomeItem(thirdCoordinator))
+        XCTAssertTrue(kept.isDismissed, "The Dismiss survives an unrelated write and another launch")
+        XCTAssertEqual(try readSessionFile(load).transcript?.turns.first { $0.id == openTurnID }?.recoveredOutcome, savedOpen.recoveredOutcome)
     }
 
     // MARK: - Fixtures

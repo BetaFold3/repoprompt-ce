@@ -608,10 +608,11 @@ extension AgentModeViewModel {
                 refreshRecoveryListUI()
                 scheduledSendCoordinator?.recordDidChange()
             }
-        // Live records and composer recovery state refresh only the recovery list (no scheduler
-        // churn): an ordinary write never changes startup results, holds, or restrictions.
+        // Live records, composer recovery state, and the catalog (questions, schedules awaiting
+        // confirmation, shared action states) refresh only the recovery list (no scheduler churn):
+        // an ordinary write never changes startup results, holds, or restrictions.
         recoveryLiveStateObserver = NotificationCenter.default
-            .publisher(for: .agentRecoveryRecordsDidChange, object: coordinator)
+            .publisher(for: .agentRecoveryCatalogDidChange, object: coordinator)
             .merge(with: NotificationCenter.default.publisher(for: .agentRecoveryComposerStateDidChange, object: coordinator))
             .receive(on: RunLoop.main)
             .sink { [weak self] _ in

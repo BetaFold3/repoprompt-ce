@@ -559,7 +559,7 @@ extension AgentModeRunServiceLifecycleTests {
         }
         XCTAssertTrue(recorder.contains("run-stream:partial"), "The run's router must be reading the stream before the cancel")
 
-        await harness.service.cancelRun(tabID: session.tabID, session: session)
+        await harness.service.cancelRun(tabID: session.tabID, session: session, cause: .userCancel)
         await agentTask?.value
         let unknown = await fixture.waitForIntent(identity, state: .deliveryUnknown)
         XCTAssertEqual(unknown?.deliveryState, .deliveryUnknown, "The ended attempt never proved acceptance")

@@ -506,7 +506,9 @@ final class ClaudeCodeAgentProvider: HeadlessAgentProvider {
                                         continuation.finish()
                                         return
                                     } else {
-                                        throw AIProviderError.apiError(source: NSError(domain: "ClaudeCLI", code: -999, userInfo: [NSLocalizedDescriptionKey: "Claude CLI did not report a termination status."]))
+                                        // Output ended with neither a completion nor a termination
+                                        // status: the CLI process was lost (review A F06).
+                                        throw HeadlessProviderProcessLostError(message: "Claude CLI did not report a termination status.")
                                     }
                                 }
 

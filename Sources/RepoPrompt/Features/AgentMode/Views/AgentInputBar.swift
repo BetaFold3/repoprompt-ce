@@ -273,7 +273,7 @@ struct AgentInputBar: View {
                     await agentModeVM.retryStaleResetRecoveryStop(tabID: tabID, recoveryID: recoveryID)
                 }
             ),
-            cancelRun: { target in _ = await agentModeVM.cancelAgentRun(target: target) },
+            cancelRun: { target in _ = await agentModeVM.cancelAgentRun(target: target, cause: .userCancel) },
             attachImages: { tabID, urls in agentModeVM.attachImages(tabID: tabID, urls: urls) },
             removeImage: { tabID, attachmentID in agentModeVM.removePendingImage(tabID: tabID, attachmentID: attachmentID) },
             commitTaggedFile: { tabID, suggestion, displayName in
@@ -345,7 +345,8 @@ struct AgentInputBar: View {
                 perform: { rowID, action in
                     await agentModeVM.performRecoveryListAction(rowID: rowID, action: action)
                 },
-                retryStartup: { agentModeVM.retryRecoveryStartup() }
+                retryStartup: { agentModeVM.retryRecoveryStartup() },
+                openNeedsAttention: { agentModeVM.presentRecoveryNeedsAttention() }
             ),
             isShutdownFrozen: { agentModeVM.isShutdownFrozen }
         )

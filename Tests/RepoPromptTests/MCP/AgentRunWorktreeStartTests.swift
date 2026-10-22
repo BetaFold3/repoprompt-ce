@@ -3684,6 +3684,7 @@ final class AgentRunWorktreeStartTests: AgentRunWorktreeStartGitSeedTestCase {
                         observeFirstAgentTaskIfNeeded()
                         await window.agentModeViewModel.cancelAgentRun(
                             tabID: trackedTabID,
+                            cause: .ordinary,
                             completion: .terminalTeardownCompleted
                         )
                         if let firstObservedAgentTask {
@@ -3896,6 +3897,7 @@ final class AgentRunWorktreeStartTests: AgentRunWorktreeStartGitSeedTestCase {
                 for tabID in activeTabIDs {
                     await viewModel.cancelAgentRun(
                         tabID: tabID,
+                        cause: .ordinary,
                         completion: .terminalTeardownCompleted
                     )
                 }

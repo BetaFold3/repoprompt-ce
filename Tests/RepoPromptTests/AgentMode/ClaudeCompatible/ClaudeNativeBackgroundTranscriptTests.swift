@@ -178,6 +178,53 @@ extension AgentModeRunServiceLifecycleTests {
         XCTAssertEqual(outcome, .completed, "The run must observe the failure emitted before its stream ended.")
         XCTAssertEqual(session.runState, .failed)
         XCTAssertTrue(session.items.contains { $0.kind == .error && $0.text == "Claude process exited unexpectedly." })
+        XCTAssertEqual(session.lastTerminalCommitRevision?.cause, .providerProcessLost, "Review A F06: typed process loss")
+    }
+
+    /// Review A F06: a turn the provider itself reports failed (its process still running) ends the
+    /// run as an ordinary failure, never as provider-process loss.
+    func testClaudeProviderReportedFailureStaysOrdinary() async throws {
+        let session = AgentTabSession(tabID: UUID())
+        session.selectedAgent = .claudeCode
+        let controller = StreamLifecycleFakeController(secondSend: .providerReportsFailure)
+        var host: AgentModeViewModel?
+        let harness = makeHarness(
+            recorder: LifecycleRecorder(),
+            claudeControllerFactory: { _, _, _, _ in controller },
+            flushPendingAssistantDelta: { host?.flushPendingAssistantDelta($0) },
+            handleHeadlessStreamResult: { result in
+                guard let host, let runID = session.runID,
+                      let attemptID = session.activeRunAttemptID else { return }
+                await host.test_handleStreamResult(
+                    result, session: session, runID: runID, runAttemptID: attemptID
+                )
+            },
+            handleBackgroundNativeStreamResult: { result, sourceID in
+                await host?.test_handleBackgroundNativeStreamResult(result, sourceID: sourceID, session: session)
+            },
+            autoSignalACPRouting: true
+        )
+        host = harness.host
+        harness.host.test_installLiveSession(session)
+        defer {
+            session.agentTask?.cancel()
+            harness.host.clearPendingAssistantDelta(session)
+        }
+        for text in ["First", "Second"] {
+            let user = AgentChatItem.user(text, sequenceIndex: session.nextSequenceIndex)
+            session.appendItem(user)
+            _ = await harness.service.startRun(
+                tabID: session.tabID, session: session,
+                initialUserMessage: user.text, initialMessageForRun: user.text,
+                attachments: []
+            )
+            try await XCTUnwrap(session.agentTask).value
+            if let runID = session.runID {
+                addTeardownBlock { await MCPRoutingWaiter.cleanup(runID: runID) }
+            }
+        }
+        XCTAssertEqual(session.runState, .failed)
+        XCTAssertEqual(session.lastTerminalCommitRevision?.cause, .ordinary)
     }
 
     /// The run's stream ends after carrying part of its output and its turn continues on a new
@@ -1050,6 +1097,15 @@ private actor StreamLifecycleFakeController: NativeAgentRuntimeControlling {
         case contentThenProcessExits
         /// The run is answered on the same stream, by the same process.
         case answersOnSameStream
+        /// The provider reports the run's turn failed; the process keeps running (ordinary).
+        case providerReportsFailure
+    }
+
+    /// Turns this fake failed by process exit, as the real controller records them on EOF.
+    private var processLostTurnIDs: Set<UUID> = []
+
+    func turnEndedByProcessLoss(_ turnID: UUID) -> Bool {
+        processLostTurnIDs.remove(turnID) != nil
     }
 
     private let secondSend: SecondSend
@@ -1130,11 +1186,13 @@ private actor StreamLifecycleFakeController: NativeAgentRuntimeControlling {
         }
         switch secondSend {
         case .processExits:
+            processLostTurnIDs.insert(turnID)
             continuation?.yield(.error("Claude process exited unexpectedly."))
             continuation?.yield(.turnCompleted(turnID: turnID, status: .failed))
             continuation?.finish()
             continuation = nil
         case .contentThenProcessExits:
+            processLostTurnIDs.insert(turnID)
             continuation?.yield(.stream(AIStreamResult(type: "content", text: "Partial answer")))
             continuation?.yield(.error("Claude process exited unexpectedly."))
             continuation?.yield(.turnCompleted(turnID: turnID, status: .failed))
@@ -1143,6 +1201,9 @@ private actor StreamLifecycleFakeController: NativeAgentRuntimeControlling {
         case .answersOnSameStream:
             continuation?.yield(.stream(AIStreamResult(type: "content", text: "Run answer")))
             continuation?.yield(.turnCompleted(turnID: turnID, status: .completed))
+        case .providerReportsFailure:
+            continuation?.yield(.error("Model refused the request."))
+            continuation?.yield(.turnCompleted(turnID: turnID, status: .failed))
         case .streamReplaced:
             continuation?.yield(.stream(AIStreamResult(type: "content", text: "Before restart")))
             continuation?.finish()

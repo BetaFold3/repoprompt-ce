@@ -120,6 +120,54 @@ package struct AgentScheduledSendCandidate: Equatable {
     }
 }
 
+/// One schedule awaiting explicit user confirmation (durable `needsConfirmation`, or a confirmation
+/// obligation not yet durable), for the recovery catalog. Read-only: confirmation, dispatch, and
+/// cancellation stay on the existing scheduled-message actions. A summary read from a workspace's
+/// metadata index (a session no window hosts) may lack a tab; it carries the attempt the index
+/// recorded (none for an entry written before the index carried it).
+package struct AgentScheduledSendConfirmationSummary: Equatable {
+    package let sessionID: UUID
+    package let tabID: UUID?
+    package let workspaceID: UUID
+    package let scheduleID: UUID
+    /// The schedule attempt the confirmation is about, when it has one.
+    package let attemptID: UUID?
+    package let reason: AgentScheduledSendPersist.ConfirmationReason?
+    package let notBefore: Date
+    package let previewText: String
+    /// Saved session name, when the source knows it (index-read summaries).
+    package let sessionName: String?
+    /// An index-read summary without its occurrence identity (no attempt: an entry written before the
+    /// index carried it, indistinguishable from one without an attempt). Review R1 (A F08 residual):
+    /// its acknowledgement could not survive hydration supplying the attempt, so it offers no Dismiss
+    /// until opened (the hydrating window's scheduler then presents it).
+    package let requiresOpenBeforeDismiss: Bool
+
+    package init(
+        sessionID: UUID,
+        tabID: UUID?,
+        workspaceID: UUID,
+        scheduleID: UUID,
+        attemptID: UUID?,
+        reason: AgentScheduledSendPersist.ConfirmationReason?,
+        notBefore: Date,
+        previewText: String,
+        sessionName: String? = nil,
+        requiresOpenBeforeDismiss: Bool = false
+    ) {
+        self.requiresOpenBeforeDismiss = requiresOpenBeforeDismiss
+        self.sessionID = sessionID
+        self.tabID = tabID
+        self.workspaceID = workspaceID
+        self.scheduleID = scheduleID
+        self.attemptID = attemptID
+        self.reason = reason
+        self.notBefore = notBefore
+        self.previewText = previewText
+        self.sessionName = sessionName
+    }
+}
+
 /// Read-only dashboard projection. Mutations still go through the owning host's existing
 /// durable scheduled-send actions, never through this discovery snapshot.
 package struct AgentScheduledSendDashboardCandidate {
@@ -816,6 +864,32 @@ package final class AgentScheduledSendCoordinator {
             }
     }
 
+    /// Every registered host's schedule awaiting explicit confirmation, across workspaces (one per
+    /// durable session, the same authority as the dashboard). A confirmation obligation not yet
+    /// durable counts too. Observers refresh on `agentScheduledSendDashboardDidChange`.
+    package func confirmationSummaries() -> [AgentScheduledSendConfirmationSummary] {
+        authoritativeCandidates(from: collectCandidates())
+            .compactMap { authority -> AgentScheduledSendConfirmationSummary? in
+                let owner = authority.matchingEntries.first(where: { $0.candidate.isHydrated })
+                    ?? authority.representative
+                let candidate = owner.candidate
+                let record = candidate.scheduledSend
+                let pending = pendingConfirmationsByScheduleID[record.id]
+                guard record.state == .needsConfirmation || pending != nil else { return nil }
+                return AgentScheduledSendConfirmationSummary(
+                    sessionID: candidate.sessionID,
+                    tabID: candidate.tabID,
+                    workspaceID: candidate.workspaceID,
+                    scheduleID: record.id,
+                    attemptID: record.attempt?.attemptID,
+                    reason: record.confirmationReason ?? pending?.reason,
+                    notBefore: record.notBefore,
+                    previewText: String(record.rawText.prefix(AgentSessionScheduledSendSummary.previewTextLimit))
+                )
+            }
+            .sorted { ($0.notBefore, $0.scheduleID.uuidString) < ($1.notBefore, $1.scheduleID.uuidString) }
+    }
+
     /// Names an active blocker only; an old first-eligibility timestamp is not proof
     /// that the destination remains busy.
     package func dashboardBlockingSessionName(for snapshot: AgentScheduledSendDashboardCandidate) -> String? {
@@ -1405,6 +1479,10 @@ package final class AgentScheduledSendCoordinator {
         }
         parts += admissionsBySessionID.values.map { admission in
             "admission:\(admission.lease.sessionID):\(admission.lease.scheduleID):\(admission.lease.id)"
+        }
+        // Observers that present schedules by identity (the recovery catalog) exclude held attempts.
+        parts += transferHoldsByScheduleID.values.map { hold in
+            "hold:\(hold.scheduleID):\(hold.scheduleAttemptID)"
         }
         return parts.sorted()
     }

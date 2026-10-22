@@ -764,6 +764,7 @@ final class AttentionNotificationAdmissionTests: XCTestCase {
                     expectedRunID: root.session.runID,
                     terminalState: .cancelled,
                     source: "test.attention.cancel",
+                    cause: .userCancel,
                     attachmentDisposition: .deleteFiles,
                     finalizeNonCodexUsage: false,
                     supportsFollowUp: false,
@@ -1279,6 +1280,7 @@ final class AttentionNotificationAdmissionTests: XCTestCase {
                     expectedRunID: root.session.runID,
                     terminalState: .cancelled,
                     source: "test.attention.cancel",
+                    cause: .userCancel,
                     attachmentDisposition: .deleteFiles,
                     finalizeNonCodexUsage: false,
                     supportsFollowUp: false,
@@ -1714,7 +1716,7 @@ final class AttentionNotificationAdmissionTests: XCTestCase {
             gate.release()
             let session = live.session
             if session.runState.isActive {
-                await Self.boundedTeardownStep("cancelAgentRun") { await vm.cancelAgentRun(tabID: live.tabID) }
+                await Self.boundedTeardownStep("cancelAgentRun") { await vm.cancelAgentRun(tabID: live.tabID, cause: .userCancel) }
             }
             if let agentTask = session.agentTask {
                 await Self.boundedTeardownStep("agentTask") { await agentTask.value }
@@ -1857,6 +1859,7 @@ final class AttentionNotificationAdmissionTests: XCTestCase {
             expectedRunID: session.runID,
             terminalState: state,
             source: "test.attention",
+            cause: .ordinary,
             attachmentDisposition: .deleteFiles,
             finalizeNonCodexUsage: false,
             supportsFollowUp: supportsFollowUp,

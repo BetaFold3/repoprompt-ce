@@ -318,6 +318,11 @@ package actor AgentSessionDataService {
     private var metadataIndexCacheByFolder: [URL: AgentSessionMetadataIndex] = [:]
     private var metadataIndexReconciliationTasksByFolder: [URL: MetadataIndexReconciliationTaskState] = [:]
     private var metadataIndexReconciledThisProcess: Set<URL> = []
+    /// Schema-8 hint inputs: recovery-record facts already obtained by startup discovery and later
+    /// commits (never a per-save record read). `nil` facts for a session mean unknown until the
+    /// discovery inventory was adopted; afterwards a session without an entry has no record.
+    private var recoveryHintRecordFacts: [UUID: (sequence: UInt64, facts: AgentSessionRecoveryHint.RecordFacts)] = [:]
+    private var recoveryHintInventoryAdopted = false
 
     private struct AgentSessionScheduleAuthority {
         var scheduledSend: AgentScheduledSendMember?
@@ -997,8 +1002,69 @@ package actor AgentSessionDataService {
             from: session,
             fileURL: fileURL,
             observedFileSize: values.size,
-            observedFileModificationDate: values.modified
+            observedFileModificationDate: values.modified,
+            recoveryRecordFacts: recoveryHintRecordFacts(for: session.id)
         )
+    }
+
+    /// Known recovery-record facts for the hint, or `nil` (unknown) before the discovery inventory
+    /// was adopted and nothing was committed for the session since.
+    private func recoveryHintRecordFacts(for sessionID: UUID) -> AgentSessionRecoveryHint.RecordFacts? {
+        if let known = recoveryHintRecordFacts[sessionID] { return known.facts }
+        return recoveryHintInventoryAdopted ? .absent : nil
+    }
+
+    /// Adopts the recovery-record inventory startup discovery already read (schema-8 hint input).
+    /// Facts a commit already reported are newer and kept.
+    package func adoptRecoveryHintInventory(_ entries: [AgentRecoveryDiscoveryEntry]) {
+        for entry in entries {
+            let sessionID: UUID
+            let facts: AgentSessionRecoveryHint.RecordFacts
+            switch entry {
+            case let .supported(discovered):
+                sessionID = discovered.record.sessionID
+                facts = .make(from: discovered.record)
+            case let .preserved(preserved):
+                guard let id = preserved.sessionID else { continue }
+                sessionID = id
+                facts = .unreadable
+            }
+            if recoveryHintRecordFacts[sessionID] == nil {
+                recoveryHintRecordFacts[sessionID] = (0, facts)
+            }
+        }
+        recoveryHintInventoryAdopted = true
+    }
+
+    /// A committed recovery-record change (published in commit order by `sequence`). Updates the
+    /// hint of an already-loaded index entry and rewrites that index only when the hint changed, so
+    /// ordinary composer or question writes never rewrite the index.
+    package func noteRecoveryRecordCommitted(
+        sessionID: UUID,
+        sequence: UInt64,
+        facts: AgentSessionRecoveryHint.RecordFacts
+    ) async {
+        if let known = recoveryHintRecordFacts[sessionID], known.sequence >= sequence { return }
+        recoveryHintRecordFacts[sessionID] = (sequence, facts)
+        for folder in Array(metadataIndexCacheByFolder.keys) {
+            // Re-read per folder: an earlier write may have suspended.
+            guard let index = metadataIndexCacheByFolder[folder],
+                  let position = index.entries.firstIndex(where: { $0.id == sessionID })
+            else { continue }
+            let entry = index.entries[position]
+            let hint = AgentSessionRecoveryHint.make(
+                unresolvedInterruption: entry.hasUnresolvedInterruption,
+                reason: entry.recoveryHint.reason,
+                schedule: entry.scheduledSendSummary,
+                record: facts
+            )
+            guard hint != entry.recoveryHint else { continue }
+            var updated = index
+            updated.entries[position].recoveryHint = hint
+            metadataIndexCacheByFolder[folder] = updated
+            // The session files remain authoritative; a failed index write is repaired later.
+            try? await writeMetadataIndex(updated, folder: folder)
+        }
     }
 
     private func readMetadataIndexIfAvailable(folder: URL, preferCache: Bool = true) async -> AgentSessionMetadataIndex? {
@@ -1253,13 +1319,16 @@ package actor AgentSessionDataService {
                     recoverMissingMetadata: false,
                     persistRecoveredMetadata: false
                 )
+                // Schema-8 hint: joined with the recovery inventory already in memory; the stub's
+                // transcript part stays unknown (no transcript is decoded for hints).
                 records.append(
                     AgentSessionMetadataRecord.record(
                         from: stub,
                         fileURL: fileURL,
                         observedFileSize: values.size,
                         observedFileModificationDate: values.modified,
-                        lastIndexedAt: now
+                        lastIndexedAt: now,
+                        recoveryRecordFacts: recoveryHintRecordFacts(for: stub.id)
                     )
                 )
             } catch {
@@ -2198,7 +2267,11 @@ package actor AgentSessionDataService {
                 await Self.hydrationOverlapProbe?.storageCommitPoint()
             #endif
             try await commitLoadedSessionStorage(rewrite: rewrite, runtimeSession: runtimeSession, fileURL: fileURL)
-            noteColdRestoreStamps(sessionID: sessionID, context: interruptionContext, transcript: runtimeSession.transcript)
+            noteColdRestoreStamps(
+                sessionID: sessionID,
+                context: interruptionContext,
+                transcript: runtimeSession.transcript
+            )
             #if DEBUG
                 Self.hydrationOverlapProbe?.branchFinished(.storage)
             #endif
@@ -3304,6 +3377,38 @@ package actor AgentSessionDataService {
         return try await body()
     }
 
+    /// Runs `body` under the session persistence gate for a session with no live lane (a closed
+    /// session's recovery-card acknowledgement), after validating `binding` against current durable
+    /// authority: no tombstone, the session file present in `workspace`, and the same incarnation
+    /// and reset generation. Rejects before `body` otherwise. Same lock order as live lanes.
+    package func performClosedRecoveryTransaction<T: Sendable>(
+        binding: AgentRecoveryLifecycleBinding,
+        workspace: AgentRecoveryWorkspaceDestination,
+        _ body: @Sendable () async throws -> T
+    ) async throws -> T {
+        let sessionID = binding.sessionID
+        await acquireSessionPersistence(for: sessionID)
+        defer { releaseSessionPersistence(for: sessionID) }
+        try requireNoTombstone(for: sessionID)
+        let fileURL = agentSessionFileURL(id: sessionID, in: existingAgentSessionsFolder(for: workspace))
+        guard FileManager.default.fileExists(atPath: fileURL.path) else {
+            throw AgentScheduledSendMutationError.sessionNotFound(sessionID)
+        }
+        guard case let .v1(current) = try currentDurableLifecycle(fileURL: fileURL, sessionID: sessionID) else {
+            throw AgentScheduledSendMutationError.staleIncarnation(expected: binding.incarnationID, actual: nil)
+        }
+        guard binding.incarnationID == current.incarnationID else {
+            throw AgentScheduledSendMutationError.staleIncarnation(expected: binding.incarnationID, actual: current.incarnationID)
+        }
+        guard binding.transcriptResetGeneration == current.transcriptResetGeneration else {
+            throw AgentScheduledSendMutationError.staleTranscriptResetGeneration(
+                expected: binding.transcriptResetGeneration,
+                actual: current.transcriptResetGeneration
+            )
+        }
+        return try await body()
+    }
+
     /// R5 stamp evidence for a gate-held cold load: the session's recovery run attempts (an absent or
     /// unreadable record contributes none, so the stamp says `unknown` without a run ID). `nil` when
     /// no recovery store is composed (legacy behavior: no stamp). Callers hold the session gate.
@@ -3359,6 +3464,7 @@ package actor AgentSessionDataService {
             observedAt: Date(),
             providerConversationID: nil,
             runAttempts: record.runAttempts,
+            intentAttempts: record.attempts,
             acceptedBubbles: bubbles,
             unacceptedBubbles: unaccepted,
             launchReason: launchReason,
@@ -3379,7 +3485,8 @@ package actor AgentSessionDataService {
     }
 
     /// After a committed cold load: remembers turns stamped `unknown` only because launch evidence
-    /// was not captured yet, or forgets them once a load with evidence refined them.
+    /// was not captured yet, or forgets them once a load with evidence refined them. (Turns closed as
+    /// an ordinary outcome carry their own durable `recoveredOutcome` marker.)
     private func noteColdRestoreStamps(
         sessionID: UUID,
         context: AgentColdRestoreInterruptionContext?,
@@ -3414,6 +3521,43 @@ package actor AgentSessionDataService {
                 .appendingPathComponent(WorkspaceDirectoryName.directoryName(name: workspace.name, id: workspace.id))
         }
         return base.appendingPathComponent("AgentSessions")
+    }
+
+    /// Index-only session metadata for the recovery catalog's schedule discovery (lossless restart
+    /// Phase 2), read through the same cache as startup discovery: creates no folder, rebuilds no
+    /// index, and hydrates nothing. `[]` when the workspace has no session folder or session files;
+    /// `nil` when session files exist but no current or schedule-compatible older index describes
+    /// them (discovery incomplete).
+    package func recoveryIndexedSessionRecords(
+        for workspace: some AgentWorkspaceStorageReference
+    ) async -> [AgentSessionMetadataRecord]? {
+        let folder = existingAgentSessionsFolder(for: workspace)
+        guard FileManager.default.fileExists(atPath: folder.path) else { return [] }
+        if let index = await readMetadataIndexIfAvailable(folder: folder) {
+            return try? excludingTombstoned(index.entries.sortedForAgentSessionMetadataIndex())
+        }
+        if let older = readScheduleCompatibleOlderMetadataIndex(folder: folder) {
+            return try? excludingTombstoned(older.entries.sortedForAgentSessionMetadataIndex())
+        }
+        let names = (try? FileManager.default.contentsOfDirectory(atPath: folder.path)) ?? []
+        return names.contains { agentSessionID(fromFilename: $0) != nil } ? nil : []
+    }
+
+    /// Oldest index schema whose `scheduledSendSummary` has the current shape (review B F4): schema 7
+    /// predates only the schema-8 recovery hint, which schedule discovery never reads.
+    private static let oldestScheduleCompatibleMetadataIndexSchemaVersion = 7
+
+    /// Read-only schedule discovery from a decodable older index left by a previous build in a
+    /// workspace this launch has not opened (review B F4). Never cached, rebuilt, or rewritten: the
+    /// ordinary current-schema read path still treats it as absent and rebuilds it on open.
+    private func readScheduleCompatibleOlderMetadataIndex(folder: URL) -> AgentSessionMetadataIndex? {
+        let fileURL = metadataIndexFileURL(forAgentSessionsFolder: folder)
+        guard let data = try? Data(contentsOf: fileURL, options: .mappedIfSafe),
+              let index = try? decoder.decode(AgentSessionMetadataIndex.self, from: data),
+              index.schemaVersion >= Self.oldestScheduleCompatibleMetadataIndexSchemaVersion,
+              index.schemaVersion < AgentSessionMetadataIndex.currentSchemaVersion
+        else { return nil }
+        return index
     }
 
     /// Every normal session file of `workspace` (full sessions and durable stubs share one file
@@ -3455,8 +3599,10 @@ package actor AgentSessionDataService {
                     lastRunStateRaw: entry.lastRunStateRaw,
                     scheduleStateRaw: entry.scheduledSendSummary?.stateRaw,
                     scheduleUnreadable: entry.hasUnreadableScheduledSend,
-                    // A stub-built entry cannot say: inspect it (once; the load re-indexes it).
-                    mayHaveUnresolvedInterruption: entry.hasUnresolvedInterruption ?? entry.lacksTranscriptDerivedFields
+                    // Only a hint whose every input was inspected and clear skips inspection; a
+                    // stub-built entry (unknown transcript part) is inspected once (the load
+                    // re-indexes it). Recovery records are inspected regardless of any hint.
+                    mayHaveUnresolvedInterruption: entry.recoveryHint.state != .none
                 ))
             }
     }
@@ -3545,18 +3691,32 @@ package actor AgentSessionDataService {
         )
         let interruptedTurns = turns.compactMap { turn -> AgentRecoveryInterruptedTurn? in
             guard let interruption = turn.interruption, interruption.resolution == nil else { return nil }
-            let completed = interruption.runAttemptID.flatMap { attemptsByID[$0]?.terminal } != nil
+            // The shared classifier: any terminal evidence is not completion (R5 Phase 2).
+            let attempt = interruption.runAttemptID.flatMap { attemptsByID[$0] }
             return AgentRecoveryInterruptedTurn(
                 turnID: turn.id,
                 interruption: interruption,
-                status: completed ? .completedTailMayBeMissing : .interrupted,
+                status: .classify(attempt: attempt),
                 isLastTurn: turn.id == turns.last?.id
             )
+        }
+        // Turns saved open that a cold restoration (this launch's or an earlier one's) closed with
+        // their attempt's ordinary outcome (review A F03 / F03-R1): the durable `recoveredOutcome`
+        // marker lists them by that attempt, never as an interruption, on every launch until the
+        // item's card acknowledgement (Dismiss) hides it.
+        let outcomeTurns = turns.compactMap { turn -> AgentRecoveryOutcomeTurn? in
+            guard let marker = turn.recoveredOutcome, turn.interruption == nil,
+                  let attempt = attemptsByID[marker.runAttemptID], attempt.terminal != nil
+            else { return nil }
+            return AgentRecoveryOutcomeTurn(turnID: turn.id, runAttempt: attempt)
         }
         // Attempts the transcript never saved (R08 joins: own turn, or an unambiguous process run):
         // open ones, and terminal ones of this generation whose turn is missing (R09).
         let runAttempts = recordState.record?.runAttempts ?? []
-        let recoveryOnlyRunAttempts = AgentRecoveryRunTurnJoin(runAttempts: runAttempts).unrepresentedAttempts(
+        let recoveryOnlyRunAttempts = AgentRecoveryRunTurnJoin(
+            runAttempts: runAttempts,
+            intentAttempts: recordState.record?.attempts ?? []
+        ).unrepresentedAttempts(
             runAttempts,
             in: turns,
             currentGeneration: lifecycle.transcriptResetGeneration
@@ -3584,9 +3744,11 @@ package actor AgentSessionDataService {
             binding: binding,
             record: discovered,
             interruptedTurns: interruptedTurns,
+            outcomeTurns: outcomeTurns,
             recoveryOnlyRunAttempts: recoveryOnlyRunAttempts,
             scheduleTransfer: transfer,
-            remoteHostID: session.remoteHost?.hostID
+            remoteHostID: session.remoteHost?.hostID,
+            workspace: workspace
         )
         guard resolved.hasRecoveryItems || recordState.record != nil else {
             return resolution(.idle)
@@ -3980,7 +4142,11 @@ package actor AgentSessionDataService {
                 )
             }
             try await commitLoadedSessionStorage(rewrite: rewrite, runtimeSession: runtimeSession, fileURL: fileURL)
-            noteColdRestoreStamps(sessionID: sessionID, context: interruptionContext, transcript: runtimeSession.transcript)
+            noteColdRestoreStamps(
+                sessionID: sessionID,
+                context: interruptionContext,
+                transcript: runtimeSession.transcript
+            )
             return runtimeSession
         } catch {
             throw AgentSessionDataError.loadFailed(error)

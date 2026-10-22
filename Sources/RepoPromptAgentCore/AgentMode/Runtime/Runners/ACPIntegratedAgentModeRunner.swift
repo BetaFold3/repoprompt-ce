@@ -516,6 +516,7 @@ package final class ACPIntegratedAgentModeRunner {
                         expectedRunID: runID,
                         terminalState: .failed,
                         source: "acp.runnerReleasedBeforeTaskEntry",
+                        cause: .ordinary,
                         completion: .terminalTeardownCompleted,
                         errorText: Self.ohMyPiAuthorizationFailureText,
                         attachmentReservationID: attachmentReservationID,
@@ -782,6 +783,7 @@ package final class ACPIntegratedAgentModeRunner {
             expectedRunID: runID,
             terminalState: .failed,
             source: "acp.startupFailure",
+            cause: .ordinary,
             errorText: errorText,
             attachmentReservationID: attachmentReservationID,
             attachmentDisposition: .deleteFiles,
@@ -813,6 +815,7 @@ package final class ACPIntegratedAgentModeRunner {
             expectedRunID: runID,
             terminalState: .cancelled,
             source: "acp.startupCancelled",
+            cause: .ordinary,
             attachmentReservationID: attachmentReservationID,
             attachmentDisposition: .deleteFiles,
             finalizeNonCodexUsage: true,
@@ -1821,6 +1824,7 @@ package final class ACPIntegratedAgentModeRunner {
             log("controller.prompt failed raw=\(String(describing: error)) normalized=\(normalizedText)", runID: runID)
             let outcome = await consumeTask.value
             let errorText = promptFailureErrorText(outcome: outcome, fallback: normalizedText)
+            let failureCause = await Self.terminalCause(terminalState: .failed, controller: controller)
             await finalize(
                 session: session,
                 runID: runID,
@@ -1830,7 +1834,8 @@ package final class ACPIntegratedAgentModeRunner {
                 terminalState: .failed,
                 errorText: errorText,
                 notifyTurnComplete: false,
-                shouldShutdownController: true
+                shouldShutdownController: true,
+                cause: failureCause
             )
             return
         }
@@ -1838,6 +1843,7 @@ package final class ACPIntegratedAgentModeRunner {
         let outcome = await consumeTask.value
         let outcomeErrorDescription = outcome.errorText ?? "nil"
         log("event consumer completed state=\(outcome.terminalState.rawValue) error=\(outcomeErrorDescription)", runID: runID)
+        let cause = await Self.terminalCause(terminalState: outcome.terminalState, controller: controller)
         await finalize(
             session: session,
             runID: runID,
@@ -1847,8 +1853,20 @@ package final class ACPIntegratedAgentModeRunner {
             terminalState: outcome.terminalState,
             errorText: outcome.errorText,
             notifyTurnComplete: outcome.terminalState == .completed,
-            shouldShutdownController: outcome.terminalState != .completed
+            shouldShutdownController: outcome.terminalState != .completed,
+            cause: cause
         )
+    }
+
+    /// Review A F06: a failed run whose provider process exited while the controller was not
+    /// closing it ended by provider-process loss; every other ending (provider-reported errors,
+    /// our own shutdown, completion) stays ordinary. A lifecycle teardown still wins at the barrier.
+    static func terminalCause(
+        terminalState: AgentSessionRunState,
+        controller: ACPAgentSessionController
+    ) async -> AgentRunTerminalCause {
+        guard terminalState == .failed else { return .ordinary }
+        return await controller.providerProcessWasLost() ? .providerProcessLost : .ordinary
     }
 
     /// Settles the staged input `handoff` carries into one ACP prompt (plan §6.2): `onSubmitted`
@@ -2042,6 +2060,7 @@ package final class ACPIntegratedAgentModeRunner {
             expectedRunID: runID,
             terminalState: .cancelled,
             source: "acp.acquireFailure",
+            cause: .ordinary,
             attachmentReservationID: attachmentReservationID,
             attachmentDisposition: .deleteFiles,
             finalizeNonCodexUsage: true,
@@ -2067,7 +2086,8 @@ package final class ACPIntegratedAgentModeRunner {
         errorText: String?,
         notifyTurnComplete: Bool,
         shouldShutdownController: Bool,
-        completion: AgentModeRunService.CancellationCompletion = .terminalPublished
+        completion: AgentModeRunService.CancellationCompletion = .terminalPublished,
+        cause: AgentRunTerminalCause = .ordinary
     ) async {
         let finalizeErrorDescription = errorText ?? "nil"
         log("finalize requested state=\(terminalState.rawValue) error=\(finalizeErrorDescription)", runID: runID)
@@ -2090,6 +2110,7 @@ package final class ACPIntegratedAgentModeRunner {
             expectedRunID: runID,
             terminalState: terminalState,
             source: "acp.finalize",
+            cause: cause,
             completion: completion,
             errorText: errorText,
             attachmentReservationID: attachmentReservationID,

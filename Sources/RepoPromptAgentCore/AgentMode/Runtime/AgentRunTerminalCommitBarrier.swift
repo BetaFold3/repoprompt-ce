@@ -12,6 +12,9 @@ package struct AgentRunTerminalCommitRevision: Equatable {
     package let ownership: AgentRunOwnership
     package let terminalState: AgentSessionRunState
     package let expectedRunID: UUID?
+    /// The effective terminal cause (`AgentRunTerminalCause.effective`), recorded with recovery
+    /// terminal evidence.
+    package let cause: AgentRunTerminalCause
     let sourceItemsRevision: Int
     let assistantDeltaFlushGeneration: UInt64
     let providerDrainGeneration: UInt64
@@ -37,6 +40,8 @@ package final class AgentRunTerminalCommitBarrier {
         let expectedRunID: UUID?
         let terminalState: AgentSessionRunState
         let source: String
+        /// The runner's requested cause; the commit records the effective one.
+        let cause: AgentRunTerminalCause
         let completion: AgentModeRunService.CancellationCompletion
         let errorText: String?
         let attachmentReservationID: UUID?
@@ -65,6 +70,7 @@ package final class AgentRunTerminalCommitBarrier {
             expectedRunID: UUID?,
             terminalState: AgentSessionRunState,
             source: String,
+            cause: AgentRunTerminalCause,
             completion: AgentModeRunService.CancellationCompletion = .terminalPublished,
             errorText: String? = nil,
             attachmentReservationID: UUID? = nil,
@@ -86,6 +92,7 @@ package final class AgentRunTerminalCommitBarrier {
             self.expectedRunID = expectedRunID
             self.terminalState = terminalState
             self.source = source
+            self.cause = cause
             self.completion = completion
             self.errorText = errorText
             self.attachmentReservationID = attachmentReservationID
@@ -334,6 +341,20 @@ package final class AgentRunTerminalCommitBarrier {
                 for: session
             )
         }
+        let cause = AgentRunTerminalCause.effective(
+            requested: request.cause,
+            terminalState: request.terminalState,
+            lifecycleTeardown: session.lifecycleTeardownCause
+        )
+        if let terminalTurnID {
+            Self.stampLiveInterruption(
+                cause: cause,
+                terminalState: request.terminalState,
+                turnID: terminalTurnID,
+                runAttemptID: request.ownership.attemptID,
+                session: session
+            )
+        }
 
         let successorKind: AgentRunEpochTransitionKind? = if queuedInstruction != nil {
             .relatedFollowUp
@@ -345,6 +366,7 @@ package final class AgentRunTerminalCommitBarrier {
             ownership: request.ownership,
             terminalState: request.terminalState,
             expectedRunID: request.expectedRunID,
+            cause: cause,
             sourceItemsRevision: session.sourceItemsRevision,
             assistantDeltaFlushGeneration: session.assistantDeltaFlushGeneration,
             providerDrainGeneration: request.providerDrainGeneration,
@@ -445,6 +467,38 @@ package final class AgentRunTerminalCommitBarrier {
             )
         #endif
         return revision
+    }
+
+    /// Live R5 stamp: a non-completed terminal whose effective cause is an interruption (quit,
+    /// window close, provider process loss) records it on the terminal turn once, so a warm
+    /// session presents the same state cold restore would. A user cancel or an ordinary terminal
+    /// is never stamped, and an existing interruption (cold restore, an earlier commit) is kept.
+    static func stampLiveInterruption(
+        cause: AgentRunTerminalCause,
+        terminalState: AgentSessionRunState,
+        turnID: UUID,
+        runAttemptID: UUID,
+        session: AgentTabSession,
+        now: Date = Date()
+    ) {
+        guard terminalState != .completed,
+              let reason = cause.interruptionReason,
+              // Review B R1-F1: the turn containing the terminal user item (its own turn, its
+              // request, or a mid-turn user activity), not only a turn with that exact ID.
+              let turnIndex = session.transcript.turns.lastIndex(where: { $0.containsUserItem(turnID) }),
+              session.transcript.turns[turnIndex].interruption == nil
+        else { return }
+        let turn = session.transcript.turns[turnIndex]
+        let lastActivity = turn.lastActivityAt
+            ?? turn.responseSpans.compactMap(\.lastActivityAt).max()
+        session.transcript.turns[turnIndex].interruption = AgentTranscriptTurnInterruption(
+            reason: reason,
+            observedAt: now,
+            lastConfirmedActivityAt: lastActivity,
+            runAttemptID: runAttemptID,
+            providerConversationID: session.providerSessionID
+        )
+        session.isDirty = true
     }
 
     /// Returns true only when the provider explicitly declined its successor after an accepted
