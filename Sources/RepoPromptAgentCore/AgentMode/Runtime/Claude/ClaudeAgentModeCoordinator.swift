@@ -1226,14 +1226,34 @@ package final class ClaudeAgentModeCoordinator {
     ) async throws -> NativeAgentRuntimeSessionRef {
         let existingSessionID = session.providerSessionID
         let runAttemptID = session.activeRunAttemptID
+        // R6 owner capture: this start (launch reservation, startup permission mode) and its fresh
+        // fallback carry the scope of the run attempt captured here, never one read later.
+        let runtimeOwner = session.runtimeSessionScope(processRunID: runID)
         let systemPromptOverride = agentModeSystemPromptOverride(for: session)
+        if controller.joinsRetirementBeforeSuccessor {
+            // R6: a retired registered runtime of this tab (any provider, for example a Codex
+            // controller retired by a provider switch) finishes its cleanup before this start
+            // reserves; the start then proceeds only while it is still current.
+            await session.joinRuntimeRetirements()
+            guard !Task.isCancelled,
+                  session.runID == runID,
+                  session.activeRunAttemptID == runAttemptID,
+                  session.runState.isActive,
+                  sessionOwnsClaudeController(controller, for: session)
+            else {
+                await shutdownClaudeControllerIfUnowned(controller, by: session)
+                throw ControllerLifecycleError.superseded
+            }
+        }
         do {
-            let sessionRef = try await controller.startOrResume(
-                existingSessionID: existingSessionID,
-                model: model,
-                effortLevel: effortLevel,
-                systemPromptOverride: systemPromptOverride
-            )
+            let sessionRef = try await AgentRuntimeOperationOwner.$session.withValue(runtimeOwner) {
+                try await controller.startOrResume(
+                    existingSessionID: existingSessionID,
+                    model: model,
+                    effortLevel: effortLevel,
+                    systemPromptOverride: systemPromptOverride
+                )
+            }
             recordStartupEffortEvidence(
                 from: sessionRef,
                 controller: controller,
@@ -1342,15 +1362,16 @@ package final class ClaudeAgentModeCoordinator {
                 ),
                 for: session
             )
-
             let sessionRef: NativeAgentRuntimeSessionRef
             do {
-                sessionRef = try await freshController.startOrResume(
-                    existingSessionID: nil,
-                    model: model,
-                    effortLevel: effortLevel,
-                    systemPromptOverride: systemPromptOverride
-                )
+                sessionRef = try await AgentRuntimeOperationOwner.$session.withValue(runtimeOwner) {
+                    try await freshController.startOrResume(
+                        existingSessionID: nil,
+                        model: model,
+                        effortLevel: effortLevel,
+                        systemPromptOverride: systemPromptOverride
+                    )
+                }
             } catch {
                 guard sessionOwnsDetachedFallbackReplacementClaim(replacementClaim, for: session),
                       let failedPrivateController = removeTrackedPrivateFallbackController(
@@ -1464,6 +1485,8 @@ package final class ClaudeAgentModeCoordinator {
     ) -> Bool {
         if error is ClaudeNativeProcessSessionController.PermissionStageError
             || error is ClaudeAgentToolPreferences.AutoPermissionModeBlockedError
+            // R6: a registry refusal never falls back to another (fresh) launch.
+            || error is AgentProcessRegistryError
         {
             return false
         }
@@ -2006,7 +2029,21 @@ package final class ClaudeAgentModeCoordinator {
                 let instructions = agentModeInstructionInjection(for: session)
                 let providerBoundText = providerBoundUserMessage(outboundText, instructions: instructions)
                 guard handoff.enterProviderBoundary(in: session) else { return false }
-                let turnID = try await controller.sendUserMessage(providerBoundText)
+                // R6 owner capture: the dispatch reservation (verified current above) owns this
+                // user turn; its scope is captured now and never re-read at write time.
+                let runtimeOwner = session.runtimeSessionScope
+                // R6: a managed transport re-verifies this dispatch still owns the turn after its
+                // registry awaits, immediately before the bytes.
+                let writeAdmission: @Sendable () async -> Bool = { @MainActor [weak self, weak session] in
+                    guard let self, let session else { return false }
+                    return dispatchReservationIsCurrent(dispatchReservation, for: session)
+                        && sessionOwnsClaudeController(controller, for: session)
+                }
+                let turnID = try await AgentRuntimeOperationOwner.$session.withValue(runtimeOwner) {
+                    try await AgentRuntimeOperationOwner.$writeAdmission.withValue(writeAdmission) {
+                        try await controller.sendUserMessage(providerBoundText)
+                    }
+                }
                 // Written: track until the turn's own completion proves acceptance.
                 dispatchHandoffsByTurnID[turnID] = WrittenDispatchHandoff(
                     tabID: session.tabID,
@@ -2221,7 +2258,14 @@ package final class ClaudeAgentModeCoordinator {
             return
         }
         let detached = prepareClaudeProviderIdentityResetSync(session)
-        Task { await cancelClaudeRun(session, oldController: detached) }
+        if let detached, detached.controller.joinsRetirementBeforeSuccessor {
+            // R6: retained so a registered successor of any provider on this tab joins it.
+            session.retainRuntimeRetirement { [self] in
+                await cancelClaudeRun(session, oldController: detached)
+            }
+        } else {
+            Task { await cancelClaudeRun(session, oldController: detached) }
+        }
     }
 
     package func handleProviderIdentityTransition(

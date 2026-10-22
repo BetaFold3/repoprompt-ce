@@ -694,6 +694,9 @@ package struct AgentRequestUserInputRequest: Identifiable, Hashable {
     let itemID: String
     package let askedAt: Date
     package let questions: [AgentRequestUserInputQuestion]
+    /// R6: the issuing Codex transport's immutable receipt; the reply routes by it (never by the
+    /// wire ID alone). Nil for requests that did not come from a Codex transport.
+    package var codexReceipt: CodexServerRequestReceipt?
 
     init(
         id: UUID? = nil,
@@ -767,6 +770,8 @@ package struct AgentMCPElicitationRequest: Identifiable, Hashable {
     let threadID: String
     let turnID: String
     let itemID: String
+    /// R6: the issuing Codex transport's immutable receipt (see `AgentRequestUserInputRequest`).
+    package var codexReceipt: CodexServerRequestReceipt?
     package let serverName: String?
     package let toolName: String?
     package let title: String
@@ -945,6 +950,8 @@ package struct AgentPermissionsRequest: Identifiable, Hashable {
     let threadID: String
     let turnID: String
     let itemID: String
+    /// R6: the issuing Codex transport's immutable receipt (see `AgentRequestUserInputRequest`).
+    package var codexReceipt: CodexServerRequestReceipt?
     package let cwd: String
     package let reason: String?
     package let permissionsJSON: String
@@ -1011,6 +1018,8 @@ package struct AgentApprovalRequest: Identifiable, Hashable {
     package let requestID: AgentApprovalRequestID
     package let method: String
     package let kind: AgentApprovalKind
+    /// R6: the issuing Codex transport's immutable receipt (see `AgentRequestUserInputRequest`).
+    package var codexReceipt: CodexServerRequestReceipt?
     let threadID: String
     let turnID: String
     let itemID: String

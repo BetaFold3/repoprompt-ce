@@ -40,10 +40,13 @@ final class AgentRecoveryAppComposition {
     ///   - store: the single recovery store; `nil` leaves recovery inactive (legacy behavior).
     ///   - dataService: must be configured with `store` (the coordinator validates it).
     ///   - scheduler: the shared scheduler; closed here before any host can register.
+    ///   - processRegistry: the app's single runtime-ownership registry (spec R6) over `store`;
+    ///     `nil` enforces no runtime records (XCTest compositions that don't exercise R6).
     init(
         store: AgentRecoveryStore?,
         dataService: AgentSessionDataService,
         scheduler: AgentScheduledSendCoordinator,
+        processRegistry: AgentProcessRegistry? = nil,
         loadInventory: @escaping InventoryLoader
     ) {
         self.scheduler = scheduler
@@ -73,6 +76,13 @@ final class AgentRecoveryAppComposition {
             )
             coordinator = composed
             failure = nil
+            // R6: existing runtime records are loaded and discovered during startup, before
+            // admission opens; sessions are keyed by the windows hosting them.
+            if let processRegistry {
+                composed.attachProcessRegistry(processRegistry) { [weak self] sessionID in
+                    self?.runtimeOwnershipKeys(sessionID: sessionID) ?? []
+                }
+            }
             // Schedules awaiting explicit confirmation are catalog items too (Phase 2): the shared
             // scheduler's summaries for hosted sessions, and every inventoried workspace's index for
             // sessions no window hosts (closed workspaces included). Hydrated sessions of windows
@@ -98,6 +108,7 @@ final class AgentRecoveryAppComposition {
         scheduler: AgentScheduledSendCoordinator(
             startupAdmission: AgentRecoveryStore.production == nil ? .open : .awaitingRecovery
         ),
+        processRegistry: AgentProcessRegistry.production,
         loadInventory: { try WorkspaceManagerViewModel.loadRecoveryWorkspaceInventory() }
     )
 
@@ -159,6 +170,20 @@ final class AgentRecoveryAppComposition {
             }
         }
         return sessionIDs
+    }
+
+    /// What a durable session would touch, from every window hosting it: each native conversation
+    /// it knows (Codex thread, Claude/ACP session) with its effective worktree, or the worktree
+    /// alone before any conversation is known. Empty when no window hosts the session.
+    private func runtimeOwnershipKeys(sessionID: UUID) -> [AgentRuntimeOwnershipKeys] {
+        var keys: [AgentRuntimeOwnershipKeys] = []
+        for entry in installedViewModels {
+            guard let viewModel = entry.viewModel else { continue }
+            for session in viewModel.sessions.values where session.activeAgentSessionID == sessionID {
+                keys.append(contentsOf: viewModel.runtimeOwnershipKeys(for: session))
+            }
+        }
+        return keys
     }
 
     /// Test observability: the task releasing the scheduler after startup.

@@ -256,7 +256,6 @@ package final class ACPIntegratedAgentModeRunner {
         hooks.setAgentRunActive(tabID, true)
         setRunningStatus(initialTransportStatusText(for: runRequest.agentKind), source: .transport, session: session, urgent: true)
 
-        let freshRunRequest = runRequest
         if let existingController = session.acpController {
             let isCompatible = await existingController.isCompatibleWith(request: runRequest)
             guard isStartupStillCurrent(session: session, runAttemptID: runAttemptID) else { return }
@@ -313,6 +312,8 @@ package final class ACPIntegratedAgentModeRunner {
                         ).apply(to: deferredLease)
                     }
                 }
+                // R6: the reused process serves this run attempt (its existing process run).
+                let attemptRunRequest = runRequest.withRuntimeSession(session.runtimeSessionScope)
                 runTaskOwnsHandoff = true
                 session.agentTask = Task { [weak self, weak session] in
                     defer { handoff.settleRunInputScope() }
@@ -330,7 +331,7 @@ package final class ACPIntegratedAgentModeRunner {
                             attachments: attachments,
                             handoff: handoff,
                             controller: existingController,
-                            runRequest: runRequest,
+                            runRequest: attemptRunRequest,
                             deferredLease: deferredLease,
                             attachmentReservationID: attachmentReservationID
                         )
@@ -346,6 +347,8 @@ package final class ACPIntegratedAgentModeRunner {
         }
         let runID = AgentModeProcessRunIdentity.startFreshProcessRun(for: session)
         guard isStartupStillCurrent(session: session, runID: runID, runAttemptID: runAttemptID) else { return }
+        // R6: the launch and every write of this attempt carry its lifecycle, attempt and process run.
+        let freshRunRequest = runRequest.withRuntimeSession(session.runtimeSessionScope)
         let lease = makeLease(runID)
 
         guard let provider = providerFactory(runRequest.agentKind, runRequest.modelString) else {
@@ -424,6 +427,12 @@ package final class ACPIntegratedAgentModeRunner {
             return
         }
 
+        if controller.joinsRetirementBeforeSuccessor {
+            // R6: a retired registered runtime of this tab (any provider, for example a Codex or
+            // Claude controller retired by a provider switch) finishes its cleanup before this
+            // launch reserves; the currency and cancellation checks below then apply.
+            await session.joinRuntimeRetirements()
+        }
         #if DEBUG
             await controller.setExpectedMCPRunID(
                 runID,
@@ -1447,7 +1456,12 @@ package final class ACPIntegratedAgentModeRunner {
 
             try await applyExplicitSelectedModelIfNeeded(runRequest, controller: controller, runID: runID)
             await controller.setAutoApproveAllToolPermissions(runRequest.autoApproveAllToolPermissions)
-            try await applyRequestedSessionModeIfNeeded(runRequest.sessionModeID, controller: controller, runID: runID)
+            try await applyRequestedSessionModeIfNeeded(
+                runRequest.sessionModeID,
+                runtimeOwner: runRequest.runtimeSession,
+                controller: controller,
+                runID: runID
+            )
             setRunningStatus(waitingForConnectionStatusText(for: runRequest.agentKind), source: .transport, session: session, urgent: true)
 
             if runRequest.agentKind.requiresPrePromptAgentModeMCPRouting {
@@ -1588,7 +1602,12 @@ package final class ACPIntegratedAgentModeRunner {
 
             try await applyExplicitSelectedModelIfNeeded(runRequest, controller: controller, runID: runID)
             await controller.setAutoApproveAllToolPermissions(runRequest.autoApproveAllToolPermissions)
-            try await applyRequestedSessionModeIfNeeded(runRequest.sessionModeID, controller: controller, runID: runID)
+            try await applyRequestedSessionModeIfNeeded(
+                runRequest.sessionModeID,
+                runtimeOwner: runRequest.runtimeSession,
+                controller: controller,
+                runID: runID
+            )
 
             if let deferredLease {
                 let acquired = await deferredLease.acquire()
@@ -1925,13 +1944,18 @@ package final class ACPIntegratedAgentModeRunner {
         hooks.updateBindings(session)
     }
 
+    /// `runtimeOwner`: the attempt request's owner-captured scope (R6), which the requested mode
+    /// change is associated with before it is written.
     private func applyRequestedSessionModeIfNeeded(
         _ requestedMode: String?,
+        runtimeOwner: AgentRuntimeSessionScope,
         controller: ACPAgentSessionController,
         runID: UUID
     ) async throws {
         if let requestedMode = requestedMode?.trimmingCharacters(in: .whitespacesAndNewlines), !requestedMode.isEmpty {
-            try await controller.setSessionMode(requestedMode)
+            try await AgentRuntimeOperationOwner.$session.withValue(runtimeOwner) {
+                try await controller.setSessionMode(requestedMode)
+            }
         }
     }
 

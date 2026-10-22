@@ -210,6 +210,10 @@ struct AgentRecoveryListRow: View {
             "Retry save"
         case .cancelSchedule:
             "Cancel pending schedule…"
+        case .refreshProcesses:
+            "Refresh"
+        case .letProcessFinish:
+            "Let it finish"
         }
     }
 }

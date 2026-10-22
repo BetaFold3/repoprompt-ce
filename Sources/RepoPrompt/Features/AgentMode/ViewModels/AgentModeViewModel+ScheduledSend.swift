@@ -1478,6 +1478,17 @@ extension AgentModeViewModel {
             ) {
                 return true
             }
+            // R6: a possible other writer of its conversation, an unassociated writer or tool-only
+            // survivor on its worktree, or global ownership uncertainty keeps automatic work paused.
+            // Keys come from this session object itself (hydrated scheduler candidates included), not
+            // only from the windows hosting it.
+            if recoveryCoordinator.runtimeBlocksAutomaticWork(
+                sessionID: sessionID,
+                additionalKeys: runtimeOwnershipKeys(for: session),
+                worktreeUnresolved: runtimeWorktreeIsUnresolved(for: session)
+            ) {
+                return true
+            }
             if let lane = session.recoveryLane, lane.sessionID == sessionID {
                 if recoveryCoordinator.blockingCrashHold(for: lane.binding) != nil {
                     return true
@@ -2425,12 +2436,54 @@ extension AgentModeViewModel: AgentScheduledSendCoordinatorHost {
         )
     }
 
+    /// R6 ownership keys of `session`: its durable session, each native conversation it knows (Codex
+    /// thread, Claude/ACP session) and its effective worktree; the session and worktree alone before
+    /// any conversation is known. The Codex thread field is Codex's by construction; the generic
+    /// provider session ID records no provider of its own (the selected agent may have changed
+    /// since), so it keeps an unknown provider, which overlaps every runtime (conservative).
+    /// Whether `session`'s effective worktree cannot be resolved (its lookup throws); a session with
+    /// no worktree at all is resolved. R6 automatic work treats an unresolved worktree as blocked.
+    func runtimeWorktreeIsUnresolved(for session: AgentTabSession) -> Bool {
+        do {
+            _ = try effectiveWorkspacePath(for: session)
+            return false
+        } catch {
+            return true
+        }
+    }
+
+    func runtimeOwnershipKeys(for session: AgentTabSession) -> [AgentRuntimeOwnershipKeys] {
+        let worktree = (try? effectiveWorkspacePath(for: session)) ?? nil
+        let sessionID = session.activeAgentSessionID
+        func trimmed(_ value: String?) -> String? {
+            guard let value = value?.trimmingCharacters(in: .whitespacesAndNewlines), !value.isEmpty else { return nil }
+            return value
+        }
+        var conversations: [(id: String, provider: AgentRuntimeProvider?)] = []
+        if let codexThread = trimmed(session.codexConversationID) {
+            conversations.append((codexThread, .codex))
+        }
+        if let providerSession = trimmed(session.providerSessionID) {
+            conversations.append((providerSession, nil))
+        }
+        guard !conversations.isEmpty else {
+            return [AgentRuntimeOwnershipKeys(sessionID: sessionID, conversationID: nil, worktreePath: worktree)]
+        }
+        return conversations.map {
+            AgentRuntimeOwnershipKeys(sessionID: sessionID, conversationID: $0.id, provider: $0.provider, worktreePath: worktree)
+        }
+    }
+
     func hasUnresolvedRecoverySession(inWorkspace workspaceID: UUID, excluding sessionID: UUID) -> Bool {
         // App-scoped startup results cover closed sessions too (every window shares the coordinator).
         if recoveryCoordinator?.hasUnresolvedSession(inWorkspace: workspaceID, excluding: sessionID) == true {
             return true
         }
         guard persistenceWorkspace?.id == workspaceID else { return false }
+        // R6: a surviving runtime on this workspace's worktree keeps new-session starts paused.
+        if recoveryCoordinator?.runtimeBlocksAutomaticWork(worktreePath: workspacePathProvider()) == true {
+            return true
+        }
         return sessions.values.contains { session in
             session.activeAgentSessionID != sessionID && scheduledSendHasUnresolvedRecovery(session)
         }

@@ -710,7 +710,9 @@ package final class AgentModeRunService {
                     exactWireModelID: selectedModelString,
                     selections: session.ohMyPiThinkingSelections
                 ),
-                autoApproveAllToolPermissions: runtimePermission.autoApproveAllACPToolPermissions
+                autoApproveAllToolPermissions: runtimePermission.autoApproveAllACPToolPermissions,
+                // Bound by the ACP runner to the run attempt it begins (lifecycle, attempt, process run).
+                runtimeSession: .unavailable
             )
         } else {
             nil
@@ -919,7 +921,9 @@ package final class AgentModeRunService {
                 exactWireModelID: selectedModelString,
                 selections: session.ohMyPiThinkingSelections
             ),
-            autoApproveAllToolPermissions: runtimePermission.autoApproveAllACPToolPermissions
+            autoApproveAllToolPermissions: runtimePermission.autoApproveAllACPToolPermissions,
+            // The active run attempt this steering prompt joins.
+            runtimeSession: session.runtimeSessionScope
         )
         let sent = await acpRunner.submitActivePrompt(
             session: session,

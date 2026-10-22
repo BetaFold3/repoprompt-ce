@@ -439,6 +439,16 @@ package final class AgentRecoveryCoordinator {
     package private(set) var catalogActionStates: [String: AgentRecoveryCatalogActionState] = [:]
     /// Serial tail of launch-mark writes (`shutdownInProgress`, `cleanExit`, corrections).
     private var launchMarkTail: Task<Void, Never>?
+    /// Spec R6 runtime ownership (see `AgentRecoveryCoordinator+RuntimeOwnership.swift`). `nil`
+    /// leaves runtime restrictions empty (XCTest compositions without a registry).
+    var processRegistry: AgentProcessRegistry?
+    /// The registry's latest restriction snapshot, published before readiness and on every change.
+    package internal(set) var runtimeRestrictions: AgentRuntimeRestrictionSnapshot = .empty
+    /// What a durable session would touch (its native conversations and worktree), from the windows
+    /// hosting it; empty for a session no window hosts.
+    var runtimeOwnershipKeys: @MainActor (UUID) -> [AgentRuntimeOwnershipKeys] = { _ in [] }
+    /// Latest issued snapshot pull; an older pull's result is never adopted over a newer one.
+    var runtimeSnapshotRequest: UInt64 = 0
 
     package init(
         store: AgentRecoveryStore,
@@ -653,8 +663,8 @@ package final class AgentRecoveryCoordinator {
         postCatalogChange()
     }
 
-    /// Startup results, holds, restrictions, or freezes changed.
-    private func postCoordinatorDidChange() {
+    /// Startup results, holds, restrictions (runtime ownership included), or freezes changed.
+    func postCoordinatorDidChange() {
         invalidateCatalog()
         NotificationCenter.default.post(name: .agentRecoveryCoordinatorDidChange, object: self)
     }
@@ -796,6 +806,9 @@ package final class AgentRecoveryCoordinator {
                 previous = await store.readLaunchMark()
                 capturedPreviousLaunch = previous
             }
+            // R6: existing runtime records are enforced before admission opens (never skipped when
+            // new registration is inactive); ownership failures become scoped or global restrictions.
+            await startRuntimeOwnership()
             // R5: cold loads stamp from the captured previous launch, not this launch's mark.
             await dataService.adoptColdRestoreLaunchEvidence(previous)
             let current = try await store.recordCurrentLaunchRunning()
@@ -993,6 +1006,9 @@ package final class AgentRecoveryCoordinator {
         }
         if let hold = blockingCrashHold(for: binding) {
             return .crashHeld(hold)
+        }
+        if let reason = runtimeSendRefusalReason(sessionID: binding.sessionID) {
+            return .restricted(reason)
         }
         if let reason = restrictions.sessionRestriction(binding.sessionID)
             ?? workspaceID.flatMap({ restrictions.workspaceRestriction($0) })

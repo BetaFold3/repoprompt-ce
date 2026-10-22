@@ -149,6 +149,9 @@ package actor ACPAgentSessionController {
         let rpcID: JSONRPCID
         let options: [PermissionOption]
         let request: AgentApprovalRequest
+        /// R6: the runtime launch whose transport issued the request (`nil` while registration is
+        /// off). Its reply goes only to that transport, never to a replacement.
+        let issuingLaunch: AgentRuntimeLaunch?
     }
 
     private struct RequestResponse {
@@ -288,6 +291,24 @@ package actor ACPAgentSessionController {
 
     private var state: State = .idle
     private var process: SpawnedProcess?
+    /// Runtime ownership of `process` (spec R6); `nil` while Phase 3 registration is off.
+    private var runtimeLaunch: AgentRuntimeLaunch?
+    /// Whether the current transport was spawned under a runtime launch; every stdin write then
+    /// requires `runtimeLaunch` to be that committed launch (synchronous transport-owner check).
+    private var runtimeManagedTransport = false
+    private var runtimeCommittedLaunch: AgentRuntimeLaunch?
+    #if DEBUG
+        /// Test-only suspension at R6 fence checkpoints (`launchCaptured` before the first await,
+        /// `associated`, `authorized`), so fixtures can replace the transport inside a write's awaits.
+        private var debugRuntimeFenceCheckpoint: (@Sendable (String) async -> Void)?
+    #endif
+    private let launchAuthority: AgentRuntimeLaunchAuthority
+    /// R6: registered launches join the tab's retained runtime retirements before a start, and a
+    /// provider switch retires a registered controller instead of keeping it warm.
+    package nonisolated var joinsRetirementBeforeSuccessor: Bool {
+        launchAuthority.isRegistrationActive
+    }
+
     private var stdoutChannel: FileHandleChunkChannel?
     private var stderrChannel: FileHandleChunkChannel?
     private var stdoutConsumerTask: Task<Void, Never>?
@@ -334,6 +355,12 @@ package actor ACPAgentSessionController {
     private var suppressSessionLoadReplayUpdates = false
     private var fallbackResumeSessionIDForPromptClearing: String?
     private var autoApproveAllToolPermissions: Bool
+    /// R6: the session scope the launch request's owner captured (reservation, `session/new` or
+    /// `load`, and the launch's own first prompt). Later prompts carry their own request's scope;
+    /// nothing is re-read from a session at write time.
+    private let launchRuntimeSession: AgentRuntimeSessionScope
+    /// R6: the most recently requested session mode (launch request, then `setSessionMode`).
+    private var requestedSessionModeID: String?
     private var expectedMCPRunID: UUID?
     private var registeredExpectedAgentPID: pid_t?
     private let mcpHost: any AgentMCPHosting
@@ -350,8 +377,10 @@ package actor ACPAgentSessionController {
         dynamicModelPublicationPolicy: ACPDynamicModelPublicationPolicy = .standard,
         ohMyPiThinkingCapabilityPublisher: @escaping OhMyPiThinkingCapabilityPublisher = {
             _ = OhMyPiThinkingCapabilityRegistry.shared.record($0)
-        }
+        },
+        launchAuthority: AgentRuntimeLaunchAuthority = .production
     ) throws {
+        self.launchAuthority = launchAuthority
         try ACPConfigOptionAssignment.validate(
             runRequest.additionalConfigOptionValues,
             for: provider.providerID
@@ -372,6 +401,8 @@ package actor ACPAgentSessionController {
         self.sessionConfiguration = sessionConfiguration
         launchConfiguration = try provider.makeLaunchConfiguration(for: runRequest)
         autoApproveAllToolPermissions = runRequest.autoApproveAllToolPermissions
+        launchRuntimeSession = runRequest.runtimeSession
+        requestedSessionModeID = runRequest.sessionModeID
         mcpClientNameHint = runRequest.agentKind.mcpClientNameHint
         logPrefix = "[ACP][\(provider.providerID.rawValue)]"
         self.diagnosticSink = diagnosticSink
@@ -501,15 +532,39 @@ package actor ACPAgentSessionController {
         )
         logLaunchContract(command: resolvedCommand, workingDirectory: workingDirectory)
         diagnose(.info("Launching ACP command: \(launchDescription ?? resolvedCommand)"))
+        // R6: reservation immediately before the spawn (generic lifecycle only: no provider
+        // home, argument or writer-classification assumptions). A refusal spawns nothing.
+        let resumeSessionID = runRequest.resumeSessionID?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let launch = launchAuthority.makeLaunch(AgentRuntimeLaunchContext(
+            family: .acp,
+            provider: .acp(provider.providerID),
+            session: launchRuntimeSession,
+            worktreePath: runRequest.workspacePath,
+            conversationID: resumeSessionID?.isEmpty == false ? resumeSessionID : nil,
+            permission: runtimePermission
+        ))
+        let runtimeID: UUID?
+        do {
+            runtimeID = try await launch?.prepareSpawn()
+        } catch {
+            state = .failed
+            throw error
+        }
+        guard state == .launching else {
+            await launch?.spawnFailed()
+            throw ControllerError.invalidState(expected: "launching", actual: state)
+        }
         let spawned: SpawnedProcess
         do {
             spawned = try ProcessLauncher.spawn(
                 command: resolvedCommand,
                 arguments: launchConfiguration.arguments,
                 environment: environment,
-                workingDirectory: workingDirectory
+                workingDirectory: workingDirectory,
+                runtimeID: runtimeID
             )
         } catch {
+            await launch?.spawnFailed()
             await recordRunLaunchContract(
                 event: "acp_launch_spawn_failed",
                 resolvedCommand: resolvedCommand,
@@ -520,19 +575,38 @@ package actor ACPAgentSessionController {
             throw error
         }
         process = spawned
+        runtimeLaunch = launch
+        runtimeManagedTransport = launch != nil
+        runtimeCommittedLaunch = nil
         do {
             try startReaders(stdout: spawned.stdout, stderr: spawned.stderr)
+            // R6: the birth identity is committed before `initialize` (the first write).
+            try await launch?.commitSpawn(pid: spawned.pid, processGroupID: spawned.processGroupID)
+            guard process?.pid == spawned.pid, state == .launching, runtimeLaunch === launch else {
+                throw ControllerError.invalidState(expected: "launching", actual: state)
+            }
+            runtimeCommittedLaunch = launch
         } catch {
             spawned.stdout.readabilityHandler = nil
             spawned.stderr.readabilityHandler = nil
             spawned.stdin?.closeFile()
-            process = nil
-            _ = await ProcessTermination.terminateAndReap(pid: spawned.pid, processGroupID: spawned.processGroupID)
+            if process?.pid == spawned.pid {
+                process = nil
+                runtimeLaunch = nil
+            }
+            let reaped = await ProcessTermination.terminateAndReapReportingRoot(
+                pid: spawned.pid,
+                processGroupID: spawned.processGroupID
+            )
+            await launch?.rootReaped(pid: spawned.pid, confirmed: reaped.rootReaped)
             state = .failed
+            if error is AgentProcessRegistryError || error is ControllerError {
+                throw error
+            }
             throw ControllerError.protocolViolation("Failed to start ACP process readers: \(error.localizedDescription)")
         }
         await registerExpectedAgentPIDIfNeeded(spawned.pid)
-        startProcessWaitTask(for: spawned)
+        startProcessWaitTask(for: spawned, launch: launch)
         await recordRunLaunchContract(
             event: "acp_launch_contract_resolved",
             resolvedCommand: resolvedCommand,
@@ -598,6 +672,12 @@ package actor ACPAgentSessionController {
         log("Opening ACP session")
         logSessionMCPInjection()
         let openSessionResult = try await openSession()
+        // R6: the session is associated (two-writer check) before any prompt is written to it.
+        try await runtimeLaunch?.associate(
+            session: launchRuntimeSession,
+            conversationID: openSessionResult.sessionID,
+            permission: runtimePermission
+        )
         sessionID = openSessionResult.sessionID
         state = .sessionOpen
 
@@ -629,6 +709,20 @@ package actor ACPAgentSessionController {
     ) async throws {
         guard state == .sessionOpen || state == .promptRunning, let sessionID else {
             throw ControllerError.invalidState(expected: "sessionOpen or promptRunning", actual: state)
+        }
+        // R6 owner operation: a prompt on a reused transport carries the scope its own request's
+        // owner captured (the launch request's for the launch's own prompt), never a later one.
+        let promptRuntimeOwner = overrideRunRequest?.runtimeSession ?? launchRuntimeSession
+        var promptWriteOwner: AgentRuntimeLaunch?
+        if runtimeManagedTransport {
+            // R6 write fence before `session/prompt` (associates this attempt first); state is
+            // revalidated after the await and the captured launch at the final write.
+            promptWriteOwner = try await fenceRuntimeWrite(
+                association: .owner(promptRuntimeOwner, permission: runtimePermission)
+            )
+            guard state == .sessionOpen || state == .promptRunning, self.sessionID == sessionID else {
+                throw ControllerError.invalidState(expected: "sessionOpen or promptRunning", actual: state)
+            }
         }
         if state == .promptRunning, activePromptTurnID != nil {
             throw ControllerError.invalidState(expected: "no active prompt turn", actual: state)
@@ -665,6 +759,7 @@ package actor ACPAgentSessionController {
                     "sessionId": sessionID,
                     "prompt": promptBlocks
                 ],
+                fence: .alreadyFenced(promptWriteOwner),
                 onWritten: onSubmitted
             ).result
             #if DEBUG
@@ -1307,6 +1402,9 @@ package actor ACPAgentSessionController {
         if snapshot.currentValue == canonicalModeID {
             return
         }
+        // R6 owner operation: the requested mode is persisted by the request's fence, for the scope
+        // the change's owner captured, before the request is written.
+        requestedSessionModeID = canonicalModeID
 
         let response = try await sendRequestResponse(
             method: "session/set_config_option",
@@ -1314,7 +1412,8 @@ package actor ACPAgentSessionController {
                 "sessionId": sessionID,
                 "configId": snapshot.configID,
                 "value": canonicalModeID
-            ]
+            ],
+            fence: .associate(.owner(AgentRuntimeOperationOwner.current, permission: runtimePermission))
         )
         try await applyVerifiedConfigOptionsMutationResponse(
             response,
@@ -1368,13 +1467,24 @@ package actor ACPAgentSessionController {
             }
         }
 
+        let issuingLaunch = pending.issuingLaunch
         do {
+            // A reply to the agent's own request creates no ownership: authorize only, and only on
+            // the transport that issued the request.
+            let writeOwner = try await fenceRuntimeWrite(association: nil)
+            guard writeOwner === issuingLaunch else { throw ControllerError.processNotRunning }
             try sendJSONLine([
                 "jsonrpc": "2.0",
                 "id": pending.rpcID.jsonValue,
                 "result": result
-            ])
+            ], writeOwner: writeOwner)
         } catch {
+            // R6: the issuing transport was replaced (before or during the fence); the stale reply
+            // is dropped and never fails the replacement's session.
+            guard runtimeLaunch === issuingLaunch else {
+                log("Dropped ACP approval reply \(id): its issuing transport was replaced")
+                return
+            }
             let message = "Failed to submit ACP approval decision: \(error.localizedDescription)"
             emit(.stream(AIStreamResult(
                 type: "error",
@@ -1401,6 +1511,47 @@ package actor ACPAgentSessionController {
     #if DEBUG
         func debugPromptSettlementWaiterCount() -> Int {
             promptSettlementWaitersByTurnID.values.reduce(0) { $0 + $1.count }
+        }
+
+        /// Attaches a fixture transport (pipes, no subprocess) with an open session, so the
+        /// production write fences and final writer run without a spawn.
+        func debugAttachTestTransport(_ transport: SpawnedProcess, sessionID: String?) {
+            process = transport
+            self.sessionID = sessionID
+            state = .sessionOpen
+        }
+
+        /// Attaches a fixture runtime launch to the current transport, committed or not, as a
+        /// registered spawn would.
+        func debugInstallTestRuntimeLaunch(_ launch: AgentRuntimeLaunch, committed: Bool) {
+            runtimeLaunch = launch
+            runtimeManagedTransport = true
+            runtimeCommittedLaunch = committed ? launch : nil
+        }
+
+        func debugSetRuntimeFenceCheckpoint(_ checkpoint: (@Sendable (String) async -> Void)?) {
+            debugRuntimeFenceCheckpoint = checkpoint
+        }
+
+        /// The production inbound `session/request_permission` handler.
+        func debugHandlePermissionRequest(id: Int, params: [String: Any]) {
+            handlePermissionRequest(id: .int(id), params: params)
+        }
+
+        /// An owner request through the production request writer and its `.associate` fence (the
+        /// path `setSessionMode` uses), carrying the operation owner's scope and `permission`.
+        func debugSendOwnerRequest(
+            method: String,
+            params: [String: Any],
+            permission: AgentRuntimePermissionSnapshot,
+            timeoutSeconds: TimeInterval
+        ) async throws -> [String: Any] {
+            try await sendRequestResponse(
+                method: method,
+                params: params,
+                explicitTimeoutInterval: timeoutSeconds,
+                fence: .associate(.owner(AgentRuntimeOperationOwner.current, permission: permission))
+            ).result
         }
     #endif
 
@@ -1575,13 +1726,26 @@ package actor ACPAgentSessionController {
         stderrChannel?.finish()
         stdoutConsumerTask?.cancel()
         stderrConsumerTask?.cancel()
-        processWaitTask?.cancel()
+        let waitTask = processWaitTask
+        waitTask?.cancel()
 
+        let launch = runtimeLaunch
+        runtimeLaunch = nil
         if let process {
             process.stdout.readabilityHandler = nil
             process.stderr.readabilityHandler = nil
             process.stdin?.closeFile()
-            _ = await ProcessTermination.terminateAndReap(pid: process.pid, processGroupID: process.processGroupID)
+            let reaped = await ProcessTermination.terminateAndReapReportingRoot(
+                pid: process.pid,
+                processGroupID: process.processGroupID
+            )
+            await launch?.rootReaped(pid: process.pid, confirmed: reaped.rootReaped)
+        }
+        // R6: a registered launch's wait task owns a reap report too (it may be the waiter that
+        // actually reaped). Join it so a successor never reserves while this launch's reap report
+        // and post-reap discovery are still in flight. It is cancelled and its wait is bounded.
+        if launch != nil {
+            await waitTask?.value
         }
 
         await clearExpectedAgentPIDIfNeeded()
@@ -1650,14 +1814,17 @@ package actor ACPAgentSessionController {
         }
     }
 
-    private func startProcessWaitTask(for process: SpawnedProcess) {
+    private func startProcessWaitTask(for process: SpawnedProcess, launch: AgentRuntimeLaunch?) {
         processWaitTask = Task { [weak self] in
             guard let self else { return }
-            let result = try? await ProcessTermination.waitForTermination(
+            let result = try? await ProcessTermination.waitForTerminationReportingRoot(
                 pid: process.pid,
                 processGroupID: process.processGroupID,
                 timeout: nil
             )
+            // Captured launch event: the exact root this task waited on, whatever the controller
+            // holds now; confirmed only when this wait itself reaped it.
+            await launch?.rootReaped(pid: process.pid, confirmed: result?.rootReaped ?? false)
             await handleProcessExit(result?.exitCode ?? 0, timedOut: result?.timedOut ?? false)
         }
     }
@@ -1936,7 +2103,8 @@ package actor ACPAgentSessionController {
         pendingPermissionRequests[id.displayValue] = PendingPermissionRequest(
             rpcID: id,
             options: options,
-            request: request
+            request: request,
+            issuingLaunch: runtimeLaunch
         )
         emit(.approvalRequested(request))
     }
@@ -2101,6 +2269,7 @@ package actor ACPAgentSessionController {
             throw ControllerError.invalidState(expected: "sessionOpen or promptRunning", actual: state)
         }
         guard process != nil else { throw ControllerError.processNotRunning }
+        let writeOwner = try await fenceRuntimeWrite(association: nil)
 
         let requestID = JSONRPCID.int(nextRequestID)
         nextRequestID += 1
@@ -2122,7 +2291,7 @@ package actor ACPAgentSessionController {
                     "id": requestID.jsonValue,
                     "method": method,
                     "params": params
-                ])
+                ], writeOwner: writeOwner)
             } catch {
                 let pendingRequest = pendingRequests.removeValue(forKey: requestID.storageKey)
                 pendingRequest?.timeoutTask?.cancel()
@@ -2136,10 +2305,21 @@ package actor ACPAgentSessionController {
         return true
     }
 
+    /// How a request passes the R6 write fence.
+    private enum RuntimeRequestFence {
+        /// Creates no ownership (bootstrap, model/thinking options, extension calls): authorize.
+        case authorize
+        /// An owner write (a requested permission change): associate, then authorize.
+        case associate(RuntimeWriteAssociation)
+        /// The caller fenced with no suspension since (`session/prompt`) and captured this launch.
+        case alreadyFenced(AgentRuntimeLaunch?)
+    }
+
     private func sendRequestResponse(
         method: String,
         params: [String: Any],
         explicitTimeoutInterval: TimeInterval? = nil,
+        fence: RuntimeRequestFence = .authorize,
         onWritten: (@Sendable () -> Void)? = nil
     ) async throws -> RequestResponse {
         switch state {
@@ -2149,6 +2329,24 @@ package actor ACPAgentSessionController {
             break
         }
         guard process != nil else { throw ControllerError.processNotRunning }
+        let writeOwner: AgentRuntimeLaunch?
+        switch fence {
+        case let .alreadyFenced(launch):
+            writeOwner = launch
+        case .authorize, .associate:
+            let association: RuntimeWriteAssociation? = if case let .associate(association) = fence {
+                association
+            } else {
+                nil
+            }
+            writeOwner = try await fenceRuntimeWrite(association: association)
+            switch state {
+            case .closing, .closed, .failed:
+                throw ControllerError.transportClosed
+            default:
+                break
+            }
+        }
 
         let requestID = JSONRPCID.int(nextRequestID)
         nextRequestID += 1
@@ -2170,7 +2368,7 @@ package actor ACPAgentSessionController {
                     "id": requestID.jsonValue,
                     "method": method,
                     "params": params
-                ])
+                ], writeOwner: writeOwner)
                 onWritten?()
             } catch {
                 let pendingRequest = pendingRequests.removeValue(forKey: requestID.storageKey)
@@ -2180,9 +2378,62 @@ package actor ACPAgentSessionController {
         }
     }
 
-    private func sendJSONLine(_ payload: [String: Any]) throws {
+    /// An owner write's association: the scope its owner captured and the permission it requests.
+    private enum RuntimeWriteAssociation {
+        case owner(AgentRuntimeSessionScope, permission: AgentRuntimePermissionSnapshot)
+    }
+
+    /// R6 fence before an awaited outgoing write. The committed launch is captured before the first
+    /// suspension; an owner write (prompt, requested mode change) associates its owner-captured
+    /// session and run attempt, the open session and its permission first; every write then
+    /// authorizes on the open session, and the captured launch is rechecked after each suspension.
+    /// Callbacks and replies pass `nil` and never associate. Returns that launch: the final
+    /// synchronous `sendJSONLine` writes only while it still owns the transport, so a replacement
+    /// made during any await receives zero bytes. No-op (nil) while registration is off.
+    private func fenceRuntimeWrite(association: RuntimeWriteAssociation?) async throws -> AgentRuntimeLaunch? {
+        guard runtimeManagedTransport else { return nil }
+        guard let launch = runtimeLaunch, runtimeCommittedLaunch === launch else {
+            throw ControllerError.processNotRunning
+        }
+        let conversationID = sessionID
+        #if DEBUG
+            if let checkpoint = debugRuntimeFenceCheckpoint { await checkpoint("launchCaptured") }
+        #endif
+        if case let .owner(session, permission) = association {
+            try await launch.associate(session: session, conversationID: conversationID, permission: permission)
+            #if DEBUG
+                if let checkpoint = debugRuntimeFenceCheckpoint { await checkpoint("associated") }
+            #endif
+            guard process != nil, runtimeLaunch === launch, runtimeCommittedLaunch === launch else {
+                throw ControllerError.processNotRunning
+            }
+        }
+        try await launch.authorizeWrite(conversationID: conversationID)
+        #if DEBUG
+            if let checkpoint = debugRuntimeFenceCheckpoint { await checkpoint("authorized") }
+        #endif
+        guard process != nil, runtimeLaunch === launch, runtimeCommittedLaunch === launch else {
+            throw ControllerError.processNotRunning
+        }
+        return launch
+    }
+
+    /// `writeOwner`: the launch a preceding fence captured and authorized; the write goes only to
+    /// the transport that launch still owns.
+    private func sendJSONLine(_ payload: [String: Any], writeOwner: AgentRuntimeLaunch? = nil) throws {
         guard let stdinDescriptor = process?.stdinDescriptor else {
             throw ControllerError.processNotRunning
+        }
+        // R6 final synchronous check: a managed transport writes only while its committed launch
+        // still owns it (never before the birth commit, never after the launch was released), and
+        // a fenced write only while the launch its fence captured is that owner.
+        if runtimeManagedTransport || writeOwner != nil {
+            guard let launch = runtimeLaunch, runtimeCommittedLaunch === launch else {
+                throw ControllerError.processNotRunning
+            }
+            if let writeOwner, writeOwner !== launch {
+                throw ControllerError.processNotRunning
+            }
         }
         #if DEBUG
             captureRawACPEvent(kind: "jsonrpc.outbound", payload: payload)
@@ -2312,6 +2563,11 @@ package actor ACPAgentSessionController {
 
     // MARK: - Helpers
 
+    /// The currently requested permission configuration (session mode and auto-approve).
+    private var runtimePermission: AgentRuntimePermissionSnapshot {
+        .acp(sessionModeID: requestedSessionModeID, autoApproveAllToolPermissions: autoApproveAllToolPermissions)
+    }
+
     private func effectivePromptRunRequest(override: ACPRunRequest?) -> ACPRunRequest {
         let request = override ?? runRequest
         let resume = request.resumeSessionID?.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -2329,7 +2585,8 @@ package actor ACPAgentSessionController {
             attachments: request.attachments,
             taskLabelKind: request.taskLabelKind,
             sessionModeID: request.sessionModeID,
-            autoApproveAllToolPermissions: request.autoApproveAllToolPermissions
+            autoApproveAllToolPermissions: request.autoApproveAllToolPermissions,
+            runtimeSession: request.runtimeSession
         )
     }
 
@@ -2587,7 +2844,8 @@ package actor ACPAgentSessionController {
                 enableDebugLogging: launchConfiguration.enableDebugLogging
             )
         )
-        return result.environment
+        // Managed launch boundary: an inherited runtime marker never reaches the child.
+        return AgentRuntimeLaunchAuthority.strippingInheritedMarker(result.environment)
     }
 
     private func beginOpeningSessionConfiguration() {

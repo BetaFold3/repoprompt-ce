@@ -108,7 +108,8 @@ final class OhMyPiACPHeadlessAgentProvider: HeadlessAgentProvider {
             resumeSessionID: message.resumeSessionID,
             attachments: [],
             taskLabelKind: nil,
-            additionalConfigOptionValues: config.additionalConfigOptionValues
+            additionalConfigOptionValues: config.additionalConfigOptionValues,
+            runtimeSession: message.runtimeSession
         )
     }
 

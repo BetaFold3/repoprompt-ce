@@ -862,7 +862,8 @@ enum AgentRecoveryRecordCodec {
     }
 
     /// Reads one JSON object, tracking which members were consumed so the rest become extras.
-    private struct Reader {
+    /// Shared with the runtime-record codec (`AgentRuntimeRecordCodec`).
+    struct Reader {
         private let object: [String: AgentRecoveryJSONValue]
         private let path: String
         private var consumed: Set<String> = []

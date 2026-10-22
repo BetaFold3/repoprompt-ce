@@ -3385,6 +3385,170 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         }
     }
 
+    /// R6: a registered (joining) Codex controller replaced mid-session is retired, and its
+    /// successor neither starts nor reserves a thread until that exact predecessor's shutdown has
+    /// completed. The unregistered contrast row keeps the legacy unjoined replacement, proving the
+    /// held gate is what orders the registered row.
+    func testRegisteredCodexSuccessorStartsOnlyAfterItsRetiredPredecessorShutdownCompletes() async throws {
+        for joins in [true, false] {
+            let rowName = joins ? "registered controllers" : "contrast: unregistered controllers"
+            let recorder = LifecycleRecorder()
+            let predecessor = LifecycleNoopCodexController(recorder: recorder)
+            predecessor.joinsRetirementBeforeSuccessor = joins
+            predecessor.lifecycleLabel = "predecessor"
+            let shutdownGate = LifecycleAsyncGate()
+            predecessor.shutdownGate = shutdownGate
+            let successor = LifecycleNoopCodexController(recorder: recorder)
+            successor.joinsRetirementBeforeSuccessor = joins
+            successor.lifecycleLabel = "successor"
+            let sequence = LifecycleCodexControllerSequence([predecessor, successor])
+            let harness = makeHarness(recorder: recorder, codexControllerSequence: sequence)
+            let session = AgentTabSession(tabID: UUID())
+            session.selectedAgent = .codexExec
+
+            let firstOutcome = await harness.service.startRun(
+                tabID: session.tabID,
+                session: session,
+                initialUserMessage: "first",
+                initialMessageForRun: "first",
+                attachments: []
+            )
+            XCTAssertEqual(firstOutcome, .sent, rowName)
+            XCTAssertTrue(session.codexController === predecessor, rowName)
+            let firstOwnership = try XCTUnwrap(session.activeRunOwnership, rowName)
+            XCTAssertTrue(session.endRunAttempt(ifCurrent: firstOwnership, source: "test.firstFinished"), rowName)
+            session.runState = .completed
+
+            // A permission-profile change replaces the ready controller, retiring the predecessor.
+            session.permissionProfile = .mcpSafeDefaults
+            let successorRun = Task { @MainActor in
+                await harness.service.startRun(
+                    tabID: session.tabID,
+                    session: session,
+                    initialUserMessage: "second",
+                    initialMessageForRun: "second",
+                    attachments: []
+                )
+            }
+            await shutdownGate.waitUntilArrived()
+            try await waitUntil("\(rowName): successor controller handed out") { sequence.handedOut == 2 }
+
+            if joins {
+                // The predecessor's shutdown is held: the successor must still be waiting on it.
+                for _ in 0 ..< 20 {
+                    await Task.yield()
+                    try? await Task.sleep(nanoseconds: 2_000_000)
+                }
+                XCTAssertTrue(successor.startReferences.isEmpty, "\(rowName): successor started before its predecessor's cleanup")
+                XCTAssertFalse(recorder.contains("codex:start:successor"), rowName)
+                XCTAssertFalse(recorder.contains("codex:shutdown-complete:predecessor"), rowName)
+                XCTAssertTrue(successor.sentTexts.isEmpty, rowName)
+
+                await shutdownGate.release()
+                let successorOutcome = await successorRun.value
+                XCTAssertEqual(successorOutcome, .sent, rowName)
+                assertOrderedEvents(
+                    ["codex:start:predecessor", "codex:shutdown-complete:predecessor", "codex:start:successor"],
+                    in: recorder,
+                    row: rowName
+                )
+            } else {
+                // Legacy unjoined replacement: the successor starts and sends while the
+                // predecessor's shutdown is still held.
+                let successorOutcome = await successorRun.value
+                XCTAssertEqual(successorOutcome, .sent, rowName)
+                XCTAssertFalse(recorder.contains("codex:shutdown-complete:predecessor"), rowName)
+                await shutdownGate.release()
+                try await waitUntil("\(rowName): predecessor shutdown completes") {
+                    recorder.contains("codex:shutdown-complete:predecessor")
+                }
+            }
+            XCTAssertEqual(successor.startReferences.count, 1, rowName)
+            XCTAssertTrue(session.codexController === successor, rowName)
+            XCTAssertEqual(predecessor.sentTexts, ["first"], rowName)
+            XCTAssertEqual(successor.sentTexts, ["second"], rowName)
+            XCTAssertEqual(recorder.events.count(where: { $0 == "codex:start:predecessor" }), 1, rowName)
+            await harness.service.cancelRun(tabID: session.tabID, session: session, cause: .userCancel)
+        }
+    }
+
+    /// R6 across providers: a registered Codex controller retired by a provider switch to Claude is
+    /// joined by the tab's registered Claude start, which does not start until that exact Codex
+    /// shutdown completed. The unregistered contrast row starts while the shutdown is still held.
+    func testRegisteredClaudeStartJoinsACodexControllerRetiredByAProviderSwitch() async throws {
+        for joins in [true, false] {
+            let rowName = joins ? "registered controllers" : "contrast: unregistered controllers"
+            let recorder = LifecycleRecorder()
+            let codex = LifecycleNoopCodexController(recorder: recorder)
+            codex.joinsRetirementBeforeSuccessor = joins
+            codex.lifecycleLabel = "predecessor"
+            let shutdownGate = LifecycleAsyncGate()
+            codex.shutdownGate = shutdownGate
+            let claude = LifecycleFakeNativeController(recorder: recorder, joinsRetirementBeforeSuccessor: joins)
+            let harness = makeHarness(recorder: recorder, codexController: codex, claudeController: claude)
+            let session = AgentTabSession(tabID: UUID())
+            session.selectedAgent = .codexExec
+
+            let firstOutcome = await harness.service.startRun(
+                tabID: session.tabID,
+                session: session,
+                initialUserMessage: "first",
+                initialMessageForRun: "first",
+                attachments: []
+            )
+            XCTAssertEqual(firstOutcome, .sent, rowName)
+            XCTAssertTrue(session.codexController === codex, rowName)
+            let firstOwnership = try XCTUnwrap(session.activeRunOwnership, rowName)
+            XCTAssertTrue(session.endRunAttempt(ifCurrent: firstOwnership, source: "test.firstFinished"), rowName)
+            session.runState = .completed
+
+            // The provider switch (as the window's agent selection performs it) retires Codex.
+            session.selectedAgent = .claudeCode
+            harness.host.test_codexCoordinator.handleProviderSwitch(from: .codexExec, to: .claudeCode, session: session)
+            XCTAssertNil(session.codexController, rowName)
+            await shutdownGate.waitUntilArrived()
+            XCTAssertEqual(session.hasPendingRuntimeRetirements, joins, rowName)
+
+            // The Claude start proceeds asynchronously after `startRun` returns (its outcome is Codex's).
+            _ = await harness.service.startRun(
+                tabID: session.tabID,
+                session: session,
+                initialUserMessage: "second",
+                initialMessageForRun: "second",
+                attachments: []
+            )
+            try await waitUntil("\(rowName): Claude controller handed out") { recorder.contains("factory:claude") }
+            if joins {
+                for _ in 0 ..< 20 {
+                    await Task.yield()
+                    try? await Task.sleep(nanoseconds: 2_000_000)
+                }
+                XCTAssertFalse(recorder.contains("claude:start"), "\(rowName): Claude started before the Codex cleanup")
+                XCTAssertFalse(recorder.contains("codex:shutdown-complete:predecessor"), rowName)
+
+                await shutdownGate.release()
+                try await waitUntil("\(rowName): Claude sends after the joined cleanup") { recorder.contains("claude:send") }
+                assertOrderedEvents(
+                    ["codex:start:predecessor", "codex:shutdown-complete:predecessor", "claude:start", "claude:send"],
+                    in: recorder,
+                    row: rowName
+                )
+                XCTAssertFalse(session.hasPendingRuntimeRetirements, rowName)
+            } else {
+                // Legacy unjoined switch: Claude starts and sends while the Codex shutdown is held.
+                try await waitUntil("\(rowName): Claude sends while the Codex shutdown is held") { recorder.contains("claude:send") }
+                XCTAssertTrue(recorder.contains("claude:start"), rowName)
+                XCTAssertFalse(recorder.contains("codex:shutdown-complete:predecessor"), rowName)
+                await shutdownGate.release()
+                try await waitUntil("\(rowName): Codex shutdown completes") {
+                    recorder.contains("codex:shutdown-complete:predecessor")
+                }
+            }
+            XCTAssertEqual(codex.sentTexts, ["first"], rowName)
+            await harness.service.cancelRun(tabID: session.tabID, session: session, cause: .userCancel)
+        }
+    }
+
     func testCodexManagedAuthRecoveryDuringResumeHonorsStopAndDiscardsLateSuccess() async throws {
         enum StopPoint {
             case duringRefresh
@@ -8042,6 +8206,13 @@ final class LifecycleNoopCodexController: CodexSessionControlling {
     fileprivate var resumeDeliveryGate: LifecyclePublicationGate?
     /// Text of every `startUserTurn` / `steerUserTurn` dispatch, in order.
     private(set) var sentTexts: [String] = []
+    /// R6: whether the coordinator retains this controller's retirement and joins it before a
+    /// successor starts (the protocol default, false, keeps the unjoined replacement).
+    var joinsRetirementBeforeSuccessor = false
+    /// When set, `shutdown` arrives here and completes only after the gate is released.
+    var shutdownGate: LifecycleAsyncGate?
+    /// When set, thread establishment and shutdown completion are recorded under this label.
+    var lifecycleLabel: String?
 
     init(
         recorder: LifecycleRecorder,
@@ -8122,6 +8293,9 @@ final class LifecycleNoopCodexController: CodexSessionControlling {
         reasoningEffort: String?
     ) throws -> CodexNativeSessionController.SessionRef {
         startReferences.append(existing)
+        if let lifecycleLabel {
+            recorder.record("codex:start:\(lifecycleLabel)")
+        }
         if let existing,
            existing.conversationID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         {
@@ -8242,6 +8416,12 @@ final class LifecycleNoopCodexController: CodexSessionControlling {
 
     func shutdown() async {
         recorder.record("codex:shutdown")
+        if let shutdownGate {
+            await shutdownGate.arriveAndWait()
+        }
+        if let lifecycleLabel {
+            recorder.record("codex:shutdown-complete:\(lifecycleLabel)")
+        }
     }
 
     func respondToServerRequest(id: CodexAppServerRequestID, result: [String: Any]) async {}

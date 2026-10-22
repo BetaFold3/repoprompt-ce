@@ -4,7 +4,7 @@ Scope: read when the task touches the Phase 2 implementation of typed terminal c
 Authority: Reference
 Last-verified: 2026-10-21
 
-Worker evidence for the adopted Oracle plan (`prompt-exports/oracle-plan-2026-10-21-185049-restart-phase2-remai-ba7b.md`, main's override of its §4) on baseline `57e451205ecded20a42b3ce1b61834ebd514cbac` (R4). R4 architecture is preserved: sealed admission, per-VM preparation serialization, absolute deadline, question ownership, secret veto, receipts, crash holds, and the scheduler. Nothing is staged or committed. The initial implementation was reviewed and not approved; its fixes were re-reviewed in R1, and the R1 fixes were re-reviewed in R2 (the last normal round, now exhausted). The post-cap fixes below were not re-reviewed; main is asking the owner how to close the capped review. Main owns the review, signing, the original plan's status and Decisions, and `phase2-plan.md`. O3 live acceptance remains pending.
+Worker evidence for the adopted Oracle plan (`prompt-exports/oracle-plan-2026-10-21-185049-restart-phase2-remai-ba7b.md`, main's override of its §4) on baseline `57e451205ecded20a42b3ce1b61834ebd514cbac` (R4). R4 architecture is preserved: sealed admission, per-VM preparation serialization, absolute deadline, question ownership, secret veto, receipts, crash holds, and the scheduler. The implementation is committed as signed checkpoint `93af6fb55a9044c7d8134e9c6be41c792db497d8`. The initial reviews and both ordinary re-review rounds are complete. The final bounded fixes were validated and accepted by main without a further review after the owner question timed out. Historical findings and their later dispositions are retained below. Main owns the review, signing, the original plan's status and Decisions, and `phase2-plan.md`. O3 live acceptance remains pending.
 
 ## Initial independent reviews
 
@@ -12,11 +12,11 @@ Worker evidence for the adopted Oracle plan (`prompt-exports/oracle-plan-2026-10
 
 ## First re-review
 
-[OracleA R1](phase2-oraclea-r1.md) and [OracleB R1](phase2-oracleb-r1.md) reviewed snapshot `0cabecc5cb118849e687f097782d226109d6eb3f`; both identities were verified. Required hand-over preservation and durable tail-warning findings remain open; mid-turn steering requires verification and repair. The coupled worker is addressing these before the second and final ordinary re-review. No findings were downgraded by main.
+[OracleA R1](phase2-oraclea-r1.md) and [OracleB R1](phase2-oracleb-r1.md) reviewed snapshot `0cabecc5cb118849e687f097782d226109d6eb3f`; both identities were verified. At R1, hand-over preservation and durable tail-warning findings remained open, and mid-turn steering required verification and repair. The coupled worker subsequently fixed these before the second and final ordinary re-review. No findings were downgraded by main.
 
 ## Second re-review
 
-[OracleA R2](phase2-oraclea-r2.md) and [OracleB R2](phase2-oracleb-r2.md) reviewed snapshot `70ee3c8bdb05a833bb4fb826d72ae7c9616c3040`; identities were verified. Earlier required findings closed. OracleA found a new P1: unscoped interruption after finalization can cancel a replacement Codex turn. Main inspected and accepted it; the bounded fix and the cheap never-published-question hand-over fix are underway. The normal review limit is exhausted. Main asked the owner whether to validate/checkpoint without another review (recommended), authorize one extra paired round, or pause after fixing. No extra review is authorized by the earlier Phase 1b-only O7 decision. The owner question timed out after 301 seconds without an answer. Main proceeds on the reversible recommended assumption: fix, validate and checkpoint without another review, explicitly disclosing that the final fix is not re-reviewed. This is not an Owner Decision.
+[OracleA R2](phase2-oraclea-r2.md) and [OracleB R2](phase2-oracleb-r2.md) reviewed snapshot `70ee3c8bdb05a833bb4fb826d72ae7c9616c3040`; identities were verified. Earlier required findings closed. OracleA found a new P1: unscoped interruption after finalization can cancel a replacement Codex turn. Main inspected and accepted it; the bounded fix and the cheap never-published-question hand-over fix were subsequently implemented and validated as recorded in the post-cap section. The normal review limit is exhausted. Main asked the owner whether to validate/checkpoint without another review (recommended), authorize one extra paired round, or pause after fixing. No extra review is authorized by the earlier Phase 1b-only O7 decision. The owner question timed out after 301 seconds without an answer. Main proceeds on the reversible recommended assumption: fix, validate and checkpoint without another review, explicitly disclosing that the final fix is not re-reviewed. This is not an Owner Decision.
 
 ## Post-cap fix dispositions (after R2; worker evidence, not a review, not re-reviewed)
 
@@ -412,6 +412,10 @@ Final suites, run sequentially after build `2165a5f0`, all exit 0:
 | AgentUsageRuntimeIntegrationTests | f59253e0-55bd-4ebf-867c-bba9c47b5cd6 | 27 pass |
 
 `ClaudeNativeBackgroundTranscriptTests` is not a conductor filter (exit 64). Its tests run inside `AgentModeRunServiceLifecycleTests`.
+
+## Successful checkpoint
+
+The 2026-10-22 retry created signed commit `93af6fb55a9044c7d8134e9c6be41c792db497d8` (`Preserve recovery questions and report interrupted runs honestly`). Main checked the commit object's signature field and the empty index. The 80 intended paths were committed; only the original unrelated changes remained dirty. No unsigned fallback was used, and no source changed since the recorded tests.
 
 ## Signing retry authorization
 

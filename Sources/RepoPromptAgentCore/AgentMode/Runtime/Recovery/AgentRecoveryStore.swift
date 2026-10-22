@@ -331,8 +331,10 @@ package actor AgentRecoveryStore {
     package nonisolated let commitPublisher = AgentRecoveryCommitPublisher()
     /// Persistence-boundary fence of this launch's clean mark (spec R4).
     package nonisolated let cleanExitGate = AgentRecoveryCleanExitGate()
-    private let fileOperations: FileOperations
-    private let now: @Sendable () -> Date
+    /// Nonisolated and internal so the runtime-record extension (`AgentRecoveryStore+Runtimes.swift`)
+    /// shares them; both are immutable.
+    nonisolated let fileOperations: FileOperations
+    nonisolated let now: @Sendable () -> Date
 
     package init(
         rootURL: URL,

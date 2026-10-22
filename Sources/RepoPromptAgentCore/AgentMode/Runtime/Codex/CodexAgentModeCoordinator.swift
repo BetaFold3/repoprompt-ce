@@ -413,6 +413,8 @@ package final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObser
         let explicitThreadID: String?
         let source: String
         let controller: any CodexSessionControlling
+        /// R6: the rename request's owner-captured session scope (never re-read when it is sent).
+        let runtimeOwner: AgentRuntimeSessionScope
     }
 
     private struct PendingCodexTerminalSettle {
@@ -1661,7 +1663,10 @@ package final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObser
         }
         beginCodexCompaction(session)
         do {
-            try await controller.compactThread()
+            // R6 owner operation: the compaction's own run attempt, captured once it began.
+            try await session.withRuntimeOperation(processRunID: session.runID) {
+                try await controller.compactThread()
+            }
             return .succeeded("Requested Codex context compaction.")
         } catch {
             resetTrackedCodexTurns(session)
@@ -1720,6 +1725,25 @@ package final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObser
         }
 
         let action = Self.goalSlashAction(from: argumentsText)
+        do {
+            // R6 owner operation: the goal command's writes carry the scope captured here.
+            return try await session.withRuntimeOperation(processRunID: session.runID) {
+                try await executeGoalSlashAction(
+                    action,
+                    controller: controller,
+                    selectedWorkflow: selectedWorkflow
+                )
+            }
+        } catch {
+            return .failed("Codex goal command failed: \(error.localizedDescription)")
+        }
+    }
+
+    private func executeGoalSlashAction(
+        _ action: GoalSlashAction,
+        controller: any CodexSessionControlling,
+        selectedWorkflow: AgentWorkflowDefinition?
+    ) async throws -> NativeSlashCommandExecutionResult {
         do {
             switch action {
             case .show:
@@ -2895,13 +2919,16 @@ package final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObser
         }
         let usageDispatchTicket = session.registerCodexUsageDispatch(requestedModel: head.model)
         do {
-            _ = try await controller.startUserTurn(
-                text: head.providerText,
-                images: head.images,
-                model: head.model,
-                reasoningEffort: head.reasoningEffort,
-                serviceTier: head.serviceTier
-            )
+            // R6 owner operation: the fallback dispatch's own run attempt, captured now.
+            _ = try await session.withRuntimeOperation(processRunID: session.runID) {
+                try await controller.startUserTurn(
+                    text: head.providerText,
+                    images: head.images,
+                    model: head.model,
+                    reasoningEffort: head.reasoningEffort,
+                    serviceTier: head.serviceTier
+                )
+            }
             // Affirmative provider acceptance, captured before any reconciliation below.
             evidence.noteAccepted()
             session.acceptCodexUsageDispatch(usageDispatchTicket)
@@ -3484,7 +3511,7 @@ package final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObser
             stopCodexStallWatchdog(for: session.tabID)
             session.endCodexUsageExecution(reason: "agent-switched")
             if let controller = session.codexController {
-                Task { await controller.shutdown() }
+                retireCodexController(controller, session: session)
             }
             session.codexController = nil
             session.codexControllerPermissionProfile = nil
@@ -3523,6 +3550,42 @@ package final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObser
         // config overrides are rebuilt from current preferences. Active turns keep
         // their existing settings until the next turn starts.
         stopCodexToolTracking(for: session)
+    }
+
+    /// R6 owner operation: the start/resume (client launch, thread start or resume, memory mode)
+    /// carries the session scope captured here for `runID`, including its detached retries.
+    private func startCodexNativeSession(
+        session: AgentTabSession,
+        runID: UUID,
+        controller: (any CodexSessionControlling)?,
+        existingRef: CodexNativeSessionController.SessionRef?,
+        baseInstructions: String,
+        model: String?,
+        reasoningEffort: String?,
+        serviceTier: String?,
+        allowMissingRolloutFallback: Bool
+    ) async throws -> CodexNativeSessionStartResult {
+        if controller?.joinsRetirementBeforeSuccessor == true {
+            // R6: a retired registered runtime's cleanup (any provider on this tab) finishes before
+            // this start reserves; the start then proceeds only while it is still current and its
+            // slot holds it.
+            await session.joinRuntimeRetirements()
+            try Task.checkCancellation()
+            guard Self.codexControllerSlotHolds(controller, session: session) else {
+                throw CancellationError()
+            }
+        }
+        return try await session.withRuntimeOperation(processRunID: runID) {
+            try await startCodexNativeSession(
+                controller: controller,
+                existingRef: existingRef,
+                baseInstructions: baseInstructions,
+                model: model,
+                reasoningEffort: reasoningEffort,
+                serviceTier: serviceTier,
+                allowMissingRolloutFallback: allowMissingRolloutFallback
+            )
+        }
     }
 
     private func startCodexNativeSession(
@@ -3964,7 +4027,8 @@ package final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObser
             name: validatedName,
             explicitThreadID: explicitThreadID,
             source: source,
-            controller: controller
+            controller: controller,
+            runtimeOwner: session.runtimeSessionScope
         )
         guard codexThreadNameSyncTaskByTabID[tabID] == nil else { return }
         let generation = UUID()
@@ -4000,7 +4064,9 @@ package final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObser
             let resolvedThreadID = pending.explicitThreadID
                 ?? (sessionThreadID?.isEmpty == false ? sessionThreadID : nil)
             do {
-                try await pending.controller.setThreadName(pending.name, threadID: resolvedThreadID)
+                try await AgentRuntimeOperationOwner.$session.withValue(pending.runtimeOwner) {
+                    try await pending.controller.setThreadName(pending.name, threadID: resolvedThreadID)
+                }
             } catch is CancellationError {
                 return
             } catch {
@@ -4455,13 +4521,16 @@ package final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObser
         }
         let usageDispatchTicket = session.registerCodexUsageDispatch(requestedModel: replayTurn.model)
         do {
-            _ = try await controller.startUserTurn(
-                text: replayTurn.text,
-                images: replayTurn.images,
-                model: replayTurn.model,
-                reasoningEffort: replayTurn.reasoningEffort,
-                serviceTier: replayTurn.serviceTier
-            )
+            // R6 owner operation: the replayed turn belongs to `runID`, captured now.
+            _ = try await session.withRuntimeOperation(processRunID: runID) {
+                try await controller.startUserTurn(
+                    text: replayTurn.text,
+                    images: replayTurn.images,
+                    model: replayTurn.model,
+                    reasoningEffort: replayTurn.reasoningEffort,
+                    serviceTier: replayTurn.serviceTier
+                )
+            }
             session.acceptCodexUsageDispatch(usageDispatchTicket)
             await applySuccessfulCodexNativeSend(
                 for: session,
@@ -4571,11 +4640,22 @@ package final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObser
             session.runID = nil
         }
         if let controllerToShutdown {
-            Task {
-                await controllerToShutdown.shutdown()
-            }
+            retireCodexController(controllerToShutdown, session: session)
         }
         return true
+    }
+
+    /// Shuts a replaced controller down. A registered controller's shutdown is retained on the
+    /// tab's session so every registered successor start (of any provider) joins it before
+    /// reserving (R6); others keep the legacy unjoined shutdown.
+    private func retireCodexController(_ controller: any CodexSessionControlling, session: AgentTabSession) {
+        guard controller.joinsRetirementBeforeSuccessor else {
+            Task { await controller.shutdown() }
+            return
+        }
+        session.retainRuntimeRetirement {
+            await controller.shutdown()
+        }
     }
 
     private func scheduleCodexTransportClosedFallback(
@@ -4804,6 +4884,9 @@ package final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObser
                     currentTaskLabelKind,
                     wantsComputerUse
                 )
+                // R6: every client start and thread request carries the scope its owner operation
+                // captured (never a client-wide or controller-wide current session).
+                controller.useOwnerCapturedRuntimeSessions()
                 session.codexController = controller
                 session.codexControllerPermissionProfile = session.permissionProfile
                 session.codexControllerSessionProfile = session.profile
@@ -5024,6 +5107,8 @@ package final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObser
         )
         do {
             let startResult = try await startCodexNativeSession(
+                session: session,
+                runID: runID,
                 controller: startController,
                 existingRef: existingRef,
                 baseInstructions: basePrompt,
@@ -5125,6 +5210,8 @@ package final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObser
                     failedController = recoveredController
                     do {
                         let recoveredStartResult = try await startCodexNativeSession(
+                            session: session,
+                            runID: runID,
                             controller: recoveredController,
                             existingRef: existingRef,
                             baseInstructions: basePrompt,
@@ -5559,6 +5646,9 @@ package final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObser
         // Only `turn/start` dispatches register accounting work; `turn/steer` joins the already
         // dispatched turn and never produces a second `turn/started`, so it registers nothing.
         var usageDispatchTicket: CodexDispatchTicket?
+        // R6 owner capture: this send's turn start or steer (and its one retry) carry the session
+        // scope of the run attempt it dispatches into, captured now, never re-read at write time.
+        let sendRuntimeOwner = session.runtimeSessionScope
         do {
             setRunningStatus("Sending message…", source: .transport, session: session, urgent: true)
             switch dispatchPlan {
@@ -5566,24 +5656,28 @@ package final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObser
                 beginTrackedCodexUserTurn(session)
                 logCodex("[AgentModeVM] sendCodexNativeMessage: calling controller.startUserTurn")
                 usageDispatchTicket = session.registerCodexUsageDispatch(requestedModel: selection.model)
-                _ = try await controller.startUserTurn(
-                    text: text,
-                    images: attachments,
-                    model: selection.model,
-                    reasoningEffort: selection.reasoningEffort,
-                    serviceTier: selection.serviceTier
-                )
+                _ = try await AgentRuntimeOperationOwner.$session.withValue(sendRuntimeOwner) {
+                    try await controller.startUserTurn(
+                        text: text,
+                        images: attachments,
+                        model: selection.model,
+                        reasoningEffort: selection.reasoningEffort,
+                        serviceTier: selection.serviceTier
+                    )
+                }
                 // Affirmative provider acceptance, captured before any reconciliation.
                 dispatchEvidence.noteAccepted()
                 session.acceptCodexUsageDispatch(usageDispatchTicket)
             case let .steer(identity):
                 logCodex("[AgentModeVM] sendCodexNativeMessage: calling controller.steerUserTurn expectedTurnID=\(identity.turnID)")
                 do {
-                    let receipt = try await controller.steerUserTurn(
-                        text: text,
-                        images: attachments,
-                        expectedTurnID: identity.turnID
-                    )
+                    let receipt = try await AgentRuntimeOperationOwner.$session.withValue(sendRuntimeOwner) {
+                        try await controller.steerUserTurn(
+                            text: text,
+                            images: attachments,
+                            expectedTurnID: identity.turnID
+                        )
+                    }
                     // Affirmative provider acceptance, captured before reconciliation.
                     dispatchEvidence.noteAccepted()
                     if receipt.acceptedTurnID != identity.turnID {
@@ -5614,11 +5708,13 @@ package final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObser
                     session.codexPendingSteerLifecycleReconciliation = reconciliation
                     let retryReceipt: CodexTurnSteerReceipt
                     do {
-                        retryReceipt = try await controller.steerUserTurn(
-                            text: text,
-                            images: attachments,
-                            expectedTurnID: actualTurnID
-                        )
+                        retryReceipt = try await AgentRuntimeOperationOwner.$session.withValue(sendRuntimeOwner) {
+                            try await controller.steerUserTurn(
+                                text: text,
+                                images: attachments,
+                                expectedTurnID: actualTurnID
+                            )
+                        }
                     } catch {
                         if session.codexPendingSteerLifecycleReconciliation == reconciliation {
                             session.codexPendingSteerLifecycleReconciliation = nil
@@ -7399,7 +7495,12 @@ package final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObser
             // Codex expects the literal option label (e.g. "Allow"), not a generic "accept" decision.
             if Self.shouldAutoApproveCodexMCPToolRequest(request) {
                 let response = Self.buildAutoApprovalResponse(for: request)
-                submitUserInputResponse(session: session, requestID: request.requestID, response: response)
+                submitUserInputResponse(
+                    session: session,
+                    requestID: request.requestID,
+                    receipt: request.codexReceipt,
+                    response: response
+                )
                 return
             }
             func isDuplicate() -> Bool {
@@ -9757,8 +9858,9 @@ package final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObser
         guard case let .codex(requestID) = request.requestID else {
             return
         }
+        let receipt = request.codexReceipt
         Task { [controller] in
-            await controller.respondToServerRequest(id: requestID, result: result)
+            await controller.respondToServerRequest(receipt: receipt, id: requestID, result: result)
         }
     }
 
@@ -9780,7 +9882,7 @@ package final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObser
         viewModel?.recordMCPInteractionResolution(for: session, interactionID: request.id)
         let authoritativeTurnID = session.codexAuthoritativeActiveTurn?.turnID
         Task { [controller] in
-            await controller.respondToServerRequest(id: request.requestID, result: result)
+            await controller.respondToServerRequest(receipt: request.codexReceipt, id: request.requestID, result: result)
             if case .cancel = decision, let authoritativeTurnID {
                 _ = try? await controller.interruptUserTurn(expectedTurnID: authoritativeTurnID)
             } else if case .cancel = decision {
@@ -9810,7 +9912,11 @@ package final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObser
         viewModel?.recordMCPInteractionResolution(for: session, interactionID: request.id)
         let authoritativeTurnID = session.codexAuthoritativeActiveTurn?.turnID
         Task { [controller] in
-            await controller.respondToServerRequest(id: request.requestID, result: response.jsonObject)
+            await controller.respondToServerRequest(
+                receipt: request.codexReceipt,
+                id: request.requestID,
+                result: response.jsonObject
+            )
             if response.action == .cancel, let authoritativeTurnID {
                 _ = try? await controller.interruptUserTurn(expectedTurnID: authoritativeTurnID)
             } else if response.action == .cancel {
@@ -9819,16 +9925,18 @@ package final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObser
         }
     }
 
+    /// `receipt`: the issuing transport's receipt for `requestID` (R6); the reply routes by it.
     package func submitUserInputResponse(
         session: AgentTabSession,
         requestID: CodexAppServerRequestID,
+        receipt: CodexServerRequestReceipt? = nil,
         response: AgentRequestUserInputResponse
     ) {
         guard let controller = session.codexController else {
             return
         }
         Task { [controller] in
-            await controller.respondToServerRequest(id: requestID, result: response.jsonObject)
+            await controller.respondToServerRequest(receipt: receipt, id: requestID, result: response.jsonObject)
         }
     }
 
@@ -9945,7 +10053,7 @@ package final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObser
         stopBashLivenessTask(for: session.tabID)
         session.endCodexUsageExecution(reason: "controller-reset")
         if let controller = session.codexController {
-            Task { await controller.shutdown() }
+            retireCodexController(controller, session: session)
         }
         session.codexController = nil
         session.codexControllerPermissionProfile = nil

@@ -44,7 +44,10 @@ extension AgentModeViewModel {
             // with the scheduled-send surfaces: a schedule awaiting confirmation is already presented
             // by the session's own scheduled-send banner, and an unchecked index is listed in Needs
             // Attention.
-            let bannerItems = catalog.bannerItems(sessionID: sessionID, workspaceID: workspaceID, tabID: activeSession?.tabID)
+            // R6: a runtime blocking this session's sends (or the global ownership warning) is
+            // app-scoped in the catalog; the banner shows it for the session it pauses.
+            let runtimeItems = recoveryListRuntimeBannerItems(catalog: catalog, coordinator: coordinator, sessionID: sessionID)
+            let bannerItems = runtimeItems + catalog.bannerItems(sessionID: sessionID, workspaceID: workspaceID, tabID: activeSession?.tabID)
                 .filter { !Self.isScheduleDomainItem($0) }
             rows += bannerItems.map { recoveryListRow(for: $0, coordinator: coordinator, activeSession: activeSession) }
             let shownIDs = Set(bannerItems.map(\.id))
@@ -93,6 +96,19 @@ extension AgentModeViewModel {
         guard recoveryNeedsAttentionRequestPending else { return false }
         recoveryNeedsAttentionRequestPending = false
         return true
+    }
+
+    /// The global runtime-ownership warning, or the runtime pausing sends to `sessionID`.
+    private func recoveryListRuntimeBannerItems(
+        catalog: AgentRecoveryCatalog,
+        coordinator: AgentRecoveryCoordinator,
+        sessionID: UUID?
+    ) -> [AgentRecoveryCatalogItem] {
+        if coordinator.runtimeRestrictions.hasGlobalUncertainty {
+            return catalog.item(id: AgentRecoveryCatalogProjection.runtimeOwnershipUnknownItemID).map { [$0] } ?? []
+        }
+        guard let sessionID, let restriction = coordinator.runtimeSendRestriction(sessionID: sessionID) else { return [] }
+        return catalog.item(id: AgentRecoveryCatalogProjection.runtimeItemID(runtimeID: restriction.runtimeID)).map { [$0] } ?? []
     }
 
     /// Schedule-domain items are presented by the scheduled-send surfaces and Needs Attention, never
@@ -336,6 +352,23 @@ extension AgentModeViewModel {
                 "Scheduled messages couldn't be checked",
                 "\(workspaceName) has saved sessions but no readable session list, so a scheduled message waiting for confirmation there may be missing here. Open that workspace to review its scheduled messages; nothing is sent automatically."
             )
+        case let .runtimeOwnershipUnknown(count, failure):
+            let cause = if let failure {
+                "The saved records of agent processes couldn't be read (\(failure))."
+            } else if count == 1 {
+                "A saved record of an agent process couldn't be read."
+            } else {
+                "\(count) saved records of agent processes couldn't be read."
+            }
+            return row(
+                "Agent processes couldn't be checked",
+                "\(cause) RepoPrompt can't tell which conversations they may still be writing, so sending and scheduled work stay paused. Nothing is stopped automatically.",
+                actions: [.refreshProcesses]
+            )
+        case let .survivingRuntime(restriction):
+            let (title, detail) = Self.recoveryListRuntimeText(restriction)
+            let canLetFinish = !restriction.letFinish && restriction.revision != nil && !restriction.isUnreadable
+            return row(title, detail, actions: [.refreshProcesses] + (canLetFinish ? [.letProcessFinish] : []))
         case let .scheduleNeedsConfirmation(summary):
             let reason = switch summary.reason {
             case .missedWhileClosed?: "Its time passed while RepoPrompt was closed."
@@ -594,9 +627,81 @@ extension AgentModeViewModel {
             await retryRecoveryListSave(rowID: rowID)
         case .cancelSchedule:
             await cancelRecoveryScheduleTransfer(rowID: rowID)
+        case .refreshProcesses:
+            await refreshRecoveryRuntimes()
+        case .letProcessFinish:
+            await letRecoveryRuntimeFinish(rowID: rowID)
         }
         coordinator.setCatalogActionState(failure.map { .failed($0) }, for: rowID)
         refreshRecoveryListUI()
+    }
+
+    /// Refresh: one fresh discovery of every unresolved runtime. It never signals anything.
+    private func refreshRecoveryRuntimes() async -> String? {
+        await recoveryCoordinator?.refreshRuntimeOwnership()
+        return nil
+    }
+
+    /// Let finish of exactly the displayed runtime revision (it stays restricted until it exits).
+    private func letRecoveryRuntimeFinish(rowID: String) async -> String? {
+        guard let coordinator = recoveryCoordinator else { return nil }
+        guard let item = coordinator.catalog.item(id: rowID),
+              case let .survivingRuntime(restriction) = item.payload,
+              let revision = restriction.revision
+        else { return "This process changed. Review it again." }
+        return await coordinator.letRuntimeFinish(runtimeID: restriction.runtimeID, expectedRevision: revision)
+    }
+
+    /// Title and detail of a surviving-runtime row: provider, state, conversation, worktree and
+    /// discovered processes. Stop is not offered (recovered Stop is disabled in production).
+    static func recoveryListRuntimeText(_ restriction: AgentRuntimeRestriction) -> (String, String) {
+        let provider = restriction.family.map(recoveryListRuntimeFamilyName) ?? "An agent"
+        let title: String = switch restriction.kind {
+        case .toolsOnly:
+            "Tools started by an agent are still running"
+        case .possibleWriter where restriction.isUnreadable:
+            "Agent process status unknown"
+        case .possibleWriter:
+            restriction.state == .unknown ? "An agent process may still be running" : "An agent process is still running"
+        }
+        var parts: [String] = []
+        let origin = restriction.isPreviousInstance ? "from an earlier launch of RepoPrompt" : "started by this launch"
+        if restriction.isUnreadable {
+            parts.append("Its saved record couldn't be read, so its processes can't be checked.")
+        } else {
+            let processes = restriction.memberCount == 1 ? "1 process" : "\(restriction.memberCount) processes"
+            parts.append("\(provider) \(origin) (\(processes) found\(restriction.rootPID.map { ", started as PID \($0)" } ?? "")).")
+        }
+        if let worktree = restriction.worktreePaths.first {
+            parts.append("Worktree: \(worktree).")
+        }
+        if let conversation = restriction.conversationIDs.first {
+            parts.append("Conversation: \(conversation).")
+        }
+        switch restriction.kind {
+        case .toolsOnly:
+            parts.append("It no longer writes the conversation, but scheduled work in this worktree stays paused until its tools exit.")
+        case .possibleWriter where restriction.conversationIDs.isEmpty:
+            parts.append("Sending in this worktree stays paused until it exits.")
+        case .possibleWriter:
+            parts.append("Sending to that conversation stays paused until it exits.")
+        }
+        if restriction.letFinish {
+            parts.append("You chose to let it finish; RepoPrompt keeps watching it.")
+        }
+        parts.append("Nothing is stopped automatically.")
+        return (title, parts.joined(separator: " "))
+    }
+
+    private static func recoveryListRuntimeFamilyName(_ family: AgentRuntimeFamily) -> String {
+        switch family {
+        case .claudeNative: "Claude"
+        case .claudeCompatible: "A Claude-compatible agent"
+        case .claudeHeadless: "Claude (headless)"
+        case .codexAppServer: "Codex"
+        case .codexExec: "Codex (exec)"
+        case .acp: "An ACP agent"
+        }
     }
 
     /// Dismiss: durably acknowledges exactly the displayed item in its displayed state. Nothing else

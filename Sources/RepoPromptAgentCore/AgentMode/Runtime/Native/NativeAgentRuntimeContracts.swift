@@ -45,6 +45,9 @@ package protocol NativeAgentRuntimeControlling: Actor {
     /// shutdown it was asked for): the run's terminal cause is provider-process loss (review A F06).
     /// Answers once per turn. Runtimes without that evidence answer `false`.
     func turnEndedByProcessLoss(_ turnID: UUID) async -> Bool
+    /// R6: whether this runtime's launches are registered. A registered start joins the tab's
+    /// retained runtime retirements (any provider) before it reserves. Others never join.
+    nonisolated var joinsRetirementBeforeSuccessor: Bool { get }
 }
 
 extension NativeAgentRuntimeControlling {
@@ -66,6 +69,10 @@ extension NativeAgentRuntimeControlling {
     }
 
     func turnEndedByProcessLoss(_: UUID) async -> Bool {
+        false
+    }
+
+    nonisolated var joinsRetirementBeforeSuccessor: Bool {
         false
     }
 }

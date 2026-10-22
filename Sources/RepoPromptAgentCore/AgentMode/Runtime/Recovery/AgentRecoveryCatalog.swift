@@ -19,6 +19,8 @@ package enum AgentRecoveryCatalogItemKind: String, CaseIterable {
     case heldScheduleTransfer
     case statusUnknown
     case saveFailure
+    /// Spec R6: an agent process family that may still be running (or whose ownership is unknown).
+    case survivingProcess
 }
 
 /// Shared progress or failure of one item's action (the same on every surface).
@@ -90,6 +92,12 @@ package enum AgentRecoveryCatalogPayload: Equatable {
     /// A workspace holds session files but no current metadata index, so schedules awaiting
     /// confirmation there could not be checked (index-only discovery never rebuilds it).
     case scheduleIndexUnavailable(workspaceName: String)
+    /// Spec R6: a runtime that may still hold a conversation or worktree (Refresh, Let finish;
+    /// recovered Stop is not offered). Never dismissible: it clears when discovery proves exit.
+    case survivingRuntime(AgentRuntimeRestriction)
+    /// Spec R6 global warning: runtime records whose bindings are unknown, or an unreadable runtime
+    /// directory. Ownership-dependent work stays paused everywhere until Refresh can check them.
+    case runtimeOwnershipUnknown(unidentifiedRecordCount: Int, failure: String?)
 }
 
 /// The latest index-only read of schedules awaiting confirmation, across every known workspace.
@@ -183,8 +191,17 @@ package enum AgentRecoveryCatalogProjection {
         builder.addOwnerlessInput()
         builder.addSchedules(schedules)
         builder.addUnavailableScheduleIndexes(unavailableScheduleIndexes)
+        builder.addRuntimeRestrictions()
         return AgentRecoveryCatalog(generation: generation, items: builder.items, blockers: builder.blockers)
     }
+
+    /// Row identity of a surviving runtime.
+    package static func runtimeItemID(runtimeID: UUID) -> String {
+        "runtime-\(runtimeID.uuidString)"
+    }
+
+    /// Row identity of the global runtime-ownership warning.
+    package static let runtimeOwnershipUnknownItemID = "runtime-ownership-unknown"
 
     /// Row identity of a tab's failed composer preparation.
     package static func preparationItemID(tabID: UUID) -> String {
@@ -776,6 +793,38 @@ package enum AgentRecoveryCatalogProjection {
                             AgentRecoveryCatalogProjection.scheduleFreshness(summary)
                         )
                     }
+                )
+            }
+        }
+
+        /// Spec R6: one item per restricting runtime, plus one global warning for unknown bindings.
+        /// App-scoped (no session or workspace): the banner adds a session's blocking runtime itself.
+        mutating func addRuntimeRestrictions() {
+            guard coordinator.hasProcessRegistry else { return }
+            let snapshot = coordinator.runtimeRestrictions
+            if snapshot.hasGlobalUncertainty {
+                append(
+                    AgentRecoveryCatalogProjection.runtimeOwnershipUnknownItemID,
+                    kind: .survivingProcess,
+                    sessionID: nil,
+                    workspaceID: nil,
+                    sessionName: nil,
+                    composeTabID: nil,
+                    payload: .runtimeOwnershipUnknown(
+                        unidentifiedRecordCount: snapshot.unidentifiedRecordCount,
+                        failure: snapshot.storageFailure
+                    )
+                )
+            }
+            for restriction in snapshot.restrictions {
+                append(
+                    AgentRecoveryCatalogProjection.runtimeItemID(runtimeID: restriction.runtimeID),
+                    kind: .survivingProcess,
+                    sessionID: nil,
+                    workspaceID: nil,
+                    sessionName: nil,
+                    composeTabID: nil,
+                    payload: .survivingRuntime(restriction)
                 )
             }
         }

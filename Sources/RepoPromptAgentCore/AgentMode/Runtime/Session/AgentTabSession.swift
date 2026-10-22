@@ -816,6 +816,38 @@ package final class AgentTabSession: ObservableObject {
     /// recovery is composed. Installed and replaced only through `AgentRecoveryCoordinator.claimLane`.
     package var recoveryLane: AgentRecoverySessionLane?
 
+    /// The managed session context of this tab's provider work right now: the live lane's durable
+    /// lifecycle binding plus the current run attempt and process run when they exist. `unavailable`
+    /// (never a fabricated or sessionless identity) when no live recovery lane binds the session.
+    package var runtimeSessionScope: AgentRuntimeSessionScope {
+        runtimeSessionScope(processRunID: runID)
+    }
+
+    /// `runtimeSessionScope` for a process run the caller already holds (headless runs pass theirs).
+    package func runtimeSessionScope(processRunID: UUID?) -> AgentRuntimeSessionScope {
+        guard let lane = recoveryLane, !lane.isRetired else { return .unavailable }
+        return .session(AgentRuntimeSessionAssociation(
+            lifecycle: lane.binding,
+            runAttemptID: activeRunAttemptID,
+            processRunID: processRunID
+        ))
+    }
+
+    /// Runs `operation` as an owner operation of this session (R6): captures this session's scope
+    /// for `processRunID` now, synchronously, and binds it immutably for the operation's whole task
+    /// tree (`AgentRuntimeOperationOwner`). Writes the operation makes later, including from its
+    /// child tasks and late callbacks, carry this captured run attempt, never the one current when
+    /// they write.
+    package func withRuntimeOperation<T>(
+        processRunID: UUID?,
+        _ operation: () async throws -> T
+    ) async rethrows -> T {
+        try await AgentRuntimeOperationOwner.$session.withValue(
+            runtimeSessionScope(processRunID: processRunID),
+            operation: operation
+        )
+    }
+
     /// Composite composer observation (text, images, tagged files, workflow, interview choice).
     /// Called synchronously after each composer mutation while installed and not suppressed.
     package var recoveryComposerObserver: (@MainActor (AgentTabSession) -> Void)?
@@ -1432,7 +1464,34 @@ package final class AgentTabSession: ObservableObject {
         usageAccounting?.endCodexExecution(executionID: codexControllerGeneration)
     }
 
+    /// R6: runs a retired controller's cleanup, retained until it completes so registered
+    /// successor starts on this tab can join it (`joinRuntimeRetirements`).
+    package func retainRuntimeRetirement(_ cleanup: @escaping @MainActor () async -> Void) {
+        let token = UUID()
+        let task = Task { @MainActor [weak self] in
+            await cleanup()
+            self?.runtimeRetirements[token] = nil
+        }
+        runtimeRetirements[token] = task
+    }
+
+    /// R6: waits for every retained retirement on this tab, including ones retained while joining.
+    package func joinRuntimeRetirements() async {
+        while let entry = runtimeRetirements.first {
+            await entry.value.value
+            runtimeRetirements[entry.key] = nil
+        }
+    }
+
+    package var hasPendingRuntimeRetirements: Bool {
+        !runtimeRetirements.isEmpty
+    }
+
     package var acpController: ACPAgentSessionController?
+    /// R6: cleanup of this tab's retired runtime controllers (any provider: replacement, reconnect
+    /// or provider switch), keyed by retirement token. Every registered successor start joins it
+    /// before reserving, so a session never races its own predecessor's still-active runtime.
+    private var runtimeRetirements: [UUID: Task<Void, Never>] = [:]
     package var codexEventTask: Task<Void, Never>?
     package var codexEventTaskRunID: UUID?
     package var codexLastEventAt: Date?

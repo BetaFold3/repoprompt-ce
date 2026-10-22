@@ -135,7 +135,12 @@ final class ACPHeadlessAgentProviderBridge: HeadlessAgentProvider {
             do {
                 _ = try await controller.bootstrap()
                 try await Self.performPromptAfterBarrier(
-                    beforePrompt: { try await beforePrompt(controller, request, runID) },
+                    // R6: pre-prompt owner writes (requested mode) carry the request's captured scope.
+                    beforePrompt: {
+                        try await AgentRuntimeOperationOwner.$session.withValue(request.runtimeSession) {
+                            try await beforePrompt(controller, request, runID)
+                        }
+                    },
                     sendPrompt: { try await controller.prompt(message, request: request) }
                 )
                 await controller.shutdown()

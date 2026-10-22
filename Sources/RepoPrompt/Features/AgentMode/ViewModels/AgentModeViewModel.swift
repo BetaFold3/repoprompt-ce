@@ -321,6 +321,7 @@ final class AgentModeViewModel: ObservableObject {
                         from: previousAgent,
                         to: selectedAgent
                     )
+                    retireRegisteredACPControllerOnProviderSwitch(session, from: previousAgent, to: selectedAgent)
                 }
                 session.selectedAgent = selectedAgent
                 if !isModelRawValid(selectedModelRaw, for: selectedAgent) {
@@ -8465,6 +8466,28 @@ final class AgentModeViewModel: ObservableObject {
         }
     }
 
+    /// R6: a registered ACP controller kept warm across a provider switch would keep its session
+    /// owned against the next provider's launch. It is retired on the switch, and its cleanup is
+    /// retained for registered successor starts to join. Unregistered controllers keep the
+    /// existing warm retention.
+    private func retireRegisteredACPControllerOnProviderSwitch(
+        _ session: AgentTabSession,
+        from previousAgent: AgentProviderKind,
+        to nextAgent: AgentProviderKind
+    ) {
+        guard previousAgent != nextAgent,
+              previousAgent.acpProviderID != nil,
+              let controller = session.acpController,
+              controller.joinsRetirementBeforeSuccessor
+        else { return }
+        session.acpController = nil
+        AgentModeProcessRunIdentity.clearProcessRunID(for: session)
+        session.retainRuntimeRetirement {
+            await controller.cancelPrompt()
+            await controller.shutdown()
+        }
+    }
+
     private func invalidateProviderContextForExecutionLocationChange(_ session: AgentTabSession) async {
         await session.disposeProviderIfPresent()
         if let controller = session.acpController {
@@ -8816,6 +8839,7 @@ final class AgentModeViewModel: ObservableObject {
                 from: previousAgent,
                 to: normalized.agent
             )
+            retireRegisteredACPControllerOnProviderSwitch(session, from: previousAgent, to: normalized.agent)
         }
 
         session.selectedAgent = normalized.agent
@@ -18944,7 +18968,11 @@ final class AgentModeViewModel: ObservableObject {
             sessionProfile: session.profile,
             delegationAudience: mcpDelegationRunToolPolicy(for: session).promptAudience
         )
-        return AgentMessage(systemPrompt: systemPrompt, userMessage: fullMessage, resumeSessionID: resumeSessionID)
+        var message = AgentMessage(systemPrompt: systemPrompt, userMessage: fullMessage, resumeSessionID: resumeSessionID)
+        // R6: a managed headless launch for this run carries the session's lifecycle, run attempt
+        // and this process run (`unavailable` without a live recovery lane; never fabricated).
+        message.runtimeSession = session.runtimeSessionScope(processRunID: runID)
+        return message
     }
 
     private static let claudeReasoningStatusBufferCharacterLimit = 4000
@@ -21079,7 +21107,12 @@ final class AgentModeViewModel: ObservableObject {
         response: AgentRequestUserInputResponse
     ) {
         let tabID = session.tabID
-        codexCoordinator.submitUserInputResponse(session: session, requestID: request.requestID, response: response)
+        codexCoordinator.submitUserInputResponse(
+            session: session,
+            requestID: request.requestID,
+            receipt: request.codexReceipt,
+            response: response
+        )
         session.pendingUserInputRequest = nil
         if !session.queuedUserInputRequests.isEmpty {
             session.pendingUserInputRequest = session.queuedUserInputRequests.removeFirst()

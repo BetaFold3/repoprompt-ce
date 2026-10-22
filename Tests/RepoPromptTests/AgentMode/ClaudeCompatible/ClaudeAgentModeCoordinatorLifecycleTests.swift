@@ -2726,6 +2726,8 @@ actor LifecycleFakeNativeController: NativeAgentRuntimeControlling {
     private var maxConcurrentStartInvocationCount = 0
     private var pendingTurnCompletionID: UUID?
     private var pendingTurnCompletionWaiters: [CheckedContinuation<UUID, Never>] = []
+    /// R6: a registered fake joins the tab's retained runtime retirements before it starts.
+    nonisolated let joinsRetirementBeforeSuccessor: Bool
 
     init(
         recorder: LifecycleRecorder,
@@ -2748,9 +2750,11 @@ actor LifecycleFakeNativeController: NativeAgentRuntimeControlling {
         rejectsEffortApplicationWhileTurnInFlight: Bool = false,
         applyGate: LifecycleAsyncGate? = nil,
         sessionID: String = "lifecycle-claude-session",
-        promptCacheRetention: AgentMCPWaitPolicy.ParentPromptCacheRetention = .standard
+        promptCacheRetention: AgentMCPWaitPolicy.ParentPromptCacheRetention = .standard,
+        joinsRetirementBeforeSuccessor: Bool = false
     ) {
         self.recorder = recorder
+        self.joinsRetirementBeforeSuccessor = joinsRetirementBeforeSuccessor
         self.label = label
         activeSession = hasActiveSession
         turnInFlight = hasTurnInFlight

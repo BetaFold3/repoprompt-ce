@@ -412,6 +412,9 @@ package final actor ClaudeNativeProcessSessionController {
     private struct PendingPermissionRequest {
         let requestID: String
         let request: [String: Any]
+        /// R6: the runtime launch whose transport issued the request (`nil` while registration is
+        /// off). Its reply goes only to that transport, never to a replacement.
+        let issuingLaunch: AgentRuntimeLaunch?
     }
 
     private struct LaunchEnvironmentSignature: Equatable {
@@ -442,6 +445,35 @@ package final actor ClaudeNativeProcessSessionController {
     private var hasWrittenRawEventLogHeader = false
 
     private var process: SpawnedProcess?
+    /// Runtime ownership of `process` (spec R6); `nil` while Phase 3 registration is off.
+    private var runtimeLaunch: AgentRuntimeLaunch?
+    /// Whether the current transport was spawned under a runtime launch; every stdin write then
+    /// requires `runtimeLaunch` to be that committed launch (synchronous transport-owner check).
+    private var runtimeManagedTransport = false
+    private var runtimeCommittedLaunch: AgentRuntimeLaunch?
+    /// R6: the native conversation durably associated with the current launch. Authorize-only
+    /// writes (replies, interrupts, settings) are checked against it, never against an observed
+    /// but not yet associated session ID.
+    private var runtimeAssociatedConversationID: String?
+    /// R6: the owner scope of the latest owner write on the current launch: the operation whose
+    /// output reports a fresh session ID owns that conversation's association.
+    private var runtimeLastOwnerScope: AgentRuntimeSessionScope?
+    /// R6: owned exact-root reaps of registered launches (one per pid), joined by shutdown and
+    /// before a successor launch reserves. Never populated while registration is off.
+    private var pendingRootReaps: [pid_t: Task<Void, Never>] = [:]
+    /// R6 (managed transports): an automatic reply (auto-approval or unsupported-request error),
+    /// bound to the launch whose transport delivered its request.
+    private struct QueuedAutomaticReply {
+        let receivingLaunch: AgentRuntimeLaunch?
+        let requestID: String
+        let encoded: Data
+        let failureMessage: String
+    }
+
+    /// R6: automatic replies awaiting the authorize-only fence. They are written in order after the
+    /// inbound line that produced them, only to their receiving transport.
+    private var queuedAutomaticReplies: [QueuedAutomaticReply] = []
+    private let launchAuthority: AgentRuntimeLaunchAuthority
     private var registeredExpectedAgentPID: pid_t?
     private var stdoutFramer = LineFramer()
     private var stderrTail = Data()
@@ -519,6 +551,12 @@ package final actor ClaudeNativeProcessSessionController {
 
     #if DEBUG
         private var decodeSkippedWarningCount = 0
+        /// Test-only suspension at R6 fence checkpoints (`launchCaptured` before the first await,
+        /// `associated`, `authorized`), so fixtures can replace the transport inside a write's awaits.
+        private var testRuntimeFenceCheckpoint: (@Sendable (String) async -> Void)?
+        /// Test-only: records a protocol failure instead of shutting the (pipe-only) fixture
+        /// transport down, so no placeholder PID is ever signalled.
+        private var testProtocolFailureInterceptor: (@Sendable (String) -> Void)?
     #endif
 
     private var eventsContinuation: AsyncStream<Event>.Continuation?
@@ -700,8 +738,10 @@ package final actor ClaudeNativeProcessSessionController {
         commandSelection: CLICommandSelection? = nil,
         environmentResolver: any ClaudeCodeLaunchEnvironmentResolving = ClaudeCodeLaunchEnvironmentResolver(),
         managedSettingsURL: URL? = ClaudePromptCacheRetentionResolver.defaultManagedSettingsURL,
-        authoritativeTurnIdleFallbackSeconds: TimeInterval = 1.0
+        authoritativeTurnIdleFallbackSeconds: TimeInterval = 1.0,
+        launchAuthority: AgentRuntimeLaunchAuthority = .production
     ) {
+        self.launchAuthority = launchAuthority
         self.runID = runID
         self.tabID = tabID
         self.windowID = windowID
@@ -881,6 +921,12 @@ package final actor ClaudeNativeProcessSessionController {
         activeFlagSettingsBaseModel = nextBaseModel
     }
 
+    /// The permission configuration a launch or `set_permission_mode` request asks for.
+    private static func runtimePermission(mode: String?) -> AgentRuntimePermissionSnapshot {
+        let trimmed = mode?.trimmingCharacters(in: .whitespacesAndNewlines)
+        return .claude(permissionMode: trimmed?.isEmpty == false ? trimmed : nil)
+    }
+
     @discardableResult
     package func sendUserMessage(_ text: String) async throws -> UUID {
         guard process != nil else {
@@ -891,8 +937,23 @@ package final actor ClaudeNativeProcessSessionController {
                 "Cannot send a user message before initialization completes."
             )
         }
+        // R6 owner operation: the user turn associates with the scope its owner captured.
+        let writeOwner = try await fenceRuntimeWrite(association: .owner(AgentRuntimeOperationOwner.current))
+        if writeOwner != nil {
+            // The fence suspended: a cancelled operation or a superseded owner writes nothing
+            // (reported as a proven non-write).
+            guard !Task.isCancelled else { throw ControllerError.processNotRunning }
+            if let admission = AgentRuntimeOperationOwner.writeAdmission {
+                guard await admission() else { throw ControllerError.processNotRunning }
+                // The admission check suspended too: cancellation during it also writes nothing.
+                guard !Task.isCancelled else { throw ControllerError.processNotRunning }
+            }
+        }
+        guard isInitialized else {
+            throw ControllerError.processNotRunning
+        }
         let payload = try ClaudeSDKProtocolCodec.encodeUserMessage(text: text, sessionID: sessionID)
-        try sendLine(payload)
+        try sendLine(payload, writeOwner: writeOwner)
         // The write succeeded: register the turn and its launch-local dispatch ordinal in this
         // same non-suspending actor step so no result can interleave between write and ordinal.
         let turnID = beginTurnTracking()
@@ -941,7 +1002,12 @@ package final actor ClaudeNativeProcessSessionController {
         guard let pending = pendingPermissionRequests.removeValue(forKey: id) else {
             return
         }
+        let issuingLaunch = pending.issuingLaunch
         do {
+            // A reply to the CLI's own request creates no ownership: authorize only, and only on
+            // the transport that issued the request.
+            let writeOwner = try await fenceRuntimeWrite(association: nil)
+            guard writeOwner === issuingLaunch else { throw ControllerError.processNotRunning }
             let response = permissionResponsePayload(decision: decision, pendingRequest: pending.request)
             writeRawEventLogRecord(kind: "approval.response.sent", payload: [
                 "requestID": id,
@@ -952,8 +1018,17 @@ package final actor ClaudeNativeProcessSessionController {
                 requestID: id,
                 response: response
             )
-            try sendLine(encoded, shutdownOnFailure: false)
+            try sendLine(encoded, shutdownOnFailure: false, writeOwner: writeOwner)
         } catch {
+            // R6: the issuing transport was replaced (before or during the fence); the stale reply
+            // is dropped and never shuts down the replacement.
+            guard runtimeLaunch === issuingLaunch else {
+                writeRawEventLogRecord(kind: "approval.response.dropped", payload: [
+                    "requestID": id,
+                    "reason": "issuing transport replaced"
+                ] as [String: Any])
+                return
+            }
             await failProtocolAndShutdown(
                 message: "Failed to submit Claude approval decision: \(error.localizedDescription)"
             )
@@ -961,12 +1036,18 @@ package final actor ClaudeNativeProcessSessionController {
     }
 
     package func shutdown() async {
-        guard !isShuttingDown else { return }
+        guard !isShuttingDown else {
+            // A concurrent caller still waits for the owned reaps (and their post-reap discovery)
+            // so it never returns while this launch's ownership is unresolved.
+            await joinPendingRootReaps()
+            return
+        }
         isShuttingDown = true
         writeRawEventLogRecord(kind: "session.shutdown")
 
         failPendingControlRequests(with: ControllerError.processNotRunning)
         pendingPermissionRequests.removeAll()
+        queuedAutomaticReplies.removeAll()
         // Flush observed deferred completions before clearing the queue. The flush inside
         // cancelAuthoritativeLifecycleState() is gated on `hasPendingTurnIDs`, so clearing
         // first made it dead code and silently dropped turns whose result had already been
@@ -982,14 +1063,28 @@ package final actor ClaudeNativeProcessSessionController {
 
         closeOutputChannelsAndInput()
 
+        let launch = runtimeLaunch
+        runtimeLaunch = nil
         if let process {
             let pid = process.pid
-            _ = await ProcessTermination.terminateAndReap(
-                pid: pid,
-                processGroupID: process.processGroupID,
-                logger: config.enableDebugLogging ? { print("[ClaudeNativeSession] \($0)") } : { _ in }
-            )
+            if let launch {
+                // R6: one owned reap per exact root, visible to concurrent shutdown callers.
+                await ownedRootReap(
+                    launch: launch,
+                    pid: pid,
+                    processGroupID: process.processGroupID,
+                    waitBeforeTerminating: nil
+                ).value
+            } else {
+                _ = await ProcessTermination.terminateAndReap(
+                    pid: pid,
+                    processGroupID: process.processGroupID,
+                    logger: config.enableDebugLogging ? { print("[ClaudeNativeSession] \($0)") } : { _ in }
+                )
+            }
         }
+        // Includes an EOF-path reap of an earlier root of this controller.
+        await joinPendingRootReaps()
         await clearExpectedAgentPIDIfNeeded()
         process = nil
         configuredContextWindow = nil
@@ -1144,11 +1239,39 @@ package final actor ClaudeNativeProcessSessionController {
         storeFlagSettingsRequest(resolvedFlags.request)
         activeFlagSettingsBaseModel = Self.flagSettingsBaseModel(from: resolvedFlags.request)
         activeLaunchEnvironmentSignature = LaunchEnvironmentSignature(launchEnvironment)
+        let requestedSessionID = existingSessionID?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let resumeSessionID = (requestedSessionID?.isEmpty == false) ? requestedSessionID : nil
+        let family: AgentRuntimeFamily = config.runtimeVariant == .standard ? .claudeNative : .claudeCompatible
+        // Fresh `--session-id` is its own qualified gate and never combined with `--resume`.
+        let provider = AgentRuntimeProvider.claude(config.runtimeVariant)
+        let freshSessionID = resumeSessionID == nil && launchAuthority.allowsFreshSessionID(family, provider: provider)
+            ? UUID().uuidString.lowercased()
+            : nil
+        let launch: AgentRuntimeLaunch? = if launchAuthority.isRegistrationActive {
+            launchAuthority.makeLaunch(AgentRuntimeLaunchContext(
+                family: family,
+                provider: provider,
+                // R6: the starting operation's owner-captured scope (fails closed when none).
+                session: AgentRuntimeOperationOwner.current,
+                worktreePath: workspacePath,
+                conversationID: resumeSessionID ?? freshSessionID,
+                permission: Self.runtimePermission(mode: config.permissionMode)
+            ))
+        } else {
+            nil
+        }
         let arguments = buildArguments(
             existingSessionID: existingSessionID,
-            model: nil
+            model: nil,
+            freshSessionID: freshSessionID
         )
 
+        // R6: the previous registered root's owned reap and post-reap discovery finish before this
+        // launch reserves, so a successor never races the app's own just-ended launch.
+        if launch != nil {
+            await joinPendingRootReaps()
+            guard process == nil else { return }
+        }
         let workingDirectory = resolvedWorkingDirectory()
         configuredContextWindow = ClaudeEffectiveContextWindowResolver.resolveConfiguredContextWindow(
             launchEnvironment: environment,
@@ -1159,12 +1282,22 @@ package final actor ClaudeNativeProcessSessionController {
             workingDirectory: workingDirectory
         )
         let launchToken = UUID()
-        let spawned = try ProcessLauncher.spawn(
-            command: resolvedCommand,
-            arguments: arguments,
-            environment: environment,
-            workingDirectory: workingDirectory
-        )
+        // R6: reservation immediately before the spawn; a refusal spawns nothing and never falls
+        // back to an unregistered launch.
+        guard case let .proceed(runtimeID) = try await reserveSpawn(launch: launch) else { return }
+        let spawned: SpawnedProcess
+        do {
+            spawned = try ProcessLauncher.spawn(
+                command: resolvedCommand,
+                arguments: arguments,
+                environment: environment,
+                workingDirectory: workingDirectory,
+                runtimeID: runtimeID
+            )
+        } catch {
+            await launch?.spawnFailed()
+            throw error
+        }
         if let lastSpawnedCommand, lastSpawnedCommand != resolvedCommand {
             Self.processLogger.notice(
                 "Claude executable changed between controller spawns from \(lastSpawnedCommand, privacy: .private) to \(resolvedCommand, privacy: .private)"
@@ -1194,20 +1327,53 @@ package final actor ClaudeNativeProcessSessionController {
         latestRuntimeInitMcpServerStatuses = [:]
         lastEmittedRuntimeInitStatus = nil
         process = spawned
+        runtimeLaunch = launch
+        runtimeManagedTransport = launch != nil
+        runtimeCommittedLaunch = nil
+        // The reservation associated the requested conversation (resume or fresh preallocation).
+        runtimeAssociatedConversationID = launch == nil ? nil : (resumeSessionID ?? freshSessionID)
+        runtimeLastOwnerScope = launch?.context.session
         activeStdoutLaunchToken = launchToken
         do {
             try startStdoutReader(handle: spawned.stdout, launchToken: launchToken)
             try startStderrReader(handle: spawned.stderr)
+            // R6: the birth identity is committed before initialization or any stdin write.
+            try await launch?.commitSpawn(pid: spawned.pid, processGroupID: spawned.processGroupID)
+            guard process?.pid == spawned.pid, runtimeLaunch === launch else {
+                throw ControllerError.processNotRunning
+            }
+            runtimeCommittedLaunch = launch
         } catch {
             spawned.stdout.readabilityHandler = nil
             spawned.stderr.readabilityHandler = nil
             spawned.stdin?.closeFile()
-            process = nil
-            _ = await ProcessTermination.terminateAndReap(
-                pid: spawned.pid,
-                processGroupID: spawned.processGroupID,
-                logger: config.enableDebugLogging ? { print("[ClaudeNativeSession] \($0)") } : { _ in }
-            )
+            if process?.pid == spawned.pid {
+                process = nil
+                activeStdoutLaunchToken = nil
+            }
+            if runtimeLaunch === launch {
+                runtimeLaunch = nil
+            }
+            if let launch {
+                // R6: never a second reap of the same child. If the EOF path already owns this
+                // root's reap, join it; otherwise this path is the single owned reap.
+                let reap = pendingRootReaps[spawned.pid] ?? ownedRootReap(
+                    launch: launch,
+                    pid: spawned.pid,
+                    processGroupID: spawned.processGroupID,
+                    waitBeforeTerminating: nil
+                )
+                await reap.value
+            } else {
+                _ = await ProcessTermination.terminateAndReap(
+                    pid: spawned.pid,
+                    processGroupID: spawned.processGroupID,
+                    logger: config.enableDebugLogging ? { print("[ClaudeNativeSession] \($0)") } : { _ in }
+                )
+            }
+            if error is AgentProcessRegistryError {
+                throw error
+            }
             throw ControllerError.initializationFailed("Failed to start Claude process readers: \(error.localizedDescription)")
         }
         let resumedSessionID = existingSessionID?.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -1239,11 +1405,13 @@ package final actor ClaudeNativeProcessSessionController {
 
         let request = Self.buildInitializeRequest(systemPromptOverride: systemPromptOverride)
 
+        let initializingLaunch = runtimeLaunch
         let initializeResult = try await sendControlRequest(request: request)
         if let returnedSessionID = (initializeResult["session_id"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines),
            !returnedSessionID.isEmpty
         {
             recordObservedSessionID(returnedSessionID)
+            await associateObservedConversationIfNeeded(originLaunch: initializingLaunch)
         }
 
         let snapshot = Self.parseInitializeResponseSnapshot(from: initializeResult)
@@ -1437,12 +1605,80 @@ package final actor ClaudeNativeProcessSessionController {
         ]
     }
 
+    /// How a fenced write relates to ownership: an owner operation associates the scope its owner
+    /// captured (and any permission it requests); `nil` (callbacks, replies, interrupts, live
+    /// settings) only authorizes on the already-associated conversation.
+    private enum RuntimeWriteAssociation {
+        case owner(AgentRuntimeSessionScope, permission: AgentRuntimePermissionSnapshot? = nil)
+    }
+
+    /// R6 fence before an awaited outgoing write. The committed launch is captured before the first
+    /// suspension; an owner write associates its owner-captured session and run attempt, the known
+    /// conversation and any requested permission change (two-writer check; persisted before the
+    /// request that changes the permission); every write then authorizes, and the captured launch
+    /// is rechecked after each suspension. Returns that launch: the final synchronous `sendLine`
+    /// writes only while it still owns the transport, so a replacement made during any await
+    /// receives zero bytes. A missing owner scope fails an owner write. No-op (nil) while
+    /// registration is off.
+    private func fenceRuntimeWrite(association: RuntimeWriteAssociation?) async throws -> AgentRuntimeLaunch? {
+        guard runtimeManagedTransport else { return nil }
+        guard let launch = runtimeLaunch, runtimeCommittedLaunch === launch else {
+            throw ControllerError.processNotRunning
+        }
+        let conversationID = sessionID
+        #if DEBUG
+            if let checkpoint = testRuntimeFenceCheckpoint { await checkpoint("launchCaptured") }
+        #endif
+        // Authorize-only writes are checked against the durably associated conversation; an owner
+        // write associates the known one first and is then checked against it.
+        var authorizedConversationID = runtimeAssociatedConversationID
+        if case let .owner(session, permission) = association {
+            try await launch.associate(session: session, conversationID: conversationID, permission: permission)
+            #if DEBUG
+                if let checkpoint = testRuntimeFenceCheckpoint { await checkpoint("associated") }
+            #endif
+            guard process != nil, runtimeLaunch === launch, runtimeCommittedLaunch === launch else {
+                throw ControllerError.processNotRunning
+            }
+            runtimeLastOwnerScope = session
+            if let conversationID {
+                runtimeAssociatedConversationID = conversationID
+            }
+            authorizedConversationID = conversationID
+        }
+        try await launch.authorizeWrite(conversationID: authorizedConversationID)
+        #if DEBUG
+            if let checkpoint = testRuntimeFenceCheckpoint { await checkpoint("authorized") }
+        #endif
+        guard process != nil, runtimeLaunch === launch, runtimeCommittedLaunch === launch else {
+            throw ControllerError.processNotRunning
+        }
+        return launch
+    }
+
     private func sendControlRequest(
         request: [String: Any],
         timeoutSeconds: TimeInterval? = nil
     ) async throws -> [String: Any] {
         guard process != nil else {
             throw ControllerError.processNotRunning
+        }
+        // R6: a permission change is an owner write (persisted before the request, for the scope
+        // its owner captured); other control requests (initialize, flag settings, interrupt)
+        // create no ownership and only authorize.
+        let association: RuntimeWriteAssociation? = if request["subtype"] as? String == "set_permission_mode" {
+            .owner(
+                AgentRuntimeOperationOwner.current,
+                permission: Self.runtimePermission(mode: request["mode"] as? String)
+            )
+        } else {
+            nil
+        }
+        let writeOwner = try await fenceRuntimeWrite(association: association)
+        if writeOwner != nil, request["subtype"] as? String != "interrupt" {
+            // The fence suspended: a cancelled operation writes nothing. An interrupt is exempt:
+            // it is how cancel and stop paths (often already cancelled) end the turn.
+            try Task.checkCancellation()
         }
         let requestID = makeControlRequestID()
         let payload = try ClaudeSDKProtocolCodec.encodeControlRequest(requestID: requestID, request: request)
@@ -1471,7 +1707,7 @@ package final actor ClaudeNativeProcessSessionController {
                 }
             }
             do {
-                try sendLine(payload)
+                try sendLine(payload, writeOwner: writeOwner)
             } catch {
                 // Writing failed — clean up the continuation and timeout, then resume with error.
                 pendingControlRequests.removeValue(forKey: requestID)
@@ -1499,9 +1735,26 @@ package final actor ClaudeNativeProcessSessionController {
         try sendLine(payload)
     }
 
-    private func sendLine(_ lineData: Data, shutdownOnFailure: Bool = true) throws {
+    /// `writeOwner`: the launch a preceding fence captured and authorized; the write goes only to
+    /// the transport that launch still owns.
+    private func sendLine(
+        _ lineData: Data,
+        shutdownOnFailure: Bool = true,
+        writeOwner: AgentRuntimeLaunch? = nil
+    ) throws {
         guard let process else {
             throw ControllerError.processNotRunning
+        }
+        // R6 final synchronous check: a managed transport writes only while its committed launch
+        // still owns it (never before the birth commit, never after the launch was released), and
+        // a fenced write only while the launch its fence captured is that owner.
+        if runtimeManagedTransport || writeOwner != nil {
+            guard let launch = runtimeLaunch, runtimeCommittedLaunch === launch else {
+                throw ControllerError.processNotRunning
+            }
+            if let writeOwner, writeOwner !== launch {
+                throw ControllerError.processNotRunning
+            }
         }
         writeRawEventLogRecord(kind: "protocol.outbound.raw", payload: lineRecordPayload(from: lineData))
         do {
@@ -1613,9 +1866,183 @@ package final actor ClaudeNativeProcessSessionController {
         }) { line in
             lines.append(line)
         }
+        // R6: the chunk belongs to the transport (stdout reader and launch) that delivered it. Every
+        // line is handled only while that transport is still current, so output buffered from a
+        // transport replaced during an earlier line's awaits never reaches its replacement.
+        let originLaunch = runtimeLaunch
         for line in lines {
+            guard isCurrentStdoutLaunch(launchToken), runtimeLaunch === originLaunch else {
+                writeRawEventLogRecord(kind: "protocol.inbound.replacedTransportDiscarded", payload: [
+                    "launchToken": launchToken.uuidString
+                ] as [String: Any])
+                return
+            }
             await handleLine(line)
+            // R6: a newly observed conversation is durably associated before the next line (a
+            // permission request, for example) can depend on it.
+            await associateObservedConversationIfNeeded(originLaunch: originLaunch)
+            await flushQueuedAutomaticReplies()
         }
+    }
+
+    /// R6: writes queued automatic replies in order, each only to the transport that delivered its
+    /// request, after the authorize-only registry fence (on the associated conversation) and the
+    /// final synchronous transport check. A reply whose transport was replaced is dropped; a
+    /// refused reply on the still-current transport shuts it down, as a failed reply always has.
+    private func flushQueuedAutomaticReplies() async {
+        while !queuedAutomaticReplies.isEmpty {
+            let reply = queuedAutomaticReplies.removeFirst()
+            do {
+                guard let receivingLaunch = reply.receivingLaunch, runtimeLaunch === receivingLaunch else {
+                    throw ControllerError.processNotRunning
+                }
+                let writeOwner = try await fenceRuntimeWrite(association: nil)
+                guard writeOwner === receivingLaunch else { throw ControllerError.processNotRunning }
+                try sendLine(reply.encoded, shutdownOnFailure: false, writeOwner: receivingLaunch)
+            } catch {
+                guard let receivingLaunch = reply.receivingLaunch, runtimeLaunch === receivingLaunch, !isShuttingDown else {
+                    writeRawEventLogRecord(kind: "control.autoReply.dropped", payload: [
+                        "requestID": reply.requestID,
+                        "reason": "receiving transport replaced"
+                    ] as [String: Any])
+                    continue
+                }
+                queuedAutomaticReplies.removeAll()
+                await failProtocolAndShutdown(message: "\(reply.failureMessage): \(error.localizedDescription)")
+                return
+            }
+        }
+    }
+
+    /// An automatic reply to a runtime-initiated request. Unmanaged transports write it at once
+    /// (unchanged); a managed transport queues it for `flushQueuedAutomaticReplies`.
+    private func sendAutomaticReply(
+        _ encoded: Data,
+        requestID: String,
+        receivingLaunch: AgentRuntimeLaunch?,
+        failureMessage: String
+    ) {
+        guard runtimeManagedTransport else {
+            do {
+                try sendLine(encoded, shutdownOnFailure: false, writeOwner: receivingLaunch)
+            } catch {
+                failProtocolAndShutdownSoon(message: "\(failureMessage): \(error.localizedDescription)")
+            }
+            return
+        }
+        queuedAutomaticReplies.append(QueuedAutomaticReply(
+            receivingLaunch: receivingLaunch,
+            requestID: requestID,
+            encoded: encoded,
+            failureMessage: failureMessage
+        ))
+    }
+
+    /// R6 (managed transports only): durably associates a newly observed native conversation with
+    /// the launch whose transport reported it, for the owner whose operation produced it (the
+    /// latest owner write, else the launch's own scope). A failure shuts the transport down rather
+    /// than letting replies or interrupts target an unowned conversation.
+    private func associateObservedConversationIfNeeded(originLaunch: AgentRuntimeLaunch?) async {
+        guard runtimeManagedTransport, !isShuttingDown, let launch = originLaunch, runtimeLaunch === launch,
+              runtimeCommittedLaunch === launch,
+              let observed = sessionID, observed != runtimeAssociatedConversationID
+        else { return }
+        let scope = runtimeLastOwnerScope ?? launch.context.session
+        do {
+            #if DEBUG
+                if let checkpoint = testRuntimeFenceCheckpoint { await checkpoint("observedAssociating") }
+            #endif
+            try await launch.associate(session: scope, conversationID: observed)
+            guard runtimeLaunch === launch else { return }
+            runtimeAssociatedConversationID = observed
+        } catch {
+            guard runtimeLaunch === launch, !isShuttingDown else { return }
+            await failProtocolAndShutdown(
+                message: "Claude conversation could not be associated with its runtime: \(error.localizedDescription)"
+            )
+        }
+    }
+
+    /// R6: the single owned reap of a registered launch's exact root, registered for joining.
+    /// `waitBeforeTerminating` lets an exited root (stdout EOF) exit on its own for a bounded time
+    /// before escalation; `nil` terminates now. Always bounded; reports the reap (confirmed only when
+    /// this wait reaped the root) and its post-reap discovery before completing.
+    private func ownedRootReap(
+        launch: AgentRuntimeLaunch,
+        pid: pid_t,
+        processGroupID: pid_t?,
+        waitBeforeTerminating: TimeInterval?
+    ) -> Task<Void, Never> {
+        if let existing = pendingRootReaps[pid] { return existing }
+        let debugLogging = config.enableDebugLogging
+        let reap = Task { [weak self] in
+            let logger: (String) -> Void = { message in
+                if debugLogging { print("[ClaudeNativeSession] \(message)") }
+            }
+            var confirmed = false
+            if let waitBeforeTerminating {
+                do {
+                    let result = try await ProcessTermination.waitForTerminationReportingRoot(
+                        pid: pid,
+                        processGroupID: processGroupID,
+                        timeout: waitBeforeTerminating,
+                        logger: logger
+                    )
+                    confirmed = result.rootReaped
+                } catch {
+                    confirmed = false
+                }
+            } else {
+                let result = await ProcessTermination.terminateAndReapReportingRoot(
+                    pid: pid,
+                    processGroupID: processGroupID,
+                    logger: logger
+                )
+                confirmed = result.rootReaped
+            }
+            await launch.rootReaped(pid: pid, confirmed: confirmed)
+            await self?.finishOwnedRootReap(pid: pid)
+        }
+        pendingRootReaps[pid] = reap
+        return reap
+    }
+
+    private func finishOwnedRootReap(pid: pid_t) {
+        pendingRootReaps[pid] = nil
+    }
+
+    private func joinPendingRootReaps() async {
+        while let entry = pendingRootReaps.first {
+            await entry.value.value
+            pendingRootReaps[entry.key] = nil
+        }
+    }
+
+    private enum SpawnReservation {
+        case proceed(runtimeID: UUID?)
+        case alreadyRunning
+    }
+
+    /// R6: reserves `launch` (when registered) immediately before the spawn. A start that lost the
+    /// slot, or whose task was cancelled by the time the reservation returned, releases it
+    /// (`spawnFailed`) and spawns nothing.
+    private func reserveSpawn(launch: AgentRuntimeLaunch?) async throws -> SpawnReservation {
+        let runtimeID = try await launch?.prepareSpawn()
+        guard process == nil else {
+            // Another start installed a process while the reservation was awaited.
+            await launch?.spawnFailed()
+            return .alreadyRunning
+        }
+        if let launch, Task.isCancelled {
+            await launch.spawnFailed()
+            throw CancellationError()
+        }
+        return .proceed(runtimeID: runtimeID)
+    }
+
+    /// R6: registered launches join the tab's retained runtime retirements before a start.
+    package nonisolated var joinsRetirementBeforeSuccessor: Bool {
+        launchAuthority.isRegistrationActive
     }
 
     private func handleLine(_ lineData: Data) async {
@@ -2407,6 +2834,11 @@ package final actor ClaudeNativeProcessSessionController {
             handleStreamPayload(payload)
         }
 
+        /// R6: launch arguments for a resume or a (gated) fresh `--session-id` start.
+        func test_buildArguments(existingSessionID: String?, freshSessionID: String?) -> [String] {
+            buildArguments(existingSessionID: existingSessionID, model: nil, freshSessionID: freshSessionID)
+        }
+
         func test_resolveCapturedCommandForLaunch(
             environment: [String: String],
             additionalPaths: [String] = []
@@ -2599,15 +3031,46 @@ package final actor ClaudeNativeProcessSessionController {
             await handleStdoutChunk(data, launchToken: launchToken)
         }
 
+        /// Stores a pending permission request as if the current transport had issued it.
         func test_storePendingPermissionRequest(id: String, request: [String: Any]) {
-            pendingPermissionRequests[id] = PendingPermissionRequest(requestID: id, request: request)
+            pendingPermissionRequests[id] = PendingPermissionRequest(requestID: id, request: request, issuingLaunch: runtimeLaunch)
+        }
+
+        /// Attaches a fixture runtime launch to the current (test-attached) transport, committed or
+        /// not, as a registered spawn would, so the production fences run without a real spawn.
+        func test_installRuntimeLaunch(_ launch: AgentRuntimeLaunch, committed: Bool) {
+            runtimeLaunch = launch
+            runtimeManagedTransport = true
+            runtimeCommittedLaunch = committed ? launch : nil
+        }
+
+        func test_setRuntimeFenceCheckpoint(_ checkpoint: (@Sendable (String) async -> Void)?) {
+            testRuntimeFenceCheckpoint = checkpoint
+        }
+
+        func test_setProtocolFailureInterceptor(_ interceptor: (@Sendable (String) -> Void)?) {
+            testProtocolFailureInterceptor = interceptor
+        }
+
+        /// Forgets a fixture transport that has no child process (pipes only), so neither `deinit`
+        /// nor `shutdown()` signals or reaps its placeholder PID.
+        func test_detachFixtureTransport() {
+            process = nil
+            runtimeLaunch = nil
+            runtimeManagedTransport = false
+            runtimeCommittedLaunch = nil
+        }
+
+        /// The production initial permission-mode request (`set_permission_mode` owner write).
+        func test_applyInitialPermissionMode() async throws {
+            try await applyInitialPermissionModeIfNeeded()
         }
 
         func test_handleControlRequest(
             requestID: String,
             subtype: String,
             request: [String: Any]
-        ) {
+        ) async {
             handleControlRequest(
                 ClaudeSDKProtocolCodec.ControlRequest(
                     requestID: requestID,
@@ -2615,6 +3078,15 @@ package final actor ClaudeNativeProcessSessionController {
                     subtype: subtype
                 )
             )
+            // As after an inbound line: queued automatic replies pass their fence and are written.
+            await flushQueuedAutomaticReplies()
+        }
+
+        /// The production launch reservation step (cancellation and slot rechecks included).
+        /// Returns whether the start would go on to spawn.
+        func test_reserveSpawn(launch: AgentRuntimeLaunch) async throws -> Bool {
+            guard case .proceed = try await reserveSpawn(launch: launch) else { return false }
+            return true
         }
     #endif
 
@@ -2648,6 +3120,8 @@ package final actor ClaudeNativeProcessSessionController {
     }
 
     private func handleControlRequest(_ request: ClaudeSDKProtocolCodec.ControlRequest) {
+        // R6: replies go only to the launch whose transport delivered this request.
+        let receivingLaunch = runtimeLaunch
         writeRawEventLogRecord(kind: "control.request.received", payload: [
             "requestID": request.requestID,
             "subtype": request.subtype,
@@ -2676,7 +3150,12 @@ package final actor ClaudeNativeProcessSessionController {
                         requestID: request.requestID,
                         response: allowResponse
                     )
-                    try sendLine(encoded, shutdownOnFailure: false)
+                    sendAutomaticReply(
+                        encoded,
+                        requestID: request.requestID,
+                        receivingLaunch: receivingLaunch,
+                        failureMessage: "Failed auto-approving RepoPrompt Claude permission request"
+                    )
                 } catch {
                     failProtocolAndShutdownSoon(
                         message: "Failed auto-approving RepoPrompt Claude permission request: \(error.localizedDescription)"
@@ -2687,7 +3166,8 @@ package final actor ClaudeNativeProcessSessionController {
             if let approval = buildApprovalRequest(from: request) {
                 pendingPermissionRequests[request.requestID] = PendingPermissionRequest(
                     requestID: request.requestID,
-                    request: payload
+                    request: payload,
+                    issuingLaunch: runtimeLaunch
                 )
                 writeRawEventLogRecord(kind: "approval.request.emitted", payload: [
                     "requestID": request.requestID,
@@ -2710,7 +3190,12 @@ package final actor ClaudeNativeProcessSessionController {
                         requestID: request.requestID,
                         response: allowResponse
                     )
-                    try sendLine(encoded, shutdownOnFailure: false)
+                    sendAutomaticReply(
+                        encoded,
+                        requestID: request.requestID,
+                        receivingLaunch: receivingLaunch,
+                        failureMessage: "Failed auto-approving Claude permission request"
+                    )
                 } catch {
                     failProtocolAndShutdownSoon(
                         message: "Failed auto-approving Claude permission request: \(error.localizedDescription)"
@@ -2723,7 +3208,12 @@ package final actor ClaudeNativeProcessSessionController {
                     requestID: request.requestID,
                     error: "Unsupported control request subtype: \(request.subtype)"
                 )
-                try sendLine(encoded, shutdownOnFailure: false)
+                sendAutomaticReply(
+                    encoded,
+                    requestID: request.requestID,
+                    receivingLaunch: receivingLaunch,
+                    failureMessage: "Failed replying to unsupported Claude control request (\(request.subtype))"
+                )
             } catch {
                 failProtocolAndShutdownSoon(
                     message: "Failed replying to unsupported Claude control request (\(request.subtype)): \(error.localizedDescription)"
@@ -2776,6 +3266,9 @@ package final actor ClaudeNativeProcessSessionController {
         }
     }
 
+    /// How long an EOF'd registered root may take to exit on its own before its owned reap escalates.
+    private static let exitedRootReapWait: TimeInterval = 2.0
+
     /// Turns failed by an unexpected stdout EOF (process loss), oldest first; bounded.
     private var processLostTurnIDs: [UUID] = []
     private static let processLostTurnIDLimit = 64
@@ -2806,8 +3299,23 @@ package final actor ClaudeNativeProcessSessionController {
         for line in remainingLines {
             await handleLine(line)
         }
+        // The transport is gone: automatic replies queued for it are never written.
+        queuedAutomaticReplies.removeAll()
         failPendingControlRequests(with: ControllerError.processNotRunning)
         cancelAuthoritativeLifecycleState()
+        if let launch = runtimeLaunch, let exited = process {
+            // R6: the captured launch owns one bounded reap of its exact root (it closed stdout, so
+            // it normally exits on its own; escalation only after the bounded wait) and reports it
+            // (root-lifetime evidence only). The reap is retained and joined by shutdown and by the
+            // next launch's reservation. Only registered launches change reaping behavior.
+            runtimeLaunch = nil
+            _ = ownedRootReap(
+                launch: launch,
+                pid: exited.pid,
+                processGroupID: exited.processGroupID,
+                waitBeforeTerminating: Self.exitedRootReapWait
+            )
+        }
         process = nil
         isInitialized = false
         hasCompletedInitialFlagSettings = false
@@ -3237,7 +3745,8 @@ package final actor ClaudeNativeProcessSessionController {
 
     private func buildArguments(
         existingSessionID: String?,
-        model: String?
+        model: String?,
+        freshSessionID: String? = nil
     ) -> [String] {
         var args: [String] = [
             "-p",
@@ -3258,6 +3767,9 @@ package final actor ClaudeNativeProcessSessionController {
             args.append(contentsOf: ["--resume", existingSessionID])
             // RepoPrompt instructions are delivered in provider-bound user messages,
             // so CLI prompt flags remain unused on both fresh starts and resumes.
+        } else if let freshSessionID, !freshSessionID.isEmpty {
+            // Qualified fresh preallocation only (R6); never combined with `--resume`.
+            args.append(contentsOf: ["--session-id", freshSessionID])
         }
 
         if config.permissionMode.caseInsensitiveCompare("bypassPermissions") == .orderedSame {
@@ -3471,6 +3983,12 @@ package final actor ClaudeNativeProcessSessionController {
 
     private func failProtocolAndShutdown(message: String) async {
         guard !isShuttingDown else { return }
+        #if DEBUG
+            if let testProtocolFailureInterceptor {
+                testProtocolFailureInterceptor(message)
+                return
+            }
+        #endif
         writeRawEventLogRecord(kind: "session.failProtocol", payload: ["message": message])
         emit(.error(message))
         let staleIDs = drainAllTurnIDs()
@@ -3521,9 +4039,11 @@ package final actor ClaudeNativeProcessSessionController {
         for (key, value) in resolverOverrides {
             env[key] = value
         }
+        // Managed launch boundary: an inherited runtime marker never reaches the child; a
+        // registered launch sets its own explicitly at spawn.
         return ProcessEnvironmentSanitizer.sanitizedForChildLaunch(
             env,
-            additionalRemovedKeys: Set(["NODE_OPTIONS"]).union(resolverRemovedKeys)
+            additionalRemovedKeys: Set(["NODE_OPTIONS", ProcessLauncher.runtimeMarkerEnvironmentKey]).union(resolverRemovedKeys)
         )
     }
 

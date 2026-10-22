@@ -441,6 +441,10 @@ struct AgentRecoveryListRowProps: Equatable, Identifiable {
         /// R10: stop owning a held scheduled transfer (after `confirmation`). The message stays
         /// visible with its uncertain delivery; it is never marked "not delivered" or resent.
         case cancelSchedule
+        /// R6: run one fresh discovery of surviving agent processes (covers missed exit events).
+        case refreshProcesses
+        /// R6: persist Let finish for the displayed runtime; it keeps watching and stays restricted.
+        case letProcessFinish
     }
 
     let id: String
