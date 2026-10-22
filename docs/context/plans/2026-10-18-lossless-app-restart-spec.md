@@ -431,6 +431,7 @@ Decision O6 (2026-10-21): Use the configured 1Password signer for reviewed local
 Decision O7 (2026-10-21): Authorize one additional independent OracleA/OracleB re-review of Phase 1b input integration after the remaining fixes, beyond the normal two re-review rounds.
 Decision O8 (2026-10-22): Retry signing now; unsigned local commits are authorized if signing remains unavailable, then continue implementation. This supersedes O6's prohibition on an unsigned fallback.
 Decision O9 (2026-10-22): Preserve the architecture and checkpoint the reviewed inactive partial Phase 4 source; keep the older-message requirement and full Phase 4 explicitly blocked, and do not enable features.
+Decision O10 (2026-10-22): Persist the OracleD/OracleE guidance and proceed with the recommended bounded source-only investigations of older saved-input canonical ownership and Claude native identity; keep automated Restart, activation, polish, retention and live acceptance deferred.
 
 Each has a recommended default; none blocks Phase 1.
 
