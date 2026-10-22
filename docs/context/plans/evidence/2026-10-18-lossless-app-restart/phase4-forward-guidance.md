@@ -8,7 +8,7 @@ Last-verified: 2026-10-22
 
 The owner requested independent guidance from OracleD and OracleE. Both consultations completed, their exact preset names and UUIDs were verified, and both full exports were read. These are planning opinions, not another Phase 4 acceptance-review round. No new owner decision, source change, feature activation, or implementation commit resulted.
 
-Current HEAD remains the signed checkpoint `fbc1ef041cd7000255c102f7abd7e2464120fe25`. Phase 1 quit/window-close preservation and Phase 2 presentation are committed; Phase 3 registry source and Phase 4 partial source remain production-inactive. Full Phase 4 stays blocked. O3 live acceptance and O9's architecture/scope constraints are unchanged.
+At consultation time, HEAD was the signed checkpoint `fbc1ef041cd7000255c102f7abd7e2464120fe25`. Phase 1 quit/window-close preservation and Phase 2 presentation are committed; Phase 3 registry source and Phase 4 partial source remain production-inactive. Full Phase 4 stays blocked. O3 live acceptance and O9's architecture/scope constraints are unchanged.
 
 - [OracleD's complete response](phase4-forward-oracled.md).
 - [OracleE's complete response](phase4-forward-oraclee.md).
@@ -63,7 +63,7 @@ After receiving the consultation report, the owner answered: “ok sounds good, 
 2. Independently establish Claude native identity/cardinality and ordinary-reader viability from authorized evidence. Only then select a narrow transport/reducer/ledger change, with partial-output-aware reconciliation.
 3. Keep automated Restart and all activation deferred. Retain existing coupled qualification and O3/O9 boundaries; do not request scope cuts merely to label Phase 4 complete.
 
-These are recommendations, not new owner Decisions. A subsequent behavioral change needs its own bounded scope, validation and applicable review policy; this consultation does not reopen the capped Phase 4 review.
+O10 approved the source-only investigations above; it did not select any new product semantics. Their [completed evidence](phase4-source-investigations.md) records results and remaining boundaries. A subsequent behavioral change needs its own bounded scope, validation and applicable review policy; this consultation does not reopen the capped Phase 4 review.
 
 ## Validation and limitations
 

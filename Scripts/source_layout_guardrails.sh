@@ -480,6 +480,7 @@ allowed_tracked_docs=(
   "docs/context/plans/evidence/2026-10-18-lossless-app-restart/phase4-plan.md"
   "docs/context/plans/evidence/2026-10-18-lossless-app-restart/phase4.md"
   "docs/context/plans/evidence/2026-10-18-lossless-app-restart/phase4-forward-guidance.md"
+  "docs/context/plans/evidence/2026-10-18-lossless-app-restart/phase4-source-investigations.md"
   "docs/context/plans/evidence/2026-10-18-lossless-app-restart/phase4-forward-oracled.md"
   "docs/context/plans/evidence/2026-10-18-lossless-app-restart/phase4-forward-oraclee.md"
   "docs/context/plans/evidence/2026-10-18-lossless-app-restart/phase4-oraclea.md"
