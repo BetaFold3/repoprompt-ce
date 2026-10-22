@@ -574,6 +574,21 @@ package final class AgentModeRunService {
                 hooks.recordStagedInputOutcome(session, stagedInput, .notSent)
             }
         }
+        // Review R1 B N2: a non-Codex start that returns before any runner owns its input (a
+        // startup failure before dispatch — knowledge-profile provider, workspace or worktree
+        // resolution, a DEBUG qualification mismatch — or a refused or revoked dispatch) handed
+        // nothing off, yet some of these exits return `nil`, which callers read as "runner
+        // admitted". An explicit recovery action carried by the input ends its submission here.
+        // Fenced: it settles only while the action has no committed attempt and no commit in flight
+        // (`settleRecoveryActionIfFenced`); it never guesses from elapsed time.
+        defer {
+            if selectedAgent != .codexExec, !runnerOwnsStagedInput,
+               let action = inputConstituents.lazy.compactMap(\.actionAuthorization).first
+            {
+                (session.recoveryLane?.recoveryCoordinator ?? session.recoveryCoordinator)?
+                    .noteRecoveryActionSubmissionEnded(action)
+            }
+        }
         #if DEBUG
             let ompQualificationStartContext = session.ompQualificationStartContext
             let invocationOMPQualificationStartContext = dependencies.ompQualificationInvocationContext(session)

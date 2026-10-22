@@ -293,6 +293,48 @@ final class AgentProcessRegistryTests: XCTestCase {
         XCTAssertTrue(snapshot.blocksSend(AgentRuntimeOwnershipKeys(conversationID: "thread-9", worktreePath: "/tmp/wt-unwritten")))
     }
 
+    /// Lossless restart Phase 4 §G Stage B proof and the Claude history home lookup.
+    func testRestartStageBProofAndClaudeHistoryHomesFollowRegisteredRecords() async throws {
+        let inactive = makeRegistry(store: makeStore(), qualification: .production)
+        await inactive.start()
+        let inactiveProof = await inactive.verifyAllFamiliesStopped()
+        XCTAssertEqual(inactiveProof, .notProven("Runtime registration is not active."))
+
+        let store = makeStore()
+        let registry = makeRegistry(store: store)
+        let unchecked = await registry.verifyAllFamiliesStopped()
+        XCTAssertEqual(unchecked, .notProven("Runtime ownership has not been checked yet."))
+        await registry.start()
+        let empty = await registry.verifyAllFamiliesStopped()
+        XCTAssertEqual(empty, .allStopped)
+        // Review A P1-08: the proof seals launches for the rest of the process (Stage B has no Cancel),
+        // sessionless probes included, so nothing can start between the proof, the arm and the exit.
+        let sealed = await registry.isSealedForSafeRestart
+        XCTAssertTrue(sealed)
+        let sessionless = try newLaunch(registry, session: .sessionless)
+        await assertThrows(.launchesSealed) { _ = try await sessionless.prepareSpawn() }
+        let afterSealed = try newLaunch(registry, conversationID: "conv-A")
+        await assertThrows(.launchesSealed) { _ = try await afterSealed.prepareSpawn() }
+        XCTAssertEqual(processes.sentSignals.count, 0)
+
+        let liveRegistry = makeRegistry(store: makeStore())
+        await liveRegistry.start()
+        let launch = try newLaunch(liveRegistry, conversationID: "conv-A")
+        let runtimeID = try await launch.prepareSpawn()
+        let reserved = await liveRegistry.verifyAllFamiliesStopped()
+        XCTAssertEqual(reserved, .notProven("A provider launch is still in progress."), "a durable reservation is never proof")
+        processes.add(processes.observation(pid: 800, group: 800, marker: runtimeID, home: "/Users/fixture/.claude-alt"))
+        try await launch.commitSpawn(pid: 800, processGroupID: 800)
+
+        let homes = await liveRegistry.claudeProviderHomes(conversationID: "conv-A")
+        XCTAssertEqual(homes, ["/Users/fixture/.claude-alt"], "the observed CLAUDE_CONFIG_DIR of the exact conversation")
+        let otherHomes = await liveRegistry.claudeProviderHomes(conversationID: "conv-other")
+        XCTAssertEqual(otherHomes, [])
+        let live = await liveRegistry.verifyAllFamiliesStopped()
+        guard case .notProven = live else { return XCTFail("a live family is never proof that everything stopped") }
+        XCTAssertEqual(processes.sentSignals.count, 0, "the proof never signals")
+    }
+
     func testStaleLaunchGenerationsAreFencedAfterRootReap() async throws {
         let store = makeStore()
         let registry = makeRegistry(store: store)

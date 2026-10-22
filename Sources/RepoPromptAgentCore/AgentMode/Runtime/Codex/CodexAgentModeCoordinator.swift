@@ -4645,6 +4645,130 @@ package final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObser
         return true
     }
 
+    /// The controller feature state normal preparation derives for this session's next controller
+    /// (also the recovery observation's, so a cold observation controller uses the same inputs).
+    private func desiredCodexControllerFeatureState(for session: AgentTabSession) -> AgentTabSession.CodexControllerFeatureState {
+        let permissionProfileAllowsComputerUse = session.permissionProfile != .mcpSafeDefaults
+        return AgentTabSession.CodexControllerFeatureState(
+            computerUseEnabled: session.profile == .standard
+                && permissionProfileAllowsComputerUse
+                && session.wantsCodexComputerUseForNextTurn
+                && computerUseEnabled(),
+            goalSupportEnabled: session.profile == .standard && goalSupportEnabled(),
+            reasoningSummariesEnabled: reasoningSummariesEnabled()
+        )
+    }
+
+    // MARK: Lossless-restart Phase 4: recovery observation transaction
+
+    /// Observes one explicit Codex thread's expected turn for a recovery action, acquiring and
+    /// releasing its own observation transport. Never prepares a run: it does not touch
+    /// `session.runID`, `session.codexController`, the event task, usage execution, the live
+    /// projection, or normal ensure/resume.
+    ///
+    /// - A compatible existing controller (same workspace, permission profile, session profile and
+    ///   task label the session would prepare now; process feature flags do not affect a read) is
+    ///   borrowed unchanged and never shut down.
+    ///   An incompatible one is refused as stale (never invalidated, never silently replaced).
+    /// - Otherwise one temporary controller is created through the existing factory from the same
+    ///   inputs (`actionID` is only its transient correlation ID, never a logical run), kept local,
+    ///   and its shutdown (client stop, transport reap and cleanup) is joined before any result is
+    ///   returned, on success, failure, cancellation and staleness alike. While it runs, its cleanup
+    ///   is retained as a tab retirement so a registered successor start joins it first (R6).
+    /// - The observation runs under an explicit durable session scope: the lane's lifecycle plus
+    ///   the action's existing source run attempt (or none) and no process run.
+    /// - Afterwards the lane, target, captured inputs, borrowed controller identity and `isCurrent`
+    ///   are revalidated; any change is `staleContext`, not "nothing new".
+    package func observeRecovery(
+        session: AgentTabSession,
+        actionID: UUID,
+        threadID: String,
+        expectedTurnID: String,
+        sourceRunAttemptID: UUID?,
+        timeout: TimeInterval?,
+        isCurrent: @escaping @MainActor () -> Bool
+    ) async throws -> CodexRecoveryObservation {
+        guard session.selectedAgent == .codexExec else { throw CodexRecoveryObservationError.unsupported }
+        guard let lane = session.recoveryLane, !lane.isRetired else { throw CodexRecoveryObservationError.staleContext }
+        guard !session.runState.isActive else { throw CodexRecoveryObservationError.sessionBusy }
+        guard isCurrent() else { throw CodexRecoveryObservationError.staleContext }
+        let lifecycle = lane.binding
+        let scope = AgentRuntimeSessionScope.session(AgentRuntimeSessionAssociation(
+            lifecycle: lifecycle,
+            runAttemptID: sourceRunAttemptID,
+            processRunID: nil
+        ))
+        // R6: a retired controller's cleanup on this tab finishes before anything is acquired.
+        await session.joinRuntimeRetirements()
+        let workspacePath = try workspacePathProvider(session)
+        let permissionProfile = session.permissionProfile
+        let sessionProfile = session.profile
+        let taskLabelKind = session.mcpControlContext?.taskLabelKind
+        let featureState = desiredCodexControllerFeatureState(for: session)
+        func contextIsCurrent() -> Bool {
+            isCurrent()
+                && session.recoveryLane === lane && !lane.isRetired && lane.binding == lifecycle
+                && !session.runState.isActive
+                && session.permissionProfile == permissionProfile
+                && session.profile == sessionProfile
+                && session.mcpControlContext?.taskLabelKind == taskLabelKind
+                && (try? workspacePathProvider(session)) == workspacePath
+        }
+        guard contextIsCurrent() else { throw CodexRecoveryObservationError.staleContext }
+
+        if let borrowed = session.codexController {
+            guard session.codexControllerWorkspacePath == workspacePath,
+                  session.codexControllerPermissionProfile == permissionProfile,
+                  session.codexControllerSessionProfile == sessionProfile,
+                  session.codexControllerTaskLabelKind == taskLabelKind
+            else { throw CodexRecoveryObservationError.staleContext }
+            let observation = try await AgentRuntimeOperationOwner.$session.withValue(scope) {
+                try await borrowed.observeRecovery(threadID: threadID, expectedTurnID: expectedTurnID, timeout: timeout)
+            }
+            guard contextIsCurrent(),
+                  let current = session.codexController,
+                  Self.sameCodexControllerInstance(current, borrowed)
+            else { throw CodexRecoveryObservationError.staleContext }
+            return observation
+        }
+
+        let controller = codexControllerFactory(
+            actionID,
+            session.tabID,
+            windowID,
+            workspacePath,
+            permissionProfile,
+            sessionProfile,
+            taskLabelKind,
+            featureState.computerUseEnabled
+        )
+        // R6: its client start and requests carry the scope bound below, never a session read.
+        controller.useOwnerCapturedRuntimeSessions()
+        let observing = Task { @MainActor in
+            try await AgentRuntimeOperationOwner.$session.withValue(scope) {
+                try await controller.observeRecovery(threadID: threadID, expectedTurnID: expectedTurnID, timeout: timeout)
+            }
+        }
+        // Unstructured on purpose: cancelling the caller never abandons the cleanup.
+        let cleanup = Task { @MainActor in
+            _ = await observing.result
+            await controller.shutdown()
+        }
+        if controller.joinsRetirementBeforeSuccessor {
+            session.retainRuntimeRetirement { await cleanup.value }
+        }
+        let result = await withTaskCancellationHandler {
+            await observing.result
+        } onCancel: {
+            observing.cancel()
+        }
+        await cleanup.value
+        let observation = try result.get()
+        guard !Task.isCancelled else { throw CancellationError() }
+        guard contextIsCurrent(), session.codexController == nil else { throw CodexRecoveryObservationError.staleContext }
+        return observation
+    }
+
     /// Shuts a replaced controller down. A registered controller's shutdown is retained on the
     /// tab's session so every registered successor start (of any provider) joins it before
     /// reserving (R6); others keep the legacy unjoined shutdown.
@@ -4797,8 +4921,6 @@ package final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObser
             await failCodexStartupForWorkspaceResolution(session: session, error: error)
             return
         }
-        let wantsGoalSupport = session.profile == .standard && goalSupportEnabled()
-        let wantsReasoningSummaries = reasoningSummariesEnabled()
         let codexComputerUseFeatureEnabled = computerUseEnabled()
         let permissionProfileAllowsComputerUse = session.permissionProfile != .mcpSafeDefaults
         if !codexComputerUseFeatureEnabled
@@ -4807,15 +4929,8 @@ package final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObser
         {
             session.pendingCodexComputerUseActivation = nil
         }
-        let wantsComputerUse = session.profile == .standard
-            && permissionProfileAllowsComputerUse
-            && session.wantsCodexComputerUseForNextTurn
-            && codexComputerUseFeatureEnabled
-        let desiredFeatureState = AgentTabSession.CodexControllerFeatureState(
-            computerUseEnabled: wantsComputerUse,
-            goalSupportEnabled: wantsGoalSupport,
-            reasoningSummariesEnabled: wantsReasoningSummaries
-        )
+        let desiredFeatureState = desiredCodexControllerFeatureState(for: session)
+        let wantsComputerUse = desiredFeatureState.computerUseEnabled
         if let existingController = session.codexController,
            session.codexControllerFeatureState != desiredFeatureState
         {

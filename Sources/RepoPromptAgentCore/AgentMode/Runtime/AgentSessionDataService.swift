@@ -350,6 +350,12 @@ package actor AgentSessionDataService {
     /// save path and prevents stale VM snapshots from dropping finalized scheduled user items.
     private var scheduleAuthorityByFileURL: [URL: AgentSessionScheduleAuthority] = [:]
     private var transcriptResetAuthorityByFileURL: [URL: AgentSessionTranscriptResetAuthority] = [:]
+    /// Latest provider-history import committed through `commitProviderHistoryImport` in this
+    /// process, by canonical session file (lossless restart Phase 4). An ordinary save whose payload
+    /// carries a different import receipt under the same incarnation is an older snapshot and is
+    /// refused, so it can never drop committed imported rows or their native-ID ledger. A transcript
+    /// reset commit clears the entry (reset semantics only).
+    private var committedHistoryImportByFileURL: [URL: (incarnationID: UUID, importID: UUID)] = [:]
     private var activeSessionPersistence: Set<UUID> = []
     private var sessionPersistenceWaiters: [UUID: [CheckedContinuation<Void, Never>]] = [:]
     /// Process-local explicit-deletion evidence keyed by canonical session-file identity. A
@@ -2452,8 +2458,12 @@ package actor AgentSessionDataService {
         intentionallyRemovingFinalizedScheduledSendItems removals: [AgentScheduledSendFinalizedItemRemoval] = [],
         committingTranscriptReset resetReceipt: AgentSessionTranscriptResetReceipt? = nil,
         fileCreationPolicy: AgentSessionFileCreationPolicy = .createIfMissing,
-        persistenceState: AgentSessionPersistenceState
+        persistenceState: AgentSessionPersistenceState,
+        committingHistoryImport historyImport: AgentSessionProviderHistoryRecovery.ImportCommit? = nil
     ) async throws -> AgentSessionSaveCommit {
+        if let historyImport, session.providerHistoryRecovery?.lastImportCommit != historyImport {
+            throw AgentSessionHistoryImportError.receiptMismatch
+        }
         await acquireSessionPersistence(for: session.id)
         defer { releaseSessionPersistence(for: session.id) }
         return try await saveAgentSessionLocked(
@@ -2464,8 +2474,55 @@ package actor AgentSessionDataService {
             intentionallyRemovingFinalizedScheduledSendItems: removals,
             committingTranscriptReset: resetReceipt,
             fileCreationPolicy: fileCreationPolicy,
-            authority: .persistenceState(persistenceState)
+            authority: .persistenceState(persistenceState),
+            committingHistoryImport: historyImport?.importID
         )
+    }
+
+    /// Provider-history import commit (lossless restart Phase 4): the session rows, the native-ID
+    /// ledger, and `importCommit` are written in ONE fenced full save; the caller advances the
+    /// recovery cursor only after this returns. The payload must already carry exactly
+    /// `importCommit` as its latest import receipt. From then on, an ordinary save whose payload
+    /// carries a different receipt under the same incarnation is refused as an older snapshot
+    /// (`AgentSessionHistoryImportError.staleHistorySnapshot`), until a transcript reset clears it.
+    package func commitProviderHistoryImport(
+        _ session: AgentSession,
+        for workspace: some AgentWorkspaceStorageReference,
+        importCommit: AgentSessionProviderHistoryRecovery.ImportCommit,
+        persistenceState: AgentSessionPersistenceState
+    ) async throws -> AgentSessionSaveCommit {
+        try await saveAgentSession(
+            session,
+            for: workspace,
+            preparation: .canonicalize,
+            fileCreationPolicy: .requireExisting,
+            persistenceState: persistenceState,
+            committingHistoryImport: importCommit
+        )
+    }
+
+    /// The stale-import fence of every full save (see `committedHistoryImportByFileURL`).
+    private func validateHistoryImportFence(
+        _ session: AgentSession,
+        fileKey: URL,
+        incarnationID: UUID,
+        committingTranscriptReset: Bool,
+        committingHistoryImport historyImportID: UUID?
+    ) throws {
+        let payloadImportID = session.providerHistoryRecovery?.lastImportCommit?.importID
+        if let historyImportID {
+            guard payloadImportID == historyImportID, !committingTranscriptReset else {
+                throw AgentSessionHistoryImportError.receiptMismatch
+            }
+            return
+        }
+        guard !committingTranscriptReset,
+              let committed = committedHistoryImportByFileURL[fileKey],
+              committed.incarnationID == incarnationID
+        else { return }
+        guard payloadImportID == committed.importID else {
+            throw AgentSessionHistoryImportError.staleHistorySnapshot
+        }
     }
 
     private enum SaveAuthority {
@@ -2485,7 +2542,8 @@ package actor AgentSessionDataService {
         committingTranscriptReset resetReceipt: AgentSessionTranscriptResetReceipt?,
         fileCreationPolicy: AgentSessionFileCreationPolicy,
         authority: SaveAuthority,
-        countsAsFullSave: Bool = true
+        countsAsFullSave: Bool = true,
+        committingHistoryImport historyImportID: UUID? = nil
     ) async throws -> AgentSessionSaveCommit {
         let agentSessionsFolder: URL
         let fileURL: URL
@@ -2600,6 +2658,13 @@ package actor AgentSessionDataService {
         } else {
             lifecycleToWrite = .fresh()
         }
+        try validateHistoryImportFence(
+            session,
+            fileKey: fileKey,
+            incarnationID: lifecycleToWrite.incarnationID,
+            committingTranscriptReset: resetReceipt != nil,
+            committingHistoryImport: historyImportID
+        )
 
         let staleRemovalPolicy: StaleFinalizedItemRemovalPolicy =
             resetReceipt == nil ? .fail : .ignore
@@ -2700,6 +2765,11 @@ package actor AgentSessionDataService {
             preservingItemAuthority: itemAuthorityForSave
         )
         rememberLifecycle(of: sessionToSave, fileURL: fileURL)
+        if resetReceipt != nil {
+            committedHistoryImportByFileURL[fileKey] = nil
+        } else if let historyImportID {
+            committedHistoryImportByFileURL[fileKey] = (lifecycleToWrite.incarnationID, historyImportID)
+        }
         if let resetReceipt {
             transcriptResetAuthorityByFileURL[fileKey] =
                 AgentSessionTranscriptResetAuthority(

@@ -122,9 +122,29 @@ package struct AgentRecoveryCatalogItem: Equatable, Identifiable {
     /// `nil` when the item offers no durable Dismiss (save failures, unknown or unreadable authority,
     /// held transfers).
     package let acknowledgement: AgentRecoveryCatalogAcknowledgement?
+    /// Durable action evidence of the item's card (offers no duplicate or invalid sends).
+    package var actionFacts = AgentRecoveryCatalogActionFacts()
 
     package var isDismissed: Bool {
         acknowledgement?.isAcknowledged == true
+    }
+}
+
+/// What the current record says about explicit recovery actions on one card.
+package struct AgentRecoveryCatalogActionFacts: Equatable {
+    /// An action already resolved the item by sending, or by proving its turn finished (B F3b).
+    package var resolvedByAction = false
+    /// The run card's attempt verifiably never delivered its input (A P1-06): its saved intent
+    /// is the route, never a generic continuation.
+    package var runNeverHandedOff = false
+    /// The run card's attempt reset generation when recorded (a run from before a conversation
+    /// clear is never continued into the cleared conversation).
+    package var runTranscriptResetGeneration: UInt64?
+
+    package init(resolvedByAction: Bool = false, runNeverHandedOff: Bool = false, runTranscriptResetGeneration: UInt64? = nil) {
+        self.resolvedByAction = resolvedByAction
+        self.runNeverHandedOff = runNeverHandedOff
+        self.runTranscriptResetGeneration = runTranscriptResetGeneration
     }
 }
 
@@ -270,12 +290,22 @@ package enum AgentRecoveryCatalogProjection {
             payload: AgentRecoveryCatalogPayload,
             card: (key: AgentRecoveryCardKey, freshness: AgentRecoveryCardFreshness)? = nil
         ) {
+            let record = sessionID.flatMap { records[$0] }
             let acknowledgement = card.map { card in
                 AgentRecoveryCatalogAcknowledgement(
                     key: card.key,
                     freshness: card.freshness,
-                    isAcknowledged: sessionID.flatMap { records[$0] }?.isCardAcknowledged(card.key, freshness: card.freshness) ?? false
+                    isAcknowledged: record?.isCardAcknowledged(card.key, freshness: card.freshness) ?? false
                 )
+            }
+            var facts = AgentRecoveryCatalogActionFacts()
+            if let record, let key = card?.key {
+                facts.resolvedByAction = record.resolvingAction(for: key) != nil
+                if key.kindRaw == AgentRecoveryCardKey.Kind.run.rawValue {
+                    let runAttemptID = UUID(uuidString: key.entityID)
+                    facts.runNeverHandedOff = record.isVerifiedNeverHandedOff(runAttemptID: runAttemptID)
+                    facts.runTranscriptResetGeneration = runAttemptID.flatMap { record.runAttempt(id: $0) }?.transcriptResetGeneration
+                }
             }
             items.append(AgentRecoveryCatalogItem(
                 id: id,
@@ -285,7 +315,8 @@ package enum AgentRecoveryCatalogProjection {
                 sessionName: sessionName,
                 composeTabID: composeTabID,
                 payload: payload,
-                acknowledgement: acknowledgement
+                acknowledgement: acknowledgement,
+                actionFacts: facts
             ))
         }
 

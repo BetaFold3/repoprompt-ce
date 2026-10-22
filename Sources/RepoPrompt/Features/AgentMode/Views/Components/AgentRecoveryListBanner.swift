@@ -103,6 +103,9 @@ struct AgentRecoveryListRow: View {
 
     @State private var isViewing = false
     @State private var pendingConfirmation: AgentRecoveryListRowProps.Action?
+    /// Phase 4: the continuation being edited (its action), and its editable text.
+    @State private var editingContinuation: AgentRecoveryListRowProps.Action?
+    @State private var continuationDraft = ""
 
     var body: some View {
         HStack(alignment: .top, spacing: 8) {
@@ -135,10 +138,20 @@ struct AgentRecoveryListRow: View {
                 Button(title(for: action), role: isDestructive(action) ? .destructive : nil) {
                     if action == .discardDraft || action == .cancelSchedule, row.confirmation != nil {
                         pendingConfirmation = action
+                    } else if isContinuation(action), let text = row.continuationText {
+                        continuationDraft = text
+                        editingContinuation = action
                     } else {
                         Task { await actions.perform(row.id, action) }
                     }
                 }
+                .popover(
+                    isPresented: Binding(
+                        get: { editingContinuation == action },
+                        set: { if !$0 { editingContinuation = nil } }
+                    ),
+                    arrowEdge: .top
+                ) { continuationEditor(for: action) }
                 .accessibilityIdentifier("agent.recoveryList.\(action)")
             }
         }
@@ -161,6 +174,43 @@ struct AgentRecoveryListRow: View {
             .accessibilityIdentifier("agent.recoveryList.confirmDiscard")
             Button(pendingConfirmation == .cancelSchedule ? "Keep" : "Cancel", role: .cancel) { pendingConfirmation = nil }
         }
+    }
+
+    private func isContinuation(_ action: AgentRecoveryListRowProps.Action) -> Bool {
+        action == .continueTurn || action == .continueInNewConversation
+    }
+
+    /// Editable continuation shown before the choice; Send reserves exactly this text.
+    private func continuationEditor(for action: AgentRecoveryListRowProps.Action) -> some View {
+        let warning = row.continuationWarning
+        return VStack(alignment: .leading, spacing: 8) {
+            Text(title(for: action)).font(.headline)
+            if let warning {
+                Text(warning)
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .accessibilityIdentifier("agent.recoveryList.continuationWarning")
+            }
+            TextEditor(text: $continuationDraft)
+                .font(.system(size: 12))
+                .frame(minHeight: 80, maxHeight: 160)
+                .accessibilityIdentifier("agent.recoveryList.continuationText")
+            HStack {
+                Spacer()
+                Button("Cancel", role: .cancel) { editingContinuation = nil }
+                Button(warning == nil ? "Send" : "Send anyway") {
+                    let text = continuationDraft
+                    editingContinuation = nil
+                    Task { await actions.performContinuation(row.id, action, text, warning) }
+                }
+                .keyboardShortcut(.defaultAction)
+                .disabled(continuationDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                .accessibilityIdentifier("agent.recoveryList.continuationSend")
+            }
+        }
+        .padding(12)
+        .frame(width: 380)
     }
 
     private func isDestructive(_ action: AgentRecoveryListRowProps.Action) -> Bool {
@@ -214,6 +264,16 @@ struct AgentRecoveryListRow: View {
             "Refresh"
         case .letProcessFinish:
             "Let it finish"
+        case .continueTurn:
+            "Continue…"
+        case .sendSaved:
+            "Send"
+        case .answerAsInput:
+            "Send answer as message"
+        case .reconcileHistory:
+            "Check provider history"
+        case .continueInNewConversation:
+            "Continue in a new conversation…"
         }
     }
 }

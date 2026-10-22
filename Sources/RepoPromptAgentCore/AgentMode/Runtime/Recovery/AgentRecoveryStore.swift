@@ -146,6 +146,21 @@ package enum AgentRecoveryStoreError: Error, Equatable {
     case heldResolutionSuperseded
     /// The acknowledged card's semantic state changed (or it no longer exists). Nothing was written.
     case cardChanged
+    /// Phase 4: the same action ID with different parameters, or another unresolved action for the
+    /// same item. Nothing was written.
+    case actionConflict(UUID)
+    case actionNotFound(UUID)
+    /// Phase 4: the action's source no longer allows it (for example the saved input was already
+    /// handed off, withdrawn, or held). Nothing was written.
+    case actionIneligible(actionID: UUID, reason: String)
+    /// Phase 4: a previous launch's unresolved action holds the item. It is joined and shown first;
+    /// only an explicit new choice naming it (`supersedesActionID`) may replace it. Nothing was written.
+    case priorLaunchAction(UUID)
+    /// Phase 4: the named previous-launch action may have delivered input, and the new choice is not
+    /// an explicitly confirmed continuation. Nothing was written.
+    case supersedeRefused(actionID: UUID, reason: String)
+    /// Phase 4: the history cursor moved since the import began (compare-and-swap on import ID).
+    case historyCursorConflict
 
     package var category: Category {
         switch self {
@@ -162,8 +177,11 @@ package enum AgentRecoveryStoreError: Error, Equatable {
         case .heldComposerUnresolved, .heldResolutionSuperseded:
             .heldInput
         case .intentNotFound, .intentConflict, .attemptNotFound, .attemptConflict, .runAttemptNotFound,
-             .runAttemptConflict, .invalidTransition, .heldIntent, .cardChanged:
+             .runAttemptConflict, .invalidTransition, .heldIntent, .cardChanged, .actionConflict, .actionNotFound,
+             .actionIneligible, .priorLaunchAction, .supersedeRefused:
             .invalidOperation
+        case .historyCursorConflict:
+            .revisionConflict
         }
     }
 }
@@ -500,7 +518,7 @@ package actor AgentRecoveryStore {
         return holds
     }
 
-    private func holdReasons(
+    func holdReasons(
         for intent: AgentRecoveryIntent,
         sessionID: UUID,
         currentGeneration: UInt64
@@ -1731,7 +1749,7 @@ package actor AgentRecoveryStore {
     // MARK: Private
 
     /// The current record if it may be written under `binding`; `nil` when absent.
-    private func writableRecord(binding: AgentRecoveryLifecycleBinding) throws -> AgentRecoveryRecord? {
+    func writableRecord(binding: AgentRecoveryLifecycleBinding) throws -> AgentRecoveryRecord? {
         switch read(sessionID: binding.sessionID) {
         case .absent:
             return nil
@@ -1846,7 +1864,7 @@ package actor AgentRecoveryStore {
         stored.merging(supplied) { _, supplied in supplied }
     }
 
-    private func requireRevision(_ expected: AgentRecoveryRecordRevision?, current: AgentRecoveryRecord?) throws {
+    func requireRevision(_ expected: AgentRecoveryRecordRevision?, current: AgentRecoveryRecord?) throws {
         guard expected == current?.revision else {
             throw AgentRecoveryStoreError.revisionConflict(expected: expected, actual: current?.revision)
         }
@@ -2078,9 +2096,10 @@ package actor AgentRecoveryStore {
     }
 
     /// Atomically replaces the record (new opaque revision, binding generation, preserved extras,
-    /// crash-hold acknowledgement, questions, and card acknowledgements unless supplied). Never
-    /// deletes attachments: a record reference is not proof that a file is unused.
-    private func replace(
+    /// crash-hold acknowledgement, questions, card acknowledgements, actions, and history cursors
+    /// unless supplied). Never deletes attachments: a record reference is not proof that a file is
+    /// unused.
+    func replace(
         _ current: AgentRecoveryRecord?,
         binding: AgentRecoveryLifecycleBinding,
         composer: AgentRecoveryComposerSnapshot?,
@@ -2089,7 +2108,9 @@ package actor AgentRecoveryStore {
         runAttempts: [AgentRecoveryRunAttempt],
         crashHoldAcknowledgement: AgentRecoveryCrashHoldAcknowledgement?? = nil,
         questions: [AgentRecoveryQuestionSnapshot]? = nil,
-        cardAcknowledgements: [AgentRecoveryCardAcknowledgement]? = nil
+        cardAcknowledgements: [AgentRecoveryCardAcknowledgement]? = nil,
+        actions: [AgentRecoveryAction]? = nil,
+        historyCursors: [AgentRecoveryHistoryCursor]? = nil
     ) throws -> AgentRecoveryRecord {
         let record = AgentRecoveryRecord(
             sessionID: binding.sessionID,
@@ -2104,6 +2125,8 @@ package actor AgentRecoveryStore {
             crashHoldAcknowledgement: crashHoldAcknowledgement ?? current?.crashHoldAcknowledgement,
             questions: questions ?? current?.questions ?? [],
             cardAcknowledgements: cardAcknowledgements ?? current?.cardAcknowledgements ?? [],
+            actions: actions ?? current?.actions ?? [],
+            historyCursors: historyCursors ?? current?.historyCursors ?? [],
             extras: current?.extras ?? [:]
         )
         do {

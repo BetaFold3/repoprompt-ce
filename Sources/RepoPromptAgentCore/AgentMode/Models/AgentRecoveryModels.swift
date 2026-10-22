@@ -924,6 +924,11 @@ package struct AgentRecoveryRecord: Equatable {
     /// Durable card acknowledgements (Dismiss), one per card key (empty = none). Additive: a record
     /// without them decodes empty and keeps its existing bytes.
     package let cardAcknowledgements: [AgentRecoveryCardAcknowledgement]
+    /// Durable recovery action reservations (Phase 4), in reservation order (empty = none).
+    /// Additive: absent when empty, so older records keep their bytes.
+    package let actions: [AgentRecoveryAction]
+    /// Provider history cursors (Phase 4), one per provider conversation (empty = none).
+    package let historyCursors: [AgentRecoveryHistoryCursor]
     package let extras: AgentRecoveryExtras
 
     package init(
@@ -939,8 +944,12 @@ package struct AgentRecoveryRecord: Equatable {
         crashHoldAcknowledgement: AgentRecoveryCrashHoldAcknowledgement? = nil,
         questions: [AgentRecoveryQuestionSnapshot] = [],
         cardAcknowledgements: [AgentRecoveryCardAcknowledgement] = [],
+        actions: [AgentRecoveryAction] = [],
+        historyCursors: [AgentRecoveryHistoryCursor] = [],
         extras: AgentRecoveryExtras = [:]
     ) {
+        self.actions = actions
+        self.historyCursors = historyCursors
         self.crashHoldAcknowledgement = crashHoldAcknowledgement
         self.questions = questions
         self.cardAcknowledgements = cardAcknowledgements

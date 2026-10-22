@@ -8213,6 +8213,12 @@ final class LifecycleNoopCodexController: CodexSessionControlling {
     var shutdownGate: LifecycleAsyncGate?
     /// When set, thread establishment and shutdown completion are recorded under this label.
     var lifecycleLabel: String?
+    /// Opt-in Phase 4 recovery observation: when set, `observeRecovery` records its owner scope and
+    /// returns (or throws) this outcome, after `observationGate` when set. Unset keeps the protocol
+    /// default (`unsupported`).
+    var recoveryObservationOutcome: Result<CodexRecoveryObservation, Error>?
+    var observationGate: LifecycleAsyncGate?
+    private(set) var observationOwners: [AgentRuntimeSessionScope] = []
 
     init(
         recorder: LifecycleRecorder,
@@ -8425,6 +8431,16 @@ final class LifecycleNoopCodexController: CodexSessionControlling {
     }
 
     func respondToServerRequest(id: CodexAppServerRequestID, result: [String: Any]) async {}
+
+    func observeRecovery(threadID: String, expectedTurnID: String, timeout: TimeInterval?) async throws -> CodexRecoveryObservation {
+        guard let outcome = recoveryObservationOutcome else { throw CodexRecoveryObservationError.unsupported }
+        recorder.record("codex:observe" + (lifecycleLabel.map { ":\($0)" } ?? ""))
+        observationOwners.append(AgentRuntimeOperationOwner.current)
+        if let observationGate {
+            await observationGate.arriveAndWait()
+        }
+        return try outcome.get()
+    }
 }
 
 private struct LifecycleFakeACPProvider: ACPAgentProvider {

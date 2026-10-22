@@ -445,6 +445,16 @@ struct AgentRecoveryListRowProps: Equatable, Identifiable {
         case refreshProcesses
         /// R6: persist Let finish for the displayed runtime; it keeps watching and stays restricted.
         case letProcessFinish
+        /// Phase 4 (gated OFF in production): a new continuation message through normal dispatch.
+        case continueTurn
+        /// Phase 4 (gated OFF): send the one saved, never handed-off message through normal dispatch.
+        case sendSaved
+        /// Phase 4 (gated OFF): send a saved question's text and partial answer as ordinary input.
+        case answerAsInput
+        /// Phase 4 (gated OFF): import what the provider recorded; never sends anything.
+        case reconcileHistory
+        /// Phase 4 (gated OFF): explicit fresh conversation after a failed Claude resume.
+        case continueInNewConversation
     }
 
     let id: String
@@ -461,10 +471,23 @@ struct AgentRecoveryListRowProps: Equatable, Identifiable {
     let error: String?
     /// Explicit confirmation shown before a destructive `discardDraft`.
     var confirmation: String?
+    /// Phase 4: editable continuation text shown before `continueTurn` / `continueInNewConversation`
+    /// is chosen (the R7 default). The exact edited text is what the choice reserves and sends.
+    var continuationText: String?
+    /// Phase 4: shown in the continuation editor when an earlier choice may have reached the agent;
+    /// sending from that editor is the explicit confirmation.
+    var continuationWarning: String?
 }
 
 struct AgentRecoveryListActions {
     let perform: (_ rowID: String, _ action: AgentRecoveryListRowProps.Action) async -> Void
+    /// Phase 4: a continuation choice with the card's edited text and the warning it showed.
+    var performContinuation: (
+        _ rowID: String,
+        _ action: AgentRecoveryListRowProps.Action,
+        _ text: String,
+        _ acknowledgedWarning: String?
+    ) async -> Void = { _, _, _, _ in }
     let retryStartup: () -> Void
     /// Presents the app-wide Needs Attention sheet.
     var openNeedsAttention: () -> Void = {}

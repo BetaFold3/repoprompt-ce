@@ -166,7 +166,8 @@ extension AgentModeViewModel {
             actions: [AgentRecoveryListRowProps.Action] = [],
             confirmation: String? = nil
         ) -> AgentRecoveryListRowProps {
-            AgentRecoveryListRowProps(
+            let continues = actions.contains(.continueTurn) || actions.contains(.continueInNewConversation)
+            return AgentRecoveryListRowProps(
                 id: rowID,
                 sessionID: sessionID,
                 sessionName: name,
@@ -177,7 +178,9 @@ extension AgentModeViewModel {
                 actions: actions,
                 isWorking: state == .working,
                 error: Self.recoveryListError(state),
-                confirmation: confirmation
+                confirmation: confirmation,
+                continuationText: continues ? Self.recoveryContinueDefaultText : nil,
+                continuationWarning: continues ? recoveryPriorActionWarning(for: item.acknowledgement?.key) : nil
             )
         }
         switch item.payload {
@@ -209,15 +212,19 @@ extension AgentModeViewModel {
             )
         case let .turn(turn):
             let (title, detail) = Self.recoveryListTurnText(turn)
-            return row(title, detail, actions: dismiss + openAction)
+            let runActions = recoveryRunActions(session: isActive ? activeSession : nil, status: turn.status, facts: item.actionFacts)
+            return row(title, detail, actions: runActions + dismiss + openAction)
         case let .outcomeTurn(outcome):
             let (title, detail) = Self.recoveryListOutcomeTurnText(outcome)
-            return row(title, detail, actions: dismiss + openAction)
+            let runActions = recoveryRunActions(session: isActive ? activeSession : nil, status: outcome.status, facts: item.actionFacts)
+            return row(title, detail, actions: runActions + dismiss + openAction)
         case let .recoveryOnlyRun(attempt):
             // R1a: a run whose turn was never saved is still listed from its recovery evidence. A
             // finished run (R09) shows its recorded outcome; it holds nothing.
             let (title, detail) = Self.recoveryOnlyRunRowText(attempt)
-            return row(title, detail, actions: dismiss + openAction)
+            let status = AgentRecoveryInterruptedTurn.Status.classify(terminal: attempt.terminal, shutdown: attempt.shutdown)
+            let runActions = recoveryRunActions(session: isActive ? activeSession : nil, status: status, facts: item.actionFacts)
+            return row(title, detail, actions: runActions + dismiss + openAction)
         case let .intent(intent, context):
             var detail = context.isRemote && intent.deliveryState == .deliveryUnknown
                 ? Self.recoveryListRemoteUncertainty
@@ -231,7 +238,7 @@ extension AgentModeViewModel {
                 detail += " It was written before the conversation was cleared, so it can't be moved into it."
             }
             let actions = isActive
-                ? Self.recoveryListIntentActions(intent.deliveryState, sameGeneration: context.sameGeneration)
+                ? recoveryIntentActions(intent, facts: item.actionFacts) + Self.recoveryListIntentActions(intent.deliveryState, sameGeneration: context.sameGeneration)
                 : openAction
             return row(
                 Self.recoveryListTitle(of: intent.deliveryState),
@@ -249,7 +256,7 @@ extension AgentModeViewModel {
                 : "The agent asked this question before RepoPrompt closed. That request has ended."
             let uncertainty = "Whether an answer reached the agent is uncertain; check the conversation before answering again."
             let actions: [AgentRecoveryListRowProps.Action] = isActive
-                ? (liveIsEmpty ? [.restoreDraft, .removeSavedQuestion] : [.removeSavedQuestion])
+                ? recoveryQuestionActions(snapshot, facts: item.actionFacts) + (liveIsEmpty ? [.restoreDraft, .removeSavedQuestion] : [.removeSavedQuestion])
                 : openAction
             return row(
                 "Expired question",
@@ -631,7 +638,32 @@ extension AgentModeViewModel {
             await refreshRecoveryRuntimes()
         case .letProcessFinish:
             await letRecoveryRuntimeFinish(rowID: rowID)
+        case .continueTurn, .sendSaved, .answerAsInput, .reconcileHistory, .continueInNewConversation:
+            await performRecoveryResumeAction(rowID: rowID, action: action)
         }
+        coordinator.setCatalogActionState(failure.map { .failed($0) }, for: rowID)
+        refreshRecoveryListUI()
+    }
+
+    /// A continuation chosen from the card's editor: the exact edited text is reserved and sent.
+    func performRecoveryListContinuation(
+        rowID: String,
+        action: AgentRecoveryListRowProps.Action,
+        text: String,
+        acknowledgedWarning: String?
+    ) async {
+        guard action == .continueTurn || action == .continueInNewConversation,
+              let coordinator = recoveryCoordinator,
+              coordinator.catalogActionStates[rowID] != .working
+        else { return }
+        coordinator.setCatalogActionState(.working, for: rowID)
+        refreshRecoveryListUI()
+        let failure = await performRecoveryResumeAction(
+            rowID: rowID,
+            action: action,
+            continuationText: text,
+            acknowledgedWarning: acknowledgedWarning
+        )
         coordinator.setCatalogActionState(failure.map { .failed($0) }, for: rowID)
         refreshRecoveryListUI()
     }
@@ -938,7 +970,7 @@ extension AgentModeViewModel {
 
     /// The open session's live lane, revalidated against the row's session and (for startup rows)
     /// the startup lifecycle. The lane's own record read validates everything else.
-    private func recoveryListLane(sessionID: UUID) -> (AgentTabSession, AgentRecoverySessionLane)? {
+    func recoveryListLane(sessionID: UUID) -> (AgentTabSession, AgentRecoverySessionLane)? {
         guard let session = activeSession,
               session.activeAgentSessionID == sessionID,
               let lane = session.recoveryLane,

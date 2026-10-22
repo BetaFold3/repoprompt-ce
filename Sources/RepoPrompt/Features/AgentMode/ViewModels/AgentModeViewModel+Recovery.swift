@@ -245,6 +245,8 @@ extension AgentModeViewModel {
             "The conversation is being cleared, so this message was not sent. Your draft is kept."
         case .shutdownInProgress:
             "RepoPrompt is saving this session before closing, so this message was not sent. Your draft is kept."
+        case .recoveryActionInProgress:
+            "A recovery choice in this workspace is in progress, so this message was not sent. Your draft is kept."
         case .laneRetired, .bindingMismatch:
             "The session changed before this message could be saved, so it was not sent. Your draft is kept."
         case .composerUnavailable, .untrackedInput:
@@ -286,6 +288,14 @@ extension AgentModeViewModel {
         let interviewFirst: Bool
         /// A composer submission: exactly the submitted items leave the live composer.
         let consumesComposer: Bool
+
+        /// Review A P1-06: Send saved re-dispatches the one saved intent its coordinator-issued
+        /// action authorization names. Only that authority may reuse the intent's already shown
+        /// deterministic bubble, and a refused submission keeps the saved intent (never withdrawn).
+        var resendsAuthorizedSavedIntent: Bool {
+            guard let sourceIntentID = identity.actionAuthorization?.sourceIntentID else { return false }
+            return sourceIntentID == identity.intentID && !consumesComposer
+        }
     }
 
     /// Durable admission applies when the session requires it, or whenever it owns a live lane.
@@ -310,7 +320,8 @@ extension AgentModeViewModel {
         taggedFiles: [AgentTaggedFileAttachment],
         workflow: AgentWorkflowDefinition?,
         interviewFirst: Bool,
-        consumesComposer: Bool
+        consumesComposer: Bool,
+        actionAuthorization: AgentRecoveryActionAuthorization? = nil
     ) async -> RecoveryInputAdmission {
         // Scoped shutdown freeze (app quit, or this window's close): refused before any authority,
         // promotion, or write, even for a session that would otherwise need no durable admission.
@@ -384,7 +395,8 @@ extension AgentModeViewModel {
             origin: origin,
             target: target,
             original: content,
-            pendingHandoff: pendingHandoff
+            pendingHandoff: pendingHandoff,
+            actionAuthorization: actionAuthorization
         )
         // Captured synchronously with the submitted content (no await since it was built). The
         // composer revision is consumed only while the live composer still is exactly the submitted
@@ -395,7 +407,7 @@ extension AgentModeViewModel {
         switch await lane.admitQueued(admission, composerToken: composerToken) {
         case let .success(admitted):
             return .admitted(
-                AgentQueuedInputIdentity(receipt: admitted.receipt),
+                AgentQueuedInputIdentity(receipt: admitted.receipt, actionAuthorization: actionAuthorization),
                 lane: lane,
                 content: content,
                 attachments: liveAttachments
@@ -714,6 +726,9 @@ extension AgentModeViewModel {
     /// `makeSession` (the single tab-session creation path) before any seeded draft, by every
     /// persistence-state (re)binding, and for existing sessions by `installRecoveryCoordinator`.
     func installRecoveryComposerObservation(on session: AgentTabSession) {
+        if let recoveryCoordinator, session.recoveryCoordinator == nil {
+            session.recoveryCoordinator = recoveryCoordinator
+        }
         guard recoveryCoordinator != nil, session.recoveryComposerObserver == nil else { return }
         session.recoveryComposerObserver = { [weak self] session in
             self?.recoveryComposerDidMutate(session: session)

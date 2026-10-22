@@ -367,6 +367,8 @@ package enum AgentProcessRegistryError: Error, Equatable {
     /// This family/provider pair has no complete-discovery qualification: the launch is refused
     /// before its spawn (no unregistered fallback).
     case unqualifiedProvider
+    /// Restart safely sealed new launches before proving every family stopped (held to exit).
+    case launchesSealed
     case storage(String)
 }
 

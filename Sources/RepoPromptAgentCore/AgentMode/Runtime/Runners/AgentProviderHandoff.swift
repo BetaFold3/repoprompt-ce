@@ -72,6 +72,20 @@ final class AgentProviderHandoff {
         committedEvidence?.observation ?? deferredObservation
     }
 
+    /// Immutable identity of a committed durable dispatch (Phase 4 history baseline): its first
+    /// delivery attempt ID, run attempt, and ordered local user items. `nil` when untracked or not
+    /// yet committed (no durable dispatch exists to bind a baseline to).
+    var dispatchBaselineIdentity: AgentDispatchBaselineIdentity? {
+        guard let evidence = committedEvidence, evidence.isDurable, let first = evidence.receipts.first else {
+            return nil
+        }
+        return AgentDispatchBaselineIdentity(
+            dispatchID: first.attemptID,
+            runAttemptID: runAttemptID,
+            userItemIDs: constituents.compactMap(\.userItemID)
+        )
+    }
+
     /// Run-start handoff (adopted plan §5): validated now, committed later by `commitDispatch`,
     /// after provider preparation/bootstrap that can create the pending-handoff prefix and once
     /// that exact prefix is attached to the still-`queued` carrier. Nothing is written here.
@@ -289,6 +303,7 @@ final class AgentProviderHandoff {
             return false
         }
         handoffStarted = true
+        evidence.noteHandoffBegan()
         return true
     }
 
@@ -324,8 +339,12 @@ final class AgentProviderHandoff {
 
     /// A deferred handoff wrote nothing: its intents are still `queued` with no attempt.
     private func noteDeferredOutcome(_ outcome: AgentRecoveryDispatchEvidence.Observation) {
-        if deferredObservation == .open {
-            deferredObservation = outcome
+        guard deferredObservation == .open else { return }
+        deferredObservation = outcome
+        // No commit can follow a settled deferred handoff (`commitDispatch` refuses it): an explicit
+        // recovery action carried here is fenced and settles as not handed off.
+        if outcome != .open, let action = constituents.first?.actionAuthorization {
+            heldLane?.recoveryCoordinator?.noteRecoveryActionSubmissionEnded(action)
         }
     }
 

@@ -238,7 +238,9 @@ let package = Package(
         .executableTarget(
             name: "RepoPromptMCP",
             dependencies: [
-                .product(name: "RepoPromptMCPCore", package: "RepoPromptCore")
+                .product(name: "RepoPromptMCPCore", package: "RepoPromptCore"),
+                // Restart safely private relaunch mode only (`ProcessRelaunchHelper`).
+                "RepoPromptPlatform"
             ],
             path: "Sources/RepoPromptMCP",
             swiftSettings: firstPartyDebugSettings

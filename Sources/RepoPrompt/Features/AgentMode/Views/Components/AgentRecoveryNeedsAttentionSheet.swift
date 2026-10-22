@@ -23,6 +23,14 @@ struct AgentRecoveryNeedsAttentionSheet: View {
             perform: { rowID, action in
                 await agentModeVM.performRecoveryListAction(rowID: rowID, action: action)
             },
+            performContinuation: { rowID, action, text, warning in
+                await agentModeVM.performRecoveryListContinuation(
+                    rowID: rowID,
+                    action: action,
+                    text: text,
+                    acknowledgedWarning: warning
+                )
+            },
             retryStartup: { agentModeVM.retryRecoveryStartup() }
         )
         VStack(alignment: .leading, spacing: 14) {

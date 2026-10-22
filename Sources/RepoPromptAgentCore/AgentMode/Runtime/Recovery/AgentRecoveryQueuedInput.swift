@@ -42,15 +42,24 @@ package struct AgentQueuedInputIdentity: Equatable {
     /// Transcript user item this input belongs to (`nil` only for untracked input without a bubble).
     package let userItemID: UUID?
     package let durability: Durability
+    /// The explicit recovery action whose own payload this is (review A P1-01). Carried unchanged
+    /// through queues, deferred hydration, and provider tasks into the dispatch evidence; only the
+    /// coordinator issues it, and a revoked one blocks every later commit and handoff.
+    package let actionAuthorization: AgentRecoveryActionAuthorization?
 
-    private init(userItemID: UUID?, durability: Durability) {
+    private init(userItemID: UUID?, durability: Durability, actionAuthorization: AgentRecoveryActionAuthorization? = nil) {
         self.userItemID = userItemID
         self.durability = durability
+        self.actionAuthorization = actionAuthorization
     }
 
     /// Durable identity from a store-issued queue receipt.
-    package init(receipt: AgentRecoveryQueueReceipt) {
-        self.init(userItemID: receipt.intent.userItemID, durability: .durable(receipt))
+    package init(receipt: AgentRecoveryQueueReceipt, actionAuthorization: AgentRecoveryActionAuthorization? = nil) {
+        self.init(
+            userItemID: receipt.intent.userItemID,
+            durability: .durable(receipt),
+            actionAuthorization: actionAuthorization
+        )
     }
 
     /// Legacy identity. `nil` once `session` requires durable admission.
@@ -122,6 +131,8 @@ package final class AgentRecoveryDispatchEvidence {
     private let lane: AgentRecoverySessionLane?
     /// One receipt per durable constituent, in handoff order (empty when untracked).
     package let receipts: [AgentRecoveryDispatchReceipt]
+    /// The recovery action whose own payload this handoff carries (`nil` for ordinary input).
+    package let actionAuthorization: AgentRecoveryActionAuthorization?
     /// Latest locally observed outcome (synchronous; durable writes follow in order).
     package private(set) var observation: Observation = .open
     /// Evidence writes that failed. Non-empty means recovery must keep treating the handoff as
@@ -129,20 +140,56 @@ package final class AgentRecoveryDispatchEvidence {
     package private(set) var writeFailures: [AgentRecoveryControllerFailure] = []
     private var writeTail: Task<Void, Never>?
 
-    private init(lane: AgentRecoverySessionLane?, receipts: [AgentRecoveryDispatchReceipt]) {
+    private init(
+        lane: AgentRecoverySessionLane?,
+        receipts: [AgentRecoveryDispatchReceipt],
+        actionAuthorization: AgentRecoveryActionAuthorization? = nil
+    ) {
         self.lane = lane
         self.receipts = receipts
+        self.actionAuthorization = actionAuthorization
     }
 
     package var isDurable: Bool {
         !receipts.isEmpty
     }
 
-    /// Final pre-handoff lane check (R06): the issuing lane is still `session`'s live lane, not
-    /// retired, and not frozen by reset preparation. Untracked evidence has no lane and is valid.
+    /// Final pre-handoff check (R06): the issuing lane is still `session`'s live lane, not retired,
+    /// and not frozen by reset preparation, and the shared recovery-action hold (review A P1-01)
+    /// admits exactly this handoff: no hold covers the session, or this evidence carries the
+    /// holding action's current authorization for its one committed attempt. Untracked evidence has
+    /// no lane; it is valid unless an action hold covers its session (the absence of a receipt is
+    /// never an exemption).
     package func isValidForHandoff(in session: AgentTabSession) -> Bool {
-        guard let lane else { return true }
-        return session.recoveryLane === lane && lane.isValidForHandoff
+        guard let lane else {
+            return !Self.untrackedInputIsHeld(in: session)
+        }
+        return session.recoveryLane === lane
+            && lane.permitsHandoff(attemptIDs: receipts.map(\.attemptID), action: actionAuthorization)
+    }
+
+    /// Untracked input (inactive admission) while an explicit recovery action holds its scope.
+    private static func untrackedInputIsHeld(in session: AgentTabSession) -> Bool {
+        let coordinator = session.recoveryLane?.recoveryCoordinator ?? session.recoveryCoordinator
+        return coordinator?.recoveryActionBlocksUntrackedInput(sessionID: session.activeAgentSessionID) ?? false
+    }
+
+    /// The provider boundary of this handoff was entered (route-specific): an explicit recovery
+    /// action's submission is handed off from here on, whatever acceptance later proves.
+    package func noteHandoffBegan() {
+        guard let actionAuthorization, let lane else { return }
+        lane.recoveryCoordinator?.noteRecoveryActionHandoffBegan(actionAuthorization, attemptIDs: receipts.map(\.attemptID))
+    }
+
+    /// The single recovery-action authorization the constituents carry: `.none` for ordinary input,
+    /// `nil` when mixed (some carry one, others not, or different ones): refused.
+    private static func carriedAction(
+        _ constituents: [AgentQueuedInputIdentity]
+    ) -> AgentRecoveryActionAuthorization?? {
+        let carried = constituents.compactMap(\.actionAuthorization)
+        guard !carried.isEmpty else { return .some(nil) }
+        guard carried.count == constituents.count, constituents.count == 1 else { return nil }
+        return .some(carried[0])
     }
 
     /// The synchronous refusals `begin` applies before writing anything: no constituents, untracked
@@ -153,13 +200,22 @@ package final class AgentRecoveryDispatchEvidence {
         constituents: [AgentQueuedInputIdentity]
     ) -> AgentRecoveryAdmissionFailure? {
         guard !constituents.isEmpty else { return .refused(.untrackedInput) }
+        // A coalesced or mixed payload never rides on one action's authority.
+        guard carriedAction(constituents) != nil else { return .refused(.recoveryActionInProgress) }
         let receipts = constituents.compactMap(\.queueReceipt)
         if receipts.isEmpty {
-            return session.recoveryAdmissionMode == .inactive ? nil : .refused(.untrackedInput)
+            guard session.recoveryAdmissionMode == .inactive else { return .refused(.untrackedInput) }
+            return untrackedInputIsHeld(in: session) ? .refused(.recoveryActionInProgress) : nil
         }
         guard receipts.count == constituents.count else { return .refused(.untrackedInput) }
         guard let lane = session.recoveryLane, !lane.isRetired else { return .refused(.laneRetired) }
         guard receipts.allSatisfy({ $0.intent.binding == lane.binding }) else { return .refused(.bindingMismatch) }
+        if let refusal = lane.recoveryActionDispatchRefusal(
+            intentIDs: receipts.map(\.intent.intentID),
+            action: carriedAction(constituents) ?? nil
+        ) {
+            return .refused(refusal)
+        }
         return nil
     }
 
@@ -180,6 +236,7 @@ package final class AgentRecoveryDispatchEvidence {
             return .success(AgentRecoveryDispatchEvidence(lane: nil, receipts: []))
         }
         guard let lane = session.recoveryLane else { return .failure(.refused(.laneRetired)) }
+        let action = carriedAction(constituents) ?? nil
         let requests = receipts.map { receipt in
             AgentRecoveryDispatchRequest(
                 intentID: receipt.intent.intentID,
@@ -190,12 +247,13 @@ package final class AgentRecoveryDispatchEvidence {
             await lane.beginDispatch(
                 intentID: requests[0].intentID,
                 attempt: requests[0].attempt,
-                authorization: authorization
+                authorization: authorization,
+                action: action
             ).map { [$0] }
         } else {
-            await lane.beginDispatches(requests, authorization: authorization)
+            await lane.beginDispatches(requests, authorization: authorization, action: action)
         }
-        return result.map { AgentRecoveryDispatchEvidence(lane: lane, receipts: $0) }
+        return result.map { AgentRecoveryDispatchEvidence(lane: lane, receipts: $0, actionAuthorization: action) }
     }
 
     /// Before-handoff step under an existing run attempt (R07): for durable input the run attempt is
@@ -211,6 +269,10 @@ package final class AgentRecoveryDispatchEvidence {
         authorization: AgentRecoveryDispatchAuthorization = .liveQueue
     ) async -> Result<AgentRecoveryDispatchEvidence, AgentRecoveryAdmissionFailure> {
         if !constituents.isEmpty, constituents.allSatisfy(\.isDurable) {
+            // Refused (including by the shared action hold) before any run-attempt write.
+            if let refusal = dispatchRefusal(session: session, constituents: constituents) {
+                return .failure(refusal)
+            }
             guard let lane = session.recoveryLane, !lane.isRetired else {
                 return .failure(.refused(.laneRetired))
             }
@@ -350,11 +412,20 @@ package final class AgentRecoveryDispatchEvidence {
         // Strong capture: a dropped evidence object still records its failures until written.
         let tail = Task { @MainActor in
             await previous?.value
+            var failed = false
             for receipt in receipts {
                 if case let .failure(failure) = await write(lane, receipt) {
                     writeFailures.append(failure)
+                    failed = true
                 }
             }
+            // An explicit recovery action's submission settles on its written (or failed) evidence.
+            lane.recoveryCoordinator?.noteRecoveryActionEvidence(
+                actionAuthorization,
+                attemptIDs: receipts.map(\.attemptID),
+                observation: observation,
+                writeFailed: failed || !writeFailures.isEmpty
+            )
         }
         writeTail = tail
         // The lane signals when this write lands, so waiters never poll for late evidence.

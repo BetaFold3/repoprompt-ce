@@ -1268,6 +1268,11 @@ package final class ClaudeAgentModeCoordinator {
                 await shutdownClaudeControllerIfUnowned(controller, by: session)
                 throw ControllerLifecycleError.superseded
             }
+            if let existingSessionID, session.recoveryResumeFallbackSuppressedConversationID == existingSessionID {
+                // Phase 4: the recovery dispatch resumed its conversation; the suppression ends.
+                session.recoveryResumeFallbackSuppressedConversationID = nil
+                session.recoveryResumeUnavailableConversationID = nil
+            }
             return sessionRef
         } catch ControllerLifecycleError.superseded {
             throw ControllerLifecycleError.superseded
@@ -1280,8 +1285,20 @@ package final class ClaudeAgentModeCoordinator {
                 await shutdownClaudeControllerIfUnowned(controller, by: session)
                 throw ControllerLifecycleError.superseded
             }
-            guard Self.shouldRetryFreshStartWithoutResume(after: error, existingSessionID: existingSessionID) else {
+            switch Self.resumeFailureDisposition(
+                after: error,
+                existingSessionID: existingSessionID,
+                suppressedConversationID: session.recoveryResumeFallbackSuppressedConversationID
+            ) {
+            case .rethrow:
                 throw error
+            case let .requireExplicitChoice(conversationID):
+                // Phase 4: a recovery dispatch never falls back to an implicit fresh conversation.
+                // The startup failed before any input write; the user chooses explicitly.
+                session.recoveryResumeUnavailableConversationID = conversationID
+                throw AgentRecoveryResumeFallbackRequired(conversationID: conversationID)
+            case .retryFresh:
+                break
             }
 
             let replacementClaim = beginFallbackReplacementClaim(
@@ -1477,6 +1494,30 @@ package final class ClaudeAgentModeCoordinator {
         }
         let description = error.localizedDescription.trimmingCharacters(in: .whitespacesAndNewlines)
         return description.isEmpty ? String(describing: error) : description
+    }
+
+    enum ResumeFailureDisposition: Equatable {
+        case rethrow
+        case retryFresh
+        /// Phase 4 recovery dispatch: the implicit fresh fallback is suppressed for this conversation.
+        case requireExplicitChoice(conversationID: String)
+    }
+
+    /// What a failed start/resume does next. The implicit fresh retry applies only when the failure
+    /// qualifies (`shouldRetryFreshStartWithoutResume`) and no recovery dispatch suppressed it for
+    /// exactly this conversation.
+    static func resumeFailureDisposition(
+        after error: Error,
+        existingSessionID: String?,
+        suppressedConversationID: String?
+    ) -> ResumeFailureDisposition {
+        guard shouldRetryFreshStartWithoutResume(after: error, existingSessionID: existingSessionID) else {
+            return .rethrow
+        }
+        if let existingSessionID, suppressedConversationID == existingSessionID {
+            return .requireExplicitChoice(conversationID: existingSessionID)
+        }
+        return .retryFresh
     }
 
     private static func shouldRetryFreshStartWithoutResume(
@@ -1705,6 +1746,9 @@ package final class ClaudeAgentModeCoordinator {
             dispatchHandoffsByTurnID.count
         }
     #endif
+
+    static let dispatchBaselineRefusedText =
+        "Claude native send stopped before anything was sent: this message's pre-send history position couldn't be saved."
 
     /// Errors the Claude controller throws before writing the user message (see
     /// `ClaudeNativeProcessSessionController.sendUserMessage`). Any other error is ambiguous.
@@ -2006,6 +2050,7 @@ package final class ClaudeAgentModeCoordinator {
             else {
                 return false
             }
+            let baselineRefusal = ClaudeDispatchBaselineRefusal()
             do {
                 let outboundText: String
                 if handoff.isDurable {
@@ -2034,8 +2079,23 @@ package final class ClaudeAgentModeCoordinator {
                 let runtimeOwner = session.runtimeSessionScope
                 // R6: a managed transport re-verifies this dispatch still owns the turn after its
                 // registry awaits, immediately before the bytes.
+                // Phase 4: inside that same pre-byte admission, the dispatch's history baseline is
+                // captured and committed first (gated OFF in production: no read, no write). A
+                // baseline that cannot be persisted refuses the write: zero bytes, proven not written.
+                let baselineIdentity = handoff.dispatchBaselineIdentity
                 let writeAdmission: @Sendable () async -> Bool = { @MainActor [weak self, weak session] in
-                    guard let self, let session else { return false }
+                    guard let self, let session,
+                          dispatchReservationIsCurrent(dispatchReservation, for: session),
+                          sessionOwnsClaudeController(controller, for: session)
+                    else { return false }
+                    if let viewModel {
+                        let admitted = await viewModel.admitClaudeDispatchBaseline(baselineIdentity, session: session)
+                        if !admitted {
+                            baselineRefusal.refused = true
+                            return false
+                        }
+                    }
+                    // Revalidated after the baseline's awaits.
                     return dispatchReservationIsCurrent(dispatchReservation, for: session)
                         && sessionOwnsClaudeController(controller, for: session)
                 }
@@ -2081,7 +2141,9 @@ package final class ClaudeAgentModeCoordinator {
                     return false
                 }
                 let errorItem = AgentChatItem.error(
-                    "Claude native send failed: \(error.localizedDescription)",
+                    baselineRefusal.refused
+                        ? Self.dispatchBaselineRefusedText
+                        : "Claude native send failed: \(error.localizedDescription)",
                     sequenceIndex: session.nextSequenceIndex
                 )
                 session.appendItem(errorItem)

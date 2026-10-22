@@ -215,6 +215,96 @@ final class AgentProviderHandoffTests: XCTestCase {
 
 @MainActor
 extension AgentModeRunServiceLifecycleTests {
+    /// Review R1 B N2: a non-Codex start that fails before any runner owns its input (the workspace
+    /// path can't be resolved) still returns `nil`, which callers read as "runner admitted". The
+    /// explicit recovery action its input carries ends anyway: fenced (nothing was committed), it
+    /// settles not handed off instead of holding the session forever, and its intent stays queued.
+    func testNonCodexStartupFailureBeforeAnyRunnerSettlesTheCarriedRecoveryAction() async throws {
+        let fixture = try await RecoveryLaneFixture.make("r1-n2-startup-failure")
+        defer { fixture.tearDown() }
+        let recorder = LifecycleRecorder()
+        let harness = makeHarness(recorder: recorder, workspacePathProvider: { _ in throw LifecycleTestError.workspaceMissing })
+        let session = fixture.boundTabSession()
+        session.selectedAgent = .claudeCode
+        harness.host.test_installLiveSession(session)
+        let lane = fixture.lane
+        let request = AgentRecoveryActionRequest(
+            actionID: UUID(),
+            itemKey: AgentRecoveryCardKey(
+                kind: .run,
+                incarnationID: lane.binding.incarnationID,
+                transcriptResetGeneration: lane.binding.transcriptResetGeneration,
+                entityID: UUID().uuidString
+            ),
+            kind: .continueWithText,
+            expectedRevision: nil,
+            sourceRunAttemptID: nil,
+            target: AgentRecoveryActionTarget(providerKindRaw: "claudeCode", providerConversationID: "conv-1"),
+            text: AgentRecoveryActionRequest.defaultContinuationText,
+            plannedUserItemID: UUID(),
+            supersedesActionID: nil,
+            confirmsUncertainPriorDelivery: false
+        )
+        guard case let .acquired(authorization) = fixture.coordinator.beginRecoveryAction(request, lane: lane) else {
+            return XCTFail("expected the action hold")
+        }
+        let plannedItemID = try XCTUnwrap(authorization.plannedUserItemID)
+        let admitted = try await lane.admitQueued(AgentRecoveryAdmission(
+            binding: lane.binding,
+            userItemID: plannedItemID,
+            origin: .followUp,
+            target: .session,
+            original: RecoveryTestSupport.content("continue"),
+            actionAuthorization: authorization
+        )).get()
+        let identity = AgentQueuedInputIdentity(receipt: admitted.receipt, actionAuthorization: authorization)
+
+        let outcome = await harness.service.startRun(
+            tabID: session.tabID,
+            session: session,
+            initialUserMessage: "continue",
+            initialMessageForRun: "continue",
+            attachments: [],
+            inputConstituents: [identity]
+        )
+        XCTAssertNil(outcome, "unchanged: a pre-runner startup failure still returns nil")
+        XCTAssertEqual(session.runState, .failed)
+        XCTAssertFalse(recorder.contains(prefix: "factory:"), "no provider was created")
+
+        // Bounded polling only detects a regression (a forever hold); the exact settlement is the proof.
+        final class Observed {
+            var settlement: AgentRecoveryActionSettlement?
+        }
+        let observed = Observed()
+        let observer = Task { @MainActor in
+            observed.settlement = await fixture.coordinator.awaitRecoveryActionSettlement(authorization)
+        }
+        let settled = await RecoveryTestSupport.eventually { observed.settlement != nil }
+        XCTAssertTrue(settled, "the carried action settles; it never holds the session forever")
+        guard settled else {
+            fixture.coordinator.endRecoveryAction(authorization)
+            return
+        }
+        _ = await observer.value
+        XCTAssertEqual(observed.settlement, .notHandedOff(nil))
+        let intent = await fixture.intent(identity)
+        XCTAssertEqual(intent?.deliveryState, .queued, "nothing was committed or sent")
+        let attempts = await fixture.attempts(for: identity)
+        XCTAssertTrue(attempts.isEmpty)
+        let intentID = try XCTUnwrap(identity.intentID)
+        let late = await lane.beginDispatch(
+            intentID: intentID,
+            attempt: AgentRecoveryAttemptStart(attemptID: UUID(), runAttemptID: nil),
+            authorization: .liveQueue,
+            action: authorization
+        )
+        guard case .failure(.refused(.recoveryActionInProgress)) = late else {
+            return XCTFail("the ended submission's token is revoked, got \(late)")
+        }
+        fixture.coordinator.endRecoveryAction(authorization)
+        XCTAssertEqual(fixture.coordinator.recoveryActionHoldCount, 0)
+    }
+
     func testStartRunDispatchRefusalStartsNoRunAndNoProviderHandoff() async throws {
         let fixture = try await RecoveryLaneFixture.make("route-refused")
         defer { fixture.tearDown() }
@@ -951,6 +1041,205 @@ extension AgentModeRunServiceLifecycleTests {
         XCTAssertEqual(intent?.pendingHandoff?.prependedText, "RECOVERY-HISTORY\n\n")
         let attempts = await fixture.attempts(for: identity)
         XCTAssertEqual(attempts.count, 1)
+    }
+}
+
+// MARK: Phase 4 pre-byte baseline admission (coordinator → host → managed write)
+
+/// Records the host's baseline admissions for the coordinator composition tests; an optional gate
+/// holds the admission (a slow baseline commit) and `result` is the host's verdict.
+@MainActor
+private final class BaselineAdmissionProbe {
+    var identities: [AgentDispatchBaselineIdentity?] = []
+    var owners: [AgentRuntimeSessionScope] = []
+    var result = true
+    var gate: LifecycleAsyncGate?
+}
+
+@MainActor
+extension AgentModeRunServiceLifecycleTests {
+    private struct BaselineRoute {
+        let fixture: RecoveryLaneFixture
+        let recorder: LifecycleRecorder
+        let controller: LifecycleFakeNativeController
+        let harness: LifecycleHarness
+        let session: AgentTabSession
+        let identity: AgentQueuedInputIdentity
+        let ownership: AgentRunOwnership
+        let handoff: AgentProviderHandoff
+        let probe: BaselineAdmissionProbe
+
+        func send(_ text: String) async -> Bool {
+            await harness.host.claudeCoordinator.sendClaudeNativeMessage(
+                session: session,
+                text: text,
+                attachments: [],
+                handoff: handoff
+            )
+        }
+    }
+
+    /// The existing route harness with a managed-transport fake (evaluates the task-local write
+    /// admission before its recorded write) and the host's baseline admission observed.
+    private func makeBaselineRoute(_ name: String, text: String) async throws -> BaselineRoute {
+        let fixture = try await RecoveryLaneFixture.make(name)
+        let recorder = LifecycleRecorder()
+        let controller = LifecycleFakeNativeController(recorder: recorder, invokesWriteAdmission: true)
+        let harness = makeHarness(recorder: recorder, claudeController: controller)
+        let session = makeRunningClaudeSession(controller: controller)
+        session.installPersistentSessionBinding(AgentPersistentSessionBindingIdentity(tabID: session.tabID, sessionID: fixture.sessionID))
+        session.recoveryLane = fixture.lane
+        harness.host.test_installLiveSession(session)
+        let identity = try await fixture.queuedIdentity(text)
+        let ownership = session.beginRunAttempt(source: "test.baseline")
+        let handoff = try await AgentProviderHandoff.begin(
+            session: session,
+            constituents: [identity],
+            ownership: ownership,
+            processRunID: session.runID
+        ).get()
+        let probe = BaselineAdmissionProbe()
+        harness.host.test_claudeDispatchBaselineAdmission = { [probe, recorder] identity, _ in
+            probe.identities.append(identity)
+            probe.owners.append(AgentRuntimeOperationOwner.current)
+            recorder.record("host:baseline")
+            if let gate = probe.gate {
+                await gate.arriveAndWait()
+            }
+            return probe.result
+        }
+        return BaselineRoute(
+            fixture: fixture,
+            recorder: recorder,
+            controller: controller,
+            harness: harness,
+            session: session,
+            identity: identity,
+            ownership: ownership,
+            handoff: handoff,
+            probe: probe
+        )
+    }
+
+    /// A slow baseline commit holds the write: nothing reaches the provider until the host admits.
+    func testClaudeBaselineAdmissionHoldsTheWriteUntilItsCommitIsReleased() async throws {
+        let route = try await makeBaselineRoute("p4-baseline-delayed", text: "held")
+        defer { route.fixture.tearDown() }
+        let gate = LifecycleAsyncGate()
+        route.probe.gate = gate
+
+        let sending = Task { await route.send("held") }
+        await gate.waitUntilArrived()
+
+        XCTAssertTrue(route.recorder.contains("claude:admission"))
+        XCTAssertTrue(route.recorder.contains("host:baseline"), "The coordinator's admission reached the host")
+        XCTAssertFalse(route.recorder.contains("claude:send"), "Zero bytes while the baseline is pending")
+        let sentWhileHeld = await route.controller.recordedSentMessages()
+        XCTAssertTrue(sentWhileHeld.isEmpty)
+
+        await gate.release()
+        let sent = await sending.value
+
+        XCTAssertTrue(sent)
+        let events = route.recorder.events
+        let baselineIndex = try XCTUnwrap(events.firstIndex(of: "host:baseline"))
+        let writeIndex = try XCTUnwrap(events.firstIndex(of: "claude:send"))
+        XCTAssertLessThan(baselineIndex, writeIndex, "The baseline admission precedes the write")
+        let sentAfterRelease = await route.controller.recordedSentMessages()
+        XCTAssertEqual(sentAfterRelease.count, 1)
+        XCTAssertEqual(route.probe.identities.count, 1, "One admission per write")
+    }
+
+    /// A baseline that cannot be committed refuses the write: zero bytes, a proven non-write (the
+    /// same intent back to `queued`, not handed off), and the refusal is explained.
+    func testClaudeBaselineCommitFailureRefusesTheWriteAsProvenNotWritten() async throws {
+        let route = try await makeBaselineRoute("p4-baseline-refused", text: "refused")
+        defer { route.fixture.tearDown() }
+        route.probe.result = false
+
+        let sent = await route.send("refused")
+        _ = await route.handoff.evidence.settled()
+
+        XCTAssertFalse(sent)
+        XCTAssertTrue(route.recorder.contains("claude:admission-refused"))
+        XCTAssertFalse(route.recorder.contains("claude:send"), "No provider write")
+        let sentMessages = await route.controller.recordedSentMessages()
+        XCTAssertTrue(sentMessages.isEmpty)
+        XCTAssertEqual(route.handoff.observation, .notHandedOff)
+        let intent = await route.fixture.intent(route.identity)
+        XCTAssertEqual(intent?.deliveryState, .queued)
+        XCTAssertTrue(
+            route.session.items.contains { $0.kind == .error && $0.text == ClaudeAgentModeCoordinator.dispatchBaselineRefusedText },
+            "The transcript explains the pre-send refusal"
+        )
+    }
+
+    /// Supersession or cancellation while the baseline is pending writes nothing even though the
+    /// host then admits: the coordinator revalidates after the await, and the managed write checks
+    /// cancellation after the admission.
+    func testClaudeBaselineAdmissionSupersededOrCancelledWhileAwaitingWritesNothing() async throws {
+        enum Cut: CaseIterable { case superseded, cancelled }
+        for cut in Cut.allCases {
+            let route = try await makeBaselineRoute("p4-baseline-\(cut)", text: "\(cut)")
+            defer { route.fixture.tearDown() }
+            let gate = LifecycleAsyncGate()
+            route.probe.gate = gate
+
+            let sending = Task { await route.send("\(cut)") }
+            await gate.waitUntilArrived()
+            switch cut {
+            case .superseded:
+                route.session.beginRunAttempt(source: "test.successor")
+            case .cancelled:
+                sending.cancel()
+            }
+            await gate.release()
+            let sent = await sending.value
+            _ = await route.handoff.evidence.settled()
+
+            XCTAssertFalse(sent, "\(cut)")
+            XCTAssertTrue(
+                route.recorder.contains(cut == .superseded ? "claude:admission-refused" : "claude:admission-cancelled"),
+                "\(cut): \(route.recorder.events)"
+            )
+            XCTAssertFalse(route.recorder.contains("claude:send"), "\(cut): no provider write")
+            let sentMessages = await route.controller.recordedSentMessages()
+            XCTAssertTrue(sentMessages.isEmpty, "\(cut)")
+            XCTAssertEqual(route.handoff.observation, .notHandedOff, "\(cut)")
+            let intent = await route.fixture.intent(route.identity)
+            XCTAssertEqual(intent?.deliveryState, .queued, "\(cut)")
+            XCTAssertFalse(
+                route.session.items.contains { $0.text == ClaudeAgentModeCoordinator.dispatchBaselineRefusedText },
+                "\(cut): the host admitted; this is not a baseline refusal"
+            )
+        }
+    }
+
+    /// The host receives exactly the committed dispatch's immutable identity (first delivery
+    /// attempt, its run attempt, its user items), and the admission runs under the owner scope the
+    /// dispatch captured.
+    func testClaudeBaselineAdmissionReceivesTheExactCommittedDispatchIdentityAndOwner() async throws {
+        let route = try await makeBaselineRoute("p4-baseline-identity", text: "identity")
+        defer { route.fixture.tearDown() }
+        let expectedOwner = route.session.runtimeSessionScope
+
+        let sent = await route.send("identity")
+
+        XCTAssertTrue(sent)
+        let attempts = await route.fixture.attempts(for: route.identity)
+        let attempt = try XCTUnwrap(attempts.first)
+        XCTAssertEqual(attempts.count, 1)
+        let expected = AgentDispatchBaselineIdentity(
+            dispatchID: attempt.attemptID,
+            runAttemptID: route.ownership.attemptID,
+            userItemIDs: [attempt.userItemID]
+        )
+        XCTAssertEqual(route.probe.identities, [expected])
+        XCTAssertEqual(route.handoff.dispatchBaselineIdentity, expected, "The identity is immutable after the write")
+        XCTAssertNotEqual(expectedOwner, .unavailable, "The bound session has a managed scope")
+        XCTAssertEqual(route.probe.owners, [expectedOwner], "The host's admission runs under the captured owner")
+        let controllerOwners = await route.controller.recordedAdmissionOwners()
+        XCTAssertEqual(controllerOwners, [expectedOwner])
     }
 }
 

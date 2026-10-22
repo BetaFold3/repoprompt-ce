@@ -41,6 +41,11 @@ package actor AgentProcessRegistry {
     /// Launches whose birth commit failed: no write authority, but their launcher still owns the
     /// exact child and must report its reap (token per runtime).
     private var uncommittedLaunches: [UUID: UUID] = [:]
+    /// Restart safely (review A P1-08): once sealed, no new launch is reserved (sessionless probes
+    /// included) for the rest of this process. Taken before the all-stopped proof, at R4 Stage B
+    /// (past its point of no return, so Stage A's reversible Cancel never meets a seal); held through
+    /// the helper's arm and the process exit. Never released.
+    package private(set) var isSealedForSafeRestart = false
 
     private struct Watch {
         let identity: AgentRuntimeProcessIdentity
@@ -665,6 +670,7 @@ package actor AgentProcessRegistry {
     /// launch lacks its session context, ownership conflicts or the reservation cannot be written.
     package func reserveLaunch(_ context: AgentRuntimeLaunchContext) throws -> (runtimeID: UUID, launchToken: UUID) {
         guard isRegistrationActive else { throw AgentProcessRegistryError.registrationInactive }
+        guard !isSealedForSafeRestart else { throw AgentProcessRegistryError.launchesSealed }
         guard qualification.covers(family: context.family, provider: context.provider) else {
             throw AgentProcessRegistryError.unqualifiedProvider
         }
@@ -1046,5 +1052,59 @@ package actor AgentProcessRegistry {
         persistIfChanged(final, previous: previous)
         publish()
         return unpersisted.contains(final.runtimeID) ? .unresolved : .stopped
+    }
+}
+
+// MARK: - Restart safely Stage B proof (lossless restart Phase 4 §G)
+
+/// Whether every registered provider family and tool is proven gone. Only `.allStopped` lets
+/// Restart safely arm its relaunch helper; anything else keeps the helper unarmed.
+package enum AgentRuntimeAllStoppedProof: Equatable {
+    case allStopped
+    case notProven(String)
+}
+
+package extension AgentProcessRegistry {
+    /// Seals new launches for Restart safely (see `isSealedForSafeRestart`), then runs one discovery
+    /// pass and proves that no family, tool, launch, reservation, or unreadable record remains. The
+    /// seal is taken synchronously on the registry's executor before any await, so no launch can be
+    /// reserved between the proof and the helper's arm or the exit. Never signals anything; absence
+    /// of evidence is not proof.
+    func verifyAllFamiliesStopped() async -> AgentRuntimeAllStoppedProof {
+        guard isRegistrationActive else { return .notProven("Runtime registration is not active.") }
+        isSealedForSafeRestart = true
+        guard hasStarted else { return .notProven("Runtime ownership has not been checked yet.") }
+        await refresh()
+        if let storageFailure { return .notProven("Runtime records are unreadable: \(storageFailure)") }
+        if !preserved.isEmpty || unidentifiedPreservedCount > 0 {
+            return .notProven("Some runtime records could not be read.")
+        }
+        if !activeLaunches.isEmpty || !uncommittedLaunches.isEmpty {
+            return .notProven("A provider launch is still in progress.")
+        }
+        if !unpersisted.isEmpty { return .notProven("A runtime's latest state could not be saved.") }
+        for record in records.values {
+            switch record.state {
+            case .exited, .stopped:
+                continue
+            case .toolsRemaining:
+                return .notProven("Tools started by an agent are still running.")
+            case .reserved, .live, .unknown, .detachedAtQuit:
+                return .notProven("An agent process may still be running.")
+            }
+        }
+        return .allStopped
+    }
+
+    /// History reconciliation (Phase 4 §D): the Claude configuration directories this registry
+    /// recorded for runtimes associated with `conversationID`, from the runtime's own observed
+    /// environment. Registry knowledge only — never the app's environment or the selected profile.
+    /// A runtime without a recorded directory contributes nothing (unknown is not the default).
+    func claudeProviderHomes(conversationID: String) -> [String] {
+        let homes = records.values
+            .filter { Self.isClaude($0.family) && $0.conversationIDs.contains(conversationID) }
+            .compactMap(\.providerHome)
+            .filter { !$0.isEmpty }
+        return Array(Set(homes)).sorted()
     }
 }

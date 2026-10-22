@@ -233,6 +233,11 @@ class WindowStatesManager: ObservableObject {
     lazy var lifecycleShutdown = AgentLifecycleShutdownCoordinator(environment: makeLifecycleShutdownEnvironment())
     /// Failure prompts currently shown by `lifecycleShutdown`, by scope.
     var presentedLifecycleShutdownAlerts: [AgentLifecycleShutdownScope: NSAlert] = [:]
+    /// Restart safely (lossless restart Phase 4): the relaunch coordinator, `nil` while gated OFF.
+    lazy var appRelaunchCoordinator: AppRelaunchCoordinator? = AppRelaunchCoordinator.production()
+    /// The reason of the one app termination request Restart safely starts (`.safeRestart` only
+    /// from `requestSafeRestart()`); taken once by the termination entry (review A P1-09).
+    var shutdownReasonLatch = AppShutdownReasonLatch()
 
     private lazy var globalShortcutActivationController = GlobalShortcutActivationController(
         trackedWindows: { [weak self] in self?.allWindows ?? [] },

@@ -142,10 +142,25 @@ package protocol CodexSessionControlling: AnyObject {
     /// session scope its operation's owner captured and bound (`AgentRuntimeOperationOwner`),
     /// never a session read at write time. Without it the client's fixed default scope applies.
     func useOwnerCapturedRuntimeSessions()
+    /// Lossless-restart Phase 4 observation of one explicit thread's expected turn (never resumes,
+    /// starts, steers, or interrupts). Unsupported by default.
+    func observeRecovery(
+        threadID: String,
+        expectedTurnID: String,
+        timeout: TimeInterval?
+    ) async throws -> CodexRecoveryObservation
 }
 
 package extension CodexSessionControlling {
     func useOwnerCapturedRuntimeSessions() {}
+
+    func observeRecovery(
+        threadID _: String,
+        expectedTurnID _: String,
+        timeout _: TimeInterval?
+    ) async throws -> CodexRecoveryObservation {
+        throw CodexRecoveryObservationError.unsupported
+    }
 
     func respondToServerRequest(receipt _: CodexServerRequestReceipt?, id: CodexAppServerRequestID, result: [String: Any]) async {
         await respondToServerRequest(id: id, result: result)
@@ -1758,6 +1773,190 @@ package final class CodexNativeSessionController {
             )
             return Self.parseThreadSnapshot(from: result, fallbackEffort: nil)
         }
+    }
+
+    // MARK: Recovery observation (lossless restart Phase 4 §E)
+
+    #if DEBUG
+        /// Test-only stand-in for a registered transport (production never sets it).
+        var recoveryObservationTreatsTransportAsRegisteredForTesting = false
+    #endif
+
+    private var recoveryObservationTransportIsRegistered: Bool {
+        #if DEBUG
+            if recoveryObservationTreatsTransportAsRegisteredForTesting { return true }
+        #endif
+        return client.isRuntimeRegistrationActive
+    }
+
+    /// Bounded number of newest turns inspected while locating the expected turn.
+    static let recoveryObservationTurnLimit = 20
+
+    /// Observes one explicit thread's expected turn without rebinding, resuming, starting,
+    /// steering, or interrupting anything. Completion is reported only from the expected turn's own
+    /// terminal status; latest-turn status, idle state, and acceptance are never evidence. A
+    /// transport without Phase 3 registration fails closed.
+    ///
+    /// Order (cold-start safe): finish the registered transport start (reservation, birth
+    /// registration, `initialize`) BEFORE capturing its generation; associate the expected thread
+    /// with that registered runtime for the owner-captured session (registry only, no thread
+    /// rebinding or `thread/resume`); then only the observational `thread/turns/list` /
+    /// `thread/read`, each fenced to that generation. A changed transport is stale: no fallback, no
+    /// retry, and no capability memo update for it.
+    package func observeRecovery(
+        threadID observedThreadID: String,
+        expectedTurnID: String,
+        timeout: TimeInterval?
+    ) async throws -> CodexRecoveryObservation {
+        let threadID = observedThreadID.trimmingCharacters(in: .whitespacesAndNewlines)
+        let turnID = expectedTurnID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !threadID.isEmpty, !turnID.isEmpty else {
+            throw CodexRecoveryObservationError.missingIdentity
+        }
+        guard recoveryObservationTransportIsRegistered else {
+            throw CodexRecoveryObservationError.registeredTransportRequired
+        }
+        var usesFixtureTransport = false
+        #if DEBUG
+            // The DEBUG stand-in has no registered transport to start or associate (fixture reads only).
+            usesFixtureTransport = recoveryObservationTreatsTransportAsRegisteredForTesting
+        #endif
+        let runtimeSession = operationRuntimeSession
+        if !usesFixtureTransport {
+            await updateClientProcessFeaturePolicy()
+            try await client.startIfNeeded(runtimeSession: runtimeSession)
+        }
+        // Captured only after the start completed, so a cold first read is attributable to it.
+        let transportGeneration = await client.currentTransportGeneration()
+        if !usesFixtureTransport {
+            try await client.associateObservedConversation(
+                threadID,
+                runtimeSession: runtimeSession,
+                worktreePath: workspacePath,
+                expectedGeneration: transportGeneration
+            )
+        }
+        func requireObservedGeneration() async throws {
+            guard await client.currentTransportGeneration() == transportGeneration else {
+                throw CodexRecoveryObservationError.staleTransportGeneration
+            }
+        }
+        try await requireObservedGeneration()
+        let memo = capabilityMemo(forTransportGeneration: transportGeneration)
+        var turns: [[String: Any]] = []
+        var source = CodexRecoveryObservation.Source.turnsList
+        if memo.turnsList != .unsupported {
+            do {
+                let result = try await performRequest(
+                    method: "thread/turns/list",
+                    params: [
+                        "threadId": threadID,
+                        "limit": Self.recoveryObservationTurnLimit,
+                        "sortDirection": "desc"
+                    ],
+                    timeout: timeout
+                )
+                try await requireObservedGeneration()
+                updateCapabilityMemo(forTransportGeneration: transportGeneration) { $0.turnsList = .supported }
+                turns = result["data"] as? [[String: Any]] ?? []
+            } catch {
+                // A changed transport is stale before any capability conclusion or fallback.
+                try await requireObservedGeneration()
+                guard Self.isTurnsListUnsupportedError(error) else { throw error }
+                updateCapabilityMemo(forTransportGeneration: transportGeneration) { $0.turnsList = .unsupported }
+                source = .threadRead
+            }
+        } else {
+            source = .threadRead
+        }
+        if source == .threadRead {
+            // Legacy app-server: one full read, bounded by the transport's inbound frame ceiling.
+            let result = try await performRequest(
+                method: "thread/read",
+                params: ["threadId": threadID, "includeTurns": true],
+                timeout: timeout
+            )
+            let thread = result["thread"] as? [String: Any] ?? [:]
+            turns = thread["turns"] as? [[String: Any]] ?? []
+        }
+        try await requireObservedGeneration()
+        return Self.recoveryObservation(
+            threadID: threadID,
+            expectedTurnID: turnID,
+            turns: turns,
+            source: source,
+            transportGeneration: transportGeneration
+        )
+    }
+
+    /// Pure parsing of the expected turn (exposed for fixture tests).
+    static func recoveryObservation(
+        threadID: String,
+        expectedTurnID: String,
+        turns: [[String: Any]],
+        source: CodexRecoveryObservation.Source,
+        transportGeneration: UInt64
+    ) -> CodexRecoveryObservation {
+        let matching = turns.filter {
+            firstString(in: $0, keys: ["id"])?.trimmingCharacters(in: .whitespacesAndNewlines) == expectedTurnID
+        }
+        guard matching.count == 1, let turn = matching.first else {
+            // Not found within the bounded observation (or ambiguous): unconfirmed, no rows.
+            return CodexRecoveryObservation(
+                threadID: threadID,
+                turnID: nil,
+                terminal: .unconfirmed,
+                abortDetail: nil,
+                items: nil,
+                source: source,
+                transportGeneration: transportGeneration
+            )
+        }
+        let rawStatus = turn["status"] as? String
+        let terminal: CodexRecoveryObservation.Terminal = switch parseTerminalTurnStatus(from: rawStatus) {
+        case .completed: .completed
+        case .interrupted: .interrupted
+        case .failed: .failed
+        case nil: .unconfirmed
+        }
+        var abortDetail: String?
+        if terminal == .interrupted || terminal == .failed,
+           let error = turn["error"] as? [String: Any], let message = error["message"] as? String
+        {
+            abortDetail = String(message.prefix(500))
+        }
+        return CodexRecoveryObservation(
+            threadID: threadID,
+            turnID: expectedTurnID,
+            terminal: terminal,
+            abortDetail: abortDetail,
+            items: recoveryItems(turn["items"]),
+            source: source,
+            transportGeneration: transportGeneration
+        )
+    }
+
+    /// The supported item subset: user and agent messages with native item IDs. Any other item type
+    /// (tools, reasoning, compaction, ...) makes the item list unavailable rather than partial.
+    private static func recoveryItems(_ raw: Any?) -> [CodexRecoveryObservation.Item]? {
+        guard let array = raw as? [[String: Any]], !array.isEmpty else { return nil }
+        var items: [CodexRecoveryObservation.Item] = []
+        var seen: Set<String> = []
+        for element in array {
+            guard let id = element["id"] as? String, !id.isEmpty, seen.insert(id).inserted,
+                  let type = element["type"] as? String
+            else { return nil }
+            switch type.lowercased() {
+            case "agentmessage", "agent_message":
+                guard let text = element["text"] as? String else { return nil }
+                items.append(.init(nativeItemID: id, kind: .agentMessage, text: text))
+            case "usermessage", "user_message":
+                items.append(.init(nativeItemID: id, kind: .userMessage, text: nil))
+            default:
+                return nil
+            }
+        }
+        return items
     }
 
     package func setThreadName(_ name: String, threadID explicitThreadID: String?) async throws {

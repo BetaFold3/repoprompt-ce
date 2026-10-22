@@ -494,6 +494,9 @@ package actor CodexAppServerClient {
         /// captures its transport, `associated` after its association await), so fixtures can replace
         /// the transport inside a request's awaits. Never set outside tests.
         private var debugRuntimeFenceCheckpoint: (@Sendable (String) async -> Void)?
+        /// Test-only replacement of process start and initialization (a fixture installs its test
+        /// transport and registered launch, advancing the generation). Never set outside tests.
+        private var debugStartupOverride: (@Sendable (CodexAppServerClient) async throws -> Void)?
     #endif
     private var stdoutChunkChannel: FileHandleChunkChannel?
     private var stderrChunkChannel: FileHandleChunkChannel?
@@ -993,6 +996,30 @@ package actor CodexAppServerClient {
         guard isCurrent(owner) else { throw ClientError.processNotRunning }
     }
 
+    /// Lossless-restart Phase 4 recovery observation: associates the observed `threadID` with this
+    /// client's current registered transport for the owner's session and worktree before its
+    /// observational reads (registry attribution only; nothing is written to the transport). The
+    /// transport must still be `expectedGeneration` with a registered launch; an unregistered,
+    /// stopped or replaced transport throws, and a conflicting writer is refused by the registry.
+    package func associateObservedConversation(
+        _ threadID: String,
+        runtimeSession: AgentRuntimeSessionScope?,
+        worktreePath: String?,
+        expectedGeneration: UInt64
+    ) async throws {
+        guard process != nil, transportGeneration == expectedGeneration, let launch = runtimeLaunch else {
+            throw ClientError.processNotRunning
+        }
+        try await associateRuntimeConversation(
+            threadID,
+            session: runtimeSession ?? defaultRuntimeSession,
+            permission: nil,
+            worktreePath: worktreePath,
+            launch: launch,
+            owner: RuntimeWriteOwner(generation: expectedGeneration, launch: launch)
+        )
+    }
+
     /// R6 write fence on the captured transport: its launch is still the committed live owner and
     /// serves `threadID`.
     private func authorizeRuntimeWrite(
@@ -1437,6 +1464,12 @@ package actor CodexAppServerClient {
     }
 
     private func performStartupIfNeeded(runtimeSession: AgentRuntimeSessionScope?) async throws {
+        #if DEBUG
+            if let debugStartupOverride {
+                try await debugStartupOverride(self)
+                return
+            }
+        #endif
         if process == nil {
             try await startProcess(runtimeSession: runtimeSession)
         }
@@ -2329,6 +2362,10 @@ package actor CodexAppServerClient {
 
         func debugSetRuntimeFenceCheckpoint(_ checkpoint: (@Sendable (String) async -> Void)?) {
             debugRuntimeFenceCheckpoint = checkpoint
+        }
+
+        func debugSetStartupOverride(_ override: (@Sendable (CodexAppServerClient) async throws -> Void)?) {
+            debugStartupOverride = override
         }
 
     #endif

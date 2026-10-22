@@ -1,5 +1,6 @@
 import Foundation
 import RepoPromptAgentCore
+import RepoPromptPlatform
 
 // Two-stage app quit / window close (lossless-restart spec R4). One app-scoped instance, owned by
 // `WindowStatesManager`.
@@ -87,6 +88,54 @@ struct AgentLifecycleShutdownFailure: Equatable {
     /// Stage B of an app quit: every participant was prepared and finalized and the clean write was
     /// enqueued under a valid authorization; only its acknowledgement is missing.
     var awaitsCleanExitAcknowledgement = false
+    /// Restart safely (review A P1-07): the relaunch helper's stop could not be proven AFTER its
+    /// `arm` was sent, so it may still be alive and armed. No choice is offered (no Retry, Cancel,
+    /// or Quit Anyway): the prompt only informs, and any answer is ignored while ownership is
+    /// retained. A helper never sent `arm` keeps the normal choices (review R1 B N3).
+    var relaunchHelperUnresolved = false
+
+    /// The choices this prompt may offer (none while a possibly armed relaunch helper is unresolved).
+    var offeredChoices: [AgentLifecycleShutdownChoice] {
+        guard !relaunchHelperUnresolved else { return [] }
+        return stage == .preparation ? [.retry, .cancel] : [.retry, .proceedAnyway]
+    }
+
+    /// The same prompt with `message` appended (and, when `unresolved`, no choices).
+    func appending(_ message: String, relaunchHelperUnresolved unresolved: Bool) -> AgentLifecycleShutdownFailure {
+        AgentLifecycleShutdownFailure(
+            requestID: requestID,
+            scope: scope,
+            stage: stage,
+            messages: messages + [message],
+            timedOut: timedOut,
+            awaitsCleanExitAcknowledgement: awaitsCleanExitAcknowledgement,
+            relaunchHelperUnresolved: relaunchHelperUnresolved || unresolved
+        )
+    }
+}
+
+/// The outcome of abandoning the relaunch helper before a prompt, on Cancel, or on Quit Anyway.
+enum AgentLifecycleRelaunchAbandonment: Equatable {
+    /// No helper can arm or open anything: none is live, it confirmed `aborted`, or its exact exit
+    /// was observed. Choices may be shown.
+    case safe
+    /// A helper's stop could not be proven, but the protocol proves its `arm` was never sent, so
+    /// it can never open anything (review R1 B N3). The normal choices are shown; the helper stays
+    /// retained and no fresh helper is spawned until its stop is proven.
+    case unresolvedUnarmed(String)
+    /// A helper's stop could not be proven after its `arm` was sent (it may be armed): it is
+    /// retained, and no choice, fresh helper, Retry, or Quit Anyway may follow.
+    case unresolved(String)
+}
+
+/// The absolute instants of one R4 attempt's single deadline, passed to every relaunch hook
+/// (review R1 A P1-07). Hooks recompute what is left after each await; nothing renews them.
+struct AgentLifecycleRelaunchBudget: Equatable {
+    /// Helper work (`ready`, the `armed` acknowledgement) ends here: the deadline minus the
+    /// helper's cleanup reserve.
+    let workExpiry: ContinuousClock.Instant
+    /// Every helper stop ends here: the attempt's deadline itself.
+    let cleanupExpiry: ContinuousClock.Instant
 }
 
 enum AgentLifecycleShutdownChoice: Equatable {
@@ -137,6 +186,34 @@ struct AgentLifecycleShutdownEnvironment {
     /// Sleeps until an absolute instant; cancellation throws.
     var sleepUntil: @Sendable (ContinuousClock.Instant) async throws -> Void
     var deadline: Duration = .seconds(8)
+    /// Restart safely (lossless restart Phase 4 §G); `nil` (production while gated) refuses it.
+    var relaunch: AgentLifecycleRelaunchHooks?
+}
+
+/// The relaunch helper as seen by R4. Every hook is bounded by the helper's own v1 limits; none
+/// extends the request's single deadline.
+@MainActor
+struct AgentLifecycleRelaunchHooks {
+    /// Stage A (and a Stage B retry): abandons any earlier helper, spawns a fresh one, and waits for
+    /// `ready` until the budget's work expiry (any failed helper stopped by its cleanup expiry).
+    /// `nil` when ready; otherwise the blocker.
+    var prepare: @MainActor (_ budget: AgentLifecycleRelaunchBudget) async -> String?
+    /// Stage B, after the clean write: proof that every provider family and tool stopped. `nil`
+    /// when proven; otherwise the blocker.
+    var verifyAllStopped: @MainActor () async -> String?
+    /// Stage B: arms the ready helper until the budget's work expiry. `nil` when armed; otherwise
+    /// the blocker (the helper is stopped, by its cleanup expiry at the latest).
+    var arm: @MainActor (_ budget: AgentLifecycleRelaunchBudget) async -> String?
+    /// Ensures no helper is ready or armed: joins any in-flight hook (each bounded by its own
+    /// budget's cleanup expiry), aborts, and waits for a correlated `aborted` or the helper's
+    /// observed exit (requesting the exact child's kill) within what is left of the helper's one
+    /// absolute cleanup budget. Called before every prompt, on Cancel, and on Quit Anyway.
+    /// `.unresolved`/`.unresolvedUnarmed` when that proof is missing (a delivered signal is not proof).
+    var abandon: @MainActor () async -> AgentLifecycleRelaunchAbandonment
+    /// The helper's bounded cleanup (abort acknowledgement + exact-child kill). R4 reserves it out of
+    /// its single deadline (review A P1-07): helper work ends at the budget's work expiry and every
+    /// stop at its cleanup expiry, so `abandon` finishes, and the prompt appears, by the deadline.
+    var cleanupReserve: Duration = ProcessRelaunchLimits.v1.cleanupReserve
 }
 
 @MainActor
@@ -149,6 +226,10 @@ final class AgentLifecycleShutdownCoordinator {
     static let cleanExitAcknowledgementMessage = "Everything was saved and every session was stopped, but RepoPrompt could not confirm within 8 seconds that it recorded a clean exit."
     /// Defensive: a window that bypassed the admission seam was never prepared.
     static let unpreparedWindowMessage = "A window that was not prepared for quitting is open, so this quit cannot be recorded as clean."
+    static let restartUnfinalizedWindowMessage = "An earlier window close did not finish saving, so RepoPrompt cannot restart safely. Quit instead."
+    /// Restart safely ran out of time after the clean write was enqueued: neither that write nor
+    /// the stopped-provider proof and helper arm are claimed (review B P2).
+    static let restartTimeoutMessage = "RepoPrompt could not confirm within 8 seconds that it recorded a clean exit, that every agent stopped, and that it can reopen, so it won't restart automatically. Try again, or quit without restarting."
 
     @MainActor
     final class Request {
@@ -166,6 +247,9 @@ final class AgentLifecycleShutdownCoordinator {
         fileprivate var deadlineID = UUID()
         /// Monotonic expiry of the current user attempt, captured when the attempt started.
         fileprivate(set) var expiry: ContinuousClock.Instant?
+        /// Restart safely: the attempt's full deadline (`expiry` plus the helper's cleanup reserve),
+        /// by which every helper stop ends (review R1 A P1-07).
+        fileprivate(set) var cleanupExpiry: ContinuousClock.Instant?
         /// Bumped by every participant joining in Stage A; an attempt whose participants changed
         /// never crosses the point of no return.
         fileprivate var participantRevision: UInt64 = 0
@@ -186,6 +270,13 @@ final class AgentLifecycleShutdownCoordinator {
         /// Completed attempts by stage (test observability).
         fileprivate(set) var preparationAttempts = 0
         fileprivate(set) var finalizationAttempts = 0
+        /// Restart safely: a helper is ready (prepared, not yet armed) for this request.
+        fileprivate(set) var relaunchHelperReady = false
+        /// Restart safely: the helper confirmed `armed` (the request then completes).
+        fileprivate(set) var relaunchArmed = false
+        /// Restart safely: prompts shown without choices because the helper's stop was unresolved
+        /// (test observability; the request stays unfinished).
+        fileprivate(set) var relaunchHelperUnresolvedPrompts = 0
 
         fileprivate init(
             scope: AgentLifecycleShutdownScope,
@@ -249,7 +340,16 @@ final class AgentLifecycleShutdownCoordinator {
     /// cancelled, `true` when the app may terminate. Returns `false` when an app quit is already
     /// in progress (its reply stays owned by the first request).
     @discardableResult
-    func requestApplicationQuit(reply: @escaping @MainActor (Bool) -> Void) -> Bool {
+    func requestApplicationQuit(
+        reason: AgentRecoveryShutdownReason = .appQuit,
+        reply: @escaping @MainActor (Bool) -> Void
+    ) -> Bool {
+        // Only an app quit or Restart safely; Restart safely only while its hooks are composed.
+        guard reason == .appQuit || (reason == .safeRestart && environment.relaunch != nil) else {
+            // Refused before anything froze: the app keeps running (the reply is never lost).
+            reply(false)
+            return false
+        }
         if isApplicationAdmissionSealed {
             // The quit that crossed the point of no return owns the (already given) reply.
             return false
@@ -260,7 +360,7 @@ final class AgentLifecycleShutdownCoordinator {
         let participants = environment.participants(.application)
         let request = Request(
             scope: .application,
-            reason: .appQuit,
+            reason: reason,
             participants: participants,
             forwardedVeto: nil,
             completion: reply
@@ -386,6 +486,15 @@ final class AgentLifecycleShutdownCoordinator {
             guard stillCurrent() else { return blockers }
             blockers += await participant.shutdownPrepare(reason: request.reason).blockers
         }
+        if blockers.isEmpty, request.reason == .safeRestart, let relaunch = environment.relaunch {
+            // Stage A ends with a ready (never armed) helper, within what is left of the deadline.
+            guard stillCurrent() else { return blockers }
+            if let blocker = await relaunch.prepare(relaunchBudget(request)) {
+                blockers.append(blocker)
+            } else if stillCurrent() {
+                request.relaunchHelperReady = true
+            }
+        }
         return blockers
     }
 
@@ -444,6 +553,11 @@ final class AgentLifecycleShutdownCoordinator {
         if request.scope == .application {
             // Ordered after this attempt's `shutdownInProgress`: the app keeps running.
             _ = environment.recordLaunchState(.running)
+        }
+        if request.reason == .safeRestart, let relaunch = environment.relaunch {
+            // Unfrozen now; the unarmed helper is told to stop (it never opens anything unarmed).
+            request.relaunchHelperReady = false
+            Task { @MainActor in _ = await relaunch.abandon() }
         }
         request.completion(false)
     }
@@ -530,7 +644,7 @@ final class AgentLifecycleShutdownCoordinator {
             let written = await awaitCleanWrite(pending, of: request)
             guard stillCurrent() else { return nil }
             if written {
-                return ([], false)
+                return await runRelaunchStep(request, attempt: attempt)
             }
             // Nothing was written: finalize and authorize afresh below.
         }
@@ -550,7 +664,7 @@ final class AgentLifecycleShutdownCoordinator {
             return ([Self.unpreparedWindowMessage], false)
         }
         if hasUnfinalizedWindowClose {
-            return ([], false)
+            return request.reason == .safeRestart ? ([Self.restartUnfinalizedWindowMessage], false) : ([], false)
         }
         let write = environment.recordCleanExit(environment.authorizeCleanExit())
         request.cleanWrite = write
@@ -558,6 +672,38 @@ final class AgentLifecycleShutdownCoordinator {
         // A late acknowledgement (no longer current) never completes the request by itself.
         guard stillCurrent() else { return nil }
         guard written else { return ([Self.cleanMarkFailureMessage], false) }
+        return await runRelaunchStep(request, attempt: attempt)
+    }
+
+    /// Restart safely, after final persistence and the clean write: prove every family and tool
+    /// stopped, then arm the helper (a fresh one when the Stage A helper was consumed or abandoned).
+    /// A plain quit passes straight through.
+    private func runRelaunchStep(_ request: Request, attempt: UUID) async -> (blockers: [String], timedOut: Bool)? {
+        guard request.reason == .safeRestart, let relaunch = environment.relaunch else { return ([], false) }
+        func stillCurrent() -> Bool {
+            isCurrent(request, attempt: attempt, phase: .tearingDown)
+        }
+        if isExpired(request) { return ([Self.timeoutMessage], true) }
+        if let blocker = await relaunch.verifyAllStopped() {
+            return stillCurrent() ? ([blocker], false) : nil
+        }
+        guard stillCurrent() else { return nil }
+        if !request.relaunchHelperReady {
+            if let blocker = await relaunch.prepare(relaunchBudget(request)) {
+                return stillCurrent() ? ([blocker], false) : nil
+            }
+            guard stillCurrent() else { return nil }
+            request.relaunchHelperReady = true
+        }
+        // The helper is consumed by this arm attempt whatever its outcome.
+        request.relaunchHelperReady = false
+        if let blocker = await relaunch.arm(relaunchBudget(request)) {
+            return stillCurrent() ? ([blocker], false) : nil
+        }
+        request.relaunchArmed = true
+        // Armed: completion terminates the app; the helper opens the bundle only after this exact
+        // process's verified exit. A stale attempt here is resolved by `abandon` before any prompt.
+        guard stillCurrent() else { return nil }
         return ([], false)
     }
 
@@ -584,8 +730,9 @@ final class AgentLifecycleShutdownCoordinator {
             timedOut = true
         }
         if timedOut, request.cleanWrite != nil {
-            // Not a preservation failure: only the clean write's acknowledgement is missing.
-            blockers = [Self.cleanExitAcknowledgementMessage]
+            // Not a preservation failure: only the clean write's acknowledgement is missing (or,
+            // for Restart safely, possibly the stopped-provider proof or the helper arm after it).
+            blockers = [request.reason == .safeRestart ? Self.restartTimeoutMessage : Self.cleanExitAcknowledgementMessage]
         }
         guard blockers.isEmpty else {
             request.phase = .finalizationFailed
@@ -603,6 +750,8 @@ final class AgentLifecycleShutdownCoordinator {
         if case .window = request.scope {
             hasUnfinalizedWindowClose = true
         }
+        // Restart safely: Quit Anyway quits without relaunching; the prompt was shown only after
+        // `abandon` proved no helper is armed.
         complete(request)
     }
 
@@ -622,7 +771,7 @@ final class AgentLifecycleShutdownCoordinator {
         messages: [String],
         timedOut: Bool
     ) {
-        let failure = AgentLifecycleShutdownFailure(
+        var failure = AgentLifecycleShutdownFailure(
             requestID: request.id,
             scope: request.scope,
             stage: stage,
@@ -632,10 +781,39 @@ final class AgentLifecycleShutdownCoordinator {
         )
         request.lastFailure = failure
         let failedPhase: AgentLifecycleShutdownPhase = stage == .preparation ? .preparationFailed : .finalizationFailed
+        let relaunch = request.reason == .safeRestart ? environment.relaunch : nil
         Task { @MainActor [weak self] in
+            if let relaunch {
+                // No choice is offered while a helper may be ready or armed (a lost `armed`
+                // acknowledgement included): Retry uses a fresh helper; Quit Anyway relaunches nothing.
+                request.relaunchHelperReady = false
+                request.relaunchArmed = false
+                switch await relaunch.abandon() {
+                case .safe:
+                    break
+                case let .unresolvedUnarmed(reason):
+                    // Review R1 B N3: `arm` was never sent, so the retained helper can never open
+                    // anything. The normal choices stay; the driver keeps the helper and refuses a
+                    // fresh one (Retry reports it) until the helper's stop is proven.
+                    failure = failure.appending(reason, relaunchHelperUnresolved: false)
+                    request.lastFailure = failure
+                case let .unresolved(reason):
+                    // Review A P1-07 (fail closed; the arm-sent exception is not approved): the
+                    // helper may still be alive and armed. Ownership stays with the relaunch
+                    // driver; no Retry, Cancel, Quit Anyway, or fresh helper; the request is never
+                    // reported finished.
+                    failure = failure.appending(reason, relaunchHelperUnresolved: true)
+                    request.lastFailure = failure
+                }
+            }
             guard let self else { return }
             let choice = await environment.presentFailure(failure)
             guard isCurrent(request, attempt: attempt, phase: failedPhase) else { return }
+            // No choice was offered while the helper is unresolved: any answer is ignored.
+            if failure.relaunchHelperUnresolved {
+                request.relaunchHelperUnresolvedPrompts += 1
+                return
+            }
             handle(choice, for: request, stage: stage, attempt: attempt)
         }
     }
@@ -680,6 +858,17 @@ final class AgentLifecycleShutdownCoordinator {
         return environment.now() >= expiry
     }
 
+    /// The current attempt's absolute relaunch budget (never extended): helper work ends at the
+    /// work expiry, every helper stop at the attempt's full deadline.
+    private func relaunchBudget(_ request: Request) -> AgentLifecycleRelaunchBudget {
+        let now = environment.now()
+        let workExpiry = request.expiry ?? now
+        return AgentLifecycleRelaunchBudget(
+            workExpiry: workExpiry,
+            cleanupExpiry: max(request.cleanupExpiry ?? workExpiry, workExpiry)
+        )
+    }
+
     /// One absolute deadline per user attempt. Its expiry is captured synchronously (a delayed
     /// deadline task never extends it); the task never joins the attempt's work and, on expiry,
     /// times out whichever stage is then current (Stage A, or Stage B on the remainder).
@@ -687,8 +876,13 @@ final class AgentLifecycleShutdownCoordinator {
         request.deadlineTask?.cancel()
         let deadlineID = UUID()
         request.deadlineID = deadlineID
-        let expiry = environment.now() + environment.deadline
+        // Restart safely: the helper's bounded cleanup is reserved inside the same deadline, so the
+        // work (and every helper hook) ends early enough for `abandon` to finish by the deadline.
+        let reserve = request.reason == .safeRestart ? (environment.relaunch?.cleanupReserve ?? .zero) : .zero
+        let start = environment.now()
+        let expiry = start + max(environment.deadline - reserve, .zero)
         request.expiry = expiry
+        request.cleanupExpiry = max(start + environment.deadline, expiry)
         let sleepUntil = environment.sleepUntil
         request.deadlineTask = Task { @MainActor [weak self] in
             do {

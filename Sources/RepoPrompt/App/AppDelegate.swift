@@ -159,6 +159,10 @@ class AppDelegate: NSObject, ObservableObject, NSApplicationDelegate {
     }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        // Bound to THIS termination request (review A P1-09): taken before any path that may not
+        // start R4 (a cancelled confirmation, a request joining one in progress), so a later
+        // ordinary Quit never restarts.
+        let reason = WindowStatesManager.shared.shutdownReasonLatch.take()
         let activeItems = WindowStatesManager.shared.allWindows.flatMap { windowState in
             WindowCloseCoordinator.activeItems(for: windowState.makeCloseImpactSnapshot())
         }
@@ -171,9 +175,9 @@ class AppDelegate: NSObject, ObservableObject, NSApplicationDelegate {
 
         switch decision {
         case let .showConfirmation(confirmation):
-            presentQuitConfirmation(confirmation, sender: sender)
+            presentQuitConfirmation(confirmation, reason: reason, sender: sender)
         case .beginTermination:
-            beginTermination(sender: sender)
+            beginTermination(sender: sender, reason: reason)
         case .awaitCurrentRequest:
             break
         }
@@ -182,6 +186,7 @@ class AppDelegate: NSObject, ObservableObject, NSApplicationDelegate {
 
     private func presentQuitConfirmation(
         _ confirmation: AppQuitConfirmation,
+        reason: AgentRecoveryShutdownReason,
         sender: NSApplication
     ) {
         let alert = NSAlert()
@@ -195,7 +200,7 @@ class AppDelegate: NSObject, ObservableObject, NSApplicationDelegate {
 
         let completion: (NSApplication.ModalResponse) -> Void = { [weak self] response in
             Task { @MainActor in
-                self?.handleQuitConfirmationResponse(response, alert: alert, sender: sender)
+                self?.handleQuitConfirmationResponse(response, alert: alert, reason: reason, sender: sender)
             }
         }
         if let parentWindow = sender.keyWindow ?? sender.mainWindow {
@@ -229,6 +234,7 @@ class AppDelegate: NSObject, ObservableObject, NSApplicationDelegate {
     private func handleQuitConfirmationResponse(
         _ response: NSApplication.ModalResponse,
         alert: NSAlert,
+        reason: AgentRecoveryShutdownReason,
         sender: NSApplication
     ) {
         guard quitRequestPhase == .awaitingConfirmation,
@@ -247,14 +253,14 @@ class AppDelegate: NSObject, ObservableObject, NSApplicationDelegate {
         presentedQuitAlert = nil
 
         if response == .alertSecondButtonReturn {
-            beginTermination(sender: sender)
+            beginTermination(sender: sender, reason: reason)
         } else {
             quitRequestPhase = .idle
             sender.reply(toApplicationShouldTerminate: false)
         }
     }
 
-    private func beginTermination(sender: NSApplication) {
+    private func beginTermination(sender: NSApplication, reason: AgentRecoveryShutdownReason) {
         guard quitRequestPhase != .terminating else { return }
         quitRequestPhase = .terminating
 
@@ -262,7 +268,7 @@ class AppDelegate: NSObject, ObservableObject, NSApplicationDelegate {
         // layout and agent state (Stage A, cancellable), and only then sets the termination flags
         // and tears down (Stage B). It owns the single reply: `false` after a cancelled Stage A
         // (the app stays usable), `true` once Stage B finished or the user chose Quit Anyway.
-        let started = WindowStatesManager.shared.lifecycleShutdown.requestApplicationQuit { [weak self] shouldTerminate in
+        let started = WindowStatesManager.shared.lifecycleShutdown.requestApplicationQuit(reason: reason) { [weak self] shouldTerminate in
             if !shouldTerminate {
                 self?.quitRequestPhase = .idle
             }

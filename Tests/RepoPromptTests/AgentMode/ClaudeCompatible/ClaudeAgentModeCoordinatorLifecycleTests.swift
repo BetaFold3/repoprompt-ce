@@ -2728,6 +2728,11 @@ actor LifecycleFakeNativeController: NativeAgentRuntimeControlling {
     private var pendingTurnCompletionWaiters: [CheckedContinuation<UUID, Never>] = []
     /// R6: a registered fake joins the tab's retained runtime retirements before it starts.
     nonisolated let joinsRetirementBeforeSuccessor: Bool
+    /// Opt-in: behaves like a managed transport at the write (the real controller's
+    /// `sendUserMessage`): evaluates the task-local write admission before the recorded write, and
+    /// a refusal or a cancellation during it is a proven non-write (`processNotRunning`).
+    private let invokesWriteAdmission: Bool
+    private var admissionOwners: [AgentRuntimeSessionScope] = []
 
     init(
         recorder: LifecycleRecorder,
@@ -2751,10 +2756,12 @@ actor LifecycleFakeNativeController: NativeAgentRuntimeControlling {
         applyGate: LifecycleAsyncGate? = nil,
         sessionID: String = "lifecycle-claude-session",
         promptCacheRetention: AgentMCPWaitPolicy.ParentPromptCacheRetention = .standard,
-        joinsRetirementBeforeSuccessor: Bool = false
+        joinsRetirementBeforeSuccessor: Bool = false,
+        invokesWriteAdmission: Bool = false
     ) {
         self.recorder = recorder
         self.joinsRetirementBeforeSuccessor = joinsRetirementBeforeSuccessor
+        self.invokesWriteAdmission = invokesWriteAdmission
         self.label = label
         activeSession = hasActiveSession
         turnInFlight = hasTurnInFlight
@@ -2964,6 +2971,20 @@ actor LifecycleFakeNativeController: NativeAgentRuntimeControlling {
     }
 
     func sendUserMessage(_ text: String) async throws -> UUID {
+        if invokesWriteAdmission {
+            recorder.record("\(label):admission")
+            admissionOwners.append(AgentRuntimeOperationOwner.current)
+            if let admission = AgentRuntimeOperationOwner.writeAdmission {
+                guard await admission() else {
+                    recorder.record("\(label):admission-refused")
+                    throw NativeAgentRuntimeControllerError.processNotRunning
+                }
+                guard !Task.isCancelled else {
+                    recorder.record("\(label):admission-cancelled")
+                    throw NativeAgentRuntimeControllerError.processNotRunning
+                }
+            }
+        }
         recorder.record("\(label):send")
         if let sendUserMessageGate {
             await sendUserMessageGate.arriveAndWait()
@@ -3009,6 +3030,11 @@ actor LifecycleFakeNativeController: NativeAgentRuntimeControlling {
 
     func recordedSentMessages() -> [String] {
         sentMessages
+    }
+
+    /// The owner scope bound for each write admission this fake evaluated.
+    func recordedAdmissionOwners() -> [AgentRuntimeSessionScope] {
+        admissionOwners
     }
 
     /// A (possibly late) successful completion for a specific earlier turn.

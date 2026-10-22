@@ -61,6 +61,12 @@ enum AgentRecoveryRecordCodec {
                     reader.optional("cardAcknowledgements"),
                     path: "record.cardAcknowledgements"
                 ),
+                actions: optionalArray(reader.optional("actions"), path: "record.actions", element: action),
+                historyCursors: optionalArray(
+                    reader.optional("historyCursors"),
+                    path: "record.historyCursors",
+                    element: historyCursor
+                ),
                 extras: reader.extras
             )
             try validateInvariants(record)
@@ -107,6 +113,186 @@ enum AgentRecoveryRecordCodec {
         if !record.cardAcknowledgements.isEmpty {
             object["cardAcknowledgements"] = .array(record.cardAcknowledgements.map(cardAcknowledgementJSON))
         }
+        // Phase 4 collections: absent when empty (older records keep their bytes).
+        if !record.actions.isEmpty {
+            object["actions"] = .array(record.actions.map(actionJSON))
+        }
+        if !record.historyCursors.isEmpty {
+            object["historyCursors"] = .array(record.historyCursors.map(historyCursorJSON))
+        }
+        return .object(object)
+    }
+
+    private static func optionalArray<Element>(
+        _ json: AgentRecoveryJSONValue?,
+        path: String,
+        element: (AgentRecoveryJSONValue, String) throws -> Element
+    ) throws -> [Element] {
+        guard let json else { return [] }
+        guard case let .array(values) = json else {
+            throw AgentRecoveryDecodingError(reason: .malformed("\(path) is not an array"))
+        }
+        // An explicit empty array would not re-encode (absent when empty).
+        guard !values.isEmpty else {
+            throw AgentRecoveryDecodingError(reason: .malformed("\(path) is empty"))
+        }
+        return try values.enumerated().map { try element($1, "\(path)[\($0)]") }
+    }
+
+    // MARK: Recovery actions (Phase 4)
+
+    private static func action(_ json: AgentRecoveryJSONValue, path: String) throws -> AgentRecoveryAction {
+        var reader = try Reader(json, path: path)
+        // Unknown kinds (a newer build's action) are kept raw and round-trip; never performed.
+        let kindRaw = try reader.string("kind")
+        var keyReader = try Reader(reader.required("item"), path: "\(path).item")
+        let keyGeneration: UInt64? = try keyReader.peek("transcriptResetGeneration") == nil
+            ? nil
+            : keyReader.uint64("transcriptResetGeneration")
+        let itemKey = try AgentRecoveryCardKey(
+            kindRaw: keyReader.string("kind"),
+            incarnationID: keyReader.uuid("incarnationID"),
+            transcriptResetGeneration: keyGeneration,
+            entityID: keyReader.string("entityID")
+        )
+        guard keyReader.extras.isEmpty else {
+            throw AgentRecoveryDecodingError(reason: .malformed("\(path).item has unknown members"))
+        }
+        var targetReader = try Reader(reader.required("target"), path: "\(path).target")
+        let target = try AgentRecoveryActionTarget(
+            providerKindRaw: targetReader.optionalString("providerKind"),
+            providerConversationID: targetReader.optionalString("providerConversationID"),
+            extras: targetReader.extras
+        )
+        let outcome: AgentRecoveryActionOutcome? = try reader.optional("outcome").map { json in
+            var outcomeReader = try Reader(json, path: "\(path).outcome")
+            return try AgentRecoveryActionOutcome(
+                kindRaw: outcomeReader.string("kind"),
+                reason: outcomeReader.optionalString("reason"),
+                recordedAt: outcomeReader.timestamp("recordedAt"),
+                extras: outcomeReader.extras
+            )
+        }
+        return try AgentRecoveryAction(
+            actionID: reader.uuid("actionID"),
+            itemKey: itemKey,
+            kindRaw: kindRaw,
+            expectedRevision: reader.optionalString("expectedRevision").map { AgentRecoveryRecordRevision(token: $0) },
+            incarnationID: reader.uuid("incarnationID"),
+            transcriptResetGeneration: reader.uint64("transcriptResetGeneration"),
+            sourceIntentIDs: reader.array("sourceIntentIDs").enumerated().map {
+                try Reader.uuid($1, path: "\(path).sourceIntentIDs[\($0)]")
+            },
+            sourceRunAttemptID: reader.optionalUUID("sourceRunAttemptID"),
+            sourceInteractionID: reader.optionalUUID("sourceInteractionID"),
+            target: target,
+            text: reader.optionalString("text"),
+            plannedUserItemID: reader.optionalUUID("plannedUserItemID"),
+            supersedesActionID: reader.optionalUUID("supersedesActionID"),
+            confirmedUncertainPriorDelivery: reader.optional("confirmsUncertainPriorDelivery").map { json in
+                guard case let .bool(value) = json else {
+                    throw AgentRecoveryDecodingError(reason: .malformed("\(path).confirmsUncertainPriorDelivery is not a bool"))
+                }
+                return value
+            } ?? false,
+            appInstanceID: reader.uuid("appInstanceID"),
+            reservedAt: reader.timestamp("reservedAt"),
+            outcome: outcome,
+            extras: reader.extras
+        )
+    }
+
+    private static func actionJSON(_ action: AgentRecoveryAction) -> AgentRecoveryJSONValue {
+        var object = action.extras
+        object["actionID"] = .string(action.actionID.uuidString)
+        object["kind"] = .string(action.kindRaw)
+        var item: AgentRecoveryExtras = [
+            "kind": .string(action.itemKey.kindRaw),
+            "incarnationID": .string(action.itemKey.incarnationID.uuidString),
+            "entityID": .string(action.itemKey.entityID)
+        ]
+        if let generation = action.itemKey.transcriptResetGeneration {
+            item["transcriptResetGeneration"] = .number(Decimal(generation))
+        }
+        object["item"] = .object(item)
+        setOptional(&object, "expectedRevision", action.expectedRevision?.token)
+        object["incarnationID"] = .string(action.incarnationID.uuidString)
+        object["transcriptResetGeneration"] = .number(Decimal(action.transcriptResetGeneration))
+        object["sourceIntentIDs"] = .array(action.sourceIntentIDs.map { .string($0.uuidString) })
+        setOptional(&object, "sourceRunAttemptID", action.sourceRunAttemptID?.uuidString)
+        setOptional(&object, "sourceInteractionID", action.sourceInteractionID?.uuidString)
+        var target = action.target.extras
+        setOptional(&target, "providerKind", action.target.providerKindRaw)
+        setOptional(&target, "providerConversationID", action.target.providerConversationID)
+        object["target"] = .object(target)
+        setOptional(&object, "text", action.text)
+        setOptional(&object, "plannedUserItemID", action.plannedUserItemID?.uuidString)
+        setOptional(&object, "supersedesActionID", action.supersedesActionID?.uuidString)
+        if action.confirmedUncertainPriorDelivery {
+            object["confirmsUncertainPriorDelivery"] = .bool(true)
+        }
+        object["appInstanceID"] = .string(action.appInstanceID.uuidString)
+        object["reservedAt"] = timestampJSON(action.reservedAt)
+        if let outcome = action.outcome {
+            var outcomeObject = outcome.extras
+            outcomeObject["kind"] = .string(outcome.kindRaw)
+            setOptional(&outcomeObject, "reason", outcome.reason)
+            outcomeObject["recordedAt"] = timestampJSON(outcome.recordedAt)
+            object["outcome"] = .object(outcomeObject)
+        }
+        return .object(object)
+    }
+
+    // MARK: History cursors (Phase 4)
+
+    private static func historyCursor(_ json: AgentRecoveryJSONValue, path: String) throws -> AgentRecoveryHistoryCursor {
+        var reader = try Reader(json, path: path)
+        let file: AgentRecoveryHistoryFileIdentity? = try reader.optional("file").map { json in
+            var fileReader = try Reader(json, path: "\(path).file")
+            let identity = try AgentRecoveryHistoryFileIdentity(
+                device: fileReader.uint64("device"),
+                inode: fileReader.uint64("inode"),
+                birthSeconds: fileReader.optional("birthSeconds").map { try Reader.int64($0, path: "\(path).file.birthSeconds") },
+                birthNanoseconds: fileReader.optional("birthNanoseconds").map {
+                    try Reader.int64($0, path: "\(path).file.birthNanoseconds")
+                }
+            )
+            guard fileReader.extras.isEmpty else {
+                throw AgentRecoveryDecodingError(reason: .malformed("\(path).file has unknown members"))
+            }
+            return identity
+        }
+        return try AgentRecoveryHistoryCursor(
+            providerRaw: reader.string("provider"),
+            conversationID: reader.string("conversationID"),
+            importID: reader.uuid("importID"),
+            file: file,
+            completeLineOffset: reader.uint64("completeLineOffset"),
+            committedAt: reader.timestamp("committedAt"),
+            extras: reader.extras
+        )
+    }
+
+    private static func historyCursorJSON(_ cursor: AgentRecoveryHistoryCursor) -> AgentRecoveryJSONValue {
+        var object = cursor.extras
+        object["provider"] = .string(cursor.providerRaw)
+        object["conversationID"] = .string(cursor.conversationID)
+        object["importID"] = .string(cursor.importID.uuidString)
+        if let file = cursor.file {
+            var fileObject: AgentRecoveryExtras = [
+                "device": .number(Decimal(file.device)),
+                "inode": .number(Decimal(file.inode))
+            ]
+            if let seconds = file.birthSeconds {
+                fileObject["birthSeconds"] = .number(Decimal(seconds))
+            }
+            if let nanoseconds = file.birthNanoseconds {
+                fileObject["birthNanoseconds"] = .number(Decimal(nanoseconds))
+            }
+            object["file"] = .object(fileObject)
+        }
+        object["completeLineOffset"] = .number(Decimal(cursor.completeLineOffset))
+        object["committedAt"] = timestampJSON(cursor.committedAt)
         return .object(object)
     }
 
@@ -286,6 +472,24 @@ enum AgentRecoveryRecordCodec {
 
     /// Structural invariants that typed fields alone cannot express.
     private static func validateInvariants(_ record: AgentRecoveryRecord) throws {
+        var actionIDs: Set<UUID> = []
+        var openItems: Set<AgentRecoveryCardKey> = []
+        // A superseded action stays unresolved (kept as evidence) but no longer holds its item.
+        let superseded = Set(record.actions.compactMap(\.supersedesActionID))
+        for action in record.actions {
+            guard actionIDs.insert(action.actionID).inserted else {
+                throw AgentRecoveryDecodingError(reason: .malformed("duplicate action \(action.actionID)"))
+            }
+            guard action.isResolved || superseded.contains(action.actionID) || openItems.insert(action.itemKey).inserted else {
+                throw AgentRecoveryDecodingError(reason: .malformed("two unresolved actions for one item"))
+            }
+        }
+        var cursorKeys: Set<String> = []
+        for cursor in record.historyCursors {
+            guard cursorKeys.insert("\(cursor.providerRaw)\u{0}\(cursor.conversationID)").inserted else {
+                throw AgentRecoveryDecodingError(reason: .malformed("duplicate history cursor"))
+            }
+        }
         var cardKeys: Set<AgentRecoveryCardKey> = []
         for acknowledgement in record.cardAcknowledgements {
             guard cardKeys.insert(acknowledgement.key).inserted else {

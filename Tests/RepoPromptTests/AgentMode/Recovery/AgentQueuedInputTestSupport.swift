@@ -53,6 +53,8 @@ final class RecoveryLaneFixture {
     let lane: AgentRecoverySessionLane
     private let owner: Owner
     private let workspace: Workspace
+    /// Owners of sibling lanes (kept alive with the fixture).
+    private var siblingOwners: [Owner] = []
 
     var sessionID: UUID {
         lane.sessionID
@@ -158,6 +160,27 @@ final class RecoveryLaneFixture {
 
     func tearDown() {
         try? FileManager.default.removeItem(at: root)
+    }
+
+    /// Another durable session of the same workspace, claimed by a different owner (another window)
+    /// through the same app-shared coordinator.
+    func claimSiblingLane(workspaceID: UUID? = nil) async throws -> AgentRecoverySessionLane {
+        let target = workspaceID.map { Workspace(id: $0, customStoragePath: workspace.customStoragePath) } ?? workspace
+        let session = AgentSession(
+            id: UUID(),
+            workspaceID: target.id,
+            composeTabID: UUID(),
+            name: "Sibling"
+        ).withItems([AgentChatItem.user("hello", sequenceIndex: 0)])
+        let load = try await service.prepareInitialAgentSessionPersistence(
+            initialSession: session,
+            for: target,
+            preparation: .alreadyCanonicalTranscript,
+            trustedCanonicalItemCount: 1
+        )
+        let sibling = Owner()
+        siblingOwners.append(sibling)
+        return try coordinator.claimLane(owner: sibling, persistenceState: load.persistenceState)
     }
 
     /// Commits a real `queued` intent through the lane and returns its durable identity.

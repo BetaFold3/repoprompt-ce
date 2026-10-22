@@ -531,4 +531,119 @@ final class CodexAppServerRuntimeFenceTests: XCTestCase {
         try await client.respondToServerRequest(receipt: reused, result: ["decision": "decline"])
         XCTAssertEqual(recorder.frames.count, 2, "the replacement's own request is answered on it")
     }
+
+    // MARK: Lossless-restart Phase 4 cold recovery observation
+
+    /// A registered client (registry launch authority) whose start installs the DEBUG test transport
+    /// with `launch`, advancing the transport generation exactly as a real start does; no spawn.
+    private func makeColdRegisteredClient(startingWith launch: AgentRuntimeLaunch) async -> CodexAppServerClient {
+        let recorder = recorder!
+        let client = CodexAppServerClient(
+            mcpHost: ServerNetworkManager.shared,
+            writeFrameHandler: { _, frame in recorder.record(frame) },
+            livenessProbe: { _ in true },
+            expectedAgentPIDRegistrar: .init(register: { _, _, _ in }, clear: { _, _, _ in }),
+            launchAuthority: .registry(registry)
+        )
+        await client.debugSetStartupOverride { client in
+            await client.debugInstallTestTransport()
+            await client.debugInstallTestRuntimeLaunch(launch, committed: true)
+        }
+        return client
+    }
+
+    private func makeObservationController(client: CodexAppServerClient) -> CodexNativeSessionController {
+        let controller = CodexNativeSessionController(
+            client: client,
+            runID: UUID(),
+            tabID: UUID(),
+            windowID: 1,
+            workspacePath: "/tmp/wt-codex",
+            options: CodexNativeSessionController.Options(
+                requestTimeout: 5,
+                configOverridesProvider: { [:] },
+                launchEnvironmentProvider: { [:] },
+                approvalPolicyProvider: { .never },
+                sandboxModeProvider: { .readOnly },
+                approvalReviewerProvider: { .user },
+                authTokensRefreshHandler: nil
+            )
+        )
+        controller.useOwnerCapturedRuntimeSessions()
+        return controller
+    }
+
+    /// Cold path through the real observation: the registered transport is started first (its
+    /// generation advances), the expected thread is associated with that runtime for the owner's
+    /// session before the read's frame, and only `thread/turns/list` is written. The first cold read
+    /// is attributed to the started generation, not rejected as stale.
+    func testColdRecoveryObservationStartsTheRegisteredTransportBeforeCapturingItsGeneration() async throws {
+        await startRegistry()
+        let (launch, runtimeID) = try await committedLaunch(pid: 4300)
+        let client = await makeColdRegisteredClient(startingWith: launch)
+        let controller = makeObservationController(client: client)
+        let generationBeforeStart = await client.currentTransportGeneration()
+        let processRunningBeforeStart = await client.debugIsProcessRunning()
+        XCTAssertFalse(processRunningBeforeStart, "cold: no transport before the observation")
+
+        let owner = owner
+        let observing = Task {
+            try await AgentRuntimeOperationOwner.$session.withValue(owner) {
+                try await controller.observeRecovery(threadID: "thread-r", expectedTurnID: "turn-r", timeout: nil)
+            }
+        }
+        let written = await Fixtures.eventually { self.recorder.frames.count == 1 }
+        XCTAssertTrue(written)
+        let frame = try XCTUnwrap(recorder.frames.first)
+        XCTAssertEqual(frame.method, "thread/turns/list")
+        XCTAssertEqual(frame.conversationIDsAtWrite, ["thread-r"], "associated with the started runtime before the read")
+        let id = try XCTUnwrap(frame.id)
+        await client.debugIngestRawStdoutChunk(Data(
+            #"{"id":\#(id),"result":{"data":[{"id":"turn-r","status":"completed","items":[{"id":"i1","type":"agentMessage","text":"done"}]}]}}"#.utf8 + [0x0A]
+        ))
+        let observation = try await observing.value
+
+        XCTAssertEqual(observation.terminal, .completed)
+        XCTAssertEqual(observation.turnID, "turn-r")
+        XCTAssertEqual(observation.items, [.init(nativeItemID: "i1", kind: .agentMessage, text: "done")])
+        XCTAssertEqual(observation.source, .turnsList)
+        XCTAssertEqual(observation.transportGeneration, generationBeforeStart + 1, "captured after the start")
+        XCTAssertEqual(recorder.frames.map(\.method), ["thread/turns/list"], "no resume, start, steer or interrupt")
+        let record = try XCTUnwrap(Fixtures.record(store, runtimeID))
+        XCTAssertEqual(record.conversationIDs, ["thread-r"])
+        guard case let .session(expected) = owner else { return XCTFail("fixture owner is a session scope") }
+        XCTAssertTrue(record.associations.contains { $0.session == expected && $0.conversationID == "thread-r" })
+        await client.stop()
+    }
+
+    /// A transport replaced during the read is stale: no `thread/read` fallback (even on an
+    /// unsupported-method reply from the replaced transport) and no retry.
+    func testRecoveryObservationIsStaleWhenTheTransportIsReplacedMidRead() async throws {
+        await startRegistry()
+        let (launch, _) = try await committedLaunch(pid: 4310)
+        let client = await makeColdRegisteredClient(startingWith: launch)
+        let controller = makeObservationController(client: client)
+        let owner = owner
+        let observing = Task {
+            try await AgentRuntimeOperationOwner.$session.withValue(owner) {
+                try await controller.observeRecovery(threadID: "thread-s", expectedTurnID: "turn-s", timeout: nil)
+            }
+        }
+        let written = await Fixtures.eventually { self.recorder.frames.count == 1 }
+        XCTAssertTrue(written)
+        let id = try XCTUnwrap(recorder.frames.first?.id)
+        await client.debugInstallTestTransport()
+        await client.debugIngestRawStdoutChunk(Data(
+            #"{"id":\#(id),"error":{"code":-32601,"message":"Method not found: thread/turns/list"}}"#.utf8 + [0x0A]
+        ))
+
+        do {
+            _ = try await observing.value
+            XCTFail("a replaced transport's reply is never attributed")
+        } catch {
+            XCTAssertEqual(error as? CodexRecoveryObservationError, .staleTransportGeneration)
+        }
+        XCTAssertEqual(recorder.frames.map(\.method), ["thread/turns/list"], "no fallback read and no retry")
+        await client.stop()
+    }
 }

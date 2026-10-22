@@ -1,6 +1,7 @@
 import Foundation
 @testable import RepoPromptAgentCore
 @testable import RepoPromptApp
+@testable import RepoPromptPlatform
 import XCTest
 
 /// R4 two-stage quit / window close (lossless-restart spec): the app-scoped lifecycle coordinator
@@ -326,11 +327,11 @@ final class AgentLifecycleShutdownCoordinatorTests: XCTestCase {
         return hang
     }
 
-    private func makeCoordinator() -> AgentLifecycleShutdownCoordinator {
+    private func makeCoordinator(relaunch: AgentLifecycleRelaunchHooks? = nil) -> AgentLifecycleShutdownCoordinator {
         let recorder = recorder!
         let clock = clock!
         let recovery = fixture.coordinator
-        return AgentLifecycleShutdownCoordinator(environment: AgentLifecycleShutdownEnvironment(
+        var environment = AgentLifecycleShutdownEnvironment(
             participants: { [unowned self] scope in
                 switch scope {
                 case .application:
@@ -361,7 +362,9 @@ final class AgentLifecycleShutdownCoordinatorTests: XCTestCase {
             dismissFailure: { recorder.dismissed.append($0) },
             now: { clock.now },
             sleepUntil: { try await clock.sleep(until: $0) }
-        ))
+        )
+        environment.relaunch = relaunch
+        return AgentLifecycleShutdownCoordinator(environment: environment)
     }
 
     private func settle() async {
@@ -1127,6 +1130,386 @@ final class AgentLifecycleShutdownCoordinatorTests: XCTestCase {
         windowParticipants = [9: participant]
         XCTAssertFalse(coordinator.requestWindowClose(windowID: 9, forwardedVeto: { true }, finish: { _ in }))
         XCTAssertEqual(replies, [true])
+    }
+
+    // MARK: Restart safely (lossless restart Phase 4 §G)
+
+    /// Scripted relaunch hooks with a model of the helper's state (ready / armed).
+    @MainActor
+    private final class FakeRelaunch {
+        var calls: [String] = []
+        var prepareResults: [String?] = []
+        var verifyResults: [String?] = []
+        var armResults: [String?] = []
+        /// Scripted `abandon` outcomes (`.safe` once exhausted).
+        var abandonResults: [AgentLifecycleRelaunchAbandonment] = []
+        var budgets: [AgentLifecycleRelaunchBudget] = []
+        /// Disk marks committed when `verifyAllStopped` ran.
+        var marksAtVerify: [[AgentRecoveryLaunchMark.State]] = []
+        var disk: LaunchMarkDisk?
+        private(set) var helperReady = false
+        private(set) var helperArmed = false
+
+        var hooks: AgentLifecycleRelaunchHooks {
+            AgentLifecycleRelaunchHooks(
+                prepare: { [self] budget in
+                    calls.append("prepare")
+                    budgets.append(budget)
+                    let result = prepareResults.isEmpty ? nil : prepareResults.removeFirst()
+                    helperReady = result == nil
+                    helperArmed = false
+                    return result
+                },
+                verifyAllStopped: { [self] in
+                    calls.append("verify")
+                    marksAtVerify.append(disk?.committed ?? [])
+                    return verifyResults.isEmpty ? nil : verifyResults.removeFirst()
+                },
+                arm: { [self] budget in
+                    calls.append("arm")
+                    budgets.append(budget)
+                    let result = armResults.isEmpty ? nil : armResults.removeFirst()
+                    helperArmed = result == nil && helperReady
+                    helperReady = false
+                    return result
+                },
+                abandon: { [self] in
+                    calls.append("abandon")
+                    let result = abandonResults.isEmpty ? .safe : abandonResults.removeFirst()
+                    if result == .safe {
+                        helperReady = false
+                        helperArmed = false
+                    }
+                    return result
+                }
+            )
+        }
+    }
+
+    func testSafeRestartIsRefusedWithoutComposedHooksBeforeAnythingFreezes() async {
+        let participant = FakeParticipant()
+        appParticipants = [participant]
+        let coordinator = makeCoordinator()
+        var replies: [Bool] = []
+        XCTAssertFalse(coordinator.requestApplicationQuit(reason: .safeRestart) { replies.append($0) })
+        XCTAssertEqual(replies, [false])
+        XCTAssertFalse(participant.isFrozen)
+        XCTAssertEqual(recorder.appFreezeBegins, 0)
+        XCTAssertNil(coordinator.applicationRequest)
+        await drainLaunchMarks()
+        XCTAssertEqual(disk.committed, [], "nothing was recorded")
+    }
+
+    func testSafeRestartPreparesInStageAProvesAllStoppedAfterTheCleanWriteThenArmsOnce() async {
+        let participant = FakeParticipant()
+        appParticipants = [participant]
+        let relaunch = FakeRelaunch()
+        relaunch.disk = disk
+        let coordinator = makeCoordinator(relaunch: relaunch.hooks)
+        var replies: [Bool] = []
+        XCTAssertTrue(coordinator.requestApplicationQuit(reason: .safeRestart) { replies.append($0) })
+        await waitUntil("the restart reply") { !replies.isEmpty }
+        XCTAssertEqual(replies, [true])
+        XCTAssertEqual(relaunch.calls, ["prepare", "verify", "arm"])
+        XCTAssertEqual(relaunch.marksAtVerify.first?.last, .cleanExit, "Stage B proves all stopped only after final persistence")
+        XCTAssertEqual(participant.finalizeCalls, 1)
+        XCTAssertTrue(relaunch.helperArmed)
+        XCTAssertEqual(coordinator.applicationRequest?.relaunchArmed, true)
+        // Review A P1-07 / R1 A P1-07: every hook gets the same absolute budget of the one 8 s
+        // deadline: helper work ends before the cleanup reserve, every helper stop by 8 s itself.
+        let reserve = ProcessRelaunchLimits.v1.cleanupReserve
+        XCTAssertEqual(reserve, .seconds(1))
+        let expected = AgentLifecycleRelaunchBudget(
+            workExpiry: clock.instant(at: .seconds(8) - reserve),
+            cleanupExpiry: clock.instant(at: .seconds(8))
+        )
+        XCTAssertEqual(relaunch.budgets, [expected, expected], "absolute, never renewed: \(relaunch.budgets)")
+    }
+
+    func testSafeRestartStageBVerifyFailureLeavesNoHelperAndQuitAnywayNeverRelaunches() async {
+        let participant = FakeParticipant()
+        appParticipants = [participant]
+        let relaunch = FakeRelaunch()
+        relaunch.verifyResults = ["A Codex runtime is still running."]
+        let coordinator = makeCoordinator(relaunch: relaunch.hooks)
+        var replies: [Bool] = []
+        XCTAssertTrue(coordinator.requestApplicationQuit(reason: .safeRestart) { replies.append($0) })
+        await waitUntil("the Stage B prompt") { recorder.isPresenting }
+        XCTAssertEqual(recorder.presented.last?.stage, .finalization)
+        XCTAssertEqual(recorder.presented.last?.messages, ["A Codex runtime is still running."])
+        XCTAssertEqual(relaunch.calls, ["prepare", "verify", "abandon"], "never armed; abandoned before the prompt")
+        XCTAssertFalse(relaunch.helperReady)
+        XCTAssertFalse(relaunch.helperArmed)
+
+        recorder.choose(.proceedAnyway)
+        await waitUntil("the reply") { !replies.isEmpty }
+        XCTAssertEqual(replies, [true])
+        XCTAssertFalse(relaunch.calls.contains("arm"))
+        XCTAssertEqual(coordinator.applicationRequest?.relaunchArmed, false)
+    }
+
+    func testSafeRestartStageBRetryUsesAFreshHelperAfterProvingAllStopped() async {
+        let participant = FakeParticipant()
+        appParticipants = [participant]
+        let relaunch = FakeRelaunch()
+        relaunch.verifyResults = ["A tool is still running."]
+        let coordinator = makeCoordinator(relaunch: relaunch.hooks)
+        var replies: [Bool] = []
+        XCTAssertTrue(coordinator.requestApplicationQuit(reason: .safeRestart) { replies.append($0) })
+        await waitUntil("the Stage B prompt") { recorder.isPresenting }
+        recorder.choose(.retry)
+        await waitUntil("the reply") { !replies.isEmpty }
+        XCTAssertEqual(replies, [true])
+        XCTAssertEqual(relaunch.calls, ["prepare", "verify", "abandon", "verify", "prepare", "arm"])
+        XCTAssertTrue(relaunch.helperArmed)
+        XCTAssertEqual(participant.teardownExecutions, 1, "Retry never repeats teardown")
+    }
+
+    func testSafeRestartLostArmAcknowledgementIsAbandonedBeforeChoices() async {
+        let participant = FakeParticipant()
+        appParticipants = [participant]
+        let relaunch = FakeRelaunch()
+        relaunch.armResults = ["The relaunch helper did not confirm it was armed."]
+        let coordinator = makeCoordinator(relaunch: relaunch.hooks)
+        var replies: [Bool] = []
+        XCTAssertTrue(coordinator.requestApplicationQuit(reason: .safeRestart) { replies.append($0) })
+        await waitUntil("the Stage B prompt") { recorder.isPresenting }
+        XCTAssertEqual(relaunch.calls, ["prepare", "verify", "arm", "abandon"])
+        XCTAssertFalse(relaunch.helperArmed)
+        XCTAssertEqual(coordinator.applicationRequest?.relaunchArmed, false)
+        recorder.choose(.proceedAnyway)
+        await waitUntil("the reply") { !replies.isEmpty }
+        XCTAssertEqual(replies, [true])
+        XCTAssertEqual(relaunch.calls.count { $0 == "arm" }, 1)
+    }
+
+    func testSafeRestartStageAHelperFailureCancelUnfreezesAndAbandons() async {
+        let participant = FakeParticipant()
+        appParticipants = [participant]
+        let relaunch = FakeRelaunch()
+        relaunch.prepareResults = ["RepoPrompt could not start its restart helper."]
+        let coordinator = makeCoordinator(relaunch: relaunch.hooks)
+        var replies: [Bool] = []
+        XCTAssertTrue(coordinator.requestApplicationQuit(reason: .safeRestart) { replies.append($0) })
+        await waitUntil("the Stage A prompt") { recorder.isPresenting }
+        XCTAssertEqual(recorder.presented.last?.stage, .preparation)
+        XCTAssertEqual(relaunch.calls, ["prepare", "abandon"])
+        XCTAssertTrue(recorder.irreversible.isEmpty)
+
+        recorder.choose(.cancel)
+        await waitUntil("the cancelled reply") { !replies.isEmpty }
+        XCTAssertEqual(replies, [false])
+        XCTAssertFalse(participant.isFrozen, "Cancel unfreezes Stage A")
+        await waitUntil("the cancel abandon") { relaunch.calls.count == 3 }
+        XCTAssertEqual(relaunch.calls, ["prepare", "abandon", "abandon"])
+        XCTAssertFalse(relaunch.helperReady)
+        XCTAssertEqual(participant.teardownExecutions, 0)
+        await drainLaunchMarks()
+        XCTAssertEqual(disk.committed, [.shutdownInProgress, .running])
+    }
+
+    /// Review A P1-07 (fail closed, pending the owner's decision): when abandoning the helper
+    /// before a prompt cannot prove its stop, the prompt offers no choice (no Retry, Cancel, or Quit
+    /// Anyway), any answer is ignored, no fresh helper is prepared, and the request never finishes.
+    func testSafeRestartUnresolvedHelperStopOffersNoChoicesAndNeverFinishes() async {
+        let participant = FakeParticipant()
+        appParticipants = [participant]
+        let relaunch = FakeRelaunch()
+        relaunch.armResults = ["The relaunch helper did not confirm it was armed."]
+        relaunch.abandonResults = [.unresolved("RepoPrompt could not confirm that its restart helper stopped.")]
+        let coordinator = makeCoordinator(relaunch: relaunch.hooks)
+        var replies: [Bool] = []
+        XCTAssertTrue(coordinator.requestApplicationQuit(reason: .safeRestart) { replies.append($0) })
+        await waitUntil("the no-choice prompt") { recorder.isPresenting }
+        XCTAssertEqual(relaunch.calls, ["prepare", "verify", "arm", "abandon"])
+        let failure = recorder.presented.last
+        XCTAssertEqual(failure?.relaunchHelperUnresolved, true)
+        XCTAssertEqual(failure?.offeredChoices, [], "no Retry, Cancel, or Quit Anyway")
+        XCTAssertEqual(failure?.messages.last, "RepoPrompt could not confirm that its restart helper stopped.")
+
+        recorder.choose(.proceedAnyway)
+        await waitUntil("the ignored answer") { coordinator.applicationRequest?.relaunchHelperUnresolvedPrompts == 1 }
+        XCTAssertEqual(replies, [], "never reported finished")
+        XCTAssertEqual(coordinator.applicationRequest?.isFinished, false)
+        XCTAssertEqual(coordinator.applicationRequest?.phase, .finalizationFailed)
+        XCTAssertEqual(relaunch.calls, ["prepare", "verify", "arm", "abandon"], "no fresh helper, retry, or second arm")
+        XCTAssertEqual(participant.finalizeCalls, 1)
+    }
+
+    /// Review R1 B N3: an unresolved stop of a helper the protocol proves was never sent `arm` (it
+    /// can never open anything) keeps the normal Stage A choices with the reason shown. The driver
+    /// keeps the helper (its Retry prepare reports the refusal instead of spawning a fresh one),
+    /// and Cancel unfreezes as usual.
+    func testSafeRestartStageAUnresolvedUnarmedHelperKeepsTheNormalChoices() async {
+        let participant = FakeParticipant()
+        appParticipants = [participant]
+        let relaunch = FakeRelaunch()
+        let unresolved = "RepoPrompt could not confirm that its restart helper stopped."
+        relaunch.prepareResults = ["The relaunch helper did not become ready in time.", unresolved]
+        relaunch.abandonResults = [.unresolvedUnarmed(unresolved), .unresolvedUnarmed(unresolved)]
+        let coordinator = makeCoordinator(relaunch: relaunch.hooks)
+        var replies: [Bool] = []
+        XCTAssertTrue(coordinator.requestApplicationQuit(reason: .safeRestart) { replies.append($0) })
+        await waitUntil("the Stage A prompt") { recorder.isPresenting }
+        let first = recorder.presented.last
+        XCTAssertEqual(first?.stage, .preparation)
+        XCTAssertEqual(first?.relaunchHelperUnresolved, false, "never armed: not the no-choice prompt")
+        XCTAssertEqual(first?.offeredChoices, [.retry, .cancel])
+        XCTAssertEqual(first?.messages.last, unresolved, "the unresolved stop is reported")
+
+        recorder.choose(.retry)
+        await waitUntil("the retried prompt") { recorder.presented.count == 2 && recorder.isPresenting }
+        XCTAssertEqual(relaunch.calls, ["prepare", "abandon", "prepare", "abandon"])
+        XCTAssertEqual(recorder.presented.last?.offeredChoices, [.retry, .cancel])
+        XCTAssertEqual(coordinator.applicationRequest?.relaunchHelperUnresolvedPrompts, 0)
+        XCTAssertTrue(recorder.irreversible.isEmpty)
+
+        recorder.choose(.cancel)
+        await waitUntil("the cancelled reply") { !replies.isEmpty }
+        XCTAssertEqual(replies, [false])
+        XCTAssertFalse(participant.isFrozen, "Cancel unfreezes Stage A")
+        await waitUntil("the cancel abandon") { relaunch.calls.count == 5 }
+        XCTAssertEqual(relaunch.calls.last, "abandon")
+    }
+
+    /// A helper channel that never replies and never exits on its own; it records frames and kill
+    /// requests (a delivered signal is never exit proof).
+    private final class SilentRelaunchChannel: @unchecked Sendable {
+        private let lock = NSLock()
+        private var frames = 0
+        private var terminates = 0
+        private var exited = false
+        private var exitWaiters: [CheckedContinuation<Void, Never>] = []
+        private let continuation: AsyncStream<ProcessRelaunchInbound>.Continuation
+        private(set) var channel: ProcessRelaunchHelperChannel!
+
+        init() {
+            let (inbound, continuation) = AsyncStream<ProcessRelaunchInbound>.makeStream()
+            self.continuation = continuation
+            channel = ProcessRelaunchHelperChannel(
+                send: { [self] _ in
+                    lock.withLock { frames += 1 }
+                    return true
+                },
+                inbound: inbound,
+                waitForExit: { [self] in
+                    await withCheckedContinuation { waiter in
+                        lock.lock()
+                        if exited {
+                            lock.unlock()
+                            waiter.resume()
+                        } else {
+                            exitWaiters.append(waiter)
+                            lock.unlock()
+                        }
+                    }
+                },
+                terminate: { [self] in
+                    lock.withLock { terminates += 1 }
+                    return .signalSent
+                }
+            )
+        }
+
+        var terminateCount: Int {
+            lock.withLock { terminates }
+        }
+
+        var frameCount: Int {
+            lock.withLock { frames }
+        }
+
+        func exit() {
+            let waiters = lock.withLock {
+                exited = true
+                let pending = exitWaiters
+                exitWaiters = []
+                return pending
+            }
+            waiters.forEach { $0.resume() }
+            continuation.finish()
+        }
+    }
+
+    /// Review R1 A P1-07: R4 and the real relaunch driver share ONE injected clock. Identity
+    /// inspection and spawn consume 2 s inside the prepare hook before the helper's ready timer
+    /// starts; the helper never answers and never exits. The ready wait still ends at the attempt's
+    /// work expiry (7 s, not 2 s + 7 s), the stop ends at the final expiry (8 s, never renewed to
+    /// 9–10 s), and by 8 s the prompt shows the unresolved ownership (the helper is retained and
+    /// was never armed, so the normal Stage A choices stay — review R1 B N3).
+    func testSafeRestartComposedHelperBudgetIsAbsoluteAcrossTimeSpentBeforeItsTimerStarts() async throws {
+        let participant = FakeParticipant()
+        appParticipants = [participant]
+        let clock = try XCTUnwrap(clock)
+        let silent = SilentRelaunchChannel()
+        defer { silent.exit() }
+        let bootSessionID = try XCTUnwrap(UUID(uuidString: "0A0B0C0D-1111-4222-8333-944455556666"))
+        let identity = ProcessRelaunchParentIdentity(
+            pid: 4242,
+            bootSessionID: bootSessionID,
+            startSeconds: 10,
+            startMicroseconds: 20,
+            uid: 501
+        )
+        let driver = AppRelaunchCoordinator(dependencies: AppRelaunchCoordinator.Dependencies(
+            spawnHelper: { silent.channel },
+            parentIdentity: {
+                // Spent inside the hook, after R4 handed over its budget.
+                clock.advance(by: .seconds(2))
+                return identity
+            },
+            bundlePath: "/Apps/RepoPrompt CE.app",
+            verifyAllStopped: { .allStopped },
+            sleep: { duration in try? await clock.sleep(until: clock.now + duration) },
+            now: { clock.now }
+        ))
+        let coordinator = makeCoordinator(relaunch: driver.hooks)
+        var replies: [Bool] = []
+        XCTAssertTrue(coordinator.requestApplicationQuit(reason: .safeRestart) { replies.append($0) })
+
+        let workExpiry = clock.instant(at: .seconds(7))
+        let finalExpiry = clock.instant(at: .seconds(8))
+        await waitUntil("R4's deadline and the helper's ready timer, both at the work expiry") {
+            clock.requestedDeadlines.count { $0 == workExpiry } == 2
+        }
+        XCTAssertEqual(clock.now, clock.instant(at: .seconds(2)), "2 s were consumed before the timer started")
+        XCTAssertEqual(driver.spawnCount, 1)
+        clock.advance(by: .seconds(5))
+
+        let acknowledgementDeadline = finalExpiry - ProcessRelaunchLimits.v1.terminateGrace
+        await waitUntil("the abort acknowledgement wait") { clock.requestedDeadlines.contains(acknowledgementDeadline) }
+        clock.advance(by: acknowledgementDeadline - clock.now)
+        await waitUntil("the kill request and its exit wait") {
+            silent.terminateCount == 1 && clock.requestedDeadlines.contains(finalExpiry)
+        }
+        clock.advance(by: finalExpiry - clock.now)
+        await waitUntil("the prompt") { recorder.isPresenting }
+
+        XCTAssertEqual(clock.now, finalExpiry, "the prompt appears by the final expiry")
+        XCTAssertTrue(
+            clock.requestedDeadlines.allSatisfy { $0 <= finalExpiry },
+            "no helper wait is renewed past 8 s: \(clock.requestedDeadlines.map { $0 - clock.instant(at: .zero) })"
+        )
+        let failure = recorder.presented.last
+        XCTAssertEqual(failure?.stage, .preparation)
+        XCTAssertEqual(failure?.timedOut, true)
+        XCTAssertEqual(failure?.relaunchHelperUnresolved, false, "arm was never sent")
+        XCTAssertEqual(failure?.offeredChoices, [.retry, .cancel])
+        XCTAssertTrue(
+            failure?.messages.last?.hasPrefix(ProcessRelaunchParentSession.stopUnresolvedText) == true,
+            String(describing: failure?.messages)
+        )
+        XCTAssertTrue(driver.retainsHelper, "signal delivery is not exit proof: ownership retained")
+        XCTAssertGreaterThanOrEqual(silent.terminateCount, 1)
+        XCTAssertEqual(driver.spawnCount, 1)
+        XCTAssertEqual(replies, [])
+
+        recorder.choose(.cancel)
+        await waitUntil("the cancelled reply") { !replies.isEmpty }
+        XCTAssertEqual(replies, [false])
+        XCTAssertFalse(participant.isFrozen)
+        XCTAssertTrue(driver.retainsHelper, "still retained until its stop is proven")
+        XCTAssertEqual(driver.spawnCount, 1, "no fresh helper")
     }
 
     // MARK: Close authorization

@@ -703,6 +703,12 @@ Deferred nonblocking findings are retained verbatim in those files: A P3-R13 (wa
 
 The scoped read-only worker audited the complete frozen comparisons, reusing the initial audit and reading all remaining R1/R2 diffs: `prompt-exports/agent-run-2d54ad1dc1e4-f3338c3c.md`. It reports 65 intended source/test/allowlist paths, no removed/weakened existing assertions, skips or expected failures, no ledger/release/packaging changes and no original unrelated dirty paths. Main independently checked the empty real index, OFF qualification/default Stop boundaries earlier, and the exact frozen source hashes. Phase 4 planning preparation is deliberately excluded from the Phase 3 checkpoint.
 
+## Signed checkpoint
+
+Main created signed local commit `559ecd9d6d037ba762d8f4d2297d3c397a9d1f67` (`Track provider runtime ownership across app restarts`), 76 intended paths, 11,198 insertions and 239 deletions. The commit object contains a signature field; unsigned fallback was not used. All 64 source/test blobs were verified identical to reviewed tree `c25b94f0`. The staged boundary contained only intended Phase 3 source, tests, review/planning evidence and exact allowlist entries, plus the Phase 2 checkpoint-status reconciliation. Main excluded the Phase 4 plan, its original-spec status line and its allowlist line using per-file index content without modifying the working copy.
+
+`make guardrails`, `.githooks/pre-commit` and staged whitespace checks passed (existing route-count warning). The real index was empty afterward, no Conductor jobs or workers were running, and original unrelated dirty files remained unstaged. No source changed during signing or checkpointing. Phase 4 implementation may now use the released interfaces.
+
 ## Deviations
 
 - **Shell reads and edits.**

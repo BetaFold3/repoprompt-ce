@@ -816,6 +816,10 @@ package final class AgentTabSession: ObservableObject {
     /// recovery is composed. Installed and replaced only through `AgentRecoveryCoordinator.claimLane`.
     package var recoveryLane: AgentRecoverySessionLane?
 
+    /// The composed app-scoped recovery coordinator, also without a lane, so untracked input of an
+    /// inactive admission still honors its shared action holds (review A P1-01).
+    package weak var recoveryCoordinator: AgentRecoveryCoordinator?
+
     /// The managed session context of this tab's provider work right now: the live lane's durable
     /// lifecycle binding plus the current run attempt and process run when they exist. `unavailable`
     /// (never a fabricated or sessionless identity) when no live recovery lane binds the session.
@@ -883,8 +887,25 @@ package final class AgentTabSession: ObservableObject {
     package var attachmentsPendingProviderConsumptionCleanup: [AgentImageAttachment] = []
     package var attachmentTurnState: AgentAttachmentTurnState = .idle
 
-    // Provider session ID for resumption (e.g., Claude CLI session_id)
+    /// Provider session ID for resumption (e.g., Claude CLI session_id)
     package var providerSessionID: String?
+    /// Provider-history ledger and latest committed import receipt (lossless restart Phase 4).
+    /// Hydrated from and persisted with the session; changed only by the history-only merge.
+    package var providerHistoryRecovery: AgentSessionProviderHistoryRecovery?
+    /// Recovery dispatch (Phase 4): the Claude conversation whose resume must not fall back to an
+    /// implicit fresh conversation. Runtime-only; set before a recovery dispatch, cleared by a
+    /// successful resume of that conversation or by an explicit new-conversation choice.
+    package var recoveryResumeFallbackSuppressedConversationID: String?
+    /// Recovery dispatch (Phase 4): the Claude conversation whose resume failed while the implicit
+    /// fresh fallback was suppressed. Offers the explicit "Continue in a new conversation" choice.
+    package var recoveryResumeUnavailableConversationID: String?
+    /// History-only merge (Phase 4): the import receipt the next owner save must commit together
+    /// with the imported rows and ledger (`AgentSessionDataService.saveAgentSession(...,
+    /// committingHistoryImport:)`). Runtime-only; cleared once that save committed it.
+    package var pendingHistoryImportCommit: AgentSessionProviderHistoryRecovery.ImportCommit?
+    /// The latest import receipt an owner save of this tab committed (runtime-only evidence the
+    /// cursor CAS waits for).
+    package var committedHistoryImportID: UUID?
     package var providerTokenUsageByTurn: [AgentTokenUsagePersist] = []
     package var claudeConfiguredContextWindow: Int?
     package var claudeConfiguredContextWindowKey: ClaudeProvisionalContextWindowResolver.Key?

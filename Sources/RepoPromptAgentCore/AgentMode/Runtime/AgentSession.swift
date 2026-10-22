@@ -343,6 +343,12 @@ package struct AgentSession: Codable, Identifiable {
     /// never writable. Only `AgentSessionDataService` assigns or advances typed values.
     package var lifecycle: AgentSessionLifecycleMember?
 
+    /// Provider-history reconciliation ledger and latest import receipt (lossless restart Phase 4).
+    /// Optional v7 member, absent when empty; committed only through
+    /// `AgentSessionDataService.commitProviderHistoryImport`, and an older snapshot can never replace
+    /// a newer committed import (`AgentSessionDataService` stale-import guard).
+    package var providerHistoryRecovery: AgentSessionProviderHistoryRecovery?
+
     package init(
         id: UUID = UUID(),
         serializationVersion: Int = AgentSession.currentSerializationVersion,
@@ -390,8 +396,10 @@ package struct AgentSession: Codable, Identifiable {
         profile: AgentSessionProfile = .standard,
         worktreeBindings: [AgentSessionWorktreeBinding] = [],
         worktreeMergeOperations: [AgentSessionWorktreeMergeOperation] = [],
-        lifecycle: AgentSessionLifecycleMember? = nil
+        lifecycle: AgentSessionLifecycleMember? = nil,
+        providerHistoryRecovery: AgentSessionProviderHistoryRecovery? = nil
     ) {
+        self.providerHistoryRecovery = providerHistoryRecovery?.nilIfEmpty
         self.id = id
         self.serializationVersion = serializationVersion
         self.workspaceID = workspaceID
@@ -490,6 +498,7 @@ package struct AgentSession: Codable, Identifiable {
         case worktreeBindings
         case worktreeMergeOperations
         case lifecycle
+        case providerHistoryRecovery
     }
 
     package init(from decoder: Decoder) throws {
@@ -576,6 +585,10 @@ package struct AgentSession: Codable, Identifiable {
         worktreeBindings = try container.decodeIfPresent([AgentSessionWorktreeBinding].self, forKey: .worktreeBindings) ?? []
         worktreeMergeOperations = try container.decodeIfPresent([AgentSessionWorktreeMergeOperation].self, forKey: .worktreeMergeOperations) ?? []
         lifecycle = try Self.decodeLifecycleMember(from: container, forKey: .lifecycle)
+        providerHistoryRecovery = try container.decodeIfPresent(
+            AgentSessionProviderHistoryRecovery.self,
+            forKey: .providerHistoryRecovery
+        )?.nilIfEmpty
     }
 
     /// Key-presence decoding: absent is legacy (`nil`); explicit `null` is unreadable.

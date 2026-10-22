@@ -16,6 +16,13 @@ struct AgentRecoveryNeedsAttentionCommands: Commands {
                     await AgentRecoveryNeedsAttentionRouter.present(from: windowStatesManager)
                 }
             }
+            // Restart safely (lossless restart Phase 4): only shown while composed, never in
+            // production until O3 live acceptance.
+            if windowStatesManager.isSafeRestartAvailable {
+                Button("Restart Safely") {
+                    windowStatesManager.requestSafeRestart()
+                }
+            }
         }
     }
 }

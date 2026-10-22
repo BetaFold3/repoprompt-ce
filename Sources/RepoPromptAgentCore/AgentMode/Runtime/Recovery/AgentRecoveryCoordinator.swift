@@ -38,6 +38,9 @@ package struct AgentRecoveryAdmission: Equatable {
     /// The pending handoff this input's send prepends, captured (with its fenced payload ID) before
     /// admission and committed with the intent, so the exact prefix is durable before any handoff.
     package let pendingHandoff: AgentRecoveryPendingHandoffSnapshot?
+    /// The explicit recovery action whose own payload this is (coordinator-issued, never persisted).
+    /// It exempts only this input from that action's hold; every other admission check applies.
+    package let actionAuthorization: AgentRecoveryActionAuthorization?
 
     package init(
         binding: AgentRecoveryLifecycleBinding,
@@ -47,7 +50,8 @@ package struct AgentRecoveryAdmission: Equatable {
         target: AgentRecoveryIntentTarget,
         original: AgentRecoveryInputContent,
         scheduleReference: AgentRecoveryScheduleReference? = nil,
-        pendingHandoff: AgentRecoveryPendingHandoffSnapshot? = nil
+        pendingHandoff: AgentRecoveryPendingHandoffSnapshot? = nil,
+        actionAuthorization: AgentRecoveryActionAuthorization? = nil
     ) {
         self.binding = binding
         self.intentID = intentID
@@ -57,6 +61,7 @@ package struct AgentRecoveryAdmission: Equatable {
         self.original = original
         self.scheduleReference = scheduleReference
         self.pendingHandoff = pendingHandoff
+        self.actionAuthorization = actionAuthorization
     }
 
     package var submission: AgentRecoveryIntentSubmission {
@@ -70,6 +75,51 @@ package struct AgentRecoveryAdmission: Equatable {
             pendingHandoff: pendingHandoff
         )
     }
+}
+
+// MARK: - Recovery action authorization (review A P1-01)
+
+/// Coordinator-issued authority for one explicit recovery action's own payload. Only
+/// `AgentRecoveryCoordinator.beginRecoveryAction` constructs it; it is never persisted or decoded,
+/// so it is no authority after a relaunch (the durable action/intent association is the evidence).
+/// It names exactly one input: a continuation's planned user item (and the intent its admission
+/// issues) or Send saved's single claimed intent, dispatched once. It exempts that input from its
+/// own action's hold only; startup, crash holds, R6, shutdown, reset, and attachment checks apply.
+package struct AgentRecoveryActionAuthorization: Hashable {
+    package let token: UUID
+    package let actionID: UUID
+    package let sessionID: UUID
+    /// A continuation's planned transcript user item.
+    package let plannedUserItemID: UUID?
+    /// Send saved's claimed saved intent.
+    package let sourceIntentID: UUID?
+
+    fileprivate init(token: UUID, actionID: UUID, sessionID: UUID, plannedUserItemID: UUID?, sourceIntentID: UUID?) {
+        self.token = token
+        self.actionID = actionID
+        self.sessionID = sessionID
+        self.plannedUserItemID = plannedUserItemID
+        self.sourceIntentID = sourceIntentID
+    }
+}
+
+/// How a recovery action's submission settled: the only evidence that releases its hold.
+package enum AgentRecoveryActionSettlement: Equatable {
+    /// The provider boundary was entered (acceptance is not awaited) or delivery was recorded.
+    case handedOff
+    /// Nothing was handed off and nothing can be any more (the authorization is revoked).
+    case notHandedOff(String?)
+    /// A handoff may have happened but its evidence could not be recorded.
+    case uncertain(String)
+}
+
+/// Result of acquiring the shared hold for one explicit recovery action.
+package enum AgentRecoveryActionHoldAcquisition {
+    case acquired(AgentRecoveryActionAuthorization)
+    /// An exact repeat of the running action: its performance.
+    case joined(Task<AgentRecoveryActionResult, Never>)
+    /// Another action holds the session or workspace, or the lane/workspace is not current.
+    case refused
 }
 
 /// A committed admission: the carrier, its store-issued receipt (never provider acceptance), and
@@ -106,6 +156,10 @@ package enum AgentRecoveryAdmissionRefusal: Error, Equatable {
     /// App quit or this window's close is preserving state (two-stage shutdown). Reopens if the
     /// user cancels Stage A; never reopens once teardown began.
     case shutdownInProgress
+    /// An explicit recovery action holds this session or its workspace (review A P1-01), or the
+    /// input carries an action authorization that is no longer current. Only the holding action's
+    /// own exact payload passes.
+    case recoveryActionInProgress
 }
 
 /// Owners frozen by one shutdown request: every lane (app quit) or the lanes of specific owners
@@ -231,6 +285,8 @@ package enum AgentRecoveryAdmissionFailure: Error, Equatable {
         switch self {
         case .refused(.untrackedInput):
             "This message was not sent because it was not saved for recovery first."
+        case .refused(.recoveryActionInProgress):
+            "This message was not sent because a recovery choice in this workspace is in progress. It stays saved."
         case .refused:
             "This message was not sent because its recovery state is not ready. It stays saved."
         case .commitFailed:
@@ -417,6 +473,9 @@ package final class AgentRecoveryCoordinator {
     private var releasedUnsavedInputs: [UUID: AgentRecoveryOwnerlessUnsavedInput] = [:]
     /// Active shutdown freezes by token (see `beginShutdownFreeze`).
     private var shutdownFreezes: [UUID: AgentRecoveryShutdownScope] = [:]
+    /// Explicit recovery actions in flight, by hold token (review A P1-01). App-scoped, so every
+    /// window's dispatch seams and scheduler projections see the same holds.
+    private var recoveryActionHolds: [UUID: RecoveryActionHold] = [:]
     /// Cached catalog snapshot; `nil` once anything it projects changed.
     private var cachedCatalog: AgentRecoveryCatalog?
     private var catalogGeneration: UInt64 = 0
@@ -929,6 +988,374 @@ package final class AgentRecoveryCoordinator {
         !shutdownFreezes.isEmpty
     }
 
+    // MARK: Recovery action holds (review A P1-01)
+
+    /// One explicit recovery action between its acquisition and its recorded outcome. An exclusion
+    /// and authorization record, never a lock held across persistence.
+    fileprivate struct RecoveryActionHold {
+        let authorization: AgentRecoveryActionAuthorization
+        let request: AgentRecoveryActionRequest
+        let laneID: ObjectIdentifier
+        let workspaceID: UUID
+        var operation: Task<AgentRecoveryActionResult, Never>?
+        /// The intent normal admission issued for a continuation's planned user item.
+        var admittedIntentID: UUID?
+        /// The one delivery attempt committed for the authorized payload.
+        var dispatchAttemptID: UUID?
+        var commitsInFlight = 0
+        var isRevoked = false
+        var settlement: AgentRecoveryActionSettlement?
+        var waiters: [CheckedContinuation<AgentRecoveryActionSettlement, Never>] = []
+
+        /// The single intent this authorization may dispatch (`nil`: none yet, or none at all).
+        var authorizedIntentID: UUID? {
+            authorization.sourceIntentID ?? admittedIntentID
+        }
+    }
+
+    /// Acquires the shared hold for one explicit recovery action. Call synchronously before the
+    /// action's first await. An exact repeat (same request, same lane) joins the running
+    /// performance; any other action in the same session or workspace, and every ordinary
+    /// admission, dispatch, and handoff of the same durable session (any window), is refused while
+    /// the hold lasts; workspace siblings see only the automatic busy projection. Refused when `lane` is not the
+    /// session's live lane or the session's workspace mapping is unknown.
+    package func beginRecoveryAction(
+        _ request: AgentRecoveryActionRequest,
+        lane: AgentRecoverySessionLane
+    ) -> AgentRecoveryActionHoldAcquisition {
+        if let existing = recoveryActionHolds.values.first(where: { $0.authorization.actionID == request.actionID }) {
+            guard existing.request == request, existing.laneID == ObjectIdentifier(lane),
+                  let operation = existing.operation
+            else {
+                return .refused
+            }
+            return .joined(operation)
+        }
+        let sessionID = lane.sessionID
+        guard lanes[sessionID] === lane, !lane.isRetired, let workspaceID = laneWorkspaceIDs[sessionID] else {
+            return .refused
+        }
+        guard !recoveryActionHolds.values.contains(where: {
+            $0.authorization.sessionID == sessionID || $0.workspaceID == workspaceID
+        }) else {
+            return .refused
+        }
+        let authorization = AgentRecoveryActionAuthorization(
+            token: UUID(),
+            actionID: request.actionID,
+            sessionID: sessionID,
+            plannedUserItemID: request.kind == .sendSaved ? nil : request.plannedUserItemID,
+            sourceIntentID: request.kind == .sendSaved && request.sourceIntentIDs.count == 1
+                ? request.sourceIntentIDs[0]
+                : nil
+        )
+        recoveryActionHolds[authorization.token] = RecoveryActionHold(
+            authorization: authorization,
+            request: request,
+            laneID: ObjectIdentifier(lane),
+            workspaceID: workspaceID
+        )
+        postCoordinatorDidChange()
+        return .acquired(authorization)
+    }
+
+    /// Records the performance an exact repeat joins (installed synchronously after acquisition).
+    package func attachRecoveryActionOperation(
+        _ authorization: AgentRecoveryActionAuthorization,
+        _ operation: Task<AgentRecoveryActionResult, Never>
+    ) {
+        recoveryActionHolds[authorization.token]?.operation = operation
+    }
+
+    /// Revokes the authorization: no later admission, dispatch commit, or handoff may use it. When
+    /// nothing was committed (or is committing) for it, nothing can be handed off any more, so the
+    /// submission settles as not handed off.
+    package func revokeRecoveryAction(_ authorization: AgentRecoveryActionAuthorization, reason: String? = nil) {
+        guard var hold = recoveryActionHolds[authorization.token] else { return }
+        hold.isRevoked = true
+        recoveryActionHolds[authorization.token] = hold
+        settleRecoveryActionIfFenced(authorization.token, reason: reason)
+    }
+
+    /// The action's submission ended without handing off its payload through any later task (a
+    /// refusal after hydration, a start that provably handed nothing off, a deferred handoff that
+    /// settled without a commit). Revokes, then settles unless a committed dispatch still owes its
+    /// evidence (which then settles it).
+    package func noteRecoveryActionSubmissionEnded(_ authorization: AgentRecoveryActionAuthorization?, reason: String? = nil) {
+        guard let authorization else { return }
+        revokeRecoveryAction(authorization, reason: reason)
+    }
+
+    /// The action's committed delivery attempt entered the provider boundary: it is handed off.
+    /// Acceptance is not awaited; ordinary run restrictions take over from here.
+    package func noteRecoveryActionHandoffBegan(_ authorization: AgentRecoveryActionAuthorization?, attemptIDs: [UUID]) {
+        guard let authorization, let hold = recoveryActionHolds[authorization.token],
+              let attemptID = hold.dispatchAttemptID, attemptIDs.contains(attemptID)
+        else { return }
+        settleRecoveryAction(authorization.token, .handedOff)
+    }
+
+    /// Ordered evidence writes for the action's committed delivery attempt landed (or failed).
+    package func noteRecoveryActionEvidence(
+        _ authorization: AgentRecoveryActionAuthorization?,
+        attemptIDs: [UUID],
+        observation: AgentRecoveryDispatchEvidence.Observation,
+        writeFailed: Bool
+    ) {
+        guard let authorization, let hold = recoveryActionHolds[authorization.token],
+              let attemptID = hold.dispatchAttemptID, attemptIDs.contains(attemptID)
+        else { return }
+        let settlement: AgentRecoveryActionSettlement? = switch observation {
+        case .open:
+            nil
+        case .accepted, .deliveryUnknown:
+            writeFailed ? .uncertain(Self.recoveryActionEvidenceUnrecordedText) : .handedOff
+        case .notHandedOff, .rejected:
+            // A failed settle leaves the attempt `dispatching`: never claimed as not sent.
+            writeFailed ? .uncertain(Self.recoveryActionEvidenceUnrecordedText) : .notHandedOff(nil)
+        }
+        if let settlement {
+            settleRecoveryAction(authorization.token, settlement)
+        }
+    }
+
+    package static let recoveryActionEvidenceUnrecordedText =
+        "The message's delivery couldn't be recorded. Check the conversation before choosing again."
+
+    /// How the action's submission settled; waits until it has (no timeout: a cancelled UI task or
+    /// elapsed time is never release evidence).
+    package func awaitRecoveryActionSettlement(_ authorization: AgentRecoveryActionAuthorization) async -> AgentRecoveryActionSettlement {
+        guard let hold = recoveryActionHolds[authorization.token] else {
+            return .uncertain(Self.recoveryActionEvidenceUnrecordedText)
+        }
+        if let settlement = hold.settlement { return settlement }
+        return await withCheckedContinuation { continuation in
+            recoveryActionHolds[authorization.token]?.waiters.append(continuation)
+        }
+    }
+
+    /// Ends the hold after the action's outcome write (revoked first: its token never revives).
+    package func endRecoveryAction(_ authorization: AgentRecoveryActionAuthorization) {
+        guard let hold = recoveryActionHolds.removeValue(forKey: authorization.token) else { return }
+        for waiter in hold.waiters {
+            waiter.resume(returning: hold.settlement ?? .uncertain(Self.recoveryActionEvidenceUnrecordedText))
+        }
+        postCoordinatorDidChange()
+    }
+
+    /// Whether an explicit recovery action holds `sessionID` itself or its workspace: the R9
+    /// AUTOMATIC busy projection only (scheduler, automatic new session; `runAlongsideOtherSessions`
+    /// never bypasses it). Hard refusals of manual, MCP, queued-drain, and handoff work are scoped to
+    /// the action's own durable session (`ownRecoveryActionHold`), never its workspace siblings.
+    package func isCoveredByRecoveryAction(sessionID: UUID) -> Bool {
+        coveringRecoveryActionHold(sessionID: sessionID) != nil
+    }
+
+    /// Whether an action of a session other than `sessionID` holds `workspaceID`.
+    package func hasRecoveryAction(inWorkspace workspaceID: UUID, excluding sessionID: UUID) -> Bool {
+        recoveryActionHolds.values.contains { $0.workspaceID == workspaceID && $0.authorization.sessionID != sessionID }
+    }
+
+    /// Test and diagnostics observability.
+    package var recoveryActionHoldCount: Int {
+        recoveryActionHolds.count
+    }
+
+    /// Test and diagnostics observability: the action's dispatch commit is in flight.
+    package func recoveryActionCommitIsInFlight(_ authorization: AgentRecoveryActionAuthorization) -> Bool {
+        (recoveryActionHolds[authorization.token]?.commitsInFlight ?? 0) > 0
+    }
+
+    /// The hold covering `sessionID` (its own, or one in its workspace per the coordinator's
+    /// mapping). With no session identity or no known workspace, any hold covers it (fail closed).
+    private func coveringRecoveryActionHold(sessionID: UUID?) -> RecoveryActionHold? {
+        guard !recoveryActionHolds.isEmpty else { return nil }
+        guard let sessionID else { return recoveryActionHolds.values.first }
+        if let own = recoveryActionHolds.values.first(where: { $0.authorization.sessionID == sessionID }) {
+            return own
+        }
+        guard let workspaceID = knownWorkspaceID(for: sessionID) else { return recoveryActionHolds.values.first }
+        return recoveryActionHolds.values.first { $0.workspaceID == workspaceID }
+    }
+
+    /// The hold of the action whose durable session is `sessionID` (whichever window or lane now
+    /// owns it). The shared HARD exclusion (admission, dispatch commit, handoff, untracked input)
+    /// applies only here (review R1 B N1): sibling sessions of the workspace keep their manual, MCP,
+    /// queued-drain, and steering work, while automatic work stays gated by the workspace projection.
+    private func ownRecoveryActionHold(sessionID: UUID?) -> RecoveryActionHold? {
+        guard let sessionID else { return nil }
+        return recoveryActionHolds.values.first { $0.authorization.sessionID == sessionID }
+    }
+
+    /// The carried authorization's live hold, when it is current for `sessionID` and is the hold
+    /// covering it.
+    private func currentRecoveryActionHold(
+        _ authorization: AgentRecoveryActionAuthorization,
+        sessionID: UUID
+    ) -> RecoveryActionHold? {
+        guard let hold = recoveryActionHolds[authorization.token], !hold.isRevoked,
+              hold.authorization == authorization, authorization.sessionID == sessionID,
+              coveringRecoveryActionHold(sessionID: sessionID)?.authorization.token == authorization.token
+        else { return nil }
+        return hold
+    }
+
+    /// Input admission: refused while an action holds this durable session, unless the input is the
+    /// holding action's own planned item (admitted once).
+    fileprivate func recoveryActionAdmissionRefusal(
+        sessionID: UUID,
+        userItemID: UUID,
+        authorization: AgentRecoveryActionAuthorization?
+    ) -> AgentRecoveryAdmissionRefusal? {
+        guard let authorization else {
+            return ownRecoveryActionHold(sessionID: sessionID) == nil ? nil : .recoveryActionInProgress
+        }
+        guard let hold = currentRecoveryActionHold(authorization, sessionID: sessionID),
+              let planned = authorization.plannedUserItemID, planned == userItemID,
+              hold.admittedIntentID == nil
+        else {
+            return .recoveryActionInProgress
+        }
+        return nil
+    }
+
+    /// Binds the intent admission issued for the action's planned item (once).
+    fileprivate func noteRecoveryActionAdmitted(_ authorization: AgentRecoveryActionAuthorization?, intentID: UUID) {
+        guard let authorization, recoveryActionHolds[authorization.token]?.admittedIntentID == nil else { return }
+        recoveryActionHolds[authorization.token]?.admittedIntentID = intentID
+    }
+
+    /// Dispatch commit: refused while an action holds this durable session, unless it is exactly
+    /// the holding action's one authorized intent, dispatched once. Mixed or coalesced constituents
+    /// never pass.
+    fileprivate func recoveryActionDispatchRefusal(
+        sessionID: UUID,
+        intentIDs: [UUID],
+        authorization: AgentRecoveryActionAuthorization?
+    ) -> AgentRecoveryAdmissionRefusal? {
+        guard let authorization else {
+            return ownRecoveryActionHold(sessionID: sessionID) == nil ? nil : .recoveryActionInProgress
+        }
+        guard let hold = currentRecoveryActionHold(authorization, sessionID: sessionID),
+              intentIDs.count == 1, let authorized = hold.authorizedIntentID, authorized == intentIDs[0],
+              hold.dispatchAttemptID == nil, hold.commitsInFlight == 0
+        else {
+            return .recoveryActionInProgress
+        }
+        return nil
+    }
+
+    fileprivate func beginRecoveryActionDispatchCommit(_ authorization: AgentRecoveryActionAuthorization?) {
+        guard let authorization else { return }
+        recoveryActionHolds[authorization.token]?.commitsInFlight += 1
+    }
+
+    /// After the dispatch commit landed (`attemptID`, or `nil` when it failed): whether the
+    /// committed attempt may still be handed off. A refused one is settled stale by the lane.
+    fileprivate func finishRecoveryActionDispatchCommit(
+        _ authorization: AgentRecoveryActionAuthorization?,
+        sessionID: UUID,
+        attemptID: UUID?
+    ) -> Bool {
+        guard let authorization else {
+            return ownRecoveryActionHold(sessionID: sessionID) == nil
+        }
+        guard var hold = recoveryActionHolds[authorization.token] else { return false }
+        hold.commitsInFlight -= 1
+        let permitted = attemptID != nil && hold.dispatchAttemptID == nil
+            && currentRecoveryActionHold(authorization, sessionID: sessionID) != nil
+        if permitted {
+            hold.dispatchAttemptID = attemptID
+        }
+        recoveryActionHolds[authorization.token] = hold
+        if !permitted {
+            settleRecoveryActionIfFenced(authorization.token, reason: nil)
+        }
+        return permitted
+    }
+
+    /// A refused post-commit dispatch (`attemptIDs`) was settled back to `queued` (or could not be).
+    /// Bound to the exact attempt: when the commit already attached it to the hold (a shutdown or
+    /// reset freeze landed during the write, after the action check passed), the action's one
+    /// delivery attempt is spent and provably not handed off, so the submission settles
+    /// `notHandedOff` (revoked: nothing can use the token any more); a failed settle write is
+    /// `uncertain`, never claimed as not sent.
+    fileprivate func noteRecoveryActionStaleCommitSettled(
+        _ authorization: AgentRecoveryActionAuthorization?,
+        attemptIDs: [UUID],
+        settled: Bool
+    ) {
+        guard let authorization, var hold = recoveryActionHolds[authorization.token] else { return }
+        if let attached = hold.dispatchAttemptID {
+            guard attemptIDs.contains(attached) else { return }
+            hold.isRevoked = true
+            recoveryActionHolds[authorization.token] = hold
+            settleRecoveryAction(
+                authorization.token,
+                settled ? .notHandedOff(nil) : .uncertain(Self.recoveryActionEvidenceUnrecordedText)
+            )
+            return
+        }
+        if !settled {
+            settleRecoveryAction(authorization.token, .uncertain(Self.recoveryActionEvidenceUnrecordedText))
+        } else {
+            settleRecoveryActionIfFenced(authorization.token, reason: nil)
+        }
+    }
+
+    /// Final handoff check: no action holds this durable session, or the carried authorization is
+    /// current and the delivery attempts are exactly its one committed attempt.
+    fileprivate func recoveryActionPermitsHandoff(
+        sessionID: UUID?,
+        attemptIDs: [UUID],
+        authorization: AgentRecoveryActionAuthorization?
+    ) -> Bool {
+        guard let authorization else {
+            return ownRecoveryActionHold(sessionID: sessionID) == nil
+        }
+        guard let sessionID, let hold = currentRecoveryActionHold(authorization, sessionID: sessionID),
+              let attemptID = hold.dispatchAttemptID
+        else { return false }
+        return attemptIDs == [attemptID]
+    }
+
+    /// Untracked input (inactive admission) carries no authorization: it is refused while an action
+    /// holds its own durable session. Input without a durable session identity is a new session,
+    /// never the action's (whose tab is bound to it), so only the automatic projection applies there.
+    package func recoveryActionBlocksUntrackedInput(sessionID: UUID?) -> Bool {
+        ownRecoveryActionHold(sessionID: sessionID) != nil
+    }
+
+    /// Revokes every hold acquired through `lane` (its owner replaced or released it). Ownership is
+    /// kept until the delayed work is fenced or its committed dispatch settles.
+    private func revokeRecoveryActions(of lane: AgentRecoverySessionLane) {
+        let laneID = ObjectIdentifier(lane)
+        for hold in recoveryActionHolds.values where hold.laneID == laneID {
+            revokeRecoveryAction(hold.authorization, reason: AgentRecoverySessionLane.sessionChangedHoldReason)
+        }
+    }
+
+    private func settleRecoveryActionIfFenced(_ token: UUID, reason: String?) {
+        guard let hold = recoveryActionHolds[token], hold.isRevoked, hold.settlement == nil,
+              hold.dispatchAttemptID == nil, hold.commitsInFlight == 0
+        else { return }
+        settleRecoveryAction(token, .notHandedOff(reason))
+    }
+
+    private func settleRecoveryAction(_ token: UUID, _ settlement: AgentRecoveryActionSettlement) {
+        guard var hold = recoveryActionHolds[token], hold.settlement == nil else { return }
+        hold.settlement = settlement
+        if case .notHandedOff = settlement {
+            hold.isRevoked = true
+        }
+        let waiters = hold.waiters
+        hold.waiters = []
+        recoveryActionHolds[token] = hold
+        for waiter in waiters {
+            waiter.resume(returning: settlement)
+        }
+    }
+
     /// Joins released lanes' retirements and returns the sessions whose ownerless input is still
     /// unsaved afterwards. Released lanes are app-owned (their window may already be gone), so only
     /// app quit loses that memory and vetoes on it; a window close never attributes them to itself.
@@ -1117,6 +1544,10 @@ package final class AgentRecoveryCoordinator {
         } else {
             []
         }
+        if let predecessor {
+            // A successor never inherits the predecessor's action authority.
+            revokeRecoveryActions(of: predecessor)
+        }
         let retirement = predecessor?.beginRetirement(preserving: predecessor?.binding == gate.binding) ?? released
         let lane = AgentRecoverySessionLane(
             coordinator: self,
@@ -1166,6 +1597,7 @@ package final class AgentRecoveryCoordinator {
     /// current. The release task stays owned by the coordinator until a later lane inherits it.
     @discardableResult
     package func releaseLane(_ lane: AgentRecoverySessionLane) -> Task<Void, Never> {
+        revokeRecoveryActions(of: lane)
         let retirement = lane.beginRetirement(preserving: true)
         let sessionID = lane.sessionID
         if lanes[sessionID] === lane {
@@ -1935,6 +2367,9 @@ package final class AgentRecoverySessionLane {
         if let refusal = await admissionRefusal() {
             return .failure(.refused(refusal))
         }
+        if let refusal = actionAdmissionRefusal(admission) {
+            return .failure(.refused(refusal))
+        }
         await predecessorSettlement?.value
         guard unsavedPredecessorInputs.isEmpty else { return .failure(.refused(.unsavedPredecessorInput)) }
         var revision: AgentRecoveryComposerRevision?
@@ -1957,6 +2392,9 @@ package final class AgentRecoverySessionLane {
         guard unsavedPredecessorInputs.isEmpty else { return .failure(.refused(.unsavedPredecessorInput)) }
         guard !isResetPreparationActive else { return .failure(.refused(.resetPreparationInProgress)) }
         guard !isShutdownFrozen else { return .failure(.refused(.shutdownInProgress)) }
+        if let refusal = actionAdmissionRefusal(admission) {
+            return .failure(.refused(refusal))
+        }
         let receipt: Receipt
         switch await commit(self, admission.submission, revision) {
         case let .failure(failure):
@@ -1971,7 +2409,26 @@ package final class AgentRecoverySessionLane {
             noteProjectionRemoved(intentIDs: [intentReceipt(receipt).intentID], reason: Self.sessionChangedHoldReason)
             return .failure(.staleAfterCommit(intentID: admission.intentID, staleMarkPersisted: persisted))
         }
+        coordinator?.noteRecoveryActionAdmitted(admission.actionAuthorization, intentID: intentReceipt(receipt).intentID)
         return .success(AgentRecoveryAdmitted(admission: admission, receipt: receipt, submittedComposerRevision: revision))
+    }
+
+    /// The shared action hold (review A P1-01): refused while an explicit recovery action holds this
+    /// session or its workspace, unless this is that action's own planned item.
+    private func actionAdmissionRefusal(_ admission: AgentRecoveryAdmission) -> AgentRecoveryAdmissionRefusal? {
+        guard let coordinator else {
+            return admission.actionAuthorization == nil ? nil : .recoveryActionInProgress
+        }
+        return coordinator.recoveryActionAdmissionRefusal(
+            sessionID: binding.sessionID,
+            userItemID: admission.userItemID,
+            authorization: admission.actionAuthorization
+        )
+    }
+
+    /// The app-scoped coordinator owning this lane (`nil` once it is gone).
+    package var recoveryCoordinator: AgentRecoveryCoordinator? {
+        coordinator
     }
 
     /// A shutdown request (app quit or this owner's window close) froze this lane's owner.
@@ -2170,11 +2627,13 @@ package final class AgentRecoverySessionLane {
     package func beginDispatch(
         intentID: UUID,
         attempt: AgentRecoveryAttemptStart,
-        authorization: AgentRecoveryDispatchAuthorization
+        authorization: AgentRecoveryDispatchAuthorization,
+        action: AgentRecoveryActionAuthorization? = nil
     ) async -> Result<AgentRecoveryDispatchReceipt, AgentRecoveryAdmissionFailure> {
         await beginDispatches(
             [AgentRecoveryDispatchRequest(intentID: intentID, attempt: attempt)],
             authorization: authorization,
+            action: action,
             single: true
         ).map { $0[0] }
     }
@@ -2183,9 +2642,10 @@ package final class AgentRecoverySessionLane {
     /// order (`AgentRecoveryStore.beginDispatches`). Same closures as `beginDispatch`.
     package func beginDispatches(
         _ dispatches: [AgentRecoveryDispatchRequest],
-        authorization: AgentRecoveryDispatchAuthorization
+        authorization: AgentRecoveryDispatchAuthorization,
+        action: AgentRecoveryActionAuthorization? = nil
     ) async -> Result<[AgentRecoveryDispatchReceipt], AgentRecoveryAdmissionFailure> {
-        await beginDispatches(dispatches, authorization: authorization, single: false)
+        await beginDispatches(dispatches, authorization: authorization, action: action, single: false)
     }
 
     /// The commit participates in the reset drain. A commit that lands after this lane retired (a
@@ -2194,12 +2654,16 @@ package final class AgentRecoverySessionLane {
     private func beginDispatches(
         _ dispatches: [AgentRecoveryDispatchRequest],
         authorization: AgentRecoveryDispatchAuthorization,
+        action: AgentRecoveryActionAuthorization?,
         single: Bool
     ) async -> Result<[AgentRecoveryDispatchReceipt], AgentRecoveryAdmissionFailure> {
         guard !dispatches.isEmpty else { return .failure(.refused(.untrackedInput)) }
         guard !isRetired else { return .failure(.refused(.laneRetired)) }
         guard !isResetPreparationActive else { return .failure(.refused(.resetPreparationInProgress)) }
         guard !isShutdownFrozen else { return .failure(.refused(.shutdownInProgress)) }
+        if let refusal = actionDispatchRefusal(dispatches, action: action) {
+            return .failure(.refused(refusal))
+        }
         activeAdmissionCount += 1
         defer { admissionDidFinish() }
         if let refusal = await admissionRefusal() {
@@ -2208,6 +2672,11 @@ package final class AgentRecoverySessionLane {
         guard !isRetired else { return .failure(.refused(.laneRetired)) }
         guard !isResetPreparationActive else { return .failure(.refused(.resetPreparationInProgress)) }
         guard !isShutdownFrozen else { return .failure(.refused(.shutdownInProgress)) }
+        // Revalidated after the await, with no suspension before the commit begins.
+        if let refusal = actionDispatchRefusal(dispatches, action: action) {
+            return .failure(.refused(refusal))
+        }
+        coordinator?.beginRecoveryActionDispatchCommit(action)
         let committed: Result<[AgentRecoveryDispatchReceipt], AgentRecoveryControllerFailure> = await transaction { store, binding in
             if single {
                 let receipt = try await store.beginDispatch(
@@ -2229,15 +2698,55 @@ package final class AgentRecoverySessionLane {
         let receipts: [AgentRecoveryDispatchReceipt]
         switch committed {
         case let .failure(failure):
+            _ = coordinator?.finishRecoveryActionDispatchCommit(action, sessionID: sessionID, attemptID: nil)
             return .failure(.commitFailed(failure))
         case let .success(value):
             receipts = value
         }
-        guard isValidForHandoff else {
+        let actionPermits = coordinator?.finishRecoveryActionDispatchCommit(
+            action,
+            sessionID: sessionID,
+            attemptID: receipts.count == 1 ? receipts[0].attemptID : nil
+        ) ?? (action == nil)
+        guard isValidForHandoff, actionPermits else {
             let settled = await settleStaleDispatch(receipts)
+            coordinator?.noteRecoveryActionStaleCommitSettled(action, attemptIDs: receipts.map(\.attemptID), settled: settled)
             return .failure(.dispatchStaleAfterCommit(settledToQueue: settled))
         }
         return .success(receipts)
+    }
+
+    /// The shared action hold at the dispatch commit: exactly the holding action's one authorized
+    /// intent passes; any other dispatch of its durable session is refused.
+    private func actionDispatchRefusal(
+        _ dispatches: [AgentRecoveryDispatchRequest],
+        action: AgentRecoveryActionAuthorization?
+    ) -> AgentRecoveryAdmissionRefusal? {
+        guard let coordinator else { return action == nil ? nil : .recoveryActionInProgress }
+        return coordinator.recoveryActionDispatchRefusal(
+            sessionID: sessionID,
+            intentIDs: dispatches.map(\.intentID),
+            authorization: action
+        )
+    }
+
+    /// Synchronous pre-check of the shared action hold for a dispatch of `intentIDs` (no write).
+    package func recoveryActionDispatchRefusal(
+        intentIDs: [UUID],
+        action: AgentRecoveryActionAuthorization?
+    ) -> AgentRecoveryAdmissionRefusal? {
+        actionDispatchRefusal(
+            intentIDs.map { AgentRecoveryDispatchRequest(intentID: $0, attempt: AgentRecoveryAttemptStart(attemptID: UUID(), runAttemptID: nil)) },
+            action: action
+        )
+    }
+
+    /// Evidence-aware final handoff check: the lane-wide closures (`isValidForHandoff`) plus the
+    /// shared action hold, which only the carried authorization's exact committed attempt passes.
+    package func permitsHandoff(attemptIDs: [UUID], action: AgentRecoveryActionAuthorization?) -> Bool {
+        guard isValidForHandoff else { return false }
+        guard let coordinator else { return action == nil }
+        return coordinator.recoveryActionPermitsHandoff(sessionID: sessionID, attemptIDs: attemptIDs, authorization: action)
     }
 
     /// Whether input dispatched through this lane may still be handed off: not retired and not

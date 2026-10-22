@@ -83,8 +83,28 @@ extension WindowStatesManager {
                 parent.endSheet(alert.window, returnCode: .cancel)
             },
             now: { ContinuousClock.now },
-            sleepUntil: { expiry in try await Task.sleep(until: expiry, clock: .continuous) }
+            sleepUntil: { expiry in try await Task.sleep(until: expiry, clock: .continuous) },
+            // `nil` while Restart safely is gated OFF: R4 then refuses `.safeRestart`.
+            relaunch: appRelaunchCoordinator?.hooks
         )
+    }
+
+    // MARK: Restart safely entry
+
+    /// Whether Restart safely is composed (production: never, until O3 live acceptance).
+    var isSafeRestartAvailable: Bool {
+        appRelaunchCoordinator != nil
+    }
+
+    /// Starts Restart safely through the ordinary termination path (and its quit confirmation);
+    /// R4 then runs under `.safeRestart`. Does nothing while gated OFF.
+    func requestSafeRestart() {
+        guard isSafeRestartAvailable, !isTerminating else { return }
+        shutdownReasonLatch.armSafeRestart()
+        // `terminate` asks the delegate synchronously, which takes the reason first thing. Disarm
+        // afterwards in case no termination request took it (it is bound to this request only).
+        NSApp.terminate(nil)
+        shutdownReasonLatch.disarm()
     }
 
     /// Stage A: Retry / Cancel. Stage B: Retry / Quit (Close) Anyway; never Cancel.
@@ -96,6 +116,14 @@ extension WindowStatesManager {
         alert.alertStyle = .warning
         let details = failure.messages.joined(separator: "\n")
         switch failure.stage {
+        case _ where failure.relaunchHelperUnresolved:
+            // Review A P1-07 (fail closed, pending the owner's decision): the restart helper may
+            // still be alive or armed, so no Retry, Cancel, or Quit Anyway is offered. The answer
+            // is ignored by R4.
+            alert.messageText = "RepoPrompt can't continue restarting safely"
+            alert.informativeText = details
+                + "\n\nRepoPrompt could not confirm that its restart helper stopped, so it offers no further choice."
+            alert.addButton(withTitle: "OK")
         case .preparation:
             alert.messageText = isQuit
                 ? "RepoPrompt couldn't save everything before quitting"

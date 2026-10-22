@@ -673,6 +673,28 @@ final class AgentModeViewModel: ObservableObject {
     /// Injection seam for scheduled dispatch: replaces `startAgentRun` so provider acceptance
     /// outcomes can be driven without a live provider. `nil` uses the real run path.
     var scheduledDispatchRunStarter: ScheduledDispatchRunStarter?
+    /// Lossless restart Phase 4 explicit recovery actions (gated OFF in production).
+    lazy var recoveryActionRunner = AgentRecoveryActionRunner(
+        qualification: .production,
+        registrationActive: { AgentProcessRegistry.production?.isRegistrationActive == true }
+    )
+    /// Stable action requests per recovery item and choice, so a repeated click joins its
+    /// reservation (same action ID, same planned user item) until its outcome is recorded.
+    var recoveryActionRequestsBySlot: [RecoveryActionSlot: AgentRecoveryActionRequest] = [:]
+    /// A previous launch's open action joined and shown on an item; the next explicit choice on
+    /// that item names it (`supersedesActionID`). The store revalidates its join every time.
+    var recoveryPriorActionsByItem: [AgentRecoveryCardKey: RecoveryPriorAction] = [:]
+    /// Registry knowledge used to locate a Claude conversation's native history (Phase 4).
+    var recoveryHistoryRegistry: AgentProcessRegistry? = AgentProcessRegistry.production
+    #if DEBUG
+        /// Tests: replaces the registry's Claude history-home lookup (fixture homes only).
+        var test_recoveryClaudeHistoryHomes: (@MainActor (String) async -> [String])?
+        /// Tests: Claude history-home lookups and history reads this window performed.
+        var test_recoveryClaudeHistoryAccessCount = 0
+        /// Tests: replaces this host's Claude pre-byte baseline admission result (coordinator wiring
+        /// tests; the producer itself is covered with a qualified runner). Production never sets it.
+        var test_claudeDispatchBaselineAdmission: (@MainActor (AgentDispatchBaselineIdentity?, AgentTabSession) async -> Bool)?
+    #endif
     /// Presenter for the discard confirmation required before a lifecycle operation destroys a tab
     /// whose retained local conversation cannot be saved (stale-reset recovery). `nil` refuses the
     /// operation instead of discarding silently; the app composition installs an alert presenter.
@@ -4252,30 +4274,33 @@ final class AgentModeViewModel: ObservableObject {
         return session.agentMessageRuntimeFootersByItemID
     }
 
-    func recordAgentTurnUserAnchor(for session: AgentTabSession, userItem: AgentChatItem) {
+    /// `startedAt` overrides the item's timestamp when an already shown bubble is reused for a new
+    /// run (Send saved): the bubble keeps its own timestamp, the run's footer starts now.
+    func recordAgentTurnUserAnchor(for session: AgentTabSession, userItem: AgentChatItem, startedAt: Date? = nil) {
+        let startedAt = startedAt ?? userItem.timestamp
         if session.runState == .running {
             completeNextAgentTurnRuntimeFooterIfNeeded(
                 for: session,
-                endedAt: userItem.timestamp,
+                endedAt: startedAt,
                 maxSequenceIndexExclusive: userItem.sequenceIndex
             )
         }
 
         if shouldRestartActiveAgentRunElapsedTimer(for: session) {
-            restartActiveAgentRunElapsedTimer(for: session, startedAt: userItem.timestamp)
+            restartActiveAgentRunElapsedTimer(for: session, startedAt: startedAt)
         }
 
         let anchor = AgentTabSession.AgentTurnRuntimeAnchor(
             userItemID: userItem.id,
             userSequenceIndex: userItem.sequenceIndex,
-            startedAt: userItem.timestamp
+            startedAt: startedAt
         )
         if session.runState == .waitingForUser,
            !session.pendingTurnRuntimeAnchors.isEmpty
         {
             completeNextAgentTurnRuntimeFooterIfNeeded(
                 for: session,
-                endedAt: userItem.timestamp,
+                endedAt: startedAt,
                 maxSequenceIndexExclusive: userItem.sequenceIndex
             )
         }
@@ -5872,6 +5897,7 @@ final class AgentModeViewModel: ObservableObject {
 
         session.runState = payload.normalizedRunState
         session.providerSessionID = agentSession.providerSessionID
+        session.providerHistoryRecovery = agentSession.providerHistoryRecovery
         session.providerTokenUsageByTurn = agentSession.providerTokenUsageByTurn
         // Restore preserved accounting before any live ingestion. The persisted payload is
         // authoritative here; pre-hydration accumulator state never overwrites it on save.
@@ -14869,6 +14895,10 @@ final class AgentModeViewModel: ObservableObject {
             guard isSaveCommitTokenOwnerCurrent(saveToken) else {
                 return notWrittenOutcome
             }
+            // A pending history import commits in this same save (rows + ledger + receipt).
+            let historyImport = session.pendingHistoryImportCommit.flatMap { pending in
+                agentSession.providerHistoryRecovery?.lastImportCommit == pending ? pending : nil
+            }
             let commit = try await dataService.saveAgentSession(
                 agentSession,
                 for: workspace,
@@ -14877,7 +14907,8 @@ final class AgentModeViewModel: ObservableObject {
                 intentionallyRemovingFinalizedScheduledSendItems: finalizedItemRemovals,
                 committingTranscriptReset: transcriptResetReceipt,
                 fileCreationPolicy: fileCreationPolicy,
-                persistenceState: persistenceState
+                persistenceState: persistenceState,
+                committingHistoryImport: historyImport
             )
             let fileURL = commit.fileURL
             // Acknowledgements are identity-aware: only the owner that issued this save adopts
@@ -14895,6 +14926,12 @@ final class AgentModeViewModel: ObservableObject {
                 }
                 if let transcriptResetReceipt, session.pendingTranscriptResetReceipt == transcriptResetReceipt {
                     session.pendingTranscriptResetReceipt = nil
+                }
+                if let historyImport {
+                    session.committedHistoryImportID = historyImport.importID
+                    if session.pendingHistoryImportCommit == historyImport {
+                        session.pendingHistoryImportCommit = nil
+                    }
                 }
             }
             agentSession.fileURL = fileURL
@@ -15099,7 +15136,8 @@ final class AgentModeViewModel: ObservableObject {
             origin: session.origin,
             profile: session.profile,
             worktreeBindings: session.worktreeBindings,
-            worktreeMergeOperations: session.worktreeMergeOperations
+            worktreeMergeOperations: session.worktreeMergeOperations,
+            providerHistoryRecovery: session.providerHistoryRecovery
         )
         codexCoordinator.applyCodexPersistence(from: session, to: &agentSession)
         return agentSession
@@ -15922,6 +15960,11 @@ final class AgentModeViewModel: ObservableObject {
             }
             switch nativeSlashCommand.command.behavior {
             case .controlPlane:
+                // An explicit recovery action's payload is a user turn; a control-plane command has
+                // no dispatch its hold could settle on (review A P1-01).
+                if admitted?.identity.actionAuthorization != nil {
+                    return .blocked(message: "A recovery message can't run a slash command. Nothing was sent.")
+                }
                 let goalAction: CodexAgentModeCoordinator.GoalSlashAction? = nativeSlashCommand.command == .goal
                     ? CodexAgentModeCoordinator.goalSlashAction(from: nativeSlashCommand.argumentsText)
                     : nil
@@ -16066,6 +16109,12 @@ final class AgentModeViewModel: ObservableObject {
     /// is released per R01 (`releaseRefusedRecoveryAdmission`: withdrawn only once nothing depends on
     /// it). Sessions that do not require admission, and native control-plane commands (no user
     /// turn), submit as before.
+    ///
+    /// `reservedPayloadOnly` (recovery continuations, review B F5): exactly `text` is sent as a new
+    /// admitted user turn. The live composer (draft text, attachments, tagged files, selected
+    /// workflow, interview-first) is neither read nor consumed, no workflow wraps the text, slash
+    /// commands are refused, and every non-admitted fallback is refused instead of submitting the
+    /// composer's state.
     func submitUserTurnAdmittingRecoveryInput(
         text: String,
         tabID: UUID,
@@ -16073,8 +16122,15 @@ final class AgentModeViewModel: ObservableObject {
         codexAttemptID: UUID? = nil,
         workflowOverride: AgentWorkflowDefinition? = nil,
         nativePreparedTurn: NativeSlashPreparedUserTurn? = nil,
+        userItemID: UUID = UUID(),
+        reservedPayloadOnly: Bool = false,
+        actionAuthorization: AgentRecoveryActionAuthorization? = nil,
         isStillCurrent: @MainActor () -> Bool = { true }
     ) async -> UserTurnSubmissionResult {
+        // Only a reserved recovery payload carries an action's authority (review A P1-01).
+        guard actionAuthorization == nil || reservedPayloadOnly else {
+            return .blocked(message: Self.recoveryReservedPayloadUnadmittedMessage)
+        }
         let submit: (AdmittedUserTurnInput?) -> UserTurnSubmissionResult = { [weak self] admitted in
             guard let self else { return .blocked(message: Self.composeTabRemovalInProgressMessage) }
             guard let session = sessions[tabID] else {
@@ -16109,12 +16165,22 @@ final class AgentModeViewModel: ObservableObject {
         guard let session = session(for: tabID, createIfNeeded: true) else {
             return .blocked(message: Self.composeTabRemovalInProgressMessage)
         }
-        guard requiresDurableRecoveryAdmission(for: session) else { return submit(nil) }
+        guard requiresDurableRecoveryAdmission(for: session) else {
+            return reservedPayloadOnly ? .blocked(message: Self.recoveryReservedPayloadUnadmittedMessage) : submit(nil)
+        }
         // Refusals the synchronous submit would return before projecting anything admit nothing.
         if let blockedMessage = newWorkBlockedMessage(for: session) {
             return .blocked(message: blockedMessage)
         }
         let trimmedText = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        if reservedPayloadOnly {
+            guard !trimmedText.isEmpty, nativePreparedTurn == nil, origin != .composer, origin != .mcp else {
+                return .blocked(message: Self.recoveryReservedPayloadUnadmittedMessage)
+            }
+            guard resolvedNativeSlashCommand(in: trimmedText, session: session) == nil else {
+                return .blocked(message: "A recovery continuation can't run a slash command. Nothing was sent.")
+            }
+        }
         let consumesComposer = origin == .composer
         // R12: the whole submitted input is captured synchronously, before any await. A native
         // prepared turn carries no composer attachments (it submits none).
@@ -16129,22 +16195,23 @@ final class AgentModeViewModel: ObservableObject {
         {
             return submit(nil)
         }
-        let workflow = origin == .mcp ? workflowOverride : session.selectedWorkflow
+        let workflow = reservedPayloadOnly ? nil : (origin == .mcp ? workflowOverride : session.selectedWorkflow)
         let interviewFirst = consumesComposer && effectiveInterviewFirst(for: session)
         let admission = await admitRecoveryInput(
             session: session,
-            userItemID: UUID(),
+            userItemID: userItemID,
             origin: origin,
             text: consumesComposer ? text : trimmedText,
             attachments: attachments,
             taggedFiles: taggedFiles,
             workflow: workflow,
             interviewFirst: interviewFirst,
-            consumesComposer: consumesComposer
+            consumesComposer: consumesComposer,
+            actionAuthorization: actionAuthorization
         )
         switch admission {
         case .notRequired:
-            return submit(nil)
+            return reservedPayloadOnly ? .blocked(message: Self.recoveryReservedPayloadUnadmittedMessage) : submit(nil)
         case let .blocked(message):
             return .blocked(message: message)
         case let .admitted(identity, lane, content, admittedAttachments):
@@ -16735,10 +16802,14 @@ final class AgentModeViewModel: ObservableObject {
     ) async {
         guard let session = sessions[tabID] else {
             // R01: never withdrawn here; the admitted intent stays held for explicit recovery.
+            recoveryCoordinator?.noteRecoveryActionSubmissionEnded(admitted?.identity.actionAuthorization)
             return
         }
         await prepareSessionForRunStart(tabID: tabID, session: session)
-        guard let hydratedSession = sessions[tabID] else { return }
+        guard let hydratedSession = sessions[tabID] else {
+            recoveryCoordinator?.noteRecoveryActionSubmissionEnded(admitted?.identity.actionAuthorization)
+            return
+        }
         let result = submitPreparedUserTurn(
             tabID: tabID,
             session: hydratedSession,
@@ -16752,8 +16823,14 @@ final class AgentModeViewModel: ObservableObject {
         )
         // The caller already reported `.submitted`; a refusal after hydration releases the admitted
         // intent under R01 (held unless its exact draft is durably back in the composer).
-        if result != .submitted, let admitted, let lane = hydratedSession.recoveryLane {
-            await releaseRefusedRecoveryAdmission(admitted, lane: lane, session: hydratedSession)
+        if result != .submitted, let admitted {
+            // A recovery action's submission settles here: nothing was or can be handed off.
+            recoveryCoordinator?.noteRecoveryActionSubmissionEnded(admitted.identity.actionAuthorization)
+            // Send saved (review A P1-06): the saved intent was the user's message before this choice;
+            // a refused re-dispatch keeps it queued (never withdrawn), exactly as before the choice.
+            if !admitted.resendsAuthorizedSavedIntent, let lane = hydratedSession.recoveryLane {
+                await releaseRefusedRecoveryAdmission(admitted, lane: lane, session: hydratedSession)
+            }
         }
     }
 
@@ -16812,6 +16889,33 @@ final class AgentModeViewModel: ObservableObject {
         if admittedIdentity == nil, session.recoveryAdmissionMode != .inactive {
             return .blocked(message: Self.durableQueueAdmissionRequiredMessage)
         }
+        // Review A P1-01: an explicit recovery action's own payload only starts a local run, whose
+        // dispatch evidence settles the action's hold; a live run or remote host never queues it.
+        if admittedIdentity?.actionAuthorization != nil, session.runState.isActive || session.remoteHost != nil {
+            return .blocked(message: Self.recoveryActionSessionBusyMessage)
+        }
+        // Review A P1-06: Send saved reuses its intent's deterministic bubble when it is already
+        // shown (canonical transcript or working suffix) and exactly matches the saved payload;
+        // a genuinely absent bubble is appended once under the same item ID. Decided synchronously
+        // with the append below (no suspension between check and use).
+        var reusedUserItem: AgentChatItem?
+        if let admitted, admitted.resendsAuthorizedSavedIntent, let userItemID = admittedIdentity?.userItemID {
+            switch recoverySavedIntentBubble(
+                userItemID: userItemID,
+                session: session,
+                trimmedText: trimmedText,
+                attachments: attachmentsToSend,
+                taggedFiles: taggedFilesToSend,
+                workflow: activeWorkflow
+            ) {
+            case .absent:
+                break
+            case let .shown(item):
+                reusedUserItem = item
+            case let .refused(message):
+                return .blocked(message: message)
+            }
+        }
 
         let prepared = appendPreparedUserTurn(
             tabID: tabID,
@@ -16823,7 +16927,9 @@ final class AgentModeViewModel: ObservableObject {
             nativePreparedTurn: nativePreparedTurn,
             inputSource: .composer,
             preassignedUserItemID: admittedIdentity?.userItemID,
-            admittedInterviewFirst: admitted.map(\.interviewFirst)
+            admittedInterviewFirst: admitted.map(\.interviewFirst),
+            consumesComposerInterview: admitted?.consumesComposer ?? true,
+            reusedUserItem: reusedUserItem
         )
         let userItem = prepared.userItem
         let effectiveUserText = prepared.effectiveUserText
@@ -16998,7 +17104,7 @@ final class AgentModeViewModel: ObservableObject {
                         self.removeUnconfirmedMCPOptimisticCodexUserItem(
                             session: session,
                             tabID: tabID,
-                            itemID: userItem.id,
+                            itemID: prepared.removableUserItemID,
                             reason: "dispatch authorization did not complete"
                         )
                         return
@@ -17014,6 +17120,7 @@ final class AgentModeViewModel: ObservableObject {
                     inputConstituents: nil,
                     codexFallbackContext: fallbackContext
                 )
+                self.noteRecoveryActionStartReturned(identity, outcome: sendOutcome, isCodex: true)
                 if sendOutcome?.didSend != true {
                     self.clearPendingCodexComputerUseActivationIfMatched(
                         session: session,
@@ -17025,7 +17132,7 @@ final class AgentModeViewModel: ObservableObject {
                         self.removeUnconfirmedMCPOptimisticCodexUserItem(
                             session: session,
                             tabID: tabID,
-                            itemID: userItem.id,
+                            itemID: prepared.removableUserItemID,
                             reason: "send outcome was not accepted or durably queued"
                         )
                     }
@@ -17197,7 +17304,7 @@ final class AgentModeViewModel: ObservableObject {
         // If agent is not running, start it
         if !session.runState.isActive {
             Task {
-                await startAgentRun(
+                let outcome = await startAgentRun(
                     tabID: tabID,
                     initialMessage: wrappedText,
                     attachments: attachmentsToSend,
@@ -17205,6 +17312,7 @@ final class AgentModeViewModel: ObservableObject {
                     inputConstituents: [inputIdentity],
                     holdsPrefixBlockedInput: true
                 )
+                noteRecoveryActionStartReturned(inputIdentity, outcome: outcome, isCodex: false)
             }
         } else {
             // Queued input carries its admission identity.
@@ -17236,7 +17344,13 @@ final class AgentModeViewModel: ObservableObject {
     /// the debounced save. `.scheduled` supplies the attempt's deterministic item id and never
     /// reads or clears composer pending state. `admittedInterviewFirst` is the admitted snapshot's
     /// interview choice (R12; `nil` only for legacy untracked composer input, which reads the live
-    /// choice).
+    /// choice). Only a composer submission (`consumesComposerInterview`) consumes the live one-shot
+    /// interview choice; an admitted non-composer input (MCP, Send saved) leaves it alone.
+    ///
+    /// `reusedUserItem` (review A P1-06, Send saved only): the authorized, already shown
+    /// deterministic bubble of the saved intent. It is left exactly as shown (no append, duplicate,
+    /// sequence-counter, or timestamp change); the new run attaches to that same turn, and the
+    /// result reports `.reused` so failure cleanup never deletes it.
     func appendPreparedUserTurn(
         tabID: UUID,
         session: AgentTabSession,
@@ -17247,7 +17361,9 @@ final class AgentModeViewModel: ObservableObject {
         nativePreparedTurn: NativeSlashPreparedUserTurn?,
         inputSource: UserTurnInputSource,
         preassignedUserItemID: UUID?,
-        admittedInterviewFirst: Bool?
+        admittedInterviewFirst: Bool?,
+        consumesComposerInterview: Bool = true,
+        reusedUserItem: AgentChatItem? = nil
     ) -> PreparedUserTurnAppend {
         let bubbleText = Self.userBubbleText(
             trimmedText: trimmedText,
@@ -17255,7 +17371,9 @@ final class AgentModeViewModel: ObservableObject {
             taggedFiles: taggedFilesToSend,
             workflow: activeWorkflow
         )
-        if case .composer = inputSource, nativePreparedTurn?.shouldEnableCodexComputerUse == true {
+        if case .composer = inputSource, reusedUserItem == nil,
+           nativePreparedTurn?.shouldEnableCodexComputerUse == true
+        {
             session.pendingCodexComputerUseActivation = AgentCodexComputerUseActivation(
                 id: UUID(),
                 createdAt: Date()
@@ -17269,13 +17387,15 @@ final class AgentModeViewModel: ObservableObject {
         switch inputSource {
         case .composer:
             // A durably admitted input is shown as the item its intent was committed for.
-            itemID = preassignedUserItemID ?? UUID()
+            itemID = reusedUserItem?.id ?? preassignedUserItemID ?? UUID()
             let interviewFirst = admittedInterviewFirst ?? effectiveInterviewFirst(for: session)
             if interviewFirst, Self.sessionQualifiesForInterviewFirst(session) {
                 effectiveUserText = Self.interviewFirstWrappedUserText(effectiveUserText)
-                // The submitted choice is consumed (one-shot); an admitted non-composer input
-                // carries `false` and leaves the live choice alone.
-                setInterviewFirst(false, for: session)
+                // The submitted choice is consumed (one-shot) by a composer submission only; an
+                // admitted non-composer input carries its own choice and leaves the live one alone.
+                if consumesComposerInterview {
+                    setInterviewFirst(false, for: session)
+                }
             }
         case let .scheduled(record, attempt):
             itemID = attempt.itemID
@@ -17305,6 +17425,19 @@ final class AgentModeViewModel: ObservableObject {
             flushPendingAssistantDelta(session)
         }
 
+        if let reusedUserItem {
+            // The shown bubble stays exactly as it is; this run's runtime footer starts now.
+            recordAgentTurnUserAnchor(for: session, userItem: reusedUserItem, startedAt: Date())
+            updateBindingsFromSession(session)
+            return PreparedUserTurnAppend(
+                userItem: reusedUserItem,
+                effectiveUserText: effectiveUserText,
+                wrappedText: wrappedText,
+                codexCompactionInFlight: codexCompactionInFlight,
+                stagedCodexComputerUseActivationID: stagedCodexComputerUseActivationID,
+                disposition: .reused
+            )
+        }
         let userItem = AgentChatItem.user(
             bubbleText,
             id: itemID,
@@ -17322,7 +17455,8 @@ final class AgentModeViewModel: ObservableObject {
             effectiveUserText: effectiveUserText,
             wrappedText: wrappedText,
             codexCompactionInFlight: codexCompactionInFlight,
-            stagedCodexComputerUseActivationID: stagedCodexComputerUseActivationID
+            stagedCodexComputerUseActivationID: stagedCodexComputerUseActivationID,
+            disposition: .appended
         )
     }
 
@@ -21665,6 +21799,7 @@ final class AgentModeViewModel: ObservableObject {
         candidate.remoteResendPayloadsByItemID = [:]
         candidate.locallyAttributedStartItemID = nil
         candidate.providerSessionID = nil
+        candidate.providerHistoryRecovery = nil
         candidate.providerTokenUsageByTurn = []
         candidate.codexConversationID = nil
         candidate.codexRolloutPath = nil
@@ -21758,6 +21893,12 @@ final class AgentModeViewModel: ObservableObject {
         // restore the old conversation or affect a replacement controller.
         claudeCoordinator.prepareForConversationResetSync(session)
         session.providerSessionID = nil
+        // The history ledger belongs to the cleared transcript (reset semantics only).
+        session.providerHistoryRecovery = nil
+        session.recoveryResumeFallbackSuppressedConversationID = nil
+        session.recoveryResumeUnavailableConversationID = nil
+        session.pendingHistoryImportCommit = nil
+        session.committedHistoryImportID = nil
         session.providerTokenUsageByTurn.removeAll()
         session.claudeConfiguredContextWindow = nil
         session.claudeConfiguredContextWindowKey = nil

@@ -1470,6 +1470,13 @@ extension AgentModeViewModel {
         if scheduledSendCoordinator?.transferHold(sessionID: sessionID) != nil {
             return true
         }
+        // An explicit recovery action of this session or its workspace is between its acquisition and
+        // its recorded outcome (review A P1-01 / B F3a). The projection comes from the app-shared
+        // coordinator hold (cross-window): automatic work waits, `runAlongsideOtherSessions`
+        // included. The action's own normal dispatch never consults this.
+        if recoveryCoordinator?.isCoveredByRecoveryAction(sessionID: sessionID) == true {
+            return true
+        }
         if let recoveryCoordinator {
             // Startup restrictions (unknown status, duplicate destination, unreadable workspace).
             if recoveryCoordinator.restrictions.blocks(
@@ -2477,6 +2484,10 @@ extension AgentModeViewModel: AgentScheduledSendCoordinatorHost {
     func hasUnresolvedRecoverySession(inWorkspace workspaceID: UUID, excluding sessionID: UUID) -> Bool {
         // App-scoped startup results cover closed sessions too (every window shares the coordinator).
         if recoveryCoordinator?.hasUnresolvedSession(inWorkspace: workspaceID, excluding: sessionID) == true {
+            return true
+        }
+        // Review A P1-01: an explicit recovery action held anywhere in this workspace (any window).
+        if recoveryCoordinator?.hasRecoveryAction(inWorkspace: workspaceID, excluding: sessionID) == true {
             return true
         }
         guard persistenceWorkspace?.id == workspaceID else { return false }
