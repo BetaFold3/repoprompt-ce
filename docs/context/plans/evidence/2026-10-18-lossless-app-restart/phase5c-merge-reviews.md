@@ -50,6 +50,12 @@ Step5c closes the final presently implementable preservation source package iden
 
 Production registry, Stop, fresh-Claude-ID, Resume/history and automated Restart stay OFF; the plan remains active and unarchived. Optional provider qualification/detach experiments, power-loss hardening, polish and retention are deferred. No whole-contract completion claim is made. The earlier Step5b accidentally installed intermediate app remains unqualified and must not be mistaken for this reviewed source; no Step5c packaging/launch/stop was performed.
 
+## Owner confirmation after checkpoint
+
+Step 5c was committed as `ce82ac6d64b3c211710b71fffbc2a1aa9b9ad56e`, unsigned under O8 after the signing wait described below. The subsequent prerequisite question timed out after 302 seconds; the owner has now explicitly accepted the recommendation to keep full Phase 4 blocked and activation off until the Claude identity evidence and armed-helper-stop policy are resolved. Decision O14 records that answer, replacing the earlier lack of a response. The owner also directs OracleA/OracleB guidance when uncertain; no new uncertainty or behavioral change requires another consultation for this documentation-only confirmation.
+
+The full contract remains intact. The next qualification pass needs the exact evidence described in [the source investigation](phase4-source-investigations.md), plus an explicit policy for an armed helper whose stop cannot be established. No additional source implementation or live action is implied by this confirmation. All existing deferrals and live-acceptance limits remain as recorded above.
+
 ## Final validation and checkpoint preparation
 
 Main's first post-review wording rerun `c7448a3a-165a-4148-b0d1-fb807fc5b139` ran19tests with1failure because another existing assertion still pinned the deliberately removed phrase. Main updated that exact wording assertion to require the lifecycle reason and reject the no-decision claim; no save/owner/durability assertion changed. Final affected suite `8317482d-967c-413c-a77f-652ce913cda8` passed19/0, compile-only app `a4a77a0c-f7a8-4fe7-b27f-e99432f041c7` exit0, format-check `1ecc7d13-ed5f-49e2-b206-b2bfc39f34b5`0/2175 and lint `f35b8316-ef40-469f-8679-2927d081f430` exit0. The other32focused tests passed on the R1 source before this wording/assertion-only change, not rerun afterward. Total coverage remains51distinct tests, not70. The worker digest identifies its reviewed tree, not main's later neutral wording/assertions.
