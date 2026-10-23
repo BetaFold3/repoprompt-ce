@@ -489,6 +489,14 @@ package struct AgentSessionProviderHistoryRecovery: Codable, Equatable {
         nativeItems.first { $0.key == key }
     }
 
+    /// Whether `localItemID` is the local item of any Claude native row in this ledger (Step 4d3a),
+    /// whatever that row's envelope digest (a missing or invalid digest still protects the item).
+    package func associatesClaudeLocalItem(_ localItemID: UUID) -> Bool {
+        nativeItems.contains {
+            $0.providerRaw == AgentRecoveryHistoryProvider.claude.rawValue && $0.localItemID == localItemID
+        }
+    }
+
     /// Exactly 64 lowercase hex digits (a SHA-256 rendered by `sha256Hex`).
     package static func isSHA256Hex(_ value: String) -> Bool {
         value.utf8.count == 64 && value.utf8.allSatisfy { (0x30 ... 0x39).contains($0) || (0x61 ... 0x66).contains($0) }

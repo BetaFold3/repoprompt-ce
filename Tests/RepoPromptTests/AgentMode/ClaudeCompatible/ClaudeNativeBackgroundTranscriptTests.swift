@@ -1081,6 +1081,138 @@ extension AgentModeRunServiceLifecycleTests {
             )
         }
     }
+
+    /// Step 4d3a: marks `ids` as the local items of Claude history rows with no envelope digest (a
+    /// missing digest still protects them).
+    private func associateWithClaudeHistory(_ ids: [UUID], session: AgentTabSession) {
+        session.providerHistoryRecovery = AgentSessionProviderHistoryRecovery(nativeItems: ids.enumerated().map { index, id in
+            .init(
+                providerRaw: "claude",
+                nativeSessionID: "conv-1",
+                nativeEntryID: "a\(index)",
+                rowKindRaw: "assistantText",
+                ordinal: 0,
+                localItemID: id
+            )
+        })
+        XCTAssertTrue(session.providerHistoryRecovery?.nativeItems.allSatisfy { $0.envelopeDigest == nil } ?? false)
+    }
+
+    /// Step 4d3a: a row associated to Claude's history is never extended by live text. The run's
+    /// streamed delta and a between-run delta each start a new row; the associated rows keep their
+    /// IDs and text.
+    func testClaudeLiveDeltasNeverExtendAProviderHistoryAssociatedRow() async throws {
+        let session = AgentTabSession(tabID: UUID())
+        session.selectedAgent = .claudeCode
+        var host: AgentModeViewModel?
+        let harness = makeHarness(
+            recorder: LifecycleRecorder(),
+            flushPendingAssistantDelta: { host?.flushPendingAssistantDelta($0) }
+        )
+        host = harness.host
+        harness.host.test_installLiveSession(session)
+        defer { harness.host.clearPendingAssistantDelta(session) }
+        session.appendItem(AgentChatItem.user("Question", sequenceIndex: session.nextSequenceIndex))
+        let runID = UUID()
+        session.runID = runID
+        session.runState = .running
+        let attemptID = session.beginRunAttempt(source: "test.associatedDeltas").attemptID
+        func run(_ type: String, _ text: String) async {
+            await harness.host.test_handleStreamResult(
+                AIStreamResult(type: type, text: text), session: session, runID: runID, runAttemptID: attemptID
+            )
+            harness.host.flushPendingAssistantDelta(session)
+        }
+        func background(_ type: String, _ text: String) async {
+            await harness.host.test_handleBackgroundNativeStreamResult(
+                AIStreamResult(type: type, text: text), session: session
+            )
+        }
+
+        await run("content", "live")
+        let runRow = try XCTUnwrap(session.items.last)
+        XCTAssertEqual(runRow.kind, .assistant)
+        XCTAssertTrue(runRow.isStreaming)
+        associateWithClaudeHistory([runRow.id], session: session)
+        await run("content", " more")
+        XCTAssertEqual(session.items.filter { $0.kind == .assistant }.map(\.text), ["live", " more"])
+        XCTAssertEqual(session.items.first { $0.kind == .assistant }?.id, runRow.id)
+
+        await background("content", "between")
+        let backgroundRow = try XCTUnwrap(session.items.last)
+        XCTAssertEqual(session.backgroundCurrentAssistantRowIDs[nil], backgroundRow.id)
+        associateWithClaudeHistory([runRow.id, backgroundRow.id], session: session)
+        await background("content", " runs")
+        XCTAssertEqual(session.items.filter { $0.kind == .assistant }.map(\.text), ["live", " more", "between", " runs"])
+        XCTAssertEqual(session.items.first { $0.text == "between" }?.id, backgroundRow.id)
+        XCTAssertEqual(session.backgroundCurrentAssistantRowIDs[nil], session.items.last?.id, "the new row is the message's row")
+    }
+
+    /// Step 4d3a: `final_content` keeps its existing target selection, but a target associated to
+    /// Claude's history is never rewritten: equal text leaves it unchanged with no duplicate, other
+    /// text appends a new visible row. The background message's row pointer is still retired.
+    func testClaudeFinalContentNeverRewritesAProviderHistoryAssociatedRow() async throws {
+        let session = AgentTabSession(tabID: UUID())
+        session.selectedAgent = .claudeCode
+        var host: AgentModeViewModel?
+        let harness = makeHarness(
+            recorder: LifecycleRecorder(),
+            flushPendingAssistantDelta: { host?.flushPendingAssistantDelta($0) }
+        )
+        host = harness.host
+        harness.host.test_installLiveSession(session)
+        defer { harness.host.clearPendingAssistantDelta(session) }
+        session.appendItem(AgentChatItem.user("Question", sequenceIndex: session.nextSequenceIndex))
+        let imported = AgentChatItem.assistant("ALPHA-7", sequenceIndex: session.nextSequenceIndex)
+        session.appendItem(imported)
+        associateWithClaudeHistory([imported.id], session: session)
+        let runID = UUID()
+        session.runID = runID
+        session.runState = .running
+        let attemptID = session.beginRunAttempt(source: "test.associatedFinalContent").attemptID
+        func run(_ type: String, _ text: String) async {
+            await harness.host.test_handleStreamResult(
+                AIStreamResult(type: type, text: text), session: session, runID: runID, runAttemptID: attemptID
+            )
+        }
+        func background(_ type: String, _ text: String) async {
+            await harness.host.test_handleBackgroundNativeStreamResult(
+                AIStreamResult(type: type, text: text), session: session
+            )
+        }
+
+        // Active run: the selected target is the associated row.
+        let before = session.items
+        await run("final_content", "ALPHA-7")
+        XCTAssertEqual(session.items.map(\.id), before.map(\.id), "equal text: no duplicate")
+        XCTAssertEqual(session.items.map(\.text), before.map(\.text), "equal text: unchanged")
+        await run("final_content", "ALPHA-8")
+        XCTAssertEqual(session.items.filter { $0.kind == .assistant }.map(\.text), ["ALPHA-7", "ALPHA-8"])
+        XCTAssertEqual(session.items.first { $0.kind == .assistant }?.id, imported.id, "the associated row is preserved")
+
+        // Background message: its current row is associated.
+        session.runState = .completed
+        await background("content", "between")
+        let backgroundRow = try XCTUnwrap(session.items.last)
+        associateWithClaudeHistory([imported.id, backgroundRow.id], session: session)
+        let beforeEqual = session.items.map(\.id)
+        await background("final_content", "between")
+        XCTAssertEqual(session.items.map(\.id), beforeEqual, "equal text: no duplicate")
+        XCTAssertEqual(session.items.last?.text, "between")
+        XCTAssertTrue(session.backgroundCurrentAssistantRowIDs.isEmpty, "the background pointer is retired")
+        await background("message_stop", "")
+
+        await background("content", "next")
+        let nextRow = try XCTUnwrap(session.items.last)
+        associateWithClaudeHistory([imported.id, backgroundRow.id, nextRow.id], session: session)
+        await background("final_content", "authoritative")
+        XCTAssertEqual(
+            session.items.filter { $0.kind == .assistant }.map(\.text),
+            ["ALPHA-7", "ALPHA-8", "between", "next", "authoritative"]
+        )
+        XCTAssertEqual(session.items.first { $0.text == "next" }?.id, nextRow.id, "the associated row is preserved")
+        XCTAssertTrue(session.backgroundCurrentAssistantRowIDs.isEmpty, "the background pointer is retired")
+    }
 }
 
 /// Fake runtime whose events stream ends during the second send. Like the real controller, it

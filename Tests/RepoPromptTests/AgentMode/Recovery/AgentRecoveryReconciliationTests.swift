@@ -627,11 +627,16 @@ final class AgentRecoveryReconciliationTests: XCTestCase {
 
     // MARK: Association preflight (pure)
 
-    private func observation(_ rows: [AgentProviderHistoryRow], conversationID: String = "conv-1") -> AgentProviderHistoryObservation {
+    private func observation(
+        _ rows: [AgentProviderHistoryRow],
+        conversationID: String = "conv-1",
+        validation: [AgentProviderHistoryRow]? = nil
+    ) -> AgentProviderHistoryObservation {
         AgentProviderHistoryObservation(
             provider: .claude,
             conversationID: conversationID,
             rows: rows,
+            validationRows: validation,
             file: nil,
             completeLineOffset: 0,
             completionConfirmed: false
@@ -649,6 +654,16 @@ final class AgentRecoveryReconciliationTests: XCTestCase {
                 components: [entry]
             ))
         )
+    }
+
+    /// A projected row carrying exactly `item` (its local ID included).
+    private func projectedRow(_ entry: String, kind: String, item: AgentChatItem) -> AgentProviderHistoryRow {
+        AgentProviderHistoryRow(nativeSessionID: "conv-1", nativeEntryID: entry, rowKindRaw: kind, ordinal: 0, item: item)
+    }
+
+    /// A ledger row mapping `entry` to `localItemID`, with no envelope digest.
+    private func mappedNative(_ entry: String, kind: String, localItemID: UUID) -> AgentSessionProviderHistoryRecovery.NativeItem {
+        .init(providerRaw: "claude", nativeSessionID: "conv-1", nativeEntryID: entry, rowKindRaw: kind, ordinal: 0, localItemID: localItemID)
     }
 
     private func nativeUserRow(_ entry: String) -> AgentProviderHistoryRow {
@@ -698,6 +713,12 @@ final class AgentRecoveryReconciliationTests: XCTestCase {
         AgentSessionProviderHistoryRecovery(nativeItems: [userAssociation(userItem)])
     }
 
+    /// The native user row `userAssociation(userItem)` maps, as the validation projection carries it
+    /// (Step 4d3a: a mapped user row is an order anchor and must be in the projection).
+    private func userRow(_ userItem: AgentChatItem) -> AgentProviderHistoryRow {
+        nativeUserRow("u-\(userItem.id.uuidString)")
+    }
+
     func testPreflightRequiresPositiveAssociationOfEveryUserConstituent() {
         let runAttemptID = UUID()
         let userItem = AgentChatItem.user("Do it")
@@ -722,17 +743,34 @@ final class AgentRecoveryReconciliationTests: XCTestCase {
                 .nativeUserAssociationUnavailable
             )
         }
-        XCTAssertNil(preflight(empty, baseline: captured, runAttemptID: runAttemptID, items: [userItem], ledger: userLedger(userItem)))
+        XCTAssertNil(preflight(
+            observation([], validation: [userRow(userItem)]), baseline: captured, runAttemptID: runAttemptID,
+            items: [userItem], ledger: userLedger(userItem)
+        ))
+        XCTAssertEqual(
+            preflight(empty, baseline: captured, runAttemptID: runAttemptID, items: [userItem], ledger: userLedger(userItem)),
+            .canonicalPayloadUnavailable,
+            "Step 4d3a: a mapped native user row must be in the validation projection to anchor order"
+        )
         // Every constituent: a steered second user item without its own association refuses.
         let both = baseline(runAttemptID: runAttemptID, userItemIDs: [userItem.id, steer.id])
         XCTAssertEqual(
             preflight(empty, baseline: both, runAttemptID: runAttemptID, items: [userItem, steer], ledger: userLedger(userItem)),
             .nativeUserAssociationUnavailable
         )
+        let bothAssociated = AgentSessionProviderHistoryRecovery(nativeItems: [userAssociation(userItem), userAssociation(steer)])
         XCTAssertNil(preflight(
-            empty, baseline: both, runAttemptID: runAttemptID, items: [userItem, steer],
-            ledger: AgentSessionProviderHistoryRecovery(nativeItems: [userAssociation(userItem), userAssociation(steer)])
+            observation([], validation: [userRow(userItem), userRow(steer)]), baseline: both, runAttemptID: runAttemptID,
+            items: [userItem, steer], ledger: bothAssociated
         ))
+        XCTAssertEqual(
+            preflight(
+                observation([], validation: [userRow(steer), userRow(userItem)]), baseline: both, runAttemptID: runAttemptID,
+                items: [userItem, steer], ledger: bothAssociated
+            ),
+            .canonicalPayloadMismatch,
+            "Step 4d3a: mapped user rows keep the native relative order"
+        )
     }
 
     func testPreflightRequiresTheAttemptsOwnCapturedBaseline() {
@@ -757,7 +795,10 @@ final class AgentRecoveryReconciliationTests: XCTestCase {
             .baselineTargetMismatch
         )
         XCTAssertEqual(preflight(empty, baseline: captured, runAttemptID: runAttemptID, items: []), .baselineTargetMismatch)
-        XCTAssertNil(preflight(empty, baseline: captured, runAttemptID: runAttemptID, items: [userItem], ledger: userLedger(userItem)))
+        XCTAssertNil(preflight(
+            observation([], validation: [userRow(userItem)]), baseline: captured, runAttemptID: runAttemptID,
+            items: [userItem], ledger: userLedger(userItem)
+        ))
     }
 
     func testPreflightNeverAssumesNativeUserOrLiveOutputAssociations() {
@@ -790,10 +831,11 @@ final class AgentRecoveryReconciliationTests: XCTestCase {
         )
         // Output before the dispatch's user item is not this dispatch's output.
         XCTAssertNil(preflight(
-            observation([assistantRow("a1")]), baseline: captured, runAttemptID: runAttemptID,
-            items: [live, userItem], ledger: userLedger(userItem)
+            observation([assistantRow("a1")], validation: [userRow(userItem), assistantRow("a1")]), baseline: captured,
+            runAttemptID: runAttemptID, items: [live, userItem], ledger: userLedger(userItem)
         ))
-        // An explicit ledger association of the live row passes, and the planner deduplicates.
+        // An explicit ledger association of the live row passes when its canonical payload equals
+        // the provider's (Step 4d3a), and the planner deduplicates.
         let associated = AgentSessionProviderHistoryRecovery(nativeItems: [userAssociation(userItem), .init(
             providerRaw: "claude",
             nativeSessionID: "conv-1",
@@ -802,7 +844,200 @@ final class AgentRecoveryReconciliationTests: XCTestCase {
             ordinal: 0,
             localItemID: live.id
         )])
-        XCTAssertNil(preflight(observation([assistantRow("a1")]), baseline: captured, runAttemptID: runAttemptID, items: [userItem, live], ledger: associated))
+        let provided = observation(
+            [assistantRow("a1")],
+            validation: [userRow(userItem), projectedRow("a0", kind: "assistantText", item: live), assistantRow("a1")]
+        )
+        XCTAssertNil(preflight(provided, baseline: captured, runAttemptID: runAttemptID, items: [userItem, live], ledger: associated))
+        XCTAssertEqual(
+            preflight(observation([assistantRow("a1")]), baseline: captured, runAttemptID: runAttemptID, items: [userItem, live], ledger: associated),
+            .canonicalPayloadUnavailable,
+            "an association is never accepted without the provider's payload to compare"
+        )
+    }
+
+    /// Step 4d3a: before overlap or deduplication is accepted, every ledger-mapped projected row (a
+    /// nil digest included) and every observation row already in the canonical transcript must match
+    /// the provider's payload and relative order across persisted full turns and the suffix. Anything
+    /// unavailable or different refuses; presentation fields never matter.
+    // swiftlint:disable:next function_body_length
+    func testPreflightComparesEveryMappedRowsCanonicalPayloadAndOrder() throws {
+        let runAttemptID = UUID()
+        let userItem = AgentChatItem.user("Do it")
+        let captured = baseline(runAttemptID: runAttemptID, userItemIDs: [userItem.id])
+        var answer = AgentChatItem.assistant("First.")
+        answer.sequenceIndex = 1
+        var call = AgentChatItem.toolCall(name: "Read", invocationID: UUID(), argsJSON: #"{"path":"a"}"#)
+        call.sequenceIndex = 2
+        var result = AgentChatItem.toolResult(name: "Read", invocationID: call.toolInvocationID, resultJSON: "contents", isError: false)
+        result.sequenceIndex = 3
+        var closing = AgentChatItem.assistant("Second.")
+        closing.sequenceIndex = 4
+        let mapped = [("a0", "assistantText", answer), ("t0", "toolCall", call), ("t1", "toolResult", result), ("a1", "assistantText", closing)]
+        let mappedRows = mapped.map { projectedRow($0.0, kind: $0.1, item: $0.2) }
+        // Native order: the mapped user row first (the suffix cases), or after the output (the
+        // earlier-turn cases, where that output predates the dispatch).
+        let validation = [userRow(userItem)] + mappedRows
+        let outputBeforeUser = mappedRows + [userRow(userItem)]
+        var ledger = userLedger(userItem)
+        ledger.nativeItems += mapped.map { mappedNative($0.0, kind: $0.1, localItemID: $0.2.id) }
+        XCTAssertTrue(ledger.nativeItems.allSatisfy { $0.envelopeDigest == nil })
+        func check(
+            _ items: [AgentChatItem],
+            transcript: AgentTranscript = .empty,
+            validation order: [AgentProviderHistoryRow]? = nil,
+            observation value: AgentProviderHistoryObservation? = nil
+        ) -> AgentProviderHistoryAssociationRefusal? {
+            preflight(
+                value ?? observation([], validation: order ?? validation), baseline: captured, runAttemptID: runAttemptID,
+                transcript: transcript, items: items, ledger: ledger
+            )
+        }
+        let suffix = [userItem, answer, call, result, closing]
+        func replacing(_ target: AgentChatItem, _ change: (inout AgentChatItem) -> Void) -> [AgentChatItem] {
+            suffix.map { item in
+                var copy = item
+                if copy.id == target.id { change(&copy) }
+                return copy
+            }
+        }
+        XCTAssertNil(check(suffix), "equal payloads in provider order pass")
+        XCTAssertNil(
+            check(replacing(answer) { item in
+                item.sequenceIndex = 99
+                item.isStreaming = true
+            }),
+            "sequence and streaming are presentation only"
+        )
+        XCTAssertEqual(
+            check(suffix, observation: observation([])),
+            .canonicalPayloadUnavailable,
+            "known rows must be retained in the validation projection"
+        )
+
+        // Same ID, changed canonical text, kind or tool fields.
+        let changes: [(String, [AgentChatItem])] = [
+            ("text", replacing(answer) { $0.text = "Edited." }),
+            ("kind", replacing(answer) { $0.kind = .assistantInline }),
+            ("tool args", replacing(call) { $0.toolArgsJSON = #"{"path":"b"}"# }),
+            ("tool name", replacing(call) { $0.toolName = "Write" }),
+            ("tool invocation", replacing(call) { $0.toolInvocationID = UUID() }),
+            ("tool result", replacing(result) { $0.toolResultJSON = "other" }),
+            ("tool error", replacing(result) { $0.toolIsError = true })
+        ]
+        for (label, items) in changes {
+            XCTAssertEqual(check(items), .canonicalPayloadMismatch, label)
+        }
+        XCTAssertEqual(check([userItem, closing, answer, call, result]), .canonicalPayloadMismatch, "reversed relative order")
+
+        // Missing, ambiguous, unavailable or summary-only payloads.
+        XCTAssertEqual(check(suffix.filter { $0.id != closing.id }), .canonicalPayloadUnavailable, "a missing mapped row")
+        XCTAssertEqual(check(suffix + [answer]), .canonicalPayloadUnavailable, "an ambiguous mapped row")
+        XCTAssertEqual(check(replacing(call) { $0.toolArgsJSON = nil }), .canonicalPayloadUnavailable, "dropped tool arguments")
+        XCTAssertEqual(check(replacing(result) { $0.toolResultJSON = nil }), .canonicalPayloadUnavailable, "dropped tool result")
+        XCTAssertEqual(
+            check(replacing(result) { $0.toolResultJSON = #"{"summary_only":true,"summary":"Read a"}"# }),
+            .canonicalPayloadUnavailable,
+            "a tool result compacted to its summary"
+        )
+
+        // Persisted turns: an earlier turn (before the dispatch) holds the mapped rows.
+
+        func activity(_ item: AgentChatItem, summaryOnly: Bool = false) -> AgentTranscriptActivity {
+            let isTool = item.kind == .toolCall || item.kind == .toolResult
+            return AgentTranscriptActivity(from: item, toolExecution: isTool ? AgentTranscriptToolExecution(
+                stableExecutionID: item.id.uuidString,
+                toolName: item.toolName,
+                invocationID: item.toolInvocationID,
+                argsJSON: item.toolArgsJSON,
+                resultJSON: item.toolResultJSON,
+                toolIsError: item.toolIsError,
+                status: .success,
+                summaryOnly: summaryOnly
+            ) : nil)
+        }
+        func turn(
+            _ items: [AgentChatItem],
+            request: AgentChatItem? = nil,
+            tier: AgentTranscriptRetentionTier = .full,
+            summaryOnly: Bool = false
+        ) -> AgentTranscriptTurn {
+            AgentTranscriptTurn(
+                request: request.map(AgentTranscriptRequestAnchor.init(from:)),
+                responseSpans: items.isEmpty ? [] : [AgentTranscriptProviderResponseSpan(
+                    startedAt: Date(timeIntervalSince1970: 0),
+                    activities: items.map { activity($0, summaryOnly: summaryOnly) }
+                )],
+                retentionTier: tier,
+                startedAt: Date(timeIntervalSince1970: 0)
+            )
+        }
+        let earlier = [answer, call, result, closing]
+        XCTAssertNil(
+            check([userItem], transcript: AgentTranscript(turns: [turn(earlier)]), validation: outputBeforeUser),
+            "a full turn's payloads compare"
+        )
+        XCTAssertNil(
+            check([userItem], transcript: AgentTranscript(turns: [turn(earlier)])),
+            "output is ordered among output only, never against user anchors (review A R1 / B F1, option a)"
+        )
+        XCTAssertEqual(
+            check([userItem], transcript: AgentTranscript(turns: [turn(earlier, tier: .condensed)]), validation: outputBeforeUser),
+            .canonicalPayloadUnavailable,
+            "a compacted turn's stored rows are not full detail"
+        )
+        XCTAssertEqual(
+            check([userItem], transcript: AgentTranscript(turns: [turn([], tier: .summary)]), validation: outputBeforeUser),
+            .canonicalPayloadUnavailable,
+            "a structurally compacted turn stores no rows"
+        )
+        XCTAssertEqual(
+            check([userItem], transcript: AgentTranscript(turns: [turn(earlier, summaryOnly: true)]), validation: outputBeforeUser),
+            .canonicalPayloadUnavailable,
+            "a summary-only tool execution"
+        )
+
+        // Full turns plus suffix: the newest persisted turn repeats the suffix. The suffix copy is
+        // authoritative, and a turn-only row of an earlier turn precedes it.
+        let answerFirst = [mappedRows[0], userRow(userItem)] + mappedRows.dropFirst()
+        let overlapping = AgentTranscript(turns: [turn([answer]), turn([call, result, closing], request: userItem)])
+        let overlapSuffix = [userItem, call, result, closing]
+        XCTAssertNil(check(overlapSuffix, transcript: overlapping, validation: answerFirst))
+        var editedClosing = closing
+        editedClosing.text = "Edited."
+        XCTAssertEqual(
+            check([userItem, call, result, editedClosing], transcript: overlapping, validation: answerFirst),
+            .canonicalPayloadMismatch,
+            "the authoritative suffix copy is compared"
+        )
+        let reversedAcrossTurns = AgentTranscript(turns: [turn([closing]), turn([answer, call, result], request: userItem)])
+        XCTAssertEqual(
+            check([userItem, answer, call, result], transcript: reversedAcrossTurns),
+            .canonicalPayloadMismatch,
+            "a turn-only row precedes the suffix"
+        )
+        // A turn-only row inside a turn that also holds suffix items has no determined place.
+        let mixedTurn = AgentTranscript(turns: [turn([answer, call, result, closing], request: userItem)])
+        XCTAssertEqual(
+            check(overlapSuffix, transcript: mixedTurn),
+            .canonicalPayloadUnavailable,
+            "ambiguous placement refuses rather than guess"
+        )
+
+        // Deduplication: an observation row already present is compared before it is accepted.
+        let fresh = assistantRow("a2", text: "Third.")
+        let present = try XCTUnwrap(fresh.item)
+        let withFresh = observation([fresh], validation: validation + [fresh])
+        XCTAssertNil(check(suffix + [present], observation: withFresh))
+        var editedPresent = present
+        editedPresent.text = "Other."
+        XCTAssertEqual(check(suffix + [editedPresent], observation: withFresh), .canonicalPayloadMismatch)
+        XCTAssertEqual(check([userItem, answer, call, result, present, closing], observation: withFresh), .canonicalPayloadMismatch)
+        XCTAssertEqual(
+            check(suffix + [present], observation: observation([fresh], validation: validation)),
+            .canonicalPayloadUnavailable,
+            "a present row outside the validation projection"
+        )
     }
 
     func testPreflightCannotLoseCompactedCanonicalOutput() {
@@ -824,6 +1059,200 @@ final class AgentRecoveryReconciliationTests: XCTestCase {
             .canonicalOutputAssociationUnavailable,
             "a dispatch inside a compacted turn has output that cannot be enumerated"
         )
+    }
+
+    /// Step 4d3a: the attempt's exactly matched claims anchor each claimed native user entry to its
+    /// dispatch's ordered local constituents. Anchors are ordered among themselves and output rows
+    /// among themselves, never output against anchors: the importer's own append-at-end order
+    /// `[first, steer, reply]` passes (review A R1 / B F1, option a), while reordered provider output
+    /// or user constituents still refuse. User payloads are never compared.
+    func testClaimedUserConstituentsAnchorTheirOwnOrderAndOutputKeepsItsOwn() throws {
+        typealias Claim = AgentSessionProviderHistoryRecovery.DispatchBaseline.OutboundUserMessage
+        let runAttemptID = UUID()
+        let first = AgentChatItem.user("Do it")
+        let steer = AgentChatItem.user("Also this")
+        let firstDispatch = UUID()
+        let steerDispatch = UUID()
+        let window = [
+            baseline(
+                dispatchID: firstDispatch, runAttemptID: runAttemptID, userItemIDs: [first.id],
+                outboundUserMessage: Claim(uuid: firstDispatch, providerBoundText: "Do it")
+            ),
+            baseline(
+                dispatchID: steerDispatch, runAttemptID: runAttemptID, userItemIDs: [steer.id],
+                outboundUserMessage: Claim(uuid: steerDispatch, providerBoundText: "Also this")
+            )
+        ]
+        let entries = [(firstDispatch, "Do it"), (steerDispatch, "Also this")].map { id, text in
+            AgentProviderHistoryNativeUserEntry(
+                nativeEntryID: id.uuidString.lowercased(),
+                textSHA256: AgentSessionProviderHistoryRecovery.sha256Hex(Data(text.utf8))
+            )
+        }
+        // Both replies were imported earlier (ledger-known, so not new rows); natively the first lies
+        // between the two claimed entries.
+        let reply = assistantRow("a1")
+        let replyItem = try XCTUnwrap(reply.item)
+        let later = assistantRow("a2", text: "Also done.")
+        let laterItem = try XCTUnwrap(later.item)
+        let ledger = AgentSessionProviderHistoryRecovery(nativeItems: [
+            mappedNative("a1", kind: "assistantText", localItemID: replyItem.id),
+            mappedNative("a2", kind: "assistantText", localItemID: laterItem.id)
+        ])
+        let userRows = entries.map { nativeUserRow($0.nativeEntryID) }
+        func check(_ items: [AgentChatItem], validation: [AgentProviderHistoryRow]? = nil) -> AgentProviderHistoryAssociationRefusal? {
+            AgentProviderHistoryAssociationPreflight.check(
+                observation: AgentProviderHistoryObservation(
+                    provider: .claude,
+                    conversationID: "conv-1",
+                    rows: userRows,
+                    validationRows: validation ?? [userRows[0], reply, userRows[1], later],
+                    file: nil,
+                    completeLineOffset: 0,
+                    completionConfirmed: false,
+                    nativeUserEntries: entries
+                ),
+                baseline: window[0],
+                hasUnreadableBaselines: false,
+                expectedRunAttemptID: runAttemptID,
+                transcriptResetGeneration: 0,
+                canonical: AgentProviderHistoryCanonicalView(transcript: .empty, suffixItems: items),
+                ledger: ledger,
+                dispatchWindow: window
+            )
+        }
+        XCTAssertNil(check([first, steer, replyItem, laterItem]), "the importer's append-at-end order")
+        XCTAssertNil(check([first, replyItem, steer, laterItem]), "the native interleaving")
+        XCTAssertEqual(
+            check([first, steer, laterItem, replyItem]),
+            .canonicalPayloadMismatch,
+            "reordered provider output"
+        )
+        XCTAssertEqual(
+            check([steer, first, replyItem, laterItem]),
+            .outboundClaimUnmatched,
+            "reordered claimed user constituents"
+        )
+        var localText = first
+        localText.text = "Do it (as typed locally)"
+        XCTAssertNil(check([localText, steer, replyItem, laterItem]), "the local user text is never compared")
+        XCTAssertEqual(
+            check([first, steer, replyItem, laterItem], validation: [userRows[0], reply, later]),
+            .canonicalPayloadUnavailable,
+            "every claimed entry must be anchored in the projection"
+        )
+        XCTAssertEqual(
+            check([first, steer, replyItem, laterItem], validation: [userRows[0], reply, userRows[1], userRows[1], later]),
+            .canonicalPayloadUnavailable,
+            "an ambiguous anchor refuses"
+        )
+    }
+
+    /// Step 4d3a (review B P3 F3): turn-only tool copies built by the real transcript builder compare
+    /// equal to the provider's projected call and result (no hand-built activity). The builder stores
+    /// the normalized tool name (`Read` → `read`) and nothing else differs; only that exact transform
+    /// is accepted, and only for a turn copy.
+    func testRealTranscriptBuilderToolCopiesCompareEqual() {
+        let runAttemptID = UUID()
+        let userItem = AgentChatItem.user("Do it")
+        let captured = baseline(runAttemptID: runAttemptID, userItemIDs: [userItem.id])
+        var call = AgentChatItem.toolCall(name: "Read", invocationID: UUID(), argsJSON: #"{"path":"a"}"#)
+        call.sequenceIndex = 1
+        var result = AgentChatItem.toolResult(name: "Read", invocationID: call.toolInvocationID, resultJSON: "contents", isError: false)
+        result.sequenceIndex = 2
+        let built = AgentTranscriptIO.buildTranscript(from: [userItem, call, result], compact: false)
+        var ledger = userLedger(userItem)
+        ledger.nativeItems += [
+            mappedNative("t0", kind: "toolCall", localItemID: call.id),
+            mappedNative("t1", kind: "toolResult", localItemID: result.id)
+        ]
+        let validation = [
+            userRow(userItem),
+            projectedRow("t0", kind: "toolCall", item: call),
+            projectedRow("t1", kind: "toolResult", item: result)
+        ]
+        func check(transcript: AgentTranscript, items: [AgentChatItem]) -> AgentProviderHistoryAssociationRefusal? {
+            preflight(
+                observation([], validation: validation), baseline: captured, runAttemptID: runAttemptID,
+                transcript: transcript, items: items, ledger: ledger
+            )
+        }
+        XCTAssertEqual(built.turns.first?.allActivities.first?.toItem().toolName, "read", "the builder normalizes the name")
+        XCTAssertNil(check(transcript: built, items: []))
+        var renamed = call
+        renamed.toolName = "Write"
+        XCTAssertEqual(
+            check(transcript: AgentTranscriptIO.buildTranscript(from: [userItem, renamed, result], compact: false), items: []),
+            .canonicalPayloadMismatch,
+            "another tool's name still differs in a turn copy"
+        )
+        var normalizedInSuffix = call
+        normalizedInSuffix.toolName = "read"
+        XCTAssertEqual(
+            check(transcript: .empty, items: [userItem, normalizedInSuffix, result]),
+            .canonicalPayloadMismatch,
+            "a suffix copy keeps the provider's name verbatim"
+        )
+    }
+
+    /// Step 4d3a, Q4: a Claude import plans against every canonical ID (persisted turns, requests
+    /// included, plus the suffix) after the preflight. A row whose deterministic item is held only by
+    /// a full persisted turn is compared first, then recorded, never appended again.
+    func testClaudeImportNeverReappendsARowHeldOnlyByAPersistedTurn() throws {
+        let runAttemptID = UUID()
+        let userItem = AgentChatItem.user("Do it")
+        let captured = baseline(runAttemptID: runAttemptID, userItemIDs: [userItem.id])
+        let row = assistantRow("a2", text: "Held by a turn.")
+        var held = try XCTUnwrap(row.item)
+        held.sequenceIndex = 1
+        func canonical(_ item: AgentChatItem) -> AgentProviderHistoryCanonicalView {
+            AgentProviderHistoryCanonicalView(
+                transcript: AgentTranscript(turns: [AgentTranscriptTurn(
+                    request: AgentTranscriptRequestAnchor(from: userItem),
+                    responseSpans: [AgentTranscriptProviderResponseSpan(
+                        startedAt: Date(timeIntervalSince1970: 0),
+                        activities: [AgentTranscriptActivity(from: item)]
+                    )],
+                    startedAt: Date(timeIntervalSince1970: 0)
+                )]),
+                suffixItems: []
+            )
+        }
+        let value = observation([row], validation: [userRow(userItem), row])
+        func check(_ view: AgentProviderHistoryCanonicalView) -> AgentProviderHistoryAssociationRefusal? {
+            AgentProviderHistoryAssociationPreflight.check(
+                observation: value,
+                baseline: captured,
+                hasUnreadableBaselines: false,
+                expectedRunAttemptID: runAttemptID,
+                transcriptResetGeneration: 0,
+                canonical: view,
+                ledger: userLedger(userItem)
+            )
+        }
+        let view = canonical(held)
+        XCTAssertNil(check(view))
+        func plan(existing: Set<UUID>) -> AgentProviderHistoryImportPlan {
+            AgentProviderHistoryImportPlanner.plan(
+                observation: value,
+                existingItemIDs: existing,
+                ledger: userLedger(userItem),
+                previousCursor: nil,
+                importID: UUID(),
+                now: Date(timeIntervalSince1970: 0)
+            )
+        }
+        let planned = plan(existing: Set(AgentProviderHistoryAssociationPreflight.canonicalItemIDs(view)))
+        XCTAssertTrue(planned.appendedItems.isEmpty, "the turn's row is not appended again")
+        XCTAssertEqual(planned.ledger.nativeItems.last?.localItemID, held.id, "it is recorded against the existing item")
+        XCTAssertEqual(
+            plan(existing: Set(view.suffixItems.map(\.id))).appendedItems.map(\.id).last,
+            held.id,
+            "the suffix-only set would have appended it twice"
+        )
+        var changed = held
+        changed.text = "Changed in the turn."
+        XCTAssertEqual(check(canonical(changed)), .canonicalPayloadMismatch, "a differing turn copy refuses first")
     }
 
     /// Step 4d2: the attempt's outbound claims associate native user entries only on an exact match
@@ -1791,6 +2220,52 @@ final class AgentRecoveryReconciliationTests: XCTestCase {
         XCTAssertEqual(cursorAfter, cursorBefore)
     }
 
+    /// Step 4d3a, real composition: once a reply is imported, a later reconcile with new native output
+    /// first compares the imported row's canonical payload. A rewritten imported row refuses with no
+    /// item, ledger or cursor change; with the row restored, the same import proceeds.
+    func testAChangedImportedRowRefusesTheNextImportWithoutChangingAnything() async throws {
+        let harness = try await makeProducerHarness(windowID: 4995)
+        let prompt = "Reply with exactly: ALPHA-7"
+        let (_, identity) = try await admitClaimedDispatch(harness, runAttemptID: UUID(), text: prompt)
+        let caller = identity.dispatchID.uuidString.lowercased()
+        try harness.appendHistory(o19History(caller: caller, parent: nil, assistant: "a1", prompt: prompt, reply: "ALPHA-7", tag: "t1"))
+        let action = reconcileAction(harness, runAttemptID: identity.runAttemptID)
+        func reconcile() async -> AgentRecoveryReconcileResult {
+            await harness.viewModel.reconcileRecoveryHistory(action, session: harness.session, lane: harness.lane, codexTurnID: nil)
+        }
+        let imported = await reconcile()
+        XCTAssertEqual(imported, .imported(completion: .unconfirmed, rowCount: 2))
+        let importedID = try XCTUnwrap(harness.session.providerHistoryRecovery?.nativeItems.first { $0.nativeEntryID == "a1" }?.localItemID)
+        let importedIndex = try XCTUnwrap(harness.session.items.firstIndex { $0.id == importedID })
+        // Claude wrote more output for the same turn after the import.
+        try harness.appendHistory([historyEntry("assistant", uuid: "a2", parent: "t1-t", text: "More.")])
+        let itemsBefore = harness.session.items.map(\.id)
+        let ledgerBefore = harness.session.providerHistoryRecovery
+        let cursorBefore = await harness.cursor()
+        let original = harness.session.items[importedIndex]
+        var rewritten = original
+        rewritten.text = "ALPHA-8"
+        harness.session.replaceItem(at: importedIndex, with: rewritten)
+
+        let refused = await reconcile()
+        XCTAssertEqual(
+            refused,
+            .associationUnavailable(.canonicalPayloadMismatch, AgentModeViewModel.recoveryAssociationText(.canonicalPayloadMismatch))
+        )
+        XCTAssertEqual(harness.session.items.map(\.id), itemsBefore, "zero transcript changes")
+        XCTAssertEqual(harness.session.items[importedIndex].text, "ALPHA-8", "the refusal rewrites nothing")
+        XCTAssertEqual(harness.session.providerHistoryRecovery, ledgerBefore, "zero ledger changes")
+        let cursorAfterRefusal = await harness.cursor()
+        XCTAssertEqual(cursorAfterRefusal, cursorBefore, "no cursor advance")
+
+        harness.session.replaceItem(at: importedIndex, with: original)
+        let resumed = await reconcile()
+        XCTAssertEqual(resumed, .imported(completion: .unconfirmed, rowCount: 2), "the refusal blocked a real import")
+        XCTAssertEqual(harness.session.items.last?.text, "More.")
+        let cursorAfterImport = await harness.cursor()
+        XCTAssertNotEqual(cursorAfterImport, cursorBefore)
+    }
+
     /// Review A R1, real composition: the initial dispatch and its claimed steer sit in two persisted
     /// turns, and both claims match Claude's history exactly. Live output saved under its own ID in
     /// the SECOND turn is still unassociated canonical output, so the import refuses with no item,
@@ -1865,6 +2340,53 @@ final class AgentRecoveryReconciliationTests: XCTestCase {
             harness.session.items.dropFirst(itemsBefore.count).filter { $0.kind == .assistant }.map(\.text),
             ["Done.", "Also done."]
         )
+
+        // Step 4d3a regression (review A R1 / B F1): the import appended both replies after the
+        // claimed steer, although "Done." natively precedes it. Its own unchanged replay must not
+        // refuse: output is ordered among output, and the claimed anchors among themselves.
+        func reconcile() async -> AgentRecoveryReconcileResult {
+            await harness.viewModel.reconcileRecoveryHistory(
+                reconcileAction(harness, runAttemptID: runAttemptID),
+                session: harness.session,
+                lane: harness.lane,
+                codexTurnID: nil
+            )
+        }
+        let importedItems = harness.session.items.map(\.id)
+        let importedLedger = try XCTUnwrap(harness.session.providerHistoryRecovery)
+        let receipt = try XCTUnwrap(importedLedger.lastImportCommit)
+        let importedCursor = await harness.cursor()
+        XCTAssertEqual(importedCursor?.importID, receipt.importID)
+        let noNewHistory = AgentRecoveryReconcileResult.nothingImported("The provider has no new history for this conversation.")
+        let repeated = await reconcile()
+        XCTAssertEqual(repeated, noNewHistory, "an unchanged second reconcile is a no-op")
+        XCTAssertEqual(harness.session.items.map(\.id), importedItems)
+        XCTAssertEqual(harness.session.providerHistoryRecovery, importedLedger)
+        let cursorAfterRepeat = await harness.cursor()
+        XCTAssertEqual(cursorAfterRepeat, importedCursor)
+
+        // A lost cursor CAS: the record cursor is back at the boundary; the replay is a no-op.
+        let boundary = try XCTUnwrap(importedLedger.dispatchBaseline(dispatchID: firstIdentity.dispatchID)?.cursor)
+        _ = await harness.lane.commitHistoryCursor(expectedPreviousImportID: receipt.importID, cursor: boundary)
+        let replay = await reconcile()
+        XCTAssertEqual(replay, noNewHistory, "a replay after a lost cursor commit is a no-op")
+        XCTAssertEqual(harness.session.items.map(\.id), importedItems)
+        XCTAssertEqual(harness.session.providerHistoryRecovery, importedLedger)
+        let cursorAfterReplay = await harness.cursor()
+        XCTAssertEqual(cursorAfterReplay, boundary)
+
+        // Append-only later output of the same attempt is accepted and appended once.
+        try harness.appendHistory([historyEntry("assistant", uuid: "a3", parent: "t2-t", text: "Later.")])
+        let grown = await reconcile()
+        XCTAssertEqual(grown, .imported(completion: .unconfirmed, rowCount: 2))
+        XCTAssertEqual(
+            harness.session.items.dropFirst(importedItems.count).map(\.kind),
+            [.system, .assistant]
+        )
+        XCTAssertEqual(harness.session.items.last?.text, "Later.")
+        XCTAssertEqual(harness.session.items.count { $0.text == "Done." }, 1, "nothing earlier is appended again")
+        let grownCursor = await harness.cursor()
+        XCTAssertEqual(grownCursor?.importID, harness.session.providerHistoryRecovery?.lastImportCommit?.importID)
     }
 
     /// Step 4d2 prefix fences, real composition (no process): the import receipt durably binds its

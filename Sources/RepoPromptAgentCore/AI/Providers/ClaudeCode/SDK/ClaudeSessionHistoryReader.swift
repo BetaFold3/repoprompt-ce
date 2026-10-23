@@ -112,6 +112,11 @@ package enum ClaudeSessionHistoryReader {
         package let prefixSHA256: String
         /// New rows in projection order (already deduplicated against the ledger, entry by entry).
         package let rows: [Row]
+        /// Transient (Step 4d3a): the WHOLE validated capture's rows in projection order, known and
+        /// pre-frontier entries included, before any suppression. Used only to compare canonical
+        /// payloads before overlap or deduplication is accepted; never appended or persisted. Empty
+        /// for a baseline.
+        package let validationRows: [Row]
         /// Native user message entries at or after the import frontier, ledger-known ones included,
         /// in projection order (outbound-claim matching only; never projected). Empty for a baseline.
         package let userMessageEntries: [AgentProviderHistoryNativeUserEntry]
@@ -280,6 +285,7 @@ package enum ClaudeSessionHistoryReader {
                     completeLineOffset: 0,
                     prefixSHA256: prefix,
                     rows: [],
+                    validationRows: [],
                     userMessageEntries: [],
                     completion: .unconfirmed,
                     isRescan: false
@@ -429,6 +435,7 @@ package enum ClaudeSessionHistoryReader {
                 completeLineOffset: completeOffset,
                 prefixSHA256: prefixSHA256,
                 rows: [],
+                validationRows: [],
                 userMessageEntries: [],
                 completion: .unconfirmed,
                 isRescan: false
@@ -470,6 +477,7 @@ package enum ClaudeSessionHistoryReader {
                 completeLineOffset: completeOffset,
                 prefixSHA256: prefixSHA256,
                 rows: newRows,
+                validationRows: rows,
                 userMessageEntries: userEntries,
                 completion: .unconfirmed,
                 isRescan: rescan

@@ -1195,9 +1195,15 @@ extension AgentModeViewModel {
             }
         }
         let previousCursor = record?.historyCursor(providerRaw: observation.provider.rawValue, conversationID: conversationID)
+        // Claude plans against every canonical ID (persisted turns, requests included, plus the
+        // suffix), after the preflight compared any overlap: a row held only by a persisted turn is
+        // recorded, never appended again (Step 4d3a). Codex keeps the suffix.
+        let existingItemIDs = session.selectedAgent == .claudeCode
+            ? Set(AgentProviderHistoryAssociationPreflight.canonicalItemIDs(canonical))
+            : Set(session.items.map(\.id))
         let plan = AgentProviderHistoryImportPlanner.plan(
             observation: observation,
-            existingItemIDs: Set(session.items.map(\.id)),
+            existingItemIDs: existingItemIDs,
             ledger: ledgerAtStart,
             previousCursor: previousCursor,
             importID: UUID(),
@@ -1418,6 +1424,10 @@ extension AgentModeViewModel {
             "The pre-send history position was saved, but this build cannot safely match Claude's history to messages already in this conversation. Nothing was imported."
         case .outboundClaimUnmatched:
             "Claude's history doesn't show exactly the messages recorded for this run, so it can't be matched safely. Nothing was imported or sent again."
+        case .canonicalPayloadUnavailable:
+            "Messages already matched to Claude's history are no longer fully available in this conversation, so they can't be checked. Nothing was imported."
+        case .canonicalPayloadMismatch:
+            "Messages already matched to Claude's history no longer match it or its order, so it can't be matched safely. Nothing was imported."
         }
     }
 

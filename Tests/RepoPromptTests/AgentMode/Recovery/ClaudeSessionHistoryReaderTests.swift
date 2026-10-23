@@ -307,6 +307,7 @@ final class ClaudeSessionHistoryReaderTests: XCTestCase {
         XCTAssertEqual(existing.file, identityA)
         XCTAssertEqual(existing.completeLineOffset, UInt64(data.count))
         XCTAssertTrue(existing.rows.isEmpty, "a baseline imports nothing")
+        XCTAssertTrue(existing.validationRows.isEmpty, "a baseline projects nothing to validate")
         XCTAssertEqual(read(nil, mode: fromStart), .unavailable(.notFound))
     }
 
@@ -381,6 +382,9 @@ final class ClaudeSessionHistoryReaderTests: XCTestCase {
         let value = try XCTUnwrap(candidate(read(full, mode: .importAfter(cursor(file: identityA, over: prefix)))))
         XCTAssertFalse(value.isRescan)
         XCTAssertEqual(value.rows.map(\.nativeEntryID), ["u2", "a2"])
+        // Step 4d3a: pre-frontier rows stay in the transient validation projection, in order.
+        XCTAssertEqual(value.validationRows.map(\.nativeEntryID), ["u1", "a1", "u2", "a2"])
+        XCTAssertEqual(Array(value.validationRows.suffix(2)), value.rows)
     }
 
     func testReplacementRescansOnlyWhenItsFencedPrefixVerifiesAndTruncationOrADifferentPrefixRefuses() throws {
@@ -658,6 +662,7 @@ final class ClaudeSessionHistoryReaderTests: XCTestCase {
         let baseline = try XCTUnwrap(candidate(read(data, mode: .baseline)))
         XCTAssertEqual(baseline.completeLineOffset, UInt64(data.count))
         XCTAssertTrue(baseline.rows.isEmpty)
+        XCTAssertTrue(baseline.validationRows.isEmpty)
         XCTAssertTrue(baseline.userMessageEntries.isEmpty)
     }
 
@@ -871,6 +876,21 @@ final class ClaudeSessionHistoryReaderTests: XCTestCase {
         )
         let replay = try XCTUnwrap(candidate(read(jsonl(fixture), mode: fromStart, ledger: plan.ledger)))
         XCTAssertTrue(replay.rows.isEmpty, "a fully proven known entry is suppressed")
+        // Step 4d3a: suppression never drops the known rows from the transient validation
+        // projection, so their canonical payloads can be compared before overlap is accepted.
+        XCTAssertEqual(replay.validationRows, first.rows, "known rows are retained for validation")
+        let replayObservation = Reader.observation(replay)
+        XCTAssertTrue(replayObservation.rows.isEmpty)
+        func summary(_ rows: [AgentProviderHistoryRow]) -> [String] {
+            // Item timestamps differ per projection; identity, payload and proof do not.
+            rows.map { "\($0.nativeEntryID)|\($0.rowKindRaw)|\($0.ordinal)|\($0.item?.id.uuidString ?? "-")|\($0.item?.text ?? "-")|\($0.envelopeDigest ?? "-")" }
+        }
+        XCTAssertEqual(summary(replayObservation.validationRows), summary(Reader.observation(first).rows))
+        XCTAssertEqual(
+            replayObservation.validationRows.compactMap { $0.item?.id },
+            plan.ledger.nativeItems.compactMap(\.localItemID),
+            "each retained row carries the local ID its ledger row maps"
+        )
         XCTAssertEqual(replay.userMessageEntries.map(\.nativeEntryID), ["c1"], "known user entries are still reported for claim matching")
 
         let changed = read(jsonl(o19Turn(reply: "ALPHA-8")), mode: fromStart, ledger: plan.ledger)

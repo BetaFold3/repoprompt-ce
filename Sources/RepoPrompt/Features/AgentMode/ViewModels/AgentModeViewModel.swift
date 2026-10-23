@@ -19510,7 +19510,15 @@ final class AgentModeViewModel: ObservableObject {
                     return nil
                 }()
 
-                if let index = tailAssistantIndex {
+                if let index = tailAssistantIndex,
+                   isProviderHistoryAssociatedItem(session.items[index].id, session: session)
+                {
+                    // Step 4d3a: a row matched to Claude's history is never rewritten. Equal text
+                    // is already shown; other text becomes a new visible row.
+                    if session.items[index].text != content {
+                        session.appendItem(AgentChatItem.assistant(content, sequenceIndex: session.nextSequenceIndex))
+                    }
+                } else if let index = tailAssistantIndex {
                     var updated = session.items[index]
                     updated.text = content
                     updated.isStreaming = false
@@ -20040,7 +20048,10 @@ final class AgentModeViewModel: ObservableObject {
     private func applyBackgroundAssistantDelta(_ delta: String, sourceID: UUID?, session: AgentTabSession) -> Bool {
         // Buffered text belongs to a run; materialize it first so order and rows stay separate.
         flushPendingAssistantDelta(session)
-        if let index = backgroundCurrentAssistantIndex(in: session, sourceID: sourceID) {
+        // Step 4d3a: a row matched to Claude's history is never extended; the text starts a new row.
+        if let index = backgroundCurrentAssistantIndex(in: session, sourceID: sourceID),
+           !isProviderHistoryAssociatedItem(session.items[index].id, session: session)
+        {
             session.mutateItem(at: index) { item in
                 item.text += delta
                 item.isStreaming = true
@@ -20063,7 +20074,10 @@ final class AgentModeViewModel: ObservableObject {
 
     @discardableResult
     func applyAssistantDelta(_ delta: String, session: AgentTabSession) -> Bool {
-        if let streamingAssistantIndex = resumableStreamingAssistantIndexAcrossTrailingUserInterjections(in: session) {
+        // Step 4d3a: a row matched to Claude's history is never extended; the text starts a new row.
+        if let streamingAssistantIndex = resumableStreamingAssistantIndexAcrossTrailingUserInterjections(in: session),
+           !isProviderHistoryAssociatedItem(session.items[streamingAssistantIndex].id, session: session)
+        {
             session.mutateItem(at: streamingAssistantIndex) { item in
                 item.text += delta
             }
@@ -20077,6 +20091,12 @@ final class AgentModeViewModel: ObservableObject {
         assistantItem.isStreaming = true
         session.appendItem(assistantItem)
         return true
+    }
+
+    /// Whether `id` is a local row associated to Claude provider history (Step 4d3a): its payload
+    /// is the provider's, so live output never mutates it, whatever the row's envelope digest.
+    private func isProviderHistoryAssociatedItem(_ id: UUID, session: AgentTabSession) -> Bool {
+        session.providerHistoryRecovery?.associatesClaudeLocalItem(id) ?? false
     }
 
     /// Retires `sourceID`'s stream's current background row; other streams keep theirs.

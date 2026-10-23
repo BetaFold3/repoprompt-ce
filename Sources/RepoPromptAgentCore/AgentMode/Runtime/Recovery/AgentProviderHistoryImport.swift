@@ -66,6 +66,10 @@ package struct AgentProviderHistoryObservation: Equatable {
     package let provider: AgentRecoveryHistoryProvider
     package let conversationID: String
     package let rows: [AgentProviderHistoryRow]
+    /// Transient (Step 4d3a): the whole validated projection in provider order, ledger-known and
+    /// pre-frontier rows included (defaults to `rows`). Read only by the canonical payload check
+    /// before overlap or deduplication is accepted; never appended, recorded or persisted.
+    package let validationRows: [AgentProviderHistoryRow]
     package let file: AgentRecoveryHistoryFileIdentity?
     package let completeLineOffset: UInt64
     /// Byte-prefix proof of the observed `[0, completeLineOffset)` (Claude; `nil` for Codex).
@@ -80,6 +84,7 @@ package struct AgentProviderHistoryObservation: Equatable {
         provider: AgentRecoveryHistoryProvider,
         conversationID: String,
         rows: [AgentProviderHistoryRow],
+        validationRows: [AgentProviderHistoryRow]? = nil,
         file: AgentRecoveryHistoryFileIdentity?,
         completeLineOffset: UInt64,
         prefixSHA256: String? = nil,
@@ -89,6 +94,7 @@ package struct AgentProviderHistoryObservation: Equatable {
         self.provider = provider
         self.conversationID = conversationID
         self.rows = rows
+        self.validationRows = validationRows ?? rows
         self.file = file
         self.completeLineOffset = completeLineOffset
         self.prefixSHA256 = prefixSHA256
@@ -221,6 +227,13 @@ package enum AgentProviderHistoryAssociationRefusal: Equatable {
     /// mismatch, duplicate claims, or constituents not in this transcript). A claim never proves a
     /// write, so a missing entry is never read as non-delivery.
     case outboundClaimUnmatched
+    /// A ledger-mapped or already-present local row's canonical payload can't be compared (Step
+    /// 4d3a): missing, ambiguous, in a compacted or summary-only turn or tool execution, or with an
+    /// unavailable tool payload.
+    case canonicalPayloadUnavailable
+    /// A ledger-mapped or already-present local row's canonical payload differs from the provider's
+    /// (text, kind or tool fields), or such rows appear in a different relative order (Step 4d3a).
+    case canonicalPayloadMismatch
 }
 
 /// The canonical transcript an import would merge into: the persisted turns (including compacted
@@ -376,6 +389,197 @@ package enum AgentProviderHistoryAssociationPreflight {
         if !ids.isSubset(of: associated) {
             return .canonicalOutputAssociationUnavailable
         }
+        return canonicalPayloadRefusal(
+            observation: observation,
+            canonical: canonical,
+            ledger: ledger,
+            claimedUserConstituents: claimed?.userItemIDsByNativeEntryID ?? [:]
+        )
+    }
+
+    /// One canonical item as the payload check reads it.
+    private struct CanonicalPayload {
+        let position: Int
+        let item: AgentChatItem
+        /// `false` in a non-full or structurally compacted turn, or for a summary-only tool execution.
+        let isComplete: Bool
+        /// Read from a persisted turn (not the suffix): the transcript builder stored its tool name
+        /// normalized (`AgentTranscriptToolNormalizer.toolExecution`).
+        let isTurnCopy: Bool
+    }
+
+    /// Canonical items by ID in canonical order (Step 4d3a). Source anchor:
+    /// `AgentTranscriptIO.rebuiltTranscriptPreservingCompactedPrefix` keeps the existing non-full
+    /// turns and rebuilds the full working turns from `AgentTabSession.items` (this suffix), merged in
+    /// place by `transcriptByReplacingWorkingTurns`. So the suffix is the authoritative copy of every
+    /// item it holds (a turn copy of it is not read), and a turn-only item has a determined place only
+    /// in a turn before the first turn holding any suffix item; it then precedes every suffix item.
+    /// A turn-only item in or after a suffix-bearing turn has no determined place, and an ID that
+    /// occurs twice in the turns (outside the suffix) or twice in the suffix is ambiguous: both refuse
+    /// when compared, never guessed.
+    private static func canonicalPayloads(
+        _ canonical: AgentProviderHistoryCanonicalView
+    ) -> (payloads: [UUID: CanonicalPayload], ambiguous: Set<UUID>) {
+        var payloads: [UUID: CanonicalPayload] = [:]
+        var ambiguous = Set<UUID>()
+        let suffixIDs = Set(canonical.suffixItems.map(\.id))
+        var position = 0
+        func record(_ item: AgentChatItem, isComplete: Bool, isTurnCopy: Bool = true) {
+            if payloads[item.id] != nil { ambiguous.insert(item.id) }
+            payloads[item.id] = CanonicalPayload(position: position, item: item, isComplete: isComplete, isTurnCopy: isTurnCopy)
+            position += 1
+        }
+        var reachedSuffixTurns = false
+        for turn in canonical.transcript.turns {
+            let turnComplete = turn.retentionTier == .full && !turn.isStructurallyCompacted
+            let activities = turn.allActivities
+            if turn.request.map({ suffixIDs.contains($0.id) }) ?? false || activities.contains(where: { suffixIDs.contains($0.id) }) {
+                reachedSuffixTurns = true
+            }
+            if let request = turn.request, !suffixIDs.contains(request.id) {
+                if reachedSuffixTurns { ambiguous.insert(request.id) }
+                record(request.toItem(), isComplete: turnComplete)
+            }
+            for activity in activities where !suffixIDs.contains(activity.id) {
+                if reachedSuffixTurns { ambiguous.insert(activity.id) }
+                record(activity.toItem(), isComplete: turnComplete && !(activity.toolExecution?.summaryOnly ?? false))
+            }
+        }
+        for item in canonical.suffixItems {
+            record(item, isComplete: true, isTurnCopy: false)
+        }
+        return (payloads, ambiguous)
+    }
+
+    /// Canonical payload and relative-order check (Step 4d3a), run before any overlap or
+    /// deduplication is accepted. Every projected (non-user) ledger row of this conversation with a
+    /// local item, and every observation row whose deterministic item is already in the canonical
+    /// transcript, must match the provider's row as projected from the whole validated capture:
+    /// same kind, text and exact tool fields (timestamps, sequence and streaming ignored).
+    ///
+    /// User rows are order anchors only (their provider-bound text may differ from the local text;
+    /// the exact claim match is the text authority): each ledger-mapped native user row's local
+    /// item, and each claimed native user entry's ordered local constituents
+    /// (`claimedUserConstituents`, from `claimAssociation`), must exist unambiguously.
+    ///
+    /// Relative order is checked within two independent sequences: compared output rows keep the
+    /// native projection's order among themselves, and user anchors keep it among themselves. Output
+    /// is NOT ordered against user anchors: the importer appends recovered rows at the end (after a
+    /// claimed steer that natively follows them), and its own unchanged replay must not refuse
+    /// (review A R1 / B F1, option a). `nil` = all compared equal; nothing is changed either way.
+    // swiftlint:disable:next cyclomatic_complexity function_body_length
+    static func canonicalPayloadRefusal(
+        observation: AgentProviderHistoryObservation,
+        canonical: AgentProviderHistoryCanonicalView,
+        ledger: AgentSessionProviderHistoryRecovery?,
+        claimedUserConstituents: [String: [UUID]] = [:]
+    ) -> AgentProviderHistoryAssociationRefusal? {
+        let providerRaw = observation.provider.rawValue
+        func rowKey(_ row: AgentProviderHistoryRow) -> String {
+            AgentSessionProviderHistoryRecovery.rowKey(
+                providerRaw: providerRaw,
+                nativeSessionID: row.nativeSessionID,
+                nativeEntryID: row.nativeEntryID,
+                rowKindRaw: row.rowKindRaw,
+                ordinal: row.ordinal
+            )
+        }
+        var validationIndex: [String: Int] = [:]
+        for (index, row) in observation.validationRows.enumerated() where validationIndex.updateValue(index, forKey: rowKey(row)) != nil {
+            return .canonicalPayloadUnavailable
+        }
+        let (payloads, ambiguous) = canonicalPayloads(canonical)
+        // One local item to check: at its native projection `index` (`rank` orders a claimed entry's
+        // constituents), with the provider's item to compare, or `nil` for a user order anchor.
+        struct Compared {
+            let index: Int
+            let rank: Int
+            let id: UUID
+            let expected: AgentChatItem?
+        }
+        var compared: [Compared] = []
+        var comparedIndexByID: [UUID: Int] = [:]
+        func include(_ entry: Compared) -> Bool {
+            if let existing = comparedIndexByID[entry.id] { return existing == entry.index }
+            comparedIndexByID[entry.id] = entry.index
+            compared.append(entry)
+            return true
+        }
+        let userKind = userRowKindRaw(observation.provider)
+        for native in ledger?.nativeItems ?? [] where native.providerRaw == providerRaw
+            && native.nativeSessionID == observation.conversationID
+        {
+            guard let localItemID = native.localItemID else { continue }
+            guard let index = validationIndex[native.key] else { return .canonicalPayloadUnavailable }
+            if native.rowKindRaw == userKind {
+                guard include(Compared(index: index, rank: 0, id: localItemID, expected: nil)) else {
+                    return .canonicalPayloadUnavailable
+                }
+                continue
+            }
+            guard let expected = observation.validationRows[index].item else { return .canonicalPayloadUnavailable }
+            guard expected.id == localItemID else { return .canonicalPayloadMismatch }
+            guard include(Compared(index: index, rank: 0, id: localItemID, expected: expected)) else {
+                return .canonicalPayloadUnavailable
+            }
+        }
+        for (entryID, constituents) in claimedUserConstituents {
+            let indices = observation.validationRows.indices.filter {
+                observation.validationRows[$0].nativeEntryID == entryID && observation.validationRows[$0].rowKindRaw == userKind
+            }
+            guard indices.count == 1 else { return .canonicalPayloadUnavailable }
+            for (rank, id) in constituents.enumerated() {
+                guard include(Compared(index: indices[0], rank: rank, id: id, expected: nil)) else {
+                    return .canonicalPayloadUnavailable
+                }
+            }
+        }
+        for row in observation.rows {
+            guard let expected = row.item, payloads[expected.id] != nil else { continue }
+            guard let index = validationIndex[rowKey(row)] else { return .canonicalPayloadUnavailable }
+            guard include(Compared(index: index, rank: 0, id: expected.id, expected: expected)) else {
+                return .canonicalPayloadUnavailable
+            }
+        }
+        var previousOutputPosition = -1
+        var previousAnchorPosition = -1
+        for entry in compared.sorted(by: { ($0.index, $0.rank) < ($1.index, $1.rank) }) {
+            guard !ambiguous.contains(entry.id), let payload = payloads[entry.id] else {
+                return .canonicalPayloadUnavailable
+            }
+            guard let expected = entry.expected else {
+                // A user order anchor: position among anchors only, never its text.
+                guard payload.position > previousAnchorPosition else { return .canonicalPayloadMismatch }
+                previousAnchorPosition = payload.position
+                continue
+            }
+            guard payload.isComplete else { return .canonicalPayloadUnavailable }
+            let actual = payload.item
+            // A tool payload the canonical copy no longer carries (dropped, or compacted to its
+            // summary) can't be compared.
+            let resultSummarized = actual.toolResultJSON != expected.toolResultJSON
+                && AgentTranscriptToolNormalizer.isSummaryOnly(raw: actual.toolResultJSON)
+            if (expected.toolArgsJSON != nil && actual.toolArgsJSON == nil)
+                || (expected.toolResultJSON != nil && actual.toolResultJSON == nil)
+                || resultSummarized
+            {
+                return .canonicalPayloadUnavailable
+            }
+            // A turn copy's tool name is the builder's normalization of the provider's (review B
+            // F3); a suffix copy keeps it verbatim. Only that exact transform is accepted.
+            let toolNameMatches = actual.toolName == expected.toolName
+                || (payload.isTurnCopy && actual.toolName == AgentTranscriptToolNormalizer.normalizedToolName(expected.toolName))
+            guard actual.kind == expected.kind,
+                  actual.text == expected.text,
+                  toolNameMatches,
+                  actual.toolInvocationID == expected.toolInvocationID,
+                  actual.toolArgsJSON == expected.toolArgsJSON,
+                  actual.toolResultJSON == expected.toolResultJSON,
+                  actual.toolIsError == expected.toolIsError,
+                  payload.position > previousOutputPosition
+            else { return .canonicalPayloadMismatch }
+            previousOutputPosition = payload.position
+        }
         return nil
     }
 
@@ -383,6 +587,8 @@ package enum AgentProviderHistoryAssociationPreflight {
     struct ClaimAssociation: Equatable {
         let nativeUserEntryIDs: Set<String>
         let userItemIDs: Set<UUID>
+        /// Each claimed native entry ID to its dispatch's ordered local user constituents.
+        let userItemIDsByNativeEntryID: [String: [UUID]]
     }
 
     enum ClaimAssociationResult: Equatable {
@@ -426,11 +632,17 @@ package enum AgentProviderHistoryAssociationPreflight {
               Set(constituents).count == constituents.count,
               isOrderedSubsequence(constituents, of: canonicalItemIDs(canonical))
         else { return .refused(.outboundClaimUnmatched) }
-        return .associated(ClaimAssociation(nativeUserEntryIDs: Set(claimedIDs), userItemIDs: Set(constituents)))
+        return .associated(ClaimAssociation(
+            nativeUserEntryIDs: Set(claimedIDs),
+            userItemIDs: Set(constituents),
+            userItemIDsByNativeEntryID: Dictionary(uniqueKeysWithValues: zip(claimedIDs, window.map(\.userItemIDs)))
+        ))
     }
 
-    /// Every canonical item ID in transcript order (persisted turns, then the suffix).
-    private static func canonicalItemIDs(_ canonical: AgentProviderHistoryCanonicalView) -> [UUID] {
+    /// Every canonical item ID in transcript order (persisted turns, requests included, then the
+    /// suffix). Also the existing-ID set a Claude import plans against (Step 4d3a), so a row already
+    /// held only by a persisted turn is recorded, never appended again.
+    package static func canonicalItemIDs(_ canonical: AgentProviderHistoryCanonicalView) -> [UUID] {
         var ids: [UUID] = []
         for turn in canonical.transcript.turns {
             if let request = turn.request { ids.append(request.id) }
@@ -554,7 +766,7 @@ extension ClaudeSessionHistoryReader {
     /// with their deterministic identities; native user rows carry no item (unassociated, never
     /// projected, and never assumed to be a local user item).
     package static func observation(_ candidate: Candidate) -> AgentProviderHistoryObservation {
-        let rows = candidate.rows.map { row -> AgentProviderHistoryRow in
+        let convert = { (row: Row) -> AgentProviderHistoryRow in
             AgentProviderHistoryRow(
                 nativeSessionID: candidate.nativeSessionID,
                 nativeEntryID: row.nativeEntryID,
@@ -567,7 +779,8 @@ extension ClaudeSessionHistoryReader {
         return AgentProviderHistoryObservation(
             provider: .claude,
             conversationID: candidate.nativeSessionID,
-            rows: rows,
+            rows: candidate.rows.map(convert),
+            validationRows: candidate.validationRows.map(convert),
             file: candidate.file,
             completeLineOffset: candidate.completeLineOffset,
             prefixSHA256: candidate.prefixSHA256,
