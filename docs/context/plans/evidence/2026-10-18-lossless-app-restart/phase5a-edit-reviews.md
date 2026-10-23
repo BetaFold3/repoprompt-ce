@@ -48,7 +48,7 @@ The user benefit is preserving proposed work without reviving a dead request or 
 
 ## Local signing
 
-Normal signed commit was retried after validation/audit and remained waiting without a signer result. Main interrupted its own Git command (exit130, no commit), then used O8's per-command unsigned fallback instead of leaving an unattended credential wait. No signing identity/configuration was changed.
+Normal signed commit was retried after validation/audit and waited without a signer result. When main sent an interrupt after the wait, the observed result was exit128 with 1Password's failed-to-fill-buffer error and failed-to-write-commit-object error, not exit130; no signed commit was created. Main then used O8's per-command unsigned fallback, producing76057942471b1e613871948a270c52108096e8b1 (signature N). No signing identity/configuration was changed. This corrects the exit-code wording recorded in that checkpoint; source and review results are unchanged.
 
 ## Finalization
 

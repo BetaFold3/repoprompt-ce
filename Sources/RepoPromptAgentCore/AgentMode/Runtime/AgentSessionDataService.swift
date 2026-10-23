@@ -4830,6 +4830,30 @@ package actor AgentSessionDataService {
         }
     #endif
 
+    // MARK: - Worktree merge review retention (Step 5c)
+
+    /// The established AgentSessions folder of a captured editable persistence authority: the
+    /// stamp must be this service's, not deleted, not tombstoned, and still the file's durable
+    /// incarnation. No mutable workspace resolver is consulted; the caller derives its
+    /// operation-owned subdirectory from the returned folder.
+    package func worktreeMergeReviewRetentionParent(for state: AgentSessionPersistenceState) async throws -> URL {
+        let stamp = state.stamp
+        await acquireSessionPersistence(for: stamp.sessionID)
+        defer { releaseSessionPersistence(for: stamp.sessionID) }
+        try validatePersistenceStamp(stamp, sessionID: stamp.sessionID, workspaceID: stamp.workspaceID)
+        try requireNoTombstone(for: stamp.sessionID)
+        guard FileManager.default.fileExists(atPath: stamp.fileURL.path) else {
+            throw AgentScheduledSendMutationError.sessionNotFound(stamp.sessionID)
+        }
+        guard case let .v1(current) = try currentDurableLifecycle(fileURL: stamp.fileURL, sessionID: stamp.sessionID),
+              let expected = stamp.incarnationID,
+              current.incarnationID == expected
+        else {
+            throw AgentScheduledSendMutationError.staleIncarnation(expected: stamp.incarnationID, actual: nil)
+        }
+        return stamp.fileURL.deletingLastPathComponent()
+    }
+
     // MARK: - Folder Helpers
 
     /// Creates (if needed) and returns the "AgentSessions" subfolder for the given workspace.

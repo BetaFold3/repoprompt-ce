@@ -19,6 +19,11 @@ struct AgentRunInteractionUISnapshot: Equatable {
     /// merge conflict card can be shown when no higher-priority blocker is
     /// active. `nil` when no such operation exists for the current tab.
     var activeWorktreeMergeConflict: AgentSessionWorktreeMergeOperation?
+    /// Step 5c: most recent ended, read-only merge review of the current tab (View/Copy/Discard
+    /// only), shown when no higher-priority card is active.
+    var historicalWorktreeMergeReview: AgentSessionWorktreeMergeOperation?
+    /// Session-owned Discard progress/failure of `historicalWorktreeMergeReview`.
+    var historicalWorktreeMergeReviewDiscard: AgentWorktreeMergeReviewDiscardState?
     var activeRunID: UUID?
     var activeAgentSessionID: UUID?
     var activeRunAttemptID: UUID?
@@ -67,6 +72,7 @@ struct AgentRunInteractionUISnapshot: Equatable {
         pendingApplyEditsReview: nil,
         pendingWorktreeMergeReview: nil,
         activeWorktreeMergeConflict: nil,
+        historicalWorktreeMergeReview: nil,
         activeRunID: nil,
         activeAgentSessionID: nil,
         activeRunAttemptID: nil,

@@ -251,6 +251,12 @@ package final class AgentTabSession: ObservableObject {
     package var applyEditsApprovalSetupID: UUID?
     package var worktreeMergeReviewContinuation: CheckedContinuation<WorktreeMergeReviewDecision, Never>?
     package var worktreeMergeReviewTimeoutTask: Task<Void, Never>?
+    /// Step 5c: shown reviews whose decision was submitted (card cleared) but not yet processed by
+    /// the waiting request. A lifecycle end treats them as shown, so a same-turn run end, reset, or
+    /// replacement keeps them as history instead of withdrawing them. In memory only.
+    package var resolvingWorktreeMergeReviewOperationIDs: Set<String> = []
+    /// Step 5c: in-flight or unacknowledged Discard of an ended merge review. In memory only.
+    package var worktreeMergeReviewDiscard: AgentWorktreeMergeReviewDiscardState?
     package var mcpControlContext: AgentMCPControlContext?
     #if DEBUG
         package var ompQualificationStartContext: OhMyPiAgentModeSmokeGate.StartContext? {

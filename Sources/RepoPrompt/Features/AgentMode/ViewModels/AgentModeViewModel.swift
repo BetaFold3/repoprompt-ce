@@ -739,8 +739,14 @@ final class AgentModeViewModel: ObservableObject {
         /// Test seam (Step 5a): awaited with the session inside each new edit-review await: before the
         /// `pending` and `applicationStarted` commits, and before the accepted review's ticket check.
         var test_editProposalRecoveryAwaitHook: (@MainActor (AgentTabSession, EditProposalRecoveryAwaitPoint) async -> Void)?
-        /// Test seam (Step 5a): replaces the pasteboard for Copy proposal.
+        /// Test seam (Step 5a): replaces the pasteboard for Copy proposal (also Step 5c Copy patch).
         var test_recoveryListPasteboardWriter: (@MainActor (String) -> Void)?
+        /// Test seam (Step 5c): awaited with the session before each new worktree-merge review await.
+        var test_worktreeMergeAwaitHook: (@MainActor (AgentTabSession, WorktreeMergeAwaitPoint) async -> Void)?
+        /// Test seam (Step 5c): replaces the VCS merge apply (counts handoffs without Git).
+        var test_worktreeMergeApplyOverride: (@MainActor (GitWorktreeMergeApplyRequest) async throws -> GitWorktreeMergeApplyResult)?
+        /// Test seam (Step 5c): replaces the read-only merge inspection.
+        var test_worktreeMergeInspectOverride: (@MainActor (GitWorktreeMergeInspectRequest) async throws -> GitWorktreeMergeInspection)?
         /// Test seam: awaited in `finalizeDeletedAgentSessionReferences` after a deleted session's
         /// owner was detached from its tab and before its awaited teardown, so a replacement owner
         /// can be installed on the tab while the cleanup is suspended.

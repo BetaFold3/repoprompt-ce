@@ -2844,6 +2844,34 @@ struct AgentModeChatDetailView: View {
             )
             .id("activeWorktreeMergeConflict")
             .transition(.opacity)
+        } else if let historical = runInteractionSnapshot.historicalWorktreeMergeReview,
+                  let tabID = currentTabID
+        {
+            AgentWorktreeMergeHistoricalReviewCard(
+                operation: historical,
+                isDisabled: runInteractionSnapshot.isShutdownFrozen,
+                loadPastPrediction: {
+                    await agentModeVM.historicalWorktreeMergePastPrediction(tabID: tabID, operationID: historical.id)
+                },
+                loadCurrentState: {
+                    await agentModeVM.historicalWorktreeMergeCurrentState(tabID: tabID, operationID: historical.id)
+                },
+                loadSavedPatch: {
+                    await agentModeVM.historicalWorktreeMergeSavedPatch(tabID: tabID, operationID: historical.id)
+                },
+                onCopy: {
+                    await agentModeVM.copyHistoricalWorktreeMergeSavedPatch(tabID: tabID, operationID: historical.id)
+                },
+                isDiscarding: runInteractionSnapshot.historicalWorktreeMergeReviewDiscard?.isDiscarding == true,
+                discardMessage: runInteractionSnapshot.historicalWorktreeMergeReviewDiscard?.message,
+                onDiscard: {
+                    Task { @MainActor in
+                        _ = await agentModeVM.discardHistoricalWorktreeMergeReview(tabID: tabID, operationID: historical.id)
+                    }
+                }
+            )
+            .id("historicalWorktreeMergeReview-\(historical.id)")
+            .transition(.opacity)
         }
         bottomTarget
         versionedBottomSentinel
