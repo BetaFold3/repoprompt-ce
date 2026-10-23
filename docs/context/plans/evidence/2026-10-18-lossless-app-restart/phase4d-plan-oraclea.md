@@ -749,3 +749,328 @@ Keep evidence outside the plan body; only owner answers enter Decisions. Apply t
 ## Recommendations
 
 Proceed now with the outbound-only slice and **omit UUID on `alreadyRecorded`**. Reuse the existing ledger for later envelope proof, with one sticky refusal field. Defer normalization/retraction handling, broader metadata support, helper shutdown, production activation, and final live qualification.
+
+
+## Synthetic-capture continuation recovered 2026-10-23
+
+Recovered verbatim from chat `claude-identity-resoluti-980C68` and its matching export. The interrupted send's result receipt was unavailable: unkeyed Oracle wait returned no undelivered operations, and the prior execution cell no longer existed. The returned preset ID/name therefore could not be reverified for this continuation. Retained as unverified consultation evidence; not synthesized or treated as implementation approval. Earlier verified planning and source reviews are unaffected.
+
+# Oracle Plan
+
+## Summary
+
+**Pause credential-dependent capture and ask the owner to complete normal CLI authentication themselves.** Do not inspect alternative credential stores, switch environments to discover credentials, copy secrets, or retry the denied inspection through another mechanism. The experiment supplies useful **synthetic-error identity and graph evidence**, but neither real-delivery qualification nor permission to broaden the native parser.
+
+## Current-state analysis
+
+Based on the supplied capture report—not independent inspection:
+
+- CLI `2.1.302` produced two synthetic `authentication_failed` responses, with zero reported API milliseconds and cost. This does not establish authenticated API delivery.
+- `apiKeySource: none` describes this invocation; it does **not** prove that credentials are absent elsewhere or identify the authentication failure’s cause.
+- The child exited and was reaped; resume was not attempted.
+- Tools/MCP/skills/slash commands reported zero. However, plugin metadata and built-in agent definitions remained loaded. Their presence proves neither execution nor harmlessness: **full requested ambient isolation remains unestablished**.
+- Outbound source slice `85aecb82` is committed following the reported A/B reviews and tests. Broader reconciliation remains unimplemented; production gates remain OFF.
+
+## Minimum next action
+
+1. **Stop further credential-dependent prompts now.** Repetition offers no useful identity qualification while authentication is unresolved.
+2. Ask the owner to authenticate using their normal, legitimate CLI workflow, without sharing credentials or configuration contents. Owner authentication is a prerequisite, not automatic authorization for broader experiments.
+3. Separately resolve the isolation discrepancy using public documentation/source and already captured nonsecret structural facts. Do not assume authentication fixes isolation, or silently relax the requested isolation standard.
+4. A later capture may use only the remaining existing approval: few trivial prompts, temporary workspace, bounded time/cost, disabled tools, and reads restricted to newly generated test history. If the required isolation cannot be established within that scope, report the blocker and seek an explicit owner decision before proceeding.
+
+No source changes, additional tooling, or activation are warranted by this consultation.
+
+## Evidence and parser boundary
+
+Record these **bounded usable conclusions**:
+
+| Observation | Supported conclusion |
+|---|---|
+| Caller UUID persisted verbatim | Demonstrated for these two synthetic-error user entries on CLI `2.1.302`; not universal delivery or retry semantics. |
+| Assistant stdout/native UUID matched | Demonstrated for the observed single-text-block synthetic errors only. |
+| Session ID stayed stable | Demonstrated across these two prompts in one process, not across resume/restart. |
+| Attachments occupied parent-chain positions | A reader cannot blanket-skip these records and expect an intact graph. Their renderability or semantic irrelevance is not established. |
+| Listed auxiliary records lacked UUIDs | These particular records lacked UUIDs; absence alone is not permission to ignore them. |
+| Request blob contained prompt context | Raw captures require sensitive-data handling even when generated in a temporary workspace. |
+
+**No parser acceptance broadening is justified now.** These observations can inform later focused structural/refusal tests, but do not establish a safe attachment allowlist, transparent graph traversal, or complete ordinary-history support. Do not copy raw request blobs into evidence or fixtures; record only necessary structural facts without prompt/configuration contents or secrets.
+
+## Status and remaining gates
+
+Keep the plan body unchanged. Record findings in its evidence directory and update only relevant status; preserve the outbound slice’s completed status.
+
+Installed qualification remains blocked by authentication and unresolved isolation. Real completion, thinking, multiblock identity, resume, tools, normalization/retraction behavior, and wire/native equivalence remain unqualified. Final live acceptance and all production recovery activation remain OFF.
+
+## Recommendations
+
+Pause capture for owner-managed authentication; retain isolation as an independent gate. Continue only evidence documentation and bounded source analysis. Treat this run as synthetic-error structural evidence—not successful delivery, parser qualification, or a reason to reopen the completed outbound slice.
+
+
+## Normal invocation continuation — verified 2026-10-23
+
+Returned preset: `OracleA` / `61D024A4-CCFB-4C9C-A614-CC65E0A1864C`; selection `inherited`; operation `C39C8461-1AB6-4D55-890E-BE2B72EDB0B8`. Main verified identity and read the full response. This is planning guidance, not source review.
+
+# Oracle Plan
+
+## Minimum evidence needed
+
+**Read-only command resolution is sufficient if it unambiguously identifies the command in the owner’s actual normal shell context.** The owner need not supply an exact command/environment merely because that command resolves to a wrapper.
+
+Record only:
+- The command name and resolved executable/wrapper identity.
+- Whether resolution reflects the owner’s normal invocation context rather than a worker-specific PATH.
+- Whether the known invocation preserves the capture arguments and existing one-prompt, cost, time, tools-disabled, and temporary-workspace constraints.
+
+Resolution identifies an entry point; it does **not** establish wrapper argument forwarding, automatic retries, credential behavior, or successful authentication. If those relevant wrapper behaviors are unknown, obtain a narrow confirmation rather than inspecting credentials or experimenting with alternative invocations.
+
+Historical references to `claude-rotator` and unset `CLAUDE_CONFIG_DIR` are context—not authorization to select that wrapper, unset variables, or reconstruct an old environment.
+
+## When an owner clarification is necessary
+
+Ask only if current resolution is ambiguous, differs from the normal shell context, or leaves the invocation’s bounds uncertain:
+
+> “The current normal command resolves to **[wrapper/path]**. Is this the normal invocation you want used, unchanged, for the one remaining bounded prompt? If not, please provide the command name and any required non-secret invocation instructions.”
+
+Do not request environment dumps, configuration contents, credential paths, or secret-bearing command lines.
+
+The existing choice **“Use my normal CLI”** authorizes using the identified normal invocation within O16; it is not confirmation that login succeeded. Separate login confirmation is not inherently necessary to spend the already-approved remaining prompt, provided the invocation and bounds are established. If the owner must perform authentication first, that remains their normal manual action—not an invitation to retry denied auth inspection.
+
+## Isolation: installed execution versus built-in metadata
+
+Use the documented and locally stated safe-mode boundary:
+
+- **Installed customizations:** safe-mode is documented to disable them. Preserve that mode and the other approved restrictions.
+- **Built-in components:** local help explicitly retains built-in plugins. Their metadata and built-in agent definitions need not disappear.
+- **Captured counts:** zero tools/MCP/skills/slash commands supports those reported inventories. Three plugin metadata entries and four agent definitions do not, by themselves, demonstrate installed-plugin execution—or establish the provenance of every entry.
+
+Therefore, **do not require “zero built-in definitions.”** The appropriate capture claim is “safe-mode with installed customizations disabled under its documented contract; built-in metadata may remain,” not “nothing ambient was loaded.”
+
+The supplied documentation and help resolve the count-only objection without another provider experiment. If there is concrete evidence of installed customization execution or wrapper-injected instructions, that is a blocker; metadata presence alone is not. Absence of managed-policy files does not prove absence of every other instruction source.
+
+## Remaining boundary
+
+If resolution is unambiguous and the normal invocation preserves the bounds, the one remaining O16 prompt can proceed without credential discovery or a broader approval request. An authentication failure ends that attempt; no alternate store, environment, wrapper, or retry follows automatically.
+
+Record any result as evidence for **that exact wrapper/CLI invocation**, not qualification of the built-in app provider. Production gates, broader reconciliation, and final live qualification remain OFF/pending. This consultation authorizes no source changes.
+
+## Recommendations
+
+Use current, unambiguous normal-command resolution—not historical environment reconstruction. Ask one narrow owner confirmation only where invocation identity or bound preservation remains uncertain. Accept documented built-in metadata retention; do not confuse it with installed-plugin execution or demand impossible zero-definition isolation.
+
+
+## Post-real-capture source sequencing — verified 2026-10-23
+
+Returned preset: `OracleA` / `61D024A4-CCFB-4C9C-A614-CC65E0A1864C`; inherited selection; operation `0543C623-B2E8-45D0-9FD5-248364EB5368`. Main verified identity and read the full reply. Planning, not source review; recommendations require source verification and are not all adopted.
+
+# Oracle Plan
+
+## Summary
+
+Implement **a graph-preserving native reader slice for the supported direct, single-text-envelope profile**, with a positive fixture derived from O19’s permitted structural evidence. This is useful source work now: it removes the reader’s blanket attachment refusal without claiming arbitrary wire/native equivalence. Do **not** combine it with live rendering, new persistence collections, or recovery activation. Completing this slice is reader qualification—not completion of the entire history-identity prerequisite.
+
+## Current-state analysis
+
+The supplied source account places the immediate blocker in `ClaudeSessionHistoryReader`: ordinary attachment nodes currently cause refusal before the existing import machinery can evaluate identity.
+
+O19 establishes, for one real turn on CLI `2.1.302`:
+
+- Caller UUID and text persisted in the native user entry.
+- The complete, single-text-block assistant envelope matched stdout and native history in UUID, API message ID, and content.
+- Attachments participate in the parent chain, including **after** the assistant.
+- `last-prompt.leafUuid` can identify an attachment rather than a visible message.
+
+Therefore, “discard attachments before building the graph” and “the leaf must be an assistant” are demonstrably wrong approaches. Conversely, the sample does not establish that every attachment or UUID-less record is semantically ignorable.
+
+Outbound association work in `85aecb82` remains complete. No authentication changes, further prompts, or installed-provider inspection are needed for the proposed source slice.
+
+## Design
+
+### 1. Bound the slice to reader correctness
+
+Keep the existing reader entry point and observation/import interfaces. Modify its internal classification and traversal; do not introduce an unused parallel reader or a new persistence authority.
+
+The supported message projection is:
+
+- User: the existing supported text representation, retaining native envelope identity.
+- Assistant: exactly one supported text block, retaining envelope identity and original ordinal.
+- No inferred API-message grouping, derived wire UUID reversal, text matching, or replay identity mapping.
+
+O19 justifies testing this profile positively. It does **not** justify using `message.id` as transcript identity or declaring all envelopes from this CLI interchangeable with native entries.
+
+### 2. Preserve the graph before projecting visible messages
+
+For each captured complete record:
+
+1. Classify it using an explicit, source-supported record/subtype rule.
+2. Retain graph-bearing records with their actual UUID and parent relationships, including approved nonrendering attachments.
+3. Validate the graph before selecting visible user/assistant messages.
+4. Walk through retained nonrendering nodes without inventing replacement parent edges.
+5. Project only supported visible message nodes.
+
+A trailing supported attachment is a valid graph endpoint. Keep separate:
+
+- the reader’s captured-file/cursor boundary;
+- the conversation graph endpoint;
+- the last projected message.
+
+An attachment UUID must never become an assistant UUID or a `resume_session_at` message target. This slice does not enable Resume.
+
+Retain existing missing-parent, cycle, branch, duplicate-conflict, partial-line, session, descriptor, and file-size safeguards.
+
+### 3. Positive classification—not a family-wide skip
+
+Before adding each accepted attachment subtype or UUID-less operational record, cite the authoritative source establishing its graph and visible-message treatment.
+
+The existing supplied Python reader’s visible-message filtering is relevant evidence, but filtering alone does not establish that all excluded records are irrelevant to lossless recovery.
+
+Rules:
+
+- An approved context attachment may remain a nonrendering graph node; do not inspect or reproduce its context contents merely to construct a fixture.
+- `structured_output`, compact summaries, retractions, normalization-dependent identities, and unclassified semantic records remain explicit unsupported cases.
+- Missing UUID does not itself make an operational record ignorable.
+- Unknown semantic shapes refuse; unrelated persisted unknown fields continue to round-trip under existing schema rules.
+
+For the additional organization-context attachment, **do not infer its treatment from its name or unseen contents**. Establish its classification from public source. If that cannot be established, explicitly retain its refusal and report that O19’s complete record sequence is not yet accepted.
+
+No fingerprint/count fields should be added merely to accommodate opaque context records.
+
+### 4. Keep the later ledger decision out of this commit
+
+This slice neither creates completed ledger evidence nor relaxes association preflight. Preserve the existing production OFF gates.
+
+Do not label successful parsing as successful reconciliation. In particular:
+
+- A baseline remains an outbound association hint, not materialization.
+- Existing ledger overlap without full payload evidence cannot become qualified through the new reader.
+- Do not add deduplication based on the newly accepted attachments.
+- Do not alter canonical transcript rows, receipts, or cursor commit ordering.
+
+The subsequent coherent slice should implement **complete-envelope evidence comparison and materialization together**, not persistence fields with no consumer. It must compare the complete supported semantic payload before ledger suppression.
+
+For the one-text profile, an additional general-purpose envelope-count framework is unnecessary: the profile itself fixes the assistant projection cardinality. A sticky persisted refusal becomes necessary only when a later live path encounters a disqualifying signal that cannot reliably be reconstructed from history. Neither feature is needed to finish this reader slice.
+
+## Bounded acceptance contract
+
+The slice passes when tests establish:
+
+1. **Positive graph:** a sanitized fixture reproducing O19’s approved record shapes yields the expected user and assistant identities/text, with intermediate and trailing attachments retained in graph validation.
+2. **Boundary correctness:** an attachment leaf is accepted without being projected or substituted for a resume target; trailing records remain within the reader’s capture boundary.
+3. **Explicit unsupported cases:** structured-output attachment, compaction semantics, retraction/normalization signals, unknown semantic records, and unsupported message blocks refuse rather than disappear.
+4. **Graph integrity:** missing parents, cycles, conflicting duplicate UUIDs, wrong sessions, and ambiguous branches still refuse.
+5. **No widened recovery:** legacy association gaps and ledger overlaps remain unqualified; production construction and recovery gates remain unchanged.
+
+Use synthetic placeholders for context-bearing values. Label the fixture **structurally derived and sanitized**, not a verbatim capture or independent live acceptance. Do not place raw request blobs, organization context, or prompt snapshots in repository evidence.
+
+## File-by-file impact
+
+Paths below are those identified in the supplied source account; exact test filenames require repository validation.
+
+| File | Change |
+|---|---|
+| `Sources/RepoPromptAgentCore/AI/Providers/ClaudeCode/SDK/ClaudeSessionHistoryReader.swift` | Explicit record classification; retain supported nonrendering graph nodes; separate graph endpoint from visible projection; support the bounded direct-text profile. |
+| Existing `ClaudeSessionHistoryReader` test file and fixture directory | Positive O19-shaped graph fixture, unsupported semantic cases, graph/boundary regressions. |
+| Existing plan evidence directory | Source citations for each accepted classification, fixture derivation, test results, and remaining limitations. |
+
+No codec, TaskLocal, controller, live reducer, session schema, registry, or recovery-action changes belong in this commit.
+
+## Implementation order
+
+1. Read the existing classifier/traversal and authoritative subtype handling; produce the small accepted/refused classification table.
+2. Land reader changes and positive/negative tests together. If the organization-context classification remains unproven, report that specific limitation rather than broadening by inference.
+3. Run affected validation and the required independent reviews. Update evidence/status only; do not rewrite the plan body.
+
+## Evidence versus activation blockers
+
+**No additional native sample is required for this slice.** The remaining evidence question is public-source classification of encountered records—not another model prompt.
+
+Multiblock, thinking, tools, retractions, and resume remain outside this profile. Their missing live qualification does not prevent implementing typed refusals or the later single-text envelope/ledger transaction contract. It does prevent claiming broader ordinary-history support or final activation readiness.
+
+## Recommendations
+
+Proceed with the graph-preserving, positively tested direct-text reader slice. Preserve unsupported semantic refusals and defer ledger/live changes to their own complete transaction slice. All four approved prompts are exhausted: run no further capture. Keep production recovery, registry, Resume, restart activation, and final live acceptance OFF.
+
+
+## Capture-qualified projection decision — verified 2026-10-23
+
+Returned preset: `OracleA` / `61D024A4-CCFB-4C9C-A614-CC65E0A1864C`; inherited selection; operation `F8BBFAFC-04D3-4CA8-994A-CDA6E59CFB15`. Main verified identity and read full reply. Planning, not implementation review.
+
+# Oracle Plan
+
+## Summary
+
+**Yes—sufficient for an explicitly capture-qualified, production-OFF single-text projection profile. Choose reader-only first.** SDK graph/visibility behavior plus O19 supports treating the enumerated attachments as **nonrendering nodes in this bounded projection**, without declaring their contents semantically irrelevant or claiming lossless reconciliation. Public definitions of every context subtype are not a prerequisite for this narrower step.
+
+## Current-state analysis
+
+The supplied evidence establishes the needed distinction:
+
+- Python SDK `sessions.py` retains attachment nodes, reconstructs ancestry through nonmessage terminals, and filters visible conversation **afterward**.
+- O19 demonstrates that structure for one real single-text turn, including a trailing attachment.
+- `ClaudeSessionHistoryReader.swift:385–398` currently refuses those nodes; `520–604` validates the graph; `624–689` projects in file order.
+- TS evidence requires explicit rejection of structured output, retractions, and eviction semantics. Generally accepting unknown fields must not accidentally admit those known semantic signals.
+
+The blocker is therefore reader classification and graph-aware projection—not missing proof of universal attachment semantics.
+
+## Design: bounded worker contract
+
+### Accept
+
+1. **Messages:** existing supported user text and complete assistant envelopes containing exactly one text block. Preserve native session/envelope UUIDs and original block position; infer no wire/native identity mapping.
+2. **Attachments:** accept only these exact `attachment.type` values as nonrendering graph nodes:
+   - `budget_usd`
+   - `credential_org`
+   - `date`
+   - `environment`
+   - `model`
+   - `prompt_snapshot`
+   - `session_context`
+   - `total_tokens_reminder`
+
+   Require the captured structural identity/parent shape and existing session checks. Keep their actual graph edges. Do not inspect context contents to infer meaning, render them, or copy them into evidence.
+3. **UUID-less operational records:** exclude from graph/projection only the exact captured discriminants whose exclusion matches the pinned SDK parser, and only when they lack graph identity/parent fields. Unknown discriminants refuse. This is a projection rule, not a declaration that these records are disposable.
+
+### Validate and project
+
+- Classify and validate the complete captured candidate **before cursor or ledger suppression**. Known unsupported signals must not hide behind an already-known key.
+- Reuse existing graph validation; retain missing-parent, cycle, reachability, duplicate-conflict, branch, session, and file-safety checks.
+- Select the accepted linear parent chain, then project its supported messages **in chain order**, not independent file order.
+- Allow a supported attachment terminal. Keep graph terminal, last visible message, and native-byte cursor boundary distinct.
+- Preserve existing baseline/cursor byte fences. Do not produce a resume target from an attachment or modify native history.
+
+### Refuse
+
+Refuse the whole candidate, with the existing typed unsupported/error mechanism, for:
+
+- Unknown attachment or operational record types.
+- `structured_output`, compaction/summary semantics, unsupported message blocks, or normalization requiring identity reconstruction.
+- Documented supersession, aborted-output, retraction, and eviction forms, checked at their defined structural locations—not by searching arbitrary text.
+- Any existing graph/file-integrity failure.
+
+Preserve unrelated unknown fields under existing compatibility behavior; add explicit guards for verified semantic markers rather than a speculative recursive “unknown semantics” detector.
+
+**No ledger schema, sticky refusal, counts, live reducer, canonical mutation, or cursor-commit changes in this slice.** Reader success must not bypass existing reconciliation eligibility checks.
+
+## File-by-file impact and acceptance
+
+- **`Sources/RepoPromptAgentCore/AI/Providers/ClaudeCode/SDK/ClaudeSessionHistoryReader.swift`:** extend classification, retain attachment nodes, project the validated chain, and reject documented semantic markers.
+- **Existing reader tests/fixtures:** add a sanitized O19-shaped positive fixture and negative cases.
+- **Plan evidence directory:** record the bounded profile, citations, fixture provenance, and results; leave the plan body unchanged.
+
+Required tests:
+
+1. Intermediate and trailing approved attachments yield only the expected user/assistant projection.
+2. A trailing attachment remains the graph endpoint without becoming a message identity.
+3. Chain ordering governs projection.
+4. Unknown types, structured output, compaction, and verified retraction/eviction forms refuse—even before a cursor boundary or under known ledger keys.
+5. Existing graph/file safeguards remain effective.
+6. Production gates and reconciliation eligibility remain unchanged.
+
+## Implementation order
+
+1. Encode the exact captured/source-backed classification table in reader tests.
+2. Land reader changes and positive/negative tests together.
+3. Validate and review under the supplied policy; record **reader-profile completion**, not history-identity or live-acceptance completion.
+
+## Recommendations
+
+Proceed now with this reader-only slice. No additional capture or owner choice is needed. Broader reconciliation, installed-format generality, Resume/restart qualification, all production activation, and final live acceptance remain pending.

@@ -522,6 +522,7 @@ allowed_tracked_docs=(
   "docs/context/plans/evidence/2026-10-18-lossless-app-restart/phase4d1-worker.md"
   "docs/context/plans/evidence/2026-10-18-lossless-app-restart/phase4d1-review-oraclea.md"
   "docs/context/plans/evidence/2026-10-18-lossless-app-restart/phase4d1-review-oracleb.md"
+  "docs/context/plans/evidence/2026-10-18-lossless-app-restart/phase4d-claude-capture.md"
   "docs/context/plans/evidence/2026-10-18-lossless-app-restart/phase4a-saved-relocation.md"
   "docs/context/plans/evidence/2026-10-18-lossless-app-restart/phase4a-relocation-plan-oraclee.md"
   "docs/context/plans/evidence/2026-10-18-lossless-app-restart/phase4a-saved-relocation-worker.md"
