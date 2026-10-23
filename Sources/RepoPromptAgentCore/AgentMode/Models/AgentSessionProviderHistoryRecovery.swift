@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 
 // Optional version-7 session member for provider-history reconciliation (lossless restart Phase 4,
@@ -144,6 +145,65 @@ package struct AgentSessionProviderHistoryRecovery: Codable, Equatable {
             case unsupported(String)
         }
 
+        /// Outbound caller-identity claim of a built-in Claude dispatch: recorded only by the admission
+        /// that newly captured this baseline, before any bytes, as the instruction to encode `uuid` as
+        /// the streamed user message's top-level `uuid`. It is NOT evidence of delivery, native
+        /// persistence or fsync. Legacy baselines (and every non-qualified admission) have none and
+        /// are never upgraded later.
+        ///
+        /// A claim may be committed while its UUID is NEVER encoded: an admission refused after the
+        /// save whose pending receipt a retry then joins (that retry sends without the UUID), or a
+        /// write superseded, cancelled or failed after the admission returned it. A missing native
+        /// entry carrying `uuid` is therefore evidence of nothing: never of non-delivery, and never
+        /// a reason to resend automatically.
+        package struct OutboundUserMessage: Codable, Equatable {
+            /// The dispatch's own `dispatchID`, stored explicitly (never inferred from it).
+            package let uuid: UUID
+            /// Lowercase hex SHA-256 of the exact provider-bound text's UTF-8 bytes.
+            package let textSHA256: String
+            /// Unknown members inside the claim, kept verbatim.
+            package var extras: [String: AgentScheduledSendJSONValue]
+
+            package init(uuid: UUID, textSHA256: String, extras: [String: AgentScheduledSendJSONValue] = [:]) {
+                self.uuid = uuid
+                self.textSHA256 = textSHA256
+                self.extras = extras
+            }
+
+            /// The claim for `uuid` over exactly `providerBoundText` (the codec's text, unmodified).
+            package init(uuid: UUID, providerBoundText: String) {
+                self.init(
+                    uuid: uuid,
+                    textSHA256: SHA256.hash(data: Data(providerBoundText.utf8)).map { String(format: "%02x", $0) }.joined()
+                )
+            }
+
+            private static let knownKeys: Set<String> = ["uuid", "textSHA256"]
+
+            package init(from decoder: Decoder) throws {
+                let container = try decoder.container(keyedBy: HistoryDynamicKey.self)
+                uuid = try container.decode(UUID.self, forKey: HistoryDynamicKey("uuid"))
+                let digest = try container.decode(String.self, forKey: HistoryDynamicKey("textSHA256"))
+                // Exactly 64 lowercase hex digits; anything else makes the whole baseline unreadable.
+                guard digest.utf8.count == 64, digest.utf8.allSatisfy({ (0x30 ... 0x39).contains($0) || (0x61 ... 0x66).contains($0) }) else {
+                    throw DecodingError.dataCorruptedError(
+                        forKey: HistoryDynamicKey("textSHA256"),
+                        in: container,
+                        debugDescription: "Malformed outbound user-message digest."
+                    )
+                }
+                textSHA256 = digest
+                extras = try HistoryDynamicKey.extras(in: container, excluding: Self.knownKeys)
+            }
+
+            package func encode(to encoder: Encoder) throws {
+                var container = encoder.container(keyedBy: HistoryDynamicKey.self)
+                try HistoryDynamicKey.encode(extras, into: &container)
+                try container.encode(uuid, forKey: HistoryDynamicKey("uuid"))
+                try container.encode(textSHA256, forKey: HistoryDynamicKey("textSHA256"))
+            }
+        }
+
         /// Existing durable dispatch identity (the first delivery attempt ID); idempotency key.
         package let dispatchID: UUID
         package let runAttemptID: UUID?
@@ -161,6 +221,8 @@ package struct AgentSessionProviderHistoryRecovery: Codable, Equatable {
         package let profileName: String
         package let status: Status
         package let recordedAt: Date
+        /// `nil` for legacy baselines and every admission that did not mint a claim.
+        package let outboundUserMessage: OutboundUserMessage?
         package var extras: [String: AgentScheduledSendJSONValue]
 
         package init(
@@ -176,6 +238,7 @@ package struct AgentSessionProviderHistoryRecovery: Codable, Equatable {
             profileName: String,
             status: Status,
             recordedAt: Date,
+            outboundUserMessage: OutboundUserMessage? = nil,
             extras: [String: AgentScheduledSendJSONValue] = [:]
         ) {
             self.dispatchID = dispatchID
@@ -190,6 +253,7 @@ package struct AgentSessionProviderHistoryRecovery: Codable, Equatable {
             self.profileName = profileName
             self.status = status
             self.recordedAt = Self.millisecondDate(Self.milliseconds(recordedAt))
+            self.outboundUserMessage = outboundUserMessage
             self.extras = extras
         }
 
@@ -218,7 +282,8 @@ package struct AgentSessionProviderHistoryRecovery: Codable, Equatable {
         private static let knownKeys: Set<String> = [
             "dispatchID", "runAttemptID", "transcriptResetGeneration", "provider", "conversationID",
             "userItemIDs", "fileDevice", "fileInode", "fileBirthSeconds", "fileBirthNanoseconds",
-            "completeLineOffset", "baselineCommitID", "profile", "status", "unsupportedReason", "recordedAtMs"
+            "completeLineOffset", "baselineCommitID", "profile", "status", "unsupportedReason", "recordedAtMs",
+            "outboundUserMessage"
         ]
 
         package init(from decoder: Decoder) throws {
@@ -260,6 +325,8 @@ package struct AgentSessionProviderHistoryRecovery: Codable, Equatable {
             }
             // Epoch milliseconds: independent of the enclosing encoder's date strategy.
             recordedAt = try Self.millisecondDate(container.decode(Int64.self, forKey: key("recordedAtMs")))
+            // A malformed claim makes the whole baseline unreadable (kept verbatim), never a claim.
+            outboundUserMessage = try container.decodeIfPresent(OutboundUserMessage.self, forKey: key("outboundUserMessage"))
             extras = try HistoryDynamicKey.extras(in: container, excluding: Self.knownKeys)
         }
 
@@ -289,6 +356,7 @@ package struct AgentSessionProviderHistoryRecovery: Codable, Equatable {
                 try container.encode(reason, forKey: HistoryDynamicKey("unsupportedReason"))
             }
             try container.encode(Self.milliseconds(recordedAt), forKey: HistoryDynamicKey("recordedAtMs"))
+            try container.encodeIfPresent(outboundUserMessage, forKey: HistoryDynamicKey("outboundUserMessage"))
         }
     }
 

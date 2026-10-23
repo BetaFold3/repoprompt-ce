@@ -2733,6 +2733,12 @@ actor LifecycleFakeNativeController: NativeAgentRuntimeControlling {
     /// a refusal or a cancellation during it is a proven non-write (`processNotRunning`).
     private let invokesWriteAdmission: Bool
     private var admissionOwners: [AgentRuntimeSessionScope] = []
+    /// Opt-in (with `invokesWriteAdmission`): the eligibility this fake's launch reports to the
+    /// admission, like the real controller's launch identity check.
+    private let outboundIdentityEligible: Bool
+    /// Exact user frames this fake wrote, encoded by the production codec with the UUID its own
+    /// admission returned (managed-transport mode only).
+    private var writtenUserFrames: [Data] = []
 
     init(
         recorder: LifecycleRecorder,
@@ -2757,11 +2763,13 @@ actor LifecycleFakeNativeController: NativeAgentRuntimeControlling {
         sessionID: String = "lifecycle-claude-session",
         promptCacheRetention: AgentMCPWaitPolicy.ParentPromptCacheRetention = .standard,
         joinsRetirementBeforeSuccessor: Bool = false,
-        invokesWriteAdmission: Bool = false
+        invokesWriteAdmission: Bool = false,
+        outboundIdentityEligible: Bool = false
     ) {
         self.recorder = recorder
         self.joinsRetirementBeforeSuccessor = joinsRetirementBeforeSuccessor
         self.invokesWriteAdmission = invokesWriteAdmission
+        self.outboundIdentityEligible = outboundIdentityEligible
         self.label = label
         activeSession = hasActiveSession
         turnInFlight = hasTurnInFlight
@@ -2971,11 +2979,13 @@ actor LifecycleFakeNativeController: NativeAgentRuntimeControlling {
     }
 
     func sendUserMessage(_ text: String) async throws -> UUID {
+        var outboundUserMessageUUID: UUID?
         if invokesWriteAdmission {
             recorder.record("\(label):admission")
             admissionOwners.append(AgentRuntimeOperationOwner.current)
             if let admission = AgentRuntimeOperationOwner.writeAdmission {
-                guard await admission() else {
+                let eligible = outboundIdentityEligible
+                guard case let .admitted(admittedUUID) = await admission(eligible) else {
                     recorder.record("\(label):admission-refused")
                     throw NativeAgentRuntimeControllerError.processNotRunning
                 }
@@ -2983,6 +2993,7 @@ actor LifecycleFakeNativeController: NativeAgentRuntimeControlling {
                     recorder.record("\(label):admission-cancelled")
                     throw NativeAgentRuntimeControllerError.processNotRunning
                 }
+                outboundUserMessageUUID = eligible ? admittedUUID : nil
             }
         }
         recorder.record("\(label):send")
@@ -2998,6 +3009,13 @@ actor LifecycleFakeNativeController: NativeAgentRuntimeControlling {
         }
         let turnID = UUID()
         sentMessages.append(text)
+        if invokesWriteAdmission {
+            try writtenUserFrames.append(ClaudeSDKProtocolCodec.encodeUserMessage(
+                text: text,
+                sessionID: nil,
+                messageUUID: outboundUserMessageUUID
+            ))
+        }
         if let emittedAssistantTextOnSend {
             streamContinuation.yield(.stream(AIStreamResult(
                 type: "assistant",
@@ -3035,6 +3053,11 @@ actor LifecycleFakeNativeController: NativeAgentRuntimeControlling {
     /// The owner scope bound for each write admission this fake evaluated.
     func recordedAdmissionOwners() -> [AgentRuntimeSessionScope] {
         admissionOwners
+    }
+
+    /// Exact encoded user frames written in managed-transport mode.
+    func recordedUserFrames() -> [Data] {
+        writtenUserFrames
     }
 
     /// A (possibly late) successful completion for a specific earlier turn.

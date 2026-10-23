@@ -79,10 +79,15 @@ final class AgentProviderHandoff {
         guard let evidence = committedEvidence, evidence.isDurable, let first = evidence.receipts.first else {
             return nil
         }
+        // The baseline keeps its existing item list; completeness is stated, never inferred from
+        // a list that silently dropped a constituent without a user item.
+        let userItemIDs = constituents.compactMap(\.userItemID)
         return AgentDispatchBaselineIdentity(
             dispatchID: first.attemptID,
             runAttemptID: runAttemptID,
-            userItemIDs: constituents.compactMap(\.userItemID)
+            userItemIDs: userItemIDs,
+            hasCompleteUserItems: !userItemIDs.isEmpty && userItemIDs.count == constituents.count
+                && Set(userItemIDs).count == userItemIDs.count
         )
     }
 

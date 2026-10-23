@@ -921,6 +921,17 @@ package final actor ClaudeNativeProcessSessionController {
         activeFlagSettingsBaseModel = nextBaseModel
     }
 
+    /// Whether the current launch may carry an outbound user-message `uuid`: an automatically
+    /// resolved command on the first-party backend with no backend-routing environment keys.
+    /// Explicit command overrides (possibly stream wrappers) and compatible backends never qualify.
+    /// Automatic resolution is not proof of an authenticated binary; capture stays gated OFF.
+    private var outboundUserMessageIdentityEligible: Bool {
+        guard let identity = usageLaunchState?.identity else { return false }
+        return identity.commandProvenance == .automaticResolved
+            && identity.backend == .defaultClaude
+            && identity.environmentOverrideKeys.isEmpty
+    }
+
     /// The permission configuration a launch or `set_permission_mode` request asks for.
     private static func runtimePermission(mode: String?) -> AgentRuntimePermissionSnapshot {
         let trimmed = mode?.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -939,20 +950,32 @@ package final actor ClaudeNativeProcessSessionController {
         }
         // R6 owner operation: the user turn associates with the scope its owner captured.
         let writeOwner = try await fenceRuntimeWrite(association: .owner(AgentRuntimeOperationOwner.current))
+        // Omitted unless this write's own admission newly committed a baseline claiming it.
+        var outboundUserMessageUUID: UUID?
         if writeOwner != nil {
             // The fence suspended: a cancelled operation or a superseded owner writes nothing
             // (reported as a proven non-write).
             guard !Task.isCancelled else { throw ControllerError.processNotRunning }
             if let admission = AgentRuntimeOperationOwner.writeAdmission {
-                guard await admission() else { throw ControllerError.processNotRunning }
+                // Decided from this transport's own launch before the await; a replacement launch
+                // during it gets zero bytes from `sendLine`'s owner check.
+                let identityEligible = outboundUserMessageIdentityEligible
+                guard case let .admitted(admittedUUID) = await admission(identityEligible) else {
+                    throw ControllerError.processNotRunning
+                }
                 // The admission check suspended too: cancellation during it also writes nothing.
                 guard !Task.isCancelled else { throw ControllerError.processNotRunning }
+                outboundUserMessageUUID = identityEligible ? admittedUUID : nil
             }
         }
         guard isInitialized else {
             throw ControllerError.processNotRunning
         }
-        let payload = try ClaudeSDKProtocolCodec.encodeUserMessage(text: text, sessionID: sessionID)
+        let payload = try ClaudeSDKProtocolCodec.encodeUserMessage(
+            text: text,
+            sessionID: sessionID,
+            messageUUID: outboundUserMessageUUID
+        )
         try sendLine(payload, writeOwner: writeOwner)
         // The write succeeded: register the turn and its launch-local dispatch ordinal in this
         // same non-suspending actor step so no result can interleave between write and ordinal.

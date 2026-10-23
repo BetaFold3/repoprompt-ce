@@ -310,6 +310,91 @@ final class AgentRecoveryReconciliationTests: XCTestCase {
         XCTAssertNotNil(partial.nilIfEmpty)
     }
 
+    /// Step 4d1: the outbound claim round-trips with the baseline's unknown members; a legacy
+    /// baseline decodes with no claim; a malformed claim makes that baseline unreadable (kept
+    /// verbatim), never a claim.
+    func testOutboundUserMessageClaimRoundTripsWithUnknownMembersAndLegacyStaysUnclaimed() throws {
+        let dispatchID = UUID()
+        var claim = AgentSessionProviderHistoryRecovery.DispatchBaseline.OutboundUserMessage(
+            uuid: dispatchID,
+            providerBoundText: "héllo\n"
+        )
+        XCTAssertEqual(
+            AgentSessionProviderHistoryRecovery.DispatchBaseline.OutboundUserMessage(uuid: dispatchID, providerBoundText: "abc").textSHA256,
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+            "lowercase hex SHA-256 of the UTF-8 bytes"
+        )
+        XCTAssertEqual(claim.textSHA256.count, 64)
+        XCTAssertEqual(claim.textSHA256, claim.textSHA256.lowercased())
+        XCTAssertNotEqual(
+            claim.textSHA256,
+            AgentSessionProviderHistoryRecovery.DispatchBaseline.OutboundUserMessage(uuid: dispatchID, providerBoundText: "héllo").textSHA256,
+            "the digest covers the exact text"
+        )
+        // An unknown member INSIDE the claim survives decode and re-encode.
+        claim.extras["futureClaimMember"] = .object(["v": .number(2)])
+        let legacy = baseline(dispatchID: dispatchID)
+        let claimed = AgentSessionProviderHistoryRecovery.DispatchBaseline(
+            dispatchID: legacy.dispatchID,
+            runAttemptID: legacy.runAttemptID,
+            transcriptResetGeneration: legacy.transcriptResetGeneration,
+            providerRaw: legacy.providerRaw,
+            conversationID: legacy.conversationID,
+            userItemIDs: legacy.userItemIDs,
+            file: legacy.file,
+            completeLineOffset: legacy.completeLineOffset,
+            baselineCommitID: legacy.baselineCommitID,
+            profileName: legacy.profileName,
+            status: legacy.status,
+            recordedAt: legacy.recordedAt,
+            outboundUserMessage: claim,
+            extras: ["futureMember": .string("kept")]
+        )
+        let decoded = try JSONDecoder().decode(
+            AgentSessionProviderHistoryRecovery.DispatchBaseline.self,
+            from: JSONEncoder().encode(claimed)
+        )
+        XCTAssertEqual(decoded, claimed)
+        XCTAssertEqual(decoded.outboundUserMessage, claim)
+        XCTAssertEqual(decoded.outboundUserMessage?.extras["futureClaimMember"], .object(["v": .number(2)]))
+        XCTAssertEqual(decoded.extras["futureMember"], .string("kept"))
+        let reencoded = try JSONDecoder().decode(
+            AgentSessionProviderHistoryRecovery.DispatchBaseline.self,
+            from: JSONEncoder().encode(decoded)
+        )
+        XCTAssertEqual(reencoded, claimed, "a second save keeps the nested unknown member")
+
+        let legacyDecoded = try JSONDecoder().decode(
+            AgentSessionProviderHistoryRecovery.DispatchBaseline.self,
+            from: JSONEncoder().encode(legacy)
+        )
+        XCTAssertNil(legacyDecoded.outboundUserMessage, "a legacy baseline never gains a claim")
+        let legacyObject = try XCTUnwrap(JSONSerialization.jsonObject(with: JSONEncoder().encode(legacy)) as? [String: Any])
+        XCTAssertNil(legacyObject["outboundUserMessage"], "no claim key is written when absent")
+
+        // Malformed claims (bad UUID, or a digest that is not exactly 64 lowercase hex digits) make
+        // that baseline unreadable, kept verbatim, never a claim.
+        let goodDigest = String(repeating: "a", count: 64)
+        let malformedClaims = [
+            #"{"uuid":"not-a-uuid","textSHA256":"\#(goodDigest)"}"#,
+            #"{"uuid":"\#(UUID().uuidString)","textSHA256":"\#(goodDigest.uppercased())"}"#,
+            #"{"uuid":"\#(UUID().uuidString)","textSHA256":"\#(goodDigest.dropLast())"}"#,
+            #"{"uuid":"\#(UUID().uuidString)","textSHA256":"\#(goodDigest.dropLast())g"}"#,
+            #"{"uuid":"\#(UUID().uuidString)"}"#
+        ]
+        for malformedClaim in malformedClaims {
+            let malformed = #"{"dispatchBaselines":[{"dispatchID":"\#(UUID().uuidString)","transcriptResetGeneration":0,"provider":"claude","conversationID":"c","completeLineOffset":0,"baselineCommitID":"\#(UUID().uuidString)","profile":"p","status":"captured","recordedAtMs":0,"outboundUserMessage":\#(malformedClaim)}]}"#
+            let ledger = try JSONDecoder().decode(AgentSessionProviderHistoryRecovery.self, from: Data(malformed.utf8))
+            XCTAssertTrue(ledger.dispatchBaselines.isEmpty, malformedClaim)
+            XCTAssertEqual(ledger.unreadableDispatchBaselines.count, 1, malformedClaim)
+        }
+        // Positive control: the same shape with a valid lowercase digest decodes as a claim.
+        let valid = #"{"dispatchBaselines":[{"dispatchID":"\#(UUID().uuidString)","transcriptResetGeneration":0,"provider":"claude","conversationID":"c","completeLineOffset":0,"baselineCommitID":"\#(UUID().uuidString)","profile":"p","status":"captured","recordedAtMs":0,"outboundUserMessage":{"uuid":"\#(UUID().uuidString)","textSHA256":"\#(goodDigest)"}}]}"#
+        let validLedger = try JSONDecoder().decode(AgentSessionProviderHistoryRecovery.self, from: Data(valid.utf8))
+        XCTAssertEqual(validLedger.dispatchBaselines.first?.outboundUserMessage?.textSHA256, goodDigest)
+        XCTAssertTrue(validLedger.unreadableDispatchBaselines.isEmpty)
+    }
+
     // MARK: Association preflight (pure)
 
     private func observation(_ rows: [AgentProviderHistoryRow], conversationID: String = "conv-1") -> AgentProviderHistoryObservation {
@@ -559,7 +644,8 @@ final class AgentRecoveryReconciliationTests: XCTestCase {
     private func makeProducerHarness(
         windowID: Int,
         qualified isQualified: Bool = true,
-        codexFactory: CodexAgentModeCoordinator.CodexControllerFactory? = nil
+        codexFactory: CodexAgentModeCoordinator.CodexControllerFactory? = nil,
+        claudeController: LifecycleFakeNativeController? = nil
     ) async throws -> ProducerHarness {
         let storageURL = try RecoveryTestSupport.makeTemporaryRoot("AgentRecoveryBaselineWorkspace")
         let home = try RecoveryTestSupport.makeTemporaryRoot("AgentRecoveryBaselineHome")
@@ -586,13 +672,28 @@ final class AgentRecoveryReconciliationTests: XCTestCase {
         coordinator.startIfNeeded()
         guard await coordinator.awaitStartup() == .ready else { throw RecoveryLaneFixtureError.startupNotReady }
         let workspace = WorkspaceModel(name: "Baseline", repoPaths: [storageURL.path], customStoragePath: storageURL)
-        let viewModel = AgentModeViewModel(
-            testWindowID: windowID,
-            testWorkspacePath: storageURL.path,
-            testWorkspaceDirectory: storageURL,
-            codexControllerFactory: { _, _, _, _, _, _ in LifecycleNoopCodexController(recorder: LifecycleRecorder()) },
-            codexControllerFactoryWithComputerUse: codexFactory
-        )
+        let viewModel = if let claudeController {
+            // Step 4d1 composition: only the injected fake Claude controller (never a real process),
+            // with inert MCP policy/routing hooks, as the run-service lifecycle harness does.
+            AgentModeViewModel(
+                testWindowID: windowID,
+                testWorkspacePath: storageURL.path,
+                testWorkspaceDirectory: storageURL,
+                codexControllerFactory: { _, _, _, _, _, _ in LifecycleNoopCodexController(recorder: LifecycleRecorder()) },
+                codexControllerFactoryWithComputerUse: codexFactory,
+                claudeControllerFactory: { _, _, _, _ in claudeController },
+                connectionPolicyInstaller: { _, _, _, _, _, _, _, _, _, _, _, _, _, _, _ in },
+                mcpRunRoutingCleaner: { _, _, _ in }
+            )
+        } else {
+            AgentModeViewModel(
+                testWindowID: windowID,
+                testWorkspacePath: storageURL.path,
+                testWorkspaceDirectory: storageURL,
+                codexControllerFactory: { _, _, _, _, _, _ in LifecycleNoopCodexController(recorder: LifecycleRecorder()) },
+                codexControllerFactoryWithComputerUse: codexFactory
+            )
+        }
         viewModel.test_initializeRunService()
         viewModel.installRecoveryCoordinator(coordinator)
         viewModel.test_establishPersistenceWorkspace(workspace)
@@ -630,8 +731,12 @@ final class AgentRecoveryReconciliationTests: XCTestCase {
         let identity = AgentDispatchBaselineIdentity(dispatchID: UUID(), runAttemptID: UUID(), userItemIDs: [UUID()])
         let admission = await harness.viewModel.captureClaudeDispatchBaseline(identity, session: harness.session)
         XCTAssertEqual(admission, .notCaptured)
-        let admitted = await harness.viewModel.admitClaudeDispatchBaseline(identity, session: harness.session)
-        XCTAssertTrue(admitted, "production keeps the ordinary send")
+        let admitted = await harness.viewModel.admitClaudeDispatchBaseline(
+            identity,
+            outboundUserMessage: .init(uuid: identity.dispatchID, providerBoundText: "hi"),
+            session: harness.session
+        )
+        XCTAssertEqual(admitted, .admittedWithoutIdentity, "production keeps the ordinary send, with no outbound identity")
         XCTAssertEqual(harness.viewModel.test_recoveryClaudeHistoryAccessCount, 0, "zero history lookups or reads")
         XCTAssertNil(harness.session.providerHistoryRecovery, "zero extra writes")
         XCTAssertNil(harness.session.pendingHistoryImportCommit)
@@ -722,10 +827,230 @@ final class AgentRecoveryReconciliationTests: XCTestCase {
         let fileURL = try XCTUnwrap(files.first { $0.lastPathComponent == "AgentSession-\(sessionID.uuidString).json" })
         try FileManager.default.removeItem(at: fileURL)
         let identity = AgentDispatchBaselineIdentity(dispatchID: UUID(), runAttemptID: UUID(), userItemIDs: [UUID()])
-        let admitted = await harness.viewModel.admitClaudeDispatchBaseline(identity, session: harness.session)
-        XCTAssertFalse(admitted, "an enabled baseline that cannot be persisted sends zero bytes")
+        let admitted = await harness.viewModel.admitClaudeDispatchBaseline(identity, outboundUserMessage: nil, session: harness.session)
+        XCTAssertEqual(admitted, .denied, "an enabled baseline that cannot be persisted sends zero bytes")
         let cursor = await harness.cursor()
         XCTAssertNil(cursor, "the cursor never moves ahead of the session commit")
+    }
+
+    // MARK: Step 4d1 outbound user-message claim (host admission)
+
+    /// A complete identity whose constituents are canonical user items, admitted with a claim:
+    /// the claim is committed with the baseline's exact receipt before the UUID is returned; the
+    /// same dispatch re-admitted (a retry) gets no UUID and the baseline is unchanged.
+    func testNewlyCapturedBaselineCommitsTheOutboundClaimBeforeReturningItsUUIDAndARetryOmitsIt() async throws {
+        let harness = try await makeProducerHarness(windowID: 4980)
+        try harness.appendHistory([historyEntry("user", uuid: "u1", parent: nil, text: "hi")])
+        let first = AgentChatItem.user("Do it")
+        let second = AgentChatItem.user("And this")
+        harness.session.appendItem(first)
+        harness.session.appendItem(second)
+        let identity = AgentDispatchBaselineIdentity(
+            dispatchID: UUID(),
+            runAttemptID: UUID(),
+            userItemIDs: [first.id, second.id],
+            hasCompleteUserItems: true
+        )
+        let claim = AgentSessionProviderHistoryRecovery.DispatchBaseline.OutboundUserMessage(
+            uuid: identity.dispatchID,
+            providerBoundText: "Do it\n\nAnd this"
+        )
+
+        let admitted = await harness.viewModel.admitClaudeDispatchBaseline(identity, outboundUserMessage: claim, session: harness.session)
+
+        XCTAssertEqual(admitted, .admitted(outboundUserMessageUUID: identity.dispatchID))
+        let baseline = try XCTUnwrap(harness.session.providerHistoryRecovery?.dispatchBaseline(dispatchID: identity.dispatchID))
+        XCTAssertEqual(baseline.outboundUserMessage, claim)
+        XCTAssertEqual(baseline.userItemIDs, [first.id, second.id], "every ordered constituent is kept")
+        XCTAssertEqual(harness.session.committedHistoryImportID, baseline.baselineCommitID, "the claim's exact receipt committed first")
+        let persisted = try await harness.persisted()
+        XCTAssertEqual(
+            persisted?.providerHistoryRecovery?.dispatchBaseline(dispatchID: identity.dispatchID)?.outboundUserMessage,
+            claim,
+            "the claim is durable in the owner session before any byte"
+        )
+
+        let retried = await harness.viewModel.admitClaudeDispatchBaseline(identity, outboundUserMessage: claim, session: harness.session)
+        XCTAssertEqual(retried, .admittedWithoutIdentity, "a retry never reuses the UUID")
+        XCTAssertEqual(harness.session.providerHistoryRecovery?.dispatchBaselines.count, 1)
+        XCTAssertEqual(harness.session.providerHistoryRecovery?.dispatchBaseline(dispatchID: identity.dispatchID), baseline)
+    }
+
+    /// All-or-nothing: an incomplete identity, a constituent missing from (or not a user item in)
+    /// the canonical transcript, or a claim for another UUID captures the ordinary baseline with no
+    /// claim and no UUID; an existing legacy baseline is never upgraded.
+    func testIncompleteOrNonCanonicalConstituentsAndLegacyBaselinesNeverCarryAClaim() async throws {
+        let harness = try await makeProducerHarness(windowID: 4981)
+        try harness.appendHistory([historyEntry("user", uuid: "u1", parent: nil, text: "hi")])
+        let present = AgentChatItem.user("present")
+        let assistant = AgentChatItem.assistant("not a user item")
+        harness.session.appendItem(present)
+        harness.session.appendItem(assistant)
+        let cases: [(String, AgentDispatchBaselineIdentity, UUID?)] = [
+            ("incomplete", .init(dispatchID: UUID(), runAttemptID: UUID(), userItemIDs: [present.id]), nil),
+            ("missing constituent", .init(dispatchID: UUID(), runAttemptID: UUID(), userItemIDs: [present.id, UUID()], hasCompleteUserItems: true), nil),
+            ("non-user constituent", .init(dispatchID: UUID(), runAttemptID: UUID(), userItemIDs: [present.id, assistant.id], hasCompleteUserItems: true), nil),
+            ("duplicate constituent", .init(dispatchID: UUID(), runAttemptID: UUID(), userItemIDs: [present.id, present.id], hasCompleteUserItems: true), nil),
+            ("empty", .init(dispatchID: UUID(), runAttemptID: UUID(), userItemIDs: [], hasCompleteUserItems: true), nil),
+            ("foreign uuid", .init(dispatchID: UUID(), runAttemptID: UUID(), userItemIDs: [present.id], hasCompleteUserItems: true), UUID())
+        ]
+        for (label, identity, foreignUUID) in cases {
+            let claim = AgentSessionProviderHistoryRecovery.DispatchBaseline.OutboundUserMessage(
+                uuid: foreignUUID ?? identity.dispatchID,
+                providerBoundText: label
+            )
+            let admitted = await harness.viewModel.admitClaudeDispatchBaseline(identity, outboundUserMessage: claim, session: harness.session)
+            XCTAssertEqual(admitted, .admittedWithoutIdentity, label)
+            let baseline = harness.session.providerHistoryRecovery?.dispatchBaseline(dispatchID: identity.dispatchID)
+            XCTAssertEqual(baseline?.status, .captured, "\(label): the existing capture policy is unchanged")
+            XCTAssertNil(baseline?.outboundUserMessage, label)
+        }
+
+        // Legacy: recorded without a claim, later admitted with one: unchanged, no UUID.
+        let legacy = AgentDispatchBaselineIdentity(dispatchID: UUID(), runAttemptID: UUID(), userItemIDs: [present.id], hasCompleteUserItems: true)
+        let unclaimed = await harness.viewModel.captureClaudeDispatchBaseline(legacy, session: harness.session)
+        XCTAssertEqual(unclaimed, .committed)
+        let legacyBaseline = harness.session.providerHistoryRecovery?.dispatchBaseline(dispatchID: legacy.dispatchID)
+        let readmitted = await harness.viewModel.admitClaudeDispatchBaseline(
+            legacy,
+            outboundUserMessage: .init(uuid: legacy.dispatchID, providerBoundText: "present"),
+            session: harness.session
+        )
+        XCTAssertEqual(readmitted, .admittedWithoutIdentity)
+        XCTAssertEqual(harness.session.providerHistoryRecovery?.dispatchBaseline(dispatchID: legacy.dispatchID), legacyBaseline)
+        XCTAssertNil(legacyBaseline?.outboundUserMessage, "a legacy baseline is never upgraded")
+    }
+
+    /// Two admissions of one dispatch, forced to overlap: A passes its first baseline lookup and is
+    /// held in its history-home lookup while B records and commits the claimed boundary; released, A
+    /// re-checks before appending and joins as already recorded. One boundary; only B has the UUID.
+    func testConcurrentAdmissionsOfOneDispatchNeverBothMintTheClaim() async throws {
+        let harness = try await makeProducerHarness(windowID: 4982)
+        try harness.appendHistory([historyEntry("user", uuid: "u1", parent: nil, text: "hi")])
+        let item = AgentChatItem.user("once")
+        harness.session.appendItem(item)
+        let identity = AgentDispatchBaselineIdentity(dispatchID: UUID(), runAttemptID: UUID(), userItemIDs: [item.id], hasCompleteUserItems: true)
+        let claim = AgentSessionProviderHistoryRecovery.DispatchBaseline.OutboundUserMessage(uuid: identity.dispatchID, providerBoundText: "once")
+        let viewModel = harness.viewModel
+        let session = harness.session
+        let gate = LifecycleAsyncGate()
+        let lookups = LifecycleRecorder()
+        let homePath = harness.home.path
+        viewModel.test_recoveryClaudeHistoryHomes = { _ in
+            lookups.record("homes")
+            if lookups.events.count == 1 {
+                await gate.arriveAndWait()
+            }
+            return [homePath]
+        }
+
+        let first = Task { await viewModel.admitClaudeDispatchBaseline(identity, outboundUserMessage: claim, session: session) }
+        await gate.waitUntilArrived()
+        XCTAssertNil(session.providerHistoryRecovery?.dispatchBaseline(dispatchID: identity.dispatchID), "A passed its first lookup")
+        let second = await viewModel.admitClaudeDispatchBaseline(identity, outboundUserMessage: claim, session: session)
+        XCTAssertEqual(second, .admitted(outboundUserMessageUUID: identity.dispatchID), "B newly committed the claim")
+        await gate.release()
+        let firstResult = await first.value
+
+        XCTAssertEqual(firstResult, .admittedWithoutIdentity, "A re-checked after its awaits: already recorded, no UUID")
+        XCTAssertEqual(lookups.events.count, 2, "both admissions reached the history lookup")
+        let recorded = harness.session.providerHistoryRecovery?.dispatchBaselines.filter { $0.dispatchID == identity.dispatchID }
+        XCTAssertEqual(recorded?.count, 1, "one boundary per dispatch")
+        XCTAssertEqual(recorded?.first?.outboundUserMessage, claim)
+    }
+
+    /// Composition (review B P2-3): a real committed durable dispatch sent through the real Claude
+    /// coordinator, the real host baseline producer (no DEBUG admission override; qualified runner,
+    /// fixture history home, real owner-session persistence) and a managed-transport fake controller
+    /// that encodes with the production codec. The frame carries the dispatch's own ID, and the
+    /// durable baseline carries the claim over exactly the provider-bound text that was encoded.
+    func testRealCoordinatorDispatchCommitsTheClaimThroughTheHostProducerAndEncodesItsUUID() async throws {
+        let recorder = LifecycleRecorder()
+        let controller = LifecycleFakeNativeController(
+            recorder: recorder,
+            sessionID: conversationID,
+            invokesWriteAdmission: true,
+            outboundIdentityEligible: true
+        )
+        let harness = try await makeProducerHarness(windowID: 4984, claudeController: controller)
+        try harness.appendHistory([historyEntry("user", uuid: "u1", parent: nil, text: "hi")])
+        let session = harness.session
+        XCTAssertNil(harness.viewModel.test_claudeDispatchBaselineAdmission, "the real host producer decides")
+        let userItem = AgentChatItem.user("Ship it")
+        session.appendItem(userItem)
+        let admitted = try await harness.lane.admitQueued(AgentRecoveryAdmission(
+            binding: harness.lane.binding,
+            userItemID: userItem.id,
+            origin: .mcp,
+            target: .session,
+            original: RecoveryTestSupport.content("Ship it")
+        )).get()
+        let identity = AgentQueuedInputIdentity(receipt: admitted.receipt)
+        session.claudeController = controller
+        session.runState = .running
+        session.runID = UUID()
+        let ownership = session.beginRunAttempt(source: "test.p4d1.composition")
+        let handoff = try await AgentProviderHandoff.begin(
+            session: session,
+            constituents: [identity],
+            ownership: ownership,
+            processRunID: session.runID
+        ).get()
+        let dispatchID = try XCTUnwrap(handoff.dispatchBaselineIdentity?.dispatchID)
+
+        let sent = await harness.viewModel.claudeCoordinator.sendClaudeNativeMessage(
+            session: session,
+            text: "Ship it",
+            attachments: [],
+            handoff: handoff
+        )
+
+        XCTAssertTrue(sent, "\(recorder.events)")
+        let sentMessages = await controller.recordedSentMessages()
+        let providerBoundText = try XCTUnwrap(sentMessages.first)
+        XCTAssertEqual(sentMessages.count, 1)
+        let frames = await controller.recordedUserFrames()
+        XCTAssertEqual(frames.count, 1, "one admission, one write")
+        let frame = try XCTUnwrap(JSONSerialization.jsonObject(with: XCTUnwrap(frames.first)) as? [String: Any])
+        XCTAssertEqual(frame["uuid"] as? String, dispatchID.uuidString.lowercased())
+        let expectedClaim = AgentSessionProviderHistoryRecovery.DispatchBaseline.OutboundUserMessage(
+            uuid: dispatchID,
+            providerBoundText: providerBoundText
+        )
+        let baseline = try XCTUnwrap(session.providerHistoryRecovery?.dispatchBaseline(dispatchID: dispatchID))
+        XCTAssertEqual(baseline.status, .captured)
+        XCTAssertEqual(baseline.userItemIDs, [userItem.id])
+        XCTAssertEqual(baseline.outboundUserMessage, expectedClaim)
+        let persisted = try await harness.persisted()
+        XCTAssertEqual(
+            persisted?.providerHistoryRecovery?.dispatchBaseline(dispatchID: dispatchID)?.outboundUserMessage,
+            expectedClaim,
+            "the claim was durable in the owner session"
+        )
+    }
+
+    /// A claim whose receipt cannot be saved is refused (zero bytes); re-admitting that dispatch
+    /// joins the existing pending receipt and never returns the UUID.
+    func testClaimWhoseReceiptCannotBeSavedIsRefusedAndARetryNeverReturnsItsUUID() async throws {
+        let harness = try await makeProducerHarness(windowID: 4983)
+        try harness.appendHistory([historyEntry("user", uuid: "u1", parent: nil, text: "hi")])
+        let item = AgentChatItem.user("unsaved")
+        harness.session.appendItem(item)
+        _ = await harness.viewModel.flushSave(for: harness.session.tabID)
+        let sessionID = try XCTUnwrap(harness.session.activeAgentSessionID)
+        let files = try await harness.service.listAgentSessions(for: harness.workspace)
+        let fileURL = try XCTUnwrap(files.first { $0.lastPathComponent == "AgentSession-\(sessionID.uuidString).json" })
+        try FileManager.default.removeItem(at: fileURL)
+        let identity = AgentDispatchBaselineIdentity(dispatchID: UUID(), runAttemptID: UUID(), userItemIDs: [item.id], hasCompleteUserItems: true)
+        let claim = AgentSessionProviderHistoryRecovery.DispatchBaseline.OutboundUserMessage(uuid: identity.dispatchID, providerBoundText: "unsaved")
+
+        let refused = await harness.viewModel.admitClaudeDispatchBaseline(identity, outboundUserMessage: claim, session: harness.session)
+        XCTAssertEqual(refused, .denied)
+
+        let retried = await harness.viewModel.admitClaudeDispatchBaseline(identity, outboundUserMessage: claim, session: harness.session)
+        XCTAssertNotEqual(retried, .admitted(outboundUserMessageUUID: identity.dispatchID), "a retry never carries the UUID")
+        XCTAssertTrue(retried == .denied || retried == .admittedWithoutIdentity, "\(retried)")
+        XCTAssertEqual(harness.session.providerHistoryRecovery?.dispatchBaselines.count { $0.dispatchID == identity.dispatchID }, 1)
     }
 
     func testReconcileRefusesWithoutAssociationsAndChangesNothing() async throws {

@@ -2083,21 +2083,37 @@ package final class ClaudeAgentModeCoordinator {
                 // captured and committed first (gated OFF in production: no read, no write). A
                 // baseline that cannot be persisted refuses the write: zero bytes, proven not written.
                 let baselineIdentity = handoff.dispatchBaselineIdentity
-                let writeAdmission: @Sendable () async -> Bool = { @MainActor [weak self, weak session] in
+                // Outbound identity: the transport reports whether its launch is eligible; the claim
+                // (dispatch UUID + digest of exactly `providerBoundText`) is fixed before any await,
+                // and the UUID reaches the wire only when this admission newly committed it.
+                let writeAdmission: @Sendable (Bool) async -> AgentRuntimeWriteAdmission = { @MainActor [weak self, weak session] identityEligible in
                     guard let self, let session,
                           dispatchReservationIsCurrent(dispatchReservation, for: session),
                           sessionOwnsClaudeController(controller, for: session)
-                    else { return false }
+                    else { return .denied }
+                    var admission = AgentRuntimeWriteAdmission.admittedWithoutIdentity
                     if let viewModel {
-                        let admitted = await viewModel.admitClaudeDispatchBaseline(baselineIdentity, session: session)
-                        if !admitted {
+                        let claim = identityEligible ? baselineIdentity.map {
+                            AgentSessionProviderHistoryRecovery.DispatchBaseline.OutboundUserMessage(
+                                uuid: $0.dispatchID,
+                                providerBoundText: providerBoundText
+                            )
+                        } : nil
+                        admission = await viewModel.admitClaudeDispatchBaseline(
+                            baselineIdentity,
+                            outboundUserMessage: claim,
+                            session: session
+                        )
+                        if admission == .denied {
                             baselineRefusal.refused = true
-                            return false
+                            return .denied
                         }
                     }
                     // Revalidated after the baseline's awaits.
-                    return dispatchReservationIsCurrent(dispatchReservation, for: session)
-                        && sessionOwnsClaudeController(controller, for: session)
+                    guard dispatchReservationIsCurrent(dispatchReservation, for: session),
+                          sessionOwnsClaudeController(controller, for: session)
+                    else { return .denied }
+                    return admission
                 }
                 let turnID = try await AgentRuntimeOperationOwner.$session.withValue(runtimeOwner) {
                     try await AgentRuntimeOperationOwner.$writeAdmission.withValue(writeAdmission) {

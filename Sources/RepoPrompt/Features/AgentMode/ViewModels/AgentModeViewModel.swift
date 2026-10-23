@@ -693,7 +693,11 @@ final class AgentModeViewModel: ObservableObject {
         var test_recoveryClaudeHistoryAccessCount = 0
         /// Tests: replaces this host's Claude pre-byte baseline admission result (coordinator wiring
         /// tests; the producer itself is covered with a qualified runner). Production never sets it.
-        var test_claudeDispatchBaselineAdmission: (@MainActor (AgentDispatchBaselineIdentity?, AgentTabSession) async -> Bool)?
+        var test_claudeDispatchBaselineAdmission: (@MainActor (
+            AgentDispatchBaselineIdentity?,
+            AgentSessionProviderHistoryRecovery.DispatchBaseline.OutboundUserMessage?,
+            AgentTabSession
+        ) async -> AgentRuntimeWriteAdmission)?
     #endif
     /// Presenter for the discard confirmation required before a lifecycle operation destroys a tab
     /// whose retained local conversation cannot be saved (stale-reset recovery). `nil` refuses the

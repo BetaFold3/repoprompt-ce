@@ -125,6 +125,13 @@ final class AgentProviderHandoffTests: XCTestCase {
             processRunID: nil
         ).get()
         XCTAssertEqual(handoff.evidence.receipts.map(\.intent.intentID), ordered.map(\.intentID))
+        // Step 4d1: the baseline identity keeps every constituent's user item, in dispatch order,
+        // and states completeness explicitly (all three named, distinct).
+        let baselineIdentity = try XCTUnwrap(handoff.dispatchBaselineIdentity)
+        let orderedUserItems = ordered.compactMap(\.userItemID)
+        XCTAssertEqual(orderedUserItems.count, ordered.count)
+        XCTAssertEqual(baselineIdentity.userItemIDs, orderedUserItems)
+        XCTAssertTrue(baselineIdentity.hasCompleteUserItems)
 
         let ownership = session.beginRunAttempt(source: "test.acpBatch")
         let attached = await handoff.attachRunAttempt(ownership: ownership, processRunID: UUID(), session: session)
@@ -1051,8 +1058,11 @@ extension AgentModeRunServiceLifecycleTests {
 @MainActor
 private final class BaselineAdmissionProbe {
     var identities: [AgentDispatchBaselineIdentity?] = []
+    var claims: [AgentSessionProviderHistoryRecovery.DispatchBaseline.OutboundUserMessage?] = []
     var owners: [AgentRuntimeSessionScope] = []
-    var result = true
+    var result = AgentRuntimeWriteAdmission.admittedWithoutIdentity
+    /// When set, admits with the received claim's UUID (a newly committed claim).
+    var mintsReceivedClaim = false
     var gate: LifecycleAsyncGate?
 }
 
@@ -1081,10 +1091,14 @@ extension AgentModeRunServiceLifecycleTests {
 
     /// The existing route harness with a managed-transport fake (evaluates the task-local write
     /// admission before its recorded write) and the host's baseline admission observed.
-    private func makeBaselineRoute(_ name: String, text: String) async throws -> BaselineRoute {
+    private func makeBaselineRoute(_ name: String, text: String, eligible: Bool = false) async throws -> BaselineRoute {
         let fixture = try await RecoveryLaneFixture.make(name)
         let recorder = LifecycleRecorder()
-        let controller = LifecycleFakeNativeController(recorder: recorder, invokesWriteAdmission: true)
+        let controller = LifecycleFakeNativeController(
+            recorder: recorder,
+            invokesWriteAdmission: true,
+            outboundIdentityEligible: eligible
+        )
         let harness = makeHarness(recorder: recorder, claudeController: controller)
         let session = makeRunningClaudeSession(controller: controller)
         session.installPersistentSessionBinding(AgentPersistentSessionBindingIdentity(tabID: session.tabID, sessionID: fixture.sessionID))
@@ -1099,12 +1113,16 @@ extension AgentModeRunServiceLifecycleTests {
             processRunID: session.runID
         ).get()
         let probe = BaselineAdmissionProbe()
-        harness.host.test_claudeDispatchBaselineAdmission = { [probe, recorder] identity, _ in
+        harness.host.test_claudeDispatchBaselineAdmission = { [probe, recorder] identity, claim, _ in
             probe.identities.append(identity)
+            probe.claims.append(claim)
             probe.owners.append(AgentRuntimeOperationOwner.current)
             recorder.record("host:baseline")
             if let gate = probe.gate {
                 await gate.arriveAndWait()
+            }
+            if probe.mintsReceivedClaim, let claim {
+                return .admitted(outboundUserMessageUUID: claim.uuid)
             }
             return probe.result
         }
@@ -1153,9 +1171,9 @@ extension AgentModeRunServiceLifecycleTests {
     /// A baseline that cannot be committed refuses the write: zero bytes, a proven non-write (the
     /// same intent back to `queued`, not handed off), and the refusal is explained.
     func testClaudeBaselineCommitFailureRefusesTheWriteAsProvenNotWritten() async throws {
-        let route = try await makeBaselineRoute("p4-baseline-refused", text: "refused")
+        let route = try await makeBaselineRoute("p4-baseline-refused", text: "refused", eligible: true)
         defer { route.fixture.tearDown() }
-        route.probe.result = false
+        route.probe.result = .denied
 
         let sent = await route.send("refused")
         _ = await route.handoff.evidence.settled()
@@ -1180,10 +1198,12 @@ extension AgentModeRunServiceLifecycleTests {
     func testClaudeBaselineAdmissionSupersededOrCancelledWhileAwaitingWritesNothing() async throws {
         enum Cut: CaseIterable { case superseded, cancelled }
         for cut in Cut.allCases {
-            let route = try await makeBaselineRoute("p4-baseline-\(cut)", text: "\(cut)")
+            let route = try await makeBaselineRoute("p4-baseline-\(cut)", text: "\(cut)", eligible: true)
             defer { route.fixture.tearDown() }
             let gate = LifecycleAsyncGate()
             route.probe.gate = gate
+            // The host even mints a claim: a stale or cancelled write still sends zero bytes.
+            route.probe.mintsReceivedClaim = true
 
             let sending = Task { await route.send("\(cut)") }
             await gate.waitUntilArrived()
@@ -1205,6 +1225,8 @@ extension AgentModeRunServiceLifecycleTests {
             XCTAssertFalse(route.recorder.contains("claude:send"), "\(cut): no provider write")
             let sentMessages = await route.controller.recordedSentMessages()
             XCTAssertTrue(sentMessages.isEmpty, "\(cut)")
+            let frames = await route.controller.recordedUserFrames()
+            XCTAssertTrue(frames.isEmpty, "\(cut): zero bytes")
             XCTAssertEqual(route.handoff.observation, .notHandedOff, "\(cut)")
             let intent = await route.fixture.intent(route.identity)
             XCTAssertEqual(intent?.deliveryState, .queued, "\(cut)")
@@ -1232,7 +1254,8 @@ extension AgentModeRunServiceLifecycleTests {
         let expected = AgentDispatchBaselineIdentity(
             dispatchID: attempt.attemptID,
             runAttemptID: route.ownership.attemptID,
-            userItemIDs: [attempt.userItemID]
+            userItemIDs: [attempt.userItemID],
+            hasCompleteUserItems: true
         )
         XCTAssertEqual(route.probe.identities, [expected])
         XCTAssertEqual(route.handoff.dispatchBaselineIdentity, expected, "The identity is immutable after the write")
@@ -1240,6 +1263,60 @@ extension AgentModeRunServiceLifecycleTests {
         XCTAssertEqual(route.probe.owners, [expectedOwner], "The host's admission runs under the captured owner")
         let controllerOwners = await route.controller.recordedAdmissionOwners()
         XCTAssertEqual(controllerOwners, [expectedOwner])
+    }
+
+    /// Step 4d1: an eligible transport's single admission hands the host the claim fixed before any
+    /// await (the dispatch's own ID and the digest of exactly the provider-bound text it writes); the
+    /// frame carries that UUID only because this admission returned it.
+    func testClaudeOutboundIdentityRidesOnlyOnTheAdmissionThatCommittedItsClaim() async throws {
+        let route = try await makeBaselineRoute("p4d1-outbound-claim", text: "claimed", eligible: true)
+        defer { route.fixture.tearDown() }
+        route.probe.mintsReceivedClaim = true
+
+        let sent = await route.send("claimed")
+
+        XCTAssertTrue(sent)
+        let attempts = await route.fixture.attempts(for: route.identity)
+        let dispatchID = try XCTUnwrap(attempts.first?.attemptID)
+        let sentMessages = await route.controller.recordedSentMessages()
+        let providerBoundText = try XCTUnwrap(sentMessages.first)
+        XCTAssertEqual(sentMessages.count, 1)
+        XCTAssertEqual(
+            route.probe.claims,
+            [.init(uuid: dispatchID, providerBoundText: providerBoundText)],
+            "one admission; the claim is the dispatch ID over the exact provider-bound text"
+        )
+        let frames = await route.controller.recordedUserFrames()
+        XCTAssertEqual(frames.count, 1)
+        let frame = try XCTUnwrap(JSONSerialization.jsonObject(with: XCTUnwrap(frames.first)) as? [String: Any])
+        XCTAssertEqual(frame["uuid"] as? String, dispatchID.uuidString.lowercased())
+        let content = (frame["message"] as? [String: Any])?["content"] as? [[String: Any]]
+        XCTAssertEqual(content?.first?["text"] as? String, providerBoundText, "the digested text is the encoded text")
+    }
+
+    /// An ineligible transport offers no claim and writes the legacy frame, and an admission that
+    /// minted nothing (re-entered / already recorded) omits the UUID even for an eligible one.
+    func testClaudeOutboundIdentityIsOmittedWithoutAnEligibleLaunchOrANewClaim() async throws {
+        let ineligible = try await makeBaselineRoute("p4d1-outbound-ineligible", text: "plain", eligible: false)
+        defer { ineligible.fixture.tearDown() }
+        ineligible.probe.mintsReceivedClaim = true
+        let ineligibleSent = await ineligible.send("plain")
+        XCTAssertTrue(ineligibleSent)
+        XCTAssertEqual(ineligible.probe.claims, [nil], "no claim is offered for an ineligible launch")
+        let ineligibleFrames = await ineligible.controller.recordedUserFrames()
+        let plainFrame = try XCTUnwrap(JSONSerialization.jsonObject(with: XCTUnwrap(ineligibleFrames.first)) as? [String: Any])
+        XCTAssertNil(plainFrame["uuid"])
+
+        let recorded = try await makeBaselineRoute("p4d1-outbound-recorded", text: "again", eligible: true)
+        defer { recorded.fixture.tearDown() }
+        recorded.probe.result = .admittedWithoutIdentity
+        let recordedSent = await recorded.send("again")
+        XCTAssertTrue(recordedSent)
+        XCTAssertEqual(recorded.probe.claims.count, 1)
+        XCTAssertNotNil(recorded.probe.claims.first ?? nil, "the claim was offered")
+        let recordedFrames = await recorded.controller.recordedUserFrames()
+        let retryFrame = try XCTUnwrap(JSONSerialization.jsonObject(with: XCTUnwrap(recordedFrames.first)) as? [String: Any])
+        XCTAssertNil(retryFrame["uuid"], "no new claim committed by this admission: no UUID, never a fresh one")
     }
 }
 

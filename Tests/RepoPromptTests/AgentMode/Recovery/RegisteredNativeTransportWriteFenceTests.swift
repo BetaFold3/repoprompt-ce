@@ -447,7 +447,7 @@ final class RegisteredNativeTransportWriteFenceTests: XCTestCase {
         // The captured dispatch no longer owns the controller by the time the fence returns.
         let owner = owner
         do {
-            try await AgentRuntimeOperationOwner.$writeAdmission.withValue({ false }) {
+            try await AgentRuntimeOperationOwner.$writeAdmission.withValue({ _ in .denied }) {
                 try await AgentRuntimeOperationOwner.$session.withValue(owner) { _ = try await controller.sendUserMessage("hello") }
             }
             XCTFail("A write whose operation is no longer current must not be written")
@@ -456,10 +456,77 @@ final class RegisteredNativeTransportWriteFenceTests: XCTestCase {
         }
         XCTAssertTrue(transport.frames.isEmpty, "zero bytes from a superseded operation")
 
-        try await AgentRuntimeOperationOwner.$writeAdmission.withValue({ true }) {
+        try await AgentRuntimeOperationOwner.$writeAdmission.withValue({ _ in .admittedWithoutIdentity }) {
             try await AgentRuntimeOperationOwner.$session.withValue(owner) { _ = try await controller.sendUserMessage("hello") }
         }
         XCTAssertEqual(transport.frames.count, 1, "a current operation writes once")
+    }
+
+    /// Step 4d1: the user frame carries a lowercase top-level `uuid` only when the write's own single
+    /// admission returned one for an eligible launch (automatic command, first-party backend, no
+    /// backend-routing keys); an ordinary admission (a retry after `alreadyRecorded`) omits it and
+    /// keeps the legacy frame exactly; an ineligible launch never encodes one.
+    func testClaudeUserFrameCarriesTheAdmittedOutboundUUIDOnlyForAnEligibleLaunch() async throws {
+        await startRegistry()
+        let (launch, _) = try await committedLaunch(.claudeNative)
+        let controller = try makeClaude()
+        let transport = FixtureTransport()
+        await controller.test_attachSpawnedProcess(transport.process)
+        await controller.test_installRuntimeLaunch(launch, committed: true)
+        defer { Task { await controller.test_detachFixtureTransport() } }
+        let owner = owner
+        let eligibility = MessageLog()
+        func send(_ admission: AgentRuntimeWriteAdmission) async throws {
+            try await AgentRuntimeOperationOwner.$writeAdmission.withValue({ eligible in
+                eligibility.append("\(eligible)")
+                return admission
+            }) {
+                try await AgentRuntimeOperationOwner.$session.withValue(owner) { _ = try await controller.sendUserMessage("hello") }
+            }
+        }
+
+        // No launch identity: ineligible, so even an admitted UUID is never encoded.
+        try await send(.admitted(outboundUserMessageUUID: UUID()))
+        XCTAssertEqual(eligibility.messages, ["false"])
+        XCTAssertNil(transport.frames.last?["uuid"], "an unqualified launch never carries an outbound identity")
+
+        // An explicit command override is ineligible too.
+        await controller.test_beginSyntheticUsageLaunch(commandProvenance: .configuredOverride)
+        try await send(.admitted(outboundUserMessageUUID: UUID()))
+        XCTAssertEqual(eligibility.messages.last, "false")
+        XCTAssertNil(transport.frames.last?["uuid"])
+
+        // A routing key on an otherwise automatic first-party launch is ineligible.
+        await controller.test_beginSyntheticUsageLaunch(environmentOverrideKeys: ["ANTHROPIC_BASE_URL"])
+        try await send(.admitted(outboundUserMessageUUID: UUID()))
+        XCTAssertEqual(eligibility.messages.last, "false")
+        XCTAssertNil(transport.frames.last?["uuid"])
+
+        // Eligible launch, newly committed claim: exactly that UUID, lowercase, at the top level.
+        await controller.test_beginSyntheticUsageLaunch()
+        let claimed = UUID()
+        try await send(.admitted(outboundUserMessageUUID: claimed))
+        XCTAssertEqual(eligibility.messages.last, "true")
+        XCTAssertEqual(transport.frames.last?["uuid"] as? String, claimed.uuidString.lowercased())
+        XCTAssertNil((transport.frames.last?["message"] as? [String: Any])?["uuid"], "top-level only")
+
+        // Retry of the same dispatch (admission reports no new claim): no UUID, legacy keys exactly.
+        try await send(.admittedWithoutIdentity)
+        XCTAssertEqual(eligibility.messages.last, "true")
+        let retried = try XCTUnwrap(transport.frames.last)
+        XCTAssertNil(retried["uuid"], "a retry never reuses or mints an identity")
+        XCTAssertEqual(Set(retried.keys), ["type", "message", "parent_tool_use_id"])
+        XCTAssertEqual(transport.frames.count, 5, "one write per send, one admission each")
+        XCTAssertEqual(eligibility.messages.count, 5)
+
+        // Denied: zero bytes even for an eligible launch.
+        do {
+            try await send(.denied)
+            XCTFail("A denied admission must not be written")
+        } catch {
+            assertProcessNotRunning(error)
+        }
+        XCTAssertEqual(transport.frames.count, 5)
     }
 
     // MARK: Claude native: inbound binding, automatic replies, cancellation (re-review A05/A06/A12)
@@ -652,9 +719,9 @@ final class RegisteredNativeTransportWriteFenceTests: XCTestCase {
         let admissionGate = LifecycleAsyncGate()
         let owner = owner
         let send = Task {
-            try await AgentRuntimeOperationOwner.$writeAdmission.withValue({
+            try await AgentRuntimeOperationOwner.$writeAdmission.withValue({ _ in
                 await admissionGate.arriveAndWait()
-                return true
+                return .admitted(outboundUserMessageUUID: UUID())
             }) {
                 try await AgentRuntimeOperationOwner.$session.withValue(owner) { _ = try await controller.sendUserMessage("hello") }
             }
@@ -671,7 +738,7 @@ final class RegisteredNativeTransportWriteFenceTests: XCTestCase {
         XCTAssertTrue(transport.frames.isEmpty, "zero bytes after an admitted-but-cancelled check")
 
         // Contrast: the same admission without cancellation writes once.
-        try await AgentRuntimeOperationOwner.$writeAdmission.withValue({ true }) {
+        try await AgentRuntimeOperationOwner.$writeAdmission.withValue({ _ in .admittedWithoutIdentity }) {
             try await AgentRuntimeOperationOwner.$session.withValue(owner) { _ = try await controller.sendUserMessage("hello") }
         }
         XCTAssertEqual(transport.frames.count, 1)

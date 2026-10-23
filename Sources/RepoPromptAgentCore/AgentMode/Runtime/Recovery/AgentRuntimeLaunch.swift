@@ -48,14 +48,29 @@ package struct AgentRuntimeLaunchContext: Hashable {
 package enum AgentRuntimeOperationOwner {
     @TaskLocal package static var session: AgentRuntimeSessionScope?
     /// Optional recheck that the operation's owner (for example a dispatch reservation) still
-    /// authorizes execution. A managed transport evaluates it after its registry fence awaits and
-    /// immediately before the bytes; capturing the owner for attribution is not this check.
-    @TaskLocal package static var writeAdmission: (@Sendable () async -> Bool)?
+    /// authorizes execution. A managed transport evaluates it once, after its registry fence awaits
+    /// and immediately before the bytes; capturing the owner for attribution is not this check.
+    /// The argument is whether the writing transport's own launch is eligible to carry an outbound
+    /// user-message identity (evaluated by the transport before the await); the result is the one
+    /// verdict the transport acts on.
+    @TaskLocal package static var writeAdmission: (@Sendable (_ outboundIdentityEligible: Bool) async -> AgentRuntimeWriteAdmission)?
 
     /// The owner-captured scope of the running operation, `.unavailable` when none was bound.
     package static var current: AgentRuntimeSessionScope {
         session ?? .unavailable
     }
+}
+
+/// Verdict of one operation's `writeAdmission`.
+package enum AgentRuntimeWriteAdmission: Equatable {
+    /// The owner no longer authorizes the write: zero bytes (a proven non-write).
+    case denied
+    /// Write. `outboundUserMessageUUID` is non-nil only when this exact admission newly committed a
+    /// baseline claiming that UUID (built-in Claude only); every other admitted write omits it.
+    case admitted(outboundUserMessageUUID: UUID?)
+
+    /// An ordinary admitted write carrying no outbound identity.
+    package static let admittedWithoutIdentity = AgentRuntimeWriteAdmission.admitted(outboundUserMessageUUID: nil)
 }
 
 /// Where managed launch owners obtain launch ownership. Production resolves to

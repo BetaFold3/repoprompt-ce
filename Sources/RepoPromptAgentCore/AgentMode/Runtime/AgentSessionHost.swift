@@ -93,11 +93,16 @@ package struct AgentDispatchBaselineIdentity: Equatable {
     package let runAttemptID: UUID?
     /// Ordered local user items of the dispatch's constituents.
     package let userItemIDs: [UUID]
+    /// Whether `userItemIDs` is the dispatch's complete constituent list: every constituent named
+    /// its user item, none was dropped, the list is nonempty and duplicate-free. Only a complete
+    /// identity can carry an outbound user-message claim (baseline capture itself is unchanged).
+    package let hasCompleteUserItems: Bool
 
-    package init(dispatchID: UUID, runAttemptID: UUID?, userItemIDs: [UUID]) {
+    package init(dispatchID: UUID, runAttemptID: UUID?, userItemIDs: [UUID], hasCompleteUserItems: Bool = false) {
         self.dispatchID = dispatchID
         self.runAttemptID = runAttemptID
         self.userItemIDs = userItemIDs
+        self.hasCompleteUserItems = hasCompleteUserItems
     }
 }
 
@@ -140,17 +145,27 @@ package protocol ClaudeAgentModeCoordinatorHost: AgentSessionHost {
     func updatePermissionBindingState(from session: AgentTabSession, syncUI: Bool) -> Bool
     /// Lossless restart Phase 4: inside the managed-transport write admission, immediately before
     /// a Claude dispatch's user bytes, capture and commit that dispatch's pre-send history baseline.
-    /// `false` = the enabled baseline could not be persisted (zero bytes are sent). With history
-    /// reconciliation unqualified (production) it returns `true` without any read or write.
-    func admitClaudeDispatchBaseline(_ identity: AgentDispatchBaselineIdentity?, session: AgentTabSession) async -> Bool
+    /// `.denied` = the enabled baseline could not be persisted (zero bytes are sent). With history
+    /// reconciliation unqualified (production) it admits without any read or write. The admitted
+    /// UUID is `outboundUserMessage.uuid` only when THIS call newly committed a captured baseline
+    /// carrying that claim (complete canonical constituents); otherwise it is omitted.
+    func admitClaudeDispatchBaseline(
+        _ identity: AgentDispatchBaselineIdentity?,
+        outboundUserMessage: AgentSessionProviderHistoryRecovery.DispatchBaseline.OutboundUserMessage?,
+        session: AgentTabSession
+    ) async -> AgentRuntimeWriteAdmission
 }
 
 /// Mirrors the default of `AgentModeViewModel.updatePermissionBindingState` (`syncUI: true`).
 @MainActor
 extension ClaudeAgentModeCoordinatorHost {
     /// Hosts without recovery capture nothing and admit the ordinary send.
-    package func admitClaudeDispatchBaseline(_: AgentDispatchBaselineIdentity?, session _: AgentTabSession) async -> Bool {
-        true
+    package func admitClaudeDispatchBaseline(
+        _: AgentDispatchBaselineIdentity?,
+        outboundUserMessage _: AgentSessionProviderHistoryRecovery.DispatchBaseline.OutboundUserMessage?,
+        session _: AgentTabSession
+    ) async -> AgentRuntimeWriteAdmission {
+        .admittedWithoutIdentity
     }
 
     @discardableResult

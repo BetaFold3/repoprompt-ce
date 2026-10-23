@@ -818,6 +818,9 @@ extension AgentModeViewModel {
         case alreadyRecorded
         /// Captured, committed in a zero-row session receipt, then the cursor was seeded if absent.
         case committed
+        /// `committed`, and this call's baseline carries the outbound user-message claim for this
+        /// UUID (its exact receipt committed and the session was still current afterwards).
+        case committedWithOutboundUserMessage(UUID)
         /// No boundary can be taken before the bytes; recorded, and the ordinary send proceeds.
         case unsupported(String)
         /// The enabled baseline could not be persisted (or the session changed): zero bytes.
@@ -829,13 +832,26 @@ extension AgentModeViewModel {
         }
     }
 
-    func admitClaudeDispatchBaseline(_ identity: AgentDispatchBaselineIdentity?, session: AgentTabSession) async -> Bool {
+    func admitClaudeDispatchBaseline(
+        _ identity: AgentDispatchBaselineIdentity?,
+        outboundUserMessage: AgentSessionProviderHistoryRecovery.DispatchBaseline.OutboundUserMessage?,
+        session: AgentTabSession
+    ) async -> AgentRuntimeWriteAdmission {
         #if DEBUG
             if let override = test_claudeDispatchBaselineAdmission {
-                return await override(identity, session)
+                return await override(identity, outboundUserMessage, session)
             }
         #endif
-        return await captureClaudeDispatchBaseline(identity, session: session).admitsWrite
+        switch await captureClaudeDispatchBaseline(identity, outboundUserMessage: outboundUserMessage, session: session) {
+        case .refused:
+            return .denied
+        case let .committedWithOutboundUserMessage(uuid):
+            return .admitted(outboundUserMessageUUID: uuid)
+        case .notCaptured, .alreadyRecorded, .committed, .unsupported:
+            // Re-entered (including a joined pending receipt), legacy, unsupported or ungated: the
+            // ordinary send, never reusing or minting an identity.
+            return .admittedWithoutIdentity
+        }
     }
 
     /// Captures the dispatch's pre-send boundary (validated `.baseline` read off the main actor),
@@ -845,6 +861,7 @@ extension AgentModeViewModel {
     /// is recorded as unsupported (never backfilled later) and the send proceeds ordinarily.
     func captureClaudeDispatchBaseline(
         _ identity: AgentDispatchBaselineIdentity?,
+        outboundUserMessage: AgentSessionProviderHistoryRecovery.DispatchBaseline.OutboundUserMessage? = nil,
         session: AgentTabSession
     ) async -> RecoveryDispatchBaselineAdmission {
         // Production OFF: zero history reads, zero extra writes, ordinary send behavior.
@@ -856,7 +873,11 @@ extension AgentModeViewModel {
                 && lane.binding.transcriptResetGeneration == generation
                 && session.providerSessionID == conversationID
         }
-        if let existing = session.providerHistoryRecovery?.dispatchBaseline(dispatchID: identity.dispatchID) {
+        /// A dispatch that already has its boundary never records (or claims) another one.
+        func admitRecorded() async -> RecoveryDispatchBaselineAdmission? {
+            guard let existing = session.providerHistoryRecovery?.dispatchBaseline(dispatchID: identity.dispatchID) else {
+                return nil
+            }
             guard existing.status == .captured, let commitID = existing.baselineCommitID,
                   session.pendingHistoryImportCommit?.importID == commitID
             else { return .alreadyRecorded }
@@ -865,7 +886,11 @@ extension AgentModeViewModel {
                 ? .alreadyRecorded
                 : .refused("The pre-send history position couldn't be saved.")
         }
-        func recordUnsupported(_ reason: String, conversationID: String?) -> RecoveryDispatchBaselineAdmission {
+        if let recorded = await admitRecorded() { return recorded }
+        func recordUnsupported(_ reason: String, conversationID: String?) async -> RecoveryDispatchBaselineAdmission {
+            // Re-checked after this admission's awaits: a concurrent admission of the same dispatch
+            // may have recorded its boundary meanwhile.
+            if let recorded = await admitRecorded() { return recorded }
             var ledger = session.providerHistoryRecovery ?? AgentSessionProviderHistoryRecovery()
             ledger.dispatchBaselines.append(.init(
                 dispatchID: identity.dispatchID,
@@ -887,12 +912,12 @@ extension AgentModeViewModel {
             return .unsupported(reason)
         }
         guard let conversationID = session.providerSessionID, !conversationID.isEmpty else {
-            return recordUnsupported("no Claude conversation identity before sending", conversationID: nil)
+            return await recordUnsupported("no Claude conversation identity before sending", conversationID: nil)
         }
         let roots = await recoveryClaudeHistoryRoots(conversationID: conversationID)
         guard stillCurrent(conversationID) else { return .refused(Self.recoveryActionStaleText) }
         guard !roots.isEmpty else {
-            return recordUnsupported("Claude history location unknown", conversationID: conversationID)
+            return await recordUnsupported("Claude history location unknown", conversationID: conversationID)
         }
         let read = await Self.readClaudeHistory(RecoveryHistoryReadInput(
             conversationID: conversationID,
@@ -906,9 +931,9 @@ extension AgentModeViewModel {
         case let .candidate(value):
             candidate = value
         case let .unavailable(reason):
-            return recordUnsupported(Self.recoveryHistoryText(reason), conversationID: conversationID)
+            return await recordUnsupported(Self.recoveryHistoryText(reason), conversationID: conversationID)
         case .unsupported:
-            return recordUnsupported("Claude history contains records this version doesn't support", conversationID: conversationID)
+            return await recordUnsupported("Claude history contains records this version doesn't support", conversationID: conversationID)
         }
         // A pending receipt (a reset or an earlier import still saving) is flushed first; one
         // that cannot commit leaves no room for this boundary: zero bytes.
@@ -918,6 +943,12 @@ extension AgentModeViewModel {
                   session.pendingTranscriptResetReceipt == nil,
                   session.pendingHistoryImportCommit == nil
             else { return .refused("An earlier save of this session is still pending.") }
+        }
+        // Re-checked after every read/save await above and immediately before the append (no
+        // suspension between): two admissions of one dispatch can never both record a boundary.
+        if let recorded = await admitRecorded() { return recorded }
+        let claim = outboundUserMessage.flatMap {
+            Self.qualifiedOutboundUserMessageClaim($0, identity: identity, session: session)
         }
         let commitID = UUID()
         let now = Date()
@@ -940,7 +971,8 @@ extension AgentModeViewModel {
             baselineCommitID: commitID,
             profileName: ClaudeSessionHistoryReader.profileName,
             status: .captured,
-            recordedAt: now
+            recordedAt: now,
+            outboundUserMessage: claim
         )
         var ledger = session.providerHistoryRecovery ?? AgentSessionProviderHistoryRecovery()
         ledger.dispatchBaselines.append(baseline)
@@ -957,7 +989,33 @@ extension AgentModeViewModel {
         }
         // Cursor second, and only when none exists: the session baseline is the authority.
         _ = await lane.commitHistoryCursor(expectedPreviousImportID: nil, cursor: cursor)
-        return .committed
+        // The claim's exact receipt committed above; it reaches the wire only while still current.
+        guard let claim, stillCurrent(conversationID),
+              session.providerHistoryRecovery?.dispatchBaseline(dispatchID: identity.dispatchID)?.outboundUserMessage == claim
+        else { return .committed }
+        return .committedWithOutboundUserMessage(claim.uuid)
+    }
+
+    /// The candidate claim, only for a complete dispatch identity whose every ordered constituent is
+    /// exactly one canonical user item of this session (all-or-nothing); otherwise no claim and the
+    /// ordinary send. The claim UUID must be the dispatch's own ID.
+    private static func qualifiedOutboundUserMessageClaim(
+        _ candidate: AgentSessionProviderHistoryRecovery.DispatchBaseline.OutboundUserMessage,
+        identity: AgentDispatchBaselineIdentity,
+        session: AgentTabSession
+    ) -> AgentSessionProviderHistoryRecovery.DispatchBaseline.OutboundUserMessage? {
+        let constituents = identity.userItemIDs
+        guard candidate.uuid == identity.dispatchID, identity.hasCompleteUserItems, !constituents.isEmpty,
+              Set(constituents).count == constituents.count
+        else { return nil }
+        let wanted = Set(constituents)
+        var userMatches: [UUID: Int] = [:]
+        for item in session.items where wanted.contains(item.id) {
+            guard item.kind == .user else { return nil }
+            userMatches[item.id, default: 0] += 1
+        }
+        guard constituents.allSatisfy({ userMatches[$0] == 1 }) else { return nil }
+        return candidate
     }
 
     /// A zero-row baseline receipt is a real commit: saved through the owner save path and verified.
