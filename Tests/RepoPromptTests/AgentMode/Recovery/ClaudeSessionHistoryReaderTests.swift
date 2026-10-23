@@ -666,6 +666,70 @@ final class ClaudeSessionHistoryReaderTests: XCTestCase {
         XCTAssertTrue(baseline.userMessageEntries.isEmpty)
     }
 
+    /// Step 4d3b parity: the live classifier's identity and proof for one O19 assistant text equal
+    /// what this reader projects for the same native entry from the history file (same deterministic
+    /// local ID, complete-envelope digest, ledger key and canonical row).
+    func testLiveQualifiedTextMatchesTheHistoryProjectionOfTheSameEntry() throws {
+        let value = try XCTUnwrap(candidate(read(jsonl(o19Turn()), mode: fromStart)))
+        let historyRow = try XCTUnwrap(value.rows.first { $0.kind == .assistantText })
+        var state = ClaudeLiveTranscriptProducerState(launchToken: UUID())
+        state.markEligible()
+        let outbound = UUID()
+        state.noteOutbound(uuid: outbound, text: "Reply with exactly: ALPHA-7")
+        let replay: [String: Any] = [
+            "type": "user", "isReplay": true, "parent_tool_use_id": NSNull(), "session_id": sessionID,
+            "uuid": outbound.uuidString.lowercased(), "message": ["role": "user", "content": "Reply with exactly: ALPHA-7"]
+        ]
+        let live: [String: Any] = [
+            "type": "assistant", "uuid": "a1", "session_id": sessionID, "parent_tool_use_id": NSNull(),
+            "message": [
+                "id": "msg_live", "type": "message", "role": "assistant", "model": "claude-sonnet-5",
+                "content": [["type": "text", "text": "ALPHA-7"]], "stop_reason": NSNull(), "stop_sequence": NSNull()
+            ] as [String: Any]
+        ]
+        let replayData = try JSONSerialization.data(withJSONObject: replay)
+        let liveData = try JSONSerialization.data(withJSONObject: live)
+        XCTAssertEqual(state.classify(envelope: replayData, translated: [], turnInFlight: true), .benign)
+        let outcome = state.classify(
+            envelope: liveData,
+            translated: [AIStreamResult(type: "content", text: "ALPHA-7")],
+            turnInFlight: true
+        )
+        guard case let .attach(_, evidence) = outcome, case let .completeText(complete) = evidence.kind else {
+            return XCTFail("expected an attachment, got \(outcome)")
+        }
+        XCTAssertEqual(complete.localItemID, historyRow.localItemID)
+        XCTAssertEqual(complete.envelopeDigest, historyRow.envelopeDigest)
+        XCTAssertEqual(
+            complete.ledgerKey,
+            AgentSessionProviderHistoryRecovery.rowKey(
+                providerRaw: Reader.providerRaw,
+                nativeSessionID: sessionID,
+                nativeEntryID: historyRow.nativeEntryID,
+                rowKindRaw: historyRow.kind.rawValue,
+                ordinal: historyRow.ordinal
+            )
+        )
+        let projected = try XCTUnwrap(Reader.item(for: historyRow))
+        let canonical = try XCTUnwrap(complete.canonicalItem)
+        XCTAssertEqual(canonical.id, projected.id)
+        XCTAssertEqual(canonical.kind, projected.kind)
+        XCTAssertEqual(canonical.text, projected.text)
+        XCTAssertEqual(canonical.isStreaming, projected.isStreaming)
+        // A known ledger entry with that proof is accepted by the reader; without it, refused.
+        let proven = AgentSessionProviderHistoryRecovery(nativeItems: [complete.ledgerItem])
+        XCTAssertNotNil(candidate(read(jsonl(o19Turn()), mode: fromStart, ledger: proven)))
+        var invalidated = proven
+        XCTAssertTrue(invalidated.invalidateClaudeEnvelopeProofs())
+        XCTAssertEqual(invalidated.nativeItems.map(\.key), proven.nativeItems.map(\.key))
+        XCTAssertEqual(invalidated.nativeItems.map(\.localItemID), proven.nativeItems.map(\.localItemID))
+        XCTAssertEqual(
+            read(jsonl(o19Turn()), mode: fromStart, ledger: invalidated),
+            .unsupported(.ledgerConflict("a1")),
+            "a known entry without proof refuses"
+        )
+    }
+
     func testDirectChainProjectsInAncestorOrderWithOriginalIDsAndOrdinals() throws {
         // Two turns: the second user entry continues through the first turn's trailing attachment
         // (or, alternatively, from the assistant with that attachment as a side branch). File order

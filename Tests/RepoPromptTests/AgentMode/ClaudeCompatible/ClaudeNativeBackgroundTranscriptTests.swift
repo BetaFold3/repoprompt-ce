@@ -1213,6 +1213,316 @@ extension AgentModeRunServiceLifecycleTests {
         XCTAssertEqual(session.items.first { $0.text == "next" }?.id, nextRow.id, "the associated row is preserved")
         XCTAssertTrue(session.backgroundCurrentAssistantRowIDs.isEmpty, "the background pointer is retired")
     }
+
+    // MARK: Step 4d3b canonical owner of qualified live output (inactive)
+
+    private func liveComplete(_ entry: String, text: String, conversation: String = "conv-1") throws -> ClaudeLiveTranscriptCompleteText {
+        let row = try XCTUnwrap(ClaudeSessionHistoryReader.singleTextAssistantRow(nativeSessionID: conversation, nativeEntryID: entry, text: text))
+        return try ClaudeLiveTranscriptCompleteText(
+            nativeSessionID: conversation,
+            nativeEntryID: entry,
+            localItemID: XCTUnwrap(row.localItemID),
+            text: text,
+            envelopeDigest: row.envelopeDigest
+        )
+    }
+
+    /// The translated `content` result carrying complete-text evidence, as the producer attaches it.
+    private func carried(_ complete: ClaudeLiveTranscriptCompleteText, producer: UUID) -> AIStreamResult {
+        var result = AIStreamResult(type: "content", text: complete.text)
+        result.claudeLiveTranscriptEvidence = .init(producerLaunchToken: producer, kind: .completeText(complete))
+        return result
+    }
+
+    /// A metadata-only carrier.
+    private func carrier(_ kind: ClaudeLiveTranscriptEvidence.Kind, producer: UUID) -> AIStreamResult {
+        var result = AIStreamResult(type: AIStreamResult.lifecycleType, text: nil)
+        result.claudeLiveTranscriptEvidence = .init(producerLaunchToken: producer, kind: kind)
+        return result
+    }
+
+    /// The harness is returned so its run service stays alive for the test's duration.
+    private func makeLiveOwnerSession() -> (AgentTabSession, LifecycleHarness, UUID, UUID) {
+        let session = AgentTabSession(tabID: UUID())
+        session.selectedAgent = .claudeCode
+        var host: AgentModeViewModel?
+        let harness = makeHarness(
+            recorder: LifecycleRecorder(),
+            flushPendingAssistantDelta: { host?.flushPendingAssistantDelta($0) }
+        )
+        host = harness.host
+        harness.host.test_installLiveSession(session)
+        session.appendItem(AgentChatItem.user("Reply with exactly: ALPHA-7", sequenceIndex: session.nextSequenceIndex))
+        let runID = UUID()
+        session.runID = runID
+        session.runState = .running
+        let attemptID = session.beginRunAttempt(source: "test.liveOwner").attemptID
+        return (session, harness, runID, attemptID)
+    }
+
+    /// Step 4d3b: an accepted complete text flushes older buffered run text, then appends the reader's
+    /// canonical row (non-streaming, deterministic ID) and its ledger entry together; a duplicate is a
+    /// no-op; a later equal `final_content` and an agreeing result change nothing. A changed text under
+    /// the same key preserves the old row, shows the incoming text unidentified, refuses the producer
+    /// and invalidates every Claude proof; a proof is never healed by a new producer.
+    func testClaudeLiveCompleteTextInsertsCanonicalRowOnceAndConflictsInvalidateProofs() async throws {
+        let (session, harness, runID, attemptID) = makeLiveOwnerSession()
+        let host = harness.host
+        defer {
+            host.clearPendingAssistantDelta(session)
+            withExtendedLifetime(harness) {}
+        }
+        func run(_ result: AIStreamResult) async {
+            await host.test_handleStreamResult(result, session: session, runID: runID, runAttemptID: attemptID)
+        }
+        let producer = UUID()
+        let complete = try liveComplete("a1", text: "ALPHA-7")
+
+        await run(AIStreamResult(type: "content", text: "Earlier"))
+        XCTAssertEqual(session.pendingAssistantDelta, "Earlier", "buffered generic text")
+        session.isDirty = false
+        await run(carried(complete, producer: producer))
+        XCTAssertEqual(session.pendingAssistantDelta, "")
+        XCTAssertEqual(session.items.map(\.kind), [.user, .assistant, .assistant])
+        XCTAssertEqual(session.items[1].text, "Earlier", "the older buffer is materialized first")
+        XCTAssertFalse(session.items[1].isStreaming, "and its segment ended")
+        let canonical = try XCTUnwrap(session.items.last)
+        XCTAssertEqual(canonical.id, complete.localItemID)
+        XCTAssertEqual(canonical.text, "ALPHA-7")
+        XCTAssertFalse(canonical.isStreaming)
+        XCTAssertEqual(session.providerHistoryRecovery?.nativeItems, [complete.ledgerItem])
+        XCTAssertNil(session.providerHistoryRecovery?.lastImportCommit, "no import receipt")
+        XCTAssertTrue(session.isDirty)
+
+        let snapshot = session.items
+        let ledger = session.providerHistoryRecovery
+        await run(carried(complete, producer: producer))
+        await run(AIStreamResult(type: "final_content", text: "ALPHA-7"))
+        await run(carrier(.resultAgreement(localItemID: complete.localItemID, text: "ALPHA-7"), producer: producer))
+        host.flushPendingAssistantDelta(session)
+        XCTAssertEqual(session.items, snapshot, "duplicate, equal final text and agreement are no-ops")
+        XCTAssertEqual(session.providerHistoryRecovery, ledger)
+        XCTAssertFalse(session.claudeLiveTranscriptRefusedProducers.contains(producer))
+
+        // Changed text under the same native key: preserved, displayed unidentified, refused.
+        let changed = try liveComplete("a1", text: "ALPHA-8")
+        await run(carried(changed, producer: producer))
+        host.flushPendingAssistantDelta(session)
+        XCTAssertEqual(session.items.first { $0.id == complete.localItemID }?.text, "ALPHA-7", "the old row is preserved")
+        XCTAssertEqual(session.items.last?.text, "ALPHA-8")
+        XCTAssertNotEqual(session.items.last?.id, changed.localItemID, "the incoming text is unidentified")
+        XCTAssertTrue(session.claudeLiveTranscriptRefusedProducers.contains(producer))
+        let invalidated = try XCTUnwrap(session.providerHistoryRecovery?.nativeItems.first)
+        XCTAssertNil(invalidated.envelopeDigest, "the proof is invalidated")
+        XCTAssertEqual(invalidated.key, complete.ledgerKey, "key and local item are kept")
+        XCTAssertEqual(invalidated.localItemID, complete.localItemID)
+        // Legacy display behavior, not under test here: without ending the segment, the next refused
+        // (unidentified) complete text would merge into this still-streaming legacy row.
+        host.endActiveAssistantSegment(session)
+
+        // A new producer never heals the conversation: its complete text shows unidentified.
+        let later = try liveComplete("a2", text: "BRAVO")
+        await run(carried(later, producer: UUID()))
+        host.flushPendingAssistantDelta(session)
+        XCTAssertEqual(session.items.last?.text, "BRAVO")
+        XCTAssertNotEqual(session.items.last?.id, later.localItemID)
+        XCTAssertEqual(session.providerHistoryRecovery?.nativeItems.count, 1, "no new ledger entry")
+        XCTAssertNil(session.providerHistoryRecovery?.nativeItems.first?.envelopeDigest, "never healed")
+    }
+
+    /// Step 4d3b: disqualification (or a disagreeing result, a background complete text, or an ID
+    /// collision) refuses the producer and clears every Claude proof, typed and raw, keeping keys,
+    /// local items, other members, rows and receipts; a refused producer never qualifies later.
+    func testClaudeLiveRefusalsInvalidateProofsAndRefusedProducersNeverRequalify() async throws {
+        let (session, harness, runID, attemptID) = makeLiveOwnerSession()
+        let host = harness.host
+        defer {
+            host.clearPendingAssistantDelta(session)
+            withExtendedLifetime(harness) {}
+        }
+        func run(_ result: AIStreamResult) async {
+            await host.test_handleStreamResult(result, session: session, runID: runID, runAttemptID: attemptID)
+        }
+        let receipt = AgentSessionProviderHistoryRecovery.ImportCommit(
+            importID: UUID(), providerRaw: "claude", conversationID: "conv-1", committedAt: Date(), rowCount: 0, target: nil
+        )
+        let proven = AgentSessionProviderHistoryRecovery.NativeItem(
+            providerRaw: "claude", nativeSessionID: "conv-0", nativeEntryID: "p1", rowKindRaw: "assistantText", ordinal: 0,
+            localItemID: UUID(), envelopeDigest: String(repeating: "a", count: 64), extras: ["future": .bool(true)]
+        )
+        let malformed = AgentSessionProviderHistoryRecovery.NativeItem(
+            providerRaw: "claude", nativeSessionID: "conv-0", nativeEntryID: "p2", rowKindRaw: "assistantText", ordinal: 0,
+            localItemID: UUID(), extras: ["envelopeDigest": .string("NOT-HEX"), "future": .bool(true)]
+        )
+        let codex = AgentSessionProviderHistoryRecovery.NativeItem(
+            providerRaw: "codex", nativeSessionID: "t1", nativeEntryID: "i1", rowKindRaw: "assistantText", ordinal: 0,
+            localItemID: UUID(), envelopeDigest: String(repeating: "b", count: 64)
+        )
+        session.providerHistoryRecovery = AgentSessionProviderHistoryRecovery(
+            nativeItems: [proven, malformed, codex], lastImportCommit: receipt, extras: ["ledgerFuture": .string("kept")]
+        )
+        let itemsBefore = session.items
+        session.isDirty = false
+
+        let producer = UUID()
+        await run(carrier(.disqualified(.unsupportedPayload), producer: producer))
+        XCTAssertEqual(session.items, itemsBefore, "no transcript change")
+        XCTAssertTrue(session.isDirty, "a ledger-only change is marked dirty")
+        let ledger = try XCTUnwrap(session.providerHistoryRecovery)
+        XCTAssertEqual(ledger.nativeItems.map(\.key), [proven.key, malformed.key, codex.key])
+        XCTAssertEqual(ledger.nativeItems.map(\.localItemID), [proven.localItemID, malformed.localItemID, codex.localItemID])
+        XCTAssertEqual(ledger.nativeItems.map(\.envelopeDigest), [nil, nil, codex.envelopeDigest], "Codex rows untouched")
+        XCTAssertEqual(ledger.nativeItems[0].extras, ["future": .bool(true)])
+        XCTAssertEqual(ledger.nativeItems[1].extras, ["future": .bool(true)], "the raw proof member is cleared too")
+        XCTAssertEqual(ledger.lastImportCommit, receipt)
+        XCTAssertEqual(ledger.extras, ["ledgerFuture": .string("kept")])
+
+        // The refused producer never qualifies, even in a conversation with no proofless row.
+        let fresh = try liveComplete("f1", text: "FRESH", conversation: "conv-2")
+        await run(carried(fresh, producer: producer))
+        host.flushPendingAssistantDelta(session)
+        XCTAssertEqual(session.items.last?.text, "FRESH")
+        XCTAssertNotEqual(session.items.last?.id, fresh.localItemID)
+        XCTAssertFalse(session.providerHistoryRecovery?.nativeItems.contains { $0.nativeSessionID == "conv-2" } ?? true)
+
+        // A disagreeing result refuses its producer (here: no identified row exists).
+        let second = UUID()
+        await run(carrier(.resultAgreement(localItemID: UUID(), text: "X"), producer: second))
+        XCTAssertTrue(session.claudeLiveTranscriptRefusedProducers.contains(second))
+
+        // A background complete text is never accepted: shown as background output and refused.
+        let third = UUID()
+        let between = try liveComplete("b1", text: "BETWEEN", conversation: "conv-3")
+        await host.test_handleBackgroundNativeStreamResult(carried(between, producer: third), session: session)
+        XCTAssertEqual(session.items.last?.text, "BETWEEN")
+        XCTAssertNotEqual(session.items.last?.id, between.localItemID)
+        XCTAssertTrue(session.claudeLiveTranscriptRefusedProducers.contains(third))
+
+        // A local row already holding the deterministic ID without its ledger entry is a collision.
+        let fourth = UUID()
+        let colliding = try liveComplete("c1", text: "COLLIDE", conversation: "conv-4")
+        session.appendItem(AgentChatItem.assistant("Other").replacingID(colliding.localItemID))
+        await run(carried(colliding, producer: fourth))
+        host.flushPendingAssistantDelta(session)
+        XCTAssertEqual(session.items.first { $0.id == colliding.localItemID }?.text, "Other", "the old row is preserved")
+        XCTAssertEqual(session.items.last?.text, "COLLIDE")
+        XCTAssertTrue(session.claudeLiveTranscriptRefusedProducers.contains(fourth))
+        XCTAssertFalse(session.providerHistoryRecovery?.nativeItems.contains { $0.nativeSessionID == "conv-4" } ?? true)
+    }
+
+    /// Step 4d3b (review B F5/F6): a complete text whose ID or digest is not the reader's projection of
+    /// its entry, or whose conversation is not the tab's known Claude conversation, is refused: no row
+    /// or ledger entry, the text shows unidentified. The exact projection is then accepted.
+    func testClaudeLiveCompleteTextMustBeTheReadersProjectionForTheTabsConversation() async throws {
+        let (session, harness, runID, attemptID) = makeLiveOwnerSession()
+        let host = harness.host
+        defer {
+            host.clearPendingAssistantDelta(session)
+            withExtendedLifetime(harness) {}
+        }
+        func run(_ result: AIStreamResult) async {
+            await host.test_handleStreamResult(result, session: session, runID: runID, runAttemptID: attemptID)
+        }
+        session.providerSessionID = "conv-1"
+        let exact = try liveComplete("a1", text: "ALPHA-7")
+        let cases: [(String, ClaudeLiveTranscriptCompleteText)] = try [
+            ("another local ID", ClaudeLiveTranscriptCompleteText(
+                nativeSessionID: exact.nativeSessionID, nativeEntryID: exact.nativeEntryID, localItemID: UUID(),
+                text: exact.text, envelopeDigest: exact.envelopeDigest
+            )),
+            ("another digest", ClaudeLiveTranscriptCompleteText(
+                nativeSessionID: exact.nativeSessionID, nativeEntryID: exact.nativeEntryID, localItemID: exact.localItemID,
+                text: exact.text, envelopeDigest: String(repeating: "c", count: 64)
+            )),
+            ("another conversation", liveComplete("a1", text: "ALPHA-7", conversation: "conv-9"))
+        ]
+        for (name, complete) in cases {
+            let producer = UUID()
+            await run(carried(complete, producer: producer))
+            host.flushPendingAssistantDelta(session)
+            host.endActiveAssistantSegment(session)
+            XCTAssertTrue(session.claudeLiveTranscriptRefusedProducers.contains(producer), name)
+            XCTAssertNil(session.providerHistoryRecovery, name)
+            XCTAssertFalse(session.items.contains { $0.id == complete.localItemID }, name)
+            XCTAssertEqual(session.items.last?.text, "ALPHA-7", "\(name): shown unidentified")
+        }
+        await run(carried(exact, producer: UUID()))
+        XCTAssertEqual(session.items.last?.id, exact.localItemID)
+        XCTAssertEqual(session.providerHistoryRecovery?.nativeItems, [exact.ledgerItem])
+    }
+
+    /// Step 4d3b (inactive; review A R1/R2 and B F4): through the real controller, translator, events
+    /// stream, integrated runner, run service and view-model handler, an eligible producer's qualified
+    /// turn inserts the canonical row with its proof while its carriers leave the run undisturbed.
+    /// Afterwards, between runs, a direct disqualification with no later payload (an undecodable line)
+    /// or a contradicting stdout tail drained at EOF reaches the owner and invalidates the proof.
+    func testClaudeLiveEvidenceReachesTheOwnerThroughTheRunServiceAndLaterRefusalsInvalidateProofs() async throws {
+        for refusal in ["undecodable line", "EOF tail"] {
+            let session = AgentTabSession(tabID: UUID())
+            session.selectedAgent = .claudeCode
+            let user = AgentChatItem.user("Reply with exactly: ALPHA-7", sequenceIndex: session.nextSequenceIndex)
+            session.appendItem(user)
+            let controller = try BackgroundTranscriptController(liveTranscriptQualification: true)
+            addTeardownBlock { await controller.shutdown() }
+            let refused = expectation(description: "the refusal reaches the owner (\(refusal))")
+            var host: AgentModeViewModel?
+            let harness = makeHarness(
+                recorder: LifecycleRecorder(),
+                claudeControllerFactory: { _, _, _, _ in controller },
+                flushPendingAssistantDelta: { host?.flushPendingAssistantDelta($0) },
+                handleHeadlessStreamResult: { result in
+                    guard let host, let runID = session.runID,
+                          let attemptID = session.activeRunAttemptID else { return }
+                    await host.test_handleStreamResult(result, session: session, runID: runID, runAttemptID: attemptID)
+                },
+                handleBackgroundNativeStreamResult: { result, sourceID in
+                    guard let host else { return }
+                    await host.test_handleBackgroundNativeStreamResult(result, sourceID: sourceID, session: session)
+                    if case .disqualified = result.claudeLiveTranscriptEvidence?.kind { refused.fulfill() }
+                },
+                autoSignalACPRouting: true
+            )
+            host = harness.host
+            harness.host.test_installLiveSession(session)
+            defer {
+                session.agentTask?.cancel()
+                harness.host.clearPendingAssistantDelta(session)
+            }
+
+            _ = await harness.service.startRun(
+                tabID: session.tabID, session: session,
+                initialUserMessage: user.text, initialMessageForRun: user.text,
+                attachments: []
+            )
+            let task = try XCTUnwrap(session.agentTask)
+            await task.value
+            let runID = try XCTUnwrap(session.runID)
+            addTeardownBlock { await MCPRoutingWaiter.cleanup(runID: runID) }
+            XCTAssertEqual(session.runState, .completed, refusal)
+            let ledgerItem = try XCTUnwrap(session.providerHistoryRecovery?.nativeItems.first, refusal)
+            XCTAssertEqual(session.providerHistoryRecovery?.nativeItems.count, 1, refusal)
+            XCTAssertNotNil(ledgerItem.envelopeDigest, refusal)
+            let row = try XCTUnwrap(session.items.first { $0.id == ledgerItem.localItemID }, refusal)
+            XCTAssertEqual(row.kind, .assistant)
+            XCTAssertFalse(row.isStreaming)
+            XCTAssertEqual(session.items.filter { $0.kind == .assistant }.map(\.text), ["ALPHA-7"], "carriers add no rows")
+            XCTAssertTrue(session.claudeLiveTranscriptRefusedProducers.isEmpty, "the result agreed")
+
+            if refusal == "undecodable line" {
+                await controller.deliverUndecodableLine()
+            } else {
+                try await controller.deliverStdoutTailThenEOF(BackgroundTranscriptController.qualifiedResult("CONTRADICTION", outbound: UUID()))
+            }
+            let delivery = await XCTWaiter.fulfillment(of: [refused], timeout: 1)
+            XCTAssertEqual(delivery, .completed, refusal)
+            let invalidated = try XCTUnwrap(session.providerHistoryRecovery?.nativeItems.first, refusal)
+            XCTAssertNil(invalidated.envelopeDigest, "\(refusal): the proof is invalidated")
+            XCTAssertEqual(invalidated.localItemID, ledgerItem.localItemID, refusal)
+            let launchToken = await controller.liveLaunchToken
+            let producer = try XCTUnwrap(launchToken, refusal)
+            XCTAssertTrue(session.claudeLiveTranscriptRefusedProducers.contains(producer), refusal)
+        }
+    }
 }
 
 /// Fake runtime whose events stream ends during the second send. Like the real controller, it
@@ -1363,14 +1673,70 @@ private actor StreamLifecycleFakeController: NativeAgentRuntimeControlling {
 /// buffering/turn-completion behavior belong to the real Claude controller, not a copied model.
 private actor BackgroundTranscriptController: NativeAgentRuntimeControlling {
     private let controller: ClaudeNativeProcessSessionController
+    private let qualifiesLiveTranscript: Bool
     private(set) var sentMessages: [String] = []
+    /// Step 4d3b: the eligible synthetic launch standing in for the spawned process.
+    private(set) var liveLaunchToken: UUID?
+    private static let fixtureSessionID = "background-transcript-fixture"
 
-    init() throws {
+    init(liveTranscriptQualification: Bool = false) throws {
+        qualifiesLiveTranscript = liveTranscriptQualification
         controller = try ClaudeNativeProcessSessionController(
             runID: UUID(), tabID: UUID(), windowID: 1, workspacePath: nil,
             config: .discovery(commandName: "/usr/bin/false", runtimeVariant: .standard),
-            mcpHost: ServerNetworkManager.shared
+            mcpHost: ServerNetworkManager.shared,
+            liveTranscriptQualificationEnabled: liveTranscriptQualification
         )
+    }
+
+    /// The current app's success result attributed to `outbound` (Step 4d3b O19 shape).
+    static func qualifiedResult(_ text: String, outbound: UUID) -> [String: Any] {
+        [
+            "type": "result", "subtype": "success", "is_error": false, "result": text,
+            "session_id": fixtureSessionID, "uuid": UUID().uuidString, "num_turns": 1, "permission_denials": [Any](),
+            "terminal_reason": "completed", "stop_reason": "end_turn", "safety_stops": 0,
+            "user_message_uuid": outbound.uuidString.lowercased(), "user_message_uuids": [outbound.uuidString.lowercased()]
+        ]
+    }
+
+    /// Step 4d3b: one O19 turn of the current app (no replay; consumed-user attribution) from an
+    /// eligible synthetic launch, with the outbound identity the real write notes.
+    private func sendQualified(_ text: String) async -> UUID {
+        if liveLaunchToken == nil {
+            liveLaunchToken = await controller.test_beginSyntheticUsageLaunch().token
+        }
+        let turnID = await controller.test_beginTurnTracking()
+        let outbound = UUID()
+        await controller.test_noteLiveTranscriptOutbound(uuid: outbound, text: text)
+        let entry = UUID().uuidString.lowercased()
+        await controller.test_handleStreamPayload([
+            "type": "assistant",
+            "message": [
+                "id": "msg_\(entry)", "type": "message", "role": "assistant", "model": "claude-sonnet-5",
+                "content": [["type": "text", "text": "ALPHA-7"]],
+                "stop_reason": NSNull(), "stop_sequence": NSNull(), "usage": ["input_tokens": 4, "output_tokens": 3]
+            ] as [String: Any],
+            "parent_tool_use_id": NSNull(),
+            "session_id": Self.fixtureSessionID,
+            "request_id": "req_\(entry)",
+            "uuid": entry,
+            "user_message_uuid": outbound.uuidString.lowercased(),
+            "user_message_uuids": [outbound.uuidString.lowercased()]
+        ])
+        await controller.test_handleStreamPayload(Self.qualifiedResult("ALPHA-7", outbound: outbound))
+        return turnID
+    }
+
+    /// An undecodable stdout line through the production line path (no later payload).
+    func deliverUndecodableLine() async {
+        await controller.test_handleLine(Data("{not json".utf8))
+    }
+
+    /// A final stdout record without its newline, then the launch's stdout EOF.
+    func deliverStdoutTailThenEOF(_ payload: [String: Any]) async throws {
+        guard let liveLaunchToken else { return }
+        try await controller.test_handleStdoutChunk(JSONSerialization.data(withJSONObject: payload), launchToken: liveLaunchToken)
+        await controller.test_handleStdoutEOF(launchToken: liveLaunchToken)
     }
 
     var hasActiveSession: Bool {
@@ -1416,6 +1782,7 @@ private actor BackgroundTranscriptController: NativeAgentRuntimeControlling {
 
     func sendUserMessage(_ text: String) async throws -> UUID {
         sentMessages.append(text)
+        if qualifiesLiveTranscript { return await sendQualified(text) }
         let turnID = await controller.test_beginTurnTracking()
         await emitResponse(sentMessages.count == 1 ? "Waiting for background build" : "Current progress answer")
         return turnID

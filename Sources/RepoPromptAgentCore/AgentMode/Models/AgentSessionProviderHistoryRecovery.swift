@@ -497,6 +497,46 @@ package struct AgentSessionProviderHistoryRecovery: Codable, Equatable {
         }
     }
 
+    /// Whether any Claude row of `nativeSessionID` lacks a valid envelope proof (invalidated, legacy
+    /// or malformed). Step 4d3b never newly qualifies live output of such a conversation: a proof is
+    /// never regenerated or healed from later output.
+    package func hasProoflessClaudeItem(nativeSessionID: String) -> Bool {
+        nativeItems.contains {
+            $0.providerRaw == AgentRecoveryHistoryProvider.claude.rawValue
+                && $0.nativeSessionID == nativeSessionID && $0.envelopeDigest == nil
+        }
+    }
+
+    /// Step 4d3b: clears the envelope proof of every Claude row, both the typed value and a
+    /// preserved raw `envelopeDigest` member, keeping its key, local item association and every
+    /// other unknown member (rows, receipts and baselines are untouched). The reader refuses a known
+    /// entry without a proof, so reconciliation of these rows refuses until a future
+    /// requalification (none exists). Conservative scope: every Claude row of this ledger, not one
+    /// conversation picked from untrusted payload fields. Returns whether anything changed.
+    @discardableResult
+    package mutating func invalidateClaudeEnvelopeProofs() -> Bool {
+        var changed = false
+        nativeItems = nativeItems.map { item in
+            guard item.providerRaw == AgentRecoveryHistoryProvider.claude.rawValue,
+                  item.envelopeDigest != nil || item.extras["envelopeDigest"] != nil
+            else { return item }
+            changed = true
+            var extras = item.extras
+            extras.removeValue(forKey: "envelopeDigest")
+            return NativeItem(
+                providerRaw: item.providerRaw,
+                nativeSessionID: item.nativeSessionID,
+                nativeEntryID: item.nativeEntryID,
+                rowKindRaw: item.rowKindRaw,
+                ordinal: item.ordinal,
+                localItemID: item.localItemID,
+                envelopeDigest: nil,
+                extras: extras
+            )
+        }
+        return changed
+    }
+
     /// Exactly 64 lowercase hex digits (a SHA-256 rendered by `sha256Hex`).
     package static func isSHA256Hex(_ value: String) -> Bool {
         value.utf8.count == 64 && value.utf8.allSatisfy { (0x30 ... 0x39).contains($0) || (0x61 ... 0x66).contains($0) }

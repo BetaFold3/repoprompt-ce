@@ -19449,6 +19449,15 @@ final class AgentModeViewModel: ObservableObject {
                     )
                 }
             }
+            // Step 4d3b (inactive: only a default-off qualified Claude producer attaches evidence).
+            // Evidence is processed before any generic mutation; an accepted complete text is the
+            // result's only effect (the content it rode on is never applied a second time).
+            if let evidence = result.claudeLiveTranscriptEvidence,
+               applyClaudeLiveTranscriptEvidence(evidence, session: session, isBackground: isBackground)
+            {
+                requestUIRefresh(tabID: session.tabID)
+                return
+            }
             var shouldUpdateBindings = false
             switch result.type {
             case "content":
@@ -20097,6 +20106,97 @@ final class AgentModeViewModel: ObservableObject {
     /// is the provider's, so live output never mutates it, whatever the row's envelope digest.
     private func isProviderHistoryAssociatedItem(_ id: UUID, session: AgentTabSession) -> Bool {
         session.providerHistoryRecovery?.associatesClaudeLocalItem(id) ?? false
+    }
+
+    /// Step 4d3b canonical owner of qualified Claude live output (inactive: no production producer
+    /// attaches evidence). Called on the main actor after the delivery guard, before any generic
+    /// mutation. Returns `true` only when the result was fully applied here (an accepted or already
+    /// recorded complete text); otherwise the result continues through the legacy display path
+    /// unidentified. Every refusal makes the producer's launch permanently unqualified for this tab
+    /// and invalidates the ledger's Claude proofs (a proof is never regenerated or healed).
+    private func applyClaudeLiveTranscriptEvidence(
+        _ evidence: ClaudeLiveTranscriptEvidence,
+        session: AgentTabSession,
+        isBackground: Bool
+    ) -> Bool {
+        guard session.selectedAgent.usesClaudeNativeRuntime else { return false }
+        switch evidence.kind {
+        case let .completeText(complete):
+            // The evidence must be the reader's exact projection (ID and digest), its row must carry
+            // that ID, and it must belong to the tab's own Claude conversation when that is known.
+            guard !isBackground,
+                  !session.claudeLiveTranscriptRefusedProducers.contains(evidence.producerLaunchToken),
+                  complete.matchesProjection,
+                  session.providerSessionID.map({ $0.isEmpty || $0 == complete.nativeSessionID }) ?? true,
+                  !(session.providerHistoryRecovery?.hasProoflessClaudeItem(nativeSessionID: complete.nativeSessionID) ?? false),
+                  let canonicalItem = complete.canonicalItem,
+                  canonicalItem.id == complete.localItemID
+            else {
+                refuseClaudeLiveTranscript(producer: evidence.producerLaunchToken, session: session)
+                return false
+            }
+            let ledgerItem = complete.ledgerItem
+            if let existing = session.providerHistoryRecovery?.nativeItem(forKey: complete.ledgerKey) {
+                // Same key, identity, valid proof and the actual canonical payload: already recorded.
+                if existing == ledgerItem,
+                   let row = session.items.first(where: { $0.id == complete.localItemID }),
+                   row.kind == .assistant, row.text == canonicalItem.text, !row.isStreaming
+                {
+                    return true
+                }
+                refuseClaudeLiveTranscript(producer: evidence.producerLaunchToken, session: session)
+                return false
+            }
+            // A local row (anywhere in the canonical transcript) already holding the deterministic ID
+            // without this ledger entry is a collision: the old row stays, the text shows unidentified.
+            let canonical = AgentProviderHistoryCanonicalView(transcript: session.transcript, suffixItems: session.items)
+            guard !AgentProviderHistoryAssociationPreflight.canonicalItemIDs(canonical).contains(complete.localItemID) else {
+                refuseClaudeLiveTranscript(producer: evidence.producerLaunchToken, session: session)
+                return false
+            }
+            // Older run text is materialized first and its segment ends, so the canonical row follows it.
+            _ = clearClaudeReasoningStatus(session)
+            flushPendingAssistantDelta(session)
+            endAssistantSegment(session, background: false)
+            // Row and ledger entry change together in this main-actor snapshot; the existing
+            // serialized save persists them (no import receipt, cursor or prefix proof).
+            var ledger = session.providerHistoryRecovery ?? AgentSessionProviderHistoryRecovery()
+            ledger.nativeItems.append(ledgerItem)
+            session.providerHistoryRecovery = ledger
+            session.appendItem(canonicalItem)
+            session.isDirty = true
+            scheduleSave(for: session.tabID)
+            return true
+
+        case let .resultAgreement(localItemID, text):
+            // The owner must hold exactly the turn's identified row with a valid proof.
+            let agrees = !session.claudeLiveTranscriptRefusedProducers.contains(evidence.producerLaunchToken)
+                && (session.providerHistoryRecovery?.nativeItems.contains {
+                    $0.providerRaw == ClaudeSessionHistoryReader.providerRaw
+                        && $0.localItemID == localItemID && $0.envelopeDigest != nil
+                } ?? false)
+                && session.items.contains { $0.id == localItemID && $0.kind == .assistant && $0.text == text }
+            if !agrees {
+                refuseClaudeLiveTranscript(producer: evidence.producerLaunchToken, session: session)
+            }
+            return false
+
+        case .disqualified:
+            refuseClaudeLiveTranscript(producer: evidence.producerLaunchToken, session: session)
+            return false
+        }
+    }
+
+    /// Step 4d3b refusal: the producer never qualifies again in this tab (transient; the producer's
+    /// own latch is the durable-for-its-launch authority), and every Claude envelope proof of this
+    /// ledger is cleared, keeping keys, local items, rows, extras, receipts and baselines. A ledger-only
+    /// change is marked dirty explicitly and saved through the existing serialized save.
+    private func refuseClaudeLiveTranscript(producer: UUID, session: AgentTabSession) {
+        session.claudeLiveTranscriptRefusedProducers.insert(producer)
+        guard var ledger = session.providerHistoryRecovery, ledger.invalidateClaudeEnvelopeProofs() else { return }
+        session.providerHistoryRecovery = ledger
+        session.isDirty = true
+        scheduleSave(for: session.tabID)
     }
 
     /// Retires `sourceID`'s stream's current background row; other streams keep theirs.

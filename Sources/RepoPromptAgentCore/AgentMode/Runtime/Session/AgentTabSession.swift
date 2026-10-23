@@ -896,7 +896,10 @@ package final class AgentTabSession: ObservableObject {
     /// Provider session ID for resumption (e.g., Claude CLI session_id)
     package var providerSessionID: String?
     /// Provider-history ledger and latest committed import receipt (lossless restart Phase 4).
-    /// Hydrated from and persisted with the session; changed only by the history-only merge.
+    /// Hydrated from and persisted with the session. Changed on the main actor by the history-only
+    /// merge (which commits only if the ledger still equals the one it read before its awaits),
+    /// dispatch-baseline admission and the Step 4d3b live owner (insert and proof invalidation);
+    /// cleared by a chat clear.
     package var providerHistoryRecovery: AgentSessionProviderHistoryRecovery?
     /// Recovery dispatch (Phase 4): the Claude conversation whose resume must not fall back to an
     /// implicit fresh conversation. Runtime-only; set before a recovery dispatch, cleared by a
@@ -1557,6 +1560,11 @@ package final class AgentTabSession: ObservableObject {
     /// session metadata. A replaced stream's output is still shown, but never overwrites the
     /// newer launch's provider session ID.
     package var claudeAuthoritativeEventSourceID: UUID?
+    /// Step 4d3b (inactive): Claude producer launches whose live identity this owner refused or saw
+    /// disqualified. The producer's own latch cannot hear owner-side conflicts, so their later
+    /// output is never identified here; a refusal before any proof exists needs this. Not
+    /// persisted (a relaunched producer has a new token; durable refusal is proof invalidation).
+    package var claudeLiveTranscriptRefusedProducers: Set<UUID> = []
 
     /// Whether `rowID` is a background row delivered from `sourceID`'s stream.
     package func isBackgroundRow(_ rowID: UUID, from sourceID: UUID?) -> Bool {

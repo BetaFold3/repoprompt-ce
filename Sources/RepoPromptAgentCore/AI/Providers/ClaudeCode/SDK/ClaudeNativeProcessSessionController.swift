@@ -573,6 +573,16 @@ package final actor ClaudeNativeProcessSessionController {
     /// bytes/EOF is keyed on this token, never on accounting state (`usageLaunchState`), so
     /// transcript and control delivery cannot depend on the usage feature (OracleB P1#4).
     private var activeStdoutLaunchToken: UUID?
+    /// Step 4d3b (inactive): injected live-identity qualification; `false` by default and set by no
+    /// production caller.
+    private let liveTranscriptQualificationEnabled: Bool
+    /// Step 4d3b: the current stdout producer's monotonic qualification state. Created only where an
+    /// actual stdout launch token is installed (never by a consumer reset, turn, `system/init` or
+    /// router change) and read only while its token is still current; `nil` when disabled.
+    private var liveTranscriptQualification: ClaudeLiveTranscriptProducerState?
+    /// Step 4d3b: the launch whose buffered stdout tail `handleStdoutEOF` is draining (only during
+    /// that drain, after the stdout token was cleared).
+    private var liveTranscriptEOFDrainLaunchToken: UUID?
     /// Lives for the controller's lifetime: a reusable controller keeps one stream across
     /// shutdown/relaunch cycles, so `shutdown()` only reports `launchEnded`. The stream is
     /// finished explicitly in `deinit` cleanup (after a final `launchEnded` if a launch was still
@@ -739,9 +749,11 @@ package final actor ClaudeNativeProcessSessionController {
         environmentResolver: any ClaudeCodeLaunchEnvironmentResolving = ClaudeCodeLaunchEnvironmentResolver(),
         managedSettingsURL: URL? = ClaudePromptCacheRetentionResolver.defaultManagedSettingsURL,
         authoritativeTurnIdleFallbackSeconds: TimeInterval = 1.0,
-        launchAuthority: AgentRuntimeLaunchAuthority = .production
+        launchAuthority: AgentRuntimeLaunchAuthority = .production,
+        liveTranscriptQualificationEnabled: Bool = false
     ) {
         self.launchAuthority = launchAuthority
+        self.liveTranscriptQualificationEnabled = liveTranscriptQualificationEnabled
         self.runID = runID
         self.tabID = tabID
         self.windowID = windowID
@@ -981,6 +993,7 @@ package final actor ClaudeNativeProcessSessionController {
         // same non-suspending actor step so no result can interleave between write and ordinal.
         let turnID = beginTurnTracking()
         registerUsageDispatch(turnID: turnID)
+        noteLiveTranscriptOutbound(uuid: outboundUserMessageUUID, text: text)
         return turnID
     }
 
@@ -1357,6 +1370,7 @@ package final actor ClaudeNativeProcessSessionController {
         runtimeAssociatedConversationID = launch == nil ? nil : (resumeSessionID ?? freshSessionID)
         runtimeLastOwnerScope = launch?.context.session
         activeStdoutLaunchToken = launchToken
+        installLiveTranscriptQualification(launchToken: launchToken)
         do {
             try startStdoutReader(handle: spawned.stdout, launchToken: launchToken)
             try startStderrReader(handle: spawned.stderr)
@@ -1420,6 +1434,7 @@ package final actor ClaudeNativeProcessSessionController {
             configuredEnvironmentOverrideKeys: environmentEvidence.configuredEnvironmentOverrideKeys,
             spawnedAt: Date()
         ))
+        resolveLiveTranscriptEligibility(launchToken: launchToken)
         await registerExpectedAgentPIDIfNeeded(spawned.pid)
     }
 
@@ -2074,6 +2089,8 @@ package final actor ClaudeNativeProcessSessionController {
             guard let inbound = try ClaudeSDKProtocolCodec.decodeLine(lineData) else { return }
             routeInboundMessage(inbound)
         } catch let codecError as ClaudeSDKProtocolCodec.CodecError {
+            // Step 4d3b: an undecodable line (whatever recovery follows) ends live qualification.
+            disqualifyLiveTranscript(.malformedLine)
             if case .invalidJSON = codecError {
                 if recoverConcatenatedInboundMessagesIfNeeded(from: lineData)
                     || recoverEmbeddedInboundTailIfNeeded(from: lineData)
@@ -2104,6 +2121,8 @@ package final actor ClaudeNativeProcessSessionController {
             if config.enableDebugLogging {
                 print("[ClaudeNativeSession] failed decoding line: \(preview) | error=\(error)")
             }
+            // Step 4d3b: refused (and its owner told) before the shutdown suspends.
+            disqualifyLiveTranscript(.malformedLine)
             await failProtocolAndShutdown(message: "Claude protocol decode failure: \(preview)")
         }
     }
@@ -2433,9 +2452,13 @@ package final actor ClaudeNativeProcessSessionController {
         }
 
         guard let data = try? JSONSerialization.data(withJSONObject: payload, options: []) else {
+            disqualifyLiveTranscript(.malformedPayload)
             return
         }
-        let streamResults = translator.parseNDJSONLine(data)
+        var streamResults = translator.parseNDJSONLine(data)
+        // Step 4d3b: the raw payload (the exact bytes the translator read) is classified before any
+        // translated result is filtered or suppressed below.
+        let liveTranscriptCarrier = classifyLiveTranscriptPayload(envelope: data, streamResults: &streamResults)
         #if DEBUG
             if ClaudeReasoningExtractionFeature.isEnabled {
                 let debugPayloadType = (payload["type"] as? String) ?? "<missing>"
@@ -2471,6 +2494,11 @@ package final actor ClaudeNativeProcessSessionController {
         let isResultPayload = payloadType == "result"
         if payloadType == "assistant" {
             emitMainRequestUsageIfOwned(payload: payload, streamResults: streamResults)
+        }
+        if let liveTranscriptCarrier {
+            // Metadata only: no text, no usage, never a turn boundary; it reaches the owner before
+            // this payload's own results, even when they are empty or suppressed.
+            emit(.stream(liveTranscriptCarrier))
         }
 
         for result in streamResults {
@@ -2987,7 +3015,9 @@ package final actor ClaudeNativeProcessSessionController {
             )
             // A synthetic launch stands in for a spawn: the stdout reader generation is that launch.
             activeStdoutLaunchToken = identity.token
+            installLiveTranscriptQualification(launchToken: identity.token)
             beginUsageLaunch(identity)
+            resolveLiveTranscriptEligibility(launchToken: identity.token)
             return identity
         }
 
@@ -3028,6 +3058,21 @@ package final actor ClaudeNativeProcessSessionController {
 
         func test_endSyntheticUsageLaunch() {
             endUsageLaunch()
+        }
+
+        /// Step 4d3b: the outbound step `sendUserMessage` performs after a successful write.
+        func test_noteLiveTranscriptOutbound(uuid: UUID?, text: String) {
+            noteLiveTranscriptOutbound(uuid: uuid, text: text)
+        }
+
+        func test_liveTranscriptQualification() -> ClaudeLiveTranscriptProducerState? {
+            liveTranscriptQualification
+        }
+
+        /// Step 4d3b: routes one raw line through the production `handleLine` path (decode failures
+        /// included).
+        func test_handleLine(_ lineData: Data) async {
+            await handleLine(lineData)
         }
 
         /// Attaches an already-spawned harmless child (for example `/bin/cat`) as the controller's
@@ -3319,9 +3364,14 @@ package final actor ClaudeNativeProcessSessionController {
         stdoutFramer.flush { line in
             remainingLines.append(line)
         }
+        // Step 4d3b: the exiting launch's producer classifies its own buffered tail (scoped to this
+        // drain; the stdout token stays cleared), then retires.
+        liveTranscriptEOFDrainLaunchToken = launchToken
         for line in remainingLines {
             await handleLine(line)
         }
+        liveTranscriptEOFDrainLaunchToken = nil
+        retireLiveTranscriptQualification(launchToken: launchToken)
         // The transport is gone: automatic replies queued for it are never written.
         queuedAutomaticReplies.removeAll()
         failPendingControlRequests(with: ControllerError.processNotRunning)
@@ -3531,6 +3581,108 @@ package final actor ClaudeNativeProcessSessionController {
             requestID: requestID,
             observation: observation
         )))
+    }
+
+    // MARK: Step 4d3b live transcript qualification (inactive)
+
+    /// A fresh state for a newly installed stdout producer; called only where an actual stdout launch
+    /// token is installed. Disabled: none.
+    private func installLiveTranscriptQualification(launchToken: UUID) {
+        guard liveTranscriptQualificationEnabled else {
+            liveTranscriptQualification = nil
+            return
+        }
+        var state = ClaudeLiveTranscriptProducerState(launchToken: launchToken)
+        // Installed across an earlier launch's EOF drain (only its fatal-path shutdown suspends): its
+        // payloads during that drain are never classified, so it never qualifies.
+        if liveTranscriptEOFDrainLaunchToken != nil { state.disqualify(.launchDuringDrain) }
+        liveTranscriptQualification = state
+    }
+
+    /// Once the launch identity is recorded, only a launch eligible for an outbound user-message
+    /// identity (automatic command, default backend, no routing overrides) keeps its state; an
+    /// ineligible producer drops it and never emits evidence. Eligibility is not installed-profile
+    /// qualification.
+    private func resolveLiveTranscriptEligibility(launchToken: UUID) {
+        guard var state = currentLiveTranscriptQualification(), state.launchToken == launchToken else { return }
+        guard outboundUserMessageIdentityEligible, usageLaunchState?.identity.token == launchToken else {
+            liveTranscriptQualification = nil
+            return
+        }
+        state.markEligible()
+        liveTranscriptQualification = state
+    }
+
+    /// The state of the producer whose stdout is current; a stale producer's state is never read.
+    /// While an EOF drain is active, only the exiting launch whose buffered tail it drains is ever
+    /// selected, never a replacement installed across the drain's (fatal-path) suspension.
+    private func currentLiveTranscriptQualification() -> ClaudeLiveTranscriptProducerState? {
+        guard let state = liveTranscriptQualification,
+              state.launchToken == (liveTranscriptEOFDrainLaunchToken ?? activeStdoutLaunchToken)
+        else {
+            return nil
+        }
+        return state
+    }
+
+    private func noteLiveTranscriptOutbound(uuid: UUID?, text: String) {
+        guard var state = currentLiveTranscriptQualification() else { return }
+        let wasQualifying = state.disqualification == nil
+        state.noteOutbound(uuid: uuid, text: text)
+        liveTranscriptQualification = state
+        emitDirectLiveTranscriptDisqualification(state, wasQualifying: wasQualifying)
+    }
+
+    private func disqualifyLiveTranscript(_ reason: ClaudeLiveTranscriptDisqualification) {
+        guard var state = currentLiveTranscriptQualification() else { return }
+        let wasQualifying = state.disqualification == nil
+        state.disqualify(reason)
+        liveTranscriptQualification = state
+        emitDirectLiveTranscriptDisqualification(state, wasQualifying: wasQualifying)
+    }
+
+    /// A producer disqualified outside payload classification (an undecodable line or payload, an
+    /// unidentified or overlapping outbound write) tells its owner at once with one metadata-only
+    /// carrier, so its owner invalidates proofs even when no later payload arrives; later payloads
+    /// still repeat it. Nothing for a disabled, ineligible or already disqualified producer.
+    private func emitDirectLiveTranscriptDisqualification(
+        _ state: ClaudeLiveTranscriptProducerState,
+        wasQualifying: Bool
+    ) {
+        guard wasQualifying, state.eligibility == .eligible, let reason = state.disqualification else { return }
+        emit(.stream(.claudeLiveTranscriptEvidenceCarrier(
+            ClaudeLiveTranscriptEvidence(producerLaunchToken: state.launchToken, kind: .disqualified(reason))
+        )))
+    }
+
+    /// After its stdout EOF drained the buffered tail, the exited launch's producer is retired (a
+    /// replacement launch installed meanwhile keeps its own).
+    private func retireLiveTranscriptQualification(launchToken: UUID) {
+        if liveTranscriptQualification?.launchToken == launchToken {
+            liveTranscriptQualification = nil
+        }
+    }
+
+    /// Classifies one raw payload of the current producer: complete-text evidence is attached to its
+    /// one translated `content` result; any other evidence is returned as a metadata-only carrier.
+    /// Nothing while disabled, stale or not (yet) eligible.
+    private func classifyLiveTranscriptPayload(
+        envelope: Data,
+        streamResults: inout [AIStreamResult]
+    ) -> AIStreamResult? {
+        guard var state = currentLiveTranscriptQualification() else { return nil }
+        let outcome = state.classify(envelope: envelope, translated: streamResults, turnInFlight: turnInFlight)
+        liveTranscriptQualification = state
+        guard state.eligibility == .eligible else { return nil }
+        switch outcome {
+        case .benign:
+            return nil
+        case let .attach(index, evidence):
+            streamResults[index].claudeLiveTranscriptEvidence = evidence
+            return nil
+        case let .standalone(evidence):
+            return .claudeLiveTranscriptEvidenceCarrier(evidence)
+        }
     }
 
     // MARK: Runtime provenance and child-activity evidence

@@ -558,7 +558,8 @@ package enum ClaudeSessionHistoryReader {
 
     /// The first documented retraction marker present in `object` (an explicit `aborted: false` is
     /// not one). Only these exact keys at this level: no recursive search, no unknown-field guess.
-    private static func semanticMarker(in object: NSDictionary) -> String? {
+    /// Also applied to live stdout envelopes (Step 4d3b `ClaudeLiveTranscriptProducerState`).
+    static func semanticMarker(in object: NSDictionary) -> String? {
         for key in semanticMarkers {
             switch object[key] {
             case nil, is NSNull:
@@ -1008,6 +1009,26 @@ package enum ClaudeSessionHistoryReader {
             }
         }
         return rows
+    }
+
+    /// Step 4d3b: the row a native assistant entry holding exactly one text block `text` projects to,
+    /// with its deterministic local ID and complete-envelope digest. Same `project`/`envelopeDigest`
+    /// derivation as a read, so a live row's identity and proof are exactly those its native entry
+    /// must later match. `nil` only for an empty projection (never for one block).
+    package static func singleTextAssistantRow(nativeSessionID: String, nativeEntryID: String, text: String) -> Row? {
+        let entry = Entry(
+            line: 0,
+            lineStart: 0,
+            uuid: nativeEntryID,
+            parentUUID: nil,
+            kind: .assistant,
+            messageID: nil,
+            sourceToolAssistantUUID: nil,
+            blocks: [.text(text)],
+            userStringContentSHA256: nil,
+            raw: NSDictionary()
+        )
+        return project([entry], entries: [entry], nativeSessionID: nativeSessionID).first
     }
 
     /// Fixed, documented derivation (not Swift's randomized `Hasher`): SHA-256 over the namespace and

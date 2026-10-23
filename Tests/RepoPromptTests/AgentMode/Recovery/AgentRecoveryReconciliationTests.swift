@@ -2185,6 +2185,141 @@ final class AgentRecoveryReconciliationTests: XCTestCase {
         }
     }
 
+    /// Step 4d3b: delivers qualified live complete text for `entry` through the real owner path.
+    private func deliverLiveComplete(
+        _ harness: ProducerHarness,
+        entry: String,
+        text: String,
+        producer: UUID,
+        runID: UUID,
+        attemptID: UUID
+    ) async throws -> ClaudeLiveTranscriptCompleteText {
+        let row = try XCTUnwrap(ClaudeSessionHistoryReader.singleTextAssistantRow(nativeSessionID: conversationID, nativeEntryID: entry, text: text))
+        let complete = try ClaudeLiveTranscriptCompleteText(
+            nativeSessionID: conversationID,
+            nativeEntryID: entry,
+            localItemID: XCTUnwrap(row.localItemID),
+            text: text,
+            envelopeDigest: row.envelopeDigest
+        )
+        var result = AIStreamResult(type: "content", text: text)
+        result.claudeLiveTranscriptEvidence = .init(producerLaunchToken: producer, kind: .completeText(complete))
+        await harness.viewModel.test_handleStreamResult(result, session: harness.session, runID: runID, runAttemptID: attemptID)
+        return complete
+    }
+
+    private func liveDisqualification(producer: UUID) -> AIStreamResult {
+        var result = AIStreamResult(type: AIStreamResult.lifecycleType, text: nil)
+        result.claudeLiveTranscriptEvidence = .init(producerLaunchToken: producer, kind: .disqualified(.unsupportedPayload))
+        return result
+    }
+
+    /// Step 4d3b, real composition: a qualified live row and its proof persist coherently in the
+    /// ordinary session save; the later import of the same native entry records it with no duplicate.
+    /// A disqualification then clears the proof durably; with Claude's history unchanged the next
+    /// reconcile refuses, and after a reload a new producer never heals the conversation.
+    func testLiveQualifiedRowRoundTripsAndInvalidationRefusesWithoutHealing() async throws {
+        let harness = try await makeProducerHarness(windowID: 4996)
+        let prompt = "Reply with exactly: ALPHA-7"
+        let runID = UUID()
+        harness.session.runID = runID
+        harness.session.runState = .running
+        let attemptID = harness.session.beginRunAttempt(source: "test.liveRoundTrip").attemptID
+        let (_, identity) = try await admitClaimedDispatch(harness, runAttemptID: attemptID, text: prompt)
+        let caller = identity.dispatchID.uuidString.lowercased()
+        let producer = UUID()
+        let complete = try await deliverLiveComplete(harness, entry: "a1", text: "ALPHA-7", producer: producer, runID: runID, attemptID: attemptID)
+        XCTAssertEqual(harness.session.items.last?.id, complete.localItemID)
+        let savedLive = await harness.viewModel.flushSave(for: harness.session.tabID)
+        XCTAssertTrue(savedLive)
+        let persistedLive = try await harness.persisted()
+        XCTAssertEqual(persistedLive?.providerHistoryRecovery?.nativeItem(forKey: complete.ledgerKey), complete.ledgerItem)
+        XCTAssertTrue(persistedLive?.items.contains { $0.id == complete.localItemID && $0.text == "ALPHA-7" } ?? false, "row and proof in one save")
+
+        // The run ends; Claude's history holds the same turn.
+        harness.session.runState = .completed
+        try harness.appendHistory(o19History(caller: caller, parent: nil, assistant: "a1", prompt: prompt, reply: "ALPHA-7", tag: "t1"))
+        let action = reconcileAction(harness, runAttemptID: attemptID)
+        func reconcile() async -> AgentRecoveryReconcileResult {
+            await harness.viewModel.reconcileRecoveryHistory(action, session: harness.session, lane: harness.lane, codexTurnID: nil)
+        }
+        let imported = await reconcile()
+        XCTAssertEqual(imported, .imported(completion: .unconfirmed, rowCount: 0), "recorded, never appended again")
+        XCTAssertEqual(harness.session.items.count { $0.kind == .assistant && $0.text == "ALPHA-7" }, 1)
+        let ledger = try XCTUnwrap(harness.session.providerHistoryRecovery)
+        XCTAssertEqual(ledger.nativeItem(forKey: complete.ledgerKey), complete.ledgerItem)
+        XCTAssertEqual(ledger.nativeItems.map(\.nativeEntryID), ["a1", caller])
+
+        // Disqualification during the same run: the proof is cleared and saved.
+        harness.session.runState = .running
+        await harness.viewModel.test_handleStreamResult(liveDisqualification(producer: producer), session: harness.session, runID: runID, runAttemptID: attemptID)
+        let savedInvalidation = await harness.viewModel.flushSave(for: harness.session.tabID)
+        XCTAssertTrue(savedInvalidation)
+        harness.session.runState = .completed
+        let persistedSession = try await harness.persisted()
+        let persisted = try XCTUnwrap(persistedSession?.providerHistoryRecovery)
+        XCTAssertTrue(persisted.nativeItems.filter { $0.providerRaw == "claude" }.allSatisfy { $0.envelopeDigest == nil })
+        XCTAssertEqual(persisted.nativeItems.map(\.key), ledger.nativeItems.map(\.key), "keys are kept")
+        XCTAssertEqual(persisted.lastImportCommit, ledger.lastImportCommit, "the receipt is kept")
+        let itemsBefore = harness.session.items.map(\.id)
+        let cursorBefore = await harness.cursor()
+        let refused = await reconcile()
+        XCTAssertEqual(refused, .blocked(AgentModeViewModel.recoveryHistoryChangedText), "unchanged native history refuses")
+        XCTAssertEqual(harness.session.items.map(\.id), itemsBefore)
+        XCTAssertEqual(harness.session.providerHistoryRecovery, persisted)
+        let cursorAfter = await harness.cursor()
+        XCTAssertEqual(cursorAfter, cursorBefore)
+
+        // Reload the persisted ledger: a new producer's complete text is shown unidentified.
+        harness.session.providerHistoryRecovery = persisted
+        harness.session.claudeLiveTranscriptRefusedProducers = []
+        harness.session.runState = .running
+        let later = try await deliverLiveComplete(harness, entry: "a2", text: "BRAVO", producer: UUID(), runID: runID, attemptID: attemptID)
+        harness.viewModel.flushPendingAssistantDelta(harness.session)
+        XCTAssertEqual(harness.session.items.last?.text, "BRAVO")
+        XCTAssertNotEqual(harness.session.items.last?.id, later.localItemID)
+        XCTAssertNil(harness.session.providerHistoryRecovery?.nativeItem(forKey: later.ledgerKey), "never healed")
+        harness.viewModel.clearPendingAssistantDelta(harness.session)
+    }
+
+    /// Step 4d3b save ordering: a save whose snapshot predates an invalidation may write the old proof,
+    /// but the invalidation's own dirty mark and save request leave the fresh snapshot last on disk.
+    func testAnInFlightOlderSaveNeverOutlivesALiveProofInvalidation() async throws {
+        let harness = try await makeProducerHarness(windowID: 4997)
+        let runID = UUID()
+        harness.session.runID = runID
+        harness.session.runState = .running
+        let attemptID = harness.session.beginRunAttempt(source: "test.liveSaveOrder").attemptID
+        let producer = UUID()
+        let complete = try await deliverLiveComplete(harness, entry: "a1", text: "ALPHA-7", producer: producer, runID: runID, attemptID: attemptID)
+        let saved = await harness.viewModel.flushSave(for: harness.session.tabID)
+        XCTAssertTrue(saved)
+
+        // The next save is held after its snapshot; the invalidation lands while it is in flight.
+        harness.session.appendItem(.user("Later"))
+        harness.session.isDirty = true
+        var hookRuns = 0
+        harness.viewModel.test_saveSessionBeforeWriteHook = { [harness] held in
+            guard held.tabID == harness.session.tabID else { return }
+            hookRuns += 1
+            guard hookRuns == 1 else { return }
+            await harness.viewModel.test_handleStreamResult(
+                self.liveDisqualification(producer: producer), session: held, runID: runID, runAttemptID: attemptID
+            )
+        }
+        _ = await harness.viewModel.flushSave(for: harness.session.tabID)
+        harness.viewModel.test_saveSessionBeforeWriteHook = nil
+        XCTAssertEqual(hookRuns, 1)
+        XCTAssertNil(harness.session.providerHistoryRecovery?.nativeItem(forKey: complete.ledgerKey)?.envelopeDigest)
+        let fresh = await harness.viewModel.flushSave(for: harness.session.tabID)
+        XCTAssertTrue(fresh)
+        let persisted = try await harness.persisted()
+        let entry = try XCTUnwrap(persisted?.providerHistoryRecovery?.nativeItem(forKey: complete.ledgerKey))
+        XCTAssertNil(entry.envelopeDigest, "the older snapshot never restores the cleared proof")
+        XCTAssertEqual(entry.localItemID, complete.localItemID)
+        XCTAssertTrue(persisted?.items.contains { $0.text == "Later" } ?? false)
+    }
+
     /// A steering dispatch of the same attempt whose claimed native user entry never appeared
     /// refuses the whole import with no state change (never read as non-delivery, never resent).
     func testAMissingClaimedSteeringEntryRefusesWithoutChangingAnything() async throws {
