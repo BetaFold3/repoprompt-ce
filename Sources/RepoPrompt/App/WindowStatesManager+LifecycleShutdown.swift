@@ -73,7 +73,11 @@ extension WindowStatesManager {
                 await self?.stopAllServers()
             },
             presentFailure: { [weak self] failure in
-                guard let self else { return failure.stage == .preparation ? .cancel : .proceedAnyway }
+                guard let self else {
+                    // Never an exit or a Quit Anyway while a relaunch helper is unresolved.
+                    if failure.relaunchHelperUnresolved { return .cancel }
+                    return failure.stage == .preparation ? .cancel : .proceedAnyway
+                }
                 return await presentLifecycleShutdownFailure(failure)
             },
             dismissFailure: { [weak self] scope in
@@ -110,18 +114,35 @@ extension WindowStatesManager {
         shutdownReasonLatch.disarm()
     }
 
-    /// Stage A: Retry / Cancel. Stage B: Retry / Quit (Close) Anyway; never Cancel.
-    private func presentLifecycleShutdownFailure(
-        _ failure: AgentLifecycleShutdownFailure
-    ) async -> AgentLifecycleShutdownChoice {
+    static let lifecycleKeepWaitingTitle = "Keep Waiting"
+    static let lifecycleExitMayReopenTitle = "Exit — may reopen"
+
+    /// Stage A: Retry / Cancel. Stage B: Retry / Quit (Close) Anyway; never Cancel. An unresolved
+    /// Restart safely helper: Keep Waiting / Exit — may reopen when admitted (Step 4c), else OK only.
+    /// Builds the alert without showing it (sheet and app-modal share it).
+    static func makeLifecycleShutdownFailureAlert(_ failure: AgentLifecycleShutdownFailure) -> NSAlert {
         let isQuit = failure.scope == .application
         let alert = NSAlert()
         alert.alertStyle = .warning
         let details = failure.messages.joined(separator: "\n")
         switch failure.stage {
+        case _ where failure.offersUncertainRelaunchExit:
+            // Step 4c (owner-delegated policy): explicit consent to exit while the helper's stop is
+            // unknown. Only what was verified before the arm request is claimed; whether the helper
+            // armed, and whether the app reopens, is not, and no bound is promised.
+            alert.messageText = "RepoPrompt can exit, but may reopen"
+            alert.informativeText = details
+                + "\n\nBefore RepoPrompt asked its restart helper to arm, your work was saved, a clean exit was recorded, and every managed agent and tool process was verified stopped. RepoPrompt could not confirm whether the helper armed or stopped."
+                + "\n\nIf you exit now, RepoPrompt may reopen automatically, or it may not; neither is guaranteed. Choose Keep Waiting to wait for confirmation: if the helper is confirmed stopped, Retry and Quit Anyway are offered again."
+            // Keep Waiting is the default (Return); the exit has no key equivalent (never Return
+            // or Escape).
+            let keepWaiting = alert.addButton(withTitle: lifecycleKeepWaitingTitle)
+            keepWaiting.keyEquivalent = "\r"
+            let exit = alert.addButton(withTitle: lifecycleExitMayReopenTitle)
+            exit.keyEquivalent = ""
         case _ where failure.relaunchHelperUnresolved:
-            // Review A P1-07 (fail closed, pending the owner's decision): the restart helper may
-            // still be alive or armed, so no Retry, Cancel, or Quit Anyway is offered. The answer
+            // Review A P1-07: the restart helper may still be alive or armed, and this request has
+            // no pre-arm witness, so no Retry, Cancel, Quit Anyway, or exit is offered. The answer
             // is ignored by R4.
             alert.messageText = "RepoPrompt can't continue restarting safely"
             alert.informativeText = details
@@ -152,6 +173,37 @@ extension WindowStatesManager {
             alert.addButton(withTitle: "Retry")
             alert.addButton(withTitle: isQuit ? "Quit Anyway" : "Close Anyway")
         }
+        return alert
+    }
+
+    /// Maps an AppKit response (a button, a sheet ended by `dismissFailure` with `.cancel`, or an
+    /// app-modal `.abort`) to R4's choice. An unresolved helper prompt is decided first: only its
+    /// admitted second button is `.exitMayReopen`; Keep Waiting, OK, and every dismissal map to the
+    /// `.cancel` sentinel R4 ignores there (never Retry, never an exit).
+    static func lifecycleShutdownChoice(
+        for failure: AgentLifecycleShutdownFailure,
+        response: NSApplication.ModalResponse
+    ) -> AgentLifecycleShutdownChoice {
+        if failure.relaunchHelperUnresolved {
+            return failure.offersUncertainRelaunchExit && response == .alertSecondButtonReturn ? .exitMayReopen : .cancel
+        }
+        switch (failure.stage, response) {
+        case (_, .alertFirstButtonReturn):
+            return .retry
+        case (.preparation, _):
+            return .cancel
+        case (.finalization, .alertSecondButtonReturn):
+            return .proceedAnyway
+        case (.finalization, _):
+            // Dismissed without a choice (superseded): not a Cancel; the fenced caller ignores it.
+            return .cancel
+        }
+    }
+
+    private func presentLifecycleShutdownFailure(
+        _ failure: AgentLifecycleShutdownFailure
+    ) async -> AgentLifecycleShutdownChoice {
+        let alert = Self.makeLifecycleShutdownFailureAlert(failure)
         let parent: NSWindow? = switch failure.scope {
         case .application:
             NSApp.keyWindow ?? NSApp.mainWindow
@@ -171,17 +223,7 @@ extension WindowStatesManager {
         if presentedLifecycleShutdownAlerts[failure.scope] === alert {
             presentedLifecycleShutdownAlerts[failure.scope] = nil
         }
-        switch (failure.stage, response) {
-        case (_, .alertFirstButtonReturn):
-            return .retry
-        case (.preparation, _):
-            return .cancel
-        case (.finalization, .alertSecondButtonReturn):
-            return .proceedAnyway
-        case (.finalization, _):
-            // Dismissed without a choice (superseded): not a Cancel; the fenced caller ignores it.
-            return .cancel
-        }
+        return Self.lifecycleShutdownChoice(for: failure, response: response)
     }
 
     // MARK: Window close entry

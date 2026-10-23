@@ -1,3 +1,4 @@
+import AppKit
 import Foundation
 @testable import RepoPromptAgentCore
 @testable import RepoPromptApp
@@ -60,6 +61,11 @@ final class AgentLifecycleShutdownCoordinatorTests: XCTestCase {
 
         var pendingCount: Int {
             lock.withLock { waiters.count }
+        }
+
+        /// The earliest absolute deadline a sleep is currently waiting for.
+        var nextPendingDeadline: ContinuousClock.Instant? {
+            lock.withLock { waiters.map(\.1).min() }
         }
 
         /// Deadline sleeps requested so far, in order.
@@ -269,6 +275,9 @@ final class AgentLifecycleShutdownCoordinatorTests: XCTestCase {
         var scopeTeardowns: [AgentLifecycleShutdownScope] = []
         var dismissed: [AgentLifecycleShutdownScope] = []
         var presented: [AgentLifecycleShutdownFailure] = []
+        /// The answer a dismissed prompt returns (AppKit returns no real choice; a test may inject a
+        /// late answer that races the dismissal).
+        var answerOnDismiss: AgentLifecycleShutdownChoice = .cancel
         private var pendingChoice: CheckedContinuation<AgentLifecycleShutdownChoice, Never>?
 
         func present(_ failure: AgentLifecycleShutdownFailure) async -> AgentLifecycleShutdownChoice {
@@ -289,7 +298,7 @@ final class AgentLifecycleShutdownCoordinatorTests: XCTestCase {
         /// Like AppKit ending a dismissed sheet: the pending prompt returns without a real choice.
         func dismiss(_ scope: AgentLifecycleShutdownScope) {
             dismissed.append(scope)
-            choose(.cancel)
+            choose(answerOnDismiss)
         }
     }
 
@@ -1150,6 +1159,11 @@ final class AgentLifecycleShutdownCoordinatorTests: XCTestCase {
         /// Scripted `abandon` outcomes (`.safe` once exhausted).
         var abandonResults: [AgentLifecycleRelaunchAbandonment] = []
         var budgets: [AgentLifecycleRelaunchBudget] = []
+        /// One-shot suspensions of the next `verifyAllStopped` / `prepare` / `arm` (consumed when
+        /// entered; ignore cancellation like a hook bounded only by its own budget).
+        var verifyGate: Hang?
+        var prepareGate: Hang?
+        var armGate: Hang?
         /// Disk marks committed when `verifyAllStopped` ran.
         var marksAtVerify: [[AgentRecoveryLaunchMark.State]] = []
         var disk: LaunchMarkDisk?
@@ -1194,6 +1208,10 @@ final class AgentLifecycleShutdownCoordinatorTests: XCTestCase {
                 prepare: { [self] budget in
                     calls.append("prepare")
                     budgets.append(budget)
+                    if let gate = prepareGate {
+                        prepareGate = nil
+                        await gate.wait()
+                    }
                     let result = prepareResults.isEmpty ? nil : prepareResults.removeFirst()
                     helperReady = result == nil
                     helperArmed = false
@@ -1202,11 +1220,19 @@ final class AgentLifecycleShutdownCoordinatorTests: XCTestCase {
                 verifyAllStopped: { [self] in
                     calls.append("verify")
                     marksAtVerify.append(disk?.committed ?? [])
+                    if let gate = verifyGate {
+                        verifyGate = nil
+                        await gate.wait()
+                    }
                     return verifyResults.isEmpty ? nil : verifyResults.removeFirst()
                 },
                 arm: { [self] budget in
                     calls.append("arm")
                     budgets.append(budget)
+                    if let gate = armGate {
+                        armGate = nil
+                        await gate.wait()
+                    }
                     let result = armResults.isEmpty ? nil : armResults.removeFirst()
                     helperArmed = result == nil && helperReady
                     helperReady = false
@@ -1365,44 +1391,69 @@ final class AgentLifecycleShutdownCoordinatorTests: XCTestCase {
         XCTAssertEqual(disk.committed, [.shutdownInProgress, .running])
     }
 
-    /// Review A P1-07 (fail closed, pending the owner's decision): when abandoning the helper
-    /// before a prompt cannot prove its stop, the prompt offers no choice (no Retry, Cancel, or Quit
-    /// Anyway), any answer is ignored, no fresh helper is prepared, and the request never finishes.
-    func testSafeRestartUnresolvedHelperStopOffersNoChoicesAndNeverFinishes() async {
+    private static let lostArmText = "The relaunch helper did not confirm it was armed."
+    private static let unresolvedStopText = "RepoPrompt could not confirm that its restart helper stopped."
+
+    /// Review A P1-07 + Step 4c: when abandoning a helper whose `arm` this attempt sent cannot prove
+    /// its stop, the prompt offers only the explicit uncertain exit (no Retry, Cancel, or Quit
+    /// Anyway). Keep Waiting (the ignored sentinel) and every ordinary choice show the SAME prompt
+    /// again without repeating `abandon`, the stop observation, a deadline, or any helper hook, so
+    /// waiting never removes the only way out. A later stop proof restores the ordinary choices, and
+    /// the ordinary Quit Anyway then quits without relaunching.
+    func testSafeRestartUnresolvedArmedHelperOffersOnlyTheUncertainExitAndWaitingShowsTheSamePromptAgain() async throws {
         let participant = FakeParticipant()
         appParticipants = [participant]
         let relaunch = FakeRelaunch()
-        relaunch.armResults = ["The relaunch helper did not confirm it was armed."]
-        relaunch.abandonResults = [.unresolved("RepoPrompt could not confirm that its restart helper stopped.")]
+        relaunch.armResults = [Self.lostArmText]
+        relaunch.abandonResults = [.unresolved(Self.unresolvedStopText)]
         let coordinator = makeCoordinator(relaunch: relaunch.hooks)
         var replies: [Bool] = []
         XCTAssertTrue(coordinator.requestApplicationQuit(reason: .safeRestart) { replies.append($0) })
-        await waitUntil("the no-choice prompt and its stop observation") { recorder.isPresenting && relaunch.isAwaitingStop }
+        await waitUntil("the unresolved prompt and its stop observation") { recorder.isPresenting && relaunch.isAwaitingStop }
+        let request = try XCTUnwrap(coordinator.applicationRequest)
         XCTAssertEqual(relaunch.calls, ["prepare", "verify", "arm", "abandon", "awaitStop"])
-        let failure = recorder.presented.last
-        XCTAssertEqual(failure?.relaunchHelperUnresolved, true)
-        XCTAssertEqual(failure?.offeredChoices, [], "no Retry, Cancel, or Quit Anyway")
-        XCTAssertEqual(failure?.messages.last, "RepoPrompt could not confirm that its restart helper stopped.")
+        let failure = try XCTUnwrap(recorder.presented.last)
+        XCTAssertTrue(failure.relaunchHelperUnresolved)
+        XCTAssertEqual(failure.offeredChoices, [.exitMayReopen], "no Retry, Cancel, or Quit Anyway")
+        XCTAssertEqual(failure.messages.last, Self.unresolvedStopText)
 
-        recorder.choose(.proceedAnyway)
-        await waitUntil("the ignored answer") { coordinator.applicationRequest?.relaunchHelperUnresolvedPrompts == 1 }
+        for (index, choice) in [AgentLifecycleShutdownChoice.cancel, .retry, .proceedAnyway, .cancel].enumerated() {
+            recorder.choose(choice)
+            await waitUntil("the same prompt after \(choice)") { recorder.presented.count == index + 2 && recorder.isPresenting }
+            XCTAssertEqual(request.relaunchHelperUnresolvedPrompts, index + 1)
+        }
+        XCTAssertTrue(recorder.presented.allSatisfy { $0 == failure }, "the same prompt is shown again")
         XCTAssertEqual(replies, [], "never reported finished")
-        XCTAssertEqual(coordinator.applicationRequest?.isFinished, false)
-        XCTAssertEqual(coordinator.applicationRequest?.phase, .finalizationFailed)
+        XCTAssertFalse(request.isFinished)
+        XCTAssertEqual(request.phase, .finalizationFailed)
         XCTAssertEqual(
             relaunch.calls,
             ["prepare", "verify", "arm", "abandon", "awaitStop"],
-            "no fresh helper, retry, or second arm"
+            "no repeated abandon or observation, fresh helper, retry, or second arm"
         )
-        XCTAssertTrue(relaunch.isAwaitingStop, "an ignored answer keeps waiting for the stop proof")
+        XCTAssertTrue(relaunch.isAwaitingStop, "waiting keeps observing the stop proof")
+        XCTAssertEqual(relaunch.cancelledStopWaits, 0)
+        XCTAssertEqual(recorder.dismissed, [])
+        XCTAssertEqual(request.finalizationAttempts, 1)
         XCTAssertEqual(participant.finalizeCalls, 1)
+        XCTAssertEqual(participant.teardownExecutions, 1)
+        XCTAssertEqual(request.expiry, clock.instant(at: .seconds(7)), "no renewed deadline")
+        XCTAssertNotNil(request.relaunchArmSafetyProof)
+
         relaunch.proveRetainedHelperStop()
-        await waitUntil("choices restored after the informational answer") { recorder.presented.count == 2 && recorder.isPresenting }
-        XCTAssertEqual(recorder.presented.last?.offeredChoices, [.retry, .proceedAnyway])
+        await waitUntil("choices restored") { recorder.presented.count == 6 && recorder.isPresenting }
+        let restored = recorder.presented.last
+        XCTAssertEqual(restored?.offeredChoices, [.retry, .proceedAnyway])
+        XCTAssertEqual(restored?.offersUncertainRelaunchExit, false)
+        XCTAssertNil(request.relaunchArmSafetyProof, "the proven stop ends the uncertainty")
+        XCTAssertEqual(request.relaunchHelperUnresolvedPrompts, 4, "the dismissed prompt's answer is not counted")
         XCTAssertEqual(replies, [], "late proof does not quit automatically")
         recorder.choose(.proceedAnyway)
         await waitUntil("explicit Quit Anyway completes") { replies == [true] }
-        XCTAssertEqual(relaunch.calls.count { $0 == "arm" }, 1, "no automatic second arm")
+        XCTAssertEqual(relaunch.calls.count { $0 == "arm" }, 1, "Quit Anyway never relaunches")
+        XCTAssertEqual(relaunch.calls.last, "abandon")
+        XCTAssertFalse(request.relaunchArmed)
+        XCTAssertEqual(request.relaunchUncertainExits, 0, "the ordinary Quit Anyway is not the uncertain exit")
     }
 
     /// Step 4b: once the retained (arm-sent) helper's stop is proven, the no-choice prompt is
@@ -1422,7 +1473,7 @@ final class AgentLifecycleShutdownCoordinatorTests: XCTestCase {
         await waitUntil("the no-choice prompt and its stop observation") { recorder.isPresenting && relaunch.isAwaitingStop }
         XCTAssertEqual(relaunch.calls, ["prepare", "verify", "arm", "abandon", "awaitStop"])
         let informational = recorder.presented.last
-        XCTAssertEqual(informational?.offeredChoices, [])
+        XCTAssertEqual(informational?.offeredChoices, [.exitMayReopen], "only the explicit uncertain exit (Step 4c)")
         let request = coordinator.applicationRequest
         XCTAssertEqual(request?.expiry, clock.instant(at: .seconds(7)))
         await drainLaunchMarks()
@@ -1487,7 +1538,9 @@ final class AgentLifecycleShutdownCoordinatorTests: XCTestCase {
         XCTAssertTrue(coordinator.requestApplicationQuit(reason: .safeRestart) { replies.append($0) })
         await waitUntil("the restored prompt") { recorder.presented.count == 2 && recorder.isPresenting }
         XCTAssertEqual(recorder.presented.first?.relaunchHelperUnresolved, true)
+        XCTAssertEqual(recorder.presented.first?.offersUncertainRelaunchExit, true)
         XCTAssertEqual(recorder.presented.last?.offeredChoices, [.retry, .proceedAnyway])
+        XCTAssertNil(coordinator.applicationRequest?.relaunchArmSafetyProof)
         XCTAssertEqual(relaunch.calls, ["prepare", "verify", "arm", "abandon", "awaitStop", "abandon"])
 
         recorder.choose(.proceedAnyway)
@@ -1534,8 +1587,485 @@ final class AgentLifecycleShutdownCoordinatorTests: XCTestCase {
         XCTAssertEqual(relaunch.calls.last, "abandon")
     }
 
-    /// A helper channel that never replies and never exits on its own; it records frames and kill
-    /// requests (a delivered signal is never exit proof).
+    // MARK: Restart safely, explicit uncertain exit (Step 4c)
+
+    /// The explicit uncertain exit completes the request exactly once without claiming the helper
+    /// stopped: the observation is cancelled, and no helper hook, launch mark, finalization,
+    /// teardown, or deadline follows. A later proof or answer does nothing.
+    func testSafeRestartUncertainExitCompletesOnceWithoutHooksMarksOrDeadline() async throws {
+        let participant = FakeParticipant()
+        appParticipants = [participant]
+        let relaunch = FakeRelaunch()
+        relaunch.armResults = [Self.lostArmText]
+        relaunch.abandonResults = [.unresolved(Self.unresolvedStopText)]
+        let coordinator = makeCoordinator(relaunch: relaunch.hooks)
+        var replies: [Bool] = []
+        XCTAssertTrue(coordinator.requestApplicationQuit(reason: .safeRestart) { replies.append($0) })
+        await waitUntil("the unresolved prompt and its stop observation") { recorder.isPresenting && relaunch.isAwaitingStop }
+        let request = try XCTUnwrap(coordinator.applicationRequest)
+        let failure = try XCTUnwrap(recorder.presented.last)
+        XCTAssertEqual(failure.stage, .finalization)
+        XCTAssertTrue(failure.offersUncertainRelaunchExit)
+        XCTAssertEqual(failure.offeredChoices, [.exitMayReopen])
+        XCTAssertEqual(
+            request.relaunchArmSafetyProof,
+            AgentLifecycleShutdownCoordinator.RelaunchArmSafetyProof(requestID: request.id, attemptID: request.attemptID),
+            "the witness of exactly this request's current attempt"
+        )
+        await drainLaunchMarks()
+        let marksBefore = disk.committed
+        XCTAssertEqual(marksBefore.last, .cleanExit)
+        clock.advance(by: .seconds(3))
+
+        recorder.choose(.exitMayReopen)
+        await waitUntil("the exit reply") { replies == [true] }
+        await waitUntil("the observation is cancelled") { relaunch.cancelledStopWaits == 1 }
+        XCTAssertEqual(request.phase, .completed)
+        XCTAssertTrue(request.isFinished)
+        XCTAssertEqual(request.relaunchUncertainExits, 1)
+        XCTAssertFalse(request.relaunchArmed, "never claimed armed")
+        XCTAssertNil(request.relaunchArmSafetyProof)
+        XCTAssertEqual(request.relaunchHelperStopRecoveries, 0, "not a stop recovery")
+        XCTAssertEqual(request.relaunchHelperUnresolvedPrompts, 0)
+        XCTAssertEqual(request.finalizationAttempts, 1)
+        XCTAssertEqual(request.expiry, clock.instant(at: .seconds(7)), "no renewed deadline")
+        XCTAssertFalse(relaunch.isAwaitingStop)
+        XCTAssertEqual(
+            relaunch.calls,
+            ["prepare", "verify", "arm", "abandon", "awaitStop"],
+            "no abandon, prepare, arm, or verify follows the exit"
+        )
+        XCTAssertEqual(participant.finalizeCalls, 1)
+        XCTAssertEqual(participant.teardownExecutions, 1)
+        XCTAssertEqual(recorder.scopeTeardowns, [.application])
+        await drainLaunchMarks()
+        XCTAssertEqual(disk.committed, marksBefore, "no further launch mark")
+        assertHonestUncertainExitAlert(failure)
+
+        relaunch.proveRetainedHelperStop()
+        recorder.choose(.exitMayReopen)
+        await settle()
+        XCTAssertEqual(replies, [true], "completed exactly once")
+        XCTAssertEqual(recorder.presented.count, 1, "no replacement prompt")
+        XCTAssertEqual(recorder.dismissed, [])
+        XCTAssertEqual(request.relaunchHelperStopRecoveries, 0)
+    }
+
+    /// Proof before answer: the stop proof invalidates the exit prompt before dismissing it, so an
+    /// exit answer resumed by that dismissal is stale and ignored. On the restored ordinary prompt
+    /// the exit is rejected (shown again), never reinterpreted as Cancel or Quit Anyway.
+    func testSafeRestartExitAnswerResumedByTheProofDismissalLosesToTheProof() async throws {
+        let participant = FakeParticipant()
+        appParticipants = [participant]
+        let relaunch = FakeRelaunch()
+        relaunch.armResults = [Self.lostArmText]
+        relaunch.abandonResults = [.unresolved(Self.unresolvedStopText)]
+        let coordinator = makeCoordinator(relaunch: relaunch.hooks)
+        var replies: [Bool] = []
+        XCTAssertTrue(coordinator.requestApplicationQuit(reason: .safeRestart) { replies.append($0) })
+        await waitUntil("the unresolved prompt and its stop observation") { recorder.isPresenting && relaunch.isAwaitingStop }
+        let request = try XCTUnwrap(coordinator.applicationRequest)
+        XCTAssertEqual(recorder.presented.last?.offeredChoices, [.exitMayReopen])
+
+        recorder.answerOnDismiss = .exitMayReopen
+        relaunch.proveRetainedHelperStop()
+        await waitUntil("the restored prompt") { recorder.presented.count == 2 && recorder.isPresenting }
+        recorder.answerOnDismiss = .cancel
+        await settle()
+        XCTAssertEqual(recorder.dismissed, [.application])
+        XCTAssertEqual(replies, [], "the dismissed prompt's exit answer loses to the proof")
+        XCTAssertEqual(request.relaunchUncertainExits, 0)
+        XCTAssertFalse(request.isFinished)
+        XCTAssertEqual(recorder.presented.last?.offeredChoices, [.retry, .proceedAnyway])
+
+        recorder.choose(.exitMayReopen)
+        await waitUntil("the ordinary prompt shown again") { recorder.presented.count == 3 && recorder.isPresenting }
+        XCTAssertEqual(request.rejectedUncertainExitAnswers, 1)
+        XCTAssertEqual(recorder.presented[2], recorder.presented[1], "the same ordinary prompt")
+        XCTAssertEqual(replies, [], "never a Quit Anyway")
+        XCTAssertEqual(request.phase, .finalizationFailed, "never a Cancel")
+        XCTAssertEqual(
+            relaunch.calls,
+            ["prepare", "verify", "arm", "abandon", "awaitStop", "abandon"],
+            "a rejected answer repeats no hook"
+        )
+
+        recorder.choose(.proceedAnyway)
+        await waitUntil("the ordinary Quit Anyway") { replies == [true] }
+        XCTAssertEqual(relaunch.calls.count { $0 == "arm" }, 1)
+        XCTAssertEqual(request.relaunchUncertainExits, 0)
+    }
+
+    /// A deadline firing while `arm` is in flight keeps the attempt's pre-arm witness, so the
+    /// unresolved prompt offers the exit; the timed-out attempt's late `armed` never mutates the
+    /// request or completes it.
+    func testSafeRestartTimeoutWhileArmIsInFlightKeepsTheWitnessAndFencesTheLateArm() async throws {
+        let participant = FakeParticipant()
+        appParticipants = [participant]
+        let relaunch = FakeRelaunch()
+        let armHang = makeHang()
+        relaunch.armGate = armHang
+        relaunch.abandonResults = [.unresolved(Self.unresolvedStopText)]
+        let coordinator = makeCoordinator(relaunch: relaunch.hooks)
+        var replies: [Bool] = []
+        XCTAssertTrue(coordinator.requestApplicationQuit(reason: .safeRestart) { replies.append($0) })
+        await waitUntil("arm in flight") { armHang.entered == 1 }
+        let request = try XCTUnwrap(coordinator.applicationRequest)
+        let attempt = request.attemptID
+        XCTAssertEqual(
+            request.relaunchArmSafetyProof,
+            AgentLifecycleShutdownCoordinator.RelaunchArmSafetyProof(requestID: request.id, attemptID: attempt),
+            "recorded before arm was entered"
+        )
+
+        clock.advance(by: .seconds(7))
+        await waitUntil("the unresolved prompt and its stop observation") { recorder.isPresenting && relaunch.isAwaitingStop }
+        let failure = try XCTUnwrap(recorder.presented.last)
+        XCTAssertTrue(failure.timedOut)
+        XCTAssertEqual(failure.offeredChoices, [.exitMayReopen])
+        XCTAssertEqual(request.attemptID, attempt)
+        // Review A F1 / B P2-1: the coordinator's own timeout prompt, through the real builder.
+        XCTAssertEqual(
+            failure.messages,
+            [AgentLifecycleShutdownCoordinator.restartArmUnconfirmedMessage, Self.unresolvedStopText],
+            "the restart-timeout text is replaced; the stop diagnostic stays"
+        )
+        XCTAssertFalse(failure.awaitsCleanExitAcknowledgement, "the witness proves the clean write")
+        assertHonestUncertainExitAlert(failure)
+
+        armHang.release()
+        await settle()
+        XCTAssertFalse(request.relaunchArmed, "a stale attempt's late armed is fenced")
+        XCTAssertEqual(replies, [], "a stale arm never completes the request")
+        XCTAssertFalse(request.isFinished)
+        XCTAssertEqual(recorder.presented.count, 1)
+        XCTAssertTrue(recorder.isPresenting)
+
+        recorder.choose(.exitMayReopen)
+        await waitUntil("the exit reply") { replies == [true] }
+        XCTAssertEqual(request.relaunchUncertainExits, 1)
+        XCTAssertEqual(relaunch.calls, ["prepare", "verify", "arm", "abandon", "awaitStop"])
+    }
+
+    /// Verification or helper preparation still suspended when the deadline fires never lets the
+    /// late continuation record the witness or arm, and a witness never survives into a new
+    /// attempt: both unresolved prompts only inform (no exit; an exit answer is ignored, not shown
+    /// again).
+    func testSafeRestartLateVerifyOrPrepareAfterATimeoutNeverRecordsTheWitnessOrArms() async throws {
+        let participant = FakeParticipant()
+        appParticipants = [participant]
+        let relaunch = FakeRelaunch()
+        let verifyHang = makeHang()
+        relaunch.verifyGate = verifyHang
+        relaunch.abandonResults = [.unresolved(Self.unresolvedStopText)]
+        let coordinator = makeCoordinator(relaunch: relaunch.hooks)
+        var replies: [Bool] = []
+        XCTAssertTrue(coordinator.requestApplicationQuit(reason: .safeRestart) { replies.append($0) })
+        await waitUntil("verification in flight") { verifyHang.entered == 1 }
+        let request = try XCTUnwrap(coordinator.applicationRequest)
+        clock.advance(by: .seconds(7))
+        await waitUntil("the unresolved prompt") { recorder.isPresenting && relaunch.isAwaitingStop }
+        XCTAssertEqual(recorder.presented.last?.offeredChoices, [])
+        XCTAssertEqual(recorder.presented.last?.relaunchHelperUnresolved, true)
+        XCTAssertEqual(
+            recorder.presented.last?.messages.first,
+            AgentLifecycleShutdownCoordinator.restartTimeoutMessage,
+            "an unadmitted prompt keeps its timeout text"
+        )
+        verifyHang.release()
+        await settle()
+        XCTAssertNil(request.relaunchArmSafetyProof)
+        XCTAssertFalse(relaunch.calls.contains("arm"), "the late verification never arms")
+        recorder.choose(.exitMayReopen)
+        await waitUntil("the ignored answer") { request.relaunchHelperUnresolvedPrompts == 1 }
+        await settle()
+        XCTAssertEqual(recorder.presented.count, 1, "not offered: ignored, not shown again")
+        XCTAssertEqual(replies, [])
+        XCTAssertEqual(request.relaunchUncertainExits, 0)
+
+        // The stop proof restores the choices; the explicit Retry's preparation outlives its fresh
+        // deadline.
+        relaunch.proveRetainedHelperStop()
+        await waitUntil("the restored prompt") { recorder.presented.count == 2 && recorder.isPresenting }
+        let restored = try XCTUnwrap(recorder.presented.last)
+        XCTAssertEqual(restored.offeredChoices, [.retry, .proceedAnyway])
+        // Resolved timeout: "won't restart automatically. Try again, or quit" is true again.
+        XCTAssertEqual(restored.messages, [AgentLifecycleShutdownCoordinator.restartTimeoutMessage])
+        let restoredAlert = WindowStatesManager.makeLifecycleShutdownFailureAlert(restored)
+        XCTAssertEqual(restoredAlert.buttons.map(\.title), ["Retry", "Quit Anyway"])
+        XCTAssertTrue(restoredAlert.informativeText.hasPrefix(AgentLifecycleShutdownCoordinator.restartTimeoutMessage))
+        let prepareHang = makeHang()
+        relaunch.prepareGate = prepareHang
+        relaunch.abandonResults = [.unresolved(Self.unresolvedStopText)]
+        recorder.choose(.retry)
+        await waitUntil("the retry's preparation in flight") { prepareHang.entered == 1 }
+        XCTAssertNil(request.relaunchArmSafetyProof)
+        clock.advance(by: .seconds(7))
+        await waitUntil("the retry's unresolved prompt") {
+            recorder.presented.count == 3 && recorder.isPresenting && relaunch.isAwaitingStop
+        }
+        XCTAssertEqual(recorder.presented.last?.offeredChoices, [], "no witness from the earlier attempt")
+        prepareHang.release()
+        await settle()
+        XCTAssertNil(request.relaunchArmSafetyProof)
+        XCTAssertFalse(relaunch.calls.contains("arm"), "the late preparation never arms")
+        XCTAssertEqual(
+            relaunch.calls,
+            ["prepare", "verify", "abandon", "awaitStop", "abandon", "verify", "prepare", "abandon", "awaitStop"]
+        )
+
+        relaunch.proveRetainedHelperStop()
+        await waitUntil("the restored prompt") { recorder.presented.count == 4 && recorder.isPresenting }
+        recorder.choose(.proceedAnyway)
+        await waitUntil("the ordinary Quit Anyway") { replies == [true] }
+        XCTAssertEqual(request.relaunchUncertainExits, 0)
+    }
+
+    /// The real alert for an admitted uncertain exit never contradicts it: no promise that the app
+    /// won't restart, no unconfirmed clean write, no Try again / quit-without-restarting advice.
+    private func assertHonestUncertainExitAlert(
+        _ failure: AgentLifecycleShutdownFailure,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) {
+        XCTAssertTrue(failure.offersUncertainRelaunchExit, file: file, line: line)
+        let alert = WindowStatesManager.makeLifecycleShutdownFailureAlert(failure)
+        XCTAssertEqual(alert.buttons.map(\.title), ["Keep Waiting", "Exit \u{2014} may reopen"], file: file, line: line)
+        let text = alert.informativeText
+        for contradiction in [
+            "won't restart automatically",
+            "Try again",
+            "quit without restarting",
+            "that it recorded a clean exit",
+            "could not record"
+        ] {
+            XCTAssertFalse(text.contains(contradiction), "contradicts the exit: \(contradiction)\n\(text)", file: file, line: line)
+        }
+        XCTAssertTrue(text.contains("may reopen automatically, or it may not"), text, file: file, line: line)
+    }
+
+    /// Unresolved prompts without this attempt's pre-arm witness only inform, as before Step 4c.
+    private func assertUnresolvedPromptOffersNoExit(
+        _ coordinator: AgentLifecycleShutdownCoordinator,
+        _ relaunch: FakeRelaunch,
+        stage: AgentLifecycleShutdownStage,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) async {
+        await waitUntil("the unresolved prompt", file: file, line: line) { recorder.isPresenting && relaunch.isAwaitingStop }
+        let failure = recorder.presented.last
+        XCTAssertEqual(failure?.stage, stage, file: file, line: line)
+        XCTAssertEqual(failure?.relaunchHelperUnresolved, true, file: file, line: line)
+        XCTAssertEqual(failure?.offeredChoices, [], file: file, line: line)
+        XCTAssertEqual(failure?.offersUncertainRelaunchExit, false, file: file, line: line)
+        XCTAssertNil(coordinator.applicationRequest?.relaunchArmSafetyProof, file: file, line: line)
+        XCTAssertFalse(relaunch.calls.contains("arm"), file: file, line: line)
+        let shown = recorder.presented.count
+        recorder.choose(.exitMayReopen)
+        await waitUntil("the ignored answer", file: file, line: line) {
+            coordinator.applicationRequest?.relaunchHelperUnresolvedPrompts == 1
+        }
+        await settle()
+        XCTAssertEqual(recorder.presented.count, shown, "ignored, not shown again", file: file, line: line)
+        XCTAssertEqual(coordinator.applicationRequest?.isFinished, false, file: file, line: line)
+        XCTAssertEqual(coordinator.applicationRequest?.relaunchUncertainExits, 0, file: file, line: line)
+        // Cleanup through the existing path: proof restores the ordinary choices.
+        relaunch.proveRetainedHelperStop()
+        await waitUntil("the restored prompt", file: file, line: line) { recorder.presented.count == shown + 1 && recorder.isPresenting }
+    }
+
+    func testSafeRestartFailedCleanWriteNeverAdmitsTheUncertainExit() async {
+        let participant = FakeParticipant()
+        appParticipants = [participant]
+        disk.fail(.cleanExit)
+        let relaunch = FakeRelaunch()
+        relaunch.abandonResults = [.unresolved(Self.unresolvedStopText)]
+        let coordinator = makeCoordinator(relaunch: relaunch.hooks)
+        var replies: [Bool] = []
+        XCTAssertTrue(coordinator.requestApplicationQuit(reason: .safeRestart) { replies.append($0) })
+        await assertUnresolvedPromptOffersNoExit(coordinator, relaunch, stage: .finalization)
+        XCTAssertEqual(recorder.presented.first?.messages.first, AgentLifecycleShutdownCoordinator.cleanMarkFailureMessage)
+        XCTAssertFalse(relaunch.calls.contains("verify"))
+        recorder.choose(.proceedAnyway)
+        await waitUntil("the ordinary Quit Anyway") { replies == [true] }
+    }
+
+    func testSafeRestartPendingCleanWriteNeverAdmitsTheUncertainExit() async {
+        let participant = FakeParticipant()
+        appParticipants = [participant]
+        disk.hold(.cleanExit)
+        let relaunch = FakeRelaunch()
+        relaunch.abandonResults = [.unresolved(Self.unresolvedStopText)]
+        let coordinator = makeCoordinator(relaunch: relaunch.hooks)
+        var replies: [Bool] = []
+        XCTAssertTrue(coordinator.requestApplicationQuit(reason: .safeRestart) { replies.append($0) })
+        await waitUntil("the held clean write") { disk.isHolding(.cleanExit) }
+        clock.advance(by: .seconds(7))
+        await assertUnresolvedPromptOffersNoExit(coordinator, relaunch, stage: .finalization)
+        XCTAssertEqual(recorder.presented.first?.messages.first, AgentLifecycleShutdownCoordinator.restartTimeoutMessage)
+        disk.release(.cleanExit)
+        await drainLaunchMarks()
+        await settle()
+        XCTAssertFalse(relaunch.calls.contains("verify"), "a late acknowledgement never continues the timed-out attempt")
+        XCTAssertNil(coordinator.applicationRequest?.relaunchArmSafetyProof)
+        recorder.choose(.proceedAnyway)
+        await waitUntil("the ordinary Quit Anyway") { replies == [true] }
+    }
+
+    func testSafeRestartFailedStopVerificationNeverAdmitsTheUncertainExit() async {
+        let participant = FakeParticipant()
+        appParticipants = [participant]
+        let relaunch = FakeRelaunch()
+        relaunch.verifyResults = ["A tool is still running."]
+        relaunch.abandonResults = [.unresolved(Self.unresolvedStopText)]
+        let coordinator = makeCoordinator(relaunch: relaunch.hooks)
+        var replies: [Bool] = []
+        XCTAssertTrue(coordinator.requestApplicationQuit(reason: .safeRestart) { replies.append($0) })
+        await assertUnresolvedPromptOffersNoExit(coordinator, relaunch, stage: .finalization)
+        XCTAssertEqual(recorder.presented.first?.messages.first, "A tool is still running.")
+        recorder.choose(.proceedAnyway)
+        await waitUntil("the ordinary Quit Anyway") { replies == [true] }
+    }
+
+    func testSafeRestartStageAUnresolvedHelperNeverAdmitsTheUncertainExit() async {
+        let participant = FakeParticipant()
+        appParticipants = [participant]
+        let relaunch = FakeRelaunch()
+        relaunch.prepareResults = ["RepoPrompt could not start its restart helper."]
+        relaunch.abandonResults = [.unresolved(Self.unresolvedStopText)]
+        let coordinator = makeCoordinator(relaunch: relaunch.hooks)
+        var replies: [Bool] = []
+        XCTAssertTrue(coordinator.requestApplicationQuit(reason: .safeRestart) { replies.append($0) })
+        await assertUnresolvedPromptOffersNoExit(coordinator, relaunch, stage: .preparation)
+        XCTAssertEqual(recorder.presented.last?.offeredChoices, [.retry, .cancel])
+        XCTAssertTrue(recorder.irreversible.isEmpty)
+        recorder.choose(.cancel)
+        await waitUntil("the cancelled reply") { replies == [false] }
+    }
+
+    /// An `.unresolvedUnarmed` stop after the arm attempt clears the witness (the helper can never
+    /// open anything): the ordinary choices stay, and an exit answer is rejected, never a quit.
+    func testSafeRestartUnresolvedUnarmedStageBKeepsTheOrdinaryChoicesAndRejectsTheExit() async throws {
+        let participant = FakeParticipant()
+        appParticipants = [participant]
+        let relaunch = FakeRelaunch()
+        relaunch.armResults = [Self.lostArmText]
+        relaunch.abandonResults = [.unresolvedUnarmed(Self.unresolvedStopText)]
+        let coordinator = makeCoordinator(relaunch: relaunch.hooks)
+        var replies: [Bool] = []
+        XCTAssertTrue(coordinator.requestApplicationQuit(reason: .safeRestart) { replies.append($0) })
+        await waitUntil("the Stage B prompt") { recorder.isPresenting }
+        let request = try XCTUnwrap(coordinator.applicationRequest)
+        XCTAssertEqual(recorder.presented.last?.relaunchHelperUnresolved, false)
+        XCTAssertEqual(recorder.presented.last?.offeredChoices, [.retry, .proceedAnyway])
+        XCTAssertNil(request.relaunchArmSafetyProof)
+
+        recorder.choose(.exitMayReopen)
+        await waitUntil("the same prompt") { recorder.presented.count == 2 && recorder.isPresenting }
+        XCTAssertEqual(request.rejectedUncertainExitAnswers, 1)
+        XCTAssertEqual(replies, [])
+        XCTAssertEqual(relaunch.calls, ["prepare", "verify", "arm", "abandon"], "no repeated abandon")
+
+        recorder.choose(.proceedAnyway)
+        await waitUntil("the ordinary Quit Anyway") { replies == [true] }
+        XCTAssertEqual(request.relaunchUncertainExits, 0)
+        XCTAssertFalse(request.relaunchArmed)
+    }
+
+    private func makeFailure(
+        scope: AgentLifecycleShutdownScope = .application,
+        stage: AgentLifecycleShutdownStage,
+        unresolved: Bool = false,
+        allowsExit: Bool = false
+    ) -> AgentLifecycleShutdownFailure {
+        var failure = AgentLifecycleShutdownFailure(
+            requestID: UUID(),
+            scope: scope,
+            stage: stage,
+            messages: ["Something went wrong."],
+            timedOut: false
+        )
+        failure.relaunchHelperUnresolved = unresolved
+        failure.allowsUncertainRelaunchExit = allowsExit
+        return failure
+    }
+
+    /// Only an admitted unresolved app Stage B prompt offers the exit (window close, Stage A, and an
+    /// unadmitted prompt never do); `appending` carries the admission forward.
+    func testUncertainExitIsOfferedOnlyOnAnAdmittedUnresolvedApplicationStageBPrompt() {
+        XCTAssertEqual(makeFailure(stage: .finalization, unresolved: true, allowsExit: true).offeredChoices, [.exitMayReopen])
+        XCTAssertEqual(makeFailure(stage: .finalization, unresolved: true).offeredChoices, [])
+        XCTAssertEqual(makeFailure(stage: .preparation, unresolved: true, allowsExit: true).offeredChoices, [])
+        XCTAssertEqual(makeFailure(scope: .window(1), stage: .finalization, unresolved: true, allowsExit: true).offeredChoices, [])
+        XCTAssertEqual(makeFailure(stage: .finalization, allowsExit: true).offeredChoices, [.retry, .proceedAnyway])
+        XCTAssertEqual(makeFailure(stage: .preparation).offeredChoices, [.retry, .cancel])
+        XCTAssertEqual(makeFailure(scope: .window(1), stage: .finalization).offeredChoices, [.retry, .proceedAnyway])
+
+        let base = makeFailure(stage: .finalization)
+        let admitted = base.appending("unresolved", relaunchHelperUnresolved: true, allowsUncertainRelaunchExit: true)
+        XCTAssertTrue(admitted.offersUncertainRelaunchExit)
+        let carried = admitted.appending("more", relaunchHelperUnresolved: false)
+        XCTAssertTrue(carried.relaunchHelperUnresolved)
+        XCTAssertTrue(carried.offersUncertainRelaunchExit, "carried forward")
+        XCTAssertEqual(carried.messages, ["Something went wrong.", "unresolved", "more"])
+        XCTAssertFalse(
+            base.appending("unarmed", relaunchHelperUnresolved: false, allowsUncertainRelaunchExit: true).allowsUncertainRelaunchExit,
+            "never admitted without an unresolved helper"
+        )
+    }
+
+    /// The AppKit adapter's builder and mapper, without showing anything: Keep Waiting first and
+    /// default (Return), the exit second with no key equivalent; the unresolved branch is decided
+    /// before the stage mapping, so no dismissal (sheet `.cancel`, app-modal `.abort`) or first
+    /// button ever becomes an exit or a Retry there. Ordinary prompts keep their mapping.
+    func testLifecycleShutdownAlertButtonsKeysAndResponseMapping() {
+        let eligible = makeFailure(stage: .finalization, unresolved: true, allowsExit: true)
+        let alert = WindowStatesManager.makeLifecycleShutdownFailureAlert(eligible)
+        XCTAssertEqual(alert.buttons.map(\.title), ["Keep Waiting", "Exit \u{2014} may reopen"])
+        XCTAssertEqual(alert.buttons.map(\.keyEquivalent), ["\r", ""])
+        XCTAssertEqual(alert.messageText, "RepoPrompt can exit, but may reopen")
+        XCTAssertTrue(alert.informativeText.hasPrefix("Something went wrong."))
+        XCTAssertTrue(alert.informativeText.contains("Before RepoPrompt asked its restart helper to arm"), alert.informativeText)
+        XCTAssertTrue(alert.informativeText.contains("may reopen automatically, or it may not"), alert.informativeText)
+        XCTAssertFalse(alert.informativeText.contains("second"), "no bound is promised")
+
+        let informative = makeFailure(stage: .finalization, unresolved: true)
+        XCTAssertEqual(WindowStatesManager.makeLifecycleShutdownFailureAlert(informative).buttons.map(\.title), ["OK"])
+        XCTAssertEqual(
+            WindowStatesManager.makeLifecycleShutdownFailureAlert(makeFailure(stage: .finalization)).buttons.map(\.title),
+            ["Retry", "Quit Anyway"]
+        )
+        XCTAssertEqual(
+            WindowStatesManager.makeLifecycleShutdownFailureAlert(makeFailure(scope: .window(1), stage: .finalization)).buttons.map(\.title),
+            ["Retry", "Close Anyway"]
+        )
+        XCTAssertEqual(
+            WindowStatesManager.makeLifecycleShutdownFailureAlert(makeFailure(stage: .preparation)).buttons.map(\.title),
+            ["Retry", "Cancel"]
+        )
+
+        let responses: [NSApplication.ModalResponse] = [
+            .alertFirstButtonReturn, .alertSecondButtonReturn, .alertThirdButtonReturn, .cancel, .abort, .stop
+        ]
+        func mapped(_ failure: AgentLifecycleShutdownFailure) -> [AgentLifecycleShutdownChoice] {
+            responses.map { WindowStatesManager.lifecycleShutdownChoice(for: failure, response: $0) }
+        }
+        XCTAssertEqual(mapped(eligible), [.cancel, .exitMayReopen, .cancel, .cancel, .cancel, .cancel])
+        XCTAssertEqual(mapped(informative), Array(repeating: .cancel, count: responses.count))
+        XCTAssertEqual(
+            mapped(makeFailure(scope: .window(1), stage: .finalization, unresolved: true, allowsExit: true)),
+            Array(repeating: .cancel, count: responses.count),
+            "never an exit outside the app's Stage B"
+        )
+        XCTAssertEqual(
+            mapped(makeFailure(stage: .finalization)),
+            [.retry, .proceedAnyway, .cancel, .cancel, .cancel, .cancel]
+        )
+        XCTAssertEqual(mapped(makeFailure(stage: .preparation)), [.retry, .cancel, .cancel, .cancel, .cancel, .cancel])
+    }
+
+    /// A helper channel that never exits on its own and replies only as `respond` scripts (by
+    /// default never); it records frames and kill requests (a delivered signal is never exit proof).
     private final class SilentRelaunchChannel: @unchecked Sendable {
         private let lock = NSLock()
         private var frames = 0
@@ -1545,12 +2075,15 @@ final class AgentLifecycleShutdownCoordinatorTests: XCTestCase {
         private let continuation: AsyncStream<ProcessRelaunchInbound>.Continuation
         private(set) var channel: ProcessRelaunchHelperChannel!
 
-        init() {
+        init(respond: @escaping @Sendable (ProcessRelaunchMessage) -> ProcessRelaunchMessage? = { _ in nil }) {
             let (inbound, continuation) = AsyncStream<ProcessRelaunchInbound>.makeStream()
             self.continuation = continuation
             channel = ProcessRelaunchHelperChannel(
-                send: { [self] _ in
+                send: { [self] data in
                     lock.withLock { frames += 1 }
+                    if let message = try? ProcessRelaunchCodec.decode(data.dropLast()), let reply = respond(message) {
+                        continuation.yield(.message(reply))
+                    }
                     return true
                 },
                 inbound: inbound,
@@ -1672,6 +2205,105 @@ final class AgentLifecycleShutdownCoordinatorTests: XCTestCase {
         XCTAssertFalse(participant.isFrozen)
         XCTAssertTrue(driver.retainsHelper, "still retained until its stop is proven")
         XCTAssertEqual(driver.spawnCount, 1, "no fresh helper")
+    }
+
+    /// Review B P2-2: the real relaunch driver over a helper channel that answers `ready` but never
+    /// `armed` and never exits (no process). R4's deadline and the driver's `armed` wait share the
+    /// work expiry, so the Stage B timeout lands while `arm` is in flight; the driver's `abandon`
+    /// reports `.unresolved` (arm sent), so the admitted prompt is honest, and the explicit exit
+    /// completes once while the driver keeps owning the helper (no fresh helper, frame, or kill).
+    func testSafeRestartComposedLostArmAcknowledgementOffersAnHonestExitAndTheDriverKeepsTheHelper() async throws {
+        let participant = FakeParticipant()
+        appParticipants = [participant]
+        let clock = try XCTUnwrap(clock)
+        let readyOnly = SilentRelaunchChannel { message in
+            if case let .prepare(id, _, _) = message { return .ready(correlationID: id) }
+            return nil
+        }
+        defer { readyOnly.exit() }
+        let bootSessionID = try XCTUnwrap(UUID(uuidString: "0A0B0C0D-1111-4222-8333-944455556666"))
+        let identity = ProcessRelaunchParentIdentity(
+            pid: 4242,
+            bootSessionID: bootSessionID,
+            startSeconds: 10,
+            startMicroseconds: 20,
+            uid: 501
+        )
+        let driver = AppRelaunchCoordinator(dependencies: AppRelaunchCoordinator.Dependencies(
+            spawnHelper: { readyOnly.channel },
+            parentIdentity: { identity },
+            bundlePath: "/Apps/RepoPrompt CE.app",
+            verifyAllStopped: { .allStopped },
+            sleep: { duration in try? await clock.sleep(until: clock.now + duration) },
+            now: { clock.now }
+        ))
+        let coordinator = makeCoordinator(relaunch: driver.hooks)
+        var replies: [Bool] = []
+        XCTAssertTrue(coordinator.requestApplicationQuit(reason: .safeRestart) { replies.append($0) })
+        await waitUntil("prepare and arm sent") { readyOnly.frameCount == 2 }
+        let request = try XCTUnwrap(coordinator.applicationRequest)
+        XCTAssertNotNil(request.relaunchArmSafetyProof, "recorded before arm")
+
+        // Advance only to deadlines that are actually awaited, never past the attempt's 8 s.
+        let finalExpiry = clock.instant(at: .seconds(8))
+        for _ in 0 ..< 20 {
+            await settle()
+            if recorder.isPresenting { break }
+            if let next = clock.nextPendingDeadline, next <= finalExpiry {
+                clock.advance(by: next - clock.now)
+            } else {
+                try? await Task.sleep(nanoseconds: 1_000_000)
+            }
+        }
+        await waitUntil("the admitted prompt") { recorder.isPresenting }
+        XCTAssertLessThanOrEqual(clock.now, finalExpiry, "the prompt appears by the final expiry")
+        let failure = try XCTUnwrap(recorder.presented.last)
+        XCTAssertEqual(failure.stage, .finalization)
+        XCTAssertTrue(failure.timedOut)
+        XCTAssertEqual(failure.offeredChoices, [.exitMayReopen])
+        XCTAssertEqual(failure.messages.first, AgentLifecycleShutdownCoordinator.restartArmUnconfirmedMessage)
+        XCTAssertFalse(failure.messages.contains(AgentLifecycleShutdownCoordinator.restartTimeoutMessage))
+        assertHonestUncertainExitAlert(failure)
+        XCTAssertTrue(driver.retainsHelper, "arm sent, stop unproven: ownership retained")
+        XCTAssertEqual(driver.spawnCount, 1)
+        let frames = readyOnly.frameCount
+        let kills = readyOnly.terminateCount
+
+        recorder.choose(.exitMayReopen)
+        await waitUntil("the exit reply") { replies == [true] }
+        await settle()
+        XCTAssertEqual(replies, [true])
+        XCTAssertEqual(request.relaunchUncertainExits, 1)
+        XCTAssertFalse(request.relaunchArmed)
+        XCTAssertTrue(driver.retainsHelper, "the exit never claims or forces the helper's stop")
+        XCTAssertEqual(driver.spawnCount, 1, "no fresh helper")
+        XCTAssertEqual(readyOnly.frameCount, frames, "no further frame")
+        XCTAssertEqual(readyOnly.terminateCount, kills, "no further kill request")
+        XCTAssertEqual(participant.finalizeCalls, 1)
+    }
+
+    /// A plain app quit never consults the relaunch hooks, even when they are composed: its Stage B
+    /// prompt keeps Retry / Quit Anyway and never offers or records the uncertain exit.
+    func testPlainQuitWithComposedRelaunchHooksNeverOffersTheUncertainExit() async {
+        let participant = FakeParticipant()
+        participant.finalizeResults = [AgentModeShutdownReport(blockers: ["Session A could not be saved."])]
+        appParticipants = [participant]
+        let relaunch = FakeRelaunch()
+        relaunch.abandonResults = [.unresolved(Self.unresolvedStopText)]
+        let coordinator = makeCoordinator(relaunch: relaunch.hooks)
+        var replies: [Bool] = []
+        XCTAssertTrue(coordinator.requestApplicationQuit(reason: .appQuit) { replies.append($0) })
+        await waitUntil("the Stage B prompt") { recorder.isPresenting }
+        XCTAssertEqual(recorder.presented.last?.offeredChoices, [.retry, .proceedAnyway])
+        XCTAssertEqual(recorder.presented.last?.offersUncertainRelaunchExit, false)
+        XCTAssertNil(coordinator.applicationRequest?.relaunchArmSafetyProof)
+        XCTAssertEqual(relaunch.calls, [], "no hook, abandon included")
+        recorder.choose(.exitMayReopen)
+        await waitUntil("the rejected exit shows the prompt again") { recorder.presented.count == 2 && recorder.isPresenting }
+        XCTAssertEqual(coordinator.applicationRequest?.rejectedUncertainExitAnswers, 1)
+        recorder.choose(.proceedAnyway)
+        await waitUntil("the ordinary Quit Anyway") { replies == [true] }
+        XCTAssertEqual(coordinator.applicationRequest?.relaunchUncertainExits, 0)
     }
 
     // MARK: Close authorization

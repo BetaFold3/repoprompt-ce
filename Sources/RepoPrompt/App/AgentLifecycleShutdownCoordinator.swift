@@ -41,6 +41,17 @@ import RepoPromptPlatform
 // refused (never registered, frozen, prepared, or torn down), so it cannot invalidate the proof.
 // A window close never seals. A window close that ended with Close Anyway keeps the later app quit
 // from marking itself clean.
+//
+// Restart safely, uncertain exit (lossless restart Step 4c, owner-delegated policy): when the
+// helper's stop stays unproven after an `arm` was sent, the prompt may offer one explicit
+// `.exitMayReopen` ("Exit — may reopen"). Only for the app's Stage B `.safeRestart` prompt whose
+// `abandon` returned `.unresolved`, and only when this request's current attempt recorded its
+// pre-arm witness (final persistence and clean write acknowledged, every family and tool proven
+// stopped, a ready helper, all within the attempt's work deadline) immediately before that
+// attempt's `arm`. It completes the request once without claiming the helper stopped: ownership
+// stays with the relaunch driver, and nothing is retried, spawned, armed, saved, or marked.
+// Retry, Cancel, and the ordinary Quit Anyway (which means "no relaunch") stay refused until the
+// helper's stop is proven (Step 4b then restores them).
 
 /// A window's agent state as seen by the shutdown coordinator (`AgentModeViewModel`).
 @MainActor
@@ -89,28 +100,69 @@ struct AgentLifecycleShutdownFailure: Equatable {
     /// enqueued under a valid authorization; only its acknowledgement is missing.
     var awaitsCleanExitAcknowledgement = false
     /// Restart safely (review A P1-07): the relaunch helper's stop could not be proven AFTER its
-    /// `arm` was sent, so it may still be alive and armed. No choice is offered (no Retry, Cancel,
-    /// or Quit Anyway): the prompt only informs, and any answer is ignored while ownership is
-    /// retained. A helper never sent `arm` keeps the normal choices (review R1 B N3). Once that exact
-    /// helper's stop is proven later, the prompt is replaced by the normal choices (Step 4b).
+    /// `arm` was sent, so it may still be alive and armed. No Retry, Cancel, or Quit Anyway is
+    /// offered while ownership is retained, and any such answer is ignored. A helper never sent
+    /// `arm` keeps the normal choices (review R1 B N3). Once that exact helper's stop is proven
+    /// later, the prompt is replaced by the normal choices (Step 4b).
     var relaunchHelperUnresolved = false
+    /// Restart safely (Step 4c): on an unresolved prompt, the app's Stage B `.safeRestart` request
+    /// holds its current attempt's pre-arm witness, so the explicit `.exitMayReopen` is offered.
+    /// Set only by the coordinator; meaningless (and ignored) without `relaunchHelperUnresolved`.
+    var allowsUncertainRelaunchExit = false
 
-    /// The choices this prompt may offer (none while a possibly armed relaunch helper is unresolved).
+    /// The choices this prompt may offer: while a possibly armed relaunch helper is unresolved,
+    /// only the explicit uncertain exit (when admitted), otherwise none.
     var offeredChoices: [AgentLifecycleShutdownChoice] {
-        guard !relaunchHelperUnresolved else { return [] }
+        guard !relaunchHelperUnresolved else {
+            return offersUncertainRelaunchExit ? [.exitMayReopen] : []
+        }
         return stage == .preparation ? [.retry, .cancel] : [.retry, .proceedAnyway]
     }
 
-    /// The same prompt with `message` appended (and, when `unresolved`, no choices).
-    func appending(_ message: String, relaunchHelperUnresolved unresolved: Bool) -> AgentLifecycleShutdownFailure {
+    /// Whether this prompt offers `.exitMayReopen` (an unresolved app Stage B prompt that was
+    /// admitted by the coordinator).
+    var offersUncertainRelaunchExit: Bool {
+        relaunchHelperUnresolved && allowsUncertainRelaunchExit && scope == .application && stage == .finalization
+    }
+
+    /// The prompt as an admitted uncertain exit presents it: the pre-arm witness proves the clean
+    /// write was acknowledged, and the restart-timeout text (no automatic restart, Try again) is
+    /// replaced by the unconfirmed arm. Every other message and field is kept.
+    @MainActor
+    fileprivate func admittingUncertainRelaunchExit() -> AgentLifecycleShutdownFailure {
         AgentLifecycleShutdownFailure(
+            requestID: requestID,
+            scope: scope,
+            stage: stage,
+            messages: messages.map {
+                $0 == AgentLifecycleShutdownCoordinator.restartTimeoutMessage
+                    ? AgentLifecycleShutdownCoordinator.restartArmUnconfirmedMessage
+                    : $0
+            },
+            timedOut: timedOut,
+            awaitsCleanExitAcknowledgement: false,
+            relaunchHelperUnresolved: relaunchHelperUnresolved,
+            allowsUncertainRelaunchExit: allowsUncertainRelaunchExit
+        )
+    }
+
+    /// The same prompt with `message` appended (and, when `unresolved`, no ordinary choices; the
+    /// uncertain exit only when `allowsUncertainExit`). Every other field is carried forward.
+    func appending(
+        _ message: String,
+        relaunchHelperUnresolved unresolved: Bool,
+        allowsUncertainRelaunchExit allowsUncertainExit: Bool = false
+    ) -> AgentLifecycleShutdownFailure {
+        let isUnresolved = relaunchHelperUnresolved || unresolved
+        return AgentLifecycleShutdownFailure(
             requestID: requestID,
             scope: scope,
             stage: stage,
             messages: messages + [message],
             timedOut: timedOut,
             awaitsCleanExitAcknowledgement: awaitsCleanExitAcknowledgement,
-            relaunchHelperUnresolved: relaunchHelperUnresolved || unresolved
+            relaunchHelperUnresolved: isUnresolved,
+            allowsUncertainRelaunchExit: isUnresolved && (allowsUncertainRelaunchExit || allowsUncertainExit)
         )
     }
 }
@@ -125,7 +177,8 @@ enum AgentLifecycleRelaunchAbandonment: Equatable {
     /// retained and no fresh helper is spawned until its stop is proven.
     case unresolvedUnarmed(String)
     /// A helper's stop could not be proven after its `arm` was sent (it may be armed): it is
-    /// retained, and no choice, fresh helper, Retry, or Quit Anyway may follow.
+    /// retained, and no fresh helper, Retry, Cancel, or Quit Anyway may follow. Only the explicit
+    /// uncertain exit may, when the request's pre-arm witness admits it (Step 4c).
     case unresolved(String)
 }
 
@@ -145,6 +198,11 @@ enum AgentLifecycleShutdownChoice: Equatable {
     case cancel
     /// Stage B only.
     case proceedAnyway
+    /// Restart safely, Stage B, only on an unresolved prompt admitted by the current attempt's
+    /// pre-arm witness (Step 4c): completes the request without claiming the helper stopped (it may
+    /// still reopen the app, or may not). Never a Cancel or an ordinary Quit Anyway; rejected on
+    /// every other prompt.
+    case exitMayReopen
 }
 
 enum AgentLifecycleShutdownPhase: Equatable {
@@ -237,6 +295,23 @@ final class AgentLifecycleShutdownCoordinator {
     /// Restart safely ran out of time after the clean write was enqueued: neither that write nor
     /// the stopped-provider proof and helper arm are claimed (review B P2).
     static let restartTimeoutMessage = "RepoPrompt could not confirm within 8 seconds that it recorded a clean exit, that every agent stopped, and that it can reopen, so it won't restart automatically. Try again, or quit without restarting."
+    /// Replaces `restartTimeoutMessage` on an admitted uncertain-exit prompt only (Step 4c review A
+    /// F1 / B P2-1): its pre-arm witness proves the clean write and the stops, its helper may still
+    /// reopen the app, and Retry / Quit Anyway are not offered, so that text would contradict it.
+    static let restartArmUnconfirmedMessage = "RepoPrompt's restart helper did not confirm within 8 seconds whether it was armed."
+
+    /// Restart safely (Step 4c): an in-memory control-flow witness, recorded synchronously
+    /// immediately before an attempt invokes `relaunch.arm`, that this request's attempt had then
+    /// acknowledged its final persistence and clean write, proven every family and tool stopped,
+    /// and held a ready helper, while current and within its work deadline. Not persisted, not an
+    /// authorization, and not a helper-stop claim. It is tied to the retained helper only through
+    /// the relaunch driver's invariants (one serialized retained helper; no replacement while its
+    /// stop is unresolved; every attempt clears the witness before it can arm): if the driver ever
+    /// allows helper replacement, this association must be revisited.
+    struct RelaunchArmSafetyProof: Equatable {
+        let requestID: UUID
+        let attemptID: UUID
+    }
 
     @MainActor
     final class Request {
@@ -292,6 +367,16 @@ final class AgentLifecycleShutdownCoordinator {
         /// Restart safely: no-choice prompts replaced by the normal choices after the retained
         /// helper's stop was proven (test observability).
         fileprivate(set) var relaunchHelperStopRecoveries = 0
+        /// Restart safely (Step 4c): the current attempt's pre-arm witness. Cleared when any attempt
+        /// starts, after a `.safe`/`.unresolvedUnarmed` abandonment, on stop-proof recovery, and when
+        /// the request ends; kept through a timeout while `arm` is in flight and an `.unresolved`
+        /// abandonment.
+        fileprivate(set) var relaunchArmSafetyProof: RelaunchArmSafetyProof?
+        /// Restart safely (Step 4c): explicit uncertain exits taken (0 or 1; test observability).
+        fileprivate(set) var relaunchUncertainExits = 0
+        /// Restart safely (Step 4c): `.exitMayReopen` answers rejected outside an admitted prompt
+        /// (test observability).
+        fileprivate(set) var rejectedUncertainExitAnswers = 0
 
         fileprivate init(
             scope: AgentLifecycleShutdownScope,
@@ -454,6 +539,7 @@ final class AgentLifecycleShutdownCoordinator {
         let attempt = UUID()
         request.attemptID = attempt
         request.phase = .preparing
+        request.relaunchArmSafetyProof = nil
         // Defensive: a participant that bypassed the admission seam joins like an admitted one.
         if request.scope == .application {
             for participant in unknownParticipants(request) {
@@ -558,6 +644,7 @@ final class AgentLifecycleShutdownCoordinator {
         guard !request.isFinished else { return }
         request.phase = .cancelled
         request.isFinished = true
+        request.relaunchArmSafetyProof = nil
         request.deadlineTask?.cancel()
         request.deadlineTask = nil
         endRelaunchStopObservation(request)
@@ -584,6 +671,7 @@ final class AgentLifecycleShutdownCoordinator {
         guard !request.isFinished else { return }
         request.phase = .cancelled
         request.isFinished = true
+        request.relaunchArmSafetyProof = nil
         request.deadlineTask?.cancel()
         request.deadlineTask = nil
         endRelaunchStopObservation(request)
@@ -632,6 +720,8 @@ final class AgentLifecycleShutdownCoordinator {
         let attempt = UUID()
         request.attemptID = attempt
         request.phase = .tearingDown
+        // A new attempt never inherits an earlier attempt's pre-arm witness (Step 4c).
+        request.relaunchArmSafetyProof = nil
         if freshDeadline || request.deadlineTask == nil {
             armDeadline(request)
         }
@@ -695,6 +785,10 @@ final class AgentLifecycleShutdownCoordinator {
     /// Restart safely, after final persistence and the clean write: prove every family and tool
     /// stopped, then arm the helper (a fresh one when the Stage A helper was consumed or abandoned).
     /// A plain quit passes straight through.
+    ///
+    /// Precondition (Step 4c): called only by `runFinalization`, and only after this attempt's clean
+    /// write reported `true` (a fresh write, or Retry joining the earlier acknowledged one). The
+    /// pre-arm witness relies on it: `cleanWrite != nil` alone only means the write was enqueued.
     private func runRelaunchStep(_ request: Request, attempt: UUID) async -> (blockers: [String], timedOut: Bool)? {
         guard request.reason == .safeRestart, let relaunch = environment.relaunch else { return ([], false) }
         func stillCurrent() -> Bool {
@@ -705,22 +799,31 @@ final class AgentLifecycleShutdownCoordinator {
             return stillCurrent() ? ([blocker], false) : nil
         }
         guard stillCurrent() else { return nil }
+        // Rechecked after every await: a delayed deadline task never lets this attempt arm late.
+        if isExpired(request) { return ([Self.timeoutMessage], true) }
         if !request.relaunchHelperReady {
             if let blocker = await relaunch.prepare(relaunchBudget(request)) {
                 return stillCurrent() ? ([blocker], false) : nil
             }
             guard stillCurrent() else { return nil }
             request.relaunchHelperReady = true
+            if isExpired(request) { return ([Self.timeoutMessage], true) }
         }
+        // Step 4c: the pre-arm witness, recorded synchronously with no suspension before `arm` is
+        // entered. It stays through a timeout while `arm` is in flight (abandonment may then report
+        // the helper possibly armed); the next attempt clears it.
+        request.relaunchArmSafetyProof = RelaunchArmSafetyProof(requestID: request.id, attemptID: attempt)
         // The helper is consumed by this arm attempt whatever its outcome.
         request.relaunchHelperReady = false
         if let blocker = await relaunch.arm(relaunchBudget(request)) {
             return stillCurrent() ? ([blocker], false) : nil
         }
-        request.relaunchArmed = true
-        // Armed: completion terminates the app; the helper opens the bundle only after this exact
-        // process's verified exit. A stale attempt here is resolved by `abandon` before any prompt.
+        // A stale attempt's late `armed` never mutates the request (a replacement attempt or prompt
+        // owns it); it is resolved by `abandon` before any prompt.
         guard stillCurrent() else { return nil }
+        // Armed: completion terminates the app; the helper opens the bundle only after this exact
+        // process's verified exit.
+        request.relaunchArmed = true
         return ([], false)
     }
 
@@ -777,7 +880,30 @@ final class AgentLifecycleShutdownCoordinator {
         request.phase = .completed
         request.isFinished = true
         endRelaunchStopObservation(request)
+        // Discards only the coordinator's eligibility witness; the driver keeps helper ownership.
+        request.relaunchArmSafetyProof = nil
         request.completion(true)
+    }
+
+    /// Step 4c, the explicit uncertain exit: completes the request once, without claiming the helper
+    /// stopped. Not `proceedAnyway`: no helper hook (abandon, prepare, arm), launch or clean mark,
+    /// finalization, teardown, or deadline follows; the relaunch driver keeps owning the possibly
+    /// armed helper until the process exits (it may reopen the app, or may not).
+    private func exitWithUncertainRelaunch(_ request: Request) {
+        guard !request.isFinished else { return }
+        request.relaunchUncertainExits += 1
+        complete(request)
+    }
+
+    /// Step 4c admission, checked when the prompt is built and again when its answer arrives: the
+    /// app's Stage B `.safeRestart` request, failed in Stage B, holding the pre-arm witness of
+    /// exactly this request and `attempt` (the attempt whose `arm` preceded the `.unresolved` stop).
+    private func admitsUncertainRelaunchExit(_ request: Request, attempt: UUID, stage: AgentLifecycleShutdownStage) -> Bool {
+        guard stage == .finalization, request.scope == .application, request.reason == .safeRestart,
+              request.isPastPointOfNoReturn, isCurrent(request, attempt: attempt, phase: .finalizationFailed),
+              let proof = request.relaunchArmSafetyProof
+        else { return false }
+        return proof == RelaunchArmSafetyProof(requestID: request.id, attemptID: attempt)
     }
 
     // MARK: Failure prompt
@@ -806,29 +932,49 @@ final class AgentLifecycleShutdownCoordinator {
         let relaunch = request.reason == .safeRestart ? environment.relaunch : nil
         Task { @MainActor [weak self] in
             if let relaunch {
-                // No choice is offered while a helper may be ready or armed (a lost `armed`
-                // acknowledgement included): Retry uses a fresh helper; Quit Anyway relaunches nothing.
+                // No ordinary choice is offered while a helper may be ready or armed (a lost
+                // `armed` acknowledgement included): Retry uses a fresh helper; Quit Anyway
+                // relaunches nothing.
                 request.relaunchHelperReady = false
                 request.relaunchArmed = false
-                switch await relaunch.abandon() {
+                let abandonment = await relaunch.abandon()
+                // Fenced before any state, observation, or prompt: a superseded presentation, a
+                // retried or finished request never shows an obsolete prompt.
+                guard let self, request.presentationID == presentation,
+                      isCurrent(request, attempt: attempt, phase: failedPhase)
+                else { return }
+                switch abandonment {
                 case .safe:
-                    break
+                    // No helper can open anything: the uncertain exit has nothing to disclose.
+                    request.relaunchArmSafetyProof = nil
                 case let .unresolvedUnarmed(reason):
                     // Review R1 B N3: `arm` was never sent, so the retained helper can never open
                     // anything. The normal choices stay; the driver keeps the helper and refuses a
                     // fresh one (Retry reports it) until the helper's stop is proven.
+                    request.relaunchArmSafetyProof = nil
                     failure = failure.appending(reason, relaunchHelperUnresolved: false)
                     request.lastFailure = failure
                 case let .unresolved(reason):
-                    // Review A P1-07 (fail closed; the arm-sent exception is not approved): the
-                    // helper may still be alive and armed. Ownership stays with the relaunch
-                    // driver; no Retry, Cancel, Quit Anyway, or fresh helper; the request is never
-                    // reported finished.
-                    failure = failure.appending(reason, relaunchHelperUnresolved: true)
+                    // Review A P1-07: the helper may still be alive and armed. Ownership stays with
+                    // the relaunch driver; no Retry, Cancel, Quit Anyway, or fresh helper. Step 4c:
+                    // only the explicit uncertain exit, when this attempt's pre-arm witness admits
+                    // it; otherwise the prompt only informs and the request stays unfinished.
+                    let admitted = admitsUncertainRelaunchExit(request, attempt: attempt, stage: stage)
+                    if admitted {
+                        // Only the known restart-timeout text is replaced; other diagnostics stay.
+                        // The restored ordinary prompt (Step 4b) keeps the original `messages`,
+                        // which are true once the helper's stop is proven.
+                        failure = failure.admittingUncertainRelaunchExit()
+                    }
+                    failure = failure.appending(
+                        reason,
+                        relaunchHelperUnresolved: true,
+                        allowsUncertainRelaunchExit: admitted
+                    )
                     request.lastFailure = failure
                     // Step 4b: registered before the prompt is shown (proof that already arrived
                     // is replayed), so a later proof restores the choices.
-                    self?.observeRelaunchHelperStop(
+                    observeRelaunchHelperStop(
                         request,
                         attempt: attempt,
                         stage: stage,
@@ -840,15 +986,36 @@ final class AgentLifecycleShutdownCoordinator {
                 }
             }
             guard let self else { return }
-            let choice = await environment.presentFailure(failure)
-            // An answer to a dismissed or replaced prompt is ignored.
-            guard request.presentationID == presentation, isCurrent(request, attempt: attempt, phase: failedPhase) else { return }
-            // No choice was offered while the helper is unresolved: any answer is ignored.
-            if failure.relaunchHelperUnresolved {
-                request.relaunchHelperUnresolvedPrompts += 1
+            // The same presentation may be shown again (Step 4c): no hook, observation, or deadline
+            // is repeated, so the stop observation of this presentation stays valid.
+            while true {
+                let choice = await environment.presentFailure(failure)
+                // An answer to a dismissed or replaced prompt is ignored.
+                guard request.presentationID == presentation, isCurrent(request, attempt: attempt, phase: failedPhase) else { return }
+                if failure.relaunchHelperUnresolved {
+                    if failure.offersUncertainRelaunchExit {
+                        if choice == .exitMayReopen, admitsUncertainRelaunchExit(request, attempt: attempt, stage: stage) {
+                            exitWithUncertainRelaunch(request)
+                            return
+                        }
+                        // Keep Waiting, a dismissal, or an ordinary choice: ignored, and the same
+                        // prompt is shown again so waiting never removes the only way out.
+                        request.relaunchHelperUnresolvedPrompts += 1
+                        continue
+                    }
+                    // No choice was offered (no pre-arm witness): any answer is ignored.
+                    request.relaunchHelperUnresolvedPrompts += 1
+                    return
+                }
+                guard choice != .exitMayReopen else {
+                    // Never offered here: rejected, never reinterpreted as Cancel or Quit Anyway.
+                    // The same prompt (and its ordinary choices) is shown again.
+                    request.rejectedUncertainExitAnswers += 1
+                    continue
+                }
+                handle(choice, for: request, stage: stage, attempt: attempt)
                 return
             }
-            handle(choice, for: request, stage: stage, attempt: attempt)
         }
     }
 
@@ -875,6 +1042,11 @@ final class AgentLifecycleShutdownCoordinator {
             guard request.presentationID == presentation, isCurrent(request, attempt: attempt, phase: failedPhase) else { return }
             request.relaunchStopObservation = nil
             request.relaunchHelperStopRecoveries += 1
+            // Invalidated before the dismissal can resume the old prompt's answer: a late
+            // `.exitMayReopen` to it loses to this proof (Step 4c). The proven stop also ends the
+            // uncertainty the witness admitted.
+            request.presentationID = UUID()
+            request.relaunchArmSafetyProof = nil
             environment.dismissFailure(request.scope)
             present(request, attempt: attempt, stage: stage, messages: messages, timedOut: timedOut)
         }
@@ -910,6 +1082,10 @@ final class AgentLifecycleShutdownCoordinator {
                 messages: request.lastFailure?.messages ?? [Self.timeoutMessage],
                 timedOut: request.lastFailure?.timedOut ?? false
             )
+        case (_, .exitMayReopen):
+            // Filtered by `present` (admitted only on an unresolved prompt, rejected elsewhere);
+            // never reinterpreted as Cancel or Quit Anyway.
+            break
         }
     }
 
