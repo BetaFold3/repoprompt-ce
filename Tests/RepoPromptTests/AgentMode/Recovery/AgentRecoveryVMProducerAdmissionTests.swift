@@ -565,7 +565,7 @@ final class AgentRecoveryVMProducerAdmissionTests: XCTestCase {
         XCTAssertEqual(harness.viewModel.retrieveDraftText(for: harness.tabID), "kept draft")
     }
 
-    // MARK: - Review A P1-06: Send saved reuses its deterministic bubble in the normal submit
+    // MARK: - Review A P1-06 / O11: Send saved places its same saved input at the execution end
 
     private struct SavedIntentScenario {
         let lane: AgentRecoverySessionLane
@@ -573,14 +573,15 @@ final class AgentRecoveryVMProducerAdmissionTests: XCTestCase {
         let intentID: UUID
         let userItemID: UUID
         let authorization: AgentRecoveryActionAuthorization
-        let admitted: AgentModeViewModel.AdmittedUserTurnInput
+        /// The durable Send saved reservation the performer runs under.
+        let action: AgentRecoveryAction
     }
 
     private struct StartFailed: Error {}
 
     /// A saved (queued) intent of an idle Codex session, optionally already shown as its
-    /// deterministic bubble, and the Send saved authorization the shared coordinator issues for it,
-    /// carried on a store-issued queue receipt exactly as `dispatchRecoverySavedIntent` builds it.
+    /// deterministic bubble, the Send saved authorization the shared coordinator issues for it, and
+    /// the action reservation `dispatchRecoverySavedIntent` performs.
     private func savedIntentScenario(_ harness: Harness, text: String, shown: Bool) async throws -> SavedIntentScenario {
         let lane = try await persistAndClaimLane(harness)
         let session = harness.session
@@ -617,11 +618,52 @@ final class AgentRecoveryVMProducerAdmissionTests: XCTestCase {
             throw Timeout()
         }
         XCTAssertEqual(authorization.sourceIntentID, intentID)
-        let receipt = try await lane.issueQueueReceipt(intentID: intentID).get()
-        let savedRecord = await lane.store.read(sessionID: lane.sessionID).record
-        let payload = try XCTUnwrap(savedRecord?.intent(id: intentID)?.payload)
+        XCTAssertTrue(session.hasLoadedPersistedState, "the submit decides synchronously (no deferred hydration)")
+        let action = AgentRecoveryAction(
+            actionID: authorization.actionID,
+            itemKey: request.itemKey,
+            kindRaw: AgentRecoveryActionKind.sendSaved.rawValue,
+            expectedRevision: nil,
+            incarnationID: lane.binding.incarnationID,
+            transcriptResetGeneration: lane.binding.transcriptResetGeneration,
+            sourceIntentIDs: [intentID],
+            sourceRunAttemptID: nil,
+            sourceInteractionID: nil,
+            target: request.target,
+            text: nil,
+            plannedUserItemID: nil,
+            appInstanceID: UUID(),
+            reservedAt: AgentRecoveryTimestamp(Date())
+        )
+        return SavedIntentScenario(
+            lane: lane,
+            coordinator: coordinator,
+            intentID: intentID,
+            userItemID: userItemID,
+            authorization: authorization,
+            action: action
+        )
+    }
+
+    /// Send saved through its real performer (placement, covering owner write, queue receipt,
+    /// synchronous submit).
+    private func performSendSaved(_ harness: Harness, _ scenario: SavedIntentScenario) async -> AgentRecoveryDispatchResult {
+        await harness.viewModel.dispatchRecoverySavedIntent(
+            scenario.action,
+            authorization: scenario.authorization,
+            session: harness.session,
+            lane: scenario.lane
+        )
+    }
+
+    /// An authorized saved-input resend carried on a store-issued queue receipt but WITHOUT the
+    /// performer's placement preparation (a direct submit bypassing O11).
+    private func unpreparedSavedAdmission(_ scenario: SavedIntentScenario) async throws -> AgentModeViewModel.AdmittedUserTurnInput {
+        let receipt = try await scenario.lane.issueQueueReceipt(intentID: scenario.intentID).get()
+        let savedRecord = await scenario.lane.store.read(sessionID: scenario.lane.sessionID).record
+        let payload = try XCTUnwrap(savedRecord?.intent(id: scenario.intentID)?.payload)
         let admitted = AgentModeViewModel.AdmittedUserTurnInput(
-            identity: AgentQueuedInputIdentity(receipt: receipt, actionAuthorization: authorization),
+            identity: AgentQueuedInputIdentity(receipt: receipt, actionAuthorization: scenario.authorization),
             content: payload,
             attachments: [],
             taggedFiles: [],
@@ -630,15 +672,13 @@ final class AgentRecoveryVMProducerAdmissionTests: XCTestCase {
             consumesComposer: false
         )
         XCTAssertTrue(admitted.resendsAuthorizedSavedIntent)
-        XCTAssertTrue(session.hasLoadedPersistedState, "the submit decides synchronously (no deferred hydration)")
-        return SavedIntentScenario(
-            lane: lane,
-            coordinator: coordinator,
-            intentID: intentID,
-            userItemID: userItemID,
-            authorization: authorization,
-            admitted: admitted
-        )
+        XCTAssertNil(admitted.savedPreparation)
+        return admitted
+    }
+
+    private func recoveryRecord(_ scenario: SavedIntentScenario) async throws -> AgentRecoveryRecord {
+        let record = await scenario.lane.store.read(sessionID: scenario.lane.sessionID).record
+        return try XCTUnwrap(record)
     }
 
     @MainActor
@@ -664,9 +704,9 @@ final class AgentRecoveryVMProducerAdmissionTests: XCTestCase {
         return box.value
     }
 
-    /// The saved intent's bubble is already shown: the normal submit reuses it exactly (no append,
-    /// duplicate, sequence, or timestamp change), a new run and one delivery attempt start on that
-    /// same turn, and the unrelated composer state survives.
+    /// The saved intent's bubble is already shown as the clean final request: Send saved reuses it
+    /// exactly (no append, duplicate, sequence, or timestamp change), a new run and one delivery
+    /// attempt start on that same turn, and the unrelated composer state survives.
     func testSendSavedReusesItsShownBubbleUnchangedAndStartsANewRunOnThatTurn() async throws {
         let controller = ProducerFakeCodexController()
         let harness = try await makeHarness(windowID: 4790, controller: controller)
@@ -678,16 +718,13 @@ final class AgentRecoveryVMProducerAdmissionTests: XCTestCase {
         harness.viewModel.setInterviewFirst(true, for: session)
         let shown = try XCTUnwrap(session.items.first { $0.id == scenario.userItemID })
         let itemIDsBefore = session.items.map(\.id)
+        let turnIDsBefore = session.transcript.turns.map(\.id)
 
-        let result = harness.viewModel.submitUserTurn(
-            text: "saved message",
-            tabID: harness.tabID,
-            codexAttemptID: nil,
-            admitted: scenario.admitted
-        )
+        let result = await performSendSaved(harness, scenario)
 
-        XCTAssertEqual(result, .submitted)
+        XCTAssertEqual(result, .dispatched)
         XCTAssertEqual(session.items.map(\.id), itemIDsBefore, "no append and no duplicate")
+        XCTAssertEqual(session.transcript.turns.map(\.id), turnIDsBefore, "an unchanged placement adds no turn")
         let intent = try await waitForSingleIntent(scenario.lane, state: .providerAccepted, session: session)
         XCTAssertEqual(intent.userItemID, scenario.userItemID)
         XCTAssertEqual(controller.startCount, 1)
@@ -696,10 +733,10 @@ final class AgentRecoveryVMProducerAdmissionTests: XCTestCase {
         XCTAssertEqual(after.sequenceIndex, shown.sequenceIndex, "no sequence change")
         XCTAssertEqual(after.timestamp, shown.timestamp, "no timestamp change")
         XCTAssertEqual(after.text, shown.text)
-        let read = await scenario.lane.store.read(sessionID: scenario.lane.sessionID)
-        let record = try XCTUnwrap(read.record)
+        let record = try await recoveryRecord(scenario)
         XCTAssertEqual(record.attempts.count, 1, "one new delivery attempt")
         XCTAssertEqual(record.runAttempts.map(\.transcriptTurnID), [scenario.userItemID], "the new run attaches to the reused turn")
+        XCTAssertNil(record.attempts.first?.transcriptTurnID, "an unrelocated dispatch joins its own user item's turn")
         let settled = try await settlement(scenario)
         XCTAssertEqual(settled, .handedOff)
         scenario.coordinator.endRecoveryAction(scenario.authorization)
@@ -708,27 +745,44 @@ final class AgentRecoveryVMProducerAdmissionTests: XCTestCase {
         XCTAssertTrue(session.interviewFirst, "Send saved never consumes the live interview choice")
     }
 
-    /// A genuinely absent bubble is appended exactly once, under the intent's item ID.
-    func testSendSavedAppendsAnAbsentBubbleOnce() async throws {
+    /// A genuinely absent bubble is reconstructed from the intent exactly once (its item ID and
+    /// durable creation time) in a clean execution turn at the end, committed by a covering owner
+    /// write before the first provider byte; the submit then reuses it (never appends).
+    func testSendSavedReconstructsAnAbsentBubbleOnceAndCommitsItBeforeSending() async throws {
         let controller = ProducerFakeCodexController()
         let harness = try await makeHarness(windowID: 4791, controller: controller)
         let scenario = try await savedIntentScenario(harness, text: "saved message", shown: false)
         let session = harness.session
         let countBefore = session.items.count
+        let turnIDsBefore = session.transcript.turns.map(\.id)
         XCTAssertFalse(session.items.contains { $0.id == scenario.userItemID })
+        let initialRecord = try await recoveryRecord(scenario)
+        let createdAt = try XCTUnwrap(initialRecord.intent(id: scenario.intentID)).createdAt.date
+        var persistedAtStart: String?
+        controller.onStart = { @MainActor in
+            persistedAtStart = try? await harness.persistedFileText()
+        }
 
-        let result = harness.viewModel.submitUserTurn(
-            text: "saved message",
-            tabID: harness.tabID,
-            codexAttemptID: nil,
-            admitted: scenario.admitted
-        )
+        let result = await performSendSaved(harness, scenario)
 
-        XCTAssertEqual(result, .submitted)
+        XCTAssertEqual(result, .dispatched)
         _ = try await waitForSingleIntent(scenario.lane, state: .providerAccepted, session: session)
         XCTAssertEqual(session.items.count, countBefore + 1)
         XCTAssertEqual(session.items.count { $0.id == scenario.userItemID }, 1)
-        XCTAssertEqual(session.items.last { $0.kind == .user }?.text, "saved message")
+        let placed = try XCTUnwrap(session.items.last { $0.kind == .user })
+        XCTAssertEqual(placed.id, scenario.userItemID)
+        XCTAssertEqual(placed.text, "saved message")
+        XCTAssertEqual(placed.timestamp, createdAt, "the saved chronology is kept")
+        let executionTurn = try XCTUnwrap(session.transcript.turns.last)
+        XCTAssertNotEqual(executionTurn.id, scenario.userItemID, "a distinct clean execution turn")
+        XCTAssertEqual(executionTurn.request?.id, scenario.userItemID)
+        XCTAssertEqual(Array(session.transcript.turns.map(\.id).prefix(turnIDsBefore.count)), turnIDsBefore)
+        let persisted = try XCTUnwrap(persistedAtStart, "the session file existed at the provider boundary")
+        XCTAssertTrue(persisted.contains(scenario.userItemID.uuidString), "the placement was durable before any provider byte")
+        XCTAssertTrue(persisted.contains(executionTurn.id.uuidString), "the execution turn was durable before any provider byte")
+        let record = try await recoveryRecord(scenario)
+        XCTAssertEqual(record.runAttempts.map(\.transcriptTurnID), [executionTurn.id], "the run joins the execution turn")
+        XCTAssertEqual(record.attempts.map(\.transcriptTurnID), [executionTurn.id], "the dispatch records its execution turn")
         let settled = try await settlement(scenario)
         XCTAssertEqual(settled, .handedOff)
         scenario.coordinator.endRecoveryAction(scenario.authorization)
@@ -746,14 +800,9 @@ final class AgentRecoveryVMProducerAdmissionTests: XCTestCase {
         let itemIDsBefore = session.items.map(\.id)
         let userItemIDsBefore = session.items.filter { $0.kind == .user }.map(\.id)
 
-        let result = harness.viewModel.submitUserTurn(
-            text: "saved message",
-            tabID: harness.tabID,
-            codexAttemptID: nil,
-            admitted: scenario.admitted
-        )
+        let result = await performSendSaved(harness, scenario)
 
-        XCTAssertEqual(result, .submitted)
+        XCTAssertEqual(result, .dispatched)
         var intent: AgentRecoveryIntent?
         for _ in 0 ..< 400 {
             intent = await scenario.lane.store.read(sessionID: scenario.lane.sessionID).record?.intent(id: scenario.intentID)
@@ -831,91 +880,404 @@ final class AgentRecoveryVMProducerAdmissionTests: XCTestCase {
         XCTAssertEqual(session.items.map(\.id), itemIDsBefore + [appendedID])
     }
 
-    /// The bubble resolver: a compacted canonical copy out of the working suffix is reused; any copy
-    /// that differs from the saved payload (text, images, tagged files, workflow) refuses; a bubble followed by a newer user message refuses (its reply would attach to a
-    /// later turn); an unshown one is absent.
-    func testSavedBubbleResolverUsesTheCanonicalTranscriptAndRefusesInconsistentCopies() async throws {
+    /// O11: a shown saved bubble followed by newer messages is neither regrouped nor rekeyed. Its
+    /// historical turn H keeps its ID, position, and evidence (without the request), every other
+    /// turn is untouched, and the same item (ID, payload, original timestamp) executes in a new
+    /// clean turn E at the end, durable before the first provider byte; the run and the dispatch
+    /// join E, and the graph survives a later full refresh. A repeated click sends nothing more.
+    func testSendSavedRelocatesAShownBubbleFollowedByNewerMessagesToACleanExecutionTurn() async throws {
         let controller = ProducerFakeCodexController()
-        let harness = try await makeHarness(windowID: 4794, controller: controller)
-        _ = try await persistAndClaimLane(harness)
+        let harness = try await makeHarness(windowID: 9461, controller: controller)
+        let scenario = try await savedIntentScenario(harness, text: "saved message", shown: true)
         let session = harness.session
-        let vm = harness.viewModel
-        let image = AgentImageAttachment(source: .url("https://example.com/saved.png"))
-        let tag = AgentTaggedFileAttachment(relativePath: "Saved.swift", displayName: "Saved.swift")
-        func resolve(_ id: UUID, images: [AgentImageAttachment] = [], tags: [AgentTaggedFileAttachment] = [], workflow: AgentWorkflowDefinition? = nil) -> AgentModeViewModel.RecoverySavedIntentBubble {
-            vm.recoverySavedIntentBubble(
-                userItemID: id,
-                session: session,
-                trimmedText: "saved message",
-                attachments: images,
-                taggedFiles: tags,
-                workflow: workflow
-            )
-        }
-        XCTAssertEqual(resolve(UUID()), .absent)
-
-        // Compacted canonical history, out of the working suffix.
-        let canonicalItem = AgentChatItem.user("saved message", id: UUID(), attachments: [image], taggedFileAttachments: [tag], sequenceIndex: 10000)
-        let originalTranscript = session.transcript
-        var transcript = originalTranscript
-        transcript.turns.append(AgentTranscriptTurn(
-            request: AgentTranscriptRequestAnchor(from: canonicalItem),
-            retentionTier: .summary,
-            startedAt: Date(timeIntervalSince1970: 0)
-        ))
-        session.transcript = transcript
-        XCTAssertFalse(session.items.contains { $0.id == canonicalItem.id })
-        guard case let .shown(found) = resolve(canonicalItem.id, images: [image], tags: [tag]) else {
-            return XCTFail("a canonical-only bubble is reused")
-        }
-        XCTAssertEqual(found.id, canonicalItem.id)
-        XCTAssertEqual(resolve(canonicalItem.id, tags: [tag]), .refused(AgentModeViewModel.recoverySavedBubbleMismatchText), "images differ")
-        XCTAssertEqual(resolve(canonicalItem.id, images: [image]), .refused(AgentModeViewModel.recoverySavedBubbleMismatchText), "tagged files differ")
-        let workflow = AgentWorkflowDefinition(customID: UUID(), displayName: "Custom", template: "Do $ARGUMENTS")
-        XCTAssertEqual(
-            resolve(canonicalItem.id, images: [image], tags: [tag], workflow: workflow),
-            .refused(AgentModeViewModel.recoverySavedBubbleMismatchText),
-            "workflow differs"
-        )
-        session.transcript = originalTranscript
-
-        // A working-suffix copy whose text differs is not this payload's bubble.
-        let edited = UUID()
-        session.appendItem(.user("edited message", id: edited))
-        XCTAssertEqual(resolve(edited), .refused(AgentModeViewModel.recoverySavedBubbleMismatchText))
-
-        // Shown, but newer user messages follow it.
-        let older = UUID()
-        session.appendItem(.user("saved message", id: older))
-        guard case let .shown(latest) = resolve(older) else {
-            return XCTFail("the latest shown bubble is reusable")
-        }
-        XCTAssertEqual(latest.id, older)
+        session.appendItem(.assistant("An earlier partial reply."))
         session.appendItem(.user("a newer message"))
-        XCTAssertEqual(resolve(older), .refused(AgentModeViewModel.recoverySavedBubbleNotLatestText))
+        session.appendItem(.assistant("The newer reply."))
+        harness.viewModel.refreshDerivedTranscriptState(for: session)
+        let shown = try XCTUnwrap(session.items.first { $0.id == scenario.userItemID })
+        let turnsBefore = session.transcript.turns
+        let historicalBefore = try XCTUnwrap(turnsBefore.first { $0.request?.id == scenario.userItemID })
+        XCTAssertEqual(historicalBefore.id, scenario.userItemID)
+        let historicalActivityIDs = historicalBefore.responseSpans.flatMap(\.activities).map(\.id)
+        XCTAssertFalse(historicalActivityIDs.isEmpty)
+        let otherItemIDs = session.items.map(\.id).filter { $0 != scenario.userItemID }
+        var persistedAtStart: String?
+        controller.onStart = { @MainActor in
+            persistedAtStart = try? await harness.persistedFileText()
+        }
+
+        let result = await performSendSaved(harness, scenario)
+
+        XCTAssertEqual(result, .dispatched)
+        _ = try await waitForSingleIntent(scenario.lane, state: .providerAccepted, session: session)
+        XCTAssertEqual(controller.startCount, 1)
+        func assertGraph(_ label: String) throws -> UUID {
+            let turns = session.transcript.turns
+            XCTAssertEqual(Array(turns.map(\.id).prefix(turnsBefore.count)), turnsBefore.map(\.id), "\(label): every earlier turn keeps its ID and order")
+            let historical = try XCTUnwrap(turns.first { $0.id == historicalBefore.id }, "\(label): H survives")
+            XCTAssertNil(historical.request, "\(label): H no longer carries the request")
+            XCTAssertEqual(historical.responseSpans.flatMap(\.activities).map(\.id), historicalActivityIDs, "\(label): H keeps its evidence")
+            for before in turnsBefore where before.id != historicalBefore.id {
+                XCTAssertEqual(turns.first { $0.id == before.id }?.request?.id, before.request?.id, "\(label): other turns are untouched")
+            }
+            let execution = try XCTUnwrap(turns.last)
+            XCTAssertEqual(turns.count, turnsBefore.count + 1, "\(label): exactly one new turn")
+            XCTAssertNotEqual(execution.id, scenario.userItemID, "\(label): E is distinct from A")
+            XCTAssertEqual(execution.request?.id, scenario.userItemID, "\(label): E's request is the same A")
+            XCTAssertEqual(session.items.count { $0.id == scenario.userItemID }, 1, "\(label): A occurs once")
+            XCTAssertEqual(session.items.map(\.id).filter { $0 != scenario.userItemID }, otherItemIDs, "\(label): other items keep their order")
+            return execution.id
+        }
+        let executionTurnID = try assertGraph("after send")
+        let placed = try XCTUnwrap(session.items.first { $0.id == scenario.userItemID })
+        XCTAssertEqual(placed.text, shown.text)
+        XCTAssertEqual(placed.timestamp, shown.timestamp, "the saved chronology is kept")
+        XCTAssertGreaterThan(placed.sequenceIndex, shown.sequenceIndex, "placed after the newer messages")
+        let persisted = try XCTUnwrap(persistedAtStart, "the session file existed at the provider boundary")
+        XCTAssertTrue(persisted.contains(executionTurnID.uuidString), "the placement was durable before any provider byte")
+        let record = try await recoveryRecord(scenario)
+        XCTAssertEqual(record.runAttempts.map(\.transcriptTurnID), [executionTurnID], "the run joins E, never H")
+        XCTAssertEqual(record.attempts.map(\.transcriptTurnID), [executionTurnID], "the dispatch records E")
+        XCTAssertEqual(session.transcript.executionTurnID(forUserItemID: scenario.userItemID), executionTurnID)
+
+        harness.viewModel.refreshDerivedTranscriptState(for: session)
+        XCTAssertEqual(try assertGraph("after a full refresh"), executionTurnID)
+
+        let settled = try await settlement(scenario)
+        XCTAssertEqual(settled, .handedOff)
+        scenario.coordinator.endRecoveryAction(scenario.authorization)
+
+        // A repeated click on the same choice never sends or moves anything again.
+        let turnIDsAfter = session.transcript.turns.map(\.id)
+        let itemIDsAfter = session.items.map(\.id)
+        let repeated = await performSendSaved(harness, scenario)
+        XCTAssertNotEqual(repeated, .dispatched)
+        XCTAssertEqual(controller.startCount, 1)
+        XCTAssertEqual(session.transcript.turns.map(\.id), turnIDsAfter)
+        XCTAssertEqual(session.items.map(\.id), itemIDsAfter)
     }
 
-    /// End to end, a shown bubble followed by newer messages is refused before any append or send;
-    /// the saved intent stays queued and the revoked hold settles not handed off.
-    func testSendSavedRefusesAShownBubbleFollowedByNewerMessages() async throws {
+    /// O11: only this call's own `.written` owner save covering the placement qualifies. Suppressed,
+    /// non-writing, reset-only, stale, and twice-deferred outcomes send nothing: no queue receipt
+    /// is used, no provider start, the intent stays queued, and the same input stays unsent at the
+    /// end of the conversation.
+    func testSendSavedRequiresACoveringWrittenPlacementSaveBeforeSending() async throws {
+        let outcomes: [(String, AgentModeViewModel.SessionSaveOutcome?)] = [
+            ("suppressed", .suppressed),
+            ("not written", .notWritten),
+            ("reset acknowledged", .resetAcknowledged),
+            ("stale written", .written(.init(sourceItemsRevision: 0, persistenceMutationGeneration: 0, projectionClean: true))),
+            ("deferred twice", .deferredBehindInFlightSave)
+        ]
+        for (index, (label, outcome)) in outcomes.enumerated() {
+            let controller = ProducerFakeCodexController()
+            let harness = try await makeHarness(windowID: 9462 + index, controller: controller)
+            let scenario = try await savedIntentScenario(harness, text: "saved message", shown: true)
+            let session = harness.session
+            session.appendItem(.user("a newer message"))
+            XCTAssertGreaterThan(session.sourceItemsRevision, 0)
+            var saveCalls = 0
+            harness.viewModel.test_recoverySavedPlacementSaveOutcomeOverride = { @MainActor _ in
+                saveCalls += 1
+                return outcome
+            }
+
+            let result = await performSendSaved(harness, scenario)
+
+            XCTAssertEqual(result, .notDispatched(AgentModeViewModel.recoverySavedNotCommittedText), label)
+            XCTAssertEqual(saveCalls, outcome == .deferredBehindInFlightSave ? 2 : 1, "\(label): at most one further flush")
+            XCTAssertEqual(controller.startCount, 0, label)
+            let record = try await recoveryRecord(scenario)
+            XCTAssertEqual(record.intent(id: scenario.intentID)?.deliveryState, .queued, "\(label): kept queued, never withdrawn")
+            XCTAssertTrue(record.attempts.isEmpty, "\(label): no delivery attempt")
+            XCTAssertTrue(record.runAttempts.isEmpty, "\(label): no run attempt")
+            XCTAssertEqual(session.items.last?.id, scenario.userItemID, "\(label): the same input stays unsent at the end")
+            XCTAssertEqual(session.transcript.turns.last?.request?.id, scenario.userItemID, label)
+            scenario.coordinator.revokeRecoveryAction(scenario.authorization, reason: "refused")
+            let settled = try await settlement(scenario)
+            XCTAssertEqual(settled, .notHandedOff("refused"), label)
+            scenario.coordinator.endRecoveryAction(scenario.authorization)
+            harness.viewModel.test_recoverySavedPlacementSaveOutcomeOverride = nil
+        }
+    }
+
+    /// O11: a save deferred behind an in-flight write is joined and followed by one real owner
+    /// write; that covering write admits the send.
+    func testSendSavedJoinsADeferredPlacementSaveThenSends() async throws {
         let controller = ProducerFakeCodexController()
-        let harness = try await makeHarness(windowID: 4795, controller: controller)
+        let harness = try await makeHarness(windowID: 9467, controller: controller)
+        let scenario = try await savedIntentScenario(harness, text: "saved message", shown: true)
+        harness.session.appendItem(.user("a newer message"))
+        var saveCalls = 0
+        harness.viewModel.test_recoverySavedPlacementSaveOutcomeOverride = { @MainActor _ in
+            saveCalls += 1
+            return saveCalls == 1 ? .deferredBehindInFlightSave : nil
+        }
+
+        let result = await performSendSaved(harness, scenario)
+
+        XCTAssertEqual(result, .dispatched)
+        XCTAssertEqual(saveCalls, 2)
+        _ = try await waitForSingleIntent(scenario.lane, state: .providerAccepted, session: harness.session)
+        XCTAssertEqual(controller.startCount, 1)
+        let executionTurnID = try XCTUnwrap(harness.session.transcript.turns.last?.id)
+        XCTAssertNotEqual(executionTurnID, scenario.userItemID)
+        let record = try await recoveryRecord(scenario)
+        XCTAssertEqual(record.runAttempts.map(\.transcriptTurnID), [executionTurnID])
+        let settled = try await settlement(scenario)
+        XCTAssertEqual(settled, .handedOff)
+        scenario.coordinator.endRecoveryAction(scenario.authorization)
+    }
+
+    /// O11: revalidation after the save await: a newer message landing during the placement write
+    /// moves the destination, so nothing is sent and the intent stays queued.
+    func testSendSavedRevalidatesThePlacementAfterTheSave() async throws {
+        let controller = ProducerFakeCodexController()
+        let harness = try await makeHarness(windowID: 9468, controller: controller)
         let scenario = try await savedIntentScenario(harness, text: "saved message", shown: true)
         let session = harness.session
         session.appendItem(.user("a newer message"))
+        harness.viewModel.test_recoverySavedPlacementSaveOutcomeOverride = { @MainActor session in
+            session.appendItem(.user("racing message"))
+            return nil
+        }
+
+        let result = await performSendSaved(harness, scenario)
+
+        XCTAssertEqual(result, .notDispatched(AgentModeViewModel.recoverySavedNotReadyText))
+        XCTAssertEqual(controller.startCount, 0)
+        let record = try await recoveryRecord(scenario)
+        XCTAssertEqual(record.intent(id: scenario.intentID)?.deliveryState, .queued)
+        XCTAssertTrue(record.attempts.isEmpty)
+        XCTAssertEqual(session.items.count { $0.id == scenario.userItemID }, 1, "never duplicated")
+        scenario.coordinator.revokeRecoveryAction(scenario.authorization, reason: "refused")
+        _ = try await settlement(scenario)
+        scenario.coordinator.endRecoveryAction(scenario.authorization)
+    }
+
+    /// O11: a historical full envelope the reconciliation could not keep (here a multi-span H) is
+    /// refused before any mutation: the full graph and working items are unchanged, no placement
+    /// save runs, no queue receipt is used, nothing is sent, and the intent stays queued.
+    func testSendSavedRefusesANonReconcilableHistoricalEnvelopeWithoutChangingTheGraph() async throws {
+        let controller = ProducerFakeCodexController()
+        let harness = try await makeHarness(windowID: 9472, controller: controller)
+        let scenario = try await savedIntentScenario(harness, text: "saved message", shown: true)
+        let session = harness.session
+        session.appendItem(.assistant("An earlier partial reply."))
+        session.appendItem(.user("a newer message"))
+        harness.viewModel.refreshDerivedTranscriptState(for: session)
+        var transcript = session.transcript
+        let historicalIndex = try XCTUnwrap(transcript.turns.firstIndex { $0.request?.id == scenario.userItemID })
+        transcript.turns[historicalIndex].responseSpans.append(AgentTranscriptProviderResponseSpan(
+            runID: UUID(),
+            lifecycle: .completed,
+            startedAt: Date(timeIntervalSince1970: 50)
+        ))
+        session.transcript = transcript
+        let itemsBefore = session.items
+        var saveCalls = 0
+        harness.viewModel.test_recoverySavedPlacementSaveOutcomeOverride = { @MainActor _ in
+            saveCalls += 1
+            return nil
+        }
+
+        let result = await performSendSaved(harness, scenario)
+
+        XCTAssertEqual(result, .notDispatched(AgentModeViewModel.recoverySavedHistoryNotMovableText))
+        XCTAssertEqual(session.transcript, transcript, "the full graph is unchanged")
+        XCTAssertEqual(session.items, itemsBefore, "the working items are unchanged")
+        XCTAssertEqual(saveCalls, 0, "no placement save")
+        XCTAssertEqual(controller.startCount, 0)
+        let record = try await recoveryRecord(scenario)
+        XCTAssertEqual(record.intent(id: scenario.intentID)?.deliveryState, .queued)
+        XCTAssertTrue(record.attempts.isEmpty)
+        XCTAssertTrue(record.runAttempts.isEmpty)
+        scenario.coordinator.revokeRecoveryAction(scenario.authorization, reason: "refused")
+        _ = try await settlement(scenario)
+        scenario.coordinator.endRecoveryAction(scenario.authorization)
+    }
+
+    /// O11: an unrelated retained full requestless span-less envelope X after T would be consumed by
+    /// the reconciliation's positional fallback once E is appended, so Send saved of an absent
+    /// saved input refuses before any mutation: graph, items, persisted bytes, and the recovery
+    /// record (no receipt, no attempt) are unchanged, no save runs, and nothing is sent.
+    func testSendSavedRefusesWhenAnyRetainedEnvelopeWouldBeSubstituted() async throws {
+        let controller = ProducerFakeCodexController()
+        let harness = try await makeHarness(windowID: 9473, controller: controller)
+        let scenario = try await savedIntentScenario(harness, text: "saved message", shown: false)
+        let session = harness.session
+        harness.viewModel.refreshDerivedTranscriptState(for: session)
+        var transcript = session.transcript
+        transcript.turns.append(AgentTranscriptTurn(
+            terminalState: .cancelled,
+            startedAt: Date(timeIntervalSince1970: 1400),
+            interruption: AgentTranscriptTurnInterruption(reason: .appCrash, observedAt: Date(timeIntervalSince1970: 1500))
+        ))
+        session.transcript = transcript
+        let transcriptBefore = session.transcript
+        let itemsBefore = session.items
+        let persistedBefore = try await harness.persistedFileText()
+        let recordBefore = try await recoveryRecord(scenario)
+        var saveCalls = 0
+        harness.viewModel.test_recoverySavedPlacementSaveOutcomeOverride = { @MainActor _ in
+            saveCalls += 1
+            return nil
+        }
+
+        let result = await performSendSaved(harness, scenario)
+
+        XCTAssertEqual(result, .notDispatched(AgentModeViewModel.recoverySavedHistoryNotMovableText))
+        XCTAssertEqual(session.transcript, transcriptBefore, "the full graph is unchanged")
+        XCTAssertEqual(session.items, itemsBefore)
+        XCTAssertEqual(saveCalls, 0, "no placement save")
+        let persistedAfter = try await harness.persistedFileText()
+        XCTAssertEqual(persistedAfter, persistedBefore, "persisted bytes unchanged")
+        let recordAfter = try await recoveryRecord(scenario)
+        XCTAssertEqual(recordAfter, recordBefore, "no queue receipt and no attempt")
+        XCTAssertEqual(controller.startCount, 0)
+        scenario.coordinator.revokeRecoveryAction(scenario.authorization, reason: "refused")
+        _ = try await settlement(scenario)
+        scenario.coordinator.endRecoveryAction(scenario.authorization)
+    }
+
+    /// O11: the placement needs paired transcript-save hydration authority. Unloaded, loading
+    /// (a pending paired load), unresolved, and failed hydration each refuse before any mutation:
+    /// graph, items, persisted bytes, and the recovery record are unchanged; no start.
+    func testSendSavedRequiresPairedHydrationAuthorityBeforePlacing() async throws {
+        let controller = ProducerFakeCodexController()
+        let harness = try await makeHarness(windowID: 9474, controller: controller)
+        let scenario = try await savedIntentScenario(harness, text: "saved message", shown: true)
+        let session = harness.session
+        session.appendItem(.user("a newer message"))
+        let flushed = await harness.viewModel.flushSave(for: harness.tabID)
+        XCTAssertTrue(flushed)
+        let transcriptBefore = session.transcript
+        let itemsBefore = session.items
+        let persistedBefore = try await harness.persistedFileText()
+        let recordBefore = try await recoveryRecord(scenario)
+        XCTAssertTrue(harness.viewModel.hasTranscriptSaveHydrationAuthority(session))
+        var saveCalls = 0
+        harness.viewModel.test_recoverySavedPlacementSaveOutcomeOverride = { @MainActor _ in
+            saveCalls += 1
+            return nil
+        }
+        let cases: [(String, @MainActor () -> Void, @MainActor () -> Void)] = [
+            ("unloaded", { session.hasLoadedPersistedState = false }, { session.hasLoadedPersistedState = true }),
+            (
+                "pending load",
+                { session.persistedLoadTask = Task { AgentPersistedLoadOutcome(attemptID: nil, disposition: .applied) } },
+                { session.persistedLoadTask = nil }
+            ),
+            ("unresolved", { session.persistedLoadDisposition = .unresolved }, { session.persistedLoadDisposition = .applied }),
+            ("failed", { session.persistedLoadDisposition = .failed }, { session.persistedLoadDisposition = .applied })
+        ]
+        for (label, apply, restore) in cases {
+            apply()
+            XCTAssertFalse(harness.viewModel.hasTranscriptSaveHydrationAuthority(session), label)
+
+            let result = await performSendSaved(harness, scenario)
+
+            XCTAssertEqual(result, .notDispatched(AgentModeViewModel.recoverySavedNotHydratedText), label)
+            XCTAssertEqual(session.transcript, transcriptBefore, "\(label): graph unchanged")
+            XCTAssertEqual(session.items, itemsBefore, "\(label): items unchanged")
+            XCTAssertEqual(saveCalls, 0, "\(label): no placement save")
+            let persistedAfter = try await harness.persistedFileText()
+            XCTAssertEqual(persistedAfter, persistedBefore, "\(label): persisted bytes unchanged")
+            let recordAfter = try await recoveryRecord(scenario)
+            XCTAssertEqual(recordAfter, recordBefore, "\(label): no receipt and no attempt")
+            XCTAssertEqual(controller.startCount, 0, label)
+            restore()
+        }
+        scenario.coordinator.revokeRecoveryAction(scenario.authorization, reason: "refused")
+        _ = try await settlement(scenario)
+        scenario.coordinator.endRecoveryAction(scenario.authorization)
+    }
+
+    /// O11: preparation is idempotent: a second preparation of an already placed input reuses the
+    /// same execution turn and changes nothing; a historical bubble whose payload differs refuses.
+    func testSavedPlacementPreparationIsIdempotentAndRefusesInconsistentCopies() async throws {
+        let controller = ProducerFakeCodexController()
+        let harness = try await makeHarness(windowID: 9469, controller: controller)
+        let scenario = try await savedIntentScenario(harness, text: "saved message", shown: true)
+        let session = harness.session
+        let vm = harness.viewModel
+        session.appendItem(.user("a newer message"))
+        let record = try await recoveryRecord(scenario)
+        let intent = try XCTUnwrap(record.intent(id: scenario.intentID))
+        let referenced = AgentModeViewModel.recoverySavedReferencedTurnIDs(in: record)
+        let firstID = UUID()
+        let first = try vm.prepareRecoverySavedInputPlacement(
+            intent: intent,
+            images: [],
+            referencedTurnIDs: referenced,
+            session: session,
+            proposedExecutionTurnID: firstID
+        ).get()
+        XCTAssertEqual(first.executionTurnID, firstID)
+        XCTAssertEqual(first.userItem.id, scenario.userItemID)
+        let transcriptAfterFirst = session.transcript
+        let itemsAfterFirst = session.items
+        let second = try vm.prepareRecoverySavedInputPlacement(
+            intent: intent,
+            images: [],
+            referencedTurnIDs: referenced,
+            session: session,
+            proposedExecutionTurnID: UUID()
+        ).get()
+        XCTAssertEqual(second, first, "the placed input is reused, never moved again")
+        XCTAssertEqual(session.transcript, transcriptAfterFirst)
+        XCTAssertEqual(session.items.map(\.id), itemsAfterFirst.map(\.id))
+
+        // A turn already referenced by an attempt is historical: a new clean E is allocated.
+        let third = try vm.prepareRecoverySavedInputPlacement(
+            intent: intent,
+            images: [],
+            referencedTurnIDs: referenced.union([firstID]),
+            session: session,
+            proposedExecutionTurnID: UUID()
+        ).get()
+        XCTAssertNotEqual(third.executionTurnID, firstID)
+        XCTAssertTrue(session.transcript.turns.contains { $0.id == firstID }, "the referenced turn is kept")
+        XCTAssertEqual(session.items.count { $0.id == scenario.userItemID }, 1)
+
+        // A shown copy that differs from the saved payload is not this input's bubble.
+        let editedHarness = try await makeHarness(windowID: 9470, controller: ProducerFakeCodexController())
+        let edited = try await savedIntentScenario(editedHarness, text: "saved message", shown: false)
+        editedHarness.session.appendItem(.user("edited message", id: edited.userItemID))
+        let editedRecord = try await recoveryRecord(edited)
+        let editedIntent = try XCTUnwrap(editedRecord.intent(id: edited.intentID))
+        let refused = editedHarness.viewModel.prepareRecoverySavedInputPlacement(
+            intent: editedIntent,
+            images: [],
+            referencedTurnIDs: [],
+            session: editedHarness.session
+        )
+        XCTAssertEqual(refused, .failure(AgentModeViewModel.RecoverySavedRefusal(message: AgentModeViewModel.recoverySavedBubbleMismatchText)))
+        XCTAssertEqual(editedHarness.session.items.last?.text, "edited message", "a refusal changes nothing")
+    }
+
+    /// O11: the synchronous submit never sends an authorized saved input without its own current
+    /// preparation (no bypass of the placement and its covering write): refused before any append
+    /// or send; the saved intent stays queued and the revoked hold settles not handed off.
+    func testDirectSubmitOfAnUnpreparedSavedInputIsRefused() async throws {
+        let controller = ProducerFakeCodexController()
+        let harness = try await makeHarness(windowID: 9471, controller: controller)
+        let scenario = try await savedIntentScenario(harness, text: "saved message", shown: true)
+        let session = harness.session
+        let admitted = try await unpreparedSavedAdmission(scenario)
         let itemIDsBefore = session.items.map(\.id)
 
         let result = harness.viewModel.submitUserTurn(
             text: "saved message",
             tabID: harness.tabID,
             codexAttemptID: nil,
-            admitted: scenario.admitted
+            admitted: admitted
         )
 
-        XCTAssertEqual(result, .blocked(message: AgentModeViewModel.recoverySavedBubbleNotLatestText))
+        XCTAssertEqual(result, .blocked(message: AgentModeViewModel.recoverySavedNotReadyText))
         XCTAssertEqual(session.items.map(\.id), itemIDsBefore)
         XCTAssertEqual(controller.startCount, 0)
-        let intent = await scenario.lane.store.read(sessionID: scenario.lane.sessionID).record?.intent(id: scenario.intentID)
+        let intent = try await recoveryRecord(scenario).intent(id: scenario.intentID)
         XCTAssertEqual(intent?.deliveryState, .queued, "kept queued, never withdrawn")
         scenario.coordinator.revokeRecoveryAction(scenario.authorization, reason: "refused")
         let settled = try await settlement(scenario)

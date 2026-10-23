@@ -387,103 +387,279 @@ extension AgentModeViewModel {
         }
     }
 
-    /// Where Send saved finds its intent's deterministic bubble (review A P1-06).
-    enum RecoverySavedIntentBubble: Equatable {
-        /// Not shown anywhere (canonical transcript or working suffix): appended once.
-        case absent
-        /// Shown exactly as the saved payload would show it, and the conversation's latest user
-        /// message: reused unchanged, the new run attaches to its turn.
-        case shown(AgentChatItem)
-        /// Shown, but not provably this payload's bubble or not attachable: nothing is sent.
-        case refused(String)
+    /// Why Send saved did not hand its saved input to the normal submit (O11). Nothing was sent.
+    struct RecoverySavedRefusal: Error, Equatable {
+        let message: String
+    }
+
+    /// O11: where Send saved's one saved input executes now.
+    struct RecoverySavedPlacement: Equatable {
+        /// The same user item (ID, payload, provenance, original timestamp) at the execution end.
+        let userItem: AgentChatItem
+        /// The clean destination turn the next attempt joins (distinct from every historical turn).
+        let executionTurnID: UUID
     }
 
     static let recoverySavedBubbleMismatchText =
         "The message shown in the conversation differs from the saved message. Edit it to send it."
-    static let recoverySavedBubbleNotLatestText =
-        "Newer messages follow this saved message. Sending it without duplicating or moving its original bubble isn’t supported yet. Nothing was sent. You can edit it as a new message."
+    /// O11: the saved input is not (or no longer) committed as the clean request at the end of the
+    /// conversation, so this submission must not send it.
+    static let recoverySavedNotReadyText =
+        "This saved message isn’t ready to send at the end of the conversation. Nothing was sent. Review it and choose Send saved again."
+    /// O11: the saved message's earlier place in the conversation has a shape that moving it would
+    /// change (kept unchanged; Edit stays available).
+    static let recoverySavedHistoryNotMovableText =
+        "This saved message can’t be moved to the end of the conversation without changing earlier history. Nothing was sent. Edit it to send it."
+    /// O11: the conversation is not (or no longer) fully loaded with save authority, so the saved
+    /// message is not placed or sent.
+    static let recoverySavedNotHydratedText =
+        "The conversation hasn’t finished loading. Nothing was sent. Wait for it to load, then choose Send saved again."
+    /// O11: the placement at the end of the conversation was not proven durable before sending.
+    static let recoverySavedNotCommittedText =
+        "The saved message couldn’t be saved at the end of the conversation. Nothing was sent. Choose Send saved again."
 
-    /// Resolves the saved intent's deterministic bubble from the canonical transcript (request
-    /// anchors and mid-turn user activities, including compacted history out of the working
-    /// suffix) and the working suffix. Every occurrence must be a user item consistent with the
-    /// saved payload's bubble (text, image IDs, tagged-file IDs, workflow); several suffix copies
-    /// are ambiguous. A shown bubble is reusable only as the latest user message, so the new run
-    /// attaches to its own turn rather than to a later one.
-    func recoverySavedIntentBubble(
+    /// Whether `item` is shown exactly as the saved payload's bubble (text, image IDs, tagged-file
+    /// IDs, workflow).
+    static func recoverySavedOccurrenceMatches(
+        _ item: AgentChatItem,
+        trimmedText: String,
+        attachments: [AgentImageAttachment],
+        taggedFiles: [AgentTaggedFileAttachment],
+        workflow: AgentWorkflowDefinition?
+    ) -> Bool {
+        item.kind == .user
+            && item.text == userBubbleText(
+                trimmedText: trimmedText,
+                attachments: attachments,
+                taggedFiles: taggedFiles,
+                workflow: workflow
+            )
+            && item.attachments.map(\.id) == attachments.map(\.id)
+            && item.taggedFileAttachments.map(\.id) == taggedFiles.map(\.id)
+            && item.workflow?.id == workflow?.id
+    }
+
+    /// Turns that recovery attempts already join (run attempts' own turns, and the turns their
+    /// dispatches executed in): such a turn is historical and never receives a new execution.
+    static func recoverySavedReferencedTurnIDs(in record: AgentRecoveryRecord) -> Set<UUID> {
+        var turnIDs = Set(record.runAttempts.compactMap(\.transcriptTurnID))
+        for attempt in record.attempts where attempt.runAttemptID != nil {
+            turnIDs.insert(attempt.transcriptTurnID ?? attempt.userItemID)
+        }
+        return turnIDs
+    }
+
+    private static func recoverySavedRefusal(
+        for refusal: AgentTranscriptSavedInputRelocationRefusal
+    ) -> RecoverySavedRefusal {
+        switch refusal {
+        case .conflictingOccurrences, .inconsistentOccurrence:
+            RecoverySavedRefusal(message: recoverySavedBubbleMismatchText)
+        case .unsynchronizedWorkingItems, .destinationCollision, .postconditionFailed:
+            RecoverySavedRefusal(message: recoverySavedNotReadyText)
+        case .historicalEnvelopeNotReconcilable:
+            RecoverySavedRefusal(message: recoverySavedHistoryNotMovableText)
+        }
+    }
+
+    /// The working items and the canonical transcript describe the same conversation before the
+    /// saved input is resolved (the same synchronous catch-up an owner save performs).
+    private func synchronizeDerivedTranscriptForRecoverySavedInput(_ session: AgentTabSession) {
+        guard session.derivedTranscriptRefreshTask != nil || session.pendingDerivedTranscriptRefreshReason != nil else {
+            return
+        }
+        refreshDerivedTranscriptState(
+            for: session,
+            reason: session.pendingDerivedTranscriptRefreshReason ?? .liveMutation
+        )
+    }
+
+    /// O11 pure resolution of the saved input against the session's current canonical transcript
+    /// and working items (see `AgentTranscriptIO.relocatingSavedInput`). The saved item is the
+    /// intent's own user item, reconstructed from its payload under its durable creation time.
+    private func recoverySavedRelocation(
         userItemID: UUID,
+        createdAt: Date?,
+        payloadText: String,
+        images: [AgentImageAttachment],
+        taggedFiles: [AgentTaggedFileAttachment],
+        workflow: AgentWorkflowDefinition?,
+        referencedTurnIDs: Set<UUID>,
+        session: AgentTabSession,
+        proposedExecutionTurnID: UUID
+    ) -> AgentTranscriptSavedInputRelocation {
+        synchronizeDerivedTranscriptForRecoverySavedInput(session)
+        let trimmedText = payloadText.trimmingCharacters(in: .whitespacesAndNewlines)
+        var savedItem = AgentChatItem.user(
+            Self.userBubbleText(trimmedText: trimmedText, attachments: images, taggedFiles: taggedFiles, workflow: workflow),
+            id: userItemID,
+            attachments: images,
+            taggedFileAttachments: taggedFiles,
+            workflow: workflow
+        )
+        if let createdAt {
+            savedItem = savedItem.replacingTimestamp(createdAt)
+        }
+        return AgentTranscriptIO.relocatingSavedInput(
+            in: session.transcript,
+            workingItems: session.items,
+            savedItem: savedItem,
+            isConsistentOccurrence: { item in
+                Self.recoverySavedOccurrenceMatches(
+                    item,
+                    trimmedText: trimmedText,
+                    attachments: images,
+                    taggedFiles: taggedFiles,
+                    workflow: workflow
+                )
+            },
+            referencedTurnIDs: referencedTurnIDs,
+            terminalState: session.runState,
+            nextSequenceIndex: session.nextSequenceIndex,
+            proposedExecutionTurnID: proposedExecutionTurnID
+        )
+    }
+
+    /// O11 synchronous preparation (main actor, no suspension between resolution and
+    /// installation): the saved input is either already the clean request of the final turn and
+    /// the last working item, or the same item (reconstructed from the intent when no occurrence
+    /// survives) is placed in a new clean destination turn at the execution end, its historical
+    /// envelope and every other turn kept. A prepared placement is installed and marked dirty.
+    func prepareRecoverySavedInputPlacement(
+        intent: AgentRecoveryIntent,
+        images: [AgentImageAttachment],
+        referencedTurnIDs: Set<UUID>,
+        session: AgentTabSession,
+        proposedExecutionTurnID: UUID = UUID()
+    ) -> Result<RecoverySavedPlacement, RecoverySavedRefusal> {
+        let relocation = recoverySavedRelocation(
+            userItemID: intent.userItemID,
+            createdAt: intent.createdAt.date,
+            payloadText: intent.payload.text,
+            images: images,
+            taggedFiles: intent.payload.taggedFiles.map(\.attachment),
+            workflow: intent.payload.workflow?.definition,
+            referencedTurnIDs: referencedTurnIDs,
+            session: session,
+            proposedExecutionTurnID: proposedExecutionTurnID
+        )
+        switch relocation {
+        case let .unchanged(userItem, executionTurnID):
+            return .success(RecoverySavedPlacement(userItem: userItem, executionTurnID: executionTurnID))
+        case let .prepared(candidate):
+            installRecoverySavedInputPlacement(candidate, in: session)
+            return .success(RecoverySavedPlacement(userItem: candidate.userItem, executionTurnID: candidate.executionTurnID))
+        case let .refused(refusal):
+            return .failure(Self.recoverySavedRefusal(for: refusal))
+        }
+    }
+
+    /// Whether `placement` is still the saved input's clean destination at the execution end.
+    private func recoverySavedPlacementIsCurrent(
+        _ placement: RecoverySavedPlacement,
+        intent: AgentRecoveryIntent,
+        images: [AgentImageAttachment],
+        referencedTurnIDs: Set<UUID>,
+        session: AgentTabSession
+    ) -> Bool {
+        let relocation = recoverySavedRelocation(
+            userItemID: intent.userItemID,
+            createdAt: intent.createdAt.date,
+            payloadText: intent.payload.text,
+            images: images,
+            taggedFiles: intent.payload.taggedFiles.map(\.attachment),
+            workflow: intent.payload.workflow?.definition,
+            referencedTurnIDs: referencedTurnIDs,
+            session: session,
+            proposedExecutionTurnID: UUID()
+        )
+        guard case let .unchanged(userItem, executionTurnID) = relocation else { return false }
+        return executionTurnID == placement.executionTurnID && userItem.id == placement.userItem.id
+    }
+
+    /// Synchronous submit gate (O11): an authorized saved-input resend reuses its bubble only under
+    /// its own still-current preparation, as the clean final request and last working item. It
+    /// never appends: a missing, stale, or moved placement refuses.
+    func recoverySavedPreparedBubble(
+        _ admitted: AdmittedUserTurnInput,
         session: AgentTabSession,
         trimmedText: String,
         attachments: [AgentImageAttachment],
         taggedFiles: [AgentTaggedFileAttachment],
         workflow: AgentWorkflowDefinition?
-    ) -> RecoverySavedIntentBubble {
-        var canonical: [AgentChatItem] = []
-        var latestOtherUserSequence: Int?
-        func noteOtherUser(_ id: UUID, _ sequenceIndex: Int) {
-            guard id != userItemID else { return }
-            latestOtherUserSequence = max(latestOtherUserSequence ?? sequenceIndex, sequenceIndex)
+    ) -> Result<AgentChatItem, RecoverySavedRefusal> {
+        guard let preparation = admitted.savedPreparation,
+              preparation.tabID == session.tabID,
+              preparation.authorizationToken == admitted.identity.actionAuthorization?.token,
+              preparation.intentID == admitted.identity.intentID,
+              preparation.userItemID == admitted.identity.userItemID
+        else {
+            return .failure(RecoverySavedRefusal(message: Self.recoverySavedNotReadyText))
         }
-        for turn in session.transcript.turns {
-            if let request = turn.request {
-                if request.id == userItemID {
-                    canonical.append(request.toItem())
-                } else {
-                    noteOtherUser(request.id, request.sequenceIndex)
-                }
-            }
-            for span in turn.responseSpans {
-                for activity in span.activities where activity.id == userItemID || activity.itemKind == .user {
-                    if activity.id == userItemID {
-                        canonical.append(activity.toItem())
-                    } else {
-                        noteOtherUser(activity.id, activity.sequenceIndex)
-                    }
-                }
-            }
-        }
-        var suffix: [AgentChatItem] = []
-        for item in session.items {
-            if item.id == userItemID {
-                suffix.append(item)
-            } else if item.kind == .user {
-                noteOtherUser(item.id, item.sequenceIndex)
-            }
-        }
-        guard !canonical.isEmpty || !suffix.isEmpty else { return .absent }
-        guard suffix.count <= 1 else { return .refused(Self.recoverySavedBubbleMismatchText) }
-        let expectedText = Self.userBubbleText(
-            trimmedText: trimmedText,
-            attachments: attachments,
+        let relocation = recoverySavedRelocation(
+            userItemID: preparation.userItemID,
+            createdAt: nil,
+            payloadText: trimmedText,
+            images: attachments,
             taggedFiles: taggedFiles,
-            workflow: workflow
+            workflow: workflow,
+            referencedTurnIDs: [],
+            session: session,
+            proposedExecutionTurnID: UUID()
         )
-        let expectedImageIDs = attachments.map(\.id)
-        let expectedTaggedIDs = taggedFiles.map(\.id)
-        for item in canonical + suffix {
-            guard item.kind == .user,
-                  item.text == expectedText,
-                  item.attachments.map(\.id) == expectedImageIDs,
-                  item.taggedFileAttachments.map(\.id) == expectedTaggedIDs,
-                  item.workflow?.id == workflow?.id
-            else {
-                return .refused(Self.recoverySavedBubbleMismatchText)
+        switch relocation {
+        case let .unchanged(userItem, executionTurnID) where executionTurnID == preparation.executionTurnID:
+            return .success(userItem)
+        case .refused(.conflictingOccurrences), .refused(.inconsistentOccurrence):
+            return .failure(RecoverySavedRefusal(message: Self.recoverySavedBubbleMismatchText))
+        default:
+            return .failure(RecoverySavedRefusal(message: Self.recoverySavedNotReadyText))
+        }
+    }
+
+    /// O11: one real owner write covering the installed placement, before the queue receipt and any
+    /// provider byte. The save is forced (dirty) even for an unchanged placement; a save already in
+    /// flight is joined and followed by at most one further explicit flush. Only a `.written`
+    /// receipt covering the capture under the same owner, binding, and persistence context
+    /// qualifies; suppressed, reset-only, deferred, and non-writing outcomes never do.
+    private func commitRecoverySavedPlacement(_ session: AgentTabSession) async -> Bool {
+        session.isDirty = true
+        let capture = captureTranscriptSaveState(session)
+        var outcome = await recoverySavedPlacementSave(session)
+        if outcome == .deferredBehindInFlightSave {
+            if let sessionID = session.activeAgentSessionID {
+                await awaitInFlightSave(sessionID: sessionID)
             }
+            guard sessions[session.tabID] === session else { return false }
+            outcome = await recoverySavedPlacementSave(session)
         }
-        // The working suffix copy is the live bubble; a canonical-only bubble is shown from history.
-        guard let shown = suffix.first ?? canonical.first else { return .absent }
-        if let latestOtherUserSequence, latestOtherUserSequence > shown.sequenceIndex {
-            return .refused(Self.recoverySavedBubbleNotLatestText)
-        }
-        return .shown(shown)
+        guard case let .written(receipt) = outcome else { return false }
+        return staleWriteCoversCapture(receipt, capture, session: session)
+    }
+
+    private func recoverySavedPlacementSave(_ session: AgentTabSession) async -> SessionSaveOutcome {
+        #if DEBUG
+            if let override = test_recoverySavedPlacementSaveOutcomeOverride,
+               let outcome = await override(session)
+            {
+                return outcome
+            }
+        #endif
+        return await flushSaveDetailed(for: session.tabID)
     }
 
     /// Send saved: the one saved intent the reservation claimed, handed to normal dispatch under a
     /// store-issued queue receipt carrying the action's coordinator-issued authorization. Refused
     /// (kept, never withdrawn) when it carries a pending handoff or any earlier attempt may have
-    /// delivered it (no uncertain-delivery retry); Edit stays available for those. An already
-    /// shown bubble is reused by the normal submit path (`appendPreparedUserTurn`), never
-    /// duplicated (review A P1-06).
-    private func dispatchRecoverySavedIntent(
+    /// delivered it (no uncertain-delivery retry); Edit stays available for those.
+    ///
+    /// O11 ordering: the same saved input is first placed at the conversation's execution end
+    /// (its historical envelope and every other turn kept; reconstructed from the intent when no
+    /// occurrence survives) and that placement is proven durable by a covering owner write; the
+    /// queue receipt and the synchronous submit follow, each after revalidating the action, owner,
+    /// idle local state, and destination. The submit reuses the placed bubble (`.reused`), so a
+    /// failed send leaves the same input unsent there.
+    func dispatchRecoverySavedIntent(
         _ action: AgentRecoveryAction,
         authorization: AgentRecoveryActionAuthorization,
         session: AgentTabSession,
@@ -492,14 +668,22 @@ extension AgentModeViewModel {
         guard action.sourceIntentIDs.count == 1, let intentID = action.sourceIntentIDs.first else {
             return .notDispatched("Send one saved message at a time.")
         }
-        guard recoveryActionStillCurrent(action, session: session, lane: lane) else {
-            return .notDispatched(Self.recoveryActionStaleText)
+        func stillCurrent() -> String? {
+            guard recoveryActionStillCurrent(action, session: session, lane: lane) else { return Self.recoveryActionStaleText }
+            // The placement edits the hydrated transcript and is committed by an owner save: it
+            // needs the same paired hydration authority a covering save does (never an unloaded,
+            // loading, unresolved, failed, or suppressed hydration).
+            guard hasTranscriptSaveHydrationAuthority(session) else { return Self.recoverySavedNotHydratedText }
+            if let blocked = newWorkBlockedMessage(for: session) { return blocked }
+            guard !session.runState.isActive else { return "The session is working. Wait for it to finish." }
+            guard session.remoteHost == nil else { return Self.recoveryActionSessionBusyMessage }
+            return nil
         }
-        if let blocked = newWorkBlockedMessage(for: session) { return .notDispatched(blocked) }
-        guard !session.runState.isActive else { return .notDispatched("The session is working. Wait for it to finish.") }
+        if let stale = stillCurrent() { return .notDispatched(stale) }
         guard case let .success(.supported(record)) = await lane.readRecord(), let intent = record.intent(id: intentID) else {
             return .notDispatched("The saved message couldn't be read.")
         }
+        if let stale = stillCurrent() { return .notDispatched(stale) }
         guard intent.pendingHandoff == nil else {
             return .notDispatched("This message carries earlier conversation history. Edit it to send it.")
         }
@@ -520,6 +704,35 @@ extension AgentModeViewModel {
             }
             images.append(attachment)
         }
+        let referencedTurnIDs = Self.recoverySavedReferencedTurnIDs(in: record)
+        let placement: RecoverySavedPlacement
+        switch prepareRecoverySavedInputPlacement(
+            intent: intent,
+            images: images,
+            referencedTurnIDs: referencedTurnIDs,
+            session: session
+        ) {
+        case let .success(value):
+            placement = value
+        case let .failure(refusal):
+            return .notDispatched(refusal.message)
+        }
+        func placementStillCurrent() -> String? {
+            if let stale = stillCurrent() { return stale }
+            guard recoverySavedPlacementIsCurrent(
+                placement,
+                intent: intent,
+                images: images,
+                referencedTurnIDs: referencedTurnIDs,
+                session: session
+            ) else { return Self.recoverySavedNotReadyText }
+            return nil
+        }
+        // The placement is durable before the queue receipt and before any provider byte.
+        guard await commitRecoverySavedPlacement(session) else {
+            return .notDispatched(Self.recoverySavedNotCommittedText)
+        }
+        if let stale = placementStillCurrent() { return .notDispatched(stale) }
         let receipt: AgentRecoveryQueueReceipt
         switch await lane.issueQueueReceipt(intentID: intentID) {
         case let .success(value):
@@ -527,17 +740,26 @@ extension AgentModeViewModel {
         case let .failure(failure):
             return .notDispatched("The saved message can't be sent now (\(Self.recoveryListDescription(of: failure))).")
         }
-        guard recoveryActionStillCurrent(action, session: session, lane: lane), !session.runState.isActive else {
-            return .notDispatched(Self.recoveryActionStaleText)
+        if let stale = placementStillCurrent() { return .notDispatched(stale) }
+        let identity = AgentQueuedInputIdentity(receipt: receipt, actionAuthorization: authorization)
+        guard identity.intentID == intentID, identity.userItemID == placement.userItem.id else {
+            return .notDispatched(Self.recoverySavedNotReadyText)
         }
         let admitted = AdmittedUserTurnInput(
-            identity: AgentQueuedInputIdentity(receipt: receipt, actionAuthorization: authorization),
+            identity: identity,
             content: intent.payload,
             attachments: images,
             taggedFiles: intent.payload.taggedFiles.map(\.attachment),
             workflow: intent.payload.workflow?.definition,
             interviewFirst: intent.payload.interviewFirst,
-            consumesComposer: false
+            consumesComposer: false,
+            savedPreparation: RecoverySavedInputPreparation(
+                authorizationToken: authorization.token,
+                intentID: intentID,
+                userItemID: placement.userItem.id,
+                executionTurnID: placement.executionTurnID,
+                tabID: session.tabID
+            )
         )
         switch submitUserTurn(text: intent.payload.text, tabID: session.tabID, codexAttemptID: nil, admitted: admitted) {
         case .submitted:

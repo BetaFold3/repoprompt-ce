@@ -727,6 +727,9 @@ final class AgentModeViewModel: ObservableObject {
         /// captured and immediately before the durable write, so a mutation can land during the
         /// awaited write.
         var test_saveSessionBeforeWriteHook: (@MainActor (AgentTabSession) async -> Void)?
+        /// Test seam (O11): when it returns an outcome, Send saved's placement save uses that outcome
+        /// instead of the owner write (suppressed, reset-only, non-writing, or stale outcomes).
+        var test_recoverySavedPlacementSaveOutcomeOverride: (@MainActor (AgentTabSession) async -> SessionSaveOutcome?)?
         /// Test seam: awaited by `clearChatPreservingRecovery` while it owns the session writer slot,
         /// immediately before the reset commit (a failure can be injected or input attempted here).
         var test_recoveryResetBeforeCommitHook: (@MainActor (AgentTabSession) async -> Void)?
@@ -12836,6 +12839,28 @@ final class AgentModeViewModel: ObservableObject {
         return builtPresentation
     }
 
+    /// O11: installs a prepared saved-input placement through the paired owner operation (working
+    /// items and their canonical transcript together) and marks it dirty. The historical envelope
+    /// keeps its turn ID while losing its request, which the turn-shape projection cache token
+    /// cannot see, so the turn projection caches are dropped once for this explicit action.
+    func installRecoverySavedInputPlacement(
+        _ candidate: AgentTranscriptSavedInputRelocationCandidate,
+        in session: AgentTabSession
+    ) {
+        session.turnProjectionCaches = [:]
+        session.rawInputSanitizeEvidence = nil
+        hydrateSession(
+            session,
+            withCanonicalItems: candidate.workingItems,
+            transcript: candidate.transcript,
+            reason: .savedInputRelocation
+        )
+        session.nextSequenceIndex = max(session.nextSequenceIndex, candidate.nextSequenceIndex)
+        session.isDirty = true
+        updateBindingsFromSession(session)
+        requestUIRefresh(tabID: session.tabID, urgent: true)
+    }
+
     @discardableResult
     private func hydrateSession(
         _ session: AgentTabSession,
@@ -16894,26 +16919,25 @@ final class AgentModeViewModel: ObservableObject {
         if admittedIdentity?.actionAuthorization != nil, session.runState.isActive || session.remoteHost != nil {
             return .blocked(message: Self.recoveryActionSessionBusyMessage)
         }
-        // Review A P1-06: Send saved reuses its intent's deterministic bubble when it is already
-        // shown (canonical transcript or working suffix) and exactly matches the saved payload;
-        // a genuinely absent bubble is appended once under the same item ID. Decided synchronously
-        // with the append below (no suspension between check and use).
+        // Review A P1-06 / O11: Send saved reuses its intent's one bubble, which its preparation
+        // placed (or found) as the clean request of the final turn and committed before the queue
+        // receipt. Without that exact, still-current preparation nothing is appended or sent: an
+        // absent bubble was reconstructed and saved by the preparation, never here. Decided
+        // synchronously with the reuse below (no suspension between check and use).
         var reusedUserItem: AgentChatItem?
-        if let admitted, admitted.resendsAuthorizedSavedIntent, let userItemID = admittedIdentity?.userItemID {
-            switch recoverySavedIntentBubble(
-                userItemID: userItemID,
+        if let admitted, admitted.resendsAuthorizedSavedIntent {
+            switch recoverySavedPreparedBubble(
+                admitted,
                 session: session,
                 trimmedText: trimmedText,
                 attachments: attachmentsToSend,
                 taggedFiles: taggedFilesToSend,
                 workflow: activeWorkflow
             ) {
-            case .absent:
-                break
-            case let .shown(item):
+            case let .success(item):
                 reusedUserItem = item
-            case let .refused(message):
-                return .blocked(message: message)
+            case let .failure(refusal):
+                return .blocked(message: refusal.message)
             }
         }
 

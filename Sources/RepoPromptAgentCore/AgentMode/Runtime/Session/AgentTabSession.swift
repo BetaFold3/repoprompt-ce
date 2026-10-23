@@ -2796,6 +2796,9 @@ package final class AgentTabSession: ObservableObject {
         case retentionCompaction
         case codexCommandStatusReconciliation
         case routeActivation
+        /// O11: Send saved placed the same unsent saved input at the execution end (paired with
+        /// its edited canonical transcript).
+        case savedInputRelocation
         case clearedChat
         case stressHarnessReset
         case testOverride

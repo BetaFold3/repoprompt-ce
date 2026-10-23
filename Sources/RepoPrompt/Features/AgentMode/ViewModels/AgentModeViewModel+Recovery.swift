@@ -275,6 +275,18 @@ extension AgentModeViewModel {
         case blocked(String)
     }
 
+    /// O11: the transient result of placing one saved input at the conversation's execution end and
+    /// proving that placement durable (a covering owner write). It names the action authorization,
+    /// intent, user item, and destination turn the synchronous submit must find unchanged. It is not
+    /// a reservation authority and is never persisted.
+    struct RecoverySavedInputPreparation: Equatable {
+        let authorizationToken: UUID
+        let intentID: UUID
+        let userItemID: UUID
+        let executionTurnID: UUID
+        let tabID: UUID
+    }
+
     /// R12: the one immutable snapshot of a durably admitted user turn, carried from admission through
     /// projection, workflow wrapping, attachment reservation, and provider preparation. Submission
     /// never re-reads the live composer: later edits belong to a newer composer revision and survive.
@@ -288,6 +300,9 @@ extension AgentModeViewModel {
         let interviewFirst: Bool
         /// A composer submission: exactly the submitted items leave the live composer.
         let consumesComposer: Bool
+        /// O11: Send saved's committed placement of its saved input at the execution end. Required
+        /// for an authorized saved-input resend (`resendsAuthorizedSavedIntent`); never persisted.
+        var savedPreparation: RecoverySavedInputPreparation?
 
         /// Review A P1-06: Send saved re-dispatches the one saved intent its coordinator-issued
         /// action authorization names. Only that authority may reuse the intent's already shown

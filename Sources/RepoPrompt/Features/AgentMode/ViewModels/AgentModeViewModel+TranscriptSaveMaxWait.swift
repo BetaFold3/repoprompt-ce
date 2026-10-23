@@ -213,8 +213,9 @@ extension AgentModeViewModel {
         }
     }
 
-    /// Pre-call state of one maximum-wait save, for proving a stale write covered it.
-    private struct TranscriptSaveCapture {
+    /// Pre-call state of one maximum-wait save, for proving a stale write covered it (also Send
+    /// saved's placement write, O11).
+    struct TranscriptSaveCapture {
         let instant: ContinuousClock.Instant
         let sourceItemsRevision: Int
         let persistenceMutationGeneration: UInt64
@@ -223,7 +224,7 @@ extension AgentModeViewModel {
         let context: SessionPersistenceContext?
     }
 
-    private func captureTranscriptSaveState(_ session: AgentTabSession) -> TranscriptSaveCapture {
+    func captureTranscriptSaveState(_ session: AgentTabSession) -> TranscriptSaveCapture {
         TranscriptSaveCapture(
             instant: .now,
             sourceItemsRevision: session.sourceItemsRevision,
@@ -238,7 +239,7 @@ extension AgentModeViewModel {
     /// same owner, binding, and persistence context, with paired hydration authority intact. The
     /// receipt's counters are the commit token's, captured after the payload was built in the
     /// save's synchronous prefix (the same invariant a clean receipt relies on to clear dirty).
-    private func staleWriteCoversCapture(
+    func staleWriteCoversCapture(
         _ receipt: SessionSaveReceipt,
         _ capture: TranscriptSaveCapture,
         session: AgentTabSession

@@ -13,6 +13,15 @@ package extension AgentTranscriptTurn {
     }
 }
 
+package extension AgentTranscript {
+    /// The execution turn of the user item `userItemID`: the turn whose request it is (a saved input
+    /// re-sent at the execution end runs in its own destination turn, O11), else the item's own ID
+    /// (the turn an ordinary user item opens, or the steering key of a mid-turn user activity).
+    func executionTurnID(forUserItemID userItemID: UUID) -> UUID {
+        turns.last(where: { $0.request?.id == userItemID })?.id ?? userItemID
+    }
+}
+
 /// Ambiguity-aware joins between recovery run attempts and saved transcript turns (R08/F-14).
 ///
 /// A run attempt's own transcript turn (`transcriptTurnID`) is authoritative. A process run ID is
@@ -50,12 +59,15 @@ package struct AgentRecoveryRunTurnJoin: Equatable {
         }
         for dispatch in intentAttempts {
             guard let runAttemptID = dispatch.runAttemptID, runAttemptsByID[runAttemptID] != nil else { continue }
-            if byTurn[dispatch.userItemID] == nil {
-                steeredRunIDs[dispatch.userItemID, default: []].insert(runAttemptID)
+            // A dispatch that recorded its execution turn (a relocated saved input, O11) joins that
+            // turn, never a historical turn that happens to share its user item's ID.
+            let dispatchTurnID = dispatch.transcriptTurnID ?? dispatch.userItemID
+            if byTurn[dispatchTurnID] == nil {
+                steeredRunIDs[dispatchTurnID, default: []].insert(runAttemptID)
             }
             // The own turn (no dispatch time) precedes every dispatch into its run; ties keep the first.
             if let at = latest[runAttemptID]?.at, at.date >= dispatch.dispatchedAt.date { continue }
-            latest[runAttemptID] = (dispatch.userItemID, dispatch.dispatchedAt)
+            latest[runAttemptID] = (dispatchTurnID, dispatch.dispatchedAt)
         }
         attemptsByTurnID = byTurn
         unkeyedAttemptsByProcessRunID = unkeyedByRun

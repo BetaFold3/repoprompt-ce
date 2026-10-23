@@ -237,10 +237,15 @@ package final class AgentRecoveryDispatchEvidence {
         }
         guard let lane = session.recoveryLane else { return .failure(.refused(.laneRetired)) }
         let action = carriedAction(constituents) ?? nil
-        let requests = receipts.map { receipt in
+        // Every constituent is durable here (`dispatchRefusal`), so receipts align with constituents.
+        let requests = zip(receipts, constituents).map { receipt, constituent in
             AgentRecoveryDispatchRequest(
                 intentID: receipt.intent.intentID,
-                attempt: AgentRecoveryAttemptStart(attemptID: UUID(), runAttemptID: runAttemptID)
+                attempt: AgentRecoveryAttemptStart(
+                    attemptID: UUID(),
+                    runAttemptID: runAttemptID,
+                    transcriptTurnID: relocatedExecutionTurnID(of: constituent, in: session)
+                )
             )
         }
         let result: Result<[AgentRecoveryDispatchReceipt], AgentRecoveryAdmissionFailure> = if requests.count == 1 {
@@ -284,7 +289,7 @@ package final class AgentRecoveryDispatchEvidence {
             if case let .failure(failure) = await lane.ensureRunAttempt(
                 ownership: ownership,
                 processRunID: processRunID,
-                transcriptTurnID: constituents.first?.userItemID
+                transcriptTurnID: executionTurnID(of: constituents.first, in: session)
             ) {
                 return .failure(.commitFailed(failure))
             }
@@ -327,6 +332,22 @@ package final class AgentRecoveryDispatchEvidence {
             processRunID: session.runID,
             authorization: authorization
         )
+    }
+
+    /// The transcript turn the input's user item executes in: its own ID, or the distinct destination
+    /// turn a relocated saved input was placed in (O11).
+    package static func executionTurnID(of constituent: AgentQueuedInputIdentity?, in session: AgentTabSession) -> UUID? {
+        constituent?.userItemID.map { session.transcript.executionTurnID(forUserItemID: $0) }
+    }
+
+    /// The delivery attempt's own turn join, recorded only when it differs from its user item's ID
+    /// (a relocated saved input, O11); every other attempt keeps the user-item join unchanged.
+    private static func relocatedExecutionTurnID(of constituent: AgentQueuedInputIdentity, in session: AgentTabSession) -> UUID? {
+        guard let userItemID = constituent.userItemID,
+              let turnID = executionTurnID(of: constituent, in: session),
+              turnID != userItemID
+        else { return nil }
+        return turnID
     }
 
     /// Whether `ownership` can be run evidence for this session's lane: it is the current run

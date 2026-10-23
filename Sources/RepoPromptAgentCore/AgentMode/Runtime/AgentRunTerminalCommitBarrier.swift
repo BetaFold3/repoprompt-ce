@@ -244,7 +244,11 @@ package final class AgentRunTerminalCommitBarrier {
             recordRejection("provider_buffers_pending", request: request)
             return nil
         }
-        let terminalTurnID = session.items.last(where: { $0.kind == .user })?.id
+        // The terminal user item's execution turn: its own ID, or the distinct destination turn a
+        // relocated saved input runs in (O11), never the historical envelope sharing that ID.
+        let terminalTurnID = session.items.last(where: { $0.kind == .user }).map {
+            session.transcript.executionTurnID(forUserItemID: $0.id)
+        }
 
         session.terminalCommitInProgress = true
         recordTerminalBarrierState(true, request: request)

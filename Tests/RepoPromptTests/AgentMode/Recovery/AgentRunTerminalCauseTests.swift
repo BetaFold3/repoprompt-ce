@@ -548,3 +548,79 @@ private enum ScriptedProcessLossACPAgent {
             send({"jsonrpc": "2.0", "id": request_id, "result": {}})
     """#
 }
+
+// MARK: - O11 relocated saved input joins its execution turn
+
+extension AgentRunTerminalCauseTests {
+    /// The same user item A was attempted in its historical turn H (= A's ID, attempt P) and, after
+    /// Send saved placed it at the end, executes in a distinct turn E (attempt R, its dispatch
+    /// recording E). H joins P only; E joins R only, both as R's own turn and as a steer into an
+    /// already-running R; R's latest turn is E. Without the recorded turn the steer would land on H.
+    func testRelocatedSavedInputDispatchJoinsItsExecutionTurnNeverTheHistoricalOne() {
+        let itemID = UUID()
+        let executionTurnID = UUID()
+        let instanceID = UUID()
+        let historical = AgentTranscriptTurn(id: itemID, terminalState: .cancelled, startedAt: Date(timeIntervalSince1970: 10))
+        let execution = AgentTranscriptTurn(id: executionTurnID, startedAt: Date(timeIntervalSince1970: 30))
+        let priorAttempt = AgentRecoveryRunAttempt(
+            runAttemptID: UUID(),
+            transcriptResetGeneration: 0,
+            processRunID: nil,
+            transcriptTurnID: itemID,
+            startedAt: AgentRecoveryTimestamp(millisecondsSince1970: 10),
+            appInstanceID: instanceID
+        )
+        let priorDispatch = AgentRecoveryAttempt(
+            attemptID: UUID(), intentID: UUID(), userItemID: itemID, runAttemptID: priorAttempt.runAttemptID,
+            transcriptTurnID: nil, appInstanceID: instanceID, dispatchedAt: AgentRecoveryTimestamp(millisecondsSince1970: 10)
+        )
+
+        // R started on E.
+        let ownAttempt = AgentRecoveryRunAttempt(
+            runAttemptID: UUID(),
+            transcriptResetGeneration: 0,
+            processRunID: nil,
+            transcriptTurnID: executionTurnID,
+            startedAt: AgentRecoveryTimestamp(millisecondsSince1970: 30),
+            appInstanceID: instanceID
+        )
+        let ownDispatch = AgentRecoveryAttempt(
+            attemptID: UUID(), intentID: priorDispatch.intentID, userItemID: itemID, runAttemptID: ownAttempt.runAttemptID,
+            transcriptTurnID: executionTurnID, appInstanceID: instanceID, dispatchedAt: AgentRecoveryTimestamp(millisecondsSince1970: 30)
+        )
+        let own = AgentRecoveryRunTurnJoin(runAttempts: [priorAttempt, ownAttempt], intentAttempts: [priorDispatch, ownDispatch])
+        XCTAssertEqual(own.attempt(for: historical)?.runAttemptID, priorAttempt.runAttemptID)
+        XCTAssertEqual(own.attempt(for: execution)?.runAttemptID, ownAttempt.runAttemptID)
+        XCTAssertEqual(own.latestTurnID(of: ownAttempt), executionTurnID)
+        XCTAssertEqual(own.latestTurnID(of: priorAttempt), itemID)
+
+        // R already running on another turn S; A's dispatch steered into it under E.
+        let startTurnID = UUID()
+        let runningAttempt = AgentRecoveryRunAttempt(
+            runAttemptID: UUID(),
+            transcriptResetGeneration: 0,
+            processRunID: nil,
+            transcriptTurnID: startTurnID,
+            startedAt: AgentRecoveryTimestamp(millisecondsSince1970: 20),
+            appInstanceID: instanceID
+        )
+        let steer = AgentRecoveryAttempt(
+            attemptID: UUID(), intentID: priorDispatch.intentID, userItemID: itemID, runAttemptID: runningAttempt.runAttemptID,
+            transcriptTurnID: executionTurnID, appInstanceID: instanceID, dispatchedAt: AgentRecoveryTimestamp(millisecondsSince1970: 40)
+        )
+        let steered = AgentRecoveryRunTurnJoin(runAttempts: [priorAttempt, runningAttempt], intentAttempts: [priorDispatch, steer])
+        XCTAssertEqual(steered.attempt(for: execution)?.runAttemptID, runningAttempt.runAttemptID, "E joins the attempt its dispatch recorded")
+        XCTAssertEqual(steered.attempt(for: historical)?.runAttemptID, priorAttempt.runAttemptID, "H keeps its own attempt")
+        XCTAssertEqual(steered.latestTurnID(of: runningAttempt), executionTurnID)
+
+        // The transcript resolves A's execution turn to E (the last turn carrying it), else A's ID.
+        let anchor = AgentTranscriptRequestAnchor(from: AgentChatItem.user("saved message", id: itemID))
+        var placed = execution
+        placed.request = anchor
+        XCTAssertEqual(AgentTranscript(turns: [historical, placed]).executionTurnID(forUserItemID: itemID), executionTurnID)
+        var unmoved = historical
+        unmoved.request = anchor
+        XCTAssertEqual(AgentTranscript(turns: [unmoved]).executionTurnID(forUserItemID: itemID), itemID)
+        XCTAssertEqual(AgentTranscript(turns: [historical]).executionTurnID(forUserItemID: itemID), itemID)
+    }
+}
