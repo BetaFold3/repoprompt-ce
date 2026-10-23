@@ -161,6 +161,12 @@ package enum AgentRecoveryStoreError: Error, Equatable {
     case supersedeRefused(actionID: UUID, reason: String)
     /// Phase 4: the history cursor moved since the import began (compare-and-swap on import ID).
     case historyCursorConflict
+    /// Step 5b: the same MCP invocation is already linked to a different child or parent attempt.
+    /// Nothing was written.
+    case delegatedChildLinkConflict(invocationID: UUID)
+    /// Step 5b: the parent record cannot take the link (no record, or the admitted parent run attempt
+    /// is missing, finished, or from another reset generation). Nothing was written.
+    case delegatedChildLinkIneligible(reason: String)
 
     package var category: Category {
         switch self {
@@ -178,7 +184,8 @@ package enum AgentRecoveryStoreError: Error, Equatable {
             .heldInput
         case .intentNotFound, .intentConflict, .attemptNotFound, .attemptConflict, .runAttemptNotFound,
              .runAttemptConflict, .invalidTransition, .heldIntent, .cardChanged, .actionConflict, .actionNotFound,
-             .actionIneligible, .priorLaunchAction, .supersedeRefused:
+             .actionIneligible, .priorLaunchAction, .supersedeRefused, .delegatedChildLinkConflict,
+             .delegatedChildLinkIneligible:
             .invalidOperation
         case .historyCursorConflict:
             .revisionConflict
@@ -2096,8 +2103,8 @@ package actor AgentRecoveryStore {
     }
 
     /// Atomically replaces the record (new opaque revision, binding generation, preserved extras,
-    /// crash-hold acknowledgement, questions, card acknowledgements, actions, and history cursors
-    /// unless supplied). Never deletes attachments: a record reference is not proof that a file is
+    /// crash-hold acknowledgement, questions, card acknowledgements, actions, history cursors, and
+    /// delegated child links unless supplied). Never deletes attachments: a record reference is not proof that a file is
     /// unused.
     func replace(
         _ current: AgentRecoveryRecord?,
@@ -2110,7 +2117,8 @@ package actor AgentRecoveryStore {
         questions: [AgentRecoveryQuestionSnapshot]? = nil,
         cardAcknowledgements: [AgentRecoveryCardAcknowledgement]? = nil,
         actions: [AgentRecoveryAction]? = nil,
-        historyCursors: [AgentRecoveryHistoryCursor]? = nil
+        historyCursors: [AgentRecoveryHistoryCursor]? = nil,
+        delegatedChildLinks: [AgentRecoveryDelegatedChildLink]? = nil
     ) throws -> AgentRecoveryRecord {
         let record = AgentRecoveryRecord(
             sessionID: binding.sessionID,
@@ -2127,6 +2135,7 @@ package actor AgentRecoveryStore {
             cardAcknowledgements: cardAcknowledgements ?? current?.cardAcknowledgements ?? [],
             actions: actions ?? current?.actions ?? [],
             historyCursors: historyCursors ?? current?.historyCursors ?? [],
+            delegatedChildLinks: delegatedChildLinks ?? current?.delegatedChildLinks ?? [],
             extras: current?.extras ?? [:]
         )
         do {

@@ -733,6 +733,9 @@ final class AgentModeViewModel: ObservableObject {
         /// Test seam: awaited by `clearChatPreservingRecovery` while it owns the session writer slot,
         /// immediately before the reset commit (a failure can be injected or input attempted here).
         var test_recoveryResetBeforeCommitHook: (@MainActor (AgentTabSession) async -> Void)?
+        /// Test seam (Step 5b): awaited by `mcpCommitDelegatedChildLink` with the child, after its
+        /// covering save and immediately before the parent's link commit (inside the link await).
+        var test_delegatedChildLinkAwaitHook: (@MainActor (AgentTabSession) async -> Void)?
         /// Test seam: awaited in `finalizeDeletedAgentSessionReferences` after a deleted session's
         /// owner was detached from its tab and before its awaited teardown, so a replacement owner
         /// can be installed on the tab while the cleanup is suspended.
@@ -9800,6 +9803,10 @@ final class AgentModeViewModel: ObservableObject {
         guard let session = mcpControlledSession(sessionID: sessionID) else {
             throw MCPError.invalidParams("The requested agent run is no longer active.")
         }
+        // Step 5b: a linked delegated child start keeps its parent admission through the final
+        // pre-submit predicate. Nil (every other dispatch) is unchanged.
+        let childLinkFence = mcpDelegatedChildDispatchFence(for: sessionID)
+        try mcpRequireDelegatedChildDispatchFence(childLinkFence)
         let trimmedText = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedText.isEmpty else {
             throw MCPError.invalidParams("message is required.")
@@ -9840,7 +9847,8 @@ final class AgentModeViewModel: ObservableObject {
                 attemptID: codexAttemptID,
                 text: trimmedText,
                 workflow: workflow,
-                nativePreparedTurn: nativePreparedTurn
+                nativePreparedTurn: nativePreparedTurn,
+                childLinkFence: childLinkFence
             )
         }
 
@@ -9859,7 +9867,11 @@ final class AgentModeViewModel: ObservableObject {
             workflowOverride: workflow,
             nativePreparedTurn: nativePreparedTurn,
             isStillCurrent: { [weak self] in
-                self?.mcpControlledSession(sessionID: sessionID) === session
+                guard let self, mcpControlledSession(sessionID: sessionID) === session else { return false }
+                // Step 5b final submission fence: this caller's task (never the owned Codex driver)
+                // also refuses a cancelled linked child start.
+                guard let childLinkFence else { return true }
+                return !Task.isCancelled && mcpDelegatedChildLinkAdmissionIsCurrent(childLinkFence)
             }
         )
         switch submission {
@@ -9902,7 +9914,8 @@ final class AgentModeViewModel: ObservableObject {
         attemptID: UUID,
         text: String,
         workflow: AgentWorkflowDefinition?,
-        nativePreparedTurn: NativeSlashPreparedUserTurn?
+        nativePreparedTurn: NativeSlashPreparedUserTurn?,
+        childLinkFence: MCPDelegatedChildLinkAdmission?
     ) async throws -> MCPInstructionDispatch {
         let tracker = session.codexSteerAckTracker
         let activeDispatchWakeIdentity = mcpActiveDispatchWakeIdentity(for: session, sessionID: sessionID)
@@ -9917,7 +9930,8 @@ final class AgentModeViewModel: ObservableObject {
                 text: text,
                 workflow: workflow,
                 nativePreparedTurn: nativePreparedTurn,
-                refusal: refusal
+                refusal: refusal,
+                childLinkFence: childLinkFence
             )
             self?.codexMCPSubmissionDrivers[attemptID] = nil
         }
@@ -9991,7 +10005,8 @@ final class AgentModeViewModel: ObservableObject {
         text: String,
         workflow: AgentWorkflowDefinition?,
         nativePreparedTurn: NativeSlashPreparedUserTurn?,
-        refusal: CodexMCPDispatchRefusal
+        refusal: CodexMCPDispatchRefusal,
+        childLinkFence: MCPDelegatedChildLinkAdmission?
     ) async {
         let tracker = session.codexSteerAckTracker
         guard tracker.markOperationStarted(attemptID: attemptID) else { return }
@@ -10010,7 +10025,8 @@ final class AgentModeViewModel: ObservableObject {
             workflowOverride: workflow,
             nativePreparedTurn: nativePreparedTurn,
             isStillCurrent: { [weak self] in
-                self?.mcpControlledSession(sessionID: sessionID) === session
+                guard let self, mcpControlledSession(sessionID: sessionID) === session else { return false }
+                return childLinkFence.map { self.mcpDelegatedChildLinkAdmissionIsCurrent($0) } ?? true
             }
         )
         switch submission {

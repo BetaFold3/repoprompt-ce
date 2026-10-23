@@ -1998,7 +1998,7 @@ package final class AgentTabSession: ObservableObject {
         return ownership
     }
 
-    func isCurrentRunAttempt(_ ownership: AgentRunOwnership, expectedRunID: UUID? = nil) -> Bool {
+    package func isCurrentRunAttempt(_ ownership: AgentRunOwnership, expectedRunID: UUID? = nil) -> Bool {
         guard activeRunOwnership == ownership else { return false }
         if let expectedRunID {
             return runID == expectedRunID
@@ -2006,7 +2006,7 @@ package final class AgentTabSession: ObservableObject {
         return true
     }
 
-    func isCurrentRunAttemptForCurrentBinding(
+    package func isCurrentRunAttemptForCurrentBinding(
         _ ownership: AgentRunOwnership,
         expectedRunID: UUID? = nil
     ) -> Bool {

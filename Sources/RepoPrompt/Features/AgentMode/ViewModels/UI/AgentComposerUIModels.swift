@@ -417,7 +417,7 @@ extension Notification.Name {
 }
 
 struct AgentRecoveryListRowProps: Equatable, Identifiable {
-    enum Action: Equatable {
+    enum Action: Hashable {
         /// Move the held input into this session's (empty) composer, then withdraw it.
         case edit
         /// Withdraw the held input (the row stays until the withdrawal commits).
@@ -455,6 +455,9 @@ struct AgentRecoveryListRowProps: Equatable, Identifiable {
         case reconcileHistory
         /// Phase 4 (gated OFF): explicit fresh conversation after a failed Claude resume.
         case continueInNewConversation
+        /// Step 5b: open the existing delegated child session linked under this run attempt. It
+        /// only opens that session; nothing is recreated, restarted, or resent.
+        case openDelegatedSession(UUID)
     }
 
     let id: String
@@ -462,7 +465,8 @@ struct AgentRecoveryListRowProps: Equatable, Identifiable {
     let sessionName: String
     let title: String
     let detail: String
-    /// The original input (View), when the row is held input.
+    /// Viewable full text (View): the original input when the row is held input, or the full
+    /// per-child status when the row is a run with delegated-child links.
     let text: String?
     let attachmentNames: [String]
     let actions: [Action]

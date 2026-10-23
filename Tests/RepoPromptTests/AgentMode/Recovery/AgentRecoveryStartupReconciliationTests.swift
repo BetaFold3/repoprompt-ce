@@ -1559,6 +1559,110 @@ final class AgentRecoveryStartupReconciliationTests: XCTestCase {
         XCTAssertEqual(try readSessionFile(load).transcript?.turns.first { $0.id == openTurnID }?.recoveredOutcome, savedOpen.recoveredOutcome)
     }
 
+    // MARK: - Delegated child links (Step 5b)
+
+    /// A parent's link committed before the child's dispatch (then a crash): the store joins only an
+    /// exact repeat, refuses a conflicting child or a missing attempt, and after a restart the link
+    /// is discovered under the admitted attempt's run card without resolving or recreating the
+    /// child. Unknown link members survive later writes; a duplicate invocation is unreadable.
+    func testDelegatedChildLinkCommittedBeforeDispatchIsDiscoveredAfterRestart() async throws {
+        let earlier = launch()
+        let home = try makeWorkspace("home")
+        let parent = try await makeSession(earlier, in: home)
+        let ownership = Support.ownership(sessionID: parent.session.id)
+        let invocationID = UUID()
+        let childSessionID = UUID()
+        let link = AgentRecoveryDelegatedChildLink(
+            invocationID: invocationID,
+            parentRunAttemptID: ownership.attemptID,
+            childSessionID: childSessionID,
+            linkedAt: AgentRecoveryTimestamp(millisecondsSince1970: 1000)
+        )
+
+        try await transact(earlier, parent) { store, binding in
+            do {
+                _ = try await store.commitDelegatedChildLink(binding: binding, link: link)
+                XCTFail("A link needs its recorded, open parent attempt")
+            } catch AgentRecoveryStoreError.delegatedChildLinkIneligible(_) {}
+            _ = try await store.ensureRunAttempt(
+                binding: binding,
+                expectedRevision: store.currentRevision(sessionID: binding.sessionID),
+                ownership: ownership,
+                processRunID: UUID(),
+                transcriptTurnID: nil
+            )
+            let first = try await store.commitDelegatedChildLink(binding: binding, link: link)
+            XCTAssertEqual(first.disposition, .committed)
+            let repeated = try await store.commitDelegatedChildLink(binding: binding, link: link)
+            XCTAssertEqual(repeated.disposition, .unchanged, "The same invocation and child is joined")
+            let conflicting = AgentRecoveryDelegatedChildLink(
+                invocationID: invocationID,
+                parentRunAttemptID: ownership.attemptID,
+                childSessionID: UUID(),
+                linkedAt: AgentRecoveryTimestamp(millisecondsSince1970: 2000)
+            )
+            do {
+                _ = try await store.commitDelegatedChildLink(binding: binding, link: conflicting)
+                XCTFail("Another child for the same invocation conflicts")
+            } catch let AgentRecoveryStoreError.delegatedChildLinkConflict(conflictID) {
+                XCTAssertEqual(conflictID, invocationID)
+            }
+        }
+        let committed = await earlier.store.read(sessionID: parent.session.id).record?.delegatedChildLinks
+        XCTAssertEqual(committed, [link])
+
+        // Crash before the child dispatch; the next launch discovers the link under its attempt.
+        let next = launch()
+        let coordinator = try await startedCoordinator(next, workspaces: [home])
+        let item = try XCTUnwrap(coordinator.catalog.items.first { item in
+            if case let .recoveryOnlyRun(attempt) = item.payload { return attempt.runAttemptID == ownership.attemptID }
+            return false
+        })
+        XCTAssertEqual(item.sessionID, parent.session.id)
+        XCTAssertEqual(item.actionFacts.delegatedChildLinks, [link])
+        XCTAssertNil(coordinator.reconciliation.resolution(for: childSessionID), "A link never resolves or creates its child")
+
+        // Unknown members of a link survive an unrelated write by a later launch.
+        let fileURL = next.store.recordFileURL(sessionID: parent.session.id)
+        var object = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: fileURL)) as? [String: Any])
+        var links = try XCTUnwrap(object["delegatedChildLinks"] as? [[String: Any]])
+        links[0]["futureLinkMember"] = "kept"
+        object["delegatedChildLinks"] = links
+        try JSONSerialization.data(withJSONObject: object).write(to: fileURL)
+        let later = launch()
+        let laterCoordinator = try await startedCoordinator(later, workspaces: [home])
+        let binding = try XCTUnwrap(laterCoordinator.reconciliation.resolution(for: parent.session.id)?.binding)
+        _ = try await later.store.updateQuestionSnapshots(
+            binding: binding,
+            expectedRevision: later.store.currentRevision(sessionID: parent.session.id),
+            update: .init(upserting: [AgentRecoveryQuestionSnapshot(
+                interactionID: UUID(),
+                kind: .askUser,
+                runAttemptID: nil,
+                transcriptResetGeneration: binding.transcriptResetGeneration,
+                appInstanceID: later.store.appInstanceID,
+                askedAt: AgentRecoveryTimestamp(millisecondsSince1970: 5000),
+                title: "Unrelated",
+                message: nil,
+                items: [],
+                extras: [:]
+            )])
+        )
+        let rewritten = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: fileURL)) as? [String: Any])
+        let keptLinks = try XCTUnwrap(rewritten["delegatedChildLinks"] as? [[String: Any]])
+        XCTAssertEqual(keptLinks.count, 1)
+        XCTAssertEqual(keptLinks.first?["futureLinkMember"] as? String, "kept")
+        XCTAssertEqual((keptLinks.first?["childSessionID"] as? String)?.uppercased(), childSessionID.uuidString)
+
+        // A duplicate invocation link is never adopted.
+        var duplicated = rewritten
+        duplicated["delegatedChildLinks"] = keptLinks + keptLinks
+        let duplicatedData = try JSONSerialization.data(withJSONObject: duplicated)
+        guard case .failure = AgentRecoveryRecordCodec.decode(duplicatedData, expectedSessionID: parent.session.id) else {
+            return XCTFail("A duplicate delegated child link is unreadable")
+        }
+    }
+
     // MARK: - Fixtures
 
     private func launch() -> Launch {

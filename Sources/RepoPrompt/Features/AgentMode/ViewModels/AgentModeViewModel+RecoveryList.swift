@@ -213,18 +213,33 @@ extension AgentModeViewModel {
         case let .turn(turn):
             let (title, detail) = Self.recoveryListTurnText(turn)
             let runActions = recoveryRunActions(session: isActive ? activeSession : nil, status: turn.status, facts: item.actionFacts)
-            return row(title, detail, actions: runActions + dismiss + openAction)
+            let children = recoveryDelegatedChildPresentation(
+                item.actionFacts.delegatedChildLinks,
+                parentSessionID: sessionID,
+                parentInOtherWorkspace: recoveryListItemIsInOtherWorkspace(item)
+            )
+            return row(title, detail + children.detail, text: children.text, actions: runActions + children.actions + dismiss + openAction)
         case let .outcomeTurn(outcome):
             let (title, detail) = Self.recoveryListOutcomeTurnText(outcome)
             let runActions = recoveryRunActions(session: isActive ? activeSession : nil, status: outcome.status, facts: item.actionFacts)
-            return row(title, detail, actions: runActions + dismiss + openAction)
+            let children = recoveryDelegatedChildPresentation(
+                item.actionFacts.delegatedChildLinks,
+                parentSessionID: sessionID,
+                parentInOtherWorkspace: recoveryListItemIsInOtherWorkspace(item)
+            )
+            return row(title, detail + children.detail, text: children.text, actions: runActions + children.actions + dismiss + openAction)
         case let .recoveryOnlyRun(attempt):
             // R1a: a run whose turn was never saved is still listed from its recovery evidence. A
             // finished run (R09) shows its recorded outcome; it holds nothing.
             let (title, detail) = Self.recoveryOnlyRunRowText(attempt)
             let status = AgentRecoveryInterruptedTurn.Status.classify(terminal: attempt.terminal, shutdown: attempt.shutdown)
             let runActions = recoveryRunActions(session: isActive ? activeSession : nil, status: status, facts: item.actionFacts)
-            return row(title, detail, actions: runActions + dismiss + openAction)
+            let children = recoveryDelegatedChildPresentation(
+                item.actionFacts.delegatedChildLinks,
+                parentSessionID: sessionID,
+                parentInOtherWorkspace: recoveryListItemIsInOtherWorkspace(item)
+            )
+            return row(title, detail + children.detail, text: children.text, actions: runActions + children.actions + dismiss + openAction)
         case let .intent(intent, context):
             var detail = context.isRemote && intent.deliveryState == .deliveryUnknown
                 ? Self.recoveryListRemoteUncertainty
@@ -389,6 +404,98 @@ extension AgentModeViewModel {
                 actions: openAction + dismiss
             )
         }
+    }
+
+    /// A catalog item recorded for a workspace other than this window's persistence workspace.
+    private func recoveryListItemIsInOtherWorkspace(_ item: AgentRecoveryCatalogItem) -> Bool {
+        item.workspaceID != nil && item.workspaceID != persistenceWorkspace?.id
+    }
+
+    /// Step 5b: honest status of the delegated children linked under a run attempt, with Open for
+    /// each child found in this workspace. A link proves only that the child's stub was saved
+    /// before its dispatch was attempted, never that it started; nothing is recreated or resent.
+    /// Every durable link is kept; status and Open are shown once per child session. The inline
+    /// detail stays one short sentence; the full per-child status is the row's viewable text. A
+    /// parent row from another workspace is never resolved here (open the parent to check).
+    func recoveryDelegatedChildPresentation(
+        _ links: [AgentRecoveryDelegatedChildLink],
+        parentSessionID: UUID?,
+        parentInOtherWorkspace: Bool = false
+    ) -> (detail: String, text: String?, actions: [AgentRecoveryListRowProps.Action]) {
+        var seen = Set<UUID>()
+        let childSessionIDs = links.map(\.childSessionID).filter { seen.insert($0).inserted }
+        guard !childSessionIDs.isEmpty else { return ("", nil, []) }
+        let never = "Delegated work is never restarted automatically."
+        let countText = childSessionIDs.count == 1
+            ? "This run is linked to a delegated session"
+            : "This run is linked to \(childSessionIDs.count) delegated sessions"
+        if parentInOtherWorkspace {
+            let lines = childSessionIDs.map {
+                "Delegated session \($0.uuidString.prefix(8)): open the parent session to check it."
+            }
+            return (" \(countText); open the parent to check. \(never)", (lines + [never]).joined(separator: "\n"), [])
+        }
+        var lines: [String] = []
+        var actions: [AgentRecoveryListRowProps.Action] = []
+        for childSessionID in childSessionIDs {
+            let name = "Delegated session \(childSessionID.uuidString.prefix(8))"
+            guard let child = recoveryDelegatedChild(childSessionID) else {
+                lines.append("\(name) was linked to this run but can't be found in this workspace.")
+                continue
+            }
+            actions.append(.openDelegatedSession(childSessionID))
+            if child.parentSessionID == nil || child.parentSessionID != parentSessionID {
+                lines.append("\(name) was linked to this run, but its saved data names a different parent; check it before relying on it.")
+            } else {
+                switch child.hasConversation {
+                case false?:
+                    lines.append("\(name) was created for this run but has no saved messages, so it may never have started.")
+                case true?:
+                    lines.append("\(name) was created for this run and has saved messages; open it to check its state.")
+                case nil:
+                    lines.append("\(name) was created for this run; whether it started is unknown. Open it to check.")
+                }
+            }
+        }
+        let detail = lines.count == 1
+            ? " \(lines[0]) \(never)"
+            : " \(countText); view the details for each one's status. \(never)"
+        return (detail, (lines + [never]).joined(separator: "\n"), actions)
+    }
+
+    private struct RecoveryDelegatedChild {
+        let tabID: UUID
+        let parentSessionID: UUID?
+        /// Nil when the saved conversation content is unknown.
+        let hasConversation: Bool?
+    }
+
+    /// The existing child session in this workspace (owner-validated index first, then a hydrated
+    /// live session). Never creates or hydrates anything.
+    private func recoveryDelegatedChild(_ childSessionID: UUID) -> RecoveryDelegatedChild? {
+        if let entry = ownerValidatedSessionIndex[childSessionID] {
+            return RecoveryDelegatedChild(
+                tabID: entry.tabID,
+                parentSessionID: entry.parentSessionID,
+                hasConversation: entry.hasUnknownConversationContent ? nil : entry.itemCount > 0
+            )
+        }
+        if let live = try? authoritativeLiveSession(for: childSessionID), live.hasLoadedPersistedState {
+            return RecoveryDelegatedChild(
+                tabID: live.tabID,
+                parentSessionID: live.parentSessionID,
+                hasConversation: hasPersistableConversationContent(live)
+            )
+        }
+        return nil
+    }
+
+    /// Opens the existing delegated child's tab (switch or unstash) without starting anything.
+    private func openRecoveryDelegatedSession(_ childSessionID: UUID) async -> String? {
+        guard let child = recoveryDelegatedChild(childSessionID) else {
+            return "The delegated session can't be found in this workspace. It was not recreated."
+        }
+        return await openRecoveryListTab(child.tabID)
     }
 
     /// This window's tab owning `sessionID` with a live lane, if any.
@@ -640,6 +747,8 @@ extension AgentModeViewModel {
             await letRecoveryRuntimeFinish(rowID: rowID)
         case .continueTurn, .sendSaved, .answerAsInput, .reconcileHistory, .continueInNewConversation:
             await performRecoveryResumeAction(rowID: rowID, action: action)
+        case let .openDelegatedSession(childSessionID):
+            await openRecoveryDelegatedSession(childSessionID)
         }
         coordinator.setCatalogActionState(failure.map { .failed($0) }, for: rowID)
         refreshRecoveryListUI()
@@ -1209,13 +1318,19 @@ extension AgentModeViewModel {
             let result = await recoveryListRouteToSession(route)
             return Self.recoveryListRouteFailure(result)
         }
+        return await openRecoveryListTab(tabID)
+    }
+
+    /// Switches to (or unstashes) one of this workspace's tabs and hydrates it; starts nothing.
+    private func openRecoveryListTab(_ tabID: UUID) async -> String? {
+        let unavailable = "This session can't be opened from here. Open it from the sidebar."
         guard let promptManager else { return unavailable }
         if promptManager.currentComposeTabs.contains(where: { $0.id == tabID }) {
             await promptManager.switchComposeTab(tabID)
         } else if promptManager.currentStashedTabs.contains(where: { $0.id == tabID }) {
             await promptManager.unstashTab(tabID)
         } else {
-            return "This session can't be opened from here. Open it from the sidebar."
+            return unavailable
         }
         _ = await ensureHydrated(tabID: tabID)
         return nil

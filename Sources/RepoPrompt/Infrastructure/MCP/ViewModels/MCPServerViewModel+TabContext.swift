@@ -1484,6 +1484,10 @@ extension MCPServerViewModel {
         /// Dispatcher-validated provenance for a one-shot hidden `_windowID`.
         /// This is distinct from effective or persisted connection affinity.
         let explicitWindowRoutingHint: MCPExplicitWindowRoutingHint?
+        /// The dispatcher's server-side invocation UUID of this `tools/call`
+        /// (`ServerNetworkManager.currentToolInvocationID`). Local execution identity only; a new
+        /// request is a new invocation. `nil` outside a dispatched tool call.
+        let toolInvocationID: UUID?
 
         init(
             connectionID: UUID?,
@@ -1491,7 +1495,8 @@ extension MCPServerViewModel {
             windowID: Int?,
             runPurpose: MCPRunPurpose? = nil,
             tabContextHint: TabContextHint? = nil,
-            explicitWindowRoutingHint: MCPExplicitWindowRoutingHint? = nil
+            explicitWindowRoutingHint: MCPExplicitWindowRoutingHint? = nil,
+            toolInvocationID: UUID? = nil
         ) {
             self.connectionID = connectionID
             self.clientName = clientName
@@ -1499,6 +1504,7 @@ extension MCPServerViewModel {
             self.runPurpose = runPurpose
             self.tabContextHint = tabContextHint
             self.explicitWindowRoutingHint = explicitWindowRoutingHint
+            self.toolInvocationID = toolInvocationID
         }
     }
 
@@ -1521,7 +1527,8 @@ extension MCPServerViewModel {
             windowID: service.currentRequestWindowID(),
             runPurpose: runPurpose,
             tabContextHint: ServerNetworkManager.currentTabContextHint,
-            explicitWindowRoutingHint: service.currentRequestExplicitWindowRoutingHint()
+            explicitWindowRoutingHint: service.currentRequestExplicitWindowRoutingHint(),
+            toolInvocationID: ServerNetworkManager.currentToolInvocationID
         )
     }
 

@@ -900,6 +900,37 @@ package struct AgentRecoveryCardAcknowledgement: Equatable {
     }
 }
 
+// MARK: - Delegated child links (Phase 5, Step 5b)
+
+/// One routed `agent_run.start` admitted under this record's session (the parent), committed after
+/// the child's covering session stub and before the child's first dispatch. It records local
+/// execution identity only: the existing server-side MCP invocation UUID of the admitted tool call
+/// and the parent run attempt active at admission. It is not a provider-native tool-use identity,
+/// not a cross-request deduplication key, and not proof that the child started: recovery uses it to
+/// find the existing child instead of replaying `agent_run`, and never dispatches from it.
+package struct AgentRecoveryDelegatedChildLink: Equatable {
+    package let invocationID: UUID
+    /// `AgentRunOwnership.attemptID` of the parent run active when the call was admitted.
+    package let parentRunAttemptID: UUID
+    package let childSessionID: UUID
+    package let linkedAt: AgentRecoveryTimestamp
+    package var extras: AgentRecoveryExtras
+
+    package init(
+        invocationID: UUID,
+        parentRunAttemptID: UUID,
+        childSessionID: UUID,
+        linkedAt: AgentRecoveryTimestamp,
+        extras: AgentRecoveryExtras = [:]
+    ) {
+        self.invocationID = invocationID
+        self.parentRunAttemptID = parentRunAttemptID
+        self.childSessionID = childSessionID
+        self.linkedAt = linkedAt
+        self.extras = extras
+    }
+}
+
 // MARK: - Record
 
 package struct AgentRecoveryRecord: Equatable {
@@ -929,6 +960,9 @@ package struct AgentRecoveryRecord: Equatable {
     package let actions: [AgentRecoveryAction]
     /// Provider history cursors (Phase 4), one per provider conversation (empty = none).
     package let historyCursors: [AgentRecoveryHistoryCursor]
+    /// Delegated child links (Step 5b), in commit order (empty = none). Additive: absent when
+    /// empty, so older records keep their bytes.
+    package let delegatedChildLinks: [AgentRecoveryDelegatedChildLink]
     package let extras: AgentRecoveryExtras
 
     package init(
@@ -946,10 +980,12 @@ package struct AgentRecoveryRecord: Equatable {
         cardAcknowledgements: [AgentRecoveryCardAcknowledgement] = [],
         actions: [AgentRecoveryAction] = [],
         historyCursors: [AgentRecoveryHistoryCursor] = [],
+        delegatedChildLinks: [AgentRecoveryDelegatedChildLink] = [],
         extras: AgentRecoveryExtras = [:]
     ) {
         self.actions = actions
         self.historyCursors = historyCursors
+        self.delegatedChildLinks = delegatedChildLinks
         self.crashHoldAcknowledgement = crashHoldAcknowledgement
         self.questions = questions
         self.cardAcknowledgements = cardAcknowledgements
@@ -975,6 +1011,15 @@ package struct AgentRecoveryRecord: Equatable {
 
     package func runAttempt(id: UUID) -> AgentRecoveryRunAttempt? {
         runAttempts.first { $0.runAttemptID == id }
+    }
+
+    package func delegatedChildLink(invocationID: UUID) -> AgentRecoveryDelegatedChildLink? {
+        delegatedChildLinks.first { $0.invocationID == invocationID }
+    }
+
+    /// Links admitted under one parent run attempt, in commit order.
+    package func delegatedChildLinks(parentRunAttemptID: UUID) -> [AgentRecoveryDelegatedChildLink] {
+        delegatedChildLinks.filter { $0.parentRunAttemptID == parentRunAttemptID }
     }
 
     package func cardAcknowledgement(for key: AgentRecoveryCardKey) -> AgentRecoveryCardAcknowledgement? {

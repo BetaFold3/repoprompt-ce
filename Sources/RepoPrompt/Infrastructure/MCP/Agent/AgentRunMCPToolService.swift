@@ -976,6 +976,30 @@ struct AgentRunMCPToolService {
         // A Knowledge start is always credited to the identity frozen by outer admission.
         let admittedCallerSessionID = knowledgeCaller?.admittedCallerSessionID ?? innerAdmittedCallerSessionID
         let admittedCallerProfile: AgentSessionProfile? = knowledgeCaller == nil ? nil : .knowledge
+        let revalidateSpawnDelegation: () throws -> Void = { [weak agentModeVM] in
+            guard let agentModeVM else {
+                throw MCPError.invalidParams(
+                    "agent_run.start: the agent window closed while the request was in flight. Nothing was started."
+                )
+            }
+            try agentModeVM.mcpRevalidateDelegationCommit(
+                sourceTabID: parentSourceTabID,
+                expectedCallerSessionID: admittedCallerSessionID,
+                targetSessionID: resolvedTabID.flatMap { agentModeVM.mcpExistingSessionID(forTabID: $0) },
+                operation: "agent_run.start",
+                expectedCallerProfile: admittedCallerProfile
+            )
+        }
+        // Step 5b: freeze, synchronously with admission, this call's dispatcher invocation UUID, the
+        // admitted parent, its active run attempt, and its recovery lane. Nil (unchanged) for an
+        // independent caller or a parent without durable recovery admission.
+        let delegatedChildLinkAdmission = try agentModeVM.mcpAdmitDelegatedChildLink(
+            sourceTabID: parentSourceTabID,
+            admittedCallerSessionID: admittedCallerSessionID,
+            invocationID: metadata.toolInvocationID,
+            operation: "agent_run.start",
+            revalidateDelegation: revalidateSpawnDelegation
+        )
         if let knowledgeCaller {
             if resolvedSelection.agentRaw == nil {
                 // K4: freeze the admitted parent's live provider, model, and effort synchronously
@@ -1098,13 +1122,8 @@ struct AgentRunMCPToolService {
                 ? false
                 : effectiveParentWorktreeInheritance,
             delegationCommitCheck: {
-                try agentModeVM.mcpRevalidateDelegationCommit(
-                    sourceTabID: parentSourceTabID,
-                    expectedCallerSessionID: admittedCallerSessionID,
-                    targetSessionID: resolvedTabID.flatMap { agentModeVM.mcpExistingSessionID(forTabID: $0) },
-                    operation: "agent_run.start",
-                    expectedCallerProfile: admittedCallerProfile
-                )
+                try revalidateSpawnDelegation()
+                try agentModeVM.mcpRequireDelegatedChildLinkAdmissionCurrent(delegatedChildLinkAdmission)
             },
             childSessionProfile: knowledgeCaller == nil ? nil : .knowledge
         )
@@ -1449,6 +1468,8 @@ struct AgentRunMCPToolService {
                     target: target
                 )
             }
+            // The parent admission must survive worktree preparation's awaits.
+            try agentModeVM.mcpRequireDelegatedChildLinkAdmissionCurrent(delegatedChildLinkAdmission)
         } catch {
             WorktreeStartupInstrumentation.record(
                 .failed,
@@ -1543,6 +1564,35 @@ struct AgentRunMCPToolService {
                 }
             }
         #endif
+        if let delegatedChildLinkAdmission {
+            // Step 5b: the child's covering save and the parent's link commit are acknowledged
+            // before any child dispatch; a failure or cancellation here dispatches nothing.
+            do {
+                try await agentModeVM.mcpCommitDelegatedChildLink(
+                    delegatedChildLinkAdmission,
+                    childTabID: target.tabID,
+                    childSessionID: targetSessionID
+                )
+                // Immediately before the start: a cancelled call starts nothing.
+                try Task.checkCancellation()
+            } catch {
+                WorktreeStartupInstrumentation.record(
+                    .failed,
+                    context: worktreeStartupContext,
+                    fallback: error is CancellationError ? .cancellation : nil
+                )
+                #if DEBUG
+                    await performTerminalQualificationCleanup(
+                        error is CancellationError ? "cancellation" : "delegated_child_link",
+                        false,
+                        error is CancellationError ? .cancellation : nil
+                    )
+                #else
+                    await agentModeVM.mcpDiscardSessionTarget(target)
+                #endif
+                throw error
+            }
+        }
         let outcome: AgentExternalMCPRunStarter.StartOutcome
         do {
             WorktreeStartupInstrumentation.record(.providerStart, context: worktreeStartupContext)
@@ -1561,7 +1611,31 @@ struct AgentRunMCPToolService {
                 outcome = try await OhMyPiAgentModeSmokeGate.$invocationStartContext.withValue(
                     ompQualificationStartContext
                 ) {
-                    try await startRun(
+                    try await MCPDelegatedChildDispatchFence.$current.withValue(delegatedChildLinkAdmission) {
+                        // One-shot: inherited unstructured work never arms the fence after the start.
+                        defer { delegatedChildLinkAdmission?.releaseDispatchFence() }
+                        return try await startRun(
+                            target,
+                            message,
+                            metadata,
+                            bindCurrentRequestToTab,
+                            agentModeVM,
+                            selection.agentRaw,
+                            selection.modelRaw,
+                            selectionReasoningEffortRaw,
+                            selection.taskLabelKind,
+                            selection.ohMyPiThinkingSelections,
+                            workflow,
+                            spawnParentSessionID,
+                            oracleLaunchSource.source
+                        )
+                    }
+                }
+            #else
+                outcome = try await MCPDelegatedChildDispatchFence.$current.withValue(delegatedChildLinkAdmission) {
+                    // One-shot: inherited unstructured work never arms the fence after the start.
+                    defer { delegatedChildLinkAdmission?.releaseDispatchFence() }
+                    return try await startRun(
                         target,
                         message,
                         metadata,
@@ -1577,22 +1651,6 @@ struct AgentRunMCPToolService {
                         oracleLaunchSource.source
                     )
                 }
-            #else
-                outcome = try await startRun(
-                    target,
-                    message,
-                    metadata,
-                    bindCurrentRequestToTab,
-                    agentModeVM,
-                    selection.agentRaw,
-                    selection.modelRaw,
-                    selectionReasoningEffortRaw,
-                    selection.taskLabelKind,
-                    selection.ohMyPiThinkingSelections,
-                    workflow,
-                    spawnParentSessionID,
-                    oracleLaunchSource.source
-                )
             #endif
             #if DEBUG
                 if worktreeStartupBenchmarkToken != nil {

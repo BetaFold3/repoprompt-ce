@@ -67,6 +67,11 @@ enum AgentRecoveryRecordCodec {
                     path: "record.historyCursors",
                     element: historyCursor
                 ),
+                delegatedChildLinks: optionalArray(
+                    reader.optional("delegatedChildLinks"),
+                    path: "record.delegatedChildLinks",
+                    element: delegatedChildLink
+                ),
                 extras: reader.extras
             )
             try validateInvariants(record)
@@ -119,6 +124,10 @@ enum AgentRecoveryRecordCodec {
         }
         if !record.historyCursors.isEmpty {
             object["historyCursors"] = .array(record.historyCursors.map(historyCursorJSON))
+        }
+        // Step 5b: absent when empty (older records keep their bytes).
+        if !record.delegatedChildLinks.isEmpty {
+            object["delegatedChildLinks"] = .array(record.delegatedChildLinks.map(delegatedChildLinkJSON))
         }
         return .object(object)
     }
@@ -293,6 +302,28 @@ enum AgentRecoveryRecordCodec {
         }
         object["completeLineOffset"] = .number(Decimal(cursor.completeLineOffset))
         object["committedAt"] = timestampJSON(cursor.committedAt)
+        return .object(object)
+    }
+
+    // MARK: Delegated child links (Step 5b)
+
+    private static func delegatedChildLink(_ json: AgentRecoveryJSONValue, path: String) throws -> AgentRecoveryDelegatedChildLink {
+        var reader = try Reader(json, path: path)
+        return try AgentRecoveryDelegatedChildLink(
+            invocationID: reader.uuid("invocationID"),
+            parentRunAttemptID: reader.uuid("parentRunAttemptID"),
+            childSessionID: reader.uuid("childSessionID"),
+            linkedAt: reader.timestamp("linkedAt"),
+            extras: reader.extras
+        )
+    }
+
+    private static func delegatedChildLinkJSON(_ link: AgentRecoveryDelegatedChildLink) -> AgentRecoveryJSONValue {
+        var object = link.extras
+        object["invocationID"] = .string(link.invocationID.uuidString)
+        object["parentRunAttemptID"] = .string(link.parentRunAttemptID.uuidString)
+        object["childSessionID"] = .string(link.childSessionID.uuidString)
+        object["linkedAt"] = timestampJSON(link.linkedAt)
         return .object(object)
     }
 
@@ -488,6 +519,12 @@ enum AgentRecoveryRecordCodec {
         for cursor in record.historyCursors {
             guard cursorKeys.insert("\(cursor.providerRaw)\u{0}\(cursor.conversationID)").inserted else {
                 throw AgentRecoveryDecodingError(reason: .malformed("duplicate history cursor"))
+            }
+        }
+        var linkedInvocationIDs: Set<UUID> = []
+        for link in record.delegatedChildLinks {
+            guard linkedInvocationIDs.insert(link.invocationID).inserted else {
+                throw AgentRecoveryDecodingError(reason: .malformed("duplicate delegated child link \(link.invocationID)"))
             }
         }
         var cardKeys: Set<AgentRecoveryCardKey> = []

@@ -274,6 +274,8 @@ struct AgentRecoveryListRow: View {
             "Check provider history"
         case .continueInNewConversation:
             "Continue in a new conversation…"
+        case let .openDelegatedSession(childSessionID):
+            "Open delegated session \(childSessionID.uuidString.prefix(8))"
         }
     }
 }

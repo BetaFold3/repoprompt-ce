@@ -2465,6 +2465,11 @@ actor ServerNetworkManager {
     static var currentEffectiveWindowID: Int?
     @TaskLocal
     static var currentToolResultDelivery: MCPToolResultDeliveryTransaction?
+    /// The server-side invocation UUID of the `tools/call` being executed (the same `invocationID`
+    /// the dispatcher uses for denial, observer, and tool-card ownership). Local execution identity
+    /// only: never a provider-native tool-use ID or a cross-request deduplication key.
+    @TaskLocal
+    static var currentToolInvocationID: UUID?
 
     nonisolated static func explicitWindowRoutingHint(
         connectionID: UUID,
@@ -3095,11 +3100,19 @@ actor ServerNetworkManager {
 
     /// Runs the given async operation with the TaskLocal connectionID and lifecycle correlation set.
     /// Use this to propagate the connection context across Task boundaries.
+    /// - Parameter toolInvocationID: when non-nil, also scopes `currentToolInvocationID`; `nil` keeps
+    ///   any inherited invocation identity unchanged.
     nonisolated static func withConnectionID<T>(
         _ connectionID: UUID?,
+        toolInvocationID: UUID? = nil,
         lifecycleCorrelation: EditFlowPerf.LifecycleCorrelation? = nil,
         operation: () async throws -> T
     ) async rethrows -> T {
+        if let toolInvocationID {
+            return try await $currentToolInvocationID.withValue(toolInvocationID) {
+                try await withConnectionID(connectionID, lifecycleCorrelation: lifecycleCorrelation, operation: operation)
+            }
+        }
         #if DEBUG || EDIT_FLOW_PERF
             let effectiveLifecycleCorrelation = lifecycleCorrelation ?? EditFlowPerf.currentLifecycleCorrelation
             guard let effectiveLifecycleCorrelation else {
@@ -12041,7 +12054,11 @@ actor ServerNetworkManager {
                         EditFlowPerf.Dimensions(toolName: toolName)
                     ) {
                         // Wrap entire call so inner services can query current routing hints.
-                        await Self.withConnectionID(connectionID, lifecycleCorrelation: lifecycleCorrelation) {
+                        await Self.withConnectionID(
+                            connectionID,
+                            toolInvocationID: invocationID,
+                            lifecycleCorrelation: lifecycleCorrelation
+                        ) {
                             await Self.$currentTabContextHint.withValue(capturedTabContextHint) {
                                 let permitPreDispatchEnvelopeState = EditFlowPerf.begin(
                                     EditFlowPerf.Stage.MCPToolCall.permitPreDispatchEnvelope,

@@ -621,8 +621,9 @@ extension AgentModeViewModel {
     /// provider byte. The save is forced (dirty) even for an unchanged placement; a save already in
     /// flight is joined and followed by at most one further explicit flush. Only a `.written`
     /// receipt covering the capture under the same owner, binding, and persistence context
-    /// qualifies; suppressed, reset-only, deferred, and non-writing outcomes never do.
-    private func commitRecoverySavedPlacement(_ session: AgentTabSession) async -> Bool {
+    /// qualifies; suppressed, reset-only, deferred, and non-writing outcomes never do. Also proves a
+    /// new delegated child's stub durable before its parent link (Step 5b).
+    func commitRecoverySavedPlacement(_ session: AgentTabSession) async -> Bool {
         session.isDirty = true
         let capture = captureTranscriptSaveState(session)
         var outcome = await recoverySavedPlacementSave(session)

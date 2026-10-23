@@ -140,11 +140,20 @@ package struct AgentRecoveryCatalogActionFacts: Equatable {
     /// The run card's attempt reset generation when recorded (a run from before a conversation
     /// clear is never continued into the cleared conversation).
     package var runTranscriptResetGeneration: UInt64?
+    /// Step 5b: delegated sessions `agent_run.start` linked under the run card's attempt, in commit
+    /// order. Discovery only: a link is not proof the child started, and nothing is replayed.
+    package var delegatedChildLinks: [AgentRecoveryDelegatedChildLink] = []
 
-    package init(resolvedByAction: Bool = false, runNeverHandedOff: Bool = false, runTranscriptResetGeneration: UInt64? = nil) {
+    package init(
+        resolvedByAction: Bool = false,
+        runNeverHandedOff: Bool = false,
+        runTranscriptResetGeneration: UInt64? = nil,
+        delegatedChildLinks: [AgentRecoveryDelegatedChildLink] = []
+    ) {
         self.resolvedByAction = resolvedByAction
         self.runNeverHandedOff = runNeverHandedOff
         self.runTranscriptResetGeneration = runTranscriptResetGeneration
+        self.delegatedChildLinks = delegatedChildLinks
     }
 }
 
@@ -305,6 +314,7 @@ package enum AgentRecoveryCatalogProjection {
                     let runAttemptID = UUID(uuidString: key.entityID)
                     facts.runNeverHandedOff = record.isVerifiedNeverHandedOff(runAttemptID: runAttemptID)
                     facts.runTranscriptResetGeneration = runAttemptID.flatMap { record.runAttempt(id: $0) }?.transcriptResetGeneration
+                    facts.delegatedChildLinks = runAttemptID.map { record.delegatedChildLinks(parentRunAttemptID: $0) } ?? []
                 }
             }
             items.append(AgentRecoveryCatalogItem(
