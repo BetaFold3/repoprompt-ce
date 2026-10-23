@@ -366,6 +366,23 @@ package enum AgentRecoveryHistoryProvider: String, CaseIterable {
     case codex
 }
 
+/// An opaque byte-integrity fence over one native history file (Step 4d2): the lowercase hex
+/// SHA-256 of the exact captured raw bytes `[0, completeLineOffset)` (original newlines, no
+/// normalization, never a partial trailing record). Unrelated to the semantic envelope digest.
+/// `file == nil` with offset 0 is verified absence; an existing empty file keeps its identity.
+package struct AgentRecoveryHistoryPrefixFence: Equatable {
+    package let file: AgentRecoveryHistoryFileIdentity?
+    package let completeLineOffset: UInt64
+    /// `nil` = no usable proof (legacy or malformed). Never synthesized; verification fails closed.
+    package let prefixSHA256: String?
+
+    package init(file: AgentRecoveryHistoryFileIdentity?, completeLineOffset: UInt64, prefixSHA256: String?) {
+        self.file = file
+        self.completeLineOffset = completeLineOffset
+        self.prefixSHA256 = prefixSHA256
+    }
+}
+
 /// The recovery-side cursor of one provider conversation's imported history. Advanced only by
 /// compare-and-swap on the previous import ID, after the session commit that holds the rows.
 package struct AgentRecoveryHistoryCursor: Equatable {
@@ -377,6 +394,9 @@ package struct AgentRecoveryHistoryCursor: Equatable {
     package let file: AgentRecoveryHistoryFileIdentity?
     /// Byte offset just after the last complete line imported.
     package let completeLineOffset: UInt64
+    /// Prefix fence proof of `[0, completeLineOffset)` (Claude, Step 4d2). `nil` for Codex, legacy
+    /// cursors, and a malformed stored value (kept verbatim in `extras`).
+    package let prefixSHA256: String?
     package let committedAt: AgentRecoveryTimestamp
     package var extras: AgentRecoveryExtras
 
@@ -386,6 +406,7 @@ package struct AgentRecoveryHistoryCursor: Equatable {
         importID: UUID,
         file: AgentRecoveryHistoryFileIdentity?,
         completeLineOffset: UInt64,
+        prefixSHA256: String? = nil,
         committedAt: AgentRecoveryTimestamp,
         extras: AgentRecoveryExtras = [:]
     ) {
@@ -394,12 +415,18 @@ package struct AgentRecoveryHistoryCursor: Equatable {
         self.importID = importID
         self.file = file
         self.completeLineOffset = completeLineOffset
+        self.prefixSHA256 = prefixSHA256
         self.committedAt = committedAt
         self.extras = extras
     }
 
     package var provider: AgentRecoveryHistoryProvider? {
         AgentRecoveryHistoryProvider(rawValue: providerRaw)
+    }
+
+    /// The byte fence this cursor's boundary represents.
+    package var prefixFence: AgentRecoveryHistoryPrefixFence {
+        AgentRecoveryHistoryPrefixFence(file: file, completeLineOffset: completeLineOffset, prefixSHA256: prefixSHA256)
     }
 }
 

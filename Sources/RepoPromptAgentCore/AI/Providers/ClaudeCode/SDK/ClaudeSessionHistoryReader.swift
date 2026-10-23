@@ -2,10 +2,11 @@ import CryptoKit
 import Darwin
 import Foundation
 
-// Claude exact-session history reader: the single built-in decoder subset `nativeEntriesSubsetV1`
+// Claude exact-session history reader: the single built-in decoder subset `nativeEntriesSubsetV2`
 // (lossless restart Phase 4, phase4-plan §D and its native-history amendment).
 //
-// "V1" versions OUR decoder subset, not Claude's format or CLI. Shapes follow the pinned official
+// "V2" versions OUR decoder subset, not Claude's format or CLI (V1 = before the Step 4d2 attachment,
+// envelope-proof and prefix-fence predicates; V1 baselines are kept as recorded and never upgraded). Shapes follow the pinned official
 // Python SDK fixtures (`claude-agent-sdk-python@3cb0c27eca8caccdc153471a1b19f97fce4ada03`,
 // `tests/test_sessions.py` `_make_transcript_entry` / `_parallel_tool_turn`, and
 // `_internal/sessions.py` `_build_conversation_chain` / `_recover_orphaned_parallel_tool_results`).
@@ -22,11 +23,34 @@ import Foundation
 // - Only complete lines are decoded; an incomplete trailing line waits (an import). A baseline
 //   refuses non-whitespace bytes after the last newline (`partialTrailingRecord`): that pre-existing
 //   record would otherwise look like a post-baseline entry later. The ENTIRE captured complete
-//   candidate is validated before any row or cursor is produced: an unsupported entry type
-//   (including `file-history-snapshot`, `progress`, `system`, `attachment`), unsupported content
-//   block, meaningful metadata (sidechain, meta, compaction, team/agent), malformed line, session
+//   candidate is validated before any row, cursor or ledger suppression is produced: an unsupported
+//   entry type (including `file-history-snapshot`, `progress`, `system`), an attachment outside the
+//   exact whitelist, an operational record carrying graph identity, unsupported content block
+//   (thinking included), meaningful metadata (sidechain, meta, compaction, team/agent), a documented
+//   retraction marker (`supersedes`, `aborted`, `retracted_message_uuids`), malformed line, session
 //   mismatch, conflicting duplicate, missing parent, cycle, ambiguous branch, or ambiguous tool
 //   association rejects the whole candidate.
+// - Capture-qualified nonrendering nodes (Step 4d2, phase4d-claude-capture O19, CLI 2.1.302): the
+//   exact observed `attachment.type` values are graph nodes that are never projected; only their
+//   `uuid`/`parentUuid`/`sessionId` structure (and top-level metadata) is read, never their payload.
+//   The exact observed operational record types carry no graph identity and are skipped unread
+//   (any `uuid`/`parentUuid` key on one refuses). This qualifies a visible projection of that
+//   observed shape only, not the native format, other attachment kinds, or activation.
+// - Attachment-only side branches carry no message and never count as a continuation; a branch
+//   whose subtree holds any message still does. A direct chain projects in ancestor order (block
+//   ordinals unchanged); a demonstrated tool fork keeps file order.
+// - Every row carries its entry's complete-envelope digest. Before any ledger suppression, every
+//   ledger-known entry must be present with exactly its observed row keys and the same digest;
+//   otherwise the whole candidate refuses (`ledgerConflict`).
+// - Byte-prefix fences (Step 4d2): every candidate carries the SHA-256 of its exact captured raw
+//   bytes `[0, completeLineOffset)` (opaque integrity, unrelated to the semantic envelope digest).
+//   The import boundary and every caller-supplied fence (the attempt's baselines, the latest
+//   durably saved import target) are verified against the SAME captured buffer: complete boundary,
+//   length at least the offset, exact digest. A missing or malformed proof refuses
+//   (`prefixProofUnavailable`); truncation or any different prefix refuses (`rewrittenHistory`),
+//   same inode or not. A replaced file is accepted only when every fence verifies byte-for-byte;
+//   there is no rewind or ledger-based fallback. No entry before the boundary may descend from one
+//   after it (`rewrittenHistory`).
 // - Parent links come from `parentUuid` only (never `logicalParentUuid`). Branching is accepted only
 //   for the demonstrated parallel-tool shape: an assistant tool-use entry may have one continuation
 //   child plus tool-result entries associated to it by `tool_use_id` and `sourceToolAssistantUUID`.
@@ -34,15 +58,15 @@ import Foundation
 // - Rows are inert data with deterministic identities derived from (provider, native session,
 //   native entry UUID, row kind, block ordinal). Native user rows are validated but never
 //   projected: `localItemID == nil` means unassociated/not projected, NOT proven RepoPrompt input.
-//   This build has no evidence relating a native user entry (or live stream output) to a local
-//   transcript item; canonical import refuses rather than assume one
-//   (`AgentProviderHistoryAssociationPreflight`).
+//   The only evidence relating a native user entry to local items is an exact match with the
+//   attempt's recorded outbound claims (`userMessageEntries`, matched by
+//   `AgentProviderHistoryAssociationPreflight`); live stream output has none, and canonical import
+//   refuses rather than assume one.
 // - Completion is always unconfirmed: no final answer, stop reason, or EOF proves a turn finished.
 // - Import needs a cursor (a baseline or an earlier import): rows are produced only after it.
-//   Replacement or truncation rescans the whole file and resumes after the last ledger-known entry.
 
 package enum ClaudeSessionHistoryReader {
-    package static let profileName = "nativeEntriesSubsetV1"
+    package static let profileName = "nativeEntriesSubsetV2"
     package static let providerRaw = AgentRecoveryHistoryProvider.claude.rawValue
     package static let defaultMaximumBytes = 64 << 20
 
@@ -69,6 +93,8 @@ package enum ClaudeSessionHistoryReader {
         package let toolInvocationID: UUID?
         package let toolInputJSON: String?
         package let toolIsError: Bool?
+        /// The entry's complete-envelope digest (identical for every row of one entry).
+        package let envelopeDigest: String
     }
 
     package enum Completion: Equatable {
@@ -81,10 +107,16 @@ package enum ClaudeSessionHistoryReader {
         /// `nil` when the session file does not exist yet (a baseline before the first turn).
         package let file: AgentRecoveryHistoryFileIdentity?
         package let completeLineOffset: UInt64
-        /// New rows in file order (already deduplicated against the ledger).
+        /// Lowercase hex SHA-256 of the exact captured bytes `[0, completeLineOffset)` (the empty
+        /// prefix for verified absence). Opaque byte integrity; never the semantic envelope digest.
+        package let prefixSHA256: String
+        /// New rows in projection order (already deduplicated against the ledger, entry by entry).
         package let rows: [Row]
+        /// Native user message entries at or after the import frontier, ledger-known ones included,
+        /// in projection order (outbound-claim matching only; never projected). Empty for a baseline.
+        package let userMessageEntries: [AgentProviderHistoryNativeUserEntry]
         package let completion: Completion
-        /// The cursor's file was replaced or truncated and the whole file was rescanned.
+        /// The boundary's file was replaced by one whose fenced prefix verified byte-for-byte.
         package let isRescan: Bool
     }
 
@@ -103,8 +135,6 @@ package enum ClaudeSessionHistoryReader {
         case partialTrailingRecord
         /// No cursor exists yet: a baseline must be recorded before rows can be imported.
         case baselineRequired
-        /// The file was replaced or truncated and no ledger-known entry locates the previous import.
-        case baselineLost
     }
 
     package enum Unsupported: Error, Equatable {
@@ -120,6 +150,19 @@ package enum ClaudeSessionHistoryReader {
         case cycle
         case ambiguousBranch(String)
         case toolAssociation(String)
+        /// An attachment outside the exact whitelist, or a malformed one (its payload is never named).
+        case attachment(line: Int)
+        /// An operational record carrying `uuid`/`parentUuid` graph identity.
+        case operationalRecord(String, line: Int)
+        /// A documented retraction/supersession marker (`supersedes`, `aborted`, `retracted_message_uuids`).
+        case semanticMarker(String, line: Int)
+        /// A ledger-known entry is missing, or its observed row keys or envelope digest differ.
+        case ledgerConflict(String)
+        /// A fenced prefix no longer matches (truncated, not on a record boundary, or different
+        /// bytes), or the history before the boundary descends from history after it.
+        case rewrittenHistory
+        /// A fence has no usable byte-prefix proof (legacy or malformed): never trusted.
+        case prefixProofUnavailable
     }
 
     package enum Result: Equatable {
@@ -183,11 +226,13 @@ package enum ClaudeSessionHistoryReader {
 
     /// Reads one exact Claude session's history. Synchronous file I/O: call off the main actor.
     /// Never mutates any session or recovery state.
+    /// `fences` are verified against the same captured bytes in addition to the import boundary.
     package static func read(
         nativeSessionID: String,
         projectsDirectories: [URL],
         mode: Mode,
         ledger: AgentSessionProviderHistoryRecovery?,
+        fences: [AgentRecoveryHistoryPrefixFence] = [],
         fileAccess: FileAccess = .live,
         maximumBytes: Int = defaultMaximumBytes
     ) -> Result {
@@ -220,12 +265,22 @@ package enum ClaudeSessionHistoryReader {
         guard let (url, resolvedIdentity) = distinct.first else {
             if case .baseline = mode {
                 // Verified absence (every root enumerated, nothing listed): the conversation has
-                // not been written yet, so everything later is new.
+                // not been written yet, so everything later is new. Its prefix is the empty one,
+                // and any earlier fence must hold for no bytes at all.
+                let prefix: String
+                switch verifyFences(fences, bytes: [], completeEnd: 0) {
+                case let .success(value):
+                    prefix = value
+                case let .failure(unsupported):
+                    return .unsupported(unsupported)
+                }
                 return .candidate(Candidate(
                     nativeSessionID: nativeSessionID,
                     file: nil,
                     completeLineOffset: 0,
+                    prefixSHA256: prefix,
                     rows: [],
+                    userMessageEntries: [],
                     completion: .unconfirmed,
                     isRescan: false
                 ))
@@ -245,21 +300,40 @@ package enum ClaudeSessionHistoryReader {
         guard capture.identity.device == resolvedIdentity.device, capture.identity.inode == resolvedIdentity.inode else {
             return .unavailable(.unstableFile)
         }
-        return decode(capture: capture, nativeSessionID: nativeSessionID, mode: mode, ledger: ledger)
+        return decode(capture: capture, nativeSessionID: nativeSessionID, mode: mode, ledger: ledger, fences: fences)
     }
 
     // MARK: Decoder (pure; exercised directly by fixture tests through `read`)
+
+    private enum EntryKind: String {
+        case user
+        case assistant
+        /// A whitelisted nonrendering graph node: no blocks, never projected.
+        case attachment
+    }
 
     private struct Entry {
         let line: Int
         let lineStart: Int
         let uuid: String
         let parentUUID: String?
-        let isAssistant: Bool
+        let kind: EntryKind
         let messageID: String?
         let sourceToolAssistantUUID: String?
         let blocks: [Block]
+        /// SHA-256 of a user entry's plain string content (outbound-claim matching only).
+        let userStringContentSHA256: String?
+        /// The decoded line, kept in memory only for the duplicate comparison (never persisted,
+        /// logged or hashed).
         let raw: NSDictionary
+
+        var isAssistant: Bool {
+            kind == .assistant
+        }
+
+        var isMessage: Bool {
+            kind != .attachment
+        }
     }
 
     private enum Block {
@@ -270,12 +344,26 @@ package enum ClaudeSessionHistoryReader {
 
     private static let rejectedWhenTrue = ["isSidechain", "isMeta", "isCompactSummary", "isApiErrorMessage", "isVisibleInTranscriptOnly"]
     private static let rejectedWhenPresent = ["logicalParentUuid", "teamName", "agentId", "compactMetadata", "subtype"]
+    /// Exact `attachment.type` values observed in the O19 capture (nonrendering graph nodes).
+    static let attachmentTypes: Set<String> = [
+        "budget_usd", "credential_org", "date", "environment", "model", "prompt_snapshot", "session_context",
+        "total_tokens_reminder"
+    ]
+    /// Exact operational record types observed in the O19 capture (no graph identity, never read).
+    static let operationalTypes: Set<String> = [
+        "queue-operation", "atis-latch", "api-request-shape", "api-request-blob", "api-request", "last-prompt",
+        "cost-state"
+    ]
+    /// Documented retraction/supersession markers (SDK assistant `supersedes`/`aborted`, refusal
+    /// fallback `retracted_message_uuids`), checked only at the entry and `message` levels.
+    private static let semanticMarkers = ["supersedes", "aborted", "retracted_message_uuids"]
 
     static func decode(
         capture: Capture,
         nativeSessionID: String,
         mode: Mode,
-        ledger: AgentSessionProviderHistoryRecovery?
+        ledger: AgentSessionProviderHistoryRecovery?,
+        fences: [AgentRecoveryHistoryPrefixFence] = []
     ) -> Result {
         let bytes = [UInt8](capture.bytes)
         // Complete lines only: everything after the last newline waits.
@@ -300,7 +388,10 @@ package enum ClaudeSessionHistoryReader {
             switch parseEntry(Data(lineBytes), line: lineNumber, lineStart: lineStart, nativeSessionID: nativeSessionID) {
             case let .failure(unsupported):
                 return .unsupported(unsupported)
-            case let .success(entry):
+            case .success(nil):
+                // An operational record: no graph identity, skipped unread.
+                continue
+            case let .success(entry?):
                 if let existing = byUUID[entry.uuid] {
                     guard entries[existing].raw.isEqual(entry.raw) else {
                         return .unsupported(.conflictingDuplicate(entry.uuid))
@@ -314,50 +405,136 @@ package enum ClaudeSessionHistoryReader {
         if let failure = validateGraph(entries, byUUID: byUUID) {
             return .unsupported(failure)
         }
-        let rows = project(entries, byUUID: byUUID, nativeSessionID: nativeSessionID)
+        // Byte-prefix fences over the SAME captured buffer (the import boundary included).
+        var allFences = fences
+        if case let .importAfter(cursor) = mode {
+            allFences.insert(cursor.prefixFence, at: 0)
+        }
+        let prefixSHA256: String
+        switch verifyFences(allFences, bytes: bytes, completeEnd: completeEnd) {
+        case let .success(value):
+            prefixSHA256 = value
+        case let .failure(unsupported):
+            return .unsupported(unsupported)
+        }
         let completeOffset = UInt64(completeEnd)
 
+        // Every parse, graph and fence validation ran above for both modes; only an import projects
+        // rows (review B P2-04: a baseline never computes rows it would discard).
         switch mode {
         case .baseline:
             return .candidate(Candidate(
                 nativeSessionID: nativeSessionID,
                 file: capture.identity,
                 completeLineOffset: completeOffset,
+                prefixSHA256: prefixSHA256,
                 rows: [],
+                userMessageEntries: [],
                 completion: .unconfirmed,
                 isRescan: false
             ))
         case let .importAfter(cursor):
-            let known = Set(ledger?.nativeItems.filter { $0.nativeSessionID == nativeSessionID }.map(\.key) ?? [])
-            func isKnown(_ row: Row) -> Bool {
-                known.contains(ledgerKey(row, nativeSessionID: nativeSessionID))
+            let order = chainOrder(entries) ?? Array(entries.indices)
+            let rows = project(order.map { entries[$0] }, entries: entries, nativeSessionID: nativeSessionID)
+            // Complete-envelope proof BEFORE any ledger suppression: a known entry must still exist
+            // with exactly its known row keys, every one carrying the observed digest.
+            if let conflict = ledgerConflict(rows: rows, ledger: ledger, nativeSessionID: nativeSessionID) {
+                return .unsupported(.ledgerConflict(conflict))
             }
-            let sameFile = cursor.file.map { $0 == capture.identity } ?? true
-            let rescan = !sameFile || UInt64(completeEnd) < cursor.completeLineOffset
-            let frontier: Int
-            if !rescan {
-                frontier = cursor.file == nil ? 0 : Int(cursor.completeLineOffset)
-            } else {
-                // Resume after the last entry the ledger already knows.
-                let knownEntryIDs = Set(rows.filter(isKnown).map(\.nativeEntryID))
-                guard let lastKnown = entries.last(where: { knownEntryIDs.contains($0.uuid) }) else {
-                    return .unavailable(.baselineLost)
+            let knownEntryIDs = Set(ledger?.nativeItems.filter {
+                $0.providerRaw == providerRaw && $0.nativeSessionID == nativeSessionID
+            }.map(\.nativeEntryID) ?? [])
+            // The boundary's prefix verified byte-for-byte above, so its offset is exact even in a
+            // replaced file (no rewind, no ledger-based resume).
+            let rescan = cursor.file.map { $0 != capture.identity } ?? false
+            let frontier = Int(cursor.completeLineOffset)
+            // History before the frontier never descends from history after it (an in-place
+            // rewrite can't move post-boundary output behind the cursor unnoticed).
+            for entry in entries where entry.lineStart < frontier {
+                if let parentID = entry.parentUUID, let parent = byUUID[parentID], entries[parent].lineStart >= frontier {
+                    return .unsupported(.rewrittenHistory)
                 }
-                frontier = lastKnown.lineStart + 1
             }
             let entryStart = Dictionary(uniqueKeysWithValues: entries.map { ($0.uuid, $0.lineStart) })
-            let newRows = rows.filter { row in
-                (entryStart[row.nativeEntryID] ?? 0) >= frontier && !isKnown(row)
+            func isNew(_ entryID: String) -> Bool {
+                (entryStart[entryID] ?? 0) >= frontier
             }
+            // Whole entries only: a known entry (proven complete above) contributes no row.
+            let newRows = rows.filter { isNew($0.nativeEntryID) && !knownEntryIDs.contains($0.nativeEntryID) }
+            let userEntries = order.map { entries[$0] }.filter { entry in
+                entry.kind == .user && toolResultIDs(entry).isEmpty && isNew(entry.uuid)
+            }.map { AgentProviderHistoryNativeUserEntry(nativeEntryID: $0.uuid, textSHA256: $0.userStringContentSHA256) }
             return .candidate(Candidate(
                 nativeSessionID: nativeSessionID,
                 file: capture.identity,
                 completeLineOffset: completeOffset,
+                prefixSHA256: prefixSHA256,
                 rows: newRows,
+                userMessageEntries: userEntries,
                 completion: .unconfirmed,
                 isRescan: rescan
             ))
         }
+    }
+
+    /// Verifies every fence against the same captured bytes in one incremental pass and returns the
+    /// prefix digest of `[0, completeEnd)`. A fence needs a valid proof, an offset within the
+    /// complete lines on a record boundary, and the exact digest of the bytes before it.
+    private static func verifyFences(
+        _ fences: [AgentRecoveryHistoryPrefixFence],
+        bytes: [UInt8],
+        completeEnd: Int
+    ) -> Swift.Result<String, Unsupported> {
+        var offsets: Set<Int> = [completeEnd]
+        for fence in fences {
+            guard let proof = fence.prefixSHA256, AgentSessionProviderHistoryRecovery.isSHA256Hex(proof) else {
+                return .failure(.prefixProofUnavailable)
+            }
+            guard fence.completeLineOffset <= UInt64(completeEnd) else { return .failure(.rewrittenHistory) }
+            let offset = Int(fence.completeLineOffset)
+            guard offset == 0 || bytes[offset - 1] == UInt8(ascii: "\n") else { return .failure(.rewrittenHistory) }
+            offsets.insert(offset)
+        }
+        var hasher = SHA256()
+        var position = 0
+        var digests: [Int: String] = [:]
+        for offset in offsets.sorted() {
+            bytes[position ..< offset].withUnsafeBytes { hasher.update(bufferPointer: $0) }
+            position = offset
+            digests[offset] = AgentSessionProviderHistoryRecovery.hex(hasher.finalize())
+        }
+        for fence in fences where digests[Int(fence.completeLineOffset)] != fence.prefixSHA256 {
+            return .failure(.rewrittenHistory)
+        }
+        return .success(digests[completeEnd] ?? AgentSessionProviderHistoryRecovery.sha256Hex(Data()))
+    }
+
+    /// The first ledger-known entry (of this provider and session) that is absent from the
+    /// observation, or whose known row keys or envelope digests differ from the observed entry.
+    private static func ledgerConflict(
+        rows: [Row],
+        ledger: AgentSessionProviderHistoryRecovery?,
+        nativeSessionID: String
+    ) -> String? {
+        var observed: [String: (keys: Set<String>, digest: String)] = [:]
+        for row in rows {
+            observed[row.nativeEntryID, default: ([], row.envelopeDigest)].keys.insert(ledgerKey(row, nativeSessionID: nativeSessionID))
+        }
+        var knownOrder: [String] = []
+        var known: [String: [AgentSessionProviderHistoryRecovery.NativeItem]] = [:]
+        for item in ledger?.nativeItems ?? [] where item.providerRaw == providerRaw && item.nativeSessionID == nativeSessionID {
+            if known[item.nativeEntryID] == nil { knownOrder.append(item.nativeEntryID) }
+            known[item.nativeEntryID, default: []].append(item)
+        }
+        for entryID in knownOrder {
+            let items = known[entryID] ?? []
+            guard let entry = observed[entryID],
+                  items.count == entry.keys.count,
+                  Set(items.map(\.key)) == entry.keys,
+                  items.allSatisfy({ $0.envelopeDigest == entry.digest })
+            else { return entryID }
+        }
+        return nil
     }
 
     /// The ledger key of a row (normalized native row key).
@@ -371,24 +548,56 @@ package enum ClaudeSessionHistoryReader {
         )
     }
 
+    /// The first documented retraction marker present in `object` (an explicit `aborted: false` is
+    /// not one). Only these exact keys at this level: no recursive search, no unknown-field guess.
+    private static func semanticMarker(in object: NSDictionary) -> String? {
+        for key in semanticMarkers {
+            switch object[key] {
+            case nil, is NSNull:
+                continue
+            case let flag as Bool where key == "aborted" && !flag:
+                continue
+            default:
+                return key
+            }
+        }
+        return nil
+    }
+
+    /// `nil` = an operational record (validated to carry no graph identity, otherwise unread).
     // swiftlint:disable:next cyclomatic_complexity function_body_length
     private static func parseEntry(
         _ data: Data,
         line: Int,
         lineStart: Int,
         nativeSessionID: String
-    ) -> Swift.Result<Entry, Unsupported> {
+    ) -> Swift.Result<Entry?, Unsupported> {
         guard let object = try? JSONSerialization.jsonObject(with: data) as? NSDictionary else {
             return .failure(.malformedLine(line: line))
         }
         guard let type = object["type"] as? String else {
             return .failure(.malformedLine(line: line))
         }
+        let kind: EntryKind
         switch type {
-        case "user", "assistant":
-            break
+        case "user":
+            kind = .user
+        case "assistant":
+            kind = .assistant
+        case "attachment":
+            kind = .attachment
         case "file-history-snapshot":
             return .failure(.fileHistorySnapshot(line: line))
+        case _ where operationalTypes.contains(type):
+            // Never a graph node: any `uuid`/`parentUuid` key (even null) refuses; a present
+            // `sessionId` must be this session. Nothing else in it is read.
+            guard object["uuid"] == nil, object["parentUuid"] == nil else {
+                return .failure(.operationalRecord(type, line: line))
+            }
+            if let session = object["sessionId"], (session as? String) != nativeSessionID {
+                return .failure(.sessionMismatch(line: line))
+            }
+            return .success(nil)
         default:
             return .failure(.entryType(type, line: line))
         }
@@ -397,6 +606,9 @@ package enum ClaudeSessionHistoryReader {
         }
         for key in rejectedWhenPresent where object[key] != nil && !(object[key] is NSNull) {
             return .failure(.metadata(key, line: line))
+        }
+        if let marker = semanticMarker(in: object) {
+            return .failure(.semanticMarker(marker, line: line))
         }
         guard let uuid = object["uuid"] as? String, !uuid.isEmpty else {
             return .failure(.malformedLine(line: line))
@@ -413,20 +625,49 @@ package enum ClaudeSessionHistoryReader {
         guard (object["sessionId"] as? String) == nativeSessionID else {
             return .failure(.sessionMismatch(line: line))
         }
-        guard let message = object["message"] as? NSDictionary, (message["role"] as? String) == type else {
-            return .failure(.malformedLine(line: line))
-        }
         let source: String?
         switch object["sourceToolAssistantUUID"] {
         case nil, is NSNull: source = nil
         case let value as String: source = value
         default: return .failure(.malformedLine(line: line))
         }
-        let isAssistant = type == "assistant"
+        if kind == .attachment {
+            // Only the exact whitelisted `attachment.type` is read; the payload never is.
+            guard object["message"] == nil, source == nil,
+                  let attachment = object["attachment"] as? NSDictionary,
+                  let attachmentType = attachment["type"] as? String,
+                  attachmentTypes.contains(attachmentType)
+            else {
+                return .failure(.attachment(line: line))
+            }
+            return .success(Entry(
+                line: line,
+                lineStart: lineStart,
+                uuid: uuid,
+                parentUUID: parentUUID,
+                kind: .attachment,
+                messageID: nil,
+                sourceToolAssistantUUID: nil,
+                blocks: [],
+                userStringContentSHA256: nil,
+                raw: object
+            ))
+        }
+        guard let message = object["message"] as? NSDictionary, (message["role"] as? String) == type else {
+            return .failure(.malformedLine(line: line))
+        }
+        if let marker = semanticMarker(in: message) {
+            return .failure(.semanticMarker(marker, line: line))
+        }
+        let isAssistant = kind == .assistant
         var blocks: [Block] = []
+        var stringContentSHA256: String?
         switch message["content"] {
         case let text as String:
             blocks = [.text(text)]
+            if !isAssistant {
+                stringContentSHA256 = AgentSessionProviderHistoryRecovery.sha256Hex(Data(text.utf8))
+            }
         case let array as [Any]:
             for element in array {
                 guard let block = element as? NSDictionary, let blockType = block["type"] as? String else {
@@ -489,10 +730,11 @@ package enum ClaudeSessionHistoryReader {
             lineStart: lineStart,
             uuid: uuid,
             parentUUID: parentUUID,
-            isAssistant: isAssistant,
+            kind: kind,
             messageID: isAssistant ? (message["id"] as? String).flatMap { $0.isEmpty ? nil : $0 } : nil,
             sourceToolAssistantUUID: source,
             blocks: blocks,
+            userStringContentSHA256: stringContentSHA256,
             raw: object
         ))
     }
@@ -530,19 +772,20 @@ package enum ClaudeSessionHistoryReader {
         }
         guard entries.isEmpty || roots.count == 1 else { return .multipleRoots }
         // Reachability from the single root (a cycle leaves entries unreachable).
-        var reached = 0
+        var preorder: [Int] = []
         var stack = roots
         var visited = Set<Int>()
         while let next = stack.popLast() {
             guard visited.insert(next).inserted else { return .cycle }
-            reached += 1
+            preorder.append(next)
             stack.append(contentsOf: children[entries[next].uuid] ?? [])
         }
-        guard reached == entries.count else { return .cycle }
+        guard preorder.count == entries.count else { return .cycle }
+        let bearing = messageBearing(entries, preorder: preorder, children: children)
 
         // Tool results: every result names a call of its parent entry exactly once overall.
         var resolvedToolUseIDs: Set<String> = []
-        for entry in entries where !entry.isAssistant {
+        for entry in entries where entry.kind == .user {
             let results = toolResultIDs(entry)
             guard !results.isEmpty else { continue }
             guard results.count == entry.blocks.count else {
@@ -567,16 +810,19 @@ package enum ClaudeSessionHistoryReader {
             }
         }
 
-        // Branching: at most one non-associated (continuation) child per entry.
+        // Branching: at most one non-associated (continuation) child per entry. An attachment-only
+        // side branch (no message anywhere below it) is not a continuation; any message is.
         var forkLeaves: Set<Int> = []
         for (parentID, childIndexes) in children {
             guard let parentIndex = byUUID[parentID] else { continue }
             let parent = entries[parentIndex]
             let associated = childIndexes.filter { isAssociatedResult(entries[$0], of: parent) }
-            let others = childIndexes.count - associated.count
-            guard others <= 1 else { return .ambiguousBranch(parentID) }
-            // A forked associated result must name its source explicitly (demonstrated shape).
-            if childIndexes.count > 1 {
+            let continuations = childIndexes.filter { bearing[$0] && !associated.contains($0) }
+            guard continuations.count <= 1 else { return .ambiguousBranch(parentID) }
+            // A forked associated result must name its source explicitly (demonstrated shape). Only
+            // message-bearing children make a fork: an attachment-only sibling never turns a
+            // sequential result into a parallel one (review A R2).
+            if childIndexes.count(where: { bearing[$0] }) > 1 {
                 for index in associated where entries[index].sourceToolAssistantUUID == nil {
                     return .toolAssociation("forked tool result without source \(entries[index].uuid)")
                 }
@@ -585,9 +831,12 @@ package enum ClaudeSessionHistoryReader {
         }
         // Leaves: exactly one conversation tip, plus tool-result leaves of a parallel call group
         // (assistant tool-use entries sharing a non-empty API message ID and chained by parent).
+        // A tip is a message with no message below it (a trailing attachment is not a tip).
         var tips = 0
         var groupLeaves = 0
-        for (index, entry) in entries.enumerated() where children[entry.uuid] == nil {
+        for (index, entry) in entries.enumerated()
+            where entry.isMessage && !(children[entry.uuid] ?? []).contains(where: { bearing[$0] })
+        {
             if forkLeaves.contains(index), let parentID = entry.parentUUID, let parentIndex = byUUID[parentID],
                isInParallelGroup(entries[parentIndex], entries: entries, byUUID: byUUID, children: children)
             {
@@ -598,10 +847,52 @@ package enum ClaudeSessionHistoryReader {
         }
         // A conversation whose last turn is a parallel tool group (no continuation yet, e.g. an
         // interrupted run) ends on those group results only.
-        guard entries.isEmpty || tips == 1 || (tips == 0 && groupLeaves > 0) else {
+        guard !entries.contains(where: \.isMessage) || tips == 1 || (tips == 0 && groupLeaves > 0) else {
             return .ambiguousBranch("conversation has \(tips) tips")
         }
         return nil
+    }
+
+    /// Whether each entry is a message or has one below it (children first: reversed preorder).
+    private static func messageBearing(_ entries: [Entry], preorder: [Int], children: [String: [Int]]) -> [Bool] {
+        var bearing = entries.map(\.isMessage)
+        for index in preorder.reversed() where !bearing[index] {
+            bearing[index] = (children[entries[index].uuid] ?? []).contains { bearing[$0] }
+        }
+        return bearing
+    }
+
+    /// Ancestor order of a direct chain: from the single root, each entry's only message-bearing
+    /// child (attachment-only side branches skipped; they project nothing). `nil` when any entry has
+    /// more than one message-bearing child (a demonstrated tool fork), which keeps file order.
+    /// Called only on a validated graph.
+    private static func chainOrder(_ entries: [Entry]) -> [Int]? {
+        var children: [String: [Int]] = [:]
+        var root: Int?
+        for (index, entry) in entries.enumerated() {
+            if let parent = entry.parentUUID {
+                children[parent, default: []].append(index)
+            } else {
+                root = index
+            }
+        }
+        guard let root else { return entries.isEmpty ? [] : nil }
+        var preorder: [Int] = []
+        var stack = [root]
+        while let next = stack.popLast() {
+            preorder.append(next)
+            stack.append(contentsOf: children[entries[next].uuid] ?? [])
+        }
+        let bearing = messageBearing(entries, preorder: preorder, children: children)
+        var order: [Int] = []
+        var current: Int? = root
+        while let index = current {
+            order.append(index)
+            let next = (children[entries[index].uuid] ?? []).filter { bearing[$0] }
+            guard next.count <= 1 else { return nil }
+            current = next.first
+        }
+        return order
     }
 
     private static func isInParallelGroup(
@@ -621,7 +912,27 @@ package enum ClaudeSessionHistoryReader {
         }
     }
 
-    private static func project(_ entries: [Entry], byUUID: [String: Int], nativeSessionID: String) -> [Row] {
+    /// Complete-envelope digest of one entry: SHA-256 over the length-prefixed ordered supported
+    /// semantic payload (entry type, block count, then per block its kind, ordinal and text / tool
+    /// name, use ID and canonical input / tool use ID, result text and error flag). No metadata.
+    private static func envelopeDigest(_ entry: Entry) -> String {
+        var components = ["rpce-claude-history-envelope-v1", entry.kind.rawValue, String(entry.blocks.count)]
+        for (ordinal, block) in entry.blocks.enumerated() {
+            switch block {
+            case let .text(text):
+                components += ["text", String(ordinal), text]
+            case let .toolUse(id, name, inputJSON):
+                components += ["tool_use", String(ordinal), name, id, inputJSON]
+            case let .toolResult(toolUseID, text, isError):
+                components += ["tool_result", String(ordinal), toolUseID, text, isError.map { $0 ? "true" : "false" } ?? "none"]
+            }
+        }
+        let encoded = components.map { "\($0.utf8.count):\($0)" }.joined(separator: "|")
+        return AgentSessionProviderHistoryRecovery.sha256Hex(Data(encoded.utf8))
+    }
+
+    /// Rows of `projected` (projection order); `entries` (all) only names tool calls.
+    private static func project(_ projected: [Entry], entries: [Entry], nativeSessionID: String) -> [Row] {
         var toolNames: [String: String] = [:]
         for entry in entries {
             for block in entry.blocks {
@@ -629,7 +940,8 @@ package enum ClaudeSessionHistoryReader {
             }
         }
         var rows: [Row] = []
-        for entry in entries {
+        for entry in projected where !entry.blocks.isEmpty {
+            let digest = envelopeDigest(entry)
             for (ordinal, block) in entry.blocks.enumerated() {
                 func localID(_ kind: RowKind) -> UUID {
                     deterministicUUID(
@@ -653,7 +965,8 @@ package enum ClaudeSessionHistoryReader {
                         toolUseID: nil,
                         toolInvocationID: nil,
                         toolInputJSON: nil,
-                        toolIsError: nil
+                        toolIsError: nil,
+                        envelopeDigest: digest
                     ))
                 case let .toolUse(id, name, inputJSON):
                     rows.append(Row(
@@ -666,7 +979,8 @@ package enum ClaudeSessionHistoryReader {
                         toolUseID: id,
                         toolInvocationID: invocationID(id),
                         toolInputJSON: inputJSON,
-                        toolIsError: nil
+                        toolIsError: nil,
+                        envelopeDigest: digest
                     ))
                 case let .toolResult(toolUseID, text, isError):
                     rows.append(Row(
@@ -679,7 +993,8 @@ package enum ClaudeSessionHistoryReader {
                         toolUseID: toolUseID,
                         toolInvocationID: invocationID(toolUseID),
                         toolInputJSON: nil,
-                        toolIsError: isError
+                        toolIsError: isError,
+                        envelopeDigest: digest
                     ))
                 }
             }

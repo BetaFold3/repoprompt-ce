@@ -919,11 +919,18 @@ extension AgentModeViewModel {
         guard !roots.isEmpty else {
             return await recordUnsupported("Claude history location unknown", conversationID: conversationID)
         }
+        // The previous latest receipt's proven target must still hold before this boundary may
+        // replace it as the latest receipt (verified on the same captured bytes).
+        let fencedReceipt = session.providerHistoryRecovery?.lastImportCommit
         let read = await Self.readClaudeHistory(RecoveryHistoryReadInput(
             conversationID: conversationID,
             roots: roots,
             mode: .baseline,
-            ledger: nil
+            ledger: nil,
+            fences: AgentProviderHistoryAssociationPreflight.claudeBaselineFences(
+                ledger: session.providerHistoryRecovery,
+                conversationID: conversationID
+            )
         ))
         guard stillCurrent(conversationID) else { return .refused(Self.recoveryActionStaleText) }
         let candidate: ClaudeSessionHistoryReader.Candidate
@@ -932,6 +939,11 @@ extension AgentModeViewModel {
             candidate = value
         case let .unavailable(reason):
             return await recordUnsupported(Self.recoveryHistoryText(reason), conversationID: conversationID)
+        case .unsupported(.rewrittenHistory):
+            return await recordUnsupported(Self.recoveryBaselineRewrittenReason, conversationID: conversationID)
+        case .unsupported(.prefixProofUnavailable):
+            // Distinct from a changed history (review B P3-02): the last target was lost or unproven.
+            return await recordUnsupported(Self.recoveryBaselineUnprovenReason, conversationID: conversationID)
         case .unsupported:
             return await recordUnsupported("Claude history contains records this version doesn't support", conversationID: conversationID)
         }
@@ -947,17 +959,31 @@ extension AgentModeViewModel {
         // Re-checked after every read/save await above and immediately before the append (no
         // suspension between): two admissions of one dispatch can never both record a boundary.
         if let recorded = await admitRecorded() { return recorded }
+        // The receipt the read fenced must still be the latest one. A real ownership change was
+        // refused above; when only the receipt moved (e.g. a concurrent admission's boundary), this
+        // boundary is recorded unsupported (no claim, no UUID, no proof) and the ordinary send
+        // proceeds (review B P2-02). No reread: the unsupported entry never replaces that receipt.
+        guard session.providerHistoryRecovery?.lastImportCommit == fencedReceipt else {
+            guard stillCurrent(conversationID) else { return .refused(Self.recoveryActionStaleText) }
+            return await recordUnsupported(Self.recoveryBaselineReceiptMovedReason, conversationID: conversationID)
+        }
         let claim = outboundUserMessage.flatMap {
             Self.qualifiedOutboundUserMessageClaim($0, identity: identity, session: session)
         }
         let commitID = UUID()
         let now = Date()
+        // The zero-row receipt binds the same target its baseline owns.
         let receipt = AgentSessionProviderHistoryRecovery.ImportCommit(
             importID: commitID,
             providerRaw: ClaudeSessionHistoryReader.providerRaw,
             conversationID: conversationID,
             committedAt: now,
-            rowCount: 0
+            rowCount: 0,
+            target: AgentRecoveryHistoryPrefixFence(
+                file: candidate.file,
+                completeLineOffset: candidate.completeLineOffset,
+                prefixSHA256: candidate.prefixSHA256
+            )
         )
         let baseline = AgentSessionProviderHistoryRecovery.DispatchBaseline(
             dispatchID: identity.dispatchID,
@@ -968,6 +994,7 @@ extension AgentModeViewModel {
             userItemIDs: identity.userItemIDs,
             file: candidate.file,
             completeLineOffset: candidate.completeLineOffset,
+            prefixSHA256: candidate.prefixSHA256,
             baselineCommitID: commitID,
             profileName: ClaudeSessionHistoryReader.profileName,
             status: .captured,
@@ -1081,6 +1108,16 @@ extension AgentModeViewModel {
                 return .associationUnavailable(refusal, Self.recoveryAssociationText(refusal))
             }
         }
+        // Claude: the attempt's whole dispatch window (its boundary first). The persisted record
+        // cursor, when present, is one more byte fence (never the frontier or a fallback); a
+        // missing or malformed proof on it fails closed.
+        let claudeWindow = action.sourceRunAttemptID.map { runAttemptID in
+            ledgerAtStart?.dispatchBaselines.filter { $0.runAttemptID == runAttemptID } ?? []
+        } ?? []
+        let recordCursorFence = record?.historyCursor(
+            providerRaw: ClaudeSessionHistoryReader.providerRaw,
+            conversationID: conversationID
+        )?.prefixFence
         let observation: AgentProviderHistoryObservation
         switch await recoveryHistoryObservation(
             action: action,
@@ -1088,6 +1125,11 @@ extension AgentModeViewModel {
             lane: lane,
             conversationID: conversationID,
             claudeBoundary: claudeBaseline?.cursor,
+            claudeFences: AgentProviderHistoryAssociationPreflight.claudePrefixFences(
+                window: claudeWindow,
+                ledger: ledgerAtStart,
+                conversationID: conversationID
+            ) + [recordCursorFence].compactMap(\.self),
             ledger: ledgerAtStart,
             codexTurnID: codexTurnID
         ) {
@@ -1118,8 +1160,9 @@ extension AgentModeViewModel {
         }
         let canonical = AgentProviderHistoryCanonicalView(transcript: session.transcript, suffixItems: session.items)
         // Claude: canonical import needs explicit native ↔ canonical associations (canonical turns,
-        // compacted ones included, plus the mutable suffix). This build has none for normal live
-        // conversations, so it refuses with zero changes and no cursor movement.
+        // compacted ones included, plus the mutable suffix): the attempt's exactly matched outbound
+        // claims (Step 4d2) or ledger associations. Live output persisted under its own IDs still has
+        // none, so it refuses with zero changes and no cursor movement.
         if session.selectedAgent == .claudeCode,
            let refusal = AgentProviderHistoryAssociationPreflight.check(
                observation: observation,
@@ -1128,7 +1171,8 @@ extension AgentModeViewModel {
                expectedRunAttemptID: action.sourceRunAttemptID,
                transcriptResetGeneration: lane.binding.transcriptResetGeneration,
                canonical: canonical,
-               ledger: ledgerAtStart
+               ledger: ledgerAtStart,
+               dispatchWindow: claudeWindow
            )
         {
             return .associationUnavailable(refusal, Self.recoveryAssociationText(refusal))
@@ -1202,6 +1246,7 @@ extension AgentModeViewModel {
         let roots: [URL]
         let mode: ClaudeSessionHistoryReader.Mode
         let ledger: AgentSessionProviderHistoryRecovery?
+        var fences: [AgentRecoveryHistoryPrefixFence] = []
     }
 
     private nonisolated static func readClaudeHistory(_ input: RecoveryHistoryReadInput) async -> ClaudeSessionHistoryReader.Result {
@@ -1209,7 +1254,8 @@ extension AgentModeViewModel {
             nativeSessionID: input.conversationID,
             projectsDirectories: input.roots,
             mode: input.mode,
-            ledger: input.ledger
+            ledger: input.ledger,
+            fences: input.fences
         )
     }
 
@@ -1240,6 +1286,7 @@ extension AgentModeViewModel {
         lane: AgentRecoverySessionLane,
         conversationID: String,
         claudeBoundary: AgentRecoveryHistoryCursor?,
+        claudeFences: [AgentRecoveryHistoryPrefixFence],
         ledger: AgentSessionProviderHistoryRecovery?,
         codexTurnID: String?
     ) async -> Result<AgentProviderHistoryObservation, RecoveryHistoryFailure> {
@@ -1286,13 +1333,18 @@ extension AgentModeViewModel {
                 conversationID: conversationID,
                 roots: roots,
                 mode: .importAfter(cursor),
-                ledger: ledger
+                ledger: ledger,
+                fences: claudeFences
             )
             switch await Self.readClaudeHistory(input) {
             case let .candidate(candidate):
                 return .success(ClaudeSessionHistoryReader.observation(candidate))
             case let .unavailable(reason):
                 return .failure(RecoveryHistoryFailure(message: Self.recoveryHistoryText(reason)))
+            case .unsupported(.ledgerConflict), .unsupported(.rewrittenHistory):
+                return .failure(RecoveryHistoryFailure(message: Self.recoveryHistoryChangedText))
+            case .unsupported(.prefixProofUnavailable):
+                return .failure(RecoveryHistoryFailure(message: Self.recoveryHistoryUnprovenText))
             case .unsupported:
                 return .failure(RecoveryHistoryFailure(
                     message: "Claude's history contains records this version doesn't support. Nothing was imported."
@@ -1321,14 +1373,25 @@ extension AgentModeViewModel {
             "Claude's history file changed while it was read. Try again."
         case .baselineRequired:
             "No history position was saved before the interrupted run, so its history can't be matched safely."
-        case .baselineLost:
-            "Claude's history file was replaced and the previous position can't be located."
         case .inspectionFailed:
             "Claude's history location couldn't be checked, so its contents are unknown."
         case .partialTrailingRecord:
             "Claude's history ends in an incomplete record, so no safe position could be taken."
         }
     }
+
+    static let recoveryHistoryChangedText =
+        "Claude's history no longer matches what was already recovered for this conversation. Nothing was imported."
+
+    static let recoveryHistoryUnprovenText =
+        "A saved history position for this conversation has no integrity proof this version can check, so its history can't be matched safely. Nothing was imported."
+
+    /// Unsupported-baseline reasons (diagnostics recorded on the dispatch baseline; the send proceeds).
+    static let recoveryBaselineRewrittenReason = "Claude history no longer matches its last recovered position"
+    static let recoveryBaselineUnprovenReason =
+        "Claude history's last recovered position has no integrity proof this version can check"
+    static let recoveryBaselineReceiptMovedReason =
+        "Another history position was saved for this session while this one was read"
 
     static func recoveryCodexObservationText(_ error: Error) -> String {
         switch error as? CodexRecoveryObservationError {
@@ -1353,6 +1416,8 @@ extension AgentModeViewModel {
             "The saved history position doesn't belong to this conversation and run. Nothing was imported."
         case .nativeUserAssociationUnavailable, .canonicalOutputAssociationUnavailable:
             "The pre-send history position was saved, but this build cannot safely match Claude's history to messages already in this conversation. Nothing was imported."
+        case .outboundClaimUnmatched:
+            "Claude's history doesn't show exactly the messages recorded for this run, so it can't be matched safely. Nothing was imported or sent again."
         }
     }
 

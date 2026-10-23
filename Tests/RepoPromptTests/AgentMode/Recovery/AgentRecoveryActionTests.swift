@@ -242,6 +242,62 @@ final class AgentRecoveryActionTests: XCTestCase {
         XCTAssertEqual(stored.completeLineOffset, 20)
     }
 
+    /// Step 4d2: the byte-prefix proof is part of a cursor's exact repeat (same import ID with a
+    /// different proof, or none, conflicts), and the codec keeps a malformed stored proof verbatim
+    /// as an unknown member (`nil`, never a proof) while a typed proof replaces it.
+    func testHistoryCursorPrefixProofIsPartOfTheExactRepeatAndDecodesTolerantly() async throws {
+        let proof = AgentSessionProviderHistoryRecovery.sha256Hex(Data("prefix".utf8))
+        let file = AgentRecoveryHistoryFileIdentity(device: 1, inode: 2, birthSeconds: nil, birthNanoseconds: nil)
+        func cursor(
+            _ importID: UUID,
+            conversationID: String = "conv-1",
+            proof: String?,
+            extras: AgentRecoveryExtras = [:]
+        ) -> AgentRecoveryHistoryCursor {
+            AgentRecoveryHistoryCursor(
+                providerRaw: "claude", conversationID: conversationID, importID: importID, file: file, completeLineOffset: 10,
+                prefixSHA256: proof, committedAt: AgentRecoveryTimestamp(Date(timeIntervalSince1970: 10)), extras: extras
+            )
+        }
+        let importID = UUID()
+        let committed = try await lane.commitHistoryCursor(expectedPreviousImportID: nil, cursor: cursor(importID, proof: proof)).get()
+        XCTAssertEqual(committed.disposition, .committed)
+        let repeated = try await lane.commitHistoryCursor(expectedPreviousImportID: nil, cursor: cursor(importID, proof: proof)).get()
+        XCTAssertEqual(repeated.disposition, .unchanged)
+        let altered = AgentSessionProviderHistoryRecovery.sha256Hex(Data("other".utf8))
+        for different in [altered, nil] {
+            let conflict = await lane.commitHistoryCursor(expectedPreviousImportID: nil, cursor: cursor(importID, proof: different))
+            XCTAssertEqual(conflict.failureValue, .store(.historyCursorConflict), "same import ID, different proof")
+        }
+        let loaded = try await record()
+        XCTAssertEqual(loaded?.historyCursor(providerRaw: "claude", conversationID: "conv-1")?.prefixSHA256, proof)
+
+        // Malformed stored proofs survive a fresh store verbatim; a typed proof replaces a raw one.
+        let malformed: [AgentRecoveryJSONValue] = [.string(proof.uppercased()), .string("short"), .number(5), .null, .object([:])]
+        for (index, raw) in malformed.enumerated() {
+            _ = try await lane.commitHistoryCursor(
+                expectedPreviousImportID: nil,
+                cursor: cursor(UUID(), conversationID: "raw-\(index)", proof: nil, extras: ["prefixSHA256": raw])
+            ).get()
+        }
+        _ = try await lane.commitHistoryCursor(
+            expectedPreviousImportID: nil,
+            cursor: cursor(UUID(), conversationID: "typed", proof: proof, extras: ["prefixSHA256": .string("stale raw")])
+        ).get()
+        let reopened = AgentRecoveryStore(rootURL: fixture.root.appendingPathComponent("AgentRecovery/v1", isDirectory: true))
+        let state = await reopened.read(sessionID: fixture.sessionID)
+        let decoded = try XCTUnwrap(state.record)
+        for (index, raw) in malformed.enumerated() {
+            let stored = try XCTUnwrap(decoded.historyCursor(providerRaw: "claude", conversationID: "raw-\(index)"))
+            XCTAssertNil(stored.prefixSHA256, "\(raw)")
+            XCTAssertEqual(stored.extras["prefixSHA256"], raw, "\(raw) kept verbatim")
+        }
+        let typed = try XCTUnwrap(decoded.historyCursor(providerRaw: "claude", conversationID: "typed"))
+        XCTAssertEqual(typed.prefixSHA256, proof)
+        XCTAssertNil(typed.extras["prefixSHA256"])
+        XCTAssertEqual(decoded.historyCursor(providerRaw: "claude", conversationID: "conv-1")?.prefixSHA256, proof)
+    }
+
     func testActionsAndCursorsRoundTripThroughAFreshStore() async throws {
         let key = runKey()
         let request = try await continuation(key: key, expectedRevision: revision())

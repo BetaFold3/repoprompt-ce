@@ -953,3 +953,84 @@ I don't recommend shipping the reader alone first. A reader that accepts real hi
 4. **Then do Step 4d3** (the gated single-text-block live carrier) as already planned.
 5. **Keep these blocked for activation and final live acceptance only, with no more capture runs:** version profile, wrapper and config-dir qualification, the isolation deltas, tool, thinking and multi-block turns, and resume.
 6. **Record under `assumed:`** that the profile is SDK visible-projection parity rather than attachment semantics, uses a coupled reader and digest step, and has no reader version gate.
+
+
+## Prefix-fence coherence — verified 2026-10-23
+
+Returned preset: `OracleB` / `7CDD523E-1D7C-47EA-98FE-D5FEA24D2D8C`; inherited selection; operation `41A5A977-838F-4349-B777-AF21F2FACF05`. Main verified identity and read full response; planning, not implementation review.
+
+# Oracle Plan
+
+# Prefix fence for Step 4d2: one optional prefix digest on the baseline and the cursor
+
+## Verdict
+
+Yes, approve it. One optional `prefixSHA256` on the existing `DispatchBaseline` and `AgentRecoveryHistoryCursor` is the minimum that makes the "native-byte fence" claim true. That claim was stated in earlier rounds, but today the code stores only the file identity and an offset.
+
+**Why the existing per-message proofs are not enough.** The claim UUID with its text digest, the ledger envelope digests and the graph checks only examine entries the app already knows about. The concrete gap is a silent loss:
+
+1. A partial import commits cursor C1 partway through a dispatch, and the claim lands in the ledger.
+2. The file is then rewritten without appending: it shrinks and regrows, or a region is rewritten in place. A not-yet-imported assistant entry now sits before C1, and C1 still falls on a line boundary.
+3. That entry is unledgered and pre-cursor. Its parent is also pre-cursor, so the pre-cursor/post-cursor parent check doesn't fire. If it was never saved live, canonical ⊆ associated doesn't fire either.
+4. The reader skips it and nothing reports the loss.
+
+**Likelihood and cost.** Normal Claude CLI behaviour is append-only. But the native entry union is explicitly CLI-internal and retraction/eviction is documented, so this can't be ruled out. Data loss calls for full rigor, and the check is cheap: the reader already reads the bytes before the cursor to validate the graph. Hashing the raw bytes in that same pass adds no parsing and no exposure of content.
+
+The other option is to retract the fence claim and record "append-only assumed". I reject it, because a loss of that kind can never be detected afterwards.
+
+**No new store, journal or collection.** Only the digest is persisted. It covers opaque bytes and is never logged or decoded.
+
+## Field contract (the same on both types)
+
+- `prefixSHA256: String?`: lowercase hex SHA-256 of the exact raw bytes `[0, completeLineOffset)`, with no line normalization. Known key, written only when present.
+- **Lenient decode, which is also the rule for `envelopeDigest`.** Anything other than a 64-character lowercase hex string decodes to nil, and the raw value stays in `extras` under the same key.
+  - The codec must not consume the key when decoding fails, so the raw value round-trips.
+  - A non-nil property overwrites the extras value on encode.
+  - The session never fails to load because of this field. Main's rejection of the strict throw is correct: that throw is a P1 that makes a whole session unavailable.
+  - If the 4d1 `outboundUserMessage` claim decodes strictly, apply the same rule there only if it is a one-line change.
+- **Claude only.** A missing or unusable proof on any fence the Claude import relies on refuses.
+  - Codex readers neither compute nor check the digest. Shared code (codec, CAS) only compares the optional for equality.
+  - Claude cursors without a digest effectively don't exist, because Claude import has never succeeded. Claude baselines exist only where the gate was on. Failing closed therefore costs nothing in production.
+- **Profile string V2: accepted.** The V2 draft I described earlier never landed, so there is no clash. A legacy V1 baseline still decodes and is kept, and it refuses through the missing prefix proof (and missing claim), not through a profile gate. That gives "not silently requalified" without adding any gate.
+
+## Edge-case handling
+
+| Case | Rule |
+|---|---|
+| Zero offset | Digest = SHA-256 of zero bytes (the constant `e3b0c442…`). Never use nil to mean "empty". Nil always means "no proof". |
+| File verifiably absent at capture | Keep today's identity semantics for an absent file, and record offset 0 with the empty-input digest. An unreadable file, or one that changes during the read, is an **unsupported** baseline, so under 4d1 no UUID is sent. |
+| Capture read | One file handle. Hash exactly `[0, offset)` in the same read that finds `completeLineOffset`. If the file shrinks mid-read, the baseline is unsupported. |
+| Reconcile order | Check file identity, then length ≥ fence offset, then record boundary, then prefix digest. Only after those come parse/graph, envelope `ledgerConflict`, dedup and plan. Read one snapshot buffer, and take every hash and the parse from that same buffer. |
+| Which fences to check | Every applicable fence: the baseline digest at its offset and, if present, the cursor digest at its offset. Both come from one incremental pass, finalizing a copy of the running hasher at each offset. Don't reason about which fence "starts" the window. |
+| Identity changed, truncated, or prefix mismatch | One new typed refusal, e.g. `prefixFence(.missingProof \| .truncated \| .changed)`, carrying no bytes and no line content. Not sticky: transcript, ledger and cursor stay unchanged and the next reconcile recomputes the same result. Reuse an existing identity-mismatch case if one already has that meaning. |
+| New cursor digest | Digest of `[0, candidateEnd)`, continued from the same pass and buffer, and never re-read when the CAS runs. |
+| Normal and exact-repeat CAS | Equality covers `(file, offset, importID, prefixSHA256)`. If the importID repeats but the digest differs, take the existing mismatch failure path. |
+| Crash after save, before CAS | Replay: the old fence digest is verified first, entries already in the ledger pass the envelope check and are deduped, the plan is a no-op, and the CAS writes the cursor with the freshly computed digest. If the receipt already embeds a cursor value, the field travels with it and the replay must match it exactly before the CAS. Don't add a receipt field otherwise. A prefix rewrite between the crash and the replay refuses with no CAS. |
+| Rollback or older build | Unknown keys are kept via extras. Older builds don't check the digest, and the gates are OFF. |
+
+**Execution context to check during implementation:** baseline capture runs inside send admission. Make sure hashing a large session file doesn't run on the main actor; if it does, move it off. Timing results are advisory only.
+
+## Acceptance tests (fixtures, labelled as fixtures)
+
+1. **Capture:** the baseline digest equals the hash of the exact prefix. Zero offset and verified absence give the empty-input digest. A read failure gives an unsupported baseline, and no `uuid` goes on the wire.
+2. **Append-only growth:** the import passes.
+3. **Changed prefix:** flipping one byte inside a pre-fence attachment or operational line refuses, with no rows and ledger and cursor unchanged.
+4. **Other fence failures:** a file shorter than the fence offset refuses, and a different file identity refuses.
+5. **Missing or malformed proof:** on either the baseline or the cursor, a Claude import refuses. Codex with nil digests behaves exactly as before.
+6. **Malformed values round-trip:** a malformed `prefixSHA256` or `envelopeDigest` survives the round trip unchanged in extras, the session loads, and the Claude import refuses.
+7. **Cursor and CAS:** the import's cursor carries the digest of `[0, end)`. An exact-repeat CAS with an equal digest is a no-op; with a different digest it fails.
+8. **Crash between save and CAS:** replay is a no-op and then the CAS runs. A prefix rewrite before the replay refuses.
+9. **No leaks:** a sentinel string placed in the prefix bytes appears in no refusal description, log or persisted JSON. Only the digest is persisted.
+
+## Recommendations
+
+1. **Approve the single optional `prefixSHA256`** on `DispatchBaseline` and `AgentRecoveryHistoryCursor`, carried from capture, candidate and observation through the existing receipt (only if the receipt already embeds the cursor) and the CAS. Add nothing else.
+2. **Use the same lenient-decode rule** for `prefixSHA256` and `envelopeDigest`: keep the raw value in extras, treat it as nil, and refuse for Claude. Never fail the whole session load.
+3. **Use the empty-input digest for zero offset.** Nil always means missing proof, and missing proof refuses.
+4. **Check all applicable fences in the single read pass,** before the graph, conflict and dedup steps, using one typed `prefixFence` refusal. Add the digest to both the normal and the exact-repeat CAS equality.
+5. **Accept the V2 profile string and the claim window scoped to the source attempt.** Legacy baselines are kept and refuse through the missing proof, with no profile gate.
+6. **Record under `assumed:`:**
+   - the prefix fence is defense against non-append rewrites that the CLI-internal format doesn't rule out;
+   - the digest is computed over opaque bytes only;
+   - no receipt field is added unless the receipt already embeds a cursor.
+7. **Next steps:** finish Step 4d2 with these tests, run the OracleA/OracleB review, and commit. Live qualification, activation and final acceptance stay pending, with no new captures.

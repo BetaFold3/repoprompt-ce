@@ -164,7 +164,7 @@ Repository composition differs from this temporary driver: `ProcessEnvironmentBu
 - Ordinals: 0–1 queue enqueue/dequeue → 2 `user` uuid=C1″, parent null.
 - 3–6 attachments chained C1″→N1→N2→N3→N4: environment, model, total_tokens_reminder, budget_usd.
 - 7 `atis-latch`.
-- 8–11 attachments N4→N5→N6→N7→N8: session_context, date, **an additional credential/org-context attachment type** (content not inspected), prompt_snapshot.
+- 8–11 attachments N4→N5→N6→N7→N8: session_context, date, `credential_org` (only the type discriminator inspected; context content not inspected), prompt_snapshot.
 - 12 `api-request-shape`, 13–14 `api-request-blob` ×2, 15 `api-request`.
 - 16 `assistant` N8→A″, real model, `requestId` present, one text block equal to `ALPHA-7`.
 - **17 `attachment` A″→N11, prompt_snapshot after the assistant.** 18 `last-prompt` with **leafUuid=N11 (the trailing attachment, not the assistant)**. 19 `cost-state`.

@@ -1074,3 +1074,113 @@ Required tests:
 ## Recommendations
 
 Proceed now with this reader-only slice. No additional capture or owner choice is needed. Broader reconciliation, installed-format generality, Resume/restart qualification, all production activation, and final live acceptance remain pending.
+
+
+## Prefix-fence coherence — verified 2026-10-23
+
+Returned preset: `OracleA` / `61D024A4-CCFB-4C9C-A614-CC65E0A1864C`; inherited selection; operation `C8369921-8C00-4ACF-9E66-372CE80E5E45`. Main verified identity and read full response; planning, not implementation review.
+
+# Oracle Plan
+
+## Summary
+
+**Approve the prefix fence as the minimum coherent fix.** Existing message proofs cannot detect rewriting wholly unimported bytes before the cursor. Add one optional `prefixSHA256` field to each existing baseline/cursor representation, carry the resulting target fence through the existing durable import receipt, and compare it during cursor CAS—including exact-repeat handling. No new store, journal, or collection is needed.
+
+## Current-state analysis
+
+The supplied implementation checks protect record boundaries, graph ordering, and known ledger entries, but not the entire previously accepted byte prefix. A same-file, same-length rewrite of an unimported attachment or operational record can therefore pass those checks.
+
+This is an integrity gap even without interpreting that record’s semantics. Message fingerprints and raw-prefix fingerprints serve different purposes; retain both.
+
+## Design
+
+### 1. Exact proof contract
+
+Use `prefixSHA256: String?`, containing canonical lowercase, 64-character SHA-256 hex.
+
+For a baseline or cursor at byte offset **N**, the proof covers **exact raw bytes `[0, N)`**, including their original line endings. N must be a validated complete-record boundary.
+
+- Compute from the same descriptor-bound byte capture used for parsing—not a second pathname read.
+- Before accepting an import, verify every baseline/cursor prefix on which its eligibility or boundary depends.
+- Compute the candidate’s target proof through its proposed complete-line offset from that same capture.
+- Never hash normalized JSON, projected messages, or an incomplete trailing line.
+- Persist only the digest, not additional raw context.
+
+This establishes byte continuity at the observation boundary, not metadata irrelevance or provider fsync durability.
+
+### 2. Zero offset and verified absence
+
+- For a **newly qualified** zero-offset baseline/cursor, store SHA-256 of the empty byte sequence. Do not use `nil` to represent this proof.
+- Preserve the existing distinction between a verified-absent file and an existing empty file. The empty digest does not establish absence.
+- A verified-absent baseline may admit a subsequently created exact-session file through the existing creation checks and full graph validation.
+- Permission errors, ambiguous paths, or unreadable files are not verified absence.
+- Never synthesize the empty digest when decoding a legacy missing proof, even at offset zero.
+
+### 3. Replacement, rescan, and truncation
+
+File identity remains useful but is not sufficient:
+
+- **Same identity:** verify the stored prefix anyway.
+- **Changed identity:** permit only a full descriptor-bound rescan that verifies the entire stored prefix at the same offset and passes existing session/profile/graph checks. A matching ledger alone is insufficient.
+- **File shorter than a required offset:** refuse; do not rewind or replace the boundary.
+- **Prefix mismatch:** refuse, including after compaction or replacement. Do not fall back to message matching.
+- **Incomplete appended tail:** retain the existing complete-line boundary behavior; exclude the tail from the target proof.
+
+Any accepted replacement identity travels with the new target fence through the same receipt/CAS path.
+
+### 4. Durable receipt and crash ordering
+
+The existing import receipt must durably bind the import ID to the **exact target cursor tuple**, including file identity, offset, and prefix proof, alongside the canonical rows and ledger.
+
+After save succeeds, CAS installs that target. For an equal import ID, exact-repeat success requires equality of the full target tuple, including `prefixSHA256`; matching identity and offset alone is insufficient.
+
+After a crash between owner-save and CAS:
+
+- Recover the saved target fence from the existing receipt.
+- Do not recompute a different digest and attach it to that import ID.
+- Revalidate the relevant prefix before resumed reconciliation; mismatch preserves the committed rows/receipt but blocks progress.
+- Retry only the recorded target under existing ownership/CAS rules.
+
+If the current receipt does not retain enough information to reconstruct that fence, adding it to that **existing receipt payload** is necessary. A transient observation field alone does not close the crash gap.
+
+### 5. Compatibility and malformed optional proofs
+
+Apply tolerant decoding to both `prefixSHA256` and `NativeItem.envelopeDigest`:
+
+- Valid value → usable typed proof.
+- Missing value → absent proof.
+- Malformed value → preserve its raw JSON in existing extras; expose no usable proof.
+
+Encoding must not erase malformed raw values merely because the typed property is `nil`. In particular, adjust `historyCursor()` key consumption and `historyCursorJSON` overwrite behavior accordingly. Unrelated saves must round-trip malformed and unknown fields unchanged.
+
+Claude qualification fails closed with the existing appropriate typed conflict/refusal; the session still loads and displays its history. Codex behavior remains unchanged.
+
+Bump the emitted profile to `nativeEntriesSubsetV2`. Preserve older profile strings and baselines without retroactive requalification. Version naming alone never substitutes for valid proofs.
+
+## File-by-file impact
+
+Modify the existing components only:
+
+- **`AgentSessionProviderHistoryRecovery.swift`:** baseline proof, tolerant optional-proof decoding/encoding, V2 profile association.
+- **`ClaudeSessionHistoryReader.swift`:** raw-prefix verification and candidate target proof.
+- **Existing observation/import/receipt implementation:** propagate and durably bind the target fence before CAS.
+- **`AgentRecoveryHistoryCursor` and its codec/CAS implementation:** additive field, raw-value preservation, full exact-repeat comparison.
+- **Existing reader/reconciliation tests:** cover these paths.
+
+Exact cursor/receipt file paths were not supplied; locate their existing definitions rather than introducing parallel implementations.
+
+## Implementation order and acceptance
+
+Land proof propagation, persistence, and CAS changes together. Require tests for:
+
+1. Same-file, same-length rewrite of an unimported pre-cursor record refuses.
+2. Append-only growth succeeds; partial tails remain excluded.
+3. Zero-offset and verified-absence behavior remains distinct.
+4. Replacement with identical prefix rescans successfully; truncation or differing prefix refuses.
+5. Missing/malformed proofs load and round-trip but block Claude qualification.
+6. Crash after receipt save retries only the saved target; altered-proof exact repeats fail.
+7. Codex and production gates remain unchanged.
+
+## Recommendations
+
+Proceed with the additive prefix fence and tolerant proof decoding now. Keep message proofs, existing ownership, and save-before-CAS ordering. No additional captures, authentication work, activation, or broader framework is necessary.

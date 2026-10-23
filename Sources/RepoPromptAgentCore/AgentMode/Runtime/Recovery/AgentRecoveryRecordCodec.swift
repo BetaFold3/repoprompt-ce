@@ -280,12 +280,19 @@ enum AgentRecoveryRecordCodec {
             }
             return identity
         }
+        // Tolerant optional proof: only a valid digest is typed (and consumed); anything else present
+        // (wrong type, null, malformed) stays verbatim in `extras` and reads as no proof.
+        var prefixSHA256: String?
+        if case let .string(value)? = reader.peek("prefixSHA256"), AgentSessionProviderHistoryRecovery.isSHA256Hex(value) {
+            prefixSHA256 = try reader.optionalString("prefixSHA256")
+        }
         return try AgentRecoveryHistoryCursor(
             providerRaw: reader.string("provider"),
             conversationID: reader.string("conversationID"),
             importID: reader.uuid("importID"),
             file: file,
             completeLineOffset: reader.uint64("completeLineOffset"),
+            prefixSHA256: prefixSHA256,
             committedAt: reader.timestamp("committedAt"),
             extras: reader.extras
         )
@@ -310,6 +317,10 @@ enum AgentRecoveryRecordCodec {
             object["file"] = .object(fileObject)
         }
         object["completeLineOffset"] = .number(Decimal(cursor.completeLineOffset))
+        // A typed proof overwrites a preserved invalid raw value; `nil` never erases it.
+        if let prefix = cursor.prefixSHA256 {
+            object["prefixSHA256"] = .string(prefix)
+        }
         object["committedAt"] = timestampJSON(cursor.committedAt)
         return .object(object)
     }

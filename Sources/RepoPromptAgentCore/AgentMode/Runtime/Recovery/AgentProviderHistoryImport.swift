@@ -27,13 +27,36 @@ package struct AgentProviderHistoryRow: Equatable {
     package let ordinal: Int
     /// The inert transcript item this row projects to (`nil` = recorded in the ledger only).
     package let item: AgentChatItem?
+    /// The native entry's complete-envelope digest, recorded with the ledger row (`nil` = none, Codex).
+    package let envelopeDigest: String?
 
-    package init(nativeSessionID: String, nativeEntryID: String, rowKindRaw: String, ordinal: Int, item: AgentChatItem?) {
+    package init(
+        nativeSessionID: String,
+        nativeEntryID: String,
+        rowKindRaw: String,
+        ordinal: Int,
+        item: AgentChatItem?,
+        envelopeDigest: String? = nil
+    ) {
         self.nativeSessionID = nativeSessionID
         self.nativeEntryID = nativeEntryID
         self.rowKindRaw = rowKindRaw
         self.ordinal = ordinal
         self.item = item
+        self.envelopeDigest = envelopeDigest
+    }
+}
+
+/// A native user message entry observed after the import frontier (Claude). Matched only against
+/// recorded outbound claims; never projected.
+package struct AgentProviderHistoryNativeUserEntry: Equatable {
+    package let nativeEntryID: String
+    /// Lowercase hex SHA-256 of the entry's plain string content (`nil` for any other content).
+    package let textSHA256: String?
+
+    package init(nativeEntryID: String, textSHA256: String?) {
+        self.nativeEntryID = nativeEntryID
+        self.textSHA256 = textSHA256
     }
 }
 
@@ -45,8 +68,13 @@ package struct AgentProviderHistoryObservation: Equatable {
     package let rows: [AgentProviderHistoryRow]
     package let file: AgentRecoveryHistoryFileIdentity?
     package let completeLineOffset: UInt64
+    /// Byte-prefix proof of the observed `[0, completeLineOffset)` (Claude; `nil` for Codex).
+    package let prefixSHA256: String?
     /// Whether the provider proved the expected turn finished (Claude: never).
     package let completionConfirmed: Bool
+    /// Every native user message entry after the attempt's boundary, ledger-known ones included,
+    /// in projection order (Claude outbound-claim matching; empty for Codex).
+    package let nativeUserEntries: [AgentProviderHistoryNativeUserEntry]
 
     package init(
         provider: AgentRecoveryHistoryProvider,
@@ -54,14 +82,18 @@ package struct AgentProviderHistoryObservation: Equatable {
         rows: [AgentProviderHistoryRow],
         file: AgentRecoveryHistoryFileIdentity?,
         completeLineOffset: UInt64,
-        completionConfirmed: Bool
+        prefixSHA256: String? = nil,
+        completionConfirmed: Bool,
+        nativeUserEntries: [AgentProviderHistoryNativeUserEntry] = []
     ) {
         self.provider = provider
         self.conversationID = conversationID
         self.rows = rows
         self.file = file
         self.completeLineOffset = completeLineOffset
+        self.prefixSHA256 = prefixSHA256
         self.completionConfirmed = completionConfirmed
+        self.nativeUserEntries = nativeUserEntries
     }
 }
 
@@ -121,7 +153,8 @@ package enum AgentProviderHistoryImportPlanner {
                 nativeEntryID: row.nativeEntryID,
                 rowKindRaw: row.rowKindRaw,
                 ordinal: row.ordinal,
-                localItemID: localItemID
+                localItemID: localItemID,
+                envelopeDigest: row.envelopeDigest
             ))
         }
         if !appended.isEmpty {
@@ -133,12 +166,18 @@ package enum AgentProviderHistoryImportPlanner {
             ))
             appended.insert(label, at: 0)
         }
+        // The receipt binds the exact target it was read from (same save as rows and ledger), so a
+        // lost cursor CAS never loses the latest accepted prefix. Codex has none.
+        let target = observation.prefixSHA256.map {
+            AgentRecoveryHistoryPrefixFence(file: observation.file, completeLineOffset: observation.completeLineOffset, prefixSHA256: $0)
+        }
         let commit = AgentSessionProviderHistoryRecovery.ImportCommit(
             importID: importID,
             providerRaw: observation.provider.rawValue,
             conversationID: observation.conversationID,
             committedAt: now,
-            rowCount: appended.count
+            rowCount: appended.count,
+            target: target
         )
         ledger.lastImportCommit = commit
         let cursor = AgentRecoveryHistoryCursor(
@@ -147,6 +186,7 @@ package enum AgentProviderHistoryImportPlanner {
             importID: importID,
             file: observation.file,
             completeLineOffset: observation.completeLineOffset,
+            prefixSHA256: observation.prefixSHA256,
             committedAt: AgentRecoveryTimestamp(now)
         )
         return AgentProviderHistoryImportPlan(
@@ -176,6 +216,11 @@ package enum AgentProviderHistoryAssociationRefusal: Equatable {
     /// Canonical provider output after the dispatch is not explicitly associated to native rows
     /// (or cannot be enumerated because it was compacted).
     case canonicalOutputAssociationUnavailable
+    /// The attempt's recorded outbound claims and the native user entries after its boundary do not
+    /// match exactly (a claimed entry missing, an unclaimed or reordered entry, a text digest
+    /// mismatch, duplicate claims, or constituents not in this transcript). A claim never proves a
+    /// write, so a missing entry is never read as non-delivery.
+    case outboundClaimUnmatched
 }
 
 /// The canonical transcript an import would merge into: the persisted turns (including compacted
@@ -193,8 +238,74 @@ package struct AgentProviderHistoryCanonicalView {
 package enum AgentProviderHistoryAssociationPreflight {
     static let outputKinds: Set<AgentChatItemKind> = [.assistant, .assistantInline, .toolCall, .toolResult, .thinking]
 
+    /// A fence whose proof is unavailable: verification always fails closed (never backfilled).
+    static let unavailablePrefixFence = AgentRecoveryHistoryPrefixFence(file: nil, completeLineOffset: 0, prefixSHA256: nil)
+
+    /// The latest durably saved Claude target this conversation must still match, or `nil` when
+    /// none applies. Only one latest receipt is kept (no per-conversation target history), so when
+    /// Claude rows of this conversation were imported but the latest receipt is absent, belongs to
+    /// another provider or conversation, or has no valid target, that last target is no longer
+    /// available and the result is a proofless fence: conservative refusal, never a quiet omission.
+    static func latestSavedClaudeTargetFence(
+        ledger: AgentSessionProviderHistoryRecovery?,
+        conversationID: String
+    ) -> AgentRecoveryHistoryPrefixFence? {
+        let hasImportedHistory = ledger?.nativeItems.contains {
+            $0.providerRaw == ClaudeSessionHistoryReader.providerRaw && $0.nativeSessionID == conversationID
+        } ?? false
+        if let receipt = ledger?.lastImportCommit,
+           receipt.providerRaw == ClaudeSessionHistoryReader.providerRaw,
+           receipt.conversationID == conversationID
+        {
+            // A matching receipt without a valid target (legacy or malformed) is never trusted.
+            return receipt.target ?? unavailablePrefixFence
+        }
+        return hasImportedHistory ? unavailablePrefixFence : nil
+    }
+
+    /// Byte-prefix fences a Claude import verifies besides its boundary (Step 4d2), all against the
+    /// same captured buffer: every captured baseline of the source attempt's dispatch window, and
+    /// the latest durably saved Claude target of this conversation, even when the record cursor is
+    /// older (a lost CAS). An unavailable target contributes a proofless fence, so the import fails
+    /// closed. The caller adds the record cursor's own fence. Only window baselines of this provider
+    /// and conversation fence this file (review B P3-01): a foreign one is left to the preflight's
+    /// `baselineTargetMismatch` instead of masking it as rewritten history.
+    package static func claudePrefixFences(
+        window: [AgentSessionProviderHistoryRecovery.DispatchBaseline],
+        ledger: AgentSessionProviderHistoryRecovery?,
+        conversationID: String
+    ) -> [AgentRecoveryHistoryPrefixFence] {
+        window
+            .filter { $0.providerRaw == ClaudeSessionHistoryReader.providerRaw && $0.conversationID == conversationID }
+            .compactMap { $0.cursor?.prefixFence }
+            + [latestSavedClaudeTargetFence(ledger: ledger, conversationID: conversationID)].compactMap(\.self)
+    }
+
+    /// The fence a new Claude baseline verifies before it may become the latest receipt: the latest
+    /// saved target of this conversation. An unavailable one (imported history whose last target is
+    /// lost or unproven) is proofless, so the baseline is recorded unsupported (no claim) and never
+    /// mints a fresh proof over it. A legacy target-less zero-row receipt with nothing imported
+    /// fences nothing (a fresh first baseline stays allowed).
+    package static func claudeBaselineFences(
+        ledger: AgentSessionProviderHistoryRecovery?,
+        conversationID: String
+    ) -> [AgentRecoveryHistoryPrefixFence] {
+        let hasImportedHistory = ledger?.nativeItems.contains {
+            $0.providerRaw == ClaudeSessionHistoryReader.providerRaw && $0.nativeSessionID == conversationID
+        } ?? false
+        guard let fence = latestSavedClaudeTargetFence(ledger: ledger, conversationID: conversationID),
+              fence.prefixSHA256 != nil || hasImportedHistory
+        else { return [] }
+        return [fence]
+    }
+
     /// Checks whether `observation` (read after `baseline`) may be planned into `canonical`.
     /// `nil` = the explicit associations exist; otherwise the import must not run.
+    ///
+    /// `dispatchWindow` (Claude, Step 4d2): every recorded dispatch of the attempt, earliest (the
+    /// boundary) first. When every one carries an outbound claim, those claims are the user
+    /// association evidence and must match the native user entries after the boundary exactly;
+    /// when any lacks one, there is no claim association (legacy) and the ledger alone decides.
     package static func check(
         observation: AgentProviderHistoryObservation,
         baseline: AgentSessionProviderHistoryRecovery.DispatchBaseline?,
@@ -202,7 +313,8 @@ package enum AgentProviderHistoryAssociationPreflight {
         expectedRunAttemptID: UUID?,
         transcriptResetGeneration: UInt64,
         canonical: AgentProviderHistoryCanonicalView,
-        ledger: AgentSessionProviderHistoryRecovery?
+        ledger: AgentSessionProviderHistoryRecovery?,
+        dispatchWindow: [AgentSessionProviderHistoryRecovery.DispatchBaseline]? = nil
     ) -> AgentProviderHistoryAssociationRefusal? {
         if let refusal = baselineRefusal(
             baseline: baseline,
@@ -220,24 +332,40 @@ package enum AgentProviderHistoryAssociationPreflight {
         guard let canonicalOutputIDs = outputItemIDs(after: Set(baseline.userItemIDs), in: canonical) else {
             return .baselineTargetMismatch
         }
+        var claimed: ClaimAssociation?
+        if let dispatchWindow {
+            switch claimAssociation(
+                window: dispatchWindow,
+                boundary: baseline,
+                observation: observation,
+                canonical: canonical
+            ) {
+            case .legacy:
+                claimed = nil
+            case let .refused(refusal):
+                return refusal
+            case let .associated(association):
+                claimed = association
+            }
+        }
         // Positive association of EVERY user constituent of the dispatch (review A P1-05), checked
         // independently of the (possibly ledger-filtered) observation: each local user item must be
-        // the explicit `localItemID` of a native user row of this conversation in the ledger. A nil
-        // `localItemID` is unassociated. Nothing in this build writes such a user association, so a
-        // live conversation always refuses here; no empty-output or user-filter shortcut exists.
+        // the explicit `localItemID` of a native user row of this conversation in the ledger, or a
+        // constituent of an exactly matched outbound claim. A nil `localItemID` is unassociated; no
+        // empty-output or user-filter shortcut exists.
         let associatedUserItemIDs = Set((ledger?.nativeItems ?? []).compactMap { native -> UUID? in
             guard native.providerRaw == observation.provider.rawValue,
                   native.nativeSessionID == observation.conversationID,
                   native.rowKindRaw == userRowKindRaw(observation.provider)
             else { return nil }
             return native.localItemID
-        })
+        }).union(claimed?.userItemIDs ?? [])
         guard Set(baseline.userItemIDs).isSubset(of: associatedUserItemIDs) else {
             return .nativeUserAssociationUnavailable
         }
-        // Native user rows: `localItemID == nil` in the ledger is NOT an association, and nothing in
-        // this build relates a native user entry to the dispatch's local user item.
-        if observation.rows.contains(where: { $0.item == nil }) {
+        // Native user rows: `localItemID == nil` in the ledger is NOT an association. Only a native
+        // entry an outbound claim matched exactly is consumed (recorded, never re-created as a row).
+        if observation.rows.contains(where: { $0.item == nil && !(claimed?.nativeUserEntryIDs.contains($0.nativeEntryID) ?? false) }) {
             return .nativeUserAssociationUnavailable
         }
         guard case let .enumerated(ids) = canonicalOutputIDs else {
@@ -249,6 +377,75 @@ package enum AgentProviderHistoryAssociationPreflight {
             return .canonicalOutputAssociationUnavailable
         }
         return nil
+    }
+
+    /// Native user entries and local user items proven by the attempt's outbound claims.
+    struct ClaimAssociation: Equatable {
+        let nativeUserEntryIDs: Set<String>
+        let userItemIDs: Set<UUID>
+    }
+
+    enum ClaimAssociationResult: Equatable {
+        /// Some dispatch of the attempt has no claim: no claim association exists.
+        case legacy
+        case refused(AgentProviderHistoryAssociationRefusal)
+        case associated(ClaimAssociation)
+    }
+
+    /// Exact association of the attempt's claims (`window`, earliest first) to the native user
+    /// entries after the boundary: one entry per claim, the claim's own UUID (lowercase) as the
+    /// entry ID, in dispatch order, with an equal plain-text digest, and no other native user entry;
+    /// every dispatch's complete ordered constituents are in `canonical` in that order. A claimed
+    /// UUID never proves a write: a missing entry refuses and is never read as non-delivery.
+    static func claimAssociation(
+        window: [AgentSessionProviderHistoryRecovery.DispatchBaseline],
+        boundary: AgentSessionProviderHistoryRecovery.DispatchBaseline,
+        observation: AgentProviderHistoryObservation,
+        canonical: AgentProviderHistoryCanonicalView
+    ) -> ClaimAssociationResult {
+        guard window.first == boundary,
+              window.allSatisfy({
+                  $0.providerRaw == boundary.providerRaw
+                      && $0.conversationID == boundary.conversationID && $0.runAttemptID == boundary.runAttemptID
+                      && $0.transcriptResetGeneration == boundary.transcriptResetGeneration
+              })
+        else { return .refused(.baselineTargetMismatch) }
+        // A same-attempt dispatch recorded unsupported (e.g. a steer read mid-write) belongs to this
+        // conversation and run but carries no usable claim: no claim association (review B P2-03),
+        // never a false target mismatch. The ledger-only checks then decide (and fail closed).
+        guard window.allSatisfy({ $0.status == .captured }) else { return .legacy }
+        let claims = window.compactMap(\.outboundUserMessage)
+        guard claims.count == window.count else { return .legacy }
+        let claimedIDs = claims.map { $0.uuid.uuidString.lowercased() }
+        let constituents = window.flatMap(\.userItemIDs)
+        guard zip(window, claims).allSatisfy({ $0.dispatchID == $1.uuid }),
+              Set(claimedIDs).count == claimedIDs.count,
+              observation.nativeUserEntries.map(\.nativeEntryID) == claimedIDs,
+              zip(observation.nativeUserEntries, claims).allSatisfy({ $0.textSHA256 == $1.textSHA256 }),
+              window.allSatisfy({ !$0.userItemIDs.isEmpty }),
+              Set(constituents).count == constituents.count,
+              isOrderedSubsequence(constituents, of: canonicalItemIDs(canonical))
+        else { return .refused(.outboundClaimUnmatched) }
+        return .associated(ClaimAssociation(nativeUserEntryIDs: Set(claimedIDs), userItemIDs: Set(constituents)))
+    }
+
+    /// Every canonical item ID in transcript order (persisted turns, then the suffix).
+    private static func canonicalItemIDs(_ canonical: AgentProviderHistoryCanonicalView) -> [UUID] {
+        var ids: [UUID] = []
+        for turn in canonical.transcript.turns {
+            if let request = turn.request { ids.append(request.id) }
+            ids.append(contentsOf: turn.allActivities.map(\.id))
+        }
+        ids.append(contentsOf: canonical.suffixItems.map(\.id))
+        return ids
+    }
+
+    private static func isOrderedSubsequence(_ wanted: [UUID], of ids: [UUID]) -> Bool {
+        var remaining = wanted[...]
+        for id in ids where id == remaining.first {
+            remaining = remaining.dropFirst()
+        }
+        return remaining.isEmpty
     }
 
     /// The baseline half of the preflight (checked before any history read).
@@ -313,12 +510,15 @@ package enum AgentProviderHistoryAssociationPreflight {
     }
 
     /// Provider-output item IDs at or after the first of `userItemIDs`; `nil` when that user item is
-    /// in neither the persisted turns nor the suffix.
+    /// in neither the persisted turns nor the suffix. Only the turn holding that first user item is
+    /// filtered (output before it is excluded); every later turn counts in full, whatever its own
+    /// request (review A R1: a later turn's live output is never skipped).
     static func outputItemIDs(after userItemIDs: Set<UUID>, in canonical: AgentProviderHistoryCanonicalView) -> CanonicalOutput? {
         var ids = Set<UUID>()
         var found = false
         var enumerable = true
         for turn in canonical.transcript.turns {
+            let passedInEarlierTurn = found
             let requestMatches = turn.request.map { userItemIDs.contains($0.id) } ?? false
             let activityMatches = turn.allActivities.contains { userItemIDs.contains($0.id) }
             if !found, requestMatches || activityMatches {
@@ -328,7 +528,7 @@ package enum AgentProviderHistoryAssociationPreflight {
             if turn.retentionTier != .full || turn.isStructurallyCompacted {
                 enumerable = false
             }
-            var afterUser = requestMatches
+            var afterUser = passedInEarlierTurn || requestMatches
             for activity in turn.allActivities {
                 if userItemIDs.contains(activity.id) { afterUser = true }
                 if afterUser, outputKinds.contains(activity.itemKind) { ids.insert(activity.id) }
@@ -360,7 +560,8 @@ extension ClaudeSessionHistoryReader {
                 nativeEntryID: row.nativeEntryID,
                 rowKindRaw: row.kind.rawValue,
                 ordinal: row.ordinal,
-                item: item(for: row)
+                item: item(for: row),
+                envelopeDigest: row.envelopeDigest
             )
         }
         return AgentProviderHistoryObservation(
@@ -369,7 +570,9 @@ extension ClaudeSessionHistoryReader {
             rows: rows,
             file: candidate.file,
             completeLineOffset: candidate.completeLineOffset,
-            completionConfirmed: false
+            prefixSHA256: candidate.prefixSHA256,
+            completionConfirmed: false,
+            nativeUserEntries: candidate.userMessageEntries
         )
     }
 

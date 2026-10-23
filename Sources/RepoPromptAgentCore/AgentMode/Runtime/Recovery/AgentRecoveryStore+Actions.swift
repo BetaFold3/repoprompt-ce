@@ -123,7 +123,8 @@ package extension AgentRecoveryStore {
 
     /// Advances one provider conversation's history cursor by compare-and-swap on the import ID it
     /// followed (`nil` = no cursor yet). Called only after the session save that committed the
-    /// imported rows and the same import receipt; an exact repeat is `unchanged`.
+    /// imported rows and the same import receipt; an exact repeat (same file, offset and prefix
+    /// proof) is `unchanged`, any other value under the same import ID conflicts.
     func commitHistoryCursor(
         binding: AgentRecoveryLifecycleBinding,
         expectedPreviousImportID: UUID?,
@@ -132,7 +133,9 @@ package extension AgentRecoveryStore {
         let current = try writableRecord(binding: binding)
         let existing = current?.historyCursor(providerRaw: cursor.providerRaw, conversationID: cursor.conversationID)
         if let current, let existing, existing.importID == cursor.importID {
-            guard existing.file == cursor.file, existing.completeLineOffset == cursor.completeLineOffset else {
+            guard existing.file == cursor.file, existing.completeLineOffset == cursor.completeLineOffset,
+                  existing.prefixSHA256 == cursor.prefixSHA256
+            else {
                 throw AgentRecoveryStoreError.historyCursorConflict
             }
             return AgentRecoveryLocalReceipt(

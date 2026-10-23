@@ -28,6 +28,12 @@ package struct AgentSessionProviderHistoryRecovery: Codable, Equatable {
         /// Local transcript item this row was projected as. `nil` = unassociated/not projected (a
         /// native user entry): never evidence that the entry is a known local user item.
         package let localItemID: UUID?
+        /// Complete-envelope proof of the native entry this row came from (lowercase hex SHA-256 of
+        /// the entry's ordered supported semantic payload; every row of one entry carries the same
+        /// value). `nil` for legacy rows, providers without one (Codex), and a malformed stored value
+        /// (kept verbatim in `extras`, never read as a proof): a Claude entry whose known rows lack a
+        /// valid one never deduplicates and refuses as a ledger conflict.
+        package let envelopeDigest: String?
         package var extras: [String: AgentScheduledSendJSONValue]
 
         package init(
@@ -37,6 +43,7 @@ package struct AgentSessionProviderHistoryRecovery: Codable, Equatable {
             rowKindRaw: String,
             ordinal: Int,
             localItemID: UUID?,
+            envelopeDigest: String? = nil,
             extras: [String: AgentScheduledSendJSONValue] = [:]
         ) {
             self.providerRaw = providerRaw
@@ -45,6 +52,7 @@ package struct AgentSessionProviderHistoryRecovery: Codable, Equatable {
             self.rowKindRaw = rowKindRaw
             self.ordinal = ordinal
             self.localItemID = localItemID
+            self.envelopeDigest = envelopeDigest
             self.extras = extras
         }
 
@@ -60,7 +68,7 @@ package struct AgentSessionProviderHistoryRecovery: Codable, Equatable {
         }
 
         private static let knownKeys: Set<String> = [
-            "provider", "nativeSessionID", "nativeEntryID", "rowKind", "ordinal", "localItemID"
+            "provider", "nativeSessionID", "nativeEntryID", "rowKind", "ordinal", "localItemID", "envelopeDigest"
         ]
 
         package init(from decoder: Decoder) throws {
@@ -71,18 +79,24 @@ package struct AgentSessionProviderHistoryRecovery: Codable, Equatable {
             rowKindRaw = try container.decode(String.self, forKey: HistoryDynamicKey("rowKind"))
             ordinal = try container.decode(Int.self, forKey: HistoryDynamicKey("ordinal"))
             localItemID = try container.decodeIfPresent(UUID.self, forKey: HistoryDynamicKey("localItemID"))
-            extras = try HistoryDynamicKey.extras(in: container, excluding: Self.knownKeys)
+            // Tolerant: a malformed proof never fails the session and is never read as a proof.
+            envelopeDigest = HistoryDynamicKey.tolerantDigest(in: container, key: "envelopeDigest")
+            extras = try HistoryDynamicKey.extras(
+                in: container,
+                excluding: envelopeDigest == nil ? Self.knownKeys.subtracting(["envelopeDigest"]) : Self.knownKeys
+            )
         }
 
         package func encode(to encoder: Encoder) throws {
             var container = encoder.container(keyedBy: HistoryDynamicKey.self)
-            try HistoryDynamicKey.encode(extras, into: &container)
+            try HistoryDynamicKey.encode(extras, into: &container, overriddenBy: envelopeDigest == nil ? [] : ["envelopeDigest"])
             try container.encode(providerRaw, forKey: HistoryDynamicKey("provider"))
             try container.encode(nativeSessionID, forKey: HistoryDynamicKey("nativeSessionID"))
             try container.encode(nativeEntryID, forKey: HistoryDynamicKey("nativeEntryID"))
             try container.encode(rowKindRaw, forKey: HistoryDynamicKey("rowKind"))
             try container.encode(ordinal, forKey: HistoryDynamicKey("ordinal"))
             try container.encodeIfPresent(localItemID, forKey: HistoryDynamicKey("localItemID"))
+            try container.encodeIfPresent(envelopeDigest, forKey: HistoryDynamicKey("envelopeDigest"))
         }
     }
 
@@ -94,6 +108,11 @@ package struct AgentSessionProviderHistoryRecovery: Codable, Equatable {
         package let committedAt: Date
         /// Rows projected by this import (0 for a baseline or a no-op import).
         package let rowCount: Int
+        /// The exact history target this receipt committed (Claude, Step 4d2): the file, complete
+        /// offset and byte-prefix proof the import's rows and ledger were read from, bound in the
+        /// same session save. It survives a lost cursor CAS, so the next import fences it. `nil` for
+        /// Codex, legacy receipts (never backfilled), and a malformed stored value (kept verbatim).
+        package let target: AgentRecoveryHistoryPrefixFence?
         package var extras: [String: AgentScheduledSendJSONValue]
 
         package init(
@@ -102,6 +121,7 @@ package struct AgentSessionProviderHistoryRecovery: Codable, Equatable {
             conversationID: String,
             committedAt: Date,
             rowCount: Int,
+            target: AgentRecoveryHistoryPrefixFence? = nil,
             extras: [String: AgentScheduledSendJSONValue] = [:]
         ) {
             self.importID = importID
@@ -109,10 +129,53 @@ package struct AgentSessionProviderHistoryRecovery: Codable, Equatable {
             self.conversationID = conversationID
             self.committedAt = committedAt
             self.rowCount = rowCount
+            self.target = target
             self.extras = extras
         }
 
-        private static let knownKeys: Set<String> = ["importID", "provider", "conversationID", "committedAt", "rowCount"]
+        private static let knownKeys: Set<String> = ["importID", "provider", "conversationID", "committedAt", "rowCount", "target"]
+
+        /// The stored `target` object (all members known and well-formed, with a valid proof).
+        private struct TargetCoding: Codable {
+            let fileDevice: UInt64?
+            let fileInode: UInt64?
+            let fileBirthSeconds: Int64?
+            let fileBirthNanoseconds: Int64?
+            let completeLineOffset: UInt64
+            let prefixSHA256: String
+
+            static let memberNames: Set<String> = [
+                "fileDevice", "fileInode", "fileBirthSeconds", "fileBirthNanoseconds", "completeLineOffset", "prefixSHA256"
+            ]
+
+            init(_ fence: AgentRecoveryHistoryPrefixFence, prefixSHA256: String) {
+                fileDevice = fence.file?.device
+                fileInode = fence.file?.inode
+                fileBirthSeconds = fence.file?.birthSeconds
+                fileBirthNanoseconds = fence.file?.birthNanoseconds
+                completeLineOffset = fence.completeLineOffset
+                self.prefixSHA256 = prefixSHA256
+            }
+
+            var fence: AgentRecoveryHistoryPrefixFence? {
+                guard AgentSessionProviderHistoryRecovery.isSHA256Hex(prefixSHA256) else { return nil }
+                let file: AgentRecoveryHistoryFileIdentity?
+                switch (fileDevice, fileInode) {
+                case let (device?, inode?):
+                    file = AgentRecoveryHistoryFileIdentity(
+                        device: device,
+                        inode: inode,
+                        birthSeconds: fileBirthSeconds,
+                        birthNanoseconds: fileBirthNanoseconds
+                    )
+                case (nil, nil) where fileBirthSeconds == nil && fileBirthNanoseconds == nil:
+                    file = nil
+                default:
+                    return nil
+                }
+                return AgentRecoveryHistoryPrefixFence(file: file, completeLineOffset: completeLineOffset, prefixSHA256: prefixSHA256)
+            }
+        }
 
         package init(from decoder: Decoder) throws {
             let container = try decoder.container(keyedBy: HistoryDynamicKey.self)
@@ -121,17 +184,33 @@ package struct AgentSessionProviderHistoryRecovery: Codable, Equatable {
             conversationID = try container.decode(String.self, forKey: HistoryDynamicKey("conversationID"))
             committedAt = try container.decode(Date.self, forKey: HistoryDynamicKey("committedAt"))
             rowCount = try container.decode(Int.self, forKey: HistoryDynamicKey("rowCount"))
-            extras = try HistoryDynamicKey.extras(in: container, excluding: Self.knownKeys)
+            // Tolerant and all-or-nothing: anything but a complete, well-formed target with a valid
+            // proof is no target (fails closed) and stays verbatim in `extras`.
+            let raw = try container.decodeIfPresent(AgentScheduledSendJSONValue.self, forKey: HistoryDynamicKey("target"))
+            target = raw.flatMap { value -> AgentRecoveryHistoryPrefixFence? in
+                guard case let .object(members) = value,
+                      Set(members.keys).isSubset(of: TargetCoding.memberNames),
+                      let data = try? JSONEncoder().encode(value),
+                      let coding = try? JSONDecoder().decode(TargetCoding.self, from: data)
+                else { return nil }
+                return coding.fence
+            }
+            extras = try HistoryDynamicKey.extras(
+                in: container,
+                excluding: target == nil ? Self.knownKeys.subtracting(["target"]) : Self.knownKeys
+            )
         }
 
         package func encode(to encoder: Encoder) throws {
             var container = encoder.container(keyedBy: HistoryDynamicKey.self)
-            try HistoryDynamicKey.encode(extras, into: &container)
+            let typedTarget = target.flatMap { fence in fence.prefixSHA256.map { TargetCoding(fence, prefixSHA256: $0) } }
+            try HistoryDynamicKey.encode(extras, into: &container, overriddenBy: typedTarget == nil ? [] : ["target"])
             try container.encode(importID, forKey: HistoryDynamicKey("importID"))
             try container.encode(providerRaw, forKey: HistoryDynamicKey("provider"))
             try container.encode(conversationID, forKey: HistoryDynamicKey("conversationID"))
             try container.encode(committedAt, forKey: HistoryDynamicKey("committedAt"))
             try container.encode(rowCount, forKey: HistoryDynamicKey("rowCount"))
+            try container.encodeIfPresent(typedTarget, forKey: HistoryDynamicKey("target"))
         }
     }
 
@@ -172,10 +251,7 @@ package struct AgentSessionProviderHistoryRecovery: Codable, Equatable {
 
             /// The claim for `uuid` over exactly `providerBoundText` (the codec's text, unmodified).
             package init(uuid: UUID, providerBoundText: String) {
-                self.init(
-                    uuid: uuid,
-                    textSHA256: SHA256.hash(data: Data(providerBoundText.utf8)).map { String(format: "%02x", $0) }.joined()
-                )
+                self.init(uuid: uuid, textSHA256: AgentSessionProviderHistoryRecovery.sha256Hex(Data(providerBoundText.utf8)))
             }
 
             private static let knownKeys: Set<String> = ["uuid", "textSHA256"]
@@ -185,7 +261,7 @@ package struct AgentSessionProviderHistoryRecovery: Codable, Equatable {
                 uuid = try container.decode(UUID.self, forKey: HistoryDynamicKey("uuid"))
                 let digest = try container.decode(String.self, forKey: HistoryDynamicKey("textSHA256"))
                 // Exactly 64 lowercase hex digits; anything else makes the whole baseline unreadable.
-                guard digest.utf8.count == 64, digest.utf8.allSatisfy({ (0x30 ... 0x39).contains($0) || (0x61 ... 0x66).contains($0) }) else {
+                guard AgentSessionProviderHistoryRecovery.isSHA256Hex(digest) else {
                     throw DecodingError.dataCorruptedError(
                         forKey: HistoryDynamicKey("textSHA256"),
                         in: container,
@@ -216,6 +292,10 @@ package struct AgentSessionProviderHistoryRecovery: Codable, Equatable {
         /// `nil` for verified absence (or an unsupported capture).
         package let file: AgentRecoveryHistoryFileIdentity?
         package let completeLineOffset: UInt64
+        /// Byte-prefix proof of `[0, completeLineOffset)` (SHA-256 of the empty prefix for verified
+        /// absence or an empty file). `nil` for legacy and unsupported baselines and a malformed
+        /// stored value (kept verbatim in `extras`); never synthesized, so such a boundary fails closed.
+        package let prefixSHA256: String?
         /// The zero-row import receipt that committed this boundary (`nil` when unsupported).
         package let baselineCommitID: UUID?
         package let profileName: String
@@ -234,6 +314,7 @@ package struct AgentSessionProviderHistoryRecovery: Codable, Equatable {
             userItemIDs: [UUID],
             file: AgentRecoveryHistoryFileIdentity?,
             completeLineOffset: UInt64,
+            prefixSHA256: String? = nil,
             baselineCommitID: UUID?,
             profileName: String,
             status: Status,
@@ -249,6 +330,7 @@ package struct AgentSessionProviderHistoryRecovery: Codable, Equatable {
             self.userItemIDs = userItemIDs
             self.file = file
             self.completeLineOffset = completeLineOffset
+            self.prefixSHA256 = prefixSHA256
             self.baselineCommitID = baselineCommitID
             self.profileName = profileName
             self.status = status
@@ -275,6 +357,7 @@ package struct AgentSessionProviderHistoryRecovery: Codable, Equatable {
                 importID: baselineCommitID,
                 file: file,
                 completeLineOffset: completeLineOffset,
+                prefixSHA256: prefixSHA256,
                 committedAt: AgentRecoveryTimestamp(recordedAt)
             )
         }
@@ -283,7 +366,7 @@ package struct AgentSessionProviderHistoryRecovery: Codable, Equatable {
             "dispatchID", "runAttemptID", "transcriptResetGeneration", "provider", "conversationID",
             "userItemIDs", "fileDevice", "fileInode", "fileBirthSeconds", "fileBirthNanoseconds",
             "completeLineOffset", "baselineCommitID", "profile", "status", "unsupportedReason", "recordedAtMs",
-            "outboundUserMessage"
+            "outboundUserMessage", "prefixSHA256"
         ]
 
         package init(from decoder: Decoder) throws {
@@ -308,6 +391,8 @@ package struct AgentSessionProviderHistoryRecovery: Codable, Equatable {
                 file = nil
             }
             completeLineOffset = try container.decode(UInt64.self, forKey: key("completeLineOffset"))
+            // Tolerant (unlike the claim): a malformed proof is no proof, kept verbatim.
+            prefixSHA256 = HistoryDynamicKey.tolerantDigest(in: container, key: "prefixSHA256")
             baselineCommitID = try container.decodeIfPresent(UUID.self, forKey: key("baselineCommitID"))
             profileName = try container.decode(String.self, forKey: key("profile"))
             switch try container.decode(String.self, forKey: key("status")) {
@@ -327,12 +412,15 @@ package struct AgentSessionProviderHistoryRecovery: Codable, Equatable {
             recordedAt = try Self.millisecondDate(container.decode(Int64.self, forKey: key("recordedAtMs")))
             // A malformed claim makes the whole baseline unreadable (kept verbatim), never a claim.
             outboundUserMessage = try container.decodeIfPresent(OutboundUserMessage.self, forKey: key("outboundUserMessage"))
-            extras = try HistoryDynamicKey.extras(in: container, excluding: Self.knownKeys)
+            extras = try HistoryDynamicKey.extras(
+                in: container,
+                excluding: prefixSHA256 == nil ? Self.knownKeys.subtracting(["prefixSHA256"]) : Self.knownKeys
+            )
         }
 
         package func encode(to encoder: Encoder) throws {
             var container = encoder.container(keyedBy: HistoryDynamicKey.self)
-            try HistoryDynamicKey.encode(extras, into: &container)
+            try HistoryDynamicKey.encode(extras, into: &container, overriddenBy: prefixSHA256 == nil ? [] : ["prefixSHA256"])
             try container.encode(dispatchID, forKey: HistoryDynamicKey("dispatchID"))
             try container.encodeIfPresent(runAttemptID, forKey: HistoryDynamicKey("runAttemptID"))
             try container.encode(transcriptResetGeneration, forKey: HistoryDynamicKey("transcriptResetGeneration"))
@@ -346,6 +434,7 @@ package struct AgentSessionProviderHistoryRecovery: Codable, Equatable {
                 try container.encodeIfPresent(file.birthNanoseconds, forKey: HistoryDynamicKey("fileBirthNanoseconds"))
             }
             try container.encode(completeLineOffset, forKey: HistoryDynamicKey("completeLineOffset"))
+            try container.encodeIfPresent(prefixSHA256, forKey: HistoryDynamicKey("prefixSHA256"))
             try container.encodeIfPresent(baselineCommitID, forKey: HistoryDynamicKey("baselineCommitID"))
             try container.encode(profileName, forKey: HistoryDynamicKey("profile"))
             switch status {
@@ -398,6 +487,21 @@ package struct AgentSessionProviderHistoryRecovery: Codable, Equatable {
 
     package func nativeItem(forKey key: String) -> NativeItem? {
         nativeItems.first { $0.key == key }
+    }
+
+    /// Exactly 64 lowercase hex digits (a SHA-256 rendered by `sha256Hex`).
+    package static func isSHA256Hex(_ value: String) -> Bool {
+        value.utf8.count == 64 && value.utf8.allSatisfy { (0x30 ... 0x39).contains($0) || (0x61 ... 0x66).contains($0) }
+    }
+
+    /// Lowercase hex SHA-256 of `data`.
+    package static func sha256Hex(_ data: Data) -> String {
+        hex(SHA256.hash(data: data))
+    }
+
+    /// Lowercase hex rendering of a SHA-256 digest.
+    package static func hex(_ digest: SHA256.Digest) -> String {
+        digest.map { String(format: "%02x", $0) }.joined()
     }
 
     /// Unambiguous length-prefixed encoding of a native row key.
@@ -497,12 +601,25 @@ private struct HistoryDynamicKey: CodingKey {
         return extras
     }
 
+    /// Encodes unknown members, skipping any a typed member of the same name is about to replace
+    /// (a valid typed proof overwrites a preserved invalid raw value; a `nil` one never erases it).
     static func encode(
         _ extras: [String: AgentScheduledSendJSONValue],
-        into container: inout KeyedEncodingContainer<HistoryDynamicKey>
+        into container: inout KeyedEncodingContainer<HistoryDynamicKey>,
+        overriddenBy typed: Set<String> = []
     ) throws {
-        for (key, value) in extras {
+        for (key, value) in extras where !typed.contains(key) {
             try container.encode(value, forKey: HistoryDynamicKey(key))
         }
+    }
+
+    /// A tolerant optional SHA-256 proof: exactly 64 lowercase hex digits is typed; anything else
+    /// (absent, `null`, another type, malformed) is `nil` and, when present, stays an unknown member.
+    static func tolerantDigest(in container: KeyedDecodingContainer<HistoryDynamicKey>, key: String) -> String? {
+        guard let value = try? container.decodeIfPresent(AgentScheduledSendJSONValue.self, forKey: HistoryDynamicKey(key)),
+              case let .string(digest) = value,
+              AgentSessionProviderHistoryRecovery.isSHA256Hex(digest)
+        else { return nil }
+        return digest
     }
 }

@@ -2,7 +2,7 @@ import Foundation
 @testable import RepoPromptAgentCore
 import XCTest
 
-/// Lossless restart Phase 4 built-in Claude native-history subset (`nativeEntriesSubsetV1`) and the
+/// Lossless restart Phase 4 built-in Claude native-history subset (`nativeEntriesSubsetV2`) and the
 /// history-only import planner. Fixtures are in-memory JSONL mirroring the pinned primary-source
 /// constructors (`_make_transcript_entry` / `_parallel_tool_turn`, commit
 /// 3cb0c27eca8caccdc153471a1b19f97fce4ada03): `type`, `uuid`, `parentUuid`, `sessionId`, `message`,
@@ -118,15 +118,31 @@ final class ClaudeSessionHistoryReaderTests: XCTestCase {
         )
     }
 
-    private func cursor(file: AgentRecoveryHistoryFileIdentity?, offset: UInt64, importID: UUID = UUID()) -> AgentRecoveryHistoryCursor {
+    /// A cursor at `offset` with an explicit byte-prefix proof (`nil` = a legacy cursor).
+    private func cursor(
+        file: AgentRecoveryHistoryFileIdentity?,
+        offset: UInt64,
+        proof: String?,
+        importID: UUID = UUID()
+    ) -> AgentRecoveryHistoryCursor {
         AgentRecoveryHistoryCursor(
             providerRaw: Reader.providerRaw,
             conversationID: sessionID,
             importID: importID,
             file: file,
             completeLineOffset: offset,
+            prefixSHA256: proof,
             committedAt: AgentRecoveryTimestamp(Date(timeIntervalSince1970: 1000))
         )
+    }
+
+    /// A cursor just after exactly `prefix`, proven by its digest.
+    private func cursor(file: AgentRecoveryHistoryFileIdentity?, over prefix: Data) -> AgentRecoveryHistoryCursor {
+        cursor(file: file, offset: UInt64(prefix.count), proof: digest(prefix))
+    }
+
+    private func digest(_ data: Data) -> String {
+        AgentSessionProviderHistoryRecovery.sha256Hex(data)
     }
 
     private func candidate(_ result: Reader.Result, file: StaticString = #filePath, line: UInt = #line) -> Reader.Candidate? {
@@ -138,7 +154,7 @@ final class ClaudeSessionHistoryReaderTests: XCTestCase {
     }
 
     private var fromStart: Reader.Mode {
-        .importAfter(cursor(file: nil, offset: 0))
+        .importAfter(cursor(file: nil, over: Data()))
     }
 
     /// One parallel tool turn: two assistant tool-use entries sharing an API message ID (chained by
@@ -362,19 +378,20 @@ final class ClaudeSessionHistoryReaderTests: XCTestCase {
             user("u2", parent: "a1", "more"),
             assistantText("a2", parent: "u2", "after")
         ])
-        let value = try XCTUnwrap(candidate(read(full, mode: .importAfter(cursor(file: identityA, offset: UInt64(prefix.count))))))
+        let value = try XCTUnwrap(candidate(read(full, mode: .importAfter(cursor(file: identityA, over: prefix)))))
         XCTAssertFalse(value.isRescan)
         XCTAssertEqual(value.rows.map(\.nativeEntryID), ["u2", "a2"])
     }
 
-    func testReplacementRescansAndDeduplicatesThroughTheLedger() throws {
+    func testReplacementRescansOnlyWhenItsFencedPrefixVerifiesAndTruncationOrADifferentPrefixRefuses() throws {
         let entries = [
             user("u1", parent: nil, "hi"),
             assistantText("a1", parent: "u1", "before"),
             user("u2", parent: "a1", "more"),
             assistantText("a2", parent: "u2", "after")
         ]
-        let first = try XCTUnwrap(candidate(read(jsonl(Array(entries.prefix(2))), mode: fromStart)))
+        let firstBytes = jsonl(Array(entries.prefix(2)))
+        let first = try XCTUnwrap(candidate(read(firstBytes, mode: fromStart)))
         let observation = Reader.observation(first)
         let plan = AgentProviderHistoryImportPlanner.plan(
             observation: observation,
@@ -384,7 +401,10 @@ final class ClaudeSessionHistoryReaderTests: XCTestCase {
             importID: UUID(),
             now: Date(timeIntervalSince1970: 2000)
         )
-        // The file is replaced (new identity) with the same history plus a new turn.
+        XCTAssertEqual(plan.cursor.prefixSHA256, digest(firstBytes), "the cursor carries the proof of the bytes it was read from")
+        XCTAssertEqual(plan.importCommit.target, plan.cursor.prefixFence, "the receipt binds the same target")
+        // The file is replaced (new identity) with the same history plus a new turn: the fenced
+        // prefix verifies byte-for-byte, so the strict rescan resumes exactly at the offset.
         let rescanned = try XCTUnwrap(candidate(read(
             jsonl(entries),
             identity: identityB,
@@ -393,12 +413,26 @@ final class ClaudeSessionHistoryReaderTests: XCTestCase {
         )))
         XCTAssertTrue(rescanned.isRescan)
         XCTAssertEqual(rescanned.rows.map(\.nativeEntryID), ["u2", "a2"], "known rows are never duplicated")
-        // Truncation below the cursor also rescans.
-        let truncated = jsonl(Array(entries.prefix(1)))
+        // Truncation below the cursor refuses: no rewind, no ledger-based fallback.
+        for identity in [identityA, identityB] {
+            XCTAssertEqual(
+                read(jsonl(Array(entries.prefix(1))), identity: identity, mode: .importAfter(plan.cursor), ledger: plan.ledger),
+                .unsupported(.rewrittenHistory)
+            )
+        }
+        // A replacement (or same-inode rewrite) whose prefix differs refuses before any ledger use.
+        var rewritten = entries
+        rewritten[1] = assistantText("a1", parent: "u1", "BEFORE")
+        for identity in [identityA, identityB] {
+            XCTAssertEqual(
+                read(jsonl(rewritten), identity: identity, mode: .importAfter(plan.cursor), ledger: plan.ledger),
+                .unsupported(.rewrittenHistory)
+            )
+        }
+        // A legacy cursor without a proof is never trusted, even on the same file.
         XCTAssertEqual(
-            read(truncated, mode: .importAfter(cursor(file: identityA, offset: 10000)), ledger: nil),
-            .unavailable(.baselineLost),
-            "a rescan with no ledger-known entry cannot locate the previous import"
+            read(jsonl(entries), mode: .importAfter(cursor(file: identityA, offset: UInt64(firstBytes.count), proof: nil)), ledger: plan.ledger),
+            .unsupported(.prefixProofUnavailable)
         )
     }
 
@@ -484,5 +518,519 @@ final class ClaudeSessionHistoryReaderTests: XCTestCase {
         )
         XCTAssertTrue(plan.appendedItems.isEmpty)
         XCTAssertEqual(plan.ledger.nativeItems.compactMap(\.localItemID), [existing])
+    }
+
+    // MARK: Step 4d2 capture-qualified single-text projection (sanitized, hand-written O19 shape)
+
+    private static let contextSentinel = "SENTINEL-PRIVATE-CONTEXT-7f3a"
+    private static let requestSentinel = "SENTINEL-REQUEST-BLOB-91c2"
+    private let firstAttachmentTypes = ["environment", "model", "total_tokens_reminder", "budget_usd"]
+    private let secondAttachmentTypes = ["session_context", "date", "credential_org", "prompt_snapshot"]
+
+    /// A whitelisted nonrendering attachment whose payload is a private-context sentinel.
+    private func attachment(
+        _ uuid: String,
+        parent: String?,
+        type: String,
+        payload: String = ClaudeSessionHistoryReaderTests.contextSentinel,
+        extra: [String: Any] = [:]
+    ) -> [String: Any] {
+        var object: [String: Any] = [
+            "type": "attachment",
+            "uuid": uuid,
+            "parentUuid": parent ?? NSNull(),
+            "sessionId": sessionID,
+            "attachment": ["type": type, "content": payload, "context": ["blob": payload]],
+            "timestamp": "2026-10-23T00:00:00.000Z",
+            "cwd": "/fixture/project",
+            "version": "2.1.302",
+            "isSidechain": false
+        ]
+        for (key, value) in extra {
+            object[key] = value
+        }
+        return object
+    }
+
+    /// An operational record (no graph identity) whose payload is a request-blob sentinel.
+    private func operational(
+        _ type: String,
+        payload: String = ClaudeSessionHistoryReaderTests.requestSentinel,
+        extra: [String: Any] = [:]
+    ) -> [String: Any] {
+        var object: [String: Any] = [
+            "type": type,
+            "sessionId": sessionID,
+            "content": payload,
+            "messages": [["role": "system", "content": payload]]
+        ]
+        for (key, value) in extra {
+            object[key] = value
+        }
+        return object
+    }
+
+    /// One O19-shaped turn: queue records, the caller's user entry, a chain of 8 whitelisted
+    /// attachments interleaved with operational records, the one-text assistant reply, a trailing
+    /// attachment after it, `last-prompt` naming that attachment, and `cost-state` (no session ID).
+    private func o19Turn(
+        caller: String = "c1",
+        parent: String? = nil,
+        assistant: String = "a1",
+        prompt: String = "Reply with exactly: ALPHA-7",
+        reply: String = "ALPHA-7",
+        tag: String = "",
+        contextPayload: String = ClaudeSessionHistoryReaderTests.contextSentinel,
+        requestPayload: String = ClaudeSessionHistoryReaderTests.requestSentinel
+    ) -> [[String: Any]] {
+        var entries = [
+            operational("queue-operation", payload: requestPayload, extra: ["operation": "enqueue"]),
+            operational("queue-operation", payload: requestPayload, extra: ["operation": "dequeue"]),
+            entry("user", uuid: caller, parent: parent, content: prompt, extra: ["promptId": "p\(tag)", "promptSource": "sdk"])
+        ]
+        var previous = caller
+        for (index, type) in firstAttachmentTypes.enumerated() {
+            let id = "n\(tag)\(index + 1)"
+            entries.append(attachment(id, parent: previous, type: type, payload: contextPayload))
+            previous = id
+        }
+        entries.append(operational("atis-latch", payload: requestPayload))
+        for (index, type) in secondAttachmentTypes.enumerated() {
+            let id = "n\(tag)\(index + 5)"
+            entries.append(attachment(id, parent: previous, type: type, payload: contextPayload))
+            previous = id
+        }
+        entries += [
+            operational("api-request-shape", payload: requestPayload),
+            operational("api-request-blob", payload: requestPayload),
+            operational("api-request-blob", payload: requestPayload),
+            operational("api-request", payload: requestPayload, extra: ["id": "req-\(tag)"]),
+            entry(
+                "assistant",
+                uuid: assistant,
+                parent: previous,
+                content: [["type": "text", "text": reply]],
+                messageID: "msg-\(assistant)",
+                extra: ["requestId": "request-\(tag)"]
+            ),
+            attachment("t\(tag)", parent: assistant, type: "prompt_snapshot", payload: contextPayload),
+            operational("last-prompt", payload: requestPayload, extra: ["leafUuid": "t\(tag)", "lastPrompt": prompt])
+        ]
+        var cost = operational("cost-state", payload: requestPayload)
+        cost["sessionId"] = nil
+        entries.append(cost)
+        return entries
+    }
+
+    private func sha256(_ text: String) -> String {
+        AgentSessionProviderHistoryRecovery.sha256Hex(Data(text.utf8))
+    }
+
+    private func rowSummary(_ rows: [Reader.Row]) -> [String] {
+        rows.map { "\($0.nativeEntryID)|\($0.kind.rawValue)|\($0.ordinal)" }
+    }
+
+    func testCaptureQualifiedSingleTextTurnProjectsOnlyTheClaimedUserAndAssistantText() throws {
+        let fixture = o19Turn()
+        // The fixture covers every whitelisted attachment type and every operational type.
+        let attachmentTypes = Set(fixture.compactMap { ($0["attachment"] as? [String: Any])?["type"] as? String })
+        XCTAssertEqual(attachmentTypes, Reader.attachmentTypes)
+        XCTAssertEqual(Set(fixture.compactMap { $0["type"] as? String }).subtracting(["user", "assistant", "attachment"]), Reader.operationalTypes)
+
+        let data = jsonl(fixture)
+        let value = try XCTUnwrap(candidate(read(data, mode: fromStart)))
+        XCTAssertEqual(rowSummary(value.rows), ["c1|userText|0", "a1|assistantText|0"], "attachments and records never render")
+        XCTAssertNil(value.rows[0].localItemID, "the native user entry is never projected")
+        XCTAssertEqual(value.rows[1].text, "ALPHA-7")
+        XCTAssertNotNil(value.rows[1].localItemID)
+        for row in value.rows {
+            XCTAssertTrue(AgentSessionProviderHistoryRecovery.isSHA256Hex(row.envelopeDigest))
+        }
+        XCTAssertNotEqual(value.rows[0].envelopeDigest, value.rows[1].envelopeDigest)
+        XCTAssertEqual(value.userMessageEntries, [.init(nativeEntryID: "c1", textSHA256: sha256("Reply with exactly: ALPHA-7"))])
+        XCTAssertEqual(value.completion, .unconfirmed, "the trailing attachment and last-prompt prove nothing")
+        let observation = Reader.observation(value)
+        XCTAssertEqual(observation.rows.compactMap(\.item).map(\.text), ["ALPHA-7"])
+        XCTAssertEqual(observation.rows.map(\.envelopeDigest), value.rows.map { Optional($0.envelopeDigest) })
+        XCTAssertEqual(observation.nativeUserEntries, value.userMessageEntries)
+
+        // The same capture is a valid baseline (whole graph validated, no rows).
+        let baseline = try XCTUnwrap(candidate(read(data, mode: .baseline)))
+        XCTAssertEqual(baseline.completeLineOffset, UInt64(data.count))
+        XCTAssertTrue(baseline.rows.isEmpty)
+        XCTAssertTrue(baseline.userMessageEntries.isEmpty)
+    }
+
+    func testDirectChainProjectsInAncestorOrderWithOriginalIDsAndOrdinals() throws {
+        // Two turns: the second user entry continues through the first turn's trailing attachment
+        // (or, alternatively, from the assistant with that attachment as a side branch). File order
+        // writes each assistant before its own user entry and the turns in reverse.
+        let throughAttachment = o19Turn(tag: "x") + o19Turn(caller: "c2", parent: "tx", assistant: "a2", prompt: "Next", reply: "Done", tag: "y")
+        let sideBranch = o19Turn(tag: "x") + o19Turn(caller: "c2", parent: "a1", assistant: "a2", prompt: "Next", reply: "Done", tag: "y")
+        for (name, turns) in [("through", throughAttachment), ("side", sideBranch)] {
+            let graph = turns.filter { $0["uuid"] != nil }
+            let scrambled = Array(graph.reversed()) + turns.filter { $0["uuid"] == nil }
+            let value = try XCTUnwrap(candidate(read(jsonl(scrambled), mode: fromStart)), name)
+            XCTAssertEqual(
+                rowSummary(value.rows),
+                ["c1|userText|0", "a1|assistantText|0", "c2|userText|0", "a2|assistantText|0"],
+                "\(name): ancestor order, not file order"
+            )
+            XCTAssertEqual(value.userMessageEntries.map(\.nativeEntryID), ["c1", "c2"], name)
+        }
+        // A two-block assistant keeps its native ordinals and one shared envelope digest.
+        let twoBlocks = [
+            user("u1", parent: nil, "hi"),
+            entry("assistant", uuid: "a1", parent: "u1", content: [["type": "text", "text": "one"], ["type": "text", "text": "two"]], messageID: "m")
+        ]
+        let value = try XCTUnwrap(candidate(read(jsonl(twoBlocks), mode: fromStart)))
+        XCTAssertEqual(rowSummary(value.rows), ["u1|userText|0", "a1|assistantText|0", "a1|assistantText|1"])
+        XCTAssertEqual(value.rows[1].envelopeDigest, value.rows[2].envelopeDigest)
+    }
+
+    func testAttachmentAndRecordPayloadsNeverReachRowsDigestsOrRefusals() throws {
+        let plain = try XCTUnwrap(candidate(read(jsonl(o19Turn()), mode: fromStart)))
+        let other = try XCTUnwrap(candidate(read(
+            jsonl(o19Turn(contextPayload: "other context", requestPayload: "other request")),
+            mode: fromStart
+        )))
+        XCTAssertEqual(plain.rows, other.rows, "rows and digests are independent of nonrendering payloads")
+        XCTAssertEqual(plain.userMessageEntries, other.userMessageEntries)
+        let described = String(describing: plain)
+        XCTAssertFalse(described.contains(Self.contextSentinel))
+        XCTAssertFalse(described.contains(Self.requestSentinel))
+        // A refusal names no payload.
+        var unknown = o19Turn()
+        unknown[4] = attachment("n2", parent: "n1", type: "hook_additional_context")
+        let refusal = read(jsonl(unknown), mode: fromStart)
+        XCTAssertEqual(refusal, .unsupported(.attachment(line: 5)))
+        XCTAssertFalse(String(describing: refusal).contains(Self.contextSentinel))
+        XCTAssertFalse(String(describing: refusal).contains("hook_additional_context"))
+    }
+
+    func testUnknownMalformedOrIdentityBearingNonrenderingRecordsRefuseTheWholeCandidate() {
+        let root = user("u1", parent: nil, "hi")
+        func refusal(_ entries: [[String: Any]]) -> Reader.Result {
+            read(jsonl(entries), mode: fromStart)
+        }
+        XCTAssertEqual(refusal([root, attachment("n1", parent: "u1", type: "structured_output")]), .unsupported(.attachment(line: 2)))
+        XCTAssertEqual(refusal([root, attachment("n1", parent: "u1", type: "hook_success")]), .unsupported(.attachment(line: 2)))
+        XCTAssertEqual(refusal([root, entry("structured_output", uuid: "s1", parent: "u1", content: "x")]), .unsupported(.entryType("structured_output", line: 2)))
+        var noAttachment = attachment("n1", parent: "u1", type: "date")
+        noAttachment["attachment"] = nil
+        XCTAssertEqual(refusal([root, noAttachment]), .unsupported(.attachment(line: 2)))
+        var numericType = attachment("n1", parent: "u1", type: "date")
+        numericType["attachment"] = ["type": 7]
+        XCTAssertEqual(refusal([root, numericType]), .unsupported(.attachment(line: 2)))
+        XCTAssertEqual(
+            refusal([root, attachment("n1", parent: "u1", type: "date", extra: ["message": ["role": "user", "content": "x"]])]),
+            .unsupported(.attachment(line: 2)),
+            "an attachment carrying a message is not the observed shape"
+        )
+        XCTAssertEqual(
+            refusal([root, attachment("n1", parent: "u1", type: "date", extra: ["isSidechain": true])]),
+            .unsupported(.metadata("isSidechain", line: 2))
+        )
+        XCTAssertEqual(refusal([root, attachment("n1", parent: "u1", type: "date", extra: ["sessionId": "other"])]), .unsupported(.sessionMismatch(line: 2)))
+        XCTAssertEqual(refusal([root, attachment("n1", parent: "u1", type: "date", extra: ["uuid": 5])]), .unsupported(.malformedLine(line: 2)))
+        // Operational records never carry graph identity (a null key still counts).
+        XCTAssertEqual(refusal([operational("api-request", extra: ["uuid": "r1"]), root]), .unsupported(.operationalRecord("api-request", line: 1)))
+        XCTAssertEqual(refusal([operational("last-prompt", extra: ["parentUuid": NSNull()]), root]), .unsupported(.operationalRecord("last-prompt", line: 1)))
+        XCTAssertEqual(refusal([operational("cost-state", extra: ["sessionId": "other"]), root]), .unsupported(.sessionMismatch(line: 1)))
+        XCTAssertEqual(refusal([operational("queue-operation-v2"), root]), .unsupported(.entryType("queue-operation-v2", line: 1)))
+    }
+
+    func testAttachmentsKeepEveryGraphSafeguard() {
+        let root = user("u1", parent: nil, "hi")
+        func refusal(_ entries: [[String: Any]]) -> Reader.Result {
+            read(jsonl(entries), mode: fromStart)
+        }
+        XCTAssertEqual(refusal([root, attachment("n1", parent: "ghost", type: "date")]), .unsupported(.missingParent("n1")))
+        XCTAssertEqual(
+            refusal([root, attachment("n1", parent: "n2", type: "date"), attachment("n2", parent: "n1", type: "model")]),
+            .unsupported(.cycle)
+        )
+        XCTAssertEqual(
+            refusal([root, attachment("n1", parent: "u1", type: "date"), attachment("n1", parent: "u1", type: "model")]),
+            .unsupported(.conflictingDuplicate("n1"))
+        )
+        XCTAssertEqual(refusal([attachment("n0", parent: nil, type: "date"), root]), .unsupported(.multipleRoots))
+        // An attachment can't hide a second message branch.
+        let hidden = [
+            root,
+            assistantText("a1", parent: "u1", "x"),
+            attachment("n1", parent: "a1", type: "prompt_snapshot"),
+            user("u2", parent: "n1", "branch one"),
+            user("u3", parent: "a1", "branch two")
+        ]
+        XCTAssertEqual(refusal(hidden), .unsupported(.ambiguousBranch("a1")))
+        // Two attachment-only side branches are not continuations.
+        let sides = [
+            root,
+            attachment("n1", parent: "u1", type: "date"),
+            attachment("n2", parent: "u1", type: "model"),
+            assistantText("a1", parent: "u1", "x")
+        ]
+        XCTAssertEqual(rowSummary(candidate(refusal(sides))?.rows ?? []), ["u1|userText|0", "a1|assistantText|0"])
+        // A tool result still needs its call as its direct parent: an attachment in between refuses.
+        let interposed = [
+            user("u1", parent: nil, "go"),
+            toolUse("a1", parent: "u1", id: "toolu_1", name: "Read", messageID: "m"),
+            attachment("n1", parent: "a1", type: "date"),
+            toolResult("r1", parent: "n1", toolUseID: "toolu_1", text: "one", source: "a1")
+        ]
+        guard case .unsupported(.toolAssociation) = refusal(interposed) else {
+            return XCTFail("tool association is never relaxed by an interposed attachment")
+        }
+        // Review A R2: an attachment-only sibling never turns a sequential result (no explicit
+        // source) into a parallel fork; a genuine fork (two message-bearing children) still needs
+        // its result's explicit source, with or without that sibling.
+        let sequential = [
+            user("u1", parent: nil, "go"),
+            toolUse("a1", parent: "u1", id: "toolu_1", name: "Read", messageID: "m"),
+            attachment("n1", parent: "a1", type: "date"),
+            toolResult("r1", parent: "a1", toolUseID: "toolu_1", text: "one", source: nil),
+            assistantText("a2", parent: "r1", "done")
+        ]
+        XCTAssertEqual(
+            rowSummary(candidate(refusal(sequential))?.rows ?? []).map { $0.components(separatedBy: "|")[0] },
+            ["u1", "a1", "r1", "a2"]
+        )
+        let fork = [
+            user("u1", parent: nil, "go"),
+            toolUse("a1", parent: "u1", id: "toolu_1", name: "Read", messageID: "m"),
+            toolResult("r1", parent: "a1", toolUseID: "toolu_1", text: "one", source: nil),
+            assistantText("a2", parent: "a1", "continued")
+        ]
+        XCTAssertEqual(refusal(fork), .unsupported(.toolAssociation("forked tool result without source r1")))
+        XCTAssertEqual(
+            refusal(fork + [attachment("n1", parent: "a1", type: "date")]),
+            .unsupported(.toolAssociation("forked tool result without source r1"))
+        )
+    }
+
+    func testDocumentedRetractionThinkingAndCompactionMarkersRefuse() {
+        let root = user("u1", parent: nil, "hi")
+        func refusal(_ entries: [[String: Any]]) -> Reader.Result {
+            read(jsonl(entries), mode: fromStart)
+        }
+        let superseding = entry("assistant", uuid: "a1", parent: "u1", content: [["type": "text", "text": "x"]], extra: ["supersedes": ["a0"]])
+        XCTAssertEqual(refusal([root, superseding]), .unsupported(.semanticMarker("supersedes", line: 2)))
+        var aborted = assistantText("a1", parent: "u1", "x")
+        aborted["message"] = ["role": "assistant", "content": [["type": "text", "text": "x"]], "aborted": true]
+        XCTAssertEqual(refusal([root, aborted]), .unsupported(.semanticMarker("aborted", line: 2)))
+        let retraction = entry("user", uuid: "u2", parent: "u1", content: "y", extra: ["retracted_message_uuids": ["a0"]])
+        XCTAssertEqual(refusal([root, retraction]), .unsupported(.semanticMarker("retracted_message_uuids", line: 2)))
+        let notAborted = entry("assistant", uuid: "a1", parent: "u1", content: [["type": "text", "text": "x"]], extra: ["aborted": false])
+        XCTAssertNotNil(candidate(refusal([root, notAborted])), "an explicit false is not a marker")
+        let thinking = entry("assistant", uuid: "a1", parent: "u1", content: [["type": "thinking", "thinking": "hmm"]])
+        XCTAssertEqual(refusal([root, thinking]), .unsupported(.contentBlock("thinking", line: 2)))
+        let summary = entry("user", uuid: "u2", parent: "u1", content: "s", extra: ["isCompactSummary": true])
+        XCTAssertEqual(refusal([root, summary]), .unsupported(.metadata("isCompactSummary", line: 2)))
+        let boundary = entry("system", uuid: "s1", parent: "u1", content: "x", extra: ["subtype": "compact_boundary"])
+        XCTAssertEqual(refusal([root, boundary]), .unsupported(.entryType("system", line: 2)))
+    }
+
+    func testRefusalsBeforeTheCursorStillRejectWithAKnownLedger() throws {
+        let earlier = o19Turn(tag: "x")
+        let later = o19Turn(caller: "c2", parent: "tx", assistant: "a2", prompt: "Next", reply: "Done", tag: "y")
+        let full = try XCTUnwrap(candidate(read(jsonl(earlier + later), mode: fromStart)))
+        let plan = AgentProviderHistoryImportPlanner.plan(
+            observation: Reader.observation(full),
+            existingItemIDs: [],
+            ledger: nil,
+            previousCursor: nil,
+            importID: UUID(),
+            now: Date(timeIntervalSince1970: 5000)
+        )
+        // An unsupported record in the region the cursor and ledger would skip still refuses.
+        var poisoned = earlier
+        poisoned[3] = attachment("nx1", parent: "c1", type: "hook_success")
+        let prefix = jsonl(poisoned)
+        XCTAssertEqual(
+            read(jsonl(poisoned + later), mode: .importAfter(cursor(file: identityA, over: prefix)), ledger: plan.ledger),
+            .unsupported(.attachment(line: 4))
+        )
+    }
+
+    func testLedgerKnownEntriesMustMatchTheirCompleteEnvelopeBeforeSuppression() throws {
+        let fixture = o19Turn()
+        let first = try XCTUnwrap(candidate(read(jsonl(fixture), mode: fromStart)))
+        let plan = AgentProviderHistoryImportPlanner.plan(
+            observation: Reader.observation(first),
+            existingItemIDs: [],
+            ledger: nil,
+            previousCursor: nil,
+            importID: UUID(),
+            now: Date(timeIntervalSince1970: 6000)
+        )
+        XCTAssertEqual(
+            plan.ledger.nativeItems.map(\.envelopeDigest),
+            first.rows.map { Optional($0.envelopeDigest) },
+            "every row records its entry's proof"
+        )
+        let replay = try XCTUnwrap(candidate(read(jsonl(fixture), mode: fromStart, ledger: plan.ledger)))
+        XCTAssertTrue(replay.rows.isEmpty, "a fully proven known entry is suppressed")
+        XCTAssertEqual(replay.userMessageEntries.map(\.nativeEntryID), ["c1"], "known user entries are still reported for claim matching")
+
+        let changed = read(jsonl(o19Turn(reply: "ALPHA-8")), mode: fromStart, ledger: plan.ledger)
+        XCTAssertEqual(changed, .unsupported(.ledgerConflict("a1")), "a changed payload under a known ID")
+
+        func ledger(_ transform: ([AgentSessionProviderHistoryRecovery.NativeItem]) -> [AgentSessionProviderHistoryRecovery.NativeItem]) -> AgentSessionProviderHistoryRecovery {
+            AgentSessionProviderHistoryRecovery(nativeItems: transform(plan.ledger.nativeItems), lastImportCommit: plan.ledger.lastImportCommit)
+        }
+        func item(_ source: AgentSessionProviderHistoryRecovery.NativeItem, entryID: String? = nil, ordinal: Int? = nil, digest: String??) -> AgentSessionProviderHistoryRecovery.NativeItem {
+            .init(
+                providerRaw: source.providerRaw,
+                nativeSessionID: source.nativeSessionID,
+                nativeEntryID: entryID ?? source.nativeEntryID,
+                rowKindRaw: source.rowKindRaw,
+                ordinal: ordinal ?? source.ordinal,
+                localItemID: source.localItemID,
+                envelopeDigest: digest ?? source.envelopeDigest
+            )
+        }
+        let legacy = ledger { $0.map { item($0, digest: .some(nil)) } }
+        XCTAssertEqual(read(jsonl(fixture), mode: fromStart, ledger: legacy), .unsupported(.ledgerConflict("c1")), "missing legacy proof")
+        let superset = ledger { $0 + [item($0[1], ordinal: 1, digest: .none)] }
+        XCTAssertEqual(read(jsonl(fixture), mode: fromStart, ledger: superset), .unsupported(.ledgerConflict("a1")), "known keys beyond the entry")
+        let vanished = ledger { $0 + [item($0[1], entryID: "gone", digest: .none)] }
+        XCTAssertEqual(read(jsonl(fixture), mode: fromStart, ledger: vanished), .unsupported(.ledgerConflict("gone")), "a known entry no longer present")
+
+        // A partial keyset of a two-block entry refuses rather than importing the rest.
+        let twoBlocks = [
+            user("u1", parent: nil, "hi"),
+            entry("assistant", uuid: "a1", parent: "u1", content: [["type": "text", "text": "one"], ["type": "text", "text": "two"]], messageID: "m")
+        ]
+        let whole = try XCTUnwrap(candidate(read(jsonl(twoBlocks), mode: fromStart)))
+        let wholePlan = AgentProviderHistoryImportPlanner.plan(
+            observation: Reader.observation(whole),
+            existingItemIDs: [],
+            ledger: nil,
+            previousCursor: nil,
+            importID: UUID(),
+            now: Date(timeIntervalSince1970: 6100)
+        )
+        let partial = AgentSessionProviderHistoryRecovery(nativeItems: wholePlan.ledger.nativeItems.filter { !($0.nativeEntryID == "a1" && $0.ordinal == 1) })
+        XCTAssertEqual(read(jsonl(twoBlocks), mode: fromStart, ledger: partial), .unsupported(.ledgerConflict("a1")))
+    }
+
+    func testASameFileCursorMustStayOnARecordBoundaryAndNeverSplitTheGraph() {
+        let prefix = jsonl([user("u1", parent: nil, "hi")])
+        let full = jsonl([user("u1", parent: nil, "hi"), assistantText("a1", parent: "u1", "x")])
+        XCTAssertEqual(
+            read(full, mode: .importAfter(cursor(file: identityA, over: full.prefix(prefix.count - 1)))),
+            .unsupported(.rewrittenHistory),
+            "an in-place rewrite moved the boundary inside a record (even with a matching digest)"
+        )
+        // A rewrite that puts a child before the cursor and its parent after it.
+        let reordered = jsonl([assistantText("a1", parent: "u1", "x"), user("u1", parent: nil, "hi")])
+        let firstLine = jsonl([assistantText("a1", parent: "u1", "x")])
+        XCTAssertEqual(
+            read(reordered, mode: .importAfter(cursor(file: identityA, over: firstLine))),
+            .unsupported(.rewrittenHistory)
+        )
+        XCTAssertNotNil(candidate(read(full, mode: .importAfter(cursor(file: identityA, over: prefix)))))
+    }
+
+    // MARK: Step 4d2 byte-prefix fences
+
+    func testCandidatesCarryTheExactRawDigestOfTheirCompleteLinesOnly() throws {
+        let complete = jsonl([user("u1", parent: nil, "hi"), assistantText("a1", parent: "u1", "x")])
+        let baseline = try XCTUnwrap(candidate(read(complete, mode: .baseline)))
+        XCTAssertEqual(baseline.prefixSHA256, digest(complete))
+        var whitespace = complete
+        whitespace.append(Data(" \r".utf8))
+        XCTAssertEqual(try XCTUnwrap(candidate(read(whitespace, mode: .baseline))).prefixSHA256, digest(complete), "trailing whitespace is not hashed")
+        // An appended partial tail is excluded from both the offset and the proof.
+        var partial = complete
+        partial.append(Data(#"{"type":"assistant","uu"#.utf8))
+        let imported = try XCTUnwrap(candidate(read(partial, mode: fromStart)))
+        XCTAssertEqual(imported.completeLineOffset, UInt64(complete.count))
+        XCTAssertEqual(imported.prefixSHA256, digest(complete))
+        XCTAssertEqual(Reader.observation(imported).prefixSHA256, digest(complete))
+        // Original newlines, no normalization.
+        let text = try XCTUnwrap(String(data: complete, encoding: .utf8))
+        let crlf = Data(text.replacingOccurrences(of: "\n", with: "\r\n").utf8)
+        let crlfBaseline = try XCTUnwrap(candidate(read(crlf, mode: .baseline)))
+        XCTAssertEqual(crlfBaseline.prefixSHA256, digest(crlf))
+        XCTAssertNotEqual(crlfBaseline.prefixSHA256, digest(complete))
+        // Verified absence and an existing empty file both prove the empty prefix, never nil, and
+        // stay distinguishable by their file identity.
+        let absent = try XCTUnwrap(candidate(read(nil, mode: .baseline)))
+        let empty = try XCTUnwrap(candidate(read(Data(), mode: .baseline)))
+        XCTAssertEqual(absent.prefixSHA256, digest(Data()))
+        XCTAssertEqual(empty.prefixSHA256, digest(Data()))
+        XCTAssertNil(absent.file)
+        XCTAssertEqual(empty.file, identityA)
+        XCTAssertEqual(empty.completeLineOffset, 0)
+    }
+
+    func testASameLengthChangeBeforeTheBoundaryRefusesEvenInNonrenderingBytes() {
+        let earlier = o19Turn(tag: "x")
+        let later = o19Turn(caller: "c2", parent: "tx", assistant: "a2", prompt: "Next", reply: "Done", tag: "y")
+        let boundaryBytes = jsonl(earlier)
+        let boundary = cursor(file: identityA, over: boundaryBytes)
+        XCTAssertNotNil(candidate(read(jsonl(earlier + later), mode: .importAfter(boundary))))
+        // The same graph with one nonrendering payload changed at the same length: the semantic
+        // envelope can't see it, the byte fence does (same inode).
+        let contextChanged = o19Turn(tag: "x", contextPayload: "SENTINEL-PRIVATE-CONTEXT-7f3b")
+        let recordChanged = o19Turn(tag: "x", requestPayload: "SENTINEL-REQUEST-BLOB-91c3")
+        for changed in [contextChanged, recordChanged] {
+            XCTAssertEqual(jsonl(changed).count, boundaryBytes.count)
+            XCTAssertEqual(read(jsonl(changed + later), mode: .importAfter(boundary)), .unsupported(.rewrittenHistory))
+        }
+        // A malformed or missing proof fails closed.
+        for proof in [nil, "ABC", digest(boundaryBytes).uppercased()] {
+            XCTAssertEqual(
+                read(jsonl(earlier + later), mode: .importAfter(cursor(file: identityA, offset: UInt64(boundaryBytes.count), proof: proof))),
+                .unsupported(.prefixProofUnavailable)
+            )
+        }
+    }
+
+    func testEveryCallerFenceIsVerifiedOnTheSameBufferBesideTheBoundary() throws {
+        let earlier = o19Turn(tag: "x")
+        let later = o19Turn(caller: "c2", parent: "tx", assistant: "a2", prompt: "Next", reply: "Done", tag: "y")
+        let boundary = cursor(file: identityA, over: Data())
+        let target = AgentRecoveryHistoryPrefixFence(
+            file: identityA,
+            completeLineOffset: UInt64(jsonl(earlier).count),
+            prefixSHA256: digest(jsonl(earlier))
+        )
+        func read(_ entries: [[String: Any]], fences: [AgentRecoveryHistoryPrefixFence], mode: Reader.Mode? = nil) -> Reader.Result {
+            Reader.read(
+                nativeSessionID: sessionID,
+                projectsDirectories: [projects],
+                mode: mode ?? .importAfter(boundary),
+                ledger: nil,
+                fences: fences,
+                fileAccess: access([(fileURL(), identityA, jsonl(entries))])
+            )
+        }
+        XCTAssertNotNil(candidate(read(earlier + later, fences: [target])))
+        // A change AFTER the boundary but BEFORE a later fenced target refuses.
+        let changed = o19Turn(tag: "x", contextPayload: "SENTINEL-PRIVATE-CONTEXT-7f3b")
+        XCTAssertNotNil(candidate(read(changed + later, fences: [])), "the boundary alone can't see it")
+        XCTAssertEqual(read(changed + later, fences: [target]), .unsupported(.rewrittenHistory))
+        // A fence beyond the complete lines (truncation) or without a proof refuses.
+        XCTAssertEqual(read(Array(earlier.prefix(3)), fences: [target]), .unsupported(.rewrittenHistory))
+        let unproven = AgentRecoveryHistoryPrefixFence(file: identityA, completeLineOffset: 0, prefixSHA256: nil)
+        XCTAssertEqual(read(earlier + later, fences: [unproven]), .unsupported(.prefixProofUnavailable))
+        // A baseline verifies its fences too (and produces its own proof).
+        XCTAssertEqual(
+            try XCTUnwrap(candidate(read(earlier + later, fences: [target], mode: .baseline))).prefixSHA256,
+            digest(jsonl(earlier + later))
+        )
+        XCTAssertEqual(read(changed + later, fences: [target], mode: .baseline), .unsupported(.rewrittenHistory))
+        // Verified absence satisfies only an empty-prefix fence.
+        let absent = Reader.read(
+            nativeSessionID: sessionID, projectsDirectories: [projects], mode: .baseline, ledger: nil, fences: [target], fileAccess: access([])
+        )
+        XCTAssertEqual(absent, .unsupported(.rewrittenHistory))
+        let emptyFence = AgentRecoveryHistoryPrefixFence(file: nil, completeLineOffset: 0, prefixSHA256: digest(Data()))
+        XCTAssertNotNil(candidate(Reader.read(
+            nativeSessionID: sessionID, projectsDirectories: [projects], mode: .baseline, ledger: nil, fences: [emptyFence], fileAccess: access([])
+        )))
     }
 }

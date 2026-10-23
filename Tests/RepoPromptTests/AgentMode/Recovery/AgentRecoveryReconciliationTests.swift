@@ -263,6 +263,232 @@ final class AgentRecoveryReconciliationTests: XCTestCase {
         )
     }
 
+    /// Step 4d2: the native row's complete-envelope proof is an optional known member, omitted when
+    /// nil, typed only when valid, and compatible with older JSON and unknown members.
+    func testNativeItemEnvelopeDigestIsOptionalAndKeepsUnknownMembers() throws {
+        typealias NativeItem = AgentSessionProviderHistoryRecovery.NativeItem
+        let digest = AgentSessionProviderHistoryRecovery.sha256Hex(Data("abc".utf8))
+        XCTAssertEqual(digest, "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
+        let proven = NativeItem(
+            providerRaw: "claude",
+            nativeSessionID: "s",
+            nativeEntryID: "e",
+            rowKindRaw: "assistantText",
+            ordinal: 0,
+            localItemID: UUID(),
+            envelopeDigest: digest,
+            extras: ["future": .object(["v": .number(2)])]
+        )
+        let encoded = try JSONEncoder().encode(proven)
+        let encodedJSON = try JSONSerialization.jsonObject(with: encoded) as? [String: Any]
+        XCTAssertEqual(encodedJSON?["envelopeDigest"] as? String, digest)
+        XCTAssertEqual(try JSONDecoder().decode(NativeItem.self, from: encoded), proven)
+        let legacy = NativeItem(providerRaw: "claude", nativeSessionID: "s", nativeEntryID: "e", rowKindRaw: "userText", ordinal: 0, localItemID: nil)
+        let legacyJSON = try JSONSerialization.jsonObject(with: JSONEncoder().encode(legacy)) as? [String: Any]
+        XCTAssertNotNil(legacyJSON)
+        XCTAssertNil(legacyJSON?["envelopeDigest"], "omitted when nil")
+        let older = #"{"provider":"claude","nativeSessionID":"s","nativeEntryID":"e","rowKind":"assistantText","ordinal":0,"other":true}"#
+        let decodedOlder = try JSONDecoder().decode(NativeItem.self, from: Data(older.utf8))
+        XCTAssertNil(decodedOlder.envelopeDigest)
+        XCTAssertEqual(decodedOlder.extras["other"], .bool(true))
+    }
+
+    /// JSON fragments of malformed optional proofs (wrong case, length, alphabet, type, or null).
+    private static func malformedProofFragments(valid digest: String) -> [String] {
+        ["\"\(digest.uppercased())\"", "\"\(digest.dropLast())\"", "\"\(String(repeating: "g", count: 64))\"", "\"\"", "null", "5", "{\"x\":1}"]
+    }
+
+    private func jsonValue(_ fragment: String) throws -> AgentScheduledSendJSONValue {
+        try XCTUnwrap(JSONDecoder().decode([String: AgentScheduledSendJSONValue].self, from: Data(#"{"v":\#(fragment)}"#.utf8))["v"])
+    }
+
+    private func members(_ value: some Encodable) throws -> [String: AgentScheduledSendJSONValue] {
+        try JSONDecoder().decode([String: AgentScheduledSendJSONValue].self, from: JSONEncoder().encode(value))
+    }
+
+    /// Step 4d2 main decision 4: a malformed optional proof (envelope digest, baseline prefix,
+    /// receipt target) never fails the member, the ledger or the session. It is unusable (`nil`) and
+    /// its exact raw value stays an unknown member, re-encoded unchanged; a valid typed value
+    /// overwrites a preserved raw one, and `nil` never erases it. Claude qualification refuses it.
+    func testMalformedOptionalProofsLoadRoundTripVerbatimAndClaudeRefusesThem() throws {
+        typealias Recovery = AgentSessionProviderHistoryRecovery
+        let digest = Recovery.sha256Hex(Data("abc".utf8))
+        let item = #""provider":"claude","nativeSessionID":"s","nativeEntryID":"e","rowKind":"assistantText","ordinal":0"#
+        let baselineMembers = #""dispatchID":"\#(UUID().uuidString)","transcriptResetGeneration":0,"provider":"claude","conversationID":"c","completeLineOffset":0,"baselineCommitID":"\#(UUID().uuidString)","profile":"nativeEntriesSubsetV2","status":"captured","recordedAtMs":0"#
+        let receiptMembers = #""importID":"\#(UUID().uuidString)","provider":"claude","conversationID":"c","committedAt":0,"rowCount":0"#
+        let badTargets = Self.malformedProofFragments(valid: digest) + [
+            #"{"completeLineOffset":0,"prefixSHA256":"\#(digest.uppercased())"}"#,
+            #"{"prefixSHA256":"\#(digest)"}"#,
+            #"{"completeLineOffset":0,"prefixSHA256":"\#(digest)","future":1}"#,
+            #"{"fileDevice":1,"completeLineOffset":0,"prefixSHA256":"\#(digest)"}"#
+        ]
+        for fragment in Self.malformedProofFragments(valid: digest) {
+            let raw = try jsonValue(fragment)
+            let native = try JSONDecoder().decode(Recovery.NativeItem.self, from: Data("{\(item),\"envelopeDigest\":\(fragment)}".utf8))
+            XCTAssertNil(native.envelopeDigest, fragment)
+            XCTAssertEqual(native.extras["envelopeDigest"], raw, fragment)
+            XCTAssertEqual(try members(native)["envelopeDigest"], raw, "\(fragment) re-encodes unchanged")
+            let baseline = try JSONDecoder().decode(Recovery.DispatchBaseline.self, from: Data("{\(baselineMembers),\"prefixSHA256\":\(fragment)}".utf8))
+            XCTAssertNil(baseline.prefixSHA256, fragment)
+            XCTAssertEqual(try members(baseline)["prefixSHA256"], raw, fragment)
+            XCTAssertNil(baseline.cursor?.prefixSHA256, "a malformed proof is never a boundary proof")
+        }
+        for fragment in badTargets {
+            let receipt = try JSONDecoder().decode(Recovery.ImportCommit.self, from: Data("{\(receiptMembers),\"target\":\(fragment)}".utf8))
+            XCTAssertNil(receipt.target, fragment)
+            XCTAssertEqual(try members(receipt)["target"], try jsonValue(fragment), "\(fragment) re-encodes unchanged")
+        }
+        // Valid values are typed (absence and an existing file stay distinct) and overwrite raw extras.
+        let absentTarget = try JSONDecoder().decode(
+            Recovery.ImportCommit.self,
+            from: Data(#"{\#(receiptMembers),"target":{"completeLineOffset":0,"prefixSHA256":"\#(digest)"}}"#.utf8)
+        )
+        XCTAssertEqual(absentTarget.target, AgentRecoveryHistoryPrefixFence(file: nil, completeLineOffset: 0, prefixSHA256: digest))
+        // A non-power-of-two above 2^53 (not exactly representable as a Double) survives exactly
+        // (review B P3-03).
+        let largeInode: UInt64 = (1 << 60) + 3
+        let file = AgentRecoveryHistoryFileIdentity(device: 1, inode: largeInode, birthSeconds: 3, birthNanoseconds: nil)
+        let fileTarget = AgentRecoveryHistoryPrefixFence(file: file, completeLineOffset: 9, prefixSHA256: digest)
+        let typedReceipt = Recovery.ImportCommit(
+            importID: UUID(), providerRaw: "claude", conversationID: "c", committedAt: Date(timeIntervalSince1970: 0), rowCount: 0,
+            target: fileTarget, extras: ["target": .string("stale raw")]
+        )
+        let reloadedReceipt = try JSONDecoder().decode(Recovery.ImportCommit.self, from: JSONEncoder().encode(typedReceipt))
+        XCTAssertEqual(reloadedReceipt.target, fileTarget)
+        XCTAssertEqual(reloadedReceipt.target?.file?.inode, largeInode, "the large inode is exact")
+        XCTAssertTrue(reloadedReceipt.extras.isEmpty, "the typed target replaced the raw one")
+        let literalReceipt = try JSONDecoder().decode(
+            Recovery.ImportCommit.self,
+            from: Data(#"{\#(receiptMembers),"target":{"fileDevice":1,"fileInode":\#(largeInode),"fileBirthSeconds":3,"completeLineOffset":9,"prefixSHA256":"\#(digest)"}}"#.utf8)
+        )
+        XCTAssertEqual(literalReceipt.target?.file?.inode, largeInode, "a literal large inode decodes exactly")
+        let typedNative = Recovery.NativeItem(
+            providerRaw: "claude", nativeSessionID: "s", nativeEntryID: "e", rowKindRaw: "assistantText", ordinal: 0,
+            localItemID: nil, envelopeDigest: digest, extras: ["envelopeDigest": .number(5)]
+        )
+        XCTAssertEqual(try members(typedNative)["envelopeDigest"], .string(digest))
+
+        // The whole session loads and round-trips with every malformed proof preserved.
+        let ledgerJSON = #"{"nativeItems":[{\#(item),"envelopeDigest":"BAD"}],"lastImportCommit":{\#(receiptMembers),"target":{"completeLineOffset":"x"}},"dispatchBaselines":[{\#(baselineMembers),"prefixSHA256":7}]}"#
+        let ledger = try JSONDecoder().decode(Recovery.self, from: Data(ledgerJSON.utf8))
+        XCTAssertEqual(ledger.dispatchBaselines.count, 1, "a malformed proof never makes a baseline unreadable")
+        XCTAssertTrue(ledger.unreadableDispatchBaselines.isEmpty)
+        var session = AgentSession(id: UUID(), name: "Proofs")
+        session.providerHistoryRecovery = ledger
+        let encoded = try AgentSessionDataCodec.encodeSession(session)
+        let loaded = try AgentSessionDataCodec.decodeSession(from: encoded)
+        XCTAssertEqual(loaded.providerHistoryRecovery, ledger)
+        let reencoded = try AgentSessionDataCodec.decodeSession(from: AgentSessionDataCodec.encodeSession(loaded))
+        XCTAssertEqual(reencoded.providerHistoryRecovery?.nativeItems.first?.extras["envelopeDigest"], .string("BAD"))
+        XCTAssertEqual(reencoded.providerHistoryRecovery?.lastImportCommit?.extras["target"], .object(["completeLineOffset": .string("x")]))
+        XCTAssertEqual(reencoded.providerHistoryRecovery?.dispatchBaselines.first?.extras["prefixSHA256"], .number(7))
+
+        // Claude qualification refuses each one: a ledger row without a usable proof, a boundary
+        // without one, and a latest receipt without a usable target.
+        let conversation = "0f8d6a3e-6f0a-4c43-9d0e-2a1b3c4d5e6f"
+        let history = try [
+            historyEntry("user", uuid: "u1", parent: nil, text: "hi"),
+            historyEntry("assistant", uuid: "a1", parent: "u1", text: "x")
+        ].reduce(into: Data()) { data, object in
+            try data.append(JSONSerialization.data(withJSONObject: object, options: [.sortedKeys]))
+            data.append(0x0A)
+        }
+        let capture = ClaudeSessionHistoryReader.Capture(
+            identity: AgentRecoveryHistoryFileIdentity(device: 1, inode: 2, birthSeconds: nil, birthNanoseconds: nil),
+            bytes: history
+        )
+        func boundary(_ proof: String?) -> AgentRecoveryHistoryCursor {
+            AgentRecoveryHistoryCursor(
+                providerRaw: "claude", conversationID: conversation, importID: UUID(), file: nil, completeLineOffset: 0,
+                prefixSHA256: proof, committedAt: AgentRecoveryTimestamp(Date(timeIntervalSince1970: 0))
+            )
+        }
+        func decode(_ cursor: AgentRecoveryHistoryCursor, ledger: Recovery? = nil, fences: [AgentRecoveryHistoryPrefixFence] = []) -> ClaudeSessionHistoryReader.Result {
+            ClaudeSessionHistoryReader.decode(capture: capture, nativeSessionID: conversation, mode: .importAfter(cursor), ledger: ledger, fences: fences)
+        }
+        let empty = Recovery.sha256Hex(Data())
+        guard case let .candidate(first) = decode(boundary(empty)) else { return XCTFail("the proven boundary reads") }
+        let malformedRows = try JSONDecoder().decode(
+            [Recovery.NativeItem].self,
+            from: JSONEncoder().encode(first.rows.map { row in
+                Recovery.NativeItem(
+                    providerRaw: "claude", nativeSessionID: conversation, nativeEntryID: row.nativeEntryID, rowKindRaw: row.kind.rawValue,
+                    ordinal: row.ordinal, localItemID: row.localItemID, extras: ["envelopeDigest": .string(row.envelopeDigest.uppercased())]
+                )
+            })
+        )
+        XCTAssertEqual(decode(boundary(empty), ledger: Recovery(nativeItems: malformedRows)), .unsupported(.ledgerConflict("u1")))
+        XCTAssertEqual(decode(boundary(nil)), .unsupported(.prefixProofUnavailable))
+        let legacyReceipt = Recovery(lastImportCommit: .init(
+            importID: UUID(), providerRaw: "claude", conversationID: conversation, committedAt: Date(timeIntervalSince1970: 0), rowCount: 0
+        ))
+        let fences = AgentProviderHistoryAssociationPreflight.claudePrefixFences(window: [], ledger: legacyReceipt, conversationID: conversation)
+        XCTAssertEqual(decode(boundary(empty), fences: fences), .unsupported(.prefixProofUnavailable))
+    }
+
+    /// Step 4d2: the fences a Claude import verifies (the attempt's captured baselines plus the
+    /// latest saved Claude receipt of this conversation, proofless when legacy) and the one a new
+    /// baseline verifies (only a proven latest target).
+    func testClaudePrefixFencesCoverTheWindowAndTheLatestSavedTargetOnly() {
+        typealias Preflight = AgentProviderHistoryAssociationPreflight
+        let proof = AgentSessionProviderHistoryRecovery.sha256Hex(Data("p".utf8))
+        let first = baseline(prefixSHA256: proof)
+        let steering = baseline(prefixSHA256: nil)
+        let unsupported = baseline(conversationID: nil, status: .unsupported("no identity"))
+        let target = AgentRecoveryHistoryPrefixFence(file: nil, completeLineOffset: 3, prefixSHA256: proof)
+        func receipt(provider: String = "claude", conversation: String = "conv-1", target: AgentRecoveryHistoryPrefixFence?) -> AgentSessionProviderHistoryRecovery {
+            AgentSessionProviderHistoryRecovery(lastImportCommit: .init(
+                importID: UUID(), providerRaw: provider, conversationID: conversation, committedAt: Date(), rowCount: 1, target: target
+            ))
+        }
+        // A captured baseline of another conversation fences nothing here (review B P3-01): the
+        // preflight reports its target mismatch instead of a masked rewritten history.
+        let foreign = baseline(conversationID: "conv-other", prefixSHA256: proof)
+        XCTAssertNotNil(foreign.cursor?.prefixFence)
+        let window = [first, steering, unsupported, foreign]
+        XCTAssertEqual(
+            Preflight.claudePrefixFences(window: window, ledger: receipt(target: target), conversationID: "conv-1"),
+            [first.cursor?.prefixFence, steering.cursor?.prefixFence].compactMap(\.self) + [target],
+            "every captured baseline of this conversation (a legacy one stays proofless) plus the latest target"
+        )
+        let proofless = AgentRecoveryHistoryPrefixFence(file: nil, completeLineOffset: 0, prefixSHA256: nil)
+        XCTAssertEqual(Preflight.claudePrefixFences(window: [], ledger: receipt(target: nil), conversationID: "conv-1"), [proofless], "never backfilled")
+        XCTAssertEqual(Preflight.claudePrefixFences(window: [], ledger: receipt(conversation: "other", target: target), conversationID: "conv-1"), [])
+        XCTAssertEqual(Preflight.claudePrefixFences(window: [], ledger: receipt(provider: "codex", target: nil), conversationID: "conv-1"), [])
+        XCTAssertEqual(Preflight.claudeBaselineFences(ledger: receipt(target: target), conversationID: "conv-1"), [target])
+        XCTAssertEqual(Preflight.claudeBaselineFences(ledger: receipt(target: nil), conversationID: "conv-1"), [], "a fresh first baseline stays allowed")
+        XCTAssertEqual(Preflight.claudeBaselineFences(ledger: receipt(conversation: "other", target: target), conversationID: "conv-1"), [])
+        XCTAssertEqual(Preflight.claudeBaselineFences(ledger: nil, conversationID: "conv-1"), [])
+
+        func imported(_ ledger: AgentSessionProviderHistoryRecovery) -> AgentSessionProviderHistoryRecovery {
+            var ledger = ledger
+            ledger.nativeItems = [.init(
+                providerRaw: "claude", nativeSessionID: "conv-1", nativeEntryID: "a1", rowKindRaw: "assistantText", ordinal: 0,
+                localItemID: UUID(), envelopeDigest: proof
+            )]
+            return ledger
+        }
+        // Imported Claude history of this conversation whose last saved target is no longer
+        // available (absent, another provider or conversation, or no valid target) is a proofless
+        // fence for imports AND baselines, never a quiet omission.
+        let lost = [
+            ("no receipt", imported(AgentSessionProviderHistoryRecovery())),
+            ("codex receipt", imported(receipt(provider: "codex", target: nil))),
+            ("other conversation", imported(receipt(conversation: "other", target: target))),
+            ("no target", imported(receipt(target: nil)))
+        ]
+        for (name, ledger) in lost {
+            XCTAssertEqual(Preflight.claudePrefixFences(window: [], ledger: ledger, conversationID: "conv-1"), [proofless], name)
+            XCTAssertEqual(Preflight.claudeBaselineFences(ledger: ledger, conversationID: "conv-1"), [proofless], name)
+        }
+        XCTAssertEqual(Preflight.claudeBaselineFences(ledger: imported(receipt(target: target)), conversationID: "conv-1"), [target])
+        XCTAssertEqual(
+            Preflight.claudeBaselineFences(ledger: imported(AgentSessionProviderHistoryRecovery()), conversationID: "other"),
+            [],
+            "another conversation's imported rows never block this one"
+        )
+    }
+
     // MARK: Dispatch baselines (model)
 
     private func baseline(
@@ -271,7 +497,9 @@ final class AgentRecoveryReconciliationTests: XCTestCase {
         generation: UInt64 = 0,
         conversationID: String? = "conv-1",
         userItemIDs: [UUID] = [UUID()],
-        status: AgentSessionProviderHistoryRecovery.DispatchBaseline.Status = .captured
+        status: AgentSessionProviderHistoryRecovery.DispatchBaseline.Status = .captured,
+        outboundUserMessage: AgentSessionProviderHistoryRecovery.DispatchBaseline.OutboundUserMessage? = nil,
+        prefixSHA256: String? = nil
     ) -> AgentSessionProviderHistoryRecovery.DispatchBaseline {
         AgentSessionProviderHistoryRecovery.DispatchBaseline(
             dispatchID: dispatchID,
@@ -282,10 +510,12 @@ final class AgentRecoveryReconciliationTests: XCTestCase {
             userItemIDs: userItemIDs,
             file: status == .captured ? AgentRecoveryHistoryFileIdentity(device: 7, inode: 1 << 60, birthSeconds: 5, birthNanoseconds: 6) : nil,
             completeLineOffset: status == .captured ? 42 : 0,
+            prefixSHA256: prefixSHA256,
             baselineCommitID: status == .captured ? UUID() : nil,
             profileName: ClaudeSessionHistoryReader.profileName,
             status: status,
-            recordedAt: Date(timeIntervalSince1970: 1_700_000_000.5)
+            recordedAt: Date(timeIntervalSince1970: 1_700_000_000.5),
+            outboundUserMessage: outboundUserMessage
         )
     }
 
@@ -594,6 +824,221 @@ final class AgentRecoveryReconciliationTests: XCTestCase {
             .canonicalOutputAssociationUnavailable,
             "a dispatch inside a compacted turn has output that cannot be enumerated"
         )
+    }
+
+    /// Step 4d2: the attempt's outbound claims associate native user entries only on an exact match
+    /// (one entry per claim, its own UUID, dispatch order, equal text digest, nothing unclaimed, every
+    /// constituent in the transcript in order). A claim never proves a write.
+    func testOutboundClaimsAssociateOnlyAnExactNativeUserMatch() {
+        typealias Claim = AgentSessionProviderHistoryRecovery.DispatchBaseline.OutboundUserMessage
+        let runAttemptID = UUID()
+        let first = AgentChatItem.user("Do it")
+        let steer = AgentChatItem.user("Also this")
+        let firstDispatch = UUID()
+        let steerDispatch = UUID()
+        let firstBaseline = baseline(
+            dispatchID: firstDispatch, runAttemptID: runAttemptID, userItemIDs: [first.id],
+            outboundUserMessage: Claim(uuid: firstDispatch, providerBoundText: "Do it")
+        )
+        let steerBaseline = baseline(
+            dispatchID: steerDispatch, runAttemptID: runAttemptID, userItemIDs: [steer.id],
+            outboundUserMessage: Claim(uuid: steerDispatch, providerBoundText: "Also this")
+        )
+        func native(_ dispatchID: UUID, _ text: String?) -> AgentProviderHistoryNativeUserEntry {
+            .init(
+                nativeEntryID: dispatchID.uuidString.lowercased(),
+                textSHA256: text.map { AgentSessionProviderHistoryRecovery.sha256Hex(Data($0.utf8)) }
+            )
+        }
+        func claimed(_ entries: [AgentProviderHistoryNativeUserEntry]) -> AgentProviderHistoryObservation {
+            AgentProviderHistoryObservation(
+                provider: .claude,
+                conversationID: "conv-1",
+                rows: entries.map { nativeUserRow($0.nativeEntryID) } + [assistantRow("a1")],
+                file: nil,
+                completeLineOffset: 0,
+                completionConfirmed: false,
+                nativeUserEntries: entries
+            )
+        }
+        func check(
+            _ observation: AgentProviderHistoryObservation,
+            window: [AgentSessionProviderHistoryRecovery.DispatchBaseline]? = nil,
+            items: [AgentChatItem]? = nil
+        ) -> AgentProviderHistoryAssociationRefusal? {
+            let window = window ?? [firstBaseline, steerBaseline]
+            return AgentProviderHistoryAssociationPreflight.check(
+                observation: observation,
+                baseline: window.first,
+                hasUnreadableBaselines: false,
+                expectedRunAttemptID: runAttemptID,
+                transcriptResetGeneration: 0,
+                canonical: AgentProviderHistoryCanonicalView(transcript: .empty, suffixItems: items ?? [first, steer]),
+                ledger: nil,
+                dispatchWindow: window
+            )
+        }
+        let exact = [native(firstDispatch, "Do it"), native(steerDispatch, "Also this")]
+        XCTAssertNil(check(claimed(exact)))
+        let plan = AgentProviderHistoryImportPlanner.plan(
+            observation: claimed(exact),
+            existingItemIDs: [first.id, steer.id],
+            ledger: nil,
+            previousCursor: nil,
+            importID: UUID(),
+            now: Date(timeIntervalSince1970: 7000)
+        )
+        XCTAssertEqual(plan.appendedItems.map(\.kind), [.system, .assistant], "consumed claimed users are never re-created")
+        XCTAssertEqual(plan.ledger.nativeItems.filter { $0.rowKindRaw == "userText" }.map(\.localItemID), [nil, nil])
+
+        XCTAssertEqual(check(claimed([exact[0]])), .outboundClaimUnmatched, "a missing claimed steering entry")
+        XCTAssertEqual(check(claimed([native(firstDispatch, "Do it!"), exact[1]])), .outboundClaimUnmatched, "text digest mismatch")
+        XCTAssertEqual(check(claimed([native(firstDispatch, nil), exact[1]])), .outboundClaimUnmatched, "non-string native content")
+        XCTAssertEqual(check(claimed([exact[1], exact[0]])), .outboundClaimUnmatched, "reordered entries")
+        XCTAssertEqual(check(claimed(exact + [native(UUID(), "Extra")])), .outboundClaimUnmatched, "an unclaimed native user entry")
+        XCTAssertEqual(
+            check(claimed([exact[0], exact[0]]), window: [firstBaseline, firstBaseline]),
+            .outboundClaimUnmatched,
+            "ambiguous duplicate claims"
+        )
+        XCTAssertEqual(check(claimed(exact), items: [first]), .outboundClaimUnmatched, "a constituent missing from the transcript")
+        XCTAssertEqual(check(claimed(exact), items: [steer, first]), .outboundClaimUnmatched, "constituents out of order")
+        let legacySteer = baseline(dispatchID: steerDispatch, runAttemptID: runAttemptID, userItemIDs: [steer.id])
+        XCTAssertEqual(
+            check(claimed(exact), window: [firstBaseline, legacySteer]),
+            .nativeUserAssociationUnavailable,
+            "a dispatch without a claim leaves no claim association"
+        )
+        let foreign = baseline(
+            dispatchID: steerDispatch, runAttemptID: runAttemptID, conversationID: "conv-other", userItemIDs: [steer.id],
+            outboundUserMessage: Claim(uuid: steerDispatch, providerBoundText: "Also this")
+        )
+        XCTAssertEqual(check(claimed(exact), window: [firstBaseline, foreign]), .baselineTargetMismatch)
+        // A same-attempt steer recorded unsupported (e.g. read mid-write) has no usable claim: no
+        // claim association, never a false "doesn't belong" (review B P2-03).
+        let unsupportedSteer = baseline(
+            dispatchID: steerDispatch, runAttemptID: runAttemptID, userItemIDs: [steer.id],
+            status: .unsupported("Claude's history ends in an incomplete record")
+        )
+        XCTAssertEqual(
+            check(claimed(exact), window: [firstBaseline, unsupportedSteer]),
+            .nativeUserAssociationUnavailable,
+            "an unsupported same-attempt dispatch leaves no claim association"
+        )
+        XCTAssertEqual(
+            check(claimed(exact), items: [first, steer, .assistant("Done.")]),
+            .canonicalOutputAssociationUnavailable,
+            "saved live output under its own ID still refuses"
+        )
+        XCTAssertEqual(
+            preflight(claimed(exact), baseline: firstBaseline, runAttemptID: runAttemptID, items: [first, steer]),
+            .nativeUserAssociationUnavailable,
+            "callers without a dispatch window keep the ledger-only contract"
+        )
+    }
+
+    /// Review A R1: once a dispatch's first user item is passed, every later persisted turn's output
+    /// is canonical output to associate, whatever that turn's own request. Only the turn holding the
+    /// first user item filters output before it. The helper is shared with the Codex overlap check.
+    func testCanonicalOutputOfEveryLaterPersistedTurnIsChecked() {
+        typealias Claim = AgentSessionProviderHistoryRecovery.DispatchBaseline.OutboundUserMessage
+        let runAttemptID = UUID()
+        let older = AgentChatItem.user("Earlier")
+        var before = AgentChatItem.assistant("Before.")
+        before.sequenceIndex = 1
+        var first = AgentChatItem.user("Do it")
+        first.sequenceIndex = 2
+        let steer = AgentChatItem.user("Also this")
+        var live = AgentChatItem.assistant("Done.")
+        live.sequenceIndex = 4
+        let firstDispatch = UUID()
+        let steerDispatch = UUID()
+        let window = [
+            baseline(
+                dispatchID: firstDispatch, runAttemptID: runAttemptID, userItemIDs: [first.id],
+                outboundUserMessage: Claim(uuid: firstDispatch, providerBoundText: "Do it")
+            ),
+            baseline(
+                dispatchID: steerDispatch, runAttemptID: runAttemptID, userItemIDs: [steer.id],
+                outboundUserMessage: Claim(uuid: steerDispatch, providerBoundText: "Also this")
+            )
+        ]
+        let entries = [(firstDispatch, "Do it"), (steerDispatch, "Also this")].map { id, text in
+            AgentProviderHistoryNativeUserEntry(
+                nativeEntryID: id.uuidString.lowercased(),
+                textSHA256: AgentSessionProviderHistoryRecovery.sha256Hex(Data(text.utf8))
+            )
+        }
+        let claimed = AgentProviderHistoryObservation(
+            provider: .claude,
+            conversationID: "conv-1",
+            rows: entries.map { nativeUserRow($0.nativeEntryID) } + [assistantRow("a1")],
+            file: nil,
+            completeLineOffset: 0,
+            completionConfirmed: false,
+            nativeUserEntries: entries
+        )
+        func spans(_ items: [AgentChatItem]) -> [AgentTranscriptProviderResponseSpan] {
+            [AgentTranscriptProviderResponseSpan(startedAt: Date(timeIntervalSince1970: 0), activities: items.map { AgentTranscriptActivity(from: $0) })]
+        }
+        func canonical(secondTurn: [AgentChatItem]) -> AgentProviderHistoryCanonicalView {
+            // Turn 1 (request `older`): pre-dispatch output, then the dispatch's first user item.
+            // Turn 2 (request: the claimed steer): `secondTurn` output.
+            AgentProviderHistoryCanonicalView(
+                transcript: AgentTranscript(turns: [
+                    AgentTranscriptTurn(
+                        request: AgentTranscriptRequestAnchor(from: older),
+                        responseSpans: spans([before, first]),
+                        startedAt: Date(timeIntervalSince1970: 0)
+                    ),
+                    AgentTranscriptTurn(
+                        request: AgentTranscriptRequestAnchor(from: steer),
+                        responseSpans: spans(secondTurn),
+                        startedAt: Date(timeIntervalSince1970: 1)
+                    )
+                ]),
+                suffixItems: []
+            )
+        }
+        func check(_ canonical: AgentProviderHistoryCanonicalView) -> AgentProviderHistoryAssociationRefusal? {
+            AgentProviderHistoryAssociationPreflight.check(
+                observation: claimed,
+                baseline: window[0],
+                hasUnreadableBaselines: false,
+                expectedRunAttemptID: runAttemptID,
+                transcriptResetGeneration: 0,
+                canonical: canonical,
+                ledger: nil,
+                dispatchWindow: window
+            )
+        }
+        XCTAssertNil(check(canonical(secondTurn: [])), "first-turn output before the dispatch's user item is excluded")
+        XCTAssertEqual(
+            check(canonical(secondTurn: [live])),
+            .canonicalOutputAssociationUnavailable,
+            "unassociated live output in a later persisted turn refuses"
+        )
+        XCTAssertEqual(
+            AgentProviderHistoryAssociationPreflight.outputItemIDs(after: [first.id], in: canonical(secondTurn: [live])),
+            .enumerated([live.id])
+        )
+
+        // Codex (same helper): live output in a later persisted turn overlaps; output before the
+        // interrupted turn's user item in its own turn does not.
+        let codexRow = AgentProviderHistoryRow(
+            nativeSessionID: "thread-1", nativeEntryID: "item-1", rowKindRaw: "agentMessage", ordinal: 0,
+            item: AgentChatItem.assistant("Codex reply")
+        )
+        let codex = AgentProviderHistoryObservation(
+            provider: .codex, conversationID: "thread-1", rows: [codexRow], file: nil, completeLineOffset: 0, completionConfirmed: false
+        )
+        func codexOverlap(_ canonical: AgentProviderHistoryCanonicalView) -> AgentProviderHistoryAssociationRefusal? {
+            AgentProviderHistoryAssociationPreflight.codexOverlapRefusal(
+                observation: codex, turnUserItemIDs: [first.id], canonical: canonical, ledger: nil
+            )
+        }
+        XCTAssertNil(codexOverlap(canonical(secondTurn: [])))
+        XCTAssertEqual(codexOverlap(canonical(secondTurn: [live])), .canonicalOutputAssociationUnavailable)
     }
 
     // MARK: Baseline producer and reconcile refusal (view model, real persistence)
@@ -1116,6 +1561,565 @@ final class AgentRecoveryReconciliationTests: XCTestCase {
         )
         XCTAssertEqual(unavailable, .associationUnavailable(.baselineUnavailable, AgentModeViewModel.recoveryAssociationText(.baselineUnavailable)))
         XCTAssertEqual(harness.viewModel.test_recoveryClaudeHistoryAccessCount, accessCount)
+    }
+
+    // MARK: Step 4d2 capture-qualified import (view model, real persistence and reader)
+
+    private static let historySentinel = "SENTINEL-PRIVATE-CONTEXT-4d2"
+
+    /// A sanitized, hand-written O19-shaped native turn (no raw capture contents): queue records,
+    /// the caller's user entry, eight whitelisted attachments with `atis-latch` between them, the
+    /// request records, the one-text reply, a trailing attachment, `last-prompt` and `cost-state`.
+    /// Every nonrendering payload is a private sentinel.
+    private func o19History(caller: String, parent: String?, assistant: String, prompt: String, reply: String, tag: String) -> [[String: Any]] {
+        func attachment(_ uuid: String, parent: String, type: String) -> [String: Any] {
+            [
+                "type": "attachment",
+                "uuid": uuid,
+                "parentUuid": parent,
+                "sessionId": conversationID,
+                "isSidechain": false,
+                "attachment": ["type": type, "content": Self.historySentinel]
+            ]
+        }
+        func record(_ type: String, _ extra: [String: Any] = [:]) -> [String: Any] {
+            var object: [String: Any] = ["type": type, "sessionId": conversationID, "content": Self.historySentinel]
+            for (key, value) in extra {
+                object[key] = value
+            }
+            return object
+        }
+        var entries = [
+            record("queue-operation", ["operation": "enqueue"]),
+            record("queue-operation", ["operation": "dequeue"]),
+            historyEntry("user", uuid: caller, parent: parent, text: prompt)
+        ]
+        var previous = caller
+        let types = ["environment", "model", "total_tokens_reminder", "budget_usd", "session_context", "date", "credential_org", "prompt_snapshot"]
+        for (index, type) in types.enumerated() {
+            if index == 4 { entries.append(record("atis-latch")) }
+            let id = "\(tag)-n\(index + 1)"
+            entries.append(attachment(id, parent: previous, type: type))
+            previous = id
+        }
+        entries += [
+            record("api-request-shape"),
+            record("api-request-blob"),
+            record("api-request-blob"),
+            record("api-request"),
+            historyEntry("assistant", uuid: assistant, parent: previous, text: reply),
+            attachment("\(tag)-t", parent: assistant, type: "prompt_snapshot"),
+            record("last-prompt", ["leafUuid": "\(tag)-t"]),
+            record("cost-state")
+        ]
+        return entries
+    }
+
+    /// Admits one claimed dispatch through the real host producer (a newly captured baseline).
+    private func admitClaimedDispatch(
+        _ harness: ProducerHarness,
+        runAttemptID: UUID,
+        text: String
+    ) async throws -> (AgentChatItem, AgentDispatchBaselineIdentity) {
+        let userItem = AgentChatItem.user(text)
+        harness.session.appendItem(userItem)
+        let identity = AgentDispatchBaselineIdentity(
+            dispatchID: UUID(),
+            runAttemptID: runAttemptID,
+            userItemIDs: [userItem.id],
+            hasCompleteUserItems: true
+        )
+        let admitted = await harness.viewModel.admitClaudeDispatchBaseline(
+            identity,
+            outboundUserMessage: .init(uuid: identity.dispatchID, providerBoundText: text),
+            session: harness.session
+        )
+        XCTAssertEqual(admitted, .admitted(outboundUserMessageUUID: identity.dispatchID))
+        return (userItem, identity)
+    }
+
+    /// Real import composition (test-only qualified runner, real session persistence, recovery store,
+    /// reader and planner; no process): a claimed baseline with no live output imports the reply once,
+    /// committing rows + ledger + receipt in the session save before the cursor; a repeat, and a replay
+    /// after a lost cursor commit, are no-ops; a changed payload, a ledger keyset beyond the entry, or
+    /// a ledger without envelope proofs refuses with no state change.
+    func testClaimedBaselineImportsTheCaptureQualifiedReplyOnceAndRefusesUnprovenLedgers() async throws {
+        let harness = try await makeProducerHarness(windowID: 4990)
+        let prompt = "Reply with exactly: ALPHA-7"
+        let (userItem, identity) = try await admitClaimedDispatch(harness, runAttemptID: UUID(), text: prompt)
+        let baseline = try XCTUnwrap(harness.session.providerHistoryRecovery?.dispatchBaseline(dispatchID: identity.dispatchID))
+        XCTAssertNil(baseline.file, "verified absence before the first turn")
+        let caller = identity.dispatchID.uuidString.lowercased()
+        try harness.appendHistory(o19History(caller: caller, parent: nil, assistant: "a1", prompt: prompt, reply: "ALPHA-7", tag: "t1"))
+        let action = reconcileAction(harness, runAttemptID: identity.runAttemptID)
+        func reconcile() async -> AgentRecoveryReconcileResult {
+            await harness.viewModel.reconcileRecoveryHistory(action, session: harness.session, lane: harness.lane, codexTurnID: nil)
+        }
+        let itemsBefore = harness.session.items.map(\.id)
+
+        let imported = await reconcile()
+        XCTAssertEqual(imported, .imported(completion: .unconfirmed, rowCount: 2))
+        let appended = Array(harness.session.items.dropFirst(itemsBefore.count))
+        XCTAssertEqual(appended.map(\.kind), [.system, .assistant])
+        XCTAssertEqual(appended.first?.text, AgentProviderHistoryImportPlanner.recoveredLabel)
+        XCTAssertEqual(appended.last?.text, "ALPHA-7")
+        XCTAssertEqual(harness.session.items.count { $0.id == userItem.id }, 1, "the claimed user is consumed, not re-created")
+        let ledger = try XCTUnwrap(harness.session.providerHistoryRecovery)
+        XCTAssertEqual(ledger.nativeItems.map(\.nativeEntryID), [caller, "a1"])
+        XCTAssertEqual(ledger.nativeItems.map(\.localItemID), [nil, appended.last?.id])
+        XCTAssertTrue(ledger.nativeItems.allSatisfy { $0.envelopeDigest.map(AgentSessionProviderHistoryRecovery.isSHA256Hex) == true })
+        let receipt = try XCTUnwrap(ledger.lastImportCommit)
+        XCTAssertEqual(receipt.rowCount, 2)
+        let persisted = try await harness.persisted()
+        XCTAssertEqual(persisted?.providerHistoryRecovery, ledger, "rows, ledger and receipt committed in the session save")
+        XCTAssertTrue(Set(appended.map(\.id)).isSubset(of: Set(persisted?.items.map(\.id) ?? [])), "the imported rows are in the same save")
+        let importedCursor = await harness.cursor()
+        XCTAssertEqual(importedCursor?.importID, receipt.importID, "the cursor followed the committed receipt")
+        let sessionID = try XCTUnwrap(harness.session.activeAgentSessionID)
+        let files = try await harness.service.listAgentSessions(for: harness.workspace)
+        let sessionFile = try XCTUnwrap(files.first { $0.lastPathComponent == "AgentSession-\(sessionID.uuidString).json" })
+        XCTAssertNil(try Data(contentsOf: sessionFile).range(of: Data(Self.historySentinel.utf8)), "no nonrendering payload persisted")
+
+        func assertUnchanged(
+            items: [UUID],
+            ledger expectedLedger: AgentSessionProviderHistoryRecovery?,
+            cursor expectedCursor: AgentRecoveryHistoryCursor?,
+            _ message: String,
+            line: UInt = #line
+        ) async {
+            XCTAssertEqual(harness.session.items.map(\.id), items, message, line: line)
+            XCTAssertEqual(harness.session.providerHistoryRecovery, expectedLedger, message, line: line)
+            let cursor = await harness.cursor()
+            XCTAssertEqual(cursor, expectedCursor, message, line: line)
+        }
+        let importedItems = harness.session.items.map(\.id)
+        let noNewHistory = AgentRecoveryReconcileResult.nothingImported("The provider has no new history for this conversation.")
+        let repeated = await reconcile()
+        XCTAssertEqual(repeated, noNewHistory)
+        await assertUnchanged(items: importedItems, ledger: ledger, cursor: importedCursor, "a second reconcile is a no-op")
+
+        // Crash after the durable session save, before the cursor CAS: the replay is a no-op.
+        let boundary = try XCTUnwrap(baseline.cursor)
+        _ = await harness.lane.commitHistoryCursor(expectedPreviousImportID: receipt.importID, cursor: boundary)
+        let replay = await reconcile()
+        XCTAssertEqual(replay, noNewHistory)
+        await assertUnchanged(items: importedItems, ledger: ledger, cursor: boundary, "a replay after a lost cursor commit")
+
+        // A changed payload under the known IDs refuses.
+        let original = try Data(contentsOf: harness.historyFile)
+        try FileManager.default.removeItem(at: harness.historyFile)
+        try harness.appendHistory(o19History(caller: caller, parent: nil, assistant: "a1", prompt: prompt, reply: "ALPHA-8", tag: "t1"))
+        let changed = await reconcile()
+        XCTAssertEqual(changed, .blocked(AgentModeViewModel.recoveryHistoryChangedText))
+        await assertUnchanged(items: importedItems, ledger: ledger, cursor: boundary, "changed text")
+        try original.write(to: harness.historyFile)
+
+        func mutatedLedger(
+            _ transform: (AgentSessionProviderHistoryRecovery.NativeItem) -> [AgentSessionProviderHistoryRecovery.NativeItem]
+        ) -> AgentSessionProviderHistoryRecovery {
+            AgentSessionProviderHistoryRecovery(
+                nativeItems: ledger.nativeItems.flatMap(transform),
+                lastImportCommit: ledger.lastImportCommit,
+                dispatchBaselines: ledger.dispatchBaselines,
+                extras: ledger.extras
+            )
+        }
+        // A known keyset beyond the observed entry, or rows without envelope proof, refuse.
+        let partial = mutatedLedger { item in
+            guard item.nativeEntryID == "a1" else { return [item] }
+            return [item, .init(
+                providerRaw: item.providerRaw,
+                nativeSessionID: item.nativeSessionID,
+                nativeEntryID: item.nativeEntryID,
+                rowKindRaw: item.rowKindRaw,
+                ordinal: 1,
+                localItemID: nil,
+                envelopeDigest: item.envelopeDigest
+            )]
+        }
+        let unproven = mutatedLedger { item in
+            [.init(
+                providerRaw: item.providerRaw,
+                nativeSessionID: item.nativeSessionID,
+                nativeEntryID: item.nativeEntryID,
+                rowKindRaw: item.rowKindRaw,
+                ordinal: item.ordinal,
+                localItemID: item.localItemID
+            )]
+        }
+        for (name, mutated) in [("keyset beyond the entry", partial), ("missing envelope proof", unproven)] {
+            harness.session.providerHistoryRecovery = mutated
+            let refused = await reconcile()
+            XCTAssertEqual(refused, .blocked(AgentModeViewModel.recoveryHistoryChangedText), name)
+            await assertUnchanged(items: importedItems, ledger: mutated, cursor: boundary, name)
+            harness.session.providerHistoryRecovery = ledger
+        }
+    }
+
+    /// A steering dispatch of the same attempt whose claimed native user entry never appeared
+    /// refuses the whole import with no state change (never read as non-delivery, never resent).
+    func testAMissingClaimedSteeringEntryRefusesWithoutChangingAnything() async throws {
+        let harness = try await makeProducerHarness(windowID: 4991)
+        let runAttemptID = UUID()
+        let (_, first) = try await admitClaimedDispatch(harness, runAttemptID: runAttemptID, text: "Do it")
+        try harness.appendHistory(o19History(
+            caller: first.dispatchID.uuidString.lowercased(),
+            parent: nil,
+            assistant: "a1",
+            prompt: "Do it",
+            reply: "Done.",
+            tag: "t1"
+        ))
+        _ = try await admitClaimedDispatch(harness, runAttemptID: runAttemptID, text: "Also this")
+        XCTAssertEqual(harness.session.providerHistoryRecovery?.dispatchBaselines.count { $0.runAttemptID == runAttemptID }, 2)
+        let itemsBefore = harness.session.items.map(\.id)
+        let ledgerBefore = harness.session.providerHistoryRecovery
+        let cursorBefore = await harness.cursor()
+        let result = await harness.viewModel.reconcileRecoveryHistory(
+            reconcileAction(harness, runAttemptID: runAttemptID),
+            session: harness.session,
+            lane: harness.lane,
+            codexTurnID: nil
+        )
+        XCTAssertEqual(
+            result,
+            .associationUnavailable(.outboundClaimUnmatched, AgentModeViewModel.recoveryAssociationText(.outboundClaimUnmatched))
+        )
+        XCTAssertEqual(harness.session.items.map(\.id), itemsBefore)
+        XCTAssertEqual(harness.session.providerHistoryRecovery, ledgerBefore)
+        let cursorAfter = await harness.cursor()
+        XCTAssertEqual(cursorAfter, cursorBefore)
+    }
+
+    /// Review A R1, real composition: the initial dispatch and its claimed steer sit in two persisted
+    /// turns, and both claims match Claude's history exactly. Live output saved under its own ID in
+    /// the SECOND turn is still unassociated canonical output, so the import refuses with no item,
+    /// ledger or cursor change (it was skipped before, letting native output be appended twice).
+    func testUnassociatedLiveOutputInALaterPersistedTurnRefusesWithoutChangingAnything() async throws {
+        let harness = try await makeProducerHarness(windowID: 4994)
+        let runAttemptID = UUID()
+        let (first, firstIdentity) = try await admitClaimedDispatch(harness, runAttemptID: runAttemptID, text: "Do it")
+        try harness.appendHistory(o19History(
+            caller: firstIdentity.dispatchID.uuidString.lowercased(),
+            parent: nil,
+            assistant: "a1",
+            prompt: "Do it",
+            reply: "Done.",
+            tag: "t1"
+        ))
+        let (steer, steerIdentity) = try await admitClaimedDispatch(harness, runAttemptID: runAttemptID, text: "Also this")
+        try harness.appendHistory(o19History(
+            caller: steerIdentity.dispatchID.uuidString.lowercased(),
+            parent: "t1-t",
+            assistant: "a2",
+            prompt: "Also this",
+            reply: "Also done.",
+            tag: "t2"
+        ))
+        let live = AgentChatItem.assistant("Also done.")
+        harness.session.transcript = AgentTranscript(turns: [
+            AgentTranscriptTurn(request: AgentTranscriptRequestAnchor(from: first), startedAt: Date(timeIntervalSince1970: 0)),
+            AgentTranscriptTurn(
+                request: AgentTranscriptRequestAnchor(from: steer),
+                responseSpans: [AgentTranscriptProviderResponseSpan(
+                    startedAt: Date(timeIntervalSince1970: 1),
+                    activities: [AgentTranscriptActivity(from: live)]
+                )],
+                startedAt: Date(timeIntervalSince1970: 1)
+            )
+        ])
+        let itemsBefore = harness.session.items.map(\.id)
+        let ledgerBefore = harness.session.providerHistoryRecovery
+        let cursorBefore = await harness.cursor()
+        let result = await harness.viewModel.reconcileRecoveryHistory(
+            reconcileAction(harness, runAttemptID: runAttemptID),
+            session: harness.session,
+            lane: harness.lane,
+            codexTurnID: nil
+        )
+        XCTAssertEqual(
+            result,
+            .associationUnavailable(
+                .canonicalOutputAssociationUnavailable,
+                AgentModeViewModel.recoveryAssociationText(.canonicalOutputAssociationUnavailable)
+            )
+        )
+        XCTAssertEqual(harness.session.items.map(\.id), itemsBefore)
+        XCTAssertEqual(harness.session.providerHistoryRecovery, ledgerBefore)
+        let cursorAfter = await harness.cursor()
+        XCTAssertEqual(cursorAfter, cursorBefore)
+
+        // Positive control: the same two turns without that live output import both replies.
+        harness.session.transcript = AgentTranscript(turns: [
+            AgentTranscriptTurn(request: AgentTranscriptRequestAnchor(from: first), startedAt: Date(timeIntervalSince1970: 0)),
+            AgentTranscriptTurn(request: AgentTranscriptRequestAnchor(from: steer), startedAt: Date(timeIntervalSince1970: 1))
+        ])
+        let imported = await harness.viewModel.reconcileRecoveryHistory(
+            reconcileAction(harness, runAttemptID: runAttemptID),
+            session: harness.session,
+            lane: harness.lane,
+            codexTurnID: nil
+        )
+        guard case .imported = imported else { return XCTFail("expected an import, got \(imported)") }
+        XCTAssertEqual(
+            harness.session.items.dropFirst(itemsBefore.count).filter { $0.kind == .assistant }.map(\.text),
+            ["Done.", "Also done."]
+        )
+    }
+
+    /// Step 4d2 prefix fences, real composition (no process): the import receipt durably binds its
+    /// exact target in the session save, so after a crash between that save and the cursor CAS the
+    /// record cursor is older but the saved target still fences the next import. A same-length
+    /// rewrite after the OLD cursor and before the saved target (in nonrendering bytes no envelope
+    /// proof covers) refuses; a normal replay is a no-op; append-only growth imports under a new
+    /// receipt after verifying the previous target; a legacy proof fails closed. No refusal changes
+    /// anything, and no nonrendering payload is persisted (only digests).
+    func testTheLatestSavedTargetFencesTheImportAfterALostCursorCommit() async throws {
+        let harness = try await makeProducerHarness(windowID: 4992)
+        let prompt = "Reply with exactly: ALPHA-7"
+        let (_, identity) = try await admitClaimedDispatch(harness, runAttemptID: UUID(), text: prompt)
+        let baseline = try XCTUnwrap(harness.session.providerHistoryRecovery?.dispatchBaseline(dispatchID: identity.dispatchID))
+        let emptyProof = AgentSessionProviderHistoryRecovery.sha256Hex(Data())
+        XCTAssertNil(baseline.file)
+        XCTAssertEqual(baseline.prefixSHA256, emptyProof, "verified absence proves the empty prefix, never nil")
+        XCTAssertEqual(baseline.profileName, "nativeEntriesSubsetV2")
+        let boundary = try XCTUnwrap(baseline.cursor)
+        XCTAssertEqual(harness.session.providerHistoryRecovery?.lastImportCommit?.target, boundary.prefixFence, "the zero-row receipt binds its baseline")
+        let seededCursor = await harness.cursor()
+        XCTAssertEqual(seededCursor, boundary)
+        let caller = identity.dispatchID.uuidString.lowercased()
+        try harness.appendHistory(o19History(caller: caller, parent: nil, assistant: "a1", prompt: prompt, reply: "ALPHA-7", tag: "t1"))
+        let action = reconcileAction(harness, runAttemptID: identity.runAttemptID)
+        func reconcile() async -> AgentRecoveryReconcileResult {
+            await harness.viewModel.reconcileRecoveryHistory(action, session: harness.session, lane: harness.lane, codexTurnID: nil)
+        }
+        let imported = await reconcile()
+        XCTAssertEqual(imported, .imported(completion: .unconfirmed, rowCount: 2))
+        let firstBytes = try Data(contentsOf: harness.historyFile)
+        let ledger = try XCTUnwrap(harness.session.providerHistoryRecovery)
+        let receipt = try XCTUnwrap(ledger.lastImportCommit)
+        XCTAssertEqual(receipt.target?.completeLineOffset, UInt64(firstBytes.count))
+        XCTAssertEqual(receipt.target?.prefixSHA256, AgentSessionProviderHistoryRecovery.sha256Hex(firstBytes))
+        XCTAssertNotNil(receipt.target?.file)
+        let importedCursor = await harness.cursor()
+        XCTAssertEqual(importedCursor?.prefixFence, receipt.target, "the cursor carries the same target")
+        let persistedAfterImport = try await harness.persisted()
+        XCTAssertEqual(persistedAfterImport?.providerHistoryRecovery?.lastImportCommit, receipt, "the target is durable with the rows")
+
+        func assertUnchanged(
+            items: [UUID],
+            ledger expectedLedger: AgentSessionProviderHistoryRecovery?,
+            cursor expectedCursor: AgentRecoveryHistoryCursor?,
+            _ message: String,
+            line: UInt = #line
+        ) async {
+            XCTAssertEqual(harness.session.items.map(\.id), items, message, line: line)
+            XCTAssertEqual(harness.session.providerHistoryRecovery, expectedLedger, message, line: line)
+            let cursor = await harness.cursor()
+            XCTAssertEqual(cursor, expectedCursor, message, line: line)
+        }
+        // Crash after the durable session save, before the cursor CAS: the record cursor is the OLD one.
+        _ = await harness.lane.commitHistoryCursor(expectedPreviousImportID: receipt.importID, cursor: boundary)
+        let items = harness.session.items.map(\.id)
+        let replay = await reconcile()
+        XCTAssertEqual(replay, .nothingImported("The provider has no new history for this conversation."))
+        await assertUnchanged(items: items, ledger: ledger, cursor: boundary, "a normal replay is a no-op")
+
+        // CRITICAL: a same-length rewrite after the old cursor but before the saved target, in an
+        // attachment payload that no envelope proof covers.
+        let sentinel = try XCTUnwrap(firstBytes.range(of: Data(Self.historySentinel.utf8)))
+        XCTAssertGreaterThan(sentinel.lowerBound, Int(boundary.completeLineOffset))
+        var rewritten = firstBytes
+        rewritten.replaceSubrange(sentinel, with: Data("SENTINEL-PRIVATE-CONTEXT-4d3".utf8))
+        XCTAssertEqual(rewritten.count, firstBytes.count)
+        try rewritten.write(to: harness.historyFile)
+        let refused = await reconcile()
+        XCTAssertEqual(refused, .blocked(AgentModeViewModel.recoveryHistoryChangedText))
+        await assertUnchanged(items: items, ledger: ledger, cursor: boundary, "rewrite before the saved target")
+        // Truncated below the saved target refuses too (no rewind to the old cursor).
+        try firstBytes.prefix(firstBytes.count / 2).write(to: harness.historyFile)
+        let truncated = await reconcile()
+        XCTAssertEqual(truncated, .blocked(AgentModeViewModel.recoveryHistoryChangedText))
+        await assertUnchanged(items: items, ledger: ledger, cursor: boundary, "truncated below the saved target")
+
+        // Legacy proofs fail closed: a latest receipt without a target, a boundary without a proof.
+        try firstBytes.write(to: harness.historyFile)
+        let legacyReceipt = AgentSessionProviderHistoryRecovery(
+            nativeItems: ledger.nativeItems,
+            lastImportCommit: .init(
+                importID: receipt.importID,
+                providerRaw: receipt.providerRaw,
+                conversationID: receipt.conversationID,
+                committedAt: receipt.committedAt,
+                rowCount: receipt.rowCount
+            ),
+            dispatchBaselines: ledger.dispatchBaselines
+        )
+        let legacyBaseline = AgentSessionProviderHistoryRecovery(
+            nativeItems: ledger.nativeItems,
+            lastImportCommit: receipt,
+            dispatchBaselines: ledger.dispatchBaselines.map { recorded in
+                .init(
+                    dispatchID: recorded.dispatchID,
+                    runAttemptID: recorded.runAttemptID,
+                    transcriptResetGeneration: recorded.transcriptResetGeneration,
+                    providerRaw: recorded.providerRaw,
+                    conversationID: recorded.conversationID,
+                    userItemIDs: recorded.userItemIDs,
+                    file: recorded.file,
+                    completeLineOffset: recorded.completeLineOffset,
+                    baselineCommitID: recorded.baselineCommitID,
+                    profileName: "nativeEntriesSubsetV1",
+                    status: recorded.status,
+                    recordedAt: recorded.recordedAt,
+                    outboundUserMessage: recorded.outboundUserMessage
+                )
+            }
+        )
+        for (name, legacy) in [("legacy receipt", legacyReceipt), ("legacy baseline", legacyBaseline)] {
+            harness.session.providerHistoryRecovery = legacy
+            let unproven = await reconcile()
+            XCTAssertEqual(unproven, .blocked(AgentModeViewModel.recoveryHistoryUnprovenText), name)
+            await assertUnchanged(items: items, ledger: legacy, cursor: boundary, name)
+            harness.session.providerHistoryRecovery = ledger
+        }
+
+        // Append-only growth (the reply continues after the trailing attachment) imports under a new
+        // receipt after the previous saved target verified; its partial tail waits.
+        try harness.appendHistory([historyEntry("assistant", uuid: "a2", parent: "t1-t", text: "BETA-3")])
+        let grownComplete = try Data(contentsOf: harness.historyFile)
+        var withTail = grownComplete
+        withTail.append(Data(#"{"type":"assistant","uuid":"a3""#.utf8))
+        try withTail.write(to: harness.historyFile)
+        let grown = await reconcile()
+        XCTAssertEqual(grown, .imported(completion: .unconfirmed, rowCount: 2))
+        XCTAssertEqual(harness.session.items.last?.text, "BETA-3")
+        let grownReceipt = try XCTUnwrap(harness.session.providerHistoryRecovery?.lastImportCommit)
+        XCTAssertNotEqual(grownReceipt.importID, receipt.importID, "a durable import ID never gets a new target")
+        XCTAssertEqual(grownReceipt.target?.completeLineOffset, UInt64(grownComplete.count), "the partial tail is excluded")
+        XCTAssertEqual(grownReceipt.target?.prefixSHA256, AgentSessionProviderHistoryRecovery.sha256Hex(grownComplete))
+        let grownCursor = await harness.cursor()
+        XCTAssertEqual(grownCursor?.importID, grownReceipt.importID)
+        XCTAssertEqual(grownCursor?.prefixFence, grownReceipt.target)
+
+        let sessionID = try XCTUnwrap(harness.session.activeAgentSessionID)
+        let files = try await harness.service.listAgentSessions(for: harness.workspace)
+        let sessionFile = try XCTUnwrap(files.first { $0.lastPathComponent == "AgentSession-\(sessionID.uuidString).json" })
+        let sessionBytes = try Data(contentsOf: sessionFile)
+        XCTAssertNil(sessionBytes.range(of: Data(Self.historySentinel.utf8)), "no nonrendering payload persisted")
+        XCTAssertNil(sessionBytes.range(of: Data("SENTINEL".utf8)), "nor any rewritten one")
+    }
+
+    /// Step 4d2 conservative multi-conversation limit and the record cursor's own proof (real
+    /// composition, no process). Once Claude rows of a conversation were imported, its last saved
+    /// target must still be the latest receipt: if another provider's or conversation's receipt (or
+    /// none) replaced it, a returning import refuses and a new baseline is recorded unsupported
+    /// without a claim (never a fresh proof over the lost target). The persisted record cursor is an
+    /// extra fence: a changed or missing proof refuses even when the baseline and the latest receipt
+    /// verify; a different file identity with the same prefix is accepted as before.
+    func testALostSavedTargetAndTheRecordCursorProofFailClosed() async throws {
+        let harness = try await makeProducerHarness(windowID: 4993)
+        let prompt = "Reply with exactly: ALPHA-7"
+        let (_, identity) = try await admitClaimedDispatch(harness, runAttemptID: UUID(), text: prompt)
+        try harness.appendHistory(o19History(
+            caller: identity.dispatchID.uuidString.lowercased(),
+            parent: nil,
+            assistant: "a1",
+            prompt: prompt,
+            reply: "ALPHA-7",
+            tag: "t1"
+        ))
+        let action = reconcileAction(harness, runAttemptID: identity.runAttemptID)
+        func reconcile() async -> AgentRecoveryReconcileResult {
+            await harness.viewModel.reconcileRecoveryHistory(action, session: harness.session, lane: harness.lane, codexTurnID: nil)
+        }
+        let imported = await reconcile()
+        XCTAssertEqual(imported, .imported(completion: .unconfirmed, rowCount: 2))
+        let ledger = try XCTUnwrap(harness.session.providerHistoryRecovery)
+        let items = harness.session.items.map(\.id)
+        let noNewHistory = AgentRecoveryReconcileResult.nothingImported("The provider has no new history for this conversation.")
+
+        // The record cursor's own proof is verified (the attempt baseline stays the boundary).
+        let importedCursor = await harness.cursor()
+        var current = try XCTUnwrap(importedCursor)
+        func replaceCursor(file: AgentRecoveryHistoryFileIdentity?, proof: String?) async throws -> AgentRecoveryHistoryCursor {
+            let next = AgentRecoveryHistoryCursor(
+                providerRaw: current.providerRaw,
+                conversationID: current.conversationID,
+                importID: UUID(),
+                file: file,
+                completeLineOffset: current.completeLineOffset,
+                prefixSHA256: proof,
+                committedAt: current.committedAt
+            )
+            _ = try await harness.lane.commitHistoryCursor(expectedPreviousImportID: current.importID, cursor: next).get()
+            current = next
+            return next
+        }
+        let wrongProof = try await replaceCursor(file: current.file, proof: AgentSessionProviderHistoryRecovery.sha256Hex(Data("other".utf8)))
+        let changed = await reconcile()
+        XCTAssertEqual(changed, .blocked(AgentModeViewModel.recoveryHistoryChangedText), "a changed record-cursor proof refuses")
+        XCTAssertEqual(harness.session.items.map(\.id), items)
+        XCTAssertEqual(harness.session.providerHistoryRecovery, ledger)
+        let afterChanged = await harness.cursor()
+        XCTAssertEqual(afterChanged, wrongProof)
+        let noProof = try await replaceCursor(file: current.file, proof: nil)
+        let unproven = await reconcile()
+        XCTAssertEqual(unproven, .blocked(AgentModeViewModel.recoveryHistoryUnprovenText), "a missing record-cursor proof refuses")
+        let afterUnproven = await harness.cursor()
+        XCTAssertEqual(afterUnproven, noProof)
+        let target = try XCTUnwrap(ledger.lastImportCommit?.target)
+        _ = try await replaceCursor(
+            file: AgentRecoveryHistoryFileIdentity(device: 9, inode: 9, birthSeconds: nil, birthNanoseconds: nil),
+            proof: target.prefixSHA256
+        )
+        let otherIdentity = await reconcile()
+        XCTAssertEqual(otherIdentity, noNewHistory, "a different identity with the same verified prefix is unchanged")
+
+        func receipt(provider: String, conversation: String) -> AgentSessionProviderHistoryRecovery.ImportCommit {
+            .init(importID: UUID(), providerRaw: provider, conversationID: conversation, committedAt: Date(), rowCount: 0)
+        }
+        // Imported A, then the latest receipt became Codex's, another conversation's, or none.
+        let superseded: [(String, AgentSessionProviderHistoryRecovery.ImportCommit?)] = [
+            ("codex receipt", receipt(provider: "codex", conversation: "thread-b")),
+            ("other conversation", receipt(provider: "claude", conversation: "11111111-2222-4333-8444-555555555555")),
+            ("no receipt", nil)
+        ]
+        for (name, latest) in superseded {
+            var lostTarget = ledger
+            lostTarget.lastImportCommit = latest
+            harness.session.providerHistoryRecovery = lostTarget
+            let returning = await reconcile()
+            XCTAssertEqual(returning, .blocked(AgentModeViewModel.recoveryHistoryUnprovenText), name)
+            XCTAssertEqual(harness.session.items.map(\.id), items, name)
+            XCTAssertEqual(harness.session.providerHistoryRecovery, lostTarget, name)
+        }
+
+        // A new A baseline can't renew qualification over the lost target: recorded unsupported, no
+        // claim UUID, no fresh proof, and the ordinary send proceeds.
+        var lostTarget = ledger
+        lostTarget.lastImportCommit = receipt(provider: "codex", conversation: "thread-b")
+        harness.session.providerHistoryRecovery = lostTarget
+        let userItem = AgentChatItem.user("Again")
+        harness.session.appendItem(userItem)
+        let renewal = AgentDispatchBaselineIdentity(
+            dispatchID: UUID(),
+            runAttemptID: UUID(),
+            userItemIDs: [userItem.id],
+            hasCompleteUserItems: true
+        )
+        let admitted = await harness.viewModel.admitClaudeDispatchBaseline(
+            renewal,
+            outboundUserMessage: .init(uuid: renewal.dispatchID, providerBoundText: "Again"),
+            session: harness.session
+        )
+        XCTAssertEqual(admitted, .admittedWithoutIdentity)
+        let recorded = try XCTUnwrap(harness.session.providerHistoryRecovery?.dispatchBaseline(dispatchID: renewal.dispatchID))
+        guard case .unsupported = recorded.status else { return XCTFail("expected an unsupported baseline") }
+        XCTAssertNil(recorded.outboundUserMessage)
+        XCTAssertNil(recorded.prefixSHA256)
+        XCTAssertEqual(harness.session.providerHistoryRecovery?.lastImportCommit, lostTarget.lastImportCommit, "no fresh proof minted")
+        XCTAssertEqual(harness.session.providerHistoryRecovery?.nativeItems, ledger.nativeItems, "rows and raw data kept")
     }
 
     @MainActor
