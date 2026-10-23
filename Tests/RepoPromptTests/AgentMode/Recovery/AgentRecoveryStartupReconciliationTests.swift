@@ -1663,6 +1663,131 @@ final class AgentRecoveryStartupReconciliationTests: XCTestCase {
         }
     }
 
+    // MARK: - Edit proposals (Step 5a)
+
+    /// A reviewed `apply_edits` proposal committed before its review was shown (then a crash) is
+    /// discovered exactly after a restart, with the session closed: historical only, never applied.
+    /// The store joins only an exact repeat; unknown proposal members survive later writes; an
+    /// unknown state and a duplicate review ID are unreadable.
+    func testEditProposalCommittedBeforeReviewIsDiscoveredExactlyAfterRestart() async throws {
+        let earlier = launch()
+        let home = try makeWorkspace("home")
+        let session = try await makeSession(earlier, in: home)
+        let generation = try earlier.service.recoveryLifecycleGate(for: session.persistenceState).binding.transcriptResetGeneration
+        let reviewID = UUID()
+        let original = "let a = 1\n"
+        let proposal = AgentRecoveryEditProposal(
+            reviewID: reviewID,
+            runAttemptID: nil,
+            transcriptResetGeneration: generation,
+            appInstanceID: earlier.store.appInstanceID,
+            proposedAt: AgentRecoveryTimestamp(millisecondsSince1970: 1000),
+            physicalPath: "/tmp/project/Sources/A.swift",
+            displayPath: "Sources/A.swift",
+            unifiedDiff: "@@ -1 +1 @@\n-let a = 1\n+let a = 2\n",
+            proposedText: "let a = 2\n",
+            base: .preview(originalText: original)
+        )
+        XCTAssertEqual(proposal.base.domain, AgentRecoveryEditProposalBase.decodedTextDomain)
+        XCTAssertEqual(proposal.base.matches(decodedText: original), true)
+        XCTAssertEqual(proposal.base.matches(decodedText: "let a = 2\n"), false)
+
+        try await transact(earlier, session) { store, binding in
+            let first = try await store.commitEditProposal(binding: binding, proposal: proposal)
+            XCTAssertEqual(first.disposition, .committed)
+            let repeated = try await store.commitEditProposal(binding: binding, proposal: proposal)
+            XCTAssertEqual(repeated.disposition, .unchanged, "The same review's own proposal is joined")
+            let conflicting = AgentRecoveryEditProposal(
+                reviewID: reviewID,
+                runAttemptID: nil,
+                transcriptResetGeneration: binding.transcriptResetGeneration,
+                appInstanceID: proposal.appInstanceID,
+                proposedAt: proposal.proposedAt,
+                physicalPath: proposal.physicalPath,
+                displayPath: proposal.displayPath,
+                unifiedDiff: proposal.unifiedDiff,
+                proposedText: "let a = 3\n",
+                base: proposal.base
+            )
+            do {
+                _ = try await store.commitEditProposal(binding: binding, proposal: conflicting)
+                XCTFail("Another proposal for the same review conflicts")
+            } catch let AgentRecoveryStoreError.editProposalConflict(conflictID) {
+                XCTAssertEqual(conflictID, reviewID)
+            }
+        }
+        let committed = await earlier.store.read(sessionID: session.session.id).record?.editProposals
+        XCTAssertEqual(committed, [proposal])
+
+        // Crash before the review was answered; the next launch discovers the exact proposal.
+        let next = launch()
+        let coordinator = try await startedCoordinator(next, workspaces: [home])
+        let item = try XCTUnwrap(coordinator.catalog.items.first { $0.kind == .pendingEditReview })
+        XCTAssertEqual(item.id, AgentRecoveryCatalogProjection.editProposalItemID(sessionID: session.session.id, reviewID: reviewID))
+        XCTAssertEqual(item.sessionID, session.session.id)
+        XCTAssertNil(item.acknowledgement, "A proposal is never merely dismissed")
+        guard case let .editProposal(discovered, isCurrentLaunch) = item.payload else {
+            return XCTFail("The item carries the stored proposal")
+        }
+        XCTAssertEqual(discovered, proposal, "Exact proposed text, diff, paths, owner, and base evidence")
+        XCTAssertFalse(isCurrentLaunch)
+        XCTAssertEqual(discovered.state, .pending)
+
+        // Unknown proposal and base members survive an unrelated write by a later launch.
+        let fileURL = next.store.recordFileURL(sessionID: session.session.id)
+        var object = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: fileURL)) as? [String: Any])
+        var proposals = try XCTUnwrap(object["editProposals"] as? [[String: Any]])
+        proposals[0]["futureProposalMember"] = "kept"
+        var base = try XCTUnwrap(proposals[0]["base"] as? [String: Any])
+        base["futureBaseMember"] = 7
+        proposals[0]["base"] = base
+        object["editProposals"] = proposals
+        object["futureRecordMember"] = ["nested": true]
+        try JSONSerialization.data(withJSONObject: object).write(to: fileURL)
+        let later = launch()
+        let laterCoordinator = try await startedCoordinator(later, workspaces: [home])
+        let binding = try XCTUnwrap(laterCoordinator.reconciliation.resolution(for: session.session.id)?.binding)
+        _ = try await later.store.updateQuestionSnapshots(
+            binding: binding,
+            expectedRevision: later.store.currentRevision(sessionID: session.session.id),
+            update: .init(upserting: [AgentRecoveryQuestionSnapshot(
+                interactionID: UUID(),
+                kind: .askUser,
+                runAttemptID: nil,
+                transcriptResetGeneration: binding.transcriptResetGeneration,
+                appInstanceID: later.store.appInstanceID,
+                askedAt: AgentRecoveryTimestamp(millisecondsSince1970: 5000),
+                title: "Unrelated",
+                message: nil,
+                items: [],
+                extras: [:]
+            )])
+        )
+        let rewritten = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: fileURL)) as? [String: Any])
+        let kept = try XCTUnwrap(rewritten["editProposals"] as? [[String: Any]])
+        XCTAssertEqual(kept.count, 1)
+        XCTAssertEqual(kept.first?["futureProposalMember"] as? String, "kept")
+        XCTAssertEqual((kept.first?["base"] as? [String: Any])?["futureBaseMember"] as? Int, 7)
+        XCTAssertEqual(kept.first?["proposedText"] as? String, "let a = 2\n")
+        XCTAssertNotNil(rewritten["futureRecordMember"], "Unrelated record fields survive")
+
+        // An unknown state and a duplicate review ID are never adopted.
+        var unknownState = rewritten
+        var unknownProposals = kept
+        unknownProposals[0]["state"] = "appliedByFutureBuild"
+        unknownState["editProposals"] = unknownProposals
+        let unknownStateData = try JSONSerialization.data(withJSONObject: unknownState)
+        guard case .failure = AgentRecoveryRecordCodec.decode(unknownStateData, expectedSessionID: session.session.id) else {
+            return XCTFail("An unknown proposal state is unreadable")
+        }
+        var duplicated = rewritten
+        duplicated["editProposals"] = kept + kept
+        let duplicatedData = try JSONSerialization.data(withJSONObject: duplicated)
+        guard case .failure = AgentRecoveryRecordCodec.decode(duplicatedData, expectedSessionID: session.session.id) else {
+            return XCTFail("A duplicate edit proposal is unreadable")
+        }
+    }
+
     // MARK: - Fixtures
 
     private func launch() -> Launch {

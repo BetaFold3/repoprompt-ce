@@ -72,6 +72,11 @@ enum AgentRecoveryRecordCodec {
                     path: "record.delegatedChildLinks",
                     element: delegatedChildLink
                 ),
+                editProposals: optionalArray(
+                    reader.optional("editProposals"),
+                    path: "record.editProposals",
+                    element: editProposal
+                ),
                 extras: reader.extras
             )
             try validateInvariants(record)
@@ -128,6 +133,10 @@ enum AgentRecoveryRecordCodec {
         // Step 5b: absent when empty (older records keep their bytes).
         if !record.delegatedChildLinks.isEmpty {
             object["delegatedChildLinks"] = .array(record.delegatedChildLinks.map(delegatedChildLinkJSON))
+        }
+        // Step 5a: absent when empty (older records keep their bytes).
+        if !record.editProposals.isEmpty {
+            object["editProposals"] = .array(record.editProposals.map(editProposalJSON))
         }
         return .object(object)
     }
@@ -324,6 +333,73 @@ enum AgentRecoveryRecordCodec {
         object["parentRunAttemptID"] = .string(link.parentRunAttemptID.uuidString)
         object["childSessionID"] = .string(link.childSessionID.uuidString)
         object["linkedAt"] = timestampJSON(link.linkedAt)
+        return .object(object)
+    }
+
+    // MARK: Edit proposals (Step 5a)
+
+    private static func editProposal(_ json: AgentRecoveryJSONValue, path: String) throws -> AgentRecoveryEditProposal {
+        var reader = try Reader(json, path: path)
+        let stateRaw = try reader.string("state")
+        // An unknown state (a newer build's) is never guessed at: the record is unreadable.
+        guard let state = AgentRecoveryEditProposalState(rawValue: stateRaw) else {
+            throw AgentRecoveryDecodingError(reason: .unknownVariant("\(path).state \(stateRaw)"))
+        }
+        let applicationStartedAt = try reader.optional("applicationStartedAt").map {
+            try timestamp($0, path: "\(path).applicationStartedAt")
+        }
+        guard (state == .applicationStarted) == (applicationStartedAt != nil) else {
+            throw AgentRecoveryDecodingError(reason: .malformed("\(path).applicationStartedAt does not match state"))
+        }
+        return try AgentRecoveryEditProposal(
+            reviewID: reader.uuid("reviewID"),
+            runAttemptID: reader.optionalUUID("runAttemptID"),
+            transcriptResetGeneration: reader.uint64("transcriptResetGeneration"),
+            appInstanceID: reader.uuid("appInstanceID"),
+            proposedAt: reader.timestamp("proposedAt"),
+            physicalPath: reader.string("physicalPath"),
+            displayPath: reader.string("displayPath"),
+            unifiedDiff: reader.string("unifiedDiff"),
+            proposedText: reader.string("proposedText"),
+            base: editProposalBase(reader.required("base"), path: "\(path).base"),
+            state: state,
+            applicationStartedAt: applicationStartedAt,
+            extras: reader.extras
+        )
+    }
+
+    private static func editProposalBase(_ json: AgentRecoveryJSONValue, path: String) throws -> AgentRecoveryEditProposalBase {
+        var reader = try Reader(json, path: path)
+        let exists = try reader.bool("exists")
+        let domain = try reader.optionalString("domain")
+        let digest = try reader.optionalString("digest")
+        // Content evidence exactly when the target existed.
+        guard exists ? (domain != nil && digest != nil) : (domain == nil && digest == nil) else {
+            throw AgentRecoveryDecodingError(reason: .malformed("\(path) evidence does not match exists"))
+        }
+        return AgentRecoveryEditProposalBase(exists: exists, domain: domain, digest: digest, extras: reader.extras)
+    }
+
+    private static func editProposalJSON(_ proposal: AgentRecoveryEditProposal) -> AgentRecoveryJSONValue {
+        var object = proposal.extras
+        object["reviewID"] = .string(proposal.reviewID.uuidString)
+        setOptional(&object, "runAttemptID", proposal.runAttemptID?.uuidString)
+        object["transcriptResetGeneration"] = .number(Decimal(proposal.transcriptResetGeneration))
+        object["appInstanceID"] = .string(proposal.appInstanceID.uuidString)
+        object["proposedAt"] = timestampJSON(proposal.proposedAt)
+        object["physicalPath"] = .string(proposal.physicalPath)
+        object["displayPath"] = .string(proposal.displayPath)
+        object["unifiedDiff"] = .string(proposal.unifiedDiff)
+        object["proposedText"] = .string(proposal.proposedText)
+        var base = proposal.base.extras
+        base["exists"] = .bool(proposal.base.exists)
+        setOptional(&base, "domain", proposal.base.domain)
+        setOptional(&base, "digest", proposal.base.digest)
+        object["base"] = .object(base)
+        object["state"] = .string(proposal.state.rawValue)
+        if let startedAt = proposal.applicationStartedAt {
+            object["applicationStartedAt"] = timestampJSON(startedAt)
+        }
         return .object(object)
     }
 
@@ -525,6 +601,12 @@ enum AgentRecoveryRecordCodec {
         for link in record.delegatedChildLinks {
             guard linkedInvocationIDs.insert(link.invocationID).inserted else {
                 throw AgentRecoveryDecodingError(reason: .malformed("duplicate delegated child link \(link.invocationID)"))
+            }
+        }
+        var proposalIDs: Set<UUID> = []
+        for proposal in record.editProposals {
+            guard proposalIDs.insert(proposal.reviewID).inserted else {
+                throw AgentRecoveryDecodingError(reason: .malformed("duplicate edit proposal \(proposal.reviewID)"))
             }
         }
         var cardKeys: Set<AgentRecoveryCardKey> = []

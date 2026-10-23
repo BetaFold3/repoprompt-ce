@@ -31,7 +31,8 @@ struct AgentRecoveryNeedsAttentionSheet: View {
                     acknowledgedWarning: warning
                 )
             },
-            retryStartup: { agentModeVM.retryRecoveryStartup() }
+            retryStartup: { agentModeVM.retryRecoveryStartup() },
+            inspect: { rowID in await agentModeVM.inspectRecoveryEditProposal(rowID: rowID) }
         )
         VStack(alignment: .leading, spacing: 14) {
             HStack {

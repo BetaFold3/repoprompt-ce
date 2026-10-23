@@ -167,6 +167,12 @@ package enum AgentRecoveryStoreError: Error, Equatable {
     /// Step 5b: the parent record cannot take the link (no record, or the admitted parent run attempt
     /// is missing, finished, or from another reset generation). Nothing was written.
     case delegatedChildLinkIneligible(reason: String)
+    /// Step 5a: the same review ID is already stored with a different proposal. Nothing was written.
+    case editProposalConflict(reviewID: UUID)
+    /// Step 5a: the proposal is not stored (already resolved, discarded, or never committed), or it
+    /// cannot take the requested state change (for example another reset generation's proposal).
+    /// Nothing was written.
+    case editProposalIneligible(reviewID: UUID, reason: String)
 
     package var category: Category {
         switch self {
@@ -185,7 +191,7 @@ package enum AgentRecoveryStoreError: Error, Equatable {
         case .intentNotFound, .intentConflict, .attemptNotFound, .attemptConflict, .runAttemptNotFound,
              .runAttemptConflict, .invalidTransition, .heldIntent, .cardChanged, .actionConflict, .actionNotFound,
              .actionIneligible, .priorLaunchAction, .supersedeRefused, .delegatedChildLinkConflict,
-             .delegatedChildLinkIneligible:
+             .delegatedChildLinkIneligible, .editProposalConflict, .editProposalIneligible:
             .invalidOperation
         case .historyCursorConflict:
             .revisionConflict
@@ -2103,8 +2109,8 @@ package actor AgentRecoveryStore {
     }
 
     /// Atomically replaces the record (new opaque revision, binding generation, preserved extras,
-    /// crash-hold acknowledgement, questions, card acknowledgements, actions, history cursors, and
-    /// delegated child links unless supplied). Never deletes attachments: a record reference is not proof that a file is
+    /// crash-hold acknowledgement, questions, card acknowledgements, actions, history cursors,
+    /// delegated child links, and edit proposals unless supplied). Never deletes attachments: a record reference is not proof that a file is
     /// unused.
     func replace(
         _ current: AgentRecoveryRecord?,
@@ -2118,7 +2124,8 @@ package actor AgentRecoveryStore {
         cardAcknowledgements: [AgentRecoveryCardAcknowledgement]? = nil,
         actions: [AgentRecoveryAction]? = nil,
         historyCursors: [AgentRecoveryHistoryCursor]? = nil,
-        delegatedChildLinks: [AgentRecoveryDelegatedChildLink]? = nil
+        delegatedChildLinks: [AgentRecoveryDelegatedChildLink]? = nil,
+        editProposals: [AgentRecoveryEditProposal]? = nil
     ) throws -> AgentRecoveryRecord {
         let record = AgentRecoveryRecord(
             sessionID: binding.sessionID,
@@ -2136,6 +2143,7 @@ package actor AgentRecoveryStore {
             actions: actions ?? current?.actions ?? [],
             historyCursors: historyCursors ?? current?.historyCursors ?? [],
             delegatedChildLinks: delegatedChildLinks ?? current?.delegatedChildLinks ?? [],
+            editProposals: editProposals ?? current?.editProposals ?? [],
             extras: current?.extras ?? [:]
         )
         do {

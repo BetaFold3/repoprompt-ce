@@ -281,6 +281,18 @@ extension AgentModeViewModel {
                 text: snapshot.composerText,
                 actions: actions + dismiss
             )
+        case let .editProposal(proposal, isCurrentLaunch):
+            // Step 5a: historical data only (View, Copy, Discard); never applied from here.
+            var props = row(
+                // Pending is known not written (never accepted, or accepted but stopped before writing).
+                proposal.state == .applicationStarted ? "Edit may have been applied" : "Edit proposal not applied",
+                Self.recoveryListEditProposalDetail(proposal, isCurrentLaunch: isCurrentLaunch),
+                text: Self.recoveryListEditProposalText(proposal),
+                actions: [.copyProposal] + (isActive ? [.discardProposal] : openAction),
+                confirmation: "Discard this edit proposal? The file is not changed; only the saved proposal is removed. This can't be undone."
+            )
+            props.inspectsOnView = true
+            return props
         case let .heldDraft(snapshot):
             guard tabSession != nil else {
                 return row("Draft from before the conversation was cleared", "Open the session to restore or discard it.", text: snapshot.content.text, actions: dismiss)
@@ -749,6 +761,10 @@ extension AgentModeViewModel {
             await performRecoveryResumeAction(rowID: rowID, action: action)
         case let .openDelegatedSession(childSessionID):
             await openRecoveryDelegatedSession(childSessionID)
+        case .copyProposal:
+            copyRecoveryEditProposal(rowID: rowID)
+        case .discardProposal:
+            await discardRecoveryEditProposal(rowID: rowID)
         }
         coordinator.setCatalogActionState(failure.map { .failed($0) }, for: rowID)
         refreshRecoveryListUI()

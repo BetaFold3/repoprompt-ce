@@ -106,6 +106,8 @@ struct AgentRecoveryListRow: View {
     /// Phase 4: the continuation being edited (its action), and its editable text.
     @State private var editingContinuation: AgentRecoveryListRowProps.Action?
     @State private var continuationDraft = ""
+    /// Step 5a: the latest comparison of this row's proposal (transient; recomputed on each View).
+    @State private var inspection: (rowID: String, text: String)?
 
     var body: some View {
         HStack(alignment: .top, spacing: 8) {
@@ -136,7 +138,7 @@ struct AgentRecoveryListRow: View {
             }
             ForEach(row.actions, id: \.self) { action in
                 Button(title(for: action), role: isDestructive(action) ? .destructive : nil) {
-                    if action == .discardDraft || action == .cancelSchedule, row.confirmation != nil {
+                    if action == .discardDraft || action == .cancelSchedule || action == .discardProposal, row.confirmation != nil {
                         pendingConfirmation = action
                     } else if isContinuation(action), let text = row.continuationText {
                         continuationDraft = text
@@ -214,13 +216,19 @@ struct AgentRecoveryListRow: View {
     }
 
     private func isDestructive(_ action: AgentRecoveryListRowProps.Action) -> Bool {
-        action == .remove || action == .discardDraft || action == .cancelSchedule
+        action == .remove || action == .discardDraft || action == .cancelSchedule || action == .discardProposal
     }
 
     private var viewer: some View {
         VStack(alignment: .leading, spacing: 8) {
             Text(row.title).font(.headline)
             Text(row.detail).font(.caption).foregroundStyle(.secondary)
+            if row.inspectsOnView {
+                Text(inspection?.rowID == row.id ? inspection?.text ?? "" : "Comparing with the current file…")
+                    .font(.caption)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .accessibilityIdentifier("agent.recoveryList.inspection")
+            }
             if let text = row.text, !text.isEmpty {
                 ScrollView {
                     Text(text)
@@ -236,6 +244,15 @@ struct AgentRecoveryListRow: View {
         }
         .padding(12)
         .frame(width: 360)
+        .task(id: row.id) {
+            // Never show an earlier View's comparison while this one is computed.
+            inspection = nil
+            guard row.inspectsOnView else { return }
+            let rowID = row.id
+            let text = await actions.inspect(rowID) ?? "The current file couldn't be compared."
+            guard !Task.isCancelled, rowID == row.id else { return }
+            inspection = (rowID, text)
+        }
     }
 
     private func title(for action: AgentRecoveryListRowProps.Action) -> String {
@@ -276,6 +293,10 @@ struct AgentRecoveryListRow: View {
             "Continue in a new conversation…"
         case let .openDelegatedSession(childSessionID):
             "Open delegated session \(childSessionID.uuidString.prefix(8))"
+        case .copyProposal:
+            "Copy proposal"
+        case .discardProposal:
+            "Discard proposal…"
         }
     }
 }

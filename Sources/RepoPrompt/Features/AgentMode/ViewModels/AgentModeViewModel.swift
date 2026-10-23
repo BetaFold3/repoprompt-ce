@@ -736,6 +736,11 @@ final class AgentModeViewModel: ObservableObject {
         /// Test seam (Step 5b): awaited by `mcpCommitDelegatedChildLink` with the child, after its
         /// covering save and immediately before the parent's link commit (inside the link await).
         var test_delegatedChildLinkAwaitHook: (@MainActor (AgentTabSession) async -> Void)?
+        /// Test seam (Step 5a): awaited with the session inside each new edit-review await: before the
+        /// `pending` and `applicationStarted` commits, and before the accepted review's ticket check.
+        var test_editProposalRecoveryAwaitHook: (@MainActor (AgentTabSession, EditProposalRecoveryAwaitPoint) async -> Void)?
+        /// Test seam (Step 5a): replaces the pasteboard for Copy proposal.
+        var test_recoveryListPasteboardWriter: (@MainActor (String) -> Void)?
         /// Test seam: awaited in `finalizeDeletedAgentSessionReferences` after a deleted session's
         /// owner was detached from its tab and before its awaited teardown, so a replacement owner
         /// can be installed on the tab while the cleanup is suspended.

@@ -354,7 +354,8 @@ struct AgentInputBar: View {
                     )
                 },
                 retryStartup: { agentModeVM.retryRecoveryStartup() },
-                openNeedsAttention: { agentModeVM.presentRecoveryNeedsAttention() }
+                openNeedsAttention: { agentModeVM.presentRecoveryNeedsAttention() },
+                inspect: { rowID in await agentModeVM.inspectRecoveryEditProposal(rowID: rowID) }
             ),
             isShutdownFrozen: { agentModeVM.isShutdownFrozen }
         )

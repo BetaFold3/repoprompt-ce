@@ -458,6 +458,12 @@ struct AgentRecoveryListRowProps: Equatable, Identifiable {
         /// Step 5b: open the existing delegated child session linked under this run attempt. It
         /// only opens that session; nothing is recreated, restarted, or resent.
         case openDelegatedSession(UUID)
+        /// Step 5a: copy the exact stored edit proposal (its full proposed text) to the pasteboard.
+        /// Never writes the target file.
+        case copyProposal
+        /// Step 5a: durably withdraw the stored edit proposal (after `confirmation`). The target
+        /// file is never touched.
+        case discardProposal
     }
 
     let id: String
@@ -481,6 +487,9 @@ struct AgentRecoveryListRowProps: Equatable, Identifiable {
     /// Phase 4: shown in the continuation editor when an earlier choice may have reached the agent;
     /// sending from that editor is the explicit confirmation.
     var continuationWarning: String?
+    /// Step 5a: opening View asks `AgentRecoveryListActions.inspect` for a transient comparison of
+    /// the target file with the stored proposal.
+    var inspectsOnView = false
 }
 
 struct AgentRecoveryListActions {
@@ -495,6 +504,9 @@ struct AgentRecoveryListActions {
     let retryStartup: () -> Void
     /// Presents the app-wide Needs Attention sheet.
     var openNeedsAttention: () -> Void = {}
+    /// Step 5a: a transient, read-only comparison shown in an `inspectsOnView` row's viewer (nil
+    /// when unavailable). Never blocks View or Copy.
+    var inspect: (_ rowID: String) async -> String? = { _ in nil }
 }
 
 struct AgentComposerProps: Equatable {

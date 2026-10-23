@@ -21,6 +21,8 @@ package enum AgentRecoveryCatalogItemKind: String, CaseIterable {
     case saveFailure
     /// Spec R6: an agent process family that may still be running (or whose ownership is unknown).
     case survivingProcess
+    /// Step 5a: an `apply_edits` proposal whose live review ended without an apply or a rejection.
+    case pendingEditReview
 }
 
 /// Shared progress or failure of one item's action (the same on every surface).
@@ -71,6 +73,10 @@ package enum AgentRecoveryCatalogPayload: Equatable {
     /// A saved question whose request has ended (an earlier launch's, or this launch's once its
     /// owning request expired). Historical text only; never resumed.
     case question(AgentRecoveryQuestionSnapshot, isCurrentLaunch: Bool)
+    /// Step 5a: a reviewed edit proposal whose live review ended (an earlier launch's, or this
+    /// launch's once its review expired, timed out, or was closed). Historical data only (View,
+    /// Copy, Discard): never applied, never answered back to the agent.
+    case editProposal(AgentRecoveryEditProposal, isCurrentLaunch: Bool)
     /// A composer typed before the conversation was cleared (a live lane's held draft).
     case heldDraft(AgentRecoveryComposerSnapshot)
     /// A session without a live lane whose recovery record holds a saved, non-empty composer
@@ -495,6 +501,7 @@ package enum AgentRecoveryCatalogProjection {
                 isRemote: resolution.remoteHostID != nil
             )
             addQuestions(sessionID: sessionID, workspaceID: workspaceID, name: name, tabID: tabID, record: record)
+            addEditProposals(sessionID: sessionID, workspaceID: workspaceID, name: name, tabID: tabID, record: record)
             addDurableComposer(
                 sessionID: sessionID,
                 workspaceID: workspaceID,
@@ -657,6 +664,23 @@ package enum AgentRecoveryCatalogProjection {
             }
         }
 
+        /// Step 5a: stored edit proposals whose live review has ended: every earlier launch's, and
+        /// this launch's no live lane still reviews or writes. Not dismissible (Discard withdraws it).
+        mutating func addEditProposals(sessionID: UUID, workspaceID: UUID?, name: String?, tabID: UUID?, record: AgentRecoveryRecord) {
+            let live = coordinator.lane(for: sessionID)?.liveEditProposalIDs ?? []
+            for proposal in record.editProposals where !live.contains(proposal.reviewID) {
+                append(
+                    AgentRecoveryCatalogProjection.editProposalItemID(sessionID: sessionID, reviewID: proposal.reviewID),
+                    kind: .pendingEditReview,
+                    sessionID: sessionID,
+                    workspaceID: workspaceID,
+                    sessionName: name,
+                    composeTabID: tabID,
+                    payload: .editProposal(proposal, isCurrentLaunch: proposal.appInstanceID == currentInstanceID)
+                )
+            }
+        }
+
         /// This launch's held input and saved questions of sessions absent from the startup results
         /// (created this launch, or first written since).
         mutating func addHeldInputOfUnlistedSessions() {
@@ -697,6 +721,7 @@ package enum AgentRecoveryCatalogProjection {
                     isRemote: false
                 )
                 addQuestions(sessionID: sessionID, workspaceID: workspaceID, name: nil, tabID: tabID, record: record)
+                addEditProposals(sessionID: sessionID, workspaceID: workspaceID, name: nil, tabID: tabID, record: record)
                 addDurableComposer(
                     sessionID: sessionID,
                     workspaceID: workspaceID,
@@ -917,6 +942,10 @@ package enum AgentRecoveryCatalogProjection {
         case .providerAccepted, .withdrawn:
             false
         }
+    }
+
+    package static func editProposalItemID(sessionID: UUID, reviewID: UUID) -> String {
+        "proposal-\(sessionID.uuidString)-\(reviewID.uuidString)"
     }
 
     package static func heldDraftItemID(sessionID: UUID, revision: AgentRecoveryComposerRevision) -> String {

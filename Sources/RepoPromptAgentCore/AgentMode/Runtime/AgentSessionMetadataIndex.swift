@@ -146,15 +146,26 @@ package struct AgentSessionRecoveryHint: Codable, Equatable {
         /// Nonempty durable composer content.
         package var hasDraft: Bool
         package var hasQuestions: Bool
+        /// Step 5a: stored `apply_edits` proposals awaiting View/Discard (runtime fact only; the
+        /// persisted hint keeps its schema and folds this into `needsAttention`).
+        package var hasEditProposals: Bool
         /// Run evidence without terminal evidence.
         package var hasOpenRun: Bool
         /// Unreadable or future record data.
         package var isUnreadable: Bool
 
-        package init(unsentCount: Int, hasDraft: Bool, hasQuestions: Bool, hasOpenRun: Bool, isUnreadable: Bool) {
+        package init(
+            unsentCount: Int,
+            hasDraft: Bool,
+            hasQuestions: Bool,
+            hasEditProposals: Bool = false,
+            hasOpenRun: Bool,
+            isUnreadable: Bool
+        ) {
             self.unsentCount = unsentCount
             self.hasDraft = hasDraft
             self.hasQuestions = hasQuestions
+            self.hasEditProposals = hasEditProposals
             self.hasOpenRun = hasOpenRun
             self.isUnreadable = isUnreadable
         }
@@ -173,6 +184,7 @@ package struct AgentSessionRecoveryHint: Codable, Equatable {
                 },
                 hasDraft: record.composer.map { !$0.content.isEmpty } ?? false,
                 hasQuestions: !record.questions.isEmpty,
+                hasEditProposals: !record.editProposals.isEmpty,
                 hasOpenRun: record.runAttempts.contains { $0.terminal == nil },
                 isUnreadable: false
             )
@@ -187,7 +199,7 @@ package struct AgentSessionRecoveryHint: Codable, Equatable {
         }
 
         package var needsAttention: Bool {
-            unsentCount > 0 || hasDraft || hasQuestions || hasOpenRun || isUnreadable
+            unsentCount > 0 || hasDraft || hasQuestions || hasEditProposals || hasOpenRun || isUnreadable
         }
     }
 

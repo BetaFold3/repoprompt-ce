@@ -963,6 +963,10 @@ package struct AgentRecoveryRecord: Equatable {
     /// Delegated child links (Step 5b), in commit order (empty = none). Additive: absent when
     /// empty, so older records keep their bytes.
     package let delegatedChildLinks: [AgentRecoveryDelegatedChildLink]
+    /// Step 5a: reviewed `apply_edits` proposals, in commit order (empty = none). A proposal is
+    /// stored before its live review is shown and removed only once it is applied (and recorded) or
+    /// explicitly withdrawn. Additive: absent when empty, so older records keep their bytes.
+    package let editProposals: [AgentRecoveryEditProposal]
     package let extras: AgentRecoveryExtras
 
     package init(
@@ -981,9 +985,11 @@ package struct AgentRecoveryRecord: Equatable {
         actions: [AgentRecoveryAction] = [],
         historyCursors: [AgentRecoveryHistoryCursor] = [],
         delegatedChildLinks: [AgentRecoveryDelegatedChildLink] = [],
+        editProposals: [AgentRecoveryEditProposal] = [],
         extras: AgentRecoveryExtras = [:]
     ) {
         self.actions = actions
+        self.editProposals = editProposals
         self.historyCursors = historyCursors
         self.delegatedChildLinks = delegatedChildLinks
         self.crashHoldAcknowledgement = crashHoldAcknowledgement
@@ -1020,6 +1026,10 @@ package struct AgentRecoveryRecord: Equatable {
     /// Links admitted under one parent run attempt, in commit order.
     package func delegatedChildLinks(parentRunAttemptID: UUID) -> [AgentRecoveryDelegatedChildLink] {
         delegatedChildLinks.filter { $0.parentRunAttemptID == parentRunAttemptID }
+    }
+
+    package func editProposal(reviewID: UUID) -> AgentRecoveryEditProposal? {
+        editProposals.first { $0.reviewID == reviewID }
     }
 
     package func cardAcknowledgement(for key: AgentRecoveryCardKey) -> AgentRecoveryCardAcknowledgement? {

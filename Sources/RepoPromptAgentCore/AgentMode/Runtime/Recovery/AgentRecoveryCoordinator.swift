@@ -2038,6 +2038,29 @@ package final class AgentRecoverySessionLane {
         coordinator?.composerStateDidChange(sessionID: binding.sessionID)
     }
 
+    // MARK: Live edit reviews (Step 5a)
+
+    private var liveEditProposalIDStorage: Set<UUID> = []
+
+    /// Review IDs of this session's `apply_edits` proposals whose live review (or accepted write)
+    /// is in progress in this launch; the recovery catalog does not list them. Empty once retired,
+    /// so a retired owner's proposals become historical.
+    package var liveEditProposalIDs: Set<UUID> {
+        isRetired ? [] : liveEditProposalIDStorage
+    }
+
+    /// Marks a proposal live, before its pending commit (so it never flashes as historical).
+    package func noteEditProposalLive(_ reviewID: UUID) {
+        guard liveEditProposalIDStorage.insert(reviewID).inserted else { return }
+        notifyStateChange()
+    }
+
+    /// Ends a proposal's live phase: whatever is still stored for it becomes historical.
+    package func endEditProposalLive(_ reviewID: UUID) {
+        guard liveEditProposalIDStorage.remove(reviewID) != nil else { return }
+        notifyStateChange()
+    }
+
     // MARK: Held intents (this launch)
 
     /// Records that the live projections of these durable intents were removed without a
