@@ -77,10 +77,13 @@ extension WindowStatesManager {
                 return await presentLifecycleShutdownFailure(failure)
             },
             dismissFailure: { [weak self] scope in
-                guard let alert = self?.presentedLifecycleShutdownAlerts.removeValue(forKey: scope),
-                      let parent = alert.window.sheetParent
-                else { return }
-                parent.endSheet(alert.window, returnCode: .cancel)
+                guard let alert = self?.presentedLifecycleShutdownAlerts.removeValue(forKey: scope) else { return }
+                if let parent = alert.window.sheetParent {
+                    parent.endSheet(alert.window, returnCode: .cancel)
+                } else if NSApp.modalWindow === alert.window {
+                    // An app-modal prompt (no parent window): stop its modal loop from outside it.
+                    NSApp.abortModal()
+                }
             },
             now: { ContinuousClock.now },
             sleepUntil: { expiry in try await Task.sleep(until: expiry, clock: .continuous) },
@@ -122,7 +125,7 @@ extension WindowStatesManager {
             // is ignored by R4.
             alert.messageText = "RepoPrompt can't continue restarting safely"
             alert.informativeText = details
-                + "\n\nRepoPrompt could not confirm that its restart helper stopped, so it offers no further choice."
+                + "\n\nRepoPrompt could not confirm that its restart helper stopped, so it offers no further choice. If it later confirms that the helper stopped, the usual choices are offered again."
             alert.addButton(withTitle: "OK")
         case .preparation:
             alert.messageText = isQuit

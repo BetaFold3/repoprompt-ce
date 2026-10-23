@@ -91,7 +91,8 @@ struct AgentLifecycleShutdownFailure: Equatable {
     /// Restart safely (review A P1-07): the relaunch helper's stop could not be proven AFTER its
     /// `arm` was sent, so it may still be alive and armed. No choice is offered (no Retry, Cancel,
     /// or Quit Anyway): the prompt only informs, and any answer is ignored while ownership is
-    /// retained. A helper never sent `arm` keeps the normal choices (review R1 B N3).
+    /// retained. A helper never sent `arm` keeps the normal choices (review R1 B N3). Once that exact
+    /// helper's stop is proven later, the prompt is replaced by the normal choices (Step 4b).
     var relaunchHelperUnresolved = false
 
     /// The choices this prompt may offer (none while a possibly armed relaunch helper is unresolved).
@@ -214,6 +215,12 @@ struct AgentLifecycleRelaunchHooks {
     /// its single deadline (review A P1-07): helper work ends at the budget's work expiry and every
     /// stop at its cleanup expiry, so `abandon` finishes, and the prompt appears, by the deadline.
     var cleanupReserve: Duration = ProcessRelaunchLimits.v1.cleanupReserve
+    /// Lossless restart Step 4b, after an `.unresolved` `abandon`: waits for proof that the helper
+    /// retained when called stopped (its exact child's observed exit, or its correlated `aborted`),
+    /// then releases exactly that helper. `true` only then. Replay-safe (proof that arrived earlier
+    /// counts) and cancellable (`false`); never inferred from end of input, a delivered signal, or a
+    /// timeout, and never spawns, prepares, arms, retries, or renews a budget.
+    var awaitRetainedHelperStop: @MainActor () async -> Bool = { false }
 }
 
 @MainActor
@@ -277,6 +284,14 @@ final class AgentLifecycleShutdownCoordinator {
         /// Restart safely: prompts shown without choices because the helper's stop was unresolved
         /// (test observability; the request stays unfinished).
         fileprivate(set) var relaunchHelperUnresolvedPrompts = 0
+        /// Identity of the prompt last presented: an answer to an earlier (dismissed) one is ignored.
+        fileprivate var presentationID = UUID()
+        /// Restart safely (Step 4b): waits for the unresolved helper's stop proof while the
+        /// no-choice prompt is current. Cancelled by the next prompt and when the request ends.
+        fileprivate var relaunchStopObservation: Task<Void, Never>?
+        /// Restart safely: no-choice prompts replaced by the normal choices after the retained
+        /// helper's stop was proven (test observability).
+        fileprivate(set) var relaunchHelperStopRecoveries = 0
 
         fileprivate init(
             scope: AgentLifecycleShutdownScope,
@@ -545,6 +560,7 @@ final class AgentLifecycleShutdownCoordinator {
         request.isFinished = true
         request.deadlineTask?.cancel()
         request.deadlineTask = nil
+        endRelaunchStopObservation(request)
         for participant in request.participants {
             participant.endShutdownFreeze(requestID: request.id)
         }
@@ -570,6 +586,7 @@ final class AgentLifecycleShutdownCoordinator {
         request.isFinished = true
         request.deadlineTask?.cancel()
         request.deadlineTask = nil
+        endRelaunchStopObservation(request)
         environment.dismissFailure(request.scope)
         for participant in request.participants {
             participant.endShutdownFreeze(requestID: request.id)
@@ -759,6 +776,7 @@ final class AgentLifecycleShutdownCoordinator {
         guard !request.isFinished else { return }
         request.phase = .completed
         request.isFinished = true
+        endRelaunchStopObservation(request)
         request.completion(true)
     }
 
@@ -780,6 +798,10 @@ final class AgentLifecycleShutdownCoordinator {
             awaitsCleanExitAcknowledgement: stage == .finalization && request.cleanWrite != nil
         )
         request.lastFailure = failure
+        // A new prompt supersedes the previous one: its answer and its stop observation are stale.
+        let presentation = UUID()
+        request.presentationID = presentation
+        endRelaunchStopObservation(request)
         let failedPhase: AgentLifecycleShutdownPhase = stage == .preparation ? .preparationFailed : .finalizationFailed
         let relaunch = request.reason == .safeRestart ? environment.relaunch : nil
         Task { @MainActor [weak self] in
@@ -804,11 +826,23 @@ final class AgentLifecycleShutdownCoordinator {
                     // reported finished.
                     failure = failure.appending(reason, relaunchHelperUnresolved: true)
                     request.lastFailure = failure
+                    // Step 4b: registered before the prompt is shown (proof that already arrived
+                    // is replayed), so a later proof restores the choices.
+                    self?.observeRelaunchHelperStop(
+                        request,
+                        attempt: attempt,
+                        stage: stage,
+                        messages: messages,
+                        timedOut: timedOut,
+                        presentation: presentation,
+                        relaunch: relaunch
+                    )
                 }
             }
             guard let self else { return }
             let choice = await environment.presentFailure(failure)
-            guard isCurrent(request, attempt: attempt, phase: failedPhase) else { return }
+            // An answer to a dismissed or replaced prompt is ignored.
+            guard request.presentationID == presentation, isCurrent(request, attempt: attempt, phase: failedPhase) else { return }
             // No choice was offered while the helper is unresolved: any answer is ignored.
             if failure.relaunchHelperUnresolved {
                 request.relaunchHelperUnresolvedPrompts += 1
@@ -816,6 +850,39 @@ final class AgentLifecycleShutdownCoordinator {
             }
             handle(choice, for: request, stage: stage, attempt: attempt)
         }
+    }
+
+    /// Restart safely (lossless restart Step 4b): while the no-choice prompt of `presentation` is
+    /// current, waits for the relaunch driver to prove that the retained (possibly armed) helper
+    /// stopped and to release it. Then that prompt is dismissed and the same stage's failure is
+    /// presented again with its normal choices (`abandon` is then `.safe`). Nothing else follows
+    /// from the proof: no Retry, quit, fresh helper, persistence, clean mark, or renewed deadline;
+    /// only an explicit Retry starts a fresh attempt. A stale or duplicate proof does nothing.
+    private func observeRelaunchHelperStop(
+        _ request: Request,
+        attempt: UUID,
+        stage: AgentLifecycleShutdownStage,
+        messages: [String],
+        timedOut: Bool,
+        presentation: UUID,
+        relaunch: AgentLifecycleRelaunchHooks
+    ) {
+        guard request.presentationID == presentation, !request.isFinished else { return }
+        endRelaunchStopObservation(request)
+        let failedPhase: AgentLifecycleShutdownPhase = stage == .preparation ? .preparationFailed : .finalizationFailed
+        request.relaunchStopObservation = Task { @MainActor [weak self] in
+            guard await relaunch.awaitRetainedHelperStop(), !Task.isCancelled, let self else { return }
+            guard request.presentationID == presentation, isCurrent(request, attempt: attempt, phase: failedPhase) else { return }
+            request.relaunchStopObservation = nil
+            request.relaunchHelperStopRecoveries += 1
+            environment.dismissFailure(request.scope)
+            present(request, attempt: attempt, stage: stage, messages: messages, timedOut: timedOut)
+        }
+    }
+
+    private func endRelaunchStopObservation(_ request: Request) {
+        request.relaunchStopObservation?.cancel()
+        request.relaunchStopObservation = nil
     }
 
     private func handle(

@@ -213,6 +213,83 @@ final class AppRelaunchCoordinatorTests: XCTestCase {
         XCTAssertFalse(coordinator.retainsHelper)
     }
 
+    /// A prepared helper whose `arm` was sent, its acknowledgement lost, and its stop unresolved
+    /// (kill signalled, exit not observed): retained by the driver.
+    private func unresolvedArmedHelper() async -> (AppRelaunchCoordinator, AgentLifecycleRelaunchHooks) {
+        let coordinator = makeCoordinator(exitsOnTerminate: false, respond: { message in
+            switch message {
+            case let .prepare(id, _, _): .ready(correlationID: id)
+            default: nil
+            }
+        })
+        let hooks = coordinator.hooks
+        _ = await hooks.prepare(budget(.seconds(8)))
+        let arm = Task { await hooks.arm(budget(.seconds(2))) }
+        await sleeper.waitForPending(.seconds(2))
+        sleeper.fire(.seconds(2))
+        await sleeper.waitForPending(ProcessRelaunchLimits.v1.abortAcknowledgement)
+        sleeper.fire(ProcessRelaunchLimits.v1.abortAcknowledgement)
+        await sleeper.waitForPending(ProcessRelaunchLimits.v1.terminateGrace)
+        sleeper.fire(ProcessRelaunchLimits.v1.terminateGrace)
+        _ = await arm.value
+        XCTAssertTrue(coordinator.retainsHelper)
+        return (coordinator, hooks)
+    }
+
+    /// Step 4b: the retained (arm-sent) helper's exact exit observed later releases exactly that
+    /// helper through the observation: no frame, kill, fresh helper, or arm follows. A duplicate
+    /// observation finds nothing; only a later explicit prepare (Retry) spawns a fresh helper.
+    func testObservedExitOfTheRetainedArmedHelperReleasesOnlyThatHelperWithoutSpawning() async {
+        let (coordinator, hooks) = await unresolvedArmedHelper()
+        let framesBefore = channels.first?.receivedTypes
+        XCTAssertEqual(framesBefore, ["prepare", "arm", "abort"])
+        let observation = Task { await hooks.awaitRetainedHelperStop() }
+        for _ in 0 ..< 200 {
+            await Task.yield()
+        }
+        XCTAssertTrue(coordinator.retainsHelper, "a delivered signal is not proof")
+
+        channels.first?.exit()
+        let released = await observation.value
+        XCTAssertTrue(released)
+        XCTAssertFalse(coordinator.retainsHelper, "the exact retained helper is released")
+        XCTAssertEqual(channels.first?.receivedTypes, framesBefore, "nothing is sent to the stopped helper")
+        XCTAssertEqual(coordinator.spawnCount, 1, "the notification never spawns a helper")
+
+        let duplicate = await hooks.awaitRetainedHelperStop()
+        XCTAssertFalse(duplicate, "a duplicate observation has nothing to release")
+
+        let retried = await hooks.prepare(budget(.seconds(8)))
+        XCTAssertNil(retried, "an explicit prepare after the proof may use a fresh helper")
+        XCTAssertEqual(coordinator.spawnCount, 2)
+    }
+
+    /// Step 4b: a cancelled observation reports nothing and keeps the helper retained; with no
+    /// retained helper there is nothing to observe.
+    func testCancelledObservationKeepsTheRetainedHelper() async {
+        let idle = makeCoordinator()
+        let none = await idle.hooks.awaitRetainedHelperStop()
+        XCTAssertFalse(none)
+
+        let (coordinator, hooks) = await unresolvedArmedHelper()
+        let observation = Task { await hooks.awaitRetainedHelperStop() }
+        for _ in 0 ..< 200 {
+            await Task.yield()
+        }
+        observation.cancel()
+        let released = await observation.value
+        XCTAssertFalse(released)
+        XCTAssertTrue(coordinator.retainsHelper, "cancellation never releases an unproven helper")
+        let retry = Task { await hooks.prepare(budget(.seconds(8))) }
+        await sleeper.waitForPending(.zero)
+        sleeper.fire(.zero)
+        await sleeper.waitForPending(.zero)
+        sleeper.fire(.zero)
+        let refused = await retry.value
+        XCTAssertNotNil(refused, "still no fresh helper")
+        XCTAssertEqual(coordinator.spawnCount, 1)
+    }
+
     /// Review R1 B N3: a ready helper whose stop is unproven but that was never sent `arm` (so it
     /// can never open anything) is `.unresolvedUnarmed`. It stays retained: Retry spawns no fresh
     /// helper and the retained one is never armed.

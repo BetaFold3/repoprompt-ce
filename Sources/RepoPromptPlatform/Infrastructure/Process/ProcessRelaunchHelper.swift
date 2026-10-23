@@ -671,6 +671,66 @@ package enum ProcessRelaunchArmResult: Equatable {
     case unresolved(String)
 }
 
+/// The first stop proof one helper gave (lossless restart Step 4b), recorded by the session's pumps
+/// as it arrives, independent of whichever call is consuming events. Lock-protected so a waiter that
+/// registers while the proof lands never misses it.
+private final class ProcessRelaunchStopProofLatch: @unchecked Sendable {
+    private let lock = NSLock()
+    private var proof: ProcessRelaunchStopProof?
+    private var abortSent = false
+    private var waiters: [UUID: CheckedContinuation<ProcessRelaunchStopProof?, Never>] = [:]
+
+    var recorded: ProcessRelaunchStopProof? {
+        lock.withLock { proof }
+    }
+
+    /// Set before an `abort` frame is written: only then is a correlated `aborted` a reply to it.
+    func noteAbortSent() {
+        lock.withLock { abortSent = true }
+    }
+
+    func recordAborted() {
+        guard lock.withLock({ abortSent }) else { return }
+        record(.abortAcknowledged)
+    }
+
+    /// The first proof wins; later ones are ignored.
+    func record(_ newProof: ProcessRelaunchStopProof) {
+        let pending: [CheckedContinuation<ProcessRelaunchStopProof?, Never>] = lock.withLock {
+            guard proof == nil else { return [] }
+            proof = newProof
+            let waiting = Array(waiters.values)
+            waiters = [:]
+            return waiting
+        }
+        pending.forEach { $0.resume(returning: newProof) }
+    }
+
+    /// The recorded proof (at once when it is already there), or `nil` once the waiting task is
+    /// cancelled.
+    func wait() async -> ProcessRelaunchStopProof? {
+        let id = UUID()
+        return await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                lock.lock()
+                if let proof {
+                    lock.unlock()
+                    continuation.resume(returning: proof)
+                } else if Task.isCancelled {
+                    lock.unlock()
+                    continuation.resume(returning: nil)
+                } else {
+                    waiters[id] = continuation
+                    lock.unlock()
+                }
+            }
+        } onCancel: {
+            let waiter = lock.withLock { waiters.removeValue(forKey: id) }
+            waiter?.resume(returning: nil)
+        }
+    }
+}
+
 /// Parent-side protocol driver for one helper. Retry always uses a fresh session and helper.
 package actor ProcessRelaunchParentSession {
     private enum Event {
@@ -688,6 +748,7 @@ package actor ProcessRelaunchParentSession {
     private var helperExited = false
     private var timerGeneration: UInt64 = 0
     private var pumps: [Task<Void, Never>] = []
+    private let stopProofLatch = ProcessRelaunchStopProofLatch()
     private let now: @Sendable () -> ContinuousClock.Instant
     /// The one absolute cleanup budget, captured when the first stop began (review A P1-07): later
     /// stops only get what is left of it, so repeated calls never renew it.
@@ -733,14 +794,21 @@ package actor ProcessRelaunchParentSession {
         guard pumps.isEmpty else { return }
         let channel = channel
         let continuation = continuation
+        let latch = stopProofLatch
+        let correlationID = correlationID
         pumps.append(Task {
             for await event in channel.inbound {
+                if case let .message(.aborted(id)) = event, id == correlationID {
+                    latch.recordAborted()
+                }
                 continuation.yield(.inbound(event))
             }
+            // End of input is never stop proof.
             continuation.yield(.inbound(.endOfInput))
         })
         pumps.append(Task {
             await channel.waitForExit()
+            latch.record(.exitObserved)
             continuation.yield(.helperExited)
         })
     }
@@ -918,6 +986,12 @@ package actor ProcessRelaunchParentSession {
             state = .finished
             return .safe(.exitObserved)
         }
+        if let proof = stopProofLatch.recorded {
+            // Proof that arrived after an earlier unresolved stop: nothing is sent or awaited.
+            helperExited = proof == .exitObserved
+            state = .finished
+            return .safe(proof)
+        }
         startPumpsIfNeeded()
         let start = now()
         var acknowledgementDeadline = stopAcknowledgementDeadline ?? start + limits.abortAcknowledgement
@@ -928,6 +1002,7 @@ package actor ProcessRelaunchParentSession {
         }
         stopAcknowledgementDeadline = acknowledgementDeadline
         stopDeadline = cleanupDeadline
+        stopProofLatch.noteAbortSent()
         _ = send(.abort(correlationID: correlationID))
         if let proof = await awaitStop(until: acknowledgementDeadline) {
             state = .finished
@@ -971,6 +1046,15 @@ package actor ProcessRelaunchParentSession {
 
     package var isFinished: Bool {
         state == .finished
+    }
+
+    /// Waits for proof that this exact helper stopped (lossless restart Step 4b): its exact child's
+    /// observed exit, or a correlated `aborted` after an `abort` was sent. Replay-safe (proof that
+    /// arrived earlier, even while an unresolved stop gave up, returns at once) and cancellable
+    /// (`nil`). Never inferred from end of input, a delivered signal, or a timeout. Sends nothing
+    /// and changes no state; a later `abort()` then reports the stop `.safe` without waiting.
+    package nonisolated func stopProof() async -> ProcessRelaunchStopProof? {
+        await stopProofLatch.wait()
     }
 }
 

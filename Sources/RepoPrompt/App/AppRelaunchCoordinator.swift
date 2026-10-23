@@ -63,7 +63,11 @@ final class AppRelaunchCoordinator {
                 guard let self else { return .safe }
                 return await serialized { await self.abandonCurrent() }
             },
-            cleanupReserve: dependencies.limits.cleanupReserve
+            cleanupReserve: dependencies.limits.cleanupReserve,
+            awaitRetainedHelperStop: { [weak self] in
+                guard let self else { return false }
+                return await awaitRetainedStop()
+            }
         )
     }
 
@@ -151,6 +155,22 @@ final class AppRelaunchCoordinator {
             return .safe
         case let .unresolved(reason):
             return await current.armWasSent ? .unresolved(reason) : .unresolvedUnarmed(reason)
+        }
+    }
+
+    /// Lossless restart Step 4b: waits for proof that the helper retained NOW (captured before any
+    /// await) stopped, without joining or blocking the serialized hooks, then releases exactly that
+    /// session (serialized; a correlated `aborted` or its observed exit is already latched, so the
+    /// stop sends and awaits nothing). `false` when no helper is retained, the wait was cancelled,
+    /// or another hook already released it. Never spawns, prepares, arms, or renews a budget.
+    private func awaitRetainedStop() async -> Bool {
+        guard let retained = session else { return false }
+        guard await retained.stopProof() != nil, !Task.isCancelled else { return false }
+        return await serialized { [weak self] in
+            guard let self, session === retained else { return false }
+            guard case .safe = await retained.abort() else { return false }
+            if session === retained { session = nil }
+            return true
         }
     }
 

@@ -483,6 +483,132 @@ final class ProcessRelaunchHelperTests: XCTestCase {
         XCTAssertTrue(finished)
     }
 
+    // MARK: Step 4b: stop proof after an unresolved stop
+
+    /// Drives a prepared, armed-sent helper whose lost `armed` acknowledgement ends unresolved
+    /// (no `aborted`, kill signalled, exit not observed).
+    private func unresolvedArmedSession(_ helper: FakeHelperChannel) async -> ProcessRelaunchParentSession {
+        let session = helper.session()
+        _ = await session.prepare(parent: RelaunchFixture.parent, bundlePath: RelaunchFixture.bundle, deadline: .seconds(5))
+        let armTask = Task { await session.arm(acknowledgementTimeout: .seconds(1)) }
+        await helper.sleeper.waitForPending(.seconds(1))
+        helper.sleeper.fire(.seconds(1))
+        await helper.sleeper.waitForPending(ProcessRelaunchLimits.v1.abortAcknowledgement)
+        helper.sleeper.fire(ProcessRelaunchLimits.v1.abortAcknowledgement)
+        await helper.sleeper.waitForPending(ProcessRelaunchLimits.v1.terminateGrace)
+        helper.sleeper.fire(ProcessRelaunchLimits.v1.terminateGrace)
+        guard case .unresolved = await armTask.value else {
+            XCTFail("expected an unresolved lost arm")
+            return session
+        }
+        return session
+    }
+
+    private func yieldBriefly() async {
+        for _ in 0 ..< 200 {
+            await Task.yield()
+        }
+    }
+
+    /// The exact child's exit observed after the stop gave up is proof: the pending observation
+    /// resolves, a later observation replays it, and the next stop is `.safe` without another
+    /// frame, kill, or timer. The delivered signal alone never resolved it.
+    func testExactExitAfterAnUnresolvedStopIsObservedReplayedAndMakesTheNextStopSafe() async {
+        let helper = FakeHelperChannel(exitsOnTerminate: false) { message, reply in
+            if case let .prepare(id, _, _) = message { reply(.ready(correlationID: id)) }
+        }
+        let session = await unresolvedArmedSession(helper)
+        let done = RelaunchLocked(false)
+        let observation = Task {
+            let proof = await session.stopProof()
+            done.set(true)
+            return proof
+        }
+        await yieldBriefly()
+        XCTAssertFalse(done.current, "a delivered signal is not proof")
+
+        helper.exit()
+        let proof = await observation.value
+        XCTAssertEqual(proof, .exitObserved)
+        let replayed = await session.stopProof()
+        XCTAssertEqual(replayed, .exitObserved, "proof that arrived earlier is replayed")
+
+        let timersBefore = helper.sleeper.pendingDurations
+        let stop = await session.abort()
+        XCTAssertEqual(stop, .safe(.exitObserved))
+        let repeatedStop = await session.abort()
+        XCTAssertEqual(repeatedStop, .safe(.exitObserved), "repeated calls keep the actual proof")
+        XCTAssertEqual(helper.terminateCount, 1, "no second kill")
+        XCTAssertEqual(helper.sleeper.pendingDurations, timersBefore, "no new timer")
+        let finished = await session.isFinished
+        XCTAssertTrue(finished)
+    }
+
+    /// A late `aborted` correlated with this helper (after the `abort` it answers) is proof; one for
+    /// another correlation, and end of input, are not.
+    func testLateCorrelatedAbortedIsProofButAForeignAbortedAndEndOfInputAreNot() async {
+        let helper = FakeHelperChannel(exitsOnTerminate: false) { message, reply in
+            if case let .prepare(id, _, _) = message { reply(.ready(correlationID: id)) }
+        }
+        let session = await unresolvedArmedSession(helper)
+        guard case let .prepare(correlationID, _, _) = helper.received.first else { return XCTFail("expected prepare") }
+        let done = RelaunchLocked(false)
+        let observation = Task {
+            let proof = await session.stopProof()
+            done.set(true)
+            return proof
+        }
+        helper.deliver(.aborted(correlationID: UUID()))
+        await yieldBriefly()
+        XCTAssertFalse(done.current, "another correlation's acknowledgement is not proof")
+
+        helper.deliver(.aborted(correlationID: correlationID))
+        let proof = await observation.value
+        XCTAssertEqual(proof, .abortAcknowledged)
+        let stop = await session.abort()
+        XCTAssertEqual(stop, .safe(.abortAcknowledged))
+        XCTAssertEqual(helper.receivedTypes, ["prepare", "arm", "abort"], "nothing more is sent")
+        XCTAssertEqual(helper.terminateCount, 1, "no second kill")
+
+        let eof = FakeHelperChannel(exitsOnTerminate: false) { message, reply in
+            if case let .prepare(id, _, _) = message { reply(.ready(correlationID: id)) }
+        }
+        let eofSession = await unresolvedArmedSession(eof)
+        let eofDone = RelaunchLocked(false)
+        let eofObservation = Task {
+            let proof = await eofSession.stopProof()
+            eofDone.set(true)
+            return proof
+        }
+        eof.finishInput()
+        await yieldBriefly()
+        XCTAssertFalse(eofDone.current, "end of input is not proof")
+        eofObservation.cancel()
+        let cancelled = await eofObservation.value
+        XCTAssertNil(cancelled, "a cancelled observation reports nothing")
+        let state = await eofSession.state
+        XCTAssertEqual(state, .stopUnresolved, "still retained")
+    }
+
+    /// An `aborted` that answers no `abort` the parent sent is not stop proof; a cancelled
+    /// observation ends without proof.
+    func testUnsolicitedAbortedIsNotProofAndObservationIsCancellable() async {
+        let helper = FakeHelperChannel(exitsOnTerminate: false) { message, reply in
+            if case let .prepare(id, _, _) = message { reply(.ready(correlationID: id)) }
+        }
+        let session = helper.session()
+        _ = await session.prepare(parent: RelaunchFixture.parent, bundlePath: RelaunchFixture.bundle, deadline: .seconds(5))
+        guard case let .prepare(correlationID, _, _) = helper.received.first else { return XCTFail("expected prepare") }
+        let observation = Task { await session.stopProof() }
+        helper.deliver(.aborted(correlationID: correlationID))
+        await yieldBriefly()
+        observation.cancel()
+        let proof = await observation.value
+        XCTAssertNil(proof)
+        let state = await session.state
+        XCTAssertEqual(state, .ready)
+    }
+
     func testPrepareFailureWithUnresolvedStopIsTyped() async {
         let helper = FakeHelperChannel(exitsOnTerminate: false) { message, reply in
             if case let .prepare(id, _, _) = message { reply(.failed(correlationID: id, reason: "wrong bundle")) }
@@ -888,7 +1014,7 @@ private final class HelperHarness: @unchecked Sendable {
 /// parent sends and may reply with helper messages.
 private final class FakeHelperChannel: @unchecked Sendable {
     let sleeper = RelaunchManualSleeper()
-    private let received = RelaunchLocked<[ProcessRelaunchMessage]>([])
+    private let receivedFrames = RelaunchLocked<[ProcessRelaunchMessage]>([])
     private let terminations = RelaunchLocked(0)
     private let exitGate = RelaunchGate()
     private let inbound: AsyncStream<ProcessRelaunchInbound>
@@ -909,7 +1035,7 @@ private final class FakeHelperChannel: @unchecked Sendable {
     }
 
     var receivedTypes: [String] {
-        received.current.map { message in
+        receivedFrames.current.map { message in
             switch message {
             case .prepare: "prepare"
             case .ready: "ready"
@@ -926,12 +1052,26 @@ private final class FakeHelperChannel: @unchecked Sendable {
         terminations.current
     }
 
+    var received: [ProcessRelaunchMessage] {
+        receivedFrames.current
+    }
+
     var hasExited: Bool {
         exitGate.opened
     }
 
+    /// A helper frame arriving on its own (not as a reply).
+    func deliver(_ message: ProcessRelaunchMessage) {
+        continuation.yield(.message(message))
+    }
+
+    /// The helper closes its output (never exit proof).
+    func finishInput() {
+        continuation.finish()
+    }
+
     func waitForReceived(_ count: Int) async {
-        await relaunchEventually { self.received.current.count >= count }
+        await relaunchEventually { self.receivedFrames.current.count >= count }
     }
 
     func exit() {
@@ -942,7 +1082,7 @@ private final class FakeHelperChannel: @unchecked Sendable {
         let channel = ProcessRelaunchHelperChannel(
             send: { [self] data in
                 guard !exitGate.opened, let message = try? ProcessRelaunchCodec.decode(data.dropLast()) else { return false }
-                received.mutate { $0.append(message) }
+                receivedFrames.mutate { $0.append(message) }
                 let continuation = continuation
                 respond(message) { reply in continuation.yield(.message(reply)) }
                 return true

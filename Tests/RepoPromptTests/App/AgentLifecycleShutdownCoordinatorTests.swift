@@ -285,6 +285,12 @@ final class AgentLifecycleShutdownCoordinatorTests: XCTestCase {
             pendingChoice = nil
             continuation?.resume(returning: choice)
         }
+
+        /// Like AppKit ending a dismissed sheet: the pending prompt returns without a real choice.
+        func dismiss(_ scope: AgentLifecycleShutdownScope) {
+            dismissed.append(scope)
+            choose(.cancel)
+        }
     }
 
     private var recorder: Recorder!
@@ -359,7 +365,7 @@ final class AgentLifecycleShutdownCoordinatorTests: XCTestCase {
             beginIrreversible: { recorder.irreversible.append($0) },
             tearDownScope: { recorder.scopeTeardowns.append($0) },
             presentFailure: { await recorder.present($0) },
-            dismissFailure: { recorder.dismissed.append($0) },
+            dismissFailure: { recorder.dismiss($0) },
             now: { clock.now },
             sleepUntil: { try await clock.sleep(until: $0) }
         )
@@ -1149,6 +1155,39 @@ final class AgentLifecycleShutdownCoordinatorTests: XCTestCase {
         var disk: LaunchMarkDisk?
         private(set) var helperReady = false
         private(set) var helperArmed = false
+        /// Step 4b: a recorded stop proof of the retained helper, released once (replayed to a
+        /// later observation when it arrived first).
+        private var retainedStopProven = false
+        private var stopWaiter: (id: UUID, continuation: CheckedContinuation<Bool, Never>)?
+        private(set) var cancelledStopWaits = 0
+
+        /// The retained helper's exact exit or correlated `aborted` arrived.
+        func proveRetainedHelperStop() {
+            if let waiter = stopWaiter {
+                stopWaiter = nil
+                waiter.continuation.resume(returning: true)
+            } else {
+                retainedStopProven = true
+            }
+        }
+
+        var isAwaitingStop: Bool {
+            stopWaiter != nil
+        }
+
+        /// Test cleanup: ends a still-pending observation without proof.
+        func endStopWait() {
+            guard let waiter = stopWaiter else { return }
+            stopWaiter = nil
+            waiter.continuation.resume(returning: false)
+        }
+
+        private func cancelStopWait(_ id: UUID) {
+            guard let waiter = stopWaiter, waiter.id == id else { return }
+            stopWaiter = nil
+            cancelledStopWaits += 1
+            waiter.continuation.resume(returning: false)
+        }
 
         var hooks: AgentLifecycleRelaunchHooks {
             AgentLifecycleRelaunchHooks(
@@ -1181,6 +1220,24 @@ final class AgentLifecycleShutdownCoordinatorTests: XCTestCase {
                         helperArmed = false
                     }
                     return result
+                },
+                awaitRetainedHelperStop: { [self] in
+                    calls.append("awaitStop")
+                    let id = UUID()
+                    return await withTaskCancellationHandler {
+                        await withCheckedContinuation { continuation in
+                            if retainedStopProven {
+                                retainedStopProven = false
+                                continuation.resume(returning: true)
+                            } else if Task.isCancelled {
+                                continuation.resume(returning: false)
+                            } else {
+                                stopWaiter = (id, continuation)
+                            }
+                        }
+                    } onCancel: {
+                        Task { @MainActor in self.cancelStopWait(id) }
+                    }
                 }
             )
         }
@@ -1320,8 +1377,8 @@ final class AgentLifecycleShutdownCoordinatorTests: XCTestCase {
         let coordinator = makeCoordinator(relaunch: relaunch.hooks)
         var replies: [Bool] = []
         XCTAssertTrue(coordinator.requestApplicationQuit(reason: .safeRestart) { replies.append($0) })
-        await waitUntil("the no-choice prompt") { recorder.isPresenting }
-        XCTAssertEqual(relaunch.calls, ["prepare", "verify", "arm", "abandon"])
+        await waitUntil("the no-choice prompt and its stop observation") { recorder.isPresenting && relaunch.isAwaitingStop }
+        XCTAssertEqual(relaunch.calls, ["prepare", "verify", "arm", "abandon", "awaitStop"])
         let failure = recorder.presented.last
         XCTAssertEqual(failure?.relaunchHelperUnresolved, true)
         XCTAssertEqual(failure?.offeredChoices, [], "no Retry, Cancel, or Quit Anyway")
@@ -1332,8 +1389,113 @@ final class AgentLifecycleShutdownCoordinatorTests: XCTestCase {
         XCTAssertEqual(replies, [], "never reported finished")
         XCTAssertEqual(coordinator.applicationRequest?.isFinished, false)
         XCTAssertEqual(coordinator.applicationRequest?.phase, .finalizationFailed)
-        XCTAssertEqual(relaunch.calls, ["prepare", "verify", "arm", "abandon"], "no fresh helper, retry, or second arm")
+        XCTAssertEqual(
+            relaunch.calls,
+            ["prepare", "verify", "arm", "abandon", "awaitStop"],
+            "no fresh helper, retry, or second arm"
+        )
+        XCTAssertTrue(relaunch.isAwaitingStop, "an ignored answer keeps waiting for the stop proof")
         XCTAssertEqual(participant.finalizeCalls, 1)
+        relaunch.proveRetainedHelperStop()
+        await waitUntil("choices restored after the informational answer") { recorder.presented.count == 2 && recorder.isPresenting }
+        XCTAssertEqual(recorder.presented.last?.offeredChoices, [.retry, .proceedAnyway])
+        XCTAssertEqual(replies, [], "late proof does not quit automatically")
+        recorder.choose(.proceedAnyway)
+        await waitUntil("explicit Quit Anyway completes") { replies == [true] }
+        XCTAssertEqual(relaunch.calls.count { $0 == "arm" }, 1, "no automatic second arm")
+    }
+
+    /// Step 4b: once the retained (arm-sent) helper's stop is proven, the no-choice prompt is
+    /// dismissed and the same Stage B failure is presented again with its normal choices. The
+    /// notification itself retries nothing, prepares or arms no helper, saves or marks nothing, and
+    /// renews no deadline; the dismissed prompt's answer and a duplicate proof do nothing. Only the
+    /// user's explicit Retry then runs the normal pipeline with a fresh deadline and helper.
+    func testSafeRestartProvenRetainedHelperStopRestoresTheChoicesAndOnlyAnExplicitRetryRearms() async {
+        let participant = FakeParticipant()
+        appParticipants = [participant]
+        let relaunch = FakeRelaunch()
+        relaunch.armResults = ["The relaunch helper did not confirm it was armed."]
+        relaunch.abandonResults = [.unresolved("RepoPrompt could not confirm that its restart helper stopped.")]
+        let coordinator = makeCoordinator(relaunch: relaunch.hooks)
+        var replies: [Bool] = []
+        XCTAssertTrue(coordinator.requestApplicationQuit(reason: .safeRestart) { replies.append($0) })
+        await waitUntil("the no-choice prompt and its stop observation") { recorder.isPresenting && relaunch.isAwaitingStop }
+        XCTAssertEqual(relaunch.calls, ["prepare", "verify", "arm", "abandon", "awaitStop"])
+        let informational = recorder.presented.last
+        XCTAssertEqual(informational?.offeredChoices, [])
+        let request = coordinator.applicationRequest
+        XCTAssertEqual(request?.expiry, clock.instant(at: .seconds(7)))
+        await drainLaunchMarks()
+        let marksBefore = disk.committed
+        XCTAssertEqual(marksBefore.last, .cleanExit)
+        // Time passes while the prompt informs: a renewed deadline would be visible.
+        clock.advance(by: .seconds(3))
+
+        relaunch.proveRetainedHelperStop()
+        await waitUntil("the restored prompt") { recorder.presented.count == 2 && recorder.isPresenting }
+        await settle()
+        XCTAssertEqual(recorder.dismissed, [.application], "the informational prompt is dismissed")
+        XCTAssertEqual(recorder.presented.count, 2, "the dismissed prompt's answer is ignored")
+        let restored = recorder.presented.last
+        XCTAssertEqual(restored?.stage, .finalization)
+        XCTAssertEqual(restored?.relaunchHelperUnresolved, false)
+        XCTAssertEqual(restored?.offeredChoices, [.retry, .proceedAnyway])
+        XCTAssertEqual(restored?.messages, informational.map { Array($0.messages.dropLast()) })
+        XCTAssertEqual(request?.relaunchHelperStopRecoveries, 1)
+        XCTAssertEqual(request?.relaunchHelperUnresolvedPrompts, 0)
+        XCTAssertEqual(
+            relaunch.calls,
+            ["prepare", "verify", "arm", "abandon", "awaitStop", "abandon"],
+            "no automatic Retry, fresh helper, or arm"
+        )
+        XCTAssertEqual(replies, [], "no automatic quit")
+        XCTAssertEqual(request?.isFinished, false)
+        XCTAssertEqual(request?.finalizationAttempts, 1)
+        XCTAssertEqual(participant.finalizeCalls, 1, "nothing is saved again")
+        XCTAssertEqual(request?.expiry, clock.instant(at: .seconds(7)), "no renewed deadline")
+        await drainLaunchMarks()
+        XCTAssertEqual(disk.committed, marksBefore, "no further launch mark")
+
+        relaunch.proveRetainedHelperStop()
+        await settle()
+        XCTAssertEqual(recorder.presented.count, 2, "a duplicate proof does nothing")
+        XCTAssertEqual(recorder.dismissed, [.application])
+        XCTAssertEqual(request?.relaunchHelperStopRecoveries, 1)
+
+        recorder.choose(.retry)
+        await waitUntil("the restart reply") { !replies.isEmpty }
+        XCTAssertEqual(replies, [true])
+        XCTAssertEqual(Array(relaunch.calls.dropFirst(6)), ["verify", "prepare", "arm"], "the explicit Retry uses a fresh helper")
+        XCTAssertEqual(request?.finalizationAttempts, 2)
+        XCTAssertEqual(request?.expiry, clock.instant(at: .seconds(10)), "the explicit Retry starts a fresh deadline")
+        XCTAssertEqual(request?.relaunchArmed, true)
+        XCTAssertEqual(participant.teardownExecutions, 1, "Retry never repeats teardown")
+        XCTAssertEqual(participant.finalizeCalls, 1, "Retry joins the acknowledged clean write")
+    }
+
+    /// Step 4b: proof that arrived before the observation was registered is not missed; the
+    /// restored Quit Anyway quits without relaunching.
+    func testSafeRestartStopProofArrivingBeforeTheObservationRestoresChoicesAndQuitAnywayNeverRelaunches() async {
+        let participant = FakeParticipant()
+        appParticipants = [participant]
+        let relaunch = FakeRelaunch()
+        relaunch.armResults = ["The relaunch helper did not confirm it was armed."]
+        relaunch.abandonResults = [.unresolved("RepoPrompt could not confirm that its restart helper stopped.")]
+        relaunch.proveRetainedHelperStop()
+        let coordinator = makeCoordinator(relaunch: relaunch.hooks)
+        var replies: [Bool] = []
+        XCTAssertTrue(coordinator.requestApplicationQuit(reason: .safeRestart) { replies.append($0) })
+        await waitUntil("the restored prompt") { recorder.presented.count == 2 && recorder.isPresenting }
+        XCTAssertEqual(recorder.presented.first?.relaunchHelperUnresolved, true)
+        XCTAssertEqual(recorder.presented.last?.offeredChoices, [.retry, .proceedAnyway])
+        XCTAssertEqual(relaunch.calls, ["prepare", "verify", "arm", "abandon", "awaitStop", "abandon"])
+
+        recorder.choose(.proceedAnyway)
+        await waitUntil("the reply") { !replies.isEmpty }
+        XCTAssertEqual(replies, [true])
+        XCTAssertEqual(relaunch.calls.count { $0 == "arm" }, 1, "Quit Anyway never relaunches")
+        XCTAssertEqual(coordinator.applicationRequest?.relaunchArmed, false)
+        XCTAssertEqual(relaunch.cancelledStopWaits, 0)
     }
 
     /// Review R1 B N3: an unresolved stop of a helper the protocol proves was never sent `arm` (it
