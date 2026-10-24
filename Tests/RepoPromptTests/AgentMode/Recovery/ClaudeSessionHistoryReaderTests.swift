@@ -1172,4 +1172,296 @@ final class ClaudeSessionHistoryReaderTests: XCTestCase {
             nativeSessionID: sessionID, projectsDirectories: [projects], mode: .baseline, ledger: nil, fences: [emptyFence], fileAccess: access([])
         )))
     }
+
+    // MARK: Step 4d4 successful main-thread Read across a same-session resume (sanitized O20 shape)
+
+    /// Modeled on the sanitized phase4d-tool-resume-capture O20 observations (CLI 2.1.302): no
+    /// captured ids, paths, file contents, attachment or request payloads. Opaque payloads are the
+    /// private-context / request sentinels, so they never reach rows or digests. Operational counts
+    /// are reduced: api-request-shape, repeated request blobs and the later atis-latch are omitted;
+    /// this is a semantic graph fixture, not an ordinal-for-ordinal capture copy.
+    private static let o20Tokens = ["BRAVO-42", "CHARLIE-19", "DELTA-63"]
+
+    private func o20Caller(_ exchange: Int) -> String {
+        "c0000000-0000-4000-8000-00000000000\(exchange)"
+    }
+
+    private func o20ToolUseID(_ exchange: Int) -> String {
+        "toolu_o20_\(exchange)"
+    }
+
+    private func settingMessage(_ object: [String: Any], _ extra: [String: Any]) -> [String: Any] {
+        var object = object
+        var message = object["message"] as? [String: Any] ?? [:]
+        for (key, value) in extra {
+            message[key] = value
+        }
+        object["message"] = message
+        return object
+    }
+
+    /// One O20 exchange: queue records, the caller's string-content prompt (a new anchor), an
+    /// attachment chain, the one-block `tool_use` Read assistant, its tool-result user entry (own
+    /// UUID, parented DIRECTLY on the call, naming it as source, string content, no `is_error`,
+    /// top-level `toolUseResult`/`permissionDecision` metadata), a second attachment chain, the
+    /// one-text final assistant parented on the last attachment, and `last-prompt`. `nativeStops`
+    /// sets native `stop_reason` (`tool_use`/`end_turn`); otherwise null as on stdout.
+    private func o20Exchange(_ exchange: Int, parent: String?, nativeStops: Bool = true) -> [[String: Any]] {
+        let caller = o20Caller(exchange)
+        let call = "o20-u\(exchange)a", result = "o20-u\(exchange)b", answer = "o20-u\(exchange)c"
+        let toolUseID = o20ToolUseID(exchange)
+        let token = Self.o20Tokens[exchange - 1]
+        let request = Self.requestSentinel
+        var entries = [
+            operational("queue-operation", extra: ["operation": "enqueue"]),
+            operational("queue-operation", extra: ["operation": "dequeue"]),
+            entry("user", uuid: caller, parent: parent, content: "Use Read on fixture\(exchange), then reply with its token.", extra: [
+                "promptId": "o20-p\(exchange)", "promptSource": "sdk", "turnOrigin": "sdk", "permissionMode": "default",
+                "turnPosition": ["promptIndex": exchange - 1, "turnIndex": exchange]
+            ])
+        ]
+        var previous = caller
+        // The first prompt carries the full context chain (with `atis-latch`); later ones, including
+        // the resumed prompt, re-inject only the token/budget reminders.
+        let leading = exchange == 1 ? firstAttachmentTypes + secondAttachmentTypes : ["total_tokens_reminder", "budget_usd"]
+        for (index, type) in leading.enumerated() {
+            let id = "o20-n\(exchange)-\(index)"
+            entries.append(attachment(id, parent: previous, type: type))
+            previous = id
+            if exchange == 1, index == firstAttachmentTypes.count - 1 { entries.append(operational("atis-latch")) }
+        }
+        entries += [operational("api-request-blob"), operational("api-request", extra: ["id": "req-o20-\(exchange)a"])]
+        entries.append(settingMessage(entry(
+            "assistant",
+            uuid: call,
+            parent: previous,
+            content: [["type": "tool_use", "id": toolUseID, "name": "Read", "input": ["file_path": "/fixture/workspace/fixture\(exchange)"]]],
+            messageID: "msg-o20-\(exchange)a",
+            extra: [
+                "requestId": "request-o20-\(exchange)a", "wireToolInputs": [request], "apiBlockIndex": 0,
+                "effort": "high", "perTurnEffort": "high", "requestedModel": "fixture-model", "version": "2.1.302"
+            ]
+        ), ["stop_reason": nativeStops ? "tool_use" : NSNull(), "model": "fixture-model"]))
+        entries.append(entry(
+            "user",
+            uuid: result,
+            parent: call,
+            content: [["type": "tool_result", "tool_use_id": toolUseID, "content": token]],
+            source: call,
+            extra: [
+                "promptId": "o20-p\(exchange)", "version": "2.1.302",
+                "toolUseResult": ["type": "text", "file": [
+                    "content": Self.contextSentinel, "filePath": "/fixture/workspace/fixture\(exchange)",
+                    "numLines": 1, "startLine": 1, "totalLines": 1
+                ] as [String: Any]] as [String: Any],
+                "permissionDecision": ["decision": "accept", "source": "config", "reasonType": "fixture"]
+            ]
+        ))
+        previous = result
+        let trailing = exchange == 1 ? ["prompt_snapshot", "total_tokens_reminder", "budget_usd"] : ["total_tokens_reminder", "budget_usd"]
+        for (index, type) in trailing.enumerated() {
+            let id = "o20-m\(exchange)-\(index)"
+            entries.append(attachment(id, parent: previous, type: type))
+            previous = id
+        }
+        entries += [operational("api-request-blob"), operational("api-request", extra: ["id": "req-o20-\(exchange)c"])]
+        if exchange == 2 { entries.append(operational("last-prompt", extra: ["leafUuid": previous])) }
+        entries.append(settingMessage(entry(
+            "assistant",
+            uuid: answer,
+            parent: previous,
+            content: [["type": "text", "text": token]],
+            messageID: "msg-o20-\(exchange)c",
+            extra: ["requestId": "request-o20-\(exchange)c", "version": "2.1.302"]
+        ), ["stop_reason": nativeStops ? "end_turn" : NSNull(), "model": "fixture-model"]))
+        if exchange >= 2 { entries.append(operational("last-prompt", extra: ["leafUuid": answer])) }
+        return entries
+    }
+
+    /// The exact observed `mode` record: only `type`, `mode` and `sessionId`.
+    private func o20ModeRecord(_ adjust: (inout [String: Any]) -> Void = { _ in }) -> [String: Any] {
+        var object: [String: Any] = ["type": "mode", "mode": "normal", "sessionId": sessionID]
+        adjust(&object)
+        return object
+    }
+
+    private func o20CostState() -> [String: Any] {
+        var cost = operational("cost-state")
+        cost["sessionId"] = nil
+        return cost
+    }
+
+    /// Process 1 (two exchanges) and the resumed process 2 append (one exchange, then `mode`).
+    private func o20Processes(nativeStops: Bool = true, mode: [String: Any]? = nil) -> (first: [[String: Any]], second: [[String: Any]]) {
+        let first = o20Exchange(1, parent: nil, nativeStops: nativeStops)
+            + o20Exchange(2, parent: "o20-u1c", nativeStops: nativeStops) + [o20CostState()]
+        let second = o20Exchange(3, parent: "o20-u2c", nativeStops: nativeStops) + [mode ?? o20ModeRecord(), o20CostState()]
+        return (first, second)
+    }
+
+    func testO20ReadExchangesAcrossASameSessionResumeProjectThroughTheExistingToolAssociation() throws {
+        let (first, second) = o20Processes()
+        let firstBytes = jsonl(first), fullBytes = jsonl(first + second)
+        XCTAssertEqual(fullBytes.prefix(firstBytes.count), firstBytes, "process 2 only appends (byte-exact prefix)")
+        let value = try XCTUnwrap(candidate(read(fullBytes, mode: fromStart)))
+        XCTAssertEqual(rowSummary(value.rows), (1 ... 3).flatMap { n in
+            ["\(o20Caller(n))|userText|0", "o20-u\(n)a|toolCall|0", "o20-u\(n)b|toolResult|0", "o20-u\(n)c|assistantText|0"]
+        }, "attachments, operational records and mode never render; one Read per prompt")
+        for exchange in 1 ... 3 {
+            let rows = value.rows.filter { $0.nativeEntryID.hasSuffix("u\(exchange)a") || $0.nativeEntryID.hasSuffix("u\(exchange)b") }
+            let call = try XCTUnwrap(rows.first { $0.kind == .toolCall })
+            let result = try XCTUnwrap(rows.first { $0.kind == .toolResult })
+            let toolUseID = o20ToolUseID(exchange)
+            // Native assistant UUID identity; the tool-result user has its own, distinct UUID.
+            XCTAssertEqual(call.localItemID, Reader.deterministicUUID(
+                namespace: "rpce-claude-history-row-v1",
+                components: [Reader.providerRaw, sessionID, "o20-u\(exchange)a", "toolCall", "0"]
+            ))
+            XCTAssertEqual(result.localItemID, Reader.deterministicUUID(
+                namespace: "rpce-claude-history-row-v1",
+                components: [Reader.providerRaw, sessionID, "o20-u\(exchange)b", "toolResult", "0"]
+            ))
+            XCTAssertNotEqual(result.nativeEntryID, call.nativeEntryID)
+            XCTAssertNotEqual(result.nativeEntryID, o20Caller(exchange), "a tool result is never a caller anchor")
+            // The shared tool_use_id alone derives the pairing invocation ID.
+            let invocation = Reader.deterministicUUID(namespace: "rpce-claude-history-tool-v1", components: [Reader.providerRaw, sessionID, toolUseID])
+            XCTAssertEqual(call.toolUseID, toolUseID)
+            XCTAssertEqual(result.toolUseID, toolUseID)
+            XCTAssertEqual(call.toolInvocationID, invocation)
+            XCTAssertEqual(result.toolInvocationID, invocation)
+            XCTAssertEqual(call.toolName, "Read")
+            XCTAssertEqual(result.toolName, "Read")
+            XCTAssertEqual(call.toolInputJSON, #"{"file_path":"\/fixture\/workspace\/fixture\#(exchange)"}"#)
+            XCTAssertEqual(result.text, Self.o20Tokens[exchange - 1])
+            XCTAssertNil(result.toolIsError, "an absent is_error stays unknown, never false")
+        }
+        XCTAssertEqual(Set(value.rows.compactMap(\.toolInvocationID)).count, 3)
+        XCTAssertEqual(value.rows.filter { $0.kind == .assistantText }.map(\.text), Self.o20Tokens)
+        XCTAssertTrue(value.rows.filter { $0.kind == .userText }.allSatisfy { $0.localItemID == nil })
+        for row in value.rows {
+            XCTAssertFalse(row.text?.contains("SENTINEL") ?? false)
+            XCTAssertFalse(row.toolInputJSON?.contains("SENTINEL") ?? false)
+        }
+        // Caller UUIDs are the only prompt anchors (tool-result users never are).
+        XCTAssertEqual(value.userMessageEntries.map(\.nativeEntryID), (1 ... 3).map(o20Caller))
+        XCTAssertEqual(
+            value.userMessageEntries.map(\.textSHA256),
+            (1 ... 3).map { Optional(sha256("Use Read on fixture\($0), then reply with its token.")) }
+        )
+        XCTAssertEqual(value.completion, .unconfirmed, "last-prompt, mode and cost-state prove nothing")
+
+        // Native stop_reason (tool_use/end_turn) vs stdout null: identical rows, IDs and digests.
+        let stdoutShaped = o20Processes(nativeStops: false)
+        let nullStops = try XCTUnwrap(candidate(read(jsonl(stdoutShaped.first + stdoutShaped.second), mode: fromStart)))
+        XCTAssertNotEqual(jsonl(stdoutShaped.first + stdoutShaped.second), fullBytes)
+        XCTAssertEqual(nullStops.rows, value.rows)
+    }
+
+    func testO20ResumedAppendImportsOnlyTheNewExchangeAndReplaysAsANoOp() throws {
+        let (first, second) = o20Processes()
+        let firstBytes = jsonl(first), fullBytes = jsonl(first + second)
+        // Process 1 imported from the start.
+        let initial = try XCTUnwrap(candidate(read(firstBytes, mode: fromStart)))
+        XCTAssertEqual(initial.completeLineOffset, UInt64(firstBytes.count))
+        let firstPlan = AgentProviderHistoryImportPlanner.plan(
+            observation: Reader.observation(initial),
+            existingItemIDs: [],
+            ledger: nil,
+            previousCursor: nil,
+            importID: UUID(),
+            now: Date(timeIntervalSince1970: 5000)
+        )
+        XCTAssertEqual(firstPlan.appendedItems.filter { $0.kind != .system }.map(\.kind), [.toolCall, .toolResult, .assistant, .toolCall, .toolResult, .assistant])
+        // The resumed append (same file, byte-exact prefix): only process 2 rows, after the cursor.
+        let resumed = try XCTUnwrap(candidate(read(fullBytes, mode: .importAfter(firstPlan.cursor), ledger: firstPlan.ledger)))
+        XCTAssertFalse(resumed.isRescan)
+        XCTAssertEqual(resumed.rows.map(\.nativeEntryID), [o20Caller(3), "o20-u3a", "o20-u3b", "o20-u3c"])
+        XCTAssertEqual(resumed.validationRows.count, 12, "the whole graph (both processes) is validated")
+        XCTAssertEqual(resumed.userMessageEntries.map(\.nativeEntryID), [o20Caller(3)], "only the resumed caller is a new anchor")
+        let resumedPlan = AgentProviderHistoryImportPlanner.plan(
+            observation: Reader.observation(resumed),
+            existingItemIDs: Set(firstPlan.appendedItems.map(\.id)),
+            ledger: firstPlan.ledger,
+            previousCursor: firstPlan.cursor,
+            importID: UUID(),
+            now: Date(timeIntervalSince1970: 6000)
+        )
+        let appended = resumedPlan.appendedItems.filter { $0.kind != .system }
+        XCTAssertEqual(appended.map(\.kind), [.toolCall, .toolResult, .assistant])
+        XCTAssertEqual(appended[0].toolInvocationID, appended[1].toolInvocationID)
+        XCTAssertEqual(appended.map(\.id), resumed.rows.compactMap(\.localItemID))
+        XCTAssertEqual(resumedPlan.ledger.nativeItems.count, 12)
+        // Re-reading the same bytes after the latest cursor yields nothing, and replaying the same
+        // observation over the transcript appends nothing.
+        let again = try XCTUnwrap(candidate(read(fullBytes, mode: .importAfter(resumedPlan.cursor), ledger: resumedPlan.ledger)))
+        XCTAssertTrue(again.rows.isEmpty)
+        let existing = Set(firstPlan.appendedItems.map(\.id)).union(resumedPlan.appendedItems.map(\.id))
+        let replay = AgentProviderHistoryImportPlanner.plan(
+            observation: Reader.observation(resumed),
+            existingItemIDs: existing,
+            ledger: resumedPlan.ledger,
+            previousCursor: resumedPlan.cursor,
+            importID: UUID(),
+            now: Date(timeIntervalSince1970: 7000)
+        )
+        XCTAssertTrue(replay.appendedItems.isEmpty, "a replay appends nothing")
+        XCTAssertEqual(replay.ledger.nativeItems.count, resumedPlan.ledger.nativeItems.count)
+    }
+
+    func testO20ModeRecordIsAcceptedOnlyInItsExactObservedShape() {
+        XCTAssertFalse(Reader.operationalTypes.contains("mode"), "mode is not a generic operational type")
+        let accepted = o20Processes()
+        XCTAssertNotNil(candidate(read(jsonl(accepted.first + accepted.second), mode: fromStart)))
+        XCTAssertNotNil(candidate(read(jsonl(accepted.first + accepted.second), mode: .baseline)))
+        func refusal(_ mode: [String: Any]) -> Reader.Result {
+            let (first, second) = o20Processes(mode: mode)
+            return read(jsonl(first + second), mode: fromStart)
+        }
+        let line = accepted.first.count + accepted.second.count - 1 // mode precedes the trailing cost-state
+        XCTAssertEqual(accepted.second[accepted.second.count - 2]["type"] as? String, "mode")
+        // Unknown fields refuse (the first unknown key in sorted order is named).
+        XCTAssertEqual(refusal(o20ModeRecord { $0["permissionMode"] = "default" }), .unsupported(.metadata("permissionMode", line: line)))
+        let twoUnknown = o20ModeRecord {
+            $0["timestamp"] = "t"
+            $0["content"] = "x"
+        }
+        XCTAssertEqual(refusal(twoUnknown), .unsupported(.metadata("content", line: line)))
+        // Other mode values or types refuse.
+        for value in ["plan", "Normal", "", 1, NSNull()] as [Any] {
+            XCTAssertEqual(refusal(o20ModeRecord { $0["mode"] = value }), .unsupported(.metadata("mode", line: line)), "\(value)")
+        }
+        XCTAssertEqual(refusal(o20ModeRecord { $0["mode"] = nil }), .unsupported(.metadata("mode", line: line)))
+        // Graph identity keys refuse, even null.
+        for key in ["uuid", "parentUuid"] {
+            for value in [NSNull(), "o20-u3c"] as [Any] {
+                XCTAssertEqual(refusal(o20ModeRecord { $0[key] = value }), .unsupported(.operationalRecord("mode", line: line)), key)
+            }
+        }
+        // A missing, non-string or different session refuses.
+        XCTAssertEqual(refusal(o20ModeRecord { $0["sessionId"] = nil }), .unsupported(.sessionMismatch(line: line)))
+        XCTAssertEqual(refusal(o20ModeRecord { $0["sessionId"] = NSNull() }), .unsupported(.sessionMismatch(line: line)))
+        XCTAssertEqual(refusal(o20ModeRecord { $0["sessionId"] = "11111111-2222-4333-8444-555555555555" }), .unsupported(.sessionMismatch(line: line)))
+        // A marker key is just another unknown field here; an unknown type stays strictly refused.
+        XCTAssertEqual(refusal(o20ModeRecord { $0["supersedes"] = "o20-u3c" }), .unsupported(.metadata("supersedes", line: line)))
+        XCTAssertEqual(refusal(o20ModeRecord { $0["type"] = "mode-v2" }), .unsupported(.entryType("mode-v2", line: line)))
+    }
+
+    func testO20WrongToolResultIdSourceOrParentRefusesTheWholeCandidate() {
+        func refusal(_ adjust: (inout [String: Any]) -> Void) -> Reader.Result {
+            let processes = o20Processes()
+            var second = processes.second
+            if let index = second.firstIndex(where: { ($0["uuid"] as? String) == "o20-u3b" }) {
+                adjust(&second[index])
+            } else {
+                XCTFail("fixture lost the resumed tool result")
+            }
+            return read(jsonl(processes.first + second), mode: fromStart)
+        }
+        let unassociated = Reader.Result.unsupported(.toolAssociation("unassociated tool result o20-u3b"))
+        XCTAssertEqual(refusal { $0["message"] = ["role": "user", "content": [["type": "tool_result", "tool_use_id": "toolu_o20_9", "content": "DELTA-63"]]] }, unassociated)
+        XCTAssertEqual(refusal { $0["message"] = ["role": "user", "content": [["type": "tool_result", "tool_use_id": "toolu_o20_1", "content": "DELTA-63"]]] }, unassociated, "an earlier call's id")
+        XCTAssertEqual(refusal { $0["sourceToolAssistantUUID"] = "o20-u2a" }, unassociated)
+        XCTAssertEqual(refusal { $0["parentUuid"] = "o20-n3-1" }, unassociated, "result re-parented onto a pre-call attachment")
+        XCTAssertEqual(refusal { $0["parentUuid"] = o20Caller(3) }, unassociated)
+    }
 }

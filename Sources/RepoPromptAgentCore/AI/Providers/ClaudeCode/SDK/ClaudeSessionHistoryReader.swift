@@ -36,6 +36,11 @@ import Foundation
 //   The exact observed operational record types carry no graph identity and are skipped unread
 //   (any `uuid`/`parentUuid` key on one refuses). This qualifies a visible projection of that
 //   observed shape only, not the native format, other attachment kinds, or activation.
+// - Step 4d4 (phase4d-tool-resume-capture O20): one exact `mode` record is skipped as nonprojected
+//   metadata only when it is precisely `{type:"mode", mode:"normal", sessionId:<this session>}`;
+//   any other key (graph ID keys included, even null), mode value, or session refuses. `mode` is
+//   deliberately not an operational type. Successful single-Read tool exchanges across a
+//   same-session resume project through the existing tool association unchanged.
 // - Attachment-only side branches carry no message and never count as a continuation; a branch
 //   whose subtree holds any message still does. A direct chain projects in ancestor order (block
 //   ordinals unchanged); a demonstrated tool fork keeps file order.
@@ -157,7 +162,7 @@ package enum ClaudeSessionHistoryReader {
         case toolAssociation(String)
         /// An attachment outside the exact whitelist, or a malformed one (its payload is never named).
         case attachment(line: Int)
-        /// An operational record carrying `uuid`/`parentUuid` graph identity.
+        /// An operational or exact-metadata record carrying `uuid`/`parentUuid` graph identity.
         case operationalRecord(String, line: Int)
         /// A documented retraction/supersession marker (`supersedes`, `aborted`, `retracted_message_uuids`).
         case semanticMarker(String, line: Int)
@@ -395,7 +400,7 @@ package enum ClaudeSessionHistoryReader {
             case let .failure(unsupported):
                 return .unsupported(unsupported)
             case .success(nil):
-                // An operational record: no graph identity, skipped unread.
+                // An operational or exact mode-metadata record: no graph identity, never projected.
                 continue
             case let .success(entry?):
                 if let existing = byUUID[entry.uuid] {
@@ -573,7 +578,33 @@ package enum ClaudeSessionHistoryReader {
         return nil
     }
 
-    /// `nil` = an operational record (validated to carry no graph identity, otherwise unread).
+    /// Step 4d4 (phase4d-tool-resume-capture O20, CLI 2.1.302): the single exact observed `mode`
+    /// record is nonprojected metadata, NOT a generic operational type. Its whole shape is checked:
+    /// no `uuid`/`parentUuid` key (even null), `sessionId` exactly this session, no other key, and
+    /// `mode == "normal"`. Anything else refuses with the existing typed cases.
+    private static func parseModeRecord(
+        _ object: NSDictionary,
+        line: Int,
+        nativeSessionID: String
+    ) -> Swift.Result<Entry?, Unsupported> {
+        guard object["uuid"] == nil, object["parentUuid"] == nil else {
+            return .failure(.operationalRecord("mode", line: line))
+        }
+        guard (object["sessionId"] as? String) == nativeSessionID else {
+            return .failure(.sessionMismatch(line: line))
+        }
+        let allowed = ["type", "mode", "sessionId"]
+        let keys = object.allKeys.map { "\($0)" }
+        if let extra = keys.filter({ !allowed.contains($0) }).sorted().first {
+            return .failure(.metadata(extra, line: line))
+        }
+        guard (object["mode"] as? String) == "normal" else {
+            return .failure(.metadata("mode", line: line))
+        }
+        return .success(nil)
+    }
+
+    /// `nil` = an operational or exact mode-metadata record (no graph identity, never projected).
     // swiftlint:disable:next cyclomatic_complexity function_body_length
     private static func parseEntry(
         _ data: Data,
@@ -597,6 +628,8 @@ package enum ClaudeSessionHistoryReader {
             kind = .attachment
         case "file-history-snapshot":
             return .failure(.fileHistorySnapshot(line: line))
+        case "mode":
+            return parseModeRecord(object, line: line, nativeSessionID: nativeSessionID)
         case _ where operationalTypes.contains(type):
             // Never a graph node: any `uuid`/`parentUuid` key (even null) refuses; a present
             // `sessionId` must be this session. Nothing else in it is read.

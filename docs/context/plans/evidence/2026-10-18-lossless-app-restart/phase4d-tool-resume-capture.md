@@ -116,6 +116,10 @@ Process 1 wrote native ordinals 0–43. Process 2 appended 44–61.
   - `turnIndex` continued at 3 and `promptId` was fresh.
   - The tool_use and result shapes after resume match those before it.
 
+## Reader follow-up
+
+[Step 4d4 worker evidence](phase4d4-worker.md) records the exact-mode reader change and sanitized Read/resume fixtures. It does not expand the live classifier or establish app qualification. Main verified the two-file diff and the focused test/build/style tickets before independent review.
+
 ## Explicit limits
 - This covers one CLI version (2.1.302), one invocation profile (safe-mode plus restricted, `--tools Read`, replay on, default-config child, sonnet/high effort), main-thread `Read` only, string-content prompts, one tool call per prompt and successful results.
 - Still **unqualified:**
