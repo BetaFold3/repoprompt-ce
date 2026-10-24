@@ -1054,6 +1054,54 @@ final class ClaudeSessionHistoryReaderTests: XCTestCase {
         XCTAssertEqual(read(jsonl(twoBlocks), mode: fromStart, ledger: partial), .unsupported(.ledgerConflict("a1")))
     }
 
+    /// Step 4d7: an agreed live row's ledger entry (the exact projection an import of the same native
+    /// entry records) stays a known key that every later read validates even before the frontier.
+    /// With the cursor past it, Claude's unchanged entry is suppressed; the same entry changed,
+    /// missing, retracted, or known without a proof refuses (never skipped by the cursor).
+    func testALiveAgreedEntryBeforeTheFrontierDeduplicatesOnlyWhileUnchanged() throws {
+        let earlier = o19Turn(tag: "x")
+        let later = o19Turn(caller: "c2", parent: "tx", assistant: "a2", prompt: "Next", reply: "Done", tag: "y")
+        let live = try XCTUnwrap(ClaudeLiveTranscriptCompleteText.projecting(nativeSessionID: sessionID, nativeEntryID: "a1", text: "ALPHA-7"))
+        let first = try XCTUnwrap(candidate(read(jsonl(earlier), mode: fromStart)))
+        let plan = AgentProviderHistoryImportPlanner.plan(
+            observation: Reader.observation(first),
+            existingItemIDs: [],
+            ledger: nil,
+            previousCursor: nil,
+            importID: UUID(),
+            now: Date(timeIntervalSince1970: 6200)
+        )
+        XCTAssertEqual(plan.ledger.nativeItems.first { $0.nativeEntryID == "a1" }, live.ledgerItem, "the live projection is the import's entry")
+        let agreed = AgentSessionProviderHistoryRecovery(nativeItems: [live.ledgerItem])
+        func readAfter(_ prefix: [[String: Any]], ledger: AgentSessionProviderHistoryRecovery? = nil) -> Reader.Result {
+            read(jsonl(prefix + later), mode: .importAfter(cursor(file: identityA, over: jsonl(prefix))), ledger: ledger ?? agreed)
+        }
+
+        let unchanged = try XCTUnwrap(candidate(readAfter(earlier)))
+        XCTAssertFalse(unchanged.rows.contains { $0.nativeEntryID == "a1" }, "the agreed entry is never imported again")
+        XCTAssertTrue(unchanged.rows.contains { $0.nativeEntryID == "a2" }, "later output is still read")
+
+        XCTAssertEqual(readAfter(o19Turn(reply: "ALPHA-8", tag: "x")), .unsupported(.ledgerConflict("a1")), "changed")
+        let gone = try XCTUnwrap(ClaudeLiveTranscriptCompleteText.projecting(nativeSessionID: sessionID, nativeEntryID: "gone", text: "ALPHA-7"))
+        XCTAssertEqual(
+            readAfter(earlier, ledger: AgentSessionProviderHistoryRecovery(nativeItems: [live.ledgerItem, gone.ledgerItem])),
+            .unsupported(.ledgerConflict("gone")),
+            "missing"
+        )
+        var retracted = earlier
+        let replyIndex = try XCTUnwrap(retracted.firstIndex { $0["uuid"] as? String == "a1" })
+        retracted[replyIndex]["supersedes"] = ["a0"]
+        guard case .unsupported(.semanticMarker("supersedes", _)) = readAfter(retracted) else {
+            return XCTFail("retracted: \(readAfter(retracted))")
+        }
+        let proofless = AgentSessionProviderHistoryRecovery(nativeItems: [.init(
+            providerRaw: live.ledgerItem.providerRaw, nativeSessionID: live.ledgerItem.nativeSessionID,
+            nativeEntryID: live.ledgerItem.nativeEntryID, rowKindRaw: live.ledgerItem.rowKindRaw,
+            ordinal: live.ledgerItem.ordinal, localItemID: live.ledgerItem.localItemID, envelopeDigest: nil
+        )])
+        XCTAssertEqual(readAfter(earlier, ledger: proofless), .unsupported(.ledgerConflict("a1")), "proofless")
+    }
+
     func testASameFileCursorMustStayOnARecordBoundaryAndNeverSplitTheGraph() {
         let prefix = jsonl([user("u1", parent: nil, "hi")])
         let full = jsonl([user("u1", parent: nil, "hi"), assistantText("a1", parent: "u1", "x")])

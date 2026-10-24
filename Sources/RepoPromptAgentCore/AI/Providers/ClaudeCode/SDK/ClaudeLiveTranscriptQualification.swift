@@ -179,6 +179,25 @@ package struct ClaudeLiveTranscriptCompleteText: Equatable {
     package let text: String
     package let envelopeDigest: String
 
+    /// Step 4d7: the complete text the reader projects for exactly these native facts (its ID and
+    /// digest derived by the same projection), or `nil` when it projects none. Used only to compare
+    /// against a stored ledger entry; never stored as a replacement proof.
+    package static func projecting(nativeSessionID: String, nativeEntryID: String, text: String) -> Self? {
+        guard let row = ClaudeSessionHistoryReader.singleTextAssistantRow(
+            nativeSessionID: nativeSessionID,
+            nativeEntryID: nativeEntryID,
+            text: text
+        ), row.kind == .assistantText, row.ordinal == 0, let localItemID = row.localItemID
+        else { return nil }
+        return Self(
+            nativeSessionID: nativeSessionID,
+            nativeEntryID: nativeEntryID,
+            localItemID: localItemID,
+            text: text,
+            envelopeDigest: row.envelopeDigest
+        )
+    }
+
     /// The ledger key (normalized native row key) of this row.
     package var ledgerKey: String {
         AgentSessionProviderHistoryRecovery.rowKey(

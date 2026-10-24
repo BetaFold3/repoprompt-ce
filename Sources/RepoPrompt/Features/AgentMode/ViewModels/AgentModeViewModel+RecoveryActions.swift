@@ -1352,9 +1352,7 @@ extension AgentModeViewModel {
             case .unsupported(.prefixProofUnavailable):
                 return .failure(RecoveryHistoryFailure(message: Self.recoveryHistoryUnprovenText))
             case .unsupported:
-                return .failure(RecoveryHistoryFailure(
-                    message: "Claude's history contains records this version doesn't support. Nothing was imported."
-                ))
+                return .failure(RecoveryHistoryFailure(message: Self.recoveryHistoryUnsupportedText))
             }
         default:
             return .failure(RecoveryHistoryFailure(message: "History reconciliation isn't supported for this provider."))
@@ -1387,10 +1385,13 @@ extension AgentModeViewModel {
     }
 
     static let recoveryHistoryChangedText =
-        "Claude's history no longer matches what was already recovered for this conversation. Nothing was imported."
+        "Claude's history no longer matches what was already recovered for this conversation. Nothing was imported or sent."
+
+    static let recoveryHistoryUnsupportedText =
+        "Claude's history contains records this version doesn't support. Nothing was imported or sent."
 
     static let recoveryHistoryUnprovenText =
-        "A saved history position for this conversation has no integrity proof this version can check, so its history can't be matched safely. Nothing was imported."
+        "A saved history position for this conversation has no integrity proof this version can check, so its history can't be matched safely. Nothing was imported or sent."
 
     /// Unsupported-baseline reasons (diagnostics recorded on the dispatch baseline; the send proceeds).
     static let recoveryBaselineRewrittenReason = "Claude history no longer matches its last recovered position"

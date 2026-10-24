@@ -2315,6 +2315,69 @@ final class AgentRecoveryReconciliationTests: XCTestCase {
         harness.viewModel.clearPendingAssistantDelta(harness.session)
     }
 
+    /// Step 4d7, actual save and relaunch: a live row whose turn agreed exactly is no longer owned,
+    /// so the launch's later refusal (an unsupported payload in the same run) keeps its proof in
+    /// memory and in the ordinary save. A fresh composition hydrates it from disk; the import of
+    /// Claude's unchanged native turn records it with no duplicate, while a changed native reply
+    /// under the same key still refuses with nothing imported (rows, ledger and cursor unchanged).
+    func testAnAgreedLiveRowSurvivesALaterRefusalAndDeduplicatesOnlyUnchangedHistoryAfterRelaunch() async throws {
+        for (index, reply) in ["ALPHA-7", "ALPHA-8"].enumerated() {
+            let harness = try await makeProducerHarness(windowID: 4960 + 2 * index)
+            let prompt = "Reply with exactly: ALPHA-7"
+            let runID = UUID()
+            harness.session.runID = runID
+            harness.session.runState = .running
+            let attemptID = harness.session.beginRunAttempt(source: "test.liveAgreedRefusal").attemptID
+            let (_, identity) = try await admitClaimedDispatch(harness, runAttemptID: attemptID, text: prompt)
+            let caller = identity.dispatchID.uuidString.lowercased()
+            let producer = UUID()
+            let complete = try await deliverLiveComplete(harness, entry: "a1", text: "ALPHA-7", producer: producer, runID: runID, attemptID: attemptID)
+            var agreement = AIStreamResult(type: AIStreamResult.lifecycleType, text: nil)
+            agreement.claudeLiveTranscriptEvidence = .init(
+                producerLaunchToken: producer, kind: .resultAgreement(localItemID: complete.localItemID, text: "ALPHA-7")
+            )
+            await harness.viewModel.test_handleStreamResult(agreement, session: harness.session, runID: runID, runAttemptID: attemptID)
+            XCTAssertTrue(harness.session.claudeLiveTranscriptOwnedKeys.isEmpty, "\(reply): the exact agreement ends ownership")
+            await harness.viewModel.test_handleStreamResult(
+                liveDisqualification(producer: producer), session: harness.session, runID: runID, runAttemptID: attemptID
+            )
+            XCTAssertTrue(harness.session.claudeLiveTranscriptRefusedProducers.contains(producer), reply)
+            XCTAssertEqual(harness.session.providerHistoryRecovery?.nativeItem(forKey: complete.ledgerKey), complete.ledgerItem, "\(reply): kept")
+            harness.session.runState = .completed
+            let saved = await harness.viewModel.flushSave(for: harness.session.tabID)
+            XCTAssertTrue(saved, reply)
+            let persistedSession = try await harness.persisted()
+            XCTAssertEqual(
+                persistedSession?.providerHistoryRecovery?.nativeItem(forKey: complete.ledgerKey), complete.ledgerItem, "\(reply): saved"
+            )
+
+            try harness.appendHistory(o19History(caller: caller, parent: nil, assistant: "a1", prompt: prompt, reply: reply, tag: "t1"))
+            let relaunched = try await makeProducerHarness(windowID: 4961 + 2 * index, relaunching: harness)
+            XCTAssertFalse(relaunched.service === harness.service, reply)
+            XCTAssertEqual(relaunched.session.items.count { $0.id == complete.localItemID }, 1, "\(reply): back from disk once")
+            XCTAssertTrue(relaunched.session.claudeLiveTranscriptOwnedKeys.isEmpty, reply)
+            let ledgerBefore = try XCTUnwrap(relaunched.session.providerHistoryRecovery, reply)
+            XCTAssertEqual(ledgerBefore.nativeItem(forKey: complete.ledgerKey), complete.ledgerItem, "\(reply): the proof on disk")
+            relaunched.session.runState = .completed
+            let itemsBefore = relaunched.session.items.filter { $0.kind != .system }
+            let cursorBefore = await relaunched.cursor()
+            let result = await relaunched.viewModel.reconcileRecoveryHistory(
+                reconcileAction(relaunched, runAttemptID: attemptID), session: relaunched.session, lane: relaunched.lane, codexTurnID: nil
+            )
+            XCTAssertEqual(relaunched.session.items.filter { $0.kind != .system }, itemsBefore, "\(reply): no row is appended")
+            if reply == "ALPHA-7" {
+                XCTAssertEqual(result, .imported(completion: .unconfirmed, rowCount: 0), "recorded, never appended again")
+                XCTAssertEqual(relaunched.session.items.count { $0.kind == .assistant && $0.text == "ALPHA-7" }, 1)
+                XCTAssertEqual(relaunched.session.providerHistoryRecovery?.nativeItem(forKey: complete.ledgerKey), complete.ledgerItem)
+            } else {
+                XCTAssertEqual(result, .blocked(AgentModeViewModel.recoveryHistoryChangedText), "a changed native reply refuses")
+                XCTAssertEqual(relaunched.session.providerHistoryRecovery, ledgerBefore)
+                let cursorAfter = await relaunched.cursor()
+                XCTAssertEqual(cursorAfter, cursorBefore)
+            }
+        }
+    }
+
     /// Step 4d5: a sanitized O20-shaped native Read turn (no capture contents): the caller's prompt,
     /// the one-block `tool_use` Read assistant, its tool-result user entry (own UUID, parented on and
     /// naming the call, string content, no `is_error`) and the one-text final assistant.
@@ -3092,6 +3155,40 @@ final class AgentRecoveryReconciliationTests: XCTestCase {
         XCTAssertEqual(persisted.nativeItem(forKey: imported.key), imported)
     }
 
+    /// Step 4d7 hydration guard through the existing entrypoint (no forced reload): the ordinary load
+    /// of an already-loaded session returns before touching rows, ledger or ownership, so the turn's
+    /// later exact agreement still ends ownership and a later refusal keeps the agreed proof.
+    func testAnAlreadyLoadedLoadKeepsLiveOwnershipForTheTurnsLaterAgreement() async throws {
+        let harness = try await makeProducerHarness(windowID: 4964)
+        XCTAssertTrue(harness.session.hasLoadedPersistedState, "precondition: the ordinary already-loaded tab")
+        let runID = UUID()
+        harness.session.runID = runID
+        harness.session.runState = .running
+        let attemptID = harness.session.beginRunAttempt(source: "test.liveAlreadyLoaded").attemptID
+        let producer = UUID()
+        let complete = try await deliverLiveComplete(harness, entry: "a1", text: "ALPHA-7", producer: producer, runID: runID, attemptID: attemptID)
+        let items = harness.session.items
+        let ledger = harness.session.providerHistoryRecovery
+        XCTAssertEqual(harness.session.claudeLiveTranscriptOwnedKeys, [producer: [complete.ledgerKey]])
+
+        _ = await harness.viewModel.loadSessionFromDisk(for: harness.session)
+        XCTAssertEqual(harness.session.items, items, "the already-loaded load changes no rows")
+        XCTAssertEqual(harness.session.providerHistoryRecovery, ledger, "nor the ledger")
+        XCTAssertEqual(harness.session.claudeLiveTranscriptOwnedKeys, [producer: [complete.ledgerKey]], "nor ownership")
+
+        var agreement = AIStreamResult(type: AIStreamResult.lifecycleType, text: nil)
+        agreement.claudeLiveTranscriptEvidence = .init(
+            producerLaunchToken: producer, kind: .resultAgreement(localItemID: complete.localItemID, text: "ALPHA-7")
+        )
+        await harness.viewModel.test_handleStreamResult(agreement, session: harness.session, runID: runID, runAttemptID: attemptID)
+        XCTAssertTrue(harness.session.claudeLiveTranscriptOwnedKeys.isEmpty, "the later agreement still consumes")
+        await harness.viewModel.test_handleStreamResult(
+            liveDisqualification(producer: producer), session: harness.session, runID: runID, runAttemptID: attemptID
+        )
+        XCTAssertEqual(harness.session.providerHistoryRecovery?.nativeItem(forKey: complete.ledgerKey), complete.ledgerItem)
+        harness.viewModel.clearPendingAssistantDelta(harness.session)
+    }
+
     /// A steering dispatch of the same attempt whose claimed native user entry never appeared
     /// refuses the whole import with no state change (never read as non-delivery, never resent).
     func testAMissingClaimedSteeringEntryRefusesWithoutChangingAnything() async throws {
@@ -3370,6 +3467,13 @@ final class AgentRecoveryReconciliationTests: XCTestCase {
         let truncated = await reconcile()
         XCTAssertEqual(truncated, .blocked(AgentModeViewModel.recoveryHistoryChangedText))
         await assertUnchanged(items: items, ledger: ledger, cursor: boundary, "truncated below the saved target")
+        // Step 4d7: a record this version doesn't support (here appended after the saved target) is the
+        // generic unsupported refusal: blocked, so a continuation never dispatches; nothing changes.
+        let unsupportedRecord = try JSONSerialization.data(withJSONObject: historyEntry("system", uuid: "s1", parent: "a1", text: "x"))
+        try (firstBytes + unsupportedRecord + Data("\n".utf8)).write(to: harness.historyFile)
+        let unsupported = await reconcile()
+        XCTAssertEqual(unsupported, .blocked(AgentModeViewModel.recoveryHistoryUnsupportedText))
+        await assertUnchanged(items: items, ledger: ledger, cursor: boundary, "an unsupported record")
 
         // Legacy proofs fail closed: a latest receipt without a target, a boundary without a proof.
         try firstBytes.write(to: harness.historyFile)

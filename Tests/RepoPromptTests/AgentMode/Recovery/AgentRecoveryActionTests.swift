@@ -1,6 +1,7 @@
 import Foundation
 @testable import RepoPromptAgentCore
 import XCTest
+@_spi(TestSupport) @testable import RepoPromptApp
 
 /// Lossless restart Phase 4 durable recovery actions, the history cursor CAS, and the action
 /// runner (gate → reservation → fence → one normal dispatch → outcome), over a real recovery lane
@@ -538,6 +539,27 @@ final class AgentRecoveryActionTests: XCTestCase {
         XCTAssertEqual(reconciled, .completed(.importedCompleted, reason: "not saved"))
         XCTAssertEqual(calls.dispatch, 0)
         XCTAssertEqual(calls.reconcile, 4)
+    }
+
+    /// Step 4d7: the three action-scoped Claude history refusals (changed, unproven, unsupported) say
+    /// nothing was imported or sent, and each, as the blocked reconciliation the view model returns
+    /// for it, stops the continuation before any dispatch.
+    func testClaudeHistoryChangedUnprovenAndUnsupportedRefusalsNeverDispatch() async throws {
+        let runner = AgentRecoveryActionRunner(qualification: qualified, registrationActive: { true })
+        let calls = Calls()
+        let messages = [
+            AgentModeViewModel.recoveryHistoryChangedText,
+            AgentModeViewModel.recoveryHistoryUnprovenText,
+            AgentModeViewModel.recoveryHistoryUnsupportedText
+        ]
+        for message in messages {
+            XCTAssertTrue(message.hasSuffix("Nothing was imported or sent."), message)
+            let request = try await continuation(key: runKey(), expectedRevision: revision(), sourceRunAttemptID: UUID())
+            let result = await runner.perform(request, lane: lane, performers: performers(calls, reconcile: .blocked(message)))
+            XCTAssertEqual(result, .completed(.notDispatched, reason: message))
+        }
+        XCTAssertEqual(calls.reconcile, messages.count)
+        XCTAssertEqual(calls.dispatch, 0, "no refusal ever dispatches")
     }
 
     func testSourceRunEvidenceInTheRecordDecidesWhetherAContinuationDispatches() async throws {

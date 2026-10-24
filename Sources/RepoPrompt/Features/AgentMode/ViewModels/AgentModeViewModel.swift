@@ -20141,8 +20141,9 @@ final class AgentModeViewModel: ObservableObject {
     /// mutation. Returns `true` only when the result was fully applied here (an accepted or already
     /// recorded complete text); otherwise the result continues through the legacy display path
     /// unidentified. Every refusal makes the producer's launch permanently unqualified for this tab
-    /// and invalidates only the proofs that launch newly inserted (Step 4d3c; a proof is never
-    /// regenerated or healed).
+    /// and invalidates only the proofs that launch newly inserted and still owns (Step 4d3c; a proof
+    /// is never regenerated or healed). An exact agreement ends ownership of its exchange's keys
+    /// (Step 4d7), so a later refusal of the launch keeps those proofs.
     ///
     /// Step 4d5 adds the single main-thread Read chain: its call, result and final text are each
     /// inserted only while every earlier link is still held (its ledger entry and valid proof, and
@@ -20187,21 +20188,25 @@ final class AgentModeViewModel: ObservableObject {
                 && holdsClaudeLiveTranscriptRow(
                     answer.ledgerItem, canonicalItem: answer.canonicalItem, canonical: canonical, session: session
                 )
-            if !agrees {
+            if agrees {
+                // Step 4d7: only the whole agreed chain's keys this producer owns.
+                consumeClaudeLiveTranscriptOwnership(
+                    of: [call.ledgerKey, resultRow.ledgerKey, answer.ledgerKey], producer: producer, session: session
+                )
+            } else {
                 refuseClaudeLiveTranscript(producer: producer, session: session)
             }
             return false
 
         case let .resultAgreement(localItemID, text):
-            // The owner must hold exactly the turn's identified row with a valid proof.
-            let agrees = !session.claudeLiveTranscriptRefusedProducers.contains(evidence.producerLaunchToken)
-                && (session.providerHistoryRecovery?.nativeItems.contains {
-                    $0.providerRaw == ClaudeSessionHistoryReader.providerRaw
-                        && $0.localItemID == localItemID && $0.envelopeDigest != nil
-                } ?? false)
-                && session.items.contains { $0.id == localItemID && $0.kind == .assistant && $0.text == text }
-            if !agrees {
-                refuseClaudeLiveTranscript(producer: evidence.producerLaunchToken, session: session)
+            // Step 4d7: the owner must hold exactly the reader's projection of the turn's identified
+            // row (exact ledger entry and proof, exact complete canonical payload).
+            if let agreedKey = claudeLiveTranscriptTextAgreementKey(
+                localItemID: localItemID, text: text, producer: producer, session: session
+            ) {
+                consumeClaudeLiveTranscriptOwnership(of: [agreedKey], producer: producer, session: session)
+            } else {
+                refuseClaudeLiveTranscript(producer: producer, session: session)
             }
             return false
 
@@ -20370,6 +20375,50 @@ final class AgentModeViewModel: ObservableObject {
         scheduleSave(for: session.tabID)
     }
 
+    /// Step 4d7 single-text agreement: the ledger key of the turn's identified row, or `nil` when the
+    /// owner does not hold exactly it. The one applicable Claude ledger entry for `localItemID` (in
+    /// the tab's conversation when known) must equal, in full (identity, kind, ordinal, local ID and
+    /// digest), the reader's projection of its native entry with `text`; its key must be unique; and
+    /// the canonical transcript (persisted turns plus suffix) must hold exactly one complete,
+    /// non-streaming copy of that projection. The projection is compared, never stored.
+    private func claudeLiveTranscriptTextAgreementKey(
+        localItemID: UUID,
+        text: String,
+        producer: UUID,
+        session: AgentTabSession
+    ) -> String? {
+        guard !session.claudeLiveTranscriptRefusedProducers.contains(producer),
+              let nativeItems = session.providerHistoryRecovery?.nativeItems
+        else { return nil }
+        let associated = nativeItems.filter {
+            $0.providerRaw == ClaudeSessionHistoryReader.providerRaw && $0.localItemID == localItemID
+        }
+        guard associated.count == 1, let stored = associated.first,
+              session.providerSessionID.map({ $0.isEmpty || $0 == stored.nativeSessionID }) ?? true,
+              nativeItems.count(where: { $0.key == stored.key }) == 1,
+              let expected = ClaudeLiveTranscriptCompleteText.projecting(
+                  nativeSessionID: stored.nativeSessionID, nativeEntryID: stored.nativeEntryID, text: text
+              ),
+              expected.localItemID == localItemID,
+              expected.ledgerItem == stored
+        else { return nil }
+        let canonical = AgentProviderHistoryCanonicalView(transcript: session.transcript, suffixItems: session.items)
+        guard holdsClaudeLiveTranscriptRow(
+            expected.ledgerItem, canonicalItem: expected.canonicalItem, canonical: canonical, session: session
+        ) else { return nil }
+        return expected.ledgerKey
+    }
+
+    /// Step 4d7: a successful agreement ends the producer's revocation ownership of exactly the
+    /// exchange's keys it owns (transient only: no ledger, row, digest, receipt, cursor, dirty mark
+    /// or save). Keys it never owned (imported, another producer's, a duplicate) are a no-op, and an
+    /// emptied entry is removed. A later refusal still latches and invalidates every remaining key.
+    private func consumeClaudeLiveTranscriptOwnership(of keys: Set<String>, producer: UUID, session: AgentTabSession) {
+        guard var owned = session.claudeLiveTranscriptOwnedKeys[producer], !owned.isDisjoint(with: keys) else { return }
+        owned.subtract(keys)
+        session.claudeLiveTranscriptOwnedKeys[producer] = owned.isEmpty ? nil : owned
+    }
+
     /// Step 4d5 chain prerequisite: `row` is the reader's projection and is still held.
     private func holdsClaudeLiveTranscriptToolRow(
         _ row: ClaudeLiveTranscriptToolRow,
@@ -20399,10 +20448,14 @@ final class AgentModeViewModel: ObservableObject {
 
     /// Step 4d3b/4d3c refusal: the producer never qualifies again in this tab (transient; the
     /// producer's own latch is the durable-for-its-launch authority). Only the proofs of the keys
-    /// this producer newly inserted are cleared (its ownership is discarded, so a repeated refusal is
-    /// idempotent), keeping keys, local items, rows, extras, receipts and baselines; imported,
-    /// another producer's and Codex proofs are untouched. A ledger-only change is marked dirty
-    /// explicitly and saved through the existing serialized save; no owned key changes nothing.
+    /// this producer newly inserted and still owns are cleared (its ownership is discarded, so a
+    /// repeated refusal is idempotent), keeping keys, local items, rows, extras, receipts and
+    /// baselines; imported, another producer's, Codex and (Step 4d7) already agreed proofs are
+    /// untouched. Intended (Step 4d7): when every key it inserted had agreed, the refusal clears no
+    /// proof, so a later distinct producer may still qualify under the normal admission checks; the
+    /// refused producer never does, and no already-cleared proof is ever healed. A ledger-only
+    /// change is marked dirty explicitly and saved through the existing serialized save; no owned
+    /// key changes nothing.
     private func refuseClaudeLiveTranscript(producer: UUID, session: AgentTabSession) {
         session.claudeLiveTranscriptRefusedProducers.insert(producer)
         let ownedKeys = session.claudeLiveTranscriptOwnedKeys.removeValue(forKey: producer) ?? []

@@ -1567,8 +1567,10 @@ package final class AgentTabSession: ObservableObject {
     package var claudeLiveTranscriptRefusedProducers: Set<UUID> = []
     /// Step 4d3c (inactive): per producer launch, the exact ledger keys that launch newly inserted
     /// (written with the row and ledger entry in the same main-actor step). A duplicate, an imported
-    /// match or an agreeing result never acquires or transfers a key. A refusal invalidates only
-    /// these proofs. Reset only by clear chat, which also detaches the tab's Claude controller. It is
+    /// match or an agreeing result never acquires or transfers a key. Step 4d7: an exactly agreeing
+    /// result (single text, or a whole Read chain) removes its exchange's keys, so an agreed proof is
+    /// no longer revocable by this launch. A refusal invalidates only the remaining (unagreed) keys'
+    /// proofs. Reset only by clear chat, which also detaches the tab's Claude controller. It is
     /// kept across run completion, cancellation, a new run, a merging import and persisted
     /// hydration or rebinding, which do not detach a still-attached producer: exact keys (provider,
     /// native session, entry) never match another conversation's rows, and a copied key the producer
