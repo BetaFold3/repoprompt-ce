@@ -497,6 +497,12 @@ package struct AgentSessionProviderHistoryRecovery: Codable, Equatable {
         }
     }
 
+    /// Every local item associated to a Claude native row, whatever its digest (Step 4d5: the rows
+    /// whose projected tool payload generic sweeps and replacements never rewrite).
+    package var claudeLocalItemIDs: Set<UUID> {
+        Set(nativeItems.lazy.filter { $0.providerRaw == AgentRecoveryHistoryProvider.claude.rawValue }.compactMap(\.localItemID))
+    }
+
     /// Whether any Claude row of `nativeSessionID` lacks a valid envelope proof (invalidated, legacy
     /// or malformed). Step 4d3b never newly qualifies live output of such a conversation: a proof is
     /// never regenerated or healed from later output.

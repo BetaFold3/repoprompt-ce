@@ -3482,7 +3482,8 @@ package enum AgentTranscriptIO {
         terminalState: AgentSessionRunState,
         includeExplicitRepoPromptToolCalls: Bool,
         maxSequenceIndexExclusive: Int? = nil,
-        nonToolBoundary: Int
+        nonToolBoundary: Int,
+        protectedItemIDs: Set<UUID> = []
     ) -> Int {
         guard !items.isEmpty else { return 0 }
         var finalizedCount = 0
@@ -3491,6 +3492,14 @@ package enum AgentTranscriptIO {
             if let maxSequenceIndexExclusive,
                items[index].sequenceIndex >= maxSequenceIndexExclusive
             {
+                continue
+            }
+            // Step 4d5: a provider-history-associated tool row (a canonical Claude call or result,
+            // imported or live) is complete as projected: it is never finalized into a fallback.
+            if protectedItemIDs.contains(items[index].id),
+               items[index].kind == .toolCall || items[index].kind == .toolResult
+            {
+                consecutiveNonToolItems = 0
                 continue
             }
             switch items[index].kind {

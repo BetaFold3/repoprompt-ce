@@ -1488,6 +1488,7 @@ final class AgentRecoveryReconciliationTests: XCTestCase {
         let service: AgentSessionDataService
         let workspace: WorkspaceModel
         let home: URL
+        let recoveryRoot: URL
 
         var historyFile: URL {
             home.appendingPathComponent("projects/-fixture-project", isDirectory: true)
@@ -1519,18 +1520,31 @@ final class AgentRecoveryReconciliationTests: XCTestCase {
         windowID: Int,
         qualified isQualified: Bool = true,
         codexFactory: CodexAgentModeCoordinator.CodexControllerFactory? = nil,
-        claudeController: LifecycleFakeNativeController? = nil
+        claudeController: LifecycleFakeNativeController? = nil,
+        relaunching previous: ProducerHarness? = nil
     ) async throws -> ProducerHarness {
-        let storageURL = try RecoveryTestSupport.makeTemporaryRoot("AgentRecoveryBaselineWorkspace")
-        let home = try RecoveryTestSupport.makeTemporaryRoot("AgentRecoveryBaselineHome")
-        let recoveryRoot = try RecoveryTestSupport.makeTemporaryRoot("AgentRecoveryBaselineStore")
-            .appendingPathComponent("AgentRecovery/v1", isDirectory: true)
-        addTeardownBlock {
-            try? FileManager.default.removeItem(at: storageURL)
-            try? FileManager.default.removeItem(at: home)
-            try? FileManager.default.removeItem(at: recoveryRoot.deletingLastPathComponent().deletingLastPathComponent())
+        let storageURL: URL
+        let home: URL
+        let recoveryRoot: URL
+        if let previous {
+            // A relaunch: the earlier composition's roots, read by a new store instance.
+            storageURL = try XCTUnwrap(previous.workspace.customStoragePath)
+            home = previous.home
+            recoveryRoot = previous.recoveryRoot
+        } else {
+            storageURL = try RecoveryTestSupport.makeTemporaryRoot("AgentRecoveryBaselineWorkspace")
+            home = try RecoveryTestSupport.makeTemporaryRoot("AgentRecoveryBaselineHome")
+            recoveryRoot = try RecoveryTestSupport.makeTemporaryRoot("AgentRecoveryBaselineStore")
+                .appendingPathComponent("AgentRecovery/v1", isDirectory: true)
+            addTeardownBlock {
+                try? FileManager.default.removeItem(at: storageURL)
+                try? FileManager.default.removeItem(at: home)
+                try? FileManager.default.removeItem(at: recoveryRoot.deletingLastPathComponent().deletingLastPathComponent())
+            }
         }
-        let store = AgentRecoveryStore(rootURL: recoveryRoot)
+        let store = previous == nil
+            ? AgentRecoveryStore(rootURL: recoveryRoot)
+            : AgentRecoveryStore(rootURL: recoveryRoot, appInstanceID: UUID())
         let service = AgentSessionDataService(
             tombstoneRoot: recoveryRoot.appendingPathComponent("tombstones", isDirectory: true),
             recoveryStore: store
@@ -1545,7 +1559,7 @@ final class AgentRecoveryReconciliationTests: XCTestCase {
         )
         coordinator.startIfNeeded()
         guard await coordinator.awaitStartup() == .ready else { throw RecoveryLaneFixtureError.startupNotReady }
-        let workspace = WorkspaceModel(name: "Baseline", repoPaths: [storageURL.path], customStoragePath: storageURL)
+        let workspace = previous?.workspace ?? WorkspaceModel(name: "Baseline", repoPaths: [storageURL.path], customStoragePath: storageURL)
         let viewModel = if let claudeController {
             // Step 4d1 composition: only the injected fake Claude controller (never a real process),
             // with inert MCP policy/routing hooks, as the run-service lifecycle harness does.
@@ -1579,13 +1593,25 @@ final class AgentRecoveryReconciliationTests: XCTestCase {
         let tabID = UUID()
         viewModel.test_setCurrentTabIDOverride(tabID)
         let session = try await viewModel.ensureSessionReady(tabID: tabID)
-        session.selectedAgent = .claudeCode
-        session.providerSessionID = conversationID
-        session.appendItem(.user("Earlier turn"))
-        let saved = await viewModel.flushSave(for: tabID)
-        XCTAssertTrue(saved)
+        if let previous {
+            // The new tab is bound to the saved session and hydrated by this composition's own load.
+            let sessionID = try XCTUnwrap(previous.session.activeAgentSessionID)
+            XCTAssertNotNil(viewModel.test_installPersistentSessionBinding(sessionID: sessionID, on: session))
+            session.hasLoadedPersistedState = false
+            let outcome = await viewModel.loadSessionFromDisk(for: session)
+            XCTAssertEqual(outcome.disposition, .applied)
+            XCTAssertEqual(session.providerSessionID, conversationID)
+        } else {
+            session.selectedAgent = .claudeCode
+            session.providerSessionID = conversationID
+            session.appendItem(.user("Earlier turn"))
+            let saved = await viewModel.flushSave(for: tabID)
+            XCTAssertTrue(saved)
+        }
         let lane = try XCTUnwrap(session.recoveryLane)
-        return ProducerHarness(viewModel: viewModel, session: session, lane: lane, service: service, workspace: workspace, home: home)
+        return ProducerHarness(
+            viewModel: viewModel, session: session, lane: lane, service: service, workspace: workspace, home: home, recoveryRoot: recoveryRoot
+        )
     }
 
     private func historyEntry(_ type: String, uuid: String, parent: String?, text: String) -> [String: Any] {
@@ -2287,6 +2313,694 @@ final class AgentRecoveryReconciliationTests: XCTestCase {
         XCTAssertNotEqual(harness.session.items.last?.id, later.localItemID)
         XCTAssertNil(harness.session.providerHistoryRecovery?.nativeItem(forKey: later.ledgerKey), "never healed")
         harness.viewModel.clearPendingAssistantDelta(harness.session)
+    }
+
+    /// Step 4d5: a sanitized O20-shaped native Read turn (no capture contents): the caller's prompt,
+    /// the one-block `tool_use` Read assistant, its tool-result user entry (own UUID, parented on and
+    /// naming the call, string content, no `is_error`) and the one-text final assistant.
+    private func o20History(
+        caller: String, prompt: String, toolUseID: String, path: String, output: String, reply: String, callOnly: Bool = false
+    ) -> [[String: Any]] {
+        func entry(_ type: String, uuid: String, parent: String?, content: Any, source: String? = nil) -> [String: Any] {
+            var object: [String: Any] = [
+                "type": type, "uuid": uuid, "parentUuid": parent ?? NSNull(), "sessionId": conversationID,
+                "message": ["role": type, "content": content], "isSidechain": false
+            ]
+            if let source { object["sourceToolAssistantUUID"] = source }
+            return object
+        }
+        let call = [
+            entry("user", uuid: caller, parent: nil, content: prompt),
+            entry("assistant", uuid: "c1", parent: caller, content: [["type": "tool_use", "id": toolUseID, "name": "Read", "input": ["file_path": path]]])
+        ]
+        guard !callOnly else { return call }
+        return call + [
+            entry("user", uuid: "r1", parent: "c1", content: [["type": "tool_result", "tool_use_id": toolUseID, "content": output]], source: "c1"),
+            entry("assistant", uuid: "a1", parent: "r1", content: [["type": "text", "text": reply]])
+        ]
+    }
+
+    /// Step 4d5: one qualified live Read chain (call, result and final text, each the reader's
+    /// projection) delivered through the owner, then the ordinary terminal session save (its
+    /// pending-tool repair runs for a finished run).
+    private struct LiveReadChainSaved {
+        let caller: String
+        let attemptID: UUID
+        let call: ClaudeLiveTranscriptToolRow
+        let result: ClaudeLiveTranscriptToolRow
+        let answer: ClaudeLiveTranscriptCompleteText
+        let persisted: AgentSession
+        let history: [[String: Any]]
+
+        var liveIDs: [UUID] {
+            [call.localItemID, result.localItemID, answer.localItemID]
+        }
+
+        var ledgerItems: [AgentSessionProviderHistoryRecovery.NativeItem] {
+            [call.ledgerItem, result.ledgerItem, answer.ledgerItem]
+        }
+
+        func holds(_ canonicalItem: AgentChatItem?, in canonical: AgentProviderHistoryCanonicalView) -> Bool {
+            canonicalItem.map { AgentProviderHistoryAssociationPreflight.holdsCanonicalPayload($0, in: canonical) } ?? false
+        }
+    }
+
+    private func deliverLiveReadChainAndSave(_ harness: ProducerHarness, terminal: Bool = true) async throws -> LiveReadChainSaved {
+        let prompt = "Use Read on notes.txt, then reply with its token."
+        let path = "/fixture/workspace/notes.txt", output = Self.readOutput, toolUseID = "toolu_fixture_1"
+        let runID = UUID()
+        harness.session.runID = runID
+        harness.session.runState = .running
+        let attemptID = harness.session.beginRunAttempt(source: "test.liveReadRoundTrip").attemptID
+        let (_, identity) = try await admitClaimedDispatch(harness, runAttemptID: attemptID, text: prompt)
+        let caller = identity.dispatchID.uuidString.lowercased()
+
+        let inputJSON = try XCTUnwrap(ClaudeSessionHistoryReader.canonicalToolInputJSON(["file_path": path] as NSDictionary))
+        let call = try XCTUnwrap(ClaudeLiveTranscriptToolRow.projecting(
+            nativeSessionID: conversationID, nativeEntryID: "c1", kind: .toolCall, toolUseID: toolUseID, toolName: "Read", payload: inputJSON
+        ))
+        let result = try XCTUnwrap(ClaudeLiveTranscriptToolRow.projecting(
+            nativeSessionID: conversationID, nativeEntryID: "r1", kind: .toolResult, toolUseID: toolUseID, toolName: "Read", payload: output
+        ))
+        let answerRow = try XCTUnwrap(ClaudeSessionHistoryReader.singleTextAssistantRow(nativeSessionID: conversationID, nativeEntryID: "a1", text: "BRAVO-42"))
+        let answer = try ClaudeLiveTranscriptCompleteText(
+            nativeSessionID: conversationID, nativeEntryID: "a1", localItemID: XCTUnwrap(answerRow.localItemID),
+            text: "BRAVO-42", envelopeDigest: answerRow.envelopeDigest
+        )
+        let producer = UUID(), invocation = UUID()
+        func evidence(_ result: AIStreamResult, _ kind: ClaudeLiveTranscriptEvidence.Kind) -> AIStreamResult {
+            var result = result
+            result.claudeLiveTranscriptEvidence = .init(producerLaunchToken: producer, kind: kind)
+            return result
+        }
+        let deliveries = [
+            evidence(AIStreamResult(type: "tool_call", text: nil, toolName: "Read", toolArgs: inputJSON, toolInvocationID: invocation, toolArgsJSON: inputJSON), .readToolCall(call)),
+            evidence(
+                AIStreamResult(type: "tool_result", text: nil, toolName: "Read", toolOutput: output, toolInvocationID: invocation, toolResultJSON: output),
+                .readToolResult(result, call: call)
+            ),
+            evidence(AIStreamResult(type: "content", text: "BRAVO-42"), .readAnswer(answer, call: call, result: result))
+        ]
+        for delivery in deliveries {
+            await harness.viewModel.test_handleStreamResult(delivery, session: harness.session, runID: runID, runAttemptID: attemptID)
+        }
+        XCTAssertEqual(harness.session.items.suffix(3).map(\.id), [call.localItemID, result.localItemID, answer.localItemID])
+
+        harness.session.runState = terminal ? .completed : .running
+        let saved = await harness.viewModel.flushSave(for: harness.session.tabID)
+        XCTAssertTrue(saved)
+        let persistedSession = try await harness.persisted()
+        return try LiveReadChainSaved(
+            caller: caller, attemptID: attemptID, call: call, result: result, answer: answer, persisted: XCTUnwrap(persistedSession),
+            history: o20History(caller: caller, prompt: prompt, toolUseID: toolUseID, path: path, output: output, reply: "BRAVO-42")
+        )
+    }
+
+    /// Step 4d5 terminal save: the rows (the call row never finalized) and their proofs are in the
+    /// same save; the answer keeps its exact canonical payload, while the ordinary tool-result
+    /// persistence policy stores the tool rows summarized (not the reader's payloads). Then, with the
+    /// persisted ledger over the session's in-memory rows (not a hydration; see the next test), the
+    /// import of the same native turn records it with no duplicate and keeps every live proof.
+    func testLiveReadChainTerminalSaveAndInMemoryImportIsANoOp() async throws {
+        let harness = try await makeProducerHarness(windowID: 4999)
+        let chain = try await deliverLiveReadChainAndSave(harness)
+        let persisted = chain.persisted
+        for item in chain.ledgerItems {
+            XCTAssertEqual(persisted.providerHistoryRecovery?.nativeItem(forKey: item.key), item, "row proof in the same save")
+        }
+        let persistedItems = persisted.items.map { $0.toItem() }
+        XCTAssertEqual(persistedItems.suffix(3).map(\.id), chain.liveIDs, "rows in the same save")
+        XCTAssertEqual(persistedItems.suffix(3).map(\.kind), [.toolCall, .toolResult, .assistant], "neither the save nor the read-back load repair finalizes the call")
+        let persistedView = AgentProviderHistoryCanonicalView(transcript: persisted.transcript ?? .empty, suffixItems: persistedItems)
+        XCTAssertTrue(chain.holds(chain.answer.canonicalItem, in: persistedView), "the answer's exact payload")
+        XCTAssertFalse(chain.holds(chain.call.canonicalItem, in: persistedView), "tool rows are persisted summarized (existing policy)")
+        XCTAssertFalse(chain.holds(chain.result.canonicalItem, in: persistedView))
+
+        // The persisted ledger over the in-memory rows (transient ownership gone), then the import.
+        harness.session.providerHistoryRecovery = persisted.providerHistoryRecovery
+        harness.session.claudeLiveTranscriptOwnedKeys = [:]
+        try harness.appendHistory(chain.history)
+        let action = reconcileAction(harness, runAttemptID: chain.attemptID)
+        let itemsBefore = harness.session.items
+        let imported = await harness.viewModel.reconcileRecoveryHistory(action, session: harness.session, lane: harness.lane, codexTurnID: nil)
+        XCTAssertEqual(imported, .imported(completion: .unconfirmed, rowCount: 0), "recorded, never appended again")
+        XCTAssertEqual(harness.session.items.filter { $0.kind != .system }, itemsBefore.filter { $0.kind != .system })
+        let ledger = try XCTUnwrap(harness.session.providerHistoryRecovery)
+        for item in chain.ledgerItems {
+            XCTAssertEqual(ledger.nativeItem(forKey: item.key), item, "the live proof is kept")
+        }
+        XCTAssertEqual(ledger.nativeItems.map(\.nativeEntryID), ["c1", "r1", "a1", chain.caller])
+    }
+
+    /// A data service of its own: no in-memory state shared with the harness's.
+    private func freshService() throws -> AgentSessionDataService {
+        let root = try RecoveryTestSupport.makeTemporaryRoot("AgentRecoveryFreshService")
+        addTeardownBlock { try? FileManager.default.removeItem(at: root) }
+        return AgentSessionDataService(
+            tombstoneRoot: root.appendingPathComponent("tombstones", isDirectory: true),
+            recoveryStore: AgentRecoveryStore(rootURL: root.appendingPathComponent("AgentRecovery/v1", isDirectory: true))
+        )
+    }
+
+    /// The stored session read back by a fresh data service, with its file's bytes.
+    private func freshlyStored(_ harness: ProducerHarness) async throws -> (session: AgentSession, bytes: String) {
+        let id = try XCTUnwrap(harness.session.activeAgentSessionID)
+        let loaded = try await freshService().loadAgentSession(id: id, for: harness.workspace)
+        let session = try XCTUnwrap(loaded)
+        return try (session, String(contentsOf: XCTUnwrap(session.fileURL), encoding: .utf8))
+    }
+
+    /// The fixture's Read output: its second line is a sentinel that appears nowhere else (not in
+    /// the answer, the prompt or the path), so any stored fragment of the output is visible.
+    private static let outputOnlySentinel = "OUTPUT-ONLY-SENTINEL-7Q4"
+    private static let readOutput = "     1\tBRAVO-42\n     2\t\(outputOnlySentinel)\n"
+
+    /// Disk holds the Read rows only in the ordinary policy's summarized form: no arguments, a
+    /// summary-only execution, and never the Read output itself. A stored result is exactly the
+    /// current summary literal (written out here, independent of the code under test).
+    private func assertStoredSummarized(_ harness: ProducerHarness, toolIDs: [UUID], _ label: String) async throws {
+        let (stored, bytes) = try await freshlyStored(harness)
+        let activities = (stored.transcript?.turns ?? []).flatMap(\.allActivities)
+        for id in toolIDs {
+            let activity = try XCTUnwrap(activities.first { $0.id == id }, label)
+            XCTAssertEqual(activity.toolExecution?.summaryOnly, true, label)
+            XCTAssertNil(activity.toolExecution?.argsJSON, label)
+            if activity.itemKind == .toolResult {
+                XCTAssertEqual(activity.toolExecution?.resultJSON, #"{"status":"unknown","summary_only":true,"summary_text":"read • unknown"}"#, label)
+                XCTAssertEqual(activity.toolExecution?.summaryText, "read • unknown", label)
+            }
+        }
+        XCTAssertFalse(bytes.contains("1\\tBRAVO-42"), "\(label): the Read output is never stored")
+        XCTAssertFalse(bytes.contains(Self.outputOnlySentinel), "\(label): no fragment of the Read output is stored")
+    }
+
+    /// A relaunch (a fresh recovery store instance, data service, coordinator and view model on the
+    /// same roots; the earlier composition stays idle) whose new tab is hydrated from disk by the
+    /// fresh service's ordinary load, then reconciles there: every `rowIDs` row comes back exactly
+    /// once, the call stays a call, each proof is the one on disk, and nothing is owned.
+    private func relaunchAndReconcile(
+        _ previous: ProducerHarness,
+        windowID: Int,
+        attemptID: UUID,
+        rowIDs: [UUID],
+        callID: UUID,
+        exchange: [AgentChatItem],
+        _ label: String
+    ) async throws -> (harness: ProducerHarness, result: AgentRecoveryReconcileResult) {
+        let harness = try await makeProducerHarness(windowID: windowID, relaunching: previous)
+        XCTAssertFalse(harness.service === previous.service, label)
+        for id in rowIDs {
+            XCTAssertEqual(harness.session.items.count { $0.id == id }, 1, "\(label): \(id) back from disk once")
+        }
+        XCTAssertEqual(harness.session.items.first { $0.id == callID }?.kind, .toolCall, "\(label): never finalized")
+        XCTAssertTrue(harness.session.claudeLiveTranscriptOwnedKeys.isEmpty, "\(label): ownership is never persisted")
+        let ledgerBefore = try XCTUnwrap(harness.session.providerHistoryRecovery, label)
+        try assertGeneratedRepresentations(harness, exchange: exchange, "\(label) hydrated")
+        harness.session.runState = .completed
+        let action = reconcileAction(harness, runAttemptID: attemptID)
+        let itemsBefore = harness.session.items.filter { $0.kind != .system }
+        let result = await harness.viewModel.reconcileRecoveryHistory(action, session: harness.session, lane: harness.lane, codexTurnID: nil)
+        // Nothing appended, removed or reordered, and every other row unchanged. A proven Read tool row
+        // may move only between whole generated representations of its own native exchange (a save
+        // re-hiding a result a later row hides), in its backing and its suffix copy alike.
+        let itemsAfter = harness.session.items.filter { $0.kind != .system }
+        XCTAssertEqual(itemsAfter.map(\.id), itemsBefore.map(\.id), "\(label): nothing appended")
+        XCTAssertEqual(itemsAfter.map(\.kind), itemsBefore.map(\.kind), label)
+        let exchangeIDs = Set(exchange.map(\.id))
+        XCTAssertEqual(
+            itemsAfter.filter { !exchangeIDs.contains($0.id) }, itemsBefore.filter { !exchangeIDs.contains($0.id) },
+            "\(label): other rows unchanged"
+        )
+        try assertGeneratedRepresentations(harness, exchange: exchange, "\(label) reconciled")
+        let ledger = try XCTUnwrap(harness.session.providerHistoryRecovery, label)
+        for native in ledgerBefore.nativeItems where native.localItemID.map(rowIDs.contains) ?? false {
+            XCTAssertEqual(ledger.nativeItem(forKey: native.key), native, "\(label): proof kept")
+            XCTAssertNotNil(native.envelopeDigest, label)
+        }
+        XCTAssertTrue(harness.session.claudeLiveTranscriptOwnedKeys.isEmpty, "\(label): never owned")
+        return (harness, result)
+    }
+
+    /// Each Read tool row of `exchange` (the proven native exchange's projected rows, call first) is,
+    /// in its one canonical backing and in its suffix copy, one complete current-pipeline
+    /// representation of that exchange (the same whole-representation test as the import's).
+    private func assertGeneratedRepresentations(_ harness: ProducerHarness, exchange: [AgentChatItem], _ label: String) throws {
+        let images = try XCTUnwrap(AgentTranscriptPolicyPipeline.storageComparisonActivities(exchange), label)
+        let activities = harness.session.transcript.turns.flatMap(\.allActivities)
+        func sameProjected(_ actual: AgentChatItem, _ image: AgentTranscriptActivity) -> Bool {
+            let expected = image.toItem()
+            return actual.kind == expected.kind && actual.text == expected.text && actual.toolName == expected.toolName
+                && actual.toolInvocationID == expected.toolInvocationID && actual.toolArgsJSON == expected.toolArgsJSON
+                && actual.toolResultJSON == expected.toolResultJSON && actual.toolIsError == expected.toolIsError
+        }
+        for native in exchange {
+            let rowImages = try XCTUnwrap(images[native.id], "\(label): \(native.kind)")
+            let backings = activities.filter { $0.id == native.id }
+            XCTAssertEqual(backings.count, 1, "\(label): one backing for \(native.kind)")
+            let backing = try XCTUnwrap(backings.first, label)
+            XCTAssertTrue(
+                rowImages.contains { image in
+                    backing.itemKind == image.itemKind && backing.text == image.text
+                        && backing.toolExecution == image.toolExecution && sameProjected(backing.toItem(), image)
+                },
+                "\(label): the \(native.kind) backing is a whole generated representation: \(String(describing: backing.toolExecution))"
+            )
+            let copies = harness.session.items.filter { $0.id == native.id }
+            XCTAssertEqual(copies.count, 1, "\(label): one suffix copy for \(native.kind)")
+            for copy in copies {
+                XCTAssertTrue(rowImages.contains { sameProjected(copy, $0) }, "\(label): the \(native.kind) suffix copy is a whole representation")
+            }
+        }
+    }
+
+    /// Step 4d5 stored-projection contract: a live Read chain saved terminally or mid-run is stored
+    /// summarized, and after each of two relaunch/hydration/save cycles the import of the same native
+    /// turn records it with no duplicate, keeping every proof. The live owner's exact check still
+    /// finds the summarized tool rows not held.
+    func testLiveReadChainSurvivesRepeatedSaveAndHydrationAndItsImportIsANoOp() async throws {
+        for terminal in [true, false] {
+            let label = terminal ? "terminal" : "running"
+            var harness = try await makeProducerHarness(windowID: terminal ? 4988 : 4987)
+            let chain = try await deliverLiveReadChainAndSave(harness, terminal: terminal)
+            let toolIDs = [chain.call.localItemID, chain.result.localItemID]
+            let exchange = try [XCTUnwrap(chain.call.canonicalItem), XCTUnwrap(chain.result.canonicalItem)]
+            try await assertStoredSummarized(harness, toolIDs: toolIDs, label)
+            try harness.appendHistory(chain.history)
+            for cycle in 1 ... 2 {
+                let cycleLabel = "\(label) cycle \(cycle)"
+                let relaunched = try await relaunchAndReconcile(
+                    harness, windowID: (terminal ? 4910 : 4920) + cycle,
+                    attemptID: chain.attemptID, rowIDs: chain.liveIDs, callID: chain.call.localItemID, exchange: exchange, cycleLabel
+                )
+                harness = relaunched.harness
+                // The first import records the claimed caller (ledger only); the next finds nothing new.
+                // Both are reached only after the association preflight accepted every proven row.
+                XCTAssertEqual(
+                    relaunched.result,
+                    cycle == 1 ? .imported(completion: .unconfirmed, rowCount: 0) : .nothingImported(Self.noNewHistoryText),
+                    cycleLabel
+                )
+                let view = AgentProviderHistoryCanonicalView(transcript: harness.session.transcript, suffixItems: harness.session.items)
+                XCTAssertFalse(chain.holds(chain.call.canonicalItem, in: view), "\(cycleLabel): the live check stays exact")
+                XCTAssertFalse(chain.holds(chain.result.canonicalItem, in: view), cycleLabel)
+                XCTAssertTrue(chain.holds(chain.answer.canonicalItem, in: view), cycleLabel)
+                harness.session.isDirty = true
+                let saved = await harness.viewModel.flushSave(for: harness.session.tabID)
+                XCTAssertTrue(saved, cycleLabel)
+                try await assertStoredSummarized(harness, toolIDs: toolIDs, cycleLabel)
+            }
+            // A tampered hydrated backing matches no generated representation: refused, nothing changed.
+            var tampered = harness.session.transcript
+            var didTamper = false
+            for turn in tampered.turns.indices {
+                for span in tampered.turns[turn].responseSpans.indices {
+                    for activity in tampered.turns[turn].responseSpans[span].activities.indices
+                        where tampered.turns[turn].responseSpans[span].activities[activity].id == chain.result.localItemID
+                    {
+                        tampered.turns[turn].responseSpans[span].activities[activity].toolExecution?.summaryText = "read • changed"
+                        didTamper = true
+                    }
+                }
+            }
+            XCTAssertTrue(didTamper, "\(label): tampered backing")
+            harness.session.transcript = tampered
+            let itemsBefore = harness.session.items
+            let ledgerBefore = harness.session.providerHistoryRecovery
+            let refused = await harness.viewModel.reconcileRecoveryHistory(
+                reconcileAction(harness, runAttemptID: chain.attemptID), session: harness.session, lane: harness.lane, codexTurnID: nil
+            )
+            guard case .associationUnavailable(.canonicalPayloadMismatch, _) = refused else {
+                return XCTFail("\(label) tampered: \(refused)")
+            }
+            XCTAssertEqual(harness.session.items, itemsBefore, "\(label) tampered: nothing changed")
+            XCTAssertEqual(harness.session.providerHistoryRecovery, ledgerBefore, "\(label) tampered: ledger unchanged")
+            XCTAssertTrue(harness.session.claudeLiveTranscriptOwnedKeys.isEmpty, label)
+        }
+    }
+
+    private static let noNewHistoryText = "The provider has no new history for this conversation."
+
+    /// Step 4d5: Read rows recovered by an import (a whole chain, or a call alone; the planner's
+    /// recovered label first) are stored summarized, and after two relaunch/hydration/save cycles
+    /// their re-import appends nothing; they are never owned. A cold restore never cancels a protected
+    /// call alone, and the native result and answer that arrive later import after it.
+    func testImportedReadRowsSurviveRepeatedSaveAndHydrationAndReimportAsANoOp() async throws {
+        for callOnly in [false, true] {
+            let label = callOnly ? "call only" : "whole chain"
+            var harness = try await makeProducerHarness(windowID: callOnly ? 4986 : 4985)
+            let runID = UUID()
+            harness.session.runID = runID
+            harness.session.runState = .running
+            let attemptID = harness.session.beginRunAttempt(source: "test.importedReadRoundTrip").attemptID
+            let prompt = "Use Read on notes.txt, then reply with its token."
+            let (_, identity) = try await admitClaimedDispatch(harness, runAttemptID: attemptID, text: prompt)
+            harness.session.runState = .completed
+            try harness.appendHistory(o20History(
+                caller: identity.dispatchID.uuidString.lowercased(), prompt: prompt, toolUseID: "toolu_fixture_1",
+                path: "/fixture/workspace/notes.txt", output: Self.readOutput, reply: "BRAVO-42", callOnly: callOnly
+            ))
+            let itemsBefore = harness.session.items.map(\.id)
+            let first = await harness.viewModel.reconcileRecoveryHistory(
+                reconcileAction(harness, runAttemptID: attemptID), session: harness.session, lane: harness.lane, codexTurnID: nil
+            )
+            // The planner prepends one recovered label to the native output rows.
+            XCTAssertEqual(first, .imported(completion: .unconfirmed, rowCount: callOnly ? 2 : 4), label)
+            let ledger = try XCTUnwrap(harness.session.providerHistoryRecovery, label)
+            func localID(_ entry: String) throws -> UUID {
+                try XCTUnwrap(ledger.nativeItems.first { $0.nativeEntryID == entry }?.localItemID, "\(label): \(entry)")
+            }
+            let callID = try localID("c1")
+            let rowIDs = try callOnly ? [callID] : [callID, localID("r1"), localID("a1")]
+            let appended = Array(harness.session.items.dropFirst(itemsBefore.count))
+            XCTAssertEqual(harness.session.items.prefix(itemsBefore.count).map(\.id), itemsBefore, label)
+            let importID = try XCTUnwrap(ledger.lastImportCommit?.importID, label)
+            let labelID = ClaudeSessionHistoryReader.deterministicUUID(
+                namespace: "rpce-history-import-label-v1",
+                components: ["claude", conversationID, importID.uuidString.lowercased()]
+            )
+            XCTAssertEqual(appended.map(\.id), [labelID] + rowIDs, "\(label): the label, then the native output in order")
+            XCTAssertEqual(appended.first?.kind, .system, label)
+            XCTAssertEqual(appended.first?.text, AgentProviderHistoryImportPlanner.recoveredLabel, label)
+            XCTAssertEqual(appended.dropFirst().map(\.kind), callOnly ? [.toolCall] : [.toolCall, .toolResult, .assistant], label)
+            let caller = identity.dispatchID.uuidString.lowercased()
+            XCTAssertEqual(ledger.nativeItems.map(\.nativeEntryID), callOnly ? [caller, "c1"] : [caller, "c1", "r1", "a1"], label)
+            XCTAssertNil(ledger.nativeItems.first { $0.nativeEntryID == caller }?.localItemID, "\(label): the caller is ledger only")
+            let toolIDs = try callOnly ? [callID] : [callID, localID("r1")]
+            // Before any save the imported tool rows are the reader's exact projections (the proven
+            // native exchange); their stored forms must stay generated representations of these.
+            let exchange = try toolIDs.map { id in try XCTUnwrap(harness.session.items.first { $0.id == id }, label) }
+            XCTAssertNotNil(exchange.first?.toolArgsJSON, "\(label): imported raw")
+            XCTAssertTrue(harness.session.claudeLiveTranscriptOwnedKeys.isEmpty, label)
+            harness.session.isDirty = true
+            let saved = await harness.viewModel.flushSave(for: harness.session.tabID)
+            XCTAssertTrue(saved, label)
+            try await assertStoredSummarized(harness, toolIDs: toolIDs, label)
+            for cycle in 1 ... 2 {
+                let cycleLabel = "\(label) cycle \(cycle)"
+                let relaunched = try await relaunchAndReconcile(
+                    harness, windowID: (callOnly ? 4940 : 4930) + cycle, attemptID: attemptID, rowIDs: rowIDs, callID: callID,
+                    exchange: exchange, cycleLabel
+                )
+                harness = relaunched.harness
+                // A call alone stays protected through the cold restore (never cancelled or errored).
+                XCTAssertEqual(relaunched.result, .nothingImported(Self.noNewHistoryText), cycleLabel)
+                harness.session.isDirty = true
+                let savedAgain = await harness.viewModel.flushSave(for: harness.session.tabID)
+                XCTAssertTrue(savedAgain, cycleLabel)
+                try await assertStoredSummarized(harness, toolIDs: toolIDs, cycleLabel)
+            }
+            guard callOnly else { continue }
+            // Partial history continues: the native result and answer arrive after the relaunches and
+            // import after the protected call (its own recovered label first); the call is unchanged.
+            let callBefore = try XCTUnwrap(harness.session.items.first { $0.id == callID }, label)
+            let full = o20History(
+                caller: caller, prompt: prompt, toolUseID: "toolu_fixture_1",
+                path: "/fixture/workspace/notes.txt", output: Self.readOutput, reply: "BRAVO-42"
+            )
+            try harness.appendHistory(Array(full.suffix(2)))
+            harness.session.runState = .completed
+            let countBefore = harness.session.items.count
+            let continued = await harness.viewModel.reconcileRecoveryHistory(
+                reconcileAction(harness, runAttemptID: attemptID), session: harness.session, lane: harness.lane, codexTurnID: nil
+            )
+            XCTAssertEqual(continued, .imported(completion: .unconfirmed, rowCount: 3), "\(label): continued")
+            let continuedLedger = try XCTUnwrap(harness.session.providerHistoryRecovery, label)
+            XCTAssertEqual(continuedLedger.nativeItems.map(\.nativeEntryID), [caller, "c1", "r1", "a1"], label)
+            let continuedImportID = try XCTUnwrap(continuedLedger.lastImportCommit?.importID, label)
+            let continuedLabelID = ClaudeSessionHistoryReader.deterministicUUID(
+                namespace: "rpce-history-import-label-v1",
+                components: ["claude", conversationID, continuedImportID.uuidString.lowercased()]
+            )
+            func continuedLocalID(_ entry: String) throws -> UUID {
+                try XCTUnwrap(continuedLedger.nativeItems.first { $0.nativeEntryID == entry }?.localItemID, "\(label): \(entry)")
+            }
+            let added = Array(harness.session.items.dropFirst(countBefore))
+            XCTAssertEqual(added.map(\.id), try [continuedLabelID, continuedLocalID("r1"), continuedLocalID("a1")], label)
+            XCTAssertEqual(added.map(\.kind), [.system, .toolResult, .assistant], label)
+            XCTAssertEqual(added.last?.text, "BRAVO-42", label)
+            XCTAssertEqual(harness.session.items.first { $0.id == callID }, callBefore, "\(label): the call is never converted")
+            let callKey = try XCTUnwrap(ledger.nativeItems.first { $0.nativeEntryID == "c1" }?.key, label)
+            XCTAssertEqual(continuedLedger.nativeItem(forKey: callKey), ledger.nativeItem(forKey: callKey), "\(label): the call's proof is kept")
+            XCTAssertTrue(harness.session.claudeLiveTranscriptOwnedKeys.isEmpty, label)
+
+            // The continued state (call, then the later label, result and answer) survives one more
+            // save, relaunch and reconcile: nothing new, each tool row a whole generated representation.
+            let resultID = try continuedLocalID("r1")
+            let continuedExchange = try [exchange[0], XCTUnwrap(harness.session.items.first { $0.id == resultID }, label)]
+            XCTAssertEqual(continuedExchange[1].toolResultJSON, Self.readOutput, "\(label): the result imported raw")
+            harness.session.isDirty = true
+            let savedContinued = await harness.viewModel.flushSave(for: harness.session.tabID)
+            XCTAssertTrue(savedContinued, label)
+            try await assertStoredSummarized(harness, toolIDs: [callID, resultID], "\(label) continued")
+            let relaunched = try await relaunchAndReconcile(
+                harness, windowID: 4950, attemptID: attemptID, rowIDs: [callID, resultID, continuedLocalID("a1")], callID: callID,
+                exchange: continuedExchange, "\(label) continued relaunch"
+            )
+            XCTAssertEqual(relaunched.result, .nothingImported(Self.noNewHistoryText), "\(label) continued relaunch")
+        }
+    }
+
+    // MARK: Step 4d5 stored-projection comparison (pure preflight)
+
+    private enum StoredReadFixture {
+        static let session = "conv-1"
+        static let inputJSON = #"{"file_path":"\/fixture\/workspace\/notes.txt"}"#
+        static let output = "     1\tBRAVO-42\n"
+    }
+
+    private func readerRow(
+        _ row: ClaudeSessionHistoryReader.Row,
+        ordinal: Int? = nil,
+        toolIsError: Bool?? = nil,
+        envelopeDigest: String? = nil
+    ) -> ClaudeSessionHistoryReader.Row {
+        ClaudeSessionHistoryReader.Row(
+            nativeEntryID: row.nativeEntryID, kind: row.kind, ordinal: ordinal ?? row.ordinal, localItemID: row.localItemID,
+            text: row.text, toolName: row.toolName, toolUseID: row.toolUseID, toolInvocationID: row.toolInvocationID,
+            toolInputJSON: row.toolInputJSON, toolIsError: toolIsError ?? row.toolIsError, envelopeDigest: envelopeDigest ?? row.envelopeDigest
+        )
+    }
+
+    private func readObservation(_ rows: [ClaudeSessionHistoryReader.Row], newRows: Bool = false) -> AgentProviderHistoryObservation {
+        ClaudeSessionHistoryReader.observation(ClaudeSessionHistoryReader.Candidate(
+            nativeSessionID: StoredReadFixture.session, file: nil, completeLineOffset: 0, prefixSHA256: "",
+            rows: newRows ? rows : [], validationRows: rows, userMessageEntries: [], completion: .unconfirmed, isRescan: false
+        ))
+    }
+
+    /// The ledger proving `rows` (their own digests unless `digest` overrides).
+    private func readLedger(_ rows: [ClaudeSessionHistoryReader.Row], digest: String?? = nil) -> AgentSessionProviderHistoryRecovery {
+        AgentSessionProviderHistoryRecovery(nativeItems: rows.map {
+            .init(
+                providerRaw: "claude", nativeSessionID: StoredReadFixture.session, nativeEntryID: $0.nativeEntryID,
+                rowKindRaw: $0.kind.rawValue, ordinal: $0.ordinal, localItemID: $0.localItemID, envelopeDigest: digest ?? $0.envelopeDigest
+            )
+        })
+    }
+
+    /// `items` (after a user turn) through the real save and load: the hydrated transcript and its
+    /// working (suffix) items.
+    private func storedView(
+        _ items: [AgentChatItem],
+        terminalState: AgentSessionRunState? = nil
+    ) -> (transcript: AgentTranscript, suffix: [AgentChatItem]) {
+        var sequenced = [AgentChatItem.user("Use Read on notes.txt")] + items
+        for index in sequenced.indices {
+            sequenced[index].sequenceIndex = index
+        }
+        let built = AgentTranscriptIO.buildTranscript(
+            from: sequenced, terminalState: terminalState, nextSequenceIndex: sequenced.count, policy: .canonical
+        )
+        let stored = AgentTranscriptPolicyPipeline.persistedTranscript(from: built).transcript
+        let loaded = AgentTranscriptPolicyPipeline.runtimeTranscriptOnly(AgentTranscriptIO.runtimeNormalizedTranscript(stored))
+        return (loaded, AgentTranscriptIO.workingSourceItems(from: loaded))
+    }
+
+    /// Step 4d5: only a proven singleton Read row in its exact stored form (a full, intact backing
+    /// activity whose complete execution agrees, and an agreeing suffix copy) passes; every other
+    /// stored, changed, unproven, ambiguous, compacted or unsupported case refuses, and the live
+    /// owner's exact check never holds a stored copy.
+    func testStoredReadProjectionIsAcceptedOnlyForAProvenExactStoredForm() throws {
+        let call = try XCTUnwrap(ClaudeSessionHistoryReader.singleToolUseRow(
+            nativeSessionID: StoredReadFixture.session, nativeEntryID: "c1", toolUseID: "toolu_1", name: "Read", inputJSON: StoredReadFixture.inputJSON
+        ))
+        let result = try XCTUnwrap(ClaudeSessionHistoryReader.singleToolResultRow(
+            nativeSessionID: StoredReadFixture.session, nativeEntryID: "r1", toolUseID: "toolu_1", toolName: "Read", text: StoredReadFixture.output
+        ))
+        let callItem = try XCTUnwrap(ClaudeSessionHistoryReader.item(for: call))
+        let resultItem = try XCTUnwrap(ClaudeSessionHistoryReader.item(for: result))
+        let rows = [call, result]
+        let stored = storedView([callItem, resultItem])
+        func refusal(
+            _ rows: [ClaudeSessionHistoryReader.Row],
+            transcript: AgentTranscript,
+            suffix: [AgentChatItem],
+            ledger: AgentSessionProviderHistoryRecovery?,
+            newRows: Bool = false
+        ) -> AgentProviderHistoryAssociationRefusal? {
+            AgentProviderHistoryAssociationPreflight.canonicalPayloadRefusal(
+                observation: readObservation(rows, newRows: newRows),
+                canonical: AgentProviderHistoryCanonicalView(transcript: transcript, suffixItems: suffix),
+                ledger: ledger
+            )
+        }
+        XCTAssertEqual(readObservation(rows).storageComparableReadItemIDs, [callItem.id, resultItem.id])
+        let summarizedResult = try XCTUnwrap(stored.suffix.first { $0.id == resultItem.id })
+        XCTAssertNotEqual(summarizedResult.toolResultJSON, StoredReadFixture.output, "the fixture is the summarized stored form")
+
+        // Accepted: suffix plus backing, persisted-prefix only, and a call alone.
+        XCTAssertNil(refusal(rows, transcript: stored.transcript, suffix: stored.suffix, ledger: readLedger(rows)))
+        XCTAssertNil(refusal(rows, transcript: stored.transcript, suffix: [], ledger: readLedger(rows)), "prefix only")
+        let callOnly = storedView([callItem])
+        XCTAssertNil(refusal([call], transcript: callOnly.transcript, suffix: callOnly.suffix, ledger: readLedger([call])), "call only")
+        // The raw copy keeps the unchanged exact path.
+        XCTAssertNil(refusal(rows, transcript: .empty, suffix: [callItem, resultItem], ledger: readLedger(rows)))
+
+        // The other generated representations, each as the real pipeline produces it: a result a later
+        // answer hides (runtime-sanitized), and a turn rebuilt from its working items.
+        let hidden = AgentToolResultPersistencePolicy.sanitizeTranscriptWithMetrics(
+            stored.transcript, preservedVisibleToolResultRowIDs: [], purpose: .runtimePresentation
+        ).transcript
+        let hiddenSuffix = AgentTranscriptIO.workingSourceItems(from: hidden)
+        let hiddenResult = try XCTUnwrap(hidden.turns.flatMap(\.allActivities).first { $0.id == resultItem.id })
+        let visibleResult = try XCTUnwrap(stored.transcript.turns.flatMap(\.allActivities).first { $0.id == resultItem.id })
+        XCTAssertNotEqual(hiddenResult.toolExecution?.resultJSON, visibleResult.toolExecution?.resultJSON, "the fixture hides the result")
+        XCTAssertNotEqual(hiddenResult.text, visibleResult.text, "the hidden text differs")
+        XCTAssertEqual(
+            AgentToolResultPersistencePolicy.sanitizeTranscriptWithMetrics(
+                hidden, preservedVisibleToolResultRowIDs: [], purpose: .runtimePresentation
+            ).transcript,
+            hidden,
+            "the runtime sanitizer is idempotent (the hidden forms rely on it)"
+        )
+        XCTAssertNil(refusal(rows, transcript: hidden, suffix: hiddenSuffix, ledger: readLedger(rows)), "hidden")
+        let rebuilt = AgentTranscriptPolicyPipeline.runtimeTranscriptOnly(AgentTranscriptIO.buildTranscript(
+            from: stored.suffix, nextSequenceIndex: stored.suffix.count, policy: .canonical
+        ))
+        let rebuiltCall = try XCTUnwrap(rebuilt.turns.flatMap(\.allActivities).first { $0.id == callItem.id })
+        XCTAssertEqual(rebuiltCall.toolExecution?.summaryOnly, false, "the fixture rebuilds the call")
+        XCTAssertNil(refusal(rows, transcript: rebuilt, suffix: AgentTranscriptIO.workingSourceItems(from: rebuilt), ledger: readLedger(rows)), "rebuilt")
+        XCTAssertNil(
+            refusal(rows, transcript: stored.transcript, suffix: hiddenSuffix, ledger: readLedger(rows)),
+            "a suffix copy and its backing each match a whole representation of their own"
+        )
+
+        // The live owner's exact check never holds a stored copy.
+        let view = AgentProviderHistoryCanonicalView(transcript: stored.transcript, suffixItems: stored.suffix)
+        XCTAssertFalse(AgentProviderHistoryAssociationPreflight.holdsCanonicalPayload(callItem, in: view))
+        XCTAssertFalse(AgentProviderHistoryAssociationPreflight.holdsCanonicalPayload(resultItem, in: view))
+
+        // Unproven: a cleared proof, a changed native entry, or no ledger entry at all.
+        XCTAssertEqual(refusal(rows, transcript: stored.transcript, suffix: stored.suffix, ledger: readLedger(rows, digest: .some(nil))), .canonicalPayloadUnavailable)
+        XCTAssertEqual(
+            refusal(rows, transcript: stored.transcript, suffix: stored.suffix, ledger: readLedger(rows, digest: String(repeating: "c", count: 64))),
+            .canonicalPayloadUnavailable,
+            "a native entry changed since its proof"
+        )
+        XCTAssertEqual(refusal(rows, transcript: stored.transcript, suffix: stored.suffix, ledger: nil, newRows: true), .canonicalPayloadUnavailable)
+
+        // Changed stored form: the suffix copy, or the backing execution behind an intact suffix.
+        var alteredSuffix = stored.suffix
+        let resultIndex = try XCTUnwrap(alteredSuffix.firstIndex { $0.id == resultItem.id })
+        alteredSuffix[resultIndex].toolResultJSON = alteredSuffix[resultIndex].toolResultJSON?.replacingOccurrences(of: "unknown", with: "success")
+        alteredSuffix[resultIndex].text = alteredSuffix[resultIndex].toolResultJSON ?? ""
+        XCTAssertEqual(refusal(rows, transcript: stored.transcript, suffix: alteredSuffix, ledger: readLedger(rows)), .canonicalPayloadMismatch)
+        func alteringBacking(_ change: (inout AgentTranscriptActivity) -> Void) throws -> AgentTranscript {
+            var transcript = stored.transcript
+            for turn in transcript.turns.indices {
+                for span in transcript.turns[turn].responseSpans.indices {
+                    for activity in transcript.turns[turn].responseSpans[span].activities.indices
+                        where transcript.turns[turn].responseSpans[span].activities[activity].id == resultItem.id
+                    {
+                        change(&transcript.turns[turn].responseSpans[span].activities[activity])
+                        return transcript
+                    }
+                }
+            }
+            XCTFail("no backing activity")
+            return transcript
+        }
+        let alteredExecution = try alteringBacking { $0.toolExecution?.summaryText = "read • changed" }
+        XCTAssertEqual(refusal(rows, transcript: alteredExecution, suffix: stored.suffix, ledger: readLedger(rows)), .canonicalPayloadMismatch)
+        let alteredFlag = try alteringBacking { $0.toolExecution?.summaryOnly = false }
+        XCTAssertEqual(refusal(rows, transcript: alteredFlag, suffix: stored.suffix, ledger: readLedger(rows)), .canonicalPayloadMismatch)
+        // Mixed representations: fields each allowed by some image, but together matching none.
+        let mixedResult = try alteringBacking { $0.text = hiddenResult.text }
+        XCTAssertEqual(refusal(rows, transcript: mixedResult, suffix: stored.suffix, ledger: readLedger(rows)), .canonicalPayloadMismatch, "hidden text, visible execution")
+        var mixedCall = stored.transcript
+        for turn in mixedCall.turns.indices {
+            for span in mixedCall.turns[turn].responseSpans.indices {
+                for activity in mixedCall.turns[turn].responseSpans[span].activities.indices
+                    where mixedCall.turns[turn].responseSpans[span].activities[activity].id == callItem.id
+                {
+                    mixedCall.turns[turn].responseSpans[span].activities[activity].toolExecution?.summaryOnly = false
+                }
+            }
+        }
+        XCTAssertNotEqual(mixedCall, stored.transcript)
+        XCTAssertEqual(refusal(rows, transcript: mixedCall, suffix: stored.suffix, ledger: readLedger(rows)), .canonicalPayloadMismatch, "rebuilt flag, loaded summary")
+
+        // A repeated or competing ledger mapping never lends its proof to the stored comparison, in
+        // either order; a mapping to another row's item is a mismatch.
+        let proofs = readLedger(rows).nativeItems
+        for repeated in [proofs + [proofs[1]], [proofs[1]] + proofs] {
+            XCTAssertEqual(
+                refusal(rows, transcript: stored.transcript, suffix: stored.suffix, ledger: AgentSessionProviderHistoryRecovery(nativeItems: repeated)),
+                .canonicalPayloadUnavailable,
+                "a duplicate proof"
+            )
+        }
+        var competing = proofs
+        competing[0] = .init(
+            providerRaw: proofs[0].providerRaw, nativeSessionID: proofs[0].nativeSessionID, nativeEntryID: proofs[0].nativeEntryID,
+            rowKindRaw: proofs[0].rowKindRaw, ordinal: proofs[0].ordinal, localItemID: resultItem.id, envelopeDigest: proofs[0].envelopeDigest
+        )
+        XCTAssertEqual(
+            refusal(rows, transcript: stored.transcript, suffix: stored.suffix, ledger: AgentSessionProviderHistoryRecovery(nativeItems: competing)),
+            .canonicalPayloadMismatch,
+            "two mappings to one item"
+        )
+
+        // Reordered canonical output.
+        XCTAssertEqual(
+            refusal(rows, transcript: stored.transcript, suffix: Array(stored.suffix.reversed()), ledger: readLedger(rows)),
+            .canonicalPayloadMismatch,
+            "a reordered suffix"
+        )
+
+        // Missing, ambiguous or compacted backing.
+        XCTAssertEqual(refusal(rows, transcript: .empty, suffix: stored.suffix, ledger: readLedger(rows)), .canonicalPayloadUnavailable, "no backing")
+        var duplicated = stored.transcript
+        let lastTurn = try XCTUnwrap(duplicated.turns.indices.last)
+        let backing = try XCTUnwrap(duplicated.turns[lastTurn].allActivities.first { $0.id == resultItem.id })
+        duplicated.turns.append(AgentTranscriptTurn(responseSpans: [AgentTranscriptProviderResponseSpan(startedAt: Date(), activities: [backing])], startedAt: Date()))
+        XCTAssertEqual(refusal(rows, transcript: duplicated, suffix: stored.suffix, ledger: readLedger(rows)), .canonicalPayloadUnavailable, "ambiguous")
+        var condensed = stored.transcript
+        for turn in condensed.turns.indices {
+            condensed.turns[turn].retentionTier = .condensed
+        }
+        XCTAssertEqual(refusal(rows, transcript: condensed, suffix: stored.suffix, ledger: readLedger(rows)), .canonicalPayloadUnavailable, "non-full")
+
+        /// Unsupported shapes never qualify, each in its own exact stored form.
+        func unsupported(_ label: String, call: ClaudeSessionHistoryReader.Row, result: ClaudeSessionHistoryReader.Row?) throws {
+            let rows = [call] + (result.map { [$0] } ?? [])
+            XCTAssertTrue(readObservation(rows).storageComparableReadItemIDs.isEmpty, label)
+            let items = try rows.map { try XCTUnwrap(ClaudeSessionHistoryReader.item(for: $0), label) }
+            let view = storedView(items)
+            XCTAssertEqual(refusal(rows, transcript: view.transcript, suffix: view.suffix, ledger: readLedger(rows)), .canonicalPayloadUnavailable, label)
+        }
+        func toolUse(_ name: String, _ inputJSON: String) throws -> ClaudeSessionHistoryReader.Row {
+            try XCTUnwrap(ClaudeSessionHistoryReader.singleToolUseRow(
+                nativeSessionID: StoredReadFixture.session, nativeEntryID: "c1", toolUseID: "toolu_1", name: name, inputJSON: inputJSON
+            ))
+        }
+        try unsupported("another tool", call: toolUse("Bash", #"{"command":"ls"}"#), result: nil)
+        try unsupported("another input", call: toolUse("Read", #"{"file_path":"\/fixture\/workspace\/notes.txt","limit":5}"#), result: nil)
+        try unsupported("an empty path", call: toolUse("Read", #"{"file_path":""}"#), result: nil)
+        try unsupported("an error result", call: call, result: readerRow(result, toolIsError: .some(true)))
+        try unsupported("a result whose digest is not its singleton entry's", call: call, result: readerRow(result, envelopeDigest: String(repeating: "d", count: 64)))
+        XCTAssertTrue(readObservation([call, readerRow(call, ordinal: 1)]).storageComparableReadItemIDs.isEmpty, "a multiblock entry")
+        XCTAssertTrue(readObservation([call, result, readerRow(result, ordinal: 0)]).storageComparableReadItemIDs.isEmpty, "two results")
     }
 
     /// Step 4d3b save ordering: a save whose snapshot predates an invalidation may write the old proof,

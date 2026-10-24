@@ -663,4 +663,454 @@ final class ClaudeLiveTranscriptQualificationTests: XCTestCase {
         let qualified = await reader.drain()
         XCTAssertEqual(qualified.count { if case .completeText = $0.claudeLiveTranscriptEvidence?.kind { true } else { false } }, 1)
     }
+
+    // MARK: Step 4d5 single main-thread Read (O20 stdout shape)
+
+    // Modeled on main's offline key/type-only O20 shape notes (phase4d5.md): no captured IDs, paths
+    // or contents. Fixture-backed only, never live or installed no-replay evidence.
+    private let readPath = "/fixture/workspace/notes.txt"
+    private let readFileContent = "BRAVO-42\n"
+    private let readToolUseID = "toolu_o20_1"
+    private let readReply = "BRAVO-42"
+    private let translatedInvocation = UUID()
+
+    /// The tool-result block text: the file content is a substring of it, never equal to it.
+    private var readBlockOutput: String {
+        "     1\t" + readFileContent
+    }
+
+    private func readCallBlock(caller: Any? = ["type": "direct"], name: String = "Read", input: [String: Any]? = nil) -> [String: Any] {
+        var block: [String: Any] = ["type": "tool_use", "id": readToolUseID, "name": name, "input": input ?? ["file_path": readPath]]
+        if let caller { block["caller"] = caller }
+        return block
+    }
+
+    /// The observed call envelope: assistant keys plus `wire_tool_inputs` (the singleton mapping of
+    /// the tool-use ID to the same input), both attributions when `attributedTo` is given.
+    private func readCall(entry: String = "c1", block: [String: Any]? = nil, attributedTo outbound: UUID?) -> [String: Any] {
+        let block = block ?? readCallBlock()
+        var payload = assistant(entry: entry, content: [block], attributedTo: outbound)
+        payload["timestamp"] = "2026-10-23T00:00:01.000Z"
+        payload["wire_tool_inputs"] = [readToolUseID: block["input"] ?? [:]]
+        return payload
+    }
+
+    /// The observed tool-result user payload (own UUID; no replay, parent or attribution keys).
+    private func readResult(
+        entry: String = "r1",
+        toolUseID: String? = nil,
+        metaID: String? = nil,
+        filePath: String? = nil,
+        fileContent: String? = nil,
+        block: [String: Any]? = nil
+    ) -> [String: Any] {
+        [
+            "type": "user",
+            "message": [
+                "role": "user",
+                "content": [block ?? ["type": "tool_result", "tool_use_id": toolUseID ?? readToolUseID, "content": readBlockOutput]]
+            ] as [String: Any],
+            "parent_tool_use_id": NSNull(),
+            "session_id": session,
+            "timestamp": "2026-10-23T00:00:02.000Z",
+            "uuid": entry,
+            "tool_use_result": [
+                "type": "text",
+                "file": [
+                    "content": fileContent ?? readFileContent, "filePath": filePath ?? readPath,
+                    "numLines": 1, "startLine": 1, "totalLines": 1
+                ] as [String: Any]
+            ] as [String: Any],
+            "tool_result_meta": [[
+                "id": metaID ?? readToolUseID,
+                "permission_decision": ["decision": "accept", "source": "config", "reason_type": "mode"]
+            ] as [String: Any]]
+        ]
+    }
+
+    /// The observed final assistant: assistant keys without caller attribution or wire inputs.
+    private func readAnswer(entry: String = "a2", text: String? = nil) -> [String: Any] {
+        var payload = assistant(entry: entry, text: text ?? readReply)
+        payload["timestamp"] = "2026-10-23T00:00:03.000Z"
+        return payload
+    }
+
+    /// The translator's call result (pretty-printed sorted arguments, its own pairing ID).
+    private func translatedReadCall(_ invocation: UUID?, name: String = "Read", args: [String: Any]? = nil) -> AIStreamResult {
+        let data = try! JSONSerialization.data(withJSONObject: args ?? ["file_path": readPath], options: [.prettyPrinted, .sortedKeys])
+        let json = String(data: data, encoding: .utf8)
+        return AIStreamResult(type: "tool_call", text: nil, toolName: name, toolArgs: json, toolInvocationID: invocation, toolArgsJSON: json)
+    }
+
+    private func translatedReadResult(_ invocation: UUID?, output: String? = nil, isError: Bool? = nil) -> AIStreamResult {
+        AIStreamResult(
+            type: "tool_result", text: nil, toolName: "Read", toolOutput: output ?? readBlockOutput,
+            toolInvocationID: invocation, toolResultJSON: output ?? readBlockOutput, toolIsError: isError
+        )
+    }
+
+    private enum ReadStage: Int, Comparable {
+        case dispatched, called, returned, answered
+
+        static func < (lhs: Self, rhs: Self) -> Bool {
+            lhs.rawValue < rhs.rawValue
+        }
+    }
+
+    /// Drives one O20 Read turn of an eligible producer through `stage`; returns its outbound.
+    @discardableResult
+    private func driveRead(
+        _ state: inout State,
+        through stage: ReadStage,
+        replay: Bool = false,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) -> UUID {
+        let outbound = UUID()
+        XCTAssertEqual(state.classify(envelope: data(systemInit()), translated: [], turnInFlight: false), .benign, file: file, line: line)
+        state.noteOutbound(uuid: outbound, text: prompt)
+        if replay {
+            XCTAssertEqual(state.classify(envelope: data(self.replay(outbound)), translated: [], turnInFlight: true), .benign, file: file, line: line)
+        }
+        let usage = AIStreamResult(type: "usage", text: nil)
+        let steps: [(ReadStage, [String: Any], [AIStreamResult])] = [
+            (.called, readCall(attributedTo: outbound), [usage, translatedReadCall(translatedInvocation)]),
+            (.returned, readResult(), [translatedReadResult(translatedInvocation)]),
+            (.answered, readAnswer(), [usage, content(readReply)])
+        ]
+        for (step, payload, translated) in steps where step <= stage {
+            guard case .attach = state.classify(envelope: data(payload), translated: translated, turnInFlight: true) else {
+                XCTFail("the \(step) step attaches", file: file, line: line)
+                return outbound
+            }
+        }
+        return outbound
+    }
+
+    /// Step 4d5: replayed or not, the exact O20 call, result and final text each attach once to their
+    /// one translated result, with the history reader's rows (deterministic row and pairing IDs,
+    /// digests, payloads; never the translator's invocation ID), each naming its prerequisites; the
+    /// attributed success agrees with all three; the producer then qualifies a later O19 turn.
+    func testO20ReadChainAttachesTheReadersRowsAlongItsLinksAndAgrees() throws {
+        for replay in [false, true] {
+            let token = UUID()
+            var state = eligibleState(token: token)
+            let outbound = driveRead(&state, through: .dispatched, replay: replay)
+            let usage = AIStreamResult(type: "usage", text: nil)
+
+            let inputJSON = try XCTUnwrap(ClaudeSessionHistoryReader.canonicalToolInputJSON(["file_path": readPath] as NSDictionary))
+            XCTAssertEqual(inputJSON, #"{"file_path":"\/fixture\/workspace\/notes.txt"}"#, "the reader's canonical input JSON")
+            let call = try XCTUnwrap(ClaudeLiveTranscriptToolRow.projecting(
+                nativeSessionID: session, nativeEntryID: "c1", kind: .toolCall, toolUseID: readToolUseID, toolName: "Read", payload: inputJSON
+            ))
+            let invocation = ClaudeSessionHistoryReader.deterministicUUID(
+                namespace: "rpce-claude-history-tool-v1", components: [ClaudeSessionHistoryReader.providerRaw, session, readToolUseID]
+            )
+            XCTAssertEqual(call.invocationID, invocation)
+            XCTAssertNotEqual(call.invocationID, translatedInvocation, "canonical IDs come only from the reader")
+            XCTAssertTrue(call.matchesProjection)
+            let callOutcome = state.classify(
+                envelope: data(readCall(attributedTo: outbound)), translated: [usage, translatedReadCall(translatedInvocation)], turnInFlight: true
+            )
+            XCTAssertEqual(callOutcome, .attach(index: 1, .init(producerLaunchToken: token, kind: .readToolCall(call))), "replay \(replay)")
+            let callItem = try XCTUnwrap(call.canonicalItem)
+            XCTAssertEqual(callItem.id, call.localItemID)
+            XCTAssertEqual(callItem.kind, .toolCall)
+            XCTAssertEqual(callItem.toolInvocationID, invocation)
+            XCTAssertEqual(callItem.toolArgsJSON, inputJSON)
+
+            let result = try XCTUnwrap(ClaudeLiveTranscriptToolRow.projecting(
+                nativeSessionID: session, nativeEntryID: "r1", kind: .toolResult, toolUseID: readToolUseID, toolName: "Read", payload: readBlockOutput
+            ))
+            XCTAssertEqual(result.invocationID, invocation, "the shared tool-use ID pairs call and result")
+            let resultOutcome = state.classify(envelope: data(readResult()), translated: [translatedReadResult(translatedInvocation)], turnInFlight: true)
+            XCTAssertEqual(resultOutcome, .attach(index: 0, .init(producerLaunchToken: token, kind: .readToolResult(result, call: call))))
+            let resultItem = try XCTUnwrap(result.canonicalItem)
+            XCTAssertEqual(resultItem.kind, .toolResult)
+            XCTAssertNil(resultItem.toolIsError, "an absent is_error stays unknown")
+            XCTAssertNotEqual(resultItem.id, callItem.id, "call and result are distinct rows")
+
+            let answerRow = try XCTUnwrap(ClaudeSessionHistoryReader.singleTextAssistantRow(nativeSessionID: session, nativeEntryID: "a2", text: readReply))
+            let answer = try ClaudeLiveTranscriptCompleteText(
+                nativeSessionID: session, nativeEntryID: "a2", localItemID: XCTUnwrap(answerRow.localItemID),
+                text: readReply, envelopeDigest: answerRow.envelopeDigest
+            )
+            let answerOutcome = state.classify(envelope: data(readAnswer()), translated: [usage, content(readReply)], turnInFlight: true)
+            XCTAssertEqual(answerOutcome, .attach(index: 1, .init(producerLaunchToken: token, kind: .readAnswer(answer, call: call, result: result))))
+
+            let agreement = state.classify(envelope: data(self.result(readReply, attributedTo: outbound)), translated: [], turnInFlight: true)
+            XCTAssertEqual(agreement, .standalone(.init(producerLaunchToken: token, kind: .readAgreement(call: call, result: result, answer: answer))))
+            XCTAssertEqual(state.classify(envelope: data(lifecycle("completed")), translated: [], turnInFlight: false), .benign)
+
+            // The chain returned the producer to idle: a later O19 single-text turn still qualifies.
+            let next = UUID()
+            state.noteOutbound(uuid: next, text: prompt)
+            guard case let .attach(_, later) = state.classify(
+                envelope: data(assistant(entry: "a3", attributedTo: next)), translated: [content(reply)], turnInFlight: true
+            ), case .completeText = later.kind else {
+                return XCTFail("a later single-text turn qualifies (replay \(replay))")
+            }
+            XCTAssertNil(state.disqualification)
+        }
+    }
+
+    /// Step 4d5: every other call, result, final-text or success shape, link, attribution or
+    /// translation, and every out-of-order payload, disqualifies with its reason (sticky).
+    func testO20ReadChainRefusesEveryOtherShapeLinkAttributionOrTranslation() {
+        typealias Case = (String, ClaudeLiveTranscriptDisqualification, (inout State) -> ClaudeLiveTranscriptOutcome)
+        let usage = AIStreamResult(type: "usage", text: nil)
+        func call(_ state: inout State, translated: [AIStreamResult]? = nil, replay: Bool = false, _ payload: (UUID) -> [String: Any]) -> ClaudeLiveTranscriptOutcome {
+            let outbound = driveRead(&state, through: .dispatched, replay: replay)
+            return state.classify(envelope: data(payload(outbound)), translated: translated ?? [usage, translatedReadCall(translatedInvocation)], turnInFlight: true)
+        }
+        func returned(_ state: inout State, _ payload: [String: Any], translated: [AIStreamResult]? = nil, turnInFlight: Bool = true) -> ClaudeLiveTranscriptOutcome {
+            driveRead(&state, through: .called)
+            return state.classify(envelope: data(payload), translated: translated ?? [translatedReadResult(translatedInvocation)], turnInFlight: turnInFlight)
+        }
+        func answered(_ state: inout State, translated: [AIStreamResult]? = nil, _ payload: (UUID) -> [String: Any]) -> ClaudeLiveTranscriptOutcome {
+            let outbound = driveRead(&state, through: .returned)
+            return state.classify(envelope: data(payload(outbound)), translated: translated ?? [usage, content(readReply)], turnInFlight: true)
+        }
+        func succeeded(_ state: inout State, _ payload: (UUID) -> [String: Any]) -> ClaudeLiveTranscriptOutcome {
+            let outbound = driveRead(&state, through: .answered)
+            return state.classify(envelope: data(payload(outbound)), translated: [], turnInFlight: true)
+        }
+        let input: [String: Any] = ["file_path": readPath]
+        let cases: [Case] = [
+            // The call: exact five-key block with the direct caller, exact input and wire inputs.
+            ("no caller", .unsupportedAssistant, { call(&$0) { self.readCall(block: self.readCallBlock(caller: nil), attributedTo: $0) } }),
+            ("another caller type", .unsupportedAssistant, { call(&$0) { self.readCall(block: self.readCallBlock(caller: ["type": "subagent"]), attributedTo: $0) } }),
+            ("caller with an extra key", .unsupportedAssistant, { call(&$0) { self.readCall(block: self.readCallBlock(caller: ["type": "direct", "id": "x"]), attributedTo: $0) } }),
+            ("caller as a string", .unsupportedAssistant, { call(&$0) { self.readCall(block: self.readCallBlock(caller: "direct"), attributedTo: $0) } }),
+            ("another tool", .unsupportedAssistant, { call(&$0) { self.readCall(block: self.readCallBlock(name: "Bash"), attributedTo: $0) } }),
+            ("extra input key", .unsupportedAssistant, { call(&$0) { self.readCall(block: self.readCallBlock(input: ["file_path": self.readPath, "limit": 5]), attributedTo: $0) } }),
+            ("empty path", .unsupportedAssistant, { call(&$0) { self.readCall(block: self.readCallBlock(input: ["file_path": ""]), attributedTo: $0) } }),
+            ("non-string path", .unsupportedAssistant, { call(&$0) { self.readCall(block: self.readCallBlock(input: ["file_path": 1]), attributedTo: $0) } }),
+            ("extra block key", .unsupportedAssistant, { call(&$0) { outbound in
+                var block = self.readCallBlock()
+                block["is_error"] = false
+                return self.readCall(block: block, attributedTo: outbound)
+            } }),
+            ("wire inputs differ", .unsupportedAssistant, { call(&$0) { outbound in
+                var payload = self.readCall(attributedTo: outbound)
+                payload["wire_tool_inputs"] = [self.readToolUseID: ["file_path": "/fixture/other"]]
+                return payload
+            } }),
+            ("wire inputs missing", .unsupportedAssistant, { call(&$0) { outbound in
+                var payload = self.readCall(attributedTo: outbound)
+                payload["wire_tool_inputs"] = nil
+                return payload
+            } }),
+            ("wire inputs of another tool use", .unsupportedAssistant, { call(&$0) { outbound in
+                var payload = self.readCall(attributedTo: outbound)
+                payload["wire_tool_inputs"] = ["toolu_other": input]
+                return payload
+            } }),
+            ("tool use beside text", .unsupportedAssistant, { call(&$0) { self.assistant(content: [self.readCallBlock(), ["type": "text", "text": "x"]], attributedTo: $0) } }),
+            ("unattributed though replayed", .unattributedAssistant, { call(&$0, replay: true) { _ in self.readCall(attributedTo: nil) } }),
+            ("one attribution field", .unattributedAssistant, { call(&$0) { outbound in
+                var payload = self.readCall(attributedTo: outbound)
+                payload["user_message_uuids"] = nil
+                return payload
+            } }),
+            ("attributed to another message", .attributionMismatch, { call(&$0) { _ in self.readCall(attributedTo: UUID()) } }),
+            ("translated another tool name", .translationMismatch, { call(&$0, translated: [self.translatedReadCall(self.translatedInvocation, name: "read")]) { self.readCall(attributedTo: $0) } }),
+            ("translated without a pairing ID", .translationMismatch, { call(&$0, translated: [self.translatedReadCall(nil)]) { self.readCall(attributedTo: $0) } }),
+            ("translated other arguments", .translationMismatch, { call(&$0, translated: [self.translatedReadCall(self.translatedInvocation, args: ["file_path": "/x"])]) { self.readCall(attributedTo: $0) } }),
+            ("no translated call", .translationMismatch, { call(&$0, translated: [usage]) { self.readCall(attributedTo: $0) } }),
+            ("a second translated carrier", .translationMismatch, { call(&$0, translated: [self.translatedReadCall(self.translatedInvocation), self.content("x")]) { self.readCall(attributedTo: $0) } }),
+            ("tool result without a call", .unsupportedUserReplay, { state in
+                self.driveRead(&state, through: .dispatched)
+                return state.classify(envelope: self.data(self.readResult()), translated: [self.translatedReadResult(self.translatedInvocation)], turnInFlight: true)
+            }),
+
+            // The result: exact observed shape, linked by ID, metadata, path and content.
+            ("is_error present", .unsupportedToolResult, { returned(&$0, self.readResult(block: ["type": "tool_result", "tool_use_id": self.readToolUseID, "content": self.readBlockOutput, "is_error": false])) }),
+            ("block content array", .unsupportedToolResult, { returned(&$0, self.readResult(block: ["type": "tool_result", "tool_use_id": self.readToolUseID, "content": [["type": "text", "text": self.readBlockOutput]]])) }),
+            ("replay key", .unsupportedToolResult, { state in
+                var payload = self.readResult()
+                payload["isReplay"] = false
+                return returned(&state, payload)
+            }),
+            ("source attribution key", .unsupportedToolResult, { state in
+                var payload = self.readResult()
+                payload["user_message_uuid"] = UUID().uuidString
+                return returned(&state, payload)
+            }),
+            ("result reuses the call entry", .unsupportedToolResult, { returned(&$0, self.readResult(entry: "c1")) }),
+            ("another permission decision", .unsupportedToolResult, { state in
+                var payload = self.readResult()
+                payload["tool_result_meta"] = [["id": self.readToolUseID, "permission_decision": ["decision": "accept", "source": "user", "reason_type": "mode"]]]
+                return returned(&state, payload)
+            }),
+            ("two metadata entries", .unsupportedToolResult, { state in
+                var payload = self.readResult()
+                let meta = (payload["tool_result_meta"] as? [Any]) ?? []
+                payload["tool_result_meta"] = meta + meta
+                return returned(&state, payload)
+            }),
+            ("boolean line count", .unsupportedToolResult, { state in
+                var payload = self.readResult()
+                payload["tool_use_result"] = ["type": "text", "file": ["content": self.readFileContent, "filePath": self.readPath, "numLines": true, "startLine": 1, "totalLines": 1]]
+                return returned(&state, payload)
+            }),
+            ("a user replay instead of the result", .unsupportedToolResult, { state in
+                self.driveRead(&state, through: .called)
+                return state.classify(envelope: self.data(self.replay(UUID())), translated: [], turnInFlight: true)
+            }),
+            ("no turn in flight", .unsupportedToolResult, { returned(&$0, self.readResult(), turnInFlight: false) }),
+            ("another tool use", .toolLinkMismatch, { returned(&$0, self.readResult(toolUseID: "toolu_other", metaID: "toolu_other")) }),
+            ("metadata of another tool use", .toolLinkMismatch, { returned(&$0, self.readResult(metaID: "toolu_other")) }),
+            ("another path", .toolLinkMismatch, { returned(&$0, self.readResult(filePath: "/fixture/other")) }),
+            ("file content not in the output", .toolLinkMismatch, { returned(&$0, self.readResult(fileContent: "CHARLIE-19")) }),
+            ("translated another pairing ID", .translationMismatch, { returned(&$0, self.readResult(), translated: [self.translatedReadResult(UUID())]) }),
+            ("translated error status", .translationMismatch, { returned(&$0, self.readResult(), translated: [self.translatedReadResult(self.translatedInvocation, isError: false)]) }),
+            ("translated other output", .translationMismatch, { returned(&$0, self.readResult(), translated: [self.translatedReadResult(self.translatedInvocation, output: self.readFileContent)]) }),
+            ("no translated result", .translationMismatch, { returned(&$0, self.readResult(), translated: []) }),
+            ("final text before the result", .unownedAssistant, { state in
+                self.driveRead(&state, through: .called)
+                return state.classify(envelope: self.data(self.readAnswer()), translated: [self.content(self.readReply)], turnInFlight: true)
+            }),
+            ("success before the result", .resultTextMismatch, { state in
+                let outbound = self.driveRead(&state, through: .called)
+                return state.classify(envelope: self.data(self.result(self.readReply, attributedTo: outbound)), translated: [], turnInFlight: true)
+            }),
+
+            // The final text: single text, never contradicting attribution.
+            ("final text attributed to another message", .attributionMismatch, { answered(&$0) { _ in
+                var payload = self.readAnswer()
+                self.attribute(&payload, to: UUID())
+                return payload
+            } }),
+            ("a second tool call", .unsupportedAssistant, { answered(&$0, translated: [self.translatedReadCall(UUID())]) { self.readCall(entry: "c2", attributedTo: $0) } }),
+            ("final text translation", .translationMismatch, { answered(&$0, translated: [usage]) { _ in self.readAnswer() } }),
+
+            // The success: both attributions naming exactly the outbound, the answer's text.
+            ("unattributed success", .unattributedResult, { succeeded(&$0) { _ in self.result(self.readReply) } }),
+            ("one success attribution field", .unattributedResult, { succeeded(&$0) { outbound in
+                var payload = self.result(self.readReply, attributedTo: outbound)
+                payload["user_message_uuid"] = nil
+                return payload
+            } }),
+            ("success attributed to another message", .attributionMismatch, { succeeded(&$0) { _ in self.result(self.readReply, attributedTo: UUID()) } }),
+            ("success with other text", .resultTextMismatch, { succeeded(&$0) { self.result("CHARLIE-19", attributedTo: $0) } })
+        ]
+        for (name, reason, classify) in cases {
+            var state = eligibleState()
+            XCTAssertEqual(disqualification(classify(&state)), reason, name)
+            XCTAssertEqual(state.disqualification, reason, name)
+            let sticky = state.classify(envelope: data(readAnswer()), translated: [content(readReply)], turnInFlight: true)
+            XCTAssertEqual(disqualification(sticky), reason, "\(name): sticky")
+        }
+    }
+
+    private func toolSignature(_ results: [AIStreamResult]) -> [String] {
+        results.map {
+            [$0.type, $0.text, $0.toolName, $0.toolArgsJSON, $0.toolResultJSON, $0.toolOutput, $0.toolIsError.map(String.init(describing:))]
+                .map { $0 ?? "<nil>" }.joined(separator: "|")
+        }
+    }
+
+    /// One O20 Read turn (current app shape: attributed call and success, unattributed final text)
+    /// through the production payload path and the real translator.
+    private func runReadTurn(_ controller: ClaudeNativeProcessSessionController) async {
+        await controller.test_handleStreamPayload(systemInit())
+        await controller.test_registerSyntheticDispatch()
+        let outbound = UUID()
+        await controller.test_noteLiveTranscriptOutbound(uuid: outbound, text: prompt)
+        let payloads = [
+            lifecycle("started"), readCall(attributedTo: outbound), rateLimit(), readResult(), readAnswer(),
+            result(readReply, attributedTo: outbound), lifecycle("completed")
+        ]
+        for payload in payloads {
+            await controller.test_handleStreamPayload(payload)
+        }
+    }
+
+    /// Step 4d5: through the controller and the real translator, gate OFF and an ineligible launch
+    /// emit exactly the legacy results; an eligible launch emits the same results in the same order,
+    /// with the call, result and final-text evidence attached to their one translated results (the
+    /// translator keeps its own pairing ID; canonical IDs are the reader's) and the agreement as the
+    /// only carrier.
+    func testReadChainThroughTheControllerAttachesOnlyEvidenceAndGateOffMatchesLegacyOutput() async throws {
+        func run(enabled: Bool, provenance: ClaudeNativeProcessSessionController.CommandProvenance) async throws -> [AIStreamResult] {
+            let controller = try makeController(enabled: enabled)
+            let reader = await EventsReader(controller)
+            await controller.test_beginSyntheticUsageLaunch(commandProvenance: provenance)
+            await runReadTurn(controller)
+            let results = await reader.drain()
+            let state = await controller.test_liveTranscriptQualification()
+            if enabled, provenance == .automaticResolved {
+                XCTAssertEqual(state?.eligibility, .eligible)
+                XCTAssertNil(state?.disqualification, "the chain qualified")
+            } else {
+                XCTAssertNil(state, "no state for a disabled or ineligible producer")
+            }
+            return results
+        }
+        let off = try await run(enabled: false, provenance: .automaticResolved)
+        XCTAssertTrue(off.allSatisfy { $0.claudeLiveTranscriptEvidence == nil })
+        let offCall = try XCTUnwrap(off.first { $0.type == "tool_call" })
+        let offResult = try XCTUnwrap(off.first { $0.type == "tool_result" })
+        XCTAssertEqual(offCall.toolInvocationID, offResult.toolInvocationID, "the translator pairs its own call and result")
+        XCTAssertNil(offResult.toolIsError)
+        let ineligible = try await run(enabled: true, provenance: .configuredOverride)
+        XCTAssertEqual(toolSignature(ineligible), toolSignature(off))
+        XCTAssertTrue(ineligible.allSatisfy { $0.claudeLiveTranscriptEvidence == nil })
+
+        let eligible = try await run(enabled: true, provenance: .automaticResolved)
+        let withoutCarriers = eligible.filter { !($0.type == AIStreamResult.lifecycleType && $0.text == nil && $0.claudeLiveTranscriptEvidence != nil) }
+        XCTAssertEqual(toolSignature(withoutCarriers), toolSignature(off), "the same results, order and payloads")
+        let attached = eligible.filter { $0.type != AIStreamResult.lifecycleType && $0.claudeLiveTranscriptEvidence != nil }
+        XCTAssertEqual(attached.map(\.type), ["tool_call", "tool_result", "content"])
+        guard case let .readToolCall(call) = attached[0].claudeLiveTranscriptEvidence?.kind,
+              case let .readToolResult(result, call: resultCall) = attached[1].claudeLiveTranscriptEvidence?.kind,
+              case let .readAnswer(answer, call: answerCall, result: answerResult) = attached[2].claudeLiveTranscriptEvidence?.kind
+        else { return XCTFail("expected the three Read links, got \(attached.map(\.claudeLiveTranscriptEvidence))") }
+        XCTAssertEqual(resultCall, call)
+        XCTAssertEqual(answerCall, call)
+        XCTAssertEqual(answerResult, result)
+        XCTAssertEqual(answer.text, readReply)
+        XCTAssertEqual(result.payload, readBlockOutput)
+        XCTAssertNotEqual(call.invocationID, attached[0].toolInvocationID, "canonical IDs never come from the translator")
+        XCTAssertEqual(call.invocationID, result.invocationID)
+        XCTAssertEqual(evidenceCarriers(eligible).map(\.kind), [.readAgreement(call: call, result: result, answer: answer)])
+    }
+
+    /// Step 4d5: a malformed record left in the stdout buffer after a qualified Read call is drained at
+    /// EOF: the producer is refused on the events stream before it ends, and the same tail yields the
+    /// same results in the same order with the gate OFF.
+    func testMalformedEOFTailAfterAReadCallIsRefusedBeforeTheProducerRetires() async throws {
+        func run(enabled: Bool) async throws -> (beforeEOF: [AIStreamResult], afterEOF: [AIStreamResult]) {
+            let controller = try makeController(enabled: enabled)
+            let reader = await EventsReader(controller)
+            let launch = await controller.test_beginSyntheticUsageLaunch()
+            await controller.test_handleStreamPayload(systemInit())
+            await controller.test_registerSyntheticDispatch()
+            let outbound = UUID()
+            await controller.test_noteLiveTranscriptOutbound(uuid: outbound, text: prompt)
+            await controller.test_handleStreamPayload(lifecycle("started"))
+            await controller.test_handleStreamPayload(readCall(attributedTo: outbound))
+            // Sorted keys: both runs feed identical bytes (the debug skip notice quotes them).
+            let complete = try JSONSerialization.data(withJSONObject: readResult(), options: [.sortedKeys])
+            await controller.test_handleStdoutChunk(complete.prefix(complete.count / 2), launchToken: launch.token)
+            let beforeEOF = await reader.drain()
+            await controller.test_handleStdoutEOF(launchToken: launch.token)
+            let afterEOF = await reader.drainToEnd()
+            let retired = await controller.test_liveTranscriptQualification()
+            XCTAssertNil(retired, "no producer state survives its EOF drain")
+            return (beforeEOF, afterEOF)
+        }
+        let off = try await run(enabled: false)
+        XCTAssertTrue((off.beforeEOF + off.afterEOF).allSatisfy { $0.claudeLiveTranscriptEvidence == nil })
+        let on = try await run(enabled: true)
+        XCTAssertEqual(
+            on.beforeEOF.count { if case .readToolCall = $0.claudeLiveTranscriptEvidence?.kind { true } else { false } }, 1,
+            "the call qualified before EOF"
+        )
+        XCTAssertTrue(evidenceCarriers(on.beforeEOF).isEmpty, "the unterminated tail is not classified before EOF")
+        XCTAssertEqual(evidenceCarriers(on.afterEOF).map(\.kind), [.disqualified(.malformedLine)])
+        let withoutCarriers = on.afterEOF.filter { !($0.type == AIStreamResult.lifecycleType && $0.claudeLiveTranscriptEvidence != nil) }
+        XCTAssertEqual(toolSignature(withoutCarriers), toolSignature(off.afterEOF), "gate-off results and order")
+    }
 }

@@ -14683,7 +14683,8 @@ final class AgentModeViewModel: ObservableObject {
                 in: &workingItemsSnapshot,
                 terminalState: session.runState,
                 includeExplicitRepoPromptToolCalls: session.selectedAgent == .codexExec || session.selectedAgent.acpProviderID != nil,
-                nonToolBoundary: Self.pendingToolFinalizationNonToolBoundary
+                nonToolBoundary: Self.pendingToolFinalizationNonToolBoundary,
+                protectedItemIDs: session.providerHistoryRecovery?.claudeLocalItemIDs ?? []
             )
             if repairedCount > 0 {
                 session.setItemsSilently(workingItemsSnapshot, reason: .pendingToolFinalizationRepair)
@@ -19457,7 +19458,7 @@ final class AgentModeViewModel: ObservableObject {
             // Evidence is processed before any generic mutation; an accepted complete text is the
             // result's only effect (the content it rode on is never applied a second time).
             if let evidence = result.claudeLiveTranscriptEvidence,
-               applyClaudeLiveTranscriptEvidence(evidence, session: session, isBackground: isBackground)
+               applyClaudeLiveTranscriptEvidence(evidence, result: result, session: session, isBackground: isBackground)
             {
                 requestUIRefresh(tabID: session.tabID)
                 return
@@ -19636,9 +19637,33 @@ final class AgentModeViewModel: ObservableObject {
                 addToolOutputTokens(outputJSON, for: session)
                 guard !AgentToolTrackingSupport.shouldHideToolFromTranscript(toolName) else { break }
                 let invocationID = result.toolInvocationID
-                if let invocationID,
-                   let index = session.items.lastIndex(where: { $0.toolInvocationID == invocationID })
+                let invocationIndex = invocationID.flatMap { invocationID in
+                    session.items.lastIndex(where: { $0.toolInvocationID == invocationID })
+                }
+                let nameIndex = invocationIndex == nil
+                    ? session.items.lastIndex(where: {
+                        // A name-only match stays within the same delivery's tool calls (for background
+                        // output, the same stream's).
+                        $0.kind == .toolCall && $0.toolName == toolName
+                            && session.isDeliveryRow($0.id, background: isBackground, sourceID: backgroundSourceID)
+                    })
+                    : nil
+                // Step 4d5: a row matched to Claude's history (live or imported, with or without a
+                // valid proof) is never converted; the output is shown as its own unidentified row,
+                // carrying the matched call's arguments as the conversion would have.
+                if let index = invocationIndex ?? nameIndex,
+                   isProviderHistoryAssociatedItem(session.items[index].id, session: session)
                 {
+                    let toolResultItem = AgentChatItem.toolResult(
+                        name: toolName,
+                        invocationID: invocationID,
+                        argsJSON: argsJSON ?? session.items[index].toolArgsJSON,
+                        resultJSON: outputJSON,
+                        isError: result.toolIsError,
+                        sequenceIndex: session.nextSequenceIndex
+                    )
+                    session.appendItem(toolResultItem)
+                } else if let index = invocationIndex {
                     var updated = session.items[index]
                     updated.kind = .toolResult
                     updated.toolResultJSON = outputJSON
@@ -19646,12 +19671,7 @@ final class AgentModeViewModel: ObservableObject {
                     updated.toolIsError = result.toolIsError
                     updated.text = outputJSON
                     session.replaceItem(at: index, with: updated)
-                } else if let index = session.items.lastIndex(where: {
-                    // A name-only match stays within the same delivery's tool calls (for background
-                    // output, the same stream's).
-                    $0.kind == .toolCall && $0.toolName == toolName
-                        && session.isDeliveryRow($0.id, background: isBackground, sourceID: backgroundSourceID)
-                }) {
+                } else if let index = nameIndex {
                     var updated = session.items[index]
                     updated.kind = .toolResult
                     updated.toolInvocationID = invocationID ?? updated.toolInvocationID
@@ -19904,12 +19924,14 @@ final class AgentModeViewModel: ObservableObject {
         maxSequenceIndexExclusive: Int?
     ) -> Int {
         var finalizedCount = 0
+        let protectedItemIDs = session.providerHistoryRecovery?.claudeLocalItemIDs ?? []
         session.mutateItemsBatch(touchActivity: false) { items in
             finalizedCount = Self.finalizePendingToolCallsInItems(
                 &items,
                 terminalState: terminalState,
                 includeExplicitRepoPromptToolCalls: includeExplicitRepoPromptToolCalls,
-                maxSequenceIndexExclusive: maxSequenceIndexExclusive
+                maxSequenceIndexExclusive: maxSequenceIndexExclusive,
+                protectedItemIDs: protectedItemIDs
             )
         }
         if finalizedCount > 0 {
@@ -19932,14 +19954,16 @@ final class AgentModeViewModel: ObservableObject {
         _ items: inout [AgentChatItem],
         terminalState: AgentSessionRunState,
         includeExplicitRepoPromptToolCalls: Bool = false,
-        maxSequenceIndexExclusive: Int?
+        maxSequenceIndexExclusive: Int?,
+        protectedItemIDs: Set<UUID>
     ) -> Int {
         AgentTranscriptIO.finalizePendingToolCalls(
             in: &items,
             terminalState: terminalState,
             includeExplicitRepoPromptToolCalls: includeExplicitRepoPromptToolCalls,
             maxSequenceIndexExclusive: maxSequenceIndexExclusive,
-            nonToolBoundary: pendingToolFinalizationNonToolBoundary
+            nonToolBoundary: pendingToolFinalizationNonToolBoundary,
+            protectedItemIDs: protectedItemIDs
         )
     }
 
@@ -20119,61 +20143,54 @@ final class AgentModeViewModel: ObservableObject {
     /// unidentified. Every refusal makes the producer's launch permanently unqualified for this tab
     /// and invalidates only the proofs that launch newly inserted (Step 4d3c; a proof is never
     /// regenerated or healed).
+    ///
+    /// Step 4d5 adds the single main-thread Read chain: its call, result and final text are each
+    /// inserted only while every earlier link is still held (its ledger entry and valid proof, and
+    /// its exact canonical payload anywhere in the canonical transcript), so a dropped or refused
+    /// link leaves every later row unidentified.
     private func applyClaudeLiveTranscriptEvidence(
         _ evidence: ClaudeLiveTranscriptEvidence,
+        result: AIStreamResult,
         session: AgentTabSession,
         isBackground: Bool
     ) -> Bool {
         guard session.selectedAgent.usesClaudeNativeRuntime else { return false }
+        let producer = evidence.producerLaunchToken
         switch evidence.kind {
         case let .completeText(complete):
-            // The evidence must be the reader's exact projection (ID and digest), its row must carry
-            // that ID, and it must belong to the tab's own Claude conversation when that is known.
-            guard !isBackground,
-                  !session.claudeLiveTranscriptRefusedProducers.contains(evidence.producerLaunchToken),
-                  complete.matchesProjection,
-                  session.providerSessionID.map({ $0.isEmpty || $0 == complete.nativeSessionID }) ?? true,
-                  !(session.providerHistoryRecovery?.hasProoflessClaudeItem(nativeSessionID: complete.nativeSessionID) ?? false),
-                  let canonicalItem = complete.canonicalItem,
-                  canonicalItem.id == complete.localItemID
-            else {
-                refuseClaudeLiveTranscript(producer: evidence.producerLaunchToken, session: session)
-                return false
-            }
-            let ledgerItem = complete.ledgerItem
-            if let existing = session.providerHistoryRecovery?.nativeItem(forKey: complete.ledgerKey) {
-                // Same key, identity, valid proof and the actual canonical payload: already recorded.
-                if existing == ledgerItem,
-                   let row = session.items.first(where: { $0.id == complete.localItemID }),
-                   row.kind == .assistant, row.text == canonicalItem.text, !row.isStreaming
-                {
-                    return true
-                }
-                refuseClaudeLiveTranscript(producer: evidence.producerLaunchToken, session: session)
-                return false
-            }
-            // A local row (anywhere in the canonical transcript) already holding the deterministic ID
-            // without this ledger entry is a collision: the old row stays, the text shows unidentified.
+            return applyClaudeLiveTranscriptCompleteText(
+                complete, prerequisites: [], producer: producer, session: session, isBackground: isBackground
+            )
+
+        case let .readToolCall(call):
+            return applyClaudeLiveTranscriptToolRow(
+                call, prerequisites: [], result: result, producer: producer, session: session, isBackground: isBackground
+            )
+
+        case let .readToolResult(row, call):
+            return applyClaudeLiveTranscriptToolRow(
+                row, prerequisites: [call], result: result, producer: producer, session: session, isBackground: isBackground
+            )
+
+        case let .readAnswer(answer, call, resultRow):
+            return applyClaudeLiveTranscriptCompleteText(
+                answer, prerequisites: [call, resultRow], producer: producer, session: session, isBackground: isBackground
+            )
+
+        case let .readAgreement(call, resultRow, answer):
+            // All three rows must still be held with their exact canonical payloads and valid proofs.
             let canonical = AgentProviderHistoryCanonicalView(transcript: session.transcript, suffixItems: session.items)
-            guard !AgentProviderHistoryAssociationPreflight.canonicalItemIDs(canonical).contains(complete.localItemID) else {
-                refuseClaudeLiveTranscript(producer: evidence.producerLaunchToken, session: session)
-                return false
+            let agrees = !session.claudeLiveTranscriptRefusedProducers.contains(producer)
+                && holdsClaudeLiveTranscriptToolRow(call, canonical: canonical, session: session)
+                && holdsClaudeLiveTranscriptToolRow(resultRow, canonical: canonical, session: session)
+                && answer.matchesProjection
+                && holdsClaudeLiveTranscriptRow(
+                    answer.ledgerItem, canonicalItem: answer.canonicalItem, canonical: canonical, session: session
+                )
+            if !agrees {
+                refuseClaudeLiveTranscript(producer: producer, session: session)
             }
-            // Older run text is materialized first and its segment ends, so the canonical row follows it.
-            _ = clearClaudeReasoningStatus(session)
-            flushPendingAssistantDelta(session)
-            endAssistantSegment(session, background: false)
-            // Row, ledger entry and the producer's ownership of that new key change together in
-            // this main-actor snapshot; the existing serialized save persists the row and entry (no
-            // import receipt, cursor or prefix proof). Ownership is transient (Step 4d3c).
-            var ledger = session.providerHistoryRecovery ?? AgentSessionProviderHistoryRecovery()
-            ledger.nativeItems.append(ledgerItem)
-            session.providerHistoryRecovery = ledger
-            session.claudeLiveTranscriptOwnedKeys[evidence.producerLaunchToken, default: []].insert(ledgerItem.key)
-            session.appendItem(canonicalItem)
-            session.isDirty = true
-            scheduleSave(for: session.tabID)
-            return true
+            return false
 
         case let .resultAgreement(localItemID, text):
             // The owner must hold exactly the turn's identified row with a valid proof.
@@ -20192,6 +20209,192 @@ final class AgentModeViewModel: ObservableObject {
             refuseClaudeLiveTranscript(producer: evidence.producerLaunchToken, session: session)
             return false
         }
+    }
+
+    /// One qualified complete assistant text (Step 4d3b), after its chain's `prerequisites` (Step
+    /// 4d5; empty for a single-text turn, which then behaves exactly as before).
+    private func applyClaudeLiveTranscriptCompleteText(
+        _ complete: ClaudeLiveTranscriptCompleteText,
+        prerequisites: [ClaudeLiveTranscriptToolRow],
+        producer: UUID,
+        session: AgentTabSession,
+        isBackground: Bool
+    ) -> Bool {
+        // The evidence must be the reader's exact projection (ID and digest), its row must carry
+        // that ID, and it must belong to the tab's own Claude conversation when that is known.
+        guard !isBackground,
+              !session.claudeLiveTranscriptRefusedProducers.contains(producer),
+              complete.matchesProjection,
+              session.providerSessionID.map({ $0.isEmpty || $0 == complete.nativeSessionID }) ?? true,
+              !(session.providerHistoryRecovery?.hasProoflessClaudeItem(nativeSessionID: complete.nativeSessionID) ?? false),
+              let canonicalItem = complete.canonicalItem,
+              canonicalItem.id == complete.localItemID
+        else {
+            refuseClaudeLiveTranscript(producer: producer, session: session)
+            return false
+        }
+        let canonical = AgentProviderHistoryCanonicalView(transcript: session.transcript, suffixItems: session.items)
+        guard prerequisites.allSatisfy({ holdsClaudeLiveTranscriptToolRow($0, canonical: canonical, session: session) }) else {
+            refuseClaudeLiveTranscript(producer: producer, session: session)
+            return false
+        }
+        let ledgerItem = complete.ledgerItem
+        if let existing = session.providerHistoryRecovery?.nativeItem(forKey: complete.ledgerKey) {
+            // Same key, identity, valid proof and the actual canonical payload: already recorded.
+            // A single-text turn (no prerequisites) keeps its Step 4d3b suffix check; a Read answer
+            // is held like its prerequisites, anywhere in the canonical view (persisted turns too).
+            if existing == ledgerItem, prerequisites.isEmpty,
+               let row = session.items.first(where: { $0.id == complete.localItemID }),
+               row.kind == .assistant, row.text == canonicalItem.text, !row.isStreaming
+            {
+                return true
+            }
+            if existing == ledgerItem, !prerequisites.isEmpty,
+               holdsClaudeLiveTranscriptRow(ledgerItem, canonicalItem: canonicalItem, canonical: canonical, session: session)
+            {
+                return true
+            }
+            refuseClaudeLiveTranscript(producer: producer, session: session)
+            return false
+        }
+        // A local row (anywhere in the canonical transcript) already holding the deterministic ID
+        // without this ledger entry is a collision: the old row stays, the text shows unidentified.
+        guard !AgentProviderHistoryAssociationPreflight.canonicalItemIDs(canonical).contains(complete.localItemID) else {
+            refuseClaudeLiveTranscript(producer: producer, session: session)
+            return false
+        }
+        // Older run text is materialized first and its segment ends, so the canonical row follows it.
+        _ = clearClaudeReasoningStatus(session)
+        flushPendingAssistantDelta(session)
+        endAssistantSegment(session, background: false)
+        insertClaudeLiveTranscriptRow(canonicalItem, ledgerItem: ledgerItem, producer: producer, session: session)
+        return true
+    }
+
+    /// Step 4d5: one qualified Read call or result row. Every identity, chain and display check that
+    /// could refuse runs before any effect, so such a refusal leaves the translated result to the
+    /// legacy path (shown unidentified, accounted once there). The one later refusal is a provider
+    /// handler consuming the event after the legacy tool preamble ran; it returns handled, exactly as
+    /// the legacy path would have, so the preamble never runs twice. An accepted new row takes the
+    /// legacy tool preamble and the translated result's own accounting exactly once; a duplicate of a
+    /// held row (live or imported) is already shown and gets neither accounting nor ownership.
+    private func applyClaudeLiveTranscriptToolRow(
+        _ row: ClaudeLiveTranscriptToolRow,
+        prerequisites: [ClaudeLiveTranscriptToolRow],
+        result: AIStreamResult,
+        producer: UUID,
+        session: AgentTabSession,
+        isBackground: Bool
+    ) -> Bool {
+        let expectedType = row.kind == .toolCall ? "tool_call" : "tool_result"
+        let canonical = AgentProviderHistoryCanonicalView(transcript: session.transcript, suffixItems: session.items)
+        guard !isBackground,
+              !session.claudeLiveTranscriptRefusedProducers.contains(producer),
+              row.kind == .toolCall || row.kind == .toolResult,
+              result.type == expectedType,
+              let toolName = result.toolName,
+              row.matchesProjection,
+              session.providerSessionID.map({ $0.isEmpty || $0 == row.nativeSessionID }) ?? true,
+              !(session.providerHistoryRecovery?.hasProoflessClaudeItem(nativeSessionID: row.nativeSessionID) ?? false),
+              let canonicalItem = row.canonicalItem,
+              canonicalItem.id == row.localItemID,
+              prerequisites.allSatisfy({ holdsClaudeLiveTranscriptToolRow($0, canonical: canonical, session: session) }),
+              // The legacy path's pure display predicates: a row it would drop, hide or auto-complete
+              // is never made canonical.
+              !AgentToolTrackingSupport.shouldSuppressProviderToolEvent(toolName: toolName, invocationID: result.toolInvocationID),
+              !AgentToolTrackingSupport.shouldHideToolFromTranscript(toolName),
+              row.kind != .toolCall
+              || !AgentToolTrackingSupport.shouldAutoCompleteProviderToolCall(
+                  for: session, toolName: toolName, invocationID: result.toolInvocationID
+              )
+        else {
+            refuseClaudeLiveTranscript(producer: producer, session: session)
+            return false
+        }
+        let ledgerItem = row.ledgerItem
+        if let existing = session.providerHistoryRecovery?.nativeItem(forKey: row.ledgerKey) {
+            // Same key, identity and valid proof, with the exact canonical payload held: already shown.
+            if existing == ledgerItem, AgentProviderHistoryAssociationPreflight.holdsCanonicalPayload(canonicalItem, in: canonical) {
+                return true
+            }
+            refuseClaudeLiveTranscript(producer: producer, session: session)
+            return false
+        }
+        guard !AgentProviderHistoryAssociationPreflight.canonicalItemIDs(canonical).contains(row.localItemID) else {
+            refuseClaudeLiveTranscript(producer: producer, session: session)
+            return false
+        }
+        // The legacy tool preamble (reasoning status stays visible through tool execution).
+        flushPendingAssistantDelta(session)
+        endAssistantSegment(session, background: false)
+        endActiveReasoningSegment(session)
+        if runService.handleProviderToolStreamEvent(result, session: session) {
+            // A provider handler consumed the event, as it would have on the legacy path.
+            refuseClaudeLiveTranscript(producer: producer, session: session)
+            return true
+        }
+        // The translated result's original values, accounted once (as the legacy path would).
+        let argsJSON = result.toolArgsJSON ?? result.toolArgs
+        if row.kind == .toolCall {
+            addToolInputTokens(argsJSON, for: session)
+        } else {
+            let outputJSON = result.toolResultJSON ?? result.toolOutput ?? ""
+            addToolOutputTokens(outputJSON, for: session)
+            codexCoordinator.reconcileCodexCommandExecutionRunningUpdate(
+                toolName: toolName,
+                argsJSON: argsJSON,
+                resultJSON: outputJSON,
+                isError: result.toolIsError,
+                session: session
+            )
+        }
+        insertClaudeLiveTranscriptRow(canonicalItem, ledgerItem: ledgerItem, producer: producer, session: session)
+        return true
+    }
+
+    /// Row, ledger entry and the producer's ownership of that new key change together in this
+    /// main-actor snapshot; the existing serialized save persists the row and entry (no import
+    /// receipt, cursor or prefix proof). Ownership is transient (Step 4d3c).
+    private func insertClaudeLiveTranscriptRow(
+        _ canonicalItem: AgentChatItem,
+        ledgerItem: AgentSessionProviderHistoryRecovery.NativeItem,
+        producer: UUID,
+        session: AgentTabSession
+    ) {
+        var ledger = session.providerHistoryRecovery ?? AgentSessionProviderHistoryRecovery()
+        ledger.nativeItems.append(ledgerItem)
+        session.providerHistoryRecovery = ledger
+        session.claudeLiveTranscriptOwnedKeys[producer, default: []].insert(ledgerItem.key)
+        session.appendItem(canonicalItem)
+        session.isDirty = true
+        scheduleSave(for: session.tabID)
+    }
+
+    /// Step 4d5 chain prerequisite: `row` is the reader's projection and is still held.
+    private func holdsClaudeLiveTranscriptToolRow(
+        _ row: ClaudeLiveTranscriptToolRow,
+        canonical: AgentProviderHistoryCanonicalView,
+        session: AgentTabSession
+    ) -> Bool {
+        row.matchesProjection
+            && holdsClaudeLiveTranscriptRow(row.ledgerItem, canonicalItem: row.canonicalItem, canonical: canonical, session: session)
+    }
+
+    /// Held: the ledger records exactly this entry (identity and valid proof), and the canonical
+    /// transcript (persisted turns plus suffix) holds exactly one complete copy of its canonical
+    /// payload, whether this producer, another producer or an import inserted it.
+    private func holdsClaudeLiveTranscriptRow(
+        _ ledgerItem: AgentSessionProviderHistoryRecovery.NativeItem,
+        canonicalItem: AgentChatItem?,
+        canonical: AgentProviderHistoryCanonicalView,
+        session: AgentTabSession
+    ) -> Bool {
+        guard ledgerItem.envelopeDigest != nil,
+              let canonicalItem,
+              canonicalItem.id == ledgerItem.localItemID,
+              session.providerHistoryRecovery?.nativeItem(forKey: ledgerItem.key) == ledgerItem
+        else { return false }
+        return AgentProviderHistoryAssociationPreflight.holdsCanonicalPayload(canonicalItem, in: canonical)
     }
 
     /// Step 4d3b/4d3c refusal: the producer never qualifies again in this tab (transient; the

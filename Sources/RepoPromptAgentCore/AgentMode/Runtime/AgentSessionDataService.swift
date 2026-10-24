@@ -830,7 +830,8 @@ package actor AgentSessionDataService {
                 in: &workingItems,
                 terminalState: repairTerminalState,
                 context: repairContext,
-                nonToolBoundary: 200
+                nonToolBoundary: 200,
+                protectedItemIDs: session.providerHistoryRecovery?.claudeLocalItemIDs ?? []
             )
         } else {
             0
@@ -885,7 +886,8 @@ package actor AgentSessionDataService {
             return AgentSessionRestoreSupport.sanitizeColdRestoredTranscript(
                 runtimeNormalized,
                 interruptionContext: interruptionContext,
-                unacceptedDeliveries: interruptionContext?.unacceptedDeliveries(lifecycle: session.lifecycle?.lifecycle) ?? [:]
+                unacceptedDeliveries: interruptionContext?.unacceptedDeliveries(lifecycle: session.lifecycle?.lifecycle) ?? [:],
+                protectedItemIDs: session.providerHistoryRecovery?.claudeLocalItemIDs ?? []
             )
         }
         let runtimeWorkingItems = runtimeTranscript.map(AgentTranscriptIO.workingSourceItems(from:)) ?? workingItems

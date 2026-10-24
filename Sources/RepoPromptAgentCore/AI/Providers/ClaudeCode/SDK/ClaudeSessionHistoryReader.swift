@@ -722,8 +722,7 @@ package enum ClaudeSessionHistoryReader {
                 case ("tool_use", true):
                     guard let id = block["id"] as? String, !id.isEmpty, let name = block["name"] as? String,
                           let input = block["input"] as? NSDictionary,
-                          let inputData = try? JSONSerialization.data(withJSONObject: input, options: [.sortedKeys]),
-                          let inputJSON = String(data: inputData, encoding: .utf8)
+                          let inputJSON = canonicalToolInputJSON(input)
                     else { return .failure(.malformedLine(line: line)) }
                     blocks.append(.toolUse(id: id, name: name, inputJSON: inputJSON))
                 case ("tool_result", false):
@@ -1062,6 +1061,58 @@ package enum ClaudeSessionHistoryReader {
             raw: NSDictionary()
         )
         return project([entry], entries: [entry], nativeSessionID: nativeSessionID).first
+    }
+
+    /// The one canonical serialization of a native `tool_use.input` (compact, sorted keys): the
+    /// reader's row payload and every live Read call's identity input (Step 4d5) use it, never the
+    /// translator's pretty-printed arguments.
+    package static func canonicalToolInputJSON(_ input: NSDictionary) -> String? {
+        guard let data = try? JSONSerialization.data(withJSONObject: input, options: [.sortedKeys]) else { return nil }
+        return String(data: data, encoding: .utf8)
+    }
+
+    /// Step 4d5: the row a native assistant entry holding exactly one `tool_use` block projects to
+    /// (`inputJSON` already canonical), with its deterministic local and invocation IDs and its
+    /// complete-envelope digest. Same `project`/`envelopeDigest` derivation as a read.
+    package static func singleToolUseRow(
+        nativeSessionID: String,
+        nativeEntryID: String,
+        toolUseID: String,
+        name: String,
+        inputJSON: String
+    ) -> Row? {
+        let entry = syntheticEntry(nativeEntryID, kind: .assistant, block: .toolUse(id: toolUseID, name: name, inputJSON: inputJSON))
+        return project([entry], entries: [entry], nativeSessionID: nativeSessionID).first
+    }
+
+    /// Step 4d5: the row a native user entry holding exactly one `tool_result` block (string
+    /// content, `is_error` absent) projects to. `toolName` is supplied by the matching call exactly
+    /// as a read resolves it; the call entry only names it and is never projected here.
+    package static func singleToolResultRow(
+        nativeSessionID: String,
+        nativeEntryID: String,
+        toolUseID: String,
+        toolName: String,
+        text: String
+    ) -> Row? {
+        let entry = syntheticEntry(nativeEntryID, kind: .user, block: .toolResult(toolUseID: toolUseID, text: text, isError: nil))
+        let naming = syntheticEntry("", kind: .assistant, block: .toolUse(id: toolUseID, name: toolName, inputJSON: "{}"))
+        return project([entry], entries: [naming, entry], nativeSessionID: nativeSessionID).first
+    }
+
+    private static func syntheticEntry(_ uuid: String, kind: EntryKind, block: Block) -> Entry {
+        Entry(
+            line: 0,
+            lineStart: 0,
+            uuid: uuid,
+            parentUUID: nil,
+            kind: kind,
+            messageID: nil,
+            sourceToolAssistantUUID: nil,
+            blocks: [block],
+            userStringContentSHA256: nil,
+            raw: NSDictionary()
+        )
     }
 
     /// Fixed, documented derivation (not Swift's randomized `Hasher`): SHA-256 over the namespace and

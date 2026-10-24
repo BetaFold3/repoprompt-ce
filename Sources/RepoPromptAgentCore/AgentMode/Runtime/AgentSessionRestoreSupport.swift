@@ -526,14 +526,16 @@ package enum AgentSessionRestoreSupport {
     static func sanitizeColdRestoredTranscript(
         _ transcript: AgentTranscript,
         interruptionContext: AgentColdRestoreInterruptionContext? = nil,
-        unacceptedDeliveries: [UUID: AgentUserItemRecoveryDelivery] = [:]
+        unacceptedDeliveries: [UUID: AgentUserItemRecoveryDelivery] = [:],
+        protectedItemIDs: Set<UUID>
     ) -> AgentTranscript {
         var restored = transcript
         for turnIndex in restored.turns.indices {
             sanitizeColdRestoredTurn(
                 &restored.turns[turnIndex],
                 interruptionContext: interruptionContext,
-                unacceptedDeliveries: unacceptedDeliveries
+                unacceptedDeliveries: unacceptedDeliveries,
+                protectedItemIDs: protectedItemIDs
             )
         }
         return restored
@@ -556,7 +558,8 @@ package enum AgentSessionRestoreSupport {
     private static func sanitizeColdRestoredTurn(
         _ turn: inout AgentTranscriptTurn,
         interruptionContext: AgentColdRestoreInterruptionContext?,
-        unacceptedDeliveries: [UUID: AgentUserItemRecoveryDelivery]
+        unacceptedDeliveries: [UUID: AgentUserItemRecoveryDelivery],
+        protectedItemIDs: Set<UUID>
     ) {
         // F-7: the turn of a run this launch still owns live (another owner hydrating the same
         // session) is left exactly as saved: not cancelled, stamped, refined, or re-presented.
@@ -648,7 +651,8 @@ package enum AgentSessionRestoreSupport {
             sanitizeColdRestoredSpan(
                 &turn.responseSpans[spanIndex],
                 terminalState: turn.terminalState,
-                activeToolExecutionIDs: activeToolExecutionIDs
+                activeToolExecutionIDs: activeToolExecutionIDs,
+                protectedItemIDs: protectedItemIDs
             )
         }
     }
@@ -656,12 +660,14 @@ package enum AgentSessionRestoreSupport {
     private static func sanitizeColdRestoredSpan(
         _ span: inout AgentTranscriptProviderResponseSpan,
         terminalState: AgentSessionRunState?,
-        activeToolExecutionIDs: Set<String>
+        activeToolExecutionIDs: Set<String>,
+        protectedItemIDs: Set<UUID>
     ) {
         for activityIndex in span.activities.indices {
             sanitizeColdRestoredActivity(
                 &span.activities[activityIndex],
-                activeToolExecutionIDs: activeToolExecutionIDs
+                activeToolExecutionIDs: activeToolExecutionIDs,
+                protectedItemIDs: protectedItemIDs
             )
         }
         if span.lifecycle == .open {
@@ -676,11 +682,15 @@ package enum AgentSessionRestoreSupport {
 
     private static func sanitizeColdRestoredActivity(
         _ activity: inout AgentTranscriptActivity,
-        activeToolExecutionIDs: Set<String>
+        activeToolExecutionIDs: Set<String>,
+        protectedItemIDs: Set<UUID>
     ) {
         activity.isStreaming = false
+        // Step 4d5: a tool row associated to Claude's history (valid or cleared proof) keeps its
+        // projected payload; the turn and its spans still close as interrupted, like any other.
         guard var execution = activity.toolExecution,
-              activeToolExecutionIDs.contains(execution.stableExecutionID)
+              activeToolExecutionIDs.contains(execution.stableExecutionID),
+              !protectedItemIDs.contains(activity.id)
         else {
             return
         }

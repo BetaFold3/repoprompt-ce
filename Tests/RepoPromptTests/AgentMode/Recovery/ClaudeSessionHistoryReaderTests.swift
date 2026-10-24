@@ -1464,4 +1464,69 @@ final class ClaudeSessionHistoryReaderTests: XCTestCase {
         XCTAssertEqual(refusal { $0["parentUuid"] = "o20-n3-1" }, unassociated, "result re-parented onto a pre-call attachment")
         XCTAssertEqual(refusal { $0["parentUuid"] = o20Caller(3) }, unassociated)
     }
+
+    /// Step 4d5: the live producer's single-entry projections of each O20 call, result and final text
+    /// are exactly the reader's rows of the full history (IDs, pairing ID, name, payload, error status
+    /// and digest). An import over live rows recorded under those projections appends nothing and
+    /// keeps their ledger entries, and the preflight's payload comparison holds every imported item
+    /// against the live rows.
+    func testO20LiveProjectionsAreTheReadersRowsAndAnImportOverLiveRowsAppendsNothing() throws {
+        let (first, _) = o20Processes(nativeStops: false)
+        let value = try XCTUnwrap(candidate(read(jsonl(first), mode: fromStart)))
+        var liveItems: [AgentChatItem] = []
+        var liveLedger = AgentSessionProviderHistoryRecovery()
+        for exchange in 1 ... 2 {
+            func row(_ suffix: String) throws -> Reader.Row {
+                try XCTUnwrap(value.rows.first { $0.nativeEntryID == "o20-u\(exchange)\(suffix)" })
+            }
+            let call = try row("a"), result = try row("b"), answer = try row("c")
+            let liveCall = try XCTUnwrap(ClaudeLiveTranscriptToolRow.projecting(
+                nativeSessionID: sessionID, nativeEntryID: call.nativeEntryID, kind: .toolCall,
+                toolUseID: o20ToolUseID(exchange), toolName: "Read", payload: XCTUnwrap(call.toolInputJSON)
+            ))
+            let liveResult = try XCTUnwrap(ClaudeLiveTranscriptToolRow.projecting(
+                nativeSessionID: sessionID, nativeEntryID: result.nativeEntryID, kind: .toolResult,
+                toolUseID: o20ToolUseID(exchange), toolName: "Read", payload: XCTUnwrap(result.text)
+            ))
+            XCTAssertEqual(liveCall.projectedRow, call, "exchange \(exchange): the call")
+            XCTAssertEqual(liveResult.projectedRow, result, "exchange \(exchange): the result")
+            XCTAssertTrue(liveCall.matchesProjection)
+            XCTAssertTrue(liveResult.matchesProjection)
+            let liveAnswer = try XCTUnwrap(Reader.singleTextAssistantRow(nativeSessionID: sessionID, nativeEntryID: answer.nativeEntryID, text: XCTUnwrap(answer.text)))
+            XCTAssertEqual(liveAnswer, answer, "exchange \(exchange): the final text")
+            let complete = try ClaudeLiveTranscriptCompleteText(
+                nativeSessionID: sessionID, nativeEntryID: answer.nativeEntryID, localItemID: XCTUnwrap(answer.localItemID),
+                text: XCTUnwrap(answer.text), envelopeDigest: answer.envelopeDigest
+            )
+            liveItems += try [XCTUnwrap(liveCall.canonicalItem), XCTUnwrap(liveResult.canonicalItem), XCTUnwrap(complete.canonicalItem)]
+            liveLedger.nativeItems += [liveCall.ledgerItem, liveResult.ledgerItem, complete.ledgerItem]
+        }
+        let observation = Reader.observation(value)
+        let plan = AgentProviderHistoryImportPlanner.plan(
+            observation: observation,
+            existingItemIDs: Set(liveItems.map(\.id)),
+            ledger: liveLedger,
+            previousCursor: nil,
+            importID: UUID(),
+            now: Date(timeIntervalSince1970: 5000)
+        )
+        XCTAssertTrue(plan.appendedItems.isEmpty, "the live rows are already the import's rows")
+        for item in liveLedger.nativeItems {
+            XCTAssertEqual(plan.ledger.nativeItem(forKey: item.key), item, "the live entry and proof are kept")
+        }
+        let canonical = AgentProviderHistoryCanonicalView(transcript: .empty, suffixItems: liveItems)
+        let imported = observation.rows.compactMap(\.item)
+        XCTAssertEqual(imported.map(\.id), liveItems.map(\.id))
+        for item in imported {
+            XCTAssertTrue(AgentProviderHistoryAssociationPreflight.holdsCanonicalPayload(item, in: canonical), "\(item.kind)")
+        }
+        // A changed payload, a streaming copy or a duplicated ID never holds.
+        var changed = liveItems
+        changed[1].toolResultJSON = "changed"
+        XCTAssertFalse(AgentProviderHistoryAssociationPreflight.holdsCanonicalPayload(imported[1], in: .init(transcript: .empty, suffixItems: changed)))
+        var streaming = liveItems
+        streaming[2].isStreaming = true
+        XCTAssertFalse(AgentProviderHistoryAssociationPreflight.holdsCanonicalPayload(imported[2], in: .init(transcript: .empty, suffixItems: streaming)))
+        XCTAssertFalse(AgentProviderHistoryAssociationPreflight.holdsCanonicalPayload(imported[0], in: .init(transcript: .empty, suffixItems: liveItems + [liveItems[0]])))
+    }
 }

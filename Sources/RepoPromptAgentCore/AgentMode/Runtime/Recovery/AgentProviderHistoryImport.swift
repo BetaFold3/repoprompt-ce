@@ -79,6 +79,10 @@ package struct AgentProviderHistoryObservation: Equatable {
     /// Every native user message entry after the attempt's boundary, ledger-known ones included,
     /// in projection order (Claude outbound-claim matching; empty for Codex).
     package let nativeUserEntries: [AgentProviderHistoryNativeUserEntry]
+    /// Transient (Step 4d5): local item IDs of `validationRows` that are a singleton O20 Read exchange
+    /// (see `ClaudeSessionHistoryReader.storageComparableReadItemIDs`), the only rows whose stored
+    /// projection the payload check may compare. Empty by default; never appended or persisted.
+    package let storageComparableReadItemIDs: Set<UUID>
 
     package init(
         provider: AgentRecoveryHistoryProvider,
@@ -89,7 +93,8 @@ package struct AgentProviderHistoryObservation: Equatable {
         completeLineOffset: UInt64,
         prefixSHA256: String? = nil,
         completionConfirmed: Bool,
-        nativeUserEntries: [AgentProviderHistoryNativeUserEntry] = []
+        nativeUserEntries: [AgentProviderHistoryNativeUserEntry] = [],
+        storageComparableReadItemIDs: Set<UUID> = []
     ) {
         self.provider = provider
         self.conversationID = conversationID
@@ -100,6 +105,7 @@ package struct AgentProviderHistoryObservation: Equatable {
         self.prefixSHA256 = prefixSHA256
         self.completionConfirmed = completionConfirmed
         self.nativeUserEntries = nativeUserEntries
+        self.storageComparableReadItemIDs = storageComparableReadItemIDs
     }
 }
 
@@ -496,6 +502,9 @@ package enum AgentProviderHistoryAssociationPreflight {
             let rank: Int
             let id: UUID
             let expected: AgentChatItem?
+            /// Step 4d5: the authorized stored representations of `expected`, only for a uniquely
+            /// proven singleton Read row.
+            var stored: [AgentTranscriptActivity]?
         }
         var compared: [Compared] = []
         var comparedIndexByID: [UUID: Int] = [:]
@@ -506,9 +515,22 @@ package enum AgentProviderHistoryAssociationPreflight {
             return true
         }
         let userKind = userRowKindRaw(observation.provider)
-        for native in ledger?.nativeItems ?? [] where native.providerRaw == providerRaw
-            && native.nativeSessionID == observation.conversationID
-        {
+        let applicableLedger = (ledger?.nativeItems ?? []).filter {
+            $0.providerRaw == providerRaw && $0.nativeSessionID == observation.conversationID
+        }
+        // Step 4d5: a lossy comparison needs one applicable ledger entry for the key and one for the
+        // local item; a repeated or competing mapping never lends its proof, whatever its digest.
+        var ledgerKeyCounts: [String: Int] = [:]
+        var ledgerLocalItemCounts: [UUID: Int] = [:]
+        for native in applicableLedger {
+            ledgerKeyCounts[native.key, default: 0] += 1
+            if let localItemID = native.localItemID {
+                ledgerLocalItemCounts[localItemID, default: 0] += 1
+            }
+        }
+        // Step 4d5: each exchange's representations, generated at most once per preflight.
+        var storedImagesByInvocation: [UUID: [UUID: [AgentTranscriptActivity]]?] = [:]
+        for native in applicableLedger {
             guard let localItemID = native.localItemID else { continue }
             guard let index = validationIndex[native.key] else { return .canonicalPayloadUnavailable }
             if native.rowKindRaw == userKind {
@@ -519,7 +541,23 @@ package enum AgentProviderHistoryAssociationPreflight {
             }
             guard let expected = observation.validationRows[index].item else { return .canonicalPayloadUnavailable }
             guard expected.id == localItemID else { return .canonicalPayloadMismatch }
-            guard include(Compared(index: index, rank: 0, id: localItemID, expected: expected)) else {
+            // Step 4d5: only a row this ledger entry alone proves (unique key and local item, a valid
+            // digest equal to the native entry's) of a singleton Read exchange may be compared in its
+            // stored representations.
+            var stored: [AgentTranscriptActivity]?
+            if observation.storageComparableReadItemIDs.contains(localItemID),
+               ledgerKeyCounts[native.key] == 1,
+               ledgerLocalItemCounts[localItemID] == 1,
+               let digest = native.envelopeDigest,
+               digest == observation.validationRows[index].envelopeDigest,
+               let invocationID = expected.toolInvocationID
+            {
+                let images = storedImagesByInvocation[invocationID]
+                    ?? storedReadImages(invocationID: invocationID, in: observation.validationRows)
+                storedImagesByInvocation[invocationID] = images
+                stored = images?[localItemID]
+            }
+            guard include(Compared(index: index, rank: 0, id: localItemID, expected: expected, stored: stored)) else {
                 return .canonicalPayloadUnavailable
             }
         }
@@ -541,6 +579,7 @@ package enum AgentProviderHistoryAssociationPreflight {
                 return .canonicalPayloadUnavailable
             }
         }
+        var storageBackings: StorageBackings?
         var previousOutputPosition = -1
         var previousAnchorPosition = -1
         for entry in compared.sorted(by: { ($0.index, $0.rank) < ($1.index, $1.rank) }) {
@@ -553,34 +592,140 @@ package enum AgentProviderHistoryAssociationPreflight {
                 previousAnchorPosition = payload.position
                 continue
             }
-            guard payload.isComplete else { return .canonicalPayloadUnavailable }
-            let actual = payload.item
-            // A tool payload the canonical copy no longer carries (dropped, or compacted to its
-            // summary) can't be compared.
-            let resultSummarized = actual.toolResultJSON != expected.toolResultJSON
-                && AgentTranscriptToolNormalizer.isSummaryOnly(raw: actual.toolResultJSON)
-            if (expected.toolArgsJSON != nil && actual.toolArgsJSON == nil)
-                || (expected.toolResultJSON != nil && actual.toolResultJSON == nil)
-                || resultSummarized
-            {
-                return .canonicalPayloadUnavailable
+            var comparison = comparePayload(payload, expected: expected)
+            if comparison == .unavailable, let stored = entry.stored {
+                let backings = storageBackings ?? Self.storageBackings(canonical)
+                storageBackings = backings
+                comparison = compareStoredProjection(payload, id: entry.id, stored: stored, backings: backings)
             }
-            // A turn copy's tool name is the builder's normalization of the provider's (review B
-            // F3); a suffix copy keeps it verbatim. Only that exact transform is accepted.
-            let toolNameMatches = actual.toolName == expected.toolName
-                || (payload.isTurnCopy && actual.toolName == AgentTranscriptToolNormalizer.normalizedToolName(expected.toolName))
-            guard actual.kind == expected.kind,
-                  actual.text == expected.text,
-                  toolNameMatches,
-                  actual.toolInvocationID == expected.toolInvocationID,
-                  actual.toolArgsJSON == expected.toolArgsJSON,
-                  actual.toolResultJSON == expected.toolResultJSON,
-                  actual.toolIsError == expected.toolIsError,
-                  payload.position > previousOutputPosition
-            else { return .canonicalPayloadMismatch }
+            switch comparison {
+            case .unavailable:
+                return .canonicalPayloadUnavailable
+            case .mismatch:
+                return .canonicalPayloadMismatch
+            case .match:
+                break
+            }
+            guard payload.position > previousOutputPosition else { return .canonicalPayloadMismatch }
             previousOutputPosition = payload.position
         }
         return nil
+    }
+
+    private enum PayloadComparison {
+        case match
+        case unavailable
+        case mismatch
+    }
+
+    /// One canonical copy against the provider's projected item: same kind, text and exact tool
+    /// fields (timestamps, sequence and streaming ignored).
+    private static func comparePayload(_ payload: CanonicalPayload, expected: AgentChatItem) -> PayloadComparison {
+        guard payload.isComplete else { return .unavailable }
+        let actual = payload.item
+        // A tool payload the canonical copy no longer carries (dropped, or compacted to its
+        // summary) can't be compared.
+        let resultSummarized = actual.toolResultJSON != expected.toolResultJSON
+            && AgentTranscriptToolNormalizer.isSummaryOnly(raw: actual.toolResultJSON)
+        if (expected.toolArgsJSON != nil && actual.toolArgsJSON == nil)
+            || (expected.toolResultJSON != nil && actual.toolResultJSON == nil)
+            || resultSummarized
+        {
+            return .unavailable
+        }
+        // A turn copy's tool name is the builder's normalization of the provider's (review B
+        // F3); a suffix copy keeps it verbatim. Only that exact transform is accepted.
+        let toolNameMatches = actual.toolName == expected.toolName
+            || (payload.isTurnCopy && actual.toolName == AgentTranscriptToolNormalizer.normalizedToolName(expected.toolName))
+        guard actual.kind == expected.kind,
+              actual.text == expected.text,
+              toolNameMatches,
+              actual.toolInvocationID == expected.toolInvocationID,
+              actual.toolArgsJSON == expected.toolArgsJSON,
+              actual.toolResultJSON == expected.toolResultJSON,
+              actual.toolIsError == expected.toolIsError
+        else { return .mismatch }
+        return .match
+    }
+
+    /// Step 4d5: every turn activity by ID with whether its turn is full and structurally intact;
+    /// an ID occurring in more than one activity is ambiguous.
+    private struct StorageBackings {
+        var activities: [UUID: (activity: AgentTranscriptActivity, isComplete: Bool)] = [:]
+        var ambiguous: Set<UUID> = []
+    }
+
+    private static func storageBackings(_ canonical: AgentProviderHistoryCanonicalView) -> StorageBackings {
+        var backings = StorageBackings()
+        for turn in canonical.transcript.turns {
+            let isComplete = turn.retentionTier == .full && !turn.isStructurallyCompacted
+            for activity in turn.allActivities {
+                if backings.activities.updateValue((activity, isComplete), forKey: activity.id) != nil {
+                    backings.ambiguous.insert(activity.id)
+                }
+            }
+        }
+        return backings
+    }
+
+    /// Step 4d5: the stored representations of one exchange's rows (call then result, as the
+    /// persisted summary pairs them), by item ID; `nil` when generation does not keep every row.
+    private static func storedReadImages(
+        invocationID: UUID,
+        in validationRows: [AgentProviderHistoryRow]
+    ) -> [UUID: [AgentTranscriptActivity]]? {
+        let exchange = validationRows.compactMap(\.item).filter {
+            $0.toolInvocationID == invocationID && ($0.kind == .toolCall || $0.kind == .toolResult)
+        }
+        let ordered = exchange.filter { $0.kind == .toolCall } + exchange.filter { $0.kind == .toolResult }
+        return AgentTranscriptPolicyPipeline.storageComparisonActivities(ordered)
+    }
+
+    /// Step 4d5 import-only comparison, after the exact comparison found the copy unavailable: the
+    /// canonical copy is an authorized stored representation of a proven row. It needs exactly one
+    /// backing activity in a full, intact turn that equals one generated representation completely
+    /// (kind, text, the whole tool execution, and its projected tool fields); a suffix copy must
+    /// independently carry one representation's complete projected fields. Membership is per whole
+    /// representation, never a union of allowed field values. A summarized copy without such backing
+    /// is unavailable; a backed copy outside the set is a mismatch. Never a raw proof: it is used
+    /// only when the ledger already uniquely proves the row.
+    private static func compareStoredProjection(
+        _ payload: CanonicalPayload,
+        id: UUID,
+        stored: [AgentTranscriptActivity],
+        backings: StorageBackings
+    ) -> PayloadComparison {
+        guard !backings.ambiguous.contains(id), let backing = backings.activities[id], backing.isComplete else {
+            return .unavailable
+        }
+        func sameProjectedTool(_ actual: AgentChatItem, _ image: AgentTranscriptActivity) -> Bool {
+            let expected = image.toItem()
+            return actual.kind == expected.kind
+                && actual.text == expected.text
+                && actual.toolName == expected.toolName
+                && actual.toolInvocationID == expected.toolInvocationID
+                && actual.toolArgsJSON == expected.toolArgsJSON
+                && actual.toolResultJSON == expected.toolResultJSON
+                && actual.toolIsError == expected.toolIsError
+        }
+        let backingMatches = stored.contains { image in
+            backing.activity.itemKind == image.itemKind
+                && backing.activity.text == image.text
+                && backing.activity.toolExecution == image.toolExecution
+                && sameProjectedTool(backing.activity.toItem(), image)
+        }
+        let suffixMatches = payload.isTurnCopy || stored.contains { sameProjectedTool(payload.item, $0) }
+        guard backingMatches, suffixMatches else { return .mismatch }
+        return .match
+    }
+
+    /// Step 4d5 prerequisite check: whether the canonical transcript (persisted turns plus suffix)
+    /// holds exactly one complete, non-streaming copy of `expected` (by ID) with its projected payload,
+    /// by the preflight's own comparison. Ambiguous, missing, summarized or changed copies never hold.
+    package static func holdsCanonicalPayload(_ expected: AgentChatItem, in canonical: AgentProviderHistoryCanonicalView) -> Bool {
+        let (payloads, ambiguous) = canonicalPayloads(canonical)
+        guard !ambiguous.contains(expected.id), let payload = payloads[expected.id], !payload.item.isStreaming else { return false }
+        return comparePayload(payload, expected: expected) == .match
     }
 
     /// Native user entries and local user items proven by the attempt's outbound claims.
@@ -785,8 +930,54 @@ extension ClaudeSessionHistoryReader {
             completeLineOffset: candidate.completeLineOffset,
             prefixSHA256: candidate.prefixSHA256,
             completionConfirmed: false,
-            nativeUserEntries: candidate.userMessageEntries
+            nativeUserEntries: candidate.userMessageEntries,
+            storageComparableReadItemIDs: storageComparableReadItemIDs(candidate.validationRows, nativeSessionID: candidate.nativeSessionID)
         )
+    }
+
+    /// Step 4d5: the local item IDs of the whole validated capture's singleton Read exchanges. A call
+    /// qualifies when its entry projects to exactly this one row and the row equals
+    /// `singleToolUseRow` of `Read` with input exactly `{file_path: non-empty String}` (identity,
+    /// payload and digest, so a multiblock or otherwise different entry never does). A result
+    /// qualifies likewise against `singleToolResultRow` (string content, `is_error` absent). The
+    /// exchange qualifies together: one such call and at most one result for its tool-use ID, each
+    /// entry its tool-use ID's only row of that kind. Errors, other tools and shapes never qualify.
+    static func storageComparableReadItemIDs(_ rows: [Row], nativeSessionID: String) -> Set<UUID> {
+        var rowsPerEntry: [String: Int] = [:]
+        for row in rows {
+            rowsPerEntry[row.nativeEntryID, default: 0] += 1
+        }
+        func singleton(_ row: Row) -> Bool {
+            row.ordinal == 0 && rowsPerEntry[row.nativeEntryID] == 1 && row.localItemID != nil
+        }
+        func eligibleCall(_ row: Row) -> Bool {
+            guard singleton(row), row.toolName == "Read", let toolUseID = row.toolUseID, let inputJSON = row.toolInputJSON,
+                  let input = (try? JSONSerialization.jsonObject(with: Data(inputJSON.utf8))) as? [String: Any],
+                  input.count == 1, let path = input["file_path"] as? String, !path.isEmpty,
+                  canonicalToolInputJSON(input as NSDictionary) == inputJSON
+            else { return false }
+            return singleToolUseRow(
+                nativeSessionID: nativeSessionID, nativeEntryID: row.nativeEntryID, toolUseID: toolUseID, name: "Read", inputJSON: inputJSON
+            ) == row
+        }
+        func eligibleResult(_ row: Row) -> Bool {
+            guard singleton(row), row.toolName == "Read", row.toolIsError == nil, let toolUseID = row.toolUseID, let text = row.text
+            else { return false }
+            return singleToolResultRow(
+                nativeSessionID: nativeSessionID, nativeEntryID: row.nativeEntryID, toolUseID: toolUseID, toolName: "Read", text: text
+            ) == row
+        }
+        var eligible = Set<UUID>()
+        let toolRows = Dictionary(grouping: rows.filter { $0.toolUseID != nil && ($0.kind == .toolCall || $0.kind == .toolResult) }) { $0.toolUseID ?? "" }
+        for exchange in toolRows.values {
+            let calls = exchange.filter { $0.kind == .toolCall }
+            let results = exchange.filter { $0.kind == .toolResult }
+            guard calls.count == 1, results.count <= 1, eligibleCall(calls[0]), results.allSatisfy(eligibleResult) else { continue }
+            for row in exchange {
+                if let id = row.localItemID { eligible.insert(id) }
+            }
+        }
+        return eligible
     }
 
     static func item(for row: Row) -> AgentChatItem? {

@@ -506,7 +506,8 @@ final class AgentTranscriptRefreshDiagnosticsTests: XCTestCase {
                 terminalState: .running,
                 nextSequenceIndex: items.count,
                 compact: false
-            )
+            ),
+            protectedItemIDs: []
         )
     }
 

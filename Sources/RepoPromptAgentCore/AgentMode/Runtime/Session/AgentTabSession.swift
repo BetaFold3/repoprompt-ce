@@ -2679,6 +2679,8 @@ package final class AgentTabSession: ObservableObject {
         var updatedItems = previousItems
         body(&updatedItems)
         guard updatedItems != previousItems else { return false }
+        preserveClaudeAssociatedToolPayloads(previous: previousItems, in: &updatedItems)
+        guard updatedItems != previousItems else { return false }
         commitSourceItems(
             updatedItems,
             dispatch: .notify(
@@ -2842,6 +2844,46 @@ package final class AgentTabSession: ObservableObject {
             }
         }
         return true
+    }
+
+    /// Step 4d5 invariant backstop (not a display policy): a tool row associated to Claude provider
+    /// history (imported or live canonical, whatever its proof) keeps its projected semantic payload
+    /// (kind, text, tool name, invocation ID, arguments, output, error status and streaming state)
+    /// through any incremental replacement or batch mutation; other presentation metadata may change.
+    /// A replacement by a different item never displaces it. Call sites that must show different
+    /// output append it as a separate unidentified row before reaching here.
+    func preservingClaudeAssociatedToolPayload(of previous: AgentChatItem, in updated: AgentChatItem) -> AgentChatItem {
+        guard previous.kind == .toolCall || previous.kind == .toolResult,
+              providerHistoryRecovery?.associatesClaudeLocalItem(previous.id) == true
+        else { return updated }
+        return Self.restoringProjectedToolPayload(of: previous, in: updated)
+    }
+
+    private func preserveClaudeAssociatedToolPayloads(previous: [AgentChatItem], in updated: inout [AgentChatItem]) {
+        guard let protectedIDs = providerHistoryRecovery?.claudeLocalItemIDs, !protectedIDs.isEmpty else { return }
+        var protectedByID: [UUID: AgentChatItem] = [:]
+        for item in previous where protectedIDs.contains(item.id) && (item.kind == .toolCall || item.kind == .toolResult) {
+            protectedByID[item.id] = item
+        }
+        guard !protectedByID.isEmpty else { return }
+        for index in updated.indices {
+            guard let original = protectedByID[updated[index].id] else { continue }
+            updated[index] = Self.restoringProjectedToolPayload(of: original, in: updated[index])
+        }
+    }
+
+    private static func restoringProjectedToolPayload(of previous: AgentChatItem, in updated: AgentChatItem) -> AgentChatItem {
+        guard updated.id == previous.id else { return previous }
+        var restored = updated
+        restored.kind = previous.kind
+        restored.text = previous.text
+        restored.toolName = previous.toolName
+        restored.toolInvocationID = previous.toolInvocationID
+        restored.toolArgsJSON = previous.toolArgsJSON
+        restored.toolResultJSON = previous.toolResultJSON
+        restored.toolIsError = previous.toolIsError
+        restored.isStreaming = previous.isStreaming
+        return restored
     }
 
     package func setItemsSilently(_ items: [AgentChatItem], reason: SilentItemReplacementReason) {
@@ -3083,6 +3125,7 @@ package final class AgentTabSession: ObservableObject {
         )
         guard items.indices.contains(index) else { return }
         let previousItem = items[index]
+        let updatedItem = preservingClaudeAssociatedToolPayload(of: previousItem, in: updatedItem)
         guard updatedItem != previousItem else { return }
         if !admitsIncrementalSourceItemID(updatedItem.id, replacing: previousItem.id) {
             var candidateItems = items
@@ -3124,6 +3167,7 @@ package final class AgentTabSession: ObservableObject {
         let previousItem = items[index]
         var updatedItem = previousItem
         mutate(&updatedItem)
+        updatedItem = preservingClaudeAssociatedToolPayload(of: previousItem, in: updatedItem)
         guard updatedItem != previousItem else { return }
         if !admitsIncrementalSourceItemID(updatedItem.id, replacing: previousItem.id) {
             var candidateItems = items
@@ -3185,6 +3229,7 @@ package final class AgentTabSession: ObservableObject {
         let previousItem = items[index]
         var updatedItem = previousItem
         mutate(&updatedItem)
+        updatedItem = preservingClaudeAssociatedToolPayload(of: previousItem, in: updatedItem)
         guard updatedItem != previousItem else { return }
         if !admitsIncrementalSourceItemID(updatedItem.id, replacing: previousItem.id) {
             var candidateItems = items

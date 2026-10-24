@@ -3663,8 +3663,9 @@ package final actor ClaudeNativeProcessSessionController {
         }
     }
 
-    /// Classifies one raw payload of the current producer: complete-text evidence is attached to its
-    /// one translated `content` result; any other evidence is returned as a metadata-only carrier.
+    /// Classifies one raw payload of the current producer: complete-text and Step 4d5 Read row
+    /// evidence is attached to its one translated `content`/`tool_call`/`tool_result` result; any
+    /// other evidence is returned as a metadata-only carrier.
     /// Nothing while disabled, stale or not (yet) eligible.
     private func classifyLiveTranscriptPayload(
         envelope: Data,
@@ -3678,6 +3679,15 @@ package final actor ClaudeNativeProcessSessionController {
         case .benign:
             return nil
         case let .attach(index, evidence):
+            // Step 4d5: evidence never rides on a result suppression would drop silently.
+            guard !Self.shouldSuppressUserFacingStreamResult(streamResults[index]) else {
+                state.disqualify(.attachmentSuppressed)
+                liveTranscriptQualification = state
+                return .claudeLiveTranscriptEvidenceCarrier(ClaudeLiveTranscriptEvidence(
+                    producerLaunchToken: state.launchToken,
+                    kind: .disqualified(state.disqualification ?? .attachmentSuppressed)
+                ))
+            }
             streamResults[index].claudeLiveTranscriptEvidence = evidence
             return nil
         case let .standalone(evidence):

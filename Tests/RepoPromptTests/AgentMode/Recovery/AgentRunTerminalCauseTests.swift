@@ -205,9 +205,75 @@ final class AgentRunTerminalCauseTests: XCTestCase {
         )
         let restored = AgentSessionRestoreSupport.sanitizeColdRestoredTranscript(
             AgentTranscript(turns: [openTurn(id: turnID)]),
-            interruptionContext: context
+            interruptionContext: context,
+            protectedItemIDs: []
         )
         return restored.turns.first
+    }
+
+    /// Step 4d5: a cold restore leaves a Claude-associated tool row's projected payload untouched,
+    /// with a valid or a cleared proof alike (the ledger's own protected set), while an ordinary
+    /// pending tool is cancelled and the turn and its spans close and are stamped exactly as without
+    /// the protection.
+    func testColdRestoreKeepsAnAssociatedToolPayloadAndStillClosesTheTurnHonestly() throws {
+        var read = AgentChatItem.toolCall(name: "Read", invocationID: UUID(), argsJSON: #"{"file_path":"/fixture/notes.txt"}"#, sequenceIndex: 1)
+        read.isStreaming = true
+        let bash = AgentChatItem.toolCall(name: "Bash", invocationID: UUID(), argsJSON: #"{"command":"ls"}"#, sequenceIndex: 2)
+        var user = AgentChatItem.user("Use Read on notes.txt")
+        user.sequenceIndex = 0
+        let saved = AgentTranscriptIO.buildTranscript(from: [user, read, bash], terminalState: .running, nextSequenceIndex: 3, policy: .canonical)
+        let savedTurn = try XCTUnwrap(saved.turns.first)
+        XCTAssertEqual(savedTurn.terminalState?.isActive, true, "the saved turn was running")
+        func activity(_ id: UUID, in turn: AgentTranscriptTurn) throws -> AgentTranscriptActivity {
+            try XCTUnwrap(turn.allActivities.first { $0.id == id })
+        }
+        let savedRead = try activity(read.id, in: savedTurn)
+        XCTAssertTrue([.pending, .running].contains(savedRead.toolExecution?.status), "the saved call is still pending")
+        let savedBash = try activity(bash.id, in: savedTurn)
+        XCTAssertTrue([.pending, .running].contains(savedBash.toolExecution?.status))
+        let attempt = AgentRecoveryRunAttempt(
+            runAttemptID: UUID(), transcriptResetGeneration: 0, processRunID: nil, transcriptTurnID: savedTurn.id,
+            startedAt: AgentRecoveryTimestamp(millisecondsSince1970: 10), appInstanceID: UUID(), terminal: nil
+        )
+        let context = AgentColdRestoreInterruptionContext(
+            observedAt: Date(timeIntervalSince1970: 500), providerConversationID: nil, runAttempts: [attempt],
+            launchReason: .appCrash, launchStateCaptured: true
+        )
+        let unprotected = try XCTUnwrap(AgentSessionRestoreSupport.sanitizeColdRestoredTranscript(
+            saved, interruptionContext: context, protectedItemIDs: []
+        ).turns.first)
+        XCTAssertEqual(unprotected.terminalState, .cancelled)
+        XCTAssertEqual(unprotected.interruption?.reason, .appCrash)
+        XCTAssertFalse(unprotected.responseSpans.contains { $0.lifecycle == .open })
+        XCTAssertEqual(try activity(read.id, in: unprotected).toolExecution?.status, .cancelled, "an unassociated call is cancelled")
+
+        for digest in [String(repeating: "a", count: 64), nil] {
+            let label = digest == nil ? "cleared proof" : "valid proof"
+            let ledger = AgentSessionProviderHistoryRecovery(nativeItems: [.init(
+                providerRaw: "claude", nativeSessionID: "native-session", nativeEntryID: "c1",
+                rowKindRaw: ClaudeSessionHistoryReader.RowKind.toolCall.rawValue, ordinal: 0,
+                localItemID: read.id, envelopeDigest: digest
+            )])
+            let restored = try XCTUnwrap(AgentSessionRestoreSupport.sanitizeColdRestoredTranscript(
+                saved, interruptionContext: context, protectedItemIDs: ledger.claudeLocalItemIDs
+            ).turns.first)
+            let restoredRead = try activity(read.id, in: restored)
+            XCTAssertEqual(restoredRead.toolExecution, savedRead.toolExecution, "\(label): the payload survives")
+            XCTAssertEqual(restoredRead.text, savedRead.text, label)
+            XCTAssertFalse(restoredRead.isStreaming, "\(label): streaming still ends")
+            let restoredBash = try activity(bash.id, in: restored)
+            XCTAssertEqual(restoredBash.toolExecution?.status, .cancelled, "\(label): an ordinary pending tool is cancelled")
+            XCTAssertEqual(restoredBash.toolExecution?.toolIsError, true, label)
+            // Everything but the protected row is exactly the unprotected restore: the turn's
+            // outcome, interruption, completion, summary, and every span's lifecycle and close.
+            var comparable = restored
+            for span in comparable.responseSpans.indices {
+                for index in comparable.responseSpans[span].activities.indices where comparable.responseSpans[span].activities[index].id == read.id {
+                    comparable.responseSpans[span].activities[index] = try activity(read.id, in: unprotected)
+                }
+            }
+            XCTAssertEqual(comparable, unprotected, "\(label): the turn closes honestly, as before")
+        }
     }
 
     func testColdRestoreDoesNotStampAUserCancel() throws {
@@ -271,7 +337,8 @@ final class AgentRunTerminalCauseTests: XCTestCase {
         )
         let restored = AgentSessionRestoreSupport.sanitizeColdRestoredTranscript(
             AgentTranscript(turns: [closedStart, openTurn(id: steerTurnID)]),
-            interruptionContext: context
+            interruptionContext: context,
+            protectedItemIDs: []
         )
         let join = AgentRecoveryRunTurnJoin(runAttempts: [attempt], intentAttempts: includeSteerDispatch ? dispatches : [])
         XCTAssertEqual(join.latestTurnID(of: attempt), includeSteerDispatch ? steerTurnID : startTurnID)
