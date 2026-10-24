@@ -720,7 +720,7 @@ final class ClaudeSessionHistoryReaderTests: XCTestCase {
         let proven = AgentSessionProviderHistoryRecovery(nativeItems: [complete.ledgerItem])
         XCTAssertNotNil(candidate(read(jsonl(o19Turn()), mode: fromStart, ledger: proven)))
         var invalidated = proven
-        XCTAssertTrue(invalidated.invalidateClaudeEnvelopeProofs())
+        XCTAssertTrue(invalidated.invalidateClaudeEnvelopeProofs(forKeys: [complete.ledgerKey]))
         XCTAssertEqual(invalidated.nativeItems.map(\.key), proven.nativeItems.map(\.key))
         XCTAssertEqual(invalidated.nativeItems.map(\.localItemID), proven.nativeItems.map(\.localItemID))
         XCTAssertEqual(
@@ -728,6 +728,61 @@ final class ClaudeSessionHistoryReaderTests: XCTestCase {
             .unsupported(.ledgerConflict("a1")),
             "a known entry without proof refuses"
         )
+    }
+
+    /// Step 4d3c: key-scoped invalidation clears only the listed Claude rows' proofs, typed and raw,
+    /// keeping keys, local items and other members; an unlisted Claude row, a Codex row (even when its
+    /// key is listed) and the ledger's receipt and extras are untouched; an empty set changes nothing.
+    func testKeyScopedProofInvalidationTouchesOnlyListedClaudeRows() {
+        typealias Item = AgentSessionProviderHistoryRecovery.NativeItem
+        let typed = Item(
+            providerRaw: "claude", nativeSessionID: "conv-1", nativeEntryID: "a1", rowKindRaw: "assistantText", ordinal: 0,
+            localItemID: UUID(), envelopeDigest: String(repeating: "a", count: 64), extras: ["future": .bool(true)]
+        )
+        let raw = Item(
+            providerRaw: "claude", nativeSessionID: "conv-1", nativeEntryID: "a2", rowKindRaw: "assistantText", ordinal: 0,
+            localItemID: UUID(), extras: ["envelopeDigest": .string("NOT-HEX"), "future": .bool(true)]
+        )
+        let unlisted = Item(
+            providerRaw: "claude", nativeSessionID: "conv-1", nativeEntryID: "a3", rowKindRaw: "assistantText", ordinal: 0,
+            localItemID: UUID(), envelopeDigest: String(repeating: "c", count: 64)
+        )
+        let unlistedRaw = Item(
+            providerRaw: "claude", nativeSessionID: "conv-1", nativeEntryID: "a4", rowKindRaw: "assistantText", ordinal: 0,
+            localItemID: UUID(), extras: ["envelopeDigest": .string("NOT-HEX")]
+        )
+        let codex = Item(
+            providerRaw: "codex", nativeSessionID: "t1", nativeEntryID: "i1", rowKindRaw: "assistantText", ordinal: 0,
+            localItemID: UUID(), envelopeDigest: String(repeating: "b", count: 64)
+        )
+        let receipt = AgentSessionProviderHistoryRecovery.ImportCommit(
+            importID: UUID(), providerRaw: "claude", conversationID: "conv-1", committedAt: Date(), rowCount: 0, target: nil
+        )
+        let original = AgentSessionProviderHistoryRecovery(
+            nativeItems: [typed, raw, unlisted, unlistedRaw, codex], lastImportCommit: receipt, extras: ["ledgerFuture": .string("kept")]
+        )
+        var ledger = original
+        XCTAssertFalse(ledger.invalidateClaudeEnvelopeProofs(forKeys: []), "an empty set changes nothing")
+        XCTAssertEqual(ledger, original)
+        XCTAssertFalse(ledger.invalidateClaudeEnvelopeProofs(forKeys: [codex.key, "unknown"]), "never a Codex row")
+        XCTAssertEqual(ledger, original)
+
+        XCTAssertTrue(ledger.invalidateClaudeEnvelopeProofs(forKeys: [typed.key, raw.key, codex.key]))
+        XCTAssertEqual(ledger.nativeItems.map(\.key), original.nativeItems.map(\.key))
+        XCTAssertEqual(ledger.nativeItems.map(\.localItemID), original.nativeItems.map(\.localItemID))
+        XCTAssertEqual(
+            ledger.nativeItems.map(\.envelopeDigest),
+            [nil, nil, unlisted.envelopeDigest, nil, codex.envelopeDigest]
+        )
+        XCTAssertEqual(ledger.nativeItems[0].extras, ["future": .bool(true)])
+        XCTAssertEqual(ledger.nativeItems[1].extras, ["future": .bool(true)], "the listed raw proof member is cleared")
+        XCTAssertEqual(ledger.nativeItems[3].extras, unlistedRaw.extras, "an unlisted raw proof member is kept")
+        XCTAssertEqual(ledger.nativeItems[4], codex)
+        XCTAssertEqual(ledger.lastImportCommit, receipt)
+        XCTAssertEqual(ledger.extras, ["ledgerFuture": .string("kept")])
+        let once = ledger
+        XCTAssertFalse(ledger.invalidateClaudeEnvelopeProofs(forKeys: [typed.key, raw.key]), "idempotent")
+        XCTAssertEqual(ledger, once)
     }
 
     func testDirectChainProjectsInAncestorOrderWithOriginalIDsAndOrdinals() throws {

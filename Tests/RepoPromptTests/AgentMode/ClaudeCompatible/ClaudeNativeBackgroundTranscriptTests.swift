@@ -1264,7 +1264,8 @@ extension AgentModeRunServiceLifecycleTests {
     /// canonical row (non-streaming, deterministic ID) and its ledger entry together; a duplicate is a
     /// no-op; a later equal `final_content` and an agreeing result change nothing. A changed text under
     /// the same key preserves the old row, shows the incoming text unidentified, refuses the producer
-    /// and invalidates every Claude proof; a proof is never healed by a new producer.
+    /// and invalidates the proof it inserted itself (Step 4d3c: a self-conflict is within its own
+    /// keys); a proof is never healed by a new producer.
     func testClaudeLiveCompleteTextInsertsCanonicalRowOnceAndConflictsInvalidateProofs() async throws {
         let (session, harness, runID, attemptID) = makeLiveOwnerSession()
         let host = harness.host
@@ -1293,6 +1294,7 @@ extension AgentModeRunServiceLifecycleTests {
         XCTAssertEqual(session.providerHistoryRecovery?.nativeItems, [complete.ledgerItem])
         XCTAssertNil(session.providerHistoryRecovery?.lastImportCommit, "no import receipt")
         XCTAssertTrue(session.isDirty)
+        XCTAssertEqual(session.claudeLiveTranscriptOwnedKeys, [producer: [complete.ledgerKey]], "the new key is owned")
 
         let snapshot = session.items
         let ledger = session.providerHistoryRecovery
@@ -1303,6 +1305,7 @@ extension AgentModeRunServiceLifecycleTests {
         XCTAssertEqual(session.items, snapshot, "duplicate, equal final text and agreement are no-ops")
         XCTAssertEqual(session.providerHistoryRecovery, ledger)
         XCTAssertFalse(session.claudeLiveTranscriptRefusedProducers.contains(producer))
+        XCTAssertEqual(session.claudeLiveTranscriptOwnedKeys, [producer: [complete.ledgerKey]], "no ownership change")
 
         // Changed text under the same native key: preserved, displayed unidentified, refused.
         let changed = try liveComplete("a1", text: "ALPHA-8")
@@ -1316,6 +1319,7 @@ extension AgentModeRunServiceLifecycleTests {
         XCTAssertNil(invalidated.envelopeDigest, "the proof is invalidated")
         XCTAssertEqual(invalidated.key, complete.ledgerKey, "key and local item are kept")
         XCTAssertEqual(invalidated.localItemID, complete.localItemID)
+        XCTAssertTrue(session.claudeLiveTranscriptOwnedKeys.isEmpty, "the refused producer's ownership is discarded")
         // Legacy display behavior, not under test here: without ending the segment, the next refused
         // (unidentified) complete text would merge into this still-streaming legacy row.
         host.endActiveAssistantSegment(session)
@@ -1330,9 +1334,10 @@ extension AgentModeRunServiceLifecycleTests {
         XCTAssertNil(session.providerHistoryRecovery?.nativeItems.first?.envelopeDigest, "never healed")
     }
 
-    /// Step 4d3b: disqualification (or a disagreeing result, a background complete text, or an ID
-    /// collision) refuses the producer and clears every Claude proof, typed and raw, keeping keys,
-    /// local items, other members, rows and receipts; a refused producer never qualifies later.
+    /// Step 4d3b/4d3c: disqualification (or a disagreeing result, a background complete text, or an ID
+    /// collision) refuses the producer; one that inserted nothing changes no ledger proof (imported
+    /// typed and raw proofs, Codex rows, keys, local items, other members, rows and receipts are
+    /// kept) and marks nothing dirty; a refused producer never qualifies later.
     func testClaudeLiveRefusalsInvalidateProofsAndRefusedProducersNeverRequalify() async throws {
         let (session, harness, runID, attemptID) = makeLiveOwnerSession()
         let host = harness.host
@@ -1364,16 +1369,16 @@ extension AgentModeRunServiceLifecycleTests {
         let itemsBefore = session.items
         session.isDirty = false
 
+        let ledgerBefore = session.providerHistoryRecovery
         let producer = UUID()
         await run(carrier(.disqualified(.unsupportedPayload), producer: producer))
         XCTAssertEqual(session.items, itemsBefore, "no transcript change")
-        XCTAssertTrue(session.isDirty, "a ledger-only change is marked dirty")
+        XCTAssertTrue(session.claudeLiveTranscriptRefusedProducers.contains(producer), "latched before any insert")
+        XCTAssertFalse(session.isDirty, "no owned proof: nothing changes, nothing is saved")
         let ledger = try XCTUnwrap(session.providerHistoryRecovery)
-        XCTAssertEqual(ledger.nativeItems.map(\.key), [proven.key, malformed.key, codex.key])
-        XCTAssertEqual(ledger.nativeItems.map(\.localItemID), [proven.localItemID, malformed.localItemID, codex.localItemID])
-        XCTAssertEqual(ledger.nativeItems.map(\.envelopeDigest), [nil, nil, codex.envelopeDigest], "Codex rows untouched")
-        XCTAssertEqual(ledger.nativeItems[0].extras, ["future": .bool(true)])
-        XCTAssertEqual(ledger.nativeItems[1].extras, ["future": .bool(true)], "the raw proof member is cleared too")
+        XCTAssertEqual(ledger, ledgerBefore, "imported proofs it never created are kept")
+        XCTAssertEqual(ledger.nativeItems.map(\.envelopeDigest), [proven.envelopeDigest, nil, codex.envelopeDigest])
+        XCTAssertEqual(ledger.nativeItems[1].extras, malformed.extras, "the imported raw proof member is kept")
         XCTAssertEqual(ledger.lastImportCommit, receipt)
         XCTAssertEqual(ledger.extras, ["ledgerFuture": .string("kept")])
 
@@ -1408,6 +1413,198 @@ extension AgentModeRunServiceLifecycleTests {
         XCTAssertEqual(session.items.last?.text, "COLLIDE")
         XCTAssertTrue(session.claudeLiveTranscriptRefusedProducers.contains(fourth))
         XCTAssertFalse(session.providerHistoryRecovery?.nativeItems.contains { $0.nativeSessionID == "conv-4" } ?? true)
+        XCTAssertEqual(session.providerHistoryRecovery, ledgerBefore, "no refusal touched a proof it never created")
+        XCTAssertTrue(session.claudeLiveTranscriptOwnedKeys.isEmpty)
+    }
+
+    /// Places `complete` as an imported row: its ledger entry with proof and its canonical row,
+    /// recorded without any producer ownership.
+    private func importLive(_ complete: ClaudeLiveTranscriptCompleteText, session: AgentTabSession) throws {
+        var ledger = session.providerHistoryRecovery ?? AgentSessionProviderHistoryRecovery()
+        ledger.nativeItems.append(complete.ledgerItem)
+        session.providerHistoryRecovery = ledger
+        try session.appendItem(XCTUnwrap(complete.canonicalItem))
+    }
+
+    /// Step 4d3c: each refusal clears only the proofs its own producer newly inserted. With imported
+    /// rows of the same and another conversation, two producers' rows in one conversation and a Codex
+    /// row, a delayed (between-run) refusal of the first producer clears only its key; a repeated one
+    /// is a no-op; a disagreeing result of the second clears only its own; a background complete text
+    /// of a producer that owns nothing changes no proof. Rows, IDs, keys and receipts are kept.
+    func testClaudeLiveRefusalClearsOnlyTheRefusedProducersOwnNewProofs() async throws {
+        let (session, harness, runID, attemptID) = makeLiveOwnerSession()
+        let host = harness.host
+        defer {
+            host.clearPendingAssistantDelta(session)
+            withExtendedLifetime(harness) {}
+        }
+        func run(_ result: AIStreamResult) async {
+            await host.test_handleStreamResult(result, session: session, runID: runID, runAttemptID: attemptID)
+        }
+        let receipt = AgentSessionProviderHistoryRecovery.ImportCommit(
+            importID: UUID(), providerRaw: "claude", conversationID: "conv-1", committedAt: Date(), rowCount: 0, target: nil
+        )
+        let importedOther = AgentSessionProviderHistoryRecovery.NativeItem(
+            providerRaw: "claude", nativeSessionID: "conv-0", nativeEntryID: "o1", rowKindRaw: "assistantText", ordinal: 0,
+            localItemID: UUID(), envelopeDigest: String(repeating: "a", count: 64), extras: ["future": .bool(true)]
+        )
+        let codex = AgentSessionProviderHistoryRecovery.NativeItem(
+            providerRaw: "codex", nativeSessionID: "t1", nativeEntryID: "i1", rowKindRaw: "assistantText", ordinal: 0,
+            localItemID: UUID(), envelopeDigest: String(repeating: "b", count: 64)
+        )
+        session.providerHistoryRecovery = AgentSessionProviderHistoryRecovery(
+            nativeItems: [importedOther, codex], lastImportCommit: receipt, extras: ["ledgerFuture": .string("kept")]
+        )
+        let importedSame = try liveComplete("i1", text: "IMPORTED")
+        try importLive(importedSame, session: session)
+
+        let first = UUID()
+        let second = UUID()
+        let fromFirst = try liveComplete("p1", text: "FROM-P")
+        let fromSecond = try liveComplete("q1", text: "FROM-Q")
+        await run(carried(fromFirst, producer: first))
+        await run(carried(fromSecond, producer: second))
+        XCTAssertEqual(
+            session.claudeLiveTranscriptOwnedKeys,
+            [first: [fromFirst.ledgerKey], second: [fromSecond.ledgerKey]]
+        )
+        let rowIDs = session.items.map(\.id)
+        let keys = try XCTUnwrap(session.providerHistoryRecovery?.nativeItems.map(\.key))
+        XCTAssertEqual(keys, [importedOther.key, codex.key, importedSame.ledgerKey, fromFirst.ledgerKey, fromSecond.ledgerKey])
+        func digests() -> [String?] {
+            session.providerHistoryRecovery?.nativeItems.map(\.envelopeDigest) ?? []
+        }
+
+        // The first producer's delayed refusal arrives between runs.
+        session.isDirty = false
+        await host.test_handleBackgroundNativeStreamResult(carrier(.disqualified(.unsupportedPayload), producer: first), session: session)
+        XCTAssertTrue(session.claudeLiveTranscriptRefusedProducers.contains(first))
+        XCTAssertFalse(session.claudeLiveTranscriptRefusedProducers.contains(second))
+        XCTAssertTrue(session.isDirty, "a ledger-only change is marked dirty")
+        XCTAssertEqual(
+            digests(),
+            [importedOther.envelopeDigest, codex.envelopeDigest, importedSame.envelopeDigest, nil, fromSecond.envelopeDigest]
+        )
+        XCTAssertEqual(session.claudeLiveTranscriptOwnedKeys, [second: [fromSecond.ledgerKey]])
+        XCTAssertEqual(session.items.map(\.id), rowIDs, "rows and IDs are kept")
+        XCTAssertEqual(session.providerHistoryRecovery?.nativeItems.map(\.key), keys, "keys are kept")
+        XCTAssertEqual(session.providerHistoryRecovery?.nativeItems.first?.extras, importedOther.extras)
+        XCTAssertEqual(session.providerHistoryRecovery?.lastImportCommit, receipt)
+        XCTAssertEqual(session.providerHistoryRecovery?.extras, ["ledgerFuture": .string("kept")])
+
+        // Repeated: idempotent, nothing changes or is saved.
+        session.isDirty = false
+        let afterFirst = session.providerHistoryRecovery
+        await run(carrier(.disqualified(.unsupportedPayload), producer: first))
+        XCTAssertEqual(session.providerHistoryRecovery, afterFirst)
+        XCTAssertFalse(session.isDirty)
+
+        // A background complete text from a producer that inserted nothing: refused, no proof change.
+        let third = UUID()
+        let between = try liveComplete("b1", text: "BETWEEN", conversation: "conv-3")
+        await host.test_handleBackgroundNativeStreamResult(carried(between, producer: third), session: session)
+        XCTAssertTrue(session.claudeLiveTranscriptRefusedProducers.contains(third))
+        XCTAssertEqual(session.providerHistoryRecovery, afterFirst)
+        XCTAssertEqual(session.claudeLiveTranscriptOwnedKeys, [second: [fromSecond.ledgerKey]])
+
+        // The second producer's disagreeing result clears only its own key.
+        session.isDirty = false
+        await run(carrier(.resultAgreement(localItemID: fromSecond.localItemID, text: "OTHER"), producer: second))
+        XCTAssertTrue(session.claudeLiveTranscriptRefusedProducers.contains(second))
+        XCTAssertEqual(
+            digests(),
+            [importedOther.envelopeDigest, codex.envelopeDigest, importedSame.envelopeDigest, nil, nil]
+        )
+        XCTAssertTrue(session.claudeLiveTranscriptOwnedKeys.isEmpty)
+        XCTAssertTrue(session.isDirty)
+    }
+
+    /// Step 4d3c: a refusal before any insert only latches. A duplicate of an imported row and an
+    /// agreeing result on it acquire no ownership, so that producer's later refusal keeps the imported
+    /// proof. A producer whose complete text conflicts with an imported key keeps the import (row and
+    /// proof; the text shows unidentified) but loses the proof of its own earlier new key.
+    func testClaudeLiveImportedMatchesNeverAcquireOwnershipAndImportedConflictsClearOnlyOwnProofs() async throws {
+        let (session, harness, runID, attemptID) = makeLiveOwnerSession()
+        let host = harness.host
+        defer {
+            host.clearPendingAssistantDelta(session)
+            withExtendedLifetime(harness) {}
+        }
+        func run(_ result: AIStreamResult) async {
+            await host.test_handleStreamResult(result, session: session, runID: runID, runAttemptID: attemptID)
+        }
+        let imported = try liveComplete("i1", text: "ALPHA-7")
+        try importLive(imported, session: session)
+        let importedLedger = session.providerHistoryRecovery
+        let importedItems = session.items
+        session.isDirty = false
+
+        let early = UUID()
+        await run(carrier(.disqualified(.unsupportedPayload), producer: early))
+        XCTAssertTrue(session.claudeLiveTranscriptRefusedProducers.contains(early))
+        XCTAssertEqual(session.providerHistoryRecovery, importedLedger, "refusal before insert: unchanged ledger")
+        XCTAssertFalse(session.isDirty, "and nothing dirty")
+
+        let duplicating = UUID()
+        await run(carried(imported, producer: duplicating))
+        await run(carrier(.resultAgreement(localItemID: imported.localItemID, text: "ALPHA-7"), producer: duplicating))
+        XCTAssertEqual(session.items, importedItems, "an imported duplicate is a no-op")
+        XCTAssertFalse(session.claudeLiveTranscriptRefusedProducers.contains(duplicating), "the result agreed")
+        XCTAssertTrue(session.claudeLiveTranscriptOwnedKeys.isEmpty, "a duplicate or agreement never owns")
+        await run(carrier(.disqualified(.unsupportedPayload), producer: duplicating))
+        XCTAssertEqual(session.providerHistoryRecovery, importedLedger, "the imported proof survives its refusal")
+        XCTAssertFalse(session.isDirty)
+
+        let conflicting = UUID()
+        let own = try liveComplete("q1", text: "OWN")
+        await run(carried(own, producer: conflicting))
+        XCTAssertEqual(session.claudeLiveTranscriptOwnedKeys, [conflicting: [own.ledgerKey]])
+        let changed = try liveComplete("i1", text: "ALPHA-8")
+        await run(carried(changed, producer: conflicting))
+        host.flushPendingAssistantDelta(session)
+        XCTAssertTrue(session.claudeLiveTranscriptRefusedProducers.contains(conflicting))
+        XCTAssertEqual(session.items.first { $0.id == imported.localItemID }?.text, "ALPHA-7", "the imported row is kept")
+        XCTAssertEqual(session.items.last?.text, "ALPHA-8")
+        XCTAssertNotEqual(session.items.last?.id, changed.localItemID, "the conflicting text is unidentified")
+        let ledger = try XCTUnwrap(session.providerHistoryRecovery)
+        XCTAssertEqual(ledger.nativeItem(forKey: imported.ledgerKey), imported.ledgerItem, "the imported proof is kept")
+        XCTAssertNil(ledger.nativeItem(forKey: own.ledgerKey)?.envelopeDigest, "its own new proof is cleared")
+        XCTAssertEqual(ledger.nativeItem(forKey: own.ledgerKey)?.localItemID, own.localItemID)
+        XCTAssertTrue(session.claudeLiveTranscriptOwnedKeys.isEmpty)
+    }
+
+    /// Step 4d3c: run completion, a new run and its cancellation keep ownership; an actual
+    /// canonical-history reset (clear chat) discards it with the ledger while the refused-producer
+    /// latch is kept.
+    func testClaudeLiveOwnershipSurvivesRunCompletionAndResetsOnlyWithTheCanonicalHistory() async throws {
+        let (session, harness, runID, attemptID) = makeLiveOwnerSession()
+        let host = harness.host
+        defer {
+            host.clearPendingAssistantDelta(session)
+            withExtendedLifetime(harness) {}
+        }
+        let refused = UUID()
+        let producer = UUID()
+        let complete = try liveComplete("a1", text: "ALPHA-7")
+        await host.test_handleStreamResult(carrier(.disqualified(.unsupportedPayload), producer: refused), session: session, runID: runID, runAttemptID: attemptID)
+        await host.test_handleStreamResult(carried(complete, producer: producer), session: session, runID: runID, runAttemptID: attemptID)
+        session.runState = .completed
+        XCTAssertEqual(session.claudeLiveTranscriptOwnedKeys, [producer: [complete.ledgerKey]], "kept at completion")
+
+        session.runID = UUID()
+        session.runState = .running
+        _ = session.beginRunAttempt(source: "test.liveOwnershipNextRun")
+        XCTAssertEqual(session.claudeLiveTranscriptOwnedKeys, [producer: [complete.ledgerKey]], "kept for a new run")
+        await harness.service.cancelRun(tabID: session.tabID, session: session, cause: .userCancel)
+        XCTAssertFalse(session.runState.isActive)
+        XCTAssertEqual(session.claudeLiveTranscriptOwnedKeys, [producer: [complete.ledgerKey]], "kept across cancellation")
+        XCTAssertNotNil(session.providerHistoryRecovery?.nativeItem(forKey: complete.ledgerKey)?.envelopeDigest)
+
+        host.clearChat(tabID: session.tabID)
+        XCTAssertTrue(session.items.isEmpty)
+        XCTAssertNil(session.providerHistoryRecovery)
+        XCTAssertTrue(session.claudeLiveTranscriptOwnedKeys.isEmpty, "reset with the canonical history")
+        XCTAssertTrue(session.claudeLiveTranscriptRefusedProducers.contains(refused), "the refused latch is kept")
     }
 
     /// Step 4d3b (review B F5/F6): a complete text whose ID or digest is not the reader's projection of

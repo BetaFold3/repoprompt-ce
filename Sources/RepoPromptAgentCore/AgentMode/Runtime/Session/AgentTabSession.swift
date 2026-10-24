@@ -1565,6 +1565,15 @@ package final class AgentTabSession: ObservableObject {
     /// output is never identified here; a refusal before any proof exists needs this. Not
     /// persisted (a relaunched producer has a new token; durable refusal is proof invalidation).
     package var claudeLiveTranscriptRefusedProducers: Set<UUID> = []
+    /// Step 4d3c (inactive): per producer launch, the exact ledger keys that launch newly inserted
+    /// (written with the row and ledger entry in the same main-actor step). A duplicate, an imported
+    /// match or an agreeing result never acquires or transfers a key. A refusal invalidates only
+    /// these proofs. Reset only by clear chat, which also detaches the tab's Claude controller. It is
+    /// kept across run completion, cancellation, a new run, a merging import and persisted
+    /// hydration or rebinding, which do not detach a still-attached producer: exact keys (provider,
+    /// native session, entry) never match another conversation's rows, and a copied key the producer
+    /// created stays its own. The refused latch above is never reset. Not persisted.
+    package var claudeLiveTranscriptOwnedKeys: [UUID: Set<String>] = [:]
 
     /// Whether `rowID` is a background row delivered from `sourceID`'s stream.
     package func isBackgroundRow(_ rowID: UUID, from sourceID: UUID?) -> Bool {

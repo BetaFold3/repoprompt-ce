@@ -127,6 +127,8 @@ Step 4d3b source is implemented and reviewed; broader provider qualification, pr
 
 ## Step 4d3b completion and remaining boundary
 
+Subsequent source correction: [Step 4d3c](phase4d3c.md) supersedes the all-tab proof-clearing rule below with transient per-producer owned-key invalidation. Its evidence also records the hydration lifetime correction. Earlier limitations below describe the Step 4d3b checkpoint, not the updated scoped rule.
+
 Both re-review 1 replies returned the expected explicit A/B preset identities; main read them in full. [OracleA](phase4d3b-review-oraclea-r1.md) closed R1/R2 and [OracleB](phase4d3b-review-oracleb-r1.md) found no P0/P1 regression. No contest remains. The source snapshot is unchanged after re-review. Main reran both carried-over suites on the final source: reader 35/35, ticket `aae1fb1f-2992-4567-a43f-939e5105e67c`; reconciliation 45/45, ticket `86bd89f0-aefd-41e8-8c6d-2cff510a6635`. Both coordinated commands completed with exit 0.
 
 Deferred, with no further review round: A R3 deterministic replacement-during-drain coverage; B R1-P2-1 conversation-ID ordering as another trigger of all-tab proof invalidation; B R1-P3-1 projection reuse, R1-P3-2/3 additional drain comments, and R1-P3-4 tighter test-local time bounds. These are activation/coverage or optional polish, not grounds to expand this inactive step. The existing conductor deadline still bounds a test hang. The owner requested optional polish be deferred. Initial B F1 remains an activation blocker: ordinary unsupported output can invalidate every Claude proof and prevent later recovery. No owner acceptance of that limitation is inferred.

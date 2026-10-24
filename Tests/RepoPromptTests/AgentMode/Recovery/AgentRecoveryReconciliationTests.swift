@@ -2216,7 +2216,8 @@ final class AgentRecoveryReconciliationTests: XCTestCase {
 
     /// Step 4d3b, real composition: a qualified live row and its proof persist coherently in the
     /// ordinary session save; the later import of the same native entry records it with no duplicate.
-    /// A disqualification then clears the proof durably; with Claude's history unchanged the next
+    /// A disqualification then clears the proof the producer inserted durably (Step 4d3c: the
+    /// imported user row it never created keeps its proof); with Claude's history unchanged the next
     /// reconcile refuses, and after a reload a new producer never heals the conversation.
     func testLiveQualifiedRowRoundTripsAndInvalidationRefusesWithoutHealing() async throws {
         let harness = try await makeProducerHarness(windowID: 4996)
@@ -2258,7 +2259,12 @@ final class AgentRecoveryReconciliationTests: XCTestCase {
         harness.session.runState = .completed
         let persistedSession = try await harness.persisted()
         let persisted = try XCTUnwrap(persistedSession?.providerHistoryRecovery)
-        XCTAssertTrue(persisted.nativeItems.filter { $0.providerRaw == "claude" }.allSatisfy { $0.envelopeDigest == nil })
+        XCTAssertNil(persisted.nativeItem(forKey: complete.ledgerKey)?.envelopeDigest, "the producer's own proof is cleared")
+        XCTAssertEqual(
+            persisted.nativeItems.filter { $0.key != complete.ledgerKey },
+            ledger.nativeItems.filter { $0.key != complete.ledgerKey },
+            "the imported row it never created keeps its proof"
+        )
         XCTAssertEqual(persisted.nativeItems.map(\.key), ledger.nativeItems.map(\.key), "keys are kept")
         XCTAssertEqual(persisted.lastImportCommit, ledger.lastImportCommit, "the receipt is kept")
         let itemsBefore = harness.session.items.map(\.id)
@@ -2273,6 +2279,7 @@ final class AgentRecoveryReconciliationTests: XCTestCase {
         // Reload the persisted ledger: a new producer's complete text is shown unidentified.
         harness.session.providerHistoryRecovery = persisted
         harness.session.claudeLiveTranscriptRefusedProducers = []
+        harness.session.claudeLiveTranscriptOwnedKeys = [:]
         harness.session.runState = .running
         let later = try await deliverLiveComplete(harness, entry: "a2", text: "BRAVO", producer: UUID(), runID: runID, attemptID: attemptID)
         harness.viewModel.flushPendingAssistantDelta(harness.session)
@@ -2318,6 +2325,57 @@ final class AgentRecoveryReconciliationTests: XCTestCase {
         XCTAssertNil(entry.envelopeDigest, "the older snapshot never restores the cleared proof")
         XCTAssertEqual(entry.localItemID, complete.localItemID)
         XCTAssertTrue(persisted?.items.contains { $0.text == "Later" } ?? false)
+    }
+
+    /// Step 4d3c (review B F1, option b): an accepted persisted hydration replaces the ledger from
+    /// disk but keeps live-producer ownership (hydration does not detach the tab's Claude
+    /// controller), so the still-attached producer's later between-run refusal revokes the proof it
+    /// inserted, durably, while an unrelated imported proof is kept.
+    func testPersistedHydrationKeepsLiveOwnershipSoALaterRefusalStillRevokesItsProof() async throws {
+        let harness = try await makeProducerHarness(windowID: 4998)
+        let imported = AgentSessionProviderHistoryRecovery.NativeItem(
+            providerRaw: "claude", nativeSessionID: "conv-0", nativeEntryID: "o1", rowKindRaw: "assistantText", ordinal: 0,
+            localItemID: UUID(), envelopeDigest: String(repeating: "a", count: 64)
+        )
+        harness.session.providerHistoryRecovery = AgentSessionProviderHistoryRecovery(nativeItems: [imported])
+        let runID = UUID()
+        harness.session.runID = runID
+        harness.session.runState = .running
+        let attemptID = harness.session.beginRunAttempt(source: "test.liveOwnershipHydration").attemptID
+        let producer = UUID()
+        let complete = try await deliverLiveComplete(harness, entry: "a1", text: "ALPHA-7", producer: producer, runID: runID, attemptID: attemptID)
+        XCTAssertEqual(harness.session.claudeLiveTranscriptOwnedKeys, [producer: [complete.ledgerKey]])
+        harness.session.runState = .completed
+        let saved = await harness.viewModel.flushSave(for: harness.session.tabID)
+        XCTAssertTrue(saved)
+
+        // An accepted persisted hydration: the in-memory-only marker shows the ledger came from disk.
+        var marked = try XCTUnwrap(harness.session.providerHistoryRecovery)
+        marked.extras["inMemoryOnly"] = .bool(true)
+        harness.session.providerHistoryRecovery = marked
+        harness.session.hasLoadedPersistedState = false
+        let outcome = await harness.viewModel.loadSessionFromDisk(for: harness.session)
+        XCTAssertEqual(outcome.disposition, .applied)
+        let hydrated = try XCTUnwrap(harness.session.providerHistoryRecovery)
+        XCTAssertNil(hydrated.extras["inMemoryOnly"], "the ledger was replaced from disk")
+        XCTAssertEqual(hydrated.nativeItem(forKey: complete.ledgerKey), complete.ledgerItem)
+        XCTAssertEqual(hydrated.nativeItem(forKey: imported.key), imported)
+        XCTAssertEqual(harness.session.claudeLiveTranscriptOwnedKeys, [producer: [complete.ledgerKey]], "ownership survives hydration")
+
+        // The still-attached producer's later between-run refusal revokes only its own proof.
+        await harness.viewModel.test_handleBackgroundNativeStreamResult(liveDisqualification(producer: producer), session: harness.session)
+        XCTAssertTrue(harness.session.claudeLiveTranscriptRefusedProducers.contains(producer))
+        XCTAssertTrue(harness.session.claudeLiveTranscriptOwnedKeys.isEmpty)
+        let revoked = try XCTUnwrap(harness.session.providerHistoryRecovery)
+        XCTAssertNil(revoked.nativeItem(forKey: complete.ledgerKey)?.envelopeDigest, "its own proof is revoked")
+        XCTAssertEqual(revoked.nativeItem(forKey: complete.ledgerKey)?.localItemID, complete.localItemID)
+        XCTAssertEqual(revoked.nativeItem(forKey: imported.key), imported, "the unrelated imported proof is kept")
+        let savedRevocation = await harness.viewModel.flushSave(for: harness.session.tabID)
+        XCTAssertTrue(savedRevocation)
+        let persistedSession = try await harness.persisted()
+        let persisted = try XCTUnwrap(persistedSession?.providerHistoryRecovery)
+        XCTAssertNil(persisted.nativeItem(forKey: complete.ledgerKey)?.envelopeDigest, "the revocation is durable")
+        XCTAssertEqual(persisted.nativeItem(forKey: imported.key), imported)
     }
 
     /// A steering dispatch of the same attempt whose claimed native user entry never appeared

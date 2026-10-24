@@ -5919,6 +5919,10 @@ final class AgentModeViewModel: ObservableObject {
         session.runState = payload.normalizedRunState
         session.providerSessionID = agentSession.providerSessionID
         session.providerHistoryRecovery = agentSession.providerHistoryRecovery
+        // Step 4d3c: live-producer ownership is deliberately kept. Hydration does not detach the
+        // tab's Claude controller, so a still-attached producer that inserted a key now present in
+        // the hydrated ledger must still revoke it when refused (exact keys never match another
+        // conversation's rows).
         session.providerTokenUsageByTurn = agentSession.providerTokenUsageByTurn
         // Restore preserved accounting before any live ingestion. The persisted payload is
         // authoritative here; pre-hydration accumulator state never overwrites it on save.
@@ -20113,7 +20117,8 @@ final class AgentModeViewModel: ObservableObject {
     /// mutation. Returns `true` only when the result was fully applied here (an accepted or already
     /// recorded complete text); otherwise the result continues through the legacy display path
     /// unidentified. Every refusal makes the producer's launch permanently unqualified for this tab
-    /// and invalidates the ledger's Claude proofs (a proof is never regenerated or healed).
+    /// and invalidates only the proofs that launch newly inserted (Step 4d3c; a proof is never
+    /// regenerated or healed).
     private func applyClaudeLiveTranscriptEvidence(
         _ evidence: ClaudeLiveTranscriptEvidence,
         session: AgentTabSession,
@@ -20158,11 +20163,13 @@ final class AgentModeViewModel: ObservableObject {
             _ = clearClaudeReasoningStatus(session)
             flushPendingAssistantDelta(session)
             endAssistantSegment(session, background: false)
-            // Row and ledger entry change together in this main-actor snapshot; the existing
-            // serialized save persists them (no import receipt, cursor or prefix proof).
+            // Row, ledger entry and the producer's ownership of that new key change together in
+            // this main-actor snapshot; the existing serialized save persists the row and entry (no
+            // import receipt, cursor or prefix proof). Ownership is transient (Step 4d3c).
             var ledger = session.providerHistoryRecovery ?? AgentSessionProviderHistoryRecovery()
             ledger.nativeItems.append(ledgerItem)
             session.providerHistoryRecovery = ledger
+            session.claudeLiveTranscriptOwnedKeys[evidence.producerLaunchToken, default: []].insert(ledgerItem.key)
             session.appendItem(canonicalItem)
             session.isDirty = true
             scheduleSave(for: session.tabID)
@@ -20187,13 +20194,19 @@ final class AgentModeViewModel: ObservableObject {
         }
     }
 
-    /// Step 4d3b refusal: the producer never qualifies again in this tab (transient; the producer's
-    /// own latch is the durable-for-its-launch authority), and every Claude envelope proof of this
-    /// ledger is cleared, keeping keys, local items, rows, extras, receipts and baselines. A ledger-only
-    /// change is marked dirty explicitly and saved through the existing serialized save.
+    /// Step 4d3b/4d3c refusal: the producer never qualifies again in this tab (transient; the
+    /// producer's own latch is the durable-for-its-launch authority). Only the proofs of the keys
+    /// this producer newly inserted are cleared (its ownership is discarded, so a repeated refusal is
+    /// idempotent), keeping keys, local items, rows, extras, receipts and baselines; imported,
+    /// another producer's and Codex proofs are untouched. A ledger-only change is marked dirty
+    /// explicitly and saved through the existing serialized save; no owned key changes nothing.
     private func refuseClaudeLiveTranscript(producer: UUID, session: AgentTabSession) {
         session.claudeLiveTranscriptRefusedProducers.insert(producer)
-        guard var ledger = session.providerHistoryRecovery, ledger.invalidateClaudeEnvelopeProofs() else { return }
+        let ownedKeys = session.claudeLiveTranscriptOwnedKeys.removeValue(forKey: producer) ?? []
+        guard !ownedKeys.isEmpty,
+              var ledger = session.providerHistoryRecovery,
+              ledger.invalidateClaudeEnvelopeProofs(forKeys: ownedKeys)
+        else { return }
         session.providerHistoryRecovery = ledger
         session.isDirty = true
         scheduleSave(for: session.tabID)
@@ -22068,8 +22081,11 @@ final class AgentModeViewModel: ObservableObject {
         // restore the old conversation or affect a replacement controller.
         claudeCoordinator.prepareForConversationResetSync(session)
         session.providerSessionID = nil
-        // The history ledger belongs to the cleared transcript (reset semantics only).
+        // The history ledger belongs to the cleared transcript (reset semantics only). Live-producer
+        // ownership of its keys goes with it, as the controller was detached above (the only
+        // ownership reset); the refused-producer latch is kept (Step 4d3c).
         session.providerHistoryRecovery = nil
+        session.claudeLiveTranscriptOwnedKeys = [:]
         session.recoveryResumeFallbackSuppressedConversationID = nil
         session.recoveryResumeUnavailableConversationID = nil
         session.pendingHistoryImportCommit = nil

@@ -507,17 +507,20 @@ package struct AgentSessionProviderHistoryRecovery: Codable, Equatable {
         }
     }
 
-    /// Step 4d3b: clears the envelope proof of every Claude row, both the typed value and a
-    /// preserved raw `envelopeDigest` member, keeping its key, local item association and every
-    /// other unknown member (rows, receipts and baselines are untouched). The reader refuses a known
-    /// entry without a proof, so reconciliation of these rows refuses until a future
-    /// requalification (none exists). Conservative scope: every Claude row of this ledger, not one
-    /// conversation picked from untrusted payload fields. Returns whether anything changed.
+    /// Step 4d3c: clears the envelope proof of the Claude rows whose exact key is in `keys` (the
+    /// keys a refused producer newly inserted), both the typed value and a preserved raw
+    /// `envelopeDigest` member, keeping its key, local item association and every other unknown
+    /// member (rows, receipts and baselines are untouched). Every other row (imported, another
+    /// producer's, Codex) keeps its proof. The reader refuses a known entry without a proof, so
+    /// reconciliation of these rows refuses until a future requalification (none exists). An empty
+    /// `keys` changes nothing. Returns whether anything changed.
     @discardableResult
-    package mutating func invalidateClaudeEnvelopeProofs() -> Bool {
+    package mutating func invalidateClaudeEnvelopeProofs(forKeys keys: Set<String>) -> Bool {
+        guard !keys.isEmpty else { return false }
         var changed = false
         nativeItems = nativeItems.map { item in
             guard item.providerRaw == AgentRecoveryHistoryProvider.claude.rawValue,
+                  keys.contains(item.key),
                   item.envelopeDigest != nil || item.extras["envelopeDigest"] != nil
             else { return item }
             changed = true
