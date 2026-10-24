@@ -1,6 +1,7 @@
 import Foundation
 import RepoPromptAgentCore
 import RepoPromptShared
+import RepoPromptUI
 import SwiftUI
 
 func isAutoExpandableEditToolResult(_ item: AgentChatItem) -> Bool {
@@ -965,15 +966,46 @@ func oracleToolCallPopoverUserInfo(
 }
 
 enum ToolCallCardStateResolver {
+    /// Display status for a generic tool-call card.
+    ///
+    /// A call with no attached result evidence, or with evidence that does not classify, is
+    /// `.neutral`: render blocks carry no per-call liveness, so the card must not claim the call
+    /// is executing. The session-level run indicator shows run activity, and separate result cards
+    /// own their outcomes. Explicitly classified success, warning, failure, or running is kept.
     static func status(for item: AgentChatItem) -> ToolCardStatus {
-        if item.toolResultJSON != nil || item.toolIsError != nil {
-            return ToolResultStatusResolver.resolve(
-                toolIsError: item.toolIsError,
-                raw: item.toolResultJSON,
-                fallback: .running
-            )
-        }
-        return .running
+        guard hasAttachedResultEvidence(item) else { return .neutral }
+        return ToolResultStatusResolver.resolve(
+            toolIsError: item.toolIsError,
+            raw: item.toolResultJSON,
+            fallback: .neutral
+        )
+    }
+
+    /// Run-scoped cancel eligibility, intentionally identical to the pre-Step-4d6 set (the old
+    /// `.running` fallback). This is not a claim that this call is executing; the cancel action
+    /// targets the run's active tools.
+    static func allowsRunScopedCancel(for item: AgentChatItem) -> Bool {
+        guard hasAttachedResultEvidence(item) else { return true }
+        return ToolResultStatusResolver.resolve(
+            toolIsError: item.toolIsError,
+            raw: item.toolResultJSON,
+            fallback: .running
+        ) == .running
+    }
+
+    static func showsRunScopedCancel(
+        for item: AgentChatItem,
+        showRunScopedToolCancel: Bool,
+        hasCancelAction: Bool
+    ) -> Bool {
+        showRunScopedToolCancel
+            && hasCancelAction
+            && allowsRunScopedCancel(for: item)
+            && MCPIntegrationHelper.isRepoPromptToolNameAfterNormalization(item.toolName)
+    }
+
+    private static func hasAttachedResultEvidence(_ item: AgentChatItem) -> Bool {
+        item.toolResultJSON != nil || item.toolIsError != nil
     }
 }
 
@@ -1005,14 +1037,17 @@ struct ToolCallCard: View {
         ToolCallCardStateResolver.status(for: item)
     }
 
-    /// Whether this card should show a cancel button in the header.
-    /// Only for running RepoPrompt MCP tools when cancel context is available.
+    /// Whether this card should show the run-scoped cancel button in the header.
+    /// Eligibility is decoupled from the display status (see `ToolCallCardStateResolver`).
     private var showsCancelButton: Bool {
-        status == .running
-            && showRunScopedToolCancel
-            && cancelActiveToolsAction != nil
-            && MCPIntegrationHelper.isRepoPromptToolNameAfterNormalization(item.toolName)
+        ToolCallCardStateResolver.showsRunScopedCancel(
+            for: item,
+            showRunScopedToolCancel: showRunScopedToolCancel,
+            hasCancelAction: cancelActiveToolsAction != nil
+        )
     }
+
+    private static let cancelActiveToolsLabel = "Cancel active tools for this run"
 
     private var onTap: (() -> Void)? {
         guard let userInfo = oracleToolCallPopoverUserInfo(
@@ -1033,10 +1068,16 @@ struct ToolCallCard: View {
             status: status,
             timestamp: item.timestamp,
             showsTimestamp: !showsCancelButton,
-            headerTrailingView: showsCancelButton ? AnyView(ToolCardCancelButton(action: cancelActiveToolsAction!)) : nil,
+            headerTrailingView: showsCancelButton
+                ? AnyView(
+                    ToolCardCancelButton(action: cancelActiveToolsAction!)
+                        .hoverTooltip(Self.cancelActiveToolsLabel)
+                        .accessibilityLabel(Self.cancelActiveToolsLabel)
+                )
+                : nil,
             onTap: onTap
         ) {
-            // Tool calls in progress don't show args by default
+            // Tool call cards don't show args by default
             EmptyView()
         }
     }
