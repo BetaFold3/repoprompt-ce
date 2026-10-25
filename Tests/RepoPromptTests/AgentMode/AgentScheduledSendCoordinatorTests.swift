@@ -1288,6 +1288,170 @@ final class AgentScheduledSendCoordinatorTests: XCTestCase {
         XCTAssertEqual(scheduledHost.dispatches.first?.lease.runAlongsideOtherSessions, true)
     }
 
+    /// Lossless restart F2: Send now (both menu items) on an overdue new-session start held by a
+    /// crash hold, a session restriction, or a workspace restriction elsewhere in the workspace
+    /// records consent and reports `blocked` with that reason, never a silent no-op. Only clearing
+    /// the blocker (It stopped, in the real host) admits it, and the consent dispatches once.
+    func testSendNowOnRecoveryBlockedNewSessionReportsBlockedUntilBlockerClears() async {
+        let cases: [(String, AgentScheduledSendRecoveryBlocker)] = [
+            ("crash hold", AgentScheduledSendRecoveryBlocker(interruptedSessionIDs: [UUID(), UUID()])),
+            ("session restriction", AgentScheduledSendRecoveryBlocker(restrictedSessionIDs: [UUID()])),
+            ("workspace restriction", AgentScheduledSendRecoveryBlocker(workspaceRestriction: "unreadable"))
+        ]
+        for (index, (label, expected)) in cases.enumerated() {
+            let launch = Date(timeIntervalSince1970: 64500 + Double(index) * 1000)
+            let clock = FakeScheduledSendClock(now: launch)
+            let coordinator = AgentScheduledSendCoordinator(clock: clock.clock)
+            let workspaceID = UUID()
+            let scheduledHost = FakeScheduledSendHost()
+            let recoveryHost = FakeScheduledSendHost()
+            recoveryHost.recoveryBlockers[workspaceID] = expected
+            var record = makeRecord(
+                createdAt: launch.addingTimeInterval(-120),
+                notBefore: launch.addingTimeInterval(-60),
+                isNewSessionStart: true
+            )
+            record.state = .needsConfirmation
+            record.confirmationReason = .missedWhileClosed
+            let sessionID = UUID()
+            scheduledHost.addScheduledSession(sessionID: sessionID, workspaceID: workspaceID, record: record)
+            let changes = DashboardChangeCounter()
+            let observer = NotificationCenter.default.addObserver(
+                forName: .agentScheduledSendDispositionDidChange,
+                object: coordinator,
+                queue: nil
+            ) { notification in
+                if notification.userInfo?["sessionID"] as? UUID == sessionID { changes.increment() }
+            }
+            defer { NotificationCenter.default.removeObserver(observer) }
+
+            coordinator.register(scheduledHost)
+            coordinator.register(recoveryHost)
+            await drainTasks()
+            XCTAssertEqual(coordinator.disposition(scheduleID: record.id), .progressing, "\(label): unconsented")
+
+            for runAlongside in [false, true] {
+                let revision = scheduledHost.record(scheduleID: record.id)?.updatedAt
+                let result = coordinator.confirmAndSendNow(
+                    scheduleID: record.id,
+                    runAlongsideOtherSessions: runAlongside,
+                    committedRevision: revision
+                )
+                XCTAssertEqual(result, .blocked(expected), "\(label), runAlongside \(runAlongside)")
+                await drainTasks()
+                XCTAssertTrue(scheduledHost.dispatches.isEmpty, "\(label): the recovery gate holds, Run alongside included")
+                XCTAssertEqual(coordinator.disposition(scheduleID: record.id), .blocked(expected), label)
+                XCTAssertEqual(coordinator.recoveryBlocker(scheduleID: record.id), expected, label)
+            }
+            XCTAssertEqual(changes.value, 1, "\(label): one change notification while the blocker is unchanged")
+
+            // The same blocker on every evaluation (Dismiss changes nothing the gate reads).
+            coordinator.recordDidChange()
+            await drainTasks()
+            XCTAssertTrue(scheduledHost.dispatches.isEmpty, label)
+
+            // It stopped (or the restriction's resolution) clears the blocker.
+            recoveryHost.recoveryBlockers = [:]
+            coordinator.recordDidChange()
+            await drainTasks()
+            XCTAssertEqual(scheduledHost.dispatches.map(\.scheduleID), [record.id], label)
+            XCTAssertEqual(scheduledHost.dispatches.first?.lease.allowsNeedsConfirmation, true, "\(label): the recorded consent")
+            XCTAssertEqual(scheduledHost.dispatches.first?.lease.runAlongsideOtherSessions, true, label)
+            XCTAssertNil(coordinator.recoveryBlocker(scheduleID: record.id), label)
+            XCTAssertEqual(changes.value, 2, "\(label): the cleared blocker is announced")
+            coordinator.recordDidChange()
+            await drainTasks()
+            XCTAssertEqual(scheduledHost.dispatches.count, 1, "\(label): exactly once")
+        }
+    }
+
+    /// Lossless restart F2: a schedule held by its own session's unresolved recovery (here a
+    /// workspace restriction) reports `blocked` with the destination flagged.
+    func testOwnSessionUnresolvedRecoveryReportsBlockedDisposition() async {
+        let start = Date(timeIntervalSince1970: 68000)
+        let clock = FakeScheduledSendClock(now: start)
+        let coordinator = AgentScheduledSendCoordinator(clock: clock.clock)
+        let workspaceID = UUID()
+        let host = FakeScheduledSendHost()
+        host.recoveryBlockers[workspaceID] = AgentScheduledSendRecoveryBlocker(workspaceRestriction: "unreadable")
+        let record = makeRecord(createdAt: start, notBefore: start.addingTimeInterval(5))
+        let tabID = host.addScheduledSession(
+            workspaceID: workspaceID,
+            record: record,
+            busyState: AgentScheduledSendBusyState(hasUnresolvedRecovery: true)
+        )
+        coordinator.register(host)
+        clock.advance(to: record.notBefore)
+        await drainTasks()
+        XCTAssertTrue(host.dispatches.isEmpty)
+        XCTAssertEqual(
+            coordinator.recoveryBlocker(scheduleID: record.id),
+            AgentScheduledSendRecoveryBlocker(workspaceRestriction: "unreadable", destinationUnresolved: true)
+        )
+
+        host.recoveryBlockers = [:]
+        host.setBusyState(AgentScheduledSendBusyState(), tabID: tabID)
+        coordinator.recordDidChange()
+        await drainTasks()
+        XCTAssertEqual(host.dispatches.map(\.scheduleID), [record.id])
+        XCTAssertEqual(coordinator.disposition(scheduleID: record.id), .progressing)
+    }
+
+    /// Lossless restart F2: every early return of `confirmAndSendNow` reports its reason.
+    func testConfirmAndSendNowReportsEveryRefusalWithoutInstallingConsent() async {
+        let launch = Date(timeIntervalSince1970: 69000)
+        let clock = FakeScheduledSendClock(now: launch)
+        let coordinator = AgentScheduledSendCoordinator(clock: clock.clock, startupAdmission: .awaitingRecovery)
+        let host = FakeScheduledSendHost()
+        let future = makeRecord(createdAt: launch, notBefore: launch.addingTimeInterval(600))
+        host.addScheduledSession(record: future)
+        coordinator.register(host)
+
+        XCTAssertEqual(
+            coordinator.confirmAndSendNow(scheduleID: future.id),
+            .rejected(.startupAdmissionClosed(.awaitingRecovery))
+        )
+        coordinator.failStartupAdmission("reconciliation failed")
+        XCTAssertEqual(
+            coordinator.confirmAndSendNow(scheduleID: future.id),
+            .rejected(.startupAdmissionClosed(.recoveryFailed("reconciliation failed")))
+        )
+        coordinator.openStartupAdmission()
+        await drainTasks()
+        XCTAssertTrue(host.dispatches.isEmpty, "Refused consent was never installed")
+
+        let hold = AgentScheduledSendTransferHold(
+            sessionID: UUID(),
+            scheduleID: future.id,
+            scheduleAttemptID: UUID(),
+            reason: .awaitingRecovery
+        )
+        coordinator.holdTransfer(hold)
+        XCTAssertEqual(coordinator.confirmAndSendNow(scheduleID: future.id), .rejected(.transferHeld))
+        coordinator.releaseTransferHold(scheduleID: future.id, scheduleAttemptID: hold.scheduleAttemptID)
+        await drainTasks()
+        XCTAssertTrue(host.dispatches.isEmpty)
+
+        // An overdue-at-launch record gets a confirmation obligation whose save is still in flight.
+        host.holdMutations = true
+        let overdue = makeRecord(createdAt: launch.addingTimeInterval(-120), notBefore: launch.addingTimeInterval(-60))
+        host.addScheduledSession(record: overdue)
+        coordinator.recordDidChange()
+        await drainTasks()
+        XCTAssertNotNil(coordinator.pendingConfirmationStatus(scheduleID: overdue.id))
+        XCTAssertEqual(coordinator.confirmAndSendNow(scheduleID: overdue.id), .rejected(.confirmationPending))
+        XCTAssertEqual(coordinator.disposition(scheduleID: overdue.id), .rejected(.confirmationPending))
+
+        XCTAssertEqual(coordinator.confirmAndSendNow(scheduleID: UUID()), .rejected(.scheduleNotFound))
+
+        XCTAssertEqual(coordinator.confirmAndSendNow(scheduleID: future.id), .progressing)
+        await drainTasks()
+        XCTAssertEqual(host.dispatches.map(\.scheduleID), [future.id], "An accepted Send now still dispatches")
+        host.holdMutations = false
+        host.releaseHeldMutation(with: nil)
+        await drainTasks()
+    }
+
     private func makeRecord(
         id: UUID = UUID(),
         createdAt: Date,
@@ -2529,6 +2693,8 @@ private final class FakeScheduledSendHost: AgentScheduledSendCoordinatorHost {
     var suppressCandidatesWhileDispatching = false
     /// Workspaces in which this host reports unresolved lossless-restart recovery.
     var unresolvedRecoveryWorkspaceIDs: Set<UUID> = []
+    /// Itemized lossless-restart recovery this host reports per workspace (F2).
+    var recoveryBlockers: [UUID: AgentScheduledSendRecoveryBlocker] = [:]
     var automaticOutcome: ScheduledDispatchOutcome = .accepted
     var hydrationSucceeds = true
     /// When set, `ensureHydrated` suspends until `releaseHeldHydrations()`.
@@ -2640,8 +2806,14 @@ private final class FakeScheduledSendHost: AgentScheduledSendCoordinatorHost {
         }
     }
 
-    func hasUnresolvedRecoverySession(inWorkspace workspaceID: UUID, excluding _: UUID) -> Bool {
-        unresolvedRecoveryWorkspaceIDs.contains(workspaceID)
+    func scheduledSendRecoveryBlocker(
+        inWorkspace workspaceID: UUID,
+        excluding _: UUID
+    ) -> AgentScheduledSendRecoveryBlocker? {
+        if let blocker = recoveryBlockers[workspaceID] { return blocker }
+        return unresolvedRecoveryWorkspaceIDs.contains(workspaceID)
+            ? AgentScheduledSendRecoveryBlocker(unattributed: true)
+            : nil
     }
 
     func scheduledSendBusyStateExcludingDispatchReservation(

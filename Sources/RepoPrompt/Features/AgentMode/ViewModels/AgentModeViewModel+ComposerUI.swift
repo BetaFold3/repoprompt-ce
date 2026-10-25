@@ -68,7 +68,8 @@ extension AgentModeViewModel {
                     recoveryPhase: session.scheduledSendPendingFinalization?.status,
                     pendingConfirmation: session.activeAgentSessionID.flatMap { sessionID in
                         scheduledSendCoordinator?.pendingConfirmationStatus(sessionID: sessionID)
-                    }.flatMap { $0.scheduleID == record.id ? $0 : nil }
+                    }.flatMap { $0.scheduleID == record.id ? $0 : nil },
+                    recoveryBlocker: scheduledSendCoordinator?.recoveryBlocker(scheduleID: record.id)
                 )
             }
         }

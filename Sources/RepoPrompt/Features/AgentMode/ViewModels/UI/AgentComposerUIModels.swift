@@ -183,6 +183,9 @@ struct AgentScheduledSendProps: Equatable, Identifiable {
     /// been acknowledged yet. Automatic sending is paused; the banner presents the confirmation
     /// state derived from the decision rather than from the persisted record.
     let pendingConfirmationSaving: PendingConfirmationSaving?
+    /// What unresolved recovery this schedule waits for (lossless restart F2): the scheduler's
+    /// recorded blocker, so Send now never looks like it silently did nothing.
+    let recoveryBlockedMessage: String?
 
     enum PendingConfirmationSaving: Equatable {
         case saving
@@ -194,9 +197,13 @@ struct AgentScheduledSendProps: Equatable, Identifiable {
         scheduledSend: AgentScheduledSendPersist,
         blockingSessionName: String? = nil,
         recoveryPhase: AgentScheduledSendRecoveryPhase? = nil,
-        pendingConfirmation: AgentScheduledSendPendingConfirmationStatus? = nil
+        pendingConfirmation: AgentScheduledSendPendingConfirmationStatus? = nil,
+        recoveryBlocker: AgentScheduledSendRecoveryBlocker? = nil
     ) {
         id = scheduledSend.id
+        recoveryBlockedMessage = scheduledSend.state == .dispatching
+            ? nil
+            : recoveryBlocker.map(Self.recoveryBlockedMessage(for:))
         self.tabID = tabID
         notBefore = scheduledSend.notBefore
         rawText = scheduledSend.rawText
@@ -256,6 +263,41 @@ struct AgentScheduledSendProps: Equatable, Identifiable {
     static let pendingConfirmationAttentionMessage =
         "Automatic sending is paused. Saving the confirmation failed; retry saving or confirm the message yourself."
 
+    /// Plain, short wording for the banner. The first applicable reason wins; counts are other
+    /// sessions in this workspace.
+    static func recoveryBlockedMessage(for blocker: AgentScheduledSendRecoveryBlocker) -> String {
+        func sessions(_ count: Int, _ adjective: String) -> String {
+            count == 1 ? "1 \(adjective) session" : "\(count) \(adjective) sessions"
+        }
+        if blocker.workspaceRestriction != nil {
+            return "Waiting: this workspace couldn't be checked for interrupted work. Restart RepoPrompt to check again."
+        }
+        if blocker.destinationUnresolved {
+            // Own-session causes vary (held transfer, restriction, earlier-launch process, crash
+            // hold); not every one is resolvable from Needs Attention, so no pointer is given.
+            return "Waiting until this session's recovery is resolved."
+        }
+        if !blocker.interruptedSessionIDs.isEmpty {
+            let count = blocker.interruptedSessionIDs.count
+            return "Will send after \(sessions(count, "interrupted")) in this workspace \(count == 1 ? "is" : "are") resolved: choose It stopped (not Dismiss) in Needs Attention…"
+        }
+        if !blocker.restrictedSessionIDs.isEmpty {
+            let count = blocker.restrictedSessionIDs.count
+            return "Will send after \(sessions(count, "unchecked")) in this workspace \(count == 1 ? "is" : "are") resolved. Restart RepoPrompt to check again."
+        }
+        if blocker.recoveryActionInProgress {
+            return "Will send after a recovery action in this workspace finishes."
+        }
+        if blocker.runtimeOwnershipUnresolved {
+            return "Will send after agent processes from an earlier launch are checked. See Needs Attention…"
+        }
+        let others = blocker.otherUnresolvedSessionIDs.count
+        if others > 0 {
+            return "Will send after \(others == 1 ? "1 session" : "\(others) sessions") in this workspace finish\(others == 1 ? "es" : "") recovery. Review Needs Attention…"
+        }
+        return "Will send after interrupted work in this workspace is resolved. Review Needs Attention…"
+    }
+
     private static func acceptedStatus(for phase: AgentScheduledSendRecoveryPhase?) -> Status {
         switch phase {
         case let .needsAttention(reason)?:
@@ -298,6 +340,7 @@ struct AgentScheduledSendProps: Equatable, Identifiable {
         firstEligibleAt = nil
         status = .unreadable
         pendingConfirmationSaving = nil
+        recoveryBlockedMessage = nil
         recoveryMessage = "This scheduled message was saved by a newer or incompatible version and can't be read here. It will never be sent automatically."
     }
 

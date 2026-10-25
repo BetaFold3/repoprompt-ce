@@ -651,6 +651,8 @@ final class AgentModeViewModel: ObservableObject {
     var scheduledSendRecoveryObserver: AnyCancellable?
     var scheduledSendDeletionObserver: AnyCancellable?
     var scheduledSendPendingConfirmationObserver: AnyCancellable?
+    /// Refreshes the schedule banner when its recorded recovery blocker changes (lossless restart F2).
+    var scheduledSendDispositionObserver: AnyCancellable?
     var scheduledSendDeliveryEvidenceObserver: AnyCancellable?
     /// F-10: retries projected transfers once startup admission opens (for example after Retry).
     var scheduledSendStartupAdmissionObserver: AnyCancellable?

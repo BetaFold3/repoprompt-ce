@@ -394,7 +394,14 @@ package struct AgentRecoveryRestrictions: Equatable {
     /// itself is unresolved: the workspace-busy extension for closed sessions.
     package func hasUnresolvedSession(inWorkspace workspaceID: UUID, excluding sessionID: UUID) -> Bool {
         if workspaces[workspaceID] != nil { return true }
-        return sessions.contains { $0.key != sessionID && $0.value.workspaceID == workspaceID }
+        return !restrictedSessionIDs(inWorkspace: workspaceID, excluding: sessionID).isEmpty
+    }
+
+    /// The restricted sessions other than `sessionID` (open or closed) in `workspaceID`.
+    package func restrictedSessionIDs(inWorkspace workspaceID: UUID, excluding sessionID: UUID) -> Set<UUID> {
+        Set(sessions.compactMap { entry in
+            entry.key != sessionID && entry.value.workspaceID == workspaceID ? entry.key : nil
+        })
     }
 
     package mutating func restrict(sessionID: UUID, workspaceID: UUID?, reason: String) {
@@ -418,6 +425,31 @@ package struct AgentRecoveryRestrictions: Equatable {
             }
         }
         return restrictions
+    }
+}
+
+/// The unresolved sessions of one workspace that keep new-session starts paused
+/// (`AgentRecoveryCoordinator.hasUnresolvedSession`), itemized for presentation.
+package struct AgentRecoveryWorkspaceUnresolvedSummary: Equatable {
+    /// Sessions with an unconfirmed crash hold.
+    package var crashHeldSessionIDs: Set<UUID> = []
+    /// Sessions restricted by startup results.
+    package var restrictedSessionIDs: Set<UUID> = []
+    /// The workspace's own restriction (it could not be read for recovery).
+    package var workspaceRestriction: String?
+
+    package init(
+        crashHeldSessionIDs: Set<UUID> = [],
+        restrictedSessionIDs: Set<UUID> = [],
+        workspaceRestriction: String? = nil
+    ) {
+        self.crashHeldSessionIDs = crashHeldSessionIDs
+        self.restrictedSessionIDs = restrictedSessionIDs
+        self.workspaceRestriction = workspaceRestriction
+    }
+
+    package var isEmpty: Bool {
+        crashHeldSessionIDs.isEmpty && restrictedSessionIDs.isEmpty && workspaceRestriction == nil
     }
 }
 

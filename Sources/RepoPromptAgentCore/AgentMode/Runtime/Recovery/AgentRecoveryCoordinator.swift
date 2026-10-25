@@ -1471,14 +1471,26 @@ package final class AgentRecoveryCoordinator {
     /// Whether a restricted or crash-held session other than `sessionID` (open or closed), or the
     /// workspace itself, is unresolved in `workspaceID`: the scheduler's workspace-busy extension.
     package func hasUnresolvedSession(inWorkspace workspaceID: UUID, excluding sessionID: UUID) -> Bool {
-        if restrictions.hasUnresolvedSession(inWorkspace: workspaceID, excluding: sessionID) {
-            return true
-        }
-        return crashHolds.values.contains { hold in
-            hold.sessionID != sessionID
-                && confirmedCrashHolds[hold.sessionID] != hold
-                && reconciliation.resolution(for: hold.sessionID)?.workspaceID == workspaceID
-        }
+        !unresolvedSessionSummary(inWorkspace: workspaceID, excluding: sessionID).isEmpty
+    }
+
+    /// What `hasUnresolvedSession` found, for presentation (lossless restart F2): the sessions with
+    /// an unconfirmed crash hold (lifted only by It stopped for that exact hold; Dismiss lifts
+    /// nothing), the restricted sessions, and the workspace's own restriction.
+    package func unresolvedSessionSummary(
+        inWorkspace workspaceID: UUID,
+        excluding sessionID: UUID
+    ) -> AgentRecoveryWorkspaceUnresolvedSummary {
+        AgentRecoveryWorkspaceUnresolvedSummary(
+            crashHeldSessionIDs: Set(crashHolds.values.compactMap { hold in
+                hold.sessionID != sessionID
+                    && confirmedCrashHolds[hold.sessionID] != hold
+                    && reconciliation.resolution(for: hold.sessionID)?.workspaceID == workspaceID
+                    ? hold.sessionID : nil
+            }),
+            restrictedSessionIDs: restrictions.restrictedSessionIDs(inWorkspace: workspaceID, excluding: sessionID),
+            workspaceRestriction: restrictions.workspaceRestriction(workspaceID)
+        )
     }
 
     /// Lifts a session's held-transfer restriction after its owner resolved the schedule transfer.

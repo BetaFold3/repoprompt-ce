@@ -413,14 +413,22 @@ final class AgentRecoveryCoordinatorTests: XCTestCase {
             uncertainIntentIDs: hold.uncertainIntentIDs,
             previousExitProvenClean: false
         )
+        XCTAssertEqual(
+            coordinator.unresolvedSessionSummary(inWorkspace: workspace.id, excluding: UUID()),
+            AgentRecoveryWorkspaceUnresolvedSummary(crashHeldSessionIDs: [load.session.id]),
+            "F2: the scheduler's new-session gate is itemized as one interrupted session"
+        )
         let staleConfirmed = await coordinator.confirmCrashHold(stale, lane: lane)
         XCTAssertFalse(staleConfirmed, "confirmation binds the exact uncertain attempts")
         XCTAssertNotNil(coordinator.blockingCrashHold(for: lane.binding))
+        XCTAssertTrue(coordinator.hasUnresolvedSession(inWorkspace: workspace.id, excluding: UUID()))
         let staleRecord = await store.read(sessionID: load.session.id).record
         XCTAssertNil(staleRecord?.crashHoldAcknowledgement, "A stale confirmation writes nothing")
         let holdConfirmed = await coordinator.confirmCrashHold(hold, lane: lane)
         XCTAssertTrue(holdConfirmed)
         XCTAssertNil(coordinator.blockingCrashHold(for: lane.binding))
+        XCTAssertTrue(coordinator.unresolvedSessionSummary(inWorkspace: workspace.id, excluding: UUID()).isEmpty)
+        XCTAssertFalse(coordinator.hasUnresolvedSession(inWorkspace: workspace.id, excluding: UUID()))
         // F-2: the acknowledgement is durable and exact.
         let acknowledgedRead = await store.read(sessionID: load.session.id)
         let acknowledged = try XCTUnwrap(acknowledgedRead.record)

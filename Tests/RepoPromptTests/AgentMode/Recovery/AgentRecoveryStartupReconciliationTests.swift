@@ -124,6 +124,8 @@ final class AgentRecoveryStartupReconciliationTests: XCTestCase {
         XCTAssertTrue(restrictions.blocks(sessionID: UUID(), workspaceID: unreadable.id))
         XCTAssertFalse(restrictions.blocks(sessionID: idle.session.id, workspaceID: unrelated.id), "An unrelated workspace stays eligible")
         XCTAssertFalse(restrictions.hasUnresolvedSession(inWorkspace: unrelated.id, excluding: UUID()))
+        XCTAssertTrue(restrictions.hasUnresolvedSession(inWorkspace: unreadable.id, excluding: UUID()), "A workspace restriction blocks its workspace")
+        XCTAssertTrue(restrictions.restrictedSessionIDs(inWorkspace: unrelated.id, excluding: UUID()).isEmpty)
     }
 
     // MARK: - Pre-normalization stamp and accepted bubbles
@@ -965,6 +967,12 @@ final class AgentRecoveryStartupReconciliationTests: XCTestCase {
             "The closed session keeps its workspace busy for scheduling"
         )
         XCTAssertFalse(coordinator.hasUnresolvedSession(inWorkspace: home.id, excluding: load.session.id))
+        // F2: the itemized summary names the same restricted session.
+        XCTAssertEqual(
+            coordinator.unresolvedSessionSummary(inWorkspace: home.id, excluding: UUID()),
+            AgentRecoveryWorkspaceUnresolvedSummary(restrictedSessionIDs: [load.session.id])
+        )
+        XCTAssertTrue(coordinator.unresolvedSessionSummary(inWorkspace: home.id, excluding: load.session.id).isEmpty)
     }
 
     // MARK: - Crash-hold matrix

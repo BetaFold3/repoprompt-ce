@@ -333,6 +333,18 @@ final class AgentRecoveryStartupCompositionTests: XCTestCase {
         let dismissed = await Support.eventually { coordinator.catalog.item(id: crash.id)?.isDismissed == true }
         XCTAssertTrue(dismissed, String(describing: coordinator.catalogActionStates[crash.id]))
         XCTAssertEqual(coordinator.catalog.blockers[held.session.id], .crashHold, "Dismiss lifts nothing")
+        // F2: the new-session gate and its itemized reason still name the dismissed crash hold.
+        let heldWorkspaceID = fixture.workspace.id
+        XCTAssertTrue(viewModel.hasUnresolvedRecoverySession(inWorkspace: heldWorkspaceID, excluding: UUID()))
+        XCTAssertEqual(
+            coordinator.unresolvedSessionSummary(inWorkspace: heldWorkspaceID, excluding: UUID()).crashHeldSessionIDs,
+            [held.session.id]
+        )
+        XCTAssertTrue(
+            viewModel.scheduledSendRecoveryBlocker(inWorkspace: heldWorkspaceID, excluding: UUID())?
+                .interruptedSessionIDs.contains(held.session.id) == true,
+            "Dismiss does not clear the new-session gate"
+        )
         let pausedRowID = "\(AgentModeViewModel.recoveryListPausedRowPrefix)\(held.session.id.uuidString)"
         let paused = try XCTUnwrap(viewModel.recoveryListProps(forActiveSession: session)?.rows.first { $0.id == pausedRowID })
         XCTAssertTrue(paused.actions.contains(.confirmStopped))
@@ -341,8 +353,136 @@ final class AgentRecoveryStartupCompositionTests: XCTestCase {
         XCTAssertNil(coordinator.catalogActionStates[pausedRowID], "It stopped resolves the hold's session from the catalog")
         let lifted = await Support.eventually { coordinator.catalog.blockers[held.session.id] == nil }
         XCTAssertTrue(lifted)
+        XCTAssertTrue(
+            coordinator.unresolvedSessionSummary(inWorkspace: heldWorkspaceID, excluding: UUID()).crashHeldSessionIDs.isEmpty,
+            "It stopped clears the crash hold behind the new-session gate"
+        )
+        XCTAssertFalse(
+            viewModel.scheduledSendRecoveryBlocker(inWorkspace: heldWorkspaceID, excluding: UUID())?
+                .interruptedSessionIDs.contains(held.session.id) ?? false
+        )
         let acknowledgement = await now.store.read(sessionID: held.session.id).record?.crashHoldAcknowledgement
         XCTAssertNotNil(acknowledgement)
+    }
+
+    /// Lossless restart F2 / review B F2-R7, real host end to end: a real startup crash hold blocks
+    /// an overdue-style new-session Send now (Run alongside included), the banner names the fix,
+    /// Dismiss changes nothing, and It stopped on that exact hold sends the consented message once.
+    func testCrashHoldBlocksNewSessionSendNowUntilItStoppedThenDispatchesOnce() async throws {
+        let fixture = try makeFixture()
+        let heldTabID = UUID()
+
+        // Earlier launch (no clean exit): a run was in flight in this workspace's session.
+        let earlier = makeLaunch(fixture)
+        let earlierStore = earlier.store
+        let held = try await makeSession(earlier, fixture: fixture, composeTabID: heldTabID)
+        let heldOwnership = Support.ownership(sessionID: held.session.id)
+        let heldGate = try earlier.service.recoveryLifecycleGate(for: held.persistenceState)
+        let heldBinding = heldGate.binding
+        try await heldGate.performRecoveryTransaction {
+            _ = try await earlierStore.ensureRunAttempt(
+                binding: heldBinding,
+                expectedRevision: earlierStore.currentRevision(sessionID: heldBinding.sessionID),
+                ownership: heldOwnership,
+                processRunID: nil,
+                transcriptTurnID: nil
+            )
+            _ = try await earlierStore.commitDispatchingIntent(
+                binding: heldBinding,
+                expectedRevision: earlierStore.currentRevision(sessionID: heldBinding.sessionID),
+                submission: Support.submission("in flight at crash"),
+                attempt: AgentRecoveryAttemptStart(attemptID: UUID(), runAttemptID: heldOwnership.attemptID),
+                consumption: nil
+            )
+        }
+
+        // This launch: the real composition, store, coordinator, and scheduler.
+        let now = makeLaunch(fixture)
+        let scheduler = AgentScheduledSendCoordinator(startupAdmission: .awaitingRecovery)
+        let destinations = [fixture.destination]
+        let composition = AgentRecoveryAppComposition(
+            store: now.store,
+            dataService: now.service,
+            scheduler: scheduler,
+            loadInventory: { AgentRecoveryWorkspaceInventory(workspaces: destinations) }
+        )
+        let viewModel = makeViewModel(windowID: 4812, fixture: fixture)
+        viewModel.test_initializeRunService()
+        composition.install(into: viewModel)
+        viewModel.attachScheduledSendCoordinator(scheduler)
+        await composition.startupCompletion?.value
+        let coordinator = try XCTUnwrap(composition.coordinator)
+        XCTAssertTrue(scheduler.isStartupAdmissionOpen)
+        viewModel.test_establishPersistenceWorkspace(fixture.workspace)
+
+        viewModel.test_setCurrentTabIDOverride(heldTabID)
+        let heldTab = try await viewModel.ensureSessionReady(tabID: heldTabID)
+        if heldTab.activeAgentSessionID != held.session.id {
+            XCTAssertNotNil(viewModel.test_installPersistentSessionBinding(sessionID: held.session.id, on: heldTab))
+            _ = await viewModel.test_hydrateBoundSession(tabID: heldTabID)
+        }
+        let heldLaneClaimed = await Support.eventually { heldTab.recoveryLane != nil }
+        XCTAssertTrue(heldLaneClaimed)
+        XCTAssertNotNil(coordinator.crashHold(for: held.session.id))
+
+        // Another tab in the same workspace schedules a new-session start.
+        let scheduledTabID = UUID()
+        let scheduledTab = try await viewModel.ensureSessionReady(tabID: scheduledTabID)
+        scheduledTab.appendItem(.user("Earlier turn"))
+        let saved = await viewModel.flushSave(for: scheduledTabID)
+        XCTAssertTrue(saved)
+        XCTAssertNotNil(scheduledTab.recoveryLane, "The first save claims the scheduled session's lane")
+        final class Starts {
+            var count = 0
+        }
+        let starts = Starts()
+        viewModel.scheduledDispatchRunStarter = { [starts] _, _, _, _ in
+            starts.count += 1
+            return .stale(reason: "test starter")
+        }
+        let scheduleID = try await viewModel.installScheduledSend(
+            text: "Start after the interrupted session",
+            on: scheduledTab,
+            notBefore: Date().addingTimeInterval(3600),
+            runAlongsideOtherSessions: false,
+            isNewSessionStart: true
+        ).get()
+
+        let message = await viewModel.sendScheduledSendNow(
+            tabID: scheduledTabID,
+            scheduleID: scheduleID,
+            runAlongsideOtherSessions: true
+        )
+        XCTAssertNil(message, "Consent is recorded; the blocker is shown in the banner")
+        let blocked = await Support.eventually {
+            scheduler.recoveryBlocker(scheduleID: scheduleID)?.interruptedSessionIDs == [held.session.id]
+        }
+        XCTAssertTrue(blocked, "\(scheduler.disposition(scheduleID: scheduleID))")
+        let expectedBanner =
+            "Will send after 1 interrupted session in this workspace is resolved: choose It stopped (not Dismiss) in Needs Attention…"
+        XCTAssertEqual(viewModel.makeComposerProps(tabID: scheduledTabID).scheduledSend?.recoveryBlockedMessage, expectedBanner)
+        XCTAssertEqual(starts.count, 0, "Run alongside never bypasses the recovery gate")
+
+        // Dismiss lifts nothing.
+        let crash = try XCTUnwrap(coordinator.catalog.items.first { $0.sessionID == held.session.id && $0.kind == .crashHold })
+        await viewModel.performRecoveryListAction(rowID: crash.id, action: .dismiss)
+        let dismissed = await Support.eventually { coordinator.catalog.item(id: crash.id)?.isDismissed == true }
+        XCTAssertTrue(dismissed)
+        scheduler.recordDidChange()
+        try? await Task.sleep(nanoseconds: 100_000_000)
+        XCTAssertEqual(starts.count, 0, "Dismiss does not release the schedule")
+        XCTAssertEqual(viewModel.makeComposerProps(tabID: scheduledTabID).scheduledSend?.recoveryBlockedMessage, expectedBanner)
+
+        // It stopped on that exact hold: the consented message is sent once.
+        let pausedRowID = "\(AgentModeViewModel.recoveryListPausedRowPrefix)\(held.session.id.uuidString)"
+        await viewModel.performRecoveryListAction(rowID: pausedRowID, action: .confirmStopped)
+        XCTAssertNil(coordinator.catalogActionStates[pausedRowID])
+        let sent = await Support.eventually { starts.count == 1 }
+        XCTAssertTrue(sent, "\(scheduler.disposition(scheduleID: scheduleID))")
+        XCTAssertNil(scheduler.recoveryBlocker(scheduleID: scheduleID))
+        scheduler.recordDidChange()
+        try? await Task.sleep(nanoseconds: 200_000_000)
+        XCTAssertEqual(starts.count, 1, "Exactly one dispatch")
     }
 
     /// Review A F09: recorded outcomes are worded without unsupported timing claims, and a failed or

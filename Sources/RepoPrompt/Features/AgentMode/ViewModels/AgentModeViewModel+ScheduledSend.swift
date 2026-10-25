@@ -139,6 +139,15 @@ extension AgentModeViewModel {
                     syncComposerUIState(tabID: session.tabID)
                 }
             }
+        scheduledSendDispositionObserver = NotificationCenter.default
+            .publisher(for: .agentScheduledSendDispositionDidChange, object: coordinator)
+            .receive(on: RunLoop.main)
+            .sink { [weak self] notification in
+                guard let self, let sessionID = notification.userInfo?["sessionID"] as? UUID else { return }
+                for session in sessions.values where session.activeAgentSessionID == sessionID {
+                    syncComposerUIState(tabID: session.tabID)
+                }
+            }
         scheduledSendDeletionObserver = NotificationCenter.default.publisher(for: .agentSessionDeletionDidCommit)
             .receive(on: RunLoop.main)
             .sink { [weak self] notification in
@@ -190,6 +199,8 @@ extension AgentModeViewModel {
         scheduledSendDeletionObserver = nil
         scheduledSendPendingConfirmationObserver?.cancel()
         scheduledSendPendingConfirmationObserver = nil
+        scheduledSendDispositionObserver?.cancel()
+        scheduledSendDispositionObserver = nil
         scheduledSendDeliveryEvidenceObserver?.cancel()
         scheduledSendDeliveryEvidenceObserver = nil
         scheduledSendStartupAdmissionObserver?.cancel()
@@ -955,13 +966,35 @@ extension AgentModeViewModel {
                 syncComposerUIState(tabID: tabID)
                 return Self.scheduledSendConfirmationChangedMessage
             }
-            coordinator.confirmAndSendNow(
+            let disposition = coordinator.confirmAndSendNow(
                 scheduleID: scheduleID,
                 runAlongsideOtherSessions: runAlongsideOtherSessions,
                 committedRevision: committedRevision
             )
             syncComposerUIState(tabID: tabID)
-            return nil
+            switch disposition {
+            case let .rejected(refusal):
+                return Self.scheduledSendNowRefusalMessage(refusal)
+            case .blocked, .progressing:
+                // Consent is recorded; a recovery blocker is shown persistently in the banner.
+                return nil
+            }
+        }
+    }
+
+    /// User-facing text for a Send now that installed no consent (one per scheduler early return).
+    static func scheduledSendNowRefusalMessage(_ refusal: AgentScheduledSendNowRefusal) -> String {
+        switch refusal {
+        case .startupAdmissionClosed(.recoveryFailed):
+            "Scheduled sending is paused because the recovery check failed. Retry it, then try Send now again."
+        case .startupAdmissionClosed:
+            "RepoPrompt is still checking for interrupted work. Try Send now again in a moment."
+        case .transferHeld:
+            "The last send of this message is still being checked. It won't be sent again until that finishes."
+        case .confirmationPending:
+            scheduledSendConfirmationChangedMessage
+        case .scheduleNotFound:
+            "The scheduler can't see this message right now. Please try again."
         }
     }
 
@@ -2635,23 +2668,40 @@ extension AgentModeViewModel: AgentScheduledSendCoordinatorHost {
         }
     }
 
-    func hasUnresolvedRecoverySession(inWorkspace workspaceID: UUID, excluding sessionID: UUID) -> Bool {
-        // App-scoped startup results cover closed sessions too (every window shares the coordinator).
-        if recoveryCoordinator?.hasUnresolvedSession(inWorkspace: workspaceID, excluding: sessionID) == true {
-            return true
+    /// The single predicate behind `hasUnresolvedRecoverySession`, itemized so the schedule banner
+    /// can say what a new-session start waits for (lossless restart F2).
+    func scheduledSendRecoveryBlocker(
+        inWorkspace workspaceID: UUID,
+        excluding sessionID: UUID
+    ) -> AgentScheduledSendRecoveryBlocker? {
+        var blocker = AgentScheduledSendRecoveryBlocker()
+        if let recoveryCoordinator {
+            // App-scoped startup results cover closed sessions too (every window shares the coordinator).
+            let summary = recoveryCoordinator.unresolvedSessionSummary(inWorkspace: workspaceID, excluding: sessionID)
+            blocker.interruptedSessionIDs = summary.crashHeldSessionIDs
+            blocker.restrictedSessionIDs = summary.restrictedSessionIDs
+            blocker.workspaceRestriction = summary.workspaceRestriction
+            // Review A P1-01: an explicit recovery action held anywhere in this workspace (any window).
+            blocker.recoveryActionInProgress = recoveryCoordinator.hasRecoveryAction(inWorkspace: workspaceID, excluding: sessionID)
         }
-        // Review A P1-01: an explicit recovery action held anywhere in this workspace (any window).
-        if recoveryCoordinator?.hasRecoveryAction(inWorkspace: workspaceID, excluding: sessionID) == true {
-            return true
+        if persistenceWorkspace?.id == workspaceID {
+            // R6: a surviving runtime on this workspace's worktree keeps new-session starts paused.
+            blocker.runtimeOwnershipUnresolved = recoveryCoordinator?.runtimeBlocksAutomaticWork(
+                worktreePath: workspacePathProvider()
+            ) == true
+            // Same membership as the pre-F2 predicate: every other open tab counts, bound or not. An
+            // unbound tab cannot report unresolved recovery today, but would block unattributed.
+            for session in sessions.values
+                where session.activeAgentSessionID != sessionID && scheduledSendHasUnresolvedRecovery(session)
+            {
+                if let openSessionID = session.activeAgentSessionID {
+                    blocker.unresolvedOpenSessionIDs.insert(openSessionID)
+                } else {
+                    blocker.unattributed = true
+                }
+            }
         }
-        guard persistenceWorkspace?.id == workspaceID else { return false }
-        // R6: a surviving runtime on this workspace's worktree keeps new-session starts paused.
-        if recoveryCoordinator?.runtimeBlocksAutomaticWork(worktreePath: workspacePathProvider()) == true {
-            return true
-        }
-        return sessions.values.contains { session in
-            session.activeAgentSessionID != sessionID && scheduledSendHasUnresolvedRecovery(session)
-        }
+        return blocker.isBlocking ? blocker : nil
     }
 
     func hasBusySession(inWorkspace workspaceID: UUID, excluding sessionID: UUID) -> Bool {
