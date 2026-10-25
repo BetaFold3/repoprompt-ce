@@ -2345,16 +2345,22 @@ struct AgentComposerView: View, Equatable {
         runAlongsideOtherSessions: Bool
     ) {
         guard !submissionLatch.isLatched(for: currentTabID) else {
-            logViewSubmitRejection(reason: "local_attempt_latched", target: renderedSubmitTarget)
+            logViewSubmitRejection(reason: "local_attempt_latched", target: renderedSubmitTarget, persistent: true)
             return
         }
-        guard canScheduleToRenderedTarget else { return }
+        guard canScheduleToRenderedTarget else {
+            logViewSubmitRejection(reason: "schedule_unavailable_for_rendered_target", target: renderedSubmitTarget, persistent: true)
+            return
+        }
 
         let rawDraftSnapshot = localInputText
         let trimmed = rawDraftSnapshot.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty || hasPendingAttachments else { return }
+        guard !trimmed.isEmpty || hasPendingAttachments else {
+            logViewSubmitRejection(reason: "empty_draft", target: renderedSubmitTarget, persistent: true)
+            return
+        }
         guard let submitTarget = renderedSubmitTarget else {
-            logViewSubmitRejection(reason: "view_nil_target", target: props.submitTarget)
+            logViewSubmitRejection(reason: "view_nil_target", target: props.submitTarget, persistent: true)
             showSteeringUnsupportedNotice(Self.staleSubmitTargetMessage)
             return
         }
@@ -2362,7 +2368,7 @@ struct AgentComposerView: View, Equatable {
             target: submitTarget,
             rawDraftSnapshot: rawDraftSnapshot
         ) else {
-            logViewSubmitRejection(reason: "local_attempt_latched", target: submitTarget)
+            logViewSubmitRejection(reason: "local_attempt_latched", target: submitTarget, persistent: true)
             return
         }
 
@@ -2391,11 +2397,14 @@ struct AgentComposerView: View, Equatable {
                     resetTextFieldTrigger.toggle()
                 }
                 if let blockedMessage = effects.blockedMessage {
+                    // The reason only: the message can carry error descriptions.
+                    logViewSubmitRejection(reason: "schedule_completion_blocked", target: attempt.target, persistent: true)
                     showSteeringUnsupportedNotice(blockedMessage)
                 }
             }
         case let .rejected(rejection):
             submissionLatch.cancel(attempt)
+            logViewSubmitRejection(reason: "schedule_claim_\(rejection.diagnosticReason)", target: submitTarget, persistent: true)
             if case .activeAttemptExists = rejection {
                 return
             }
@@ -2405,10 +2414,15 @@ struct AgentComposerView: View, Equatable {
 
     private func sendMessage() {
         guard !submissionLatch.isLatched(for: currentTabID) else {
-            logViewSubmitRejection(reason: "local_attempt_latched", target: renderedSubmitTarget)
+            logViewSubmitRejection(reason: "local_attempt_latched", target: renderedSubmitTarget, persistent: true)
             return
         }
         guard props.canSendWithCurrentProvider else {
+            logViewSubmitRejection(
+                reason: props.hasAvailableAgentProviders ? "selected_provider_unavailable" : "no_agent_providers",
+                target: renderedSubmitTarget,
+                persistent: true
+            )
             if props.hasAvailableAgentProviders {
                 showSteeringUnsupportedNotice(props.unavailableSelectedAgentMessage ?? "Connect this agent provider in Settings before sending.")
             } else {
@@ -2418,9 +2432,12 @@ struct AgentComposerView: View, Equatable {
         }
         let rawDraftSnapshot = localInputText
         let trimmed = rawDraftSnapshot.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty || hasPendingAttachments else { return }
+        guard !trimmed.isEmpty || hasPendingAttachments else {
+            logViewSubmitRejection(reason: "empty_draft", target: renderedSubmitTarget, persistent: true)
+            return
+        }
         guard let submitTarget = renderedSubmitTarget else {
-            logViewSubmitRejection(reason: "view_nil_target", target: props.submitTarget)
+            logViewSubmitRejection(reason: "view_nil_target", target: props.submitTarget, persistent: true)
             showSteeringUnsupportedNotice(Self.staleSubmitTargetMessage)
             return
         }
@@ -2428,7 +2445,7 @@ struct AgentComposerView: View, Equatable {
             target: submitTarget,
             rawDraftSnapshot: rawDraftSnapshot
         ) else {
-            logViewSubmitRejection(reason: "local_attempt_latched", target: submitTarget)
+            logViewSubmitRejection(reason: "local_attempt_latched", target: submitTarget, persistent: true)
             return
         }
 
@@ -2452,11 +2469,14 @@ struct AgentComposerView: View, Equatable {
                     resetTextFieldTrigger.toggle()
                 }
                 if let blockedMessage = effects.blockedMessage {
+                    // The reason only: the message can carry error descriptions.
+                    logViewSubmitRejection(reason: "completion_blocked", target: attempt.target, persistent: true)
                     showSteeringUnsupportedNotice(blockedMessage)
                 }
             }
         case let .rejected(rejection):
             submissionLatch.cancel(attempt)
+            logViewSubmitRejection(reason: "claim_\(rejection.diagnosticReason)", target: submitTarget, persistent: true)
             if case .activeAttemptExists = rejection {
                 return
             }
@@ -2487,7 +2507,16 @@ struct AgentComposerView: View, Equatable {
         }
     }
 
-    private func logViewSubmitRejection(reason: String, target: AgentComposerSubmitTarget?) {
+    /// `persistent` also writes the reason to the always-on `ComposerSubmit` log.
+    private func logViewSubmitRejection(reason: String, target: AgentComposerSubmitTarget?, persistent: Bool = false) {
+        if persistent {
+            AgentComposerSubmitDiagnostics.viewRejected(
+                reason: reason,
+                currentTabID: currentTabID,
+                propsTabID: props.currentTabID,
+                targetTabID: target?.tabID
+            )
+        }
         #if DEBUG
             AgentModePerfDiagnostics.event(
                 "agent.composer.submit.rejected",

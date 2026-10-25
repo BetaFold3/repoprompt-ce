@@ -15331,6 +15331,7 @@ final class AgentModeViewModel: ObservableObject {
         let target = claim.attempt.target
         let claimedSourceSession = claim.sourceSession
         guard composerSubmitClaimIsCurrent(claim) else {
+            logRejectedSubmitTarget(target, session: sessions[target.tabID], reason: "claim_not_current", persistent: true)
             return .blocked(message: Self.staleComposerSubmitTargetMessage)
         }
         defer {
@@ -15340,14 +15341,17 @@ final class AgentModeViewModel: ObservableObject {
         switch target.route {
         case .existingAgentSession:
             guard let preparedSession = try? await ensureSessionReady(tabID: target.tabID) else {
+                logRejectedSubmitTarget(target, session: sessions[target.tabID], reason: "session_not_ready", persistent: true)
                 return .blocked(message: Self.composeTabRemovalInProgressMessage)
             }
             guard preparedSession === claimedSourceSession,
                   composerSubmitClaimIsCurrent(claim)
             else {
+                logRejectedSubmitTarget(target, session: preparedSession, reason: "prepared_session_or_claim_changed", persistent: true)
                 return .blocked(message: Self.staleComposerSubmitTargetMessage)
             }
             if let blockedMessage = newWorkBlockedMessage(for: preparedSession) {
+                logRejectedSubmitTarget(target, session: preparedSession, reason: "new_work_blocked", persistent: true)
                 return .blocked(message: blockedMessage)
             }
             if let rejectionReason = submitTargetRejectionReason(
@@ -15355,7 +15359,7 @@ final class AgentModeViewModel: ObservableObject {
                 session: preparedSession,
                 validateSubmissionToken: false
             ) {
-                logRejectedSubmitTarget(target, session: preparedSession, reason: rejectionReason)
+                logRejectedSubmitTarget(target, session: preparedSession, reason: rejectionReason, persistent: true)
                 resyncAfterRejectedSubmitTarget(target)
                 return .blocked(message: Self.staleComposerSubmitTargetMessage)
             }
@@ -15395,6 +15399,7 @@ final class AgentModeViewModel: ObservableObject {
                 }
             }
             if let blocked = preflightInitialUserTurn(text: text, session: preparedSession) {
+                logRejectedSubmitTarget(target, session: preparedSession, reason: "initial_turn_preflight_blocked", persistent: true)
                 return blocked
             }
             do {
@@ -15410,12 +15415,13 @@ final class AgentModeViewModel: ObservableObject {
                         && Self.pendingUserTurnState(from: preparedSession) == pendingState
                 }
             } catch {
+                logRejectedSubmitTarget(target, session: sessions[target.tabID], reason: "initial_location_preparation_failed", persistent: true)
                 return .blocked(message: (error as? LocalizedError)?.errorDescription ?? error.localizedDescription)
             }
             guard composerSourceAgentSessionID(tabID: target.tabID, session: preparedSession)
                 == target.expectedSourceAgentSessionID
             else {
-                logRejectedSubmitTarget(target, session: preparedSession, reason: "agent_session_id_mismatch")
+                logRejectedSubmitTarget(target, session: preparedSession, reason: "agent_session_id_mismatch", persistent: true)
                 resyncAfterRejectedSubmitTarget(target)
                 return .blocked(message: Self.staleComposerSubmitTargetMessage)
             }
@@ -15425,9 +15431,11 @@ final class AgentModeViewModel: ObservableObject {
                   sourceSnapshot.matches(sessions[target.tabID]),
                   Self.pendingUserTurnState(from: preparedSession) == pendingState
             else {
+                logRejectedSubmitTarget(target, session: sessions[target.tabID], reason: "state_changed_during_location_preparation", persistent: true)
                 return .blocked(message: Self.staleComposerSubmitTargetMessage)
             }
             if let blocked = preflightInitialUserTurn(text: text, session: preparedSession) {
+                logRejectedSubmitTarget(target, session: preparedSession, reason: "initial_turn_preflight_blocked_after_preparation", persistent: true)
                 return blocked
             }
             preparedSession.pendingInitialStartLocation = .local
@@ -15467,6 +15475,7 @@ final class AgentModeViewModel: ObservableObject {
                             && Self.pendingUserTurnState(from: sourceSession) == pendingState
                     }
                 } catch {
+                    logRejectedSubmitTarget(target, session: sessions[target.tabID], reason: "initial_location_workspace_preflight_failed", persistent: true)
                     return .blocked(message: (error as? LocalizedError)?.errorDescription ?? error.localizedDescription)
                 }
                 sourceSession.isPreparingInitialWorktree = true
@@ -15483,15 +15492,18 @@ final class AgentModeViewModel: ObservableObject {
                 }
             }
             guard let destinationTabID = await createAndActivateSessionTab() else {
+                logRejectedSubmitTarget(target, session: sessions[target.tabID], reason: "first_send_destination_not_created", persistent: true)
                 return .blocked(message: "Failed to create a new agent session.")
             }
             guard !Task.isCancelled,
                   composerSubmitClaimIsCurrent(claim)
             else {
+                logRejectedSubmitTarget(target, session: sessions[target.tabID], reason: "claim_not_current_after_destination_created", persistent: true)
                 await discardFreshFirstSendDestinationIfPossible(destinationTabID)
                 return .blocked(message: Self.staleComposerSubmitTargetMessage)
             }
             guard sessions[target.tabID] === sourceSession else {
+                logRejectedSubmitTarget(target, session: sessions[target.tabID], reason: "source_session_replaced", persistent: true)
                 await discardFreshFirstSendDestinationIfPossible(destinationTabID)
                 return .blocked(message: Self.staleComposerSubmitTargetMessage)
             }
@@ -15500,7 +15512,7 @@ final class AgentModeViewModel: ObservableObject {
                 session: sourceSession,
                 validateSubmissionToken: false
             ) {
-                logRejectedSubmitTarget(target, session: sessions[target.tabID], reason: rejectionReason)
+                logRejectedSubmitTarget(target, session: sessions[target.tabID], reason: rejectionReason, persistent: true)
                 resyncAfterRejectedSubmitTarget(target)
                 await discardFreshFirstSendDestinationIfPossible(destinationTabID)
                 return .blocked(message: Self.staleComposerSubmitTargetMessage)
@@ -15508,13 +15520,13 @@ final class AgentModeViewModel: ObservableObject {
             guard composerSubmitClaimIsCurrent(claim),
                   sourceSnapshot.matches(sessions[target.tabID])
             else {
-                logRejectedSubmitTarget(target, session: sessions[target.tabID], reason: "source_pending_state_changed")
+                logRejectedSubmitTarget(target, session: sessions[target.tabID], reason: "source_pending_state_changed", persistent: true)
                 resyncAfterRejectedSubmitTarget(target)
                 await discardFreshFirstSendDestinationIfPossible(destinationTabID)
                 return .blocked(message: Self.staleComposerSubmitTargetMessage)
             }
             guard destinationTabID != target.tabID else {
-                logRejectedSubmitTarget(target, session: sessions[target.tabID], reason: "invalid_first_send_destination")
+                logRejectedSubmitTarget(target, session: sessions[target.tabID], reason: "invalid_first_send_destination", persistent: true)
                 resyncAfterRejectedSubmitTarget(target)
                 await discardFreshFirstSendDestinationIfPossible(destinationTabID)
                 return .blocked(message: "Failed to create a new agent session.")
@@ -15522,7 +15534,7 @@ final class AgentModeViewModel: ObservableObject {
             guard let destinationSession = session(for: destinationTabID, createIfNeeded: true),
                   isFreshFirstSendDestination(destinationSession)
             else {
-                logRejectedSubmitTarget(target, session: sessions[target.tabID], reason: "invalid_first_send_destination")
+                logRejectedSubmitTarget(target, session: sessions[target.tabID], reason: "invalid_first_send_destination", persistent: true)
                 resyncAfterRejectedSubmitTarget(target)
                 await discardFreshFirstSendDestinationIfPossible(destinationTabID)
                 return .blocked(message: "Failed to create a new agent session.")
@@ -15549,6 +15561,7 @@ final class AgentModeViewModel: ObservableObject {
             // guard below can never be satisfied and the first send blocks.
             installPendingUserTurnState(pendingState, on: destinationSession)
             if let blocked = preflightInitialUserTurn(text: text, session: destinationSession) {
+                logRejectedSubmitTarget(target, session: sessions[target.tabID], reason: "destination_preflight_blocked", persistent: true)
                 clearPendingUserTurnState(on: destinationSession)
                 await discardFreshFirstSendDestinationIfPossible(destinationTabID)
                 return blocked
@@ -15564,6 +15577,7 @@ final class AgentModeViewModel: ObservableObject {
                             && Self.pendingUserTurnState(from: destinationSession) == pendingState
                     }
                 } catch {
+                    logRejectedSubmitTarget(target, session: sessions[target.tabID], reason: "destination_location_preparation_failed", persistent: true)
                     clearPendingUserTurnState(on: destinationSession)
                     await discardFreshFirstSendDestinationIfPossible(destinationTabID)
                     return .blocked(message: (error as? LocalizedError)?.errorDescription ?? error.localizedDescription)
@@ -15576,10 +15590,12 @@ final class AgentModeViewModel: ObservableObject {
                   sourceSnapshot.matches(sessions[target.tabID]),
                   Self.pendingUserTurnState(from: destinationSession) == pendingState
             else {
+                logRejectedSubmitTarget(target, session: sessions[target.tabID], reason: "state_changed_during_destination_preparation", persistent: true)
                 clearPendingUserTurnState(on: destinationSession)
                 return .blocked(message: Self.staleComposerSubmitTargetMessage)
             }
             if let blocked = preflightInitialUserTurn(text: text, session: destinationSession) {
+                logRejectedSubmitTarget(target, session: sessions[target.tabID], reason: "destination_preflight_blocked_after_preparation", persistent: true)
                 clearPendingUserTurnState(on: destinationSession)
                 return blocked
             }
@@ -16286,6 +16302,14 @@ final class AgentModeViewModel: ObservableObject {
                 consumesComposer: consumesComposer
             )
             guard isStillCurrent(), sessions[tabID] === session, session.recoveryLane === lane, !lane.isRetired else {
+                if origin == .composer {
+                    AgentComposerSubmitDiagnostics.submitRejected(
+                        reason: "admission_no_longer_current",
+                        route: "recovery_admission",
+                        targetTabID: tabID,
+                        currentTabID: currentTabID
+                    )
+                }
                 await releaseRefusedRecoveryAdmission(admitted, lane: lane, session: session)
                 return .blocked(message: Self.staleComposerSubmitTargetMessage)
             }
@@ -20859,8 +20883,17 @@ final class AgentModeViewModel: ObservableObject {
         session: AgentTabSession?,
         reason: String,
         attempt: AgentComposerSubmitAttempt? = nil,
-        activeAttempt: AgentComposerSubmitAttempt? = nil
+        activeAttempt: AgentComposerSubmitAttempt? = nil,
+        persistent: Bool = false
     ) {
+        if persistent {
+            AgentComposerSubmitDiagnostics.submitRejected(
+                reason: reason,
+                route: target.route.rawValue,
+                targetTabID: target.tabID,
+                currentTabID: currentTabID
+            )
+        }
         let liveSourceAgentSessionID = composerSourceAgentSessionID(tabID: target.tabID, session: session)
         let reportedAttempt = attempt ?? session?.activeComposerSubmitAttempt
         let reportedActiveAttempt = activeAttempt ?? session?.activeComposerSubmitAttempt

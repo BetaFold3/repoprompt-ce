@@ -1050,9 +1050,24 @@ extension AgentModeViewModel {
         refreshRecoveryListUI()
     }
 
+    /// Publishes the current tab's composer (its recovery list) once and re-reports every other
+    /// open tab's scheduler busy state. Never publishes another tab's props (F7), and never
+    /// materializes a session: a current tab without one gets a non-submittable snapshot.
     func refreshRecoveryListUI() {
-        for tabID in sessions.keys {
-            syncComposerUIState(tabID: tabID)
+        let ownerTabID = currentTabID
+        if let ownerTabID {
+            if sessions[ownerTabID] != nil {
+                syncComposerUIState(tabID: ownerTabID)
+            } else {
+                // The only composer publication besides `syncComposerUIState`: current-tab props only.
+                ui.composer.update(makeComposerProps(tabID: ownerTabID, materializingSession: false))
+            }
+        } else {
+            syncComposerUIState()
+        }
+        let otherTabIDs = Set(sessions.keys.filter { $0 != ownerTabID })
+        if !otherTabIDs.isEmpty {
+            notifyScheduledSendBusyStateMayHaveChanged(tabIDs: otherTabIDs)
         }
     }
 

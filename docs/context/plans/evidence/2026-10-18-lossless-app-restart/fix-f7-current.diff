@@ -1,0 +1,733 @@
+diff --git a/Sources/RepoPrompt/Features/AgentMode/ViewModels/AgentModeViewModel+ComposerUI.swift b/Sources/RepoPrompt/Features/AgentMode/ViewModels/AgentModeViewModel+ComposerUI.swift
+index 0f2a746c..c2340d86 100644
+--- a/Sources/RepoPrompt/Features/AgentMode/ViewModels/AgentModeViewModel+ComposerUI.swift
++++ b/Sources/RepoPrompt/Features/AgentMode/ViewModels/AgentModeViewModel+ComposerUI.swift
+@@ -1,8 +1,31 @@
+ import Foundation
++import OSLog
+ import RepoPromptAgentCore
+ 
++/// Always-on composer submit rejection reasons (unified logging, persisted at `.notice`), for
++/// after-the-fact diagnosis in a normal run. Logs only fixed reason strings and identifiers, never
++/// draft text or other user content.
++enum AgentComposerSubmitDiagnostics {
++    private static let logger = Logger(subsystem: "com.repoprompt.agents", category: "ComposerSubmit")
++
++    /// A rejection in the composer view (`AgentInputBar.sendMessage()` / `scheduleMessage(...)`).
++    static func viewRejected(reason: String, currentTabID: UUID?, propsTabID: UUID?, targetTabID: UUID?) {
++        logger.notice(
++            "view_rejected reason=\(reason, privacy: .public) currentTab=\(currentTabID?.uuidString ?? "nil", privacy: .public) propsTab=\(propsTabID?.uuidString ?? "nil", privacy: .public) targetTab=\(targetTabID?.uuidString ?? "nil", privacy: .public)"
++        )
++    }
++
++    /// A rejection in the view model's composer submit path (`executeComposerSubmitAttempt`).
++    static func submitRejected(reason: String, route: String, targetTabID: UUID, currentTabID: UUID?) {
++        logger.notice(
++            "submit_rejected reason=\(reason, privacy: .public) route=\(route, privacy: .public) targetTab=\(targetTabID.uuidString, privacy: .public) currentTab=\(currentTabID?.uuidString ?? "nil", privacy: .public)"
++        )
++    }
++}
++
+ extension AgentModeViewModel {
+-    func makeComposerProps(tabID explicitTabID: UUID? = nil) -> AgentComposerProps {
++    /// `materializingSession: false` never creates a session: a tab without one gets no submit target.
++    func makeComposerProps(tabID explicitTabID: UUID? = nil, materializingSession: Bool = true) -> AgentComposerProps {
+         let tabID = explicitTabID ?? currentTabID
+         let session = tabID.flatMap { sessions[$0] }
+         let isMCPControlled = isMCPControlled(tabID: tabID)
+@@ -23,7 +46,9 @@ extension AgentModeViewModel {
+             else { return nil }
+             return makeRunCancelTarget(tabID: tabID, session: session)
+         }()
+-        let submitTarget = makeComposerSubmitTarget(tabID: tabID, session: session)
++        let submitTarget = session != nil || materializingSession
++            ? makeComposerSubmitTarget(tabID: tabID, session: session)
++            : nil
+         let remoteCatalog = remoteHostCatalogSnapshot(for: session)
+         let isRemoteSession = session?.remoteHost != nil
+         let scheduledSend: AgentScheduledSendProps? = session.flatMap { session in
+@@ -193,8 +218,15 @@ extension AgentModeViewModel {
+         #if DEBUG
+             test_syncComposerCallCount += 1
+         #endif
+-        ui.composer.update(makeComposerProps(tabID: tabID))
+-        if let observedTabID = tabID ?? currentTabID {
++        // The composer store holds one tab's props: the current tab's (F7). Props built for another
++        // tab mix that tab's state with the visible session's, so an explicit non-current tab never
++        // publishes; its scheduler busy state is still reported. With no current tab, the no-tab
++        // props are published so another tab's props never linger.
++        let ownerTabID = currentTabID
++        if tabID == nil || tabID == ownerTabID || ownerTabID == nil {
++            ui.composer.update(makeComposerProps(tabID: ownerTabID))
++        }
++        if let observedTabID = tabID ?? ownerTabID {
+             notifyScheduledSendBusyStateMayHaveChanged(tabIDs: [observedTabID])
+         }
+     }
+diff --git a/Sources/RepoPrompt/Features/AgentMode/ViewModels/AgentModeViewModel+Recovery.swift b/Sources/RepoPrompt/Features/AgentMode/ViewModels/AgentModeViewModel+Recovery.swift
+index e7558032..86d519de 100644
+--- a/Sources/RepoPrompt/Features/AgentMode/ViewModels/AgentModeViewModel+Recovery.swift
++++ b/Sources/RepoPrompt/Features/AgentMode/ViewModels/AgentModeViewModel+Recovery.swift
+@@ -626,7 +626,8 @@ extension AgentModeViewModel {
+         recoveryCoordinator = coordinator
+         recoveryAdmissionModeForSessions = admissionMode
+         recoveryCompositionFailure = nil
+-        // Startup results, holds, and restrictions refresh every tab's recovery UI and busy state.
++        // Startup results, holds, and restrictions republish the current tab's composer (its
++        // recovery list), re-report every open tab's busy state, and force a scheduler re-evaluation.
+         recoveryCoordinatorChangeObserver = NotificationCenter.default
+             .publisher(for: .agentRecoveryCoordinatorDidChange, object: coordinator)
+             .receive(on: RunLoop.main)
+@@ -636,8 +637,11 @@ extension AgentModeViewModel {
+                 scheduledSendCoordinator?.recordDidChange()
+             }
+         // Live records, composer recovery state, and the catalog (questions, schedules awaiting
+-        // confirmation, shared action states) refresh only the recovery list (no scheduler churn):
+-        // an ordinary write never changes startup results, holds, or restrictions.
++        // confirmation, shared action states) republish the current tab's composer (its recovery
++        // list) and re-report every open tab's scheduler busy state; the scheduler re-evaluates
++        // only when a tab's busy state actually changed. Unlike the observer above, this does not
++        // force `recordDidChange()`: an ordinary write never changes startup results, holds, or
++        // restrictions.
+         recoveryLiveStateObserver = NotificationCenter.default
+             .publisher(for: .agentRecoveryCatalogDidChange, object: coordinator)
+             .merge(with: NotificationCenter.default.publisher(for: .agentRecoveryComposerStateDidChange, object: coordinator))
+diff --git a/Sources/RepoPrompt/Features/AgentMode/ViewModels/AgentModeViewModel+RecoveryList.swift b/Sources/RepoPrompt/Features/AgentMode/ViewModels/AgentModeViewModel+RecoveryList.swift
+index 3b9c5ebf..4e3d8796 100644
+--- a/Sources/RepoPrompt/Features/AgentMode/ViewModels/AgentModeViewModel+RecoveryList.swift
++++ b/Sources/RepoPrompt/Features/AgentMode/ViewModels/AgentModeViewModel+RecoveryList.swift
+@@ -1050,9 +1050,24 @@ extension AgentModeViewModel {
+         refreshRecoveryListUI()
+     }
+ 
++    /// Publishes the current tab's composer (its recovery list) once and re-reports every other
++    /// open tab's scheduler busy state. Never publishes another tab's props (F7), and never
++    /// materializes a session: a current tab without one gets a non-submittable snapshot.
+     func refreshRecoveryListUI() {
+-        for tabID in sessions.keys {
+-            syncComposerUIState(tabID: tabID)
++        let ownerTabID = currentTabID
++        if let ownerTabID {
++            if sessions[ownerTabID] != nil {
++                syncComposerUIState(tabID: ownerTabID)
++            } else {
++                // The only composer publication besides `syncComposerUIState`: current-tab props only.
++                ui.composer.update(makeComposerProps(tabID: ownerTabID, materializingSession: false))
++            }
++        } else {
++            syncComposerUIState()
++        }
++        let otherTabIDs = Set(sessions.keys.filter { $0 != ownerTabID })
++        if !otherTabIDs.isEmpty {
++            notifyScheduledSendBusyStateMayHaveChanged(tabIDs: otherTabIDs)
+         }
+     }
+ 
+diff --git a/Sources/RepoPrompt/Features/AgentMode/ViewModels/AgentModeViewModel+ScheduledSend.swift b/Sources/RepoPrompt/Features/AgentMode/ViewModels/AgentModeViewModel+ScheduledSend.swift
+index 3d0e5f23..50f1392b 100644
+--- a/Sources/RepoPrompt/Features/AgentMode/ViewModels/AgentModeViewModel+ScheduledSend.swift
++++ b/Sources/RepoPrompt/Features/AgentMode/ViewModels/AgentModeViewModel+ScheduledSend.swift
+@@ -396,6 +396,7 @@ extension AgentModeViewModel {
+         let target = claim.attempt.target
+         let sourceSession = claim.sourceSession
+         guard composerSubmitClaimIsCurrent(claim) else {
++            logRejectedSubmitTarget(target, session: sessions[target.tabID], reason: "schedule_claim_not_current", persistent: true)
+             return .blocked(message: Self.staleComposerSubmitTargetMessage)
+         }
+         defer {
+@@ -408,14 +409,17 @@ extension AgentModeViewModel {
+         switch target.route {
+         case .existingAgentSession:
+             guard let preparedSession = try? await ensureSessionReady(tabID: target.tabID) else {
++                logRejectedSubmitTarget(target, session: sessions[target.tabID], reason: "schedule_session_not_ready", persistent: true)
+                 return .blocked(message: Self.composeTabRemovalInProgressMessage)
+             }
+             guard preparedSession === sourceSession,
+                   composerSubmitClaimIsCurrent(claim)
+             else {
++                logRejectedSubmitTarget(target, session: preparedSession, reason: "schedule_prepared_session_or_claim_changed", persistent: true)
+                 return .blocked(message: Self.staleComposerSubmitTargetMessage)
+             }
+             if let blockedMessage = newWorkBlockedMessage(for: preparedSession) {
++                logRejectedSubmitTarget(target, session: preparedSession, reason: "schedule_new_work_blocked", persistent: true)
+                 return .blocked(message: blockedMessage)
+             }
+             if let rejectionReason = submitTargetRejectionReason(
+@@ -423,7 +427,7 @@ extension AgentModeViewModel {
+                 session: preparedSession,
+                 validateSubmissionToken: false
+             ) {
+-                logRejectedSubmitTarget(target, session: preparedSession, reason: rejectionReason)
++                logRejectedSubmitTarget(target, session: preparedSession, reason: rejectionReason, persistent: true)
+                 resyncAfterRejectedSubmitTarget(target)
+                 return .blocked(message: Self.staleComposerSubmitTargetMessage)
+             }
+@@ -469,6 +473,7 @@ extension AgentModeViewModel {
+                       sourceSnapshot.matches(sessions[target.tabID]),
+                       Self.pendingUserTurnState(from: preparedSession) == pendingState
+                 else {
++                    logRejectedSubmitTarget(target, session: sessions[target.tabID], reason: "schedule_state_changed_during_location_preparation", persistent: true)
+                     return .blocked(message: Self.staleComposerSubmitTargetMessage)
+                 }
+                 preparedSession.pendingInitialStartLocation = .local
+@@ -477,6 +482,7 @@ extension AgentModeViewModel {
+                 }
+             } else {
+                 guard preparedSession.pendingInitialStartLocation == .local else {
++                    logRejectedSubmitTarget(target, session: preparedSession, reason: "schedule_initial_start_location_pending", persistent: true)
+                     return .blocked(message: Self.staleComposerSubmitTargetMessage)
+                 }
+             }
+@@ -531,6 +537,7 @@ extension AgentModeViewModel {
+                   sourceSnapshot.matches(sessions[target.tabID]),
+                   destinationTabID != target.tabID
+             else {
++                logRejectedSubmitTarget(target, session: sessions[target.tabID], reason: "schedule_state_changed_after_destination_created", persistent: true)
+                 await discardFreshFirstSendDestinationIfPossible(destinationTabID)
+                 return .blocked(message: Self.staleComposerSubmitTargetMessage)
+             }
+@@ -581,6 +588,7 @@ extension AgentModeViewModel {
+                       sourceSnapshot.matches(sessions[target.tabID]),
+                       Self.pendingUserTurnState(from: destinationSession) == pendingState
+                 else {
++                    logRejectedSubmitTarget(target, session: sessions[target.tabID], reason: "schedule_state_changed_during_destination_preparation", persistent: true)
+                     clearPendingUserTurnState(on: destinationSession)
+                     return .blocked(message: Self.staleComposerSubmitTargetMessage)
+                 }
+diff --git a/Sources/RepoPrompt/Features/AgentMode/ViewModels/AgentModeViewModel.swift b/Sources/RepoPrompt/Features/AgentMode/ViewModels/AgentModeViewModel.swift
+index 6a7e0216..f569331a 100644
+--- a/Sources/RepoPrompt/Features/AgentMode/ViewModels/AgentModeViewModel.swift
++++ b/Sources/RepoPrompt/Features/AgentMode/ViewModels/AgentModeViewModel.swift
+@@ -15331,6 +15331,7 @@ final class AgentModeViewModel: ObservableObject {
+         let target = claim.attempt.target
+         let claimedSourceSession = claim.sourceSession
+         guard composerSubmitClaimIsCurrent(claim) else {
++            logRejectedSubmitTarget(target, session: sessions[target.tabID], reason: "claim_not_current", persistent: true)
+             return .blocked(message: Self.staleComposerSubmitTargetMessage)
+         }
+         defer {
+@@ -15340,14 +15341,17 @@ final class AgentModeViewModel: ObservableObject {
+         switch target.route {
+         case .existingAgentSession:
+             guard let preparedSession = try? await ensureSessionReady(tabID: target.tabID) else {
++                logRejectedSubmitTarget(target, session: sessions[target.tabID], reason: "session_not_ready", persistent: true)
+                 return .blocked(message: Self.composeTabRemovalInProgressMessage)
+             }
+             guard preparedSession === claimedSourceSession,
+                   composerSubmitClaimIsCurrent(claim)
+             else {
++                logRejectedSubmitTarget(target, session: preparedSession, reason: "prepared_session_or_claim_changed", persistent: true)
+                 return .blocked(message: Self.staleComposerSubmitTargetMessage)
+             }
+             if let blockedMessage = newWorkBlockedMessage(for: preparedSession) {
++                logRejectedSubmitTarget(target, session: preparedSession, reason: "new_work_blocked", persistent: true)
+                 return .blocked(message: blockedMessage)
+             }
+             if let rejectionReason = submitTargetRejectionReason(
+@@ -15355,7 +15359,7 @@ final class AgentModeViewModel: ObservableObject {
+                 session: preparedSession,
+                 validateSubmissionToken: false
+             ) {
+-                logRejectedSubmitTarget(target, session: preparedSession, reason: rejectionReason)
++                logRejectedSubmitTarget(target, session: preparedSession, reason: rejectionReason, persistent: true)
+                 resyncAfterRejectedSubmitTarget(target)
+                 return .blocked(message: Self.staleComposerSubmitTargetMessage)
+             }
+@@ -15395,6 +15399,7 @@ final class AgentModeViewModel: ObservableObject {
+                 }
+             }
+             if let blocked = preflightInitialUserTurn(text: text, session: preparedSession) {
++                logRejectedSubmitTarget(target, session: preparedSession, reason: "initial_turn_preflight_blocked", persistent: true)
+                 return blocked
+             }
+             do {
+@@ -15410,12 +15415,13 @@ final class AgentModeViewModel: ObservableObject {
+                         && Self.pendingUserTurnState(from: preparedSession) == pendingState
+                 }
+             } catch {
++                logRejectedSubmitTarget(target, session: sessions[target.tabID], reason: "initial_location_preparation_failed", persistent: true)
+                 return .blocked(message: (error as? LocalizedError)?.errorDescription ?? error.localizedDescription)
+             }
+             guard composerSourceAgentSessionID(tabID: target.tabID, session: preparedSession)
+                 == target.expectedSourceAgentSessionID
+             else {
+-                logRejectedSubmitTarget(target, session: preparedSession, reason: "agent_session_id_mismatch")
++                logRejectedSubmitTarget(target, session: preparedSession, reason: "agent_session_id_mismatch", persistent: true)
+                 resyncAfterRejectedSubmitTarget(target)
+                 return .blocked(message: Self.staleComposerSubmitTargetMessage)
+             }
+@@ -15425,9 +15431,11 @@ final class AgentModeViewModel: ObservableObject {
+                   sourceSnapshot.matches(sessions[target.tabID]),
+                   Self.pendingUserTurnState(from: preparedSession) == pendingState
+             else {
++                logRejectedSubmitTarget(target, session: sessions[target.tabID], reason: "state_changed_during_location_preparation", persistent: true)
+                 return .blocked(message: Self.staleComposerSubmitTargetMessage)
+             }
+             if let blocked = preflightInitialUserTurn(text: text, session: preparedSession) {
++                logRejectedSubmitTarget(target, session: preparedSession, reason: "initial_turn_preflight_blocked_after_preparation", persistent: true)
+                 return blocked
+             }
+             preparedSession.pendingInitialStartLocation = .local
+@@ -15467,6 +15475,7 @@ final class AgentModeViewModel: ObservableObject {
+                             && Self.pendingUserTurnState(from: sourceSession) == pendingState
+                     }
+                 } catch {
++                    logRejectedSubmitTarget(target, session: sessions[target.tabID], reason: "initial_location_workspace_preflight_failed", persistent: true)
+                     return .blocked(message: (error as? LocalizedError)?.errorDescription ?? error.localizedDescription)
+                 }
+                 sourceSession.isPreparingInitialWorktree = true
+@@ -15483,15 +15492,18 @@ final class AgentModeViewModel: ObservableObject {
+                 }
+             }
+             guard let destinationTabID = await createAndActivateSessionTab() else {
++                logRejectedSubmitTarget(target, session: sessions[target.tabID], reason: "first_send_destination_not_created", persistent: true)
+                 return .blocked(message: "Failed to create a new agent session.")
+             }
+             guard !Task.isCancelled,
+                   composerSubmitClaimIsCurrent(claim)
+             else {
++                logRejectedSubmitTarget(target, session: sessions[target.tabID], reason: "claim_not_current_after_destination_created", persistent: true)
+                 await discardFreshFirstSendDestinationIfPossible(destinationTabID)
+                 return .blocked(message: Self.staleComposerSubmitTargetMessage)
+             }
+             guard sessions[target.tabID] === sourceSession else {
++                logRejectedSubmitTarget(target, session: sessions[target.tabID], reason: "source_session_replaced", persistent: true)
+                 await discardFreshFirstSendDestinationIfPossible(destinationTabID)
+                 return .blocked(message: Self.staleComposerSubmitTargetMessage)
+             }
+@@ -15500,7 +15512,7 @@ final class AgentModeViewModel: ObservableObject {
+                 session: sourceSession,
+                 validateSubmissionToken: false
+             ) {
+-                logRejectedSubmitTarget(target, session: sessions[target.tabID], reason: rejectionReason)
++                logRejectedSubmitTarget(target, session: sessions[target.tabID], reason: rejectionReason, persistent: true)
+                 resyncAfterRejectedSubmitTarget(target)
+                 await discardFreshFirstSendDestinationIfPossible(destinationTabID)
+                 return .blocked(message: Self.staleComposerSubmitTargetMessage)
+@@ -15508,13 +15520,13 @@ final class AgentModeViewModel: ObservableObject {
+             guard composerSubmitClaimIsCurrent(claim),
+                   sourceSnapshot.matches(sessions[target.tabID])
+             else {
+-                logRejectedSubmitTarget(target, session: sessions[target.tabID], reason: "source_pending_state_changed")
++                logRejectedSubmitTarget(target, session: sessions[target.tabID], reason: "source_pending_state_changed", persistent: true)
+                 resyncAfterRejectedSubmitTarget(target)
+                 await discardFreshFirstSendDestinationIfPossible(destinationTabID)
+                 return .blocked(message: Self.staleComposerSubmitTargetMessage)
+             }
+             guard destinationTabID != target.tabID else {
+-                logRejectedSubmitTarget(target, session: sessions[target.tabID], reason: "invalid_first_send_destination")
++                logRejectedSubmitTarget(target, session: sessions[target.tabID], reason: "invalid_first_send_destination", persistent: true)
+                 resyncAfterRejectedSubmitTarget(target)
+                 await discardFreshFirstSendDestinationIfPossible(destinationTabID)
+                 return .blocked(message: "Failed to create a new agent session.")
+@@ -15522,7 +15534,7 @@ final class AgentModeViewModel: ObservableObject {
+             guard let destinationSession = session(for: destinationTabID, createIfNeeded: true),
+                   isFreshFirstSendDestination(destinationSession)
+             else {
+-                logRejectedSubmitTarget(target, session: sessions[target.tabID], reason: "invalid_first_send_destination")
++                logRejectedSubmitTarget(target, session: sessions[target.tabID], reason: "invalid_first_send_destination", persistent: true)
+                 resyncAfterRejectedSubmitTarget(target)
+                 await discardFreshFirstSendDestinationIfPossible(destinationTabID)
+                 return .blocked(message: "Failed to create a new agent session.")
+@@ -15549,6 +15561,7 @@ final class AgentModeViewModel: ObservableObject {
+             // guard below can never be satisfied and the first send blocks.
+             installPendingUserTurnState(pendingState, on: destinationSession)
+             if let blocked = preflightInitialUserTurn(text: text, session: destinationSession) {
++                logRejectedSubmitTarget(target, session: sessions[target.tabID], reason: "destination_preflight_blocked", persistent: true)
+                 clearPendingUserTurnState(on: destinationSession)
+                 await discardFreshFirstSendDestinationIfPossible(destinationTabID)
+                 return blocked
+@@ -15564,6 +15577,7 @@ final class AgentModeViewModel: ObservableObject {
+                             && Self.pendingUserTurnState(from: destinationSession) == pendingState
+                     }
+                 } catch {
++                    logRejectedSubmitTarget(target, session: sessions[target.tabID], reason: "destination_location_preparation_failed", persistent: true)
+                     clearPendingUserTurnState(on: destinationSession)
+                     await discardFreshFirstSendDestinationIfPossible(destinationTabID)
+                     return .blocked(message: (error as? LocalizedError)?.errorDescription ?? error.localizedDescription)
+@@ -15576,10 +15590,12 @@ final class AgentModeViewModel: ObservableObject {
+                   sourceSnapshot.matches(sessions[target.tabID]),
+                   Self.pendingUserTurnState(from: destinationSession) == pendingState
+             else {
++                logRejectedSubmitTarget(target, session: sessions[target.tabID], reason: "state_changed_during_destination_preparation", persistent: true)
+                 clearPendingUserTurnState(on: destinationSession)
+                 return .blocked(message: Self.staleComposerSubmitTargetMessage)
+             }
+             if let blocked = preflightInitialUserTurn(text: text, session: destinationSession) {
++                logRejectedSubmitTarget(target, session: sessions[target.tabID], reason: "destination_preflight_blocked_after_preparation", persistent: true)
+                 clearPendingUserTurnState(on: destinationSession)
+                 return blocked
+             }
+@@ -16286,6 +16302,14 @@ final class AgentModeViewModel: ObservableObject {
+                 consumesComposer: consumesComposer
+             )
+             guard isStillCurrent(), sessions[tabID] === session, session.recoveryLane === lane, !lane.isRetired else {
++                if origin == .composer {
++                    AgentComposerSubmitDiagnostics.submitRejected(
++                        reason: "admission_no_longer_current",
++                        route: "recovery_admission",
++                        targetTabID: tabID,
++                        currentTabID: currentTabID
++                    )
++                }
+                 await releaseRefusedRecoveryAdmission(admitted, lane: lane, session: session)
+                 return .blocked(message: Self.staleComposerSubmitTargetMessage)
+             }
+@@ -20859,8 +20883,17 @@ final class AgentModeViewModel: ObservableObject {
+         session: AgentTabSession?,
+         reason: String,
+         attempt: AgentComposerSubmitAttempt? = nil,
+-        activeAttempt: AgentComposerSubmitAttempt? = nil
++        activeAttempt: AgentComposerSubmitAttempt? = nil,
++        persistent: Bool = false
+     ) {
++        if persistent {
++            AgentComposerSubmitDiagnostics.submitRejected(
++                reason: reason,
++                route: target.route.rawValue,
++                targetTabID: target.tabID,
++                currentTabID: currentTabID
++            )
++        }
+         let liveSourceAgentSessionID = composerSourceAgentSessionID(tabID: target.tabID, session: session)
+         let reportedAttempt = attempt ?? session?.activeComposerSubmitAttempt
+         let reportedActiveAttempt = activeAttempt ?? session?.activeComposerSubmitAttempt
+diff --git a/Sources/RepoPrompt/Features/AgentMode/Views/AgentInputBar.swift b/Sources/RepoPrompt/Features/AgentMode/Views/AgentInputBar.swift
+index 654bcee8..fe3377dd 100644
+--- a/Sources/RepoPrompt/Features/AgentMode/Views/AgentInputBar.swift
++++ b/Sources/RepoPrompt/Features/AgentMode/Views/AgentInputBar.swift
+@@ -2345,16 +2345,22 @@ struct AgentComposerView: View, Equatable {
+         runAlongsideOtherSessions: Bool
+     ) {
+         guard !submissionLatch.isLatched(for: currentTabID) else {
+-            logViewSubmitRejection(reason: "local_attempt_latched", target: renderedSubmitTarget)
++            logViewSubmitRejection(reason: "local_attempt_latched", target: renderedSubmitTarget, persistent: true)
++            return
++        }
++        guard canScheduleToRenderedTarget else {
++            logViewSubmitRejection(reason: "schedule_unavailable_for_rendered_target", target: renderedSubmitTarget, persistent: true)
+             return
+         }
+-        guard canScheduleToRenderedTarget else { return }
+ 
+         let rawDraftSnapshot = localInputText
+         let trimmed = rawDraftSnapshot.trimmingCharacters(in: .whitespacesAndNewlines)
+-        guard !trimmed.isEmpty || hasPendingAttachments else { return }
++        guard !trimmed.isEmpty || hasPendingAttachments else {
++            logViewSubmitRejection(reason: "empty_draft", target: renderedSubmitTarget, persistent: true)
++            return
++        }
+         guard let submitTarget = renderedSubmitTarget else {
+-            logViewSubmitRejection(reason: "view_nil_target", target: props.submitTarget)
++            logViewSubmitRejection(reason: "view_nil_target", target: props.submitTarget, persistent: true)
+             showSteeringUnsupportedNotice(Self.staleSubmitTargetMessage)
+             return
+         }
+@@ -2362,7 +2368,7 @@ struct AgentComposerView: View, Equatable {
+             target: submitTarget,
+             rawDraftSnapshot: rawDraftSnapshot
+         ) else {
+-            logViewSubmitRejection(reason: "local_attempt_latched", target: submitTarget)
++            logViewSubmitRejection(reason: "local_attempt_latched", target: submitTarget, persistent: true)
+             return
+         }
+ 
+@@ -2391,11 +2397,14 @@ struct AgentComposerView: View, Equatable {
+                     resetTextFieldTrigger.toggle()
+                 }
+                 if let blockedMessage = effects.blockedMessage {
++                    // The reason only: the message can carry error descriptions.
++                    logViewSubmitRejection(reason: "schedule_completion_blocked", target: attempt.target, persistent: true)
+                     showSteeringUnsupportedNotice(blockedMessage)
+                 }
+             }
+         case let .rejected(rejection):
+             submissionLatch.cancel(attempt)
++            logViewSubmitRejection(reason: "schedule_claim_\(rejection.diagnosticReason)", target: submitTarget, persistent: true)
+             if case .activeAttemptExists = rejection {
+                 return
+             }
+@@ -2405,10 +2414,15 @@ struct AgentComposerView: View, Equatable {
+ 
+     private func sendMessage() {
+         guard !submissionLatch.isLatched(for: currentTabID) else {
+-            logViewSubmitRejection(reason: "local_attempt_latched", target: renderedSubmitTarget)
++            logViewSubmitRejection(reason: "local_attempt_latched", target: renderedSubmitTarget, persistent: true)
+             return
+         }
+         guard props.canSendWithCurrentProvider else {
++            logViewSubmitRejection(
++                reason: props.hasAvailableAgentProviders ? "selected_provider_unavailable" : "no_agent_providers",
++                target: renderedSubmitTarget,
++                persistent: true
++            )
+             if props.hasAvailableAgentProviders {
+                 showSteeringUnsupportedNotice(props.unavailableSelectedAgentMessage ?? "Connect this agent provider in Settings before sending.")
+             } else {
+@@ -2418,9 +2432,12 @@ struct AgentComposerView: View, Equatable {
+         }
+         let rawDraftSnapshot = localInputText
+         let trimmed = rawDraftSnapshot.trimmingCharacters(in: .whitespacesAndNewlines)
+-        guard !trimmed.isEmpty || hasPendingAttachments else { return }
++        guard !trimmed.isEmpty || hasPendingAttachments else {
++            logViewSubmitRejection(reason: "empty_draft", target: renderedSubmitTarget, persistent: true)
++            return
++        }
+         guard let submitTarget = renderedSubmitTarget else {
+-            logViewSubmitRejection(reason: "view_nil_target", target: props.submitTarget)
++            logViewSubmitRejection(reason: "view_nil_target", target: props.submitTarget, persistent: true)
+             showSteeringUnsupportedNotice(Self.staleSubmitTargetMessage)
+             return
+         }
+@@ -2428,7 +2445,7 @@ struct AgentComposerView: View, Equatable {
+             target: submitTarget,
+             rawDraftSnapshot: rawDraftSnapshot
+         ) else {
+-            logViewSubmitRejection(reason: "local_attempt_latched", target: submitTarget)
++            logViewSubmitRejection(reason: "local_attempt_latched", target: submitTarget, persistent: true)
+             return
+         }
+ 
+@@ -2452,11 +2469,14 @@ struct AgentComposerView: View, Equatable {
+                     resetTextFieldTrigger.toggle()
+                 }
+                 if let blockedMessage = effects.blockedMessage {
++                    // The reason only: the message can carry error descriptions.
++                    logViewSubmitRejection(reason: "completion_blocked", target: attempt.target, persistent: true)
+                     showSteeringUnsupportedNotice(blockedMessage)
+                 }
+             }
+         case let .rejected(rejection):
+             submissionLatch.cancel(attempt)
++            logViewSubmitRejection(reason: "claim_\(rejection.diagnosticReason)", target: submitTarget, persistent: true)
+             if case .activeAttemptExists = rejection {
+                 return
+             }
+@@ -2487,7 +2507,16 @@ struct AgentComposerView: View, Equatable {
+         }
+     }
+ 
+-    private func logViewSubmitRejection(reason: String, target: AgentComposerSubmitTarget?) {
++    /// `persistent` also writes the reason to the always-on `ComposerSubmit` log.
++    private func logViewSubmitRejection(reason: String, target: AgentComposerSubmitTarget?, persistent: Bool = false) {
++        if persistent {
++            AgentComposerSubmitDiagnostics.viewRejected(
++                reason: reason,
++                currentTabID: currentTabID,
++                propsTabID: props.currentTabID,
++                targetTabID: target?.tabID
++            )
++        }
+         #if DEBUG
+             AgentModePerfDiagnostics.event(
+                 "agent.composer.submit.rejected",
+diff --git a/Tests/RepoPromptTests/AgentMode/AgentComposerTabOwnershipTests.swift b/Tests/RepoPromptTests/AgentMode/AgentComposerTabOwnershipTests.swift
+new file mode 100644
+index 00000000..16bb5634
+--- /dev/null
++++ b/Tests/RepoPromptTests/AgentMode/AgentComposerTabOwnershipTests.swift
+@@ -0,0 +1,204 @@
++import Foundation
++@testable import RepoPromptAgentCore
++@testable import RepoPromptPlatform
++@testable import RepoPromptUI
++@testable import RepoPromptWorkspace
++import XCTest
++@_spi(TestSupport) @testable import RepoPromptApp
++
++/// F7: the shared composer store only ever holds the current tab's props. Another tab's sync or a
++/// recovery refresh never overwrites them, and other tabs' scheduler busy state is still reported.
++@MainActor
++final class AgentComposerTabOwnershipTests: XCTestCase {
++    func testRecoveryListRefreshKeepsCurrentTabPropsForEveryTabOrder() async throws {
++        let viewModel = makeViewModel()
++        let tabIDs = try await openTabs(4, in: viewModel)
++
++        // Every tab takes a turn as the current tab, so it sits first, in the middle and last in
++        // the sessions dictionary's (per-launch seeded) iteration order.
++        for currentTabID in tabIDs {
++            makeCurrent(currentTabID, among: tabIDs, in: viewModel)
++            viewModel.refreshRecoveryListUI()
++            assertComposerOwned(by: currentTabID, in: viewModel)
++        }
++    }
++
++    func testExplicitNonCurrentSyncLeavesPropsAndStillReportsBusyState() async throws {
++        let viewModel = makeViewModel()
++        let tabIDs = try await openTabs(2, in: viewModel)
++        let (tabA, tabB) = (tabIDs[0], tabIDs[1])
++        let scheduler = AgentScheduledSendCoordinator()
++        viewModel.attachScheduledSendCoordinator(scheduler)
++        addTeardownBlock { @MainActor in viewModel.detachScheduledSendCoordinator() }
++        makeCurrent(tabA, among: tabIDs, in: viewModel)
++        let sessionB = try XCTUnwrap(viewModel.session(for: tabB, createIfNeeded: false))
++        let propsBefore = viewModel.ui.composer.props
++        let revisionBefore = viewModel.ui.composer.revision
++
++        sessionB.lastReportedScheduledSendBusyState = nil
++        viewModel.syncComposerUIState(tabID: tabB)
++
++        XCTAssertEqual(viewModel.ui.composer.props, propsBefore)
++        XCTAssertEqual(viewModel.ui.composer.revision, revisionBefore)
++        XCTAssertNotNil(sessionB.lastReportedScheduledSendBusyState, "B's busy state is still reported")
++
++        sessionB.lastReportedScheduledSendBusyState = nil
++        viewModel.refreshRecoveryListUI()
++
++        assertComposerOwned(by: tabA, in: viewModel)
++        XCTAssertNotNil(sessionB.lastReportedScheduledSendBusyState, "The refresh reports every other tab")
++    }
++
++    func testCatalogChangeNotificationKeepsCurrentTabPropsAndFollowsATabSwitchWhileQueued() async throws {
++        let coordinator = try await makeRecoveryCoordinator()
++        let viewModel = makeViewModel()
++        viewModel.installRecoveryCoordinator(coordinator)
++        let tabIDs = try await openTabs(3, in: viewModel)
++        makeCurrent(tabIDs[0], among: tabIDs, in: viewModel)
++
++        try await postAndAwaitRefresh(.agentRecoveryCatalogDidChange, from: coordinator, in: viewModel)
++        assertComposerOwned(by: tabIDs[0], in: viewModel)
++
++        try await postAndAwaitRefresh(.agentRecoveryComposerStateDidChange, from: coordinator, in: viewModel)
++        assertComposerOwned(by: tabIDs[0], in: viewModel)
++
++        // The tab switches after the notification is posted but before it is delivered: the
++        // refresh publishes the tab that is current at delivery. Only the middle tab stays
++        // MCP-controlled, so the switched-to tab's own props are unlocked.
++        viewModel.test_setMCPControlledTabIDs([tabIDs[1]])
++        assertComposerOwned(by: tabIDs[0], in: viewModel)
++        try await postAndAwaitRefresh(.agentRecoveryCatalogDidChange, from: coordinator, in: viewModel) {
++            viewModel.test_setCurrentTabIDOverride(tabIDs[2])
++        }
++        assertComposerOwned(by: tabIDs[2], in: viewModel)
++    }
++
++    func testNoCurrentTabPublishesNoTabPropsInsteadOfAnotherTabs() async throws {
++        let viewModel = makeViewModel()
++        let tabIDs = try await openTabs(2, in: viewModel)
++        makeCurrent(tabIDs[0], among: tabIDs, in: viewModel)
++        viewModel.test_setCurrentTabIDOverride(nil)
++
++        viewModel.syncComposerUIState(tabID: tabIDs[1])
++        XCTAssertNil(viewModel.ui.composer.props.currentTabID)
++        XCTAssertNil(viewModel.ui.composer.props.submitTarget)
++
++        viewModel.refreshRecoveryListUI()
++        XCTAssertNil(viewModel.ui.composer.props.currentTabID)
++        XCTAssertNil(viewModel.ui.composer.props.submitTarget)
++        XCTAssertFalse(viewModel.ui.composer.props.isCurrentTabMCPControlled)
++    }
++
++    func testTabRemovalNeverPublishesTheRemovedOrAnotherTab() async throws {
++        let viewModel = makeViewModel()
++        let tabIDs = try await openTabs(3, in: viewModel)
++        let (tabA, tabB, tabC) = (tabIDs[0], tabIDs[1], tabIDs[2])
++        makeCurrent(tabA, among: tabIDs, in: viewModel)
++
++        // A removed non-current tab: its late sync publishes nothing, and the refresh keeps A.
++        viewModel.test_removeLiveSession(tabID: tabB)
++        viewModel.syncComposerUIState(tabID: tabB)
++        viewModel.refreshRecoveryListUI()
++        assertComposerOwned(by: tabA, in: viewModel)
++
++        // The current tab's session removed: the refresh publishes a non-submittable snapshot of
++        // A (never C) without re-creating A's session.
++        viewModel.test_removeLiveSession(tabID: tabA)
++        viewModel.refreshRecoveryListUI()
++        XCTAssertNil(viewModel.session(for: tabA, createIfNeeded: false), "A refresh never materializes a session")
++        XCTAssertEqual(viewModel.ui.composer.props.currentTabID, tabA)
++        XCTAssertNotEqual(viewModel.ui.composer.props.currentTabID, tabC)
++        XCTAssertNil(viewModel.ui.composer.props.submitTarget, "The removed session's target is not left submittable")
++        XCTAssertFalse(viewModel.ui.composer.props.isCurrentTabMCPControlled)
++    }
++
++    // MARK: - Helpers
++
++    private func makeViewModel() -> AgentModeViewModel {
++        AgentModeViewModel(
++            testWindowID: 9701,
++            testWorkspacePath: FileManager.default.currentDirectoryPath,
++            codexControllerFactory: { _, _, _, _, _, _ in LifecycleNoopCodexController(recorder: LifecycleRecorder()) }
++        )
++    }
++
++    private func openTabs(_ count: Int, in viewModel: AgentModeViewModel) async throws -> [UUID] {
++        var tabIDs: [UUID] = []
++        for _ in 0 ..< count {
++            let tabID = UUID()
++            _ = try await viewModel.ensureSessionReady(tabID: tabID)
++            tabIDs.append(tabID)
++        }
++        addTeardownBlock { @MainActor in viewModel.test_setCurrentTabIDOverride(nil) }
++        return tabIDs
++    }
++
++    /// Makes `tabID` current and every other tab MCP-controlled, so a leaked props snapshot of
++    /// another tab shows up as an MCP lock and a foreign submit target.
++    private func makeCurrent(_ tabID: UUID, among tabIDs: [UUID], in viewModel: AgentModeViewModel) {
++        viewModel.test_setCurrentTabIDOverride(tabID)
++        viewModel.test_setMCPControlledTabIDs(Set(tabIDs.filter { $0 != tabID }))
++        viewModel.syncComposerUIState()
++        assertComposerOwned(by: tabID, in: viewModel)
++    }
++
++    private func assertComposerOwned(
++        by tabID: UUID,
++        in viewModel: AgentModeViewModel,
++        file: StaticString = #filePath,
++        line: UInt = #line
++    ) {
++        let props = viewModel.ui.composer.props
++        XCTAssertEqual(props.currentTabID, tabID, file: file, line: line)
++        XCTAssertEqual(props.submitTarget?.tabID, tabID, "Send stays enabled for the current tab", file: file, line: line)
++        XCTAssertTrue(props.canSendWithCurrentProvider, "Send stays enabled for the current tab", file: file, line: line)
++        XCTAssertFalse(props.isCurrentTabMCPControlled, file: file, line: line)
++        XCTAssertFalse(props.areModelControlsDisabled, file: file, line: line)
++    }
++
++    private func postAndAwaitRefresh(
++        _ name: Notification.Name,
++        from coordinator: AgentRecoveryCoordinator,
++        in viewModel: AgentModeViewModel,
++        beforeDelivery: () -> Void = {}
++    ) async throws {
++        NotificationCenter.default.post(name: name, object: coordinator)
++        beforeDelivery()
++        // Sampled after `beforeDelivery`, so only the delivered refresh (never a setter's own
++        // synchronous sync) can satisfy the wait; delivery needs the main run loop.
++        let syncCountBefore = viewModel.test_syncComposerCallCount
++        let refreshed = await RecoveryTestSupport.eventually {
++            viewModel.test_syncComposerCallCount > syncCountBefore
++        }
++        XCTAssertTrue(refreshed, "The observer refreshes the composer")
++    }
++
++    private func makeRecoveryCoordinator() async throws -> AgentRecoveryCoordinator {
++        let recoveryRoot = try RecoveryTestSupport.makeTemporaryRoot("AgentComposerTabOwnershipStore")
++            .appendingPathComponent("AgentRecovery/v1", isDirectory: true)
++        addTeardownBlock {
++            try? FileManager.default.removeItem(at: recoveryRoot.deletingLastPathComponent().deletingLastPathComponent())
++        }
++        let store = AgentRecoveryStore(rootURL: recoveryRoot)
++        let service = AgentSessionDataService(
++            tombstoneRoot: recoveryRoot.appendingPathComponent("tombstones", isDirectory: true),
++            recoveryStore: store
++        )
++        let coordinator = try AgentRecoveryCoordinator(
++            store: store,
++            dataService: service,
++            reconcile: { _ in .empty },
++            makeComposerController: { store, gate in
++                AgentRecoveryComposerPersistenceController(
++                    store: store,
++                    gate: gate,
++                    sleep: { _ in try await Task.sleep(for: .seconds(3600)) }
++                )
++            }
++        )
++        coordinator.startIfNeeded()
++        let startup = await coordinator.awaitStartup()
++        XCTAssertTrue(startup == .ready)
++        return coordinator
++    }
++}

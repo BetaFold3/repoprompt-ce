@@ -626,7 +626,8 @@ extension AgentModeViewModel {
         recoveryCoordinator = coordinator
         recoveryAdmissionModeForSessions = admissionMode
         recoveryCompositionFailure = nil
-        // Startup results, holds, and restrictions refresh every tab's recovery UI and busy state.
+        // Startup results, holds, and restrictions republish the current tab's composer (its
+        // recovery list), re-report every open tab's busy state, and force a scheduler re-evaluation.
         recoveryCoordinatorChangeObserver = NotificationCenter.default
             .publisher(for: .agentRecoveryCoordinatorDidChange, object: coordinator)
             .receive(on: RunLoop.main)
@@ -636,8 +637,11 @@ extension AgentModeViewModel {
                 scheduledSendCoordinator?.recordDidChange()
             }
         // Live records, composer recovery state, and the catalog (questions, schedules awaiting
-        // confirmation, shared action states) refresh only the recovery list (no scheduler churn):
-        // an ordinary write never changes startup results, holds, or restrictions.
+        // confirmation, shared action states) republish the current tab's composer (its recovery
+        // list) and re-report every open tab's scheduler busy state; the scheduler re-evaluates
+        // only when a tab's busy state actually changed. Unlike the observer above, this does not
+        // force `recordDidChange()`: an ordinary write never changes startup results, holds, or
+        // restrictions.
         recoveryLiveStateObserver = NotificationCenter.default
             .publisher(for: .agentRecoveryCatalogDidChange, object: coordinator)
             .merge(with: NotificationCenter.default.publisher(for: .agentRecoveryComposerStateDidChange, object: coordinator))

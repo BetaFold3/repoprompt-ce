@@ -396,6 +396,7 @@ extension AgentModeViewModel {
         let target = claim.attempt.target
         let sourceSession = claim.sourceSession
         guard composerSubmitClaimIsCurrent(claim) else {
+            logRejectedSubmitTarget(target, session: sessions[target.tabID], reason: "schedule_claim_not_current", persistent: true)
             return .blocked(message: Self.staleComposerSubmitTargetMessage)
         }
         defer {
@@ -408,14 +409,17 @@ extension AgentModeViewModel {
         switch target.route {
         case .existingAgentSession:
             guard let preparedSession = try? await ensureSessionReady(tabID: target.tabID) else {
+                logRejectedSubmitTarget(target, session: sessions[target.tabID], reason: "schedule_session_not_ready", persistent: true)
                 return .blocked(message: Self.composeTabRemovalInProgressMessage)
             }
             guard preparedSession === sourceSession,
                   composerSubmitClaimIsCurrent(claim)
             else {
+                logRejectedSubmitTarget(target, session: preparedSession, reason: "schedule_prepared_session_or_claim_changed", persistent: true)
                 return .blocked(message: Self.staleComposerSubmitTargetMessage)
             }
             if let blockedMessage = newWorkBlockedMessage(for: preparedSession) {
+                logRejectedSubmitTarget(target, session: preparedSession, reason: "schedule_new_work_blocked", persistent: true)
                 return .blocked(message: blockedMessage)
             }
             if let rejectionReason = submitTargetRejectionReason(
@@ -423,7 +427,7 @@ extension AgentModeViewModel {
                 session: preparedSession,
                 validateSubmissionToken: false
             ) {
-                logRejectedSubmitTarget(target, session: preparedSession, reason: rejectionReason)
+                logRejectedSubmitTarget(target, session: preparedSession, reason: rejectionReason, persistent: true)
                 resyncAfterRejectedSubmitTarget(target)
                 return .blocked(message: Self.staleComposerSubmitTargetMessage)
             }
@@ -469,6 +473,7 @@ extension AgentModeViewModel {
                       sourceSnapshot.matches(sessions[target.tabID]),
                       Self.pendingUserTurnState(from: preparedSession) == pendingState
                 else {
+                    logRejectedSubmitTarget(target, session: sessions[target.tabID], reason: "schedule_state_changed_during_location_preparation", persistent: true)
                     return .blocked(message: Self.staleComposerSubmitTargetMessage)
                 }
                 preparedSession.pendingInitialStartLocation = .local
@@ -477,6 +482,7 @@ extension AgentModeViewModel {
                 }
             } else {
                 guard preparedSession.pendingInitialStartLocation == .local else {
+                    logRejectedSubmitTarget(target, session: preparedSession, reason: "schedule_initial_start_location_pending", persistent: true)
                     return .blocked(message: Self.staleComposerSubmitTargetMessage)
                 }
             }
@@ -531,6 +537,7 @@ extension AgentModeViewModel {
                   sourceSnapshot.matches(sessions[target.tabID]),
                   destinationTabID != target.tabID
             else {
+                logRejectedSubmitTarget(target, session: sessions[target.tabID], reason: "schedule_state_changed_after_destination_created", persistent: true)
                 await discardFreshFirstSendDestinationIfPossible(destinationTabID)
                 return .blocked(message: Self.staleComposerSubmitTargetMessage)
             }
@@ -581,6 +588,7 @@ extension AgentModeViewModel {
                       sourceSnapshot.matches(sessions[target.tabID]),
                       Self.pendingUserTurnState(from: destinationSession) == pendingState
                 else {
+                    logRejectedSubmitTarget(target, session: sessions[target.tabID], reason: "schedule_state_changed_during_destination_preparation", persistent: true)
                     clearPendingUserTurnState(on: destinationSession)
                     return .blocked(message: Self.staleComposerSubmitTargetMessage)
                 }
