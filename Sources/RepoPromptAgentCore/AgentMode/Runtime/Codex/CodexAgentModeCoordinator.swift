@@ -1,5 +1,6 @@
 import Foundation
 import MCP
+import OSLog
 import RepoPromptPlatform
 #if canImport(Darwin)
     import Darwin
@@ -308,6 +309,9 @@ package final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObser
     private let codexControllerFactory: CodexControllerFactory
     private let connectionPolicyInstaller: ConnectionPolicyInstaller
     private let shouldManageCodexTooling: Bool
+    /// Controllers with a native start/resume currently in flight (counted, so overlapping starts on
+    /// one controller stay marked until the last settles). Read-only signal for `/compact` refusals.
+    private var codexStartsInFlight: [ObjectIdentifier: Int] = [:]
     private let runCoordinator: AgentRunCoordinator
     /// The host the run coordinator registers policies on, so observers and policies share one server.
     private var mcpHost: any AgentMCPHosting {
@@ -1646,20 +1650,79 @@ package final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObser
         }
     }
 
+    /// The saved thread exists but readiness ended without an active thread (start failure, quiet
+    /// cancellation, or a startup gate that refused). Distinct from "no conversation".
+    package static let compactReconnectFailedMessage = "Couldn't reconnect to this Codex conversation, so compaction was not requested. The saved thread was kept; try /compact again or send a message."
+    /// The slot holds a controller whose native start/resume is still in flight for another owner.
+    package static let compactReconnectInProgressMessage = "Codex is still reconnecting to this conversation, so compaction was not requested. Try /compact again when it is ready."
+    /// A turn or run attempt was admitted while `/compact` readiness was suspended.
+    package static let compactTurnStartedDuringReconnectMessage = "A Codex turn started while /compact was reconnecting, so compaction was not requested. Use /compact after the turn finishes."
+    /// The tab was bound to a different agent session while `/compact` readiness was suspended.
+    package static let compactSessionChangedDuringReconnectMessage = "This conversation changed while /compact was reconnecting, so compaction was not requested."
+
+    private static let slashCommandLogger = Logger(subsystem: "com.repoprompt.agents", category: "CodexSlashCommand")
+
+    /// Always-on `/compact` refusal reasons (fixed strings and identifiers only, no user content).
+    private func logCompactRefusal(_ reason: String, session: AgentTabSession) {
+        let tabID = session.tabID.uuidString
+        let agentSessionID = session.activeAgentSessionID?.uuidString ?? "nil"
+        Self.slashCommandLogger.notice(
+            "compact_refused reason=\(reason, privacy: .public) tab=\(tabID, privacy: .public) agentSession=\(agentSessionID, privacy: .public)"
+        )
+        logCodex("[AgentModeVM][CodexCompact] refused reason=\(reason) tab=\(session.tabID)")
+    }
+
+    private func compactAvailabilityRefusalReason(session: AgentTabSession) -> String {
+        if session.selectedAgent != .codexExec { return "not_codex" }
+        if session.runState.isActive { return "run_active" }
+        if !hasKnownCodexThread(session) { return "no_conversation" }
+        return "unavailable"
+    }
+
     private func executeCompactSlashCommand(
         session: AgentTabSession
     ) async -> NativeSlashCommandExecutionResult {
         if let message = nativeSlashCommandAvailabilityMessage(.compact, session: session) {
+            logCompactRefusal(compactAvailabilityRefusalReason(session: session), session: session)
             return .failed(message)
         }
+        // Readiness authority captured before the first suspension. A turn admitted, a run attempt
+        // begun (even one that already finished), or another agent session bound while readiness
+        // is suspended supersedes this /compact, so compaction never overlaps a newly admitted turn.
+        // `beginRunAttempt` is the only writer of the generation and of a new ownership, so the
+        // generation alone detects a new attempt; an older attempt merely ending is not a refusal.
+        let readinessRunAttemptGeneration = session.runAttemptGeneration
+        let readinessAgentSessionID = session.activeAgentSessionID
         if session.codexController == nil, hasPersistedCodexThreadMetadata(session) {
             session.codexNeedsReconnect = true
         }
         await ensureCodexNativeSession(session: session)
+        if session.runAttemptGeneration != readinessRunAttemptGeneration || session.runState.isActive {
+            logCompactRefusal("turn_started_during_readiness", session: session)
+            return .failed(Self.compactTurnStartedDuringReconnectMessage)
+        }
+        if session.activeAgentSessionID != readinessAgentSessionID {
+            logCompactRefusal("session_changed_during_readiness", session: session)
+            return .failed(Self.compactSessionChangedDuringReconnectMessage)
+        }
+        if let message = nativeSlashCommandAvailabilityMessage(.compact, session: session) {
+            logCompactRefusal("\(compactAvailabilityRefusalReason(session: session))_after_readiness", session: session)
+            return .failed(message)
+        }
         guard let controller = session.codexController,
               controller.hasActiveThread
         else {
-            return .failed("Start a Codex conversation before using /compact.")
+            if let pendingController = session.codexController,
+               codexStartIsInFlight(for: pendingController)
+            {
+                logCompactRefusal("reconnect_in_progress", session: session)
+                return .failed(Self.compactReconnectInProgressMessage)
+            }
+            logCompactRefusal(
+                session.codexController == nil ? "reconnect_failed_no_controller" : "reconnect_failed_no_thread",
+                session: session
+            )
+            return .failed(Self.compactReconnectFailedMessage)
         }
         beginCodexCompaction(session)
         do {
@@ -5100,6 +5163,10 @@ package final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObser
         let hasActiveThread = session.codexController?.hasActiveThread == true
 
         let requiresTransportStart = !hasActiveThread || session.codexNeedsReconnect
+        // "Reconnect in progress" for `/compact`: from the controller's installation through the
+        // startup lease and its own start/resume, cleared on every exit of this readiness pass.
+        let startInFlightMark = requiresTransportStart ? markCodexStartInFlight(session.codexController) : nil
+        defer { clearCodexStartInFlight(startInFlightMark) }
         let shouldBootstrapSessionInitialization = effectiveRunState.isActive || requiresTransportStart
         let hasLiveRunRoute = shouldManageCodexTooling
             ? (viewModel?.hasLiveRunRouteInCurrentMCPServer(runID) ?? false)
@@ -5220,6 +5287,8 @@ package final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObser
             runID: runID,
             runAttemptGeneration: session.runAttemptGeneration
         )
+        let startSiteInFlightMark = markCodexStartInFlight(startController)
+        defer { clearCodexStartInFlight(startSiteInFlightMark) }
         do {
             let startResult = try await startCodexNativeSession(
                 session: session,
@@ -5323,6 +5392,8 @@ package final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObser
                         break
                     }
                     failedController = recoveredController
+                    let recoveredInFlightMark = markCodexStartInFlight(recoveredController)
+                    defer { clearCodexStartInFlight(recoveredInFlightMark) }
                     do {
                         let recoveredStartResult = try await startCodexNativeSession(
                             session: session,
@@ -5379,6 +5450,32 @@ package final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObser
                 preserveRunID: preserveExistingRunID
             )
         }
+    }
+
+    /// Holds its controller strongly so the identifier can't be reused while the mark is live.
+    private struct CodexStartInFlightMark {
+        let controller: any CodexSessionControlling
+    }
+
+    private func markCodexStartInFlight(_ controller: (any CodexSessionControlling)?) -> CodexStartInFlightMark? {
+        guard let controller else { return nil }
+        codexStartsInFlight[ObjectIdentifier(controller), default: 0] += 1
+        return CodexStartInFlightMark(controller: controller)
+    }
+
+    private func clearCodexStartInFlight(_ mark: CodexStartInFlightMark?) {
+        guard let mark else { return }
+        let id = ObjectIdentifier(mark.controller)
+        guard let count = codexStartsInFlight[id] else { return }
+        if count <= 1 {
+            codexStartsInFlight.removeValue(forKey: id)
+        } else {
+            codexStartsInFlight[id] = count - 1
+        }
+    }
+
+    private func codexStartIsInFlight(for controller: any CodexSessionControlling) -> Bool {
+        codexStartsInFlight[ObjectIdentifier(controller)] != nil
     }
 
     private enum CodexTurnDispatchPlan {
