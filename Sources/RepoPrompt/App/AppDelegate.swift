@@ -19,6 +19,8 @@ import SwiftUI
 @MainActor
 class AppDelegate: NSObject, ObservableObject, NSApplicationDelegate {
     private var quitRequestPhase: AppQuitRequestPhase = .idle
+    /// The shutdown request whose reply this delegate awaits (log correlation only).
+    private var shutdownRequestID: UUID?
     private var presentedQuitAlert: NSAlert?
     private weak var presentedQuitAlertParent: NSWindow?
     private let dockMenuController = DockMenuController()
@@ -173,6 +175,12 @@ class AppDelegate: NSObject, ObservableObject, NSApplicationDelegate {
             activeItems: activeItems
         )
 
+        AgentLifecycleShutdownDiagnostics.terminateRequested(
+            decision: Self.diagnosticToken(decision),
+            phase: Self.diagnosticToken(quitRequestPhase),
+            reason: reason,
+            current: WindowStatesManager.shared.lifecycleShutdown.activeApplicationRequestID
+        )
         switch decision {
         case let .showConfirmation(confirmation):
             presentQuitConfirmation(confirmation, reason: reason, sender: sender)
@@ -182,6 +190,22 @@ class AppDelegate: NSObject, ObservableObject, NSApplicationDelegate {
             break
         }
         return .terminateLater
+    }
+
+    private static func diagnosticToken(_ decision: AppQuitRequestDecision) -> String {
+        switch decision {
+        case .showConfirmation: "show_confirmation"
+        case .beginTermination: "begin_termination"
+        case .awaitCurrentRequest: "await_current_request"
+        }
+    }
+
+    private static func diagnosticToken(_ phase: AppQuitRequestPhase) -> String {
+        switch phase {
+        case .idle: "idle"
+        case .awaitingConfirmation: "awaiting_confirmation"
+        case .terminating: "terminating"
+        }
     }
 
     private func presentQuitConfirmation(
@@ -240,8 +264,12 @@ class AppDelegate: NSObject, ObservableObject, NSApplicationDelegate {
         guard quitRequestPhase == .awaitingConfirmation,
               presentedQuitAlert === alert
         else {
+            AgentLifecycleShutdownDiagnostics.quitConfirmationAnswered("stale")
             return
         }
+        AgentLifecycleShutdownDiagnostics.quitConfirmationAnswered(
+            response == .alertSecondButtonReturn ? "quit" : "cancel"
+        )
         if let parentWindow = presentedQuitAlertParent {
             NotificationCenter.default.removeObserver(
                 self,
@@ -261,22 +289,39 @@ class AppDelegate: NSObject, ObservableObject, NSApplicationDelegate {
     }
 
     private func beginTermination(sender: NSApplication, reason: AgentRecoveryShutdownReason) {
-        guard quitRequestPhase != .terminating else { return }
+        guard quitRequestPhase != .terminating else {
+            AgentLifecycleShutdownDiagnostics.terminationBegan(
+                started: false,
+                current: WindowStatesManager.shared.lifecycleShutdown.activeApplicationRequestID,
+                cause: "already_terminating"
+            )
+            return
+        }
         quitRequestPhase = .terminating
 
         // Two-stage quit (spec R4): the coordinator freezes admission synchronously, preserves
         // layout and agent state (Stage A, cancellable), and only then sets the termination flags
         // and tears down (Stage B). It owns the single reply: `false` after a cancelled Stage A
         // (the app stays usable), `true` once Stage B finished or the user chose Quit Anyway.
-        let started = WindowStatesManager.shared.lifecycleShutdown.requestApplicationQuit(reason: reason) { [weak self] shouldTerminate in
+        let lifecycleShutdown = WindowStatesManager.shared.lifecycleShutdown
+        // A refused request replies synchronously, before any request of its own exists.
+        shutdownRequestID = nil
+        let started = lifecycleShutdown.requestApplicationQuit(reason: reason) { [weak self] shouldTerminate in
+            AgentLifecycleShutdownDiagnostics.terminateReply(shouldTerminate, current: self?.shutdownRequestID)
             if !shouldTerminate {
                 self?.quitRequestPhase = .idle
+                self?.shutdownRequestID = nil
             }
             sender.reply(toApplicationShouldTerminate: shouldTerminate)
         }
+        // Not started: refused (it already replied `false`, resetting the phase, or an earlier quit
+        // is sealed past its point of no return), or joined the request in progress.
+        let refused = !started && (quitRequestPhase == .idle || lifecycleShutdown.isApplicationAdmissionSealed)
+        let cause = started ? "started" : refused ? "refused" : "joined_in_progress"
+        shutdownRequestID = refused ? nil : lifecycleShutdown.activeApplicationRequestID
+        AgentLifecycleShutdownDiagnostics.terminationBegan(started: started, current: shutdownRequestID, cause: cause)
         if !started {
-            // An earlier quit still owns its reply; this request adds nothing.
-            appDelegateDebugLog("quit request joined an in-progress shutdown")
+            appDelegateDebugLog("quit request did not start a shutdown (\(cause))")
         }
     }
 

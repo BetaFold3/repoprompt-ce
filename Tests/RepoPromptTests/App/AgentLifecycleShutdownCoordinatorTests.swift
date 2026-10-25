@@ -723,6 +723,157 @@ final class AgentLifecycleShutdownCoordinatorTests: XCTestCase {
         XCTAssertEqual(replies, [true], "replied exactly once")
     }
 
+    // MARK: F5 observability (repeated requests, prompt identity at the single deadline)
+
+    /// Repeated quit requests (a second Quit click, another terminate) join the request in progress:
+    /// no new attempt, no new or later deadline, no second prompt, and no reply of their own. The
+    /// prompt appears at the first request's 8-second expiry and carries that request's identity.
+    func testRepeatedQuitRequestsNeverExtendTheSingleDeadline() async {
+        let participant = FakeParticipant()
+        let hang = makeHang()
+        participant.prepareHang = hang
+        appParticipants = [participant]
+        let coordinator = makeCoordinator()
+        var replies: [Bool] = []
+        XCTAssertTrue(coordinator.requestApplicationQuit { replies.append($0) })
+        let requestID = coordinator.applicationRequest?.id
+        await waitUntil("the stuck preparation") { hang.entered == 1 && clock.pendingCount == 1 }
+        XCTAssertEqual(clock.requestedDeadlines, [clock.instant(at: .seconds(8))])
+
+        clock.advance(by: .seconds(5))
+        for _ in 0 ..< 3 {
+            XCTAssertFalse(coordinator.requestApplicationQuit { replies.append($0) }, "a repeated quit joins")
+        }
+        await settle()
+        XCTAssertEqual(coordinator.applicationRequest?.id, requestID, "the same request")
+        XCTAssertEqual(clock.requestedDeadlines, [clock.instant(at: .seconds(8))], "no new or later deadline")
+        XCTAssertEqual(participant.prepareCalls, 1, "no new attempt")
+
+        clock.advance(by: .milliseconds(2900))
+        await settle()
+        XCTAssertFalse(recorder.isPresenting, "7.9 of 8 seconds since the first request")
+        clock.advance(by: .milliseconds(100))
+        await waitUntil("the timeout at the first request's expiry") { recorder.isPresenting }
+        let failure = recorder.presented.last
+        XCTAssertEqual(failure?.requestID, requestID)
+        XCTAssertEqual(failure?.stage, .preparation)
+        XCTAssertEqual(failure?.timedOut, true)
+        XCTAssertEqual(failure.map(AgentLifecycleShutdownDiagnostics.dialogStage), "preparation.deadline_expired")
+
+        // While the prompt waits for the user, a repeated quit neither re-presents nor re-arms.
+        XCTAssertFalse(coordinator.requestApplicationQuit { replies.append($0) })
+        await settle()
+        XCTAssertEqual(recorder.presented.count, 1)
+        XCTAssertEqual(clock.requestedCount, 1)
+        XCTAssertTrue(replies.isEmpty, "a repeated request never gets a reply of its own")
+
+        recorder.choose(.cancel)
+        await waitUntil("the cancelled reply") { !replies.isEmpty }
+        XCTAssertEqual(replies, [false], "replied exactly once, to the first request")
+        XCTAssertEqual(coordinator.applicationRequest?.id, requestID)
+        XCTAssertNil(coordinator.activeApplicationRequestID, "a finished request is never logged as the current one")
+    }
+
+    /// A teardown that never finishes: the Stage B prompt appears exactly at the single deadline the
+    /// request armed (none is armed at the point of no return), carries the request's identity, and
+    /// the teardown's late completion never finalizes, marks clean, or replies.
+    func testStalledTeardownPresentsTheStageBPromptForItsRequestAtTheSingleDeadline() async {
+        let participant = FakeParticipant()
+        let hang = makeHang()
+        participant.teardownHang = hang
+        appParticipants = [participant]
+        let coordinator = makeCoordinator()
+        var replies: [Bool] = []
+        coordinator.requestApplicationQuit { replies.append($0) }
+        let requestID = coordinator.applicationRequest?.id
+        await waitUntil("the stuck teardown") { hang.entered == 1 && clock.pendingCount == 1 }
+        XCTAssertEqual(clock.requestedDeadlines, [clock.instant(at: .seconds(8))], "one deadline, armed at the request")
+
+        clock.advance(by: .milliseconds(7900))
+        await settle()
+        XCTAssertFalse(recorder.isPresenting)
+        clock.advance(by: .milliseconds(100))
+        await waitUntil("the Stage B timeout") { recorder.isPresenting }
+        let failure = recorder.presented.last
+        XCTAssertEqual(failure?.requestID, requestID)
+        XCTAssertEqual(failure?.stage, .finalization)
+        XCTAssertEqual(failure?.timedOut, true)
+        XCTAssertEqual(failure.map(AgentLifecycleShutdownDiagnostics.dialogStage), "finalization.deadline_expired")
+
+        hang.release()
+        await settle()
+        XCTAssertEqual(coordinator.applicationRequest?.phase, .finalizationFailed, "the late teardown is fenced")
+        XCTAssertEqual(participant.finalizeCalls, 0)
+        XCTAssertTrue(replies.isEmpty, "the prompt keeps waiting for the user")
+        await drainLaunchMarks()
+        XCTAssertFalse(disk.committed.contains(.cleanExit))
+
+        recorder.choose(.proceedAnyway)
+        await waitUntil("the reply") { !replies.isEmpty }
+        XCTAssertEqual(replies, [true])
+    }
+
+    /// The persisted token and the dialog actually built for the same failure stay paired: each
+    /// failure kind's `dialogStage` is checked together with its alert's title.
+    func testDialogStageTokenPairsWithTheAlertTitleForEachFailureKind() {
+        func failure(
+            scope: AgentLifecycleShutdownScope = .application,
+            _ stage: AgentLifecycleShutdownStage,
+            timedOut: Bool = false,
+            awaitsAck: Bool = false,
+            unresolved: Bool = false,
+            allowsExit: Bool = false
+        ) -> AgentLifecycleShutdownFailure {
+            var failure = AgentLifecycleShutdownFailure(
+                requestID: UUID(),
+                scope: scope,
+                stage: stage,
+                messages: [AgentLifecycleShutdownCoordinator.timeoutMessage],
+                timedOut: timedOut,
+                awaitsCleanExitAcknowledgement: awaitsAck
+            )
+            failure.relaunchHelperUnresolved = unresolved
+            failure.allowsUncertainRelaunchExit = allowsExit
+            return failure
+        }
+        let cases: [(AgentLifecycleShutdownFailure, String, String)] = [
+            (failure(.preparation, timedOut: true), "preparation.deadline_expired", "RepoPrompt couldn't save everything before quitting"),
+            (failure(.preparation), "preparation.failure", "RepoPrompt couldn't save everything before quitting"),
+            (
+                failure(scope: .window(1), .preparation, timedOut: true),
+                "preparation.deadline_expired",
+                "RepoPrompt couldn't save everything before closing this window"
+            ),
+            (failure(.finalization, timedOut: true), "finalization.deadline_expired", "Some work could not be saved"),
+            (failure(.finalization), "finalization.failure", "Some work could not be saved"),
+            (failure(scope: .window(1), .finalization), "finalization.failure", "Some work could not be saved"),
+            (
+                failure(.finalization, timedOut: true, awaitsAck: true),
+                "finalization.clean_exit_unacknowledged",
+                "RepoPrompt is still finishing its quit"
+            ),
+            (
+                failure(.finalization, unresolved: true),
+                "finalization.relaunch_unresolved",
+                "RepoPrompt can't continue restarting safely"
+            ),
+            (
+                failure(.preparation, unresolved: true),
+                "preparation.relaunch_unresolved",
+                "RepoPrompt can't continue restarting safely"
+            ),
+            (
+                failure(.finalization, unresolved: true, allowsExit: true),
+                "finalization.relaunch_unresolved_exit_offered",
+                "RepoPrompt can exit, but may reopen"
+            )
+        ]
+        for (failure, token, title) in cases {
+            XCTAssertEqual(AgentLifecycleShutdownDiagnostics.dialogStage(failure), token, title)
+            XCTAssertEqual(WindowStatesManager.makeLifecycleShutdownFailureAlert(failure).messageText, title, token)
+        }
+    }
+
     // MARK: Clean mark at the persistence boundary (R4-02)
 
     /// A clean write that failed committed nothing: no correction is needed, the launch file keeps

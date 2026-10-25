@@ -301,13 +301,32 @@ extension AgentModeViewModel {
         let label = shutdownSessionLabel(session)
         // Composer input that has no lane yet (first draft of a new tab, images awaiting promotion):
         // its single preparation is joined, and any obligation left is not durable.
+        // F5 observability: this join is unbounded (only the coordinator's deadline ends Stage A),
+        // so a persisted line brackets it.
+        let requestID = shutdownFreezeState?.requestID
         if let preparation = coordinator.composerPreparation(for: session) {
+            AgentLifecycleShutdownDiagnostics.composerPreparationWait(request: requestID, tabID: session.tabID, finished: false)
             await preparation.preparationTask?.value
-            if coordinator.composerPreparation(for: session) != nil {
+            let stillPending = coordinator.composerPreparation(for: session) != nil
+            AgentLifecycleShutdownDiagnostics.composerPreparationWait(
+                request: requestID,
+                tabID: session.tabID,
+                finished: true,
+                stillPending: stillPending
+            )
+            if stillPending {
                 return "\(label) has a draft that could not be saved yet."
             }
         }
-        guard let lane = session.recoveryLane, !lane.isRetired else { return nil }
+        guard let lane = session.recoveryLane, !lane.isRetired else {
+            // No lane: no composer, question, or run-shutdown evidence is written for this session.
+            AgentLifecycleShutdownDiagnostics.sessionSkippedWithoutLane(
+                request: requestID,
+                tabID: session.tabID,
+                hasActiveRun: session.activeRunOwnership != nil
+            )
+            return nil
+        }
         let capture = AgentRecoveryQuestionSnapshotBuilder.capture(
             session: session,
             appInstanceID: coordinator.store.appInstanceID,

@@ -1166,6 +1166,93 @@ final class AgentRecoveryResetBoundaryTests: XCTestCase {
         )
     }
 
+    // MARK: - F5: unbounded composer-preparation join under the single deadline
+
+    /// Stage A joins a session's pending composer preparation without a bound of its own. One that
+    /// never finishes presents the window close's Stage A prompt (Retry / Cancel) at the request's
+    /// single 8-second deadline, carrying that request's identity; the prompt then waits for the
+    /// user, and the preparation's late completion never completes the expired request.
+    func testPermanentlySuspendedComposerPreparationPresentsTheStageAPromptAtTheSingleDeadline() async throws {
+        let windowID = 4632
+        let harness = try await makeHarness(windowID: windowID)
+        let viewModel = harness.viewModel
+        let session = harness.session
+        let recovery = try XCTUnwrap(viewModel.recoveryCoordinator)
+        let preparationGate = ResetBoundaryWriteGate()
+        defer { preparationGate.release() }
+        recovery.recordComposerMutationAwaitingPreparation(owner: session, content: nil)
+        XCTAssertTrue(recovery.startComposerPreparation(owner: session) { _ in
+            await preparationGate.waitOnce()
+            return nil
+        })
+        let preparationTask = try XCTUnwrap(recovery.composerPreparation(for: session)?.preparationTask)
+
+        let sleeper = ShutdownDeadlineSleeper()
+        let prompts = ShutdownPromptRecorder()
+        let origin = ContinuousClock.now
+        let shutdown = AgentLifecycleShutdownCoordinator(environment: AgentLifecycleShutdownEnvironment(
+            participants: { [weak viewModel] scope in
+                guard scope == .window(windowID), let viewModel else { return [] }
+                return [viewModel]
+            },
+            beginApplicationRecoveryFreeze: { {} },
+            preserveLayout: { true },
+            settleReleasedRecoveryInput: { [] },
+            recordLaunchState: { _ in Task { true } },
+            authorizeCleanExit: { UUID() },
+            recordCleanExit: { _ in Task { true } },
+            beginIrreversible: { prompts.irreversible.append($0) },
+            tearDownScope: { _ in },
+            presentFailure: { await prompts.present($0) },
+            dismissFailure: { _ in },
+            now: { origin },
+            sleepUntil: { try await sleeper.sleep(until: $0) }
+        ))
+        var finishes: [Bool] = []
+        XCTAssertTrue(shutdown.requestWindowClose(windowID: windowID, forwardedVeto: { true }, finish: { finishes.append($0) }))
+        let requestID = try XCTUnwrap(shutdown.request(for: .window(windowID))?.id)
+
+        let parked = await RecoveryTestSupport.eventually { preparationGate.isWaiting && sleeper.requested.count == 1 }
+        XCTAssertTrue(parked)
+        for _ in 0 ..< 100 {
+            await Task.yield()
+        }
+        XCTAssertEqual(shutdown.request(for: .window(windowID))?.phase, .preparing, "Stage A is parked in the join")
+        XCTAssertFalse(prompts.isPresenting, "no prompt before the deadline")
+        XCTAssertEqual(sleeper.requested, [origin + .seconds(8)], "the single deadline, captured at the request")
+
+        sleeper.fire()
+        let presented = await RecoveryTestSupport.eventually { prompts.isPresenting }
+        XCTAssertTrue(presented)
+        let failure = try XCTUnwrap(prompts.presented.last)
+        XCTAssertEqual(failure.requestID, requestID)
+        XCTAssertEqual(failure.scope, .window(windowID))
+        XCTAssertEqual(failure.stage, .preparation)
+        XCTAssertEqual(failure.timedOut, true)
+        XCTAssertEqual(failure.messages, [AgentLifecycleShutdownCoordinator.timeoutMessage])
+        XCTAssertEqual(failure.offeredChoices, [.retry, .cancel])
+        XCTAssertEqual(AgentLifecycleShutdownDiagnostics.dialogStage(failure), "preparation.deadline_expired")
+        XCTAssertTrue(viewModel.isShutdownFrozen, "the prompt waits for the user; nothing reopens on its own")
+
+        // The preparation finishes late: the expired request is not completed, re-prompted, or closed.
+        preparationGate.release()
+        await preparationTask.value
+        // Stage A itself (the participant's preparation) now runs to its end.
+        _ = await viewModel.shutdownPreparationTask?.value
+        for _ in 0 ..< 200 {
+            await Task.yield()
+        }
+        XCTAssertEqual(shutdown.request(for: .window(windowID))?.phase, .preparationFailed, "the late completion is fenced")
+        XCTAssertEqual(prompts.presented.count, 1)
+        XCTAssertTrue(prompts.irreversible.isEmpty, "never crosses the point of no return")
+        XCTAssertTrue(finishes.isEmpty)
+
+        prompts.choose(.cancel)
+        let cancelled = await RecoveryTestSupport.eventually { finishes == [false] }
+        XCTAssertTrue(cancelled)
+        XCTAssertFalse(viewModel.isShutdownFrozen, "Cancel reopens the window")
+    }
+
     private struct Harness {
         let viewModel: AgentModeViewModel
         let workspace: WorkspaceModel
@@ -1362,6 +1449,74 @@ private final class RecoveryStoreRunShutdownWriteHold: @unchecked Sendable {
         if wasHolding {
             gate.signal()
         }
+    }
+}
+
+/// The shutdown coordinator's deadline sleep, fired by the test (time never moves on its own).
+/// Cancellation throws, so a cancelled deadline task never stays suspended.
+private final class ShutdownDeadlineSleeper: @unchecked Sendable {
+    private let lock = NSLock()
+    private var waiters: [(UUID, CheckedContinuation<Void, Error>)] = []
+    private var requestedInstants: [ContinuousClock.Instant] = []
+
+    var requested: [ContinuousClock.Instant] {
+        lock.withLock { requestedInstants }
+    }
+
+    func sleep(until deadline: ContinuousClock.Instant) async throws {
+        let id = UUID()
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                lock.lock()
+                if Task.isCancelled {
+                    lock.unlock()
+                    continuation.resume(throwing: CancellationError())
+                    return
+                }
+                requestedInstants.append(deadline)
+                waiters.append((id, continuation))
+                lock.unlock()
+            }
+        } onCancel: {
+            lock.lock()
+            let index = waiters.firstIndex { $0.0 == id }
+            let continuation = index.map { waiters.remove(at: $0).1 }
+            lock.unlock()
+            continuation?.resume(throwing: CancellationError())
+        }
+    }
+
+    /// Expires every pending sleep.
+    func fire() {
+        let pending = lock.withLock {
+            let values = waiters
+            waiters = []
+            return values
+        }
+        pending.forEach { $0.1.resume() }
+    }
+}
+
+/// Records the shutdown coordinator's prompts and answers them on the test's command.
+@MainActor
+private final class ShutdownPromptRecorder {
+    var presented: [AgentLifecycleShutdownFailure] = []
+    var irreversible: [AgentLifecycleShutdownScope] = []
+    private var pendingChoice: CheckedContinuation<AgentLifecycleShutdownChoice, Never>?
+
+    var isPresenting: Bool {
+        pendingChoice != nil
+    }
+
+    func present(_ failure: AgentLifecycleShutdownFailure) async -> AgentLifecycleShutdownChoice {
+        presented.append(failure)
+        return await withCheckedContinuation { pendingChoice = $0 }
+    }
+
+    func choose(_ choice: AgentLifecycleShutdownChoice) {
+        let continuation = pendingChoice
+        pendingChoice = nil
+        continuation?.resume(returning: choice)
     }
 }
 

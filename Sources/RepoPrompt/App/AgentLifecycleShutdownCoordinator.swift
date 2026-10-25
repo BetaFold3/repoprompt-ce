@@ -429,6 +429,12 @@ final class AgentLifecycleShutdownCoordinator {
         applicationRequest.map { !$0.isFinished } ?? false
     }
 
+    /// The unfinished app quit's ID, for log correlation only (`nil` once it finished, so a log line
+    /// never names an earlier, finished request).
+    var activeApplicationRequestID: UUID? {
+        applicationRequest.flatMap { $0.isFinished ? nil : $0.id }
+    }
+
     /// Whether a window close of `windowID` is in progress (any stage, unfinished).
     func isWindowRequestActive(_ windowID: Int) -> Bool {
         windowRequests[windowID].map { !$0.isFinished } ?? false
@@ -447,14 +453,33 @@ final class AgentLifecycleShutdownCoordinator {
         // Only an app quit or Restart safely; Restart safely only while its hooks are composed.
         guard reason == .appQuit || (reason == .safeRestart && environment.relaunch != nil) else {
             // Refused before anything froze: the app keeps running (the reply is never lost).
+            AgentLifecycleShutdownDiagnostics.requestCoalesced(
+                current: activeApplicationRequestID,
+                scope: .application,
+                reason: reason,
+                cause: "refused_reason_unavailable"
+            )
             reply(false)
             return false
         }
         if isApplicationAdmissionSealed {
             // The quit that crossed the point of no return owns the (already given) reply.
+            AgentLifecycleShutdownDiagnostics.requestCoalesced(
+                current: activeApplicationRequestID,
+                scope: .application,
+                reason: reason,
+                cause: "admission_sealed"
+            )
             return false
         }
         if let current = applicationRequest, !current.isFinished {
+            // Joins the request in progress: no new attempt, and its deadline is not extended.
+            AgentLifecycleShutdownDiagnostics.requestCoalesced(
+                current: current.id,
+                scope: .application,
+                reason: reason,
+                cause: "in_progress:\(AgentLifecycleShutdownDiagnostics.phaseToken(current.phase))"
+            )
             return false
         }
         let participants = environment.participants(.application)
@@ -466,6 +491,12 @@ final class AgentLifecycleShutdownCoordinator {
             completion: reply
         )
         applicationRequest = request
+        AgentLifecycleShutdownDiagnostics.requested(
+            request.id,
+            scope: .application,
+            reason: reason,
+            participants: participants.count
+        )
         // Synchronous freeze before any await: every lane (later ones included), every window.
         request.endRecoveryFreeze = environment.beginApplicationRecoveryFreeze()
         for participant in participants {
@@ -516,6 +547,15 @@ final class AgentLifecycleShutdownCoordinator {
         finish: @escaping @MainActor (Bool) -> Void
     ) -> Bool {
         guard !isApplicationAdmissionSealed, !isApplicationRequestActive, !isWindowRequestActive(windowID) else {
+            let cause = isApplicationAdmissionSealed
+                ? "admission_sealed"
+                : isApplicationRequestActive ? "application_quit_in_progress" : "close_in_progress"
+            AgentLifecycleShutdownDiagnostics.requestCoalesced(
+                current: isWindowRequestActive(windowID) ? windowRequests[windowID]?.id : activeApplicationRequestID,
+                scope: .window(windowID),
+                reason: .windowClose,
+                cause: cause
+            )
             return false
         }
         let request = Request(
@@ -526,6 +566,12 @@ final class AgentLifecycleShutdownCoordinator {
             completion: finish
         )
         windowRequests[windowID] = request
+        AgentLifecycleShutdownDiagnostics.requested(
+            request.id,
+            scope: request.scope,
+            reason: request.reason,
+            participants: request.participants.count
+        )
         for participant in request.participants {
             participant.beginShutdownFreeze(requestID: request.id, ownsRecoveryFreeze: true)
         }
@@ -548,7 +594,14 @@ final class AgentLifecycleShutdownCoordinator {
         }
         request.attemptParticipantRevision = request.participantRevision
         // A new user attempt (initial request or Retry): a fresh absolute deadline, captured now.
-        armDeadline(request)
+        let workBudget = armDeadline(request)
+        AgentLifecycleShutdownDiagnostics.stageAStarted(
+            request.id,
+            attempt: attempt,
+            attemptNumber: request.preparationAttempts + 1,
+            participants: request.preparationParticipants.count,
+            deadlineMilliseconds: Self.milliseconds(workBudget)
+        )
         // A retried attempt runs only after the previous attempt's work settled (never twice
         // concurrently); its fresh deadline already covers that wait.
         let previous = request.workTask
@@ -570,26 +623,38 @@ final class AgentLifecycleShutdownCoordinator {
         }
         if request.scope == .application {
             // Layout first: it is preserved before anything can be torn down.
+            AgentLifecycleShutdownDiagnostics.stageAStep(request.id, attempt: attempt, step: "layout")
             if await !environment.preserveLayout() {
                 blockers.append(Self.layoutFailureMessage)
             }
             guard stillCurrent() else { return blockers }
             // Verified before the point of no return: Stage B relies on this unclean mark (an
             // unconfirmed write is held by the attempt's deadline, never crossed).
+            AgentLifecycleShutdownDiagnostics.stageAStep(request.id, attempt: attempt, step: "launch_mark")
             let marked = await environment.recordLaunchState(.shutdownInProgress).value
             guard stillCurrent() else { return blockers }
             if !marked {
                 blockers.append(Self.launchMarkFailureMessage)
             }
+            AgentLifecycleShutdownDiagnostics.stageAStep(request.id, attempt: attempt, step: "released_input")
             blockers += await environment.settleReleasedRecoveryInput()
         }
-        for participant in request.preparationParticipants {
+        let participants = request.preparationParticipants
+        for (index, participant) in participants.enumerated() {
             guard stillCurrent() else { return blockers }
+            AgentLifecycleShutdownDiagnostics.stageAStep(
+                request.id,
+                attempt: attempt,
+                step: "participant",
+                index: index,
+                count: participants.count
+            )
             blockers += await participant.shutdownPrepare(reason: request.reason).blockers
         }
         if blockers.isEmpty, request.reason == .safeRestart, let relaunch = environment.relaunch {
             // Stage A ends with a ready (never armed) helper, within what is left of the deadline.
             guard stillCurrent() else { return blockers }
+            AgentLifecycleShutdownDiagnostics.stageAStep(request.id, attempt: attempt, step: "relaunch_prepare")
             if let blocker = await relaunch.prepare(relaunchBudget(request)) {
                 blockers.append(blocker)
             } else if stillCurrent() {
@@ -614,7 +679,10 @@ final class AgentLifecycleShutdownCoordinator {
 
     private func preparationFinished(_ request: Request, attempt: UUID, blockers: [String], timedOut: Bool) {
         // Late-completion fence: a timed-out, cancelled, superseded, or retried attempt is ignored.
-        guard isCurrent(request, attempt: attempt, phase: .preparing) else { return }
+        guard isCurrent(request, attempt: attempt, phase: .preparing) else {
+            AgentLifecycleShutdownDiagnostics.staleCompletionIgnored(request.id, attempt: attempt, stage: .preparation, phase: request.phase)
+            return
+        }
         request.preparationAttempts += 1
         var blockers = blockers
         var timedOut = timedOut
@@ -629,6 +697,13 @@ final class AgentLifecycleShutdownCoordinator {
             // attempt preserved does not include it. Retry covers both.
             blockers.append(Self.newWindowMessage)
         }
+        AgentLifecycleShutdownDiagnostics.stageFinished(
+            request.id,
+            attempt: attempt,
+            stage: .preparation,
+            blockers: blockers.count,
+            timedOut: timedOut
+        )
         guard blockers.isEmpty else {
             request.deadlineTask?.cancel()
             request.deadlineTask = nil
@@ -653,6 +728,7 @@ final class AgentLifecycleShutdownCoordinator {
         }
         request.endRecoveryFreeze?()
         request.endRecoveryFreeze = nil
+        AgentLifecycleShutdownDiagnostics.ended(request.id, outcome: "cancelled", reply: false)
         if request.scope == .application {
             // Ordered after this attempt's `shutdownInProgress`: the app keeps running.
             _ = environment.recordLaunchState(.running)
@@ -679,6 +755,7 @@ final class AgentLifecycleShutdownCoordinator {
         for participant in request.participants {
             participant.endShutdownFreeze(requestID: request.id)
         }
+        AgentLifecycleShutdownDiagnostics.ended(request.id, outcome: "superseded", reply: false)
         request.completion(false)
     }
 
@@ -687,6 +764,7 @@ final class AgentLifecycleShutdownCoordinator {
     private func enterPointOfNoReturn(_ request: Request) {
         // The forwarded delegate's veto is honored before anything irreversible happens.
         if let veto = request.forwardedVeto, !veto() {
+            AgentLifecycleShutdownDiagnostics.vetoed(request.id)
             cancel(request)
             return
         }
@@ -696,11 +774,13 @@ final class AgentLifecycleShutdownCoordinator {
             isApplicationAdmissionSealed = true
         }
         request.phase = .tearingDown
+        AgentLifecycleShutdownDiagnostics.stageBStarted(request.id, participants: request.participants.count)
         environment.beginIrreversible(request.scope)
         let participants = request.participants
         let reason = request.reason
         let scope = request.scope
         let environment = environment
+        let requestID = request.id
         request.teardownTask = Task { @MainActor in
             await withTaskGroup(of: Void.self) { group in
                 for participant in participants {
@@ -710,6 +790,7 @@ final class AgentLifecycleShutdownCoordinator {
                 }
             }
             await environment.tearDownScope(scope)
+            AgentLifecycleShutdownDiagnostics.teardownFinished(requestID)
         }
         startFinalizationAttempt(request, freshDeadline: false)
     }
@@ -722,16 +803,28 @@ final class AgentLifecycleShutdownCoordinator {
         request.phase = .tearingDown
         // A new attempt never inherits an earlier attempt's pre-arm witness (Step 4c).
         request.relaunchArmSafetyProof = nil
-        if freshDeadline || request.deadlineTask == nil {
-            armDeadline(request)
-        }
+        let workBudget = freshDeadline || request.deadlineTask == nil ? armDeadline(request) : nil
+        AgentLifecycleShutdownDiagnostics.finalizationStarted(
+            request.id,
+            attempt: attempt,
+            attemptNumber: request.finalizationAttempts + 1,
+            freshDeadlineMilliseconds: workBudget.map(Self.milliseconds)
+        )
         let previous = request.workTask
         let teardown = request.teardownTask
         request.workTask = Task { @MainActor [weak self] in
             await previous?.value
             await teardown?.value
             guard let self, isCurrent(request, attempt: attempt, phase: .tearingDown) else { return }
-            guard let outcome = await runFinalization(request, attempt: attempt) else { return }
+            guard let outcome = await runFinalization(request, attempt: attempt) else {
+                AgentLifecycleShutdownDiagnostics.staleCompletionIgnored(
+                    request.id,
+                    attempt: attempt,
+                    stage: .finalization,
+                    phase: request.phase
+                )
+                return
+            }
             finalizationFinished(request, attempt: attempt, blockers: outcome.blockers, timedOut: outcome.timedOut)
         }
     }
@@ -838,7 +931,10 @@ final class AgentLifecycleShutdownCoordinator {
     }
 
     private func finalizationFinished(_ request: Request, attempt: UUID, blockers: [String], timedOut: Bool) {
-        guard isCurrent(request, attempt: attempt, phase: .tearingDown) else { return }
+        guard isCurrent(request, attempt: attempt, phase: .tearingDown) else {
+            AgentLifecycleShutdownDiagnostics.staleCompletionIgnored(request.id, attempt: attempt, stage: .finalization, phase: request.phase)
+            return
+        }
         request.deadlineTask?.cancel()
         request.deadlineTask = nil
         request.finalizationAttempts += 1
@@ -854,6 +950,13 @@ final class AgentLifecycleShutdownCoordinator {
             // for Restart safely, possibly the stopped-provider proof or the helper arm after it).
             blockers = [request.reason == .safeRestart ? Self.restartTimeoutMessage : Self.cleanExitAcknowledgementMessage]
         }
+        AgentLifecycleShutdownDiagnostics.stageFinished(
+            request.id,
+            attempt: attempt,
+            stage: .finalization,
+            blockers: blockers.count,
+            timedOut: timedOut
+        )
         guard blockers.isEmpty else {
             request.phase = .finalizationFailed
             present(request, attempt: attempt, stage: .finalization, messages: blockers, timedOut: timedOut)
@@ -882,6 +985,7 @@ final class AgentLifecycleShutdownCoordinator {
         endRelaunchStopObservation(request)
         // Discards only the coordinator's eligibility witness; the driver keeps helper ownership.
         request.relaunchArmSafetyProof = nil
+        AgentLifecycleShutdownDiagnostics.ended(request.id, outcome: "completed", reply: true)
         request.completion(true)
     }
 
@@ -989,9 +1093,18 @@ final class AgentLifecycleShutdownCoordinator {
             // The same presentation may be shown again (Step 4c): no hook, observation, or deadline
             // is repeated, so the stop observation of this presentation stays valid.
             while true {
+                AgentLifecycleShutdownDiagnostics.dialogPresented(failure, attempt: attempt, presentation: presentation)
                 let choice = await environment.presentFailure(failure)
                 // An answer to a dismissed or replaced prompt is ignored.
-                guard request.presentationID == presentation, isCurrent(request, attempt: attempt, phase: failedPhase) else { return }
+                let isCurrentAnswer = request.presentationID == presentation
+                    && isCurrent(request, attempt: attempt, phase: failedPhase)
+                AgentLifecycleShutdownDiagnostics.dialogChoice(
+                    failure,
+                    presentation: presentation,
+                    choice: choice,
+                    stale: !isCurrentAnswer
+                )
+                guard isCurrentAnswer else { return }
                 if failure.relaunchHelperUnresolved {
                     if failure.offersUncertainRelaunchExit {
                         if choice == .exitMayReopen, admitsUncertainRelaunchExit(request, attempt: attempt, stage: stage) {
@@ -1096,6 +1209,11 @@ final class AgentLifecycleShutdownCoordinator {
             && self.request(for: request.scope) === request
     }
 
+    private static func milliseconds(_ duration: Duration) -> Int64 {
+        let components = duration.components
+        return components.seconds * 1000 + components.attoseconds / 1_000_000_000_000_000
+    }
+
     private func isExpired(_ request: Request) -> Bool {
         guard let expiry = request.expiry else { return false }
         return environment.now() >= expiry
@@ -1115,7 +1233,9 @@ final class AgentLifecycleShutdownCoordinator {
     /// One absolute deadline per user attempt. Its expiry is captured synchronously (a delayed
     /// deadline task never extends it); the task never joins the attempt's work and, on expiry,
     /// times out whichever stage is then current (Stage A, or Stage B on the remainder).
-    private func armDeadline(_ request: Request) {
+    /// Returns the attempt's effective work budget (`expiry - start`: the deadline minus Restart
+    /// safely's cleanup reserve), for the log only.
+    private func armDeadline(_ request: Request) -> Duration {
         request.deadlineTask?.cancel()
         let deadlineID = UUID()
         request.deadlineID = deadlineID
@@ -1134,6 +1254,7 @@ final class AgentLifecycleShutdownCoordinator {
                 return
             }
             guard let self, request.deadlineID == deadlineID, !request.isFinished else { return }
+            AgentLifecycleShutdownDiagnostics.deadlineFired(request.id, attempt: request.attemptID, phase: request.phase)
             switch request.phase {
             case .preparing:
                 preparationFinished(request, attempt: request.attemptID, blockers: [Self.timeoutMessage], timedOut: true)
@@ -1144,5 +1265,6 @@ final class AgentLifecycleShutdownCoordinator {
                 break
             }
         }
+        return expiry - start
     }
 }
