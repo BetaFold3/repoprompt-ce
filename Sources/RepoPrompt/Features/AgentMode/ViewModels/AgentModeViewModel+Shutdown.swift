@@ -366,10 +366,17 @@ extension AgentModeViewModel {
             }
             return nil
         case let .failure(failure):
+            AgentRecoveryFailureDiagnostics.shutdownBlocked(
+                reason: Self.shutdownPreparationDiagnosticReason(failure),
+                tabID: session.tabID,
+                failure: Self.shutdownPreparationControllerFailure(failure)
+            )
             return "\(label): \(Self.shutdownPreparationFailureText(failure))"
         }
     }
 
+    /// F6: plain, actionable wording only. The raw controller failure (store errors, `Domain=`
+    /// text, paths) is logged privately by `AgentRecoveryFailureDiagnostics.shutdownBlocked`.
     static func shutdownPreparationFailureText(_ failure: AgentRecoveryShutdownPreparationFailure) -> String {
         switch failure {
         case .composer(.unsavedPredecessorInput):
@@ -381,9 +388,31 @@ extension AgentModeViewModel {
         case .composer(.laneRetired), .composer(.alreadyPreparing):
             "the session changed while it was being saved."
         case let .composer(.composerNotPersisted(failure)):
-            "the message box could not be saved\(failure.map { " (\($0))" } ?? "")."
+            "the message box could not be saved\(failure.map { " (\($0.userFacingDescription))" } ?? "")."
         case let .evidenceNotPersisted(failure):
-            "its recovery state could not be saved (\(failure))."
+            "its recovery state could not be saved (\(failure.userFacingDescription))."
+        }
+    }
+
+    private static func shutdownPreparationDiagnosticReason(_ failure: AgentRecoveryShutdownPreparationFailure) -> String {
+        switch failure {
+        case .composer(.unsavedPredecessorInput): "unsaved_predecessor_input"
+        case .composer(.unrepresentableComposerInput): "unrepresentable_composer_input"
+        case .composer(.composerChangedDuringPreparation): "composer_changed_during_preparation"
+        case .composer(.laneRetired): "lane_retired"
+        case .composer(.alreadyPreparing): "already_preparing"
+        case .composer(.composerNotPersisted): "composer_not_persisted"
+        case .evidenceNotPersisted: "evidence_not_persisted"
+        }
+    }
+
+    private static func shutdownPreparationControllerFailure(
+        _ failure: AgentRecoveryShutdownPreparationFailure
+    ) -> AgentRecoveryControllerFailure? {
+        switch failure {
+        case let .composer(.composerNotPersisted(failure)): failure
+        case let .evidenceNotPersisted(failure): failure
+        case .composer: nil
         }
     }
 
@@ -478,7 +507,12 @@ extension AgentModeViewModel {
                     report.blockers.append("\(label): how its last run ended could not be saved.")
                 }
                 if case let .failed(failure) = await lane.flushComposer() {
-                    report.blockers.append("\(label): the message box could not be saved (\(failure)).")
+                    AgentRecoveryFailureDiagnostics.shutdownBlocked(
+                        reason: "final_composer_not_persisted",
+                        tabID: session.tabID,
+                        failure: failure
+                    )
+                    report.blockers.append("\(label): the message box could not be saved (\(failure.userFacingDescription)).")
                 }
             }
             if case let .failed(message) = await flushTranscriptForShutdown(session, final: true) {

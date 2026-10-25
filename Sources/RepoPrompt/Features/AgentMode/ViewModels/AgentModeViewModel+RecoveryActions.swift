@@ -173,7 +173,8 @@ extension AgentModeViewModel {
         case .success(.preserved):
             return "This session's recovery data is unreadable and is kept unchanged."
         case let .failure(failure):
-            return "This session's recovery data couldn't be read (\(failure))."
+            AgentRecoveryFailureDiagnostics.presentationFailure(site: "recovery_action_record_unreadable", failure: failure)
+            return "This session's recovery data couldn't be read (\(Self.recoveryListDescription(of: failure)))."
         }
         // A previous launch's open action, already shown: this explicit choice names it. Uncertain
         // delivery admits only a continuation sent from the editor that showed the warning.

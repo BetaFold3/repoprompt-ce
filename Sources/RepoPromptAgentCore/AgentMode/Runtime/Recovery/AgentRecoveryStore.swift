@@ -132,7 +132,9 @@ package enum AgentRecoveryStoreError: Error, Equatable {
     case unreadableRecord(UUID, AgentRecoveryUnreadableReason)
     case attachmentUnavailable(imageID: UUID)
     case attachmentImportFailed(String)
-    case storageFailure(String)
+    /// A storage operation failed: the raw description (logs only, never user-facing text) and its
+    /// typed cause, classified at the store boundary (`AgentRecoveryStorageFailureCause`).
+    case storageFailure(String, cause: AgentRecoveryStorageFailureCause)
     case intentNotFound(UUID)
     case intentConflict(UUID)
     case attemptNotFound(UUID)
@@ -485,7 +487,7 @@ package actor AgentRecoveryStore {
         } catch let error as CocoaError where error.code == .fileReadNoSuchFile {
             return []
         } catch {
-            throw AgentRecoveryStoreError.storageFailure(String(describing: error))
+            throw AgentRecoveryStoreError.classifiedStorageFailure(error)
         }
         var entries: [AgentRecoveryDiscoveryEntry] = []
         for url in contents.sorted(by: { $0.lastPathComponent < $1.lastPathComponent }) where url.pathExtension == "json" {
@@ -1484,7 +1486,7 @@ package actor AgentRecoveryStore {
     /// through `recordCleanExit(authorization:)`; a committed unclean mark replaces any clean one.
     package func recordCurrentLaunch(_ state: AgentRecoveryLaunchMark.State) throws -> AgentRecoveryLaunchMark {
         guard state != .cleanExit else {
-            throw AgentRecoveryStoreError.storageFailure("cleanExit requires a clean-exit authorization")
+            throw AgentRecoveryStoreError.storageFailure("cleanExit requires a clean-exit authorization", cause: .other)
         }
         let mark = try writeLaunchMark(state)
         cleanExitGate.noteUncleanCommitted()
@@ -1523,7 +1525,7 @@ package actor AgentRecoveryStore {
             try FileManager.default.createDirectory(at: rootURL, withIntermediateDirectories: true)
             try fileOperations.writeAtomically(data, launchStateFileURL)
         } catch {
-            throw AgentRecoveryStoreError.storageFailure(String(describing: error))
+            throw AgentRecoveryStoreError.classifiedStorageFailure(error)
         }
         return mark
     }
@@ -2151,7 +2153,7 @@ package actor AgentRecoveryStore {
             try FileManager.default.createDirectory(at: sessionsDirectoryURL, withIntermediateDirectories: true)
             try fileOperations.writeAtomically(data, recordFileURL(sessionID: binding.sessionID))
         } catch {
-            throw AgentRecoveryStoreError.storageFailure(String(describing: error))
+            throw AgentRecoveryStoreError.classifiedStorageFailure(error)
         }
         commitPublisher.publish(sessionID: binding.sessionID, state: .supported(record))
         return record
@@ -2161,7 +2163,7 @@ package actor AgentRecoveryStore {
         do {
             try fileOperations.removeItem(url)
         } catch {
-            throw AgentRecoveryStoreError.storageFailure(String(describing: error))
+            throw AgentRecoveryStoreError.classifiedStorageFailure(error)
         }
     }
 }

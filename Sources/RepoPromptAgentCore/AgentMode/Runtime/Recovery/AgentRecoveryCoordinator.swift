@@ -291,7 +291,7 @@ package enum AgentRecoveryAdmissionFailure: Error, Equatable {
             "This message was not sent because its recovery state is not ready. It stays saved."
         case .commitFailed:
             // Same user text as the runners' run-attempt failures; `diagnosticReason` tells them apart.
-            "This message was not sent because its delivery could not be recorded. It stays saved."
+            Self.deliveryNotRecordedText()
         case .staleAfterCommit, .dispatchStaleAfterCommit:
             "This message was not sent because the session changed. It stays saved."
         }
@@ -816,7 +816,7 @@ package final class AgentRecoveryCoordinator {
         freshness: AgentRecoveryCardFreshness
     ) async -> Result<AgentRecoveryLocalReceipt, AgentRecoveryControllerFailure> {
         let store = store
-        var lastFailure: AgentRecoveryControllerFailure = .store(.storageFailure("no attempt"))
+        var lastFailure: AgentRecoveryControllerFailure = .store(.storageFailure("no attempt", cause: .other))
         for _ in 0 ..< 3 {
             do {
                 return try await .success(dataService.performClosedRecoveryTransaction(binding: binding, workspace: workspace) {
@@ -925,7 +925,9 @@ package final class AgentRecoveryCoordinator {
             )
             startupState = .ready
         } catch {
-            startupState = .failed(String(describing: error))
+            // F6: plain wording reaches the banner, scheduler, and refusals; the raw error is logged.
+            AgentRecoveryFailureDiagnostics.startupFailed(error)
+            startupState = .failed(AgentRecoveryStorageFailureCause.startupFailureDescription(error))
         }
         postCoordinatorDidChange()
         requestIndexedScheduleRefresh()
@@ -3299,7 +3301,7 @@ package final class AgentRecoverySessionLane {
     ) async -> Result<T, AgentRecoveryControllerFailure> {
         let store = store
         let binding = binding
-        var lastFailure: AgentRecoveryControllerFailure = .store(.storageFailure("no attempt"))
+        var lastFailure: AgentRecoveryControllerFailure = .store(.storageFailure("no attempt", cause: .other))
         for _ in 0 ..< Self.maximumConflictRetries {
             do {
                 return try await .success(gate.performRecoveryTransaction { try await body(store, binding) })

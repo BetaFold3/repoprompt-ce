@@ -144,7 +144,7 @@ final class ClaudeIntegratedAgentModeRunner {
                     session: session
                 ) {
                     AgentDeliveryRecordDiagnostics.runAttemptNotRecorded(route: .claude, runAttemptID: runAttemptID, failure: failure)
-                    handoff.noteNoHandoff(message: "run attempt not recorded: \(failure)")
+                    handoff.noteNoHandoff(message: AgentProviderHandoff.deliveryNotRecordedText(failure))
                     self.hooks.recordStagedInputSendOutcome(handoff: handoff, sent: false)
                     await self.finalize(
                         session: session,
@@ -152,7 +152,7 @@ final class ClaudeIntegratedAgentModeRunner {
                         ownership: ownership,
                         attachmentReservationID: attachmentReservationID,
                         terminalState: .failed,
-                        errorText: "This message was not sent because its delivery could not be recorded. It stays saved.",
+                        errorText: AgentRecoveryAdmissionFailure.deliveryNotRecordedText(),
                         notifyTurnComplete: false
                     )
                     return

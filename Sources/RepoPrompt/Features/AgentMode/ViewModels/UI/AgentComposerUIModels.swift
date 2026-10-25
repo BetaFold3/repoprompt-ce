@@ -438,6 +438,36 @@ struct AgentRecoveryListProps: Equatable {
     var isEmpty: Bool {
         status == .ready && rows.isEmpty && otherItemCount == 0
     }
+
+    /// Banner header. F3: `rows` are this session's items and `otherItemCount` the items elsewhere
+    /// (the "Needs Attention (n)…" button), so the two counts are never merged and a session with
+    /// no rows never claims "0 items need your attention".
+    var headerText: String {
+        switch status {
+        case .loading:
+            return "Checking for work interrupted when RepoPrompt last closed…"
+        case let .failed(message):
+            return message
+        case .ready:
+            let elsewhere = otherItemCount == 1
+                ? "1 item elsewhere needs attention."
+                : "\(otherItemCount) items elsewhere need attention."
+            if rows.isEmpty {
+                return otherItemCount > 0
+                    ? "Nothing interrupted in this session. \(elsewhere)"
+                    : "Nothing interrupted in this session."
+            }
+            if otherItemCount == 0 {
+                return rows.count == 1
+                    ? "1 saved or interrupted item needs your attention."
+                    : "\(rows.count) saved or interrupted items need your attention."
+            }
+            let here = rows.count == 1
+                ? "1 saved or interrupted item in this session needs your attention."
+                : "\(rows.count) saved or interrupted items in this session need your attention."
+            return "\(here) \(elsewhere)"
+        }
+    }
 }
 
 /// One row of the app-wide Needs Attention sheet.

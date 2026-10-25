@@ -846,7 +846,7 @@ package final class AgentRecoveryComposerPersistenceController {
     private func withConflictRetry<T: Sendable>(
         _ body: @escaping @Sendable () async throws -> T
     ) async -> Result<T, AgentRecoveryControllerFailure> {
-        var lastFailure: AgentRecoveryControllerFailure = .store(.storageFailure("no attempt"))
+        var lastFailure: AgentRecoveryControllerFailure = .store(.storageFailure("no attempt", cause: .other))
         for _ in 0 ..< Self.maximumConflictRetries {
             let result = await inGate(body)
             if case let .failure(.store(error)) = result, case .revisionConflict = error {

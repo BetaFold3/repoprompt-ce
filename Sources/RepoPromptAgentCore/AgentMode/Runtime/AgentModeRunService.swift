@@ -679,7 +679,7 @@ package final class AgentModeRunService {
             case let .failure(failure):
                 AgentDeliveryRecordDiagnostics.runStartRefused(failure)
                 if case let .commitFailed(controllerFailure) = failure {
-                    return .failed(message: AgentProviderHandoff.dispatchFailureText(failure) + " (\(controllerFailure))")
+                    return .failed(message: AgentProviderHandoff.deliveryNotRecordedText(controllerFailure))
                 }
                 return .stale(reason: Self.recoveryDispatchRefusedReason)
             case let .success(prepared):

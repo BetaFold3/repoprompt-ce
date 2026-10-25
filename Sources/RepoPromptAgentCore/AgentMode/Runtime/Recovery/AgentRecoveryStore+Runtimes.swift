@@ -47,7 +47,7 @@ package extension AgentRecoveryStore {
         } catch let error as CocoaError where error.code == .fileReadNoSuchFile {
             return []
         } catch {
-            throw AgentRecoveryStoreError.storageFailure(String(describing: error))
+            throw AgentRecoveryStoreError.classifiedStorageFailure(error)
         }
         var entries: [AgentRuntimeDiscoveryEntry] = []
         for url in contents.sorted(by: { $0.lastPathComponent < $1.lastPathComponent }) where url.pathExtension == "json" {
@@ -119,7 +119,7 @@ package extension AgentRecoveryStore {
             try FileManager.default.createDirectory(at: runtimesDirectoryURL, withIntermediateDirectories: true)
             try fileOperations.writeAtomically(data, runtimeFileURL(runtimeID: next.runtimeID))
         } catch {
-            throw AgentRecoveryStoreError.storageFailure(String(describing: error))
+            throw AgentRecoveryStoreError.classifiedStorageFailure(error)
         }
         return next
     }

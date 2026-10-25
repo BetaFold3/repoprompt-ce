@@ -982,6 +982,34 @@ extension AgentModeViewModel {
         }
     }
 
+    /// F6 / review B R1: why a due scheduled message was refused durable admission. The schedule is
+    /// then marked failed (it is not retried automatically), so every case says it was not sent.
+    static func scheduledRecoveryAdmissionRefusalMessage(_ refusal: AgentRecoveryAdmissionRefusal) -> String {
+        switch refusal {
+        case .startupNotReady:
+            "The scheduled message was not sent because RepoPrompt was still checking what was interrupted by the last restart."
+        case let .startupFailed(reason):
+            // Already plain: `AgentRecoveryStorageFailureCause.startupFailureDescription`.
+            "The scheduled message was not sent. \(reason)"
+        case let .restricted(reason):
+            "The scheduled message was not sent: \(reason) Review it in the recovery banner."
+        case .crashHeld:
+            "The scheduled message was not sent because the previous run in this session may still have been working when RepoPrompt closed. Confirm it stopped from the recovery banner."
+        case .unsavedPredecessorInput:
+            "The scheduled message was not sent because earlier unsaved input in this session needs to be restored or discarded first (recovery banner)."
+        case .resetPreparationInProgress:
+            "The scheduled message was not sent because the conversation was being cleared."
+        case .shutdownInProgress:
+            "The scheduled message was not sent because RepoPrompt was saving this session before closing."
+        case .recoveryActionInProgress:
+            "The scheduled message was not sent because a recovery choice in this workspace was in progress."
+        case .laneRetired, .bindingMismatch:
+            "The scheduled message was not sent because the session changed before it could be saved."
+        case .composerUnavailable, .untrackedInput:
+            "The scheduled message could not be saved for recovery, so it was not sent."
+        }
+    }
+
     /// User-facing text for a Send now that installed no consent (one per scheduler early return).
     static func scheduledSendNowRefusalMessage(_ refusal: AgentScheduledSendNowRefusal) -> String {
         switch refusal {
@@ -3269,9 +3297,16 @@ extension AgentModeViewModel: AgentScheduledSendCoordinatorHost {
         case let .success(admitted):
             return .admitted(AgentQueuedInputIdentity(receipt: admitted.receipt), lane)
         case let .failure(.refused(refusal)):
-            return .notAdmitted("The scheduled message could not be saved for recovery (\(refusal)).")
+            // F6: a refusal is not a save failure, and its raw case is never shown. `.notAdmitted`
+            // marks the schedule failed (final; nothing retries it), so no text promises a resume.
+            AgentRecoveryFailureDiagnostics.presentationFailure(
+                site: "scheduled_admission_refused_\(refusal.diagnosticName)",
+                failure: refusal
+            )
+            return .notAdmitted(Self.scheduledRecoveryAdmissionRefusalMessage(refusal))
         case let .failure(.commitFailed(failure)):
-            return .notAdmitted("The scheduled message could not be saved for recovery (\(failure)).")
+            AgentRecoveryFailureDiagnostics.presentationFailure(site: "scheduled_admission_commit_failed", failure: failure)
+            return .notAdmitted("The scheduled message could not be saved for recovery (\(Self.recoveryListDescription(of: failure))).")
         case .failure(.staleAfterCommit), .failure(.dispatchStaleAfterCommit):
             // `dispatchStaleAfterCommit` is dispatch-only; admission never reports it.
             return .committedButStale
@@ -3381,11 +3416,12 @@ extension AgentModeViewModel: AgentScheduledSendCoordinatorHost {
         case let .success(state):
             recoveryRecord = state
         case let .failure(failure):
+            AgentRecoveryFailureDiagnostics.presentationFailure(site: "scheduled_delivery_evidence_unreadable", failure: failure)
             coordinator.reportProviderOutcomeNotAccepted(key: context.recoveryKey)
             holdScheduledSendTransfer(
                 sessionID: context.lease.sessionID,
                 record: context.dispatching,
-                reason: .unresolved("Delivery evidence could not be read: \(failure)")
+                reason: .unresolved("Delivery evidence could not be read (\(Self.recoveryListDescription(of: failure))).")
             )
             return .heldForRecovery
         }

@@ -292,6 +292,9 @@ final class AgentRecoveryStartupCompositionTests: XCTestCase {
         let elsewhereOnly = try XCTUnwrap(viewModel.recoveryListProps(forActiveSession: nil), "Items elsewhere keep the banner reachable")
         XCTAssertTrue(elsewhereOnly.rows.isEmpty)
         XCTAssertGreaterThanOrEqual(elsewhereOnly.otherItemCount, 3)
+        // F3: the header never says "0 items" beside a nonzero Needs Attention button.
+        XCTAssertEqual(elsewhereOnly.otherItemCount, 7, "The fixture's undismissed items, none in this (no) session")
+        XCTAssertEqual(elsewhereOnly.headerText, "Nothing interrupted in this session. 7 items elsewhere need attention.")
 
         // Cross-workspace Open (run and schedule rows) uses the exact agent-session route.
         final class Routes {
@@ -346,7 +349,15 @@ final class AgentRecoveryStartupCompositionTests: XCTestCase {
             "Dismiss does not clear the new-session gate"
         )
         let pausedRowID = "\(AgentModeViewModel.recoveryListPausedRowPrefix)\(held.session.id.uuidString)"
-        let paused = try XCTUnwrap(viewModel.recoveryListProps(forActiveSession: session)?.rows.first { $0.id == pausedRowID })
+        let pausedProps = try XCTUnwrap(viewModel.recoveryListProps(forActiveSession: session))
+        let paused = try XCTUnwrap(pausedProps.rows.first { $0.id == pausedRowID })
+        // F3: the dismissed crash hold's indicator is this session's item; items elsewhere stay distinct.
+        XCTAssertEqual(pausedProps.rows.count, 3, pausedProps.rows.map(\.id).description)
+        XCTAssertEqual(pausedProps.otherItemCount, 4)
+        XCTAssertEqual(
+            pausedProps.headerText,
+            "3 saved or interrupted items in this session need your attention. 4 items elsewhere need attention."
+        )
         XCTAssertTrue(paused.actions.contains(.confirmStopped))
         XCTAssertFalse(paused.actions.contains(.dismiss), "The paused indicator is not dismissible")
         await viewModel.performRecoveryListAction(rowID: pausedRowID, action: .confirmStopped)

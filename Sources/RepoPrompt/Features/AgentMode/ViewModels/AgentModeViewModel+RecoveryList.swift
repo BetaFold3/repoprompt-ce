@@ -13,7 +13,8 @@ extension AgentModeViewModel {
     func recoveryListProps(forActiveSession activeSession: AgentTabSession?) -> AgentRecoveryListProps? {
         if let failure = recoveryCompositionFailure {
             return AgentRecoveryListProps(
-                status: .failed("Interrupted-work recovery is unavailable (\(failure)). Sending stays paused."),
+                // `failure` is already a complete plain sentence (`startupFailureDescription`).
+                status: .failed("\(failure) Sending stays paused."),
                 rows: [],
                 canRetry: false
             )
@@ -25,7 +26,8 @@ extension AgentModeViewModel {
         case .ready:
             .ready
         case let .failed(message):
-            .failed("Interrupted work could not be checked: \(message). Sending stays paused until this succeeds.")
+            // `message` is already a complete plain sentence (`startupFailureDescription`).
+            .failed("\(message) Sending stays paused until this succeeds.")
         }
         var rows: [AgentRecoveryListRowProps] = []
         var otherItemCount = 0
@@ -387,8 +389,9 @@ extension AgentModeViewModel {
                 "\(workspaceName) has saved sessions but no readable session list, so a scheduled message waiting for confirmation there may be missing here. Open that workspace to review its scheduled messages; nothing is sent automatically."
             )
         case let .runtimeOwnershipUnknown(count, failure):
-            let cause = if let failure {
-                "The saved records of agent processes couldn't be read (\(failure))."
+            let cause = if failure != nil {
+                // F6: `failure` is an opaque raw error string (logged by the registry); never shown.
+                "The saved records of agent processes couldn't be read."
             } else if count == 1 {
                 "A saved record of an agent process couldn't be read."
             } else {
@@ -543,20 +546,7 @@ extension AgentModeViewModel {
 
     /// User-facing wording only: raw store errors and gate reasons can describe local paths.
     static func recoveryListDescription(of failure: AgentRecoveryControllerFailure) -> String {
-        switch failure {
-        case .store:
-            "saving to disk failed"
-        case .lifecycleRejected:
-            "the session changed"
-        case .retired:
-            "the session moved to another tab or window"
-        case .noHeldComposer, .heldInputChanged:
-            "it changed while it was being saved"
-        case .liveComposerHasUnsavedContent:
-            "the message box has newer text"
-        case .composerChangedDuringRestore:
-            "the message box changed while the draft was being restored"
-        }
+        failure.userFacingDescription
     }
 
     private static func recoveryListDescription(of failure: AgentRecoveryComposerPreparationFailure) -> String {
@@ -946,7 +936,8 @@ extension AgentModeViewModel {
         let questions: [AgentRecoveryQuestionSnapshot]
         switch await lane.readRecord() {
         case let .failure(failure):
-            return "The saved question couldn't be read (\(failure)). Nothing was changed."
+            AgentRecoveryFailureDiagnostics.presentationFailure(site: "recovery_list_question_unreadable", failure: failure)
+            return "The saved question couldn't be read (\(Self.recoveryListDescription(of: failure))). Nothing was changed."
         case let .success(state):
             switch state {
             case .preserved:
@@ -1141,7 +1132,8 @@ extension AgentModeViewModel {
     ) async -> RecoveredIntentLookup {
         switch await lane.readRecord() {
         case let .failure(failure):
-            return .unavailable("The saved message couldn't be read (\(failure)). Nothing was changed.")
+            AgentRecoveryFailureDiagnostics.presentationFailure(site: "recovery_list_message_unreadable", failure: failure)
+            return .unavailable("The saved message couldn't be read (\(Self.recoveryListDescription(of: failure))). Nothing was changed.")
         case let .success(state):
             switch state {
             case .preserved:
@@ -1259,13 +1251,15 @@ extension AgentModeViewModel {
         // The composer is written under this lane before the original is withdrawn.
         recoveryComposerDidMutate(session: session)
         if case let .failed(failure) = await lane.flushComposer() {
-            return "The message box couldn't be saved (\(failure)). The original message is still saved here."
+            AgentRecoveryFailureDiagnostics.presentationFailure(site: "recovery_list_edit_composer_not_saved", failure: failure)
+            return "The message box couldn't be saved (\(Self.recoveryListDescription(of: failure))). The original message is still saved here."
         }
         guard session.recoveryLane === lane, !lane.isRetired else {
             return "The session changed. The original message is still saved here."
         }
         if case let .failure(failure) = await lane.withdraw(intentID: intentID) {
-            return "The message was moved into the message box, but the original couldn't be removed (\(failure))."
+            AgentRecoveryFailureDiagnostics.presentationFailure(site: "recovery_list_edit_original_not_withdrawn", failure: failure)
+            return "The message was moved into the message box, but the original couldn't be removed (\(Self.recoveryListDescription(of: failure)))."
         }
         await awaitPendingHandoffRecoveryJoin(for: session)
         return nil
@@ -1287,7 +1281,8 @@ extension AgentModeViewModel {
             break
         }
         if case let .failure(failure) = await lane.withdraw(intentID: intentID) {
-            return "The message couldn't be removed (\(failure)). It is still saved."
+            AgentRecoveryFailureDiagnostics.presentationFailure(site: "recovery_list_remove_not_withdrawn", failure: failure)
+            return "The message couldn't be removed (\(Self.recoveryListDescription(of: failure))). It is still saved."
         }
         // A withdrawn carrier no longer reserves its pending-handoff payload.
         if session.recoveryLane === lane {

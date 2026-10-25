@@ -53,7 +53,7 @@ struct AgentRecoveryListBanner: View {
             Image(systemName: headerIcon)
                 .font(.system(size: 12, weight: .semibold))
                 .foregroundStyle(.orange)
-            Text(headerText)
+            Text(props.headerText)
                 .font(.system(size: 11, weight: .medium))
                 .lineLimit(2)
                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -79,19 +79,6 @@ struct AgentRecoveryListBanner: View {
             "exclamationmark.arrow.triangle.2.circlepath"
         case .failed:
             "exclamationmark.triangle"
-        }
-    }
-
-    private var headerText: String {
-        switch props.status {
-        case .loading:
-            "Checking for work interrupted when RepoPrompt last closed…"
-        case .ready:
-            props.rows.count == 1
-                ? "1 saved or interrupted item needs your attention."
-                : "\(props.rows.count) saved or interrupted items need your attention."
-        case let .failed(message):
-            message
         }
     }
 }

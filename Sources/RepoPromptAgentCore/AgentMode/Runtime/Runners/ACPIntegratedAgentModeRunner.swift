@@ -1709,7 +1709,7 @@ package final class ACPIntegratedAgentModeRunner {
             session: session
         ) {
             AgentDeliveryRecordDiagnostics.runAttemptNotRecorded(route: .acp, runAttemptID: runAttemptID, failure: failure)
-            handoff.noteNoHandoff(message: "run attempt not recorded: \(failure)")
+            handoff.noteNoHandoff(message: AgentProviderHandoff.deliveryNotRecordedText(failure))
             await finalize(
                 session: session,
                 runID: runID,
@@ -1717,7 +1717,7 @@ package final class ACPIntegratedAgentModeRunner {
                 controller: controller,
                 attachmentReservationID: attachmentReservationID,
                 terminalState: .failed,
-                errorText: "This message was not sent because its delivery could not be recorded. It stays saved.",
+                errorText: AgentRecoveryAdmissionFailure.deliveryNotRecordedText(),
                 notifyTurnComplete: false,
                 shouldShutdownController: false
             )

@@ -533,6 +533,12 @@ final class AgentProviderHandoff {
         failure.dispatchFailureText
     }
 
+    /// F6: the delivery could not be recorded, with a plain cause (never the raw failure; callers
+    /// log that privately through `AgentDeliveryRecordDiagnostics`).
+    static func deliveryNotRecordedText(_ failure: AgentRecoveryControllerFailure) -> String {
+        AgentRecoveryAdmissionFailure.deliveryNotRecordedText(cause: failure.userFacingDescription)
+    }
+
     /// Headless provider streams: model output proves the provider processed the input. Stream
     /// creation, lifecycle, usage, and error results do not.
     static func streamResultProvesProviderAcceptance(_ result: AIStreamResult) -> Bool {

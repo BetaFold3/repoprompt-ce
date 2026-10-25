@@ -12,7 +12,7 @@ private enum HeadlessHandoffError: LocalizedError {
     var errorDescription: String? {
         switch self {
         case .deliveryNotRecorded:
-            "This message was not sent because its delivery could not be recorded. It stays saved."
+            AgentRecoveryAdmissionFailure.deliveryNotRecordedText()
         case .sessionChangedBeforeHandoff:
             AgentProviderHandoff.sessionChangedBeforeHandoffMessage
         case let .dispatchNotCommitted(failure):
@@ -242,7 +242,7 @@ final class HeadlessAgentModeRunner {
                 session: session
             ) {
                 AgentDeliveryRecordDiagnostics.runAttemptNotRecorded(route: .headless, runAttemptID: runAttemptID, failure: failure)
-                handoff.noteNoHandoff(message: "run attempt not recorded: \(failure)")
+                handoff.noteNoHandoff(message: AgentProviderHandoff.deliveryNotRecordedText(failure))
                 throw HeadlessHandoffError.deliveryNotRecorded
             }
             // Deferred dispatch commit (no bootstrap on this route creates a pending-handoff prefix;

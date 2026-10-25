@@ -227,7 +227,7 @@ package actor AgentProcessRegistry {
         do {
             entries = try store.discoverRuntimes()
         } catch {
-            storageFailure = String(describing: error)
+            recordStorageFailure(error)
             publish()
             return
         }
@@ -251,6 +251,16 @@ package actor AgentProcessRegistry {
         storageFailure = nil
     }
 
+    /// Keeps the raw read failure (never shown to the user) and logs it only on a transition: when a
+    /// failure first appears or its description changes, not on every failed refresh.
+    private func recordStorageFailure(_ error: Error) {
+        let next = String(describing: error)
+        if next != storageFailure {
+            AgentRecoveryFailureDiagnostics.runtimeRecordsUnreadable(error)
+        }
+        storageFailure = next
+    }
+
     private func loadRecords() {
         do {
             for entry in try store.discoverRuntimes() {
@@ -266,7 +276,7 @@ package actor AgentProcessRegistry {
                 }
             }
         } catch {
-            storageFailure = String(describing: error)
+            recordStorageFailure(error)
         }
     }
 
@@ -1075,7 +1085,8 @@ package extension AgentProcessRegistry {
         isSealedForSafeRestart = true
         guard hasStarted else { return .notProven("Runtime ownership has not been checked yet.") }
         await refresh()
-        if let storageFailure { return .notProven("Runtime records are unreadable: \(storageFailure)") }
+        // F6: `storageFailure` is a raw error string (logged when recorded); it is never shown.
+        if storageFailure != nil { return .notProven("Runtime records are unreadable.") }
         if !preserved.isEmpty || unidentifiedPreservedCount > 0 {
             return .notProven("Some runtime records could not be read.")
         }

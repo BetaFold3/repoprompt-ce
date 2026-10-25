@@ -96,8 +96,11 @@ final class AgentRecoveryAppComposition {
             )
         } catch {
             coordinator = nil
-            failure = String(describing: error)
-            scheduler.failStartupAdmission("Recovery could not be composed: \(error)")
+            // F6 / review B R5: plain wording reaches the banner; the raw error is logged privately.
+            AgentRecoveryFailureDiagnostics.startupFailed(error)
+            let message = AgentRecoveryStorageFailureCause.startupFailureDescription(error, nextStep: "then reopen RepoPrompt")
+            failure = message
+            scheduler.failStartupAdmission(message)
         }
     }
 
@@ -122,7 +125,7 @@ final class AgentRecoveryAppComposition {
             viewModel.installRecoveryCoordinator(coordinator, admissionMode: .mandatory)
             viewModel.recoveryStartupRetry = { [weak self] in self?.retryStartup() }
         } else {
-            viewModel.failRecoveryComposition(failure ?? "unknown composition failure")
+            viewModel.failRecoveryComposition(failure ?? "Recovery couldn't start.")
         }
         startIfNeeded()
     }
