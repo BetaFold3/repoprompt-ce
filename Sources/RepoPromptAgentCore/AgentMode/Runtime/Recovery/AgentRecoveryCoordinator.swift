@@ -290,11 +290,34 @@ package enum AgentRecoveryAdmissionFailure: Error, Equatable {
         case .refused:
             "This message was not sent because its recovery state is not ready. It stays saved."
         case .commitFailed:
+            // Same user text as the runners' run-attempt failures; `diagnosticReason` tells them apart.
             "This message was not sent because its delivery could not be recorded. It stays saved."
         case .staleAfterCommit, .dispatchStaleAfterCommit:
             "This message was not sent because the session changed. It stays saved."
         }
     }
+
+    /// Fixed, content-free reason for logs and diagnostics (several cases share user text).
+    package var diagnosticReason: String {
+        switch self {
+        case .refused:
+            "dispatch_refused"
+        case .commitFailed:
+            "dispatch_commit_failed"
+        case .staleAfterCommit:
+            "admission_stale_after_commit"
+        case .dispatchStaleAfterCommit:
+            "dispatch_stale_after_commit"
+        }
+    }
+}
+
+/// A deferred run-start handoff's state for one durable intent (`AgentRecoverySessionLane`).
+package enum AgentDeferredRunStartHandoffState: Equatable {
+    /// Prepared: its runner owes the dispatch commit or a no-handoff settlement.
+    case pending
+    /// Settled before any dispatch commit; the handoff's own message, when it gave one.
+    case notHandedOff(message: String?)
 }
 
 /// Submission captured synchronously at the moment the user sends from the composer. Its revision
@@ -1585,6 +1608,24 @@ package final class AgentRecoveryCoordinator {
     /// compose tab; `nil` when neither is known.
     package func knownComposeTabID(for sessionID: UUID) -> UUID? {
         laneComposeTabIDs[sessionID] ?? reconciliation.resolution(for: sessionID)?.composeTabID
+    }
+
+    /// Deferred run-start handoffs (F1) by durable intent, kept here rather than on the issuing lane so
+    /// a successor owner (tab replaced or reopened while the runner still prepares) sees the
+    /// predecessor's `pending` entry and its later no-handoff settlement. The retired issuing lane
+    /// refuses the late commit itself (`beginDispatches`). Process memory only.
+    fileprivate var deferredRunStartHandoffs: [UUID: AgentDeferredRunStartHandoffState] = [:]
+    /// Intents whose owner consumes a no-handoff settlement later (a scheduled send's hold), marked
+    /// before its run starts. Only these keep a `notHandedOff` entry; others are cleared when settled.
+    fileprivate var ownerAwaitedDeferredRunStartIntentIDs: Set<UUID> = []
+    /// The durable session of each `deferredRunStartHandoffs` entry (kept and removed with it).
+    fileprivate var deferredRunStartHandoffSessionIDs: [UUID: UUID] = [:]
+
+    /// Whether any deferred run-start handoff entry (pending or an unconsumed no-handoff settlement)
+    /// exists for `sessionID` in this launch. When none does, no runner in this process can owe
+    /// the session's input a settlement, so the R9 repair decides exactly as before F1.
+    package func hasDeferredRunStartHandoff(sessionID: UUID) -> Bool {
+        deferredRunStartHandoffSessionIDs.values.contains(sessionID)
     }
 
     /// The live (unretired) lane for a durable session.
@@ -3025,6 +3066,69 @@ package final class AgentRecoverySessionLane {
 
     package var hasPendingDeliveryEvidenceWrites: Bool {
         !pendingDeliveryEvidenceWrites.isEmpty
+    }
+
+    // MARK: Deferred run-start handoffs (F1)
+
+    /// Durable intents carried by a deferred run-start handoff (adopted plan §5), in this launch:
+    /// `pending` while its runner still owes the dispatch commit or a no-handoff settlement;
+    /// `notHandedOff` once it settled without a commit (nothing was written, so the intent is still
+    /// `queued` with no attempt). A committed handoff is removed: its durable evidence speaks from
+    /// then on. Stored by the coordinator (shared by every lane of the session, so a successor owner
+    /// reads its predecessor's entry). Process memory only; never read as delivery evidence after a
+    /// relaunch. Without a coordinator nothing can be ruled out, so the answer is `pending` (decide
+    /// nothing), never "no entry".
+    package func deferredRunStartHandoffState(intentID: UUID) -> AgentDeferredRunStartHandoffState? {
+        guard let coordinator else { return .pending }
+        return coordinator.deferredRunStartHandoffs[intentID]
+    }
+
+    /// Drops the entry (and its owner's mark) once its owner consumed the settlement (or no longer
+    /// needs it).
+    package func clearDeferredRunStartHandoff(intentID: UUID) {
+        coordinator?.deferredRunStartHandoffs[intentID] = nil
+        coordinator?.deferredRunStartHandoffSessionIDs[intentID] = nil
+        coordinator?.ownerAwaitedDeferredRunStartIntentIDs.remove(intentID)
+    }
+
+    /// Marks `intentID` as awaited by an owner that consumes its no-handoff settlement later (a
+    /// scheduled send). Call before the run starts; the owner clears it on every other exit.
+    package func noteDeferredRunStartHandoffAwaitedByOwner(intentID: UUID) {
+        coordinator?.ownerAwaitedDeferredRunStartIntentIDs.insert(intentID)
+    }
+
+    func noteDeferredRunStartHandoffPrepared(intentIDs: [UUID]) {
+        for intentID in intentIDs {
+            coordinator?.deferredRunStartHandoffs[intentID] = .pending
+            coordinator?.deferredRunStartHandoffSessionIDs[intentID] = sessionID
+        }
+    }
+
+    func noteDeferredRunStartHandoffCommitted(intentIDs: [UUID]) {
+        for intentID in intentIDs {
+            clearDeferredRunStartHandoff(intentID: intentID)
+        }
+    }
+
+    /// The deferred handoff settled without a dispatch commit. Posts
+    /// `agentRecoveryDeliveryEvidenceDidSettle` (object: this lane) so an owner waiting on the
+    /// handoff's own settlement (a scheduled send's `.awaitingProviderEvidence` hold) re-checks:
+    /// nothing durable was written, so no evidence write would wake it. Only owner-awaited intents
+    /// (`noteDeferredRunStartHandoffAwaitedByOwner`) keep the settlement; the rest are cleared.
+    func noteDeferredRunStartHandoffNotHandedOff(intentIDs: [UUID], message: String?) {
+        guard !intentIDs.isEmpty else { return }
+        for intentID in intentIDs {
+            if coordinator?.ownerAwaitedDeferredRunStartIntentIDs.contains(intentID) == true {
+                coordinator?.deferredRunStartHandoffs[intentID] = .notHandedOff(message: message)
+            } else {
+                clearDeferredRunStartHandoff(intentID: intentID)
+            }
+        }
+        NotificationCenter.default.post(
+            name: .agentRecoveryDeliveryEvidenceDidSettle,
+            object: self,
+            userInfo: ["sessionID": sessionID]
+        )
     }
 
     /// Awaits every delivery-evidence write tracked so far. Writes enqueued afterwards post their

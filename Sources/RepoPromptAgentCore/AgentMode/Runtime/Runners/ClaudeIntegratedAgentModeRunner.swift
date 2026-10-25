@@ -85,7 +85,7 @@ final class ClaudeIntegratedAgentModeRunner {
             AgentModeProcessRunIdentity.existingProcessRunID(for: session)
         } ?? AgentModeProcessRunIdentity.startFreshProcessRun(for: session)
         let lease = makeLease(runID)
-        let ownership = session.beginRunAttempt(source: "claudeNative")
+        let ownership = session.beginRunAttempt(source: "claudeNative", inputUserItemID: handoff.attributedUserItemID)
         session.installRunAttemptTerminalResources(ownership: ownership) { terminalState in
             {
                 switch terminalState {
@@ -143,6 +143,7 @@ final class ClaudeIntegratedAgentModeRunner {
                     processRunID: runID,
                     session: session
                 ) {
+                    AgentDeliveryRecordDiagnostics.runAttemptNotRecorded(route: .claude, runAttemptID: runAttemptID, failure: failure)
                     handoff.noteNoHandoff(message: "run attempt not recorded: \(failure)")
                     self.hooks.recordStagedInputSendOutcome(handoff: handoff, sent: false)
                     await self.finalize(

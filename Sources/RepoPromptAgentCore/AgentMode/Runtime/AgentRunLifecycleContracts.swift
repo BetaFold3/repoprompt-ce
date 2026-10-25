@@ -94,6 +94,14 @@ package struct AgentRunOwnership: Equatable, Hashable {
     }
 }
 
+/// The user item a run attempt's own input owns (F1): its terminal outcome is attributed to that
+/// item's execution turn (relocated saved input included), never to a later queued item or, when
+/// the item is gone, to an earlier turn.
+package struct AgentRunAttemptInputAttribution: Equatable {
+    package let attemptID: UUID
+    package let userItemID: UUID
+}
+
 @MainActor
 final class AgentRunAttemptTerminalResources {
     typealias Teardown = @MainActor () async -> Void

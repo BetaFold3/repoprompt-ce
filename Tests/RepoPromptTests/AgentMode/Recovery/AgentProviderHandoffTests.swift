@@ -274,7 +274,13 @@ extension AgentModeRunServiceLifecycleTests {
             attachments: [],
             inputConstituents: [identity]
         )
-        XCTAssertNil(outcome, "unchanged: a pre-runner startup failure still returns nil")
+        // F1 (deliberate contract change): `nil` means a runner owns the input; a pre-runner startup
+        // failure is an explicit `.failed` carrying the startup error.
+        guard case let .failed(message)? = outcome else {
+            fixture.coordinator.endRecoveryAction(authorization)
+            return XCTFail("a pre-runner startup failure is explicit, got \(String(describing: outcome))")
+        }
+        XCTAssertFalse(message.isEmpty)
         XCTAssertEqual(session.runState, .failed)
         XCTAssertFalse(recorder.contains(prefix: "factory:"), "no provider was created")
 
@@ -310,6 +316,59 @@ extension AgentModeRunServiceLifecycleTests {
         }
         fixture.coordinator.endRecoveryAction(authorization)
         XCTAssertEqual(fixture.coordinator.recoveryActionHoldCount, 0)
+    }
+
+    /// F1: every exit before a runner owns the input returns an explicit outcome for Claude and ACP
+    /// alike (`nil` means only that a runner owns the input and owes its settlement). Nothing was
+    /// prepared, committed, or handed off: the intent stays `queued` with no delivery attempt.
+    func testPreRunnerStartupExitsReturnAnExplicitFailureForClaudeAndACP() async throws {
+        let cases: [(name: String, agent: AgentProviderKind, knowledge: Bool)] = [
+            ("workspace-claude", .claudeCode, false),
+            ("workspace-acp", .openCode, false),
+            ("knowledge-acp", .openCode, true)
+        ]
+        for testCase in cases {
+            let fixture = try await RecoveryLaneFixture.make("f1-pre-runner-\(testCase.name)")
+            defer { fixture.tearDown() }
+            let recorder = LifecycleRecorder()
+            let harness = testCase.knowledge
+                ? makeHarness(recorder: recorder)
+                : makeHarness(recorder: recorder, workspacePathProvider: { _ in throw LifecycleTestError.workspaceMissing })
+            let session = fixture.boundTabSession()
+            session.selectedAgent = testCase.agent
+            if testCase.knowledge {
+                XCTAssertTrue(session.adoptSessionProfile(.knowledge), testCase.name)
+            }
+            harness.host.test_installLiveSession(session)
+            let identity = try await fixture.queuedIdentity("pre-runner \(testCase.name)")
+            session.recoveryAdmissionMode = .mandatory
+
+            let outcome = await harness.service.startRun(
+                tabID: session.tabID,
+                session: session,
+                initialUserMessage: "pre-runner",
+                initialMessageForRun: "pre-runner",
+                attachments: [],
+                inputConstituents: [identity]
+            )
+
+            guard case let .failed(message)? = outcome else {
+                XCTFail("\(testCase.name): expected an explicit failure, got \(String(describing: outcome))")
+                continue
+            }
+            if testCase.knowledge {
+                XCTAssertEqual(message, "Knowledge sessions currently support Claude Code and Codex only.")
+            }
+            XCTAssertFalse(message.isEmpty, testCase.name)
+            XCTAssertEqual(session.runState, .failed, testCase.name)
+            XCTAssertFalse(recorder.contains(prefix: "factory:"), "\(testCase.name): no provider was created")
+            let intent = await fixture.intent(identity)
+            XCTAssertEqual(intent?.deliveryState, .queued, testCase.name)
+            let attempts = await fixture.attempts(for: identity)
+            XCTAssertTrue(attempts.isEmpty, testCase.name)
+            let intentID = try XCTUnwrap(identity.intentID)
+            XCTAssertNil(fixture.lane.deferredRunStartHandoffState(intentID: intentID), "\(testCase.name): no handoff was prepared")
+        }
     }
 
     func testStartRunDispatchRefusalStartsNoRunAndNoProviderHandoff() async throws {
@@ -407,6 +466,202 @@ extension AgentModeRunServiceLifecycleTests {
         await agentTask?.value
         let accepted = await fixture.waitForIntent(identity, state: .providerAccepted)
         XCTAssertEqual(accepted?.deliveryState, .providerAccepted)
+    }
+
+    /// F1 (real Claude runner): `startRun` returns `nil` once the runner owns the input, before its
+    /// delayed `lease.acquire()` (MCP bootstrap) finishes. Until the runner commits, the intent is
+    /// still `queued` with no attempt and the lane records the deferred handoff as pending (never
+    /// proof of non-handoff); the commit clears it and is not acceptance. The run attempt names this
+    /// input's own item for its terminal outcome.
+    func testClaudeDeferredStartWithDelayedLeaseAcquireStaysPendingUntilItsRunnerCommits() async throws {
+        let fixture = try await RecoveryLaneFixture.make("f1-claude-delayed-acquire")
+        defer { fixture.tearDown() }
+        let recorder = LifecycleRecorder()
+        let controller = LifecycleFakeNativeController(recorder: recorder, emittedAssistantTextOnSend: "ok")
+        let gate = LifecycleAsyncGate()
+        let arrival = F1ArmerArrival()
+        let harness = makeHarness(
+            recorder: recorder,
+            claudeController: controller,
+            autoSignalACPRouting: true,
+            expectedPIDPolicyArmer: { _ in
+                await arrival.note()
+                await gate.arriveAndWait()
+                return true
+            }
+        )
+        let session = fixture.boundTabSession()
+        session.selectedAgent = .claudeCode
+        harness.host.test_installLiveSession(session)
+        let identity = try await fixture.queuedIdentity("delayed acquire")
+        session.recoveryAdmissionMode = .mandatory
+        let intentID = try XCTUnwrap(identity.intentID)
+
+        let outcome = await harness.service.startRun(
+            tabID: session.tabID,
+            session: session,
+            initialUserMessage: "delayed acquire",
+            initialMessageForRun: "delayed acquire",
+            attachments: [],
+            inputConstituents: [identity]
+        )
+        XCTAssertNil(outcome, "nil: the runner owns the input")
+        let reachedAcquire = await RecoveryTestSupport.eventually { arrival.arrived }
+        XCTAssertTrue(reachedAcquire, "The runner reached its delayed lease acquisition")
+        guard reachedAcquire else { return await gate.release() }
+        XCTAssertEqual(fixture.lane.deferredRunStartHandoffState(intentID: intentID), .pending)
+        let queued = await fixture.intent(identity)
+        XCTAssertEqual(queued?.deliveryState, .queued, "Nothing is committed before the runner's preparation")
+        let attemptsBeforeCommit = await fixture.attempts(for: identity)
+        XCTAssertTrue(attemptsBeforeCommit.isEmpty)
+        let runAttemptID = try XCTUnwrap(session.activeRunAttemptID)
+        let ownItemID = try XCTUnwrap(identity.userItemID)
+        XCTAssertEqual(
+            session.runAttemptInputAttribution,
+            AgentRunAttemptInputAttribution(attemptID: runAttemptID, userItemID: ownItemID)
+        )
+
+        await gate.release()
+        let agentTask = session.agentTask
+        _ = await controller.waitForPendingTurnCompletion()
+        XCTAssertNil(fixture.lane.deferredRunStartHandoffState(intentID: intentID), "Committed evidence speaks from here")
+        let written = await fixture.intent(identity)
+        XCTAssertEqual(written?.deliveryState, .dispatching, "The commit is not acceptance")
+
+        await controller.emitPendingTurnCompletion()
+        await agentTask?.value
+        let accepted = await fixture.waitForIntent(identity, state: .providerAccepted)
+        XCTAssertEqual(accepted?.deliveryState, .providerAccepted)
+    }
+
+    /// F1 (R4): a run-start handoff names only its constituents' own user item, never the session's
+    /// last user item. Durable input always carries one (`AgentRecoveryIntent.userItemID` is not
+    /// optional); when that item is not (or no longer) in the transcript the barrier attributes
+    /// nothing, never the earlier turn. Only untracked input without a bubble names none and keeps
+    /// the legacy terminal-time attribution.
+    func testRunStartHandoffAttributesOnlyItsOwnInputNeverAnEarlierTranscriptItem() async throws {
+        let fixture = try await RecoveryLaneFixture.make("f1-attribution-own-input")
+        defer { fixture.tearDown() }
+        let session = fixture.boundTabSession()
+        session.recoveryAdmissionMode = .mandatory
+        let earlier = AgentChatItem.user("earlier turn", sequenceIndex: 1)
+        session.appendItem(earlier)
+        // The durable input's own item is not in this transcript (a withdrawn or not-yet-appended bubble).
+        let identity = try await fixture.queuedIdentity("durable input without a transcript item")
+        let ownItemID = try XCTUnwrap(identity.userItemID, "Durable input always names its user item")
+        XCTAssertFalse(session.items.contains { $0.id == ownItemID })
+
+        let handoff = try AgentProviderHandoff.prepareRunStart(session: session, constituents: [identity]).get()
+        XCTAssertEqual(handoff.attributedUserItemID, ownItemID, "Its own item, never the earlier turn")
+        session.runID = UUID()
+        session.runState = .running
+        let ownership = session.beginRunAttempt(source: "test.claude", inputUserItemID: handoff.attributedUserItemID)
+        XCTAssertNil(
+            AgentRunTerminalCommitBarrier.terminalUserItemID(for: ownership, in: session),
+            "Nothing is attributed, never the earlier turn"
+        )
+        handoff.noteNoHandoff(message: nil)
+        handoff.settleRunInputScope()
+
+        // Untracked input without a bubble (inactive admission) names nothing: legacy attribution.
+        let legacy = AgentTabSession(tabID: UUID())
+        legacy.appendItem(earlier)
+        let untracked = try XCTUnwrap(AgentQueuedInputIdentity.untracked(userItemID: nil, in: legacy))
+        let untrackedHandoff = try AgentProviderHandoff.prepareRunStart(session: legacy, constituents: [untracked]).get()
+        XCTAssertNil(untrackedHandoff.attributedUserItemID)
+        let legacyOwnership = legacy.beginRunAttempt(source: "test.claude", inputUserItemID: untrackedHandoff.attributedUserItemID)
+        XCTAssertEqual(AgentRunTerminalCommitBarrier.terminalUserItemID(for: legacyOwnership, in: legacy), earlier.id)
+    }
+
+    /// F1 (real Claude runner): a delayed `lease.acquire()` that fails, or a run cancelled while it
+    /// is pending (by the user or by app quit), settles the uncommitted handoff as not handed off:
+    /// the intent stays `queued` with no attempt and no run attempt is persisted, and the lane's
+    /// settle signal is posted (the hook a held scheduled send waits on; no durable write would
+    /// wake it).
+    func testClaudeDeferredStartEndedDuringPreparationSettlesNotHandedOffAndSignals() async throws {
+        let causes: [AgentRunTerminalCause?] = [nil, .userCancel, .appQuit]
+        for cause in causes {
+            let cancels = cause != nil
+            let name = cause.map { "cancelled-\($0.rawValue)" } ?? "acquire-failed"
+            let fixture = try await RecoveryLaneFixture.make("f1-claude-\(name)")
+            defer { fixture.tearDown() }
+            let recorder = LifecycleRecorder()
+            let controller = LifecycleFakeNativeController(recorder: recorder)
+            let gate = LifecycleAsyncGate()
+            let arrival = F1ArmerArrival()
+            let harness = makeHarness(
+                recorder: recorder,
+                claudeController: controller,
+                autoSignalACPRouting: true,
+                expectedPIDPolicyArmer: { _ in
+                    await arrival.note()
+                    await gate.arriveAndWait()
+                    return cancels
+                }
+            )
+            let session = fixture.boundTabSession()
+            session.selectedAgent = .claudeCode
+            harness.host.test_installLiveSession(session)
+            let identity = try await fixture.queuedIdentity("ended early \(name)")
+            session.recoveryAdmissionMode = .mandatory
+            let intentID = try XCTUnwrap(identity.intentID)
+
+            let outcome = await harness.service.startRun(
+                tabID: session.tabID,
+                session: session,
+                initialUserMessage: "ended early",
+                initialMessageForRun: "ended early",
+                attachments: [],
+                inputConstituents: [identity]
+            )
+            XCTAssertNil(outcome, name)
+            let reachedAcquire = await RecoveryTestSupport.eventually { arrival.arrived }
+            XCTAssertTrue(reachedAcquire, "\(name): the runner reached its delayed lease acquisition")
+            guard reachedAcquire else {
+                await gate.release()
+                continue
+            }
+            XCTAssertEqual(fixture.lane.deferredRunStartHandoffState(intentID: intentID), .pending, name)
+
+            let settled = expectation(forNotification: .agentRecoveryDeliveryEvidenceDidSettle, object: fixture.lane)
+            settled.assertForOverFulfill = false
+            let agentTask = session.agentTask
+            var cancellation: Task<Void, Never>?
+            if cancels {
+                cancellation = Task { @MainActor in
+                    await harness.service.cancelRun(tabID: session.tabID, session: session, cause: cause ?? .userCancel)
+                }
+            }
+            await gate.release()
+            await fulfillment(of: [settled], timeout: 5)
+            let ended = await RecoveryTestSupport.eventually { !session.runState.isActive }
+            XCTAssertTrue(ended, "\(name): the run ended")
+            await cancellation?.value
+            await agentTask?.value
+
+            // Settled (the signal above); a non-scheduled entry is cleared at its settlement (R8).
+            XCTAssertNil(fixture.lane.deferredRunStartHandoffState(intentID: intentID), name)
+            XCTAssertFalse(recorder.contains("claude:send"), "\(name): never handed off")
+            let intent = await fixture.intent(identity)
+            XCTAssertEqual(intent?.deliveryState, .queued, name)
+            let attempts = await fixture.attempts(for: identity)
+            XCTAssertTrue(attempts.isEmpty, "\(name): no delivery attempt")
+            XCTAssertFalse(session.runState.isActive, name)
+            // Persisted state once every evidence write of the terminal (quit or not) has landed:
+            // the same queued intent with no delivery attempt; the run's own attempt carries only its
+            // terminal evidence (an app quit is recorded as such), never a dispatch.
+            await fixture.lane.deliveryEvidenceWritesSettled()
+            let persisted = await fixture.lane.store.read(sessionID: fixture.lane.sessionID).record
+            XCTAssertEqual(persisted?.intents.first { $0.intentID == intentID }?.deliveryState, .queued, name)
+            XCTAssertEqual(persisted?.attempts.count { $0.intentID == intentID }, 0, name)
+            XCTAssertEqual(persisted?.runAttempts.count, 1, name)
+            let runTerminal = persisted?.runAttempts.first?.terminal
+            XCTAssertNotNil(runTerminal, "\(name): the run's terminal is recorded")
+            if cause == .appQuit {
+                XCTAssertEqual(runTerminal?.cause, .appQuit, name)
+                XCTAssertEqual(runTerminal?.terminalState, .cancelled, name)
+            }
+        }
     }
 
     /// A Claude write whose turn ends without its own `.completed` result stays uncertain.
@@ -1527,6 +1782,16 @@ private struct R03LoadFallbackACPProvider: ACPAgentProvider {
             else { return nil }
             return blocks.compactMap { $0["text"] as? String }.joined(separator: "\n")
         }
+    }
+}
+
+/// Records that a gated `expectedPIDPolicyArmer` (inside the runner's `lease.acquire()`) was reached.
+@MainActor
+private final class F1ArmerArrival {
+    private(set) var arrived = false
+
+    func note() {
+        arrived = true
     }
 }
 

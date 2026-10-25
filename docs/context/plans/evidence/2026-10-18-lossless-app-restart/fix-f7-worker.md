@@ -115,7 +115,7 @@ Note: `make dev-test FILTER=a|b` needs the regex quoted inside the make variable
 
 These address `fix-f7-review-oraclea.md` (A) and `fix-f7-review-oracleb.md` (B).
 - Full diff of this step against HEAD: `fix-f7-current.diff`. It covers only `Sources/RepoPrompt/Features/AgentMode/**` and the new test file; the unrelated `CodemapSeamTestSupport.swift` change is excluded.
-- Delta against the reviewed `fix-f7-review.diff`: `fix-f7-r1-delta.diff`. I built it by applying `fix-f7-review.diff` to HEAD copies of the files and diffing that against the current files.
+- Delta against the reviewed `prompt-exports/restart-fixes/fix-f7-review.diff` (local only): `prompt-exports/restart-fixes/fix-f7-r1-delta.diff` (local only). I built it by applying `fix-f7-review.diff` to HEAD copies of the files and diffing that against the current files.
 - Nothing is staged or committed.
 
 | Finding | Change |
@@ -178,5 +178,5 @@ After these changes, `make dev-build` and `make dev-lint` passed. The 13-suite f
 
 ## Reviews
 
-- Initial: [OracleA](fix-f7-review-oraclea.md), [OracleB](fix-f7-review-oracleb.md) on `fix-f7-review.diff`.
-- Re-review 1: [OracleA](fix-f7-review-oraclea-r1.md), [OracleB](fix-f7-review-oracleb-r1.md) on `fix-f7-r1-delta.diff`; no P0/P1 open. OracleB N4 (`canSchedule` true in the no-session snapshot) is by design: `canScheduleSend` allows a new session's first schedule and the view also requires a rendered submit target; deferred.
+- Initial: [OracleA](fix-f7-review-oraclea.md), [OracleB](fix-f7-review-oracleb.md) on `prompt-exports/restart-fixes/fix-f7-review.diff` (local only).
+- Re-review 1: [OracleA](fix-f7-review-oraclea-r1.md), [OracleB](fix-f7-review-oracleb-r1.md) on `prompt-exports/restart-fixes/fix-f7-r1-delta.diff` (local only); no P0/P1 open. OracleB N4 (`canSchedule` true in the no-session snapshot) is by design: `canScheduleSend` allows a new session's first schedule and the view also requires a rendered submit target; deferred.

@@ -249,7 +249,7 @@ package final class ACPIntegratedAgentModeRunner {
         session.reasoningItemIDsByGroupID.removeAll()
         session.codexReasoningSegmentsByKey.removeAll()
 
-        let ownership = session.beginRunAttempt(source: "acp")
+        let ownership = session.beginRunAttempt(source: "acp", inputUserItemID: handoff.attributedUserItemID)
         let runAttemptID = ownership.attemptID
         session.recordRunProgress(ownership: ownership, kind: .stageTransition, stage: .preparingRuntime)
         session.runState = .running
@@ -1708,6 +1708,7 @@ package final class ACPIntegratedAgentModeRunner {
             processRunID: runID,
             session: session
         ) {
+            AgentDeliveryRecordDiagnostics.runAttemptNotRecorded(route: .acp, runAttemptID: runAttemptID, failure: failure)
             handoff.noteNoHandoff(message: "run attempt not recorded: \(failure)")
             await finalize(
                 session: session,

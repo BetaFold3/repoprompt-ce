@@ -246,8 +246,8 @@ package final class AgentRunTerminalCommitBarrier {
         }
         // The terminal user item's execution turn: its own ID, or the distinct destination turn a
         // relocated saved input runs in (O11), never the historical envelope sharing that ID.
-        let terminalTurnID = session.items.last(where: { $0.kind == .user }).map {
-            session.transcript.executionTurnID(forUserItemID: $0.id)
+        let terminalTurnID = Self.terminalUserItemID(for: request.ownership, in: session).map {
+            session.transcript.executionTurnID(forUserItemID: $0)
         }
 
         session.terminalCommitInProgress = true
@@ -471,6 +471,19 @@ package final class AgentRunTerminalCommitBarrier {
             )
         #endif
         return revision
+    }
+
+    /// The user item a terminal commit is attributed to (F1). A run attempt whose runner named its
+    /// own input is bound to that item: a later queued user item never takes its outcome, and when
+    /// the item is gone (a withdrawn scheduled bubble) nothing is attributed, never an earlier turn.
+    /// Attempts without a named input (Codex, pre-runner startup failures) keep the last user item.
+    static func terminalUserItemID(for ownership: AgentRunOwnership, in session: AgentTabSession) -> UUID? {
+        if let attribution = session.runAttemptInputAttribution, attribution.attemptID == ownership.attemptID {
+            return session.items.contains { $0.id == attribution.userItemID && $0.kind == .user }
+                ? attribution.userItemID
+                : nil
+        }
+        return session.items.last(where: { $0.kind == .user })?.id
     }
 
     /// Live R5 stamp: a non-completed terminal whose effective cause is an interruption (quit,

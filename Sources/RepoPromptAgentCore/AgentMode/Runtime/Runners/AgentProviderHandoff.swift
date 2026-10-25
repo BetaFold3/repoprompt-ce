@@ -16,6 +16,7 @@
 // never acceptance.
 
 import Foundation
+import os
 
 @MainActor
 final class AgentProviderHandoff {
@@ -39,6 +40,11 @@ final class AgentProviderHandoff {
     /// The one stage-delivery outcome reported for `carriedStagedInput` (see `reportStagedInput`).
     private(set) var reportedStagedInputDisposition: AgentStagedInputDisposition?
     private var stagedInputReporter: ((AgentCarriedStagedInput, AgentStagedInputDisposition) -> Void)?
+    /// User item whose turn a run attempt carrying this input is attributed to (F1): the last
+    /// constituent with a user item. Durable input always names one (`AgentRecoveryIntent.userItemID`);
+    /// `nil` only for untracked input without a bubble, which keeps the legacy terminal-time
+    /// attribution. Never pinned to another transcript item.
+    private(set) var attributedUserItemID: UUID?
 
     private init(evidence: AgentRecoveryDispatchEvidence, constituents: [AgentQueuedInputIdentity], runAttemptID: UUID?) {
         committedEvidence = evidence
@@ -102,10 +108,21 @@ final class AgentProviderHandoff {
             return .failure(refusal)
         }
         let handoff = AgentProviderHandoff(deferred: constituents)
+        handoff.attributedUserItemID = attributedUserItemID(of: constituents)
         if handoff.isDurable {
             handoff.heldLane = session.recoveryLane
+            // F1: the issuing lane knows this input is owned by a runner that owes its settlement.
+            session.recoveryLane?.noteDeferredRunStartHandoffPrepared(intentIDs: handoff.durableIntentIDs)
         }
         return .success(handoff)
+    }
+
+    private static func attributedUserItemID(of constituents: [AgentQueuedInputIdentity]) -> UUID? {
+        constituents.last(where: { $0.userItemID != nil })?.userItemID
+    }
+
+    private var durableIntentIDs: [UUID] {
+        isDurable ? constituents.compactMap(\.intentID) : []
     }
 
     /// Before-handoff step. With `ownership`, the existing run attempt is recorded first (durable
@@ -137,6 +154,7 @@ final class AgentProviderHandoff {
         }
         return result.map {
             let handoff = AgentProviderHandoff(evidence: $0, constituents: constituents, runAttemptID: ownership?.attemptID)
+            handoff.attributedUserItemID = attributedUserItemID(of: constituents)
             handoff.recordPendingHandoffAtCommit(session)
             return handoff
         }
@@ -173,6 +191,18 @@ final class AgentProviderHandoff {
         case dispatch(AgentRecoveryAdmissionFailure)
         /// The pending-handoff prefix could not be staged with a durable payload ID.
         case pendingHandoffNotSaved
+
+        /// Fixed, content-free reason for logs (several cases share `userText`).
+        var diagnosticReason: String {
+            switch self {
+            case .runAttemptNotBound: "run_attempt_not_bound"
+            case .pendingHandoffNotAttached: "pending_handoff_not_attached"
+            case .pendingHandoffAfterCommit: "pending_handoff_after_commit"
+            case .alreadySettled: "already_settled"
+            case let .dispatch(failure): failure.diagnosticReason
+            case .pendingHandoffNotSaved: "pending_handoff_not_saved"
+            }
+        }
 
         /// User-facing explanation; the input stays saved in every case.
         var userText: String {
@@ -232,6 +262,7 @@ final class AgentProviderHandoff {
             committedEvidence = evidence
             runAttemptID = ownership.attemptID
             recordPendingHandoffAtCommit(session)
+            heldLane?.noteDeferredRunStartHandoffCommitted(intentIDs: durableIntentIDs)
             return .success(())
         }
     }
@@ -309,6 +340,10 @@ final class AgentProviderHandoff {
         }
         handoffStarted = true
         evidence.noteHandoffBegan()
+        // The run attempt's terminal outcome now belongs to this input's turn (steering included).
+        if let runAttemptID, let attributedUserItemID {
+            session.noteRunAttemptInput(attemptID: runAttemptID, userItemID: attributedUserItemID)
+        }
         return true
     }
 
@@ -323,7 +358,7 @@ final class AgentProviderHandoff {
     func noteDeliveryUnknown() {
         guard let evidence = committedEvidence else {
             // Uncommitted input never reached a provider boundary.
-            noteDeferredOutcome(.notHandedOff)
+            noteDeferredOutcome(.notHandedOff, message: nil)
             return
         }
         evidence.noteDeliveryUnknown()
@@ -332,7 +367,7 @@ final class AgentProviderHandoff {
     /// Proven pre-handoff only: once the boundary was entered this records uncertainty instead.
     func noteNoHandoff(message: String? = nil) {
         guard let evidence = committedEvidence else {
-            noteDeferredOutcome(.notHandedOff)
+            noteDeferredOutcome(.notHandedOff, message: message)
             return
         }
         if handoffStarted {
@@ -342,10 +377,14 @@ final class AgentProviderHandoff {
         }
     }
 
-    /// A deferred handoff wrote nothing: its intents are still `queued` with no attempt.
-    private func noteDeferredOutcome(_ outcome: AgentRecoveryDispatchEvidence.Observation) {
+    /// A deferred handoff wrote nothing: its intents are still `queued` with no attempt. The issuing
+    /// lane records the settlement (with `message`) and signals waiters on this exact handoff (F1).
+    private func noteDeferredOutcome(_ outcome: AgentRecoveryDispatchEvidence.Observation, message: String?) {
         guard deferredObservation == .open else { return }
         deferredObservation = outcome
+        if outcome != .open {
+            heldLane?.noteDeferredRunStartHandoffNotHandedOff(intentIDs: durableIntentIDs, message: message)
+        }
         // No commit can follow a settled deferred handoff (`commitDispatch` refuses it): an explicit
         // recovery action carried here is fenced and settles as not handed off.
         if outcome != .open, let action = constituents.first?.actionAuthorization {
@@ -380,6 +419,7 @@ final class AgentProviderHandoff {
     /// the carried staged input is released, and the durable input is presented as held with the
     /// failure's explanation. Its intents stay saved (`queued` before a commit).
     func blockBeforeHandoff(_ failure: CommitFailure) {
+        AgentDeliveryRecordDiagnostics.blockedBeforeHandoff(failure, runAttemptID: runAttemptID)
         noteNoHandoff(message: failure.userText)
         reportStagedInput(stagedInputDisposition(sent: false))
         holdForUser(reason: failure.userText)
@@ -389,7 +429,7 @@ final class AgentProviderHandoff {
     /// written (Claude: thrown before the stdin write; ACP: thrown without `onSubmitted`).
     func noteProvenNotWritten(message: String? = nil) {
         guard let evidence = committedEvidence else {
-            noteDeferredOutcome(.notHandedOff)
+            noteDeferredOutcome(.notHandedOff, message: message)
             return
         }
         evidence.noteNoHandoff(message: message)
@@ -398,7 +438,7 @@ final class AgentProviderHandoff {
     /// Verified provider rejection.
     func noteRejected(message: String? = nil) {
         guard let evidence = committedEvidence else {
-            noteDeferredOutcome(.rejected)
+            noteDeferredOutcome(.rejected, message: message)
             return
         }
         evidence.noteRejected(message: message)
@@ -408,7 +448,7 @@ final class AgentProviderHandoff {
     /// no recorded outcome → delivery unknown. Recorded outcomes are left untouched.
     func settleIfUnresolved() {
         guard let evidence = committedEvidence else {
-            noteDeferredOutcome(.notHandedOff)
+            noteDeferredOutcome(.notHandedOff, message: nil)
             reportStagedInput(stagedInputDisposition(sent: false))
             return
         }
@@ -620,6 +660,54 @@ extension AgentModeRunService.Hooks {
     @MainActor
     func recordStagedInputSendOutcome(handoff: AgentProviderHandoff, sent: Bool) {
         handoff.settleStagedInput(sent: sent)
+    }
+}
+
+/// Always-on, content-free diagnostics for run input that was not sent because its delivery could
+/// not be recorded (F1). Several sources share one user-facing text ("…its delivery could not be
+/// recorded…"); the logged reason names the source. Failure details are logged privately.
+package enum AgentDeliveryRecordDiagnostics {
+    private static let logger = Logger(subsystem: "com.repoprompt.agents", category: "DeliveryRecord")
+
+    /// A runner could not record its run attempt against the input's delivery attempts.
+    enum RunAttemptRoute: String {
+        case claude
+        case acp
+        case headless
+    }
+
+    static func runAttemptNotRecorded(
+        route: RunAttemptRoute,
+        runAttemptID: UUID,
+        failure: AgentRecoveryControllerFailure
+    ) {
+        logger.notice(
+            "not_sent reason=\(route.rawValue, privacy: .public)_run_attempt_not_recorded runAttempt=\(runAttemptID.uuidString, privacy: .public) detail=\(String(describing: failure), privacy: .private)"
+        )
+    }
+
+    /// A deferred dispatch commit (or the staging before it) failed before handoff; a
+    /// `dispatch_commit_failed` reason is `AgentRecoveryAdmissionFailure.commitFailed`.
+    static func blockedBeforeHandoff(_ failure: AgentProviderHandoff.CommitFailure, runAttemptID: UUID?) {
+        logger.notice(
+            "not_sent reason=\(failure.diagnosticReason, privacy: .public) runAttempt=\(runAttemptID?.uuidString ?? "nil", privacy: .public) detail=\(String(describing: failure), privacy: .private)"
+        )
+    }
+
+    /// A scheduled send failed because its run-start handoff settled without a handoff. The schedule
+    /// banner shows the generic scheduled explanation; the handoff's own reason (if any) is logged.
+    package static func scheduledNotHandedOff(scheduleID: UUID, sourceMessage: String?) {
+        let source = (sourceMessage?.isEmpty ?? true) ? "none" : "handoff_message"
+        logger.notice(
+            "not_sent reason=scheduled_not_handed_off schedule=\(scheduleID.uuidString, privacy: .public) source=\(source, privacy: .public) detail=\(sourceMessage ?? "", privacy: .private)"
+        )
+    }
+
+    /// The run service refused a start because its input's dispatch could not be validated.
+    static func runStartRefused(_ failure: AgentRecoveryAdmissionFailure) {
+        logger.notice(
+            "not_sent reason=run_start_\(failure.diagnosticReason, privacy: .public) detail=\(String(describing: failure), privacy: .private)"
+        )
     }
 }
 

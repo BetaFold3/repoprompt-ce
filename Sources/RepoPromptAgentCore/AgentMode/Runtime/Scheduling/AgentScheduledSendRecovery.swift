@@ -234,15 +234,31 @@ package enum AgentScheduledSendTransfer {
         record: AgentScheduledSendPersist,
         recoveryRecord: AgentRecoveryRecordState
     ) -> AgentRecoveryDeliveryState? {
-        guard let attempt = record.attempt, let supported = recoveryRecord.record else { return nil }
-        let linked = supported.intents.filter {
+        let linked = linkedIntents(record: record, recoveryRecord: recoveryRecord)
+        return linked.count == 1 ? linked[0].deliveryState : nil
+    }
+
+    /// Intent ID of the single intent linked to this exact attempt (same matching as
+    /// `linkedIntentDeliveryState`); `nil` when there is none or several.
+    package static func linkedIntentID(
+        record: AgentScheduledSendPersist,
+        recoveryRecord: AgentRecoveryRecordState
+    ) -> UUID? {
+        let linked = linkedIntents(record: record, recoveryRecord: recoveryRecord)
+        return linked.count == 1 ? linked[0].intentID : nil
+    }
+
+    private static func linkedIntents(
+        record: AgentScheduledSendPersist,
+        recoveryRecord: AgentRecoveryRecordState
+    ) -> [AgentRecoveryIntent] {
+        guard let attempt = record.attempt, let supported = recoveryRecord.record else { return [] }
+        return supported.intents.filter {
             $0.origin == .scheduled
                 && $0.scheduleReference?.scheduleID == record.id
                 && $0.scheduleReference?.scheduleAttemptID == attempt.attemptID
                 && $0.userItemID == attempt.itemID
         }
-        guard linked.count == 1 else { return nil }
-        return linked[0].deliveryState
     }
 
     /// Pure R9 repair decision for `record` (must be `.dispatching` with an attempt) against the

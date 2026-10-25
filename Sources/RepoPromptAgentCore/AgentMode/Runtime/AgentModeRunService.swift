@@ -540,7 +540,15 @@ package final class AgentModeRunService {
     /// was awaited. The same intents were settled back to `queued` (no handoff).
     package static let recoveryDispatchTargetChangedReason = "recovery_dispatch_target_changed"
 
+    /// Reason carried by the `.stale` outcome of a DEBUG Oh My Pi qualification start refused before
+    /// any runner owned its input (generation or context identity mismatch).
+    package static let qualificationStartRefusedReason = "omp_qualification_start_refused"
+
     /// Starts a run for `initialUserMessage`.
+    ///
+    /// Outcome contract (F1): `nil` means only that a runner owns this input and owes its handoff's
+    /// settlement (dispatch commit and provider evidence, or a no-handoff settlement). Every exit
+    /// before a runner owns the input returns an explicit `.failed` or `.stale`, for every provider.
     ///
     /// `inputConstituents` are the immutable identities of the user input this run delivers, in
     /// order (captured at admission, never re-derived from the composer). For every non-Codex
@@ -577,8 +585,8 @@ package final class AgentModeRunService {
         // Review R1 B N2: a non-Codex start that returns before any runner owns its input (a
         // startup failure before dispatch — knowledge-profile provider, workspace or worktree
         // resolution, a DEBUG qualification mismatch — or a refused or revoked dispatch) handed
-        // nothing off, yet some of these exits return `nil`, which callers read as "runner
-        // admitted". An explicit recovery action carried by the input ends its submission here.
+        // nothing off and returns an explicit `.failed`/`.stale` (F1: `nil` means a runner owns the
+        // input). An explicit recovery action carried by the input ends its submission here.
         // Fenced: it settles only while the action has no committed attempt and no commit in flight
         // (`settleRecoveryActionIfFenced`); it never guesses from elapsed time.
         defer {
@@ -613,28 +621,28 @@ package final class AgentModeRunService {
                         .denied,
                         startupFailureReason: "start_invocation_generation_mismatch"
                     )
-                    return nil
+                    return .stale(reason: Self.qualificationStartRefusedReason)
                 }
                 guard let ompQualificationStartContext,
                       let invocationOMPQualificationStartContext
                 else {
                     let message = "Oh My Pi qualification state is incomplete or is not bound to this session and workspace."
                     await failBeforeProviderStartup(session: session, message: message, stagedInput: stagedInput)
-                    return nil
+                    return .failed(message: message)
                 }
                 guard ompQualificationStartContext === invocationOMPQualificationStartContext else {
                     invocationOMPQualificationStartContext.authorizationReceipt.resolve(
                         .denied,
                         startupFailureReason: "qualification_context_identity_mismatch"
                     )
-                    return nil
+                    return .stale(reason: Self.qualificationStartRefusedReason)
                 }
                 guard session.mcpControlContext?.sessionID == ompQualificationStartContext.transaction.sessionID,
                       dependencies.ompQualificationActiveWorkspaceID() == ompQualificationStartContext.expectedWorkspaceID
                 else {
                     let message = "Oh My Pi qualification state is incomplete or is not bound to this session and workspace."
                     await failBeforeProviderStartup(session: session, message: message, stagedInput: stagedInput)
-                    return nil
+                    return .failed(message: message)
                 }
             }
         #endif
@@ -643,7 +651,7 @@ package final class AgentModeRunService {
         {
             let message = "Knowledge sessions currently support Claude Code and Codex only."
             await failBeforeProviderStartup(session: session, message: message, stagedInput: stagedInput)
-            return selectedAgent == .codexExec ? .failed(message: message) : nil
+            return .failed(message: message)
         }
         let selectedModelString = session.selectedModelRaw == AgentModel.defaultModel.rawValue
             ? nil
@@ -655,7 +663,7 @@ package final class AgentModeRunService {
         } catch {
             let message = Self.providerStartupFailureMessage(for: error)
             await failBeforeProviderStartup(session: session, message: message, stagedInput: stagedInput)
-            return selectedAgent == .codexExec ? .failed(message: message) : nil
+            return .failed(message: message)
         }
 
         // Validate the run's input for dispatch before any runner is admitted and before any run
@@ -669,6 +677,7 @@ package final class AgentModeRunService {
             let preDispatchRunState = session.runState
             switch AgentProviderHandoff.prepareRunStart(session: session, constituents: inputConstituents) {
             case let .failure(failure):
+                AgentDeliveryRecordDiagnostics.runStartRefused(failure)
                 if case let .commitFailed(controllerFailure) = failure {
                     return .failed(message: AgentProviderHandoff.dispatchFailureText(failure) + " (\(controllerFailure))")
                 }
@@ -706,7 +715,8 @@ package final class AgentModeRunService {
                 stagedInput: stagedInput
             )
         }
-        guard let handoff else { return nil }
+        // Every non-Codex route prepared a handoff above; without one no runner may own the input.
+        guard let handoff else { return .stale(reason: Self.recoveryDispatchRefusedReason) }
         // The handoff carries the staged input from here: its runner reports the outcome, and its
         // end-of-scope settlement classifies anything left unreported.
         runnerOwnsStagedInput = true

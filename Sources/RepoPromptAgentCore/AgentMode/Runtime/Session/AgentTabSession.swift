@@ -1971,8 +1971,11 @@ package final class AgentTabSession: ObservableObject {
         return teardown
     }
 
+    /// `inputUserItemID`: the user item this attempt's own input owns (non-Codex runners, from their
+    /// handoff). The terminal barrier attributes the attempt's outcome to that item's execution turn
+    /// instead of the last user item; `nil` keeps the legacy last-user-item attribution.
     @discardableResult
-    func beginRunAttempt(source: String, attemptID: UUID = UUID()) -> AgentRunOwnership {
+    func beginRunAttempt(source: String, attemptID: UUID = UUID(), inputUserItemID: UUID? = nil) -> AgentRunOwnership {
         assert(runAttemptTerminalResources == nil || runAttemptTerminalResources?.isClaimed == true)
         runAttemptGeneration &+= 1
         runAttemptTerminalResources = nil
@@ -2004,6 +2007,9 @@ package final class AgentTabSession: ObservableObject {
             attemptID: ownership.attemptID,
             minimumSourceSequenceIndex: nextSequenceIndex
         )
+        runAttemptInputAttribution = inputUserItemID.map {
+            AgentRunAttemptInputAttribution(attemptID: ownership.attemptID, userItemID: $0)
+        }
         #if DEBUG
             AgentModePerfDiagnostics.increment("run.lifecycle.attempt.started")
             AgentModePerfDiagnostics.increment("run.lifecycle.attempt.started.source.\(source)")
@@ -2021,6 +2027,17 @@ package final class AgentTabSession: ObservableObject {
             )
         #endif
         return ownership
+    }
+
+    /// The user item whose turn the current run attempt's terminal outcome belongs to (F1), when its
+    /// runner named one; see `beginRunAttempt(inputUserItemID:)`.
+    package private(set) var runAttemptInputAttribution: AgentRunAttemptInputAttribution?
+
+    /// A later input of the same run attempt crossed its provider boundary (steering): the attempt's
+    /// outcome now belongs to that input's turn. Ignored for any other attempt.
+    func noteRunAttemptInput(attemptID: UUID, userItemID: UUID) {
+        guard activeRunAttemptID == attemptID else { return }
+        runAttemptInputAttribution = AgentRunAttemptInputAttribution(attemptID: attemptID, userItemID: userItemID)
     }
 
     package func isCurrentRunAttempt(_ ownership: AgentRunOwnership, expectedRunID: UUID? = nil) -> Bool {

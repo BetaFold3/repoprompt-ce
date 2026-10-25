@@ -69,7 +69,7 @@ final class HeadlessAgentModeRunner {
         session.reasoningItemIDsByGroupID.removeAll()
         session.codexReasoningSegmentsByKey.removeAll()
 
-        let ownership = session.beginRunAttempt(source: "headless")
+        let ownership = session.beginRunAttempt(source: "headless", inputUserItemID: handoff.attributedUserItemID)
         let runAttemptID = ownership.attemptID
         session.recordRunProgress(ownership: ownership, kind: .stageTransition, stage: .preparingRuntime)
         session.runningStatusText = nil
@@ -241,6 +241,7 @@ final class HeadlessAgentModeRunner {
                 processRunID: runID,
                 session: session
             ) {
+                AgentDeliveryRecordDiagnostics.runAttemptNotRecorded(route: .headless, runAttemptID: runAttemptID, failure: failure)
                 handoff.noteNoHandoff(message: "run attempt not recorded: \(failure)")
                 throw HeadlessHandoffError.deliveryNotRecorded
             }

@@ -154,7 +154,8 @@ extension AgentModeViewModel {
             .receive(on: RunLoop.main)
             .sink { [weak self] notification in
                 guard let self, let lane = notification.object as? AgentRecoverySessionLane else { return }
-                for session in sessions.values where session.recoveryLane === lane {
+                // A retired predecessor's late no-handoff settlement (F1) also wakes its successor owner.
+                for session in sessions.values where session.recoveryLane?.sessionID == lane.sessionID {
                     recheckScheduledSendTransferAwaitingEvidence(for: session)
                 }
             }
@@ -1641,14 +1642,102 @@ extension AgentModeViewModel {
                       record.attempt?.attemptID == hold.scheduleAttemptID,
                       record.state == .dispatching
                 else { return }
-                _ = await runScheduledSendAction(on: session) {
-                    await self.performScheduledSendTransferRepair(session: session, sessionID: sessionID, record: record)
+                await runScheduledSendAction(on: session) {
+                    // F1: a run-start handoff still owned by its runner is never decided here.
+                    switch await self.settleScheduledDeferredHandoffIfNeeded(session: session, sessionID: sessionID, record: record) {
+                    case .notDeferred:
+                        _ = await self.performScheduledSendTransferRepair(session: session, sessionID: sessionID, record: record)
+                    case .pending, .undecided, .resolved:
+                        break
+                    }
                 }
                 // Still awaiting evidence: the lane's settle signal (or a run-state change) re-checks.
                 return
             }
         }
     }
+
+    private enum ScheduledDeferredHandoffSettlement {
+        /// Read succeeded and no deferred run-start handoff owns the linked intent (no registry entry,
+        /// or the intent already has a delivery attempt): the R9 repair decides.
+        case notDeferred
+        /// Its runner still owes the commit or a no-handoff settlement: keep holding.
+        case pending
+        /// Nothing could be read safely (owner not current; lane unavailable, retired, or another
+        /// session's; record read failed): decide nothing.
+        case undecided
+        /// The handoff's proven no-handoff was applied (or the release failed and is held).
+        case resolved
+    }
+
+    /// F1: an `.awaitingProviderEvidence` hold whose linked intent is carried by a deferred run-start
+    /// handoff (adopted plan §5). While that handoff is pending nothing is decided: a `queued` intent
+    /// is not proof of non-handoff, and the R9 repair would read it as saved input. Only the handoff's
+    /// own no-handoff settlement, with the intent still `queued` and no delivery attempt, withdraws
+    /// the intent, removes the scheduled bubble, and fails the schedule with the scheduled
+    /// explanation (the handoff's own reason is logged). A committed handoff is left to the R9
+    /// repair (acceptance evidence, never the commit, is Sent). The settlement is read from the
+    /// coordinator's registry, so a successor owner sees its predecessor's pending handoff.
+    private func settleScheduledDeferredHandoffIfNeeded(
+        session: AgentTabSession,
+        sessionID: UUID,
+        record: AgentScheduledSendPersist
+    ) async -> ScheduledDeferredHandoffSettlement {
+        guard scheduledSendTransferOwnerIsCurrent(session, sessionID: sessionID, record: record),
+              let attempt = record.attempt,
+              let lane = session.recoveryLane,
+              !lane.isRetired,
+              lane.sessionID == sessionID,
+              case let .success(recoveryRecord) = await lane.readRecord()
+        else { return .undecided }
+        guard let intentID = AgentScheduledSendTransfer.linkedIntentID(record: record, recoveryRecord: recoveryRecord),
+              let state = lane.deferredRunStartHandoffState(intentID: intentID),
+              AgentScheduledSendTransfer.intentNeverDispatched(intentID: intentID, in: recoveryRecord)
+        else { return .notDeferred }
+        guard case let .notHandedOff(message) = state else { return .pending }
+        guard scheduledSendTransferOwnerIsCurrent(session, sessionID: sessionID, record: record),
+              session.recoveryLane === lane
+        else { return .undecided }
+        // The handoff's own settlement is consumed here, whatever the release outcome.
+        lane.clearDeferredRunStartHandoff(intentID: intentID)
+        guard case .success = await lane.withdraw(intentID: intentID) else {
+            holdScheduledSendTransfer(
+                sessionID: sessionID,
+                record: record,
+                reason: .unresolved("This scheduled message's saved copy could not be released.")
+            )
+            syncComposerUIState(tabID: session.tabID)
+            return .resolved
+        }
+        lane.clearHeldIntent(intentID)
+        removeUnsentScheduledUserItem(id: attempt.itemID, from: session)
+        // The banner always shows the scheduled explanation; the handoff's own reason is logged.
+        AgentDeliveryRecordDiagnostics.scheduledNotHandedOff(scheduleID: record.id, sourceMessage: message)
+        // The failed record is committed before the hold is released: releasing re-evaluates the
+        // scheduler, which must never see this attempt as an unowned `.dispatching` record. A failed
+        // commit keeps an unresolved hold, so the scheduler never re-reads the attempt.
+        let dispatchingMember = session.scheduledSend
+        let wasDirty = session.isDirty
+        guard await markScheduledSendFailed(session: session, record: record, message: Self.scheduledNotHandedOffMessage) else {
+            // Memory agrees with the hold and with disk (still `.dispatching`); a later save never
+            // persists the unsaved failure behind the hold.
+            session.scheduledSend = dispatchingMember
+            session.isDirty = wasDirty
+            updateLocalSessionIndexScheduledSendSummary(for: session)
+            holdScheduledSendTransfer(
+                sessionID: sessionID,
+                record: record,
+                reason: .unresolved("This scheduled message was not sent, but its status could not be saved.")
+            )
+            syncComposerUIState(tabID: session.tabID)
+            return .resolved
+        }
+        releaseScheduledSendTransferHold(record: record)
+        notifyScheduledSendRecordChanged()
+        return .resolved
+    }
+
+    static let scheduledNotHandedOffMessage = "The scheduled message was not sent: its run ended before the message was handed off."
 
     /// Waits for the scheduler barrier and recovery startup, then repairs, holds, or normalizes the
     /// exact projected attempt inside the session's serialized schedule action.
@@ -1668,8 +1757,37 @@ extension AgentModeViewModel {
                 )
                 return
             }
-            _ = await runScheduledSendAction(on: session) {
-                await self.performScheduledSendTransferRepair(session: session, sessionID: sessionID, record: record)
+            await runScheduledSendAction(on: session) {
+                guard record.attempt != nil,
+                      recoveryCoordinator.hasDeferredRunStartHandoff(sessionID: sessionID)
+                else {
+                    // No attempt, or no deferred run-start handoff of this session exists in this
+                    // process (Codex, restart): nothing can be pending, so the R9 repair decides as before.
+                    _ = await self.performScheduledSendTransferRepair(session: session, sessionID: sessionID, record: record)
+                    return
+                }
+                // F1: a successor owner (tab replaced or reopened) never reads a predecessor's still
+                // pending run-start handoff as saved input; it waits for that handoff's settlement.
+                switch await self.settleScheduledDeferredHandoffIfNeeded(session: session, sessionID: sessionID, record: record) {
+                case .notDeferred:
+                    _ = await self.performScheduledSendTransferRepair(session: session, sessionID: sessionID, record: record)
+                case .pending:
+                    self.holdScheduledSendTransfer(sessionID: sessionID, record: record, reason: .awaitingProviderEvidence)
+                    self.syncComposerUIState(tabID: session.tabID)
+                case .undecided:
+                    // Its own guards hold (lane or record unavailable) or skip (owner changed); a
+                    // pending handoff could not be ruled out, so it never decides from disk here.
+                    if self.scheduledSendTransferOwnerIsCurrent(session, sessionID: sessionID, record: record) {
+                        _ = self.holdScheduledSendTransferForRepair(
+                            session: session,
+                            sessionID: sessionID,
+                            record: record,
+                            message: "The recovery record for this session is not available yet."
+                        )
+                    }
+                case .resolved:
+                    break
+                }
             }
         }
     }
@@ -2027,6 +2145,23 @@ extension AgentModeViewModel {
         let outcome: CodexAgentModeCoordinator.NativeSendOutcome?
         /// The appended user item exactly as prepared (pre-marker), retained as the accepted snapshot.
         let userItem: AgentChatItem?
+        /// F1: a non-Codex start whose `nil` outcome means a runner owns the input and owes its
+        /// handoff's settlement (`AgentModeRunService.startRun`). Codex keeps its own `nil` meaning.
+        /// Every start computes it the same way (`selectedAgent != .codexExec`, captured before the
+        /// start's await); results that never started a run pass `false`.
+        let runnerOwnsInputOnNil: Bool
+    }
+
+    /// F1: before a runner may own the scheduled intent, its owner marks it awaited, so the
+    /// runner's no-handoff settlement is kept for the hold (`finishMandatoryScheduledDispatch`
+    /// clears the mark on every exit that is not that hold).
+    private func noteScheduledRunStartAwaited(
+        _ identity: AgentQueuedInputIdentity?,
+        in session: AgentTabSession,
+        runnerOwnsInputOnNil: Bool
+    ) {
+        guard runnerOwnsInputOnNil, let intentID = identity?.intentID else { return }
+        session.recoveryLane?.noteDeferredRunStartHandoffAwaitedByOwner(intentID: intentID)
     }
 
     private func submitScheduledUserTurn(
@@ -2040,7 +2175,8 @@ extension AgentModeViewModel {
         guard !session.runState.isActive, session.remoteHost == nil else {
             return ScheduledSubmitResult(
                 outcome: .stale(reason: "The session became busy before the scheduled message could start."),
-                userItem: nil
+                userItem: nil,
+                runnerOwnsInputOnNil: false
             )
         }
         let trimmedText = record.rawText.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -2063,11 +2199,14 @@ extension AgentModeViewModel {
             guard providerHandoffAuthorization() else {
                 return ScheduledSubmitResult(
                     outcome: .stale(reason: AgentModeRunService.providerHandoffRevokedReason),
-                    userItem: prepared.userItem
+                    userItem: prepared.userItem,
+                    runnerOwnsInputOnNil: false
                 )
             }
+            let runnerOwnsInputOnNil = session.selectedAgent != .codexExec
+            noteScheduledRunStartAwaited(recoveryIdentity, in: session, runnerOwnsInputOnNil: runnerOwnsInputOnNil)
             let outcome = await scheduledDispatchRunStarter(tabID, wrappedText, record.attachments, record.taggedFileAttachments)
-            return ScheduledSubmitResult(outcome: outcome, userItem: prepared.userItem)
+            return ScheduledSubmitResult(outcome: outcome, userItem: prepared.userItem, runnerOwnsInputOnNil: runnerOwnsInputOnNil)
         }
         if session.selectedAgent == .codexExec {
             // Mandatory recovery carries the linked intent's durable identity (queue ID == intent ID);
@@ -2077,7 +2216,8 @@ extension AgentModeViewModel {
             else {
                 return ScheduledSubmitResult(
                     outcome: .stale(reason: Self.durableQueueAdmissionRequiredMessage),
-                    userItem: prepared.userItem
+                    userItem: prepared.userItem,
+                    runnerOwnsInputOnNil: false
                 )
             }
             let dispatchTicket = session.codexDispatchSerialGate.issueTicket()
@@ -2101,7 +2241,7 @@ extension AgentModeViewModel {
                 codexFallbackContext: fallbackContext,
                 providerHandoffAuthorization: providerHandoffAuthorization
             )
-            return ScheduledSubmitResult(outcome: outcome, userItem: prepared.userItem)
+            return ScheduledSubmitResult(outcome: outcome, userItem: prepared.userItem, runnerOwnsInputOnNil: false)
         }
         // The linked intent's durable identity (mandatory recovery), or untracked while inactive.
         guard let identity = recoveryIdentity
@@ -2109,7 +2249,8 @@ extension AgentModeViewModel {
         else {
             return ScheduledSubmitResult(
                 outcome: .stale(reason: Self.durableQueueAdmissionRequiredMessage),
-                userItem: prepared.userItem
+                userItem: prepared.userItem,
+                runnerOwnsInputOnNil: false
             )
         }
         _ = enqueueUserTurnTokenEstimate(
@@ -2117,6 +2258,8 @@ extension AgentModeViewModel {
             attachments: record.attachments,
             session: session
         )
+        let runnerOwnsInputOnNil = session.selectedAgent != .codexExec
+        noteScheduledRunStartAwaited(identity, in: session, runnerOwnsInputOnNil: runnerOwnsInputOnNil)
         let outcome = await startAgentRun(
             tabID: tabID,
             initialMessage: wrappedText,
@@ -2125,7 +2268,7 @@ extension AgentModeViewModel {
             inputConstituents: [identity],
             providerHandoffAuthorization: providerHandoffAuthorization
         )
-        return ScheduledSubmitResult(outcome: outcome, userItem: prepared.userItem)
+        return ScheduledSubmitResult(outcome: outcome, userItem: prepared.userItem, runnerOwnsInputOnNil: runnerOwnsInputOnNil)
     }
 
     /// Releases a persisted `.dispatching` attempt that never reached the provider: the record
@@ -2180,14 +2323,16 @@ extension AgentModeViewModel {
         session.replaceItem(at: index, with: item)
     }
 
+    /// Returns whether the failure is durable (or there is nothing left to mark: deleted session).
+    @discardableResult
     private func markScheduledSendFailed(
         session: AgentTabSession,
         record: AgentScheduledSendPersist,
         message: String
-    ) async {
+    ) async -> Bool {
         // The durable session was explicitly deleted while this attempt was in flight: there is
         // nothing to mark and no file may be recreated.
-        guard session.scheduledSend != nil else { return }
+        guard session.scheduledSend != nil else { return true }
         var failed = record
         failed.state = .failed
         failed.lastFailureMessage = message
@@ -2196,9 +2341,10 @@ extension AgentModeViewModel {
         let expected = session.scheduledSendPersistedUpdatedAt
         session.scheduledSend = .v1(failed)
         session.isDirty = true
-        _ = await commitScheduledSend(session: session, member: .v1(failed), expectedUpdatedAt: expected)
+        let committed = await commitScheduledSend(session: session, member: .v1(failed), expectedUpdatedAt: expected)
         updateLocalSessionIndexScheduledSendSummary(for: session)
         syncComposerUIState(tabID: session.tabID)
+        return committed
     }
 
     // MARK: - Recovery projection (coordinator-owned persistence)
@@ -3134,6 +3280,7 @@ extension AgentModeViewModel: AgentScheduledSendCoordinatorHost {
             coordinator.reportProviderOutcomeNotAccepted(key: context.recoveryKey)
             removeUnsentScheduledUserItem(id: context.attempt.itemID, from: session)
             rollBackRevokedHandoffPreparation(session: session)
+            context.lane.clearDeferredRunStartHandoff(intentID: intentID)
             return await rollBackScheduledRecoveryAdmission(
                 (context.identity, context.lane),
                 record: context.record,
@@ -3147,6 +3294,7 @@ extension AgentModeViewModel: AgentScheduledSendCoordinatorHost {
             // The handoff began but its result is not proven (or its evidence could not be written):
             // the intent stays `dispatching`/`deliveryUnknown`. Keep the schedule, payload, and bubble.
             coordinator.reportProviderOutcomeNotAccepted(key: context.recoveryKey)
+            context.lane.clearDeferredRunStartHandoff(intentID: intentID)
             holdScheduledSendTransfer(
                 sessionID: context.lease.sessionID,
                 record: context.dispatching,
@@ -3154,6 +3302,24 @@ extension AgentModeViewModel: AgentScheduledSendCoordinatorHost {
             )
             return .heldForRecovery
         }
+
+        if outcome == nil, submitResult.runnerOwnsInputOnNil {
+            // F1: a runner owns this input and owes its handoff's settlement; the non-Codex dispatch
+            // commit is deferred to it, so the intent may still be `queued` here. Neither `nil` nor a
+            // record read proves non-delivery: hold the schedule, payload, intent, and bubble. The
+            // hold resolves only on the handoff's own settlement (committed evidence → the R9
+            // transfer after acceptance; a proven no-handoff of the still-queued intent → failed).
+            coordinator.reportProviderOutcomeNotAccepted(key: context.recoveryKey)
+            holdScheduledSendTransfer(
+                sessionID: context.lease.sessionID,
+                record: context.dispatching,
+                reason: .awaitingProviderEvidence
+            )
+            recheckScheduledSendTransferAwaitingEvidence(for: session)
+            return .heldForRecovery
+        }
+        // An explicit outcome: no runner owns this input, so no deferred settlement will be consumed.
+        context.lane.clearDeferredRunStartHandoff(intentID: intentID)
 
         let queueReceiptMatches: Bool = if case .queuedFallback? = outcome {
             outcome?.durableQueueReceipt?.intent.intentID == intentID
@@ -3183,6 +3349,7 @@ extension AgentModeViewModel: AgentScheduledSendCoordinatorHost {
             false
         }
         if neverDispatched, outcomeIsNonDelivery {
+            // An explicit pre-runner `.failed`/`.stale`/`.cancelled` (or Codex's `nil`): nothing was handed off.
             coordinator.reportProviderOutcomeNotAccepted(key: context.recoveryKey)
             removeUnsentScheduledUserItem(id: context.attempt.itemID, from: session)
             guard case .success = await context.lane.withdraw(intentID: intentID) else {

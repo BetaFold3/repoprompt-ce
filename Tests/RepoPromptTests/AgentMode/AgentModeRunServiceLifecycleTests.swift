@@ -329,15 +329,13 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
             XCTAssertTrue(recorder.contains("bindings"), agent.rawValue)
             XCTAssertTrue(recorder.contains("save"), agent.rawValue)
             XCTAssertFalse(recorder.contains(prefix: "factory:"), agent.rawValue)
-            if agent == .codexExec {
-                guard case let .failed(message)? = outcome else {
-                    XCTFail("Expected Codex startup failure outcome", file: #filePath, line: #line)
-                    continue
-                }
-                XCTAssertEqual(message, LifecycleTestError.workspaceMissing.errorDescription ?? "")
-            } else {
-                XCTAssertNil(outcome, agent.rawValue)
+            // F1 (deliberate contract change): every provider reports a pre-runner startup failure
+            // explicitly; `nil` means only that a runner owns the input.
+            guard case let .failed(message)? = outcome else {
+                XCTFail("Expected an explicit startup failure outcome for \(agent.rawValue)", file: #filePath, line: #line)
+                continue
             }
+            XCTAssertEqual(message, LifecycleTestError.workspaceMissing.errorDescription ?? "", agent.rawValue)
         }
     }
 
@@ -5116,6 +5114,87 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         XCTAssertTrue(hasRunAttempt)
     }
 
+    /// F1 (real ACP runner): `startRun` returns `nil` once the runner owns the input, before its
+    /// delayed `lease.acquire()` finishes. While it is pending the intent is still `queued` with no
+    /// attempt and the lane records the deferred handoff as pending; then the runner commits and only
+    /// the `session/prompt` response accepts. A failed acquisition instead settles not handed off.
+    func testACPDeferredStartWithDelayedLeaseAcquireIsPendingThenCommittedOrNotHandedOff() async throws {
+        for acquireSucceeds in [true, false] {
+            let name = acquireSucceeds ? "accepted" : "acquire-failed"
+            let fixture = try await RecoveryLaneFixture.make("f1-acp-delayed-acquire-\(name)")
+            defer { fixture.tearDown() }
+            let recorder = LifecycleRecorder()
+            let workspace = try makeTemporaryDirectory()
+            let recordURL = workspace.appendingPathComponent("acp-deferred-\(name).jsonl")
+            let scriptURL = try makeOpenCodeModeFlowServerScript()
+            let provider = LifecycleFakeACPProvider(
+                providerID: .cursor,
+                commandPath: scriptURL.path,
+                environment: ["ACP_RECORD_PATH": recordURL.path],
+                recorder: recorder
+            )
+            let gate = LifecycleAsyncGate()
+            let harness = makeHarness(
+                recorder: recorder,
+                workspacePathProvider: { _ in workspace.path },
+                acpProviderFactory: { _, _ in provider },
+                expectedPIDPolicyArmer: { _ in
+                    await gate.arriveAndWait()
+                    return acquireSucceeds
+                }
+            )
+            let session = fixture.boundTabSession()
+            session.selectedAgent = .cursor
+            let identity = try await fixture.queuedIdentity("deferred ACP prompt \(name)")
+            session.recoveryAdmissionMode = .mandatory
+            let intentID = try XCTUnwrap(identity.intentID)
+
+            let outcome = await harness.service.startRun(
+                tabID: session.tabID,
+                session: session,
+                initialUserMessage: "deferred ACP prompt",
+                initialMessageForRun: "deferred ACP prompt",
+                attachments: [],
+                inputConstituents: [identity]
+            )
+            XCTAssertNil(outcome, "\(name): nil means the runner owns the input")
+            try await withLifecycleTimeout("ACP lease acquisition reached (\(name))") { await gate.waitUntilArrived() }
+            XCTAssertEqual(fixture.lane.deferredRunStartHandoffState(intentID: intentID), .pending, name)
+            let queued = await fixture.intent(identity)
+            XCTAssertEqual(queued?.deliveryState, .queued, "\(name): nothing committed before the runner's preparation")
+            let attemptsBeforeCommit = await fixture.attempts(for: identity)
+            XCTAssertTrue(attemptsBeforeCommit.isEmpty, name)
+
+            let settled = acquireSucceeds
+                ? nil
+                : expectation(forNotification: .agentRecoveryDeliveryEvidenceDidSettle, object: fixture.lane)
+            settled?.assertForOverFulfill = false
+            await gate.release()
+            try await withLifecycleTimeout("ACP run task ended (\(name))") {
+                await session.agentTask?.value
+            }
+
+            if acquireSucceeds {
+                XCTAssertNil(fixture.lane.deferredRunStartHandoffState(intentID: intentID), "Committed evidence speaks from here")
+                let accepted = await fixture.waitForIntent(identity, state: .providerAccepted)
+                XCTAssertEqual(accepted?.deliveryState, .providerAccepted)
+                let attempts = await fixture.attempts(for: identity)
+                XCTAssertEqual(attempts.count, 1)
+            } else {
+                // The no-handoff settlement signals; a non-scheduled entry is cleared then (R8).
+                if let settled {
+                    await fulfillment(of: [settled], timeout: 5)
+                }
+                XCTAssertNil(fixture.lane.deferredRunStartHandoffState(intentID: intentID), name)
+                XCTAssertFalse(recordedOpenCodeFlowRequests(at: recordURL).contains { $0.method == "session/prompt" })
+                let intent = await fixture.intent(identity)
+                XCTAssertEqual(intent?.deliveryState, .queued, name)
+                let attempts = await fixture.attempts(for: identity)
+                XCTAssertTrue(attempts.isEmpty, name)
+            }
+        }
+    }
+
     /// Phase 1b ACP initial route: a `session/prompt` that fails before its write (no
     /// `onSubmitted`) is proven not handed off, so the same intent returns to `queued`.
     func testACPDurablePromptNeverWrittenReturnsSameIntentToQueue() async throws {
@@ -5749,6 +5828,184 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         XCTAssertEqual(session.runState, .running)
         XCTAssertEqual(session.activeRunOwnership, currentOwnership)
         XCTAssertFalse(recorder.contains(prefix: "commit:"))
+    }
+
+    // MARK: F1 terminal attribution
+
+    private func f1OpenTurn(id: UUID, request: AgentChatItem? = nil) -> AgentTranscriptTurn {
+        var turn = AgentTranscriptTurn(
+            id: id,
+            responseSpans: [AgentTranscriptProviderResponseSpan(lifecycle: .open, startedAt: Date(timeIntervalSince1970: 100))],
+            terminalState: .running,
+            startedAt: Date(timeIntervalSince1970: 100)
+        )
+        if let request {
+            turn.request = AgentTranscriptRequestAnchor(from: request)
+        }
+        return turn
+    }
+
+    private func f1InterruptedTerminal(
+        _ barrier: AgentRunTerminalCommitBarrier,
+        session: AgentTabSession,
+        ownership: AgentRunOwnership
+    ) async -> AgentRunTerminalCommitRevision? {
+        await barrier.commit(.init(
+            session: session,
+            ownership: ownership,
+            expectedRunID: session.runID,
+            terminalState: .cancelled,
+            source: "test.f1.attribution",
+            cause: .appQuit,
+            attachmentDisposition: .deleteFiles,
+            finalizeNonCodexUsage: true,
+            supportsFollowUp: false,
+            notifyTurnComplete: false
+        ))
+    }
+
+    /// F1: a non-Codex run attempt's terminal outcome belongs to its own input's turn. A newer user
+    /// item queued meanwhile (a scheduled follow-up's bubble) never takes it, and when the attempt's
+    /// own item is gone nothing is attributed, never an earlier turn.
+    func testTerminalBarrierAttributesTheAttemptsOwnInputNeverANewerQueuedUserItem() async throws {
+        let ownID = UUID()
+        let newerID = UUID()
+        let own = AgentChatItem.user("own input", id: ownID, sequenceIndex: 1)
+        let newer = AgentChatItem.user("queued follow-up", id: newerID, sequenceIndex: 2)
+
+        for ownItemRemains in [true, false] {
+            let barrier = AgentRunTerminalCommitBarrier(hooks: makeHooks(recorder: LifecycleRecorder()))
+            let session = AgentTabSession(tabID: UUID())
+            session.appendItem(own)
+            session.runID = UUID()
+            session.runState = .running
+            let ownership = session.beginRunAttempt(source: "test.claude", inputUserItemID: ownID)
+            session.appendItem(newer)
+            if !ownItemRemains {
+                // The attempt's own (scheduled) bubble was withdrawn.
+                let index = try XCTUnwrap(session.items.firstIndex { $0.id == ownID })
+                _ = session.removeItem(at: index)
+            }
+            session.transcript = AgentTranscript(
+                turns: (ownItemRemains ? [f1OpenTurn(id: ownID)] : []) + [f1OpenTurn(id: newerID)]
+            )
+            XCTAssertEqual(
+                AgentRunTerminalCommitBarrier.terminalUserItemID(for: ownership, in: session),
+                ownItemRemains ? ownID : nil
+            )
+
+            let revision = await f1InterruptedTerminal(barrier, session: session, ownership: ownership)
+            XCTAssertNotNil(revision)
+            XCTAssertNil(session.transcript.turns.first { $0.id == newerID }?.interruption, "Never the newer queued item")
+            if ownItemRemains {
+                XCTAssertEqual(session.transcript.turns.first { $0.id == ownID }?.interruption?.runAttemptID, ownership.attemptID)
+            }
+        }
+
+        // Legacy attempts without a named input (Codex, pre-runner startup failures) keep the last user item.
+        let session = AgentTabSession(tabID: UUID())
+        session.appendItem(own)
+        session.appendItem(newer)
+        let legacy = session.beginRunAttempt(source: "test.codex")
+        XCTAssertEqual(AgentRunTerminalCommitBarrier.terminalUserItemID(for: legacy, in: session), newerID)
+    }
+
+    /// F1 regression: transcript `[earlier (completed), own]`, the attempt's own (scheduled) input is
+    /// removed, and its run ends with an ordinary `.failed` carrying error text. The earlier turn is
+    /// never touched (terminal state, response spans, interruption all unchanged) and nothing is
+    /// attributed; the error text is still shown once as the session's error item.
+    func testTerminalBarrierOrdinaryFailureAfterOwnInputRemovedNeverTouchesTheEarlierTurn() async throws {
+        let earlierID = UUID()
+        let ownID = UUID()
+        let earlier = AgentChatItem.user("earlier turn", id: earlierID, sequenceIndex: 1)
+        let own = AgentChatItem.user("scheduled input", id: ownID, sequenceIndex: 2)
+        let barrier = AgentRunTerminalCommitBarrier(hooks: makeHooks(recorder: LifecycleRecorder()))
+        let session = AgentTabSession(tabID: UUID())
+        session.appendItem(earlier)
+        session.appendItem(own)
+        var earlierTurn = f1OpenTurn(id: earlierID, request: earlier)
+        earlierTurn.terminalState = .completed
+        earlierTurn.completedAt = Date(timeIntervalSince1970: 150)
+        session.transcript = AgentTranscript(turns: [earlierTurn, f1OpenTurn(id: ownID, request: own)])
+        session.runID = UUID()
+        session.runState = .running
+        let ownership = session.beginRunAttempt(source: "test.claude", inputUserItemID: ownID)
+
+        // The attempt's own bubble (and its turn) is withdrawn before the terminal.
+        let index = try XCTUnwrap(session.items.firstIndex { $0.id == ownID })
+        _ = session.removeItem(at: index)
+        session.transcript = AgentTranscript(turns: [earlierTurn])
+        XCTAssertNil(AgentRunTerminalCommitBarrier.terminalUserItemID(for: ownership, in: session), "Nothing is attributed")
+
+        let errorText = "Claude Code exited before responding."
+        let revision = await barrier.commit(.init(
+            session: session,
+            ownership: ownership,
+            expectedRunID: session.runID,
+            terminalState: .failed,
+            source: "test.f1.regression",
+            cause: .ordinary,
+            errorText: errorText,
+            attachmentDisposition: .deleteFiles,
+            finalizeNonCodexUsage: true,
+            supportsFollowUp: false,
+            notifyTurnComplete: false
+        ))
+        XCTAssertNotNil(revision)
+        XCTAssertEqual(session.runState, .failed)
+        let after = try XCTUnwrap(session.transcript.turns.first { $0.id == earlierID })
+        XCTAssertEqual(after.terminalState, .completed, "The earlier turn stays completed")
+        XCTAssertNil(after.interruption)
+        XCTAssertNil(after.responseSpans.last?.runID, "The run is never retained in the earlier turn")
+        XCTAssertEqual(after, earlierTurn, "The earlier turn is unchanged")
+        XCTAssertEqual(session.items.filter { $0.kind == .error }.map(\.text), [errorText], "Shown once, as the session's error")
+    }
+
+    /// F1: the attempt's own item resolves through the relocated-input mapping (O11): a saved input
+    /// re-sent after newer messages executes in a distinct turn E; the terminal outcome lands on E,
+    /// never on its historical envelope H nor on a newer queued item. Steering moves attribution to
+    /// the input that crossed the provider boundary, for the same attempt only.
+    func testTerminalBarrierAttributesARelocatedOwnInputToItsExecutionTurn() async {
+        let itemID = UUID()
+        let executionTurnID = UUID()
+        let newerID = UUID()
+        let input = AgentChatItem.user("saved message", id: itemID, sequenceIndex: 1)
+        let newer = AgentChatItem.user("queued follow-up", id: newerID, sequenceIndex: 3)
+        let barrier = AgentRunTerminalCommitBarrier(hooks: makeHooks(recorder: LifecycleRecorder()))
+        let session = AgentTabSession(tabID: UUID())
+        session.appendItem(input)
+        session.runID = UUID()
+        session.runState = .running
+        let ownership = session.beginRunAttempt(source: "test.acp", inputUserItemID: itemID)
+        session.appendItem(newer)
+        var historical = f1OpenTurn(id: itemID, request: input)
+        historical.terminalState = .cancelled
+        session.transcript = AgentTranscript(turns: [
+            historical,
+            f1OpenTurn(id: executionTurnID, request: input),
+            f1OpenTurn(id: newerID)
+        ])
+        XCTAssertEqual(session.transcript.executionTurnID(forUserItemID: itemID), executionTurnID, "Precondition: relocated")
+
+        // Another attempt's input never moves this attempt's attribution.
+        session.noteRunAttemptInput(attemptID: UUID(), userItemID: newerID)
+        XCTAssertEqual(session.runAttemptInputAttribution?.userItemID, itemID)
+
+        let revision = await f1InterruptedTerminal(barrier, session: session, ownership: ownership)
+        XCTAssertNotNil(revision)
+        XCTAssertEqual(session.transcript.turns.first { $0.id == executionTurnID }?.interruption?.runAttemptID, ownership.attemptID)
+        XCTAssertNil(session.transcript.turns.first { $0.id == itemID }?.interruption, "Never the historical envelope")
+        XCTAssertNil(session.transcript.turns.first { $0.id == newerID }?.interruption, "Never the newer queued item")
+
+        // Steering: a later input of the same attempt that crossed its boundary owns the outcome.
+        let steered = AgentTabSession(tabID: UUID())
+        steered.appendItem(input)
+        steered.runID = UUID()
+        steered.runState = .running
+        let steeredOwnership = steered.beginRunAttempt(source: "test.claude", inputUserItemID: itemID)
+        steered.appendItem(newer)
+        steered.noteRunAttemptInput(attemptID: steeredOwnership.attemptID, userItemID: newerID)
+        XCTAssertEqual(AgentRunTerminalCommitBarrier.terminalUserItemID(for: steeredOwnership, in: steered), newerID)
     }
 
     func testNewAttemptResetsProviderDrainGenerationAcrossProviderFamilies() async {
