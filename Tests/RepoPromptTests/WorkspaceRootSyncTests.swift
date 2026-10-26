@@ -213,9 +213,12 @@ final class WorkspaceRootSyncTests: XCTestCase {
         XCTAssertTrue(workspaceRoot.contains("/Application Support/RepoPrompt CE/Workspaces"), workspaceRoot)
         XCTAssertFalse(workspaceRoot.contains("/Application Support/RepoPrompt/Workspaces"), workspaceRoot)
 
-        let windowPath = WindowSessionStore.sessionFileURL().path
-        XCTAssertTrue(windowPath.contains("/Application Support/RepoPrompt CE/windowSessions.json"), windowPath)
+        let windowPath = WindowSessionStore.productionSessionFileURL().path
+        XCTAssertTrue(windowPath.hasSuffix("/Application Support/RepoPrompt CE/windowSessions.json"), windowPath)
         XCTAssertFalse(windowPath.contains("/Application Support/RepoPrompt/windowSessions.json"), windowPath)
+        let testWindowPath = WindowSessionStore.sessionFileURL().path
+        let productionWindowDirectory = WindowSessionStore.productionSessionFileURL().deletingLastPathComponent().path
+        XCTAssertFalse(testWindowPath.hasPrefix(productionWindowDirectory + "/"), testWindowPath)
     }
 
     func testWorkspaceDecodeCreatesDefaultComposeTabAndIgnoresRemovedLegacyFields() throws {

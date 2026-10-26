@@ -125,13 +125,52 @@ struct WindowSessionRestorePersistenceGate {
 }
 
 enum WindowSessionStore {
-    static func sessionFileURL() -> URL {
-        let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)
+    /// The live app's window-session file. Pure path computation; creates no directory.
+    static func productionSessionFileURL() -> URL {
+        FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)
             .first!
             .appendingPathComponent("RepoPrompt CE", isDirectory: true)
-        try? FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
-        return base.appendingPathComponent("windowSessions.json")
+            .appendingPathComponent("windowSessions.json")
     }
+
+    /// The file `WindowStatesManager` reads and writes. DEBUG builds running under
+    /// XCTest use a per-process temporary file so tests never overwrite the user's
+    /// live `windowSessions.json` or leave interrupted atomic-write siblings beside it.
+    static func sessionFileURL() -> URL {
+        #if DEBUG
+            if NSClassFromString("XCTestCase") != nil || NSClassFromString("XCTest.XCTestCase") != nil {
+                return xctestSessionFileURL
+            }
+        #endif
+        let url = productionSessionFileURL()
+        try? FileManager.default.createDirectory(
+            at: url.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        return url
+    }
+
+    #if DEBUG
+        private static let xctestSessionFileURL: URL = {
+            let directory = FileManager.default.temporaryDirectory
+                .appendingPathComponent("RepoPromptCE-XCTest", isDirectory: true)
+                .appendingPathComponent(UUID().uuidString, isDirectory: true)
+            do {
+                try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            } catch {
+                preconditionFailure("Cannot create isolated XCTest window-session directory")
+            }
+            // Remove only this process's directory on normal exit (never another worker's).
+            let cleanup: @convention(block) () -> Void = {
+                try? FileManager.default.removeItem(at: directory)
+            }
+            guard atexit_b(cleanup) == 0 else {
+                cleanup()
+                preconditionFailure("Cannot register isolated XCTest window-session cleanup")
+            }
+            return directory.appendingPathComponent("windowSessions.json")
+        }()
+    #endif
 }
 
 actor WindowSessionDiskWriter {
