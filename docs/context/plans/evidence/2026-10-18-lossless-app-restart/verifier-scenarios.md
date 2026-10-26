@@ -40,6 +40,9 @@ A3. After A2, click It stopped, send a new message normally, reopen the sheet. P
 A4. Bulk Dismiss on Information with three notes. Pass: summary "Dismissed 3 of 3"; each record has an acknowledgement; saved inputs, questions and crash holds unchanged.
 A5. Bulk Dismiss on a Needs action workspace group that contains a non-dismissible item (save failure or surviving process). Pass: confirmation text says Dismiss only hides cards; the non-dismissible item is reported as skipped; crash holds still pause sending (the "Sending paused" row remains).
 A6. Start a bulk Dismiss and change one item before it is reached (for example, restore its draft in another window). Pass: that item is reported skipped/changed, never dismissed in its new form.
+A7. Sheet sections: open Needs Attention. Pass: header `agent.recoveryNeedsAttention.section.needsAction` reads "Needs action (n)" and the disclosure `agent.recoveryNeedsAttention.section.informational` reads "Information (m)", collapsed (accessibility value `collapsed`); n equals the sidebar badge (`agent.recoveryNeedsAttention.sidebarButton`); turning on Show dismissed does not change n or m.
+A8. Section move during an action (after activation): on a run note in Information, start Continue or Reconcile. Pass: the row may move to Needs action while the action runs and back afterwards; no confirmation or typed text is lost, and the composer banner flash is acceptable only while the action runs. Record what happens.
+A9. Unsent continuation (after activation, Claude or Codex): type a continuation that is refused before sending (e.g. while the old process may still be running). Pass: the run row is under Needs action and its detail ends with "The message you typed to continue it was not sent."; a following Reconcile that does not confirm completion leaves it under Needs action.
 
 ## Step 9-check
 

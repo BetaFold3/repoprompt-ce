@@ -1773,6 +1773,445 @@ final class AgentRecoveryCoordinatorTests: XCTestCase {
         XCTAssertEqual(record?.cardAcknowledgements.count ?? 0, 0, "Nothing was written")
     }
 
+    // MARK: Attention classification (Step 8-attention, O34-3)
+
+    /// Every payload's class: run cards are informational notes, everything else needs action
+    /// (including a closed session's draft and an unchecked schedule index). The classifier's switch
+    /// is exhaustive, so this table covers every case that compiles.
+    func testCatalogAttentionClassifiesEveryPayload() {
+        let id = UUID()
+        let stamp = AgentRecoveryTimestamp(millisecondsSince1970: 1000)
+        let run = AgentRecoveryRunAttempt(runAttemptID: id, transcriptResetGeneration: 0, processRunID: nil, transcriptTurnID: nil, startedAt: stamp)
+        let turn = AgentRecoveryInterruptedTurn(
+            turnID: id,
+            interruption: AgentTranscriptTurnInterruption(reason: .appCrash, observedAt: stamp.date, runAttemptID: id),
+            status: .interrupted,
+            isLastTurn: true
+        )
+        let intent = AgentRecoveryIntent(
+            intentID: id, userItemID: id, origin: .composer, target: .session, createdAt: stamp, appInstanceID: id,
+            transcriptResetGeneration: 0, deliveryState: .queued, payload: Support.content("saved"), scheduleReference: nil
+        )
+        let question = AgentRecoveryQuestionSnapshot(
+            interactionID: id, kind: .askUser, runAttemptID: id, transcriptResetGeneration: 0, appInstanceID: id,
+            askedAt: stamp, title: "Question", message: nil, items: [], extras: [:]
+        )
+        let proposal = AgentRecoveryEditProposal(
+            reviewID: id, runAttemptID: id, transcriptResetGeneration: 0, appInstanceID: id, proposedAt: stamp,
+            physicalPath: "/tmp/a.txt", displayPath: "a.txt", unifiedDiff: "", proposedText: "b", base: .preview(originalText: nil)
+        )
+        let unsaved = AgentRecoveryUnsavedComposerInput(
+            binding: AgentRecoveryLifecycleBinding(sessionID: id, incarnationID: id, transcriptResetGeneration: 0),
+            content: Support.content("unsaved"),
+            failure: nil
+        )
+        let summary = AgentScheduledSendConfirmationSummary(
+            sessionID: id, tabID: nil, workspaceID: id, scheduleID: id, attemptID: nil, reason: nil, notBefore: stamp.date, previewText: "later"
+        )
+        let restriction = AgentRuntimeRestriction(
+            runtimeID: id, kind: .possibleWriter, family: nil, provider: nil, state: .reserved, isPreviousInstance: true,
+            isUnreadable: false, providerHome: nil, conversationIDs: [], worktreePaths: [], sessionIDs: [id], associations: [],
+            rootPID: nil, memberCount: 0, letFinish: false, revision: nil, createdAt: nil
+        )
+        let table: [(String, AgentRecoveryCatalogPayload, AgentRecoveryCatalogAttention)] = [
+            ("workspaceFailure", .workspaceFailure(reason: "x"), .needsAction),
+            ("nonactionable", .nonactionable(.authorityMismatch), .needsAction),
+            ("duplicateDestination", .duplicateDestination, .needsAction),
+            ("noDestination", .noDestination, .needsAction),
+            ("crashHold", .crashHold(AgentRecoveryCrashHold(
+                sessionID: id, incarnationID: id, transcriptResetGeneration: 0,
+                uncertainRunAttemptIDs: [id], uncertainIntentIDs: [], previousExitProvenClean: false
+            )), .needsAction),
+            ("scheduleTransfer", .scheduleTransfer(message: "held"), .needsAction),
+            ("turn", .turn(turn), .informational),
+            ("outcomeTurn", .outcomeTurn(AgentRecoveryOutcomeTurn(turnID: id, runAttempt: run)), .informational),
+            ("recoveryOnlyRun", .recoveryOnlyRun(run), .informational),
+            ("intent", .intent(intent, AgentRecoveryCatalogIntentContext(isEarlierLaunch: true, heldReason: nil, sameGeneration: true, isRemote: false)), .needsAction),
+            ("question", .question(question, isCurrentLaunch: false), .needsAction),
+            ("editProposal", .editProposal(proposal, isCurrentLaunch: false), .needsAction),
+            ("heldDraft", .heldDraft(Support.snapshot("held")), .needsAction),
+            ("closedSessionDraft", .closedSessionDraft(Support.snapshot("closed"), fromClearedConversation: false), .needsAction),
+            ("composerRestoreFailed", .composerRestoreFailed(.retired), .needsAction),
+            ("unsavedPredecessor", .unsavedPredecessor(unsaved, count: 1), .needsAction),
+            ("composerWriteFailed", .composerWriteFailed(.retired), .needsAction),
+            ("ownerlessDraft", .ownerlessDraft(unsaved), .needsAction),
+            ("composerPreparationFailed", .composerPreparationFailed(.ownerReplaced), .needsAction),
+            ("questionSaveFailed", .questionSaveFailed(nil, unsentAnswer: true), .needsAction),
+            ("scheduleNeedsConfirmation", .scheduleNeedsConfirmation(summary), .needsAction),
+            ("scheduleIndexUnavailable", .scheduleIndexUnavailable(workspaceName: "W"), .needsAction),
+            ("survivingRuntime", .survivingRuntime(restriction), .needsAction),
+            ("runtimeOwnershipUnknown", .runtimeOwnershipUnknown(unidentifiedRecordCount: 1, failure: nil), .needsAction)
+        ]
+        XCTAssertEqual(table.count, 24, "one row per payload case")
+        let unfinished = AgentRecoveryCatalogActionFacts(hasUnfinishedAction: true)
+        let unsent = AgentRecoveryCatalogActionFacts(hasUnsentContinuation: true)
+        for (name, payload, expected) in table {
+            XCTAssertEqual(AgentRecoveryCatalogProjection.attention(for: payload, facts: AgentRecoveryCatalogActionFacts()), expected, name)
+            // An unfinished recovery action or an unsent typed continuation makes a run card need
+            // action and never downgrades others.
+            XCTAssertEqual(AgentRecoveryCatalogProjection.attention(for: payload, facts: unfinished), .needsAction, name)
+            XCTAssertEqual(AgentRecoveryCatalogProjection.attention(for: payload, facts: unsent), .needsAction, name)
+        }
+        // Other facts never promote a run note.
+        let resolved = AgentRecoveryCatalogActionFacts(resolvedByAction: true, runNeverHandedOff: true)
+        XCTAssertEqual(AgentRecoveryCatalogProjection.attention(for: .recoveryOnlyRun(run), facts: resolved), .informational)
+    }
+
+    /// A run card is a note until a recovery action reserved on it has no recorded outcome ("Resume
+    /// was interrupted; status unknown"); once the outcome is recorded it is a note again. Dismissed
+    /// and informational items are never counted as open needs-action items.
+    func testRunCardWithAnUnfinishedRecoveryActionNeedsAction() async throws {
+        let store = makeStore()
+        let service = makeService(store: store)
+        let load = try await makeSession(service)
+        let coordinator = try await startedCoordinator(store: store, service: service)
+        let lane = try coordinator.claimLane(owner: Owner(), persistenceState: load.persistenceState)
+        let sessionID = load.session.id
+
+        let ownership = Support.ownership(sessionID: sessionID)
+        let turnID = UUID()
+        _ = try await lane.ensureRunAttempt(ownership: ownership, processRunID: nil, transcriptTurnID: turnID).get()
+        await lane.recordTerminalEvidence(
+            Support.terminalCommit(ownership: ownership, state: .failed, cause: .providerProcessLost),
+            transcriptTurnID: turnID
+        ).value
+        let itemID = "turn-\(sessionID.uuidString)-\(turnID.uuidString)"
+        let listed = await Support.eventually { coordinator.catalog.item(id: itemID) != nil }
+        XCTAssertTrue(listed)
+        let note = try XCTUnwrap(coordinator.catalog.item(id: itemID))
+        XCTAssertEqual(note.attention, .informational)
+        XCTAssertFalse(note.isOpenNeedsAction)
+        XCTAssertFalse(coordinator.catalog.items.contains { $0.sessionID == sessionID && $0.isOpenNeedsAction })
+        XCTAssertEqual(coordinator.catalog.openNeedsActionCount, 0, "\(coordinator.catalog.items.map { "\($0.id) \($0.attention)" })")
+
+        // A reserved action without an outcome makes the card need action.
+        let key = try XCTUnwrap(note.acknowledgement?.key)
+        let revision = try await store.currentRevision(sessionID: sessionID)
+        let request = AgentRecoveryActionRequest(
+            actionID: UUID(),
+            itemKey: key,
+            kind: .reconcileOnly,
+            expectedRevision: revision,
+            sourceRunAttemptID: ownership.attemptID,
+            target: AgentRecoveryActionTarget(providerKindRaw: "claudeCode", providerConversationID: "conv-1")
+        )
+        _ = try await lane.reserveRecoveryAction(request).get()
+        let promoted = await Support.eventually { coordinator.catalog.item(id: itemID)?.attention == .needsAction }
+        XCTAssertTrue(promoted)
+        let open = try XCTUnwrap(coordinator.catalog.item(id: itemID))
+        XCTAssertTrue(open.actionFacts.hasUnfinishedAction)
+        XCTAssertTrue(open.isOpenNeedsAction)
+        XCTAssertEqual(coordinator.catalog.openNeedsActionCount, 1)
+
+        // Its recorded outcome makes it a note again.
+        _ = try await lane.completeRecoveryAction(actionID: request.actionID, outcome: .importedUnconfirmed, reason: nil).get()
+        let settled = await Support.eventually { coordinator.catalog.item(id: itemID)?.attention == .informational }
+        XCTAssertTrue(settled)
+        XCTAssertEqual(coordinator.catalog.item(id: itemID)?.actionFacts.hasUnfinishedAction, false)
+        XCTAssertEqual(coordinator.catalog.openNeedsActionCount, 0)
+    }
+
+    /// Review B ATT1-3: the action's shared hold pauses the session from before its reservation is
+    /// written; the card it acts on needs action for the whole hold, not only once reserved.
+    func testRunCardNeedsActionWhileARecoveryActionHoldsItsSession() async throws {
+        let store = makeStore()
+        let service = makeService(store: store)
+        let load = try await makeSession(service)
+        let coordinator = try await startedCoordinator(store: store, service: service)
+        let lane = try coordinator.claimLane(owner: Owner(), persistenceState: load.persistenceState)
+        let sessionID = load.session.id
+        let ownership = Support.ownership(sessionID: sessionID)
+        let turnID = UUID()
+        _ = try await lane.ensureRunAttempt(ownership: ownership, processRunID: nil, transcriptTurnID: turnID).get()
+        await lane.recordTerminalEvidence(
+            Support.terminalCommit(ownership: ownership, state: .failed, cause: .providerProcessLost),
+            transcriptTurnID: turnID
+        ).value
+        let itemID = "turn-\(sessionID.uuidString)-\(turnID.uuidString)"
+        let listed = await Support.eventually { coordinator.catalog.item(id: itemID) != nil }
+        XCTAssertTrue(listed)
+        let note = try XCTUnwrap(coordinator.catalog.item(id: itemID))
+        XCTAssertEqual(note.attention, .informational)
+
+        let request = try await AgentRecoveryActionRequest(
+            actionID: UUID(),
+            itemKey: XCTUnwrap(note.acknowledgement?.key),
+            kind: .reconcileOnly,
+            expectedRevision: store.currentRevision(sessionID: sessionID),
+            sourceRunAttemptID: ownership.attemptID,
+            target: AgentRecoveryActionTarget(providerKindRaw: "claudeCode", providerConversationID: "conv-1")
+        )
+        guard case let .acquired(authorization) = coordinator.beginRecoveryAction(request, lane: lane) else {
+            return XCTFail("the hold is acquired")
+        }
+        XCTAssertTrue(coordinator.isCoveredByRecoveryAction(sessionID: sessionID))
+        let held = try XCTUnwrap(coordinator.catalog.item(id: itemID), "nothing is reserved yet")
+        XCTAssertEqual(held.attention, .needsAction)
+        XCTAssertTrue(held.actionFacts.hasUnfinishedAction)
+        let reserved = await store.read(sessionID: sessionID).record?.actions ?? []
+        XCTAssertTrue(reserved.isEmpty, "the hold alone, before any reservation")
+
+        coordinator.revokeRecoveryAction(authorization)
+        coordinator.endRecoveryAction(authorization)
+        XCTAssertEqual(coordinator.catalog.item(id: itemID)?.attention, .informational)
+    }
+
+    /// An interrupted run's card (informational) on a claimed lane, for the continuation tests.
+    @MainActor
+    private struct RunCardFixture {
+        let store: AgentRecoveryStore
+        let coordinator: AgentRecoveryCoordinator
+        let lane: AgentRecoverySessionLane
+        let sessionID: UUID
+        let attemptID: UUID
+        let itemID: String
+        let key: AgentRecoveryCardKey
+        let target = AgentRecoveryActionTarget(providerKindRaw: "claudeCode", providerConversationID: "conv-1")
+
+        var item: AgentRecoveryCatalogItem? {
+            coordinator.catalog.item(id: itemID)
+        }
+
+        func request(
+            text: String? = nil,
+            plannedUserItemID: UUID? = nil,
+            supersedesActionID: UUID? = nil
+        ) async throws -> AgentRecoveryActionRequest {
+            try await AgentRecoveryActionRequest(
+                actionID: UUID(),
+                itemKey: key,
+                kind: text == nil ? .reconcileOnly : .continueWithText,
+                expectedRevision: store.currentRevision(sessionID: sessionID),
+                sourceRunAttemptID: attemptID,
+                target: target,
+                text: text,
+                plannedUserItemID: text == nil ? nil : (plannedUserItemID ?? UUID()),
+                supersedesActionID: supersedesActionID
+            )
+        }
+
+        /// Reserves `request` and records `outcome`, returning once the catalog reflects the outcome.
+        func perform(_ request: AgentRecoveryActionRequest, outcome: AgentRecoveryActionOutcomeKind) async throws {
+            _ = try await lane.reserveRecoveryAction(request).get()
+            _ = try await lane.completeRecoveryAction(actionID: request.actionID, outcome: outcome, reason: nil).get()
+            let adopted = await waitForRecord { $0.action(id: request.actionID)?.outcome != nil }
+            XCTAssertTrue(adopted, "the outcome reached the coordinator's live record")
+        }
+
+        /// Waits until the coordinator adopted a record commit satisfying `condition` (adoption and
+        /// catalog invalidation happen together, so the catalog then reflects it).
+        func waitForRecord(_ condition: @escaping (AgentRecoveryRecord) -> Bool) async -> Bool {
+            await Support.eventually {
+                guard case let .supported(record)? = coordinator.liveRecordState(for: sessionID) else { return false }
+                return condition(record)
+            }
+        }
+    }
+
+    private func makeRunCardFixture() async throws -> RunCardFixture {
+        let store = makeStore()
+        let service = makeService(store: store)
+        let load = try await makeSession(service)
+        let coordinator = try await startedCoordinator(store: store, service: service)
+        let lane = try coordinator.claimLane(owner: Owner(), persistenceState: load.persistenceState)
+        let sessionID = load.session.id
+        let ownership = Support.ownership(sessionID: sessionID)
+        let turnID = UUID()
+        _ = try await lane.ensureRunAttempt(ownership: ownership, processRunID: nil, transcriptTurnID: turnID).get()
+        await lane.recordTerminalEvidence(
+            Support.terminalCommit(ownership: ownership, state: .failed, cause: .providerProcessLost),
+            transcriptTurnID: turnID
+        ).value
+        let itemID = "turn-\(sessionID.uuidString)-\(turnID.uuidString)"
+        let listed = await Support.eventually { coordinator.catalog.item(id: itemID) != nil }
+        XCTAssertTrue(listed)
+        let item = try XCTUnwrap(coordinator.catalog.item(id: itemID))
+        XCTAssertEqual(item.attention, .informational)
+        return try RunCardFixture(
+            store: store,
+            coordinator: coordinator,
+            lane: lane,
+            sessionID: sessionID,
+            attemptID: ownership.attemptID,
+            itemID: itemID,
+            key: XCTUnwrap(item.acknowledgement?.key)
+        )
+    }
+
+    /// Records a typed continuation as not sent, with no saved intent holding its text.
+    private func recordUnsentContinuation(_ fixture: RunCardFixture, plannedUserItemID: UUID = UUID()) async throws {
+        let continuation = try await fixture.request(text: "please continue from the last step", plannedUserItemID: plannedUserItemID)
+        try await fixture.perform(continuation, outcome: .notDispatched)
+        let item = try XCTUnwrap(fixture.item)
+        XCTAssertTrue(item.actionFacts.hasUnsentContinuation)
+        XCTAssertFalse(item.actionFacts.hasUnfinishedAction)
+        XCTAssertFalse(item.actionFacts.resolvedByAction)
+        XCTAssertEqual(item.attention, .needsAction)
+        XCTAssertEqual(fixture.coordinator.catalog.openNeedsActionCount, 1)
+    }
+
+    /// Review B ATT1-1 / A ATT1-R1-1: a typed continuation recorded as not sent, whose text never
+    /// became a saved intent, keeps the run card needing action (the text exists only on the
+    /// action). A later Reconcile that does not resolve the card only checked history: neither a
+    /// failed (`notDispatched`) nor an unconfirmed (`importedUnconfirmed`) one discards the text.
+    func testRunCardWithAnUnsentContinuationNeedsAction() async throws {
+        let fixture = try await makeRunCardFixture()
+        try await recordUnsentContinuation(fixture)
+
+        for outcome in [AgentRecoveryActionOutcomeKind.notDispatched, .importedUnconfirmed] {
+            try await fixture.perform(fixture.request(), outcome: outcome)
+            let item = try XCTUnwrap(fixture.item)
+            XCTAssertTrue(item.actionFacts.hasUnsentContinuation, "\(outcome)")
+            XCTAssertFalse(item.actionFacts.hasUnfinishedAction, "\(outcome)")
+            XCTAssertEqual(item.attention, .needsAction, "\(outcome)")
+            XCTAssertEqual(fixture.coordinator.catalog.openNeedsActionCount, 1, "\(outcome)")
+        }
+
+        // Review B ATT1-R2-5: empty text is no typed text (the store refuses it; decoded records may
+        // still carry it).
+        let emptyText = AgentRecoveryAction(
+            actionID: UUID(),
+            itemKey: fixture.key,
+            kindRaw: AgentRecoveryActionKind.continueWithText.rawValue,
+            expectedRevision: nil,
+            incarnationID: fixture.key.incarnationID,
+            transcriptResetGeneration: 0,
+            sourceIntentIDs: [],
+            sourceRunAttemptID: fixture.attemptID,
+            sourceInteractionID: nil,
+            target: fixture.target,
+            text: "",
+            plannedUserItemID: UUID(),
+            appInstanceID: UUID(),
+            reservedAt: AgentRecoveryTimestamp(millisecondsSince1970: 1000),
+            outcome: AgentRecoveryActionOutcome(kind: .notDispatched, reason: nil, recordedAt: AgentRecoveryTimestamp(millisecondsSince1970: 2000))
+        )
+        let emptyTextRecord = AgentRecoveryRecord(
+            sessionID: fixture.sessionID,
+            revision: .make(),
+            incarnationID: fixture.key.incarnationID,
+            transcriptResetGeneration: 0,
+            updatedAt: AgentRecoveryTimestamp(millisecondsSince1970: 2000),
+            composer: nil,
+            intents: [],
+            attempts: [],
+            runAttempts: [],
+            actions: [emptyText]
+        )
+        XCTAssertFalse(emptyTextRecord.hasUnsentContinuation(for: fixture.key))
+    }
+
+    /// Review A/B ATT1-R2-2 (a): a previous launch's typed continuation that never got an outcome,
+    /// replaced by a textless Reconcile of this launch that does not resolve the card, is unsent
+    /// text: the card needs action through it, not through an unfinished action.
+    func testSupersededOutcomelessContinuationStaysUnsentAfterAnUnresolvingReconcile() async throws {
+        let fixture = try await makeRunCardFixture()
+        // The earlier launch: another store instance on the same recovery root.
+        let earlierStore = makeStore()
+        let continuation = try await fixture.request(text: "please continue from the last step")
+        let binding = fixture.lane.binding
+        _ = try await earlierStore.reserveRecoveryAction(binding: binding, request: continuation)
+
+        let superseding = try await fixture.request(supersedesActionID: continuation.actionID)
+        try await fixture.perform(superseding, outcome: .notDispatched)
+        for outcome in [AgentRecoveryActionOutcomeKind.notDispatched, .importedUnconfirmed] {
+            if outcome == .importedUnconfirmed {
+                try await fixture.perform(fixture.request(), outcome: outcome)
+            }
+            let record = await fixture.store.read(sessionID: fixture.sessionID).record
+            XCTAssertNotNil(record?.action(id: continuation.actionID), "the old continuation is kept")
+            XCTAssertNil(record?.action(id: continuation.actionID)?.outcome, "the old continuation has no outcome")
+            let item = try XCTUnwrap(fixture.item)
+            XCTAssertTrue(item.actionFacts.hasUnsentContinuation, "\(outcome)")
+            XCTAssertFalse(item.actionFacts.hasUnfinishedAction, "\(outcome)")
+            XCTAssertEqual(item.attention, .needsAction, "\(outcome)")
+        }
+    }
+
+    /// Review A/B ATT1-R2-2 (b): an open typed continuation is not "unsent"; the card needs action
+    /// only through its unfinished action.
+    func testOpenContinuationNeedsActionOnlyThroughItsUnfinishedAction() async throws {
+        let fixture = try await makeRunCardFixture()
+        let continuation = try await fixture.request(text: "please continue from the last step")
+        _ = try await fixture.lane.reserveRecoveryAction(continuation).get()
+        let adopted = await fixture.waitForRecord { $0.action(id: continuation.actionID) != nil }
+        XCTAssertTrue(adopted)
+        let item = try XCTUnwrap(fixture.item)
+        XCTAssertFalse(item.actionFacts.hasUnsentContinuation)
+        XCTAssertTrue(item.actionFacts.hasUnfinishedAction)
+        XCTAssertEqual(item.attention, .needsAction)
+    }
+
+    /// Review A/B ATT1-R2-2 (c): a newer typed continuation that was sent decides the card over an
+    /// older unsent one.
+    func testNewerSentContinuationClearsAnOlderUnsentOne() async throws {
+        let fixture = try await makeRunCardFixture()
+        try await recordUnsentContinuation(fixture)
+
+        try await fixture.perform(fixture.request(text: "continue, second try"), outcome: .dispatched)
+        let item = try XCTUnwrap(fixture.item)
+        XCTAssertFalse(item.actionFacts.hasUnsentContinuation)
+        XCTAssertTrue(item.actionFacts.resolvedByAction)
+        XCTAssertEqual(item.attention, .informational)
+    }
+
+    /// A saved intent carrying the continuation's text (its planned transcript item) holds the
+    /// text: the run card is a note again (the intent's own item asks for the decision).
+    func testUnsentContinuationClearsWhenASavedIntentCarriesItsText() async throws {
+        let fixture = try await makeRunCardFixture()
+        let plannedUserItemID = UUID()
+        try await recordUnsentContinuation(fixture, plannedUserItemID: plannedUserItemID)
+
+        let submission = Support.submission("please continue from the last step", userItemID: plannedUserItemID)
+        _ = try await fixture.lane.transaction { store, binding in
+            try await store.commitQueuedIntent(
+                binding: binding,
+                expectedRevision: store.currentRevision(sessionID: binding.sessionID),
+                submission: submission,
+                consumption: nil
+            )
+        }.get()
+        let adopted = await fixture.waitForRecord { $0.intents.contains { $0.userItemID == plannedUserItemID } }
+        XCTAssertTrue(adopted)
+        let item = try XCTUnwrap(fixture.item)
+        XCTAssertFalse(item.actionFacts.hasUnsentContinuation)
+        XCTAssertEqual(item.attention, .informational)
+    }
+
+    /// A later action that resolves the card (here a Reconcile proving the turn finished) decides it.
+    func testUnsentContinuationClearsWhenALaterActionResolvesTheCard() async throws {
+        let fixture = try await makeRunCardFixture()
+        try await recordUnsentContinuation(fixture)
+
+        try await fixture.perform(fixture.request(), outcome: .importedCompleted)
+        let item = try XCTUnwrap(fixture.item)
+        XCTAssertTrue(item.actionFacts.resolvedByAction)
+        XCTAssertFalse(item.actionFacts.hasUnsentContinuation)
+        XCTAssertEqual(item.attention, .informational)
+        XCTAssertEqual(fixture.coordinator.catalog.openNeedsActionCount, 0)
+    }
+
+    /// Between an action's outcome write and the release of its hold the session is still paused;
+    /// the card it acts on needs action until the hold ends.
+    func testRunCardNeedsActionAfterTheOutcomeWriteUntilTheHoldIsReleased() async throws {
+        let fixture = try await makeRunCardFixture()
+        let request = try await fixture.request()
+        guard case let .acquired(authorization) = fixture.coordinator.beginRecoveryAction(request, lane: fixture.lane) else {
+            return XCTFail("the hold is acquired")
+        }
+        try await fixture.perform(request, outcome: .importedUnconfirmed)
+        XCTAssertTrue(fixture.coordinator.isCoveredByRecoveryAction(sessionID: fixture.sessionID))
+        let held = try XCTUnwrap(fixture.item)
+        XCTAssertTrue(held.actionFacts.hasUnfinishedAction, "the outcome is recorded; the hold is not released")
+        XCTAssertEqual(held.attention, .needsAction)
+
+        fixture.coordinator.revokeRecoveryAction(authorization)
+        fixture.coordinator.endRecoveryAction(authorization)
+        let released = try XCTUnwrap(fixture.item)
+        XCTAssertFalse(released.actionFacts.hasUnfinishedAction)
+        XCTAssertEqual(released.attention, .informational)
+    }
+
     // MARK: Indexed schedules (sessions no window hosts)
 
     @MainActor

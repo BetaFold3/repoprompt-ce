@@ -42,7 +42,8 @@ extension AgentModeViewModel {
             {
                 rows.append(recoveryListRow(for: hold, coordinator: coordinator, activeSession: activeSession, pausedIndicator: true))
             }
-            // The banner is an exact session (and tab) filter of the catalog. Schedule items stay
+            // The banner is an exact session (and tab) filter of the catalog's needs-action items
+            // (O34-1: informational notes live only in Needs Attention). Schedule items stay
             // with the scheduled-send surfaces: a schedule awaiting confirmation is already presented
             // by the session's own scheduled-send banner, and an unchecked index is listed in Needs
             // Attention.
@@ -50,11 +51,13 @@ extension AgentModeViewModel {
             // app-scoped in the catalog; the banner shows it for the session it pauses.
             let runtimeItems = recoveryListRuntimeBannerItems(catalog: catalog, coordinator: coordinator, sessionID: sessionID)
             let bannerItems = runtimeItems + catalog.bannerItems(sessionID: sessionID, workspaceID: workspaceID, tabID: activeSession?.tabID)
-                .filter { !Self.isScheduleDomainItem($0) }
+                .filter { $0.attention == .needsAction && !Self.isScheduleDomainItem($0) }
             rows += bannerItems.map { recoveryListRow(for: $0, coordinator: coordinator, activeSession: activeSession) }
             let shownIDs = Set(bannerItems.map(\.id))
+            // Needs-action items elsewhere (the header's Needs Attention button while this banner is
+            // shown); they never keep the banner visible on their own.
             otherItemCount = catalog.items.count { item in
-                !item.isDismissed && !shownIDs.contains(item.id)
+                item.isOpenNeedsAction && !shownIDs.contains(item.id)
                     && !(item.kind == .scheduleNeedsConfirmation && item.sessionID == sessionID)
             }
         }
@@ -72,15 +75,17 @@ extension AgentModeViewModel {
             AgentRecoveryNeedsAttentionRow(
                 row: recoveryListRow(for: item, coordinator: coordinator, activeSession: activeSession),
                 isDismissed: item.isDismissed,
-                isOtherWorkspace: item.workspaceID != nil && item.workspaceID != workspaceID
+                isOtherWorkspace: item.workspaceID != nil && item.workspaceID != workspaceID,
+                attention: item.attention
             )
         }
     }
 
-    /// Undismissed catalog items (the sidebar's Needs Attention count).
+    /// Needs-action, undismissed catalog items (the sidebar's Needs Attention count; O34-1:
+    /// informational notes are not counted).
     var recoveryNeedsAttentionCount: Int {
         guard let coordinator = recoveryCoordinator, coordinator.startupState == .ready else { return 0 }
-        return coordinator.catalog.items.count { !$0.isDismissed }
+        return coordinator.catalog.openNeedsActionCount
     }
 
     /// Asks this window's root to present the app-wide Needs Attention sheet (reachable with any
@@ -220,7 +225,12 @@ extension AgentModeViewModel {
                 parentSessionID: sessionID,
                 parentInOtherWorkspace: recoveryListItemIsInOtherWorkspace(item)
             )
-            return row(title, detail + children.detail, text: children.text, actions: runActions + children.actions + dismiss + openAction)
+            return row(
+                title,
+                detail + Self.recoveryRunUnsentNote(item.actionFacts) + children.detail,
+                text: children.text,
+                actions: runActions + children.actions + dismiss + openAction
+            )
         case let .outcomeTurn(outcome):
             let (title, detail) = Self.recoveryListOutcomeTurnText(outcome)
             let runActions = recoveryRunActions(session: isActive ? activeSession : nil, status: outcome.status, facts: item.actionFacts)
@@ -229,7 +239,12 @@ extension AgentModeViewModel {
                 parentSessionID: sessionID,
                 parentInOtherWorkspace: recoveryListItemIsInOtherWorkspace(item)
             )
-            return row(title, detail + children.detail, text: children.text, actions: runActions + children.actions + dismiss + openAction)
+            return row(
+                title,
+                detail + Self.recoveryRunUnsentNote(item.actionFacts) + children.detail,
+                text: children.text,
+                actions: runActions + children.actions + dismiss + openAction
+            )
         case let .recoveryOnlyRun(attempt):
             // R1a: a run whose turn was never saved is still listed from its recovery evidence. A
             // finished run (R09) shows its recorded outcome; it holds nothing.
@@ -241,7 +256,12 @@ extension AgentModeViewModel {
                 parentSessionID: sessionID,
                 parentInOtherWorkspace: recoveryListItemIsInOtherWorkspace(item)
             )
-            return row(title, detail + children.detail, text: children.text, actions: runActions + children.actions + dismiss + openAction)
+            return row(
+                title,
+                detail + Self.recoveryRunUnsentNote(item.actionFacts) + children.detail,
+                text: children.text,
+                actions: runActions + children.actions + dismiss + openAction
+            )
         case let .intent(intent, context):
             var detail = context.isRemote && intent.deliveryState == .deliveryUnknown
                 ? Self.recoveryListRemoteUncertainty
@@ -419,6 +439,14 @@ extension AgentModeViewModel {
                 actions: openAction + dismiss
             )
         }
+    }
+
+    static let recoveryListUnsentContinuationNote = "The message you typed to continue it was not sent."
+
+    /// Why a run card asks for a decision when typed continuation text was never sent (ATT1-R2-3):
+    /// appended to the run row's detail with a leading space, or empty.
+    static func recoveryRunUnsentNote(_ facts: AgentRecoveryCatalogActionFacts) -> String {
+        facts.hasUnsentContinuation ? " \(recoveryListUnsentContinuationNote)" : ""
     }
 
     /// A catalog item recorded for a workspace other than this window's persistence workspace.

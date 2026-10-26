@@ -417,8 +417,9 @@ struct AgentStaleResetRecoveryActions {
 
 /// Lossless-restart recovery banner: the exact session filter of the coordinator's app-wide
 /// recovery catalog (Phase 2) for the active session, plus its owner's composer-preparation
-/// failure. Items elsewhere are counted and reachable through the Needs Attention sheet. Opening a
-/// row never starts a provider.
+/// failure. Only needs-action items are shown (O34-1); in the ready state the banner exists only
+/// while it has rows. Needs-action items elsewhere are counted on its Needs Attention button while
+/// it is shown. Opening a row never starts a provider.
 struct AgentRecoveryListProps: Equatable {
     enum Status: Equatable {
         case loading
@@ -430,13 +431,14 @@ struct AgentRecoveryListProps: Equatable {
     let status: Status
     let rows: [AgentRecoveryListRowProps]
     let canRetry: Bool
-    /// Undismissed catalog items outside this banner (shown in the Needs Attention sheet).
+    /// Undismissed needs-action catalog items outside this banner (shown in the Needs Attention
+    /// sheet).
     var otherItemCount: Int = 0
 
-    /// Nothing to show: no rows and nothing elsewhere (the "Needs Attention (n)…" affordance alone
-    /// keeps the banner visible).
+    /// Nothing to show in the ready state: no rows of this session. Items elsewhere never keep the
+    /// banner visible on their own (O34-1).
     var isEmpty: Bool {
-        status == .ready && rows.isEmpty && otherItemCount == 0
+        status == .ready && rows.isEmpty
     }
 
     /// Banner header. F3: `rows` are this session's items and `otherItemCount` the items elsewhere
@@ -449,14 +451,14 @@ struct AgentRecoveryListProps: Equatable {
         case let .failed(message):
             return message
         case .ready:
+            if rows.isEmpty {
+                // Fallback only: a ready banner without rows is hidden (`isEmpty`), so this text is
+                // never shown.
+                return "Nothing interrupted in this session."
+            }
             let elsewhere = otherItemCount == 1
                 ? "1 item elsewhere needs attention."
                 : "\(otherItemCount) items elsewhere need attention."
-            if rows.isEmpty {
-                return otherItemCount > 0
-                    ? "Nothing interrupted in this session. \(elsewhere)"
-                    : "Nothing interrupted in this session."
-            }
             if otherItemCount == 0 {
                 return rows.count == 1
                     ? "1 saved or interrupted item needs your attention."
@@ -476,6 +478,8 @@ struct AgentRecoveryNeedsAttentionRow: Equatable, Identifiable {
     let isDismissed: Bool
     /// The item belongs to another workspace (actions may need that workspace open).
     let isOtherWorkspace: Bool
+    /// Which sheet section lists it (O34-2).
+    let attention: AgentRecoveryCatalogAttention
 
     var id: String {
         row.id

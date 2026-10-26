@@ -1176,6 +1176,12 @@ package final class AgentRecoveryCoordinator {
         coveringRecoveryActionHold(sessionID: sessionID) != nil
     }
 
+    /// Whether an explicit recovery action on the card `itemKey` of `sessionID` holds the session
+    /// right now (acquired before its reservation is written, released after its outcome write).
+    package func hasRecoveryActionHold(sessionID: UUID, itemKey: AgentRecoveryCardKey) -> Bool {
+        recoveryActionHolds.values.contains { $0.authorization.sessionID == sessionID && $0.request.itemKey == itemKey }
+    }
+
     /// Whether an action of a session other than `sessionID` holds `workspaceID`.
     package func hasRecoveryAction(inWorkspace workspaceID: UUID, excluding sessionID: UUID) -> Bool {
         recoveryActionHolds.values.contains { $0.workspaceID == workspaceID && $0.authorization.sessionID != sessionID }

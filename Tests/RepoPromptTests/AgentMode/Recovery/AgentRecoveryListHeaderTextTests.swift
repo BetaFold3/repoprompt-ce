@@ -1,8 +1,10 @@
+import RepoPromptAgentCore
 @testable import RepoPromptApp
 import XCTest
 
 /// Lossless restart F3: the banner header counts this session's rows and never contradicts the
-/// "Needs Attention (n)…" button, which counts items elsewhere.
+/// "Needs Attention (n)…" button, which counts items elsewhere. O34-1: items elsewhere never keep
+/// the banner visible on their own.
 @MainActor
 final class AgentRecoveryListHeaderTextTests: XCTestCase {
     private func row(_ id: String) -> AgentRecoveryListRowProps {
@@ -29,15 +31,12 @@ final class AgentRecoveryListHeaderTextTests: XCTestCase {
         )
     }
 
-    func testNoRowsHereButItemsElsewhereUsesNeutralText() {
+    func testNoRowsHereHidesTheBannerEvenWithItemsElsewhere() {
         let many = props(rows: 0, other: 64)
-        XCTAssertFalse(many.isEmpty, "Items elsewhere keep the banner for its Needs Attention button")
-        XCTAssertEqual(many.headerText, "Nothing interrupted in this session. 64 items elsewhere need attention.")
+        XCTAssertTrue(many.isEmpty, "Items elsewhere never keep the banner visible on their own (O34-1)")
+        XCTAssertFalse(many.headerText.contains("elsewhere"))
         XCTAssertFalse(many.headerText.contains("0 saved"))
-        XCTAssertEqual(
-            props(rows: 0, other: 1).headerText,
-            "Nothing interrupted in this session. 1 item elsewhere needs attention."
-        )
+        XCTAssertTrue(props(rows: 0, other: 1).isEmpty)
     }
 
     func testRowsHereOnlyCountThisSession() {
@@ -76,6 +75,26 @@ final class AgentRecoveryListHeaderTextTests: XCTestCase {
             withElsewhere.headerText,
             "1 saved or interrupted item in this session needs your attention. 4 items elsewhere need attention."
         )
+    }
+
+    /// Review B ATT1-4: the sheet's "Needs action (n)" and "Information (m)" counts exclude
+    /// dismissed rows (listed only when "Show dismissed" is on).
+    func testSheetSectionCountsExcludeDismissedRows() {
+        func entry(_ id: String, dismissed: Bool, attention: AgentRecoveryCatalogAttention) -> AgentRecoveryNeedsAttentionRow {
+            AgentRecoveryNeedsAttentionRow(row: row(id), isDismissed: dismissed, isOtherWorkspace: false, attention: attention)
+        }
+        let needsAction = [
+            entry("a", dismissed: false, attention: .needsAction),
+            entry("b", dismissed: true, attention: .needsAction),
+            entry("c", dismissed: false, attention: .needsAction)
+        ]
+        let informational = [
+            entry("d", dismissed: true, attention: .informational),
+            entry("e", dismissed: true, attention: .informational)
+        ]
+        XCTAssertEqual(AgentRecoveryNeedsAttentionSheet.headerCount(needsAction), 2)
+        XCTAssertEqual(AgentRecoveryNeedsAttentionSheet.headerCount(informational), 0)
+        XCTAssertEqual(AgentRecoveryNeedsAttentionSheet.headerCount([]), 0)
     }
 
     func testLoadingAndFailedStatusesAreUnchanged() {

@@ -100,13 +100,22 @@ final class AgentRecoveryStartupCompositionTests: XCTestCase {
         XCTAssertEqual(row()?.text, "held input")
         XCTAssertEqual(row()?.actions, [.edit, .remove, .dismiss])
 
-        // Phase 2: the banner is the active session's exact catalog filter; other sessions' items
-        // are counted there and listed in the app-wide Needs Attention sheet.
+        // Phase 2: the banner is the active session's exact catalog filter; other sessions'
+        // needs-action items are counted there (O34-1: informational run notes are not) and every
+        // item is listed in the app-wide Needs Attention sheet.
         let statusRowID = "status-\(unreadable.session.id.uuidString)"
         let runRowID = "run-\(unsaved.session.id.uuidString)-\(unsavedOwnership.attemptID.uuidString)"
         let banner = try XCTUnwrap(viewModel.recoveryListProps(forActiveSession: session))
         XCTAssertFalse(banner.rows.contains { $0.id == statusRowID || $0.id == runRowID })
-        XCTAssertGreaterThanOrEqual(banner.otherItemCount, 2)
+        let listCoordinator = try XCTUnwrap(viewModel.recoveryCoordinator)
+        XCTAssertEqual(listCoordinator.catalog.item(id: statusRowID)?.attention, .needsAction)
+        XCTAssertEqual(listCoordinator.catalog.item(id: runRowID)?.attention, .informational)
+        XCTAssertGreaterThanOrEqual(banner.otherItemCount, 1)
+        XCTAssertEqual(
+            banner.otherItemCount,
+            listCoordinator.catalog.items.count { $0.isOpenNeedsAction && $0.sessionID != load.session.id },
+            "\(listCoordinator.catalog.items.map { "\($0.id) \($0.attention)" })"
+        )
         func sheetRow(_ id: String, includeDismissed: Bool = false) -> AgentRecoveryNeedsAttentionRow? {
             viewModel.recoveryNeedsAttentionRows(includeDismissed: includeDismissed, activeSession: session).first { $0.id == id }
         }
@@ -288,13 +297,18 @@ final class AgentRecoveryStartupCompositionTests: XCTestCase {
         XCTAssertFalse(questionRow.row.detail.localizedCaseInsensitiveContains("before it was answered"))
         XCTAssertEqual(questionRow.row.actions, [.open, .dismiss])
 
-        // F10: with nothing for the active (here no) session, items elsewhere keep the banner.
-        let elsewhereOnly = try XCTUnwrap(viewModel.recoveryListProps(forActiveSession: nil), "Items elsewhere keep the banner reachable")
-        XCTAssertTrue(elsewhereOnly.rows.isEmpty)
-        XCTAssertGreaterThanOrEqual(elsewhereOnly.otherItemCount, 3)
-        // F3: the header never says "0 items" beside a nonzero Needs Attention button.
-        XCTAssertEqual(elsewhereOnly.otherItemCount, 7, "The fixture's undismissed items, none in this (no) session")
-        XCTAssertEqual(elsewhereOnly.headerText, "Nothing interrupted in this session. 7 items elsewhere need attention.")
+        // O34-1 (replaces F10): with nothing for the active (here no) session, items elsewhere never
+        // keep the banner; they stay reachable from the sidebar badge and the View menu, which count
+        // needs-action items only.
+        XCTAssertNil(viewModel.recoveryListProps(forActiveSession: nil), "Items elsewhere never keep the banner")
+        let undismissed = coordinator.catalog.items.filter { !$0.isDismissed }
+        let summary = undismissed.map { "\($0.id) \($0.attention)" }
+        XCTAssertEqual(undismissed.count, 7, "The fixture's undismissed items, none in this (no) session: \(summary)")
+        XCTAssertEqual(coordinator.catalog.item(id: runRowID)?.attention, .informational)
+        XCTAssertEqual(coordinator.catalog.item(id: scheduleRowID)?.attention, .needsAction)
+        XCTAssertEqual(coordinator.catalog.item(id: questionRowID)?.attention, .needsAction)
+        XCTAssertEqual(viewModel.recoveryNeedsAttentionCount, undismissed.count { $0.attention == .needsAction }, "\(summary)")
+        XCTAssertLessThan(viewModel.recoveryNeedsAttentionCount, undismissed.count, "Informational notes are not counted")
 
         // Cross-workspace Open (run and schedule rows) uses the exact agent-session route.
         final class Routes {
@@ -352,11 +366,16 @@ final class AgentRecoveryStartupCompositionTests: XCTestCase {
         let pausedProps = try XCTUnwrap(viewModel.recoveryListProps(forActiveSession: session))
         let paused = try XCTUnwrap(pausedProps.rows.first { $0.id == pausedRowID })
         // F3: the dismissed crash hold's indicator is this session's item; items elsewhere stay distinct.
-        XCTAssertEqual(pausedProps.rows.count, 3, pausedProps.rows.map(\.id).description)
-        XCTAssertEqual(pausedProps.otherItemCount, 4)
+        // O34-1: the banner keeps the paused indicator and the uncertain input; the session's run
+        // note (informational) moved to the sheet's Information section, and the elsewhere count
+        // excludes the other workspace's informational run note.
+        XCTAssertEqual(pausedProps.rows.count, 2, pausedProps.rows.map(\.id).description)
+        XCTAssertFalse(pausedProps.rows.contains { $0.id.hasPrefix("turn-") || $0.id.hasPrefix("run-") }, pausedProps.rows.map(\.id).description)
+        XCTAssertTrue(coordinator.catalog.items.contains { $0.sessionID == held.session.id && $0.attention == .informational })
+        XCTAssertEqual(pausedProps.otherItemCount, 3)
         XCTAssertEqual(
             pausedProps.headerText,
-            "3 saved or interrupted items in this session need your attention. 4 items elsewhere need attention."
+            "2 saved or interrupted items in this session need your attention. 3 items elsewhere need attention."
         )
         XCTAssertTrue(paused.actions.contains(.confirmStopped))
         XCTAssertFalse(paused.actions.contains(.dismiss), "The paused indicator is not dismissible")
@@ -1077,8 +1096,11 @@ final class AgentRecoveryStartupCompositionTests: XCTestCase {
         let initialRows = windowA.recoveryNeedsAttentionRows(includeDismissed: false, activeSession: nil)
         let initialSummary = initialRows.map { "\($0.id): \($0.row.title) \($0.row.actions)" }
         XCTAssertTrue(initialRows.contains { $0.id == runRowID }, "\(initialSummary)")
-        XCTAssertEqual(windowA.recoveryNeedsAttentionCount, initialRows.count)
-        XCTAssertEqual(windowB.recoveryNeedsAttentionCount, initialRows.count)
+        // O34-1: the badge counts needs-action rows only (the run note is informational).
+        XCTAssertEqual(initialRows.first { $0.id == runRowID }?.attention, .informational, "\(initialSummary)")
+        let needsActionCount = initialRows.count { $0.attention == .needsAction }
+        XCTAssertEqual(windowA.recoveryNeedsAttentionCount, needsActionCount)
+        XCTAssertEqual(windowB.recoveryNeedsAttentionCount, needsActionCount)
         XCTAssertEqual(
             initialRows.map(\.id),
             windowB.recoveryNeedsAttentionRows(includeDismissed: false, activeSession: nil).map(\.id),
@@ -1137,6 +1159,204 @@ final class AgentRecoveryStartupCompositionTests: XCTestCase {
         XCTAssertTrue(scheduler.confirmationSummaries().isEmpty)
     }
 
+    /// O34-1: a session whose only item is an informational run note shows no banner and adds
+    /// nothing to the Needs Attention count; the note is listed in the sheet's Information section.
+    /// An unfinished recovery action on it makes it a needs-action row of the banner again.
+    func testBannerHidesInformationalRunNotesAndShowsARunWithAnUnfinishedAction() async throws {
+        let fixture = try makeFixture()
+        let tabID = UUID()
+        let earlier = makeLaunch(fixture)
+        let load = try await makeSession(earlier, fixture: fixture, composeTabID: tabID)
+
+        let now = makeLaunch(fixture)
+        let scheduler = AgentScheduledSendCoordinator(startupAdmission: .awaitingRecovery)
+        let destination = fixture.destination
+        let composition = AgentRecoveryAppComposition(
+            store: now.store,
+            dataService: now.service,
+            scheduler: scheduler,
+            loadInventory: { AgentRecoveryWorkspaceInventory(workspaces: [destination]) }
+        )
+        let viewModel = makeViewModel(windowID: 4871, fixture: fixture)
+        composition.install(into: viewModel)
+        await composition.startupCompletion?.value
+        let coordinator = try XCTUnwrap(composition.coordinator)
+        viewModel.test_establishPersistenceWorkspace(fixture.workspace)
+        viewModel.test_setCurrentTabIDOverride(tabID)
+        let session = try await viewModel.ensureSessionReady(tabID: tabID)
+        if session.activeAgentSessionID != load.session.id {
+            XCTAssertNotNil(viewModel.test_installPersistentSessionBinding(sessionID: load.session.id, on: session))
+            _ = await viewModel.test_hydrateBoundSession(tabID: tabID)
+        }
+        let laneClaimed = await Support.eventually { session.recoveryLane != nil }
+        XCTAssertTrue(laneClaimed)
+        let lane = try XCTUnwrap(session.recoveryLane)
+        XCTAssertNil(viewModel.recoveryListProps(forActiveSession: session), "Nothing to show")
+
+        // This launch's run ends by provider process loss: an informational note only.
+        let ownership = Support.ownership(sessionID: load.session.id)
+        let turnID = UUID()
+        _ = try await lane.ensureRunAttempt(ownership: ownership, processRunID: nil, transcriptTurnID: turnID).get()
+        await lane.recordTerminalEvidence(
+            Support.terminalCommit(ownership: ownership, state: .failed, cause: .providerProcessLost),
+            transcriptTurnID: turnID
+        ).value
+        let itemID = "turn-\(load.session.id.uuidString)-\(turnID.uuidString)"
+        let listed = await Support.eventually { coordinator.catalog.item(id: itemID) != nil }
+        XCTAssertTrue(listed, "\(coordinator.catalog.items.map(\.id))")
+        let summary = coordinator.catalog.items.map { "\($0.id) \($0.attention)" }
+        XCTAssertNil(viewModel.recoveryListProps(forActiveSession: session), "An informational note never shows the banner: \(summary)")
+        XCTAssertEqual(viewModel.recoveryNeedsAttentionCount, 0, "\(summary)")
+        let sheetRow = viewModel.recoveryNeedsAttentionRows(includeDismissed: false, activeSession: session).first { $0.id == itemID }
+        XCTAssertEqual(sheetRow?.attention, .informational, "Listed in the Information section")
+
+        // A reserved recovery action without an outcome: the banner shows the run as needing action.
+        let key = try XCTUnwrap(coordinator.catalog.item(id: itemID)?.acknowledgement?.key)
+        let revision = try await now.store.currentRevision(sessionID: load.session.id)
+        let request = AgentRecoveryActionRequest(
+            actionID: UUID(),
+            itemKey: key,
+            kind: .reconcileOnly,
+            expectedRevision: revision,
+            sourceRunAttemptID: ownership.attemptID,
+            target: AgentRecoveryActionTarget(providerKindRaw: "claudeCode", providerConversationID: "conv-1")
+        )
+        _ = try await lane.reserveRecoveryAction(request).get()
+        let shown = await Support.eventually {
+            viewModel.recoveryListProps(forActiveSession: session)?.rows.contains { $0.id == itemID } == true
+        }
+        XCTAssertTrue(shown, "\(coordinator.catalog.items.map { "\($0.id) \($0.attention)" })")
+        XCTAssertEqual(viewModel.recoveryNeedsAttentionCount, 1)
+        XCTAssertEqual(
+            viewModel.recoveryNeedsAttentionRows(includeDismissed: false, activeSession: session).first { $0.id == itemID }?.attention,
+            .needsAction
+        )
+        XCTAssertFalse(
+            viewModel.recoveryListProps(forActiveSession: session)?.rows.first { $0.id == itemID }?.detail
+                .contains(AgentModeViewModel.recoveryListUnsentContinuationNote) ?? true
+        )
+
+        // ATT1-R2-3: typed continuation text that was not sent keeps the row, and its detail says why.
+        _ = try await lane.completeRecoveryAction(actionID: request.actionID, outcome: .importedUnconfirmed, reason: nil).get()
+        let continuation = try await AgentRecoveryActionRequest(
+            actionID: UUID(),
+            itemKey: key,
+            kind: .continueWithText,
+            expectedRevision: now.store.currentRevision(sessionID: load.session.id),
+            sourceRunAttemptID: ownership.attemptID,
+            target: AgentRecoveryActionTarget(providerKindRaw: "claudeCode", providerConversationID: "conv-1"),
+            text: "please continue",
+            plannedUserItemID: UUID()
+        )
+        _ = try await lane.reserveRecoveryAction(continuation).get()
+        _ = try await lane.completeRecoveryAction(actionID: continuation.actionID, outcome: .notDispatched, reason: nil).get()
+        let explained = await Support.eventually {
+            viewModel.recoveryListProps(forActiveSession: session)?.rows.first { $0.id == itemID }?.detail
+                .hasSuffix(" \(AgentModeViewModel.recoveryListUnsentContinuationNote)") == true
+        }
+        XCTAssertTrue(explained, "\(viewModel.recoveryListProps(forActiveSession: session)?.rows.map(\.detail) ?? [])")
+    }
+
+    /// Review B ATT1-5: after a crash, an active session whose only other items are informational
+    /// run notes still shows the banner with its undismissed crash hold; and a run card on the
+    /// startup path (keyed by the startup binding's incarnation) with an earlier launch's unfinished
+    /// recovery action needs action.
+    func testStartupCrashHoldKeepsTheBannerAndAnEarlierLaunchUnfinishedActionNeedsAction() async throws {
+        let fixture = try makeFixture()
+        let tabID = UUID()
+        let earlier = makeLaunch(fixture)
+        let earlierStore = earlier.store
+
+        // Earlier launch (no clean exit): S1's run is open at the crash (a crash hold and a run
+        // note); S2's run too, with a recovery action reserved on its run card and no outcome.
+        let active = try await makeSession(earlier, fixture: fixture, composeTabID: tabID)
+        let activeOwnership = Support.ownership(sessionID: active.session.id)
+        let activeGate = try earlier.service.recoveryLifecycleGate(for: active.persistenceState)
+        let activeBinding = activeGate.binding
+        try await activeGate.performRecoveryTransaction {
+            _ = try await earlierStore.ensureRunAttempt(
+                binding: activeBinding,
+                expectedRevision: earlierStore.currentRevision(sessionID: activeBinding.sessionID),
+                ownership: activeOwnership,
+                processRunID: nil,
+                transcriptTurnID: nil
+            )
+        }
+        let acted = try await makeSession(earlier, fixture: fixture)
+        let actedOwnership = Support.ownership(sessionID: acted.session.id)
+        let actedGate = try earlier.service.recoveryLifecycleGate(for: acted.persistenceState)
+        let actedBinding = actedGate.binding
+        let actedKey = AgentRecoveryCardKey(
+            kind: .run,
+            incarnationID: actedBinding.incarnationID,
+            transcriptResetGeneration: nil,
+            entityID: actedOwnership.attemptID.uuidString
+        )
+        try await actedGate.performRecoveryTransaction {
+            _ = try await earlierStore.ensureRunAttempt(
+                binding: actedBinding,
+                expectedRevision: earlierStore.currentRevision(sessionID: actedBinding.sessionID),
+                ownership: actedOwnership,
+                processRunID: nil,
+                transcriptTurnID: nil
+            )
+            _ = try await earlierStore.reserveRecoveryAction(
+                binding: actedBinding,
+                request: AgentRecoveryActionRequest(
+                    actionID: UUID(),
+                    itemKey: actedKey,
+                    kind: .reconcileOnly,
+                    expectedRevision: earlierStore.currentRevision(sessionID: actedBinding.sessionID),
+                    sourceRunAttemptID: actedOwnership.attemptID,
+                    target: AgentRecoveryActionTarget(providerKindRaw: "claudeCode", providerConversationID: "conv-1")
+                )
+            )
+        }
+
+        let now = makeLaunch(fixture)
+        let scheduler = AgentScheduledSendCoordinator(startupAdmission: .awaitingRecovery)
+        let destination = fixture.destination
+        let composition = AgentRecoveryAppComposition(
+            store: now.store,
+            dataService: now.service,
+            scheduler: scheduler,
+            loadInventory: { AgentRecoveryWorkspaceInventory(workspaces: [destination]) }
+        )
+        let viewModel = makeViewModel(windowID: 4872, fixture: fixture)
+        composition.install(into: viewModel)
+        await composition.startupCompletion?.value
+        let coordinator = try XCTUnwrap(composition.coordinator)
+        viewModel.test_establishPersistenceWorkspace(fixture.workspace)
+
+        let crashID = "crash-\(active.session.id.uuidString)"
+        let activeRunID = "run-\(active.session.id.uuidString)-\(activeOwnership.attemptID.uuidString)"
+        let actedRunID = "run-\(acted.session.id.uuidString)-\(actedOwnership.attemptID.uuidString)"
+        let listed = await Support.eventually {
+            [crashID, activeRunID, actedRunID].allSatisfy { coordinator.catalog.item(id: $0) != nil }
+        }
+        let summary = coordinator.catalog.items.map { "\($0.id) \($0.attention)" }
+        XCTAssertTrue(listed, "\(summary)")
+        XCTAssertEqual(coordinator.catalog.item(id: activeRunID)?.attention, .informational, "\(summary)")
+        let actedRun = try XCTUnwrap(coordinator.catalog.item(id: actedRunID))
+        XCTAssertEqual(actedRun.acknowledgement?.key, actedKey, "The startup run card is keyed by the startup binding")
+        XCTAssertTrue(actedRun.actionFacts.hasUnfinishedAction, "\(summary)")
+        XCTAssertEqual(actedRun.attention, .needsAction)
+
+        viewModel.test_setCurrentTabIDOverride(tabID)
+        let session = try await viewModel.ensureSessionReady(tabID: tabID)
+        if session.activeAgentSessionID != active.session.id {
+            XCTAssertNotNil(viewModel.test_installPersistentSessionBinding(sessionID: active.session.id, on: session))
+            _ = await viewModel.test_hydrateBoundSession(tabID: tabID)
+        }
+        XCTAssertEqual(session.activeAgentSessionID, active.session.id)
+        let banner = try XCTUnwrap(viewModel.recoveryListProps(forActiveSession: session), "\(summary)")
+        XCTAssertEqual(banner.rows.map(\.id), [crashID], "The crash hold explains the pause; the run note is information")
+        XCTAssertEqual(
+            viewModel.recoveryNeedsAttentionRows(includeDismissed: false, activeSession: session).first { $0.id == actedRunID }?.attention,
+            .needsAction
+        )
+    }
+
     /// A tab's failed composer preparation is a coordinator catalog item (runtime only): every
     /// window lists it, only the window owning the tab offers Retry, it has no durable Dismiss, and
     /// an action's failure is the same shared state in every window.
@@ -1177,6 +1397,7 @@ final class AgentRecoveryStartupCompositionTests: XCTestCase {
         XCTAssertEqual(item.composeTabID, tabID)
         XCTAssertNil(item.acknowledgement, "No durable Dismiss for an unpersistable failure")
         XCTAssertEqual(item.payload, .composerPreparationFailed(.authorityUnavailable("no workspace authority")))
+        XCTAssertEqual(item.attention, .needsAction, "Review B ATT1-5: a sessionless tab's failure needs action")
 
         func sheetRow(_ window: AgentModeViewModel) -> AgentRecoveryListRowProps? {
             window.recoveryNeedsAttentionRows(includeDismissed: true, activeSession: nil).first { $0.id == itemID }?.row
@@ -1185,6 +1406,7 @@ final class AgentRecoveryStartupCompositionTests: XCTestCase {
         XCTAssertEqual(sheetRow(windowA)?.actions, [.retrySave], "The window owning the tab retries")
         XCTAssertEqual(sheetRow(windowB)?.title, "Message box not saved yet")
         XCTAssertEqual(sheetRow(windowB)?.actions, [], "Another window lists it without acting on a tab it does not own")
+        XCTAssertNil(owner.activeAgentSessionID, "The tab has no session")
         let banner = try XCTUnwrap(windowA.recoveryListProps(forActiveSession: owner))
         XCTAssertTrue(banner.rows.contains { $0.id == itemID }, "The owning tab's banner shows the same item")
 

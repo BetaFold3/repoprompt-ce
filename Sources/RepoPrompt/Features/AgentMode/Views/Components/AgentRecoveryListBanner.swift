@@ -1,11 +1,12 @@
 import Foundation
 import SwiftUI
 
-/// Lossless-restart recovery banner above the composer: the active session's items of the app-wide
-/// recovery catalog (held input with View / Edit / Remove, held or unsaved drafts with Restore /
-/// Discard (confirmed), unanswered questions, composer save failures, crash holds, interrupted
-/// turns, held schedule transfers, and unknown recovery status), with a Needs Attention entry for
-/// items elsewhere. Failures stay inline on their row until the action succeeds; nothing shows a
+/// Lossless-restart recovery banner above the composer: the active session's needs-action items of
+/// the app-wide recovery catalog (held input with View / Edit / Remove, held or unsaved drafts with
+/// Restore / Discard (confirmed), unanswered questions, composer save failures, crash holds, run
+/// cards with an unfinished recovery action or an unsent continuation, held schedule transfers, and
+/// unknown recovery status), with a Needs Attention entry counting needs-action items elsewhere
+/// while it is shown. Failures stay inline on their row until the action succeeds; nothing shows a
 /// permanent "Saving"/"Saved" state.
 struct AgentRecoveryListBanner: View {
     let props: AgentRecoveryListProps

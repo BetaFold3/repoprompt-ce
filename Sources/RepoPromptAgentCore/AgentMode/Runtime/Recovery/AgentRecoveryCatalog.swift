@@ -25,6 +25,14 @@ package enum AgentRecoveryCatalogItemKind: String, CaseIterable {
     case pendingEditReview
 }
 
+/// Step 8-attention (O34-3): whether an item asks the user for a decision (something is paused, or
+/// text or a decision stays unsent if the user does nothing) or is a note (nothing is paused or
+/// lost). Derived at projection time from the payload and the item's action facts; never persisted.
+package enum AgentRecoveryCatalogAttention: Equatable {
+    case needsAction
+    case informational
+}
+
 /// Shared progress or failure of one item's action (the same on every surface).
 package enum AgentRecoveryCatalogActionState: Equatable {
     case working
@@ -134,12 +142,32 @@ package struct AgentRecoveryCatalogItem: Equatable, Identifiable {
     package var isDismissed: Bool {
         acknowledgement?.isAcknowledged == true
     }
+
+    /// O34-3 classification (derived, never stored).
+    package var attention: AgentRecoveryCatalogAttention {
+        AgentRecoveryCatalogProjection.attention(for: payload, facts: actionFacts)
+    }
+
+    /// Shown by the banner and counted by Needs Attention badges: needs action and not dismissed.
+    package var isOpenNeedsAction: Bool {
+        attention == .needsAction && !isDismissed
+    }
 }
 
 /// What the current record says about explicit recovery actions on one card.
 package struct AgentRecoveryCatalogActionFacts: Equatable {
     /// An action already resolved the item by sending, or by proving its turn finished (B F3b).
     package var resolvedByAction = false
+    /// A recovery action on the card is unfinished: reserved without a recorded outcome (and not
+    /// replaced by a later choice: "Resume was interrupted; status unknown" until the user decides),
+    /// or holding its session right now (from before its reservation until after its outcome write).
+    package var hasUnfinishedAction = false
+    /// Typed text chosen on the card was never sent and exists only on its action
+    /// (`AgentRecoveryRecord.hasUnsentContinuation(for:)`): the latest action with non-empty text
+    /// ended without sending or proving completion (or was replaced before it had an outcome).
+    /// Cleared only by a saved intent carrying that text or a later action that resolves the card;
+    /// a later textless Reconcile that does not resolve it never clears it.
+    package var hasUnsentContinuation = false
     /// The run card's attempt verifiably never delivered its input (A P1-06): its saved intent
     /// is the route, never a generic continuation.
     package var runNeverHandedOff = false
@@ -152,11 +180,15 @@ package struct AgentRecoveryCatalogActionFacts: Equatable {
 
     package init(
         resolvedByAction: Bool = false,
+        hasUnfinishedAction: Bool = false,
+        hasUnsentContinuation: Bool = false,
         runNeverHandedOff: Bool = false,
         runTranscriptResetGeneration: UInt64? = nil,
         delegatedChildLinks: [AgentRecoveryDelegatedChildLink] = []
     ) {
         self.resolvedByAction = resolvedByAction
+        self.hasUnfinishedAction = hasUnfinishedAction
+        self.hasUnsentContinuation = hasUnsentContinuation
         self.runNeverHandedOff = runNeverHandedOff
         self.runTranscriptResetGeneration = runTranscriptResetGeneration
         self.delegatedChildLinks = delegatedChildLinks
@@ -185,6 +217,11 @@ package struct AgentRecoveryCatalog: Equatable {
     /// The exact items of the Needs Attention sheet, in snapshot order.
     package func needsAttentionItems(includeDismissed: Bool) -> [AgentRecoveryCatalogItem] {
         includeDismissed ? items : items.filter { !$0.isDismissed }
+    }
+
+    /// Needs-action, not-dismissed items (the sidebar's Needs Attention badge).
+    package var openNeedsActionCount: Int {
+        items.count { $0.isOpenNeedsAction }
     }
 
     /// The banner's exact session filter: the session's items, a tab-keyed item of its tab that has
@@ -228,6 +265,28 @@ package enum AgentRecoveryCatalogProjection {
         builder.addUnavailableScheduleIndexes(unavailableScheduleIndexes)
         builder.addRuntimeRestrictions()
         return AgentRecoveryCatalog(generation: generation, items: builder.items, blockers: builder.blockers)
+    }
+
+    /// O34-3: exhaustive per-payload classification (a new payload must be classified to compile).
+    /// Run cards are notes (the transcript is saved and the crash hold is its own item) unless a
+    /// recovery action on them is unfinished or their latest typed continuation was not sent;
+    /// everything else asks the user for a decision.
+    package nonisolated static func attention(
+        for payload: AgentRecoveryCatalogPayload,
+        facts: AgentRecoveryCatalogActionFacts
+    ) -> AgentRecoveryCatalogAttention {
+        switch payload {
+        case .turn, .outcomeTurn, .recoveryOnlyRun:
+            facts.hasUnfinishedAction || facts.hasUnsentContinuation ? .needsAction : .informational
+        case .workspaceFailure, .nonactionable, .duplicateDestination, .noDestination,
+             .crashHold, .scheduleTransfer, .intent, .question, .editProposal,
+             .heldDraft, .closedSessionDraft,
+             .composerRestoreFailed, .unsavedPredecessor, .composerWriteFailed, .ownerlessDraft,
+             .composerPreparationFailed, .questionSaveFailed,
+             .scheduleNeedsConfirmation, .scheduleIndexUnavailable,
+             .survivingRuntime, .runtimeOwnershipUnknown:
+            .needsAction
+        }
     }
 
     /// Row identity of a surviving runtime.
@@ -314,8 +373,13 @@ package enum AgentRecoveryCatalogProjection {
                 )
             }
             var facts = AgentRecoveryCatalogActionFacts()
+            if let sessionID, let key = card?.key {
+                facts.hasUnfinishedAction = coordinator.hasRecoveryActionHold(sessionID: sessionID, itemKey: key)
+            }
             if let record, let key = card?.key {
                 facts.resolvedByAction = record.resolvingAction(for: key) != nil
+                facts.hasUnfinishedAction = facts.hasUnfinishedAction || record.unresolvedAction(for: key) != nil
+                facts.hasUnsentContinuation = record.hasUnsentContinuation(for: key)
                 if key.kindRaw == AgentRecoveryCardKey.Kind.run.rawValue {
                     let runAttemptID = UUID(uuidString: key.entityID)
                     facts.runNeverHandedOff = record.isVerifiedNeverHandedOff(runAttemptID: runAttemptID)

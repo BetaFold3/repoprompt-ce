@@ -3,14 +3,16 @@ import RepoPromptUI
 import SwiftUI
 
 /// App-wide Needs Attention sheet (lossless restart Phase 2): renders the recovery coordinator's
-/// catalog snapshot itself, in snapshot order, with the same rows and actions as the composer
-/// banner. Dismissed items are hidden unless "Show dismissed" is on. Presented by each window's
+/// catalog snapshot itself in two sections (O34-2), "Needs action" then "Information" (collapsed by
+/// default), each in snapshot order, with the same rows and actions as the composer banner.
+/// Dismissed items are hidden unless "Show dismissed" is on. Presented by each window's
 /// root host (`AgentRecoveryNeedsAttentionHost`) from the View menu, the banner, or the sidebar,
 /// independent of the sidebar and of any tab. Opening a row never starts a provider.
 struct AgentRecoveryNeedsAttentionSheet: View {
     let agentModeVM: AgentModeViewModel
     @Environment(\.dismiss) private var dismiss
     @State private var showDismissed = false
+    @State private var showInformation = false
     @State private var revision = 0
 
     var body: some View {
@@ -19,6 +21,8 @@ struct AgentRecoveryNeedsAttentionSheet: View {
             includeDismissed: showDismissed,
             activeSession: agentModeVM.activeSession
         )
+        let needsActionRows = rows.filter { $0.attention == .needsAction }
+        let informationalRows = rows.filter { $0.attention == .informational }
         let actions = AgentRecoveryListActions(
             perform: { rowID, action in
                 await agentModeVM.performRecoveryListAction(rowID: rowID, action: action)
@@ -46,26 +50,36 @@ struct AgentRecoveryNeedsAttentionSheet: View {
             }
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 10) {
-                    if rows.isEmpty {
+                    Text("Needs action (\(Self.headerCount(needsActionRows)))")
+                        .font(.headline)
+                        .accessibilityIdentifier("agent.recoveryNeedsAttention.section.needsAction")
+                    if needsActionRows.isEmpty {
                         Text("Nothing needs your attention.")
                             .foregroundStyle(.secondary)
-                            .frame(maxWidth: .infinity, minHeight: 160)
+                            .frame(maxWidth: .infinity, minHeight: 80)
                     }
-                    ForEach(rows) { entry in
-                        VStack(alignment: .leading, spacing: 2) {
-                            if let label = Self.label(for: entry) {
-                                Text(label)
-                                    .font(.caption2)
-                                    .foregroundStyle(.secondary)
-                            }
-                            AgentRecoveryListRow(row: entry.row, actions: actions)
+                    ForEach(needsActionRows) { entry in
+                        entryView(entry, actions: actions)
+                    }
+                    Button {
+                        showInformation.toggle()
+                    } label: {
+                        HStack(spacing: 4) {
+                            Image(systemName: showInformation ? "chevron.down" : "chevron.right")
+                                .font(.caption.weight(.semibold))
+                            Text("Information (\(Self.headerCount(informationalRows)))")
+                                .font(.headline)
                         }
-                        .padding(8)
-                        .background(
-                            RoundedRectangle(cornerRadius: 8, style: .continuous)
-                                .fill(Color.orange.opacity(entry.isDismissed ? 0.04 : 0.10))
-                        )
-                        .opacity(entry.isDismissed ? 0.7 : 1)
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .padding(.top, 6)
+                    .accessibilityIdentifier("agent.recoveryNeedsAttention.section.informational")
+                    .accessibilityValue(showInformation ? "expanded" : "collapsed")
+                    if showInformation {
+                        ForEach(informationalRows) { entry in
+                            entryView(entry, actions: actions)
+                        }
                     }
                 }
                 .frame(maxWidth: .infinity)
@@ -81,6 +95,29 @@ struct AgentRecoveryNeedsAttentionSheet: View {
 }
 
 extension AgentRecoveryNeedsAttentionSheet {
+    private func entryView(_ entry: AgentRecoveryNeedsAttentionRow, actions: AgentRecoveryListActions) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            if let label = Self.label(for: entry) {
+                Text(label)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+            AgentRecoveryListRow(row: entry.row, actions: actions)
+        }
+        .padding(8)
+        .background(
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .fill(Color.orange.opacity(entry.isDismissed ? 0.04 : 0.10))
+        )
+        .opacity(entry.isDismissed ? 0.7 : 1)
+    }
+
+    /// A section header's count: its undismissed rows (dismissed ones are listed only while "Show
+    /// dismissed" is on and are never counted).
+    static func headerCount(_ rows: [AgentRecoveryNeedsAttentionRow]) -> Int {
+        rows.count { !$0.isDismissed }
+    }
+
     static func label(for entry: AgentRecoveryNeedsAttentionRow) -> String? {
         var parts: [String] = []
         if entry.isDismissed { parts.append("Dismissed") }
@@ -115,8 +152,8 @@ struct AgentRecoveryNeedsAttentionHost: ViewModifier {
     }
 }
 
-/// Sidebar shortcut to the Needs Attention sheet; shown while any recovery item is undismissed (the
-/// View menu's command is always available).
+/// Sidebar shortcut to the Needs Attention sheet; shown while any needs-action recovery item is
+/// undismissed (the View menu's command is always available).
 struct AgentRecoveryNeedsAttentionSidebarButton: View {
     let agentModeVM: AgentModeViewModel
     let hitSize: CGFloat

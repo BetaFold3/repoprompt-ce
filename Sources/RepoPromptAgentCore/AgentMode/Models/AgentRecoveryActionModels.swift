@@ -307,10 +307,37 @@ package extension AgentRecoveryRecord {
     /// interrupted turn finished (`importedCompleted`). Such an item is never offered a duplicate
     /// send (review B F3b); Reconcile stays available.
     func resolvingAction(for itemKey: AgentRecoveryCardKey) -> AgentRecoveryAction? {
-        actions.last { action in
-            guard action.itemKey == itemKey, let kind = action.outcome?.kind else { return false }
-            return kind == .dispatched || kind == .importedCompleted
+        actions.last { $0.itemKey == itemKey && Self.resolvesItem($0) }
+    }
+
+    /// Whether `action` resolved its item: it sent (`dispatched`) or proved the interrupted turn
+    /// finished (`importedCompleted`).
+    private static func resolvesItem(_ action: AgentRecoveryAction) -> Bool {
+        guard let kind = action.outcome?.kind else { return false }
+        return kind == .dispatched || kind == .importedCompleted
+    }
+
+    /// Whether typed text chosen on `itemKey` was never sent and exists only on its action, so the
+    /// card still asks for a decision. It is the latest action carrying non-empty text on the item (a newer
+    /// typed choice decides by its own state) that has ended without resolving: an outcome other
+    /// than `dispatched` / `importedCompleted`, or replaced by a later choice before it had one.
+    /// An action still open is not "unsent" (`unresolvedAction(for:)` covers it). Cleared only when
+    /// - a saved intent carries the text (`userItemID == plannedUserItemID`), or
+    /// - a later action on the item resolves it (`dispatched` / `importedCompleted`).
+    /// A later textless action that does not resolve (Reconcile recorded `notDispatched` or
+    /// `importedUnconfirmed`) only checked history; it never discards the text.
+    func hasUnsentContinuation(for itemKey: AgentRecoveryCardKey) -> Bool {
+        guard let index = actions.lastIndex(where: { $0.itemKey == itemKey && $0.text?.isEmpty == false }) else { return false }
+        let continuation = actions[index]
+        if continuation.outcome != nil {
+            if Self.resolvesItem(continuation) { return false }
+        } else if !isSuperseded(continuation) {
+            return false
         }
+        if let itemID = continuation.plannedUserItemID, intents.contains(where: { $0.userItemID == itemID }) {
+            return false
+        }
+        return !actions[(index + 1)...].contains { $0.itemKey == itemKey && Self.resolvesItem($0) }
     }
 
     /// Relaunch join of one action to the record's intents and attempts (phase4-plan "Restart
