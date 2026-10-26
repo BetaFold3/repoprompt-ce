@@ -93,8 +93,6 @@ struct AgentRecoveryListRow: View {
     /// Phase 4: the continuation being edited (its action), and its editable text.
     @State private var editingContinuation: AgentRecoveryListRowProps.Action?
     @State private var continuationDraft = ""
-    /// Step 5a: the latest comparison of this row's proposal (transient; recomputed on each View).
-    @State private var inspection: (rowID: String, text: String)?
 
     var body: some View {
         HStack(alignment: .top, spacing: 8) {
@@ -120,7 +118,10 @@ struct AgentRecoveryListRow: View {
             }
             if row.text != nil || !row.attachmentNames.isEmpty {
                 Button("View") { isViewing = true }
-                    .popover(isPresented: $isViewing, arrowEdge: .top) { viewer }
+                    // Native NSPopover: the outside click that closes it still reaches its target.
+                    .agentRecoveryNativePopover(isPresented: $isViewing, arrowEdge: .top) {
+                        AgentRecoveryRowViewer(row: row, inspect: actions.inspect)
+                    }
                     .accessibilityIdentifier("agent.recoveryList.view")
             }
             ForEach(row.actions, id: \.self) { action in
@@ -206,42 +207,6 @@ struct AgentRecoveryListRow: View {
         action == .remove || action == .discardDraft || action == .cancelSchedule || action == .discardProposal
     }
 
-    private var viewer: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Text(row.title).font(.headline)
-            Text(row.detail).font(.caption).foregroundStyle(.secondary)
-            if row.inspectsOnView {
-                Text(inspection?.rowID == row.id ? inspection?.text ?? "" : "Comparing with the current file…")
-                    .font(.caption)
-                    .fixedSize(horizontal: false, vertical: true)
-                    .accessibilityIdentifier("agent.recoveryList.inspection")
-            }
-            if let text = row.text, !text.isEmpty {
-                ScrollView {
-                    Text(text)
-                        .textSelection(.enabled)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                }
-                .frame(maxHeight: 240)
-            }
-            if !row.attachmentNames.isEmpty {
-                Text("Attachments: \(row.attachmentNames.joined(separator: ", "))")
-                    .font(.caption)
-            }
-        }
-        .padding(12)
-        .frame(width: 360)
-        .task(id: row.id) {
-            // Never show an earlier View's comparison while this one is computed.
-            inspection = nil
-            guard row.inspectsOnView else { return }
-            let rowID = row.id
-            let text = await actions.inspect(rowID) ?? "The current file couldn't be compared."
-            guard !Task.isCancelled, rowID == row.id else { return }
-            inspection = (rowID, text)
-        }
-    }
-
     private func title(for action: AgentRecoveryListRowProps.Action) -> String {
         switch action {
         case .edit:
@@ -284,6 +249,53 @@ struct AgentRecoveryListRow: View {
             "Copy proposal"
         case .discardProposal:
             "Discard proposal…"
+        }
+    }
+}
+
+/// A recovery row's View popover content. It owns the Step 5a comparison so the hosted popover
+/// re-renders when the comparison arrives; each open gets fresh state from its own hosting
+/// controller.
+struct AgentRecoveryRowViewer: View {
+    let row: AgentRecoveryListRowProps
+    let inspect: (_ rowID: String) async -> String?
+
+    /// The latest comparison of this row's proposal (transient; recomputed on each View).
+    @State private var inspection: (rowID: String, text: String)?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text(row.title).font(.headline)
+            Text(row.detail).font(.caption).foregroundStyle(.secondary)
+            if row.inspectsOnView {
+                Text(inspection?.rowID == row.id ? inspection?.text ?? "" : "Comparing with the current file…")
+                    .font(.caption)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .accessibilityIdentifier("agent.recoveryList.inspection")
+            }
+            if let text = row.text, !text.isEmpty {
+                ScrollView {
+                    Text(text)
+                        .textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .frame(maxHeight: 240)
+            }
+            if !row.attachmentNames.isEmpty {
+                Text("Attachments: \(row.attachmentNames.joined(separator: ", "))")
+                    .font(.caption)
+            }
+        }
+        .padding(12)
+        .frame(width: 360)
+        .task(id: row.id) {
+            // Never show an earlier View's comparison while this one is computed.
+            inspection = nil
+            guard row.inspectsOnView else { return }
+            let rowID = row.id
+            let text = await inspect(rowID) ?? "The current file couldn't be compared."
+            guard !Task.isCancelled, rowID == row.id else { return }
+            inspection = (rowID, text)
         }
     }
 }
