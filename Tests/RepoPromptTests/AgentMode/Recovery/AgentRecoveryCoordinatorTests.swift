@@ -1966,6 +1966,8 @@ final class AgentRecoveryCoordinatorTests: XCTestCase {
         let attemptID: UUID
         let itemID: String
         let key: AgentRecoveryCardKey
+        let load: AgentSessionEditableLoad
+        let service: AgentSessionDataService
         let target = AgentRecoveryActionTarget(providerKindRaw: "claudeCode", providerConversationID: "conv-1")
 
         var item: AgentRecoveryCatalogItem? {
@@ -2009,10 +2011,31 @@ final class AgentRecoveryCoordinatorTests: XCTestCase {
     }
 
     private func makeRunCardFixture() async throws -> RunCardFixture {
+        try await makeRunCardFixtures(count: 1)[0]
+    }
+
+    /// `count` sessions' informational run cards on one coordinator (sessions saved before startup).
+    private func makeRunCardFixtures(count: Int) async throws -> [RunCardFixture] {
         let store = makeStore()
         let service = makeService(store: store)
-        let load = try await makeSession(service)
+        var loads: [AgentSessionEditableLoad] = []
+        for _ in 0 ..< count {
+            try await loads.append(makeSession(service))
+        }
         let coordinator = try await startedCoordinator(store: store, service: service)
+        var fixtures: [RunCardFixture] = []
+        for load in loads {
+            try await fixtures.append(addRunCard(load: load, store: store, service: service, coordinator: coordinator))
+        }
+        return fixtures
+    }
+
+    private func addRunCard(
+        load: AgentSessionEditableLoad,
+        store: AgentRecoveryStore,
+        service: AgentSessionDataService,
+        coordinator: AgentRecoveryCoordinator
+    ) async throws -> RunCardFixture {
         let lane = try coordinator.claimLane(owner: Owner(), persistenceState: load.persistenceState)
         let sessionID = load.session.id
         let ownership = Support.ownership(sessionID: sessionID)
@@ -2034,7 +2057,9 @@ final class AgentRecoveryCoordinatorTests: XCTestCase {
             sessionID: sessionID,
             attemptID: ownership.attemptID,
             itemID: itemID,
-            key: XCTUnwrap(item.acknowledgement?.key)
+            key: XCTUnwrap(item.acknowledgement?.key),
+            load: load,
+            service: service
         )
     }
 
@@ -2210,6 +2235,357 @@ final class AgentRecoveryCoordinatorTests: XCTestCase {
         let released = try XCTUnwrap(fixture.item)
         XCTAssertFalse(released.actionFacts.hasUnfinishedAction)
         XCTAssertEqual(released.attention, .informational)
+    }
+
+    // MARK: Automatic clearing (Step 8-attention-2)
+
+    /// The pure clearing rule, first match wins: resolved by an action, then an older reset
+    /// generation than current, then a later attempt of the same generation in `runAttempts`
+    /// (first-record order). Nothing else clears; there is no age-based expiry.
+    func testAutomaticClearRuleOrder() {
+        let stamp = AgentRecoveryTimestamp(millisecondsSince1970: 1000)
+        func attempt(_ id: UUID, _ generation: UInt64) -> AgentRecoveryRunAttempt {
+            AgentRecoveryRunAttempt(runAttemptID: id, transcriptResetGeneration: generation, processRunID: nil, transcriptTurnID: nil, startedAt: stamp)
+        }
+        func clear(
+            resolved: Bool = false,
+            _ id: UUID?,
+            _ attempts: [AgentRecoveryRunAttempt],
+            current: UInt64
+        ) -> AgentRecoveryCatalogAutomaticClear? {
+            AgentRecoveryCatalogProjection.automaticClear(resolvedByAction: resolved, runAttemptID: id, runAttempts: attempts, currentGeneration: current)
+        }
+        let (first, second, third) = (UUID(), UUID(), UUID())
+        let sameGeneration = [attempt(first, 0), attempt(second, 0)]
+        XCTAssertEqual(clear(resolved: true, nil, [], current: 0), .resolved, "a legacy turn is cleared by its action alone")
+        XCTAssertEqual(clear(resolved: true, first, sameGeneration, current: 1), .resolved, "first match wins")
+        XCTAssertEqual(clear(first, sameGeneration, current: 1), .conversationCleared)
+        XCTAssertEqual(clear(first, sameGeneration, current: 0), .sessionContinued)
+        XCTAssertNil(clear(second, sameGeneration, current: 0), "the latest attempt is not continued")
+        XCTAssertNil(clear(UUID(), sameGeneration, current: 0), "an attempt missing from the record")
+        XCTAssertNil(clear(nil, sameGeneration, current: 0))
+        // A later attempt of another generation is no continuation of this one.
+        XCTAssertNil(clear(second, [attempt(second, 1), attempt(third, 2)], current: 1))
+        XCTAssertEqual(clear(third, [attempt(first, 0), attempt(third, 1)], current: 1), nil)
+    }
+
+    /// Review B F4: a run with delegated-child links is never cleared (its card is their only
+    /// discovery pointer), whichever rule would match.
+    func testAutomaticClearNeverClearsARunWithDelegatedChildren() {
+        let stamp = AgentRecoveryTimestamp(millisecondsSince1970: 1000)
+        let (first, second) = (UUID(), UUID())
+        let attempts = [first, second].map {
+            AgentRecoveryRunAttempt(runAttemptID: $0, transcriptResetGeneration: 0, processRunID: nil, transcriptTurnID: nil, startedAt: stamp)
+        }
+        for (resolved, current) in [(false, UInt64(0)), (false, 1), (true, 0)] {
+            XCTAssertNotNil(AgentRecoveryCatalogProjection.automaticClear(
+                resolvedByAction: resolved, runAttemptID: first, runAttempts: attempts, currentGeneration: current
+            ), "the rule matches without links")
+            XCTAssertNil(AgentRecoveryCatalogProjection.automaticClear(
+                resolvedByAction: resolved, runAttemptID: first, runAttempts: attempts, currentGeneration: current,
+                hasDelegatedChildren: true
+            ), "resolved: \(resolved), current generation: \(current)")
+        }
+    }
+
+    /// Review B F4: a later attempt that verifiably never delivered its input continues nothing, so
+    /// it never clears the earlier run as "session continued"; a delivered one still does.
+    func testAutomaticClearIgnoresALaterAttemptThatWasNeverHandedOff() {
+        let stamp = AgentRecoveryTimestamp(millisecondsSince1970: 1000)
+        let (first, neverHandedOff, delivered) = (UUID(), UUID(), UUID())
+        func attempts(_ ids: [UUID]) -> [AgentRecoveryRunAttempt] {
+            ids.map { AgentRecoveryRunAttempt(runAttemptID: $0, transcriptResetGeneration: 0, processRunID: nil, transcriptTurnID: nil, startedAt: stamp) }
+        }
+        func clear(_ ids: [UUID]) -> AgentRecoveryCatalogAutomaticClear? {
+            AgentRecoveryCatalogProjection.automaticClear(
+                resolvedByAction: false, runAttemptID: first, runAttempts: attempts(ids), currentGeneration: 0,
+                isVerifiedNeverHandedOff: { $0 == neverHandedOff }
+            )
+        }
+        XCTAssertNil(clear([first, neverHandedOff]))
+        XCTAssertEqual(clear([first, neverHandedOff, delivered]), .sessionContinued)
+    }
+
+    /// A later run attempt in the same conversation generation clears the earlier run's note from
+    /// ordinary presentation: still in the catalog, hidden from the sheet's default rows, listed
+    /// with "Show dismissed and cleared", and never counted. Nothing is written.
+    func testRunCardIsClearedWhenALaterRunAttemptExists() async throws {
+        let fixture = try await makeRunCardFixture()
+        XCTAssertNil(fixture.item?.automaticClear)
+        let before = await fixture.store.read(sessionID: fixture.sessionID).record
+        XCTAssertEqual(before?.cardAcknowledgements.count ?? 0, 0)
+
+        let later = Support.ownership(sessionID: fixture.sessionID)
+        _ = try await fixture.lane.ensureRunAttempt(ownership: later, processRunID: nil, transcriptTurnID: UUID()).get()
+        let cleared = await Support.eventually { fixture.item?.automaticClear == .sessionContinued }
+        XCTAssertTrue(cleared, "\(String(describing: fixture.item?.actionFacts))")
+        let item = try XCTUnwrap(fixture.item, "a cleared note stays in the catalog")
+        XCTAssertTrue(item.isHidden)
+        XCTAssertFalse(item.isDismissed)
+        XCTAssertEqual(item.attention, .informational)
+        let catalog = fixture.coordinator.catalog
+        XCTAssertFalse(catalog.needsAttentionItems(includeDismissed: false).contains { $0.id == fixture.itemID })
+        XCTAssertTrue(catalog.needsAttentionItems(includeDismissed: true).contains { $0.id == fixture.itemID })
+        XCTAssertEqual(catalog.openNeedsActionCount, 0)
+        let after = await fixture.store.read(sessionID: fixture.sessionID).record
+        XCTAssertEqual(after?.cardAcknowledgements.count ?? 0, 0, "clearing is projection-only")
+    }
+
+    /// A recovery action that resolved the card (here a Reconcile proving the turn finished) clears it.
+    func testRunCardIsClearedWhenAnActionResolvedIt() async throws {
+        let fixture = try await makeRunCardFixture()
+        try await fixture.perform(fixture.request(), outcome: .importedCompleted)
+        let item = try XCTUnwrap(fixture.item)
+        XCTAssertTrue(item.actionFacts.resolvedByAction)
+        XCTAssertEqual(item.automaticClear, .resolved)
+        XCTAssertTrue(item.isHidden)
+    }
+
+    /// Clearing the conversation after the run clears its note (the run's reset generation is older
+    /// than the session's current one).
+    func testRunCardIsClearedWhenTheConversationWasClearedAfterIt() async throws {
+        let store = makeStore()
+        let service = makeService(store: store)
+        let load = try await makeSession(service)
+        let coordinator = try await startedCoordinator(store: store, service: service)
+        let owner = Owner()
+        let lane = try coordinator.claimLane(owner: owner, persistenceState: load.persistenceState)
+        let ownership = Support.ownership(sessionID: load.session.id)
+        let turnID = UUID()
+        _ = try await lane.ensureRunAttempt(ownership: ownership, processRunID: nil, transcriptTurnID: turnID).get()
+        await lane.recordTerminalEvidence(
+            Support.terminalCommit(ownership: ownership, state: .failed, cause: .providerProcessLost),
+            transcriptTurnID: turnID
+        ).value
+        let itemID = "turn-\(load.session.id.uuidString)-\(turnID.uuidString)"
+        let listed = await Support.eventually { coordinator.catalog.item(id: itemID) != nil }
+        XCTAssertTrue(listed)
+        XCTAssertNil(coordinator.catalog.item(id: itemID)?.automaticClear)
+
+        let reset = try await resetTranscript(service, load)
+        let fresh = try coordinator.claimLane(owner: owner, persistenceState: reset.persistenceState)
+        XCTAssertEqual(fresh.binding.transcriptResetGeneration, 1)
+        let cleared = await Support.eventually { coordinator.catalog.item(id: itemID)?.automaticClear == .conversationCleared }
+        XCTAssertTrue(cleared, "\(coordinator.catalog.items.map { "\($0.id) \(String(describing: $0.automaticClear))" })")
+        XCTAssertEqual(coordinator.catalog.item(id: itemID)?.isHidden, true)
+    }
+
+    /// A needs-action run card is never cleared, even when a clearing rule matches: not with an
+    /// unfinished recovery action, and not with an unsent typed continuation.
+    func testNeedsActionRunCardIsNeverCleared() async throws {
+        let fixtures = try await makeRunCardFixtures(count: 2)
+        let (unfinished, unsent) = (fixtures[0], fixtures[1])
+        let open = try await unfinished.request(text: "please continue from the last step")
+        _ = try await unfinished.lane.reserveRecoveryAction(open).get()
+        _ = try await unfinished.lane.ensureRunAttempt(ownership: Support.ownership(sessionID: unfinished.sessionID), processRunID: nil, transcriptTurnID: UUID()).get()
+        let matched = await Support.eventually { unfinished.item?.actionFacts.automaticClear == .sessionContinued }
+        XCTAssertTrue(matched, "the rule matches")
+        let held = try XCTUnwrap(unfinished.item)
+        XCTAssertEqual(held.attention, .needsAction)
+        XCTAssertNil(held.automaticClear, "never cleared while an action is unfinished")
+        XCTAssertFalse(held.isHidden)
+        XCTAssertTrue(unfinished.coordinator.catalog.needsAttentionItems(includeDismissed: false).contains { $0.id == unfinished.itemID })
+
+        let continuation = try await unsent.request(text: "please continue from the last step")
+        try await unsent.perform(continuation, outcome: .notDispatched)
+        XCTAssertTrue(unsent.item?.actionFacts.hasUnsentContinuation == true)
+        _ = try await unsent.lane.ensureRunAttempt(ownership: Support.ownership(sessionID: unsent.sessionID), processRunID: nil, transcriptTurnID: UUID()).get()
+        let unsentMatched = await Support.eventually { unsent.item?.actionFacts.automaticClear == .sessionContinued }
+        XCTAssertTrue(unsentMatched)
+        let kept = try XCTUnwrap(unsent.item)
+        XCTAssertEqual(kept.attention, .needsAction)
+        XCTAssertNil(kept.automaticClear, "never cleared while its typed text was not sent")
+        XCTAssertEqual(unsent.coordinator.catalog.openNeedsActionCount, 2, "both cards are counted")
+    }
+
+    // MARK: Bulk Dismiss (Step 8-attention-2)
+
+    /// Every captured item is either dismissed or skipped with its reason: no Dismiss, busy, or
+    /// changed since shown. A changed item is never dismissed in its new form. A dismissed (hidden)
+    /// item is not captured at all: it is neither counted nor skipped.
+    func testBulkDismissSkipsIneligibleAndChangedItems() async throws {
+        let cards = try await makeRunCardFixtures(count: 5)
+        let (eligible, dismissedCard, busyCard, changedCard, staleCard) = (cards[0], cards[1], cards[2], cards[3], cards[4])
+        let (store, coordinator) = (eligible.store, eligible.coordinator)
+
+        let dismissFirst = try await coordinator.dismissCatalogItem(XCTUnwrap(dismissedCard.item))
+        XCTAssertNil(dismissFirst)
+        let dismissedCaptured = try XCTUnwrap(dismissedCard.item)
+        XCTAssertTrue(dismissedCaptured.isDismissed)
+        let noDismiss = AgentRecoveryCatalogItem(
+            id: "draft-savefail-\(UUID().uuidString)", kind: .saveFailure, sessionID: UUID(), workspaceID: nil,
+            sessionName: nil, composeTabID: nil, payload: .composerWriteFailed(.retired), acknowledgement: nil
+        )
+        // Captured as an informational note; it then needs action (an action is reserved on it).
+        let changedCaptured = try XCTUnwrap(changedCard.item)
+        _ = try await changedCard.lane.reserveRecoveryAction(changedCard.request()).get()
+        let promoted = await Support.eventually { changedCard.item?.attention == .needsAction }
+        XCTAssertTrue(promoted)
+        // Captured in a state the catalog no longer shows.
+        let current = try XCTUnwrap(staleCard.item)
+        let staleAcknowledgement = try XCTUnwrap(current.acknowledgement)
+        let staleCaptured = AgentRecoveryCatalogItem(
+            id: current.id, kind: current.kind, sessionID: current.sessionID, workspaceID: current.workspaceID,
+            sessionName: current.sessionName, composeTabID: current.composeTabID, payload: current.payload,
+            acknowledgement: AgentRecoveryCatalogAcknowledgement(
+                key: staleAcknowledgement.key, freshness: AgentRecoveryCardFreshness("older"), isAcknowledged: false
+            ),
+            actionFacts: current.actionFacts
+        )
+        coordinator.setCatalogActionState(.working, for: busyCard.itemID)
+        let captured = try [XCTUnwrap(eligible.item), noDismiss, dismissedCaptured, XCTUnwrap(busyCard.item), changedCaptured, staleCaptured]
+
+        let result = await coordinator.dismissCatalogItems(captured, section: .informational)
+        let status = try XCTUnwrap(result)
+        XCTAssertFalse(status.isRunning)
+        XCTAssertFalse(coordinator.isBulkDismissRunning)
+        XCTAssertEqual(status.total, 5)
+        XCTAssertEqual(status.dismissed, 1)
+        XCTAssertEqual(status.failed, 0)
+        XCTAssertEqual(status.skipped, [
+            AgentRecoveryBulkDismissSkip(itemID: noDismiss.id, reason: .noDismiss),
+            AgentRecoveryBulkDismissSkip(itemID: busyCard.itemID, reason: .busy),
+            AgentRecoveryBulkDismissSkip(itemID: changedCard.itemID, reason: .changed),
+            AgentRecoveryBulkDismissSkip(itemID: staleCard.itemID, reason: .changed)
+        ])
+        XCTAssertEqual(
+            status.summaryText,
+            "Information: Dismissed 1 of 5 · 4 skipped (1 can't be dismissed, 1 busy, 2 changed)"
+        )
+        XCTAssertEqual(coordinator.bulkDismiss, status, "the summary stays until the sheet closes or the next bulk")
+        coordinator.clearBulkDismissSummary()
+        XCTAssertNil(coordinator.bulkDismiss, "closing the sheet clears a finished summary")
+        XCTAssertEqual(eligible.item?.isDismissed, true)
+        XCTAssertEqual(coordinator.catalogActionStates[busyCard.itemID], .working, "a busy row's own action state is untouched")
+        for skipped in [busyCard, changedCard, staleCard] {
+            let record = await store.read(sessionID: skipped.sessionID).record
+            XCTAssertEqual(record?.cardAcknowledgements.count ?? 0, 0, "\(skipped.itemID) is not dismissed")
+            XCTAssertEqual(skipped.item?.isDismissed, false)
+        }
+        XCTAssertEqual(changedCard.item?.attention, .needsAction, "still listed in its new form")
+    }
+
+    /// A failed Dismiss stays on its row (shared action state) and is counted; the rest continue.
+    func testBulkDismissReportsPartialFailureOnTheRow() async throws {
+        let cards = try await makeRunCardFixtures(count: 2)
+        let (first, second, coordinator) = (cards[0], cards[1], cards[0].coordinator)
+        let captured = try [XCTUnwrap(first.item), XCTUnwrap(second.item)]
+        // Storage fails for the second session's record only.
+        failures.failingWritePathFragment = second.sessionID.uuidString
+        let result = await coordinator.dismissCatalogItems(captured, section: .informational)
+        failures.failingWritePathFragment = nil
+        let status = try XCTUnwrap(result)
+        XCTAssertEqual(status.dismissed, 1)
+        XCTAssertEqual(status.failed, 1)
+        XCTAssertTrue(status.skipped.isEmpty)
+        XCTAssertEqual(status.summaryText, "Information: Dismissed 1 of 2 · 1 failed")
+        XCTAssertEqual(first.item?.isDismissed, true)
+        XCTAssertNil(coordinator.catalogActionStates[first.itemID])
+        XCTAssertEqual(second.item?.isDismissed, false, "the failed card stays listed")
+        guard case .failed? = coordinator.catalogActionStates[second.itemID] else {
+            return XCTFail("the failure stays on its row: \(String(describing: coordinator.catalogActionStates[second.itemID]))")
+        }
+    }
+
+    /// Cancel stops before the next item: committed Dismisses stay, the rest are untouched, and only
+    /// one bulk Dismiss runs at a time.
+    func testBulkDismissCancelStopsBeforeTheNextItemAndKeepsCommittedOnes() async throws {
+        let cards = try await makeRunCardFixtures(count: 3)
+        let (store, service, coordinator) = (cards[0].store, cards[0].service, cards[0].coordinator)
+        let captured = try cards.map { try XCTUnwrap($0.item) }
+        // The first Dismiss waits on its session's persistence gate while the cancel is requested.
+        let gate = try service.recoveryLifecycleGate(for: cards[0].load.persistenceState)
+        let latch = RecoveryGateLatch()
+        let holder = Task {
+            try await gate.performRecoveryTransaction { await latch.pause() }
+        }
+        await latch.waitUntilPaused()
+        let running = Task { await coordinator.dismissCatalogItems(captured, section: .informational) }
+        let started = await Support.eventually { coordinator.catalogActionStates[cards[0].itemID] == .working }
+        XCTAssertTrue(started)
+        XCTAssertTrue(coordinator.isBulkDismissRunning)
+        XCTAssertTrue(coordinator.bulkDismiss?.summaryText.hasPrefix("Information: Dismissing 1 of 3") == true, String(describing: coordinator.bulkDismiss?.summaryText))
+        coordinator.clearBulkDismissSummary()
+        XCTAssertNotNil(coordinator.bulkDismiss, "closing the sheet keeps a running bulk's status")
+        let concurrent = await coordinator.dismissCatalogItems(captured, section: .needsAction)
+        XCTAssertNil(concurrent, "one bulk Dismiss at a time")
+        coordinator.requestBulkDismissCancel()
+        XCTAssertEqual(coordinator.bulkDismiss?.cancelRequested, true)
+        await latch.open()
+        _ = try await holder.value
+        let result = await running.value
+        let status = try XCTUnwrap(result)
+        XCTAssertFalse(status.isRunning)
+        XCTAssertEqual(status.dismissed, 1, "the item in progress settles and stays dismissed")
+        XCTAssertEqual(status.notAttempted, 2)
+        XCTAssertEqual(status.summaryText, "Information: Dismissed 1 of 3 · stopped, 2 not attempted")
+        XCTAssertEqual(cards.map { $0.item?.isDismissed }, [true, false, false])
+        for card in cards.dropFirst() {
+            let record = await store.read(sessionID: card.sessionID).record
+            XCTAssertEqual(record?.cardAcknowledgements.count ?? 0, 0)
+        }
+    }
+
+    /// Review A ATT2-01: the set is frozen when the bulk is chosen. A card busy with its own Dismiss
+    /// then is a `.busy` skip and is never promoted into the batch, even when its own Dismiss fails
+    /// (so it is no longer busy and unchanged) while the bulk's first write is still blocked.
+    func testBulkDismissActsOnlyOnTheItemsEligibleWhenConfirmed() async throws {
+        let cards = try await makeRunCardFixtures(count: 2)
+        let (first, busy, coordinator) = (cards[0], cards[1], cards[0].coordinator)
+        func hold(_ card: RunCardFixture, _ latch: RecoveryGateLatch) throws -> Task<Void, Error> {
+            let gate = try card.service.recoveryLifecycleGate(for: card.load.persistenceState)
+            return Task { _ = try await gate.performRecoveryTransaction { await latch.pause() } }
+        }
+        // The busy card's own Dismiss (as its row runs it) waits on its session's gate, then fails.
+        let busyLatch = RecoveryGateLatch()
+        let busyHolder = try hold(busy, busyLatch)
+        await busyLatch.waitUntilPaused()
+        failures.failingWritePathFragment = busy.sessionID.uuidString
+        let busyItem = try XCTUnwrap(busy.item)
+        coordinator.setCatalogActionState(.working, for: busy.itemID)
+        let individual = Task {
+            let failure = await coordinator.dismissCatalogItem(busyItem)
+            coordinator.setCatalogActionState(failure.map { .failed($0) }, for: busy.itemID)
+            return failure
+        }
+
+        let capture = try coordinator.bulkDismissCapture([XCTUnwrap(first.item), busyItem])
+        XCTAssertEqual(capture.items.map(\.id), [first.itemID], "the confirmed count is 1")
+        XCTAssertEqual(capture.skipped, [AgentRecoveryBulkDismissSkip(itemID: busy.itemID, reason: .busy)])
+
+        let firstLatch = RecoveryGateLatch()
+        let firstHolder = try hold(first, firstLatch)
+        await firstLatch.waitUntilPaused()
+        let running = Task { await coordinator.dismissCatalogItems(capture, section: .needsAction) }
+        let started = await Support.eventually { coordinator.catalogActionStates[first.itemID] == .working }
+        XCTAssertTrue(started)
+
+        await busyLatch.open()
+        _ = try await busyHolder.value
+        let individualFailure = await individual.value
+        XCTAssertNotNil(individualFailure, "the card's own Dismiss failed")
+        failures.failingWritePathFragment = nil
+        XCTAssertNotEqual(coordinator.catalogActionStates[busy.itemID], .working, "no longer busy")
+        XCTAssertEqual(busy.item?.acknowledgement, busyItem.acknowledgement, "and unchanged")
+        XCTAssertTrue(coordinator.isBulkDismissRunning, "the bulk's first write is still blocked")
+        XCTAssertEqual(coordinator.catalogActionStates[first.itemID], .working)
+
+        await firstLatch.open()
+        _ = try await firstHolder.value
+        let result = await running.value
+        let status = try XCTUnwrap(result)
+        XCTAssertEqual(status.total, 2)
+        XCTAssertEqual(status.dismissed, 1, "only the confirmed card")
+        XCTAssertEqual(status.failed, 0)
+        XCTAssertEqual(status.skipped, [AgentRecoveryBulkDismissSkip(itemID: busy.itemID, reason: .busy)])
+        XCTAssertEqual(status.summaryText, "Needs action: Dismissed 1 of 2 · 1 skipped (1 busy)")
+        XCTAssertEqual(first.item?.isDismissed, true)
+        XCTAssertEqual(busy.item?.isDismissed, false, "never promoted into the batch")
+        let record = await busy.store.read(sessionID: busy.sessionID).record
+        XCTAssertEqual(record?.cardAcknowledgements.count ?? 0, 0)
+        guard case .failed? = coordinator.catalogActionStates[busy.itemID] else {
+            return XCTFail("its own failure stays on its row: \(String(describing: coordinator.catalogActionStates[busy.itemID]))")
+        }
     }
 
     // MARK: Indexed schedules (sessions no window hosts)

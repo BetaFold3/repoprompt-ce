@@ -480,9 +480,20 @@ struct AgentRecoveryNeedsAttentionRow: Equatable, Identifiable {
     let isOtherWorkspace: Bool
     /// Which sheet section lists it (O34-2).
     let attention: AgentRecoveryCatalogAttention
+    /// Why the note is cleared from ordinary presentation (listed only under "Show dismissed and
+    /// cleared"); `nil` when it is not cleared.
+    var automaticClear: AgentRecoveryCatalogAutomaticClear?
+    /// The catalog item exactly as displayed: bulk Dismiss acts on it, never on a newer item with
+    /// the same ID.
+    var item: AgentRecoveryCatalogItem?
 
     var id: String {
         row.id
+    }
+
+    /// Listed only while "Show dismissed and cleared" is on (never counted).
+    var isHidden: Bool {
+        isDismissed || automaticClear != nil
     }
 }
 

@@ -5,15 +5,20 @@ import SwiftUI
 /// App-wide Needs Attention sheet (lossless restart Phase 2): renders the recovery coordinator's
 /// catalog snapshot itself in two sections (O34-2), "Needs action" then "Information" (collapsed by
 /// default), each in snapshot order, with the same rows and actions as the composer banner.
-/// Dismissed items are hidden unless "Show dismissed" is on. Presented by each window's
-/// root host (`AgentRecoveryNeedsAttentionHost`) from the View menu, the banner, or the sidebar,
-/// independent of the sidebar and of any tab. Opening a row never starts a provider.
+/// Dismissed and automatically cleared items are hidden unless "Show dismissed and cleared" is on.
+/// Each section offers a bulk Dismiss of its displayed rows (O34-2; confirmed for Needs action).
+/// Presented by each window's root host (`AgentRecoveryNeedsAttentionHost`) from the View menu,
+/// the banner, or the sidebar, independent of the sidebar and of any tab. Opening a row never
+/// starts a provider.
 struct AgentRecoveryNeedsAttentionSheet: View {
     let agentModeVM: AgentModeViewModel
     @Environment(\.dismiss) private var dismiss
     @State private var showDismissed = false
     @State private var showInformation = false
     @State private var revision = 0
+    /// The needs-action bulk Dismiss frozen when "Dismiss eligible…" was clicked, awaiting
+    /// confirmation (its eligible items are the confirmed count).
+    @State private var pendingNeedsActionBulk: AgentRecoveryBulkDismissRequest?
 
     var body: some View {
         let _ = revision
@@ -43,16 +48,26 @@ struct AgentRecoveryNeedsAttentionSheet: View {
                 Text("Needs Attention")
                     .font(.title2.weight(.semibold))
                 Spacer()
-                Toggle("Show dismissed", isOn: $showDismissed)
+                Toggle("Show dismissed and cleared", isOn: $showDismissed)
                     .toggleStyle(.checkbox)
                     .accessibilityIdentifier("agent.recoveryNeedsAttention.showDismissed")
                 Button("Done") { dismiss() }
             }
+            bulkStatusLine
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 10) {
-                    Text("Needs action (\(Self.headerCount(needsActionRows)))")
-                        .font(.headline)
-                        .accessibilityIdentifier("agent.recoveryNeedsAttention.section.needsAction")
+                    HStack {
+                        Text("Needs action (\(Self.headerCount(needsActionRows)))")
+                            .font(.headline)
+                            .accessibilityIdentifier("agent.recoveryNeedsAttention.section.needsAction")
+                        Spacer()
+                        Button("Dismiss eligible…") {
+                            pendingNeedsActionBulk = agentModeVM.recoveryBulkDismissRequest(section: .needsAction, rows: needsActionRows)
+                        }
+                        .controlSize(.small)
+                        .disabled(isBulkRunning || agentModeVM.recoveryBulkDismissEligibleCount(needsActionRows) == 0)
+                        .accessibilityIdentifier("agent.recoveryNeedsAttention.dismissAll.needsAction")
+                    }
                     if needsActionRows.isEmpty {
                         Text("Nothing needs your attention.")
                             .foregroundStyle(.secondary)
@@ -61,21 +76,31 @@ struct AgentRecoveryNeedsAttentionSheet: View {
                     ForEach(needsActionRows) { entry in
                         entryView(entry, actions: actions)
                     }
-                    Button {
-                        showInformation.toggle()
-                    } label: {
-                        HStack(spacing: 4) {
-                            Image(systemName: showInformation ? "chevron.down" : "chevron.right")
-                                .font(.caption.weight(.semibold))
-                            Text("Information (\(Self.headerCount(informationalRows)))")
-                                .font(.headline)
+                    HStack {
+                        Button {
+                            showInformation.toggle()
+                        } label: {
+                            HStack(spacing: 4) {
+                                Image(systemName: showInformation ? "chevron.down" : "chevron.right")
+                                    .font(.caption.weight(.semibold))
+                                Text("Information (\(Self.headerCount(informationalRows)))")
+                                    .font(.headline)
+                            }
+                            .contentShape(Rectangle())
                         }
-                        .contentShape(Rectangle())
+                        .buttonStyle(.plain)
+                        .accessibilityIdentifier("agent.recoveryNeedsAttention.section.informational")
+                        .accessibilityValue(showInformation ? "expanded" : "collapsed")
+                        Spacer()
+                        // Informational notes: no confirmation (nothing is paused or lost).
+                        Button("Dismiss all") {
+                            agentModeVM.startRecoveryBulkDismiss(section: .informational, rows: informationalRows)
+                        }
+                        .controlSize(.small)
+                        .disabled(isBulkRunning || agentModeVM.recoveryBulkDismissEligibleCount(informationalRows) == 0)
+                        .accessibilityIdentifier("agent.recoveryNeedsAttention.dismissAll.informational")
                     }
-                    .buttonStyle(.plain)
                     .padding(.top, 6)
-                    .accessibilityIdentifier("agent.recoveryNeedsAttention.section.informational")
-                    .accessibilityValue(showInformation ? "expanded" : "collapsed")
                     if showInformation {
                         ForEach(informationalRows) { entry in
                             entryView(entry, actions: actions)
@@ -88,8 +113,58 @@ struct AgentRecoveryNeedsAttentionSheet: View {
         .padding(20)
         .frame(minWidth: 620, minHeight: 400)
         .accessibilityIdentifier("agent.recoveryNeedsAttention.sheet")
+        .confirmationDialog(
+            Self.needsActionConfirmationTitle(
+                eligible: pendingNeedsActionBulk?.eligibleCount ?? 0,
+                otherWorkspaces: pendingNeedsActionBulk?.otherWorkspaceCount ?? 0
+            ),
+            isPresented: Binding(
+                get: { pendingNeedsActionBulk != nil },
+                set: { if !$0 { pendingNeedsActionBulk = nil } }
+            ),
+            titleVisibility: .visible
+        ) {
+            Button("Dismiss") {
+                if let captured = pendingNeedsActionBulk {
+                    agentModeVM.startRecoveryBulkDismiss(captured)
+                }
+                pendingNeedsActionBulk = nil
+            }
+            .accessibilityIdentifier("agent.recoveryNeedsAttention.dismissAll.needsAction.confirm")
+            Button("Cancel", role: .cancel) { pendingNeedsActionBulk = nil }
+        } message: {
+            Text(AgentModeViewModel.recoveryBulkDismissNeedsActionWarning)
+        }
         .onReceive(NotificationCenter.default.publisher(for: .agentRecoveryCatalogDidChange).receive(on: RunLoop.main)) { _ in
             revision &+= 1
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .agentRecoveryCoordinatorDidChange).receive(on: RunLoop.main)) { _ in
+            revision &+= 1
+        }
+        // A finished bulk's summary is not shown again on the next opening (a running one stays).
+        .onDisappear { agentModeVM.clearRecoveryBulkDismissSummary() }
+    }
+
+    private var isBulkRunning: Bool {
+        agentModeVM.isRecoveryBulkDismissRunning
+    }
+
+    /// The app-wide bulk Dismiss's one-line progress or summary, with Stop while it runs.
+    @ViewBuilder
+    private var bulkStatusLine: some View {
+        if let status = agentModeVM.recoveryBulkDismissStatus {
+            HStack(spacing: 8) {
+                Text(status.summaryText)
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .accessibilityIdentifier("agent.recoveryNeedsAttention.bulkSummary")
+                if status.isRunning {
+                    Button("Stop") { agentModeVM.cancelRecoveryBulkDismiss() }
+                        .controlSize(.small)
+                        .disabled(status.cancelRequested)
+                        .accessibilityIdentifier("agent.recoveryNeedsAttention.bulkCancel")
+                }
+            }
         }
     }
 }
@@ -107,22 +182,43 @@ extension AgentRecoveryNeedsAttentionSheet {
         .padding(8)
         .background(
             RoundedRectangle(cornerRadius: 8, style: .continuous)
-                .fill(Color.orange.opacity(entry.isDismissed ? 0.04 : 0.10))
+                .fill(Color.orange.opacity(entry.isHidden ? 0.04 : 0.10))
         )
-        .opacity(entry.isDismissed ? 0.7 : 1)
+        .opacity(entry.isHidden ? 0.7 : 1)
     }
 
-    /// A section header's count: its undismissed rows (dismissed ones are listed only while "Show
-    /// dismissed" is on and are never counted).
+    /// A section header's count: its rows that are neither dismissed nor cleared (those are listed
+    /// only while "Show dismissed and cleared" is on and are never counted).
     static func headerCount(_ rows: [AgentRecoveryNeedsAttentionRow]) -> Int {
-        rows.count { !$0.isDismissed }
+        rows.count { !$0.isHidden }
+    }
+
+    /// Names how many of the confirmed cards are in other workspaces (the bulk covers every
+    /// workspace's cards).
+    static func needsActionConfirmationTitle(eligible: Int, otherWorkspaces: Int = 0) -> String {
+        let cards = eligible == 1 ? "1 card that needs action" : "\(eligible) cards that need action"
+        let scope = switch otherWorkspaces {
+        case 0: ""
+        case 1: " (1 in another workspace)"
+        default: " (\(otherWorkspaces) in other workspaces)"
+        }
+        return "Dismiss \(cards)\(scope)?"
     }
 
     static func label(for entry: AgentRecoveryNeedsAttentionRow) -> String? {
         var parts: [String] = []
         if entry.isDismissed { parts.append("Dismissed") }
+        if let clear = entry.automaticClear { parts.append(clearedLabel(clear)) }
         if entry.isOtherWorkspace { parts.append("Another workspace") }
         return parts.isEmpty ? nil : parts.joined(separator: " · ")
+    }
+
+    static func clearedLabel(_ clear: AgentRecoveryCatalogAutomaticClear) -> String {
+        switch clear {
+        case .sessionContinued: "Cleared: session continued"
+        case .conversationCleared: "Cleared: conversation cleared"
+        case .resolved: "Cleared: resolved"
+        }
     }
 }
 

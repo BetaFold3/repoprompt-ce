@@ -4,7 +4,7 @@ import SwiftUI
 /// App-wide entry point of the Needs Attention sheet (lossless restart Phase 2): a View-menu
 /// command that works from any window, with every tab or the session sidebar closed, and with no
 /// window open at all. It is always enabled, even when nothing is undismissed, so dismissed items
-/// stay reviewable through "Show dismissed". The menu owns no state.
+/// stay reviewable through "Show dismissed and cleared". The menu owns no state.
 struct AgentRecoveryNeedsAttentionCommands: Commands {
     /// Shared window tracker injected from the app.
     @ObservedObject var windowStatesManager: WindowStatesManager

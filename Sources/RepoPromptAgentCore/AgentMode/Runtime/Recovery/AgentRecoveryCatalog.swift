@@ -33,6 +33,19 @@ package enum AgentRecoveryCatalogAttention: Equatable {
     case informational
 }
 
+/// Step 8-attention-2 (O34): why an informational run card is cleared from ordinary presentation.
+/// Derived at projection time, never written: a cleared card stays in the catalog, is not counted
+/// or listed in Information, and is shown with its reason only under "Show dismissed and cleared".
+/// No age-based expiry.
+package enum AgentRecoveryCatalogAutomaticClear: Equatable {
+    /// A recovery action on the card sent, or proved its turn finished (`resolvedByAction`).
+    case resolved
+    /// The conversation was cleared after the run (its reset generation is older than current).
+    case conversationCleared
+    /// A later run attempt exists in the run's own conversation generation.
+    case sessionContinued
+}
+
 /// Shared progress or failure of one item's action (the same on every surface).
 package enum AgentRecoveryCatalogActionState: Equatable {
     case working
@@ -152,6 +165,30 @@ package struct AgentRecoveryCatalogItem: Equatable, Identifiable {
     package var isOpenNeedsAction: Bool {
         attention == .needsAction && !isDismissed
     }
+
+    /// Why the card is cleared from ordinary presentation (derived, never stored). Only an
+    /// informational run card can be cleared: a needs-action card (an unfinished action, a hold, an
+    /// unsent continuation) never is.
+    package var automaticClear: AgentRecoveryCatalogAutomaticClear? {
+        guard attention == .informational else { return nil }
+        switch payload {
+        case .turn, .outcomeTurn, .recoveryOnlyRun:
+            return actionFacts.automaticClear
+        case .workspaceFailure, .nonactionable, .duplicateDestination, .noDestination,
+             .crashHold, .scheduleTransfer, .intent, .question, .editProposal,
+             .heldDraft, .closedSessionDraft,
+             .composerRestoreFailed, .unsavedPredecessor, .composerWriteFailed, .ownerlessDraft,
+             .composerPreparationFailed, .questionSaveFailed,
+             .scheduleNeedsConfirmation, .scheduleIndexUnavailable,
+             .survivingRuntime, .runtimeOwnershipUnknown:
+            return nil
+        }
+    }
+
+    /// Hidden from the Needs Attention sections unless "Show dismissed and cleared" is on.
+    package var isHidden: Bool {
+        isDismissed || automaticClear != nil
+    }
 }
 
 /// What the current record says about explicit recovery actions on one card.
@@ -168,6 +205,10 @@ package struct AgentRecoveryCatalogActionFacts: Equatable {
     /// Cleared only by a saved intent carrying that text or a later action that resolves the card;
     /// a later textless Reconcile that does not resolve it never clears it.
     package var hasUnsentContinuation = false
+    /// Run cards only: the projection-time clearing rule that matched
+    /// (`AgentRecoveryCatalogProjection.automaticClear`). Applied only while the card is
+    /// informational (`AgentRecoveryCatalogItem.automaticClear`).
+    package var automaticClear: AgentRecoveryCatalogAutomaticClear?
     /// The run card's attempt verifiably never delivered its input (A P1-06): its saved intent
     /// is the route, never a generic continuation.
     package var runNeverHandedOff = false
@@ -182,6 +223,7 @@ package struct AgentRecoveryCatalogActionFacts: Equatable {
         resolvedByAction: Bool = false,
         hasUnfinishedAction: Bool = false,
         hasUnsentContinuation: Bool = false,
+        automaticClear: AgentRecoveryCatalogAutomaticClear? = nil,
         runNeverHandedOff: Bool = false,
         runTranscriptResetGeneration: UInt64? = nil,
         delegatedChildLinks: [AgentRecoveryDelegatedChildLink] = []
@@ -189,6 +231,7 @@ package struct AgentRecoveryCatalogActionFacts: Equatable {
         self.resolvedByAction = resolvedByAction
         self.hasUnfinishedAction = hasUnfinishedAction
         self.hasUnsentContinuation = hasUnsentContinuation
+        self.automaticClear = automaticClear
         self.runNeverHandedOff = runNeverHandedOff
         self.runTranscriptResetGeneration = runTranscriptResetGeneration
         self.delegatedChildLinks = delegatedChildLinks
@@ -214,9 +257,10 @@ package struct AgentRecoveryCatalog: Equatable {
         items.first { $0.id == id }
     }
 
-    /// The exact items of the Needs Attention sheet, in snapshot order.
+    /// The exact items of the Needs Attention sheet, in snapshot order. `includeDismissed` also
+    /// includes automatically cleared run notes ("Show dismissed and cleared").
     package func needsAttentionItems(includeDismissed: Bool) -> [AgentRecoveryCatalogItem] {
-        includeDismissed ? items : items.filter { !$0.isDismissed }
+        includeDismissed ? items : items.filter { !$0.isHidden }
     }
 
     /// Needs-action, not-dismissed items (the sidebar's Needs Attention badge).
@@ -287,6 +331,41 @@ package enum AgentRecoveryCatalogProjection {
              .survivingRuntime, .runtimeOwnershipUnknown:
             .needsAction
         }
+    }
+
+    /// Step 8-attention-2: projection-only clearing of a run card (no writes; the caller applies it
+    /// only while the card is informational). First match wins:
+    /// 1. a recovery action resolved the card (`resolvedByAction`) → `.resolved`;
+    /// 2. the run's reset generation is older than the session's current one → `.conversationCleared`;
+    /// 3. a later attempt of the same reset generation follows it in `runAttempts` →
+    ///    `.sessionContinued` (a later attempt that verifiably never delivered its input continues
+    ///    nothing and is ignored; review B F4).
+    /// A run with delegated-child links is never cleared: its card is their only discovery pointer
+    /// (review B F4).
+    /// Relies on `runAttempts` being in first-record order: `AgentRecoveryStore.ensureRunAttempt` is
+    /// its only producer, appends a new attempt at the end, updates existing ones in place, and
+    /// nothing reorders or removes them (the codec keeps array order). A card without a run attempt
+    /// (a legacy turn keyed by its turn ID, or an attempt missing from the record) is cleared only by
+    /// rule 1. No age-based expiry.
+    package nonisolated static func automaticClear(
+        resolvedByAction: Bool,
+        runAttemptID: UUID?,
+        runAttempts: [AgentRecoveryRunAttempt],
+        currentGeneration: UInt64,
+        hasDelegatedChildren: Bool = false,
+        isVerifiedNeverHandedOff: (UUID) -> Bool = { _ in false }
+    ) -> AgentRecoveryCatalogAutomaticClear? {
+        if hasDelegatedChildren { return nil }
+        if resolvedByAction { return .resolved }
+        guard let runAttemptID, let index = runAttempts.firstIndex(where: { $0.runAttemptID == runAttemptID }) else { return nil }
+        let generation = runAttempts[index].transcriptResetGeneration
+        if generation < currentGeneration { return .conversationCleared }
+        if runAttempts[(index + 1)...].contains(where: {
+            $0.transcriptResetGeneration == generation && !isVerifiedNeverHandedOff($0.runAttemptID)
+        }) {
+            return .sessionContinued
+        }
+        return nil
     }
 
     /// Row identity of a surviving runtime.
@@ -385,6 +464,17 @@ package enum AgentRecoveryCatalogProjection {
                     facts.runNeverHandedOff = record.isVerifiedNeverHandedOff(runAttemptID: runAttemptID)
                     facts.runTranscriptResetGeneration = runAttemptID.flatMap { record.runAttempt(id: $0) }?.transcriptResetGeneration
                     facts.delegatedChildLinks = runAttemptID.map { record.delegatedChildLinks(parentRunAttemptID: $0) } ?? []
+                    // The session's current generation, as its held input is judged (`addIntents`).
+                    let currentGeneration = sessionID.flatMap { coordinator.lane(for: $0)?.binding.transcriptResetGeneration }
+                        ?? max(sessionID.flatMap { bindings[$0]?.transcriptResetGeneration } ?? 0, record.transcriptResetGeneration)
+                    facts.automaticClear = AgentRecoveryCatalogProjection.automaticClear(
+                        resolvedByAction: facts.resolvedByAction,
+                        runAttemptID: runAttemptID,
+                        runAttempts: record.runAttempts,
+                        currentGeneration: currentGeneration,
+                        hasDelegatedChildren: !facts.delegatedChildLinks.isEmpty,
+                        isVerifiedNeverHandedOff: { record.isVerifiedNeverHandedOff(runAttemptID: $0) }
+                    )
                 }
             }
             items.append(AgentRecoveryCatalogItem(

@@ -519,6 +519,10 @@ package final class AgentRecoveryCoordinator {
     /// Shared, app-wide action state per catalog item (every surface shows the same progress or
     /// error). An item disappears only when its backing state changes, never by a local mark.
     package private(set) var catalogActionStates: [String: AgentRecoveryCatalogActionState] = [:]
+    /// Step 8-attention-2: the app-wide bulk Dismiss (one at a time; transient, never persisted).
+    /// The running one, or the last finished one's summary until the next starts
+    /// (`AgentRecoveryCoordinator+BulkDismiss.swift`).
+    package internal(set) var bulkDismiss: AgentRecoveryBulkDismissStatus?
     /// Serial tail of launch-mark writes (`shutdownInProgress`, `cleanExit`, corrections).
     private var launchMarkTail: Task<Void, Never>?
     /// Spec R6 runtime ownership (see `AgentRecoveryCoordinator+RuntimeOwnership.swift`). `nil`
@@ -759,7 +763,7 @@ package final class AgentRecoveryCoordinator {
         postCatalogChange()
     }
 
-    private func postCatalogChange() {
+    func postCatalogChange() {
         guard !catalogChangePostScheduled else { return }
         catalogChangePostScheduled = true
         Task { @MainActor [weak self] in

@@ -1419,6 +1419,126 @@ final class AgentRecoveryStartupCompositionTests: XCTestCase {
         XCTAssertTrue(windowB.sessions.isEmpty, "Listing it in another window hydrates nothing there")
     }
 
+    /// Step 8-attention-2: a needs-action bulk Dismiss from the sheet dismisses the crash hold and the
+    /// held input, skips the unreadable status item (no Dismiss), and lifts nothing: the dismissed
+    /// crash hold still blocks the session and the new-session gate, its paused indicator still
+    /// shows, and the saved input is neither sent nor withdrawn.
+    func testNeedsActionBulkDismissKeepsTheCrashHoldBlockingAndItsPausedIndicator() async throws {
+        let fixture = try makeFixture()
+        let tabID = UUID()
+
+        // Earlier launch (no clean exit): a run in flight with its input (a crash hold), and a
+        // session whose record is unreadable.
+        let earlier = makeLaunch(fixture)
+        let earlierStore = earlier.store
+        let held = try await makeSession(earlier, fixture: fixture, composeTabID: tabID)
+        let heldOwnership = Support.ownership(sessionID: held.session.id)
+        let heldGate = try earlier.service.recoveryLifecycleGate(for: held.persistenceState)
+        let heldBinding = heldGate.binding
+        let submission = Support.submission("in flight at crash")
+        try await heldGate.performRecoveryTransaction {
+            _ = try await earlierStore.ensureRunAttempt(
+                binding: heldBinding,
+                expectedRevision: earlierStore.currentRevision(sessionID: heldBinding.sessionID),
+                ownership: heldOwnership,
+                processRunID: nil,
+                transcriptTurnID: nil
+            )
+            _ = try await earlierStore.commitDispatchingIntent(
+                binding: heldBinding,
+                expectedRevision: earlierStore.currentRevision(sessionID: heldBinding.sessionID),
+                submission: submission,
+                attempt: AgentRecoveryAttemptStart(attemptID: UUID(), runAttemptID: heldOwnership.attemptID),
+                consumption: nil
+            )
+        }
+        let unreadable = try await makeSession(earlier, fixture: fixture)
+        try await commitQueued(earlier, unreadable, Support.submission("unreadable input"))
+        try Data("{ not a recovery record".utf8).write(to: earlier.store.recordFileURL(sessionID: unreadable.session.id), options: .atomic)
+
+        let now = makeLaunch(fixture)
+        let scheduler = AgentScheduledSendCoordinator(startupAdmission: .awaitingRecovery)
+        let destination = fixture.destination
+        let composition = AgentRecoveryAppComposition(
+            store: now.store,
+            dataService: now.service,
+            scheduler: scheduler,
+            loadInventory: { AgentRecoveryWorkspaceInventory(workspaces: [destination]) }
+        )
+        let viewModel = makeViewModel(windowID: 4881, fixture: fixture)
+        composition.install(into: viewModel)
+        await composition.startupCompletion?.value
+        let coordinator = try XCTUnwrap(composition.coordinator)
+        viewModel.test_establishPersistenceWorkspace(fixture.workspace)
+        viewModel.test_setCurrentTabIDOverride(tabID)
+        let session = try await viewModel.ensureSessionReady(tabID: tabID)
+        if session.activeAgentSessionID != held.session.id {
+            XCTAssertNotNil(viewModel.test_installPersistentSessionBinding(sessionID: held.session.id, on: session))
+            _ = await viewModel.test_hydrateBoundSession(tabID: tabID)
+        }
+        let laneClaimed = await Support.eventually { session.recoveryLane != nil }
+        XCTAssertTrue(laneClaimed)
+        let lane = try XCTUnwrap(session.recoveryLane)
+
+        let crashID = "crash-\(held.session.id.uuidString)"
+        let statusID = "status-\(unreadable.session.id.uuidString)"
+        let intentRowID = "intent-\(held.session.id.uuidString)-\(submission.intentID.uuidString)"
+        let listed = await Support.eventually {
+            [crashID, statusID, intentRowID].allSatisfy { coordinator.catalog.item(id: $0) != nil }
+        }
+        XCTAssertTrue(listed, "\(coordinator.catalog.items.map(\.id))")
+        let needsActionRows = viewModel.recoveryNeedsAttentionRows(includeDismissed: false, activeSession: session)
+            .filter { $0.attention == .needsAction }
+        XCTAssertTrue(Set([crashID, statusID, intentRowID]).isSubset(of: Set(needsActionRows.map(\.id))), "\(needsActionRows.map(\.id))")
+        let eligible = viewModel.recoveryBulkDismissEligibleCount(needsActionRows)
+        XCTAssertEqual(eligible, needsActionRows.count { $0.item?.acknowledgement != nil })
+        let deliveryBefore = await deliveryState(now.store, held, submission.intentID)
+
+        let task = try XCTUnwrap(viewModel.startRecoveryBulkDismiss(section: .needsAction, rows: needsActionRows))
+        let result = await task.value
+        let status = try XCTUnwrap(result)
+        XCTAssertEqual(status.section, .needsAction)
+        XCTAssertEqual(status.dismissed, eligible, status.summaryText)
+        XCTAssertEqual(status.failed, 0, status.summaryText)
+        XCTAssertTrue(status.skipped.contains(AgentRecoveryBulkDismissSkip(itemID: statusID, reason: .noDismiss)))
+        XCTAssertEqual(viewModel.recoveryBulkDismissStatus, status)
+        XCTAssertFalse(viewModel.isRecoveryBulkDismissRunning)
+        XCTAssertEqual(coordinator.catalog.item(id: crashID)?.isDismissed, true)
+        XCTAssertEqual(coordinator.catalog.item(id: intentRowID)?.isDismissed, true)
+        XCTAssertEqual(coordinator.catalog.item(id: statusID)?.isDismissed, false)
+
+        // Dismiss lifts nothing.
+        XCTAssertEqual(coordinator.catalog.blockers[held.session.id], .crashHold)
+        XCTAssertNotNil(coordinator.blockingCrashHold(for: lane.binding), "sending stays paused")
+        XCTAssertTrue(
+            viewModel.scheduledSendRecoveryBlocker(inWorkspace: fixture.workspace.id, excluding: UUID())?
+                .interruptedSessionIDs.contains(held.session.id) == true,
+            "the new-session gate still names the session"
+        )
+        let pausedRowID = "\(AgentModeViewModel.recoveryListPausedRowPrefix)\(held.session.id.uuidString)"
+        let banner = try XCTUnwrap(viewModel.recoveryListProps(forActiveSession: session))
+        let paused = try XCTUnwrap(banner.rows.first { $0.id == pausedRowID }, "\(banner.rows.map(\.id))")
+        XCTAssertTrue(paused.actions.contains(.confirmStopped))
+        let deliveryAfter = await deliveryState(now.store, held, submission.intentID)
+        XCTAssertEqual(deliveryAfter, deliveryBefore, "the saved input is neither sent nor withdrawn")
+        let acknowledgement = await now.store.read(sessionID: held.session.id).record?.crashHoldAcknowledgement
+        XCTAssertNil(acknowledgement, "Dismiss is not It stopped")
+
+        // Review B F2: with "Show dismissed and cleared" on, the dismissed rows are listed but never
+        // captured or counted: a bulk acts on exactly what the section header counts.
+        let toggledOn = viewModel.recoveryNeedsAttentionRows(includeDismissed: true, activeSession: session)
+            .filter { $0.attention == .needsAction }
+        XCTAssertTrue(Set([crashID, intentRowID]).isSubset(of: Set(toggledOn.map(\.id))), "\(toggledOn.map(\.id))")
+        let request = try XCTUnwrap(viewModel.recoveryBulkDismissRequest(section: .needsAction, rows: toggledOn))
+        XCTAssertEqual(request.capture.total, AgentRecoveryNeedsAttentionSheet.headerCount(toggledOn))
+        XCTAssertEqual(request.eligibleCount, 0)
+        XCTAssertEqual(viewModel.recoveryBulkDismissEligibleCount(toggledOn), 0)
+        XCTAssertFalse(request.capture.skipped.contains { [crashID, intentRowID].contains($0.itemID) })
+        // Closing the sheet clears the finished summary.
+        viewModel.clearRecoveryBulkDismissSummary()
+        XCTAssertNil(viewModel.recoveryBulkDismissStatus)
+    }
+
     // MARK: - Fixtures
 
     private func makeFixture() throws -> Fixture {

@@ -67,7 +67,7 @@ extension AgentModeViewModel {
     }
 
     /// Rows of the app-wide Needs Attention sheet: every catalog item in snapshot order (dismissed
-    /// ones only when asked), formatted for this window.
+    /// and automatically cleared ones only when asked), formatted for this window.
     func recoveryNeedsAttentionRows(includeDismissed: Bool, activeSession: AgentTabSession?) -> [AgentRecoveryNeedsAttentionRow] {
         guard let coordinator = recoveryCoordinator, coordinator.startupState == .ready else { return [] }
         let workspaceID = persistenceWorkspace?.id
@@ -76,7 +76,9 @@ extension AgentModeViewModel {
                 row: recoveryListRow(for: item, coordinator: coordinator, activeSession: activeSession),
                 isDismissed: item.isDismissed,
                 isOtherWorkspace: item.workspaceID != nil && item.workspaceID != workspaceID,
-                attention: item.attention
+                attention: item.attention,
+                automaticClear: item.automaticClear,
+                item: item
             )
         }
     }
@@ -158,7 +160,8 @@ extension AgentModeViewModel {
             "This workspace"
         }
         let openAction: [AgentRecoveryListRowProps.Action] = isActive || item.composeTabID == nil ? [] : [.open]
-        let dismiss: [AgentRecoveryListRowProps.Action] = item.acknowledgement != nil && !item.isDismissed ? [.dismiss] : []
+        // The same rule as bulk Dismiss eligibility (`AgentRecoveryCatalogItem.offersDismiss`).
+        let dismiss: [AgentRecoveryListRowProps.Action] = item.offersDismiss ? [.dismiss] : []
         let liveIsEmpty: Bool = {
             guard let tabSession, let lane = tabSession.recoveryLane else { return false }
             return recoveryInputContent(for: tabSession, store: lane.store, sessionID: lane.sessionID)?.isEmpty ?? false

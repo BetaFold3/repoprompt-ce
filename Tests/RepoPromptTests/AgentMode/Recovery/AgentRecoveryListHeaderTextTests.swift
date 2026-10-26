@@ -97,6 +97,45 @@ final class AgentRecoveryListHeaderTextTests: XCTestCase {
         XCTAssertEqual(AgentRecoveryNeedsAttentionSheet.headerCount([]), 0)
     }
 
+    /// Step 8-attention-2: automatically cleared notes are not counted and, when listed under "Show
+    /// dismissed and cleared", are labelled with why they were cleared.
+    func testClearedNotesAreNotCountedAndAreLabelledWithTheirReason() {
+        func entry(_ id: String, clear: AgentRecoveryCatalogAutomaticClear?, dismissed: Bool = false) -> AgentRecoveryNeedsAttentionRow {
+            AgentRecoveryNeedsAttentionRow(row: row(id), isDismissed: dismissed, isOtherWorkspace: false, attention: .informational, automaticClear: clear)
+        }
+        let rows = [
+            entry("a", clear: nil),
+            entry("b", clear: .sessionContinued),
+            entry("c", clear: .conversationCleared),
+            entry("d", clear: .resolved, dismissed: true)
+        ]
+        XCTAssertEqual(AgentRecoveryNeedsAttentionSheet.headerCount(rows), 1)
+        XCTAssertEqual(rows.map(\.isHidden), [false, true, true, true])
+        XCTAssertNil(AgentRecoveryNeedsAttentionSheet.label(for: rows[0]))
+        XCTAssertEqual(AgentRecoveryNeedsAttentionSheet.label(for: rows[1]), "Cleared: session continued")
+        XCTAssertEqual(AgentRecoveryNeedsAttentionSheet.label(for: rows[2]), "Cleared: conversation cleared")
+        XCTAssertEqual(AgentRecoveryNeedsAttentionSheet.label(for: rows[3]), "Dismissed · Cleared: resolved")
+    }
+
+    /// The needs-action bulk Dismiss confirmation states the count, how many are in other
+    /// workspaces, and that Dismiss only hides.
+    func testNeedsActionBulkDismissConfirmationText() {
+        XCTAssertEqual(AgentRecoveryNeedsAttentionSheet.needsActionConfirmationTitle(eligible: 1), "Dismiss 1 card that needs action?")
+        XCTAssertEqual(AgentRecoveryNeedsAttentionSheet.needsActionConfirmationTitle(eligible: 3), "Dismiss 3 cards that need action?")
+        XCTAssertEqual(
+            AgentRecoveryNeedsAttentionSheet.needsActionConfirmationTitle(eligible: 5, otherWorkspaces: 2),
+            "Dismiss 5 cards that need action (2 in other workspaces)?"
+        )
+        XCTAssertEqual(
+            AgentRecoveryNeedsAttentionSheet.needsActionConfirmationTitle(eligible: 1, otherWorkspaces: 1),
+            "Dismiss 1 card that needs action (1 in another workspace)?"
+        )
+        XCTAssertEqual(
+            AgentModeViewModel.recoveryBulkDismissNeedsActionWarning,
+            "Dismiss only hides these cards. Saved messages, questions, drafts and schedules stay saved and are never sent. Sending stays paused for crash holds until you confirm they stopped."
+        )
+    }
+
     func testLoadingAndFailedStatusesAreUnchanged() {
         XCTAssertEqual(
             props(rows: 0, other: 3, status: .loading).headerText,

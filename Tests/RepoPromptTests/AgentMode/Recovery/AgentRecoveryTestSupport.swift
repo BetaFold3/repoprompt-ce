@@ -98,6 +98,7 @@ final class RecoveryStoreWriteFailureSwitch: @unchecked Sendable {
     private let lock = NSLock()
     private var failWrites = false
     private var failRemovals = false
+    private var failWritePathFragment: String?
 
     var shouldFailWrites: Bool {
         get { lock.withLock { failWrites } }
@@ -109,10 +110,19 @@ final class RecoveryStoreWriteFailureSwitch: @unchecked Sendable {
         set { lock.withLock { failRemovals = newValue } }
     }
 
+    /// Writes whose path contains this fragment fail (for example one session's record).
+    var failingWritePathFragment: String? {
+        get { lock.withLock { failWritePathFragment } }
+        set { lock.withLock { failWritePathFragment = newValue } }
+    }
+
     func fileOperations() -> AgentRecoveryStore.FileOperations {
         AgentRecoveryStore.FileOperations(
             writeAtomically: { [self] data, url in
                 if shouldFailWrites {
+                    throw CocoaError(.fileWriteUnknown)
+                }
+                if let fragment = failingWritePathFragment, url.path.contains(fragment) {
                     throw CocoaError(.fileWriteUnknown)
                 }
                 try data.write(to: url, options: .atomic)
