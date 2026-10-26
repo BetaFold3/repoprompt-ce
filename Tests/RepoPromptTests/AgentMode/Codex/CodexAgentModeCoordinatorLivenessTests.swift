@@ -1489,6 +1489,116 @@ final class CodexAgentModeCoordinatorLivenessTests: XCTestCase {
         XCTAssertFalse(bashItem.text.contains("inactive first chunk"))
     }
 
+    /// Restart Step 7-minor: a command killed by an app quit is saved as a running row. After
+    /// relaunch no Codex app-server is attached, so its vanished process means the command was
+    /// interrupted; the liveness poll must not settle it as a success.
+    func testRestoredRunningBashRowWithVanishedProcessSettlesAsInterruptedWithoutLiveProvider() async throws {
+        let controller = LivenessFakeCodexController(snapshot: .active(activeFlags: []))
+        let viewModel = makeViewModel(controller: controller)
+        let (session, row) = try restoredSessionWithRunningBashRow(in: viewModel)
+        XCTAssertNil(session.codexController)
+
+        let settled = try await settledBashRow(id: row.id, in: session)
+        try assertInterruptedWithoutInventedExitCode(settled)
+    }
+
+    /// Review MINOR-01 / M1: a controller attached after the restore does not own the restored
+    /// command, so its vanished process still settles as interrupted, never as a success.
+    func testRestoredRunningBashRowStaysUnownedWhenControllerAttachesAfterRebuild() async throws {
+        let controller = LivenessFakeCodexController(snapshot: .active(activeFlags: []))
+        let viewModel = makeViewModel(controller: controller)
+        let (session, row) = try restoredSessionWithRunningBashRow(in: viewModel)
+        XCTAssertFalse(session.bashLiveExecutionByKey.isEmpty, "restore re-arms the saved running row")
+        session.codexController = controller
+
+        let settled = try await settledBashRow(id: row.id, in: session)
+        try assertInterruptedWithoutInventedExitCode(settled)
+    }
+
+    /// Control: an execution driven by the attached controller's events keeps its provisional
+    /// `finished` settlement when its process vanishes (the real completion may still arrive).
+    func testLiveProviderBashExecutionWithVanishedProcessStaysProvisionallyFinished() async throws {
+        let controller = LivenessFakeCodexController(snapshot: .active(activeFlags: []))
+        let viewModel = makeViewModel(controller: controller)
+        let session = try XCTUnwrap(preparedCodexSession(in: viewModel, controller: controller))
+        let rowID = try await startLiveBashExecution(
+            processID: exitedProcessID(),
+            invocationID: UUID(),
+            viewModel: viewModel,
+            session: session
+        )
+
+        let settled = try await settledBashRow(id: rowID, in: session)
+        let persisted = try XCTUnwrap(AgentToolResultPersistencePolicy.sanitizedToolResult(for: settled))
+        XCTAssertEqual(persisted.persistedStatusWord, "success")
+    }
+
+    /// Review MINOR-03 / M2: an authoritative completion recorded before the poll's grace
+    /// expires is final. It removes the live execution, so the poll has nothing left to settle.
+    func testAuthoritativeBashCompletionBeforePollSurvivesLivenessPoll() async throws {
+        let controller = LivenessFakeCodexController(snapshot: .active(activeFlags: []))
+        let viewModel = makeViewModel(controller: controller)
+        let session = try XCTUnwrap(preparedCodexSession(in: viewModel, controller: controller))
+        let processID = try exitedProcessID()
+        let invocationID = UUID()
+        let rowID = try await startLiveBashExecution(
+            processID: processID,
+            invocationID: invocationID,
+            viewModel: viewModel,
+            session: session
+        )
+        await viewModel.test_codexCoordinator.test_handleCodexNativeEvent(
+            .toolResult(
+                name: "bash",
+                invocationID: invocationID,
+                argsJSON: Self.liveBashArgsJSON,
+                resultJSON: #"{"type":"commandExecution","status":"failed","processId":""# + processID
+                    + #"","exitCode":2,"aggregatedOutput":"boom"}"#,
+                isError: true
+            ),
+            session: session
+        )
+        XCTAssertTrue(session.bashLiveExecutionByKey.isEmpty, "no live execution is left for the poll")
+
+        try assertFailedWithExitCode2(rowID: rowID, in: session)
+    }
+
+    /// Review R1-03: a real completion that arrives after the poll settled an unowned execution
+    /// as interrupted replaces that settlement.
+    func testAuthoritativeBashCompletionAfterInterruptedSettlementReplacesIt() async throws {
+        let controller = LivenessFakeCodexController(snapshot: .active(activeFlags: []))
+        let viewModel = makeViewModel(controller: controller)
+        let session = try XCTUnwrap(preparedCodexSession(in: viewModel, controller: controller))
+        let processID = try exitedProcessID()
+        let invocationID = UUID()
+        let rowID = try await startLiveBashExecution(
+            processID: processID,
+            invocationID: invocationID,
+            viewModel: viewModel,
+            session: session
+        )
+        // A replacement controller does not own the execution, so the poll settles it as interrupted.
+        session.codexController = LivenessFakeCodexController(snapshot: .active(activeFlags: []))
+        let interrupted = try await settledBashRow(id: rowID, in: session)
+        try assertInterruptedWithoutInventedExitCode(interrupted)
+
+        await viewModel.test_codexCoordinator.test_handleCodexNativeEvent(
+            .toolResult(
+                name: "bash",
+                invocationID: invocationID,
+                argsJSON: Self.liveBashArgsJSON,
+                resultJSON: #"{"type":"commandExecution","status":"failed","processId":""# + processID
+                    + #"","exitCode":2,"aggregatedOutput":"boom"}"#,
+                isError: true
+            ),
+            session: session
+        )
+
+        XCTAssertTrue(session.bashLiveExecutionByKey.isEmpty)
+        XCTAssertEqual(session.items.count(where: { $0.toolName == "bash" }), 1, "the settled row is updated in place")
+        try assertFailedWithExitCode2(rowID: rowID, in: session)
+    }
+
     func testStaleCompletionBeforeObservedStartPreservesPendingTurnThenMatchingTurnFinalizes() async {
         let controller = LivenessFakeCodexController(snapshot: .active(activeFlags: []))
         let viewModel = makeViewModel(controller: controller)
@@ -2376,6 +2486,131 @@ final class CodexAgentModeCoordinatorLivenessTests: XCTestCase {
                 )
             ]
         )
+    }
+
+    private static let liveBashArgsJSON = #"{"command":"printf probe"}"#
+
+    /// A Codex session restored from a saved session whose last command row is still running.
+    private func restoredSessionWithRunningBashRow(
+        in viewModel: AgentModeViewModel
+    ) throws -> (AgentTabSession, AgentChatItem) {
+        let session = try XCTUnwrap(viewModel.session(for: UUID(), createIfNeeded: true))
+        session.selectedAgent = .codexExec
+        let row = try runningBashRow(processID: exitedProcessID())
+        session.appendItem(row)
+        viewModel.test_codexCoordinator.restoreCodexMetadata(
+            from: AgentSession(id: UUID(), name: "Restored"),
+            session: session
+        )
+        return (session, row)
+    }
+
+    /// Starts a bash execution through the attached controller's events; returns its row ID.
+    private func startLiveBashExecution(
+        processID: String,
+        invocationID: UUID,
+        viewModel: AgentModeViewModel,
+        session: AgentTabSession
+    ) async throws -> UUID {
+        await viewModel.test_codexCoordinator.test_handleCodexNativeEvent(
+            .toolCall(name: "bash", invocationID: invocationID, argsJSON: Self.liveBashArgsJSON),
+            session: session
+        )
+        await viewModel.test_codexCoordinator.test_handleCodexNativeEvent(
+            .toolResult(
+                name: "bash",
+                invocationID: invocationID,
+                argsJSON: Self.liveBashArgsJSON,
+                resultJSON: #"{"type":"commandExecution","status":"inProgress","processId":""# + processID + #""}"#,
+                isError: false
+            ),
+            session: session
+        )
+        let execution = try XCTUnwrap(session.bashLiveExecutionByKey.values.first)
+        XCTAssertEqual(execution.ownerControllerGeneration, session.codexControllerGeneration)
+        return execution.transcriptItemID
+    }
+
+    private func assertFailedWithExitCode2(
+        rowID: UUID,
+        in session: AgentTabSession,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) throws {
+        let row = try XCTUnwrap(session.items.first { $0.id == rowID }, file: file, line: line)
+        let metadata = BashToolResultParser.parseLivenessMetadata(raw: row.toolResultJSON)
+        XCTAssertEqual(metadata.statusWord, "failed", file: file, line: line)
+        XCTAssertEqual(metadata.exitCode, 2, file: file, line: line)
+        let persisted = try XCTUnwrap(
+            AgentToolResultPersistencePolicy.sanitizedToolResult(for: row),
+            file: file,
+            line: line
+        )
+        XCTAssertEqual(persisted.persistedStatusWord, "failed", file: file, line: line)
+        XCTAssertEqual(persisted.exitCode, 2, file: file, line: line)
+    }
+
+    /// The unknown outcome is settled as `interrupted`, which the save stores as its normalized
+    /// word `cancelled`, and carries no exit code it never observed.
+    private func assertInterruptedWithoutInventedExitCode(
+        _ settled: AgentChatItem,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) throws {
+        let object = try XCTUnwrap(ToolRawJSON.object(from: settled.toolResultJSON), file: file, line: line)
+        XCTAssertEqual(
+            AgentTranscriptToolStatusSemantics.normalizedStatusWord(ToolRawJSON.string(object, key: "status")),
+            "cancelled",
+            file: file,
+            line: line
+        )
+        XCTAssertNil(ToolRawJSON.int(object, key: "exitCode"), file: file, line: line)
+        // Bash rows carry no error flag once settled (`persistedToolIsError`); never an error.
+        XCTAssertNotEqual(settled.toolIsError, true, file: file, line: line)
+        let persisted = try XCTUnwrap(
+            AgentToolResultPersistencePolicy.sanitizedToolResult(for: settled),
+            file: file,
+            line: line
+        )
+        XCTAssertEqual(persisted.persistedStatusWord, "cancelled", file: file, line: line)
+        XCTAssertEqual(persisted.transcriptStatus, .cancelled, file: file, line: line)
+    }
+
+    /// A saved running Codex command row, older than the liveness poll's quiet-signal grace.
+    private func runningBashRow(processID: String) -> AgentChatItem {
+        let resultJSON = #"{"type":"commandExecution","status":"running","processId":""# + processID + #""}"#
+        return AgentChatItem(
+            timestamp: Date().addingTimeInterval(-60),
+            kind: .toolResult,
+            text: resultJSON,
+            toolName: "bash",
+            toolInvocationID: UUID(),
+            toolArgsJSON: #"{"command":"while true; do sleep 1; done"}"#,
+            toolResultJSON: resultJSON,
+            toolIsError: false
+        )
+    }
+
+    /// The PID of a process that already exited and was reaped.
+    private func exitedProcessID() throws -> String {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/true")
+        try process.run()
+        process.waitUntilExit()
+        return String(process.processIdentifier)
+    }
+
+    /// Waits past the poll's unobserved-process grace (1.2 s) for the row to stop running.
+    private func settledBashRow(id: UUID, in session: AgentTabSession) async throws -> AgentChatItem {
+        func row() -> AgentChatItem? {
+            session.items.first { $0.id == id }
+        }
+        try await waitUntil(timeout: 10) {
+            guard let item = row() else { return false }
+            return !BashToolResultParser.parseLivenessMetadata(raw: item.toolResultJSON).isRunning
+        }
+        XCTAssertTrue(session.bashLiveExecutionByKey.isEmpty)
+        return try XCTUnwrap(row())
     }
 
     private func waitUntil(

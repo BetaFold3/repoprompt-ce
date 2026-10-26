@@ -300,6 +300,9 @@ package struct AgentBashLiveExecutionState: Equatable {
     package var output: String?
     var isSummaryOnly: Bool
     var lastSignalAt: Date
+    /// `codexControllerGeneration` of the controller whose events drive this execution; `nil`
+    /// when it was rebuilt from saved rows with no owning controller (e.g. after relaunch).
+    var ownerControllerGeneration: UUID?
 
     var isRunning: Bool {
         guard let statusWord = statusWord?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),

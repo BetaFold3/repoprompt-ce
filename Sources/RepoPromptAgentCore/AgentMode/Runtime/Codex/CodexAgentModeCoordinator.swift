@@ -7784,7 +7784,8 @@ package final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObser
                     argsJSON: argsJSON,
                     processID: Self.extractProcessIDFromArgsJSON(argsJSON),
                     session: session,
-                    observedAt: eventTimestamp
+                    observedAt: eventTimestamp,
+                    claimsCurrentProvider: true
                 ) != nil
                 if didUpdate {
                     updateBashLivenessTaskState(for: session)
@@ -7859,7 +7860,8 @@ package final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObser
                         parsedResult: Self.parsedBashLivenessResult(metadata: parsedBashResult, argsJSON: argsJSON),
                         metadata: parsedBashResult,
                         session: session,
-                        observedAt: eventTimestamp
+                        observedAt: eventTimestamp,
+                        claimsCurrentProvider: true
                     )
                     let shouldMaterializeRunningOutput = canMaterializeRunningBashOutput(for: session)
                     let didMaterialize = shouldMaterializeRunningOutput
@@ -8620,7 +8622,8 @@ package final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObser
         metadata: BashToolResultParser.Metadata? = nil,
         session: AgentTabSession,
         observedAt: Date,
-        createAnchorIfNeeded: Bool = true
+        createAnchorIfNeeded: Bool = true,
+        claimsCurrentProvider: Bool
     ) -> AgentBashLiveExecutionState? {
         let fallbackSignature = Self.canonicalNativeToolFallbackSignature(toolName: toolName, argsJSON: argsJSON)
         let desiredKey = Self.bashExecutionKey(
@@ -8647,13 +8650,14 @@ package final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObser
                     exitCode: existing.state.exitCode,
                     output: existing.state.output,
                     isSummaryOnly: existing.state.isSummaryOnly,
-                    lastSignalAt: observedAt
+                    lastSignalAt: observedAt,
+                    ownerControllerGeneration: existing.state.ownerControllerGeneration
                 )
                 session.removeBashLiveExecution(forKey: existing.key)
                 session.setBashLiveExecution(migrated)
-                return migrated
+                return claimsCurrentProvider ? claimLiveBashExecution(migrated, session: session) : migrated
             }
-            return existing.state
+            return claimsCurrentProvider ? claimLiveBashExecution(existing.state, session: session) : existing.state
         }
         guard createAnchorIfNeeded else { return nil }
         var itemIndex: Int
@@ -8712,10 +8716,31 @@ package final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObser
             exitCode: livenessMetadata.exitCode,
             output: nil,
             isSummaryOnly: livenessMetadata.isSummaryOnly,
-            lastSignalAt: observedAt
+            lastSignalAt: observedAt,
+            ownerControllerGeneration: nil
         )
         session.setBashLiveExecution(state)
-        return state
+        return claimsCurrentProvider ? claimLiveBashExecution(state, session: session) : state
+    }
+
+    /// The generation of the attached controller, or `nil` when none is attached.
+    private func currentControllerGeneration(of session: AgentTabSession) -> UUID? {
+        session.codexController == nil ? nil : session.codexControllerGeneration
+    }
+
+    /// Records the attached controller as the owner of an execution its events now drive.
+    /// The only place ownership is claimed; the rebuild only carries existing owners across.
+    private func claimLiveBashExecution(
+        _ state: AgentBashLiveExecutionState,
+        session: AgentTabSession
+    ) -> AgentBashLiveExecutionState {
+        guard let generation = currentControllerGeneration(of: session),
+              state.ownerControllerGeneration != generation
+        else { return state }
+        var claimed = state
+        claimed.ownerControllerGeneration = generation
+        session.setBashLiveExecution(claimed)
+        return claimed
     }
 
     @discardableResult
@@ -8727,7 +8752,8 @@ package final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObser
         metadata: BashToolResultParser.Metadata? = nil,
         session: AgentTabSession,
         observedAt: Date,
-        createAnchorIfNeeded: Bool = true
+        createAnchorIfNeeded: Bool = true,
+        claimsCurrentProvider: Bool
     ) -> Bool {
         guard var state = ensureLiveBashExecutionState(
             toolName: toolName,
@@ -8737,7 +8763,8 @@ package final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObser
             metadata: metadata,
             session: session,
             observedAt: observedAt,
-            createAnchorIfNeeded: createAnchorIfNeeded
+            createAnchorIfNeeded: createAnchorIfNeeded,
+            claimsCurrentProvider: claimsCurrentProvider
         ) else {
             return false
         }
@@ -8819,13 +8846,14 @@ package final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObser
                 return .noChange
             }
         }
-        guard var state = existingLookup?.state ?? ensureLiveBashExecutionState(
+        guard var state = existingLookup.map({ claimLiveBashExecution($0.state, session: session) }) ?? ensureLiveBashExecutionState(
             toolName: "bash",
             invocationID: runningUpdate.invocationID,
             argsJSON: nil,
             processID: runningUpdate.processID,
             session: session,
-            observedAt: observedAt
+            observedAt: observedAt,
+            claimsCurrentProvider: true
         ) else {
             return .noChange
         }
@@ -8909,7 +8937,10 @@ package final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObser
             argsJSON: argsJSON,
             processID: metadata.processID,
             session: session,
-            observedAt: observedAt
+            observedAt: observedAt,
+            // Also reached from the liveness poll and cancellation drain; the state is removed
+            // below in this call, so it never needs an owner.
+            claimsCurrentProvider: false
         ) else {
             return false
         }
@@ -8940,7 +8971,22 @@ package final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObser
     }
 
     private func rebuildLiveBashExecutionState(from session: AgentTabSession) {
+        // Rebuilding from rows claims no provider: an execution keeps only the owner its live
+        // state already had, so a restored row stays unowned even if a controller is attached.
+        var ownerByTranscriptItemID: [UUID: UUID] = [:]
+        for execution in session.bashLiveExecutionByKey.values {
+            if let owner = execution.ownerControllerGeneration {
+                ownerByTranscriptItemID[execution.transcriptItemID] = owner
+            }
+        }
         session.clearBashLiveExecutions()
+        defer {
+            for var execution in session.bashLiveExecutionByKey.values {
+                guard let owner = ownerByTranscriptItemID[execution.transcriptItemID] else { continue }
+                execution.ownerControllerGeneration = owner
+                session.setBashLiveExecution(execution)
+            }
+        }
         for item in session.items {
             guard item.kind == .toolResult else { continue }
             guard Self.normalizedExternalToolName(item.toolName) == "bash" else { continue }
@@ -8953,7 +8999,8 @@ package final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObser
                     parsedResult: Self.parsedBashLivenessResult(metadata: metadata, argsJSON: item.toolArgsJSON),
                     metadata: metadata,
                     session: session,
-                    observedAt: item.timestamp
+                    observedAt: item.timestamp,
+                    claimsCurrentProvider: false
                 )
             }
         }
@@ -9574,6 +9621,7 @@ package final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObser
 
         var didFinalize = false
         var hasAliveRunningProcess = false
+        let currentGeneration = currentControllerGeneration(of: session)
         for execution in activeExecutions {
             guard let processID = execution.processID else { continue }
             if now.timeIntervalSince(execution.lastSignalAt) < bashSignalQuietPollGraceInterval {
@@ -9596,7 +9644,12 @@ package final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObser
                 invocationID: execution.invocationID,
                 argsJSON: session.items.first(where: { $0.id == execution.transcriptItemID })?.toolArgsJSON,
                 resultJSON: nil,
-                statusWord: "finished",
+                // `finished` is provisional: only the controller that owns this execution can
+                // still deliver its real completion. Without one (a row restored after quit or
+                // crash, or a replaced controller) the outcome is unknown and never a success.
+                statusWord: currentGeneration != nil && execution.ownerControllerGeneration == currentGeneration
+                    ? "finished"
+                    : "interrupted",
                 isError: false,
                 session: session,
                 observedAt: now
@@ -9814,7 +9867,8 @@ package final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObser
                 parsedResult: parsedResult,
                 metadata: metadata,
                 session: session,
-                observedAt: observedAt
+                observedAt: observedAt,
+                claimsCurrentProvider: true
             ) {
                 let shouldMaterializeRunningOutput = canMaterializeRunningBashOutput(for: session)
                 if shouldMaterializeRunningOutput,
