@@ -1161,13 +1161,17 @@ package actor AgentRecoveryStore {
     /// The transcript turn is the first one recorded (the turn the run's first carried input opened);
     /// a later different turn keeps it. A conflicting process run fails, unless `processRunAssociation`
     /// is `.keepExisting` (terminal-time completion, which never fails on an existing association).
+    /// `providerKindRaw` is run-start evidence written only when the attempt is first recorded
+    /// (extras member `providerKind`); an existing attempt's (or a legacy attempt's absent) provider
+    /// is never rewritten.
     package func ensureRunAttempt(
         binding: AgentRecoveryLifecycleBinding,
         expectedRevision: AgentRecoveryRecordRevision?,
         ownership: AgentRunOwnership,
         processRunID: UUID?,
         transcriptTurnID: UUID?,
-        processRunAssociation: AgentRecoveryRunAssociationPolicy = .strict
+        processRunAssociation: AgentRecoveryRunAssociationPolicy = .strict,
+        providerKindRaw: String?
     ) throws -> AgentRecoveryRunReceipt {
         try requireOwnership(ownership, binding: binding)
         let current = try writableRecord(binding: binding)
@@ -1199,7 +1203,8 @@ package actor AgentRecoveryStore {
                 startedAt: AgentRecoveryTimestamp(now()),
                 // Run-start ownership evidence; an existing attempt's (or a legacy attempt's
                 // absent) instance is never rewritten.
-                appInstanceID: appInstanceID
+                appInstanceID: appInstanceID,
+                extras: providerKindRaw.map { [AgentRecoveryRunAttempt.providerKindExtrasKey: .string($0)] } ?? [:]
             ))
         }
         try requireRevision(expectedRevision, current: current)

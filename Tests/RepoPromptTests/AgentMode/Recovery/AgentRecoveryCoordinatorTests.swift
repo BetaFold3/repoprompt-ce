@@ -368,7 +368,8 @@ final class AgentRecoveryCoordinatorTests: XCTestCase {
         try await previousGate.performRecoveryTransaction {
             _ = try await previousStore.ensureRunAttempt(
                 binding: previousGate.binding, expectedRevision: nil, ownership: ownership,
-                processRunID: nil, transcriptTurnID: nil
+                processRunID: nil, transcriptTurnID: nil,
+                providerKindRaw: nil
             )
             _ = try await previousStore.commitDispatchingIntent(
                 binding: previousGate.binding,
@@ -1690,7 +1691,7 @@ final class AgentRecoveryCoordinatorTests: XCTestCase {
         // An ordinary failure of another run is not an interruption.
         let ordinary = Support.ownership(sessionID: sessionID)
         let ordinaryTurnID = UUID()
-        _ = try await lane.ensureRunAttempt(ownership: ordinary, processRunID: nil, transcriptTurnID: ordinaryTurnID).get()
+        _ = try await lane.ensureRunAttempt(ownership: ordinary, processRunID: nil, transcriptTurnID: ordinaryTurnID, providerKindRaw: nil).get()
         await lane.recordTerminalEvidence(
             Support.terminalCommit(ownership: ordinary, state: .failed, cause: .ordinary),
             transcriptTurnID: ordinaryTurnID
@@ -1699,7 +1700,7 @@ final class AgentRecoveryCoordinatorTests: XCTestCase {
         // The interrupted run: opened on one turn, then steered into a second one.
         let ownership = Support.ownership(sessionID: sessionID)
         let openingTurnID = UUID()
-        _ = try await lane.ensureRunAttempt(ownership: ownership, processRunID: nil, transcriptTurnID: openingTurnID).get()
+        _ = try await lane.ensureRunAttempt(ownership: ownership, processRunID: nil, transcriptTurnID: openingTurnID, providerKindRaw: nil).get()
         XCTAssertNil(coordinator.catalog.item(id: "turn-\(sessionID.uuidString)-\(openingTurnID.uuidString)"), "An active run is never listed")
         let steer = try await lane.admitQueued(admission(lane, "steer")).get()
         _ = try await lane.beginDispatch(
@@ -1870,7 +1871,7 @@ final class AgentRecoveryCoordinatorTests: XCTestCase {
 
         let ownership = Support.ownership(sessionID: sessionID)
         let turnID = UUID()
-        _ = try await lane.ensureRunAttempt(ownership: ownership, processRunID: nil, transcriptTurnID: turnID).get()
+        _ = try await lane.ensureRunAttempt(ownership: ownership, processRunID: nil, transcriptTurnID: turnID, providerKindRaw: nil).get()
         await lane.recordTerminalEvidence(
             Support.terminalCommit(ownership: ownership, state: .failed, cause: .providerProcessLost),
             transcriptTurnID: turnID
@@ -1922,7 +1923,7 @@ final class AgentRecoveryCoordinatorTests: XCTestCase {
         let sessionID = load.session.id
         let ownership = Support.ownership(sessionID: sessionID)
         let turnID = UUID()
-        _ = try await lane.ensureRunAttempt(ownership: ownership, processRunID: nil, transcriptTurnID: turnID).get()
+        _ = try await lane.ensureRunAttempt(ownership: ownership, processRunID: nil, transcriptTurnID: turnID, providerKindRaw: nil).get()
         await lane.recordTerminalEvidence(
             Support.terminalCommit(ownership: ownership, state: .failed, cause: .providerProcessLost),
             transcriptTurnID: turnID
@@ -2040,7 +2041,7 @@ final class AgentRecoveryCoordinatorTests: XCTestCase {
         let sessionID = load.session.id
         let ownership = Support.ownership(sessionID: sessionID)
         let turnID = UUID()
-        _ = try await lane.ensureRunAttempt(ownership: ownership, processRunID: nil, transcriptTurnID: turnID).get()
+        _ = try await lane.ensureRunAttempt(ownership: ownership, processRunID: nil, transcriptTurnID: turnID, providerKindRaw: nil).get()
         await lane.recordTerminalEvidence(
             Support.terminalCommit(ownership: ownership, state: .failed, cause: .providerProcessLost),
             transcriptTurnID: turnID
@@ -2316,7 +2317,7 @@ final class AgentRecoveryCoordinatorTests: XCTestCase {
         XCTAssertEqual(before?.cardAcknowledgements.count ?? 0, 0)
 
         let later = Support.ownership(sessionID: fixture.sessionID)
-        _ = try await fixture.lane.ensureRunAttempt(ownership: later, processRunID: nil, transcriptTurnID: UUID()).get()
+        _ = try await fixture.lane.ensureRunAttempt(ownership: later, processRunID: nil, transcriptTurnID: UUID(), providerKindRaw: nil).get()
         let cleared = await Support.eventually { fixture.item?.automaticClear == .sessionContinued }
         XCTAssertTrue(cleared, "\(String(describing: fixture.item?.actionFacts))")
         let item = try XCTUnwrap(fixture.item, "a cleared note stays in the catalog")
@@ -2352,7 +2353,7 @@ final class AgentRecoveryCoordinatorTests: XCTestCase {
         let lane = try coordinator.claimLane(owner: owner, persistenceState: load.persistenceState)
         let ownership = Support.ownership(sessionID: load.session.id)
         let turnID = UUID()
-        _ = try await lane.ensureRunAttempt(ownership: ownership, processRunID: nil, transcriptTurnID: turnID).get()
+        _ = try await lane.ensureRunAttempt(ownership: ownership, processRunID: nil, transcriptTurnID: turnID, providerKindRaw: nil).get()
         await lane.recordTerminalEvidence(
             Support.terminalCommit(ownership: ownership, state: .failed, cause: .providerProcessLost),
             transcriptTurnID: turnID
@@ -2377,7 +2378,7 @@ final class AgentRecoveryCoordinatorTests: XCTestCase {
         let (unfinished, unsent) = (fixtures[0], fixtures[1])
         let open = try await unfinished.request(text: "please continue from the last step")
         _ = try await unfinished.lane.reserveRecoveryAction(open).get()
-        _ = try await unfinished.lane.ensureRunAttempt(ownership: Support.ownership(sessionID: unfinished.sessionID), processRunID: nil, transcriptTurnID: UUID()).get()
+        _ = try await unfinished.lane.ensureRunAttempt(ownership: Support.ownership(sessionID: unfinished.sessionID), processRunID: nil, transcriptTurnID: UUID(), providerKindRaw: nil).get()
         let matched = await Support.eventually { unfinished.item?.actionFacts.automaticClear == .sessionContinued }
         XCTAssertTrue(matched, "the rule matches")
         let held = try XCTUnwrap(unfinished.item)
@@ -2389,7 +2390,7 @@ final class AgentRecoveryCoordinatorTests: XCTestCase {
         let continuation = try await unsent.request(text: "please continue from the last step")
         try await unsent.perform(continuation, outcome: .notDispatched)
         XCTAssertTrue(unsent.item?.actionFacts.hasUnsentContinuation == true)
-        _ = try await unsent.lane.ensureRunAttempt(ownership: Support.ownership(sessionID: unsent.sessionID), processRunID: nil, transcriptTurnID: UUID()).get()
+        _ = try await unsent.lane.ensureRunAttempt(ownership: Support.ownership(sessionID: unsent.sessionID), processRunID: nil, transcriptTurnID: UUID(), providerKindRaw: nil).get()
         let unsentMatched = await Support.eventually { unsent.item?.actionFacts.automaticClear == .sessionContinued }
         XCTAssertTrue(unsentMatched)
         let kept = try XCTUnwrap(unsent.item)
@@ -2595,11 +2596,16 @@ final class AgentRecoveryCoordinatorTests: XCTestCase {
         var ids: [String] = []
     }
 
+    @MainActor
+    private final class LateReconcile {
+        var result: AgentRecoveryActionResult?
+    }
+
     /// Before activation (production qualification: Reconcile unavailable) Check refreshes and
     /// reconciles nothing, writes nothing, and reports the items from the catalog only with the
     /// "not active" header; nothing is resolved.
     func testCheckBeforeActivationReportsNotActiveAndWritesNothing() async throws {
-        let production = AgentRecoveryActionRunner(qualification: .production, registrationActive: { true })
+        let production = AgentRecoveryActionRunner(activation: .production, registrationActive: { true })
         XCTAssertFalse(production.isAvailable(.reconcileOnly), "the window's checksActive is off in production")
         let cards = try await makeRunCardFixtures(count: 2)
         let (store, coordinator) = (cards[0].store, cards[0].coordinator)
@@ -2639,8 +2645,9 @@ final class AgentRecoveryCoordinatorTests: XCTestCase {
         XCTAssertNil(coordinator.recoveryCheck, "closing the sheet clears a finished report")
     }
 
-    /// One check at a time, one item at a time; Stop halts before the next item and the report says
-    /// it was cancelled. The item in progress settles and keeps its result.
+    /// One check at a time, one item at a time; Stop ends the check at once and the report says it
+    /// was cancelled: the item in progress is no longer waited for (Step 9-activation), its late
+    /// result never reaches the finished report, and nothing after it is checked.
     func testCheckStopHaltsBeforeTheNextItemAndRunsOneAtATime() async throws {
         let cards = try await makeRunCardFixtures(count: 3)
         let coordinator = cards[0].coordinator
@@ -2664,15 +2671,150 @@ final class AgentRecoveryCoordinatorTests: XCTestCase {
         coordinator.clearRecoveryCheckReport()
         XCTAssertNotNil(coordinator.recoveryCheck, "closing the sheet keeps a running check")
         coordinator.requestRecoveryCheckCancel()
-        XCTAssertEqual(coordinator.recoveryCheck?.summaryText, "Checking 1 of 3… Stopping after this item.")
-        await latch.open()
+        XCTAssertEqual(coordinator.recoveryCheck?.summaryText, "Checking 1 of 3… Stopping…")
+        coordinator.requestRecoveryCheckCancel() // A repeated Stop is ignored.
         let result = await running.value
         let status = try XCTUnwrap(result)
         XCTAssertEqual(calls.ids, [cards[0].itemID], "nothing after Stop")
-        XCTAssertEqual(status.entries.map(\.outcome), [.couldNotCheck("Open this session to check its provider history.")])
+        XCTAssertEqual(status.entries.map(\.outcome), [.couldNotCheck(AgentRecoveryCheckStatus.abandonedText)])
         XCTAssertEqual(status.notChecked, 2)
         XCTAssertEqual(status.summaryText, "Cancelled: checked 1 of 3, 2 not checked · 1 could not check")
         XCTAssertEqual(cards.map(\.item), captured, "the remaining items are untouched")
+        await latch.open()
+        await Task.yield()
+        XCTAssertEqual(coordinator.recoveryCheck, status, "the late result never reaches the finished report")
+    }
+
+    /// Step 9-activation (re-review blocker): a Reconcile that never returns cannot keep Check
+    /// running. Stop ends the wait without cancelling the work: the report finishes, the row's
+    /// `.working` state is released, the session's recovery action hold still refuses another
+    /// dispatch, and when the work finally ends its result reaches the card, not the report.
+    func testCheckStopAbandonsAHungReconcileButKeepsItsActionHold() async throws {
+        let cards = try await makeRunCardFixtures(count: 2)
+        let (card, coordinator) = (cards[0], cards[0].coordinator)
+        let captured = try cards.map { try XCTUnwrap($0.item) }
+        let runner = AgentRecoveryActionRunner(
+            activation: .claudeAndCodex,
+            registrationActive: { true }
+        )
+        let latch = RecoveryGateLatch()
+        let calls = CheckCalls()
+        let reconcileRequest = try await card.request()
+        let hung = AgentRecoveryActionPerformers(reconcile: { _ in
+            await latch.pause()
+            return .nothingImported("Nothing new.")
+        }, dispatch: { _, _ in .notDispatched("never") })
+        let late = LateReconcile()
+        let running = Task {
+            await coordinator.checkCatalogItems(captured, checksActive: true) { item in
+                calls.ids.append(item.id)
+                coordinator.setCatalogActionState(.working, for: item.id)
+                let result = await runner.perform(reconcileRequest, lane: card.lane, performers: hung)
+                // The card's own state, as the window's Reconcile records it.
+                coordinator.setCatalogActionState(.failed("late result"), for: item.id)
+                late.result = result
+                return .performed(result, observed: nil)
+            }
+        }
+        await latch.waitUntilPaused()
+        XCTAssertEqual(coordinator.catalogActionStates[card.itemID], .working)
+        XCTAssertTrue(coordinator.isCoveredByRecoveryAction(sessionID: card.sessionID))
+
+        coordinator.requestRecoveryCheckCancel()
+        let finishedStatus = await running.value
+        XCTAssertEqual(finishedStatus?.isRunning, false, "Stop finishes the report without the hung Reconcile")
+        let status = try XCTUnwrap(coordinator.recoveryCheck)
+        XCTAssertEqual(status.entries.map(\.outcome), [.couldNotCheck(AgentRecoveryCheckStatus.abandonedText)])
+        XCTAssertEqual(status.notChecked, 1)
+        XCTAssertEqual(calls.ids, [card.itemID])
+        XCTAssertNil(coordinator.catalogActionStates[card.itemID], "the row's working state is released")
+
+        // The hold persists: another choice in that session is refused, nothing reserved or sent.
+        XCTAssertTrue(coordinator.isCoveredByRecoveryAction(sessionID: card.sessionID))
+        let continuation = try await card.request(text: "continue")
+        let refused = await runner.perform(continuation, lane: card.lane, performers: hung)
+        XCTAssertEqual(refused, .refused(AgentRecoveryActionRunner.sessionActionInFlightText))
+
+        XCTAssertNil(late.result, "the hung Reconcile is still running")
+        await latch.open()
+        let ended = await Support.eventually { late.result != nil }
+        XCTAssertTrue(ended)
+        XCTAssertEqual(late.result, .completed(.notDispatched, reason: "Nothing new."), "the work ran to its own end")
+        XCTAssertEqual(coordinator.catalogActionStates[card.itemID], .failed("late result"), "the late result reaches the card")
+        XCTAssertEqual(coordinator.recoveryCheck, status, "and never the finished report")
+        let released = await Support.eventually { !coordinator.isCoveredByRecoveryAction(sessionID: card.sessionID) }
+        XCTAssertTrue(released, "the hold ends only when the work really ends")
+    }
+
+    /// Round-0 review (A F1, B P2-1): Stop that lands after an item's work was queued but before it
+    /// ran never starts a Reconcile afterwards, and leaves a `.working` state Check didn't set
+    /// (another action's) alone. Stopping the only item gives the cancelled heading (A F3), and the
+    /// item is reported stopped before checking, never as a check that continues.
+    func testCheckStopBeforeTheItemsWorkStartsNeverReconcilesAndKeepsAnotherActionsWorkingState() async throws {
+        let cards = try await makeRunCardFixtures(count: 1)
+        let (card, coordinator) = (cards[0], cards[0].coordinator)
+        let captured = try XCTUnwrap(card.item)
+        coordinator.test_recoveryCheckItemQueued = { coordinator.requestRecoveryCheckCancel() }
+        defer { coordinator.test_recoveryCheckItemQueued = nil }
+        let calls = CheckCalls()
+        let check: @MainActor () async throws -> AgentRecoveryCheckStatus = {
+            let result = await coordinator.checkCatalogItems([captured], checksActive: true) { item in
+                calls.ids.append(item.id)
+                return .notAttempted("never")
+            }
+            let status = try XCTUnwrap(result)
+            // No promise of a later result: the item's check never starts (round-1 A F2).
+            XCTAssertEqual(status.entries.map(\.outcome), [.couldNotCheck(AgentRecoveryCheckStatus.stoppedBeforeCheckingText)])
+            XCTAssertEqual(status.notChecked, 0)
+            XCTAssertEqual(status.summaryText, "Cancelled: checked 1 of 1 · 1 could not check")
+            for _ in 0 ..< 20 {
+                await Task.yield()
+            }
+            try await Task.sleep(nanoseconds: 50_000_000)
+            XCTAssertEqual(coordinator.recoveryCheck, status)
+            return status
+        }
+
+        // The row is free: without the guard the queued work would start a Reconcile after Stop.
+        _ = try await check()
+        XCTAssertEqual(calls.ids, [], "the queued work saw Stop and never started a Reconcile")
+        XCTAssertNil(coordinator.catalogActionStates[card.itemID])
+
+        // Another action (not Check) is working on the row: abandoning doesn't clear its state.
+        coordinator.setCatalogActionState(.working, for: card.itemID)
+        _ = try await check()
+        XCTAssertEqual(calls.ids, [])
+        XCTAssertEqual(coordinator.catalogActionStates[card.itemID], .working, "another action's working state is kept")
+    }
+
+    /// A F3: Stop that abandons the only item mid-Reconcile reports cancelled (not "Checked 1 of
+    /// 1") and releases the `.working` state that item's own Reconcile set.
+    func testCheckStopOnTheOnlyItemReportsCancelled() async throws {
+        let cards = try await makeRunCardFixtures(count: 1)
+        let (card, coordinator) = (cards[0], cards[0].coordinator)
+        let captured = try XCTUnwrap(card.item)
+        let latch = RecoveryGateLatch()
+        let running = Task {
+            await coordinator.checkCatalogItems([captured], checksActive: true) { item in
+                coordinator.setCatalogActionState(.working, for: item.id)
+                await latch.pause()
+                coordinator.setCatalogActionState(nil, for: item.id)
+                return .notAttempted("late")
+            }
+        }
+        await latch.waitUntilPaused()
+        XCTAssertEqual(coordinator.recoveryCheck?.summaryText, "Checking 1 of 1…")
+        coordinator.requestRecoveryCheckCancel()
+        let result = await running.value
+        let status = try XCTUnwrap(result)
+        XCTAssertEqual(status.entries.map(\.outcome), [.couldNotCheck(AgentRecoveryCheckStatus.abandonedText)])
+        XCTAssertEqual(status.notChecked, 0)
+        XCTAssertEqual(status.summaryText, "Cancelled: checked 1 of 1 · 1 could not check")
+        XCTAssertNil(coordinator.catalogActionStates[card.itemID], "Check's own working state is released")
+        await latch.open()
+        let settled = await Support.eventually { coordinator.catalogActionStates[card.itemID] == nil }
+        XCTAssertTrue(settled)
+        XCTAssertEqual(coordinator.recoveryCheck, status, "the late result never reaches the finished report")
     }
 
     /// After activation (checks active, injected), each run card still as captured goes to the

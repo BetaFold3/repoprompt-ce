@@ -61,7 +61,8 @@ final class AgentRecoveryStartupCompositionTests: XCTestCase {
                 expectedRevision: earlierStore.currentRevision(sessionID: unsavedBinding.sessionID),
                 ownership: unsavedOwnership,
                 processRunID: nil,
-                transcriptTurnID: nil
+                transcriptTurnID: nil,
+                providerKindRaw: nil
             )
         }
 
@@ -191,7 +192,8 @@ final class AgentRecoveryStartupCompositionTests: XCTestCase {
                 expectedRevision: earlierStore.currentRevision(sessionID: heldBinding.sessionID),
                 ownership: heldOwnership,
                 processRunID: nil,
-                transcriptTurnID: nil
+                transcriptTurnID: nil,
+                providerKindRaw: nil
             )
             _ = try await earlierStore.commitDispatchingIntent(
                 binding: heldBinding,
@@ -226,7 +228,8 @@ final class AgentRecoveryStartupCompositionTests: XCTestCase {
                 expectedRevision: earlierStore.currentRevision(sessionID: elsewhereBinding.sessionID),
                 ownership: elsewhereOwnership,
                 processRunID: nil,
-                transcriptTurnID: nil
+                transcriptTurnID: nil,
+                providerKindRaw: nil
             )
             _ = try await earlierStore.updateQuestionSnapshots(
                 binding: elsewhereBinding,
@@ -415,7 +418,8 @@ final class AgentRecoveryStartupCompositionTests: XCTestCase {
                 expectedRevision: earlierStore.currentRevision(sessionID: heldBinding.sessionID),
                 ownership: heldOwnership,
                 processRunID: nil,
-                transcriptTurnID: nil
+                transcriptTurnID: nil,
+                providerKindRaw: nil
             )
             _ = try await earlierStore.commitDispatchingIntent(
                 binding: heldBinding,
@@ -677,6 +681,40 @@ final class AgentRecoveryStartupCompositionTests: XCTestCase {
         first.test_setCurrentTabIDOverride(tabID)
         let session = try await first.ensureSessionReady(tabID: tabID)
         XCTAssertEqual(session.recoveryAdmissionMode, .mandatory)
+    }
+
+    func testCompositionAndViewModelDefaultReadTheOneProductionActivation() throws {
+        let fixture = try makeFixture()
+        let now = makeLaunch(fixture)
+        // A view model nobody installed into still reads the composition's runner, not an all-off copy.
+        let uninstalled = makeViewModel(windowID: 4815, fixture: fixture)
+        XCTAssertEqual(uninstalled.recoveryActionRunner.activation, AgentRecoveryActivation.production)
+        XCTAssertEqual(AgentRecoveryAppComposition.makeActionRunner().activation, AgentRecoveryActivation.production)
+        XCTAssertEqual(AgentRecoveryActivation.production, .off, "Production stays off until the reviewed flip")
+
+        let scheduler = AgentScheduledSendCoordinator(startupAdmission: .awaitingRecovery)
+        let composition = AgentRecoveryAppComposition(
+            store: now.store,
+            dataService: now.service,
+            scheduler: scheduler,
+            loadInventory: { .empty }
+        )
+        XCTAssertEqual(composition.activation, AgentRecoveryActivation.production)
+        let installed = makeViewModel(windowID: 4816, fixture: fixture)
+        composition.install(into: installed)
+        XCTAssertEqual(installed.recoveryActionRunner.activation, AgentRecoveryActivation.production)
+
+        // An explicit activation reaches every installed window's runner.
+        let qualifiedComposition = AgentRecoveryAppComposition(
+            store: now.store,
+            dataService: now.service,
+            scheduler: AgentScheduledSendCoordinator(startupAdmission: .awaitingRecovery),
+            activation: .claudeAndCodex,
+            loadInventory: { .empty }
+        )
+        let qualified = makeViewModel(windowID: 4817, fixture: fixture)
+        qualifiedComposition.install(into: qualified)
+        XCTAssertEqual(qualified.recoveryActionRunner.activation, .claudeAndCodex)
     }
 
     func testCompositionDependencyFailureStaysFailClosedWithoutPermissiveFallback() async throws {
@@ -1069,7 +1107,8 @@ final class AgentRecoveryStartupCompositionTests: XCTestCase {
                 expectedRevision: earlierStore.currentRevision(sessionID: binding.sessionID),
                 ownership: ownership,
                 processRunID: nil,
-                transcriptTurnID: nil
+                transcriptTurnID: nil,
+                providerKindRaw: nil
             )
         }
 
@@ -1196,7 +1235,7 @@ final class AgentRecoveryStartupCompositionTests: XCTestCase {
         // This launch's run ends by provider process loss: an informational note only.
         let ownership = Support.ownership(sessionID: load.session.id)
         let turnID = UUID()
-        _ = try await lane.ensureRunAttempt(ownership: ownership, processRunID: nil, transcriptTurnID: turnID).get()
+        _ = try await lane.ensureRunAttempt(ownership: ownership, processRunID: nil, transcriptTurnID: turnID, providerKindRaw: nil).get()
         await lane.recordTerminalEvidence(
             Support.terminalCommit(ownership: ownership, state: .failed, cause: .providerProcessLost),
             transcriptTurnID: turnID
@@ -1279,7 +1318,8 @@ final class AgentRecoveryStartupCompositionTests: XCTestCase {
                 expectedRevision: earlierStore.currentRevision(sessionID: activeBinding.sessionID),
                 ownership: activeOwnership,
                 processRunID: nil,
-                transcriptTurnID: nil
+                transcriptTurnID: nil,
+                providerKindRaw: nil
             )
         }
         let acted = try await makeSession(earlier, fixture: fixture)
@@ -1298,7 +1338,8 @@ final class AgentRecoveryStartupCompositionTests: XCTestCase {
                 expectedRevision: earlierStore.currentRevision(sessionID: actedBinding.sessionID),
                 ownership: actedOwnership,
                 processRunID: nil,
-                transcriptTurnID: nil
+                transcriptTurnID: nil,
+                providerKindRaw: nil
             )
             _ = try await earlierStore.reserveRecoveryAction(
                 binding: actedBinding,
@@ -1442,7 +1483,8 @@ final class AgentRecoveryStartupCompositionTests: XCTestCase {
                 expectedRevision: earlierStore.currentRevision(sessionID: heldBinding.sessionID),
                 ownership: heldOwnership,
                 processRunID: nil,
-                transcriptTurnID: nil
+                transcriptTurnID: nil,
+                providerKindRaw: nil
             )
             _ = try await earlierStore.commitDispatchingIntent(
                 binding: heldBinding,

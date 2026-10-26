@@ -325,7 +325,8 @@ final class AppRelaunchCoordinatorTests: XCTestCase {
     }
 
     func testProductionCompositionStaysOff() {
-        XCTAssertFalse(AgentRecoveryActionQualification.production.safeRestart)
+        XCTAssertFalse(AgentRecoveryActivation.production.actions.safeRestart)
+        XCTAssertFalse(AgentRecoveryActivation.claudeAndCodex.actions.safeRestart, "subset registration can't prove unregistered families stopped")
         XCTAssertNil(AppRelaunchCoordinator.production())
         XCTAssertNil(AppRelaunchCoordinator.production(qualification: AgentRecoveryActionQualification(safeRestart: true), registry: nil))
     }

@@ -28,6 +28,11 @@ final class AgentRecoveryAppComposition {
     let failure: String?
     /// Whether this composition selects mandatory recovery for the windows it installs into.
     let isActive: Bool
+    /// The one recovery activation (runtime + action qualification) of this composition; its runner
+    /// and registry are what every window it installs into uses.
+    let activation: AgentRecoveryActivation
+    /// The app's single runtime-ownership registry, built from `activation.runtime`.
+    let processRegistry: AgentProcessRegistry?
     private var startupTask: Task<Void, Never>?
     /// Every window view model recovery was installed into (weak; a closed window drops out).
     private var installedViewModels: [WeakInstalledViewModel] = []
@@ -42,14 +47,24 @@ final class AgentRecoveryAppComposition {
     ///   - scheduler: the shared scheduler; closed here before any host can register.
     ///   - processRegistry: the app's single runtime-ownership registry (spec R6) over `store`;
     ///     `nil` enforces no runtime records (XCTest compositions that don't exercise R6).
+    ///   - activation: the recovery activation the installed runners use (production:
+    ///     `AgentRecoveryActivation.production`, the same value the registry was built from).
     init(
         store: AgentRecoveryStore?,
         dataService: AgentSessionDataService,
         scheduler: AgentScheduledSendCoordinator,
         processRegistry: AgentProcessRegistry? = nil,
+        activation: AgentRecoveryActivation = AgentRecoveryActivation.production,
         loadInventory: @escaping InventoryLoader
     ) {
+        // One activation: the registry (launch ownership) and the runners (actions) read the same one.
+        assert(
+            processRegistry.map { $0.qualification == activation.runtime } ?? true,
+            "The process registry must be built from this composition's activation"
+        )
         self.scheduler = scheduler
+        self.activation = activation
+        self.processRegistry = processRegistry
         guard let store else {
             coordinator = nil
             failure = nil
@@ -112,8 +127,22 @@ final class AgentRecoveryAppComposition {
             startupAdmission: AgentRecoveryStore.production == nil ? .open : .awaitingRecovery
         ),
         processRegistry: AgentProcessRegistry.production,
+        activation: AgentRecoveryActivation.production,
         loadInventory: { try WorkspaceManagerViewModel.loadRecoveryWorkspaceInventory() }
     )
+
+    /// The recovery action runner of `activation` over `registry`'s registration (defaults: the
+    /// app's one production activation and registry). The view model's default and every
+    /// installed window use this, so launch, runner and row presentation share one source.
+    static func makeActionRunner(
+        activation: AgentRecoveryActivation = AgentRecoveryActivation.production,
+        registry: AgentProcessRegistry? = AgentProcessRegistry.production
+    ) -> AgentRecoveryActionRunner {
+        AgentRecoveryActionRunner(
+            activation: activation,
+            registrationActive: { registry?.isAnyPairRegistered == true }
+        )
+    }
 
     /// Installs recovery into a freshly created view model, before it hydrates any session or
     /// observes its first draft, then starts startup once. Inactive compositions install nothing.
@@ -121,6 +150,8 @@ final class AgentRecoveryAppComposition {
         guard isActive else { return }
         installedViewModels.removeAll { $0.viewModel == nil || $0.viewModel === viewModel }
         installedViewModels.append(WeakInstalledViewModel(viewModel: viewModel))
+        viewModel.recoveryActionRunner = Self.makeActionRunner(activation: activation, registry: processRegistry)
+        viewModel.recoveryHistoryRegistry = processRegistry
         if let coordinator {
             viewModel.installRecoveryCoordinator(coordinator, admissionMode: .mandatory)
             viewModel.recoveryStartupRetry = { [weak self] in self?.retryStartup() }

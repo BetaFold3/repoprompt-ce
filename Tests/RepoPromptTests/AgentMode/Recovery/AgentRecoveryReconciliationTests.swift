@@ -2032,7 +2032,9 @@ final class AgentRecoveryReconciliationTests: XCTestCase {
         let sessionID = try XCTUnwrap(harness.session.activeAgentSessionID)
         let ownership = RecoveryTestSupport.ownership(sessionID: sessionID)
         let turnID = UUID()
-        _ = try await harness.lane.ensureRunAttempt(ownership: ownership, processRunID: nil, transcriptTurnID: turnID).get()
+        _ = try await harness.lane.ensureRunAttempt(
+            ownership: ownership, processRunID: nil, transcriptTurnID: turnID, providerKindRaw: harness.session.selectedAgent.rawValue
+        ).get()
         await harness.lane.recordTerminalEvidence(
             RecoveryTestSupport.terminalCommit(ownership: ownership, state: .failed, cause: .providerProcessLost),
             transcriptTurnID: turnID
@@ -2056,6 +2058,169 @@ final class AgentRecoveryReconciliationTests: XCTestCase {
         XCTAssertTrue(status.headerText.contains(AgentRecoveryCheckStatus.restrictionWarningText))
         XCTAssertEqual(harness.session.items.map(\.id), itemsBefore, "nothing imported or sent")
         XCTAssertNotEqual(coordinator.catalogActionStates[itemID], .working, "the row is no longer busy")
+    }
+
+    /// Round-0 review P1-1: a choice whose target names another provider than the session's
+    /// current one (here a cached request built before the session switched from Codex to Claude
+    /// Code) is refused through the real `performRecoveryResumeAction` before the runner: nothing
+    /// is reserved, written or sent, and the stale request is dropped.
+    func testProviderMismatchedTargetIsRefusedBeforeTheRunner() async throws {
+        let harness = try await makeProducerHarness(windowID: 4981)
+        let viewModel = harness.viewModel
+        let coordinator = try XCTUnwrap(viewModel.recoveryCoordinator)
+        XCTAssertEqual(harness.session.selectedAgent, .claudeCode)
+        let sessionID = try XCTUnwrap(harness.session.activeAgentSessionID)
+        let ownership = RecoveryTestSupport.ownership(sessionID: sessionID)
+        let turnID = UUID()
+        _ = try await harness.lane.ensureRunAttempt(
+            ownership: ownership, processRunID: nil, transcriptTurnID: turnID, providerKindRaw: harness.session.selectedAgent.rawValue
+        ).get()
+        await harness.lane.recordTerminalEvidence(
+            RecoveryTestSupport.terminalCommit(ownership: ownership, state: .failed, cause: .providerProcessLost),
+            transcriptTurnID: turnID
+        ).value
+        let itemID = "turn-\(sessionID.uuidString)-\(turnID.uuidString)"
+        let listed = await RecoveryTestSupport.eventually { coordinator.catalog.item(id: itemID) != nil }
+        XCTAssertTrue(listed)
+        let key = try XCTUnwrap(coordinator.catalog.item(id: itemID)?.acknowledgement?.key)
+        guard case let .success(.supported(before)) = await harness.lane.readRecord() else {
+            return XCTFail("expected a supported record")
+        }
+        let stale = AgentRecoveryActionRequest(
+            actionID: UUID(),
+            itemKey: key,
+            kind: .continueWithText,
+            expectedRevision: before.revision,
+            sourceRunAttemptID: ownership.attemptID,
+            target: AgentRecoveryActionTarget(providerKindRaw: AgentProviderKind.codexExec.rawValue, providerConversationID: "thread-old"),
+            text: AgentModeViewModel.recoveryContinueDefaultText,
+            plannedUserItemID: UUID()
+        )
+        let slot = AgentModeViewModel.RecoveryActionSlot(item: key, kindRaw: AgentRecoveryActionKind.continueWithText.rawValue)
+        viewModel.recoveryActionRequestsBySlot[slot] = stale
+        let itemsBefore = harness.session.items.map(\.id)
+
+        let failure = await viewModel.performRecoveryResumeAction(rowID: itemID, action: .continueTurn)
+        XCTAssertEqual(
+            failure,
+            "This card is from a \(AgentProviderKind.codexExec.displayName) run, but the session now uses \(AgentProviderKind.claudeCode.displayName). Switch back to act on it. Nothing was changed."
+        )
+        XCTAssertNil(viewModel.recoveryActionRequestsBySlot[slot], "the stale request is dropped")
+        guard case let .success(.supported(after)) = await harness.lane.readRecord() else {
+            return XCTFail("expected a supported record")
+        }
+        XCTAssertEqual(after.revision, before.revision, "nothing is written")
+        XCTAssertTrue(after.actions.isEmpty, "nothing is reserved")
+        XCTAssertEqual(harness.session.items.map(\.id), itemsBefore, "nothing is sent")
+        XCTAssertFalse(coordinator.isCoveredByRecoveryAction(sessionID: sessionID))
+        XCTAssertNil(
+            AgentModeViewModel.recoveryProviderMismatchText(
+                target: viewModel.recoveryActionTarget(for: harness.session), current: harness.session.selectedAgent
+            ),
+            "a target built now names the current provider"
+        )
+    }
+
+    /// A run card in the open session, whose run attempt recorded `providerKindRaw` at run start
+    /// (`nil`: a run recorded before the provider was captured). Returns the card's row ID.
+    private func makeRunCard(_ harness: ProducerHarness, providerKindRaw: String?) async throws -> String {
+        let coordinator = try XCTUnwrap(harness.viewModel.recoveryCoordinator)
+        let sessionID = try XCTUnwrap(harness.session.activeAgentSessionID)
+        let ownership = RecoveryTestSupport.ownership(sessionID: sessionID)
+        let turnID = UUID()
+        _ = try await harness.lane.ensureRunAttempt(
+            ownership: ownership, processRunID: nil, transcriptTurnID: turnID, providerKindRaw: providerKindRaw
+        ).get()
+        await harness.lane.recordTerminalEvidence(
+            RecoveryTestSupport.terminalCommit(ownership: ownership, state: .failed, cause: .providerProcessLost),
+            transcriptTurnID: turnID
+        ).value
+        let itemID = "turn-\(sessionID.uuidString)-\(turnID.uuidString)"
+        let listed = await RecoveryTestSupport.eventually { coordinator.catalog.item(id: itemID) != nil }
+        XCTAssertTrue(listed)
+        return itemID
+    }
+
+    /// Asserts Continue and Reconcile on `itemID` are both refused with `expected` through the real
+    /// `performRecoveryResumeAction`, before the runner: nothing reserved, written or sent.
+    private func assertRunActionsRefused(
+        _ harness: ProducerHarness,
+        itemID: String,
+        expected: String,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) async throws {
+        guard case let .success(.supported(before)) = await harness.lane.readRecord() else {
+            return XCTFail("expected a supported record", file: file, line: line)
+        }
+        let itemsBefore = harness.session.items.map(\.id)
+        for action in [AgentRecoveryListRowProps.Action.continueTurn, .reconcileHistory] {
+            let report = RecoveryResumeActionReport()
+            let failure = await harness.viewModel.performRecoveryResumeAction(rowID: itemID, action: action, report: report)
+            XCTAssertEqual(failure, expected, "\(action)", file: file, line: line)
+            XCTAssertNil(report.result, "\(action) never reaches the runner", file: file, line: line)
+        }
+        guard case let .success(.supported(after)) = await harness.lane.readRecord() else {
+            return XCTFail("expected a supported record", file: file, line: line)
+        }
+        XCTAssertEqual(after.revision, before.revision, "nothing is written", file: file, line: line)
+        XCTAssertTrue(after.actions.isEmpty, "nothing is reserved", file: file, line: line)
+        XCTAssertEqual(harness.session.items.map(\.id), itemsBefore, "nothing is sent", file: file, line: line)
+        XCTAssertTrue(harness.viewModel.recoveryActionRequestsBySlot.isEmpty, "no request is cached", file: file, line: line)
+    }
+
+    /// P1-1: a run card whose run was started by Codex is refused once the session uses Claude Code,
+    /// naming the recorded provider, for both Continue and Reconcile.
+    func testRunCardFromASwitchedProviderIsRefusedNamingTheRecordedProvider() async throws {
+        let harness = try await makeProducerHarness(windowID: 5091)
+        XCTAssertEqual(harness.session.selectedAgent, .claudeCode)
+        let itemID = try await makeRunCard(harness, providerKindRaw: AgentProviderKind.codexExec.rawValue)
+        try await assertRunActionsRefused(
+            harness,
+            itemID: itemID,
+            expected: "This card is from a \(AgentProviderKind.codexExec.displayName) run, but the session now uses \(AgentProviderKind.claudeCode.displayName). Switch back to act on it. Nothing was changed."
+        )
+    }
+
+    /// P1-1: a run recorded before the provider was captured is refused rather than guessed.
+    func testRunCardWithoutARecordedProviderIsRefused() async throws {
+        let harness = try await makeProducerHarness(windowID: 5092)
+        let itemID = try await makeRunCard(harness, providerKindRaw: nil)
+        try await assertRunActionsRefused(
+            harness,
+            itemID: itemID,
+            expected: "This card's provider wasn't recorded, so RepoPrompt can't act on it safely. Nothing was changed."
+        )
+    }
+
+    /// Round-1 B F1: the guard fails closed. A card without a run attempt (a legacy interrupted turn's
+    /// `runAttemptID` is nil) or whose attempt is not in the record is refused as not recorded; only
+    /// the found attempt's recorded provider decides.
+    func testRunProviderGuardFailsClosedWithoutAKnownRunAttempt() {
+        let notRecorded = AgentModeViewModel.recoveryRunProviderNotRecordedText
+        let stamp = AgentRecoveryTimestamp(millisecondsSince1970: 1000)
+        let recordedID = UUID()
+        let recorded = AgentRecoveryRunAttempt(
+            runAttemptID: recordedID, transcriptResetGeneration: 0, processRunID: nil, transcriptTurnID: nil, startedAt: stamp,
+            extras: [AgentRecoveryRunAttempt.providerKindExtrasKey: .string(AgentProviderKind.claudeCode.rawValue)]
+        )
+        func refusal(_ id: UUID?) -> String? {
+            AgentModeViewModel.recoveryRunProviderRefusal(sourceRunAttemptID: id, runAttempts: [recorded], current: .claudeCode)
+        }
+        XCTAssertEqual(refusal(nil), notRecorded, "no run attempt (legacy interrupted turn)")
+        XCTAssertEqual(refusal(UUID()), notRecorded, "an attempt not in the record")
+        XCTAssertNil(refusal(recordedID), "the found attempt's matching recorded provider proceeds")
+    }
+
+    /// P1-1: a run card recorded by the session's current provider proceeds to the runner.
+    func testRunCardFromTheCurrentProviderProceedsToTheRunner() async throws {
+        let harness = try await makeProducerHarness(windowID: 5093)
+        let itemID = try await makeRunCard(harness, providerKindRaw: harness.session.selectedAgent.rawValue)
+        let report = RecoveryResumeActionReport()
+        let failure = await harness.viewModel.performRecoveryResumeAction(rowID: itemID, action: .reconcileHistory, report: report)
+        XCTAssertNotNil(report.result, "the choice reached the runner (got \(String(describing: failure)))")
+        XCTAssertNotEqual(failure, AgentModeViewModel.recoveryRunProviderNotRecordedText)
+        XCTAssertFalse(failure?.hasPrefix("This card is from a") == true, "\(String(describing: failure))")
     }
 
     // MARK: Step 4d2 capture-qualified import (view model, real persistence and reader)
@@ -3930,7 +4095,9 @@ final class AgentRecoveryReconciliationTests: XCTestCase {
             startedAt: Date()
         )])
         let ownership = RecoveryTestSupport.ownership(sessionID: sessionID)
-        _ = try await harness.lane.ensureRunAttempt(ownership: ownership, processRunID: nil, transcriptTurnID: turnID).get()
+        _ = try await harness.lane.ensureRunAttempt(
+            ownership: ownership, processRunID: nil, transcriptTurnID: turnID, providerKindRaw: harness.session.selectedAgent.rawValue
+        ).get()
         await harness.lane.recordTerminalEvidence(
             RecoveryTestSupport.terminalCommit(ownership: ownership, state: .failed, cause: .providerProcessLost),
             transcriptTurnID: turnID

@@ -151,7 +151,8 @@ final class AgentRecoveryStartupReconciliationTests: XCTestCase {
                 expectedRevision: store.currentRevision(sessionID: binding.sessionID),
                 ownership: ownership,
                 processRunID: nil,
-                transcriptTurnID: completedTurnID
+                transcriptTurnID: completedTurnID,
+                providerKindRaw: nil
             )
             _ = try await store.recordRunTerminal(
                 binding: binding,
@@ -315,7 +316,8 @@ final class AgentRecoveryStartupReconciliationTests: XCTestCase {
                 expectedRevision: store.currentRevision(sessionID: binding.sessionID),
                 ownership: windowOwnership,
                 processRunID: nil,
-                transcriptTurnID: windowTurnID
+                transcriptTurnID: windowTurnID,
+                providerKindRaw: nil
             )
             _ = try await store.recordRunShutdown(
                 binding: binding,
@@ -408,7 +410,8 @@ final class AgentRecoveryStartupReconciliationTests: XCTestCase {
                     expectedRevision: store.currentRevision(sessionID: binding.sessionID),
                     ownership: ownership,
                     processRunID: nil,
-                    transcriptTurnID: startID
+                    transcriptTurnID: startID,
+                    providerKindRaw: nil
                 )
                 if steered {
                     _ = try await store.commitDispatchingIntent(
@@ -482,7 +485,8 @@ final class AgentRecoveryStartupReconciliationTests: XCTestCase {
                 expectedRevision: store.currentRevision(sessionID: binding.sessionID),
                 ownership: ownership,
                 processRunID: nil,
-                transcriptTurnID: nil
+                transcriptTurnID: nil,
+                providerKindRaw: nil
             )
             _ = try await store.commitQueuedIntent(
                 binding: binding,
@@ -694,7 +698,8 @@ final class AgentRecoveryStartupReconciliationTests: XCTestCase {
                 expectedRevision: store.currentRevision(sessionID: binding.sessionID),
                 ownership: ownership,
                 processRunID: UUID(),
-                transcriptTurnID: UUID()
+                transcriptTurnID: UUID(),
+                providerKindRaw: nil
             )
         }
 
@@ -743,7 +748,8 @@ final class AgentRecoveryStartupReconciliationTests: XCTestCase {
                     expectedRevision: store.currentRevision(sessionID: binding.sessionID),
                     ownership: spec.ownership,
                     processRunID: spec.processRunID,
-                    transcriptTurnID: spec.turnID
+                    transcriptTurnID: spec.turnID,
+                    providerKindRaw: nil
                 )
                 if let commit = spec.commit {
                     _ = try await store.recordRunTerminal(
@@ -990,7 +996,8 @@ final class AgentRecoveryStartupReconciliationTests: XCTestCase {
                 expectedRevision: store.currentRevision(sessionID: binding.sessionID),
                 ownership: quitOwnership,
                 processRunID: nil,
-                transcriptTurnID: nil
+                transcriptTurnID: nil,
+                providerKindRaw: nil
             )
             _ = try await store.recordRunShutdown(
                 binding: binding,
@@ -1037,7 +1044,8 @@ final class AgentRecoveryStartupReconciliationTests: XCTestCase {
                 expectedRevision: store.currentRevision(sessionID: binding.sessionID),
                 ownership: resetOwnership,
                 processRunID: nil,
-                transcriptTurnID: nil
+                transcriptTurnID: nil,
+                providerKindRaw: nil
             )
         }
         _ = try await resetTranscript(earlier, reset, in: home)
@@ -1053,7 +1061,8 @@ final class AgentRecoveryStartupReconciliationTests: XCTestCase {
                 expectedRevision: store.currentRevision(sessionID: binding.sessionID),
                 ownership: remoteHostedOwnership,
                 processRunID: nil,
-                transcriptTurnID: nil
+                transcriptTurnID: nil,
+                providerKindRaw: nil
             )
             _ = try await store.commitQueuedIntent(
                 binding: binding,
@@ -1247,7 +1256,8 @@ final class AgentRecoveryStartupReconciliationTests: XCTestCase {
                     expectedRevision: store.currentRevision(sessionID: binding.sessionID),
                     ownership: ownership,
                     processRunID: nil,
-                    transcriptTurnID: turnID
+                    transcriptTurnID: turnID,
+                    providerKindRaw: nil
                 )
             }
         }
@@ -1280,7 +1290,8 @@ final class AgentRecoveryStartupReconciliationTests: XCTestCase {
                 expectedRevision: store.currentRevision(sessionID: binding.sessionID),
                 ownership: live,
                 processRunID: UUID(),
-                transcriptTurnID: liveTurnID
+                transcriptTurnID: liveTurnID,
+                providerKindRaw: nil
             )
         }
         // The saved file holds all three turns open at once (the live owner saved mid-run beside the
@@ -1388,7 +1399,8 @@ final class AgentRecoveryStartupReconciliationTests: XCTestCase {
                     expectedRevision: store.currentRevision(sessionID: binding.sessionID),
                     ownership: ownership,
                     processRunID: nil,
-                    transcriptTurnID: turnID
+                    transcriptTurnID: turnID,
+                    providerKindRaw: nil
                 )
                 if ownership == completed {
                     // Stage A recorded a provisional quit reason before the run completed.
@@ -1492,7 +1504,8 @@ final class AgentRecoveryStartupReconciliationTests: XCTestCase {
                     expectedRevision: store.currentRevision(sessionID: binding.sessionID),
                     ownership: ownership,
                     processRunID: nil,
-                    transcriptTurnID: turnID
+                    transcriptTurnID: turnID,
+                    providerKindRaw: nil
                 )
                 _ = try await store.recordRunTerminal(
                     binding: binding,
@@ -1597,7 +1610,8 @@ final class AgentRecoveryStartupReconciliationTests: XCTestCase {
                 expectedRevision: store.currentRevision(sessionID: binding.sessionID),
                 ownership: ownership,
                 processRunID: UUID(),
-                transcriptTurnID: nil
+                transcriptTurnID: nil,
+                providerKindRaw: nil
             )
             let first = try await store.commitDelegatedChildLink(binding: binding, link: link)
             XCTAssertEqual(first.disposition, .committed)

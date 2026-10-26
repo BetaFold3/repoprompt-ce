@@ -123,6 +123,30 @@ final class AgentRecoveryDelegatedChildLinkTests: XCTestCase {
         XCTAssertFalse(harness.viewModel.mcpDelegatedChildLinkAdmissionIsCurrent(admission))
     }
 
+    /// The link's write creates the parent's run attempt with the parent run's run-start provider:
+    /// never the child's provider, and never the parent's provider after a mid-run change.
+    func testLinkCreatingTheParentAttemptRecordsTheParentRunStartProvider() async throws {
+        let harness = try await makeHarness(windowID: 95211)
+        let lane = try await persistAndClaimLane(harness)
+        harness.session.selectedAgent = .codexExec
+        let ownership = beginParentAttempt(harness)
+        harness.session.selectedAgent = .claudeCode
+        let admission = try XCTUnwrap(admit(harness, invocationID: UUID()))
+        let child = try await makeChild(harness)
+        child.session.selectedAgent = .openCode
+        func parentAttempt() async -> AgentRecoveryRunAttempt? {
+            guard case let .success(.supported(record)) = await lane.readRecord() else { return nil }
+            return record.runAttempt(id: ownership.attemptID)
+        }
+        let before = await parentAttempt()
+        XCTAssertNil(before, "the link's write creates the parent's attempt")
+
+        try await harness.viewModel.mcpCommitDelegatedChildLink(admission, childTabID: child.session.tabID, childSessionID: child.sessionID)
+
+        let after = await parentAttempt()
+        XCTAssertEqual(after?.recordedProviderKindRaw, AgentProviderKind.codexExec.rawValue)
+    }
+
     func testAttemptReplacedBeforeAdmissionBelongsToNewAttemptAndAfterAdmissionFails() async throws {
         let harness = try await makeHarness(windowID: 95203)
         let lane = try await persistAndClaimLane(harness)

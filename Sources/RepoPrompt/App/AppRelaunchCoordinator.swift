@@ -184,12 +184,14 @@ final class AppRelaunchCoordinator {
 
 extension AppRelaunchCoordinator {
     /// `nil` unless Restart safely is qualified, Phase 3 registration is active, and the bundled
-    /// helper resolves inside this exact bundle. Production qualification keeps it `nil`.
+    /// helper resolves inside this exact bundle. The app's one activation
+    /// (`AgentRecoveryActivation.production`) never qualifies it: safe restart has its own acceptance,
+    /// and subset registration can't prove unregistered families stopped.
     static func production(
-        qualification: AgentRecoveryActionQualification = .production,
+        qualification: AgentRecoveryActionQualification = AgentRecoveryActivation.production.actions,
         registry: AgentProcessRegistry? = AgentProcessRegistry.production
     ) -> AppRelaunchCoordinator? {
-        guard qualification.safeRestart, let registry, registry.isRegistrationActive else { return nil }
+        guard qualification.safeRestart, let registry, registry.isAnyPairRegistered else { return nil }
         let bundleURL = Bundle.main.bundleURL.standardizedFileURL
         // The ONLY helper resolver: the bundled auxiliary executable.
         guard let helperURL = Bundle.main.url(forAuxiliaryExecutable: "repoprompt-mcp")?.standardizedFileURL,

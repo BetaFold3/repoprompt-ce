@@ -3,7 +3,8 @@ import Foundation
 // Lossless restart Phase 4 explicit recovery actions (phase4-plan "Durable action association",
 // "Restart join", and the activation gates). One runner per window performs each user choice as:
 //
-//   gate (qualification AND active Phase 3 registration)
+//   gate (qualification AND active Phase 3 registration AND the target's provider qualified,
+//         with a history performer when the choice reconciles)
 //   → durable reservation (idempotent: a repeated click joins, never re-performs)
 //   → history-only reconciliation (Reconcile, and R7 step 2 before every continuation when
 //     history reconciliation is qualified)
@@ -18,8 +19,8 @@ import Foundation
 // record and reported, never performed again. A previous launch's open action on the item is joined
 // and returned typed (`priorAction`); only an explicit new choice naming it may replace it.
 
-/// Activation of explicit recovery actions. Production keeps every capability OFF until live
-/// acceptance (O3) qualifies it; tests opt in explicitly.
+/// Activation of explicit recovery actions. Production takes it from
+/// `AgentRecoveryActivation.production` (see O32 there); tests opt in explicitly.
 package struct AgentRecoveryActionQualification: Equatable {
     /// Same-conversation Continue / Send saved / Answer as input through normal dispatch.
     package var sameConversationResume: Bool
@@ -41,9 +42,6 @@ package struct AgentRecoveryActionQualification: Equatable {
         self.freshClaudeConversation = freshClaudeConversation
         self.safeRestart = safeRestart
     }
-
-    /// Production: everything OFF (O3 live acceptance pending).
-    package static let production = AgentRecoveryActionQualification()
 
     package func allows(_ kind: AgentRecoveryActionKind) -> Bool {
         switch kind {
@@ -140,14 +138,28 @@ package final class AgentRecoveryActionRunner {
     package static let clearedConversationText =
         "The conversation was cleared after this run, so it can't be continued there. Nothing was sent."
 
-    private let qualification: AgentRecoveryActionQualification
+    /// A qualified provider whose window supplied no history performer refuses every choice that
+    /// reconciles, before anything is reserved.
+    package static let historyUnavailableText = "Provider history isn't available for this session. Nothing was sent."
+    /// O32: every provider sees the actions; one whose process ownership and provider history can't
+    /// be verified refuses before anything is reserved.
+    package static func unqualifiedProviderText(_ providerName: String) -> String {
+        "Recovery for \(providerName) isn't qualified yet: RepoPrompt can't verify its process ownership and provider history. Nothing was sent."
+    }
+
+    /// The one activation this runner gates on (its composition's).
+    package let activation: AgentRecoveryActivation
     private let registrationActive: @MainActor () -> Bool
 
+    private var qualification: AgentRecoveryActionQualification {
+        activation.actions
+    }
+
     package init(
-        qualification: AgentRecoveryActionQualification = .production,
+        activation: AgentRecoveryActivation,
         registrationActive: @escaping @MainActor () -> Bool
     ) {
-        self.qualification = qualification
+        self.activation = activation
         self.registrationActive = registrationActive
     }
 
@@ -155,11 +167,13 @@ package final class AgentRecoveryActionRunner {
         qualification.allows(kind) && registrationActive()
     }
 
-    /// Whether a Claude dispatch captures its pre-send history baseline: history reconciliation is
-    /// qualified and verified provider tracking is active. Production: never (zero history reads,
-    /// zero extra writes, ordinary send behavior).
-    package var capturesDispatchBaselines: Bool {
+    /// Whether a dispatch by `agent` captures its pre-send history baseline: history reconciliation
+    /// is qualified, verified provider tracking is active, and that provider's own pairs are covered
+    /// (never a Claude-compatible backend or any provider this activation doesn't qualify). While
+    /// the activation is `.off`: never (zero history reads, zero extra writes, ordinary sends).
+    package func capturesDispatchBaselines(for agent: AgentProviderKind) -> Bool {
         qualification.historyReconciliation && registrationActive()
+            && activation.coversProvider(AgentRuntimeProvider(agentKind: agent))
     }
 
     /// Performs (or joins) one explicit choice under the app-scoped coordinator's shared action hold
@@ -176,6 +190,17 @@ package final class AgentRecoveryActionRunner {
     ) async -> AgentRecoveryActionResult {
         guard qualification.allows(request.kind) else { return .disabled(Self.disabledText) }
         guard registrationActive() else { return .disabled(Self.registrationInactiveText) }
+        // O32 provider gate, before any hold or reservation (zero writes): the reserved target's own
+        // provider must be qualified, and a choice that reconciles needs a history performer (a
+        // missing one is a refusal, never a silent dispatch or "nothing imported").
+        let providerKind = request.target.providerKindRaw.flatMap(AgentProviderKind.init(rawValue:))
+        let needsHistory = request.kind == .reconcileOnly
+            || (qualification.historyReconciliation && request.kind.reconcilesBeforeDispatch)
+        guard activation.coversProvider(providerKind.flatMap(AgentRuntimeProvider.init(agentKind:))) else {
+            return .disabled(Self.unqualifiedProviderText(providerKind?.displayName ?? "this provider"))
+        }
+        // A qualified provider whose window lent no history performer: nothing can reconcile.
+        guard !needsHistory || performers.reconcile != nil else { return .disabled(Self.historyUnavailableText) }
         guard let coordinator = lane.recoveryCoordinator else { return .refused(Self.recoveryUnavailableText) }
         let authorization: AgentRecoveryActionAuthorization
         switch coordinator.beginRecoveryAction(request, lane: lane) {

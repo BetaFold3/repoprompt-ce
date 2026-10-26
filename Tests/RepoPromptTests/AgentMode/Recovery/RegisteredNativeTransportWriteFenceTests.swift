@@ -76,9 +76,13 @@ final class RegisteredNativeTransportWriteFenceTests: XCTestCase {
         }
     }
 
-    private func startRegistry() async {
+    /// Claude tests run under the production candidate (`.claudeAndCodex`); ACP is not covered
+    /// there, so its fence tests pass the all-pairs fixture qualification.
+    private func startRegistry(
+        _ qualification: AgentRuntimeQualification = AgentRecoveryActivation.claudeAndCodex.runtime
+    ) async {
         store = AgentRecoveryStore(rootURL: recoveryRoot, appInstanceID: UUID())
-        registry = AgentProcessRegistry(store: store, qualification: Fixtures.qualified(), system: processes.system)
+        registry = AgentProcessRegistry(store: store, qualification: qualification, system: processes.system)
         await registry.start()
     }
 
@@ -664,7 +668,9 @@ final class RegisteredNativeTransportWriteFenceTests: XCTestCase {
         // Registry not yet started: the reservation's admission runs that startup discovery, whose
         // scripted inventory is held so the start can be cancelled while its reservation is suspended.
         store = AgentRecoveryStore(rootURL: recoveryRoot, appInstanceID: UUID())
-        registry = AgentProcessRegistry(store: store, qualification: Fixtures.qualified(), system: processes.system)
+        registry = AgentProcessRegistry(
+            store: store, qualification: AgentRecoveryActivation.claudeAndCodex.runtime, system: processes.system
+        )
         let gate = InventoryGate()
         processes.inventoryHook = { await gate.pass() }
         let controller = try makeClaude()
@@ -877,8 +883,81 @@ final class RegisteredNativeTransportWriteFenceTests: XCTestCase {
         )
     }
 
-    func testACPOwnerRequestAssociatesItsPermissionAndWritesOnceOnlyWhenCommitted() async throws {
+    /// Step 9-activation-a acceptance 3: under `.claudeAndCodex`, a covered pair's controller
+    /// registers (joins retirement, reserves before its spawn, carries the marker); an uncovered
+    /// pair (ACP, a Claude-compatible backend, headless GLM) gets no launch owner, no runtime file
+    /// and no marker, its controller does not join retirement, and an inherited marker is still
+    /// stripped at the managed launch boundary.
+    func testUncoveredPairsLaunchUnregisteredUnderClaudeAndCodex() async throws {
         await startRegistry()
+        let authority = AgentRuntimeLaunchAuthority.registry(registry)
+        func claude(_ variant: ClaudeCodeRuntimeVariant) throws -> ClaudeNativeProcessSessionController {
+            try ClaudeNativeProcessSessionController(
+                runID: UUID(),
+                tabID: UUID(),
+                windowID: 1,
+                workspacePath: nil,
+                config: .agentMode(commandName: "claude", modelString: nil, runtimeVariant: variant, permissionMode: nil),
+                mcpHost: ServerNetworkManager.shared,
+                launchAuthority: authority
+            )
+        }
+        let acp = try ACPAgentSessionController(
+            provider: FixtureACPProvider(),
+            runRequest: ACPRunRequest(
+                agentKind: .cursor,
+                modelString: nil,
+                workspacePath: "/tmp/wt-native",
+                resumeSessionID: nil,
+                attachments: [],
+                taskLabelKind: nil
+            ),
+            mcpHost: ServerNetworkManager.shared,
+            launchAuthority: authority
+        )
+        XCTAssertTrue(try claude(.standard).joinsRetirementBeforeSuccessor, "Claude Code is covered")
+        XCTAssertFalse(try claude(.glm).joinsRetirementBeforeSuccessor, "a compatible backend is not")
+        XCTAssertFalse(acp.joinsRetirementBeforeSuccessor, "ACP is not")
+
+        let uncovered: [(AgentRuntimeFamily, AgentRuntimeProvider)] = [
+            (.acp, .acp(.cursor)),
+            (.claudeCompatible, .claude(.glm)),
+            (.claudeHeadless, .claude(.glm))
+        ]
+        for (family, provider) in uncovered {
+            XCTAssertFalse(authority.isRegistrationActive(family: family, provider: provider), "\(family) \(provider)")
+            XCTAssertNil(
+                authority.makeLaunch(Fixtures.context(family, provider: provider, session: owner, worktreePath: "/tmp/wt-native")),
+                "\(family) \(provider) launches unregistered"
+            )
+        }
+        XCTAssertEqual(Fixtures.runtimeFileCount(rootURL: recoveryRoot), 0, "no uncovered pair writes a runtime file")
+
+        // The launch environment of an unregistered spawn: the inherited marker is stripped and,
+        // with no launch owner (`runtimeID == nil`), none is added.
+        let marker = ProcessLauncher.runtimeMarkerEnvironmentKey
+        let inherited = ["PATH": "/usr/bin", marker: UUID().uuidString]
+        let unregistered = ProcessLauncher.launchEnvironment(
+            AgentRuntimeLaunchAuthority.strippingInheritedMarker(inherited), runtimeID: nil
+        )
+        XCTAssertNil(unregistered[marker])
+        XCTAssertEqual(unregistered["PATH"], "/usr/bin")
+
+        // The covered pair reserves before its spawn and its child carries the reserved marker.
+        let covered = try XCTUnwrap(authority.makeLaunch(
+            Fixtures.context(.claudeNative, provider: .claude(.standard), session: owner, worktreePath: "/tmp/wt-native")
+        ))
+        let runtimeID = try await covered.prepareSpawn()
+        XCTAssertEqual(Fixtures.runtimeFileCount(rootURL: recoveryRoot), 1)
+        let registered = ProcessLauncher.launchEnvironment(
+            AgentRuntimeLaunchAuthority.strippingInheritedMarker(inherited), runtimeID: runtimeID
+        )
+        XCTAssertEqual(registered[marker], runtimeID.uuidString)
+        await covered.spawnFailed()
+    }
+
+    func testACPOwnerRequestAssociatesItsPermissionAndWritesOnceOnlyWhenCommitted() async throws {
+        await startRegistry(Fixtures.qualified())
         let (launch, runtimeID) = try await committedLaunch(.acp)
         let transport = FixtureTransport()
         let controller = try await makeACP(transport: transport)
@@ -913,7 +992,7 @@ final class RegisteredNativeTransportWriteFenceTests: XCTestCase {
     }
 
     func testACPReplacementDuringAnyFenceAwaitGetsZeroBytes() async throws {
-        await startRegistry()
+        await startRegistry(Fixtures.qualified())
         let original = FixtureTransport()
         let controller = try await makeACP(transport: original)
         for checkpoint in ["launchCaptured", "associated", "authorized"] {
@@ -955,7 +1034,7 @@ final class RegisteredNativeTransportWriteFenceTests: XCTestCase {
     }
 
     func testACPPermissionReplyGoesOnlyToItsIssuingTransport() async throws {
-        await startRegistry()
+        await startRegistry(Fixtures.qualified())
         let (first, _) = try await committedLaunch(.acp)
         let firstPID = nextPID - 1
         let original = FixtureTransport()

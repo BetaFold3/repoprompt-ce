@@ -373,7 +373,7 @@ final class AgentRecoveryActionTests: XCTestCase {
                 intentID = try XCTUnwrap(AgentQueuedInputIdentity(receipt: admitted.receipt).intentID)
             }
             let ownership = RecoveryTestSupport.ownership(sessionID: fixture.sessionID)
-            _ = try await lane.ensureRunAttempt(ownership: ownership, processRunID: nil, transcriptTurnID: UUID()).get()
+            _ = try await lane.ensureRunAttempt(ownership: ownership, processRunID: nil, transcriptTurnID: UUID(), providerKindRaw: nil).get()
             let attemptID = UUID()
             _ = try await lane.beginDispatch(
                 intentID: intentID,
@@ -397,13 +397,15 @@ final class AgentRecoveryActionTests: XCTestCase {
     )
 
     func testProductionQualificationAndInactiveRegistrationReserveNothing() async throws {
-        XCTAssertEqual(AgentRecoveryActionQualification.production, AgentRecoveryActionQualification())
+        // Step 9-activation-a: production stays `.off` until the live checks (9-flip).
+        XCTAssertEqual(AgentRecoveryActivation.production, .off)
+        XCTAssertEqual(AgentRecoveryActivation.production.actions, AgentRecoveryActionQualification())
         for kind in AgentRecoveryActionKind.allCases {
-            XCTAssertFalse(AgentRecoveryActionQualification.production.allows(kind), "\(kind) must stay OFF in production")
+            XCTAssertFalse(AgentRecoveryActivation.production.actions.allows(kind), "\(kind) must stay OFF in production")
         }
-        XCTAssertFalse(AgentRecoveryActionQualification.production.safeRestart)
+        XCTAssertFalse(AgentRecoveryActivation.production.actions.safeRestart)
         let calls = Calls()
-        let production = AgentRecoveryActionRunner(qualification: .production, registrationActive: { true })
+        let production = AgentRecoveryActionRunner(activation: .production, registrationActive: { true })
         let request = try await continuation(key: runKey(), expectedRevision: revision())
         let disabled = await production.perform(request, lane: lane, performers: performers(calls))
         XCTAssertEqual(disabled, .disabled(AgentRecoveryActionRunner.disabledText))
@@ -416,17 +418,172 @@ final class AgentRecoveryActionTests: XCTestCase {
         XCTAssertEqual(actionCount, 0)
     }
 
+    /// O32 provider gate (Step 9-activation-a): under `.claudeAndCodex`, every recovery choice for a
+    /// provider whose ownership and history aren't qualified refuses before the coordinator hold and
+    /// any reservation (zero writes, nothing reconciled or sent), with the named reason, even when a
+    /// history performer is supplied. Check reports that refusal as could not check.
+    func testUnqualifiedProvidersRefuseEveryChoiceBeforeAnyReservation() async throws {
+        let runner = AgentRecoveryActionRunner(activation: .claudeAndCodex, registrationActive: { true })
+        let calls = Calls()
+        let unqualified: [AgentProviderKind] = [.openCode, .cursor, .ohMyPi, .claudeCodeGLM, .kimiCode, .customClaudeCompatible]
+        XCTAssertEqual(
+            Set(unqualified),
+            Set(AgentProviderKind.allCases).subtracting([.claudeCode, .codexExec]),
+            "every Agent Mode provider other than Claude Code and Codex"
+        )
+        let revisionBefore = try await revision()
+        for kind in unqualified {
+            let target = AgentRecoveryActionTarget(providerKindRaw: kind.rawValue, providerConversationID: "conv-\(kind.rawValue)")
+            for actionKind in AgentRecoveryActionKind.allCases {
+                let request = AgentRecoveryActionRequest(
+                    actionID: UUID(),
+                    itemKey: runKey(),
+                    kind: actionKind,
+                    expectedRevision: revisionBefore,
+                    sourceIntentIDs: actionKind == .sendSaved ? [UUID()] : [],
+                    sourceRunAttemptID: UUID(),
+                    target: target,
+                    text: actionKind.dispatches && actionKind != .sendSaved ? "continue" : nil,
+                    plannedUserItemID: actionKind.dispatches && actionKind != .sendSaved ? UUID() : nil
+                )
+                let result = await runner.perform(
+                    request,
+                    lane: lane,
+                    performers: performers(calls, reconcile: .imported(completion: .unconfirmed, rowCount: 1))
+                )
+                let expected = AgentRecoveryActionRunner.unqualifiedProviderText(kind.displayName)
+                if actionKind == .continueInNewConversation {
+                    // Not part of this activation at all: refused by the capability gate first.
+                    XCTAssertEqual(result, .disabled(AgentRecoveryActionRunner.disabledText))
+                } else {
+                    XCTAssertEqual(result, .disabled(expected), "\(kind) \(actionKind)")
+                    XCTAssertEqual(
+                        AgentRecoveryCheckReconcile.performed(result, observed: nil).outcome,
+                        .couldNotCheck(expected),
+                        "Check reports the refusal as could not check"
+                    )
+                }
+            }
+        }
+        XCTAssertEqual(calls.reconcile, 0, "nothing reconciled")
+        XCTAssertEqual(calls.dispatch, 0, "nothing sent")
+        let revisionAfter = try await revision()
+        XCTAssertEqual(revisionAfter, revisionBefore, "zero writes")
+        let actions = try await record()?.actions ?? []
+        XCTAssertTrue(actions.isEmpty, "nothing reserved")
+        XCTAssertEqual(
+            AgentRecoveryActionRunner.unqualifiedProviderText("OpenCode"),
+            "Recovery for OpenCode isn't qualified yet: RepoPrompt can't verify its process ownership and provider history. Nothing was sent."
+        )
+        // A target naming no known provider refuses too.
+        let unnamed = AgentRecoveryActionRequest(
+            actionID: UUID(), itemKey: runKey(), kind: .reconcileOnly, expectedRevision: revisionBefore,
+            target: AgentRecoveryActionTarget(providerKindRaw: nil, providerConversationID: "conv-x")
+        )
+        let unnamedResult = await runner.perform(unnamed, lane: lane, performers: performers(calls, reconcile: .nothingImported("none")))
+        XCTAssertEqual(unnamedResult, .disabled(AgentRecoveryActionRunner.unqualifiedProviderText("this provider")))
+    }
+
+    /// A qualified provider whose choice reconciles still needs a history performer: without one it
+    /// refuses before reserving with the history-unavailable reason (never a silent continuation or
+    /// a "nothing imported" outcome). Send saved reads no history, so it needs none: a real saved
+    /// message is dispatched exactly once.
+    func testQualifiedProviderWithoutAHistoryPerformerRefusesOnlyChoicesThatReconcile() async throws {
+        let runner = AgentRecoveryActionRunner(activation: .claudeAndCodex, registrationActive: { true })
+        let calls = Calls()
+        let revisionBefore = try await revision()
+        for providerKind in [AgentProviderKind.claudeCode, .codexExec] {
+            let target = AgentRecoveryActionTarget(providerKindRaw: providerKind.rawValue, providerConversationID: "conv-1")
+            let reconcile = AgentRecoveryActionRequest(
+                actionID: UUID(), itemKey: runKey(), kind: .reconcileOnly, expectedRevision: revisionBefore, target: target
+            )
+            let reconciled = await runner.perform(reconcile, lane: lane, performers: performers(calls))
+            XCTAssertEqual(reconciled, .disabled(AgentRecoveryActionRunner.historyUnavailableText), "\(providerKind)")
+            let continuation = AgentRecoveryActionRequest(
+                actionID: UUID(), itemKey: runKey(), kind: .continueWithText, expectedRevision: revisionBefore,
+                target: target, text: "continue", plannedUserItemID: UUID()
+            )
+            let continued = await runner.perform(continuation, lane: lane, performers: performers(calls))
+            XCTAssertEqual(continued, .disabled(AgentRecoveryActionRunner.historyUnavailableText), "\(providerKind)")
+        }
+        XCTAssertEqual(
+            AgentRecoveryActionRunner.historyUnavailableText,
+            "Provider history isn't available for this session. Nothing was sent."
+        )
+        let revisionAfterRefusals = try await revision()
+        XCTAssertEqual(revisionAfterRefusals, revisionBefore, "the refusals wrote nothing")
+        XCTAssertEqual(calls.dispatch, 0)
+
+        let identity = try await fixture.queuedIdentity("saved message")
+        let intentID = try XCTUnwrap(identity.intentID)
+        let key = AgentRecoveryCardKey(
+            kind: .savedInput,
+            incarnationID: lane.binding.incarnationID,
+            transcriptResetGeneration: lane.binding.transcriptResetGeneration,
+            entityID: intentID.uuidString
+        )
+        let sendSaved = try await AgentRecoveryActionRequest(
+            actionID: UUID(), itemKey: key, kind: .sendSaved, expectedRevision: revision(),
+            sourceIntentIDs: [intentID],
+            target: AgentRecoveryActionTarget(providerKindRaw: AgentProviderKind.claudeCode.rawValue, providerConversationID: "conv-1")
+        )
+        let sent = await runner.perform(sendSaved, lane: lane, performers: performers(calls))
+        XCTAssertEqual(sent, .completed(.dispatched, reason: nil), "Send saved needs no history performer")
+        XCTAssertEqual(calls.dispatch, 1)
+        XCTAssertEqual(calls.reconcile, 0)
+    }
+
+    /// Round-0 review P2-3: a provider is covered only when every supported family that serves it is
+    /// covered. A hypothetical activation qualifying Codex exec alone (app-server runs would launch
+    /// unregistered) or headless GLM alone doesn't cover that provider, and the runner refuses it.
+    func testProviderIsCoveredOnlyWhenEveryFamilyServingItIsCovered() async throws {
+        let full = AgentRecoveryActivation.claudeAndCodex
+        func only(_ families: Set<AgentRuntimeFamily>) -> AgentRecoveryActivation {
+            AgentRecoveryActivation(
+                runtime: AgentRuntimeQualification(families: full.runtime.families.filter { families.contains($0.key) }),
+                actions: full.actions
+            )
+        }
+        XCTAssertTrue(full.coversProvider(.codex))
+        XCTAssertTrue(full.coversProvider(.claude(.standard)))
+        let execOnly = only([.codexExec])
+        XCTAssertTrue(execOnly.runtime.covers(family: .codexExec, provider: .codex))
+        XCTAssertFalse(execOnly.coversProvider(.codex), "app-server runs would launch unregistered")
+        XCTAssertFalse(only([.claudeHeadless]).coversProvider(.claude(.standard)), "native runs would launch unregistered")
+        let headlessGLM = AgentRecoveryActivation(
+            runtime: AgentRuntimeQualification(families: [.claudeHeadless: AgentRuntimeFamilyQualification(
+                providers: [.claude(.glm)], markerPropagation: true, completeDiscovery: true,
+                writerExecutableBasenames: ["claude"]
+            )]),
+            actions: full.actions
+        )
+        XCTAssertFalse(headlessGLM.coversProvider(.claude(.glm)), "compatible native runs would launch unregistered")
+        XCTAssertFalse(full.coversProvider(nil))
+
+        let runner = AgentRecoveryActionRunner(activation: execOnly, registrationActive: { true })
+        let calls = Calls()
+        let request = try await continuation(key: runKey(), expectedRevision: revision())
+        let codexRequest = AgentRecoveryActionRequest(
+            actionID: request.actionID, itemKey: request.itemKey, kind: request.kind, expectedRevision: request.expectedRevision,
+            target: AgentRecoveryActionTarget(providerKindRaw: AgentProviderKind.codexExec.rawValue, providerConversationID: "thread-1"),
+            text: request.text, plannedUserItemID: request.plannedUserItemID
+        )
+        let result = await runner.perform(codexRequest, lane: lane, performers: performers(calls, reconcile: .nothingImported("none")))
+        XCTAssertEqual(result, .disabled(AgentRecoveryActionRunner.unqualifiedProviderText(AgentProviderKind.codexExec.displayName)))
+        XCTAssertEqual(calls.reconcile + calls.dispatch, 0)
+    }
+
     func testQualifiedChoiceDispatchesOnceAndARepeatJoins() async throws {
         let calls = Calls()
         let runner = AgentRecoveryActionRunner(qualification: qualified, registrationActive: { true })
         let request = try await continuation(key: runKey(), expectedRevision: revision())
-        async let first = runner.perform(request, lane: lane, performers: performers(calls))
-        async let concurrent = runner.perform(request, lane: lane, performers: performers(calls))
+        async let first = runner.perform(request, lane: lane, performers: performers(calls, reconcile: .nothingImported("none")))
+        async let concurrent = runner.perform(request, lane: lane, performers: performers(calls, reconcile: .nothingImported("none")))
         let (one, two) = await (first, concurrent)
         XCTAssertEqual(one, .completed(.dispatched, reason: nil))
         XCTAssertEqual(two, one, "a concurrent repeat joins the in-flight performance")
         XCTAssertEqual(calls.dispatch, 1)
-        let repeated = await runner.perform(request, lane: lane, performers: performers(calls))
+        let repeated = await runner.perform(request, lane: lane, performers: performers(calls, reconcile: .nothingImported("none")))
         guard case let .joined(.resolved(outcome)) = repeated else { return XCTFail("expected a resolved join, got \(repeated)") }
         XCTAssertEqual(outcome.kind, .dispatched)
         XCTAssertEqual(calls.dispatch, 1, "a recorded choice is never performed again")
@@ -438,7 +595,7 @@ final class AgentRecoveryActionTests: XCTestCase {
         _ = try await lane.reserveRecoveryAction(request).get()
         let calls = Calls()
         let runner = AgentRecoveryActionRunner(qualification: qualified, registrationActive: { true })
-        let result = await runner.perform(request, lane: lane, performers: performers(calls))
+        let result = await runner.perform(request, lane: lane, performers: performers(calls, reconcile: .nothingImported("none")))
         XCTAssertEqual(result, .joined(.notDispatched), "the planned message never became an intent")
         XCTAssertEqual(calls.dispatch, 0)
         let outcome = try await record()?.action(id: request.actionID)?.outcome
@@ -449,10 +606,11 @@ final class AgentRecoveryActionTests: XCTestCase {
         let runner = AgentRecoveryActionRunner(qualification: qualified, registrationActive: { true })
         let calls = Calls()
         let refusedRequest = try await continuation(key: runKey(), expectedRevision: revision())
-        let refused = await runner.perform(refusedRequest, lane: lane, performers: performers(calls, dispatch: .notDispatched("busy")))
+        let refused = await runner.perform(refusedRequest, lane: lane, performers: performers(calls, dispatch: .notDispatched("busy"), reconcile: .nothingImported("none")))
         XCTAssertEqual(refused, .completed(.notDispatched, reason: "busy"))
         let reason = try await record()?.action(id: refusedRequest.actionID)?.outcome?.reason
         XCTAssertEqual(reason, "busy")
+        XCTAssertEqual(calls.reconcile, 1, "a qualified continuation reconciles history before it dispatches")
 
         let reconcileRequest = try await AgentRecoveryActionRequest(
             actionID: UUID(), itemKey: runKey(), kind: .reconcileOnly, expectedRevision: revision(), target: target
@@ -463,7 +621,7 @@ final class AgentRecoveryActionTests: XCTestCase {
             performers: performers(calls, reconcile: .imported(completion: .unconfirmed, rowCount: 3))
         )
         XCTAssertEqual(imported, .completed(.importedUnconfirmed, reason: nil))
-        XCTAssertEqual(calls.reconcile, 1)
+        XCTAssertEqual(calls.reconcile, 2)
         XCTAssertEqual(calls.dispatch, 1, "reconciliation never dispatches")
 
         let nothingRequest = try await AgentRecoveryActionRequest(
@@ -475,9 +633,28 @@ final class AgentRecoveryActionTests: XCTestCase {
 
     func testAssociationUnavailableIsNeitherCompletionNorImport() async throws {
         let runner = AgentRecoveryActionRunner(qualification: qualified, registrationActive: { true })
-        XCTAssertTrue(runner.capturesDispatchBaselines)
-        XCTAssertFalse(AgentRecoveryActionRunner(qualification: .production, registrationActive: { true }).capturesDispatchBaselines)
-        XCTAssertFalse(AgentRecoveryActionRunner(qualification: qualified, registrationActive: { false }).capturesDispatchBaselines)
+        XCTAssertTrue(runner.capturesDispatchBaselines(for: .claudeCode))
+        XCTAssertFalse(AgentRecoveryActionRunner(activation: .production, registrationActive: { true }).capturesDispatchBaselines(for: .claudeCode))
+        let claudeAndCodex = AgentRecoveryActionRunner(activation: .claudeAndCodex, registrationActive: { true })
+        XCTAssertTrue(
+            claudeAndCodex.capturesDispatchBaselines(for: .claudeCode),
+            "the qualified activation captures Claude baselines (coupled, ungated)"
+        )
+        for compatible in [AgentProviderKind.claudeCodeGLM, .kimiCode, .customClaudeCompatible] {
+            XCTAssertFalse(claudeAndCodex.capturesDispatchBaselines(for: compatible), "never a compatible backend: \(compatible)")
+        }
+        // Round-0 review P1-2: Claude baselines need Claude's own pairs covered, not just any pair.
+        let codexOnly = AgentRecoveryActionRunner(
+            activation: AgentRecoveryActivation(
+                runtime: AgentRuntimeQualification(families: AgentRecoveryActivation.claudeAndCodex.runtime.families.filter {
+                    $0.key == .codexAppServer || $0.key == .codexExec
+                }),
+                actions: AgentRecoveryActivation.claudeAndCodex.actions
+            ),
+            registrationActive: { true }
+        )
+        XCTAssertFalse(codexOnly.capturesDispatchBaselines(for: .claudeCode))
+        XCTAssertFalse(AgentRecoveryActionRunner(qualification: qualified, registrationActive: { false }).capturesDispatchBaselines(for: .claudeCode))
         let calls = Calls()
         let refusal = AgentRecoveryReconcileResult.associationUnavailable(.nativeUserAssociationUnavailable, "cannot match")
         let reconcileRequest = try await AgentRecoveryActionRequest(
@@ -569,7 +746,7 @@ final class AgentRecoveryActionTests: XCTestCase {
 
         func run(state: AgentSessionRunState?, cause: AgentRunTerminalCause = .ordinary) async throws -> UUID {
             let ownership = RecoveryTestSupport.ownership(sessionID: sessionID)
-            _ = try await lane.ensureRunAttempt(ownership: ownership, processRunID: nil, transcriptTurnID: UUID()).get()
+            _ = try await lane.ensureRunAttempt(ownership: ownership, processRunID: nil, transcriptTurnID: UUID(), providerKindRaw: nil).get()
             if let state {
                 _ = try await lane.recordRunTerminal(
                     RecoveryTestSupport.terminalCommit(ownership: ownership, state: state, cause: cause)
@@ -601,7 +778,7 @@ final class AgentRecoveryActionTests: XCTestCase {
         let runner = AgentRecoveryActionRunner(qualification: qualified, registrationActive: { true })
         let calls = Calls()
         let ownership = RecoveryTestSupport.ownership(sessionID: fixture.sessionID)
-        _ = try await lane.ensureRunAttempt(ownership: ownership, processRunID: nil, transcriptTurnID: UUID()).get()
+        _ = try await lane.ensureRunAttempt(ownership: ownership, processRunID: nil, transcriptTurnID: UUID(), providerKindRaw: nil).get()
         let identity = try await fixture.queuedIdentity("never delivered")
         let intentID = try XCTUnwrap(identity.intentID)
         let deliveryID = UUID()
@@ -627,10 +804,10 @@ final class AgentRecoveryActionTests: XCTestCase {
         let calls = Calls()
         let key = runKey()
         let first = try await continuation(key: key, expectedRevision: revision())
-        let sent = await runner.perform(first, lane: lane, performers: performers(calls))
+        let sent = await runner.perform(first, lane: lane, performers: performers(calls, reconcile: .nothingImported("none")))
         XCTAssertEqual(sent, .completed(.dispatched, reason: nil))
         let again = try await continuation(key: key, expectedRevision: revision())
-        let refused = await runner.perform(again, lane: lane, performers: performers(calls))
+        let refused = await runner.perform(again, lane: lane, performers: performers(calls, reconcile: .nothingImported("none")))
         guard case .refused = refused else { return XCTFail("a resolved item refuses a new send, got \(refused)") }
         XCTAssertEqual(calls.dispatch, 1)
     }
@@ -684,7 +861,7 @@ final class AgentRecoveryActionTests: XCTestCase {
         )
 
         let other = try await continuation(key: runKey(), expectedRevision: revision())
-        let otherResult = await runner.perform(other, lane: lane, performers: performers(calls))
+        let otherResult = await runner.perform(other, lane: lane, performers: performers(calls, reconcile: .nothingImported("none")))
         XCTAssertEqual(otherResult, .refused(AgentRecoveryActionRunner.sessionActionInFlightText))
         let changed = try await continuation(
             key: request.itemKey,
@@ -693,7 +870,7 @@ final class AgentRecoveryActionTests: XCTestCase {
             expectedRevision: revision(),
             plannedUserItemID: XCTUnwrap(request.plannedUserItemID)
         )
-        let changedResult = await runner.perform(changed, lane: lane, performers: performers(calls))
+        let changedResult = await runner.perform(changed, lane: lane, performers: performers(calls, reconcile: .nothingImported("none")))
         XCTAssertEqual(changedResult, .refused(AgentRecoveryActionRunner.sessionActionInFlightText), "only an exact repeat joins")
         XCTAssertEqual(calls.dispatch, 0)
 
@@ -740,7 +917,7 @@ final class AgentRecoveryActionTests: XCTestCase {
 
     private func ensureRun(on lane: AgentRecoverySessionLane) async throws -> UUID {
         let ownership = RecoveryTestSupport.ownership(sessionID: lane.sessionID)
-        _ = try await lane.ensureRunAttempt(ownership: ownership, processRunID: nil, transcriptTurnID: UUID()).get()
+        _ = try await lane.ensureRunAttempt(ownership: ownership, processRunID: nil, transcriptTurnID: UUID(), providerKindRaw: nil).get()
         return ownership.attemptID
     }
 
@@ -960,7 +1137,7 @@ final class AgentRecoveryActionTests: XCTestCase {
     func testRunnerRecordsUncertainSettlementAsDispatchedWithItsReason() async throws {
         let runner = AgentRecoveryActionRunner(qualification: qualified, registrationActive: { true })
         let request = try await continuation(key: runKey(), expectedRevision: revision())
-        let performers = AgentRecoveryActionPerformers(reconcile: nil) { [self] action, authorization in
+        let performers = AgentRecoveryActionPerformers(reconcile: { _ in .nothingImported("none") }) { [self] action, authorization in
             do {
                 let plannedItemID = try XCTUnwrap(action.plannedUserItemID)
                 let admitted = try await lane.admitQueued(admission(
@@ -1032,7 +1209,7 @@ final class AgentRecoveryActionTests: XCTestCase {
         let plannedItemID = try XCTUnwrap(request.plannedUserItemID)
         let gate = CommitGate()
         let capture = CommitCapture()
-        let performers = AgentRecoveryActionPerformers(reconcile: nil) { [self] _, authorization in
+        let performers = AgentRecoveryActionPerformers(reconcile: { _ in .nothingImported("none") }) { [self] _, authorization in
             capture.authorization = authorization
             do {
                 let admitted = try await lane.admitQueued(admission(
@@ -1213,7 +1390,7 @@ final class AgentRecoveryActionTests: XCTestCase {
         let calls = Calls()
         let edited = "  Check the build first,\nthen continue. "
         let request = try await continuation(key: runKey(), text: edited, expectedRevision: revision())
-        let result = await runner.perform(request, lane: lane, performers: performers(calls))
+        let result = await runner.perform(request, lane: lane, performers: performers(calls, reconcile: .nothingImported("none")))
         XCTAssertEqual(result, .completed(.dispatched, reason: nil))
         XCTAssertEqual(calls.dispatchedTexts, [edited], "the exact edited text is sent")
         let stored = try await record()?.action(id: request.actionID)?.text
@@ -1225,7 +1402,7 @@ final class AgentRecoveryActionTests: XCTestCase {
             expectedRevision: revision(),
             plannedUserItemID: XCTUnwrap(request.plannedUserItemID)
         )
-        let refused = await runner.perform(changed, lane: lane, performers: performers(calls))
+        let refused = await runner.perform(changed, lane: lane, performers: performers(calls, reconcile: .nothingImported("none")))
         guard case .refused = refused else { return XCTFail("changed text must not join, got \(refused)") }
         XCTAssertEqual(calls.dispatch, 1)
     }
@@ -1242,14 +1419,14 @@ final class AgentRecoveryActionTests: XCTestCase {
         let oldStored = try XCTUnwrap(oldLoaded)
 
         let fresh = try await continuation(key: key, expectedRevision: revision())
-        let first = await runner.perform(fresh, lane: lane, performers: performers(calls))
+        let first = await runner.perform(fresh, lane: lane, performers: performers(calls, reconcile: .nothingImported("none")))
         XCTAssertEqual(first, .priorAction(actionID: old.actionID, join: .notDispatched), "the old action is joined first")
         XCTAssertEqual(calls.dispatch, 0)
         let afterJoin = try await record()?.actions.count
         XCTAssertEqual(afterJoin, 1, "joining writes nothing")
 
         let replacement = try await continuation(key: key, expectedRevision: revision(), supersedes: old.actionID)
-        let replaced = await runner.perform(replacement, lane: lane, performers: performers(calls))
+        let replaced = await runner.perform(replacement, lane: lane, performers: performers(calls, reconcile: .nothingImported("none")))
         XCTAssertEqual(replaced, .completed(.dispatched, reason: nil))
         XCTAssertEqual(calls.dispatch, 1)
         let finalLoaded = try await record()
@@ -1260,7 +1437,7 @@ final class AgentRecoveryActionTests: XCTestCase {
         XCTAssertEqual(final.action(id: replacement.actionID)?.supersedesActionID, old.actionID)
 
         let stale = try await continuation(key: key, expectedRevision: revision(), supersedes: old.actionID)
-        let staleResult = await runner.perform(stale, lane: lane, performers: performers(calls))
+        let staleResult = await runner.perform(stale, lane: lane, performers: performers(calls, reconcile: .nothingImported("none")))
         guard case .refused = staleResult else { return XCTFail("a closed old action can't be replaced again, got \(staleResult)") }
 
         let sameLaunchKey = runKey()
@@ -1301,7 +1478,7 @@ final class AgentRecoveryActionTests: XCTestCase {
         let oldStored = try XCTUnwrap(before.action(id: old.actionID))
         guard case .dispatchEvidence = before.join(oldStored) else { return XCTFail("expected dispatch evidence") }
 
-        let first = try await runner.perform(continuation(key: key, expectedRevision: revision()), lane: lane, performers: performers(calls))
+        let first = try await runner.perform(continuation(key: key, expectedRevision: revision()), lane: lane, performers: performers(calls, reconcile: .nothingImported("none")))
         guard case let .priorAction(priorID, .dispatchEvidence(evidenceIntent, _)) = first else {
             return XCTFail("expected the uncertain prior action, got \(first)")
         }
@@ -1311,7 +1488,7 @@ final class AgentRecoveryActionTests: XCTestCase {
         let unconfirmed = try await runner.perform(
             continuation(key: key, expectedRevision: revision(), supersedes: old.actionID),
             lane: lane,
-            performers: performers(calls)
+            performers: performers(calls, reconcile: .nothingImported("none"))
         )
         guard case .refused = unconfirmed else { return XCTFail("an unconfirmed replacement is refused, got \(unconfirmed)") }
         let resend = try await runner.perform(
@@ -1321,7 +1498,7 @@ final class AgentRecoveryActionTests: XCTestCase {
                 confirmsUncertainPriorDelivery: true
             ),
             lane: lane,
-            performers: performers(calls)
+            performers: performers(calls, reconcile: .nothingImported("none"))
         )
         guard case .refused = resend else { return XCTFail("the old input is never retried, got \(resend)") }
         XCTAssertEqual(calls.dispatch, 0)
@@ -1329,7 +1506,7 @@ final class AgentRecoveryActionTests: XCTestCase {
         let confirmed = try await continuation(
             key: key, expectedRevision: revision(), supersedes: old.actionID, confirmsUncertainPrior: true
         )
-        let sent = await runner.perform(confirmed, lane: lane, performers: performers(calls))
+        let sent = await runner.perform(confirmed, lane: lane, performers: performers(calls, reconcile: .nothingImported("none")))
         XCTAssertEqual(sent, .completed(.dispatched, reason: nil))
         XCTAssertEqual(calls.dispatch, 1)
         let afterLoaded = try await record()

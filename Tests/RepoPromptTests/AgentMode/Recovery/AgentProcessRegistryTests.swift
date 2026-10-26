@@ -98,11 +98,21 @@ final class AgentProcessRegistryTests: XCTestCase {
     // MARK: Activation gate
 
     func testProductionActivationStaysOffAndInactiveRegistryRefusesReservations() async {
-        XCTAssertFalse(AgentRuntimeQualification.production.activatesRegistration)
+        // Step 9-activation-a: production stays `.off` until the live checks (9-flip).
+        XCTAssertEqual(AgentRecoveryActivation.production, .off)
+        XCTAssertFalse(AgentRecoveryActivation.off.runtime.activatesRegistration)
+        // Subset activation: any covered supported pair activates registration; only all of them
+        // speak for the whole app.
         var partial = Fixtures.qualified(freshSessionID: true)
         partial.families[.acp] = nil
-        XCTAssertFalse(partial.activatesRegistration, "one coupled activation: every managed family must qualify")
-        XCTAssertFalse(partial.allowsFreshSessionID(.claudeNative, provider: .claude(.standard)), "fresh --session-id is gated on activation")
+        XCTAssertTrue(partial.activatesRegistration, "subset activation: covered pairs register")
+        XCTAssertFalse(partial.coversAllSupportedPairs, "an uncovered family leaves whole-app proofs unavailable")
+        XCTAssertTrue(Fixtures.qualified().coversAllSupportedPairs)
+        XCTAssertTrue(partial.allowsFreshSessionID(.claudeNative, provider: .claude(.standard)), "fresh --session-id follows its own pair")
+        XCTAssertFalse(
+            AgentRecoveryActivation.off.runtime.allowsFreshSessionID(.claudeNative, provider: .claude(.standard)),
+            "fresh --session-id is gated on activation"
+        )
         XCTAssertTrue(Fixtures.qualified(freshSessionID: true).allowsFreshSessionID(.claudeNative, provider: .claude(.standard)))
         XCTAssertFalse(Fixtures.qualified(freshSessionID: true).allowsFreshSessionID(.claudeCompatible, provider: .claude(.glm)))
         XCTAssertFalse(
@@ -110,7 +120,8 @@ final class AgentProcessRegistryTests: XCTestCase {
             "qualification is keyed to the actual provider, never the family alone"
         )
         XCTAssertFalse(Fixtures.qualified().allowsFreshSessionID(.claudeNative, provider: .claude(.standard)), "fresh --session-id is a separate gate")
-        var emptyProviders = Fixtures.qualified()
+        var emptyProviders = AgentRuntimeQualification(families: [:])
+        emptyProviders.families[.acp] = Fixtures.qualified().families[.acp]
         emptyProviders.families[.acp]?.providers = []
         XCTAssertFalse(emptyProviders.activatesRegistration, "a family qualified for no actual provider does not activate")
 
@@ -119,10 +130,11 @@ final class AgentProcessRegistryTests: XCTestCase {
             return XCTFail("Production launch authority must stay off")
         }
         XCTAssertNil(AgentRuntimeLaunchAuthority.activationOff.makeLaunch(Fixtures.context(.claudeNative, worktreePath: "/tmp/x")))
+        XCTAssertFalse(AgentRuntimeLaunchAuthority.activationOff.isRegistrationActive(family: .claudeNative, provider: .claude(.standard)))
         XCTAssertFalse(AgentRuntimeLaunchAuthority.activationOff.allowsFreshSessionID(.claudeNative, provider: .claude(.standard)))
 
-        let registry = makeRegistry(store: makeStore(), qualification: .production)
-        XCTAssertFalse(registry.isRegistrationActive)
+        let registry = makeRegistry(store: makeStore(), qualification: AgentRecoveryActivation.off.runtime)
+        XCTAssertFalse(registry.isAnyPairRegistered)
         await registry.start()
         XCTAssertNil(
             AgentRuntimeLaunchAuthority.registry(registry).makeLaunch(Fixtures.context(.codexAppServer, worktreePath: "/tmp/x")),
@@ -145,7 +157,7 @@ final class AgentProcessRegistryTests: XCTestCase {
             conversationIDs: ["conv-A"],
             worktreePaths: ["/tmp/wt-a"]
         )
-        let registry = makeRegistry(store: makeStore(), qualification: .production)
+        let registry = makeRegistry(store: makeStore(), qualification: AgentRecoveryActivation.off.runtime)
         let snapshot = await registry.start()
 
         XCTAssertEqual(snapshot.restrictions.map(\.runtimeID), [seeded.runtimeID])
@@ -172,7 +184,7 @@ final class AgentProcessRegistryTests: XCTestCase {
             root: processes.identity(pid: 501),
             conversationIDs: ["conv-A"]
         )
-        let unqualified = makeRegistry(store: makeStore(), qualification: .production)
+        let unqualified = makeRegistry(store: makeStore(), qualification: AgentRecoveryActivation.off.runtime)
         var snapshot = await unqualified.start()
         XCTAssertEqual(snapshot.restrictions.first?.state, .unknown, "root gone, family discovery unqualified")
         await unqualified.disposeWatches()
@@ -295,7 +307,7 @@ final class AgentProcessRegistryTests: XCTestCase {
 
     /// Lossless restart Phase 4 §G Stage B proof and the Claude history home lookup.
     func testRestartStageBProofAndClaudeHistoryHomesFollowRegisteredRecords() async throws {
-        let inactive = makeRegistry(store: makeStore(), qualification: .production)
+        let inactive = makeRegistry(store: makeStore(), qualification: AgentRecoveryActivation.off.runtime)
         await inactive.start()
         let inactiveProof = await inactive.verifyAllFamiliesStopped()
         XCTAssertEqual(inactiveProof, .notProven("Runtime registration is not active."))
@@ -375,6 +387,33 @@ final class AgentProcessRegistryTests: XCTestCase {
         XCTAssertEqual(processes.processExited(pid: 801), 1, "every identified member is watched")
         let exited = await Fixtures.eventually { Fixtures.record(store, runtimeID)?.state == .exited }
         XCTAssertTrue(exited)
+    }
+
+    /// Q4 writer basenames: under `.claudeAndCodex` (writers `["claude"]`, no tool basenames) a
+    /// marker-bearing family member running as `node` (an npm-installed Claude, or any tool) is never
+    /// a harmless tool: after its root exits it keeps the conversation blocked, unlike the fixture
+    /// qualification that lists `node` as a tool.
+    func testNodeBasenameMemberKeepsBlockingSendsUnderClaudeAndCodex() async throws {
+        let store = makeStore()
+        let registry = makeRegistry(store: store, qualification: AgentRecoveryActivation.claudeAndCodex.runtime)
+        await registry.start()
+        let launch = try newLaunch(registry, conversationID: "conv-A")
+        let runtimeID = try await launch.prepareSpawn()
+        processes.add(processes.observation(pid: 820, group: 820, marker: runtimeID))
+        processes.add(processes.observation(pid: 821, start: 200, parent: 820, executable: "/usr/bin/node", group: 820, marker: runtimeID))
+        try await launch.commitSpawn(pid: 820, processGroupID: 820)
+
+        processes.remove(pid: 820)
+        processes.add(processes.observation(pid: 821, start: 200, parent: 1, executable: "/usr/bin/node", group: 820, marker: runtimeID))
+        await launch.rootReaped(pid: 820, confirmed: true)
+        let record = try XCTUnwrap(Fixtures.record(store, runtimeID))
+        XCTAssertNotEqual(record.state, .toolsRemaining, "a `node` member is not positively a tool")
+        XCTAssertFalse(record.members.contains { $0.role == .tool })
+        let snapshot = await registry.restrictionSnapshot()
+        XCTAssertTrue(
+            snapshot.blocksSend(AgentRuntimeOwnershipKeys(conversationID: "conv-A", worktreePath: "/tmp/rpce-wt")),
+            "an unlisted basename stays a possible writer and blocks its conversation"
+        )
     }
 
     // MARK: Discovery
@@ -793,23 +832,119 @@ final class AgentProcessRegistryTests: XCTestCase {
         ))
     }
 
-    func testNarrowedProviderQualificationDoesNotActivateRegistration() async {
+    /// Subset activation (Step 9-activation): narrowed qualification activates registration for the
+    /// covered pairs only. An uncovered pair gets no launch owner (it launches unregistered, as
+    /// before activation); `reserveLaunch` still refuses a direct caller for it.
+    func testNarrowedProviderQualificationRegistersOnlyCoveredPairs() async throws {
         let narrowedACP = Fixtures.qualified(providers: [.acp: [.acp(.cursor)]])
-        XCTAssertFalse(narrowedACP.activatesRegistration, "every supported provider of every family must be covered")
+        XCTAssertTrue(narrowedACP.activatesRegistration, "subset activation")
+        XCTAssertFalse(narrowedACP.coversAllSupportedPairs)
         let narrowedCompatible = Fixtures.qualified(providers: [.claudeCompatible: [.claude(.glm)]])
-        XCTAssertFalse(narrowedCompatible.activatesRegistration)
+        XCTAssertTrue(narrowedCompatible.activatesRegistration)
+        XCTAssertFalse(narrowedCompatible.covers(family: .claudeCompatible, provider: .claude(.kimi)))
         XCTAssertTrue(Fixtures.qualified().activatesRegistration)
 
         let registry = makeRegistry(store: makeStore(), qualification: narrowedACP)
         await registry.start()
+        let authority = AgentRuntimeLaunchAuthority.registry(registry)
+        XCTAssertFalse(authority.isRegistrationActive(family: .acp, provider: .acp(.openCode)))
         XCTAssertNil(
-            AgentRuntimeLaunchAuthority.registry(registry).makeLaunch(Fixtures.context(.acp, provider: .acp(.openCode), worktreePath: "/tmp/x")),
-            "no legacy or partial registration for an uncovered provider"
+            authority.makeLaunch(Fixtures.context(.acp, provider: .acp(.openCode), worktreePath: "/tmp/x")),
+            "no registration for an uncovered provider: it launches unregistered"
         )
-        await assertThrows(.registrationInactive) {
-            _ = try await registry.reserveLaunch(Fixtures.context(.acp, provider: .acp(.cursor), worktreePath: "/tmp/x"))
+        await assertThrows(.unqualifiedProvider) {
+            _ = try await registry.reserveLaunch(Fixtures.context(.acp, provider: .acp(.openCode), worktreePath: "/tmp/x"))
         }
-        XCTAssertEqual(Fixtures.runtimeFileCount(rootURL: recoveryRoot), 0)
+        XCTAssertEqual(Fixtures.runtimeFileCount(rootURL: recoveryRoot), 0, "an uncovered pair writes no runtime file")
+        XCTAssertTrue(authority.isRegistrationActive(family: .acp, provider: .acp(.cursor)))
+        let covered = try XCTUnwrap(authority.makeLaunch(Fixtures.context(.acp, provider: .acp(.cursor), worktreePath: "/tmp/x")))
+        _ = try await covered.prepareSpawn()
+        XCTAssertEqual(Fixtures.runtimeFileCount(rootURL: recoveryRoot), 1, "the covered pair reserves before its spawn")
+    }
+
+    /// D 3.5 item 2: under `.claudeAndCodex`, sessionless work (model listing, auth, Oracle print
+    /// mode, Context Builder) on a covered pair reserves when it says `.sessionless` explicitly;
+    /// a launch whose owner never bound a scope (`.unavailable`) is refused before its spawn.
+    func testClaudeAndCodexSessionlessLaunchesReserveAndUnboundLaunchesAreRefused() async throws {
+        let registry = makeRegistry(store: makeStore(), qualification: AgentRecoveryActivation.claudeAndCodex.runtime)
+        await registry.start()
+        let covered: [(AgentRuntimeFamily, AgentRuntimeProvider)] = [
+            (.claudeNative, .claude(.standard)),
+            (.claudeHeadless, .claude(.standard)),
+            (.codexAppServer, .codex),
+            (.codexExec, .codex)
+        ]
+        for (family, provider) in covered {
+            await assertThrows(.sessionContextUnavailable) {
+                _ = try await registry.reserveLaunch(
+                    Fixtures.context(family, provider: provider, session: .unavailable, worktreePath: nil)
+                )
+            }
+        }
+        XCTAssertEqual(Fixtures.runtimeFileCount(rootURL: recoveryRoot), 0, "a refused launch reserves nothing")
+        for (family, provider) in covered {
+            _ = try await registry.reserveLaunch(
+                Fixtures.context(family, provider: provider, session: .sessionless, worktreePath: nil)
+            )
+        }
+        XCTAssertEqual(Fixtures.runtimeFileCount(rootURL: recoveryRoot), covered.count, "each sessionless launch reserves")
+    }
+
+    /// O32 / Step 9-activation-a value test: `.claudeAndCodex` covers exactly the four Claude
+    /// standard and Codex pairs; every other supported pair stays unregistered; its actions offer
+    /// same-conversation resume and history reconciliation only.
+    func testClaudeAndCodexActivationCoversExactlyTheFourQualifiedPairs() {
+        let activation = AgentRecoveryActivation.claudeAndCodex
+        let expected: [(AgentRuntimeFamily, AgentRuntimeProvider)] = [
+            (.claudeNative, .claude(.standard)),
+            (.claudeHeadless, .claude(.standard)),
+            (.codexAppServer, .codex),
+            (.codexExec, .codex)
+        ]
+        let pairs = AgentRuntimeQualification.supportedPairs
+        XCTAssertEqual(pairs.count, 13, "the supported-pair inventory is unchanged")
+        let covered = pairs.filter { activation.runtime.covers(family: $0.family, provider: $0.provider) }
+        XCTAssertEqual(covered.map(\.family), expected.map(\.0))
+        XCTAssertEqual(covered.map(\.provider), expected.map(\.1))
+        XCTAssertEqual(pairs.count - covered.count, 9, "the other nine pairs launch unregistered")
+        XCTAssertTrue(activation.runtime.activatesRegistration)
+        XCTAssertFalse(activation.runtime.coversAllSupportedPairs)
+        XCTAssertFalse(AgentRecoveryActivation.off.runtime.activatesRegistration)
+        for family in [AgentRuntimeFamily.claudeNative, .claudeHeadless] {
+            let qualification = activation.runtime.families[family]
+            XCTAssertEqual(qualification?.writerExecutableBasenames, ["claude"])
+            XCTAssertEqual(qualification?.toolExecutableBasenames, [])
+            XCTAssertEqual(qualification?.freshSessionID, false)
+        }
+        for family in [AgentRuntimeFamily.codexAppServer, .codexExec] {
+            XCTAssertEqual(activation.runtime.families[family]?.writerExecutableBasenames, ["codex"])
+            XCTAssertEqual(activation.runtime.families[family]?.toolExecutableBasenames, [])
+        }
+        XCTAssertFalse(activation.runtime.allowsFreshSessionID(.claudeNative, provider: .claude(.standard)))
+        XCTAssertTrue(activation.coversProvider(.claude(.standard)))
+        XCTAssertTrue(activation.coversProvider(.codex))
+        for provider in [AgentRuntimeProvider.claude(.glm), .claude(.kimi), .claude(.customCompatible), .acp(.openCode), .acp(.cursor), .acp(.ohMyPi)] {
+            XCTAssertFalse(activation.coversProvider(provider), "\(provider.rawValue) is not qualified")
+        }
+        XCTAssertFalse(activation.coversProvider(nil))
+        for kind in [AgentRecoveryActionKind.continueWithText, .sendSaved, .questionAnswerAsInput, .reconcileOnly] {
+            XCTAssertTrue(activation.actions.allows(kind), "\(kind)")
+        }
+        XCTAssertFalse(activation.actions.allows(.continueInNewConversation))
+        XCTAssertFalse(activation.actions.freshClaudeConversation)
+        XCTAssertFalse(activation.actions.safeRestart)
+    }
+
+    /// Partial coverage never proves whole-app quiescence (Restart safely): an unregistered family
+    /// can't be proven stopped, so the proof is refused and launches are not sealed.
+    func testPartialCoverageRefusesTheWholeAppStoppedProof() async throws {
+        let registry = makeRegistry(store: makeStore(), qualification: AgentRecoveryActivation.claudeAndCodex.runtime)
+        await registry.start()
+        let proof = await registry.verifyAllFamiliesStopped()
+        guard case .notProven = proof else { return XCTFail("partial coverage proves nothing app-wide: \(proof)") }
+        let sealed = await registry.isSealedForSafeRestart
+        XCTAssertFalse(sealed, "a refused proof does not seal launches")
+        _ = try await registry.reserveLaunch(Fixtures.context(.claudeNative, worktreePath: "/tmp/x"))
     }
 
     func testRefreshRetriesAFailedRuntimeDirectoryRead() async throws {

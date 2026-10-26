@@ -7,8 +7,8 @@ import RepoPromptPlatform
 // MARK: - Qualification
 
 /// Live-qualified evidence for one launch family, recorded for specific actual providers. Nothing
-/// here is inferred: production carries no recorded qualification, so every flag is false and every
-/// set empty. Evidence for one ACP or Claude-compatible backend never qualifies another backend that
+/// here is inferred: production takes its qualification from `AgentRecoveryActivation.production`
+/// only. Evidence for one ACP or Claude-compatible backend never qualifies another backend that
 /// shares its family.
 package struct AgentRuntimeFamilyQualification: Equatable {
     /// The actual providers this evidence was recorded for.
@@ -55,10 +55,6 @@ package struct AgentRuntimeQualification: Equatable {
         self.families = families
     }
 
-    /// Production: no live qualification has been recorded for any family. Not overridable by
-    /// environment or defaults; changing it is a reviewed source change backed by evidence.
-    package static let production = AgentRuntimeQualification(families: [:])
-
     /// Every managed family/provider pair the app can launch: Claude native serves the standard
     /// provider, Claude-compatible native serves every compatible backend, headless Claude serves
     /// every variant, both Codex families serve Codex, and ACP serves every ACP backend.
@@ -71,16 +67,24 @@ package struct AgentRuntimeQualification: Equatable {
             + ACPProviderID.allCases.map { (AgentRuntimeFamily.acp, AgentRuntimeProvider.acp($0)) }
     }
 
-    /// One coupled activation (phase3-registry-plan "Activation clarification"): registration,
-    /// marker injection and enforcement of new launches turn on together, and only when every
-    /// supported family/provider pair is qualified for complete discovery. Evidence for one ACP or
-    /// compatible backend never activates the others.
+    /// Subset activation (Step 9-activation, O32; replaces phase3-registry-plan's coupled
+    /// "Activation clarification"): registration is active once any supported pair is qualified for
+    /// complete discovery. Only covered pairs register, carry the marker and are fenced; every
+    /// uncovered pair launches unregistered exactly as before activation. Evidence for one ACP or
+    /// compatible backend never covers another.
     package var activatesRegistration: Bool {
+        Self.supportedPairs.contains { covers(family: $0.family, provider: $0.provider) }
+    }
+
+    /// Whether every supported pair is covered: only then can registry evidence speak for the whole
+    /// app (an unregistered family can never be proven stopped).
+    package var coversAllSupportedPairs: Bool {
         Self.supportedPairs.allSatisfy { covers(family: $0.family, provider: $0.provider) }
     }
 
-    /// Whether this exact family/provider pair has complete-discovery qualification. A launch for an
-    /// uncovered pair is refused before its spawn (never registered, never run unregistered).
+    /// Whether this exact family/provider pair has complete-discovery qualification. Launch
+    /// authority makes no launch for an uncovered pair (it runs unregistered); `reserveLaunch` still
+    /// refuses one as a defence against a direct caller.
     package func covers(family: AgentRuntimeFamily, provider: AgentRuntimeProvider) -> Bool {
         qualification(family: family, provider: provider)?.supportsCompleteDiscovery == true
     }

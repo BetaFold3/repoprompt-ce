@@ -28,7 +28,7 @@ extension AgentModeViewModel {
     }
 
     /// Whether Check may refresh process ownership and reconcile provider history: exactly when
-    /// Reconcile itself is available (production: not active until 9-activation).
+    /// Reconcile itself is available (not active while the production activation is off).
     var recoveryChecksActive: Bool {
         recoveryActionRunner.isAvailable(.reconcileOnly)
     }
@@ -46,7 +46,7 @@ extension AgentModeViewModel {
         return Task { @MainActor [weak self] in
             await coordinator.checkCatalogItems(items, checksActive: checksActive) { item in
                 guard let self else { return .notAttempted(AgentModeViewModel.recoveryActionStaleText) }
-                return await reconcileRecoveryCheckItem(item)
+                return await self.reconcileRecoveryCheckItem(item)
             }
         }
     }
@@ -76,7 +76,8 @@ extension AgentModeViewModel {
     }
 
     /// The existing Reconcile of one run card, only for the session open in this window (Check never
-    /// opens a session). Its progress and any failure are the row's shared action state.
+    /// opens a session). Its progress and any failure are the row's shared action state. If Stop
+    /// abandoned the wait, this still finishes later and records its result on the row only.
     private func reconcileRecoveryCheckItem(_ item: AgentRecoveryCatalogItem) async -> AgentRecoveryCheckReconcile {
         guard let coordinator = recoveryCoordinator,
               let sessionID = item.sessionID,

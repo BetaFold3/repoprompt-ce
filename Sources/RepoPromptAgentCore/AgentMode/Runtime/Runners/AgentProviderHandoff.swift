@@ -309,7 +309,8 @@ final class AgentProviderHandoff {
         if case let .failure(failure) = await lane.ensureRunAttempt(
             ownership: ownership,
             processRunID: processRunID,
-            transcriptTurnID: AgentRecoveryDispatchEvidence.executionTurnID(of: constituents.first, in: session)
+            transcriptTurnID: AgentRecoveryDispatchEvidence.executionTurnID(of: constituents.first, in: session),
+            providerKindRaw: ownership.providerKindRaw
         ) {
             return .failure(failure)
         }

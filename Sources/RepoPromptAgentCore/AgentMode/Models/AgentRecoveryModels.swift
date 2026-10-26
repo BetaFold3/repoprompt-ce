@@ -750,6 +750,17 @@ package struct AgentRecoveryRunAttempt: Equatable {
     package internal(set) var shutdown: AgentRecoveryRunShutdownEvidence?
     package var extras: AgentRecoveryExtras
 
+    /// Extras member naming the provider kind (`AgentProviderKind` raw value) the run was started
+    /// with: optional run-start evidence carried as a forward-compatible member (no schema change).
+    package static let providerKindExtrasKey = "providerKind"
+
+    /// The provider kind raw value recorded at run start, or `nil` for a run recorded before it was
+    /// captured (or by a path that did not know it).
+    package var recordedProviderKindRaw: String? {
+        if case let .string(value)? = extras[Self.providerKindExtrasKey] { return value }
+        return nil
+    }
+
     package init(
         runAttemptID: UUID,
         transcriptResetGeneration: UInt64,

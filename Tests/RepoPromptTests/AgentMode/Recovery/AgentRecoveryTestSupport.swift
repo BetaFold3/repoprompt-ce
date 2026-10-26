@@ -1,6 +1,18 @@
 @testable import RepoPromptAgentCore
 import XCTest
 
+extension AgentRecoveryActionRunner {
+    /// Tests: `qualification`'s actions over the Claude Code + Codex runtime qualification
+    /// (`AgentRecoveryActivation.claudeAndCodex.runtime`), so the O32 provider gate admits the
+    /// fixtures' Claude Code and Codex targets and refuses every other provider.
+    convenience init(qualification: AgentRecoveryActionQualification, registrationActive: @escaping @MainActor () -> Bool) {
+        self.init(
+            activation: AgentRecoveryActivation(runtime: AgentRecoveryActivation.claudeAndCodex.runtime, actions: qualification),
+            registrationActive: registrationActive
+        )
+    }
+}
+
 /// Fixture lifecycle authority for controller-unit tests. It serializes transactions per instance
 /// and validates incarnation, reset generation, and deletion before running the body. Real
 /// `AgentSessionDataService` gate races are covered by `AgentSessionRecoveryIntegrationTests`.

@@ -64,7 +64,10 @@ final class CodexAppServerRuntimeFenceTests: XCTestCase {
 
     private func startRegistry() async {
         store = AgentRecoveryStore(rootURL: recoveryRoot, appInstanceID: UUID())
-        registry = AgentProcessRegistry(store: store, qualification: Fixtures.qualified(), system: processes.system)
+        // The production candidate's qualification (D 3.5 item 1: Codex owner operations under it).
+        registry = AgentProcessRegistry(
+            store: store, qualification: AgentRecoveryActivation.claudeAndCodex.runtime, system: processes.system
+        )
         await registry.start()
     }
 

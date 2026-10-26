@@ -12,8 +12,9 @@ import RepoPromptPlatform
 /// anything automatically; root exit, a clean shutdown mark, an absent marker or denied inspection
 /// never prove that a family exited.
 package actor AgentProcessRegistry {
-    /// Whether new managed launches reserve, carry the marker and are fenced (coupled activation).
-    package nonisolated let isRegistrationActive: Bool
+    /// Whether any supported pair registers (subset activation). Each launch also needs its own pair
+    /// covered (`AgentRuntimeLaunchAuthority.isRegistrationActive(family:provider:)`).
+    package nonisolated let isAnyPairRegistered: Bool
     package nonisolated let qualification: AgentRuntimeQualification
 
     private let store: AgentRecoveryStore
@@ -70,16 +71,17 @@ package actor AgentProcessRegistry {
     ) {
         self.store = store
         self.qualification = qualification
-        isRegistrationActive = qualification.activatesRegistration
+        isAnyPairRegistered = qualification.activatesRegistration
         self.system = system
         self.stopActions = stopActions
         self.now = now
     }
 
-    /// The production registry over the production store with production (empty) qualification:
-    /// registration stays off and only existing runtime records are enforced. `nil` in XCTest.
+    /// The production registry over the production store with the runtime qualification of
+    /// `AgentRecoveryActivation.production` (while that is `.off`, registration stays off and only
+    /// existing runtime records are enforced). `nil` in XCTest.
     package static let production: AgentProcessRegistry? = AgentRecoveryStore.production.map {
-        AgentProcessRegistry(store: $0, qualification: .production, system: .live)
+        AgentProcessRegistry(store: $0, qualification: AgentRecoveryActivation.production.runtime, system: .live)
     }
 
     package var isStopEnabled: Bool {
@@ -679,7 +681,7 @@ package actor AgentProcessRegistry {
     /// permission). Throws (and nothing may be spawned) when registration is inactive, an Agent Mode
     /// launch lacks its session context, ownership conflicts or the reservation cannot be written.
     package func reserveLaunch(_ context: AgentRuntimeLaunchContext) throws -> (runtimeID: UUID, launchToken: UUID) {
-        guard isRegistrationActive else { throw AgentProcessRegistryError.registrationInactive }
+        guard isAnyPairRegistered else { throw AgentProcessRegistryError.registrationInactive }
         guard !isSealedForSafeRestart else { throw AgentProcessRegistryError.launchesSealed }
         guard qualification.covers(family: context.family, provider: context.provider) else {
             throw AgentProcessRegistryError.unqualifiedProvider
@@ -1081,7 +1083,11 @@ package extension AgentProcessRegistry {
     /// reserved between the proof and the helper's arm or the exit. Never signals anything; absence
     /// of evidence is not proof.
     func verifyAllFamiliesStopped() async -> AgentRuntimeAllStoppedProof {
-        guard isRegistrationActive else { return .notProven("Runtime registration is not active.") }
+        guard isAnyPairRegistered else { return .notProven("Runtime registration is not active.") }
+        // Subset activation: an unregistered family can never be proven stopped, so no whole-app proof.
+        guard qualification.coversAllSupportedPairs else {
+            return .notProven("Some providers' processes aren't tracked, so they can't be proven stopped.")
+        }
         isSealedForSafeRestart = true
         guard hasStarted else { return .notProven("Runtime ownership has not been checked yet.") }
         await refresh()

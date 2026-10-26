@@ -289,7 +289,8 @@ package final class AgentRecoveryDispatchEvidence {
             if case let .failure(failure) = await lane.ensureRunAttempt(
                 ownership: ownership,
                 processRunID: processRunID,
-                transcriptTurnID: executionTurnID(of: constituents.first, in: session)
+                transcriptTurnID: executionTurnID(of: constituents.first, in: session),
+                providerKindRaw: ownership.providerKindRaw
             ) {
                 return .failure(.commitFailed(failure))
             }

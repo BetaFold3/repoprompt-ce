@@ -67,7 +67,9 @@ package extension AgentRecoverySessionLane {
     /// Commits the parent's delegated child link inside the foundation session gate. The admitted
     /// parent attempt's evidence is ensured first with the existing run-attempt mutation
     /// (`.keepExisting`: never fails on an existing process-run association), so a parent whose
-    /// run began before its lane was claimed still records the attempt the link belongs to.
+    /// run began before its lane was claimed still records the attempt the link belongs to (with
+    /// the parent run's run-start provider, `parentOwnership.providerKindRaw`, only when that write
+    /// creates it).
     func commitDelegatedChildLink(
         _ link: AgentRecoveryDelegatedChildLink,
         parentOwnership: AgentRunOwnership,
@@ -85,7 +87,8 @@ package extension AgentRecoverySessionLane {
                 ownership: parentOwnership,
                 processRunID: parentProcessRunID,
                 transcriptTurnID: nil,
-                processRunAssociation: .keepExisting
+                processRunAssociation: .keepExisting,
+                providerKindRaw: parentOwnership.providerKindRaw
             )
             return try await store.commitDelegatedChildLink(binding: binding, link: link)
         }

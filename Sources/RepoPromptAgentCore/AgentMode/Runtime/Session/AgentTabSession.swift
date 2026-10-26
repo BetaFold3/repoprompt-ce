@@ -2001,7 +2001,9 @@ package final class AgentTabSession: ObservableObject {
             persistentBindingGeneration: persistentSessionBindingIdentity?.generation,
             bindingTransitionGeneration: bindingTransitionGeneration,
             attemptID: attemptID,
-            turnEpoch: turnEpoch
+            turnEpoch: turnEpoch,
+            // The run's provider, captured once at run start (recovery records it on the attempt).
+            providerKindRaw: selectedAgent.rawValue
         )
         attentionTextProvenance = AttentionTextProvenance(
             attemptID: ownership.attemptID,

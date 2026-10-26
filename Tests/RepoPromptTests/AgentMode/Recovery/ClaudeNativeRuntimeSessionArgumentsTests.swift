@@ -44,6 +44,7 @@ final class ClaudeNativeRuntimeSessionArgumentsTests: XCTestCase {
     func testFreshSessionIDGateIsOffByDefault() {
         XCTAssertFalse(AgentRuntimeLaunchAuthority.production.allowsFreshSessionID(.claudeNative, provider: .claude(.standard)))
         XCTAssertFalse(AgentRuntimeLaunchAuthority.activationOff.allowsFreshSessionID(.claudeNative, provider: .claude(.standard)))
-        XCTAssertFalse(AgentRuntimeQualification.production.allowsFreshSessionID(.claudeNative, provider: .claude(.standard)))
+        XCTAssertFalse(AgentRecoveryActivation.production.runtime.allowsFreshSessionID(.claudeNative, provider: .claude(.standard)))
+        XCTAssertFalse(AgentRecoveryActivation.claudeAndCodex.runtime.allowsFreshSessionID(.claudeNative, provider: .claude(.standard)))
     }
 }

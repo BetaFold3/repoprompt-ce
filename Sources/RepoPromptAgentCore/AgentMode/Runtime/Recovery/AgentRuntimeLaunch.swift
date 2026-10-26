@@ -74,7 +74,7 @@ package enum AgentRuntimeWriteAdmission: Equatable {
 }
 
 /// Where managed launch owners obtain launch ownership. Production resolves to
-/// `.activationOff` until every managed family is qualified (coupled activation); tests inject a
+/// `.activationOff` while `AgentRecoveryActivation.production` covers no pair; tests inject a
 /// registry with fixture qualification. Not configurable by environment or defaults.
 package enum AgentRuntimeLaunchAuthority {
     /// Phase 1/2 behavior: no reservation, marker or fence. Inherited markers are still stripped
@@ -83,20 +83,25 @@ package enum AgentRuntimeLaunchAuthority {
     case registry(AgentProcessRegistry)
 
     package static var production: AgentRuntimeLaunchAuthority {
-        guard let registry = AgentProcessRegistry.production, registry.isRegistrationActive else { return .activationOff }
+        guard let registry = AgentProcessRegistry.production, registry.isAnyPairRegistered else { return .activationOff }
         return .registry(registry)
     }
 
-    /// Whether launches made here are registered (callers skip gathering launch context otherwise).
-    package var isRegistrationActive: Bool {
+    /// Whether launches of this exact family/provider pair are registered (callers skip gathering
+    /// launch context otherwise). An uncovered pair launches unregistered, as before activation.
+    package func isRegistrationActive(family: AgentRuntimeFamily, provider: AgentRuntimeProvider) -> Bool {
         guard case let .registry(registry) = self else { return false }
-        return registry.isRegistrationActive
+        return registry.isAnyPairRegistered && registry.qualification.covers(family: family, provider: provider)
     }
 
     /// One launch owner per actual spawn (each replacement or fallback launch gets a new runtime),
-    /// or `nil` while registration is off.
+    /// or `nil` while registration is off or this pair is not covered (an unregistered launch).
+    /// Once a launch owner exists, every later registration, storage, inspection, association or
+    /// fence failure refuses the launch or write; nothing falls back to unregistered execution.
     package func makeLaunch(_ context: AgentRuntimeLaunchContext) -> AgentRuntimeLaunch? {
-        guard case let .registry(registry) = self, registry.isRegistrationActive else { return nil }
+        guard case let .registry(registry) = self,
+              isRegistrationActive(family: context.family, provider: context.provider)
+        else { return nil }
         return AgentRuntimeLaunch(registry: registry, context: context)
     }
 

@@ -10,8 +10,9 @@ import RepoPromptAgentCore
 // under the action's planned user item ID; Send saved hands the single claimed saved intent to
 // `submitUserTurn` under a store-issued queue receipt. History reconciliation commits rows, the
 // native-ID ledger and the import receipt in ONE owner session save before the recovery cursor's
-// compare-and-swap. Production keeps every action OFF (`AgentRecoveryActionQualification.production`),
-// so none of these row actions is offered until live acceptance qualifies it.
+// compare-and-swap. Which actions are offered and may execute comes from the app's one activation
+// (`AgentRecoveryActivation.production`, OFF until the live checks); the runner refuses a choice for
+// a provider that activation doesn't qualify before anything is reserved (O32).
 
 extension AgentModeViewModel {
     /// One recovery item and one choice on it (the stable-request key).
@@ -168,9 +169,11 @@ extension AgentModeViewModel {
             return "This choice doesn't apply to this item."
         }
         let expectedRevision: AgentRecoveryRecordRevision?
+        var runAttempts: [AgentRecoveryRunAttempt] = []
         switch await lane.readRecord() {
         case let .success(.supported(record)):
             expectedRevision = record.revision
+            runAttempts = record.runAttempts
         case .success(.absent):
             expectedRevision = nil
         case .success(.preserved):
@@ -178,6 +181,15 @@ extension AgentModeViewModel {
         case let .failure(failure):
             AgentRecoveryFailureDiagnostics.presentationFailure(site: "recovery_action_record_unreadable", failure: failure)
             return "This session's recovery data couldn't be read (\(Self.recoveryListDescription(of: failure)))."
+        }
+        // A choice that acts on the run attempt (Continue, Reconcile) is performed only by the
+        // provider the run was started with (recorded at run start); nothing reserved or written.
+        if kind == .continueWithText || kind == .reconcileOnly,
+           let refusal = Self.recoveryRunProviderRefusal(
+               sourceRunAttemptID: sourceRunAttemptID, runAttempts: runAttempts, current: session.selectedAgent
+           )
+        {
+            return refusal
         }
         // A previous launch's open action, already shown: this explicit choice names it. Uncertain
         // delivery admits only a continuation sent from the editor that showed the warning.
@@ -214,6 +226,13 @@ extension AgentModeViewModel {
             supersedesActionID: supersedesActionID,
             confirmsUncertainPriorDelivery: confirmsUncertainPrior
         )
+        // Round-0 review P1-1: a choice is performed only by the provider its target names. A request
+        // whose target names another provider than the session's current one (a cached or earlier
+        // request from before a switch) is refused before the runner: nothing reserved or written.
+        if let mismatch = Self.recoveryProviderMismatchText(target: request.target, current: session.selectedAgent) {
+            recoveryActionRequestsBySlot[slot] = nil
+            return mismatch
+        }
         recoveryActionRequestsBySlot[slot] = request
         var performers = recoveryActionPerformers(
             kind: kind,
@@ -264,6 +283,43 @@ extension AgentModeViewModel {
         }
     }
 
+    /// Neutral run-provider refusals (Continue, Reconcile and Check alike).
+    static let recoveryRunProviderNotRecordedText =
+        "This card's provider wasn't recorded, so RepoPrompt can't act on it safely. Nothing was changed."
+
+    /// The refusal when `target` names a provider other than the session's `current` one, or `nil`
+    /// (a cached or earlier request built before a provider switch).
+    static func recoveryProviderMismatchText(target: AgentRecoveryActionTarget, current: AgentProviderKind) -> String? {
+        guard let raw = target.providerKindRaw else { return nil }
+        return recoveryProviderMismatchText(providerKindRaw: raw, current: current)
+    }
+
+    /// The run-provider refusal of a Continue/Reconcile on the run `sourceRunAttemptID` of `runAttempts`
+    /// (the record's). Fails closed: a card without a run attempt (a legacy interrupted turn) or whose
+    /// attempt is not in the record has no recorded provider.
+    static func recoveryRunProviderRefusal(
+        sourceRunAttemptID: UUID?,
+        runAttempts: [AgentRecoveryRunAttempt],
+        current: AgentProviderKind
+    ) -> String? {
+        let attempt = sourceRunAttemptID.flatMap { id in runAttempts.first { $0.runAttemptID == id } }
+        return recoveryRunProviderRefusal(recorded: attempt?.recordedProviderKindRaw, current: current)
+    }
+
+    /// The refusal for a run card whose run was started with `recorded` (its run attempt's
+    /// run-start provider) when the session now uses `current`; a run recorded without a provider
+    /// (before this was captured) is refused rather than guessed.
+    static func recoveryRunProviderRefusal(recorded: String?, current: AgentProviderKind) -> String? {
+        guard let recorded else { return recoveryRunProviderNotRecordedText }
+        return recoveryProviderMismatchText(providerKindRaw: recorded, current: current)
+    }
+
+    private static func recoveryProviderMismatchText(providerKindRaw raw: String, current: AgentProviderKind) -> String? {
+        guard raw != current.rawValue else { return nil }
+        let name = AgentProviderKind(rawValue: raw)?.displayName ?? "another provider"
+        return "This card is from a \(name) run, but the session now uses \(current.displayName). Switch back to act on it. Nothing was changed."
+    }
+
     /// The provider conversation a choice is decided against (fenced at every await).
     func recoveryActionTarget(for session: AgentTabSession) -> AgentRecoveryActionTarget {
         let conversationID = session.selectedAgent == .codexExec ? session.codexConversationID : session.providerSessionID
@@ -298,9 +354,9 @@ extension AgentModeViewModel {
     ) -> AgentRecoveryActionPerformers {
         var reconcile: (@MainActor (AgentRecoveryAction) async -> AgentRecoveryReconcileResult)?
         // R7 step 2: continuations reconcile first (the runner runs it only when history
-        // reconciliation is qualified). Only providers with a history mechanism (Claude, Codex)
-        // reconcile; for any other provider there is nothing to observe, so a continuation follows
-        // its ordinary path and Reconcile reports history unavailable.
+        // reconciliation is qualified). Only providers with a history mechanism (Claude Code, Codex)
+        // get a performer; for any other provider the runner refuses every choice that reconciles
+        // (and, under O32, every choice for a provider it doesn't qualify) before reserving.
         let reconcilesProviderHistory = session.selectedAgent == .claudeCode || session.selectedAgent == .codexExec
         if reconcilesProviderHistory, kind == .reconcileOnly || kind.reconcilesBeforeDispatch {
             reconcile = { @MainActor [weak self] (action: AgentRecoveryAction) async -> AgentRecoveryReconcileResult in
@@ -877,7 +933,9 @@ extension AgentModeViewModel {
         session: AgentTabSession
     ) async -> RecoveryDispatchBaselineAdmission {
         // Production OFF: zero history reads, zero extra writes, ordinary send behavior.
-        guard recoveryActionRunner.capturesDispatchBaselines, session.selectedAgent == .claudeCode else { return .notCaptured }
+        guard session.selectedAgent == .claudeCode,
+              recoveryActionRunner.capturesDispatchBaselines(for: session.selectedAgent)
+        else { return .notCaptured }
         guard let identity, let lane = session.recoveryLane, !lane.isRetired else { return .notCaptured }
         let generation = lane.binding.transcriptResetGeneration
         func stillCurrent(_ conversationID: String?) -> Bool {

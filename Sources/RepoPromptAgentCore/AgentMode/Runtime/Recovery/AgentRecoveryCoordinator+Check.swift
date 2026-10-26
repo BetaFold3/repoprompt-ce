@@ -3,8 +3,9 @@ import Foundation
 // Step 9-check: "Check and resolve" in the Needs Attention sheet. Observational: it works on the
 // catalog items captured when the user clicks (never a workspace or folder crawl), one item at a
 // time, one check at a time app-wide, and reports each item as resolved, needs you (naming the
-// choice), could not check, or failed. Stop halts before the next item; checked items keep their
-// result. It uses only existing machinery, and only when process and provider-history checks are
+// choice), could not check, or failed. Stop ends the check at once: checked items keep their result,
+// and the item being checked stops being waited for (its work is never cancelled: a Reconcile keeps
+// its session's action hold until it really ends, then reports on its card). It uses only existing machinery, and only when process and provider-history checks are
 // active (the window passes `checksActive`: history reconciliation is qualified and verified
 // process registration is active):
 //   - one runtime-ownership Refresh (`refreshRuntimeOwnership`, which never signals anything);
@@ -18,6 +19,38 @@ import Foundation
 // active."; items are then reported from the catalog only and nothing is resolved automatically.
 // It never sends, stops, discards, dismisses, confirms a crash hold or a schedule, opens a session
 // or starts a turn. (Crash-hold confirmation from registry proof of exit is not built here.)
+
+/// A one-shot wait for one Check item: the first `finish` wins (the item's result, or `nil` for
+/// Stop); later ones are ignored, so a late result never reaches a finished report.
+@MainActor
+final class AgentRecoveryCheckItemWait {
+    private var continuation: CheckedContinuation<AgentRecoveryCheckOutcome?, Never>?
+    private var result: AgentRecoveryCheckOutcome??
+    /// The item's Reconcile was called (the window marks its row `.working` before its first
+    /// suspension), so a Stop after this owns that `.working` state; before it, Check set nothing.
+    private(set) var reconcileStarted = false
+
+    /// Finished by its result or by Stop: work that hasn't started yet must not start.
+    var isFinished: Bool {
+        result != nil
+    }
+
+    func markReconcileStarted() {
+        reconcileStarted = true
+    }
+
+    func value() async -> AgentRecoveryCheckOutcome? {
+        if let result { return result }
+        return await withCheckedContinuation { continuation = $0 }
+    }
+
+    func finish(_ outcome: AgentRecoveryCheckOutcome?) {
+        guard result == nil else { return }
+        result = .some(outcome)
+        continuation?.resume(returning: outcome)
+        continuation = nil
+    }
+}
 
 /// One item's Check and resolve result.
 package enum AgentRecoveryCheckOutcome: Equatable {
@@ -110,6 +143,10 @@ package struct AgentRecoveryCheckEntry: Equatable {
 /// Progress and report of one Check and resolve (transient, never persisted).
 package struct AgentRecoveryCheckStatus: Equatable {
     package static let checksInactiveText = "Process and provider-history checks are not active."
+    /// The item being checked when Stop was pressed (its check continues on its card).
+    package static let abandonedText = "Stopped while checking. Its check continues; the card shows the result."
+    /// The item Stop reached before its check started (it never starts, so no result follows).
+    package static let stoppedBeforeCheckingText = "Stopped before checking this item."
     package static let restrictionWarningText =
         "Clearing a restriction may let already-authorized scheduled sends run."
 
@@ -145,11 +182,16 @@ package struct AgentRecoveryCheckStatus: Equatable {
         }
         if isRunning {
             let progress = "Checking \(min(entries.count + 1, max(total, 1))) of \(total)…"
-            return cancelRequested ? "\(progress) Stopping after this item." : progress
+            return cancelRequested ? "\(progress) Stopping…" : progress
         }
-        let lead = notChecked > 0
-            ? "Cancelled: checked \(entries.count) of \(total), \(notChecked) not checked"
-            : "Checked \(entries.count) of \(total)"
+        // Stop always gives the cancelled heading, also when it abandoned the last or only item.
+        let lead = if cancelRequested || notChecked > 0 {
+            notChecked > 0
+                ? "Cancelled: checked \(entries.count) of \(total), \(notChecked) not checked"
+                : "Cancelled: checked \(entries.count) of \(total)"
+        } else {
+            "Checked \(entries.count) of \(total)"
+        }
         var parts = [lead]
         let counts: [(String, (AgentRecoveryCheckOutcome) -> Bool)] = [
             ("resolved", { if case .resolved = $0 { true } else { false } }),
@@ -176,11 +218,20 @@ package extension AgentRecoveryCoordinator {
     /// reports its typed result; other items are reported from the catalog when their turn comes.
     /// Without it, nothing is refreshed, reconciled or written. Returns the final status,
     /// or `nil` without doing anything while another check runs.
+    ///
+    /// Stop (`requestRecoveryCheckCancel`) during an item ends the wait for it (a Reconcile has no
+    /// time limit: a Codex cold start or a Claude history read can't be interrupted): the item is
+    /// reported `abandonedText`, the `.working` state its Reconcile set is released (never another
+    /// action's), the rest are not checked. An item whose work had not started yet never starts and
+    /// is reported `stoppedBeforeCheckingText`.
+    /// The item's work keeps running and keeps its session's recovery action hold (every other
+    /// choice there is still refused; a repeated identical choice joins it); its late result goes
+    /// only to its card, never to this finished report.
     @discardableResult
     func checkCatalogItems(
         _ items: [AgentRecoveryCatalogItem],
         checksActive: Bool,
-        reconcile: @MainActor (AgentRecoveryCatalogItem) async -> AgentRecoveryCheckReconcile
+        reconcile: @escaping @MainActor (AgentRecoveryCatalogItem) async -> AgentRecoveryCheckReconcile
     ) async -> AgentRecoveryCheckStatus? {
         guard !isRecoveryCheckRunning else { return nil }
         let captured = items.filter { !$0.isHidden }
@@ -198,7 +249,26 @@ package extension AgentRecoveryCoordinator {
                 recoveryCheck?.notChecked = captured.count - index
                 break
             }
-            let outcome = await checkOutcome(of: item, checksActive: checksActive, reconcile: reconcile)
+            let waited = await waitForCheckOutcome(of: item, checksActive: checksActive, reconcile: reconcile)
+            guard let outcome = waited.outcome else {
+                // Stopped while this item was being checked: stop waiting for it (never cancel it).
+                // Its Reconcile, if started, continues and reports on its card; otherwise it never runs.
+                recoveryCheck?.entries.append(AgentRecoveryCheckEntry(
+                    itemID: item.id,
+                    label: item.checkLabel,
+                    outcome: .couldNotCheck(
+                        waited.reconcileStarted ? AgentRecoveryCheckStatus.abandonedText : AgentRecoveryCheckStatus.stoppedBeforeCheckingText
+                    )
+                ))
+                recoveryCheck?.notChecked = captured.count - index - 1
+                // Only the `.working` this item's own Reconcile set (it is set before the Reconcile's
+                // first suspension, so it is in place whenever Stop can run); if the Reconcile never
+                // started, a `.working` row belongs to another action and is left alone.
+                if waited.reconcileStarted, catalogActionStates[item.id] == .working {
+                    setCatalogActionState(nil, for: item.id)
+                }
+                break
+            }
             recoveryCheck?.entries.append(AgentRecoveryCheckEntry(itemID: item.id, label: item.checkLabel, outcome: outcome))
             postCatalogChange()
         }
@@ -207,11 +277,41 @@ package extension AgentRecoveryCoordinator {
         return recoveryCheck
     }
 
-    /// Stops the running check before its next item (the current one settles).
+    /// Stops the running check: before the next item, and without waiting any longer for the item
+    /// being checked (its work is not cancelled). Repeated Stops are ignored.
     func requestRecoveryCheckCancel() {
         guard recoveryCheck?.isRunning == true, recoveryCheck?.cancelRequested == false else { return }
         recoveryCheck?.cancelRequested = true
         postCatalogChange()
+        recoveryCheckItemWait?.finish(nil)
+    }
+
+    /// One item's outcome, or `nil` when Stop ended the wait first, and whether its Reconcile was
+    /// called. The item's work runs in its own unstructured task that nothing cancels; whichever of
+    /// its result or Stop comes first resumes the one-shot wait, and the other is ignored. A task
+    /// that runs only after Stop finished its wait does nothing (no new Reconcile after Stop).
+    private func waitForCheckOutcome(
+        of item: AgentRecoveryCatalogItem,
+        checksActive: Bool,
+        reconcile: @escaping @MainActor (AgentRecoveryCatalogItem) async -> AgentRecoveryCheckReconcile
+    ) async -> (outcome: AgentRecoveryCheckOutcome?, reconcileStarted: Bool) {
+        let wait = AgentRecoveryCheckItemWait()
+        recoveryCheckItemWait = wait
+        defer { if recoveryCheckItemWait === wait { recoveryCheckItemWait = nil } }
+        let tracked: @MainActor (AgentRecoveryCatalogItem) async -> AgentRecoveryCheckReconcile = { item in
+            wait.markReconcileStarted()
+            return await reconcile(item)
+        }
+        Task { @MainActor [weak self] in
+            guard !wait.isFinished else { return }
+            guard let self else { return wait.finish(.couldNotCheck("Recovery isn't available right now.")) }
+            await wait.finish(checkOutcome(of: item, checksActive: checksActive, reconcile: tracked))
+        }
+        #if DEBUG
+            test_recoveryCheckItemQueued?()
+        #endif
+        let outcome = await wait.value()
+        return (outcome, wait.reconcileStarted)
     }
 
     /// Clears the last finished check's report (the sheet was closed); a running one stays.

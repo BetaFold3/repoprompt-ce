@@ -474,6 +474,12 @@ package final actor ClaudeNativeProcessSessionController {
     /// inbound line that produced them, only to their receiving transport.
     private var queuedAutomaticReplies: [QueuedAutomaticReply] = []
     private let launchAuthority: AgentRuntimeLaunchAuthority
+    /// R6: this controller's one launch pair (native standard, or the compatible backend's actual
+    /// variant), derived once from its immutable config and used for every launch decision.
+    private nonisolated let launchFamily: AgentRuntimeFamily
+    private nonisolated let launchProvider: AgentRuntimeProvider
+    /// R6 subset activation: whether that pair registers its launches.
+    private nonisolated let registersLaunches: Bool
     private var registeredExpectedAgentPID: pid_t?
     private var stdoutFramer = LineFramer()
     private var stderrTail = Data()
@@ -753,6 +759,9 @@ package final actor ClaudeNativeProcessSessionController {
         liveTranscriptQualificationEnabled: Bool = false
     ) {
         self.launchAuthority = launchAuthority
+        launchFamily = Self.runtimeFamily(config.runtimeVariant)
+        launchProvider = .claude(config.runtimeVariant)
+        registersLaunches = launchAuthority.isRegistrationActive(family: launchFamily, provider: launchProvider)
         self.liveTranscriptQualificationEnabled = liveTranscriptQualificationEnabled
         self.runID = runID
         self.tabID = tabID
@@ -1277,13 +1286,13 @@ package final actor ClaudeNativeProcessSessionController {
         activeLaunchEnvironmentSignature = LaunchEnvironmentSignature(launchEnvironment)
         let requestedSessionID = existingSessionID?.trimmingCharacters(in: .whitespacesAndNewlines)
         let resumeSessionID = (requestedSessionID?.isEmpty == false) ? requestedSessionID : nil
-        let family: AgentRuntimeFamily = config.runtimeVariant == .standard ? .claudeNative : .claudeCompatible
+        let family = launchFamily
         // Fresh `--session-id` is its own qualified gate and never combined with `--resume`.
-        let provider = AgentRuntimeProvider.claude(config.runtimeVariant)
+        let provider = launchProvider
         let freshSessionID = resumeSessionID == nil && launchAuthority.allowsFreshSessionID(family, provider: provider)
             ? UUID().uuidString.lowercased()
             : nil
-        let launch: AgentRuntimeLaunch? = if launchAuthority.isRegistrationActive {
+        let launch: AgentRuntimeLaunch? = if registersLaunches {
             launchAuthority.makeLaunch(AgentRuntimeLaunchContext(
                 family: family,
                 provider: provider,
@@ -2080,7 +2089,12 @@ package final actor ClaudeNativeProcessSessionController {
 
     /// R6: registered launches join the tab's retained runtime retirements before a start.
     package nonisolated var joinsRetirementBeforeSuccessor: Bool {
-        launchAuthority.isRegistrationActive
+        registersLaunches
+    }
+
+    /// The launch family of a Claude runtime variant: native for standard, compatible otherwise.
+    private static func runtimeFamily(_ variant: ClaudeCodeRuntimeVariant) -> AgentRuntimeFamily {
+        variant == .standard ? .claudeNative : .claudeCompatible
     }
 
     private func handleLine(_ lineData: Data) async {

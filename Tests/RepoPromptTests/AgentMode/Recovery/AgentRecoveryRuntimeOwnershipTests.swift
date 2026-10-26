@@ -35,7 +35,7 @@ final class AgentRecoveryRuntimeOwnershipTests: XCTestCase {
     // MARK: Fixtures
 
     private func startedCoordinator(
-        qualification: AgentRuntimeQualification = .production,
+        qualification: AgentRuntimeQualification = AgentRecoveryActivation.off.runtime,
         attachRegistry: Bool = true
     ) async throws -> AgentRecoveryCoordinator {
         let store = AgentRecoveryStore(rootURL: recoveryRoot, appInstanceID: UUID())

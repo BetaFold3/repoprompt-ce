@@ -67,7 +67,8 @@ final class AgentRecoveryStoreTests: XCTestCase {
         ).recordRevision
         let ownership = Support.ownership(sessionID: session.sessionID)
         revision = try await store.ensureRunAttempt(
-            binding: session, expectedRevision: revision, ownership: ownership, processRunID: UUID(), transcriptTurnID: nil
+            binding: session, expectedRevision: revision, ownership: ownership, processRunID: UUID(), transcriptTurnID: nil,
+            providerKindRaw: nil
         ).recordRevision
         let direct = Support.submission(
             "scheduled",
@@ -726,7 +727,8 @@ final class AgentRecoveryStoreTests: XCTestCase {
         let ownership = Support.ownership(sessionID: session.sessionID)
         let processRunID = UUID()
         revision = try await store.ensureRunAttempt(
-            binding: session, expectedRevision: revision, ownership: ownership, processRunID: processRunID, transcriptTurnID: nil
+            binding: session, expectedRevision: revision, ownership: ownership, processRunID: processRunID, transcriptTurnID: nil,
+            providerKindRaw: nil
         ).recordRevision
 
         // Two deliveries share one run attempt: one associated at dispatch, one attached later.
@@ -752,7 +754,8 @@ final class AgentRecoveryStoreTests: XCTestCase {
             )
         }
         revision = try await store.ensureRunAttempt(
-            binding: session, expectedRevision: revision, ownership: unknownRun, processRunID: nil, transcriptTurnID: nil
+            binding: session, expectedRevision: revision, ownership: unknownRun, processRunID: nil, transcriptTurnID: nil,
+            providerKindRaw: nil
         ).recordRevision
         await assertStoreError(.attemptConflict(firstAttempt)) {
             try await store.attachDeliveryAttempt(
@@ -763,15 +766,18 @@ final class AgentRecoveryStoreTests: XCTestCase {
         // The transcript turn can be completed later; a conflicting process run fails.
         let turnID = UUID()
         revision = try await store.ensureRunAttempt(
-            binding: session, expectedRevision: revision, ownership: ownership, processRunID: processRunID, transcriptTurnID: turnID
+            binding: session, expectedRevision: revision, ownership: ownership, processRunID: processRunID, transcriptTurnID: turnID,
+            providerKindRaw: nil
         ).recordRevision
         let repeatEnsure = try await store.ensureRunAttempt(
-            binding: session, expectedRevision: nil, ownership: ownership, processRunID: nil, transcriptTurnID: turnID
+            binding: session, expectedRevision: nil, ownership: ownership, processRunID: nil, transcriptTurnID: turnID,
+            providerKindRaw: nil
         )
         XCTAssertEqual(repeatEnsure.disposition, .unchanged)
         await assertStoreError(.runAttemptConflict(ownership.attemptID)) {
             try await store.ensureRunAttempt(
-                binding: session, expectedRevision: revision, ownership: ownership, processRunID: UUID(), transcriptTurnID: nil
+                binding: session, expectedRevision: revision, ownership: ownership, processRunID: UUID(), transcriptTurnID: nil,
+                providerKindRaw: nil
             )
         }
 
@@ -820,7 +826,8 @@ final class AgentRecoveryStoreTests: XCTestCase {
         let foreign = Support.ownership(sessionID: UUID())
         await assertStoreError(.runAttemptConflict(foreign.attemptID)) {
             try await store.ensureRunAttempt(
-                binding: session, expectedRevision: nil, ownership: foreign, processRunID: nil, transcriptTurnID: nil
+                binding: session, expectedRevision: nil, ownership: foreign, processRunID: nil, transcriptTurnID: nil,
+                providerKindRaw: nil
             )
         }
         let afterForeign = await store.read(sessionID: session.sessionID)
@@ -828,7 +835,8 @@ final class AgentRecoveryStoreTests: XCTestCase {
 
         let ownership = Support.ownership(sessionID: session.sessionID)
         let run = try await store.ensureRunAttempt(
-            binding: session, expectedRevision: nil, ownership: ownership, processRunID: nil, transcriptTurnID: nil
+            binding: session, expectedRevision: nil, ownership: ownership, processRunID: nil, transcriptTurnID: nil,
+            providerKindRaw: nil
         )
         let attemptID = UUID()
         let dispatched = try await store.commitDispatchingIntent(

@@ -306,8 +306,12 @@ package actor ACPAgentSessionController {
     /// R6: registered launches join the tab's retained runtime retirements before a start, and a
     /// provider switch retires a registered controller instead of keeping it warm.
     package nonisolated var joinsRetirementBeforeSuccessor: Bool {
-        launchAuthority.isRegistrationActive
+        registersLaunches
     }
+
+    /// R6 subset activation: whether this backend's own ACP pair registers its launches (an
+    /// unqualified backend launches unregistered, keeps its warm controllers and joins nothing).
+    private nonisolated let registersLaunches: Bool
 
     private var stdoutChannel: FileHandleChunkChannel?
     private var stderrChannel: FileHandleChunkChannel?
@@ -381,6 +385,7 @@ package actor ACPAgentSessionController {
         launchAuthority: AgentRuntimeLaunchAuthority = .production
     ) throws {
         self.launchAuthority = launchAuthority
+        registersLaunches = launchAuthority.isRegistrationActive(family: .acp, provider: .acp(provider.providerID))
         try ACPConfigOptionAssignment.validate(
             runRequest.additionalConfigOptionValues,
             for: provider.providerID

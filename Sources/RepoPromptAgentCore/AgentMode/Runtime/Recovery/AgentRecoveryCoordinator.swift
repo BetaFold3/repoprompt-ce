@@ -526,6 +526,13 @@ package final class AgentRecoveryCoordinator {
     /// Step 9-check: the app-wide Check and resolve (one at a time; transient, never persisted).
     /// The running one, or the last finished one's report (`AgentRecoveryCoordinator+Check.swift`).
     package internal(set) var recoveryCheck: AgentRecoveryCheckStatus?
+    /// The running check's wait on its current item, which Stop ends early (Step 9-activation).
+    var recoveryCheckItemWait: AgentRecoveryCheckItemWait?
+    #if DEBUG
+        /// Runs after an item's wait is installed and its work queued, before Check waits on it
+        /// (lets a test press Stop before the item's work has started).
+        package var test_recoveryCheckItemQueued: (@MainActor () -> Void)?
+    #endif
     /// Serial tail of launch-mark writes (`shutdownInProgress`, `cleanExit`, corrections).
     private var launchMarkTail: Task<Void, Never>?
     /// Spec R6 runtime ownership (see `AgentRecoveryCoordinator+RuntimeOwnership.swift`). `nil`
@@ -2639,7 +2646,9 @@ package final class AgentRecoverySessionLane {
                 ownership: run.ownership,
                 processRunID: run.processRunID,
                 transcriptTurnID: nil,
-                processRunAssociation: .keepExisting
+                processRunAssociation: .keepExisting,
+                // The run-start provider, if this write creates the attempt.
+                providerKindRaw: run.ownership.providerKindRaw
             ) {
                 return .failure(.evidenceNotPersisted(failure))
             }
@@ -2946,11 +2955,14 @@ package final class AgentRecoverySessionLane {
         }
     }
 
+    /// `providerKindRaw`: the run's provider captured at run start (`ownership.providerKindRaw`),
+    /// recorded only when this write creates the attempt. Required so every writer states it.
     package func ensureRunAttempt(
         ownership: AgentRunOwnership,
         processRunID: UUID?,
         transcriptTurnID: UUID?,
-        processRunAssociation: AgentRecoveryRunAssociationPolicy = .strict
+        processRunAssociation: AgentRecoveryRunAssociationPolicy = .strict,
+        providerKindRaw: String?
     ) async -> Result<AgentRecoveryRunReceipt, AgentRecoveryControllerFailure> {
         await transaction { store, binding in
             try await store.ensureRunAttempt(
@@ -2959,7 +2971,8 @@ package final class AgentRecoverySessionLane {
                 ownership: ownership,
                 processRunID: processRunID,
                 transcriptTurnID: transcriptTurnID,
-                processRunAssociation: processRunAssociation
+                processRunAssociation: processRunAssociation,
+                providerKindRaw: providerKindRaw
             )
         }
     }
@@ -3029,7 +3042,8 @@ package final class AgentRecoverySessionLane {
     /// expected process run and `transcriptTurnID`, the turn the barrier retained that run in)
     /// without replacing recorded ones (R08), then records its terminal commit. Writes run in
     /// call order. A failure stays visible in `terminalEvidenceFailures` (keyed by run attempt)
-    /// until a later write for that attempt succeeds.
+    /// until a later write for that attempt succeeds. The run-start provider of the commit's
+    /// ownership is recorded only if this write creates the run attempt.
     @discardableResult
     package func recordTerminalEvidence(
         _ commit: AgentRunTerminalCommitRevision,
@@ -3044,7 +3058,8 @@ package final class AgentRecoverySessionLane {
                 ownership: commit.ownership,
                 processRunID: commit.expectedRunID,
                 transcriptTurnID: transcriptTurnID,
-                processRunAssociation: .keepExisting
+                processRunAssociation: .keepExisting,
+                providerKindRaw: commit.ownership.providerKindRaw
             ) {
                 failure = ensureFailure
             } else if case let .failure(terminalFailure) = await recordRunTerminal(commit) {

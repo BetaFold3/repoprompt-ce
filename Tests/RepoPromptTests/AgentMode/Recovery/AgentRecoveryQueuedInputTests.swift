@@ -93,6 +93,55 @@ final class AgentRecoveryQueuedInputTests: XCTestCase {
         XCTAssertEqual(unchanged, .queued)
     }
 
+    // MARK: Run-start provider
+
+    /// P1-1: run start records the session's provider (when the run attempt is first written) as the
+    /// run attempt's `providerKind` extras member; it survives the store codec unchanged, and a later
+    /// write for the same run (here after a provider switch) never rewrites it.
+    func testRunStartRecordsTheSessionsProviderOnTheRunAttempt() async throws {
+        let session = fixture.boundTabSession()
+        session.selectedAgent = .codexExec
+        let identity = try await fixture.queuedIdentity("first input")
+        let ownership = session.beginRunAttempt(source: "test.run-start.provider")
+
+        _ = try await AgentRecoveryDispatchEvidence.begin(
+            session: session,
+            constituents: [identity],
+            ownership: ownership,
+            processRunID: UUID()
+        ).get()
+
+        func runAttempt() async throws -> AgentRecoveryRunAttempt {
+            let record = await fixture.store.read(sessionID: fixture.sessionID).record
+            return try XCTUnwrap(record?.runAttempts.first { $0.runAttemptID == ownership.attemptID })
+        }
+        let recorded = try await runAttempt()
+        XCTAssertEqual(recorded.recordedProviderKindRaw, AgentProviderKind.codexExec.rawValue)
+        XCTAssertEqual(recorded.extras, [AgentRecoveryRunAttempt.providerKindExtrasKey: .string(AgentProviderKind.codexExec.rawValue)])
+
+        // Store codec: the member is kept verbatim as extras and re-encodes to the same bytes.
+        let stored = await fixture.store.read(sessionID: fixture.sessionID).record
+        let record = try XCTUnwrap(stored)
+        let data = try AgentRecoveryRecordCodec.encode(record)
+        guard case let .success(decoded) = AgentRecoveryRecordCodec.decode(data, expectedSessionID: record.sessionID) else {
+            return XCTFail("the record must decode")
+        }
+        XCTAssertEqual(decoded.runAttempts, record.runAttempts)
+        XCTAssertEqual(try AgentRecoveryRecordCodec.encode(decoded), data)
+
+        // A later write for the same run never rewrites its run-start provider.
+        session.selectedAgent = .claudeCode
+        _ = try await fixture.lane.ensureRunAttempt(
+            ownership: ownership,
+            processRunID: nil,
+            transcriptTurnID: nil,
+            processRunAssociation: .keepExisting,
+            providerKindRaw: session.selectedAgent.rawValue
+        ).get()
+        let kept = try await runAttempt()
+        XCTAssertEqual(kept.recordedProviderKindRaw, AgentProviderKind.codexExec.rawValue)
+    }
+
     // MARK: Coalesced dispatch
 
     func testCoalescedDispatchCommitsEveryConstituentInOneOrderedReplacement() async throws {
@@ -290,8 +339,8 @@ final class AgentRecoveryQueuedInputTests: XCTestCase {
         let keyed = Support.ownership(sessionID: fixture.sessionID)
         let openingTurnID = UUID()
         let processRunID = UUID()
-        _ = try await fixture.lane.ensureRunAttempt(ownership: keyed, processRunID: processRunID, transcriptTurnID: openingTurnID).get()
-        let steering = try await fixture.lane.ensureRunAttempt(ownership: keyed, processRunID: nil, transcriptTurnID: UUID()).get()
+        _ = try await fixture.lane.ensureRunAttempt(ownership: keyed, processRunID: processRunID, transcriptTurnID: openingTurnID, providerKindRaw: nil).get()
+        let steering = try await fixture.lane.ensureRunAttempt(ownership: keyed, processRunID: nil, transcriptTurnID: UUID(), providerKindRaw: nil).get()
         XCTAssertEqual(steering.disposition, .unchanged, "A later turn never replaces the run's opening turn")
         await fixture.lane.recordTerminalEvidence(
             Support.terminalCommit(ownership: keyed, state: .completed, expectedRunID: UUID()),
@@ -320,7 +369,7 @@ final class AgentRecoveryQueuedInputTests: XCTestCase {
         XCTAssertEqual(completedRun.terminal?.terminalState, .cancelled)
 
         // The store keeps the strict process-run check for start-time evidence.
-        let conflict = await fixture.lane.ensureRunAttempt(ownership: keyed, processRunID: UUID(), transcriptTurnID: nil)
+        let conflict = await fixture.lane.ensureRunAttempt(ownership: keyed, processRunID: UUID(), transcriptTurnID: nil, providerKindRaw: nil)
         guard case .failure(.store(.runAttemptConflict(keyed.attemptID))) = conflict else {
             return XCTFail("A conflicting start-time process run must fail, got \(conflict)")
         }

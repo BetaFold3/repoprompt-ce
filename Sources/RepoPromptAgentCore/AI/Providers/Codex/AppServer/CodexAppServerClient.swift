@@ -552,7 +552,7 @@ package actor CodexAppServerClient {
         defaultRuntimeSession: AgentRuntimeSessionScope = .unavailable
     ) {
         self.launchAuthority = launchAuthority
-        isRuntimeRegistrationActive = launchAuthority.isRegistrationActive
+        isRuntimeRegistrationActive = launchAuthority.isRegistrationActive(family: .codexAppServer, provider: .codex)
         self.defaultRuntimeSession = defaultRuntimeSession
         self.writeFrameHandler = writeFrameHandler
         self.livenessProbe = livenessProbe
@@ -1505,7 +1505,7 @@ package actor CodexAppServerClient {
         // R6: every transport start (models, auth, control, sessionless and thread work) reserves
         // its runtime immediately before the spawn; a refusal spawns nothing.
         // The process requests no permission configuration itself; threads request theirs.
-        let launch: AgentRuntimeLaunch? = if launchAuthority.isRegistrationActive {
+        let launch: AgentRuntimeLaunch? = if isRuntimeRegistrationActive {
             launchAuthority.makeLaunch(AgentRuntimeLaunchContext(
                 family: .codexAppServer,
                 provider: .codex,

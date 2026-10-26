@@ -675,18 +675,18 @@ final class AgentModeViewModel: ObservableObject {
     /// Injection seam for scheduled dispatch: replaces `startAgentRun` so provider acceptance
     /// outcomes can be driven without a live provider. `nil` uses the real run path.
     var scheduledDispatchRunStarter: ScheduledDispatchRunStarter?
-    /// Lossless restart Phase 4 explicit recovery actions (gated OFF in production).
-    lazy var recoveryActionRunner = AgentRecoveryActionRunner(
-        qualification: .production,
-        registrationActive: { AgentProcessRegistry.production?.isRegistrationActive == true }
-    )
+    /// Lossless restart Phase 4 explicit recovery actions, from the app's one activation
+    /// (`AgentRecoveryActivation.production`); `AgentRecoveryAppComposition.install(into:)` sets the
+    /// same composition's runner explicitly.
+    lazy var recoveryActionRunner = AgentRecoveryAppComposition.makeActionRunner()
     /// Stable action requests per recovery item and choice, so a repeated click joins its
     /// reservation (same action ID, same planned user item) until its outcome is recorded.
     var recoveryActionRequestsBySlot: [RecoveryActionSlot: AgentRecoveryActionRequest] = [:]
     /// A previous launch's open action joined and shown on an item; the next explicit choice on
     /// that item names it (`supersedesActionID`). The store revalidates its join every time.
     var recoveryPriorActionsByItem: [AgentRecoveryCardKey: RecoveryPriorAction] = [:]
-    /// Registry knowledge used to locate a Claude conversation's native history (Phase 4).
+    /// Registry knowledge used to locate a Claude conversation's native history (Phase 4); the
+    /// composition's registry (set again by `install(into:)`).
     var recoveryHistoryRegistry: AgentProcessRegistry? = AgentProcessRegistry.production
     #if DEBUG
         /// Tests: replaces the registry's Claude history-home lookup (fixture homes only).
