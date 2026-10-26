@@ -5,14 +5,15 @@ Authority: Reference
 Last-verified: 2026-10-18
 
 Status: Phases 1/2, Phase 3 process-registry source, Steps 4a/4b/4c and Phase 5 preservation source are committed and reviewed. The bounded observed Claude subset now includes outbound identity, native-history reconciliation, single-text/Read identity, save/reload comparison, honest unresolved-tool presentation and prospective agreement-proof retention (Step 4d7), without additional raw retention or healing previously cleared proofs. The demonstrated pre-live source findings are closed; full Phase 4 remains blocked on actual app-profile and every-supported-pair qualification in the final isolated live package. Production recovery activation and final live acceptance remain pending (O3/O9/O10).
-Step 6-prelive — blocked | rounds 0/2 | open: full-root codemap test failure reproduced after retry and focused serial run; attributed 2026-10-25 as pre-existing (fails in clean worktrees at d971983b and at 5507c3fa, before every restart-series commit; see [Live acceptance results](#live-acceptance-results-2026-10-25)) ([validation](evidence/2026-10-18-lossless-app-restart/pre-live-validation-2026-10-24.md)) | downgraded: none | assumed: existing dirty-tree tests/package are labeled source and packaging evidence, not clean-HEAD/live acceptance; no unrelated codemap edits | deferred: baseline diagnosis/fix; live cases below
+Step 6-prelive — done | rounds 0/2 | open: none ([validation](evidence/2026-10-18-lossless-app-restart/pre-live-validation-2026-10-24.md)) | downgraded: full-root codemap test failure (`MCPCodeStructureWorktreeTests…ForegroundRecoversOnce`) ignored per O27; pre-existing, fails in clean worktrees at d971983b and 5507c3fa ([Live acceptance results](#live-acceptance-results-2026-10-25)) | assumed: existing dirty-tree tests/package are labeled source and packaging evidence, not clean-HEAD/live acceptance; no unrelated codemap edits | deferred: codemap baseline diagnosis/fix (owner, separately); live cases below
 Step 7-F7 — done | rounds 1/2 | open: none; A/B initial review (B P1 R1: unpersisted submit-exit logs) fixed and cleared by A/B re-review 1; 383 focused tests pass ([evidence](evidence/2026-10-18-lossless-app-restart/fix-f7-worker.md)) | downgraded: none | assumed: tab/workspace activation sets `currentTabID` before publishing (audited, no ordering test; view tab-change re-sync is the fallback) | deferred: Tab-tag first-send test until the new ComposerSubmit logs show the reason; workspace-switch ordering test; B R5 other-tab-dependent fields, N3 log correlation, N4 `canSchedule` in no-session snapshot (view gates on target); full test lane and live composer re-checks
 Step 7-F1 — done | rounds 1/2 | open: none; A/B initial review had no confirmed P0/P1 (B conditional R2 resolved: replacement retires the lane, registry moved to the coordinator), A/B re-review 1 cleared; 672 focused tests, core 66/66; full lane 54 failures = known codemap failure plus 53 load-only watcher-start failures that pass in isolation ([evidence](evidence/2026-10-18-lossless-app-restart/fix-f1-worker.md); reviews [A](evidence/2026-10-18-lossless-app-restart/fix-f1-review-oraclea.md), [B](evidence/2026-10-18-lossless-app-restart/fix-f1-review-oracleb.md), [A r1](evidence/2026-10-18-lossless-app-restart/fix-f1-review-oraclea-r1.md), [B r1](evidence/2026-10-18-lossless-app-restart/fix-f1-review-oracleb-r1.md)) | downgraded: none | assumed: only scheduled owners keep no-handoff settlements; non-scheduled settlements cleared (two tests updated deliberately) | deferred: A r1 R4 read-failure liveness (bounded to deferred entries), B R6 scheduled send through the real Claude runner, B N1/N3 failed-status-save test, B P3-a rare registry retention; live acceptance
 Step 7-F2 — done | rounds 1/2 | open: none; A/B initial review had no confirmed P0/P1 (B conditional R1 closed: unbound tabs never report unresolved recovery, old predicate restored), A/B re-review 1 cleared, cheap P3s applied; 343 focused tests ([evidence](evidence/2026-10-18-lossless-app-restart/fix-f2-worker.md); reviews [A](evidence/2026-10-18-lossless-app-restart/fix-f2-review-oraclea.md), [B](evidence/2026-10-18-lossless-app-restart/fix-f2-review-oracleb.md), [A r1](evidence/2026-10-18-lossless-app-restart/fix-f2-review-oraclea-r1.md), [B r1](evidence/2026-10-18-lossless-app-restart/fix-f2-review-oracleb-r1.md)) | downgraded: none | assumed: the recovery gate explains the live observation (reproduced in tests, not observed live); restriction wording "Restart RepoPrompt to check again" | deferred: B r1 P3-4 stub `.stale` outcome, P3-5 empty-blocker filter; no Needs Attention button in the banner; full test lane, rendered banner layout and live check
 Step 7-F4 — done | rounds 1/2 | open: none; diagnosis: race supported (concurrent readiness replacing the controller), lazy resume after cancel refuted by test; A/B initial review no P0/P1, A/B re-review 1 cleared, cheap P3s applied; 410 focused tests ([evidence](evidence/2026-10-18-lossless-app-restart/fix-f4-worker.md); reviews [A](evidence/2026-10-18-lossless-app-restart/fix-f4-review-oraclea.md), [B](evidence/2026-10-18-lossless-app-restart/fix-f4-review-oracleb.md), [A r1](evidence/2026-10-18-lossless-app-restart/fix-f4-review-oraclea-r1.md), [B r1](evidence/2026-10-18-lossless-app-restart/fix-f4-review-oracleb-r1.md)) | downgraded: none | assumed: MCP startup-lease and managed-auth recovered start never begin/end a run attempt (code reading; no lease-enabled test); "still reconnecting" refuses rather than waits | deferred: lease-enabled /compact test; B R7 duplicated availability-reason mapping, R8 second log channel, RR4 retry-test controller identity, RR5 concurrent resumes on one controller (pre-existing); live idle /compact with production tooling and a cancel→/compact re-run to name the K3 trigger
 Step 7-F3F6 — done | rounds 0/2 | open: none; A/B initial review no P0/P1; text/log-only P2/P3 fixes applied without a re-review round; 712 focused tests; full lane 45 failures in 12 suites, all passing in isolation except the known codemap failure ([evidence](evidence/2026-10-18-lossless-app-restart/fix-f3f6-worker.md); reviews [A](evidence/2026-10-18-lossless-app-restart/fix-f3f6-review-oraclea.md), [B](evidence/2026-10-18-lossless-app-restart/fix-f3f6-review-oracleb.md)) | downgraded: none | assumed: a refused scheduled send is final (marked failed), so its text says "not sent", not "paused"; read-only volumes share the neutral access wording; audit scope covered recovery/shutdown/commit-failure user-facing text | deferred: live permission-denied quit check (cycle8.H_shutdownFault re-run, needs owner approval)
 Step 7-F5obs — done | rounds 0/2 | open: none; A/B initial review no P0/P1 ([worker](evidence/2026-10-18-lossless-app-restart/fix-f5obs-worker.md), [A](evidence/2026-10-18-lossless-app-restart/fix-f5obs-review-oraclea.md), [B](evidence/2026-10-18-lossless-app-restart/fix-f5obs-review-oracleb.md)); log-text-only P2/P3 follow-ups applied without a re-review round; persisted `LifecycleShutdown` log lines per shutdown phase and per failure dialog (request ID, stage, choice); 80 focused tests | downgraded: none | assumed: "dialog presented" in the log means requested from the presenter, not confirmed visible | deferred: live F5 reproduction with screenshot ~10 s after Quit (needs owner approval); Stage B per-step lines, a stricter composer-wait assertion and test-fixture cleanup (OracleB P3s)
-Step 6-live — partial | rounds 0/2 | open: fixes for findings F1–F7, diagnosed 2026-10-26 with root causes, fix order (F7, F1 first), fix guidance and regression tests in [Findings for the implementer](#findings-for-the-implementer) (OracleA/OracleD diagnosis review, not a phase round; F5 still needs one live observation); production activation of Phase 3/4 actions; 2026-10-25 crash cuts, injected shutdown failure, Codex resume and run-queue admission verified there; whole-app qualification and exact crash/failure controls are prerequisites only for their applicable scenarios ([external-driver handoff](evidence/2026-10-18-lossless-app-restart/live-acceptance-handoff.md)) | completed: 2026-10-25 approved same-candidate normal quit/relaunch preserved two distinct unsent drafts and one managed image, exact IDs/payloads/image bytes plus eventual UI readback, zero synthetic sends; 94/94 focused persistence/shutdown tests | downgraded: disposable account optional for destructive tests (O24); 14.09s quit interval includes owner's dialog-response delay and is not a valid latency sample | assumed: external Terminal Pi, actual accessibility UI checks, unchanged default-off production qualification; Step4c helper policy resolved, live verification pending | deferred: remaining preservation variants/questions/reviews/children/schedules, actual-profile/every-pair qualification, crash/injected failures, workload timing and production activation
+Step 7-minor — doing | rounds 0/2 | open: | downgraded: | assumed: | deferred:
+Step 6-live — partial | rounds 0/2 | open: none of F1–F7 (fixed in 7d7be9b6, 03b845d1, 4ce78bde, 5363ad2e, 4e7c8bf9, ae111cc7 and re-verified live 2026-10-26 on ae111cc7, see [Live re-verification](#live-re-verification-of-the-fixes-2026-10-26)); production activation of Phase 3/4 actions; 2026-10-25 crash cuts, injected shutdown failure, Codex resume and run-queue admission verified there; whole-app qualification and exact crash/failure controls are prerequisites only for their applicable scenarios ([external-driver handoff](evidence/2026-10-18-lossless-app-restart/live-acceptance-handoff.md)) | completed: 2026-10-25 approved same-candidate normal quit/relaunch preserved two distinct unsent drafts and one managed image, exact IDs/payloads/image bytes plus eventual UI readback, zero synthetic sends; 94/94 focused persistence/shutdown tests | downgraded: disposable account optional for destructive tests (O24); 14.09s quit interval includes owner's dialog-response delay and is not a valid latency sample | assumed: external Terminal Pi, actual accessibility UI checks, unchanged default-off production qualification; Step4c helper policy resolved, live verification pending | deferred: remaining preservation variants/questions/reviews/children/schedules, actual-profile/every-pair qualification, crash/injected failures, workload timing and production activation
 Step 4d7 — done | rounds 0/2 | open: none in bounded pre-live source; A/B accepted frozen tree fb60e9de, cheap F1/F2 clarifications validated after review ([evidence](evidence/2026-10-18-lossless-app-restart/phase4d7.md)) | downgraded: none | assumed: exact agreement ends existing revocation ownership, fresh whole-history validation remains authoritative, no healing; already-loaded hydration covered, no demonstrated normal forced-replacement path | deferred: B F3/F4 optional refactor/cosmetics; actual-profile and every-supported-pair qualification in one final isolated live package, production activation and final acceptance
 Step 4d6 — done | rounds 0/2 | open: none in bounded presentation source; A/B accepted staged tree0bc4bccb, cheap final corrections validated, 123 focused tests with affected18 rerun ([evidence](evidence/2026-10-18-lossless-app-restart/phase4d6.md)) | downgraded: none | assumed: generic missing/unclassifiable result evidence is neutral even live; explicit classified running unchanged; exact previous run-scoped cancellation preserved separately; no ownership pipeline, recovery bypass or retention change | deferred: B P2-1 visual click/accessibility, P3-2 frozen test names, exact per-call liveness, missing-proof recovery coverage, broader app profile, activation and final live acceptance
 Step 4d-no-replay-capture — done | rounds 0/2 | open: none in bounded O21 capture; two successful Read prompts, exact caller/native identity and six stdout/native joins, same-session byte-prefix continuity independently checked ([evidence](evidence/2026-10-18-lossless-app-restart/phase4d-no-replay-capture.md)) | downgraded: none | assumed: observed isolated no-replay CLI profile only; no Swift classifier or app pipeline exercised | deferred: actual app profile, unsupported shapes, invalidated-proof handling, activation and final live acceptance; O21 budget exhausted
@@ -450,6 +451,248 @@ A crash after step 2 is repaired by matching the receipt. Because the startup ba
 
 The shared pre-dispatch gate runs this spec's ownership check before the checkpoint's 2-second capture. File review is never a prerequisite for Resume, Resume never restores files, and a missing checkpoint never blocks an otherwise safe Resume.
 
+## Live acceptance results (2026-10-25)
+
+Scope: Claude Code and Codex CLI only, on the daily debug app `/Applications/RepoPrompt CE Dev.app` built from `d971983b`, with synthetic `RPCE_RESTART_ACCEPTANCE_…` sessions only. Production recovery qualification stayed unchanged (default off). The owner approved normal quits, deliberate `SIGKILL`s, and a temporary permission fault. Full step-by-step evidence is in the [live-acceptance handoff](evidence/2026-10-18-lossless-app-restart/live-acceptance-handoff.md); raw records are in the local journal `.agent-artifacts/lossless-restart-ordinary-acceptance/lifecycle.json` (keys `cycle2`–`cycle9`).
+
+### Verified
+
+| Area | Result | Evidence |
+|---|---|---|
+| Normal quit | Drafts, images and queued records preserved; no resend | 8/8 records after quit; four active sessions (Claude, Codex, OpenCode, Cursor) quit in 1.12 s (one advisory sample) |
+| Quit during a live turn | Claude intent `dispatching` → `deliveryUnknown`; Codex intent stays `providerAccepted`, run attempt `terminal{appQuit, cancelled}` | Banners "previous run may still be running" and "Message may have been delivered" |
+| Exact crash cuts (lldb breakpoint, then `SIGKILL`) | Every cut below: payload kept, nothing resent, no provider process started after relaunch | Debug signing has no hardened runtime, so `lldb` attaches without a prompt |
+| — queued written, before receipt | intent `queued`, composer consumed; card "Saved message, not sent" | `AgentRecoveryStore.swift:747` |
+| — run attempt recorded, before dispatch | intent `queued`, open run attempt; crash hold plus "Run interrupted before it was saved" | `AgentRecoveryQueuedInput.swift:252` |
+| — dispatching written, before handoff | intent `dispatching`, one attempt; "Message may have been delivered" (conservative: the provider never saw it) | `AgentRecoveryStore.swift:870` (line 868 is before the durable `rewrite`) |
+| — quit Stage A after the unclean mark | `launch-state` `shutdownInProgress`; relaunch treats it as unclean; draft restored exactly | `AgentLifecycleShutdownCoordinator.swift:584` |
+| — quit Stage B before the clean mark | same as Stage A | `AgentLifecycleShutdownCoordinator.swift:776` |
+| Timing-based kills mid-turn (Claude and Codex) | records frozen, no resend; Codex children die with the app; Claude shim, CLI and tool survive as orphans and finish on their own | `cycle8.E_crash` |
+| Injected shutdown failure (`chmod 555` on `AgentRecovery/v1/sessions` only) | Quit blocked with "RepoPrompt couldn't save everything before quitting … Nothing was stopped or closed" and Cancel / Retry; app stays usable; after permissions are restored, Retry flushes all pending text and quits | `cycle8.H_shutdownFault` |
+| Scheduled send across a quit | `needsConfirmation` / `missedWhileClosed`; nothing dispatched | banner "Scheduled for 14:28 · app was closed; confirmation required" |
+| Recovery card actions | It stopped, Dismiss, View, Edit, Remove write only their own decision; none sends | Edit restored exact text and withdrew the intent |
+| Codex resume after a restart (MCP steer and composer) | same thread; reply "QUEUED; lighthouses." needs both earlier turns; no re-execution | `cycle9.L` |
+| Queued behind a running command (Codex, MCP) | "Queued to start", durable `queued` intent, drained exactly once | `cycle9.K` |
+| Codex `queuedFallback` | accepted on unit-test evidence (owner, O25): `CodexFallbackFIFOTests`, `AgentModeRunServiceLifecycleTests`, `AgentRecoveryQueuedInputTests`, 213 + 10 tests, 0 failures | its only reliable live trigger (`resumedThreadActive`) cannot occur: the Codex app-server is a child of the app and dies with it |
+| Full-root codemap failure | pre-existing, not caused by this work | `MCPCodeStructureWorktreeTests…ForegroundRecoversOnce` fails at line 1805 in clean worktrees at `d971983b` and `5507c3fa` |
+
+### Live re-verification of the fixes (2026-10-26)
+
+Built and installed from `ae111cc7` (`make dev-run`, provenance commit `ae111cc7`; `dirty` only from unrelated local docs and the codemap helper), on the daily debug app, with synthetic `RPCE_RESTART_ACCEPTANCE_20261026_…` sessions, Claude Code and Codex CLI only. Production recovery qualification stayed default off. Raw records: `cycle10` in the local journal.
+
+| Finding | Live result | Evidence |
+|---|---|---|
+| F7 | **PASS.** The exact trigger, a first send in a new session with a Tab-accepted `@` file suggestion, sent once on both Claude and Codex, with the tag attached. Switching between a Claude and a Codex tab kept each composer's own model, showed no foreign MCP chip, and a send from each tab was accepted once. | intents `2E8A55A1`, `66E6D7EF` `providerAccepted`; `taggedFileAttachments` = the spec path; replies `TWELVE` / `THIRTEEN` |
+| F1 | **PASS.** A 15-minute follow-up in an idle, composer-created Claude session fired on time without a restart and was delivered once. The earlier turns were untouched: no error row, not marked failed. | scheduled intent `7CF30842` `providerAccepted`, no `withdrawnAt`; run attempt `ordinary/completed`; reply `FIRED`; schedule cleared |
+| F2 | **PASS (feedback; the gate is unchanged by design).** Send now on a new-session schedule, both while running and after a quit as `missedWhileClosed`, now explains itself: "Will send after 13 interrupted sessions in this workspace are resolved: choose It stopped (not Dismiss) in Needs Attention…". Nothing dispatched. | schedule `needsConfirmation` / `missedWhileClosed`, `runAlongsideOtherSessions` true, 0 turns |
+| F3 | **PASS.** The header reads "Nothing interrupted in this session. 64 items elsewhere need attention." With local rows it reads "3 saved or interrupted items in this session need your attention. 66 items elsewhere need attention." | screenshots during the run |
+| F4 | **PASS.** Idle `/compact`; a compaction cancelled with Stop (`userCancel` after 25 ms); then `/compact` again. Each answered "Requested Codex context compaction." and never "Start a Codex conversation". The thread kept its context (follow-up answered `Harbors`). | run attempts in the Codex session `F0C20642…` |
+| F5 | **PASS (not reproduced).** A normal quit during a running Codex foreground command exited about 2 s after Quit and killed the command. The run attempt has `shutdown{appQuit}` and `terminal{appQuit, cancelled}`; `launch-state` was `cleanExit`. The new `LifecycleShutdown` log shows the whole request (confirmation answered, Stage A steps, teardown, Stage B, `shutdown_ended outcome=completed`) in 0.8 s. | unified log, request `BFD1674D…` |
+| F6 | **PASS.** With the sessions directory made read-only and a pending draft, the quit dialog reads: "the message box could not be saved (RepoPrompt can't access its data folder; check that folder's permissions and that its disk is writable). Nothing was stopped or closed…", with no Swift or `NSError` text. After permissions were restored, Retry saved the exact text and quit cleanly. The dialog and the choice are in the `LifecycleShutdown` log. | `shutdown_dialog_presented` / `shutdown_dialog_choice` |
+| Regression | **PASS.** The dispatching crash cut (lldb at `AgentRecoveryStore.swift:872`, after `beginDispatch`'s durable rewrite, then `SIGKILL`) on the fixed build: `dispatching` intent and attempt kept; after relaunch no resend and no provider process; crash hold, "Run interrupted before it was saved" and "Message may have been delivered" shown. | Claude session `2A0336BA…` |
+
+Not re-run on the fixed build: the other crash cuts, timing kills, the four-provider quit, and the Codex queue scenarios. The minor observations below remain as recorded.
+
+### Findings for the implementer
+
+Fixed and re-verified live on 2026-10-26 (see above); the diagnosis below is kept as the record. Diagnosed 2026-10-26 at `d971983b` from code, the on-disk records of the affected sessions, Claude's own session log and the acceptance journal (`.agent-artifacts/lossless-restart-ordinary-acceptance/lifecycle.json`). OracleA and OracleD reviewed the diagnosis and the fix guidance independently (identity verified; a diagnosis review, not a phase review round). Line numbers refer to `d971983b`. Labels: **confirmed** (code, or code plus recorded data), **inference** (fits the evidence, not proven), **open** (unknown).
+
+**Fix order:** F7, then F1, each with its regression tests, plus the observability items under "Cross-cutting". Then F2 feedback, F4, and F3/F6 wording. F5 first needs one live observation.
+
+**Safety fences that every fix keeps:**
+- the composer submit-target checks (`AgentInputBar.swift:543-549`, `renderedSubmitTarget`) and submission tokens;
+- the recovery admission gates, including the new-session gate that "Run alongside" does not bypass;
+- the durable-intent transition rules (`AgentRecoveryStore.swift:930-960`): a withdrawn intent is never dispatched;
+- "Sent" only on affirmative provider acceptance;
+- the single 8-second quit deadline followed by a user choice.
+
+#### F7 — Submit disabled or "This composer changed…" because another tab's state overwrites the composer (high)
+
+- *Observed:*
+  - Owner, 2026-10-25: a first send with a Tab-accepted file tag in a new Codex session was refused with "This composer changed before the message could be sent. Please try again." Afterwards Submit was barely ever clickable. Changing the reasoning effort and changing it back re-enabled Submit, but only for a while.
+  - Journal (`queuedScenario`, 10:35–11:10): Return or Send did nothing in sessions E, G, J, K and T3, sometimes showing the same message. In T3, a session never touched by MCP, the composer showed an orange MCP chip, a locked model and a disabled Send button. A relaunch cleared it temporarily (`cycle2.uiReadbackT4`). `cycle9.J2` and `K` hit the same thing.
+- *Cause (confirmed, code):*
+  1. Every recovery-record write publishes a commit with no change filter, including the composer snapshots written while typing (`AgentRecoveryStore.swift:2156`).
+  2. The coordinator adopts it, invalidates the catalog and posts a coalesced `.agentRecoveryCatalogDidChange` (`AgentRecoveryCoordinator.swift:529-559`, `:719-747`). `composerStateDidChange` also posts `.agentRecoveryComposerStateDidChange` (`:819-827`).
+  3. The view model's observer (`AgentModeViewModel+Recovery.swift:641-646`) calls `refreshRecoveryListUI`, which loops over `sessions.keys` and calls `syncComposerUIState(tabID:)` for each tab (`AgentModeViewModel+RecoveryList.swift:1053-1056`).
+  4. Each call writes `makeComposerProps(tabID:)` into the one shared `AgentComposerUIStore` (`AgentModeViewModel+ComposerUI.swift:192-195`; the store has a single `props`, `AgentComposerUIStore.swift:7`). The last dictionary key wins, and Swift's per-launch hash seeding makes that order differ between launches.
+  5. When the winner isn't the visible tab, `renderedSubmitTarget` is nil (`AgentInputBar.swift:543-549`): the button is disabled, and Return shows the stale message from `view_nil_target` (`:2422-2424`).
+  6. The MCP chip and model lock read the props without a tab check (`AgentInputBar.swift:613-618`, `:994`; built from the explicit tab at `AgentModeViewModel+ComposerUI.swift:74-75`). That is why T3 showed another tab's MCP state.
+  7. The effort `didSet` republishes the current tab (`AgentModeViewModel.swift:381-386`), which explains the workaround until the next write.
+- *Also:* `makeComposerProps` for a non-current tab is a mix of states. Some fields come from that tab (submit target, schedule, MCP lock, selected agent); others come from the visible session or view model (run state, busy flags, pending attachments, reasoning effort, auto-edit). Publishing it was never a valid state.
+- *Open:* the exact rejection reason for the owner's Tab-tag send was not logged. Tag acceptance attaches synchronously (`TextFieldMentionHelpers.swift:331-340`, `AgentModeViewModel+DraftsAttachments.swift:195-220`), so the earlier "late tag resolution" lead is unsupported. `sendMessage()` has silent exits before the logged one: the provider-unavailable notice (`AgentInputBar.swift:2411-2418`, which can read another tab's `canSendWithCurrentProvider`) and the empty-draft guard (`:2420`). A separate first-send race, where draft persistence binds a session after the rendered target was captured, is plausible but untested.
+- *Fix:*
+  - Enforce ownership in `syncComposerUIState(tabID:)`, the shared publication boundary used by about 67 call sites. When an explicit `tabID` is not `currentTabID`, skip the store update but still call `notifyScheduledSendBusyStateMayHaveChanged(tabIDs: [tabID])`. Otherwise publish `makeComposerProps()` for the current tab.
+  - Make `refreshRecoveryListUI` publish the current tab once and send busy notifications for the other tabs explicitly. Don't drop scheduler notifications by accident: the observer comment saying "no scheduler churn" is already inaccurate.
+  - Optionally add a DEBUG assertion in `AgentComposerUIStore.update` that published props belong to the current tab.
+- *Audit before landing:*
+  - `currentTabID` is computed from `promptManager.activeComposeTabID` (`AgentModeViewModel.swift:1307-1314`). Find any tab-activation or first-send path that publishes the new tab before that value switches, for example `createAndActivateSessionTab` and the first-send destination sync near `AgentModeViewModel.swift:15530`. With the new guard such a path would leave stale props, so make it publish after the switch.
+  - Check direct `ui.composer.update` calls and other shared UI stores fed by `syncAllActiveUIState(tabID:)` for the same pattern.
+- *Do not change:* the submit-target checks (they turned this into a safe failure instead of a send to the wrong tab), the commit publisher (scheduled-send evidence consumers need every commit), or store equality (another tab's props are legitimately unequal).
+- *Tests:*
+  - With tabs A (current) and B open, `refreshRecoveryListUI()` and a posted catalog-change notification leave `props.currentTabID`, `submitTarget`, `isCurrentTabMCPControlled` and `areModelControlsDisabled` as A's; Send stays enabled.
+  - `syncComposerUIState(tabID: B)` leaves the props unchanged and still notifies B's scheduler busy state.
+  - Run across tab-order permutations.
+  - Switch tabs while a notification is queued.
+  - Cover the no-current-tab and tab-removal cases.
+  - Keep separate coverage for the Tab-tag first send.
+- *Afterwards:* re-run the live composer checks. Per-keystroke refresh cost (one refresh per write, plus a second for composer-state changes) is a separate, optional performance follow-up; any filtering belongs in `adoptRecordCommit`, never in the store.
+
+#### F1 — A scheduled follow-up is withdrawn before its runner dispatches it, and the previous turn is marked failed (high; Claude confirmed, ACP likely)
+
+- *Observed:* an idle Claude session (`86798767-FE57-4D15-9AD9-AB11A469EE3F`, `cycle9.I_followup`) ran a 15-minute follow-up with no restart.
+  - The schedule went `failed` with "The agent runtime changed before the scheduled message could be sent." and the banner read "Delivery unconfirmed".
+  - The previous completed turn (S3, reply `READY`) was rewritten `terminalState: failed` with the error "This message was not sent because its delivery could not be recorded. It stays saved."
+- *Recorded sequence (confirmed, on-disk recovery record):*
+  - t0: intent `496A71F4` saved `queued`.
+  - t0+118 ms: intent `withdrawn`.
+  - t0+289 ms: run attempt `8196222E` recorded, 171 ms after the withdrawal. It reuses the previous `processRunID`, which is intended; the run attempt is new.
+  - t0+420 ms: terminal `ordinary/failed`.
+  - There is no delivery-attempt row for the intent. Claude's session log (`897e3ec2-ab7a-4ef7-8d93-7cc700c5f534.jsonl`) contains S3 and never S4, so nothing was delivered.
+- *Cause (confirmed, code):*
+  1. For non-Codex providers the run service defers the durable dispatch commit to the runner (`AgentModeRunService.swift` ~650-700, "adopted plan §5").
+  2. The Claude runner spawns `session.agentTask` and returns (`ClaudeIntegratedAgentModeRunner.swift:63-113`). The commit happens later in that task, after `lease.acquire()` and tool-tracking setup (`ClaudeAgentModeCoordinator.swift:2014`). So `startAgentRun` returns `nil` while the intent is still `queued` with no attempt.
+  3. `finishMandatoryScheduledDispatch` reads the record, finds `intentNeverDispatched` (`AgentScheduledSendRecovery.swift:206-211`), and treats a `nil` outcome as non-delivery (`AgentModeViewModel+ScheduledSend.swift:3170-3176`). It then removes the bubble, withdraws the intent and marks the schedule failed, using the nil-fallback text (`:2881-2896`).
+  4. The runner's later `beginDispatch` on the withdrawn intent throws `invalidTransition` (`AgentRecoveryStore.swift:939-953`; the intent is still present with state `withdrawn`). That maps to the `.commitFailed` text (`AgentRecoveryCoordinator.swift:292-293`), and the run finalizes `failed`.
+  5. The terminal barrier attributes the failure to `session.items.last(where: .user)` (`AgentRunTerminalCommitBarrier.swift:248-250`). The scheduled bubble was already removed, so that is the previous turn.
+- *Same exposure (confirmed, code):* ACP providers (OpenCode, Cursor, Oh My Pi) also commit inside a spawned run task (`ACPIntegratedAgentModeRunner.swift:317-325`, commit at `:1729`). Headless is unaudited.
+- *Why tests missed it:* the injected starter in `AgentScheduledSendNonCodexMandatoryTests.swift:15-25` writes dispatch evidence before returning `nil`, which production doesn't do. Only the "already dispatching" branch is covered.
+- *Also:*
+  - `nil` is ambiguous. Some non-Codex exits before any runner exists also return `nil` (comment at `AgentModeRunService.swift` ~576-582; the workspace failure at ~658).
+  - The view model's staged-input path already treats "inactive run" as not proving non-handoff (`stagedInputStartDisposition`, `AgentModeViewModel.swift` ~19058). The scheduled finisher is the odd one out.
+  - The error text "…delivery could not be recorded…" has three sources: `.commitFailed`, and literal strings in the Claude runner (`:154`) and the ACP runner (`:1719`) `attachRunAttempt` branches.
+- *Fix (authority: the run-start and handoff boundary, not provider-specific scheduler heuristics):*
+  1. Make `nil` from `AgentModeRunService.startRun` mean only "a runner owns this input and owes a settlement". Every pre-runner exit returns an explicit `.failed` or `.stale` for every provider. Codex semantics are unchanged.
+  2. In `finishMandatoryScheduledDispatch`, never infer non-delivery from `nil` or from a record read. Hold with `.awaitingProviderEvidence`, keeping the schedule, payload, intent and bubble.
+     - Resolve the hold only on the handoff's own settlement. Committed evidence leads to the existing transfer and acceptance logic. A proven no-handoff (`noteNoHandoff`) on the still-queued intent is the only case that may withdraw, remove the bubble and mark failed, using the handoff's message.
+     - Verify that a deferred, uncommitted durable handoff's `noteNoHandoff` and `settleRunInputScope` actually wake the scheduled hold, for example via `.agentRecoveryDeliveryEvidenceDidSettle` (`AgentModeViewModel+Recovery.swift:649`). If not, that is the one new hook.
+     - A dispatch commit is not acceptance and not Sent. A timeout never proves non-handoff.
+  3. Bind terminal attribution to the run attempt's own input (the attempt's `userItemID` and execution turn, keeping the relocated-input mapping) instead of `items.last(.user)`. If that target is absent, never fall back to failing an earlier turn. This also covers a newer queued input being appended.
+  4. Give the three identical "could not be recorded" texts distinguishable diagnostics.
+- *Do not change:* `beginDispatch`'s refusal of withdrawn intents, `intentNeverDispatched`, `withdraw` semantics, dispatch-before-provider ordering, intentional `processRunID` reuse, the Codex path, or the existing `deliveryUnknown` hold branch (`AgentModeViewModel+ScheduledSend.swift:3138-3149`).
+- *Tests:*
+  - A production-shaped starter returns `nil` first and commits evidence after a delay. Expect a hold, the intent kept, a transfer only after acceptance, and the previous turn unchanged.
+  - The starter returns `nil` and then reports no-handoff. Expect `.failedBeforeHandoff`, with only the scheduled bubble removed.
+  - Every pre-runner exit in the run service returns non-nil for Claude and ACP.
+  - The real Claude runner with a delayed fake `lease.acquire()`.
+  - The same for ACP.
+  - Cancellation, tab replacement or shutdown during preparation.
+  - Terminal attribution with a relocated input and with a newer queued user item.
+
+#### F2 — "Send now" on an overdue new-session schedule silently does nothing (medium)
+
+- *Observed (`cycle6.sched`):* in `needsConfirmation` / `missedWhileClosed` with `isNewSessionStart`, both menu items left the record unchanged for over a minute. "Run alongside other sessions" only set `runAlongsideOtherSessions`. There was no intent, attempt or process.
+- *Cause (confirmed, code; live blocker inference):*
+  - `confirmAndSendNow` returns `Void`, records consent and calls `evaluate()` (`AgentScheduledSendCoordinator.swift:995-1027`).
+  - `evaluate()` silently skips new-session starts while any host reports `hasUnresolvedRecoverySession`, including when Run alongside is set (`:1729-1739`; revalidated at `:1345-1356`). This is by design (comments at `:409-410`, `:1345-1346`).
+  - The gate clears for a crash hold only through explicit **It stopped** for that exact hold, and for restrictions only through schedule-transfer resolution or the next launch's inspection (`AgentRecoveryCoordinator.swift:1448-1471`). Dismiss does not clear it.
+  - The workspace held many crash holds from the deliberate kill tests.
+- *Open alternative:* `confirmAndSendNow` also returns early, silently, when a pending confirmation obligation exists (`:1002`), when startup admission is closed, when a transfer hold exists, or when no candidate matches. Check which applied before choosing the message.
+- *Fix:*
+  - Keep the gate.
+  - Have the scheduler expose a per-schedule disposition (rejected, consent recorded but blocked with a reason, or progressing), derived from the same predicates admission uses.
+  - Have `confirmAndSendNow` return or emit a refusal reason.
+  - Show it in the schedule banner, for example "Will send after N interrupted sessions in this workspace are resolved (It stopped, not Dismiss) → Needs Attention…".
+  - Keep revision-scoped consent.
+- *Tests:*
+  - A crash hold, a session restriction and a workspace restriction each produce visible blocked feedback.
+  - Run alongside stays blocked.
+  - Dismiss doesn't clear the gate; It stopped does, and the valid consent then dispatches once.
+  - Every early return of `confirmAndSendNow` is covered.
+
+#### F4 — `/compact`: a misleading "Start a Codex conversation" after a cancelled compaction (medium; thread loss refuted)
+
+- *Observed (`cycle9.K`, session `531B9358-98FE-4770-B972-E061B16250B0`):* the first `/compact` printed "Requested Codex context compaction." and a run attempt (`DE6F5490…`) ended `userCancel`. The second `/compact` answered "Start a Codex conversation before using /compact." A later normal message resumed the same thread with its context (`cycle9.L`). A composer message typed during compaction did not submit.
+- *Confirmed (code):*
+  - "Requested…" means the `thread/compact/start` request returned, not that compaction finished (`CodexAgentModeCoordinator.swift:1664-1670`).
+  - Cancellation detaches the controller and marks reconnect, but keeps `codexConversationID` and `codexRolloutPath` (`:10238-10260`). No thread is lost.
+  - The same message has two sources: the availability check with no thread metadata (`:1587-1589`), and the post-readiness check where the controller is nil or `!hasActiveThread` after `ensureCodexNativeSession` (`:1659-1662`). The second `/compact` passed availability, so it came from the post-readiness check.
+  - Return calls `sendMessage` and never cancels. The mouse Send button becomes Stop while a run is active (`AgentModeViewModel+ComposerUI.swift:17-25`, `AgentInputBar.swift:1032-1047`).
+- *Inference:*
+  - The `userCancel` was a click on Stop; the journal records the automation clicking Stop by mistake once before (`queuedScenario.errorLog`).
+  - The 2 ms interval is not the compaction duration: a worker reported that the run-attempt record is created at terminal time (`AgentRecoveryCoordinator.swift` ~2957-2981, `AgentRecoveryStore.swift` ~1191-1200). Not spot-checked.
+  - The second error was recorded 182 ms after the MCP-sent message K3 arrived, and K3 started a run on the same session about 1 s later. So two reconnects probably raced.
+- *Open alternative (OracleD):* after a cancel-detach, `ensureCodexNativeSession` may never re-establish an active thread until a normal turn runs. That would make `/compact` fail deterministically after any cancel. A cancel → `/compact` unit test separates the two explanations. Also open: which guard swallowed the typed message (F7, or a silent latch or empty-draft exit).
+- *Fix:*
+  - Separate "couldn't reconnect / reconnect in progress" from "no conversation" in the `/compact` message and diagnostics.
+  - If the race or lazy resume is confirmed, coordinate readiness at the session/controller authority, and recheck session identity, run state and eligibility after suspension, so compaction never overlaps a newly admitted turn.
+  - No sleeps or blind RPC retries. Keep the reconnect metadata retention and the cancellation fences.
+- *Tests:*
+  - A persisted thread with a detached controller and a delayed reconnect.
+  - Cancel → `/compact`.
+  - A concurrent MCP submission with `/compact`.
+  - Controller replacement during readiness.
+
+#### F5 — Quit during a running Codex turn not finished after 30 s (medium; narrowed, not diagnosed)
+
+- *Observed (`cycle9.M`):* a terminate request plus a click on the sheet's Quit did not end the app in 30 s. Tooling then killed it, and recovery correctly classified that as `appCrash` with no resend.
+- *Confirmed (on-disk):*
+  - A successful quit writes Stage A `runAttempts[].shutdown{appQuit}` and Stage B `terminal{appQuit, cancelled}` about 110 ms apart. Examples: sessions `A5291E56…` (Codex) and `6A56F9A3…` (Claude). The four-session quit including an active Codex turn exited in 1.12 s (`cycle7`).
+  - The F5 run attempt `3F894870-E449-4FED-B5D7-5D8745C896D9` has **neither**. This session's Stage A evidence and teardown never happened. Teardown did not stall, though a stall elsewhere isn't excluded: Stage A can also skip a session with no live lane (`AgentModeViewModel+Shutdown.swift:310`).
+- *Remaining explanations:*
+  - The Quit click wasn't accepted: later terminate requests only return `.terminateLater` (`AppQuitPolicy.swift:53-55`).
+  - Stage A stalled. After the 8-second deadline the app presents "RepoPrompt couldn't save everything before quitting" [Retry][Cancel] and waits for the user indefinitely, which is spec-consistent (`AgentLifecycleShutdownCoordinator.swift:832-866`; dialogs `WindowStatesManager+LifecycleShutdown.swift:145-176`).
+  - A lead for the stall: Stage A awaits a pending composer preparation with no bound (`AgentModeViewModel+Shutdown.swift:304-309`).
+  - Main-actor starvation or an obscured sheet are also possible.
+- *Next:*
+  - Screenshot the window about 10 s after clicking Quit.
+  - Add a persisted log line whenever a quit-failure dialog is presented, plus request-ID phase timestamps, so this is diagnosable after the fact.
+  - Tests: a permanently suspended preparation and a stalled teardown each present the right dialog at the single deadline; repeated quit requests don't extend it; a late completion can't complete an expired request.
+- *Do not change:* the deadline or the intentional wait for the user's choice.
+
+#### F3 — The banner header contradicts its button (low, wording)
+
+- *Observed:* "0 saved or interrupted items need your attention." beside "Needs Attention (64)…".
+- *Cause (confirmed, code):*
+  - The header counts this session's rows (`AgentRecoveryListBanner.swift:87-92`).
+  - The button counts every undismissed catalog item not shown here, including other workspaces (`AgentModeViewModel+RecoveryList.swift:52-55`).
+  - `isEmpty` deliberately keeps the banner for the button alone (`AgentComposerUIModels.swift:393-397`).
+  - Not caused by F7: the banner is hidden when the props belong to another tab (`AgentInputBar.swift:571`).
+- *Fix:*
+  - When there are no rows but other items exist, use neutral text, for example "Nothing interrupted in this session. N items elsewhere need attention." Keep both counts distinct when both exist.
+  - Don't change catalog scope, dismissal or visibility.
+- *Tests:* header text for zero-local/nonzero-other, one, many and empty, plus the dismissed crash-hold indicator.
+
+#### F6 — The quit-failure dialog shows raw Swift error text (low, presentation)
+
+- *Observed (`cycle8.H_shutdownFault`):* "…the message box could not be saved (store(AgentRecoveryStoreError.storageFailure(… Code=513 … mktemp … Permission denied …)))".
+- *Cause (confirmed, code; matches the live text):*
+  - `shutdownPreparationFailureText` interpolates the failure for `composerNotPersisted` and `evidenceNotPersisted` (`AgentModeViewModel+Shutdown.swift:380-383`).
+  - That failure is the store's `String(describing: error)` (`AgentRecoveryStore.swift:2152-2154`).
+- *Fix:*
+  - Map typed failures to plain, actionable text at the presentation boundary: permission denied, disk full, other. Where only an opaque string exists, use a generic message rather than parsing it.
+  - Keep the raw detail in redacted logs.
+  - Audit other raw interpolations, such as the run-service commit-failure message (`AgentModeRunService.swift` ~650-700).
+  - Keep the failure classification and the quit-blocking behavior.
+- *Tests:* permission, disk-full and unknown failures produce text with no enum or `Domain=` syntax and no draft content.
+
+#### Cross-cutting observability (cheap; land with F7/F1)
+
+- Log a reason on every early return of `AgentInputBar.sendMessage()` and the composer submit path, not only on `view_nil_target`. This closes the F7 Tab-tag and F4 typed-message gaps.
+- Persist a line, with request ID and stage, whenever a quit-failure dialog is presented (F5).
+- Give the three "delivery could not be recorded" sources distinct diagnostics (F1).
+
+#### Minor observations
+
+- A Codex bash row can still read `success` after its command was cancelled by quit.
+- The View popover swallows the next press on its row while open.
+- MCP-created sessions cannot schedule (`canScheduleSend` requires no MCP control). This is by design.
+
+### Deliberately gated, not a defect
+
+- **Orphaned provider processes:** live, a crash leaves the Claude shim, CLI and tool running unmanaged; the app shows only the crash hold ("It stopped" / Dismiss).
+- **Recovery row actions:** Continue, Send saved and the other row actions are hidden by `AgentRecoveryActionQualification.production`.
+- **What exists:** Phase 3 (discovery, Let finish, Stop, two-writer rule) and Phase 4 (Resume) source is committed and reviewed but inactive by design (O9, O14).
+- **What enabling them takes:** this is the remaining Step 4 qualification (actual app profile, every supported provider pair) and an explicit owner activation decision, not a bug fix.
+
+### Not verified
+
+- The exact rejection reason for the owner's Tab-tag first send (F7), which dialog the F5 quit was showing, why the F4 reconnect failed, and which guard swallowed the F4 typed message.
+- Exact intent/ack boundaries for scheduled-send transfer steps.
+- The `reserved`-record crash cut.
+- A storage fault during an active run.
+- Quit-latency and intent-commit performance targets.
+
 ## Owner decisions
 
 Decision O3 (2026-10-20): Defer real-app crash testing; proceed with instrumentation and code validation, leaving live acceptance pending.
@@ -473,6 +716,12 @@ Decision O21 (2026-10-24): Approve the bounded no-replay capture: at most two Re
 
 Decision O22 (2026-10-24): Approve continuing the work until the remaining blockers are resolved (owner: “then go on continue until all resolved. I approve.”).
 Decision O23 (2026-10-24): Run the remaining validation up to the part requiring app stop/relaunch, and draft a low-manual-effort plan for those lifecycle steps using available external apps/agents or the debug CLI; no immediate app stop/relaunch is requested.
+Decision O25 (2026-10-25): Accept Codex `queuedFallback` as passed on its unit-test coverage, since its live trigger cannot occur with an app-owned Codex app-server. Record the live-acceptance findings and evidence in this spec; the owner implements the fixes.
+Decision O24 (2026-10-24): Proceed without a disposable-account requirement. Use the existing daily app for ordinary quit/relaunch durability acceptance, coordinated by Pi already running in Terminal. Diagnose the outstanding test failure, prepare synthetic drafts/queued messages/sessions and verify exact restoration. Deliberate crashes and injected storage failures remain separate and unverified until a proportionate method is chosen; recovery-action qualification remains a distinct limitation. Fresh approval is still required immediately before each visible lifecycle action.
+Decision O26 (2026-10-26): Keep the live re-verification results in this spec.
+Decision O27 (2026-10-26): Ignore the pre-existing full-root codemap test failure for this plan; the owner will address that test separately.
+Decision O28 (2026-10-26): Recovery activation only needs Claude Code and Codex for now.
+Decision O29 (2026-10-26): Re-sign the unsigned local commits now that the owner is present to approve signing.
 
 Each has a recommended default; none blocks Phase 1.
 
@@ -482,7 +731,7 @@ Each has a recommended default; none blocks Phase 1.
   - (a) a DEBUG-only Application Support root override honored by every store, which needs an audit of those stores, the MCP socket paths, and the Keychain service;
   - (b) a disposable macOS test account, which needs no code but does need the provider CLIs, shims, and logins set up there.
 
-  Recommendation: (b) for the first acceptance pass, and (a) only if repeated runs justify it.
+  These are isolation options for deliberate crash/fault tests only. Per O24, neither is required for ordinary quit/relaunch acceptance on the daily app. Choose a proportionate isolation method separately if destructive tests are later authorized.
 - **O4 — Composer durability.** Default: a 300 ms write debounce with a 2-second maximum delay, and no Saving/Saved indicator.
 - **O5 — What "durably queued" means to MCP callers.** Default: the item survives a restart as held input that needs one click. It is never auto-sent.
 
@@ -564,7 +813,9 @@ These need O3. Kill RepoPrompt at each point and check the result:
 
 ### Live acceptance
 
-Run through the real shims, using O3's isolated instance:
+First exercise ordinary preservation on the daily app with an external Terminal coordinator (O24): bind a current candidate, prepare synthetic composer/attachment/queued-input state through normal app paths, obtain fresh approval for normal quit/relaunch, and verify exact restoration with no automatic resend. A bootstrap from an older running build does not prove the candidate's pre-quit behavior. Keep recovery activation off; UI-only checks need actual UI interaction.
+
+The advanced provider/crash qualification cases below remain separate. Use the real shims; for destructive cases choose and verify an O3 isolation option before obtaining fresh scenario-specific approval:
 - a Claude foreground tool followed by a new tool;
 - Claude with a background child;
 - Claude with an unanswered stdio permission request (this decides O1's advice);
