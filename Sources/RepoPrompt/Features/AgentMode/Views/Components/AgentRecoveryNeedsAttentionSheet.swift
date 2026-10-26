@@ -7,6 +7,8 @@ import SwiftUI
 /// default), each in snapshot order, with the same rows and actions as the composer banner.
 /// Dismissed and automatically cleared items are hidden unless "Show dismissed and cleared" is on.
 /// Each section offers a bulk Dismiss of its displayed rows (O34-2; confirmed for Needs action).
+/// "Check and resolve" (Step 9-check) checks the displayed rows and reports each one; it is
+/// observational (no confirmation: its report header names what it may clear).
 /// Presented by each window's root host (`AgentRecoveryNeedsAttentionHost`) from the View menu,
 /// the banner, or the sidebar, independent of the sidebar and of any tab. Opening a row never
 /// starts a provider.
@@ -48,12 +50,19 @@ struct AgentRecoveryNeedsAttentionSheet: View {
                 Text("Needs Attention")
                     .font(.title2.weight(.semibold))
                 Spacer()
+                Button("Check and resolve") {
+                    agentModeVM.startRecoveryCheck(rows: rows)
+                }
+                .disabled(agentModeVM.isRecoveryCheckRunning || AgentModeViewModel.recoveryCheckItems(rows).isEmpty)
+                .hoverTooltip(agentModeVM.recoveryCheckHelpText)
+                .accessibilityIdentifier("agent.recoveryNeedsAttention.check")
                 Toggle("Show dismissed and cleared", isOn: $showDismissed)
                     .toggleStyle(.checkbox)
                     .accessibilityIdentifier("agent.recoveryNeedsAttention.showDismissed")
                 Button("Done") { dismiss() }
             }
             bulkStatusLine
+            checkReport
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 10) {
                     HStack {
@@ -142,7 +151,10 @@ struct AgentRecoveryNeedsAttentionSheet: View {
             revision &+= 1
         }
         // A finished bulk's summary is not shown again on the next opening (a running one stays).
-        .onDisappear { agentModeVM.clearRecoveryBulkDismissSummary() }
+        .onDisappear {
+            agentModeVM.clearRecoveryBulkDismissSummary()
+            agentModeVM.clearRecoveryCheckReport()
+        }
     }
 
     private var isBulkRunning: Bool {
@@ -165,6 +177,47 @@ struct AgentRecoveryNeedsAttentionSheet: View {
                         .accessibilityIdentifier("agent.recoveryNeedsAttention.bulkCancel")
                 }
             }
+        }
+    }
+
+    /// The app-wide Check and resolve's header, progress or summary and per-item results, with Stop
+    /// while it runs.
+    @ViewBuilder
+    private var checkReport: some View {
+        if let status = agentModeVM.recoveryCheckStatus {
+            VStack(alignment: .leading, spacing: 4) {
+                Text(status.headerText)
+                    .font(.callout.weight(.medium))
+                HStack(spacing: 8) {
+                    Text(status.summaryText)
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                    if status.isRunning {
+                        Button("Stop") { agentModeVM.cancelRecoveryCheck() }
+                            .controlSize(.small)
+                            .disabled(status.cancelRequested)
+                            .accessibilityIdentifier("agent.recoveryNeedsAttention.checkCancel")
+                    }
+                }
+                if !status.entries.isEmpty {
+                    ScrollView {
+                        VStack(alignment: .leading, spacing: 2) {
+                            ForEach(Array(status.entries.enumerated()), id: \.offset) { _, entry in
+                                Text("\(entry.label) — \(entry.outcome.text)")
+                                    .font(.caption)
+                                    .textSelection(.enabled)
+                            }
+                        }
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                    .frame(maxHeight: 140)
+                }
+            }
+            .padding(8)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(RoundedRectangle(cornerRadius: 8, style: .continuous).fill(Color.secondary.opacity(0.08)))
+            .accessibilityElement(children: .contain)
+            .accessibilityIdentifier("agent.recoveryNeedsAttention.checkReport")
         }
     }
 }

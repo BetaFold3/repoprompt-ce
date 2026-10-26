@@ -523,6 +523,9 @@ package final class AgentRecoveryCoordinator {
     /// The running one, or the last finished one's summary until the next starts
     /// (`AgentRecoveryCoordinator+BulkDismiss.swift`).
     package internal(set) var bulkDismiss: AgentRecoveryBulkDismissStatus?
+    /// Step 9-check: the app-wide Check and resolve (one at a time; transient, never persisted).
+    /// The running one, or the last finished one's report (`AgentRecoveryCoordinator+Check.swift`).
+    package internal(set) var recoveryCheck: AgentRecoveryCheckStatus?
     /// Serial tail of launch-mark writes (`shutdownInProgress`, `cleanExit`, corrections).
     private var launchMarkTail: Task<Void, Never>?
     /// Spec R6 runtime ownership (see `AgentRecoveryCoordinator+RuntimeOwnership.swift`). `nil`
@@ -535,6 +538,8 @@ package final class AgentRecoveryCoordinator {
     var runtimeOwnershipKeys: @MainActor (UUID) -> [AgentRuntimeOwnershipKeys] = { _ in [] }
     /// Latest issued snapshot pull; an older pull's result is never adopted over a newer one.
     var runtimeSnapshotRequest: UInt64 = 0
+    /// The request whose snapshot `runtimeRestrictions` was last adopted from (never decreases).
+    var runtimeSnapshotAdopted: UInt64 = 0
 
     package init(
         store: AgentRecoveryStore,

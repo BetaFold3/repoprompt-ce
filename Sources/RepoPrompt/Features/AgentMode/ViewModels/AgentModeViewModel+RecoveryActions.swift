@@ -114,11 +114,14 @@ extension AgentModeViewModel {
     /// `nil` once the choice was performed (or found already performed). `continuationText` is the
     /// card's edited continuation (frozen into the reservation exactly as given);
     /// `acknowledgedWarning` is the uncertain-prior warning the editor showed when the user sent.
+    /// `report`, when given, receives the runner's typed result and the history observation it ran
+    /// (Check and resolve reports from them; it stays empty when the choice never reached the runner).
     func performRecoveryResumeAction(
         rowID: String,
         action: AgentRecoveryListRowProps.Action,
         continuationText: String? = nil,
-        acknowledgedWarning: String? = nil
+        acknowledgedWarning: String? = nil,
+        report: RecoveryResumeActionReport? = nil
     ) async -> String? {
         guard let item = recoveryListCatalogItem(rowID), let sessionID = item.sessionID else {
             return "This item is no longer available."
@@ -212,14 +215,22 @@ extension AgentModeViewModel {
             confirmsUncertainPriorDelivery: confirmsUncertainPrior
         )
         recoveryActionRequestsBySlot[slot] = request
-        let performers = recoveryActionPerformers(
+        var performers = recoveryActionPerformers(
             kind: kind,
             session: session,
             lane: lane,
             codexTurnID: codexTurnID,
             runTurnID: runTurnID
         )
+        if let report, let reconcile = performers.reconcile {
+            performers.reconcile = { @MainActor action in
+                let observed = await reconcile(action)
+                report.observed = observed
+                return observed
+            }
+        }
         let result = await recoveryActionRunner.perform(request, lane: lane, performers: performers)
+        report?.result = result
         // The session's action hold ended: automatic work it paused is re-evaluated.
         scheduledSendCoordinator?.recordDidChange()
         refreshRecoveryListUI()

@@ -2018,6 +2018,46 @@ final class AgentRecoveryReconciliationTests: XCTestCase {
         XCTAssertEqual(harness.viewModel.test_recoveryClaudeHistoryAccessCount, accessCount)
     }
 
+    // MARK: Step 9-check through the real view-model Reconcile
+
+    /// Check and resolve (checks active) sends the open session's run card through the window's
+    /// real Reconcile (lane lookup, shared working state, `performRecoveryResumeAction`, runner,
+    /// Claude history preflight) and reports from the runner's typed result. The attempt has no
+    /// pre-send baseline, so the observation is "association unavailable": needs you, never failed
+    /// and never resolved, and nothing is imported.
+    func testCheckReportsTheRealReconcileTypedResult() async throws {
+        let harness = try await makeProducerHarness(windowID: 4979)
+        let viewModel = harness.viewModel
+        let coordinator = try XCTUnwrap(viewModel.recoveryCoordinator)
+        let sessionID = try XCTUnwrap(harness.session.activeAgentSessionID)
+        let ownership = RecoveryTestSupport.ownership(sessionID: sessionID)
+        let turnID = UUID()
+        _ = try await harness.lane.ensureRunAttempt(ownership: ownership, processRunID: nil, transcriptTurnID: turnID).get()
+        await harness.lane.recordTerminalEvidence(
+            RecoveryTestSupport.terminalCommit(ownership: ownership, state: .failed, cause: .providerProcessLost),
+            transcriptTurnID: turnID
+        ).value
+        let itemID = "turn-\(sessionID.uuidString)-\(turnID.uuidString)"
+        let listed = await RecoveryTestSupport.eventually { coordinator.catalog.item(id: itemID)?.attention == .informational }
+        XCTAssertTrue(listed)
+        XCTAssertTrue(viewModel.recoveryChecksActive)
+        let itemsBefore = harness.session.items.map(\.id)
+        let rows = viewModel.recoveryNeedsAttentionRows(includeDismissed: false, activeSession: harness.session)
+        XCTAssertTrue(AgentModeViewModel.recoveryCheckItems(rows).contains { $0.id == itemID })
+
+        let task = try XCTUnwrap(viewModel.startRecoveryCheck(rows: rows))
+        let result = await task.value
+        let status = try XCTUnwrap(result)
+        let entry = try XCTUnwrap(status.entries.first { $0.itemID == itemID })
+        XCTAssertEqual(
+            entry.outcome,
+            .needsYou("Continue it or dismiss the note. \(AgentModeViewModel.recoveryAssociationText(.baselineUnavailable))")
+        )
+        XCTAssertTrue(status.headerText.contains(AgentRecoveryCheckStatus.restrictionWarningText))
+        XCTAssertEqual(harness.session.items.map(\.id), itemsBefore, "nothing imported or sent")
+        XCTAssertNotEqual(coordinator.catalogActionStates[itemID], .working, "the row is no longer busy")
+    }
+
     // MARK: Step 4d2 capture-qualified import (view model, real persistence and reader)
 
     private static let historySentinel = "SENTINEL-PRIVATE-CONTEXT-4d2"
@@ -3865,6 +3905,50 @@ final class AgentRecoveryReconciliationTests: XCTestCase {
             XCTAssertFalse(harness.session.hasPendingRuntimeRetirements, row.name)
             XCTAssertEqual(harness.session.items.map(\.id), itemsBefore, "\(row.name): zero transcript rows")
         }
+    }
+
+    /// Step 9-check through the real Reconcile (cold Codex, temporary controller): history confirms
+    /// the interrupted attempt's turn finished and its rows are saved, so Check reports the card
+    /// resolved from the runner's typed result.
+    func testCheckReportsAConfirmedAndSavedCodexCompletionAsResolved() async throws {
+        let controller = LifecycleNoopCodexController(recorder: LifecycleRecorder())
+        controller.joinsRetirementBeforeSuccessor = true
+        controller.recoveryObservationOutcome = .success(codexObservation(
+            turnID: "turn-c",
+            terminal: .completed,
+            items: [.init(nativeItemID: "item-1", kind: .agentMessage, text: "Done.")]
+        ))
+        let (harness, _) = try await makeColdCodexHarness(windowID: 5070, controllers: [controller])
+        let viewModel = harness.viewModel
+        let coordinator = try XCTUnwrap(viewModel.recoveryCoordinator)
+        let sessionID = try XCTUnwrap(harness.session.activeAgentSessionID)
+        let turnID = UUID()
+        harness.session.transcript = AgentTranscript(turns: [AgentTranscriptTurn(
+            id: turnID,
+            request: AgentTranscriptRequestAnchor(from: AgentChatItem.user("Do it")),
+            responseSpans: [AgentTranscriptProviderResponseSpan(providerTurnID: "turn-c", startedAt: Date(), activities: [])],
+            startedAt: Date()
+        )])
+        let ownership = RecoveryTestSupport.ownership(sessionID: sessionID)
+        _ = try await harness.lane.ensureRunAttempt(ownership: ownership, processRunID: nil, transcriptTurnID: turnID).get()
+        await harness.lane.recordTerminalEvidence(
+            RecoveryTestSupport.terminalCommit(ownership: ownership, state: .failed, cause: .providerProcessLost),
+            transcriptTurnID: turnID
+        ).value
+        let itemID = "turn-\(sessionID.uuidString)-\(turnID.uuidString)"
+        let listed = await RecoveryTestSupport.eventually { coordinator.catalog.item(id: itemID)?.attention == .informational }
+        XCTAssertTrue(listed)
+        let itemCountBefore = harness.session.items.count
+        let rows = viewModel.recoveryNeedsAttentionRows(includeDismissed: false, activeSession: harness.session)
+
+        let task = try XCTUnwrap(viewModel.startRecoveryCheck(rows: rows))
+        let result = await task.value
+        let status = try XCTUnwrap(result)
+        let entry = try XCTUnwrap(status.entries.first { $0.itemID == itemID })
+        XCTAssertEqual(entry.outcome, .resolved("Provider history shows the turn finished."))
+        XCTAssertGreaterThan(harness.session.items.count, itemCountBefore, "the observed rows were imported")
+        XCTAssertTrue(controller.sentTexts.isEmpty, "nothing was sent")
+        XCTAssertTrue(controller.startReferences.isEmpty, "no thread start or resume")
     }
 
     /// Review A P1-04 / B F1: live Codex output already in the conversation has no native mapping, so

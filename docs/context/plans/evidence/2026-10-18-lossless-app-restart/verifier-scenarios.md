@@ -49,7 +49,7 @@ A11. Close the sheet after a finished bulk and reopen it. Pass: the old summary 
 ## Step 9-check
 
 C1. Before activation: run Check and resolve on existing items. Pass: report says process and provider-history checks are not active; nothing is resolved automatically; no session is opened; no message is sent.
-C2. Kill/relaunch, after activation: mixed state (one Claude process still running a long tool, one Codex run that finished while closed, one unsent saved message, one pending question). Run Check. Pass: running process → "needs you" (Let finish or Stop); finished Codex run → resolved via history; unsent message → "needs you"; question → "needs you"; run-attempt counts unchanged.
+C2. Kill/relaunch, after activation: mixed state (one Claude process still running a long tool, one Codex run that finished while closed, one unsent saved message, one pending question). Open the finished Codex session in a window, then run Check (`agent.recoveryNeedsAttention.check`) from that window. Pass: report (`agent.recoveryNeedsAttention.checkReport`) shows a "Refreshing process ownership…" phase first and warns that clearing a restriction may let already-authorized scheduled sends run; running process → "needs you" (Let it finish or Stop); finished Codex run → resolved via history; run cards of sessions not open in that window → "Open this session to check its provider history."; unsent message → "needs you"; question → "needs you"; nothing sent; run-attempt counts unchanged.
 C3. Cancel a running Check part-way. Pass: completed items stay completed; remaining items untouched; the report says cancelled.
 
 ## Step 9-activation (Claude Code = C, Codex = X)

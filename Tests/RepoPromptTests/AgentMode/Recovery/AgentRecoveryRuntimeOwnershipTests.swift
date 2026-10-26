@@ -186,6 +186,65 @@ final class AgentRecoveryRuntimeOwnershipTests: XCTestCase {
         XCTAssertNil(afterRefresh)
     }
 
+    /// Refresh returns only once restrictions at least as new as its own snapshot are adopted, also
+    /// when a second Refresh overlaps it; and an adoption never goes back to an older request's
+    /// snapshot (an earlier request landing after a later one is ignored).
+    func testRefreshAdoptsAtLeastItsOwnSnapshotBeforeReturningAndNeverGoesBackwards() async throws {
+        try seedWriter(pid: 5700, conversationID: "conv-O", worktreePath: "/tmp/wt-o")
+        let coordinator = try await startedCoordinator(qualification: Fixtures.qualified())
+        let restricted = coordinator.runtimeRestrictions
+        XCTAssertFalse(restricted.restrictions.isEmpty)
+        processes.remove(pid: 5700) // Exits without a delivered watch event.
+        let latch = RecoveryGateLatch()
+        processes.inventoryHook = { await latch.pause() }
+        let first = Task {
+            await coordinator.refreshRuntimeOwnership()
+            return coordinator.runtimeRestrictions.restrictions.isEmpty
+        }
+        await latch.waitUntilPaused()
+        let second = Task {
+            await coordinator.refreshRuntimeOwnership()
+            return coordinator.runtimeRestrictions.restrictions.isEmpty
+        }
+        await latch.open()
+        let firstSaw = await first.value
+        let secondSaw = await second.value
+        XCTAssertTrue(firstSaw, "the first Refresh returned with the exit adopted")
+        XCTAssertTrue(secondSaw, "the overlapping Refresh returned with the exit adopted")
+
+        let cleared = coordinator.runtimeRestrictions
+        coordinator.adoptRuntimeRestrictions(restricted, request: coordinator.runtimeSnapshotAdopted)
+        XCTAssertEqual(coordinator.runtimeRestrictions, cleared, "a request no newer than the adopted one is ignored")
+        let later = coordinator.runtimeSnapshotRequest + 100
+        coordinator.runtimeSnapshotRequest = later
+        coordinator.adoptRuntimeRestrictions(restricted, request: later)
+        XCTAssertEqual(coordinator.runtimeRestrictions, restricted, "the later request is adopted")
+        coordinator.adoptRuntimeRestrictions(cleared, request: later - 1)
+        XCTAssertEqual(coordinator.runtimeRestrictions, restricted, "an earlier request landing later never overwrites it")
+    }
+
+    /// Check and resolve with checks active shows the refreshing phase while its Refresh runs, then
+    /// reports a captured survivor the adopted snapshot positively lacks as exited.
+    func testCheckRefreshesOwnershipFirstAndReportsAProvenExit() async throws {
+        let writer = try seedWriter(pid: 5800, conversationID: "conv-X", worktreePath: "/tmp/wt-x")
+        let coordinator = try await startedCoordinator(qualification: Fixtures.qualified())
+        let itemID = AgentRecoveryCatalogProjection.runtimeItemID(runtimeID: writer.runtimeID)
+        let captured = try XCTUnwrap(coordinator.catalog.item(id: itemID))
+        processes.remove(pid: 5800)
+        let latch = RecoveryGateLatch()
+        processes.inventoryHook = { await latch.pause() }
+        let running = Task {
+            await coordinator.checkCatalogItems([captured], checksActive: true) { _ in .notAttempted("never") }
+        }
+        await latch.waitUntilPaused()
+        XCTAssertEqual(coordinator.recoveryCheck?.summaryText, "Refreshing process ownership…")
+        await latch.open()
+        let result = await running.value
+        let status = try XCTUnwrap(result)
+        XCTAssertEqual(status.entries.map(\.outcome), [.resolved("The process exited.")])
+        XCTAssertEqual(status.summaryText, "Checked 1 of 1 · 1 resolved")
+    }
+
     func testLetFinishPersistsAndKeepsTheRestriction() async throws {
         let writer = try seedWriter(pid: 5300, conversationID: "conv-L", worktreePath: "/tmp/wt-l")
         let coordinator = try await startedCoordinator()

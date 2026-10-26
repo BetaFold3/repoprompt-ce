@@ -95,11 +95,16 @@ package extension AgentRecoveryCoordinator {
     // MARK: Actions
 
     /// The Refresh action: retries a failed runtime-directory read, then one coalesced discovery
-    /// pass; the published snapshot follows.
+    /// pass; returns only once restrictions at least as new as its own snapshot are adopted (its own,
+    /// or a later request's that was adopted first), so a caller re-reading the catalog afterwards
+    /// (Check and resolve) sees the refreshed restrictions.
     func refreshRuntimeOwnership() async {
         guard let registry = processRegistry else { return }
         await registry.refreshRetryingStorage()
-        pullRuntimeRestrictions()
+        runtimeSnapshotRequest &+= 1
+        let request = runtimeSnapshotRequest
+        let snapshot = await registry.restrictionSnapshot()
+        adoptRuntimeRestrictions(snapshot, request: request)
     }
 
     /// Persists Let finish for exactly the displayed runtime revision; it keeps watching and keeps
@@ -126,9 +131,11 @@ extension AgentRecoveryCoordinator {
                 self?.pullRuntimeRestrictions()
             }
         }
-        runtimeSnapshotRequest &+= 1
         let snapshot = await registry.start()
-        adoptRuntimeRestrictions(snapshot)
+        // Issued after start returns: a pull that read mid-start saw older state and loses, so
+        // readiness always sees start's final snapshot.
+        runtimeSnapshotRequest &+= 1
+        adoptRuntimeRestrictions(snapshot, request: runtimeSnapshotRequest)
     }
 
     /// Re-reads the registry's current snapshot; a later pull supersedes an earlier one.
@@ -138,12 +145,16 @@ extension AgentRecoveryCoordinator {
         let request = runtimeSnapshotRequest
         Task { @MainActor [weak self] in
             let snapshot = await registry.restrictionSnapshot()
-            guard let self, runtimeSnapshotRequest == request else { return }
-            adoptRuntimeRestrictions(snapshot)
+            self?.adoptRuntimeRestrictions(snapshot, request: request)
         }
     }
 
-    private func adoptRuntimeRestrictions(_ snapshot: AgentRuntimeRestrictionSnapshot) {
+    /// Adopts the snapshot read for `request` unless a later request's snapshot was already adopted
+    /// (request numbers are issued before each read). An earlier request finishing first is adopted
+    /// and then replaced by the later one when it lands.
+    func adoptRuntimeRestrictions(_ snapshot: AgentRuntimeRestrictionSnapshot, request: UInt64) {
+        guard request > runtimeSnapshotAdopted else { return }
+        runtimeSnapshotAdopted = request
         guard snapshot != runtimeRestrictions else { return }
         runtimeRestrictions = snapshot
         postCoordinatorDidChange()

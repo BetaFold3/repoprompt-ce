@@ -2588,6 +2588,223 @@ final class AgentRecoveryCoordinatorTests: XCTestCase {
         }
     }
 
+    // MARK: Check and resolve (Step 9-check)
+
+    @MainActor
+    private final class CheckCalls {
+        var ids: [String] = []
+    }
+
+    /// Before activation (production qualification: Reconcile unavailable) Check refreshes and
+    /// reconciles nothing, writes nothing, and reports the items from the catalog only with the
+    /// "not active" header; nothing is resolved.
+    func testCheckBeforeActivationReportsNotActiveAndWritesNothing() async throws {
+        let production = AgentRecoveryActionRunner(qualification: .production, registrationActive: { true })
+        XCTAssertFalse(production.isAvailable(.reconcileOnly), "the window's checksActive is off in production")
+        let cards = try await makeRunCardFixtures(count: 2)
+        let (store, coordinator) = (cards[0].store, cards[0].coordinator)
+        let captured = try cards.map { try XCTUnwrap($0.item) }
+        let gone = AgentRecoveryCatalogItem(
+            id: "intent-\(UUID().uuidString)", kind: .savedInput, sessionID: UUID(), workspaceID: nil,
+            sessionName: "Gone", composeTabID: nil, payload: .scheduleIndexUnavailable(workspaceName: "W"), acknowledgement: nil
+        )
+        var revisions: [AgentRecoveryRecordRevision?] = []
+        for card in cards {
+            try await revisions.append(store.currentRevision(sessionID: card.sessionID))
+        }
+        var reconciled = 0
+        let result = await coordinator.checkCatalogItems(captured + [gone], checksActive: false) { _ in
+            reconciled += 1
+            return .notAttempted("never")
+        }
+        let status = try XCTUnwrap(result)
+        XCTAssertEqual(reconciled, 0, "no provider history is read")
+        XCTAssertFalse(status.isRunning)
+        XCTAssertEqual(status.headerText, "Process and provider-history checks are not active. Items are reported as they are; nothing was changed.")
+        XCTAssertFalse(status.headerText.contains(AgentRecoveryCheckStatus.restrictionWarningText))
+        XCTAssertEqual(status.entries.map(\.outcome), [
+            .couldNotCheck("Provider history checks are not active."),
+            .couldNotCheck("Provider history checks are not active."),
+            .couldNotCheck("It is no longer listed.")
+        ])
+        XCTAssertEqual(status.summaryText, "Checked 3 of 3 · 3 could not check")
+        XCTAssertEqual(status.entries.last?.label, "Saved message · Gone")
+        for (card, revision) in zip(cards, revisions) {
+            let after = try await store.currentRevision(sessionID: card.sessionID)
+            XCTAssertEqual(after, revision, "nothing is written")
+            XCTAssertEqual(card.item, captured.first { $0.id == card.itemID }, "the card is unchanged")
+            XCTAssertNil(coordinator.catalogActionStates[card.itemID])
+        }
+        coordinator.clearRecoveryCheckReport()
+        XCTAssertNil(coordinator.recoveryCheck, "closing the sheet clears a finished report")
+    }
+
+    /// One check at a time, one item at a time; Stop halts before the next item and the report says
+    /// it was cancelled. The item in progress settles and keeps its result.
+    func testCheckStopHaltsBeforeTheNextItemAndRunsOneAtATime() async throws {
+        let cards = try await makeRunCardFixtures(count: 3)
+        let coordinator = cards[0].coordinator
+        let captured = try cards.map { try XCTUnwrap($0.item) }
+        let latch = RecoveryGateLatch()
+        let calls = CheckCalls()
+        let running = Task {
+            await coordinator.checkCatalogItems(captured, checksActive: true) { item in
+                calls.ids.append(item.id)
+                await latch.pause()
+                return .notAttempted("Open this session to check its provider history.")
+            }
+        }
+        await latch.waitUntilPaused()
+        XCTAssertTrue(coordinator.isRecoveryCheckRunning)
+        XCTAssertEqual(calls.ids, [cards[0].itemID], "one item at a time")
+        XCTAssertEqual(coordinator.recoveryCheck?.summaryText, "Checking 1 of 3…")
+        XCTAssertTrue(coordinator.recoveryCheck?.headerText.contains(AgentRecoveryCheckStatus.restrictionWarningText) == true)
+        let concurrent = await coordinator.checkCatalogItems(captured, checksActive: false) { _ in .notAttempted("never") }
+        XCTAssertNil(concurrent, "one check at a time app-wide")
+        coordinator.clearRecoveryCheckReport()
+        XCTAssertNotNil(coordinator.recoveryCheck, "closing the sheet keeps a running check")
+        coordinator.requestRecoveryCheckCancel()
+        XCTAssertEqual(coordinator.recoveryCheck?.summaryText, "Checking 1 of 3… Stopping after this item.")
+        await latch.open()
+        let result = await running.value
+        let status = try XCTUnwrap(result)
+        XCTAssertEqual(calls.ids, [cards[0].itemID], "nothing after Stop")
+        XCTAssertEqual(status.entries.map(\.outcome), [.couldNotCheck("Open this session to check its provider history.")])
+        XCTAssertEqual(status.notChecked, 2)
+        XCTAssertEqual(status.summaryText, "Cancelled: checked 1 of 3, 2 not checked · 1 could not check")
+        XCTAssertEqual(cards.map(\.item), captured, "the remaining items are untouched")
+    }
+
+    /// After activation (checks active, injected), each run card still as captured goes to the
+    /// window's Reconcile and is reported from the runner's typed result, never a catalog re-read
+    /// (record commits reach the catalog asynchronously). A captured card that changed meanwhile, or
+    /// that another action cleared before its turn, is never reconciled; a captured survivor that
+    /// left the catalog without registry proof of exit is not claimed to have exited.
+    func testCheckAfterActivationReportsEachReconcileResult() async throws {
+        let cards = try await makeRunCardFixtures(count: 5)
+        let coordinator = cards[0].coordinator
+        let captured = try cards.map { try XCTUnwrap($0.item) }
+        let (changed, clearedLater) = (cards[3], cards[4])
+        _ = try await changed.lane.reserveRecoveryAction(changed.request()).get()
+        let promoted = await Support.eventually { changed.item?.attention == .needsAction }
+        XCTAssertTrue(promoted)
+        let restriction = AgentRuntimeRestriction(
+            runtimeID: UUID(), kind: .possibleWriter, family: nil, provider: nil, state: .reserved, isPreviousInstance: true,
+            isUnreadable: false, providerHome: nil, conversationIDs: [], worktreePaths: [], sessionIDs: [], associations: [],
+            rootPID: nil, memberCount: 0, letFinish: false, revision: nil, createdAt: nil
+        )
+        let goneSurvivor = AgentRecoveryCatalogItem(
+            id: AgentRecoveryCatalogProjection.runtimeItemID(runtimeID: restriction.runtimeID), kind: .survivingProcess,
+            sessionID: nil, workspaceID: nil, sessionName: nil, composeTabID: nil,
+            payload: .survivingRuntime(restriction), acknowledgement: nil
+        )
+        let confirmed = AgentRecoveryReconcileCompletion.confirmed(runAttemptID: cards[0].attemptID)
+        var reconciled: [String] = []
+        let result = await coordinator.checkCatalogItems(captured + [goneSurvivor], checksActive: true) { item in
+            reconciled.append(item.id)
+            switch item.id {
+            case cards[0].itemID:
+                // Another window resolves a later captured card meanwhile.
+                try? await clearedLater.perform(clearedLater.request(), outcome: .importedCompleted)
+                return .performed(.completed(.importedCompleted, reason: nil), observed: .imported(completion: confirmed, rowCount: 2))
+            case cards[1].itemID:
+                return .performed(
+                    .completed(.importedCompleted, reason: "The session couldn't be saved."),
+                    observed: .blocked("The session couldn't be saved.", completion: confirmed)
+                )
+            case cards[2].itemID:
+                return .performed(
+                    .completed(.notDispatched, reason: "Codex has no matching record of the interrupted turn."),
+                    observed: .nothingImported("Codex has no matching record of the interrupted turn.")
+                )
+            default:
+                return .notAttempted("Open this session to check its provider history.")
+            }
+        }
+        let status = try XCTUnwrap(result)
+        XCTAssertEqual(reconciled, cards.prefix(3).map(\.itemID), "the changed and the cleared cards are never reconciled")
+        XCTAssertEqual(status.entries.map(\.outcome), [
+            .resolved("Provider history shows the turn finished."),
+            .failed("The turn had finished, but its history couldn't be saved: The session couldn't be saved."),
+            .needsYou("Continue it or dismiss the note. Codex has no matching record of the interrupted turn."),
+            .needsYou("Check the conversation, then continue it or dismiss the card"),
+            .resolved("A recovery action resolved it."),
+            .couldNotCheck("It is no longer listed.")
+        ])
+        XCTAssertEqual(status.summaryText, "Checked 6 of 6 · 2 resolved · 2 need you · 1 could not check · 1 failed")
+        XCTAssertEqual(
+            status.headerText,
+            "Checks process ownership and provider history. Clearing a restriction may let already-authorized scheduled sends run."
+        )
+    }
+
+    /// The runner's typed result maps to one report: refusals and providers without history could
+    /// not be checked; transport/read failures and unrecorded outcomes failed; unconfirmed or
+    /// unassociated observations need the user.
+    func testCheckMapsTheRunnersTypedReconcileResult() {
+        let unconfirmed = AgentRecoveryCheckReconcile.unconfirmedChoice
+        let inFlight = AgentRecoveryActionRunner.sessionActionInFlightText
+        let inactive = AgentRecoveryActionRunner.registrationInactiveText
+        let noHistory = "Provider history is unavailable."
+        let finishedUnrecorded = "The turn had finished, but that couldn't be recorded."
+        let unconfirmedImport = AgentRecoveryReconcileResult.imported(completion: .unconfirmed, rowCount: 1)
+        let unassociated = AgentRecoveryReconcileResult.associationUnavailable(.baselineUnavailable, "a")
+        let table: [(AgentRecoveryCheckReconcile, AgentRecoveryCheckOutcome)] = [
+            (.performed(.refused(inFlight), observed: nil), .couldNotCheck(inFlight)),
+            (.performed(.disabled(inactive), observed: nil), .couldNotCheck(inactive)),
+            (.performed(.completed(.importedUnconfirmed, reason: nil), observed: unconfirmedImport), .needsYou(unconfirmed)),
+            (.performed(.completed(.notDispatched, reason: "a"), observed: unassociated), .needsYou("Continue it or dismiss the note. a")),
+            (.performed(.completed(.notDispatched, reason: "read failed"), observed: .blocked("read failed")), .failed("read failed")),
+            (.performed(.completed(.notDispatched, reason: noHistory), observed: nil), .couldNotCheck(noHistory)),
+            (.performed(.outcomeUnrecorded(.importedCompleted, reason: nil), observed: nil), .failed(finishedUnrecorded)),
+            (.performed(.joined(.unknown), observed: nil), .couldNotCheck(AgentRecoveryCheckReconcile.alreadyChosenText)),
+            (.notAttempted("why"), .couldNotCheck("why"))
+        ]
+        for (reconcile, expected) in table {
+            XCTAssertEqual(reconcile.outcome, expected, "\(reconcile)")
+        }
+    }
+
+    /// Representative items are reported from the catalog alone with the named choice, or why they
+    /// can't be checked.
+    func testCheckClassifiesRepresentativeItems() {
+        let id = UUID()
+        let stamp = AgentRecoveryTimestamp(millisecondsSince1970: 1000)
+        let intent = AgentRecoveryIntent(
+            intentID: id, userItemID: id, origin: .composer, target: .session, createdAt: stamp, appInstanceID: id,
+            transcriptResetGeneration: 0, deliveryState: .queued, payload: Support.content("saved"), scheduleReference: nil
+        )
+        let question = AgentRecoveryQuestionSnapshot(
+            interactionID: id, kind: .askUser, runAttemptID: id, transcriptResetGeneration: 0, appInstanceID: id,
+            askedAt: stamp, title: "Question", message: nil, items: [], extras: [:]
+        )
+        let restriction = AgentRuntimeRestriction(
+            runtimeID: id, kind: .possibleWriter, family: nil, provider: nil, state: .reserved, isPreviousInstance: true,
+            isUnreadable: false, providerHome: nil, conversationIDs: [], worktreePaths: [], sessionIDs: [id], associations: [],
+            rootPID: nil, memberCount: 0, letFinish: false, revision: nil, createdAt: nil
+        )
+        let run = AgentRecoveryRunAttempt(runAttemptID: id, transcriptResetGeneration: 0, processRunID: nil, transcriptTurnID: nil, startedAt: stamp)
+        let note = AgentRecoveryCheckOutcome.couldNotCheck("note")
+        let context = AgentRecoveryCatalogIntentContext(isEarlierLaunch: true, heldReason: nil, sameGeneration: true, isRemote: false)
+        let table: [(AgentRecoveryCatalogPayload, AgentRecoveryCatalogActionFacts, AgentRecoveryCheckOutcome)] = [
+            (.intent(intent, context), .init(), .needsYou("Send or discard the saved message")),
+            (.question(question, isCurrentLaunch: false), .init(), .needsYou("Answer the question")),
+            (.survivingRuntime(restriction), .init(), .needsYou("Let it finish or Stop")),
+            (.closedSessionDraft(Support.snapshot("closed"), fromClearedConversation: false), .init(), .needsYou("Restore or discard the draft")),
+            (.scheduleIndexUnavailable(workspaceName: "W"), .init(), .couldNotCheck("Scheduled sends in W couldn't be read.")),
+            (.composerWriteFailed(.retired), .init(), .couldNotCheck("A save failed. Retry it from its card.")),
+            (.recoveryOnlyRun(run), .init(), note),
+            (.recoveryOnlyRun(run), .init(hasUnsentContinuation: true), .needsYou("Send your continuation again or dismiss the card"))
+        ]
+        for (payload, facts, expected) in table {
+            let item = AgentRecoveryCatalogItem(
+                id: "item", kind: .savedInput, sessionID: id, workspaceID: nil, sessionName: nil, composeTabID: nil,
+                payload: payload, acknowledgement: nil, actionFacts: facts
+            )
+            XCTAssertEqual(item.checkOutcome(unresolvedRun: note), expected, "\(payload)")
+        }
+    }
+
     // MARK: Indexed schedules (sessions no window hosts)
 
     @MainActor
